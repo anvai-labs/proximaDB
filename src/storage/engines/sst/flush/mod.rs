@@ -816,6 +816,12 @@ impl SstEngine {
             );
         }
 
+        // TD-PAXDIR-2 (L1): the new segment must be visible to the next query —
+        // drop the cross-query listing cache immediately after the publish
+        // (before the awaited directory emission) to minimize the window.
+        crate::storage::engines::sst::search::invalidate_segment_listing_cache(
+            &atomic_op.final_url,
+        );
         if already_materialized {
             return Ok(FlushResult {
                 success: true,

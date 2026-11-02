@@ -2552,6 +2552,12 @@ impl Compaction {
                     "local-spill atomic publication failed",
                 )
                 .await;
+            // TD-PAXDIR-2 (L1): the local-spill publish path also invalidates.
+            if let Some(parent) = task.output_file.parent() {
+                crate::storage::engines::sst::search::invalidate_segment_listing_cache(
+                    &parent.to_string_lossy(),
+                );
+            }
             return Err(crate::core::StorageError::SstEngine(format!(
                 "publish local-spill PAX segment: {error}"
             )));

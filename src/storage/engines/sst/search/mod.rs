@@ -57,6 +57,79 @@ impl Drop for UmbrellaTimer {
     }
 }
 
+/// TD-PAXDIR-2 (L1): a process-wide listing cache — how long a collection's
+/// discovered segment set is reused before the next query re-LISTs. Default
+/// 30 s; `PROXIMADB_SEGMENT_LISTING_CACHE_MS=0` disables (kill value, every
+/// query pays one LIST as before); a flush or compaction publish
+/// invalidates the affected collection immediately, so read-after-write
+/// correctness does not depend on the TTL (which bounds only cross-pod
+/// staleness — the same contract as the centroid directory recheck).
+pub fn segment_listing_cache_ttl() -> Option<std::time::Duration> {
+    const DEFAULT_MS: u64 = 30_000;
+    match std::env::var("PROXIMADB_SEGMENT_LISTING_CACHE_MS")
+        .ok()
+        .as_deref()
+        .map(str::trim)
+        .map(str::parse::<u64>)
+    {
+        Some(Ok(0)) => None,
+        Some(Ok(ms)) => Some(std::time::Duration::from_millis(ms)),
+        _ => Some(std::time::Duration::from_millis(DEFAULT_MS)),
+    }
+}
+
+/// TD-PAXDIR-2 (L1): cross-query segment listing cache. Each entry holds the
+/// discovered file set and the instant it was fetched; entries expire by TTL
+/// and are invalidated by flush/compaction publishes (see
+/// [`invalidate_segment_listing_cache`]).
+static SEGMENT_LISTING_CACHE: std::sync::OnceLock<std::sync::Mutex<SegmentListingCache>> =
+    std::sync::OnceLock::new();
+
+/// Bounded like the centroid directory cache (MAX_CACHED_DIRECTORIES).
+const MAX_CACHED_SEGMENT_LISTINGS: usize = 1024;
+
+/// The cross-query listing cache state. `generation` increments on every
+/// invalidation so a LIST that raced a publish cannot insert a stale
+/// snapshot after the invalidation already fired.
+#[derive(Default)]
+struct SegmentListingCache {
+    entries: std::collections::HashMap<String, (std::time::Instant, Vec<DiscoveredSstFile>)>,
+    generation: u64,
+}
+
+impl SegmentListingCache {
+    /// Trailing-`/` differences between the discovery and invalidation
+    /// paths must not fork entries.
+    fn key(url: &str) -> String {
+        url.trim_end_matches('/').to_string()
+    }
+}
+
+fn segment_listing_cache() -> &'static std::sync::Mutex<SegmentListingCache> {
+    SEGMENT_LISTING_CACHE.get_or_init(Default::default)
+}
+
+/// Invalidate a collection's cached segment listing (called by the flush and
+/// compaction publish paths). `storage_url` is the collection data directory.
+pub(crate) fn invalidate_segment_listing_cache(storage_url: &str) {
+    let mut cache = segment_listing_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    cache.entries.remove(&SegmentListingCache::key(storage_url));
+    cache.generation += 1;
+}
+
+/// Clear every cached listing (tests that assert exact wave counts need the
+/// LIST to fire).
+#[cfg(test)]
+pub(crate) fn clear_segment_listing_cache_for_tests() {
+    let mut cache = segment_listing_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    cache.entries.clear();
+    cache.generation += 1;
+}
+
 tokio::task_local! {
     /// TD-PAXDIR-1 D7: one query's segment listing, by storage URL. Bound by
     /// [`scope_discovery_memo`] around a search, so the Adaptive-mode vector
@@ -2965,12 +3038,65 @@ self.try_pax_cascade(
             files.retain(|f| !pending.contains(&f.url));
             return Ok(files);
         }
-        let files = self.discover_sstable_files_listed(storage_url).await?;
+        // TD-PAXDIR-2 (L1): a live cross-query listing avoids the LIST entirely.
+        // The retirement filter is applied below (same as the per-query memo
+        // path) so superseded segments stop serving immediately.
+        let cache_key = SegmentListingCache::key(storage_url);
+        let (generation_at_read, cached_files) = {
+            let cache = segment_listing_cache();
+            let mut guard = cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // Prune expired entries opportunistically (bounded memory).
+            if guard.entries.len() > MAX_CACHED_SEGMENT_LISTINGS {
+                let ttl = segment_listing_cache_ttl();
+                guard
+                    .entries
+                    .retain(|_, (at, _)| ttl.is_some_and(|t| at.elapsed() < t));
+            }
+            let generation = guard.generation;
+            let files = guard
+                .entries
+                .get(&cache_key)
+                .filter(|(at, _)| segment_listing_cache_ttl().is_some_and(|t| at.elapsed() < t))
+                .map(|(_, f)| f.clone());
+            (generation, files)
+        };
+        let files = if let Some(files) = cached_files {
+            files
+        } else {
+            let files = self.discover_sstable_files_listed(storage_url).await?;
+            // Only insert if no invalidation fired during the LIST — a
+            // generation bump means a publish invalidated the entry and
+            // this snapshot is already stale (the re-poisoning race).
+            if segment_listing_cache_ttl().is_some() {
+                let mut guard = segment_listing_cache()
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if guard.generation == generation_at_read {
+                    // Bounded: drop an arbitrary entry at the cap.
+                    if guard.entries.len() >= MAX_CACHED_SEGMENT_LISTINGS
+                        && let Some(key) = guard.entries.keys().next().cloned()
+                    {
+                        guard.entries.remove(&key);
+                    }
+                    guard
+                        .entries
+                        .insert(cache_key, (std::time::Instant::now(), files.clone()));
+                }
+            }
+            files
+        };
         let _ = DISCOVERY_MEMO.try_with(|memo| {
             memo.lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .insert(storage_url.to_owned(), files.clone())
         });
+        // The retirement filter: the cache may hold segments whose compaction
+        // published between the listing and this query.
+        let pending = crate::storage::engines::sst::retirement_ledger::pending_paths();
+        let mut files = files;
+        files.retain(|f| !pending.contains(&f.url));
         Ok(files)
     }
 
@@ -3348,6 +3474,49 @@ fn stamp_persisted_version(
 mod tests {
     use super::*;
     use crate::storage::engines::sst::SstConfig;
+
+    /// TD-PAXDIR-2 (L1): the cross-query listing cache TTL — env parsing,
+    /// default, and the kill value.
+    #[test]
+    fn segment_listing_cache_ttl_from_env() {
+        // SAFETY: nextest process-per-test isolation.
+        unsafe { std::env::remove_var("PROXIMADB_SEGMENT_LISTING_CACHE_MS") };
+        assert_eq!(
+            segment_listing_cache_ttl(),
+            Some(std::time::Duration::from_millis(30_000))
+        );
+        unsafe { std::env::set_var("PROXIMADB_SEGMENT_LISTING_CACHE_MS", "0") };
+        assert_eq!(segment_listing_cache_ttl(), None);
+        unsafe { std::env::set_var("PROXIMADB_SEGMENT_LISTING_CACHE_MS", "5000") };
+        assert_eq!(
+            segment_listing_cache_ttl(),
+            Some(std::time::Duration::from_millis(5_000))
+        );
+        unsafe { std::env::remove_var("PROXIMADB_SEGMENT_LISTING_CACHE_MS") };
+    }
+
+    /// TD-PAXDIR-2 (L1): invalidation removes the entry.
+    #[test]
+    fn segment_listing_cache_invalidation_removes_entry() {
+        let mut guard = segment_listing_cache()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.entries.insert(
+            "test://listing-cache-invalidation".to_string(),
+            (std::time::Instant::now(), Vec::new()),
+        );
+        drop(guard);
+        invalidate_segment_listing_cache("test://listing-cache-invalidation");
+        assert!(
+            segment_listing_cache()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .entries
+                .get("test://listing-cache-invalidation")
+                .is_none()
+        );
+    }
+
     use crate::storage::persistence::filesystem::FilesystemFactory;
     use proximadb_data_model::ProximaValue;
     use proximadb_distance_kernel::engine::UnifiedDistanceCompute;
