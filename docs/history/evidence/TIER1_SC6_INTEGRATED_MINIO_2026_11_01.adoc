@@ -34,7 +34,7 @@ link:../../current/TIER1_SC6_COST_WORKSHEET.adoc[worksheet].)
 |===
 | Phase | Balanced GETs/q (bytes/q) | Granted GETs/q (bytes/q) | p50 bal→grant | recall@10 bal→grant
 | post-write (warm DRAM) | 4.84 (11.97 MB) | **0.00 (0 B)** | 40.4→37.9 ms | 0.9847→0.9842
-| restart + store (warm) | 4.95 (12.29 MB) | **0.00 (0 B)** | 70.5→65.2 ms | 0.9828→0.9827
+| restart + store (warm) | ~18 GETs/q — see the wire retraction below | **0.00 (0 B)** | 70.5→65.2 ms | 0.9828→0.9827
 | restart, no store (cold) | 18.22 (56.93 MB) | 17.53 (53.09 MB) | 57.3→56.9 ms | 0.9838→0.9835
 |===
 
@@ -88,6 +88,47 @@ actually a 5 ms replicate (kept as `sc6-granted-1m-lat5-r2`).
   collision with a concurrent lane's replicate. The bench config now sets
   `timeout_seconds = 300` for latency arms (API timeout is not a measured
   dimension).
+
+== Wire-verified per-operation costs (mc admin trace, both arms)
+
+The app's per-phase GET counters were reconciled against MinIO's request
+trace. The granted warm and cold phases reconcile exactly; the ungranted
+"4.95 GETs/q warm" from the first balanced arm DOES NOT reproduce (a
+fixture-reuse repeat shows 18.07 app / 17.48 wire — the full cold bill) and is
+RETRACTED: it was ingest-era construction state, not a tier property.
+
+[cols="1,2,2,2",options="header"]
+|===
+| Phase (1,000 queries) | GET/q (wire) | LIST/q (wire) | ≈$/1k queries (list-price structure)
+| balanced — every phase (17.5–18.6) | ~18 | ~1.0 | ~$0.077
+| granted, READY (0 GETs, n=2 wire) | **0.00** | **0.97** | **~$0.0049**
+|===
+
+* The granted arm's ENTIRE request bill is the control plane: one LIST per
+  query (segment discovery — the open L1 listing-cache item would zero it).
+  Request-cost reduction ≈ 16x, wire-verified on both sides.
+* One counter-fidelity anomaly stays open: granted post_write claims 17.2
+  GETs/q at the app while the wire saw 2.56 — only that phase, only granted.
+
+== F1: the granted read path serialized its batches (found + fixed + measured)
+
+`read_ranges_prefetch_resident` served each logical range through its own
+spawn_blocking+checksum hop ONE AT A TIME, serializing the batch the cold path
+issues as a bounded-concurrent coalesced wave. Fixture-reuse arms showed it as
+warm 215 ms / post_write 196 ms at zero GETs (n=2). The fix reuses the remote
+path's own plan (`plan_read_ranges` + `read_ranges_prefetch_inflight` +
+logical slicing), swapping only the transport (seams branch, F1 commit).
+
+[cols="1,2,2",options="header"]
+|===
+| Phase (granted, fixture-reuse) | pre-fix (r2) | post-fix (r3)
+| post_write p50 | 195.9 ms | **75.0 ms**
+| warm p50 (0 GETs) | 215.2 ms | **158.0 ms**
+| cold p50 (sanity) | 60.7 ms | 63.2 ms |
+|===
+
+A residual ~95 ms warm-vs-cold gap remains open (hypotheses: single-range
+resident reads still pay per-call blocking+checksum; store read throughput).
 
 == Disclosures
 
