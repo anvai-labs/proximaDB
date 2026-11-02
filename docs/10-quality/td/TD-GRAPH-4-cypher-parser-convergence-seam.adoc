@@ -5,7 +5,7 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | **Open (seam extracted 2026-11-01; corpus pin landed 2026-11-01; convergence step 1 — shared lexemes — landed 2026-11-02; clause-by-clause port pending).**
+| Status | **Open (seam extracted 2026-11-01; corpus pin landed 2026-11-01; steps 1-2 landed 2026-11-02 — shared lexemes + shared constraint patterns/type unification; clause-by-clause port pending).**
 | Priority | P2 — two live nom-based Cypher grammars with 34 shared function names and drifted bodies is the standard fork disease; every parser fix must currently land twice or silently miss one path.
 | Relates to | link:TD-GRAPH-3-cypher-variable-length-multihop.adoc[TD-GRAPH-3] (variable-length parsing), the 2026-10-31 victor clone-scan dedup program (wave 3)
 | Component | `crates/query/proximadb-graph-query/src/parser/` (read path + `write_seam.rs`), `crates/modalities/proximadb-graph/src/cypher_parser.rs` (the graph-API grammar), `src/query/parsers/cypher.rs` + `src/graph/query/graph_parser.rs` (its consumers).
@@ -36,31 +36,47 @@ drifted twin.
    delegate to them — previously the seam accepted strictly less, so adopting the superset
    only makes previously-REJECTED inputs parse; the 41-entry pinned corpus stayed
    byte-identical through the switch (the differential check this pin exists for). Remaining
-   steps (open): shared patterns → clause-by-clause port, keeping the modality's
-   `CypherQuery`→`query_ast` mapping as a thin conversion over the seam's AST, until the
-   modality file reduces to the conversion layer.   modality file reduces to the conversion layer.
+   steps (step 2 LANDED 2026-11-02 — shared constraint patterns + type
+   unification): the modality's `PropertyConstraint` twin is GONE —
+   `query_ast` re-exports the seam's superset enum (adds `NotIn` + the
+   `GreaterThanOrEqual`/`LessThanOrEqual` aliases; CLAUDE.md #19), so the
+   two grammars now share ONE constraint type and ONE constraint-map
+   pattern (`lexemes::constraint_map`, both sides delegating). The step-1
+   ledger's three items are executed: inf→0 → parse error (both paths);
+   null rejected in constraint position (write path still allows
+   set-to-null); the live read entry errors on unconsumed remainder.
+   Remaining (open): clause-by-clause port, keeping the modality's
+   `CypherQuery`→`query_ast` mapping as a thin conversion over the seam's
+   AST, until the modality file reduces to the conversion layer.   modality file reduces to the conversion layer.
 
    _Widened-behavior ledger (recorded per the step-1 review — tracked
    decisions, not accidents of superset adoption):_
-   * **inf→0 coercion** (`Number::from_f64(f).unwrap_or(Number::from(0))`
-     in `lexemes.rs`): an oversized exponent (`{v: 1.0e999}`) parses as
-     `Equals(0)` silently. Pre-existing modality behavior carried by
-     parity; the seam read path previously failed loudly. A later
-     convergence step should make `from_f64` failure a parse error on
-     BOTH paths (a deliberate pin update).
-   * **`null` filter drop**: `{x: null}` / `WHERE n.x = null` now parse
-     on the seam read path and the constraint is dropped downstream
-     (`graph_runtime.rs` maps json-null to no-filter), behaving as an
-     unconstrained MATCH. Parity-correct, but the semantics (vs Cypher's
-     null-comparison rules) were never deliberately chosen — decide
-     explicitly during the clause-by-clause steps.
-   * **Read-path convergence is VALUES-only so far**: the read path's
-     identifier stays bare-only and its map braces tight; the write seam
-     gained backtick keys/permissive spacing. Full parity is later steps'
-     target. (Pre-existing, unchanged, noted for the record: the live
-     read entry `QueryParser::parse` discards unconsumed remainder —
-     `MATCH (n) RETURN ngarbage` silently truncates; the corpus pin
-     guards remainder-stranding only on the write entry.)
+   * **inf→0 coercion** — RESOLVED in step 2: `from_f64` failure now fails
+     the parse on BOTH paths (`map_opt`; an oversized exponent in map
+     context is a parse error, not `Equals(0)`). Pinned by tests on both
+     grammars.
+   * **`null` filter drop** — DECIDED in step 2, with its actual SCOPE:
+     `null` is rejected in CONSTRAINT-MAP position on both grammars (the
+     form that silently produced an unconstrained scan). Deliberately
+     unchanged: `WHERE n.x = null` is still ACCEPTED (a separate code
+     path — comparison parsing; downstream it evaluates as an accidental
+     IS NULL, matching only nodes MISSING the property — its real
+     semantics are clause-by-clause step work). MERGE maps REJECT null
+     (they route through the constraint map even though MERGE is
+     write-shaped — Cypher-correct; Neo4j rejects it too); CREATE/SET
+     (the true write paths) still accept null (set-to-null). `[null]`
+     in a constraint map passes the top-level check and pins to an empty
+     result (0 rows — storage cannot hold nulls in arrays; not the
+     scan hazard). All shapes pinned by tests on both grammars.
+   * **Read-path convergence is VALUES-only so far** — IMPROVED in step 2:
+     the read path's constraint map now shares the full pattern (quoted
+     keys, permissive spacing). (Pre-existing remainder-discarding on the
+     read entries — RESOLVED in step 2: `QueryParser::parse` AND the
+     modality's `parse_to_compiled_pattern` now error on unconsumed
+     input, matching the write entry's discipline. Note: trailing
+     comments and a stray `;` at the direct entries now hard-error where
+     they previously silently truncated — intended tightening; comment
+     support is grammar work, not convergence.)
 3. **Contract pinning** (landed 2026-11-01): a 41-entry shared corpus (reads incl. var-length
    `*`/`*1..3`, OPTIONAL MATCH, WHERE and/or, incoming/bidirectional edges, property maps with
    string/bool/int values, DISTINCT, SKIP/LIMIT, ORDER BY over a bare variable (incl. DESC), and the

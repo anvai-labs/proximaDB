@@ -40,7 +40,7 @@ use nom::{
     bytes::complete::{tag, tag_no_case},
     character::complete::{char, digit1, multispace0, multispace1},
     combinator::{map, map_res, opt, value},
-    multi::{many0, separated_list0, separated_list1},
+    multi::{many0, separated_list1},
     sequence::{delimited, preceded, separated_pair, tuple},
 };
 use proximadb_kernel::error::ProximaDBError;
@@ -80,7 +80,17 @@ impl QueryParser {
     /// Parse a Cypher-like query string into a CompiledPattern (AST)
     pub fn parse(&self, input: &str) -> QueryResult<CompiledPattern> {
         match parse_query(input) {
-            Ok((_, compiled_pattern)) => Ok(compiled_pattern),
+            // Full-consumption discipline (TD-GRAPH-4 step 2): leftover
+            // input is a parse error, not silently discarded — trailing
+            // garbage (`@@@`, comments, a stray `;`) must not silently
+            // truncate the query into a "valid" prefix.
+            Ok((remaining, compiled_pattern)) if remaining.trim().is_empty() => {
+                Ok(compiled_pattern)
+            }
+            Ok((remaining, _)) => Err(ProximaDBError::InvalidInput(format!(
+                "Unexpected input remaining after parsing: '{}'",
+                remaining.chars().take(50).collect::<String>()
+            ))),
             Err(e) => Err(ProximaDBError::InvalidInput(format!(
                 "Failed to parse query: {}",
                 e
@@ -105,31 +115,10 @@ fn property_value(input: &str) -> IResult<&str, serde_json::Value> {
     lexemes::property_value::<nom::error::Error<&str>>(input)
 }
 
-// Helper to parse property assignments (e.g., key: value)
-fn property_assignment(input: &str) -> IResult<&str, (String, PropertyConstraint)> {
-    map(
-        separated_pair(
-            identifier,
-            delimited(multispace0, char(':'), multispace0),
-            property_value,
-        ),
-        |(key, value)| (key, PropertyConstraint::Equals(value)),
-    )(input)
-}
-
-// Helper to parse property map (e.g., {key: value, key2: value2})
+// Helper to parse property map — the shared constraint map (permissive
+// spacing + quoted keys now on the read path too; identifier parity).
 fn property_map(input: &str) -> IResult<&str, HashMap<String, PropertyConstraint>> {
-    map(
-        delimited(
-            char('{'),
-            separated_list0(
-                delimited(multispace0, char(','), multispace0),
-                property_assignment,
-            ),
-            char('}'),
-        ),
-        |assignments| assignments.into_iter().collect(),
-    )(input)
+    lexemes::constraint_map(input)
 }
 
 // Parse a node pattern (e.g., (n:Label {prop: "val"}), (:Label), or anonymous ())
@@ -1344,5 +1333,57 @@ mod tests {
                 .expect("tight spacing still parses");
         assert_eq!(m["name"], serde_json::json!("Alice"));
         assert_eq!(m["age"], serde_json::json!(30));
+    }
+    #[test]
+    fn test_step2_null_rejected_in_constraint_maps() {
+        // Cypher equality-with-null never matches (IS NULL is the idiom);
+        // pre-convergence both grammars accepted it and dropped the
+        // constraint downstream (an unconstrained scan).
+        assert!(lexemes::constraint_map::<nom::error::Error<&str>>("{x: null}").is_err());
+        assert!(parse_node_pattern("(n {x: null})").is_err());
+        // The WRITE path still accepts null (set-to-null is meaningful).
+        assert!(lexemes::property_value_map::<nom::error::Error<&str>>("{x: null}").is_ok());
+    }
+
+    #[test]
+    fn test_step2_oversized_float_fails_not_zero() {
+        // inf does not fit a JSON number: in map context the parse fails
+        // instead of the pre-convergence silent `= 0` coercion (a bare
+        // property_value legitimately consumes the `1` prefix of "1.0e999"
+        // as an integer — the map's delimiter expectation catches the rest).
+        assert!(lexemes::constraint_map::<nom::error::Error<&str>>("{v: 1.0e999}").is_err());
+        assert!(lexemes::property_value_map::<nom::error::Error<&str>>("{v: -1.0e999}").is_err());
+        let (_, m) = lexemes::constraint_map::<nom::error::Error<&str>>("{v: 1.5e2}").expect("ok");
+        assert_eq!(
+            m["v"],
+            crate::ast::PropertyConstraint::Equals(serde_json::json!(150.0))
+        );
+    }
+
+    #[test]
+    fn test_step2_live_entry_requires_full_consumption() {
+        // Leftover input is an error, not silently discarded.
+        // (`ngarbage` would be a valid RETURN variable — use real garbage.)
+        assert!(QueryParser::new().parse("MATCH (n) @@@").is_err());
+        assert!(QueryParser::new().parse("MATCH (n) RETURN n").is_ok());
+        // trailing whitespace after a COMPLETE query is fine
+        assert!(QueryParser::new().parse("MATCH (n) RETURN n  ").is_ok());
+    }
+
+    #[test]
+    fn test_step2_read_path_identifier_parity() {
+        // The read path's constraint map gains the shared shape: quoted
+        // keys + permissive spacing (previously tight/bare-only).
+        let (_, m) =
+            lexemes::constraint_map::<nom::error::Error<&str>>("{ `weird key` : 1 , b : 2 }")
+                .expect("permissive map");
+        assert_eq!(
+            m["weird key"],
+            crate::ast::PropertyConstraint::Equals(serde_json::json!(1))
+        );
+        assert_eq!(
+            m["b"],
+            crate::ast::PropertyConstraint::Equals(serde_json::json!(2))
+        );
     }
 }

@@ -834,7 +834,14 @@ impl CypherParser {
         input: &str,
     ) -> Result<CompiledPattern, ProximaDBError> {
         match parse_simple_query(input.trim()) {
-            Ok((_, compiled)) => Ok(compiled),
+            // Full-consumption discipline (TD-GRAPH-4 step 2 — same rule
+            // as the seam's live entry): leftover input is an error, not
+            // silently discarded.
+            Ok((remaining, compiled)) if remaining.trim().is_empty() => Ok(compiled),
+            Ok((remaining, _)) => Err(ProximaDBError::InvalidInput(format!(
+                "Unexpected input remaining after parsing: '{}'",
+                remaining.chars().take(50).collect::<String>()
+            ))),
             Err(e) => Err(ProximaDBError::InvalidInput(format!(
                 "Failed to parse query pattern: {:?}",
                 e
@@ -874,30 +881,9 @@ fn property_value(input: &str) -> ParseResult<'_, serde_json::Value> {
 }
 
 /// Parse property assignment: key: value
-fn property_assignment(input: &str) -> ParseResult<'_, (String, PropertyConstraint)> {
-    map(
-        separated_pair(
-            any_identifier,
-            delimited(multispace0, char(':'), multispace0),
-            property_value,
-        ),
-        |(key, value)| (key, PropertyConstraint::Equals(value)),
-    )(input)
-}
-
-/// Parse property map: {key: value, ...}
+/// Parse property map — the shared TD-GRAPH-4 constraint map.
 fn property_map(input: &str) -> ParseResult<'_, HashMap<String, PropertyConstraint>> {
-    map(
-        delimited(
-            pair(char('{'), multispace0),
-            separated_list0(
-                delimited(multispace0, char(','), multispace0),
-                property_assignment,
-            ),
-            pair(multispace0, char('}')),
-        ),
-        |pairs| pairs.into_iter().collect(),
-    )(input)
+    proximadb_graph_query::parser::lexemes::constraint_map(input)
 }
 
 /// Parse property value map: {key: value, ...} for CREATE
@@ -956,9 +942,14 @@ fn property_constraint_to_value(constraint: PropertyConstraint) -> serde_json::V
         PropertyConstraint::NotEquals(v) => v,
         PropertyConstraint::GreaterThan(v) => v,
         PropertyConstraint::GreaterOrEqual(v) => v,
+        PropertyConstraint::GreaterThanOrEqual(v) => v,
         PropertyConstraint::LessThan(v) => v,
         PropertyConstraint::LessOrEqual(v) => v,
+        PropertyConstraint::LessThanOrEqual(v) => v,
         PropertyConstraint::In(vals) => serde_json::Value::Array(vals),
+        // Unreachable today (constraint maps mint only Equals); if a
+        // future step mints NotIn in maps, this needs a real answer.
+        PropertyConstraint::NotIn(_) => serde_json::Value::Bool(false),
         PropertyConstraint::Contains(s) => serde_json::Value::String(s),
         PropertyConstraint::StartsWith(s) => serde_json::Value::String(s),
         PropertyConstraint::EndsWith(s) => serde_json::Value::String(s),
@@ -2433,6 +2424,51 @@ pub fn cypher_to_graph_query(
 // ============================================================================
 // TESTS
 // ============================================================================
+
+#[cfg(test)]
+mod step2_decisions {
+    use super::*;
+
+    #[test]
+    fn null_rejected_in_match_maps_but_not_create() {
+        let p = CypherParser::new();
+        assert!(p.parse("MATCH (n {x: null}) RETURN n").is_err());
+        // CREATE still accepts null (set-to-null).
+        assert!(p.parse("CREATE (n:Person {x: null})").is_ok());
+    }
+
+    #[test]
+    fn oversized_float_fails_not_zero() {
+        let p = CypherParser::new();
+        assert!(p.parse("CREATE (n:Person {v: 1.0e999})").is_err());
+        assert!(p.parse("CREATE (n:Person {v: 1.5e2})").is_ok());
+    }
+
+    #[test]
+    fn null_decision_scope_pinned() {
+        // The null rejection is CONSTRAINT-MAP position only. The other
+        // forms are deliberately left as-is (step-2 scope decision,
+        // recorded in TD-GRAPH-4):
+        let p = CypherParser::new();
+        // (a) WHERE n.x = null: still accepted (a separate code path —
+        // comparison parsing, not the map). Downstream it evaluates as
+        // an accidental IS NULL (matches only nodes missing the
+        // property); deciding its real semantics is clause-by-clause
+        // step work.
+        assert!(p.parse("MATCH (n) WHERE n.x = null RETURN n").is_ok());
+        // (b) MERGE maps REJECT null — they route through the constraint
+        // map even though MERGE is write-shaped (Cypher-correct; Neo4j
+        // rejects null in MERGE patterns too). CREATE/SET (true write
+        // paths) still accept it.
+        assert!(p.parse("MERGE (n:Person {x: null})").is_err());
+        assert!(p.parse("CREATE (n:Person {x: null})").is_ok());
+        // (c) [null] in a constraint map passes the TOP-LEVEL check —
+        // pinned as-is: the effect downstream is an empty result (0
+        // rows), NOT the unconstrained-scan hazard the map rejection
+        // targets; storage cannot hold nulls in arrays.
+        assert!(p.parse("MATCH (n {x: [null]}) RETURN n").is_ok());
+    }
+}
 
 #[cfg(test)]
 mod tests {
