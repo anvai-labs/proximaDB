@@ -1,0 +1,85 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-WALPOISON-1: A poisoned record store stops pinning its committed-but-unapplied WAL entries, so the truncator can delete them
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Fixed (fail-closed refusal), 2026-11-01.** Found by the v0.4.x→v0.5.1 release review (finding F1, `RELEASE_REVIEW_v0.4_to_v0.5.1.md`); the precision poison-floor alternative remains a follow-up below.
+| Priority | **HIGH.** The bug class is the one TD-SEAM-2/P2.2 was designed to kill — a flush-time answer that loses a durable write — wearing a new costume: the reservation protocol is correct while the write is in flight and dropped the moment the write *fails*.
+| Component | `src/services/record_store.rs` (`write_mutations`'s apply error arm, `InflightReservation`'s drop, `DirectWalTableRecordStore::min_unflushed_lsn`, `poisoned`)
+| Relates to | TD-SEAM-2 (truncation only at `min_unflushed_lsn`), TD-SEAM-12 (in-flight reservations), TD-USUB-19 (a different unbounded WAL pin, also fail-closed), ADR-095 (the poison flag's origin, "ADR-095 review F2")
+|===
+
+== The finding
+
+When a write's `apply_storage_actions` fails after `append_operations` has made it durable, the
+store does the right thing for readers: it sets `poisoned` and returns `CommitOutcomeUnknown`
+("durable but only partly applied … refuse to serve it"). But for the *truncator* the write then
+vanishes:
+
+* its WAL entry is in no partition (the apply failed), so no partition's
+  `min_unflushed_lsn` accounts for it;
+* its in-flight reservation — held precisely so a concurrent floor could not pass it
+  (TD-SEAM-12) — is released when `write_mutations` returns, because
+  `InflightReservation` drops on **every** exit path: "success, error, cancellation";
+* `DirectWalTableRecordStore::min_unflushed_lsn` never consulted `poisoned`, so the tier
+  answered a floor as if the store were healthy.
+
+Nothing pinned the entry except `ChangeFeedRetention` (newest `DEFAULT_RETAIN_ENTRIES` = 1M
+entries) — and that shield is *incidental*: the shared canonical WAL keeps growing (graph
+checkpoints, rank, function appends, branch-base images), so once the head advances ~1M entries
+past the poisoned batch, the feed floor rises above it and the scheduled truncator deletes a
+**committed** entry. On restart the row is gone: replay cannot restore what was truncated.
+No concurrent failure is needed beyond the one apply error (an object-store blip during a spill
+PUT suffices to poison the store).
+
+== The fix (shipped with this TD)
+
+Fail closed, at the existing composition seam: while `poisoned` is set,
+`DirectWalTableRecordStore::min_unflushed_lsn` returns `Err`. The truncator already aborts a
+whole run on any source refusal ("one refusal stops the whole run; there is no partial
+answer"), so the WAL is retained until the restart that replays it and clears the poison — the
+same recovery story the poison flag already promises readers.
+
+Gate (red-first, `tests/wal_truncation_recovery_test.rs::
+a_poisoned_store_refuses_wal_truncation_so_its_committed_entry_survives`): a
+fault-injectable partition (`FailablePartition`) fails `upsert_record_at_lsn` after the durable
+append, the head advances past the poisoned entry, and with `ChangeFeedRetention(0)` collapsing
+the incidental shield, the run must end `TruncationRun::Refused { source: "record-tier" }`,
+nothing may be truncated, and a restarted store must replay the poisoned write's row. Against
+the unfixed tree the same test fails by truncating the entry and losing the row on restart.
+
+== Alternatives declined (and the follow-up)
+
+* *Precision poison-floor.* Capture the failed batch's LSN range at poison time and add it as a
+  durable `WalFloorSource`, so truncation could continue **below** the failed batch. More
+  available (one store's poison would not stop the whole WAL's truncation), but it adds
+  persisted state and a new floor source for a condition that already halts that store's
+  writes; retention-until-restart is the honest posture and matches how the poison already
+  treats reads. Recorded here as the follow-up if WAL growth during poison windows ever
+  becomes the measured problem (measure first: the window is bounded by operator restart
+  latency, and `admit_writes` already refuses new writes on the poisoned store).
+* *Keep the reservation on error.* Equivalent to the poison-floor through existing machinery,
+  but leaves a half-open reservation protocol (who releases a reservation whose owner has
+  returned?) for no additional guarantee over refusing.
+
+== Follow-ups filed here
+
+* **Replay-failure fatality gate (release-review F7, shipped in the same PR):** a WAL replay
+  failure over a **truncated** WAL (`retained_from() > 1`, the spill-off refusal's own
+  predicate) now refuses boot instead of warn-and-serving a partial store — the retained tail
+  is the only copy of the unflushed rows. The dedicated e2e (seed a table, force one truncation,
+  corrupt the retained tail, assert the server refuses to boot with the new message) is a
+  follow-up; today the fatal machinery itself is covered by the atomic-commit fatal-path e2e
+  (`pgwire_atomic_commit_e2e.rs`), and the predicate is the one the spill-off boot refusal
+  tests already pin.
+* **Roll-forward composition fixture (release-review F21):** the marker mechanics
+  (`storage_format.rs`) and the frozen WAL frame bytes are each tested, but no test boots a
+  directory genuinely written by a v0.4.1 binary through marker-record → first rotation →
+  first truncation and asserts row counts. The v0.4.1→v0.5.0 drill covered
+  Iceberg/MATERIALIZE only. A golden v0.4.1-written WAL directory is the missing fixture.
+* **Truncation-refusal observability:** like TD-USUB-19, a refusal is fail-closed but quiet —
+  one `warn!` per run. A `proximadb_wal_truncation_refusals_total{source}` counter would make
+  "the WAL is retained in full" an operator-visible condition rather than a log line (same
+  remedy TD-USUB-19 names for its own pin).

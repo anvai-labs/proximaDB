@@ -392,6 +392,16 @@ impl MultiServer {
         // back to opening a local appender when (a) the pgwire path is
         // overridden to a non-default location, or (b) `SharedServices`
         // wasn't constructed with an appender (e.g. opt_config was None).
+        // Release-review F20: the fallback arms below open the WAL directly
+        // (custom `direct_record_wal_path`, or SharedServices without an
+        // appender), bypassing the marker check SharedServices performs on
+        // its own open — record (or check) the data format here too, so a
+        // directory written by a newer binary refuses instead of silently
+        // serving a subset. Idempotent for the shared arm, whose directory
+        // was already checked when SharedServices opened it.
+        if let Some(dir) = wal_path.parent() {
+            crate::services::storage_format::ensure_data_format(dir)?;
+        }
         let wal_appender = if wal_path == default_wal_path {
             if let Some(shared) = self.shared_services.canonical_wal_appender.clone() {
                 info!(
