@@ -1948,8 +1948,13 @@ async fn dv_mat_puffins(
         .await
         .expect("metadata log")
         .expect("a published snapshot");
+    // F8: the retained window is 3 generations TOTAL by default (V, V−1,
+    // V−2) — mirror materialize_append::retained_generations_from's default
+    // path (the lib helper is pub(crate), so this pins the default window;
+    // the soak does not set the env knob).
+    let retained: u64 = 3;
     let mut referenced = std::collections::BTreeSet::new();
-    for version in [latest.saturating_sub(1), latest] {
+    for version in (latest + 1).saturating_sub(retained)..=latest {
         let snapshot = bridge
             .read_iceberg_snapshot_files("metadata", version)
             .await
@@ -2052,7 +2057,7 @@ async fn check_soak_incremental_materialize() {
             minted_any |= !on_disk.is_empty();
             assert_eq!(
                 on_disk, referenced,
-                "round {round}: dv-mat Puffins on disk == those V and V-1 name"
+                "round {round}: dv-mat Puffins on disk == those the retained window name"
             );
         }
     }
