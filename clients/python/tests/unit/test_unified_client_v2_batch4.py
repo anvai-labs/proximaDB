@@ -414,6 +414,7 @@ class TestOwnershipAndCensus:
         for name in (
             "scan_page",
             "search_envelope",
+            "search_next_page",
             "execute_sql",
             "execute_unified_query",
         ):
@@ -422,7 +423,13 @@ class TestOwnershipAndCensus:
             ), f"{name} grew a gRPC impl"
 
     def test_rest_overrides_ops(self):
-        for name in ("scan_page", "search_envelope", "execute_sql", "hybrid_search"):
+        for name in (
+            "scan_page",
+            "search_envelope",
+            "search_next_page",
+            "execute_sql",
+            "hybrid_search",
+        ):
             assert getattr(RestProtocolAdapter, name) is not getattr(
                 BaseProtocolAdapter, name
             )
