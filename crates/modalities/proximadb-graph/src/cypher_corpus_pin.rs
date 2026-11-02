@@ -17,6 +17,11 @@
 //! runtime-minted identifiers (node `id`, edge `from`/`to`) are elided —
 //! fresh UUIDs per parse are not grammar behavior.
 //!
+//! Corpus EXTENDED 41→45 in TD-GRAPH-4 step 3 (deliberate pin update):
+//! the seam gained the modality's IN / multi-label / WITH-AS / COUNT(DISTINCT)
+//! constructs, so four formerly modality-only shapes joined the BOTH
+//! intersection and are now differentially pinned.
+//!
 //! Coverage note: entries are the BOTH-grammar intersection (full input
 //! consumed on both sides — the seam parser does NOT require eof, so an
 //! `Ok` with stranded remainder is a REJECTION here). Aggregations
@@ -156,6 +161,19 @@ const CORPUS: &[(&str, &str)] = &[
         "MATCH (n:Person) RETURN n ORDER BY n DESC",
     ),
     ("count_star_alias", "MATCH (n:Person) RETURN COUNT(*) AS c"),
+    ("read_multi_label", "MATCH (n:Person:Adult) RETURN n"),
+    (
+        "where_in_list",
+        "MATCH (n:Person) WHERE n.tag IN [\"a\", \"b\"] RETURN n",
+    ),
+    (
+        "with_var_alias_where",
+        "MATCH (n:Person) WITH n AS x WHERE x.age > 21 RETURN x",
+    ),
+    (
+        "count_distinct",
+        "MATCH (n:Person) RETURN COUNT(DISTINCT n)",
+    ),
 ];
 
 /// The frozen clause-level behavior of both grammars over {CORPUS}.
@@ -325,6 +343,22 @@ S: {"reading_clauses":[{"Match":{"optional":false,"pattern":{"edges":[],"nodes":
 Q: MATCH (n:Person) RETURN COUNT(*) AS c
 M: {"clauses":[],"reading_clauses":[{"Match":{"optional":false,"pattern":{"edges":[],"nodes":[{"label":"Person","labels":["Person"],"optional":false,"properties":{},"variable":"n"}],"paths":[],"where_clause":null,"where_clauses":[],"with_clauses":[]}}}],"return_spec":{"distinct":false,"items":["c"],"limit":null,"order_by":[],"projections":["Count"],"skip":null,"variables":["c"]},"union_clauses":[],"updating_clauses":[],"with_clauses":[]}
 S: {"reading_clauses":[{"Match":{"optional":false,"pattern":{"edges":[],"nodes":[{"labels":["Person"],"optional":false,"properties":{},"variable":"n"}],"paths":[],"where_clause":null}}}],"return_spec":{"distinct":false,"limit":null,"order_by":[],"projections":["Count"],"skip":null,"variables":["c"]},"union_clauses":[],"updating_clauses":[],"with_clauses":[]}
+=== read_multi_label
+Q: MATCH (n:Person:Adult) RETURN n
+M: {"clauses":[],"reading_clauses":[{"Match":{"optional":false,"pattern":{"edges":[],"nodes":[{"label":"Person","labels":["Person","Adult"],"optional":false,"properties":{},"variable":"n"}],"paths":[],"where_clause":null,"where_clauses":[],"with_clauses":[]}}}],"return_spec":{"distinct":false,"items":["n"],"limit":null,"order_by":[],"projections":[{"Variable":"n"}],"skip":null,"variables":["n"]},"union_clauses":[],"updating_clauses":[],"with_clauses":[]}
+S: {"reading_clauses":[{"Match":{"optional":false,"pattern":{"edges":[],"nodes":[{"labels":["Person","Adult"],"optional":false,"properties":{},"variable":"n"}],"paths":[],"where_clause":null}}}],"return_spec":{"distinct":false,"limit":null,"order_by":[],"projections":[{"Variable":"n"}],"skip":null,"variables":["n"]},"union_clauses":[],"updating_clauses":[],"with_clauses":[]}
+=== where_in_list
+Q: MATCH (n:Person) WHERE n.tag IN ["a", "b"] RETURN n
+M: {"clauses":[],"reading_clauses":[{"Match":{"optional":false,"pattern":{"edges":[],"nodes":[{"label":"Person","labels":["Person"],"optional":false,"properties":{},"variable":"n"}],"paths":[],"where_clause":{"Property":{"constraint":{"In":["a","b"]},"property":"tag","variable":"n"}},"where_clauses":[],"with_clauses":[]}}}],"return_spec":{"distinct":false,"items":["n"],"limit":null,"order_by":[],"projections":[{"Variable":"n"}],"skip":null,"variables":["n"]},"union_clauses":[],"updating_clauses":[],"with_clauses":[]}
+S: {"reading_clauses":[{"Match":{"optional":false,"pattern":{"edges":[],"nodes":[{"labels":["Person"],"optional":false,"properties":{},"variable":"n"}],"paths":[],"where_clause":{"Property":{"constraint":{"In":["a","b"]},"property":"tag","variable":"n"}}}}}],"return_spec":{"distinct":false,"limit":null,"order_by":[],"projections":[{"Variable":"n"}],"skip":null,"variables":["n"]},"union_clauses":[],"updating_clauses":[],"with_clauses":[]}
+=== with_var_alias_where
+Q: MATCH (n:Person) WITH n AS x WHERE x.age > 21 RETURN x
+M: {"clauses":[],"reading_clauses":[{"Match":{"optional":false,"pattern":{"edges":[],"nodes":[{"label":"Person","labels":["Person"],"optional":false,"properties":{},"variable":"n"}],"paths":[],"where_clause":null,"where_clauses":[],"with_clauses":[]}}}],"return_spec":{"distinct":false,"items":["x"],"limit":null,"order_by":[],"projections":[{"Variable":"x"}],"skip":null,"variables":["x"]},"union_clauses":[],"updating_clauses":[],"with_clauses":[{"distinct":false,"limit":null,"order_by":[],"projections":[{"Variable":"n"}],"skip":null,"where_clause":{"Property":{"constraint":{"GreaterThan":21},"property":"age","variable":"x"}}}]}
+S: {"reading_clauses":[{"Match":{"optional":false,"pattern":{"edges":[],"nodes":[{"labels":["Person"],"optional":false,"properties":{},"variable":"n"}],"paths":[],"where_clause":null}}}],"return_spec":{"distinct":false,"limit":null,"order_by":[],"projections":[{"Variable":"x"}],"skip":null,"variables":["x"]},"union_clauses":[],"updating_clauses":[],"with_clauses":[{"distinct":false,"limit":null,"order_by":[],"projections":[["x",{"Variable":"n"}]],"skip":null,"where_clause":{"Property":{"constraint":{"GreaterThan":21},"property":"age","variable":"x"}}}]}
+=== count_distinct
+Q: MATCH (n:Person) RETURN COUNT(DISTINCT n)
+M: {"clauses":[],"reading_clauses":[{"Match":{"optional":false,"pattern":{"edges":[],"nodes":[{"label":"Person","labels":["Person"],"optional":false,"properties":{},"variable":"n"}],"paths":[],"where_clause":null,"where_clauses":[],"with_clauses":[]}}}],"return_spec":{"distinct":false,"items":["count"],"limit":null,"order_by":[],"projections":["Count"],"skip":null,"variables":["count"]},"union_clauses":[],"updating_clauses":[],"with_clauses":[]}
+S: {"reading_clauses":[{"Match":{"optional":false,"pattern":{"edges":[],"nodes":[{"labels":["Person"],"optional":false,"properties":{},"variable":"n"}],"paths":[],"where_clause":null}}}],"return_spec":{"distinct":false,"limit":null,"order_by":[],"projections":["Count"],"skip":null,"variables":["count"]},"union_clauses":[],"updating_clauses":[],"with_clauses":[]}
 "#;
 
 /// Deterministic JSON rendering: object keys sorted at every level.

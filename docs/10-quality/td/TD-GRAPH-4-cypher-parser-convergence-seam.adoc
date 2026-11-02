@@ -5,7 +5,7 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | **Open (seam extracted 2026-11-01; corpus pin landed 2026-11-01; steps 1-2 landed 2026-11-02 — shared lexemes + shared constraint patterns/type unification; clause-by-clause port pending).**
+| Status | **Open (seam extracted 2026-11-01; corpus pin landed 2026-11-01; steps 1-2 landed 2026-11-02; step-3 prerequisite — the seam gains the modality-only constructs — landed same day, corpus 41→45; clause-by-clause port unblocked).**
 | Priority | P2 — two live nom-based Cypher grammars with 34 shared function names and drifted bodies is the standard fork disease; every parser fix must currently land twice or silently miss one path.
 | Relates to | link:TD-GRAPH-3-cypher-variable-length-multihop.adoc[TD-GRAPH-3] (variable-length parsing), the 2026-10-31 victor clone-scan dedup program (wave 3)
 | Component | `crates/query/proximadb-graph-query/src/parser/` (read path + `write_seam.rs`), `crates/modalities/proximadb-graph/src/cypher_parser.rs` (the graph-API grammar), `src/query/parsers/cypher.rs` + `src/graph/query/graph_parser.rs` (its consumers).
@@ -45,9 +45,16 @@ drifted twin.
    ledger's three items are executed: inf→0 → parse error (both paths);
    null rejected in constraint position (write path still allows
    set-to-null); the live read entry errors on unconsumed remainder.
-   Remaining (open): clause-by-clause port, keeping the modality's
-   `CypherQuery`→`query_ast` mapping as a thin conversion over the seam's
-   AST, until the modality file reduces to the conversion layer.   modality file reduces to the conversion layer.
+   Step 3 prerequisite LANDED 2026-11-02 (the seam GAINS the modality-only
+   constructs, per the corpus blind-spot list): `IN` predicates in WHERE,
+   multi-label `:A:B` node patterns, bare-variable `AS` aliasing (WITH n AS x),
+   and `COUNT(DISTINCT expr)` (reduced to Count, the modality's own
+   simplification). The corpus was DELIBERATELY EXTENDED 41 → 45 (a reviewed
+   pin update per this TD's rule) so the four newly-shared shapes are
+   differentially pinned. Remaining modality-only constructs: NONE — the
+   grammars' accepted-surface intersection is now the full corpus plus the
+   aliasing family; the clause-by-clause port (modality parser reduces to a
+   conversion layer over the seam's AST) is unblocked.   modality file reduces to the conversion layer.
 
    _Widened-behavior ledger (recorded per the step-1 review — tracked
    decisions, not accidents of superset adoption):_

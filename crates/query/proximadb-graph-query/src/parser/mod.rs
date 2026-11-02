@@ -37,10 +37,10 @@ use super::ast::{
 use nom::{
     IResult,
     branch::alt,
-    bytes::complete::{tag, tag_no_case},
+    bytes::complete::{tag, tag_no_case, take_while},
     character::complete::{char, digit1, multispace0, multispace1},
-    combinator::{map, map_res, opt, value},
-    multi::{many0, separated_list1},
+    combinator::{map, map_res, opt, recognize, value},
+    multi::{many0, separated_list0, separated_list1},
     sequence::{delimited, preceded, separated_pair, tuple},
 };
 use proximadb_kernel::error::ProximaDBError;
@@ -132,15 +132,17 @@ fn parse_node_pattern(input: &str) -> IResult<&str, NodePattern> {
         delimited(
             char('('),
             tuple((
-                opt(identifier),                          // Optional variable (anonymous if absent)
-                opt(preceded(char(':'), identifier)),     // Optional Label
+                opt(identifier), // Optional variable (anonymous if absent)
+                // Labels: :A or :A:B (multi-label, TD-GRAPH-4 step 3 —
+                // the modality grammar's shape; previously single-only)
+                many0(preceded(char(':'), identifier)),
                 opt(preceded(multispace0, property_map)), // Optional Properties
             )),
             char(')'),
         ),
-        move |(variable_opt, label_opt, properties_opt)| NodePattern {
+        move |(variable_opt, labels, properties_opt)| NodePattern {
             variable: variable_opt.unwrap_or_else(|| format!("__anon_{anon_seed}")),
-            labels: label_opt.map(|l| vec![l]).unwrap_or_default(),
+            labels,
             properties: properties_opt.unwrap_or_default(),
             optional: false, // Not handling OPTIONAL MATCH yet
         },
@@ -378,28 +380,55 @@ fn parse_where_primary(input: &str) -> IResult<&str, WhereClause> {
 }
 
 fn parse_where_property_condition(input: &str) -> IResult<&str, WhereClause> {
-    map(
-        tuple((
-            identifier, // variable
-            char('.'),
-            identifier, // property
-            delimited(multispace0, parse_comparison_op, multispace0),
-            property_value, // value
-        )),
-        |(variable, _, property, operator, value)| WhereClause::Property {
-            variable,
-            property,
-            constraint: match operator {
-                "=" => PropertyConstraint::Equals(value),
-                ">" => PropertyConstraint::GreaterThan(value),
-                "<" => PropertyConstraint::LessThan(value),
-                ">=" => PropertyConstraint::GreaterOrEqual(value),
-                "<=" => PropertyConstraint::LessOrEqual(value),
-                "!=" => PropertyConstraint::NotEquals(value),
-                _ => PropertyConstraint::Equals(value),
+    alt((
+        // IN predicate: n.tag IN ["a", "b"] (TD-GRAPH-4 step 3 — the
+        // modality grammar's shape; previously unsupported, so queries
+        // using IN failed the whole WHERE parse).
+        map(
+            tuple((
+                identifier,
+                char('.'),
+                identifier,
+                delimited(multispace1, tag_no_case("IN"), multispace1),
+                delimited(
+                    char('['),
+                    separated_list0(
+                        delimited(multispace0, char(','), multispace0),
+                        property_value,
+                    ),
+                    char(']'),
+                ),
+            )),
+            |(variable, _, property, _, values)| WhereClause::Property {
+                variable,
+                property,
+                constraint: PropertyConstraint::In(values),
             },
-        },
-    )(input)
+        ),
+        // Comparison: n.age > 30
+        map(
+            tuple((
+                identifier, // variable
+                char('.'),
+                identifier, // property
+                delimited(multispace0, parse_comparison_op, multispace0),
+                property_value, // value
+            )),
+            |(variable, _, property, operator, value)| WhereClause::Property {
+                variable,
+                property,
+                constraint: match operator {
+                    "=" => PropertyConstraint::Equals(value),
+                    ">" => PropertyConstraint::GreaterThan(value),
+                    "<" => PropertyConstraint::LessThan(value),
+                    ">=" => PropertyConstraint::GreaterOrEqual(value),
+                    "<=" => PropertyConstraint::LessOrEqual(value),
+                    "!=" => PropertyConstraint::NotEquals(value),
+                    _ => PropertyConstraint::Equals(value),
+                },
+            },
+        ),
+    ))(input)
 }
 
 fn parse_comparison_op(input: &str) -> IResult<&str, &str> {
@@ -421,13 +450,24 @@ fn parse_where_clause(input: &str) -> IResult<&str, WhereClause> {
 // Parse aggregation functions
 fn parse_aggregation(input: &str) -> IResult<&str, PropertyProjection> {
     alt((
-        // COUNT(*)
+        // COUNT(*) — and COUNT(DISTINCT expr), which reduces to Count
+        // (the modality grammar's simplification; TD-GRAPH-4 step 3)
         map(
             tuple((
                 tag_no_case("COUNT"),
                 delimited(
                     char('('),
-                    delimited(multispace0, char('*'), multispace0),
+                    delimited(
+                        multispace0,
+                        alt((
+                            tag("*"),
+                            recognize(preceded(
+                                tuple((tag_no_case("DISTINCT"), multispace1)),
+                                take_while(|c| c != ')'),
+                            )),
+                        )),
+                        multispace0,
+                    ),
                     char(')'),
                 ),
             )),
@@ -588,10 +628,22 @@ fn parse_return_item(input: &str) -> IResult<&str, (String, PropertyProjection)>
                 )
             },
         ),
-        // Simple variable
-        map(identifier, |var| {
-            (var.clone(), PropertyProjection::Variable(var))
-        }),
+        // Simple variable — with optional alias (`n AS x`; TD-GRAPH-4
+        // step 3: WITH n AS x previously failed because only the
+        // property/aggregation arms carried AS)
+        map(
+            tuple((
+                identifier,
+                opt(preceded(
+                    delimited(multispace1, tag("AS"), multispace1),
+                    identifier,
+                )),
+            )),
+            |(var, alias_opt)| {
+                let name = alias_opt.unwrap_or_else(|| var.clone());
+                (name, PropertyProjection::Variable(var))
+            },
+        ),
     ))(input)
 }
 
