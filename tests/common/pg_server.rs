@@ -121,13 +121,35 @@ impl TestPgServer {
     }
 
     /// Connect a pgwire client (`tokio_postgres`) to this server.
+    ///
+    /// `start()` waits for the REST listener only; the pgwire accept loop can
+    /// lag it by more than the fixed settle sleep on a loaded CI runner, and
+    /// a client connecting into that window gets ConnectionReset — seen once
+    /// in eight on the pgwire-accuracy lane's first run of
+    /// pgwire_on_conflict_e2e (tests never fail locally on an idle box).
+    /// The port is assigned from a bound socket before `start()` returns, so
+    /// acceptance is imminent: retry the connection briefly instead of
+    /// failing the test.
     pub async fn connect(&self) -> anyhow::Result<tokio_postgres::Client, tokio_postgres::Error> {
-        let (client, connection) =
-            tokio_postgres::connect(&self.conn_str(), tokio_postgres::NoTls).await?;
-        tokio::spawn(async move {
-            let _ = connection.await;
-        });
-        Ok(client)
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            match tokio_postgres::connect(&self.conn_str(), tokio_postgres::NoTls).await {
+                Ok((client, connection)) => {
+                    tokio::spawn(async move {
+                        let _ = connection.await;
+                    });
+                    return Ok(client);
+                }
+                // tokio-postgres 0.7 keeps its error Kind private; at CONNECT
+                // time (no SQL sent yet) a non-Db error is transport-class
+                // (reset/refused/timeout), and only those are worth retrying
+                // — a server Db rejection (auth, startup error) fails fast.
+                Err(e) if e.as_db_error().is_none() && std::time::Instant::now() < deadline => {
+                    sleep(Duration::from_millis(200)).await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
     }
 
     /// A no-proxy REST client pointed at this server's base URL, for the
