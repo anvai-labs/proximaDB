@@ -275,7 +275,9 @@ pub struct FilesystemFactory {
     /// a pure-diagnostics/fault gate changed routing OUTCOMES (a local tiered
     /// publish failed instead of riding the native copy). Returning one
     /// stable `Arc` per (backend, gate state) keeps the env gates live per
-    /// call while identity holds. Bounded: at most 4 states per scheme.
+    /// call while identity holds. Bounded: at most 4 states per scheme in
+    /// production builds (6 in test builds, where the injected-counters
+    /// bit adds two).
     wrapper_memo: std::sync::Mutex<HashMap<(String, u8), Arc<dyn FileSystem>>>,
     /// Test-only per-factory GET counters: when set, every `get_filesystem`
     /// wraps the backend in a `CountingFileSystem` sharing THESE counters
@@ -481,6 +483,11 @@ impl FilesystemFactory {
         counters: std::sync::Arc<proximadb_storage_filesystem_types::counting::GetCounters>,
     ) {
         self.test_get_counters = Some(counters);
+        // Memoized counting stacks captured the OLD counters Arc — drop them
+        // so a re-point counts into the new one (must precede any I/O).
+        if let Ok(mut memo) = self.wrapper_memo.lock() {
+            memo.clear();
+        }
     }
 
     /// Initialize all configured filesystem backends
@@ -676,20 +683,16 @@ impl FilesystemFactory {
         } else {
             fs
         };
+        // Test-injected counters take precedence over the env route (the
+        // pre-fix early return skipped the env check for the same effect).
+        #[cfg(test)]
         let wrapped: Arc<dyn FileSystem> = if test_count {
-            #[cfg(test)]
-            {
-                Arc::new(
-                    proximadb_storage_filesystem_types::counting::CountingFileSystem::new(
-                        fs,
-                        test_counters.expect("test_count implies counters"),
-                    ),
-                )
-            }
-            #[cfg(not(test))]
-            {
-                unreachable!("test_count is constant false in non-test builds")
-            }
+            Arc::new(
+                proximadb_storage_filesystem_types::counting::CountingFileSystem::new(
+                    fs,
+                    test_counters.expect("test_count implies counters"),
+                ),
+            )
         } else if count_env {
             Arc::new(
                 proximadb_storage_filesystem_types::counting::CountingFileSystem::new(
@@ -700,8 +703,27 @@ impl FilesystemFactory {
         } else {
             fs
         };
-        // A poisoned memo must never fail I/O: skip memoizing instead.
+        #[cfg(not(test))]
+        let wrapped: Arc<dyn FileSystem> = if count_env {
+            Arc::new(
+                proximadb_storage_filesystem_types::counting::CountingFileSystem::new(
+                    fs,
+                    proximadb_storage_filesystem_types::counting::global_counters(),
+                ),
+            )
+        } else {
+            fs
+        };
+        // A poisoned memo must never fail I/O: skip memoizing instead. The
+        // get-then-insert is CANONICAL: a racer may have installed this very
+        // state while we were building — hand back THEIR Arc so one state is
+        // always exactly one handle (two cold-start builders each returning
+        // their own wrapper is precisely the identity bug this memo exists
+        // to kill).
         if let Ok(mut memo) = self.wrapper_memo.lock() {
+            if let Some(existing) = memo.get(&key) {
+                return Ok(Arc::clone(existing));
+            }
             memo.insert(key, Arc::clone(&wrapped));
         }
         Ok(wrapped)
