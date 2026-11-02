@@ -906,13 +906,13 @@ fn default_write_lease_ttl_ms() -> u64 {
 }
 
 impl CoreStorageConfig {
-    /// The partition-lease renew interval derived from
-    /// [`CoreStorageConfig::write_lease_ttl_ms`]: `ttl / 2`, clamped to at
-    /// least 1 s and at most the TTL itself (TD-LEASE-2: a configurable TTL
-    /// with a fixed interval would lapse the lease every cycle).
+    /// The shared lease renew interval derived from
+    /// [`CoreStorageConfig::write_lease_ttl_ms`]: `ttl / 2`, clamped to 1–5 s.
+    /// The upper bound also covers DML locks and graph node/edge leases,
+    /// whose initial TTL is 10 s even when the writer TTL is raised.
     pub fn write_lease_renew_interval(&self) -> std::time::Duration {
         let ttl = self.write_lease_ttl_ms.max(2_000);
-        std::time::Duration::from_millis((ttl / 2).max(1_000))
+        std::time::Duration::from_millis((ttl / 2).clamp(1_000, 5_000))
     }
 }
 /// Backwards-compat alias for [`CoreStorageConfig`].
@@ -942,9 +942,9 @@ pub struct CoreStorageConfig {
     /// SST (Sorted String Table) engine configuration
     pub sst_config: Option<SstConfig>,
     /// Writer-incarnation / partition-lease TTL in milliseconds
-    /// (TD-LEASE-2). The renew loop interval is derived as `ttl / 2`
-    /// (clamped to at least 1 s), so the lease never lapses between renewals
-    /// under default scheduling. Raise it for workloads whose compaction or
+    /// (TD-LEASE-2). The shared renew loop interval is derived as `ttl / 2`,
+    /// clamped to 1–5 s so short-lived resource leases also receive a renewal
+    /// opportunity before expiry. Raise it for workloads whose compaction or
     /// flush stalls can exceed the default 10 s (observed: a 13 s stall
     /// lapsed the incarnation and fenced an ingest batch).
     #[serde(default = "default_write_lease_ttl_ms")]

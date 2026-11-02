@@ -65,11 +65,15 @@ bumps; live-self always renews; only a LIVE FOREIGN holder fences.*
   self-conflict.
 * *TTL configurability + interval coupling:* `[storage]
   write_lease_ttl_ms` (default 10_000); the renew interval is DERIVED as
-  `clamp(ttl/2, ≥1s)` — a configurable TTL with the old fixed 5 s
-  interval would lapse the lease every cycle. Consumed at the single
-  production `PartitionLeaseManager::new`.
+  `clamp(ttl/2, 1s, 5s)` — the floor preserves the minimum cadence,
+  while the ceiling retains a renewal opportunity before DML locks and
+  graph node/edge leases reach their initial 10 s expiry, even when the
+  writer TTL is raised. Smaller writer TTLs retain their half-TTL
+  cadence (the effective writer TTL is at least 2 s). Consumed at the
+  single production `PartitionLeaseManager::new` and its shared renew loop.
 * *Bounded renewals (ADR-095 adoption):* each per-key renewal in
-  `renew_held` is wrapped in `timeout(lease/2)`; a hung authority call
+  `renew_held` is wrapped in `timeout(min(lease/2, 5s))`; this per-call
+  timeout is separate from the shared loop cadence. A hung authority call
   counts as a renewal failure instead of stalling the serial pass for
   EVERY collection (the observed amplifier).
 * *Observability:* `proximadb_lease_conflict_resolutions_total{resolution
@@ -84,7 +88,10 @@ Resolver units (own-live adopt / dead-own retry / dead-foreign retry /
 live-foreign fenced / no-phantom); manager gate-sequence (lapse bumps,
 foreign stays fenced); the D3 negative (registry-self alone must not
 answer owned after lapse); TTL survival; the store-level
-renew-and-begin interleave (every same-pod outcome Acquired); plus the
+renew-and-begin interleave (every same-pod outcome Acquired); interval
+boundaries (default, small, raised, and maximum writer TTL); shared
+cadence keeps initially 10 s DML/node/edge leases continuously held with
+stable generations through competing-pod probes; plus the
 pre-existing pins (restart-bumps, single-pod-keeps-lease,
 renew-extends-same-generation, steps-down, takeover-fence).
 

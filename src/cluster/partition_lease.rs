@@ -2583,9 +2583,10 @@ impl PartitionLeaseManager {
         // stalling the serial pass for EVERY collection (observed: a 13 s
         // compaction stall lapsed all incarnations because one slow path
         // blocked the single renew tick).
-        // Cap at 5 s so a raised write_lease_ttl_ms cannot push the interval
-        // past the 10 s TTL of DML locks and graph resources (the hardcoded
-        // ttl_ms in acquire_dml_lock and the GraphNode/GraphEdge strategies).
+        // Cap each call's timeout at 5 s. This bounds authority-call latency;
+        // the shared loop's cadence is capped separately by
+        // CoreStorageConfig::write_lease_renew_interval for 10 s DML and graph
+        // resource leases.
         let renew_budget_ms = (self.lease_ms.max(2) / 2).min(5_000);
         let renew_budget = std::time::Duration::from_millis(renew_budget_ms as u64);
         for (tenant_id, collection_id, binding) in self.registry.list() {
@@ -4396,6 +4397,92 @@ mod tests {
             0,
             "released DML lease must no longer be renewed"
         );
+        Ok(())
+    }
+
+    /// Raising the writer TTL must still renew DML, node, and edge leases
+    /// before their initial 10s expiry, using the production config cadence.
+    #[tokio::test]
+    async fn raised_writer_ttl_keeps_short_resource_leases_live() -> Result<()> {
+        let config = crate::core::config::StorageConfig {
+            write_lease_ttl_ms: 30_000,
+            ..Default::default()
+        };
+        let backing = shared_backing();
+        let manager = Arc::new(PartitionLeaseManager::new(
+            Arc::new(store(&backing)),
+            Arc::new(PrimaryPodRegistry::new()),
+            "owner",
+            config.write_lease_ttl_ms as i64,
+        ));
+        manager.register_strategy(Arc::new(GraphNodeStrategy));
+        manager.register_strategy(Arc::new(GraphEdgeStrategy));
+
+        let lock_service = DmlLockService::new(manager.clone(), "owner".to_string());
+        let scope = DmlLockScope::Table {
+            schema_name: "public".to_string(),
+            table_name: "users".to_string(),
+        };
+        assert!(matches!(
+            lock_service
+                .acquire_dml_lock("tenant", None, &scope, LockIntent::Write, 0)
+                .await?,
+            LockOutcome::Acquired { .. }
+        ));
+        let mut keys = vec![ResourceKey::table("tenant", "public", "users")];
+        for strategy in [
+            &GraphNodeStrategy as &dyn ResourceStrategy,
+            &GraphEdgeStrategy as &dyn ResourceStrategy,
+        ] {
+            let key = strategy.make_key("tenant", None, &["graph".into(), "element".into()])?;
+            assert!(manager.acquire_with_key(&key, 0).await?);
+            keys.push(key);
+        }
+        let mut generations = Vec::new();
+        for key in &keys {
+            let (_, lease) = manager
+                .store
+                .read_key(key)
+                .await?
+                .context("initial lease")?;
+            assert_eq!(lease.expires_at_ms, 10_000);
+            generations.push(lease.generation);
+        }
+
+        let interval_ms = config.write_lease_renew_interval().as_millis() as i64;
+        // Probe just before each scheduled renewal, including beyond both the
+        // initial resource lifetime and the configured writer TTL. An expired
+        // lease would let this peer acquire it and advance the generation.
+        for tick in 1..=7 {
+            let now_ms = tick * interval_ms;
+            for key in &keys {
+                assert!(
+                    matches!(
+                        manager
+                            .store
+                            .acquire_with_key(key, "peer", now_ms - 1, 10_000)
+                            .await?,
+                        LeaseOutcome::Held { .. }
+                    ),
+                    "{} became takeover-eligible before renewal at {now_ms}ms",
+                    key.resource_type.name()
+                );
+            }
+            assert_eq!(manager.renew_held(now_ms).await?, keys.len());
+            for (key, generation) in keys.iter().zip(&generations) {
+                let (_, lease) = manager
+                    .store
+                    .read_key(key)
+                    .await?
+                    .context("renewed lease")?;
+                assert_eq!(lease.holder_pod, "owner");
+                assert_eq!(
+                    lease.generation, *generation,
+                    "live renewal must preserve the fence"
+                );
+                assert!(!lease.is_expired(now_ms));
+            }
+        }
         Ok(())
     }
 

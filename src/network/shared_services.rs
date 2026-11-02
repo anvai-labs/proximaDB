@@ -2816,12 +2816,13 @@ impl SharedServices {
                     );
                     // P1a: keep held leases warm. Without this the renew loop
                     // never runs in production (it was only spawned in tests),
-                    // so held leases lapse after the 10s TTL and the
+                    // so held leases lapse after their TTL and the
                     // leaseholder model the write-gate (421) + DML locks rely
                     // on silently degrades. Fire-and-forget for the process
                     // lifetime (matches SharedServices' existing background-task
-                    // pattern); interval ≤ lease_ms/2 so a lease never lapses
-                    // between renewals.
+                    // pattern). The config-derived interval is at most half
+                    // the writer TTL and capped at 5s for initially 10s DML
+                    // locks and graph node/edge resource leases.
                     // `spawn_renew_loop` tokio::spawns the loop and returns its
                     // JoinHandle; drop it as a temporary so the task runs detached
                     // (fire-and-forget) without tripping clippy::let_underscore_future.
