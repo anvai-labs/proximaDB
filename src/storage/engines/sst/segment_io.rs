@@ -29,7 +29,10 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use futures::StreamExt as _;
 use proximadb_cache::{L2Class, PersistentByteStore, object_key};
+use proximadb_storage_filesystem_types::read_ranges_plan;
+use proximadb_storage_filesystem_types::read_ranges_prefetch_inflight;
 use proximadb_storage_filesystem_types::{FileSystem, FilesystemError, FsResult};
 
 /// Whole-object fetches are staged in chunks of this size (bounded RAM).
@@ -91,14 +94,49 @@ impl<T: FileSystem + ?Sized> ResidentRangeRead for T {
                 .iter()
                 .all(|range| range.end <= resident.len && range.start <= range.end)
         {
-            let mut out = Vec::with_capacity(ranges.len());
-            for range in &ranges {
-                match resident.range(range.start, range.end - range.start).await {
-                    Some(bytes) => out.push(bytes),
-                    None => return self.read_ranges_prefetch(path, ranges).await,
+            // F1 (SC6 measurement): serve the batch with the SAME plan the
+            // remote path uses — one coalesced physical plan, bounded-
+            // concurrent fetch, identical logical slicing — swapping only the
+            // transport for the resident copy. The previous loop served each
+            // logical range through its own spawn_blocking hop one at a time,
+            // serializing exactly what the cold path issues as parallel waves
+            // (granted warm p50 ~215 ms vs cold ~60 ms at zero GETs).
+            let inflight = read_ranges_prefetch_inflight(path).max(1);
+            let plan = self.plan_read_ranges(&ranges)?;
+            let identity = self.range_coalesce_policy().is_none();
+            let physical: Vec<std::ops::Range<u64>> = plan.physical.clone();
+            let mut fetch = futures::stream::iter(physical.into_iter().map(|range| {
+                let resident = resident.clone();
+                async move { resident.range(range.start, range.end - range.start).await }
+            }))
+            .buffered(inflight);
+            let mut buffers = Vec::with_capacity(plan.physical.len());
+            let mut complete = true;
+            while let Some(item) = fetch.next().await {
+                match item {
+                    Some(bytes) => buffers.push(bytes),
+                    None => {
+                        // A resident miss (eviction/corruption): fall back to
+                        // the remote batch wholesale, dropping in-flight reads.
+                        complete = false;
+                        break;
+                    }
                 }
             }
-            return Ok(out);
+            if complete {
+                if identity {
+                    return Ok(buffers);
+                }
+                return Ok(plan
+                    .mapping
+                    .iter()
+                    .map(|slice| match slice.physical {
+                        Some(idx) => read_ranges_plan::slice_from_physical(&buffers[idx], *slice),
+                        None => Vec::new(),
+                    })
+                    .collect());
+            }
+            return self.read_ranges_prefetch(path, ranges).await;
         }
         self.read_ranges_prefetch(path, ranges).await
     }
@@ -123,6 +161,7 @@ impl<T: FileSystem + ?Sized> ResidentRangeRead for T {
 }
 
 /// A resident whole-object copy of one segment.
+#[derive(Clone)]
 struct Resident {
     store: Arc<PersistentByteStore>,
     key: String,
@@ -697,6 +736,107 @@ mod tests {
         std::fs::create_dir_all(&covered).expect("dirs");
         std::fs::create_dir_all(&other).expect("dirs");
         (covered, other)
+    }
+
+    /// A local fs carrying a range-coalesce policy, so the resident batched
+    /// path exercises bridging + logical slicing (the plain local fs is
+    /// identity-mapped and would not).
+    #[derive(Debug)]
+    struct CoalescingLocalFs {
+        inner: Arc<CountingFileSystem>,
+    }
+    proximadb_storage_filesystem_types::forward_filesystem_impl! {
+        impl FileSystem for CoalescingLocalFs => inner;
+        forward [
+            as_any, filesystem_type, supports_mmap, write,
+            supports_bounded_local_file_write, write_local_file, write_if_absent, append,
+            supports_append, supports_conditional_replace, delete, exists, metadata,
+            create_dir, create_dir_all, copy, move_file, sync, sync_file, sync_data, open_file,
+        ];
+        {
+            async fn read(&self, path: &str) -> FsResult<Vec<u8>> {
+                self.inner.read(path).await
+            }
+
+            async fn read_range(&self, path: &str, offset: u64, length: u64) -> FsResult<Vec<u8>> {
+                self.inner.read_range(path, offset, length).await
+            }
+
+            async fn list(
+                &self,
+                path: &str,
+            ) -> FsResult<Vec<proximadb_storage_filesystem_types::DirEntry>> {
+                self.inner.list(path).await
+            }
+
+            fn range_coalesce_policy(
+                &self,
+            ) -> Option<proximadb_storage_filesystem_types::RangeCoalescePolicy> {
+                Some(proximadb_storage_filesystem_types::RangeCoalescePolicy {
+                    max_gap_bytes: 64 * 1024,
+                    max_merged_bytes: 256 * 1024,
+                })
+            }
+        }
+    }
+
+    /// F1 regression (SC6 measurement): the resident batched-prefetch path
+    /// serves the SAME coalesced physical plan the remote path uses —
+    /// bridging small gaps, slicing logical ranges back out — byte-exactly
+    /// and with zero object-store GETs. The previous implementation served
+    /// each logical range through one spawn_blocking hop at a time,
+    /// serializing what the cold path issues as parallel waves (granted warm
+    /// p50 ~215 ms vs cold ~60 ms at zero GETs). A range beyond the resident
+    /// copy falls back to the remote batch wholesale.
+    #[tokio::test]
+    async fn resident_prefetch_is_coalesced_concurrent_and_byte_exact() {
+        let root = tempfile::tempdir().expect("root");
+        let (covered, _) = dirs(root.path());
+        let _armed = arm(&covered, "f1", 32 << 20);
+        let (fs, counters) = counting_local(root.path()).await;
+        let coalescing = CoalescingLocalFs { inner: fs.clone() };
+        let (path, bytes) = segment(&covered, "L0_f1.pax", 300_000);
+        assert!(warm_object(fs.as_ref(), &path, None).await.expect("warm"));
+
+        // Small gaps bridge under the policy; a gap beyond max_gap does not.
+        let ranges: Vec<std::ops::Range<u64>> = vec![0..1_000, 2_000..3_000, 150_000..151_000];
+        let plan = coalescing.plan_read_ranges(&ranges).expect("plan");
+        assert!(
+            plan.physical.len() < ranges.len(),
+            "coalescing active: {} physical for {} logical",
+            plan.physical.len(),
+            ranges.len()
+        );
+
+        let before = counters.total_gets();
+        let out = coalescing
+            .read_ranges_prefetch_resident(&path, ranges.clone())
+            .await
+            .expect("resident batch");
+        assert_eq!(counters.total_gets(), before, "zero remote GETs");
+        for (slice, range) in out.iter().zip(&ranges) {
+            let start = range.start as usize;
+            let end = range.end as usize;
+            assert_eq!(slice, &bytes[start..end], "logical slice {range:?}");
+        }
+
+        // A range past the resident copy falls back to the remote batch
+        // wholesale — remote GETs return, results stay byte-exact.
+        let mut beyond = ranges.clone();
+        beyond.push(400_000..401_000);
+        let out = coalescing
+            .read_ranges_prefetch_resident(&path, beyond.clone())
+            .await
+            .expect("fallback batch");
+        assert!(
+            counters.total_gets() > before,
+            "the fallback reads remotely"
+        );
+        for (slice, range) in out.iter().zip(&beyond) {
+            let start = std::cmp::min(range.start as usize, bytes.len());
+            let end = std::cmp::min(range.end as usize, bytes.len());
+            assert_eq!(slice, &bytes[start..end], "fallback slice {range:?}");
+        }
     }
 
     /// The SC4-4 core: a covered segment, once resident, is read — single
