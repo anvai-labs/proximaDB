@@ -1,0 +1,44 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= PAX Region E filter columns — measured (PR #2312, in v0.5.1; writer default-OFF)
+
+Bench: the 3M SIFT128 `category=3` bed, same binary family as the #2303 gate; the Region-D
+arm is the same build with the read gate off (`PROXIMADB_PAX_READ_FILTER_REGION=0`), the
+Region-E arm reads footer section 8. Writer gate `PROXIMADB_PAX_WRITE_FILTER_REGION` is
+default-OFF in v0.5.1 — these arms ran with it armed. Numbers transcribed from the PR's
+bench section (raw run logs local to the PR session; not checked in — disclosed).
+
+== object_cold, filtered `category=3`
+
+| Metric | Region D (read gate off) | Region E |
+|---|---|---|
+| recall@10 | 0.9786 | **0.9786** |
+| GET/q | 240.2 | **74.2** (−69%) |
+| MB/q | 769 | **196** (−75%) |
+| $/M queries (requests) | 101.1 | **34.7** (−66%) |
+| p50 / p95 | 1379 / 1546 ms | **448 / 710 ms** |
+| Stage F fetch / decode (mean ms/q) | 909 / 786 | **44.5 / 11.9** |
+
+Warm phases show the same shape: local_disk_warm p50 1499 → 691 ms; post_write
+1637 → 859 ms. Recall is identical in every phase.
+
+Other arms, same bed and binary: `half=0` (1-bit column) recall 0.9750, 71.5 GET/q,
+p50 394 ms; unfiltered recall 0.9737, 55.6 GET/q — Region E is never read unfiltered.
+
+== Reading
+
+* The read cost collapses to header + footer + one GET per referenced filter column — the
+  row-decode work (Region D's dominant term) disappears for filtered queries that Region E
+  can answer.
+* Exactness is pinned by the 57-filter oracle test (allow-set == full-row Stage F across
+  every operator, null literals, `Not` over absent fields, multi-field And/Or/Not,
+  `Between` with lo > hi, and the typed/untyped/wrong-typed/NaN/non-round-tripping float
+  column shapes); fallback covers fields Region E does not carry; a malformed or
+  future-version section reads as absent, never fails the footer.
+
+== Limitations
+
+n=1 per arm, single-host emulator, transcribed-from-PR provenance as disclosed. The
+shipped v0.5.1 default is writer-OFF (mandate #8: default-OFF until baked) — these numbers
+describe the armed arms, not a default-on posture; the flip-on decision is TD-FPRUNE-1's to
+make on its own gate.

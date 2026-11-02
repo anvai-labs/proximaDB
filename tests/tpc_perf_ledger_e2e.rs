@@ -1504,6 +1504,38 @@ impl PhaseMeter {
     }
 }
 
+/// P2.4 bound enforcement (ledger id `p24_sf1_bounded_memory_load`): the load
+/// phases' recorded cgroup peaks must stay within the finite cgroup the
+/// preflight required. "Bounded" until now meant only "the run refused to
+/// start unisolated and the peaks were recorded" — an unbounded regression
+/// would OOM (or thrash to MemoryHigh) in a manual run and fail nothing
+/// automated. This turns the recorded numbers into the assertion: any phase
+/// peak at or over the limit, or a load phase with NO recorded peak when a
+/// cgroup limit exists, fails the run that produced it. The harness stays
+/// `#[ignore]` (advisory, manual, cgroup-gated) — the ratchet fires wherever
+/// the harness is run, which is wherever its numbers are cited from.
+fn enforce_load_peaks_within_cgroup(load_stats: &[LoadStats], limit_mib: Option<u64>) {
+    let Some(limit) = limit_mib else { return };
+    for stats in load_stats {
+        for phase in &stats.memory {
+            match phase.cgroup_peak_mib {
+                Some(peak) => assert!(
+                    peak <= limit,
+                    "P2.4 bound violated: phase {} peaked at {peak} MiB against the cgroup \
+                     limit {limit} MiB — the load is no longer bounded; the cited ledger \
+                     claim is stale",
+                    phase.phase
+                ),
+                None => panic!(
+                    "P2.4 bound unverifiable: phase {} recorded no cgroup peak although a \
+                     {limit} MiB limit exists — fix the capture before citing the claim",
+                    phase.phase
+                ),
+            }
+        }
+    }
+}
+
 /// Run one query: clear the capture, time the client round-trip, drain the
 /// per-query billing snapshot (the observer fires server-side at scope close,
 /// so poll briefly for it).
@@ -2268,6 +2300,7 @@ async fn tpc_perf_ledger_inner() {
         .await;
         load_stats.push(tpcds_stats);
         server.shutdown().await;
+        enforce_load_peaks_within_cgroup(&load_stats, preflight.cgroup_limit_mib);
         #[cfg(not(feature = "duckdb"))]
         if !load_only() {
             run_duckdb_baseline(
