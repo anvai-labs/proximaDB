@@ -796,7 +796,6 @@ struct Portal {
     execution_state: Option<PortalExecutionState>,
 }
 
-/// Cached execution state for a portal.
 /// Outcome of [`PostgresProtocol::execute_portal_fast_paths`].
 enum PortalFastPathOutcome {
     /// A fast path claimed the Execute and fully served it.
@@ -806,6 +805,7 @@ enum PortalFastPathOutcome {
     Declined,
 }
 
+/// Cached execution state for a portal.
 struct PortalExecutionState {
     result: ExecutionPipelineResult,
     next_row: usize,
@@ -3039,25 +3039,28 @@ impl PostgresProtocol {
         Self::strip_sql_literal(value)
     }
 
-    /// Execute a translated query
+    /// Execute a translated query.
+    ///
+    /// E0 (TD-PGPORTAL-1 follow-up): the rate-limit check lives in the TWO
+    /// metered entry points — here (every simple-protocol statement) and
+    /// `execute_portal_query` (every budgeted Execute that runs a query) — so
+    /// each query pays exactly once regardless of which path serves it: a
+    /// Declined budgeted Execute falls through to
+    /// `execute_query_with_controls` UNMETERED (see its comment).
     async fn execute_query(&mut self, query: &str) -> Result<()> {
+        if self.check_pgwire_rate_limit().await? {
+            return Ok(());
+        }
         self.execute_query_with_controls(query, ExecutionControls::default())
             .await
     }
 
-    /// Execute a translated query with request-scoped execution controls.
-    ///
-    /// E0 (in-process edge — `IN_PROCESS_EDGE_COLLAPSE_HLD_2026_06_19`): every
-    /// pgwire query is scoped in a per-query `io_trace` span with tenant
-    /// attribution, so the pgwire surface emits the *same* per-query I/O trace
-    /// (object-store GETs/bytes, footer-cache outcomes, engine-ms) as REST/gRPC
-    /// — closing the consistency gap where pgwire bypassed the edge middleware
-    /// entirely. The tenant is the one already resolved for read routing
-    /// (TD-064); no new identity source is introduced. The wrapper is a thin
-    /// scope around the unchanged body in `_inner`.
-    /// E0 (TD-PGPORTAL-1 follow-up): the SAME converged rate-limit check
-    /// `execute_query_with_controls` runs, factored out for the portal fast
-    /// paths. Returns `true` when the query was REFUSED (53400 already sent).
+    /// E0 (TD-PGPORTAL-1 follow-up): the converged rate-limit check (the SAME
+    /// `RateLimitState` REST uses). Called by the two metered entry points —
+    /// `execute_query` and `execute_portal_query` — NEVER by
+    /// `execute_query_with_controls` itself (the Declined-portal fall-through
+    /// reaches it already metered; a check there would double-charge budgeted
+    /// Executes). Returns `true` when the query was REFUSED (53400 sent).
     async fn check_pgwire_rate_limit(&mut self) -> Result<bool> {
         if let Some(limiter) = self.rate_limiter.clone()
             && limiter.enabled()
@@ -3074,6 +3077,21 @@ impl PostgresProtocol {
         Ok(false)
     }
 
+    /// Execute a translated query with request-scoped execution controls.
+    ///
+    /// E0 (in-process edge — `IN_PROCESS_EDGE_COLLAPSE_HLD_2026_06_19`): every
+    /// pgwire query is scoped in a per-query `io_trace` span with tenant
+    /// attribution, so the pgwire surface emits the *same* per-query I/O trace
+    /// (object-store GETs/bytes, footer-cache outcomes, engine-ms) as REST/gRPC
+    /// — closing the consistency gap where pgwire bypassed the edge middleware
+    /// entirely. The tenant is the one already resolved for read routing
+    /// (TD-064); no new identity source is introduced. The wrapper is a thin
+    /// scope around the unchanged body in `_inner`.
+    ///
+    /// E0 rate-limiting is deliberately ABSENT here (TD-PGPORTAL-1 follow-up):
+    /// the two callers are the metered entry points, and the Declined-portal
+    /// fall-through arrives already metered — a check here would
+    /// double-charge budgeted Executes.
     async fn execute_query_with_controls(
         &mut self,
         query: &str,
@@ -3082,21 +3100,6 @@ impl PostgresProtocol {
         let cancellation_flag = self.session.read().await.cancellation_flag.clone();
         cancellation_flag.store(false, Ordering::Relaxed);
         controls.cancellation_flag = Some(cancellation_flag);
-        // E0 rate-limiting: reject over-quota queries up front with a pgwire
-        // error, using the SAME converged RateLimitState check REST uses (no
-        // duplicate limiter). No-op when unset/disabled.
-        if let Some(limiter) = self.rate_limiter.clone()
-            && limiter.enabled()
-            && let Err(retry_after) = limiter.check_and_consume(self.peer_ip).await
-        {
-            return self
-                .send_error(
-                    "ERROR",
-                    "53400",
-                    &format!("rate limit exceeded; retry after {retry_after}s"),
-                )
-                .await;
-        }
         let tenant = self.pgwire_resolve_read_tenant().await;
         // E0 (edge consistency): give every pgwire query a request-id correlation
         // scope — matching REST's request_id middleware — so logs and error
@@ -7854,11 +7857,10 @@ impl PostgresProtocol {
                 self.send_command_complete("SELECT 0").await?;
                 return Ok(PortalFastPathOutcome::Handled);
             }
-            // Cancellation parity (review finding 3): arm the flag for
-            // the fetch and honor it before serving pages. The io_trace
-            // span and the E0 rate limiter remain uncovered on this fast
-            // path — the SAME documented debt the pipeline fast-path
-            // carries a few lines up; tracked on the TD, not dropped.
+            // Cancellation parity (review finding 3): arm the flag for the
+            // fetch and honor it before serving pages. (The rate limiter and
+            // io_trace span are the CALLER's governance wrapper — both fast
+            // paths run inside it.)
             let cancellation_flag = self.session.read().await.cancellation_flag.clone();
             cancellation_flag.store(false, Ordering::Relaxed);
             let outcome = match self

@@ -423,16 +423,31 @@ async fn execute_max_rows_pages_the_legacy_reader_e2e() {
 async fn budgeted_portal_selects_are_rate_limited_e2e() {
     use tokio::io::AsyncWriteExt;
 
-    // SAFETY: nextest runs this test in a dedicated process, and the server
-    // (the only env reader) is built strictly after this line — no thread
-    // reads the environment concurrently. Same pattern the atomic-commit
-    // harness uses for its fault gate.
+    // The pgwire-accuracy CI lane runs this file as ONE shared process with
+    // --test-threads=1 (the exact mode that bit the atomic-commit fault env),
+    // so the variable MUST NOT outlive this test: every later test boots its
+    // own server, and a leaked RPM=3 would 53400 them all. The guard removes
+    // it on drop — including on assert-panic (unwind) — before the next
+    // test's server is constructed.
+    struct ScopedEnv(&'static str);
+    impl Drop for ScopedEnv {
+        fn drop(&mut self) {
+            // SAFETY: runs at test end, before the NEXT test's server exists;
+            // within this test, the only env readers are server threads built
+            // after the set and torn down before the drop.
+            unsafe { std::env::remove_var(self.0) };
+        }
+    }
+    // SAFETY (the set itself): the server (the only env reader) is built
+    // strictly after this line; same pattern the atomic-commit harness uses
+    // for its fault gate.
+    let _scoped = ScopedEnv("PROXIMADB_PGWIRE_RATE_LIMIT_RPM");
+    unsafe { std::env::set_var("PROXIMADB_PGWIRE_RATE_LIMIT_RPM", "3") };
     //
     // Quota arithmetic: the limiter meters EVERY statement (DDL included) —
     // seed = CREATE + INSERT = 2 tokens, the first simple SELECT = token 3.
     // RPM=3 leaves both proof arms over quota. (The tokio-postgres handshake
     // consumes none: with RPM=3 the CREATE below is the first metered call.)
-    unsafe { std::env::set_var("PROXIMADB_PGWIRE_RATE_LIMIT_RPM", "3") };
     let server = PgServer::start().await.expect("server start");
     let client = connect(&server).await;
     seed(&client).await;
