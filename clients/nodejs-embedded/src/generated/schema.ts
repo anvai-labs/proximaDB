@@ -2567,6 +2567,11 @@ export interface components {
              *     Desired, not observed: an account lifecycle rule may move objects.
              */
             default_access_tier?: string | null;
+            /**
+             * @description Reservation pool the PERFORMANCE grant charges (TD-TIER-1 SC6);
+             *     omitted when the default pool applies.
+             */
+            pool_id?: string | null;
             schema?: null | components["schemas"]["SchemaDefinition"];
             /** @description Collection statistics */
             stats: components["schemas"]["CollectionStatsV2"];
@@ -2734,6 +2739,13 @@ export interface components {
              *     set, a tier can be changed but not cleared back to the default.
              */
             default_access_tier?: string | null;
+            /**
+             * @description TD-TIER-1 SC6 policy seam: the reservation pool this PERFORMANCE
+             *     collection's grant charges ("pool_id" in [storage.reservation_pools]);
+             *     omitted ⇒ the configured default pool. Unknown ids are refused at
+             *     admission with the configured ids listed.
+             */
+            pool_id?: string | null;
         };
         /** @description Response for collection creation */
         CreateCollectionV2Response: {

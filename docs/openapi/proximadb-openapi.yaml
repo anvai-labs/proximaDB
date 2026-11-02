@@ -5209,6 +5209,13 @@ components:
             Desired access tier for future segment writes (TD-TIER-1 SC5):
             "hot" | "cool" | "cold"; omitted when unset (the account default).
             Desired, not observed: an account lifecycle rule may move objects.
+        pool_id:
+          type:
+          - string
+          - 'null'
+          description: |-
+            Reservation pool the PERFORMANCE grant charges (TD-TIER-1 SC6);
+            omitted when the default pool applies.
         schema:
           oneOf:
           - type: 'null'
@@ -5455,6 +5462,15 @@ components:
             before a cool/cold tier's minimum storage duration. Existing objects
             are not rewritten; control objects keep the account default. Once
             set, a tier can be changed but not cleared back to the default.
+        pool_id:
+          type:
+          - string
+          - 'null'
+          description: |-
+            TD-TIER-1 SC6 policy seam: the reservation pool this PERFORMANCE
+            collection's grant charges ("pool_id" in [storage.reservation_pools]);
+            omitted ⇒ the configured default pool. Unknown ids are refused at
+            admission with the configured ids listed.
       additionalProperties: false
     CreateCollectionV2Response:
       type: object
