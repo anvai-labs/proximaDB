@@ -107,10 +107,6 @@ impl Default for QueryParser {
 
 // --- Nom Parser Combinators ---
 
-fn identifier(input: &str) -> IResult<&str, String> {
-    lexemes::identifier(input)
-}
-
 fn any_identifier(input: &str) -> IResult<&str, String> {
     lexemes::any_identifier(input)
 }
@@ -177,12 +173,17 @@ fn parse_edge_direction_right(input: &str) -> IResult<&str, bool> {
 fn parse_edge_spec(input: &str) -> IResult<&str, EdgeSpec> {
     map(
         tuple((
-            opt(identifier),                          // Optional variable
-            opt(preceded(char(':'), identifier)),     // Optional edge type
+            opt(any_identifier), // Optional variable
+            // Edge types with ALTERNATION :KNOWS|LIKES (the modality
+            // grammar's shape — the full list kept; previously single)
+            opt(preceded(
+                char(':'),
+                separated_list1(char('|'), any_identifier),
+            )),
             opt(preceded(multispace0, property_map)), // Optional properties
         )),
-        |(variable_opt, edge_type_opt, properties_opt)| {
-            let edge_types = edge_type_opt.map(|t| vec![t]).unwrap_or_default();
+        |(variable_opt, edge_types_opt, properties_opt)| {
+            let edge_types = edge_types_opt.unwrap_or_default();
             let properties = properties_opt.unwrap_or_default();
             (variable_opt, edge_types, properties)
         },
@@ -527,8 +528,12 @@ fn parse_where_property_condition(input: &str) -> IResult<&str, WhereClause> {
                     "<=" => PropertyConstraint::LessOrEqual(value),
                     "!=" | "<>" => PropertyConstraint::NotEquals(value),
                     "=~" => match value {
+                        // Regex applies to string RHS; a non-string RHS
+                        // falls back to Equals — the modality grammar's
+                        // behavior (review R2-F2: Regex(other.to_string())
+                        // silently diverged on e.g. n.age =~ 30).
                         serde_json::Value::String(re) => PropertyConstraint::Regex(re),
-                        other => PropertyConstraint::Regex(other.to_string()),
+                        other => PropertyConstraint::Equals(other),
                     },
                     _ => PropertyConstraint::Equals(value),
                 },
@@ -552,7 +557,10 @@ fn parse_comparison_op(input: &str) -> IResult<&str, &str> {
 
 // Parse WHERE clause
 fn parse_where_clause(input: &str) -> IResult<&str, WhereClause> {
-    preceded(tag("WHERE"), preceded(multispace1, parse_where_condition))(input)
+    preceded(
+        tag_no_case("WHERE"),
+        preceded(multispace1, parse_where_condition),
+    )(input)
 }
 
 // Parse aggregation functions
@@ -597,7 +605,7 @@ fn parse_aggregation(input: &str) -> IResult<&str, PropertyProjection> {
                     char('('),
                     delimited(
                         multispace0,
-                        separated_pair(identifier, char('.'), identifier),
+                        separated_pair(any_identifier, char('.'), any_identifier),
                         multispace0,
                     ),
                     char(')'),
@@ -616,7 +624,7 @@ fn parse_aggregation(input: &str) -> IResult<&str, PropertyProjection> {
                     char('('),
                     delimited(
                         multispace0,
-                        separated_pair(identifier, char('.'), identifier),
+                        separated_pair(any_identifier, char('.'), any_identifier),
                         multispace0,
                     ),
                     char(')'),
@@ -635,7 +643,7 @@ fn parse_aggregation(input: &str) -> IResult<&str, PropertyProjection> {
                     char('('),
                     delimited(
                         multispace0,
-                        separated_pair(identifier, char('.'), identifier),
+                        separated_pair(any_identifier, char('.'), any_identifier),
                         multispace0,
                     ),
                     char(')'),
@@ -654,7 +662,7 @@ fn parse_aggregation(input: &str) -> IResult<&str, PropertyProjection> {
                     char('('),
                     delimited(
                         multispace0,
-                        separated_pair(identifier, char('.'), identifier),
+                        separated_pair(any_identifier, char('.'), any_identifier),
                         multispace0,
                     ),
                     char(')'),
@@ -671,7 +679,7 @@ fn parse_aggregation(input: &str) -> IResult<&str, PropertyProjection> {
 // Parse a MATCH clause with support for both nodes and edge patterns
 fn parse_match_clause(input: &str) -> IResult<&str, (Vec<NodePattern>, Vec<EdgePattern>)> {
     preceded(
-        tag("MATCH"),
+        tag_no_case("MATCH"),
         preceded(
             multispace1,
             map(
@@ -707,7 +715,7 @@ fn parse_return_item(input: &str) -> IResult<&str, (String, PropertyProjection)>
                 parse_aggregation,
                 opt(preceded(
                     delimited(multispace1, tag_no_case("AS"), multispace1),
-                    identifier,
+                    any_identifier,
                 )),
             )),
             |(agg, alias_opt)| {
@@ -725,12 +733,12 @@ fn parse_return_item(input: &str) -> IResult<&str, (String, PropertyProjection)>
         // Property projection (variable.property AS alias)
         map(
             tuple((
-                identifier,
+                any_identifier,
                 char('.'),
-                identifier,
+                any_identifier,
                 opt(preceded(
                     delimited(multispace1, tag_no_case("AS"), multispace1),
-                    identifier,
+                    any_identifier,
                 )),
             )),
             |(var, _, prop, alias_opt)| {
@@ -749,10 +757,10 @@ fn parse_return_item(input: &str) -> IResult<&str, (String, PropertyProjection)>
         // property/aggregation arms carried AS)
         map(
             tuple((
-                identifier,
+                any_identifier,
                 opt(preceded(
                     delimited(multispace1, tag_no_case("AS"), multispace1),
-                    identifier,
+                    any_identifier,
                 )),
             )),
             |(var, alias_opt)| {
@@ -765,7 +773,9 @@ fn parse_return_item(input: &str) -> IResult<&str, (String, PropertyProjection)>
 
 // Parse DISTINCT keyword
 fn parse_distinct(input: &str) -> IResult<&str, bool> {
-    map(opt(preceded(multispace1, tag("DISTINCT"))), |d| d.is_some())(input)
+    map(opt(preceded(multispace1, tag_no_case("DISTINCT"))), |d| {
+        d.is_some()
+    })(input)
 }
 
 // Parse ORDER BY clause
@@ -780,7 +790,7 @@ fn parse_order_by(input: &str) -> IResult<&str, Vec<(String, bool)>> {
                     delimited(multispace0, char(','), multispace0),
                     map(
                         tuple((
-                            identifier,
+                            any_identifier,
                             opt(preceded(
                                 multispace1,
                                 alt((map(tag("ASC"), |_| true), map(tag("DESC"), |_| false))),
@@ -797,7 +807,7 @@ fn parse_order_by(input: &str) -> IResult<&str, Vec<(String, bool)>> {
 // Parse LIMIT clause
 fn parse_limit(input: &str) -> IResult<&str, usize> {
     preceded(
-        delimited(multispace1, tag("LIMIT"), multispace1),
+        delimited(multispace1, tag_no_case("LIMIT"), multispace1),
         map_res(digit1, |s: &str| s.parse::<usize>()),
     )(input)
 }
@@ -805,7 +815,7 @@ fn parse_limit(input: &str) -> IResult<&str, usize> {
 // Parse SKIP clause
 fn parse_skip(input: &str) -> IResult<&str, usize> {
     preceded(
-        delimited(multispace1, tag("SKIP"), multispace1),
+        delimited(multispace1, tag_no_case("SKIP"), multispace1),
         map_res(digit1, |s: &str| s.parse::<usize>()),
     )(input)
 }
@@ -813,7 +823,7 @@ fn parse_skip(input: &str) -> IResult<&str, usize> {
 // Parse enhanced RETURN clause
 fn parse_return_clause(input: &str) -> IResult<&str, ReturnSpec> {
     preceded(
-        tag("RETURN"),
+        tag_no_case("RETURN"),
         map(
             tuple((
                 parse_distinct,

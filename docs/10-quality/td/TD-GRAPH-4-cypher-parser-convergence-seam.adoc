@@ -5,7 +5,7 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | **Open (seam extracted 2026-11-01; corpus pin landed 2026-11-01; steps 1-2 landed 2026-11-02; step-3 prerequisite landed same day in two review passes, corpus 41→54; clause-by-clause port unblocked).**
+| Status | **Open (seam extracted 2026-11-01; corpus pin landed 2026-11-01; steps 1-2 landed 2026-11-02; step-3 prerequisite landed same day in THREE review passes, corpus 41→58; clause-by-clause port unblocked — keep probing at the port).**
 | Priority | P2 — two live nom-based Cypher grammars with 34 shared function names and drifted bodies is the standard fork disease; every parser fix must currently land twice or silently miss one path.
 | Relates to | link:TD-GRAPH-3-cypher-variable-length-multihop.adoc[TD-GRAPH-3] (variable-length parsing), the 2026-10-31 victor clone-scan dedup program (wave 3)
 | Component | `crates/query/proximadb-graph-query/src/parser/` (read path + `write_seam.rs`), `crates/modalities/proximadb-graph/src/cypher_parser.rs` (the graph-API grammar), `src/query/parsers/cypher.rs` + `src/graph/query/graph_parser.rs` (its consumers).
@@ -61,13 +61,25 @@ drifted twin.
    operands), case-insensitive `as`/AND/OR/NOT, permissive node-pattern
    spacing, and write-path multi-label CREATE (which had left the seam
    internally inconsistent: MERGE multi-label parsed, CREATE did not).
-   The corpus was DELIBERATELY EXTENDED 41 → 54 (reviewed pin updates)
-   so every newly-shared shape is differentially pinned. KNOWN
-   BOTH-reject shapes (kept out of the corpus by construction): ORDER BY
-   over properties, UNION, UNWIND, FOREACH, CALL, COUNT(n),
-   COUNT(DISTINCT n.name). The blind-spot ledger now claims exactly what
-   the pins show — the clause-by-clause port (modality parser reduces to
-   a conversion layer over the seam's AST) is unblocked.   modality file reduces to the conversion layer.
+   ROUND 2 then falsified pass 2's own completeness claim and its list
+   was landed too: backtick identifiers EVERYWHERE (RETURN/ORDER BY
+   projection paths, all write-clause operands), edge-type ALTERNATION
+   (`-[r:KNOWS|LIKES]->`, full list kept on the read path, first-type on
+   CREATE), clause-keyword case-insensitivity (match/return/where/
+   create/set/remove/merge/on/with/distinct/limit), permissive spacing in
+   the CREATE node spec, and `=~` with a NON-STRING RHS falls back to
+   Equals (the modality's behavior — round 2 caught the new arm silently
+   producing Regex("30") where the modality produces Equals(30); now
+   pinned by a corpus entry). The corpus was DELIBERATELY EXTENDED
+   41 → 58 (reviewed pin updates across three passes) so every
+   newly-shared shape is differentially pinned. KNOWN BOTH-reject shapes
+   (kept out of the corpus by construction): ORDER BY over properties,
+   UNION, UNWIND, FOREACH, CALL, COUNT(n), COUNT(DISTINCT n.name).
+   KNOWN UNPINNED divergence (disclosed, must be decided at the port):
+   mixed-operator chains nest differently (seam tiered precedence vs
+   modality flat left-assoc). The completeness claim is scoped to the
+   PROBED battery — three review rounds have each falsified the
+   previous one, so the port itself must keep probing.   modality file reduces to the conversion layer.
 
    _Widened-behavior ledger (recorded per the step-1 review — tracked
    decisions, not accidents of superset adoption):_
@@ -114,15 +126,16 @@ drifted twin.
    `Serialize` impls buffer through maps with process-varying iteration order, so raw
    `to_string` is NOT a stable pin).
 +
-   _Pin blind spots (deliberate, disclosed):_ the corpus is the BOTH-grammar intersection.
-   Constructs only the MODALITY grammar accepts — float/array/null literals, `WHERE ... IN`,
-   multi-label `:A:B`, `WITH n AS x` aliasing, `COUNT(DISTINCT n)` — are structurally outside this pin, so the
-   convergence design MUST extend the seam grammar to cover them BEFORE any replacement of the
-   modality grammar (otherwise those constructs silently drop while the pin stays green).
-   Constructs BOTH grammars reject (ORDER BY over a property such as `n.name`,
-   UNION, UNWIND, FOREACH, CALL, `COUNT(n)` — the seam's AST has no bare-variable
-   count) are absent from both ASTs' parsed output today despite AST fields
-   existing for several — a shared gap, not a divergence. `COUNT(DISTINCT n)` is
+   _Pin blind spots (deliberate, disclosed):_ the corpus is the BOTH-grammar intersection and
+   CANNOT protect modality-only shapes (they cannot enter it). The modality-only ledger is
+   maintained in §2 by PROBING, not guessing — round-2 review falsified two earlier
+   completeness claims, and its final state is recorded there. Constructs BOTH grammars
+   reject (ORDER BY over a property, UNION, UNWIND, aggregations other than SUM, FOREACH,
+   CALL, `COUNT(n)`) are absent from both ASTs' parsed output today despite AST fields
+   existing for several — a shared gap, not a divergence. KNOWN UNPINNED divergence:
+   mixed-operator chains (`a XOR b AND c`) nest differently on the two grammars (seam
+   tiered precedence vs modality flat left-assoc) — the clause port must pick a
+   precedence deliberately and pin it. `COUNT(DISTINCT n)` is
    modality-only today and joins the modality-only list above. Probe discipline
    for these lists: the seam parser does NOT require eof, so acceptance means
    full consumption (`rest` empty), never a bare `Ok`.

@@ -17,9 +17,9 @@
 //! runtime-minted identifiers (node `id`, edge `from`/`to`) are elided —
 //! fresh UUIDs per parse are not grammar behavior.
 //!
-//! Corpus EXTENDED twice in TD-GRAPH-4 step 3 (deliberate, reviewed pin
+//! Corpus EXTENDED in TD-GRAPH-4 step 3 (deliberate, reviewed pin
 //! updates): 41→45 (the seam gained IN / multi-label / WITH-AS /
-//! COUNT(DISTINCT n)), then 45→54 after round-1 review proved the
+//! COUNT(DISTINCT n)), then 45→54 (round-1 review) and 54→58 (round-2) proved the
 //! "no modality-only constructs remain" claim premature — the seam also
 //! gained CONTAINS / STARTS WITH / ENDS WITH, IS [NOT] NULL, <> and =~,
 //! XOR, backtick-quoted identifiers everywhere (vars, labels, WHERE
@@ -31,16 +31,13 @@
 //!
 //! Coverage note: entries are the BOTH-grammar intersection (full input
 //! consumed on both sides — the seam parser does NOT require eof, so an
-//! `Ok` with stranded remainder is a REJECTION here). Aggregations
-//! SUM/AVG/MIN/MAX/COUNT(*) and ORDER BY over a bare variable (with DESC)
-//! are both-accepted and pinned. Constructs only the modality grammar
-//! accepts (float/array/null literals, `IN`, multi-label `:A:B`,
-//! `WITH n AS x` aliasing, `COUNT(DISTINCT n)`) are structurally OUTSIDE
-//! this pin — the seam must gain them before any replacement of the
-//! modality grammar (a convergence-design requirement, recorded in
-//! TD-GRAPH-4 §3). Constructs BOTH reject (ORDER BY over a property like
-//! `n.name`, UNION, UNWIND, FOREACH, CALL, `COUNT(n)` — the seam's AST has
-//! no bare-variable count) are likewise absent.
+//! `Ok` with stranded remainder is a REJECTION here). The corpus does
+//! NOT protect modality-only shapes (they cannot enter it); the honest
+//! remaining modality-only list lives in TD-GRAPH-4 §2 and is probed,
+//! not guessed. Round-2 review note: mixed-operator chains (a XOR b AND
+//! c) parse on both grammars but NEST differently (seam tiered
+//! precedence vs modality flat left-assoc) — the convergence port must
+//! pick a precedence deliberately; no corpus entry pins this yet.
 //!
 //! To regenerate after a DELIBERATE behavior change, print the rebuilt
 //! snapshot from the corpus (same canonicalization), diff it against
@@ -196,6 +193,19 @@ const CORPUS: &[(&str, &str)] = &[
     ("read_quoted_label", "MATCH (n:`My Label`) RETURN n"),
     ("with_var_alias_lower", "MATCH (n) WITH n as x RETURN x"),
     ("write_multi_label", "CREATE (n:A:B {k: 1})"),
+    (
+        "read_edge_alternation",
+        "MATCH (n)-[r:KNOWS|LIKES]->(m) RETURN n",
+    ),
+    ("return_quoted_path", "MATCH (n) RETURN `n`.`name`"),
+    (
+        "keywords_lowercase",
+        "match (n) where n.age > 5 and n.x = 1 return n",
+    ),
+    (
+        "where_regex_nonstring",
+        "MATCH (n) WHERE n.age =~ 30 RETURN n",
+    ),
 ];
 
 /// The frozen clause-level behavior of both grammars over {CORPUS}.
@@ -417,6 +427,22 @@ S: {"reading_clauses":[{"Match":{"optional":false,"pattern":{"edges":[],"nodes":
 Q: CREATE (n:A:B {k: 1})
 M: {"clauses":[],"reading_clauses":[],"return_spec":null,"union_clauses":[],"updating_clauses":[{"Create":{"edges":[],"nodes":[{"labels":["A","B"],"properties":{"k":1},"variable":"n"}]}}],"with_clauses":[]}
 S: {"reading_clauses":[],"return_spec":null,"union_clauses":[],"updating_clauses":[{"Create":{"edges":[],"nodes":[{"labels":["A","B"],"properties":{"k":1},"variable":"n"}]}}],"with_clauses":[]}
+=== read_edge_alternation
+Q: MATCH (n)-[r:KNOWS|LIKES]->(m) RETURN n
+M: {"clauses":[],"reading_clauses":[{"Match":{"optional":false,"pattern":{"edges":[{"direction":"Outgoing","edge_types":["KNOWS","LIKES"],"from_variable":"n","label":"KNOWS","optional":false,"properties":{},"to_variable":"m","variable":"r"}],"nodes":[{"label":null,"labels":[],"optional":false,"properties":{},"variable":"n"},{"label":null,"labels":[],"optional":false,"properties":{},"variable":"m"}],"paths":[],"where_clause":null,"where_clauses":[],"with_clauses":[]}}}],"return_spec":{"distinct":false,"items":["n"],"limit":null,"order_by":[],"projections":[{"Variable":"n"}],"skip":null,"variables":["n"]},"union_clauses":[],"updating_clauses":[],"with_clauses":[]}
+S: {"reading_clauses":[{"Match":{"optional":false,"pattern":{"edges":[{"direction":"Outgoing","edge_types":["KNOWS","LIKES"],"from_variable":"n","optional":false,"properties":{},"to_variable":"m","var_length":null,"variable":"r"}],"nodes":[{"labels":[],"optional":false,"properties":{},"variable":"n"},{"labels":[],"optional":false,"properties":{},"variable":"m"}],"paths":[],"where_clause":null}}}],"return_spec":{"distinct":false,"limit":null,"order_by":[],"projections":[{"Variable":"n"}],"skip":null,"variables":["n"]},"union_clauses":[],"updating_clauses":[],"with_clauses":[]}
+=== return_quoted_path
+Q: MATCH (n) RETURN `n`.`name`
+M: {"clauses":[],"reading_clauses":[{"Match":{"optional":false,"pattern":{"edges":[],"nodes":[{"label":null,"labels":[],"optional":false,"properties":{},"variable":"n"}],"paths":[],"where_clause":null,"where_clauses":[],"with_clauses":[]}}}],"return_spec":{"distinct":false,"items":["n.name"],"limit":null,"order_by":[],"projections":[{"Property":{"property":"name","variable":"n"}}],"skip":null,"variables":["n.name"]},"union_clauses":[],"updating_clauses":[],"with_clauses":[]}
+S: {"reading_clauses":[{"Match":{"optional":false,"pattern":{"edges":[],"nodes":[{"labels":[],"optional":false,"properties":{},"variable":"n"}],"paths":[],"where_clause":null}}}],"return_spec":{"distinct":false,"limit":null,"order_by":[],"projections":[{"Property":{"property":"name","variable":"n"}}],"skip":null,"variables":["n.name"]},"union_clauses":[],"updating_clauses":[],"with_clauses":[]}
+=== keywords_lowercase
+Q: match (n) where n.age > 5 and n.x = 1 return n
+M: {"clauses":[],"reading_clauses":[{"Match":{"optional":false,"pattern":{"edges":[],"nodes":[{"label":null,"labels":[],"optional":false,"properties":{},"variable":"n"}],"paths":[],"where_clause":{"And":[{"Property":{"constraint":{"GreaterThan":5},"property":"age","variable":"n"}},{"Property":{"constraint":{"Equals":1},"property":"x","variable":"n"}}]},"where_clauses":[],"with_clauses":[]}}}],"return_spec":{"distinct":false,"items":["n"],"limit":null,"order_by":[],"projections":[{"Variable":"n"}],"skip":null,"variables":["n"]},"union_clauses":[],"updating_clauses":[],"with_clauses":[]}
+S: {"reading_clauses":[{"Match":{"optional":false,"pattern":{"edges":[],"nodes":[{"labels":[],"optional":false,"properties":{},"variable":"n"}],"paths":[],"where_clause":{"And":[{"Property":{"constraint":{"GreaterThan":5},"property":"age","variable":"n"}},{"Property":{"constraint":{"Equals":1},"property":"x","variable":"n"}}]}}}}],"return_spec":{"distinct":false,"limit":null,"order_by":[],"projections":[{"Variable":"n"}],"skip":null,"variables":["n"]},"union_clauses":[],"updating_clauses":[],"with_clauses":[]}
+=== where_regex_nonstring
+Q: MATCH (n) WHERE n.age =~ 30 RETURN n
+M: {"clauses":[],"reading_clauses":[{"Match":{"optional":false,"pattern":{"edges":[],"nodes":[{"label":null,"labels":[],"optional":false,"properties":{},"variable":"n"}],"paths":[],"where_clause":{"Property":{"constraint":{"Equals":30},"property":"age","variable":"n"}},"where_clauses":[],"with_clauses":[]}}}],"return_spec":{"distinct":false,"items":["n"],"limit":null,"order_by":[],"projections":[{"Variable":"n"}],"skip":null,"variables":["n"]},"union_clauses":[],"updating_clauses":[],"with_clauses":[]}
+S: {"reading_clauses":[{"Match":{"optional":false,"pattern":{"edges":[],"nodes":[{"labels":[],"optional":false,"properties":{},"variable":"n"}],"paths":[],"where_clause":{"Property":{"constraint":{"Equals":30},"property":"age","variable":"n"}}}}}],"return_spec":{"distinct":false,"limit":null,"order_by":[],"projections":[{"Variable":"n"}],"skip":null,"variables":["n"]},"union_clauses":[],"updating_clauses":[],"with_clauses":[]}
 "#;
 
 /// Deterministic JSON rendering: object keys sorted at every level.
