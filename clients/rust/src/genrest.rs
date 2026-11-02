@@ -38176,7 +38176,7 @@ pub mod types {
 ///
 /// SDK-facing ProximaDB REST contract. This specification is v2-first and centers on ProximaRecord, typed schemas, record search, and collection lifecycle operations. Legacy v1 compatibility routes are intentionally not part of this publishable SDK surface.
 ///
-/// Version: 0.2.0
+/// Version: 0.5.1
 pub struct Client {
     pub(crate) baseurl: String,
     pub(crate) client: reqwest::Client,
@@ -38214,7 +38214,7 @@ impl Client {
 }
 impl ClientInfo<()> for Client {
     fn api_version() -> &'static str {
-        "0.2.0"
+        "0.5.1"
     }
     fn baseurl(&self) -> &str {
         self.baseurl.as_str()

@@ -97,7 +97,12 @@ pub struct QueryResponse(pub Value);
 #[openapi(
     info(
         title = "ProximaDB REST API",
-        version = "0.2.0",
+        // Review F6 (RELEASE_REVIEW_v0.4_to_v0.5.1.md): derived, not
+        // hardcoded — the published contract reported 0.2.0 through two
+        // minor releases while the product shipped 0.4.x/0.5.x. The root
+        // crate's version is the one `version-sync.sh check-tag` pins to the
+        // release tag, so the spec now tracks the release mechanically.
+        version = env!("CARGO_PKG_VERSION"),
         description = "SDK-facing ProximaDB REST contract. This specification is v2-first and \
 centers on ProximaRecord, typed schemas, record search, and collection \
 lifecycle operations. Legacy v1 compatibility routes are intentionally not \
