@@ -43,6 +43,8 @@ pub mod ordered_float;
 pub use ordered_float::{BitKeyF32, BitKeyF64, TotalOrderedF32, TotalOrderedF64};
 pub mod proto_v2;
 pub mod store;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
 pub mod wire_v2;
 
 pub use store::{

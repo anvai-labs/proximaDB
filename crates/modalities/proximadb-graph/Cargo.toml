@@ -33,4 +33,5 @@ uuid = { version = "1.0", features = ["v4", "serde"] }
 async-recursion = "1.0"
 
 [dev-dependencies]
+proximadb-records = { path = "../../foundation/proximadb-records", features = ["test-support"] }
 tokio = { version = "1.37", features = ["macros", "rt-multi-thread"] }
