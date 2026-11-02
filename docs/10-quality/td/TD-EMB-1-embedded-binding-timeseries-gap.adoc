@@ -1,0 +1,34 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-EMB-1: embedded PyO3 binding lacks the timeseries surface the SDK adapter advertises
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open (filed 2026-11-02; found by TD-SDK-3 batch 3's round-3 review).**
+| Priority | P3 — no current data loss on default paths; the SDK degrades instead of lying, but two advertised behaviors silently narrow.
+| Relates to | link:TD-SDK-3-unified-client-v1-v2-convergence.adoc[TD-SDK-3] (batch 3, embedded adapter), link:TD-XMODAL-1-timeseries-source.adoc[TD-XMODAL-1]
+| Component | `crates/binding/proximadb-embedded/src/python.rs` (the PyO3 surface), `clients/python/src/proximadb_sdk/adapters/embedded_adapter.py` (the SDK adapter over it).
+| Evidence | The in-process binding exposes NO timeseries methods (zero `timeseries` mentions in python.rs). The SDK adapter's timeseries family therefore always takes its legacy vector-fallback path on the recommended in-process transport: `_create_timeseries_collection_as_vector`, `_ingest_timeseries_as_vector`, `_query_timeseries_as_vector`. Consequences: (a) `query_timeseries(aggregation=…/bucket_ms=…)` silently drops the aggregation on the fallback (only `tag_filters` is honored) — the same silent-no-op shape TD-SDK-3's REST review forced into honest typed errors; (b) the subprocess `EmbeddedProximaDB.query_timeseries` is `async def`, mismatched with the adapter's synchronous call, so the subprocess flavor cannot serve the family at all.
+|===
+
+== The finding
+
+The embedded adapter's docstring contract says the embedded transport "honors" the timeseries
+query parameters, which is true only of an engine API the in-process binding never exposes. The
+binding is the recommended transport; the fallback shapes are legacy.
+
+== Direction
+
+1. Expose the engine's timeseries surface through the PyO3 binding (`create_timeseries_collection`,
+   `ingest_timeseries`, `query_timeseries` incl. aggregation/bucket_ms, list/delete) mirroring the
+   observability methods' registration shape.
+2. Until then, the adapter's docstrings should scope the "honored" claim to the engine API and
+   note the in-process fallback narrows queries to `tag_filters` (consider raising the typed
+   capability error for aggregation/bucket_ms on the fallback, matching the REST decision).
+3. Fix or remove the `async def` subprocess `query_timeseries` mismatch.
+
+== Non-goals
+
+Changing the vector-fallback storage layout (legacy data lives there); porting the REST
+timeseries surface to embedded (the engine API is the source of truth).

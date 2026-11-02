@@ -77,9 +77,9 @@
 use nom::{
     IResult,
     branch::alt,
-    bytes::complete::{tag, tag_no_case, take_while, take_while1},
-    character::complete::{alpha1, alphanumeric1, char, digit1, multispace0, multispace1, one_of},
-    combinator::{map, map_res, opt, recognize, value},
+    bytes::complete::{tag, tag_no_case},
+    character::complete::{char, digit1, multispace0, multispace1},
+    combinator::{map, map_res, opt, value},
     error::VerboseError,
     multi::{many0, many1, separated_list0, separated_list1},
     sequence::{delimited, pair, preceded, separated_pair, tuple},
@@ -92,6 +92,9 @@ use crate::query_ast::{
     // TODO: Add other AST types
 };
 use std::collections::HashMap;
+
+// Shared TD-GRAPH-4 lexeme (string literals for the string predicates).
+use proximadb_graph_query::parser::lexemes::string_literal;
 
 // Placeholder types for Cypher AST
 pub type EdgeDirection = crate::query_ast::EdgeDirection;
@@ -858,105 +861,16 @@ impl super::QueryParser for CypherParser {
 // NOM PARSER COMBINATORS
 // ============================================================================
 
-/// Parse identifier (variable names, labels, property keys)
-fn identifier(input: &str) -> ParseResult<'_, String> {
-    map(
-        recognize(tuple((
-            alt((alpha1, tag("_"))),
-            many0(alt((alphanumeric1, tag("_")))),
-        ))),
-        String::from,
-    )(input)
-}
-
-/// Parse backtick-quoted identifier
-fn quoted_identifier(input: &str) -> ParseResult<'_, String> {
-    map(
-        delimited(char('`'), take_while1(|c| c != '`'), char('`')),
-        String::from,
-    )(input)
-}
-
-/// Parse any identifier (normal or quoted)
+/// Parse any identifier (bare or backtick-quoted) — the shared
+/// TD-GRAPH-4 lexeme, instantiated with this parser's error type.
 fn any_identifier(input: &str) -> ParseResult<'_, String> {
-    alt((quoted_identifier, identifier))(input)
+    proximadb_graph_query::parser::lexemes::any_identifier(input)
 }
 
-/// Parse string literal (single or double quoted)
-fn string_literal(input: &str) -> ParseResult<'_, String> {
-    alt((
-        map(
-            delimited(char('"'), take_while(|c| c != '"'), char('"')),
-            String::from,
-        ),
-        map(
-            delimited(char('\''), take_while(|c| c != '\''), char('\'')),
-            String::from,
-        ),
-    ))(input)
-}
-
-/// Parse integer literal
-fn integer_literal(input: &str) -> ParseResult<'_, i64> {
-    map_res(recognize(tuple((opt(char('-')), digit1))), |s: &str| {
-        s.parse::<i64>()
-    })(input)
-}
-
-/// Parse float literal
-fn float_literal(input: &str) -> ParseResult<'_, f64> {
-    map_res(
-        recognize(tuple((
-            opt(char('-')),
-            digit1,
-            char('.'),
-            digit1,
-            opt(tuple((one_of("eE"), opt(one_of("+-")), digit1))),
-        ))),
-        |s: &str| s.parse::<f64>(),
-    )(input)
-}
-
-/// Parse boolean literal
-fn boolean_literal(input: &str) -> ParseResult<'_, bool> {
-    alt((
-        value(true, tag_no_case("true")),
-        value(false, tag_no_case("false")),
-    ))(input)
-}
-
-/// Parse null literal
-fn null_literal(input: &str) -> ParseResult<'_, serde_json::Value> {
-    value(serde_json::Value::Null, tag_no_case("null"))(input)
-}
-
-/// Parse a property value (string, number, boolean, null)
+/// Parse a property value (string, float, integer, boolean, null, or
+/// array) — the shared TD-GRAPH-4 lexeme.
 fn property_value(input: &str) -> ParseResult<'_, serde_json::Value> {
-    alt((
-        map(string_literal, serde_json::Value::String),
-        map(float_literal, |f| {
-            serde_json::Value::Number(
-                serde_json::Number::from_f64(f).unwrap_or(serde_json::Number::from(0)),
-            )
-        }),
-        map(integer_literal, |i| {
-            serde_json::Value::Number(serde_json::Number::from(i))
-        }),
-        map(boolean_literal, serde_json::Value::Bool),
-        null_literal,
-        // Array value
-        map(
-            delimited(
-                char('['),
-                separated_list0(
-                    delimited(multispace0, char(','), multispace0),
-                    property_value,
-                ),
-                char(']'),
-            ),
-            serde_json::Value::Array,
-        ),
-    ))(input)
+    proximadb_graph_query::parser::lexemes::property_value(input)
 }
 
 /// Parse property assignment: key: value
@@ -988,21 +902,7 @@ fn property_map(input: &str) -> ParseResult<'_, HashMap<String, PropertyConstrai
 
 /// Parse property value map: {key: value, ...} for CREATE
 fn property_value_map(input: &str) -> ParseResult<'_, HashMap<String, serde_json::Value>> {
-    map(
-        delimited(
-            pair(char('{'), multispace0),
-            separated_list0(
-                delimited(multispace0, char(','), multispace0),
-                separated_pair(
-                    any_identifier,
-                    delimited(multispace0, char(':'), multispace0),
-                    property_value,
-                ),
-            ),
-            pair(multispace0, char('}')),
-        ),
-        |pairs| pairs.into_iter().collect(),
-    )(input)
+    proximadb_graph_query::parser::lexemes::property_value_map(input)
 }
 
 /// Parse labels: :Label1:Label2

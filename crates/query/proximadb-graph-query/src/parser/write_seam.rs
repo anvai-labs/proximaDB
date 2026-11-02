@@ -18,21 +18,9 @@ use super::*;
 pub(super) fn parse_property_value_map(
     input: &str,
 ) -> IResult<&str, HashMap<String, serde_json::Value>> {
-    map(
-        delimited(
-            char('{'),
-            separated_list0(
-                delimited(multispace0, char(','), multispace0),
-                separated_pair(
-                    identifier,
-                    delimited(multispace0, char(':'), multispace0),
-                    property_value,
-                ),
-            ),
-            char('}'),
-        ),
-        |pairs| pairs.into_iter().collect(),
-    )(input)
+    // Shared lexeme (TD-GRAPH-4 step 1): the superset behavior — quoted
+    // keys, permissive spacing — with existing inputs parsing identically.
+    lexemes::property_value_map(input)
 }
 
 // Parse a CREATE node specification (n:Label {props})
