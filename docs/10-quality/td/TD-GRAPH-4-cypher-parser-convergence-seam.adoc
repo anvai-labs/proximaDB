@@ -5,7 +5,7 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | **Open (seam extracted 2026-11-01; corpus pin landed 2026-11-01; convergence design pending).**
+| Status | **Open (seam extracted 2026-11-01; corpus pin landed 2026-11-01; convergence step 1 — shared lexemes — landed 2026-11-02; clause-by-clause port pending).**
 | Priority | P2 — two live nom-based Cypher grammars with 34 shared function names and drifted bodies is the standard fork disease; every parser fix must currently land twice or silently miss one path.
 | Relates to | link:TD-GRAPH-3-cypher-variable-length-multihop.adoc[TD-GRAPH-3] (variable-length parsing), the 2026-10-31 victor clone-scan dedup program (wave 3)
 | Component | `crates/query/proximadb-graph-query/src/parser/` (read path + `write_seam.rs`), `crates/modalities/proximadb-graph/src/cypher_parser.rs` (the graph-API grammar), `src/query/parsers/cypher.rs` + `src/graph/query/graph_parser.rs` (its consumers).
@@ -28,9 +28,15 @@ drifted twin.
    `dead_code` allowance was removed when the module became `pub` (its full-query entry is
    the declared convergence surface) — every private combinator is reachable from that entry,
    so no allowance is needed.
-2. **Convergence design** (open): new full-Cypher parsing work belongs behind the seam. When
-   the modality parser next needs a grammar change, port the clause parsers onto the seam
-   (shared lexemes → shared patterns → clause-by-clause), keeping the modality's
+2. **Convergence design** (step 1 LANDED 2026-11-02 — shared lexemes): the token-level
+   parsers now live ONCE in `parser/lexemes.rs` (generic over the nom error type), with the
+   MODALITY's behavior as the superset (quoted/backtick identifiers, negative integers,
+   floats with exponents, case-insensitive booleans, `null`, arrays, empty strings,
+   permissive map spacing). Both grammars in this crate AND the modality's graph-API parser
+   delegate to them — previously the seam accepted strictly less, so adopting the superset
+   only makes previously-REJECTED inputs parse; the 41-entry pinned corpus stayed
+   byte-identical through the switch (the differential check this pin exists for). Remaining
+   steps (open): shared patterns → clause-by-clause port, keeping the modality's
    `CypherQuery`→`query_ast` mapping as a thin conversion over the seam's AST, until the
    modality file reduces to the conversion layer.
 3. **Contract pinning** (landed 2026-11-01): a 41-entry shared corpus (reads incl. var-length

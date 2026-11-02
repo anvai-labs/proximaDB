@@ -37,9 +37,9 @@ use super::ast::{
 use nom::{
     IResult,
     branch::alt,
-    bytes::complete::{tag, tag_no_case, take_while1},
-    character::complete::{alpha1, alphanumeric1, char, digit1, multispace0, multispace1},
-    combinator::{map, map_res, opt, recognize, value},
+    bytes::complete::{tag, tag_no_case},
+    character::complete::{char, digit1, multispace0, multispace1},
+    combinator::{map, map_res, opt, value},
     multi::{many0, separated_list0, separated_list1},
     sequence::{delimited, preceded, separated_pair, tuple},
 };
@@ -97,57 +97,12 @@ impl Default for QueryParser {
 
 // --- Nom Parser Combinators ---
 
-// Helper to parse identifiers (variable names, labels, property keys)
 fn identifier(input: &str) -> IResult<&str, String> {
-    map(
-        recognize(tuple((
-            alt((alpha1, tag("_"))),
-            many0(alt((alphanumeric1, tag("_")))),
-        ))),
-        String::from,
-    )(input)
+    lexemes::identifier(input)
 }
 
-// Helper to parse string literals (e.g., "value" or 'value')
-fn string_literal(input: &str) -> IResult<&str, String> {
-    map(
-        alt((
-            delimited(
-                char::<&str, nom::error::Error<_>>('"'),
-                take_while1(|c| c != '"'),
-                char('"'),
-            ),
-            delimited(
-                char::<&str, nom::error::Error<_>>('\''),
-                take_while1(|c| c != '\''),
-                char('\''),
-            ),
-        )),
-        |s| s.to_string(),
-    )(input)
-}
-
-// Helper to parse integer literals
-fn integer_literal(input: &str) -> IResult<&str, i64> {
-    map_res(take_while1(|c: char| c.is_ascii_digit()), |s: &str| {
-        s.parse::<i64>()
-    })(input)
-}
-
-// Helper to parse boolean literals
-fn boolean_literal(input: &str) -> IResult<&str, bool> {
-    alt((map(tag("true"), |_| true), map(tag("false"), |_| false)))(input)
-}
-
-// Helper to parse property values (simplified to string, int, bool for now)
 fn property_value(input: &str) -> IResult<&str, serde_json::Value> {
-    alt((
-        map(string_literal, serde_json::Value::String),
-        map(integer_literal, |i| {
-            serde_json::Value::Number(serde_json::Number::from(i))
-        }),
-        map(boolean_literal, serde_json::Value::Bool),
-    ))(input)
+    lexemes::property_value::<nom::error::Error<&str>>(input)
 }
 
 // Helper to parse property assignments (e.g., key: value)
@@ -739,6 +694,7 @@ fn parse_return_clause(input: &str) -> IResult<&str, ReturnSpec> {
 // the convergence plan). The module is `pub` because its full-query entry
 // is the crate's declared convergence surface (TD-GRAPH-4); its private
 // combinators are exercised by the tests below and need no allowance.
+pub mod lexemes;
 pub mod write_seam;
 
 // The seam re-exports through this scope so the ported tests (mod tests
@@ -1345,5 +1301,48 @@ mod tests {
         );
         assert_eq!(props.get("age"), Some(&serde_json::json!(25)));
         assert_eq!(props.get("active"), Some(&serde_json::Value::Bool(true)));
+    }
+    #[test]
+    fn test_shared_lexeme_superset_gains() {
+        // TD-GRAPH-4 step 1: the seam adopted the modality's lexeme
+        // superset — floats (incl. negatives/exponents), null, arrays,
+        // negative integers, case-insensitive booleans, quoted keys.
+        let (_, m) = lexemes::property_value_map::<nom::error::Error<&str>>(
+            "{score: -1.5e2, ratio: 3.14, missing: null, tags: [1, 'a', true], name: Null}",
+        )
+        .expect("superset map parses");
+        assert_eq!(m["score"], serde_json::json!(-150.0));
+        assert_eq!(m["ratio"], serde_json::json!(3.14));
+        assert_eq!(m["missing"], serde_json::Value::Null);
+        assert_eq!(m["tags"], serde_json::json!([1, "a", true]));
+        assert_eq!(m["name"], serde_json::Value::Null);
+
+        let (_, v) = lexemes::property_value::<nom::error::Error<&str>>("TRUE")
+            .expect("case-insensitive bool");
+        assert_eq!(v, serde_json::Value::Bool(true));
+        let (_, v) =
+            lexemes::property_value::<nom::error::Error<&str>>("-42").expect("negative int");
+        assert_eq!(v, serde_json::json!(-42));
+        let (_, k) =
+            lexemes::any_identifier::<nom::error::Error<&str>>("`weird key`").expect("quoted key");
+        assert_eq!(k, "weird key");
+    }
+
+    #[test]
+    fn test_shared_lexemes_preserve_existing_parses() {
+        // The gains must not change previously-accepted parses.
+        let (_, v) =
+            lexemes::property_value::<nom::error::Error<&str>>("30").expect("int still int");
+        assert_eq!(v, serde_json::json!(30));
+        let (_, v) =
+            lexemes::property_value::<nom::error::Error<&str>>("\"Alice\"").expect("string");
+        assert_eq!(v, serde_json::json!("Alice"));
+        let (_, v) = lexemes::property_value::<nom::error::Error<&str>>("true").expect("bool");
+        assert_eq!(v, serde_json::Value::Bool(true));
+        let (_, m) =
+            lexemes::property_value_map::<nom::error::Error<&str>>("{name: \"Alice\", age: 30}")
+                .expect("tight spacing still parses");
+        assert_eq!(m["name"], serde_json::json!("Alice"));
+        assert_eq!(m["age"], serde_json::json!(30));
     }
 }
