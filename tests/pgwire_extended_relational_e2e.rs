@@ -307,6 +307,105 @@ fn parse_bind_execute(sql: &str) -> Vec<u8> {
     out
 }
 
+/// TD-PGPORTAL-1: `Execute(max_rows)` must page the LEGACY single-table
+/// reader with PortalSuspended. `SELECT *` (wildcard projection) is declined
+/// by `pipeline_projection`, so this portal lands on the legacy reader — the
+/// one route that ignored the row budget: before the fix the first Execute
+/// streamed EVERY row plus CommandComplete, and a subsequent Execute RE-RAN
+/// the query (duplicate rows for any JDBC fetch-size / asyncpx client). The
+/// full paging contract: Execute(1) -> one DataRow + PortalSuspended;
+/// Execute(1) -> one DataRow + PortalSuspended; Execute(0) ("no limit" =
+/// drain the remainder) -> remaining rows + CommandComplete — and the TOTAL
+/// across pages is exactly the table's row count, never a re-run's duplicate.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn execute_max_rows_pages_the_legacy_reader_e2e() {
+    use tokio::io::AsyncWriteExt;
+
+    let server = PgServer::start().await.expect("server start");
+    let client = connect(&server).await;
+    seed(&client).await; // menu_items: exactly 2 rows
+
+    let mut stream = raw_connect(&server).await;
+
+    // Parse + Bind once; the (unnamed) portal persists across Execute+Sync
+    // rounds until the next Bind, exactly like a JDBC fetch-size cursor.
+    let sql = "SELECT * FROM menu_items";
+    let mut parse = vec![0u8];
+    parse.extend_from_slice(sql.as_bytes());
+    parse.push(0);
+    parse.extend_from_slice(&0i16.to_be_bytes());
+    let mut bind = vec![0u8, 0u8];
+    bind.extend_from_slice(&0i16.to_be_bytes());
+    bind.extend_from_slice(&0i16.to_be_bytes());
+    bind.extend_from_slice(&0i16.to_be_bytes());
+    let mut out = message(b'P', &parse);
+    out.extend(message(b'B', &bind));
+    out.extend(message(b'S', &[]));
+    stream.write_all(&out).await.expect("parse+bind+sync");
+
+    // Drain to ReadyForQuery (ParseComplete, BindComplete, ReadyForQuery).
+    loop {
+        let (tag, _) = read_message(&mut stream).await;
+        if tag == b'Z' {
+            break;
+        }
+    }
+
+    // One Execute round: Execute(portal, max_rows) + Sync, collecting message
+    // tags up to ReadyForQuery. Returns (data_row_count, saw_portal_suspended,
+    // saw_command_complete).
+    async fn execute_round(
+        stream: &mut tokio::net::TcpStream,
+        max_rows: i32,
+    ) -> (usize, bool, bool) {
+        use tokio::io::AsyncWriteExt;
+        let mut frame = vec![0u8, 0u8]; // unnamed portal
+        frame.extend_from_slice(&max_rows.to_be_bytes());
+        let mut out = message(b'E', &frame);
+        out.extend(message(b'S', &[]));
+        stream.write_all(&out).await.expect("execute+sync");
+        let mut data_rows = 0usize;
+        let (mut suspended, mut complete) = (false, false);
+        loop {
+            let (tag, _) = read_message(stream).await;
+            match tag {
+                b'D' => data_rows += 1,
+                b's' => suspended = true,
+                b'C' => complete = true,
+                b'Z' => break,
+                _ => {}
+            }
+        }
+        (data_rows, suspended, complete)
+    }
+
+    // Page 1: exactly one row, then PortalSuspended — NOT CommandComplete.
+    let (rows, suspended, complete) = execute_round(&mut stream, 1).await;
+    assert_eq!(rows, 1, "Execute(max_rows=1) must emit exactly one row");
+    assert!(
+        suspended && !complete,
+        "with rows remaining the page must end PortalSuspended, not CommandComplete"
+    );
+
+    // Page 2: the second row, still suspended.
+    let (rows, suspended, complete) = execute_round(&mut stream, 1).await;
+    assert_eq!(rows, 1, "the second page must emit the second row");
+    assert!(
+        suspended && !complete,
+        "one row remains: still PortalSuspended"
+    );
+
+    // Page 3: max_rows=0 drains the remainder and COMPLETES — the round that
+    // used to re-run the query and duplicate every row.
+    let (rows, suspended, complete) = execute_round(&mut stream, 0).await;
+    assert_eq!(
+        rows, 0,
+        "the table had 2 rows; the drained remainder is empty"
+    );
+    assert!(complete && !suspended, "drain ends in CommandComplete");
+    assert!(!client.is_closed());
+}
+
 /// After an ErrorResponse, the server discards messages until Sync: a
 /// pipelined batch (JDBC `executeBatch`, asyncpg `executemany`) must not run
 /// the statements queued behind a failed one.
