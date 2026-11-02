@@ -50,11 +50,8 @@ jobs:
     # The human drives the code, not the agents: block AI-agent authorship
     # attribution (co-author trailers, "Generated with ...", robot emoji, agent
     # signatures) in the PR title/body. The repo squash-merges, so the PR
-    # title/body IS the commit message that lands on the branch — that is the
-    # surface to enforce. Per-commit messages are checked locally by the
-    # `.githooks/commit-msg` hook; CI does NOT scan the commit range, since on a
-    # promotion PR that range contains pre-policy historical commits and would
-    # block the merge over messages that never land.
+    # title/body IS the commit message that lands on the branch — that is one
+    # surface to enforce.
     - name: Block AI-agent attribution (PR title/body)
       if: github.event_name == 'pull_request'
       env:
@@ -62,6 +59,27 @@ jobs:
         PR_BODY: ${{ github.event.pull_request.body }}
       run: |
         printf '%s\n%s\n' "$PR_TITLE" "$PR_BODY" | python3 scripts/check_no_agent_attribution.py --stdin
+
+    # Release-review F5 (forward-only range scan): per-commit messages on a
+    # feat->develop PR are the OTHER surface, and the one that leaked — 122
+    # commits between 2026-10-19 and the v0.5.1 tag carry co-author trailers
+    # that only ever existed in commit messages (the PR bodies were clean), so
+    # the title/body check above never saw them. Scope: ONLY PRs into develop
+    # whose head is not qa/main — a feat PR's base..head range holds just its
+    # own commits, while promotion PRs (base qa/main) and back-merges
+    # (head qa/main into develop) span grandfathered pre-policy history and
+    # would block forever over messages that never land. The existing 122 are
+    # grandfathered by this scoping, deliberately: new violations are blocked
+    # at PR time; history is not rewritten on released tags.
+    - name: Block AI-agent attribution (commit range, feat->develop)
+      if: >-
+        github.event_name == 'pull_request'
+        && github.base_ref == 'develop'
+        && github.head_ref != 'qa'
+        && github.head_ref != 'main'
+      run: |
+        git fetch --no-tags origin "+refs/heads/${{ github.base_ref }}:refs/remotes/origin/${{ github.base_ref }}"
+        python3 scripts/check_no_agent_attribution.py --range "origin/${{ github.base_ref }}...HEAD"
 
     - name: Run layering validation
       run: |

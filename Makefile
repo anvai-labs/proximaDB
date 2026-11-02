@@ -99,6 +99,10 @@ env-gate-check:
 	@echo "🚪 Validating env-gate registry..."
 	python3 scripts/check_env_gates.py
 
+ci-lane-coverage-check:
+	@echo "🛬 Validating integration-test CI lane coverage..."
+	python3 scripts/check_ci_lane_coverage.py
+
 release-build-features-check:
 	@echo "📦 Validating what the release artifacts are compiled with..."
 	python3 scripts/check_release_build_features.py
@@ -254,7 +258,7 @@ tenant-ingress-check:
 	@echo "Validating deployment-aware tenant ingress..."
 	python3 scripts/check_tenant_ingress_contract.py
 
-work-commit-check: fmt-check deterministic-commit-contract-check branch-promotion-policy-check docs-claim-check design-status-check status-asof-check capability-matrix-check mvp-contract-check mvp-smoke-test context-benchmark-check workspace-boundaries-check tenant-path-check tenant-ingress-check catalog-seal-check panic-policy-module-guard panic-policy-workspace-no-regression silent-failure-no-regression hygiene-check env-gate-check dup-ratchet-check release-build-features-check release-evidence-contract-check orphan-rust-files-check
+work-commit-check: fmt-check deterministic-commit-contract-check branch-promotion-policy-check docs-claim-check design-status-check status-asof-check capability-matrix-check mvp-contract-check mvp-smoke-test context-benchmark-check workspace-boundaries-check tenant-path-check tenant-ingress-check catalog-seal-check panic-policy-module-guard panic-policy-workspace-no-regression silent-failure-no-regression hygiene-check env-gate-check ci-lane-coverage-check dup-ratchet-check release-build-features-check release-evidence-contract-check orphan-rust-files-check
 	@echo "✅ work-commit-check: deterministic architecture and commit guardrails passed"
 
 validated-commit-check: work-commit-check
