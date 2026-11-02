@@ -153,9 +153,9 @@ fn single_executor_program(
 mod tests {
     use super::*;
     use crate::spec::{PhaseSpec, RankProfileSpec};
+    use proximadb_rank_core::test_support::MapAttributeAccess;
     use proximadb_rank_core::{
-        AttributeAccess, DocHandle, FeatureArena, NoopCandidateData, NoopMetricsSink,
-        NoopModelCache, ScoreCtx,
+        DocHandle, FeatureArena, NoopCandidateData, NoopMetricsSink, NoopModelCache, ScoreCtx,
     };
     use proximadb_rank_features::register_builtins;
     use std::collections::HashMap;
@@ -164,13 +164,6 @@ mod tests {
         let f = Arc::new(BlueprintFactory::new());
         register_builtins(&f);
         f
-    }
-
-    struct Attrs(HashMap<(u32, String), f32>);
-    impl AttributeAccess for Attrs {
-        fn read_f32(&self, doc: DocHandle, f: &str) -> Option<f32> {
-            self.0.get(&(doc.0, f.to_string())).copied()
-        }
     }
 
     #[test]
@@ -199,11 +192,13 @@ mod tests {
         let qctx = QueryContext::default();
         let mut pipe = compiled.materialize(&qctx).unwrap();
 
-        let attrs = Attrs(HashMap::from([
-            ((0, "score".into()), 3.0),
-            ((1, "score".into()), 5.0),
-            ((2, "score".into()), 1.0),
-        ]));
+        let attrs = MapAttributeAccess {
+            values: HashMap::from([
+                ((0, "score".into()), 3.0),
+                ((1, "score".into()), 5.0),
+                ((2, "score".into()), 1.0),
+            ]),
+        };
         let arena = FeatureArena::new();
         let cands = NoopCandidateData;
         let m = NoopModelCache;

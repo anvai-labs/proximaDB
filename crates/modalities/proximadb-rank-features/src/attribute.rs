@@ -67,20 +67,11 @@ impl FeatureExecutor for AttributeExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proximadb_rank_core::test_support::MapAttributeAccess;
     use proximadb_rank_core::{
-        AttributeAccess, FeatureArena, NoopCandidateData, NoopMetricsSink, NoopModelCache,
-        QueryContext, RankProgram,
+        FeatureArena, NoopCandidateData, NoopMetricsSink, NoopModelCache, QueryContext, RankProgram,
     };
     use std::collections::HashMap;
-
-    struct MapAttrs {
-        values: HashMap<(u32, String), f32>,
-    }
-    impl AttributeAccess for MapAttrs {
-        fn read_f32(&self, doc: DocHandle, field: &str) -> Option<f32> {
-            self.values.get(&(doc.0, field.to_string())).copied()
-        }
-    }
 
     fn build_program(field: &str) -> RankProgram {
         let bp = AttributeBlueprint;
@@ -98,7 +89,7 @@ mod tests {
     #[test]
     fn attribute_blueprint_reads_column() {
         let mut prog = build_program("price");
-        let attrs = MapAttrs {
+        let attrs = MapAttributeAccess {
             values: HashMap::from([((1, "price".into()), 42.0)]),
         };
         let q = QueryContext::default();
@@ -111,7 +102,7 @@ mod tests {
     #[test]
     fn attribute_missing_value_returns_zero() {
         let mut prog = build_program("price");
-        let attrs = MapAttrs {
+        let attrs = MapAttributeAccess {
             values: HashMap::new(),
         };
         let q = QueryContext::default();
