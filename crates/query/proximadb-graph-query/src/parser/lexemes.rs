@@ -22,7 +22,7 @@ use nom::IResult;
 use nom::branch::alt;
 use nom::bytes::complete::{tag, tag_no_case, take_while, take_while1};
 use nom::character::complete::{alpha1, alphanumeric1, char, digit1, multispace0, one_of};
-use nom::combinator::{map, map_res, opt, recognize, value};
+use nom::combinator::{map, map_opt, map_res, opt, recognize, value, verify};
 use nom::error::{FromExternalError, ParseError};
 use nom::multi::{many0, separated_list0};
 use nom::sequence::{delimited, pair, separated_pair, tuple};
@@ -124,9 +124,12 @@ pub fn property_value<
 ) -> IResult<&'a str, Value, E> {
     alt((
         map(string_literal, Value::String),
-        map(float_literal, |f| {
-            Value::Number(serde_json::Number::from_f64(f).unwrap_or(serde_json::Number::from(0)))
-        }),
+        // inf/nan do not fit a JSON number — fail the parse rather than
+        // silently coercing to 0 (TD-GRAPH-4 step-2 decision, both paths).
+        map(
+            map_opt(float_literal, serde_json::Number::from_f64),
+            Value::Number,
+        ),
         map(integer_literal, |i| {
             Value::Number(serde_json::Number::from(i))
         }),
@@ -166,6 +169,97 @@ pub fn property_value_map<
                     delimited(multispace0, char(':'), multispace0),
                     property_value,
                 ),
+            ),
+            pair(multispace0, char('}')),
+        ),
+        |pairs| pairs.into_iter().collect(),
+    )(input)
+}
+
+/// Parse a CONSTRAINT-map property assignment: `key: value` →
+/// `PropertyConstraint::Equals(value)` — with the two TD-GRAPH-4 step-2
+/// decisions applied:
+///
+/// * `null` is REJECTED in constraint position (MATCH/WHERE maps). Cypher
+///   equality-with-null never matches — the idiom is `IS NULL` — and the
+///   pre-convergence behavior on both grammars was to accept it and then
+///   silently DROP the constraint downstream (an unconstrained scan).
+///   The write-path `property_value_map` still accepts null (setting a
+///   property to null is meaningful there).
+/// * a float that does not fit an `f64`-backed JSON number (`1.0e999`)
+///   fails the parse instead of silently coercing to `0` (the
+///   pre-convergence `unwrap_or(0)` behavior, which produced a
+///   `= 0` equality constraint with no error).
+pub fn property_assignment<
+    'a,
+    E: ParseError<&'a str>
+        + FromExternalError<&'a str, std::num::ParseIntError>
+        + FromExternalError<&'a str, std::num::ParseFloatError>,
+>(
+    input: &'a str,
+) -> IResult<&'a str, (String, crate::ast::PropertyConstraint), E> {
+    map(
+        separated_pair(
+            any_identifier,
+            delimited(multispace0, char(':'), multispace0),
+            verify(constraint_value, |v| !v.is_null()),
+        ),
+        |(key, value)| (key, crate::ast::PropertyConstraint::Equals(value)),
+    )(input)
+}
+
+/// A property value in CONSTRAINT position: the shared `property_value`
+/// with the inf→0 coercion removed (`map_opt` — a non-finite float fails
+/// the branch instead of becoming `0`).
+fn constraint_value<
+    'a,
+    E: ParseError<&'a str>
+        + FromExternalError<&'a str, std::num::ParseIntError>
+        + FromExternalError<&'a str, std::num::ParseFloatError>,
+>(
+    input: &'a str,
+) -> IResult<&'a str, Value, E> {
+    alt((
+        map(string_literal, Value::String),
+        map(
+            map_opt(float_literal, serde_json::Number::from_f64),
+            Value::Number,
+        ),
+        map(integer_literal, |i| {
+            Value::Number(serde_json::Number::from(i))
+        }),
+        map(boolean_literal, Value::Bool),
+        null_literal,
+        map(
+            delimited(
+                char('['),
+                separated_list0(
+                    delimited(multispace0, char(','), multispace0),
+                    property_value,
+                ),
+                char(']'),
+            ),
+            Value::Array,
+        ),
+    ))(input)
+}
+
+/// Parse a constraint map: `{ key: value, … }` → per-key equality
+/// constraints (permissive spacing, quoted keys — the shared shape).
+pub fn constraint_map<
+    'a,
+    E: ParseError<&'a str>
+        + FromExternalError<&'a str, std::num::ParseIntError>
+        + FromExternalError<&'a str, std::num::ParseFloatError>,
+>(
+    input: &'a str,
+) -> IResult<&'a str, HashMap<String, crate::ast::PropertyConstraint>, E> {
+    map(
+        delimited(
+            pair(char('{'), multispace0),
+            separated_list0(
+                delimited(multispace0, char(','), multispace0),
+                property_assignment,
             ),
             pair(multispace0, char('}')),
         ),

@@ -874,30 +874,9 @@ fn property_value(input: &str) -> ParseResult<'_, serde_json::Value> {
 }
 
 /// Parse property assignment: key: value
-fn property_assignment(input: &str) -> ParseResult<'_, (String, PropertyConstraint)> {
-    map(
-        separated_pair(
-            any_identifier,
-            delimited(multispace0, char(':'), multispace0),
-            property_value,
-        ),
-        |(key, value)| (key, PropertyConstraint::Equals(value)),
-    )(input)
-}
-
-/// Parse property map: {key: value, ...}
+/// Parse property map — the shared TD-GRAPH-4 constraint map.
 fn property_map(input: &str) -> ParseResult<'_, HashMap<String, PropertyConstraint>> {
-    map(
-        delimited(
-            pair(char('{'), multispace0),
-            separated_list0(
-                delimited(multispace0, char(','), multispace0),
-                property_assignment,
-            ),
-            pair(multispace0, char('}')),
-        ),
-        |pairs| pairs.into_iter().collect(),
-    )(input)
+    proximadb_graph_query::parser::lexemes::constraint_map(input)
 }
 
 /// Parse property value map: {key: value, ...} for CREATE
@@ -956,9 +935,12 @@ fn property_constraint_to_value(constraint: PropertyConstraint) -> serde_json::V
         PropertyConstraint::NotEquals(v) => v,
         PropertyConstraint::GreaterThan(v) => v,
         PropertyConstraint::GreaterOrEqual(v) => v,
+        PropertyConstraint::GreaterThanOrEqual(v) => v,
         PropertyConstraint::LessThan(v) => v,
         PropertyConstraint::LessOrEqual(v) => v,
+        PropertyConstraint::LessThanOrEqual(v) => v,
         PropertyConstraint::In(vals) => serde_json::Value::Array(vals),
+        PropertyConstraint::NotIn(_) => serde_json::Value::Bool(false),
         PropertyConstraint::Contains(s) => serde_json::Value::String(s),
         PropertyConstraint::StartsWith(s) => serde_json::Value::String(s),
         PropertyConstraint::EndsWith(s) => serde_json::Value::String(s),
@@ -2433,6 +2415,26 @@ pub fn cypher_to_graph_query(
 // ============================================================================
 // TESTS
 // ============================================================================
+
+#[cfg(test)]
+mod step2_decisions {
+    use super::*;
+
+    #[test]
+    fn null_rejected_in_match_maps_but_not_create() {
+        let p = CypherParser::new();
+        assert!(p.parse("MATCH (n {x: null}) RETURN n").is_err());
+        // CREATE still accepts null (set-to-null).
+        assert!(p.parse("CREATE (n:Person {x: null})").is_ok());
+    }
+
+    #[test]
+    fn oversized_float_fails_not_zero() {
+        let p = CypherParser::new();
+        assert!(p.parse("CREATE (n:Person {v: 1.0e999})").is_err());
+        assert!(p.parse("CREATE (n:Person {v: 1.5e2})").is_ok());
+    }
+}
 
 #[cfg(test)]
 mod tests {
