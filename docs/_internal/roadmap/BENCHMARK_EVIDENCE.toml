@@ -1441,7 +1441,7 @@ asserted_in = [
   "docs/10-quality/td/TD-FPRUNE-1-filter-aware-cascade-arc.adoc",
 ]
 bench_source = "scripts/bench/sift1m_get_reduction.py"
-bench_command = "same layout-off 3M SIFT128 category=3 bed and protocol as the #2298 read-waves gate (--skip-ingest, n=1000, MinIO + Toxiproxy 5+5 ms on-host); only the binary changed (sha256 prefix 6825514d5); Region arms via PROXIMADB_SEARCH_MORSEL_DEGREE (1 = serial baseline)"
+bench_command = "same layout-off 3M SIFT128 category=3 bed and protocol as the #2298 read-waves gate (--skip-ingest, n=1000, MinIO + Toxiproxy 5+5 ms on-host); the comparison arm is the #2298 BINARY (only the binary changed, sha256 prefix 6825514d5); PROXIMADB_SEARCH_MORSEL_DEGREE=1 additionally forces the serial path within the new binary as a self-consistency check, not as the reported baseline"
 artifact = "docs/history/evidence/STAGEF_PARALLEL_DECODE_2026_10_31.adoc"
 hardware = "aiserver1: WSL2 Ubuntu 24.04, 16 vCPU, 125 GB; MinIO single drive + Toxiproxy 2.12.0 on the same host"
 date = "2026-10-31"
@@ -1458,7 +1458,7 @@ asserted_in = [
   "docs/10-quality/td/TD-FPRUNE-1-filter-aware-cascade-arc.adoc",
 ]
 bench_source = "scripts/bench/sift1m_get_reduction.py"
-bench_command = "3M SIFT128 category=3 bed, same protocol as the #2303 gate; Region-D arm = same build with PROXIMADB_PAX_READ_FILTER_REGION=0, Region-E arm reads footer section 8 (writer gate armed for the armed-arm fixtures)"
+bench_command = "a NEW layout-off 3M SIFT128 category=3 bed written for this PR (settled at 3 segments - NOT the #2303 bed), same harness protocol (n=1000, MinIO + Toxiproxy on-host); Region-D arm = same build with PROXIMADB_PAX_READ_FILTER_REGION=0, Region-E arm reads footer section 8 (writer gate armed for the armed-arm fixtures)"
 artifact = "docs/history/evidence/REGION_E_FILTER_COLUMNS_2026_10_31.adoc"
 hardware = "aiserver1: WSL2 Ubuntu 24.04, 16 vCPU, 125 GB; MinIO single drive + Toxiproxy 2.12.0 on the same host"
 date = "2026-10-31"
@@ -1467,16 +1467,16 @@ notes = "Transcribed from the PR #2312 bench section; raw logs local-only, discl
 
 [[claims]]
 id = "p24_sf1_bounded_memory_load"
-claim = "ADR-097 P2.4 exit gate (TD-USUB-22/#2286): the TPC-DS SF1 load + MATERIALIZE runs in bounded memory - 5.84 M rows loaded in 1,655 s and 22/22 tables published, peak RSS 10,401 MiB (load) / 10,773 MiB (MATERIALIZE) inside a 13,677 MiB cgroup, no OOM. 'Bounded' = the run refused to start outside a finite cgroup and the per-phase peaks (VmHWM + cgroup memory.peak) were recorded into ledger.load_stats; there is no fixed numeric threshold asserted by an automated gate - the harness is advisory (#[ignore]) and the assertion added with this entry checks peak <= cgroup MemoryHigh when the harness IS run."
+claim = "ADR-097 P2.4 exit gate (TD-USUB-22/#2286): the TPC-DS SF1 load + MATERIALIZE runs in bounded memory - 5.84 M rows loaded in 1,655 s and 22/22 tables published, peak RSS 10,401 MiB (load) / 10,773 MiB (MATERIALIZE) inside a 13,677 MiB cgroup, no OOM. 'Bounded' = the run refused to start outside a finite cgroup and the per-phase peaks (VmHWM + the cgroup peak: v2 memory.peak, v1 max_usage_in_bytes - this run was v1) were recorded into ledger.load_stats. The in-harness assertion added with this entry fails a run whose load/MATERIALIZE-phase cgroup peak goes beyond the cgroup bound (memory.high where one exists, else the hard limit, plus a small batched-charge tolerance) or was never captured; the harness remains advisory (#[ignore], manual, cgroup-gated)."
 metric = "peak RSS (VmHWM + cgroup memory.peak) per phase + rows loaded + tables published + wall time, SF1, n=1"
 status = "measured"
 asserted_in = [
   "docs/history/evidence/P24_SF1_GATE_EVIDENCE_2026_10_23.adoc",
 ]
 bench_source = "tests/tpc_perf_ledger_e2e.rs"
-bench_command = "systemd-run --user --scope -p MemoryHigh=13G -p MemoryMax=13.5G scripts/run_tpc_perf_ledger.sh <sf1 args> with TPC_PERF_LOAD_ONLY=1 (load + MATERIALIZE only)"
+bench_command = "TPC_PERF_SCALE=1 TPC_PERF_BENCHMARK=tpcds TPC_PERF_LOAD_ONLY=1 TPC_PERF_ALLOW_LARGE_SCALE=I_ACCEPT_ISOLATED_OOM TPC_PERF_HOST_HEADROOM_MIB=2048 cargo test --release --test tpc_perf_ledger_e2e -- --ignored <the gate test>; run inside the shell's ambient cgroup (v1 limit 13,677 MiB). scripts/run_tpc_perf_ledger.sh (systemd-run MemoryHigh/MemoryMax) is the wrapper for hosts that have systemd + cgroup v2 - this host had neither, which the artifact records"
 artifact = "docs/history/evidence/P24_SF1_GATE_EVIDENCE_2026_10_23.adoc"
-hardware = "aiserver1: WSL2 Ubuntu 24.04, 16 vCPU, 125 GB (cgroup-capped to ~13.3 GiB for the run)"
+hardware = "the artifact's SF1 gate host: 4 vCPU, 15.7 GiB RAM, no swap; cgroup v1 memory.limit_in_bytes = 13,677 MiB (ambient, not systemd-run)"
 date = "2026-10-24"
 version = "release build, 2026-10-24; commit/build/host/run provenance in the artifact"
 notes = "Registered here (release-review F3) because the 0.5.0 changelog cites the P2.4 gate while the ledger had no entry for it. Without the datafusion-integration feature the sort path holds the whole table in memory - default features include it. The peak-vs-bound assertion rides the harness itself, so the claim is only as fresh as the last manual run; re-run before citing a new binary."

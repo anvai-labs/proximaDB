@@ -593,6 +593,11 @@ jobs:
             rpm -V proximadb
             rpm -e proximadb
             test ! -e /usr/bin/proximadb-server'
+          # %post scriptlets (systemctl daemon-reload) still report failure here because
+          # systemd is not PID 1 in the container; rpm treats a scriptlet failure as a
+          # warning and dnf exits 0, so this step proves payload/paths/version/metadata/
+          # removal - scriptlet health is covered by the post-publish distro smoke, where
+          # systemd IS running.
 
       - name: Upload RPM Artifact
         uses: actions/upload-artifact@v7

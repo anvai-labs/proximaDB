@@ -69,7 +69,6 @@ TIMED_WORKFLOWS = RELEASE_WORKFLOWS + (
     ".github/workflows/layering-check.yml",
     ".github/workflows/mirror-ci-images.yml",
     ".github/workflows/objstore-nightly.yml",
-    ".github/workflows/prerelease-ci-v0.2.1-macos.yml",
     ".github/workflows/public-overflow-runner-smoke.yml",
     ".github/workflows/release-python.yml",
     # Post-publish release evidence, called by release.yml (workflow_call).

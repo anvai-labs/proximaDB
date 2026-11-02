@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 = PAX Region E filter columns — measured (PR #2312, in v0.5.1; writer default-OFF)
 
-Bench: the 3M SIFT128 `category=3` bed, same binary family as the #2303 gate; the Region-D
+Bench: a **new** layout-off 3M SIFT128 `category=3` bed written for this PR (settled at 3 segments — not the #2303 bed), same harness protocol and binary family as the #2303 gate; the Region-D
 arm is the same build with the read gate off (`PROXIMADB_PAX_READ_FILTER_REGION=0`), the
 Region-E arm reads footer section 8. Writer gate `PROXIMADB_PAX_WRITE_FILTER_REGION` is
 default-OFF in v0.5.1 — these arms ran with it armed. Numbers transcribed from the PR's

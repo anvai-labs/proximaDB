@@ -176,10 +176,14 @@ Per-registry reality — none of these undo a download that already happened:
   re-push; a re-run of `create-release` regenerates the body from the in-repo template and
   drops hand-added notes — keep known-issue notes in the template fragment, not only on
   the release object.
-* **PyPI / crates.io**: versions are immutable. There is no unpublish; `pip/yank`-style
-  deprecation (PyPI: "yank" with a note; crates: `cargo yank`) hides the version from new
-  resolves without breaking existing lockfiles. A truly broken wheel cannot be replaced
-  under the same version — ship `<version>.post1`/`<version+rev>` and re-point the docs.
+* **PyPI**: maintainers CAN delete a release or a file (pull the wheel if it is
+  broken — do not let immutability folklore stop a pull); what is impossible is re-uploading
+  the same filename+version, so the fix ships as `<version>.post1`. Yanking (with a note)
+  is the softer action: it hides the version from new resolves without breaking existing
+  lockfiles.
+* **crates.io**: no deletion and no un-yank; `cargo yank <crate>@<version>` hides it from
+  new resolves. A replacement cannot ride semver build metadata (`+rev` — cargo ignores it
+  in resolution); bump the patch version instead.
 * **npm**: `npm unpublish` works within the 72-hour window and only if no dependents;
   afterwards `npm deprecate <pkg>@<version> "use <fix version>"`. OIDC-published versions
   carry provenance for the old version; a re-publish under the same version is impossible.
