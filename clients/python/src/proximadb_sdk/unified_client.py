@@ -3880,7 +3880,16 @@ class ProximaDBClient:
         name: str,
         retention_days: int | None = None,
     ) -> dict[str, Any]:
-        """Create a namespace for logs, metrics, and traces."""
+        """Create a namespace for logs, metrics, and traces.
+
+        REST-path note (TD-SDK-3 batch 3): the adapter now implements the
+        namespace/logs/metrics ops over the spec-driven endpoints, so a
+        REST client no longer falls through to the "embedded mode only"
+        NotImplementedError — these calls perform real HTTP (traces remain
+        embedded-only; no REST endpoints). ``retention_days`` means DAYS
+        on REST (hot_retention_days) but HOURS on the embedded engine — a
+        pre-existing divergence now visible because both paths work.
+        """
         if self._active_protocol == Protocol.EMBEDDED and self._client is not None:
             try:
                 result = self._client.create_observability_namespace(

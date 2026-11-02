@@ -15,7 +15,6 @@ from __future__ import annotations
 
 from typing import Any
 
-
 from ._generated.rest.api.documents import ingest_documents as _ingest_op
 from ._generated.rest.models.ingest_document import IngestDocument
 from ._generated.rest.models.ingest_documents_request import (

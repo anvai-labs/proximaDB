@@ -65,9 +65,11 @@ assert len(PORTED_OBSERVABILITY_METHODS) == 8, "batch 3 ported exactly 8"
 
 #: The name-filter keys for the observability census. Lexical, not
 #: semantic — and deliberately not exact on the v1 side until batch 4
-#: lands: three batch-4 names also contain these keys
-#: (get_protocol_metrics, reset_routing_metrics, logout) and belong to
-#: THAT pinned set, not this one.
+#: lands: TWO batch-4 names also contain these keys
+#: (get_protocol_metrics, reset_routing_metrics) and belong to THAT
+#: pinned set, not this one. (`logout` contains no key and escapes the
+#: filter entirely — the v2-side exactness below is exact over the
+#: filtered vocabulary only.)
 _OBS_KEYS = ("observ", "logs", "trace", "namespace", "metric")
 
 
@@ -253,18 +255,19 @@ class TestRestWireEquivalence:
             mock_op.return_value = _ok(
                 TsQueryResponse.from_dict({"points": [{"timestamp": 1}]})
             )
-            out = rest_client.query_timeseries(
-                "ts", 1, 2, aggregation="avg", bucket_ms=60, tag_filters={"h": "a"}
-            )
+            out = rest_client.query_timeseries("ts", 1, 2)
         assert out["points"] == [{"timestamp": 1}]
         body = mock_op.call_args.kwargs["body"].to_dict()
-        # Declared fields parse; the rest ride the model's
-        # additional_properties onto the wire.
         assert body["start_time"] == 1
         assert body["end_time"] == 2
-        assert body["aggregation"] == "avg"
-        assert body["bucket_ms"] == 60
-        assert body["tag_filters"] == {"h": "a"}
+
+    def test_query_aggregation_raises_honestly(self, rest_client):
+        """The server's QueryRequest drops unknown fields — shipping
+        aggregation/bucket_ms/tag_filters would silently return raw
+        points. The adapter raises instead (v2: typed capability error;
+        v1: falls back to the local repo, which honors them)."""
+        with pytest.raises(ProximaDBNotSupportedError):
+            rest_client.query_timeseries("ts", 1, 2, aggregation="max")
 
     def test_list_and_delete_timeseries(self, rest_client):
         from proximadb_sdk._generated.rest.models.ts_delete_response import (

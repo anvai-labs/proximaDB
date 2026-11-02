@@ -748,13 +748,13 @@ class RestProtocolAdapter(SyncGraphDelegations, BaseProtocolAdapter):
         self, name: str, config: dict[str, Any] | None = None, **kwargs
     ) -> dict[str, Any]:
         """Create a document collection (spec-driven op)."""
-        from .._generated_op_exec import execute_generated_op
         from .._generated.rest.api.documents.create_document_collection import (
             sync_detailed,
         )
         from .._generated.rest.models.create_document_collection_request import (
             CreateDocumentCollectionRequest,
         )
+        from .._generated_op_exec import execute_generated_op
 
         # The positional ``name`` is authoritative — a config dict keyed
         # "name" must not silently override it.
@@ -822,9 +822,9 @@ class RestProtocolAdapter(SyncGraphDelegations, BaseProtocolAdapter):
         transport → ``NetworkError``, documented errors and undocumented
         statuses → ``ServerError`` (the op documents 200/400/500).
         """
-        from .._generated_op_exec import execute_generated_op
         from .._generated.rest.api.documents.insert_document import sync_detailed
         from .._generated.rest.models.doc_insert_request import DocInsertRequest
+        from .._generated_op_exec import execute_generated_op
 
         # Wave-9 typed the previously free-form request body
         # (InsertDocumentBody) into DocInsertRequest {id?, document}.
@@ -846,9 +846,9 @@ class RestProtocolAdapter(SyncGraphDelegations, BaseProtocolAdapter):
         **kwargs,
     ) -> dict[str, Any] | None:
         """Get a document by ID (spec-driven op; 404 → ``None``)."""
-        from .._generated_op_exec import execute_generated_op
         from .._generated.rest.api.documents.get_document import sync_detailed
         from .._generated.rest.types import UNSET
+        from .._generated_op_exec import execute_generated_op
 
         projection_csv = ",".join(projection) if projection else UNSET
         return execute_generated_op(
@@ -873,9 +873,9 @@ class RestProtocolAdapter(SyncGraphDelegations, BaseProtocolAdapter):
         """Query documents with filter (spec-driven op; filter → JSON param)."""
         import json as _json
 
-        from .._generated_op_exec import execute_generated_op
         from .._generated.rest.api.documents.query_documents import sync_detailed
         from .._generated.rest.types import UNSET
+        from .._generated_op_exec import execute_generated_op
 
         return execute_generated_op(
             "query_documents",
@@ -892,9 +892,9 @@ class RestProtocolAdapter(SyncGraphDelegations, BaseProtocolAdapter):
         self, collection_name: str, doc_id: str, updates: list[dict[str, Any]], **kwargs
     ) -> dict[str, Any]:
         """Update a document (spec-driven op)."""
-        from .._generated_op_exec import execute_generated_op
         from .._generated.rest.api.documents.update_document import sync_detailed
         from .._generated.rest.models.doc_update_request import DocUpdateRequest
+        from .._generated_op_exec import execute_generated_op
 
         body = DocUpdateRequest.from_dict({"updates": updates})
         return execute_generated_op(
@@ -909,8 +909,8 @@ class RestProtocolAdapter(SyncGraphDelegations, BaseProtocolAdapter):
 
     def delete_document(self, collection_name: str, doc_id: str, **kwargs) -> bool:
         """Delete a document (spec-driven op; 404 → ``False``)."""
-        from .._generated_op_exec import execute_generated_op
         from .._generated.rest.api.documents.delete_document import sync_detailed
+        from .._generated_op_exec import execute_generated_op
 
         result = execute_generated_op(
             "delete_document",
@@ -927,10 +927,10 @@ class RestProtocolAdapter(SyncGraphDelegations, BaseProtocolAdapter):
 
     def list_document_collections(self, **kwargs) -> list[dict[str, Any]]:
         """List all document collections (spec-driven op)."""
-        from .._generated_op_exec import execute_generated_op
         from .._generated.rest.api.documents.list_document_collections import (
             sync_detailed,
         )
+        from .._generated_op_exec import execute_generated_op
 
         result = execute_generated_op(
             "list_document_collections",
@@ -941,10 +941,10 @@ class RestProtocolAdapter(SyncGraphDelegations, BaseProtocolAdapter):
 
     def delete_document_collection(self, collection_name: str, **kwargs) -> bool:
         """Delete a document collection (spec-driven op; 404 → ``False``)."""
-        from .._generated_op_exec import execute_generated_op
         from .._generated.rest.api.documents.delete_document_collection import (
             sync_detailed,
         )
+        from .._generated_op_exec import execute_generated_op
 
         result = execute_generated_op(
             "delete_document_collection",
@@ -1011,13 +1011,10 @@ class RestProtocolAdapter(SyncGraphDelegations, BaseProtocolAdapter):
         from .._generated_op_exec import execute_generated_op
 
         # The positional ``name`` is authoritative; config keys (known or
-        # additional) ride the model's additional_properties.
-        body = TsCollectionConfig.from_dict(
-            {
-                "name": name,
-                **{k: v for k, v in (config or {}).items() if k != "name"},
-            }
-        )
+        # additional) ride the model's additional_properties. The body
+        # builds INSIDE the executed callable so a malformed config (a
+        # TsValueColumn missing its required `name`, say) maps to
+        # ProximaDBError, not a raw KeyError.
         return execute_generated_op(
             "create_timeseries_collection",
             lambda: sync_detailed(
@@ -1072,16 +1069,24 @@ class RestProtocolAdapter(SyncGraphDelegations, BaseProtocolAdapter):
         from .._generated.rest.models.ts_query_request import TsQueryRequest
         from .._generated_op_exec import execute_generated_op
 
+        if aggregation is not None or bucket_ms is not None or tag_filters is not None:
+            # The server's QueryRequest declares ONLY start_time/end_time/
+            # limit and serde DROPS unknown fields — shipping these would
+            # be a silent no-op (raw points, aggregation ignored). Raise
+            # the honest capability signal instead: v2 surfaces the typed
+            # ProximaDBNotSupportedError; v1's dispatch falls back to the
+            # in-memory repository, which honors them (its users' actual
+            # pre-batch behavior).
+            raise NotImplementedError(
+                "query_timeseries(aggregation/bucket_ms/tag_filters) is not "
+                "supported by the REST query op (the server drops unknown "
+                "fields); use the aggregate_timeseries op or the embedded/"
+                "local path"
+            )
         payload: dict[str, Any] = {
             "start_time": start_time,
             "end_time": end_time,
         }
-        if aggregation is not None:
-            payload["aggregation"] = aggregation
-        if bucket_ms is not None:
-            payload["bucket_ms"] = bucket_ms
-        if tag_filters is not None:
-            payload["tag_filters"] = tag_filters
         if "limit" in kwargs:
             payload["limit"] = kwargs["limit"]
         return execute_generated_op(

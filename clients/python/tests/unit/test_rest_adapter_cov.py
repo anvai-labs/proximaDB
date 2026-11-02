@@ -1216,20 +1216,13 @@ def test_query_timeseries_full(doc_adapter):
     op = (
         "proximadb_sdk._generated.rest.api.timeseries" ".query_timeseries.sync_detailed"
     )
-    with patch(op) as mock_op:
-        mock_op.return_value = _ok_ts(
-            TsQueryResponse.from_dict({"points": [{"timestamp": 1}]})
-        )
-        out = doc_adapter.query_timeseries(
+    # aggregation/bucket_ms/tag_filters raise the honest capability
+    # signal (the server's QueryRequest drops unknown fields — shipping
+    # them would silently return raw points).
+    with pytest.raises(NotImplementedError):
+        doc_adapter.query_timeseries(
             "ts", 1, 2, aggregation="avg", bucket_ms=60, tag_filters={"h": "a"}
         )
-    assert out["points"] == [{"timestamp": 1}]
-    body = mock_op.call_args.kwargs["body"].to_dict()
-    assert body["start_time"] == 1
-    assert body["end_time"] == 2
-    assert body["aggregation"] == "avg"
-    assert body["bucket_ms"] == 60
-    assert body["tag_filters"] == {"h": "a"}
 
 
 def test_query_timeseries_minimal(doc_adapter):
