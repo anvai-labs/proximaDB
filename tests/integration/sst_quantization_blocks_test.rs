@@ -174,7 +174,7 @@ async fn test_pq_quantization_256kb_blocks() -> Result<()> {
 
     // Setup quantization adapter (for future use when SstQuantizationAdapter is available)
     let _pq_config = UnifiedQuantizationLevel {
-        level_type: Some(proximadb::compute::quantization::QuantizationLevel::Pq(
+        level_type: Some(proximadb::compute::quantization::QuantizationStrategy::Pq(
             PqConfig {
                 num_subvectors: 8,
                 bits_per_code: 8,

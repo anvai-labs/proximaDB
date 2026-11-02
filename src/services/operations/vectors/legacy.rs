@@ -494,28 +494,32 @@ fn vector_record_to_rich_result(record: ProximaRecord) -> RichSearchResult {
 /// Convert a query optimizer quantization strategy to a unified quantization level.
 #[allow(dead_code)]
 fn quantization_strategy_to_level(strategy: &QuantizationStrategy) -> UnifiedQuantizationLevel {
+    // Aliased: this file already binds the query optimizer's
+    // QuantizationStrategy at module scope, so the model crate's renamed
+    // enum (TD-QUANT-1) needs a distinct local name here.
     use crate::compute::quantization::types::{
-        BinaryQuantization, ProductQuantization, QuantizationLevel, ScalarQuantization,
+        BinaryQuantization, ProductQuantization, QuantizationStrategy as ModelLevel,
+        ScalarQuantization,
     };
 
     let level_type = match strategy.quantization_type {
-        QuantizationType::Binary => Some(QuantizationLevel::Binary(BinaryQuantization {
+        QuantizationType::Binary => Some(ModelLevel::Binary(BinaryQuantization {
             threshold: None,
             sign_based: false,
         })),
-        QuantizationType::INT8 => Some(QuantizationLevel::Scalar(ScalarQuantization {
+        QuantizationType::INT8 => Some(ModelLevel::Scalar(ScalarQuantization {
             bits: 8,
             scale: 1.0,
             offset: 0.0,
             clamp_values: false,
         })),
-        QuantizationType::PQ4 => Some(QuantizationLevel::Pq(ProductQuantization {
+        QuantizationType::PQ4 => Some(ModelLevel::Pq(ProductQuantization {
             num_subvectors: 8, // default
             bits_per_code: 4,
             codebook_id: None,
             adaptive_subvectors: false,
         })),
-        QuantizationType::PQ8 => Some(QuantizationLevel::Pq(ProductQuantization {
+        QuantizationType::PQ8 => Some(ModelLevel::Pq(ProductQuantization {
             num_subvectors: 8, // default
             bits_per_code: 8,
             codebook_id: None,
@@ -6771,22 +6775,22 @@ mod index_first_search_tests {
     #[test]
     fn test_quantization_levels() {
         use crate::compute::quantization::types::{
-            BinaryQuantization, ProductQuantization, QuantizationLevel, ScalarQuantization,
+            BinaryQuantization, ProductQuantization, QuantizationStrategy, ScalarQuantization,
         };
 
         // Test that quantization levels are properly defined
         let levels = [
-            QuantizationLevel::Binary(BinaryQuantization {
+            QuantizationStrategy::Binary(BinaryQuantization {
                 threshold: None,
                 sign_based: false,
             }),
-            QuantizationLevel::Scalar(ScalarQuantization {
+            QuantizationStrategy::Scalar(ScalarQuantization {
                 scale: 1.0,
                 offset: 0.0,
                 bits: 8, // INT8 quantization
                 clamp_values: true,
             }),
-            QuantizationLevel::Pq(ProductQuantization {
+            QuantizationStrategy::Pq(ProductQuantization {
                 bits_per_code: 8,
                 num_subvectors: 8,
                 codebook_id: None,
@@ -6796,13 +6800,13 @@ mod index_first_search_tests {
 
         for level in &levels {
             match level {
-                QuantizationLevel::Binary(_) => {
+                QuantizationStrategy::Binary(_) => {
                     assert!(true, "Binary quantization available");
                 }
-                QuantizationLevel::Scalar(_) => {
+                QuantizationStrategy::Scalar(_) => {
                     assert!(true, "Scalar quantization available");
                 }
-                QuantizationLevel::Pq(_) => {
+                QuantizationStrategy::Pq(_) => {
                     assert!(true, "Product quantization available");
                 }
                 _ => {}

@@ -10,7 +10,7 @@ use std::sync::Arc;
 use tracing::{debug, info, warn};
 
 use super::quantization_engine::{
-    InMemoryCodebookStore, QuantizationLevel, QuantizationMetadata, QuantizedVector,
+    InMemoryCodebookStore, QuantizationMetadata, QuantizationStrategy, QuantizedVector,
     UnifiedQuantizationEngine, UnifiedQuantizationLevel,
 };
 use proximadb_distance_kernel::engine::{DistanceMetric, UnifiedDistanceCompute};
@@ -158,7 +158,7 @@ impl StorageQuantizationEngine {
 
         // Train primary quantization (PQ)
         if let Some(ref level) = self.config.primary_level
-            && let Some(QuantizationLevel::Pq(pq)) = &level.level_type
+            && let Some(QuantizationStrategy::Pq(pq)) = &level.level_type
         {
             let codebook_id = format!("storage_pq_{}_{}", pq.num_subvectors, pq.bits_per_code);
 
@@ -254,7 +254,7 @@ impl StorageQuantizationEngine {
             if let Some(ref level) = self.config.primary_level {
                 // Clone level and add codebook_id if PQ
                 let mut level_with_codebook = level.clone();
-                if let Some(QuantizationLevel::Pq(pq)) = &mut level_with_codebook.level_type {
+                if let Some(QuantizationStrategy::Pq(pq)) = &mut level_with_codebook.level_type {
                     // Set the codebook_id based on the configuration
                     pq.codebook_id = Some(format!(
                         "storage_pq_{}_{}",
@@ -313,13 +313,13 @@ impl StorageQuantizationEngine {
             // Generate primary quantization with selected level
             if let Some(ref level) = self.config.primary_level {
                 // Check if it's a PQ level by examining the internal structure
-                let level_with_codebook = if let Some(QuantizationLevel::Pq(_)) = &level.level_type
-                {
-                    // For PQ levels, use the configured level directly
-                    level.clone()
-                } else {
-                    level.clone()
-                };
+                let level_with_codebook =
+                    if let Some(QuantizationStrategy::Pq(_)) = &level.level_type {
+                        // For PQ levels, use the configured level directly
+                        level.clone()
+                    } else {
+                        level.clone()
+                    };
                 // Pass slice directly - no conversion needed
                 data.primary = Some(
                     self.unified_engine
@@ -538,7 +538,7 @@ impl StorageQuantizationEngine {
         metric: &DistanceMetric,
     ) -> Result<f32> {
         match &quantized_vector.quantization_level.level_type {
-            Some(QuantizationLevel::Scalar(scalar)) => {
+            Some(QuantizationStrategy::Scalar(scalar)) => {
                 // Use existing INT8 SIMD infrastructure from distance_computation
                 // The quantized data is stored in the data field
                 let int8_data: Vec<i8> = quantized_vector.data.iter().map(|&b| b as i8).collect();
@@ -554,7 +554,7 @@ impl StorageQuantizationEngine {
                 );
                 Ok(result.raw_value)
             }
-            Some(QuantizationLevel::Binary(_)) => {
+            Some(QuantizationStrategy::Binary(_)) => {
                 // Use Hamming distance for binary vectors
                 // Binary data is stored in the data field
                 let query_binary = self.fp32_to_binary(query);
@@ -566,7 +566,7 @@ impl StorageQuantizationEngine {
                     .sum::<u32>();
                 Ok(hamming_dist as f32)
             }
-            Some(QuantizationLevel::Pq(_)) => {
+            Some(QuantizationStrategy::Pq(_)) => {
                 // Use PQ lookup table optimization
                 self.calculate_pq_simd_distance(query, quantized_vector, metric)
             }
@@ -607,18 +607,19 @@ impl StorageQuantizationEngine {
         metric: &DistanceMetric,
     ) -> Result<f32> {
         // Extract PQ parameters from quantization level
-        let (num_subvectors, bits_per_code, codebook_id) = if let Some(QuantizationLevel::Pq(pq)) =
-            &quantized_vector.quantization_level.level_type
-        {
-            (
-                pq.num_subvectors as usize,
-                pq.bits_per_code as u8,
-                pq.codebook_id.clone().unwrap_or_default(),
-            )
-        } else {
-            // Fallback if not PQ
-            return self.calculate_fp32_simd_distance(query, quantized_vector, metric);
-        };
+        let (num_subvectors, bits_per_code, codebook_id) =
+            if let Some(QuantizationStrategy::Pq(pq)) =
+                &quantized_vector.quantization_level.level_type
+            {
+                (
+                    pq.num_subvectors as usize,
+                    pq.bits_per_code as u8,
+                    pq.codebook_id.clone().unwrap_or_default(),
+                )
+            } else {
+                // Fallback if not PQ
+                return self.calculate_fp32_simd_distance(query, quantized_vector, metric);
+            };
 
         // Try to get cached codebook
         if let Some(codebook_centroids) = self.codebooks.get(&codebook_id) {
@@ -884,7 +885,7 @@ impl StorageQuantizationEngine {
 
         // Check if we have PQ quantization configuration and precompute distance table
         if let Some(ref level) = self.config.primary_level
-            && let Some(QuantizationLevel::Pq(pq)) = &level.level_type
+            && let Some(QuantizationStrategy::Pq(pq)) = &level.level_type
         {
             // Precompute distance table for faster PQ distance calculations
             let _distance_table = self.precompute_pq_distance_table(

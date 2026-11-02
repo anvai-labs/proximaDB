@@ -45,7 +45,7 @@ use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 use datafusion::physical_plan::ExecutionPlan;
 use serde::{Deserialize, Serialize};
 
-use crate::compute::quantization::QuantizationLevel;
+use crate::compute::quantization::QuantizationStrategy;
 use crate::storage::formats::FileSplit;
 use crate::storage::traits::StorageFormatStrategy;
 
@@ -136,7 +136,7 @@ pub struct DataFusionCollectionInfo {
     /// Storage engine type
     pub engine_type: EngineType,
     /// Quantization type if enabled
-    pub quantization: Option<QuantizationLevel>,
+    pub quantization: Option<QuantizationStrategy>,
     /// Total storage size in bytes
     pub storage_size_bytes: u64,
     /// Number of data files
@@ -178,7 +178,7 @@ impl DataFusionCollectionInfo {
     }
 
     /// Builder method to set quantization type.
-    pub fn with_quantization(mut self, quant: QuantizationLevel) -> Self {
+    pub fn with_quantization(mut self, quant: QuantizationStrategy) -> Self {
         self.quantization = Some(quant);
         self
     }

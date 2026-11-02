@@ -43,7 +43,7 @@ mod tests {
     fn test_turboquant_identity_constructor() {
         let q = UnifiedQuantizationLevel::turboquant_identity(4, 42);
         match &q.level_type {
-            Some(QuantizationLevel::TurboQuant(tq)) => {
+            Some(QuantizationStrategy::TurboQuant(tq)) => {
                 assert_eq!(tq.bit_width, 4);
                 assert_eq!(tq.rotation_seed, 42);
                 assert_eq!(tq.calibration_mode, CalibrationMode::Identity);
@@ -203,20 +203,20 @@ mod tests {
 
     #[test]
     fn quantization_method_blanket_on_quantization_level_delegates_correctly() {
-        // QuantizationLevel is the enum every router holds — verify each
+        // QuantizationStrategy is the enum every router holds — verify each
         // arm delegates to its inner variant.
-        let none = QuantizationLevel::None(NoQuantization {});
+        let none = QuantizationStrategy::None(NoQuantization {});
         assert_eq!(none.quantization_type(), QuantizationType::None);
         assert_eq!(none.lifecycle(), QuantizationLifecycle::Identity);
 
-        let bin = QuantizationLevel::Binary(BinaryQuantization {
+        let bin = QuantizationStrategy::Binary(BinaryQuantization {
             threshold: None,
             sign_based: false,
         });
         assert_eq!(bin.quantization_type(), QuantizationType::Binary);
         assert_eq!(bin.bit_width(), 1);
 
-        let pq = QuantizationLevel::Pq(ProductQuantization {
+        let pq = QuantizationStrategy::Pq(ProductQuantization {
             bits_per_code: 8,
             num_subvectors: 16,
             codebook_id: Some("cb".to_string()),

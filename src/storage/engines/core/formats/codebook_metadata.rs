@@ -14,7 +14,9 @@ use std::sync::Arc;
 
 use crate::compute::quantization::{
     global_cache::{GlobalQuantizationCache, QuantizationCacheKey},
-    quantization_engine::{Codebook, CodebookData, QuantizationLevel, UnifiedQuantizationEngine},
+    quantization_engine::{
+        Codebook, CodebookData, QuantizationStrategy, UnifiedQuantizationEngine,
+    },
     storage_engine::StorageQuantizationEngine,
 };
 
@@ -263,12 +265,13 @@ impl CodebookSerializer {
         } = &codebook.data
         {
             // Extract quantization parameters from the level
-            let (num_subvectors, bits_per_code) =
-                if let Some(QuantizationLevel::Pq(pq)) = &codebook.quantization_level.level_type {
-                    (pq.num_subvectors, pq.bits_per_code)
-                } else {
-                    return Err(anyhow::anyhow!("Codebook is not PQ type"));
-                };
+            let (num_subvectors, bits_per_code) = if let Some(QuantizationStrategy::Pq(pq)) =
+                &codebook.quantization_level.level_type
+            {
+                (pq.num_subvectors, pq.bits_per_code)
+            } else {
+                return Err(anyhow::anyhow!("Codebook is not PQ type"));
+            };
 
             let num_centroids = 1 << bits_per_code;
             let subvector_dim = *_subvector_dim;
