@@ -290,6 +290,43 @@ async fn raw_connect(server: &PgServer) -> tokio::net::TcpStream {
     stream
 }
 
+// One Execute round: Execute(portal, max_rows) + Sync, collecting message
+// tags up to ReadyForQuery. Returns (data_row_count, saw_portal_suspended,
+// saw_command_complete, first_row_bytes).
+async fn execute_round(
+    stream: &mut tokio::net::TcpStream,
+    max_rows: i32,
+) -> (usize, bool, bool, Option<Vec<u8>>) {
+    use tokio::io::AsyncWriteExt;
+    // Execute body: portal name as a cstring (the unnamed portal is ONE
+    // 0 byte) followed by the i32 row budget — 5 bytes total, matching
+    // parse_bind_execute's `[0, 0,0,0,0]`.
+    let mut frame = vec![0u8];
+    frame.extend_from_slice(&max_rows.to_be_bytes());
+    let mut out = message(b'E', &frame);
+    out.extend(message(b'S', &[]));
+    stream.write_all(&out).await.expect("execute+sync");
+    let mut data_rows = 0usize;
+    let mut first_row: Option<Vec<u8>> = None;
+    let (mut suspended, mut complete) = (false, false);
+    loop {
+        let (tag, body) = read_message(stream).await;
+        match tag {
+            b'D' => {
+                if first_row.is_none() {
+                    first_row = Some(body);
+                }
+                data_rows += 1;
+            }
+            b's' => suspended = true,
+            b'C' => complete = true,
+            b'Z' => break,
+            _ => {}
+        }
+    }
+    (data_rows, suspended, complete, first_row)
+}
+
 /// Parse + Bind (no parameters, text results) + Execute on the unnamed
 /// statement/portal.
 fn parse_bind_execute(sql: &str) -> Vec<u8> {
@@ -351,39 +388,8 @@ async fn execute_max_rows_pages_the_legacy_reader_e2e() {
         }
     }
 
-    // One Execute round: Execute(portal, max_rows) + Sync, collecting message
-    // tags up to ReadyForQuery. Returns (data_row_count, saw_portal_suspended,
-    // saw_command_complete).
-    async fn execute_round(
-        stream: &mut tokio::net::TcpStream,
-        max_rows: i32,
-    ) -> (usize, bool, bool) {
-        use tokio::io::AsyncWriteExt;
-        // Execute body: portal name as a cstring (the unnamed portal is ONE
-        // 0 byte) followed by the i32 row budget — 5 bytes total, matching
-        // parse_bind_execute's `[0, 0,0,0,0]`.
-        let mut frame = vec![0u8];
-        frame.extend_from_slice(&max_rows.to_be_bytes());
-        let mut out = message(b'E', &frame);
-        out.extend(message(b'S', &[]));
-        stream.write_all(&out).await.expect("execute+sync");
-        let mut data_rows = 0usize;
-        let (mut suspended, mut complete) = (false, false);
-        loop {
-            let (tag, _) = read_message(stream).await;
-            match tag {
-                b'D' => data_rows += 1,
-                b's' => suspended = true,
-                b'C' => complete = true,
-                b'Z' => break,
-                _ => {}
-            }
-        }
-        (data_rows, suspended, complete)
-    }
-
     // Page 1: exactly one row, then PortalSuspended — NOT CommandComplete.
-    let (rows, suspended, complete) = execute_round(&mut stream, 1).await;
+    let (rows, suspended, complete, page1_row) = execute_round(&mut stream, 1).await;
     assert_eq!(rows, 1, "Execute(max_rows=1) must emit exactly one row");
     assert!(
         suspended && !complete,
@@ -394,12 +400,67 @@ async fn execute_max_rows_pages_the_legacy_reader_e2e() {
     // that used to take the non-paging branch and RE-RUN the query, serving
     // both rows AGAIN as duplicates. Exactly one row here proves it drained
     // the cursor instead of re-executing.
-    let (rows, suspended, complete) = execute_round(&mut stream, 0).await;
+    let (rows, suspended, complete, page2_row) = execute_round(&mut stream, 0).await;
     assert_eq!(
         rows, 1,
         "max_rows=0 must drain exactly the one remaining row"
     );
     assert!(complete && !suspended, "the drain ends in CommandComplete");
+    assert_ne!(
+        page1_row, page2_row,
+        "the drained row must be the OTHER row, not a re-serve of page 1's"
+    );
+    assert!(!client.is_closed());
+}
+
+/// TD-PGPORTAL-1 (review round 1, finding 1): a budgeted portal must honor
+/// the SQL LIMIT, not just the Execute budget — with an ORDER BY the fetch
+/// retrieves every matching row (sort-then-truncate semantics) and the
+/// portal used to stream past the LIMIT forever: Execute(1) pages would
+/// keep yielding rows until the TABLE ran out, not the LIMIT.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn budgeted_portal_honors_the_sql_limit_with_order_by_e2e() {
+    use tokio::io::AsyncWriteExt;
+
+    let server = PgServer::start().await.expect("server start");
+    let client = connect(&server).await;
+    seed(&client).await; // 2 rows
+
+    let mut stream = raw_connect(&server).await;
+    let sql = "SELECT * FROM menu_items ORDER BY id LIMIT 1";
+    let mut parse = vec![0u8];
+    parse.extend_from_slice(sql.as_bytes());
+    parse.push(0);
+    parse.extend_from_slice(&0i16.to_be_bytes());
+    let mut bind = vec![0u8, 0u8];
+    bind.extend_from_slice(&0i16.to_be_bytes());
+    bind.extend_from_slice(&0i16.to_be_bytes());
+    bind.extend_from_slice(&0i16.to_be_bytes());
+    let mut out = message(b'P', &parse);
+    out.extend(message(b'B', &bind));
+    out.extend(message(b'S', &[]));
+    stream.write_all(&out).await.expect("parse+bind+sync");
+    loop {
+        let (tag, _) = read_message(&mut stream).await;
+        if tag == b'Z' {
+            break;
+        }
+    }
+
+    let (rows, suspended, complete, _) = execute_round(&mut stream, 1).await;
+    assert_eq!(
+        rows, 1,
+        "the page holds the LIMIT's one row — not the whole table"
+    );
+    assert!(
+        complete && !suspended,
+        "the LIMIT is exhausted: CommandComplete, never PortalSuspended"
+    );
+
+    // A further Execute must not resurrect the query past its LIMIT.
+    let (rows, _, complete, _) = execute_round(&mut stream, 0).await;
+    assert_eq!(rows, 0, "nothing remains past the LIMIT");
+    assert!(complete);
     assert!(!client.is_closed());
 }
 

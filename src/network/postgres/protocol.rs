@@ -4077,6 +4077,30 @@ impl PostgresProtocol {
     /// misparsing `customer,` or `(select` as a table name. Inspects only the
     /// FROM clause segment (up to the next clause keyword), so commas in the
     /// projection, WHERE `IN (…)` lists, or ORDER BY never false-positive.
+    /// TD-PGPORTAL-1: does `upper` name a statement the pre-dispatch special
+    /// cases answer (version/settings/catalog introspection)? Both Describe's
+    /// classification and the portal legacy branch must exclude these — one
+    /// predicate so the two cannot drift.
+    fn is_pre_dispatch_special(upper: &str) -> bool {
+        const SPECIAL: [&str; 13] = [
+            "AS SERVER_VERSION",
+            "VERSION()",
+            "AS SERVER_ENCODING",
+            "AS CLIENT_ENCODING",
+            "AS TIMEZONE",
+            "AS SEARCH_PATH",
+            "CURRENT_SCHEMA()",
+            "CURRENT_DATABASE()",
+            "CURRENT_USER",
+            "SESSION_USER",
+            "FROM PG_CATALOG",
+            "FROM INFORMATION_SCHEMA",
+            "PG_SETTINGS",
+        ];
+        SPECIAL.iter().any(|marker| upper.contains(marker))
+            || crate::services::CatalogIntrospectionService::is_catalog_query(upper)
+    }
+
     fn legacy_unsupported_from_shape(upper: &str) -> Option<&'static str> {
         let from_pos = upper.find("FROM ")?;
         let after = &upper[from_pos + 5..];
@@ -4890,8 +4914,7 @@ impl PostgresProtocol {
 
     /// Execute a relational query against a cataloged table.
     async fn execute_relational_query(&mut self, query: &str, table_name: &str) -> Result<()> {
-        debug!("Executing relational query on table: {}", table_name);
-
+        // (the fetch-phase debug! lives in legacy_relational_select_result)
         if self.dml_service.is_none() {
             self.send_command_complete("SELECT 0").await?;
             return Ok(());
@@ -7756,17 +7779,52 @@ impl PostgresProtocol {
             // query on the next Execute.
             let upper = query.trim_start().to_uppercase();
             if upper.starts_with("SELECT")
+                // Classification PARITY with the pre-dispatch gates the
+                // fall-through used to run (TD-PGPORTAL-1 review round 1,
+                // finding 2): special cases and catalog introspection keep
+                // their own handlers; unsupported FROM shapes keep the
+                // actionable 0A000 instead of a misparsed-table XX000.
+                && !Self::is_pre_dispatch_special(&upper)
+                && Self::legacy_unsupported_from_shape(&upper).is_none()
                 && let Some(table_name) = self.extract_table_name(query)
                 && matches!(
                     self.detect_select_store_type(&table_name, &upper),
                     DataModel::Relational | DataModel::Event
                 )
             {
+                // Edge-config parity (review finding 4): no DML service is a
+                // silent empty result everywhere else on this surface.
+                if self.dml_service.is_none() {
+                    return self.send_command_complete("SELECT 0").await;
+                }
+                // Cancellation parity (review finding 3): arm the flag for
+                // the fetch and honor it before serving pages. The io_trace
+                // span and the E0 rate limiter remain uncovered on this fast
+                // path — the SAME documented debt the pipeline fast-path
+                // carries a few lines up; tracked on the TD, not dropped.
+                let cancellation_flag = self.session.read().await.cancellation_flag.clone();
+                cancellation_flag.store(false, Ordering::Relaxed);
                 return match self
                     .legacy_relational_select_result(query, &table_name)
                     .await
                 {
-                    Ok((fields, result)) => {
+                    Ok((fields, mut result)) => {
+                        if cancellation_flag.load(Ordering::Relaxed) {
+                            return self
+                                .send_error(
+                                    "ERROR",
+                                    "57014",
+                                    "canceling statement due to user request",
+                                )
+                                .await;
+                        }
+                        // SQL LIMIT parity (review finding 1): with an ORDER BY
+                        // the fetch retrieved every matching row (sorted) and
+                        // the SENDER truncates — the portal must truncate too,
+                        // or a budgeted portal streams past the LIMIT forever.
+                        if let Some(limit) = Self::extract_select_limit(query) {
+                            result.rows.truncate(limit);
+                        }
                         // This route never sends a RowDescription, so check the
                         // shape against Describe here (TD-PGEXT-1), same as the
                         // pipeline branch above.
