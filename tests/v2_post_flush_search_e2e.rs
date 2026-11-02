@@ -928,7 +928,17 @@ async fn v2_fp32_point_read_is_byte_exact_after_compaction() {
 
     // Every flushed segment carries the exact tier (TD-READFID-1). Then wait
     // for the background compaction the fifth flush enqueued to retire them.
-    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    // Compaction is admission-gated; on an idle dev box five L0s retire in
+    // ~3s, but a loaded shared CI runner can hold the gate closed far past
+    // 120s (first seen when this test entered the storage lane: green at
+    // 2.7s locally, deadline-expired in CI). Keep the tight local window
+    // for fast failure and widen it only where runners are slow.
+    let wait_secs = if std::env::var("CI").is_ok_and(|v| v == "true") {
+        480
+    } else {
+        120
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(wait_secs);
     let merged = loop {
         let pax = server.persisted_pax_files();
         if pax.len() == 1 {
