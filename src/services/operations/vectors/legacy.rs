@@ -496,9 +496,9 @@ fn vector_record_to_rich_result(record: ProximaRecord) -> RichSearchResult {
 fn quantization_strategy_to_level(strategy: &QuantizationStrategy) -> UnifiedQuantizationLevel {
     // Aliased: this file already binds the query optimizer's
     // QuantizationStrategy at module scope, so the model crate's renamed
-    // enum (TD-QUANT-1) needs a distinct local name here.
+    // enum (QuantizationScheme, TD-QUANT-1) needs a distinct local name.
     use crate::compute::quantization::types::{
-        BinaryQuantization, ProductQuantization, QuantizationStrategy as ModelLevel,
+        BinaryQuantization, ProductQuantization, QuantizationScheme as ModelLevel,
         ScalarQuantization,
     };
 
@@ -6775,22 +6775,22 @@ mod index_first_search_tests {
     #[test]
     fn test_quantization_levels() {
         use crate::compute::quantization::types::{
-            BinaryQuantization, ProductQuantization, QuantizationStrategy, ScalarQuantization,
+            BinaryQuantization, ProductQuantization, QuantizationScheme, ScalarQuantization,
         };
 
         // Test that quantization levels are properly defined
         let levels = [
-            QuantizationStrategy::Binary(BinaryQuantization {
+            QuantizationScheme::Binary(BinaryQuantization {
                 threshold: None,
                 sign_based: false,
             }),
-            QuantizationStrategy::Scalar(ScalarQuantization {
+            QuantizationScheme::Scalar(ScalarQuantization {
                 scale: 1.0,
                 offset: 0.0,
                 bits: 8, // INT8 quantization
                 clamp_values: true,
             }),
-            QuantizationStrategy::Pq(ProductQuantization {
+            QuantizationScheme::Pq(ProductQuantization {
                 bits_per_code: 8,
                 num_subvectors: 8,
                 codebook_id: None,
@@ -6800,13 +6800,13 @@ mod index_first_search_tests {
 
         for level in &levels {
             match level {
-                QuantizationStrategy::Binary(_) => {
+                QuantizationScheme::Binary(_) => {
                     assert!(true, "Binary quantization available");
                 }
-                QuantizationStrategy::Scalar(_) => {
+                QuantizationScheme::Scalar(_) => {
                     assert!(true, "Scalar quantization available");
                 }
-                QuantizationStrategy::Pq(_) => {
+                QuantizationScheme::Pq(_) => {
                     assert!(true, "Product quantization available");
                 }
                 _ => {}

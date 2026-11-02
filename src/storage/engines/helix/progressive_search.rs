@@ -352,10 +352,10 @@ impl ProgressiveSearchCoordinator {
     ) -> Result<Vec<OptimizedSearchRecord>> {
         let _ = (distance_metric, quantization_level); // Currently unused, will be used for future optimizations
         // Determine if we should use binary or INT8 based on quantization level
-        use proximadb_quantization_model::QuantizationStrategy;
+        use proximadb_quantization_model::QuantizationScheme;
         let use_binary = matches!(
             &quantization_level.level_type,
-            Some(QuantizationStrategy::Binary(_))
+            Some(QuantizationScheme::Binary(_))
         );
 
         // Use the quantized search function that reads from quantized_section

@@ -5,7 +5,7 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | **Executed 2026-11-02 (mechanical rename, PR pending): the model crate's enum is now `QuantizationStrategy` — NOT the originally proposed `QuantizationMethod`, which execution found is already the name of the types crate's dispatch TRAIT (the Quantization Trait Convergence Plan) re-exported by the model crate itself. `QuantizationStrategy` was unclaimed and is the model crate's own docstring vocabulary ("the rich QuantizationStrategy enum"). The `UnifiedQuantizationLevel` wrapper rename remains deferred (deliberately — see Direction).**
+| Status | **Executed 2026-11-02 (mechanical rename, PR pending): the model crate's enum is now `QuantizationScheme`. Two earlier name candidates were rejected at execution time, each verified against the workspace: `QuantizationMethod` is the types crate's dispatch TRAIT (re-exported by the model crate), and `QuantizationStrategy` is bound by TWO root-crate types (`query_optimizer.rs` pub struct; `columnar/mod.rs` pub enum) — the same bare-name collision class this TD removes. `QuantizationScheme` has zero workspace references (grep-verified). The `UnifiedQuantizationLevel` wrapper rename remains deferred (deliberately — see Direction).**
 | Priority | P3 — no current bug; the hazard is reader confusion and import-site aliasing that grows with every new consumer of either crate.
 | Relates to | CLAUDE.md directive 19 (consolidate duplicates / same-named types in two crates is a duplicate to collapse), the 2026-10-31 dedup program item 9 (quantization crates census)
 | Component | `crates/foundation/proximadb-quantization-types` (precision ladder), `crates/foundation/proximadb-quantization-model` (strategy/config enum), and ~20 consumer files.
@@ -24,16 +24,18 @@ compile error at sites that import via re-exports.
 
 == Direction
 
-1. **Rename the MODEL crate's enum** — EXECUTED as `QuantizationLevel` → `QuantizationStrategy`
-   (126 sites across 18 files; the crate's own docstring already called it "the rich
-   QuantizationStrategy enum"). The original proposal `QuantizationMethod` was abandoned at
-   execution time: that name is already the types crate's dispatch trait (Quantization Trait
-   Convergence Plan), re-exported by the model crate — renaming the enum onto it would have
-   created a new, worse collision. "Level" stays with the types crate's precision ladder, which
-   keeps the name unchanged — it is the wire vocabulary and the larger, safer surface.
+1. **Rename the MODEL crate's enum** — EXECUTED as `QuantizationLevel` → `QuantizationScheme`
+   (~166 token sites across 15 code files + this TD). Name selection was empirical: the TD's
+   original proposal `QuantizationMethod` was abandoned (the types crate's dispatch trait,
+   re-exported by the model crate); the second candidate `QuantizationStrategy` was abandoned
+   after adversarial review found two pre-existing root-crate bindings of that name — and
+   found the first attempt's justification ("unclaimed"; "the crate's own docstring already
+   called it that") FALSE: the docstring line it cited was this rename's own edit. Correction
+   recorded here deliberately: decision records must not carry manufactured evidence.
+   `QuantizationScheme` was then verified unclaimed by workspace grep before adoption.
+   "Level" stays with the types crate's precision ladder — the wire vocabulary, unchanged.
    The wrapper `UnifiedQuantizationLevel` and its field `level_type` are EXPLICITLY DEFERRED
-   (no name collision once the enum is renamed; renaming it is cosmetic churn — a follow-up if
-   the wrapper's name bothers anyone).
+   (no name collision once the enum is renamed; cosmetic churn).
 2. **Clean break, no deprecated alias**: a `pub use QuantizationMethod as QuantizationLevel`
    alias would resurrect the exact collision this TD removes (both crates exporting the bare name
    again). Pre-GA renames in this repo are clean breaks (env-gate registry precedent); fix all

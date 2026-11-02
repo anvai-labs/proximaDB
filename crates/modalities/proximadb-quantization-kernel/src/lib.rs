@@ -45,7 +45,7 @@ pub use proximadb_vector::quantization::smart_defaults::QuantizationSmartDefault
 pub use quantization_engine::{
     BinaryQuantization, Codebook, CodebookData, CodebookStore, CustomQuantization,
     InMemoryCodebookStore, NoQuantization, ProductQuantization, QuantizationMetadata,
-    QuantizationStrategy, QuantizedVector, ScalarQuantization, TrainingConfig,
+    QuantizationScheme, QuantizedVector, ScalarQuantization, TrainingConfig,
     UnifiedQuantizationEngine, UnifiedQuantizationLevel, UniformQuantization,
 };
 pub use storage_engine::{StorageQuantizationConfig, StorageQuantizationEngine};

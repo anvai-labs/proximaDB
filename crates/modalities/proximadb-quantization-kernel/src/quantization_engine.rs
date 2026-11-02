@@ -54,7 +54,7 @@ use proximadb_distance_kernel::engine::{SimilarityResult, UnifiedDistanceCompute
 // Use internal types (Release 1 - no legacy proto compatibility)
 pub use super::types::{
     BinaryQuantization, CustomQuantization, NoQuantization, ProductQuantization,
-    QuantizationStrategy, ScalarQuantization, UnifiedQuantizationLevel, UniformQuantization,
+    QuantizationScheme, ScalarQuantization, UnifiedQuantizationLevel, UniformQuantization,
 };
 
 // Implementation is in types.rs to maintain single source of truth
@@ -278,7 +278,7 @@ impl UnifiedQuantizationEngine {
         level: &UnifiedQuantizationLevel,
     ) -> Result<QuantizedVector> {
         match &level.level_type {
-            None | Some(QuantizationStrategy::None(_)) => {
+            None | Some(QuantizationScheme::None(_)) => {
                 // No quantization - store as FP32 bytes
                 let bytes = vector.iter().flat_map(|f| f.to_le_bytes()).collect();
 
@@ -289,7 +289,7 @@ impl UnifiedQuantizationEngine {
                 })
             }
 
-            Some(QuantizationStrategy::Pq(pq)) => {
+            Some(QuantizationScheme::Pq(pq)) => {
                 let codebook_id = pq
                     .codebook_id
                     .as_ref()
@@ -304,19 +304,19 @@ impl UnifiedQuantizationEngine {
                 self.quantize_pq(vector, &codebook)
             }
 
-            Some(QuantizationStrategy::Scalar(s)) => {
+            Some(QuantizationScheme::Scalar(s)) => {
                 self.quantize_scalar(vector, s.bits as u8, s.scale, s.offset)
             }
 
-            Some(QuantizationStrategy::Uniform(u)) => {
+            Some(QuantizationScheme::Uniform(u)) => {
                 self.quantize_uniform(vector, u.bits as u8, u.scale.as_ref(), u.offset.as_ref())
             }
 
-            Some(QuantizationStrategy::Binary(b)) => {
+            Some(QuantizationScheme::Binary(b)) => {
                 self.quantize_binary(vector, b.threshold.as_ref())
             }
 
-            Some(QuantizationStrategy::Custom(c)) => {
+            Some(QuantizationScheme::Custom(c)) => {
                 // Custom quantization allows user-defined compression schemes
                 // We'll implement a flexible approach that supports various custom methods
                 self.quantize_custom(vector, c)
@@ -336,7 +336,7 @@ impl UnifiedQuantizationEngine {
             // (Phase D) honour this contract. Reaching this arm is a
             // wire-contract violation worth a loud error.
             #[cfg(feature = "experimental-turboquant")]
-            Some(QuantizationStrategy::TurboQuant(_)) => {
+            Some(QuantizationScheme::TurboQuant(_)) => {
                 anyhow::bail!(
                     "TurboQuant has lifecycle=ReadTime; UnifiedQuantizationEngine::quantize \
                      is the WriteTime seam. Switch on QuantizationMethod::lifecycle() and \
@@ -355,7 +355,7 @@ impl UnifiedQuantizationEngine {
         metric: &DistanceMetric,
     ) -> Result<SimilarityResult> {
         match &quantized_vector.quantization_level.level_type {
-            None | Some(QuantizationStrategy::None(_)) => {
+            None | Some(QuantizationScheme::None(_)) => {
                 // Direct FP32 comparison
                 let vector = self.dequantize_fp32(&quantized_vector.data)?;
                 Ok(self
@@ -363,7 +363,7 @@ impl UnifiedQuantizationEngine {
                     .similarity(query, &vector, Some(*metric)))
             }
 
-            Some(QuantizationStrategy::Pq(pq)) => {
+            Some(QuantizationScheme::Pq(pq)) => {
                 // Use asymmetric distance computation for efficiency
                 let codebook_id = pq
                     .codebook_id
@@ -411,7 +411,7 @@ impl UnifiedQuantizationEngine {
 
         if all_same {
             // Optimized batch processing for same quantization level
-            if let Some(QuantizationStrategy::Pq(pq)) = &first_level.level_type
+            if let Some(QuantizationScheme::Pq(pq)) = &first_level.level_type
                 && let Some(codebook_id) = &pq.codebook_id
             {
                 let codebook = self
@@ -486,7 +486,7 @@ impl UnifiedQuantizationEngine {
         let codebook = Codebook {
             id: codebook_id.to_string(),
             quantization_level: UnifiedQuantizationLevel {
-                level_type: Some(QuantizationStrategy::Pq(ProductQuantization {
+                level_type: Some(QuantizationScheme::Pq(ProductQuantization {
                     bits_per_code: bits_per_code as i32,
                     num_subvectors: num_subvectors as i32,
                     codebook_id: Some(codebook_id.to_string()),
@@ -639,15 +639,15 @@ impl UnifiedQuantizationEngine {
     /// Dequantize back to approximate FP32 vector
     pub async fn dequantize(&self, quantized_vector: &QuantizedVector) -> Result<Vec<f32>> {
         match &quantized_vector.quantization_level.level_type {
-            None | Some(QuantizationStrategy::None(_)) => {
+            None | Some(QuantizationScheme::None(_)) => {
                 self.dequantize_fp32(&quantized_vector.data)
             }
 
-            Some(QuantizationStrategy::Scalar(s)) => {
+            Some(QuantizationScheme::Scalar(s)) => {
                 self.dequantize_scalar(&quantized_vector.data, s.bits as u8, s.scale, s.offset)
             }
 
-            Some(QuantizationStrategy::Uniform(u)) => self.dequantize_uniform(
+            Some(QuantizationScheme::Uniform(u)) => self.dequantize_uniform(
                 &quantized_vector.data,
                 u.bits as u8,
                 u.scale.unwrap_or(1.0),
@@ -745,7 +745,7 @@ impl UnifiedQuantizationEngine {
         Ok(QuantizedVector {
             data: bytes,
             quantization_level: UnifiedQuantizationLevel {
-                level_type: Some(QuantizationStrategy::Scalar(ScalarQuantization {
+                level_type: Some(QuantizationScheme::Scalar(ScalarQuantization {
                     bits: bits as i32,
                     scale,
                     offset,
@@ -796,7 +796,7 @@ impl UnifiedQuantizationEngine {
         Ok(QuantizedVector {
             data: bytes,
             quantization_level: UnifiedQuantizationLevel {
-                level_type: Some(QuantizationStrategy::Uniform(UniformQuantization {
+                level_type: Some(QuantizationScheme::Uniform(UniformQuantization {
                     bits: bits as i32,
                     scale: Some(scale),
                     offset: Some(offset),
@@ -824,7 +824,7 @@ impl UnifiedQuantizationEngine {
         Ok(QuantizedVector {
             data: bytes,
             quantization_level: UnifiedQuantizationLevel {
-                level_type: Some(QuantizationStrategy::Binary(BinaryQuantization {
+                level_type: Some(QuantizationScheme::Binary(BinaryQuantization {
                     threshold: Some(threshold),
                     sign_based: false,
                 })),
@@ -872,7 +872,7 @@ impl UnifiedQuantizationEngine {
         Ok(QuantizedVector {
             data: quantized_data,
             quantization_level: UnifiedQuantizationLevel {
-                level_type: Some(QuantizationStrategy::Custom(custom.clone())),
+                level_type: Some(QuantizationScheme::Custom(custom.clone())),
             },
             metadata: QuantEngineQuantizationMetadata {
                 codebook_id: None,
@@ -1485,23 +1485,23 @@ impl UnifiedQuantizationEngine {
         let same_type = matches!(
             (query_type, data_type),
             (
-                Some(QuantizationStrategy::None(_)),
-                Some(QuantizationStrategy::None(_))
+                Some(QuantizationScheme::None(_)),
+                Some(QuantizationScheme::None(_))
             ) | (
-                Some(QuantizationStrategy::Uniform(_)),
-                Some(QuantizationStrategy::Uniform(_))
+                Some(QuantizationScheme::Uniform(_)),
+                Some(QuantizationScheme::Uniform(_))
             ) | (
-                Some(QuantizationStrategy::Pq(_)),
-                Some(QuantizationStrategy::Pq(_))
+                Some(QuantizationScheme::Pq(_)),
+                Some(QuantizationScheme::Pq(_))
             ) | (
-                Some(QuantizationStrategy::Scalar(_)),
-                Some(QuantizationStrategy::Scalar(_))
+                Some(QuantizationScheme::Scalar(_)),
+                Some(QuantizationScheme::Scalar(_))
             ) | (
-                Some(QuantizationStrategy::Binary(_)),
-                Some(QuantizationStrategy::Binary(_))
+                Some(QuantizationScheme::Binary(_)),
+                Some(QuantizationScheme::Binary(_))
             ) | (
-                Some(QuantizationStrategy::Custom(_)),
-                Some(QuantizationStrategy::Custom(_))
+                Some(QuantizationScheme::Custom(_)),
+                Some(QuantizationScheme::Custom(_))
             )
         );
         // TurboQuant: same-type pair. Match arm is feature-gated so the
@@ -1514,8 +1514,8 @@ impl UnifiedQuantizationEngine {
                     &data.quantization_level.level_type
                 ),
                 (
-                    Some(QuantizationStrategy::TurboQuant(_)),
-                    Some(QuantizationStrategy::TurboQuant(_))
+                    Some(QuantizationScheme::TurboQuant(_)),
+                    Some(QuantizationScheme::TurboQuant(_))
                 )
             );
 
@@ -1525,7 +1525,7 @@ impl UnifiedQuantizationEngine {
         }
 
         match &query.quantization_level.level_type {
-            None | Some(QuantizationStrategy::None(_)) => {
+            None | Some(QuantizationScheme::None(_)) => {
                 // FP32 vectors stored as bytes
                 let query_floats = self.bytes_to_f32(&query.data);
                 let data_floats = self.bytes_to_f32(&data.data);
@@ -1533,16 +1533,16 @@ impl UnifiedQuantizationEngine {
                     .calculate_distance(&query_floats, &data_floats, metric)
                     .rank_value
             }
-            Some(QuantizationStrategy::Pq(pq)) => self.calculate_pq_distance(
+            Some(QuantizationScheme::Pq(pq)) => self.calculate_pq_distance(
                 &query.data,
                 &data.data,
                 metric,
                 pq.num_subvectors as usize,
             ),
-            Some(QuantizationStrategy::Binary(_)) => {
+            Some(QuantizationScheme::Binary(_)) => {
                 self.calculate_hamming_distance(&query.data, &data.data) as f32
             }
-            Some(QuantizationStrategy::Scalar(_)) | Some(QuantizationStrategy::Uniform(_)) => {
+            Some(QuantizationScheme::Scalar(_)) | Some(QuantizationScheme::Uniform(_)) => {
                 // For scalar/uniform quantization, dequantize and compute
                 // This is less efficient but ensures correctness
                 match (self.dequantize_sync(query), self.dequantize_sync(data)) {
@@ -1554,7 +1554,7 @@ impl UnifiedQuantizationEngine {
                     _ => f32::INFINITY,
                 }
             }
-            Some(QuantizationStrategy::Custom(_)) => f32::INFINITY,
+            Some(QuantizationScheme::Custom(_)) => f32::INFINITY,
             // TurboQuant is `lifecycle = ReadTime`: scoring lives in the
             // modality crate's SIMD kernel (`proximadb_vector::quantization::
             // turboquant::kernel::search`), invoked via
@@ -1567,7 +1567,7 @@ impl UnifiedQuantizationEngine {
             // — bug-loud but not crash-loud, since this arm runs on the
             // hot scoring path.
             #[cfg(feature = "experimental-turboquant")]
-            Some(QuantizationStrategy::TurboQuant(_)) => f32::INFINITY,
+            Some(QuantizationScheme::TurboQuant(_)) => f32::INFINITY,
         }
     }
 
@@ -1584,25 +1584,25 @@ impl UnifiedQuantizationEngine {
     /// Synchronous dequantize for use in distance calculations
     fn dequantize_sync(&self, quantized_vector: &QuantizedVector) -> Result<Vec<f32>> {
         match &quantized_vector.quantization_level.level_type {
-            None | Some(QuantizationStrategy::None(_)) => {
+            None | Some(QuantizationScheme::None(_)) => {
                 Ok(self.bytes_to_f32(&quantized_vector.data))
             }
-            Some(QuantizationStrategy::Scalar(s)) => {
+            Some(QuantizationScheme::Scalar(s)) => {
                 self.dequantize_scalar(&quantized_vector.data, s.bits as u8, s.scale, s.offset)
             }
-            Some(QuantizationStrategy::Uniform(u)) => self.dequantize_uniform(
+            Some(QuantizationScheme::Uniform(u)) => self.dequantize_uniform(
                 &quantized_vector.data,
                 u.bits as u8,
                 u.scale.unwrap_or(1.0),
                 u.offset.unwrap_or(0.0),
             ),
-            Some(QuantizationStrategy::Binary(_binary)) => {
+            Some(QuantizationScheme::Binary(_binary)) => {
                 // Binary vectors have dimension encoded in the quantization level
                 // For now, use a reasonable default dimension
                 let dimension = 128; // This should be stored in metadata or config
                 self.dequantize_binary(&quantized_vector.data, dimension)
             }
-            Some(QuantizationStrategy::Pq(pq)) => {
+            Some(QuantizationScheme::Pq(pq)) => {
                 // For PQ, we need the codebook which should be cached
                 // Use cached codebook if available, otherwise return error
                 let codebook_id = pq.codebook_id.as_deref().unwrap_or("default");
@@ -1617,7 +1617,7 @@ impl UnifiedQuantizationEngine {
                     )
                 }
             }
-            Some(QuantizationStrategy::Custom(c)) => {
+            Some(QuantizationScheme::Custom(c)) => {
                 // Custom dequantization using cached parameters
                 self.dequantize_custom(&quantized_vector.data, c)
             }
@@ -1633,7 +1633,7 @@ impl UnifiedQuantizationEngine {
             // error — the typed sentinel lets a future router fail loudly
             // on misroute without losing the explanation.
             #[cfg(feature = "experimental-turboquant")]
-            Some(QuantizationStrategy::TurboQuant(_)) => anyhow::bail!(
+            Some(QuantizationScheme::TurboQuant(_)) => anyhow::bail!(
                 "TurboQuant codes are non-invertible (RaBitQ length-renorm is lossy by \
                  design — TURBOQUANT_LLD §\"Locked Type Signatures\"). Read the original \
                  vector from the canonical ProximaRecord (ADR-021 §\"Repair source\") \
@@ -1707,7 +1707,7 @@ mod tests {
         assert_eq!(pq8.bytes_per_vector(dimension), 16); // 16 subvectors * 1 byte
 
         let uniform4 = UnifiedQuantizationLevel {
-            level_type: Some(QuantizationStrategy::Uniform(UniformQuantization {
+            level_type: Some(QuantizationScheme::Uniform(UniformQuantization {
                 bits: 4,
                 scale: None,
                 offset: None,
@@ -1716,7 +1716,7 @@ mod tests {
         assert_eq!(uniform4.bytes_per_vector(dimension), 768);
 
         let binary = UnifiedQuantizationLevel {
-            level_type: Some(QuantizationStrategy::Binary(BinaryQuantization {
+            level_type: Some(QuantizationScheme::Binary(BinaryQuantization {
                 threshold: None,
                 sign_based: false,
             })),
@@ -1768,7 +1768,7 @@ mod tests {
         // Test PQ4 creation
         let pq4 = UnifiedQuantizationLevel::pq4(8);
         match &pq4.level_type {
-            Some(QuantizationStrategy::Pq(pq)) => {
+            Some(QuantizationScheme::Pq(pq)) => {
                 assert_eq!(pq.bits_per_code, 4);
                 assert_eq!(pq.num_subvectors, 8);
             }
@@ -1778,7 +1778,7 @@ mod tests {
         // Test INT8 creation
         let int8 = UnifiedQuantizationLevel::int8();
         match &int8.level_type {
-            Some(QuantizationStrategy::Scalar(s)) => {
+            Some(QuantizationScheme::Scalar(s)) => {
                 assert_eq!(s.bits, 8);
                 assert_eq!(s.scale, 1.0);
                 assert_eq!(s.offset, 0.0);
@@ -1802,7 +1802,7 @@ mod tests {
 
         // Test Binary
         let binary = UnifiedQuantizationLevel {
-            level_type: Some(QuantizationStrategy::Binary(BinaryQuantization {
+            level_type: Some(QuantizationScheme::Binary(BinaryQuantization {
                 threshold: None,
                 sign_based: false,
             })),
@@ -1811,7 +1811,7 @@ mod tests {
 
         // Test Scalar
         let scalar = UnifiedQuantizationLevel {
-            level_type: Some(QuantizationStrategy::Scalar(ScalarQuantization {
+            level_type: Some(QuantizationScheme::Scalar(ScalarQuantization {
                 bits: 16,
                 scale: 1.0,
                 offset: 0.0,
@@ -1837,7 +1837,7 @@ mod tests {
 
         // Binary quantization
         let binary = UnifiedQuantizationLevel {
-            level_type: Some(QuantizationStrategy::Binary(BinaryQuantization {
+            level_type: Some(QuantizationScheme::Binary(BinaryQuantization {
                 threshold: None,
                 sign_based: false,
             })),
@@ -1973,7 +1973,7 @@ mod tests {
 
         let test_vector = vec![0.1, 0.2, 0.3, 0.4];
         let level = UnifiedQuantizationLevel {
-            level_type: Some(QuantizationStrategy::None(NoQuantization {})),
+            level_type: Some(QuantizationScheme::None(NoQuantization {})),
         };
 
         let quantized = engine.quantize(&test_vector, &level).await?;
@@ -2003,7 +2003,7 @@ mod tests {
         // Test different bit widths
         for bits in [4, 8, 16] {
             let level = UnifiedQuantizationLevel {
-                level_type: Some(QuantizationStrategy::Uniform(UniformQuantization {
+                level_type: Some(QuantizationScheme::Uniform(UniformQuantization {
                     bits,
                     scale: Some(1.0),
                     offset: Some(0.0),
@@ -2043,7 +2043,7 @@ mod tests {
 
         // Test threshold-based binary quantization
         let level = UnifiedQuantizationLevel {
-            level_type: Some(QuantizationStrategy::Binary(BinaryQuantization {
+            level_type: Some(QuantizationScheme::Binary(BinaryQuantization {
                 threshold: Some(0.5),
                 sign_based: false,
             })),
@@ -2057,7 +2057,7 @@ mod tests {
 
         // Test sign-based binary quantization
         let sign_level = UnifiedQuantizationLevel {
-            level_type: Some(QuantizationStrategy::Binary(BinaryQuantization {
+            level_type: Some(QuantizationScheme::Binary(BinaryQuantization {
                 threshold: None,
                 sign_based: true,
             })),
@@ -2077,7 +2077,7 @@ mod tests {
         let test_vector = vec![0.1, 0.5, 1.0, 2.0, 5.0];
 
         let level = UnifiedQuantizationLevel {
-            level_type: Some(QuantizationStrategy::Scalar(ScalarQuantization {
+            level_type: Some(QuantizationScheme::Scalar(ScalarQuantization {
                 bits: 8,
                 scale: 10.0, // Scale to handle range [0, 5]
                 offset: 0.0,
@@ -2131,7 +2131,7 @@ mod tests {
 
         // PQ with 8 subvectors
         let level = UnifiedQuantizationLevel {
-            level_type: Some(QuantizationStrategy::Pq(ProductQuantization {
+            level_type: Some(QuantizationScheme::Pq(ProductQuantization {
                 bits_per_code: 8,
                 num_subvectors: 8,
                 codebook_id: Some(codebook_id.to_string()),
@@ -2221,7 +2221,7 @@ mod tests {
         let _ = proximadb_hardware::hardware_capabilities(); // OnceLock auto-init
         // Test helper methods
         let pq8 = UnifiedQuantizationLevel::pq8(16);
-        if let Some(QuantizationStrategy::Pq(pq)) = &pq8.level_type {
+        if let Some(QuantizationScheme::Pq(pq)) = &pq8.level_type {
             assert_eq!(pq.bits_per_code, 8);
             assert_eq!(pq.num_subvectors, 16);
         } else {
@@ -2229,7 +2229,7 @@ mod tests {
         }
 
         let pq4 = UnifiedQuantizationLevel::pq4(8);
-        if let Some(QuantizationStrategy::Pq(pq)) = &pq4.level_type {
+        if let Some(QuantizationScheme::Pq(pq)) = &pq4.level_type {
             assert_eq!(pq.bits_per_code, 4);
             assert_eq!(pq.num_subvectors, 8);
         } else {
@@ -2237,7 +2237,7 @@ mod tests {
         }
 
         let int8 = UnifiedQuantizationLevel::int8();
-        if let Some(QuantizationStrategy::Scalar(scalar)) = &int8.level_type {
+        if let Some(QuantizationScheme::Scalar(scalar)) = &int8.level_type {
             assert_eq!(scalar.bits, 8);
             assert_eq!(scalar.scale, 1.0);
             assert_eq!(scalar.offset, 0.0);
@@ -2253,13 +2253,13 @@ mod tests {
 
         // No quantization - full FP32
         let none = UnifiedQuantizationLevel {
-            level_type: Some(QuantizationStrategy::None(NoQuantization {})),
+            level_type: Some(QuantizationScheme::None(NoQuantization {})),
         };
         assert_eq!(none.bytes_per_vector(dimension), dimension * 4);
 
         // Uniform 8-bit
         let uniform8 = UnifiedQuantizationLevel {
-            level_type: Some(QuantizationStrategy::Uniform(UniformQuantization {
+            level_type: Some(QuantizationScheme::Uniform(UniformQuantization {
                 bits: 8,
                 scale: None,
                 offset: None,
@@ -2269,7 +2269,7 @@ mod tests {
 
         // Binary (1 bit per dimension)
         let binary = UnifiedQuantizationLevel {
-            level_type: Some(QuantizationStrategy::Binary(BinaryQuantization {
+            level_type: Some(QuantizationScheme::Binary(BinaryQuantization {
                 threshold: None,
                 sign_based: true,
             })),
@@ -2293,7 +2293,7 @@ mod tests {
             (UnifiedQuantizationLevel::int8(), 4.0),    // 32/8
             (
                 UnifiedQuantizationLevel {
-                    level_type: Some(QuantizationStrategy::Binary(BinaryQuantization {
+                    level_type: Some(QuantizationScheme::Binary(BinaryQuantization {
                         threshold: None,
                         sign_based: false,
                     })),
@@ -2374,7 +2374,7 @@ mod tests {
 
         // Create quantization level with the trained codebook
         let level = UnifiedQuantizationLevel {
-            level_type: Some(QuantizationStrategy::Pq(ProductQuantization {
+            level_type: Some(QuantizationScheme::Pq(ProductQuantization {
                 bits_per_code: 8,
                 num_subvectors: 16,
                 codebook_id: Some(codebook_id.to_string()),
