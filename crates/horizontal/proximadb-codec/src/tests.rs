@@ -10,6 +10,104 @@ use crate::traits::{RawDecoder, RawEncoder};
 use crate::types::{ProximaScheme, TypeId};
 use crate::wire_format::WireFormatManager;
 
+/// Capability is scheme-level: quantized vectors need the PAX column parameters,
+/// while the accelerated implementations advertise only their five core schemes.
+#[test]
+fn test_raw_codec_support_matrix() {
+    use crate::gpu::{GpuDecoder, GpuEncoder};
+    use crate::simd::{SimdDecoder, SimdEncoder, get_simd_backend};
+    use proximadb_hardware_caps::HardwareBackend;
+
+    // Explicit expectations for every scheme, independent of codec predicates.
+    let cases = [
+        (ProximaScheme::Raw, true, false),
+        (ProximaScheme::Delta { base: i64::MIN }, true, true),
+        (ProximaScheme::BitPacked { bits: 0 }, true, true),
+        (
+            ProximaScheme::FrameOfReference {
+                reference: i64::MAX,
+                bits: 255,
+            },
+            true,
+            true,
+        ),
+        (
+            ProximaScheme::PForDelta {
+                majority_bits: 0,
+                base: i64::MAX,
+            },
+            true,
+            true,
+        ),
+        (
+            ProximaScheme::PForDoubleDelta {
+                base: i64::MIN,
+                first_delta: i64::MAX,
+            },
+            true,
+            false,
+        ),
+        (ProximaScheme::Zigzag { bits: 255 }, true, true),
+        (ProximaScheme::Simple8b, true, false),
+        (ProximaScheme::VByte, true, false),
+        (
+            ProximaScheme::DoubleDelta {
+                first_value: i64::MAX,
+                first_delta: i64::MIN,
+            },
+            true,
+            false,
+        ),
+        (ProximaScheme::Gorilla, true, false),
+        (ProximaScheme::SparseBitmap, true, false),
+        (ProximaScheme::SparseCOO, true, false),
+        (ProximaScheme::Dictionary, true, false),
+        (ProximaScheme::RunLength, true, false),
+        (ProximaScheme::Sq8, false, false),
+        (ProximaScheme::RaBitQ, false, false),
+        (ProximaScheme::Adaptive, true, false),
+    ];
+    let backend = get_simd_backend();
+    let (simd_available, gpu_available) = match backend {
+        HardwareBackend::Scalar => (false, false),
+        HardwareBackend::AVX512
+        | HardwareBackend::AVX2
+        | HardwareBackend::SSE
+        | HardwareBackend::NEON => (true, false),
+        HardwareBackend::CUDA
+        | HardwareBackend::ROCm
+        | HardwareBackend::MPS
+        | HardwareBackend::OpenCL => (true, true),
+    };
+    let implementations: [(&dyn RawEncoder, &dyn RawDecoder, bool); 3] = [
+        (&BaselineEncoder, &BaselineDecoder, true),
+        (&SimdEncoder, &SimdDecoder, simd_available),
+        (&GpuEncoder, &GpuDecoder, gpu_available),
+    ];
+
+    for (lane, (encoder, decoder, available)) in implementations.iter().enumerate() {
+        for (scheme, baseline, accelerated) in &cases {
+            let expected = if lane == 0 {
+                *baseline
+            } else {
+                *available && *accelerated
+            };
+            assert_eq!(
+                encoder.supports(scheme),
+                expected,
+                "{} encoder: {scheme:?}, {backend:?}",
+                encoder.name()
+            );
+            assert_eq!(
+                decoder.supports(scheme),
+                expected,
+                "{} decoder: {scheme:?}, {backend:?}",
+                decoder.name()
+            );
+        }
+    }
+}
+
 /// Test complete roundtrip: encode → wire format → decode
 #[test]
 fn test_complete_roundtrip_f32_delta() {

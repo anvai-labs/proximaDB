@@ -215,21 +215,7 @@ impl RawEncoder for GpuEncoder {
     }
 
     fn supports(&self, scheme: &ProximaScheme) -> bool {
-        // Check if GPU is available
-        let backend = get_simd_backend();
-        if !backend.is_gpu() {
-            return false;
-        }
-
-        // GPU supports: Delta, BitPacked, FrameOfReference, Zigzag, PForDelta
-        matches!(
-            scheme,
-            ProximaScheme::Delta { .. }
-                | ProximaScheme::BitPacked { .. }
-                | ProximaScheme::FrameOfReference { .. }
-                | ProximaScheme::Zigzag { .. }
-                | ProximaScheme::PForDelta { .. }
-        )
+        super::supports_scheme(scheme)
     }
 
     fn encode_f32(&self, values: &[f32], scheme: &ProximaScheme) -> Result<Vec<u8>> {

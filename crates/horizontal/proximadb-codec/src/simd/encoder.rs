@@ -10,7 +10,7 @@
 use anyhow::Result;
 use tracing::{debug, trace};
 
-use crate::simd::{get_simd_backend, simd_bitpack_encode_f32};
+use crate::simd::simd_bitpack_encode_f32;
 use crate::traits::RawEncoder;
 use crate::types::ProximaScheme;
 
@@ -29,21 +29,7 @@ impl RawEncoder for SimdEncoder {
     }
 
     fn supports(&self, scheme: &ProximaScheme) -> bool {
-        // Check if SIMD is available
-        let backend = get_simd_backend();
-        if !backend.has_acceleration() {
-            return false;
-        }
-
-        // SIMD supports: Delta, BitPacked, FrameOfReference, Zigzag, PForDelta
-        matches!(
-            scheme,
-            ProximaScheme::Delta { .. }
-                | ProximaScheme::BitPacked { .. }
-                | ProximaScheme::FrameOfReference { .. }
-                | ProximaScheme::Zigzag { .. }
-                | ProximaScheme::PForDelta { .. }
-        )
+        super::supports_scheme(scheme)
     }
 
     fn encode_f32(&self, values: &[f32], scheme: &ProximaScheme) -> Result<Vec<u8>> {

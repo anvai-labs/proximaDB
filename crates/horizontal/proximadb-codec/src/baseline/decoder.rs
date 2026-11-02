@@ -20,27 +20,7 @@ impl RawDecoder for BaselineDecoder {
     }
 
     fn supports(&self, scheme: &ProximaScheme) -> bool {
-        // Baseline supports ALL schemes (will implement progressively)
-        // Currently implemented: Raw, Delta, BitPacked, FrameOfReference, SparseBitmap, SparseCOO, RunLength, PForDelta, Zigzag, DoubleDelta, PForDoubleDelta, Gorilla, VByte, Dictionary
-        matches!(
-            scheme,
-            ProximaScheme::Raw
-                | ProximaScheme::Delta { .. }
-                | ProximaScheme::BitPacked { .. }
-                | ProximaScheme::FrameOfReference { .. }
-                | ProximaScheme::SparseBitmap
-                | ProximaScheme::SparseCOO
-                | ProximaScheme::RunLength
-                | ProximaScheme::PForDelta { .. }
-                | ProximaScheme::Zigzag { .. }
-                | ProximaScheme::DoubleDelta { .. }
-                | ProximaScheme::PForDoubleDelta { .. }
-                | ProximaScheme::Gorilla
-                | ProximaScheme::VByte
-                | ProximaScheme::Dictionary
-                | ProximaScheme::Simple8b
-                | ProximaScheme::Adaptive
-        )
+        super::supports_scheme(scheme)
     }
 
     fn decode_f32(&self, data: &[u8], scheme: &ProximaScheme, count: usize) -> Result<Vec<f32>> {
