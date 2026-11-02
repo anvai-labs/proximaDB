@@ -413,6 +413,80 @@ async fn execute_max_rows_pages_the_legacy_reader_e2e() {
     assert!(!client.is_closed());
 }
 
+/// TD-PGPORTAL-1 follow-up (E0 governance): a budgeted portal SELECT must
+/// pass the SAME rate limiter every other pgwire query passes. The portal
+/// fast-paths return before `execute_query_with_controls`, so the row-budget
+/// path was the one query shape that never checked (or consumed) quota: a
+/// client could page unboundedly while a simple-query peer gets 53400s.
+/// nextest runs each test in its own process, so the env var is contained.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn budgeted_portal_selects_are_rate_limited_e2e() {
+    use tokio::io::AsyncWriteExt;
+
+    // SAFETY: nextest runs this test in a dedicated process, and the server
+    // (the only env reader) is built strictly after this line — no thread
+    // reads the environment concurrently. Same pattern the atomic-commit
+    // harness uses for its fault gate.
+    //
+    // Quota arithmetic: the limiter meters EVERY statement (DDL included) —
+    // seed = CREATE + INSERT = 2 tokens, the first simple SELECT = token 3.
+    // RPM=3 leaves both proof arms over quota. (The tokio-postgres handshake
+    // consumes none: with RPM=3 the CREATE below is the first metered call.)
+    unsafe { std::env::set_var("PROXIMADB_PGWIRE_RATE_LIMIT_RPM", "3") };
+    let server = PgServer::start().await.expect("server start");
+    let client = connect(&server).await;
+    seed(&client).await;
+
+    // Token 3 (seed consumed 1-2): still within quota.
+    client
+        .simple_query("SELECT * FROM menu_items")
+        .await
+        .expect("the first SELECT is within quota");
+
+    // Query 2 (simple protocol): over quota — proves the limiter is armed
+    // and this client's IP is subject to it.
+    let over = client.simple_query("SELECT * FROM menu_items").await;
+    let err = over.expect_err("the second query must be over quota");
+    assert_eq!(
+        err.code().map(|c| c.code()),
+        Some("53400"),
+        "over-quota is 53400: {}",
+        explain_err(&err)
+    );
+    // The errored simple query leaves the connection usable.
+    assert!(!client.is_closed());
+
+    // Query 3 — a BUDGETED portal SELECT (the fast path): must be refused by
+    // the same limiter, not silently serve rows.
+    let mut stream = raw_connect(&server).await;
+    // NOTE: raw_connect is a SECOND connection (same peer IP: 127.0.0.1).
+    let sql = "SELECT * FROM menu_items";
+    let mut parse = vec![0u8];
+    parse.extend_from_slice(sql.as_bytes());
+    parse.push(0);
+    parse.extend_from_slice(&0i16.to_be_bytes());
+    let mut bind = vec![0u8, 0u8];
+    bind.extend_from_slice(&0i16.to_be_bytes());
+    bind.extend_from_slice(&0i16.to_be_bytes());
+    bind.extend_from_slice(&0i16.to_be_bytes());
+    let mut out = message(b'P', &parse);
+    out.extend(message(b'B', &bind));
+    out.extend(message(b'S', &[]));
+    stream.write_all(&out).await.expect("parse+bind+sync");
+    loop {
+        let (tag, _) = read_message(&mut stream).await;
+        if tag == b'Z' {
+            break;
+        }
+    }
+
+    let (rows, _, _, _) = execute_round(&mut stream, 1).await;
+    assert_eq!(
+        rows, 0,
+        "an over-quota budgeted portal SELECT must serve NO rows (53400)"
+    );
+}
+
 /// TD-PGPORTAL-1 (review round 1, finding 1): a budgeted portal must honor
 /// the SQL LIMIT, not just the Execute budget — with an ORDER BY the fetch
 /// retrieves every matching row (sort-then-truncate semantics) and the
