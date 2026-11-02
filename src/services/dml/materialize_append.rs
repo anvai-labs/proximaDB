@@ -190,12 +190,25 @@ pub(crate) enum AppendPlan {
     },
 }
 
+/// Pure core of the dv-live grace gate (testable without env injection):
+/// unset/typo keep the 600s default; OFF/0 disable the sweep (the u64::MAX
+/// sentinel); values below 60s clamp to 60s — the lease cannot be shorter
+/// than a commit path.
+pub(crate) fn dv_live_gc_grace_from(raw: Option<&str>) -> std::time::Duration {
+    std::time::Duration::from_secs(
+        crate::services::storage_format::default_on_gate_value(raw, 600)
+            .unwrap_or(u64::MAX)
+            .max(60),
+    )
+}
+
 /// F8 (release review 0.4→0.5.1): how many committed Iceberg metadata
-/// generations MATERIALIZE's GC must keep files for. The structural floor is
-/// 2 (the committed version and its parent); the default 3 keeps V−2 alive
-/// so a reader pinned two quick MATERIALIZEs back does not lose files
-/// mid-scan. Values below 2 (including OFF spellings) clamp to the floor:
-/// retention cannot go under the two generations the reader contract names.
+/// generations MATERIALIZE's GC must keep files for, TOTAL including the
+/// committed one. The structural floor is 2 (the committed version and its
+/// parent); the default 3 keeps V−2 alive so a reader pinned two quick
+/// MATERIALIZEs back does not lose files mid-scan. Values below 2 (including
+/// OFF spellings) clamp to the floor: retention cannot go under the two
+/// generations the reader contract names.
 pub(crate) fn gc_retained_generations() -> u64 {
     retained_generations_from(
         std::env::var("PROXIMADB_MATERIALIZE_GC_RETAINED_GENERATIONS")
@@ -222,6 +235,20 @@ pub(crate) fn retained_generations_from(raw: Option<&str>) -> u64 {
 pub(crate) fn retained_versions(previous: u64, retained: u64) -> Vec<u64> {
     let floor = previous.saturating_sub(retained - 2);
     (floor..=previous).rev().collect()
+}
+
+/// F15 (TD-LIVEDEL-1): how old an UNREFERENCED self-minted `dv-live-*`
+/// Puffin must be before the post-MATERIALIZE sweep may collect it — the
+/// grace is the lease: a concurrent live publisher that has minted but not
+/// yet committed must never lose its file. Default 600s; OFF/0 disables the
+/// sweep entirely (u64::MAX grace); values below 60s clamp to 60s so the
+/// lease cannot be set shorter than a publication's commit path.
+pub(crate) fn dv_live_gc_grace() -> std::time::Duration {
+    dv_live_gc_grace_from(
+        std::env::var("PROXIMADB_LIVE_DELETE_GC_GRACE_SECS")
+            .ok()
+            .as_deref(),
+    )
 }
 
 /// F14: the many-parts fallback threshold, extracted so its exact boundary is
@@ -330,6 +357,29 @@ mod tests {
         // retained=2 is exactly the pre-fix window.
         assert_eq!(retained_versions(10, 2), vec![10]);
         assert_eq!(retained_versions(0, 2), vec![0]);
+    }
+
+    #[test]
+    fn dv_live_grace_is_never_shorter_than_the_commit_path() {
+        use super::dv_live_gc_grace_from;
+        assert_eq!(dv_live_gc_grace_from(None).as_secs(), 600);
+        assert_eq!(dv_live_gc_grace_from(Some("garbage")).as_secs(), 600);
+        assert_eq!(
+            dv_live_gc_grace_from(Some("off")).as_secs(),
+            u64::MAX,
+            "OFF disables the sweep"
+        );
+        assert_eq!(
+            dv_live_gc_grace_from(Some("0")).as_secs(),
+            u64::MAX,
+            "0 disables, never immediate"
+        );
+        assert_eq!(
+            dv_live_gc_grace_from(Some("5")).as_secs(),
+            60,
+            "clamped to 60s"
+        );
+        assert_eq!(dv_live_gc_grace_from(Some("3600")).as_secs(), 3600);
     }
 
     #[test]

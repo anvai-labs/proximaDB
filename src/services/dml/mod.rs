@@ -3581,12 +3581,23 @@ impl DmlService {
                 }
             }
         }
+        // F15 (TD-LIVEDEL-1) rides the SAME GC pass: self-minted dv-live
+        // Puffins are collected by lease (grace) once unreferenced, in the
+        // single listing above — an adopted dv-live is in the keep sets by
+        // exact key. See gc_older_generations.
+        let dv_live_grace = materialize_append::dv_live_gc_grace();
+        let dv_live_now_ns: i64 = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as i64)
+            .unwrap_or_default();
         match materialize_stream::gc_older_generations(
             bridge,
             &object_store::path::Path::from(data_dir.as_str()),
             &keep_current,
             &keep_older,
             &stem,
+            dv_live_grace,
+            dv_live_now_ns,
         )
         .await
         {
@@ -6133,6 +6144,21 @@ impl DmlService {
                 .write_deletion_vectors(&puffin_key, &borrowed)
                 .await
                 .map_err(|e| anyhow!("live delete: writing the vectors: {e}"))?;
+
+            // Gate 4b (F15 review, finding 1c): HEAD the minted Puffin
+            // before the CAS. The dv-live GC's grace lease protects a
+            // publisher between mint and commit, but a publisher stalled
+            // LONGER than the grace would otherwise commit a dangling
+            // reference — every later DV read would fail stickily. One stat
+            // converts that into the contract's accepted fence-gap failure:
+            // this publish refuses loudly, the fence stays unrecorded, and
+            // the swept Puffin is a harmless orphan.
+            bridge
+                .object_size(&puffin_key)
+                .await
+                .map_err(|e| {
+                    anyhow!("live delete: the minted Puffin vanished before commit (GC lease expired or external deletion): {e}")
+                })?;
 
             // Gate 4, second check — IMMEDIATELY before the CAS. The check is
             // point-in-time (no token reaches the CAS), so its protection is
