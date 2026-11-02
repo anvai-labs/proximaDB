@@ -45,6 +45,84 @@ const RETIRED_MEMORY: usize = 4096;
 /// budget check.
 const WARMS_IN_FLIGHT: usize = 4;
 
+/// TD-TIER-1 SC6 S3: one pool's aggregate warm bandwidth (bytes/s), shared
+/// by every grant in that pool. A token bucket with one second of burst
+/// capacity; `rate <= 0` paces nothing.
+pub struct WarmBudget {
+    rate_bytes_per_s: f64,
+    state: std::sync::Mutex<WarmBucketState>,
+}
+
+struct WarmBucketState {
+    tokens: f64,
+    last: std::time::Instant,
+}
+
+impl WarmBudget {
+    /// A bucket passing `rate_bytes_per_s` in aggregate.
+    pub fn new(rate_bytes_per_s: f64) -> Self {
+        Self {
+            rate_bytes_per_s,
+            state: std::sync::Mutex::new(WarmBucketState {
+                tokens: rate_bytes_per_s,
+                last: std::time::Instant::now(),
+            }),
+        }
+    }
+
+    /// Account `bytes` of warm transfer and sleep for the deficit. Concurrency
+    /// is bounded by WARMS_IN_FLIGHT, so lock contention is negligible.
+    pub async fn pace(&self, bytes: u64) {
+        if self.rate_bytes_per_s <= 0.0 {
+            return;
+        }
+        let deficit = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let now = std::time::Instant::now();
+            let refill =
+                now.duration_since(state.last).as_secs_f64().min(1.0) * self.rate_bytes_per_s;
+            state.tokens = (state.tokens + refill).min(self.rate_bytes_per_s);
+            state.last = now;
+            state.tokens -= bytes as f64;
+            let deficit_tokens = -state.tokens.min(0.0);
+            deficit_tokens / self.rate_bytes_per_s
+        };
+        if deficit > 0.0 {
+            tokio::time::sleep(std::time::Duration::from_secs_f64(deficit.min(60.0))).await;
+        }
+    }
+}
+
+static WARM_PREFIX_BUDGETS: std::sync::OnceLock<
+    std::sync::RwLock<Vec<(String, std::sync::Arc<WarmBudget>)>>,
+> = std::sync::OnceLock::new();
+
+/// Install the prefix → pool-bucket map (the reservation registry refreshes
+/// it whenever grants change). Longest matching prefix wins; an empty map
+/// paces nothing (today's behavior).
+pub fn set_warm_prefix_budgets(budgets: Vec<(String, std::sync::Arc<WarmBudget>)>) {
+    let registry = WARM_PREFIX_BUDGETS.get_or_init(|| std::sync::RwLock::new(Vec::new()));
+    let mut guard = registry
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *guard = budgets;
+}
+
+fn warm_budget_for(path: &str) -> Option<std::sync::Arc<WarmBudget>> {
+    let registry = WARM_PREFIX_BUDGETS.get_or_init(|| std::sync::RwLock::new(Vec::new()));
+    let guard = registry
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard
+        .iter()
+        .filter(|(prefix, _)| !prefix.is_empty() && path.starts_with(prefix.as_str()))
+        .max_by_key(|(prefix, _)| prefix.len())
+        .map(|(_, budget)| budget.clone())
+}
+
 fn warm_permits() -> &'static tokio::sync::Semaphore {
     static PERMITS: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
     PERMITS.get_or_init(|| tokio::sync::Semaphore::new(WARMS_IN_FLIGHT))
@@ -296,12 +374,18 @@ pub async fn warm_object(
             .map_err(|error| anyhow::anyhow!("warm stage {path}: {error}"))?;
         let mut out = tokio::fs::File::from_std(file);
         let mut offset = 0u64;
+        // TD-TIER-1 SC6 S3: pace this object's chunks against its pool's
+        // aggregate warm budget, when one is installed for the path.
+        let budget = warm_budget_for(path);
         while offset < len {
             let chunk = WARM_CHUNK_BYTES.min(len - offset);
             let bytes = fs
                 .read_range(path, offset, chunk)
                 .await
                 .map_err(|error| anyhow::anyhow!("warm read {path}@{offset}: {error}"))?;
+            if let Some(budget) = &budget {
+                budget.pace(chunk).await;
+            }
             if bytes.len() as u64 != chunk {
                 anyhow::bail!("warm read {path}@{offset}: short read");
             }
@@ -778,6 +862,32 @@ mod tests {
                 })
             }
         }
+    }
+
+    /// TD-TIER-1 SC6 S3: an installed warm budget paces the aggregate —
+    /// warming a multi-chunk object under a small rate takes at least
+    /// bytes/rate (minus the one-second burst), and no budget paces nothing.
+    #[tokio::test]
+    async fn warm_budget_bounds_the_aggregate() {
+        let root = tempfile::tempdir().expect("root");
+        let (covered, _) = dirs(root.path());
+        let _armed = arm(&covered, "s3-budget", 64 << 20);
+        let (fs, _counters) = counting_local(root.path()).await;
+        // 4 MiB object; a 1 MiB/s budget allows ~1 MiB burst, so >= 3 s.
+        let (path, _) = segment(&covered, "L0_budget.pax", 4 << 20);
+        let rate = 1024.0 * 1024.0;
+        let budget = std::sync::Arc::new(WarmBudget::new(rate));
+        set_warm_prefix_budgets(vec![(covered.to_string_lossy().to_string(), budget)]);
+
+        let started = std::time::Instant::now();
+        assert!(warm_object(fs.as_ref(), &path, None).await.expect("warm"));
+        let elapsed = started.elapsed().as_secs_f64();
+        let minimum = (4.0 - 1.0) / 1.0_f64 - 0.3;
+        assert!(
+            elapsed >= minimum,
+            "budgeted warm took {elapsed:.2}s, expected >= {minimum:.2}s"
+        );
+        set_warm_prefix_budgets(Vec::new());
     }
 
     /// F1 regression (SC6 measurement): the resident batched-prefetch path

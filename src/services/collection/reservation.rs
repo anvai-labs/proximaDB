@@ -120,6 +120,18 @@ pub struct ReservationPoolConfig {
     /// this is never reclaimed, idle or not.
     #[serde(default = "default_idle_reclaim_min_lifetime_secs")]
     pub idle_reclaim_min_lifetime_secs: u64,
+    /// TD-TIER-1 SC6 S3: aggregate warm/backfill bandwidth for this pool's
+    /// grants, MiB/s — the shared-disk fairness knob (one tenant's re-warm
+    /// must not starve another's READY; on ST1 keep it under the volume's
+    /// sustained baseline so the burst bucket survives). `0` (default) =
+    /// uncapped (today's behavior).
+    #[serde(default)]
+    pub warm_bandwidth_mib_per_s: u64,
+    /// TD-TIER-1 SC6 S4: ceiling on this pool's LIVE-grant bytes (the DRAM
+    /// protection share), enforced at admission — fail-closed like pool
+    /// capacity. `None` (default) = uncapped.
+    #[serde(default)]
+    pub dram_budget_bytes: Option<u64>,
 }
 
 /// Default grant age floor before idle reclaim may act (1 h).
@@ -649,10 +661,56 @@ impl ReservationRegistry {
     /// order-independent (late store registration pulls the current cell).
     async fn sync_residency_budget(&self) {
         let mut total = 0u64;
-        for (_, authority) in self.pools.values() {
-            total = total.saturating_add(authority.charged_effective_bytes().await);
+        for (config, authority) in self.pools.values() {
+            let charged = authority.charged_effective_bytes().await;
+            // S4: a capped pool contributes at most its DRAM ceiling (the
+            // protection share it may actually claim).
+            let contribution = config
+                .dram_budget_bytes
+                .map_or(charged, |cap| charged.min(cap));
+            total = total.saturating_add(contribution);
         }
         proximadb_cache::set_process_reserved_budget(total);
+        // S3: refresh the warm-path prefix budgets from the live grants.
+        self.sync_warm_budgets().await;
+    }
+
+    /// TD-TIER-1 SC6 S3: map every live grant's prefixes to its pool's warm
+    /// bucket (one bucket per pool: the rate is aggregate, shared by the
+    /// pool's grants). Pools without a budget contribute nothing (uncapped).
+    async fn sync_warm_budgets(&self) {
+        let mut budgets: Vec<(
+            String,
+            std::sync::Arc<crate::storage::engines::sst::segment_io::WarmBudget>,
+        )> = Vec::new();
+        let mut buckets: std::collections::HashMap<
+            String,
+            std::sync::Arc<crate::storage::engines::sst::segment_io::WarmBudget>,
+        > = std::collections::HashMap::new();
+        for (config, authority) in self.pools.values() {
+            if config.warm_bandwidth_mib_per_s == 0 {
+                continue;
+            }
+            for grant in authority.grants_snapshot().await {
+                if !grant.state.charges_capacity() {
+                    continue;
+                }
+                let bucket = buckets
+                    .entry(config.id.clone())
+                    .or_insert_with(|| {
+                        std::sync::Arc::new(
+                            crate::storage::engines::sst::segment_io::WarmBudget::new(
+                                config.warm_bandwidth_mib_per_s as f64 * 1024.0 * 1024.0,
+                            ),
+                        )
+                    })
+                    .clone();
+                for prefix in &grant.residency_prefixes {
+                    budgets.push((prefix.clone(), bucket.clone()));
+                }
+            }
+        }
+        crate::storage::engines::sst::segment_io::set_warm_prefix_budgets(budgets);
     }
 
     fn park_intervals(&self, closed: Vec<ReservationUsageInterval>) {
@@ -1160,6 +1218,32 @@ impl ReservationAuthority {
     /// these twins drifting). `credit` is an effective charge refunded to the
     /// pool before the check — a resize credits the grant's own current
     /// charge, so shrinking always fits.
+    /// TD-TIER-1 SC6 S4: the pool's live-grant sum may not exceed its DRAM
+    /// ceiling — the protection share a tier may claim. Same fail-closed
+    /// shape as pool capacity; `None` = uncapped.
+    fn ensure_dram_budget(
+        &self,
+        ledger: &Ledger,
+        requested: u64,
+        effective: u64,
+        credit: u64,
+    ) -> Result<(), ReservationError> {
+        let Some(cap) = self.config.dram_budget_bytes else {
+            return Ok(());
+        };
+        let charged = self.charged_effective(ledger);
+        let free = cap.saturating_sub(charged.saturating_sub(credit));
+        if effective > free {
+            return Err(ReservationError::Capacity {
+                pool: format!("{} (dram_budget {} B)", self.config.id, cap),
+                requested,
+                effective,
+                free,
+            });
+        }
+        Ok(())
+    }
+
     fn ensure_capacity(
         &self,
         ledger: &Ledger,
@@ -1236,6 +1320,7 @@ impl ReservationAuthority {
         let mut prospective = (*guard).clone();
         let effective = self.config.effective_bytes(bytes);
         self.ensure_capacity(&prospective, bytes, effective, 0)?;
+        self.ensure_dram_budget(&prospective, bytes, effective, 0)?;
         self.ensure_tenant_limit(&prospective, tenant_id, bytes, None)?;
         let now = now_unix_secs;
         let grant = Grant {
@@ -1847,6 +1932,8 @@ mod tests {
             is_default: false,
             idle_reclaim_secs: 0,
             idle_reclaim_min_lifetime_secs: 3600,
+            warm_bandwidth_mib_per_s: 0,
+            dram_budget_bytes: None,
         }
     }
 
@@ -1861,6 +1948,8 @@ mod tests {
             is_default: default,
             idle_reclaim_secs: 0,
             idle_reclaim_min_lifetime_secs: 3600,
+            warm_bandwidth_mib_per_s: 0,
+            dram_budget_bytes: None,
         }
     }
 
@@ -1925,6 +2014,40 @@ mod tests {
                 .live_grant_snapshot("t1", "c-named")
                 .await
                 .is_none()
+        );
+    }
+
+    /// TD-TIER-1 SC6 S4: a pool's live-grant sum may not exceed its DRAM
+    /// ceiling — refused at admission, fail-closed like pool capacity — and
+    /// the process budget counts the pool at its cap, not its raw sum.
+    #[tokio::test]
+    async fn dram_ceiling_refuses_at_the_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut capped = armed_pool(&dir, "freemium-dram", true);
+        capped.dram_budget_bytes = Some(3 << 30);
+        let registry = ReservationRegistry::open_from_config(&[capped])
+            .await
+            .unwrap()
+            .expect("registry");
+        let now = current_unix_secs();
+
+        // Grants are effective = bytes * (1 + overhead 0.1); two 1 GiB
+        // grants fit under a 3 GiB cap, the third must refuse.
+        registry
+            .reserve_for_performance("t1", "c1", now, &[], None)
+            .await
+            .unwrap();
+        registry
+            .reserve_for_performance("t1", "c2", now, &[], None)
+            .await
+            .unwrap();
+        let error = registry
+            .reserve_for_performance("t1", "c3", now, &[], None)
+            .await
+            .expect_err("the DRAM ceiling refuses");
+        assert!(
+            error.to_string().contains("dram_budget"),
+            "names the ceiling: {error}"
         );
     }
 
@@ -2870,6 +2993,8 @@ mod tests {
             is_default: false,
             idle_reclaim_secs: 0,
             idle_reclaim_min_lifetime_secs: 3600,
+            warm_bandwidth_mib_per_s: 0,
+            dram_budget_bytes: None,
         }
     }
 
