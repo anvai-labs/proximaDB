@@ -1889,6 +1889,129 @@ fn soak_incremental_materialize_holds_both_views() {
     );
 }
 
+/// F14 (TD-GCRETAIN-1 acceptance): the 64-part APPEND_MAX_FILES fallback had
+/// no test anywhere, and no soak asserted the compacting-rewrite leg actually
+/// fired. Dedicated child with tiny parts so the published snapshot crosses
+/// 64 parts; the NEXT publication must be a full rewrite (all-new file set,
+/// collapsed part count), not a carried append.
+#[test]
+fn soak_compaction_leg_fires_past_64_parts() {
+    run_isolated(
+        "soak_compaction_leg_fires_past_64_parts",
+        "PROXIMADB_COMPACTION_SOAK_CHILD",
+        &[
+            ("PROXIMADB_MATERIALIZE_INCREMENTAL_DV", "1"),
+            ("PROXIMADB_PARQUET_WRITE_BLOOM_MIN_ROWS", "1"),
+            ("PROXIMADB_MATERIALIZE_TARGET_FILE_ROWS", "2"),
+        ],
+        check_soak_compaction_leg,
+    );
+}
+
+/// Shared soak opening: a fresh server, a pg client, and the (k INT PRIMARY
+/// KEY, v VARCHAR) table materialized from an empty model — both soaks start
+/// from exactly this shape.
+async fn soak_open(table: &str) -> (TestPgServer, tokio_postgres::Client) {
+    let server = TestPgServer::start().await.expect("server start");
+    let client = connect_pg(&server).await;
+    client
+        .simple_query(&format!(
+            "CREATE TABLE {table} (k INT PRIMARY KEY, v VARCHAR)"
+        ))
+        .await
+        .unwrap_or_else(|e| panic!("create {table}: {e:?}"));
+    (server, client)
+}
+
+/// Run one SQL statement, panicking with the statement on error (the soaks'
+/// `exec` closure, as a fn so it is not per-test duplication).
+async fn exec_sql(client: &tokio_postgres::Client, sql: String) {
+    client
+        .simple_query(&sql)
+        .await
+        .unwrap_or_else(|e| panic!("{sql}: {e:?}"));
+}
+
+/// Insert `rows` new rows (k, v{k}) starting at *next_key*, advancing it
+/// and the model together — the soaks' insert-round shape.
+async fn insert_rows(
+    client: &tokio_postgres::Client,
+    table: &str,
+    next_key: &mut i32,
+    model: &mut std::collections::BTreeMap<i32, String>,
+    rows: u64,
+) {
+    for _ in 0..rows {
+        let k = *next_key;
+        *next_key += 1;
+        client
+            .simple_query(&format!("INSERT INTO {table} (k, v) VALUES ({k}, 'v{k}')"))
+            .await
+            .unwrap_or_else(|e| panic!("insert {k}: {e:?}"));
+        model.insert(k, format!("v{k}"));
+    }
+}
+
+async fn check_soak_compaction_leg() {
+    let (server, client) = soak_open("compact_soak").await;
+    let table = "compact_soak";
+    let exec = |sql: String| exec_sql(&client, sql);
+    let mut model: std::collections::BTreeMap<i32, String> = Default::default();
+    let mut next_key: i32 = 1;
+    // Base publication.
+    insert_rows(&client, table, &mut next_key, &mut model, 5).await;
+    exec(format!("ALTER TABLE {table} MATERIALIZE")).await;
+    sleep(Duration::from_millis(300)).await;
+
+    // Buildup: every publication carries the prior parts and appends ~3 more
+    // (5 rows at 2 rows/part), so the published snapshot crosses 64 parts.
+    let mut crossed: Option<std::collections::BTreeSet<String>> = None;
+    for round in 0..40u64 {
+        insert_rows(&client, table, &mut next_key, &mut model, 5).await;
+        exec(format!("ALTER TABLE {table} MATERIALIZE")).await;
+        sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            olap_fingerprint(&client, table).await,
+            model_fingerprint(&model),
+            "round {round}: the OLAP view reconciles"
+        );
+        let parts = latest_parts(&server, table).await;
+        if parts.len() >= 64 {
+            crossed = Some(parts);
+            break;
+        }
+    }
+    let pre = crossed.unwrap_or_else(|| {
+        panic!("seed drift: the buildup never crossed 64 parts in 40 rounds (F14 compaction leg)")
+    });
+
+    // The publication AFTER crossing plans against a >=64-part snapshot and
+    // must take the Rewrite leg: the new snapshot shares NO file name with
+    // the crossing one (a carried append keeps prior names) and its part
+    // count collapses toward rows/target.
+    insert_rows(&client, table, &mut next_key, &mut model, 5).await;
+    exec(format!("ALTER TABLE {table} MATERIALIZE")).await;
+    sleep(Duration::from_millis(300)).await;
+    let post = latest_parts(&server, table).await;
+    assert!(
+        post.intersection(&pre).next().is_none(),
+        "the compaction leg rewrote: carried names survived ({}/{})",
+        post.intersection(&pre).count(),
+        pre.len()
+    );
+    assert!(
+        post.len() < pre.len(),
+        "the rewrite compacted: post {} parts vs pre {}",
+        post.len(),
+        pre.len()
+    );
+    assert_eq!(
+        olap_fingerprint(&client, table).await,
+        model_fingerprint(&model),
+        "post-rewrite: the OLAP view reconciles"
+    );
+}
+
 /// The OLAP view's `(COUNT(*), SUM(k), COUNT of updated values)`; updates
 /// write `a{round}` values, which sort below every inserted `v{k}`.
 async fn olap_fingerprint(client: &tokio_postgres::Client, table: &str) -> (i64, i64, i64) {
@@ -1908,6 +2031,50 @@ async fn olap_fingerprint(client: &tokio_postgres::Client, table: &str) -> (i64,
     )
 }
 
+/// The latest published snapshot's data-file names (the part count pins the
+/// APPEND_MAX_FILES threshold's buildup).
+/// The table's base dir (the parent of its metadata dir), found by walking
+/// the warehouse for the table's `.metadata.json`. Shared by the snapshot
+/// readers below.
+fn table_base_dir(server: &TestPgServer, table: &str) -> std::path::PathBuf {
+    let mut files = Vec::new();
+    walk(&server.data_dir().join("warehouse"), &mut files);
+    let metadata_dir = files
+        .iter()
+        .find(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.ends_with(".metadata.json"))
+                && p.to_string_lossy().contains(table)
+        })
+        .and_then(|p| p.parent())
+        .expect("the table's metadata dir");
+    metadata_dir.parent().expect("table base").to_path_buf()
+}
+
+async fn latest_parts(server: &TestPgServer, table: &str) -> std::collections::BTreeSet<String> {
+    use proximadb_iceberg_engine::IcebergObjectStoreBridge;
+    use proximadb_storage_common::object_store_bridge::ObjectStoreBridge as _;
+
+    let base_dir = table_base_dir(server, table);
+    let bridge = IcebergObjectStoreBridge::from_url(&format!("file://{}", base_dir.display()))
+        .expect("bridge");
+    let latest = bridge
+        .latest_metadata_version("metadata")
+        .await
+        .expect("metadata log")
+        .expect("a published snapshot");
+    let snapshot = bridge
+        .read_iceberg_snapshot_files("metadata", latest)
+        .await
+        .unwrap_or_else(|e| panic!("read snapshot v{latest}: {e}"));
+    snapshot
+        .data_files
+        .iter()
+        .filter_map(|p| p.filename().map(String::from))
+        .collect()
+}
+
 /// The `dv-mat-*` Puffin file names on disk under the table's base, and the
 /// ones its latest and previous snapshots name (read through the engine).
 async fn dv_mat_puffins(
@@ -1922,22 +2089,11 @@ async fn dv_mat_puffins(
 
     let mut files = Vec::new();
     walk(&server.data_dir().join("warehouse"), &mut files);
-    let metadata_dir = files
-        .iter()
-        .find(|p| {
-            p.file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.ends_with(".metadata.json"))
-                && p.to_string_lossy().contains(table)
-        })
-        .and_then(|p| p.parent())
-        .expect("the table's metadata dir")
-        .to_path_buf();
-    let base_dir = metadata_dir.parent().expect("table base");
+    let base_dir = table_base_dir(server, table);
     let name_of = |p: &std::path::Path| p.file_name().and_then(|n| n.to_str()).map(String::from);
     let on_disk = files
         .iter()
-        .filter(|p| p.starts_with(base_dir))
+        .filter(|p| p.starts_with(&base_dir))
         .filter_map(|p| name_of(p))
         .filter(|n| n.starts_with("dv-mat-") && n.ends_with(".puffin"))
         .collect();
@@ -1978,22 +2134,9 @@ fn model_fingerprint(model: &std::collections::BTreeMap<i32, String>) -> (i64, i
 }
 
 async fn check_soak_incremental_materialize() {
-    let server = TestPgServer::start().await.expect("server start");
-    let client = connect_pg(&server).await;
+    let (server, client) = soak_open("incr_soak").await;
     let table = "incr_soak";
-    let exec = |sql: String| {
-        let client = &client;
-        async move {
-            client
-                .simple_query(&sql)
-                .await
-                .unwrap_or_else(|e| panic!("{sql}: {e:?}"));
-        }
-    };
-    exec(format!(
-        "CREATE TABLE {table} (k INT PRIMARY KEY, v VARCHAR)"
-    ))
-    .await;
+    let exec = |sql: String| exec_sql(&client, sql);
     let mut model: std::collections::BTreeMap<i32, String> = Default::default();
     // A base large enough that most deltas stay under the 20% bound.
     for k in 1..=40 {
@@ -2009,12 +2152,7 @@ async fn check_soak_incremental_materialize() {
     let mut max_dv_mat = 0usize;
     let mut minted_any = false;
     for round in 0..40u64 {
-        for _ in 0..rng.below(3) {
-            let k = next_key;
-            next_key += 1;
-            exec(format!("INSERT INTO {table} (k, v) VALUES ({k}, 'v{k}')")).await;
-            model.insert(k, format!("v{k}"));
-        }
+        insert_rows(&client, table, &mut next_key, &mut model, rng.below(3)).await;
         for _ in 0..rng.below(3) {
             let idx = rng.below(model.len() as u64) as usize;
             let k = *model.keys().nth(idx).expect("indexed key");
