@@ -38,7 +38,29 @@ drifted twin.
    byte-identical through the switch (the differential check this pin exists for). Remaining
    steps (open): shared patterns → clause-by-clause port, keeping the modality's
    `CypherQuery`→`query_ast` mapping as a thin conversion over the seam's AST, until the
-   modality file reduces to the conversion layer.
+   modality file reduces to the conversion layer.   modality file reduces to the conversion layer.
+
+   _Widened-behavior ledger (recorded per the step-1 review — tracked
+   decisions, not accidents of superset adoption):_
+   * **inf→0 coercion** (`Number::from_f64(f).unwrap_or(Number::from(0))`
+     in `lexemes.rs`): an oversized exponent (`{v: 1.0e999}`) parses as
+     `Equals(0)` silently. Pre-existing modality behavior carried by
+     parity; the seam read path previously failed loudly. A later
+     convergence step should make `from_f64` failure a parse error on
+     BOTH paths (a deliberate pin update).
+   * **`null` filter drop**: `{x: null}` / `WHERE n.x = null` now parse
+     on the seam read path and the constraint is dropped downstream
+     (`graph_runtime.rs` maps json-null to no-filter), behaving as an
+     unconstrained MATCH. Parity-correct, but the semantics (vs Cypher's
+     null-comparison rules) were never deliberately chosen — decide
+     explicitly during the clause-by-clause steps.
+   * **Read-path convergence is VALUES-only so far**: the read path's
+     identifier stays bare-only and its map braces tight; the write seam
+     gained backtick keys/permissive spacing. Full parity is later steps'
+     target. (Pre-existing, unchanged, noted for the record: the live
+     read entry `QueryParser::parse` discards unconsumed remainder —
+     `MATCH (n) RETURN ngarbage` silently truncates; the corpus pin
+     guards remainder-stranding only on the write entry.)
 3. **Contract pinning** (landed 2026-11-01): a 41-entry shared corpus (reads incl. var-length
    `*`/`*1..3`, OPTIONAL MATCH, WHERE and/or, incoming/bidirectional edges, property maps with
    string/bool/int values, DISTINCT, SKIP/LIMIT, ORDER BY over a bare variable (incl. DESC), and the

@@ -93,6 +93,9 @@ use crate::query_ast::{
 };
 use std::collections::HashMap;
 
+// Shared TD-GRAPH-4 lexeme (string literals for the string predicates).
+use proximadb_graph_query::parser::lexemes::string_literal;
+
 // Placeholder types for Cypher AST
 pub type EdgeDirection = crate::query_ast::EdgeDirection;
 pub type CypherQuery = crate::query_ast::CypherStatement;
@@ -858,19 +861,14 @@ impl super::QueryParser for CypherParser {
 // NOM PARSER COMBINATORS
 // ============================================================================
 
-/// Parse identifier (variable names, labels, property keys)
-/// Parse backtick-quoted identifier
-/// Parse any identifier (normal or quoted)
+/// Parse any identifier (bare or backtick-quoted) — the shared
+/// TD-GRAPH-4 lexeme, instantiated with this parser's error type.
 fn any_identifier(input: &str) -> ParseResult<'_, String> {
     proximadb_graph_query::parser::lexemes::any_identifier(input)
 }
 
-/// Parse string literal (single or double quoted)
-/// Parse integer literal
-/// Parse float literal
-/// Parse boolean literal
-/// Parse null literal
-/// Parse a property value (string, number, boolean, null)
+/// Parse a property value (string, float, integer, boolean, null, or
+/// array) — the shared TD-GRAPH-4 lexeme.
 fn property_value(input: &str) -> ParseResult<'_, serde_json::Value> {
     proximadb_graph_query::parser::lexemes::property_value(input)
 }
@@ -1212,10 +1210,6 @@ fn parse_in_clause(input: &str) -> ParseResult<'_, WhereClause> {
         },
     )(input)
 }
-
-/// String literal (the shared TD-GRAPH-4 lexeme, instantiated with this
-/// parser's error type).
-use proximadb_graph_query::parser::lexemes::string_literal;
 
 /// Parse STARTS WITH / ENDS WITH / CONTAINS
 fn parse_string_predicates(input: &str) -> ParseResult<'_, WhereClause> {
