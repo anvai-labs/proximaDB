@@ -1326,7 +1326,7 @@ mod tests {
         };
         let acme = || Extension(TenantContext::new("acme"));
 
-        insert_document(
+        let _ = insert_document(
             st(),
             acme(),
             Path("docs".to_string()),
@@ -1348,10 +1348,10 @@ mod tests {
             }),
         )
         .await;
-        delete_document(st(), acme(), Path(("docs".to_string(), "d".to_string())))
+        let _ = delete_document(st(), acme(), Path(("docs".to_string(), "d".to_string())))
             .await
             .unwrap();
-        delete_collection(st(), acme(), Path("docs".to_string()))
+        let _ = delete_collection(st(), acme(), Path("docs".to_string()))
             .await
             .unwrap();
         assert!(

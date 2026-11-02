@@ -63,3 +63,48 @@ pub use observability::create_observability_router;
 
 // Re-exports — handler functions (for direct registration in existing root-crate routers)
 pub use hybrid::{liveness_check, readiness_check};
+
+#[cfg(test)]
+mod pagination_contract_tests {
+    use super::{document::DocumentQueryParams, observability::LogQueryRequest};
+    use axum::{extract::Query, http::Uri};
+    use serde_json::json;
+
+    #[test]
+    fn missing_limits_default_and_explicit_limits_are_preserved() {
+        for (limit, expected) in [
+            (None, 100),
+            (Some(0), 0),
+            (Some(17), 17),
+            (Some(u32::MAX), u32::MAX),
+        ] {
+            let (uri, payload) = match limit {
+                None => ("/documents".to_string(), json!({})),
+                Some(limit) => (format!("/documents?limit={limit}"), json!({"limit": limit})),
+            };
+            let uri: Uri = uri.parse().unwrap();
+            let document = Query::<DocumentQueryParams>::try_from_uri(&uri).unwrap().0;
+            let logs: LogQueryRequest = serde_json::from_value(payload).unwrap();
+            assert_eq!(document.limit, expected);
+            assert_eq!(logs.limit, expected);
+        }
+    }
+
+    #[test]
+    fn invalid_limits_are_rejected_instead_of_defaulted_or_truncated() {
+        for payload in [
+            json!({"limit": null}),
+            json!({"limit": -1}),
+            json!({"limit": u64::from(u32::MAX) + 1}),
+            json!({"limit": "100"}),
+            json!({"limit": 1.5}),
+        ] {
+            assert!(serde_json::from_value::<LogQueryRequest>(payload).is_err());
+        }
+        // Documents use query strings; a numeric text value such as "100" is valid.
+        for limit in ["", "-1", "4294967296", "invalid", "1.5", "null"] {
+            let uri: Uri = format!("/documents?limit={limit}").parse().unwrap();
+            assert!(Query::<DocumentQueryParams>::try_from_uri(&uri).is_err());
+        }
+    }
+}
