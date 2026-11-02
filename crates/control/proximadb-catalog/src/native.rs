@@ -1438,18 +1438,10 @@ impl NativeCatalog {
         let marker = MigrationMarker {
             layout_version: 1,
             oid_paths: true,
-            migrated_at: Self::now_millis(),
+            migrated_at: proximadb_kernel::time::now_unix_ms(),
         };
         let data = serde_json::to_vec_pretty(&marker)?;
         self.io_write(&Self::migration_marker_rel(), &data).await
-    }
-
-    /// Get current timestamp in milliseconds
-    fn now_millis() -> i64 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as i64
     }
 
     /// Mint an opaque, rename-stable namespace id (`ns_<uuid-v4>`). Matches the
@@ -1473,7 +1465,7 @@ impl NativeCatalog {
             return Err(anyhow!("Namespace '{}' already exists", key));
         }
 
-        let now = Self::now_millis();
+        let now = proximadb_kernel::time::now_unix_ms();
         let ns = CatalogNamespace {
             levels: namespace.to_vec(),
             properties,
@@ -1740,7 +1732,7 @@ impl Catalog for NativeCatalog {
             ns.properties.remove(&k);
         }
 
-        ns.updated_at_ms = Self::now_millis();
+        ns.updated_at_ms = proximadb_kernel::time::now_unix_ms();
         drop(namespaces);
 
         self.save_namespaces().await?;
@@ -1780,7 +1772,7 @@ impl Catalog for NativeCatalog {
             return Err(anyhow!("Table '{}' already exists", identifier));
         }
 
-        let now = Self::now_millis();
+        let now = proximadb_kernel::time::now_unix_ms();
         let meta = TableMetadata {
             identifier: identifier.into(),
             schema: schema.clone(),
@@ -1843,7 +1835,7 @@ impl Catalog for NativeCatalog {
         } else {
             None
         };
-        let now = Self::now_millis();
+        let now = proximadb_kernel::time::now_unix_ms();
         let meta = TableMetadata {
             identifier: identifier.into(),
             schema: schema.clone(),
@@ -2022,7 +2014,7 @@ impl Catalog for NativeCatalog {
         // Update metadata
         meta.identifier = to.into();
         meta.schema.name = to.name.clone();
-        meta.updated_at = Self::now_millis();
+        meta.updated_at = proximadb_kernel::time::now_unix_ms();
 
         // Save to new location
         self.save_table(&meta).await?;
@@ -2060,7 +2052,7 @@ impl Catalog for NativeCatalog {
 
         // Apply evolution
         meta.schema = apply_evolution(&meta.schema, &evolution)?;
-        meta.updated_at = Self::now_millis();
+        meta.updated_at = proximadb_kernel::time::now_unix_ms();
 
         self.save_table(&meta).await?;
 
@@ -2088,7 +2080,7 @@ impl Catalog for NativeCatalog {
         // consumers that watch the catalog cache see the new state.
         let mut meta = self.load_table(identifier).await?;
         meta.schema.primary_pod = primary;
-        meta.updated_at = Self::now_millis();
+        meta.updated_at = proximadb_kernel::time::now_unix_ms();
         self.save_table(&meta).await?;
         self.cache
             .invalidate_table_in_catalog(&self.name, identifier);
@@ -2106,7 +2098,7 @@ impl Catalog for NativeCatalog {
         // updated_at bump matters so catalog-cache watchers see the new state.
         let mut meta = self.load_table(identifier).await?;
         meta.schema.storage_layouts = layouts;
-        meta.updated_at = Self::now_millis();
+        meta.updated_at = proximadb_kernel::time::now_unix_ms();
         self.save_table(&meta).await?;
         self.cache
             .invalidate_table_in_catalog(&self.name, identifier);
@@ -2130,7 +2122,7 @@ impl Catalog for NativeCatalog {
             .map_err(anyhow::Error::new)?;
         asset.validate().map_err(anyhow::Error::new)?;
         meta.schema.set_mlops_asset_typed(asset);
-        let now = Self::now_millis();
+        let now = proximadb_kernel::time::now_unix_ms();
         meta.schema.updated_at_ms = now;
         meta.updated_at = now;
         self.save_table(&meta).await?;
@@ -2201,7 +2193,7 @@ impl Catalog for NativeCatalog {
         index.object_id = Some(self.mint_object_id(index.object_id));
 
         meta.schema.indexes.push(index.clone());
-        meta.updated_at = Self::now_millis();
+        meta.updated_at = proximadb_kernel::time::now_unix_ms();
 
         self.save_table(&meta).await?;
         // TD-PATH-2: the index's freshly minted object_id is durable with the
@@ -2226,7 +2218,7 @@ impl Catalog for NativeCatalog {
         meta.schema.indexes.retain(|i| i.name != index_name);
 
         if meta.schema.indexes.len() < initial_len {
-            meta.updated_at = Self::now_millis();
+            meta.updated_at = proximadb_kernel::time::now_unix_ms();
             self.save_table(&meta).await?;
 
             // Invalidate cache
@@ -2283,7 +2275,7 @@ impl Catalog for NativeCatalog {
     ) -> Result<()> {
         let mut meta = self.load_table(identifier).await?;
         meta.statistics = Some(stats.clone());
-        meta.updated_at = Self::now_millis();
+        meta.updated_at = proximadb_kernel::time::now_unix_ms();
 
         self.save_table(&meta).await?;
 
@@ -2313,7 +2305,7 @@ impl Catalog for NativeCatalog {
     ) -> Result<()> {
         let mut meta = self.load_table(identifier).await?;
         meta.partition_spec = Some(spec);
-        meta.updated_at = Self::now_millis();
+        meta.updated_at = proximadb_kernel::time::now_unix_ms();
 
         self.save_table(&meta).await?;
 
@@ -2343,7 +2335,7 @@ impl Catalog for NativeCatalog {
     ) -> Result<()> {
         let mut meta = self.load_table(identifier).await?;
         meta.sort_order = Some(order);
-        meta.updated_at = Self::now_millis();
+        meta.updated_at = proximadb_kernel::time::now_unix_ms();
 
         self.save_table(&meta).await?;
 
