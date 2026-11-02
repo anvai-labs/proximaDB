@@ -93,7 +93,7 @@ drifted twin.
    mixed-operator chains nest differently (seam tiered precedence vs
    modality flat left-assoc). The completeness claim is scoped to the
    PROBED battery — three review rounds have each falsified the
-   previous one, so the port itself must keep probing.   modality file reduces to the conversion layer.
+   previous one, so the port itself must keep probing.
 
    _Widened-behavior ledger (recorded per the step-1 review — tracked
    decisions, not accidents of superset adoption):_
@@ -142,15 +142,14 @@ drifted twin.
 +
    _Pin blind spots (deliberate, disclosed):_ the corpus is the BOTH-grammar intersection and
    CANNOT protect modality-only shapes (they cannot enter it). The modality-only ledger is
-   maintained in §2 by PROBING, not guessing — round-2 review falsified two earlier
-   completeness claims, and its final state is recorded there. Constructs BOTH grammars
+   maintained in §2 by PROBING, not guessing — the reviews falsified three earlier
+   completeness claims (rounds 1–3), and its final state is recorded there. Constructs BOTH grammars
    reject (ORDER BY over a property, UNION, UNWIND, aggregations other than SUM, FOREACH,
    CALL, `COUNT(n)`) are absent from both ASTs' parsed output today despite AST fields
    existing for several — a shared gap, not a divergence. KNOWN UNPINNED divergence:
    mixed-operator chains (`a XOR b AND c`) nest differently on the two grammars (seam
    tiered precedence vs modality flat left-assoc) — the clause port must pick a
-   precedence deliberately and pin it. `COUNT(DISTINCT n)` is
-   modality-only today and joins the modality-only list above. Probe discipline
+   precedence deliberately and pin it. Probe discipline
    for these lists: the seam parser does NOT require eof, so acceptance means
    full consumption (`rest` empty), never a bare `Ok`.
 
