@@ -4258,15 +4258,22 @@ fn an_incremental_republication_hides_old_versions_with_deletion_vectors() {
         );
 
         // Four incremental publications minted four dv-mat Puffins; GC keeps
-        // exactly the ones the current or the previous snapshot names.
+        // exactly the ones the retained window names — derived from the SAME
+        // enumeration the GC uses (F8: default 3 generations total), so this
+        // expectation cannot drift from the implementation again.
         let latest = inv
             .bridge
             .latest_metadata_version(&metadata_prefix)
             .await
             .expect("metadata log")
             .expect("a committed snapshot");
+        let retained = super::materialize_append::gc_retained_generations();
         let mut referenced = std::collections::BTreeSet::new();
-        for version in [latest - 1, latest] {
+        let window = std::iter::once(latest).chain(super::materialize_append::retained_versions(
+            latest - 1,
+            retained,
+        ));
+        for version in window {
             for v in inv
                 .bridge
                 .read_iceberg_snapshot_files(&metadata_prefix, version)
@@ -4684,9 +4691,14 @@ fn materialize_publishes_multi_part_generations_and_collects_old_ones() {
             .list_objects(&object_store::path::Path::from(prefix.as_str()))
             .await
             .expect("list data");
+        // F8: the default window is 3 generations (V, V−1, V−2), so after
+        // materialize 3 (V=2) generation 1 — version 0's files, V−2 — is
+        // RETAINED: a reader pinned two quick MATERIALIZEs back keeps its
+        // files. It ages out only once THREE newer versions exist; the
+        // collection side of that is pinned by the gc fixture unit test.
         assert!(
-            gen1.iter().all(|p| !listed.contains(p)),
-            "generation 1 is collected once two newer versions exist"
+            gen1.iter().all(|p| listed.contains(p)),
+            "F8: generation 1 (V−2) is retained under the 3-generation window"
         );
         assert!(
             gen2.iter().chain(gen3.iter()).all(|p| listed.contains(p)),

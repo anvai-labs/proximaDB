@@ -190,6 +190,47 @@ pub(crate) enum AppendPlan {
     },
 }
 
+/// F8 (release review 0.4→0.5.1): how many committed Iceberg metadata
+/// generations MATERIALIZE's GC must keep files for. The structural floor is
+/// 2 (the committed version and its parent); the default 3 keeps V−2 alive
+/// so a reader pinned two quick MATERIALIZEs back does not lose files
+/// mid-scan. Values below 2 (including OFF spellings) clamp to the floor:
+/// retention cannot go under the two generations the reader contract names.
+pub(crate) fn gc_retained_generations() -> u64 {
+    retained_generations_from(
+        std::env::var("PROXIMADB_MATERIALIZE_GC_RETAINED_GENERATIONS")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// Pure core of the gate (testable without env injection): unset/typo keeps
+/// the default 3; OFF/0/1 clamp to the structural floor 2 (V and V−1) — the
+/// pre-fix behavior, so OFF is a faithful kill-switch.
+pub(crate) fn retained_generations_from(raw: Option<&str>) -> u64 {
+    crate::services::storage_format::default_on_gate_value(raw, 3)
+        .unwrap_or(2)
+        .max(2)
+}
+
+/// The metadata versions whose referenced files GC must keep, newest-first:
+/// `previous` down to and including `previous - (retained - 2)`, saturating at
+/// 0. `retained` counts TOTAL generations including the committed V, so
+/// retained=2 ⇒ [previous] exactly (the pre-fix window), retained=3 ⇒
+/// [previous, previous−1] (V−1 and V−2 — the F8 fix; version 0 INCLUDED: the
+/// first commit lands at v0, so `previous - x` must be allowed to reach 0).
+pub(crate) fn retained_versions(previous: u64, retained: u64) -> Vec<u64> {
+    let floor = previous.saturating_sub(retained - 2);
+    (floor..=previous).rev().collect()
+}
+
+/// F14: the many-parts fallback threshold, extracted so its exact boundary is
+/// pinnable by test (`63` appends, `64` and `65` rewrite) — it had no test.
+pub(crate) fn parts_fallback_reason(files_len: usize) -> Option<&'static str> {
+    (files_len >= APPEND_MAX_FILES)
+        .then_some("the snapshot has many parts; a rewrite compacts them")
+}
+
 /// `PROXIMADB_MATERIALIZE_INCREMENTAL_DV` (default ON since 2026-10-29): an
 /// update or delete since the last publication republishes incrementally —
 /// after-images appended, old positions marked with deletion vectors — instead
@@ -242,6 +283,73 @@ mod tests {
             min: min.as_bytes().to_vec(),
             max: max.as_bytes().to_vec(),
             bloom: None,
+        }
+    }
+
+    #[test]
+    fn parts_threshold_boundary_is_pinned() {
+        // F14: the 64-part fallback threshold had no test anywhere.
+        assert_eq!(parts_fallback_reason(0), None);
+        assert_eq!(parts_fallback_reason(APPEND_MAX_FILES - 1), None);
+        assert_eq!(
+            parts_fallback_reason(APPEND_MAX_FILES),
+            Some("the snapshot has many parts; a rewrite compacts them")
+        );
+        assert_eq!(
+            parts_fallback_reason(APPEND_MAX_FILES + 1),
+            Some("the snapshot has many parts; a rewrite compacts them")
+        );
+    }
+
+    #[test]
+    fn gc_retention_clamps_to_the_structural_floor() {
+        // F8: unset/typo keeps the default; OFF/0/1 clamp to the floor 2
+        // (V and V−1) — the pre-fix window, so OFF is a kill-switch, never
+        // "GC everything" and never wider.
+        assert_eq!(retained_generations_from(None), 3);
+        assert_eq!(retained_generations_from(Some("")), 3);
+        assert_eq!(retained_generations_from(Some("garbage")), 3);
+        assert_eq!(retained_generations_from(Some("0")), 2);
+        assert_eq!(retained_generations_from(Some("1")), 2);
+        assert_eq!(retained_generations_from(Some("off")), 2);
+        assert_eq!(retained_generations_from(Some("5")), 5);
+    }
+
+    #[test]
+    fn retained_versions_enumeration_includes_version_zero() {
+        // retained counts TOTAL generations including the committed V.
+        use super::retained_versions;
+        // The F8 headline: default 3 keeps V−1 and V−2, and version 0 (the
+        // first commit) is a reachable V−2 — the `.max(1)` off-by-one this
+        // test pins excluded it and left the F8 hole open at a table's
+        // third publication.
+        assert_eq!(retained_versions(10, 3), vec![10, 9]);
+        assert_eq!(retained_versions(2, 3), vec![2, 1]);
+        assert_eq!(retained_versions(1, 3), vec![1, 0]);
+        assert_eq!(retained_versions(0, 3), vec![0]);
+        // retained=2 is exactly the pre-fix window.
+        assert_eq!(retained_versions(10, 2), vec![10]);
+        assert_eq!(retained_versions(0, 2), vec![0]);
+    }
+
+    #[test]
+    fn classify_max_rows_boundary_is_exact_equality_not_rewrite() {
+        // F14: changed.len() == max_rows is AT the bound (append/delta), one
+        // past it rewrites. The boundary had no test.
+        let published = PublishedOids {
+            groups: vec![group("t:row:100", "t:row:199")],
+            files: vec![(Path::from("p0"), 100)],
+        };
+        let changed = (0..5).map(|i| format!("t:row:{i}")).collect::<Vec<_>>();
+        match classify(changed.clone(), &published, 5, false) {
+            AppendPlan::Append(oids) => assert_eq!(oids, changed),
+            other => panic!("at-bound must Append, got {other:?}"),
+        }
+        match classify(changed, &published, 4, false) {
+            AppendPlan::Rewrite(reason) => {
+                assert_eq!(reason, "the delta exceeds the append bound")
+            }
+            other => panic!("past-bound must Rewrite, got {other:?}"),
         }
     }
 

@@ -49,32 +49,48 @@ pub const DEFAULT_SPILL_FLUSH_LAG_ENTRIES: u64 = 1_000_000;
 /// Anything else keeps the default and warns — a typo must neither disable
 /// durability features silently nor pick an absurd value.
 pub fn default_on_gate(env: &str, default: u64) -> Option<u64> {
-    let Ok(raw) = std::env::var(env) else {
+    let raw = std::env::var(env).ok();
+    let value = default_on_gate_value(raw.as_deref(), default);
+    if let (Some(r), Some(v)) = (&raw, value) {
+        let t = r.trim();
+        if v == default && !t.is_empty() && t.parse::<u64>().is_err() && !is_off_like(t) {
+            tracing::warn!(
+                env,
+                value = %r,
+                default,
+                "unrecognised value; using the default (set 0 or off to disable)"
+            );
+        }
+    }
+    value
+}
+
+/// [`default_on_gate`]'s pure core over the raw value (testable without env
+/// injection; the typo branch keeps the default instead of logging — only
+/// the env-reading wrapper warns).
+pub fn default_on_gate_value(raw: Option<&str>, default: u64) -> Option<u64> {
+    let Some(raw) = raw else {
         return Some(default);
     };
     let value = raw.trim();
     if value.is_empty() {
         return Some(default);
     }
-    if matches!(
-        value.to_ascii_lowercase().as_str(),
-        "off" | "false" | "no" | "none" | "disabled"
-    ) {
+    if is_off_like(value) {
         return None;
     }
     match value.parse::<u64>() {
         Ok(0) => None,
         Ok(n) => Some(n),
-        _ => {
-            tracing::warn!(
-                env,
-                value,
-                default,
-                "unrecognised value; using the default (set 0 or off to disable)"
-            );
-            Some(default)
-        }
+        _ => Some(default),
     }
+}
+
+fn is_off_like(value: &str) -> bool {
+    matches!(
+        value.to_ascii_lowercase().as_str(),
+        "off" | "false" | "no" | "none" | "disabled" | "0"
+    )
 }
 
 /// The format this binary writes by default.
