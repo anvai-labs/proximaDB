@@ -204,6 +204,6 @@ mod tests {
 
         assert!(matches!(from_string, StreamError::Internal { message } if message == "owned"));
         assert!(matches!(from_str, StreamError::Internal { message } if message == "borrowed"));
-        assert!(result.unwrap_err().to_string().contains("borrowed"));
+        assert!(matches!(result, Err(error) if error.to_string().contains("borrowed")));
     }
 }

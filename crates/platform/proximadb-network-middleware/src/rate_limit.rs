@@ -408,14 +408,6 @@ mod tests {
     }
 
     #[test]
-    fn test_is_health_endpoint() {
-        assert!(is_health_endpoint("/health"));
-        assert!(is_health_endpoint("/health/ready"));
-        assert!(is_health_endpoint("/health/live"));
-        assert!(!is_health_endpoint("/collections"));
-    }
-
-    #[test]
     fn test_rate_limit_config_default() {
         let config = RateLimitConfig::default();
         // Default is now enabled for security
@@ -674,6 +666,9 @@ mod tests {
         assert!(is_health_endpoint("/health/ready"));
         assert!(is_health_endpoint("/health/live"));
         assert!(is_health_endpoint("/health/startup"));
+        assert!(!is_health_endpoint("/collections"));
+        assert!(!is_health_endpoint("/api/health"));
+        assert!(!is_health_endpoint("/Health"));
         assert!(!is_health_endpoint("/api/v1/collections"));
         assert!(!is_health_endpoint("/metrics"));
         assert!(!is_health_endpoint("/"));
