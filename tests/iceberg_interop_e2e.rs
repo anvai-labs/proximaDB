@@ -1398,7 +1398,10 @@ where
     if std::env::var_os(child_var).is_none() {
         let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
         cmd.args(["--exact", test, "--nocapture"])
-            .env(child_var, "1");
+            .env(child_var, "1")
+            // A child exercises the shipped default unless this case
+            // explicitly supplies a retention override below.
+            .env_remove("PROXIMADB_MATERIALIZE_GC_RETAINED_GENERATIONS");
         for (k, v) in envs {
             cmd.env(k, v);
         }
@@ -1874,18 +1877,19 @@ async fn check_incremental_materialize() {
 /// MATERIALIZE, and between them over the DV-carrying base, the OLAP view
 /// agrees on the row count, the key sum and the count of updated values;
 /// after every MATERIALIZE the `dv-mat` Puffins on disk are EXACTLY those the
-/// current and previous snapshots name (superseded ones collected); the
+/// configured retained snapshots name (superseded ones collected). Both the
+/// three-generation default and two-generation minimum are exercised; the
 /// external engines read the final state.
 #[test]
 fn soak_incremental_materialize_holds_both_views() {
-    run_isolated(
-        "soak_incremental_materialize_holds_both_views",
-        "PROXIMADB_INCR_SOAK_CHILD",
-        &[
-            ("PROXIMADB_MATERIALIZE_INCREMENTAL_DV", "1"),
-            ("PROXIMADB_PARQUET_WRITE_BLOOM_MIN_ROWS", "1"),
-        ],
-        check_soak_incremental_materialize,
+    run_incremental_materialize_soak("soak_incremental_materialize_holds_both_views", 3);
+}
+
+#[test]
+fn soak_incremental_materialize_holds_both_views_minimum_retention() {
+    run_incremental_materialize_soak(
+        "soak_incremental_materialize_holds_both_views_minimum_retention",
+        2,
     );
 }
 
@@ -2012,6 +2016,20 @@ async fn check_soak_compaction_leg() {
     );
 }
 
+fn run_incremental_materialize_soak(test: &str, retained_generations: u64) {
+    let retained = retained_generations.to_string();
+    let mut envs = vec![
+        ("PROXIMADB_MATERIALIZE_INCREMENTAL_DV", "1"),
+        ("PROXIMADB_PARQUET_WRITE_BLOOM_MIN_ROWS", "1"),
+    ];
+    if retained_generations != 3 {
+        envs.push(("PROXIMADB_MATERIALIZE_GC_RETAINED_GENERATIONS", &retained));
+    }
+    run_isolated(test, "PROXIMADB_INCR_SOAK_CHILD", &envs, move || {
+        check_soak_incremental_materialize(retained_generations)
+    });
+}
+
 /// The OLAP view's `(COUNT(*), SUM(k), COUNT of updated values)`; updates
 /// write `a{round}` values, which sort below every inserted `v{k}`.
 async fn olap_fingerprint(client: &tokio_postgres::Client, table: &str) -> (i64, i64, i64) {
@@ -2076,10 +2094,11 @@ async fn latest_parts(server: &TestPgServer, table: &str) -> std::collections::B
 }
 
 /// The `dv-mat-*` Puffin file names on disk under the table's base, and the
-/// ones its latest and previous snapshots name (read through the engine).
+/// ones its retained snapshots name (read through the engine).
 async fn dv_mat_puffins(
     server: &TestPgServer,
     table: &str,
+    retained_generations: u64,
 ) -> (
     std::collections::BTreeSet<String>,
     std::collections::BTreeSet<String>,
@@ -2104,13 +2123,9 @@ async fn dv_mat_puffins(
         .await
         .expect("metadata log")
         .expect("a published snapshot");
-    // F8: the retained window is 3 generations TOTAL by default (V, V−1,
-    // V−2) — mirror materialize_append::retained_generations_from's default
-    // path (the lib helper is pub(crate), so this pins the default window;
-    // the soak does not set the env knob).
-    let retained: u64 = 3;
     let mut referenced = std::collections::BTreeSet::new();
-    for version in (latest + 1).saturating_sub(retained)..=latest {
+    let oldest = latest.saturating_sub(retained_generations.saturating_sub(1));
+    for version in oldest..=latest {
         let snapshot = bridge
             .read_iceberg_snapshot_files("metadata", version)
             .await
@@ -2133,7 +2148,7 @@ fn model_fingerprint(model: &std::collections::BTreeMap<i32, String>) -> (i64, i
     )
 }
 
-async fn check_soak_incremental_materialize() {
+async fn check_soak_incremental_materialize(retained_generations: u64) {
     let (server, client) = soak_open("incr_soak").await;
     let table = "incr_soak";
     let exec = |sql: String| exec_sql(&client, sql);
@@ -2188,14 +2203,14 @@ async fn check_soak_incremental_materialize() {
                 model_fingerprint(&model),
                 "round {round}: the OLAP view reconciles after MATERIALIZE"
             );
-            // Exact: the dv-mat Puffins on disk are the ones the current or
-            // the previous snapshot names — superseded ones are collected.
-            let (on_disk, referenced) = dv_mat_puffins(&server, table).await;
+            // Exact: retain the configured snapshot window and collect
+            // superseded Puffins outside it.
+            let (on_disk, referenced) = dv_mat_puffins(&server, table, retained_generations).await;
             max_dv_mat = max_dv_mat.max(on_disk.len());
             minted_any |= !on_disk.is_empty();
             assert_eq!(
                 on_disk, referenced,
-                "round {round}: dv-mat Puffins on disk == those the retained window name"
+                "round {round}: dv-mat Puffins on disk == those the last {retained_generations} snapshots name"
             );
         }
     }
@@ -2212,7 +2227,7 @@ async fn check_soak_incremental_materialize() {
         model_fingerprint(&model),
         "the final publication reconciles the OLAP view"
     );
-    let (on_disk, referenced) = dv_mat_puffins(&server, table).await;
+    let (on_disk, referenced) = dv_mat_puffins(&server, table, retained_generations).await;
     assert_eq!(on_disk, referenced, "the final publication's GC");
 
     let rows: Vec<(String, String)> = model
@@ -2220,10 +2235,17 @@ async fn check_soak_incremental_materialize() {
         .map(|(k, v)| (k.to_string(), v.clone()))
         .collect();
     let expected: Vec<(&str, &str)> = rows.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-    let external = external_leg_kv(server.rest_port, table, &expected, "iceberg-incr-soak").await;
+    let scratch = tempfile::tempdir().expect("isolated soak readback");
+    let external = external_leg_kv(
+        server.rest_port,
+        table,
+        &expected,
+        scratch.path().to_str().expect("UTF-8 scratch path"),
+    )
+    .await;
     eprintln!(
         "incremental soak ok: {updates} updates, {deletes} deletes, {materializes} materializes, \
-         <= {max_dv_mat} dv-mat Puffins on disk (== those V and V-1 name); external leg {}",
+         <= {max_dv_mat} dv-mat Puffins on disk (== those the last {retained_generations} snapshots name); external leg {}",
         if external {
             "checked"
         } else {

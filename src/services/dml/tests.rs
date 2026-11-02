@@ -4301,6 +4301,134 @@ fn an_incremental_republication_hides_old_versions_with_deletion_vectors() {
     });
 }
 
+/// A transient read failure in V−2 must not turn its Parquet files or Puffins
+/// into GC candidates. The healthy control proves GC still collects old
+/// unreferenced objects and protects a newer concurrent publisher's objects.
+#[cfg(feature = "datafusion-integration")]
+fn check_gc_with_retained_metadata_unavailable(unavailable: bool) {
+    let _bloom = EnvGuard::set("PROXIMADB_PARQUET_WRITE_BLOOM_MIN_ROWS", "1");
+    let _dv = EnvGuard::set("PROXIMADB_MATERIALIZE_INCREMENTAL_DV", "1");
+    let _append = EnvGuard::set("PROXIMADB_MATERIALIZE_APPEND_MAX_ROWS", "1000000");
+    let _retained = EnvGuard::set("PROXIMADB_MATERIALIZE_GC_RETAINED_GENERATIONS", "3");
+    crate::query::execution::test_runtime::run_with_timeout(30, async {
+        use object_store::path::Path;
+
+        let inv = InvFixture::new("retained-metadata.wal", 20).await;
+        let location = inv.materialize().await;
+        let (prefix, metadata_prefix) = inv.prefixes(&location);
+        inv.exec("UPDATE inv SET qty = 100 WHERE id = 'i0';").await;
+        inv.materialize().await;
+        let older = inv
+            .bridge
+            .read_iceberg_snapshot_files(&metadata_prefix, 1)
+            .await
+            .expect("V−2 snapshot");
+        assert!(!older.data_files.is_empty());
+        assert!(!older.deletion_vectors.is_empty(), "a real retained Puffin");
+        let older_keys: Vec<Path> = older
+            .data_files
+            .into_iter()
+            .chain(older.deletion_vectors.into_iter().map(|dv| dv.puffin_file))
+            .collect();
+
+        // Rewrite away from the DV base, so neither V=3 nor its parent V=2
+        // references V−2's files. Only reading V−2 can protect them.
+        let _rewrite = EnvGuard::set("PROXIMADB_MATERIALIZE_APPEND_MAX_ROWS", "0");
+        inv.materialize().await;
+        let parent = published_data_files(&inv.bridge, &prefix).await;
+        assert!(parent.iter().all(|p| !older_keys.contains(p)));
+        let old_stem = super::materialize_stream::generation_stem(0);
+        let newer_stem = super::materialize_stream::generation_stem(4);
+        let garbage = [
+            Path::from(format!("{prefix}/{old_stem}-orphan.parquet")),
+            Path::from(format!("{prefix}/dv-mat-{old_stem}.puffin")),
+        ];
+        let newer = [
+            Path::from(format!("{prefix}/{newer_stem}-00000.parquet")),
+            Path::from(format!("{prefix}/dv-mat-{newer_stem}.puffin")),
+        ];
+        for key in garbage.iter().chain(newer.iter()) {
+            inv.bridge
+                .persist_vector_segment(key, b"GC fixture", None)
+                .await
+                .expect("write GC fixture");
+        }
+        let before = inv
+            .bridge
+            .list_objects(&Path::from(prefix.as_str()))
+            .await
+            .expect("list before publication");
+
+        // Temporarily hide just V−2's metadata, using the real file-backed
+        // bridge. The object is restored immediately after publication;
+        // this is an unavailable read, not evidence that its files are dead.
+        let metadata =
+            std::path::Path::new(inv.root_url.strip_prefix("file://").expect("file root"))
+                .join(&metadata_prefix)
+                .join("v00000000000000000001.metadata.json");
+        let hidden = metadata.with_extension("unavailable");
+        if unavailable {
+            std::fs::rename(&metadata, &hidden).expect("inject unavailable metadata");
+            assert!(
+                inv.bridge
+                    .read_iceberg_snapshot_files(&metadata_prefix, 1)
+                    .await
+                    .is_err(),
+                "the retained metadata read really fails"
+            );
+        }
+        let published = inv.materialize().await;
+        if unavailable {
+            std::fs::rename(hidden, metadata).expect("restore metadata");
+        }
+        assert_eq!(published, location, "GC cannot fail the landed publication");
+        assert_eq!(
+            inv.bridge
+                .latest_metadata_version(&metadata_prefix)
+                .await
+                .expect("latest"),
+            Some(3),
+            "the new publication committed despite the retained read failure"
+        );
+        let after = inv
+            .bridge
+            .list_objects(&Path::from(prefix.as_str()))
+            .await
+            .expect("list after publication");
+        assert!(
+            older_keys.iter().all(|p| after.contains(p)),
+            "V−2's data and Puffins remain available to pinned readers"
+        );
+        assert!(
+            newer.iter().all(|p| after.contains(p)),
+            "newer publisher survives"
+        );
+        if unavailable {
+            assert!(
+                before.iter().all(|p| after.contains(p)),
+                "an incomplete retained keep-set skips the entire GC round"
+            );
+        } else {
+            assert!(
+                garbage.iter().all(|p| !after.contains(p)),
+                "healthy metadata reads still collect old unreferenced data and Puffins"
+            );
+        }
+    });
+}
+
+#[cfg(feature = "datafusion-integration")]
+#[test]
+fn materialize_gc_skips_when_older_retained_metadata_is_unavailable() {
+    check_gc_with_retained_metadata_unavailable(true);
+}
+
+#[cfg(feature = "datafusion-integration")]
+#[test]
+fn materialize_gc_collects_with_healthy_retained_metadata() {
+    check_gc_with_retained_metadata_unavailable(false);
+}
+
 /// v0.5.0 upgrade (release blocker): v0.4.1 published Iceberg format-version
 /// 3 WITHOUT row lineage (no `next-row-id`, no snapshot `first-row-id` or
 /// `added-rows`). The lineage check from #2261 refused such a parent, so every
