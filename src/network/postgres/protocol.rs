@@ -796,6 +796,15 @@ struct Portal {
     execution_state: Option<PortalExecutionState>,
 }
 
+/// Outcome of [`PostgresProtocol::execute_portal_fast_paths`].
+enum PortalFastPathOutcome {
+    /// A fast path claimed the Execute and fully served it.
+    Handled,
+    /// Neither fast path claims the shape; the caller falls through to the
+    /// general (self-governing) execution path.
+    Declined,
+}
+
 /// Cached execution state for a portal.
 struct PortalExecutionState {
     result: ExecutionPipelineResult,
@@ -3030,10 +3039,45 @@ impl PostgresProtocol {
         Self::strip_sql_literal(value)
     }
 
-    /// Execute a translated query
+    /// Execute a translated query.
+    ///
+    /// E0 (TD-PGPORTAL-1 follow-up): the rate-limit check lives in the TWO
+    /// metered entry points — here (every simple-protocol statement) and
+    /// `execute_portal_query` (every Execute that runs a query, budgeted or
+    /// not) — so
+    /// each query pays exactly once regardless of which path serves it: a
+    /// Declined budgeted Execute falls through to
+    /// `execute_query_with_controls` UNMETERED (see its comment).
     async fn execute_query(&mut self, query: &str) -> Result<()> {
+        if self.check_pgwire_rate_limit().await? {
+            return Ok(());
+        }
         self.execute_query_with_controls(query, ExecutionControls::default())
             .await
+    }
+
+    /// E0 (TD-PGPORTAL-1 follow-up): the converged rate-limit check (the SAME
+    /// `RateLimitState` REST uses). Called by the two metered entry points —
+    /// `execute_query` (every simple-protocol statement) and
+    /// `execute_portal_query` (EVERY Execute that runs a query: budgeted
+    /// fast-path or unbudgeted fall-through) — NEVER by
+    /// `execute_query_with_controls` itself (both of its arrival paths are
+    /// already metered; a check there would double-charge). Returns `true`
+    /// when the query was REFUSED (53400 sent).
+    async fn check_pgwire_rate_limit(&mut self) -> Result<bool> {
+        if let Some(limiter) = self.rate_limiter.clone()
+            && limiter.enabled()
+            && let Err(retry_after) = limiter.check_and_consume(self.peer_ip).await
+        {
+            self.send_error(
+                "ERROR",
+                "53400",
+                &format!("rate limit exceeded; retry after {retry_after}s"),
+            )
+            .await?;
+            return Ok(true);
+        }
+        Ok(false)
     }
 
     /// Execute a translated query with request-scoped execution controls.
@@ -3046,6 +3090,11 @@ impl PostgresProtocol {
     /// entirely. The tenant is the one already resolved for read routing
     /// (TD-064); no new identity source is introduced. The wrapper is a thin
     /// scope around the unchanged body in `_inner`.
+    ///
+    /// E0 rate-limiting is deliberately ABSENT here (TD-PGPORTAL-1 follow-up):
+    /// the two callers are the metered entry points, and the Declined-portal
+    /// fall-through arrives already metered — a check here would
+    /// double-charge budgeted Executes.
     async fn execute_query_with_controls(
         &mut self,
         query: &str,
@@ -3054,21 +3103,6 @@ impl PostgresProtocol {
         let cancellation_flag = self.session.read().await.cancellation_flag.clone();
         cancellation_flag.store(false, Ordering::Relaxed);
         controls.cancellation_flag = Some(cancellation_flag);
-        // E0 rate-limiting: reject over-quota queries up front with a pgwire
-        // error, using the SAME converged RateLimitState check REST uses (no
-        // duplicate limiter). No-op when unset/disabled.
-        if let Some(limiter) = self.rate_limiter.clone()
-            && limiter.enabled()
-            && let Err(retry_after) = limiter.check_and_consume(self.peer_ip).await
-        {
-            return self
-                .send_error(
-                    "ERROR",
-                    "53400",
-                    &format!("rate limit exceeded; retry after {retry_after}s"),
-                )
-                .await;
-        }
         let tenant = self.pgwire_resolve_read_tenant().await;
         // E0 (edge consistency): give every pgwire query a request-id correlation
         // scope — matching REST's request_id middleware — so logs and error
@@ -7706,141 +7740,37 @@ impl PostgresProtocol {
                 .await;
         }
 
-        if max_rows > 0 {
-            // E0 follow-up: this portal-SELECT fast-path returns before reaching
-            // `execute_query_with_controls`, so it is the one pgwire query path
-            // not yet under the per-query `io_trace` span. Bring it under the
-            // same scope in the next slice (kept out here to avoid restructuring
-            // the borrow in this `&&` let-chain).
-            if query.trim_start().to_uppercase().starts_with("SELECT")
-                && let Some(result) = {
-                    let cancellation_flag = self.session.read().await.cancellation_flag.clone();
-                    cancellation_flag.store(false, Ordering::Relaxed);
-                    self.try_run_relational_select_pipeline(
-                        query,
-                        ExecutionControls {
-                            cancellation_flag: Some(cancellation_flag),
-                            ..Default::default()
-                        },
-                    )
-                    .await
-                }
-            {
-                let result = match result {
-                    Ok(result) => result,
-                    Err(msg) => return self.send_relational_error(&msg).await,
-                };
-                // This route never sends a RowDescription, so check the shape
-                // against Describe here (TD-PGEXT-1).
-                let fields: Vec<FieldDescription> = result
-                    .schema
-                    .columns
-                    .iter()
-                    .map(|c| {
-                        FieldDescription::new(
-                            &c.name,
-                            super::relational_pipeline::pg_type_for(&c.ty),
-                        )
-                    })
-                    .collect();
-                if let Some(mismatch) = self.described_shape_mismatch(&fields) {
-                    return Err(anyhow::Error::new(DescribeMismatch(mismatch)));
-                }
-                if let Some(portal) = self.portals.get_mut(portal_name) {
-                    portal.execution_state = Some(PortalExecutionState {
-                        result,
-                        next_row: 0,
-                    });
-                }
-                return self.emit_portal_page(portal_name, max_rows as usize).await;
-            }
+        // E0 rate limiting (TD-PGPORTAL-1 follow-up, review round 2): EVERY
+        // Execute that runs a query pays exactly one token — budgeted
+        // (max_rows > 0: either fast path) AND unbudgeted (max_rows == 0: the
+        // fall-through, the DEFAULT shape for tokio-postgres/asyncpg/libpq —
+        // which would otherwise be the one unmetered query path left). Page
+        // EMISSION on later rounds (the hoisted drain above) is not metered:
+        // the query already paid when it ran.
+        if self.check_pgwire_rate_limit().await? {
+            return Ok(());
+        }
 
-            // TD-PGPORTAL-1: the LEGACY single-table reader materializes into
-            // the portal too and pages with PortalSuspended — mirroring the
-            // dispatch `execute_query` uses (extract_table_name +
-            // detect_select_store_type), restricted to the Relational/Event
-            // stores this reader serves. Before, this shape fell through to
-            // `execute_query_with_controls`, which streamed EVERY row plus
-            // CommandComplete regardless of the Execute budget and re-ran the
-            // query on the next Execute.
-            let upper = query.trim_start().to_uppercase();
-            if upper.starts_with("SELECT")
-                // Classification PARITY with the pre-dispatch gates the
-                // fall-through used to run (TD-PGPORTAL-1 review round 1,
-                // finding 2): special cases and catalog introspection keep
-                // their own handlers; unsupported FROM shapes keep the
-                // actionable 0A000 instead of a misparsed-table XX000.
-                && !Self::is_pre_dispatch_special(&upper)
-                && Self::legacy_unsupported_from_shape(&upper).is_none()
-                && let Some(table_name) = self.extract_table_name(query)
-                && matches!(
-                    self.detect_select_store_type(&table_name, &upper),
-                    DataModel::Relational | DataModel::Event
+        if max_rows > 0 {
+            // E0 span governance (TD-PGPORTAL-1 follow-up): both fast paths
+            // return before `execute_query_with_controls`, so they run inside
+            // the SAME request-id + per-query io_trace scope the general path
+            // provides (around the query execution — materialization + the
+            // first page emit). The fall-through carries its own scope.
+            let tenant = self.pgwire_resolve_read_tenant().await;
+            let request_id = crate::network::middleware::request_id::RequestId::generate();
+            let outcome = proximadb_api::rest::errors::REQUEST_ID
+                .scope(
+                    request_id.0,
+                    crate::observability::io_trace::instrument(
+                        Some(tenant),
+                        "pgwire.portal_query",
+                        self.execute_portal_fast_paths(portal_name, query, max_rows),
+                    ),
                 )
-            {
-                // Edge-config parity (review finding 4): no DML service is a
-                // silent empty result everywhere else on this surface.
-                if self.dml_service.is_none() {
-                    return self.send_command_complete("SELECT 0").await;
-                }
-                // Cancellation parity (review finding 3): arm the flag for
-                // the fetch and honor it before serving pages. The io_trace
-                // span and the E0 rate limiter remain uncovered on this fast
-                // path — the SAME documented debt the pipeline fast-path
-                // carries a few lines up; tracked on the TD, not dropped.
-                let cancellation_flag = self.session.read().await.cancellation_flag.clone();
-                cancellation_flag.store(false, Ordering::Relaxed);
-                return match self
-                    .legacy_relational_select_result(query, &table_name)
-                    .await
-                {
-                    Ok((fields, mut result)) => {
-                        if cancellation_flag.load(Ordering::Relaxed) {
-                            return self
-                                .send_error(
-                                    "ERROR",
-                                    "57014",
-                                    "canceling statement due to user request",
-                                )
-                                .await;
-                        }
-                        // SQL LIMIT parity (review finding 1): with an ORDER BY
-                        // the fetch retrieved every matching row (sorted) and
-                        // the SENDER truncates — the portal must truncate too,
-                        // or a budgeted portal streams past the LIMIT forever.
-                        if let Some(limit) = Self::extract_select_limit(query) {
-                            result.rows.truncate(limit);
-                        }
-                        // This route never sends a RowDescription, so check the
-                        // shape against Describe here (TD-PGEXT-1), same as the
-                        // pipeline branch above.
-                        if let Some(mismatch) = self.described_shape_mismatch(&fields) {
-                            return Err(anyhow::Error::new(DescribeMismatch(mismatch)));
-                        }
-                        // ColumnInfo types come from the catalog-resolved
-                        // selected columns; the portal only READS rows at page
-                        // time, but keep the schema honest for anything that
-                        // inspects it.
-                        let schema = RelationalSchema::new(
-                            result
-                                .selected_columns
-                                .iter()
-                                .map(|c| ColumnInfo::new(c.name.clone(), c.data_type.clone(), true))
-                                .collect(),
-                        );
-                        if let Some(portal) = self.portals.get_mut(portal_name) {
-                            portal.execution_state = Some(PortalExecutionState {
-                                result: ExecutionPipelineResult {
-                                    schema,
-                                    rows: result.rows,
-                                },
-                                next_row: 0,
-                            });
-                        }
-                        self.emit_portal_page(portal_name, max_rows as usize).await
-                    }
-                    Err(msg) => self.send_relational_error(&msg.to_string()).await,
-                };
+                .await?;
+            if matches!(outcome, PortalFastPathOutcome::Handled) {
+                return Ok(());
             }
         }
 
@@ -7849,6 +7779,158 @@ impl PostgresProtocol {
             Self::execution_controls_for_execute_max_rows(max_rows),
         )
         .await
+    }
+
+    /// TD-PGPORTAL-1 + E0 follow-up: the two portal fast paths (relational
+    /// pipeline; legacy single-table reader), run under the caller's
+    /// governance scope. `Handled` = the Execute was fully served; `Declined`
+    /// = neither fast path claims this shape and the caller falls through to
+    /// `execute_query_with_controls` (which carries its own governance).
+    async fn execute_portal_fast_paths(
+        &mut self,
+        portal_name: &str,
+        query: &str,
+        max_rows: i32,
+    ) -> Result<PortalFastPathOutcome> {
+        if query.trim_start().to_uppercase().starts_with("SELECT")
+            && let Some(result) = {
+                let cancellation_flag = self.session.read().await.cancellation_flag.clone();
+                cancellation_flag.store(false, Ordering::Relaxed);
+                self.try_run_relational_select_pipeline(
+                    query,
+                    ExecutionControls {
+                        cancellation_flag: Some(cancellation_flag),
+                        ..Default::default()
+                    },
+                )
+                .await
+            }
+        {
+            let result = match result {
+                Ok(result) => result,
+                Err(msg) => {
+                    self.send_relational_error(&msg).await?;
+                    return Ok(PortalFastPathOutcome::Handled);
+                }
+            };
+            // This route never sends a RowDescription, so check the shape
+            // against Describe here (TD-PGEXT-1).
+            let fields: Vec<FieldDescription> = result
+                .schema
+                .columns
+                .iter()
+                .map(|c| {
+                    FieldDescription::new(&c.name, super::relational_pipeline::pg_type_for(&c.ty))
+                })
+                .collect();
+            if let Some(mismatch) = self.described_shape_mismatch(&fields) {
+                return Err(anyhow::Error::new(DescribeMismatch(mismatch)));
+            }
+            if let Some(portal) = self.portals.get_mut(portal_name) {
+                portal.execution_state = Some(PortalExecutionState {
+                    result,
+                    next_row: 0,
+                });
+            }
+            self.emit_portal_page(portal_name, max_rows as usize)
+                .await?;
+            return Ok(PortalFastPathOutcome::Handled);
+        }
+
+        // TD-PGPORTAL-1: the LEGACY single-table reader materializes into
+        // the portal too and pages with PortalSuspended — mirroring the
+        // dispatch `execute_query` uses (extract_table_name +
+        // detect_select_store_type), restricted to the Relational/Event
+        // stores this reader serves. Before, this shape fell through to
+        // `execute_query_with_controls`, which streamed EVERY row plus
+        // CommandComplete regardless of the Execute budget and re-ran the
+        // query on the next Execute.
+        let upper = query.trim_start().to_uppercase();
+        if upper.starts_with("SELECT")
+            // Classification PARITY with the pre-dispatch gates the
+            // fall-through used to run (TD-PGPORTAL-1 review round 1,
+            // finding 2): special cases and catalog introspection keep
+            // their own handlers; unsupported FROM shapes keep the
+            // actionable 0A000 instead of a misparsed-table XX000.
+            && !Self::is_pre_dispatch_special(&upper)
+            && Self::legacy_unsupported_from_shape(&upper).is_none()
+            && let Some(table_name) = self.extract_table_name(query)
+            && matches!(
+                self.detect_select_store_type(&table_name, &upper),
+                DataModel::Relational | DataModel::Event
+            )
+        {
+            // Edge-config parity (review finding 4): no DML service is a
+            // silent empty result everywhere else on this surface.
+            if self.dml_service.is_none() {
+                self.send_command_complete("SELECT 0").await?;
+                return Ok(PortalFastPathOutcome::Handled);
+            }
+            // Cancellation parity (review finding 3): arm the flag for the
+            // fetch and honor it before serving pages. (The rate limiter and
+            // io_trace span are the CALLER's governance wrapper — both fast
+            // paths run inside it.)
+            let cancellation_flag = self.session.read().await.cancellation_flag.clone();
+            cancellation_flag.store(false, Ordering::Relaxed);
+            let outcome = match self
+                .legacy_relational_select_result(query, &table_name)
+                .await
+            {
+                Ok((fields, mut result)) => {
+                    if cancellation_flag.load(Ordering::Relaxed) {
+                        self.send_error(
+                            "ERROR",
+                            "57014",
+                            "canceling statement due to user request",
+                        )
+                        .await?;
+                        return Ok(PortalFastPathOutcome::Handled);
+                    }
+                    // SQL LIMIT parity (review finding 1): with an ORDER BY
+                    // the fetch retrieved every matching row (sorted) and
+                    // the SENDER truncates — the portal must truncate too,
+                    // or a budgeted portal streams past the LIMIT forever.
+                    if let Some(limit) = Self::extract_select_limit(query) {
+                        result.rows.truncate(limit);
+                    }
+                    // This route never sends a RowDescription, so check the
+                    // shape against Describe here (TD-PGEXT-1), same as the
+                    // pipeline branch above.
+                    if let Some(mismatch) = self.described_shape_mismatch(&fields) {
+                        return Err(anyhow::Error::new(DescribeMismatch(mismatch)));
+                    }
+                    // ColumnInfo types come from the catalog-resolved
+                    // selected columns; the portal only READS rows at page
+                    // time, but keep the schema honest for anything that
+                    // inspects it.
+                    let schema = RelationalSchema::new(
+                        result
+                            .selected_columns
+                            .iter()
+                            .map(|c| ColumnInfo::new(c.name.clone(), c.data_type.clone(), true))
+                            .collect(),
+                    );
+                    if let Some(portal) = self.portals.get_mut(portal_name) {
+                        portal.execution_state = Some(PortalExecutionState {
+                            result: ExecutionPipelineResult {
+                                schema,
+                                rows: result.rows,
+                            },
+                            next_row: 0,
+                        });
+                    }
+                    self.emit_portal_page(portal_name, max_rows as usize)
+                        .await?;
+                    PortalFastPathOutcome::Handled
+                }
+                Err(msg) => {
+                    self.send_relational_error(&msg.to_string()).await?;
+                    PortalFastPathOutcome::Handled
+                }
+            };
+            return Ok(outcome);
+        }
+        Ok(PortalFastPathOutcome::Declined)
     }
 
     async fn emit_portal_page(&mut self, portal_name: &str, max_rows: usize) -> Result<()> {
