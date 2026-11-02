@@ -27,7 +27,7 @@ use anyhow::Result;
 use std::collections::HashMap;
 use tracing::{debug, info, warn};
 
-use crate::proto::proximadb_v1::{Collection, VectorRecord};
+use crate::proto::proximadb_v1::Collection;
 use crate::storage::engines::sst::{SstEngine, SstError};
 use crate::storage::traits::CompactionResult;
 
@@ -238,40 +238,10 @@ impl SstEngine {
     // never-populated sst_storages registry). Production DROP cleanup is
     // CollectionManager::cleanup_storage_directories (both storage roots).
     // TD-SSTCLEAN-1 documents the full history.
-
-    /// Scan all vectors in a collection with pagination
-    pub async fn scan_all_vectors(
-        &self,
-        collection_id: &str,
-        offset: usize,
-        limit: Option<usize>,
-    ) -> Result<Vec<VectorRecord>> {
-        debug!(
-            "📖 SST: Scanning vectors in collection {} (offset: {}, limit: {:?})",
-            collection_id, offset, limit
-        );
-
-        let _storage_url = self.get_collection_storage_url(collection_id).await?;
-
-        // In a real implementation, this would:
-        // 1. List all SST files for the collection
-        // 2. Open each file and scan records
-        // 3. Apply offset and limit across all files
-        // 4. Return paginated results
-
-        let results = Vec::new();
-        let _effective_limit = limit.unwrap_or(1000); // Default limit
-
-        // For now, return empty results as this is a complex operation
-        // that requires implementing SST file reading
-        debug!(
-            "📖 Scan completed for collection {}: {} vectors returned",
-            collection_id,
-            results.len()
-        );
-
-        Ok(results)
-    }
+    //
+    // TD-SEAM-16: `scan_all_vectors` is also deleted — its only caller was
+    // the deleted `StorageEngine::all_vectors` (zero repo-wide callers);
+    // same lookalike-dead-code class this TD was filed against.
 
     /// Get storage URL for a collection — resolved via the injected
     /// `CollectionPathResolver` (catalog → config fallback; the single source of
