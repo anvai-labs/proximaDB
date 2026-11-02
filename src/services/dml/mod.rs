@@ -3547,8 +3547,9 @@ impl DmlService {
         // F8: keep files for N generations (default 3, floor 2), not just V
         // and V−1 — a reader pinned two quick MATERIALIZEs back was losing
         // files mid-scan. Walk the metadata versions downward from the parent;
-        // a version that can no longer be read (metadata already GC'd) only
-        // narrows retention, like every other best-effort branch here.
+        // if any retained version cannot be read, skip GC this round. A read
+        // failure cannot prove its files are unreferenced, even if its metadata
+        // may have been pruned externally.
         let retained = materialize_append::gc_retained_generations();
         let mut keep_older: std::collections::HashSet<String> = Default::default();
         if let Some(previous) = parent {
@@ -3568,15 +3569,10 @@ impl DmlService {
                             .map(|p| p.to_string()),
                     ),
                     Err(e) => {
-                        if v == previous {
-                            // The parent is structural (the reader contract
-                            // names V−1): without its files GC would delete
-                            // what a pinned reader is still scanning. Skip GC
-                            // this round, as the two-generation code did.
-                            warn!(table = %table_name, "MATERIALIZE GC skipped: {e}");
-                            return Ok(location);
-                        }
-                        warn!(table = %table_name, version = v, "MATERIALIZE GC: older generation unreadable (external pruning or corruption), not retained: {e}")
+                        // An incomplete keep-set could delete data or Puffins
+                        // still in use by a reader pinned within the window.
+                        warn!(table = %table_name, version = v, "MATERIALIZE GC skipped: retained generation unreadable: {e}");
+                        return Ok(location);
                     }
                 }
             }
