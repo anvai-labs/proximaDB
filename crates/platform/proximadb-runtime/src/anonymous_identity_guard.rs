@@ -506,6 +506,11 @@ mod tests {
         ),
         (
             "src/network/rest/v2/mod.rs",
+            "/collections/{collection_id}/compact",
+            "tenant: collection resolved within the request tenant via get_collection_with_tenant_context, 404 on miss; maintain-gated (TD-COMPACT-14)",
+        ),
+        (
+            "src/network/rest/v2/mod.rs",
             "/collections/{collection_id}/suspend",
             "tenant: ensure_collection_exists within the request tenant",
         ),

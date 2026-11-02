@@ -2804,11 +2804,12 @@ impl SharedServices {
             match PartitionLeaseStore::from_url(&storage_config.metadata_url, "_operator/leases") {
                 Ok(store) => {
                     let pod_id = crate::cluster::primary_pod_registry::resolve_self_pod_id(None);
+                    let lease_ttl_ms = storage_config.write_lease_ttl_ms.max(2_000) as i64;
                     let manager = Arc::new(PartitionLeaseManager::new(
                         Arc::new(store),
                         primary_pod_registry.clone(),
                         pod_id.clone(),
-                        10_000,
+                        lease_ttl_ms,
                     ));
                     crate::cluster::partition_lease::install_global_partition_lease_manager(
                         manager.clone(),
@@ -2826,7 +2827,7 @@ impl SharedServices {
                     // (fire-and-forget) without tripping clippy::let_underscore_future.
                     manager
                         .clone()
-                        .spawn_renew_loop(std::time::Duration::from_millis(5_000));
+                        .spawn_renew_loop(storage_config.write_lease_renew_interval());
 
                     // TD-MANIFEST-1: cap the lease manifest log. Manifests are
                     // append-only and were never pruned, so a long-lived lease grew
