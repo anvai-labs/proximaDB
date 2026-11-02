@@ -9,8 +9,9 @@
 //!   with, unique per publication and ordered by time;
 //! * [`gc_older_generations`]: after version `V` commits, delete the data files
 //!   and the incremental MATERIALIZE's `dv-mat-*` deletion-vector Puffins no
-//!   longer referenced by `V` or `V − 1` (a reader that opened `V − 1` keeps its
-//!   files).
+//!   longer referenced by the retained generations —
+//!   `PROXIMADB_MATERIALIZE_GC_RETAINED_GENERATIONS` total, default 3, so a
+//!   reader that opened `V − 1` or `V − 2` keeps its files (F8).
 
 use std::collections::HashSet;
 
@@ -297,19 +298,22 @@ fn sort_batches_with_budget(
     .boxed())
 }
 
-/// Delete the data files under `data_prefix` that the just-committed version
-/// (`keep_current`) and its predecessor (`keep_previous`) do not reference and
-/// that are OLDER than this publication (`current_stem`): an older generation,
-/// or a pre-generation name. This generation's other files (a publisher that
-/// lost the race for this version) and newer ones (a publisher that has not
-/// committed yet) are never touched; see [`generation_stem`]. Returns how many files were
+/// Delete the data files under `data_prefix` that the retained generations do
+/// not reference and that are OLDER than this publication (`current_stem`): an
+/// older generation, or a pre-generation name. Retention is
+/// `PROXIMADB_MATERIALIZE_GC_RETAINED_GENERATIONS` (default 3, floor 2 — F8):
+/// the caller unions the referenced files of the kept versions into
+/// `keep_older`, so a reader pinned a few quick MATERIALIZEs back keeps its
+/// files. This generation's other files (a publisher that lost the race for
+/// this version) and newer ones (a publisher that has not committed yet) are
+/// never touched; see [`generation_stem`]. Returns how many files were
 /// deleted. Best-effort per file: the first failure is returned after every
 /// candidate was attempted.
 pub(super) async fn gc_older_generations(
     bridge: &dyn ObjectStoreBridge,
     data_prefix: &Path,
     keep_current: &HashSet<String>,
-    keep_previous: &HashSet<String>,
+    keep_older: &HashSet<String>,
     current_stem: &str,
 ) -> Result<usize> {
     let current_generation =
@@ -319,7 +323,7 @@ pub(super) async fn gc_older_generations(
     let mut first_err = None;
     for key in bridge.list_objects(data_prefix).await? {
         let key_str = key.as_ref();
-        if keep_current.contains(key_str) || keep_previous.contains(key_str) {
+        if keep_current.contains(key_str) || keep_older.contains(key_str) {
             continue;
         }
         let name = key.filename().unwrap_or_default();
@@ -600,6 +604,10 @@ mod tests {
         let names = [
             "part-0.parquet".to_string(),
             format!("{old}-00000.parquet"),
+            // F8: a V-2-era part the caller RETAINS (a reader pinned two
+            // quick MATERIALIZEs back) — must survive; its sibling below is
+            // unreferenced and must not.
+            format!("{old}-00001.parquet"),
             format!("{prev}-00000.parquet"),
             format!("{cur}-00000.parquet"),
             format!("{cur}-00001.parquet"),
@@ -632,15 +640,15 @@ mod tests {
             key(&format!("dv-mat-{ancient}.puffin")),
         ]
         .into();
-        let previous: HashSet<String> = [
+        let older: HashSet<String> = [
             key(&format!("{prev}-00000.parquet")),
             key(&format!("dv-mat-{prev}.puffin")),
+            key(&format!("{old}-00001.parquet")),
         ]
         .into();
-        let deleted =
-            gc_older_generations(&bridge, &Path::from("t/data"), &current, &previous, &cur)
-                .await
-                .unwrap();
+        let deleted = gc_older_generations(&bridge, &Path::from("t/data"), &current, &older, &cur)
+            .await
+            .unwrap();
         assert_eq!(deleted, 3);
         let mut left: Vec<String> = bridge
             .list_objects(&Path::from("t/data"))
@@ -651,6 +659,7 @@ mod tests {
             .collect();
         left.sort();
         let mut expected = vec![
+            format!("{old}-00001.parquet"),
             format!("{prev}-00000.parquet"),
             format!("{cur}-00000.parquet"),
             format!("{cur}-00001.parquet"),

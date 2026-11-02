@@ -3529,44 +3529,63 @@ impl DmlService {
             ndv.publish();
         }
 
-        // 7. Garbage-collect generations older than the previous version. Best
+        // 7. Garbage-collect generations older than the retained window
+        //    (PROXIMADB_MATERIALIZE_GC_RETAINED_GENERATIONS, default 3
+        //    generations INCLUDING this one). Best
         //    effort: a leftover file is unreferenced (readers select from the
         //    manifest), so a failure here only costs storage until the next run.
         //    Puffins are kept by the same rule as data files: anything the
         //    committed or the previous snapshot's vectors name survives. Every
         //    vector is carried only from the parent, so a Puffin the committed
-        //    snapshot names by reference is also in `keep_previous`; keeping
+        //    snapshot names by reference is also in `keep_older`; keeping
         //    the committed set too is defence in depth, not the only guard.
         let keep_current: std::collections::HashSet<String> = snapshot_keys
             .iter()
             .chain(carried_deletes.iter().map(|v| &v.puffin_file))
             .map(|p| p.to_string())
             .collect();
-        let keep_previous: std::collections::HashSet<String> = match parent {
-            Some(previous) => {
+        // F8: keep files for N generations (default 3, floor 2), not just V
+        // and V−1 — a reader pinned two quick MATERIALIZEs back was losing
+        // files mid-scan. Walk the metadata versions downward from the parent;
+        // a version that can no longer be read (metadata already GC'd) only
+        // narrows retention, like every other best-effort branch here.
+        let retained = materialize_append::gc_retained_generations();
+        let mut keep_older: std::collections::HashSet<String> = Default::default();
+        if let Some(previous) = parent {
+            // `retained` counts TOTAL generations including the committed V;
+            // retained_versions enumerates the OLDER ones, newest-first, and
+            // includes version 0 (the first commit) — pinned by its own test.
+            for v in materialize_append::retained_versions(previous, retained) {
                 match bridge
-                    .read_iceberg_snapshot_files(&metadata_prefix, previous)
+                    .read_iceberg_snapshot_files(&metadata_prefix, v)
                     .await
                 {
-                    Ok(snapshot) => snapshot
-                        .data_files
-                        .iter()
-                        .chain(snapshot.deletion_vectors.iter().map(|v| &v.puffin_file))
-                        .map(|p| p.to_string())
-                        .collect(),
+                    Ok(snapshot) => keep_older.extend(
+                        snapshot
+                            .data_files
+                            .iter()
+                            .chain(snapshot.deletion_vectors.iter().map(|x| &x.puffin_file))
+                            .map(|p| p.to_string()),
+                    ),
                     Err(e) => {
-                        warn!(table = %table_name, "MATERIALIZE GC skipped: {e}");
-                        return Ok(location);
+                        if v == previous {
+                            // The parent is structural (the reader contract
+                            // names V−1): without its files GC would delete
+                            // what a pinned reader is still scanning. Skip GC
+                            // this round, as the two-generation code did.
+                            warn!(table = %table_name, "MATERIALIZE GC skipped: {e}");
+                            return Ok(location);
+                        }
+                        warn!(table = %table_name, version = v, "MATERIALIZE GC: older generation unreadable (external pruning or corruption), not retained: {e}")
                     }
                 }
             }
-            None => Default::default(),
-        };
+        }
         match materialize_stream::gc_older_generations(
             bridge,
             &object_store::path::Path::from(data_dir.as_str()),
             &keep_current,
-            &keep_previous,
+            &keep_older,
             &stem,
         )
         .await
@@ -3746,11 +3765,8 @@ impl DmlService {
             ));
         }
         let files = snapshot.data_files;
-        if files.len() >= materialize_append::APPEND_MAX_FILES {
-            return Ok((
-                AppendPlan::Rewrite("the snapshot has many parts; a rewrite compacts them"),
-                Vec::new(),
-            ));
+        if let Some(reason) = materialize_append::parts_fallback_reason(files.len()) {
+            return Ok((AppendPlan::Rewrite(reason), Vec::new()));
         }
         let Some(published) =
             materialize_append::PublishedOids::read(bridge, &files, expected).await?
