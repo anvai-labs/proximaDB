@@ -1,0 +1,24 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-MVCCNS-1: search merge's dead-state rule compares milliseconds while get-by-id compares nanoseconds
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open** (filed 2026-11-03, split from TD-MEMTABLE-MVCC-1 residual (b)).
+| Priority | **MEDIUM**: a delete + re-insert within one millisecond + flush causes search and get-by-id to disagree (search drops the record; get-by-id returns it).
+| Component | `src/core/search/merge.rs` (dead-state rule at :229); `OptimizedSearchRecord` (carries `updated_at` in ms); `WalOidState::Dead` (carries `updated_at` in ms); get-by-id uses `updated_at_ns` (ns).
+| Relates | TD-MEMTABLE-MVCC-1 (the parent TD; its residual (b)).
+|===
+
+== Problem
+
+The search-path merge's dead-state comparison (`merge.rs:229`) uses `updated_at` which is carried in **milliseconds** on `OptimizedSearchRecord` and `WalOidState::Dead`. The by-id read path compares `updated_at_ns` in **nanoseconds**. A delete + re-insert within the same millisecond, followed by flush, causes search to drop the record (fail-closed) while get-by-id returns it.
+
+== Fix direction
+
+Carry `updated_at_ns` on `OptimizedSearchRecord` and `WalOidState::Dead` instead of the millisecond-truncated `updated_at`. This is a **typed-surface change** across the search path — not a one-liner. Both the struct definitions and all their consumers (merge, scoring, index building) must be updated.
+
+== Scope note from the filing session
+
+This was residual (b) on TD-MEMTABLE-MVCC-1. It requires changing the search-path types (`OptimizedSearchRecord` + `WalOidState::Dead`), so whoever picks it up should know it's a typed-surface change, not a comparator tweak.
