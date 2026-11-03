@@ -941,27 +941,43 @@ def summarize_outcomes(outcomes: list[QueryOutcome]) -> dict:
 
 def trace_counter_gate(
     phase: str, prom_gets_delta: float, outcomes: list[QueryOutcome]
-) -> list[str]:
+) -> tuple[list[str], str | None]:
     """The per-query search_plan_trace and the process-global Prometheus GET
     counter must agree in direction. Without this gate, a server-side break
     of the trace attachment (debug:true ignored) would silently zero every
-    gets_per_query gauge and read as a perfectly warm bed."""
+    gets_per_query gauge and read as a perfectly warm bed.
+
+    Returns (problems, vacated): ``vacated`` names why the gate could not run
+    (no queries, or none succeeded) and MUST be recorded in the phase record
+    — a vacated gate is never a silent skip; the caller's own zero-success
+    failure makes the run red in that case."""
     problems: list[str] = []
     ok = [outcome for outcome in outcomes if outcome.error is None]
-    if outcomes and ok and not any(outcome.trace_present for outcome in ok):
+    if not outcomes:
+        return problems, "no queries ran in this phase"
+    if not ok:
+        return (
+            problems,
+            f"all {len(outcomes)} queries failed — trace attribution vacuous",
+        )
+    if not any(outcome.trace_present for outcome in ok):
         problems.append(
             f"trace_vs_counter[{phase}]: search_plan_trace absent on every "
             "successful response (debug:true not honored?) — per-tenant GET "
             "attribution would be silently zero"
         )
     trace_gets = sum(outcome.gets for outcome in ok)
-    if ok and prom_gets_delta > 0 and trace_gets == 0:
+    # Accepted-as-is residual (round-2 review): a background GET during an
+    # all-warm sweep can advance the process counter while every trace reads
+    # 0 — a spurious red. Kept loud rather than silenced.
+    if prom_gets_delta > 0 and trace_gets == 0:
         problems.append(
             f"trace_vs_counter[{phase}]: object_store_gets_total advanced by "
             f"{prom_gets_delta:.0f} while summed trace GETs == 0 — trace "
-            "attachment is broken or mis-attributing server-side"
+            "attachment is broken or mis-attributing server-side (or a "
+            "background GET raced an all-warm sweep)"
         )
-    return problems
+    return problems, None
 
 
 def recall_for(outcomes: list[QueryOutcome], expected: list[set[str]]) -> dict:
@@ -1310,7 +1326,10 @@ def main() -> int:
         )
 
     config_out = args.config_out or (root / "config.toml")
-    data_dir = args.data_dir or (root / "data")
+    # Resolve before interpolating into the TOML and recording: a relative
+    # --data-dir must not depend on the spawned server inheriting the bed cwd,
+    # and result.json must name the absolute path the server actually uses.
+    data_dir = (args.data_dir or (root / "data")).resolve()
     pool_dir = root / "pool"
     if args.storage_url:
         storage_url = args.storage_url
@@ -1611,17 +1630,22 @@ def main() -> int:
         result["phases"]["recall_parity_warm_prometheus"] = {
             name: metric_delta(prom_before, prom_after, name) for name in PROM_COUNTERS
         }
-        failures.extend(
-            trace_counter_gate(
-                "recall_parity_warm",
-                metric_delta(
-                    prom_before,
-                    prom_after,
-                    "proximadb_object_store_gets_total",
-                ),
-                [outcome for pair in warm_outcomes.values() for outcome in pair],
-            )
+        warm_all = [outcome for pair in warm_outcomes.values() for outcome in pair]
+        warm_problems, warm_vacated = trace_counter_gate(
+            "recall_parity_warm",
+            metric_delta(
+                prom_before,
+                prom_after,
+                "proximadb_object_store_gets_total",
+            ),
+            warm_all,
         )
+        result["phases"]["recall_parity_warm_trace_gate"] = {"vacated": warm_vacated}
+        failures.extend(warm_problems)
+        # Zero successful warm queries already fails this phase below via the
+        # granted collections' no-comparable-queries recall gate (and the
+        # parity gate's compared==0 branch) — stated here so the vacated
+        # record above is not read as an unbackstopped skip.
 
         recalls: dict[str, Any] = {}
         for tenant, name, storage_class, slice_label in BED:
@@ -1736,17 +1760,33 @@ def main() -> int:
                 if phase == "concurrent_shared_pool"
                 for outcome in outcomes
             ]
-        failures.extend(
-            trace_counter_gate(
-                "concurrent_shared_pool",
-                metric_delta(
-                    prom_conc_before,
-                    prom_conc_after,
-                    "proximadb_object_store_gets_total",
-                ),
-                conc_outcomes,
+        conc_succeeded = sum(1 for outcome in conc_outcomes if outcome.error is None)
+        result["phases"]["concurrent_shared_pool_queries"] = {
+            "issued": len(conc_outcomes),
+            "succeeded": conc_succeeded,
+        }
+        if conc_succeeded == 0:
+            # A concurrency phase with zero successful queries vacates every
+            # gauge and the trace gate — that is a failed phase, not a skip
+            # (the server may be rejecting searches while ingest/ledger stay
+            # healthy, which is exactly the shape this must catch).
+            failures.append(
+                "concurrent_shared_pool: zero queries succeeded "
+                f"({len(conc_outcomes)} issued) — phase vacated"
             )
+        conc_problems, conc_vacated = trace_counter_gate(
+            "concurrent_shared_pool",
+            metric_delta(
+                prom_conc_before,
+                prom_conc_after,
+                "proximadb_object_store_gets_total",
+            ),
+            conc_outcomes,
         )
+        result["phases"]["concurrent_shared_pool_trace_gate"] = {
+            "vacated": conc_vacated
+        }
+        failures.extend(conc_problems)
 
         if sampler_errors:
             failures.append(
@@ -1867,6 +1907,9 @@ def main() -> int:
 
         # Keep sc6-perf-a's grant hot (read hits reset its idle clock) while
         # the idle subject's collection receives NO traffic at all.
+        # Accepted-as-is residual (round-2 review): a keepalive served
+        # entirely from DRAM L1 does not tick the persistent-store clock, so
+        # the grant can still age out — loud-not-green, no action.
         keepalive: list[QueryOutcome] = []
         deadline = time.monotonic() + idle_wait
         reclaimed_at: dict | None = None
