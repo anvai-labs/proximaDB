@@ -461,10 +461,10 @@ impl PersistentByteStore {
     /// TD-TIER-1 SC4-2: replace the protection policy and reconcile resident
     /// entries against it. Each group is one reservation grant: its
     /// collection's segment-root prefixes and its own byte budget. A key
-    /// belongs to the first group (by id) one of whose prefixes it contains,
-    /// both compared in canonical form (see [`canonical_location`]); cache
-    /// keys embed the published segment path mid-string, and each prefix
-    /// ends in `/`, so containment cannot match a sibling collection.
+    /// belongs to the first group (by id) whose source prefix matches at
+    /// the start of its versioned whole-object location, on a path boundary.
+    /// Both use [`canonical_location`]; object-key bytes remain exact.
+    /// Legacy and non-whole-object keys cannot acquire policy protection.
     ///
     /// Reconcile: pins owned by a removed group, or whose key no longer
     /// matches its group, are released; a group whose budget shrank below
@@ -510,13 +510,12 @@ impl PersistentByteStore {
             let Some(owner) = Self::pin_owner(meta) else {
                 continue;
             };
-            let canonical = canonical_location(key);
             let keeps = policy.groups.values().any(|group| {
                 Arc::ptr_eq(&group.counter, &owner)
                     && group
                         .prefixes
                         .iter()
-                        .any(|p| canonical.contains(p.as_str()))
+                        .any(|p| protection_prefix_matches(key, p))
             });
             if !keeps && self.release_pin(meta) {
                 sweep.unprotected += 1;
@@ -587,10 +586,9 @@ impl PersistentByteStore {
                 if !entry.key().starts_with(OBJECT_KEY_PREFIX) {
                     return false;
                 }
-                let canonical = canonical_location(entry.key());
                 prefixes
                     .iter()
-                    .any(|prefix| canonical.contains(prefix.as_str()))
+                    .any(|prefix| protection_prefix_matches(entry.key(), prefix))
             })
             .map(|entry| entry.value().file_len)
             .sum()
@@ -1571,12 +1569,11 @@ impl ProtectionPolicy {
         if self.groups.is_empty() || !key.starts_with(OBJECT_KEY_PREFIX) {
             return None;
         }
-        let canonical = canonical_location(key);
         self.groups.values().find(|group| {
             group
                 .prefixes
                 .iter()
-                .any(|prefix| canonical.contains(prefix.as_str()))
+                .any(|prefix| protection_prefix_matches(key, prefix))
         })
     }
 }
@@ -1589,7 +1586,7 @@ impl ProtectionPolicy {
 ///
 /// Canonicalized (review B2): flush seeds under its publish URL while readers
 /// and compaction use the LIST URL, which can spell the same object
-/// differently (`adls://` vs `az://`, slash runs); one canonical key keeps
+/// differently (`adls://` vs `az://`); one canonical key keeps
 /// seed, read and forget on the same entry.
 pub fn object_key(path: &str) -> String {
     format!("{OBJECT_KEY_PREFIX}{}", canonical_location(path))
@@ -1604,37 +1601,54 @@ fn stored_len(key: &str, value_len: u64) -> u64 {
 }
 
 /// Prefix of every whole-object key ([`object_key`]).
-const OBJECT_KEY_PREFIX: &str = "pax-object/";
+// Version the disposable key namespace: old keys collapsed distinct cloud
+// objects. Never reuse those bytes under the corrected identity contract.
+const OBJECT_KEY_PREFIX: &str = "pax-object-v2/";
 
-/// TD-TIER-1 SC4-2: canonical form for comparing locations embedded in cache
-/// keys (review S2). Azure scheme aliases (`abfs://`, `abfss://`, `adls://`,
-/// `azure://`) become the `az://` form the Azure listing emits, `gcs://`
-/// becomes `gs://`, and runs of
-/// `/` collapse to one except the `//` that follows a scheme's `:`, so a
-/// base written as `s3://b/x/` and keys listed as `s3://b/x/...` compare
-/// equal. Applied to both prefixes and keys. Known trade-off: two bases that
-/// differ only in a run of slashes (`s3://b/x//y/` vs `s3://b/x/y/`), which
-/// object stores treat as distinct keys, compare equal here.
+fn protection_prefix_matches(key: &str, prefix: &str) -> bool {
+    let Some(location) = key.strip_prefix(OBJECT_KEY_PREFIX) else {
+        return false;
+    };
+    if prefix.ends_with('/') {
+        location.starts_with(prefix)
+    } else {
+        location
+            .strip_prefix(prefix)
+            .is_some_and(|tail| tail.starts_with('/'))
+    }
+}
+
+/// Normalize only documented backend scheme aliases and absolute local URLs.
+/// Cloud object-key bytes (including slash runs and embedded URI-like text)
+/// remain exact. Relative file URLs and bare relative paths can resolve under
+/// different roots; only the filesystem resolver can establish their identity.
 pub fn canonical_location(raw: &str) -> String {
-    // A local location has two spellings — the writer's plain path and the
-    // listing's `file://` URL — that must name ONE resident copy (SC4
-    // hardening review: two keys for one object charge the grant twice).
-    let mut text = raw.strip_prefix("file://").unwrap_or(raw).to_string();
-    for alias in ["abfss://", "abfs://", "adls://", "azure://"] {
-        text = text.replace(alias, "az://");
-    }
-    text = text.replace("gcs://", "gs://");
-    let mut out = String::with_capacity(text.len());
-    for ch in text.chars() {
-        if ch == '/' && out.ends_with('/') {
-            let before_last = out[..out.len() - 1].chars().last();
-            if before_last != Some(':') {
-                continue;
-            }
+    let local = raw.strip_prefix("file://").unwrap_or(raw);
+    if Path::new(local).is_absolute() {
+        // Local slash runs and `.` components name the same path. Preserve
+        // parent components (symlinks make folding `..` unsafe) and a trailing
+        // separator used by collection-prefix/orphan reconciliation.
+        let mut resolved = Path::new(local)
+            .components()
+            .collect::<PathBuf>()
+            .to_string_lossy()
+            .into_owned();
+        if (local.ends_with('/') || local.ends_with(std::path::MAIN_SEPARATOR))
+            && !resolved.ends_with(std::path::MAIN_SEPARATOR)
+        {
+            resolved.push(std::path::MAIN_SEPARATOR);
         }
-        out.push(ch);
+        return resolved;
     }
-    out
+    if let Some((scheme, key)) = raw.split_once("://") {
+        let canonical = match scheme {
+            "abfss" | "abfs" | "adls" | "azure" => "az",
+            "gcs" => "gs",
+            _ => return raw.to_string(),
+        };
+        return format!("{canonical}://{key}");
+    }
+    raw.to_string()
 }
 
 /// Outcome of a [`PersistentByteStore::set_protection_groups`] reconcile.
@@ -2483,7 +2497,7 @@ mod tests {
             object_key("adls://cont/tenants/t/12/data/L0.pax"),
             object_key("az://cont/tenants/t/12/data/L0.pax")
         );
-        assert_eq!(
+        assert_ne!(
             object_key("s3://b/x//12/data/L0.pax"),
             object_key("s3://b/x/12/data/L0.pax")
         );
@@ -2493,9 +2507,9 @@ mod tests {
         );
     }
 
-    /// Review S2: Azure scheme aliases and doubled slashes compare equal.
+    /// Aliases normalize; distinct object-key bytes remain distinct.
     #[test]
-    fn canonical_location_unifies_aliases_and_slashes() {
+    fn canonical_location_preserves_object_key_bytes() {
         assert_eq!(
             canonical_location("adls://c/t/12/data/"),
             "az://c/t/12/data/"
@@ -2503,12 +2517,76 @@ mod tests {
         assert_eq!(canonical_location("abfs://c/x"), "az://c/x");
         assert_eq!(
             canonical_location("s3://b/x//tenants/t/"),
-            "s3://b/x/tenants/t/"
+            "s3://b/x//tenants/t/"
         );
         assert_eq!(
             canonical_location("invariants/region-a/s3://b/k"),
             "invariants/region-a/s3://b/k",
             "the scheme's own // is preserved"
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_cloud_keys_and_protection_survive_reopen() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = PersistentByteStore::open(dir.path(), 1 << 20).expect("open");
+        let a = object_key("s3://bucket/x//data/a.pax");
+        let b = object_key("s3://bucket/x/data/a.pax");
+        store
+            .put(a.clone(), L2Class::Invariants, Arc::from(&b"double"[..]))
+            .await
+            .expect("put");
+        store
+            .put(b.clone(), L2Class::Invariants, Arc::from(&b"single"[..]))
+            .await
+            .expect("put");
+        store
+            .put(
+                "pax-object/s3://bucket/legacy.pax",
+                L2Class::Invariants,
+                payload(8),
+            )
+            .await
+            .expect("legacy");
+        drop(store);
+        let store = PersistentByteStore::open(dir.path(), 1 << 20).expect("reopen");
+        assert_eq!(
+            store.get(&a).await.expect("get").as_deref(),
+            Some(&b"double"[..])
+        );
+        assert_eq!(
+            store.get(&b).await.expect("get").as_deref(),
+            Some(&b"single"[..])
+        );
+        assert!(
+            store
+                .get(&object_key("s3://bucket/legacy.pax"))
+                .await
+                .expect("get")
+                .is_none()
+        );
+        store.set_reserved_budget(1 << 20);
+        store.set_protection_groups(vec![group("g", "s3://bucket/x//data", 1 << 20)]);
+        assert!(store.is_protected(&a));
+        assert!(!store.is_protected(&b));
+        let nested = object_key("s3://foreign/s3://bucket/x//data/a.pax");
+        assert!(!store.policy_covers(&nested));
+        assert!(!store.policy_covers(&object_key("s3://bucket/x//data-other/a.pax")));
+    }
+
+    #[test]
+    fn relative_local_names_and_embedded_schemes_do_not_alias() {
+        assert_ne!(object_key("data/a.pax"), object_key("file://data/a.pax"));
+        assert_eq!(object_key("/data/a.pax"), object_key("file:///data/a.pax"));
+        assert_eq!(
+            object_key("/data//./a.pax"),
+            object_key("file:///data/a.pax")
+        );
+        assert_eq!(canonical_location("/data//./"), "/data/");
+        assert_ne!(object_key("/data/link/../a.pax"), object_key("/data/a.pax"));
+        assert_eq!(
+            canonical_location("s3://bucket/adls://object//a"),
+            "s3://bucket/adls://object//a"
         );
     }
 

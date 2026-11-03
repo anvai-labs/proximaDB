@@ -39,6 +39,13 @@ proposed experiments, not another release or authorization for a whole-engine re
 Completed foundation: link:../history/README.adoc[history index]. No completed slice is a
 new implementation target merely because an old release table mentioned it.
 
+Storage/embedded foundations follow one dependency order: backend-resolved source identity
+and safe cache I/O, then explicit embedded configuration and fallible materialization, then
+read-only catalog bootstrap with proven absence of writer side effects. These close existing
+TD-TIER-1, TD-PAXDIR-2 and TD-OBJSTORE-1 residuals; they do not create a parallel storage
+program. Broad headless modality support requires the existing TD-WAL-2 recovery gates.
+Dynamic disk placement, WAL-free bulk ingestion and durable cross-process completion receipts
+remain dependent designs until their failure/recovery proofs exist.
 == v0.5 — Correct and durable
 
 *Theme:* the SQL front door is correct, durable and tenant-safe before anything is added to it.
@@ -58,6 +65,10 @@ new implementation target merely because an old release table mentioned it.
 | Recovery boundary and durability proof
 | Complete object-owner recovery/reattach and all-consumer floor proof; do not rebuild the landed spill/rotation/truncation primitives.
 | TD-SEAM-14, TD-SEAM-12; path residuals TD-CONV-1/2
+
+| Storage and embedded lifecycle foundations
+| Preserve resolved source identity, cache-local I/O and effective durability settings; explicit flush reports failure. Read-only catalog boot must neither seize ownership nor materialize writes. Fresh-process reopen proves only the tested modality/profile.
+| TD-TIER-1, TD-PAXDIR-2, TD-OBJSTORE-1, TD-WAL-2
 
 | Native table provider by default
 | Window functions and ABAC behave the same for every session.
@@ -135,7 +146,7 @@ the one canonical record.
 | TD-OBJSTORE-1, MVP corridor
 
 | Scan and cache economics
-| SIFT1M cache acceptance, IVF training, streaming compaction and the SF1/SF10 analytical ledger recorded with dated evidence.
+| SIFT1M cache acceptance, IVF training, streaming compaction and the SF1/SF10 analytical ledger recorded with dated evidence. Compare direct object reads against optional disk admission over one job and repeated jobs, charging idle provisioned disks and lost-cache restarts; no cache default from query count alone.
 | TD-CACHE-9, TD-IVF-2, TD-COMPACT-2, TD-COMPACT-10, TD-COMPACT-11, TD-OLAP-2, TD-OLAP-4, TD-OLAP-11
 
 | Storage layout

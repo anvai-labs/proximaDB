@@ -21,6 +21,103 @@ mod tests {
     }
 
     #[test]
+    fn explicit_storage_uris_preserve_backend_and_object_identity() {
+        for uri in [
+            "s3://bucket/prefix//collection/",
+            "az://account/container/collection",
+            "gs://bucket/collection",
+            "file:///disk/collection",
+            "unknown://authority/key",
+        ] {
+            let mut config = EmbeddedConfig::default();
+            config.storage_locations = vec![StorageLocationConfig::new(uri)];
+            config.metadata_path = uri.to_string();
+            let converted = EmbeddedProximaDB::to_storage_config(&config).expect("convert config");
+            assert_eq!(converted.storage_locations[0].url, uri);
+            assert_eq!(converted.metadata_url, uri);
+        }
+    }
+
+    #[test]
+    fn embedded_wal_sync_modes_reach_canonical_engine_config() {
+        use proximadb::storage::persistence::write_ahead_log::config::SyncMode;
+        for (mode, expected) in [
+            ("immediate", SyncMode::PerBatch),
+            ("batch", SyncMode::PerBatch),
+            ("PerBatch", SyncMode::PerBatch),
+            ("always", SyncMode::PerBatch),
+            ("async", SyncMode::Periodic),
+            ("Periodic", SyncMode::Periodic),
+            ("None", SyncMode::Never),
+        ] {
+            let config = EmbeddedConfig {
+                wal_sync_mode: mode.to_string(),
+                ..EmbeddedConfig::default()
+            };
+            let converted = EmbeddedProximaDB::to_storage_config(&config).expect("valid sync mode");
+            assert_eq!(
+                converted
+                    .wal_config
+                    .to_engine_config()
+                    .performance
+                    .sync_mode,
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_embedded_config_is_rejected_before_ownership_side_effects() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let root = temp_dir.path().join("must-not-be-created");
+        let local = EmbeddedConfig::for_low_memory(root.to_string_lossy().as_ref());
+        let mut invalid_sync = local.clone();
+        invalid_sync.wal_sync_mode = "typo".to_string();
+        let error = EmbeddedProximaDB::new(invalid_sync)
+            .err()
+            .expect("invalid sync mode");
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .expect("I/O error")
+                .kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+        assert!(!root.exists());
+
+        for uri in [
+            "s3://bucket/data",
+            "az://account/container",
+            "unknown://backend/key",
+        ] {
+            for remote_metadata in [false, true] {
+                let mut config = local.clone();
+                if remote_metadata {
+                    config.metadata_path = uri.to_string();
+                } else {
+                    config
+                        .storage_locations
+                        .push(StorageLocationConfig::new(uri));
+                }
+                let error = EmbeddedProximaDB::new(config)
+                    .err()
+                    .expect("unsupported remote bootstrap");
+                assert_eq!(
+                    error
+                        .downcast_ref::<std::io::Error>()
+                        .expect("I/O error")
+                        .kind(),
+                    std::io::ErrorKind::Unsupported
+                );
+                assert!(
+                    !root.exists(),
+                    "invalid remote config must not acquire local ownership"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn test_storage_location_builder() {
         let loc = StorageLocationConfig::new("/data")
             .with_weight(2)
@@ -103,6 +200,93 @@ mod tests {
 
         let reopened = EmbeddedProximaDB::new(config)
             .expect("close must release ownership before the old handle is dropped");
+        reopened.close();
+    }
+
+    #[test]
+    fn flush_and_close_materializes_vectors_before_releasing_ownership() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let config = EmbeddedConfig::for_low_memory(temp_dir.path().to_string_lossy().as_ref());
+        let mut db = EmbeddedProximaDB::new(config.clone()).expect("open");
+        db.create_collection("finish_col", 4, None)
+            .expect("create collection");
+        db.insert(
+            "finish_col",
+            vec!["v1".to_string()],
+            vec![vec![0.1, 0.2, 0.3, 0.4]],
+            None,
+        )
+        .expect("insert");
+        db.flush_and_close().expect("flush and close");
+        assert!(!db.can_write());
+        assert!(
+            walkdir_files(temp_dir.path())
+                .iter()
+                .any(|path| path.extension().and_then(|e| e.to_str()) == Some("pax")),
+            "successful finish must materialize a PAX segment"
+        );
+        let reopened = EmbeddedProximaDB::new(config).expect("ownership released");
+        assert!(
+            reopened
+                .get_vector("finish_col", "v1")
+                .expect("read materialized vector")
+                .is_some()
+        );
+        reopened.close();
+    }
+
+    #[test]
+    fn flush_and_close_failure_retains_open_handle_and_ownership() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let config = EmbeddedConfig::for_low_memory(temp_dir.path().to_string_lossy().as_ref());
+        let mut db = EmbeddedProximaDB::new(config.clone()).expect("open");
+        db.create_collection("retry_col", 4, None).expect("create");
+        db.insert(
+            "retry_col",
+            vec!["first".to_string()],
+            vec![vec![0.1; 4]],
+            None,
+        )
+        .expect("first insert");
+        db.flush().expect("first materialization");
+        let data_dir = walkdir_files(temp_dir.path())
+            .into_iter()
+            .find(|path| path.extension().and_then(|e| e.to_str()) == Some("pax"))
+            .and_then(|path| path.parent().map(std::path::Path::to_path_buf))
+            .expect("materialized data directory");
+        db.insert(
+            "retry_col",
+            vec!["second".to_string()],
+            vec![vec![0.2; 4]],
+            None,
+        )
+        .expect("second insert");
+        // Replace the real destination directory with a file so publication
+        // fails with an I/O error; preserve the prior segment for retry.
+        let backup = data_dir.with_extension("held-for-retry");
+        std::fs::rename(&data_dir, &backup).expect("hold prior data");
+        std::fs::write(&data_dir, b"block materialization").expect("inject I/O failure");
+        db.flush_and_close().expect_err("materialization must fail");
+        assert!(!db.closed.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(db.can_write(), "flush failure must retain write authority");
+        assert!(
+            EmbeddedProximaDB::new(config.clone()).is_err(),
+            "failed flush must retain ownership"
+        );
+        std::fs::remove_file(&data_dir).expect("remove injected failure");
+        std::fs::rename(&backup, &data_dir).expect("restore prior data");
+        db.flush_and_close()
+            .expect("retry after restoring destination");
+        let reopened = EmbeddedProximaDB::new(config).expect("reopen after retry");
+        for id in ["first", "second"] {
+            assert!(
+                reopened
+                    .get_vector("retry_col", id)
+                    .expect("read durable vector")
+                    .is_some(),
+                "retry must preserve both prior and failed-flush writes"
+            );
+        }
         reopened.close();
     }
 

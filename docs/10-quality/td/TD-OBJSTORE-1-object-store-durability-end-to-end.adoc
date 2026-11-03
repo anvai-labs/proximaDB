@@ -5,7 +5,7 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | **Partial: batches 1–3 fixed — scheme-safe path construction and local-fs escapes (#966), catalog durability on all object-store schemes (batch 2), and the batch-3 "zero-vector" restart loss via TD-OBJSTORE-4 (#1061, strict Azurite PR gate #1072); open: end-to-end closure (TD-OBJSTORE-4's remaining gate + TD-OBJSTORE-2's live three-store proof and the anvaiops batch-3 proof rerun) and the Deferred limitations below.**
+| Status | **Partial: batches 1–3 fixed — scheme-safe path construction and local-fs escapes (#966), catalog durability on all object-store schemes (batch 2), and the batch-3 "zero-vector" restart loss via TD-OBJSTORE-4 (#1061, strict Azurite PR gate #1072); open: end-to-end closure (TD-OBJSTORE-4's remaining gate + TD-OBJSTORE-2's live three-store proof and the anvaiops batch-3 proof rerun) the embedded bootstrap/end-job foundation gates, and the Deferred limitations below.**
 | Severity | Critical — with `storage.metadata_url = adls://…` (or `s3://`, `gcs://`) the server constructs invalid `file://adls://…` URLs and/or drives `std::fs`/`tokio::fs` at object-store URLs; metrics, document WAL, audit/event-log, and timeseries subsystems fail at startup or silently write to wrong local paths. Blocks the ADR-0028 anvaiops object-store deployment (issue #960).
 | Component | `src/network/shared_services.rs` (subsystem path wiring), `src/storage/persistence/write_ahead_log/wal_operations.rs` (unified WAL), `src/storage/engines/eventlog/*` (audit event log), `src/audit/*` (security audit storage), `crates/control/proximadb-catalog/src/delta.rs`, defensive: disk caches + tantivy log index.
 | Relates to | link:TD-OBJSTORE-2.adoc[TD-OBJSTORE-2], link:TD-OBJSTORE-3.adoc[TD-OBJSTORE-3], link:TD-OBJSTORE-4-list-authority-wal-recovery.adoc[TD-OBJSTORE-4], link:TD-OBJSTORE-5-emulator-ci-matrix.adoc[TD-OBJSTORE-5], TD-CAT-4, TD-CAT-5
@@ -32,6 +32,78 @@
 * Live: anvaiops redeploys the pinned `-full` image digest with `adls://` config and
   runs vector/document/graph/hybrid/observability modality tests; failures feed back
   into this TD.
+
+== Embedded bootstrap and end-job residual (2026-11-02)
+
+At the pre-change baseline `9d25b5a20`, the embedded adapter retained the path bug class:
+`StorageLocationConfig::to_url` and metadata-path construction special-cased `file://`, so a
+cloud URI could become a local file URL. Embedded `build_storage_config` copied WAL enablement
+but not its advertised `wal_sync_mode`. The general service constructor also needs a valid
+local work/WAL root when metadata is remote. Fix the adapter using existing storage semantics,
+not another filesystem implementation or implicit cache-based durable directory.
+
+The foundation implementation now preserves schemes and validates/wires the effective sync
+mode. The existing local constructor explicitly rejects remote data/metadata roots before
+service initialization. This closes unsafe silent interpretation; it does not implement a
+cloud writer. Explicit remote writer bootstrap, local durability configuration and cloud
+reopen proof remain required actions for the requested embedded-cloud lifecycle (F3).
+
+`flush_and_close(&mut self)` adds a fallible vector-only boundary: existing `flush` succeeds
+before legacy `close` releases ownership, and a flush error leaves the handle open for retry.
+Graph/policy work in `close` remains best-effort. Focused local tests now prove vector
+materialization failure/retry, ownership retention and reopen; this F4 implementation still
+does not provide all-modality completion or a cloud receipt.
+
+Acceptance: preserve explicit storage schemes and configured locations; map and validate
+all supported durability settings; reject unsupported configuration before initialization;
+prove distinct metadata/data/local-work roots and error propagation. Invoke the existing
+materializer in an explicit fallible end-job boundary with a documented collection/modality
+scope. Prove successful publication with fresh-process reopen and failure without false
+success. Unit mapping tests alone do not prove cloud durability or support every modality.
+
+`SystemCatalog::open_follower`/`reload_if_stale` already exist. The foundation F5 implementation
+adds a metadata-only `EmbeddedCatalogFollower`: explicit cloud catalog URI plus an absolute
+local work directory, isolated temporary appender state, and refresh/list/lookup APIs. It
+exposes no data query API and must not reuse an owner's stale local WAL. Two focused tests
+passed for refresh/takeover without publication and missing/corrupt snapshot refusal. Full
+read-only embedded query boot remains required foundational work: the
+general writer startup initializes the global WAL manifest and `SharedServices`; its SST
+lifecycle starts compaction and its vector service expects a writer WAL. Provide a read-only
+engine lifecycle and injected read view before routing cloud queries through it. Gate with no
+takeover, no remote mutations and a real query after
+fresh-process open; reject unsupported writer operations. A local catalog copy does not
+replace committed cloud metadata. These gates belong to this TD and the
+link:../../current/PLATFORM_PLAN.adoc#embedded-cloud-lifecycle[platform lifecycle contract].
+TD-WAL-2 still owns modality recovery, ADR-069 owns the reattachable-WAL default, and ADR-081
+leaves persisted completion receipts/crash idempotency open. Do not claim cloud-headless
+completion from URI preservation or follower construction alone.
+
+Local evidence checkpoint: 11 focused embedded tests passed (nine F3/F4/lifecycle and two
+F5 follower tests; command/result transcript `/private/tmp/foundations-embedded-tests.log`).
+The complete `make work-commit-check` passed (`/private/tmp/foundations-work-commit-check.log`).
+Latest fetched `develop` is unchanged at `9d25b5a20`. The root storage/cache cohort passed 146/146 tests; server/cloud
+build validation remains pending. No hosted CI, merge or cloud-headless support completion
+is asserted by these local checks.
+
+=== Required next seams (reuse the existing owners)
+
+`CollectionService::upsert_collection_catalog_asset` already persists vector collections as
+`CatalogTableSchema`; `src/storage/metadata/collection_mapping.rs` owns the bidirectional
+mapping. Reuse it for a read-only collection projection and invalidate its cached projection
+on catalog snapshot-version changes. No new metastore is needed.
+
+For cloud queries, inject a published-only read view instead of requiring a writer WAL
+manager. Add a read-only lifecycle to the existing engine: no compaction, recovery publication
+or training writes, and no `SharedServices` owner/default-namespace initialization side effects.
+Prove catalog refresh, query visibility and authorization together; a snapshot version alone
+is not a data-file visibility watermark.
+
+Cloud writer bootstrap must take an explicit role, metadata URI, authorized data roots and
+reattachable WAL/work root. Pass the concrete local work directory through composition rather
+than using presence of `opt_config` as a proxy. Isolate process-global state/ownership across
+contexts; catalog fencing and a collection write lease are distinct controls. Reuse the
+existing flush/materializer after admission. These are required implementation/acceptance
+actions, not capabilities supplied by the metadata-only follower.
 
 == Deferred (documented limitations — next cycles)
 

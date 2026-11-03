@@ -46,6 +46,7 @@ anyhow.workspace = true
 serde.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+tempfile = "3"
 chrono.workspace = true
 proximadb-data-model = { path = "../../foundation/proximadb-data-model" }
 arrow = { workspace = true }
@@ -109,6 +110,12 @@ canonical-document-store = ["proximadb/canonical-document-store"]
 graph-first-sks = ["proximadb/graph-first-sks"]
 unified-facade-routing = ["proximadb/unified-facade-routing"]
 otlp-metering = ["proximadb/otlp-metering"]
+# Provider backends for explicit cloud catalog/storage access. Keep opt-in,
+# matching the server artifact; these do not enable remote writer bootstrap.
+aws = ["proximadb/aws"]
+azure = ["proximadb/azure"]
+gcp = ["proximadb/gcp"]
+cloud-full = ["aws", "azure", "gcp"]
 # In-memory ANN index engine (AXIS: HNSW/IVF/RaBitQ). ON by default; OFF
 # (`--no-default-features`) yields the exact-scan embedded build.
 axis = ["proximadb/axis"]
@@ -150,7 +157,7 @@ c_ffi = []
 vendored-openssl = ["openssl/vendored"]
 
 [dev-dependencies]
-tempfile = "3"
+async-trait.workspace = true
 
 [lints]
 workspace = true

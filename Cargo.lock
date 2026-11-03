@@ -7966,6 +7966,7 @@ dependencies = [
  "anyhow",
  "arrow 59.3.2",
  "arrow-ipc",
+ "async-trait",
  "bincode",
  "chrono",
  "crc32fast",
