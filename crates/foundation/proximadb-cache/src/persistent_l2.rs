@@ -11,7 +11,7 @@
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 
 use crc32fast::Hasher as Crc32;
 use dashmap::DashMap;
@@ -560,6 +560,58 @@ impl PersistentByteStore {
 
     /// Bytes currently pinned under one grant group — the coverage that
     /// grant has actually achieved (status/coverage input).
+    /// Test support (TD-TIER-1 SC6 S2): force a group's liveness clock, so
+    /// the idle-reclaim policy is exercisable without real read traffic.
+    pub fn register_group_hit_for_test(&self, group_id: &str, unix_secs: i64) {
+        let guard = self.protection_guard();
+        if let Some(group) = guard.groups.get(group_id) {
+            group.counter.hits.fetch_add(1, Ordering::Relaxed);
+            group
+                .counter
+                .last_hit_unix_secs
+                .store(unix_secs, Ordering::Relaxed);
+        }
+    }
+
+    /// TD-TIER-1 SC6 S2: record a read hit against the key's group (grant).
+    /// Cheap when no policy is armed; per-read cost is one flag check plus a
+    /// tiny prefix scan (few groups), dominated by the read itself.
+    fn note_group_hit(&self, key: &str) {
+        if !self.inner.policy_active.load(Ordering::Acquire) {
+            return;
+        }
+        let guard = self.protection_guard();
+        let Some(group) = guard.matching_group(key) else {
+            return;
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.as_secs() as i64);
+        group.counter.hits.fetch_add(1, Ordering::Relaxed);
+        group
+            .counter
+            .last_hit_unix_secs
+            .swap(now, Ordering::Relaxed);
+    }
+
+    /// TD-TIER-1 SC6 S2: per-group read liveness for the idle-reclaim sweep —
+    /// `(grant id, hits, last_hit_unix_secs)` (0 = no hit since
+    /// registration). Status/sweep reads only.
+    pub fn group_activity_snapshot(&self) -> Vec<(String, u64, i64)> {
+        let guard = self.protection_guard();
+        guard
+            .groups
+            .iter()
+            .map(|(id, group)| {
+                (
+                    id.clone(),
+                    group.counter.hits.load(Ordering::Relaxed),
+                    group.counter.last_hit_unix_secs.load(Ordering::Relaxed),
+                )
+            })
+            .collect()
+    }
+
     pub fn covered_bytes(&self, group_id: &str) -> u64 {
         self.protection_guard()
             .groups
@@ -843,6 +895,7 @@ impl PersistentByteStore {
             return Ok(None);
         };
         let meta_for_read = meta.clone();
+        self.note_group_hit(key);
         let result = tokio::task::spawn_blocking(move || read_full_value(&meta_for_read))
             .await
             .map_err(join_error)?;
@@ -888,6 +941,7 @@ impl PersistentByteStore {
         match result {
             Ok(bytes) => {
                 meta.touch.store(self.next_tick(), Ordering::Relaxed);
+                self.note_group_hit(key);
                 self.heal_on_hit(key, &meta);
                 Ok(Some(Arc::from(bytes)))
             }
@@ -1531,10 +1585,14 @@ pub struct ProtectionGroup {
     pub budget_bytes: u64,
 }
 
-/// Bytes pinned under one group (shared by the policy and the entries).
+/// Bytes pinned under one group (shared by the policy and the entries), and
+/// TD-TIER-1 SC6 S2: the group's READ liveness — the idle-reclaim policy's
+/// signal. `last_hit_unix_secs == 0` means no hit since registration.
 #[derive(Debug, Default)]
 struct GroupCounter {
     pinned: AtomicU64,
+    hits: AtomicU64,
+    last_hit_unix_secs: AtomicI64,
     /// Set when one of this group's pins is released (its budget may have
     /// room again). Never cleared by a heal attempt; a group change rebuilds
     /// it.

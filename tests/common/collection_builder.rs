@@ -165,6 +165,7 @@ impl TestCollectionBuilder {
             storage_class_status: None,
             id,
             config: Some(CollectionConfig {
+                pool_id: None,
                 storage_class: None,
                 policy_generation: None,
                 default_access_tier: None,
@@ -229,6 +230,7 @@ impl TestCollectionBuilder {
             storage_class_status: None,
             id,
             config: Some(CollectionConfig {
+                pool_id: None,
                 storage_class: None,
                 policy_generation: None,
                 default_access_tier: None,

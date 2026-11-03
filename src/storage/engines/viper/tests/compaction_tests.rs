@@ -69,6 +69,7 @@ fn create_test_collection(
         storage_class_status: None,
         id: collection_id.to_string(),
         config: Some(CollectionConfig {
+            pool_id: None,
             storage_class: None,
             policy_generation: None,
             default_access_tier: None,

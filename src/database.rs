@@ -433,6 +433,11 @@ impl ProximaDB {
                                 );
                             }
                         }
+                        // TD-TIER-1 SC6 S2: idle-grant reclaim rides the same
+                        // cadence, AFTER the drain (a slow sweep must never
+                        // delay metering). No pool arms a TTL by default, so
+                        // this is a no-op unless configured.
+                        registry.reclaim_idle_grants(now_secs).await;
                     }
                 }
             });

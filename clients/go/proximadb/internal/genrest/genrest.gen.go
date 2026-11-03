@@ -1226,6 +1226,10 @@ type CollectionV2Response struct {
 	// Name Collection name
 	Name string `json:"name"`
 
+	// PoolId Reservation pool the PERFORMANCE grant charges (TD-TIER-1 SC6);
+	// omitted when the default pool applies.
+	PoolId *string `json:"pool_id,omitempty"`
+
 	// ProximaRecordEnabled Whether ProximaRecord is enabled
 	ProximaRecordEnabled bool `json:"proxima_record_enabled"`
 
@@ -1372,6 +1376,12 @@ type CreateCollectionV2Request struct {
 
 	// Name Collection name (required)
 	Name string `json:"name"`
+
+	// PoolId TD-TIER-1 SC6 policy seam: the reservation pool this PERFORMANCE
+	// collection's grant charges ("pool_id" in [storage.reservation_pools]);
+	// omitted ⇒ the configured default pool. Unknown ids are refused at
+	// admission with the configured ids listed.
+	PoolId *string `json:"pool_id,omitempty"`
 
 	// Quantization REST input for quantization config (mirrors proto `QuantizationConfig`;
 	// gRPC-v2 parity with `V2QuantizationConfig`).

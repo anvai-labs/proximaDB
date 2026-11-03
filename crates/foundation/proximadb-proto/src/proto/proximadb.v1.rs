@@ -6698,6 +6698,14 @@ pub struct CollectionConfig {
     #[prost(enumeration = "AccessTier", optional, tag = "32")]
     #[serde(default)]
     pub default_access_tier: ::core::option::Option<i32>,
+    /// TD-TIER-1 SC6 policy seam: the reservation pool this PERFORMANCE
+    /// collection's grant charges. Absent ⇒ the configured default pool
+    /// (the only behavior before this field). An explicit id must name a
+    /// pool in `storage.reservation_pools`; unknown ids are refused at
+    /// admission. `serde(default)` keeps old persisted records readable.
+    #[prost(string, optional, tag = "33")]
+    #[serde(default)]
+    pub pool_id: ::core::option::Option<::prost::alloc::string::String>,
 }
 /// Per-collection storage class (TD-TIER-1 SC1). The DESIRED policy only —
 /// observed residency is reported separately via `StorageClassStatus` on the

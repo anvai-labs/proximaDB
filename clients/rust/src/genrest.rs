@@ -3996,6 +3996,13 @@ pub mod types {
     ///      "description": "Collection name",
     ///      "type": "string"
     ///    },
+    ///    "pool_id": {
+    ///      "description": "Reservation pool the PERFORMANCE grant charges (TD-TIER-1 SC6);\nomitted when the default pool applies.",
+    ///      "type": [
+    ///        "string",
+    ///        "null"
+    ///      ]
+    ///    },
     ///    "proxima_record_enabled": {
     ///      "description": "Whether ProximaRecord is enabled",
     ///      "type": "boolean"
@@ -4060,6 +4067,10 @@ pub mod types {
         pub index_specs: ::std::vec::Vec<IndexSpecOutput>,
         ///Collection name
         pub name: ::std::string::String,
+        /// Reservation pool the PERFORMANCE grant charges (TD-TIER-1 SC6);
+        /// omitted when the default pool applies.
+        #[serde(default, skip_serializing_if = "::std::option::Option::is_none")]
+        pub pool_id: ::std::option::Option<::std::string::String>,
         ///Whether ProximaRecord is enabled
         pub proxima_record_enabled: bool,
         #[serde(default, skip_serializing_if = "::std::option::Option::is_none")]
@@ -4270,6 +4281,13 @@ pub mod types {
     ///      "type": "string",
     ///      "minLength": 1
     ///    },
+    ///    "pool_id": {
+    ///      "description": "TD-TIER-1 SC6 policy seam: the reservation pool this PERFORMANCE\ncollection's grant charges (\"pool_id\" in [storage.reservation_pools]);\nomitted ⇒ the configured default pool. Unknown ids are refused at\nadmission with the configured ids listed.",
+    ///      "type": [
+    ///        "string",
+    ///        "null"
+    ///      ]
+    ///    },
     ///    "quantization": {
     ///      "$ref": "#/components/schemas/QuantizationConfigInput"
     ///    },
@@ -4370,6 +4388,12 @@ pub mod types {
         pub initial_capacity: ::std::option::Option<i64>,
         ///Collection name (required)
         pub name: CreateCollectionV2RequestName,
+        /// TD-TIER-1 SC6 policy seam: the reservation pool this PERFORMANCE
+        /// collection's grant charges ("pool_id" in [storage.reservation_pools]);
+        /// omitted ⇒ the configured default pool. Unknown ids are refused at
+        /// admission with the configured ids listed.
+        #[serde(default, skip_serializing_if = "::std::option::Option::is_none")]
+        pub pool_id: ::std::option::Option<::std::string::String>,
         #[serde(default, skip_serializing_if = "::std::option::Option::is_none")]
         pub quantization: ::std::option::Option<QuantizationConfigInput>,
         #[serde(default, skip_serializing_if = "::std::option::Option::is_none")]
@@ -21194,6 +21218,10 @@ pub mod types {
                 ::std::string::String,
             >,
             name: ::std::result::Result<::std::string::String, ::std::string::String>,
+            pool_id: ::std::result::Result<
+                ::std::option::Option<::std::string::String>,
+                ::std::string::String,
+            >,
             proxima_record_enabled: ::std::result::Result<bool, ::std::string::String>,
             quantization: ::std::result::Result<
                 ::std::option::Option<super::QuantizationConfigOutput>,
@@ -21228,6 +21256,7 @@ pub mod types {
                     engine: Err("no value supplied for engine".to_string()),
                     index_specs: Err("no value supplied for index_specs".to_string()),
                     name: Err("no value supplied for name".to_string()),
+                    pool_id: Ok(Default::default()),
                     proxima_record_enabled: Err(
                         "no value supplied for proxima_record_enabled".to_string()
                     ),
@@ -21355,6 +21384,16 @@ pub mod types {
                     .map_err(|e| format!("error converting supplied value for name: {e}"));
                 self
             }
+            pub fn pool_id<T>(mut self, value: T) -> Self
+            where
+                T: ::std::convert::TryInto<::std::option::Option<::std::string::String>>,
+                T::Error: ::std::fmt::Display,
+            {
+                self.pool_id = value
+                    .try_into()
+                    .map_err(|e| format!("error converting supplied value for pool_id: {e}"));
+                self
+            }
             pub fn proxima_record_enabled<T>(mut self, value: T) -> Self
             where
                 T: ::std::convert::TryInto<bool>,
@@ -21443,6 +21482,7 @@ pub mod types {
                     engine: value.engine?,
                     index_specs: value.index_specs?,
                     name: value.name?,
+                    pool_id: value.pool_id?,
                     proxima_record_enabled: value.proxima_record_enabled?,
                     quantization: value.quantization?,
                     schema: value.schema?,
@@ -21467,6 +21507,7 @@ pub mod types {
                     engine: Ok(value.engine),
                     index_specs: Ok(value.index_specs),
                     name: Ok(value.name),
+                    pool_id: Ok(value.pool_id),
                     proxima_record_enabled: Ok(value.proxima_record_enabled),
                     quantization: Ok(value.quantization),
                     schema: Ok(value.schema),
@@ -21630,6 +21671,10 @@ pub mod types {
                 ::std::result::Result<::std::option::Option<i64>, ::std::string::String>,
             name:
                 ::std::result::Result<super::CreateCollectionV2RequestName, ::std::string::String>,
+            pool_id: ::std::result::Result<
+                ::std::option::Option<::std::string::String>,
+                ::std::string::String,
+            >,
             quantization: ::std::result::Result<
                 ::std::option::Option<super::QuantizationConfigInput>,
                 ::std::string::String,
@@ -21662,6 +21707,7 @@ pub mod types {
                     index_type: Ok(Default::default()),
                     initial_capacity: Ok(Default::default()),
                     name: Err("no value supplied for name".to_string()),
+                    pool_id: Ok(Default::default()),
                     quantization: Ok(Default::default()),
                     schema: Ok(Default::default()),
                     storage_class: Ok(Default::default()),
@@ -21794,6 +21840,16 @@ pub mod types {
                     .map_err(|e| format!("error converting supplied value for name: {e}"));
                 self
             }
+            pub fn pool_id<T>(mut self, value: T) -> Self
+            where
+                T: ::std::convert::TryInto<::std::option::Option<::std::string::String>>,
+                T::Error: ::std::fmt::Display,
+            {
+                self.pool_id = value
+                    .try_into()
+                    .map_err(|e| format!("error converting supplied value for pool_id: {e}"));
+                self
+            }
             pub fn quantization<T>(mut self, value: T) -> Self
             where
                 T: ::std::convert::TryInto<::std::option::Option<super::QuantizationConfigInput>>,
@@ -21855,6 +21911,7 @@ pub mod types {
                     index_type: value.index_type?,
                     initial_capacity: value.initial_capacity?,
                     name: value.name?,
+                    pool_id: value.pool_id?,
                     quantization: value.quantization?,
                     schema: value.schema?,
                     storage_class: value.storage_class?,
@@ -21877,6 +21934,7 @@ pub mod types {
                     index_type: Ok(value.index_type),
                     initial_capacity: Ok(value.initial_capacity),
                     name: Ok(value.name),
+                    pool_id: Ok(value.pool_id),
                     quantization: Ok(value.quantization),
                     schema: Ok(value.schema),
                     storage_class: Ok(value.storage_class),

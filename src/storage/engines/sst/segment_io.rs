@@ -29,7 +29,10 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use futures::StreamExt as _;
 use proximadb_cache::{L2Class, PersistentByteStore, object_key};
+use proximadb_storage_filesystem_types::read_ranges_plan;
+use proximadb_storage_filesystem_types::read_ranges_prefetch_inflight;
 use proximadb_storage_filesystem_types::{FileSystem, FilesystemError, FsResult};
 
 /// Whole-object fetches are staged in chunks of this size (bounded RAM).
@@ -41,6 +44,84 @@ const RETIRED_MEMORY: usize = 4096;
 /// staging disk, and how far concurrent warms can overshoot the advisory
 /// budget check.
 const WARMS_IN_FLIGHT: usize = 4;
+
+/// TD-TIER-1 SC6 S3: one pool's aggregate warm bandwidth (bytes/s), shared
+/// by every grant in that pool. A token bucket with one second of burst
+/// capacity; `rate <= 0` paces nothing.
+pub struct WarmBudget {
+    rate_bytes_per_s: f64,
+    state: std::sync::Mutex<WarmBucketState>,
+}
+
+struct WarmBucketState {
+    tokens: f64,
+    last: std::time::Instant,
+}
+
+impl WarmBudget {
+    /// A bucket passing `rate_bytes_per_s` in aggregate.
+    pub fn new(rate_bytes_per_s: f64) -> Self {
+        Self {
+            rate_bytes_per_s,
+            state: std::sync::Mutex::new(WarmBucketState {
+                tokens: rate_bytes_per_s,
+                last: std::time::Instant::now(),
+            }),
+        }
+    }
+
+    /// Account `bytes` of warm transfer and sleep for the deficit. Concurrency
+    /// is bounded by WARMS_IN_FLIGHT, so lock contention is negligible.
+    pub async fn pace(&self, bytes: u64) {
+        if self.rate_bytes_per_s <= 0.0 {
+            return;
+        }
+        let deficit = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let now = std::time::Instant::now();
+            let refill =
+                now.duration_since(state.last).as_secs_f64().min(1.0) * self.rate_bytes_per_s;
+            state.tokens = (state.tokens + refill).min(self.rate_bytes_per_s);
+            state.last = now;
+            state.tokens -= bytes as f64;
+            let deficit_tokens = -state.tokens.min(0.0);
+            deficit_tokens / self.rate_bytes_per_s
+        };
+        if deficit > 0.0 {
+            tokio::time::sleep(std::time::Duration::from_secs_f64(deficit.min(60.0))).await;
+        }
+    }
+}
+
+static WARM_PREFIX_BUDGETS: std::sync::OnceLock<
+    std::sync::RwLock<Vec<(String, std::sync::Arc<WarmBudget>)>>,
+> = std::sync::OnceLock::new();
+
+/// Install the prefix → pool-bucket map (the reservation registry refreshes
+/// it whenever grants change). Longest matching prefix wins; an empty map
+/// paces nothing (today's behavior).
+pub fn set_warm_prefix_budgets(budgets: Vec<(String, std::sync::Arc<WarmBudget>)>) {
+    let registry = WARM_PREFIX_BUDGETS.get_or_init(|| std::sync::RwLock::new(Vec::new()));
+    let mut guard = registry
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *guard = budgets;
+}
+
+fn warm_budget_for(path: &str) -> Option<std::sync::Arc<WarmBudget>> {
+    let registry = WARM_PREFIX_BUDGETS.get_or_init(|| std::sync::RwLock::new(Vec::new()));
+    let guard = registry
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard
+        .iter()
+        .filter(|(prefix, _)| !prefix.is_empty() && path.starts_with(prefix.as_str()))
+        .max_by_key(|(prefix, _)| prefix.len())
+        .map(|(_, budget)| budget.clone())
+}
 
 fn warm_permits() -> &'static tokio::sync::Semaphore {
     static PERMITS: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
@@ -91,14 +172,49 @@ impl<T: FileSystem + ?Sized> ResidentRangeRead for T {
                 .iter()
                 .all(|range| range.end <= resident.len && range.start <= range.end)
         {
-            let mut out = Vec::with_capacity(ranges.len());
-            for range in &ranges {
-                match resident.range(range.start, range.end - range.start).await {
-                    Some(bytes) => out.push(bytes),
-                    None => return self.read_ranges_prefetch(path, ranges).await,
+            // F1 (SC6 measurement): serve the batch with the SAME plan the
+            // remote path uses — one coalesced physical plan, bounded-
+            // concurrent fetch, identical logical slicing — swapping only the
+            // transport for the resident copy. The previous loop served each
+            // logical range through its own spawn_blocking hop one at a time,
+            // serializing exactly what the cold path issues as parallel waves
+            // (granted warm p50 ~215 ms vs cold ~60 ms at zero GETs).
+            let inflight = read_ranges_prefetch_inflight(path).max(1);
+            let plan = self.plan_read_ranges(&ranges)?;
+            let identity = self.range_coalesce_policy().is_none();
+            let physical: Vec<std::ops::Range<u64>> = plan.physical.clone();
+            let mut fetch = futures::stream::iter(physical.into_iter().map(|range| {
+                let resident = resident.clone();
+                async move { resident.range(range.start, range.end - range.start).await }
+            }))
+            .buffered(inflight);
+            let mut buffers = Vec::with_capacity(plan.physical.len());
+            let mut complete = true;
+            while let Some(item) = fetch.next().await {
+                match item {
+                    Some(bytes) => buffers.push(bytes),
+                    None => {
+                        // A resident miss (eviction/corruption): fall back to
+                        // the remote batch wholesale, dropping in-flight reads.
+                        complete = false;
+                        break;
+                    }
                 }
             }
-            return Ok(out);
+            if complete {
+                if identity {
+                    return Ok(buffers);
+                }
+                return Ok(plan
+                    .mapping
+                    .iter()
+                    .map(|slice| match slice.physical {
+                        Some(idx) => read_ranges_plan::slice_from_physical(&buffers[idx], *slice),
+                        None => Vec::new(),
+                    })
+                    .collect());
+            }
+            return self.read_ranges_prefetch(path, ranges).await;
         }
         self.read_ranges_prefetch(path, ranges).await
     }
@@ -123,6 +239,7 @@ impl<T: FileSystem + ?Sized> ResidentRangeRead for T {
 }
 
 /// A resident whole-object copy of one segment.
+#[derive(Clone)]
 struct Resident {
     store: Arc<PersistentByteStore>,
     key: String,
@@ -235,11 +352,20 @@ pub async fn warm_object(
         }
     };
     // Process-wide limit, then re-judge the budget: a warm that waited may
-    // find the room taken by the ones ahead of it.
-    let _permit = warm_permits()
-        .acquire()
-        .await
-        .map_err(|error| anyhow::anyhow!("warm permit for {path}: {error}"))?;
+    // find the room taken by the ones ahead of it. The setup permit is
+    // dropped before the chunk loop: each chunk reacquires (the RAM bound is
+    // one chunk per permit), and S3 pacing sleeps BETWEEN permits — a
+    // budgeted pool must never pin the process-wide permits while it sleeps
+    // (review SF1), or a slow pool starves every other pool's warm.
+    {
+        let _setup_permit = warm_permits()
+            .acquire()
+            .await
+            .map_err(|error| anyhow::anyhow!("warm permit for {path}: {error}"))?;
+        if warm_target(path, len).is_none() {
+            return Ok(false);
+        }
+    }
     let Some((store, key)) = warm_target(path, len) else {
         return Ok(false);
     };
@@ -257,18 +383,38 @@ pub async fn warm_object(
             .map_err(|error| anyhow::anyhow!("warm stage {path}: {error}"))?;
         let mut out = tokio::fs::File::from_std(file);
         let mut offset = 0u64;
+        // TD-TIER-1 SC6 S3: pace this object's chunks against its pool's
+        // aggregate warm budget, when one is installed for the path. Pacing
+        // happens OUTSIDE the warm permit (review SF1): a budgeted pool must
+        // not pin the process-wide permits while it sleeps, or a slow pool
+        // starves every other pool's warm.
+        let budget = warm_budget_for(path);
         while offset < len {
             let chunk = WARM_CHUNK_BYTES.min(len - offset);
-            let bytes = fs
-                .read_range(path, offset, chunk)
-                .await
-                .map_err(|error| anyhow::anyhow!("warm read {path}@{offset}: {error}"))?;
-            if bytes.len() as u64 != chunk {
-                anyhow::bail!("warm read {path}@{offset}: short read");
+            if let Some(budget) = &budget {
+                budget.pace(chunk).await;
             }
-            out.write_all(&bytes)
-                .await
-                .map_err(|error| anyhow::anyhow!("warm stage {path}: {error}"))?;
+            // The chunk buffer lives INSIDE the permit (review SF2): one
+            // WARMS_IN_FLIGHT permit ⇒ at most one 64 MiB buffer held per
+            // warm across the process — the write included. Pacing stays
+            // before the permit, so a budgeted pool still never pins permits
+            // while sleeping.
+            {
+                let _chunk_permit = warm_permits()
+                    .acquire()
+                    .await
+                    .map_err(|error| anyhow::anyhow!("warm permit for {path}: {error}"))?;
+                let bytes = fs
+                    .read_range(path, offset, chunk)
+                    .await
+                    .map_err(|error| anyhow::anyhow!("warm read {path}@{offset}: {error}"))?;
+                if bytes.len() as u64 != chunk {
+                    anyhow::bail!("warm read {path}@{offset}: short read");
+                }
+                out.write_all(&bytes)
+                    .await
+                    .map_err(|error| anyhow::anyhow!("warm stage {path}: {error}"))?;
+            };
             offset += chunk;
         }
         out.flush()
@@ -736,6 +882,133 @@ mod tests {
         std::fs::create_dir_all(&covered).expect("dirs");
         std::fs::create_dir_all(&other).expect("dirs");
         (covered, other)
+    }
+
+    /// A local fs carrying a range-coalesce policy, so the resident batched
+    /// path exercises bridging + logical slicing (the plain local fs is
+    /// identity-mapped and would not).
+    #[derive(Debug)]
+    struct CoalescingLocalFs {
+        inner: Arc<CountingFileSystem>,
+    }
+    proximadb_storage_filesystem_types::forward_filesystem_impl! {
+        impl FileSystem for CoalescingLocalFs => inner;
+        forward [
+            as_any, filesystem_type, supports_mmap, write,
+            supports_bounded_local_file_write, write_local_file, write_if_absent, append,
+            supports_append, supports_conditional_replace, delete, exists, metadata,
+            create_dir, create_dir_all, copy, move_file, sync, sync_file, sync_data, open_file,
+        ];
+        {
+            async fn read(&self, path: &str) -> FsResult<Vec<u8>> {
+                self.inner.read(path).await
+            }
+
+            async fn read_range(&self, path: &str, offset: u64, length: u64) -> FsResult<Vec<u8>> {
+                self.inner.read_range(path, offset, length).await
+            }
+
+            async fn list(
+                &self,
+                path: &str,
+            ) -> FsResult<Vec<proximadb_storage_filesystem_types::DirEntry>> {
+                self.inner.list(path).await
+            }
+
+            fn range_coalesce_policy(
+                &self,
+            ) -> Option<proximadb_storage_filesystem_types::RangeCoalescePolicy> {
+                Some(proximadb_storage_filesystem_types::RangeCoalescePolicy {
+                    max_gap_bytes: 64 * 1024,
+                    max_merged_bytes: 256 * 1024,
+                })
+            }
+        }
+    }
+
+    /// TD-TIER-1 SC6 S3: an installed warm budget paces the aggregate —
+    /// warming a multi-chunk object under a small rate takes at least
+    /// bytes/rate (minus the one-second burst), and no budget paces nothing.
+    #[tokio::test]
+    async fn warm_budget_bounds_the_aggregate() {
+        let root = tempfile::tempdir().expect("root");
+        let (covered, _) = dirs(root.path());
+        let _armed = arm(&covered, "s3-budget", 64 << 20);
+        let (fs, _counters) = counting_local(root.path()).await;
+        // 4 MiB object; a 1 MiB/s budget allows ~1 MiB burst, so >= 3 s.
+        let (path, _) = segment(&covered, "L0_budget.pax", 4 << 20);
+        let rate = 1024.0 * 1024.0;
+        let budget = std::sync::Arc::new(WarmBudget::new(rate));
+        set_warm_prefix_budgets(vec![(covered.to_string_lossy().to_string(), budget)]);
+
+        let started = std::time::Instant::now();
+        assert!(warm_object(fs.as_ref(), &path, None).await.expect("warm"));
+        let elapsed = started.elapsed().as_secs_f64();
+        let minimum = (4.0 - 1.0) / 1.0_f64 - 0.3;
+        assert!(
+            elapsed >= minimum,
+            "budgeted warm took {elapsed:.2}s, expected >= {minimum:.2}s"
+        );
+        set_warm_prefix_budgets(Vec::new());
+    }
+
+    /// F1 regression (SC6 measurement): the resident batched-prefetch path
+    /// serves the SAME coalesced physical plan the remote path uses —
+    /// bridging small gaps, slicing logical ranges back out — byte-exactly
+    /// and with zero object-store GETs. The previous implementation served
+    /// each logical range through one spawn_blocking hop at a time,
+    /// serializing what the cold path issues as parallel waves (granted warm
+    /// p50 ~215 ms vs cold ~60 ms at zero GETs). A range beyond the resident
+    /// copy falls back to the remote batch wholesale.
+    #[tokio::test]
+    async fn resident_prefetch_is_coalesced_concurrent_and_byte_exact() {
+        let root = tempfile::tempdir().expect("root");
+        let (covered, _) = dirs(root.path());
+        let _armed = arm(&covered, "f1", 32 << 20);
+        let (fs, counters) = counting_local(root.path()).await;
+        let coalescing = CoalescingLocalFs { inner: fs.clone() };
+        let (path, bytes) = segment(&covered, "L0_f1.pax", 300_000);
+        assert!(warm_object(fs.as_ref(), &path, None).await.expect("warm"));
+
+        // Small gaps bridge under the policy; a gap beyond max_gap does not.
+        let ranges: Vec<std::ops::Range<u64>> = vec![0..1_000, 2_000..3_000, 150_000..151_000];
+        let plan = coalescing.plan_read_ranges(&ranges).expect("plan");
+        assert!(
+            plan.physical.len() < ranges.len(),
+            "coalescing active: {} physical for {} logical",
+            plan.physical.len(),
+            ranges.len()
+        );
+
+        let before = counters.total_gets();
+        let out = coalescing
+            .read_ranges_prefetch_resident(&path, ranges.clone())
+            .await
+            .expect("resident batch");
+        assert_eq!(counters.total_gets(), before, "zero remote GETs");
+        for (slice, range) in out.iter().zip(&ranges) {
+            let start = range.start as usize;
+            let end = range.end as usize;
+            assert_eq!(slice, &bytes[start..end], "logical slice {range:?}");
+        }
+
+        // A range past the resident copy falls back to the remote batch
+        // wholesale — remote GETs return, results stay byte-exact.
+        let mut beyond = ranges.clone();
+        beyond.push(400_000..401_000);
+        let out = coalescing
+            .read_ranges_prefetch_resident(&path, beyond.clone())
+            .await
+            .expect("fallback batch");
+        assert!(
+            counters.total_gets() > before,
+            "the fallback reads remotely"
+        );
+        for (slice, range) in out.iter().zip(&beyond) {
+            let start = std::cmp::min(range.start as usize, bytes.len());
+            let end = std::cmp::min(range.end as usize, bytes.len());
+            assert_eq!(slice, &bytes[start..end], "fallback slice {range:?}");
+        }
     }
 
     /// The SC4-4 core: a covered segment, once resident, is read — single

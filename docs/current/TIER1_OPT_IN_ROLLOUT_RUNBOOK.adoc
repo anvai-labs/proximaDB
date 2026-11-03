@@ -25,6 +25,23 @@
   applied to future compaction output only; omitted ⇒ the account default.
   L0 flush output and staging keep the account default (minimum-duration
   economics — see the worksheet).
+* **Policy seams (SC6, all opt-in, all default-off/None):**
+** `pool_id` on the collection — the pool its PERFORMANCE grant charges
+   (absent = the default pool; unknown ids refused at admission with the
+   configured list). This is the freemium-shared / team / enterprise routing
+   knob.
+** `idle_reclaim_secs` + `idle_reclaim_min_lifetime_secs` on a pool — an
+   idle grant (no read hit on its group for the TTL, older than the floor)
+   is released by the sweep riding the metering loop: unpinned, accrual
+   stopped; re-admission follows the normal path. `0` = never (enterprise).
+** `warm_bandwidth_mib_per_s` on a pool — the aggregate backfill rate its
+   grants share (one tenant's re-warm cannot starve another's READY; on ST1
+   keep it under the sustained baseline so the burst bucket survives
+   serving). `0` = uncapped.
+** `dram_budget_bytes` on a pool — the ceiling on its live-grant sum (the
+   tier's DRAM protection share), refused at admission like pool capacity.
+   `None` = uncapped.
+
 * **Balanced** collections are byte-for-byte today's behavior: no pool, no
   admission, no tier, no status change beyond the `active` projection.
 
@@ -42,6 +59,14 @@
 
 == Operator drills (each names its invariant)
 
+* **Idle reclaim:** arm a short TTL on a test pool, stop querying a granted
+  collection past the TTL, confirm the metering loop's sweep releases it
+  (status leaves READY; the ledger's accrual tail closes at the reclaim).
+  Re-admission is NOT automatic: the next storage-class update (or recreate)
+  re-reserves through the normal admission path.
+* **Warm budget:** arm `warm_bandwidth_mib_per_s` on a shared pool, start two
+  re-warms at once, confirm neither starves the other's READY window and the
+  aggregate stays under the budget.
 * **Disk loss:** revoke a pool's disk → serving continues remotely at recall
   parity, and the status depends on the failure shape: the store re-opening
   EMPTY reports WARMING (coverage 0-of-N within capacity — never read

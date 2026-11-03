@@ -1509,6 +1509,17 @@ impl CollectionService {
             &enriched_config,
             &base_location,
         )?;
+        // TD-TIER-1 SC6: an explicit pool must be configured (the registry's
+        // ids; no pools configured ⇒ any explicit id is refused).
+        let configured_pool_ids = self
+            .reservations
+            .as_ref()
+            .map(|registry| registry.configured_pool_ids())
+            .unwrap_or_default();
+        crate::services::collection::storage_class::check_pool_admission(
+            &enriched_config,
+            &configured_pool_ids,
+        )?;
 
         // ADR-031 Phase 4c: pre-mint the typed collection identity
         // `(account, namespace, collection)` BEFORE storage-dir creation, so the
@@ -1574,6 +1585,9 @@ impl CollectionService {
                 uuid.clone(),
                 chrono::Utc::now().timestamp(),
                 &protect_prefixes,
+                // TD-TIER-1 SC6: charge the collection's named pool when it
+                // declared one (tier routing); else the armed default.
+                enriched_config.pool_id.as_deref(),
             );
             reserved_grant
                 .committed()
@@ -2281,6 +2295,12 @@ impl CollectionService {
         // `Some(true)` = reserve after persist, `Some(false)` = release.
         // Applied only after the durable upsert succeeds.
         let mut policy_side_effect: Option<bool> = None;
+        // TD-TIER-1 SC6: the pool the re-admission charges — the merged
+        // config's `pool_id` (explicit new value, else the recorded one).
+        let mut performance_pool_id: Option<String> = None;
+        // A pool-only reroute on a live PERFORMANCE grant: release the old
+        // grant (every pool) before the re-reserve lands in the new pool.
+        let mut pool_reroute = false;
         // SF1: a post-persist reserve failure surfaces here (policy durable,
         // grant missing) instead of a quiet success.
         let mut reservation_pending: Option<String> = None;
@@ -2412,7 +2432,16 @@ impl CollectionService {
                             // declared) also refuses — PERFORMANCE without a
                             // reservation admission would be a silent lie.
                             match &self.reservations {
-                                Some(registry) => registry.peek_performance_admission().await?,
+                                Some(registry) => {
+                                    registry
+                                        .peek_performance_admission(
+                                            new_config
+                                                .pool_id
+                                                .as_deref()
+                                                .or(existing_config.pool_id.as_deref()),
+                                        )
+                                        .await?
+                                }
                                 None => {
                                     return Err(anyhow::anyhow!(
                                         "storage_class 'performance' requires a \
@@ -2433,9 +2462,46 @@ impl CollectionService {
                         existing_config.policy_generation =
                             Some(u32::try_from(generation.saturating_add(1)).unwrap_or(u32::MAX));
                         existing_config.storage_class = Some(resolved as i32);
+                        if resolved != crate::proto::proximadb_v1::StorageClass::Performance {
+                            // A demoted collection has no grant to route: a
+                            // stale pool_id would re-reserve a retired pool on
+                            // a later re-promotion.
+                            existing_config.pool_id = None;
+                        }
                         policy_side_effect =
                             Some(resolved == crate::proto::proximadb_v1::StorageClass::Performance);
                     }
+                }
+                // TD-TIER-1 SC6 (review BLOCKER): a pool_id-only update on an
+                // already-PERFORMANCE collection must take effect — the merge
+                // used to live inside the class-change branch, so it silently
+                // dropped (validated, reported success, grant unmoved: the
+                // DTO-drop class). Hoisted: any explicit pool change re-routes
+                // the live grant — the old one releases (release sweeps every
+                // pool) and policy_side_effect forces the re-reserve.
+                if new_config.pool_id.is_some()
+                    && new_config.pool_id != existing_config.pool_id
+                    && crate::services::collection::storage_class::storage_class_or_balanced(
+                        existing_config,
+                    ) == crate::proto::proximadb_v1::StorageClass::Performance
+                {
+                    // The reroute sheds the old grant and re-reserves into
+                    // the NEW pool — gate it on that pool's headroom BEFORE
+                    // the config persists (the pool-only path runs no class
+                    // peek): a full target pool must refuse the update, not
+                    // leave the collection grant-less post-persist.
+                    if let Some(registry) = &self.reservations {
+                        registry
+                            .peek_performance_admission(new_config.pool_id.as_deref())
+                            .await?;
+                    }
+                    existing_config.pool_id = new_config.pool_id.clone();
+                    performance_pool_id = existing_config.pool_id.clone();
+                    policy_side_effect = Some(true);
+                    pool_reroute = true;
+                } else if new_config.pool_id.is_some() {
+                    existing_config.pool_id = new_config.pool_id.clone();
+                    performance_pool_id = existing_config.pool_id.clone();
                 }
                 // TD-TIER-1 SC5: the tier governs FUTURE segment PUTs only
                 // (nothing is rewritten), so a change needs no reservation
@@ -2459,6 +2525,27 @@ impl CollectionService {
                         &base,
                     )?;
                     existing_config.default_access_tier = Some(raw_tier);
+                }
+                // TD-TIER-1 SC6: an explicit pool on the update must name a
+                // configured pool — refused BEFORE the config persists (peek
+                // shape, like the class/tier checks above).
+                if new_config.pool_id.is_some() {
+                    let prospective_for_pool = {
+                        let mut prospective = existing_config.clone();
+                        if new_config.pool_id.is_some() {
+                            prospective.pool_id = new_config.pool_id.clone();
+                        }
+                        prospective
+                    };
+                    let configured_pool_ids = self
+                        .reservations
+                        .as_ref()
+                        .map(|registry| registry.configured_pool_ids())
+                        .unwrap_or_default();
+                    crate::services::collection::storage_class::check_pool_admission(
+                        &prospective_for_pool,
+                        &configured_pool_ids,
+                    )?;
                 }
                 if !new_config.tags.is_empty() {
                     existing_config.tags = new_config.tags;
@@ -2500,9 +2587,10 @@ impl CollectionService {
                 // generation, grant effects). Refuse it explicitly.
                 if new_config.storage_class.is_some_and(|class| class != 0)
                     || new_config.default_access_tier.is_some_and(|tier| tier != 0)
+                    || new_config.pool_id.is_some()
                 {
                     return Err(anyhow::anyhow!(
-                        "storage_class / default_access_tier cannot be set on a \
+                        "storage_class / default_access_tier / pool_id cannot be set on a \
                          record without a recorded config; recreate the collection \
                          instead"
                     ));
@@ -2546,7 +2634,26 @@ impl CollectionService {
                 .filter(|owner| !owner.is_empty());
             let now = chrono::Utc::now().timestamp();
             if to_performance {
-                let tenant = owner.unwrap_or_else(|| Self::DEFAULT_VERSION_TENANT.to_string());
+                let tenant = owner
+                    .clone()
+                    .unwrap_or_else(|| Self::DEFAULT_VERSION_TENANT.to_string());
+                if pool_reroute {
+                    // The old grant may live in ANY pool: release everywhere
+                    // (idempotent) so the re-reserve lands in the new pool
+                    // without double-charging capacity. The grant's ledger key
+                    // is the CREATE-time version_tenant, which can diverge from
+                    // the owner recorded later — release BOTH keys like the
+                    // delete path does (a single-key release would leave the
+                    // old grant live: double charge, double billing).
+                    if let Some(owner) = owner.as_deref() {
+                        registry
+                            .release_for_collection(owner, &collection_id, now)
+                            .await;
+                    }
+                    registry
+                        .release_for_collection(Self::DEFAULT_VERSION_TENANT, &collection_id, now)
+                        .await;
+                }
                 // SC4-2: protection prefixes from the record's own storage
                 // assignment (the exact base + typed triple flush uses).
                 let protect_prefixes = previous_record
@@ -2569,7 +2676,13 @@ impl CollectionService {
                     );
                 }
                 if let Err(error) = registry
-                    .reserve_for_performance(&tenant, &collection_id, now, &protect_prefixes)
+                    .reserve_for_performance(
+                        &tenant,
+                        &collection_id,
+                        now,
+                        &protect_prefixes,
+                        performance_pool_id.as_deref(),
+                    )
                     .await
                 {
                     // The policy is durable but unreserved (peek→reserve
@@ -3688,6 +3801,7 @@ mod tests {
     /// exhaustive literals used; tests override what they exercise.
     fn collection_config(name: &str) -> CollectionConfig {
         CollectionConfig {
+            pool_id: None,
             name: name.to_string(),
             embedding_config: None,
             dimension: 128,

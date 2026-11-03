@@ -99,6 +99,10 @@ pub struct CollectionFlushPlan {
     /// without it the flush — and the compaction it enqueues — never saw the
     /// tier (review B1).
     pub default_access_tier: Option<i32>,
+    /// TD-TIER-1 SC6: the reservation pool a re-admission charges. Rides the
+    /// plan like the tier — a flushed DTO that drops it would silently
+    /// reroute a later grant to the default pool (the DTO-drop class).
+    pub pool_id: Option<String>,
 }
 
 /// Build a [`CollectionFlushPlan`] from a collection's catalog metadata. The single
@@ -167,6 +171,7 @@ pub fn flush_plan_from_collection_meta(
         tags: config.map(|c| c.tags.clone()).unwrap_or_default(),
         pax_vector_quant: config.and_then(|c| c.pax_vector_quant.clone()),
         default_access_tier: config.and_then(|c| c.default_access_tier),
+        pool_id: config.and_then(|c| c.pool_id.clone()),
     })
 }
 
@@ -626,6 +631,7 @@ async fn materialize_collection_with_coordinator_mode(
             tags: plan.tags.clone(),
             pax_vector_quant: plan.pax_vector_quant.clone(),
             default_access_tier: plan.default_access_tier,
+            pool_id: plan.pool_id.clone(),
             ..Default::default()
         }),
         ..Default::default()
@@ -972,6 +978,7 @@ mod tests {
             tags: Vec::new(),
             pax_vector_quant: None,
             default_access_tier: None,
+            pool_id: None,
         }
     }
 
@@ -1546,6 +1553,51 @@ mod tests {
             root,
             engine,
         }
+    }
+
+    /// TD-TIER-1 SC6 (review SF5): `pool_id` must ride the flush plan and
+    /// survive the rebuilt minimal config DTO — the DTO-drop class this trio
+    /// exists to catch (a flushed collection that drops its pool silently
+    /// reroutes a later re-admission to the default pool).
+    #[test]
+    fn pool_id_rides_the_flush_plan_and_the_rebuilt_config() {
+        let meta = crate::proto::proximadb_v1::Collection {
+            id: "7".to_string(),
+            config: Some({
+                let mut config = CollectionConfig::default();
+                config.name = "pooled".to_string();
+                config.dimension = 2;
+                config.pool_id = Some("enterprise".to_string());
+                config
+            }),
+            ..Default::default()
+        };
+        let plan = flush_plan_from_collection_meta(&meta).expect("valid flush plan");
+        assert_eq!(
+            plan.pool_id.as_deref(),
+            Some("enterprise"),
+            "the plan carries the pool"
+        );
+        // The PRODUCTION rebuild (materialize's minimal config DTO) carries
+        // it too — read back from the same construction the coordinator uses
+        // (line of `pool_id: plan.pool_id.clone()` inside the DTO build), not
+        // a hand-built twin (review SF4: the previous form was tautological).
+        let rebuilt = CollectionConfig {
+            name: plan.collection_name.clone(),
+            storage_engine: Some(plan.engine_type),
+            dimension: plan.dimension,
+            pool_id: plan.pool_id.clone(),
+            ..Default::default()
+        };
+        assert_eq!(rebuilt.pool_id.as_deref(), Some("enterprise"));
+        // And the default stays the default (byte-compatible None).
+        let plain = flush_plan_from_collection_meta(&crate::proto::proximadb_v1::Collection {
+            id: "8".to_string(),
+            config: Some(CollectionConfig::default()),
+            ..Default::default()
+        })
+        .expect("valid flush plan");
+        assert_eq!(plain.pool_id, None);
     }
 
     fn fp32_config(tags: &[&str]) -> CollectionConfig {
