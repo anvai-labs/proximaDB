@@ -1,5 +1,5 @@
 = TD-PATH-2: A typed collection id can be reused after a failed drop, so the new collection inherits the old one's segments
-:status: Partial — durable identity high-water shipped (SystemCatalog); NativeCatalog lazy floors open
+:status: Partial — durable identity high-water shipped for BOTH catalogs (#2316 SystemCatalog, #2336 NativeCatalog); reserved-uncommitted ids and older-binary publishers open
 :filed: 2026-10-30
 :priority: P2 — latent while `PROXIMADB_TYPED_PATHS` is default-off; P1 before it defaults on
 
@@ -24,7 +24,7 @@ failed to delete therefore survives with no owner, and the next collection minte
 triple finds the dropped collection's segments in its data directory. Search discovery lists
 that directory, so the dropped rows come back.
 
-`NativeCatalog` is worse. Its floors are recovered lazily, as tables load (`native.rs`
+`NativeCatalog` is worse (NOTE: fixed by #2336 — this paragraph records the pre-fix state; see the Status row). Its floors are recovered lazily, as tables load (`native.rs`
 ~1170–1183), and `namespace_registry` does not survive a restart. A fresh create can therefore
 mint the triple of a live collection that has not been loaded yet, and dropping either
 collection would delete the other's segments.
