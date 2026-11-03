@@ -5,7 +5,7 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | **Convergence LANDED 2026-11-02: seam extracted → corpus pinned → steps 1-2 (shared lexemes/patterns, type unification) → step-3 prerequisite (four review passes, corpus 41→61) → step 3 (the modality parser IS the conversion layer; write grammar is ONE behind the seam). Remaining: the SQL-lowering read entry (a TD non-goal) and the mixed-operator precedence decision.**
+| Status | **Convergence LANDED 2026-11-02: seam extracted → corpus pinned → steps 1-2 (shared lexemes/patterns, type unification) → step-3 prerequisite (four review passes, corpus 41→61) → step 3 (the modality parser IS the conversion layer; write grammar is ONE behind the seam). Remaining: the SQL-lowering read entry (a TD non-goal — and see its correction below). The mixed-operator precedence decision is MADE: FLAT LEFT-ASSOC (the retired live grammar's semantics), implemented in the seam's where-chain and pinned by two corpus entries.**
 | Priority | P2 — two live nom-based Cypher grammars with 34 shared function names and drifted bodies is the standard fork disease; every parser fix must currently land twice or silently miss one path.
 | Relates to | link:TD-GRAPH-3-cypher-variable-length-multihop.adoc[TD-GRAPH-3] (variable-length parsing), the 2026-10-31 victor clone-scan dedup program (wave 3)
 | Component | `crates/query/proximadb-graph-query/src/parser/` (read path + `write_seam.rs`), `crates/modalities/proximadb-graph/src/cypher_parser.rs` (the graph-API grammar), `src/query/parsers/cypher.rs` + `src/graph/query/graph_parser.rs` (its consumers).
@@ -109,8 +109,10 @@ drifted twin.
    the `direction` field its parser computed then discarded. 13 dead
    clause parsers deleted (cypher_parser.rs 2675 → 2230 ln). The
    read-path entry (parse_to_compiled_pattern) still parses with the
-   retired read helpers — per this TD's non-goals it serves the
-   SQL-lowering pipeline and stays until that pipeline migrates.
+   retired read helpers and stays per the non-goal — though review
+   found it has ZERO in-repo callers today (the SQL lowering uses the
+   seam's own QueryParser directly), so it is retained public API
+   awaiting removal at a later cleanup, not a live pipeline.
 
    _Widened-behavior ledger (recorded per the step-1 review — tracked
    decisions, not accidents of superset adoption):_

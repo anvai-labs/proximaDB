@@ -29,6 +29,13 @@
 //! properties, UNION, UNWIND, FOREACH, CALL, COUNT(n),
 //! COUNT(DISTINCT n.name) (DISTINCT takes exactly one bare identifier).
 //!
+//! Post-step-3 note: the modality side of every entry is now produced
+//! by the CONVERSION layer (the retired grammar is gone) — the M: lines
+//! freeze the conversion's output, and new entries added after step 3
+//! (e.g. read_path_chain, a seam-only widening the retired grammar
+//! rejected) pin the NEW both-entry surface rather than a retired
+//! freeze. The __anon→_anon rename caveat lives in seam_conversion.rs
+//! (`variable()` maps by prefix; user vars named `__anon_*` are renamed).
 //! Coverage note: entries are the BOTH-grammar intersection (full input
 //! consumed on both sides — the seam parser does NOT require eof, so an
 //! `Ok` with stranded remainder is a REJECTION here). The corpus does

@@ -83,16 +83,18 @@ fn convert_match_pattern(
     pattern: seam::MatchPattern,
     optional: bool,
 ) -> crate::query_ast::CompiledPattern {
-    let mut id_by_var: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    // Occurrence-ordered ids: the retired parser wired each edge to the
+    // ids of the ADJACENT node occurrences — same-variable endpoints
+    // (`()-[:X]->()`, `(a)-[:X]->(a)`) are DIFFERENT occurrences with
+    // DIFFERENT ids. A name-keyed map would collapse them (review F1).
+    let mut occurrence_ids: Vec<(String, String)> = Vec::new();
     let nodes: Vec<PatternNode> = pattern
         .nodes
         .into_iter()
         .map(|n| {
             let var = variable(&n.variable);
-            // Mint first, then record for the edge join below (the
-            // retired parser wired edge.from/to to these ids).
             let id = format!("{}_{}", var, Uuid::new_v4());
-            id_by_var.insert(var.clone(), id.clone());
+            occurrence_ids.push((var.clone(), id.clone()));
             PatternNode {
                 id,
                 variable: var,
@@ -107,6 +109,9 @@ fn convert_match_pattern(
             }
         })
         .collect();
+    let mut from_cursors: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    let mut to_cursors: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     let edges: Vec<PatternEdge> = pattern
         .edges
         .into_iter()
@@ -117,17 +122,11 @@ fn convert_match_pattern(
                 variable: e.variable.map(|v| variable(&v)),
                 from_variable: from_var.clone(),
                 to_variable: to_var.clone(),
-                // Wire edges to the MINTED node ids of this pattern
-                // (the retired parser's join: edge.from == the source
-                // node's id; review M3 caught fresh-uuid minting here).
-                from: id_by_var
-                    .get(&from_var)
-                    .cloned()
-                    .unwrap_or_else(|| format!("{}_{}", from_var, Uuid::new_v4())),
-                to: id_by_var
-                    .get(&to_var)
-                    .cloned()
-                    .unwrap_or_else(|| format!("{}_{}", to_var, Uuid::new_v4())),
+                // Wire edges to the MINTED node-OCCURRENCE ids (the
+                // retired parser's adjacent-occurrence join; cursors so
+                // same-variable endpoints resolve to distinct ids).
+                from: occurrence_take(&mut from_cursors, &occurrence_ids, &from_var),
+                to: occurrence_take(&mut to_cursors, &occurrence_ids, &to_var),
                 label: e.edge_types.first().cloned(),
                 edge_types: e.edge_types,
                 direction: edge_direction(e.direction),
@@ -148,6 +147,25 @@ fn convert_match_pattern(
         where_clauses: vec![],
         with_clauses: vec![],
     }
+}
+
+/// Resolve an edge endpoint to the id of its NEXT node occurrence in the
+/// pattern (occurrence-cursor join — the retired parser wired ADJACENT
+/// occurrences, so same-variable endpoints get distinct ids). Fresh-mints
+/// only for dangling references.
+fn occurrence_take(
+    cursors: &mut std::collections::HashMap<String, usize>,
+    occurrence_ids: &[(String, String)],
+    var: &str,
+) -> String {
+    let cursor = cursors.entry(var.to_string()).or_insert(0);
+    for (idx, (v, id)) in occurrence_ids.iter().enumerate().skip(*cursor) {
+        if v == var {
+            *cursor = idx + 1;
+            return id.clone();
+        }
+    }
+    format!("{}_{}", var, Uuid::new_v4())
 }
 
 fn constraint_to_value(constraint: PropertyConstraint) -> serde_json::Value {
