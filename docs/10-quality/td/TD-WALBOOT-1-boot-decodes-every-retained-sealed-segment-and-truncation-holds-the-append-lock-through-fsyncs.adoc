@@ -47,7 +47,7 @@ trailer at seal time — `[rmp(SummaryData) payload][payload_len u32 LE][magic
 rename — and boot reads it with one suffix read per segment. Mixed-read-safe
 by construction: segments without a trailer (all existing ones) full-decode
 exactly as today; corrupt/overlong trailers fall back to the decode (counted
-in `proximadb_wal_boot_summary_trailer_{hits,misses}_total`); a
+in `proximadb_wal_boot_summary_section_{hits,misses}_total`); a
 trailer-bearing segment would trip an older binary's strict sealed decoder,
 so arming the gate (`PROXIMADB_WAL_SUMMARY_TRAILER`, default ON) raises the
 data format marker to 4 on first write (the OBJECT_SPILL_FORMAT=3 precedent:

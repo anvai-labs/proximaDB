@@ -772,21 +772,44 @@ async fn append_summary_trailer(active_path: &Path, summary: &SegmentSummary) {
         }
     };
     use tokio::io::AsyncWriteExt;
-    let result = async {
-        let mut file = tokio::fs::OpenOptions::new()
+    // Rollback-safe (review round 1): a partial section write or a failed
+    // sync leaves bytes in the active file that the frame decoder would
+    // hard-fail on — the pre-feature format tore gracefully (an incomplete
+    // FRAME header is quarantined). On ANY error the file is rolled back to
+    // its pre-section length so the next seal simply tries again on a clean
+    // frame boundary.
+    let result: Result<u64, (std::io::Error, u64)> = async {
+        let file = tokio::fs::OpenOptions::new()
             .append(true)
             .open(active_path)
-            .await?;
-        file.write_all(&bytes).await?;
-        file.sync_data().await
+            .await
+            .map_err(|err| (err, 0))?;
+        let pre_len = file.metadata().await.map_err(|err| (err, 0))?.len();
+        let mut file = file;
+        let write_result = file.write_all(&bytes).await;
+        match write_result {
+            Ok(()) => file
+                .sync_data()
+                .await
+                .map(|_| pre_len)
+                .map_err(|err| (err, pre_len)),
+            Err(err) => Err((err, pre_len)),
+        }
     }
     .await;
-    if let Err(err) = result {
-        tracing::warn!(
-            segment = %active_path.display(),
-            error = %err,
-            "canonical WAL: summary section not written; boot will decode this segment"
-        );
+    match result {
+        Ok(_) => {}
+        Err((err, pre_len)) => {
+            // Roll the file back: the section bytes must not survive.
+            if let Ok(f) = std::fs::OpenOptions::new().write(true).open(active_path) {
+                let _ = f.set_len(pre_len);
+            }
+            tracing::warn!(
+                segment = %active_path.display(),
+                error = %err,
+                "canonical WAL: summary section write FAILED and was rolled back;                  boot will decode this segment"
+            );
+        }
     }
 }
 
@@ -1359,16 +1382,22 @@ impl FramedTableWalAppender {
             return;
         };
         let sealed_path = sealed_segment_path(&self.path, first_seq);
+        // Odd generation FIRST — the seqlock exists for READERS: an even
+        // generation while the section bytes are visible in the active file
+        // lets a concurrent change-feed poll hard-fail on them (the same
+        // discipline truncate_below follows: odd before touching disk).
+        self.rotations.fetch_add(1, Ordering::SeqCst);
         // TD-WALBOOT-1: the summary section rides inside the segment (one
-        // object, one suffix read at boot). Written while the rotation
-        // seqlock is still even and the append lock is held; the format
-        // marker rises to 4 before the FIRST section a directory sees, so
-        // older binaries refuse the directory instead of failing on the
-        // unfamiliar tail.
+        // object, one suffix read at boot). The format marker rises to 4
+        // (WAL_SECTION_FORMAT) before the FIRST section a directory sees.
         if summary_trailer_enabled() {
             if !self.trailer_format_raised.swap(true, Ordering::SeqCst)
                 && let Some(dir) = self.path.parent()
-                && crate::services::storage_format::raise_data_format(dir, 4).is_err()
+                && crate::services::storage_format::raise_data_format(
+                    dir,
+                    crate::services::storage_format::WAL_SECTION_FORMAT,
+                )
+                .is_err()
             {
                 tracing::warn!(
                     "canonical WAL: could not raise the data format for summary sections;                      skipping them for this process"
@@ -1378,8 +1407,6 @@ impl FramedTableWalAppender {
                 append_summary_trailer(&self.path, &summary).await;
             }
         }
-        // Odd generation: readers that overlap the rename re-read.
-        self.rotations.fetch_add(1, Ordering::SeqCst);
         if let Err(err) = tokio::fs::rename(&self.path, &sealed_path).await {
             self.rotations.fetch_add(1, Ordering::SeqCst);
             tracing::warn!(
@@ -2555,14 +2582,23 @@ mod tests {
                 path.display()
             );
         }
-        // Boot trusts them: summaries match a gate-forced decode (same facts,
-        // recovered without the sections).
         let with_sections = recovered_summaries(&wal_path).await;
-        // SAFETY: nextest runs this test in its own process; no other threads
-        // hold the env. (cargo test's shared process runs these serially.)
-        unsafe { std::env::set_var("PROXIMADB_WAL_SUMMARY_TRAILER", "0") };
+        // Force the decode HONESTLY (review round 1: gating only the write
+        // path left the read path trusting the same sections — a vacuous
+        // X==X comparison): delete every .idx-less section by truncating
+        // each segment to its frames boundary. A fresh re-open then recovers
+        // the same facts by full decode, proving the section payload agrees
+        // with the frames.
+        for entry in std::fs::read_dir(dir.path())? {
+            let path = entry?.path();
+            if path.extension().is_some_and(|e| e == "seg") {
+                let bytes = std::fs::read(&path)?;
+                if let Some((frames, _)) = split_summary_trailer(&bytes) {
+                    std::fs::write(&path, frames)?;
+                }
+            }
+        }
         let decoded = recovered_summaries(&wal_path).await;
-        unsafe { std::env::remove_var("PROXIMADB_WAL_SUMMARY_TRAILER") };
         assert_eq!(with_sections.len(), decoded.len());
         for (section, decode) in with_sections.iter().zip(decoded.iter()) {
             assert_eq!(section.first_seq, decode.first_seq);
@@ -2570,6 +2606,8 @@ mod tests {
             assert_eq!(section.collection_max, decode.collection_max);
             assert_eq!(section.tenants, decode.tenants);
             assert_eq!(section.has_uncollected, decode.has_uncollected);
+            assert_eq!(section.first_branch_seq, decode.first_branch_seq);
+            assert_eq!(section.branched, decode.branched);
         }
         Ok(())
     }
@@ -2599,24 +2637,30 @@ mod tests {
 
     #[tokio::test]
     async fn gate_off_writes_no_sections_and_boots_by_decode() -> Result<()> {
-        // SAFETY: nextest runs tests in isolated processes; set before any
-        // appender exists.
+        // SAFETY: set before any appender exists; RESTORED before return so
+        // a shared-process libtest run (parallel by default — see review
+        // round 1) cannot leak the gate-off state into sibling tests.
         unsafe { std::env::set_var("PROXIMADB_WAL_SUMMARY_TRAILER", "0") };
-        let dir = tempfile::tempdir()?;
-        let wal_path = seal_segments(&dir, 2).await;
-        for entry in std::fs::read_dir(dir.path())? {
-            let path = entry?.path();
-            if path.extension().is_some_and(|e| e == "seg") {
-                let bytes = std::fs::read(&path)?;
-                assert!(
-                    &bytes[bytes.len().saturating_sub(8)..] != SUMMARY_TRAILER_MAGIC,
-                    "gate off must write no sections"
-                );
+        let result = async {
+            let dir = tempfile::tempdir()?;
+            let wal_path = seal_segments(&dir, 2).await;
+            for entry in std::fs::read_dir(dir.path())? {
+                let path = entry?.path();
+                if path.extension().is_some_and(|e| e == "seg") {
+                    let bytes = std::fs::read(&path)?;
+                    assert!(
+                        &bytes[bytes.len().saturating_sub(8)..] != SUMMARY_TRAILER_MAGIC,
+                        "gate off must write no sections"
+                    );
+                }
             }
+            let summaries = recovered_summaries(&wal_path).await;
+            assert_eq!(summaries.len(), 2);
+            Ok::<(), anyhow::Error>(())
         }
-        let summaries = recovered_summaries(&wal_path).await;
-        assert_eq!(summaries.len(), 2);
-        Ok(())
+        .await;
+        unsafe { std::env::remove_var("PROXIMADB_WAL_SUMMARY_TRAILER") };
+        result.map_err(|e| anyhow::anyhow!("{e:#}"))
     }
 
     #[tokio::test]
