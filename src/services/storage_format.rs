@@ -307,10 +307,12 @@ mod tests {
         assert_eq!(ensure_data_format(dir.path())?, 3);
         assert_eq!(raise_data_format(dir.path(), CURRENT_FORMAT)?, 3);
 
-        // A newer one refuses, and is left as it was.
+        // A newer one refuses, and is left as it was. (WAL_SECTION_FORMAT + 1,
+        // not OBJECT_SPILL_FORMAT + 1: format 4 is this binary's readable
+        // ceiling now — the "future" format must exceed it.)
         let newer = format!(
             r#"{{"format":{},"written_by":"future"}}"#,
-            OBJECT_SPILL_FORMAT + 1
+            WAL_SECTION_FORMAT + 1
         );
         std::fs::write(dir.path().join(FORMAT_MARKER), &newer)?;
         let err = ensure_data_format(dir.path()).expect_err("newer format");
