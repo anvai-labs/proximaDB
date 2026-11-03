@@ -7,6 +7,7 @@ use crate::storage::engines::sst::blocks::SstRecord;
 use crate::storage::engines::sst::{
     Compaction, CompactionPriority, CompactionStats, CompactionTask, SstConfig,
 };
+use proximadb_storage_filesystem_types::ObjectAccessTier;
 use serial_test::serial;
 use std::collections::HashMap as StdHashMap;
 use std::path::PathBuf;
@@ -329,6 +330,222 @@ async fn compaction_morsel_admission_rejects_overlapping_inputs() {
         "a different output name must not admit the same input morsel twice"
     );
     assert_eq!(manager.pending_task_count().await, 1);
+}
+
+/// Shared builder for the TD-TIER-1 SC5 tier-adoption tests: a task for one
+/// fixed collection dir whose output file and tier the test overrides.
+fn sc5_tier_task(output: &str, access_tier: Option<ObjectAccessTier>) -> CompactionTask {
+    CompactionTask {
+        collection_object_id: 1,
+        collection_identity: crate::core::stable_id::CollectionIdentity::default(),
+        level: 0,
+        input_files: vec![PathBuf::from(
+            "/nonexistent/proxima_sc5_tier/input_L0_a.pax",
+        )],
+        input_bytes: 0,
+        output_file: PathBuf::from(output),
+        priority: CompactionPriority::Medium,
+        block_size_kb: None,
+        compression_config: None,
+        precision_hint: None,
+        rg_layout: None,
+        vector_quant: None,
+        access_tier,
+    }
+}
+
+/// TD-TIER-1 SC5 (WAL-recovery residual): an enqueue declined by the same-
+/// output dedup must not strand the collection's tier on an UNTIERED task that
+/// owns the work (the recovery-enqueued winner). While the owner is still
+/// queued it adopts the incoming explicit tier, so the output PUT lands with
+/// the collection's current intent.
+#[tokio::test]
+async fn sc5_dedup_decline_adopts_incoming_tier_on_the_queued_owner() {
+    let manager = Compaction::new(SstConfig::default()).await.unwrap();
+    // No start_workers → the owner stays queued, deterministically.
+    assert!(
+        manager
+            .schedule_compaction(sc5_tier_task(
+                "/nonexistent/proxima_sc5_tier/compacted_L1.pax",
+                None
+            ))
+            .await
+            .unwrap()
+    );
+    assert!(
+        !manager
+            .schedule_compaction(sc5_tier_task(
+                "/nonexistent/proxima_sc5_tier/compacted_L1.pax",
+                Some(ObjectAccessTier::Cool)
+            ))
+            .await
+            .unwrap(),
+        "same output file is still deduped"
+    );
+    let queued_tier = {
+        let queue = manager.task_queue.lock().await;
+        assert_eq!(queue.len(), 1, "no second task was enqueued");
+        queue.front().expect("owner task").access_tier
+    };
+    assert_eq!(
+        queued_tier,
+        Some(ObjectAccessTier::Cool),
+        "the queued owner adopted the declined task's tier"
+    );
+    // The dedup snapshot stays consistent with the queued task.
+    let active_tier = {
+        let active = manager.active_compactions.read().await;
+        active
+            .get("/nonexistent/proxima_sc5_tier/compacted_L1.pax")
+            .expect("active marker for the owner")
+            .access_tier
+    };
+    assert_eq!(active_tier, Some(ObjectAccessTier::Cool));
+}
+
+/// The input-overlap dedup rule adopts the tier too: a declined task sharing
+/// an input file upgrades the morsel that owns that input.
+#[tokio::test]
+async fn sc5_dedup_decline_adopts_tier_across_input_overlap() {
+    let manager = Compaction::new(SstConfig::default()).await.unwrap();
+    assert!(
+        manager
+            .schedule_compaction(sc5_tier_task(
+                "/nonexistent/proxima_sc5_tier/out_one.pax",
+                None
+            ))
+            .await
+            .unwrap()
+    );
+    let mut overlapping = sc5_tier_task(
+        "/nonexistent/proxima_sc5_tier/out_two.pax",
+        Some(ObjectAccessTier::Cold),
+    );
+    overlapping.input_files = vec![
+        PathBuf::from("/nonexistent/proxima_sc5_tier/input_L0_a.pax"),
+        PathBuf::from("/nonexistent/proxima_sc5_tier/input_L0_b.pax"),
+    ];
+    assert!(
+        !manager.schedule_compaction(overlapping).await.unwrap(),
+        "shared input file is still rejected"
+    );
+    let queued_tier = {
+        let queue = manager.task_queue.lock().await;
+        assert_eq!(queue.len(), 1);
+        queue.front().expect("owner task").access_tier
+    };
+    assert_eq!(queued_tier, Some(ObjectAccessTier::Cold));
+}
+
+/// An incoming `None` (collection record unresolved — e.g. a recovery flush
+/// that fell back to the minimal config) must never ERASE a resolved tier.
+#[tokio::test]
+async fn sc5_dedup_decline_without_tier_leaves_a_resolved_tier_intact() {
+    let manager = Compaction::new(SstConfig::default()).await.unwrap();
+    assert!(
+        manager
+            .schedule_compaction(sc5_tier_task(
+                "/nonexistent/proxima_sc5_tier/compacted_L1.pax",
+                Some(ObjectAccessTier::Cool)
+            ))
+            .await
+            .unwrap()
+    );
+    assert!(
+        !manager
+            .schedule_compaction(sc5_tier_task(
+                "/nonexistent/proxima_sc5_tier/compacted_L1.pax",
+                None
+            ))
+            .await
+            .unwrap()
+    );
+    let queued_tier = {
+        let queue = manager.task_queue.lock().await;
+        queue.front().expect("owner task").access_tier
+    };
+    assert_eq!(queued_tier, Some(ObjectAccessTier::Cool));
+}
+
+/// A tier CHANGE reaches a queued-but-unstarted owner: the output PUT has not
+/// happened, so the latest collection intent wins. (An in-flight task keeps
+/// its tier — see the popped-owner test below.)
+#[tokio::test]
+async fn sc5_dedup_decline_adopts_a_changed_tier_while_queued() {
+    let manager = Compaction::new(SstConfig::default()).await.unwrap();
+    assert!(
+        manager
+            .schedule_compaction(sc5_tier_task(
+                "/nonexistent/proxima_sc5_tier/compacted_L1.pax",
+                Some(ObjectAccessTier::Cool)
+            ))
+            .await
+            .unwrap()
+    );
+    assert!(
+        !manager
+            .schedule_compaction(sc5_tier_task(
+                "/nonexistent/proxima_sc5_tier/compacted_L1.pax",
+                Some(ObjectAccessTier::Hot)
+            ))
+            .await
+            .unwrap()
+    );
+    let queued_tier = {
+        let queue = manager.task_queue.lock().await;
+        queue.front().expect("owner task").access_tier
+    };
+    assert_eq!(queued_tier, Some(ObjectAccessTier::Hot));
+}
+
+/// A task already popped by a worker is in flight: the decline must be a
+/// no-op (no retrofit, no requeue) — a tier change applies from the next
+/// enqueue for in-flight work.
+#[tokio::test]
+async fn sc5_popped_owner_keeps_its_tier_and_is_not_retrofitted() {
+    let manager = Compaction::new(SstConfig::default()).await.unwrap();
+    assert!(
+        manager
+            .schedule_compaction(sc5_tier_task(
+                "/nonexistent/proxima_sc5_tier/compacted_L1.pax",
+                None
+            ))
+            .await
+            .unwrap()
+    );
+    // Simulate the worker taking the task (the real pop is under this same
+    // lock, so this is the exact interleaving the adoption must survive).
+    {
+        let mut queue = manager.task_queue.lock().await;
+        let popped = queue.pop_front();
+        assert!(popped.is_some());
+    }
+    assert!(
+        !manager
+            .schedule_compaction(sc5_tier_task(
+                "/nonexistent/proxima_sc5_tier/compacted_L1.pax",
+                Some(ObjectAccessTier::Cool)
+            ))
+            .await
+            .unwrap(),
+        "the active marker still dedupes the popped task's output"
+    );
+    assert_eq!(
+        manager.pending_task_count().await,
+        0,
+        "nothing was requeued for the in-flight task"
+    );
+    let active_tier = {
+        let active = manager.active_compactions.read().await;
+        active
+            .get("/nonexistent/proxima_sc5_tier/compacted_L1.pax")
+            .expect("active marker still present until the worker finishes")
+            .access_tier
+    };
+    assert_eq!(
+        active_tier, None,
+        "the in-flight task's tier was not retrofitted"
+    );
 }
 
 /// TD-COMPACT-6 (ADR-076 D1): on the async path the flush caller sets the
