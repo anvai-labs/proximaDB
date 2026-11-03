@@ -1,0 +1,34 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-MVCCRES-1: MvccResolver uses a third ordering (effective_version then created_at_ns) that the memtable does not
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open** (filed 2026-11-03, split from TD-MEMTABLE-MVCC-1 residual (c)).
+| Priority | **MEDIUM**: compaction and multi-tier dedup resolve versions by a rule that disagrees with the serving path — compaction can promote a version that the memtable/read path would not have chosen.
+| Component | `crates/horizontal/proximadb-mvcc-resolution/src/mvcc_resolution.rs` (`compare_records` at :229, `effective_version` at :253).
+| Relates | TD-MEMTABLE-MVCC-1 (the parent TD; its residual (c)).
+|===
+
+== Problem
+
+`MvccResolver::compare_records` orders by `(effective_version, created_at_ns <=)`. The memtable's `mvcc_is_newer` orders by `(updated_at_ns, tombstone-wins-exact-tie, record_version, batch_seq)`. These disagree on:
+- Which timestamp: `created_at_ns` vs `updated_at_ns`
+- Version handling: `effective_version` (0→1) vs raw `record_version`
+- Tombstone: no tombstone rule in MvccResolver
+
+== Callers (all in the compaction/dedup path)
+
+- `src/storage/engines/sst/compactor_impl.rs`
+- `src/storage/engines/sst/compaction_spill.rs`
+- `src/storage/engines/sst/compaction.rs`
+- `src/core/search/multi_tier_deduplication.rs`
+
+== Fix direction
+
+**Architectural decision needed**: align `MvccResolver` with the serving path's rule, or retire it and have its callers use the memtable comparator. Aligning changes compaction behavior (which version survives a merge); retiring changes the compaction API. Both need benchmark evidence that compaction output doesn't regress recall.
+
+== Scope note from the filing session
+
+This was residual (c) on TD-MEMTABLE-MVCC-1. It has real production callers in the compaction path — this is NOT dead code. Changing the ordering changes which version compaction promotes, so it needs benchmark evidence, not just a comparator swap.
