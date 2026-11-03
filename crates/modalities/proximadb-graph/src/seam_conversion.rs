@@ -83,13 +83,18 @@ fn convert_match_pattern(
     pattern: seam::MatchPattern,
     optional: bool,
 ) -> crate::query_ast::CompiledPattern {
+    let mut id_by_var: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     let nodes: Vec<PatternNode> = pattern
         .nodes
         .into_iter()
         .map(|n| {
             let var = variable(&n.variable);
+            // Mint first, then record for the edge join below (the
+            // retired parser wired edge.from/to to these ids).
+            let id = format!("{}_{}", var, Uuid::new_v4());
+            id_by_var.insert(var.clone(), id.clone());
             PatternNode {
-                id: format!("{}_{}", var, Uuid::new_v4()),
+                id,
                 variable: var,
                 labels: n.labels.clone(),
                 label: n.labels.first().cloned(),
@@ -112,10 +117,17 @@ fn convert_match_pattern(
                 variable: e.variable.map(|v| variable(&v)),
                 from_variable: from_var.clone(),
                 to_variable: to_var.clone(),
-                // The retired parser wired edges to the MINTED node ids
-                // (same "{var}_{uuid}" scheme, minted per node above).
-                from: format!("{}_{}", from_var, Uuid::new_v4()),
-                to: format!("{}_{}", to_var, Uuid::new_v4()),
+                // Wire edges to the MINTED node ids of this pattern
+                // (the retired parser's join: edge.from == the source
+                // node's id; review M3 caught fresh-uuid minting here).
+                from: id_by_var
+                    .get(&from_var)
+                    .cloned()
+                    .unwrap_or_else(|| format!("{}_{}", from_var, Uuid::new_v4())),
+                to: id_by_var
+                    .get(&to_var)
+                    .cloned()
+                    .unwrap_or_else(|| format!("{}_{}", to_var, Uuid::new_v4())),
                 label: e.edge_types.first().cloned(),
                 edge_types: e.edge_types,
                 direction: edge_direction(e.direction),
@@ -331,7 +343,11 @@ fn with_clause(clause: seam::WithClause) -> WithClause {
             .collect(),
         distinct: clause.distinct,
         where_clause: clause.where_clause.map(where_clause),
-        order_by: clause.order_by.into_iter().map(|(var, _asc)| var).collect(),
+        order_by: clause
+            .order_by
+            .into_iter()
+            .map(|(var, asc)| format!("{}{}", var, if asc { " ASC" } else { " DESC" }))
+            .collect(),
         limit: clause.limit,
         skip: clause.skip,
     }

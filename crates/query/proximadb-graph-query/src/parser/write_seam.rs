@@ -421,18 +421,25 @@ pub fn parse_cypher_query(input: &str) -> IResult<&str, CypherQuery> {
             many0(preceded(
                 multispace0,
                 alt((
-                    // OPTIONAL MATCH
-                    map(parse_optional_match_clause, |(nodes, edges)| {
-                        ReadingClause::Match {
+                    // OPTIONAL MATCH (with its WHERE — the retired
+                    // modality grammar attached WHERE after BOTH arms;
+                    // review M1: omitting it silently REJECTED
+                    // `OPTIONAL MATCH ... WHERE ...`)
+                    map(
+                        tuple((
+                            parse_optional_match_clause,
+                            opt(preceded(multispace1, parse_where_clause)),
+                        )),
+                        |((nodes, edges), where_opt)| ReadingClause::Match {
                             pattern: MatchPattern {
                                 nodes,
                                 edges,
                                 paths: Vec::new(),
-                                where_clause: None,
+                                where_clause: where_opt,
                             },
                             optional: true,
-                        }
-                    }),
+                        },
+                    ),
                     // Regular MATCH with optional WHERE
                     map(
                         tuple((

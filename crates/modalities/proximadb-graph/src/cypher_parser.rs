@@ -2053,10 +2053,10 @@ mod tests {
     fn test_lexer_numbers() {
         let mut lexer = CypherLexer::new();
         let tokens = lexer
-            .tokenize("42 3.14 -5")
+            .tokenize("42 2.5 -5")
             .expect("lexer should tokenize numbers");
         assert!(matches!(tokens[0].token, Token::Integer(42)));
-        assert!(matches!(tokens[1].token, Token::Float(f) if (f - 3.14).abs() < 0.001));
+        assert!(matches!(tokens[1].token, Token::Float(f) if (f - 2.5).abs() < 1e-9));
         assert!(matches!(tokens[2].token, Token::Integer(-5)));
     }
 
