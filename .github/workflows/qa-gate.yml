@@ -372,6 +372,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: "v1-objstore-qa-tier"
+      - name: Install nextest
+        uses: taiki-e/install-action@nextest
       - uses: mozilla-actions/sccache-action@v0.0.11
       - uses: actions/cache@v6
         with:

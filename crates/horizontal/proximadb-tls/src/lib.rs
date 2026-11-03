@@ -57,6 +57,18 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::info;
 
+/// Select ProximaDB's default TLS provider when the host has not selected one.
+///
+/// Library and embedded callers do not run the server's startup path. Cloud
+/// SDKs may construct rustls clients with both provider features enabled, where
+/// automatic selection panics. An installed host provider is never
+/// replaced. Concurrent initialization honors the first successful selection.
+pub fn ensure_crypto_provider() {
+    if rustls::crypto::CryptoProvider::get_default().is_none() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    }
+}
+
 /// TLS configuration for ProximaDB
 #[derive(Debug, Clone, Default)]
 pub struct TlsConfig {
@@ -156,8 +168,7 @@ impl TlsConfig {
 
     /// Build rustls ServerConfig for the server
     pub async fn build_server_config(&self) -> Result<Arc<ServerConfig>> {
-        // rustls 0.23 requires a process-default CryptoProvider before builder(); idempotent.
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        ensure_crypto_provider();
         let (cert_path, key_path) = self
             .get_certificate_paths()
             .ok_or_else(|| anyhow::anyhow!("No certificate paths configured"))?;
@@ -345,6 +356,34 @@ fn asn1_time_to_system_time(
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn crypto_provider_initialization_enables_client_config_without_server_startup() {
+        ensure_crypto_provider();
+        let provider = rustls::crypto::CryptoProvider::get_default().expect("installed provider");
+        let config = rustls::ClientConfig::builder()
+            .with_root_certificates(rustls::RootCertStore::empty())
+            .with_no_client_auth();
+        assert!(Arc::ptr_eq(config.crypto_provider(), provider));
+    }
+
+    #[test]
+    fn crypto_provider_initialization_preserves_host_selection() {
+        let mut host = rustls::crypto::aws_lc_rs::default_provider();
+        host.cipher_suites.reverse();
+        // Nextest isolates this test. Under libtest another test may already
+        // have selected the provider, which must be preserved just as well.
+        let _ = host.install_default();
+        let before = rustls::crypto::CryptoProvider::get_default()
+            .expect("host provider")
+            .clone();
+        ensure_crypto_provider();
+        ensure_crypto_provider();
+        assert!(Arc::ptr_eq(
+            &before,
+            rustls::crypto::CryptoProvider::get_default().expect("retained provider")
+        ));
+    }
 
     #[test]
     fn test_tls_config_default() {
