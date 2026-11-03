@@ -67,3 +67,48 @@ def test_v1_plain_fallback_still_works(monkeypatch):
     )
     assert out == {"raw_points": [], "total_points": 0}
     repo.query.assert_called_once()
+
+
+def test_v1_ingest_reentry_guard(monkeypatch):
+    """Round-2 F2: the repository's ingest calls BACK into the client —
+    the identical cycle shape. The guard must break it (previously a
+    ~330-deep recursion swallowed into {'success': True, ...})."""
+    adapter = MagicMock()
+    adapter.protocol_name = "embedded"
+    adapter.ingest_timeseries = None  # dispatch fails -> fallback
+
+    with (
+        patch.object(uc.ProximaDBClient, "_create_adapter", return_value=adapter),
+        patch.object(uc.ProximaDBClient, "_get_rest_adapter", return_value=None),
+    ):
+        c = ProximaDBClient(protocol=Protocol.EMBEDDED, data_dir="/tmp/x")
+
+    repo = MagicMock()
+    # The repository's ingest re-calls the client (the cycle):
+    repo.ingest.side_effect = lambda cid, pts: c.ingest_timeseries(cid, pts)
+    monkeypatch.setattr(c, "_get_timeseries_repository", lambda: repo)
+
+    with pytest.raises(ProximaDBError, match="re-entered the client"):
+        c.ingest_timeseries("tscoll001", [{"timestamp": "t1"}])
+
+
+def test_v1_create_reentry_guard(monkeypatch):
+    """Round-2 F2: create_timeseries_collection has the same cycle."""
+    adapter = MagicMock()
+    adapter.protocol_name = "embedded"
+    adapter.create_timeseries_collection = None
+
+    with (
+        patch.object(uc.ProximaDBClient, "_create_adapter", return_value=adapter),
+        patch.object(uc.ProximaDBClient, "_get_rest_adapter", return_value=None),
+    ):
+        c = ProximaDBClient(protocol=Protocol.EMBEDDED, data_dir="/tmp/x")
+
+    repo = MagicMock()
+    repo.create_collection.side_effect = lambda cfg: c.create_timeseries_collection(
+        cfg.name
+    )
+    monkeypatch.setattr(c, "_get_timeseries_repository", lambda: repo)
+
+    with pytest.raises(ProximaDBError, match="re-entered the client"):
+        c.create_timeseries_collection("tscoll001")

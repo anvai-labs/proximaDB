@@ -1166,7 +1166,9 @@ class RestProtocolAdapter(SyncGraphDelegations, BaseProtocolAdapter):
         server's query body declares only the window and limit, and
         drops unknown fields) — passing any of them raises
         NotImplementedError here rather than silently shipping ignored
-        keys. The EMBEDDED adapter honors all three.
+        keys. The EMBEDDED adapter honors ``tag_filters`` only —
+        ``aggregation``/``bucket_ms`` raise there too (the engine has no
+        timeseries surface; TD-EMB-1).
         """
         from .._generated.rest.api.timeseries.query_timeseries import sync_detailed
         from .._generated.rest.models.ts_query_request import TsQueryRequest

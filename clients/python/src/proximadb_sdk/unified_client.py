@@ -118,6 +118,50 @@ def _is_connection_error(error: Exception) -> bool:
     return any(marker in msg for marker in _CONNECTION_ERROR_MARKERS)
 
 
+class _TimeseriesRepoReentryGuard:
+    """Per-thread guard around v1's timeseries repository fallbacks.
+
+    The repository (``timeseries.py``) wraps the SAME client object and
+    calls back into its public methods, so falling back to it from a failed
+    dispatch is an unbounded cycle (TD-EMB-1 review F1; ingest/create have
+    the identical pair-of-methods shape). The repository's blanket catches
+    re-raise sentinel-carrying errors instead of converting them into
+    empty success dicts.
+    """
+
+    def __init__(self, client: "ProximaDBClient"):
+        self._client = client
+
+    def __enter__(self):
+        import threading
+
+        try:
+            state = self._client._ts_repo_fallback
+        except AttributeError:
+            state = self._client._ts_repo_fallback = threading.local()
+        self._state = state
+        if getattr(state, "in_progress", False):
+            raise _timeseries_reentry_error("timeseries")
+        state.in_progress = True
+        return self
+
+    def __exit__(self, *exc):
+        self._state.in_progress = False
+        return False
+
+
+def _timeseries_reentry_error(op: str) -> ProximaDBError:
+    err = ProximaDBError(
+        f"{op} dispatch failed and the local repository re-entered the "
+        "client (a capability gap the fallback cannot serve — e.g. embedded "
+        "aggregation; TD-EMB-1)"
+    )
+    # Sentinel: the repository's blanket catches must re-raise this
+    # (falling through would return an empty success-shaped dict).
+    err._timeseries_reentry = True  # noqa: SLF001
+    return err
+
+
 class ProximaDBClient:
     """
     Unified ProximaDB Python Client
@@ -2196,9 +2240,13 @@ class ProximaDBClient:
 
         from .timeseries import TimeSeriesCollectionConfig
 
-        collection_id = self._get_timeseries_repository().create_collection(
-            TimeSeriesCollectionConfig(name=name, **(config or {}))
-        )
+        # Same re-entry guard (review round-2 F2: repo.create_collection
+        # calls back into this method; the cycle raised a multiply-wrapped
+        # chained error after a recursion flood).
+        with _TimeseriesRepoReentryGuard(self):
+            collection_id = self._get_timeseries_repository().create_collection(
+                TimeSeriesCollectionConfig(name=name, **(config or {}))
+            )
         return {"success": True, "collection_id": collection_id}
 
     def ingest_timeseries(
@@ -2214,7 +2262,11 @@ class ProximaDBClient:
         if adapter_result is not None:
             return adapter_result
 
-        return self._get_timeseries_repository().ingest(collection_name, points)
+        # Same re-entry guard as query (review round-2 F2: the repository's
+        # ingest calls BACK into this method — the identical cycle shape,
+        # previously swallowed into {'success': True, ...} local dicts).
+        with _TimeseriesRepoReentryGuard(self):
+            return self._get_timeseries_repository().ingest(collection_name, points)
 
     def query_timeseries(
         self,
@@ -2244,19 +2296,18 @@ class ProximaDBClient:
         # calls BACK into this client method (timeseries.py wraps us) —
         # falling back to it from a failed dispatch is an infinite loop
         # (~330-deep recursion swallowed into an empty success-shaped
-        # dict). Track in-flight repository fallbacks per client and
+        # dict). Track in-flight repository fallbacks per THREAD (two
+        # threads sharing a client must not trip each other's guard) and
         # raise a clear error instead of cycling.
-        if getattr(self, "_in_timeseries_repo_fallback", False):
-            err = ProximaDBError(
-                "query_timeseries dispatch failed and the local repository "
-                "re-entered the client (a capability gap the fallback "
-                "cannot serve — e.g. embedded aggregation; TD-EMB-1)"
-            )
-            # Sentinel: the repository's blanket catch must re-raise this
-            # (falling through would return an empty success-shaped dict).
-            err._timeseries_reentry = True  # noqa: SLF001
-            raise err
-        self._in_timeseries_repo_fallback = True
+        import threading
+
+        try:
+            self._ts_repo_fallback
+        except AttributeError:
+            self._ts_repo_fallback = threading.local()
+        if getattr(self._ts_repo_fallback, "in_progress", False):
+            raise _timeseries_reentry_error("query_timeseries")
+        self._ts_repo_fallback.in_progress = True
         try:
             response = self._get_timeseries_repository().query(
                 collection_id=collection_name,
@@ -2268,7 +2319,7 @@ class ProximaDBClient:
                 limit=kwargs.get("limit", 1000),
             )
         finally:
-            self._in_timeseries_repo_fallback = False
+            self._ts_repo_fallback.in_progress = False
         return response.to_dict()
 
     def list_timeseries_collections(self, **kwargs) -> list[dict[str, Any]]:
