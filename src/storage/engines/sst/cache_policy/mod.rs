@@ -6,5 +6,7 @@
 //! region groups on the [`PersistentByteStore`]) to the resolved policy.
 
 pub mod registry;
+pub mod residency;
 
 pub use registry::{CachePolicyRegistry, cache_properties_of};
+pub use residency::{region_group_resident, seed_region_group};

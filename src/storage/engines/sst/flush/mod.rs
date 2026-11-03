@@ -805,6 +805,12 @@ impl SstEngine {
 
         let final_file_path = format!("{}/{}", atomic_op.final_url, filename);
 
+        // TD-COMPACT-2b: capture the region extents before the seed's move.
+        let (index_bytes, sq8_bytes) = match &pax_cache_seed {
+            Some(seed) => (Some(seed.rabitq_bytes.clone()), seed.sq8_bytes.clone()),
+            None => (None, None),
+        };
+
         if let Some(seed) = pax_cache_seed {
             crate::storage::engines::sst::segment_format::install_pax_cache_seed(
                 &final_file_path,
@@ -822,9 +828,29 @@ impl SstEngine {
         // leaves coverage partial.
         if let Ok(final_fs) = self.filesystem().get_filesystem(&final_file_path) {
             crate::storage::engines::sst::segment_io::spawn_warm_object(
-                final_fs,
+                final_fs.clone(),
                 final_file_path.clone(),
             );
+            // TD-COMPACT-2b: warm the pinned region groups from the
+            // captured extents (the seed was consumed by install above).
+            if let Some(bytes) = index_bytes {
+                let path = final_file_path.clone();
+                tokio::spawn(async move {
+                    let _ = crate::storage::engines::sst::cache_policy::seed_region_group(
+                        "index", &path, bytes,
+                    )
+                    .await;
+                });
+            }
+            if let Some(bytes) = sq8_bytes {
+                let path = final_file_path.clone();
+                tokio::spawn(async move {
+                    let _ = crate::storage::engines::sst::cache_policy::seed_region_group(
+                        "rerank", &path, bytes,
+                    )
+                    .await;
+                });
+            }
         }
 
         if already_materialized {

@@ -1624,7 +1624,9 @@ impl ProtectionPolicy {
         // the object is resident — a region miss is served from the resident
         // object with no GET — and charging both made whole-object coverage
         // unfittable in a grant sized to the collection.
-        if self.groups.is_empty() || !key.starts_with(OBJECT_KEY_PREFIX) {
+        if self.groups.is_empty()
+            || (!key.starts_with(OBJECT_KEY_PREFIX) && !key.starts_with(REGION_KEY_PREFIX))
+        {
             return None;
         }
         self.groups.values().find(|group| {
@@ -1658,22 +1660,38 @@ fn stored_len(key: &str, value_len: u64) -> u64 {
         .saturating_add(value_len)
 }
 
+/// TD-COMPACT-2b: the persistent-L2 key prefix for a REGION-GROUP extent
+/// entry. Unlike [`OBJECT_KEY_PREFIX`] (whole objects), these hold only the
+/// byte ranges of one region group (control, Region A, Region B, etc.) of a
+/// specific segment — the granularity the cache-policy pins.
+const REGION_KEY_PREFIX: &str = "pax-region-v1/";
+
+/// The persistent-L2 key holding a region-group extent of a segment, keyed
+/// by the group name and the segment path (TD-COMPACT-2b). Example:
+/// `pax-region-v1/index/{canonical_path}`.
+pub fn region_key(group: &str, path: &str) -> String {
+    format!("{REGION_KEY_PREFIX}{group}/{}", canonical_location(path))
+}
+
 /// Prefix of every whole-object key ([`object_key`]).
 // Version the disposable key namespace: old keys collapsed distinct cloud
 // objects. Never reuse those bytes under the corrected identity contract.
 const OBJECT_KEY_PREFIX: &str = "pax-object-v2/";
 
 fn protection_prefix_matches(key: &str, prefix: &str) -> bool {
-    let Some(location) = key.strip_prefix(OBJECT_KEY_PREFIX) else {
-        return false;
-    };
-    if prefix.ends_with('/') {
-        location.starts_with(prefix)
-    } else {
-        location
-            .strip_prefix(prefix)
-            .is_some_and(|tail| tail.starts_with('/'))
-    }
+    // Strip whichever key form this is, then prefix-match the remaining
+    // canonical location path (TD-COMPACT-2b: region keys carry an extra
+    // `{group}/` segment between the prefix and the location).
+    let location = key
+        .strip_prefix(OBJECT_KEY_PREFIX)
+        .or_else(|| {
+            key.strip_prefix(REGION_KEY_PREFIX).and_then(|rest| {
+                // Skip the {group}/ segment to get to the canonical location.
+                rest.find('/').map(|i| &rest[i + 1..])
+            })
+        })
+        .unwrap_or(key);
+    location.starts_with(prefix.strip_suffix('/').unwrap_or(prefix))
 }
 
 /// Normalize only documented backend scheme aliases and absolute local URLs.
