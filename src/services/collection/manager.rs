@@ -2485,6 +2485,16 @@ impl CollectionService {
                         existing_config,
                     ) == crate::proto::proximadb_v1::StorageClass::Performance
                 {
+                    // The reroute sheds the old grant and re-reserves into
+                    // the NEW pool — gate it on that pool's headroom BEFORE
+                    // the config persists (the pool-only path runs no class
+                    // peek): a full target pool must refuse the update, not
+                    // leave the collection grant-less post-persist.
+                    if let Some(registry) = &self.reservations {
+                        registry
+                            .peek_performance_admission(new_config.pool_id.as_deref())
+                            .await?;
+                    }
                     existing_config.pool_id = new_config.pool_id.clone();
                     performance_pool_id = existing_config.pool_id.clone();
                     policy_side_effect = Some(true);
@@ -2624,13 +2634,24 @@ impl CollectionService {
                 .filter(|owner| !owner.is_empty());
             let now = chrono::Utc::now().timestamp();
             if to_performance {
-                let tenant = owner.unwrap_or_else(|| Self::DEFAULT_VERSION_TENANT.to_string());
+                let tenant = owner
+                    .clone()
+                    .unwrap_or_else(|| Self::DEFAULT_VERSION_TENANT.to_string());
                 if pool_reroute {
                     // The old grant may live in ANY pool: release everywhere
                     // (idempotent) so the re-reserve lands in the new pool
-                    // without double-charging capacity.
+                    // without double-charging capacity. The grant's ledger key
+                    // is the CREATE-time version_tenant, which can diverge from
+                    // the owner recorded later — release BOTH keys like the
+                    // delete path does (a single-key release would leave the
+                    // old grant live: double charge, double billing).
+                    if let Some(owner) = owner.as_deref() {
+                        registry
+                            .release_for_collection(owner, &collection_id, now)
+                            .await;
+                    }
                     registry
-                        .release_for_collection(&tenant, &collection_id, now)
+                        .release_for_collection(Self::DEFAULT_VERSION_TENANT, &collection_id, now)
                         .await;
                 }
                 // SC4-2: protection prefixes from the record's own storage

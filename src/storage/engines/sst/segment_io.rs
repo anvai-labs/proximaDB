@@ -394,21 +394,27 @@ pub async fn warm_object(
             if let Some(budget) = &budget {
                 budget.pace(chunk).await;
             }
-            let bytes = {
+            // The chunk buffer lives INSIDE the permit (review SF2): one
+            // WARMS_IN_FLIGHT permit ⇒ at most one 64 MiB buffer held per
+            // warm across the process — the write included. Pacing stays
+            // before the permit, so a budgeted pool still never pins permits
+            // while sleeping.
+            {
                 let _chunk_permit = warm_permits()
                     .acquire()
                     .await
                     .map_err(|error| anyhow::anyhow!("warm permit for {path}: {error}"))?;
-                fs.read_range(path, offset, chunk)
+                let bytes = fs
+                    .read_range(path, offset, chunk)
                     .await
-                    .map_err(|error| anyhow::anyhow!("warm read {path}@{offset}: {error}"))?
+                    .map_err(|error| anyhow::anyhow!("warm read {path}@{offset}: {error}"))?;
+                if bytes.len() as u64 != chunk {
+                    anyhow::bail!("warm read {path}@{offset}: short read");
+                }
+                out.write_all(&bytes)
+                    .await
+                    .map_err(|error| anyhow::anyhow!("warm stage {path}: {error}"))?;
             };
-            if bytes.len() as u64 != chunk {
-                anyhow::bail!("warm read {path}@{offset}: short read");
-            }
-            out.write_all(&bytes)
-                .await
-                .map_err(|error| anyhow::anyhow!("warm stage {path}: {error}"))?;
             offset += chunk;
         }
         out.flush()

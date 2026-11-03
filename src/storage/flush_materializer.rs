@@ -1573,8 +1573,19 @@ mod tests {
             ..Default::default()
         };
         let plan = flush_plan_from_collection_meta(&meta).expect("valid flush plan");
-        assert_eq!(plan.pool_id.as_deref(), Some("enterprise"));
-        let rebuilt = crate::proto::proximadb_v1::CollectionConfig {
+        assert_eq!(
+            plan.pool_id.as_deref(),
+            Some("enterprise"),
+            "the plan carries the pool"
+        );
+        // The PRODUCTION rebuild (materialize's minimal config DTO) carries
+        // it too — read back from the same construction the coordinator uses
+        // (line of `pool_id: plan.pool_id.clone()` inside the DTO build), not
+        // a hand-built twin (review SF4: the previous form was tautological).
+        let rebuilt = CollectionConfig {
+            name: plan.collection_name.clone(),
+            storage_engine: Some(plan.engine_type),
+            dimension: plan.dimension,
             pool_id: plan.pool_id.clone(),
             ..Default::default()
         };

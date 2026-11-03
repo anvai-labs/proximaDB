@@ -221,17 +221,9 @@ pub fn validate_pool_configs(pools: &[ReservationPoolConfig]) -> anyhow::Result<
                 pool.id
             );
         }
-        if pool.idle_reclaim_secs > 0
-            && pool.idle_reclaim_min_lifetime_secs > pool.idle_reclaim_secs
-        {
-            anyhow::bail!(
-                "reservation pool '{}' idle_reclaim_min_lifetime_secs ({}) exceeds \
-                 idle_reclaim_secs ({}) — the TTL could never fire",
-                pool.id,
-                pool.idle_reclaim_min_lifetime_secs,
-                pool.idle_reclaim_secs
-            );
-        }
+        // NOTE: min_lifetime > idle_reclaim_secs is COHERENT (a grant ages
+        // past the floor and then idles past the TTL — the sweep checks both),
+        // so no cross-check here; an earlier guard wrongly refused those.
     }
     let defaults = pools.iter().filter(|p| p.is_default).count();
     if defaults > 1 {
