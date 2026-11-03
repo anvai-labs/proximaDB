@@ -1215,10 +1215,11 @@ impl VectorOperationsService {
         for (index, record) in records.iter().enumerate() {
             let newer = match latest.get(&record.oid).and_then(|&kept| records.get(kept)) {
                 Some(kept) => {
-                    // Same rule as read.rs::is_fresher (timestamp-first) —
-                    // matches the memtable's mvcc_is_newer on the first two
-                    // components. The >= was >= on (version, ts) before; now
-                    // > on (ts, version) matching every other surface.
+                    // Same rule as read.rs::is_fresher (timestamp-first).
+                    // NOTE: does NOT include mvcc_is_newer's tombstone-first
+                    // exact-tie rule — this input is pre-deduped so ties
+                    // cannot occur here (verified: get_collection_vectors
+                    // returns one winner per oid via the memtable).
                     (record.updated_at_ns, record.record_version)
                         > (kept.updated_at_ns, kept.record_version)
                 }

@@ -527,14 +527,15 @@ impl CollectionPartition {
     ///
     /// Winner selection per oid uses the SAME MVCC rule as
     /// [`Self::get_all_vectors`] — the total order from [`Self::mvcc_is_newer`]
-    /// (TD-MEMTABLE-MVCC-1) — so the indexed scan returns byte-identical
-    /// results. Only locators are recorded (no record clones). TTL is applied at
-    /// READ time (a record can expire after the index is built), matching
-    /// `get_all_vectors`.
+    /// (TD-MEMTABLE-MVCC-1), INCLUDING the tombstone-wins-exact-tie rule —
+    /// so the indexed scan returns byte-identical results. Only locators are
+    /// recorded (no record clones). TTL is applied at READ time (a record
+    /// can expire after the index is built), matching `get_all_vectors`.
     fn rebuild_scan_index(&mut self, collection_id: &str) {
-        // oid -> (updated_at_ns, version, batch_seq, locator) — the first three
-        // are the comparator key, stored to avoid needing the record on compare.
-        let mut winners: HashMap<String, (i64, u64, u64, RecordLocator)> = HashMap::new();
+        // oid -> (updated_at_ns, is_tombstone, version, batch_seq, locator) —
+        // the first four are the comparator key (tombstone bit for the
+        // exact-tie rule), stored to avoid needing the record on compare.
+        let mut winners: HashMap<String, (i64, bool, u64, u64, RecordLocator)> = HashMap::new();
         let mut has_empty_oid = false;
 
         for (batch_key, (batch, batch_seq)) in self.wal_batches.iter() {
@@ -543,11 +544,18 @@ impl CollectionPartition {
                     has_empty_oid = true;
                     continue;
                 }
+                let rec_tombstone = rec.valid_to_ns == Some(0);
                 let is_newer = match winners.get(&rec.oid) {
-                    Some((existing_ns, existing_ver, existing_seq, _)) => {
-                        // Same total order as mvcc_is_newer, inline (no record clone)
-                        (rec.updated_at_ns, rec.record_version, *batch_seq)
-                            > (*existing_ns, *existing_ver, *existing_seq)
+                    Some((existing_ns, existing_tomb, existing_ver, existing_seq, _)) => {
+                        // Same total order as mvcc_is_newer, inline (no clone):
+                        // ts → tombstone-wins-exact-tie → (version, batch_seq)
+                        if rec.updated_at_ns != *existing_ns {
+                            rec.updated_at_ns > *existing_ns
+                        } else if rec_tombstone != *existing_tomb {
+                            rec_tombstone // tombstone wins the exact-tie
+                        } else {
+                            (rec.record_version, *batch_seq) > (*existing_ver, *existing_seq)
+                        }
                     }
                     None => true,
                 };
@@ -556,6 +564,7 @@ impl CollectionPartition {
                         rec.oid.clone(),
                         (
                             rec.updated_at_ns,
+                            rec_tombstone,
                             rec.record_version,
                             *batch_seq,
                             RecordLocator {
@@ -569,7 +578,7 @@ impl CollectionPartition {
         }
 
         let mut ordered = BTreeMap::new();
-        for (oid, (updated_at_ns, _, _, locator)) in winners {
+        for (oid, (updated_at_ns, _, _, _, locator)) in winners {
             ordered.insert((updated_at_ns, oid), locator);
         }
         // Operator gauge: distinct indexed oids ≈ the index's resident size.
@@ -745,18 +754,19 @@ impl CollectionPartition {
                 if !vector_record.oid.is_empty() {
                     let vector_id = &vector_record.oid;
                     // Same total order as mvcc_is_newer (TD-MEMTABLE-MVCC-1):
-                    // updated_at_ns → record_version → batch_seq
+                    // updated_at_ns → tombstone-wins-exact-tie → (version, batch_seq)
                     let is_newer = match id_to_latest.get(vector_id.as_str()) {
                         Some((_, existing, existing_seq)) => {
-                            (
-                                vector_record.updated_at_ns,
-                                vector_record.record_version,
-                                *batch_seq,
-                            ) > (
-                                existing.updated_at_ns,
-                                existing.record_version,
-                                *existing_seq,
-                            )
+                            let cand_tomb = vector_record.valid_to_ns == Some(0);
+                            let curr_tomb = existing.valid_to_ns == Some(0);
+                            if vector_record.updated_at_ns != existing.updated_at_ns {
+                                vector_record.updated_at_ns > existing.updated_at_ns
+                            } else if cand_tomb != curr_tomb {
+                                cand_tomb // tombstone wins the exact-tie
+                            } else {
+                                (vector_record.record_version, *batch_seq)
+                                    > (existing.record_version, *existing_seq)
+                            }
                         }
                         None => true,
                     };
@@ -1938,6 +1948,57 @@ mod tests {
         assert!(
             surviving.is_empty(),
             "TD-MEMTABLE-MVCC-1 rd: the tombstone must win an exact-timestamp tie over a higher-version live copy (16d); got {} surviving",
+            surviving.len()
+        );
+    }
+
+    /// TD-MEMTABLE-MVCC-1 residual (d) edge — same-ns re-insert loses to its
+    /// own tombstone. The tombstone check fires BEFORE batch_seq, so a live
+    /// re-insert at the identical nanosecond is suppressed. This is
+    /// INTENTIONAL (matches the search path's `unflushed_supersedes`) —
+    /// pinned here so a future reviewer doesn't "fix" it as a regression.
+    #[tokio::test]
+    async fn same_ns_reinsert_loses_to_tombstone() {
+        let memtable = GlobalPartitionedMemtable::new();
+        let collection_id = "1mvcc_reinsert";
+        let tie_ns: i64 = 1_700_000_000_000_000_000;
+
+        // Tombstone first
+        let mut tombstone = make_proxima_record("edge_1", vec![], 0, Some(0));
+        tombstone.updated_at_ns = tie_ns;
+        let batch1 = WALVectorBatch {
+            batch_id: BatchId::new(),
+            vector_records: Arc::new(vec![tombstone]),
+            timestamp: std::time::SystemTime::now(),
+            total_size_bytes: 64,
+            is_flushed: false,
+            metadata_bloom_filter: None,
+        };
+        memtable.add_wal_batch(collection_id, batch1).await.unwrap();
+
+        // Re-insert at the EXACT SAME ns (later batch_seq, but the tombstone
+        // check fires first on exact-tie)
+        let mut reinsert = make_proxima_record("edge_1", vec![0.5], 0, None);
+        reinsert.updated_at_ns = tie_ns;
+        let batch2 = WALVectorBatch {
+            batch_id: BatchId::new(),
+            vector_records: Arc::new(vec![reinsert]),
+            timestamp: std::time::SystemTime::now(),
+            total_size_bytes: 64,
+            is_flushed: false,
+            metadata_bloom_filter: None,
+        };
+        memtable.add_wal_batch(collection_id, batch2).await.unwrap();
+
+        // The tombstone wins (checked before batch_seq): row stays dead
+        let visible = memtable
+            .get_collection_vectors(collection_id)
+            .await
+            .unwrap();
+        let surviving: Vec<&ProximaRecord> = visible.iter().filter(|r| r.oid == "edge_1").collect();
+        assert!(
+            surviving.is_empty(),
+            "TD-MEMTABLE-MVCC-1 rd-edge: the tombstone suppresses a same-ns re-insert (intentional, matches search); got {} surviving",
             surviving.len()
         );
     }
