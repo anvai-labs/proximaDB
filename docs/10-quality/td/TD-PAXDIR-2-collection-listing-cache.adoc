@@ -5,7 +5,7 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | **Partial.** Listing-cache foundation landed in #2374; publication/retirement invalidation landed in #2385. Resolver-owned source identity and the remaining cancellation cases below are follow-up gates; foundation branch rebased onto `2aa70f18d`, 2026-11-02. Original D7 filing context is retained below.
+| Status | **Partial.** Listing-cache foundation landed in #2374; publication/retirement invalidation landed in #2385. Resolver-owned source identity and the remaining cancellation cases below are follow-up gates; foundation branch rebased onto `f68674e44`, 2026-11-02. Original D7 filing context is retained below.
 | Priority | MED. One sequential round trip on every vector query against object storage; the remaining warm-depth term after D7.
 | Component | `src/storage/engines/sst/search/mod.rs` (`discover_sstable_files`, the per-query `DISCOVERY_MEMO`), flush (`flush_materializer.rs`) and compaction retire paths, `CacheInvalidationCoordinator`
 | Relates to | TD-PAXDIR-1 (D7 measured it; D8 flips defaults), TD-PAXMETA-1 (a collection segment manifest would replace the LIST), mandate 16 (read-after-write)
@@ -48,8 +48,10 @@ objects then fail) or miss the output.
 
 Publication/retirement invalidation landed in #2385. The foundation follow-up adds
 resolver-based listing identity and cancellation coverage inside coordinator cleanup.
-The root storage/cache cohort passed 146/146 tests before rebasing onto #2385; focused
-post-rebase validation remains pending. Required acceptance remains:
+The combined storage/cache/embedded cohort passed 164/164 tests after #2385, including
+legacy relative-path retirement suppression on warm and fresh listings. Fresh review is
+CLEAR; latest-base cloud build/lint and 88 graph integration tests passed. Hosted CI remains
+a separate acceptance gate. Required acceptance remains:
 compaction-success invalidation through the existing publication
 path, including post-publish cleanup/error branches: a committed output must become visible
 even if a later best-effort step fails. A lookup begun before invalidation must not reinstall

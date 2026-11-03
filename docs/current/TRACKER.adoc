@@ -15,7 +15,7 @@ link:STORAGE_PLAN.adoc[storage], link:PLATFORM_PLAN.adoc[platform].
 Completed foundation is summarized once in link:../history/README.adoc[history]; detailed
 merged-slice evidence is there. v3-first remains accepted; new-table policy and live deletes are implemented behind default-OFF gates, not a completed rollout.
 
-Storage-foundation refresh: `origin/develop` `2aa70f18d`, 2026-11-02 (local date). The SC rows below
+Storage-foundation refresh: `origin/develop` `f68674e44`, 2026-11-02 (local date). The SC rows below
 supersede their October observations using TD-TIER-1's landed-slice record and first integrated
 MinIO evidence. Other branch heads/owners below remain historical observations, not renewed
 claims about remote state. Existing foreign WIP is preserved.
@@ -39,7 +39,7 @@ claims about remote state. Existing foreign WIP is preserved.
 | Filtered PAX / TD-FPRUNE-1 P5–P7 | Evidence merged #2268; P5 WIP (GLM) | Residual-tail store-once and typed shred/consumer proof in feat/pax-residual-tail; then filter-aware directory and cell-scoped Stage F. Gate with the same filtered workload and exact/recall oracle; default flip in WIP is not merged behavior.
 | TD-FPRUNE-1 P5 / E1 follow-through | feat/pax-residual-tail; GLM owner | Residual-tail store-once implemented in three slices: default-ON kill-switch gate, typed shred columns from schema (Integer→Int64/Float→Float64/String→String, per-value fail-safe exactness), v2 typed SECTION_SHRED_FIELD_MAP (compaction preserves residual across rewrites; field-map emission ungated from FOOTER_STATS). The flip surfaced and fixed a real gap: FlatRow::props_tree (the Stage-F filter path) ignored shredded values. Adjacent: 14 pre-existing Collection-initializer bench breaks repaired. Next: schema-bearing e1p bed measurement for the merge gate (≤350 MB/q), review, CI.
 | SC3–6 / TD-TIER-1 | SC3/SC4 landed; SC5 implemented; SC6 partial | TD-TIER-1 records #2270 and SC4 through #2304 as landed; its November 1 integrated MinIO run proves a bounded profile, not rollout closure. Remaining: source/protection identity, control-plane split, tier-mix round trip, multi-tenant soak, declared-pool reporting, repeats and support-scope decision.
-| Storage/embedded foundations / TD-TIER-1, PAXDIR-2, OBJSTORE-1, WAL-2 | Active `feat/cloud-storage-foundations`; local implementation, validation in progress | Reconciled into existing plans/ADRs. Persistent object keys now preserve cloud key bytes under `pax-object-v2/`; anchored protection regressions pass (49/49 cache tests locally). Root storage/cache cohort 146/146 and embedded cohort 11/11 pass locally; adversarial review is CLEAR. Server plus embedded cloud-full build passed before rebase; cloud runtime proof remains open. The foundation milestone is committed locally and rebased onto merged #2385; affected-test rerun and PR publication are pending. Endpoint-aware persistent identity and full read-only query boot remain explicit gates; bounded catalog-follower metadata access does not close them. Persistent receipt, WAL-free bulk, dynamic disks and broad headless modality support remain dependent gates.
+| Storage/embedded foundations / TD-TIER-1, PAXDIR-2, OBJSTORE-1, WAL-2 | Active `feat/cloud-storage-foundations`; local implementation, validation in progress | Reconciled into existing plans/ADRs. Persistent object keys now preserve cloud key bytes under `pax-object-v2/`; anchored protection regressions pass (49/49 cache tests locally). Root storage/cache cohort 146/146 and embedded cohort 11/11 pass locally; adversarial review is CLEAR. The combined post-#2385 cohort passed 164/164 tests. The milestone is rebased onto `f68674e44`; strict cloud lint, 88 graph integration tests and the assembled server/embedded cloud-full build passed. Cloud runtime proof and hosted CI remain separate gates. Endpoint-aware persistent identity and full read-only query boot remain explicit gates; bounded catalog-follower metadata access does not close them. Persistent receipt, WAL-free bulk, dynamic disks and broad headless modality support remain dependent gates.
 | P6 | Open, continuous | Value-compared SF1/SF10 query gates and multimodal benchmark; retain existing ratchets. Load/publication memory is not query coverage.
 | Dependency/security residuals | Planned; dependency lane | Track #2225–#2228/#2242; retire zstd advisory exceptions only with the documented dependency upgrades/exposure checks. #2251 is an accepted exception disposition, not a patched dependency. Workspace panic-site reduction/per-crate compiler lints remain separate from the completed coverage guard.
 | Platform release gates | Open/needs per-TD pickup | Published-image install/restart and driver proof, surface parity, workspace residuals and security/CI lanes: platform plan. No inference of completion from old plans.
@@ -56,22 +56,25 @@ Local implementation or a bounded API does not complete the encompassing contrac
 [cols="1,2,3,3",options="header"]
 |===
 | Slice / authority | Implemented scope | Evidence state | Required next action / dependency
-| F1 / TD-TIER-1, TD-PAXDIR-2 | Exact cloud key preservation, resolver-based listing identity/publication repair, versioned whole-object keys and anchored protection | `proximadb-cache` 49/49 and the root storage/cache cohort 146/146 passed locally | Carry endpoint/account-aware source identity through every persistent/range/protection consumer and prove cross-endpoint isolation plus old-key/grant restart reconciliation. These are required before general shared-pool identity claims.
+| F1 / TD-TIER-1, TD-PAXDIR-2 | Exact cloud key preservation, resolver-based listing identity/publication repair, versioned whole-object keys and anchored protection | `proximadb-cache` 49/49 and the root storage/cache cohort 146/146 passed locally | Carry endpoint/account-aware source identity through every persistent/range/protection consumer and prove cross-endpoint isolation plus obsolete disposable-key rejection and current-schema grant restart validation. These are required before general shared-pool identity claims.
 | F2 / TD-TIER-1 | Local backing reads and bounded disk-cache admission/replacement | Root storage/cache cohort 146/146 passed, including disk-cache and `UnifiedCachingFilesystem` coverage | Retain local-I/O, capacity/failure/fallback regressions while integrating complete endpoint identity. Broader cloud backend and real SST residency/recall gates remain required.
 | F3 / TD-OBJSTORE-1 | Scheme-preserving conversion, explicit WAL sync validation/wiring, fail-closed local constructor for remote roots | F3/F4/lifecycle cohort: 9/9 focused tests passed locally, including URI/sync validation and rejection before side effects | Retain those guards while adding a separately explicit cloud-writer bootstrap with catalog ownership and local durability/work configuration before claiming embedded cloud writes; F3's guard is safety groundwork, not that bootstrap.
 | F4 / TD-OBJSTORE-1, TD-WAL-2 | `flush_and_close(&mut self)` uses existing vector flush before legacy close; flush failure retains ownership | Same 9/9 cohort includes materialization failure/retry, ownership retention and local reopen | Retain the vector-scoped boundary while extending required modality materialization/recovery through TD-WAL-2 before all-modality completion. Cloud completion depends on F3 cloud-writer bootstrap and backend reopen proof; a durable receipt additionally needs persisted idempotency/fencing.
 | F5 / TD-OBJSTORE-1 | Metadata-only `EmbeddedCatalogFollower` opens published snapshots using isolated local scratch; explicit refresh/list/lookup | 2/2 focused follower tests passed: refresh/takeover without publication, missing/corrupt snapshot refusal | Build a read-only SST/service lifecycle and inject the read view without writer WAL/recovery/compaction side effects; enforce authorization/freshness and prove real cloud queries with zero remote mutations. Metadata bootstrap alone does not complete headless reads.
 |===
 
-Local validation checkpoint (2026-11-02): root storage/cache cohort 146/146 passed
-(`/private/tmp/foundations-root-tests-final.log`); 11 focused embedded tests passed
-(`/private/tmp/foundations-embedded-tests.log`). Complete `make work-commit-check` passed
-(`/private/tmp/foundations-work-commit-check-final.log`), and adversarial review is CLEAR.
-The server plus embedded cloud-full build passed (`/private/tmp/foundations-cloud-build.log`).
-The first foundation milestone is committed on `feat/cloud-storage-foundations` and rebased
-onto current `develop` `2aa70f18d`. Its affected publication tests and fresh review are being
-rerun before PR publication; local evidence does not establish hosted CI or merge completion.
-Required foundation residuals above remain open.
+Local validation checkpoint (2026-11-02): the combined storage/cache/embedded cohort
+passed 164/164 tests (`/private/tmp/foundations-rebased-tests.log`), including the retirement
+alias regression. Cache/runtime leaf clippy and complete deterministic guards passed.
+Fresh adversarial review is CLEAR: the local relative/absolute retirement mismatch was fixed
+without rewriting durable obligations, and range-diff confirms the reviewed changes survived
+rebasing onto `develop` `f68674e44`. The post-#2385 server plus embedded cloud-full build
+passed (`/private/tmp/foundations-rebased-cloud-build.log`). On the latest base, strict cloud
+lint passed, 88/88 graph integration tests passed, and the assembled server/embedded
+cloud-full build passed (`/private/tmp/foundations-final-clippy.log`,
+`/private/tmp/foundations-final-graph-tests.log`, `/private/tmp/foundations-final-cloud-build.log`).
+Complete deterministic guards passed (`/private/tmp/foundations-final-guards.log`). Hosted CI
+and cloud runtime proof remain separate acceptance gates. Required foundation residuals above remain open.
 
 The focused CI unblock https://github.com/anvai-labs/proximaDB/pull/2385[#2385] merged as
 `2aa70f18d` after green CI and clean adversarial review. The final fix refreshes cached SST
@@ -90,9 +93,10 @@ than one CI run per helper or a single combined implementation review.
 
 The retained October inventory below is historical; refresh remote state before pickup.
 Current task: `feat/cloud-storage-foundations` at
-`/private/tmp/proximadb-worktrees/feat-cloud-storage-foundations`, based on `2aa70f18d`.
-Reconciliation and foundation implementation are session-owned. Pre-rebase build/tests and
-review passed; rebase integration review, affected tests, publication and hosted CI are pending. Other
+`/private/tmp/proximadb-worktrees/feat-cloud-storage-foundations`, based on `f68674e44`.
+Reconciliation and foundation implementation are session-owned. The 164-test cohort and
+fresh review passed; final lint, graph tests and cloud build passed. Hosted CI remains a
+publication acceptance gate. Other
 owners and their unique WIP remain untouched.
 
 October worktrees were under `/home/vsingh/code/proximaDB.worktrees/` unless otherwise stated.

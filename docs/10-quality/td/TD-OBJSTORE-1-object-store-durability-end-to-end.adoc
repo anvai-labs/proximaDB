@@ -78,14 +78,13 @@ TD-WAL-2 still owns modality recovery, ADR-069 owns the reattachable-WAL default
 leaves persisted completion receipts/crash idempotency open. Do not claim cloud-headless
 completion from URI preservation or follower construction alone.
 
-Local evidence checkpoint: 11 focused embedded tests passed (nine F3/F4/lifecycle and two
-F5 follower tests; command/result transcript `/private/tmp/foundations-embedded-tests.log`).
-The complete `make work-commit-check` passed (`/private/tmp/foundations-work-commit-check.log`).
-The foundation branch is rebased onto `develop` at `2aa70f18d` (#2385 landed).
-Before that rebase, the root storage/cache cohort passed 146/146 tests and the server plus
-embedded cloud-full build passed (`/private/tmp/foundations-cloud-build.log`). Focused
-post-rebase validation remains pending. No hosted CI or cloud-headless support completion
-is asserted by these local checks.
+Local evidence checkpoint: the combined storage/cache/embedded cohort passed 164/164 tests
+(`/private/tmp/foundations-rebased-tests.log`), including F3/F4/lifecycle and F5 follower tests.
+Complete deterministic guards and fresh adversarial review passed. The foundation is rebased
+onto `develop` at `f68674e44`, preserving merged #2385 (`2aa70f18d`). The post-#2385 server
+plus embedded cloud-full build passed. On the latest base, strict cloud lint, 88 graph
+integration tests and the assembled server/embedded cloud-full build also passed. These local checks do not establish hosted CI or
+cloud-headless support completion.
 
 === Required next seams (reuse the existing owners)
 
