@@ -35,7 +35,27 @@ scheduled truncation on a cold directory (io_trace already carries the query-sco
 The co-design mandate's cost term is round-trips and tail latency, not component
 throughput — a kernel microbenchmark of rename() says nothing about the p99 the writers see.
 
-== Candidate designs (ranked, decide on the measurement)
+== Chosen design (corrected 2026-11-03): a sealed-segment summary TRAILER, in-file
+
+The original candidate text below proposed `{name}.idx` sidecars; corrected on
+review: sidecars double the per-segment object count (an extra GET per segment
+on object stores — the co-design mandate's dominant cost term) and add a
+paired-file lifecycle. The house pattern is metadata WITHIN the file (PAX
+footer, Region E). The summary is therefore appended as a self-locating
+trailer at seal time — `[rmp(SummaryData) payload][payload_len u32 LE][magic
+"PXWSTL01"]`, written after the synced final append and before the seal
+rename — and boot reads it with one suffix read per segment. Mixed-read-safe
+by construction: segments without a trailer (all existing ones) full-decode
+exactly as today; corrupt/overlong trailers fall back to the decode (counted
+in `proximadb_wal_boot_summary_trailer_{hits,misses}_total`); a
+trailer-bearing segment would trip an older binary's strict sealed decoder,
+so arming the gate (`PROXIMADB_WAL_SUMMARY_TRAILER`, default ON) raises the
+data format marker to 4 on first write (the OBJECT_SPILL_FORMAT=3 precedent:
+refuse loudly, never misread). The interrupted-seal window (trailer synced,
+rename not) is closed at boot by completing the rotation — the seal's bytes
+were durable.
+
+== Superseded candidate text (sidecars — kept for the record)
 
 * **Sidecar summaries** (for cost 1): persist each segment's `SegmentSummary` beside the
   segment (`{name}.idx`), written before the seal's dir-fsync completes; boot trusts a
