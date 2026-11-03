@@ -331,6 +331,15 @@ impl AtomicMetadataStore {
                             config_map.insert("storage_engine".to_string(), serde_json::json!(se));
                         }
                         super::catalog_config::write_index_and_quant(c, &mut config_map)?;
+                        // TD-TIER-1 SC5 residual: the atomic path also dropped
+                        // the access tier — serialize it like the direct-WAL
+                        // path so every round-trip carries it.
+                        if let Some(tier) = c.default_access_tier
+                            && tier != 0
+                        {
+                            config_map
+                                .insert("default_access_tier".to_string(), serde_json::json!(tier));
+                        }
                     }
                     let versioned = VersionedCollectionMetadata {
                         id: collection.id.clone(),
@@ -462,6 +471,12 @@ impl AtomicMetadataStore {
                         index_policy: super::catalog_config::read_index_policy(
                             &versioned_metadata.config,
                         ),
+                        default_access_tier: versioned_metadata
+                            .config
+                            .get("default_access_tier")
+                            .and_then(|v| v.as_i64())
+                            .filter(|t| *t != 0)
+                            .map(|t| t as i32),
                         ..Default::default()
                     }),
                     stats: Some(crate::proto::proximadb_v1::CollectionStats {
@@ -707,6 +722,12 @@ impl MetadataStoreInterface for AtomicMetadataStore {
                     index_configs,
                     quantization,
                     index_policy,
+                    default_access_tier: versioned
+                        .config
+                        .get("default_access_tier")
+                        .and_then(|v| v.as_i64())
+                        .filter(|t| *t != 0)
+                        .map(|t| t as i32),
                     ..Default::default()
                 }),
                 stats: Some(crate::proto::proximadb_v1::CollectionStats {
@@ -811,6 +832,12 @@ impl MetadataStoreInterface for AtomicMetadataStore {
                         index_configs: super::catalog_config::read_index_configs(&versioned.config),
                         quantization: super::catalog_config::read_quantization(&versioned.config),
                         index_policy: super::catalog_config::read_index_policy(&versioned.config),
+                        default_access_tier: versioned
+                            .config
+                            .get("default_access_tier")
+                            .and_then(|v| v.as_i64())
+                            .filter(|t| *t != 0)
+                            .map(|t| t as i32),
                         ..Default::default()
                     }),
                     stats: Some(crate::proto::proximadb_v1::CollectionStats {

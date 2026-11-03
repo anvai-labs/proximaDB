@@ -341,15 +341,10 @@ pub async fn publish_centroid_directory(
         // TD-TIER-1 SC5 residual: control objects (the centroid directory)
         // keep an EXPLICIT Hot tier so a cold-tier bucket policy never
         // transitions-lifecycle-moves them — they are read on every query.
-        let options = crate::storage::persistence::filesystem::FileOptions {
-            storage_class: Some(
-                proximadb_storage_filesystem_types::ObjectAccessTier::Hot
-                    .as_s3_storage_class()
-                    .to_string(),
-            ),
-            ..Default::default()
-        };
-        match fs.write_if_absent(&url, &bytes, Some(options)).await {
+        let options = crate::storage::persistence::filesystem::FileOptions::for_access_tier(Some(
+            proximadb_storage_filesystem_types::ObjectAccessTier::Hot,
+        ));
+        match fs.write_if_absent(&url, &bytes, options).await {
             Ok(()) => {
                 for (old, entry) in &objects {
                     // TD-TIER-1 SC4-5: g-1 is kept remotely for readers but is

@@ -943,6 +943,12 @@ async fn create_collection_v2_checked(
     // a misspelt tier must never silently become the account default).
     let default_access_tier = match request.default_access_tier.take() {
         None => None,
+        // TD-TIER-1 SC5 residual: "default" is an EXPLICIT clear — it maps to
+        // Some(0) so the update path clears the recorded tier back to the
+        // account default (omitted preserves it, which is None).
+        Some(raw) if raw.trim().eq_ignore_ascii_case("default") => {
+            Some(crate::proto::proximadb_v1::AccessTier::Unspecified as i32)
+        }
         Some(raw) => {
             let tier = crate::services::collection::storage_class::parse_access_tier(&raw)
                 .map_err(|e| ApiError::InvalidArgument(e.to_string()))?;

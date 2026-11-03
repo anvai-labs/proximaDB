@@ -295,6 +295,13 @@ impl NativeCatalog {
                 self.object_id_allocator.raise_floor(floor);
                 let id = self.object_id_allocator.allocate();
                 self.identity_hw_object.fetch_max(id, Ordering::Relaxed);
+                // TD-PATH-2 reserved-id guard: the high-water is raised in-memory above
+                // the minted id; the sidecar persists at the next durability
+                // point. A crash between mint and that write CAN re-issue the
+                // id — the create path builds directories BEFORE the catalog
+                // commit — so this window is REAL and UNBOUND. Full
+                // reservation persistence (sidecar write at mint time) is the
+                // open design item.
                 id
             }
         }
