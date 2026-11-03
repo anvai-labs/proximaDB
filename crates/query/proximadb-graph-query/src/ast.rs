@@ -822,6 +822,7 @@ mod tests {
                 to_variable: "m".to_string(),
                 edge_type: "KNOWS".to_string(),
                 properties: HashMap::from([("since".to_string(), json!(2024))]),
+                direction: EdgeDirection::Outgoing,
             });
         let delete = DeleteClause::detach(vec!["n".to_string(), "r".to_string()]);
         let set = SetClause::new()
