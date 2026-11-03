@@ -320,10 +320,11 @@ impl CollectionPartition {
     /// 3. Checking TTL expiration for temporal validity
     /// 4. Verifying the vector isn't logically deleted
     ///
-    /// # MVCC Resolution Strategy
-    /// - Primary: Higher version number wins
-    /// - Secondary: If versions equal, newer timestamp wins
-    /// - Tertiary: Check TTL expiration
+    /// # MVCC Resolution Strategy (TD-MEMTABLE-MVCC-1)
+    /// - Primary: Later `updated_at_ns` wins (write order)
+    /// - Secondary: Higher `record_version` wins (explicit version bumps)
+    /// - Tertiary: Later batch insertion sequence wins (deterministic tiebreak)
+    /// - Post-selection: Check TTL expiration
     ///
     /// # Returns
     /// - `Some(ProximaRecord)` - Latest valid version of the vector
@@ -1771,13 +1772,15 @@ mod tests {
         let memtable = GlobalPartitionedMemtable::new();
         let collection_id = "1mvcc_fm1";
 
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as i64;
+        // Pin BOTH to fixed timestamps (no clock-race): live at T, tombstone
+        // at T+1ms — the tombstone is later, which is the only way it can win
+        // under timestamp-first ordering when the live copy has a higher version.
+        let live_ts_ns: i64 = 1_700_000_000_000_000_000;
+        let tomb_ts_ns: i64 = live_ts_ns + 1_000_000; // +1ms
 
         // Live document: record_version=1 (DocumentService default)
-        let live = make_proxima_record("doc_1", vec![0.1, 0.2, 0.3], 1, None);
+        let mut live = make_proxima_record("doc_1", vec![0.1, 0.2, 0.3], 1, None);
+        live.updated_at_ns = live_ts_ns;
         let batch1 = WALVectorBatch {
             batch_id: BatchId::new(),
             vector_records: Arc::new(vec![live]),
@@ -1790,7 +1793,7 @@ mod tests {
 
         // Delete tombstone: record_version=0 (tombstone_records_for_ids default)
         let mut tombstone = make_proxima_record("doc_1", vec![], 0, Some(0));
-        tombstone.updated_at_ns = (now_ms + 1) * 1_000_000; // later than live
+        tombstone.updated_at_ns = tomb_ts_ns;
         let batch2 = WALVectorBatch {
             batch_id: BatchId::new(),
             vector_records: Arc::new(vec![tombstone]),
