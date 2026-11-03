@@ -355,27 +355,31 @@ impl CollectionPartition {
     ///      tombstone beat a live copy written earlier, even when the live
     ///      copy has a higher `record_version`, e.g. every DocumentService
     ///      document at version 1 vs a version-0 tombstone)
-    ///   2. `record_version` (higher wins — an explicit version bump)
-    ///   3. `batch_seq` (the partition's monotonic insertion counter —
+    ///   2. TOMBSTONE-WINS-EXACT-TIE (residual (d), mandate 16d): at the
+    ///      exact same nanosecond, a tombstone beats a live copy regardless
+    ///      of version — matching `unflushed_supersedes` on the search path.
+    ///      Without this, a same-instant live v1 vs tombstone v0 is visible
+    ///      to scan/get-by-id but hidden to search (cross-surface 16d).
+    ///   3. `record_version` (higher wins — an explicit version bump)
+    ///   4. `batch_seq` (the partition's monotonic insertion counter —
     ///      later-inserted batch wins; NEVER HashMap iteration order)
-    ///
-    /// This matches `read.rs::is_fresher` (timestamp-first), the search-path
-    /// merge (`core::search::merge`), and the storage-inclusive list merge.
     fn mvcc_is_newer(
         candidate: &ProximaRecord,
         candidate_batch_seq: u64,
         current: &ProximaRecord,
         current_batch_seq: u64,
     ) -> bool {
-        (
-            candidate.updated_at_ns,
-            candidate.record_version,
-            candidate_batch_seq,
-        ) > (
-            current.updated_at_ns,
-            current.record_version,
-            current_batch_seq,
-        )
+        if candidate.updated_at_ns != current.updated_at_ns {
+            return candidate.updated_at_ns > current.updated_at_ns;
+        }
+        // Exact-instant tie: tombstone wins BEFORE version (mandate 16d —
+        // matches unflushed_supersedes on the search path, residual (d)).
+        let tombstone = |r: &ProximaRecord| r.valid_to_ns == Some(0);
+        if tombstone(candidate) != tombstone(current) {
+            return tombstone(candidate);
+        }
+        (candidate.record_version, candidate_batch_seq)
+            > (current.record_version, current_batch_seq)
     }
 
     fn latest_version_by_id(&self, vector_id: &str) -> Option<ProximaRecord> {
@@ -523,14 +527,15 @@ impl CollectionPartition {
     ///
     /// Winner selection per oid uses the SAME MVCC rule as
     /// [`Self::get_all_vectors`] — the total order from [`Self::mvcc_is_newer`]
-    /// (TD-MEMTABLE-MVCC-1) — so the indexed scan returns byte-identical
-    /// results. Only locators are recorded (no record clones). TTL is applied at
-    /// READ time (a record can expire after the index is built), matching
-    /// `get_all_vectors`.
+    /// (TD-MEMTABLE-MVCC-1), INCLUDING the tombstone-wins-exact-tie rule —
+    /// so the indexed scan returns byte-identical results. Only locators are
+    /// recorded (no record clones). TTL is applied at READ time (a record
+    /// can expire after the index is built), matching `get_all_vectors`.
     fn rebuild_scan_index(&mut self, collection_id: &str) {
-        // oid -> (updated_at_ns, version, batch_seq, locator) — the first three
-        // are the comparator key, stored to avoid needing the record on compare.
-        let mut winners: HashMap<String, (i64, u64, u64, RecordLocator)> = HashMap::new();
+        // oid -> (updated_at_ns, is_tombstone, version, batch_seq, locator) —
+        // the first four are the comparator key (tombstone bit for the
+        // exact-tie rule), stored to avoid needing the record on compare.
+        let mut winners: HashMap<String, (i64, bool, u64, u64, RecordLocator)> = HashMap::new();
         let mut has_empty_oid = false;
 
         for (batch_key, (batch, batch_seq)) in self.wal_batches.iter() {
@@ -539,11 +544,18 @@ impl CollectionPartition {
                     has_empty_oid = true;
                     continue;
                 }
+                let rec_tombstone = rec.valid_to_ns == Some(0);
                 let is_newer = match winners.get(&rec.oid) {
-                    Some((existing_ns, existing_ver, existing_seq, _)) => {
-                        // Same total order as mvcc_is_newer, inline (no record clone)
-                        (rec.updated_at_ns, rec.record_version, *batch_seq)
-                            > (*existing_ns, *existing_ver, *existing_seq)
+                    Some((existing_ns, existing_tomb, existing_ver, existing_seq, _)) => {
+                        // Same total order as mvcc_is_newer, inline (no clone):
+                        // ts → tombstone-wins-exact-tie → (version, batch_seq)
+                        if rec.updated_at_ns != *existing_ns {
+                            rec.updated_at_ns > *existing_ns
+                        } else if rec_tombstone != *existing_tomb {
+                            rec_tombstone // tombstone wins the exact-tie
+                        } else {
+                            (rec.record_version, *batch_seq) > (*existing_ver, *existing_seq)
+                        }
                     }
                     None => true,
                 };
@@ -552,6 +564,7 @@ impl CollectionPartition {
                         rec.oid.clone(),
                         (
                             rec.updated_at_ns,
+                            rec_tombstone,
                             rec.record_version,
                             *batch_seq,
                             RecordLocator {
@@ -565,7 +578,7 @@ impl CollectionPartition {
         }
 
         let mut ordered = BTreeMap::new();
-        for (oid, (updated_at_ns, _, _, locator)) in winners {
+        for (oid, (updated_at_ns, _, _, _, locator)) in winners {
             ordered.insert((updated_at_ns, oid), locator);
         }
         // Operator gauge: distinct indexed oids ≈ the index's resident size.
@@ -741,18 +754,19 @@ impl CollectionPartition {
                 if !vector_record.oid.is_empty() {
                     let vector_id = &vector_record.oid;
                     // Same total order as mvcc_is_newer (TD-MEMTABLE-MVCC-1):
-                    // updated_at_ns → record_version → batch_seq
+                    // updated_at_ns → tombstone-wins-exact-tie → (version, batch_seq)
                     let is_newer = match id_to_latest.get(vector_id.as_str()) {
                         Some((_, existing, existing_seq)) => {
-                            (
-                                vector_record.updated_at_ns,
-                                vector_record.record_version,
-                                *batch_seq,
-                            ) > (
-                                existing.updated_at_ns,
-                                existing.record_version,
-                                *existing_seq,
-                            )
+                            let cand_tomb = vector_record.valid_to_ns == Some(0);
+                            let curr_tomb = existing.valid_to_ns == Some(0);
+                            if vector_record.updated_at_ns != existing.updated_at_ns {
+                                vector_record.updated_at_ns > existing.updated_at_ns
+                            } else if cand_tomb != curr_tomb {
+                                cand_tomb // tombstone wins the exact-tie
+                            } else {
+                                (vector_record.record_version, *batch_seq)
+                                    > (existing.record_version, *existing_seq)
+                            }
                         }
                         None => true,
                     };
@@ -1883,6 +1897,112 @@ mod tests {
         );
     }
 
+    /// TD-MEMTABLE-MVCC-1 residual (d) — exact-timestamp tie with live v1 vs
+    /// tombstone v0: the tombstone must win (mandate 16d), matching the search
+    /// path's `unflushed_supersedes` which orders tombstone-first on exact
+    /// ties. The current comparator orders version-first on ties, so the live
+    /// copy (v1 > v0) wins and the row stays visible to scan while search
+    /// hides it — a cross-surface 16d violation.
+    #[tokio::test]
+    async fn tombstone_wins_exact_timestamp_tie_over_higher_version_live() {
+        let memtable = GlobalPartitionedMemtable::new();
+        let collection_id = "1mvcc_rd";
+
+        // BOTH records at the EXACT SAME nanosecond — the tie case
+        let tie_ns: i64 = 1_700_000_000_000_000_000;
+
+        // Live copy: record_version=1 (DocumentService default)
+        let mut live = make_proxima_record("tie_doc", vec![0.1, 0.2, 0.3], 1, None);
+        live.updated_at_ns = tie_ns;
+
+        // Tombstone: record_version=0, SAME timestamp
+        let mut tombstone = make_proxima_record("tie_doc", vec![], 0, Some(0));
+        tombstone.updated_at_ns = tie_ns;
+
+        let batch1 = WALVectorBatch {
+            batch_id: BatchId::new(),
+            vector_records: Arc::new(vec![live]),
+            timestamp: std::time::SystemTime::now(),
+            total_size_bytes: 128,
+            is_flushed: false,
+            metadata_bloom_filter: None,
+        };
+        let batch2 = WALVectorBatch {
+            batch_id: BatchId::new(),
+            vector_records: Arc::new(vec![tombstone]),
+            timestamp: std::time::SystemTime::now(),
+            total_size_bytes: 64,
+            is_flushed: false,
+            metadata_bloom_filter: None,
+        };
+        memtable.add_wal_batch(collection_id, batch1).await.unwrap();
+        memtable.add_wal_batch(collection_id, batch2).await.unwrap();
+
+        // The tombstone must win the exact-tie: scan must NOT return the live copy
+        let visible = memtable
+            .get_collection_vectors(collection_id)
+            .await
+            .unwrap();
+        let surviving: Vec<&ProximaRecord> =
+            visible.iter().filter(|r| r.oid == "tie_doc").collect();
+        assert!(
+            surviving.is_empty(),
+            "TD-MEMTABLE-MVCC-1 rd: the tombstone must win an exact-timestamp tie over a higher-version live copy (16d); got {} surviving",
+            surviving.len()
+        );
+    }
+
+    /// TD-MEMTABLE-MVCC-1 residual (d) edge — same-ns re-insert loses to its
+    /// own tombstone. The tombstone check fires BEFORE batch_seq, so a live
+    /// re-insert at the identical nanosecond is suppressed. This is
+    /// INTENTIONAL (matches the search path's `unflushed_supersedes`) —
+    /// pinned here so a future reviewer doesn't "fix" it as a regression.
+    #[tokio::test]
+    async fn same_ns_reinsert_loses_to_tombstone() {
+        let memtable = GlobalPartitionedMemtable::new();
+        let collection_id = "1mvcc_reinsert";
+        let tie_ns: i64 = 1_700_000_000_000_000_000;
+
+        // Tombstone first
+        let mut tombstone = make_proxima_record("edge_1", vec![], 0, Some(0));
+        tombstone.updated_at_ns = tie_ns;
+        let batch1 = WALVectorBatch {
+            batch_id: BatchId::new(),
+            vector_records: Arc::new(vec![tombstone]),
+            timestamp: std::time::SystemTime::now(),
+            total_size_bytes: 64,
+            is_flushed: false,
+            metadata_bloom_filter: None,
+        };
+        memtable.add_wal_batch(collection_id, batch1).await.unwrap();
+
+        // Re-insert at the EXACT SAME ns (later batch_seq, but the tombstone
+        // check fires first on exact-tie)
+        let mut reinsert = make_proxima_record("edge_1", vec![0.5], 0, None);
+        reinsert.updated_at_ns = tie_ns;
+        let batch2 = WALVectorBatch {
+            batch_id: BatchId::new(),
+            vector_records: Arc::new(vec![reinsert]),
+            timestamp: std::time::SystemTime::now(),
+            total_size_bytes: 64,
+            is_flushed: false,
+            metadata_bloom_filter: None,
+        };
+        memtable.add_wal_batch(collection_id, batch2).await.unwrap();
+
+        // The tombstone wins (checked before batch_seq): row stays dead
+        let visible = memtable
+            .get_collection_vectors(collection_id)
+            .await
+            .unwrap();
+        let surviving: Vec<&ProximaRecord> = visible.iter().filter(|r| r.oid == "edge_1").collect();
+        assert!(
+            surviving.is_empty(),
+            "TD-MEMTABLE-MVCC-1 rd-edge: the tombstone suppresses a same-ns re-insert (intentional, matches search); got {} surviving",
+            surviving.len()
+        );
+    }
+
     use super::*;
 
     #[tokio::test]
@@ -2356,6 +2476,15 @@ mod tests {
         m.add_wal_batch(c, batch_of(vec![rec_at("w", 25, 1, None)]))
             .await
             .unwrap();
+        // TD-MEMTABLE-MVCC-1 (d): tombstone exact-tie — live v1 + tombstone v0
+        // at the SAME ns. The tombstone must win on BOTH the indexed scan
+        // (rebuild_scan_index) and the legacy path (get_all_vectors).
+        m.add_wal_batch(
+            c,
+            batch_of(vec![rec_at("t", 50, 1, None), rec_at("t", 50, 0, Some(0))]),
+        )
+        .await
+        .unwrap();
 
         let indexed = m
             .scan_collection_paginated(c, None, 1000, None, now_ns)
@@ -2374,6 +2503,14 @@ mod tests {
         assert!(
             indexed.iter().all(|r| r.oid != "z"),
             "TTL-expired record must be excluded"
+        );
+        assert!(
+            indexed.iter().all(|r| r.oid != "t"),
+            "TD-MEMTABLE-MVCC-1 (d): tombstone exact-tie must suppress the live copy on the INDEXED scan too"
+        );
+        assert!(
+            legacy.iter().all(|r| r.oid != "t"),
+            "TD-MEMTABLE-MVCC-1 (d): tombstone exact-tie must suppress the live copy on the LEGACY path"
         );
     }
 

@@ -1203,20 +1203,25 @@ impl VectorOperationsService {
                 record.tenant_id.is_empty() || record.tenant_id == tenant_context.tenant_id
             });
         }
-        // TD-DML-3: one CURRENT version per oid. The raw WAL view holds every
-        // write of a key, and an UPDATE of a relational row on this store
-        // appends a new version — so a SELECT returned the old and the new row
-        // side by side. Latest wins (highest record_version, then
-        // updated_at_ns, then the later write), and it is chosen BEFORE the
-        // dead filter so a newer tombstone / expired version hides its older
-        // live copy (mandate #16d).
+        // TD-DML-3: one CURRENT version per oid. The memtable's
+        // get_collection_vectors already applies MVCC winner selection (one
+        // record per oid), so this dedup is defense-in-depth — but if the
+        // input ever becomes the raw delta, the comparator must match the
+        // unified rule (TD-MEMTABLE-MVCC-1 residual (f)): timestamp-first
+        // (is_fresher semantics), NOT the old version-first ordering that
+        // was here before.
         let mut latest: std::collections::HashMap<String, usize> =
             std::collections::HashMap::with_capacity(records.len());
         for (index, record) in records.iter().enumerate() {
             let newer = match latest.get(&record.oid).and_then(|&kept| records.get(kept)) {
                 Some(kept) => {
-                    (record.record_version, record.updated_at_ns)
-                        >= (kept.record_version, kept.updated_at_ns)
+                    // Same rule as read.rs::is_fresher (timestamp-first).
+                    // NOTE: does NOT include mvcc_is_newer's tombstone-first
+                    // exact-tie rule — this input is pre-deduped so ties
+                    // cannot occur here (verified: get_collection_vectors
+                    // returns one winner per oid via the memtable).
+                    (record.updated_at_ns, record.record_version)
+                        > (kept.updated_at_ns, kept.record_version)
                 }
                 None => true,
             };

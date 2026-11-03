@@ -8036,9 +8036,13 @@ impl DmlService {
                 projection.version.map(|version| version as u64 + 1)
             }
         };
-        let mut updated_at_ns = chrono::Utc::now()
-            .timestamp_millis()
-            .saturating_mul(1_000_000);
+        // TD-MEMTABLE-MVCC-1 residual (a): stamp FULL nanoseconds, matching
+        // the INSERT path (which inherits full ns from ProximaRecord::default
+        // via to_proxima_record). The old millisecond truncation made an
+        // INSERT followed by an UPDATE within the same millisecond order the
+        // UPDATE as OLDER under every ns-first comparator — the update was
+        // invisible until another write.
+        let mut updated_at_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
         if let Some(timestamp_ns) = assigned_timestamp_ns {
             created_at_ns = Some(timestamp_ns);
             updated_at_ns = timestamp_ns;
