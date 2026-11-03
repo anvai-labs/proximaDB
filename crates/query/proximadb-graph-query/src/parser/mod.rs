@@ -343,43 +343,36 @@ fn parse_path_chain(input: &str) -> IResult<&str, (Vec<NodePattern>, Vec<EdgePat
 
 // Parse WHERE clause conditions
 fn parse_where_condition(input: &str) -> IResult<&str, WhereClause> {
-    alt((
-        // Logical AND
-        map(
-            tuple((
-                parse_where_primary,
-                preceded(
-                    delimited(multispace1, tag_no_case("AND"), multispace1),
-                    parse_where_condition,
-                ),
-            )),
-            |(left, right)| WhereClause::And(Box::new(left), Box::new(right)),
+    // FLAT LEFT-ASSOCIATIVE chaining (TD-GRAPH-4 step 3, review M4): the
+    // retired modality grammar — the LIVE public semantics — chained
+    // AND/OR/XOR at one precedence level, folding left. The previous
+    // tiered recursion (AND above OR above XOR) silently flipped the
+    // boolean meaning of mixed chains (`a AND b OR c` parsed as
+    // a∧(b∨c) instead of (a∧b)∨c). The decision is now deliberate and
+    // PINNED (where_mixed_precedence corpus entries).
+    let (input, first) = parse_where_primary(input)?;
+    let result = many0(tuple((
+        delimited(
+            multispace1,
+            alt((tag_no_case("AND"), tag_no_case("OR"), tag_no_case("XOR"))),
+            multispace1,
         ),
-        // Logical OR
-        map(
-            tuple((
-                parse_where_primary,
-                preceded(
-                    delimited(multispace1, tag_no_case("OR"), multispace1),
-                    parse_where_condition,
-                ),
-            )),
-            |(left, right)| WhereClause::Or(Box::new(left), Box::new(right)),
-        ),
-        // Logical XOR (the modality grammar's combinator)
-        map(
-            tuple((
-                parse_where_primary,
-                preceded(
-                    delimited(multispace1, tag_no_case("XOR"), multispace1),
-                    parse_where_condition,
-                ),
-            )),
-            |(left, right)| WhereClause::Xor(Box::new(left), Box::new(right)),
-        ),
-        // Primary condition
         parse_where_primary,
-    ))(input)
+    )))(input);
+    match result {
+        Ok((remaining, pairs)) => {
+            let mut current = first;
+            for (op, right) in pairs {
+                current = match op.to_uppercase().as_str() {
+                    "AND" => WhereClause::And(Box::new(current), Box::new(right)),
+                    "OR" => WhereClause::Or(Box::new(current), Box::new(right)),
+                    _ => WhereClause::Xor(Box::new(current), Box::new(right)),
+                };
+            }
+            Ok((remaining, current))
+        }
+        Err(e) => Err(e),
+    }
 }
 
 fn parse_where_primary(input: &str) -> IResult<&str, WhereClause> {
@@ -1478,11 +1471,11 @@ mod tests {
         // superset — floats (incl. negatives/exponents), null, arrays,
         // negative integers, case-insensitive booleans, quoted keys.
         let (_, m) = lexemes::property_value_map::<nom::error::Error<&str>>(
-            "{score: -1.5e2, ratio: 3.14, missing: null, tags: [1, 'a', true], name: Null}",
+            "{score: -1.5e2, ratio: 2.5, missing: null, tags: [1, 'a', true], name: Null}",
         )
         .expect("superset map parses");
         assert_eq!(m["score"], serde_json::json!(-150.0));
-        assert_eq!(m["ratio"], serde_json::json!(3.14));
+        assert_eq!(m["ratio"], serde_json::json!(2.5));
         assert_eq!(m["missing"], serde_json::Value::Null);
         assert_eq!(m["tags"], serde_json::json!([1, "a", true]));
         assert_eq!(m["name"], serde_json::Value::Null);
