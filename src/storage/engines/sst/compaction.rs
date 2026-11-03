@@ -1052,6 +1052,11 @@ impl Compaction {
         // inserted — double-enqueue to the same output. Marking active here,
         // atomically with the dedup, closes that TOCTOU. The worker only
         // removes the entry after completion.
+        //
+        // TD-TIER-1 SC5 (WAL-recovery residual): a declined enqueue first
+        // offers its explicit tier to the queued task that owns the work (see
+        // `adopt_incoming_tier_on_queued_owner`) so the collection's current
+        // intent is not stranded on an untiered dedup winner.
         {
             let mut active = self.active_compactions.write().await;
             if active.contains_key(&compaction_key) {
@@ -1059,6 +1064,8 @@ impl Compaction {
                     "Skipping compaction - already active for output file {}",
                     compaction_key
                 );
+                drop(active);
+                self.adopt_incoming_tier_on_queued_owner(&task).await;
                 return Ok(false);
             }
             if active.values().any(|active_task| {
@@ -1071,6 +1078,8 @@ impl Compaction {
                     collection_object_id = task.collection_object_id,
                     "Skipping compaction - an input file is already owned by another morsel"
                 );
+                drop(active);
+                self.adopt_incoming_tier_on_queued_owner(&task).await;
                 return Ok(false);
             }
             active.insert(compaction_key, task.clone());
@@ -1096,6 +1105,58 @@ impl Compaction {
         );
 
         Ok(true)
+    }
+
+    /// TD-TIER-1 SC5 (WAL-recovery residual): an enqueue declined by the dedup
+    /// (same output file, or an input file owned by another morsel) must not
+    /// strand the collection's CURRENT tier intent on the task that owns the
+    /// work — the original case is an untiered recovery-enqueued winner whose
+    /// long-lived output would publish at the account default. While the owner
+    /// is still QUEUED it adopts the incoming task's explicit tier: the output
+    /// PUT has not happened, so the latest collection intent wins (this also
+    /// lets an operator tier change reach a queued-but-unstarted compaction).
+    /// A task already popped by a worker is in flight and keeps its tier — a
+    /// change applies from the next enqueue — and an incoming `None` (e.g. a
+    /// recovery flush whose collection record did not resolve) never erases a
+    /// resolved tier.
+    ///
+    /// The queue lock makes the adoption atomic with the worker's pop. No lock
+    /// nesting anywhere on this path (the enqueue's active-map guard is always
+    /// dropped before the queue lock is taken, and the active-map refresh here
+    /// is a best-effort `try_write` that never blocks).
+    async fn adopt_incoming_tier_on_queued_owner(&self, incoming: &SstCompactionTask) {
+        let Some(incoming_tier) = incoming.access_tier else {
+            return;
+        };
+        let mut adopted_output_keys: Vec<String> = Vec::new();
+        {
+            let mut queue = self.task_queue.lock().await;
+            for queued in queue.iter_mut() {
+                let same_output = queued.output_file == incoming.output_file;
+                let shares_input = queued
+                    .input_files
+                    .iter()
+                    .any(|input| incoming.input_files.contains(input));
+                if (same_output || shares_input) && queued.access_tier != Some(incoming_tier) {
+                    queued.access_tier = Some(incoming_tier);
+                    if same_output {
+                        adopted_output_keys.push(queued.output_file.to_string_lossy().to_string());
+                    }
+                }
+            }
+        }
+        // Keep the dedup snapshot consistent with the adopted tier. The
+        // snapshot's tier is never read for the publish (the worker uses the
+        // popped task); this is bookkeeping only.
+        if !adopted_output_keys.is_empty()
+            && let Ok(mut active) = self.active_compactions.try_write()
+        {
+            for key in adopted_output_keys {
+                if let Some(active_task) = active.get_mut(&key) {
+                    active_task.access_tier = Some(incoming_tier);
+                }
+            }
+        }
     }
 
     /// TD-COMPACT-6 (ADR-076 D1): the production flush-path compaction trigger.
