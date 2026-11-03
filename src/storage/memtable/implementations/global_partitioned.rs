@@ -355,27 +355,31 @@ impl CollectionPartition {
     ///      tombstone beat a live copy written earlier, even when the live
     ///      copy has a higher `record_version`, e.g. every DocumentService
     ///      document at version 1 vs a version-0 tombstone)
-    ///   2. `record_version` (higher wins — an explicit version bump)
-    ///   3. `batch_seq` (the partition's monotonic insertion counter —
+    ///   2. TOMBSTONE-WINS-EXACT-TIE (residual (d), mandate 16d): at the
+    ///      exact same nanosecond, a tombstone beats a live copy regardless
+    ///      of version — matching `unflushed_supersedes` on the search path.
+    ///      Without this, a same-instant live v1 vs tombstone v0 is visible
+    ///      to scan/get-by-id but hidden to search (cross-surface 16d).
+    ///   3. `record_version` (higher wins — an explicit version bump)
+    ///   4. `batch_seq` (the partition's monotonic insertion counter —
     ///      later-inserted batch wins; NEVER HashMap iteration order)
-    ///
-    /// This matches `read.rs::is_fresher` (timestamp-first), the search-path
-    /// merge (`core::search::merge`), and the storage-inclusive list merge.
     fn mvcc_is_newer(
         candidate: &ProximaRecord,
         candidate_batch_seq: u64,
         current: &ProximaRecord,
         current_batch_seq: u64,
     ) -> bool {
-        (
-            candidate.updated_at_ns,
-            candidate.record_version,
-            candidate_batch_seq,
-        ) > (
-            current.updated_at_ns,
-            current.record_version,
-            current_batch_seq,
-        )
+        if candidate.updated_at_ns != current.updated_at_ns {
+            return candidate.updated_at_ns > current.updated_at_ns;
+        }
+        // Exact-instant tie: tombstone wins BEFORE version (mandate 16d —
+        // matches unflushed_supersedes on the search path, residual (d)).
+        let tombstone = |r: &ProximaRecord| r.valid_to_ns == Some(0);
+        if tombstone(candidate) != tombstone(current) {
+            return tombstone(candidate);
+        }
+        (candidate.record_version, candidate_batch_seq)
+            > (current.record_version, current_batch_seq)
     }
 
     fn latest_version_by_id(&self, vector_id: &str) -> Option<ProximaRecord> {
@@ -1879,6 +1883,61 @@ mod tests {
         assert!(
             surviving.is_empty(),
             "TD-MEMTABLE-MVCC-1 fm2: the second write (tombstone) must deterministically beat the first (live) even in the same millisecond; got {} surviving",
+            surviving.len()
+        );
+    }
+
+    /// TD-MEMTABLE-MVCC-1 residual (d) — exact-timestamp tie with live v1 vs
+    /// tombstone v0: the tombstone must win (mandate 16d), matching the search
+    /// path's `unflushed_supersedes` which orders tombstone-first on exact
+    /// ties. The current comparator orders version-first on ties, so the live
+    /// copy (v1 > v0) wins and the row stays visible to scan while search
+    /// hides it — a cross-surface 16d violation.
+    #[tokio::test]
+    async fn tombstone_wins_exact_timestamp_tie_over_higher_version_live() {
+        let memtable = GlobalPartitionedMemtable::new();
+        let collection_id = "1mvcc_rd";
+
+        // BOTH records at the EXACT SAME nanosecond — the tie case
+        let tie_ns: i64 = 1_700_000_000_000_000_000;
+
+        // Live copy: record_version=1 (DocumentService default)
+        let mut live = make_proxima_record("tie_doc", vec![0.1, 0.2, 0.3], 1, None);
+        live.updated_at_ns = tie_ns;
+
+        // Tombstone: record_version=0, SAME timestamp
+        let mut tombstone = make_proxima_record("tie_doc", vec![], 0, Some(0));
+        tombstone.updated_at_ns = tie_ns;
+
+        let batch1 = WALVectorBatch {
+            batch_id: BatchId::new(),
+            vector_records: Arc::new(vec![live]),
+            timestamp: std::time::SystemTime::now(),
+            total_size_bytes: 128,
+            is_flushed: false,
+            metadata_bloom_filter: None,
+        };
+        let batch2 = WALVectorBatch {
+            batch_id: BatchId::new(),
+            vector_records: Arc::new(vec![tombstone]),
+            timestamp: std::time::SystemTime::now(),
+            total_size_bytes: 64,
+            is_flushed: false,
+            metadata_bloom_filter: None,
+        };
+        memtable.add_wal_batch(collection_id, batch1).await.unwrap();
+        memtable.add_wal_batch(collection_id, batch2).await.unwrap();
+
+        // The tombstone must win the exact-tie: scan must NOT return the live copy
+        let visible = memtable
+            .get_collection_vectors(collection_id)
+            .await
+            .unwrap();
+        let surviving: Vec<&ProximaRecord> =
+            visible.iter().filter(|r| r.oid == "tie_doc").collect();
+        assert!(
+            surviving.is_empty(),
+            "TD-MEMTABLE-MVCC-1 rd: the tombstone must win an exact-timestamp tie over a higher-version live copy (16d); got {} surviving",
             surviving.len()
         );
     }
