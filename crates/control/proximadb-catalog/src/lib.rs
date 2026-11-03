@@ -20,6 +20,29 @@ pub mod proto {
     pub use proximadb_proto::proximadb_v1;
 }
 
+// ── TD-PATH-2 4c: identity writer-version ladder ─────────────────────────────
+// Shared by BOTH catalog implementations (SystemCatalog snapshot + sidecar,
+// NativeCatalog `_syscat/identity_high_water.json`) so a high-water-aware
+// binary can tell whether a durable artifact it is adopting was published by
+// an older binary that did not maintain the identity high-water.
+
+/// The catalog's identity artifacts were written by a binary that predates
+/// the TD-PATH-2 identity high-water (or the artifact carries no stamp at
+/// all — additive `serde(default)` decodes as `None`).
+pub const IDENTITY_WRITER_VERSION_LEGACY: u32 = 1;
+
+/// The current writer: maintains the identity high-water in its snapshots and
+/// sidecars, and stamps every such artifact so a later reader can detect (and
+/// WARN about) a lagging publisher.
+pub const IDENTITY_WRITER_VERSION_HIGH_WATER: u32 = 2;
+
+/// Whether an adopted artifact's writer-version stamp was produced by a
+/// pre-high-water binary (`None` stamp = written before the stamp existed).
+/// The caller logs a WARN and leans on the independent sidecar / WAL floor.
+pub fn identity_writer_version_lags(stamp: Option<u32>) -> bool {
+    stamp.unwrap_or(IDENTITY_WRITER_VERSION_LEGACY) < IDENTITY_WRITER_VERSION_HIGH_WATER
+}
+
 pub mod cache;
 // Runtime/wiring modules extracted from the root `src/catalog` (decomposition
 // Slice 1 — foundation-pure leaves). The root `crate::catalog` re-exports these

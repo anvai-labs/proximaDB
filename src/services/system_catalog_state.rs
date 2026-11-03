@@ -91,6 +91,21 @@ impl CatalogDelta {
         }
     }
 
+    /// TD-PATH-2 4a: can this delta type raise the identity high-water the
+    /// sidecar carries? Every variant can mint or retire an id EXCEPT
+    /// `UpsertStatistics` — it mutates only a per-table stats row (row counts,
+    /// sizes), so a stats-only commit cannot move the floor. This gates the
+    /// mint-time sidecar persist in `SystemCatalog::commit_batch_locked`:
+    /// DML row-count updates flow through `update_statistics` as
+    /// `UpsertStatistics`-only commits on the ingest hot path, and they must
+    /// not pay the sidecar round-trip (a read + tmp + fsync + rename on local
+    /// stores; a GET+PUT pair on `requires_snapshot_on_commit` object stores).
+    /// The checkpoint-time write stays unconditional — that one is
+    /// load-bearing for WAL compaction.
+    pub fn touches_ids_high_water(&self) -> bool {
+        !matches!(self, CatalogDelta::UpsertStatistics { .. })
+    }
+
     /// Encode this delta as a `CanonicalOperation::CatalogMutation` ready for
     /// [`TableWalAppender::append_operations`]. Uses field-named MessagePack so
     /// the additive-serde evolution of `CatalogTableSchema` stays compatible.
@@ -144,6 +159,12 @@ struct CatalogInner {
     /// dead one's grants. WAL replay rebuilds these from the create deltas;
     /// the snapshot carries them so compaction cannot forget a dropped id.
     ids_high_water: IdsHighWater,
+    /// TD-PATH-2 4c: writer-version stamp of the snapshot this state was last
+    /// decoded from. `None` = built without a snapshot (WAL replay only);
+    /// `Some(None)` = adopted an UNSTAMPED snapshot, i.e. published by a
+    /// pre-high-water binary — the WARN condition. Transient: never
+    /// serialized, set only by [`Self::inner_from_snapshot_bytes`].
+    loaded_writer_version: Option<Option<u32>>,
 }
 
 /// TD-PATH-2: monotonic identity high-water marks (see `CatalogInner`).
@@ -158,6 +179,16 @@ struct IdsHighWater {
 }
 
 impl IdsHighWater {
+    /// TD-PATH-2 4a: monotone merge — raise every dimension to the max of the
+    /// two, never lower. The sidecar adopt path and the merge-before-write in
+    /// `SystemCatalog::persist_identity_high_water_sidecar` both rely on this
+    /// so a stale or partially-read artifact can never regress the floor.
+    fn merge_max(&mut self, other: IdsHighWater) {
+        self.object_id = self.object_id.max(other.object_id);
+        self.collection_id = self.collection_id.max(other.collection_id);
+        self.namespace_id = self.namespace_id.max(other.namespace_id);
+    }
+
     fn fold_table(&mut self, schema: &CatalogTableSchema) {
         let ids = schema
             .object_id
@@ -259,6 +290,30 @@ struct CatalogSnapshot {
     /// bound the floor, as before).
     #[serde(default)]
     ids_high_water: Option<IdsHighWater>,
+    /// TD-PATH-2 4c: writer-version stamp — identifies the publisher's
+    /// identity-high-water awareness. Absent on decode = published by a
+    /// pre-high-water binary (whose checkpoints compact the WAL past the
+    /// watermark without preserving the dropped-id floor anywhere it names);
+    /// a high-water-aware binary WARNs when it adopts such a snapshot.
+    #[serde(default)]
+    writer_version: Option<u32>,
+}
+
+/// TD-PATH-2 4a: the durable identity-high-water SIDECAR image — a tiny
+/// object beside the catalog snapshot, written and read independently of the
+/// snapshot pointer. It exists because an older (pre-high-water) binary
+/// publishing a snapshot re-encodes the live state WITHOUT the `ids_high_water`
+/// key and compacts the WAL past the watermark, destroying the create deltas
+/// replay would fold; the sidecar is the floor record that publisher cannot
+/// touch (it never names the sidecar's path/key).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+struct IdentityHighWaterSidecar {
+    /// TD-PATH-2 4c stamp (`None` = written before the stamp existed).
+    #[serde(default)]
+    writer_version: Option<u32>,
+    /// The floor itself (all fields always encoded by this writer).
+    #[serde(default)]
+    high_water: IdsHighWater,
 }
 
 /// In-RAM authoritative system-catalog state.
@@ -482,6 +537,7 @@ impl SystemCatalogState {
             statistics: inner.statistics.clone(),
             applied_seq: inner.applied_seq,
             ids_high_water: Some(inner.ids_high_water),
+            writer_version: Some(proximadb_catalog::IDENTITY_WRITER_VERSION_HIGH_WATER),
         };
         rmp_serde::to_vec_named(&snapshot).context("encoding catalog snapshot")
     }
@@ -547,7 +603,40 @@ impl SystemCatalogState {
             object_ids,
             applied_seq: snapshot.applied_seq,
             ids_high_water,
+            loaded_writer_version: Some(snapshot.writer_version),
         })
+    }
+
+    /// TD-PATH-2 4c: the writer-version stamp of the snapshot this state was
+    /// last decoded from. `None` = the state was built without a snapshot
+    /// (WAL replay only); `Some(None)` = an unstamped (pre-high-water)
+    /// snapshot; `Some(Some(v))` = stamped by writer version `v`.
+    pub fn loaded_writer_version(&self) -> Option<Option<u32>> {
+        self.inner.read().loaded_writer_version
+    }
+
+    /// TD-PATH-2 4a: encode the durable high-water sidecar image (see
+    /// [`IdentityHighWaterSidecar`]). Stamped with the current writer version.
+    pub fn to_identity_high_water_sidecar_bytes(&self) -> Result<Vec<u8>> {
+        let sidecar = IdentityHighWaterSidecar {
+            writer_version: Some(proximadb_catalog::IDENTITY_WRITER_VERSION_HIGH_WATER),
+            high_water: self.inner.read().ids_high_water,
+        };
+        rmp_serde::to_vec_named(&sidecar).context("encoding identity high-water sidecar")
+    }
+
+    /// TD-PATH-2 4a: fold a sidecar image into state — monotone (`merge_max`,
+    /// never lowers) — and return the sidecar's writer-version stamp so the
+    /// caller can WARN on a lagging (pre-high-water) writer.
+    pub fn adopt_identity_high_water_sidecar_bytes(&self, bytes: &[u8]) -> Result<Option<u32>> {
+        let sidecar: IdentityHighWaterSidecar =
+            rmp_serde::from_slice(bytes).context("decoding identity high-water sidecar")?;
+        let stamp = sidecar.writer_version;
+        self.inner
+            .write()
+            .ids_high_water
+            .merge_max(sidecar.high_water);
+        Ok(stamp)
     }
 }
 
@@ -747,6 +836,96 @@ mod tests {
                 .and_then(|schema| schema.stable_collection_id),
             Some(3)
         );
+        Ok(())
+    }
+
+    /// TD-PATH-2 4c: the writer-version stamp rides the snapshot — a stamped
+    /// snapshot decodes back as `Some(Some(2))` (no lag WARN), an unstamped
+    /// (legacy) one as `Some(None)` (the WARN condition), and WAL-only
+    /// construction is `None` (nothing adopted, nothing to WARN about).
+    #[test]
+    fn snapshot_writer_version_stamp_is_visible_on_adoption() -> Result<()> {
+        // Legacy shape: no `writer_version` key at all.
+        #[derive(Serialize, Deserialize)]
+        struct UnstampedSnapshot {
+            account_ids: HashMap<String, u32>,
+            namespaces: HashMap<Vec<String>, CatalogNamespace>,
+            tables: HashMap<TableIdentifier, CatalogTableSchema>,
+            statistics: HashMap<TableIdentifier, CatalogTableStatistics>,
+            applied_seq: u64,
+        }
+        let legacy = UnstampedSnapshot {
+            account_ids: HashMap::new(),
+            namespaces: HashMap::new(),
+            tables: HashMap::new(),
+            statistics: HashMap::new(),
+            applied_seq: 1,
+        };
+        let adopted = SystemCatalogState::from_snapshot_bytes(&rmp_serde::to_vec_named(&legacy)?)?;
+        assert_eq!(adopted.loaded_writer_version(), Some(None));
+        assert!(proximadb_catalog::identity_writer_version_lags(None));
+
+        // Current writer: stamped, no lag.
+        let stamped = SystemCatalogState::new();
+        let round = SystemCatalogState::from_snapshot_bytes(&stamped.to_snapshot_bytes()?)?;
+        assert_eq!(
+            round.loaded_writer_version(),
+            Some(Some(proximadb_catalog::IDENTITY_WRITER_VERSION_HIGH_WATER))
+        );
+        assert!(!proximadb_catalog::identity_writer_version_lags(Some(
+            proximadb_catalog::IDENTITY_WRITER_VERSION_HIGH_WATER
+        )));
+
+        // WAL-only construction: nothing was adopted.
+        assert_eq!(SystemCatalogState::new().loaded_writer_version(), None);
+        Ok(())
+    }
+
+    /// TD-PATH-2 4a: the sidecar round-trips the floor, adoption is monotone
+    /// (a lower image never lowers it), and the sidecar carries the stamp.
+    #[test]
+    fn identity_high_water_sidecar_round_trips_and_adoption_is_monotone() -> Result<()> {
+        let state = SystemCatalogState::new();
+        let mut schema = CatalogTableSchema::new("newest");
+        schema.object_id = Some(50);
+        schema.stable_collection_id = Some(7);
+        schema.stable_namespace_id = Some(3);
+        state.apply_committed(
+            1,
+            CatalogDelta::UpsertTable {
+                identifier: tid(&["t"], "newest"),
+                schema: Box::new(schema),
+            },
+        );
+        let bytes = state.to_identity_high_water_sidecar_bytes()?;
+
+        // Adoption into an EMPTY state restores the floor dimensions...
+        let fresh = SystemCatalogState::new();
+        let stamp = fresh.adopt_identity_high_water_sidecar_bytes(&bytes)?;
+        assert_eq!(
+            stamp,
+            Some(proximadb_catalog::IDENTITY_WRITER_VERSION_HIGH_WATER)
+        );
+        assert_eq!(fresh.max_collection_id_ever(), Some(7));
+        assert_eq!(fresh.max_object_id(), Some(50));
+        assert_eq!(fresh.max_namespace_id_ever(), Some(3));
+
+        // ...and a STALE (older) sidecar can never lower them.
+        let mut schema_low = CatalogTableSchema::new("older");
+        schema_low.object_id = Some(9);
+        schema_low.stable_collection_id = Some(2);
+        let lagging = SystemCatalogState::new();
+        lagging.apply_committed(
+            1,
+            CatalogDelta::UpsertTable {
+                identifier: tid(&["t"], "older"),
+                schema: Box::new(schema_low),
+            },
+        );
+        let lagging_bytes = lagging.to_identity_high_water_sidecar_bytes()?;
+        fresh.adopt_identity_high_water_sidecar_bytes(&lagging_bytes)?;
+        assert_eq!(fresh.max_collection_id_ever(), Some(7));
+        assert_eq!(fresh.max_object_id(), Some(50));
         Ok(())
     }
 
