@@ -866,10 +866,13 @@ async fn v2_fp32_point_read_is_byte_exact_after_flush() {
 /// "no input has the tier", so the merged segment was written lossy and an
 /// `fp32` collection re-lossified at its first compaction.
 ///
-/// Drives the real trigger: five forced flushes reach the default L0 threshold
-/// (`L0_COMPACTION_THRESHOLD = 5`), the flush enqueues compaction, and the
-/// background worker merges the five tier'd segments into one. No test-only
-/// compaction entry point is used.
+/// Drives the production operator trigger: five forced flushes reach the
+/// default L0 threshold (`L0_COMPACTION_THRESHOLD = 5`), then an explicit
+/// operator compaction (the same entry point as `COMPACT TABLE`) merges the
+/// five tier'd segments into one and AWAITS the result. The background
+/// worker's admission gate never reliably opens on memory-tight CI runners,
+/// so the wall-clock poll this test used first could pass only on an idle
+/// dev box.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn v2_fp32_point_read_is_byte_exact_after_compaction() {
     let server = TestServer::start().await.expect("server start");
@@ -926,9 +929,30 @@ async fn v2_fp32_point_read_is_byte_exact_after_compaction() {
         server.force_flush(&name).await.expect("force flush");
     }
 
-    // Every flushed segment carries the exact tier (TD-READFID-1). Then wait
-    // for the background compaction the fifth flush enqueued to retire them.
-    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    // Every flushed segment carries the exact tier (TD-READFID-1). The
+    // explicit operator compaction awaits the merge, so the result is
+    // deterministic on any runner; the short settle only covers the file
+    // listing's visibility of retired L0s.
+    // The PRODUCTION operator surface: POST /api/v2/collections/{id}/compact
+    // (TD-COMPACT-14) — same entry as `COMPACT TABLE`, awaits, and reports
+    // segments_before/after so the merge is asserted, not polled.
+    let compact = http
+        .post(format!(
+            "{}/api/v2/collections/{}/compact",
+            server.base_url(),
+            name
+        ))
+        .json(&json!({"full": false}))
+        .send()
+        .await
+        .expect("compact request");
+    assert!(
+        compact.status().is_success(),
+        "compact: {} {}",
+        compact.status(),
+        compact.text().await.unwrap_or_default()
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
     let merged = loop {
         let pax = server.persisted_pax_files();
         if pax.len() == 1 {

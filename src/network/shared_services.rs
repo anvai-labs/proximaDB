@@ -2129,6 +2129,15 @@ impl SharedServices {
                      replayed tables stay resident until each table's first write"
                 ),
             }
+            // Release-review F7: once the WAL has been truncated below its
+            // head (`retained_from() > 1` — the same condition the spill-off
+            // boot refusal treats as "rows may be in no retained WAL entry"),
+            // a failed replay is not self-healing: the retained tail is the
+            // only copy of the unflushed rows, so serving whatever replayed
+            // is a silent subset, exactly the failure the DATA_FORMAT marker
+            // exists to refuse. Fatal there; a never-truncated WAL keeps the
+            // legacy warn-and-recover-on-restart posture.
+            let truncated_history = appender.retained_from() > 1;
             match appender.read_entries().await {
                 Ok(entries) => match store.replay_wal_entries(entries).await {
                     Ok(_) => record_store_recovered = true,
@@ -2138,12 +2147,29 @@ impl SharedServices {
                                 "canonical record-store WAL replay failed with [oltp] atomic_commit on; refusing to serve partial state: {e:#}"
                             );
                         }
+                        if truncated_history {
+                            anyhow::bail!(
+                                "canonical record-store WAL replay failed on a truncated WAL \
+                                 (retained from LSN {}); the retained tail is the only copy of \
+                                 unflushed rows, so serving the partial replay would silently \
+                                 drop data. Restore or investigate the WAL, then restart: {e:#}",
+                                appender.retained_from()
+                            );
+                        }
                         warn!("SharedServices: canonical record-store WAL replay failed: {e}");
                     }
                 },
                 Err(e) if atomic_commit => {
                     anyhow::bail!(
                         "reading the canonical WAL failed with [oltp] atomic_commit on; refusing to serve: {e:#}"
+                    );
+                }
+                Err(e) if truncated_history => {
+                    anyhow::bail!(
+                        "reading the canonical WAL failed on a truncated WAL (retained from \
+                         LSN {}); the retained tail is the only copy of unflushed rows, so \
+                         serving without it would silently drop data: {e:#}",
+                        appender.retained_from()
                     );
                 }
                 Err(e) => {

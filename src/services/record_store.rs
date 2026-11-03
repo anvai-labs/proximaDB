@@ -2986,6 +2986,20 @@ impl DirectWalTableRecordStore {
                  durable per partition, so the WAL cannot be truncated on its account"
             );
         }
+        // TD-WALPOISON-1: a poisoned store has durable WAL entries that no
+        // partition holds (their apply failed after the append) and no
+        // in-flight reservation (released when the write returned). Until a
+        // restart replays them, any answer here lets the truncator delete
+        // committed entries once the WAL head and the change-feed window pass
+        // them — refuse instead; the truncator stops on any refusal, keeping
+        // the WAL for the restart that clears the poison.
+        if self.poisoned.load(std::sync::atomic::Ordering::SeqCst) {
+            anyhow::bail!(
+                "record store is poisoned: a durable write could not be applied, so its WAL \
+                 entries are held by no partition and no reservation — refusing to answer a \
+                 truncation floor until a restart replays them"
+            );
+        }
         let partitions = self.partition_snapshot();
         let mut floor: Option<u64> = None;
         for ((tenant_id, collection), partition) in partitions {
