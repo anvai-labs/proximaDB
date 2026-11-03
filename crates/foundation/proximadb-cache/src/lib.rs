@@ -36,6 +36,7 @@ pub mod policy;
 
 pub use persistent_l2::{
     L2Class, PersistentByteStore, ProtectionGroup, ProtectionSweep, canonical_location, object_key,
+    region_key,
 };
 
 /// TD-TIER-1 SC4-1: the process-wide residency-budget bridge.
