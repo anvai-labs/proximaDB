@@ -157,6 +157,7 @@ impl<T: FileSystem + ?Sized> ResidentRangeRead for T {
         if let Some(resident) = Resident::lookup(path)
             && let Some(bytes) = resident.range(offset, length).await
         {
+            crate::storage::engines::sst::metrics::record_resident_hit();
             return Ok(bytes);
         }
         self.read_range(path, offset, length).await
@@ -202,6 +203,7 @@ impl<T: FileSystem + ?Sized> ResidentRangeRead for T {
                 }
             }
             if complete {
+                crate::storage::engines::sst::metrics::record_resident_hit();
                 if identity {
                     return Ok(buffers);
                 }
@@ -223,6 +225,7 @@ impl<T: FileSystem + ?Sized> ResidentRangeRead for T {
         if let Some(resident) = Resident::lookup(path)
             && let Some(bytes) = resident.range(0, resident.len).await
         {
+            crate::storage::engines::sst::metrics::record_resident_hit();
             return Ok(bytes);
         }
         self.read(path).await

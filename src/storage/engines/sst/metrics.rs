@@ -69,6 +69,12 @@ lazy_static! {
         "proximadb_pax_metadata_ops_agg_total",
         "Object-storage HEAD/metadata ops on the SST search path (TD-RDSTRAT-13 C3 removes the per-segment HEAD)",
     );
+    /// TD-TIER-1 SC4 residual: a read served from the resident (granted)
+    /// local-disk copy — zero object-store cost. Per-query trace visibility.
+    pub static ref PAX_RESIDENT_HITS: IntCounter = counter(
+        "proximadb_pax_resident_hits_total",
+        "Reads served from the resident whole-object copy (admitted residency)",
+    );
     pub static ref IVF_PROBE_RANK_US: IntCounter = counter(
         "proximadb_ivf_probe_rank_us_agg_total",
         "Cumulative coarse-probe rank wall microseconds incl. morsel join (TD-RDSTRAT-13 C2 compute term)",
@@ -190,6 +196,11 @@ pub fn record_tier_get(tier_idx: usize, bytes: u64) {
 /// Record one object-storage metadata op (HEAD) on the search path (C3).
 pub fn record_metadata_op() {
     PAX_METADATA_OPS.inc();
+}
+
+/// TD-TIER-1 SC4 residual: record a read served from the resident copy.
+pub fn record_resident_hit() {
+    PAX_RESIDENT_HITS.inc();
 }
 
 /// Record one coarse-probe rank wall duration in microseconds (C2).
