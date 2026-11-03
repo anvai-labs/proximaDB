@@ -1,0 +1,43 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-WALBOOT-1 boot-decode measurement — linear, bytes-bound, worst when recovering
+
+Harness: `wal_boot_summary_rebuild_cost_measurement` (`#[ignore]`, advisory) in
+`src/services/canonical_wal.rs` — seals N segments (rotation at 1 byte, one append per
+segment, ~500 B records), then times `FramedTableWalAppender::open()` three times per N.
+Run: `cargo test --lib wal_boot_summary_rebuild_cost -- --ignored --nocapture`, **dev
+profile** (release numbers are the follow-up gate; the linear SHAPE is this artifact's
+finding). Host: aiserver1 (WSL2, 16 vCPU, 125 GB), /tmp on ext4, light load.
+
+== Data (2026-11-03)
+
+| Sealed segments | Bytes | open ms (1st / 2nd / 3rd) |
+|---|---|---|
+| 8 | 3,928 | 2 / 1 / 1 |
+| 32 | 15,734 | 5 / 5 / 5 |
+| 128 | 62,995 | 22 / 20 / 20 |
+| 512 | 252,948 | 93 / 81 / 80 |
+
+Fit: linear, **~0.32 ms per KB** (dev), stable across cold→warm opens (the decode is the
+cost, not the disk — page-cache-warm opens improve ≈10–15%).
+
+== Reading
+
+1. **The cost is bytes, not segment count** — `read_sealed_segment` decodes whole files, so
+   the summary rebuild is O(retained WAL bytes). Segment granularity is irrelevant to the
+   cost; a sidecar summary per segment saves the decode at any granularity.
+2. **The worst case lands at the worst time.** A healthy WAL truncates below
+   `min_unflushed_lsn` and stays small; the retained WAL grows to hundreds of MB exactly
+   when truncation is pinned — a poisoned store (TD-WALPOISON-1), ambiguous oids
+   (TD-USUB-19), or object-store outage — and the recovery for every one of those states is
+   **restart**. Extrapolated (dev): 0.5 GB ≈ 2.6 min; even a 10× release-profile
+   improvement puts a 2 GB pin-recovery boot at ~a minute. The sidecar-summary candidate is
+   justified by this data; the off-lock-truncation candidate still needs its
+   append-latency measurement (the truncate/rotate hold histograms shipped with this
+   instrumentation capture it in operation — no dedicated harness yet).
+
+== Limitations
+
+Dev-profile absolutes (release re-run pending); tiny uniform records (~500 B) rather than
+mixed payloads; single host, light load; extrapolation beyond 253 KB is linear-fit, not
+measured. None of these plausibly change the SHAPE; they bound the magnitude only.

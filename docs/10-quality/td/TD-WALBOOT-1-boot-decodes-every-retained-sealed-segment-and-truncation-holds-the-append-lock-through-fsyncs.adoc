@@ -5,7 +5,7 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | **Open — measurement-first (co-design mandate #2: trace before you tune).** Filed from the v0.4.x→v0.5.1 release review (finding F9, `RELEASE_REVIEW_v0.4_to_v0.5.1.md`).
+| Status | **Open — COST 1 MEASURED (2026-11-03, instrumentation + harness landed): boot rebuild is linear, bytes-bound at ~0.32 ms/KB dev-profile, and the worst case coincides with recovery from truncation-pin states (poison/ambiguous-oid), where the retained WAL is largest. Evidence: `docs/history/evidence/WALBOOT1_BOOT_DECODE_2026_11_03.adoc`; live metrics `proximadb_wal_boot_rebuild_seconds` / `_sealed_segments_decoded_total` / `_sealed_decoded_bytes_total`, and `proximadb_wal_append_lock_{truncate,rotate}_hold_seconds` for cost 2. The sidecar-summary candidate is justified; not yet implemented. Cost 2's hold histograms are in place for operational collection.** Filed from the v0.4.x→v0.5.1 release review (finding F9, `RELEASE_REVIEW_v0.4_to_v0.5.1.md`).
 | Priority | **MEDIUM (scalability/perf, not correctness).** Boot time and peak memory are O(retained WAL); every writer sees fsync-scale latency spikes on a 300 s cadence and at each 64 MiB rotation.
 | Component | `src/services/canonical_wal.rs` (`FramedTableWalAppender::open` / `read_sealed_segment` / `truncate_below` / `rotate_active`)
 | Relates to | TD-SEAM-2 (the rotation/truncation design), TD-USUB-19 and TD-WALPOISON-1 (the other WAL-retention costs of failing closed), TD-IOBUDGET-1 (the round-trip cost vocabulary)

@@ -553,6 +553,99 @@ async fn discover_sealed_segments(active: &Path) -> Result<Vec<(u64, PathBuf)>> 
     Ok(out)
 }
 
+/// TD-WALBOOT-1 instrumentation (measurement-first): the two costs the TD
+/// names, made observable before any change to them —
+/// * boot is O(retained WAL) in full decode (`open`'s summary rebuild): wall
+///   time, segments decoded, bytes decoded;
+/// * truncation and rotation hold the same `append_lock` as every append
+///   across fsync-scale work: hold-duration histograms per operation.
+///
+/// Histogram buckets span 1ms..60s (+Inf above), coarse by design (order-of-magnitude
+/// drift is the signal, not microseconds).
+struct WalCostMetrics {
+    boot_rebuild: prometheus::Histogram,
+    boot_segments: prometheus::IntCounter,
+    boot_bytes: prometheus::IntCounter,
+    truncate_hold: prometheus::Histogram,
+    rotate_hold: prometheus::Histogram,
+}
+
+fn wal_cost_metrics() -> &'static WalCostMetrics {
+    static METRICS: std::sync::OnceLock<WalCostMetrics> = std::sync::OnceLock::new();
+    METRICS.get_or_init(|| {
+        let histogram = |name: &str, help: &str| {
+            prometheus::register_histogram!(
+                name,
+                help,
+                vec![
+                    0.001, 0.005, 0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0
+                ]
+            )
+            .unwrap_or_else(|_| {
+                let opts = prometheus::HistogramOpts::new(
+                    format!("{name}_fallback"),
+                    "fallback",
+                )
+                .buckets(vec![
+                    0.001, 0.005, 0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0,
+                ]);
+                prometheus::Histogram::with_opts(opts)
+                    .unwrap_or_else(|_| unreachable!("valid histogram metric descriptor"))
+            })
+        };
+        let counter = |name: &str, help: &str| {
+            prometheus::register_int_counter!(name, help).unwrap_or_else(|_| {
+                prometheus::IntCounter::new(format!("{name}_fallback"), "fallback")
+                    .unwrap_or_else(|_| unreachable!("valid counter metric descriptor"))
+            })
+        };
+        WalCostMetrics {
+            boot_rebuild: histogram(
+                "proximadb_wal_boot_rebuild_seconds",
+                "Wall time of canonical-WAL open()'s sealed-segment summary rebuild (TD-WALBOOT-1: boot is O(retained WAL) in full decode)",
+            ),
+            boot_segments: counter(
+                "proximadb_wal_boot_sealed_segments_decoded_total",
+                "Sealed canonical-WAL segments fully decoded at boot to rebuild summaries (TD-WALBOOT-1)",
+            ),
+            boot_bytes: counter(
+                "proximadb_wal_boot_sealed_decoded_bytes_total",
+                "Bytes of sealed canonical-WAL segments fully decoded at boot (TD-WALBOOT-1)",
+            ),
+            truncate_hold: histogram(
+                "proximadb_wal_append_lock_truncate_hold_seconds",
+                "Duration truncate_below holds the append lock (floor-marker fsync + unlinks + dir fsync; TD-WALBOOT-1)",
+            ),
+            rotate_hold: histogram(
+                "proximadb_wal_append_lock_rotate_hold_seconds",
+                "Duration rotate_active holds the append lock (seal rename + dir fsync; TD-WALBOOT-1)",
+            ),
+        }
+    })
+}
+
+/// Observes a duration into `histogram` when dropped — measures a lock hold
+/// across every exit path without threading timers through early returns.
+struct HoldTimer<'a> {
+    started: std::time::Instant,
+    histogram: &'a prometheus::Histogram,
+}
+
+impl<'a> HoldTimer<'a> {
+    fn start(histogram: &'a prometheus::Histogram) -> Self {
+        Self {
+            started: std::time::Instant::now(),
+            histogram,
+        }
+    }
+}
+
+impl Drop for HoldTimer<'_> {
+    fn drop(&mut self) {
+        self.histogram.observe(self.started.elapsed().as_secs_f64());
+    }
+}
+
 /// Read every complete entry of a sealed segment. A sealed segment was synced
 /// before it was sealed, so anything short of a clean parse is corruption and
 /// fails closed (unlike the active file, whose torn tail is repaired on open).
@@ -633,7 +726,16 @@ impl FramedTableWalAppender {
         let mut sealed_last = truncated_through;
         let mut sealed_collection_max: std::collections::HashMap<String, u64> =
             std::collections::HashMap::new();
+        // TD-WALBOOT-1: the boot cost the TD names — measure it where it
+        // happens, so the sidecar-vs-status-quo decision is made on data.
+        let boot_started = std::time::Instant::now();
+        let mut boot_segments: u64 = 0;
+        let mut boot_bytes: u64 = 0;
         for (_, segment_path) in discover_sealed_segments(&path).await? {
+            boot_segments += 1;
+            if let Ok(meta) = tokio::fs::metadata(&segment_path).await {
+                boot_bytes += meta.len();
+            }
             let mut summary = SegmentSummary::new(segment_path.clone());
             for entry in read_sealed_segment(&segment_path).await? {
                 summary.observe(&entry);
@@ -657,6 +759,11 @@ impl FramedTableWalAppender {
             }
             sealed.push(summary);
         }
+        wal_cost_metrics()
+            .boot_rebuild
+            .observe(boot_started.elapsed().as_secs_f64());
+        wal_cost_metrics().boot_segments.inc_by(boot_segments);
+        wal_cost_metrics().boot_bytes.inc_by(boot_bytes);
 
         let mut recovery = recover_wal_state(&path).await?;
         recovery.last_sequence = recovery.last_sequence.max(sealed_last);
@@ -856,6 +963,7 @@ impl FramedTableWalAppender {
     /// list stable while victims are chosen.
     pub async fn truncate_below(&self, floor: u64) -> Result<WalTruncation> {
         let _guard = self.append_lock.lock().await;
+        let _hold = HoldTimer::start(&wal_cost_metrics().truncate_hold);
         let floor = self
             .pins
             .lock()
@@ -953,6 +1061,7 @@ impl FramedTableWalAppender {
     /// only acknowledged, complete frames. A failed rename leaves everything in
     /// the active file (nothing is lost; rotation is retried on the next append).
     async fn rotate_active(&self) {
+        let _hold = HoldTimer::start(&wal_cost_metrics().rotate_hold);
         let summary = {
             let active = self.active.lock();
             if active.first_seq.is_none() {
@@ -2053,6 +2162,52 @@ mod tests {
             _ if new == old => Ok(()),
             _ => Err(format!("{path}: format 2 wrote {old}, now {new}")),
         }
+    }
+
+    /// TD-WALBOOT-1 measurement harness (advisory, run explicitly):
+    /// `cargo test --lib wal_boot_summary_rebuild_cost -- --ignored --nocapture`.
+    /// Boot's summary rebuild is claimed O(retained WAL) in full decode; this
+    /// times `open()` across sealed-segment counts (3 opens each — the first
+    /// includes cold-ish disk reads, the later ones the page-cache floor) so
+    /// the sidecar-summary decision rests on data. Dev-profile provenance
+    /// unless run with --release; record whichever in the evidence artifact.
+    #[tokio::test]
+    #[ignore = "TD-WALBOOT-1 measurement harness: advisory, run explicitly"]
+    async fn wal_boot_summary_rebuild_cost_measurement() -> Result<()> {
+        for segments in [8u32, 32, 128, 512] {
+            let dir = tempfile::tempdir()?;
+            let wal_path = dir.path().join("boot-cost.wal");
+            {
+                let wal = FramedTableWalAppender::open(&wal_path).await?;
+                // Rotation at 1 byte: every append seals its own segment
+                // (the same trick the truncation tests use), so the segment
+                // count is exact without payload-size tuning.
+                wal.enable_segment_rotation(1);
+                for i in 0..segments {
+                    wal.append_operations(
+                        vec![upsert_operation("boot_cost", &format!("r{i}"))],
+                        Some("t".to_string()),
+                    )
+                    .await?;
+                }
+            }
+            let bytes: u64 = std::fs::read_dir(dir.path())?
+                .flatten()
+                .filter_map(|e| e.metadata().ok())
+                .map(|m| m.len())
+                .sum();
+            let mut samples_ms = Vec::new();
+            for _ in 0..3 {
+                let started = std::time::Instant::now();
+                let wal = FramedTableWalAppender::open(&wal_path).await?;
+                samples_ms.push(started.elapsed().as_millis());
+                drop(wal);
+            }
+            println!(
+                "TD-WALBOOT-1 boot rebuild: segments={segments} bytes={bytes} open_ms={samples_ms:?}"
+            );
+        }
+        Ok(())
     }
 
     fn upsert_operation(collection_id: &str, oid: &str) -> CanonicalOperation {
