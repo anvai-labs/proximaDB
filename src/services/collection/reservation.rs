@@ -1616,7 +1616,7 @@ fn owner_is_live(held: &OwnerToken) -> bool {
     #[cfg(not(target_os = "linux"))]
     {
         // No portable liveness probe: treat the lock as held (fail-closed).
-        return true;
+        true
     }
 }
 

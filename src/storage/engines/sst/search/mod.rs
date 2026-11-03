@@ -93,16 +93,11 @@ const MAX_CACHED_SEGMENT_LISTINGS: usize = 1024;
 /// snapshot after the invalidation already fired.
 #[derive(Default)]
 struct SegmentListingCache {
-    entries: std::collections::HashMap<String, (std::time::Instant, Vec<DiscoveredSstFile>)>,
+    entries: std::collections::HashMap<
+        crate::storage::persistence::filesystem::DirectoryCacheIdentity,
+        (std::time::Instant, Vec<DiscoveredSstFile>),
+    >,
     generation: u64,
-}
-
-impl SegmentListingCache {
-    /// Trailing-`/` differences between the discovery and invalidation
-    /// paths must not fork entries.
-    fn key(url: &str) -> String {
-        url.trim_end_matches('/').to_string()
-    }
 }
 
 fn segment_listing_cache() -> &'static std::sync::Mutex<SegmentListingCache> {
@@ -111,12 +106,28 @@ fn segment_listing_cache() -> &'static std::sync::Mutex<SegmentListingCache> {
 
 /// Invalidate a collection's cached segment listing (called by the flush and
 /// compaction publish paths). `storage_url` is the collection data directory.
-pub(crate) fn invalidate_segment_listing_cache(storage_url: &str) {
+pub(crate) fn invalidate_segment_listing_cache(
+    filesystem: &crate::storage::persistence::filesystem::FilesystemFactory,
+    storage_url: &str,
+) {
+    let identity = filesystem
+        .directory_cache_identity(storage_url)
+        .ok()
+        .flatten();
     let mut cache = segment_listing_cache()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    cache.entries.remove(&SegmentListingCache::key(storage_url));
-    cache.generation += 1;
+    match identity {
+        Some(key) if key.namespace == 0 => {
+            cache.entries.remove(&key);
+        }
+        // Remote factories can bind different endpoints. Conservatively retire
+        // remote entries across factories so same-store writers using another
+        // factory cannot leave stale listings; no endpoint equivalence guessed.
+        Some(_) => cache.entries.retain(|key, _| key.namespace == 0),
+        None => cache.entries.clear(),
+    }
+    cache.generation = cache.generation.wrapping_add(1);
 }
 
 /// Publication can become durable inside an awaited backend/coordinator call.
@@ -124,21 +135,26 @@ pub(crate) fn invalidate_segment_listing_cache(storage_url: &str) {
 /// cancellation after the output moved but before cleanup completed. This does
 /// not fence backend I/O that finishes after its future has been dropped.
 #[must_use]
-pub(crate) struct SegmentListingPublicationGuard {
+pub(crate) struct SegmentListingPublicationGuard<'a> {
+    filesystem: &'a crate::storage::persistence::filesystem::FilesystemFactory,
     directory: String,
 }
 
-impl SegmentListingPublicationGuard {
-    pub(crate) fn new(directory: &str) -> Self {
+impl<'a> SegmentListingPublicationGuard<'a> {
+    pub(crate) fn new(
+        filesystem: &'a crate::storage::persistence::filesystem::FilesystemFactory,
+        directory: &str,
+    ) -> Self {
         Self {
+            filesystem,
             directory: directory.to_owned(),
         }
     }
 }
 
-impl Drop for SegmentListingPublicationGuard {
+impl Drop for SegmentListingPublicationGuard<'_> {
     fn drop(&mut self) {
-        invalidate_segment_listing_cache(&self.directory);
+        invalidate_segment_listing_cache(self.filesystem, &self.directory);
     }
 }
 
@@ -159,7 +175,7 @@ tokio::task_local! {
     /// count and the scan share one LIST (the P5b gate run measured them as
     /// two sequential round trips on every query). Within one query both see
     /// the same segment set.
-    static DISCOVERY_MEMO: std::sync::Mutex<std::collections::HashMap<String, Vec<DiscoveredSstFile>>>;
+    static DISCOVERY_MEMO: std::sync::Mutex<std::collections::HashMap<crate::storage::persistence::filesystem::DirectoryCacheIdentity, Vec<DiscoveredSstFile>>>;
 }
 
 /// Run one search with a per-query discovery memo (see [`DISCOVERY_MEMO`]).
@@ -3051,12 +3067,20 @@ self.try_pax_cascade(
         // TD-PAXDIR-1 D7: within one search, reuse its first listing — minus
         // anything retired since (the TD-COMPACT-13 pending set is re-read,
         // as a fresh listing would filter it).
-        if let Ok(Some(mut files)) = DISCOVERY_MEMO.try_with(|memo| {
-            memo.lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .get(storage_url)
-                .cloned()
-        }) {
+        let cache_key = self
+            .filesystem()
+            .directory_cache_identity(storage_url)
+            .ok()
+            .flatten();
+        let memo_key = cache_key.clone();
+        if let Some(memo_key) = &memo_key
+            && let Ok(Some(mut files)) = DISCOVERY_MEMO.try_with(|memo| {
+                memo.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .get(memo_key)
+                    .cloned()
+            })
+        {
             let pending = crate::storage::engines::sst::retirement_ledger::pending_paths();
             files.retain(|f| !pending.contains(&f.url));
             return Ok(files);
@@ -3064,7 +3088,6 @@ self.try_pax_cascade(
         // TD-PAXDIR-2 (L1): a live cross-query listing avoids the LIST entirely.
         // The retirement filter is applied below (same as the per-query memo
         // path) so superseded segments stop serving immediately.
-        let cache_key = SegmentListingCache::key(storage_url);
         let (generation_at_read, cached_files) = {
             let cache = segment_listing_cache();
             let mut guard = cache
@@ -3078,9 +3101,9 @@ self.try_pax_cascade(
                     .retain(|_, (at, _)| ttl.is_some_and(|t| at.elapsed() < t));
             }
             let generation = guard.generation;
-            let files = guard
-                .entries
-                .get(&cache_key)
+            let files = cache_key
+                .as_ref()
+                .and_then(|key| guard.entries.get(key))
                 .filter(|(at, _)| segment_listing_cache_ttl().is_some_and(|t| at.elapsed() < t))
                 .map(|(_, f)| f.clone());
             (generation, files)
@@ -3092,7 +3115,9 @@ self.try_pax_cascade(
             // Only insert if no invalidation fired during the LIST — a
             // generation bump means a publish invalidated the entry and
             // this snapshot is already stale (the re-poisoning race).
-            if segment_listing_cache_ttl().is_some() {
+            if segment_listing_cache_ttl().is_some()
+                && let Some(cache_key) = cache_key
+            {
                 let mut guard = segment_listing_cache()
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -3110,11 +3135,13 @@ self.try_pax_cascade(
             }
             files
         };
-        let _ = DISCOVERY_MEMO.try_with(|memo| {
-            memo.lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .insert(storage_url.to_owned(), files.clone())
-        });
+        if let Some(memo_key) = memo_key {
+            let _ = DISCOVERY_MEMO.try_with(|memo| {
+                memo.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(memo_key, files.clone())
+            });
+        }
         // The retirement filter: the cache may hold segments whose compaction
         // published between the listing and this query.
         let pending = crate::storage::engines::sst::retirement_ledger::pending_paths();
@@ -3519,25 +3546,149 @@ mod tests {
     }
 
     /// TD-PAXDIR-2 (L1): invalidation removes the entry.
-    #[test]
-    fn segment_listing_cache_invalidation_removes_entry() {
-        let mut guard = segment_listing_cache()
+    #[tokio::test]
+    async fn segment_listing_cache_invalidation_removes_entry() -> anyhow::Result<()> {
+        let filesystem = FilesystemFactory::create(Default::default()).await?;
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().to_string_lossy();
+        let key = filesystem
+            .directory_cache_identity(&path)?
+            .expect("local identity");
+        segment_listing_cache()
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        guard.entries.insert(
-            "test://listing-cache-invalidation".to_string(),
-            (std::time::Instant::now(), Vec::new()),
-        );
-        drop(guard);
-        invalidate_segment_listing_cache("test://listing-cache-invalidation");
+            .expect("cache")
+            .entries
+            .insert(key.clone(), (std::time::Instant::now(), Vec::new()));
+        invalidate_segment_listing_cache(&filesystem, &format!("file://{path}/"));
         assert!(
-            segment_listing_cache()
+            !segment_listing_cache()
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .expect("cache")
                 .entries
-                .get("test://listing-cache-invalidation")
-                .is_none()
+                .contains_key(&key)
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn segment_listing_cache_preserves_relative_path_namespaces() -> anyhow::Result<()> {
+        use crate::observability::io_trace;
+        use crate::storage::persistence::filesystem::{FilesystemConfig, local::LocalConfig};
+
+        // SAFETY: nextest gives this test its own process; the value is pinned
+        // before constructing the engine or starting any background workers.
+        unsafe { std::env::set_var("PROXIMADB_SEGMENT_LISTING_CACHE_MS", "300000") };
+        let cwd = std::env::current_dir()?;
+        let cwd_collection = tempfile::Builder::new()
+            .prefix(".listing-relative-")
+            .tempdir_in(&cwd)?;
+        let relative = cwd_collection
+            .path()
+            .file_name()
+            .expect("unique fixture name")
+            .to_string_lossy()
+            .into_owned();
+        let root = tempfile::tempdir()?;
+        let rooted_collection = root.path().join(&relative);
+        std::fs::create_dir_all(&rooted_collection)?;
+        std::fs::write(rooted_collection.join("rooted.pax"), b"rooted")?;
+        std::fs::write(cwd_collection.path().join("cwd.pax"), b"cwd")?;
+        let filesystem = Arc::new(
+            FilesystemFactory::create(FilesystemConfig {
+                local: Some(LocalConfig {
+                    root_dir: Some(root.path().to_path_buf()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .await?,
+        );
+        let engine = SstEngine::new_with_config(
+            SstConfig::default(),
+            filesystem,
+            Arc::new(UnifiedDistanceCompute::default()),
+        )
+        .await?;
+        let check = |directory: String, name: &'static str, lists: u64| {
+            let engine = &engine;
+            async move {
+                io_trace::scope(async {
+                    let files = engine.discover_sstable_files(&directory).await?;
+                    assert_eq!(files.len(), 1);
+                    assert_eq!(files[0].url.rsplit('/').next(), Some(name));
+                    assert_eq!(io_trace::snapshot().expect("listing trace").list_ops, lists);
+                    Ok::<_, anyhow::Error>(())
+                })
+                .await
+            }
+        };
+        check(format!("./{relative}"), "rooted.pax", 1).await?;
+        let listing = engine.discover_sstable_files(&relative).await?;
+        let listed_fs = engine.filesystem().get_filesystem(&listing[0].url)?;
+        assert_eq!(listed_fs.read_resident(&listing[0].url).await?, b"rooted");
+        check(relative.clone(), "rooted.pax", 0).await?;
+        let relative_url = format!("file://{relative}");
+        check(relative_url.clone(), "cwd.pax", 1).await?;
+        check(relative_url.clone(), "cwd.pax", 0).await?;
+        invalidate_segment_listing_cache(engine.filesystem(), &format!("{relative_url}/"));
+        check(relative.clone(), "rooted.pax", 0).await?;
+        check(relative_url, "cwd.pax", 1).await?;
+
+        // Absolute aliases are safe even with a configured root, and share
+        // invalidation in both directions without collapsing relative keys.
+        let absolute = rooted_collection.to_string_lossy().into_owned();
+        check(absolute.clone(), "rooted.pax", 0).await?;
+        let absolute_url = format!("file://{absolute}/");
+        check(absolute_url.clone(), "rooted.pax", 0).await?;
+        invalidate_segment_listing_cache(engine.filesystem(), &absolute_url);
+        check(absolute, "rooted.pax", 1).await?;
+        check(relative.clone(), "rooted.pax", 0).await?;
+
+        // Legacy ledgers retain file://./ references, while LIST now returns
+        // absolute URLs. A warm listing must apply the same pending filter as
+        // a fresh listing and the residency inventory, regardless of root_dir.
+        use crate::storage::engines::sst::{retirement_ledger, segment_io};
+        let legacy_input = format!("file://./{relative}/cwd.pax");
+        retirement_ledger::record_pending(
+            cwd_collection.path(),
+            &cwd_collection.path().join("output.pax"),
+            std::slice::from_ref(&legacy_input),
+        )
+        .await?;
+        // Simulate a fresh process loading the raw durable obligation.
+        retirement_ledger::mark_drained(std::slice::from_ref(&legacy_input));
+        retirement_ledger::register_collection_dir(cwd_collection.path());
+        let directory = format!("file://./{relative}");
+        io_trace::scope(async {
+            assert!(engine.discover_sstable_files(&directory).await?.is_empty());
+            assert_eq!(
+                io_trace::snapshot().expect("warm listing trace").list_ops,
+                0
+            );
+            Ok::<_, anyhow::Error>(())
+        })
+        .await?;
+        let fs = engine.filesystem().get_filesystem(&directory)?;
+        assert!(
+            segment_io::live_segments(fs.as_ref(), &directory)
+                .await?
+                .is_empty()
+        );
+        assert!(
+            segment_io::residency_objects(fs.as_ref(), &directory)
+                .await?
+                .is_empty()
+        );
+        check(relative, "rooted.pax", 0).await?;
+        invalidate_segment_listing_cache(engine.filesystem(), &directory);
+        assert!(engine.discover_sstable_files(&directory).await?.is_empty());
+        assert_eq!(
+            retirement_ledger::load_ledger(cwd_collection.path())?.pending[0].inputs,
+            vec![legacy_input.clone()],
+            "snapshot aliases must not rewrite durable deletion obligations"
+        );
+        retirement_ledger::mark_drained(&[legacy_input]);
+        Ok(())
     }
 
     use crate::storage::persistence::filesystem::FilesystemFactory;

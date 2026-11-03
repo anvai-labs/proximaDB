@@ -946,7 +946,13 @@ onnx = [
 # Cloud storage features (optional to avoid linking issues during testing)
 aws = ["object_store/aws", "proximadb-catalog/aws"]
 azure = ["object_store/azure"]
-gcp = ["dep:google-cloud-storage", "dep:google-cloud-auth", "dep:http", "dep:crc32c"]
+gcp = [
+  "dep:google-cloud-storage",
+  "dep:google-cloud-auth",
+  "dep:http",
+  "dep:crc32c",
+  "proximadb-object-store/gcp",
+]
 
 # TD-161 external OTLP metering push (default-OFF). Compiles the OTLP exporter that
 # ships the per-tenant metering snapshot to a collector; runtime-gated additionally by

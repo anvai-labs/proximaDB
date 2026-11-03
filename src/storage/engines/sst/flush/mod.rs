@@ -665,6 +665,7 @@ impl SstEngine {
 
         let publication_invalidation =
             crate::storage::engines::sst::search::SegmentListingPublicationGuard::new(
+                self.filesystem(),
                 &atomic_op.final_url,
             );
         let mut already_materialized = false;
@@ -707,6 +708,7 @@ impl SstEngine {
             }
             // The recovery object is visible before tracking finalization.
             crate::storage::engines::sst::search::invalidate_segment_listing_cache(
+                self.filesystem(),
                 &atomic_op.final_url,
             );
             if let Err(error) = self
@@ -2241,7 +2243,10 @@ mod tests {
         )
         .unwrap();
         // Direct fixture writes bypass the flush publication hook.
-        crate::storage::engines::sst::search::invalidate_segment_listing_cache(&data_dir);
+        crate::storage::engines::sst::search::invalidate_segment_listing_cache(
+            engine.filesystem(),
+            &data_dir,
+        );
 
         let before = engine
             .flush_sort_invocations
@@ -2341,6 +2346,88 @@ mod tests {
             3,
             "the live flush path must index all flushed vectors into AXIS (TD-112)"
         );
+    }
+
+    #[tokio::test]
+    async fn cancelled_flush_refreshes_listing_after_durable_move() -> anyhow::Result<()> {
+        use crate::observability::io_trace;
+        use crate::proto::proximadb_v1::{
+            Collection, CollectionConfig, StorageAssignment, StorageEngine,
+        };
+        use crate::storage::traits::UnifiedStorageFormat;
+        // SAFETY: nextest runs this storage-state test in its own process.
+        unsafe { std::env::set_var("PROXIMADB_SEGMENT_LISTING_CACHE_MS", "300000") };
+        let engine = create_test_engine().await;
+        let root = tempfile::tempdir()?;
+        let collection_id = "cancelled_flush_publication";
+        let directory = proximadb_storage_common::storage_path::StoragePath::collection_data_path(
+            root.path().to_string_lossy().as_ref(),
+            collection_id,
+        );
+        std::fs::create_dir_all(&directory)?;
+        for expected_lists in [1, 0] {
+            io_trace::scope(async {
+                assert!(engine.discover_sstable_files(&directory).await?.is_empty());
+                assert_eq!(
+                    io_trace::snapshot().expect("listing trace").list_ops,
+                    expected_lists
+                );
+                Ok::<(), anyhow::Error>(())
+            })
+            .await?;
+        }
+        let params = FlushParameters {
+            collection_id: Some(collection_id.to_string()),
+            vector_records: vec![create_test_vector("v0", vec![1.0, 0.0, 0.0, 0.0])],
+            force: true,
+            synchronous: true,
+            trigger_compaction: false,
+            collection_config: Some(Collection {
+                id: collection_id.to_string(),
+                config: Some(CollectionConfig {
+                    name: collection_id.to_string(),
+                    dimension: 4,
+                    storage_engine: Some(StorageEngine::Sst as i32),
+                    ..Default::default()
+                }),
+                storage_assignment: Some(StorageAssignment {
+                    base_location: root.path().to_string_lossy().into_owned(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let published = Arc::new(tokio::sync::Notify::new());
+        let resume = Arc::new(tokio::sync::Notify::new());
+        let mut flush = Box::pin(
+            crate::storage::transaction_coordinator::FINALIZE_DURABLE_MOVE_CHECKPOINT
+                .scope((published.clone(), resume), engine.do_flush(&params)),
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            tokio::select! {
+                result = &mut flush => anyhow::bail!("flush exited before durable-move checkpoint: {result:?}"),
+                () = published.notified() => Ok::<(), anyhow::Error>(()),
+            }
+        }).await??;
+        drop(flush);
+        for expected_lists in [1, 0] {
+            io_trace::scope(async {
+                let files = engine.discover_sstable_files(&directory).await?;
+                assert_eq!(
+                    files.len(),
+                    1,
+                    "cancelled flush already durably published its segment"
+                );
+                assert_eq!(
+                    io_trace::snapshot().expect("listing trace").list_ops,
+                    expected_lists
+                );
+                Ok::<(), anyhow::Error>(())
+            })
+            .await?;
+        }
+        Ok(())
     }
 
     #[tokio::test]
@@ -2581,7 +2668,10 @@ mod tests {
             .unwrap();
         }
         // Each direct fixture mutation changes the live segment set.
-        crate::storage::engines::sst::search::invalidate_segment_listing_cache(storage_url);
+        crate::storage::engines::sst::search::invalidate_segment_listing_cache(
+            engine.filesystem(),
+            storage_url,
+        );
         assert_eq!(
             engine
                 .should_trigger_compaction(storage_url, &tags)
@@ -2598,7 +2688,10 @@ mod tests {
         std::fs::rename(&flushed, &parked).unwrap();
         let fifth = data_dir.join("L1_20261029T000005_00000005.pax");
         std::fs::copy(&parked, &fifth).unwrap();
-        crate::storage::engines::sst::search::invalidate_segment_listing_cache(storage_url);
+        crate::storage::engines::sst::search::invalidate_segment_listing_cache(
+            engine.filesystem(),
+            storage_url,
+        );
         assert_eq!(
             engine
                 .should_trigger_compaction(storage_url, &tags)
@@ -2609,7 +2702,10 @@ mod tests {
         );
         std::fs::remove_file(&fifth).unwrap();
         std::fs::rename(&parked, &flushed).unwrap();
-        crate::storage::engines::sst::search::invalidate_segment_listing_cache(storage_url);
+        crate::storage::engines::sst::search::invalidate_segment_listing_cache(
+            engine.filesystem(),
+            storage_url,
+        );
 
         // With a training compaction in flight the arm stays suppressed
         // (TD-COMPACT-8) and the count arm is the fallback, as before.

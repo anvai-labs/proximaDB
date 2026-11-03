@@ -261,8 +261,19 @@ impl Default for FilesystemConfig {
     }
 }
 
-/// Abstract factory for creating filesystem instances
+/// Process-local cache namespace. It is intentionally not a persistent object
+/// identity: different configured factory bindings must never share listings.
+static NEXT_CACHE_NAMESPACE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct DirectoryCacheIdentity {
+    pub(crate) namespace: u64,
+    pub(crate) location: String,
+}
+
+/// Abstract factory for creating filesystem instances.
 pub struct FilesystemFactory {
+    cache_namespace: u64,
     config: FilesystemConfig,
     filesystems: HashMap<String, Arc<dyn FileSystem>>,
     tier_mapping: HashMap<FileStorageTier, String>,
@@ -456,7 +467,15 @@ impl FilesystemFactory {
     /// let factory = FilesystemFactory::create(config).await?;
     /// ```text
     pub async fn create(config: FilesystemConfig) -> FsResult<Self> {
+        let cache_namespace = NEXT_CACHE_NAMESPACE
+            .try_update(
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+                |value| value.checked_add(1),
+            )
+            .map_err(|_| FilesystemError::Config("Cache namespace exhausted".to_string()))?;
         let mut factory = Self {
+            cache_namespace,
             config,
             filesystems: HashMap::new(),
             tier_mapping: HashMap::new(),
@@ -630,10 +649,31 @@ impl FilesystemFactory {
         }
     }
 
-    /// Get filesystem instance for URL scheme (cached instances)
-    /// Get filesystem instance for URL scheme (returns Arc for safe sharing).
-    ///
-    /// Use this when you need raw filesystem access without caching.
+    /// Resolve discovery identity through the selected backend. Unknown local
+    /// wrappers bypass caching rather than guessing root semantics. Remote
+    /// factories are isolated until stable endpoint-aware identities are wired
+    /// through all persistent-cache and reservation consumers.
+    pub(crate) fn directory_cache_identity(
+        &self,
+        url: &str,
+    ) -> FsResult<Option<DirectoryCacheIdentity>> {
+        let filesystem = self.get_filesystem(url)?;
+        if let Some(local) = filesystem.as_any().downcast_ref::<local::LocalFileSystem>() {
+            return Ok(Some(DirectoryCacheIdentity {
+                namespace: 0,
+                location: local.directory_cache_identity(url)?,
+            }));
+        }
+        if !url.contains("://") || url.starts_with("file://") {
+            return Ok(None);
+        }
+        Ok(Some(DirectoryCacheIdentity {
+            namespace: self.cache_namespace,
+            location: proximadb_cache::canonical_location(url),
+        }))
+    }
+
+    /// Return the configured filesystem and its enabled decorators.
     pub fn get_filesystem(&self, url: &str) -> FsResult<Arc<dyn FileSystem>> {
         // Use centralized scheme extraction and validation
         let scheme = extract_scheme(url)?;
@@ -2250,10 +2290,15 @@ mod access_tier_publish_tests {
     proximadb_storage_filesystem_types::forward_filesystem_impl! {
         impl FileSystem for RecordingCloudFs => inner;
         forward [
-            as_any, filesystem_type, supports_mmap, append, exists, metadata,
+            filesystem_type, supports_mmap, append, exists, metadata,
             create_dir, move_file, sync, sync_file, sync_data, open_file,
         ];
         {
+            fn as_any(&self) -> &dyn std::any::Any {
+                // This fake changes path semantics; it must not impersonate
+                // its local scratch backend during resolver downcasts.
+                self
+            }
             async fn read(&self, path: &str) -> FsResult<Vec<u8>> {
                 self.record(format!("read {path}"));
                 Ok(b"segment".to_vec())
@@ -2308,6 +2353,8 @@ mod access_tier_publish_tests {
         // The coordinator resolves a `file://` backend at construction.
         filesystems.insert("file".to_string(), fs);
         FilesystemFactory {
+            cache_namespace: NEXT_CACHE_NAMESPACE
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             config: FilesystemConfig::default(),
             filesystems,
             tier_mapping: HashMap::new(),
@@ -2315,6 +2362,51 @@ mod access_tier_publish_tests {
             #[cfg(test)]
             test_get_counters: None,
         }
+    }
+
+    #[tokio::test]
+    async fn directory_cache_identity_isolates_bindings_and_preserves_object_keys()
+    -> anyhow::Result<()> {
+        let first = factory_with(RecordingCloudFs::new().await);
+        let second = factory_with(RecordingCloudFs::new().await);
+        let uri = "s3://bucket/collection//data";
+        assert_ne!(
+            first.directory_cache_identity(uri)?,
+            second.directory_cache_identity(uri)?
+        );
+        assert_ne!(
+            first.directory_cache_identity(uri)?,
+            first.directory_cache_identity("s3://bucket/collection/data")?
+        );
+        assert_ne!(
+            first.directory_cache_identity(uri)?,
+            first.directory_cache_identity("s3://bucket/collection//data/")?
+        );
+        // A custom wrapper with unknown local semantics cannot safely guess a root.
+        assert!(first.directory_cache_identity("file://relative")?.is_none());
+        let root_a = tempfile::tempdir()?;
+        let root_b = tempfile::tempdir()?;
+        let create = |root: &std::path::Path| {
+            FilesystemFactory::create(FilesystemConfig {
+                local: Some(local::LocalConfig {
+                    root_dir: Some(root.to_path_buf()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+        };
+        let local_a = create(root_a.path()).await?;
+        let local_b = create(root_b.path()).await?;
+        assert_ne!(
+            local_a.directory_cache_identity("data")?,
+            local_b.directory_cache_identity("data")?
+        );
+        let absolute = root_a.path().join("data").to_string_lossy().into_owned();
+        assert_eq!(
+            local_a.directory_cache_identity("./data")?,
+            local_b.directory_cache_identity(&format!("file://{absolute}"))?
+        );
+        Ok(())
     }
 
     /// Regression (surfaced by the #2335 flaky-test audit): the env-gated

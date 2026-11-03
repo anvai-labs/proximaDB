@@ -237,6 +237,30 @@ The process-boundary restart test (`object_store_restart_recovery.rs`, now accep
 by id. It caught batch 3; it stays red until D3-D5 land, and the CI wiring must be
 **red-first** on develop to prove the gate bites.
 
+== Deployment-profile clarification (2026-11-02)
+
+Cloud authority means committed bulk data and catalog metadata outlive compute. It does not
+require each insert to issue an object-store WAL PUT. The later
+link:ADR-069-wal-local-disk-tiered-flush.adoc[ADR-069] chooses reattachable local WAL for the
+streaming profile and coalesced object publication. Its durability boundary refines this ADR:
+local-WAL acknowledgement depends on that volume surviving; remote durability depends on
+successful remote publication. Existing object-store-WAL recovery rules still apply wherever
+that backend is used; this clarification does not invent a new remote-WAL default.
+
+A short-lived embedded process may use the same catalog and storage assignments. Opening a
+read-only follower must not acquire a writer incarnation or replay/publish an owner's WAL.
+The existing follower API is a building block, not proof that every service constructor is
+read-only. Its local working state is reconstructible. Writer startup and explicit end-job
+materialization retain existing ownership and publication rules.
+
+No new generic snapshot manifest is required by headless access. PAX segment discovery and
+catalog authority retain their existing contracts; governed Iceberg publication remains
+link:ADR-097-foundational-seams-single-logical-ir.adoc[ADR-097]. An end-job return value is not a
+cross-process durable receipt until exact publication identity, fencing and crash recovery
+are persisted and proved (link:ADR-081-admission-first-flush-ownership.adoc[ADR-081]).
+Implementation and acceptance live in link:../../current/PLATFORM_PLAN.adoc#embedded-cloud-lifecycle[the platform plan]
+and TD-OBJSTORE-1; this amendment does not certify new supported deployment surfaces.
+
 == Alternatives rejected
 
 * **A1 — Side RDBMS catalog (Unity/Polaris/Gravitino shape).** Reintroduces a stateful

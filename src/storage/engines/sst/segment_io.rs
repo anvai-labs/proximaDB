@@ -548,11 +548,16 @@ pub struct WarmReport {
 /// missing from a listing that predates it (review SF1: nothing would
 /// re-warm it).
 ///
-/// Keys are canonical ([`object_key`]: Azure aliases, `file://` vs plain
-/// path, slash runs), so the root is matched ANCHORED at the start of the
-/// location — another base ending in the same path is not this root.
+/// Keys normalize documented scheme aliases and absolute local spellings,
+/// while preserving exact cloud-key bytes. The root is matched ANCHORED at
+/// the start of the location, including every existing trailing delimiter.
 pub(crate) fn orphan_candidates(store: &PersistentByteStore, data_url: &str) -> Vec<String> {
-    let root = object_key(&format!("{}/", data_url.trim_end_matches('/')));
+    let directory = if data_url.ends_with('/') {
+        data_url.to_owned()
+    } else {
+        format!("{data_url}/")
+    };
+    let root = object_key(&directory);
     store.keys_where(|key| {
         key.strip_prefix(root.as_str())
             // Direct children only: the listing is not recursive, so a
@@ -633,6 +638,40 @@ mod tests {
     use super::*;
     use crate::storage::persistence::filesystem::local::{LocalConfig, LocalFileSystem};
     use proximadb_storage_filesystem_types::counting::{CountingFileSystem, GetCounters};
+
+    #[tokio::test]
+    async fn orphan_candidates_preserve_exact_cloud_delimiters() {
+        let directory = tempfile::tempdir().expect("cache directory");
+        let store = PersistentByteStore::open(directory.path(), 1 << 20).expect("cache store");
+        let intended = object_key("s3://bucket/x//a.pax");
+        let alternate = object_key("s3://bucket/x/a.pax");
+        let nested = object_key("s3://bucket/x///nested.pax");
+        let sibling = object_key("s3://bucket/x-other/a.pax");
+        for key in [&intended, &alternate, &nested, &sibling] {
+            store
+                .put(key.clone(), L2Class::Invariants, Arc::from(&b"body"[..]))
+                .await
+                .expect("seed entry");
+        }
+        let candidates = orphan_candidates(&store, "s3://bucket/x//");
+        assert_eq!(
+            candidates,
+            vec![intended.clone()],
+            "only direct children of the exact prefix qualify"
+        );
+        assert_eq!(
+            orphan_candidates(&store, "s3://bucket/x"),
+            vec![alternate.clone()]
+        );
+        assert_eq!(sweep_orphan_objects(&store, candidates, &[]).await, 1);
+        assert!(store.entry_len(&intended).is_none());
+        for key in [&alternate, &nested, &sibling] {
+            assert!(
+                store.entry_len(key).is_some(),
+                "other prefixes must survive: {key}"
+            );
+        }
+    }
 
     /// The process store (first registration wins) and a grant group covering
     /// `covered_dir` with `budget` bytes. Holds the crate-wide residency gate,

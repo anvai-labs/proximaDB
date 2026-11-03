@@ -38,6 +38,24 @@ pub use crate::storage::metadata::atomic::{
 };
 // Note: TransactionState is defined locally to avoid conflicts
 
+#[cfg(test)]
+tokio::task_local! {
+    /// Pause after durable publication, inside finalization before any cleanup.
+    /// Scoped to one test future so unrelated operations cannot be blocked.
+    pub(crate) static FINALIZE_DURABLE_MOVE_CHECKPOINT:
+        (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>);
+}
+
+#[cfg(test)]
+async fn finalize_durable_move_checkpoint() {
+    if let Ok(resume) = FINALIZE_DURABLE_MOVE_CHECKPOINT.try_with(|(published, resume)| {
+        published.notify_one();
+        resume.clone()
+    }) {
+        resume.notified().await;
+    }
+}
+
 /// Atomic operation ID for tracking operations
 pub type OperationId = String;
 
@@ -629,6 +647,8 @@ impl UnifiedTransactionCoordinator {
                     }
                 }
 
+                #[cfg(test)]
+                finalize_durable_move_checkpoint().await;
                 debug!("✅ Moved: {}", entry.name);
             }
         }

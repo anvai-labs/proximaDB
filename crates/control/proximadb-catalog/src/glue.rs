@@ -146,12 +146,12 @@ impl GlueCatalog {
         let mut properties = HashMap::new();
 
         // Parse vector dimension from comment or parameters
-        if let Some(comment) = col.comment() {
-            if comment.starts_with("vector:") {
-                if let Some(dim) = comment.strip_prefix("vector:").and_then(|s| s.parse().ok()) {
-                    properties.insert("dimension".to_string(), dim);
-                }
-            }
+        if let Some(dim) = col
+            .comment()
+            .and_then(|comment| comment.strip_prefix("vector:"))
+            .and_then(|dimension| dimension.parse().ok())
+        {
+            properties.insert("dimension".to_string(), dim);
         }
 
         CatalogColumn {

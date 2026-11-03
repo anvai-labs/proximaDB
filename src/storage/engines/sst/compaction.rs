@@ -1895,6 +1895,7 @@ impl Compaction {
         // cancellation at a later await. The reconciler shares this path and
         // must invalidate before it removes pending-path suppression.
         struct InvalidateListingsOnExit<'a> {
+            filesystem: &'a FilesystemFactory,
             inputs: &'a [PathBuf],
         }
         impl Drop for InvalidateListingsOnExit<'_> {
@@ -1906,12 +1907,16 @@ impl Compaction {
                     .collect();
                 for directory in directories {
                     crate::storage::engines::sst::search::invalidate_segment_listing_cache(
+                        self.filesystem,
                         &directory.to_string_lossy(),
                     );
                 }
             }
         }
-        let _listing_invalidation = InvalidateListingsOnExit { inputs };
+        let _listing_invalidation = InvalidateListingsOnExit {
+            filesystem: self.filesystem_factory.as_ref(),
+            inputs,
+        };
         let warm_caches = crate::storage::engines::sst::core::get_warm_tier_caches();
         #[cfg(feature = "cold-deletion-vectors")]
         let dv_store =
@@ -2533,12 +2538,13 @@ impl Compaction {
                 })?;
             // Direct uploads publish here; coordinator-managed staging is
             // covered by the finalization guard below.
-            let _publication_invalidation =
-                if direct_remote_publication || atomic_operation.is_none() {
-                    guard_compaction_publication(&task.output_file)
-                } else {
-                    None
-                };
+            let _publication_invalidation = if direct_remote_publication
+                || atomic_operation.is_none()
+            {
+                guard_compaction_publication(self.filesystem_factory.as_ref(), &task.output_file)
+            } else {
+                None
+            };
             let bytes = staged
                 .upload_bounded_retaining_local(&self.filesystem_port())
                 .await
@@ -2571,7 +2577,8 @@ impl Compaction {
             "spill_pax_uploaded",
             usize::try_from(mvcc_stats.output_records).unwrap_or(usize::MAX),
         );
-        let publication_invalidation = guard_compaction_publication(&task.output_file);
+        let publication_invalidation =
+            guard_compaction_publication(self.filesystem_factory.as_ref(), &task.output_file);
         if let (Some(coordinator), Some(operation)) = (&self.atomic_coordinator, &atomic_operation)
             && let Err(error) = coordinator
                 .finalize_atomic_operation(&operation.operation_id)
@@ -3241,7 +3248,8 @@ impl Compaction {
                     ))
                 })?;
 
-            let publication_invalidation = guard_compaction_publication(&task.output_file);
+            let publication_invalidation =
+                guard_compaction_publication(self.filesystem_factory.as_ref(), &task.output_file);
             // Finalize atomic operation - this moves the file from staging to final location
             coordinator
                 .finalize_atomic_operation(&atomic_op.operation_id)
@@ -3414,7 +3422,10 @@ impl Compaction {
                 }
             }
 
-            drop(guard_compaction_publication(&task.output_file));
+            drop(guard_compaction_publication(
+                self.filesystem_factory.as_ref(),
+                &task.output_file,
+            ));
             #[cfg(test)]
             publication_checkpoint().await;
 
@@ -3872,11 +3883,13 @@ impl Compaction {
     }
 }
 
-fn guard_compaction_publication(
+fn guard_compaction_publication<'a>(
+    filesystem: &'a FilesystemFactory,
     output: &Path,
-) -> Option<crate::storage::engines::sst::search::SegmentListingPublicationGuard> {
+) -> Option<crate::storage::engines::sst::search::SegmentListingPublicationGuard<'a>> {
     output.parent().map(|directory| {
         crate::storage::engines::sst::search::SegmentListingPublicationGuard::new(
+            filesystem,
             &directory.to_string_lossy(),
         )
     })
