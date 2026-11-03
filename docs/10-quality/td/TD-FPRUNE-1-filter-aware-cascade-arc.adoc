@@ -186,5 +186,17 @@ C1 integrated filtered stack **4.2× byte cut** at recall parity (correlated dat
 * In-memory per-tag payload indexes (Qdrant-style): possible future cache
   layer above this design; not the foundation (ADR-089 Alternatives).
 
+== k′ (candidate multiplier) shrink — MOOT (2026-11-02, negative result)
+
+The planned "shrink k′ = 10 × top_k with a refill loop" follow-on is moot and
+should not be re-investigated: the O1 deferred OID/rehydrate change (#2330)
+resolves OIDs and rehydrates only the merged winners, so the per-segment k′
+excess no longer reaches Region D at all — and the pool-multiplier sweep
+(×100/×30/×10 on the 3M Region-E bed) already showed GETs, bytes and $/query
+flat within noise across the range. Recall was identical at every multiplier,
+so the pool is oversized for quality too; shrinking it buys only rerank CPU,
+which the pool sweep also showed to be noise-level. Recorded so nobody burns
+a bed on it again.
+
 Refs: ADR-089 (decision + full file:line evidence), ADR-026/-055/-062/-065,
 TD-RDSTRAT-8, TD-CTXCORR-1, TD-073, TD-064, TD-FILT-1.
