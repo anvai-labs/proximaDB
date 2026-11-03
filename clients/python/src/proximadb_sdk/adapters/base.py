@@ -405,12 +405,16 @@ class BaseProtocolAdapter(ABC):
         collection_name: str,
         start_time: str,
         end_time: str,
-        aggregation: str = "avg",
+        aggregation: str | None = None,
         bucket_ms: int | None = None,
         tag_filters: dict[str, str] | None = None,
         **kwargs,
     ) -> dict[str, Any]:
-        """Query time-series data with optional aggregation."""
+        """Query time-series data with optional aggregation.
+
+        ``aggregation`` defaults to ``None`` — the v1 public signature's
+        contract (the old ``"avg"`` default was an adapter invention no
+        transport honored; TD-EMB-1)."""
         raise NotImplementedError(
             f"{self.__class__.__name__} does not support time-series queries"
         )

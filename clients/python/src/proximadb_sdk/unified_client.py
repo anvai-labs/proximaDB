@@ -2240,15 +2240,35 @@ class ProximaDBClient:
         if adapter_result is not None:
             return adapter_result
 
-        response = self._get_timeseries_repository().query(
-            collection_id=collection_name,
-            start_time=start_time,
-            end_time=end_time,
-            aggregation=aggregation,
-            bucket_ms=bucket_ms,
-            tag_filters=tag_filters,
-            limit=kwargs.get("limit", 1000),
-        )
+        # Re-entry guard (TD-EMB-1 review F1): the repository's query
+        # calls BACK into this client method (timeseries.py wraps us) —
+        # falling back to it from a failed dispatch is an infinite loop
+        # (~330-deep recursion swallowed into an empty success-shaped
+        # dict). Track in-flight repository fallbacks per client and
+        # raise a clear error instead of cycling.
+        if getattr(self, "_in_timeseries_repo_fallback", False):
+            err = ProximaDBError(
+                "query_timeseries dispatch failed and the local repository "
+                "re-entered the client (a capability gap the fallback "
+                "cannot serve — e.g. embedded aggregation; TD-EMB-1)"
+            )
+            # Sentinel: the repository's blanket catch must re-raise this
+            # (falling through would return an empty success-shaped dict).
+            err._timeseries_reentry = True  # noqa: SLF001
+            raise err
+        self._in_timeseries_repo_fallback = True
+        try:
+            response = self._get_timeseries_repository().query(
+                collection_id=collection_name,
+                start_time=start_time,
+                end_time=end_time,
+                aggregation=aggregation,
+                bucket_ms=bucket_ms,
+                tag_filters=tag_filters,
+                limit=kwargs.get("limit", 1000),
+            )
+        finally:
+            self._in_timeseries_repo_fallback = False
         return response.to_dict()
 
     def list_timeseries_collections(self, **kwargs) -> list[dict[str, Any]]:

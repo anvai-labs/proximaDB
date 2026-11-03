@@ -771,7 +771,7 @@ class EmbeddedProtocolAdapter(BaseProtocolAdapter):
 
         try:
             if hasattr(self._db, "update_metadata"):
-                result = self._db.update_metadata(collection_id, vector_id, metadata)
+                self._db.update_metadata(collection_id, vector_id, metadata)
             else:
                 # Fallback: get, update, upsert
                 vectors = self.get_vectors(collection_id, [vector_id])
@@ -1686,7 +1686,7 @@ class EmbeddedProtocolAdapter(BaseProtocolAdapter):
                 target[parts[-1]] = value
 
         # Re-insert the updated document
-        result = self.insert_document(collection_name, document, doc_id)
+        self.insert_document(collection_name, document, doc_id)
         return {"success": True, "new_version": 1, "implementation": "vector_fallback"}
 
     def delete_document(self, collection_name: str, doc_id: str, **kwargs) -> bool:

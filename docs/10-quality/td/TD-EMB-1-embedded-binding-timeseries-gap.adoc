@@ -33,6 +33,13 @@ binding is the recommended transport; the fallback shapes are legacy.
 3. LANDED 2026-11-03: all five `hasattr(self._db, <timeseries>)` gates now also check the bound
    method is not a coroutine function, so the subprocess flavor's `async def` surface can never
    be called synchronously (an un-awaited coroutine returned as a success-shaped object).
+4. LANDED 2026-11-03 (review F1): v1 + embedded + explicit aggregation previously fell into an
+   UNBOUNDED RECURSION (the repository fallback re-enters the client — `timeseries.py` wraps the
+   same client object; ~330-deep cycle, 329 error logs, swallowed into an empty success-shaped
+   dict). A re-entry guard on v1's `query_timeseries` breaks the cycle with a sentinel-carrying
+   `ProximaDBError` the repository re-raises instead of converting to an empty local result.
+   First-entry fallbacks (no explicit aggregation) behave as before. Pinned by
+   `test_unified_client_ts_fallback.py`.
 
 == Non-goals
 

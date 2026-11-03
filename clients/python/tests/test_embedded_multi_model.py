@@ -431,14 +431,23 @@ class TestEmbeddedAdapterMultiModel:
         start_time = (now - timedelta(minutes=1)).isoformat() + "Z"
         end_time = (now + timedelta(minutes=1)).isoformat() + "Z"
 
+        # TD-EMB-1: the engine has no timeseries surface, so the vector
+        # fallback runs and EXPLICIT aggregation raises the honest
+        # capability error (tags-only fallback).
         query_result = embedded_adapter.query_timeseries(
             collection_name="test_metrics",
             start_time=start_time,
             end_time=end_time,
-            aggregation="AVG",
         )
 
         assert query_result is not None
+        with pytest.raises(NotImplementedError, match="tag_filters"):
+            embedded_adapter.query_timeseries(
+                collection_name="test_metrics",
+                start_time=start_time,
+                end_time=end_time,
+                aggregation="AVG",
+            )
 
     @pytest.mark.asyncio
     async def test_list_collections(self, embedded_adapter):

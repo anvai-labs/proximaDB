@@ -1153,7 +1153,9 @@ class ProximaDBClient:
         """Query time-series data (see the adapter for the wire contract:
         the spec's window is integer epoch time). REST does not support
         ``aggregation``/``bucket_ms``/``tag_filters`` (raises the typed
-        capability error); the embedded adapter honors them."""
+        capability error); the embedded adapter honors ``tag_filters``
+        only — ``aggregation``/``bucket_ms`` raise there too (the engine
+        has no timeseries surface; TD-EMB-1)."""
         return self._adapter_call(
             "query_timeseries",
             collection_name,

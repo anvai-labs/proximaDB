@@ -1061,6 +1061,11 @@ class TimeSeriesRepository:
                     query_time_ms=int((time.time() - started_at) * 1000),
                 )
         except Exception as e:
+            if getattr(e, "_timeseries_reentry", False):
+                # The client's re-entry guard (TD-EMB-1 review F1):
+                # falling through here would return an empty
+                # success-shaped dict for a capability gap — re-raise.
+                raise
             warnings.warn(f"Server query failed, using local storage: {e}")
             # Fall back to local storage
             points = [

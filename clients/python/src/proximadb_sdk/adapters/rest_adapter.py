@@ -1177,9 +1177,11 @@ class RestProtocolAdapter(SyncGraphDelegations, BaseProtocolAdapter):
             # limit and serde DROPS unknown fields — shipping these would
             # be a silent no-op (raw points, aggregation ignored). Raise
             # the honest capability signal instead: v2 surfaces the typed
-            # ProximaDBNotSupportedError; v1's dispatch falls back to the
-            # in-memory repository, which honors them (its users' actual
-            # pre-batch behavior).
+            # ProximaDBNotSupportedError. v1's dispatch falls back to
+            # the in-memory repository, which re-enters the client — a
+            # guarded cycle (TD-EMB-1 review F1) — so v1 callers with
+            # explicit aggregation get a clear ProximaDBError, not
+            # silent raw points.
             raise NotImplementedError(
                 "query_timeseries(aggregation/bucket_ms/tag_filters) is not "
                 "supported by the REST query op (the server drops unknown "

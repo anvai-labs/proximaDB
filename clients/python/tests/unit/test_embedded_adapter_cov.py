@@ -18,7 +18,6 @@ from proximadb_sdk.models import (
     CollectionConfig,
     CollectionStats,
     DistanceMetric,
-    HealthStatus,
     SearchResult,
     VectorOperationResponse,
     VectorRecord,
@@ -1370,7 +1369,9 @@ def test_ingest_timeseries_vector_fallback_raises():
     db = FakeDB()  # no ingest_timeseries
     db.insert_numpy = lambda cid, ids, arr, meta: len(ids)
     a = make_adapter(db)
-    with pytest.raises(Exception):
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
         a.ingest_timeseries(
             "tscoll001",
             [{"timestamp": "t1", "values": {"cpu": 0.5}, "tags": {"host": "h"}}],
