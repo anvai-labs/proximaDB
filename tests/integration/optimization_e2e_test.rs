@@ -154,7 +154,7 @@ async fn test_optimization_end_to_end() -> anyhow::Result<()> {
     let temp_dir = TempDir::new().unwrap();
 
     // Create optimized configurations
-    let sst_config = Arc::new(SstConfig {
+    let _sst_config = Arc::new(SstConfig {
         level_count: 3,
         compaction_threshold: 3,
         compaction_config: None,
@@ -191,9 +191,9 @@ async fn test_optimization_end_to_end() -> anyhow::Result<()> {
 
     // Setup infrastructure
     let filesystem = Arc::new(FilesystemFactory::create(Default::default()).await?);
-    let metadata_url = format!("file://{}/metadata", temp_dir.path().display());
+    let _metadata_url = format!("file://{}/metadata", temp_dir.path().display());
 
-    let coordinator = Arc::new(
+    let _coordinator = Arc::new(
         TransactionCoordinator::new(filesystem.clone(), None)
             .await
             .unwrap(),
@@ -215,10 +215,10 @@ async fn test_optimization_end_to_end() -> anyhow::Result<()> {
         replication_config: None,
     };
 
-    let metadata_store = Arc::new(MetadataStore::new(metadata_config).await.unwrap());
+    let _metadata_store = Arc::new(MetadataStore::new(metadata_config).await.unwrap());
 
     // Create SST engine
-    let distance_compute = Arc::new(UnifiedDistanceCompute::new(
+    let _distance_compute = Arc::new(UnifiedDistanceCompute::new(
         proximadb::compute::distance_computation::DistanceMetric::Cosine,
     ));
     let sst_engine = SstEngine::new().await?;
@@ -228,7 +228,7 @@ async fn test_optimization_end_to_end() -> anyhow::Result<()> {
 
     // Register collection for VIPER with proper storage assignment
     // IMPORTANT: Use standard path format: {baseurl}/{collectionid}/data
-    let collection_storage_path = format!("{}/optimization_test", temp_dir.path().display());
+    let _collection_storage_path = format!("{}/optimization_test", temp_dir.path().display());
     let collection = Collection {
         storage_class_status: None,
         id: "optimization_test".to_string(),
@@ -266,11 +266,11 @@ async fn test_optimization_end_to_end() -> anyhow::Result<()> {
         growth_factor: 2.0,
         enable_stats: true,
     };
-    let memory_pool = Arc::new(VectorMemoryPool::with_config(pool_config));
+    let _memory_pool = Arc::new(VectorMemoryPool::with_config(pool_config));
 
     // Measure serialization performance with pooling
     let start = Instant::now();
-    let serialization_config = VectorSerializationConfig {
+    let _serialization_config = VectorSerializationConfig {
         use_bytemuck: true,
         compression_threshold: 256,
         compression_algorithm: CompressionAlgorithm::Zstd,
@@ -602,7 +602,6 @@ async fn test_optimization_end_to_end() -> anyhow::Result<()> {
 // Helper function to calculate directory size
 fn calculate_directory_size(path: &str) -> u64 {
     use std::fs;
-    use tracing::{debug, error, info, warn};
 
     fn dir_size(path: &std::path::Path) -> u64 {
         let mut size = 0;

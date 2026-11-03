@@ -2365,7 +2365,6 @@ pub(crate) mod tests {
     async fn publish_snapshot_with_positions(root: &std::path::Path, positions: &[u64]) -> String {
         use proximadb_iceberg_engine::deletion_vector::PositionDeletes;
         use proximadb_iceberg_engine::iceberg;
-        use proximadb_storage_common::object_store_bridge::ObjectStoreBridge;
 
         let data_dir = root.join("data");
         std::fs::create_dir(&data_dir).unwrap();

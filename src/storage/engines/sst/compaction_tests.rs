@@ -1395,7 +1395,7 @@ async fn td_global_precision_resolver_stamps_hint_without_per_instance_wiring() 
     use crate::storage::engines::sst::compaction::set_global_precision_resolver;
     use proximadb_catalog::cache::CatalogCache;
     use proximadb_catalog::canonical_precision::CanonicalPrecisionResolver;
-    use proximadb_catalog::{Catalog, CatalogNamespace, CatalogTableSchema, TableIdentifier};
+    use proximadb_catalog::{Catalog, CatalogTableSchema, TableIdentifier};
     use std::sync::Arc;
     let cache = Arc::new(CatalogCache::new(1000, 60));
     let cat: Arc<dyn Catalog> = Arc::new(InMemoryTestCatalog::new(

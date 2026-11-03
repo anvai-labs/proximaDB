@@ -6,7 +6,7 @@
 use anyhow::Result;
 use serde_json::json;
 use std::collections::HashMap;
-use tracing::{debug, error, info, warn};
+use tracing::debug;
 
 #[tokio::test]
 async fn test_vector_record_creation() -> Result<()> {

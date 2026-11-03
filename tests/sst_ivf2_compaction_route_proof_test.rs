@@ -23,7 +23,7 @@ use proximadb::storage::traits::{
     FlushParameters, FlushResult, StorageQueryContext, StorageQueryMetadata, UnifiedStorageEngine,
 };
 use proximadb_proto::v1::{Collection, CollectionConfig, StorageAssignment, StorageEngine};
-use proximadb_records::{EmbeddingCell, EmbeddingValues, ProximaRecord};
+use proximadb_records::{EmbeddingCell, ProximaRecord};
 use proximadb_storage_common::coarse_directory::CoarseDirectory;
 use proximadb_storage_common::segment_layout::{
     SEG_LAYOUT_VERSION, SegmentHeaderPrefix, is_coalesced_segment,

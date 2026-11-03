@@ -191,7 +191,6 @@ fn resolve_tenant_for_mode(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::*;
 
     #[test]
     fn bearer_prefix_is_jwt() {

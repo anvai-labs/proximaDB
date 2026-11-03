@@ -5702,7 +5702,6 @@ mod tests {
     /// raw number), never coerced to a default.
     #[tokio::test]
     async fn storage_class_unknown_number_rejected_on_create() -> Result<()> {
-        use crate::proto::proximadb_v1::StorageClass;
         let service = CollectionService::new(StorageConfig::default())
             .await
             .context("collection service")?;

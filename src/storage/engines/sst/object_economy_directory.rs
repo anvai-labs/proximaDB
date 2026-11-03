@@ -1529,7 +1529,7 @@ mod tests {
 
     #[tokio::test]
     async fn cached_handle_calls_loader_once_and_reuses_entry() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::atomic::Ordering;
 
         let handle = CachedDirectoryHandle::new();
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -1578,8 +1578,6 @@ mod tests {
 
     #[tokio::test]
     async fn cached_handle_concurrent_callers_share_single_load() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
         let handle = Arc::new(CachedDirectoryHandle::new());
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
@@ -1640,8 +1638,6 @@ mod tests {
 
     #[tokio::test]
     async fn directory_cache_invalidate_forces_fresh_handle_and_reload() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
         let cache = VectorObjectEconomyDirectoryCache::new();
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
@@ -1710,7 +1706,6 @@ mod tests {
         epoch: u64,
     ) -> impl FnOnce() -> std::future::Ready<(VectorObjectEconomyDirectory, DirectoryLoadStatus)> + '_
     {
-        use std::sync::atomic::Ordering;
         let calls = calls.clone();
         move || {
             calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);

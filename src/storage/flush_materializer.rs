@@ -2639,7 +2639,7 @@ mod tests {
         let engine = Arc::new(RecordingEngine::blocking());
         let task_coordinator = coordinator.clone();
         let task_buffer = write_buffer.clone();
-        let task_engine = engine.clone();
+        let _task_engine = engine.clone();
         coordinator
             .register_engine(ProtoStorageEngine::Sst, engine.clone())
             .await;
@@ -2686,7 +2686,7 @@ mod tests {
         let engine = Arc::new(RecordingEngine::blocking());
         let task_coordinator = coordinator.clone();
         let task_buffer = write_buffer.clone();
-        let task_engine = engine.clone();
+        let _task_engine = engine.clone();
         coordinator
             .register_engine(ProtoStorageEngine::Sst, engine.clone())
             .await;

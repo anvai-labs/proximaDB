@@ -80,7 +80,7 @@ mod tests {
         }];
 
         // Create storage engines
-        let filesystem = Arc::new(
+        let _filesystem = Arc::new(
             crate::storage::persistence::filesystem::FilesystemFactory::create(Default::default())
                 .await
                 .expect("Failed to create filesystem factory"),

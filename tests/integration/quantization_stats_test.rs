@@ -164,14 +164,14 @@ async fn run_quantization_test(
     primary_level: Option<UnifiedQuantizationLevel>,
     fast_level: Option<UnifiedQuantizationLevel>,
 ) -> Result<TestResult> {
-    let start_time = Instant::now();
+    let _start_time = Instant::now();
 
     // Create temporary directory
     let temp_dir = TempDir::new()?;
     let base_path = temp_dir.path().to_str().unwrap();
 
     // Setup SST engine with test configuration
-    let sst_config = SstConfig::test_config_256kb(); // Use 256KB blocks for clustering
+    let _sst_config = SstConfig::test_config_256kb(); // Use 256KB blocks for clustering
     let fs_config = FilesystemConfig {
         default_fs: Some(format!("file://{}", base_path)),
         local: Some(LocalConfig::default()),
@@ -180,10 +180,10 @@ async fn run_quantization_test(
         performance_config: FilesystemPerformanceConfig::default(),
         scheme_mapping: HashMap::new(),
     };
-    let filesystem = Arc::new(FilesystemFactory::create(fs_config).await?);
+    let _filesystem = Arc::new(FilesystemFactory::create(fs_config).await?);
 
-    let distance_compute = Arc::new(UnifiedDistanceCompute::default());
-    let mut sst_storage = SstEngine::new().await?;
+    let _distance_compute = Arc::new(UnifiedDistanceCompute::default());
+    let sst_storage = SstEngine::new().await?;
 
     // Calculate baseline (uncompressed) size
     let baseline_size = vectors.len() * dimension * 4; // FP32 = 4 bytes per float

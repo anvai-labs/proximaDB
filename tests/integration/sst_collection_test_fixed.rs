@@ -141,7 +141,7 @@ async fn test_sst_collection_with_proper_routing() -> anyhow::Result<()> {
     info!("Test 3: Search vectors from SST");
 
     // Build proper storage URL for search
-    let storage_url = operations::build_sst_storage_url(&env);
+    let _storage_url = operations::build_sst_storage_url(&env);
 
     // Search for vectors
     let query_vector = vec![1.0, 0.0, 0.0];

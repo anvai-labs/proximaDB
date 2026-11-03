@@ -55,13 +55,13 @@ async fn test_quantization_with_256kb_blocks() -> Result<()> {
             performance_config: Default::default(),
             scheme_mapping: std::collections::HashMap::new(),
         };
-        let filesystem = Arc::new(FilesystemFactory::create(fs_config).await?);
-        let distance_compute = Arc::new(
+        let _filesystem = Arc::new(FilesystemFactory::create(fs_config).await?);
+        let _distance_compute = Arc::new(
             proximadb::compute::distance_computation::UnifiedDistanceCompute::new(
                 proximadb::compute::distance_computation::DistanceMetric::Cosine,
             ),
         );
-        let mut sst_storage = SstEngine::new().await?;
+        let sst_storage = SstEngine::new().await?;
 
         // Calculate how many vectors fit per block
         let vector_bytes = dimension * 4; // FP32
@@ -237,13 +237,13 @@ async fn test_pq_quantization_256kb_blocks() -> Result<()> {
         performance_config: Default::default(),
         scheme_mapping: std::collections::HashMap::new(),
     };
-    let filesystem = Arc::new(FilesystemFactory::create(fs_config).await?);
-    let distance_compute = Arc::new(
+    let _filesystem = Arc::new(FilesystemFactory::create(fs_config).await?);
+    let _distance_compute = Arc::new(
         proximadb::compute::distance_computation::UnifiedDistanceCompute::new(
             proximadb::compute::distance_computation::DistanceMetric::Cosine,
         ),
     );
-    let mut sst_storage = SstEngine::new().await?;
+    let sst_storage = SstEngine::new().await?;
 
     // Flush with vectors
     let test_env = common::integration_test_helpers::UnifiedTestEnvironment::new().await?;
