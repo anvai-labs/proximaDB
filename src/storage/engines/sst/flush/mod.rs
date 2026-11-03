@@ -663,6 +663,10 @@ impl SstEngine {
         });
         let bytes_written = file_metadata.size;
 
+        let publication_invalidation =
+            crate::storage::engines::sst::search::SegmentListingPublicationGuard::new(
+                &atomic_op.final_url,
+            );
         let mut already_materialized = false;
         if recovery_materialization.is_some() {
             // The deterministic segment object is the recovery commit record.
@@ -701,6 +705,10 @@ impl SstEngine {
                 }
                 Err(error) => return Err(error).context("publishing recovery segment"),
             }
+            // The recovery object is visible before tracking finalization.
+            crate::storage::engines::sst::search::invalidate_segment_listing_cache(
+                &atomic_op.final_url,
+            );
             if let Err(error) = self
                 .atomic_coordinator()
                 .finalize_atomic_operation(&atomic_op.operation_id)
@@ -720,6 +728,7 @@ impl SstEngine {
                 .await
                 .context("Failed to commit atomic flush operation")?;
         }
+        drop(publication_invalidation);
         tracing::debug!(
             final_url = %atomic_op.final_url,
             filename = %filename,
@@ -816,12 +825,6 @@ impl SstEngine {
             );
         }
 
-        // TD-PAXDIR-2 (L1): the new segment must be visible to the next query —
-        // drop the cross-query listing cache immediately after the publish
-        // (before the awaited directory emission) to minimize the window.
-        crate::storage::engines::sst::search::invalidate_segment_listing_cache(
-            &atomic_op.final_url,
-        );
         if already_materialized {
             return Ok(FlushResult {
                 success: true,
