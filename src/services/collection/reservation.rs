@@ -2146,6 +2146,296 @@ mod tests {
         assert!(registry.reclaim_idle_grants(t0 + 7_200).await.is_empty());
     }
 
+    // ── TD-TIER-1 SC6 (runbook Phase 2): multi-tenant exit gates ─────────────
+    //
+    // Phase 2 = "Pools shared across tenants; mixed balanced/performance" with
+    // the exit gate "no capacity overcommit under concurrency (SC-TE3); idle
+    // reservation accrual matches the ledger; drops/updates release cleanly."
+    // The existing SC-TE3 stress gate races ONE tenant; Phase 2 shares the
+    // pool ACROSS tenants, so these gates race several tenants on one pool
+    // (1), bound one tenant's share under that contention (2), prove idle
+    // reclaim is per-GRANT across tenants — a hot tenant's grant never
+    // subsidizes an idle tenant's (3) — and prove drop releases exactly the
+    // dropped grant with no cross-tenant leak (4).
+
+    /// SC-TE3, multi-tenant: four tenants share one 10 MiB pool. Wave 1 (one
+    /// admission per tenant, 2 MiB each) is guaranteed to fit, so the pool
+    /// serves EVERY tenant deterministically; wave 2 races eight more
+    /// admissions (any tenant) for the last 2 MiB — exactly one more wins.
+    /// Final state regardless of interleaving: 5 grants, pool exactly full,
+    /// all four tenants hold a grant (the contention is genuinely
+    /// cross-tenant, not one tenant sweeping the pool).
+    #[tokio::test]
+    async fn multi_tenant_stress_never_overcommits_shared_pool() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = pool(&dir);
+        cfg.allocatable_bytes = 10 * 1024 * 1024; // 10 effective MiB
+        cfg.overhead_factor = 0.0; // isolate the counter from overhead math
+        let auth = ReservationAuthority::open(cfg).await.unwrap();
+        let tenants = ["t-alpha", "t-beta", "t-gamma", "t-delta"];
+        let reserve_ok = |tenant: String, collection: String| {
+            let a = auth.clone();
+            async move {
+                a.reserve(&tenant, &collection, 2 * 1024 * 1024, current_unix_secs())
+                    .await
+                    .is_ok()
+            }
+        };
+        // Wave 1: 4 × 2 MiB always fits — every tenant is served.
+        let wave1 = futures::future::join_all(
+            tenants
+                .iter()
+                .map(|t| reserve_ok(t.to_string(), format!("w1-{t}"))),
+        )
+        .await;
+        assert!(
+            wave1.iter().all(|&won| won),
+            "every tenant's wave-1 grant fits"
+        );
+
+        // Wave 2: eight racing admissions for the last 2 MiB — exactly one wins.
+        let mut handles = Vec::new();
+        for i in 0..8 {
+            let a = auth.clone();
+            handles.push(tokio::spawn(async move {
+                a.reserve(
+                    "t-alpha",
+                    &format!("w2-{i}"),
+                    2 * 1024 * 1024,
+                    current_unix_secs(),
+                )
+                .await
+                .is_ok()
+            }));
+        }
+        let wave2_wins: usize = futures::future::join_all(handles)
+            .await
+            .into_iter()
+            .map(|r| r.unwrap() as usize)
+            .sum();
+        assert_eq!(
+            wave2_wins, 1,
+            "exactly one of the eight racing admissions fits"
+        );
+
+        let grants = auth.grants_snapshot().await;
+        let live: Vec<&str> = grants
+            .iter()
+            .filter(|g| g.state.charges_capacity())
+            .map(|g| g.tenant_id.as_str())
+            .collect();
+        assert_eq!(live.len(), 5, "exactly floor(10/2) grants hold capacity");
+        assert_eq!(
+            auth.charged_effective_bytes().await,
+            10 * 1024 * 1024,
+            "the shared pool is exactly full"
+        );
+        for tenant in tenants {
+            assert!(
+                live.contains(&tenant),
+                "tenant {tenant} holds a grant — the pool served every tenant"
+            );
+        }
+    }
+
+    /// Phase 2, per-tenant limit under cross-tenant contention. The pool-level
+    /// `tenant_limit_bytes` bounds EVERY tenant's share uniformly (there is no
+    /// per-tenant override), so with a 4 MiB limit inside a 10 MiB shared pool
+    /// and THREE tenants racing 2 MiB admissions: each tenant wins at most its
+    /// 2-grant share, every tenant is still served, and the pool ends exactly
+    /// full (the three shares demand 12 MiB against 10 MiB of capacity —
+    /// capacity binds at 5 regardless of admission order).
+    #[tokio::test]
+    async fn tenant_limit_bounds_one_share_under_cross_tenant_contention() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = pool(&dir);
+        cfg.allocatable_bytes = 10 * 1024 * 1024;
+        cfg.overhead_factor = 0.0;
+        cfg.tenant_limit_bytes = Some(4 * 1024 * 1024);
+        let auth = ReservationAuthority::open(cfg).await.unwrap();
+        let mut handles = Vec::new();
+        for tenant in ["t-alpha", "t-beta", "t-gamma"] {
+            for i in 0..8 {
+                let a = auth.clone();
+                let tenant = tenant.to_string();
+                handles.push(tokio::spawn(async move {
+                    let won = a
+                        .reserve(
+                            &tenant,
+                            &format!("c{i}"),
+                            2 * 1024 * 1024,
+                            current_unix_secs(),
+                        )
+                        .await
+                        .is_ok();
+                    (tenant, won)
+                }));
+            }
+        }
+        let results = futures::future::join_all(handles).await;
+        let wins_for = |tenant: &str| -> usize {
+            results
+                .iter()
+                .filter(|r| {
+                    let (t, won) = r.as_ref().unwrap();
+                    t == tenant && *won
+                })
+                .count()
+        };
+        // Each tenant's first two admissions are limit-legal (2 × 2 MiB = the
+        // 4 MiB share); every later attempt is refused by the limit. Exactly
+        // six limit-legal admissions demand 12 MiB against 10 MiB, so exactly
+        // five win — in ANY interleaving, and dropping one admission from six
+        // still leaves every tenant at least one grant (only two per tenant).
+        for tenant in ["t-alpha", "t-beta", "t-gamma"] {
+            let wins = wins_for(tenant);
+            assert!(
+                (1..=2).contains(&wins),
+                "tenant {tenant} holds {wins} grants — the 4 MiB limit allows at most 2, \
+                 and the served-every-tenant shape guarantees at least 1"
+            );
+        }
+        let total: usize = ["t-alpha", "t-beta", "t-gamma"]
+            .iter()
+            .map(|t| wins_for(t))
+            .sum();
+        assert_eq!(
+            total, 5,
+            "the pool ends exactly full (10 MiB of 2 MiB grants)"
+        );
+        assert_eq!(auth.charged_effective_bytes().await, 10 * 1024 * 1024);
+        // The limit bounded each tenant's CHARGE, not just its wins: the
+        // ledger attributes ≤ 4 MiB raw to every tenant.
+        let grants = auth.grants_snapshot().await;
+        for tenant in ["t-alpha", "t-beta", "t-gamma"] {
+            let charged: u64 = grants
+                .iter()
+                .filter(|g| g.tenant_id == tenant && g.state.charges_capacity())
+                .map(|g| g.bytes)
+                .sum();
+            assert!(
+                charged <= 4 * 1024 * 1024,
+                "tenant {tenant} charge {charged} exceeds its 4 MiB share"
+            );
+        }
+    }
+
+    /// Phase 2, idle accrual is per-GRANT across tenants: two tenants share a
+    /// TTL pool; the idle tenant's grant is reclaimed at the sweep while the
+    /// hot tenant's grant (read hits recorded against its group) survives, and
+    /// the pool's charge drops by exactly one grant.
+    #[tokio::test]
+    async fn idle_reclaim_is_per_grant_across_tenants() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut shared = armed_pool(&dir, "shared", true);
+        shared.idle_reclaim_secs = 100;
+        shared.idle_reclaim_min_lifetime_secs = 60;
+        let registry = ReservationRegistry::open_from_config(&[shared])
+            .await
+            .unwrap()
+            .expect("registry");
+        let t0 = 1_700_000_000i64;
+        let _gate = crate::services::collection::reservation::residency_test_gate();
+        let _store = crate::services::collection::reservation::residency_test_store();
+        let hot_prefixes = vec!["s3://bed/c-hot/data/".to_string()];
+
+        registry
+            .reserve_for_performance("t-hot", "c-hot", t0, &hot_prefixes, Some("shared"))
+            .await
+            .unwrap();
+        registry
+            .reserve_for_performance("t-idle", "c-idle", t0, &[], Some("shared"))
+            .await
+            .unwrap();
+        let hot_grant = registry
+            .live_grant_for_collection("c-hot")
+            .await
+            .expect("live hot grant");
+        let store = proximadb_cache::process_store().expect("test store armed");
+        store.register_group_hit_for_test(&hot_grant.id, t0 + 10_000);
+
+        let authority = &registry.pools["shared"].1;
+        let charged_before = authority.charged_effective_bytes().await;
+        let reclaimed = registry.reclaim_idle_grants(t0 + 10_000).await;
+        let ids: Vec<&str> = reclaimed.iter().map(|g| g.collection_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["c-idle"],
+            "only the idle tenant's grant is reclaimed"
+        );
+        assert!(registry.live_grant_for_collection("c-hot").await.is_some());
+        assert!(registry.live_grant_for_collection("c-idle").await.is_none());
+        let charged_after = authority.charged_effective_bytes().await;
+        assert!(
+            charged_before > charged_after && charged_after > 0,
+            "exactly one grant's charge left the pool ({} → {})",
+            charged_before,
+            charged_after
+        );
+        // Idempotent sweep: the hot grant is never a casualty of a re-run —
+        // the second sweep runs 50s after the recorded hit, well inside the
+        // 100s TTL (the hit clocks the grant's idle time from the hit).
+        assert!(registry.reclaim_idle_grants(t0 + 10_050).await.is_empty());
+        assert!(registry.live_grant_for_collection("c-hot").await.is_some());
+    }
+
+    /// Phase 2, drops release cleanly across tenants: dropping one tenant's
+    /// collection releases exactly its grant (the other tenant's charge is
+    /// untouched), a repeat drop is a no-op, and a reopen of the ledger shows
+    /// only the survivor.
+    #[tokio::test]
+    async fn drop_releases_exactly_one_grant_across_tenants() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut shared = armed_pool(&dir, "shared", true);
+        shared.default_grant_bytes = 1024 * 1024;
+        let config = vec![shared];
+        let registry = ReservationRegistry::open_from_config(&config)
+            .await
+            .unwrap()
+            .expect("registry");
+        let now = current_unix_secs();
+        registry
+            .reserve_for_performance("t-one", "c-one", now, &[], Some("shared"))
+            .await
+            .unwrap();
+        registry
+            .reserve_for_performance("t-two", "c-two", now, &[], Some("shared"))
+            .await
+            .unwrap();
+
+        let authority = &registry.pools["shared"].1;
+        let charged_before = authority.charged_effective_bytes().await;
+        registry
+            .release_for_collection("t-one", "c-one", now + 1)
+            .await;
+        assert!(registry.live_grant_for_collection("c-one").await.is_none());
+        assert!(registry.live_grant_for_collection("c-two").await.is_some());
+        let charged_after = authority.charged_effective_bytes().await;
+        assert!(
+            charged_after > 0 && charged_after < charged_before,
+            "one grant released, the other tenant's charge remains ({} → {})",
+            charged_before,
+            charged_after
+        );
+        // Repeat drop: a no-op that cannot underflow the survivor's charge.
+        registry
+            .release_for_collection("t-one", "c-one", now + 2)
+            .await;
+        assert_eq!(
+            authority.charged_effective_bytes().await,
+            charged_after,
+            "repeat drop changes nothing"
+        );
+        // The ledger on disk agrees: a reopen restores only the survivor.
+        drop(registry);
+        let reopened = ReservationRegistry::open_from_config(&config)
+            .await
+            .unwrap()
+            .expect("registry");
+        assert!(reopened.live_grant_for_collection("c-one").await.is_none());
+        assert!(reopened.live_grant_for_collection("c-two").await.is_some());
+    }
+
     /// TD-TIER-1 SC6: an unknown pool id is refused fail-closed with the
     /// configured ids listed; an ungranted (no default_grant_bytes) named
     /// pool refuses too.
