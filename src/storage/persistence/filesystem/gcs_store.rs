@@ -262,6 +262,9 @@ struct GcsListItem {
 
 impl GcsFileSystem {
     pub async fn new(cfg: GcsConfig) -> FsResult<Self> {
+        // The SDK also initializes a gRPC TLS client. Embedded/library callers
+        // must not depend on the server executable installing its provider.
+        proximadb_tls::ensure_crypto_provider();
         // One credential source for both planes: anonymous (fake-gcs) or ADC
         // (resolved once here, shared with the data client).
         let (creds, data_builder) = match cfg.anonymous {

@@ -21,8 +21,9 @@
 #            disk. Compiles the server binary, so it gets its OWN scope/job (kept
 #            off --fast/--all's compile budget).
 #
-# Requires: docker, cargo, aws CLI (S3 bucket), az CLI (Azurite container),
-# curl (fake-gcs bucket). On GitHub ubuntu-latest all are preinstalled.
+# Requires: docker, cargo (plus cargo-nextest for --qa), aws CLI (S3 bucket), az CLI (Azurite container),
+# curl (fake-gcs bucket). QA installs cargo-nextest explicitly; the other
+# command-line tools are available on GitHub ubuntu-latest.
 #
 # Azure + S3 are strict (PUT-with-tier must be accepted + round-trip). GCS is
 # best-effort: the test itself skips on a fake-gcs/object_store incompatibility,
@@ -290,6 +291,14 @@ if [ "$SCOPE" = "qa" ]; then
   # compile efficiency). cloud-full (= aws+azure+gcp) is already built above;
   # this is a near-free incremental build + run. Emulators (Azurite/LocalStack/gcs)
   # are started by the setup trap before this scope runs.
+  # Keep the offline TLS constructor regression in a fresh process so no prior
+  # cloud client can install a provider and mask the embedded-caller failure.
+  # This QA scope reuses the integration binary without building root lib tests.
+  echo "==> QA tier: GCS HTTPS constructor initializes TLS without server startup"
+  CARGO_BUILD_JOBS=1 cargo nextest run -p proximadb --features cloud-full \
+    --test objstore_backend_contract_test \
+    -E 'test(=gcs_https_constructor_initializes_crypto_provider)'
+
   echo "==> TD-OBJSTORE-5 S2: backend contract tests (Azure/S3 strict, GCS best-effort)"
   CARGO_BUILD_JOBS=1 cargo test -p proximadb --features cloud-full \
     --test objstore_backend_contract_test \
