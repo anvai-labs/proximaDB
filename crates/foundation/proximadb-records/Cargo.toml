@@ -13,6 +13,11 @@ description = "ProximaRecord unified record envelope (spec §3 — Phase B, TD-0
 name = "proximadb_records"
 path = "src/lib.rs"
 
+[features]
+default = []
+# In-memory fixtures for downstream tests; enable only in dev-dependencies.
+test-support = []
+
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true

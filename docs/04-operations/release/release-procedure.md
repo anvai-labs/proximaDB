@@ -162,3 +162,41 @@ vendored (`scripts/build_portable_linux.sh`, server feature
 archive, the `.rpm` and the `.deb` in `release.yml`; minimums are in the
 [install guide](../../01-quick-start/install.md).
 
+## Withdrawing or rolling back a bad artifact
+
+A red release smoke after publication is visible but not a rollback. Decide first whether
+the artifact is **broken** (cannot serve, wrong arch, data-destroying) or **mislocated**
+(works, wrong place — the v0.5.0 MSI): pulling beats annotating only for the broken class.
+Per-registry reality — none of these undo a download that already happened:
+
+* **GitHub Release assets** (tarballs, .rpm, .deb, .msi, sdist, SHA256SUMS): delete the
+  asset from the release. Tags are ordinary annotated objects (no protection ruleset at the
+  time of writing — adding one for `v*` is an open item), so also verify the tag still
+  points at the intended qa→main merge (`git rev-parse <tag>` vs the PR head) before any
+  re-push; a re-run of `create-release` regenerates the body from the in-repo template and
+  drops hand-added notes — keep known-issue notes in the template fragment, not only on
+  the release object.
+* **PyPI**: maintainers CAN delete a release or a file (pull the wheel if it is
+  broken — do not let immutability folklore stop a pull); what is impossible is re-uploading
+  the same filename+version, so the fix ships as `<version>.post1`. Yanking (with a note)
+  is the softer action: it hides the version from new resolves without breaking existing
+  lockfiles.
+* **crates.io**: no deletion and no un-yank; `cargo yank <crate>@<version>` hides it from
+  new resolves. A replacement cannot ride semver build metadata (`+rev` — cargo ignores it
+  in resolution); bump the patch version instead.
+* **npm**: `npm unpublish` works within the 72-hour window and only if no dependents;
+  afterwards `npm deprecate <pkg>@<version> "use <fix version>"`. OIDC-published versions
+  carry provenance for the old version; a re-publish under the same version is impossible.
+* **Homebrew tap**: revert the formula commit in the tap repo (the workflow pushes
+  `url`+`sha256` per release; the smoke's homebrew leg asserts them against the release
+  asset, so revert in the same order you pull the asset).
+* **Docker Hub**: tags are mutable — re-push the fixed image under the same tag and, if
+  the bad digest was pulled, note the fixed digest. `docker tag <fixed> <repo>:<version>`
+  from the re-run's `publish-image` job.
+* **Order**: pull/annotate the GitHub asset first (it is the funnel every install doc
+  cites), then deprecate the registry versions, then the tap, then Docker. File the
+  follow-up TD against the smoke lane that missed it before closing.
+
+The upgrade notes in CHANGELOG.md carry the data-format constraints (e.g. v0.4.x rollback
+is unsupported once the format-2 truncator has run); a binary rollback is never a data
+rollback — restore from the pre-upgrade backup taken per those notes.

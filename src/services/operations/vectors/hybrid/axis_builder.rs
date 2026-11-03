@@ -99,6 +99,23 @@ pub fn build_axis_hybrid_query_with_policy(
                     ComparisonOperator::IsNull => FilterOperator::IsNull,
                     ComparisonOperator::IsNotNull => FilterOperator::IsNotNull,
                     ComparisonOperator::Like => FilterOperator::Like,
+                    // Presence tests lower onto their identical null-test
+                    // predicates (absent and present-and-null are conflated).
+                    ComparisonOperator::NotExists => FilterOperator::IsNull,
+                    ComparisonOperator::Exists => FilterOperator::IsNotNull,
+                    // No AXIS lowering for Regex. Unlike
+                    // to_index_metadata_filters (whose consumers re-apply the
+                    // full expression as a residual), the AXIS leg has NO
+                    // residual re-filter — skipping the condition here would
+                    // silently drop it. Decline the whole AXIS lowering
+                    // instead (same contract as Or/Not below): callers either
+                    // fall back to the storage leg, which evaluates the full
+                    // filter, or fail closed.
+                    ComparisonOperator::Regex => {
+                        return Err(anyhow!(
+                            "Regex filters are not lowerable to AXIS (no residual re-filter on this path)"
+                        ));
+                    }
                 };
 
                 if field == "id"

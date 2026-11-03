@@ -1035,7 +1035,6 @@ async fn runs_search(
 mod tests {
     use super::*;
     use crate::network::middleware::tenant::{TenantContext, TenantIdSource};
-    use crate::storage::engines::sst::SstEngine;
     use axum::body::Body;
     use axum::http::Request;
     use axum::http::StatusCode;

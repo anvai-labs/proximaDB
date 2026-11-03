@@ -20,7 +20,9 @@ def record_payload(
         "props": dict(metadata or {}),
     }
     if text is not None:
-        payload["source"] = text
+        # TD-REC-1: text rides in text_fields (where it persists) — a
+        # top-level `source` was always silently dropped server-side and is
+        # now a contract 400.
         payload["text_fields"] = [{"name": "text", "content": text}]
     return payload
 

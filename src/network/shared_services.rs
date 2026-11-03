@@ -1813,6 +1813,7 @@ impl SharedServices {
                     storage_class: None,
                     policy_generation: None,
                     default_access_tier: None,
+                    pool_id: None,
                     name: metadata.name.clone(),
                     embedding_config: None,
                     dimension: metadata.dimension as u32,
@@ -2129,6 +2130,15 @@ impl SharedServices {
                      replayed tables stay resident until each table's first write"
                 ),
             }
+            // Release-review F7: once the WAL has been truncated below its
+            // head (`retained_from() > 1` — the same condition the spill-off
+            // boot refusal treats as "rows may be in no retained WAL entry"),
+            // a failed replay is not self-healing: the retained tail is the
+            // only copy of the unflushed rows, so serving whatever replayed
+            // is a silent subset, exactly the failure the DATA_FORMAT marker
+            // exists to refuse. Fatal there; a never-truncated WAL keeps the
+            // legacy warn-and-recover-on-restart posture.
+            let truncated_history = appender.retained_from() > 1;
             match appender.read_entries().await {
                 Ok(entries) => match store.replay_wal_entries(entries).await {
                     Ok(_) => record_store_recovered = true,
@@ -2138,12 +2148,29 @@ impl SharedServices {
                                 "canonical record-store WAL replay failed with [oltp] atomic_commit on; refusing to serve partial state: {e:#}"
                             );
                         }
+                        if truncated_history {
+                            anyhow::bail!(
+                                "canonical record-store WAL replay failed on a truncated WAL \
+                                 (retained from LSN {}); the retained tail is the only copy of \
+                                 unflushed rows, so serving the partial replay would silently \
+                                 drop data. Restore or investigate the WAL, then restart: {e:#}",
+                                appender.retained_from()
+                            );
+                        }
                         warn!("SharedServices: canonical record-store WAL replay failed: {e}");
                     }
                 },
                 Err(e) if atomic_commit => {
                     anyhow::bail!(
                         "reading the canonical WAL failed with [oltp] atomic_commit on; refusing to serve: {e:#}"
+                    );
+                }
+                Err(e) if truncated_history => {
+                    anyhow::bail!(
+                        "reading the canonical WAL failed on a truncated WAL (retained from \
+                         LSN {}); the retained tail is the only copy of unflushed rows, so \
+                         serving without it would silently drop data: {e:#}",
+                        appender.retained_from()
                     );
                 }
                 Err(e) => {
@@ -2804,29 +2831,31 @@ impl SharedServices {
             match PartitionLeaseStore::from_url(&storage_config.metadata_url, "_operator/leases") {
                 Ok(store) => {
                     let pod_id = crate::cluster::primary_pod_registry::resolve_self_pod_id(None);
+                    let lease_ttl_ms = storage_config.write_lease_ttl_ms.max(2_000) as i64;
                     let manager = Arc::new(PartitionLeaseManager::new(
                         Arc::new(store),
                         primary_pod_registry.clone(),
                         pod_id.clone(),
-                        10_000,
+                        lease_ttl_ms,
                     ));
                     crate::cluster::partition_lease::install_global_partition_lease_manager(
                         manager.clone(),
                     );
                     // P1a: keep held leases warm. Without this the renew loop
                     // never runs in production (it was only spawned in tests),
-                    // so held leases lapse after the 10s TTL and the
+                    // so held leases lapse after their TTL and the
                     // leaseholder model the write-gate (421) + DML locks rely
                     // on silently degrades. Fire-and-forget for the process
                     // lifetime (matches SharedServices' existing background-task
-                    // pattern); interval ≤ lease_ms/2 so a lease never lapses
-                    // between renewals.
+                    // pattern). The config-derived interval is at most half
+                    // the writer TTL and capped at 5s for initially 10s DML
+                    // locks and graph node/edge resource leases.
                     // `spawn_renew_loop` tokio::spawns the loop and returns its
                     // JoinHandle; drop it as a temporary so the task runs detached
                     // (fire-and-forget) without tripping clippy::let_underscore_future.
                     manager
                         .clone()
-                        .spawn_renew_loop(std::time::Duration::from_millis(5_000));
+                        .spawn_renew_loop(storage_config.write_lease_renew_interval());
 
                     // TD-MANIFEST-1: cap the lease manifest log. Manifests are
                     // append-only and were never pruned, so a long-lived lease grew
@@ -2954,6 +2983,12 @@ impl SharedServices {
         // so DDL and DML share one ownership view.
         let mut ddl = crate::services::DdlService::new(catalog_manager.clone())
             .with_record_store(dml_service_for_grpc.record_store())
+            // TD-COMPACT-14: COMPACT TABLE over the REST/gRPC SQL facade.
+            .with_collection_compactor(std::sync::Arc::new(
+                crate::services::operations::vectors::VectorOpsCollectionCompactor {
+                    vector_ops: vector_operations_service.clone(),
+                },
+            ))
             .with_primary_pod_registry(primary_pod_registry.clone())
             .with_self_pod_id(crate::cluster::primary_pod_registry::resolve_self_pod_id(
                 None,

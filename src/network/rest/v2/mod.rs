@@ -308,6 +308,10 @@ pub fn create_v2_router() -> Router<AppState> {
         )
         // Phase 8 (F4a) — single-node collection suspend/resume (TD-094).
         .route(
+            "/collections/{collection_id}/compact",
+            post(collections::post_collection_compact_v2),
+        )
+        .route(
             "/collections/{collection_id}/suspend",
             post(collections::post_collection_suspend_v2),
         )

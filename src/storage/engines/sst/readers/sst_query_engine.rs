@@ -2901,6 +2901,16 @@ impl UnifiedSstableReader {
                             Ok(FilterCondition::Equals(field.clone(), value.clone()))
                         }
                     }
+                    // Presence tests and Regex have no vectorized kernel
+                    // here, and the catch-all dummy below evaluates as
+                    // admit-all on this path (no residual re-filter) —
+                    // fail closed instead of silently dropping the
+                    // predicate.
+                    ComparisonOperator::Exists
+                    | ComparisonOperator::NotExists
+                    | ComparisonOperator::Regex => Err(anyhow::anyhow!(
+                        "operator {operator:?} has no vectorized kernel in the SST query engine"
+                    )),
                     _ => {
                         // For other operators, use a pass-through condition
                         Ok(FilterCondition::Equals(

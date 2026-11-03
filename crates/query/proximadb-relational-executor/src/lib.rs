@@ -2506,22 +2506,8 @@ impl Accumulator {
 }
 
 fn numeric_to_f64(v: &ProximaValue) -> Result<f64, ExecError> {
-    use ProximaValue as V;
-    match v {
-        V::Int8(x) => Ok(*x as f64),
-        V::Int16(x) => Ok(*x as f64),
-        V::Int32(x) => Ok(*x as f64),
-        V::Int64(x) => Ok(*x as f64),
-        V::UInt8(x) => Ok(*x as f64),
-        V::UInt16(x) => Ok(*x as f64),
-        V::UInt32(x) => Ok(*x as f64),
-        V::UInt64(x) => Ok(*x as f64),
-        V::Float16(x) | V::Float32(x) => Ok(*x as f64),
-        V::Float64(x) => Ok(*x),
-        other => Err(ExecError::TypeMismatch(format!(
-            "expected numeric, got {other:?}"
-        ))),
-    }
+    v.as_numeric_f64()
+        .ok_or_else(|| ExecError::TypeMismatch(format!("expected numeric, got {v:?}")))
 }
 
 // =========================================================================
@@ -2656,10 +2642,26 @@ mod tests {
     use proximadb_relational_types::{BinaryOp, ColumnInfo, ColumnRef, Expr};
     use std::sync::Mutex;
 
+    #[test]
+    fn aggregate_numeric_conversion_keeps_float16_and_type_errors() {
+        assert_eq!(numeric_to_f64(&ProximaValue::Float16(1.5)).unwrap(), 1.5);
+        for value in [
+            ProximaValue::Decimal("1.5".into()),
+            ProximaValue::String("1.5".into()),
+            ProximaValue::Null,
+        ] {
+            let result = numeric_to_f64(&value);
+            assert!(matches!(result, Err(ExecError::TypeMismatch(ref msg))
+                if msg == &format!("expected numeric, got {value:?}")));
+        }
+    }
+
+    type ReaderSource = (RelationalSchema, Vec<RelationalRow>, Vec<usize>);
+
     /// Test reader factory backed by a name-keyed registry. Each
     /// table returns a clone of a stored `VecReader` source.
     struct VecReaderFactory {
-        sources: Mutex<HashMap<String, (RelationalSchema, Vec<RelationalRow>, Vec<usize>)>>,
+        sources: Mutex<HashMap<String, ReaderSource>>,
         /// Optional non-PK secondary-index ordinals per table (TD-127).
         secondary: Mutex<HashMap<String, Vec<usize>>>,
     }

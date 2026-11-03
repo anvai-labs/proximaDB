@@ -291,6 +291,81 @@ class BaseProtocolAdapter(ABC):
     # Hybrid Search Operations
     # ==========================================================================
 
+    # ==========================================================================
+    # Search/Scan/Query Extensions (TD-SDK-3 batch 4) — optional namespace,
+    # same pattern: REST implements over the spec-driven ops / protocol
+    # surfaces, embedded over the engine, gRPC stays on these defaults.
+    # ==========================================================================
+
+    def scan_page(
+        self,
+        collection_id: str,
+        *,
+        filter: list[dict[str, Any]] | dict[str, Any] | None = None,
+        limit: int | None = None,
+        cursor: str | None = None,
+        include_vectors: bool = False,
+        include_text: bool = False,
+    ) -> tuple[list, str | None]:
+        """Scan one page of records via the vector-free metadata-scan
+        endpoint (REST-only surface). Returns ``(records, next_cursor)``."""
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not support metadata scans"
+        )
+
+    def search_envelope(
+        self,
+        collection_id: str,
+        vector: list[float],
+        top_k: int = 10,
+        include_vectors: bool = False,
+        include_metadata: bool = True,
+        **kwargs,
+    ) -> Any:
+        """Run the first-page REST OpenAPI v2 search envelope (the
+        concrete REST adapter returns ``models.SearchEnvelope``)."""
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not support the paged search envelope"
+        )
+
+    def search_next_page(
+        self,
+        collection_id: str,
+        cursor: str,
+        include_vectors: bool = False,
+        include_metadata: bool = True,
+        **kwargs,
+    ) -> Any:
+        """Continue a paged search by cursor (transports with the
+        envelope surface only)."""
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not support cursor-continued search"
+        )
+
+    def execute_sql(
+        self,
+        query: str,
+        parameters: list[Any] | None = None,
+        collection: str | None = None,
+        **kwargs,
+    ) -> dict[str, Any]:
+        """Execute a SQL query (the spec-driven sql op / engine SQL)."""
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not support SQL execution"
+        )
+
+    def execute_unified_query(
+        self,
+        query: str,
+        query_vector: list[float] | None = None,
+        fusion_strategy: str | None = None,
+        **kwargs,
+    ) -> list[dict[str, Any]]:
+        """Execute a federated multi-model (UQL) query — embedded native."""
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not support unified queries"
+        )
+
     def hybrid_search(
         self,
         collection: str,
@@ -350,6 +425,288 @@ class BaseProtocolAdapter(ABC):
         """Delete a time-series collection."""
         raise NotImplementedError(
             f"{self.__class__.__name__} does not support time-series collection deletion"
+        )
+
+    # ==========================================================================
+    # Observability Operations (TD-SDK-3 batch 3 — logs, metrics, traces)
+    #
+    # Optional namespace, same pattern as documents/timeseries: adapters
+    # implement what their transport supports (embedded implements the whole
+    # family; REST covers namespace/logs/metrics where the spec defines
+    # endpoints) and the rest fall through to these NotImplementedError
+    # defaults — the honest capability signal, surfacing as the typed
+    # ProximaDBNotSupportedError on the v2 facade. Canonical signatures
+    # mirror the v1 unified client's public observability surface.
+    # ==========================================================================
+
+    def create_observability_namespace(
+        self,
+        name: str,
+        retention_days: int | None = None,
+        **kwargs,
+    ) -> dict[str, Any]:
+        """Create a namespace for logs, metrics, and traces."""
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not support observability namespaces"
+        )
+
+    def ingest_logs(self, namespace: str, logs: list[dict[str, Any]], **kwargs) -> int:
+        """Ingest structured log events into an observability namespace."""
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not support log ingest"
+        )
+
+    def query_logs(
+        self,
+        namespace: str,
+        start_time_ns: int,
+        end_time_ns: int,
+        query: str | None = None,
+        limit: int = 100,
+        **kwargs,
+    ) -> list[dict[str, Any]]:
+        """Query log events from an observability namespace."""
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not support log queries"
+        )
+
+    def ingest_metrics(
+        self, namespace: str, samples: list[dict[str, Any]], **kwargs
+    ) -> int:
+        """Ingest metric samples into an observability namespace."""
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not support metric ingest"
+        )
+
+    def aggregate_metrics(
+        self,
+        namespace: str,
+        metric_name: str,
+        aggregation: str = "avg",
+        start_time: str | None = None,
+        end_time: str | None = None,
+        step_seconds: int = 60,
+        **kwargs,
+    ) -> list[dict[str, Any]]:
+        """Aggregate metrics from an observability namespace."""
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not support metric aggregation"
+        )
+
+    def ingest_traces(
+        self, namespace: str, traces: list[dict[str, Any]], **kwargs
+    ) -> int:
+        """Ingest trace spans into an observability namespace."""
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not support trace ingest"
+        )
+
+    def query_traces(
+        self,
+        namespace: str,
+        start_time_ns: int,
+        end_time_ns: int,
+        trace_id: str | None = None,
+        service: str | None = None,
+        operation: str | None = None,
+        min_duration_ns: int | None = None,
+        status: str | None = None,
+        limit: int = 100,
+        **kwargs,
+    ) -> list[dict[str, Any]]:
+        """Query trace spans in an observability namespace."""
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not support trace queries"
+        )
+
+    def get_trace(self, namespace: str, trace_id: str, **kwargs) -> dict[str, Any]:
+        """Get all spans for a specific trace ID."""
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not support trace reads"
+        )
+
+    # ==========================================================================
+    # Graph Operations (TD-SDK-3 batch 1 — the graph-CRUD family)
+    #
+    # Optional namespace, same pattern as documents/timeseries above: adapters
+    # implement what their transport supports and let the rest fall through to
+    # these NotImplementedError defaults. Canonical signatures mirror the v1
+    # unified client's public graph surface so v2 methods are drop-in; the
+    # ``graph_id`` keyword (``None`` → the server's "default" graph) is the one
+    # canonical spelling — adapters translate, never the facade.
+    # ==========================================================================
+
+    def create_node(
+        self,
+        node_id: str,
+        labels: list[str],
+        properties: dict[str, Any] | None = None,
+        embedding: list[float] | None = None,
+        graph_id: str | None = None,
+        **kwargs,
+    ) -> dict[str, Any]:
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not support graph node creation"
+        )
+
+    def create_edge(
+        self,
+        edge_id: str,
+        from_node_id: str,
+        to_node_id: str,
+        edge_type: str,
+        properties: dict[str, Any] | None = None,
+        weight: float | None = None,
+        graph_id: str | None = None,
+        **kwargs,
+    ) -> dict[str, Any]:
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not support graph edge creation"
+        )
+
+    def batch_create_nodes(
+        self, nodes: list[dict[str, Any]], graph_id: str | None = None, **kwargs
+    ) -> dict[str, Any]:
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not support graph node batches"
+        )
+
+    def batch_create_edges(
+        self, edges: list[dict[str, Any]], graph_id: str | None = None, **kwargs
+    ) -> dict[str, Any]:
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not support graph edge batches"
+        )
+
+    def get_node(
+        self, node_id: str, graph_id: str | None = None, **kwargs
+    ) -> dict[str, Any] | None:
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not support graph node reads"
+        )
+
+    def get_outgoing_edges(
+        self,
+        node_id: str,
+        edge_types: list[str] | None = None,
+        graph_id: str | None = None,
+        **kwargs,
+    ) -> list[dict[str, Any]]:
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not support graph edge reads"
+        )
+
+    def get_incoming_edges(
+        self,
+        node_id: str,
+        edge_types: list[str] | None = None,
+        graph_id: str | None = None,
+        **kwargs,
+    ) -> list[dict[str, Any]]:
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not support graph edge reads"
+        )
+
+    def delete_node(self, node_id: str, graph_id: str | None = None, **kwargs) -> bool:
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not support graph node deletion"
+        )
+
+    def query_nodes(
+        self,
+        labels: list[str] | None = None,
+        properties: dict[str, Any] | None = None,
+        limit: int | None = None,
+        offset: int | None = None,
+        graph_id: str | None = None,
+        **kwargs,
+    ) -> dict[str, Any]:
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not support graph node queries"
+        )
+
+    def traverse_graph(
+        self,
+        start_node_id: str,
+        max_depth: int = 3,
+        edge_types: list[str] | None = None,
+        node_labels: list[str] | None = None,
+        algorithm: str = "BFS",
+        limit: int | None = None,
+        graph_id: str | None = None,
+        **kwargs,
+    ) -> dict[str, Any]:
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not support graph traversal"
+        )
+
+    def create_graph(
+        self,
+        graph_id: str,
+        name: str | None = None,
+        description: str | None = None,
+        schema: dict[str, Any] | None = None,
+        **kwargs,
+    ) -> dict[str, Any]:
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not support graph collection creation"
+        )
+
+    def delete_graph(self, graph_id: str, **kwargs) -> dict[str, Any]:
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not support graph collection deletion"
+        )
+
+    def get_graph(self, graph_id: str, **kwargs) -> dict[str, Any]:
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not support graph collection reads"
+        )
+
+    def list_graphs(self, **kwargs) -> dict[str, Any]:
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not support graph collection listing"
+        )
+
+    def get_graph_stats(self, graph_id: str, **kwargs) -> dict[str, Any]:
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not support graph collection stats"
+        )
+
+    def graph_shortest_path(
+        self,
+        start_node_id: str,
+        target_node_id: str,
+        max_depth: int | None = None,
+        edge_types: list[str] | None = None,
+        algorithm: str = "DIJKSTRA",
+        k: int | None = None,
+        enable_prefetch: bool | None = None,
+        prefetch_budget: int | None = None,
+        timeout: float | None = None,
+        graph_id: str = "default",
+        **kwargs,
+    ) -> dict[str, Any]:
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not support graph shortest path"
+        )
+
+    def graph_traverse(
+        self,
+        start_node_id: str,
+        max_depth: int = 3,
+        edge_types: list[str] | None = None,
+        algorithm: str = "BFS",
+        limit: int | None = None,
+        timeout_ms: int | None = None,
+        max_frontier: int | None = None,
+        enable_prefetch: bool | None = None,
+        prefetch_budget: int | None = None,
+        timeout: float | None = None,
+        graph_id: str = "default",
+        **kwargs,
+    ) -> dict[str, Any]:
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not support tuned graph traversal"
         )
 
     # ==========================================================================

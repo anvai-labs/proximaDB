@@ -433,6 +433,11 @@ impl ProximaDB {
                                 );
                             }
                         }
+                        // TD-TIER-1 SC6 S2: idle-grant reclaim rides the same
+                        // cadence, AFTER the drain (a slow sweep must never
+                        // delay metering). No pool arms a TTL by default, so
+                        // this is a no-op unless configured.
+                        registry.reclaim_idle_grants(now_secs).await;
                     }
                 }
             });
@@ -1955,6 +1960,7 @@ mod security_initialization_tests {
     use crate::security::{
         AuthenticationConfig, AuthenticationMethod, SecurityConfig, SecurityMode,
     };
+    use serial_test::serial;
 
     fn security_config(enabled: bool) -> SecurityConfig {
         SecurityConfig {
@@ -2053,11 +2059,13 @@ mod security_initialization_tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn password_without_security_rejects_before_queue_admission() {
         constructor_queue_admission("password").await;
     }
 
     #[tokio::test]
+    #[serial]
     async fn explicit_trust_without_security_reaches_queue_admission() {
         constructor_queue_admission("trust").await;
     }

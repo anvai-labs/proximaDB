@@ -53,9 +53,41 @@ pytest.importorskip(
 )
 
 
+#: The docstring marker emitted by ``generate_protos.write_legacy_shims``.
+#: A file is treated as a shim ONLY if it carries this exact marker AND
+#: re-exports the module with the SAME stem — so an incidental
+#: ``from proximadb_sdk...`` import inside a real (non-shim) generated file
+#: can never divert content checks, and a wrong-stem shim fails loudly here.
+_SHIM_MARKER = "Compatibility shim: the canonical generated module lives in"
+
+
+def _resolve_shim(path: Path) -> Path:
+    """Follow a legacy compatibility shim to its canonical generated file.
+
+    Files under ``src/proximadb/`` are generated-form re-export shims of
+    ``proximadb_sdk`` (the single generated source of truth). Gates inspect
+    the descriptor of the module they resolve to, so a shim is validated
+    through the canonical content it re-exports.
+    """
+    if path.parent.parent.name != "proximadb":
+        return path  # only the legacy package is shimmed
+    text = path.read_text()
+    if _SHIM_MARKER not in text:
+        return path  # real protoc output carries no marker
+    for line in text.splitlines():
+        if line.startswith("from proximadb_sdk.") and " import" in line:
+            target = line.split(" import")[0].removeprefix("from ").strip()
+            resolved = PYTHON_SRC / Path(*target.split(".")).with_suffix(".py")
+            assert (
+                resolved.stem == path.stem
+            ), f"legacy shim {path.name} re-exports wrong module {target}"
+            return resolved
+    return path
+
+
 def _descriptor(path: Path) -> bytes | None:
     """The serialized FileDescriptorProto embedded in a generated stub."""
-    match = _SERIALIZED.search(path.read_text())
+    match = _SERIALIZED.search(_resolve_shim(path).read_text())
     return ast.literal_eval(match.group(1)) if match else None
 
 
@@ -119,6 +151,11 @@ NO_PYTHON_STUB_BY_DESIGN = frozenset(
         "proximadb/v1/streaming.proto",
         "proximadb/v1/unified.proto",
         "proximadb/v2/ledger.proto",
+        # model_registry: the canonical tree (proximadb_sdk) dropped its stub
+        # when the registry moved off the client surface; the legacy tree kept
+        # serving a stale copy until the shim conversion (2026-10-31) removed
+        # it — server-side contract the client never speaks.
+        "proximadb/v2/model_registry.proto",
     }
 )
 

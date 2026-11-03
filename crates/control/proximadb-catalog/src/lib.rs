@@ -24,6 +24,63 @@ pub mod cache;
 // Runtime/wiring modules extracted from the root `src/catalog` (decomposition
 // Slice 1 — foundation-pure leaves). The root `crate::catalog` re-exports these
 // so existing `crate::catalog::*` import paths are unchanged.
+
+/// Poison-tolerant `RwLock` helpers shared across catalog modules.
+#[cfg(feature = "fc-metamodel")]
+pub(crate) mod lock_util {
+    use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+
+    /// Acquire a read lock, recovering from poison instead of panicking.
+    pub(crate) fn read_lock<T>(lock: &RwLock<T>) -> RwLockReadGuard<'_, T> {
+        match lock.read() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    /// Acquire a write lock, recovering from poison instead of panicking.
+    pub(crate) fn write_lock<T>(lock: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
+        match lock.write() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::sync::Arc;
+
+        #[test]
+        fn healthy_lock_reads_and_commits_mutations() {
+            let lock = RwLock::new(vec![1]);
+            assert_eq!(*read_lock(&lock), [1]);
+            write_lock(&lock).push(2);
+            assert_eq!(*read_lock(&lock), [1, 2]);
+            assert!(!lock.is_poisoned());
+        }
+
+        #[test]
+        fn poisoned_writer_preserves_data_and_allows_later_reads_and_writes() {
+            let lock = Arc::new(RwLock::new(vec![1]));
+            let writer = Arc::clone(&lock);
+            let result = std::thread::spawn(move || {
+                let mut guard = writer.write().unwrap();
+                guard.push(2);
+                panic!("deliberate writer failure while holding the lock");
+            })
+            .join();
+            assert!(result.is_err());
+            assert!(lock.is_poisoned());
+            assert_eq!(*read_lock(&lock), [1, 2]);
+            write_lock(&lock).push(3);
+            assert_eq!(*read_lock(&lock), [1, 2, 3]);
+            // Recovery must keep working even though poisoning is not cleared.
+            assert!(lock.is_poisoned());
+        }
+    }
+}
+
 pub mod canonical_precision;
 pub mod corpus_version_fs_store;
 #[cfg(feature = "fc-metamodel")]

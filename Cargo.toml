@@ -819,6 +819,7 @@ tracing-subscriber = "0.3"
 
 # Development dependencies
 [dev-dependencies]
+proximadb-records = { path = "crates/foundation/proximadb-records", features = ["test-support"] }
 criterion = { version = "0.5", features = ["async_tokio"] }
 proptest = "1.0"
 # In-process gather of the default prometheus registry where the per-tenant
@@ -846,6 +847,11 @@ serde_yaml = "0.9"
 # Test-only: integration tests use EmbeddedProximaDB from the embedded crate.
 # Dev-deps don't create build cycles (test-mode only).
 proximadb-embedded = { path = "crates/binding/proximadb-embedded" }
+# `cargo test --lib` runs every unit test in ONE process, so tests that mutate
+# process-global state (env gates, global counters, fault injection) must be
+# mutually serialized; nextest isolates them per process but the plain
+# libtest runner does not. `#[serial]` gives those tests one shared lock.
+serial_test = "3"
 
 [features]
 # Default feature set as of 2026-05-26 (ADR-020 Tier 2.2 / TD-065 default-enable).
@@ -940,7 +946,13 @@ onnx = [
 # Cloud storage features (optional to avoid linking issues during testing)
 aws = ["object_store/aws", "proximadb-catalog/aws"]
 azure = ["object_store/azure"]
-gcp = ["dep:google-cloud-storage", "dep:google-cloud-auth", "dep:http", "dep:crc32c"]
+gcp = [
+  "dep:google-cloud-storage",
+  "dep:google-cloud-auth",
+  "dep:http",
+  "dep:crc32c",
+  "proximadb-object-store/gcp",
+]
 
 # TD-161 external OTLP metering push (default-OFF). Compiles the OTLP exporter that
 # ships the per-tenant metering snapshot to a collector; runtime-gated additionally by

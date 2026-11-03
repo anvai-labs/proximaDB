@@ -884,6 +884,7 @@ impl Default for StorageConfig {
             metadata_url: "file://./metadata".to_string(),
             assignment_config: AssignmentConfig::default(),
             wal_config: WriteBufferUserConfig::default(),
+            write_lease_ttl_ms: default_write_lease_ttl_ms(),
             prune_mode: None,
             mmap_enabled: true,
             sst_config: Some(SstConfig::default()),
@@ -900,6 +901,20 @@ impl Default for StorageConfig {
 
 pub use proximadb_config::ServerConfig;
 
+fn default_write_lease_ttl_ms() -> u64 {
+    10_000
+}
+
+impl CoreStorageConfig {
+    /// The shared lease renew interval derived from
+    /// [`CoreStorageConfig::write_lease_ttl_ms`]: `ttl / 2`, clamped to 1–5 s.
+    /// The upper bound also covers DML locks and graph node/edge leases,
+    /// whose initial TTL is 10 s even when the writer TTL is raised.
+    pub fn write_lease_renew_interval(&self) -> std::time::Duration {
+        let ttl = self.write_lease_ttl_ms.max(2_000);
+        std::time::Duration::from_millis((ttl / 2).clamp(1_000, 5_000))
+    }
+}
 /// Backwards-compat alias for [`CoreStorageConfig`].
 pub type StorageConfig = CoreStorageConfig;
 
@@ -926,6 +941,14 @@ pub struct CoreStorageConfig {
     pub mmap_enabled: bool,
     /// SST (Sorted String Table) engine configuration
     pub sst_config: Option<SstConfig>,
+    /// Writer-incarnation / partition-lease TTL in milliseconds
+    /// (TD-LEASE-2). The shared renew loop interval is derived as `ttl / 2`,
+    /// clamped to 1–5 s so short-lived resource leases also receive a renewal
+    /// opportunity before expiry. Raise it for workloads whose compaction or
+    /// flush stalls can exceed the default 10 s (observed: a 13 s stall
+    /// lapsed the incarnation and fenced an ingest batch).
+    #[serde(default = "default_write_lease_ttl_ms")]
+    pub write_lease_ttl_ms: u64,
     /// VIPER columnar engine configuration
     pub viper_config: Option<ViperConfig>,
     /// Global read cache size in megabytes

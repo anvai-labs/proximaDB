@@ -424,21 +424,7 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
-/// Poison-tolerant lock helpers: a panicked writer elsewhere must not turn the
-/// registry into a panic amplifier (panic-policy: no unwrap in prod paths).
-fn read_lock(lock: &RwLock<State>) -> std::sync::RwLockReadGuard<'_, State> {
-    match lock.read() {
-        Ok(g) => g,
-        Err(poisoned) => poisoned.into_inner(),
-    }
-}
-
-fn write_lock(lock: &RwLock<State>) -> std::sync::RwLockWriteGuard<'_, State> {
-    match lock.write() {
-        Ok(g) => g,
-        Err(poisoned) => poisoned.into_inner(),
-    }
-}
+use crate::lock_util::{read_lock, write_lock};
 
 // ---------------------------------------------------------------------------
 // The specification. Written before the implementation (ADR-090 / TD-AUTHZ-1

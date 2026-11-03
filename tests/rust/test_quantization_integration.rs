@@ -5,7 +5,7 @@
 
 use anyhow::Result;
 use serde_json::json;
-use tracing::{debug, error, info, warn};
+use tracing::debug;
 
 #[tokio::test]
 async fn test_quantization_config_creation() -> Result<()> {

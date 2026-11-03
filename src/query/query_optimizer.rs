@@ -179,6 +179,14 @@ pub enum FilterCondition {
         /// Lower bound (inclusive)
         value: serde_json::Value,
     },
+    /// Regular-expression match (folded in from the former metadata_query
+    /// vocabulary; `FilterCondition` previously had no equivalent).
+    Regex {
+        /// Column name to filter on
+        column: String,
+        /// Regular expression pattern (Rust `regex` syntax)
+        pattern: String,
+    },
     /// Less-than comparison
     LessThan {
         /// Column name to filter on
@@ -939,6 +947,7 @@ impl UnifiedCostModel {
             FilterCondition::Range { .. } => 0.3,  // 30% for range
             FilterCondition::In { values, .. } => 1.0 / values.len() as f64,
             FilterCondition::IsNull { .. } => 0.05, // 5% null rate assumption
+            FilterCondition::Regex { .. } => 0.3,   // between anchored and unanchored LIKE
             FilterCondition::Like { pattern, .. } => {
                 if pattern.starts_with('%') {
                     0.5
@@ -2095,6 +2104,19 @@ pub fn migrate_universal_filter(
                         column: field.clone(),
                         pattern: value.as_str().unwrap_or("").to_string(),
                     },
+                    // Presence tests lower onto their identical null-test
+                    // predicates (this codebase conflates absent and
+                    // present-and-null).
+                    ComparisonOperator::Exists => FilterCondition::IsNotNull {
+                        column: field.clone(),
+                    },
+                    ComparisonOperator::NotExists => FilterCondition::IsNull {
+                        column: field.clone(),
+                    },
+                    ComparisonOperator::Regex => FilterCondition::Regex {
+                        column: field.clone(),
+                        pattern: value.as_str().unwrap_or("").to_string(),
+                    },
                 };
                 conditions.push(condition);
             }
@@ -2535,6 +2557,20 @@ impl UnifiedQueryOptimizer {
                     serde_json::Value::Array(arr) => arr.clone(),
                     _ => vec![value.clone()],
                 },
+            },
+            // Presence tests lower onto their identical null-test predicates;
+            // Regex keeps its own FilterCondition so the legacy executor
+            // evaluates the real predicate instead of falling into the
+            // catch-all (which would collapse it to bogus equality).
+            ComparisonOperator::Exists => FilterCondition::IsNotNull {
+                column: field.to_string(),
+            },
+            ComparisonOperator::NotExists => FilterCondition::IsNull {
+                column: field.to_string(),
+            },
+            ComparisonOperator::Regex => FilterCondition::Regex {
+                column: field.to_string(),
+                pattern: value.as_str().unwrap_or("").to_string(),
             },
             _ => FilterCondition::Equals {
                 column: field.to_string(),

@@ -87,14 +87,10 @@ impl Default for DocumentQueryHandler {
 pub struct DocumentQueryParams {
     #[serde(default)]
     pub projection: Option<String>,
-    #[serde(default = "default_limit")]
+    #[serde(default = "super::default_limit")]
     pub limit: u32,
     #[serde(default)]
     pub filter: Option<String>,
-}
-
-fn default_limit() -> u32 {
-    100
 }
 
 #[derive(Debug, Deserialize)]
@@ -1212,7 +1208,7 @@ mod tests {
         let _router = create_document_router();
         let _handler = DocumentHandler;
         let _query_handler = DocumentQueryHandler::new();
-        assert_eq!(default_limit(), 100);
+        assert_eq!(crate::rest::canonical::default_limit(), 100);
         assert_eq!(default_index_type(), "btree");
     }
 
@@ -1330,7 +1326,7 @@ mod tests {
         };
         let acme = || Extension(TenantContext::new("acme"));
 
-        insert_document(
+        let _ = insert_document(
             st(),
             acme(),
             Path("docs".to_string()),
@@ -1352,10 +1348,10 @@ mod tests {
             }),
         )
         .await;
-        delete_document(st(), acme(), Path(("docs".to_string(), "d".to_string())))
+        let _ = delete_document(st(), acme(), Path(("docs".to_string(), "d".to_string())))
             .await
             .unwrap();
-        delete_collection(st(), acme(), Path("docs".to_string()))
+        let _ = delete_collection(st(), acme(), Path("docs".to_string()))
             .await
             .unwrap();
         assert!(

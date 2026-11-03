@@ -69,6 +69,7 @@ from .exceptions import (
     InvalidVectorError,
     NetworkError,
     ProximaDBError,
+    ProximaDBNotSupportedError,
     QuotaExceededError,
     RateLimitError,
     ServerError,
@@ -389,6 +390,7 @@ __all__ = [
     "SearchRequestV2",
     # Exceptions
     "ProximaDBError",
+    "ProximaDBNotSupportedError",
     "CollectionNotFoundError",
     "CollectionExistsError",
     "VectorNotFoundError",

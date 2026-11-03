@@ -753,6 +753,7 @@ mod pool_tests {
 #[cfg(all(test, feature = "axis"))]
 mod tests {
     use super::*;
+    use serial_test::serial;
     use std::sync::Arc;
 
     use arrow_array::RecordBatch;
@@ -910,6 +911,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn register_catalogs_federated_read_and_external_snapshot() {
         crate::query::request_scope::with_internal_scope("test", async move {
             let path = fixture_path();
@@ -966,6 +968,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn runtime_disabled_rejects_build_before_reading_the_source() {
         crate::query::request_scope::with_internal_scope("test", async move {
             let path = fixture_path();
@@ -998,6 +1001,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn build_in_place_makes_index_queryable_and_fresh() {
         crate::query::request_scope::with_internal_scope("test", async move {
             let path = fixture_path();
@@ -1043,6 +1047,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn search_before_build_is_rejected() {
         crate::query::request_scope::with_internal_scope("test", async move {
             let path = fixture_path();
@@ -1069,6 +1074,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn search_returns_federated_props_from_source() {
         crate::query::request_scope::with_internal_scope("test", async move {
             let path = fixture_path();
@@ -1114,6 +1120,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn refresh_rebuilds_only_when_source_changed() {
         crate::query::request_scope::with_internal_scope("test", async move {
             let path = fixture_path();
@@ -1167,6 +1174,7 @@ mod tests {
     // ─── F5 Slice 3: BM25 + hybrid ──────────────────────────────────────────
 
     #[tokio::test]
+    #[serial]
     async fn build_populates_bm25_index_only_when_text_column_set() {
         crate::query::request_scope::with_internal_scope("test", async move {
             let path = fixture_path();
@@ -1216,6 +1224,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn hybrid_search_fuses_lexical_match_with_vector() {
         crate::query::request_scope::with_internal_scope("test", async move {
             let path = fixture_path();
@@ -1274,6 +1283,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn hybrid_search_lazily_rebuilds_bm25_after_restart() {
         crate::query::request_scope::with_internal_scope("test", async move {
             let path = fixture_path();
@@ -1331,6 +1341,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn hybrid_search_with_weighted_fusion_returns_fused_hits() {
         crate::query::request_scope::with_internal_scope("test", async move {
             use crate::core::search::hybrid::FusionStrategy;

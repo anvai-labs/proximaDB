@@ -8,7 +8,11 @@ Status, branch ownership and ordering at pickup: link:TRACKER.adoc[tracker].
 The original investigation and completed slice designs are in
 link:../history/planning/LAKEHOUSE_MULTIMODAL_SEAMS_2026_10.adoc[design history] and
 link:../history/planning/LAKEHOUSE_MULTIMODAL_EXECUTION_TRACKER.adoc[execution history].
-Historical code-gap descriptions must be rechecked before implementation.
+Historical code-gap descriptions must be rechecked before implementation. Embedded/cloud
+bootstrap and explicit job completion reuse these S1–S9 contracts; see
+link:PLATFORM_PLAN.adoc#embedded-cloud-lifecycle[the platform lifecycle contract]. A catalog
+follower is metadata access, not proof of a coherent multimodal read view or a new PAX
+publication authority.
 
 == Architecture and invariants
 

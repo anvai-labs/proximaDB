@@ -1,0 +1,60 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-GCRETAIN-1: dv-mat generation GC keeps two generations, so a reader pinned to V-2 loses files mid-scan
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Resolved (2026-11-02), in four pieces by the incremental-MATERIALIZE lineage.** (1) F8 retention window: `PROXIMADB_MATERIALIZE_GC_RETAINED_GENERATIONS` keeps N TOTAL generations (default 3, floor 2; version 0 included — the enumeration is `retained_versions`, unit-pinned), #2363. (2) F14 boundary tests: the 64-part `APPEND_MAX_FILES` threshold and `changed.len()==max_rows` both sides, #2363; the compaction-leg soak (`soak_compaction_leg_fires_past_64_parts`, all-new file set + collapsed parts), #2379. (3) The dv-live collection rule from TD-LIVEDEL-1's own gate rides the same single GC pass with a lease-scoped grace (`PROXIMADB_LIVE_DELETE_GC_GRACE_SECS`) plus the pre-CAS existence check (gate 4b) that turns a swept Puffin into a loud refusal, #2375. (4) Hardening: ANY retained version's metadata read failure now skips GC entirely (a read failure cannot prove files unreferenced), #2380. Filed from the v0.4.x→v0.5.1 release review (finding F8, `RELEASE_REVIEW_v0.4_to_v0.5.1.md`).
+| Priority | **MEDIUM.** Fails loud (object-not-found), never wrong rows — but two quick MATERIALIZEs (or one MATERIALIZE + one live-delete publication) under a long external scan (BI export, a pinned Iceberg reader) break that scan partway through, and Iceberg ecosystems typically retain ~100 snapshots.
+| Component | `src/services/dml/materialize_stream.rs` (`gc_older_generations`), `src/services/dml/mod.rs` (keep-set construction from the committed snapshot + the V-1 manifest)
+| Relates to | TD-USUB-10 (the incremental publication), TD-LIVEDEL-1 (the dv-live files the generation GC deliberately never touches), TD-AUDITGATE-1 (ignore hygiene precedent for bounded waivers)
+|===
+
+== The finding
+
+After publication V commits, `gc_older_generations` keeps only V's and V-1's files and
+Puffins (`dv_mat_generation(name) < current` is deleted unless keep-listed). A reader still
+pinned to V-2 — a long scan, an external Iceberg consumer holding a snapshot reference —
+gets object-not-found partway through. Only files *exclusive* to V-2 die, so correctness of
+the current view is untouched; the contract advertised (in code comments and the fence docs)
+is V-1 only.
+
+== The chosen design (decided here so implementation is mechanical)
+
+Keep **N generations** (V, V-1, … V-N+1) behind an env gate, default **3**:
+
+* `PROXIMADB_MATERIALIZE_GC_KEEP_GENERATIONS` (default 3; `1` restores today's exact
+  behavior; registry row required in `docs/12-design/ENV_GATE_REGISTRY.adoc`).
+* The keep-set builder extends from "committed snapshot ∪ parent manifest" to "committed
+  snapshot ∪ the last N-1 manifests" — still positive evidence (committed snapshots only,
+  never a listing), still fail-closed-keep when a manifest read fails.
+* Document the reader-pinning contract beside `gc_older_generations`: a consumer may pin at
+  most N-2 publications behind the head.
+
+Alternatives declined: time-based grace (the generation design is deliberately clock-free —
+"generation order never depends on a clock" — and a grace interval reintroduces wall-clock
+semantics into GC safety); Iceberg-style snapshot leases with minSnapshotsToKeep/maxSnapshotAge
+(churn without a demonstrated pinned-reader workload — N-generations answers the observed
+failure with a fraction of the machinery).
+
+== Acceptance criteria (include the review's missing tests — finding F14)
+
+* `gc_older_generations` keeps V-2 at the default and collects it at `=1` (unit test).
+* The 64-part fallback (`APPEND_MAX_FILES`) has a test: a snapshot with 64 stub parts must
+  classify `Rewrite("the snapshot has many parts…")` — of the four changelog-advertised
+  fallback thresholds, this is the one enforced only by an unexercised `if`.
+* Boundary: `changed.len() == max_rows` stays incremental (unit test beside `classify`).
+* The soak asserts at least one compacting rewrite occurred (a counter or classification
+  assert), so the compaction leg is pinned rather than incidental to the seed — if the seeded
+  mix drifts under future edits, the incremental-only path silently becomes the only one
+  exercised.
+* The soak's external read-back still passes at the new default.
+
+== Also carried here (finding F16, owner: the PR-1/review session, measurement-first)
+
+`PublishedOids::read` (`src/services/dml/materialize_append.rs:96-160`) probes up to 63 files'
+footers + SBBF Blooms **sequentially** per MATERIALIZE and materializes every row group's
+Bloom in memory — an unmeasured I/O-round-trip term on remote stores, the co-design
+mandate's own cost currency. Measure it (query-scoped io_trace at that site), then decide
+between bounded-parallel probing and footer-side summaries.

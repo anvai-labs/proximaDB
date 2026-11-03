@@ -11,6 +11,7 @@ class AbacComparisonOperator(StrEnum):
     CONTAINS = "Contains"
     ENDSWITH = "EndsWith"
     EQUALS = "Equals"
+    EXISTS = "Exists"
     GREATERTHAN = "GreaterThan"
     GREATERTHANOREQUAL = "GreaterThanOrEqual"
     IN = "In"
@@ -20,7 +21,9 @@ class AbacComparisonOperator(StrEnum):
     LESSTHANOREQUAL = "LessThanOrEqual"
     LIKE = "Like"
     NOTEQUALS = "NotEquals"
+    NOTEXISTS = "NotExists"
     NOTIN = "NotIn"
+    REGEX = "Regex"
     STARTSWITH = "StartsWith"
 
     def __str__(self) -> str:

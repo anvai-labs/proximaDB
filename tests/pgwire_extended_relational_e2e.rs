@@ -290,6 +290,43 @@ async fn raw_connect(server: &PgServer) -> tokio::net::TcpStream {
     stream
 }
 
+// One Execute round: Execute(portal, max_rows) + Sync, collecting message
+// tags up to ReadyForQuery. Returns (data_row_count, saw_portal_suspended,
+// saw_command_complete, first_row_bytes).
+async fn execute_round(
+    stream: &mut tokio::net::TcpStream,
+    max_rows: i32,
+) -> (usize, bool, bool, Option<Vec<u8>>) {
+    use tokio::io::AsyncWriteExt;
+    // Execute body: portal name as a cstring (the unnamed portal is ONE
+    // 0 byte) followed by the i32 row budget — 5 bytes total, matching
+    // parse_bind_execute's `[0, 0,0,0,0]`.
+    let mut frame = vec![0u8];
+    frame.extend_from_slice(&max_rows.to_be_bytes());
+    let mut out = message(b'E', &frame);
+    out.extend(message(b'S', &[]));
+    stream.write_all(&out).await.expect("execute+sync");
+    let mut data_rows = 0usize;
+    let mut first_row: Option<Vec<u8>> = None;
+    let (mut suspended, mut complete) = (false, false);
+    loop {
+        let (tag, body) = read_message(stream).await;
+        match tag {
+            b'D' => {
+                if first_row.is_none() {
+                    first_row = Some(body);
+                }
+                data_rows += 1;
+            }
+            b's' => suspended = true,
+            b'C' => complete = true,
+            b'Z' => break,
+            _ => {}
+        }
+    }
+    (data_rows, suspended, complete, first_row)
+}
+
 /// Parse + Bind (no parameters, text results) + Execute on the unnamed
 /// statement/portal.
 fn parse_bind_execute(sql: &str) -> Vec<u8> {
@@ -305,6 +342,225 @@ fn parse_bind_execute(sql: &str) -> Vec<u8> {
     out.extend(message(b'B', &bind));
     out.extend(message(b'E', &[0, 0, 0, 0, 0]));
     out
+}
+
+/// TD-PGPORTAL-1: `Execute(max_rows)` must page the LEGACY single-table
+/// reader with PortalSuspended. `SELECT *` (wildcard projection) is declined
+/// by `pipeline_projection`, so this portal lands on the legacy reader — the
+/// one route that ignored the row budget: before the fix the first Execute
+/// streamed EVERY row plus CommandComplete, and a subsequent Execute RE-RAN
+/// the query (duplicate rows for any JDBC fetch-size / asyncpx client). The
+/// full paging contract: Execute(1) -> one DataRow + PortalSuspended;
+/// Execute(1) -> one DataRow + PortalSuspended; Execute(0) ("no limit" =
+/// drain the remainder) -> remaining rows + CommandComplete — and the TOTAL
+/// across pages is exactly the table's row count, never a re-run's duplicate.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn execute_max_rows_pages_the_legacy_reader_e2e() {
+    use tokio::io::AsyncWriteExt;
+
+    let server = PgServer::start().await.expect("server start");
+    let client = connect(&server).await;
+    seed(&client).await; // menu_items: exactly 2 rows
+
+    let mut stream = raw_connect(&server).await;
+
+    // Parse + Bind once; the (unnamed) portal persists across Execute+Sync
+    // rounds until the next Bind, exactly like a JDBC fetch-size cursor.
+    let sql = "SELECT * FROM menu_items";
+    let mut parse = vec![0u8];
+    parse.extend_from_slice(sql.as_bytes());
+    parse.push(0);
+    parse.extend_from_slice(&0i16.to_be_bytes());
+    let mut bind = vec![0u8, 0u8];
+    bind.extend_from_slice(&0i16.to_be_bytes());
+    bind.extend_from_slice(&0i16.to_be_bytes());
+    bind.extend_from_slice(&0i16.to_be_bytes());
+    let mut out = message(b'P', &parse);
+    out.extend(message(b'B', &bind));
+    out.extend(message(b'S', &[]));
+    stream.write_all(&out).await.expect("parse+bind+sync");
+
+    // Drain to ReadyForQuery (ParseComplete, BindComplete, ReadyForQuery).
+    loop {
+        let (tag, _) = read_message(&mut stream).await;
+        if tag == b'Z' {
+            break;
+        }
+    }
+
+    // Page 1: exactly one row, then PortalSuspended — NOT CommandComplete.
+    let (rows, suspended, complete, page1_row) = execute_round(&mut stream, 1).await;
+    assert_eq!(rows, 1, "Execute(max_rows=1) must emit exactly one row");
+    assert!(
+        suspended && !complete,
+        "with rows remaining the page must end PortalSuspended, not CommandComplete"
+    );
+
+    // Page 2: max_rows=0 drains the remainder and COMPLETES — the round
+    // that used to take the non-paging branch and RE-RUN the query, serving
+    // both rows AGAIN as duplicates. Exactly one row here proves it drained
+    // the cursor instead of re-executing.
+    let (rows, suspended, complete, page2_row) = execute_round(&mut stream, 0).await;
+    assert_eq!(
+        rows, 1,
+        "max_rows=0 must drain exactly the one remaining row"
+    );
+    assert!(complete && !suspended, "the drain ends in CommandComplete");
+    assert_ne!(
+        page1_row, page2_row,
+        "the drained row must be the OTHER row, not a re-serve of page 1's"
+    );
+    assert!(!client.is_closed());
+}
+
+/// TD-PGPORTAL-1 follow-up (E0 governance): a budgeted portal SELECT must
+/// pass the SAME rate limiter every other pgwire query passes. The portal
+/// fast-paths return before `execute_query_with_controls`, so the row-budget
+/// path was the one query shape that never checked (or consumed) quota: a
+/// client could page unboundedly while a simple-query peer gets 53400s.
+/// nextest runs each test in its own process, so the env var is contained.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn budgeted_portal_selects_are_rate_limited_e2e() {
+    use tokio::io::AsyncWriteExt;
+
+    // The pgwire-accuracy CI lane runs this file as ONE shared process with
+    // --test-threads=1 (the exact mode that bit the atomic-commit fault env),
+    // so the variable MUST NOT outlive this test: every later test boots its
+    // own server, and a leaked RPM=3 would 53400 them all. The guard removes
+    // it on drop — including on assert-panic (unwind) — before the next
+    // test's server is constructed.
+    struct ScopedEnv(&'static str);
+    impl Drop for ScopedEnv {
+        fn drop(&mut self) {
+            // SAFETY: runs at test end, before the NEXT test's server exists;
+            // within this test, the only env readers are server threads built
+            // after the set and torn down before the drop.
+            unsafe { std::env::remove_var(self.0) };
+        }
+    }
+    // SAFETY (the set itself): the server (the only env reader) is built
+    // strictly after this line; same pattern the atomic-commit harness uses
+    // for its fault gate.
+    let _scoped = ScopedEnv("PROXIMADB_PGWIRE_RATE_LIMIT_RPM");
+    unsafe { std::env::set_var("PROXIMADB_PGWIRE_RATE_LIMIT_RPM", "3") };
+    //
+    // Quota arithmetic: the limiter meters EVERY statement (DDL included) —
+    // seed = CREATE + INSERT = 2 tokens, the first simple SELECT = token 3.
+    // RPM=3 leaves both proof arms over quota. (The tokio-postgres handshake
+    // consumes none: with RPM=3 the CREATE below is the first metered call.)
+    let server = PgServer::start().await.expect("server start");
+    let client = connect(&server).await;
+    seed(&client).await;
+
+    // Token 3 (seed consumed 1-2): still within quota.
+    client
+        .simple_query("SELECT * FROM menu_items")
+        .await
+        .expect("the first SELECT is within quota");
+
+    // Query 2 (simple protocol): over quota — proves the limiter is armed
+    // and this client's IP is subject to it.
+    let over = client.simple_query("SELECT * FROM menu_items").await;
+    let err = over.expect_err("the second query must be over quota");
+    assert_eq!(
+        err.code().map(|c| c.code()),
+        Some("53400"),
+        "over-quota is 53400: {}",
+        explain_err(&err)
+    );
+    // The errored simple query leaves the connection usable.
+    assert!(!client.is_closed());
+
+    // Query 3 — a BUDGETED portal SELECT (the fast path): must be refused by
+    // the same limiter, not silently serve rows.
+    let mut stream = raw_connect(&server).await;
+    // NOTE: raw_connect is a SECOND connection (same peer IP: 127.0.0.1).
+    let sql = "SELECT * FROM menu_items";
+    let mut parse = vec![0u8];
+    parse.extend_from_slice(sql.as_bytes());
+    parse.push(0);
+    parse.extend_from_slice(&0i16.to_be_bytes());
+    let mut bind = vec![0u8, 0u8];
+    bind.extend_from_slice(&0i16.to_be_bytes());
+    bind.extend_from_slice(&0i16.to_be_bytes());
+    bind.extend_from_slice(&0i16.to_be_bytes());
+    let mut out = message(b'P', &parse);
+    out.extend(message(b'B', &bind));
+    out.extend(message(b'S', &[]));
+    stream.write_all(&out).await.expect("parse+bind+sync");
+    loop {
+        let (tag, _) = read_message(&mut stream).await;
+        if tag == b'Z' {
+            break;
+        }
+    }
+
+    let (rows, _, _, _) = execute_round(&mut stream, 1).await;
+    assert_eq!(
+        rows, 0,
+        "an over-quota budgeted portal SELECT must serve NO rows (53400)"
+    );
+
+    // The UNBUDGETED arm (max_rows=0 — tokio-postgres/asyncpg/libpq's
+    // default shape): it takes the fall-through, which must ALSO arrive
+    // metered. Review round 2 caught this arm going unmetered when the
+    // check sat inside the max_rows>0 gate.
+    let (rows, _, _, _) = execute_round(&mut stream, 0).await;
+    assert_eq!(
+        rows, 0,
+        "an over-quota UNBUDGETED portal SELECT must serve NO rows (53400)"
+    );
+}
+
+/// TD-PGPORTAL-1 (review round 1, finding 1): a budgeted portal must honor
+/// the SQL LIMIT, not just the Execute budget — with an ORDER BY the fetch
+/// retrieves every matching row (sort-then-truncate semantics) and the
+/// portal used to stream past the LIMIT forever: Execute(1) pages would
+/// keep yielding rows until the TABLE ran out, not the LIMIT.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn budgeted_portal_honors_the_sql_limit_with_order_by_e2e() {
+    use tokio::io::AsyncWriteExt;
+
+    let server = PgServer::start().await.expect("server start");
+    let client = connect(&server).await;
+    seed(&client).await; // 2 rows
+
+    let mut stream = raw_connect(&server).await;
+    let sql = "SELECT * FROM menu_items ORDER BY id LIMIT 1";
+    let mut parse = vec![0u8];
+    parse.extend_from_slice(sql.as_bytes());
+    parse.push(0);
+    parse.extend_from_slice(&0i16.to_be_bytes());
+    let mut bind = vec![0u8, 0u8];
+    bind.extend_from_slice(&0i16.to_be_bytes());
+    bind.extend_from_slice(&0i16.to_be_bytes());
+    bind.extend_from_slice(&0i16.to_be_bytes());
+    let mut out = message(b'P', &parse);
+    out.extend(message(b'B', &bind));
+    out.extend(message(b'S', &[]));
+    stream.write_all(&out).await.expect("parse+bind+sync");
+    loop {
+        let (tag, _) = read_message(&mut stream).await;
+        if tag == b'Z' {
+            break;
+        }
+    }
+
+    let (rows, suspended, complete, _) = execute_round(&mut stream, 1).await;
+    assert_eq!(
+        rows, 1,
+        "the page holds the LIMIT's one row — not the whole table"
+    );
+    assert!(
+        complete && !suspended,
+        "the LIMIT is exhausted: CommandComplete, never PortalSuspended"
+    );
+
+    // A further Execute must not resurrect the query past its LIMIT.
+    let (rows, _, complete, _) = execute_round(&mut stream, 0).await;
+    assert_eq!(rows, 0, "nothing remains past the LIMIT");
+    assert!(complete);
+    assert!(!client.is_closed());
 }
 
 /// After an ErrorResponse, the server discards messages until Sync: a

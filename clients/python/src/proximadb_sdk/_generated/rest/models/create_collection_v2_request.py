@@ -112,6 +112,10 @@ class CreateCollectionV2Request:
                 before a cool/cold tier's minimum storage duration. Existing objects
                 are not rewritten; control objects keep the account default. Once
                 set, a tier can be changed but not cleared back to the default.
+            pool_id (None | str | Unset): TD-TIER-1 SC6 policy seam: the reservation pool this PERFORMANCE
+                collection's grant charges ("pool_id" in [storage.reservation_pools]);
+                omitted ⇒ the configured default pool. Unknown ids are refused at
+                admission with the configured ids listed.
     """
 
     name: str
@@ -130,6 +134,7 @@ class CreateCollectionV2Request:
     index_type: None | str | Unset = UNSET
     storage_class: None | str | Unset = UNSET
     default_access_tier: None | str | Unset = UNSET
+    pool_id: None | str | Unset = UNSET
 
     def to_dict(self) -> dict[str, Any]:
         from ..models.index_config_input import IndexConfigInput  # noqa: PLC0415
@@ -242,6 +247,12 @@ class CreateCollectionV2Request:
         else:
             default_access_tier = self.default_access_tier
 
+        pool_id: None | str | Unset
+        if isinstance(self.pool_id, Unset):
+            pool_id = UNSET
+        else:
+            pool_id = self.pool_id
+
         field_dict: dict[str, Any] = {}
 
         field_dict.update(
@@ -278,6 +289,8 @@ class CreateCollectionV2Request:
             field_dict["storage_class"] = storage_class
         if default_access_tier is not UNSET:
             field_dict["default_access_tier"] = default_access_tier
+        if pool_id is not UNSET:
+            field_dict["pool_id"] = pool_id
 
         return field_dict
 
@@ -474,6 +487,15 @@ class CreateCollectionV2Request:
             d.pop("default_access_tier", UNSET)
         )
 
+        def _parse_pool_id(data: object) -> None | str | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            return cast(None | str | Unset, data)
+
+        pool_id = _parse_pool_id(d.pop("pool_id", UNSET))
+
         create_collection_v2_request = cls(
             name=name,
             dimension=dimension,
@@ -491,6 +513,7 @@ class CreateCollectionV2Request:
             index_type=index_type,
             storage_class=storage_class,
             default_access_tier=default_access_tier,
+            pool_id=pool_id,
         )
 
         return create_collection_v2_request

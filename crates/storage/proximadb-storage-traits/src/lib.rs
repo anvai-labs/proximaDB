@@ -734,6 +734,36 @@ pub trait UnifiedStorageFormat: Send + Sync {
         self.do_compact(&params).await
     }
 
+    /// Operator compaction with an explicit mode. `full = true` asks the
+    /// engine to collapse the collection toward
+    /// `CompactionConfig::full_target_segments`, crossing levels the
+    /// background policy never crosses (PG `VACUUM FULL` / Delta `OPTIMIZE`
+    /// analog). Engines without a cross-level mode keep the single explicit
+    /// pass semantics of [`Self::compact_collection`].
+    async fn compact_collection_full(
+        &self,
+        collection_id: &str,
+        collection_config: Option<&Collection>,
+        full: bool,
+    ) -> Result<CompactionResult> {
+        if !full {
+            return self
+                .compact_collection(collection_id, collection_config)
+                .await;
+        }
+        let params = CompactionParameters {
+            collection_id: Some(collection_id.to_string()),
+            collection_config: collection_config.cloned(),
+            // Explicit operator semantics: never disarmed by per-collection
+            // tags, thresholds lowered (see the SST `do_compact` modes).
+            force: true,
+            synchronous: true,
+            full: true,
+            ..Default::default()
+        };
+        self.do_compact(&params).await
+    }
+
     /// Create a scan iterator based on the unified scan strategy pattern
     /// This follows the successful pattern from RAPTOR's scan_vectors_with_strategy
     /// and is implemented differently by each engine:

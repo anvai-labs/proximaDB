@@ -123,6 +123,20 @@ projection.
   manifest generation CAS, and compaction source-set claims remain explicit
   follow-ups.
 
+== Explicit embedded completion boundary (2026-11-02)
+
+An embedded end-job operation must invoke this materializer and return failures to its caller.
+Document the selected collections/modalities and coordinate producers if the caller needs
+all of its job's writes included. Concurrent appends outside a successful exact claim remain
+pending; failures must not retire those batches. Cache seeding and eventual compaction are
+separate from successful authoritative publication.
+
+This is a fallible in-process materialization boundary. It does not add a globally atomic
+snapshot or durable receipt, and `Drop`/warning-only shutdown cannot stand in for it. A
+crash after publication but before retirement still requires the separate persistent
+idempotency work above. Multi-modal completion remains TD-WAL-2, rather than a parallel
+embedded-only flush path.
+
 == Implementation history
 
 Implemented 2026-07-29 under TD-FLUSH-7: one canonical engine per storage format, per-collection

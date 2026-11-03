@@ -1535,7 +1535,9 @@ def test_record_payload_from_legacy_input_dict_and_record():
     rec = VectorRecord(id="r1", vector=[1.0, 2.0], metadata={"k": "v"}, source="src")
     payload2 = c._record_payload_from_legacy_input(rec, 1)
     assert payload2["id"] == "r1"
-    assert payload2["source"] == "src"
+    # TD-REC-1: no top-level source on the wire — it rides in text_fields.
+    assert "source" not in payload2
+    assert payload2["text_fields"][0]["content"] == "src"
 
 
 # ---------------------------------------------------------------------------

@@ -154,6 +154,7 @@ impl BackgroundMaintenanceManager {
         let collection_config = Some(context.to_collection_proto());
 
         let compaction_params = crate::storage::traits::CompactionParameters {
+            full: false,
             collection_id: Some(context.collection_id.clone()),
             force: false,      // Background compaction is not forced
             synchronous: true, // Wait for completion

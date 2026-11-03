@@ -482,3 +482,249 @@ async fn a_delete_through_the_write_path_is_a_truncation_floor_and_recovers() ->
     );
     Ok(())
 }
+
+/// A partition whose apply can fail on demand — AFTER the write is already
+/// durable in the WAL, which is the poison condition. Everything else answers
+/// as a partition whose rows are all durable elsewhere (`Ok(None)`), so the
+/// only mechanism that can protect the poisoned write's WAL entry is the
+/// store's poison check — exactly the mechanism under test.
+struct FailablePartition {
+    fail_apply: std::sync::atomic::AtomicBool,
+    applied: std::sync::Mutex<std::collections::BTreeMap<String, ProximaRecord>>,
+}
+
+impl Default for FailablePartition {
+    fn default() -> Self {
+        Self {
+            fail_apply: std::sync::atomic::AtomicBool::new(false),
+            applied: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+        }
+    }
+}
+
+impl FailablePartition {
+    fn arm(&self) {
+        self.fail_apply
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[async_trait::async_trait]
+impl proximadb_records::RecordStore for FailablePartition {
+    async fn upsert_record(
+        &self,
+        record: ProximaRecord,
+    ) -> proximadb_records::RecordStoreResult<ProximaRecord> {
+        if self.fail_apply.load(std::sync::atomic::Ordering::SeqCst) {
+            anyhow::bail!("injected: apply failed after the durable append");
+        }
+        self.applied
+            .lock()
+            .expect("applied map")
+            .insert(record.oid.clone(), record.clone());
+        Ok(record)
+    }
+
+    async fn upsert_record_at_lsn(
+        &self,
+        record: ProximaRecord,
+        lsn: u64,
+    ) -> proximadb_records::RecordStoreResult<ProximaRecord> {
+        // `write_mutations` calls this arm (LSNs are tracked), so this is the
+        // failure the store must survive by refusing to answer a floor.
+        if self.fail_apply.load(std::sync::atomic::Ordering::SeqCst) {
+            anyhow::bail!("injected: apply at lsn {lsn} failed after the durable append");
+        }
+        let _ = lsn;
+        self.applied
+            .lock()
+            .expect("applied map")
+            .insert(record.oid.clone(), record.clone());
+        Ok(record)
+    }
+
+    async fn get_record(
+        &self,
+        key: &proximadb_records::RecordKey,
+    ) -> proximadb_records::RecordStoreResult<Option<ProximaRecord>> {
+        Ok(self
+            .applied
+            .lock()
+            .expect("applied map")
+            .get(&key.oid)
+            .cloned())
+    }
+
+    async fn delete_record(
+        &self,
+        key: &proximadb_records::RecordKey,
+    ) -> proximadb_records::RecordStoreResult<bool> {
+        Ok(self
+            .applied
+            .lock()
+            .expect("applied map")
+            .remove(&key.oid)
+            .is_some())
+    }
+
+    /// `Ok(None)`: the fake's rows behave as if durable in a segment, so this
+    /// partition contributes no floor of its own. A real spill partition
+    /// answers the same after a flush; using the default (refuse) would refuse
+    /// truncation for an unrelated reason and mask the mechanism under test.
+    async fn min_unflushed_lsn(&self) -> proximadb_records::RecordStoreResult<Option<u64>> {
+        Ok(None)
+    }
+}
+
+#[async_trait::async_trait]
+impl proximadb_records::RecordScan for FailablePartition {
+    async fn scan_records(
+        &self,
+        limit: usize,
+    ) -> proximadb_records::RecordStoreResult<Vec<ProximaRecord>> {
+        Ok(self
+            .applied
+            .lock()
+            .expect("applied map")
+            .values()
+            .take(limit)
+            .cloned()
+            .collect())
+    }
+
+    async fn scan_records_with_options(
+        &self,
+        options: proximadb_records::RecordScanOptions,
+    ) -> proximadb_records::RecordStoreResult<Vec<ProximaRecord>> {
+        let records = self
+            .applied
+            .lock()
+            .expect("applied map")
+            .values()
+            .filter(|record| options.matches_record(record))
+            .take(options.limit.unwrap_or(usize::MAX))
+            .cloned()
+            .collect();
+        Ok(records)
+    }
+}
+
+/// A write whose WAL entry is durable but whose apply fails poisons the store.
+/// Its LSN is in no partition and its in-flight reservation was released when
+/// the write returned, so while the store is poisoned the record tier MUST
+/// refuse to answer a truncation floor — otherwise, once the WAL head advances
+/// past it (other collections keep appending) and the change-feed retention
+/// window passes it, the truncator deletes a committed entry and the row is
+/// lost on restart.
+#[tokio::test]
+async fn a_poisoned_store_refuses_wal_truncation_so_its_committed_entry_survives() -> Result<()> {
+    let dir = TempDir::new()?;
+    let wal_path = dir.path().join("canonical-records.wal");
+    let wal = Arc::new(FramedTableWalAppender::open(&wal_path).await?);
+    // Every append seals its own segment, so a truncation can drop any prefix.
+    wal.enable_segment_rotation(1);
+    let partition = Arc::new(FailablePartition::default());
+    // The factory form (NOT `new`, which marks the store shared-storage and
+    // makes `min_unflushed_lsn` refuse unconditionally — a refusal for the
+    // wrong reason that would mask the mechanism under test).
+    let factory_partition = partition.clone();
+    let store = Arc::new(DirectWalTableRecordStore::with_storage_factory(
+        wal.clone() as Arc<dyn TableWalAppender>,
+        Arc::new(move |_tenant, _collection| {
+            factory_partition.clone() as Arc<dyn proximadb_records::RecordStorage>
+        }),
+    ));
+
+    let schema = CatalogTableSchema::new(TABLE);
+    let tenant = StorageTenantContext::for_tenant_id("t1");
+    let row = |oid: &str| match upsert(oid, "t1", 1) {
+        CanonicalOperation::RecordUpsert { record, .. } => *record,
+        _ => unreachable!(),
+    };
+
+    // A healthy write first: the store is not poisoned and nothing is pinned.
+    store
+        .write_mutations(
+            &schema,
+            vec![TableRecordMutation::new(
+                TableRecordMutationKind::Upsert,
+                row("r0"),
+            )],
+            Some(&tenant),
+        )
+        .await?;
+
+    // r1: durable in the WAL, apply fails ⇒ the store reports an unknown
+    // commit and poisons itself until a restart replays the WAL.
+    partition.arm();
+    let poisoned = store
+        .write_mutations(
+            &schema,
+            vec![TableRecordMutation::new(
+                TableRecordMutationKind::Upsert,
+                row("r1"),
+            )],
+            Some(&tenant),
+        )
+        .await;
+    assert!(
+        poisoned.is_err(),
+        "the failed apply must surface, not vanish"
+    );
+    let r1_lsn = wal.last_sequence();
+    assert!(r1_lsn > 0, "r1's entry is durable in the WAL at {r1_lsn}");
+
+    // The head advances past the poisoned entry. The store now refuses writes,
+    // but the shared WAL keeps growing for other writers.
+    wal.append_operations(vec![upsert("r2", "t1", 1)], tenant_arg("t1"))
+        .await?;
+    let head = wal.last_sequence();
+    assert!(head > r1_lsn, "the head must move past the poisoned entry");
+
+    // With the change-feed retention collapsed (0), the record tier is the
+    // only floor that can protect r1's durable entry.
+    let sources: Vec<Arc<dyn WalFloorSource>> = vec![
+        Arc::new(ChangeFeedRetention(0)),
+        Arc::new(RecordTierFloor(store.clone())),
+        Arc::new(BranchMergeBase(Arc::new(BranchBaseStore::new(wal.clone())))),
+    ];
+    let run = wal_truncator::run_once(&wal, &sources).await?;
+    assert!(
+        matches!(&run, TruncationRun::Refused { source, reason } if source == "record-tier"
+            && reason.contains("poisoned")),
+        "a poisoned record tier must refuse WAL truncation for the poison reason (not, say, a shared-storage or memtable refusal): {run:?}"
+    );
+    assert_eq!(
+        wal.retained_from(),
+        0,
+        "nothing may be truncated while the poisoned entry is unpinned"
+    );
+
+    // Restart: a fresh (unpoisoned) store replays the retained WAL and r1 —
+    // whose only durable copy is that WAL entry — must come back.
+    drop(store);
+    drop(wal);
+    let wal = Arc::new(FramedTableWalAppender::open(&wal_path).await?);
+    let replayed = Arc::new(FailablePartition::default());
+    let factory_partition = replayed.clone();
+    let store = DirectWalTableRecordStore::with_storage_factory(
+        wal.clone() as Arc<dyn TableWalAppender>,
+        Arc::new(move |_tenant, _collection| {
+            factory_partition.clone() as Arc<dyn proximadb_records::RecordStorage>
+        }),
+    );
+    store.replay_wal_entries(wal.read_entries().await?).await?;
+    let applied: Vec<String> = replayed
+        .applied
+        .lock()
+        .expect("applied map")
+        .keys()
+        .cloned()
+        .collect();
+    assert_eq!(
+        applied,
+        vec!["r0".to_string(), "r1".to_string(), "r2".to_string()],
+        "the poisoned write's durable entry must replay after restart — losing it is silent data loss"
+    );
+    Ok(())
+}

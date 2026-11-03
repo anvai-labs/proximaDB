@@ -15,7 +15,6 @@
 //! centralized in `crate::rest::deprecation` (TD-V1SUNSET-1 step 2) and
 //! re-exported below.
 
-pub mod analytics;
 pub mod document;
 pub mod entities;
 pub mod graph;
@@ -23,6 +22,14 @@ pub mod graph_tenant_scope;
 pub mod hybrid;
 pub mod multimodal_query;
 pub mod observability;
+
+/// Shared default for pagination `limit` fields across canonical REST endpoints.
+pub(crate) const DEFAULT_LIMIT: u32 = 100;
+
+/// Serde-compatible accessor for [`DEFAULT_LIMIT`] (serde `default = "..."` needs a fn path).
+pub(crate) fn default_limit() -> u32 {
+    DEFAULT_LIMIT
+}
 
 // Deprecation-header utilities live in `crate::rest::deprecation` (a sibling
 // module) and are re-exported here so the adapters' `super::with_v1_compatibility_headers`
@@ -34,7 +41,6 @@ pub use crate::rest::deprecation::{
 };
 
 // Re-exports — handler types
-pub use analytics::{AnalyticsHandler, AqlHandler};
 pub use document::{DocumentHandler, DocumentQueryHandler};
 pub use entities::{EntityHandler, VectorHandler};
 pub use graph::{GraphHandler, GraphTraversalHandler};
@@ -42,7 +48,6 @@ pub use hybrid::{HybridSearchHandler, ProgressiveSearchHandler};
 pub use observability::{LogsHandler, MetricsHandler};
 
 // Re-exports — state types
-pub use analytics::AnalyticsRestState;
 pub use document::DocumentRestState;
 pub use graph::GraphRestState;
 pub use hybrid::HybridRestState;
@@ -50,7 +55,6 @@ pub use multimodal_query::UnifiedQueryRestState;
 pub use observability::ObservabilityRestState;
 
 // Re-exports — router builders
-pub use analytics::create_analytics_router;
 pub use document::create_document_router;
 pub use graph::create_graph_router;
 pub use hybrid::{create_health_router, create_hybrid_search_router, execute_sql};
@@ -59,3 +63,48 @@ pub use observability::create_observability_router;
 
 // Re-exports — handler functions (for direct registration in existing root-crate routers)
 pub use hybrid::{liveness_check, readiness_check};
+
+#[cfg(test)]
+mod pagination_contract_tests {
+    use super::{document::DocumentQueryParams, observability::LogQueryRequest};
+    use axum::{extract::Query, http::Uri};
+    use serde_json::json;
+
+    #[test]
+    fn missing_limits_default_and_explicit_limits_are_preserved() {
+        for (limit, expected) in [
+            (None, 100),
+            (Some(0), 0),
+            (Some(17), 17),
+            (Some(u32::MAX), u32::MAX),
+        ] {
+            let (uri, payload) = match limit {
+                None => ("/documents".to_string(), json!({})),
+                Some(limit) => (format!("/documents?limit={limit}"), json!({"limit": limit})),
+            };
+            let uri: Uri = uri.parse().unwrap();
+            let document = Query::<DocumentQueryParams>::try_from_uri(&uri).unwrap().0;
+            let logs: LogQueryRequest = serde_json::from_value(payload).unwrap();
+            assert_eq!(document.limit, expected);
+            assert_eq!(logs.limit, expected);
+        }
+    }
+
+    #[test]
+    fn invalid_limits_are_rejected_instead_of_defaulted_or_truncated() {
+        for payload in [
+            json!({"limit": null}),
+            json!({"limit": -1}),
+            json!({"limit": u64::from(u32::MAX) + 1}),
+            json!({"limit": "100"}),
+            json!({"limit": 1.5}),
+        ] {
+            assert!(serde_json::from_value::<LogQueryRequest>(payload).is_err());
+        }
+        // Documents use query strings; a numeric text value such as "100" is valid.
+        for limit in ["", "-1", "4294967296", "invalid", "1.5", "null"] {
+            let uri: Uri = format!("/documents?limit={limit}").parse().unwrap();
+            assert!(Query::<DocumentQueryParams>::try_from_uri(&uri).is_err());
+        }
+    }
+}

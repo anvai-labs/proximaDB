@@ -1,5 +1,5 @@
 schema_version = 1
-as_of_date = "2026-08-03"
+as_of_date = "2026-11-01"
 product_name = "ProximaDB"
 positioning = "Object-storage-native context serving for SQL, JSON, and vectors"
 deployment = "single-node"

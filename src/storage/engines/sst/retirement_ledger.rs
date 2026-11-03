@@ -235,12 +235,37 @@ pub(crate) fn sweep_due() -> bool {
     }
 }
 
-/// URLs currently pending (for tests and the discovery filter's fast path).
+/// Pending URLs plus unambiguous aliases returned by local LIST.
+///
+/// Keep the durable obligations and the global set in their original spelling:
+/// draining must still remove those exact entries. Explicit `file://` paths are
+/// CWD-relative, independent of a configured local root. Bare relative paths
+/// may instead be root-relative, so a factory-free snapshot must not guess.
 pub(crate) fn pending_paths() -> HashSet<String> {
-    global_pending_retirements()
+    let mut pending = global_pending_retirements()
         .read()
         .map(|s| s.clone())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    let aliases: Vec<String> = pending
+        .iter()
+        .filter(|path| {
+            path.starts_with("file://") || (!path.contains("://") && Path::new(path).is_absolute())
+        })
+        .filter_map(|path| {
+            let local =
+                crate::storage::persistence::filesystem::FilesystemFactory::resolve_path(path)
+                    .ok()?;
+            if local.is_empty() {
+                return None;
+            }
+            // Match LocalFileSystem::list without canonicalizing symlinks or
+            // rewriting cloud keys. The file may already have been deleted.
+            let absolute = std::path::absolute(local).ok()?;
+            Some(format!("file://{}", absolute.display()))
+        })
+        .collect();
+    pending.extend(aliases);
+    pending
 }
 
 #[cfg(test)]
@@ -356,5 +381,37 @@ mod tests {
         mark_drained(&[probe.clone()]);
         assert!(!pending_paths().contains(&probe), "drained must clear");
         let _ = before;
+    }
+
+    #[test]
+    fn pending_snapshot_adds_only_unambiguous_local_aliases() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let absolute = dir.path().join("retired.pax").display().to_string();
+        let relative = format!("ledger-probe-{}/retired.pax", std::process::id());
+        let explicit = format!("file://./{relative}");
+        let cloud = format!("s3://bucket//{relative}");
+        let inputs = vec![
+            absolute.clone(),
+            relative.clone(),
+            explicit.clone(),
+            cloud.clone(),
+        ];
+        mark_pending(&inputs);
+        let snapshot = pending_paths();
+        let explicit_alias = format!("file://{}", std::path::absolute(&relative)?.display());
+        assert!(snapshot.contains(&format!("file://{absolute}")));
+        assert!(snapshot.contains(&explicit_alias));
+        assert!(snapshot.contains(&cloud));
+        assert!(!snapshot.contains(&cloud.replace("bucket//", "bucket/")));
+        assert!(inputs.iter().all(|input| snapshot.contains(input)));
+        mark_drained(&inputs);
+        assert!(!pending_paths().contains(&explicit_alias));
+
+        // The same bare reference alone must not imply a CWD binding: it
+        // could belong to a different LocalConfig.root_dir.
+        mark_pending(std::slice::from_ref(&relative));
+        assert!(!pending_paths().contains(&explicit_alias));
+        mark_drained(&[relative]);
+        Ok(())
     }
 }

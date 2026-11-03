@@ -3,19 +3,7 @@
 //! This test verifies that metadata filtering works correctly when reading
 //! from actual Parquet files created by the VIPER engine flush process.
 
-use std::collections::HashMap;
-use std::sync::Arc;
-use tempfile::TempDir;
-use tracing::{debug, error, info, warn};
-
-use proximadb::compute::distance_computation::DistanceMetric;
-use proximadb::proto::proximadb_v1::SearchResult;
-use proximadb::proto::proximadb_v1::{MetadataItem, VectorRecord};
-use proximadb::services::VectorOperationsService;
-use proximadb::services::collection_service::CollectionService;
-use proximadb::storage::engines::viper::ViperEngine;
-use proximadb::storage::memtable::implementations::global_partitioned::GlobalPartitionedMemtable;
-use proximadb::storage::persistence::filesystem::FilesystemFactory;
+use tracing::debug;
 
 #[tokio::test]
 async fn test_viper_metadata_filtering_integration() {

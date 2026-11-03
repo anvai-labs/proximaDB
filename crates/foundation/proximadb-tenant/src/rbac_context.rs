@@ -78,6 +78,10 @@ pub enum UnifiedPermission {
     ConfigureSystem,
     AuditRead,
     SystemAdmin,
+    /// Operator maintenance on collections (compaction and similar
+    /// non-destructive upkeep) — the PG17 `MAINTAIN` analog. Granted by
+    /// `TenantAdmin` and `SystemAdmin` (see `check_wildcard_permissions`).
+    MaintainCollections,
 
     // === BUSINESS CONTEXT PERMISSIONS ===
     // (From Enhanced RBAC for business intelligence)

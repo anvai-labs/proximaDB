@@ -2286,6 +2286,7 @@ impl ProximaRecordService for ProximaRecordServiceImpl {
         // InvalidArgument here, and a known label flows into the v1 config so
         // manager admission applies identically to REST, gRPC and Flight.
         v1_config.storage_class = v2_storage_class_field(&cfg)?;
+        v1_config.pool_id = v2_pool_id_field(&cfg);
         // TD-TIER-1 SC5: same strict parse as REST; admission is the manager's.
         v1_config.default_access_tier = v2_access_tier_field(&cfg)?;
 
@@ -2411,10 +2412,26 @@ impl ProximaRecordService for ProximaRecordServiceImpl {
             options: Default::default(),
             migration_config: Default::default(),
         };
-        self.api_handlers
+        let resp = self
+            .api_handlers
             .handle_collection_operation_for_tenant(req, Some(tenant_id.as_str()))
             .await
-            .map_err(|e| Status::internal(format!("DeleteCollection failed: {e}")))?;
+            .map_err(|e| {
+                // A drop that failed leaves the collection in place: the
+                // caller must retry, so report it as such (never success).
+                match proximadb_search_types::client_argument::collection_drop_failed(&e) {
+                    Some(failed) => Status::unavailable(failed.to_string()),
+                    None => Status::internal(format!("DeleteCollection failed: {e}")),
+                }
+            })?;
+        // Nothing deleted: no such collection for this tenant (missing and
+        // another tenant's are answered alike). It used to say success.
+        if !resp.success {
+            return Err(Status::not_found(format!(
+                "Collection '{}' not found",
+                req_in.collection_id
+            )));
+        }
         Ok(Response::new(V2DeleteCollectionResponse { success: true }))
     }
 
@@ -2601,6 +2618,16 @@ fn v2_storage_class_field(cfg: &proximadb_v2::V2CollectionConfig) -> Result<Opti
     }
 }
 
+/// TD-TIER-1 SC6: the v2 request's `pool_id` — unset/empty ⇒ the default
+/// pool; a non-empty id is carried verbatim for admission validation (an
+/// unknown id is refused there with the configured ids listed).
+fn v2_pool_id_field(cfg: &proximadb_v2::V2CollectionConfig) -> Option<String> {
+    cfg.pool_id
+        .as_deref()
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+}
+
 /// TD-TIER-1 SC5: parse the v2 create request's `default_access_tier` label
 /// (strict, like `storage_class`): unset/empty ⇒ the account default.
 fn v2_access_tier_field(cfg: &proximadb_v2::V2CollectionConfig) -> Result<Option<i32>, Status> {
@@ -2656,6 +2683,7 @@ fn collection_to_v2(c: crate::proto::proximadb_v1::Collection) -> V2Collection {
                 cfg.default_access_tier,
             )
             .map(str::to_string),
+            pool_id: cfg.pool_id.clone(),
             description: cfg.description.unwrap_or_default(),
             index_specs: cfg
                 .index_configs
@@ -2681,8 +2709,11 @@ fn collection_to_v2(c: crate::proto::proximadb_v1::Collection) -> V2Collection {
                     strategy: quantization_strategy_to_str(q.strategy),
                 }),
         }),
-        created_at: c.created_at,
-        updated_at: c.updated_at,
+        // TD-COLLTIME-1: epoch milliseconds. Normalize on the way out: the
+        // catalog serves genuine ms (legacy rows included), but WAL-era
+        // recovery reconstruction can still surface microsecond values.
+        created_at: proximadb_runtime::handlers::normalize_epoch_ms(c.created_at),
+        updated_at: proximadb_runtime::handlers::normalize_epoch_ms(c.updated_at),
     }
 }
 
@@ -2751,6 +2782,7 @@ mod tests {
         let cfg = proximadb_v2::V2CollectionConfig {
             storage_class: None,
             default_access_tier: None,
+            pool_id: None,
             name: "c".to_string(),
             dimension: 128,
             distance_metric: "cosine".to_string(),

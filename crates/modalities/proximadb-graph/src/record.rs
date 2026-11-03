@@ -464,42 +464,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
-    use std::sync::RwLock;
-
-    #[derive(Default)]
-    struct MemoryRecordStore {
-        records: RwLock<HashMap<String, ProximaRecord>>,
-    }
-
-    #[async_trait]
-    impl RecordStore for MemoryRecordStore {
-        async fn upsert_record(&self, record: ProximaRecord) -> anyhow::Result<ProximaRecord> {
-            self.records
-                .write()
-                .expect("write lock")
-                .insert(record.oid.clone(), record.clone());
-            Ok(record)
-        }
-
-        async fn get_record(&self, key: &RecordKey) -> anyhow::Result<Option<ProximaRecord>> {
-            Ok(self
-                .records
-                .read()
-                .expect("read lock")
-                .get(&key.oid)
-                .cloned())
-        }
-
-        async fn delete_record(&self, key: &RecordKey) -> anyhow::Result<bool> {
-            Ok(self
-                .records
-                .write()
-                .expect("write lock")
-                .remove(&key.oid)
-                .is_some())
-        }
-    }
+    use proximadb_records::test_support::MemoryRecordStore;
 
     #[test]
     fn node_key_builds_stable_canonical_oid() {

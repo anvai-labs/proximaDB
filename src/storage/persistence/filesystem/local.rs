@@ -298,6 +298,16 @@ impl LocalFileSystem {
         Ok(path)
     }
 
+    /// Identity uses the same root/CWD rules as actual local I/O, without
+    /// issuing metadata requests or changing the path used for the operation.
+    pub(crate) fn directory_cache_identity(&self, url: &str) -> FsResult<String> {
+        let resolved = self.resolve_path(url)?;
+        let absolute = std::path::absolute(resolved).map_err(|error| {
+            FilesystemError::Config(format!("Cannot resolve local cache identity: {error}"))
+        })?;
+        Ok(absolute.to_string_lossy().trim_end_matches('/').to_string())
+    }
+
     /// Create new local filesystem instance with encryption support
     pub async fn new_with_encryption(
         config: LocalConfig,
@@ -1136,23 +1146,11 @@ impl FileSystem for LocalFileSystem {
                 let metadata = entry.metadata().await.map_err(FilesystemError::Io)?;
                 let file_metadata = self.convert_metadata(&entry_path, &metadata);
 
-                // Create full URL for entry (stateless design)
-                let entry_url = if path.starts_with("file://./") || path.starts_with("./") {
-                    // For relative URLs, preserve the relative nature
-                    if let Some(root_dir) = &self.config.root_dir {
-                        let relative_from_root = entry_path.strip_prefix(root_dir).map_or_else(
-                            |_| entry_path.display().to_string(),
-                            |p| p.to_string_lossy().to_string(),
-                        );
-                        format!("file://./{}", relative_from_root)
-                    } else {
-                        // No root_dir, but path is relative - preserve relative nature
-                        format!("file://{}", entry_path.display())
-                    }
-                } else {
-                    // Absolute path
-                    format!("file://{}", entry_path.display())
-                };
+                // A listed URL must resolve to this exact entry through any
+                // factory. Relative file:// URLs use CWD, not root_dir, so
+                // returning one for rooted I/O would point at another file.
+                let absolute = std::path::absolute(&entry_path).map_err(FilesystemError::Io)?;
+                let entry_url = format!("file://{}", absolute.display());
                 // Per-file logging removed - too verbose for production
                 // Use trace only if debugging specific file issues
                 trace!("LocalFileSystem entry: '{}' -> {:?}", entry_url, entry_path);

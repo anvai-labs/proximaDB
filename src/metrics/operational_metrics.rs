@@ -27,7 +27,9 @@ use prometheus::{
     register_int_counter_vec, register_int_gauge,
 };
 
-fn counter(name: &str, help: &str) -> IntCounter {
+// Canonical scalar policy shared with trace-sink and SST metrics: silently
+// register in the default registry, or return an unregistered renamed handle.
+pub(crate) fn counter(name: &str, help: &str) -> IntCounter {
     register_int_counter!(name, help).unwrap_or_else(|_| {
         IntCounter::new(format!("{name}_fallback"), help)
             .unwrap_or_else(|_| unreachable!("valid counter metric descriptor"))
@@ -52,7 +54,7 @@ lazy_static::lazy_static! {
     );
 }
 
-fn gauge(name: &str, help: &str) -> IntGauge {
+pub(super) fn gauge(name: &str, help: &str) -> IntGauge {
     register_int_gauge!(name, help).unwrap_or_else(|_| {
         IntGauge::new(format!("{name}_fallback"), help)
             .unwrap_or_else(|_| unreachable!("valid gauge metric descriptor"))
@@ -342,5 +344,88 @@ mod tests {
                 .get(),
             1024
         );
+    }
+}
+
+#[cfg(test)]
+mod scalar_registration_contract {
+    use super::*;
+    use prometheus::core::Collector;
+
+    struct RegistrationCleanup<T: Collector + Clone + 'static>(T);
+
+    impl<T: Collector + Clone + 'static> Drop for RegistrationCleanup<T> {
+        fn drop(&mut self) {
+            let _ = prometheus::unregister(Box::new(self.0.clone()));
+        }
+    }
+
+    fn assert_local_fallback(metric: &impl Collector, name: &str, help: &str) {
+        let descriptors = metric.desc();
+        assert_eq!(descriptors.len(), 1);
+        assert_eq!(descriptors[0].fq_name, format!("{name}_fallback"));
+        assert_eq!(descriptors[0].help, help);
+    }
+
+    fn assert_scrape(name: &str, help: &str, value: &str) -> prometheus::Result<()> {
+        let scrape = prometheus::TextEncoder::new().encode_to_string(&prometheus::gather())?;
+        assert!(
+            scrape
+                .lines()
+                .any(|line| line == format!("# HELP {name} {help}"))
+        );
+        assert!(scrape.lines().any(|line| line == format!("{name} {value}")));
+        assert!(!scrape.contains(&format!("{name}_fallback")));
+        Ok(())
+    }
+
+    #[test]
+    fn scalar_counter_registration_and_collision_contract() -> prometheus::Result<()> {
+        let name = format!("{}_counter_total", module_path!().replace("::", "_"));
+        let help = "Registered counter help";
+        let original = counter(&name, help);
+        let _cleanup = RegistrationCleanup(original.clone());
+        original.inc_by(3);
+        assert_scrape(&name, help, "3")?;
+
+        let duplicate = counter(&name, help);
+        let different_help = "Requested counter help";
+        let collision = counter(&name, different_help);
+        assert_local_fallback(&duplicate, &name, help);
+        assert_local_fallback(&collision, &name, different_help);
+        assert_eq!(duplicate.get(), 0);
+        assert_eq!(collision.get(), 0);
+        duplicate.inc_by(7);
+        collision.inc_by(11);
+        original.inc_by(2);
+        assert_eq!(original.get(), 5);
+        assert_eq!(duplicate.get(), 7);
+        assert_eq!(collision.get(), 11);
+        assert_scrape(&name, help, "5")
+    }
+
+    #[test]
+    fn scalar_gauge_registration_and_collision_contract() -> prometheus::Result<()> {
+        let name = format!("{}_gauge", module_path!().replace("::", "_"));
+        let help = "Registered gauge help";
+        let original = gauge(&name, help);
+        let _cleanup = RegistrationCleanup(original.clone());
+        original.set(-3);
+        assert_scrape(&name, help, "-3")?;
+
+        let duplicate = gauge(&name, help);
+        let different_help = "Requested gauge help";
+        let collision = gauge(&name, different_help);
+        assert_local_fallback(&duplicate, &name, help);
+        assert_local_fallback(&collision, &name, different_help);
+        assert_eq!(duplicate.get(), 0);
+        assert_eq!(collision.get(), 0);
+        duplicate.set(7);
+        collision.set(-11);
+        original.set(5);
+        assert_eq!(original.get(), 5);
+        assert_eq!(duplicate.get(), 7);
+        assert_eq!(collision.get(), -11);
+        assert_scrape(&name, help, "5")
     }
 }

@@ -24,7 +24,7 @@ use futures::stream;
 use proximadb::core::Config;
 use proximadb::database::ProximaDB;
 use proximadb::network::arrow_ipc::codec::ArrowProtoCodec;
-use proximadb_records::{EmbeddingCell, EmbeddingValues, ProximaRecord};
+use proximadb_records::{EmbeddingCell, ProximaRecord};
 use serde_json::json;
 use tempfile::TempDir;
 use tokio::time::sleep;

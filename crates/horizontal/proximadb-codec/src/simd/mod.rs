@@ -96,3 +96,22 @@ pub use backend as hardware;
 // Re-export encoder/decoder types
 pub use decoder::SimdDecoder;
 pub use encoder::SimdEncoder;
+
+// Encoder and decoder advertise the same scheme-level capability.
+fn supports_scheme(scheme: &crate::types::ProximaScheme) -> bool {
+    use crate::types::ProximaScheme;
+
+    let backend = get_simd_backend();
+    if !backend.has_acceleration() {
+        return false;
+    }
+
+    matches!(
+        scheme,
+        ProximaScheme::Delta { .. }
+            | ProximaScheme::BitPacked { .. }
+            | ProximaScheme::FrameOfReference { .. }
+            | ProximaScheme::Zigzag { .. }
+            | ProximaScheme::PForDelta { .. }
+    )
+}

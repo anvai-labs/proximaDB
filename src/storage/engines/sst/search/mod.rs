@@ -29,6 +29,7 @@
 //! - File discovery and routing logic
 
 pub mod coordinator;
+pub(crate) mod deferred;
 pub mod operations;
 pub mod optimizer;
 
@@ -56,13 +57,125 @@ impl Drop for UmbrellaTimer {
     }
 }
 
+/// TD-PAXDIR-2 (L1): a process-wide listing cache — how long a collection's
+/// discovered segment set is reused before the next query re-LISTs. Default
+/// 30 s; `PROXIMADB_SEGMENT_LISTING_CACHE_MS=0` disables (kill value, every
+/// query pays one LIST as before); a flush or compaction publish
+/// invalidates the affected collection immediately, so read-after-write
+/// correctness does not depend on the TTL (which bounds only cross-pod
+/// staleness — the same contract as the centroid directory recheck).
+pub fn segment_listing_cache_ttl() -> Option<std::time::Duration> {
+    const DEFAULT_MS: u64 = 30_000;
+    match std::env::var("PROXIMADB_SEGMENT_LISTING_CACHE_MS")
+        .ok()
+        .as_deref()
+        .map(str::trim)
+        .map(str::parse::<u64>)
+    {
+        Some(Ok(0)) => None,
+        Some(Ok(ms)) => Some(std::time::Duration::from_millis(ms)),
+        _ => Some(std::time::Duration::from_millis(DEFAULT_MS)),
+    }
+}
+
+/// TD-PAXDIR-2 (L1): cross-query segment listing cache. Each entry holds the
+/// discovered file set and the instant it was fetched; entries expire by TTL
+/// and are invalidated by flush/compaction publishes (see
+/// [`invalidate_segment_listing_cache`]).
+static SEGMENT_LISTING_CACHE: std::sync::OnceLock<std::sync::Mutex<SegmentListingCache>> =
+    std::sync::OnceLock::new();
+
+/// Bounded like the centroid directory cache (MAX_CACHED_DIRECTORIES).
+const MAX_CACHED_SEGMENT_LISTINGS: usize = 1024;
+
+/// The cross-query listing cache state. `generation` increments on every
+/// invalidation so a LIST that raced a publish cannot insert a stale
+/// snapshot after the invalidation already fired.
+#[derive(Default)]
+struct SegmentListingCache {
+    entries: std::collections::HashMap<
+        crate::storage::persistence::filesystem::DirectoryCacheIdentity,
+        (std::time::Instant, Vec<DiscoveredSstFile>),
+    >,
+    generation: u64,
+}
+
+fn segment_listing_cache() -> &'static std::sync::Mutex<SegmentListingCache> {
+    SEGMENT_LISTING_CACHE.get_or_init(Default::default)
+}
+
+/// Invalidate a collection's cached segment listing (called by the flush and
+/// compaction publish paths). `storage_url` is the collection data directory.
+pub(crate) fn invalidate_segment_listing_cache(
+    filesystem: &crate::storage::persistence::filesystem::FilesystemFactory,
+    storage_url: &str,
+) {
+    let identity = filesystem
+        .directory_cache_identity(storage_url)
+        .ok()
+        .flatten();
+    let mut cache = segment_listing_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match identity {
+        Some(key) if key.namespace == 0 => {
+            cache.entries.remove(&key);
+        }
+        // Remote factories can bind different endpoints. Conservatively retire
+        // remote entries across factories so same-store writers using another
+        // factory cannot leave stale listings; no endpoint equivalence guessed.
+        Some(_) => cache.entries.retain(|key, _| key.namespace == 0),
+        None => cache.entries.clear(),
+    }
+    cache.generation = cache.generation.wrapping_add(1);
+}
+
+/// Publication can become durable inside an awaited backend/coordinator call.
+/// Retire discovery snapshots when the enclosing attempt exits, including
+/// cancellation after the output moved but before cleanup completed. This does
+/// not fence backend I/O that finishes after its future has been dropped.
+#[must_use]
+pub(crate) struct SegmentListingPublicationGuard<'a> {
+    filesystem: &'a crate::storage::persistence::filesystem::FilesystemFactory,
+    directory: String,
+}
+
+impl<'a> SegmentListingPublicationGuard<'a> {
+    pub(crate) fn new(
+        filesystem: &'a crate::storage::persistence::filesystem::FilesystemFactory,
+        directory: &str,
+    ) -> Self {
+        Self {
+            filesystem,
+            directory: directory.to_owned(),
+        }
+    }
+}
+
+impl Drop for SegmentListingPublicationGuard<'_> {
+    fn drop(&mut self) {
+        invalidate_segment_listing_cache(self.filesystem, &self.directory);
+    }
+}
+
+/// Clear every cached listing (tests that assert exact wave counts need the
+/// LIST to fire).
+#[cfg(test)]
+pub(crate) fn clear_segment_listing_cache_for_tests() {
+    let mut cache = segment_listing_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    cache.entries.clear();
+    cache.generation += 1;
+}
+
 tokio::task_local! {
     /// TD-PAXDIR-1 D7: one query's segment listing, by storage URL. Bound by
     /// [`scope_discovery_memo`] around a search, so the Adaptive-mode vector
     /// count and the scan share one LIST (the P5b gate run measured them as
     /// two sequential round trips on every query). Within one query both see
     /// the same segment set.
-    static DISCOVERY_MEMO: std::sync::Mutex<std::collections::HashMap<String, Vec<DiscoveredSstFile>>>;
+    static DISCOVERY_MEMO: std::sync::Mutex<std::collections::HashMap<crate::storage::persistence::filesystem::DirectoryCacheIdentity, Vec<DiscoveredSstFile>>>;
 }
 
 /// Run one search with a per-query discovery memo (see [`DISCOVERY_MEMO`]).
@@ -394,6 +507,20 @@ fn resolve_exact_budget(policy: Option<&crate::proto::proximadb_v1::IndexPolicy>
     }
 }
 
+/// Whether `collection`'s f32 tier may make its segments an Adaptive
+/// exact-scan authority: only when the collection explicitly asked for the
+/// tier (tag, env, declared fp32), or its base column is itself exact
+/// (`RawF32`). A tier the default wrote, or one the collection has since
+/// opted out of, stays storage-only.
+fn f32_tier_exact_route_eligible(collection: &crate::proto::proximadb_v1::Collection) -> bool {
+    use crate::storage::engines::sst::flush::{
+        resolve_pax_f32_tier_decision, resolve_pax_vector_quant,
+    };
+    let quant = resolve_pax_vector_quant(Some(collection));
+    quant == proximadb_block_format::VectorQuant::RawF32
+        || resolve_pax_f32_tier_decision(Some(collection), quant).explicitly_requested()
+}
+
 impl SstEngine {
     /// TD-165: best-effort total vector count across a collection's segments, read
     /// cheaply from each segment header (8-byte prefix + the bincode header — no
@@ -568,6 +695,7 @@ impl SstEngine {
         collection_root: &str,
         snapshot_lsn: u64,
         known_size: Option<u64>,
+        deferred: Option<&deferred::DeferredRehydrate>,
     ) -> anyhow::Result<Option<Vec<OptimizedSearchRecord>>> {
         // PR-D L4: one top-k block stash per segment cascade, shared by its
         // Region-D OID resolve and its rehydration (one block wave, not two).
@@ -581,6 +709,7 @@ impl SstEngine {
             collection_root,
             snapshot_lsn,
             known_size,
+            deferred,
         ))
         .await
     }
@@ -598,6 +727,7 @@ impl SstEngine {
         collection_root: &str,
         snapshot_lsn: u64,
         known_size: Option<u64>,
+        deferred: Option<&deferred::DeferredRehydrate>,
     ) -> anyhow::Result<Option<Vec<OptimizedSearchRecord>>> {
         // TD-RDSTRAT-13 PR-B: umbrella wall over the whole cascade — the four
         // stage timers (probe rank, Region-B, Region-D, rehydrate) decompose
@@ -684,7 +814,9 @@ impl SstEngine {
             // coalesced segment, so no separate 4 B magic-detection GET is needed
             // (collapses the redundant offset-0 prefix read the FS trace found).
             if filter_expression.is_none() || row_allow.is_some() {
-                let coalesced_hits = rabitq_search_segment_coalesced_allowed(
+                // Boxed: the cascade future is large, and it is awaited
+                // under one of two scopes below.
+                let search = Box::pin(rabitq_search_segment_coalesced_allowed(
                     fs.as_ref(),
                     sstable_path,
                     query_vector,
@@ -694,8 +826,15 @@ impl SstEngine {
                     self.survivor_cache.as_deref(),
                     row_allow.as_ref(),
                     known_size,
-                )
-                .await?;
+                ));
+                // O1: with a deferred table, stop after the rerank — the
+                // OIDs come from rehydrating the merged winners.
+                let coalesced_hits = if deferred.is_some() {
+                    crate::storage::engines::sst::segment_format::scope_deferred_topk_oids(search)
+                        .await?
+                } else {
+                    search.await?
+                };
                 if let Some(hits) = coalesced_hits {
                     // TD-DELVEC-1 WI-4 slice 2: merge-on-read on the RaBitQ ANN
                     // path — warm this segment's deletion vector, then drop hits
@@ -721,6 +860,20 @@ impl SstEngine {
                     } else {
                         hits
                     };
+                    if let Some(deferred) = deferred {
+                        debug!(
+                            target: deferred::TRACE_TARGET,
+                            path = sstable_path,
+                            candidates = hits.len(),
+                            "segment cascade: OID resolve deferred to the merge"
+                        );
+                        crate::observability::io_trace::record_vector_ann_proof();
+                        return Ok(Some(
+                            hits.iter()
+                                .map(|h| deferred.placeholder(sstable_path, h, &distance_metric))
+                                .collect(),
+                        ));
+                    }
                     // TD-FPRUNE-1 top-k rehydration: the exact path this cascade
                     // replaces returns full record metadata (props); the cascade
                     // ranks from codes and knows only id+score+vector. Fetch the
@@ -1423,6 +1576,49 @@ impl SstEngine {
         include_vectors: bool,
         include_metadata: bool,
     ) -> Result<Vec<OptimizedSearchRecord>> {
+        // O1 (as in `fallback_to_direct_search_arc`): rehydrate only the
+        // merged winners; an unresolvable winner re-runs per segment.
+        let mut deferred = deferred::maybe_new(collection_id, k);
+        loop {
+            let retryable = deferred.is_some();
+            // Boxed: the scan future is large and this loop may run it twice.
+            let attempt = Box::pin(self.direct_search_with(
+                deferred.take(),
+                ctx,
+                collection_id,
+                storage_url,
+                query_vector,
+                k,
+                distance_metric,
+                filter_expression,
+                include_vectors,
+                include_metadata,
+            ))
+            .await;
+            if let Err(e) = &attempt
+                && deferred::retry_due(retryable, e)
+            {
+                deferred::note_retry(collection_id, e);
+                continue;
+            }
+            return attempt;
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn direct_search_with(
+        &self,
+        deferred: Option<std::sync::Arc<deferred::DeferredRehydrate>>,
+        ctx: &StorageQueryContext,
+        collection_id: &str,
+        storage_url: &str,
+        query_vector: &[f32],
+        k: usize,
+        distance_metric: DistanceMetric,
+        filter_expression: Option<&FilterExpression>,
+        include_vectors: bool,
+        include_metadata: bool,
+    ) -> Result<Vec<OptimizedSearchRecord>> {
         tracing::debug!(
             "[SST] Starting direct search for collection {}, storage_url: {}",
             collection_id,
@@ -1580,6 +1776,7 @@ impl SstEngine {
                 let known_size = discovered.size_bytes;
                 let filter_owned = filter_expression.cloned();
                 let directory_choice = directory_cells.get(sstable_path).cloned();
+                let deferred = deferred.clone();
                 // TD-PAXDIR-1 D7: concurrent scans polled in one task each
                 // get their own wave unit (`io_trace::scope_concurrent_unit`).
                 crate::observability::io_trace::scope_concurrent_unit(async move {
@@ -1603,6 +1800,7 @@ self.try_pax_cascade(
                                         storage_url,
                                         snapshot_lsn,
                                         known_size,
+                                        deferred.as_deref(),
 ),
 )
 .await
@@ -1713,6 +1911,7 @@ self.try_pax_cascade(
                                 storage_url,
                                 snapshot_lsn,
                                 known_size,
+                                deferred.as_deref(),
                             ),
                         )
                         .await
@@ -1879,7 +2078,15 @@ self.try_pax_cascade(
 
         // Get sorted results from bounded queue
         let mut all_candidates = priority_queue.into_sorted_vec();
+        // Merge timing excludes the deferred rehydrate: it is the winners'
+        // I/O, not the merge (the deferred debug logs carry its own timings).
         let merge_us = merge_start.elapsed().as_micros() as u64;
+        if let Some(deferred) = &deferred {
+            all_candidates = deferred
+                .resolve(self, all_candidates, &directory_cells)
+                .await
+                .map_err(anyhow::Error::new)?;
+        }
         tracing::info!(
             target: "sst_warm_phase",
             phase = "topk_merge",
@@ -1934,6 +2141,14 @@ self.try_pax_cascade(
                 if pin_exact {
                     // Owner pinned exact — always brute-force, any N.
                     true
+                } else if !f32_tier_exact_route_eligible(&ctx.collection) {
+                    // A tier the DEFAULT wrote is storage-only (exact
+                    // compaction, retraining and point reads); it must not
+                    // move a small collection's queries from the cascade to a
+                    // whole-segment exact scan, nor may a later opt-out. Only
+                    // an explicit request (or a RawF32 base) keeps the
+                    // small-collection exact route below.
+                    false
                 } else {
                     let count = self.segment_vector_count(storage_url).await;
                     let dim = query_vector.len().max(1);
@@ -2014,6 +2229,7 @@ self.try_pax_cascade(
         use_parallel_morsels: bool,
         use_vectorized: bool,
         known_size: Option<u64>,
+        deferred: Option<&deferred::DeferredRehydrate>,
     ) -> Result<Vec<OptimizedSearchRecord>> {
         // TD-DELVEC-1 WI-4: capture the scan's snapshot LSN once per single-file
         // scan (the parallel/arc path's per-file entry) for merge-on-read filtering
@@ -2041,6 +2257,7 @@ self.try_pax_cascade(
                         storage_url,
                         snapshot_lsn,
                         known_size,
+                        deferred,
                     )
                     .await
                 {
@@ -2245,6 +2462,51 @@ self.try_pax_cascade(
         include_vectors: bool,
         include_metadata: bool,
     ) -> Result<Vec<OptimizedSearchRecord>> {
+        // O1: resolve OIDs and rehydrate after the merge. A winner that
+        // cannot be resolved re-runs the search on the per-segment path (the
+        // second pass takes no deferred table), so a deferred placeholder
+        // never reaches the caller.
+        let mut deferred = deferred::maybe_new(collection_id, k);
+        loop {
+            let retryable = deferred.is_some();
+            // Boxed: the scan future is large and this loop may run it twice.
+            let attempt = Box::pin(std::sync::Arc::clone(&self).direct_search_arc_with(
+                ctx,
+                collection_id,
+                storage_url,
+                query_vector,
+                k,
+                distance_metric,
+                filter_expression,
+                include_vectors,
+                include_metadata,
+                deferred.take(),
+            ))
+            .await;
+            if let Err(e) = &attempt
+                && deferred::retry_due(retryable, e)
+            {
+                deferred::note_retry(collection_id, e);
+                continue;
+            }
+            return attempt;
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn direct_search_arc_with(
+        self: std::sync::Arc<Self>,
+        ctx: &StorageQueryContext,
+        collection_id: &str,
+        storage_url: &str,
+        query_vector: &[f32],
+        k: usize,
+        distance_metric: DistanceMetric,
+        filter_expression: Option<&FilterExpression>,
+        include_vectors: bool,
+        include_metadata: bool,
+        deferred: Option<std::sync::Arc<deferred::DeferredRehydrate>>,
+    ) -> Result<Vec<OptimizedSearchRecord>> {
         use crate::storage::engines::sst::segment_format::scope_directory_cells;
         // --- discover (mirrors fallback_to_direct_search) ---
         let search_mode = &ctx.search_params.search_mode;
@@ -2342,6 +2604,7 @@ self.try_pax_cascade(
                 let trace = trace_handle.clone();
                 let scan_path = path.clone();
                 let cells = directory_cells.get(&path).cloned();
+                let deferred = deferred.clone();
                 handles.push((
                     path,
                     tokio::spawn(async move {
@@ -2361,6 +2624,7 @@ self.try_pax_cascade(
                             use_parallel_morsels,
                             use_vectorized,
                             known_size,
+                            deferred.as_deref(),
                         );
                         let scan = scope_directory_cells(cells, scan);
                         if let Some(trace) = trace {
@@ -2405,6 +2669,7 @@ self.try_pax_cascade(
                     use_parallel_morsels,
                     use_vectorized,
                     discovered.size_bytes,
+                    deferred.as_deref(),
                 );
                 let cells = directory_cells.get(&discovered.url).cloned();
                 match scope_directory_cells(cells, scan).await {
@@ -2424,6 +2689,12 @@ self.try_pax_cascade(
             priority_queue.try_insert(candidate);
         }
         let mut all_candidates = priority_queue.into_sorted_vec();
+        if let Some(deferred) = &deferred {
+            all_candidates = deferred
+                .resolve(&self, all_candidates, &directory_cells)
+                .await
+                .map_err(anyhow::Error::new)?;
+        }
         self.filter_search_results(&mut all_candidates, include_vectors, include_metadata);
         Ok(all_candidates)
     }
@@ -2796,22 +3067,86 @@ self.try_pax_cascade(
         // TD-PAXDIR-1 D7: within one search, reuse its first listing — minus
         // anything retired since (the TD-COMPACT-13 pending set is re-read,
         // as a fresh listing would filter it).
-        if let Ok(Some(mut files)) = DISCOVERY_MEMO.try_with(|memo| {
-            memo.lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .get(storage_url)
-                .cloned()
-        }) {
+        let cache_key = self
+            .filesystem()
+            .directory_cache_identity(storage_url)
+            .ok()
+            .flatten();
+        let memo_key = cache_key.clone();
+        if let Some(memo_key) = &memo_key
+            && let Ok(Some(mut files)) = DISCOVERY_MEMO.try_with(|memo| {
+                memo.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .get(memo_key)
+                    .cloned()
+            })
+        {
             let pending = crate::storage::engines::sst::retirement_ledger::pending_paths();
             files.retain(|f| !pending.contains(&f.url));
             return Ok(files);
         }
-        let files = self.discover_sstable_files_listed(storage_url).await?;
-        let _ = DISCOVERY_MEMO.try_with(|memo| {
-            memo.lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .insert(storage_url.to_owned(), files.clone())
-        });
+        // TD-PAXDIR-2 (L1): a live cross-query listing avoids the LIST entirely.
+        // The retirement filter is applied below (same as the per-query memo
+        // path) so superseded segments stop serving immediately.
+        let (generation_at_read, cached_files) = {
+            let cache = segment_listing_cache();
+            let mut guard = cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // Prune expired entries opportunistically (bounded memory).
+            if guard.entries.len() > MAX_CACHED_SEGMENT_LISTINGS {
+                let ttl = segment_listing_cache_ttl();
+                guard
+                    .entries
+                    .retain(|_, (at, _)| ttl.is_some_and(|t| at.elapsed() < t));
+            }
+            let generation = guard.generation;
+            let files = cache_key
+                .as_ref()
+                .and_then(|key| guard.entries.get(key))
+                .filter(|(at, _)| segment_listing_cache_ttl().is_some_and(|t| at.elapsed() < t))
+                .map(|(_, f)| f.clone());
+            (generation, files)
+        };
+        let files = if let Some(files) = cached_files {
+            files
+        } else {
+            let files = self.discover_sstable_files_listed(storage_url).await?;
+            // Only insert if no invalidation fired during the LIST — a
+            // generation bump means a publish invalidated the entry and
+            // this snapshot is already stale (the re-poisoning race).
+            if segment_listing_cache_ttl().is_some()
+                && let Some(cache_key) = cache_key
+            {
+                let mut guard = segment_listing_cache()
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if guard.generation == generation_at_read {
+                    // Bounded: drop an arbitrary entry at the cap.
+                    if guard.entries.len() >= MAX_CACHED_SEGMENT_LISTINGS
+                        && let Some(key) = guard.entries.keys().next().cloned()
+                    {
+                        guard.entries.remove(&key);
+                    }
+                    guard
+                        .entries
+                        .insert(cache_key, (std::time::Instant::now(), files.clone()));
+                }
+            }
+            files
+        };
+        if let Some(memo_key) = memo_key {
+            let _ = DISCOVERY_MEMO.try_with(|memo| {
+                memo.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(memo_key, files.clone())
+            });
+        }
+        // The retirement filter: the cache may hold segments whose compaction
+        // published between the listing and this query.
+        let pending = crate::storage::engines::sst::retirement_ledger::pending_paths();
+        let mut files = files;
+        files.retain(|f| !pending.contains(&f.url));
         Ok(files)
     }
 
@@ -3189,9 +3524,177 @@ fn stamp_persisted_version(
 mod tests {
     use super::*;
     use crate::storage::engines::sst::SstConfig;
+
+    /// TD-PAXDIR-2 (L1): the cross-query listing cache TTL — env parsing,
+    /// default, and the kill value.
+    #[test]
+    fn segment_listing_cache_ttl_from_env() {
+        // SAFETY: nextest process-per-test isolation.
+        unsafe { std::env::remove_var("PROXIMADB_SEGMENT_LISTING_CACHE_MS") };
+        assert_eq!(
+            segment_listing_cache_ttl(),
+            Some(std::time::Duration::from_millis(30_000))
+        );
+        unsafe { std::env::set_var("PROXIMADB_SEGMENT_LISTING_CACHE_MS", "0") };
+        assert_eq!(segment_listing_cache_ttl(), None);
+        unsafe { std::env::set_var("PROXIMADB_SEGMENT_LISTING_CACHE_MS", "5000") };
+        assert_eq!(
+            segment_listing_cache_ttl(),
+            Some(std::time::Duration::from_millis(5_000))
+        );
+        unsafe { std::env::remove_var("PROXIMADB_SEGMENT_LISTING_CACHE_MS") };
+    }
+
+    /// TD-PAXDIR-2 (L1): invalidation removes the entry.
+    #[tokio::test]
+    async fn segment_listing_cache_invalidation_removes_entry() -> anyhow::Result<()> {
+        let filesystem = FilesystemFactory::create(Default::default()).await?;
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().to_string_lossy();
+        let key = filesystem
+            .directory_cache_identity(&path)?
+            .expect("local identity");
+        segment_listing_cache()
+            .lock()
+            .expect("cache")
+            .entries
+            .insert(key.clone(), (std::time::Instant::now(), Vec::new()));
+        invalidate_segment_listing_cache(&filesystem, &format!("file://{path}/"));
+        assert!(
+            !segment_listing_cache()
+                .lock()
+                .expect("cache")
+                .entries
+                .contains_key(&key)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn segment_listing_cache_preserves_relative_path_namespaces() -> anyhow::Result<()> {
+        use crate::observability::io_trace;
+        use crate::storage::persistence::filesystem::{FilesystemConfig, local::LocalConfig};
+
+        // SAFETY: nextest gives this test its own process; the value is pinned
+        // before constructing the engine or starting any background workers.
+        unsafe { std::env::set_var("PROXIMADB_SEGMENT_LISTING_CACHE_MS", "300000") };
+        let cwd = std::env::current_dir()?;
+        let cwd_collection = tempfile::Builder::new()
+            .prefix(".listing-relative-")
+            .tempdir_in(&cwd)?;
+        let relative = cwd_collection
+            .path()
+            .file_name()
+            .expect("unique fixture name")
+            .to_string_lossy()
+            .into_owned();
+        let root = tempfile::tempdir()?;
+        let rooted_collection = root.path().join(&relative);
+        std::fs::create_dir_all(&rooted_collection)?;
+        std::fs::write(rooted_collection.join("rooted.pax"), b"rooted")?;
+        std::fs::write(cwd_collection.path().join("cwd.pax"), b"cwd")?;
+        let filesystem = Arc::new(
+            FilesystemFactory::create(FilesystemConfig {
+                local: Some(LocalConfig {
+                    root_dir: Some(root.path().to_path_buf()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .await?,
+        );
+        let engine = SstEngine::new_with_config(
+            SstConfig::default(),
+            filesystem,
+            Arc::new(UnifiedDistanceCompute::default()),
+        )
+        .await?;
+        let check = |directory: String, name: &'static str, lists: u64| {
+            let engine = &engine;
+            async move {
+                io_trace::scope(async {
+                    let files = engine.discover_sstable_files(&directory).await?;
+                    assert_eq!(files.len(), 1);
+                    assert_eq!(files[0].url.rsplit('/').next(), Some(name));
+                    assert_eq!(io_trace::snapshot().expect("listing trace").list_ops, lists);
+                    Ok::<_, anyhow::Error>(())
+                })
+                .await
+            }
+        };
+        check(format!("./{relative}"), "rooted.pax", 1).await?;
+        let listing = engine.discover_sstable_files(&relative).await?;
+        let listed_fs = engine.filesystem().get_filesystem(&listing[0].url)?;
+        assert_eq!(listed_fs.read_resident(&listing[0].url).await?, b"rooted");
+        check(relative.clone(), "rooted.pax", 0).await?;
+        let relative_url = format!("file://{relative}");
+        check(relative_url.clone(), "cwd.pax", 1).await?;
+        check(relative_url.clone(), "cwd.pax", 0).await?;
+        invalidate_segment_listing_cache(engine.filesystem(), &format!("{relative_url}/"));
+        check(relative.clone(), "rooted.pax", 0).await?;
+        check(relative_url, "cwd.pax", 1).await?;
+
+        // Absolute aliases are safe even with a configured root, and share
+        // invalidation in both directions without collapsing relative keys.
+        let absolute = rooted_collection.to_string_lossy().into_owned();
+        check(absolute.clone(), "rooted.pax", 0).await?;
+        let absolute_url = format!("file://{absolute}/");
+        check(absolute_url.clone(), "rooted.pax", 0).await?;
+        invalidate_segment_listing_cache(engine.filesystem(), &absolute_url);
+        check(absolute, "rooted.pax", 1).await?;
+        check(relative.clone(), "rooted.pax", 0).await?;
+
+        // Legacy ledgers retain file://./ references, while LIST now returns
+        // absolute URLs. A warm listing must apply the same pending filter as
+        // a fresh listing and the residency inventory, regardless of root_dir.
+        use crate::storage::engines::sst::{retirement_ledger, segment_io};
+        let legacy_input = format!("file://./{relative}/cwd.pax");
+        retirement_ledger::record_pending(
+            cwd_collection.path(),
+            &cwd_collection.path().join("output.pax"),
+            std::slice::from_ref(&legacy_input),
+        )
+        .await?;
+        // Simulate a fresh process loading the raw durable obligation.
+        retirement_ledger::mark_drained(std::slice::from_ref(&legacy_input));
+        retirement_ledger::register_collection_dir(cwd_collection.path());
+        let directory = format!("file://./{relative}");
+        io_trace::scope(async {
+            assert!(engine.discover_sstable_files(&directory).await?.is_empty());
+            assert_eq!(
+                io_trace::snapshot().expect("warm listing trace").list_ops,
+                0
+            );
+            Ok::<_, anyhow::Error>(())
+        })
+        .await?;
+        let fs = engine.filesystem().get_filesystem(&directory)?;
+        assert!(
+            segment_io::live_segments(fs.as_ref(), &directory)
+                .await?
+                .is_empty()
+        );
+        assert!(
+            segment_io::residency_objects(fs.as_ref(), &directory)
+                .await?
+                .is_empty()
+        );
+        check(relative, "rooted.pax", 0).await?;
+        invalidate_segment_listing_cache(engine.filesystem(), &directory);
+        assert!(engine.discover_sstable_files(&directory).await?.is_empty());
+        assert_eq!(
+            retirement_ledger::load_ledger(cwd_collection.path())?.pending[0].inputs,
+            vec![legacy_input.clone()],
+            "snapshot aliases must not rewrite durable deletion obligations"
+        );
+        retirement_ledger::mark_drained(&[legacy_input]);
+        Ok(())
+    }
+
     use crate::storage::persistence::filesystem::FilesystemFactory;
     use proximadb_data_model::ProximaValue;
     use proximadb_distance_kernel::engine::UnifiedDistanceCompute;
+    use serial_test::serial;
     use std::sync::Arc;
 
     /// TD-SEARCH-2 S2b: the adaptive degree formula divides the base degree
@@ -3249,16 +3752,103 @@ mod tests {
         (engine, collection)
     }
 
+    /// The f32 tier written by the DEFAULT is storage-only: Adaptive keeps a
+    /// small all-tiered collection on the ANN cascade. A collection that asks
+    /// for the tier (`pax_f32_tier:on`) keeps today's small-collection exact
+    /// route.
+    #[tokio::test]
+    async fn default_f32_tier_does_not_move_adaptive_to_exact() {
+        use crate::core::search::{SearchMode, SearchParams};
+        use crate::storage::traits::{FlushParameters, StorageQueryContext, StorageQueryMetadata};
+        use proximadb_records::{EmbeddingCell, ProximaRecord};
+        // SAFETY: nextest process-per-test isolation.
+        unsafe { std::env::remove_var("PROXIMADB_PAX_F32_TIER") };
+        let dim = 16usize;
+        let mut routes = Vec::new();
+        // Cases: the default tier; an explicit request; an opt-out set AFTER
+        // default-tiered flushes (the segments keep the tier, and the route
+        // must not flip to exact).
+        for (tag, tag_after_flush) in [
+            (None, None),
+            (Some("pax_f32_tier:on"), None),
+            (None, Some("pax_f32_tier:off")),
+        ] {
+            let cid = format!("f32_route_{}_{}", tag.is_some(), tag_after_flush.is_some());
+            let (engine, mut collection) = file_backed_test_engine(&cid, dim, Some("pax")).await;
+            if let (Some(tag), Some(config)) = (tag, collection.config.as_mut()) {
+                config.tags.push(tag.to_string());
+            }
+            let records: Vec<ProximaRecord> = (0..300usize)
+                .map(|i| ProximaRecord {
+                    oid: format!("r{i}"),
+                    record_version: 1,
+                    embeddings: vec![EmbeddingCell::new_fp32(
+                        "test",
+                        "dense_vector",
+                        dim as u32,
+                        (0..dim)
+                            .map(|j| ((i * 7 + j) as f32 * 0.01).sin())
+                            .collect(),
+                    )],
+                    ..ProximaRecord::default()
+                })
+                .collect();
+            let flushed = engine
+                .do_flush(&FlushParameters {
+                    collection_id: Some(cid.clone()),
+                    vector_records: records,
+                    force: true,
+                    synchronous: true,
+                    collection_config: Some(collection.clone()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            assert!(flushed.success);
+            if let (Some(tag), Some(config)) = (tag_after_flush, collection.config.as_mut()) {
+                config.tags.push(tag.to_string());
+            }
+            let query: Vec<f32> = (0..dim).map(|j| (j as f32 * 0.01).sin()).collect();
+            let ctx = StorageQueryContext {
+                search_params: Arc::new(SearchParams {
+                    vector: Some(query.clone()),
+                    top_k: Some(10),
+                    search_mode: SearchMode::Adaptive { threshold: 100_000 },
+                    ..Default::default()
+                }),
+                collection: Arc::new(collection.clone()),
+                metadata: StorageQueryMetadata {
+                    collection_id: cid.clone(),
+                    ..Default::default()
+                },
+                user_context: None,
+                tenant_context: None,
+            };
+            let storage_url = ctx.collection_storage_path().expect("storage path");
+            assert!(
+                engine.segment_vector_count(&storage_url).await > 0,
+                "both flushes carry the tier, so the segments count as exact authority"
+            );
+            routes.push(engine.want_exact_search(&ctx, &query, &storage_url).await);
+        }
+        assert_eq!(
+            routes,
+            vec![false, true, false],
+            "default tier: cascade; requested tier: exact; later opt-out: cascade"
+        );
+    }
+
     /// TD-SEARCH-2 S2: multi-core (`tokio::spawn`) inter-file search is
     /// recall-neutral vs sequential. Flushes 3 batches → 3 files (no compaction),
     /// then runs the SAME query through `search_vectors_unified_arc` at degree=1
     /// (sequential) and degree=4 (multi-core spawn) and asserts the returned
     /// id-sets agree. Process-per-test isolation (nextest) makes the env-set safe.
     #[tokio::test]
+    #[serial]
     async fn s2_multicore_arc_matches_sequential() {
         use crate::core::search::SearchParams;
         use crate::storage::traits::{FlushParameters, StorageQueryContext, StorageQueryMetadata};
-        use proximadb_records::{EmbeddingCell, EmbeddingValues, ProximaRecord};
+        use proximadb_records::{EmbeddingCell, ProximaRecord};
 
         let dim = 64usize;
         let cid = "s2_multicore_test";
@@ -3465,6 +4055,90 @@ mod tests {
         }
     }
 
+    /// A record with a `half = idx % 2` prop and the given vector.
+    fn half_tagged_record(
+        idx: usize,
+        dim: usize,
+        version: u64,
+        vector: Vec<f32>,
+    ) -> proximadb_records::ProximaRecord {
+        let id = format!("r{idx}");
+        let mut rec = proximadb_records::ProximaRecord {
+            oid: id.clone(),
+            local_id: Some(id),
+            created_at_ns: 1_000 + idx as i64,
+            updated_at_ns: 1_000 + idx as i64,
+            record_version: version,
+            embeddings: vec![proximadb_records::EmbeddingCell::new_fp32(
+                "test",
+                "dense_vector",
+                dim as u32,
+                vector,
+            )],
+            ..proximadb_records::ProximaRecord::default()
+        };
+        rec.props.insert(
+            "half".to_string(),
+            proximadb_records::ProximaTreeNode::Value(proximadb_records::ProximaValue::Int64(
+                (idx % 2) as i64,
+            )),
+        );
+        rec
+    }
+
+    async fn flush_into(
+        engine: &SstEngine,
+        cid: &str,
+        collection: &crate::proto::proximadb_v1::Collection,
+        records: Vec<proximadb_records::ProximaRecord>,
+    ) {
+        let params = crate::storage::traits::FlushParameters {
+            collection_id: Some(cid.to_string()),
+            vector_records: records,
+            force: true,
+            synchronous: true,
+            collection_config: Some(collection.clone()),
+            ..Default::default()
+        };
+        assert!(engine.do_flush(&params).await.unwrap().success);
+    }
+
+    fn half_is_one() -> proximadb_filter_expression::FilterExpression {
+        proximadb_filter_expression::FilterExpression::Comparison {
+            field: "half".to_string(),
+            operator: proximadb_filter_expression::ComparisonOperator::Equals,
+            value: serde_json::json!(1),
+        }
+    }
+
+    /// An Approximate-mode vector query context.
+    fn approximate_ctx(
+        cid: &str,
+        collection: &crate::proto::proximadb_v1::Collection,
+        query: &[f32],
+        top_k: u16,
+        filter: Option<proximadb_filter_expression::FilterExpression>,
+    ) -> crate::storage::traits::StorageQueryContext {
+        crate::storage::traits::StorageQueryContext {
+            search_params: Arc::new(crate::core::search::SearchParams {
+                vector: Some(query.to_vec()),
+                top_k: Some(top_k),
+                filter_expression: filter,
+                search_mode: proximadb_search_types::search_params::SearchMode::Approximate {
+                    nprobe: None,
+                },
+                ..Default::default()
+            }),
+            collection: Arc::new(collection.clone()),
+            metadata: crate::storage::traits::StorageQueryMetadata {
+                collection_id: cid.to_string(),
+                ..Default::default()
+            },
+            user_context: None,
+            tenant_context: None,
+        }
+    }
+
     /// PR-D L4: an Approximate (cascade) query outside any directory scope
     /// reads its top-k Region-D blocks ONCE — the OID resolve fetches them
     /// whole and stashes them, and the rehydration takes them (zero `Rehyd`
@@ -3473,79 +4147,27 @@ mod tests {
     /// under a filter).
     #[tokio::test]
     async fn cascade_rehydrate_reuses_the_top_k_block_fetch() {
-        use crate::core::search::SearchParams;
         use crate::storage::engines::sst::segment_format::CacheTier;
-        use crate::storage::traits::{FlushParameters, StorageQueryContext, StorageQueryMetadata};
-        use proximadb_records::{EmbeddingCell, ProximaRecord};
 
+        // The per-segment OID resolve + rehydrate path (O1 kill switch); the
+        // deferred path is pinned by `deferred_rehydrate_matches_per_segment`.
+        // SAFETY: nextest process-per-test isolation.
+        unsafe { std::env::set_var("PROXIMADB_PAX_READ_DEFERRED_REHYDRATE", "0") };
         let dim = 16usize;
         let cid = "topk_stash";
         let (engine, collection) = file_backed_test_engine(cid, dim, None).await;
-        let recs: Vec<ProximaRecord> = (0..60usize)
+        let recs = (0..60usize)
             .map(|idx| {
-                let id = format!("r{idx}");
-                let mut rec = ProximaRecord {
-                    oid: id.clone(),
-                    local_id: Some(id),
-                    created_at_ns: 1_000,
-                    updated_at_ns: 1_000,
-                    record_version: 1,
-                    embeddings: vec![EmbeddingCell::new_fp32(
-                        "test",
-                        "dense_vector",
-                        dim as u32,
-                        (0..dim).map(|j| (idx * dim + j) as f32 * 0.01).collect(),
-                    )],
-                    ..ProximaRecord::default()
-                };
-                rec.props.insert(
-                    "half".to_string(),
-                    proximadb_records::ProximaTreeNode::Value(
-                        proximadb_records::ProximaValue::Int64((idx % 2) as i64),
-                    ),
-                );
-                rec
+                let vector = (0..dim).map(|j| (idx * dim + j) as f32 * 0.01).collect();
+                half_tagged_record(idx, dim, 1, vector)
             })
             .collect();
-        let params = FlushParameters {
-            collection_id: Some(cid.to_string()),
-            vector_records: recs,
-            force: true,
-            synchronous: true,
-            collection_config: Some(collection.clone()),
-            ..Default::default()
-        };
-        assert!(engine.do_flush(&params).await.unwrap().success);
+        flush_into(&engine, cid, &collection, recs).await;
 
         let engine = Arc::new(engine);
         let query: Vec<f32> = (0..dim).map(|j| (7 * dim + j) as f32 * 0.01).collect();
-        for filter in [
-            None,
-            Some(proximadb_filter_expression::FilterExpression::Comparison {
-                field: "half".to_string(),
-                operator: proximadb_filter_expression::ComparisonOperator::Equals,
-                value: serde_json::json!(1),
-            }),
-        ] {
-            let sp = SearchParams {
-                vector: Some(query.clone()),
-                top_k: Some(5),
-                filter_expression: filter.clone(),
-                search_mode: proximadb_search_types::search_params::SearchMode::Approximate {
-                    nprobe: None,
-                },
-                ..Default::default()
-            };
-            let ctx = StorageQueryContext {
-                search_params: Arc::new(sp),
-                collection: Arc::new(collection.clone()),
-                metadata: StorageQueryMetadata {
-                    collection_id: cid.to_string(),
-                    ..Default::default()
-                },
-                user_context: None,
-                tenant_context: None,
-            };
+        for filter in [None, Some(half_is_one())] {
+            let ctx = approximate_ctx(cid, &collection, &query, 5, filter.clone());
             let (results, snap) = crate::observability::io_trace::scope(async {
                 let results = engine
                     .clone()
@@ -3584,6 +4206,129 @@ mod tests {
                 "filter={filter:?}: rehydration must reuse the top-k block fetch: {:?}",
                 snap.tier_get_ops
             );
+        }
+    }
+
+    /// O1: a winner that cannot be rehydrated is a `DeferredResolveError`
+    /// (the caller's retry trigger), never a placeholder handed back.
+    #[tokio::test]
+    async fn deferred_resolve_fails_closed_on_an_unreadable_winner() {
+        use crate::storage::engines::sst::segment_format::CascadeHit;
+        let (engine, _collection) = file_backed_test_engine("deferred_fail", 8, None).await;
+        let table = deferred::DeferredRehydrate::new();
+        let hit = CascadeHit {
+            oid: String::new(),
+            distance: 0.5,
+            vector: None,
+            position: 0,
+        };
+        let placeholder =
+            table.placeholder("/nonexistent/seg.pax", &hit, &DistanceMetric::Euclidean);
+        let passthrough = OptimizedSearchRecord::new("real-id".to_string(), 0.1);
+        let err = table
+            .resolve(&engine, vec![placeholder, passthrough], &HashMap::new())
+            .await
+            .expect_err("an unreadable segment cannot resolve");
+        let err = anyhow::Error::new(err);
+        assert!(
+            err.downcast_ref::<deferred::DeferredResolveError>()
+                .is_some(),
+            "the retry loop recognizes the error: {err}"
+        );
+    }
+
+    /// O1 parity oracle: rehydrating only the merged winners returns exactly
+    /// the per-segment path's results (ids, scores, metadata, persisted
+    /// versions), filtered and unfiltered, across several segments; and it
+    /// reads no Region-D OID ranges at all.
+    #[tokio::test]
+    async fn deferred_rehydrate_matches_per_segment() {
+        use crate::storage::engines::sst::segment_format::CacheTier;
+
+        let dim = 16usize;
+        let cid = "deferred_rehydrate";
+        let (engine, collection) = file_backed_test_engine(cid, dim, None).await;
+        // Three flushes -> three segments, so each query merges S x k'.
+        for batch in 0..3usize {
+            let recs = (batch * 80..batch * 80 + 80)
+                .map(|idx| {
+                    let vector = (0..dim)
+                        .map(|j| ((idx * 7 + j * 3) % 97) as f32 * 0.01)
+                        .collect();
+                    half_tagged_record(idx, dim, 1 + (idx % 3) as u64, vector)
+                })
+                .collect();
+            flush_into(&engine, cid, &collection, recs).await;
+        }
+        let engine = Arc::new(engine);
+        let query: Vec<f32> = (0..dim).map(|j| (j * 5 % 97) as f32 * 0.01).collect();
+        type Seen = Vec<(String, f32, Option<String>, String, Option<u32>)>;
+        let summarize = |results: &[OptimizedSearchRecord]| -> Seen {
+            results
+                .iter()
+                .map(|r| {
+                    let mut meta: Vec<String> = r
+                        .metadata
+                        .iter()
+                        .map(|(k, v)| format!("{k}={v:?}"))
+                        .collect();
+                    meta.sort();
+                    (
+                        r.id.clone(),
+                        r.score,
+                        r.vector_id.clone(),
+                        meta.join(","),
+                        r.version,
+                    )
+                })
+                .collect()
+        };
+        for filter in [None, Some(half_is_one())] {
+            let ctx = approximate_ctx(cid, &collection, &query, 30, filter.clone());
+            // Both search entry points: the REST/service path
+            // (`search_vectors_unified` -> `fallback_to_direct_search`) and
+            // the coordinator path (`search_vectors_unified_arc`).
+            for arc_entry in [false, true] {
+                let mut runs = Vec::new();
+                for gate in ["0", "1"] {
+                    // SAFETY: nextest process-per-test isolation.
+                    unsafe { std::env::set_var("PROXIMADB_PAX_READ_DEFERRED_REHYDRATE", gate) };
+                    let (results, snap) = crate::observability::io_trace::scope(async {
+                        let results = if arc_entry {
+                            engine.clone().search_vectors_unified_arc(&ctx).await
+                        } else {
+                            engine.search_vectors_unified(&ctx).await
+                        }
+                        .unwrap();
+                        (results, crate::observability::io_trace::snapshot())
+                    })
+                    .await;
+                    runs.push((summarize(&results), snap.expect("io_trace scope")));
+                }
+                let (per_segment, per_segment_io) = &runs[0];
+                let (deferred, deferred_io) = &runs[1];
+                let at = format!("filter={filter:?} arc_entry={arc_entry}");
+                assert!(per_segment.len() >= 10, "{at}: hits {per_segment:?}");
+                assert_eq!(deferred, per_segment, "{at}: deferred == per-segment");
+                assert!(
+                    deferred.iter().all(|(id, ..)| !id.starts_with('\u{0}')),
+                    "{at}: no placeholder escapes"
+                );
+                assert!(
+                    per_segment_io.tier_get_ops[CacheTier::ResultPayload as usize] > 0,
+                    "{at}: the per-segment path resolves OIDs from Region D"
+                );
+                assert_eq!(
+                    deferred_io.tier_get_ops[CacheTier::ResultPayload as usize],
+                    0,
+                    "{at}: deferred reads no Region-D OID ranges: {:?}",
+                    deferred_io.tier_get_ops
+                );
+                assert!(
+                    deferred_io.tier_get_ops[CacheTier::Rehydrate as usize] > 0,
+                    "{at}: deferred rehydrates the winners"
+                );
+            }
         }
     }
 
@@ -3659,7 +4404,7 @@ mod tests {
     #[tokio::test]
     async fn pax_footer_facts_report_rows_and_exact_authority() {
         use crate::storage::engines::sst::segment_format::write_pax_segment_with_f32_tier;
-        use proximadb_records::{EmbeddingCell, EmbeddingValues, ProximaRecord};
+        use proximadb_records::{EmbeddingCell, ProximaRecord};
         // Coalesced RaBitQ layout (the default write), env-pinned like the
         // segment_format tests.
         unsafe { std::env::set_var("PROXIMADB_PAX_COALESCED_RABITQ", "1") };

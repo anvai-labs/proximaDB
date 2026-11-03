@@ -42,6 +42,7 @@ use crate::services::{DdlService, DmlService};
 use crate::storage::document::DocumentService;
 use proximadb_data_model::ProximaType;
 use proximadb_data_model::ProximaValue;
+use proximadb_relational_types::{ColumnInfo, RelationalSchema};
 
 use proximadb_records::conversions::sql_value_to_json;
 
@@ -795,6 +796,15 @@ struct Portal {
     execution_state: Option<PortalExecutionState>,
 }
 
+/// Outcome of [`PostgresProtocol::execute_portal_fast_paths`].
+enum PortalFastPathOutcome {
+    /// A fast path claimed the Execute and fully served it.
+    Handled,
+    /// Neither fast path claims the shape; the caller falls through to the
+    /// general (self-governing) execution path.
+    Declined,
+}
+
 /// Cached execution state for a portal.
 struct PortalExecutionState {
     result: ExecutionPipelineResult,
@@ -1409,7 +1419,13 @@ impl PostgresProtocol {
             self.vector_ops.clone(),
         ));
         self.ddl_service = Some(Arc::new(
-            DdlService::new(catalog_manager.clone()).with_record_store(dml_service.record_store()),
+            DdlService::new(catalog_manager.clone())
+                .with_record_store(dml_service.record_store())
+                .with_collection_compactor(std::sync::Arc::new(
+                    crate::services::operations::vectors::VectorOpsCollectionCompactor {
+                        vector_ops: self.vector_ops.clone(),
+                    },
+                )),
         ));
         self.dml_service = Some(dml_service);
         self.catalog_manager = Some(catalog_manager);
@@ -1436,7 +1452,13 @@ impl PostgresProtocol {
         }
         let dml = Arc::new(dml);
         self.ddl_service = Some(Arc::new(
-            DdlService::new(catalog_manager.clone()).with_record_store(dml.record_store()),
+            DdlService::new(catalog_manager.clone())
+                .with_record_store(dml.record_store())
+                .with_collection_compactor(std::sync::Arc::new(
+                    crate::services::operations::vectors::VectorOpsCollectionCompactor {
+                        vector_ops: self.vector_ops.clone(),
+                    },
+                )),
         ));
         self.dml_service = Some(dml);
         self.catalog_manager = Some(catalog_manager);
@@ -1464,7 +1486,12 @@ impl PostgresProtocol {
         let mut ddl = DdlService::new(catalog_manager)
             .with_rank_profile_store(store)
             .with_rank_services(services)
-            .with_function_store(function_store);
+            .with_function_store(function_store)
+            .with_collection_compactor(std::sync::Arc::new(
+                crate::services::operations::vectors::VectorOpsCollectionCompactor {
+                    vector_ops: self.vector_ops.clone(),
+                },
+            ));
         if let Some(dml) = self.dml_service.as_ref() {
             ddl = ddl.with_record_store(dml.record_store());
         }
@@ -2168,7 +2195,8 @@ impl PostgresProtocol {
         if (upper.starts_with("CREATE")
             || upper.starts_with("ALTER")
             || upper.starts_with("DROP")
-            || upper.starts_with("COPY"))
+            || upper.starts_with("COPY")
+            || upper.starts_with("COMPACT"))
             && self.transaction_in_progress().await
         {
             self.send_error(
@@ -3011,10 +3039,45 @@ impl PostgresProtocol {
         Self::strip_sql_literal(value)
     }
 
-    /// Execute a translated query
+    /// Execute a translated query.
+    ///
+    /// E0 (TD-PGPORTAL-1 follow-up): the rate-limit check lives in the TWO
+    /// metered entry points — here (every simple-protocol statement) and
+    /// `execute_portal_query` (every Execute that runs a query, budgeted or
+    /// not) — so
+    /// each query pays exactly once regardless of which path serves it: a
+    /// Declined budgeted Execute falls through to
+    /// `execute_query_with_controls` UNMETERED (see its comment).
     async fn execute_query(&mut self, query: &str) -> Result<()> {
+        if self.check_pgwire_rate_limit().await? {
+            return Ok(());
+        }
         self.execute_query_with_controls(query, ExecutionControls::default())
             .await
+    }
+
+    /// E0 (TD-PGPORTAL-1 follow-up): the converged rate-limit check (the SAME
+    /// `RateLimitState` REST uses). Called by the two metered entry points —
+    /// `execute_query` (every simple-protocol statement) and
+    /// `execute_portal_query` (EVERY Execute that runs a query: budgeted
+    /// fast-path or unbudgeted fall-through) — NEVER by
+    /// `execute_query_with_controls` itself (both of its arrival paths are
+    /// already metered; a check there would double-charge). Returns `true`
+    /// when the query was REFUSED (53400 sent).
+    async fn check_pgwire_rate_limit(&mut self) -> Result<bool> {
+        if let Some(limiter) = self.rate_limiter.clone()
+            && limiter.enabled()
+            && let Err(retry_after) = limiter.check_and_consume(self.peer_ip).await
+        {
+            self.send_error(
+                "ERROR",
+                "53400",
+                &format!("rate limit exceeded; retry after {retry_after}s"),
+            )
+            .await?;
+            return Ok(true);
+        }
+        Ok(false)
     }
 
     /// Execute a translated query with request-scoped execution controls.
@@ -3027,6 +3090,11 @@ impl PostgresProtocol {
     /// entirely. The tenant is the one already resolved for read routing
     /// (TD-064); no new identity source is introduced. The wrapper is a thin
     /// scope around the unchanged body in `_inner`.
+    ///
+    /// E0 rate-limiting is deliberately ABSENT here (TD-PGPORTAL-1 follow-up):
+    /// the two callers are the metered entry points, and the Declined-portal
+    /// fall-through arrives already metered — a check here would
+    /// double-charge budgeted Executes.
     async fn execute_query_with_controls(
         &mut self,
         query: &str,
@@ -3035,21 +3103,6 @@ impl PostgresProtocol {
         let cancellation_flag = self.session.read().await.cancellation_flag.clone();
         cancellation_flag.store(false, Ordering::Relaxed);
         controls.cancellation_flag = Some(cancellation_flag);
-        // E0 rate-limiting: reject over-quota queries up front with a pgwire
-        // error, using the SAME converged RateLimitState check REST uses (no
-        // duplicate limiter). No-op when unset/disabled.
-        if let Some(limiter) = self.rate_limiter.clone()
-            && limiter.enabled()
-            && let Err(retry_after) = limiter.check_and_consume(self.peer_ip).await
-        {
-            return self
-                .send_error(
-                    "ERROR",
-                    "53400",
-                    &format!("rate limit exceeded; retry after {retry_after}s"),
-                )
-                .await;
-        }
         let tenant = self.pgwire_resolve_read_tenant().await;
         // E0 (edge consistency): give every pgwire query a request-id correlation
         // scope — matching REST's request_id middleware — so logs and error
@@ -3109,7 +3162,8 @@ impl PostgresProtocol {
             if (upper_for_ddl.starts_with("CREATE")
                 || upper_for_ddl.starts_with("ALTER")
                 || upper_for_ddl.starts_with("DROP")
-                || upper_for_ddl.starts_with("COPY"))
+                || upper_for_ddl.starts_with("COPY")
+                || upper_for_ddl.starts_with("COMPACT"))
                 && self.transaction_in_progress().await
             {
                 return self
@@ -3295,7 +3349,8 @@ impl PostgresProtocol {
 
         if (upper.starts_with("CREATE ")
             || upper.starts_with("ALTER ")
-            || upper.starts_with("DROP "))
+            || upper.starts_with("DROP ")
+            || upper.starts_with("COMPACT "))
             && let Some(ddl_service) = self.ddl_service.clone()
         {
             let parser = SqlFrontendParser::new();
@@ -3355,6 +3410,9 @@ impl PostgresProtocol {
                         crate::services::DdlStatement::MaterializeTable { name, .. } => {
                             Some(name.clone())
                         }
+                        crate::services::DdlStatement::CompactTable { name, .. } => {
+                            Some(name.clone())
+                        }
                         _ => None,
                     };
                     match ddl_service
@@ -3389,6 +3447,8 @@ impl PostgresProtocol {
                                 "DROP TABLE"
                             } else if upper.starts_with("DROP INDEX") {
                                 "DROP INDEX"
+                            } else if upper.starts_with("COMPACT TABLE") {
+                                "COMPACT TABLE"
                             } else {
                                 "OK"
                             };
@@ -3405,10 +3465,42 @@ impl PostgresProtocol {
                             return self.send_command_complete(tag).await;
                         }
                         Err(e) => {
-                            warn!("DdlService execution failed: {}", e);
-                            return self
-                                .send_error("ERROR", "42P01", &format!("DDL failed: {}", e))
-                                .await;
+                            // 42P01 ONLY when the object truly is not there
+                            // (missing, or another tenant's). Every other
+                            // failure is a server error: labelling a failed
+                            // DROP TABLE 'does not exist' told the client a
+                            // live table was gone (TD-PATH-2).
+                            let not_found = upper.starts_with("DROP TABLE")
+                                && (e.to_string().contains("does not exist")
+                                    || proximadb_catalog::TableNotVisible::is(&e));
+                            if not_found {
+                                warn!("DdlService: object not found: {}", e);
+                                return self
+                                    .send_error(
+                                        "ERROR",
+                                        "42P01",
+                                        &format!("Table does not exist: {e}"),
+                                    )
+                                    .await;
+                            }
+                            let (sqlstate, message) = if upper.starts_with("DROP TABLE")
+                                && upper.contains("IF EXISTS")
+                            {
+                                // A failed drop still exists: IF EXISTS
+                                // must not read as success either.
+                                warn!("DROP TABLE failed: {e:#}");
+                                (
+                                    "XX000",
+                                    format!(
+                                        "could not drop table ({}); it still exists, retry",
+                                        e.to_string().split(':').next().unwrap_or("error").trim()
+                                    ),
+                                )
+                            } else {
+                                warn!("DdlService execution failed: {e:#}");
+                                ("XX000", format!("DDL failed: {e}"))
+                            };
+                            return self.send_error("ERROR", sqlstate, &message).await;
                         }
                     }
                 }
@@ -4019,6 +4111,30 @@ impl PostgresProtocol {
     /// misparsing `customer,` or `(select` as a table name. Inspects only the
     /// FROM clause segment (up to the next clause keyword), so commas in the
     /// projection, WHERE `IN (…)` lists, or ORDER BY never false-positive.
+    /// TD-PGPORTAL-1: does `upper` name a statement the pre-dispatch special
+    /// cases answer (version/settings/catalog introspection)? Both Describe's
+    /// classification and the portal legacy branch must exclude these — one
+    /// predicate so the two cannot drift.
+    fn is_pre_dispatch_special(upper: &str) -> bool {
+        const SPECIAL: [&str; 13] = [
+            "AS SERVER_VERSION",
+            "VERSION()",
+            "AS SERVER_ENCODING",
+            "AS CLIENT_ENCODING",
+            "AS TIMEZONE",
+            "AS SEARCH_PATH",
+            "CURRENT_SCHEMA()",
+            "CURRENT_DATABASE()",
+            "CURRENT_USER",
+            "SESSION_USER",
+            "FROM PG_CATALOG",
+            "FROM INFORMATION_SCHEMA",
+            "PG_SETTINGS",
+        ];
+        SPECIAL.iter().any(|marker| upper.contains(marker))
+            || crate::services::CatalogIntrospectionService::is_catalog_query(upper)
+    }
+
     fn legacy_unsupported_from_shape(upper: &str) -> Option<&'static str> {
         let from_pos = upper.find("FROM ")?;
         let after = &upper[from_pos + 5..];
@@ -4832,14 +4948,64 @@ impl PostgresProtocol {
 
     /// Execute a relational query against a cataloged table.
     async fn execute_relational_query(&mut self, query: &str, table_name: &str) -> Result<()> {
+        // (the fetch-phase debug! lives in legacy_relational_select_result)
+        if self.dml_service.is_none() {
+            self.send_command_complete("SELECT 0").await?;
+            return Ok(());
+        }
+        let (fields, result) = self
+            .legacy_relational_select_result(query, table_name)
+            .await?;
+        self.send_row_description(&fields).await?;
+
+        // The SQL LIMIT: with an ORDER BY the fetch retrieved every matching
+        // row (sorted above) and the limit is applied HERE; without one the
+        // scan already pushed it down.
+        let limit = Self::extract_select_limit(query);
+        let mut rows_sent = 0usize;
+        for row in result.rows {
+            // Text-encode each column via the shared nullable converter: SQL NULL
+            // (ProximaValue::Null) → None → pgwire `-1` length sentinel (see
+            // send_data_row_nullable). Non-null values render identically to the
+            // legacy simple-query encoder.
+            let values = row
+                .iter()
+                .map(super::relational_pipeline::wire_text)
+                .collect::<Vec<_>>();
+            self.send_data_row_nullable(&values).await?;
+            rows_sent += 1;
+            if limit.is_some_and(|limit| rows_sent >= limit) {
+                break;
+            }
+        }
+
+        self.send_command_complete(&format!("SELECT {}", rows_sent))
+            .await
+    }
+
+    /// TD-PGPORTAL-1: the legacy single-table reader's FULLY MATERIALIZED
+    /// result (fetch + ORDER BY sort), with NO protocol output — shared by the
+    /// simple protocol's send-everything path (`execute_relational_query`)
+    /// and the extended protocol's portal paging (which loads it into
+    /// `PortalExecutionState` and serves `Execute(max_rows)` pages ending in
+    /// PortalSuspended). The ABAC fail-closed gate and tenant scoping ride
+    /// along: they are properties of the FETCH, not of the send.
+    async fn legacy_relational_select_result(
+        &self,
+        query: &str,
+        table_name: &str,
+    ) -> Result<(
+        Vec<FieldDescription>,
+        crate::services::dml::RelationalSelectResult,
+    )> {
         debug!("Executing relational query on table: {}", table_name);
 
         let projection_column_names = Self::extract_selected_column_names(query);
 
-        let Some(dml_service) = self.dml_service.clone() else {
-            self.send_command_complete("SELECT 0").await?;
-            return Ok(());
-        };
+        let dml_service = self
+            .dml_service
+            .clone()
+            .ok_or_else(|| anyhow!("no DML service for the legacy single-table reader"))?;
 
         let limit = Self::extract_select_limit(query);
         let order_by = match Self::extract_select_order_by(query) {
@@ -4919,7 +5085,6 @@ impl PostgresProtocol {
                 )
             })
             .collect::<Vec<_>>();
-        self.send_row_description(&fields).await?;
 
         // Apply ORDER BY if present (ADR-018 Phase 2: multi-column +
         // NULLS handling). Sort by the string representation of each
@@ -5011,27 +5176,8 @@ impl PostgresProtocol {
             }
         }
 
-        let mut rows_sent = 0usize;
-        for row in result.rows {
-            // Text-encode each column via the shared nullable converter: SQL NULL
-            // (ProximaValue::Null) → None → pgwire `-1` length sentinel (see
-            // send_data_row_nullable). Non-null values render identically to the
-            // legacy simple-query encoder.
-            let values = row
-                .iter()
-                .map(super::relational_pipeline::wire_text)
-                .collect::<Vec<_>>();
-            self.send_data_row_nullable(&values).await?;
-            rows_sent += 1;
-            if limit.is_some_and(|limit| rows_sent >= limit) {
-                break;
-            }
-        }
-
-        self.send_command_complete(&format!("SELECT {}", rows_sent))
-            .await
+        Ok((fields, result))
     }
-
     /// Execute a document store query
     /// Supports: SELECT * FROM doc_users WHERE $.age > 25
     async fn execute_document_query(&mut self, table_name: &str, query: &str) -> Result<()> {
@@ -6351,28 +6497,21 @@ impl PostgresProtocol {
 
         // Scoped to the connection's tenant (startup `database`).
         let tenant = self.pgwire_resolve_write_tenant().await;
-        match self
+        let outcome = self
             .collection_port
             .delete_collection(&table_name, Some(&tenant))
-            .await
-        {
-            Ok(_) => {
+            .await;
+        match drop_table_reply(&table_name, upper.contains("IF EXISTS"), &outcome) {
+            DropTableReply::Complete => {
                 info!("Dropped collection '{}' via PostgreSQL", table_name);
                 self.send_command_complete("DROP TABLE").await
             }
-            Err(e) => {
-                if upper.contains("IF EXISTS") {
-                    // IF EXISTS - don't error if not found
-                    self.send_command_complete("DROP TABLE").await
-                } else {
-                    warn!("Failed to drop collection '{}': {}", table_name, e);
-                    self.send_error(
-                        "ERROR",
-                        "42P01",
-                        &format!("Table does not exist: {}", table_name),
-                    )
-                    .await
+            DropTableReply::Error { sqlstate, message } => {
+                if let Err(error) = outcome.as_ref() {
+                    // The client message may be generic; the log keeps the cause.
+                    warn!("DROP TABLE '{}' failed: {error:#}", table_name);
                 }
+                self.send_error("ERROR", sqlstate, &message).await
             }
         }
     }
@@ -7088,25 +7227,11 @@ impl PostgresProtocol {
         if !upper.starts_with("SELECT") {
             return DescribedShape::Unknown;
         }
-        // Special cases `execute_query` answers before its SELECT dispatch.
-        const SPECIAL: [&str; 13] = [
-            "AS SERVER_VERSION",
-            "VERSION()",
-            "AS SERVER_ENCODING",
-            "AS CLIENT_ENCODING",
-            "AS TIMEZONE",
-            "AS SEARCH_PATH",
-            "CURRENT_SCHEMA()",
-            "CURRENT_DATABASE()",
-            "CURRENT_USER",
-            "SESSION_USER",
-            "FROM PG_CATALOG",
-            "FROM INFORMATION_SCHEMA",
-            "PG_SETTINGS",
-        ];
-        if SPECIAL.iter().any(|marker| upper.contains(marker))
-            || crate::services::CatalogIntrospectionService::is_catalog_query(query)
-        {
+        // Special cases `execute_query` answers before its SELECT dispatch —
+        // the SAME shared predicate the portal legacy branch excludes by
+        // (TD-PGPORTAL-1 review round 2, N1): Describe's classification and
+        // Execute's routing must not drift apart.
+        if Self::is_pre_dispatch_special(&upper) {
             return DescribedShape::Unknown;
         }
         let Some(dml_service) = self.dml_service.clone() else {
@@ -7600,61 +7725,52 @@ impl PostgresProtocol {
                 )
                 .await;
         }
-        if max_rows > 0 {
-            if self
-                .portals
-                .get(portal_name)
-                .is_some_and(|p| p.execution_state.is_some())
-            {
-                return self.emit_portal_page(portal_name, max_rows as usize).await;
-            }
+        // TD-PGPORTAL-1: ANY Execute against a portal with materialized state
+        // pages or DRAINS it — including max_rows == 0, which PostgreSQL
+        // defines as "no limit" (drain the remainder + CommandComplete). The
+        // old placement inside `max_rows > 0` made that round fall through to
+        // a full RE-RUN of the query and serve every row again as duplicates.
+        if self
+            .portals
+            .get(portal_name)
+            .is_some_and(|p| p.execution_state.is_some())
+        {
+            return self
+                .emit_portal_page(portal_name, max_rows.max(0) as usize)
+                .await;
+        }
 
-            // E0 follow-up: this portal-SELECT fast-path returns before reaching
-            // `execute_query_with_controls`, so it is the one pgwire query path
-            // not yet under the per-query `io_trace` span. Bring it under the
-            // same scope in the next slice (kept out here to avoid restructuring
-            // the borrow in this `&&` let-chain).
-            if query.trim_start().to_uppercase().starts_with("SELECT")
-                && let Some(result) = {
-                    let cancellation_flag = self.session.read().await.cancellation_flag.clone();
-                    cancellation_flag.store(false, Ordering::Relaxed);
-                    self.try_run_relational_select_pipeline(
-                        query,
-                        ExecutionControls {
-                            cancellation_flag: Some(cancellation_flag),
-                            ..Default::default()
-                        },
-                    )
-                    .await
-                }
-            {
-                let result = match result {
-                    Ok(result) => result,
-                    Err(msg) => return self.send_relational_error(&msg).await,
-                };
-                // This route never sends a RowDescription, so check the shape
-                // against Describe here (TD-PGEXT-1).
-                let fields: Vec<FieldDescription> = result
-                    .schema
-                    .columns
-                    .iter()
-                    .map(|c| {
-                        FieldDescription::new(
-                            &c.name,
-                            super::relational_pipeline::pg_type_for(&c.ty),
-                        )
-                    })
-                    .collect();
-                if let Some(mismatch) = self.described_shape_mismatch(&fields) {
-                    return Err(anyhow::Error::new(DescribeMismatch(mismatch)));
-                }
-                if let Some(portal) = self.portals.get_mut(portal_name) {
-                    portal.execution_state = Some(PortalExecutionState {
-                        result,
-                        next_row: 0,
-                    });
-                }
-                return self.emit_portal_page(portal_name, max_rows as usize).await;
+        // E0 rate limiting (TD-PGPORTAL-1 follow-up, review round 2): EVERY
+        // Execute that runs a query pays exactly one token — budgeted
+        // (max_rows > 0: either fast path) AND unbudgeted (max_rows == 0: the
+        // fall-through, the DEFAULT shape for tokio-postgres/asyncpg/libpq —
+        // which would otherwise be the one unmetered query path left). Page
+        // EMISSION on later rounds (the hoisted drain above) is not metered:
+        // the query already paid when it ran.
+        if self.check_pgwire_rate_limit().await? {
+            return Ok(());
+        }
+
+        if max_rows > 0 {
+            // E0 span governance (TD-PGPORTAL-1 follow-up): both fast paths
+            // return before `execute_query_with_controls`, so they run inside
+            // the SAME request-id + per-query io_trace scope the general path
+            // provides (around the query execution — materialization + the
+            // first page emit). The fall-through carries its own scope.
+            let tenant = self.pgwire_resolve_read_tenant().await;
+            let request_id = crate::network::middleware::request_id::RequestId::generate();
+            let outcome = proximadb_api::rest::errors::REQUEST_ID
+                .scope(
+                    request_id.0,
+                    crate::observability::io_trace::instrument(
+                        Some(tenant),
+                        "pgwire.portal_query",
+                        self.execute_portal_fast_paths(portal_name, query, max_rows),
+                    ),
+                )
+                .await?;
+            if matches!(outcome, PortalFastPathOutcome::Handled) {
+                return Ok(());
             }
         }
 
@@ -7663,6 +7779,158 @@ impl PostgresProtocol {
             Self::execution_controls_for_execute_max_rows(max_rows),
         )
         .await
+    }
+
+    /// TD-PGPORTAL-1 + E0 follow-up: the two portal fast paths (relational
+    /// pipeline; legacy single-table reader), run under the caller's
+    /// governance scope. `Handled` = the Execute was fully served; `Declined`
+    /// = neither fast path claims this shape and the caller falls through to
+    /// `execute_query_with_controls` (which carries its own governance).
+    async fn execute_portal_fast_paths(
+        &mut self,
+        portal_name: &str,
+        query: &str,
+        max_rows: i32,
+    ) -> Result<PortalFastPathOutcome> {
+        if query.trim_start().to_uppercase().starts_with("SELECT")
+            && let Some(result) = {
+                let cancellation_flag = self.session.read().await.cancellation_flag.clone();
+                cancellation_flag.store(false, Ordering::Relaxed);
+                self.try_run_relational_select_pipeline(
+                    query,
+                    ExecutionControls {
+                        cancellation_flag: Some(cancellation_flag),
+                        ..Default::default()
+                    },
+                )
+                .await
+            }
+        {
+            let result = match result {
+                Ok(result) => result,
+                Err(msg) => {
+                    self.send_relational_error(&msg).await?;
+                    return Ok(PortalFastPathOutcome::Handled);
+                }
+            };
+            // This route never sends a RowDescription, so check the shape
+            // against Describe here (TD-PGEXT-1).
+            let fields: Vec<FieldDescription> = result
+                .schema
+                .columns
+                .iter()
+                .map(|c| {
+                    FieldDescription::new(&c.name, super::relational_pipeline::pg_type_for(&c.ty))
+                })
+                .collect();
+            if let Some(mismatch) = self.described_shape_mismatch(&fields) {
+                return Err(anyhow::Error::new(DescribeMismatch(mismatch)));
+            }
+            if let Some(portal) = self.portals.get_mut(portal_name) {
+                portal.execution_state = Some(PortalExecutionState {
+                    result,
+                    next_row: 0,
+                });
+            }
+            self.emit_portal_page(portal_name, max_rows as usize)
+                .await?;
+            return Ok(PortalFastPathOutcome::Handled);
+        }
+
+        // TD-PGPORTAL-1: the LEGACY single-table reader materializes into
+        // the portal too and pages with PortalSuspended — mirroring the
+        // dispatch `execute_query` uses (extract_table_name +
+        // detect_select_store_type), restricted to the Relational/Event
+        // stores this reader serves. Before, this shape fell through to
+        // `execute_query_with_controls`, which streamed EVERY row plus
+        // CommandComplete regardless of the Execute budget and re-ran the
+        // query on the next Execute.
+        let upper = query.trim_start().to_uppercase();
+        if upper.starts_with("SELECT")
+            // Classification PARITY with the pre-dispatch gates the
+            // fall-through used to run (TD-PGPORTAL-1 review round 1,
+            // finding 2): special cases and catalog introspection keep
+            // their own handlers; unsupported FROM shapes keep the
+            // actionable 0A000 instead of a misparsed-table XX000.
+            && !Self::is_pre_dispatch_special(&upper)
+            && Self::legacy_unsupported_from_shape(&upper).is_none()
+            && let Some(table_name) = self.extract_table_name(query)
+            && matches!(
+                self.detect_select_store_type(&table_name, &upper),
+                DataModel::Relational | DataModel::Event
+            )
+        {
+            // Edge-config parity (review finding 4): no DML service is a
+            // silent empty result everywhere else on this surface.
+            if self.dml_service.is_none() {
+                self.send_command_complete("SELECT 0").await?;
+                return Ok(PortalFastPathOutcome::Handled);
+            }
+            // Cancellation parity (review finding 3): arm the flag for the
+            // fetch and honor it before serving pages. (The rate limiter and
+            // io_trace span are the CALLER's governance wrapper — both fast
+            // paths run inside it.)
+            let cancellation_flag = self.session.read().await.cancellation_flag.clone();
+            cancellation_flag.store(false, Ordering::Relaxed);
+            let outcome = match self
+                .legacy_relational_select_result(query, &table_name)
+                .await
+            {
+                Ok((fields, mut result)) => {
+                    if cancellation_flag.load(Ordering::Relaxed) {
+                        self.send_error(
+                            "ERROR",
+                            "57014",
+                            "canceling statement due to user request",
+                        )
+                        .await?;
+                        return Ok(PortalFastPathOutcome::Handled);
+                    }
+                    // SQL LIMIT parity (review finding 1): with an ORDER BY
+                    // the fetch retrieved every matching row (sorted) and
+                    // the SENDER truncates — the portal must truncate too,
+                    // or a budgeted portal streams past the LIMIT forever.
+                    if let Some(limit) = Self::extract_select_limit(query) {
+                        result.rows.truncate(limit);
+                    }
+                    // This route never sends a RowDescription, so check the
+                    // shape against Describe here (TD-PGEXT-1), same as the
+                    // pipeline branch above.
+                    if let Some(mismatch) = self.described_shape_mismatch(&fields) {
+                        return Err(anyhow::Error::new(DescribeMismatch(mismatch)));
+                    }
+                    // ColumnInfo types come from the catalog-resolved
+                    // selected columns; the portal only READS rows at page
+                    // time, but keep the schema honest for anything that
+                    // inspects it.
+                    let schema = RelationalSchema::new(
+                        result
+                            .selected_columns
+                            .iter()
+                            .map(|c| ColumnInfo::new(c.name.clone(), c.data_type.clone(), true))
+                            .collect(),
+                    );
+                    if let Some(portal) = self.portals.get_mut(portal_name) {
+                        portal.execution_state = Some(PortalExecutionState {
+                            result: ExecutionPipelineResult {
+                                schema,
+                                rows: result.rows,
+                            },
+                            next_row: 0,
+                        });
+                    }
+                    self.emit_portal_page(portal_name, max_rows as usize)
+                        .await?;
+                    PortalFastPathOutcome::Handled
+                }
+                Err(msg) => {
+                    self.send_relational_error(&msg.to_string()).await?;
+                    PortalFastPathOutcome::Handled
+                }
+            };
+            return Ok(outcome);
+        }
+        Ok(PortalFastPathOutcome::Declined)
     }
 
     async fn emit_portal_page(&mut self, portal_name: &str, max_rows: usize) -> Result<()> {
@@ -8274,3 +8542,99 @@ fn decode_binary_vector(bytes: &[u8]) -> std::result::Result<String, String> {
 #[cfg(test)]
 #[path = "protocol_tests.rs"]
 mod tests;
+
+/// The pgwire reply to `DROP TABLE`, from the drop outcome
+/// (`Ok(true)` deleted / `Ok(false)` no such table / `Err` failed).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum DropTableReply {
+    Complete,
+    Error {
+        sqlstate: &'static str,
+        message: String,
+    },
+}
+
+/// `DROP TABLE` semantics: a missing table is `42P01` unless `IF EXISTS`; a
+/// drop that FAILED is an error even under `IF EXISTS` (the table still
+/// exists — reporting `DROP TABLE` there told clients a live table was gone,
+/// and the next `CREATE TABLE` then failed with "already exists").
+pub(crate) fn drop_table_reply(
+    table_name: &str,
+    if_exists: bool,
+    outcome: &anyhow::Result<bool>,
+) -> DropTableReply {
+    match outcome {
+        Ok(true) => DropTableReply::Complete,
+        Ok(false) if if_exists => DropTableReply::Complete,
+        Ok(false) => DropTableReply::Error {
+            sqlstate: "42P01",
+            message: format!("table \"{table_name}\" does not exist"),
+        },
+        Err(error) => {
+            if proximadb_search_types::client_argument::collection_not_found(error).is_some() {
+                return if if_exists {
+                    DropTableReply::Complete
+                } else {
+                    DropTableReply::Error {
+                        sqlstate: "42P01",
+                        message: format!("table \"{table_name}\" does not exist"),
+                    }
+                };
+            }
+            let message = proximadb_search_types::client_argument::collection_drop_failed(error)
+                .map(ToString::to_string)
+                .unwrap_or_else(|| format!("could not drop table \"{table_name}\""));
+            DropTableReply::Error {
+                sqlstate: "XX000",
+                message,
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod drop_table_reply_tests {
+    use super::*;
+
+    #[test]
+    fn missing_tables_honor_if_exists() {
+        assert_eq!(
+            drop_table_reply("t", false, &Ok(true)),
+            DropTableReply::Complete
+        );
+        assert_eq!(
+            drop_table_reply("t", true, &Ok(false)),
+            DropTableReply::Complete
+        );
+        assert!(matches!(
+            drop_table_reply("t", false, &Ok(false)),
+            DropTableReply::Error {
+                sqlstate: "42P01",
+                ..
+            }
+        ));
+    }
+
+    /// A failed drop is never `DROP TABLE` — not even under `IF EXISTS` —
+    /// and never "does not exist".
+    #[test]
+    fn failed_drops_are_errors_even_under_if_exists() {
+        for if_exists in [false, true] {
+            let failure: anyhow::Error =
+                proximadb_search_types::client_argument::CollectionDropFailed {
+                    identifier: "t".into(),
+                    code: "CATALOG_DELETE_FAILED".into(),
+                }
+                .into();
+            let reply = drop_table_reply("t", if_exists, &Err(failure));
+            assert!(
+                matches!(
+                    &reply,
+                    DropTableReply::Error { sqlstate: "XX000", message }
+                        if message.contains("CATALOG_DELETE_FAILED")
+                ),
+                "a failed drop reported {reply:?}"
+            );
+        }
+    }
+}

@@ -1540,7 +1540,6 @@ mod tests {
 
     #[test]
     fn advised_is_observe_mode_never_overrides_backend() {
-        use crate::query::route_cost_model::RouteCostModel;
         // OLAP-over-Parquet: static rule => DataFusionLocal. Warm Native as far
         // cheaper (few coalesced GETs vs DataFusion's many) so observe-mode
         // DISCLOSES the preference without flipping the backend. (The only class
@@ -1566,7 +1565,6 @@ mod tests {
 
     #[test]
     fn advised_notes_when_cost_model_concurs() {
-        use crate::query::route_cost_model::RouteCostModel;
         let shape = QueryShape {
             engages_relational: false,
             parquet_backed: false,
@@ -1589,7 +1587,6 @@ mod tests {
 
     #[test]
     fn override_off_keeps_static_backend_even_when_model_disagrees() {
-        use crate::query::route_cost_model::RouteCostModel;
         let shape = QueryShape {
             engages_relational: true,
             parquet_backed: true,
@@ -1609,7 +1606,6 @@ mod tests {
 
     #[test]
     fn override_on_flips_olap_parquet_to_the_cheaper_backend() {
-        use crate::query::route_cost_model::RouteCostModel;
         // TD-ROUTE-3: a Native flip is only eligible for a native-servable shape
         // (ungrouped scalar aggregate) — an Unknown-op shape can never be served by
         // the native-over-parquet adapter, so flipping the DECISION onto Native
@@ -1638,7 +1634,7 @@ mod tests {
     #[test]
     fn class_scoped_override_gates_on_the_decision_class() {
         use crate::query::compute_scheduler::{GeometryClass, OperationClass};
-        use crate::query::route_cost_model::{OverrideScope, RouteCostModel, shape_class};
+        use crate::query::route_cost_model::{OverrideScope, shape_class};
         // TD-EXEC-2 per-class staged go-live at the router: two shapes whose
         // refined classes differ only in operation class; the scope enables one
         // prefix. Warm identical Native-cheaper evidence under BOTH refined
@@ -1689,7 +1685,6 @@ mod tests {
 
     #[test]
     fn override_never_flips_join_bearing_plan_to_native() {
-        use crate::query::route_cost_model::RouteCostModel;
         // Same warmed model as the flip test — Native measured far cheaper —
         // but the plan carries a JOIN, which the Native arm cannot serve over
         // Parquet (TD-ROUTE-1: no multi-table native-over-parquet scan).
@@ -1721,7 +1716,6 @@ mod tests {
 
     #[test]
     fn exploration_skips_native_for_join_bearing_plan() {
-        use crate::query::route_cost_model::RouteCostModel;
         let shape = QueryShape {
             engages_relational: true,
             parquet_backed: true,
@@ -1747,7 +1741,6 @@ mod tests {
 
     #[test]
     fn rtt_budget_flip_respects_join_eligibility() {
-        use crate::query::route_cost_model::RouteCostModel;
         let shape = QueryShape {
             engages_relational: true,
             parquet_backed: true,
@@ -1773,7 +1766,6 @@ mod tests {
 
     #[test]
     fn override_on_explores_under_explored_olap_parquet_candidate() {
-        use crate::query::route_cost_model::RouteCostModel;
         // TD-ROUTE-3: exploration may only target a native-servable shape
         // (native-eligible op); the refined `op=agg` class consults the warmed
         // `olap/parquet` ancestor cells via hierarchical fallback.
@@ -1802,7 +1794,6 @@ mod tests {
 
     #[test]
     fn exploration_never_targets_freshness_critical_oltp() {
-        use crate::query::route_cost_model::RouteCostModel;
         let shape = QueryShape {
             engages_relational: false,
             parquet_backed: true,
@@ -1830,7 +1821,6 @@ mod tests {
 
     #[test]
     fn override_never_flips_freshness_critical_oltp() {
-        use crate::query::route_cost_model::RouteCostModel;
         // Point/OLTP shape: static => Native, MUST stay Native (strong freshness)
         // no matter what the cost model says.
         let shape = QueryShape {
@@ -1907,7 +1897,6 @@ mod tests {
 
     #[test]
     fn override_sets_decision_source_label() {
-        use crate::query::route_cost_model::RouteCostModel;
         // TD-ROUTE-3: native-eligible shape so the override→Native flip is a valid
         // (servable) route, not a mis-attribution.
         let shape = QueryShape {

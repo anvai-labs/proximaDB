@@ -37,9 +37,9 @@ use super::ast::{
 use nom::{
     IResult,
     branch::alt,
-    bytes::complete::{tag, tag_no_case, take_while1},
-    character::complete::{alpha1, alphanumeric1, char, digit1, multispace0, multispace1},
-    combinator::{map, map_res, opt, recognize, value},
+    bytes::complete::{tag, tag_no_case},
+    character::complete::{char, digit1, multispace0, multispace1},
+    combinator::{map, map_res, opt, value},
     multi::{many0, separated_list0, separated_list1},
     sequence::{delimited, preceded, separated_pair, tuple},
 };
@@ -80,7 +80,17 @@ impl QueryParser {
     /// Parse a Cypher-like query string into a CompiledPattern (AST)
     pub fn parse(&self, input: &str) -> QueryResult<CompiledPattern> {
         match parse_query(input) {
-            Ok((_, compiled_pattern)) => Ok(compiled_pattern),
+            // Full-consumption discipline (TD-GRAPH-4 step 2): leftover
+            // input is a parse error, not silently discarded — trailing
+            // garbage (`@@@`, comments, a stray `;`) must not silently
+            // truncate the query into a "valid" prefix.
+            Ok((remaining, compiled_pattern)) if remaining.trim().is_empty() => {
+                Ok(compiled_pattern)
+            }
+            Ok((remaining, _)) => Err(ProximaDBError::InvalidInput(format!(
+                "Unexpected input remaining after parsing: '{}'",
+                remaining.chars().take(50).collect::<String>()
+            ))),
             Err(e) => Err(ProximaDBError::InvalidInput(format!(
                 "Failed to parse query: {}",
                 e
@@ -97,84 +107,22 @@ impl Default for QueryParser {
 
 // --- Nom Parser Combinators ---
 
-// Helper to parse identifiers (variable names, labels, property keys)
-fn identifier(input: &str) -> IResult<&str, String> {
-    map(
-        recognize(tuple((
-            alt((alpha1, tag("_"))),
-            many0(alt((alphanumeric1, tag("_")))),
-        ))),
-        String::from,
-    )(input)
+fn any_identifier(input: &str) -> IResult<&str, String> {
+    lexemes::any_identifier(input)
 }
 
-// Helper to parse string literals (e.g., "value" or 'value')
 fn string_literal(input: &str) -> IResult<&str, String> {
-    map(
-        alt((
-            delimited(
-                char::<&str, nom::error::Error<_>>('"'),
-                take_while1(|c| c != '"'),
-                char('"'),
-            ),
-            delimited(
-                char::<&str, nom::error::Error<_>>('\''),
-                take_while1(|c| c != '\''),
-                char('\''),
-            ),
-        )),
-        |s| s.to_string(),
-    )(input)
+    lexemes::string_literal(input)
 }
 
-// Helper to parse integer literals
-fn integer_literal(input: &str) -> IResult<&str, i64> {
-    map_res(take_while1(|c: char| c.is_ascii_digit()), |s: &str| {
-        s.parse::<i64>()
-    })(input)
-}
-
-// Helper to parse boolean literals
-fn boolean_literal(input: &str) -> IResult<&str, bool> {
-    alt((map(tag("true"), |_| true), map(tag("false"), |_| false)))(input)
-}
-
-// Helper to parse property values (simplified to string, int, bool for now)
 fn property_value(input: &str) -> IResult<&str, serde_json::Value> {
-    alt((
-        map(string_literal, serde_json::Value::String),
-        map(integer_literal, |i| {
-            serde_json::Value::Number(serde_json::Number::from(i))
-        }),
-        map(boolean_literal, serde_json::Value::Bool),
-    ))(input)
+    lexemes::property_value::<nom::error::Error<&str>>(input)
 }
 
-// Helper to parse property assignments (e.g., key: value)
-fn property_assignment(input: &str) -> IResult<&str, (String, PropertyConstraint)> {
-    map(
-        separated_pair(
-            identifier,
-            delimited(multispace0, char(':'), multispace0),
-            property_value,
-        ),
-        |(key, value)| (key, PropertyConstraint::Equals(value)),
-    )(input)
-}
-
-// Helper to parse property map (e.g., {key: value, key2: value2})
+// Helper to parse property map — the shared constraint map (permissive
+// spacing + quoted keys now on the read path too; identifier parity).
 fn property_map(input: &str) -> IResult<&str, HashMap<String, PropertyConstraint>> {
-    map(
-        delimited(
-            char('{'),
-            separated_list0(
-                delimited(multispace0, char(','), multispace0),
-                property_assignment,
-            ),
-            char('}'),
-        ),
-        |assignments| assignments.into_iter().collect(),
-    )(input)
+    lexemes::constraint_map(input)
 }
 
 // Parse a node pattern (e.g., (n:Label {prop: "val"}), (:Label), or anonymous ())
@@ -188,15 +136,18 @@ fn parse_node_pattern(input: &str) -> IResult<&str, NodePattern> {
         delimited(
             char('('),
             tuple((
-                opt(identifier),                          // Optional variable (anonymous if absent)
-                opt(preceded(char(':'), identifier)),     // Optional Label
+                preceded(multispace0, opt(any_identifier)), // Optional variable (backticks ok)
+                // Labels: :A or :A:B (multi-label, TD-GRAPH-4 step 3 —
+                // the modality grammar's shape; previously single-only)
+                many0(preceded(char(':'), any_identifier)),
                 opt(preceded(multispace0, property_map)), // Optional Properties
+                multispace0,
             )),
             char(')'),
         ),
-        move |(variable_opt, label_opt, properties_opt)| NodePattern {
+        move |(variable_opt, labels, properties_opt, _)| NodePattern {
             variable: variable_opt.unwrap_or_else(|| format!("__anon_{anon_seed}")),
-            labels: label_opt.map(|l| vec![l]).unwrap_or_default(),
+            labels,
             properties: properties_opt.unwrap_or_default(),
             optional: false, // Not handling OPTIONAL MATCH yet
         },
@@ -222,12 +173,17 @@ fn parse_edge_direction_right(input: &str) -> IResult<&str, bool> {
 fn parse_edge_spec(input: &str) -> IResult<&str, EdgeSpec> {
     map(
         tuple((
-            opt(identifier),                          // Optional variable
-            opt(preceded(char(':'), identifier)),     // Optional edge type
+            opt(any_identifier), // Optional variable
+            // Edge types with ALTERNATION :KNOWS|LIKES (the modality
+            // grammar's shape — the full list kept; previously single)
+            opt(preceded(
+                char(':'),
+                separated_list1(char('|'), any_identifier),
+            )),
             opt(preceded(multispace0, property_map)), // Optional properties
         )),
-        |(variable_opt, edge_type_opt, properties_opt)| {
-            let edge_types = edge_type_opt.map(|t| vec![t]).unwrap_or_default();
+        |(variable_opt, edge_types_opt, properties_opt)| {
+            let edge_types = edge_types_opt.unwrap_or_default();
             let properties = properties_opt.unwrap_or_default();
             (variable_opt, edge_types, properties)
         },
@@ -387,39 +343,125 @@ fn parse_path_chain(input: &str) -> IResult<&str, (Vec<NodePattern>, Vec<EdgePat
 
 // Parse WHERE clause conditions
 fn parse_where_condition(input: &str) -> IResult<&str, WhereClause> {
-    alt((
-        // Logical AND
-        map(
-            tuple((
-                parse_where_primary,
-                preceded(
-                    delimited(multispace1, tag("AND"), multispace1),
-                    parse_where_condition,
-                ),
-            )),
-            |(left, right)| WhereClause::And(Box::new(left), Box::new(right)),
+    // FLAT LEFT-ASSOCIATIVE chaining (TD-GRAPH-4 step 3, review M4): the
+    // retired modality grammar — the LIVE public semantics — chained
+    // AND/OR/XOR at one precedence level, folding left. The previous
+    // tiered recursion (AND above OR above XOR) silently flipped the
+    // boolean meaning of mixed chains (`a AND b OR c` parsed as
+    // a∧(b∨c) instead of (a∧b)∨c). The decision is now deliberate and
+    // PINNED (where_mixed_precedence corpus entries).
+    let (input, first) = parse_where_primary(input)?;
+    let result = many0(tuple((
+        delimited(
+            multispace1,
+            alt((tag_no_case("AND"), tag_no_case("OR"), tag_no_case("XOR"))),
+            multispace1,
         ),
-        // Logical OR
-        map(
-            tuple((
-                parse_where_primary,
-                preceded(
-                    delimited(multispace1, tag("OR"), multispace1),
-                    parse_where_condition,
-                ),
-            )),
-            |(left, right)| WhereClause::Or(Box::new(left), Box::new(right)),
-        ),
-        // Primary condition
         parse_where_primary,
-    ))(input)
+    )))(input);
+    match result {
+        Ok((remaining, pairs)) => {
+            let mut current = first;
+            for (op, right) in pairs {
+                current = match op.to_uppercase().as_str() {
+                    "AND" => WhereClause::And(Box::new(current), Box::new(right)),
+                    "OR" => WhereClause::Or(Box::new(current), Box::new(right)),
+                    _ => WhereClause::Xor(Box::new(current), Box::new(right)),
+                };
+            }
+            Ok((remaining, current))
+        }
+        Err(e) => Err(e),
+    }
 }
 
 fn parse_where_primary(input: &str) -> IResult<&str, WhereClause> {
     alt((
+        // STARTS WITH / ENDS WITH / CONTAINS (the modality grammar's string
+        // predicates; TD-GRAPH-4 step-3 parity)
+        map(
+            tuple((
+                any_identifier,
+                char('.'),
+                any_identifier,
+                delimited(multispace1, tag_no_case("STARTS"), multispace1),
+                tag_no_case("WITH"),
+                multispace1,
+                string_literal,
+            )),
+            |(variable, _, property, _, _, _, value)| WhereClause::Property {
+                variable,
+                property,
+                constraint: PropertyConstraint::StartsWith(value),
+            },
+        ),
+        map(
+            tuple((
+                any_identifier,
+                char('.'),
+                any_identifier,
+                delimited(multispace1, tag_no_case("ENDS"), multispace1),
+                tag_no_case("WITH"),
+                multispace1,
+                string_literal,
+            )),
+            |(variable, _, property, _, _, _, value)| WhereClause::Property {
+                variable,
+                property,
+                constraint: PropertyConstraint::EndsWith(value),
+            },
+        ),
+        map(
+            tuple((
+                any_identifier,
+                char('.'),
+                any_identifier,
+                delimited(multispace1, tag_no_case("CONTAINS"), multispace1),
+                string_literal,
+            )),
+            |(variable, _, property, _, value)| WhereClause::Property {
+                variable,
+                property,
+                constraint: PropertyConstraint::Contains(value),
+            },
+        ),
+        // IS NULL / IS NOT NULL (the modality grammar's shapes)
+        map(
+            tuple((
+                any_identifier,
+                char('.'),
+                any_identifier,
+                delimited(multispace1, tag_no_case("IS"), multispace1),
+                tag_no_case("NULL"),
+            )),
+            |(variable, _, property, _, _)| WhereClause::Property {
+                variable,
+                property,
+                constraint: PropertyConstraint::NotExists,
+            },
+        ),
+        map(
+            tuple((
+                any_identifier,
+                char('.'),
+                any_identifier,
+                delimited(multispace1, tag_no_case("IS"), multispace1),
+                tag_no_case("NOT"),
+                multispace1,
+                tag_no_case("NULL"),
+            )),
+            |(variable, _, property, _, _, _, _)| WhereClause::Property {
+                variable,
+                property,
+                constraint: PropertyConstraint::Exists,
+            },
+        ),
         // NOT condition
         map(
-            preceded(tuple((tag("NOT"), multispace1)), parse_where_primary),
+            preceded(
+                tuple((tag_no_case("NOT"), multispace1)),
+                parse_where_primary,
+            ),
             |cond| WhereClause::Not(Box::new(cond)),
         ),
         // Parenthesized condition
@@ -434,28 +476,63 @@ fn parse_where_primary(input: &str) -> IResult<&str, WhereClause> {
 }
 
 fn parse_where_property_condition(input: &str) -> IResult<&str, WhereClause> {
-    map(
-        tuple((
-            identifier, // variable
-            char('.'),
-            identifier, // property
-            delimited(multispace0, parse_comparison_op, multispace0),
-            property_value, // value
-        )),
-        |(variable, _, property, operator, value)| WhereClause::Property {
-            variable,
-            property,
-            constraint: match operator {
-                "=" => PropertyConstraint::Equals(value),
-                ">" => PropertyConstraint::GreaterThan(value),
-                "<" => PropertyConstraint::LessThan(value),
-                ">=" => PropertyConstraint::GreaterOrEqual(value),
-                "<=" => PropertyConstraint::LessOrEqual(value),
-                "!=" => PropertyConstraint::NotEquals(value),
-                _ => PropertyConstraint::Equals(value),
+    alt((
+        // IN predicate: n.tag IN ["a", "b"] (TD-GRAPH-4 step 3 — the
+        // modality grammar's shape; previously unsupported, so queries
+        // using IN failed the whole WHERE parse).
+        map(
+            tuple((
+                any_identifier,
+                char('.'),
+                any_identifier,
+                delimited(multispace1, tag_no_case("IN"), multispace1),
+                delimited(
+                    char('['),
+                    separated_list0(
+                        delimited(multispace0, char(','), multispace0),
+                        property_value,
+                    ),
+                    char(']'),
+                ),
+            )),
+            |(variable, _, property, _, values)| WhereClause::Property {
+                variable,
+                property,
+                constraint: PropertyConstraint::In(values),
             },
-        },
-    )(input)
+        ),
+        // Comparison: n.age > 30
+        map(
+            tuple((
+                any_identifier, // variable (backticks ok — modality shape)
+                char('.'),
+                any_identifier, // property
+                delimited(multispace0, parse_comparison_op, multispace0),
+                property_value, // value
+            )),
+            |(variable, _, property, operator, value)| WhereClause::Property {
+                variable,
+                property,
+                constraint: match operator {
+                    "=" => PropertyConstraint::Equals(value),
+                    ">" => PropertyConstraint::GreaterThan(value),
+                    "<" => PropertyConstraint::LessThan(value),
+                    ">=" => PropertyConstraint::GreaterOrEqual(value),
+                    "<=" => PropertyConstraint::LessOrEqual(value),
+                    "!=" | "<>" => PropertyConstraint::NotEquals(value),
+                    "=~" => match value {
+                        // Regex applies to string RHS; a non-string RHS
+                        // falls back to Equals — the modality grammar's
+                        // behavior (review R2-F2: Regex(other.to_string())
+                        // silently diverged on e.g. n.age =~ 30).
+                        serde_json::Value::String(re) => PropertyConstraint::Regex(re),
+                        other => PropertyConstraint::Equals(other),
+                    },
+                    _ => PropertyConstraint::Equals(value),
+                },
+            },
+        ),
+    ))(input)
 }
 
 fn parse_comparison_op(input: &str) -> IResult<&str, &str> {
@@ -463,6 +540,8 @@ fn parse_comparison_op(input: &str) -> IResult<&str, &str> {
         tag(">="),
         tag("<="),
         tag("!="),
+        tag("<>"), // NotEquals alias (the modality grammar's shape)
+        tag("=~"), // Regex match (the modality grammar's shape)
         tag("="),
         tag(">"),
         tag("<"),
@@ -471,19 +550,41 @@ fn parse_comparison_op(input: &str) -> IResult<&str, &str> {
 
 // Parse WHERE clause
 fn parse_where_clause(input: &str) -> IResult<&str, WhereClause> {
-    preceded(tag("WHERE"), preceded(multispace1, parse_where_condition))(input)
+    preceded(
+        tag_no_case("WHERE"),
+        preceded(multispace1, parse_where_condition),
+    )(input)
 }
 
 // Parse aggregation functions
 fn parse_aggregation(input: &str) -> IResult<&str, PropertyProjection> {
     alt((
-        // COUNT(*)
+        // COUNT(*) — and COUNT(DISTINCT expr), which reduces to Count
+        // (the modality grammar's simplification; TD-GRAPH-4 step 3)
         map(
             tuple((
                 tag_no_case("COUNT"),
                 delimited(
                     char('('),
-                    delimited(multispace0, char('*'), multispace0),
+                    delimited(
+                        multispace0,
+                        // Both branches discard their output (unified to
+                        // &str): `*`, or DISTINCT + exactly one identifier
+                        // (the modality grammar's shape — review F2: the
+                        // take_while form accepted arbitrary garbage and
+                        // misparsed nested close-parens).
+                        alt((
+                            map(tag("*"), |_| ""),
+                            map(
+                                preceded(
+                                    tuple((tag_no_case("DISTINCT"), multispace1)),
+                                    any_identifier,
+                                ),
+                                |_| "",
+                            ),
+                        )),
+                        multispace0,
+                    ),
                     char(')'),
                 ),
             )),
@@ -497,7 +598,7 @@ fn parse_aggregation(input: &str) -> IResult<&str, PropertyProjection> {
                     char('('),
                     delimited(
                         multispace0,
-                        separated_pair(identifier, char('.'), identifier),
+                        separated_pair(any_identifier, char('.'), any_identifier),
                         multispace0,
                     ),
                     char(')'),
@@ -516,7 +617,7 @@ fn parse_aggregation(input: &str) -> IResult<&str, PropertyProjection> {
                     char('('),
                     delimited(
                         multispace0,
-                        separated_pair(identifier, char('.'), identifier),
+                        separated_pair(any_identifier, char('.'), any_identifier),
                         multispace0,
                     ),
                     char(')'),
@@ -535,7 +636,7 @@ fn parse_aggregation(input: &str) -> IResult<&str, PropertyProjection> {
                     char('('),
                     delimited(
                         multispace0,
-                        separated_pair(identifier, char('.'), identifier),
+                        separated_pair(any_identifier, char('.'), any_identifier),
                         multispace0,
                     ),
                     char(')'),
@@ -554,7 +655,7 @@ fn parse_aggregation(input: &str) -> IResult<&str, PropertyProjection> {
                     char('('),
                     delimited(
                         multispace0,
-                        separated_pair(identifier, char('.'), identifier),
+                        separated_pair(any_identifier, char('.'), any_identifier),
                         multispace0,
                     ),
                     char(')'),
@@ -571,7 +672,7 @@ fn parse_aggregation(input: &str) -> IResult<&str, PropertyProjection> {
 // Parse a MATCH clause with support for both nodes and edge patterns
 fn parse_match_clause(input: &str) -> IResult<&str, (Vec<NodePattern>, Vec<EdgePattern>)> {
     preceded(
-        tag("MATCH"),
+        tag_no_case("MATCH"),
         preceded(
             multispace1,
             map(
@@ -606,8 +707,8 @@ fn parse_return_item(input: &str) -> IResult<&str, (String, PropertyProjection)>
             tuple((
                 parse_aggregation,
                 opt(preceded(
-                    delimited(multispace1, tag("AS"), multispace1),
-                    identifier,
+                    delimited(multispace1, tag_no_case("AS"), multispace1),
+                    any_identifier,
                 )),
             )),
             |(agg, alias_opt)| {
@@ -625,12 +726,12 @@ fn parse_return_item(input: &str) -> IResult<&str, (String, PropertyProjection)>
         // Property projection (variable.property AS alias)
         map(
             tuple((
-                identifier,
+                any_identifier,
                 char('.'),
-                identifier,
+                any_identifier,
                 opt(preceded(
-                    delimited(multispace1, tag("AS"), multispace1),
-                    identifier,
+                    delimited(multispace1, tag_no_case("AS"), multispace1),
+                    any_identifier,
                 )),
             )),
             |(var, _, prop, alias_opt)| {
@@ -644,34 +745,51 @@ fn parse_return_item(input: &str) -> IResult<&str, (String, PropertyProjection)>
                 )
             },
         ),
-        // Simple variable
-        map(identifier, |var| {
-            (var.clone(), PropertyProjection::Variable(var))
-        }),
+        // Simple variable — with optional alias (`n AS x`; TD-GRAPH-4
+        // step 3: WITH n AS x previously failed because only the
+        // property/aggregation arms carried AS)
+        map(
+            tuple((
+                any_identifier,
+                opt(preceded(
+                    delimited(multispace1, tag_no_case("AS"), multispace1),
+                    any_identifier,
+                )),
+            )),
+            |(var, alias_opt)| {
+                let name = alias_opt.unwrap_or_else(|| var.clone());
+                (name, PropertyProjection::Variable(var))
+            },
+        ),
     ))(input)
 }
 
 // Parse DISTINCT keyword
 fn parse_distinct(input: &str) -> IResult<&str, bool> {
-    map(opt(preceded(multispace1, tag("DISTINCT"))), |d| d.is_some())(input)
+    map(opt(preceded(multispace1, tag_no_case("DISTINCT"))), |d| {
+        d.is_some()
+    })(input)
 }
 
 // Parse ORDER BY clause
 fn parse_order_by(input: &str) -> IResult<&str, Vec<(String, bool)>> {
     preceded(
-        delimited(multispace1, tag("ORDER"), multispace1),
+        delimited(multispace1, tag_no_case("ORDER"), multispace1),
         preceded(
-            tag("BY"),
+            tag_no_case("BY"),
             preceded(
                 multispace1,
                 separated_list1(
                     delimited(multispace0, char(','), multispace0),
                     map(
                         tuple((
-                            identifier,
+                            any_identifier,
                             opt(preceded(
                                 multispace1,
-                                alt((map(tag("ASC"), |_| true), map(tag("DESC"), |_| false))),
+                                alt((
+                                    map(tag_no_case("ASC"), |_| true),
+                                    map(tag_no_case("DESC"), |_| false),
+                                )),
                             )),
                         )),
                         |(var, asc_opt)| (var, asc_opt.unwrap_or(true)),
@@ -685,7 +803,7 @@ fn parse_order_by(input: &str) -> IResult<&str, Vec<(String, bool)>> {
 // Parse LIMIT clause
 fn parse_limit(input: &str) -> IResult<&str, usize> {
     preceded(
-        delimited(multispace1, tag("LIMIT"), multispace1),
+        delimited(multispace1, tag_no_case("LIMIT"), multispace1),
         map_res(digit1, |s: &str| s.parse::<usize>()),
     )(input)
 }
@@ -693,7 +811,7 @@ fn parse_limit(input: &str) -> IResult<&str, usize> {
 // Parse SKIP clause
 fn parse_skip(input: &str) -> IResult<&str, usize> {
     preceded(
-        delimited(multispace1, tag("SKIP"), multispace1),
+        delimited(multispace1, tag_no_case("SKIP"), multispace1),
         map_res(digit1, |s: &str| s.parse::<usize>()),
     )(input)
 }
@@ -701,7 +819,7 @@ fn parse_skip(input: &str) -> IResult<&str, usize> {
 // Parse enhanced RETURN clause
 fn parse_return_clause(input: &str) -> IResult<&str, ReturnSpec> {
     preceded(
-        tag("RETURN"),
+        tag_no_case("RETURN"),
         map(
             tuple((
                 parse_distinct,
@@ -732,448 +850,24 @@ fn parse_return_clause(input: &str) -> IResult<&str, ReturnSpec> {
 }
 
 // ==================== Mutation Clause Parsers ====================
+// (the grammar lives in parser/write_seam.rs — the seam module below)
 
-// Parse a property value map for CREATE/SET operations
-#[allow(dead_code)]
-fn parse_property_value_map(input: &str) -> IResult<&str, HashMap<String, serde_json::Value>> {
-    map(
-        delimited(
-            char('{'),
-            separated_list0(
-                delimited(multispace0, char(','), multispace0),
-                separated_pair(
-                    identifier,
-                    delimited(multispace0, char(':'), multispace0),
-                    property_value,
-                ),
-            ),
-            char('}'),
-        ),
-        |pairs| pairs.into_iter().collect(),
-    )(input)
-}
+// The write-clause seam: intentionally-retained full-Cypher grammar that no
+// runtime path wires up yet (see parser/write_seam.rs for the rationale and
+// the convergence plan). The module is `pub` because its full-query entry
+// is the crate's declared convergence surface (TD-GRAPH-4); its private
+// combinators are exercised by the tests below and need no allowance.
+pub mod lexemes;
+pub mod write_seam;
 
-// Parse a CREATE node specification (n:Label {props})
-#[allow(dead_code)]
-fn parse_create_node_spec(input: &str) -> IResult<&str, CreateNodeSpec> {
-    map(
-        delimited(
-            char('('),
-            tuple((
-                opt(identifier),                                      // Optional variable
-                opt(preceded(char(':'), identifier)),                 // Optional label
-                opt(preceded(multispace0, parse_property_value_map)), // Optional properties
-            )),
-            char(')'),
-        ),
-        |(variable, label_opt, properties_opt)| CreateNodeSpec {
-            variable,
-            labels: label_opt.map(|l| vec![l]).unwrap_or_default(),
-            properties: properties_opt.unwrap_or_default(),
-        },
-    )(input)
-}
-
-// Parse a CREATE edge specification (a)-[r:TYPE {props}]->(b)
-#[allow(dead_code)]
-fn parse_create_edge_pattern(
-    input: &str,
-) -> IResult<&str, (CreateNodeSpec, CreateEdgeSpec, CreateNodeSpec)> {
-    map(
-        tuple((
-            parse_create_node_spec,
-            preceded(multispace0, parse_create_edge_spec),
-            preceded(multispace0, parse_create_node_spec),
-        )),
-        |(from_node, (edge_var, edge_type, edge_props, _direction), to_node)| {
-            let from_var = from_node
-                .variable
-                .clone()
-                .unwrap_or_else(|| "_from".to_string());
-            let to_var = to_node
-                .variable
-                .clone()
-                .unwrap_or_else(|| "_to".to_string());
-
-            let edge = CreateEdgeSpec {
-                variable: edge_var,
-                from_variable: from_var,
-                to_variable: to_var,
-                edge_type: edge_type.unwrap_or_default(),
-                properties: edge_props,
-            };
-
-            (from_node, edge, to_node)
-        },
-    )(input)
-}
-
-// Parse edge spec for CREATE: -[r:TYPE {props}]->
-#[allow(dead_code)]
-fn parse_create_edge_spec(input: &str) -> IResult<&str, CreateEdgeSpecParts> {
-    map(
-        tuple((
-            parse_edge_direction_left,
-            delimited(
-                char('['),
-                tuple((
-                    opt(identifier),                                      // Variable
-                    opt(preceded(char(':'), identifier)),                 // Edge type
-                    opt(preceded(multispace0, parse_property_value_map)), // Properties
-                )),
-                char(']'),
-            ),
-            parse_edge_direction_right,
-        )),
-        |(left_arrow, (variable, edge_type, properties_opt), right_arrow)| {
-            let direction = match (left_arrow, right_arrow) {
-                (false, true) => EdgeDirection::Outgoing,
-                (true, false) => EdgeDirection::Incoming,
-                _ => EdgeDirection::Bidirectional,
-            };
-            (
-                variable,
-                edge_type,
-                properties_opt.unwrap_or_default(),
-                direction,
-            )
-        },
-    )(input)
-}
-
-// Parse CREATE clause
-#[allow(dead_code)]
-fn parse_create_clause(input: &str) -> IResult<&str, CreateClause> {
-    preceded(
-        tag("CREATE"),
-        preceded(
-            multispace1,
-            map(
-                separated_list1(
-                    delimited(multispace0, char(','), multispace0),
-                    alt((
-                        // Edge pattern: (a)-[r:TYPE]->(b)
-                        map(parse_create_edge_pattern, |(from, edge, to)| {
-                            (vec![from, to], vec![edge])
-                        }),
-                        // Simple node: (n:Label {props})
-                        map(parse_create_node_spec, |node| (vec![node], vec![])),
-                    )),
-                ),
-                |patterns| {
-                    let mut nodes = Vec::new();
-                    let mut edges = Vec::new();
-                    for (mut ns, mut es) in patterns {
-                        nodes.append(&mut ns);
-                        edges.append(&mut es);
-                    }
-                    CreateClause { nodes, edges }
-                },
-            ),
-        ),
-    )(input)
-}
-
-// Parse DELETE clause
-#[allow(dead_code)]
-fn parse_delete_clause(input: &str) -> IResult<&str, DeleteClause> {
-    map(
-        tuple((
-            opt(preceded(tag("DETACH"), multispace1)),
-            preceded(
-                tag("DELETE"),
-                preceded(
-                    multispace1,
-                    separated_list1(delimited(multispace0, char(','), multispace0), identifier),
-                ),
-            ),
-        )),
-        |(detach_opt, variables)| DeleteClause {
-            variables,
-            detach: detach_opt.is_some(),
-        },
-    )(input)
-}
-
-// Parse SET item: n.prop = value OR n:Label OR n = {props} OR n += {props}
-#[allow(dead_code)]
-fn parse_set_item(input: &str) -> IResult<&str, SetItem> {
-    alt((
-        // Property assignment: n.prop = value
-        map(
-            tuple((
-                identifier,
-                char('.'),
-                identifier,
-                delimited(multispace0, char('='), multispace0),
-                property_value,
-            )),
-            |(variable, _, property, _, value)| SetItem::Property {
-                variable,
-                property,
-                value,
-            },
-        ),
-        // Add label: n:Label
-        map(
-            tuple((identifier, char(':'), identifier)),
-            |(variable, _, label)| SetItem::AddLabel { variable, label },
-        ),
-        // Merge properties: n += {props}
-        map(
-            tuple((
-                identifier,
-                delimited(multispace0, tag("+="), multispace0),
-                parse_property_value_map,
-            )),
-            |(variable, _, properties)| SetItem::MergeProperties {
-                variable,
-                properties,
-            },
-        ),
-        // Replace all properties: n = {props}
-        map(
-            tuple((
-                identifier,
-                delimited(multispace0, char('='), multispace0),
-                parse_property_value_map,
-            )),
-            |(variable, _, properties)| SetItem::AllProperties {
-                variable,
-                properties,
-            },
-        ),
-    ))(input)
-}
-
-// Parse SET clause
-#[allow(dead_code)]
-fn parse_set_clause(input: &str) -> IResult<&str, SetClause> {
-    preceded(
-        tag("SET"),
-        preceded(
-            multispace1,
-            map(
-                separated_list1(
-                    delimited(multispace0, char(','), multispace0),
-                    parse_set_item,
-                ),
-                |items| SetClause { items },
-            ),
-        ),
-    )(input)
-}
-
-// Parse REMOVE item: n.prop OR n:Label
-#[allow(dead_code)]
-fn parse_remove_item(input: &str) -> IResult<&str, RemoveItem> {
-    alt((
-        // Remove property: n.prop
-        map(
-            tuple((identifier, char('.'), identifier)),
-            |(variable, _, property)| RemoveItem::Property { variable, property },
-        ),
-        // Remove label: n:Label
-        map(
-            tuple((identifier, char(':'), identifier)),
-            |(variable, _, label)| RemoveItem::Label { variable, label },
-        ),
-    ))(input)
-}
-
-// Parse REMOVE clause
-#[allow(dead_code)]
-fn parse_remove_clause(input: &str) -> IResult<&str, RemoveClause> {
-    preceded(
-        tag("REMOVE"),
-        preceded(
-            multispace1,
-            map(
-                separated_list1(
-                    delimited(multispace0, char(','), multispace0),
-                    parse_remove_item,
-                ),
-                |items| RemoveClause { items },
-            ),
-        ),
-    )(input)
-}
-
-// Parse MERGE clause
-#[allow(dead_code)]
-fn parse_merge_clause(input: &str) -> IResult<&str, MergeClause> {
-    map(
-        tuple((
-            preceded(
-                tag("MERGE"),
-                preceded(
-                    multispace1,
-                    map(
-                        separated_list1(
-                            delimited(multispace0, char(','), multispace0),
-                            alt((
-                                map(parse_path_segment, |(from, edge, to)| {
-                                    (vec![from, to], vec![edge])
-                                }),
-                                map(parse_node_pattern, |node| (vec![node], vec![])),
-                            )),
-                        ),
-                        |patterns| {
-                            let mut nodes = Vec::new();
-                            let mut edges = Vec::new();
-                            for (mut ns, mut es) in patterns {
-                                nodes.append(&mut ns);
-                                edges.append(&mut es);
-                            }
-                            MatchPattern {
-                                nodes,
-                                edges,
-                                paths: Vec::new(),
-                                where_clause: None,
-                            }
-                        },
-                    ),
-                ),
-            ),
-            opt(preceded(
-                delimited(multispace1, tag("ON CREATE"), multispace1),
-                parse_set_clause,
-            )),
-            opt(preceded(
-                delimited(multispace1, tag("ON MATCH"), multispace1),
-                parse_set_clause,
-            )),
-        )),
-        |(pattern, on_create, on_match)| MergeClause {
-            pattern,
-            on_create,
-            on_match,
-        },
-    )(input)
-}
-
-// Parse OPTIONAL MATCH clause
-#[allow(dead_code)]
-fn parse_optional_match_clause(input: &str) -> IResult<&str, (Vec<NodePattern>, Vec<EdgePattern>)> {
-    map(
-        preceded(tag("OPTIONAL"), preceded(multispace1, parse_match_clause)),
-        |(nodes, edges)| {
-            // Mark all nodes and edges as optional
-            let optional_nodes = nodes
-                .into_iter()
-                .map(|mut n| {
-                    n.optional = true;
-                    n
-                })
-                .collect();
-            let optional_edges = edges
-                .into_iter()
-                .map(|mut e| {
-                    e.optional = true;
-                    e
-                })
-                .collect();
-            (optional_nodes, optional_edges)
-        },
-    )(input)
-}
-
-// Parse WITH clause
-#[allow(dead_code)]
-fn parse_with_clause(input: &str) -> IResult<&str, WithClause> {
-    preceded(
-        tag("WITH"),
-        map(
-            tuple((
-                parse_distinct,
-                preceded(
-                    multispace1,
-                    separated_list1(
-                        delimited(multispace0, char(','), multispace0),
-                        parse_return_item,
-                    ),
-                ),
-                opt(parse_order_by),
-                opt(parse_skip),
-                opt(parse_limit),
-                opt(preceded(multispace1, parse_where_clause)),
-            )),
-            |(distinct, items, order_by_opt, skip_opt, limit_opt, where_opt)| WithClause {
-                projections: items,
-                distinct,
-                order_by: order_by_opt.unwrap_or_default(),
-                limit: limit_opt,
-                skip: skip_opt,
-                where_clause: where_opt,
-            },
-        ),
-    )(input)
-}
-
-// Parse a full Cypher query with all clause types
-#[allow(dead_code)]
-fn parse_cypher_query(input: &str) -> IResult<&str, CypherQuery> {
-    map(
-        tuple((
-            // Reading clauses (MATCH, OPTIONAL MATCH)
-            many0(preceded(
-                multispace0,
-                alt((
-                    // OPTIONAL MATCH
-                    map(parse_optional_match_clause, |(nodes, edges)| {
-                        ReadingClause::Match {
-                            pattern: MatchPattern {
-                                nodes,
-                                edges,
-                                paths: Vec::new(),
-                                where_clause: None,
-                            },
-                            optional: true,
-                        }
-                    }),
-                    // Regular MATCH with optional WHERE
-                    map(
-                        tuple((
-                            parse_match_clause,
-                            opt(preceded(multispace1, parse_where_clause)),
-                        )),
-                        |((nodes, edges), where_opt)| ReadingClause::Match {
-                            pattern: MatchPattern {
-                                nodes,
-                                edges,
-                                paths: Vec::new(),
-                                where_clause: where_opt,
-                            },
-                            optional: false,
-                        },
-                    ),
-                )),
-            )),
-            // WITH clauses
-            many0(preceded(multispace0, parse_with_clause)),
-            // Updating clauses (CREATE, DELETE, SET, REMOVE, MERGE)
-            many0(preceded(
-                multispace0,
-                alt((
-                    map(parse_create_clause, UpdatingClause::Create),
-                    map(parse_delete_clause, UpdatingClause::Delete),
-                    map(parse_set_clause, UpdatingClause::Set),
-                    map(parse_remove_clause, UpdatingClause::Remove),
-                    map(parse_merge_clause, UpdatingClause::Merge),
-                )),
-            )),
-            // Optional RETURN clause
-            opt(preceded(multispace0, parse_return_clause)),
-        )),
-        |(reading_clauses, with_clauses, updating_clauses, return_spec)| CypherQuery {
-            reading_clauses,
-            updating_clauses,
-            with_clauses,
-            union_clauses: Vec::new(), // TD-019: UNION clause support
-            return_spec,
-        },
-    )(input)
-}
+// The seam re-exports through this scope so the ported tests (mod tests
+// below) and future callers resolve the grammar names via `super::*`,
+// exactly as when everything was one file. The module itself is `pub`
+// because its full-query entry (`write_seam::parse_cypher_query`) is the
+// crate's declared convergence surface — TD-GRAPH-4's corpus pin (in the
+// modality crate, which depends on this one) drives it from outside.
+#[cfg(test)]
+use write_seam::*;
 
 // Main query parser
 fn parse_query(input: &str) -> IResult<&str, CompiledPattern> {
@@ -1770,5 +1464,100 @@ mod tests {
         );
         assert_eq!(props.get("age"), Some(&serde_json::json!(25)));
         assert_eq!(props.get("active"), Some(&serde_json::Value::Bool(true)));
+    }
+    #[test]
+    fn test_shared_lexeme_superset_gains() {
+        // TD-GRAPH-4 step 1: the seam adopted the modality's lexeme
+        // superset — floats (incl. negatives/exponents), null, arrays,
+        // negative integers, case-insensitive booleans, quoted keys.
+        let (_, m) = lexemes::property_value_map::<nom::error::Error<&str>>(
+            "{score: -1.5e2, ratio: 2.5, missing: null, tags: [1, 'a', true], name: Null}",
+        )
+        .expect("superset map parses");
+        assert_eq!(m["score"], serde_json::json!(-150.0));
+        assert_eq!(m["ratio"], serde_json::json!(2.5));
+        assert_eq!(m["missing"], serde_json::Value::Null);
+        assert_eq!(m["tags"], serde_json::json!([1, "a", true]));
+        assert_eq!(m["name"], serde_json::Value::Null);
+
+        let (_, v) = lexemes::property_value::<nom::error::Error<&str>>("TRUE")
+            .expect("case-insensitive bool");
+        assert_eq!(v, serde_json::Value::Bool(true));
+        let (_, v) =
+            lexemes::property_value::<nom::error::Error<&str>>("-42").expect("negative int");
+        assert_eq!(v, serde_json::json!(-42));
+        let (_, k) =
+            lexemes::any_identifier::<nom::error::Error<&str>>("`weird key`").expect("quoted key");
+        assert_eq!(k, "weird key");
+    }
+
+    #[test]
+    fn test_shared_lexemes_preserve_existing_parses() {
+        // The gains must not change previously-accepted parses.
+        let (_, v) =
+            lexemes::property_value::<nom::error::Error<&str>>("30").expect("int still int");
+        assert_eq!(v, serde_json::json!(30));
+        let (_, v) =
+            lexemes::property_value::<nom::error::Error<&str>>("\"Alice\"").expect("string");
+        assert_eq!(v, serde_json::json!("Alice"));
+        let (_, v) = lexemes::property_value::<nom::error::Error<&str>>("true").expect("bool");
+        assert_eq!(v, serde_json::Value::Bool(true));
+        let (_, m) =
+            lexemes::property_value_map::<nom::error::Error<&str>>("{name: \"Alice\", age: 30}")
+                .expect("tight spacing still parses");
+        assert_eq!(m["name"], serde_json::json!("Alice"));
+        assert_eq!(m["age"], serde_json::json!(30));
+    }
+    #[test]
+    fn test_step2_null_rejected_in_constraint_maps() {
+        // Cypher equality-with-null never matches (IS NULL is the idiom);
+        // pre-convergence both grammars accepted it and dropped the
+        // constraint downstream (an unconstrained scan).
+        assert!(lexemes::constraint_map::<nom::error::Error<&str>>("{x: null}").is_err());
+        assert!(parse_node_pattern("(n {x: null})").is_err());
+        // The WRITE path still accepts null (set-to-null is meaningful).
+        assert!(lexemes::property_value_map::<nom::error::Error<&str>>("{x: null}").is_ok());
+    }
+
+    #[test]
+    fn test_step2_oversized_float_fails_not_zero() {
+        // inf does not fit a JSON number: in map context the parse fails
+        // instead of the pre-convergence silent `= 0` coercion (a bare
+        // property_value legitimately consumes the `1` prefix of "1.0e999"
+        // as an integer — the map's delimiter expectation catches the rest).
+        assert!(lexemes::constraint_map::<nom::error::Error<&str>>("{v: 1.0e999}").is_err());
+        assert!(lexemes::property_value_map::<nom::error::Error<&str>>("{v: -1.0e999}").is_err());
+        let (_, m) = lexemes::constraint_map::<nom::error::Error<&str>>("{v: 1.5e2}").expect("ok");
+        assert_eq!(
+            m["v"],
+            crate::ast::PropertyConstraint::Equals(serde_json::json!(150.0))
+        );
+    }
+
+    #[test]
+    fn test_step2_live_entry_requires_full_consumption() {
+        // Leftover input is an error, not silently discarded.
+        // (`ngarbage` would be a valid RETURN variable — use real garbage.)
+        assert!(QueryParser::new().parse("MATCH (n) @@@").is_err());
+        assert!(QueryParser::new().parse("MATCH (n) RETURN n").is_ok());
+        // trailing whitespace after a COMPLETE query is fine
+        assert!(QueryParser::new().parse("MATCH (n) RETURN n  ").is_ok());
+    }
+
+    #[test]
+    fn test_step2_read_path_identifier_parity() {
+        // The read path's constraint map gains the shared shape: quoted
+        // keys + permissive spacing (previously tight/bare-only).
+        let (_, m) =
+            lexemes::constraint_map::<nom::error::Error<&str>>("{ `weird key` : 1 , b : 2 }")
+                .expect("permissive map");
+        assert_eq!(
+            m["weird key"],
+            crate::ast::PropertyConstraint::Equals(serde_json::json!(1))
+        );
+        assert_eq!(
+            m["b"],
+            crate::ast::PropertyConstraint::Equals(serde_json::json!(2))
+        );
     }
 }

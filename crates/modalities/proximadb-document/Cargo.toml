@@ -28,4 +28,5 @@ thiserror.workspace = true
 tracing = "0.1"
 
 [dev-dependencies]
+proximadb-records = { path = "../../foundation/proximadb-records", features = ["test-support"] }
 tokio = { version = "1.37", features = ["macros", "rt-multi-thread"] }

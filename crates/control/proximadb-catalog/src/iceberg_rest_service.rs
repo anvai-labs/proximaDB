@@ -1767,8 +1767,10 @@ mod tests {
         // One real snapshot through the engine writer, keyed bridge-relatively
         // at facts/metadata (a warehouse-root-scoped bridge, as in production).
         let writer = IcebergObjectStoreBridge::from_url(&root_url).unwrap();
-        let mut record = ProximaRecord::default();
-        record.oid = "r1".to_string();
+        let mut record = ProximaRecord {
+            oid: "r1".to_string(),
+            ..Default::default()
+        };
         record.props.insert(
             "age".to_string(),
             proximadb_records::ProximaTreeNode::Value(ProximaValue::Int64(41)),

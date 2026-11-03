@@ -412,6 +412,21 @@ pub fn where_clause_to_filter_expression(clause: &WhereClause) -> Option<FilterE
                 _ => Some(FilterExpression::Or(parts)),
             }
         }
+        WhereClause::Xor(left, right) => {
+            // XOR = (l OR r) AND NOT (l AND r) over filter expressions
+            // (FilterExpression has no native XOR; boolean-equivalent).
+            let l = where_clause_to_filter_expression(left);
+            let r = where_clause_to_filter_expression(right);
+            match (l, r) {
+                (Some(l), Some(r)) => Some(FilterExpression::And(vec![
+                    FilterExpression::Or(vec![l.clone(), r.clone()]),
+                    FilterExpression::Not(Box::new(FilterExpression::And(vec![l, r]))),
+                ])),
+                (Some(l), None) => Some(l),
+                (None, Some(r)) => Some(r),
+                (None, None) => None,
+            }
+        }
         WhereClause::Not(inner) => where_clause_to_filter_expression(inner)
             .map(|expr| FilterExpression::Not(Box::new(expr))),
     }

@@ -2920,6 +2920,7 @@ impl UnifiedStorageFormat for ViperEngine {
         let config_to_use = collection_config.or(owned_config.as_ref());
         // Create compaction parameters with collection config
         let params = crate::storage::traits::CompactionParameters {
+            full: false,
             collection_id: Some(collection_id.to_string()),
             force: true,
             synchronous: false,
@@ -3091,6 +3092,7 @@ mod minimal_compaction_tests {
             storage_class_status: None,
             id: collection_id.to_string(),
             config: Some(crate::proto::proximadb_v1::CollectionConfig {
+                pool_id: None,
                 storage_class: None,
                 policy_generation: None,
                 default_access_tier: None,
@@ -3167,6 +3169,7 @@ mod minimal_compaction_tests {
         debug!("\n[TEST] Running compaction_info");
 
         let compact_params = CompactionParameters {
+            full: false,
             collection_id: Some(collection_id.to_string()),
             force: true,
             synchronous: true,

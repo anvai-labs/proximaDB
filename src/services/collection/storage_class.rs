@@ -437,6 +437,35 @@ pub fn check_access_tier_admission(
 /// shape `StoragePath::tenant_root_path` writes) — a path under ANOTHER
 /// tenant's prefix is rejected. Anything failing admission is rejected here
 /// with an actionable message — never accepted and silently degraded later.
+/// TD-TIER-1 SC6 policy seam: validate an explicit `pool_id` at admission —
+/// unknown ids are refused with the configured ids listed (fail-closed, the
+/// same shape as the class/tier checks), and a pool is only meaningful for a
+/// PERFORMANCE collection (a silent no-op on balanced would be the DTO-drop
+/// defect's cousin). `None`/empty ⇒ the armed default pool, always valid.
+pub fn check_pool_admission(
+    config: &CollectionConfig,
+    configured_pool_ids: &[String],
+) -> anyhow::Result<()> {
+    let Some(pool_id) = config.pool_id.as_deref().filter(|id| !id.is_empty()) else {
+        return Ok(());
+    };
+    if storage_class_or_balanced(config) != StorageClass::Performance {
+        return Err(anyhow::anyhow!(
+            "pool_id '{pool_id}' requires storage_class 'performance' (resolved class: \
+             {:?}); a pool only charges a PERFORMANCE grant",
+            storage_class_or_balanced(config)
+        ));
+    }
+    if !configured_pool_ids.iter().any(|id| id == pool_id) {
+        return Err(anyhow::anyhow!(
+            "pool_id '{pool_id}' is not a configured reservation pool; configured pools: \
+             [{}] (set [storage.reservation_pools] or drop pool_id for the default)",
+            configured_pool_ids.join(", ")
+        ));
+    }
+    Ok(())
+}
+
 pub fn check_performance_admission(
     config: &CollectionConfig,
     resolved_engine: StorageEngine,

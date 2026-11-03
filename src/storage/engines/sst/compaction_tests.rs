@@ -1,15 +1,219 @@
 use super::{
     MergedVectorTracking, retain_training_guard_for_follow_up, training_follow_up_threshold,
 };
+// Tests below pin process-global gates/env; serialized on the shared lock
+// because the plain `cargo test --lib` runner shares one process.
 use crate::storage::engines::sst::blocks::SstRecord;
 use crate::storage::engines::sst::{
     Compaction, CompactionPriority, CompactionStats, CompactionTask, SstConfig,
 };
+use serial_test::serial;
 use std::collections::HashMap as StdHashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::testing::InMemoryTestCatalog;
+
+/// Keep expiration from masking a missed invalidation. These tests run in
+/// separate nextest processes, as required for process-global storage state.
+struct ListingCacheTestGuard(Option<std::ffi::OsString>);
+
+impl ListingCacheTestGuard {
+    fn enable() -> Self {
+        let previous = std::env::var_os("PROXIMADB_SEGMENT_LISTING_CACHE_MS");
+        // SAFETY: this test owns its nextest process and restores the value.
+        unsafe { std::env::set_var("PROXIMADB_SEGMENT_LISTING_CACHE_MS", "300000") };
+        Self(previous)
+    }
+}
+
+impl Drop for ListingCacheTestGuard {
+    fn drop(&mut self) {
+        // SAFETY: paired restoration in the same isolated process.
+        unsafe {
+            match self.0.take() {
+                Some(value) => std::env::set_var("PROXIMADB_SEGMENT_LISTING_CACHE_MS", value),
+                None => std::env::remove_var("PROXIMADB_SEGMENT_LISTING_CACHE_MS"),
+            }
+        }
+    }
+}
+
+async fn traced_listing(
+    engine: &crate::storage::engines::sst::SstEngine,
+    directory: &str,
+) -> anyhow::Result<(std::collections::BTreeSet<PathBuf>, u64)> {
+    use crate::observability::io_trace;
+    io_trace::scope(async {
+        let files = engine
+            .discover_sstable_files(directory)
+            .await?
+            .into_iter()
+            .map(|file| PathBuf::from(file.url.strip_prefix("file://").unwrap_or(&file.url)))
+            .collect();
+        let trace = io_trace::snapshot().expect("active listing trace");
+        Ok((files, trace.list_ops))
+    })
+    .await
+}
+
+async fn assert_listing_refreshes_then_hits(
+    engine: &crate::storage::engines::sst::SstEngine,
+    directory: &str,
+    expected: &[PathBuf],
+) -> anyhow::Result<()> {
+    let expected = expected.iter().cloned().collect();
+    let (files, lists) = traced_listing(engine, directory).await?;
+    assert_eq!(
+        files, expected,
+        "discovery must reflect the live files immediately"
+    );
+    assert_eq!(lists, 1, "the first query must refresh the listing");
+    let (files, lists) = traced_listing(engine, directory).await?;
+    assert_eq!(files, expected);
+    assert_eq!(lists, 0, "the next query must reuse the refreshed listing");
+    Ok(())
+}
+
+/// Inspect the actual durable publication before the executor can retire any
+/// input. Filling the listing here independently exercises retirement's later
+/// invalidation; its exit guard cannot mask a missing publication invalidation.
+async fn assert_listing_at_publication<T>(
+    engine: &crate::storage::engines::sst::SstEngine,
+    directory: &str,
+    inputs: &[PathBuf],
+    output: &std::path::Path,
+    compact: impl std::future::Future<Output = anyhow::Result<T>>,
+) -> anyhow::Result<T> {
+    let published = Arc::new(tokio::sync::Notify::new());
+    let resume = Arc::new(tokio::sync::Notify::new());
+    let checkpoint = (published.clone(), resume.clone());
+    let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        tokio::try_join!(
+            super::PUBLICATION_CHECKPOINT.scope(checkpoint, compact),
+            async {
+                published.notified().await;
+                assert!(output.exists(), "the replacement must already be durable");
+                assert!(
+                    inputs.iter().all(|input| input.exists()),
+                    "publication must be observable before input retirement"
+                );
+                let mut expected = inputs.to_vec();
+                expected.push(output.to_path_buf());
+                assert_listing_refreshes_then_hits(engine, directory, &expected).await?;
+                resume.notify_one();
+                Ok::<(), anyhow::Error>(())
+            }
+        )
+    })
+    .await
+    .map_err(|error| anyhow::anyhow!("compaction publication checkpoint timed out: {error}"))??;
+    Ok(result)
+}
+
+/// Cancel while finalization is suspended *inside* the coordinator after the
+/// durable move. Outer success-path invalidation and input retirement have not
+/// run, so only the publication guard can retire the previously warm snapshot.
+async fn assert_listing_after_cancelled_publication(
+    engine: &crate::storage::engines::sst::SstEngine,
+    directory: &str,
+    inputs: &[PathBuf],
+    output: &std::path::Path,
+    publish: impl std::future::Future,
+) -> anyhow::Result<()> {
+    let published = Arc::new(tokio::sync::Notify::new());
+    let resume = Arc::new(tokio::sync::Notify::new());
+    let mut operation = Box::pin(
+        crate::storage::transaction_coordinator::FINALIZE_DURABLE_MOVE_CHECKPOINT
+            .scope((published.clone(), resume), publish),
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        tokio::select! {
+            _ = &mut operation => anyhow::bail!("publication completed before the coordinator checkpoint"),
+            () = published.notified() => Ok::<(), anyhow::Error>(()),
+        }
+    }).await.map_err(|error| anyhow::anyhow!("durable-move checkpoint timed out: {error}"))??;
+    assert!(
+        output.exists(),
+        "output must be durable before cancellation"
+    );
+    assert!(
+        inputs.iter().all(|input| input.exists()),
+        "retirement must not have begun"
+    );
+    drop(operation);
+    let mut expected = inputs.to_vec();
+    expected.push(output.to_path_buf());
+    assert_listing_refreshes_then_hits(engine, directory, &expected).await
+}
+
+async fn listing_test_compaction(config: SstConfig, atomic: bool) -> anyhow::Result<Compaction> {
+    let coordinator = if atomic {
+        let factory = Arc::new(
+            crate::storage::persistence::filesystem::FilesystemFactory::create_default().await?,
+        );
+        Some(Arc::new(
+            crate::storage::transaction_coordinator::TransactionCoordinator::new(factory, None)
+                .await?,
+        ))
+    } else {
+        None
+    };
+    Ok(Compaction::with_atomic_coordinator(config, coordinator).await?)
+}
+
+fn listing_test_path(path: &std::path::Path, file_url: bool) -> PathBuf {
+    if file_url {
+        PathBuf::from(format!("file://{}", path.display()))
+    } else {
+        path.to_path_buf()
+    }
+}
+
+#[tokio::test]
+async fn input_retirement_refreshes_a_listing_filled_after_publication() -> anyhow::Result<()> {
+    check_retirement_listing(false).await
+}
+
+#[tokio::test]
+async fn pending_retirement_drain_cannot_resurrect_cached_inputs() -> anyhow::Result<()> {
+    check_retirement_listing(true).await
+}
+
+async fn check_retirement_listing(pending: bool) -> anyhow::Result<()> {
+    let _listing_cache = ListingCacheTestGuard::enable();
+    let root = tempfile::tempdir()?;
+    let input = root.path().join("old.pax");
+    let output = root.path().join("new.pax");
+    std::fs::write(&input, b"old")?;
+    std::fs::write(&output, b"new")?;
+    let engine = crate::storage::engines::sst::SstEngine::new().await?;
+    let directory = root.path().to_string_lossy();
+    // Deterministically model a LIST after publication but before retirement:
+    // both old and new names are now cached. No sleep or scheduler race.
+    assert_listing_refreshes_then_hits(&engine, &directory, &[input.clone(), output.clone()])
+        .await?;
+    let compaction = Compaction::new(SstConfig::default()).await?;
+    let input_url = format!("file://{}", input.display());
+    if pending {
+        super::retirement_ledger::record_pending(root.path(), &output, &[input_url]).await?;
+        let (files, lists) = traced_listing(&engine, &directory).await?;
+        assert_eq!(files, [output.clone()].into_iter().collect());
+        assert_eq!(lists, 0, "pending inputs are filtered on a cache hit");
+        compaction.drain_pending_for_dir(root.path()).await?;
+    } else {
+        assert!(
+            compaction
+                .delete_inputs_attempt(&[PathBuf::from(input_url)])
+                .await
+                .is_empty()
+        );
+    }
+    assert!(!input.exists());
+    assert!(output.exists());
+    assert_listing_refreshes_then_hits(&engine, &directory, &[output]).await?;
+    Ok(())
+}
 
 #[tokio::test]
 async fn test_compaction_basic() {
@@ -633,11 +837,29 @@ fn canonical_compaction_prepare_accounts_expiry_and_old_tombstones() {
 
 #[tokio::test]
 async fn canonical_compaction_round_trips_real_pax_inputs() -> anyhow::Result<()> {
+    check_canonical_compaction_listing(false, false).await
+}
+
+#[tokio::test]
+async fn canonical_atomic_compaction_refreshes_warm_listing() -> anyhow::Result<()> {
+    check_canonical_compaction_listing(true, false).await
+}
+
+#[tokio::test]
+async fn cancelled_atomic_compaction_refreshes_listing_after_durable_move() -> anyhow::Result<()> {
+    check_canonical_compaction_listing(true, true).await
+}
+
+async fn check_canonical_compaction_listing(
+    atomic: bool,
+    cancel_after_move: bool,
+) -> anyhow::Result<()> {
     use crate::storage::engines::sst::segment_format::{read_segment_records, write_pax_segment};
     use proximadb_block_format::VectorQuant;
     use proximadb_records::{EmbeddingCell, ProximaRecord};
     use tempfile::tempdir;
 
+    let _listing_cache = ListingCacheTestGuard::enable();
     let dir = tempdir()?;
     let input_a = dir.path().join("segment_L0_a.pax");
     let input_b = dir.path().join("segment_L0_b.pax");
@@ -676,14 +898,25 @@ async fn canonical_compaction_round_trips_real_pax_inputs() -> anyhow::Result<()
     )?;
 
     let config = SstConfig::default();
-    let compaction = Compaction::new(config.clone()).await?;
+    let engine = crate::storage::engines::sst::SstEngine::new().await?;
+    let directory = if atomic {
+        format!("file://{}/", dir.path().display())
+    } else {
+        format!("{}/", dir.path().display())
+    };
+    assert_listing_refreshes_then_hits(&engine, &directory, &[input_a.clone(), input_b.clone()])
+        .await?;
+    let compaction = listing_test_compaction(config.clone(), atomic).await?;
     let task = CompactionTask {
         collection_object_id: 7,
         collection_identity: crate::core::stable_id::CollectionIdentity::default(),
         level: 0,
-        input_files: vec![input_a.clone(), input_b.clone()],
+        input_files: vec![
+            listing_test_path(&input_a, atomic),
+            listing_test_path(&input_b, atomic),
+        ],
         input_bytes: 0,
-        output_file: output.clone(),
+        output_file: listing_test_path(&output, atomic),
         priority: CompactionPriority::High,
         block_size_kb: None,
         compression_config: None,
@@ -692,15 +925,45 @@ async fn canonical_compaction_round_trips_real_pax_inputs() -> anyhow::Result<()
         vector_quant: None,
         access_tier: None,
     };
-    let stats = compaction
-        .perform_compaction_enhanced(&task, &config, None, None)
-        .await?;
+    if cancel_after_move {
+        return assert_listing_after_cancelled_publication(
+            &engine,
+            &directory,
+            &[input_a.clone(), input_b.clone()],
+            &output,
+            compaction.perform_compaction_enhanced(
+                &task,
+                &config,
+                compaction.atomic_coordinator.clone(),
+                None,
+            ),
+        )
+        .await;
+    }
+    let stats = assert_listing_at_publication(
+        &engine,
+        &directory,
+        &[input_a.clone(), input_b.clone()],
+        &output,
+        async {
+            Ok(compaction
+                .perform_compaction_enhanced(
+                    &task,
+                    &config,
+                    compaction.atomic_coordinator.clone(),
+                    None,
+                )
+                .await?)
+        },
+    )
+    .await?;
 
     assert_eq!(stats.base_stats.files_merged, 2);
     assert_eq!(stats.merged_vectors.len(), 4);
     assert!(output.exists());
     assert!(!input_a.exists());
     assert!(!input_b.exists());
+    assert_listing_refreshes_then_hits(&engine, &directory, std::slice::from_ref(&output)).await?;
 
     let output_bytes = std::fs::read(&output)?;
     let output_records = read_segment_records(&output_bytes, &[], &[], None)?;
@@ -722,6 +985,23 @@ async fn canonical_compaction_round_trips_real_pax_inputs() -> anyhow::Result<()
 #[tokio::test]
 async fn forced_local_spill_compacts_real_pax_with_mvcc_and_reclaims_scratch() -> anyhow::Result<()>
 {
+    check_local_spill_compaction_listing(false, false).await
+}
+
+#[tokio::test]
+async fn atomic_local_spill_compaction_refreshes_warm_listing() -> anyhow::Result<()> {
+    check_local_spill_compaction_listing(true, false).await
+}
+
+#[tokio::test]
+async fn cancelled_atomic_local_spill_refreshes_listing_after_durable_move() -> anyhow::Result<()> {
+    check_local_spill_compaction_listing(true, true).await
+}
+
+async fn check_local_spill_compaction_listing(
+    atomic: bool,
+    cancel_after_move: bool,
+) -> anyhow::Result<()> {
     use crate::storage::common::compaction_memory::{
         CompactionExecutionMode, CompactionResourceUsage, plan_compaction_resources,
     };
@@ -755,6 +1035,7 @@ async fn forced_local_spill_compacts_real_pax_with_mvcc_and_reclaims_scratch() -
             }
         }
     }
+    let _listing_cache = ListingCacheTestGuard::enable();
     let root = tempdir()?;
     let scratch = root.path().join("spill");
     let input_a = root.path().join("segment_L0_a.pax");
@@ -835,7 +1116,15 @@ async fn forced_local_spill_compacts_real_pax_with_mvcc_and_reclaims_scratch() -
     .ok_or_else(|| anyhow::anyhow!("forced spill plan was not admitted"))?;
     assert_eq!(plan.mode, CompactionExecutionMode::LocalSpill);
 
-    let compaction = Compaction::new(config).await?;
+    let engine = crate::storage::engines::sst::SstEngine::new().await?;
+    let directory = if atomic {
+        format!("file://{}/", root.path().display())
+    } else {
+        format!("{}/", root.path().display())
+    };
+    assert_listing_refreshes_then_hits(&engine, &directory, &[input_a.clone(), input_b.clone()])
+        .await?;
+    let compaction = listing_test_compaction(config, atomic).await?;
     let task = CompactionTask {
         collection_object_id: 7,
         collection_identity: crate::core::stable_id::CollectionIdentity {
@@ -844,9 +1133,12 @@ async fn forced_local_spill_compacts_real_pax_with_mvcc_and_reclaims_scratch() -
             collection_id: 7,
         },
         level: 0,
-        input_files: vec![input_a.clone(), input_b.clone()],
+        input_files: vec![
+            listing_test_path(&input_a, atomic),
+            listing_test_path(&input_b, atomic),
+        ],
         input_bytes,
-        output_file: output.clone(),
+        output_file: listing_test_path(&output, atomic),
         priority: CompactionPriority::High,
         block_size_kb: Some(1),
         compression_config: None,
@@ -894,19 +1186,119 @@ async fn forced_local_spill_compacts_real_pax_with_mvcc_and_reclaims_scratch() -
         input_a.exists() && input_b.exists(),
         "publication failure must leave every source segment authoritative"
     );
+    let (files, lists) = traced_listing(&engine, &directory).await?;
+    assert_eq!(
+        files,
+        [input_a.clone(), input_b.clone()].into_iter().collect()
+    );
+    assert_eq!(
+        lists, 0,
+        "failed publication keeps the cached live input set"
+    );
     assert_no_task_scratch(&scratch)?;
 
-    let stats = compaction
-        .perform_compaction_with_plan(&task, plan)
-        .await?
-        .completed()
-        .ok_or_else(|| anyhow::anyhow!("an untagged (RaBitQ) spill must not be declined"))?;
+    if !atomic {
+        // Force the real staged writer's final rename to fail in the same
+        // collection whose listing is warm. A nonempty directory cannot be
+        // replaced by the completed PAX file, independent of permissions.
+        let blocked = root.path().join("blocked.pax");
+        std::fs::create_dir(&blocked)?;
+        let marker = blocked.join("keep");
+        std::fs::write(&marker, b"blocked publication")?;
+        let mut failed_write = task.clone();
+        failed_write.output_file = blocked.clone();
+        let failure = compaction
+            .perform_compaction_with_plan(&failed_write, plan)
+            .await
+            .expect_err("a PAX file cannot replace the nonempty output directory");
+        assert!(
+            failure
+                .to_string()
+                .contains("upload local-spill PAX segment"),
+            "failure must reach the actual writer's publication step: {failure}"
+        );
+        assert!(input_a.exists() && input_b.exists());
+        assert!(!output.exists());
+        assert_eq!(std::fs::read(&marker)?, b"blocked publication");
+        let (files, lists) = traced_listing(&engine, &directory).await?;
+        assert_eq!(
+            files,
+            [input_a.clone(), input_b.clone()].into_iter().collect()
+        );
+        assert_eq!(
+            lists, 1,
+            "a failed publication attempt must conservatively refresh the collection listing"
+        );
+        assert_no_task_scratch(&scratch)?;
+        std::fs::remove_dir_all(&blocked)?;
+        let (files, lists) = traced_listing(&engine, &directory).await?;
+        assert_eq!(
+            files,
+            [input_a.clone(), input_b.clone()].into_iter().collect()
+        );
+        assert_eq!(
+            lists, 0,
+            "the admission-decline control must start with a warm listing"
+        );
+    }
+
+    // Unlike the unsupported-backend control, this task targets the actual
+    // warmed collection root. Admission decline must not invalidate that root
+    // or retire its inputs. Publication failures may invalidate defensively;
+    // this decline never reaches publication.
+    let mut declined = task.clone();
+    declined.vector_quant = Some(VectorQuant::Sq8);
+    let outcome = compaction
+        .perform_compaction_with_plan(&declined, plan)
+        .await?;
+    assert!(
+        matches!(outcome, super::CompactionOutcome::Declined(_)),
+        "unsupported spill quantization must decline the actual output task"
+    );
+    assert!(input_a.exists() && input_b.exists());
+    assert!(!output.exists());
+    let (files, lists) = traced_listing(&engine, &directory).await?;
+    assert_eq!(
+        files,
+        [input_a.clone(), input_b.clone()].into_iter().collect()
+    );
+    assert_eq!(
+        lists, 0,
+        "decline must preserve the warmed collection listing"
+    );
+    assert_no_task_scratch(&scratch)?;
+
+    if cancel_after_move {
+        return assert_listing_after_cancelled_publication(
+            &engine,
+            &directory,
+            &[input_a.clone(), input_b.clone()],
+            &output,
+            compaction.perform_compaction_with_plan(&task, plan),
+        )
+        .await;
+    }
+    let stats = assert_listing_at_publication(
+        &engine,
+        &directory,
+        &[input_a.clone(), input_b.clone()],
+        &output,
+        async {
+            compaction
+                .perform_compaction_with_plan(&task, plan)
+                .await?
+                .completed()
+                .ok_or_else(|| anyhow::anyhow!("an untagged (RaBitQ) spill must not be declined"))
+        },
+    )
+    .await?;
 
     assert_eq!(stats.files_merged, 2);
     assert!(stats.bytes_written > 0);
     assert!(output.exists());
     assert!(!input_a.exists());
     assert!(!input_b.exists());
+    assert_listing_refreshes_then_hits(&engine, &directory, std::slice::from_ref(&output)).await?;
     let output_records = read_segment_records(&std::fs::read(&output)?, &[], &[], None)?;
     assert_eq!(output_records.len(), 128);
     assert!(
@@ -998,11 +1390,12 @@ async fn check_compaction_needed_stamps_precision_hint_from_resolver() {
 /// fallback reaches unwired instances. (nextest runs each test in its own
 /// process, so the set-once global is fresh here.)
 #[tokio::test]
+#[serial]
 async fn td_global_precision_resolver_stamps_hint_without_per_instance_wiring() {
     use crate::storage::engines::sst::compaction::set_global_precision_resolver;
     use proximadb_catalog::cache::CatalogCache;
     use proximadb_catalog::canonical_precision::CanonicalPrecisionResolver;
-    use proximadb_catalog::{Catalog, CatalogNamespace, CatalogTableSchema, TableIdentifier};
+    use proximadb_catalog::{Catalog, CatalogTableSchema, TableIdentifier};
     use std::sync::Arc;
     let cache = Arc::new(CatalogCache::new(1000, 60));
     let cat: Arc<dyn Catalog> = Arc::new(InMemoryTestCatalog::new(
@@ -1037,6 +1430,9 @@ async fn td_global_precision_resolver_stamps_hint_without_per_instance_wiring() 
         "the global precision resolver must stamp precision_hint on a Compaction \
          that was never per-instance-wired (the per-collection-SstEngine case)"
     );
+    // Drop the override so later shared-process tests see the boot-armed
+    // global again (the plain `cargo test --lib` runner shares one process).
+    crate::storage::engines::sst::compaction::clear_global_precision_resolver_for_tests();
 }
 
 /// INT-3-followup-d wiring: with `CompactionTask.precision_hint =
@@ -1409,12 +1805,23 @@ async fn spill_declines_a_raw_f32_collection_with_lossy_inputs() -> anyhow::Resu
 /// output and deleted the inputs, the only copies of the exact f32 values.
 /// The probe error must abort the compaction and keep the inputs.
 #[tokio::test]
+#[serial]
 async fn tier_probe_read_error_aborts_and_keeps_exact_inputs() -> anyhow::Result<()> {
     use crate::storage::engines::sst::segment_format::write_pax_segment_full_with_layout;
     use proximadb_block_format::VectorQuant;
-    // SAFETY: isolated nextest process; armed before the factory is built.
+    // Armed before the factory is built, and SCOPED to this test's own temp
+    // dir: under the plain `cargo test --lib` runner every test shares one
+    // process, so an unscoped read-fault would inject failures into every
+    // concurrent test's `.pax` reads.
     unsafe { std::env::set_var("PROXIMADB_TEST_FS_READ_FAIL_AFTER_FIRST", "1") };
     let dir = tempfile::tempdir()?;
+    // The temp dir only exists here — point the fault scope at it now.
+    unsafe {
+        std::env::set_var(
+            "PROXIMADB_TEST_FS_READ_FAIL_SCOPE",
+            dir.path().display().to_string(),
+        )
+    }
     let inputs = [
         dir.path().join("segment_L0_a.pax"),
         dir.path().join("segment_L0_b.pax"),
@@ -1468,6 +1875,10 @@ async fn tier_probe_read_error_aborts_and_keeps_exact_inputs() -> anyhow::Result
         "no lossy output may be published after a probe I/O error"
     );
     assert!(result.is_err(), "the compaction must abort");
+    unsafe {
+        std::env::remove_var("PROXIMADB_TEST_FS_READ_FAIL_SCOPE");
+        std::env::remove_var("PROXIMADB_TEST_FS_READ_FAIL_AFTER_FIRST");
+    }
     Ok(())
 }
 
@@ -1476,6 +1887,7 @@ async fn tier_probe_read_error_aborts_and_keeps_exact_inputs() -> anyhow::Result
 /// (read from the published centroid directory beside the inputs) instead of
 /// training a new model, and republishes the directory for the output.
 #[tokio::test]
+#[serial]
 async fn shared_model_gate_classifies_compaction_output_with_the_collection_model()
 -> anyhow::Result<()> {
     use crate::storage::engines::sst::centroid_directory_publisher::{

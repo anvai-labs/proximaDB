@@ -8,8 +8,53 @@ mod tests {
     };
 
     #[test]
+    fn write_lease_renew_interval_preserves_default_and_small_ttls() {
+        use std::time::Duration;
+
+        assert_eq!(
+            StorageConfig::default().write_lease_renew_interval(),
+            Duration::from_secs(5)
+        );
+        for (ttl_ms, interval_ms) in [
+            (0, 1_000),
+            (1_999, 1_000),
+            (2_000, 1_000),
+            (4_000, 2_000),
+            (9_998, 4_999),
+        ] {
+            let config = StorageConfig {
+                write_lease_ttl_ms: ttl_ms,
+                ..Default::default()
+            };
+            assert_eq!(
+                config.write_lease_renew_interval(),
+                Duration::from_millis(interval_ms),
+                "TTL {ttl_ms} must retain its half-TTL cadence and 1s floor"
+            );
+        }
+    }
+
+    #[test]
+    fn write_lease_renew_interval_caps_raised_ttls_for_short_resource_leases() {
+        use std::time::Duration;
+
+        for ttl_ms in [10_000, 10_002, 30_000, 120_000, u64::MAX] {
+            let config = StorageConfig {
+                write_lease_ttl_ms: ttl_ms,
+                ..Default::default()
+            };
+            assert_eq!(
+                config.write_lease_renew_interval(),
+                Duration::from_secs(5),
+                "TTL {ttl_ms} must leave a renewal opportunity before 10s resource leases expire"
+            );
+        }
+    }
+
+    #[test]
     fn test_storage_locations_config() {
         let config = StorageConfig {
+            write_lease_ttl_ms: 10_000,
             storage_locations: vec![
                 StorageLocation {
                     url: "file:///nvme1/proximadb".to_string(),

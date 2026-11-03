@@ -16,18 +16,16 @@ pub use state::{RestAppState, TenantContext};
 
 // Re-export canonical REST handler + state types
 pub use canonical::{
-    AnalyticsHandler, AqlHandler, DocumentHandler, DocumentQueryHandler, EntityHandler,
-    GraphHandler, GraphTraversalHandler, HybridSearchHandler, LogsHandler, MetricsHandler,
-    ProgressiveSearchHandler, UnifiedQueryRestState, VectorHandler,
+    DocumentHandler, DocumentQueryHandler, EntityHandler, GraphHandler, GraphTraversalHandler,
+    HybridSearchHandler, LogsHandler, MetricsHandler, ProgressiveSearchHandler,
+    UnifiedQueryRestState, VectorHandler,
 };
-pub use canonical::{
-    AnalyticsRestState, DocumentRestState, GraphRestState, HybridRestState, ObservabilityRestState,
-};
+pub use canonical::{DocumentRestState, GraphRestState, HybridRestState, ObservabilityRestState};
 
 // Re-export canonical REST router builders
 pub use canonical::{
-    create_analytics_router, create_document_router, create_graph_router, create_health_router,
-    create_hybrid_search_router, create_multimodal_router, create_observability_router,
+    create_document_router, create_graph_router, create_health_router, create_hybrid_search_router,
+    create_multimodal_router, create_observability_router,
 };
 
 /// REST API request context

@@ -19,7 +19,7 @@
 //! Contains collection management utilities for the SST engine.
 //! This module provides:
 //! - Collection metadata and statistics
-//! - File management and cleanup operations
+//! - File management operations
 //! - Vector existence checking with bloom filters
 //! - Collection scanning and enumeration
 
@@ -27,7 +27,7 @@ use anyhow::Result;
 use std::collections::HashMap;
 use tracing::{debug, info, warn};
 
-use crate::proto::proximadb_v1::{Collection, VectorRecord};
+use crate::proto::proximadb_v1::Collection;
 use crate::storage::engines::sst::{SstEngine, SstError};
 use crate::storage::traits::CompactionResult;
 
@@ -44,6 +44,7 @@ impl SstEngine {
             storage_class: None,
             policy_generation: None,
             default_access_tier: None,
+            pool_id: None,
             name: collection_id.to_string(),
             embedding_config: None,
             dimension: 1536,          // Default dimension
@@ -233,89 +234,15 @@ impl SstEngine {
         Ok(true)
     }
 
-    /// Clean up all files for a collection
-    pub async fn cleanup_collection_files(&self, collection_id: &str) -> Result<()> {
-        info!("🧹 SST: Cleaning up files for collection {}", collection_id);
-
-        let _storage_url = self.get_collection_storage_url(collection_id).await?;
-        let unified_fs = self
-            .unified_fs()
-            .ok_or_else(|| SstError::Internal("Unified filesystem not initialized".to_string()))?;
-
-        // List all files for the collection
-        let files = match unified_fs.list("/").await {
-            Ok(files) => files,
-            Err(e) => {
-                warn!("Failed to list collection files for cleanup: {}", e);
-                return Ok(()); // Don't fail cleanup
-            }
-        };
-
-        let mut deleted_count = 0;
-        let mut error_count = 0;
-
-        // Clean up SST files, bloom filters, and metadata files
-        for entry in &files {
-            if entry.name.ends_with(".sst")
-                || entry.name.ends_with(".bloom")
-                || entry.name.ends_with(".meta")
-                || entry.name.ends_with(".idx")
-            {
-                match unified_fs.delete(&entry.name).await {
-                    Ok(_) => {
-                        deleted_count += 1;
-                        debug!("🗑️ Deleted file: {}", entry.name);
-                    }
-                    Err(e) => {
-                        error_count += 1;
-                        warn!("Failed to delete collection file {}: {}", entry.name, e);
-                        // Continue with other files
-                    }
-                }
-            }
-        }
-
-        info!(
-            "🧹 Cleanup completed for collection {}: {} files deleted, {} errors",
-            collection_id, deleted_count, error_count
-        );
-
-        Ok(())
-    }
-
-    /// Scan all vectors in a collection with pagination
-    pub async fn scan_all_vectors(
-        &self,
-        collection_id: &str,
-        offset: usize,
-        limit: Option<usize>,
-    ) -> Result<Vec<VectorRecord>> {
-        debug!(
-            "📖 SST: Scanning vectors in collection {} (offset: {}, limit: {:?})",
-            collection_id, offset, limit
-        );
-
-        let _storage_url = self.get_collection_storage_url(collection_id).await?;
-
-        // In a real implementation, this would:
-        // 1. List all SST files for the collection
-        // 2. Open each file and scan records
-        // 3. Apply offset and limit across all files
-        // 4. Return paginated results
-
-        let results = Vec::new();
-        let _effective_limit = limit.unwrap_or(1000); // Default limit
-
-        // For now, return empty results as this is a complex operation
-        // that requires implementing SST file reading
-        debug!(
-            "📖 Scan completed for collection {}: {} vectors returned",
-            collection_id,
-            results.len()
-        );
-
-        Ok(results)
-    }
+    // TD-SEAM-16: `cleanup_collection_files` is DELETED along with its only
+    // caller (`StorageEngine::delete_collection` — dead behind the
+    // never-populated sst_storages registry). Production DROP cleanup is
+    // CollectionManager::cleanup_storage_directories (both storage roots).
+    // TD-SSTCLEAN-1 documents the full history.
+    //
+    // TD-SEAM-16: `scan_all_vectors` is also deleted — its only caller was
+    // the deleted `StorageEngine::all_vectors` (zero repo-wide callers);
+    // same lookalike-dead-code class this TD was filed against.
 
     /// Get storage URL for a collection — resolved via the injected
     /// `CollectionPathResolver` (catalog → config fallback; the single source of

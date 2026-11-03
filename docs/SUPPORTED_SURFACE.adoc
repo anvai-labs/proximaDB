@@ -3,7 +3,7 @@
 :toclevels: 2
 :icons: font
 :last-updated: 2026-10-29
-// status-as-of: 2026-09-11
+// status-as-of: 2026-11-01
 // The status-as-of tag above is checked by scripts/check_status_as_of.py (wired into
 // `make work-commit-check`): re-verify the support tiers against HEAD, then bump it.
 
@@ -315,6 +315,11 @@ for evidence/provenance, and event/history records for temporal state. The v1
 | `VECTOR_SEARCH(...)`, `GRAPH_QUERY(...)`, `DOCUMENT_QUERY(...)`, `LOGS(...)`, and `METRICS(...)` run through the federated engine with cache support. Phase 2.5: pipeline-based execution, morsel-driven parallelism, Arrow-native cross-model format for LATERAL joins, batch SIMD distance.
 | Strongest on function-backed sources; generic relational scans and remote distributed execution are still incomplete.
 
+| Operator compaction (`COMPACT TABLE ... [FULL]`, `POST /api/v2/collections/{id}/compact`, Flight `"compact_collection"` with `"full": true`)
+| Beta
+| Cross-level collapse toward `[storage.compaction_config] full_target_segments` (TD-COMPACT-14). Operator class like suspend/resume: tenant-scoped, `SystemAdmin | ConfigureSystem | MaintainCollections` when an authenticated context is present; the REST endpoint is not part of the published OpenAPI spec.
+| Plain `COMPACT` runs one explicit policy pass (never disarmed by `compaction:off`); FULL is synchronous with a `full_timeout_ms` request budget.
+
 | Document CRUD, query, and aggregation
 | Beta
 | WAL-backed collections, CRUD, aggregation, change events, and in-memory query execution are implemented. Canonical `ProximaRecord` storage exists as the convergence path.
@@ -382,7 +387,7 @@ in the Current Matrix stay authoritative for API-level claims. `StorageEngineStr
 
 | SST
 | Supported
-| Supported engine (`StorageEngineStrategy::Sst`, factory `create_sst`); REST/gRPC creates that omit the engine are auto-routed to HELIX until v0.5 (TD-ENGSEL-1). Hybrid columnar OLTP/LSM over PAX blocks; serves the Supported vector surface.
+| Supported engine (`StorageEngineStrategy::Sst`, factory `create_sst`); REST/gRPC creates that omit the engine are auto-routed to SST since v0.5.0 (TD-ENGSEL-1, P5a — pinned by `rest_v2_create_without_engine_defaults_to_sst`, itself on the ci_lane burn-down baseline until wired into a lane); before that they went to the Beta HELIX engine. Hybrid columnar OLTP/LSM over PAX blocks; serves the Supported vector surface.
 | The safe default for adoption and examples.
 
 | VIPER

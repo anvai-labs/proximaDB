@@ -635,6 +635,7 @@ impl CompactionCoordinator {
 
         // Use VIPER's do_compact method through unified framework
         let params = crate::storage::CompactionParameters {
+            full: false,
             collection_id: Some(collection_id.to_string()),
             force: false,
             synchronous: true,
@@ -688,6 +689,7 @@ impl CompactionCoordinator {
         // SST engine declines rather than guess; the flush trigger and the
         // background manager are the meta-aware producers.
         let params = crate::storage::CompactionParameters {
+            full: false,
             collection_id: Some(collection_id.to_string()),
             force: false,
             synchronous: true,

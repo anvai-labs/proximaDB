@@ -2567,6 +2567,11 @@ export interface components {
              *     Desired, not observed: an account lifecycle rule may move objects.
              */
             default_access_tier?: string | null;
+            /**
+             * @description Reservation pool the PERFORMANCE grant charges (TD-TIER-1 SC6);
+             *     omitted when the default pool applies.
+             */
+            pool_id?: string | null;
             schema?: null | components["schemas"]["SchemaDefinition"];
             /** @description Collection statistics */
             stats: components["schemas"]["CollectionStatsV2"];
@@ -2734,6 +2739,13 @@ export interface components {
              *     set, a tier can be changed but not cleared back to the default.
              */
             default_access_tier?: string | null;
+            /**
+             * @description TD-TIER-1 SC6 policy seam: the reservation pool this PERFORMANCE
+             *     collection's grant charges ("pool_id" in [storage.reservation_pools]);
+             *     omitted ⇒ the configured default pool. Unknown ids are refused at
+             *     admission with the configured ids listed.
+             */
+            pool_id?: string | null;
         };
         /** @description Response for collection creation */
         CreateCollectionV2Response: {
@@ -3012,7 +3024,14 @@ export interface components {
             /** @description Whether this is the collection's primary ANN index. */
             is_primary: boolean;
         };
-        /** @description A single record submitted for native embedding + indexing. */
+        /**
+         * @description A single record submitted for native embedding + indexing.
+         *
+         *     Unknown fields are REJECTED (`deny_unknown_fields`, TD-REC-1 policy — the
+         *     same rule as the records surface): the declared fields plus the
+         *     `props`/`metadata` alias pair are the contract; anything else is a 400
+         *     naming the unknown field instead of a silently dropped write.
+         */
         IngestDocument: {
             id: string;
             /**
@@ -3026,7 +3045,13 @@ export interface components {
              *     locally (legacy path).
              */
             vector?: number[] | null;
-            /** @description Arbitrary metadata fields. Stored as ProximaRecord props. */
+            /**
+             * @description Arbitrary metadata fields. Stored as ProximaRecord props.
+             *
+             *     `props` is accepted as an alias (TD-REC-1): the records surface
+             *     documents `props` as the canonical map and accepts `metadata` as its
+             *     alias, so this surface accepts both spellings of the same map too.
+             */
             metadata?: {
                 [key: string]: unknown;
             };
@@ -3076,13 +3101,17 @@ export interface components {
          *                         "content": "A detailed product description...",
          *                         "storage_hint": "adaptive"
          *                     }
-         *                 ],
-         *                 "source": "catalog_import"
+         *                 ]
          *             }
          *         ],
          *         "validate_schema": true
          *     }
          *     ```
+         *
+         *     (A record top level accepts exactly `id`, `vector`, `props` — or its
+         *     advertised alias `metadata` — and `text_fields`; anything else is a 400
+         *     naming the unknown field. The example used to show a `"source"` key: it
+         *     was never a contract field and was silently dropped before TD-REC-1.)
          *     Not supported in v0.2: optimistic versioning, conditional-write predicates,
          *     update-by-filter, delete-by-filter, and patch / partial-record update. The
          *     live contract is exposed via `WriteContractHealth` on the route-health
@@ -3198,13 +3227,34 @@ export interface components {
          *     This is the JSON-serializable input format for ProximaRecord.
          *     It uses serde_json::Value for typed fields to support dynamic typing
          *     at the API boundary, with validation happening during conversion.
+         *
+         *     Unknown fields are REJECTED (`deny_unknown_fields`, TD-REC-1 policy): a
+         *     write that carries a field this contract does not know must fail loud at
+         *     the boundary, not report success while silently discarding data — which
+         *     is exactly how the `metadata` drop shipped. The grandfathered spellings
+         *     are the ones the contract itself advertises: `props` and its `metadata`
+         *     alias. Generated SDKs (regenerated in #2337) send only declared fields,
+         *     so the deny cannot break them; a hand-rolled client sending something
+         *     else gets a 400 naming the problem instead of a silent no-op filter.
          */
         ProximaRecordInput: {
             /** @description Record ID (optional, will be auto-generated if not provided) */
             id?: string | null;
             /** @description Vector embedding (required) */
             vector: number[];
-            /** @description Canonical rich property map. */
+            /**
+             * @description Canonical rich property map.
+             *
+             *     `metadata` is accepted as an alias: the documents API advertises that
+             *     spelling ("Arbitrary metadata fields. Stored as ProximaRecord props")
+             *     and maps it here, so the records API must accept it too — before the
+             *     alias it was silently dropped and filters over it matched nothing
+             *     (TD-REC-1). The OpenAPI contract stays `props`; the alias is
+             *     lenience for the already-advertised spelling, not a second field.
+             *     It composes with `deny_unknown_fields`: an alias is a KNOWN field
+             *     name, so `metadata` passes the deny while any other unknown key is
+             *     rejected.
+             */
             props?: {
                 [key: string]: unknown;
             } | null;
@@ -4359,8 +4409,14 @@ export interface components {
         } | {
             List: string[];
         };
-        /** @enum {string} */
-        AbacComparisonOperator: "Equals" | "NotEquals" | "GreaterThan" | "GreaterThanOrEqual" | "LessThan" | "LessThanOrEqual" | "In" | "NotIn" | "Contains" | "StartsWith" | "EndsWith" | "Between" | "IsNull" | "IsNotNull" | "Like";
+        /**
+         * @description The server additionally accepts the legacy wire names `Equal` and
+         *     `NotEqual` as aliases of `Equals`/`NotEquals` when deserializing
+         *     (mixed-read compatibility); serialization always emits the names
+         *     above.
+         * @enum {string}
+         */
+        AbacComparisonOperator: "Equals" | "NotEquals" | "GreaterThan" | "GreaterThanOrEqual" | "LessThan" | "LessThanOrEqual" | "In" | "NotIn" | "Contains" | "StartsWith" | "EndsWith" | "Between" | "IsNull" | "IsNotNull" | "Like" | "Exists" | "NotExists" | "Regex";
         /**
          * @description A predicate-object row filter — a RECURSIVE, externally-tagged Rust
          *     enum (`proximadb_filter_expression::FilterExpression`). Modeled
@@ -4374,7 +4430,8 @@ export interface components {
          *     * `{"Comparison": {"field": <string>, "operator": <one of
          *       "Equals","NotEquals","GreaterThan","GreaterThanOrEqual",
          *       "LessThan","LessThanOrEqual","In","NotIn","Contains",
-         *       "StartsWith","EndsWith","Between","IsNull","IsNotNull","Like">,
+         *       "StartsWith","EndsWith","Between","IsNull","IsNotNull","Like",
+         *       "Exists","NotExists","Regex">,
          *       "value": <any JSON value>}}`
          *     * `{"And": [<AbacFilterExpression>, ...]}`
          *     * `{"Or": [<AbacFilterExpression>, ...]}`

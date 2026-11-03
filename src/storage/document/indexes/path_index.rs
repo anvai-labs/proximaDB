@@ -54,36 +54,7 @@ impl std::hash::Hash for IndexValueOrd {
 }
 
 /// Ordered float wrapper
-#[derive(Debug, Clone)]
-struct OrderedFloat(f64);
-
-impl std::hash::Hash for OrderedFloat {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.0.to_bits().hash(state);
-    }
-}
-
-impl PartialEq for OrderedFloat {
-    fn eq(&self, other: &Self) -> bool {
-        self.0.to_bits() == other.0.to_bits()
-    }
-}
-
-impl Eq for OrderedFloat {}
-
-impl PartialOrd for OrderedFloat {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for OrderedFloat {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.0
-            .partial_cmp(&other.0)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    }
-}
+use proximadb_records::BitKeyF64 as OrderedFloat;
 
 impl PartialEq for IndexValueOrd {
     fn eq(&self, other: &Self) -> bool {

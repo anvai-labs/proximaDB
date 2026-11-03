@@ -1,0 +1,41 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= Stage-F bounded parallel decode — measured (PR #2303, in v0.5.1)
+
+Bench: the same layout-off 3M SIFT128 `category=3` bed as the #2298 read-waves gate
+(`--skip-ingest`, n=1000, MinIO + Toxiproxy 5+5 ms on the same host); only the binary
+changed (sha256 prefix `6825514d5`, PR #2303). Numbers below are transcribed from the
+PR's bench section (its run logs were local to the PR session; raw result.json files
+were not checked in — disclosed here rather than implied).
+
+== Filtered `category=3`, object_cold
+
+| Metric | #2298 (PR-D, baseline) | #2303 (this change) |
+|---|---|---|
+| object_cold p50 / p95 | 3136 / 3330 ms | **1385 / 1797 ms** |
+| local_disk_warm p50 | 3304 ms | 1556 ms |
+| post_write p50 | 3421 ms | 1455 ms |
+| Stage F fetch / decode, mean ms/q (object_cold) | 1078 / 2339 | 701 / **632** |
+| recall@10 / GET/q / MB/q (object_cold) | 0.9751 / 235.3 / 737.0 | 0.9751 / 235.3 / 737.0 |
+| waves p50 | 30 | 30 |
+
+== Reading
+
+* The gate (object_cold p50 ≤ 1.5 s) is met; before #2298 the same bed measured 5.29 s.
+* Recall, GETs, bytes and wave counts are identical in every phase — the change moves the
+  compute term only (exactness is by construction: block results are independent and the
+  caller only sums counts and unions ordinals; worker error or panic routes the segment to
+  the exact path, never a partial allow-set).
+* The fetch wall also dropped (1078 → 701 ms/q); the PR's stated hypothesis — reads no
+  longer compete with serial decode on the query task — was NOT isolated and is not claimed
+  as measured.
+* Mechanism: per-wave round-robin deal to `morsel_degree()` `spawn_blocking` workers under a
+  process-wide `stage_f_decode_permits` semaphore (one permit per core); waves below
+  `MORSEL_MIN_ROWS` stay serial; `PROXIMADB_SEARCH_MORSEL_DEGREE=1` forces serial.
+
+== Limitations
+
+n=1 per arm on a single-host emulator (aiserver1: WSL2, 16 vCPU, 125 GB; MinIO + Toxiproxy
+on-host) — not an SLA, not a multi-node result. Transcribed-from-PR provenance as disclosed
+above. The TD narrative (`TD-FPRUNE-1-filter-aware-cascade-arc.adoc`, "5.29 s → 1.39 s")
+spans #2298+#2303 together; the ledger entries carry the per-PR arms.

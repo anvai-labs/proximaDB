@@ -579,6 +579,13 @@ impl ConsolidatedRBACManager {
                     || user_permissions.contains(&UnifiedPermission::SystemAdmin)
             }
 
+            // Operator maintenance (PG17 MAINTAIN analog): a tenant admin or
+            // system admin can always compact their collections.
+            UnifiedPermission::MaintainCollections => {
+                user_permissions.contains(&UnifiedPermission::TenantAdmin)
+                    || user_permissions.contains(&UnifiedPermission::SystemAdmin)
+            }
+
             _ => false,
         }
     }
@@ -604,6 +611,9 @@ impl ConsolidatedRBACManager {
                 UnifiedPermission::TenantAdmin,
                 UnifiedPermission::CollectionCreate,
                 UnifiedPermission::AuditRead,
+                // TD-COMPACT-14: the PG17 MAINTAIN analog — a tenant admin can
+                // always run operator compaction on the tenant's collections.
+                UnifiedPermission::MaintainCollections,
             ]
             .into_iter()
             .collect(),

@@ -11,14 +11,36 @@
 //! * LIST returns ALL objects across pages (the production GCS backend once
 //!   silently truncated at page 1).
 //!
-//! Emulator-gated (`#[ignore]` + env skip), same pattern as the
-//! `put_with_tier_*` tier tests; run via `scripts/run_cloud_emulator_tests.sh`.
+//! Wire contracts are emulator-gated (`#[ignore]` + env skip), same pattern as
+//! the `put_with_tier_*` tier tests. The offline GCS TLS construction regression
+//! runs separately under nextest for process isolation. Both run in the QA
+//! scope of `scripts/run_cloud_emulator_tests.sh`.
 
 use std::sync::Arc;
 
 use proximadb::storage::persistence::filesystem::{
     FilesystemConfig, FilesystemError, FilesystemFactory,
 };
+
+#[cfg(feature = "gcp")]
+#[tokio::test]
+async fn gcs_https_constructor_initializes_crypto_provider() -> anyhow::Result<()> {
+    use proximadb::storage::persistence::filesystem::gcs_store::{GcsConfig, GcsFileSystem};
+
+    // Run in a fresh nextest process: an earlier factory/TLS test must not mask
+    // the embedded-caller path, which never runs the server's initialization.
+    assert!(rustls::crypto::CryptoProvider::get_default().is_none());
+    // Construction configures the SDK's gRPC TLS client but performs no I/O.
+    // HTTPS reaches the ambiguous-provider path with cloud-full enabled.
+    let _fs = GcsFileSystem::new(GcsConfig {
+        endpoint_url: Some("https://127.0.0.1:9".into()),
+        anonymous: true,
+        ..Default::default()
+    })
+    .await?;
+    assert!(rustls::crypto::CryptoProvider::get_default().is_some());
+    Ok(())
+}
 
 async fn factory() -> Arc<FilesystemFactory> {
     Arc::new(

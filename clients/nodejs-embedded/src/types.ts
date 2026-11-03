@@ -176,7 +176,12 @@ export interface ProximaRecord {
   version?: number;
   /** Original content that generated this vector (e.g., chunk text for RAG) */
   source?: string;
-  /** Text fields for dedicated text storage */
+  /** Text fields for dedicated text storage.
+   *
+   * DISPLAY-SIDE alias only: the REST wire contract is snake_case
+   * `text_fields` (TD-REC-1) and the transport stringifies bodies as-is —
+   * write-path builders must emit `text_fields`, never this camelCase key.
+   */
   textFields?: Array<{ name: string; content: string }>;
 }
 

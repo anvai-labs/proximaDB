@@ -182,8 +182,14 @@ async def test_delete_by_file_hits_and_deletes(victor):
 async def test_delete_by_file_no_hits_and_search_error(victor):
     victor.client.search.return_value = []
     assert await victor.p.delete_by_file("a.py") == 0
+    # Since #1717 a failed read must be distinguishable from an empty one:
+    # delete_by_file RAISES on a failed search instead of returning 0 (0
+    # means "nothing matched", which a caller treats as success). This test
+    # still asserted the pre-#1717 swallow — #1717 swept the sibling cov
+    # files (test_code_knowledge_cov, test_graph_cov) and missed this one.
     victor.client.search.side_effect = RuntimeError("boom")
-    assert await victor.p.delete_by_file("a.py") == 0
+    with pytest.raises(RuntimeError, match="failed to delete records for file: boom"):
+        await victor.p.delete_by_file("a.py")
 
 
 @pytest.mark.asyncio

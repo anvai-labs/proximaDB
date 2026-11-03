@@ -671,7 +671,6 @@ fn build_external_embedding_event(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use proximadb_catalog::Catalog;
     use proximadb_embedding::config::{ByoAuth, EmbeddingConfig};
     use proximadb_embedding::scheduler::EmbedSchedulerConfig;
     use proximadb_queue::{Message, QueueConfig, TopicConfig};
@@ -1382,9 +1381,8 @@ mod tests {
     async fn drainer_stamps_target_precision_from_resolver() {
         use proximadb_catalog::cache::CatalogCache;
         use proximadb_catalog::canonical_precision::CanonicalPrecisionResolver;
-        use proximadb_catalog::{Catalog, CatalogNamespace, CatalogTableSchema, TableIdentifier};
+        use proximadb_catalog::{Catalog, CatalogTableSchema, TableIdentifier};
         use std::collections::HashMap;
-        use tokio::sync::RwLock;
 
         ensure_embedding_singleton();
         let tmp = TempDir::new().expect("tempdir");

@@ -110,8 +110,8 @@ async fn test_sst_datablock_zstd_compression_roundtrip() -> anyhow::Result<()> {
     let vector_count = vectors.len();
 
     // Create SST storage to test compression
-    let collection = std::sync::Arc::new(env.create_test_collection());
-    let distance_compute = std::sync::Arc::new(
+    let _collection = std::sync::Arc::new(env.create_test_collection());
+    let _distance_compute = std::sync::Arc::new(
         proximadb::compute::distance_computation::engine::UnifiedDistanceCompute::default(),
     );
     let sst_storage = proximadb::storage::engines::sst::SstEngine::new().await?;
@@ -179,7 +179,7 @@ async fn test_sst_engine_flush_with_compression_integration() -> anyhow::Result<
         .compression = "zstd".to_string();
     sst_config.compression_level = 3;
 
-    let distance_compute = Arc::new(UnifiedDistanceCompute::new(
+    let _distance_compute = Arc::new(UnifiedDistanceCompute::new(
         proximadb::compute::distance_computation::DistanceMetric::Cosine,
     ));
     let engine = SstEngine::new().await?;
@@ -235,7 +235,7 @@ async fn test_sst_compaction_preserves_compression_integrity() -> anyhow::Result
     sst_config.compression_level = 3;
     sst_config.compaction_threshold = 2; // Lower threshold to trigger compaction
 
-    let distance_compute = Arc::new(UnifiedDistanceCompute::new(
+    let _distance_compute = Arc::new(UnifiedDistanceCompute::new(
         proximadb::compute::distance_computation::DistanceMetric::Cosine,
     ));
     let engine = SstEngine::new().await?;
@@ -270,6 +270,7 @@ async fn test_sst_compaction_preserves_compression_integrity() -> anyhow::Result
     // Trigger compaction using unified helper (which would handle the collection config properly)
     let collection_config = env.create_test_collection_for_engine(StorageEngine::Sst);
     let compact_params = proximadb::storage::traits::CompactionParameters {
+        full: false,
         collection_id: Some(env.collection_id().to_string()),
         force: true,
         synchronous: true,
@@ -334,7 +335,7 @@ async fn test_sst_search_compressed_blocks() -> anyhow::Result<()> {
         .compression = "zstd".to_string();
     sst_config.compression_level = 3;
 
-    let distance_compute = Arc::new(UnifiedDistanceCompute::new(
+    let _distance_compute = Arc::new(UnifiedDistanceCompute::new(
         proximadb::compute::distance_computation::DistanceMetric::Cosine,
     ));
     let engine = SstEngine::new().await?;
@@ -472,7 +473,7 @@ async fn test_compression_algorithm_vs_disabled() -> anyhow::Result<()> {
 
     info!("Testing compression effectiveness with identical data...");
 
-    let distance_compute = Arc::new(UnifiedDistanceCompute::new(
+    let _distance_compute = Arc::new(UnifiedDistanceCompute::new(
         proximadb::compute::distance_computation::DistanceMetric::Cosine,
     ));
 
@@ -614,9 +615,9 @@ async fn test_all_compression_algorithms_sst() -> anyhow::Result<()> {
         );
 
         let env = UnifiedTestEnvironment::new().await?;
-        let sst_config = create_sst_config_with_algorithm(&env, algo, *level);
+        let _sst_config = create_sst_config_with_algorithm(&env, algo, *level);
 
-        let distance_compute = Arc::new(UnifiedDistanceCompute::new(
+        let _distance_compute = Arc::new(UnifiedDistanceCompute::new(
             proximadb::compute::distance_computation::DistanceMetric::Cosine,
         ));
         let engine = SstEngine::new().await?;
@@ -707,7 +708,7 @@ async fn test_compression_levels() -> anyhow::Result<()> {
         config.compression = "zstd".to_string();
         config.compression_level = level;
 
-        let distance_compute = Arc::new(UnifiedDistanceCompute::new(
+        let _distance_compute = Arc::new(UnifiedDistanceCompute::new(
             proximadb::compute::distance_computation::DistanceMetric::Cosine,
         ));
         let engine = SstEngine::new().await?;

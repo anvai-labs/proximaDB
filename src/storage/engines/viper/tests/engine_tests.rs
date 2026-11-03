@@ -114,6 +114,7 @@ mod tests {
             storage_class_status: None,
             id: collection_id.to_string(),
             config: Some(CollectionConfig {
+                pool_id: None,
                 storage_class: None,
                 policy_generation: None,
                 default_access_tier: None,
@@ -658,6 +659,7 @@ mod tests {
 
         // Trigger compaction
         let compact_params = crate::storage::traits::CompactionParameters {
+            full: false,
             collection_id: Some(collection_id.to_string()),
             force: true,
             synchronous: true,

@@ -972,6 +972,21 @@ pub struct CompactionConfig {
     /// Zero means automatic sizing from live disk availability.
     #[serde(default)]
     pub spill_max_disk_mb: u64,
+
+    /// Target live segment count for an operator FULL compaction
+    /// (`COMPACT TABLE ... FULL` / `POST .../compact {"full":true}`). 1
+    /// collapses the collection to a single segment, crossing levels the
+    /// background policy never crosses.
+    #[serde(default = "default_full_target_segments")]
+    pub full_target_segments: usize,
+    /// Bound on pairwise merge passes per FULL request (n segments need
+    /// n-1 passes).
+    #[serde(default = "default_full_max_passes")]
+    pub full_max_passes: usize,
+    /// Wall-clock budget for one FULL request, including inter-pass
+    /// quiescence waits.
+    #[serde(default = "default_full_timeout_ms")]
+    pub full_timeout_ms: u64,
 }
 
 impl Default for CompactionConfig {
@@ -994,8 +1009,23 @@ impl Default for CompactionConfig {
             spill_scratch_amplification_factor: default_compaction_spill_scratch_amplification(),
             spill_available_disk_fraction: default_compaction_spill_available_disk_fraction(),
             spill_max_disk_mb: 0,
+            full_target_segments: default_full_target_segments(),
+            full_max_passes: default_full_max_passes(),
+            full_timeout_ms: default_full_timeout_ms(),
         }
     }
+}
+
+fn default_full_target_segments() -> usize {
+    1
+}
+
+fn default_full_max_passes() -> usize {
+    16
+}
+
+fn default_full_timeout_ms() -> u64 {
+    3_600_000
 }
 
 fn default_higher_level_file_threshold() -> usize {

@@ -10,7 +10,15 @@ use tokio::sync::RwLock;
 use tracing::debug;
 
 /// Transaction isolation level
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+/// Canonical isolation-level vocabulary (dedup wave 5): previously defined
+/// independently (with drifted variant sets) in storage-transaction,
+/// metadata/atomic, graph/service_transactions and catalog_bulk_write.
+/// `Snapshot` is the snapshot-isolation level those sites spelled
+/// `SnapshotIsolation`; variant names are the wire vocabulary and are
+/// unchanged from every former definition.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize,
+)]
 pub enum IsolationLevel {
     /// Read uncommitted - can see uncommitted changes from other transactions
     ReadUncommitted,
@@ -19,37 +27,53 @@ pub enum IsolationLevel {
     ReadCommitted,
     /// Repeatable read - consistent reads within transaction
     RepeatableRead,
+    /// Snapshot isolation - transactions read from a consistent snapshot
+    Snapshot,
     /// Serializable - full isolation, transactions appear to run serially
     Serializable,
 }
 
 impl IsolationLevel {
+    /// Get the strictness level (higher = more strict)
+    pub fn strictness(&self) -> u8 {
+        match self {
+            IsolationLevel::ReadUncommitted => 0,
+            IsolationLevel::ReadCommitted => 1,
+            IsolationLevel::RepeatableRead => 2,
+            IsolationLevel::Snapshot => 3,
+            IsolationLevel::Serializable => 4,
+        }
+    }
+
     /// Get display name
     pub fn name(&self) -> &'static str {
         match self {
             IsolationLevel::ReadUncommitted => "READ UNCOMMITTED",
             IsolationLevel::ReadCommitted => "READ COMMITTED",
             IsolationLevel::RepeatableRead => "REPEATABLE READ",
+            IsolationLevel::Snapshot => "SNAPSHOT",
             IsolationLevel::Serializable => "SERIALIZABLE",
         }
     }
 
     /// Check if this level allows dirty reads
     pub fn allows_dirty_reads(&self) -> bool {
-        matches!(self, IsolationLevel::ReadUncommitted)
+        self.strictness() < 1
+    }
+
+    /// Check if this level prevents dirty reads
+    pub fn prevents_dirty_reads(&self) -> bool {
+        self.strictness() >= 1
     }
 
     /// Check if this level prevents non-repeatable reads
     pub fn prevents_non_repeatable_reads(&self) -> bool {
-        matches!(
-            self,
-            IsolationLevel::RepeatableRead | IsolationLevel::Serializable
-        )
+        self.strictness() >= 2
     }
 
     /// Check if this level prevents phantom reads
     pub fn prevents_phantom_reads(&self) -> bool {
-        matches!(self, IsolationLevel::Serializable)
+        self.strictness() >= 4
     }
 }
 

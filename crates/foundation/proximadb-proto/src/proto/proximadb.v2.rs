@@ -886,6 +886,11 @@ pub struct V2CollectionConfig {
     /// placement; "archive" is refused. Desired, not observed.
     #[prost(string, optional, tag = "11")]
     pub default_access_tier: ::core::option::Option<::prost::alloc::string::String>,
+    /// TD-TIER-1 SC6 policy seam: reservation pool id for a PERFORMANCE
+    /// collection's grant; unset ⇒ the configured default pool. Must name a
+    /// pool in `storage.reservation_pools`.
+    #[prost(string, optional, tag = "12")]
+    pub pool_id: ::core::option::Option<::prost::alloc::string::String>,
 }
 /// TD-TIER-1 SC1: observed storage-class status (read-side projection of the
 /// desired policy; never an input). Mirrors the v1 `StorageClassStatus`.
@@ -924,8 +929,10 @@ pub struct V2Collection {
     pub id: ::prost::alloc::string::String,
     #[prost(message, optional, tag = "2")]
     pub config: ::core::option::Option<V2CollectionConfig>,
+    /// Unix epoch MILLISECONDS (TD-COLLTIME-1; normalized on the way out).
     #[prost(int64, tag = "3")]
     pub created_at: i64,
+    /// Unix epoch MILLISECONDS (TD-COLLTIME-1).
     #[prost(int64, tag = "4")]
     pub updated_at: i64,
     /// TD-TIER-1 SC1: observed status alongside the echoed desired class in

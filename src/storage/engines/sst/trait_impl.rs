@@ -226,6 +226,71 @@ impl UnifiedStorageFormat for SstEngine {
         // TD-PAXRG-1: resolve the row-group switch from the collection's
         // `pax_rg_layout` tag (same precedence the flush seam applies).
         let rg_tags = collection_tags;
+        // TD-READFID-2 review: same base-quant resolution as flush.
+        let rg_layout = Some(super::flush::resolve_pax_rg_layout(rg_tags));
+        let vector_quant = Some(super::flush::resolve_pax_vector_quant(
+            params.collection_config.as_ref(),
+        ));
+        // TD-TIER-1 SC5: the output object carries the collection's tier.
+        let access_tier = params
+            .collection_config
+            .as_ref()
+            .and_then(|collection| collection.config.as_ref())
+            .and_then(crate::services::collection::storage_class::collection_access_tier);
+
+        // TD-COMPACT-14: an operator FULL request collapses the collection
+        // across levels instead of running one policy morsel.
+        if params.full {
+            let full_config = self.config().compaction_config.clone().unwrap_or_default();
+            let timeout = std::time::Duration::from_millis(
+                params.timeout_ms.unwrap_or(full_config.full_timeout_ms),
+            );
+            let summary = compaction
+                .compact_collection_full(
+                    collection_object_id,
+                    std::path::Path::new(&collection_dir),
+                    precision_hint,
+                    rg_layout,
+                    vector_quant,
+                    access_tier,
+                    timeout,
+                )
+                .await?;
+            return Ok(CompactionResult {
+                success: true,
+                collections_affected: vec![collection_id],
+                completed_at: chrono::Utc::now(),
+                engine_metrics: HashMap::from([
+                    ("full".to_string(), serde_json::json!(true)),
+                    (
+                        "segments_before".to_string(),
+                        serde_json::json!(summary.segments_before),
+                    ),
+                    (
+                        "segments_after".to_string(),
+                        serde_json::json!(summary.segments_after),
+                    ),
+                    (
+                        "passes".to_string(),
+                        serde_json::json!(summary.passes_executed),
+                    ),
+                    (
+                        "reached_target".to_string(),
+                        serde_json::json!(summary.reached_target),
+                    ),
+                    (
+                        "stop_reason".to_string(),
+                        serde_json::json!(summary.stop_reason),
+                    ),
+                    (
+                        "pending_files".to_string(),
+                        serde_json::json!(summary.pending_files),
+                    ),
+                ]),
+                ..Default::default()
+            });
+        }
+
         let enqueued = compaction
             .enqueue_due_compaction(
                 collection_object_id,
@@ -233,17 +298,9 @@ impl UnifiedStorageFormat for SstEngine {
                 std::path::Path::new(&collection_dir),
                 l0_threshold,
                 precision_hint,
-                Some(super::flush::resolve_pax_rg_layout(rg_tags)),
-                // TD-READFID-2 review: same base-quant resolution as flush.
-                Some(super::flush::resolve_pax_vector_quant(
-                    params.collection_config.as_ref(),
-                )),
-                // TD-TIER-1 SC5: the output object carries the collection's tier.
-                params
-                    .collection_config
-                    .as_ref()
-                    .and_then(|collection| collection.config.as_ref())
-                    .and_then(crate::services::collection::storage_class::collection_access_tier),
+                rg_layout,
+                vector_quant,
+                access_tier,
             )
             .await?;
 
@@ -634,6 +691,7 @@ mod tests {
             ..Default::default()
         };
         let params = CompactionParameters {
+            full: false,
             collection_id: Some("7".to_string()),
             synchronous: true,
             collection_config: Some(meta),
@@ -657,6 +715,7 @@ mod tests {
         let engine = create_test_engine().await;
         let directory = tempfile::tempdir().unwrap();
         let params = CompactionParameters {
+            full: false,
             collection_id: Some("7".to_string()),
             synchronous: true,
             hints: HashMap::from([(

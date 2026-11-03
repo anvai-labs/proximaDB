@@ -12,7 +12,7 @@ use proximadb::storage::traits::{
     FlushParameters, StorageQueryContext, StorageQueryMetadata, UnifiedStorageEngine,
 };
 use proximadb_proto::v1::{Collection, CollectionConfig, StorageAssignment, StorageEngine};
-use proximadb_records::{EmbeddingCell, EmbeddingValues, ProximaRecord};
+use proximadb_records::{EmbeddingCell, ProximaRecord};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 

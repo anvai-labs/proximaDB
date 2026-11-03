@@ -28,6 +28,7 @@ use super::{
 };
 
 use crate::storage::persistence::filesystem::FilesystemFactory;
+pub use proximadb_storage_common::IsolationLevel;
 // Import CollectionMetadata from proxima
 
 /// Transaction identifier
@@ -69,19 +70,6 @@ pub struct MetadataTransaction {
     pub timeout_at: DateTime<Utc>,
     /// Isolation level for this transaction
     pub isolation_level: IsolationLevel,
-}
-
-/// Transaction isolation levels
-///
-/// Defines the isolation guarantees for transaction operations.
-#[derive(Debug, Clone, PartialEq)]
-pub enum IsolationLevel {
-    /// Read committed - can see committed changes from other transactions
-    ReadCommitted,
-    /// Repeatable read - consistent snapshot for duration of transaction
-    RepeatableRead,
-    /// Serializable - full isolation
-    Serializable,
 }
 
 impl MetadataTransaction {
