@@ -72,7 +72,8 @@ class TestDockerDemoContainer:
         # Use SDK instead of raw REST calls for proper API handling
         from proximadb_sdk import ProximaDBClient
 
-        client = ProximaDBClient(url=base_url, force_protocol="rest")
+        # force_protocol was never honored by any client (v1 swallowed the kwarg silently); state the actual intent.
+        client = ProximaDBClient(url=base_url, protocol="rest")
 
         try:
             # Test create collection using SDK
@@ -138,7 +139,8 @@ class TestDockerDemoContainer:
         # Use SDK instead of raw REST calls for proper metadata handling
         from proximadb_sdk import ProximaDBClient, VectorRecord
 
-        client = ProximaDBClient(url=base_url, force_protocol="rest")
+        # force_protocol was never honored by any client (v1 swallowed the kwarg silently); state the actual intent.
+        client = ProximaDBClient(url=base_url, protocol="rest")
 
         try:
             # Create test collection using SDK
