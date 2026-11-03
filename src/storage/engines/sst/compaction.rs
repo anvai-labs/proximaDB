@@ -1890,6 +1890,28 @@ impl Compaction {
     /// TD-COMPACT-13: ONE delete attempt per input (warm-cache purge + DV
     /// removal on success). Returns the inputs that failed this attempt.
     async fn delete_inputs_attempt(&self, inputs: &[PathBuf]) -> Vec<PathBuf> {
+        // A LIST after publication can cache both replacement and inputs.
+        // Cover every exit after deletion, including partial retirement and
+        // cancellation at a later await. The reconciler shares this path and
+        // must invalidate before it removes pending-path suppression.
+        struct InvalidateListingsOnExit<'a> {
+            inputs: &'a [PathBuf],
+        }
+        impl Drop for InvalidateListingsOnExit<'_> {
+            fn drop(&mut self) {
+                let directories: std::collections::HashSet<_> = self
+                    .inputs
+                    .iter()
+                    .filter_map(|input| input.parent())
+                    .collect();
+                for directory in directories {
+                    crate::storage::engines::sst::search::invalidate_segment_listing_cache(
+                        &directory.to_string_lossy(),
+                    );
+                }
+            }
+        }
+        let _listing_invalidation = InvalidateListingsOnExit { inputs };
         let warm_caches = crate::storage::engines::sst::core::get_warm_tier_caches();
         #[cfg(feature = "cold-deletion-vectors")]
         let dv_store =
@@ -2509,6 +2531,14 @@ impl Compaction {
                         "update local-spill upload manifest: {error}"
                     ))
                 })?;
+            // Direct uploads publish here; coordinator-managed staging is
+            // covered by the finalization guard below.
+            let _publication_invalidation =
+                if direct_remote_publication || atomic_operation.is_none() {
+                    guard_compaction_publication(&task.output_file)
+                } else {
+                    None
+                };
             let bytes = staged
                 .upload_bounded_retaining_local(&self.filesystem_port())
                 .await
@@ -2541,6 +2571,7 @@ impl Compaction {
             "spill_pax_uploaded",
             usize::try_from(mvcc_stats.output_records).unwrap_or(usize::MAX),
         );
+        let publication_invalidation = guard_compaction_publication(&task.output_file);
         if let (Some(coordinator), Some(operation)) = (&self.atomic_coordinator, &atomic_operation)
             && let Err(error) = coordinator
                 .finalize_atomic_operation(&operation.operation_id)
@@ -2552,16 +2583,13 @@ impl Compaction {
                     "local-spill atomic publication failed",
                 )
                 .await;
-            // TD-PAXDIR-2 (L1): the local-spill publish path also invalidates.
-            if let Some(parent) = task.output_file.parent() {
-                crate::storage::engines::sst::search::invalidate_segment_listing_cache(
-                    &parent.to_string_lossy(),
-                );
-            }
             return Err(crate::core::StorageError::SstEngine(format!(
                 "publish local-spill PAX segment: {error}"
             )));
         }
+        drop(publication_invalidation);
+        #[cfg(test)]
+        publication_checkpoint().await;
         if let Err(error) = task_scratch.update_phase("published", None) {
             warn!(%error, "Local-spill publication committed but manifest update failed");
         }
@@ -3213,6 +3241,7 @@ impl Compaction {
                     ))
                 })?;
 
+            let publication_invalidation = guard_compaction_publication(&task.output_file);
             // Finalize atomic operation - this moves the file from staging to final location
             coordinator
                 .finalize_atomic_operation(&atomic_op.operation_id)
@@ -3223,6 +3252,10 @@ impl Compaction {
                         e
                     ))
                 })?;
+
+            drop(publication_invalidation);
+            #[cfg(test)]
+            publication_checkpoint().await;
 
             info!(
                 "✅ LSM COMPACTION: Atomic operation {} completed successfully",
@@ -3380,6 +3413,10 @@ impl Compaction {
                     );
                 }
             }
+
+            drop(guard_compaction_publication(&task.output_file));
+            #[cfg(test)]
+            publication_checkpoint().await;
 
             // TD-COMPACT-1 S2: size the output through its URL-selected
             // backend, and never fail the already-durable compaction over a
@@ -3835,10 +3872,36 @@ impl Compaction {
     }
 }
 
+fn guard_compaction_publication(
+    output: &Path,
+) -> Option<crate::storage::engines::sst::search::SegmentListingPublicationGuard> {
+    output.parent().map(|directory| {
+        crate::storage::engines::sst::search::SegmentListingPublicationGuard::new(
+            &directory.to_string_lossy(),
+        )
+    })
+}
+
 type WarmTierCachePair = (
     Arc<crate::storage::engines::sst::segment_format::SegmentInvariantsCache>,
     Arc<crate::storage::engines::sst::survivor_range_cache::SurvivorRangeCache>,
 );
+
+#[cfg(test)]
+tokio::task_local! {
+    /// Scoped to one compaction future so unrelated tests cannot block here.
+    static PUBLICATION_CHECKPOINT: (Arc<Notify>, Arc<Notify>);
+}
+
+#[cfg(test)]
+async fn publication_checkpoint() {
+    if let Ok(resume) = PUBLICATION_CHECKPOINT.try_with(|(published, resume)| {
+        published.notify_one();
+        resume.clone()
+    }) {
+        resume.notified().await;
+    }
+}
 
 /// Retire one immutable compaction input through the backend selected by its
 /// URL. A missing input is an idempotent success: another already-running

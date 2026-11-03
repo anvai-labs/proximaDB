@@ -119,6 +119,29 @@ pub(crate) fn invalidate_segment_listing_cache(storage_url: &str) {
     cache.generation += 1;
 }
 
+/// Publication can become durable inside an awaited backend/coordinator call.
+/// Retire discovery snapshots when the enclosing attempt exits, including
+/// cancellation after the output moved but before cleanup completed. This does
+/// not fence backend I/O that finishes after its future has been dropped.
+#[must_use]
+pub(crate) struct SegmentListingPublicationGuard {
+    directory: String,
+}
+
+impl SegmentListingPublicationGuard {
+    pub(crate) fn new(directory: &str) -> Self {
+        Self {
+            directory: directory.to_owned(),
+        }
+    }
+}
+
+impl Drop for SegmentListingPublicationGuard {
+    fn drop(&mut self) {
+        invalidate_segment_listing_cache(&self.directory);
+    }
+}
+
 /// Clear every cached listing (tests that assert exact wave counts need the
 /// LIST to fire).
 #[cfg(test)]

@@ -1203,6 +1203,8 @@ mod tests {
         let rows = corpus();
         let arm = arm("paxdir_d7_server_path", &rows).await;
         preload_directory(&arm).await;
+        // Preloading discovers segments; measure the intended cold LIST wave.
+        crate::storage::engines::sst::search::clear_segment_listing_cache_for_tests();
         let ctx = search_ctx(
             &arm,
             &rows,

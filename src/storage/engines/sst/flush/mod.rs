@@ -663,6 +663,10 @@ impl SstEngine {
         });
         let bytes_written = file_metadata.size;
 
+        let publication_invalidation =
+            crate::storage::engines::sst::search::SegmentListingPublicationGuard::new(
+                &atomic_op.final_url,
+            );
         let mut already_materialized = false;
         if recovery_materialization.is_some() {
             // The deterministic segment object is the recovery commit record.
@@ -701,6 +705,10 @@ impl SstEngine {
                 }
                 Err(error) => return Err(error).context("publishing recovery segment"),
             }
+            // The recovery object is visible before tracking finalization.
+            crate::storage::engines::sst::search::invalidate_segment_listing_cache(
+                &atomic_op.final_url,
+            );
             if let Err(error) = self
                 .atomic_coordinator()
                 .finalize_atomic_operation(&atomic_op.operation_id)
@@ -720,6 +728,7 @@ impl SstEngine {
                 .await
                 .context("Failed to commit atomic flush operation")?;
         }
+        drop(publication_invalidation);
         tracing::debug!(
             final_url = %atomic_op.final_url,
             filename = %filename,
@@ -816,12 +825,6 @@ impl SstEngine {
             );
         }
 
-        // TD-PAXDIR-2 (L1): the new segment must be visible to the next query —
-        // drop the cross-query listing cache immediately after the publish
-        // (before the awaited directory emission) to minimize the window.
-        crate::storage::engines::sst::search::invalidate_segment_listing_cache(
-            &atomic_op.final_url,
-        );
         if already_materialized {
             return Ok(FlushResult {
                 success: true,
@@ -2237,6 +2240,8 @@ mod tests {
             b"l0",
         )
         .unwrap();
+        // Direct fixture writes bypass the flush publication hook.
+        crate::storage::engines::sst::search::invalidate_segment_listing_cache(&data_dir);
 
         let before = engine
             .flush_sort_invocations
@@ -2575,6 +2580,8 @@ mod tests {
             )
             .unwrap();
         }
+        // Each direct fixture mutation changes the live segment set.
+        crate::storage::engines::sst::search::invalidate_segment_listing_cache(storage_url);
         assert_eq!(
             engine
                 .should_trigger_compaction(storage_url, &tags)
@@ -2591,6 +2598,7 @@ mod tests {
         std::fs::rename(&flushed, &parked).unwrap();
         let fifth = data_dir.join("L1_20261029T000005_00000005.pax");
         std::fs::copy(&parked, &fifth).unwrap();
+        crate::storage::engines::sst::search::invalidate_segment_listing_cache(storage_url);
         assert_eq!(
             engine
                 .should_trigger_compaction(storage_url, &tags)
@@ -2601,6 +2609,7 @@ mod tests {
         );
         std::fs::remove_file(&fifth).unwrap();
         std::fs::rename(&parked, &flushed).unwrap();
+        crate::storage::engines::sst::search::invalidate_segment_listing_cache(storage_url);
 
         // With a training compaction in flight the arm stays suppressed
         // (TD-COMPACT-8) and the count arm is the fallback, as before.
