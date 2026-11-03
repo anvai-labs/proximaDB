@@ -49,6 +49,7 @@
 /// (full input consumed, no error) — pinned by the tests below.
 #[cfg(test)]
 const CORPUS: &[(&str, &str)] = &[
+    ("read_simple", "MATCH (n:Person) RETURN n"),
     ("read_where", "MATCH (n:Person) WHERE n.age > 30 RETURN n"),
     (
         "read_edge",
@@ -219,7 +220,11 @@ const CORPUS: &[(&str, &str)] = &[
 /// The frozen clause-level behavior of both grammars over {CORPUS}.
 /// Format per entry: `=== id` / `Q:` query / `M:` modality JSON / `S:` seam JSON.
 #[cfg(test)]
-const PINNED_SNAPSHOT: &str = r#"=== read_where
+const PINNED_SNAPSHOT: &str = r#"=== read_simple
+Q: MATCH (n:Person) RETURN n
+M: {"clauses":[],"reading_clauses":[{"Match":{"optional":false,"pattern":{"edges":[],"nodes":[{"label":"Person","labels":["Person"],"optional":false,"properties":{},"variable":"n"}],"paths":[],"where_clause":null,"where_clauses":[],"with_clauses":[]}}}],"return_spec":{"distinct":false,"items":["n"],"limit":null,"order_by":[],"projections":[{"Variable":"n"}],"skip":null,"variables":["n"]},"union_clauses":[],"updating_clauses":[],"with_clauses":[]}
+S: {"reading_clauses":[{"Match":{"optional":false,"pattern":{"edges":[],"nodes":[{"labels":["Person"],"optional":false,"properties":{},"variable":"n"}],"paths":[],"where_clause":null}}}],"return_spec":{"distinct":false,"limit":null,"order_by":[],"projections":[{"Variable":"n"}],"skip":null,"variables":["n"]},"union_clauses":[],"updating_clauses":[],"with_clauses":[]}
+=== read_where
 Q: MATCH (n:Person) WHERE n.age > 30 RETURN n
 M: {"clauses":[],"reading_clauses":[{"Match":{"optional":false,"pattern":{"edges":[],"nodes":[{"label":"Person","labels":["Person"],"optional":false,"properties":{},"variable":"n"}],"paths":[],"where_clause":{"Property":{"constraint":{"GreaterThan":30},"property":"age","variable":"n"}},"where_clauses":[],"with_clauses":[]}}}],"return_spec":{"distinct":false,"items":["n"],"limit":null,"order_by":[],"projections":[{"Variable":"n"}],"skip":null,"variables":["n"]},"union_clauses":[],"updating_clauses":[],"with_clauses":[]}
 S: {"reading_clauses":[{"Match":{"optional":false,"pattern":{"edges":[],"nodes":[{"labels":["Person"],"optional":false,"properties":{},"variable":"n"}],"paths":[],"where_clause":{"Property":{"constraint":{"GreaterThan":30},"property":"age","variable":"n"}}}}}],"return_spec":{"distinct":false,"limit":null,"order_by":[],"projections":[{"Variable":"n"}],"skip":null,"variables":["n"]},"union_clauses":[],"updating_clauses":[],"with_clauses":[]}
@@ -250,7 +255,7 @@ S: {"reading_clauses":[],"return_spec":{"distinct":false,"limit":null,"order_by"
 === create_edge
 Q: MATCH (a:Person), (b:Person) CREATE (a)-[r:KNOWS {since: 2020}]->(b)
 M: {"clauses":[],"reading_clauses":[{"Match":{"optional":false,"pattern":{"edges":[],"nodes":[{"label":"Person","labels":["Person"],"optional":false,"properties":{},"variable":"a"},{"label":"Person","labels":["Person"],"optional":false,"properties":{},"variable":"b"}],"paths":[],"where_clause":null,"where_clauses":[],"with_clauses":[]}}}],"return_spec":null,"union_clauses":[],"updating_clauses":[{"Create":{"edges":[{"direction":"Outgoing","edge_type":"KNOWS","from_variable":"a","properties":{"since":2020},"to_variable":"b","variable":"r"}],"nodes":[{"labels":[],"properties":{},"variable":"a"},{"labels":[],"properties":{},"variable":"b"}]}}],"with_clauses":[]}
-S: {"reading_clauses":[{"Match":{"optional":false,"pattern":{"edges":[],"nodes":[{"labels":["Person"],"optional":false,"properties":{},"variable":"a"},{"labels":["Person"],"optional":false,"properties":{},"variable":"b"}],"paths":[],"where_clause":null}}}],"return_spec":null,"union_clauses":[],"updating_clauses":[{"Create":{"edges":[{"edge_type":"KNOWS","from_variable":"a","properties":{"since":2020},"to_variable":"b","variable":"r"}],"nodes":[{"labels":[],"properties":{},"variable":"a"},{"labels":[],"properties":{},"variable":"b"}]}}],"with_clauses":[]}
+S: {"reading_clauses":[{"Match":{"optional":false,"pattern":{"edges":[],"nodes":[{"labels":["Person"],"optional":false,"properties":{},"variable":"a"},{"labels":["Person"],"optional":false,"properties":{},"variable":"b"}],"paths":[],"where_clause":null}}}],"return_spec":null,"union_clauses":[],"updating_clauses":[{"Create":{"edges":[{"direction":"Outgoing","edge_type":"KNOWS","from_variable":"a","properties":{"since":2020},"to_variable":"b","variable":"r"}],"nodes":[{"labels":[],"properties":{},"variable":"a"},{"labels":[],"properties":{},"variable":"b"}]}}],"with_clauses":[]}
 === merge_on_create
 Q: MERGE (n:Person {name: "Bob"}) ON CREATE SET n.created = true
 M: {"clauses":[],"reading_clauses":[],"return_spec":null,"union_clauses":[],"updating_clauses":[{"Merge":{"on_create":{"items":[{"Property":{"property":"created","value":true,"variable":"n"}}]},"on_match":null,"pattern":{"edges":[],"nodes":[{"label":"Person","labels":["Person"],"optional":false,"properties":{"name":"Bob"},"variable":"n"}],"paths":[],"where_clause":null,"where_clauses":[],"with_clauses":[]}}}],"with_clauses":[]}

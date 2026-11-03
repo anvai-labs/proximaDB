@@ -58,7 +58,7 @@ pub(super) fn parse_create_edge_pattern(
             preceded(multispace0, parse_create_edge_spec),
             preceded(multispace0, parse_create_node_spec),
         )),
-        |(from_node, (edge_var, edge_type, edge_props, _direction), to_node)| {
+        |(from_node, (edge_var, edge_type, edge_props, direction), to_node)| {
             let from_var = from_node
                 .variable
                 .clone()
@@ -74,6 +74,7 @@ pub(super) fn parse_create_edge_pattern(
                 to_variable: to_var,
                 edge_type: edge_type.unwrap_or_default(),
                 properties: edge_props,
+                direction,
             };
 
             (from_node, edge, to_node)

@@ -38,6 +38,8 @@ pub mod storage;
 pub mod topology_codec;
 pub mod traversal;
 
+pub mod seam_conversion;
+
 // TD-GRAPH-4 §3: the Cypher corpus pin (test-only — see the module docs).
 #[cfg(test)]
 mod cypher_corpus_pin;

@@ -423,6 +423,9 @@ pub struct CreateEdgeSpec {
     pub edge_type: String,
     /// Properties for the new edge
     pub properties: HashMap<String, serde_json::Value>,
+    /// Direction (the modality AST's field; previously parsed then
+    /// discarded — TD-GRAPH-4 step 3 keeps it)
+    pub direction: EdgeDirection,
 }
 
 /// DELETE clause for removing nodes and relationships
