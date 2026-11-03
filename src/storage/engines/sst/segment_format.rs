@@ -3006,10 +3006,23 @@ impl SegmentInvariantsCache {
                 Some(bytes)
             }
             Ok(None) | Err(_) => {
-                self.l2_misses
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                crate::observability::io_trace::record_l2s(0, 1);
-                None
+                // TD-COMPACT-2b step 3: the legacy key missed. Fall back to
+                // the policy's region key (pinned, survives eviction).
+                let policy_key = proximadb_cache::region_key("index", path);
+                match store.get_range(&policy_key, relative_off, len).await {
+                    Ok(Some(bytes)) => {
+                        self.l2_hits
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        crate::observability::io_trace::record_l2s(1, 0);
+                        Some(bytes)
+                    }
+                    _ => {
+                        self.l2_misses
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        crate::observability::io_trace::record_l2s(0, 1);
+                        None
+                    }
+                }
             }
         }
     }
