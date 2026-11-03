@@ -3837,7 +3837,7 @@ mod tests {
     /// and `record_schema`, so record mode could never be enabled after create.
     #[tokio::test]
     async fn schema_update_persists_record_mode() -> Result<()> {
-        let (svc, mgr, _temp_dir) = service_in_tempdir().await?;
+        let (svc, _mgr, _temp_dir) = service_in_tempdir().await?;
 
         let name = "grpcschema2_record";
         assert!(

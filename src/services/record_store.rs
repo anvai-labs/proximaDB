@@ -7000,7 +7000,7 @@ mod tests {
             std::env::set_var(crate::services::record_spill::SPILL_MAX_RESIDENT_ENV, "4");
         }
 
-        let (root, base) = spill_root();
+        let (_root, base) = spill_root();
         let fs = local_fs().await;
 
         let wal = Arc::new(RecordingWalAppender::default());

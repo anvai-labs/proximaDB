@@ -2790,6 +2790,7 @@ mod tests {
         }
     }
 
+    #[test]
     fn parse_ddl_alter_table_materialize_routes_through_pre_parser() {
         let parser = SqlFrontendParser::new();
 
