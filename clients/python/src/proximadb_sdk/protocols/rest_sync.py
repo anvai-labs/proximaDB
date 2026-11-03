@@ -1327,12 +1327,15 @@ class ProximaDBClient:
 
             # CollectionV2Summary (the spec shape for GET /api/v2/collections)
             # keys the id as "collection_id"; older payloads used "id". Accept
-            # both — the hard ["id"] index raised KeyError against the spec
-            # shape, which the v1 client masked via its in-memory fallback
-            # (TD-SDK-3 swap surfaced it).
-            collection_id_value = (
-                coll_data.get("collection_id") or coll_data.get("id") or ""
-            )
+            # both; an entry with NEITHER is malformed (the spec marks
+            # collection_id required) — raise rather than fabricate an
+            # empty-id Collection (silent-failure doctrine).
+            collection_id_value = coll_data.get("collection_id") or coll_data.get("id")
+            if not collection_id_value:
+                raise ProximaDBError(
+                    "Malformed collection list entry: missing both "
+                    f"'collection_id' and 'id' keys (got keys: {sorted(coll_data)})"
+                )
             collections.append(
                 Collection(
                     id=collection_id_value,

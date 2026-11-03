@@ -180,9 +180,7 @@ from .unified_client_v2 import connect_embedded
 
 
 # Convenience factory functions
-def connect(
-    url: str = None, **kwargs
-) -> ProximaDBClient:  # noqa: F811 (the swapped v2 class)
+def connect(url: str = None, **kwargs) -> ProximaDBClient:  # the swapped v2 class
     """Create a ProximaDB client with automatic protocol detection.
 
     Uses unified port mode by default (single port for all protocols).
@@ -223,7 +221,7 @@ def connect_unified(url: str = None, **kwargs) -> ProximaDBClient:
     return ProximaDBClient(**kwargs)
 
 
-def connect_legacy(url: str = None, **kwargs) -> ProximaDBClient:  # noqa: F811
+def connect_legacy(url: str = None, **kwargs) -> ProximaDBClient:
     """Create a ProximaDB client for legacy multi-port mode.
 
     Use this for older deployments with separate ports for REST (5678)

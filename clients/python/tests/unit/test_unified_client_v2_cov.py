@@ -503,8 +503,14 @@ def test_get_collection_stats_found(client, mock_adapter):
 
 
 def test_get_collection_stats_missing(client, mock_adapter):
+    # TD-SDK-3 swap: get_collection restores v1's public contract — a missing
+    # collection raises CollectionNotFoundError (previously returned None and
+    # stats silently degraded to {}).
+    from proximadb_sdk.exceptions import CollectionNotFoundError
+
     mock_adapter.get_collection.return_value = None
-    assert client.get_collection_stats("cid") == {}
+    with pytest.raises(CollectionNotFoundError):
+        client.get_collection_stats("cid")
 
 
 def test_get_performance_info_grpc(mock_adapter):
