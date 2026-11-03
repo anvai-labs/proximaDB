@@ -3642,7 +3642,52 @@ mod tests {
         check(absolute_url.clone(), "rooted.pax", 0).await?;
         invalidate_segment_listing_cache(engine.filesystem(), &absolute_url);
         check(absolute, "rooted.pax", 1).await?;
+        check(relative.clone(), "rooted.pax", 0).await?;
+
+        // Legacy ledgers retain file://./ references, while LIST now returns
+        // absolute URLs. A warm listing must apply the same pending filter as
+        // a fresh listing and the residency inventory, regardless of root_dir.
+        use crate::storage::engines::sst::{retirement_ledger, segment_io};
+        let legacy_input = format!("file://./{relative}/cwd.pax");
+        retirement_ledger::record_pending(
+            cwd_collection.path(),
+            &cwd_collection.path().join("output.pax"),
+            std::slice::from_ref(&legacy_input),
+        )
+        .await?;
+        // Simulate a fresh process loading the raw durable obligation.
+        retirement_ledger::mark_drained(std::slice::from_ref(&legacy_input));
+        retirement_ledger::register_collection_dir(cwd_collection.path());
+        let directory = format!("file://./{relative}");
+        io_trace::scope(async {
+            assert!(engine.discover_sstable_files(&directory).await?.is_empty());
+            assert_eq!(
+                io_trace::snapshot().expect("warm listing trace").list_ops,
+                0
+            );
+            Ok::<_, anyhow::Error>(())
+        })
+        .await?;
+        let fs = engine.filesystem().get_filesystem(&directory)?;
+        assert!(
+            segment_io::live_segments(fs.as_ref(), &directory)
+                .await?
+                .is_empty()
+        );
+        assert!(
+            segment_io::residency_objects(fs.as_ref(), &directory)
+                .await?
+                .is_empty()
+        );
         check(relative, "rooted.pax", 0).await?;
+        invalidate_segment_listing_cache(engine.filesystem(), &directory);
+        assert!(engine.discover_sstable_files(&directory).await?.is_empty());
+        assert_eq!(
+            retirement_ledger::load_ledger(cwd_collection.path())?.pending[0].inputs,
+            vec![legacy_input.clone()],
+            "snapshot aliases must not rewrite durable deletion obligations"
+        );
+        retirement_ledger::mark_drained(&[legacy_input]);
         Ok(())
     }
 
