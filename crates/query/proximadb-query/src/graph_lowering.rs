@@ -437,7 +437,9 @@ fn validate_where_clause(clause: &WhereClause, known_variables: &HashSet<String>
                 ));
             }
         }
-        WhereClause::And(left, right) | WhereClause::Or(left, right) => {
+        WhereClause::And(left, right)
+        | WhereClause::Or(left, right)
+        | WhereClause::Xor(left, right) => {
             validate_where_clause(left, known_variables)?;
             validate_where_clause(right, known_variables)?;
         }

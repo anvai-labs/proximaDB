@@ -163,6 +163,9 @@ pub enum WhereClause {
     And(Box<WhereClause>, Box<WhereClause>),
     /// Logical OR of two conditions
     Or(Box<WhereClause>, Box<WhereClause>),
+    /// Logical XOR of two conditions (the modality grammar's combinator;
+    /// TD-GRAPH-4 step-3 parity)
+    Xor(Box<WhereClause>, Box<WhereClause>),
     /// Logical NOT of a condition
     Not(Box<WhereClause>),
 }

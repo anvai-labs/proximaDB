@@ -855,6 +855,9 @@ fn matches_where_clause(binding: &BindingRow, clause: &WhereClause) -> bool {
         WhereClause::Or(left, right) => {
             matches_where_clause(binding, left) || matches_where_clause(binding, right)
         }
+        WhereClause::Xor(left, right) => {
+            matches_where_clause(binding, left) ^ matches_where_clause(binding, right)
+        }
         WhereClause::Not(inner) => !matches_where_clause(binding, inner),
     }
 }

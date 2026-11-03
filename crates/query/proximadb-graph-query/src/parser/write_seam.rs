@@ -29,15 +29,20 @@ pub(super) fn parse_create_node_spec(input: &str) -> IResult<&str, CreateNodeSpe
         delimited(
             char('('),
             tuple((
-                opt(identifier),                                      // Optional variable
-                opt(preceded(char(':'), identifier)),                 // Optional label
+                preceded(multispace0, opt(any_identifier)), // Optional variable
+                // Labels: :A or :A:B (multi-label — the modality grammar's
+                // shape; previously single-only, which left the seam
+                // internally inconsistent: MERGE multi-label parsed via the
+                // shared node pattern while CREATE did not)
+                many0(preceded(char(':'), any_identifier)),
                 opt(preceded(multispace0, parse_property_value_map)), // Optional properties
+                multispace0,
             )),
             char(')'),
         ),
-        |(variable, label_opt, properties_opt)| CreateNodeSpec {
+        |(variable, labels, properties_opt, _)| CreateNodeSpec {
             variable,
-            labels: label_opt.map(|l| vec![l]).unwrap_or_default(),
+            labels,
             properties: properties_opt.unwrap_or_default(),
         },
     )(input)
@@ -84,8 +89,13 @@ pub(super) fn parse_create_edge_spec(input: &str) -> IResult<&str, CreateEdgeSpe
             delimited(
                 char('['),
                 tuple((
-                    opt(identifier),                                      // Variable
-                    opt(preceded(char(':'), identifier)),                 // Edge type
+                    opt(any_identifier), // Variable
+                    // Edge type — SINGLE type (the modality grammar's
+                    // create-edge shape; review R3-F3: alternation here
+                    // was a seam superset silently dropping the extra
+                    // types — the read path keeps the full list, CREATE
+                    // matches the modality and rejects alternation).
+                    opt(preceded(char(':'), any_identifier)),
                     opt(preceded(multispace0, parse_property_value_map)), // Properties
                 )),
                 char(']'),
@@ -111,7 +121,7 @@ pub(super) fn parse_create_edge_spec(input: &str) -> IResult<&str, CreateEdgeSpe
 // Parse CREATE clause
 pub(super) fn parse_create_clause(input: &str) -> IResult<&str, CreateClause> {
     preceded(
-        tag("CREATE"),
+        tag_no_case("CREATE"),
         preceded(
             multispace1,
             map(
@@ -144,12 +154,15 @@ pub(super) fn parse_create_clause(input: &str) -> IResult<&str, CreateClause> {
 pub(super) fn parse_delete_clause(input: &str) -> IResult<&str, DeleteClause> {
     map(
         tuple((
-            opt(preceded(tag("DETACH"), multispace1)),
+            opt(preceded(tag_no_case("DETACH"), multispace1)),
             preceded(
-                tag("DELETE"),
+                tag_no_case("DELETE"),
                 preceded(
                     multispace1,
-                    separated_list1(delimited(multispace0, char(','), multispace0), identifier),
+                    separated_list1(
+                        delimited(multispace0, char(','), multispace0),
+                        any_identifier,
+                    ),
                 ),
             ),
         )),
@@ -166,9 +179,9 @@ pub(super) fn parse_set_item(input: &str) -> IResult<&str, SetItem> {
         // Property assignment: n.prop = value
         map(
             tuple((
-                identifier,
+                any_identifier,
                 char('.'),
-                identifier,
+                any_identifier,
                 delimited(multispace0, char('='), multispace0),
                 property_value,
             )),
@@ -180,13 +193,13 @@ pub(super) fn parse_set_item(input: &str) -> IResult<&str, SetItem> {
         ),
         // Add label: n:Label
         map(
-            tuple((identifier, char(':'), identifier)),
+            tuple((any_identifier, char(':'), any_identifier)),
             |(variable, _, label)| SetItem::AddLabel { variable, label },
         ),
         // Merge properties: n += {props}
         map(
             tuple((
-                identifier,
+                any_identifier,
                 delimited(multispace0, tag("+="), multispace0),
                 parse_property_value_map,
             )),
@@ -198,7 +211,7 @@ pub(super) fn parse_set_item(input: &str) -> IResult<&str, SetItem> {
         // Replace all properties: n = {props}
         map(
             tuple((
-                identifier,
+                any_identifier,
                 delimited(multispace0, char('='), multispace0),
                 parse_property_value_map,
             )),
@@ -213,7 +226,7 @@ pub(super) fn parse_set_item(input: &str) -> IResult<&str, SetItem> {
 // Parse SET clause
 pub(super) fn parse_set_clause(input: &str) -> IResult<&str, SetClause> {
     preceded(
-        tag("SET"),
+        tag_no_case("SET"),
         preceded(
             multispace1,
             map(
@@ -232,12 +245,12 @@ pub(super) fn parse_remove_item(input: &str) -> IResult<&str, RemoveItem> {
     alt((
         // Remove property: n.prop
         map(
-            tuple((identifier, char('.'), identifier)),
+            tuple((any_identifier, char('.'), any_identifier)),
             |(variable, _, property)| RemoveItem::Property { variable, property },
         ),
         // Remove label: n:Label
         map(
-            tuple((identifier, char(':'), identifier)),
+            tuple((any_identifier, char(':'), any_identifier)),
             |(variable, _, label)| RemoveItem::Label { variable, label },
         ),
     ))(input)
@@ -246,7 +259,7 @@ pub(super) fn parse_remove_item(input: &str) -> IResult<&str, RemoveItem> {
 // Parse REMOVE clause
 pub(super) fn parse_remove_clause(input: &str) -> IResult<&str, RemoveClause> {
     preceded(
-        tag("REMOVE"),
+        tag_no_case("REMOVE"),
         preceded(
             multispace1,
             map(
@@ -265,7 +278,7 @@ pub(super) fn parse_merge_clause(input: &str) -> IResult<&str, MergeClause> {
     map(
         tuple((
             preceded(
-                tag("MERGE"),
+                tag_no_case("MERGE"),
                 preceded(
                     multispace1,
                     map(
@@ -295,12 +308,28 @@ pub(super) fn parse_merge_clause(input: &str) -> IResult<&str, MergeClause> {
                     ),
                 ),
             ),
+            // ON CREATE / ON MATCH — case-insensitive and spacing-
+            // permissive (the modality grammar's shape; review R3-F1: the
+            // frozen single-space case-sensitive tags never landed the
+            // claimed parity).
             opt(preceded(
-                delimited(multispace1, tag("ON CREATE"), multispace1),
+                tuple((
+                    multispace1,
+                    tag_no_case("ON"),
+                    multispace1,
+                    tag_no_case("CREATE"),
+                    multispace1,
+                )),
                 parse_set_clause,
             )),
             opt(preceded(
-                delimited(multispace1, tag("ON MATCH"), multispace1),
+                tuple((
+                    multispace1,
+                    tag_no_case("ON"),
+                    multispace1,
+                    tag_no_case("MATCH"),
+                    multispace1,
+                )),
                 parse_set_clause,
             )),
         )),
@@ -317,7 +346,10 @@ pub(super) fn parse_optional_match_clause(
     input: &str,
 ) -> IResult<&str, (Vec<NodePattern>, Vec<EdgePattern>)> {
     map(
-        preceded(tag("OPTIONAL"), preceded(multispace1, parse_match_clause)),
+        preceded(
+            tag_no_case("OPTIONAL"),
+            preceded(multispace1, parse_match_clause),
+        ),
         |(nodes, edges)| {
             // Mark all nodes and edges as optional
             let optional_nodes = nodes
@@ -342,7 +374,7 @@ pub(super) fn parse_optional_match_clause(
 // Parse WITH clause
 pub(super) fn parse_with_clause(input: &str) -> IResult<&str, WithClause> {
     preceded(
-        tag("WITH"),
+        tag_no_case("WITH"),
         map(
             tuple((
                 parse_distinct,
