@@ -2237,6 +2237,8 @@ mod tests {
             b"l0",
         )
         .unwrap();
+        // Direct fixture writes bypass the flush publication hook.
+        crate::storage::engines::sst::search::invalidate_segment_listing_cache(&data_dir);
 
         let before = engine
             .flush_sort_invocations
@@ -2575,6 +2577,8 @@ mod tests {
             )
             .unwrap();
         }
+        // Each direct fixture mutation changes the live segment set.
+        crate::storage::engines::sst::search::invalidate_segment_listing_cache(storage_url);
         assert_eq!(
             engine
                 .should_trigger_compaction(storage_url, &tags)
@@ -2591,6 +2595,7 @@ mod tests {
         std::fs::rename(&flushed, &parked).unwrap();
         let fifth = data_dir.join("L1_20261029T000005_00000005.pax");
         std::fs::copy(&parked, &fifth).unwrap();
+        crate::storage::engines::sst::search::invalidate_segment_listing_cache(storage_url);
         assert_eq!(
             engine
                 .should_trigger_compaction(storage_url, &tags)
@@ -2601,6 +2606,7 @@ mod tests {
         );
         std::fs::remove_file(&fifth).unwrap();
         std::fs::rename(&parked, &flushed).unwrap();
+        crate::storage::engines::sst::search::invalidate_segment_listing_cache(storage_url);
 
         // With a training compaction in flight the arm stays suppressed
         // (TD-COMPACT-8) and the count arm is the fallback, as before.
