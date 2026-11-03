@@ -827,7 +827,9 @@ mod tests {
             let filesystem_factory = FilesystemFactory::create(FilesystemConfig::default())
                 .await
                 .expect("mock filesystem factory should initialize");
-            Self { _filesystem_factory: filesystem_factory }
+            Self {
+                _filesystem_factory: filesystem_factory,
+            }
         }
     }
 
