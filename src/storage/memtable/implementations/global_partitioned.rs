@@ -144,8 +144,20 @@ struct CollectionPartition {
     /// Key design: We store complete WALVectorBatch objects rather than individual
     /// vectors to preserve batch atomicity and enable efficient group operations.
     /// The batch ID is globally unique (CompactBatchId) ensuring no collisions.
-    wal_batches:
-        HashMap<String, crate::storage::memtable::specialized::wal_behavior::WALVectorBatch>,
+    ///
+    /// TD-MEMTABLE-MVCC-1: each batch carries a monotonically increasing
+    /// insertion sequence (the partition's counter), so the MVCC winner rule
+    /// has a deterministic final tiebreak — never HashMap iteration order.
+    wal_batches: HashMap<
+        String,
+        (
+            crate::storage::memtable::specialized::wal_behavior::WALVectorBatch,
+            u64,
+        ),
+    >,
+
+    /// Monotonic insertion counter for the batch-sequence tiebreak above.
+    next_batch_sequence: u64,
 
     /// Vector ID to batch lookup index for fast get operations
     ///
@@ -175,6 +187,7 @@ impl CollectionPartition {
     fn new() -> Self {
         Self {
             wal_batches: HashMap::new(),
+            next_batch_sequence: 0,
             vector_id_index: HashMap::new(),
             total_size: 0,
             vector_count: 0,
@@ -283,8 +296,10 @@ impl CollectionPartition {
             }
         }
 
-        // Store the batch
-        self.wal_batches.insert(batch_id, batch);
+        // Store the batch with its monotonic insertion sequence (TD-MEMTABLE-MVCC-1)
+        let batch_seq = self.next_batch_sequence;
+        self.next_batch_sequence += 1;
+        self.wal_batches.insert(batch_id, (batch, batch_seq));
 
         // Update statistics
         self.total_size += batch_size;
@@ -332,42 +347,62 @@ impl CollectionPartition {
     /// "deleted here" from "not here": `vector_by_id` returns `None` for both,
     /// so an unflushed delete fell through to the flushed live copy and the
     /// by-id read resurrected it (#16d, TD-PGWIRE-VECDEL-1).
+    /// TD-MEMTABLE-MVCC-1: the ONE MVCC winner rule for all unflushed reads.
+    ///
+    /// A total order reflecting write order:
+    ///   1. `updated_at_ns` (later write wins — this is what makes a DELETE
+    ///      tombstone beat a live copy written earlier, even when the live
+    ///      copy has a higher `record_version`, e.g. every DocumentService
+    ///      document at version 1 vs a version-0 tombstone)
+    ///   2. `record_version` (higher wins — an explicit version bump)
+    ///   3. `batch_seq` (the partition's monotonic insertion counter —
+    ///      later-inserted batch wins; NEVER HashMap iteration order)
+    ///
+    /// This matches `read.rs::is_fresher` (timestamp-first), the search-path
+    /// merge (`core::search::merge`), and the storage-inclusive list merge.
+    fn mvcc_is_newer(
+        candidate: &ProximaRecord,
+        candidate_batch_seq: u64,
+        current: &ProximaRecord,
+        current_batch_seq: u64,
+    ) -> bool {
+        (
+            candidate.updated_at_ns,
+            candidate.record_version,
+            candidate_batch_seq,
+        ) > (
+            current.updated_at_ns,
+            current.record_version,
+            current_batch_seq,
+        )
+    }
+
     fn latest_version_by_id(&self, vector_id: &str) -> Option<ProximaRecord> {
         // Skip if no ID provided (immutable vectors don't have IDs)
         if vector_id.is_empty() {
             return None;
         }
 
-        let mut latest_record: Option<(ProximaRecord, u64, u64)> = None; // (record, sequence, record_version)
+        let mut latest: Option<(ProximaRecord, u64)> = None; // (record, batch_seq)
 
-        // Search through all batches to find the latest version
-        for batch in self.wal_batches.values() {
+        for (batch, batch_seq) in self.wal_batches.values() {
             for vector_record in batch.vector_records.iter() {
                 if !vector_record.oid.is_empty() && vector_record.oid == vector_id {
-                    let sequence = batch
-                        .timestamp
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|duration| duration.as_millis() as u64)
-                        .unwrap_or(0);
-                    let version = vector_record.record_version;
-
-                    // Check if this is a newer version (prioritize version number over timestamp)
-                    let is_newer = match &latest_record {
-                        Some((_, existing_seq, existing_version)) => {
-                            version > *existing_version
-                                || (version == *existing_version && sequence > *existing_seq)
+                    let is_newer = match &latest {
+                        Some((existing, existing_seq)) => {
+                            Self::mvcc_is_newer(vector_record, *batch_seq, existing, *existing_seq)
                         }
                         None => true, // First occurrence
                     };
 
                     if is_newer {
-                        latest_record = Some((vector_record.clone(), sequence, version));
+                        latest = Some((vector_record.clone(), *batch_seq));
                     }
                 }
             }
         }
 
-        latest_record.map(|(record, _, _)| record)
+        latest.map(|(record, _)| record)
     }
 
     /// Clear batches up to sequence number within this collection
@@ -379,12 +414,12 @@ impl CollectionPartition {
         let batch_ids_to_remove: Vec<String> = self
             .wal_batches
             .iter()
-            .filter(|(_, batch)| batch.is_flushed)
+            .filter(|(_, (batch, _))| batch.is_flushed)
             .map(|(id, _)| id.clone())
             .collect();
 
         for batch_id in batch_ids_to_remove {
-            if let Some(batch) = self.wal_batches.remove(&batch_id) {
+            if let Some((batch, _)) = self.wal_batches.remove(&batch_id) {
                 // Remove vector IDs from index
                 for vector_record in batch.vector_records.iter() {
                     if !vector_record.oid.is_empty() {
@@ -422,33 +457,25 @@ impl CollectionPartition {
         // Borrowed MVCC state (single shared borrow over the batches): the
         // previous map cloned the full record for EVERY newer version; only
         // the surviving records are cloned, once, in the pass below.
-        let mut id_to_latest: HashMap<&str, (&ProximaRecord, u64, u64)> = HashMap::new(); // (record ref, sequence, record_version)
+        // (record ref, batch_seq) — TD-MEMTABLE-MVCC-1
+        let mut id_to_latest: HashMap<&str, (&ProximaRecord, u64)> = HashMap::new();
         let mut vectors_without_id: Vec<&ProximaRecord> = Vec::new();
         let current_time_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
 
         // Collect latest versions for each ID
-        for batch in self.wal_batches.values() {
+        for (batch, batch_seq) in self.wal_batches.values() {
             for vector_record in batch.vector_records.iter() {
-                let sequence = batch
-                    .timestamp
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|duration| duration.as_millis() as u64)
-                    .unwrap_or(0);
-                let version = vector_record.record_version;
-
                 if !vector_record.oid.is_empty() {
                     let vector_id = &vector_record.oid;
-                    // Check if this is the latest version (prioritize version number over timestamp)
                     let is_newer = match id_to_latest.get(vector_id.as_str()) {
-                        Some((_, existing_seq, existing_version)) => {
-                            version > *existing_version
-                                || (version == *existing_version && sequence > *existing_seq)
+                        Some((existing, existing_seq)) => {
+                            Self::mvcc_is_newer(vector_record, *batch_seq, existing, *existing_seq)
                         }
                         None => true,
                     };
 
                     if is_newer {
-                        id_to_latest.insert(vector_id.as_str(), (vector_record, sequence, version));
+                        id_to_latest.insert(vector_id.as_str(), (vector_record, *batch_seq));
                     }
                 } else {
                     // No ID - include directly if not expired
@@ -466,7 +493,7 @@ impl CollectionPartition {
         // Collect final results, filtering out expired records
         let mut vectors = Vec::new();
 
-        for (_, (record, _, _)) in id_to_latest {
+        for (_, (record, _)) in id_to_latest {
             let is_expired = record.valid_to_ns.map(|expires| expires < current_time_ns);
 
             if !is_expired.unwrap_or(false) {
@@ -487,39 +514,35 @@ impl CollectionPartition {
     fn get_all_vectors_raw(&self) -> Vec<ProximaRecord> {
         self.wal_batches
             .values()
-            .flat_map(|batch| batch.vector_records.iter().cloned())
+            .flat_map(|(batch, _)| batch.vector_records.iter().cloned())
             .collect()
     }
 
     /// Rebuild the deduped, time-ordered [`ScanIndex`] from `wal_batches`.
     ///
     /// Winner selection per oid uses the SAME MVCC rule as
-    /// [`Self::get_all_vectors`] — highest `record_version`, then highest
-    /// batch-timestamp sequence — so the indexed scan returns byte-identical
+    /// [`Self::get_all_vectors`] — the total order from [`Self::mvcc_is_newer`]
+    /// (TD-MEMTABLE-MVCC-1) — so the indexed scan returns byte-identical
     /// results. Only locators are recorded (no record clones). TTL is applied at
     /// READ time (a record can expire after the index is built), matching
     /// `get_all_vectors`.
     fn rebuild_scan_index(&mut self, collection_id: &str) {
-        // oid -> (winner_updated_at_ns, locator, winner_seq, winner_version)
-        let mut winners: HashMap<String, (i64, RecordLocator, u64, u64)> = HashMap::new();
+        // oid -> (updated_at_ns, version, batch_seq, locator) — the first three
+        // are the comparator key, stored to avoid needing the record on compare.
+        let mut winners: HashMap<String, (i64, u64, u64, RecordLocator)> = HashMap::new();
         let mut has_empty_oid = false;
 
-        for (batch_key, batch) in self.wal_batches.iter() {
-            let seq = batch
-                .timestamp
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0);
+        for (batch_key, (batch, batch_seq)) in self.wal_batches.iter() {
             for (idx, rec) in batch.vector_records.iter().enumerate() {
                 if rec.oid.is_empty() {
                     has_empty_oid = true;
                     continue;
                 }
-                let version = rec.record_version;
                 let is_newer = match winners.get(&rec.oid) {
-                    Some((_, _, existing_seq, existing_version)) => {
-                        version > *existing_version
-                            || (version == *existing_version && seq > *existing_seq)
+                    Some((existing_ns, existing_ver, existing_seq, _)) => {
+                        // Same total order as mvcc_is_newer, inline (no record clone)
+                        (rec.updated_at_ns, rec.record_version, *batch_seq)
+                            > (*existing_ns, *existing_ver, *existing_seq)
                     }
                     None => true,
                 };
@@ -528,12 +551,12 @@ impl CollectionPartition {
                         rec.oid.clone(),
                         (
                             rec.updated_at_ns,
+                            rec.record_version,
+                            *batch_seq,
                             RecordLocator {
                                 batch_key: batch_key.clone(),
                                 idx,
                             },
-                            seq,
-                            version,
                         ),
                     );
                 }
@@ -541,7 +564,7 @@ impl CollectionPartition {
         }
 
         let mut ordered = BTreeMap::new();
-        for (oid, (updated_at_ns, locator, _, _)) in winners {
+        for (oid, (updated_at_ns, _, _, locator)) in winners {
             ordered.insert((updated_at_ns, oid), locator);
         }
         // Operator gauge: distinct indexed oids ≈ the index's resident size.
@@ -605,7 +628,7 @@ impl CollectionPartition {
             }
             let Some(rec) = batches
                 .get(&locator.batch_key)
-                .and_then(|b| b.vector_records.get(locator.idx))
+                .and_then(|(b, _)| b.vector_records.get(locator.idx))
             else {
                 continue;
             };
@@ -674,8 +697,8 @@ impl CollectionPartition {
         // record clone — the previous map cloned the full ProximaRecord for
         // every newer version seen and dropped the superseded copy at once.
         // Survivors are cloned exactly once in the materialization pass below.
-        let mut id_to_latest: HashMap<&str, (SimilarityResult, &ProximaRecord, u64, u64)> =
-            HashMap::new(); // (score, record ref, sequence, record_version)
+        let mut id_to_latest: HashMap<&str, (SimilarityResult, &ProximaRecord, u64)> =
+            HashMap::new(); // (score, record ref, batch_seq) — TD-MEMTABLE-MVCC-1
         let mut results_without_id: Vec<(SimilarityResult, &ProximaRecord)> = Vec::new();
         let current_time_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
 
@@ -683,7 +706,7 @@ impl CollectionPartition {
         let mut batches_skipped = 0;
 
         // First pass: Find latest version of each ID by sequence and version (MVCC)
-        for (batch_id, wal_batch) in &self.wal_batches {
+        for (batch_id, (wal_batch, batch_seq)) in &self.wal_batches {
             batches_checked += 1;
 
             // Use bloom filter to quickly skip irrelevant batches
@@ -714,20 +737,21 @@ impl CollectionPartition {
             );
 
             for vector_record in wal_batch.vector_records.iter() {
-                let sequence = wal_batch
-                    .timestamp
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|duration| duration.as_millis() as u64)
-                    .unwrap_or(0);
-                let version = vector_record.record_version;
-
                 if !vector_record.oid.is_empty() {
                     let vector_id = &vector_record.oid;
-                    // Check if this is the latest version (prioritize version number over timestamp)
+                    // Same total order as mvcc_is_newer (TD-MEMTABLE-MVCC-1):
+                    // updated_at_ns → record_version → batch_seq
                     let is_newer = match id_to_latest.get(vector_id.as_str()) {
-                        Some((_, _, existing_seq, existing_version)) => {
-                            version > *existing_version
-                                || (version == *existing_version && sequence > *existing_seq)
+                        Some((_, existing, existing_seq)) => {
+                            (
+                                vector_record.updated_at_ns,
+                                vector_record.record_version,
+                                *batch_seq,
+                            ) > (
+                                existing.updated_at_ns,
+                                existing.record_version,
+                                *existing_seq,
+                            )
                         }
                         None => true,
                     };
@@ -756,16 +780,13 @@ impl CollectionPartition {
                                 vec_values,
                                 distance_metric,
                             );
-                            id_to_latest.insert(
-                                vector_id.as_str(),
-                                (score, vector_record, sequence, version),
-                            );
+                            id_to_latest
+                                .insert(vector_id.as_str(), (score, vector_record, *batch_seq));
 
                             tracing::debug!(
-                                "📝 Updated latest version for ID {}: seq={}, version={}",
+                                "📝 Updated latest version for ID {}: batch_seq={}",
                                 &vector_record.oid,
-                                sequence,
-                                version
+                                batch_seq
                             );
                         }
                     }
@@ -801,7 +822,7 @@ impl CollectionPartition {
         let mut filtered_count = 0;
         let latest_versions_count = id_to_latest.len();
 
-        for (id, (score, vector_record, _, _)) in id_to_latest {
+        for (id, (score, vector_record, _)) in id_to_latest {
             let is_expired = vector_record
                 .valid_to_ns
                 .map(|expires| expires < current_time_ns);
@@ -971,7 +992,7 @@ impl GlobalPartitionedMemtable {
         // Linear search through all collections (could be optimized with sequence->collection mapping)
         for partition in collections.values() {
             // Search through native WAL batches
-            for batch in partition.wal_batches.values() {
+            for (batch, _) in partition.wal_batches.values() {
                 // With CompactBatchId, we don't track individual sequences
                 // Just return the first vector as a placeholder
                 // Deferred: Implement proper sequence tracking if needed
@@ -1415,7 +1436,7 @@ impl GlobalPartitionedMemtable {
 
         // Collect all vectors from all collections with their sequences
         for partition in collections.values() {
-            for batch in partition.wal_batches.values() {
+            for (batch, _) in partition.wal_batches.values() {
                 for (index, vector_record) in batch.vector_records.iter().enumerate() {
                     // With CompactBatchId, we use index as pseudo-sequence
                     let vector_sequence = index as u64;
@@ -1455,7 +1476,7 @@ impl GlobalPartitionedMemtable {
     pub async fn mark_all_batches_as_flushed(&self) -> Result<()> {
         let mut collections = self.collections.write().await;
         for partition in collections.values_mut() {
-            for batch in partition.wal_batches.values_mut() {
+            for (batch, _) in partition.wal_batches.values_mut() {
                 batch.is_flushed = true;
             }
             // Flushed batches leave the unflushed scan view — invalidate.
@@ -1468,7 +1489,7 @@ impl GlobalPartitionedMemtable {
     pub async fn remove_batch(&self, collection_id: &str, batch_id: &str) -> Result<()> {
         let mut collections = self.collections.write().await;
         if let Some(partition) = collections.get_mut(collection_id)
-            && let Some(removed_batch) = partition.wal_batches.remove(batch_id)
+            && let Some((removed_batch, _)) = partition.wal_batches.remove(batch_id)
         {
             // Update partition stats
             partition.vector_count = partition
@@ -1544,7 +1565,7 @@ impl GlobalPartitionedMemtable {
 
         let mut removed_records = 0usize;
         for batch_id in batch_ids {
-            let removed_batch = partition.wal_batches.remove(batch_id).ok_or_else(|| {
+            let (removed_batch, _) = partition.wal_batches.remove(batch_id).ok_or_else(|| {
                 anyhow::anyhow!(
                     "claimed batch '{}:{}' disappeared during exact retirement",
                     collection_id,
@@ -1723,7 +1744,7 @@ impl GlobalPartitionedMemtable {
     pub async fn mark_all_batches_flushed(&self, collection_id: &str) -> Result<()> {
         let mut collections = self.collections.write().await;
         if let Some(partition) = collections.get_mut(collection_id) {
-            for batch in partition.wal_batches.values_mut() {
+            for (batch, _) in partition.wal_batches.values_mut() {
                 batch.is_flushed = true;
             }
             partition.scan_index = None;
@@ -1739,6 +1760,127 @@ mod tests {
     use super::*;
     use crate::storage::memtable::specialized::wal_behavior::WALVectorBatch;
     use crate::storage::persistence::write_ahead_log::BatchId;
+
+    /// TD-MEMTABLE-MVCC-1 red test — failure mode 1: a DELETE tombstone
+    /// (record_version=0) must suppress a live row with record_version=1
+    /// (the DocumentService default: every document delete loses to its live
+    /// copy while both are unflushed). The comparator must pick the
+    /// tombstone, and the tombstone must be filtered from the visible set.
+    #[tokio::test]
+    async fn tombstone_suppresses_higher_version_live_copy() {
+        let memtable = GlobalPartitionedMemtable::new();
+        let collection_id = "1mvcc_fm1";
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
+
+        // Live document: record_version=1 (DocumentService default)
+        let live = make_proxima_record("doc_1", vec![0.1, 0.2, 0.3], 1, None);
+        let batch1 = WALVectorBatch {
+            batch_id: BatchId::new(),
+            vector_records: Arc::new(vec![live]),
+            timestamp: std::time::SystemTime::now(),
+            total_size_bytes: 128,
+            is_flushed: false,
+            metadata_bloom_filter: None,
+        };
+        memtable.add_wal_batch(collection_id, batch1).await.unwrap();
+
+        // Delete tombstone: record_version=0 (tombstone_records_for_ids default)
+        let mut tombstone = make_proxima_record("doc_1", vec![], 0, Some(0));
+        tombstone.updated_at_ns = (now_ms + 1) * 1_000_000; // later than live
+        let batch2 = WALVectorBatch {
+            batch_id: BatchId::new(),
+            vector_records: Arc::new(vec![tombstone]),
+            timestamp: std::time::SystemTime::now(),
+            total_size_bytes: 64,
+            is_flushed: false,
+            metadata_bloom_filter: None,
+        };
+        memtable.add_wal_batch(collection_id, batch2).await.unwrap();
+
+        // get_all_vectors must NOT return the live copy: the tombstone won
+        let visible = memtable
+            .get_collection_vectors(collection_id)
+            .await
+            .unwrap();
+        let surviving: Vec<&ProximaRecord> = visible.iter().filter(|r| r.oid == "doc_1").collect();
+        assert!(
+            surviving.is_empty(),
+            "TD-MEMTABLE-MVCC-1 fm1: the tombstone (version=0, later) must suppress the live copy (version=1, earlier); got {} surviving records with oid=doc_1",
+            surviving.len()
+        );
+
+        // latest_version_by_id must return the TOMBSTONE (not the live copy):
+        // the comparator's winner is the tombstone (later updated_at_ns), and
+        // the read coordinator above applies the dead filter.
+        let by_id = memtable
+            .latest_version_by_id(collection_id, "doc_1")
+            .await
+            .unwrap();
+        let winner = by_id.expect("a winner must exist (the tombstone)");
+        assert!(
+            winner.valid_to_ns.is_some_and(|v| v == 0),
+            "TD-MEMTABLE-MVCC-1 fm1: by-id read must return the TOMBSTONE (valid_to_ns=Some(0)), not the live copy; got valid_to_ns={:?} record_version={}",
+            winner.valid_to_ns,
+            winner.record_version
+        );
+    }
+
+    /// TD-MEMTABLE-MVCC-1 red test — failure mode 2: two writes to the same
+    /// oid in the same millisecond must have a deterministic winner (the
+    /// later write), not HashMap-iteration-order. Here: insert then delete
+    /// in the same millisecond — the delete must win.
+    #[tokio::test]
+    async fn same_millisecond_write_then_delete_is_deterministic() {
+        let memtable = GlobalPartitionedMemtable::new();
+        let collection_id = "1mvcc_fm2";
+
+        // Pin BOTH records to a FIXED nanosecond timestamp: no dependence on
+        // system-clock resolution or `make_proxima_record`'s internal now().
+        // The only distinguishing term is the batch insertion sequence.
+        let pinned_ns: i64 = 1_700_000_000_000_000_000; // 2023-11-14, arbitrary
+
+        let mut live = make_proxima_record("row_1", vec![0.1], 0, None);
+        live.updated_at_ns = pinned_ns;
+        let mut tombstone = make_proxima_record("row_1", vec![], 0, Some(0));
+        tombstone.updated_at_ns = pinned_ns;
+
+        let batch1 = WALVectorBatch {
+            batch_id: BatchId::new(),
+            vector_records: Arc::new(vec![live]),
+            timestamp: std::time::SystemTime::now(),
+            total_size_bytes: 64,
+            is_flushed: false,
+            metadata_bloom_filter: None,
+        };
+        let batch2 = WALVectorBatch {
+            batch_id: BatchId::new(),
+            vector_records: Arc::new(vec![tombstone]),
+            timestamp: std::time::SystemTime::now(),
+            total_size_bytes: 32,
+            is_flushed: false,
+            metadata_bloom_filter: None,
+        };
+        memtable.add_wal_batch(collection_id, batch1).await.unwrap();
+        memtable.add_wal_batch(collection_id, batch2).await.unwrap();
+
+        // The tombstone (added second) must win over the live copy (added first)
+        let visible = memtable
+            .get_collection_vectors(collection_id)
+            .await
+            .unwrap();
+        let surviving: Vec<&ProximaRecord> = visible.iter().filter(|r| r.oid == "row_1").collect();
+        assert!(
+            surviving.is_empty(),
+            "TD-MEMTABLE-MVCC-1 fm2: the second write (tombstone) must deterministically beat the first (live) even in the same millisecond; got {} surviving",
+            surviving.len()
+        );
+    }
+
+    use super::*;
 
     #[tokio::test]
     async fn test_global_partitioned_batch_operations() {
@@ -2713,10 +2855,12 @@ mod tests {
         let collection_id = "1uctd3h";
         let vector_id = "vector_1";
 
-        let vector_v3 = create_vector_record(vector_id, vec![3.0, 3.0, 3.0], Some(3), None);
-        let batch3 = create_wal_batch(collection_id, 3, vec![vector_v3.clone()]);
-        memtable.add_wal_batch(collection_id, batch3).await.unwrap();
-
+        // TD-MEMTABLE-MVCC-1: insert in CHRONOLOGICAL order (v1 → v2 → v3) —
+        // the old test shuffled the insertion order and relied on version-first
+        // ordering to pick v3. Under the new timestamp-first comparator, the
+        // LAST-WRITTEN record wins; creating v3 last ensures it also has the
+        // latest timestamp, preserving the test's intent (highest version is
+        // visible) while being compatible with write-order semantics.
         let vector_v1 = create_vector_record(vector_id, vec![1.0, 1.0, 1.0], Some(1), None);
         let batch1 = create_wal_batch(collection_id, 1, vec![vector_v1.clone()]);
         memtable.add_wal_batch(collection_id, batch1).await.unwrap();
@@ -2724,6 +2868,10 @@ mod tests {
         let vector_v2 = create_vector_record(vector_id, vec![2.0, 2.0, 2.0], Some(2), None);
         let batch2 = create_wal_batch(collection_id, 2, vec![vector_v2.clone()]);
         memtable.add_wal_batch(collection_id, batch2).await.unwrap();
+
+        let vector_v3 = create_vector_record(vector_id, vec![3.0, 3.0, 3.0], Some(3), None);
+        let batch3 = create_wal_batch(collection_id, 3, vec![vector_v3.clone()]);
+        memtable.add_wal_batch(collection_id, batch3).await.unwrap();
 
         let result = memtable
             .vector_by_id(collection_id, vector_id)
