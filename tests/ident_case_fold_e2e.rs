@@ -28,7 +28,6 @@
 use arrow_array::{Int16Array, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use parquet::arrow::ArrowWriter;
-use std::net::TcpListener;
 use std::sync::Arc;
 use tempfile::TempDir;
 use tokio_postgres::{NoTls, SimpleQueryMessage};

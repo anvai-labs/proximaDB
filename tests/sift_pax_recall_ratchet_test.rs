@@ -65,7 +65,7 @@ use proximadb::storage::traits::{
     FlushParameters, StorageQueryContext, StorageQueryMetadata, UnifiedStorageEngine,
 };
 use proximadb_block_format::{RankMetric, VectorQuant};
-use proximadb_records::{EmbeddingCell, EmbeddingValues, ProximaRecord};
+use proximadb_records::{EmbeddingCell, ProximaRecord};
 use rayon::prelude::*;
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};

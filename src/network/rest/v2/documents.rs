@@ -757,7 +757,6 @@ mod tests {
         }
     }
 
-    use super::*;
     use crate::services::operations::BatchOperationResult;
     use proximadb_embedding::config::{EmbedRoute, EmbeddingConfig};
     use proximadb_embedding::scheduler::EmbedSchedulerConfig;

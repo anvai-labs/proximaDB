@@ -1243,7 +1243,7 @@ mod tests {
     async fn ranged_pushdown_prunes_bytes_and_matches() {
         use proximadb_block_format::{BlockCompression, BlockMode};
         use proximadb_data_model::ProximaType;
-        use proximadb_records::{EmbeddingCell, EmbeddingValues};
+        use proximadb_records::EmbeddingCell;
         use proximadb_storage_common::pax_block::PaxSegmentWriter;
 
         // Pin the cached gate directly (not via env): the plain `cargo test --lib` runner

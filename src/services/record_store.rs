@@ -4689,7 +4689,7 @@ mod tests {
     }
     use proximadb_data_model::{ProximaType, VectorElement};
     use proximadb_kernel::error::StorageError;
-    use proximadb_records::{EmbeddingCell, EmbeddingValues, RecordScan, RecordStore};
+    use proximadb_records::{EmbeddingCell, RecordScan, RecordStore};
     use proximadb_storage_common::object_store_bridge::{
         BridgeInMemoryObjectStore as InMemory, BridgeObjectStore,
     };

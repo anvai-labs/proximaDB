@@ -1156,7 +1156,6 @@ mod tests {
     #[serial]
     #[ignore = "environment-sensitive: load_directory returns None in some CI and local runs; fails on clean develop locally too — not caused by TD-PAXDIR-2 (the listing cache); tracked separately"]
     async fn a_warm_directory_planned_query_also_takes_three_waves() {
-        use crate::observability::io_trace;
         // TD-PAXDIR-2 (L1): clear the cross-query listing cache so the wave
         // count includes the discovery round trip.
         crate::storage::engines::sst::search::clear_segment_listing_cache_for_tests();

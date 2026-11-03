@@ -5457,7 +5457,7 @@ mod recluster_apply_tests {
     use super::*;
     use crate::index::axis::index_factory::AxisVectorIndex;
     use crate::index::axis::types::AxisConfig;
-    use proximadb_records::{EmbeddingCell, EmbeddingValues};
+    use proximadb_records::EmbeddingCell;
 
     fn rec(id: &str, v: Vec<f32>) -> ProximaRecord {
         ProximaRecord {
@@ -6516,7 +6516,7 @@ mod hot_swap_ef_tests {
 
     #[tokio::test]
     async fn rebuild_for_recall_target_sizes_from_advisor() {
-        use proximadb_records::{EmbeddingCell, EmbeddingValues};
+        use proximadb_records::EmbeddingCell;
 
         let manager = make_manager().await;
 
@@ -6881,7 +6881,7 @@ mod clear_collection_vectors_tests {
 #[cfg(test)]
 mod hmgi_lifecycle_tests {
     use super::*;
-    use proximadb_records::{EmbeddingCell, EmbeddingValues};
+    use proximadb_records::EmbeddingCell;
 
     #[tokio::test]
     async fn failed_enable_does_not_publish_or_leave_owned_partitions() {

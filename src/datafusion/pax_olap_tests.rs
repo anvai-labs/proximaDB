@@ -1071,7 +1071,7 @@ mod tests {
     /// Writes a v4 row-group segment with `rows` records at
     /// `created_at = (i+1) * 1000` (32-dim embeddings so RGs carry real bulk).
     fn write_v4_segment(dir: &std::path::Path, rows: usize) -> std::path::PathBuf {
-        use proximadb_records::{EmbeddingCell, EmbeddingValues};
+        use proximadb_records::EmbeddingCell;
         use proximadb_storage_common::pax_block::RG_TARGET_MIN_BYTES;
 
         let seg = dir.join("seg.pax");
@@ -1264,7 +1264,7 @@ mod tests {
         use arrow_schema::{DataType, Field, Schema};
         use datafusion::prelude::SessionContext;
         use proximadb_block_format::col_id;
-        use proximadb_records::{EmbeddingCell, EmbeddingValues, ProximaRecord};
+        use proximadb_records::{EmbeddingCell, ProximaRecord};
 
         use crate::datafusion::engine_adapters::register_pax_location;
         use crate::storage::persistence::filesystem::FilesystemFactory;
@@ -1387,7 +1387,7 @@ mod tests {
         use crate::storage::persistence::filesystem::FilesystemFactory;
 
         const ROWS: usize = 4_000;
-        let build = |path: &std::path::Path, rg: bool| {
+        let _build = |path: &std::path::Path, rg: bool| {
             let records: Vec<ProximaRecord> = (0..ROWS)
                 .map(|i| {
                     let ts = (i + 1) as i64 * 1000;
@@ -1419,7 +1419,7 @@ mod tests {
         let v3_dir = dir.path().join("v3");
         std::fs::create_dir_all(&v3_dir).expect("v3 dir");
         {
-            use proximadb_records::{EmbeddingCell, EmbeddingValues};
+            use proximadb_records::EmbeddingCell;
             let seg = v3_dir.join("seg.pax");
             let mut writer = proximadb_storage_common::pax_block::PaxSegmentWriter::new(
                 &seg,
@@ -1455,8 +1455,7 @@ mod tests {
         let v4_dir = dir.path().join("v4");
         std::fs::create_dir_all(&v4_dir).expect("v4 dir");
         {
-            use proximadb_records::{EmbeddingCell, EmbeddingValues};
-            use proximadb_storage_common::pax_block::RG_TARGET_MIN_BYTES;
+            use proximadb_records::EmbeddingCell;
             let seg = v4_dir.join("seg.pax");
             let mut writer = proximadb_storage_common::pax_block::PaxSegmentWriter::new(
                 &seg,
@@ -1577,7 +1576,6 @@ mod tests {
 
         use crate::datafusion::engine_adapters::register_pax_location;
         use crate::observability::io_trace;
-        use crate::storage::engines::sst::segment_format::write_pax_segment;
         use crate::storage::persistence::filesystem::FilesystemFactory;
 
         let dir = tempfile::tempdir().expect("tempdir");

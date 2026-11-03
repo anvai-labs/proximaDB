@@ -88,7 +88,7 @@ fn cache_tier_discriminant_matches_tier_counter_contract() {
 #[test]
 fn exact_authority_holds_for_region_c_segment() {
     use proximadb_block_format::{BlockCompression, BlockMode, VectorQuant};
-    use proximadb_records::{EmbeddingCell, EmbeddingValues};
+    use proximadb_records::EmbeddingCell;
     use proximadb_storage_common::pax_block::PaxSegmentWriter;
 
     let dir = tempfile::tempdir().expect("tempdir");
@@ -766,7 +766,7 @@ async fn invariant_l2_survives_dram_and_store_restart() {
 
 #[tokio::test]
 async fn local_pax_seed_streams_regions_into_persistent_cache() {
-    use proximadb_records::{EmbeddingCell, EmbeddingValues};
+    use proximadb_records::EmbeddingCell;
     use proximadb_storage_common::coarse_directory::CoarseModel;
 
     const DIM: usize = 8;
@@ -1140,7 +1140,7 @@ fn adaptive_range_policy_obeys_gate_knee_and_explicit_override_precedence() {
     }
 }
 use crate::storage::engines::core::formats::proximablocks::BlockCompressionConfig;
-use proximadb_records::{EmbeddingCell, EmbeddingValues};
+use proximadb_records::EmbeddingCell;
 
 fn rec(oid: &str, ts: i64, vec: Vec<f32>) -> ProximaRecord {
     let mut r = ProximaRecord {

@@ -30,7 +30,7 @@ use proximadb::storage::memtable::specialized::wal_behavior::WALVectorBatch;
 use proximadb::storage::persistence::write_ahead_log::BatchId;
 use proximadb_records::ProximaRecord;
 use std::sync::Arc;
-use tracing::{debug, error, info, warn};
+use tracing::debug;
 
 /// Test semantic consistency across different distance metrics
 #[tokio::test]
@@ -487,7 +487,7 @@ async fn test_edge_cases_and_error_handling() {
 
     // Test empty vectors
     let empty_vec: Vec<f32> = vec![];
-    let result = compute.calculate_distance(&empty_vec, &empty_vec, &DistanceMetric::Euclidean);
+    let _result = compute.calculate_distance(&empty_vec, &empty_vec, &DistanceMetric::Euclidean);
     // Should handle gracefully without panicking
 
     // Test very large values

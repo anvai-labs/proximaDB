@@ -31,7 +31,7 @@ use proximadb::database::ProximaDB;
 use proximadb::network::arrow_ipc::codec::ArrowProtoCodec;
 use proximadb::proto::proximadb_v2::TypedSearchRequest;
 use proximadb::proto::proximadb_v2::proxima_record_service_client::ProximaRecordServiceClient;
-use proximadb_records::{EmbeddingCell, EmbeddingValues, ProximaRecord};
+use proximadb_records::{EmbeddingCell, ProximaRecord};
 use serde_json::json;
 use tempfile::TempDir;
 use tokio::time::sleep;

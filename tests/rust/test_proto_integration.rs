@@ -6,7 +6,7 @@
 use anyhow::Result;
 use proximadb::proto::proximadb_v1::StorageEngine as StorageEngineType;
 use serde_json::json;
-use tracing::{debug, error, info, warn};
+use tracing::debug;
 
 // Import test utilities - accessible from tests/common/
 #[path = "../common/collection_builder.rs"]

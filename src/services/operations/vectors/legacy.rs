@@ -6170,7 +6170,7 @@ mod index_first_search_tests {
             io_budget: None,
         }];
 
-        let filesystem = Arc::new(
+        let _filesystem = Arc::new(
             crate::storage::persistence::filesystem::FilesystemFactory::create(Default::default())
                 .await?,
         );

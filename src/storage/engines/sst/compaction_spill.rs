@@ -1734,7 +1734,7 @@ mod tests {
     use super::*;
     use crate::core::search::mvcc_resolution::MvccResolver;
     use proximadb_block_format::{BlockCompression, BlockMode, VectorQuant};
-    use proximadb_records::{EmbeddingCell, EmbeddingValues, ProximaRecord};
+    use proximadb_records::{EmbeddingCell, ProximaRecord};
     use proximadb_storage_common::pax_block::PaxSegmentWriter;
     use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 

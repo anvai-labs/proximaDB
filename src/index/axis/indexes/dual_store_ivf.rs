@@ -2943,7 +2943,6 @@ impl UnifiedIvfIndex {
 mod tests {
     use super::{IvfClusteringMethod, PartitionedKey};
     use crate::compute::distance_computation::DistanceMetric;
-    use crate::core::search::bounded_queue::TopKHeap;
     use crate::index::axis::*;
 
     #[test]

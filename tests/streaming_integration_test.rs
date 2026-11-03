@@ -32,7 +32,7 @@ use proximadb::streaming::{
     BackpressureLevel, RingBuffer, SessionConfig, SessionState, StreamConfig, StreamCoordinator,
     StreamId, Watermarks,
 };
-use proximadb_records::{EmbeddingCell, EmbeddingValues, ProximaRecord};
+use proximadb_records::{EmbeddingCell, ProximaRecord};
 
 // =============================================================================
 // Helper Functions

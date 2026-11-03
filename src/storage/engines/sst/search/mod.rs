@@ -3848,7 +3848,7 @@ mod tests {
     async fn s2_multicore_arc_matches_sequential() {
         use crate::core::search::SearchParams;
         use crate::storage::traits::{FlushParameters, StorageQueryContext, StorageQueryMetadata};
-        use proximadb_records::{EmbeddingCell, EmbeddingValues, ProximaRecord};
+        use proximadb_records::{EmbeddingCell, ProximaRecord};
 
         let dim = 64usize;
         let cid = "s2_multicore_test";
@@ -4404,7 +4404,7 @@ mod tests {
     #[tokio::test]
     async fn pax_footer_facts_report_rows_and_exact_authority() {
         use crate::storage::engines::sst::segment_format::write_pax_segment_with_f32_tier;
-        use proximadb_records::{EmbeddingCell, EmbeddingValues, ProximaRecord};
+        use proximadb_records::{EmbeddingCell, ProximaRecord};
         // Coalesced RaBitQ layout (the default write), env-pinned like the
         // segment_format tests.
         unsafe { std::env::set_var("PROXIMADB_PAX_COALESCED_RABITQ", "1") };
