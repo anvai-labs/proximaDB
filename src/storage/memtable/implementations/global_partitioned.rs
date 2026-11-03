@@ -2476,6 +2476,15 @@ mod tests {
         m.add_wal_batch(c, batch_of(vec![rec_at("w", 25, 1, None)]))
             .await
             .unwrap();
+        // TD-MEMTABLE-MVCC-1 (d): tombstone exact-tie — live v1 + tombstone v0
+        // at the SAME ns. The tombstone must win on BOTH the indexed scan
+        // (rebuild_scan_index) and the legacy path (get_all_vectors).
+        m.add_wal_batch(
+            c,
+            batch_of(vec![rec_at("t", 50, 1, None), rec_at("t", 50, 0, Some(0))]),
+        )
+        .await
+        .unwrap();
 
         let indexed = m
             .scan_collection_paginated(c, None, 1000, None, now_ns)
@@ -2494,6 +2503,14 @@ mod tests {
         assert!(
             indexed.iter().all(|r| r.oid != "z"),
             "TTL-expired record must be excluded"
+        );
+        assert!(
+            indexed.iter().all(|r| r.oid != "t"),
+            "TD-MEMTABLE-MVCC-1 (d): tombstone exact-tie must suppress the live copy on the INDEXED scan too"
+        );
+        assert!(
+            legacy.iter().all(|r| r.oid != "t"),
+            "TD-MEMTABLE-MVCC-1 (d): tombstone exact-tie must suppress the live copy on the LEGACY path"
         );
     }
 
