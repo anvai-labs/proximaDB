@@ -238,7 +238,7 @@ def test_silent_failure_detectors():
     Pinned without a server: a client that fell back to its offline store
     (a dead port makes create_collection return a fake Collection and set
     this flag) and a coroutine held in a name must both be reported."""
-    from proximadb_sdk import ProximaDBClient
+    from proximadb_sdk import ProximaDBClientLegacy as ProximaDBClient
 
     client = ProximaDBClient.__new__(ProximaDBClient)
     client._prefer_local_fallback = True
@@ -261,7 +261,7 @@ def test_fallback_recorder_sees_clients_outside_the_namespace():
     """A client that never reaches the namespace (built inside a function,
     or held by a wrapper as `.client`) is still caught when it falls back,
     and the original method is restored afterwards."""
-    from proximadb_sdk import ProximaDBClient
+    from proximadb_sdk import ProximaDBClientLegacy as ProximaDBClient
 
     original = ProximaDBClient._activate_local_fallback
 
@@ -380,7 +380,7 @@ class _FallbackRecorder:
     storing it as `.client` are all invisible to a namespace scan."""
 
     def __enter__(self) -> _FallbackRecorder:
-        from proximadb_sdk import ProximaDBClient
+        from proximadb_sdk import ProximaDBClientLegacy as ProximaDBClient
 
         self.activations: list[Exception] = []
         self.original = ProximaDBClient._activate_local_fallback
@@ -396,7 +396,7 @@ class _FallbackRecorder:
         return self
 
     def __exit__(self, *exc: Any) -> None:
-        from proximadb_sdk import ProximaDBClient
+        from proximadb_sdk import ProximaDBClientLegacy as ProximaDBClient
 
         ProximaDBClient._activate_local_fallback = self.original  # type: ignore[method-assign]
 
@@ -432,7 +432,7 @@ def _silent_failures(namespace: dict[str, Any]) -> list[str]:
       does nothing, and while the name holds it no "never awaited" warning
       fires.
     """
-    from proximadb_sdk import ProximaDBClient
+    from proximadb_sdk import ProximaDBClientLegacy as ProximaDBClient
 
     # The flag, not the class-level store: the client also caches every
     # collection it creates successfully in that store.

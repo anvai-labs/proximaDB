@@ -1132,8 +1132,14 @@ class ProximaDBClient:
         else:
             collection_data = response_data
 
-        # Debug: Check if required fields are present
-        collection_id_from_response = collection_data.get("id", collection_id)
+        # Debug: Check if required fields are present. CollectionV2Response
+        # (the spec shape) keys the id as "collection_id"; older payloads
+        # used "id" (TD-SDK-3 swap surfaced the drift).
+        collection_id_from_response = (
+            collection_data.get("collection_id")
+            or collection_data.get("id")
+            or collection_id
+        )
 
         # Handle nested config structure (server returns dimension in config.dimension)
         if "dimension" not in collection_data and "config" in collection_data:
@@ -1319,9 +1325,17 @@ class ProximaDBClient:
                 data_size_bytes=stats_src.get("data_size_bytes", 0),
             )
 
+            # CollectionV2Summary (the spec shape for GET /api/v2/collections)
+            # keys the id as "collection_id"; older payloads used "id". Accept
+            # both — the hard ["id"] index raised KeyError against the spec
+            # shape, which the v1 client masked via its in-memory fallback
+            # (TD-SDK-3 swap surfaced it).
+            collection_id_value = (
+                coll_data.get("collection_id") or coll_data.get("id") or ""
+            )
             collections.append(
                 Collection(
-                    id=coll_data["id"],
+                    id=collection_id_value,
                     config=config,
                     stats=stats,
                     created_at=coll_data.get("created_at"),

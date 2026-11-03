@@ -167,14 +167,22 @@ from .proto_conversion import (
     storage_engine_to_str,
 )
 
-# Core client and configuration
-from .unified_client import ProximaDBClient
+# Core client and configuration — TD-SDK-3 SWAP (2026-11-03): the
+# package-level ``ProximaDBClient`` IS the v2 client (method parity with
+# v1 is closed and census-pinned). The v1 client remains available as
+# ``ProximaDBClientLegacy`` for one minor release, emitting a
+# DeprecationWarning on instantiation; deletion is a separate, later
+# decision.
+from .unified_client import ProximaDBClient as ProximaDBClientLegacy
+from .unified_client_v2 import ProximaDBClient
 from .unified_client_v2 import ProximaDBClient as ProximaDBClientV2
 from .unified_client_v2 import connect_embedded
 
 
 # Convenience factory functions
-def connect(url: str = None, **kwargs) -> ProximaDBClient:
+def connect(
+    url: str = None, **kwargs
+) -> ProximaDBClient:  # noqa: F811 (the swapped v2 class)
     """Create a ProximaDB client with automatic protocol detection.
 
     Uses unified port mode by default (single port for all protocols).
@@ -215,7 +223,7 @@ def connect_unified(url: str = None, **kwargs) -> ProximaDBClient:
     return ProximaDBClient(**kwargs)
 
 
-def connect_legacy(url: str = None, **kwargs) -> ProximaDBClient:
+def connect_legacy(url: str = None, **kwargs) -> ProximaDBClient:  # noqa: F811
     """Create a ProximaDB client for legacy multi-port mode.
 
     Use this for older deployments with separate ports for REST (5678)
@@ -335,7 +343,9 @@ except (ImportError, AttributeError):
 __all__ = [
     # Core
     "ProximaDBClient",
+    "ProximaDBClientLegacy",
     "ProximaDBClientV1",
+    "ProximaDBClientV2",
     "ClientConfig",
     "LogLevel",
     "ConnectionConfig",
