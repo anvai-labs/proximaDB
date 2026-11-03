@@ -5,7 +5,7 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | **Open (filed 2026-11-02; found by TD-SDK-3 batch 3's round-3 review).**
+| Status | **Partially resolved 2026-11-03: directions 2+3 landed (the SDK adapter's honest fallback signal — explicit aggregation/bucket_ms raises on the tags-only vector fallback, whose signature default now matches v1's `None`; the subprocess flavor's `async def` timeseries methods are guarded so the sync adapter can never strand an un-awaited coroutine). Direction 1 (expose the engine surface through the binding) is BLOCKED: the engine has NO timeseries surface to expose — the multimodel facade maps `ModelType::TimeSeries => None // Not yet implemented` (`src/storage/multimodel/facade.rs:304`); a binding PR would first require engine-level multimodel-store work (a separate workstream, out of this TD's scope).**
 | Priority | P3 — no current data loss on default paths; the SDK degrades instead of lying, but two advertised behaviors silently narrow.
 | Relates to | link:TD-SDK-3-unified-client-v1-v2-convergence.adoc[TD-SDK-3] (batch 3, embedded adapter), link:TD-XMODAL-1-timeseries-source.adoc[TD-XMODAL-1]
 | Component | `crates/binding/proximadb-embedded/src/python.rs` (the PyO3 surface), `clients/python/src/proximadb_sdk/adapters/embedded_adapter.py` (the SDK adapter over it).
@@ -22,11 +22,17 @@ binding is the recommended transport; the fallback shapes are legacy.
 
 1. Expose the engine's timeseries surface through the PyO3 binding (`create_timeseries_collection`,
    `ingest_timeseries`, `query_timeseries` incl. aggregation/bucket_ms, list/delete) mirroring the
-   observability methods' registration shape.
-2. Until then, the adapter's docstrings should scope the "honored" claim to the engine API and
-   note the in-process fallback narrows queries to `tag_filters` (consider raising the typed
-   capability error for aggregation/bucket_ms on the fallback, matching the REST decision).
-3. Fix or remove the `async def` subprocess `query_timeseries` mismatch.
+   observability methods' registration shape — **BLOCKED 2026-11-03: the engine surface does not
+   exist** (`ModelType::TimeSeries => None` in the multimodel facade); prerequisite is engine-level
+   multimodal-store work. When it lands, the binding PR follows and the direction-2 guard becomes
+   the seam's negative control.
+2. LANDED 2026-11-03: the adapter's docstring scopes the claim; explicit
+   `aggregation`/`bucket_ms` on the fallback raises the honest capability error (matching the
+   REST decision); the signature default is `None` (v1 parity — the old `"avg"` default was the
+   adapter's invention and was never honored by anything).
+3. LANDED 2026-11-03: all five `hasattr(self._db, <timeseries>)` gates now also check the bound
+   method is not a coroutine function, so the subprocess flavor's `async def` surface can never
+   be called synchronously (an un-awaited coroutine returned as a success-shaped object).
 
 == Non-goals
 

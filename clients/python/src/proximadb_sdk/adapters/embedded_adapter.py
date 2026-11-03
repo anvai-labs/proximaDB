@@ -41,6 +41,14 @@ from .base import BaseProtocolAdapter
 logger = logging.getLogger(__name__)
 
 
+def _is_coroutine_fn(fn) -> bool:
+    """True when ``fn`` is a coroutine function (the subprocess flavor's
+    async timeseries surface — TD-EMB-1 direction 3)."""
+    import asyncio
+
+    return asyncio.iscoroutinefunction(fn)
+
+
 class EmbeddedProtocolAdapter(BaseProtocolAdapter):
     """Embedded adapter implementing BaseProtocolAdapter.
 
@@ -1791,7 +1799,9 @@ class EmbeddedProtocolAdapter(BaseProtocolAdapter):
     ) -> dict[str, Any]:
         """Create a time-series collection via embedded API."""
         try:
-            if hasattr(self._db, "create_timeseries_collection"):
+            if hasattr(
+                self._db, "create_timeseries_collection"
+            ) and not _is_coroutine_fn(self._db.create_timeseries_collection):
                 result = self._db.create_timeseries_collection(
                     name=name, config=config or {}
                 )
@@ -1825,7 +1835,9 @@ class EmbeddedProtocolAdapter(BaseProtocolAdapter):
     ) -> dict[str, Any]:
         """Ingest time-series data points via embedded API."""
         try:
-            if hasattr(self._db, "ingest_timeseries"):
+            if hasattr(self._db, "ingest_timeseries") and not _is_coroutine_fn(
+                self._db.ingest_timeseries
+            ):
                 result = self._db.ingest_timeseries(
                     collection=collection_name,
                     points=points,
@@ -1880,14 +1892,31 @@ class EmbeddedProtocolAdapter(BaseProtocolAdapter):
         collection_name: str,
         start_time: str,
         end_time: str,
-        aggregation: str = "avg",
+        aggregation: str | None = None,
         bucket_ms: int | None = None,
         tag_filters: dict[str, str] | None = None,
         **kwargs,
     ) -> dict[str, Any]:
-        """Query time-series data with optional aggregation via embedded API."""
+        """Query time-series data with optional aggregation via embedded API.
+
+        TD-EMB-1 disclosure: the embedded ENGINE has no timeseries
+        surface (the multimodel facade maps ``ModelType::TimeSeries`` to
+        ``None`` — not yet implemented), so ``hasattr`` below is False on
+        every current build and the VECTOR FALLBACK always runs. The
+        fallback honors ``tag_filters`` ONLY — ``aggregation``/``bucket_ms``
+        are silently dropped there, so on the fallback they raise the
+        typed capability error (TD-SDK-3's honest-signal convention)
+        instead of returning raw points that look aggregated.
+        """
         try:
-            if hasattr(self._db, "query_timeseries"):
+            if hasattr(self._db, "query_timeseries") and not _is_coroutine_fn(
+                self._db.query_timeseries
+            ):
+                # The SUBPROCESS flavor's query_timeseries is `async def`
+                # (TD-EMB-1 direction 3): a sync call would silently
+                # return an un-awaited coroutine — raise the honest
+                # capability error instead (use the async client or the
+                # vector fallback).
                 result = self._db.query_timeseries(
                     collection=collection_name,
                     start_time=start_time,
@@ -1898,7 +1927,15 @@ class EmbeddedProtocolAdapter(BaseProtocolAdapter):
                 )
                 return result
             else:
-                # Fall back to vector storage
+                # Vector fallback: tags-only. Reject the parameters it
+                # would silently drop (TD-EMB-1 direction 2).
+                if aggregation is not None or bucket_ms is not None:
+                    raise NotImplementedError(
+                        "query_timeseries(aggregation/bucket_ms) is not "
+                        "supported on the embedded vector fallback (the "
+                        "engine has no timeseries surface; TD-EMB-1) — "
+                        "only tag_filters are honored"
+                    )
                 return self._query_timeseries_as_vector(
                     collection_name, start_time, end_time, tag_filters
                 )
@@ -1966,7 +2003,9 @@ class EmbeddedProtocolAdapter(BaseProtocolAdapter):
     def list_timeseries_collections(self, **kwargs) -> list[dict[str, Any]]:
         """List all time-series collections via embedded API."""
         try:
-            if hasattr(self._db, "list_timeseries_collections"):
+            if hasattr(
+                self._db, "list_timeseries_collections"
+            ) and not _is_coroutine_fn(self._db.list_timeseries_collections):
                 result = self._db.list_timeseries_collections()
                 return result if isinstance(result, list) else []
             else:
@@ -1987,7 +2026,9 @@ class EmbeddedProtocolAdapter(BaseProtocolAdapter):
     def delete_timeseries_collection(self, collection_name: str, **kwargs) -> bool:
         """Delete a time-series collection via embedded API."""
         try:
-            if hasattr(self._db, "delete_timeseries_collection"):
+            if hasattr(
+                self._db, "delete_timeseries_collection"
+            ) and not _is_coroutine_fn(self._db.delete_timeseries_collection):
                 result = self._db.delete_timeseries_collection(
                     collection=collection_name
                 )
