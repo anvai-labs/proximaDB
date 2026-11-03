@@ -15,7 +15,7 @@ link:STORAGE_PLAN.adoc[storage], link:PLATFORM_PLAN.adoc[platform].
 Completed foundation is summarized once in link:../history/README.adoc[history]; detailed
 merged-slice evidence is there. v3-first remains accepted; new-table policy and live deletes are implemented behind default-OFF gates, not a completed rollout.
 
-Storage-foundation refresh: `origin/develop` `9d25b5a20`, 2026-11-02. The SC rows below
+Storage-foundation refresh: `origin/develop` `2aa70f18d`, 2026-11-02 (local date). The SC rows below
 supersede their October observations using TD-TIER-1's landed-slice record and first integrated
 MinIO evidence. Other branch heads/owners below remain historical observations, not renewed
 claims about remote state. Existing foreign WIP is preserved.
@@ -39,7 +39,7 @@ claims about remote state. Existing foreign WIP is preserved.
 | Filtered PAX / TD-FPRUNE-1 P5–P7 | Evidence merged #2268; P5 WIP (GLM) | Residual-tail store-once and typed shred/consumer proof in feat/pax-residual-tail; then filter-aware directory and cell-scoped Stage F. Gate with the same filtered workload and exact/recall oracle; default flip in WIP is not merged behavior.
 | TD-FPRUNE-1 P5 / E1 follow-through | feat/pax-residual-tail; GLM owner | Residual-tail store-once implemented in three slices: default-ON kill-switch gate, typed shred columns from schema (Integer→Int64/Float→Float64/String→String, per-value fail-safe exactness), v2 typed SECTION_SHRED_FIELD_MAP (compaction preserves residual across rewrites; field-map emission ungated from FOOTER_STATS). The flip surfaced and fixed a real gap: FlatRow::props_tree (the Stage-F filter path) ignored shredded values. Adjacent: 14 pre-existing Collection-initializer bench breaks repaired. Next: schema-bearing e1p bed measurement for the merge gate (≤350 MB/q), review, CI.
 | SC3–6 / TD-TIER-1 | SC3/SC4 landed; SC5 implemented; SC6 partial | TD-TIER-1 records #2270 and SC4 through #2304 as landed; its November 1 integrated MinIO run proves a bounded profile, not rollout closure. Remaining: source/protection identity, control-plane split, tier-mix round trip, multi-tenant soak, declared-pool reporting, repeats and support-scope decision.
-| Storage/embedded foundations / TD-TIER-1, PAXDIR-2, OBJSTORE-1, WAL-2 | Active `feat/cloud-storage-foundations`; local implementation, validation in progress | Reconciled into existing plans/ADRs. Persistent object keys now preserve cloud key bytes under `pax-object-v2/`; anchored protection regressions pass (49/49 cache tests locally). Root storage/cache cohort 146/146 and embedded cohort 11/11 pass locally; adversarial review is CLEAR. Server plus embedded cloud-full build is running; cloud integration proof remains open. No foundation commit or PR yet. Endpoint-aware persistent identity and full read-only query boot remain explicit gates; bounded catalog-follower metadata access does not close them. Persistent receipt, WAL-free bulk, dynamic disks and broad headless modality support remain dependent gates.
+| Storage/embedded foundations / TD-TIER-1, PAXDIR-2, OBJSTORE-1, WAL-2 | Active `feat/cloud-storage-foundations`; local implementation, validation in progress | Reconciled into existing plans/ADRs. Persistent object keys now preserve cloud key bytes under `pax-object-v2/`; anchored protection regressions pass (49/49 cache tests locally). Root storage/cache cohort 146/146 and embedded cohort 11/11 pass locally; adversarial review is CLEAR. Server plus embedded cloud-full build passed before rebase; cloud runtime proof remains open. The foundation milestone is committed locally and rebased onto merged #2385; affected-test rerun and PR publication are pending. Endpoint-aware persistent identity and full read-only query boot remain explicit gates; bounded catalog-follower metadata access does not close them. Persistent receipt, WAL-free bulk, dynamic disks and broad headless modality support remain dependent gates.
 | P6 | Open, continuous | Value-compared SF1/SF10 query gates and multimodal benchmark; retain existing ratchets. Load/publication memory is not query coverage.
 | Dependency/security residuals | Planned; dependency lane | Track #2225–#2228/#2242; retire zstd advisory exceptions only with the documented dependency upgrades/exposure checks. #2251 is an accepted exception disposition, not a patched dependency. Workspace panic-site reduction/per-crate compiler lints remain separate from the completed coverage guard.
 | Platform release gates | Open/needs per-TD pickup | Published-image install/restart and driver proof, surface parity, workspace residuals and security/CI lanes: platform plan. No inference of completion from old plans.
@@ -67,26 +67,32 @@ Local validation checkpoint (2026-11-02): root storage/cache cohort 146/146 pass
 (`/private/tmp/foundations-root-tests-final.log`); 11 focused embedded tests passed
 (`/private/tmp/foundations-embedded-tests.log`). Complete `make work-commit-check` passed
 (`/private/tmp/foundations-work-commit-check-final.log`), and adversarial review is CLEAR.
-The latest fetched `develop` remains `9d25b5a20`. The server plus embedded cloud-full build
-is running. This foundation checkpoint is not promoted or opened as a PR; local evidence does not
-establish hosted CI or merge completion. Required foundation residuals above remain open.
+The server plus embedded cloud-full build passed (`/private/tmp/foundations-cloud-build.log`).
+The first foundation milestone is committed on `feat/cloud-storage-foundations` and rebased
+onto current `develop` `2aa70f18d`. Its affected publication tests and fresh review are being
+rerun before PR publication; local evidence does not establish hosted CI or merge completion.
+Required foundation residuals above remain open.
 
-The urgent test-fixture repair was pushed separately as
-https://github.com/anvai-labs/proximaDB/pull/2385[#2385], branch
-`fix/listing-cache-ci-unblock`, commit `80bd1cc75`: eight lines in two test files repair three
-fixture failures after #2374, with no production changes. The user-confirmed dependency chain
-is #2385 → #2361 (owned/handled elsewhere) → #2378; #2382 has the same unit failures. This is
-a pushed hotfix, not a claim that any of these PRs is green or merged. When #2385 lands, rebase
-and integrate its two flush-fixture invalidations against the foundation's changed invalidator
-signature, then rerun affected tests and review before foundation publication.
+The focused CI unblock https://github.com/anvai-labs/proximaDB/pull/2385[#2385] merged as
+`2aa70f18d` after green CI and clean adversarial review. The final fix refreshes cached SST
+listings at durable publication and input retirement, and repairs stale test fixtures; it
+supersedes the initial test-only patch. The foundation rebase preserves those changes and
+its stronger cancellation coverage without duplicate invalidation guards. The user-confirmed
+dependency chain is #2385 → #2361 (owned/handled elsewhere) → #2378. This tracker does not
+assert that the downstream PRs have merged.
+
+Publish coherent milestones after local validation: cache/work and embedded lifecycle
+foundations first; complete source identity and the unreleased grant/policy schema next;
+then the bounded published-reader lifecycle. Keep one PR per reviewable milestone rather
+than one CI run per helper or a single combined implementation review.
 
 == Active and retained branches
 
 The retained October inventory below is historical; refresh remote state before pickup.
 Current task: `feat/cloud-storage-foundations` at
-`/private/tmp/proximadb-worktrees/feat-cloud-storage-foundations`, based on `9d25b5a20`.
-Reconciliation and foundation implementation are session-owned; local adversarial review is
-CLEAR, while build completion, foundation publication and hosted CI remain pending. Other
+`/private/tmp/proximadb-worktrees/feat-cloud-storage-foundations`, based on `2aa70f18d`.
+Reconciliation and foundation implementation are session-owned. Pre-rebase build/tests and
+review passed; rebase integration review, affected tests, publication and hosted CI are pending. Other
 owners and their unique WIP remain untouched.
 
 October worktrees were under `/home/vsingh/code/proximaDB.worktrees/` unless otherwise stated.

@@ -81,8 +81,10 @@ completion from URI preservation or follower construction alone.
 Local evidence checkpoint: 11 focused embedded tests passed (nine F3/F4/lifecycle and two
 F5 follower tests; command/result transcript `/private/tmp/foundations-embedded-tests.log`).
 The complete `make work-commit-check` passed (`/private/tmp/foundations-work-commit-check.log`).
-Latest fetched `develop` is unchanged at `9d25b5a20`. The root storage/cache cohort passed 146/146 tests; server/cloud
-build validation remains pending. No hosted CI, merge or cloud-headless support completion
+The foundation branch is rebased onto `develop` at `2aa70f18d` (#2385 landed).
+Before that rebase, the root storage/cache cohort passed 146/146 tests and the server plus
+embedded cloud-full build passed (`/private/tmp/foundations-cloud-build.log`). Focused
+post-rebase validation remains pending. No hosted CI or cloud-headless support completion
 is asserted by these local checks.
 
 === Required next seams (reuse the existing owners)
