@@ -23,6 +23,7 @@ mod tests {
             (9_998, 4_999),
         ] {
             let config = StorageConfig {
+                cache_policy: Default::default(),
                 write_lease_ttl_ms: ttl_ms,
                 ..Default::default()
             };
@@ -54,6 +55,7 @@ mod tests {
     #[test]
     fn test_storage_locations_config() {
         let config = StorageConfig {
+            cache_policy: Default::default(),
             write_lease_ttl_ms: 10_000,
             storage_locations: vec![
                 StorageLocation {

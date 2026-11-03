@@ -4288,6 +4288,16 @@ pub mod types {
     ///        "null"
     ///      ]
     ///    },
+    ///    "properties": {
+    ///      "description": "Per-collection table properties (Hive TBLPROPERTIES-style). Keys in\nthe `cache.*` namespace configure the per-collection cache policy\n(TD-COMPACT-2b): `{\"cache.index.mode\": \"pin\"}` pins Region A. All\n`cache.*` keys are validated at create time; unknown keys in that\nnamespace are rejected. Non-`cache.*` keys are stored verbatim.",
+    ///      "type": [
+    ///        "object",
+    ///        "null"
+    ///      ],
+    ///      "additionalProperties": {
+    ///        "type": "string"
+    ///      }
+    ///    },
     ///    "quantization": {
     ///      "$ref": "#/components/schemas/QuantizationConfigInput"
     ///    },
@@ -4394,6 +4404,15 @@ pub mod types {
         /// admission with the configured ids listed.
         #[serde(default, skip_serializing_if = "::std::option::Option::is_none")]
         pub pool_id: ::std::option::Option<::std::string::String>,
+        /// Per-collection table properties (Hive TBLPROPERTIES-style). Keys in
+        /// the `cache.*` namespace configure the per-collection cache policy
+        /// (TD-COMPACT-2b): `{"cache.index.mode": "pin"}` pins Region A. All
+        /// `cache.*` keys are validated at create time; unknown keys in that
+        /// namespace are rejected. Non-`cache.*` keys are stored verbatim.
+        #[serde(default, skip_serializing_if = "::std::option::Option::is_none")]
+        pub properties: ::std::option::Option<
+            ::std::collections::HashMap<::std::string::String, ::std::string::String>,
+        >,
         #[serde(default, skip_serializing_if = "::std::option::Option::is_none")]
         pub quantization: ::std::option::Option<QuantizationConfigInput>,
         #[serde(default, skip_serializing_if = "::std::option::Option::is_none")]
@@ -21675,6 +21694,12 @@ pub mod types {
                 ::std::option::Option<::std::string::String>,
                 ::std::string::String,
             >,
+            properties: ::std::result::Result<
+                ::std::option::Option<
+                    ::std::collections::HashMap<::std::string::String, ::std::string::String>,
+                >,
+                ::std::string::String,
+            >,
             quantization: ::std::result::Result<
                 ::std::option::Option<super::QuantizationConfigInput>,
                 ::std::string::String,
@@ -21708,6 +21733,7 @@ pub mod types {
                     initial_capacity: Ok(Default::default()),
                     name: Err("no value supplied for name".to_string()),
                     pool_id: Ok(Default::default()),
+                    properties: Ok(Default::default()),
                     quantization: Ok(Default::default()),
                     schema: Ok(Default::default()),
                     storage_class: Ok(Default::default()),
@@ -21850,6 +21876,23 @@ pub mod types {
                     .map_err(|e| format!("error converting supplied value for pool_id: {e}"));
                 self
             }
+            pub fn properties<T>(mut self, value: T) -> Self
+            where
+                T: ::std::convert::TryInto<
+                        ::std::option::Option<
+                            ::std::collections::HashMap<
+                                ::std::string::String,
+                                ::std::string::String,
+                            >,
+                        >,
+                    >,
+                T::Error: ::std::fmt::Display,
+            {
+                self.properties = value
+                    .try_into()
+                    .map_err(|e| format!("error converting supplied value for properties: {e}"));
+                self
+            }
             pub fn quantization<T>(mut self, value: T) -> Self
             where
                 T: ::std::convert::TryInto<::std::option::Option<super::QuantizationConfigInput>>,
@@ -21912,6 +21955,7 @@ pub mod types {
                     initial_capacity: value.initial_capacity?,
                     name: value.name?,
                     pool_id: value.pool_id?,
+                    properties: value.properties?,
                     quantization: value.quantization?,
                     schema: value.schema?,
                     storage_class: value.storage_class?,
@@ -21935,6 +21979,7 @@ pub mod types {
                     initial_capacity: Ok(value.initial_capacity),
                     name: Ok(value.name),
                     pool_id: Ok(value.pool_id),
+                    properties: Ok(value.properties),
                     quantization: Ok(value.quantization),
                     schema: Ok(value.schema),
                     storage_class: Ok(value.storage_class),

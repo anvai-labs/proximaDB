@@ -14,6 +14,9 @@ from attrs import field as _attrs_field
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
+    from ..models.create_collection_v2_request_properties_type_0 import (
+        CreateCollectionV2RequestPropertiesType0,
+    )
     from ..models.index_config_input import IndexConfigInput
     from ..models.index_policy_input import IndexPolicyInput
     from ..models.quantization_config_input import QuantizationConfigInput
@@ -89,6 +92,12 @@ class CreateCollectionV2Request:
             tags (list[str] | None | Unset): Operator metadata tags, e.g. `"recall_target:0.95"`,
                 `"target_vector_count:1000"`, `"modalities:text,image"`. Consumed by the
                 recall advisor / route-health (`services/collection/recall_target.rs`).
+            properties (CreateCollectionV2RequestPropertiesType0 | None | Unset): Per-collection table properties (Hive
+                TBLPROPERTIES-style). Keys in
+                the `cache.*` namespace configure the per-collection cache policy
+                (TD-COMPACT-2b): `{"cache.index.mode": "pin"}` pins Region A. All
+                `cache.*` keys are validated at create time; unknown keys in that
+                namespace are rejected. Non-`cache.*` keys are stored verbatim.
             quantization (None | QuantizationConfigInput | Unset):
             index_policy (IndexPolicyInput | None | Unset):
             description (None | str | Unset): Free-text description, persisted on the collection config.
@@ -128,6 +137,7 @@ class CreateCollectionV2Request:
     canonical_embedding_precision: None | str | Unset = UNSET
     index_configs: list[IndexConfigInput] | None | Unset = UNSET
     tags: list[str] | None | Unset = UNSET
+    properties: CreateCollectionV2RequestPropertiesType0 | None | Unset = UNSET
     quantization: None | QuantizationConfigInput | Unset = UNSET
     index_policy: IndexPolicyInput | None | Unset = UNSET
     description: None | str | Unset = UNSET
@@ -137,6 +147,9 @@ class CreateCollectionV2Request:
     pool_id: None | str | Unset = UNSET
 
     def to_dict(self) -> dict[str, Any]:
+        from ..models.create_collection_v2_request_properties_type_0 import (  # noqa: PLC0415
+            CreateCollectionV2RequestPropertiesType0,
+        )
         from ..models.index_config_input import IndexConfigInput  # noqa: PLC0415
         from ..models.index_policy_input import IndexPolicyInput  # noqa: PLC0415
         from ..models.quantization_config_input import (  # noqa: PLC0415
@@ -206,6 +219,14 @@ class CreateCollectionV2Request:
 
         else:
             tags = self.tags
+
+        properties: dict[str, Any] | None | Unset
+        if isinstance(self.properties, Unset):
+            properties = UNSET
+        elif isinstance(self.properties, CreateCollectionV2RequestPropertiesType0):
+            properties = self.properties.to_dict()
+        else:
+            properties = self.properties
 
         quantization: dict[str, Any] | None | Unset
         if isinstance(self.quantization, Unset):
@@ -277,6 +298,8 @@ class CreateCollectionV2Request:
             field_dict["index_configs"] = index_configs
         if tags is not UNSET:
             field_dict["tags"] = tags
+        if properties is not UNSET:
+            field_dict["properties"] = properties
         if quantization is not UNSET:
             field_dict["quantization"] = quantization
         if index_policy is not UNSET:
@@ -296,6 +319,9 @@ class CreateCollectionV2Request:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.create_collection_v2_request_properties_type_0 import (  # noqa: PLC0415
+            CreateCollectionV2RequestPropertiesType0,
+        )
         from ..models.index_config_input import IndexConfigInput  # noqa: PLC0415
         from ..models.index_policy_input import IndexPolicyInput  # noqa: PLC0415
         from ..models.quantization_config_input import (  # noqa: PLC0415
@@ -415,6 +441,27 @@ class CreateCollectionV2Request:
 
         tags = _parse_tags(d.pop("tags", UNSET))
 
+        def _parse_properties(
+            data: object,
+        ) -> CreateCollectionV2RequestPropertiesType0 | None | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                properties_type_0 = CreateCollectionV2RequestPropertiesType0.from_dict(
+                    data
+                )
+
+                return properties_type_0
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            return cast(CreateCollectionV2RequestPropertiesType0 | None | Unset, data)
+
+        properties = _parse_properties(d.pop("properties", UNSET))
+
         def _parse_quantization(data: object) -> None | QuantizationConfigInput | Unset:
             if data is None:
                 return data
@@ -507,6 +554,7 @@ class CreateCollectionV2Request:
             canonical_embedding_precision=canonical_embedding_precision,
             index_configs=index_configs,
             tags=tags,
+            properties=properties,
             quantization=quantization,
             index_policy=index_policy,
             description=description,

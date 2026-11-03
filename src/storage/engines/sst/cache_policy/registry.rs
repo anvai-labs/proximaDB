@@ -34,6 +34,14 @@ impl CachePolicyRegistry {
             resolved: dashmap::DashMap::new(),
         }
     }
+    /// Construct from the server's `[storage.cache_policy]` config section.
+    /// When absent (default), uses `ServerCachePolicy::default()`.
+    pub fn from_config(
+        config: &crate::core::config::CoreStorageConfig,
+        engine: EngineCacheBaseline,
+    ) -> Self {
+        Self::new(config.cache_policy.clone(), engine)
+    }
 
     /// Resolve the effective policy for a collection from its table
     /// properties. The result is cached (per-collection) until invalidated.

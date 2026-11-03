@@ -885,6 +885,7 @@ impl Default for StorageConfig {
             assignment_config: AssignmentConfig::default(),
             wal_config: WriteBufferUserConfig::default(),
             write_lease_ttl_ms: default_write_lease_ttl_ms(),
+            cache_policy: Default::default(),
             prune_mode: None,
             mmap_enabled: true,
             sst_config: Some(SstConfig::default()),
@@ -941,6 +942,20 @@ pub struct CoreStorageConfig {
     pub mmap_enabled: bool,
     /// SST (Sorted String Table) engine configuration
     pub sst_config: Option<SstConfig>,
+    /// Per-collection cache-policy server defaults (TD-COMPACT-2b).
+    /// Overrides the built-in defaults; per-collection properties override
+    /// these. Resolution: collection property > server default > advisor >
+    /// built-in. Example TOML:
+    /// ```toml
+    /// [storage.cache_policy]
+    /// advisor = "shadow"
+    /// [storage.cache_policy.modes]
+    /// index = "warm"
+    /// rerank = "on_demand"
+    /// ```
+    #[serde(default)]
+    pub cache_policy: proximadb_cache::policy::ServerCachePolicy,
+
     /// Writer-incarnation / partition-lease TTL in milliseconds
     /// (TD-LEASE-2). The shared renew loop interval is derived as `ttl / 2`,
     /// clamped to 1–5 s so short-lived resource leases also receive a renewal
