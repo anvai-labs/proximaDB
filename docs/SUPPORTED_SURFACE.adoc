@@ -2,7 +2,7 @@
 :toc: left
 :toclevels: 2
 :icons: font
-:last-updated: 2026-10-29
+:last-updated: 2026-11-03
 // status-as-of: 2026-11-01
 // The status-as-of tag above is checked by scripts/check_status_as_of.py (wired into
 // `make work-commit-check`): re-verify the support tiers against HEAD, then bump it.
@@ -309,6 +309,11 @@ for evidence/provenance, and event/history records for temporal state. The v1
 | Supported
 | Canonical REST `/api/v2` record batch/search/get/scan flows, gRPC `proximadb.v2.ProximaRecordService` record operations, and Arrow Flight canonical `type: "vector_search"` `DoGet`. REST v1 vector/collection/search routes and gRPC v1 are removed wire surfaces; the entity-only REST v1 compatibility exception remains, and other v1 DTO usage is internal migration debt. Record metadata filters are enforced on typed `/search` (`filters:[{field,op,value}]`) and `/records/scan` (`filter`) across the supported ops (`eq,neq,gt,gte,lt,lte,in,contains,between,starts_with,ends_with`), including tenant/account scoping; array-valued props support `in`/`contains` membership. Canonical REST search/point-get, authenticated gRPC v2 unary search/streaming search/point-get, and authenticated Flight record search have live provisioned-ABAC evidence for deny-before-provision, row-predicate filtering, principal isolation, and hot revoke.
 | Keep hybrid retrieval and distributed search claims separate from the supported vector surface. New clients must not target v1 `VectorRecord`/`SqlValue` payloads.
+
+| Collection storage classes (residency + access tier)
+| Experimental
+| `storage_class: "performance"` with `[[storage.reservation_pools]]` arms admitted residency: the collection's whole PAX segments are pinned on local disk, serving with zero object-store GETs per query (wire-verified, release binary, MinIO). `default_access_tier: hot/cool/cold` applies the tier to future compaction output only. Policy seams (pool routing via `pool_id`, idle reclaim, warm bandwidth, DRAM ceiling) are opt-in config. Balanced collections are byte-identical to pre-TD-TIER-1 behavior.
+| Requires SST/PAX engine + object-store placement; pools are node-local; access tier needs S3/Azure/GCS; no default-on without soak; wire evidence at docs/history/evidence/TIER1_SC6_INTEGRATED_MINIO_2026_11_01.adoc.
 
 | Federated SQL over function-backed sources
 | Beta

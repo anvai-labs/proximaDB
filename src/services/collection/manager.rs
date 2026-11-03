@@ -2508,7 +2508,15 @@ impl CollectionService {
                 // effects — just re-admission on the EXISTING placement,
                 // refused before the config persists. Omitted/UNSPECIFIED
                 // preserves the recorded tier; an unknown number is refused.
+                // TD-TIER-1 SC5 residual: an EXPLICIT Some(0) CLEARS the
+                // recorded tier back to the account default — set-once was
+                // the old behavior. The REST v2 surface maps the literal
+                // "default" to Some(0); omitted stays None (preserve).
                 if let Some(raw_tier) = new_config.default_access_tier
+                    && raw_tier == 0
+                {
+                    existing_config.default_access_tier = None;
+                } else if let Some(raw_tier) = new_config.default_access_tier
                     && raw_tier != 0
                 {
                     let base = previous_record
