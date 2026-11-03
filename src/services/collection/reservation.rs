@@ -1933,6 +1933,7 @@ mod tests {
 
     /// A foreign pid's REAL start ticks (from /proc), for forging live
     /// holders in lock tests. None if /proc is unreadable (non-Linux).
+    #[cfg(target_os = "linux")]
     fn foreign_start_ticks(pid: u32) -> Option<u64> {
         start_ticks_of(&std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?)
     }

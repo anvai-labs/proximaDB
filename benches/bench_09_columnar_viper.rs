@@ -96,14 +96,14 @@ fn generate_vectors(count: usize, dimension: usize) -> Vec<VectorRecord> {
 
 /// Create VIPER engine using async constructor
 async fn create_viper_engine() -> Arc<dyn UnifiedStorageEngine> {
-    let filesystem_config = FilesystemConfig::default();
-    let filesystem = Arc::new(
-        FilesystemFactory::create(filesystem_config)
+    let _filesystem_config = FilesystemConfig::default();
+    let _filesystem = Arc::new(
+        FilesystemFactory::create(_filesystem_config)
             .await
             .expect("Failed to create filesystem"),
     );
-    let viper_config = ViperConfig::default();
-    let distance_compute = Arc::new(UnifiedDistanceCompute::default());
+    let _viper_config = ViperConfig::default();
+    let _distance_compute = Arc::new(UnifiedDistanceCompute::default());
 
     let engine = ViperEngine::new()
         .await

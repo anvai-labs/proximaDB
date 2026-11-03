@@ -4411,6 +4411,7 @@ mod tests {
         }
     }
 
+    #[test]
     fn require_recall_admin_allows_when_no_context_in_unified_port_mode() {
         // The unified-port REST server doesn't attach
         // auth_middleware_unified, so Option<Extension<...>> resolves

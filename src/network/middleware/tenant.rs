@@ -1307,11 +1307,11 @@ mod tests {
 
     // Unique tenant ids per test: TENANT_TIERS is a process-global insert-only
     // registry with no removal API, so shared ids would couple tests.
-    const T_OPEN: &str = "tier-test-open-tenant";
-    const T_AUTHD: &str = "tier-test-authd-tenant";
+    const _T_OPEN: &str = "tier-test-open-tenant";
+    const _T_AUTHD: &str = "tier-test-authd-tenant";
     const T_BOUND: &str = "tier-test-bound-tenant";
     const T_GW: &str = "tier-test-gateway-tenant";
-    const T_GW_OK: &str = "tier-test-gateway-ok-tenant";
+    const _T_GW_OK: &str = "tier-test-gateway-ok-tenant";
 
     #[test]
     fn tier_claim_open_records_stamp_for_bare_header() {
