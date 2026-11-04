@@ -94,6 +94,7 @@ mod tests {
             batch_ids: vec![],
             collection_config: Some(collection.clone()),
             estimated_size: 0,
+            collection_properties: std::collections::HashMap::new(),
         };
         let res = engine.do_flush(&flush).await?;
         assert!(res.success, "flush should produce a cold segment");
