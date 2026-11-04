@@ -23,6 +23,48 @@ pub use llm_config::{
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+/// Declare a memoized boolean env gate (CLAUDE.md Env-Gate-Registry #21).
+///
+/// Generates the canonical `OnceLock<bool>` getter the codebase hand-copied
+/// ~12 times (victor post-program clone scan, cluster A5): read `$gate` once,
+/// accept the registry's documented truthy set (`1|true|on|yes`,
+/// case-insensitive); fall back to `$default` only when UNSET — a set
+/// but unrecognized value evaluates false (matching every hand-written
+/// body this replaces).
+/// Note the widened truthy set: the hand-written getters accepted only
+/// `1|true` — this macro aligns the code with the registry contract.
+///
+/// The gate name MUST be a string literal so `scripts/check_env_gates.py`
+/// (which greps literal `PROXIMADB_*` names out of `.rs` sources) keeps
+/// seeing it; never derive the name from the function identifier. Registry
+/// rows stay hand-maintained in `docs/12-design/ENV_GATE_REGISTRY.adoc`.
+///
+/// ```ignore
+/// proximadb_config::env_gate! {
+///     /// Gate: native vectorized execution (ADR-054). Default OFF.
+///     pub fn native_vectorized_enabled() { gate: "PROXIMADB_NATIVE_VECTORIZED", default: false }
+/// }
+/// ```
+#[macro_export]
+macro_rules! env_gate {
+    ($(#[$meta:meta])* $vis:vis fn $name:ident() { gate: $gate:literal, default: $default:expr }) => {
+        $(#[$meta])*
+        $vis fn $name() -> bool {
+            static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *ENABLED.get_or_init(|| {
+                std::env::var($gate)
+                    .map(|v| {
+                        matches!(
+                            v.to_ascii_lowercase().as_str(),
+                            "1" | "true" | "on" | "yes"
+                        )
+                    })
+                    .unwrap_or($default)
+            })
+        }
+    };
+}
+
 /// TLS transport security configuration shared by protocol listeners.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TlsConfig {
@@ -1291,6 +1333,44 @@ fn parse_bool_flag(raw: &str, env_name: &str) -> anyhow::Result<bool> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn env_gate_truthy_set_and_default() {
+        use std::sync::Mutex;
+        // Serialize env mutations across tests in one process.
+        static ENV_LOCK: Mutex<()> = Mutex::new(());
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        // SAFETY: single-threaded test process section held under ENV_LOCK;
+        // edition 2024 marks env mutation unsafe for multi-threaded UB.
+        unsafe { std::env::set_var("ENVGATE_TEST_GATE", "on") };
+        env_gate! {
+            /// test gate
+            fn envgate_test_on() { gate: "ENVGATE_TEST_GATE", default: false }
+        }
+        assert!(
+            envgate_test_on(),
+            "'on' must count as true per the registry contract"
+        );
+
+        unsafe { std::env::set_var("ENVGATE_TEST_GATE2", "bogus") };
+        env_gate! {
+            fn envgate_test_unrecognized() { gate: "ENVGATE_TEST_GATE2", default: true }
+        }
+        assert!(
+            !envgate_test_unrecognized(),
+            "an unrecognized value must evaluate false (matching every hand-written body), NOT the default"
+        );
+
+        unsafe { std::env::remove_var("ENVGATE_TEST_GATE3") };
+        env_gate! {
+            fn envgate_test_unset_default() { gate: "ENVGATE_TEST_GATE3", default: true }
+        }
+        assert!(
+            envgate_test_unset_default(),
+            "an UNSET gate must fall back to the declared default"
+        );
+    }
     use super::*;
 
     #[test]

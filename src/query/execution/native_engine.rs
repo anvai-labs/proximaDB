@@ -23,78 +23,53 @@ use proximadb_relational_planner::PhysicalPlan;
 use proximadb_relational_types::{ColumnInfo, RelationalRow, RelationalSchema};
 use std::sync::Arc;
 
-/// Gate: is the native vectorized execution path opted in? Default OFF — the
-/// Volcano (row-at-a-time) serves all native-path queries until the vectorized
-/// path is promoted (ledger-gated, per ADR-054 §8).
-pub fn native_vectorized_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("PROXIMADB_NATIVE_VECTORIZED")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false)
-    })
+proximadb_config::env_gate! {
+    /// Gate: is the native vectorized execution path opted in? Default OFF — the
+    /// Volcano (row-at-a-time) serves all native-path queries until the vectorized
+    /// path is promoted (ledger-gated, per ADR-054 §8).
+    pub fn native_vectorized_enabled() { gate: "PROXIMADB_NATIVE_VECTORIZED", default: false }
 }
 
-/// Gate: should the native hash-join path be used? Default OFF — distinct from
-/// `PROXIMADB_NATIVE_VECTORIZED` so FilterProject/HashAgg can serve without
-/// forcing the join on. When ON, `lower_physical::Join` wires the #779
-/// `HashJoinBuildOperator`/`HashJoinProbeOperator` (ADR-054 Phase 3, TD-OLAP-11).
-pub fn native_join_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("PROXIMADB_NATIVE_JOIN")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false)
-    })
+proximadb_config::env_gate! {
+    /// Gate: should the native hash-join path be used? Default OFF — distinct from
+    /// `PROXIMADB_NATIVE_VECTORIZED` so FilterProject/HashAgg can serve without
+    /// forcing the join on. When ON, `lower_physical::Join` wires the #779
+    /// `HashJoinBuildOperator`/`HashJoinProbeOperator` (ADR-054 Phase 3, TD-OLAP-11).
+    pub fn native_join_enabled() { gate: "PROXIMADB_NATIVE_JOIN", default: false }
 }
 
-/// Gate: parallelize native pipelines with the TD-OLAP-12 morsel scheduler?
-/// Default OFF, distinct from `PROXIMADB_NATIVE_VECTORIZED`/`_JOIN`. When on, a
-/// splittable source (parquet row-group lanes) is decoded across cores and fanned
-/// into the serial downstream operators; a non-splittable source runs serially, so
-/// this is additive and never a correctness dependency.
-pub fn native_morsel_scheduler_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("PROXIMADB_NATIVE_MORSEL")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false)
-    })
+proximadb_config::env_gate! {
+    /// Gate: parallelize native pipelines with the TD-OLAP-12 morsel scheduler?
+    /// Default OFF, distinct from `PROXIMADB_NATIVE_VECTORIZED`/`_JOIN`. When on, a
+    /// splittable source (parquet row-group lanes) is decoded across cores and fanned
+    /// into the serial downstream operators; a non-splittable source runs serially, so
+    /// this is additive and never a correctness dependency.
+    pub fn native_morsel_scheduler_enabled() { gate: "PROXIMADB_NATIVE_MORSEL", default: false }
 }
 
-/// Gate: run the native-parquet SHADOW probe alongside DataFusion on the OLAP
-/// path? Default OFF — this is a benchmark/measurement instrument, not a product
-/// path: when on, a parquet SELECT that DataFusion serves is ALSO re-planned,
-/// re-opened, and re-executed on the native vectorized engine purely to record a
-/// `native-vectorized` compute sample for the engine-dimension trace (TD-OLAP-4).
-/// It roughly doubles the query's work, so it must never be on in production.
-pub fn native_shadow_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("PROXIMADB_NATIVE_SHADOW")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false)
-    })
+proximadb_config::env_gate! {
+    /// Gate: run the native-parquet SHADOW probe alongside DataFusion on the OLAP
+    /// path? Default OFF — this is a benchmark/measurement instrument, not a product
+    /// path: when on, a parquet SELECT that DataFusion serves is ALSO re-planned,
+    /// re-opened, and re-executed on the native vectorized engine purely to record a
+    /// `native-vectorized` compute sample for the engine-dimension trace (TD-OLAP-4).
+    /// It roughly doubles the query's work, so it must never be on in production.
+    pub fn native_shadow_enabled() { gate: "PROXIMADB_NATIVE_SHADOW", default: false }
 }
 
-/// Gate: route the operation classes native measurably wins to the native
-/// vectorized engine as the PRIMARY backend over external parquet (returning its
-/// result), with DataFusion as the correctness floor. Default OFF (TD-OLAP-4
-/// "favor native by operation"). Distinct from [`native_shadow_enabled`] (which
-/// runs native ALONGSIDE DataFusion and discards the result): when this is on, a
-/// footer-elidable / scalar-aggregate unfiltered parquet SELECT is served by
-/// native and DataFusion is only consulted when native declines the shape.
-/// Correctness is preserved because native's result MUST equal DataFusion's for
-/// the routed shapes (guarded by the eligibility gates in `try_native_over_parquet`
-/// and the native-vs-DataFusion ratchet tests); any decline falls through to
-/// DataFusion.
-pub fn native_route_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("PROXIMADB_NATIVE_ROUTE")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false)
-    })
+proximadb_config::env_gate! {
+    /// Gate: route the operation classes native measurably wins to the native
+    /// vectorized engine as the PRIMARY backend over external parquet (returning its
+    /// result), with DataFusion as the correctness floor. Default OFF (TD-OLAP-4
+    /// "favor native by operation"). Distinct from [`native_shadow_enabled`] (which
+    /// runs native ALONGSIDE DataFusion and discards the result): when this is on, a
+    /// footer-elidable / scalar-aggregate unfiltered parquet SELECT is served by
+    /// native and DataFusion is only consulted when native declines the shape.
+    /// Correctness is preserved because native's result MUST equal DataFusion's for
+    /// the routed shapes (guarded by the eligibility gates in `try_native_over_parquet`
+    /// and the native-vs-DataFusion ratchet tests); any decline falls through to
+    /// DataFusion.
+    pub fn native_route_enabled() { gate: "PROXIMADB_NATIVE_ROUTE", default: false }
 }
 
 /// Try the native vectorized execution path for an already-planned query.

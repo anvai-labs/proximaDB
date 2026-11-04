@@ -180,16 +180,12 @@ pub fn typed_path_identity_when(
     enabled.then_some(identity).flatten()
 }
 
-/// Whether the base62 account/namespace/collection path layout is enabled.
-///
-/// Read once per process so every engine path observes one layout decision and
-/// cannot split reads from writes if the process environment changes later.
-pub fn typed_paths_enabled() -> bool {
-    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| match std::env::var("PROXIMADB_TYPED_PATHS") {
-        Ok(value) => value == "1" || value.eq_ignore_ascii_case("true"),
-        Err(_) => false,
-    })
+proximadb_config::env_gate! {
+    /// Whether the base62 account/namespace/collection path layout is enabled.
+    ///
+    /// Read once per process so every engine path observes one layout decision and
+    /// cannot split reads from writes if the process environment changes later.
+    pub fn typed_paths_enabled() { gate: "PROXIMADB_TYPED_PATHS", default: false }
 }
 
 /// ADR-031 Phase 4c: typed collection **data** directory path.

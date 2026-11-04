@@ -24,20 +24,15 @@ use super::engine::{
 };
 use async_trait::async_trait;
 
-/// ADR-059 rollout step 2 (production routing gate, default OFF): when
-/// `PROXIMADB_DUCKDB_ROUTE` is truthy, join/agg-shaped parquet-backed SELECTs
-/// are attempted on DuckDB as the PRIMARY engine (DataFusion stays the
-/// correctness floor), and `DuckDbCompat` becomes a freshness-safe cost-model
-/// candidate so its cells warm through the router. Mirrors
-/// [`super::native_engine::native_route_enabled`]; ledger-gated promotion per
-/// the ADR-054 progressive-cutover discipline.
-pub fn duckdb_route_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("PROXIMADB_DUCKDB_ROUTE")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false)
-    })
+proximadb_config::env_gate! {
+    /// ADR-059 rollout step 2 (production routing gate, default OFF): when
+    /// `PROXIMADB_DUCKDB_ROUTE` is truthy, join/agg-shaped parquet-backed SELECTs
+    /// are attempted on DuckDB as the PRIMARY engine (DataFusion stays the
+    /// correctness floor), and `DuckDbCompat` becomes a freshness-safe cost-model
+    /// candidate so its cells warm through the router. Mirrors
+    /// [`super::native_engine::native_route_enabled`]; ledger-gated promotion per
+    /// the ADR-054 progressive-cutover discipline.
+    pub fn duckdb_route_enabled() { gate: "PROXIMADB_DUCKDB_ROUTE", default: false }
 }
 
 /// In-process DuckDB OLAP engine. Stateless — a fresh in-memory DuckDB is opened

@@ -9440,6 +9440,7 @@ version = "0.5.1"
 dependencies = [
  "anyhow",
  "async-trait",
+ "proximadb-config",
  "proximadb-distance-kernel",
  "proximadb-filter-expression",
  "proximadb-graph-model",
