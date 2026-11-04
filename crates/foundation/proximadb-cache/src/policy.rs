@@ -1047,6 +1047,78 @@ mod tests {
     }
 
     #[test]
+    /// The full resolution chain: collection property > server default >
+    /// advisor > built-in. Each layer must override the one below it.
+    #[test]
+    fn resolution_chain_code_server_ml_collection() {
+        use GroupMode::*;
+
+        // Layer 1: code default (index=Warm, filter=Off)
+        let none = CollectionCacheProperties::default();
+        let default_server = ServerCachePolicy::default();
+        let base = resolve_cache_policy(ResolveInput {
+            engine: EngineCacheBaseline::default(),
+            collection: &none,
+            server: &default_server,
+            class: StorageClassHint::Balanced,
+            performance_grant: false,
+            recommendations: &[],
+        });
+        assert_eq!(base.group(RegionGroup::Index).policy.mode, Warm);
+        assert_eq!(base.group(RegionGroup::Filter).policy.mode, Off);
+
+        // Layer 2: server config overrides code default
+        let mut server = ServerCachePolicy {
+            advisor: AdvisorMode::Off, // Layer 3 disabled for this test
+            ..Default::default()
+        };
+        server.modes.insert(RegionGroup::Index, Pin);
+        server.modes.insert(RegionGroup::Filter, OnDemand);
+        let server_level = resolve_cache_policy(ResolveInput {
+            engine: EngineCacheBaseline::default(),
+            collection: &none,
+            server: &server,
+            class: StorageClassHint::Balanced,
+            performance_grant: false,
+            recommendations: &[],
+        });
+        assert_eq!(server_level.group(RegionGroup::Index).policy.mode, Pin);
+        assert_eq!(
+            server_level.group(RegionGroup::Filter).policy.mode,
+            OnDemand
+        );
+        // Untouched group still at code default
+        assert_eq!(
+            server_level.group(RegionGroup::Rerank).policy.mode,
+            OnDemand
+        );
+
+        // Layer 4: collection property overrides server
+        let collection = CollectionCacheProperties::parse(
+            &[
+                ("cache.index.mode", "off"), // overrides server's Pin
+            ]
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
+        )
+        .unwrap();
+        let collection_level = resolve_cache_policy(ResolveInput {
+            engine: EngineCacheBaseline::default(),
+            collection: &collection,
+            server: &server,
+            class: StorageClassHint::Balanced,
+            performance_grant: false,
+            recommendations: &[],
+        });
+        assert_eq!(collection_level.group(RegionGroup::Index).policy.mode, Off);
+        // Server's filter=OnDemand still applies (collection didn't set it)
+        assert_eq!(
+            collection_level.group(RegionGroup::Filter).policy.mode,
+            OnDemand
+        );
+    }
+
     fn server_policy_round_trips_as_config() {
         let mut server = ServerCachePolicy {
             advisor: AdvisorMode::On,

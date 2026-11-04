@@ -2705,6 +2705,16 @@ export interface components {
              *     recall advisor / route-health (`services/collection/recall_target.rs`).
              */
             tags?: string[] | null;
+            /**
+             * @description Per-collection table properties (Hive TBLPROPERTIES-style). Keys in
+             *     the `cache.*` namespace configure the per-collection cache policy
+             *     (TD-COMPACT-2b): `{"cache.index.mode": "pin"}` pins Region A. All
+             *     `cache.*` keys are validated at create time; unknown keys in that
+             *     namespace are rejected. Non-`cache.*` keys are stored verbatim.
+             */
+            properties?: {
+                [key: string]: string;
+            } | null;
             quantization?: null | components["schemas"]["QuantizationConfigInput"];
             index_policy?: null | components["schemas"]["IndexPolicyInput"];
             /** @description Free-text description, persisted on the collection config. */

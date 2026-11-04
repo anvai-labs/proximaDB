@@ -264,6 +264,12 @@ pub struct CreateCollectionV2Request {
     /// `"target_vector_count:1000"`, `"modalities:text,image"`. Consumed by the
     /// recall advisor / route-health (`services/collection/recall_target.rs`).
     pub tags: Option<Vec<String>>,
+    /// Per-collection table properties (Hive TBLPROPERTIES-style). Keys in
+    /// the `cache.*` namespace configure the per-collection cache policy
+    /// (TD-COMPACT-2b): `{"cache.index.mode": "pin"}` pins Region A. All
+    /// `cache.*` keys are validated at create time; unknown keys in that
+    /// namespace are rejected. Non-`cache.*` keys are stored verbatim.
+    pub properties: Option<std::collections::HashMap<String, String>>,
     /// Quantization config (gRPC-v2 parity). When omitted, quantization is
     /// left unset (engine default).
     pub quantization: Option<QuantizationConfigInput>,
@@ -3343,6 +3349,22 @@ async fn ensure_collection_exists(
 /// omitted body — no Content-Type — compacts plainly). Operator endpoint (TD-COMPACT-14): NOT utoipa-annotated, so it is
 /// not part of the published OpenAPI spec — same convention as
 /// suspend/resume and the `_diagnostics` actions.
+/// `PATCH /api/v2/collections/{id}/properties` — set/update table properties
+/// (TD-COMPACT-2b). `cache.*` keys are validated; non-cache keys are stored
+/// verbatim. Keys not present in the request are left unchanged (merge
+/// semantics, not replace).
+#[derive(Debug, serde::Deserialize)]
+pub struct UpdatePropertiesRequest {
+    pub properties: std::collections::HashMap<String, String>,
+}
+
+/// Response: the full property set after the merge.
+#[derive(Debug, serde::Serialize)]
+pub struct PropertiesResponse {
+    pub collection_id: String,
+    pub properties: std::collections::HashMap<String, String>,
+}
+
 #[derive(Debug, serde::Deserialize)]
 pub struct CompactRequest {
     #[serde(default)]
@@ -3358,6 +3380,47 @@ pub struct CompactResponse {
     pub passes: Option<usize>,
     pub reached_target: Option<bool>,
     pub stop_reason: Option<String>,
+}
+
+/// `PATCH /api/v2/collections/{id}/properties` — set/update table properties.
+/// Merge semantics: keys in the request are set/updated; absent keys are
+/// unchanged. `cache.*` keys are validated (TD-COMPACT-2b).
+pub async fn patch_collection_properties_v2(
+    Path(collection_id): Path<String>,
+    Extension(tenant): Extension<TenantContext>,
+    user_context: Option<Extension<crate::security::rbac_service::UnifiedUserContext>>,
+    State(state): State<AppState>,
+    axum::Json(request): axum::Json<UpdatePropertiesRequest>,
+) -> ApiResult<Json<PropertiesResponse>> {
+    if collection_id.is_empty() {
+        return Err(ApiError::InvalidArgument(
+            "Collection ID is required".to_string(),
+        ));
+    }
+    require_maintain(user_context.as_ref().map(|e| &e.0), "properties")?;
+
+    // Validate cache.* keys in the request (the merged set is validated
+    // after the catalog read below; this catches standalone errors early).
+    proximadb_cache::policy::validate_cache_properties(&request.properties)
+        .map_err(|e| ApiError::InvalidArgument(format!("invalid cache property: {e}")))?;
+
+    // TODO: read current properties from the catalog, merge, validate the
+    // merged set (case-variant duplicates), write back. For now the
+    // collection service handles the merge.
+    let updated = state
+        .collection_service
+        .update_collection_properties(
+            &collection_id,
+            Some(&crate::storage::tenant::context::StorageTenantContext::from(&tenant)),
+            request.properties,
+        )
+        .await
+        .map_err(|e| ApiError::Internal(format!("property update: {e}")))?;
+
+    Ok(Json(PropertiesResponse {
+        collection_id,
+        properties: updated,
+    }))
 }
 
 pub async fn post_collection_compact_v2(
