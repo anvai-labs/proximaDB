@@ -3231,6 +3231,19 @@ def main() -> int:
         "--collection-id",
         help="collection id for --skip-ingest runs (the build run records it in result.json)",
     )
+    parser.add_argument(
+        "--compact-full-before-measure",
+        action="store_true",
+        help=(
+            "TD-COMPACT-15 S=1: after the bed settles, issue COMPACT FULL "
+            "(cross-level collapse, #2339) via Arrow Flight and re-settle "
+            "before any query arm. The pre/post geometries are pinned into "
+            "result.json so the segment-count-vs-GET-cost delta is measured "
+            "on byte-identical rows/model/queries — no external server or "
+            "second bed. Combines with --skip-ingest to measure a prior "
+            "bed collapsed in place"
+        ),
+    )
     parser.add_argument("--top-k", type=int, default=10)
     parser.add_argument("--settle-timeout-secs", type=int, default=1_200)
     parser.add_argument(
@@ -3902,6 +3915,13 @@ def main() -> int:
                 spill_directory,
             )
             resource_sampler.start()
+        # TD-COMPACT-15 S=1: with --compact-full-before-measure the bed must
+        # first settle at its CURRENT segment count; --max-segments asserts
+        # the POST-compact geometry, so the pre-compact waits get a
+        # permissive bound (settled beds hold <= a handful of segments).
+        pre_compact_max_segments = (
+            64 if args.compact_full_before_measure else args.max_segments
+        )
         if args.skip_ingest:
             # TD-TIER-1 E1: reuse the settled OBJECT PREFIX a prior run built —
             # identical objects, model and query IDs across cap arms. The
@@ -3924,7 +3944,7 @@ def main() -> int:
                 server_url,
                 collection_id,
                 args.rows,
-                args.max_segments,
+                pre_compact_max_segments,
                 args.settle_timeout_secs,
                 args.stable_secs,
                 remote_geometry,
@@ -3973,12 +3993,49 @@ def main() -> int:
             server_url,
             collection_id,
             args.rows,
-            args.max_segments,
+            pre_compact_max_segments,
             args.settle_timeout_secs,
             args.stable_secs,
             remote_geometry,
             required_layout_version=args.require_layout_version,
         )
+        if args.compact_full_before_measure:
+            # TD-COMPACT-15 S=1: collapse the settled bed with COMPACT FULL
+            # (#2339) and re-settle so every arm below measures the SAME
+            # rows/model/queries against a smaller segment count. The
+            # validations that follow (layout, trained, ivf_k, n_comp) then
+            # gate the final measured geometry, and --max-segments turns
+            # into the collapse assertion (S=1 arms pass --max-segments 1).
+            before = {
+                "segment_count": geometry["segment_count"],
+                "bytes": geometry["bytes"],
+                "segments": [
+                    {"path": s["path"], "bytes": s.get("bytes")}
+                    for s in geometry["segments"]
+                ],
+            }
+            action = compact_via_flight(
+                "127.0.0.1", args.port, collection_id, full=True
+            )
+            geometry = wait_for_materialization(
+                root / "data" / "sst",
+                server_url,
+                collection_id,
+                args.rows,
+                args.max_segments,
+                args.settle_timeout_secs,
+                args.stable_secs,
+                remote_geometry,
+                required_layout_version=args.require_layout_version,
+            )
+            result["compact_full_before_measure"] = {
+                "before": before,
+                "action": action,
+                "after": {
+                    "segment_count": geometry["segment_count"],
+                    "bytes": geometry["bytes"],
+                },
+            }
         wrong_layouts = [
             segment
             for segment in geometry["segments"]
