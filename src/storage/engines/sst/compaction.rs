@@ -310,6 +310,21 @@ impl SstCompactionTask {
     /// producer resolved from the catalog meta. `check_compaction_needed` is
     /// config-free and builds tasks with these unset, so without this an sq8
     /// collection's L1->L2 compaction re-encoded as RaBitQ.
+    ///
+    /// TD-TIER-1 SC5 note (review M1 — stated plainly): under a
+    /// `tier_by_level:` policy the follow-up carries the ORIGIN's resolved
+    /// tier, and the follow-up's follow-up carries THAT — the resolved scalar
+    /// propagates down the whole chain, never re-resolved for the deeper
+    /// output's own level. A burst-then-quiesce collection therefore lands
+    /// its entire chain at the ORIGIN's level tier: with
+    /// `tier_by_level:hot,cool`, every chain-produced deep segment (the
+    /// long-lived bytes the policy exists to cool) stays Hot. The
+    /// corrections are probabilistic — a NEW enqueue re-resolves, and dedup
+    /// adoption upgrades a still-queued task — but neither fires once ingest
+    /// stops. This is acceptable ONLY while the tag is default-OFF and
+    /// unmeasured; carrying the parsed policy on the task so the worker
+    /// re-resolves each follow-up by its own output level is the REQUIRED
+    /// fix before any SC6 flip-ON decision.
     pub(crate) fn inherit_collection_intent(&mut self, origin: &SstCompactionTask) {
         self.collection_identity = origin.collection_identity;
         self.rg_layout = origin.rg_layout;
@@ -502,6 +517,17 @@ struct PreparedCompactionRecords {
     merged_vectors: Vec<VectorRecord>,
     expired_records_count: u64,
     tombstones_removed_count: u64,
+}
+
+/// The `L{n}_` level encoded in a compaction output filename (0 when the name
+/// carries no level — adoption treats that as "same level", preserving the
+/// flat-tier semantics).
+fn output_level_of(output_file: &Path) -> u32 {
+    let filename = output_file
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    crate::storage::common::compaction_orchestrator::FilenameCodec::new().parse_level(&filename)
 }
 
 /// Manages background compaction of SST files
@@ -1128,6 +1154,16 @@ impl Compaction {
         let Some(incoming_tier) = incoming.access_tier else {
             return;
         };
+        // TD-TIER-1 SC5 (level-aware tiering review M2): adoption must never
+        // move a tier BETWEEN output levels. A full pass pairs ACROSS levels
+        // while its own output is always L1, so a full-vs-background race can
+        // pair owners of different levels; under a `tier_by_level:` policy
+        // their correct tiers differ, and an unconditional adopt would
+        // publish the wrong one. Gate on the output levels (from the `L{n}_`
+        // filenames; non-level names parse as 0 and adopt as before — the
+        // flat-tier semantics #2404 pinned, where every task of a collection
+        // carried the same value).
+        let incoming_level = output_level_of(&incoming.output_file);
         let mut adopted_output_keys: Vec<String> = Vec::new();
         {
             let mut queue = self.task_queue.lock().await;
@@ -1137,7 +1173,11 @@ impl Compaction {
                     .input_files
                     .iter()
                     .any(|input| incoming.input_files.contains(input));
-                if (same_output || shares_input) && queued.access_tier != Some(incoming_tier) {
+                let same_level = output_level_of(&queued.output_file) == incoming_level;
+                if (same_output || shares_input)
+                    && same_level
+                    && queued.access_tier != Some(incoming_tier)
+                {
                     queued.access_tier = Some(incoming_tier);
                     if same_output {
                         adopted_output_keys.push(queued.output_file.to_string_lossy().to_string());
@@ -1157,6 +1197,88 @@ impl Compaction {
                 }
             }
         }
+    }
+
+    /// TD-TIER-1 SC5 (level-aware tiering, default-OFF): parse the
+    /// `tier_by_level:` collection tag — a comma list of tiers indexed by
+    /// compaction OUTPUT level (`tier_by_level:hot,cool` ⇒ every L1 output
+    /// Hot, L2+ Cool; the list clamps to its last entry). L0/flush output is
+    /// untouched: staging stays at the account default (minimum-duration
+    /// trap, SC5 review S1), and this policy only ever meets compaction
+    /// outputs (always ≥ L1). With the tag absent, the collection's flat
+    /// `default_access_tier` semantics are exactly today's behavior.
+    /// An unparseable or empty entry refuses the WHOLE policy with a warn —
+    /// a misspelt tier must never silently become the account default.
+    fn level_tier_policy(
+        tags: &[String],
+    ) -> Option<Vec<proximadb_storage_filesystem_types::ObjectAccessTier>> {
+        // Last match wins — the same convention as every other multi-valued
+        // collection tag (compaction_override.rs), not first-wins.
+        let raw = tags
+            .iter()
+            .filter_map(|t| t.strip_prefix("tier_by_level:"))
+            .next_back()?;
+        let mut tiers = Vec::new();
+        for entry in raw.split(',') {
+            let parsed =
+                crate::services::collection::storage_class::parse_access_tier(entry.trim());
+            let canonical = parsed.and_then(|proto| {
+                crate::services::collection::storage_class::validate_access_tier_raw(Some(
+                    proto as i32,
+                ))
+            });
+            match canonical {
+                Ok(Some(tier)) => tiers.push(tier),
+                Ok(None) | Err(_) => {
+                    tracing::warn!(
+                        tier_list = %raw,
+                        "TD-TIER-1 SC5: refusing tier_by_level policy — every entry \
+                         must name a tier (hot|cool|cold); falling back to the \
+                         collection's flat default_access_tier"
+                    );
+                    return None;
+                }
+            }
+        }
+        (!tiers.is_empty()).then_some(tiers)
+    }
+
+    /// The tier a compaction OUTPUT carries: the level policy's entry for the
+    /// output level (clamping past the list), else the collection's flat tier.
+    fn effective_output_tier(
+        collection_tier: Option<proximadb_storage_filesystem_types::ObjectAccessTier>,
+        policy: Option<&[proximadb_storage_filesystem_types::ObjectAccessTier]>,
+        output_level: u32,
+    ) -> Option<proximadb_storage_filesystem_types::ObjectAccessTier> {
+        match policy {
+            Some(tiers) => tiers
+                .get(output_level.saturating_sub(1) as usize)
+                .copied()
+                .or_else(|| tiers.last().copied()),
+            None => collection_tier,
+        }
+    }
+
+    /// Resolve the tier for a built task from its output filename's `L{n}_`
+    /// level (the sanctioned `FilenameCodec` inverse — the level lives only
+    /// in the filename; `SstCompactionTask.level` is the SOURCE level).
+    fn resolve_task_output_tier(
+        task: &SstCompactionTask,
+        collection_tier: Option<proximadb_storage_filesystem_types::ObjectAccessTier>,
+        tags: &[String],
+    ) -> Option<proximadb_storage_filesystem_types::ObjectAccessTier> {
+        let filename = task
+            .output_file
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let output_level = crate::storage::common::compaction_orchestrator::FilenameCodec::new()
+            .parse_level(&filename);
+        Self::effective_output_tier(
+            collection_tier,
+            Self::level_tier_policy(tags).as_deref(),
+            output_level,
+        )
     }
 
     /// TD-COMPACT-6 (ADR-076 D1): the production flush-path compaction trigger.
@@ -1188,6 +1310,7 @@ impl Compaction {
         rg_layout: Option<bool>,
         vector_quant: Option<proximadb_block_format::VectorQuant>,
         access_tier: Option<proximadb_storage_filesystem_types::ObjectAccessTier>,
+        collection_tags: &[String],
     ) -> Result<bool> {
         let Some(mut task) = self
             .check_compaction_needed(
@@ -1202,7 +1325,10 @@ impl Compaction {
         };
         task.rg_layout = rg_layout;
         task.vector_quant = vector_quant;
-        task.access_tier = access_tier;
+        // TD-TIER-1 SC5: a `tier_by_level:` tag re-resolves the output tier by
+        // the task's OUTPUT level; without it the collection's flat tier is
+        // exactly today's behavior.
+        task.access_tier = Self::resolve_task_output_tier(&task, access_tier, collection_tags);
         task.collection_identity = collection_identity;
         // TD-COMPACT-6 D1: the worker clears the shared training_in_flight guard
         // for this collection on completion. It derives the collection dir from
@@ -1242,6 +1368,7 @@ impl Compaction {
         vector_quant: Option<proximadb_block_format::VectorQuant>,
         access_tier: Option<proximadb_storage_filesystem_types::ObjectAccessTier>,
         timeout: std::time::Duration,
+        collection_tags: &[String],
     ) -> Result<FullCompactionSummary> {
         use crate::storage::common::compaction_memory::current_compaction_input_budget;
         use crate::storage::common::compaction_utils::CompactionFileDiscovery;
@@ -1367,7 +1494,15 @@ impl Compaction {
                 precision_hint,
                 rg_layout,
                 vector_quant,
-                access_tier,
+                // TD-TIER-1 SC5: full passes publish L1 outputs by design
+                // (re-pairing; see the filename comment above), so a
+                // `tier_by_level:` policy always resolves its first entry
+                // here; without the tag this is exactly the flat tier.
+                access_tier: Self::effective_output_tier(
+                    access_tier,
+                    Self::level_tier_policy(collection_tags).as_deref(),
+                    1,
+                ),
             };
             let output_key = task.output_file.to_string_lossy().to_string();
             if !self.schedule_compaction(task).await? {
