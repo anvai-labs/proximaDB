@@ -311,12 +311,20 @@ impl SstCompactionTask {
     /// config-free and builds tasks with these unset, so without this an sq8
     /// collection's L1->L2 compaction re-encoded as RaBitQ.
     ///
-    /// TD-TIER-1 SC5 note: under a `tier_by_level:` policy the follow-up
-    /// carries the ORIGIN's resolved tier (resolved for the origin's own
-    /// output level) — a one-hop staleness by design: the next enqueue
-    /// re-resolves for its level, and a newer enqueue's dedup adoption
-    /// (`adopt_incoming_tier_on_queued_owner`) upgrades a still-queued task
-    /// to the newest collection intent.
+    /// TD-TIER-1 SC5 note (review M1 — stated plainly): under a
+    /// `tier_by_level:` policy the follow-up carries the ORIGIN's resolved
+    /// tier, and the follow-up's follow-up carries THAT — the resolved scalar
+    /// propagates down the whole chain, never re-resolved for the deeper
+    /// output's own level. A burst-then-quiesce collection therefore lands
+    /// its entire chain at the ORIGIN's level tier: with
+    /// `tier_by_level:hot,cool`, every chain-produced deep segment (the
+    /// long-lived bytes the policy exists to cool) stays Hot. The
+    /// corrections are probabilistic — a NEW enqueue re-resolves, and dedup
+    /// adoption upgrades a still-queued task — but neither fires once ingest
+    /// stops. This is acceptable ONLY while the tag is default-OFF and
+    /// unmeasured; carrying the parsed policy on the task so the worker
+    /// re-resolves each follow-up by its own output level is the REQUIRED
+    /// fix before any SC6 flip-ON decision.
     pub(crate) fn inherit_collection_intent(&mut self, origin: &SstCompactionTask) {
         self.collection_identity = origin.collection_identity;
         self.rg_layout = origin.rg_layout;
@@ -512,6 +520,17 @@ struct PreparedCompactionRecords {
 }
 
 /// Manages background compaction of SST files
+/// The `L{n}_` level encoded in a compaction output filename (0 when the name
+/// carries no level — adoption treats that as "same level", preserving the
+/// flat-tier semantics).
+fn output_level_of(output_file: &Path) -> u32 {
+    let filename = output_file
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    crate::storage::common::compaction_orchestrator::FilenameCodec::new().parse_level(&filename)
+}
+
 pub struct Compaction {
     config: SstConfig,
     task_queue: Arc<Mutex<VecDeque<SstCompactionTask>>>,
@@ -1135,6 +1154,16 @@ impl Compaction {
         let Some(incoming_tier) = incoming.access_tier else {
             return;
         };
+        // TD-TIER-1 SC5 (level-aware tiering review M2): adoption must never
+        // move a tier BETWEEN output levels. A full pass pairs ACROSS levels
+        // while its own output is always L1, so a full-vs-background race can
+        // pair owners of different levels; under a `tier_by_level:` policy
+        // their correct tiers differ, and an unconditional adopt would
+        // publish the wrong one. Gate on the output levels (from the `L{n}_`
+        // filenames; non-level names parse as 0 and adopt as before — the
+        // flat-tier semantics #2404 pinned, where every task of a collection
+        // carried the same value).
+        let incoming_level = output_level_of(&incoming.output_file);
         let mut adopted_output_keys: Vec<String> = Vec::new();
         {
             let mut queue = self.task_queue.lock().await;
@@ -1144,7 +1173,11 @@ impl Compaction {
                     .input_files
                     .iter()
                     .any(|input| incoming.input_files.contains(input));
-                if (same_output || shares_input) && queued.access_tier != Some(incoming_tier) {
+                let same_level = output_level_of(&queued.output_file) == incoming_level;
+                if (same_output || shares_input)
+                    && same_level
+                    && queued.access_tier != Some(incoming_tier)
+                {
                     queued.access_tier = Some(incoming_tier);
                     if same_output {
                         adopted_output_keys.push(queued.output_file.to_string_lossy().to_string());
@@ -1180,7 +1213,12 @@ impl Compaction {
         tags: &[String],
     ) -> Option<Vec<proximadb_storage_filesystem_types::ObjectAccessTier>> {
         use proximadb_storage_filesystem_types::ObjectAccessTier;
-        let raw = tags.iter().find_map(|t| t.strip_prefix("tier_by_level:"))?;
+        // Last match wins — the same convention as every other multi-valued
+        // collection tag (compaction_override.rs), not first-wins.
+        let raw = tags
+            .iter()
+            .filter_map(|t| t.strip_prefix("tier_by_level:"))
+            .last()?;
         let mut tiers = Vec::new();
         for entry in raw.split(',') {
             let parsed =
@@ -1194,7 +1232,10 @@ impl Compaction {
                 Ok(Some(tier)) => tiers.push(tier),
                 Ok(None) | Err(_) => {
                     tracing::warn!(
-                        "TD-TIER-1 SC5: refusing tier_by_level policy {raw:?} —                          every entry must name a tier (hot|cool|cold); falling back to the                          collection's flat default_access_tier"
+                        tier_list = %raw,
+                        "TD-TIER-1 SC5: refusing tier_by_level policy — every entry \
+                         must name a tier (hot|cool|cold); falling back to the \
+                         collection's flat default_access_tier"
                     );
                     return None;
                 }

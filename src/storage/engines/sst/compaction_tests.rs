@@ -420,6 +420,84 @@ fn sc5_level_aware_tier_resolves_by_output_level() {
     );
 }
 
+/// Review M2: dedup adoption must never move a tier BETWEEN output levels.
+/// A full pass pairs across levels while its output is always L1, so a
+/// full-vs-background race can pair owners of different levels; under a
+/// level policy their correct tiers differ. An incoming L1-resolved tier
+/// must NOT overwrite a queued L2-resolved owner (and vice versa); same-level
+/// owners still adopt.
+#[tokio::test]
+async fn sc5_adoption_never_moves_tiers_between_levels() {
+    let manager = Compaction::new(SstConfig::default()).await.unwrap();
+    // Queued owner: an L2 output carrying its policy tier (Cool).
+    let owner = sc5_tier_task(
+        "/nonexistent/proxima_sc5_tier/L2_owner12.pax",
+        Some(ObjectAccessTier::Cool),
+    );
+    assert!(manager.schedule_compaction(owner).await.unwrap());
+    // Incoming: an L1 output (a full pass pairs across levels) sharing an
+    // input file, resolved Hot by the policy's first entry.
+    let mut incoming = sc5_tier_task(
+        "/nonexistent/proxima_sc5_tier/L1_full12.pax",
+        Some(ObjectAccessTier::Hot),
+    );
+    incoming.input_files = vec![
+        PathBuf::from("/nonexistent/proxima_sc5_tier/input_L2_b.pax"),
+        PathBuf::from("/nonexistent/proxima_sc5_tier/input_L0_a.pax"),
+    ];
+    assert!(
+        !manager.schedule_compaction(incoming).await.unwrap(),
+        "the shared input still declines the enqueue"
+    );
+    let queued_tier = {
+        let queue = manager.task_queue.lock().await;
+        queue.front().expect("owner task").access_tier
+    };
+    assert_eq!(
+        queued_tier,
+        Some(ObjectAccessTier::Cool),
+        "a cross-level decline must not rewrite the owner's tier"
+    );
+
+    // Same output level: adoption still upgrades (the M2 gate opens).
+    let manager2 = Compaction::new(SstConfig::default()).await.unwrap();
+    let owner2 = sc5_tier_task("/nonexistent/proxima_sc5_tier/L1_same12.pax", None);
+    assert!(manager2.schedule_compaction(owner2).await.unwrap());
+    let mut incoming2 = sc5_tier_task(
+        "/nonexistent/proxima_sc5_tier/L1_same12.pax",
+        Some(ObjectAccessTier::Hot),
+    );
+    incoming2.input_files = vec![PathBuf::from(
+        "/nonexistent/proxima_sc5_tier/input_L0_a.pax",
+    )];
+    assert!(!manager2.schedule_compaction(incoming2).await.unwrap());
+    let queued2 = {
+        let queue = manager2.task_queue.lock().await;
+        queue.front().expect("owner task").access_tier
+    };
+    assert_eq!(
+        queued2,
+        Some(ObjectAccessTier::Hot),
+        "same-level adoption still applies"
+    );
+}
+
+/// Review m1: a duplicated `tier_by_level:` tag follows the house
+/// last-match-wins convention for multi-valued tags.
+#[test]
+fn sc5_duplicate_tier_by_level_tag_last_wins() {
+    use crate::storage::engines::sst::compaction::Compaction;
+    let tags = vec![
+        "tier_by_level:hot,cool".to_string(),
+        "tier_by_level:cold".to_string(),
+    ];
+    assert_eq!(
+        Compaction::level_tier_policy(&tags),
+        Some(vec![ObjectAccessTier::Cold]),
+        "the last tier_by_level tag wins, like every other multi-valued tag"
+    );
+}
+
 /// Shared builder for the TD-TIER-1 SC5 tier-adoption tests: a task for one
 /// fixed collection dir whose output file and tier the test overrides.
 fn sc5_tier_task(output: &str, access_tier: Option<ObjectAccessTier>) -> CompactionTask {
