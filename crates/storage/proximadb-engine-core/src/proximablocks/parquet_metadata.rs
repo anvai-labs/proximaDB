@@ -9,6 +9,7 @@ use proximadb_storage_common::zero_copy_traits::{
     DataRange, EngineMetadata, MetadataSerializer, QueryContext,
 };
 // FilesystemPort seam (TD-DECOMP-75 pattern): root FilesystemFactory implements it.
+use super::utilities::stable_id_hash;
 use proximadb_kernel::error::ProximaDBError;
 use proximadb_storage_ports::FilesystemPort;
 
@@ -930,12 +931,7 @@ impl MetadataSerializer for ParquetMetadataSerializer {
 
     // Helper methods
     fn hash_string(&self, s: &str) -> u64 {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-
-        let mut hasher = DefaultHasher::new();
-        s.hash(&mut hasher);
-        hasher.finish()
+        stable_id_hash(s)
     }
 }
 

@@ -11,6 +11,7 @@ use proximadb_storage_common::zero_copy_traits::{
 };
 // The serializer depends only on the `FilesystemPort` seam (get_filesystem); the
 // root `FilesystemFactory` implements it, so callers pass it unchanged.
+use super::utilities::{ids_outside_all_ranges, stable_id_hash};
 use proximadb_kernel::error::ProximaDBError;
 use proximadb_storage_ports::FilesystemPort;
 
@@ -187,12 +188,7 @@ impl EngineMetadata for SwiftMetadata {
 impl SwiftMetadata {
     /// Hash an ID for range comparison
     fn hash_id(&self, id: &str) -> u64 {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-
-        let mut hasher = DefaultHasher::new();
-        id.hash(&mut hasher);
-        hasher.finish()
+        stable_id_hash(id)
     }
 
     /// Get required segments for a query
@@ -551,15 +547,12 @@ impl MetadataSerializer for SwiftMetadataSerializer {
         match &query_context.query_type {
             QueryType::IdLookup => {
                 // Check if any IDs might be in this file
-                for id in &query_context.id_lookups {
-                    let id_hash = swift_metadata.hash_id(id);
-                    for segment in &swift_metadata.segments {
-                        if id_hash >= segment.min_id_hash && id_hash <= segment.max_id_hash {
-                            return false; // Found potential match
-                        }
-                    }
-                }
-                true // No potential matches
+                let ranges: Vec<(u64, u64)> = swift_metadata
+                    .segments
+                    .iter()
+                    .map(|seg| (seg.min_id_hash, seg.max_id_hash))
+                    .collect();
+                ids_outside_all_ranges(&query_context.id_lookups, &ranges, stable_id_hash)
             }
 
             QueryType::SimilaritySearch => {
