@@ -11,9 +11,10 @@ use proximadb_storage_common::zero_copy_traits::{
 };
 // The serializer depends only on the `FilesystemPort` seam (get_filesystem); the
 // root `FilesystemFactory` implements it, so callers pass it unchanged.
-use super::utilities::{ids_outside_all_ranges, stable_id_hash};
 use proximadb_kernel::error::ProximaDBError;
 use proximadb_storage_ports::FilesystemPort;
+
+use super::utilities::{ids_outside_all_ranges, stable_id_hash};
 
 /// SWIFT global metadata header (bytemuck compatible)
 #[repr(C)]

@@ -13,8 +13,9 @@ use proximadb_records::ProximaRecord;
 
 /// Stable id hash for range comparisons (nova/swift/parquet id-hash ranges).
 ///
-/// The five per-format `hash_*` helpers this replaces were byte-identical
-/// `DefaultHasher` wrappers. IMPORTANT: the str-Hash and bytes-Hash digests
+/// The per-format `hash_*` helpers this replaces (nova/swift `hash_id`,
+/// parquet `hash_string`, sst `hash_bytes`, and the footer-cache schema
+/// fingerprint) were byte-identical `DefaultHasher` wrappers. IMPORTANT: the str-Hash and bytes-Hash digests
 /// DIFFER (std length-prefix handling), and each format's persisted
 /// min/max id-hash ranges were written with one specific form — nova, swift
 /// and parquet hash the `&str`, SST hashes the raw bytes. Both forms are

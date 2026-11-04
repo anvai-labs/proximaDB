@@ -11,9 +11,10 @@ use proximadb_storage_common::zero_copy_traits::{
     DataRange, EngineMetadata, MetadataSerializer, QueryContext, QueryType,
 };
 // FilesystemPort seam (TD-DECOMP-75 pattern): root FilesystemFactory implements it.
-use super::utilities::{ids_outside_all_ranges, stable_id_hash};
 use proximadb_kernel::error::ProximaDBError;
 use proximadb_storage_ports::FilesystemPort;
+
+use super::utilities::{ids_outside_all_ranges, stable_id_hash};
 
 /// NOVA file footer information (bytemuck compatible)
 #[repr(C)]

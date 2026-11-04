@@ -9,9 +9,10 @@ use proximadb_storage_common::zero_copy_traits::{
     DataRange, EngineMetadata, MetadataSerializer, QueryContext,
 };
 // FilesystemPort seam (TD-DECOMP-75 pattern): root FilesystemFactory implements it.
-use super::utilities::stable_id_hash;
 use proximadb_kernel::error::ProximaDBError;
 use proximadb_storage_ports::FilesystemPort;
+
+use super::utilities::stable_id_hash;
 
 /// Parquet Footer metadata (fixed size, bytemuck-compatible)
 #[repr(C)]
