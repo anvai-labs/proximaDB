@@ -1212,13 +1212,12 @@ impl Compaction {
     fn level_tier_policy(
         tags: &[String],
     ) -> Option<Vec<proximadb_storage_filesystem_types::ObjectAccessTier>> {
-        use proximadb_storage_filesystem_types::ObjectAccessTier;
         // Last match wins — the same convention as every other multi-valued
         // collection tag (compaction_override.rs), not first-wins.
         let raw = tags
             .iter()
             .filter_map(|t| t.strip_prefix("tier_by_level:"))
-            .last()?;
+            .next_back()?;
         let mut tiers = Vec::new();
         for entry in raw.split(',') {
             let parsed =
