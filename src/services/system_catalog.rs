@@ -419,6 +419,29 @@ impl SystemCatalog {
         // no-op when the local WAL already carries the watermark.
         appender.advance_sequence_floor(state.applied_seq());
 
+        // TD-PATH-2 4c: WARN when the snapshot we just adopted is UNSTAMPED.
+        // That covers two writer generations: a #2316-era high-water-aware
+        // binary that simply predates stamping (its `ids_high_water` field is
+        // present — the WARN is benign noise for it), and a pre-high-water
+        // binary (no field, and its checkpoints compact the WAL — there the
+        // floor leans on the sidecar and the WAL tail).
+        if let Some(stamp) = state.loaded_writer_version()
+            && proximadb_catalog::identity_writer_version_lags(stamp)
+        {
+            tracing::warn!(
+                store = %snapshot_store.describe(),
+                "adopted an unstamped catalog snapshot (writer predates \
+                 writer-version stamping; if it also predates the identity \
+                 high-water, the floor leans on the sidecar and the WAL tail)"
+            );
+        }
+        // TD-PATH-2 4a: fold the durable high-water sidecar —
+        // fetch_max(sidecar, snapshot.ids_high_water, WAL replay) — BEFORE the
+        // allocator floors are seeded, so an older binary's field-less
+        // snapshot + compacted WAL cannot lower the floor below an id this
+        // deployment already minted.
+        Self::adopt_identity_high_water_sidecar(&state, snapshot_store.as_ref()).await;
+
         // Owner claims the next generation — a pod taking the catalog over
         // outranks the one it replaced, so its first fenced commit fences any
         // stale writer. For the local (unfenced) store this is inert. A follower
@@ -492,10 +515,37 @@ impl SystemCatalog {
             .collect::<Result<Vec<_>>>()?;
         let entries = self.appender.append_operations(ops, None).await?;
         let applied = entries.len() as u64;
+        let touches_ids = deltas.iter().any(CatalogDelta::touches_ids_high_water);
         for (entry, delta) in entries.into_iter().zip(deltas) {
             self.state.apply_committed(entry.sequence_number, delta);
         }
         if let Some(cfg) = &self.snapshot {
+            // TD-PATH-2 4a: the mint/drop durability point. The WAL entry is
+            // durable and folded; persist the sidecar so an older binary that
+            // later takes over and checkpoints (compacting the WAL past this
+            // commit) cannot destroy the floor's only publisher-independent
+            // record. Warn-only: the WAL still carries the ids and the next
+            // checkpoint retries — failing here would report an
+            // already-committed DDL as failed.
+            //
+            // Gated on ID-BEARING deltas (review R2 MAJOR-1): an
+            // `UpsertStatistics`-only commit cannot raise the high-water, and
+            // DML row-count updates reach here on the ingest hot path — an
+            // ungated persist cost a sidecar read + tmp-write + fsync + rename
+            // per stats commit on local stores (~tripling per-commit fsync
+            // latency) and, on `requires_snapshot_on_commit` object stores,
+            // this GET+PUT stacked on the checkpoint's own GET+PUT. The
+            // checkpoint-time write in `checkpoint_locked` stays
+            // unconditional — it is the load-bearing one guarding compaction.
+            if touches_ids && let Err(error) = self.persist_identity_high_water_sidecar(cfg).await {
+                tracing::warn!(
+                    catalog = %self.name,
+                    error = %error,
+                    "identity high-water sidecar write failed at the mint/drop \
+                     durability point (the WAL still carries the ids; the next \
+                     checkpoint retries)"
+                );
+            }
             let n = self
                 .commits_since_snapshot
                 .fetch_add(applied, Ordering::SeqCst)
@@ -535,6 +585,79 @@ impl SystemCatalog {
 
     async fn commit(&self, delta: CatalogDelta) -> Result<()> {
         self.commit_batch(vec![delta]).await
+    }
+
+    /// TD-PATH-2 4a: fold the durable high-water sidecar into `state`
+    /// (`fetch_max(sidecar, snapshot.ids_high_water, WAL replay)`) and WARN on
+    /// a lagging stamp. Non-fatal by design: a missing, unreadable or corrupt
+    /// sidecar only loses DROPPED-id memory (live schemas still bound the
+    /// floor), and the merge-before-write in
+    /// [`Self::persist_identity_high_water_sidecar`] repairs the file before
+    /// the next checkpoint compacts anything.
+    async fn adopt_identity_high_water_sidecar(
+        state: &SystemCatalogState,
+        store: &dyn CatalogSnapshotStore,
+    ) {
+        match store.read_identity_high_water().await {
+            Ok(Some(bytes)) => match state.adopt_identity_high_water_sidecar_bytes(&bytes) {
+                Ok(stamp) => {
+                    if proximadb_catalog::identity_writer_version_lags(stamp) {
+                        tracing::warn!(
+                            store = %store.describe(),
+                            stamp = ?stamp,
+                            "identity high-water sidecar is unstamped (writer \
+                             predates writer-version stamping; #2336-era sidecars \
+                             are current but unstamped — benign. If it predates \
+                             high-water awareness it may under-count minted ids) — \
+                             folding it anyway"
+                        );
+                    }
+                }
+                Err(error) => tracing::warn!(
+                    store = %store.describe(),
+                    error = %error,
+                    "identity high-water sidecar is unreadable; ignoring it"
+                ),
+            },
+            Ok(None) => {}
+            Err(error) => tracing::warn!(
+                store = %store.describe(),
+                error = %error,
+                "identity high-water sidecar could not be read; it will be merged \
+                 before the next sidecar write"
+            ),
+        }
+    }
+
+    /// TD-PATH-2 4a: persist the identity high-water sidecar. Merge-first: the
+    /// on-disk image is folded into state so this write can never LOWER the
+    /// durable floor (a missed or corrupt read at open must not regress it).
+    /// An unreadable CURRENT sidecar propagates the error — writing blind
+    /// could lower the floor.
+    async fn persist_identity_high_water_sidecar(&self, cfg: &SnapshotConfig) -> Result<()> {
+        match cfg.store.read_identity_high_water().await {
+            Ok(Some(bytes)) => {
+                if let Err(error) = self.state.adopt_identity_high_water_sidecar_bytes(&bytes) {
+                    tracing::warn!(
+                        store = %cfg.store.describe(),
+                        error = %error,
+                        "existing identity high-water sidecar is unreadable; replacing \
+                         it with the state-derived floor"
+                    );
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "reading the identity high-water sidecar before rewrite at {}",
+                        cfg.store.describe()
+                    )
+                });
+            }
+        }
+        let bytes = self.state.to_identity_high_water_sidecar_bytes()?;
+        cfg.store.write_identity_high_water(&bytes).await
     }
 
     /// Force a snapshot + WAL compaction now. No-op for injected-appender
@@ -600,6 +723,19 @@ impl SystemCatalog {
                 return Ok(());
             }
         }
+
+        // 1b. TD-PATH-2 4a: durable high-water sidecar BEFORE compaction. The
+        //     snapshot published above carries the high-water, but a LATER
+        //     older-binary publisher overwrites the snapshot with a field-less
+        //     image after compacting the WAL — the sidecar is the artifact
+        //     that publisher cannot touch. A failure here fails the checkpoint
+        //     (the WAL is left un-compacted, still carrying the create deltas
+        //     replay folds), so the floor always survives somewhere.
+        //     Unconditional by design (unlike the mint-time write in
+        //     `commit_batch_locked`, which is gated on id-bearing deltas):
+        //     this write is what makes WAL compaction safe, whatever the
+        //     commit mix since the last checkpoint was.
+        self.persist_identity_high_water_sidecar(cfg).await?;
 
         // 2. Compact the WAL: keep only entries the snapshot does not cover.
         let entries = self.appender.read_all_entries().await?;
@@ -674,6 +810,23 @@ impl SystemCatalog {
                     cfg.store.describe()
                 )
             })?;
+        // TD-PATH-2 4a/4c: the peer's snapshot may be unstamped (an
+        // #2316-era aware writer, or a pre-high-water writer with no
+        // `ids_high_water`). WARN on the lagging stamp, then fold the sidecar
+        // so the re-seeded floors below sit above every id this deployment
+        // ever minted — not merely the live schemas the peer encoded.
+        if let Some(stamp) = self.state.loaded_writer_version()
+            && proximadb_catalog::identity_writer_version_lags(stamp)
+        {
+            tracing::warn!(
+                catalog = %self.name,
+                store = %cfg.store.describe(),
+                "adopted an unstamped peer catalog snapshot (writer predates \
+                 writer-version stamping; if it also predates the identity \
+                 high-water, the floor leans on the sidecar)"
+            );
+        }
+        Self::adopt_identity_high_water_sidecar(&self.state, cfg.store.as_ref()).await;
         // The snapshot may contain account ids minted by another pod after
         // this instance booted. Keep the local allocator strictly above every
         // adopted id even when the reload is same-generation (and therefore
@@ -1840,6 +1993,267 @@ mod tests {
         assert!(
             minted > dropped,
             "{minted} re-issues (or precedes) the dropped collection's id {dropped}"
+        );
+        Ok(())
+    }
+
+    /// TD-PATH-2 4a, the older-binary publisher: an OLD (pre-high-water)
+    /// binary's checkpoint publishes a snapshot WITHOUT the `ids_high_water`
+    /// key and compacts the WAL past the watermark — destroying the create
+    /// deltas replay would fold. Without a floor record independent of the
+    /// snapshot publisher, the dropped-id memory is unrecoverable from that
+    /// store and the next create re-issues the dropped collection's typed root.
+    ///
+    /// The durable high-water SIDECAR (beside the snapshot, never touched by a
+    /// publisher that does not know it) must preserve the floor.
+    #[tokio::test]
+    async fn legacy_snapshot_publisher_cannot_destroy_the_dropped_id_floor() -> Result<()> {
+        // The pre-TD-PATH-2 snapshot shape an older binary re-publishes: same
+        // live state, no `ids_high_water`, no `writer_version`.
+        #[derive(serde::Serialize, serde::Deserialize)]
+        struct PreHighWaterSnapshot {
+            account_ids: HashMap<String, u32>,
+            namespaces: HashMap<Vec<String>, CatalogNamespace>,
+            tables: HashMap<TableIdentifier, CatalogTableSchema>,
+            statistics: HashMap<TableIdentifier, CatalogTableStatistics>,
+            applied_seq: u64,
+        }
+
+        let dir = tempfile::tempdir()?;
+        let wal = dir.path().join("catalog.wal");
+        let snapshot_path = dir.path().join("catalog.snapshot");
+        let namespace = nslevels(&["legacy_pub", "default"]);
+        let orders = TableIdentifier::new(namespace.clone(), "orders");
+
+        let (dropped_coll, dropped_object) = {
+            let cat = SystemCatalog::open("default", &wal).await?;
+            cat.create_namespace_for_tenant(&namespace, HashMap::new(), Some("legacy_pub"))
+                .await?;
+            create_named(&cat, &namespace, "orders").await?;
+            let newest = create_named(&cat, &namespace, "customers").await?;
+            let dropped = (
+                newest.stable_collection_id.expect("typed collection id"),
+                newest.object_id.expect("object id"),
+            );
+            cat.drop_table(&TableIdentifier::new(namespace.clone(), "customers"), false)
+                .await?;
+            // New binary checkpoint: snapshot WITH the high-water, plus the
+            // sidecar beside it.
+            cat.checkpoint().await?;
+            dropped
+        };
+
+        // ── Simulate the older binary taking over and checkpointing ──
+        // It decodes our snapshot fine (additive fields are ignored), replays
+        // an empty WAL tail, and re-publishes the same live state WITHOUT the
+        // high-water key. Read the live image through a new-binary open (reads
+        // only), then overwrite the snapshot with the legacy encoding.
+        let (live_ns, live_schema, live_account, applied) = {
+            let cat = SystemCatalog::open("default", &wal).await?;
+            let ns = cat.get_namespace(&namespace).await?;
+            let schema = cat.get_table(&orders).await?;
+            let account = cat
+                .account_id_u32_lookup("legacy_pub")
+                .expect("account minted");
+            (ns, schema, account, cat.state.applied_seq())
+        };
+        let legacy = PreHighWaterSnapshot {
+            account_ids: HashMap::from([("legacy_pub".to_string(), live_account)]),
+            namespaces: HashMap::from([(namespace.clone(), live_ns)]),
+            tables: HashMap::from([(orders.clone(), live_schema)]),
+            statistics: HashMap::new(),
+            applied_seq: applied,
+        };
+        tokio::fs::write(&snapshot_path, rmp_serde::to_vec_named(&legacy)?).await?;
+        // …and its checkpoint compacts the WAL past the watermark, so the
+        // dropped collection's create delta is gone.
+        crate::services::canonical_wal::rewrite_canonical_wal(&wal, &[]).await?;
+
+        // ── New binary reopens on the legacy-published store ──
+        let reopened = SystemCatalog::open("default", &wal).await?;
+        // TD-PATH-2 4c: the adoption is detectable — an unstamped snapshot is
+        // the WARN condition (published by a pre-high-water binary).
+        assert_eq!(reopened.state.loaded_writer_version(), Some(None));
+        assert!(proximadb_catalog::identity_writer_version_lags(
+            reopened.state.loaded_writer_version().flatten()
+        ));
+        let fresh = create_named(&reopened, &namespace, "invoices").await?;
+        let minted_coll = fresh.stable_collection_id.expect("typed collection id");
+        let minted_object = fresh.object_id.expect("object id");
+        assert!(
+            minted_coll > dropped_coll,
+            "typed id {minted_coll} re-issues the dropped collection's {dropped_coll}: the \
+             legacy publisher destroyed the only durable record of the floor"
+        );
+        assert!(
+            minted_object > dropped_object,
+            "object id {minted_object} re-issues the dropped table's {dropped_object} \
+             (its grants would transfer)"
+        );
+
+        // Contrast: a store published ONLY by this (stamped) binary adopts a
+        // stamped snapshot — no WARN condition.
+        reopened.checkpoint().await?;
+        let reopened_again = SystemCatalog::open("default", &wal).await?;
+        assert_eq!(
+            reopened_again.state.loaded_writer_version(),
+            Some(Some(proximadb_catalog::IDENTITY_WRITER_VERSION_HIGH_WATER))
+        );
+        assert!(!proximadb_catalog::identity_writer_version_lags(
+            reopened_again.state.loaded_writer_version().flatten()
+        ));
+        Ok(())
+    }
+
+    /// A snapshot store whose sidecar write always fails — pins that the
+    /// checkpoint-time sidecar write (TD-PATH-2 4a step 1b) is LOAD-BEARING:
+    /// removing it from `checkpoint_locked`, or moving it after the WAL trim,
+    /// must fail this test. (The mint-time write alone does not cover this:
+    /// it is warn-only, and a reader cannot tell it succeeded.)
+    struct FailingSidecarStore {
+        inner: LocalSnapshotStore,
+    }
+
+    #[async_trait::async_trait]
+    impl CatalogSnapshotStore for FailingSidecarStore {
+        async fn read(
+            &self,
+        ) -> Result<Option<crate::services::catalog_snapshot_store::SnapshotRead>> {
+            self.inner.read().await
+        }
+        async fn write_atomic(&self, generation: u64, bytes: &[u8]) -> Result<SnapshotWrite> {
+            self.inner.write_atomic(generation, bytes).await
+        }
+        async fn write_identity_high_water(&self, _bytes: &[u8]) -> Result<()> {
+            Err(anyhow!("injected sidecar-write failure (test)"))
+        }
+        fn describe(&self) -> String {
+            self.inner.describe()
+        }
+    }
+
+    /// TD-PATH-2 4a (review MAJOR-2): when the sidecar write fails at
+    /// checkpoint time, the checkpoint must FAIL and the WAL must remain
+    /// un-compacted — the create deltas are the floor's fallback record, so
+    /// compaction must never destroy them without the sidecar durable.
+    #[tokio::test]
+    async fn failing_sidecar_write_fails_the_checkpoint_and_keeps_the_wal() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let wal = dir.path().join("catalog.wal");
+        let store = Arc::new(FailingSidecarStore {
+            inner: LocalSnapshotStore::new(wal.with_extension("snapshot")),
+        });
+        let ns = nslevels(&["sidecar_fail"]);
+        let cat = SystemCatalog::open_with_snapshot_store("default", &wal, store).await?;
+        cat.create_namespace(&ns, HashMap::new()).await?;
+        create_named(&cat, &ns, "t").await?; // mint-time write fails (warn-only): commit still Ok
+
+        // The checkpoint MUST fail on the sidecar write (step 1b)…
+        let checkpoint = cat.checkpoint().await;
+        assert!(
+            checkpoint.is_err(),
+            "a failed sidecar write must fail the checkpoint — otherwise the WAL \
+             can be compacted with no publisher-independent floor record"
+        );
+        // …and the WAL must still hold the pre-watermark deltas (un-compacted).
+        let appender = crate::services::FramedTableWalAppender::open(&wal).await?;
+        let entries = appender.read_entries().await?;
+        let watermark = cat.state.applied_seq();
+        assert!(
+            entries.iter().any(|e| e.sequence_number <= watermark),
+            "the WAL was compacted past the watermark ({watermark}) despite the failed \
+             sidecar write — the create deltas are gone with no sidecar to cover them"
+        );
+        // End-to-end: a plain reopen still recovers the table from that WAL.
+        let reopened = SystemCatalog::open("default", &wal).await?;
+        assert!(
+            reopened
+                .table_exists(&TableIdentifier::new(ns, "t"))
+                .await?
+        );
+        Ok(())
+    }
+
+    /// A snapshot store that COUNTS sidecar writes (delegating everything
+    /// else to a real local store), so a test can pin WHICH commits persist
+    /// the mint-time sidecar.
+    struct CountingSidecarStore {
+        inner: LocalSnapshotStore,
+        writes: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl CatalogSnapshotStore for CountingSidecarStore {
+        async fn read(
+            &self,
+        ) -> Result<Option<crate::services::catalog_snapshot_store::SnapshotRead>> {
+            self.inner.read().await
+        }
+        async fn write_atomic(&self, generation: u64, bytes: &[u8]) -> Result<SnapshotWrite> {
+            self.inner.write_atomic(generation, bytes).await
+        }
+        async fn write_identity_high_water(&self, _bytes: &[u8]) -> Result<()> {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        fn describe(&self) -> String {
+            self.inner.describe()
+        }
+    }
+
+    /// TD-PATH-2 4a (review R2 MAJOR-1): the mint-time sidecar persist is
+    /// gated on ID-BEARING deltas. DML row-count updates flow through
+    /// `update_statistics` as `UpsertStatistics`-only commits on the ingest
+    /// hot path; they cannot raise the identity high-water, so they must not
+    /// pay the sidecar round-trip (a read + tmp + fsync + rename per stats
+    /// commit on local stores; a GET+PUT pair stacked on the checkpoint's own
+    /// GET+PUT on `requires_snapshot_on_commit` object stores). Id-bearing
+    /// commits must still persist — and the gate must be per-commit, not a
+    /// sticky latch. (The checkpoint-time write stays unconditional; that
+    /// half is pinned by
+    /// `failing_sidecar_write_fails_the_checkpoint_and_keeps_the_wal`.)
+    #[tokio::test]
+    async fn stats_only_commits_skip_the_mint_time_sidecar_write() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let wal = dir.path().join("catalog.wal");
+        let store = Arc::new(CountingSidecarStore {
+            inner: LocalSnapshotStore::new(wal.with_extension("snapshot")),
+            writes: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let cat = SystemCatalog::open_with_snapshot_store("default", &wal, store.clone()).await?;
+        let ns = nslevels(&["stats_gate"]);
+        cat.create_namespace(&ns, HashMap::new()).await?;
+        create_named(&cat, &ns, "t").await?;
+        let id = TableIdentifier::new(ns.clone(), "t");
+        let after_ddl = store.writes.load(Ordering::SeqCst);
+        assert_eq!(
+            after_ddl, 2,
+            "each id-bearing commit (namespace create, table create) persists the \
+             sidecar at the mint/drop durability point"
+        );
+
+        // The hot path: row-count updates are UpsertStatistics-only commits.
+        // (Two fresh stats values: `update_statistics` takes them by value.)
+        let mut first = CatalogTableStatistics::default();
+        first.row_count = 42;
+        cat.update_statistics(&id, first).await?;
+        let mut second = CatalogTableStatistics::default();
+        second.row_count = 84;
+        cat.update_statistics(&id, second).await?;
+        assert_eq!(
+            store.writes.load(Ordering::SeqCst),
+            after_ddl,
+            "UpsertStatistics commits cannot raise the high-water and must not \
+             write the sidecar (it would sit on the DML ingest hot path)"
+        );
+
+        // The gate reads the batch, not a latch: an id-bearing commit after
+        // the stats-only ones persists again.
+        create_named(&cat, &ns, "t2").await?;
+        assert_eq!(
+            store.writes.load(Ordering::SeqCst),
+            after_ddl + 1,
+            "an id-bearing commit after stats-only commits still persists the sidecar"
         );
         Ok(())
     }

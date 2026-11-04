@@ -1,12 +1,12 @@
 = TD-PATH-2: A typed collection id can be reused after a failed drop, so the new collection inherits the old one's segments
-:status: Partial — durable identity high-water shipped for BOTH catalogs (#2316 SystemCatalog, #2336 NativeCatalog); reserved-uncommitted ids and older-binary publishers open
+:status: Partial — durable identity high-water shipped for BOTH catalogs (#2316 SystemCatalog, #2336 NativeCatalog); older-binary publishers addressed for both (fix/tdpath2-older-binary-publishers: SystemCatalog durable high-water sidecar + eager NativeCatalog typed-id fold + writer-version stamp); reserved-uncommitted ids remain
 :filed: 2026-10-30
 :priority: P2 — latent while `PROXIMADB_TYPED_PATHS` is default-off; P1 before it defaults on
 
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | **Partial.** Shipped (fix/td-path-2-collection-id-hwm): `SystemCatalog` keeps a monotonic identity high-water (`IdsHighWater`: typed `collection_id` and `object_id`) that drops never lower — folded from every upserted table/namespace on WAL replay, and carried in the snapshot as an additive optional field (an older binary ignores it; an older snapshot decodes as `None` and the live schemas bound the floor, as before). Both allocator floors sit above it, so a dropped collection's typed root and a dropped object's id (and its grants) are never re-issued, whatever the drop's storage cleanup did. The typed namespace id is high-watered too. The legacy `{base}/{id}` root was exposed as well — `collection.id` is the decimal `object_id` — and is covered by the same fix. Shipped for `NativeCatalog` too (fix/native-catalog-id-floors): a durable identity high-water sidecar (`_syscat/identity_high_water.json`, additive `serde(default)` — absent = written before the change, seeded once from a full metadata scan) mirrors the SystemCatalog design: enforcement at both mint choke points (`mint_object_id`, `resolve_typed_triple`) raises the scope above the global high-water BEFORE minting; the sidecar is persisted at open, at every mint's durability point (table/namespace create), and at `drop_table` entry — before the file carrying the newest ids can disappear. Semantic change: typed collection ids remain per-scope addressed but are now globally NON-REUSING (a new namespace's first collection sits above the global high-water, not 1). Remaining open: reserved-but-uncommitted ids, and older-binary publishers in a mixed rollout; any older-binary snapshot publisher (rollback, or a mixed-version rollout where an old owner publishes and a new follower later checkpoints) persists a high-water derived from live state only; an id reserved by `allocate_object_id` whose catalog commit then fails can be re-issued onto directories the failed create left behind. Rejected: a fail-closed drop — every network surface reported a refused drop as success or 404, the `exists` probe is a no-op on S3/Azure/GCS prefixes, and a local refusal can already have deleted segments (review of the abandoned slice); the misreporting of failed drops (e.g. `CATALOG_DELETE_FAILED`) is a separate pre-existing surface bug.
+| Status | **Partial.** Shipped (fix/td-path-2-collection-id-hwm): `SystemCatalog` keeps a monotonic identity high-water (`IdsHighWater`: typed `collection_id` and `object_id`) that drops never lower — folded from every upserted table/namespace on WAL replay, and carried in the snapshot as an additive optional field (an older binary ignores it; an older snapshot decodes as `None` and the live schemas bound the floor, as before). Both allocator floors sit above it, so a dropped collection's typed root and a dropped object's id (and its grants) are never re-issued, whatever the drop's storage cleanup did. The typed namespace id is high-watered too. The legacy `{base}/{id}` root was exposed as well — `collection.id` is the decimal `object_id` — and is covered by the same fix. Shipped for `NativeCatalog` too (fix/native-catalog-id-floors): a durable identity high-water sidecar (`_syscat/identity_high_water.json`, additive `serde(default)` — absent = written before the change, seeded once from a full metadata scan) mirrors the SystemCatalog design: enforcement at both mint choke points (`mint_object_id`, `resolve_typed_triple`) raises the scope above the global high-water BEFORE minting; the sidecar is persisted at open, at every mint's durability point (table/namespace create), and at `drop_table` entry — before the file carrying the newest ids can disappear. Semantic change: typed collection ids remain per-scope addressed but are now globally NON-REUSING (a new namespace's first collection sits above the global high-water, not 1). Older-binary publishers ADDRESSED for both catalogs (fix/tdpath2-older-binary-publishers): the snapshot field alone could not survive a mixed rollout, because an older binary's checkpoint re-publishes a field-less snapshot AND compacts the WAL past the watermark, destroying the create deltas replay would fold. For `SystemCatalog` a durable high-water SIDECAR object now lives beside the snapshot, independent of snapshot publishers — `catalog.hw` next to the local snapshot blob, `_operator/catalog/identity_high_water` beside the object-store `_manifests/` log (verified: `LocalSnapshotStore` renames only its own two paths, and the manifest log's retention prune deletes only its own canonical `{prefix}/_history/` archives — an old binary cannot clean a sibling it never names). It is written at the mint/drop durability point for ID-BEARING deltas only — `UpsertStatistics` commits (the DML ingest hot path: every row-count update) cannot move the high-water and skip the sidecar round-trip entirely (review R2 MAJOR-1; warn-only when it does write, the WAL still carries the ids) and, load-bearing and UNCONDITIONAL, BEFORE `checkpoint_locked` compacts the WAL — a sidecar write failure fails the checkpoint, so compaction never destroys history the floor still needs (pinned by `failing_sidecar_write_fails_the_checkpoint_and_keeps_the_wal`); the write merges the on-disk sidecar first (fetch-max) so it can never lower the durable floor. Open/adopt folds `fetch_max(sidecar, snapshot.ids_high_water, WAL replay)`. For `NativeCatalog` the typed-id fold from table files now runs EAGERLY at EVERY open (not only the one-time seed while the sidecar is absent — an old binary minting after the seed left it stale forever), so a live-but-unloaded collection's typed ids bound the mint before any `load_table`; cost: ~2N file reads at open (dual-written tables are read once per layout — legacy name-keyed AND `_syscat/objects/` — plus one list per namespace and one for the objects dir; skipped entirely when the index rebuild already scanned). The fold runs LENIENT — a torn/undecodable metadata file is skipped with a loud WARN, degrading to that table's pre-fold lazy recovery instead of failing the whole open (review MAJOR-1a; pinned by `a_torn_table_file_degrades_the_fold_not_the_open`), while the index-rebuild scan keeps its strict policy; and `io_write`'s local branch is now genuinely atomic (tmp → fsync → rename — its doc always claimed atomicity; review MAJOR-1b), closing the torn-write source for new files. Both artifacts carry a `writer_version` stamp (shared ladder in `proximadb-catalog`: 1 = pre-high-water, 2 = high-water-aware); a new binary logs a WARN when it adopts an UNSTAMPED snapshot or sidecar — which covers both a pre-high-water writer (floor leans on the sidecar/WAL) and a #2316/#2336-era aware writer that predates stamping (benign noise; its high-water is present/current). See "Rollback protocol" for the upgrade/rollback matrix and the interregnum residuals. Remaining open: reserved-but-uncommitted ids — an id reserved by `allocate_object_id` whose catalog commit then fails can be re-issued onto directories the failed create left behind (persist-at-allocate is the open design item, documented in #2398; for NativeCatalog the eager open fold now re-bounds the floor from table files at every open, shrinking — not closing — that window) — and the interregnum residual (see "Rollback protocol"): ids MINTED AND DROPPED by an OLD binary during a rollback/mixed window are invisible to every recovery mechanism here, so old binaries must not run create-then-drop DDL during such windows (or the exposure is accepted). Rejected: a fail-closed drop — every network surface reported a refused drop as success or 404, the `exists` probe is a no-op on S3/Azure/GCS prefixes, and a local refusal can already have deleted segments (review of the abandoned slice); the misreporting of failed drops (e.g. `CATALOG_DELETE_FAILED`) is a separate pre-existing surface bug.
 | Relates to | link:TD-PATH-1-cwd-relative-default-paths-cross-contaminate.adoc[TD-PATH-1], ADR-031 (typed `accounts/{a}/{n}/{c}` layout), ADR-0083 (typed identity on every assignment), link:TD-TIER-1-collection-storage-policy-and-residency.adoc[TD-TIER-1]
 |===
 
@@ -39,6 +39,74 @@ collection would delete the other's segments.
 * Gate: a test that drops the highest-id typed collection with an injected `remove_dir_all`
   failure, restarts, creates a new collection, and asserts the new collection's data directory
   is empty (or that the create mints a fresh triple).
+
+== Rollback protocol (older-binary publishers, shipped fix)
+
+The durable artifacts and what each binary version does to them. Note the THREE writer
+generations: pre-high-water (no field/sidecar, no stamp), #2316/#2336-era high-water-aware
+(field/sidecar maintained, but UNSTAMPED — the stamp postdates them), and current
+(writer_version 2). An unstamped artifact is therefore not proof of a pre-high-water
+writer; the adoption WARNs are deliberately worded for both cases and are BENIGN NOISE on
+a #2316/#2336-era artifact.
+
+[cols="2,3,2,3", options="header"]
+|===
+| Artifact | Written by a current binary (writer_version 2) | Written by a #2316/#2336-era aware binary (unstamped) | Written by a pre-high-water binary
+| `SystemCatalog` snapshot (`catalog.snapshot` / the object-store manifest log)
+| Carries `ids_high_water` + `writer_version: 2`
+| Carries `ids_high_water`, no stamp
+| Carries neither (additive fields simply omitted); its checkpoint still compacts the WAL past the watermark
+| `SystemCatalog` high-water sidecar (`catalog.hw` / `_operator/catalog/identity_high_water`)
+| Fetch-max merged + stamped at the mint/drop durability point and before every WAL compaction
+| Did not exist yet — never written
+| NEVER touched — old binaries do not name it (local: they rename only their own snapshot+tmp paths; object store: manifest retention prunes only its own `_history/` archives)
+| `NativeCatalog` sidecar (`_syscat/identity_high_water.json`)
+| Stamped; raised at open, at every mint's durability point, at drop entry
+| Written and raised, but unstamped (the #2336-era sidecar is current, not stale)
+| Not written (a pre-TD-PATH-2 binary does not know it), so it can go stale below ids the old binary minted
+|===
+
+Upgrade (old → new) is safe in every ordering:
+
+* New binary opens a legacy-published store: decodes the field-less snapshot (live schemas
+  bound the floor, as before), folds the sidecar `fetch_max`, replays the WAL — and WARNs
+  that the adopted snapshot's stamp lags.
+* New binary opens a store whose NativeCatalog sidecar is stale (an old binary minted after
+  the last aware writer): the EAGER typed-id fold from all table files re-bounds the global
+  high-water above every live id before any mint, then persists the repaired sidecar.
+
+[NOTE]
+====
+Ops prerequisite before upgrading an object-store catalog: the sidecar is written to a NEW
+sibling key (`_operator/catalog/identity_high_water`) that pre-existing bucket policies have
+never named. A policy that denies PUT outside its allowlisted keys fails EVERY checkpoint
+(and every DDL commit on `requires_snapshot_on_commit` stores) after the upgrade — grant PUT
+on the sidecar key BEFORE upgrading, not after the first failed checkpoint.
+====
+
+Rollback (new → old) is the asymmetric direction and the one that can destroy evidence:
+
+* Rolling the `SystemCatalog` back to a pre-high-water binary and letting it CHECKPOINT is
+  the destructive act: its snapshot drops the field and its WAL compaction deletes the
+  create deltas. The floor survives ONLY through the sidecar it cannot touch — so never
+  delete `catalog.hw` / `_operator/catalog/identity_high_water` when rolling back, and
+  expect a WARN-storm from the aware binary when you upgrade again (each WARN is it
+  telling you it is leaning on the sidecar).
+* RESIDUAL — ids MINTED AND DROPPED BY THE OLD BINARY during the interregnum are lost to
+  every mechanism this fix has: the old binary's snapshot carries no high-water, its WAL
+  compaction deletes the create deltas, the dropped object is absent from every live
+  schema, and the sidecar predates those mints. A rollback/mixed window is therefore only
+  as safe as the old binary's DDL discipline: old binaries must NOT run create-then-drop
+  DDL during such a window, or the window is accepted as re-issuance-exposed.
+* Rolling `NativeCatalog` back does not lose the sidecar (old binaries never write it), but
+  ids the OLD binary mints afterwards are invisible to it. If the old binary mints AND
+  COMMITS, the next aware open re-bounds via the eager fold (the committed metadata file
+  carries the id). But an old-binary mint that is then DROPPED is as invisible as the
+  reserved-uncommitted case — the drop deletes the metadata file that was the id's only
+  record, so the eager fold cannot see it either; the same create+drop prohibition during
+  mixed windows applies. Between two aware opens, a second old-binary mint can also still
+  collide with a live-but-unloaded collection before any aware open re-bounds — bounded by
+  "run one aware binary open after any rollback window before trusting new mints".
 
 == Not in scope
 

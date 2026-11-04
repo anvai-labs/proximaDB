@@ -245,6 +245,12 @@ struct IdentityHighWaterFile {
     collection_id: u32,
     #[serde(default)]
     namespace_id: u32,
+    /// TD-PATH-2 4c: writer-version stamp. Absent (`None`) = last written by
+    /// a binary that predates the stamp — which is exactly the binary whose
+    /// mints the file may under-count; the eager open fold re-bounds the
+    /// floor from the table files in that case.
+    #[serde(default)]
+    writer_version: Option<u32>,
 }
 
 /// ADR-031 Phase 4b: durable account-string → u32 registry sidecar
@@ -269,6 +275,21 @@ struct MigrationMarker {
     oid_paths: bool,
     /// Millis-since-epoch when oid paths were first enabled for this catalog.
     migrated_at: i64,
+}
+
+/// How [`NativeCatalog::scan_object_index_entries`] treats a metadata file
+/// it cannot read or decode.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ScanMode {
+    /// Propagate every error. The caller rebuilds the durable index from
+    /// this scan — a swallowed error would silently drop a table from the
+    /// index (and its oid from the allocator floor), so it must fail loud.
+    Strict,
+    /// Skip the file with a WARN. The caller only folds identity ids, and
+    /// one torn file must not make the whole catalog unopenable: the
+    /// skipped table's ids degrade exactly as they did pre-fold (recovered
+    /// lazily by its own `load_table` once the file is readable/repaired).
+    Lenient,
 }
 
 impl NativeCatalog {
@@ -593,8 +614,20 @@ impl NativeCatalog {
 
         // TD-PATH-2: the durable identity high-water must be in place before
         // ANY mint — including load_namespaces' legacy object_id backfill.
-        // (The one-time seed scan runs later, once the index is loaded.)
-        let sidecar_loaded = catalog.load_identity_high_water_file().await?;
+        // (The eager fold from the table files runs later, once the index is
+        // loaded and namespaces are in memory.)
+        //
+        // Why the backfill minting BEFORE the table-file fold is safe: the
+        // backfill only fires for namespaces persisted with `object_id: None`
+        // (pre-TD-CAT-9 era), and it is idempotent — after the first aware
+        // run every namespace carries an oid, so with the sidecar present
+        // (the steady mixed-rollout case) no backfill mint happens at all.
+        // On the very first aware run (sidecar absent) the eager fold below
+        // immediately re-bounds the floor from every table file; the residual
+        // — a first-run backfill mint colliding with an id recorded only in a
+        // not-yet-scanned table file — is the same class as the documented
+        // reserved-uncommitted window (TD-PATH-2 Status).
+        catalog.load_identity_high_water_file().await?;
 
         // Load existing namespaces
         catalog.load_namespaces().await?;
@@ -609,17 +642,24 @@ impl NativeCatalog {
         // it from the authoritative object files if it is absent — first boot
         // after upgrade). After this, oid↔name resolution is available without a
         // name-keyed load, which oid-keyed reads (S2) and WAL-oid depend on.
-        catalog.load_object_index().await?;
+        let folded_while_rebuilding_index = catalog.load_object_index().await?;
 
-        // TD-PATH-2: absent sidecar = written before this change → seed once
-        // from the authoritative table files (the index-rebuild precedent),
-        // so even a boot → drop-newest → restart cycle on the first
-        // new-binary run cannot re-issue. Persisting at open makes the
-        // recovered maxima durable immediately (warn-only: a read-only
-        // location must not refuse an otherwise-openable catalog).
-        if !sidecar_loaded {
-            catalog.seed_identity_high_water_from_files().await?;
+        // TD-PATH-2 4b: fold typed collection/namespace ids from ALL table
+        // files EAGERLY at every open (the TD's own "recovered eagerly at
+        // open"), not only when the sidecar is absent and not lazily per
+        // `load_table`. An older binary minting after this catalog's last run
+        // never refreshes the sidecar, so the sidecar alone can sit BELOW a
+        // live collection's id — and a fresh mint would collide with that
+        // live-but-unloaded collection's `accounts/{a}/{n}/{c}` root. The
+        // eager fold re-bounds the floor from the authoritative files before
+        // any mint. Cost: one table-file read per table at open. (Skipped
+        // only when the index rebuild above already scanned the same files.)
+        if !folded_while_rebuilding_index {
+            catalog.fold_identity_high_water_from_files().await?;
         }
+        // Persisting at open makes the recovered maxima durable immediately
+        // (warn-only: a read-only location must not refuse an otherwise-
+        // openable catalog).
         if let Err(error) = catalog.persist_identity_high_water().await {
             warn!("identity high-water sidecar write failed at open: {error}");
         }
@@ -751,7 +791,12 @@ impl NativeCatalog {
     /// allocator floor. If the index file is absent (first boot after upgrade),
     /// rebuild it by scanning the authoritative object files **once** and persist
     /// — never an unconditional per-boot scan (steady state is a single file read).
-    async fn load_object_index(&self) -> Result<()> {
+    ///
+    /// Returns whether the rebuild branch ran — that scan already folds every
+    /// persisted identity id into the TD-PATH-2 high-water
+    /// ([`Self::fold_identity_high_water_from_files`]), so the caller can skip
+    /// the (otherwise unconditional) eager fold.
+    async fn load_object_index(&self) -> Result<bool> {
         if let Some(data) = self.io_read_opt(&Self::object_index_rel()).await? {
             let index: ObjectIndex = serde_json::from_slice(&data)?;
             self.populate_object_index(&index.tables).await;
@@ -759,7 +804,7 @@ impl NativeCatalog {
                 "Loaded {} table object_id index entries",
                 index.tables.len()
             );
-            return Ok(());
+            return Ok(false);
         }
         // Canonical location absent → migrate the pre-rename index in place if it
         // exists (write it to `_syscat/index.json`; the old file becomes an inert
@@ -773,12 +818,14 @@ impl NativeCatalog {
                  _syscat/ location",
                 index.tables.len()
             );
-            return Ok(());
+            return Ok(false);
         }
         // Both absent → one-time rebuild from authoritative object files.
-        let entries = self.scan_object_index_entries().await?;
+        // Strict: a swallowed error here would silently drop a table from the
+        // durable index (and its oid from the allocator floor).
+        let entries = self.scan_object_index_entries(ScanMode::Strict).await?;
         if entries.is_empty() {
-            return Ok(());
+            return Ok(true);
         }
         self.populate_object_index(&entries).await;
         self.save_object_index().await?;
@@ -786,7 +833,7 @@ impl NativeCatalog {
             "Rebuilt durable object_id index from {} object file(s)",
             entries.len()
         );
-        Ok(())
+        Ok(true)
     }
 
     // ── ADR-031 Phase 4b: durable account-string → u32 registry ──────────
@@ -814,6 +861,7 @@ impl NativeCatalog {
             object_id: self.identity_hw_object.load(Ordering::Relaxed),
             collection_id: self.identity_hw_collection.load(Ordering::Relaxed),
             namespace_id: self.identity_hw_namespace.load(Ordering::Relaxed),
+            writer_version: Some(crate::IDENTITY_WRITER_VERSION_HIGH_WATER),
         };
         let data = serde_json::to_vec_pretty(&file)?;
         self.io_write(&Self::identity_high_water_rel(), &data).await
@@ -850,6 +898,20 @@ impl NativeCatalog {
             return Ok(false);
         };
         let file: IdentityHighWaterFile = serde_json::from_slice(&data)?;
+        // TD-PATH-2 4c: an unstamped sidecar predates writer-version
+        // stamping. That is usually a #2336-era aware binary (its sidecar is
+        // current, the WARN is benign noise); only a pre-high-water writer's
+        // file genuinely under-counts. WARN either way — the eager open fold
+        // re-bounds the floor from the authoritative table files.
+        if crate::identity_writer_version_lags(file.writer_version) {
+            warn!(
+                "identity high-water sidecar is unstamped (writer predates \
+                 writer-version stamping; stamp {:?}) — if it predates \
+                 high-water awareness it may under-count minted ids; the eager \
+                 open fold re-bounds the floor from the table files",
+                file.writer_version
+            );
+        }
         self.identity_hw_object
             .fetch_max(file.object_id, Ordering::Relaxed);
         self.identity_hw_collection
@@ -863,11 +925,21 @@ impl NativeCatalog {
         Ok(true)
     }
 
-    /// One-time seed (sidecar absent): fold every persisted identity id from
-    /// the authoritative table files — the same full-read precedent as the
-    /// index rebuild.
-    async fn seed_identity_high_water_from_files(&self) -> Result<()> {
-        let _ = self.scan_object_index_entries().await?;
+    /// TD-PATH-2 4b: fold every persisted identity id from the authoritative
+    /// table files. Used to run once, when the sidecar was absent (the
+    /// one-time seed) — which left the hole an older binary publisher walks
+    /// through: an old binary minting AFTER the seed never refreshes the
+    /// sidecar, and the lazy per-`load_table` recovery meant a
+    /// live-but-unloaded collection's typed ids did not bound the allocator
+    /// until first read. The fold now runs at EVERY open, before any mint.
+    ///
+    /// [`ScanMode::Lenient`]: this runs at every open, so one torn metadata
+    /// file must not make the whole catalog unopenable — the skipped table
+    /// degrades to the pre-fold lazy recovery instead (server stays up; the
+    /// WARN names the file for repair). The index-rebuild caller keeps the
+    /// strict policy, where dropping a table silently is the worse failure.
+    async fn fold_identity_high_water_from_files(&self) -> Result<()> {
+        let _ = self.scan_object_index_entries(ScanMode::Lenient).await?;
         Ok(())
     }
 
@@ -928,7 +1000,11 @@ impl NativeCatalog {
     ///    read straight from the file. Missing either scan would silently drop a
     ///    table from the index — and, worse, never raise the allocator floor for
     ///    its oid, risking a reuse.
-    async fn scan_object_index_entries(&self) -> Result<Vec<ObjectIndexEntry>> {
+    ///
+    /// `mode` selects the per-file error policy ([`ScanMode`]): `Strict` for
+    /// the index rebuild, `Lenient` for the identity fold that runs at every
+    /// open.
+    async fn scan_object_index_entries(&self, mode: ScanMode) -> Result<Vec<ObjectIndexEntry>> {
         let mut entries = Vec::new();
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut push = |id: &TableIdentifier, object_id: u64| {
@@ -940,6 +1016,39 @@ impl NativeCatalog {
                 });
             }
         };
+        /// Read + decode one metadata file under the scan's error policy.
+        macro_rules! read_meta {
+            ($rel:expr) => {
+                match self.io_read_opt($rel).await {
+                    Ok(Some(data)) => match serde_json::from_slice::<TableMetadata>(&data) {
+                        Ok(meta) => Some(meta),
+                        Err(error) => match mode {
+                            ScanMode::Strict => return Err(error.into()),
+                            ScanMode::Lenient => {
+                                warn!(
+                                    "skipping undecodable table metadata {} during the \
+                                     identity fold (torn write?): {error}",
+                                    $rel
+                                );
+                                None
+                            }
+                        },
+                    },
+                    Ok(None) => None,
+                    Err(error) => match mode {
+                        ScanMode::Strict => return Err(error),
+                        ScanMode::Lenient => {
+                            warn!(
+                                "skipping unreadable table metadata {} during the \
+                                 identity fold: {error}",
+                                $rel
+                            );
+                            None
+                        }
+                    },
+                }
+            };
+        }
 
         // 1) Legacy name-keyed files, namespace by namespace.
         let namespaces: Vec<Vec<String>> = {
@@ -953,8 +1062,7 @@ impl NativeCatalog {
         for ns in namespaces {
             for name in self.io_list_json_stems(&Self::tables_dir_rel(&ns)).await {
                 let id = TableIdentifier::new(ns.clone(), name);
-                if let Some(data) = self.io_read_opt(&Self::table_metadata_rel(&id)).await? {
-                    let meta: TableMetadata = serde_json::from_slice(&data)?;
+                if let Some(meta) = read_meta!(&Self::table_metadata_rel(&id)) {
                     self.fold_identity_high_water(&meta.schema);
                     if let Some(object_id) = meta.schema.object_id {
                         push(&id, object_id);
@@ -969,8 +1077,7 @@ impl NativeCatalog {
             let Ok(oid) = stem.parse::<u64>() else {
                 continue; // not an oid file (e.g. _migration.json lives elsewhere)
             };
-            if let Some(data) = self.io_read_opt(&Self::object_file_rel(oid)).await? {
-                let meta: TableMetadata = serde_json::from_slice(&data)?;
+            if let Some(meta) = read_meta!(&Self::object_file_rel(oid)) {
                 self.fold_identity_high_water(&meta.schema);
                 let id = TableIdentifier::new(
                     meta.identifier.namespace.clone(),
@@ -1189,14 +1296,48 @@ impl NativeCatalog {
     }
 
     /// Write a key atomically, creating parent directories as needed.
+    ///
+    /// TD-PATH-2 (review MAJOR-1b): the local branch used a plain `fs::write`,
+    /// so a crash mid-DDL could leave a TORN metadata file. That was merely a
+    /// per-table `load_table` failure before; with the eager identity fold at
+    /// open it would (before the Lenient scan mode) fail the entire catalog
+    /// open. Both ends are now closed: torn writes are prevented here (tmp →
+    /// fsync → rename), and the fold tolerates any torn file that predates
+    /// the fix (Lenient skip + WARN). The injected-FS branch was already
+    /// atomic (`write_atomic`). A write failure removes its tmp file (review
+    /// R2 NIT-3); only a hard crash between tmp-write and rename can leave a
+    /// `*.json.tmp` orphan — extension-filtered out of every list.
     async fn io_write(&self, rel: &str, data: &[u8]) -> Result<()> {
         match &self.fs {
             None => {
+                use tokio::io::AsyncWriteExt;
                 let path = self.local_path(rel);
                 if let Some(parent) = path.parent() {
                     fs::create_dir_all(parent).await?;
                 }
-                fs::write(&path, data).await?;
+                let tmp = path.with_extension("json.tmp");
+                let written = async {
+                    {
+                        let mut file = tokio::fs::File::create(&tmp).await?;
+                        file.write_all(data).await?;
+                        file.flush().await?;
+                        file.sync_data().await?;
+                    }
+                    tokio::fs::rename(&tmp, &path).await?;
+                    Ok(())
+                }
+                .await;
+                if let Err(error) = written {
+                    let _ = fs::remove_file(&tmp).await;
+                    return Err(error);
+                }
+                // Best-effort directory fsync so the rename itself survives a
+                // power loss (the file content already is).
+                if let Some(dir) = path.parent()
+                    && let Ok(handle) = std::fs::File::open(dir)
+                {
+                    let _ = handle.sync_all();
+                }
                 Ok(())
             }
             Some(fs) => {
@@ -2927,6 +3068,172 @@ mod tests {
             coll > live_coll,
             "{coll} must sit above the live collection's {live_coll} even without a sidecar"
         );
+    }
+
+    /// TD-PATH-2 4b, the older-binary publisher: an old binary minting AFTER
+    /// the new binary's one-time seed leaves the sidecar STALE forever (the
+    /// seed only runs while the file is ABSENT) — here simulated by an
+    /// old-binary-shaped sidecar that stops below a live collection's id.
+    /// Typed ids are recovered lazily per `load_table`, so on current code the
+    /// reopened catalog mints below the live-but-unloaded collection's id —
+    /// the same-scope typed-triple collision, i.e. the new collection's data
+    /// lands on the old collection's `accounts/{a}/{n}/{c}` root.
+    ///
+    /// The eager typed-id fold from ALL table files at open must prevent it.
+    #[tokio::test]
+    async fn stale_sidecar_cannot_collide_with_a_live_unloaded_collection() {
+        use crate::{Catalog, TableIdentifier};
+        let ns_key = vec!["tdp2d".to_string()];
+        let (cat, dir) = catalog_in_tempdir().await;
+        cat.create_namespace_for_tenant(&ns_key, HashMap::new(), Some("tdp2d_acct"))
+            .await
+            .expect("tenant namespace");
+        let a = cat
+            .create_table(&TableIdentifier::new(ns_key.clone(), "a"), id_schema("a"))
+            .await
+            .expect("create a");
+        let b = cat
+            .create_table(&TableIdentifier::new(ns_key.clone(), "b"), id_schema("b"))
+            .await
+            .expect("create b");
+        let c = cat
+            .create_table(&TableIdentifier::new(ns_key.clone(), "c"), id_schema("c"))
+            .await
+            .expect("create c");
+        let c_coll = c.stable_collection_id.expect("coll c");
+        let b_object = b.object_id.expect("object b");
+        assert!(c_coll > b.stable_collection_id.expect("coll b"));
+        drop(cat);
+
+        // Old-binary-shaped sidecar: as if the last writer minted `b` (and
+        // persisted) but the writer of `c` predates high-water awareness —
+        // the file exists, so the one-time seed will never run again.
+        let stale = serde_json::json!({
+            "object_id": b_object,
+            "collection_id": b.stable_collection_id.expect("coll b"),
+            "namespace_id": a.stable_namespace_id.unwrap_or(0),
+        });
+        std::fs::write(
+            dir.path().join("cat/_syscat/identity_high_water.json"),
+            stale.to_string(),
+        )
+        .expect("plant stale sidecar");
+
+        // Reopen and mint WITHOUT loading any table (the lazy floors stay
+        // unrecovered — exactly the hole).
+        let reopened = reopen_same_dir(&dir).await;
+        let (_acct, _ns, coll) = reopened
+            .mint_collection_typed_identity("tdp2d_acct", "tdp2d")
+            .await
+            .expect("mint after stale sidecar")
+            .expect("triple");
+        assert!(
+            coll > c_coll,
+            "typed id {coll} collides with (or precedes) the live-but-unloaded \
+             collection's {c_coll} — the eager open fold did not bound the mint"
+        );
+    }
+
+    /// TD-PATH-2 4b (review MAJOR-1a): the eager fold runs at EVERY open, so
+    /// one torn table-metadata file (a crash mid-`io_write` predating the
+    /// atomic-write fix) must degrade to a skip + WARN, not fail the whole
+    /// catalog open — the server stays up, the readable files still bound the
+    /// floor, and the torn table keeps its pre-fold lazy `load_table`
+    /// degradation.
+    #[tokio::test]
+    async fn a_torn_table_file_degrades_the_fold_not_the_open() {
+        use crate::{Catalog, TableIdentifier};
+        let ns_key = vec!["tdp2f".to_string()];
+        let (cat, dir) = catalog_in_tempdir().await;
+        cat.create_namespace_for_tenant(&ns_key, HashMap::new(), Some("tdp2f_acct"))
+            .await
+            .expect("tenant namespace");
+        let intact = cat
+            .create_table(
+                &TableIdentifier::new(ns_key.clone(), "intact"),
+                id_schema("intact"),
+            )
+            .await
+            .expect("create intact");
+        let torn = cat
+            .create_table(
+                &TableIdentifier::new(ns_key.clone(), "torn"),
+                id_schema("torn"),
+            )
+            .await
+            .expect("create torn");
+        let intact_coll = intact.stable_collection_id.expect("coll intact");
+        assert!(torn.stable_collection_id.expect("coll torn") > intact_coll);
+        drop(cat);
+
+        // Simulate the torn write: truncate one metadata file to garbage, and
+        // remove the sidecar so the floor comes ONLY from the file scan (the
+        // intact file must bound the mint even with its sibling torn).
+        let torn_path = dir
+            .path()
+            .join(format!("cat/metadata/tables/{}/torn.json", ns_key[0]));
+        std::fs::write(&torn_path, b"{\"identifier\": ").expect("plant torn file");
+        std::fs::remove_file(dir.path().join("cat/_syscat/identity_high_water.json"))
+            .expect("sidecar present after create");
+
+        // The open must SUCCEED (skip + warn), and the intact file still
+        // bounds the floor.
+        let reopened = reopen_same_dir(&dir).await;
+        let (_acct, _ns, coll) = reopened
+            .mint_collection_typed_identity("tdp2f_acct", "tdp2f")
+            .await
+            .expect("mint with a torn file present")
+            .expect("triple");
+        assert!(
+            coll > intact_coll,
+            "the intact file's id {intact_coll} must still bound the mint ({coll})"
+        );
+    }
+
+    /// TD-PATH-2 4c: the persisted sidecar carries the writer-version stamp,
+    /// and a pre-stamp (old-binary-shaped) file decodes mixed-read-safe and
+    /// trips the lag predicate that drives the adoption WARN.
+    #[tokio::test]
+    async fn sidecar_carries_writer_version_and_a_legacy_shape_lags() {
+        use crate::{Catalog, TableIdentifier};
+        let ns_key = vec!["tdp2e".to_string()];
+        let (cat, dir) = catalog_in_tempdir().await;
+        cat.create_namespace_for_tenant(&ns_key, HashMap::new(), Some("tdp2e_acct"))
+            .await
+            .expect("tenant namespace");
+        cat.create_table(&TableIdentifier::new(ns_key.clone(), "t"), id_schema("t"))
+            .await
+            .expect("create t");
+        drop(cat);
+
+        // Current binary: the file is stamped and does not lag.
+        let stamped: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join("cat/_syscat/identity_high_water.json"))
+                .expect("sidecar persisted"),
+        )
+        .expect("sidecar json");
+        assert_eq!(
+            stamped["writer_version"],
+            serde_json::json!(crate::IDENTITY_WRITER_VERSION_HIGH_WATER),
+            "a high-water-aware binary stamps every sidecar write"
+        );
+        let stamp = stamped["writer_version"].as_u64().map(|v| v as u32);
+        assert!(!crate::identity_writer_version_lags(stamp));
+
+        // Pre-stamp shape (exactly what an older binary leaves behind): the
+        // additive field decodes as None — mixed-read-safe — and lags.
+        let legacy = serde_json::json!({"object_id": 1, "collection_id": 1, "namespace_id": 1});
+        let file: IdentityHighWaterFile =
+            serde_json::from_value(legacy).expect("legacy sidecar decodes");
+        assert_eq!(file.writer_version, None);
+        assert!(
+            crate::identity_writer_version_lags(file.writer_version),
+            "an unstamped sidecar is the lagging-publisher WARN condition"
+        );
+        assert!(crate::identity_writer_version_lags(None));
+        assert!(!crate::identity_writer_version_lags(Some(
+            crate::IDENTITY_WRITER_VERSION_HIGH_WATER
+        )));
     }
 
     // Note: These tests require a mock filesystem or temp directory
