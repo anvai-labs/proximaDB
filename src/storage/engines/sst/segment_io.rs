@@ -128,6 +128,45 @@ fn warm_permits() -> &'static tokio::sync::Semaphore {
     PERMITS.get_or_init(|| tokio::sync::Semaphore::new(WARMS_IN_FLIGHT))
 }
 
+/// TD-TIER-1 SC4 PR-D: whole-object warms in flight, keyed by the CANONICAL
+/// store key ([`object_key`] — the same identity the [`Resident`] copy uses).
+/// The WARMS_IN_FLIGHT semaphore bounds CONCURRENCY; this set bounds
+/// DUPLICATE targets — a post-flush [`spawn_warm_object`] racing a
+/// [`warm_collection`] pass over the same object must not pay the GET twice.
+fn warm_inflight() -> std::sync::MutexGuard<'static, std::collections::HashSet<String>> {
+    static INFLIGHT: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    INFLIGHT
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Claims one canonical key for the guard's lifetime: every exit path —
+/// return, `?` error, panic, task cancellation — runs `Drop`, so a failed or
+/// aborted warm never wedges the target behind a dead claim.
+struct WarmClaim {
+    key: String,
+}
+
+impl WarmClaim {
+    /// `None` when the key is already being warmed elsewhere in the process.
+    fn try_claim(key: String) -> Option<Self> {
+        let mut inflight = warm_inflight();
+        if inflight.contains(&key) {
+            return None;
+        }
+        inflight.insert(key.clone());
+        Some(Self { key })
+    }
+}
+
+impl Drop for WarmClaim {
+    fn drop(&mut self) {
+        warm_inflight().remove(&self.key);
+    }
+}
+
 /// Segment reads that prefer a resident whole-segment copy.
 #[async_trait::async_trait]
 pub trait ResidentRangeRead {
@@ -370,6 +409,17 @@ pub async fn warm_object(
         }
     }
     let Some((store, key)) = warm_target(path, len) else {
+        return Ok(false);
+    };
+    // SC4 PR-D: claim the canonical key for the duration of the fetch — a
+    // concurrent warm of the same object (a post-flush spawn racing a
+    // backfill pass) returns early here instead of paying a second GET for
+    // bytes the claim holder is already fetching. The claim drops on every
+    // exit (return, error, panic, cancellation), and the loser's early
+    // return is the same outcome as losing the budget re-judge above: the
+    // next warm pass retries if the winner does not land the copy.
+    let Some(_claim) = WarmClaim::try_claim(key.clone()) else {
+        tracing::debug!("TD-TIER-1 SC4: warm of {path} already in flight; skipping");
         return Ok(false);
     };
     // Stage on the store's own filesystem (never a possibly RAM-backed
@@ -1139,6 +1189,61 @@ mod tests {
         );
         assert_eq!(counters.total_gets(), 0, "skipped before the fetch");
         assert_eq!(resident_len(&path), None);
+    }
+
+    /// SC4 PR-D (in-flight warm dedup): two concurrent warms of the SAME
+    /// object pay exactly ONE GET — the loser finds the canonical key already
+    /// in flight and returns without fetching (the WARMS_IN_FLIGHT semaphore
+    /// bounds concurrency; the in-flight set bounds duplicate targets — a
+    /// post-flush `spawn_warm_object` racing a `warm_collection` pass is the
+    /// production shape of this). A different object still warms, and a
+    /// FAILED warm releases its claim so a later warm of the same object is
+    /// not wedged behind it.
+    #[tokio::test]
+    async fn concurrent_warms_of_one_object_fetch_it_once() {
+        let root = tempfile::tempdir().expect("root");
+        let (covered, _) = dirs(root.path());
+        let _armed = arm(&covered, "warm-dedup", 32 << 20);
+        let (fs, counters) = counting_local(root.path()).await;
+        let (path, _) = segment(&covered, "L0_d.pax", 200_000);
+        let (other, _) = segment(&covered, "L0_e.pax", 2_048);
+        let (flaky, _) = segment(&covered, "L0_f.pax", 2_048);
+
+        let (first, second) = tokio::join!(
+            warm_object(fs.as_ref(), &path, None),
+            warm_object(fs.as_ref(), &path, None),
+        );
+        let wrote = first.expect("warm a") as usize + second.expect("warm b") as usize;
+        assert_eq!(wrote, 1, "exactly one of the racing warms writes");
+        assert_eq!(counters.total_gets(), 1, "the duplicate warm paid no GET");
+        assert_eq!(
+            resident_len(&path),
+            Some(200_000),
+            "the winner's copy lands"
+        );
+
+        // A different object is never deduplicated away.
+        assert!(
+            warm_object(fs.as_ref(), &other, None)
+                .await
+                .expect("warm other")
+        );
+
+        // A failed warm (declared length past the file: short read) releases
+        // its in-flight claim — the same object warms cleanly right after
+        // instead of returning early behind a dead claim forever.
+        assert!(
+            warm_object(fs.as_ref(), &flaky, Some(1 << 20))
+                .await
+                .is_err(),
+            "a length past the file fails the fetch"
+        );
+        assert!(
+            warm_object(fs.as_ref(), &flaky, None)
+                .await
+                .expect("warm flaky"),
+            "the claim was released on failure"
+        );
     }
 
     /// Backfill warms every live segment once (non-segment files ignored) and

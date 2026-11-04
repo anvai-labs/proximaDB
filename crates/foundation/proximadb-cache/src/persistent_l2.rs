@@ -115,6 +115,12 @@ struct StoreInner {
     /// the read-path cost of a steadily over-budget grant (review S1); the
     /// per-group `freed` flag decides whether an attempt can succeed.
     heal_attempts: AtomicU32,
+    /// Test-only: cumulative count of entries the reconcile sweeps ran
+    /// per-entry pass work on — the probe for the incremental reconcile's
+    /// scaling claim (read as a delta around one call; a count, never a
+    /// wall-clock benchmark).
+    #[cfg(test)]
+    sweep_examined: AtomicU64,
     /// Test-only hook run between victim selection and its re-check, to
     /// exercise the selection→pin race deterministically.
     #[cfg(test)]
@@ -173,6 +179,8 @@ impl PersistentByteStore {
             policy_active: AtomicBool::new(false),
             heal_pending: AtomicBool::new(false),
             heal_attempts: AtomicU32::new(0),
+            #[cfg(test)]
+            sweep_examined: AtomicU64::new(0),
             #[cfg(test)]
             evict_hook: std::sync::Mutex::new(None),
             clock: AtomicU64::new(1),
@@ -466,47 +474,121 @@ impl PersistentByteStore {
     /// Both use [`canonical_location`]; object-key bytes remain exact.
     /// Legacy and non-whole-object keys cannot acquire policy protection.
     ///
-    /// Reconcile: pins owned by a removed group, or whose key no longer
+    /// Reconcile (SC4 PR-D, incremental): the NEW group set is DIFFED against
+    /// the old one, and only entries matching a CHANGED prefix — a removed
+    /// group's, an added group's, or a changed group's old-or-new prefixes —
+    /// can change protection outcome, so the three passes below run their
+    /// per-entry pin/unpin work on that scoped subset only. The scope is
+    /// sound because a policy pin's key always matches its owning group's
+    /// CURRENT prefixes (pins are only taken under a matching group, and
+    /// prefix changes go through this sweep, which releases stranded pins),
+    /// so every pin a removal or prefix change can strand sits under a
+    /// changed prefix; and an unchanged group can never exceed its budget,
+    /// because [`Self::pin_meta`] admits only within it. The pass-3 group
+    /// MATCH still considers the whole policy, so an entry a removed group
+    /// released re-pins under an overlapping surviving group exactly as the
+    /// full sweep did.
+    ///
+    /// Firing cadence unchanged — every grant mutation and every registry
+    /// open still reconciles, now incrementally. Worst case (stated): a
+    /// change whose changed prefixes match every entry (the first arm on a
+    /// populated store, a mass re-register) degrades to the previous full
+    /// O(entries × changed prefixes) pass work, and the key-filter scan of
+    /// the index stays O(total entries) per call (admission cadence only —
+    /// no per-entry work is done out of scope). One deliberate, disclosed
+    /// narrowing: an UNCHANGED group's previously skipped entries are no
+    /// longer retried by an UNRELATED group's reconcile — the read-path
+    /// heal (a hit retries the pin once the group freed room) and the next
+    /// reconcile touching that group cover them, so `heal_pending` stays
+    /// armed for unchanged groups instead of being cleared.
+    ///
+    /// Passes: pins owned by a removed group, or whose key no longer
     /// matches its group, are released; a group whose budget shrank below
     /// its pinned bytes is clamped by releasing its pins; then unpinned
     /// matching entries are pinned against their group's budget —
     /// best-effort, skipped and counted when the budget is exhausted.
-    /// Manual pins are never touched. O(entries × prefixes): admission
-    /// cadence only.
+    /// Manual pins are never touched.
     pub fn set_protection_groups(&self, groups: Vec<ProtectionGroup>) -> ProtectionSweep {
         let mut policy = self.protection_guard();
         let mut previous = std::mem::take(&mut policy.groups);
+        // Diff the incoming set against the outgoing one: the reconcile
+        // below only needs the entries a change can reach.
+        let mut changed_prefixes: Vec<String> = Vec::new();
+        // Groups whose budget changed — the only pass-2 clamp candidates (an
+        // unchanged budget was clamped by the call that set it, and
+        // `pin_meta` never admits past the budget in between).
+        let mut budget_changed: Vec<String> = Vec::new();
+        let mut unchanged_groups = 0usize;
         for group in groups {
-            let counter = previous
-                .remove(&group.id)
-                .map(|old| old.counter)
-                .unwrap_or_else(|| Arc::new(GroupCounter::default()));
-            policy.groups.insert(
-                group.id,
-                PolicyGroup {
-                    prefixes: group
-                        .prefixes
-                        .iter()
-                        .map(|prefix| canonical_location(prefix))
-                        .collect(),
-                    budget: group.budget_bytes,
-                    counter,
-                },
-            );
+            let canonical: Vec<String> = group
+                .prefixes
+                .iter()
+                .map(|prefix| canonical_location(prefix))
+                .collect();
+            match previous.remove(&group.id) {
+                Some(old) => {
+                    if old.prefixes == canonical && old.budget == group.budget_bytes {
+                        unchanged_groups += 1;
+                    } else {
+                        changed_prefixes.extend(old.prefixes.iter().cloned());
+                        changed_prefixes.extend(canonical.iter().cloned());
+                        budget_changed.push(group.id.clone());
+                    }
+                    policy.groups.insert(
+                        group.id,
+                        PolicyGroup {
+                            prefixes: canonical,
+                            budget: group.budget_bytes,
+                            counter: old.counter,
+                        },
+                    );
+                }
+                None => {
+                    changed_prefixes.extend(canonical.iter().cloned());
+                    policy.groups.insert(
+                        group.id,
+                        PolicyGroup {
+                            prefixes: canonical,
+                            budget: group.budget_bytes,
+                            counter: Arc::new(GroupCounter::default()),
+                        },
+                    );
+                }
+            }
         }
+        // Whatever is left in `previous` left the policy — only its prefixes
+        // (and the changed groups' above) reach the entries it protected.
+        for old in previous.values() {
+            changed_prefixes.extend(old.prefixes.iter().cloned());
+        }
+        changed_prefixes.sort_unstable();
+        changed_prefixes.dedup();
         self.inner
             .policy_active
             .store(!policy.groups.is_empty(), Ordering::Release);
 
         let mut sweep = ProtectionSweep::default();
-        let entries: Vec<(String, Arc<EntryMeta>)> = self
+        // Scoped materialization: the index scan stays O(total entries), but
+        // the per-entry pin/unpin work below runs only on entries matching a
+        // changed prefix — the 3-pass sweep under this mutex is what the
+        // admission cadence was paying for.
+        let scoped: Vec<(String, Arc<EntryMeta>)> = self
             .inner
             .entries
             .iter()
+            .filter(|entry| {
+                changed_prefixes
+                    .iter()
+                    .any(|prefix| protection_prefix_matches(entry.key(), prefix))
+            })
             .map(|entry| (entry.key().clone(), entry.value().clone()))
             .collect();
+        #[cfg(test)]
+        self.inner
+            .sweep_examined
+            .fetch_add(scoped.len() as u64, Ordering::Relaxed);
         // 1. Release policy pins whose group left or whose key left its group.
-        for (key, meta) in &entries {
+        for (key, meta) in &scoped {
             let Some(owner) = Self::pin_owner(meta) else {
                 continue;
             };
@@ -521,9 +603,13 @@ impl PersistentByteStore {
                 sweep.unprotected += 1;
             }
         }
-        // 2. Clamp groups whose budget shrank below their pinned bytes.
-        for group in policy.groups.values() {
-            for (_, meta) in &entries {
+        // 2. Clamp groups whose budget shrank below their pinned bytes —
+        // only budget-changed groups can be over it (see the diff above).
+        for id in &budget_changed {
+            let Some(group) = policy.groups.get(id) else {
+                continue;
+            };
+            for (_, meta) in &scoped {
                 if group.counter.pinned.load(Ordering::Acquire) <= group.budget {
                     break;
                 }
@@ -534,8 +620,11 @@ impl PersistentByteStore {
                 }
             }
         }
-        // 3. Pin unpinned matching entries against their group's budget.
-        for (key, meta) in &entries {
+        // 3. Pin unpinned matching entries against their group's budget. The
+        // match considers the WHOLE policy, not just changed groups, so an
+        // entry a removed group released re-pins under an overlapping
+        // surviving group exactly as the full sweep did.
+        for (key, meta) in &scoped {
             if meta.protected.load(Ordering::Acquire) {
                 continue;
             }
@@ -547,15 +636,30 @@ impl PersistentByteStore {
                 }
             }
         }
-        self.inner
-            .heal_pending
-            .store(sweep.skipped_over_budget > 0, Ordering::Release);
+        // Entries of UNCHANGED groups were not re-examined above, so a skip
+        // recorded earlier may still stand for them — keep the heal flag
+        // armed rather than clearing it (the read-path heal is bounded; a
+        // full rescan per unrelated grant mutation is exactly the cost this
+        // incremental reconcile removed).
+        let stale_skip_possible =
+            unchanged_groups > 0 && self.inner.heal_pending.load(Ordering::Acquire);
+        self.inner.heal_pending.store(
+            sweep.skipped_over_budget > 0 || stale_skip_possible,
+            Ordering::Release,
+        );
         sweep
     }
 
     /// The ids of the groups in the current policy (diagnostics/tests).
     pub fn protection_group_ids(&self) -> Vec<String> {
         self.protection_guard().groups.keys().cloned().collect()
+    }
+
+    /// Test-only: cumulative count of entries the reconcile sweeps ran
+    /// per-entry pass work on (read as a delta around one call).
+    #[cfg(test)]
+    pub(crate) fn sweep_examined_for_test(&self) -> u64 {
+        self.inner.sweep_examined.load(Ordering::Relaxed)
     }
 
     /// Bytes currently pinned under one grant group — the coverage that
@@ -2393,6 +2497,69 @@ mod tests {
         assert!(
             store.covered_bytes("g1") <= one,
             "clamped to the new budget"
+        );
+    }
+
+    /// SC4 PR-D (reconcile scaling): the reconcile is INCREMENTAL — with N
+    /// resident entries under groups the call does not touch, the sweep's
+    /// per-entry work is proportional to the CHANGED group's matches, not to
+    /// N. Asserted as a COUNT across two store sizes (a ratio, not a
+    /// wall-clock benchmark — mandate #6): growing the untouched population
+    /// tenfold must not grow the examined count, which stays at the changed
+    /// group's own match count.
+    #[tokio::test]
+    async fn reconcile_examines_only_the_changed_groups_entries() {
+        const CHANGED_MATCHES: usize = 6;
+        async fn examined_touching_one_group(untouched: usize) -> u64 {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let store = PersistentByteStore::open(dir.path(), 8 << 20).expect("open");
+            store.set_reserved_budget(8 << 20);
+            for i in 0..untouched {
+                store
+                    .put(
+                        key_in(C2, &format!("L0_stable_{i}.pax")),
+                        L2Class::Invariants,
+                        payload(64),
+                    )
+                    .await
+                    .expect("put stable");
+            }
+            for i in 0..CHANGED_MATCHES {
+                store
+                    .put(
+                        key_in(C1, &format!("L0_moving_{i}.pax")),
+                        L2Class::Invariants,
+                        payload(64),
+                    )
+                    .await
+                    .expect("put moving");
+            }
+            // First arm: every group is new, so a full pass is expected (and
+            // pins everything retroactively, as before).
+            store.set_protection_groups(vec![
+                group("stable", C2, 1 << 20),
+                group("moving", C1, 1 << 20),
+            ]);
+            assert!(store.covered_bytes("stable") > 0, "stable group armed");
+            // The measured call: only "moving" changes (its budget); "stable"
+            // is byte-identical.
+            let before = store.sweep_examined_for_test();
+            store.set_protection_groups(vec![
+                group("stable", C2, 1 << 20),
+                group("moving", C1, (1 << 20) + 1024),
+            ]);
+            store.sweep_examined_for_test() - before
+        }
+
+        let small = examined_touching_one_group(50).await;
+        let big = examined_touching_one_group(500).await;
+        assert_eq!(
+            small, big,
+            "examined entries must not grow with the untouched population"
+        );
+        assert!(
+            small <= CHANGED_MATCHES as u64,
+            "proportional to the changed group's matches ({CHANGED_MATCHES}), got {small}"
         );
     }
 
