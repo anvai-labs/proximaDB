@@ -22,9 +22,10 @@ system maintain that automatically.
 * The compaction policy CANNOT merge them: cross-level is out of scope,
   and pairs at each level don't meet the count threshold.
 * `COMPACT TABLE FULL` CAN merge them (verified by #2339's tests).
-* The current FULL implementation pairs the two LARGEST segments
-  (O(N×D) write amplification); the smallest-first approach is
-  O(D) — a 3.6× improvement (see §Smallest-first).
+* The pre-#2407 FULL implementation paired the two LARGEST segments
+  (O(N×D) write amplification); smallest-first GROUPING is O(D) —
+  a 3.6× improvement (see §Smallest-first grouping; the ordering alone
+  accounts for 2.0×, the group for the rest).
 
 == Design
 
@@ -51,8 +52,9 @@ After every flush publish:
    whose combined size reaches `compaction.target_file_size_mb`
 4. Each group merges to ONE output of ~target_file_size (the output's
    level is the level of the largest input — a tier hint, not a gate)
-5. The target segment count is DERIVED:
-   `target_segments = ceil(total_bytes / target_file_size_mb)`
+5. The target segment count is DERIVED (bytes and MB kept consistent —
+   as implemented with `div_ceil` in the flush arm):
+   `target_segments = ceil(total_bytes / (target_file_size_mb × 2^20))`
 6. If a group exceeds the memory admission budget, take fewer (the
    smallest that fit); repeat next flush
 
@@ -70,22 +72,29 @@ override exists for the "exactly 1 segment" case but is secondary.
 - Each segment becomes a predictable I/O unit (read, warm, prefetch in
   target_file_size chunks — aligned with the cache-policy region groups)
 
-=== Smallest-first (the write-amplification fix)
+=== Smallest-first grouping (the write-amplification fix)
 
 The current FULL implementation pairs the two LARGEST segments (N−1
-merges, O(N×D) bytes). The correct approach merges the SMALLEST
-segments first:
+merges, O(N×D) bytes). Two separate improvements, with distinct gains —
+for files [100, 200, 400, 800, 1600] MB, target=1:
 
 ```
-5 files [100, 200, 400, 800, 1600] MB, target=1:
-
-  largest-first (current): 4 merges, 11,300 MB rewritten
-  smallest-first (proposed): 1 merge,   3,100 MB rewritten
-                              ─── 3.6× less I/O
+largest-first pairwise:  4 merges, 11,300 MB rewritten
+smallest-first pairwise: 4 merges,  5,600 MB rewritten   (2.0×)
+smallest-first GROUP:    1 merge,   3,100 MB rewritten   (3.6×)
 ```
+
+* **Ordering alone (smallest-first, still pairwise)** yields 2.0×:
+  300 + 700 + 1500 + 3100 = 5,600 MB — each merge output feeds the next.
+* **The GROUP is the load-bearing half**: greedily accumulating the
+  smallest inputs into ONE multi-way merge reaching the target rewrites
+  each input exactly once (3,100 MB). #2407's `compact_collection_full`
+  implements the greedy group, which is where the 3.6× comes from —
+  ascending sort without grouping does not deliver it.
 
 This also means:
-* The admission budget is never the bottleneck (smallest always fits)
+* The admission budget is rarely the bottleneck (the smallest group
+  always fits)
 * The output of merging small files is small — it naturally cascades
   upward through subsequent merges (no explicit "promote at size X" logic)
 * No file is ever "stuck between levels" — there ARE no level boundaries
@@ -95,9 +104,10 @@ This also means:
 
 ```
 [L0:100, L0:100, L0:100] → merge → [L0:280]
-[L0:280, L0:128]        → merge → [L1:408]     (level of largest input)
-[L1:408, L1:280]        → merge → [L2:688]     (cross-level is fine)
-[L2:688, L5:2000]       → merge → [L5:2688]    (biggest wins)
+[L0:280, L0:128]         → merge → [L1:408]     (level of largest input)
+   (a new flush publishes [L1:280])
+[L1:408, L1:280]         → merge → [L2:688]     (cross-level is fine)
+[L2:688, L5:2000]        → merge → [L5:2688]    (biggest wins)
 ```
 
 No "minimum size for next level" rule — that would REINTRODUCE the
@@ -112,21 +122,36 @@ would rewrite the entire 1 TB on every flush. The guardrail:
   degrade to `hybrid` for that collection
 * The degradation is reported in the collection's status
 
-=== Property surface
+=== Property surface — as implemented (#2407)
 
-Same resolution chain as the cache policy (TD-COMPACT-2b):
+Resolution is layered like the cache policy (TD-COMPACT-2b), but only the
+tag channel is resolved at flush time today:
 
 ```
-collection:  compaction.strategy=consolidate, compaction.target_file_size_mb=1024
-  > server:  [storage.compaction_config] strategy=hybrid, target_file_size_mb=512
-    > code:  hybrid (the current behavior)
+flush trigger:  TAG `compaction.strategy:consolidate` (resolve_strategy_from_tags)
+                  — the `compaction:off` tag disarms everything (wins first)
+server TOML:     [storage.compaction_config] consolidate_target_file_size_mb (512),
+                  consolidate_write_amp_limit (100) — knobs only, NO strategy field
+code default:    hybrid (the current behavior)
 ```
 
-Surfaces:
-* `ALTER TABLE t SET ('compaction.strategy' = 'consolidate')`
-* `POST /collections {"properties": {"compaction.strategy": "consolidate"}}`
-* `PATCH /collections/{id}/properties` (from #2405)
-* Server TOML `[storage.compaction_config]`
+Live surfaces:
+* Collection tag `compaction.strategy:consolidate` (the resolved channel)
+* `ALTER TABLE t SET ('compaction.*')` — validated at SET time
+  (`validate_compaction_properties`; unknown keys/values rejected)
+* Server TOML knobs above
+
+NOTE: the legacy `[storage.compaction_config] strategy` field is the
+count|size level heuristic (`compaction_utils.rs`) — setting it to
+`consolidate` is dead config (falls through the `_` arm to count/size).
+Do not use it for this strategy; a dedicated server-level default needs
+its own field if ever wanted.
+
+Wiring follow-up (open): `resolve_strategy_from_properties` is exported
+but has no caller — the `compaction.strategy` PROPERTY is validated at
+SET yet not resolved at flush, so property-only configuration is inert
+until the property channel is plumbed into the flush trigger (or
+properties are bridged to tags at collection load).
 
 === Interaction with COMPACT TABLE FULL
 
@@ -150,7 +175,7 @@ Surfaces:
 
 == Experiments
 
-=== 1. S=1 collapse — MEASURED (2026-11-04)
+=== 1. S=1 collapse — MEASURED (2026-11-04T04:51-05:26 UTC; filed 2026-11-03 local)
 
 The settled f32 bed (p5e-f32ev-build, 3M vectors, 2.60 GB, Region E +
 cat3 filter, 1000 queries) measured as-settled (L1+L2+L5 = 3 segments)
@@ -198,7 +223,11 @@ not yet measured end-to-end).
 === 3. Various targets — partially measured
 
 Build-time S=1/2/3/4 curve above; the compact-path curve (S=1, S=2 on
-the same collapsed bed) is open.
+the same collapsed bed) is open. NOTE: the compact path currently has
+no target plumbing — the Flight `compact_collection` body carries only
+`full` (collapses to the `full_target_segments` default of 1) — so an
+S=2 arm needs either a `target_segments` body field or the wired
+`compaction.*` property channel, not just `--max-segments 2`.
 
 === 4. Write-heavy stress — open
 
@@ -206,7 +235,19 @@ Verify the guardrail prevents the 1 TB rewrite catastrophe.
 
 == Relations
 
-* #2339 COMPACT TABLE FULL — the manual override; this TD automates it
+* #2339 / TD-COMPACT-14 — COMPACT TABLE FULL, the manual override; this
+  TD automates it (and #2407 applies smallest-first grouping to the same
+  merge machinery)
+* TD-COMPACT-10 — the L2 segment-consolidation gap; its 1/2/3-segment
+  GET table is the prior this experiment's S=1/S=2/S=3 curve confirms
+* TD-WLP-2 — the per-collection compaction TAG cascade
+  (`compaction:on|off`, `l0_threshold:N`); this TD's strategy rides the
+  same tag channel (off always wins), and the SET-time-validated
+  `compaction.*` properties are the second surface — see the wiring
+  note in <<Property surface>>
+* TD-RDSTRAT-9 — the collection read-cost envelope; the natural future
+  advisor for choosing the strategy from observed Q/W (rather than the
+  CachePolicyAdvisor seam guessed at below)
 * #2384/#2397/#2400/#2405 — the cache-policy property chain (same
   resolution pattern)
 * TD-TIER-1 E1 — the fragment ladder (the admission ceiling analysis

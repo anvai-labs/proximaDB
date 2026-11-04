@@ -3918,10 +3918,28 @@ def main() -> int:
         # TD-COMPACT-15 S=1: with --compact-full-before-measure the bed must
         # first settle at its CURRENT segment count; --max-segments asserts
         # the POST-compact geometry, so the pre-compact waits get a
-        # permissive bound (settled beds hold <= a handful of segments).
+        # permissive bound. FULL is bounded by full_max_passes (default 16
+        # passes), so a bed beyond ~17 segments can never reach S=1 — fail
+        # the PRE gate fast rather than burning the settle timeout after.
         pre_compact_max_segments = (
-            64 if args.compact_full_before_measure else args.max_segments
+            17 if args.compact_full_before_measure else args.max_segments
         )
+        # The three settle waits (skip-ingest, post-ingest, post-compact)
+        # share every argument but the segment bound — one closure keeps
+        # them from drifting apart (the file's phase_sweep pattern).
+        def settle(max_segments: int) -> dict:
+            return wait_for_materialization(
+                root / "data" / "sst",
+                server_url,
+                collection_id,
+                args.rows,
+                max_segments,
+                args.settle_timeout_secs,
+                args.stable_secs,
+                remote_geometry,
+                required_layout_version=args.require_layout_version,
+            )
+
         if args.skip_ingest:
             # TD-TIER-1 E1: reuse the settled OBJECT PREFIX a prior run built —
             # identical objects, model and query IDs across cap arms. The
@@ -3939,17 +3957,7 @@ def main() -> int:
                 )
             result["collection_id"] = collection_id
             result["ingest"] = {"skipped": True, "source_collection_id": collection_id}
-            geometry = wait_for_materialization(
-                root / "data" / "sst",
-                server_url,
-                collection_id,
-                args.rows,
-                pre_compact_max_segments,
-                args.settle_timeout_secs,
-                args.stable_secs,
-                remote_geometry,
-                required_layout_version=args.require_layout_version,
-            )
+            geometry = settle(pre_compact_max_segments)
             result["settled_geometry"] = geometry
         else:
             (
@@ -3988,17 +3996,7 @@ def main() -> int:
                 "explicit_flushes": explicit_flushes,
                 "explicit_compaction": explicit_compaction,
             }
-        geometry = wait_for_materialization(
-            root / "data" / "sst",
-            server_url,
-            collection_id,
-            args.rows,
-            pre_compact_max_segments,
-            args.settle_timeout_secs,
-            args.stable_secs,
-            remote_geometry,
-            required_layout_version=args.require_layout_version,
-        )
+        geometry = settle(pre_compact_max_segments)
         if args.compact_full_before_measure:
             # TD-COMPACT-15 S=1: collapse the settled bed with COMPACT FULL
             # (#2339) and re-settle so every arm below measures the SAME
@@ -4017,17 +4015,7 @@ def main() -> int:
             action = compact_via_flight(
                 "127.0.0.1", args.port, collection_id, full=True
             )
-            geometry = wait_for_materialization(
-                root / "data" / "sst",
-                server_url,
-                collection_id,
-                args.rows,
-                args.max_segments,
-                args.settle_timeout_secs,
-                args.stable_secs,
-                remote_geometry,
-                required_layout_version=args.require_layout_version,
-            )
+            geometry = settle(args.max_segments)
             result["compact_full_before_measure"] = {
                 "before": before,
                 "action": action,
