@@ -1133,6 +1133,47 @@ impl SstEngine {
         if !proximadb_storage_common::resolve_compaction_armed(tags) {
             return Ok(None);
         }
+        // TD-COMPACT-15: the consolidate strategy targets a file count
+        // derived from total_bytes / target_file_size_mb, not an L0
+        // threshold. When the live segment count exceeds that target,
+        // compaction fires immediately (the greedy smallest-first group in
+        // compact_collection_full does the merge).
+        let strategy = proximadb_storage_common::resolve_strategy_from_tags(tags);
+        if strategy == proximadb_storage_common::CompactionStrategy::Consolidate {
+            crate::metrics::operational_metrics::CONSOLIDATE_CHECKS.inc();
+            let cfg = self.config().compaction_config.clone().unwrap_or_default();
+            let target_mb = cfg.consolidate_target_file_size_mb.max(1);
+            let write_amp_limit = cfg.consolidate_write_amp_limit;
+            let files = self
+                .discover_sstable_files(storage_url)
+                .await
+                .unwrap_or_default();
+            let total_bytes: u64 = files.iter().map(|f| f.size_bytes.unwrap_or(0)).sum();
+            let target_segments = total_bytes
+                .div_ceil(target_mb.saturating_mul(1_048_576))
+                .max(1);
+            if (files.len() as u64) <= target_segments {
+                return Ok(None); // at target — nothing due
+            }
+            // Guardrail: if the collection is large relative to a typical
+            // flush, consolidating on every flush means rewriting
+            // everything each time — degrade to hybrid.
+            let expected_flush_bytes = 128u64.saturating_mul(1_048_576);
+            let write_amp = total_bytes / expected_flush_bytes.max(1);
+            if write_amp > write_amp_limit {
+                tracing::warn!(
+                    storage_url = %storage_url,
+                    write_amp,
+                    limit = write_amp_limit,
+                    "TD-COMPACT-15 consolidate guardrail: degrading to hybrid"
+                );
+                crate::metrics::operational_metrics::CONSOLIDATE_DEGRADED.inc();
+                tracing::debug!("metric recorded");
+                // Fall through to the hybrid path below
+            } else {
+                return Ok(Some(1)); // always compact (smallest-first)
+            }
+        }
         let threshold =
             proximadb_storage_common::resolve_l0_threshold(tags, L0_COMPACTION_THRESHOLD);
         let files = self

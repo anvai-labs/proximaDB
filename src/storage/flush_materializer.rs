@@ -2399,7 +2399,7 @@ mod tests {
             .expect_err("over-budget pair must fail, not thrash");
         let message = format!("{err:#}");
         assert!(
-            message.contains("no segment pair fits the compaction input budget")
+            message.contains("no segment group fits the compaction input budget")
                 && message.contains("spill_enabled"),
             "actionable budget error: {message}"
         );

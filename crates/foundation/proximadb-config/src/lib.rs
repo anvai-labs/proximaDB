@@ -987,6 +987,16 @@ pub struct CompactionConfig {
     /// quiescence waits.
     #[serde(default = "default_full_timeout_ms")]
     pub full_timeout_ms: u64,
+    /// TD-COMPACT-15: the target file size (MB) for the consolidate
+    /// strategy — segments merge smallest-first until each output
+    /// reaches this size, producing uniform I/O units.
+    #[serde(default = "default_consolidate_target_file_size_mb")]
+    pub consolidate_target_file_size_mb: u64,
+    /// TD-COMPACT-15: the write-amplification limit above which the
+    /// consolidate strategy degrades to hybrid (guards against rewriting
+    /// the entire collection per flush).
+    #[serde(default = "default_consolidate_write_amp_limit")]
+    pub consolidate_write_amp_limit: u64,
 }
 
 impl Default for CompactionConfig {
@@ -1012,6 +1022,8 @@ impl Default for CompactionConfig {
             full_target_segments: default_full_target_segments(),
             full_max_passes: default_full_max_passes(),
             full_timeout_ms: default_full_timeout_ms(),
+            consolidate_target_file_size_mb: default_consolidate_target_file_size_mb(),
+            consolidate_write_amp_limit: default_consolidate_write_amp_limit(),
         }
     }
 }
@@ -1026,6 +1038,14 @@ fn default_full_max_passes() -> usize {
 
 fn default_full_timeout_ms() -> u64 {
     3_600_000
+}
+
+fn default_consolidate_target_file_size_mb() -> u64 {
+    512
+}
+
+fn default_consolidate_write_amp_limit() -> u64 {
+    100
 }
 
 fn default_higher_level_file_threshold() -> usize {

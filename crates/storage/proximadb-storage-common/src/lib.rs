@@ -225,3 +225,8 @@ pub use zero_copy_traits::{
     AccessFrequency, CollectionContext, EngineMetadata, MetadataSerializer,
     QueryContext as ZeroCopyQueryContext, QueryType,
 };
+pub mod compaction_strategy;
+pub use compaction_strategy::{
+    CompactionStrategy, resolve_strategy_from_properties, resolve_strategy_from_tags,
+    resolve_target_file_size_mb, validate_compaction_properties,
+};

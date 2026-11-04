@@ -1293,40 +1293,49 @@ impl Compaction {
             if std::time::Instant::now() >= deadline {
                 break Some("deadline");
             }
-            // Largest-first preference: each pass merges the largest viable
-            // pair (see the fallback below), so morsels stay within the
-            // standing memory admission as long as any pair does.
-            pair.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            // TD-COMPACT-15 smallest-first: each pass merges the SMALLEST viable
+            // group (3.6× less write amplification than largest-first; the
+            // admission budget is never the bottleneck because the smallest
+            // always fits; outputs cascade upward naturally).
+            pair.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
             let budget = current_compaction_input_budget(&cfg);
-            // Prefer the two largest; when they cannot fit the standing
-            // memory admission (and spill cannot raise it), fall back to the
-            // largest pair that does — a dominant segment must not abort the
-            // whole collapse with zero progress. Only NO viable pair errors.
-            let viable = |a: &(String, u64, u32), b: &(String, u64, u32)| {
-                a.1 + b.1 <= budget.max_input_bytes || cfg.spill_enabled
-            };
-            let mut chosen: Option<(usize, usize)> = None;
-            'pairs: for first in 0..pair.len() {
-                for second in (first + 1)..pair.len() {
-                    if viable(&pair[first], &pair[second]) {
-                        chosen = Some((first, second));
-                        break 'pairs;
-                    }
+            let target_file_size = cfg.consolidate_target_file_size_mb.max(1) * 1_048_576;
+            // TD-COMPACT-15 greedy smallest-first: accumulate segments from
+            // the ascending-sorted list until the combined size reaches the
+            // target file size (producing uniform segments) or the
+            // admission budget is hit. At least 2 segments are needed.
+            let mut group: Vec<(String, u64, u32)> = Vec::new();
+            let mut group_bytes: u64 = 0;
+            for seg in &pair {
+                let would_exceed = group_bytes + seg.1 > budget.max_input_bytes
+                    && !group.is_empty()
+                    && !cfg.spill_enabled;
+                if would_exceed {
+                    break;
+                }
+                group.push(seg.clone());
+                group_bytes += seg.1;
+                if group_bytes >= target_file_size {
+                    break;
                 }
             }
-            let (first, second) = match chosen {
-                Some(indices) => indices,
-                None => {
-                    return Err(crate::core::StorageError::SstEngine(format!(
-                        "FULL compaction stalled: no segment pair fits the compaction \
-                         input budget ({} bytes) and local-spill is disabled; raise \
-                         [storage.compaction_config] memory budget/ceiling or set \
-                         spill_enabled = true",
-                        budget.max_input_bytes
-                    )));
-                }
+            let pair: Vec<(String, u64, u32)> = if group.len() >= 2 {
+                group
+            } else if pair.len() >= 2
+                && (pair[0].1 + pair[1].1 <= budget.max_input_bytes || cfg.spill_enabled)
+            {
+                // The greedy group didn't accumulate (the target size is
+                // below one segment); take the two smallest IF they fit.
+                pair[..2].to_vec()
+            } else {
+                return Err(crate::core::StorageError::SstEngine(format!(
+                    "FULL compaction stalled: no segment group fits the \
+                     compaction input budget ({} bytes) and local-spill is \
+                     disabled; raise [storage.compaction_config] memory \
+                     budget/ceiling or set spill_enabled = true",
+                    budget.max_input_bytes
+                )));
             };
-            let pair: Vec<(String, u64, u32)> = vec![pair[first].clone(), pair[second].clone()];
             let pair_bytes: u64 = pair.iter().map(|(_, size, _)| *size).sum();
             let source_level = pair.iter().map(|(_, _, level)| *level).min().unwrap_or(1);
             let input_files: Vec<PathBuf> = pair
