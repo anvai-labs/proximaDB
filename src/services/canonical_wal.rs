@@ -755,6 +755,17 @@ async fn read_summary_section(segment: &Path) -> Option<SegmentSummary> {
     Some(data.into_summary(segment.to_path_buf()))
 }
 
+/// Trim a trailing summary section from file bytes (sealed OR active —
+/// during a rotation the active file legitimately ends with one). The trim
+/// is STRUCTURAL: the section's magic+length delimit the frames even when
+/// its payload is untrusted; trust is the CALLER's concern.
+fn trim_summary_section(bytes: &[u8]) -> &[u8] {
+    match split_summary_trailer(bytes) {
+        Some((frames, _)) => frames,
+        None => bytes,
+    }
+}
+
 /// Append the summary section to the ACTIVE file and sync it, just before
 /// the seal rename — the rotation seqlock is odd and the append lock is
 /// held, so no append can interleave. Best-effort: on failure the segment
@@ -926,15 +937,7 @@ async fn read_sealed_segment(path: &Path) -> Result<Vec<CanonicalWalEntry>> {
     let bytes = tokio::fs::read(path)
         .await
         .with_context(|| format!("reading canonical WAL segment {}", path.display()))?;
-    // Trim a trailing summary section first: with one, the frames end where
-    // the section starts and `scan` must see only them. The trim is
-    // STRUCTURAL (magic + length): even an untrusted section still delimits
-    // the frames — otherwise the decode fallback would parse section bytes
-    // as frames and fail closed on a merely-corrupt summary.
-    let bytes: &[u8] = match split_summary_trailer(&bytes) {
-        Some((frames, _trusted)) => frames,
-        None => &bytes,
-    };
+    let bytes: &[u8] = trim_summary_section(&bytes);
     let scan = scan_wal_bytes(bytes, path)?;
     if scan.valid_len != bytes.len() {
         bail!(
@@ -2064,14 +2067,7 @@ async fn read_active_file(path: &Path) -> Result<Vec<CanonicalWalEntry>> {
             return Err(err).with_context(|| format!("opening canonical WAL {}", path.display()));
         }
     };
-    // TD-WALBOOT-1: during a rotation the active file legitimately ends with
-    // a summary section (the seal writes it before the rename) — a reader
-    // racing that window must trim it, or it fails on section bytes as if
-    // they were a corrupt frame. Same structural trim the sealed reader uses.
-    let bytes: &[u8] = match split_summary_trailer(&bytes) {
-        Some((frames, _)) => frames,
-        None => &bytes,
-    };
+    let bytes: &[u8] = trim_summary_section(&bytes);
     Ok(scan_wal_bytes(bytes, path)?.entries)
 }
 
@@ -2717,22 +2713,24 @@ mod tests {
             .tenants
             .insert("c".into(), ["t1".to_string()].into_iter().collect());
         summary.has_uncollected = true;
+        let assert_facts = |d: &SummaryData| {
+            assert_eq!(d.first_seq, Some(7));
+            assert_eq!(d.last_seq, 42);
+            assert_eq!(d.collection_max.get("c"), Some(&42));
+        };
         let trailer = encode_summary_trailer(&summary).unwrap();
         // Bare trailer: split returns zero frames and the exact facts.
         let (frames, data) = split_summary_trailer(&trailer)
             .unwrap_or_else(|| panic!("split failed; trailer len {}", trailer.len()));
         assert!(frames.is_empty());
-        let data = data.expect("freshly-encoded section must be trusted");
-        assert_eq!(data.first_seq, Some(7));
-        assert_eq!(data.last_seq, 42);
-        assert_eq!(data.collection_max.get("c"), Some(&42));
+        assert_facts(&data.expect("freshly-encoded section must be trusted"));
         // Frame-prefixed file: exactly the prefix comes back as frames.
         let mut with_prefix = vec![0xABu8; 100];
         with_prefix.extend_from_slice(&trailer);
         let (frames2, data2) =
             split_summary_trailer(&with_prefix).expect("split with prefix failed");
         assert_eq!(frames2.len(), 100);
-        assert_eq!(data2.expect("trusted").first_seq, Some(7));
+        assert_facts(&data2.expect("trusted"));
     }
 
     fn upsert_operation(collection_id: &str, oid: &str) -> CanonicalOperation {
