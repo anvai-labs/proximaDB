@@ -164,6 +164,7 @@
 //! - Storage class transitions (S3 IA, Glacier)
 //! - Bandwidth optimization with compression
 
+use crate::storage::engines::sst::segment_io::{ResidentRangeRead as _, resident_len};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, error, info, trace};
@@ -1408,8 +1409,26 @@ impl FilesystemFactory {
     ) -> FsResult<Vec<Vec<u8>>> {
         let fs = self.get_filesystem(url)?;
         let path = Self::resolve_path(url)?;
+        self.read_ranges_with_factory_plan(url, &path, fs, ranges)
+            .await
+    }
+
+    /// The factory's env-gated coalescing body, shared by [`Self::read_ranges`]
+    /// and the resident-prefetch MISS path (review round-1 M2: the miss
+    /// previously fell back to the trait's `read_ranges_prefetch`, whose plan
+    /// is the INSTANCE policy — `range_coalesce_policy`, None everywhere —
+    /// silently dropping the `PROXIMADB_FS_READ_RANGES_COALESCE_GAP`/`_MAX`
+    /// plan the factory layer applies here, and swapping the `PARALLEL`
+    /// concurrency for `INFLIGHT`).
+    async fn read_ranges_with_factory_plan(
+        &self,
+        url: &str,
+        path: &str,
+        fs: Arc<dyn FileSystem>,
+        ranges: Vec<std::ops::Range<u64>>,
+    ) -> FsResult<Vec<Vec<u8>>> {
         let Some(policy) = Self::range_coalesce_policy_for(url) else {
-            return fs.read_ranges(&path, ranges).await;
+            return fs.read_ranges(path, ranges).await;
         };
 
         // Coalesce HERE rather than inside the filesystem, because this is the
@@ -1432,7 +1451,7 @@ impl FilesystemFactory {
         let mut buffers = Vec::with_capacity(plan.physical.len());
         for physical in &plan.physical {
             buffers.push(
-                fs.read_range(&path, physical.start, physical.end - physical.start)
+                fs.read_range(path, physical.start, physical.end - physical.start)
                     .await?,
             );
         }
@@ -1563,6 +1582,75 @@ impl FilesystemFactory {
         let fs = self.get_filesystem(url)?;
         let path = Self::resolve_path(url)?;
         fs.metadata(&path).await
+    }
+
+    // ── Resident-preferring reads (TD-TIER-1 SC4: readers outside the vector
+    //    profile) ────────────────────────────────────────────────────────────
+    //
+    // Mirrors of [`Self::read`], [`Self::read_range`], [`Self::read_ranges`]
+    // and [`Self::metadata`] that first consult a resident whole-segment copy
+    // (a PERFORMANCE grant's pinned bytes): a covered read costs no object
+    // store request at all, an uncovered one falls through unchanged. The
+    // `ResidentRangeRead` blanket impl on `T: FileSystem` carries the routing;
+    // these convenience forms exist so factory-level callers (the DataFusion
+    // PAX adapter) route with a one-token change, the same way the in-engine
+    // readers already do. The trait's current home is the SST engine module —
+    // the architecturally clean home is `proximadb-storage-filesystem-types`
+    // beside `FileSystem` itself (follow-up; recorded on the TD row).
+
+    /// Resolve the filesystem handle + canonical path for a resident-preferring
+    /// read (the shared body of the `*_resident` convenience forms below).
+    fn resident_handle(&self, url: &str) -> FsResult<(std::sync::Arc<dyn FileSystem>, String)> {
+        Ok((self.get_filesystem(url)?, Self::resolve_path(url)?))
+    }
+
+    pub async fn read_resident(&self, url: &str) -> FsResult<Vec<u8>> {
+        let (fs, path) = self.resident_handle(url)?;
+        fs.read_resident(&path).await
+    }
+
+    pub async fn read_range_resident(
+        &self,
+        url: &str,
+        offset: u64,
+        length: u64,
+    ) -> FsResult<Vec<u8>> {
+        let (fs, path) = self.resident_handle(url)?;
+        fs.read_range_resident(&path, offset, length).await
+    }
+
+    pub async fn read_ranges_prefetch_resident(
+        &self,
+        url: &str,
+        ranges: Vec<std::ops::Range<u64>>,
+    ) -> FsResult<Vec<Vec<u8>>> {
+        let (fs, path) = self.resident_handle(url)?;
+        // Resident hit: serve the whole batch from the resident copy under
+        // the same coalesced plan the remote path uses (the fast path the
+        // seam tests pin) — delegated to the trait impl unchanged. Coverage
+        // is checked HERE rather than inside the trait so the MISS can fall
+        // back to the FACTORY's coalescing body: the trait's own miss path
+        // calls `FileSystem::read_ranges_prefetch`, whose plan is the
+        // INSTANCE policy (`range_coalesce_policy` — None everywhere), which
+        // would silently drop the env-gated factory coalescing and change
+        // cold-path concurrency (review round-1 M2).
+        if resident_len(&path).is_some_and(|len| {
+            ranges
+                .iter()
+                .all(|range| range.end <= len && range.start <= range.end)
+        }) {
+            return fs.read_ranges_prefetch_resident(&path, ranges).await;
+        }
+        self.read_ranges_with_factory_plan(url, &path, fs, ranges)
+            .await
+    }
+
+    /// The object's size: from the resident copy when present (no HEAD),
+    /// otherwise one recorded metadata op. Size-only mirror of
+    /// [`Self::metadata`].
+    pub async fn object_size_resident(&self, url: &str) -> FsResult<u64> {
+        let (fs, path) = self.resident_handle(url)?;
+        fs.object_size_resident(&path).await
     }
 
     pub async fn list(&self, url: &str) -> FsResult<Vec<DirEntry>> {

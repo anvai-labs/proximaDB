@@ -29,6 +29,8 @@
 
 use crate::core::search::OptimizedSearchRecord;
 use crate::core::search::bounded_queue::BoundedPriorityQueue;
+use crate::storage::engines::sst::segment_io::ResidentRangeRead as _;
+use crate::storage::engines::sst::segment_io::resident_len;
 use anyhow::Result;
 use std::collections::HashMap;
 use std::io::Read;
@@ -61,7 +63,6 @@ use proximadb_distance_kernel::engine::UnifiedDistanceCompute;
 use proximadb_filter_expression::FilterExpression;
 
 // Using UnifiedCachingFilesystem instead of ZeroCopyIOSystem
-use crate::storage::persistence::filesystem::FileSystem;
 use crate::storage::persistence::filesystem::caching_filesystem::UnifiedCachingFilesystem;
 use proximadb_records::ProximaRecord;
 
@@ -691,7 +692,11 @@ impl ModularBlockReader {
             .filesystem_factory
             .get_filesystem(&self.file_path)
             .map_err(|e| anyhow::anyhow!("Failed to get filesystem: {}", e))?;
-        fs.read_range(&self.file_path, offset, length as u64)
+        // TD-TIER-1 SC4: routed through the resident seam — the legacy `.sst`
+        // reader is outside the vector profile, so without this a resident
+        // (PERFORMANCE-granted) collection still pays a GET per block read
+        // through the point-lookup/scan paths that land here.
+        fs.read_range_resident(&self.file_path, offset, length as u64)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to read range: {}", e))
     }
@@ -2100,8 +2105,8 @@ impl SstDirectReader {
         };
 
         // Read just the data blocks portion of the file
-        let file_metadata = fs.metadata(&file_path).await?;
-        let data_blocks_size = file_metadata.size - data_blocks_offset;
+        let file_size = fs.object_size_resident(&file_path).await?;
+        let data_blocks_size = file_size - data_blocks_offset;
 
         debug!(
             "📊 Reading data blocks: offset={}, size={} bytes, format={:?}",
@@ -3260,38 +3265,11 @@ impl UnifiedSstableReader {
         // CRITICAL: Create distance compute locally per query to avoid cross-query contamination
         let distance_compute = UnifiedDistanceCompute::default();
 
-        // CACHE-FIRST PATTERN: Check zero-copy metadata cache for each file
-        // Cache key format: filename:collection_id:engine (filename-first for optimal sequential matching)
-        let cached_metadata = Vec::<String>::new();
-        let mut files_needing_load = Vec::new();
-
-        for file_path in &collection_context.sstable_files {
-            debug!("📁 Checking cache for SSTable file: {}", file_path);
-
-            // UnifiedCachingFilesystem handles caching internally
-            // Try to get metadata (will use cache if available)
-            match self.caching_filesystem.metadata(file_path).await {
-                Ok(_metadata) => {
-                    debug!("✅ Got metadata for file: {}", file_path);
-                    // Convert FileMetadata to the format needed here
-                    // For now, we'll need to load the file to get SSTable metadata
-                    files_needing_load.push(file_path.clone());
-                }
-                Err(e) => {
-                    warn!(
-                        "⚠️ Error getting metadata for file {}: {}, will try to load",
-                        file_path, e
-                    );
-                    files_needing_load.push(file_path.clone());
-                }
-            }
-        }
-
-        debug!(
-            "📊 Cache stats: {} hits, {} misses",
-            cached_metadata.len(),
-            files_needing_load.len()
-        );
+        // Review round-1 M3: this used to probe `caching_filesystem.metadata`
+        // for every file before loading — one real object HEAD per file per
+        // query on a metadata-cache miss, for a result both arms discarded
+        // (every file landed in `files_needing_load` either way). The probe
+        // is deleted; the caching filesystem still serves the reads below.
 
         // 1. Select optimal reading strategy
         let search_strategy = self
@@ -3783,22 +3761,22 @@ impl UnifiedSstableReader {
                 file_path
             );
 
-            // For remote files, check if already in disk cache
+            // For remote files, log whether a resident copy serves the reads.
+            // Review round-1 M3: this probe used to call
+            // `caching_filesystem.metadata` — a real object HEAD on a
+            // metadata-cache miss — only to pick between two debug lines (and
+            // it said "found in disk cache" for ANY existing object).
+            // `resident_len` answers with zero requests.
             let is_remote = !file_path.starts_with("file://")
                 && !file_path.starts_with("/")
                 && file_path.contains("://");
             if is_remote {
-                let cache_status = self.caching_filesystem.metadata(file_path).await;
-                if cache_status.is_ok() {
-                    debug!(
-                        "💾 SST: File {} found in disk cache, using cached copy",
-                        file_path
-                    );
-                } else {
-                    debug!(
+                match resident_len(file_path) {
+                    Some(_) => debug!("💾 SST: File {} has a resident copy", file_path),
+                    None => debug!(
                         "☁️ SST: File {} will be downloaded to disk cache",
                         file_path
-                    );
+                    ),
                 }
             }
 
@@ -4901,8 +4879,8 @@ impl UnifiedSstableReader {
             debug!("Bloom length bytes: {:?}", bloom_len_data);
 
             // Check file size
-            let file_metadata = fs.metadata(file_path).await?;
-            debug!("File size: {} bytes", file_metadata.size);
+            let file_metadata_size = fs.object_size_resident(file_path).await?;
+            debug!("File size: {} bytes", file_metadata_size);
 
             // Read bloom filter data
             let bloom_data = fs
@@ -5215,8 +5193,7 @@ impl UnifiedSstableReader {
         let mut blocks = Vec::new();
 
         // Read the rest of the file
-        let file_metadata = fs.metadata(path).await?;
-        let file_size = file_metadata.size;
+        let file_size = fs.object_size_resident(path).await?;
 
         while offset < file_size {
             // Try to read block length
@@ -5441,7 +5418,7 @@ impl UnifiedSstableReader {
         let fs = self.filesystem.get_filesystem(&format!("{}://", scheme))?;
 
         // Read the full file in one operation for optimal sequential I/O
-        let data = fs.read(path).await?;
+        let data = fs.read_resident(path).await?;
         let mut offset = 0usize;
 
         // Verify SST1 magic bytes
@@ -5576,7 +5553,7 @@ impl UnifiedSstableReader {
         let fs = self.filesystem.get_filesystem(&format!("{}://", scheme))?;
 
         // Read the full file
-        let data = fs.read(path).await?;
+        let data = fs.read_resident(path).await?;
         let mut offset = 0usize;
 
         // Verify SST1 magic bytes

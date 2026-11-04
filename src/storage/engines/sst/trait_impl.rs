@@ -26,6 +26,7 @@ use tracing::{debug, info};
 
 use crate::core::search::results::OptimizedSearchRecord;
 use crate::storage::engines::sst::core::SstEngine;
+use crate::storage::engines::sst::segment_io::ResidentRangeRead as _;
 use crate::storage::engines::sst::{BACKGROUND_COMPACTION_HINT, COLLECTION_META_COMPLETE_HINT};
 use crate::storage::traits::{
     CompactionParameters, CompactionResult, FlushParameters, FlushResult, StorageFormatStrategy,
@@ -514,8 +515,13 @@ impl UnifiedStorageFormat for SstEngine {
                 // compaction reader (`read_batch`) cannot decode `.pax`. This is
                 // the path TD-112 AXIS-rebuild-from-SST uses, so it must read
                 // `.pax` or the index stays empty after a loss.
+                //
+                // TD-TIER-1 SC4: routed through the resident seam — a
+                // PERFORMANCE grant's pinned copy serves this whole-object read
+                // with zero GETs (this is the point-lookup / scan path: every
+                // get-by-id and list funnels through here).
                 let bytes = fs
-                    .read(file)
+                    .read_resident(file)
                     .await
                     .map_err(|e| anyhow::anyhow!("read_all_records: read pax {file}: {e}"))?;
                 all.extend(
