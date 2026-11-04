@@ -519,7 +519,6 @@ struct PreparedCompactionRecords {
     tombstones_removed_count: u64,
 }
 
-/// Manages background compaction of SST files
 /// The `L{n}_` level encoded in a compaction output filename (0 when the name
 /// carries no level — adoption treats that as "same level", preserving the
 /// flat-tier semantics).
@@ -531,6 +530,7 @@ fn output_level_of(output_file: &Path) -> u32 {
     crate::storage::common::compaction_orchestrator::FilenameCodec::new().parse_level(&filename)
 }
 
+/// Manages background compaction of SST files
 pub struct Compaction {
     config: SstConfig,
     task_queue: Arc<Mutex<VecDeque<SstCompactionTask>>>,
