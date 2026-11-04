@@ -164,6 +164,7 @@
 //! - Storage class transitions (S3 IA, Glacier)
 //! - Bandwidth optimization with compression
 
+use crate::storage::engines::sst::segment_io::ResidentRangeRead as _;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, error, info, trace};
@@ -1563,6 +1564,58 @@ impl FilesystemFactory {
         let fs = self.get_filesystem(url)?;
         let path = Self::resolve_path(url)?;
         fs.metadata(&path).await
+    }
+
+    // ── Resident-preferring reads (TD-TIER-1 SC4: readers outside the vector
+    //    profile) ────────────────────────────────────────────────────────────
+    //
+    // Mirrors of [`Self::read`], [`Self::read_range`], [`Self::read_ranges`]
+    // and [`Self::metadata`] that first consult a resident whole-segment copy
+    // (a PERFORMANCE grant's pinned bytes): a covered read costs no object
+    // store request at all, an uncovered one falls through unchanged. The
+    // `ResidentRangeRead` blanket impl on `T: FileSystem` carries the routing;
+    // these convenience forms exist so factory-level callers (the DataFusion
+    // PAX adapter) route with a one-token change, the same way the in-engine
+    // readers already do. The trait's current home is the SST engine module —
+    // the architecturally clean home is `proximadb-storage-filesystem-types`
+    // beside `FileSystem` itself (follow-up; recorded on the TD row).
+
+    /// Resolve the filesystem handle + canonical path for a resident-preferring
+    /// read (the shared body of the `*_resident` convenience forms below).
+    fn resident_handle(&self, url: &str) -> FsResult<(std::sync::Arc<dyn FileSystem>, String)> {
+        Ok((self.get_filesystem(url)?, Self::resolve_path(url)?))
+    }
+
+    pub async fn read_resident(&self, url: &str) -> FsResult<Vec<u8>> {
+        let (fs, path) = self.resident_handle(url)?;
+        fs.read_resident(&path).await
+    }
+
+    pub async fn read_range_resident(
+        &self,
+        url: &str,
+        offset: u64,
+        length: u64,
+    ) -> FsResult<Vec<u8>> {
+        let (fs, path) = self.resident_handle(url)?;
+        fs.read_range_resident(&path, offset, length).await
+    }
+
+    pub async fn read_ranges_prefetch_resident(
+        &self,
+        url: &str,
+        ranges: Vec<std::ops::Range<u64>>,
+    ) -> FsResult<Vec<Vec<u8>>> {
+        let (fs, path) = self.resident_handle(url)?;
+        fs.read_ranges_prefetch_resident(&path, ranges).await
+    }
+
+    /// The object's size: from the resident copy when present (no HEAD),
+    /// otherwise one recorded metadata op. Size-only mirror of
+    /// [`Self::metadata`].
+    pub async fn object_size_resident(&self, url: &str) -> FsResult<u64> {
+        let (fs, path) = self.resident_handle(url)?;
+        fs.object_size_resident(&path).await
     }
 
     pub async fn list(&self, url: &str) -> FsResult<Vec<DirEntry>> {

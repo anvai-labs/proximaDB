@@ -231,7 +231,7 @@ impl PaxSplitReader {
     /// engaged by `PROXIMADB_DF_PAX_RANGED` (TD-DOC-PUSHDOWN-1).
     async fn load_bytes(&self, split: &FileSplit) -> DFResult<Vec<u8>> {
         self.filesystem_factory
-            .read(&split.file_path)
+            .read_resident(&split.file_path)
             .await
             .map_err(|e| {
                 DataFusionError::Execution(format!(
@@ -279,8 +279,8 @@ impl PaxSplitReader {
         // hand-built splits that never carried a size).
         let len = match split.object_size {
             Some(size) => size,
-            None => match self.filesystem_factory.metadata(path).await {
-                Ok(m) => m.size,
+            None => match self.filesystem_factory.object_size_resident(path).await {
+                Ok(size) => size,
                 Err(_) => return Ok(None), // no cheap size → fall back
             },
         };
@@ -324,7 +324,7 @@ impl PaxSplitReader {
         let prefix_len = (SEG_HEADER_PREFIX_LEN as u64).min(len);
         let prefix = self
             .filesystem_factory
-            .read_range(path, 0, prefix_len)
+            .read_range_resident(path, 0, prefix_len)
             .await
             .map_err(|e| DataFusionError::Execution(format!("PAX ranged header read: {e}")))?;
         let v4_index: Option<SegmentIndex> = if is_coalesced_segment(&prefix) {
@@ -332,7 +332,7 @@ impl PaxSplitReader {
                 Ok(h) if h.layout_version == SEG_LAYOUT_VERSION && h.footer_len > 0 => {
                     let body = self
                         .filesystem_factory
-                        .read_range(path, h.footer_off, h.footer_len)
+                        .read_range_resident(path, h.footer_off, h.footer_len)
                         .await
                         .map_err(|e| {
                             DataFusionError::Execution(format!("PAX ranged v4 footer read: {e}"))
@@ -388,7 +388,7 @@ impl PaxSplitReader {
             let start = len - probe;
             let suffix = self
                 .filesystem_factory
-                .read_range(path, start, probe)
+                .read_range_resident(path, start, probe)
                 .await
                 .map_err(|e| DataFusionError::Execution(format!("PAX ranged tail read: {e}")))?;
             match SegmentIndex::locate_in_suffix(&suffix) {
@@ -476,7 +476,7 @@ impl PaxSplitReader {
             .collect();
         let bufs = self
             .filesystem_factory
-            .read_ranges(path, ranges)
+            .read_ranges_prefetch_resident(path, ranges)
             .await
             .map_err(|e| DataFusionError::Execution(format!("PAX ranged block read: {e}")))?;
         let mut batches = Vec::with_capacity(bufs.len());
@@ -529,7 +529,7 @@ impl PaxSplitReader {
         let footer_start = block_size - BLOCK_FOOTER_SIZE as u64;
         let tail = self
             .filesystem_factory
-            .read_range(path, block_offset + footer_start, BLOCK_FOOTER_SIZE as u64)
+            .read_range_resident(path, block_offset + footer_start, BLOCK_FOOTER_SIZE as u64)
             .await
             .map_err(|e| DataFusionError::Execution(format!("PAX footer read: {e}")))?;
         let footer = BlockFooter::from_bytes(&tail)
@@ -546,7 +546,7 @@ impl PaxSplitReader {
         }
         let meta_buf = if footer_start > meta_start {
             self.filesystem_factory
-                .read_range(path, block_offset + meta_start, footer_start - meta_start)
+                .read_range_resident(path, block_offset + meta_start, footer_start - meta_start)
                 .await
                 .map_err(|e| DataFusionError::Execution(format!("PAX meta read: {e}")))?
         } else {

@@ -1335,38 +1335,109 @@ mod tests {
     /// directly — a direct call would silently bypass residency and cost a
     /// GET on a resident collection (review B1: the first guard matched only
     /// `.read_range(` and missed the batched and whole-object reads).
+    ///
+    /// TD-TIER-1 SC4 (readers outside the vector profile): the pin now covers
+    /// the non-vector readers too — the point-lookup/scan PAX path
+    /// (`trait_impl.rs`), the legacy `.sst` reader (`sst_query_engine.rs`),
+    /// and the DataFusion PAX adapter (`pax_adapter.rs`) — plus
+    /// `search/operations.rs`, whose point-lookup was silently uncovered (it
+    /// delegates to the legacy reader, which the pin above now catches, but a
+    /// future direct read there would have bypassed both).
+    ///
+    /// Matching runs on WHITESPACE-STRIPPED source: the point-lookup site was
+    /// originally a line-broken `fs\n    .read(` that a raw-substring guard
+    /// cannot see — exactly the evasion this guard exists to prevent.
+    ///
+    /// Files whose internal helpers self-call `read_range` (the legacy reader)
+    /// or that read through wrapper handles (`caching_filesystem`) are pinned
+    /// on the FILESYSTEM-OBJECT call forms only; the four original files are
+    /// pinned on the strict forms.
     #[test]
     fn segment_readers_route_reads_through_residency() {
-        for (name, source) in [
-            ("segment_format.rs", include_str!("segment_format.rs")),
-            ("oid_resolve.rs", include_str!("oid_resolve.rs")),
-            ("search/mod.rs", include_str!("search/mod.rs")),
+        fn non_test(source: &str) -> &str {
+            source.split("#[cfg(test)]").next().unwrap_or_default()
+        }
+        fn norm(source: &str) -> String {
+            source.replace(['\n', '\t', ' '], "")
+        }
+        for (name, source, filesystem_object_forms_only) in [
+            (
+                "segment_format.rs",
+                include_str!("segment_format.rs"),
+                false,
+            ),
+            ("oid_resolve.rs", include_str!("oid_resolve.rs"), false),
+            ("search/mod.rs", include_str!("search/mod.rs"), false),
             (
                 "centroid_directory_reader.rs (non-test)",
-                include_str!("centroid_directory_reader.rs")
-                    .split("#[cfg(test)]")
-                    .next()
-                    .unwrap_or_default(),
+                non_test(include_str!("centroid_directory_reader.rs")),
+                false,
+            ),
+            (
+                "trait_impl.rs (non-test) — point-lookup/scan PAX path",
+                non_test(include_str!("trait_impl.rs")),
+                false,
+            ),
+            (
+                "readers/sst_query_engine.rs (non-test) — legacy .sst reader",
+                non_test(include_str!("readers/sst_query_engine.rs")),
+                true,
+            ),
+            (
+                "search/operations.rs (non-test) — point-lookup coverage hole",
+                non_test(include_str!("search/operations.rs")),
+                true,
             ),
         ] {
-            let heads =
-                source.matches(".metadata(").count() - source.matches(".metadata()").count();
-            assert_eq!(
-                heads, 0,
-                "{name}: {heads} direct `.metadata(` — use `object_size_resident`"
-            );
-            for direct in [
-                ".read_range(",
-                ".read_ranges_prefetch(",
-                ".read_ranges(",
-                "fs.read(",
-            ] {
-                let count = source.matches(direct).count();
+            let normalized = norm(source);
+            let banned: &[&str] = if filesystem_object_forms_only {
+                &[
+                    "fs.read(",
+                    "fs.read_range(",
+                    "fs.read_ranges(",
+                    "fs.metadata(",
+                ]
+            } else {
+                &[
+                    ".read_range(",
+                    ".read_ranges_prefetch(",
+                    ".read_ranges(",
+                    "fs.read(",
+                ]
+            };
+            for direct in banned {
+                let count = normalized.matches(direct).count();
                 assert_eq!(
                     count, 0,
                     "{name}: {count} direct `{direct}` — use the resident read"
                 );
             }
+            if !filesystem_object_forms_only {
+                let heads = normalized.matches(".metadata(").count()
+                    - normalized.matches(".metadata()").count();
+                assert_eq!(
+                    heads, 0,
+                    "{name}: {heads} direct `.metadata(` — use `object_size_resident`"
+                );
+            }
+        }
+        // The DataFusion adapter reads through the FACTORY's convenience
+        // methods, so it is pinned on the factory call forms (the resident
+        // variants end `_resident` and do not match).
+        let adapter = norm(include_str!(
+            "../../../datafusion/engine_adapters/pax_adapter.rs"
+        ));
+        for direct in [
+            "filesystem_factory.read(",
+            "filesystem_factory.read_range(",
+            "filesystem_factory.read_ranges(",
+            "filesystem_factory.metadata(",
+        ] {
+            let count = adapter.matches(direct).count();
+            assert_eq!(
+                count, 0,
+                "pax_adapter.rs: {count} direct `{direct}` — use the `_resident` factory form"
+            );
         }
     }
 }

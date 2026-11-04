@@ -29,6 +29,7 @@
 
 use crate::core::search::OptimizedSearchRecord;
 use crate::core::search::bounded_queue::BoundedPriorityQueue;
+use crate::storage::engines::sst::segment_io::ResidentRangeRead as _;
 use anyhow::Result;
 use std::collections::HashMap;
 use std::io::Read;
@@ -691,7 +692,11 @@ impl ModularBlockReader {
             .filesystem_factory
             .get_filesystem(&self.file_path)
             .map_err(|e| anyhow::anyhow!("Failed to get filesystem: {}", e))?;
-        fs.read_range(&self.file_path, offset, length as u64)
+        // TD-TIER-1 SC4: routed through the resident seam — the legacy `.sst`
+        // reader is outside the vector profile, so without this a resident
+        // (PERFORMANCE-granted) collection still pays a GET per block read
+        // through the point-lookup/scan paths that land here.
+        fs.read_range_resident(&self.file_path, offset, length as u64)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to read range: {}", e))
     }
@@ -2100,8 +2105,8 @@ impl SstDirectReader {
         };
 
         // Read just the data blocks portion of the file
-        let file_metadata = fs.metadata(&file_path).await?;
-        let data_blocks_size = file_metadata.size - data_blocks_offset;
+        let file_size = { fs.object_size_resident(&file_path).await? };
+        let data_blocks_size = file_size - data_blocks_offset;
 
         debug!(
             "📊 Reading data blocks: offset={}, size={} bytes, format={:?}",
@@ -4901,8 +4906,8 @@ impl UnifiedSstableReader {
             debug!("Bloom length bytes: {:?}", bloom_len_data);
 
             // Check file size
-            let file_metadata = fs.metadata(file_path).await?;
-            debug!("File size: {} bytes", file_metadata.size);
+            let file_metadata_size = { fs.object_size_resident(file_path).await? };
+            debug!("File size: {} bytes", file_metadata_size);
 
             // Read bloom filter data
             let bloom_data = fs
@@ -5215,8 +5220,7 @@ impl UnifiedSstableReader {
         let mut blocks = Vec::new();
 
         // Read the rest of the file
-        let file_metadata = fs.metadata(path).await?;
-        let file_size = file_metadata.size;
+        let file_size = { fs.object_size_resident(path).await? };
 
         while offset < file_size {
             // Try to read block length
@@ -5441,7 +5445,7 @@ impl UnifiedSstableReader {
         let fs = self.filesystem.get_filesystem(&format!("{}://", scheme))?;
 
         // Read the full file in one operation for optimal sequential I/O
-        let data = fs.read(path).await?;
+        let data = { fs.read_resident(path).await? };
         let mut offset = 0usize;
 
         // Verify SST1 magic bytes
@@ -5576,7 +5580,7 @@ impl UnifiedSstableReader {
         let fs = self.filesystem.get_filesystem(&format!("{}://", scheme))?;
 
         // Read the full file
-        let data = fs.read(path).await?;
+        let data = { fs.read_resident(path).await? };
         let mut offset = 0usize;
 
         // Verify SST1 magic bytes
