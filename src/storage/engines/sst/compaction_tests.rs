@@ -332,6 +332,94 @@ async fn compaction_morsel_admission_rejects_overlapping_inputs() {
     assert_eq!(manager.pending_task_count().await, 1);
 }
 
+// ── TD-TIER-1 SC5: level-aware tiering (`tier_by_level:` tag, default-OFF) ──
+
+/// The policy parse: entries must name tiers (hot|cool|cold), the list
+/// clamps past its end for deeper levels, an unparseable or empty entry
+/// refuses the WHOLE policy (a misspelt tier must never silently become the
+/// account default), and no tag means no policy.
+#[test]
+fn sc5_level_tier_policy_parses_clamps_and_refuses() {
+    use crate::storage::engines::sst::compaction::Compaction;
+    let tag = |s: &str| vec![s.to_string()];
+
+    assert_eq!(
+        Compaction::level_tier_policy(&[]),
+        None,
+        "no tags, no policy"
+    );
+    assert_eq!(
+        Compaction::level_tier_policy(&tag("compaction:on")),
+        None,
+        "unrelated tags are not a policy"
+    );
+    let policy =
+        Compaction::level_tier_policy(&tag("tier_by_level:hot,cool")).expect("valid policy parses");
+    assert_eq!(policy, vec![ObjectAccessTier::Hot, ObjectAccessTier::Cool]);
+    // Clamping: deeper output levels take the LAST entry.
+    assert_eq!(
+        Compaction::effective_output_tier(None, Some(&policy), 3),
+        Some(ObjectAccessTier::Cool),
+        "L3 clamps to the last entry"
+    );
+    assert_eq!(
+        Compaction::effective_output_tier(None, Some(&policy), 1),
+        Some(ObjectAccessTier::Hot),
+        "L1 takes the first entry"
+    );
+    // A misspelt entry refuses the policy entirely.
+    assert_eq!(
+        Compaction::level_tier_policy(&tag("tier_by_level:hot,warm")),
+        None,
+        "an unknown tier refuses the whole policy"
+    );
+    assert_eq!(
+        Compaction::level_tier_policy(&tag("tier_by_level:")),
+        None,
+        "an empty policy is not a policy"
+    );
+}
+
+/// The task-level resolution: the tier follows the OUTPUT filename's `L{n}_`
+/// level (not the task's SOURCE level), a policy overrides the collection's
+/// flat tier for level ≥ 1, and without a policy the flat tier is exactly
+/// today's behavior.
+#[test]
+fn sc5_level_aware_tier_resolves_by_output_level() {
+    use crate::storage::engines::sst::compaction::Compaction;
+    let tags = vec!["tier_by_level:hot,cool".to_string()];
+    let l1 = sc5_tier_task("/nonexistent/proxima_sc5_tier/L1_ab12cd34.pax", None);
+    let l2 = sc5_tier_task("/nonexistent/proxima_sc5_tier/L2_ab12cd34.pax", None);
+    let l0 = sc5_tier_task("/nonexistent/proxima_sc5_tier/L0_ab12cd34.pax", None);
+
+    assert_eq!(
+        Compaction::resolve_task_output_tier(&l1, Some(ObjectAccessTier::Cold), &tags),
+        Some(ObjectAccessTier::Hot),
+        "the policy's first entry wins for an L1 output over the flat tier"
+    );
+    assert_eq!(
+        Compaction::resolve_task_output_tier(&l2, Some(ObjectAccessTier::Cold), &tags),
+        Some(ObjectAccessTier::Cool),
+        "the second entry applies to L2"
+    );
+    assert_eq!(
+        Compaction::resolve_task_output_tier(&l0, Some(ObjectAccessTier::Cold), &tags),
+        Some(ObjectAccessTier::Hot),
+        "a defensively-seen L0 output resolves the first entry (compaction          outputs are always >= L1; the policy never meets flush output)"
+    );
+    // Without the tag: the flat collection tier passes through unchanged.
+    assert_eq!(
+        Compaction::resolve_task_output_tier(&l2, Some(ObjectAccessTier::Cold), &[]),
+        Some(ObjectAccessTier::Cold),
+        "no policy means exactly today's flat-tier behavior"
+    );
+    assert_eq!(
+        Compaction::resolve_task_output_tier(&l2, None, &[]),
+        None,
+        "no policy and no flat tier means the account default"
+    );
+}
+
 /// Shared builder for the TD-TIER-1 SC5 tier-adoption tests: a task for one
 /// fixed collection dir whose output file and tier the test overrides.
 fn sc5_tier_task(output: &str, access_tier: Option<ObjectAccessTier>) -> CompactionTask {

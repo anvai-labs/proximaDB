@@ -255,6 +255,7 @@ impl UnifiedStorageFormat for SstEngine {
                     vector_quant,
                     access_tier,
                     timeout,
+                    rg_tags,
                 )
                 .await?;
             return Ok(CompactionResult {
@@ -302,6 +303,7 @@ impl UnifiedStorageFormat for SstEngine {
                 rg_layout,
                 vector_quant,
                 access_tier,
+                rg_tags,
             )
             .await?;
 

@@ -998,12 +998,14 @@ impl SstEngine {
                             // sq8 / `pax_vector_format:off` collection is not
                             // silently rewritten as RaBitQ.
                             Some(resolve_pax_vector_quant(params.collection_config.as_ref())),
-                            // TD-TIER-1 SC5: the output object carries the collection's tier.
+                            // TD-TIER-1 SC5: the output object carries the collection's tier
+                            // (a `tier_by_level:` tag re-resolves it by output level).
                             params
                                 .collection_config
                                 .as_ref()
                                 .and_then(|collection| collection.config.as_ref())
                                 .and_then(crate::services::collection::storage_class::collection_access_tier),
+                            collection_tags,
                         )
                         .await
                 }
