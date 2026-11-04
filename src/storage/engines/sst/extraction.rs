@@ -14,7 +14,7 @@ use crate::storage::persistence::filesystem::caching_filesystem::UnifiedCachingF
 use crate::storage::trait_components::extractor::{
     ExtractedVector, ExtractionCapabilities, ExtractionCost, ExtractionError, ExtractionMode,
     ExtractionRequest, ExtractionResult, VectorExtractor, filter_existing_files,
-    finalize_extraction, id_filter_allows, mode_wants_fp32, strip_file_url,
+    finalize_extraction, id_filter_allows, linear_file_cost, mode_wants_fp32, strip_file_url,
 };
 
 use super::readers::sst_query_engine::UnifiedSstableReader;
@@ -238,16 +238,7 @@ impl VectorExtractor for SstExtractor {
 
     fn estimate_extraction_cost(&self, request: &ExtractionRequest) -> ExtractionCost {
         // Estimate based on file count and typical SST file characteristics
-        let files = request.file_paths.len();
-        let vectors_per_file = 10_000; // Typical SST file size
-        let bytes_per_vector = 768 * 4; // Typical dimension * f32 size
-
-        ExtractionCost {
-            estimated_vectors: files * vectors_per_file,
-            estimated_bytes: files * vectors_per_file * bytes_per_vector,
-            estimated_duration_ms: (files * 50) as u64, // ~50ms per file
-            io_cost: 1.0,                               // SST is the baseline
-        }
+        linear_file_cost(request.file_paths.len(), 10000, 768 * 4, 50, 1.0)
     }
 
     fn engine_type(&self) -> StorageEngineType {

@@ -456,6 +456,30 @@ pub struct ExtractionCost {
     pub io_cost: f64,
 }
 
+/// The linear files-based cost formula shared by every extractor
+/// (victor post-program clone scan, cluster A3: seven engines carried the
+/// identical body, differing only in tuning constants).
+///
+/// NOTE: callers pass a fixed `bytes_per_vector` (typically `768 * 4`), a
+/// default-dimension assumption. `ExtractionRequest` does not carry the
+/// collection dimension yet; when it does, this is the one place to thread
+/// it through.
+#[allow(clippy::too_many_arguments)]
+pub fn linear_file_cost(
+    file_count: usize,
+    vectors_per_file: usize,
+    bytes_per_vector: usize,
+    ms_per_file: u64,
+    io_cost: f64,
+) -> ExtractionCost {
+    ExtractionCost {
+        estimated_vectors: file_count * vectors_per_file,
+        estimated_bytes: file_count * vectors_per_file * bytes_per_vector,
+        estimated_duration_ms: (file_count as u64) * ms_per_file,
+        io_cost,
+    }
+}
+
 /// Errors that can occur during vector extraction.
 #[derive(Debug, Error)]
 pub enum ExtractionError {
