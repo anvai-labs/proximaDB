@@ -1132,8 +1132,14 @@ class ProximaDBClient:
         else:
             collection_data = response_data
 
-        # Debug: Check if required fields are present
-        collection_id_from_response = collection_data.get("id", collection_id)
+        # Debug: Check if required fields are present. CollectionV2Response
+        # (the spec shape) keys the id as "collection_id"; older payloads
+        # used "id" (TD-SDK-3 swap surfaced the drift).
+        collection_id_from_response = (
+            collection_data.get("collection_id")
+            or collection_data.get("id")
+            or collection_id
+        )
 
         # Handle nested config structure (server returns dimension in config.dimension)
         if "dimension" not in collection_data and "config" in collection_data:
@@ -1319,9 +1325,20 @@ class ProximaDBClient:
                 data_size_bytes=stats_src.get("data_size_bytes", 0),
             )
 
+            # CollectionV2Summary (the spec shape for GET /api/v2/collections)
+            # keys the id as "collection_id"; older payloads used "id". Accept
+            # both; an entry with NEITHER is malformed (the spec marks
+            # collection_id required) — raise rather than fabricate an
+            # empty-id Collection (silent-failure doctrine).
+            collection_id_value = coll_data.get("collection_id") or coll_data.get("id")
+            if not collection_id_value:
+                raise ProximaDBError(
+                    "Malformed collection list entry: missing both "
+                    f"'collection_id' and 'id' keys (got keys: {sorted(coll_data)})"
+                )
             collections.append(
                 Collection(
-                    id=coll_data["id"],
+                    id=collection_id_value,
                     config=config,
                     stats=stats,
                     created_at=coll_data.get("created_at"),

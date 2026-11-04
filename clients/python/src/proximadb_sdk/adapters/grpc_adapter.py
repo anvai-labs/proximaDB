@@ -70,8 +70,16 @@ class GrpcProtocolAdapter(SyncGraphDelegations, BaseProtocolAdapter):
                 config, "base_url", None
             )
             if config_url:
+                # grpcio's insecure_channel expects a bare host:port target.
+                # Strip the http(s):// forms AND the grpc(s):// pseudo-schemes
+                # the SDK accepts as input convenience (v1's _create_adapter
+                # does the same); a scheme-prefixed target is undialable.
                 server_address = (
-                    str(config_url).replace("http://", "").replace("https://", "")
+                    str(config_url)
+                    .replace("https://", "")
+                    .replace("http://", "")
+                    .replace("grpcs://", "")
+                    .replace("grpc://", "")
                 )
 
         metadata = (

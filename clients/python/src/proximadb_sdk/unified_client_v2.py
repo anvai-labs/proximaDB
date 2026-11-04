@@ -26,8 +26,13 @@ from ._graph_validation import (
     validate_traverse_graph_args,
 )
 from .adapters import BaseProtocolAdapter, create_adapter
+from .auth import AuthConfig, AuthMethod
 from .config import ClientConfig, Protocol, load_config
-from .exceptions import ProximaDBError, ProximaDBNotSupportedError
+from .exceptions import (
+    CollectionNotFoundError,
+    ProximaDBError,
+    ProximaDBNotSupportedError,
+)
 from .models import (
     BatchResult,
     Collection,
@@ -66,6 +71,13 @@ class ProximaDBClient:
         data_dir: str | None = None,
         pool_size: int = 10,
         timeout: float = 60.0,
+        verify_ssl: bool | None = None,
+        cert_file: str | None = None,
+        key_file: str | None = None,
+        pool_maxsize: int | None = None,
+        auth_config: "AuthConfig | None" = None,
+        auth_method: "AuthMethod | str | None" = None,
+        sks_warmup_collection: str | None = None,
         **kwargs,
     ):
         """
@@ -79,10 +91,126 @@ class ProximaDBClient:
             data_dir: Data directory for embedded mode
             pool_size: Connection pool size
             timeout: Request timeout in seconds
-            **kwargs: Additional configuration parameters
+            verify_ssl: TLS certificate verification (v1 parity; maps to config.tls.verify)
+            cert_file: Client certificate for mTLS (maps to config.tls.cert_file)
+            key_file: Client key for mTLS (maps to config.tls.key_file)
+            pool_maxsize: Max connection-pool size (maps to config.connection.pool_maxsize)
+            auth_config: Authentication configuration (API-key and client-certificate
+                methods are honored; interactive flows raise NotImplementedError)
+            auth_method: Authentication method selector (API-key parity only;
+                enum or its string value)
+            sks_warmup_collection: v1 constructor param. None (v1's default)
+                is accepted as the no-op it was; a real collection name raises
+                NotImplementedError (v2 has no SKS warmup path yet)
+            **kwargs: Additional ClientConfig fields (unknown keywords raise
+                TypeError — never silently dropped, per TD-SDKENG-1)
         """
+        # Round-2 review: v1 accepted sks_warmup_collection explicitly; a
+        # non-None value requests REST SKS warmup v2 does not implement.
+        if sks_warmup_collection is not None:
+            raise NotImplementedError(
+                "sks_warmup_collection is not implemented on the v2 client "
+                "(no SKS warmup path yet). Pass None, or use the legacy "
+                "client from proximadb_sdk.unified_client (TD-SDK-3)."
+            )
+
+        # v1-parity flat kwargs that ClientConfig does not accept as flat
+        # names: map them onto the structured config instead of letting
+        # pydantic's extra=ignore silently drop them (the swap review caught
+        # verify_ssl/cert_file/key_file/pool_maxsize disappearing).
+        tls_overrides: dict[str, Any] = {}
+        if verify_ssl is not None:
+            tls_overrides["verify"] = verify_ssl
+        if cert_file is not None:
+            tls_overrides["cert_file"] = cert_file
+        if key_file is not None:
+            tls_overrides["key_file"] = key_file
+
+        # TD-SDKENG-1: never silently drop an unknown keyword. Anything that
+        # is not a ClientConfig field (routed through load_config) or one of
+        # the explicit parameters above is a caller error.
+        recognized = set(ClientConfig.model_fields) | {
+            "url",
+            "api_key",
+            "config_file",
+        }
+        unknown = set(kwargs) - recognized
+        if unknown:
+            raise TypeError(
+                f"Unknown constructor keyword(s) {sorted(unknown)} — "
+                f"recognized: ClientConfig fields {sorted(recognized)}"
+            )
+
         if config is None:
             config = load_config(url=url, api_key=api_key, **kwargs)
+        elif kwargs:
+            # Round-2 review: with an explicit config the recognized kwargs
+            # were being dropped (load_config never ran). Apply them.
+            config = config.model_copy(
+                update={k: v for k, v in kwargs.items() if k in recognized}
+            )
+
+        if tls_overrides:
+            config = config.model_copy(
+                update={"tls": config.tls.model_copy(update=tls_overrides)}
+            )
+        if pool_maxsize is not None:
+            config = config.model_copy(
+                update={
+                    "connection": config.connection.model_copy(
+                        update={"pool_maxsize": pool_maxsize}
+                    )
+                }
+            )
+
+        # Auth: v2 has no interactive auth orchestrator (v1's ProximaDBAuth
+        # OAuth2/JWT flows). Honor what the adapters actually consume — the
+        # API key and the mTLS client certificates — and fail loudly on the
+        # interactive methods instead of dropping the credentials silently.
+        # Round-2 review: coerce string selectors ("api_key", …) like the
+        # protocol param does, and keep the error path attribute-safe.
+        if isinstance(auth_method, str):
+            auth_method = AuthMethod(auth_method)
+        method = (
+            auth_config.method
+            if auth_config is not None
+            else (auth_method if auth_method is not None else None)
+        )
+        if isinstance(method, str):
+            method = AuthMethod(method)
+        if method is not None and method != AuthMethod.API_KEY:
+            if method == AuthMethod.CLIENT_CERTIFICATE:
+                cert = (
+                    auth_config.client_cert_file
+                    if auth_config is not None and auth_config.client_cert_file
+                    else cert_file
+                )
+                key = (
+                    auth_config.client_key_file
+                    if auth_config is not None and auth_config.client_key_file
+                    else key_file
+                )
+                if cert is None or key is None:
+                    raise ValueError(
+                        "CLIENT_CERTIFICATE auth requires cert_file and key_file"
+                    )
+                config = config.model_copy(
+                    update={
+                        "tls": config.tls.model_copy(
+                            update={"cert_file": cert, "key_file": key}
+                        )
+                    }
+                )
+            else:
+                raise NotImplementedError(
+                    f"AuthMethod {getattr(method, 'value', method)} requires v1's "
+                    f"interactive auth orchestrator, which the v2 client does not "
+                    f"implement yet. Use the legacy client from "
+                    f"proximadb_sdk.unified_client until v2 gains it (TD-SDK-3)."
+                )
+        if auth_config is not None and auth_config.api_key:
+            if config.api_key is None:
+                config = config.model_copy(update={"api_key": auth_config.api_key})
 
         self.config = config
         self._protocol = Protocol(protocol) if isinstance(protocol, str) else protocol
@@ -186,6 +314,15 @@ class ProximaDBClient:
         return self._protocol
 
     @property
+    def protocol(self) -> Protocol:
+        """The active protocol (v1 public-attribute parity).
+
+        v1 exposed ``self.protocol`` as a plain instance attribute; consumers
+        branching on it must keep working under the swap.
+        """
+        return self._protocol
+
+    @property
     def adapter(self) -> BaseProtocolAdapter:
         """Get the underlying protocol adapter."""
         return self._adapter
@@ -219,9 +356,17 @@ class ProximaDBClient:
             config = CollectionConfig(name=name, **merged)
         return self._adapter.create_collection(name, config, **passthrough)
 
-    def get_collection(self, collection_id: str) -> Collection | None:
-        """Get collection metadata by ID or name."""
-        return self._adapter.get_collection(collection_id)
+    def get_collection(self, collection_id: str) -> Collection:
+        """Get collection metadata by ID or name.
+
+        Raises CollectionNotFoundError when the collection does not exist —
+        v1's public contract (the swap review caught v2 returning None
+        silently where every v1 caller expected the documented raise).
+        """
+        result = self._adapter.get_collection(collection_id)
+        if result is None:
+            raise CollectionNotFoundError(f"Collection '{collection_id}' not found")
+        return result
 
     def list_collections(self) -> list[Collection]:
         """List all collections."""
@@ -380,16 +525,52 @@ class ProximaDBClient:
         self,
         collection_id: str,
         vector_id: str,
-        vector: list[float] | np.ndarray,
+        vector: list[float] | np.ndarray | tuple[float, ...],
         metadata: dict[str, Any] | None = None,
+        timestamp_ms: int | None = None,
+        updated_at_ms: int | None = None,
+        expires_at_ms: int | None = None,
+        version: int | None = None,
+        source: str | None = None,
         upsert: bool = False,
-        **kwargs,
     ) -> VectorOperationResponse:
-        """Insert a single vector."""
+        """Insert a single vector with full VectorRecord support.
+
+        v1's exact positional signature (round-2 review: v2 had ``upsert``
+        as the 5th positional — a positional timestamp caller would have
+        silently performed an UPSERT) and v1's None-tolerance: absent
+        fields are auto-generated by the model, explicit ``None`` is
+        treated as absent.
+
+        Wire honesty note (round-2 review, wire-captured): the v2 REST
+        contract (``ProximaRecordInput``) carries only id/vector/props/
+        text_fields — timestamp/TTL/version/source are set on the SDK
+        record (embedded/local paths consume them) but are dropped at the
+        REST transport boundary. v1's REST path dropped them at the same
+        boundary; a wire-level TTL is a server-contract gap to file, not
+        an SDK regression.
+        """
+        record_fields: dict[str, Any] = {}
+        if timestamp_ms is not None:
+            record_fields["timestamp_ms"] = timestamp_ms
+        if updated_at_ms is not None:
+            record_fields["updated_at_ms"] = updated_at_ms
+        if expires_at_ms is not None:
+            record_fields["expires_at_ms"] = expires_at_ms
+        if version is not None:
+            record_fields["version"] = version
+        if source is not None:
+            record_fields["source"] = source
+        # Sequence coercion: pydantic accepts lists/tuples, but the ndarray
+        # branch must also accept any array-like (round-2 review: tuples
+        # crashed on .tolist).
+        if not isinstance(vector, list):
+            vector = np.asarray(vector).tolist()
         record = VectorRecord(
             id=vector_id,
-            vector=vector if isinstance(vector, list) else vector.tolist(),
+            vector=vector,
             metadata=metadata or {},
+            **record_fields,
         )
 
         if upsert:
@@ -417,6 +598,21 @@ class ProximaDBClient:
 
         query_vector = vector if isinstance(vector, list) else vector.tolist()
 
+        # v1 parity (round-2 review): v1's REST path stripped the hint-style
+        # kwargs the transport does not accept before delegating — forwarding
+        # them raw made v2 raise TypeError where v1 callers worked. Strip the
+        # same set; the rest (optimization_level, quantization_level, …) are
+        # real transport params.
+        _REST_UNSUPPORTED = {
+            "optimization_hints",
+            "enable_two_stage_search",
+            "quantization_hint",
+            "candidate_multiplier",
+            "enable_parallel_search",
+        }
+        filtered_kwargs = {
+            k: v for k, v in kwargs.items() if k not in _REST_UNSUPPORTED
+        }
         return self._adapter.search(
             collection_id=collection_id,
             query_vector=query_vector,
@@ -424,7 +620,7 @@ class ProximaDBClient:
             filter=metadata_filter,
             include_vectors=include_vectors,
             include_metadata=include_metadata,
-            **kwargs,
+            **filtered_kwargs,
         )
 
     def search_single(
@@ -522,7 +718,13 @@ class ProximaDBClient:
         return {}
 
     def get_performance_info(self) -> dict[str, Any]:
-        """Get performance information about the active protocol."""
+        """Get performance information about the active protocol.
+
+        The ``serialization``/``transport`` keys are v1's public response
+        shape — the swap review caught v2 returning only
+        ``protocol``/``advantages``, breaking consumers of the documented
+        contract.
+        """
         if self._protocol == Protocol.GRPC:
             return {
                 "protocol": "gRPC",
@@ -531,6 +733,8 @@ class ProximaDBClient:
                     "HTTP/2 multiplexing",
                     "Better type safety",
                 ],
+                "serialization": "Binary Protocol Buffers",
+                "transport": "HTTP/2",
             }
         elif self._protocol == Protocol.REST:
             return {
@@ -540,6 +744,8 @@ class ProximaDBClient:
                     "Easy debugging",
                     "Human-readable JSON",
                 ],
+                "serialization": "JSON",
+                "transport": "HTTP/1.1",
             }
         else:
             return {
@@ -549,6 +755,8 @@ class ProximaDBClient:
                     "Direct memory access",
                     "Lowest overhead",
                 ],
+                "serialization": "In-memory objects",
+                "transport": "Direct",
             }
 
     # ==========================================================================

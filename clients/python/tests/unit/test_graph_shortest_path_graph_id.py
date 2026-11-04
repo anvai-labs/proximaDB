@@ -27,7 +27,10 @@ if not proximadb_sdk.__file__.startswith(str(Path(__file__).resolve().parents[2]
         allow_module_level=True,
     )
 
-from proximadb_sdk import GraphAnalytics, Protocol, ProximaDBClient  # noqa: E402
+from proximadb_sdk import GraphAnalytics, Protocol  # noqa: E402
+from proximadb_sdk.unified_client import (  # noqa: E402; the v1 client — this file pins v1's dispatch shapes
+    ProximaDBClient,
+)
 
 
 class _RestTransport:

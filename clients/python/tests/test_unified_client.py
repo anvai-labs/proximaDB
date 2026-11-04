@@ -22,6 +22,11 @@ from proximadb_sdk import (
     VectorRecord,
 )
 
+# TD-SDK-3 swap: the package-level ProximaDBClient is the v2 client. The
+# proto-conversion helpers below are v1 internals — import the v1 client
+# explicitly to keep pinning them.
+from proximadb_sdk.unified_client import ProximaDBClient as ProximaDBClientV1
+
 
 def test_protocol_selection():
     """Test that protocol selection works correctly"""
@@ -99,7 +104,7 @@ def test_vector_record_creation():
 def test_type_conversion_helpers():
     """Test type conversion between proto and Pydantic"""
 
-    client = ProximaDBClient(url="http://localhost:5678", protocol=Protocol.REST)
+    client = ProximaDBClientV1(url="http://localhost:5678", protocol=Protocol.REST)
 
     # Test distance metric conversion
     assert client._proto_to_pydantic_distance_metric(1) == "cosine"

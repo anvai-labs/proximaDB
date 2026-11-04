@@ -15,6 +15,7 @@ import math
 import re
 import sys
 import time
+import warnings
 from typing import Any, Union
 
 import httpx
@@ -197,6 +198,17 @@ class ProximaDBClient:
                 protocol="auto"  # Selects gRPC for performance, REST as fallback
             )
         """
+        # TD-SDK-3 swap (2026-11-03): the package-level ProximaDBClient is
+        # the v2 client; this class is the legacy export
+        # (``ProximaDBClientLegacy``) for one minor release.
+        warnings.warn(
+            "ProximaDBClientLegacy (the v1 unified client) is deprecated — "
+            "the package-level ProximaDBClient is the v2 client (method "
+            "parity is census-pinned). See TD-SDK-3.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+
         # Convert port_mode to enum if string
         if isinstance(port_mode, str):
             port_mode = PortMode(port_mode.lower())
