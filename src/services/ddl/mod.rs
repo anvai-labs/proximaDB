@@ -2150,6 +2150,16 @@ impl DdlService {
                 AlterTableChange::SetTableOption { key, value } => {
                     // TD-COMPACT-2b: validate cache.* keys at SET time so a
                     // typo fails immediately rather than silently doing nothing.
+                    // TD-COMPACT-15: validate compaction.* keys at SET time.
+                    if key.trim().to_ascii_lowercase().starts_with("compaction.") {
+                        let mut probe = std::collections::HashMap::new();
+                        probe.insert(key.clone(), value.clone());
+                        if let Err(error) =
+                            proximadb_storage_common::validate_compaction_properties(&probe)
+                        {
+                            anyhow::bail!("invalid compaction property: {error}");
+                        }
+                    }
                     if key.trim().to_ascii_lowercase().starts_with("cache.") {
                         let mut probe = std::collections::HashMap::new();
                         probe.insert(key.clone(), value.clone());
