@@ -1,0 +1,255 @@
+= TD-COMPACT-15: Consolidate compaction strategy — policy-driven segment-size targeting
+:status: Accepted
+:date: 2026-11-03
+:tags: [compaction, lsm, policy, performance]
+
+== Problem
+
+The leveled compaction policy never merges across levels and never triggers
+on single files per level. A 3M-vector bed settles at L1+L2+L5 (3
+stranded segments), each paying its own header/footer/probe overhead per
+query (~61 GETs/q cold on the f32 bed). The ONLY way to collapse them
+today is the manual `COMPACT TABLE FULL` (#2339).
+
+For read-heavy collections, the segment count IS the query-cost dial:
+each segment adds header, footer, probe and coalescing overhead. Operators
+need a way to say "keep this collection at ~2 segments" and have the
+system maintain that automatically.
+
+== Observed evidence
+
+* The f32 bed (3M vectors, ~2.6 GB) settles at 3 segments (L1+L2+L5).
+* The compaction policy CANNOT merge them: cross-level is out of scope,
+  and pairs at each level don't meet the count threshold.
+* `COMPACT TABLE FULL` CAN merge them (verified by #2339's tests).
+* The pre-#2407 FULL implementation paired the two LARGEST segments
+  (O(N×D) write amplification); smallest-first GROUPING is O(D) —
+  a 3.6× improvement (see §Smallest-first grouping; the ordering alone
+  accounts for 2.0×, the group for the rest).
+
+== Design
+
+=== Strategy enum
+
+`compaction.strategy` — per-collection property, same resolution chain as
+the cache policy:
+
+```
+collection property > server [storage.compaction_config] > code default
+```
+
+| value | behavior | best for |
+|---|---|---|
+| `hybrid` (default) | current leveled policy | write-heavy |
+| `consolidate` | merge smallest-first to target | read-heavy, batch-loaded |
+
+=== Consolidate strategy
+
+After every flush publish:
+1. Discover live segments across ALL levels (same as FULL)
+2. If count ≤ `compaction.target_segments`, stop
+3. Sort by size **ascending** — greedily group the smallest segments
+   whose combined size reaches `compaction.target_file_size_mb`
+4. Each group merges to ONE output of ~target_file_size (the output's
+   level is the level of the largest input — a tier hint, not a gate)
+5. The target segment count is DERIVED (bytes and MB kept consistent —
+   as implemented with `div_ceil` in the flush arm):
+   `target_segments = ceil(total_bytes / (target_file_size_mb × 2^20))`
+6. If a group exceeds the memory admission budget, take fewer (the
+   smallest that fit); repeat next flush
+
+The `target_file_size_mb` knob (not an explicit segment count) is the
+primary dial because it produces uniform segments — each a predictable
+I/O unit for reads, prefetch and cache warming. A `target_segments`
+override exists for the "exactly 1 segment" case but is secondary.
+
+**Why target_file_size, not target_segments:**
+- Count-only degenerates into a geometric size ladder (merge 2 smallest
+  → medium → merge with next → etc.), not uniform segments
+- Count-only with target=1 on a large collection means rewriting the
+  entire dataset per flush (catastrophic write amplification)
+- Size-based grouping bounds the rewrite per merge to target_file_size
+- Each segment becomes a predictable I/O unit (read, warm, prefetch in
+  target_file_size chunks — aligned with the cache-policy region groups)
+
+=== Smallest-first grouping (the write-amplification fix)
+
+The current FULL implementation pairs the two LARGEST segments (N−1
+merges, O(N×D) bytes). Two separate improvements, with distinct gains —
+for files [100, 200, 400, 800, 1600] MB, target=1:
+
+```
+largest-first pairwise:  4 merges, 11,300 MB rewritten
+smallest-first pairwise: 4 merges,  5,600 MB rewritten   (2.0×)
+smallest-first GROUP:    1 merge,   3,100 MB rewritten   (3.6×)
+```
+
+* **Ordering alone (smallest-first, still pairwise)** yields 2.0×:
+  300 + 700 + 1500 + 3100 = 5,600 MB — each merge output feeds the next.
+* **The GROUP is the load-bearing half**: greedily accumulating the
+  smallest inputs into ONE multi-way merge reaching the target rewrites
+  each input exactly once (3,100 MB). #2407's `compact_collection_full`
+  implements the greedy group, which is where the 3.6× comes from —
+  ascending sort without grouping does not deliver it.
+
+This also means:
+* The admission budget is rarely the bottleneck (the smallest group
+  always fits)
+* The output of merging small files is small — it naturally cascades
+  upward through subsequent merges (no explicit "promote at size X" logic)
+* No file is ever "stuck between levels" — there ARE no level boundaries
+  in the merge decision
+
+=== The natural cascade IS the promotion
+
+```
+[L0:100, L0:100, L0:100] → merge → [L0:280]
+[L0:280, L0:128]         → merge → [L1:408]     (level of largest input)
+   (a new flush publishes [L1:280])
+[L1:408, L1:280]         → merge → [L2:688]     (cross-level is fine)
+[L2:688, L5:2000]        → merge → [L5:2688]    (biggest wins)
+```
+
+No "minimum size for next level" rule — that would REINTRODUCE the
+stranded-file problem this strategy exists to solve.
+
+=== Write-amplification guardrail
+
+A tenant setting `target_segments=1` on a 1 TB write-heavy collection
+would rewrite the entire 1 TB on every flush. The guardrail:
+* Project the write amplification (total_bytes / flush_size)
+* If > a configurable threshold (default 100×), log a warning and
+  degrade to `hybrid` for that collection
+* The degradation is reported in the collection's status
+
+=== Property surface — as implemented (#2407)
+
+Resolution is layered like the cache policy (TD-COMPACT-2b), but only the
+tag channel is resolved at flush time today:
+
+```
+flush trigger:  TAG `compaction.strategy:consolidate` (resolve_strategy_from_tags)
+                  — the `compaction:off` tag disarms everything (wins first)
+server TOML:     [storage.compaction_config] consolidate_target_file_size_mb (512),
+                  consolidate_write_amp_limit (100) — knobs only, NO strategy field
+code default:    hybrid (the current behavior)
+```
+
+Live surfaces:
+* Collection tag `compaction.strategy:consolidate` (the resolved channel)
+* `ALTER TABLE t SET ('compaction.*')` — validated at SET time
+  (`validate_compaction_properties`; unknown keys/values rejected)
+* Server TOML knobs above
+
+NOTE: the legacy `[storage.compaction_config] strategy` field is the
+count|size level heuristic (`compaction_utils.rs`) — setting it to
+`consolidate` is dead config (falls through the `_` arm to count/size).
+Do not use it for this strategy; a dedicated server-level default needs
+its own field if ever wanted.
+
+Wiring follow-up (open): `resolve_strategy_from_properties` is exported
+but has no caller — the `compaction.strategy` PROPERTY is validated at
+SET yet not resolved at flush, so property-only configuration is inert
+until the property channel is plumbed into the flush trigger (or
+properties are bridged to tags at collection load).
+
+=== Interaction with COMPACT TABLE FULL
+
+* FULL always works regardless of strategy (it's an operator override)
+* FULL should use smallest-first (the fix applies to both paths)
+* The consolidate strategy is FULL automated + policy-driven
+
+== Considered and deferred
+
+* **Per-level overrides** (`compaction.L1.target=2`): over-engineering;
+  users shouldn't need LSM internals knowledge; the collection-level
+  strategy + target captures the intent.
+* **Runtime hot-reload**: restart-based config is fine for MVP; a
+  hot-reload mechanism is a separate infrastructure concern.
+* **Adaptive advisor**: the `CachePolicyAdvisor` seam (TD-COMPACT-2b)
+  can eventually recommend the strategy from observed Q/W ratios; the
+  seam exists, the implementation is future work.
+* **Idle-time trigger**: for batch-loaded collections (write burst then
+  read-heavy), a "compact after N seconds of write idle" trigger; defer
+  until there's demand.
+
+== Experiments
+
+=== 1. S=1 collapse — MEASURED (2026-11-04T04:51-05:26 UTC; filed 2026-11-03 local)
+
+The settled f32 bed (p5e-f32ev-build, 3M vectors, 2.60 GB, Region E +
+cat3 filter, 1000 queries) measured as-settled (L1+L2+L5 = 3 segments)
+versus collapsed to 1 segment via COMPACT FULL — same bed, same objects,
+byte-identical rows/model/queries (harness `--skip-ingest` +
+`--compact-full-before-measure`, which compacts through Arrow Flight
+inside the harness and re-settles before measuring):
+
+[cols="1,4,4,3,3", options="header"]
+|===
+| phase | metric | S=3 (settled) | S=1 (collapsed) | delta
+| post_write | GETs/query | 53.47 | 18.31 | -65.8%
+| post_write | $/M queries | 21.47 | 7.35 | -65.8%
+| post_write | p50 | 458.30 ms | 147.14 ms | -67.9%
+| local_disk_warm | GETs/query | 53.41 | 18.05 | -66.2%
+| local_disk_warm | $/M queries | 21.44 | 7.26 | -66.1%
+| object_cold | GETs/query | 61.32 | 45.63 | -25.6%
+| object_cold | $/M queries | 24.58 | 18.29 | -25.6%
+| all phases | recall@10 | 0.983-0.985 | 0.978-0.982 | -0.3..-0.5pp (gate >= 0.97 held)
+|===
+
+* The compact itself is byte-neutral: 2,604,342,955 -> 2,603,536,050
+  bytes (-0.03%) for 3 -> 1 segments.
+* Warm-path improvement (−66%) is larger than object-cold (−26%): cold
+  runs still pay the centroid-directory/A0 loads, while the per-segment
+  footer/probe overhead disappears entirely.
+* One merged directory: cells/query 70.66 -> 21.00 (three per-segment
+  directories become one).
+* Recall dips 0.3-0.5pp — the known clustering-geometry effect of
+  directory retraining at merge, within the f32-baseline tolerance.
+
+Build-time corroboration (e1f beds, 2026-10-27, separate builds,
+unfiltered): S=1 23.6 / S=2 41.7 / S=3 49.9 GETs/query object-cold —
+the same shape from a different construction path.
+
+Conclusion: **the segment count IS the dominant query-cost dial**; the
+consolidate strategy automates exactly this collapse.
+
+=== 2. Smallest vs largest — open
+
+Run both orders on the f32 bed, compare write amplification and total
+time (the 3.6x claim in <<Smallest-first,§Smallest-first>> is analysis,
+not yet measured end-to-end).
+
+=== 3. Various targets — partially measured
+
+Build-time S=1/2/3/4 curve above; the compact-path curve (S=1, S=2 on
+the same collapsed bed) is open. NOTE: the compact path currently has
+no target plumbing — the Flight `compact_collection` body carries only
+`full` (collapses to the `full_target_segments` default of 1) — so an
+S=2 arm needs either a `target_segments` body field or the wired
+`compaction.*` property channel, not just `--max-segments 2`.
+
+=== 4. Write-heavy stress — open
+
+Verify the guardrail prevents the 1 TB rewrite catastrophe.
+
+== Relations
+
+* #2339 / TD-COMPACT-14 — COMPACT TABLE FULL, the manual override; this
+  TD automates it (and #2407 applies smallest-first grouping to the same
+  merge machinery)
+* TD-COMPACT-10 — the L2 segment-consolidation gap; its 1/2/3-segment
+  GET table is the prior this experiment's S=1/S=2/S=3 curve confirms
+* TD-WLP-2 — the per-collection compaction TAG cascade
+  (`compaction:on|off`, `l0_threshold:N`); this TD's strategy rides the
+  same tag channel (off always wins), and the SET-time-validated
+  `compaction.*` properties are the second surface — see the wiring
+  note in <<Property surface>>
+* TD-RDSTRAT-9 — the collection read-cost envelope; the natural future
+  advisor for choosing the strategy from observed Q/W (rather than the
+  CachePolicyAdvisor seam guessed at below)
+* #2384/#2397/#2400/#2405 — the cache-policy property chain (same
+  resolution pattern)
+* TD-TIER-1 E1 — the fragment ladder (the admission ceiling analysis
+  that identified the compaction-policy gap)
+* ADR-076 / ADR-086 / ADR-088 — the compaction admission framework
