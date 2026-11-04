@@ -572,6 +572,16 @@ impl PersistentByteStore {
         // the per-entry pin/unpin work below runs only on entries matching a
         // changed prefix — the 3-pass sweep under this mutex is what the
         // admission cadence was paying for.
+        // Review NIT-5: an EMPTY diff (the identical re-registration every
+        // registry open fires) has nothing to reconcile — skip the O(entries)
+        // scan under the protection mutex entirely.
+        if changed_prefixes.is_empty() {
+            return ProtectionSweep {
+                protected: 0,
+                unprotected: 0,
+                skipped_over_budget: 0,
+            };
+        }
         let scoped: Vec<(String, Arc<EntryMeta>)> = self
             .inner
             .entries
