@@ -997,6 +997,42 @@ pub struct CompactionConfig {
     /// the entire collection per flush).
     #[serde(default = "default_consolidate_write_amp_limit")]
     pub consolidate_write_amp_limit: u64,
+    /// TD-COMPACT-15: the server-level DEFAULT compaction strategy for
+    /// collections that set neither the `compaction.strategy` property nor
+    /// a tag — `"hybrid"` or `"consolidate"`. `None` keeps the code default
+    /// (hybrid). Resolution: collection property > tag > this > code.
+    #[serde(default)]
+    pub consolidate_strategy: Option<String>,
+}
+
+impl CompactionConfig {
+    /// Validate strategy fields fail-closed: an unknown value must abort
+    /// startup with an actionable message, never silently fall back (the
+    /// dead-config failure mode TD-COMPACT-9 documented). The legacy
+    /// `strategy` field drives the count/size level heuristic; it is NOT
+    /// the consolidate/hybrid switch — reject the common mistake of
+    /// setting `strategy = "consolidate"` there.
+    pub fn validate(&self) -> Result<(), String> {
+        let legacy = self.strategy.trim().to_ascii_lowercase();
+        if !matches!(legacy.as_str(), "count" | "size" | "hybrid") {
+            return Err(format!(
+                "storage.compaction_config.strategy must be 'count', 'size' or 'hybrid' \
+                 (got '{}'); the consolidate strategy is selected via \
+                 consolidate_strategy or the per-collection compaction.strategy property",
+                self.strategy
+            ));
+        }
+        if let Some(strategy) = &self.consolidate_strategy {
+            let value = strategy.trim().to_ascii_lowercase();
+            if !matches!(value.as_str(), "hybrid" | "consolidate") {
+                return Err(format!(
+                    "storage.compaction_config.consolidate_strategy must be 'hybrid' or \
+                     'consolidate' (got '{strategy}')"
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Default for CompactionConfig {
@@ -1024,6 +1060,7 @@ impl Default for CompactionConfig {
             full_timeout_ms: default_full_timeout_ms(),
             consolidate_target_file_size_mb: default_consolidate_target_file_size_mb(),
             consolidate_write_amp_limit: default_consolidate_write_amp_limit(),
+            consolidate_strategy: None,
         }
     }
 }
@@ -1292,6 +1329,57 @@ fn parse_bool_flag(raw: &str, env_name: &str) -> anyhow::Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compaction_strategy_validation_fails_closed() {
+        // Valid legacy values pass, including the default.
+        for strategy in ["count", "size", "hybrid", "Hybrid"] {
+            let config = CompactionConfig {
+                strategy: strategy.to_string(),
+                ..Default::default()
+            };
+            assert!(config.validate().is_ok(), "expected '{strategy}' valid");
+        }
+        // The common dead-config mistake: 'consolidate' in the legacy field.
+        let config = CompactionConfig {
+            strategy: "consolidate".to_string(),
+            ..Default::default()
+        };
+        let error = config.validate().unwrap_err();
+        assert!(
+            error.contains("consolidate_strategy"),
+            "error should point at the right knob: {error}"
+        );
+        // Typos fail too — no silent `_` fallback at boot.
+        assert!(
+            CompactionConfig {
+                strategy: "hybrd".to_string(),
+                ..Default::default()
+            }
+            .validate()
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn consolidate_strategy_field_validated_and_default_none() {
+        assert!(CompactionConfig::default().consolidate_strategy.is_none());
+        for value in ["hybrid", "consolidate", "Consolidate"] {
+            let config = CompactionConfig {
+                consolidate_strategy: Some(value.to_string()),
+                ..Default::default()
+            };
+            assert!(config.validate().is_ok(), "expected '{value}' valid");
+        }
+        assert!(
+            CompactionConfig {
+                consolidate_strategy: Some("aggressive".to_string()),
+                ..Default::default()
+            }
+            .validate()
+            .is_err()
+        );
+    }
 
     #[test]
     fn hardware_defaults_match_root_runtime_expectations() {

@@ -3347,6 +3347,11 @@ async fn ensure_collection_exists(
 pub struct CompactRequest {
     #[serde(default)]
     pub full: bool,
+    /// TD-COMPACT-15 Experiment 3: per-request override of the FULL
+    /// collapse target (`[storage.compaction_config] full_target_segments`).
+    /// Ignored when `full` is false; must be > 0.
+    #[serde(default)]
+    pub target_segments: Option<usize>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -3358,6 +3363,10 @@ pub struct CompactResponse {
     pub passes: Option<usize>,
     pub reached_target: Option<bool>,
     pub stop_reason: Option<String>,
+    pub pending_files: Option<usize>,
+    pub bytes_read: Option<u64>,
+    pub bytes_written: Option<u64>,
+    pub duration_ms: Option<u64>,
 }
 
 pub async fn post_collection_compact_v2(
@@ -3385,11 +3394,18 @@ pub async fn post_collection_compact_v2(
     else {
         return Err(ApiError::CollectionNotFound(collection_id.clone()));
     };
-    let full = body.map(|Json(request)| request.full).unwrap_or(false);
+    let (full, target_segments) = body
+        .map(|Json(request)| (request.full, request.target_segments))
+        .unwrap_or((false, None));
+    if target_segments.is_some_and(|t| t == 0) {
+        return Err(ApiError::InvalidArgument(
+            "target_segments must be greater than zero".to_string(),
+        ));
+    }
     let result = state
         .vector_operations_service
         .unified_engine()
-        .compact_collection_full(&collection.id, Some(&collection), full)
+        .compact_collection_full(&collection.id, Some(&collection), full, target_segments)
         .await
         .map_err(|e| ApiError::Internal(format!("compaction: {e}")))?;
     let metric = |key: &str| {
@@ -3398,6 +3414,12 @@ pub async fn post_collection_compact_v2(
             .get(key)
             .and_then(|value| value.as_u64())
             .map(|value| value as usize)
+    };
+    let metric_u64 = |key: &str| {
+        result
+            .engine_metrics
+            .get(key)
+            .and_then(|value| value.as_u64())
     };
     Ok(Json(CompactResponse {
         collection_id,
@@ -3413,6 +3435,10 @@ pub async fn post_collection_compact_v2(
             .engine_metrics
             .get("stop_reason")
             .and_then(|value| value.as_str().map(str::to_string)),
+        pending_files: metric("pending_files"),
+        bytes_read: metric_u64("bytes_read"),
+        bytes_written: metric_u64("bytes_written"),
+        duration_ms: metric_u64("duration_ms"),
     }))
 }
 

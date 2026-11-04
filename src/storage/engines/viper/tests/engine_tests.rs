@@ -659,6 +659,7 @@ mod tests {
 
         // Trigger compaction
         let compact_params = crate::storage::traits::CompactionParameters {
+            full_target_segments: None,
             full: false,
             collection_id: Some(collection_id.to_string()),
             force: true,

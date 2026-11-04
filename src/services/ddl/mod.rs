@@ -508,6 +508,10 @@ pub struct CompactSummary {
     pub passes: Option<usize>,
     pub reached_target: Option<bool>,
     pub stop_reason: Option<String>,
+    pub pending_files: Option<usize>,
+    pub bytes_read: Option<u64>,
+    pub bytes_written: Option<u64>,
+    pub duration_ms: Option<u64>,
 }
 
 impl CompactSummary {
@@ -533,6 +537,12 @@ impl CompactSummary {
                 .map(|v| v as usize),
             reached_target: metric("reached_target").and_then(|v| v.as_bool()),
             stop_reason: metric("stop_reason").and_then(|v| v.as_str().map(str::to_string)),
+            pending_files: metric("pending_files")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize),
+            bytes_read: metric("bytes_read").and_then(|v| v.as_u64()),
+            bytes_written: metric("bytes_written").and_then(|v| v.as_u64()),
+            duration_ms: metric("duration_ms").and_then(|v| v.as_u64()),
         }
     }
 }
@@ -837,15 +847,24 @@ impl DdlService {
                     .segments_after
                     .map(|value| value.to_string())
                     .unwrap_or_else(|| "?".to_string());
+                // TD-COMPACT-15: measured I/O + why the loop stopped — the
+                // provenance an operator needs to trust the message.
+                let io_note = match (summary.bytes_read, summary.bytes_written) {
+                    (Some(read), Some(written)) => format!(
+                        ", {read} read / {written} written in {}ms",
+                        summary.duration_ms.unwrap_or(0)
+                    ),
+                    _ => String::new(),
+                };
+                let stop_note = match (&summary.stop_reason, summary.reached_target) {
+                    (Some(reason), _) => format!(" (stopped: {reason})"),
+                    (None, Some(false)) => " (stopped before target)".to_string(),
+                    _ => String::new(),
+                };
                 Ok(DdlResult::success(format!(
                     "Compacted table '{name}' (full={full}): {before} -> {after} segments \
-                     in {} passes{}",
+                     in {} passes{stop_note}{io_note}",
                     summary.passes.unwrap_or(0),
-                    if summary.reached_target == Some(false) {
-                        " (stopped before target)"
-                    } else {
-                        ""
-                    },
                 )))
             }
             DdlStatement::MaterializeTable { name } => {
@@ -2769,6 +2788,10 @@ mod tests {
                 passes: Some(2),
                 reached_target: Some(true),
                 stop_reason: None,
+                pending_files: None,
+                bytes_read: None,
+                bytes_written: None,
+                duration_ms: None,
             })
         }
     }

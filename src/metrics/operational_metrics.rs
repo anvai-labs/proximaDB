@@ -251,6 +251,15 @@ lazy_static! {
         "proximadb_consolidate_degraded_total",
         "Consolidate strategy degradations to hybrid (write-amp guardrail, TD-COMPACT-15)",
     );
+    /// TD-COMPACT-15: outcome of each COMPACT FULL request, by stop reason
+    /// (`completed` = reached target with passes, `at_target` = no-op, else
+    /// the engine's stop reason: max_passes / deadline / axis_pending /
+    /// contended / no_progress).
+    pub static ref COMPACTION_FULL_STOP: Option<IntCounterVec> = counter_vec(
+        "proximadb_compaction_full_stop_total",
+        "COMPACT FULL request outcomes by stop reason (TD-COMPACT-15)",
+        &["reason"],
+    );
     pub static ref COMPACTION_QUEUE_DEPTH: IntGauge = gauge(
         "proximadb_compaction_queue_depth",
         "Compaction tasks queued across all collections",

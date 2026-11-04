@@ -254,11 +254,31 @@ impl UnifiedStorageFormat for SstEngine {
                     vector_quant,
                     access_tier,
                     timeout,
+                    params.full_target_segments,
                 )
                 .await?;
+            // TD-COMPACT-15: one observation per FULL request — the first
+            // place pass outcomes are counted. `None` means the engine
+            // finished at/below target: distinguish a real collapse from a
+            // no-op so the counter is diagnosable.
+            let stop_label = summary
+                .stop_reason
+                .unwrap_or(if summary.passes_executed > 0 {
+                    "completed"
+                } else {
+                    "at_target"
+                });
+            if let Some(stop_metric) =
+                crate::metrics::operational_metrics::COMPACTION_FULL_STOP.as_ref()
+            {
+                stop_metric.with_label_values(&[stop_label]).inc();
+            }
             return Ok(CompactionResult {
                 success: true,
                 collections_affected: vec![collection_id],
+                bytes_read: Some(summary.bytes_read),
+                bytes_written: Some(summary.bytes_written),
+                duration_ms: Some(summary.duration_ms),
                 completed_at: chrono::Utc::now(),
                 engine_metrics: HashMap::from([
                     ("full".to_string(), serde_json::json!(true)),
@@ -285,6 +305,18 @@ impl UnifiedStorageFormat for SstEngine {
                     (
                         "pending_files".to_string(),
                         serde_json::json!(summary.pending_files),
+                    ),
+                    (
+                        "bytes_read".to_string(),
+                        serde_json::json!(summary.bytes_read),
+                    ),
+                    (
+                        "bytes_written".to_string(),
+                        serde_json::json!(summary.bytes_written),
+                    ),
+                    (
+                        "duration_ms".to_string(),
+                        serde_json::json!(summary.duration_ms),
                     ),
                 ]),
                 ..Default::default()

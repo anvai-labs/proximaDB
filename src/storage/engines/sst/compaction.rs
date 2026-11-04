@@ -266,6 +266,12 @@ pub struct SstCompactionTask {
     /// object, resolved by the task producer from the collection config.
     /// `None` = the account default (also what config-free producers set).
     pub access_tier: Option<proximadb_storage_filesystem_types::ObjectAccessTier>,
+    /// TD-COMPACT-15: set by FULL passes that carry an operator-pinned
+    /// `target_segments` — the request's own loop drives the remaining
+    /// passes, so the worker's background follow-up chain stands down for
+    /// this task (it would merge below the requested count and undo the
+    /// operator's stop point).
+    pub suppress_follow_up: bool,
 }
 
 impl SstCompactionTask {
@@ -421,10 +427,12 @@ pub enum CompactionPriority {
 
 /// Terminal outcome of one scheduled compaction morsel, keyed by its output
 /// path; written by the worker, consumed (removed) by the FULL collapse loop
-/// so declines and failures surface typed instead of silent.
+/// so declines and failures surface typed instead of silent. `Completed`
+/// carries the morsel's measured bytes so the FULL summary reports real
+/// I/O, not estimates.
 #[derive(Debug, Clone)]
 pub enum PassOutcome {
-    Completed,
+    Completed { bytes_read: u64, bytes_written: u64 },
     Declined(&'static str),
     Failed(String),
 }
@@ -438,6 +446,12 @@ pub struct FullCompactionSummary {
     pub reached_target: bool,
     pub stop_reason: Option<&'static str>,
     pub pending_files: usize,
+    /// Measured across all completed passes (TD-COMPACT-15 provenance).
+    pub bytes_read: u64,
+    pub bytes_written: u64,
+    /// Wall-clock duration of the whole request, including discovery and
+    /// inter-pass quiescence waits.
+    pub duration_ms: u64,
 }
 
 /// Backwards-compat alias for [`SstCompactionStats`].
@@ -1242,14 +1256,21 @@ impl Compaction {
         vector_quant: Option<proximadb_block_format::VectorQuant>,
         access_tier: Option<proximadb_storage_filesystem_types::ObjectAccessTier>,
         timeout: std::time::Duration,
+        target_override: Option<usize>,
     ) -> Result<FullCompactionSummary> {
         use crate::storage::common::compaction_memory::current_compaction_input_budget;
         use crate::storage::common::compaction_utils::CompactionFileDiscovery;
 
+        let started = std::time::Instant::now();
         let cfg = self.config.compaction_config.clone().unwrap_or_default();
-        let target = cfg.full_target_segments.max(1);
+        // Per-request override (TD-COMPACT-15 Experiment 3): the API layer
+        // validates > 0; clamp defensively regardless.
+        let target = target_override
+            .map(|t| t.max(1))
+            .unwrap_or(cfg.full_target_segments.max(1));
         let max_passes = cfg.full_max_passes.max(1);
-        let deadline = std::time::Instant::now() + timeout;
+        let deadline = started + timeout;
+        let (mut total_bytes_read, mut total_bytes_written) = (0u64, 0u64);
 
         let collection_path = collection_dir.to_string_lossy().to_string();
         let collection_id_text = collection_object_id.to_string();
@@ -1304,9 +1325,19 @@ impl Compaction {
             // the ascending-sorted list until the combined size reaches the
             // target file size (producing uniform segments) or the
             // admission budget is hit. At least 2 segments are needed.
+            // The count target CAPS the group: merging g inputs leaves
+            // live - g + 1 segments, so taking more than live - target + 1
+            // inputs would overshoot BELOW the requested count (more write
+            // amplification than the operator asked for). With target=1 the
+            // cap is the whole list — the S=1 collapse behavior.
+            let live = pair.len();
+            let max_group_inputs = live.saturating_sub(target).saturating_add(1);
             let mut group: Vec<(String, u64, u32)> = Vec::new();
             let mut group_bytes: u64 = 0;
             for seg in &pair {
+                if group.len() >= max_group_inputs {
+                    break;
+                }
                 let would_exceed = group_bytes + seg.1 > budget.max_input_bytes
                     && !group.is_empty()
                     && !cfg.spill_enabled;
@@ -1368,6 +1399,9 @@ impl Compaction {
                 rg_layout,
                 vector_quant,
                 access_tier,
+                // An operator-pinned target drives its own passes; the
+                // background follow-up would merge below the stop point.
+                suppress_follow_up: target_override.is_some(),
             };
             let output_key = task.output_file.to_string_lossy().to_string();
             if !self.schedule_compaction(task).await? {
@@ -1391,8 +1425,13 @@ impl Compaction {
                 )));
             }
             match self.take_pass_outcome(&output_key).await {
-                Some(PassOutcome::Completed) => {
+                Some(PassOutcome::Completed {
+                    bytes_read,
+                    bytes_written,
+                }) => {
                     passes += 1;
+                    total_bytes_read += bytes_read;
+                    total_bytes_written += bytes_written;
                     no_progress_rounds = 0;
                     // The worker's follow-up chain may have merged more; the
                     // next discovery reflects it.
@@ -1435,6 +1474,9 @@ impl Compaction {
             reached_target: after <= target,
             stop_reason,
             pending_files: files.pending_files.values().map(Vec::len).sum(),
+            bytes_read: total_bytes_read,
+            bytes_written: total_bytes_written,
+            duration_ms: started.elapsed().as_millis() as u64,
         })
     }
 
@@ -1544,6 +1586,7 @@ impl Compaction {
                 rg_layout: None,
                 vector_quant: None,
                 access_tier: None,
+                suppress_follow_up: false,
             }));
         }
 
@@ -1747,7 +1790,13 @@ impl Compaction {
                                     (stats_guard.avg_compaction_time_ms + elapsed_ms) / 2;
                             }
                         }
-                        (true, Some(PassOutcome::Completed))
+                        (
+                            true,
+                            Some(PassOutcome::Completed {
+                                bytes_read: compaction_stats.bytes_read,
+                                bytes_written: compaction_stats.bytes_written,
+                            }),
+                        )
                     }
                     Err(e) => {
                         error!(
@@ -1790,7 +1839,15 @@ impl Compaction {
                     task.level,
                     &task.output_file,
                 );
-                if succeeded
+                // TD-COMPACT-15: an operator-pinned FULL target drives its
+                // own passes — a follow-up morsel would merge below the
+                // requested stop point and undo it.
+                if task.suppress_follow_up {
+                    debug!(
+                        collection_object_id = task.collection_object_id,
+                        "Follow-up suppressed: operator-pinned FULL target owns the collapse"
+                    );
+                } else if succeeded
                     && !shutdown_signal.load(Ordering::SeqCst)
                     && let Some(collection_dir) = task.output_file.parent()
                 {
@@ -4070,6 +4127,7 @@ mod compaction_format_tests {
             rg_layout: None,
             vector_quant,
             access_tier: None,
+            suppress_follow_up: false,
         }
     }
 

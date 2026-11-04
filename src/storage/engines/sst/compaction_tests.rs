@@ -251,6 +251,7 @@ async fn test_compaction_task_scheduling() {
         rg_layout: None,
         vector_quant: None,
         access_tier: None,
+        suppress_follow_up: false,
     };
 
     assert!(manager.schedule_compaction(task).await.is_ok());
@@ -279,6 +280,7 @@ async fn td_compact6_schedule_dedups_same_output_at_enqueue() {
         rg_layout: None,
         vector_quant: None,
         access_tier: None,
+        suppress_follow_up: false,
     };
     assert!(manager.schedule_compaction(mk_task()).await.unwrap());
     // Second schedule for the same output file is deduped at enqueue (the
@@ -322,6 +324,7 @@ async fn compaction_morsel_admission_rejects_overlapping_inputs() {
         rg_layout: None,
         vector_quant: None,
         access_tier: None,
+        suppress_follow_up: false,
     };
 
     assert!(manager.schedule_compaction(task(1)).await.unwrap());
@@ -351,6 +354,7 @@ fn sc5_tier_task(output: &str, access_tier: Option<ObjectAccessTier>) -> Compact
         rg_layout: None,
         vector_quant: None,
         access_tier,
+        suppress_follow_up: false,
     }
 }
 
@@ -592,6 +596,7 @@ async fn td_compact6_worker_clears_training_in_flight_after_completion() {
         rg_layout: None,
         vector_quant: None,
         access_tier: None,
+        suppress_follow_up: false,
     };
     manager.schedule_compaction(task).await.unwrap();
 
@@ -735,6 +740,7 @@ async fn test_sst_compaction_expired_deletion_unit() -> anyhow::Result<()> {
         rg_layout: None,
         vector_quant: None,
         access_tier: None,
+        suppress_follow_up: false,
     };
 
     // Create config and perform compaction
@@ -1141,6 +1147,7 @@ async fn check_canonical_compaction_listing(
         rg_layout: None,
         vector_quant: None,
         access_tier: None,
+        suppress_follow_up: false,
     };
     if cancel_after_move {
         return assert_listing_after_cancelled_publication(
@@ -1363,6 +1370,7 @@ async fn check_local_spill_compaction_listing(
         rg_layout: None,
         vector_quant: None,
         access_tier: None,
+        suppress_follow_up: false,
     };
     let assert_no_task_scratch = |root: &std::path::Path| -> anyhow::Result<()> {
         for owner in std::fs::read_dir(root)? {
@@ -1890,6 +1898,7 @@ async fn spill_quant_fixture(
         rg_layout: None,
         vector_quant: Some(collection_quant),
         access_tier: None,
+        suppress_follow_up: false,
     };
     Ok(SpillQuantFixture {
         _root: root,
@@ -2078,6 +2087,7 @@ async fn tier_probe_read_error_aborts_and_keeps_exact_inputs() -> anyhow::Result
         rg_layout: None,
         vector_quant: None,
         access_tier: None,
+        suppress_follow_up: false,
     };
     let result = compaction
         .perform_compaction_enhanced(&task, &config, None, None)
@@ -2196,6 +2206,7 @@ async fn shared_model_gate_classifies_compaction_output_with_the_collection_mode
         rg_layout: None,
         vector_quant: None,
         access_tier: None,
+        suppress_follow_up: false,
     };
     compaction
         .perform_compaction_enhanced(&task, &config, None, None)

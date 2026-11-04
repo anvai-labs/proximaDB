@@ -411,6 +411,7 @@ async fn test_nova_compact_basic() {
 
     // Compact
     let compact_params = CompactionParameters {
+        full_target_segments: None,
         full: false,
         collection_id: Some(collection_id.to_string()),
         collection_config: Some(collection),
