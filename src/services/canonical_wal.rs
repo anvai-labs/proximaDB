@@ -2064,7 +2064,15 @@ async fn read_active_file(path: &Path) -> Result<Vec<CanonicalWalEntry>> {
             return Err(err).with_context(|| format!("opening canonical WAL {}", path.display()));
         }
     };
-    Ok(scan_wal_bytes(&bytes, path)?.entries)
+    // TD-WALBOOT-1: during a rotation the active file legitimately ends with
+    // a summary section (the seal writes it before the rename) — a reader
+    // racing that window must trim it, or it fails on section bytes as if
+    // they were a corrupt frame. Same structural trim the sealed reader uses.
+    let bytes: &[u8] = match split_summary_trailer(&bytes) {
+        Some((frames, _)) => frames,
+        None => &bytes,
+    };
+    Ok(scan_wal_bytes(bytes, path)?.entries)
 }
 
 /// Write `bytes` to a new file and fsync it.
