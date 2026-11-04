@@ -1,0 +1,41 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-BLOOM-1: SST global-bloom check is a stub shadowing the real bloom implementations
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open (2026-11-04). Filed from the post-program victor clone scan (cluster A2 bonus find).**
+| Priority | P2 — the stub can produce FALSE NEGATIVES (skip a file that contains the id) if any writer emits real bloom bytes; today it likely only misestimates, but nothing documents the contract.
+| Relates to | link:TD-SDKERR-1-python-sdk-hides-failures-and-drops-filters.adoc[TD-SDKERR-1] (same fake-implementation-shadows-real-primitive shape); format-migration discipline #8 in CLAUDE.md
+| Component | `crates/storage/proximadb-engine-core/src/proximablocks/sst_metadata.rs` (`check_bloom_simple`, used once inside `can_skip_file`), `src/storage/engines/sst/collections.rs` (neighboring prototype `check_bloom_filter`)
+| Evidence | `check_bloom_simple` is a 1-byte-probe placeholder ("In practice, would use proper bloom filter implementation") over `variable_data[bloom_filter_offset..+size]`. REAL bloom implementations exist and are unused on this path: `crates/foundation/proximadb-bloom` (`SstableBloomFilter`, builders, fpr sizing) and the re-export module `proximablocks/bloom_filter.rs`. The neighboring `collections.rs` path is also prototype-grade ("In a real implementation, this would…") and conservatively returns true.
+|===
+
+== Problem
+
+The SST read path decides `can_skip_file` using a fake bloom probe whose byte
+layout matches nothing specified. Whether it is merely crude or actively wrong
+depends on what the FLUSH path writes at `bloom_filter_offset` — which is
+itself undocumented on this path. A real `SstableBloomFilter` serialization
+read by the stub = systematic false negatives = silently missing vectors.
+
+== Proposed direction
+
+1. Trace the writer: what bytes land at `bloom_filter_offset` today (SST flush
+   path, `has_global_bloom` in `sst_format_types.rs`)? Three possible answers:
+   real-filter bytes (stub is WRONG), simple-scheme bytes (stub consistent but
+   crude), or nothing/no writer (dead path — delete the probe).
+2. If real bytes: replace the probe with the `proximadb-bloom` reader — mixed-
+   read-safe per discipline #8 (version/magic detection; legacy fallback when
+   the marker is absent), gated by round-trip + recall tests against the f32
+   baseline.
+3. If no writer exists: either build the writer (feature work, out of TD
+   scope) or delete the bloom branch of `can_skip_file` (conservative false,
+   honest) until one exists.
+
+== Non-goals
+
+Deduplicating bloom APIs across `proximadb-bloom` / `proximablocks/bloom_filter.rs`
+(see the victor scan backlog); changing any persisted format without the
+migration discipline.

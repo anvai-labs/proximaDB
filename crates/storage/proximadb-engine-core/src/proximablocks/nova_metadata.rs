@@ -14,6 +14,8 @@ use proximadb_storage_common::zero_copy_traits::{
 use proximadb_kernel::error::ProximaDBError;
 use proximadb_storage_ports::FilesystemPort;
 
+use super::utilities::{ids_outside_all_ranges, stable_id_hash};
+
 /// NOVA file footer information (bytemuck compatible)
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
@@ -241,12 +243,7 @@ impl EngineMetadata for NovaMetadata {
 impl NovaMetadata {
     /// Hash an ID for range comparison
     fn hash_id(&self, id: &str) -> u64 {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-
-        let mut hasher = DefaultHasher::new();
-        id.hash(&mut hasher);
-        hasher.finish()
+        stable_id_hash(id)
     }
 
     /// Get required column groups for a query
@@ -1003,15 +1000,12 @@ impl MetadataSerializer for NovaMetadataSerializer {
         match &query_context.query_type {
             QueryType::IdLookup => {
                 // Check if any IDs might be in this file using column group ranges
-                for id in &query_context.id_lookups {
-                    let id_hash = nova_metadata.hash_id(id);
-                    for group in &nova_metadata.column_groups {
-                        if id_hash >= group.min_id_hash && id_hash <= group.max_id_hash {
-                            return false; // Found potential match
-                        }
-                    }
-                }
-                true // No potential matches
+                let ranges: Vec<(u64, u64)> = nova_metadata
+                    .column_groups
+                    .iter()
+                    .map(|g| (g.min_id_hash, g.max_id_hash))
+                    .collect();
+                ids_outside_all_ranges(&query_context.id_lookups, &ranges, stable_id_hash)
             }
 
             QueryType::SimilaritySearch => {

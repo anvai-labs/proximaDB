@@ -13,6 +13,8 @@ use proximadb_storage_common::zero_copy_traits::{
     DataRange, EngineMetadata, MetadataSerializer, QueryContext,
 };
 
+use super::utilities::stable_bytes_hash;
+
 /// SST Global metadata (fixed size, bytemuck-compatible)
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Serialize, Deserialize)]
@@ -595,12 +597,7 @@ impl MetadataSerializer for SstMetadataSerializer {
     }
 
     fn hash_bytes(&self, bytes: &[u8]) -> u64 {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-
-        let mut hasher = DefaultHasher::new();
-        bytes.hash(&mut hasher);
-        hasher.finish()
+        stable_bytes_hash(bytes)
     }
 }
 
