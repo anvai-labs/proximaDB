@@ -17,7 +17,7 @@ use crate::storage::persistence::filesystem::caching_filesystem::UnifiedCachingF
 use crate::storage::trait_components::extractor::{
     ExtractedVector, ExtractionCapabilities, ExtractionCost, ExtractionError, ExtractionMode,
     ExtractionRequest, ExtractionResult, VectorExtractor, finalize_extraction, id_filter_allows,
-    mode_wants_fp32,
+    linear_file_cost, mode_wants_fp32,
 };
 
 /// HELIX Vector Extractor
@@ -259,16 +259,7 @@ impl VectorExtractor for HelixExtractor {
 
     fn estimate_extraction_cost(&self, request: &ExtractionRequest) -> ExtractionCost {
         // HELIX has moderate I/O due to spatial clustering
-        let files = request.file_paths.len();
-        let vectors_per_file = 20_000;
-        let bytes_per_vector = 768 * 4;
-
-        ExtractionCost {
-            estimated_vectors: files * vectors_per_file,
-            estimated_bytes: files * vectors_per_file * bytes_per_vector,
-            estimated_duration_ms: (files * 60) as u64, // ~60ms per file
-            io_cost: 0.9, // Slightly better than SST due to spatial locality
-        }
+        linear_file_cost(request.file_paths.len(), 20000, 768 * 4, 60, 0.9)
     }
 
     fn engine_type(&self) -> StorageEngineType {

@@ -16,6 +16,7 @@ use crate::storage::trait_components::extractor::{
     ExtractedVector, ExtractionCapabilities, ExtractionCost, ExtractionError, ExtractionMode,
     ExtractionRequest, ExtractionResult, VectorExtractor, filter_existing_files,
     finalize_extraction, id_filter_allows, mode_wants_fp32,
+    linear_file_cost,
 };
 
 /// NOVA Vector Extractor
@@ -197,16 +198,7 @@ impl VectorExtractor for NovaExtractor {
 
     fn estimate_extraction_cost(&self, request: &ExtractionRequest) -> ExtractionCost {
         // NOVA uses progressive columnar with zone maps
-        let files = request.file_paths.len();
-        let vectors_per_file = 50_000;
-        let bytes_per_vector = 768 * 4;
-
-        ExtractionCost {
-            estimated_vectors: files * vectors_per_file,
-            estimated_bytes: files * vectors_per_file * bytes_per_vector,
-            estimated_duration_ms: (files * 150) as u64, // ~150ms per file
-            io_cost: 0.75,                               // Good with zone maps
-        }
+        linear_file_cost(request.file_paths.len(), 50000, 768 * 4, 150, 0.75)
     }
 
     fn engine_type(&self) -> StorageEngineType {

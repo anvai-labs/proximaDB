@@ -14,7 +14,7 @@ use crate::storage::persistence::filesystem::caching_filesystem::UnifiedCachingF
 use crate::storage::trait_components::extractor::{
     ExtractedVector, ExtractionCapabilities, ExtractionCost, ExtractionError, ExtractionMode,
     ExtractionRequest, ExtractionResult, VectorExtractor, filter_existing_files,
-    finalize_extraction, id_filter_allows, mode_wants_fp32,
+    finalize_extraction, id_filter_allows, linear_file_cost, mode_wants_fp32,
 };
 
 use super::proximablocks_compact_reader::{
@@ -200,16 +200,7 @@ impl VectorExtractor for SwiftExtractor {
 
     fn estimate_extraction_cost(&self, request: &ExtractionRequest) -> ExtractionCost {
         // SWIFT is optimized for batch reads due to superblock structure
-        let files = request.file_paths.len();
-        let vectors_per_file = 50_000; // Larger due to superblock structure
-        let bytes_per_vector = 768 * 4; // Typical dimension * f32 size
-
-        ExtractionCost {
-            estimated_vectors: files * vectors_per_file,
-            estimated_bytes: files * vectors_per_file * bytes_per_vector,
-            estimated_duration_ms: (files * 100) as u64, // ~100ms per file (larger files)
-            io_cost: 0.8, // SWIFT is more efficient than SST for batch reads
-        }
+        linear_file_cost(request.file_paths.len(), 50000, 768 * 4, 100, 0.8)
     }
 
     fn engine_type(&self) -> StorageEngineType {
