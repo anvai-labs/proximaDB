@@ -736,15 +736,17 @@ pub trait UnifiedStorageFormat: Send + Sync {
 
     /// Operator compaction with an explicit mode. `full = true` asks the
     /// engine to collapse the collection toward
-    /// `CompactionConfig::full_target_segments`, crossing levels the
-    /// background policy never crosses (PG `VACUUM FULL` / Delta `OPTIMIZE`
-    /// analog). Engines without a cross-level mode keep the single explicit
-    /// pass semantics of [`Self::compact_collection`].
+    /// `CompactionConfig::full_target_segments` (or `full_target_segments`
+    /// when given), crossing levels the background policy never crosses
+    /// (PG `VACUUM FULL` / Delta `OPTIMIZE` analog). Engines without a
+    /// cross-level mode keep the single explicit pass semantics of
+    /// [`Self::compact_collection`].
     async fn compact_collection_full(
         &self,
         collection_id: &str,
         collection_config: Option<&Collection>,
         full: bool,
+        full_target_segments: Option<usize>,
     ) -> Result<CompactionResult> {
         if !full {
             return self
@@ -759,6 +761,7 @@ pub trait UnifiedStorageFormat: Send + Sync {
             force: true,
             synchronous: true,
             full: true,
+            full_target_segments: full_target_segments.map(|t| t.max(1)),
             ..Default::default()
         };
         self.do_compact(&params).await

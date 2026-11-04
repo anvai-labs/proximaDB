@@ -166,6 +166,13 @@ pub struct CompactionParameters {
     /// as an explicit single pass.
     #[serde(default)]
     pub full: bool,
+
+    /// Per-request override of `CompactionConfig::full_target_segments`
+    /// (TD-COMPACT-15 Experiment 3): stop the collapse at this many
+    /// segments instead of the config default. Validated > 0 at the API
+    /// boundary; `None` keeps the configured target.
+    #[serde(default)]
+    pub full_target_segments: Option<usize>,
 }
 
 impl CompactionParameters {

@@ -2337,6 +2337,74 @@ mod tests {
         );
     }
 
+    /// TD-COMPACT-15 Experiment 3: a per-request `full_target_segments`
+    /// override stops the collapse AT that count (the group is capped so it
+    /// never overshoots below the request — no extra write amplification),
+    /// and the summary carries measured provenance — bytes and duration,
+    /// not estimates. The fixture runs with `compaction:off` so the
+    /// override is measured in isolation: the background policy keeps its
+    /// own authority afterward (FULL is never disarmed by the tag).
+    #[tokio::test]
+    async fn full_compaction_honors_target_override_and_reports_provenance() {
+        let config = CollectionConfig {
+            tags: vec!["compaction:off".into()],
+            ..Default::default()
+        };
+        let flushed = flush_via_materializer(286, config.clone(), 5).await;
+        assert_eq!(
+            flushed.pax_files().len(),
+            5,
+            "compaction:off fixture holds every flushed segment"
+        );
+        let full = crate::storage::traits::CompactionParameters {
+            collection_id: Some("286".to_string()),
+            collection_config: Some(knob_meta(286, &flushed.root, config)),
+            force: true,
+            synchronous: true,
+            full: true,
+            full_target_segments: Some(2),
+            ..Default::default()
+        };
+        let result = flushed
+            .engine
+            .do_compact(&full)
+            .await
+            .expect("target-override FULL");
+        let metrics = &result.engine_metrics;
+        let after = flushed.pax_files().len();
+        assert_eq!(after, 2, "collapsed to the override target exactly");
+        assert_eq!(
+            metrics.get("segments_after").and_then(|v| v.as_u64()),
+            Some(after as u64),
+            "the summary matches the on-disk segment count: {metrics:?}"
+        );
+        assert_eq!(
+            metrics.get("reached_target").and_then(|v| v.as_bool()),
+            Some(true),
+            "the override target counts as reached: {metrics:?}"
+        );
+        assert!(
+            metrics
+                .get("stop_reason")
+                .and_then(|v| v.as_str())
+                .is_none(),
+            "no stop reason when the override target is met: {metrics:?}"
+        );
+        // Provenance: measured bytes + duration from the executor's
+        // per-morsel counters, mapped top-level on the result.
+        assert!(
+            metrics
+                .get("bytes_read")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0)
+                > 0,
+            "measured bytes_read reported: {metrics:?}"
+        );
+        assert!(result.bytes_written.unwrap_or(0) > 0);
+        assert!(result.bytes_read.unwrap_or(0) > 0);
+        assert!(result.duration_ms.unwrap_or(0) > 0);
+    }
+
     /// An operator FULL request is never disarmed by `compaction:off` (the
     /// tag gates background producers only), and reports its summary.
     #[tokio::test]

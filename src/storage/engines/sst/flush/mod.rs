@@ -1139,12 +1139,30 @@ impl SstEngine {
         // derived from total_bytes / target_file_size_mb, not an L0
         // threshold. When the live segment count exceeds that target,
         // compaction fires immediately (the greedy smallest-first group in
-        // compact_collection_full does the merge).
-        let strategy = proximadb_storage_common::resolve_strategy_from_tags(tags);
+        // compact_collection_full does the merge). Resolution chain:
+        // collection PROPERTY (bridged into tags at catalog load, appended
+        // last so it wins) > operator tag > server TOML
+        // `consolidate_strategy` > code default (hybrid).
+        let mut strategy = proximadb_storage_common::resolve_strategy_from_tags(tags);
+        let cfg = self.config().compaction_config.clone().unwrap_or_default();
+        if strategy == proximadb_storage_common::CompactionStrategy::Hybrid
+            && cfg
+                .consolidate_strategy
+                .as_deref()
+                .map(str::trim)
+                .map(|s| s.eq_ignore_ascii_case("consolidate"))
+                .unwrap_or(false)
+        {
+            strategy = proximadb_storage_common::CompactionStrategy::Consolidate;
+        }
         if strategy == proximadb_storage_common::CompactionStrategy::Consolidate {
             crate::metrics::operational_metrics::CONSOLIDATE_CHECKS.inc();
-            let cfg = self.config().compaction_config.clone().unwrap_or_default();
-            let target_mb = cfg.consolidate_target_file_size_mb.max(1);
+            // Target: collection property/tag (bridged) > server default.
+            let target_mb = proximadb_storage_common::resolve_target_file_size_mb_from_tags(
+                tags,
+                cfg.consolidate_target_file_size_mb,
+            )
+            .max(1);
             let write_amp_limit = cfg.consolidate_write_amp_limit;
             let files = self
                 .discover_sstable_files(storage_url)

@@ -122,36 +122,42 @@ would rewrite the entire 1 TB on every flush. The guardrail:
   degrade to `hybrid` for that collection
 * The degradation is reported in the collection's status
 
-=== Property surface — as implemented (#2407)
+=== Property surface — as implemented (#2407 + this PR)
 
-Resolution is layered like the cache policy (TD-COMPACT-2b), but only the
-tag channel is resolved at flush time today:
+Resolution is a 4-layer chain, resolved at the flush trigger on EVERY
+flush (always fresh — no registry, no invalidation hook to forget):
 
 ```
-flush trigger:  TAG `compaction.strategy:consolidate` (resolve_strategy_from_tags)
-                  — the `compaction:off` tag disarms everything (wins first)
-server TOML:     [storage.compaction_config] consolidate_target_file_size_mb (512),
-                  consolidate_write_amp_limit (100) — knobs only, NO strategy field
-code default:    hybrid (the current behavior)
+collection PROPERTY `compaction.strategy` (bridged into the tag channel
+    at catalog load — `collection_from_catalog_schema` appends the
+    canonical tag AFTER operator tags, so last-wins makes the property
+    authoritative; derived per load, never persisted back)
+  > operator TAG `compaction.strategy:consolidate`
+  > server TOML  [storage.compaction_config] consolidate_strategy = "hybrid"|"consolidate"
+  > code default hybrid
 ```
 
-Live surfaces:
-* Collection tag `compaction.strategy:consolidate` (the resolved channel)
-* `ALTER TABLE t SET ('compaction.*')` — validated at SET time
-  (`validate_compaction_properties`; unknown keys/values rejected)
-* Server TOML knobs above
+The `compaction:off` tag disarms all background compaction including
+consolidate (checked first, unchanged from TD-WLP-2). The
+`compaction.target_file_size_mb` property resolves through the same
+bridge (`property > tag > [storage.compaction_config]
+consolidate_target_file_size_mb (512) > code`).
+
+Surfaces:
+* `ALTER TABLE t SET ('compaction.strategy' = 'consolidate',
+  'compaction.target_file_size_mb' = '1024')` — validated at SET time
+  (`validate_compaction_properties`), resolved at flush via the bridge
+* Collection tag `compaction.strategy:consolidate` (legacy channel)
+* `POST /collections {"properties": ...}` / `PATCH .../properties` (#2405)
+* Server TOML: `consolidate_strategy`, `consolidate_target_file_size_mb`,
+  `consolidate_write_amp_limit` — all validated fail-closed at config
+  load (below)
 
 NOTE: the legacy `[storage.compaction_config] strategy` field is the
-count|size level heuristic (`compaction_utils.rs`) — setting it to
-`consolidate` is dead config (falls through the `_` arm to count/size).
-Do not use it for this strategy; a dedicated server-level default needs
-its own field if ever wanted.
-
-Wiring follow-up (open): `resolve_strategy_from_properties` is exported
-but has no caller — the `compaction.strategy` PROPERTY is validated at
-SET yet not resolved at flush, so property-only configuration is inert
-until the property channel is plumbed into the flush trigger (or
-properties are bridged to tags at collection load).
+count|size level heuristic (`compaction_utils.rs`). Since this PR it is
+strictly validated (`count|size|hybrid`) — setting `consolidate` (or a
+typo) aborts startup with an actionable message instead of silently
+falling through the `_` arm to count/size (the dead-config hazard).
 
 === Interaction with COMPACT TABLE FULL
 
@@ -223,11 +229,11 @@ not yet measured end-to-end).
 === 3. Various targets — partially measured
 
 Build-time S=1/2/3/4 curve above; the compact-path curve (S=1, S=2 on
-the same collapsed bed) is open. NOTE: the compact path currently has
-no target plumbing — the Flight `compact_collection` body carries only
-`full` (collapses to the `full_target_segments` default of 1) — so an
-S=2 arm needs either a `target_segments` body field or the wired
-`compaction.*` property channel, not just `--max-segments 2`.
+the same collapsed bed) is open. UNLOCKED by this PR: the Flight
+`compact_collection` body now accepts `target_segments` (validated > 0,
+overriding `[storage.compaction_config] full_target_segments`) and the
+harness wires it as `--compact-full-target-segments`; an S=2 arm no
+longer needs hand-edited server config.
 
 === 4. Write-heavy stress — open
 

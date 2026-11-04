@@ -538,6 +538,16 @@ pub(crate) fn collection_from_catalog_schema(
     {
         config = full;
     }
+    // TD-COMPACT-15: bridge collection POLICY PROPERTIES into the tag
+    // channel so the flush-side resolvers (strategy, target file size) see
+    // them without a properties field on the engine-facing proto. Appended
+    // LAST — last-wins resolution makes the property authoritative over
+    // operator tags. Derived on every load and never persisted back: no
+    // staleness channel, no invalidation hook to forget.
+    proximadb_storage_common::project_policy_properties_to_tags(
+        &schema.properties,
+        &mut config.tags,
+    );
 
     let location = schema
         .storage_layouts

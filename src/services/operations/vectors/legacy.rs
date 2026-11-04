@@ -5328,7 +5328,7 @@ impl VectorOperationsService {
                 anyhow::anyhow!("collection '{identifier}' does not exist for this tenant")
             })?;
         self.unified_engine()
-            .compact_collection_full(&collection.id, Some(&collection), full)
+            .compact_collection_full(&collection.id, Some(&collection), full, None)
             .await
     }
 

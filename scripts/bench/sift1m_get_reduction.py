@@ -2680,10 +2680,21 @@ def force_flush_via_flight(
 
 
 def compact_via_flight(
-    host: str, port: int, collection_id: str, flight_module=None, full: bool = False
+    host: str,
+    port: int,
+    collection_id: str,
+    flight_module=None,
+    full: bool = False,
+    target_segments: int | None = None,
 ) -> dict:
     """Trigger a compaction. ``full=True`` asks for the cross-level collapse
-    (TD-COMPACT-14); the action body carries the flag through."""
+    (TD-COMPACT-14); ``target_segments`` overrides the FULL collapse target
+    (TD-COMPACT-15 Experiment 3) — both ride the action body."""
+    body = {"full": full}
+    if target_segments is not None:
+        if target_segments < 1:
+            raise SystemExit("--compact-full-target-segments must be >= 1")
+        body["target_segments"] = target_segments
     return storage_action_via_flight(
         host,
         port,
@@ -2691,7 +2702,7 @@ def compact_via_flight(
         "compact_collection",
         "compact",
         flight_module,
-        extra_body={"full": full},
+        extra_body=body,
     )
 
 
@@ -3242,6 +3253,16 @@ def main() -> int:
             "on byte-identical rows/model/queries — no external server or "
             "second bed. Combines with --skip-ingest to measure a prior "
             "bed collapsed in place"
+        ),
+    )
+    parser.add_argument(
+        "--compact-full-target-segments",
+        type=int,
+        help=(
+            "TD-COMPACT-15 Experiment 3: per-request override of the FULL "
+            "collapse target (server [storage.compaction_config] "
+            "full_target_segments, default 1). Requires "
+            "--compact-full-before-measure; keep --max-segments consistent"
         ),
     )
     parser.add_argument("--top-k", type=int, default=10)
@@ -3924,6 +3945,10 @@ def main() -> int:
         pre_compact_max_segments = (
             17 if args.compact_full_before_measure else args.max_segments
         )
+        if args.compact_full_target_segments is not None and not args.compact_full_before_measure:
+            raise SystemExit(
+                "--compact-full-target-segments requires --compact-full-before-measure"
+            )
         # The three settle waits (skip-ingest, post-ingest, post-compact)
         # share every argument but the segment bound — one closure keeps
         # them from drifting apart (the file's phase_sweep pattern).
@@ -4013,7 +4038,11 @@ def main() -> int:
                 ],
             }
             action = compact_via_flight(
-                "127.0.0.1", args.port, collection_id, full=True
+                "127.0.0.1",
+                args.port,
+                collection_id,
+                full=True,
+                target_segments=args.compact_full_target_segments,
             )
             geometry = settle(args.max_segments)
             result["compact_full_before_measure"] = {

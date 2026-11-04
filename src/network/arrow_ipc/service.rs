@@ -1008,7 +1008,15 @@ impl ProximaFlightService {
             .read_collection_file(&collection, &file_ticket.file_path)
     }
 
-    async fn trigger_collection_compaction(&self, collection_id: &str, full: bool) -> Result<()> {
+    /// TD-COMPACT-14/15: run (FULL) compaction and return the engine result
+    /// so the action payload carries provenance — segment counts, passes,
+    /// stop reason and measured bytes — instead of a bare success flag.
+    async fn trigger_collection_compaction(
+        &self,
+        collection_id: &str,
+        full: bool,
+        target_segments: Option<usize>,
+    ) -> Result<proximadb_storage_traits::CompactionResult> {
         let collection = self
             .collection_service
             .collection(collection_id)
@@ -1016,12 +1024,12 @@ impl ProximaFlightService {
             .with_context(|| format!("Collection not found: {collection_id}"))?;
         let storage_engine = self.vector_operations_service.unified_engine();
         // TD-COMPACT-14: `full` collapses across levels toward
-        // `[storage.compaction_config] full_target_segments`.
+        // `[storage.compaction_config] full_target_segments` unless the
+        // request overrides it (TD-COMPACT-15 Experiment 3).
         storage_engine
-            .compact_collection_full(&collection.id, Some(&collection), full)
+            .compact_collection_full(&collection.id, Some(&collection), full, target_segments)
             .await
-            .with_context(|| format!("Failed to compact collection '{}'", collection_id))?;
-        Ok(())
+            .with_context(|| format!("Failed to compact collection '{}'", collection_id))
     }
 
     fn insert_request_conflict_result(
@@ -1841,7 +1849,7 @@ impl FlightService for ProximaFlightService {
                 collection_id = %write_target,
                 "Arrow Flight: triggering compaction after DoPut"
             );
-            self.trigger_collection_compaction(&write_target, false)
+            self.trigger_collection_compaction(&write_target, false, None)
                 .await
                 .map_err(|e| TonicStatus::internal(format!("Compaction failed: {}", e)))?;
         }
@@ -2533,16 +2541,39 @@ impl FlightService for ProximaFlightService {
                     .get("full")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
-                self.trigger_collection_compaction(collection_id, full)
+                // TD-COMPACT-15 Experiment 3: optional per-request override
+                // of the FULL collapse target (must be > 0 to be meaningful).
+                let target_segments = params
+                    .get("target_segments")
+                    .and_then(|v| v.as_u64())
+                    .map(|t| t as usize)
+                    .filter(|t| *t > 0);
+                let compaction = self
+                    .trigger_collection_compaction(collection_id, full, target_segments)
                     .await
                     .map_err(|e| {
                         TonicStatus::internal(format!("Failed to compact collection: {}", e))
                     })?;
 
+                // TD-COMPACT-15 provenance: the payload carries what the
+                // engine did (segment counts, passes, measured bytes) and
+                // why it stopped — a FULL that stops at `max_passes` still
+                // reports success, so the reason is the load-bearing field.
+                let metric = |key: &str| compaction.engine_metrics.get(key).cloned();
                 let result_bytes = serde_json::to_vec(&serde_json::json!({
                     "success": true,
                     "collection_id": collection_id,
-                    "operation": "compact"
+                    "operation": "compact",
+                    "full": full,
+                    "segments_before": metric("segments_before"),
+                    "segments_after": metric("segments_after"),
+                    "passes": metric("passes"),
+                    "reached_target": metric("reached_target"),
+                    "stop_reason": metric("stop_reason"),
+                    "pending_files": metric("pending_files"),
+                    "bytes_read": metric("bytes_read"),
+                    "bytes_written": metric("bytes_written"),
+                    "duration_ms": metric("duration_ms"),
                 }))
                 .map_err(|e| TonicStatus::internal(format!("Failed to serialize result: {}", e)))?;
 
@@ -2593,7 +2624,7 @@ impl FlightService for ProximaFlightService {
                         TonicStatus::internal(format!("Failed to flush collection: {}", e))
                     })?;
 
-                self.trigger_collection_compaction(collection_id, false)
+                self.trigger_collection_compaction(collection_id, false, None)
                     .await
                     .map_err(|e| {
                         TonicStatus::internal(format!("Failed to compact collection: {}", e))

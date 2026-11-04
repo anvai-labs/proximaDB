@@ -258,6 +258,7 @@ mod helix_integration_tests {
             priority: OperationPriority::Medium,
             collection_config: Some(collection_config.clone()),
             estimated_input_size: 0,
+            full_target_segments: None,
         };
 
         let compact_result = engine.do_compact(&compact_params).await.unwrap();
