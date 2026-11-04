@@ -2542,12 +2542,22 @@ impl FlightService for ProximaFlightService {
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
                 // TD-COMPACT-15 Experiment 3: optional per-request override
-                // of the FULL collapse target (must be > 0 to be meaningful).
-                let target_segments = params
-                    .get("target_segments")
-                    .and_then(|v| v.as_u64())
-                    .map(|t| t as usize)
-                    .filter(|t| *t > 0);
+                // of the FULL collapse target. Validated fail-closed — an
+                // invalid value (0, non-integer) is rejected, NOT silently
+                // ignored: a swallowed 0 would fall back to the config
+                // default (full collapse) and do the MAXIMUM write
+                // amplification while reporting success.
+                let target_segments = match params.get("target_segments") {
+                    None | Some(serde_json::Value::Null) => None,
+                    Some(value) => {
+                        let parsed = value.as_u64().filter(|t| *t > 0).ok_or_else(|| {
+                            TonicStatus::invalid_argument(format!(
+                                "target_segments must be a positive integer, got {value}"
+                            ))
+                        })?;
+                        Some(parsed as usize)
+                    }
+                };
                 let compaction = self
                     .trigger_collection_compaction(collection_id, full, target_segments)
                     .await
@@ -2559,21 +2569,23 @@ impl FlightService for ProximaFlightService {
                 // engine did (segment counts, passes, measured bytes) and
                 // why it stopped — a FULL that stops at `max_passes` still
                 // reports success, so the reason is the load-bearing field.
-                let metric = |key: &str| compaction.engine_metrics.get(key).cloned();
+                // Extracted once (`full_compaction_metrics`) so REST, Flight
+                // and DDL cannot drift apart.
+                let metrics = compaction.full_compaction_metrics();
                 let result_bytes = serde_json::to_vec(&serde_json::json!({
                     "success": true,
                     "collection_id": collection_id,
                     "operation": "compact",
                     "full": full,
-                    "segments_before": metric("segments_before"),
-                    "segments_after": metric("segments_after"),
-                    "passes": metric("passes"),
-                    "reached_target": metric("reached_target"),
-                    "stop_reason": metric("stop_reason"),
-                    "pending_files": metric("pending_files"),
-                    "bytes_read": metric("bytes_read"),
-                    "bytes_written": metric("bytes_written"),
-                    "duration_ms": metric("duration_ms"),
+                    "segments_before": metrics.segments_before,
+                    "segments_after": metrics.segments_after,
+                    "passes": metrics.passes,
+                    "reached_target": metrics.reached_target,
+                    "stop_reason": metrics.stop_reason,
+                    "pending_files": metrics.pending_files,
+                    "bytes_read": metrics.bytes_read,
+                    "bytes_written": metrics.bytes_written,
+                    "duration_ms": metrics.duration_ms,
                 }))
                 .map_err(|e| TonicStatus::internal(format!("Failed to serialize result: {}", e)))?;
 

@@ -522,27 +522,20 @@ impl CompactSummary {
         full: bool,
         result: &crate::storage::traits::CompactionResult,
     ) -> Self {
-        let metric = |key: &str| result.engine_metrics.get(key).cloned();
+        // The single extraction point shared with REST and Flight.
+        let metrics = result.full_compaction_metrics();
         Self {
             collection_id: collection_id.to_string(),
             full,
-            segments_before: metric("segments_before")
-                .and_then(|v| v.as_u64())
-                .map(|v| v as usize),
-            segments_after: metric("segments_after")
-                .and_then(|v| v.as_u64())
-                .map(|v| v as usize),
-            passes: metric("passes")
-                .and_then(|v| v.as_u64())
-                .map(|v| v as usize),
-            reached_target: metric("reached_target").and_then(|v| v.as_bool()),
-            stop_reason: metric("stop_reason").and_then(|v| v.as_str().map(str::to_string)),
-            pending_files: metric("pending_files")
-                .and_then(|v| v.as_u64())
-                .map(|v| v as usize),
-            bytes_read: metric("bytes_read").and_then(|v| v.as_u64()),
-            bytes_written: metric("bytes_written").and_then(|v| v.as_u64()),
-            duration_ms: metric("duration_ms").and_then(|v| v.as_u64()),
+            segments_before: metrics.segments_before,
+            segments_after: metrics.segments_after,
+            passes: metrics.passes,
+            reached_target: metrics.reached_target,
+            stop_reason: metrics.stop_reason,
+            pending_files: metrics.pending_files,
+            bytes_read: metrics.bytes_read,
+            bytes_written: metrics.bytes_written,
+            duration_ms: metrics.duration_ms,
         }
     }
 }

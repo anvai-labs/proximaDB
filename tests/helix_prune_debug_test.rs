@@ -112,6 +112,7 @@ mod helix_prune_debug {
             batch_ids: vec![],
             collection_config: Some(collection.clone()),
             estimated_size: 0,
+            collection_properties: std::collections::HashMap::new(),
         };
 
         let flush_result = engine.do_flush(&flush_params).await.unwrap();
@@ -321,6 +322,7 @@ mod helix_prune_debug {
                 batch_ids: vec![],
                 collection_config: Some(collection.clone()),
                 estimated_size: 0,
+                collection_properties: std::collections::HashMap::new(),
             };
 
             engine.do_flush(&flush_params).await.unwrap();
@@ -477,6 +479,7 @@ mod helix_prune_debug {
             batch_ids: vec![],
             collection_config: Some(collection.clone()),
             estimated_size: 0,
+            collection_properties: std::collections::HashMap::new(),
         };
 
         engine.do_flush(&flush_params).await.unwrap();
@@ -630,6 +633,7 @@ mod helix_prune_debug {
             batch_ids: vec![],
             collection_config: Some(collection.clone()),
             estimated_size: 0,
+            collection_properties: std::collections::HashMap::new(),
         };
 
         engine.do_flush(&flush_params).await.unwrap();

@@ -341,6 +341,7 @@ mod tests {
             trigger_compaction: false,
             collection_config: Some(collection),
             estimated_size: 1024, // Default size estimate for testing
+            collection_properties: std::collections::HashMap::new(),
         };
         engine
             .do_flush(&flush_params)
@@ -454,6 +455,7 @@ mod tests {
             trigger_compaction: false,
             estimated_size: vectors.len() * vector_dimension,
             collection_config: Some(collection),
+            collection_properties: std::collections::HashMap::new(),
         };
 
         let flush_result = engine
@@ -511,6 +513,7 @@ mod tests {
                 collection_id,
                 temp_dir.path().to_str().unwrap(),
             )),
+            collection_properties: std::collections::HashMap::new(),
         };
         let flush_result = engine.do_flush(&flush_params).await.unwrap();
         assert!(flush_result.success, "Flush should succeed");
@@ -589,6 +592,7 @@ mod tests {
                 collection_id,
                 temp_dir.path().to_str().unwrap(),
             )),
+            collection_properties: std::collections::HashMap::new(),
         };
         engine.do_flush(&flush_params).await.unwrap();
 
@@ -653,6 +657,7 @@ mod tests {
                     collection_id,
                     temp_dir.path().to_str().unwrap(),
                 )),
+                collection_properties: std::collections::HashMap::new(),
             };
             engine.do_flush(&flush_params).await.unwrap();
         }
@@ -735,6 +740,7 @@ mod tests {
                 trigger_compaction: false,
                 estimated_size: 10 * 256,
                 collection_config: Some(create_test_collection(&collection, base_path)),
+                collection_properties: std::collections::HashMap::new(),
             };
             engine.do_flush(&flush_params).await.unwrap();
         }
@@ -808,6 +814,7 @@ mod tests {
                 trigger_compaction: false,
                 estimated_size: 10 * 256,
                 collection_config: Some(create_test_collection(collection_id, base_path)),
+                collection_properties: std::collections::HashMap::new(),
             };
 
             let flush_result = engine.do_flush(&flush_params).await.unwrap();
@@ -926,6 +933,7 @@ mod tests {
             trigger_compaction: false,
             estimated_size: 10 * 256,
             collection_config: Some(collection),
+            collection_properties: std::collections::HashMap::new(),
         };
         let flush_result = engine.do_flush(&flush_params).await.unwrap();
         assert!(flush_result.success, "Flush should succeed");
@@ -1303,6 +1311,7 @@ mod tests {
                 collection_id,
                 temp_dir.path().to_str().unwrap(),
             )),
+            collection_properties: std::collections::HashMap::new(),
         };
         let flush_result = engine.do_flush(&flush_params).await.unwrap();
         assert!(flush_result.success, "Flush should succeed");

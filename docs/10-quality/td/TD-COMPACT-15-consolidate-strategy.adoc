@@ -124,29 +124,36 @@ would rewrite the entire 1 TB on every flush. The guardrail:
 
 === Property surface — as implemented (#2407 + this PR)
 
-Resolution is a 4-layer chain, resolved at the flush trigger on EVERY
-flush (always fresh — no registry, no invalidation hook to forget):
+Resolution is a 4-layer chain resolved by one pure function
+(`resolve_effective_strategy`: property > tag > server > code). An
+explicit `hybrid` at any layer WINS over a consolidate default below it —
+silence falls through, an explicit choice does not:
 
 ```
-collection PROPERTY `compaction.strategy` (bridged into the tag channel
-    at catalog load — `collection_from_catalog_schema` appends the
-    canonical tag AFTER operator tags, so last-wins makes the property
-    authoritative; derived per load, never persisted back)
-  > operator TAG `compaction.strategy:consolidate`
+collection PROPERTY `compaction.strategy`
+    (carried on the flush path: catalog walk -> CatalogCollectionMeta
+     -> CollectionFlushPlan.properties -> FlushParameters
+     .collection_properties — the engine-facing proto Collection has no
+     properties field, and projecting onto its tags would leak into
+     read-modify-write catalog saves, baking policy into `tags`/
+     `config_json` and surviving property removal)
+  > operator TAG `compaction.strategy:consolidate` (legacy channel)
   > server TOML  [storage.compaction_config] consolidate_strategy = "hybrid"|"consolidate"
   > code default hybrid
 ```
 
 The `compaction:off` tag disarms all background compaction including
-consolidate (checked first, unchanged from TD-WLP-2). The
-`compaction.target_file_size_mb` property resolves through the same
-bridge (`property > tag > [storage.compaction_config]
-consolidate_target_file_size_mb (512) > code`).
+consolidate (checked first, unchanged from TD-WLP-2).
+`compaction.target_file_size_mb` resolves property > server
+(`consolidate_target_file_size_mb`, 512) > code, via the same
+FlushParameters channel. Flush entry points without a catalog schema at
+hand (recovery, coordinator, embedded) degrade to the server/code
+defaults — graceful, never stale.
 
 Surfaces:
 * `ALTER TABLE t SET ('compaction.strategy' = 'consolidate',
   'compaction.target_file_size_mb' = '1024')` — validated at SET time
-  (`validate_compaction_properties`), resolved at flush via the bridge
+  (`validate_compaction_properties`), resolved at flush
 * Collection tag `compaction.strategy:consolidate` (legacy channel)
 * `POST /collections {"properties": ...}` / `PATCH .../properties` (#2405)
 * Server TOML: `consolidate_strategy`, `consolidate_target_file_size_mb`,

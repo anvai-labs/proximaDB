@@ -141,6 +141,52 @@ impl Default for StorageCompactionResult {
     }
 }
 
+/// The FULL-collapse provenance a `COMPACT ... FULL` result carries
+/// (TD-COMPACT-14/15), extracted once so every API surface (REST, Flight,
+/// DDL) reports the same keys and cannot drift. Fields the engine did not
+/// report (a plain, non-FULL pass) stay `None`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FullCompactionMetrics {
+    pub segments_before: Option<usize>,
+    pub segments_after: Option<usize>,
+    pub passes: Option<usize>,
+    pub reached_target: Option<bool>,
+    pub stop_reason: Option<String>,
+    pub pending_files: Option<usize>,
+    pub bytes_read: Option<u64>,
+    pub bytes_written: Option<u64>,
+    pub duration_ms: Option<u64>,
+}
+
+impl StorageCompactionResult {
+    /// Extract the FULL provenance from `engine_metrics` (keys written by
+    /// the SST FULL branch). The single extraction point for all surfaces.
+    pub fn full_compaction_metrics(&self) -> FullCompactionMetrics {
+        let metric_u64 = |key: &str| {
+            self.engine_metrics
+                .get(key)
+                .and_then(|value| value.as_u64())
+        };
+        FullCompactionMetrics {
+            segments_before: metric_u64("segments_before").map(|v| v as usize),
+            segments_after: metric_u64("segments_after").map(|v| v as usize),
+            passes: metric_u64("passes").map(|v| v as usize),
+            reached_target: self
+                .engine_metrics
+                .get("reached_target")
+                .and_then(|value| value.as_bool()),
+            stop_reason: self
+                .engine_metrics
+                .get("stop_reason")
+                .and_then(|value| value.as_str().map(str::to_string)),
+            pending_files: metric_u64("pending_files").map(|v| v as usize),
+            bytes_read: metric_u64("bytes_read"),
+            bytes_written: metric_u64("bytes_written"),
+            duration_ms: metric_u64("duration_ms"),
+        }
+    }
+}
+
 /// Engine statistics for monitoring and observability.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct EngineStatistics {

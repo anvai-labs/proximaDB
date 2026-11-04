@@ -103,6 +103,14 @@ pub struct CollectionFlushPlan {
     /// plan like the tier — a flushed DTO that drops it would silently
     /// reroute a later grant to the default pool (the DTO-drop class).
     pub pool_id: Option<String>,
+    /// TD-COMPACT-15: the collection's catalog POLICY PROPERTIES
+    /// (`compaction.*`), carried explicitly — the engine-facing proto
+    /// `Collection` has no properties field, and projecting them onto its
+    /// tags would leak into catalog read-modify-write saves. Flows into
+    /// `FlushParameters.collection_properties` for the flush-side policy
+    /// resolvers. Empty ⇒ server/code defaults (graceful degradation for
+    /// callers without a catalog schema at hand).
+    pub properties: std::collections::HashMap<String, String>,
 }
 
 /// Build a [`CollectionFlushPlan`] from a collection's catalog metadata. The single
@@ -111,6 +119,7 @@ pub struct CollectionFlushPlan {
 /// three triggers, not *what* they materialize.
 pub fn flush_plan_from_collection_meta(
     meta: &crate::proto::proximadb_v1::Collection,
+    properties: std::collections::HashMap<String, String>,
 ) -> Result<CollectionFlushPlan> {
     let config = meta.config.as_ref();
     let assignment = meta.storage_assignment.as_ref();
@@ -172,6 +181,7 @@ pub fn flush_plan_from_collection_meta(
         pax_vector_quant: config.and_then(|c| c.pax_vector_quant.clone()),
         default_access_tier: config.and_then(|c| c.default_access_tier),
         pool_id: config.and_then(|c| c.pool_id.clone()),
+        properties,
     })
 }
 
@@ -682,6 +692,9 @@ async fn materialize_collection_with_coordinator_mode(
         vector_records,
         batch_ids: claim.batches().iter().map(|batch| batch.batch_id).collect(),
         collection_config: Some(collection_config),
+        // TD-COMPACT-15: policy properties ride the flush so the
+        // compaction-strategy resolver sees the property channel.
+        collection_properties: plan.properties.clone(),
         ..Default::default()
     };
 
@@ -979,6 +992,7 @@ mod tests {
             pax_vector_quant: None,
             default_access_tier: None,
             pool_id: None,
+            properties: std::collections::HashMap::new(),
         }
     }
 
@@ -1282,7 +1296,8 @@ mod tests {
             }),
             ..Default::default()
         };
-        let mut fp32_plan = flush_plan_from_collection_meta(&meta).expect("valid flush plan");
+        let mut fp32_plan =
+            flush_plan_from_collection_meta(&meta, HashMap::new()).expect("valid flush plan");
         assert_eq!(
             fp32_plan.canonical_embedding_precision,
             Some(EmbeddingPrecision::Fp32 as i32)
@@ -1347,7 +1362,8 @@ mod tests {
             }),
             ..Default::default()
         };
-        let mut knob_plan = flush_plan_from_collection_meta(&meta).expect("valid flush plan");
+        let mut knob_plan =
+            flush_plan_from_collection_meta(&meta, HashMap::new()).expect("valid flush plan");
         knob_plan.base_location = "file:///tmp/readfid1-knob-tests".to_string();
 
         let coordinator = FlushExecutionCoordinator::new(1);
@@ -1497,7 +1513,8 @@ mod tests {
             }),
             ..Default::default()
         };
-        let plan = flush_plan_from_collection_meta(&meta).expect("valid flush plan");
+        let plan =
+            flush_plan_from_collection_meta(&meta, HashMap::new()).expect("valid flush plan");
 
         let filesystem = Arc::new(
             crate::storage::persistence::filesystem::FilesystemFactory::create(
@@ -1572,7 +1589,8 @@ mod tests {
             }),
             ..Default::default()
         };
-        let plan = flush_plan_from_collection_meta(&meta).expect("valid flush plan");
+        let plan =
+            flush_plan_from_collection_meta(&meta, HashMap::new()).expect("valid flush plan");
         assert_eq!(
             plan.pool_id.as_deref(),
             Some("enterprise"),
@@ -1591,11 +1609,14 @@ mod tests {
         };
         assert_eq!(rebuilt.pool_id.as_deref(), Some("enterprise"));
         // And the default stays the default (byte-compatible None).
-        let plain = flush_plan_from_collection_meta(&crate::proto::proximadb_v1::Collection {
-            id: "8".to_string(),
-            config: Some(CollectionConfig::default()),
-            ..Default::default()
-        })
+        let plain = flush_plan_from_collection_meta(
+            &crate::proto::proximadb_v1::Collection {
+                id: "8".to_string(),
+                config: Some(CollectionConfig::default()),
+                ..Default::default()
+            },
+            HashMap::new(),
+        )
         .expect("valid flush plan");
         assert_eq!(plain.pool_id, None);
     }
@@ -2494,7 +2515,8 @@ mod tests {
             ..Default::default()
         };
 
-        let plan = flush_plan_from_collection_meta(&collection).expect("valid flush plan");
+        let plan =
+            flush_plan_from_collection_meta(&collection, HashMap::new()).expect("valid flush plan");
         assert_eq!(
             plan.collection_identity,
             Some(crate::core::stable_id::CollectionIdentity {
@@ -2510,7 +2532,7 @@ mod tests {
             .expect("storage assignment")
             .typed_namespace_id = None;
         assert!(
-            flush_plan_from_collection_meta(&collection)
+            flush_plan_from_collection_meta(&collection, HashMap::new())
                 .err()
                 .expect("partial typed identity must fail closed")
                 .to_string()
@@ -2523,7 +2545,7 @@ mod tests {
             .expect("storage assignment")
             .typed_namespace_id = Some(u32::from(u16::MAX) + 1);
         assert!(
-            flush_plan_from_collection_meta(&collection)
+            flush_plan_from_collection_meta(&collection, HashMap::new())
                 .err()
                 .expect("out-of-range typed identity must fail closed")
                 .to_string()

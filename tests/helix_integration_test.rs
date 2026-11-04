@@ -140,6 +140,7 @@ mod helix_integration_tests {
             batch_ids: vec![],
             collection_config: Some(collection_config),
             estimated_size: 0,
+            collection_properties: std::collections::HashMap::new(),
         };
 
         let flush_result = engine.do_flush(&flush_params).await.unwrap();
@@ -243,6 +244,7 @@ mod helix_integration_tests {
                 batch_ids: vec![],
                 collection_config: Some(collection_config.clone()),
                 estimated_size: 0,
+                collection_properties: std::collections::HashMap::new(),
             };
             engine.do_flush(&flush_params).await.unwrap();
         }
@@ -402,6 +404,7 @@ mod helix_integration_tests {
             batch_ids: vec![],
             collection_config: Some(collection_config),
             estimated_size: 0,
+            collection_properties: std::collections::HashMap::new(),
         };
         engine.do_flush(&flush_params).await.unwrap();
 
@@ -586,6 +589,7 @@ mod helix_integration_tests {
             batch_ids: vec![],
             collection_config: Some(collection_config),
             estimated_size: 0,
+            collection_properties: std::collections::HashMap::new(),
         };
         engine.do_flush(&flush_params).await.unwrap();
 
@@ -761,6 +765,7 @@ mod helix_integration_tests {
                 trigger_compaction: false,
                 batch_ids: vec![],
                 collection_config: Some(collection_config.clone()),
+                collection_properties: HashMap::new(),
                 estimated_size: 0,
             })
             .await
@@ -877,6 +882,7 @@ mod helix_integration_tests {
                 trigger_compaction: false,
                 batch_ids: vec![],
                 collection_config: Some(collection_config.clone()),
+                collection_properties: HashMap::new(),
                 estimated_size: 0,
             })
             .await

@@ -538,16 +538,13 @@ pub(crate) fn collection_from_catalog_schema(
     {
         config = full;
     }
-    // TD-COMPACT-15: bridge collection POLICY PROPERTIES into the tag
-    // channel so the flush-side resolvers (strategy, target file size) see
-    // them without a properties field on the engine-facing proto. Appended
-    // LAST — last-wins resolution makes the property authoritative over
-    // operator tags. Derived on every load and never persisted back: no
-    // staleness channel, no invalidation hook to forget.
-    proximadb_storage_common::project_policy_properties_to_tags(
-        &schema.properties,
-        &mut config.tags,
-    );
+    // TD-COMPACT-15: policy PROPERTIES deliberately do NOT project onto the
+    // Collection here — a derived tag would leak into the read-modify-write
+    // catalog saves that also load through this mapping (update_stats,
+    // update_collection), baking policy into `tags`/`config_json` and
+    // surviving property removal. The properties ride alongside the
+    // Collection instead (`CatalogCollectionMeta` → `CollectionFlushPlan`
+    // → `FlushParameters.collection_properties`).
 
     let location = schema
         .storage_layouts

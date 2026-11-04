@@ -1022,6 +1022,7 @@ impl EmbeddedProximaDB {
                 let Ok(plan) =
                     proximadb::storage::flush_materializer::flush_plan_from_collection_meta(
                         &collection,
+                        std::collections::HashMap::new(),
                     )
                 else {
                     continue;
@@ -2493,6 +2494,7 @@ impl EmbeddedProximaDB {
                     // unified SST engine as the create-failure fallback.
                     let plan = match proximadb::storage::flush_materializer::flush_plan_from_collection_meta(
                         &collection_metadata,
+                        std::collections::HashMap::new(),
                     ) {
                         Ok(plan) => plan,
                         Err(error) => {

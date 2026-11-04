@@ -148,6 +148,7 @@ mod tests {
             batch_ids: vec![],
             collection_config: Some(collection),
             estimated_size: 1024,
+            collection_properties: std::collections::HashMap::new(),
         };
 
         let result = fixture.sst_engine.do_flush(&flush_params).await?;
@@ -208,6 +209,7 @@ mod tests {
             batch_ids: vec![],
             collection_config: Some(collection),
             estimated_size: 1024,
+            collection_properties: std::collections::HashMap::new(),
         };
 
         let result = fixture.viper_engine.do_flush(&flush_params).await?;
@@ -288,6 +290,7 @@ mod tests {
             batch_ids: vec![],
             collection_config: Some(sst_collection),
             estimated_size: 1024,
+            collection_properties: std::collections::HashMap::new(),
         };
 
         let viper_flush_params = FlushParameters {
@@ -305,6 +308,7 @@ mod tests {
             batch_ids: vec![],
             collection_config: Some(viper_collection),
             estimated_size: 1024,
+            collection_properties: std::collections::HashMap::new(),
         };
 
         let sst_result = fixture.sst_engine.do_flush(&sst_flush_params).await?;
@@ -364,6 +368,7 @@ mod tests {
             batch_ids: vec![],
             collection_config: Some(collection.clone()),
             estimated_size: 1024,
+            collection_properties: std::collections::HashMap::new(),
         };
 
         fixture.sst_engine.do_flush(&flush_params).await?;
@@ -478,6 +483,7 @@ mod tests {
             batch_ids: vec![],
             collection_config: Some(sst_collection.clone()),
             estimated_size: 1024,
+            collection_properties: std::collections::HashMap::new(),
         };
 
         let viper_flush_params = FlushParameters {
@@ -495,6 +501,7 @@ mod tests {
             batch_ids: vec![],
             collection_config: Some(viper_collection.clone()),
             estimated_size: 1024,
+            collection_properties: std::collections::HashMap::new(),
         };
 
         fixture.sst_engine.do_flush(&sst_flush_params).await?;

@@ -96,6 +96,7 @@ async fn flush_records(engine: &SstEngine, collection: &Collection, records: Vec
         batch_ids: vec![],
         collection_config: Some(collection.clone()),
         estimated_size: 0,
+        collection_properties: std::collections::HashMap::new(),
     };
     let result = engine
         .do_flush(&flush_params)

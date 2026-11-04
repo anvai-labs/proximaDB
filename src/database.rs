@@ -971,8 +971,9 @@ impl ProximaDB {
                     let mut tenant_set: std::collections::HashSet<String> =
                         crate::storage::persistence::write_ahead_log::list_collections_from_catalog()
                             .await
-                            .iter()
-                            .filter_map(proximadb_tenant::tenant_id_of)
+                            .into_iter()
+                            .map(|meta| meta.collection)
+                            .filter_map(|collection| proximadb_tenant::tenant_id_of(&collection))
                             .collect();
                     tenant_set.insert("default".to_string());
                     let tenants: Vec<String> = tenant_set.into_iter().collect();

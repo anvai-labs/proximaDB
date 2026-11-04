@@ -161,10 +161,13 @@ impl AutoFlushDriver {
             // violated — escalate loudly (metric + error) instead of spinning
             // silently at WARN: a permanently unflushable collection is a
             // durability incident (its unflushed window grows without bound).
-            let resolved_fallback = match catalog.iter().find(|c| &c.id == collection_id) {
+            let resolved_fallback = match catalog
+                .iter()
+                .find(|meta| &meta.collection.id == collection_id)
+            {
                 Some(meta) => Some(meta.clone()),
                 None => {
-                    crate::storage::persistence::write_ahead_log::resolve_collection_from_catalog(
+                    crate::storage::persistence::write_ahead_log::resolve_collection_meta_from_catalog(
                         collection_id,
                     )
                     .await
@@ -180,17 +183,19 @@ impl AutoFlushDriver {
                 );
                 continue;
             };
-            let plan =
-                match crate::storage::flush_materializer::flush_plan_from_collection_meta(meta) {
-                    Ok(plan) => plan,
-                    Err(error) => {
-                        tracing::warn!(
-                            collection_id,
-                            "ADR-069 auto-flush: catalog identity resolution failed: {error}"
-                        );
-                        continue;
-                    }
-                };
+            let plan = match crate::storage::flush_materializer::flush_plan_from_collection_meta(
+                &meta.collection,
+                meta.properties.clone(),
+            ) {
+                Ok(plan) => plan,
+                Err(error) => {
+                    tracing::warn!(
+                        collection_id,
+                        "ADR-069 auto-flush: catalog identity resolution failed: {error}"
+                    );
+                    continue;
+                }
+            };
 
             // ADR-081 D4: submit independent collections concurrently. The
             // process-wide materializer permit pool bounds the actual work, and

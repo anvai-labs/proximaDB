@@ -3471,37 +3471,21 @@ pub async fn post_collection_compact_v2(
         .compact_collection_full(&collection.id, Some(&collection), full, target_segments)
         .await
         .map_err(|e| ApiError::Internal(format!("compaction: {e}")))?;
-    let metric = |key: &str| {
-        result
-            .engine_metrics
-            .get(key)
-            .and_then(|value| value.as_u64())
-            .map(|value| value as usize)
-    };
-    let metric_u64 = |key: &str| {
-        result
-            .engine_metrics
-            .get(key)
-            .and_then(|value| value.as_u64())
-    };
+    // Extracted once so REST, Flight and DDL report the same keys and
+    // cannot drift (TD-COMPACT-15 review).
+    let metrics = result.full_compaction_metrics();
     Ok(Json(CompactResponse {
         collection_id,
         full,
-        segments_before: metric("segments_before"),
-        segments_after: metric("segments_after"),
-        passes: metric("passes"),
-        reached_target: result
-            .engine_metrics
-            .get("reached_target")
-            .and_then(|value| value.as_bool()),
-        stop_reason: result
-            .engine_metrics
-            .get("stop_reason")
-            .and_then(|value| value.as_str().map(str::to_string)),
-        pending_files: metric("pending_files"),
-        bytes_read: metric_u64("bytes_read"),
-        bytes_written: metric_u64("bytes_written"),
-        duration_ms: metric_u64("duration_ms"),
+        segments_before: metrics.segments_before,
+        segments_after: metrics.segments_after,
+        passes: metrics.passes,
+        reached_target: metrics.reached_target,
+        stop_reason: metrics.stop_reason,
+        pending_files: metrics.pending_files,
+        bytes_read: metrics.bytes_read,
+        bytes_written: metrics.bytes_written,
+        duration_ms: metrics.duration_ms,
     }))
 }
 

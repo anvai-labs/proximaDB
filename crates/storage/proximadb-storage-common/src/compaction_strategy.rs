@@ -55,103 +55,102 @@ pub fn parse_strategy(value: &str) -> Option<CompactionStrategy> {
 
 /// Resolve from collection TAGS (the legacy channel: last valid wins,
 /// matching `resolve_compaction_armed` semantics). Tag:
-/// `compaction.strategy:consolidate`
+/// `compaction.strategy:consolidate`. Returns `None` when no explicit tag
+/// is present — use [`resolve_strategy_explicit_from_tags`] when the
+/// distinction between "absent" and "explicit hybrid" matters (the
+/// precedence chain).
 pub fn resolve_strategy_from_tags(tags: &[String]) -> CompactionStrategy {
-    let mut strategy = CompactionStrategy::default();
+    resolve_strategy_explicit_from_tags(tags).unwrap_or_default()
+}
+
+/// The tag channel's explicit value, if any: `Some` means an operator (or
+/// an explicit property) chose a strategy; `None` means the channel is
+/// silent and the next layer down decides. Last valid wins.
+pub fn resolve_strategy_explicit_from_tags(tags: &[String]) -> Option<CompactionStrategy> {
+    let mut explicit = None;
     for tag in tags {
         if let Some(parsed) = tag
             .trim()
             .strip_prefix(COMPACTION_STRATEGY_TAG_PREFIX)
             .and_then(parse_strategy)
         {
-            strategy = parsed;
+            explicit = Some(parsed);
         }
     }
-    strategy
+    explicit
 }
 
 /// Resolve from catalog PROPERTIES (the property channel). Property:
-/// `compaction.strategy = "consolidate"`
+/// `compaction.strategy = "consolidate"`. Returns `None` when absent.
 pub fn resolve_strategy_from_properties(
     properties: &HashMap<String, String>,
 ) -> CompactionStrategy {
-    properties
-        .iter()
-        .find(|(k, _)| k.trim().to_ascii_lowercase() == COMPACTION_STRATEGY_PROPERTY_KEY)
-        .and_then(|(_, v)| parse_strategy(v))
+    resolve_strategy_explicit_from_properties(properties).unwrap_or_default()
+}
+
+/// The property channel's explicit value, if any (case-insensitive key
+/// match, first wins over the lowercased duplicate risk by NOT iterating
+/// randomly: HashMap order is nondeterministic, so when both spellings
+/// exist the choice is deterministic — the canonical lowercase key wins).
+pub fn resolve_strategy_explicit_from_properties(
+    properties: &HashMap<String, String>,
+) -> Option<CompactionStrategy> {
+    // Prefer the canonical key spelling; only fall back to a case-variant
+    // scan when it is absent, so duplicate-spelling catalogs resolve the
+    // same way in every process.
+    if let Some(value) = properties.get(COMPACTION_STRATEGY_PROPERTY_KEY) {
+        return parse_strategy(value);
+    }
+    let mut found = None;
+    for (key, value) in properties {
+        if key.trim().to_ascii_lowercase() == COMPACTION_STRATEGY_PROPERTY_KEY {
+            found = parse_strategy(value);
+        }
+    }
+    found
+}
+
+/// The full precedence chain, as one pure function (unit-testable without
+/// an engine): **collection property > operator tag > server TOML > code**.
+/// An explicit `hybrid` at any layer WINS over a consolidate default at a
+/// lower layer — silence falls through, an explicit choice does not.
+pub fn resolve_effective_strategy(
+    properties: &HashMap<String, String>,
+    tags: &[String],
+    server_consolidate_strategy: Option<&str>,
+) -> CompactionStrategy {
+    resolve_strategy_explicit_from_properties(properties)
+        .or_else(|| resolve_strategy_explicit_from_tags(tags))
+        .or_else(|| {
+            server_consolidate_strategy
+                .and_then(parse_strategy)
+                .filter(|s| *s == CompactionStrategy::Consolidate)
+        })
         .unwrap_or_default()
 }
 
 /// Resolve the target file size (MB) from properties, falling back to the
-/// server default. Property: `compaction.target_file_size_mb = "1024"`
+/// server default. Property: `compaction.target_file_size_mb = "1024"`.
+/// Deterministic under case-duplicate keys (canonical spelling first), for
+/// the same reason as [`resolve_strategy_explicit_from_properties`].
 pub fn resolve_target_file_size_mb(
     properties: &HashMap<String, String>,
     server_default_mb: u64,
 ) -> u64 {
-    properties
-        .iter()
-        .find(|(k, _)| k.trim().to_ascii_lowercase() == COMPACTION_TARGET_FILE_SIZE_PROPERTY_KEY)
-        .and_then(|(_, v)| v.trim().parse::<u64>().ok())
-        .filter(|mb| *mb > 0)
-        .unwrap_or(server_default_mb)
-}
-
-/// The canonical tag form of the target-file-size property (last-wins
-/// resolution, mirroring [`COMPACTION_STRATEGY_TAG_PREFIX`]).
-pub const COMPACTION_TARGET_FILE_SIZE_TAG_PREFIX: &str = "compaction.target_file_size_mb:";
-
-/// Resolve the target file size (MB) from the TAG channel, falling back to
-/// the server default. Last valid occurrence wins, mirroring
-/// [`resolve_strategy_from_tags`] — the property bridge appends these tags
-/// AFTER operator tags so the property is authoritative.
-pub fn resolve_target_file_size_mb_from_tags(tags: &[String], server_default_mb: u64) -> u64 {
-    let mut resolved = server_default_mb;
-    for tag in tags {
-        if let Some(parsed) = tag
-            .trim()
-            .strip_prefix(COMPACTION_TARGET_FILE_SIZE_TAG_PREFIX)
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .filter(|mb| *mb > 0)
+    let parse_valid =
+        |v: &str| -> Option<u64> { v.trim().parse::<u64>().ok().filter(|mb| *mb > 0) };
+    if let Some(value) = properties.get(COMPACTION_TARGET_FILE_SIZE_PROPERTY_KEY) {
+        return parse_valid(value).unwrap_or(server_default_mb);
+    }
+    let mut resolved = None;
+    for (key, value) in properties {
+        if key.trim().to_ascii_lowercase() == COMPACTION_TARGET_FILE_SIZE_PROPERTY_KEY
+            && let Some(parsed) = parse_valid(value)
         {
-            resolved = parsed;
+            resolved = Some(parsed);
         }
     }
-    resolved
-}
-
-/// Project collection POLICY PROPERTIES into canonical tags, appended LAST
-/// so last-wins resolution makes the property authoritative over operator
-/// tags. This is the property→tag bridge at collection load
-/// (`collection_from_catalog_schema`): the derived tags are never persisted
-/// back — they are re-derived from the catalog properties on every load, so
-/// there is no staleness channel and no invalidation hook to forget.
-///
-/// Only known `compaction.*` keys project (case-insensitive). Values that
-/// fail validation are skipped defensively — they cannot exist past
-/// SET-time validation, but a hand-edited catalog must not wedge the flush
-/// path.
-pub fn project_policy_properties_to_tags(
-    properties: &HashMap<String, String>,
-    tags: &mut Vec<String>,
-) {
-    for (raw_key, raw_value) in properties {
-        let key = raw_key.trim().to_ascii_lowercase();
-        match key.as_str() {
-            COMPACTION_STRATEGY_PROPERTY_KEY => {
-                if parse_strategy(raw_value).is_some() {
-                    let canonical = raw_value.trim().to_ascii_lowercase();
-                    tags.push(format!("{COMPACTION_STRATEGY_TAG_PREFIX}{canonical}"));
-                }
-            }
-            COMPACTION_TARGET_FILE_SIZE_PROPERTY_KEY => {
-                let trimmed = raw_value.trim();
-                if trimmed.parse::<u64>().map(|mb| mb > 0).unwrap_or(false) {
-                    tags.push(format!("{COMPACTION_TARGET_FILE_SIZE_TAG_PREFIX}{trimmed}"));
-                }
-            }
-            _ => {}
-        }
-    }
+    resolved.unwrap_or(server_default_mb)
 }
 
 /// Validate a `compaction.*` property at SET time. Returns `Err` with a
@@ -278,45 +277,96 @@ mod tests {
     }
 
     #[test]
-    fn bridge_projects_known_keys_as_canonical_tags() {
-        let properties = props(&[
-            ("Compaction.Strategy", "Consolidate"),
-            ("compaction.target_file_size_mb", "1024"),
-            ("compaction.unknown", "ignored"),
-            ("cache.index.mode", "pin"),
-        ]);
-        let mut tags = vec!["compaction.strategy:hybrid".to_string()];
-        project_policy_properties_to_tags(&properties, &mut tags);
-        // Appended last: property wins over the operator tag (last-wins).
+    fn effective_strategy_chain_property_tag_server_code() {
+        let hybrid_tag = vec!["compaction.strategy:hybrid".to_string()];
+        let consolidate_tag = vec!["compaction.strategy:consolidate".to_string()];
+        // Property wins over tag and server.
         assert_eq!(
-            resolve_strategy_from_tags(&tags),
+            resolve_effective_strategy(
+                &props(&[("compaction.strategy", "consolidate")]),
+                &hybrid_tag,
+                Some("hybrid"),
+            ),
             CompactionStrategy::Consolidate
         );
-        assert_eq!(resolve_target_file_size_mb_from_tags(&tags, 512), 1024);
-        // Exactly one projected tag per known key; unknown keys inert.
-        assert_eq!(tags.iter().filter(|t| t.contains("compaction.")).count(), 3);
+        // Explicit tag wins over server (and absent property).
+        assert_eq!(
+            resolve_effective_strategy(&HashMap::new(), &consolidate_tag, Some("hybrid")),
+            CompactionStrategy::Consolidate
+        );
+        // An EXPLICIT hybrid at a higher layer beats a consolidate default
+        // below it — silence falls through, an explicit choice does not.
+        assert_eq!(
+            resolve_effective_strategy(&HashMap::new(), &hybrid_tag, Some("consolidate")),
+            CompactionStrategy::Hybrid
+        );
+        assert_eq!(
+            resolve_effective_strategy(
+                &props(&[("compaction.strategy", "hybrid")]),
+                &consolidate_tag,
+                Some("consolidate"),
+            ),
+            CompactionStrategy::Hybrid
+        );
+        // Server default applies only when both collection layers are silent.
+        assert_eq!(
+            resolve_effective_strategy(&HashMap::new(), &[], Some("consolidate")),
+            CompactionStrategy::Consolidate
+        );
+        // Code default last.
+        assert_eq!(
+            resolve_effective_strategy(&HashMap::new(), &[], None),
+            CompactionStrategy::Hybrid
+        );
+        // A junk server value is inert (config load rejects it, but the
+        // resolver must not invent a strategy).
+        assert_eq!(
+            resolve_effective_strategy(&HashMap::new(), &[], Some("aggressive")),
+            CompactionStrategy::Hybrid
+        );
     }
 
     #[test]
-    fn bridge_skips_invalid_values_defensively() {
-        let properties = props(&[
-            ("compaction.strategy", "garbage"),
-            ("compaction.target_file_size_mb", "0"),
-            ("compaction.target_file_size_mb", "not-a-number"),
-        ]);
-        let mut tags = vec![];
-        project_policy_properties_to_tags(&properties, &mut tags);
-        assert!(tags.is_empty());
+    fn explicit_resolvers_distinguish_absent_from_hybrid() {
+        assert_eq!(resolve_strategy_explicit_from_tags(&[]), None);
+        assert_eq!(
+            resolve_strategy_explicit_from_tags(&["compaction.strategy:hybrid".into()]),
+            Some(CompactionStrategy::Hybrid)
+        );
+        assert_eq!(
+            resolve_strategy_explicit_from_properties(&HashMap::new()),
+            None
+        );
+        assert_eq!(
+            resolve_strategy_explicit_from_properties(&props(&[("compaction.strategy", "hybrid")])),
+            Some(CompactionStrategy::Hybrid)
+        );
     }
 
     #[test]
-    fn target_from_tags_last_wins_and_falls_back() {
-        assert_eq!(resolve_target_file_size_mb_from_tags(&[], 512), 512);
-        let tags = vec![
-            "compaction.target_file_size_mb:256".to_string(),
-            "compaction.target_file_size_mb:2048".to_string(),
-            "compaction.target_file_size_mb:0".to_string(), // invalid — prior kept
-        ];
-        assert_eq!(resolve_target_file_size_mb_from_tags(&tags, 512), 2048);
+    fn case_duplicate_properties_resolve_deterministically() {
+        // The canonical spelling wins over a case variant regardless of
+        // HashMap iteration order.
+        for _ in 0..20 {
+            let properties = props(&[
+                ("Compaction.Strategy", "hybrid"),
+                ("compaction.strategy", "consolidate"),
+            ]);
+            assert_eq!(
+                resolve_strategy_explicit_from_properties(&properties),
+                Some(CompactionStrategy::Consolidate)
+            );
+        }
+    }
+
+    #[test]
+    fn target_deterministic_under_case_duplicates() {
+        for _ in 0..20 {
+            let properties = props(&[
+                ("Compaction.Target_File_Size_MB", "256"),
+                ("compaction.target_file_size_mb", "1024"),
+            ]);
+            assert_eq!(resolve_target_file_size_mb(&properties, 512), 1024);
+        }
     }
 }

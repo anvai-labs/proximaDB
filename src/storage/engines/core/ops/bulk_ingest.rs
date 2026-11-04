@@ -68,6 +68,7 @@ pub fn build_bulk_flush_parameters(
         trigger_compaction: false,
         batch_ids: vec![],
         collection_config,
+        collection_properties: std::collections::HashMap::new(),
         estimated_size: 0,
     })
 }

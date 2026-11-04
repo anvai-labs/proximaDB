@@ -51,6 +51,17 @@ pub struct FlushParameters {
     /// Collection configuration to avoid redundant lookups
     pub collection_config: Option<Collection>,
 
+    /// TD-COMPACT-15: the collection's catalog POLICY PROPERTIES
+    /// (`compaction.*`, `cache.*`) carried alongside the flush so policy
+    /// resolvers see the property channel without mutating the
+    /// engine-facing Collection proto (which has no properties field —
+    /// derived tags would leak into read-modify-write catalog saves).
+    /// Populated by the catalog walk at flush-plan build time; empty means
+    /// the server/code defaults apply (graceful degradation for
+    /// recovery/coordinator paths).
+    #[serde(default)]
+    pub collection_properties: HashMap<String, String>,
+
     /// Estimated size in bytes for metrics tracking
     pub estimated_size: usize,
 }

@@ -895,8 +895,12 @@ impl SstEngine {
         let compaction_due_threshold = if suppress_recovery_compaction {
             None
         } else {
-            self.should_trigger_compaction(storage_url, collection_tags)
-                .await?
+            self.should_trigger_compaction(
+                storage_url,
+                collection_tags,
+                &params.collection_properties,
+            )
+            .await?
         };
 
         // TD-WLP-7 (ADR-061 D3): schedule compaction when armed. Before
@@ -1131,6 +1135,7 @@ impl SstEngine {
         &self,
         storage_url: &str,
         tags: &[String],
+        properties: &std::collections::HashMap<String, String>,
     ) -> Result<Option<usize>> {
         if !proximadb_storage_common::resolve_compaction_armed(tags) {
             return Ok(None);
@@ -1139,27 +1144,21 @@ impl SstEngine {
         // derived from total_bytes / target_file_size_mb, not an L0
         // threshold. When the live segment count exceeds that target,
         // compaction fires immediately (the greedy smallest-first group in
-        // compact_collection_full does the merge). Resolution chain:
-        // collection PROPERTY (bridged into tags at catalog load, appended
-        // last so it wins) > operator tag > server TOML
-        // `consolidate_strategy` > code default (hybrid).
-        let mut strategy = proximadb_storage_common::resolve_strategy_from_tags(tags);
+        // compact_collection_full does the merge). The chain is resolved by
+        // one pure function: collection PROPERTY > operator tag > server
+        // TOML `consolidate_strategy` > code default (hybrid) — an explicit
+        // `hybrid` anywhere above beats a consolidate default below it.
         let cfg = self.config().compaction_config.clone().unwrap_or_default();
-        if strategy == proximadb_storage_common::CompactionStrategy::Hybrid
-            && cfg
-                .consolidate_strategy
-                .as_deref()
-                .map(str::trim)
-                .map(|s| s.eq_ignore_ascii_case("consolidate"))
-                .unwrap_or(false)
-        {
-            strategy = proximadb_storage_common::CompactionStrategy::Consolidate;
-        }
+        let strategy = proximadb_storage_common::resolve_effective_strategy(
+            properties,
+            tags,
+            cfg.consolidate_strategy.as_deref(),
+        );
         if strategy == proximadb_storage_common::CompactionStrategy::Consolidate {
             crate::metrics::operational_metrics::CONSOLIDATE_CHECKS.inc();
-            // Target: collection property/tag (bridged) > server default.
-            let target_mb = proximadb_storage_common::resolve_target_file_size_mb_from_tags(
-                tags,
+            // Target: collection property > server default.
+            let target_mb = proximadb_storage_common::resolve_target_file_size_mb(
+                properties,
                 cfg.consolidate_target_file_size_mb,
             )
             .max(1);
@@ -2420,6 +2419,7 @@ mod tests {
             batch_ids: vec![],
             collection_config: Some(collection),
             estimated_size: 0,
+            collection_properties: std::collections::HashMap::new(),
         };
 
         let result = engine
@@ -2568,6 +2568,7 @@ mod tests {
             batch_ids: vec![],
             collection_config: Some(collection),
             estimated_size: 0,
+            collection_properties: std::collections::HashMap::new(),
         };
 
         let first = engine
@@ -2690,6 +2691,7 @@ mod tests {
             batch_ids: vec![],
             collection_config: Some(collection),
             estimated_size: 0,
+            collection_properties: std::collections::HashMap::new(),
         };
         let result = engine
             .do_flush(&params)
@@ -2761,7 +2763,7 @@ mod tests {
         );
         assert_eq!(
             engine
-                .should_trigger_compaction(storage_url, &tags)
+                .should_trigger_compaction(storage_url, &tags, &std::collections::HashMap::new())
                 .await
                 .unwrap(),
             Some(1),
@@ -2781,7 +2783,7 @@ mod tests {
         );
         assert_eq!(
             engine
-                .should_trigger_compaction(storage_url, &tags)
+                .should_trigger_compaction(storage_url, &tags, &std::collections::HashMap::new())
                 .await
                 .unwrap(),
             Some(L0_COMPACTION_THRESHOLD),
@@ -2803,7 +2805,7 @@ mod tests {
             .insert(storage_url.to_string());
         assert_eq!(
             engine
-                .should_trigger_compaction(storage_url, &tags)
+                .should_trigger_compaction(storage_url, &tags, &std::collections::HashMap::new())
                 .await
                 .unwrap(),
             Some(L0_COMPACTION_THRESHOLD)

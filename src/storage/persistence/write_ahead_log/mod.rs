@@ -1047,6 +1047,18 @@ pub async fn set_global_catalog(catalog: Arc<crate::catalog::CatalogManager>) {
 pub(crate) async fn resolve_collection_from_catalog(
     collection_id: &str,
 ) -> Option<crate::proto::proximadb_v1::Collection> {
+    resolve_collection_meta_from_catalog(collection_id)
+        .await
+        .map(|meta| meta.collection)
+}
+
+/// [`resolve_collection_from_catalog`] carrying the collection's catalog
+/// properties alongside (TD-COMPACT-15) — same resolution order (table-name
+/// fast path, then id/name scan), same `["default"]`-guaranteed namespace
+/// walk.
+pub(crate) async fn resolve_collection_meta_from_catalog(
+    collection_id: &str,
+) -> Option<CatalogCollectionMeta> {
     let global = get_global_catalog();
     let catalog_manager = global.read().await.clone()?;
 
@@ -1059,7 +1071,10 @@ pub(crate) async fn resolve_collection_from_catalog(
                 &table_id, &schema,
             )
     {
-        return Some(collection);
+        return Some(CatalogCollectionMeta {
+            collection,
+            properties: schema.properties.clone(),
+        });
     }
 
     // Fallback: the identifier is an opaque collection id. Scan the catalog and
@@ -1085,7 +1100,10 @@ pub(crate) async fn resolve_collection_from_catalog(
                         .as_ref()
                         .is_some_and(|cfg| cfg.name == collection_id))
             {
-                return Some(collection);
+                return Some(CatalogCollectionMeta {
+                    collection,
+                    properties: schema.properties.clone(),
+                });
             }
         }
     }
@@ -1096,7 +1114,18 @@ pub(crate) async fn resolve_collection_from_catalog(
 /// an empty vec if no catalog is wired. The catalog is the sole authority, so
 /// this replaces the legacy `provider.list_collections()` lookup used during WAL
 /// recovery.
-pub(crate) async fn list_collections_from_catalog() -> Vec<crate::proto::proximadb_v1::Collection> {
+/// A catalog-resolved collection PLUS its policy properties (TD-COMPACT-15):
+/// the engine-facing proto `Collection` has no properties field, and
+/// deriving policy tags onto it would leak into read-modify-write catalog
+/// saves — so the properties ride alongside, explicitly, from the catalog
+/// walk to the flush plan to `FlushParameters.collection_properties`.
+#[derive(Debug, Clone)]
+pub(crate) struct CatalogCollectionMeta {
+    pub collection: crate::proto::proximadb_v1::Collection,
+    pub properties: std::collections::HashMap<String, String>,
+}
+
+pub(crate) async fn list_collections_from_catalog() -> Vec<CatalogCollectionMeta> {
     let global = get_global_catalog();
     let Some(catalog_manager) = global.read().await.clone() else {
         return Vec::new();
@@ -1118,7 +1147,7 @@ pub(crate) async fn list_collections_from_catalog() -> Vec<crate::proto::proxima
 /// it never fired. The catalog is the identity authority; both paths must agree.
 async fn collections_from_catalog_walk(
     catalog: &dyn proximadb_catalog::Catalog,
-) -> Vec<crate::proto::proximadb_v1::Collection> {
+) -> Vec<CatalogCollectionMeta> {
     let mut collections = Vec::new();
     let mut seen_ids = std::collections::HashSet::new();
     for namespace in catalog_default_namespaces(catalog).await {
@@ -1135,7 +1164,13 @@ async fn collections_from_catalog_walk(
                 )
                 && seen_ids.insert(collection.id.clone())
             {
-                collections.push(collection);
+                collections.push(CatalogCollectionMeta {
+                    collection,
+                    // Policy properties ride alongside (TD-COMPACT-15): the
+                    // proto cannot carry them and derived tags would leak
+                    // into catalog read-modify-write saves.
+                    properties: schema.properties.clone(),
+                });
             }
         }
     }
@@ -1240,14 +1275,15 @@ fn spawn_inline_flush(collection_id: String) {
         #[cfg(feature = "axis")]
         let axis = crate::index::get_global_axis_manager();
         let catalog = list_collections_from_catalog().await;
-        let Some(meta) = catalog.iter().find(|c| c.id == collection_id) else {
+        let Some(meta) = catalog.iter().find(|m| m.collection.id == collection_id) else {
             tracing::warn!(
                 "inline size-flush: no catalog metadata for '{}', skipping",
                 collection_id
             );
             return;
         };
-        let plan = match flush_plan_from_collection_meta(meta) {
+        let plan = match flush_plan_from_collection_meta(&meta.collection, meta.properties.clone())
+        {
             Ok(plan) => plan,
             Err(error) => {
                 tracing::warn!(
@@ -2038,12 +2074,12 @@ impl WriteAheadLogManager {
 
         let memtable_config = crate::storage::memtable::core::MemtableConfig::default();
         let write_buffer = self.shared_wal_behavior.get_or_init(&memtable_config);
-        let collection = resolve_collection_from_catalog(collection_id)
+        let meta = resolve_collection_meta_from_catalog(collection_id)
             .await
             .with_context(|| {
                 format!("cannot flush collection {collection_id:?}: catalog metadata was not found")
             })?;
-        let plan = flush_plan_from_collection_meta(&collection)?;
+        let plan = flush_plan_from_collection_meta(&meta.collection, meta.properties)?;
         #[cfg(feature = "axis")]
         let axis = crate::index::get_global_axis_manager();
         #[cfg(feature = "axis")]
@@ -4126,11 +4162,11 @@ mod td_flush_8_catalog_walk_tests {
 
         let collections = collections_from_catalog_walk(&catalog).await;
         assert!(
-            collections.iter().any(|collection| collection.id == "1"),
+            collections.iter().any(|meta| meta.collection.id == "1"),
             "the WAL id '1' must be catalog-resolvable by the flush-side walk; got ids {:?}",
             collections
                 .iter()
-                .map(|collection| collection.id.clone())
+                .map(|meta| meta.collection.id.clone())
                 .collect::<Vec<_>>()
         );
     }

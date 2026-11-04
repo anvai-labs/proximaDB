@@ -468,6 +468,7 @@ impl RecoveryManager {
             crate::storage::persistence::write_ahead_log::list_collections_from_catalog()
                 .await
                 .into_iter()
+                .map(|meta| meta.collection)
                 .find(|collection| collection.id == collection_id)
                 .and_then(|collection| collection.storage_assignment)
                 .map(|assignment| assignment.base_location);

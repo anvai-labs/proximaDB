@@ -68,7 +68,9 @@ pub use query::{
     ParsedQuantizationConfig, QuantizationLevel, QuantizationType, RlsRecordPredicate,
     StorageQueryContext, StorageQueryMetadata, collection_declares_axis_index,
 };
-pub use results::{CompactionResult, EngineHealth, EngineStatistics, FlushResult};
+pub use results::{
+    CompactionResult, EngineHealth, EngineStatistics, FlushResult, FullCompactionMetrics,
+};
 pub use types::{
     CompactionParameters, FlushParameters, OperationPriority, PerformanceTier,
     StorageEngineStrategy, StorageFormatStrategy,
