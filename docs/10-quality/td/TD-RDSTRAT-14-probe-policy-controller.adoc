@@ -1,0 +1,131 @@
+= TD-RDSTRAT-14: Probe-policy controller — the algorithm/band dial in one module
+:status: Proposed
+:date: 2026-11-04
+:tags: [read-strategy, ivf, probe, policy, performance]
+
+== Problem
+
+The coarse-probe fan-out is the recall↔GETs dial of the IVF-family read
+path, and it was ONE hardcoded power law: `geometric_nprobe =
+ceil(sqrt(k_c) × multiplier)` clamped `[min, max]` — process-global, no
+collection or query identity (the config doc said so verbatim: "no
+per-collection retune without a signature change (TD-RDSTRAT-9 tracks
+the missing controller)").
+
+Measured consequence (e1 beds, 2026-10/11): cells/query grew 12 → 15 → 43
+across 1M → 3M → 10M at a fixed recall gate — GET fan-out ×3.6 per ×10
+corpus (worse than √N), while bytes/GET fell 4.29 → 2.37 MB (scatter
+defeats coalescing). The 10M $/M-queries cost is ~2× the competitive
+target band.
+
+== Correlation with the known algorithm families
+
+The read path is **IVF-family, deliberately not HNSW**: rank cells in RAM
+(the tiny cached directory), then read the chosen cells' extents as
+coalesced ranges matched to the 4-24 MB GET ladder. HNSW's graph hops are
+random-access — one GET per hop on object storage, structurally wrong for
+the dominant cost term (I/O round-trips). HNSW remains only in the
+in-memory axis index where hops are free.
+
+The cascade maps one-to-one onto the quantization families:
+
+[cols="2,2,3,4"]
+|===
+| scheme | bits/dim | our region | role
+| F32 | 32 | Region C (default-on) | exact distances for final winners
+| F16 | 16 | — (absent by design) | SQ8 owns the middle; C is deliberately exact
+| SQ8 | 8 | Region B | rerank; direct SIMD distance, no LUTs
+| PQ4 | ~4 | — (not used) | needs codebooks + per-query LUTs
+| RaBitQ | ~1 + O(1) | Region A | provable-error binary codes; 2-4× tighter than PQ4
+|===
+
+So: **IVF(RaBitQ codes) → SQ8 rerank → F32 exact** — published math; the
+moat is that each tier is a separately placeable, cacheable, billable
+region in one PAX object. This TD makes the tier-1 fan-out POLICY.
+
+== Design
+
+=== One module, named algorithms (never a formula interpreter)
+
+`crates/storage/proximadb-storage-common/src/probe_policy.rs`:
+
+* `ProbeAlgorithm` — closed enum: `Sqrt | CubeRoot | FourthRoot | Log |
+  Fixed | ByteBudget`. Adding a formula = one variant + one pure fn + one
+  unit test, in this file only.
+* `resolve_probe_plan(policy, cells, corpus_rows, rowgroup_bytes,
+  avg_cell_bytes) -> ProbePlan{cells, probe_bytes, band}` — THE one pure
+  function both consumers call.
+* `band_ladder(rowgroup_bytes)` — discrete rungs DERIVED from the
+  rowgroup geometry (the per-backend IOPS budget: 4 MiB cloud/Azure,
+  8 MiB S3, 1 MiB local): `[rg/4, rg/2, rg, 2rg, 4rg]`. Band edges live
+  here and nowhere else.
+* `resolve_probe_policy(properties, tags, server)` — the 4-layer chain
+  (property > tag > server TOML > code), exported as the ONLY resolution
+  path (no single-channel resolvers — the inert-property bug class stays
+  dead at the type level).
+* `validate_probe_properties` — fail-closed SET-time validation.
+
+A formula string in config would be unvalidatable at SET time,
+untestable, and a security/review surface — the enum is the deliberate
+alternative.
+
+=== ByteBudget — the cost-matched form
+
+`budget = base_bytes × (corpus_rows / 1M)^0.25`, cells = budget /
+avg_cell_bytes, snapped to the band ladder, capped by `cap_bytes`
+(default 4 / 32 MiB). Quarter-power growth means 100× data costs ~3.2×
+probe bytes; the cap bounds worst-case fan-out at ~8 coalesced ranges
+regardless of corpus. This is the form that maps directly to GET bytes —
+the planner plans in the unit the bill is written in.
+
+=== Surfaces (this PR)
+
+* Server TOML: `[storage.sst_config.coarse_probe]` gains `algorithm`
+  ("sqrt" default — byte-for-byte the historical formula; the module's
+  regression test pins equality across k_c 1..4096), `base_mb` (4),
+  `cap_mb` (32). Fail-closed at load: an unknown name aborts boot naming
+  the section.
+* Env overrides (the harness/operator escape hatch, same precedence as
+  every other probe knob): `PROXIMADB_PROBE_ALGORITHM`,
+  `PROXIMADB_PROBE_BASE_MB`, `PROXIMADB_PROBE_CAP_MB`.
+* Both consumers rewired through the module: the per-segment probe
+  (`coarse_probe_nprobe` — now carries `path` for the IOPS geometry and
+  the parsed directory for rows/cell bytes) and the collection directory
+  plan (`centroid_directory_nprobe`, closure into `plan_probe`).
+* Bench harness: `--probe-algorithm/--probe-base-mb/--probe-cap-mb` ->
+  env; the resolved policy pins into result.json.
+
+=== Deferred slices (open)
+
+* **Collection-level `probe.*` properties** — land WITH the search-path
+  property carrier (service-resolved properties into the search arc), in
+  the SAME PR so the keys are never accepted-but-inert. The chain
+  resolver + SET validation ship now, un-wired.
+* **Axis advisor mirror** — `ivf_param_advisor` keeps its own curves:
+  its nprobe model is recall-target-driven (better than any blind power
+  law where it matters). Revisit only if the PAX and in-memory bands
+  need to co-tune.
+* **Legacy file/block sqrt pruners** (`effective_nprobe`,
+  `BlockPruneMode::Sqrt`, TD-040 seed, helix/swift siblings) — separate
+  BlockPruneConfig plumbing.
+
+== The default-selection experiment
+
+The point of the policy: the DEFAULT becomes a measured decision. Arms
+{sqrt (control), cbrt, fourth_root, log, byte_budget@4MB, @8MB, @16MB}
+× beds {SIFT 1M, 3M (settled + S=1), 10M}; gates recall@10 ≥ 0.97 (plus
+0.98 sensitivity rows); report GETs/q, MB/q, cells/q, $/M. A non-sqrt
+arm holding recall at ≤50% of control GETs on 10M graduates to a default
+-flip PR with the ledger claim + recall ratchet. If no single formula
+dominates, a scale-conditional default (one more pure fn in the module)
+is the fallback — though `byte_budget`'s `(rows/1M)^0.25` factor IS the
+scale adaptation and is expected to win outright.
+
+== Relations
+
+* TD-RDSTRAT-9 — the collection read-cost envelope; this IS its missing
+  controller
+* TD-RDSTRAT-8 PR-B / TD-PAXDIR-1 D2 — the probe consumers this rewires
+* TD-RDSTRAT-13 — morsel-parallel rank downstream of the probe
+* TD-COMPACT-2b / TD-COMPACT-15 — the policy-chain pattern this follows
+* The competitive analysis (2026-11) — the 10M GET fan-out is lever #1

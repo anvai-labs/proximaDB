@@ -3656,6 +3656,12 @@ pub struct CoarseProbeSettings {
     /// TD-IVF-3 write-side floor on the coarse-PCA projection width; 0 = legacy
     /// formula. Read by `block_cluster::ivf_ncomp_floor()`.
     pub ncomp_floor: usize,
+    /// TD-RDSTRAT-9: the resolved probe policy (algorithm + budgets). The
+    /// numeric fields above are the policy's root-form params — kept flat
+    /// because they predate it; `policy()` folds them.
+    pub probe_algorithm: proximadb_storage_common::probe_policy::ProbeAlgorithm,
+    pub probe_base_bytes: u64,
+    pub probe_cap_bytes: u64,
 }
 
 // TD-COMPACT-9: overwritable, NOT first-wins. Every production `SstEngine::new()`
@@ -3698,6 +3704,12 @@ impl From<crate::core::config::CoarseProbeConfig> for CoarseProbeSettings {
             nprobe_min: c.nprobe_min,
             nprobe_max: c.nprobe_max,
             ncomp_floor: c.ncomp_floor,
+            probe_algorithm: proximadb_storage_common::probe_policy::ProbeAlgorithm::parse(
+                &c.algorithm,
+            )
+            .unwrap_or_default(),
+            probe_base_bytes: c.base_mb * 1024 * 1024,
+            probe_cap_bytes: c.cap_mb * 1024 * 1024,
         }
     }
 }
@@ -3710,21 +3722,69 @@ pub(crate) fn coarse_probe_settings() -> CoarseProbeSettings {
         .unwrap_or_default()
 }
 
-/// Geometric nprobe: `ceil(sqrt(k_c) × multiplier)`, clamped to `[min, max]`
-/// then to `k_c`. Sub-linear in corpus (V^0.25): ~56× fewer ranks than full-scan
-/// at 1M. The default multiplier 2.0 is recall-ratcheted by the settled
-/// one-segment SIFT1M geometry (11/30 cells, recall@10 >= 0.98); operators may
-/// trade quality for fewer bytes via TOML. The max-then-min ordering avoids the
-/// `clamp(min, k_c)` panic when `k_c < min` (no-panic mandate #4).
-fn geometric_nprobe(k_c: usize, s: CoarseProbeSettings) -> usize {
-    let raw = ((k_c as f32).sqrt() * s.nprobe_multiplier).ceil() as usize;
-    let floored = raw.max(s.nprobe_min);
-    let bounded = if s.nprobe_max > 0 {
-        floored.min(s.nprobe_max)
-    } else {
-        floored
+/// Fold the flat settings (the historical root-form params) into the
+/// TD-RDSTRAT-9 probe policy. All probe-band formulas live in
+/// `proximadb-storage-common::probe_policy` — tuned in ONE place.
+fn settings_policy(s: &CoarseProbeSettings) -> proximadb_storage_common::probe_policy::ProbePolicy {
+    let mut policy = proximadb_storage_common::probe_policy::ProbePolicy {
+        algorithm: s.probe_algorithm,
+        multiplier: s.nprobe_multiplier as f64,
+        min_cells: s.nprobe_min,
+        max_cells: s.nprobe_max,
+        base_bytes: s.probe_base_bytes,
+        cap_bytes: s.probe_cap_bytes,
     };
-    bounded.min(k_c.max(1))
+    // TD-RDSTRAT-9 env overrides (the bench-harness and operator escape
+    // hatch — the same precedence every other probe knob has):
+    // env > TOML > code default.
+    if let Ok(name) = std::env::var("PROXIMADB_PROBE_ALGORITHM")
+        && let Some(algorithm) =
+            proximadb_storage_common::probe_policy::ProbeAlgorithm::parse(&name)
+    {
+        policy.algorithm = algorithm;
+    }
+    if let Ok(base) = std::env::var("PROXIMADB_PROBE_BASE_MB")
+        && let Ok(base) = base.trim().parse::<u64>()
+        && base > 0
+    {
+        policy.base_bytes = base * 1024 * 1024;
+    }
+    if let Ok(cap) = std::env::var("PROXIMADB_PROBE_CAP_MB")
+        && let Ok(cap) = cap.trim().parse::<u64>()
+        && cap > 0
+    {
+        policy.cap_bytes = cap * 1024 * 1024;
+    }
+    policy
+}
+
+/// Policy nprobe (TD-RDSTRAT-9): the resolved plan's cell count for a pool of
+/// `cells` candidates. The default (`sqrt`) is byte-for-byte the historical
+/// `ceil(sqrt(k_c) × multiplier)` clamped `[min, max]` then to the pool (the
+/// module's regression test pins equality across k_c 1..4096). Callers with
+/// corpus/rowgroup/cell-byte context at hand pass them so non-root forms
+/// (`byte_budget`) scale correctly; root forms ignore them.
+fn geometric_nprobe(
+    k_c: usize,
+    s: CoarseProbeSettings,
+    corpus_rows: u64,
+    rowgroup_bytes: u64,
+    avg_cell_bytes: u64,
+) -> usize {
+    let plan = proximadb_storage_common::probe_policy::resolve_probe_plan(
+        &settings_policy(&s),
+        k_c,
+        corpus_rows,
+        rowgroup_bytes,
+        avg_cell_bytes,
+    );
+    plan.cells
+}
+
+/// Root-form compatibility shim: the historical two-argument call. Root forms
+/// are corpus/geometry-invariant, so the extra inputs are neutral defaults.
+fn geometric_nprobe_root(k_c: usize, s: CoarseProbeSettings) -> usize {
+    geometric_nprobe(k_c, s, 0, 4 * 1024 * 1024, 0)
 }
 
 /// TD-RDSTRAT-8 PR-B gate: engage the Region-A0 coarse probe on v3 segments.
@@ -3753,12 +3813,35 @@ pub fn coarse_probe_enabled() -> bool {
 /// `ceil(sqrt(k_c) × multiplier)` from the TOML config
 /// (`[storage.sst_config.coarse_probe] nprobe_multiplier/min/max`), clamped to
 /// `k_c`. `>= k_c` is exact mode (every cell).
-fn coarse_probe_nprobe(k_c: usize) -> usize {
+/// TD-RDSTRAT-9: per-segment nprobe with the probe context the policy
+/// needs (`path` → the rowgroup/IOPS geometry; the parsed directory →
+/// corpus rows and mean cell bytes). Env override precedence unchanged.
+fn coarse_probe_nprobe(
+    k_c: usize,
+    path: &str,
+    dir: &proximadb_storage_common::coarse_directory::CoarseDirectory,
+) -> usize {
+    let corpus_rows = dir.cells.iter().map(|c| c.row_end).max().unwrap_or(0);
+    let avg_cell_bytes = if k_c > 0 {
+        dir.cells.iter().map(|c| c.a_len).sum::<u64>() / k_c as u64
+    } else {
+        0
+    };
+    let rowgroup_bytes =
+        proximadb_storage_common::iops_budget::IopsBudget::for_path(path).target_block_bytes();
     std::env::var("PROXIMADB_PAX_READ_COARSE_NPROBE")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|n| *n > 0)
-        .unwrap_or_else(|| geometric_nprobe(k_c, coarse_probe_settings()))
+        .unwrap_or_else(|| {
+            geometric_nprobe(
+                k_c,
+                coarse_probe_settings(),
+                corpus_rows,
+                rowgroup_bytes,
+                avg_cell_bytes,
+            )
+        })
         .min(k_c.max(1))
 }
 
@@ -3768,12 +3851,25 @@ fn coarse_probe_nprobe(k_c: usize) -> usize {
 /// default as the per-segment probe, applied to the **total** usable cells
 /// (`ceil(sqrt(cells) × multiplier)`), so S segments of k cells probe about
 /// `2·sqrt(S·k)` cells instead of `S · 2·sqrt(k)`.
-pub(crate) fn centroid_directory_nprobe(total_cells: usize) -> usize {
+pub(crate) fn centroid_directory_nprobe(
+    total_cells: usize,
+    corpus_rows: u64,
+    rowgroup_bytes: u64,
+    avg_cell_bytes: u64,
+) -> usize {
     std::env::var("PROXIMADB_PAX_READ_CENTROID_DIRECTORY_NPROBE")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|n| *n > 0)
-        .unwrap_or_else(|| geometric_nprobe(total_cells, coarse_probe_settings()))
+        .unwrap_or_else(|| {
+            geometric_nprobe(
+                total_cells,
+                coarse_probe_settings(),
+                corpus_rows,
+                rowgroup_bytes,
+                avg_cell_bytes,
+            )
+        })
         .min(total_cells.max(1))
 }
 
@@ -4150,7 +4246,7 @@ async fn coarse_probe_survivors(
         })
         .collect();
     cell_dist.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-    let nprobe = coarse_probe_nprobe(k_c);
+    let nprobe = coarse_probe_nprobe(k_c, path, &dir);
     // TD-PAXDIR-1 D2: the collection directory already ranked this segment's
     // cells against every other segment's; probe exactly its choice (valid,
     // non-empty, distinct cells only). Filtered queries never carry a

@@ -238,10 +238,29 @@ pub(crate) fn plan_segments<'a>(
             size_bytes,
         });
     }
-    let plan = dir.plan_probe(query, &live, centroid_directory_nprobe, |rows| {
-        let rows = usize::try_from(rows).unwrap_or(usize::MAX);
-        pax_rabitq_pool_for_top_k(k, rows) as u64
-    })?;
+    // TD-RDSTRAT-9: the probe policy needs corpus/geometry context. The
+    // collection plan covers every live segment; the rowgroup geometry is
+    // the IOPS budget of the first URL (one collection = one backend class).
+    let corpus_rows: u64 = dir.segments.iter().map(|s| s.rows_covered).sum();
+    let first_url = url_by_name
+        .values()
+        .next()
+        .map(String::as_str)
+        .unwrap_or("");
+    let rowgroup_bytes =
+        proximadb_storage_common::iops_budget::IopsBudget::for_path(first_url).target_block_bytes();
+    // `DirectoryCell` carries no Region-A extents (those live in each
+    // segment's own A0 directory) — avg_cell_bytes = 0 lets the policy's
+    // documented rowgroup-based estimate stand; root forms ignore it.
+    let plan = dir.plan_probe(
+        query,
+        &live,
+        |total_cells: usize| centroid_directory_nprobe(total_cells, corpus_rows, rowgroup_bytes, 0),
+        |rows| {
+            let rows = usize::try_from(rows).unwrap_or(usize::MAX);
+            pax_rabitq_pool_for_top_k(k, rows) as u64
+        },
+    )?;
     let decode_keys = directory_decode_keys_read_enabled();
     let keyed: HashMap<&str, usize> = dir
         .segments

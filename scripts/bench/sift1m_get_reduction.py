@@ -2321,6 +2321,9 @@ class OwnedServer:
         ivf_k: int | None = None,
         n_comp: int | None = None,
         nprobe: int | None = None,
+        probe_algorithm: str | None = None,
+        probe_base_mb: int | None = None,
+        probe_cap_mb: int | None = None,
         training_compaction_min_mb: int | None = None,
         azure_emulator: bool = False,
         s3_endpoint: str | None = None,
@@ -2341,6 +2344,9 @@ class OwnedServer:
         self.ivf_k = ivf_k
         self.n_comp = n_comp
         self.nprobe = nprobe
+        self.probe_algorithm = probe_algorithm
+        self.probe_base_mb = probe_base_mb
+        self.probe_cap_mb = probe_cap_mb
         self.training_compaction_min_mb = training_compaction_min_mb
         self.azure_emulator = azure_emulator
         self.s3_endpoint = s3_endpoint
@@ -2493,6 +2499,12 @@ class OwnedServer:
                 if self.centroid_directory in ("on", "default")
                 else "PROXIMADB_PAX_READ_COARSE_NPROBE"
             ] = str(self.nprobe)
+        if self.probe_algorithm is not None:
+            environment["PROXIMADB_PROBE_ALGORITHM"] = self.probe_algorithm
+        if self.probe_base_mb is not None:
+            environment["PROXIMADB_PROBE_BASE_MB"] = str(self.probe_base_mb)
+        if self.probe_cap_mb is not None:
+            environment["PROXIMADB_PROBE_CAP_MB"] = str(self.probe_cap_mb)
         if self.training_compaction_min_mb is not None:
             environment["PROXIMADB_TRAINING_COMPACTION_MIN_MB"] = str(
                 self.training_compaction_min_mb
@@ -3403,6 +3415,24 @@ def main() -> int:
         help="force query-time coarse cells (scale experiments only)",
     )
     parser.add_argument(
+        "--probe-algorithm",
+        choices=["sqrt", "cbrt", "fourth_root", "log", "fixed", "byte_budget"],
+        help=(
+            "TD-RDSTRAT-9 probe-band algorithm (PROXIMADB_PROBE_ALGORITHM); "
+            "default sqrt. The recall-vs-GETs dial for the ladder experiment"
+        ),
+    )
+    parser.add_argument(
+        "--probe-base-mb",
+        type=int,
+        help="byte_budget/log base probe budget in MiB (PROXIMADB_PROBE_BASE_MB)",
+    )
+    parser.add_argument(
+        "--probe-cap-mb",
+        type=int,
+        help="hard per-query probe byte cap in MiB (PROXIMADB_PROBE_CAP_MB)",
+    )
+    parser.add_argument(
         "--adaptive-read-strategy",
         action="store_true",
         help=(
@@ -3805,6 +3835,11 @@ def main() -> int:
             "ivf_k_override": args.ivf_k,
             "n_comp_override": args.n_comp,
             "nprobe_override": args.nprobe,
+            "probe_policy": {
+                "algorithm": args.probe_algorithm,
+                "base_mb": args.probe_base_mb,
+                "cap_mb": args.probe_cap_mb,
+            },
             "training_compaction_min_mb_override": (
                 args.training_compaction_min_mb
             ),
@@ -3891,6 +3926,9 @@ def main() -> int:
                 ivf_k=args.ivf_k,
                 n_comp=args.n_comp,
                 nprobe=args.nprobe,
+                probe_algorithm=args.probe_algorithm,
+                probe_base_mb=args.probe_base_mb,
+                probe_cap_mb=args.probe_cap_mb,
                 training_compaction_min_mb=args.training_compaction_min_mb,
                 azure_emulator=args.azurite,
                 s3_endpoint=args.s3_endpoint,

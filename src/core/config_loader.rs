@@ -149,6 +149,17 @@ impl ConfigLoader {
             })?;
         }
         if let Some(sst_config) = &config.storage.sst_config {
+            if let Some(probe_cfg) = &sst_config.coarse_probe {
+                probe_cfg
+                    .validate("storage.sst_config.coarse_probe")
+                    .map_err(|err| {
+                        let message = format!("Invalid coarse-probe configuration: {err}");
+                        Box::new(std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            message,
+                        )) as Box<dyn std::error::Error + Send + Sync>
+                    })?;
+            }
             sst_config.validate().map_err(|err| {
                 let message = format!("Invalid SST configuration: {err}");
                 Box::new(std::io::Error::new(

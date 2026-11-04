@@ -1770,6 +1770,33 @@ pub struct CoarseProbeConfig {
     /// and PCA-conditioning bake. Env: `PROXIMADB_IVF_NCOMP_FLOOR`.
     #[serde(default)]
     pub ncomp_floor: usize,
+    /// TD-RDSTRAT-9: the probe-band ALGORITHM (see
+    /// `proximadb-storage-common::probe_policy`). One of sqrt|cbrt|
+    /// fourth_root|log|fixed|byte_budget. Default "sqrt" — byte-for-byte
+    /// the historical `ceil(sqrt(k_c) × nprobe_multiplier)` behavior; a
+    /// different default requires the recall-gated bed experiment + a
+    /// ledger claim. Fail-closed at load: an unknown name aborts boot.
+    #[serde(default = "default_probe_algorithm")]
+    pub algorithm: String,
+    /// Base per-query probe byte budget for `byte_budget`/`log` (MiB).
+    /// Default 4.
+    #[serde(default = "default_probe_base_mb")]
+    pub base_mb: u64,
+    /// Hard per-query probe byte cap (MiB; 0 = none). Default 32.
+    #[serde(default = "default_probe_cap_mb")]
+    pub cap_mb: u64,
+}
+
+fn default_probe_algorithm() -> String {
+    "sqrt".to_string()
+}
+
+fn default_probe_base_mb() -> u64 {
+    4
+}
+
+fn default_probe_cap_mb() -> u64 {
+    32
 }
 
 /// Cache population performed only after a segment is atomically published.
@@ -1820,7 +1847,34 @@ impl Default for CoarseProbeConfig {
             nprobe_min: default_nprobe_min(),
             nprobe_max: 0,
             ncomp_floor: 0, // TD-IVF-3: disabled until the bake clears it
+            algorithm: default_probe_algorithm(),
+            base_mb: default_probe_base_mb(),
+            cap_mb: default_probe_cap_mb(),
         }
+    }
+}
+
+impl CoarseProbeConfig {
+    /// TD-RDSTRAT-9: fail-closed validation — an unknown algorithm name
+    /// aborts boot with the section and the valid names (never a silent
+    /// fallback to sqrt, the dead-config hazard).
+    pub fn validate(&self, section: &str) -> Result<(), String> {
+        if proximadb_storage_common::probe_policy::ProbeAlgorithm::parse(&self.algorithm).is_none()
+        {
+            return Err(format!(
+                "{section}.algorithm must be one of sqrt|cbrt|fourth_root|log|fixed|byte_budget \
+                 (got '{}')",
+                self.algorithm
+            ));
+        }
+        if self.base_mb == 0 || self.cap_mb != 0 && self.cap_mb < self.base_mb {
+            return Err(format!(
+                "{section}.base_mb/cap_mb must be a positive base with cap >= base \
+                 (base_mb={}, cap_mb={})",
+                self.base_mb, self.cap_mb
+            ));
+        }
+        Ok(())
     }
 }
 
