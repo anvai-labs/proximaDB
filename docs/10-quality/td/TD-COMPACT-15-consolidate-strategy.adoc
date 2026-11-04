@@ -1,5 +1,5 @@
-= TD-COMPACT-15: Consolidate compaction strategy — policy-driven segment-count targeting
-:status: Proposed
+= TD-COMPACT-15: Consolidate compaction strategy — policy-driven segment-size targeting
+:status: Accepted
 :date: 2026-11-03
 :tags: [compaction, lsm, policy, performance]
 
@@ -148,15 +148,61 @@ Surfaces:
   read-heavy), a "compact after N seconds of write idle" trigger; defer
   until there's demand.
 
-== Experiments needed
+== Experiments
 
-1. **S=1 collapse** (binary building): the GET-reduction data point
-2. **Smallest vs largest**: run both on the f32 bed, compare write
-   amplification and total time
-3. **Various targets**: S=1, S=2, S=4 on the same bed to map the
-   GET-vs-target curve
-4. **Write-heavy stress**: verify the guardrail prevents the 1 TB
-   rewrite catastrophe
+=== 1. S=1 collapse — MEASURED (2026-11-04)
+
+The settled f32 bed (p5e-f32ev-build, 3M vectors, 2.60 GB, Region E +
+cat3 filter, 1000 queries) measured as-settled (L1+L2+L5 = 3 segments)
+versus collapsed to 1 segment via COMPACT FULL — same bed, same objects,
+byte-identical rows/model/queries (harness `--skip-ingest` +
+`--compact-full-before-measure`, which compacts through Arrow Flight
+inside the harness and re-settles before measuring):
+
+[cols="1,4,4,3,3", options="header"]
+|===
+| phase | metric | S=3 (settled) | S=1 (collapsed) | delta
+| post_write | GETs/query | 53.47 | 18.31 | -65.8%
+| post_write | $/M queries | 21.47 | 7.35 | -65.8%
+| post_write | p50 | 458.30 ms | 147.14 ms | -67.9%
+| local_disk_warm | GETs/query | 53.41 | 18.05 | -66.2%
+| local_disk_warm | $/M queries | 21.44 | 7.26 | -66.1%
+| object_cold | GETs/query | 61.32 | 45.63 | -25.6%
+| object_cold | $/M queries | 24.58 | 18.29 | -25.6%
+| all phases | recall@10 | 0.983-0.985 | 0.978-0.982 | -0.3..-0.5pp (gate >= 0.97 held)
+|===
+
+* The compact itself is byte-neutral: 2,604,342,955 -> 2,603,536,050
+  bytes (-0.03%) for 3 -> 1 segments.
+* Warm-path improvement (−66%) is larger than object-cold (−26%): cold
+  runs still pay the centroid-directory/A0 loads, while the per-segment
+  footer/probe overhead disappears entirely.
+* One merged directory: cells/query 70.66 -> 21.00 (three per-segment
+  directories become one).
+* Recall dips 0.3-0.5pp — the known clustering-geometry effect of
+  directory retraining at merge, within the f32-baseline tolerance.
+
+Build-time corroboration (e1f beds, 2026-10-27, separate builds,
+unfiltered): S=1 23.6 / S=2 41.7 / S=3 49.9 GETs/query object-cold —
+the same shape from a different construction path.
+
+Conclusion: **the segment count IS the dominant query-cost dial**; the
+consolidate strategy automates exactly this collapse.
+
+=== 2. Smallest vs largest — open
+
+Run both orders on the f32 bed, compare write amplification and total
+time (the 3.6x claim in <<Smallest-first,§Smallest-first>> is analysis,
+not yet measured end-to-end).
+
+=== 3. Various targets — partially measured
+
+Build-time S=1/2/3/4 curve above; the compact-path curve (S=1, S=2 on
+the same collapsed bed) is open.
+
+=== 4. Write-heavy stress — open
+
+Verify the guardrail prevents the 1 TB rewrite catastrophe.
 
 == Relations
 
