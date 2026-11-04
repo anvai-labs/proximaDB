@@ -1691,7 +1691,14 @@ fn protection_prefix_matches(key: &str, prefix: &str) -> bool {
             })
         })
         .unwrap_or(key);
-    location.starts_with(prefix.strip_suffix('/').unwrap_or(prefix))
+    // Segment-boundary match: a prefix names a directory (or an exact
+    // object), so `…/x//data` must NOT cover the sibling `…/x//data-other`
+    // (a plain string prefix would — `data-other` starts with `data`).
+    let trimmed = prefix.strip_suffix('/').unwrap_or(prefix);
+    let Some(rest) = location.strip_prefix(trimmed) else {
+        return false;
+    };
+    rest.is_empty() || rest.starts_with('/')
 }
 
 /// Normalize only documented backend scheme aliases and absolute local URLs.
