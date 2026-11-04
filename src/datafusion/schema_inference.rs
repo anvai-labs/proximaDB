@@ -248,29 +248,24 @@ pub fn statistics_from_splits(
     }
 }
 
-/// Opt-in gate for projecting typed min/max value bounds into DataFusion
-/// `ColumnStatistics` (default **off**, per the default-OFF mandate for
-/// planner-behavior changes): bounds enable DataFusion 54's recursive
-/// interval-based filter-selectivity analysis, deepening plan-time recursion
-/// on join+subquery-heavy shapes (TPC-H Q2 class) whose debug-build stack use
-/// is already borderline on some environments. Enable with
-/// `PROXIMADB_DF_STATS_VALUE_BOUNDS=1` once that recursion depth is
-/// characterized; row/null/NDV statistics flow regardless.
-///
-/// When ON, numeric bounds are reported `Exact` (see `statistics_from_splits`),
-/// which additionally unlocks the *non-recursive* `AggregateStatistics` rule to
-/// elide unfiltered `MIN`/`MAX` from the footer (e.g. ClickBench q07's
-/// `MIN/MAX(EventDate)` — a 10 s full scan today answered from metadata). That
-/// aggregate-elision path is unrelated to the filter-selectivity recursion that
-/// keeps the default OFF; `COUNT(col)` elision (via exact `null_count`) is wired
-/// unconditionally and needs no gate.
-pub fn df_stats_value_bounds_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("PROXIMADB_DF_STATS_VALUE_BOUNDS")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false)
-    })
+proximadb_config::env_gate! {
+    /// Opt-in gate for projecting typed min/max value bounds into DataFusion
+    /// `ColumnStatistics` (default **off**, per the default-OFF mandate for
+    /// planner-behavior changes): bounds enable DataFusion 54's recursive
+    /// interval-based filter-selectivity analysis, deepening plan-time recursion
+    /// on join+subquery-heavy shapes (TPC-H Q2 class) whose debug-build stack use
+    /// is already borderline on some environments. Enable with
+    /// `PROXIMADB_DF_STATS_VALUE_BOUNDS=1` once that recursion depth is
+    /// characterized; row/null/NDV statistics flow regardless.
+    ///
+    /// When ON, numeric bounds are reported `Exact` (see `statistics_from_splits`),
+    /// which additionally unlocks the *non-recursive* `AggregateStatistics` rule to
+    /// elide unfiltered `MIN`/`MAX` from the footer (e.g. ClickBench q07's
+    /// `MIN/MAX(EventDate)` — a 10 s full scan today answered from metadata). That
+    /// aggregate-elision path is unrelated to the filter-selectivity recursion that
+    /// keeps the default OFF; `COUNT(col)` elision (via exact `null_count`) is wired
+    /// unconditionally and needs no gate.
+    pub fn df_stats_value_bounds_enabled() { gate: "PROXIMADB_DF_STATS_VALUE_BOUNDS", default: false }
 }
 
 /// Narrow a table-wide [`Statistics`] to a projection, preserving the

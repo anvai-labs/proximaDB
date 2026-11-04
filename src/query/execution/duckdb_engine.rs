@@ -31,13 +31,8 @@ use async_trait::async_trait;
 /// candidate so its cells warm through the router. Mirrors
 /// [`super::native_engine::native_route_enabled`]; ledger-gated promotion per
 /// the ADR-054 progressive-cutover discipline.
-pub fn duckdb_route_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("PROXIMADB_DUCKDB_ROUTE")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false)
-    })
+proximadb_config::env_gate! {
+    pub fn duckdb_route_enabled() { gate: "PROXIMADB_DUCKDB_ROUTE", default: false }
 }
 
 /// In-process DuckDB OLAP engine. Stateless — a fresh in-memory DuckDB is opened

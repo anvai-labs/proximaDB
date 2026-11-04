@@ -28,17 +28,12 @@ use super::engine::ExecutionPipelineResult;
 /// ADR-054 §7 Phase 0.5 / TD-OLAP-11 §Gate: "mismatch rate >0.1% → auto-demote".
 pub const MISMATCH_DEMOTE_THRESHOLD: f64 = 0.001;
 
-/// Gate: is native-vs-Volcano shadow comparison opted in? Default OFF — shadow
-/// mode runs every native-handled query twice (native + Volcano), so it is a
-/// validation/CI switch, not a production default (TD-OLAP-11 §Gate flag,
-/// distinct from `PROXIMADB_NATIVE_JOIN`).
-pub fn native_join_shadow_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("PROXIMADB_NATIVE_JOIN_SHADOW")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false)
-    })
+proximadb_config::env_gate! {
+    /// Gate: is native-vs-Volcano shadow comparison opted in? Default OFF — shadow
+    /// mode runs every native-handled query twice (native + Volcano), so it is a
+    /// validation/CI switch, not a production default (TD-OLAP-11 §Gate flag,
+    /// distinct from `PROXIMADB_NATIVE_JOIN`).
+    pub fn native_join_shadow_enabled() { gate: "PROXIMADB_NATIVE_JOIN_SHADOW", default: false }
 }
 
 /// The outcome of one shadow comparison.
