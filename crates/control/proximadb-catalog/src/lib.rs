@@ -2739,8 +2739,16 @@ pub trait Catalog: Send + Sync {
         identifier: &TableIdentifier,
         index_name: &str,
     ) -> anyhow::Result<bool>;
-    async fn list_indexes(&self, identifier: &TableIdentifier)
-    -> anyhow::Result<Vec<CatalogIndex>>;
+    /// List a table's indexes. Default: the table's schema-declared indexes
+    /// (the former identical glue/iceberg/polaris/unity bodies). Backends
+    /// storing indexes elsewhere (e.g. delta's table properties) override.
+    async fn list_indexes(
+        &self,
+        identifier: &TableIdentifier,
+    ) -> anyhow::Result<Vec<CatalogIndex>> {
+        let schema = self.get_table(identifier).await?;
+        Ok(schema.indexes)
+    }
 
     // Statistics
     async fn get_statistics(
