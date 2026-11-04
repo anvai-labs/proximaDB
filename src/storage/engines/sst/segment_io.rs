@@ -1336,8 +1336,8 @@ mod tests {
     /// GET on a resident collection (review B1: the first guard matched only
     /// `.read_range(` and missed the batched and whole-object reads).
     ///
-    /// TD-TIER-1 SC4 (readers outside the vector profile): the pin now covers
-    /// the non-vector readers too — the point-lookup/scan PAX path
+    /// TD-TIER-1 SC4 (readers outside the vector profile): the pin covers the
+    /// non-vector readers too — the point-lookup/scan PAX path
     /// (`trait_impl.rs`), the legacy `.sst` reader (`sst_query_engine.rs`),
     /// and the DataFusion PAX adapter (`pax_adapter.rs`) — plus
     /// `search/operations.rs`, whose point-lookup was silently uncovered (it
@@ -1348,63 +1348,211 @@ mod tests {
     /// originally a line-broken `fs\n    .read(` that a raw-substring guard
     /// cannot see — exactly the evasion this guard exists to prevent.
     ///
-    /// Files whose internal helpers self-call `read_range` (the legacy reader)
-    /// or that read through wrapper handles (`caching_filesystem`) are pinned
-    /// on the FILESYSTEM-OBJECT call forms only; the four original files are
-    /// pinned on the strict forms.
+    /// Source PREPARATION (review round-1 B1): the previous helper split at
+    /// the first literal `#[cfg(test)]`, which truncates at an attribute
+    /// mentioned inside a `//` comment (segment_format.rs line 33) or at the
+    /// FIRST interleaved test mod — sst_query_engine.rs's routed sites at
+    /// ~2105/~4906/~5220/~5448/~5582 all sat AFTER its first test mod and
+    /// were therefore never actually pinned. Preparation now (a) strips `//`
+    /// line comments first and (b) cuts every real `#[cfg(test)]` ITEM with
+    /// a brace-aware scanner, so production code after interleaved test mods
+    /// stays pinned and files whose tests live at the end are handled by the
+    /// same scanner. Truncation sentinels below fail loudly if a future
+    /// preparation regression re-guts the pin.
+    ///
+    /// Accepted limitations (disclosed on the TD row): the comment strip
+    /// eats the rest of a line containing `//` inside a string literal (none
+    /// in the pinned files' production code); the brace scanner counts
+    /// braces inside string literals (none unbalanced there); and the
+    /// FILESYSTEM-OBJECT forms match on the receiver NAME `fs` — a rename
+    /// evades them (a future `source preparation` could match on type, not
+    /// text).
     #[test]
     fn segment_readers_route_reads_through_residency() {
-        fn non_test(source: &str) -> &str {
-            source.split("#[cfg(test)]").next().unwrap_or_default()
+        fn strip_line_comments(source: &str) -> String {
+            source
+                .lines()
+                .map(|line| match line.find("//") {
+                    Some(cut) => &line[..cut],
+                    None => line,
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
         }
+
+        /// Index just past the `}` matching the `{` at `open_at` (None when
+        /// the braces never balance — cut to end-of-source in that case; the
+        /// sentinels below make that visible instead of silent).
+        fn balanced_brace_end(source: &str, open_at: usize) -> Option<usize> {
+            let mut depth = 0usize;
+            for (i, b) in source.bytes().enumerate().skip(open_at) {
+                match b {
+                    b'{' => depth += 1,
+                    b'}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return Some(i + 1);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            None
+        }
+
+        /// Every `#[cfg(test)]` ITEM cut — the attribute(s), the item head,
+        /// and for braced items the whole balanced body (`mod tests { … }`,
+        /// test-only `fn`s, `#[cfg(test)] use …;`). Chained attributes
+        /// (`#[cfg(test)] #[path = "…"] mod tests;`) are skipped to the item
+        /// head; a `;`-terminated item ends at the semicolon.
+        fn without_test_items(source: &str) -> String {
+            const ATTR: &str = "#[cfg(test)]";
+            let mut prepared = String::with_capacity(source.len());
+            let mut cursor = 0usize;
+            while let Some(attr_at) = source[cursor..].find(ATTR).map(|i| i + cursor) {
+                prepared.push_str(&source[cursor..attr_at]);
+                let mut i = attr_at + ATTR.len();
+                loop {
+                    i += source[i..].len() - source[i..].trim_start().len();
+                    if !source[i..].starts_with("#[") {
+                        break;
+                    }
+                    let mut depth = 0isize;
+                    while i < source.len() {
+                        match source.as_bytes()[i] {
+                            b'[' => depth += 1,
+                            b']' => {
+                                depth -= 1;
+                                if depth == 0 {
+                                    i += 1;
+                                    break;
+                                }
+                            }
+                            _ => {}
+                        }
+                        i += 1;
+                    }
+                }
+                let item_end = match source[i..].find(['{', ';']) {
+                    Some(rel) => {
+                        let at = i + rel;
+                        if source.as_bytes()[at] == b';' {
+                            at + 1
+                        } else {
+                            balanced_brace_end(source, at).unwrap_or(source.len())
+                        }
+                    }
+                    None => source.len(),
+                };
+                cursor = item_end;
+            }
+            prepared.push_str(&source[cursor..]);
+            prepared
+        }
+
+        fn production_source(source: &str) -> String {
+            without_test_items(&strip_line_comments(source))
+        }
+
         fn norm(source: &str) -> String {
             source.replace(['\n', '\t', ' '], "")
         }
-        for (name, source, filesystem_object_forms_only) in [
+
+        // Truncation sentinels (review round-1 B1): each prepared source
+        // must still reach the END of its file's production code — the old
+        // first-`#[cfg(test)]`-split pinned 0.5% of segment_format.rs (first
+        // hit: a comment), 3.5% of search/mod.rs (a mid-file test-only fn)
+        // and only lines 1-1437 of sst_query_engine.rs. Each sentinel names
+        // a production identifier from deep inside the previously-truncated
+        // region.
+        let segment_format = production_source(include_str!("segment_format.rs"));
+        assert!(
+            segment_format.contains("rabitq_search_segment_coalesced_allowed"),
+            "segment_format.rs preparation truncated: its last production fn \
+             (rabitq_search_segment_coalesced_allowed, ~line 4911) is gone"
+        );
+        let search_mod = production_source(include_str!("search/mod.rs"));
+        assert!(
+            search_mod.contains("morsel_degree"),
+            "search/mod.rs preparation truncated: morsel_degree (~line 267, \
+             past the first test-only item) is gone"
+        );
+        let legacy_reader = production_source(include_str!("readers/sst_query_engine.rs"));
+        assert!(
+            legacy_reader.contains("MemoryPressure"),
+            "sst_query_engine.rs preparation truncated: MemoryPressure \
+             (~line 6829, past the interleaved test mods) is gone"
+        );
+
+        // STRICT pins: files whose every production read routes through the
+        // seam — no direct ranged/batched/whole-object read may appear.
+        for (name, source) in [
+            ("segment_format.rs", segment_format.as_str()),
             (
-                "segment_format.rs",
-                include_str!("segment_format.rs"),
-                false,
+                "oid_resolve.rs",
+                production_source(include_str!("oid_resolve.rs")).as_str(),
             ),
-            ("oid_resolve.rs", include_str!("oid_resolve.rs"), false),
-            ("search/mod.rs", include_str!("search/mod.rs"), false),
+            ("search/mod.rs", search_mod.as_str()),
             (
-                "centroid_directory_reader.rs (non-test)",
-                non_test(include_str!("centroid_directory_reader.rs")),
-                false,
+                "centroid_directory_reader.rs — directory reads",
+                production_source(include_str!("centroid_directory_reader.rs")).as_str(),
             ),
             (
-                "trait_impl.rs (non-test) — point-lookup/scan PAX path",
-                non_test(include_str!("trait_impl.rs")),
-                false,
-            ),
-            (
-                "readers/sst_query_engine.rs (non-test) — legacy .sst reader",
-                non_test(include_str!("readers/sst_query_engine.rs")),
-                true,
-            ),
-            (
-                "search/operations.rs (non-test) — point-lookup coverage hole",
-                non_test(include_str!("search/operations.rs")),
-                true,
+                "trait_impl.rs — point-lookup/scan PAX path",
+                production_source(include_str!("trait_impl.rs")).as_str(),
             ),
         ] {
             let normalized = norm(source);
-            let banned: &[&str] = if filesystem_object_forms_only {
+            for direct in [
+                ".read_range(",
+                ".read_ranges_prefetch(",
+                ".read_ranges(",
+                "fs.read(",
+            ] {
+                let count = normalized.matches(direct).count();
+                assert_eq!(
+                    count, 0,
+                    "{name}: {count} direct `{direct}` — use the resident read"
+                );
+            }
+            let heads = normalized.matches(".metadata(").count()
+                - normalized.matches(".metadata()").count();
+            assert_eq!(
+                heads, 0,
+                "{name}: {heads} direct `.metadata(` — use `object_size_resident`"
+            );
+        }
+
+        // FILESYSTEM-OBJECT pins: files that read through wrapper handles
+        // (`caching_filesystem`) — banned on the `fs.`-receiver call forms
+        // plus the metadata probes (review round-1 M3: a
+        // `caching_filesystem.metadata` "cache probe" is a real object HEAD
+        // on a metadata-cache miss). The legacy reader cannot carry the
+        // `fs.read_range(` absence ban — see the presence ratchet below.
+        for (name, source, banned) in [
+            (
+                "readers/sst_query_engine.rs — legacy .sst reader",
+                legacy_reader.as_str(),
+                &[
+                    "fs.read(",
+                    "fs.read_ranges(",
+                    "fs.metadata(",
+                    "caching_filesystem.metadata(",
+                ][..],
+            ),
+            (
+                "search/operations.rs — point-lookup coverage hole",
+                production_source(include_str!("search/operations.rs")).as_str(),
                 &[
                     "fs.read(",
                     "fs.read_range(",
                     "fs.read_ranges(",
                     "fs.metadata(",
-                ]
-            } else {
-                &[
-                    ".read_range(",
-                    ".read_ranges_prefetch(",
-                    ".read_ranges(",
-                    "fs.read(",
-                ]
-            };
+                    "caching_filesystem.metadata(",
+                ][..],
+            ),
+        ] {
+            let normalized = norm(source);
             for direct in banned {
                 let count = normalized.matches(direct).count();
                 assert_eq!(
@@ -1412,15 +1560,32 @@ mod tests {
                     "{name}: {count} direct `{direct}` — use the resident read"
                 );
             }
-            if !filesystem_object_forms_only {
-                let heads = normalized.matches(".metadata(").count()
-                    - normalized.matches(".metadata()").count();
-                assert_eq!(
-                    heads, 0,
-                    "{name}: {heads} direct `.metadata(` — use `object_size_resident`"
-                );
-            }
         }
+
+        // PRESENCE ratchet for the legacy reader: `fs.read_range(` cannot be
+        // an ABSENCE pin — the pre-slice SstDirectReader/UnifiedSstableReader
+        // paths still hold ~25 direct `fs.read_range(` reads that slice 4
+        // deliberately did not route (open item on the TD row). What slice 4
+        // DID route is pinned by PRESENCE: revert any of the routed forms
+        // below and this fails.
+        let legacy_normalized = norm(&legacy_reader);
+        for (routed, at_least, what) in [
+            (
+                "fs.read_range_resident(",
+                1,
+                "the ModularBlockReader read_range choke point",
+            ),
+            ("fs.object_size_resident(", 3, "size probes"),
+            ("fs.read_resident(", 2, "whole-object reads"),
+        ] {
+            let count = legacy_normalized.matches(routed).count();
+            assert!(
+                count >= at_least,
+                "sst_query_engine.rs: only {count} `{routed}` ({what}) — \
+                 slice 4 routed {at_least}; a routed site regressed"
+            );
+        }
+
         // The DataFusion adapter reads through the FACTORY's convenience
         // methods, so it is pinned on the factory call forms (the resident
         // variants end `_resident` and do not match).
