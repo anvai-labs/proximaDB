@@ -890,28 +890,12 @@ impl Catalog for GlueCatalog {
         Ok(schema.indexes.len() < initial_len)
     }
 
-    async fn list_indexes(&self, identifier: &TableIdentifier) -> Result<Vec<CatalogIndex>> {
-        let schema = self.get_table(identifier).await?;
-        Ok(schema.indexes)
-    }
-
     // ========================
     // Statistics
     // ========================
 
     async fn get_statistics(&self, identifier: &TableIdentifier) -> Result<CatalogTableStatistics> {
-        // Check cache first
-        if let Some(stats) = self.cache.get_statistics(&self.name, identifier) {
-            return Ok(stats);
-        }
-
-        // Glue has its own statistics in the table metadata
-        // For now, return empty stats
-        let stats = CatalogTableStatistics::default();
-
-        self.cache
-            .put_statistics(&self.name, identifier, stats.clone());
-        Ok(stats)
+        Ok(self.cache.cached_default_statistics(&self.name, identifier))
     }
 
     async fn update_statistics(
