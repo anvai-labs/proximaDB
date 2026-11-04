@@ -28,7 +28,9 @@ use std::path::PathBuf;
 /// Generates the canonical `OnceLock<bool>` getter the codebase hand-copied
 /// ~12 times (victor post-program clone scan, cluster A5): read `$gate` once,
 /// accept the registry's documented truthy set (`1|true|on|yes`,
-/// case-insensitive), fall back to `$default` when unset or unrecognized.
+/// case-insensitive); fall back to `$default` only when UNSET — a set
+/// but unrecognized value evaluates false (matching every hand-written
+/// body this replaces).
 /// Note the widened truthy set: the hand-written getters accepted only
 /// `1|true` — this macro aligns the code with the registry contract.
 ///
@@ -1341,28 +1343,28 @@ mod tests {
 
         // SAFETY: single-threaded test process section held under ENV_LOCK;
         // edition 2024 marks env mutation unsafe for multi-threaded UB.
-        unsafe { std::env::set_var("PROXIMADB_ENVGATE_TEST_GATE", "on") };
+        unsafe { std::env::set_var("ENVGATE_TEST_GATE", "on") };
         env_gate! {
             /// test gate
-            fn envgate_test_on() { gate: "PROXIMADB_ENVGATE_TEST_GATE", default: false }
+            fn envgate_test_on() { gate: "ENVGATE_TEST_GATE", default: false }
         }
         assert!(
             envgate_test_on(),
             "'on' must count as true per the registry contract"
         );
 
-        unsafe { std::env::set_var("PROXIMADB_ENVGATE_TEST_GATE2", "bogus") };
+        unsafe { std::env::set_var("ENVGATE_TEST_GATE2", "bogus") };
         env_gate! {
-            fn envgate_test_unrecognized() { gate: "PROXIMADB_ENVGATE_TEST_GATE2", default: true }
+            fn envgate_test_unrecognized() { gate: "ENVGATE_TEST_GATE2", default: true }
         }
         assert!(
             !envgate_test_unrecognized(),
             "an unrecognized value must evaluate false (matching every hand-written body), NOT the default"
         );
 
-        unsafe { std::env::remove_var("PROXIMADB_ENVGATE_TEST_GATE3") };
+        unsafe { std::env::remove_var("ENVGATE_TEST_GATE3") };
         env_gate! {
-            fn envgate_test_unset_default() { gate: "PROXIMADB_ENVGATE_TEST_GATE3", default: true }
+            fn envgate_test_unset_default() { gate: "ENVGATE_TEST_GATE3", default: true }
         }
         assert!(
             envgate_test_unset_default(),

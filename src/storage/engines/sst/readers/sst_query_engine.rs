@@ -358,20 +358,14 @@ impl ObjectRangeExecutionStats {
     }
 }
 
-/// Operational kill-switch for TD-040 per-block vector-bounds pruning on the
-/// SST cold read path. Set `PROXIMADB_VECTOR_BOUNDS_PRUNE_DISABLE=1` (or
-/// `true`) to bypass the L2 lower-bound block-skip and read every selected
-/// block (byte-identical to the pre-TD-040 path). The prune is
-/// recall-preserving by construction, so this exists purely as an operational
-/// escape hatch. Read once per process.
-fn vector_bounds_prune_disabled() -> bool {
-    use std::sync::OnceLock;
-    static DISABLED: OnceLock<bool> = OnceLock::new();
-    *DISABLED.get_or_init(|| {
-        std::env::var("PROXIMADB_VECTOR_BOUNDS_PRUNE_DISABLE")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false)
-    })
+proximadb_config::env_gate! {
+    /// Operational kill-switch for TD-040 per-block vector-bounds pruning on the
+    /// SST cold read path. Set `PROXIMADB_VECTOR_BOUNDS_PRUNE_DISABLE=1` (or
+    /// `true`) to bypass the L2 lower-bound block-skip and read every selected
+    /// block (byte-identical to the pre-TD-040 path). The prune is
+    /// recall-preserving by construction, so this exists purely as an operational
+    /// escape hatch. Read once per process.
+    fn vector_bounds_prune_disabled() { gate: "PROXIMADB_VECTOR_BOUNDS_PRUNE_DISABLE", default: false }
 }
 
 /// Guard for TD-040 vector-bounds block pruning. Returns the query vector slice

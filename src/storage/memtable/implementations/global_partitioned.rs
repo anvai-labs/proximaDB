@@ -115,19 +115,13 @@ struct ScanIndex {
     has_empty_oid: bool,
 }
 
-/// Operational kill-switch for the TD-099(3d) scan index. Set
-/// `PROXIMADB_SCAN_INDEX_DISABLE=1` (or `true`) to bypass the cached index and
-/// serve paginated scans via the legacy full scan. The index is always
-/// correctness-equivalent, so this exists purely as a memory-pressure escape
-/// hatch. Read once per process.
-fn scan_index_disabled() -> bool {
-    use std::sync::OnceLock;
-    static DISABLED: OnceLock<bool> = OnceLock::new();
-    *DISABLED.get_or_init(|| {
-        std::env::var("PROXIMADB_SCAN_INDEX_DISABLE")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false)
-    })
+proximadb_config::env_gate! {
+    /// Operational kill-switch for the TD-099(3d) scan index. Set
+    /// `PROXIMADB_SCAN_INDEX_DISABLE=1` (or `true`) to bypass the cached index and
+    /// serve paginated scans via the legacy full scan. The index is always
+    /// correctness-equivalent, so this exists purely as a memory-pressure escape
+    /// hatch. Read once per process.
+    fn scan_index_disabled() { gate: "PROXIMADB_SCAN_INDEX_DISABLE", default: false }
 }
 
 /// Collection partition within the global memtable
