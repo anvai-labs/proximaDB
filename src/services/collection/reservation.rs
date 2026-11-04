@@ -297,13 +297,31 @@ impl ReservationRegistry {
         // whenever it registers.
         // Registration is keyed by grant id, so re-registering a grant that is
         // still registered (an in-process reopen) replaces, never doubles.
-        // Known gap (recorded): a group still registered for a grant that the
-        // reopened ledger no longer holds is not pruned here.
+        // SC4 PR-D (reopen pruning): the reopen is also the one place that can
+        // PRUNE — a bridge group still keyed by a grant id the reopened
+        // ledgers no longer hold (an operator rollback of the pool file, a
+        // grant that left the ledger between registrations) would keep its
+        // entries pinned and its bytes charged against the armed budget until
+        // process exit. Unregister every group whose grant id is not in the
+        // live set; the store reconcile that unregistration triggers releases
+        // the stale group's pins (unregistration is idempotent, and groups of
+        // THIS registry's live grants were just re-registered above).
+        let mut live_group_ids = HashSet::new();
         for (_, authority) in registry.pools.values() {
             for grant in authority.grants_snapshot().await {
                 if grant.state.charges_capacity() && !grant.residency_prefixes.is_empty() {
                     proximadb_cache::register_protection_group(protection_group(&grant));
+                    live_group_ids.insert(grant.id.clone());
                 }
+            }
+        }
+        for group_id in proximadb_cache::process_protection_group_ids() {
+            if !live_group_ids.contains(&group_id) {
+                tracing::debug!(
+                    "TD-TIER-1 SC4: pruning protection group '{group_id}' at registry open \
+                     (its grant is not in the reopened ledgers)"
+                );
+                proximadb_cache::unregister_protection_group(&group_id);
             }
         }
         Ok(Some(Arc::new(registry)))
@@ -3285,6 +3303,77 @@ mod tests {
             "release unregisters the grant (a single registration despite the reopen)"
         );
         assert!(!store.is_protected(&key), "release unpins the entry");
+    }
+
+    /// SC4 PR-D (reopen pruning): a reopen PRUNES process-global groups whose
+    /// grants the reopened ledgers no longer hold — a stale group otherwise
+    /// keeps its entries pinned (and its bytes charged against the armed
+    /// budget) until process exit. The bridge is keyed by grant id; the
+    /// durable ledger here is rewritten without the grant, as an operator
+    /// rollback of the pool file would leave it, while the bridge still
+    /// carries the pre-rollback registration.
+    #[tokio::test]
+    async fn reopen_prunes_groups_of_grants_the_ledger_no_longer_holds() {
+        let _guard = budget_cell_gate();
+        let prefix = "s3://b/tenants/t9/42/data/".to_string();
+        let key = proximadb_cache::object_key(&format!("{prefix}L0_x.pax"));
+        let store = super::residency_test_store();
+        store
+            .put(
+                key.clone(),
+                proximadb_cache::L2Class::Invariants,
+                std::sync::Arc::from(vec![1u8; 64]),
+            )
+            .await
+            .unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = pool_config(&dir, "p1", 0);
+        cfg.overhead_factor = 0.0;
+        cfg.default_grant_bytes = 4096;
+        let registry = ReservationRegistry::open_from_config(std::slice::from_ref(&cfg))
+            .await
+            .unwrap()
+            .unwrap();
+        let grant = registry
+            .reserve_for_performance(
+                "t9",
+                "42",
+                current_unix_secs(),
+                std::slice::from_ref(&prefix),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(store.is_protected(&key), "the grant pins its entry");
+
+        // The grant leaves the DURABLE ledger while the process-global bridge
+        // still holds its group.
+        drop(registry);
+        let ledger = Ledger {
+            schema_version: LEDGER_SCHEMA_VERSION,
+            producer_epoch: 9,
+            next_sequence: 0,
+            grants: Vec::new(),
+        };
+        std::fs::write(
+            ledger_path(dir.path()),
+            serde_json::to_vec(&ledger).unwrap(),
+        )
+        .unwrap();
+
+        let _reopened = ReservationRegistry::open_from_config(&[cfg])
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !proximadb_cache::process_protection_group_ids().contains(&grant.id),
+            "the stale group is pruned at reopen"
+        );
+        assert!(
+            !store.is_protected(&key),
+            "its pins are released with the group"
+        );
     }
 
     // ---- SC3-2: ReservationRegistry ----
