@@ -1534,9 +1534,10 @@ impl Compaction {
                     Self::level_tier_policy(collection_tags).as_deref(),
                     1,
                 ),
-                // An operator-pinned target drives its own passes; the
-                // background follow-up would merge below the stop point.
-                suppress_follow_up: target_override.is_some(),
+                // A pinned stop point — per-request override OR a
+                // config-level full_target_segments > 1 — drives its own
+                // passes; the background follow-up would merge below it.
+                suppress_follow_up: target > 1,
             };
             let output_key = task.output_file.to_string_lossy().to_string();
             if !self.schedule_compaction(task).await? {

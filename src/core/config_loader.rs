@@ -157,25 +157,31 @@ impl ConfigLoader {
                 )) as Box<dyn std::error::Error + Send + Sync>
             })?;
             if let Some(compaction_cfg) = &sst_config.compaction_config {
-                compaction_cfg.validate().map_err(|err| {
-                    let message = format!("Invalid SST compaction configuration: {err}");
-                    Box::new(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        message,
-                    )) as Box<dyn std::error::Error + Send + Sync>
-                })?;
+                compaction_cfg
+                    .validate("storage.sst_config.compaction_config")
+                    .map_err(|err| {
+                        let message = format!("Invalid SST compaction configuration: {err}");
+                        Box::new(std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            message,
+                        )) as Box<dyn std::error::Error + Send + Sync>
+                    })?;
             }
         }
         // TD-COMPACT-15: strategy values fail closed at load — an unknown
         // value (including 'consolidate' in the legacy count/size field)
         // must abort startup, not silently run the wrong policy.
-        config.storage.compaction_config.validate().map_err(|err| {
-            let message = format!("Invalid compaction configuration: {err}");
-            Box::new(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                message,
-            )) as Box<dyn std::error::Error + Send + Sync>
-        })?;
+        config
+            .storage
+            .compaction_config
+            .validate("storage.compaction_config")
+            .map_err(|err| {
+                let message = format!("Invalid compaction configuration: {err}");
+                Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    message,
+                )) as Box<dyn std::error::Error + Send + Sync>
+            })?;
 
         // TD-IOBUDGET-1: fail closed on invalid per-location I/O budgets — an
         // operator error (unknown disk class already dies at TOML parse; bad

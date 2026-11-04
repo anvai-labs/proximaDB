@@ -1148,21 +1148,33 @@ impl SstEngine {
         // one pure function: collection PROPERTY > operator tag > server
         // TOML `consolidate_strategy` > code default (hybrid) — an explicit
         // `hybrid` anywhere above beats a consolidate default below it.
-        let cfg = self.config().compaction_config.clone().unwrap_or_default();
-        let strategy = proximadb_storage_common::resolve_effective_strategy(
-            properties,
-            tags,
-            cfg.consolidate_strategy.as_deref(),
-        );
+        // Read the two policy fields by reference — the default hybrid path
+        // must not pay a full CompactionConfig clone per flush trigger.
+        let (server_strategy, server_target_mb) = self
+            .config()
+            .compaction_config
+            .as_ref()
+            .map(|cfg| {
+                (
+                    cfg.consolidate_strategy.as_deref(),
+                    cfg.consolidate_target_file_size_mb,
+                )
+            })
+            .unwrap_or((None, u64::default()));
+        let strategy =
+            proximadb_storage_common::resolve_effective_strategy(properties, tags, server_strategy);
         if strategy == proximadb_storage_common::CompactionStrategy::Consolidate {
             crate::metrics::operational_metrics::CONSOLIDATE_CHECKS.inc();
             // Target: collection property > server default.
-            let target_mb = proximadb_storage_common::resolve_target_file_size_mb(
-                properties,
-                cfg.consolidate_target_file_size_mb,
-            )
-            .max(1);
-            let write_amp_limit = cfg.consolidate_write_amp_limit;
+            let target_mb =
+                proximadb_storage_common::resolve_target_file_size_mb(properties, server_target_mb)
+                    .max(1);
+            let write_amp_limit = self
+                .config()
+                .compaction_config
+                .as_ref()
+                .map(|cfg| cfg.consolidate_write_amp_limit)
+                .unwrap_or_default();
             let files = self
                 .discover_sstable_files(storage_url)
                 .await

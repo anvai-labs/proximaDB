@@ -53,20 +53,13 @@ pub fn parse_strategy(value: &str) -> Option<CompactionStrategy> {
     }
 }
 
-/// Resolve from collection TAGS (the legacy channel: last valid wins,
-/// matching `resolve_compaction_armed` semantics). Tag:
-/// `compaction.strategy:consolidate`. Returns `None` when no explicit tag
-/// is present — use [`resolve_strategy_explicit_from_tags`] when the
-/// distinction between "absent" and "explicit hybrid" matters (the
-/// precedence chain).
-pub fn resolve_strategy_from_tags(tags: &[String]) -> CompactionStrategy {
-    resolve_strategy_explicit_from_tags(tags).unwrap_or_default()
-}
-
-/// The tag channel's explicit value, if any: `Some` means an operator (or
-/// an explicit property) chose a strategy; `None` means the channel is
-/// silent and the next layer down decides. Last valid wins.
-pub fn resolve_strategy_explicit_from_tags(tags: &[String]) -> Option<CompactionStrategy> {
+/// The tag channel's explicit value, if any: `Some` means an operator
+/// chose a strategy; `None` means the channel is silent and the next layer
+/// down decides (see [`resolve_effective_strategy`]). Last valid wins.
+/// Single-channel resolution is deliberately NOT exported: a caller
+/// resolving only tags silently misses the property/server layers (the
+/// "property set but inert" bug class).
+pub(crate) fn resolve_strategy_explicit_from_tags(tags: &[String]) -> Option<CompactionStrategy> {
     let mut explicit = None;
     for tag in tags {
         if let Some(parsed) = tag
@@ -80,34 +73,22 @@ pub fn resolve_strategy_explicit_from_tags(tags: &[String]) -> Option<Compaction
     explicit
 }
 
-/// Resolve from catalog PROPERTIES (the property channel). Property:
-/// `compaction.strategy = "consolidate"`. Returns `None` when absent.
-pub fn resolve_strategy_from_properties(
-    properties: &HashMap<String, String>,
-) -> CompactionStrategy {
-    resolve_strategy_explicit_from_properties(properties).unwrap_or_default()
-}
-
-/// The property channel's explicit value, if any (case-insensitive key
-/// match, first wins over the lowercased duplicate risk by NOT iterating
-/// randomly: HashMap order is nondeterministic, so when both spellings
-/// exist the choice is deterministic — the canonical lowercase key wins).
-pub fn resolve_strategy_explicit_from_properties(
+/// The property channel's explicit value, if any. Deterministic under
+/// duplicate spellings: the canonical key wins; among non-canonical
+/// variants the lexicographically smallest key wins (never HashMap
+/// iteration order). Single-channel resolution is deliberately NOT
+/// exported — see [`resolve_strategy_explicit_from_tags`].
+pub(crate) fn resolve_strategy_explicit_from_properties(
     properties: &HashMap<String, String>,
 ) -> Option<CompactionStrategy> {
-    // Prefer the canonical key spelling; only fall back to a case-variant
-    // scan when it is absent, so duplicate-spelling catalogs resolve the
-    // same way in every process.
     if let Some(value) = properties.get(COMPACTION_STRATEGY_PROPERTY_KEY) {
         return parse_strategy(value);
     }
-    let mut found = None;
-    for (key, value) in properties {
-        if key.trim().to_ascii_lowercase() == COMPACTION_STRATEGY_PROPERTY_KEY {
-            found = parse_strategy(value);
-        }
-    }
-    found
+    properties
+        .iter()
+        .filter(|(key, _)| key.trim().to_ascii_lowercase() == COMPACTION_STRATEGY_PROPERTY_KEY)
+        .min_by_key(|(key, _)| key.as_str())
+        .and_then(|(_, value)| parse_strategy(value))
 }
 
 /// The full precedence chain, as one pure function (unit-testable without
@@ -142,15 +123,14 @@ pub fn resolve_target_file_size_mb(
     if let Some(value) = properties.get(COMPACTION_TARGET_FILE_SIZE_PROPERTY_KEY) {
         return parse_valid(value).unwrap_or(server_default_mb);
     }
-    let mut resolved = None;
-    for (key, value) in properties {
-        if key.trim().to_ascii_lowercase() == COMPACTION_TARGET_FILE_SIZE_PROPERTY_KEY
-            && let Some(parsed) = parse_valid(value)
-        {
-            resolved = Some(parsed);
-        }
-    }
-    resolved.unwrap_or(server_default_mb)
+    properties
+        .iter()
+        .filter(|(key, _)| {
+            key.trim().to_ascii_lowercase() == COMPACTION_TARGET_FILE_SIZE_PROPERTY_KEY
+        })
+        .min_by_key(|(key, _)| key.as_str())
+        .and_then(|(_, value)| parse_valid(value))
+        .unwrap_or(server_default_mb)
 }
 
 /// Validate a `compaction.*` property at SET time. Returns `Err` with a
@@ -201,10 +181,10 @@ mod tests {
     #[test]
     fn default_is_hybrid() {
         assert_eq!(CompactionStrategy::default(), CompactionStrategy::Hybrid);
-        assert_eq!(resolve_strategy_from_tags(&[]), CompactionStrategy::Hybrid);
+        assert_eq!(resolve_strategy_explicit_from_tags(&[]), None);
         assert_eq!(
-            resolve_strategy_from_properties(&HashMap::new()),
-            CompactionStrategy::Hybrid
+            resolve_strategy_explicit_from_properties(&HashMap::new()),
+            None
         );
     }
 
@@ -215,8 +195,8 @@ mod tests {
             "compaction.strategy:consolidate".to_string(),
         ];
         assert_eq!(
-            resolve_strategy_from_tags(&tags),
-            CompactionStrategy::Consolidate
+            resolve_strategy_explicit_from_tags(&tags),
+            Some(CompactionStrategy::Consolidate)
         );
         // Invalid value keeps the prior
         let tags = vec![
@@ -224,8 +204,8 @@ mod tests {
             "compaction.strategy:garbage".to_string(),
         ];
         assert_eq!(
-            resolve_strategy_from_tags(&tags),
-            CompactionStrategy::Consolidate
+            resolve_strategy_explicit_from_tags(&tags),
+            Some(CompactionStrategy::Consolidate)
         );
     }
 
@@ -233,9 +213,31 @@ mod tests {
     fn property_resolution_case_insensitive() {
         let props = props(&[("Compaction.Strategy", "CONSOLIDATE")]);
         assert_eq!(
-            resolve_strategy_from_properties(&props),
-            CompactionStrategy::Consolidate
+            resolve_strategy_explicit_from_properties(&props),
+            Some(CompactionStrategy::Consolidate)
         );
+    }
+
+    #[test]
+    fn two_non_canonical_spellings_resolve_deterministically() {
+        // Both non-canonical: the lexicographically smallest key wins,
+        // never HashMap iteration order.
+        for _ in 0..20 {
+            let properties = props(&[
+                ("COMPACTION.STRATEGY", "consolidate"),
+                ("Compaction.Strategy", "hybrid"),
+            ]);
+            // "COMPACTION.STRATEGY" < "Compaction.Strategy" (ASCII 'O' < 'o')
+            assert_eq!(
+                resolve_strategy_explicit_from_properties(&properties),
+                Some(CompactionStrategy::Consolidate)
+            );
+            let target = props(&[
+                ("Compaction.Target_File_Size_MB", "256"),
+                ("COMPACTION.TARGET_FILE_SIZE_MB", "1024"),
+            ]);
+            assert_eq!(resolve_target_file_size_mb(&target, 512), 1024);
+        }
     }
 
     #[test]

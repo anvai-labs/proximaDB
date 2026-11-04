@@ -2571,23 +2571,30 @@ impl FlightService for ProximaFlightService {
                 // reports success, so the reason is the load-bearing field.
                 // Extracted once (`full_compaction_metrics`) so REST, Flight
                 // and DDL cannot drift apart.
-                let metrics = compaction.full_compaction_metrics();
-                let result_bytes = serde_json::to_vec(&serde_json::json!({
+                // The metrics keys come from serializing the STRUCT (not a
+                // hand-enumerated copy) merged flat into the payload — a new
+                // field on FullCompactionMetrics reaches this payload
+                // automatically, and the wire shape stays flat for the
+                // harness + e2e contract.
+                let metrics =
+                    serde_json::to_value(compaction.full_compaction_metrics()).map_err(|e| {
+                        TonicStatus::internal(format!("Failed to serialize result: {}", e))
+                    })?;
+                let mut payload = serde_json::json!({
                     "success": true,
                     "collection_id": collection_id,
                     "operation": "compact",
                     "full": full,
-                    "segments_before": metrics.segments_before,
-                    "segments_after": metrics.segments_after,
-                    "passes": metrics.passes,
-                    "reached_target": metrics.reached_target,
-                    "stop_reason": metrics.stop_reason,
-                    "pending_files": metrics.pending_files,
-                    "bytes_read": metrics.bytes_read,
-                    "bytes_written": metrics.bytes_written,
-                    "duration_ms": metrics.duration_ms,
-                }))
-                .map_err(|e| TonicStatus::internal(format!("Failed to serialize result: {}", e)))?;
+                });
+                if let (Some(fields), Some(object)) = (metrics.as_object(), payload.as_object_mut())
+                {
+                    for (key, value) in fields {
+                        object.insert(key.clone(), value.clone());
+                    }
+                }
+                let result_bytes = serde_json::to_vec(&payload).map_err(|e| {
+                    TonicStatus::internal(format!("Failed to serialize result: {}", e))
+                })?;
 
                 let result = arrow_flight::Result {
                     body: result_bytes.into(),

@@ -3444,6 +3444,10 @@ def main() -> int:
     args = parser.parse_args()
     if args.skip_ingest and not args.collection_id:
         raise SystemExit("--skip-ingest requires --collection-id")
+        if args.compact_full_target_segments is not None and not args.compact_full_before_measure:
+            raise SystemExit(
+                "--compact-full-target-segments requires --compact-full-before-measure"
+            )
     if not (
         args.coalesce_gap_mb >= 0
         and args.coalesce_range_mb > 0
@@ -3945,10 +3949,6 @@ def main() -> int:
         pre_compact_max_segments = (
             17 if args.compact_full_before_measure else args.max_segments
         )
-        if args.compact_full_target_segments is not None and not args.compact_full_before_measure:
-            raise SystemExit(
-                "--compact-full-target-segments requires --compact-full-before-measure"
-            )
         # The three settle waits (skip-ingest, post-ingest, post-compact)
         # share every argument but the segment bound — one closure keeps
         # them from drifting apart (the file's phase_sweep pattern).
@@ -4044,7 +4044,7 @@ def main() -> int:
                 full=True,
                 target_segments=args.compact_full_target_segments,
             )
-            geometry = settle(args.max_segments)
+            geometry = settle(args.compact_full_target_segments or args.max_segments)
             result["compact_full_before_measure"] = {
                 "before": before,
                 "action": action,

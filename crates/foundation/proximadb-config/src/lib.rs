@@ -1054,13 +1054,14 @@ impl CompactionConfig {
     /// `strategy` field drives the count/size level heuristic; it is NOT
     /// the consolidate/hybrid switch — reject the common mistake of
     /// setting `strategy = "consolidate"` there.
-    pub fn validate(&self) -> Result<(), String> {
+    pub fn validate(&self, section: &str) -> Result<(), String> {
         let legacy = self.strategy.trim().to_ascii_lowercase();
         if !matches!(legacy.as_str(), "count" | "size" | "hybrid") {
             return Err(format!(
-                "storage.compaction_config.strategy must be 'count', 'size' or 'hybrid' \
+                "{section}.strategy must be 'count', 'size' or 'hybrid' \
                  (got '{}'); the consolidate strategy is selected via \
-                 consolidate_strategy or the per-collection compaction.strategy property",
+                 {section}.consolidate_strategy or the per-collection \
+                 compaction.strategy property",
                 self.strategy
             ));
         }
@@ -1068,7 +1069,7 @@ impl CompactionConfig {
             let value = strategy.trim().to_ascii_lowercase();
             if !matches!(value.as_str(), "hybrid" | "consolidate") {
                 return Err(format!(
-                    "storage.compaction_config.consolidate_strategy must be 'hybrid' or \
+                    "{section}.consolidate_strategy must be 'hybrid' or \
                      'consolidate' (got '{strategy}')"
                 ));
             }
@@ -1418,14 +1419,17 @@ mod tests {
                 strategy: strategy.to_string(),
                 ..Default::default()
             };
-            assert!(config.validate().is_ok(), "expected '{strategy}' valid");
+            assert!(
+                config.validate("storage.compaction_config").is_ok(),
+                "expected '{strategy}' valid"
+            );
         }
         // The common dead-config mistake: 'consolidate' in the legacy field.
         let config = CompactionConfig {
             strategy: "consolidate".to_string(),
             ..Default::default()
         };
-        let error = config.validate().unwrap_err();
+        let error = config.validate("storage.compaction_config").unwrap_err();
         assert!(
             error.contains("consolidate_strategy"),
             "error should point at the right knob: {error}"
@@ -1436,7 +1440,7 @@ mod tests {
                 strategy: "hybrd".to_string(),
                 ..Default::default()
             }
-            .validate()
+            .validate("storage.compaction_config")
             .is_err()
         );
     }
@@ -1449,14 +1453,17 @@ mod tests {
                 consolidate_strategy: Some(value.to_string()),
                 ..Default::default()
             };
-            assert!(config.validate().is_ok(), "expected '{value}' valid");
+            assert!(
+                config.validate("storage.compaction_config").is_ok(),
+                "expected '{value}' valid"
+            );
         }
         assert!(
             CompactionConfig {
                 consolidate_strategy: Some("aggressive".to_string()),
                 ..Default::default()
             }
-            .validate()
+            .validate("storage.compaction_config")
             .is_err()
         );
     }
