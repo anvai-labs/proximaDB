@@ -401,3 +401,16 @@ refused-consolidate WARN is logged once per collection. Filed:
   consumer* beyond the refused-consolidate WARN. It is kept deliberately as
   TD-COMPACT-16's prerequisite (the background rework needs to know whether
   the catalog was consulted); if that rework is abandoned, remove it.
+
+Round 12 (#2418): the floor's single-input rewrite is reserved for an L0
+follow-up in the training chain (the threshold alone also matched every
+follow-up after an L0-sourced pass, so it could rewrite a trained L1+
+segment); a transient LIST failure no longer drops the promotion — it falls
+back to the one follow-up that cannot reduce the count, a single-input
+rewrite. Filed:
+
+* *COMPACT-15-F8 — the floor check re-LISTs.* `bound_follow_up_to_floor`
+  runs its own `discover_compactable_files` right after
+  `check_compaction_needed` did the same discovery, one extra object-store
+  round trip per bounded follow-up (operator FULL with a target > 1 only).
+  Return the live count and sizes with the task instead.

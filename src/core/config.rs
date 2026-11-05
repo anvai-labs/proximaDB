@@ -1012,14 +1012,9 @@ impl StorageConfig {
     /// from silently falling back to code defaults while another honors TOML.
     pub fn effective_sst_config(&self) -> SstConfig {
         let mut config = self.sst_config.clone().unwrap_or_default();
-        // Field-level merge via the ONE shared implementation, the same call
-        // `ProximaDB::start` makes when it installs the authoritative server
-        // config (#2418 review round 6, finding 6). The previous
-        // `if is_none()` wholesale pick dropped every top-level
-        // `consolidate_*` value the moment an operator declared an SST
-        // section for an unrelated knob, and it disagreed with the install —
-        // so an instance built from here and the flush engine would have
-        // resolved different policies.
+        // Field-level merge for the `consolidate_*` fields via
+        // `CompactionConfig::merge_section_over`; every other field is still
+        // taken from the SST section as a whole (TD-COMPACT-15 F1).
         config.compaction_config = Some(CompactionConfig::merge_section_over(
             &self.compaction_config,
             config.compaction_config.as_ref(),

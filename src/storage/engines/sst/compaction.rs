@@ -467,12 +467,10 @@ pub struct FullCompactionSummary {
     pub stop_reason: Option<&'static str>,
     pub pending_files: usize,
     /// Measured bytes across the passes THIS request's loop executed
-    /// (TD-COMPACT-15 provenance). Scope caveat: when the resolved target is
-    /// 1, the worker's follow-up chain may merge further after a pass
-    /// publishes; those morsels carry their own output keys, so their bytes
-    /// are not summed here. The figure is therefore a measured LOWER BOUND
-    /// on the request's total I/O on the default path, and exact when a
-    /// target > 1 suppresses the follow-up chain.
+    /// (TD-COMPACT-15 provenance) — a measured LOWER BOUND on the request's
+    /// total I/O, for every target: worker follow-ups (merges, merges
+    /// bounded by a pinned floor, single-input training rewrites) carry
+    /// their own output keys and are not summed here.
     pub bytes_read: u64,
     pub bytes_written: u64,
     /// Wall-clock duration of the whole request, including discovery and
@@ -1491,8 +1489,7 @@ impl Compaction {
             let budget = current_compaction_input_budget(&cfg);
             // saturating: config validation rejects only 0, so a huge stated
             // value must not overflow (debug panic, mandate #4; release wrap
-            // to a tiny target) — and must agree with the flush trigger,
-            // which already saturates the same product.
+            // to a tiny target).
             let target_file_size = cfg
                 .consolidate_target_file_size_mb_or_default()
                 .max(1)
@@ -2103,6 +2100,14 @@ impl Compaction {
                             // suppressing it: the chain (and its training
                             // promotion) still runs, but can never merge
                             // below the operator's stop point.
+                            // Only an L0 follow-up in the training chain is
+                            // a promotion: `training_follow_up_threshold` is
+                            // Some for EVERY follow-up after an L0-sourced
+                            // .pax pass, so on its own it would let the floor
+                            // schedule a single-input rewrite of an already
+                            // trained L1+ segment — pure write amplification
+                            // (#2418 review round 12).
+                            let promotes = follow_up_threshold.is_some() && follow_up.level == 0;
                             let keep = match follow_up.min_live_segments {
                                 None => true,
                                 Some(floor) => match compaction
@@ -2110,15 +2115,30 @@ impl Compaction {
                                         &mut follow_up,
                                         collection_dir,
                                         floor,
-                                        follow_up_threshold.is_some(),
+                                        promotes,
                                     )
                                     .await
                                 {
                                     Ok(keep) => keep,
+                                    // A transient LIST failure must not drop the
+                                    // promotion round 11 exists to keep. Without
+                                    // the live count, the only safe follow-up is
+                                    // one that cannot reduce it: a single-input
+                                    // rewrite. Its `input_bytes` stays the
+                                    // untrimmed sum, an over-estimate, which is
+                                    // the safe direction for admission.
+                                    Err(error) if promotes => {
+                                        warn!(
+                                            collection_object_id = task.collection_object_id,
+                                            "Compaction follow-up floor check failed; scheduling the training promotion as a single-input rewrite: {error}"
+                                        );
+                                        follow_up.input_files.truncate(1);
+                                        true
+                                    }
                                     Err(error) => {
                                         warn!(
                                             collection_object_id = task.collection_object_id,
-                                            "Compaction follow-up floor check failed; not scheduling: {error}"
+                                            "Compaction follow-up floor check failed; not scheduling a plain merge: {error}"
                                         );
                                         false
                                     }
