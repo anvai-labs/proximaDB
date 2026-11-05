@@ -460,14 +460,13 @@ pub fn resolve_probe_policy_gated(
     {
         policy.algorithm = algorithm;
     }
-    // A non-positive/non-finite multiplier is rejected at config load
-    // (`CoarseProbeConfig::validate`), so reaching here means a
-    // non-loader construction path; keep the shipped default rather than
-    // producing a zero/negative probe count.
-    // `>= 0`, not `> 0`: a multiplier of 0 historically meant "probe exactly
-    // the floor" (ceil(sqrt(k) x 0) = 0, clamped up to min_cells), and
-    // filtering it out silently swapped it for the 2.0 default — so a
-    // config that set it got a different nprobe than before this module.
+    // The multiplier rules, as shipped (#2419 round 17 corrected this
+    // comment): config load rejects NON-FINITE and >1e6 values but ACCEPTS
+    // negatives and 0 (a negative behaved exactly like 0 before this module
+    // and keeps that meaning; see `CoarseProbeConfig::validate`).
+    // settings_policy clamps negatives to 0 before they reach here, so this
+    // filter is the same rule expressed once more for non-loader paths —
+    // and it must stay in sync with `is_valid_multiplier`, never diverge.
     if let Some(multiplier) = server.multiplier.filter(|m| is_valid_multiplier(*m)) {
         policy.multiplier = multiplier;
     }

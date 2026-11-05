@@ -339,3 +339,18 @@ env/TOML doors and the property/tag layers), so no future caller of the
 exported entry can select an ungated algorithm; the resolved-policy cache is
 poison-safe (a poisoned RwLock disabled it forever, re-running the env scan
 and its WARNs per query).
+
+Round 17 (#2419): the Iceberg createTable door REFUSES reserved table
+properties instead of silently stripping them (a 200 that dropped `owner`
+while every other door rejects it); the per-segment corpus/geometry inputs
+(corpus_rows, avg_cell_bytes, IopsBudget::for_path) are gathered lazily,
+ONLY for byte_budget, inside the count closure — the default sqrt path pays
+none of the O(k_c) walks or the registry lookup it provably never reads
+(this was F2's escalation onto the default path; the directory-path
+single-walk merge stays F9); the default-chain tests skip under an exported
+PROXIMADB_PAX_READ_PROBE_* env instead of failing (the settings chain folds
+the env layer — a leftover bench shell changed their answer; the pure-module
+tests stay env-free); the property-doors e2e rides the file's single-boot
+test instead of starting a second ProximaDB (the WAL manifest is a set-once
+singleton under the libtest fallback); the registry rows state the snapshot
+semantics; the resolver's multiplier comment matches the shipped rules.

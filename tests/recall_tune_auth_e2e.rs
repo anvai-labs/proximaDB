@@ -357,24 +357,13 @@ async fn unified_port_auth_converged_recall_tune_e2e() {
         403,
         "read-only Api-Key must be authenticated but forbidden on recall-tune"
     );
-}
 
-/// #2419 review round 16: POST /collections refuses a non-empty
-/// `properties` map (400, naming the working path) — those keys were never
-/// persisted, so the 200 reported a write that did not happen. The
-/// PATCH /properties ROUTE is REMOVED outright: it could only ever refuse
-/// (the merge + catalog write does not exist), so it was an advertised
-/// capability that isn't there. Set properties with ALTER TABLE ... SET.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn create_refuses_unpersisted_properties_and_patch_route_is_gone() {
-    let server = AuthTestServer::start().await.expect("server start");
-    let http = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .no_proxy()
-        .build()
-        .expect("http client");
-
-    // Create WITH properties -> 400, naming the working path.
+    // ── Phase 6: property write doors fail closed (#2419 round 16) ──
+    //
+    // One server for the whole file (the global WAL manifest is a set-once
+    // singleton — see the header), so this rides THIS test rather than
+    // booting a second ProximaDB (which is what the standalone version did;
+    // it failed under the libtest shared-process fallback).
     let resp = http
         .post(server.url("/api/v2/collections"))
         .header("Authorization", "Api-Key dev-key")
@@ -397,8 +386,6 @@ async fn create_refuses_unpersisted_properties_and_patch_route_is_gone() {
         body.contains("ALTER TABLE"),
         "the refusal must name the working path: {body}"
     );
-
-    // Create WITHOUT properties still succeeds.
     let resp = http
         .post(server.url("/api/v2/collections"))
         .header("Authorization", "Api-Key dev-key")
@@ -410,15 +397,14 @@ async fn create_refuses_unpersisted_properties_and_patch_route_is_gone() {
         .send()
         .await
         .expect("send plain create");
-    let status = resp.status().as_u16();
-    let body = resp.text().await.unwrap_or_default();
     assert_eq!(
-        status, 200,
-        "a property-free create must still succeed; body={body}"
+        resp.status().as_u16(),
+        200,
+        "a property-free create must still succeed"
     );
-
-    // The PATCH route is GONE, not a 501 stub: restoring a write door
-    // should be a conscious route addition, not a status-code flip.
+    // The PATCH route is REMOVED (it could only ever refuse — an advertised
+    // capability that does not exist). Restoring a write door should be a
+    // conscious route addition, not a status-code flip.
     let resp = http
         .patch(server.url("/api/v2/collections/props_target/properties"))
         .header("Authorization", "Api-Key dev-key")

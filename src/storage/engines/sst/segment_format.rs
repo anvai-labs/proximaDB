@@ -4020,29 +4020,42 @@ fn coarse_probe_nprobe(
     path: &str,
     dir: &proximadb_storage_common::coarse_directory::CoarseDirectory,
 ) -> usize {
-    let corpus_rows = dir.cells.iter().map(|c| c.row_end).max().unwrap_or(0);
-    // Average over NON-EMPTY cells only: the probe never reads a zero-length
-    // cell, so including them biased the mean low and made a band under-read
-    // its budget (10 empty of 30 cells turned an 8 MiB band into ~11 MiB of
-    // actual reads).
-    let avg_cell_bytes = {
-        let mut bytes = 0u64;
-        let mut count = 0u64;
-        for cell in &dir.cells {
-            if cell.a_len > 0 {
-                bytes += cell.a_len;
-                count += 1;
-            }
-        }
-        bytes.checked_div(count).unwrap_or(0)
-    };
-    let rowgroup_bytes =
-        proximadb_storage_common::iops_budget::IopsBudget::for_path(path).target_block_bytes();
     std::env::var("PROXIMADB_PAX_READ_COARSE_NPROBE")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|n| *n > 0)
-        .unwrap_or_else(|| geometric_nprobe(k_c, corpus_rows, rowgroup_bytes, avg_cell_bytes))
+        .unwrap_or_else(|| {
+            // The corpus/geometry inputs cost an O(k_c) scan, an O(k_c) mean
+            // and an IopsBudget registry+env lookup per segment — and are
+            // read ONLY by byte_budget (sqrt/cbrt/log/fixed are cell-count
+            // functions; the parity is pinned by test). Gather them lazily,
+            // inside the closure, and only for byte_budget, so the DEFAULT
+            // sqrt path pays none of it (#2419 review round 17; was F2).
+            if cached_probe_policy().algorithm
+                != proximadb_storage_common::probe_policy::ProbeAlgorithm::ByteBudget
+            {
+                return geometric_nprobe(k_c, 0, 0, 0);
+            }
+            let corpus_rows = dir.cells.iter().map(|c| c.row_end).max().unwrap_or(0);
+            // Average over NON-EMPTY cells only: the probe never reads a
+            // zero-length cell, so including them biased the mean low and
+            // made a band under-read its budget (10 empty of 30 cells turned
+            // an 8 MiB band into ~11 MiB of actual reads).
+            let avg_cell_bytes = {
+                let mut bytes = 0u64;
+                let mut count = 0u64;
+                for cell in &dir.cells {
+                    if cell.a_len > 0 {
+                        bytes += cell.a_len;
+                        count += 1;
+                    }
+                }
+                bytes.checked_div(count).unwrap_or(0)
+            };
+            let rowgroup_bytes = proximadb_storage_common::iops_budget::IopsBudget::for_path(path)
+                .target_block_bytes();
+            geometric_nprobe(k_c, corpus_rows, rowgroup_bytes, avg_cell_bytes)
+        })
         .min(k_c.max(1))
 }
 

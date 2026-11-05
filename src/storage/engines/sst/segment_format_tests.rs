@@ -664,6 +664,23 @@ fn settings_policy_falls_back_to_sqrt_without_the_experimental_gate() {
     );
 }
 
+/// True when the environment carries any PROXIMADB_PAX_READ_PROBE_* override.
+/// The default-chain tests below assert the SHIPPED defaults through
+/// settings_policy (which folds the env layer), so an exported override — a
+/// leftover bench shell — would fail them for the right behavior. They skip
+/// under contamination instead of flaking (mandate #11); the pure-module
+/// tests in probe_policy.rs stay env-free and always run.
+fn probe_env_overrides_present() -> bool {
+    [
+        "PROXIMADB_PAX_READ_PROBE_ALGORITHM",
+        "PROXIMADB_PAX_READ_PROBE_BASE_MB",
+        "PROXIMADB_PAX_READ_PROBE_CAP_MB",
+        "PROXIMADB_PAX_READ_PROBE_EXPERIMENTAL",
+    ]
+    .iter()
+    .any(|key| std::env::var(key).is_ok())
+}
+
 fn cp_cfg(mult: f32) -> crate::core::config::CoarseProbeConfig {
     crate::core::config::CoarseProbeConfig {
         enable_read_probe: true,
@@ -680,6 +697,10 @@ fn cp_cfg(mult: f32) -> crate::core::config::CoarseProbeConfig {
 
 #[test]
 fn default_probe_quality_and_backend_ranges_match_sift_acceptance() {
+    if probe_env_overrides_present() {
+        return; // contaminated shell: defaults are not observable here
+    }
+
     // Assert the PURE resolver against the default policy: this test must
     // not read OR write the process-global coarse-probe settings. Reading it
     // let a prior test's install leak in; writing it (the round-2 fix) let
@@ -932,6 +953,10 @@ async fn local_pax_seed_streams_regions_into_persistent_cache() {
 /// geometric_nprobe. (nextest = process isolation; the static won't leak.)
 #[test]
 fn toml_coarse_probe_config_wins_over_default_init() {
+    if probe_env_overrides_present() {
+        return; // contaminated shell: defaults are not observable here
+    }
+
     // Simulate a default-config engine seeding first...
     init_coarse_probe_settings(None);
     // ...then the authoritative TOML config (server startup) — must override.
