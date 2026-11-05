@@ -188,7 +188,11 @@ deliberately — see above). These are filed, not fixed:
   stringifies an already-parsed enum and `resolve_probe_policy` parses it
   back; the case-insensitive key lookup is hand-copied for algorithm and
   multiplier beside `property_usize`. Use `Option<ProbeAlgorithm>` and one
-  `property_str` helper.
+  `property_str` helper. Same item: `ProbePolicy::default` hard-codes the
+  multiplier/min/base/cap that `CoarseProbeConfig`'s `default_*` functions
+  also define, so a retune in config.rs would leave the code-default layer
+  stale for any field the server layer leaves `None` — derive one from the
+  other.
 * *RDSTRAT-14-F7 — persist create-time properties instead of refusing.*
   POST /collections now 400s any non-empty `properties`, including plain
   keys like `team`. That is a status change (200 -> 400) but not a
