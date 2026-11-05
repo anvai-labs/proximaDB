@@ -5,7 +5,7 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | **Open (2026-11-05), ratcheted.** The class is now gated by `scripts/count_capability_facades.py` (`make capability-facade-no-regression` in `work-commit-check`, plus its own CI step): a new self-declared facade in any file fails CI, and removals must lower the baseline. Limits are listed under <<limits>>. The bloom founding instance is mitigated (link:TD-BLOOM-1-sst-bloom-stub.adoc[TD-BLOOM-1]); the inventory below remains.
+| Status | **Open (2026-11-05), ratcheted.** The class is now gated by `scripts/count_capability_facades.py` (`make capability-facade-no-regression` in `work-commit-check`, plus its own CI step): a new self-declared facade in any file fails CI, and removals must lower the baseline. Limits are listed under <<limits>>. The bloom founding instance is mitigated (link:TD-BLOOM-1-sst-bloom-stub.adoc[TD-BLOOM-1]), and the highest-risk inventory item — the network RBAC tenant predicate — is mitigated (2026-11-05, fail-closed; see its row below). The remaining inventory stays open.
 | Priority | P1 for the class (live-path and public-uncalled tiers); individual entries graded below.
 | Relates to | link:TD-WAL-6-proto-and-avro-wal-slots-are-bincode-facade.adoc[TD-WAL-6] and link:TD-BLOOM-1-sst-bloom-stub.adoc[TD-BLOOM-1] (founding instances); link:TD-SDKERR-1-python-sdk-hides-failures-and-drops-filters.adoc[TD-SDKERR-1] (the Python SDK twin — `count_silent_failures.py` is this guard's sibling); CLAUDE.md #12 ("silent duplication of an existing primitive"), #6 (measure, don't assert), #16 (read-path correctness), #19 (retire dead twins)
 | Found | 2026-11-05: 32 of the 197 B-harness findings (`report/llm_module_analysis/`) shared one shape; a census of `src/` + `crates/` then traced liveness per site by hand.
@@ -112,7 +112,7 @@ this; it falsified the claim, made while planning this TD, that the crate was
 "complete". Building real bloom pruning must use `murmur3_32` or replace those
 two first.
 
-== Open inventory (not fixed by this PR)
+== Open inventory (rows marked MITIGATED in-body have been fixed; the rest remain open)
 
 Graded by traced liveness. Entries marked *(inferred)* were not traced to a
 request.
@@ -132,9 +132,9 @@ request.
 | Lying config; "fixing" it silently changes indexing and invalidates existing indexes
 
 | `src/network/auth/rbac.rs` `user_belongs_to_tenant` (+ `user_has_collection_access`)
-| Returns `true` unconditionally — it is the tenant-isolation gate inside `check_permission_with_context`.
-| One wiring step from live — it HAS callers (`src/network/auth/middleware.rs`, two sites) and the middleware is already written; the chain is dead only because the network `AuthService` is never constructed outside `src/network/auth/`. A `pub struct RbacService` named identically to the live `src/security/rbac_service.rs`. **Highest misadoption risk in the census.**
-| Cross-tenant authorization bypass if adopted
+| Returned `true` unconditionally — the tenant-isolation gate inside `check_permission_with_context`. **MITIGATED (2026-11-05):** the predicate is now fail-closed (`false` — this layer holds no membership data, so any asserted tenant is denied), the middleware no longer echoes the caller's own tenant into the permission context (it was circular and would now deny everything), and `user_has_collection_access` is documented as reducing to role permissions. Pinned by `tenant_asserted_context_is_denied_fail_closed` + `no_tenant_context_allows_permitted_operation` + `test_build_permission_context_never_asserts_a_tenant`.
+| Was one wiring step from live — it HAS callers (`src/network/auth/middleware.rs`, two sites); the chain was dead only because the network `AuthService` is never constructed outside `src/network/auth/`. A `pub struct RbacService` named identically to the live `src/security/rbac_service.rs`. Real membership validation still needs a membership store; tenancy remains structural (`TenantContext` + `DrPathBuilder`).
+| Was a cross-tenant authorization bypass if adopted; now fail-closed. Middleware behavior unchanged (no tenant asserted); direct callers asserting any tenant are denied.
 
 | `src/security/rbac_service.rs` `get_accessible_collections`
 | Returns `vec!["*"]` ("Placeholder").
