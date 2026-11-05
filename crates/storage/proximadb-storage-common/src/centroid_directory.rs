@@ -1062,9 +1062,13 @@ impl PaxCentroidDirectory {
             .iter()
             .filter(|c| usable[c.segment_idx as usize] && c.rows() > 0)
         {
-            *bytes_by_group
+            // saturating (mandate #4): a_len is file-derived and unbounded
+            // at parse; a corrupt/crafted directory must not panic (debug) or
+            // wrap (release) the per-group sum (#2419 review round 19).
+            let group = bytes_by_group
                 .entry((self.cell_spaces()[cell.segment_idx as usize], cell.a0_cell))
-                .or_insert(0) += cell.entry.a_len;
+                .or_insert(0);
+            *group = group.saturating_add(cell.entry.a_len);
         }
         let usable_cells = bytes_by_group.len();
         if usable_cells == 0 {
@@ -1078,7 +1082,7 @@ impl PaxCentroidDirectory {
             let mut counted = 0u64;
             for bytes in bytes_by_group.values() {
                 if *bytes > 0 {
-                    total += *bytes;
+                    total = total.saturating_add(*bytes);
                     counted += 1;
                 }
             }

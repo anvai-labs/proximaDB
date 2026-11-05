@@ -698,7 +698,14 @@ fn cp_cfg(mult: f32) -> crate::core::config::CoarseProbeConfig {
 #[test]
 fn default_probe_quality_and_backend_ranges_match_sift_acceptance() {
     if probe_env_overrides_present() {
-        return; // contaminated shell: defaults are not observable here
+        // A VISIBLE skip, not a vacuous pass: green output must be
+        // distinguishable from never-ran (#2419 review round 19).
+        eprintln!(
+            "SKIPPED {}: PROXIMADB_PAX_READ_PROBE_* is set in the environment; \
+             the shipped defaults are not observable here",
+            stringify!(default_probe_quality_and_backend_ranges_match_sift_acceptance())
+        );
+        return;
     }
 
     // Assert the PURE resolver against the default policy: this test must
@@ -954,7 +961,14 @@ async fn local_pax_seed_streams_regions_into_persistent_cache() {
 #[test]
 fn toml_coarse_probe_config_wins_over_default_init() {
     if probe_env_overrides_present() {
-        return; // contaminated shell: defaults are not observable here
+        // A VISIBLE skip, not a vacuous pass: green output must be
+        // distinguishable from never-ran (#2419 review round 19).
+        eprintln!(
+            "SKIPPED {}: PROXIMADB_PAX_READ_PROBE_* is set in the environment; \
+             the shipped defaults are not observable here",
+            stringify!(toml_coarse_probe_config_wins_over_default_init())
+        );
+        return;
     }
 
     // Simulate a default-config engine seeding first...

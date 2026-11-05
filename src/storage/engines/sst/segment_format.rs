@@ -4088,7 +4088,9 @@ fn coarse_probe_nprobe(
                 let mut count = 0u64;
                 for cell in &dir.cells {
                     if cell.a_len > 0 {
-                        bytes += cell.a_len;
+                        // saturating (mandate #4): file-derived a_len
+                        // (#2419 review round 19).
+                        bytes = bytes.saturating_add(cell.a_len);
                         count += 1;
                     }
                 }
@@ -4107,10 +4109,10 @@ fn coarse_probe_nprobe(
 /// default as the per-segment probe, applied to the **total** usable cells
 /// (`ceil(sqrt(cells) × multiplier)`), so S segments of k cells probe about
 /// `2·sqrt(S·k)` cells instead of `S · 2·sqrt(k)`.
-pub(crate) fn centroid_directory_nprobe(
+pub(crate) fn centroid_directory_nprobe_for(
+    first_url: &str,
     total_cells: usize,
     corpus_rows: u64,
-    rowgroup_bytes: u64,
     avg_cell_bytes: u64,
 ) -> usize {
     std::env::var("PROXIMADB_PAX_READ_CENTROID_DIRECTORY_NPROBE")
@@ -4118,7 +4120,26 @@ pub(crate) fn centroid_directory_nprobe(
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|n| *n > 0)
         .unwrap_or_else(|| {
-            geometric_nprobe(total_cells, corpus_rows, rowgroup_bytes, avg_cell_bytes)
+            // Policy read ONCE; the rowgroup budget (registry + env scan) is
+            // resolved ONLY for byte_budget — every other algorithm ignores
+            // it, and this runs per directory-planned query (#2419 review
+            // round 19; same rule as the per-segment path).
+            let policy = cached_probe_policy();
+            let rowgroup_bytes = if policy.algorithm
+                == proximadb_storage_common::probe_policy::ProbeAlgorithm::ByteBudget
+            {
+                proximadb_storage_common::iops_budget::IopsBudget::for_path(first_url)
+                    .target_block_bytes()
+            } else {
+                0
+            };
+            geometric_nprobe_with(
+                &policy,
+                total_cells,
+                corpus_rows,
+                rowgroup_bytes,
+                avg_cell_bytes,
+            )
         })
         .min(total_cells.max(1))
 }

@@ -240,11 +240,22 @@ fn snap_to_band(bytes: u64, rowgroup_bytes: u64, cap_bytes: u64) -> u64 {
             best = rung;
         }
     }
-    // The result is a LADDER RUNG (its doc contract), bounded only by the
-    // cap. Clamping back down to the pre-snap target would return a
-    // non-rung whenever the nearest rung sits above it.
+    // The result is a LADDER RUNG (its doc contract). When the cap sits
+    // BETWEEN rungs, `min(cap)` returned the cap itself — a value the
+    // ladder never contained, so `ProbePlan.band` reported a band that does
+    // not exist (#2419 review round 19). Take the nearest rung NOT above
+    // the cap instead; a cap below the smallest rung keeps the cap (the
+    // documented sub-ladder case — no rung fits).
     if cap_bytes > 0 {
-        best.min(cap_bytes)
+        if best <= cap_bytes {
+            best
+        } else {
+            ladder
+                .into_iter()
+                .filter(|rung| *rung <= cap_bytes)
+                .max()
+                .unwrap_or(cap_bytes)
+        }
     } else {
         best
     }
@@ -388,11 +399,8 @@ const PROBE_BASE_MB_KEY: &str = "probe.base_mb";
 const PROBE_CAP_MB_KEY: &str = "probe.cap_mb";
 
 fn property_usize(properties: &HashMap<String, String>, key: &str) -> Option<usize> {
-    properties
-        .iter()
-        .filter(|(k, _)| k.trim().to_ascii_lowercase() == key)
-        .min_by_key(|(k, _)| k.as_str())
-        .and_then(|(_, v)| v.trim().parse::<usize>().ok())
+    crate::policy_properties::policy_value(properties, key)
+        .and_then(|v| v.trim().parse::<usize>().ok())
     // NO `> 0` filter: 0 is the sentinel (no floor / unlimited / no cap) that
     // `validate_probe_properties` accepts and the server layer honours, so
     // dropping it here resolved `probe.cap_mb=0` silently back to the code
@@ -528,25 +536,21 @@ pub fn resolve_probe_policy_gated(
     }
 
     // Collection property layer (the top).
-    if let Some(algorithm) = properties
-        .iter()
-        .filter(|(k, _)| k.trim().to_ascii_lowercase() == PROBE_ALGORITHM_PROPERTY_KEY)
-        .min_by_key(|(k, _)| k.as_str())
-        .and_then(|(_, v)| ProbeAlgorithm::parse(v))
-        .filter(|a| admitted(*a))
+    if let Some(algorithm) =
+        crate::policy_properties::policy_value(properties, PROBE_ALGORITHM_PROPERTY_KEY)
+            .and_then(|v| ProbeAlgorithm::parse(v))
+            .filter(|a| admitted(*a))
     {
         policy.algorithm = algorithm;
     }
-    if let Some(multiplier) = properties
-        .iter()
-        .filter(|(k, _)| k.trim().to_ascii_lowercase() == PROBE_MULTIPLIER_KEY)
-        .min_by_key(|(k, _)| k.as_str())
-        .and_then(|(_, v)| v.trim().parse::<f64>().ok())
-        // is_finite() and >= 0: "inf" parses and would saturate nprobe to
-        // usize::MAX (the silent full scan this module removed from the
-        // `log` arm); 0 is the historical "floor only" setting and stays
-        // legal. Matches the server layer's filter.
-        .filter(|m| is_valid_multiplier(*m))
+    if let Some(multiplier) =
+        crate::policy_properties::policy_value(properties, PROBE_MULTIPLIER_KEY)
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            // is_finite() and >= 0: "inf" parses and would saturate nprobe to
+            // usize::MAX (the silent full scan this module removed from the
+            // `log` arm); 0 is the historical "floor only" setting and stays
+            // legal. Matches the server layer's filter.
+            .filter(|m| is_valid_multiplier(*m))
     {
         policy.multiplier = multiplier;
     }
@@ -1137,5 +1141,15 @@ mod tests {
             pick(&tags(&["Probe.Algorithm:cbrt"]), true),
             ProbeAlgorithm::CubeRoot
         );
+    }
+    #[test]
+    fn snap_returns_a_real_rung_when_the_cap_sits_between_rungs() {
+        let mib: u64 = 1024 * 1024;
+        // Ladder for rg=4MiB capped at 7 MiB: the 8 MiB rung is out, the
+        // result must be the 4 MiB rung, not "7 MiB".
+        let snapped = snap_to_band(9 * mib, 4 * mib, 7 * mib);
+        assert_eq!(snapped, 4 * mib, "nearest rung not above the cap");
+        // A cap below every rung is honoured as-is (sub-ladder case).
+        assert_eq!(snap_to_band(9 * mib, 4 * mib, 300 * 1024), 300 * 1024);
     }
 }

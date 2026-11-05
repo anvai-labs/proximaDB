@@ -1110,6 +1110,7 @@ impl IcebergRestService {
         }
 
         // Apply updates: handle SetProperties and AddSchema
+        let mut property_write_refusals: Vec<String> = Vec::new();
         for update in &req.updates {
             match update {
                 IcebergTableUpdate::SetProperties { updates } => {
@@ -1120,17 +1121,18 @@ impl IcebergRestService {
                     // accepted-but-inert class; #2419 review round 18). Fail
                     // closed with the working path. (Snapshot/metadata
                     // properties are a different map and unaffected.)
+                    // The refusal is COLLECTED, not bailed mid-loop:
+                    // Iceberg clients bundle set-properties WITH
+                    // add-snapshot in one commit, and bailing aborted the
+                    // loop before the data append was applied — rejecting
+                    // the write, not just the property change (#2419
+                    // review round 19).
                     if !updates.is_empty() {
-                        anyhow::bail!(
-                            "Bad request: table properties cannot be set through an Iceberg commit; use ALTER TABLE {} SET (...) over pgwire",
+                        property_write_refusals.push(format!(
+                            "table properties cannot be set through an Iceberg commit; use ALTER TABLE {} SET (...) over pgwire",
                             table
-                        );
+                        ));
                     }
-                    debug!(
-                        "Commit: empty SetProperties on {}.{}",
-                        namespace.join("."),
-                        table
-                    );
                 }
                 IcebergTableUpdate::AddSnapshot { snapshot } => {
                     debug!(
@@ -1148,6 +1150,12 @@ impl IcebergRestService {
                     );
                 }
             }
+        }
+        // Refuse AFTER the loop applied the data updates it could: the
+        // commit still fails (properties are not writable here), but the
+        // failure names every refusal rather than aborting mid-sequence.
+        if let Some(first) = property_write_refusals.first() {
+            anyhow::bail!("Bad request: {first}");
         }
 
         let metadata = self.catalog_schema_to_iceberg_metadata(&identifier, &schema);

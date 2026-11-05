@@ -29,6 +29,19 @@ use std::collections::HashMap;
 /// fourth family is added HERE and every consumer sees it.
 pub const POLICY_PROPERTY_PREFIXES: [&str; 3] = ["cache.", "compaction.", "probe."];
 
+/// The case-insensitive property lookup every knob resolver uses: the
+/// FIRST key (by raw byte order) among case/whitespace variants wins, so
+/// resolution is deterministic under HashMap iteration order. ONE
+/// implementation — hand-copied filter/min_by_key chains could drift
+/// (#2419 review round 19).
+pub fn policy_value<'a>(properties: &'a HashMap<String, String>, key: &str) -> Option<&'a String> {
+    properties
+        .iter()
+        .filter(|(k, _)| normalize_policy_key(k) == key)
+        .min_by_key(|(k, _)| k.as_str())
+        .map(|(_, v)| v)
+}
+
 /// The normalized form every policy resolver keys on.
 pub fn normalize_policy_key(key: &str) -> String {
     key.trim().to_ascii_lowercase()
@@ -40,6 +53,8 @@ pub fn normalize_policy_key(key: &str) -> String {
 /// untouched (they are stored verbatim by design).
 ///
 /// Returns the first family error, already phrased for an operator.
+const PROBE_PREFIX_CANARY: &str = "probe.";
+
 pub fn validate_policy_properties(properties: &HashMap<String, String>) -> Result<(), String> {
     // One map may not name the same policy knob twice. The resolvers key on
     // `normalize_policy_key`, so 'compaction.strategy' and
@@ -89,7 +104,9 @@ pub fn validate_policy_properties(properties: &HashMap<String, String>) -> Resul
         // review raised that this narrows what the REST `properties` doc
         // comment promises; the doc is corrected rather than the guard
         // loosened.
-        .find(|(key, _)| key.trim().to_ascii_lowercase().starts_with("probe."))
+        .find(|(key, _)| {
+            normalize_policy_key(key).starts_with(&normalize_policy_key(PROBE_PREFIX_CANARY))
+        })
     {
         return Err(format!(
             "{key}: per-collection probe properties are not consumed yet (TD-RDSTRAT-14 deferred the search-path carrier). Configure the probe policy with [storage.sst_config.coarse_probe] or PROXIMADB_PAX_READ_PROBE_* until it lands"

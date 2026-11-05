@@ -375,3 +375,20 @@ snapshotted. Filed:
   compacts away or a scheme migration advances (1 MiB local vs 4 MiB cloud
   rungs, mid-experiment, no config change). Plumb the CONFIGURED storage
   location's budget instead. byte_budget arms only (experimental-gated).
+
+Round 19 (#2419): the SetProperties refusal is COLLECTED and raised after
+the update loop — bailing mid-loop rejected the bundled add-snapshot too,
+so a Spark `writeTo(...).tableProperty(...)` lost its DATA append, not just
+the property change; the file-derived per-group/cell byte sums are
+saturating (a crafted directory could overflow-panic a debug build);
+the directory path resolves its rowgroup budget lazily, byte_budget-only,
+inside the nprobe closure (the per-query registry+env scan is gone from
+the default path, matching round 17's per-segment rule);
+snap_to_band returns a real ladder rung when the cap sits between rungs
+(`ProbePlan.band` could report a band the ladder never contained); the
+env-guarded default-chain tests print a visible SKIPPED line instead of
+passing vacuously; one `policy_value` helper replaces the hand-copied
+case-insensitive lookups, and the probe.* refusal keys on
+`normalize_policy_key`. The dead tag channel was raised again (F1): when
+the carrier lands it must validate at the same doors, or the tag prefix
+must be refused until then.

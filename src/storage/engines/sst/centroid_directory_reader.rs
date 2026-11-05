@@ -37,7 +37,7 @@ use proximadb_storage_filesystem_types::{DirEntry, FileSystem};
 use crate::storage::engines::sst::block_cluster::env_kill_switch_off;
 use crate::storage::engines::sst::centroid_directory_publisher::directory_objects_newest_first;
 use crate::storage::engines::sst::segment_format::{
-    SegmentInvariants, centroid_directory_nprobe, pax_rabitq_pool_for_top_k,
+    SegmentInvariants, centroid_directory_nprobe_for, pax_rabitq_pool_for_top_k,
     prefix_read_covers_segment,
 };
 
@@ -245,18 +245,19 @@ pub(crate) fn plan_segments<'a>(
     // counted entries whose size no longer matches the live object, which
     // inflated a byte_budget plan by (counted/usable)^0.25 mid-compaction.
     // The rowgroup geometry comes from the lexicographically-smallest live
-    // URL: deterministic across restarts even when a collection spans URL
-    // schemes mid-migration.
+    // URL (deterministic across restarts even when a collection spans URL
+    // schemes mid-migration; its residual nondeterminism is filed as
+    // RDSTRAT-14-F14) — resolved LAZILY, inside the closure and only for
+    // byte_budget, so the default path pays no registry/env scan per query
+    // (#2419 review round 19).
     let first_url = url_by_name.values().min().map(String::as_str).unwrap_or("");
-    let rowgroup_bytes =
-        proximadb_storage_common::iops_budget::IopsBudget::for_path(first_url).target_block_bytes();
     let plan = dir.plan_probe(
         query,
         &live,
         // `avg_group_bytes` comes from `plan_probe`, which alone knows the
         // usable, stamp-matched set and the real grouping — see its doc.
         |total_cells: usize, usable_rows: u64, avg_group_bytes: u64| {
-            centroid_directory_nprobe(total_cells, usable_rows, rowgroup_bytes, avg_group_bytes)
+            centroid_directory_nprobe_for(first_url, total_cells, usable_rows, avg_group_bytes)
         },
         |rows| {
             let rows = usize::try_from(rows).unwrap_or(usize::MAX);
