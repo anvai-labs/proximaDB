@@ -386,13 +386,13 @@ impl RbacService {
         Ok(())
     }
 
-    /// Check if user has access to a specific collection
     /// Collection-access predicate.
     ///
     /// No per-collection ACLs exist in this service: access to ANY collection
     /// is granted whenever the caller's role permissions already allow the
     /// operation (checked separately by `check_permission_with_context`) and
-    /// the user record resolves. Enforcing per-collection ACLs would require
+    /// the roles read succeeds (`try_read` contention is the only failure
+    /// mode; unknown users resolve to the default role). Enforcing per-collection ACLs would require
     /// an ACL store this layer does not have (TD-FACADE-1); until one exists
     /// this intentionally reduces to role permissions, and the `admin` short
     /// circuit below is the only collection-independent override.
@@ -410,7 +410,6 @@ impl RbacService {
         true
     }
 
-    /// Check if user belongs to tenant
     /// Fail-closed tenant-membership predicate (TD-FACADE-1).
     ///
     /// This service stores roles and permissions only — it has no
