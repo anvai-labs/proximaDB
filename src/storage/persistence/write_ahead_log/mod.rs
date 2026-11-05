@@ -1110,10 +1110,6 @@ pub(crate) async fn resolve_collection_meta_from_catalog(
     None
 }
 
-/// List every collection known to the global catalog as proto `Collection`s, or
-/// an empty vec if no catalog is wired. The catalog is the sole authority, so
-/// this replaces the legacy `provider.list_collections()` lookup used during WAL
-/// recovery.
 /// A catalog-resolved collection PLUS its policy properties (TD-COMPACT-15):
 /// the engine-facing proto `Collection` has no properties field, and
 /// deriving policy tags onto it would leak into read-modify-write catalog
@@ -1125,6 +1121,10 @@ pub(crate) struct CatalogCollectionMeta {
     pub properties: std::collections::HashMap<String, String>,
 }
 
+/// List every collection known to the global catalog, each paired with its
+/// catalog properties, or an empty vec if no catalog is wired. The catalog is
+/// the sole authority, so this replaces the legacy `provider.list_collections()`
+/// lookup used during WAL recovery.
 pub(crate) async fn list_collections_from_catalog() -> Vec<CatalogCollectionMeta> {
     let global = get_global_catalog();
     let Some(catalog_manager) = global.read().await.clone() else {

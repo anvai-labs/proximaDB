@@ -3444,10 +3444,10 @@ def main() -> int:
     args = parser.parse_args()
     if args.skip_ingest and not args.collection_id:
         raise SystemExit("--skip-ingest requires --collection-id")
-        if args.compact_full_target_segments is not None and not args.compact_full_before_measure:
-            raise SystemExit(
-                "--compact-full-target-segments requires --compact-full-before-measure"
-            )
+    if args.compact_full_target_segments is not None and not args.compact_full_before_measure:
+        raise SystemExit(
+            "--compact-full-target-segments requires --compact-full-before-measure"
+        )
     if not (
         args.coalesce_gap_mb >= 0
         and args.coalesce_range_mb > 0

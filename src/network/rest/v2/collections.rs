@@ -3465,6 +3465,16 @@ pub async fn post_collection_compact_v2(
             "target_segments must be greater than zero".to_string(),
         ));
     }
+    // Fail closed on the same reasoning the Flight side rejects 0: a knob
+    // that is accepted and then silently dropped reports success for work
+    // that never happened. `target_segments` only means anything to the
+    // cross-level collapse.
+    if target_segments.is_some() && !full {
+        return Err(ApiError::InvalidArgument(
+            "target_segments requires \"full\": true (it bounds the cross-level collapse)"
+                .to_string(),
+        ));
+    }
     let result = state
         .vector_operations_service
         .unified_engine()

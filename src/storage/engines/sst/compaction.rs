@@ -461,7 +461,13 @@ pub struct FullCompactionSummary {
     pub reached_target: bool,
     pub stop_reason: Option<&'static str>,
     pub pending_files: usize,
-    /// Measured across all completed passes (TD-COMPACT-15 provenance).
+    /// Measured bytes across the passes THIS request's loop executed
+    /// (TD-COMPACT-15 provenance). Scope caveat: when the resolved target is
+    /// 1, the worker's follow-up chain may merge further after a pass
+    /// publishes; those morsels carry their own output keys, so their bytes
+    /// are not summed here. The figure is therefore a measured LOWER BOUND
+    /// on the request's total I/O on the default path, and exact when a
+    /// target > 1 suppresses the follow-up chain.
     pub bytes_read: u64,
     pub bytes_written: u64,
     /// Wall-clock duration of the whole request, including discovery and

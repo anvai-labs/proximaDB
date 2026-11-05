@@ -1150,17 +1150,31 @@ impl SstEngine {
         // `hybrid` anywhere above beats a consolidate default below it.
         // Read the two policy fields by reference — the default hybrid path
         // must not pay a full CompactionConfig clone per flush trigger.
-        let (server_strategy, server_target_mb) = self
-            .config()
-            .compaction_config
-            .as_ref()
+        // A `None` compaction_config is the PRODUCTION shape (every
+        // `SstConfig::default()` construction: factory, `SstEngine::new`,
+        // legacy ops), not a test artifact. Falling back to zeros here made
+        // `target_mb` 1 MiB and the write-amp limit 0 — so consolidate was
+        // always "at target" and never fired, and it disagreed with
+        // `compact_collection_full`'s `unwrap_or_default()` (512 MiB). The
+        // numeric fallbacks must be the real config defaults; the default
+        // struct is built only on the None path, so the common path still
+        // does not allocate.
+        let cfg = self.config().compaction_config.as_ref();
+        let server_strategy = cfg.and_then(|cfg| cfg.consolidate_strategy.as_deref());
+        let (server_target_mb, write_amp_limit) = cfg
             .map(|cfg| {
                 (
-                    cfg.consolidate_strategy.as_deref(),
                     cfg.consolidate_target_file_size_mb,
+                    cfg.consolidate_write_amp_limit,
                 )
             })
-            .unwrap_or((None, u64::default()));
+            .unwrap_or_else(|| {
+                let defaults = crate::core::config::CompactionConfig::default();
+                (
+                    defaults.consolidate_target_file_size_mb,
+                    defaults.consolidate_write_amp_limit,
+                )
+            });
         let strategy =
             proximadb_storage_common::resolve_effective_strategy(properties, tags, server_strategy);
         if strategy == proximadb_storage_common::CompactionStrategy::Consolidate {
@@ -1169,12 +1183,6 @@ impl SstEngine {
             let target_mb =
                 proximadb_storage_common::resolve_target_file_size_mb(properties, server_target_mb)
                     .max(1);
-            let write_amp_limit = self
-                .config()
-                .compaction_config
-                .as_ref()
-                .map(|cfg| cfg.consolidate_write_amp_limit)
-                .unwrap_or_default();
             let files = self
                 .discover_sstable_files(storage_url)
                 .await

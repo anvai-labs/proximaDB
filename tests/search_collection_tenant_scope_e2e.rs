@@ -2706,8 +2706,9 @@ async fn flight_compact_collection_payload_carries_provenance() {
         payload["bytes_written"].as_u64().unwrap_or(0) > 0,
         "measured bytes_written: {payload}"
     );
+    // Presence, not magnitude (whole-millisecond truncation).
     assert!(
-        payload["duration_ms"].as_u64().unwrap_or(0) > 0,
-        "wall-clock duration: {payload}"
+        payload["duration_ms"].is_u64(),
+        "duration_ms reported: {payload}"
     );
 }

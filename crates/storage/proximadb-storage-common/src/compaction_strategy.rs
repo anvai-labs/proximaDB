@@ -81,14 +81,19 @@ pub(crate) fn resolve_strategy_explicit_from_tags(tags: &[String]) -> Option<Com
 pub(crate) fn resolve_strategy_explicit_from_properties(
     properties: &HashMap<String, String>,
 ) -> Option<CompactionStrategy> {
+    // A key that is PRESENT but unparseable is an explicit (if broken)
+    // operator choice, so it must not fall through and inherit a lower
+    // layer that might say `consolidate`. It fails safe to the code
+    // default instead. (Validation rejects such values at every write
+    // door; this covers a catalog written by a path that bypassed them.)
     if let Some(value) = properties.get(COMPACTION_STRATEGY_PROPERTY_KEY) {
-        return parse_strategy(value);
+        return Some(parse_strategy(value).unwrap_or_default());
     }
     properties
         .iter()
         .filter(|(key, _)| key.trim().to_ascii_lowercase() == COMPACTION_STRATEGY_PROPERTY_KEY)
         .min_by_key(|(key, _)| key.as_str())
-        .and_then(|(_, value)| parse_strategy(value))
+        .map(|(_, value)| parse_strategy(value).unwrap_or_default())
 }
 
 /// The full precedence chain, as one pure function (unit-testable without
@@ -325,6 +330,36 @@ mod tests {
         assert_eq!(
             resolve_effective_strategy(&HashMap::new(), &[], Some("aggressive")),
             CompactionStrategy::Hybrid
+        );
+    }
+
+    #[test]
+    fn invalid_explicit_property_fails_safe_instead_of_inheriting() {
+        // #2418 review F7: a present-but-unparseable property is an explicit
+        // (broken) choice. It must NOT fall through to a tag or server layer
+        // that says `consolidate` — it resolves to the safe code default.
+        let consolidate_tag = vec!["compaction.strategy:consolidate".to_string()];
+        assert_eq!(
+            resolve_effective_strategy(
+                &props(&[("compaction.strategy", "consolidat")]),
+                &consolidate_tag,
+                Some("consolidate"),
+            ),
+            CompactionStrategy::Hybrid
+        );
+        // Same for a non-canonical spelling carrying junk.
+        assert_eq!(
+            resolve_effective_strategy(
+                &props(&[("Compaction.Strategy", "garbage")]),
+                &consolidate_tag,
+                Some("consolidate"),
+            ),
+            CompactionStrategy::Hybrid
+        );
+        // An ABSENT property still falls through, as designed.
+        assert_eq!(
+            resolve_effective_strategy(&HashMap::new(), &consolidate_tag, None),
+            CompactionStrategy::Consolidate
         );
     }
 

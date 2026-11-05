@@ -2423,7 +2423,9 @@ mod tests {
         );
         assert!(result.bytes_written.unwrap_or(0) > 0);
         assert!(result.bytes_read.unwrap_or(0) > 0);
-        assert!(result.duration_ms.unwrap_or(0) > 0);
+        // Presence, not magnitude: `as_millis() as u64` truncates, so a
+        // sub-millisecond FULL on tmpfs legitimately reports 0.
+        assert!(result.duration_ms.is_some());
     }
 
     /// An operator FULL request is never disarmed by `compaction:off` (the

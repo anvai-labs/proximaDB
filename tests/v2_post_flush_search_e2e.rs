@@ -1106,10 +1106,9 @@ async fn v2_compact_full_response_reports_provenance_and_target_override() {
         body["bytes_written"].as_u64().unwrap_or(0) > 0,
         "measured bytes_written: {body}"
     );
-    assert!(
-        body["duration_ms"].as_u64().unwrap_or(0) > 0,
-        "wall-clock duration: {body}"
-    );
+    // Presence, not magnitude: the duration truncates to whole
+    // milliseconds, so a sub-ms compaction legitimately reports 0.
+    assert!(body["duration_ms"].is_u64(), "duration_ms reported: {body}");
     assert_eq!(
         server.persisted_pax_files().len(),
         after as usize,
