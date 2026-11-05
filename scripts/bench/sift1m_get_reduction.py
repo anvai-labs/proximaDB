@@ -3260,7 +3260,18 @@ def main() -> int:
             "TD-COMPACT-15 Experiment 3: per-request override of the FULL "
             "collapse target (server [storage.compaction_config] "
             "full_target_segments, default 1). Requires "
-            "--compact-full-before-measure; keep --max-segments consistent"
+            "--compact-full-before-measure; --max-segments must match"
+        ),
+    )
+    parser.add_argument(
+        "--allow-untrained-geometry",
+        action="store_true",
+        help=(
+            "record a --compact-full-target-segments > 1 arm even though its "
+            "segments may be UNTRAINED (the pinned target suppresses the "
+            "training promotion, and a settled bed never triggers the round "
+            "that would perform it). Stamps untrained_geometry_risk into "
+            "result.json; see TD-COMPACT-15"
         ),
     )
     parser.add_argument("--top-k", type=int, default=10)
@@ -3442,6 +3453,27 @@ def main() -> int:
     args = parser.parse_args()
     if args.skip_ingest and not args.collection_id:
         raise SystemExit("--skip-ingest requires --collection-id")
+    if (
+        args.compact_full_target_segments is not None
+        and args.compact_full_target_segments > 1
+        and not args.allow_untrained_geometry
+    ):
+        # #2418 review round 6: a pinned target > 1 suppresses the follow-up
+        # carrying the layout/TRAINING promotion, and "the next write heals
+        # it" cannot apply here — this harness pins a target on a SETTLED bed
+        # and then measures queries, so no further write arrives. The outputs
+        # can stay untrained (~180 GETs/query vs 20-51), making the arm NOT
+        # comparable to a trained S=1 arm. Refuse rather than publish a
+        # number that looks comparable and is not.
+        raise SystemExit(
+            "--compact-full-target-segments > 1 can leave the collapsed segments "
+            "untrained (the pinned target suppresses the training promotion, and a "
+            "settled bed never triggers the next round that would perform it), so the "
+            "arm is not comparable to a trained S=1 arm. Check the "
+            "proximadb_compaction_training_promotion_suppressed_total counter; pass "
+            "--allow-untrained-geometry to record it anyway with the caveat stamped "
+            "into result.json"
+        )
     if (
         args.compact_full_target_segments is not None
         and args.compact_full_target_segments != args.max_segments
@@ -3913,6 +3945,13 @@ def main() -> int:
             "local_disk_warm_max_p50_ms": args.local_warm_max_p50_ms,
             "object_cold_max_p50_ms": args.max_p50_ms,
             "max_segments": args.max_segments,
+            # TD-COMPACT-15: a pinned target > 1 may leave segments untrained,
+            # so an arm recorded with --allow-untrained-geometry carries the
+            # caveat rather than reading as directly comparable.
+            "untrained_geometry_risk": bool(
+                args.compact_full_target_segments
+                and args.compact_full_target_segments > 1
+            ),
         },
         "phases": {},
     }

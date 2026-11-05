@@ -2627,7 +2627,16 @@ impl FlightService for ProximaFlightService {
                 // instead of ignoring them — the sibling `compact_collection`
                 // arm fail-closes on the same inputs, and accepting them here
                 // returned `success: true` for a collapse that never ran.
-                if params.get("full").is_some() || params.get("target_segments").is_some() {
+                // Reject a MEANINGFUL value, not the mere presence of the
+                // key: a client that always serializes the field sends
+                // `"full": false` (semantically "no collapse" — exactly what
+                // this action does) and an explicit `"target_segments": null`
+                // reads as Some(Value::Null) from `Map::get`. The sibling
+                // `compact_collection` arm already treats null as absent, so
+                // a presence check made the two arms disagree on one input.
+                let asks_for_full = params.get("full").and_then(|v| v.as_bool()) == Some(true);
+                let asks_for_target = params.get("target_segments").is_some_and(|v| !v.is_null());
+                if asks_for_full || asks_for_target {
                     return Err(TonicStatus::invalid_argument(
                         "flush_and_compact does not support full/target_segments: it runs a flush plus one plain policy morsel. Use the compact_collection action for a FULL collapse",
                     ));

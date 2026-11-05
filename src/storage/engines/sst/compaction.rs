@@ -1453,7 +1453,8 @@ impl Compaction {
             // always fits; outputs cascade upward naturally).
             pair.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
             let budget = current_compaction_input_budget(&cfg);
-            let target_file_size = cfg.consolidate_target_file_size_mb.max(1) * 1_048_576;
+            let target_file_size =
+                cfg.consolidate_target_file_size_mb_or_default().max(1) * 1_048_576;
             // TD-COMPACT-15 greedy smallest-first: accumulate segments from
             // the ascending-sorted list until the combined size reaches the
             // target file size (producing uniform segments) or the
@@ -2007,6 +2008,8 @@ impl Compaction {
                 // write. That is why this warns rather than debug-logs.
                 if task.suppress_follow_up {
                     if follow_up_threshold.is_some() {
+                        crate::metrics::operational_metrics::COMPACTION_TRAINING_PROMOTION_SUPPRESSED
+                            .inc();
                         warn!(
                             collection_object_id = task.collection_object_id,
                             "Pinned FULL target suppressed a follow-up carrying a layout/training promotion: outputs stay untrained until the next ordinary compaction round (TD-COMPACT-15 known trade-off)"

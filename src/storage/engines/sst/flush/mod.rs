@@ -86,8 +86,8 @@ fn effective_consolidate_knobs(
     let pick = |cfg: &crate::core::config::CompactionConfig| {
         (
             cfg.consolidate_strategy.clone(),
-            cfg.consolidate_target_file_size_mb,
-            cfg.consolidate_write_amp_limit,
+            cfg.consolidate_target_file_size_mb_or_default(),
+            cfg.consolidate_write_amp_limit_or_default(),
         )
     };
     if let Some(cfg) = engine {
@@ -1243,14 +1243,30 @@ impl SstEngine {
         // With no properties and no tags we cannot distinguish "did not opt
         // out" from "we cannot see it", and the conservative answer is the
         // code default (hybrid) — never the broader rewrite.
-        let opt_out_visible = !properties.is_empty() || !tags.is_empty();
+        // "Any tag" was the WRONG proxy (#2418 review round 6): `tags` comes
+        // from `collection_config` and is populated on EVERY flush path,
+        // while `properties` is populated only by the materializer. So a
+        // collection carrying any unrelated tag (a tier policy, a WLP
+        // profile) satisfied the guard on a recovery flush where the property
+        // opt-out was still invisible — leaving it protecting only
+        // collections with zero tags, which is not the set it documents.
+        //
+        // The channels are independent, so test each for what it can
+        // actually say: properties are visible when non-empty, and the tag
+        // channel counts only when it explicitly STATES a strategy.
+        let tags_state_a_strategy = tags.iter().any(|tag| {
+            tag.trim()
+                .to_ascii_lowercase()
+                .starts_with(proximadb_storage_common::COMPACTION_STRATEGY_TAG_PREFIX)
+        });
+        let opt_out_visible = !properties.is_empty() || tags_state_a_strategy;
         let server_strategy = if opt_out_visible {
             server_strategy_owned.as_deref()
         } else {
             if server_strategy_owned.is_some() {
                 tracing::debug!(
                     storage_url = %storage_url,
-                    "TD-COMPACT-15: server consolidate_strategy not applied — this flush path                      carries no collection properties, so a per-collection opt-out would be                      invisible; falling back to the code default"
+                    "TD-COMPACT-15: server consolidate_strategy not applied — this flush path carries no collection properties, so a per-collection opt-out would be invisible; falling back to the code default"
                 );
             }
             None
@@ -2076,14 +2092,17 @@ mod tests {
         // Before any install, a None engine config yields the code defaults.
         let defaults = crate::core::config::CompactionConfig::default();
         let (before_strategy, before_target, _) = effective_consolidate_knobs(None);
-        assert_eq!(before_target, defaults.consolidate_target_file_size_mb);
+        assert_eq!(
+            before_target,
+            defaults.consolidate_target_file_size_mb_or_default()
+        );
         assert!(before_strategy.is_none());
 
         // Install an operator config the way `ProximaDB::start` does.
         let server = crate::core::config::CompactionConfig {
             consolidate_strategy: Some("consolidate".to_string()),
-            consolidate_target_file_size_mb: 4096,
-            consolidate_write_amp_limit: 7,
+            consolidate_target_file_size_mb: Some(4096),
+            consolidate_write_amp_limit: Some(7),
             ..Default::default()
         };
         init_server_compaction_config(Some(&server));
@@ -2106,7 +2125,7 @@ mod tests {
 
         // An engine that DOES carry a config still wins (it is more specific).
         let engine = crate::core::config::CompactionConfig {
-            consolidate_target_file_size_mb: 128,
+            consolidate_target_file_size_mb: Some(128),
             ..Default::default()
         };
         assert_eq!(effective_consolidate_knobs(Some(&engine)).1, 128);

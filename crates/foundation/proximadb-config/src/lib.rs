@@ -1032,13 +1032,21 @@ pub struct CompactionConfig {
     /// TD-COMPACT-15: the target file size (MB) for the consolidate
     /// strategy — segments merge smallest-first until each output
     /// reaches this size, producing uniform I/O units.
-    #[serde(default = "default_consolidate_target_file_size_mb")]
-    pub consolidate_target_file_size_mb: u64,
+    ///
+    /// `Option` so that "the operator stated this" is distinguishable from
+    /// "absent": the SST-section merge needs to know, and comparing against
+    /// the default value cannot tell them apart (an operator explicitly
+    /// setting 512 to override a top-level 4096 looked absent). Read it
+    /// through [`CompactionConfig::consolidate_target_file_size_mb_or_default`].
+    #[serde(default)]
+    pub consolidate_target_file_size_mb: Option<u64>,
     /// TD-COMPACT-15: the write-amplification limit above which the
     /// consolidate strategy degrades to hybrid (guards against rewriting
-    /// the entire collection per flush).
-    #[serde(default = "default_consolidate_write_amp_limit")]
-    pub consolidate_write_amp_limit: u64,
+    /// the entire collection per flush). `Option` for the same reason as
+    /// the field above; read it through
+    /// [`CompactionConfig::consolidate_write_amp_limit_or_default`].
+    #[serde(default)]
+    pub consolidate_write_amp_limit: Option<u64>,
     /// TD-COMPACT-15: the server-level DEFAULT compaction strategy for
     /// collections that set neither the `compaction.strategy` property nor
     /// a tag — `"hybrid"` or `"consolidate"`. `None` keeps the code default
@@ -1105,8 +1113,8 @@ impl Default for CompactionConfig {
             full_target_segments: default_full_target_segments(),
             full_max_passes: default_full_max_passes(),
             full_timeout_ms: default_full_timeout_ms(),
-            consolidate_target_file_size_mb: default_consolidate_target_file_size_mb(),
-            consolidate_write_amp_limit: default_consolidate_write_amp_limit(),
+            consolidate_target_file_size_mb: None,
+            consolidate_write_amp_limit: None,
             consolidate_strategy: None,
         }
     }
@@ -1124,12 +1132,53 @@ fn default_full_timeout_ms() -> u64 {
     3_600_000
 }
 
-fn default_consolidate_target_file_size_mb() -> u64 {
-    512
-}
+/// The consolidate target file size when the operator stated none (MiB).
+pub const DEFAULT_CONSOLIDATE_TARGET_FILE_SIZE_MB: u64 = 512;
+/// The consolidate write-amplification limit when the operator stated none.
+pub const DEFAULT_CONSOLIDATE_WRITE_AMP_LIMIT: u64 = 100;
 
-fn default_consolidate_write_amp_limit() -> u64 {
-    100
+impl CompactionConfig {
+    /// The consolidate target file size, defaulted.
+    pub fn consolidate_target_file_size_mb_or_default(&self) -> u64 {
+        self.consolidate_target_file_size_mb
+            .unwrap_or(DEFAULT_CONSOLIDATE_TARGET_FILE_SIZE_MB)
+    }
+
+    /// The consolidate write-amp limit, defaulted.
+    pub fn consolidate_write_amp_limit_or_default(&self) -> u64 {
+        self.consolidate_write_amp_limit
+            .unwrap_or(DEFAULT_CONSOLIDATE_WRITE_AMP_LIMIT)
+    }
+
+    /// Merge an SST-section override over the top-level config, per FIELD.
+    ///
+    /// The single implementation of this merge (#2418 review round 6,
+    /// finding 6): `database.rs` field-merged while `effective_sst_config`
+    /// picked wholesale, so the two would have drifted the first time a
+    /// flush was served by a config-carrying instance. Both now call this.
+    ///
+    /// A wholesale pick is wrong because an operator who declares
+    /// `[storage.sst_config.compaction_config]` for one knob (say
+    /// `l0_file_threshold`) would silently lose every top-level
+    /// `consolidate_*` value.
+    pub fn merge_section_over(top: &CompactionConfig, section: Option<&CompactionConfig>) -> Self {
+        let Some(section) = section else {
+            return top.clone();
+        };
+        let mut merged = section.clone();
+        // Each field is Option, so `is_none()` means genuinely unstated —
+        // not "happens to equal the default".
+        if merged.consolidate_strategy.is_none() {
+            merged.consolidate_strategy = top.consolidate_strategy.clone();
+        }
+        if merged.consolidate_target_file_size_mb.is_none() {
+            merged.consolidate_target_file_size_mb = top.consolidate_target_file_size_mb;
+        }
+        if merged.consolidate_write_amp_limit.is_none() {
+            merged.consolidate_write_amp_limit = top.consolidate_write_amp_limit;
+        }
+        merged
+    }
 }
 
 fn default_higher_level_file_threshold() -> usize {

@@ -758,9 +758,18 @@ pub trait UnifiedStorageFormat: Send + Sync {
         full: bool,
         full_target_segments: Option<usize>,
     ) -> Result<CompactionResult> {
-        // Checked BEFORE the !full early return: a caller passing
-        // (full = false, Some(n)) otherwise dropped the bound silently,
-        // which is the very case this guard exists for.
+        // Checked BEFORE the !full early return, and WITHOUT an engine
+        // condition: `target_segments` without `full` is incoherent on every
+        // engine, including the one that supports FULL. Gating this on
+        // `!supports_full_compaction()` meant the guard fired only where the
+        // knob could never be honoured and let it through on SstEngine —
+        // the single engine behind every production caller, i.e. the one
+        // case that mattered (#2418 review round 6).
+        if full_target_segments.is_some() && !full {
+            anyhow::bail!(
+                "target_segments requires full: true — a plain compaction pass cannot honour a segment-count bound (this would otherwise report success for a bound that was never applied)"
+            );
+        }
         if full_target_segments.is_some() && !self.supports_full_compaction() {
             anyhow::bail!(
                 "this engine has no cross-level FULL collapse, so target_segments cannot be honoured; omit it (the request would otherwise report success for a bound that was never applied)"
