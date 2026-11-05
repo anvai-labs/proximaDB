@@ -105,7 +105,7 @@ async fn duckdb_search_posts_v2_search_request() {
                 // present and `top_k` is an int. We avoid asserting the
                 // float vector verbatim because f32 → JSON encoding
                 // doesn't necessarily round-trip a literal "0.1".
-                .json_body_partial(r#"{"top_k":10}"#);
+                .json_body_includes(r#"{"top_k":10}"#);
             then.status(200)
                 .header("content-type", "application/json")
                 .body(r#"{"results":[],"latency_ms":1,"request_id":"r1"}"#);
@@ -153,7 +153,7 @@ async fn duckdb_insert_posts_v2_records_batch() {
             when.method(Method::POST)
                 .path("/api/v2/collections/embeddings/records/batch")
                 .header("content-type", "application/json")
-                .json_body_partial(r#"{"records":[]}"#);
+                .json_body_includes(r#"{"records":[]}"#);
             then.status(200)
                 .header("content-type", "application/json")
                 .body(r#"{"success":true,"inserted":2,"results":[]}"#);
@@ -203,7 +203,7 @@ async fn hadoop_flush_batch_posts_v2_records_batch() {
             when.method(Method::POST)
                 .path("/api/v2/collections/hadoop_col/records/batch")
                 .header("content-type", "application/json")
-                .json_body_partial(r#"{"records":[]}"#);
+                .json_body_includes(r#"{"records":[]}"#);
             then.status(200)
                 .header("content-type", "application/json")
                 .body(r#"{"success":true,"inserted":1,"results":[]}"#);
@@ -381,7 +381,7 @@ async fn hadoop_next_record_follows_cursor_across_pages() {
         .mock_async(|when, then| {
             when.method(Method::POST)
                 .path("/api/v2/collections/col_b/records/scan")
-                .json_body_partial(r#"{"cursor":null}"#);
+                .json_body_includes(r#"{"cursor":null}"#);
             then.status(200)
                 .header("content-type", "application/json")
                 .body(
@@ -396,7 +396,7 @@ async fn hadoop_next_record_follows_cursor_across_pages() {
         .mock_async(|when, then| {
             when.method(Method::POST)
                 .path("/api/v2/collections/col_b/records/scan")
-                .json_body_partial(r#"{"cursor":"abc"}"#);
+                .json_body_includes(r#"{"cursor":"abc"}"#);
             then.status(200)
                 .header("content-type", "application/json")
                 .body(

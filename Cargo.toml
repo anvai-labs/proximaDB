@@ -842,7 +842,7 @@ proximadb-sdk = { path = "clients/rust", default-features = false, features = ["
 # and tests/connectors_flight_contract.rs). httpmock is the same crate the SDK
 # gate uses at clients/rust/tests/openapi_contract.rs; serde_yaml lets the
 # gates load docs/openapi/proximadb-openapi.yaml directly.
-httpmock = "0.7"
+httpmock = "0.9"
 serde_yaml = "0.9"
 # Test-only: integration tests use EmbeddedProximaDB from the embedded crate.
 # Dev-deps don't create build cycles (test-mode only).
