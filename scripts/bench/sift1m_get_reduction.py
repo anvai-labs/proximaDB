@@ -2307,6 +2307,20 @@ PROBE_POLICY_GATES = (
     "PROXIMADB_PAX_READ_PROBE_EXPERIMENTAL",
 )
 
+def probe_experimental_gate(probe_algorithm, probe_base_mb, probe_cap_mb) -> bool:
+    """Whether a run sets PROXIMADB_PAX_READ_PROBE_EXPERIMENTAL=1.
+
+    ONE decision used both to spawn the server and to record the arm in
+    result.json, so the label cannot drift from what the server got (#2419
+    review round 13). Non-sqrt algorithms need the gate; so do base/cap with
+    no --probe-algorithm, which only matter against a TOML byte_budget
+    server (round 11).
+    """
+    if probe_algorithm is not None:
+        return probe_algorithm != "sqrt"
+    return probe_base_mb is not None or probe_cap_mb is not None
+
+
 # TD-PAXDIR-1 D7: the gates the --centroid-directory arm turns on — publish the
 # collection directory with decode keys (D1, D6), plan queries on it (D2), ride
 # the rerank on the probe wave (D5), and use the keys on the query path (D6).
@@ -2511,16 +2525,8 @@ class OwnedServer:
             ] = str(self.nprobe)
         if self.probe_algorithm is not None:
             environment["PROXIMADB_PAX_READ_PROBE_ALGORITHM"] = self.probe_algorithm
-            # Non-sqrt algorithms are experimental (no recall@k eval gates
-            # them yet, mandate #13); the server ignores them without this
-            # gate, so a ladder arm must set it or it silently runs sqrt.
-            if self.probe_algorithm != "sqrt":
-                environment["PROXIMADB_PAX_READ_PROBE_EXPERIMENTAL"] = "1"
-        elif self.probe_base_mb is not None or self.probe_cap_mb is not None:
-            # base/cap with no --probe-algorithm only matter if the server's
-            # TOML is already byte_budget — which the gate must admit, or boot
-            # refuses the very arm the parse-time check allows (#2419 review
-            # round 11).
+        # The same decision result.json records (see probe_experimental_gate).
+        if probe_experimental_gate(self.probe_algorithm, self.probe_base_mb, self.probe_cap_mb):
             environment["PROXIMADB_PAX_READ_PROBE_EXPERIMENTAL"] = "1"
         if self.probe_base_mb is not None:
             environment["PROXIMADB_PAX_READ_PROBE_BASE_MB"] = str(self.probe_base_mb)
@@ -3910,12 +3916,8 @@ def main() -> int:
             # so a None row is the control only against the default config
             # (#2419 review round 9).
             "probe_policy_env_overrides": {
-                "experimental_gate": bool(
-                    (args.probe_algorithm and args.probe_algorithm != "sqrt")
-                    or (
-                        args.probe_algorithm is None
-                        and (args.probe_base_mb is not None or args.probe_cap_mb is not None)
-                    )
+                "experimental_gate": probe_experimental_gate(
+                    args.probe_algorithm, args.probe_base_mb, args.probe_cap_mb
                 ),
                 "algorithm": args.probe_algorithm,
                 "base_mb": args.probe_base_mb,

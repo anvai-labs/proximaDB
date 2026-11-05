@@ -145,6 +145,19 @@ pub struct ProbePlan {
     pub band: u64,
 }
 
+/// The largest multiplier any layer accepts. The sqrt arm computes in f32
+/// (byte-identity with the historical formula), so a finite f64 above
+/// `f32::MAX` would narrow to `inf` there and probe every cell — the silent
+/// full scan the finiteness checks exist to block (#2419 review round 13).
+/// 1e6 is far beyond any meaningful fan-out multiplier.
+pub const MAX_PROBE_MULTIPLIER: f64 = 1e6;
+
+/// Whether `m` is a usable multiplier: finite, non-negative (0 = probe
+/// exactly the floor) and at most [`MAX_PROBE_MULTIPLIER`].
+pub fn is_valid_multiplier(m: f64) -> bool {
+    m.is_finite() && (0.0..=MAX_PROBE_MULTIPLIER).contains(&m)
+}
+
 /// The env gate that admits the non-default (EXPERIMENTAL) algorithms.
 ///
 /// Only `sqrt` — the historical formula, recall-ratcheted — is a production
@@ -433,7 +446,7 @@ pub fn resolve_probe_policy(
     // the floor" (ceil(sqrt(k) x 0) = 0, clamped up to min_cells), and
     // filtering it out silently swapped it for the 2.0 default — so a
     // config that set it got a different nprobe than before this module.
-    if let Some(multiplier) = server.multiplier.filter(|m| m.is_finite() && *m >= 0.0) {
+    if let Some(multiplier) = server.multiplier.filter(|m| is_valid_multiplier(*m)) {
         policy.multiplier = multiplier;
     }
     // `Some(0)` is a documented SENTINEL on the server layer, not junk:
@@ -486,7 +499,7 @@ pub fn resolve_probe_policy(
         // usize::MAX (the silent full scan this module removed from the
         // `log` arm); 0 is the historical "floor only" setting and stays
         // legal. Matches the server layer's filter.
-        .filter(|m| m.is_finite() && *m >= 0.0)
+        .filter(|m| is_valid_multiplier(*m))
     {
         policy.multiplier = multiplier;
     }
@@ -525,9 +538,9 @@ pub fn validate_probe_properties(properties: &HashMap<String, String>) -> Result
                 // Non-negative finite: 0 is the historical "floor only"
                 // setting and must stay expressible (see the server layer).
                 let parsed = raw_value.trim().parse::<f64>().unwrap_or(f64::NAN);
-                if !parsed.is_finite() || parsed < 0.0 {
+                if !is_valid_multiplier(parsed) {
                     return Err(format!(
-                        "probe.multiplier: expected a non-negative finite number, got '{raw_value}'"
+                        "probe.multiplier: expected a finite number in 0..={MAX_PROBE_MULTIPLIER}, got '{raw_value}'"
                     ));
                 }
             }
@@ -984,6 +997,8 @@ mod tests {
         // nprobe to usize::MAX — a silent full scan (#2419 review round 5).
         assert!(validate_probe_properties(&props(&[("probe.multiplier", "inf")])).is_err());
         assert!(validate_probe_properties(&props(&[("probe.multiplier", "NaN")])).is_err());
+        // Finite but above f32::MAX: would narrow to inf in the f32 sqrt arm.
+        assert!(validate_probe_properties(&props(&[("probe.multiplier", "1e300")])).is_err());
         // 0 is the documented SENTINEL on these three — no floor, unlimited,
         // no cap — and `resolve_probe_policy` honours `Some(0)`, so rejecting
         // it meant the property channel could not express what the TOML field

@@ -3882,16 +3882,23 @@ fn settings_policy(s: &CoarseProbeSettings) -> proximadb_storage_common::probe_p
         // and the server layer drops it to the 2.0 default — so say so
         // instead of silently probing approximately where `inf` used to mean
         // every cell (#2419 review round 12).
-        multiplier: Some({
-            let m = s.nprobe_multiplier as f64;
-            if !m.is_finite() {
+        // NaN and inf took different paths here (NaN.max(0.0) is 0 = floor
+        // only; inf survived to be dropped downstream = 2.0). Both now take
+        // ONE: unusable -> warn -> the default (#2419 review round 13).
+        multiplier: {
+            let m = (s.nprobe_multiplier as f64).max(0.0);
+            if proximadb_storage_common::probe_policy::is_valid_multiplier(m)
+                && !(s.nprobe_multiplier as f64).is_nan()
+            {
+                Some(m)
+            } else {
                 tracing::warn!(
-                    nprobe_multiplier = m,
-                    "TD-RDSTRAT-14: non-finite nprobe_multiplier is not supported (it used to mean a full scan); using the default. Use an exact search mode for exhaustive probing"
+                    nprobe_multiplier = s.nprobe_multiplier,
+                    "TD-RDSTRAT-14: unusable nprobe_multiplier (non-finite or above the bound); using the default. Use an exact search mode for exhaustive probing"
                 );
+                None
             }
-            m.max(0.0)
-        }),
+        },
         min_cells: Some(s.nprobe_min),
         max_cells: Some(s.nprobe_max),
         base_bytes: Some(s.probe_base_bytes),

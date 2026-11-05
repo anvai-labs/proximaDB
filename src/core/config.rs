@@ -1891,9 +1891,13 @@ impl CoarseProbeConfig {
         // (#2419 review round 9). Only a NON-FINITE multiplier fails: `inf`
         // used to mean a silent full scan and NaN had no defined behaviour,
         // neither a setting anyone should be running (pre-GA, deliberate).
-        if !self.nprobe_multiplier.is_finite() {
+        if !self.nprobe_multiplier.is_finite()
+            || f64::from(self.nprobe_multiplier)
+                > proximadb_storage_common::probe_policy::MAX_PROBE_MULTIPLIER
+        {
             return Err(format!(
-                "{section}.nprobe_multiplier must be a finite number (got {})",
+                "{section}.nprobe_multiplier must be a finite number of at most {} (got {})",
+                proximadb_storage_common::probe_policy::MAX_PROBE_MULTIPLIER,
                 self.nprobe_multiplier
             ));
         }
@@ -1902,7 +1906,12 @@ impl CoarseProbeConfig {
         // to clamp silently, so one input resolved three ways; boot now
         // refuses an out-of-range value like the property door does.
         let max_mb = proximadb_storage_common::probe_policy::MAX_PROBE_BUDGET_MB as u64;
-        if self.base_mb > max_mb || self.cap_mb > max_mb {
+        // Only byte_budget reads base/cap, so only byte_budget fails boot on
+        // them — the same rule as base_mb below (#2419 review round 13).
+        let reads_budget =
+            proximadb_storage_common::probe_policy::ProbeAlgorithm::parse(&self.algorithm)
+                == Some(proximadb_storage_common::probe_policy::ProbeAlgorithm::ByteBudget);
+        if reads_budget && (self.base_mb > max_mb || self.cap_mb > max_mb) {
             return Err(format!(
                 "{section}.base_mb/cap_mb must be at most {max_mb} MiB (base_mb={}, cap_mb={})",
                 self.base_mb, self.cap_mb

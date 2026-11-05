@@ -283,3 +283,19 @@ passages are fixed; PATCH answers an empty request without calling the stub.
 Still filed: F1 (tag channel), F2 (hot-path inputs), F10 (inline
 normalization), F11 (no-op invalidation), and the per-segment budget scaling
 under F2.
+
+Round 13 (#2419; the review ran on the round-11 head, so only findings that
+still held were taken): one multiplier predicate, `is_valid_multiplier`,
+for every layer, bounded at `MAX_PROBE_MULTIPLIER` (1e6) — a finite f64
+above `f32::MAX` passed every check and then narrowed to `inf` in the f32
+sqrt arm, probing every cell; NaN and inf now take one path on non-loader
+configs (warn, use the default); the 1 TiB base/cap bounds fail boot only
+under byte_budget, the one form that reads them; the harness decides the
+experimental gate once (`probe_experimental_gate`) for both the spawn and
+the result.json label. Filed:
+
+* *RDSTRAT-14-F12 — the catalog stores policy keys in their raw spelling.*
+  SET replaces case/whitespace variants (round 8/9), but `' cache.index.mode '`
+  is still persisted with its whitespace, so every resolver re-normalizes on
+  read and only the SET door deduplicates. Persist the normalized key for
+  policy namespaces and the resolvers' tie-breaks go away.
