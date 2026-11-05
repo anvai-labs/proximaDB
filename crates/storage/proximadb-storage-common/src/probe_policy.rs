@@ -44,7 +44,8 @@ pub enum ProbeAlgorithm {
     /// `ceil(cells^0.25 × multiplier)` — the aggressive end of the root
     /// ladder.
     FourthRoot,
-    /// `ceil(a × log2(cells + 1) + multiplier)` — logarithmic growth.
+    /// `ceil(log2(cells) × multiplier + log2(base_bytes))` — logarithmic
+    /// growth; the base budget scales the ladder's step.
     Log,
     /// `min_cells` passthrough (clamped) — exact control arm.
     Fixed,
@@ -135,7 +136,7 @@ pub struct ProbePlan {
 }
 
 /// The discrete band ladder, DERIVED from the rowgroup geometry:
-/// rungs `[rg/4, rg/2, rg, 2·rg, 4·rg]` filtered to sane bounds (≥ 1 MiB
+/// rungs `[rg/4, rg/2, rg, 2·rg, 4·rg]` filtered to sane bounds (sub-512 KiB
 /// probes are pointless; unbounded above is fine — `cap_bytes` bounds).
 /// Band edges live HERE and nowhere else.
 pub fn band_ladder(rowgroup_bytes: u64) -> Vec<u64> {
@@ -152,26 +153,29 @@ pub fn band_ladder(rowgroup_bytes: u64) -> Vec<u64> {
     .collect()
 }
 
-/// Snap `bytes` to the nearest ladder rung (nearest-up on ties), bounded by
-/// `cap_bytes`. Returns the rung (0 when the ladder is empty).
+/// Snap `bytes` to the nearest ladder rung (ties keep the LOWER rung —
+/// fewer probes on ambiguity), bounded by `cap_bytes` (a cap above the top
+/// rung still bites: the returned plan never exceeds it). When the ladder
+/// is empty (a sub-512 KiB rowgroup target) the cap applies directly.
 fn snap_to_band(bytes: u64, rowgroup_bytes: u64, cap_bytes: u64) -> u64 {
+    let mut target = bytes;
+    if cap_bytes > 0 {
+        target = target.min(cap_bytes);
+    }
     let ladder = band_ladder(rowgroup_bytes);
     if ladder.is_empty() {
-        return bytes.min(cap_bytes.max(bytes));
+        return target;
     }
     let mut best = ladder[0];
     let mut best_dist = u64::MAX;
     for &rung in &ladder {
-        let dist = rung.abs_diff(bytes);
+        let dist = rung.abs_diff(target);
         if dist < best_dist {
             best_dist = dist;
             best = rung;
         }
     }
-    if cap_bytes > 0 {
-        best = best.min(cap_bytes);
-    }
-    best
+    best.min(target)
 }
 
 /// THE one pure function: the probe plan for a query under a policy.
@@ -188,6 +192,13 @@ fn snap_to_band(bytes: u64, rowgroup_bytes: u64, cap_bytes: u64) -> u64 {
 /// Clamped `[min_cells, max_cells]` then to `cells`, with the
 /// max-then-min ordering so a pool smaller than `min_cells` cannot panic
 /// (no-panic mandate #4).
+///
+/// SCALING CAVEAT (per-pool semantics): `corpus_rows` scales the budget of
+/// THIS pool. The collection-directory site passes collection-total rows
+/// (the authoritative path); a per-segment caller that lacks collection
+/// context scales per-SEGMENT — more probes than the collection-level plan
+/// would take, bounded by `cap_bytes`/`max_cells`. Callers should prefer
+/// the collection path (TD-RDSTRAT-14 §Deferred).
 pub fn resolve_probe_plan(
     policy: &ProbePolicy,
     cells: usize,
@@ -201,43 +212,71 @@ pub fn resolve_probe_plan(
     } else {
         (rowgroup_bytes / 8).max(1)
     };
-    let raw = match policy.algorithm {
-        ProbeAlgorithm::Sqrt => pool.sqrt() * policy.multiplier,
-        ProbeAlgorithm::CubeRoot => pool.cbrt() * policy.multiplier,
-        ProbeAlgorithm::FourthRoot => pool.sqrt().sqrt() * policy.multiplier,
-        ProbeAlgorithm::Log => {
-            pool.log2() * (policy.base_bytes as f64).log2().max(1.0) + policy.multiplier
-        }
-        ProbeAlgorithm::Fixed => policy.min_cells as f64,
+    match policy.algorithm {
+        // ByteBudget plans in BYTES end-to-end: budget → cap → band → cells,
+        // so the cell count, the planned bytes and the band can never
+        // contradict each other and the cap genuinely bounds fan-out.
         ProbeAlgorithm::ByteBudget => {
-            // budget grows quarter-power with corpus; 1M rows is the base.
+            // Budget grows quarter-power with corpus; 1M rows is the base.
             let scale = (corpus_rows.max(1) as f64 / 1_000_000.0).powf(0.25);
-            let budget = policy.base_bytes as f64 * scale;
-            (budget / cell_bytes as f64).ceil()
+            let mut budget = policy.base_bytes as f64 * scale;
+            if policy.cap_bytes > 0 {
+                budget = budget.min(policy.cap_bytes as f64);
+            }
+            let snapped = snap_to_band(budget as u64, rowgroup_bytes, policy.cap_bytes).max(1);
+            let by_budget = ((snapped as f64) / (cell_bytes as f64)).ceil() as usize;
+            // The recall floor (min_cells) can never exceed what the cap
+            // affords: the CAP is the contract (it bounds fan-out), the
+            // floor only raises the count when the budget has room.
+            let cap_cells = if policy.cap_bytes > 0 {
+                ((policy.cap_bytes / cell_bytes.max(1)) as usize).max(1)
+            } else {
+                usize::MAX
+            };
+            let floor = policy.min_cells.max(1).min(cap_cells);
+            let floored = by_budget.max(floor);
+            let bounded = if policy.max_cells > 0 {
+                floored.min(policy.max_cells)
+            } else {
+                floored
+            };
+            let chosen = bounded.min(cells.max(1));
+            ProbePlan {
+                cells: chosen,
+                probe_bytes: chosen as u64 * cell_bytes,
+                band: snapped,
+            }
         }
-    };
-    let raw = raw.ceil().max(1.0) as usize;
-    let floored = raw.max(policy.min_cells.max(1));
-    let bounded = if policy.max_cells > 0 {
-        floored.min(policy.max_cells)
-    } else {
-        floored
-    };
-    let chosen = bounded.min(cells.max(1));
-
-    let mut probe_bytes = chosen as u64 * cell_bytes;
-    let band = if policy.algorithm == ProbeAlgorithm::ByteBudget {
-        let snapped = snap_to_band(probe_bytes, rowgroup_bytes, policy.cap_bytes);
-        probe_bytes = snapped;
-        snapped
-    } else {
-        0
-    };
-    ProbePlan {
-        cells: chosen,
-        probe_bytes,
-        band,
+        _ => {
+            let raw = match policy.algorithm {
+                ProbeAlgorithm::Sqrt => pool.sqrt() * policy.multiplier,
+                ProbeAlgorithm::CubeRoot => pool.cbrt() * policy.multiplier,
+                ProbeAlgorithm::FourthRoot => pool.sqrt().sqrt() * policy.multiplier,
+                ProbeAlgorithm::Log => pool.log2() * policy.multiplier + (snapped_log_base(policy)),
+                ProbeAlgorithm::Fixed => policy.min_cells as f64,
+                ProbeAlgorithm::ByteBudget => unreachable!("handled above"),
+            };
+            let raw = raw.ceil().max(1.0) as usize;
+            let floored = raw.max(policy.min_cells.max(1));
+            let bounded = if policy.max_cells > 0 {
+                floored.min(policy.max_cells)
+            } else {
+                floored
+            };
+            let chosen = bounded.min(cells.max(1));
+            ProbePlan {
+                cells: chosen,
+                probe_bytes: chosen as u64 * cell_bytes,
+                band: 0,
+            }
+        }
     }
+}
+
+/// Log form's corpus-scale term: `log2(base_bytes)` so the budget knob
+/// meaningfully scales the logarithmic ladder too.
+fn snapped_log_base(policy: &ProbePolicy) -> f64 {
+    (policy.base_bytes as f64).log2().max(1.0)
 }
 
 /// The property key for the algorithm (`probe.algorithm`).
@@ -443,19 +482,43 @@ mod tests {
         };
         let cell = 512 * 1024; // 0.5 MiB cells
         let rg = 4 * 1024 * 1024;
-        // 1M rows: budget 4 MiB -> 8 cells; snapped to a rung of [1,2,4,8,16] MiB.
+        // 1M rows: budget 4 MiB -> snapped 4 MiB -> 8 cells of 0.5 MiB.
         let small = resolve_probe_plan(&policy, 10_000, 1_000_000, rg, cell);
         assert_eq!(small.cells, 8);
         assert_eq!(small.band, 4 * 1024 * 1024);
-        // 10,000M rows: budget 4 MiB × 10000^0.25 ≈ 22.5 MiB -> ~45 cells,
-        // snapped to 16 MiB rung (nearest to 22.5 of [1,2,4,8,16] MiB... 16
-        // vs 32-cap: 16 MiB is nearer than 8).
+        // 10B rows: raw budget 40 MiB exceeds the 32 MiB cap -> snapped to
+        // the 16 MiB rung -> 32 cells. cells/bytes/band AGREE (the cap
+        // genuinely bounds fan-out — the plan never exceeds it).
         let big = resolve_probe_plan(&policy, 10_000, 10_000_000_000, rg, cell);
+        assert_eq!(big.band, 16 * 1024 * 1024);
+        assert_eq!(big.cells, 32);
+        assert_eq!(big.probe_bytes, big.cells as u64 * cell);
+        assert!(big.probe_bytes <= policy.cap_bytes);
         assert!(
             big.cells > small.cells,
             "sub-linear growth: {big:?} vs {small:?}"
         );
-        assert!(big.band <= policy.cap_bytes);
+    }
+
+    #[test]
+    fn byte_budget_cap_bounds_cells_not_just_labels() {
+        // The review regression: with a cap of 1 MiB and 0.5 MiB cells, no
+        // corpus size may plan more than 2 cells — the cap limits the CELL
+        // COUNT, not merely the reported bytes.
+        let policy = ProbePolicy {
+            algorithm: ProbeAlgorithm::ByteBudget,
+            base_bytes: 4 * 1024 * 1024,
+            cap_bytes: 1024 * 1024,
+            ..Default::default()
+        };
+        for rows in [1_000_000u64, 10_000_000_000, 1_000_000_000_000] {
+            let plan = resolve_probe_plan(&policy, 100_000, rows, 4 * 1024 * 1024, 512 * 1024);
+            assert!(plan.cells <= 2, "rows={rows}: {plan:?}");
+            assert!(
+                plan.probe_bytes <= policy.cap_bytes,
+                "rows={rows}: {plan:?}"
+            );
+        }
     }
 
     #[test]

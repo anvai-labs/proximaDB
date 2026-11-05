@@ -1746,9 +1746,10 @@ pub struct CoarseProbeConfig {
     ///   not a post-change evidence run; the full three-phase harness remains
     ///   the release gate.
     ///
-    /// This is process-global: `coarse_probe_nprobe` takes only `k_c`, with no
-    /// collection or query identity, so there is no per-collection retune
-    /// without a signature change (TD-RDSTRAT-9 tracks the missing controller).
+    /// The formula itself is policy-selected (`algorithm` above —
+    /// TD-RDSTRAT-14); this multiplier scales the root/log forms.
+    /// Per-collection retune arrives with the probe.* property carrier
+    /// (TD-RDSTRAT-14 §Deferred); until then this is process-global.
     /// Operators may lower this only with a representative recall gate.
     #[serde(default = "default_nprobe_multiplier")]
     pub nprobe_multiplier: f32,

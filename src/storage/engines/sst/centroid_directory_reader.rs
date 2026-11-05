@@ -238,15 +238,20 @@ pub(crate) fn plan_segments<'a>(
             size_bytes,
         });
     }
-    // TD-RDSTRAT-9: the probe policy needs corpus/geometry context. The
-    // collection plan covers every live segment; the rowgroup geometry is
-    // the IOPS budget of the first URL (one collection = one backend class).
-    let corpus_rows: u64 = dir.segments.iter().map(|s| s.rows_covered).sum();
-    let first_url = url_by_name
-        .values()
-        .next()
-        .map(String::as_str)
-        .unwrap_or("");
+    // TD-RDSTRAT-9: the probe policy needs corpus/geometry context. Only
+    // LIVE segments count toward corpus rows — plan_probe plans over the
+    // live+size-matched set, and a directory still covering compacted-away
+    // segments would otherwise inflate a byte-budget policy by up to
+    // (dead/live)^0.25. The rowgroup geometry comes from the
+    // lexicographically-smallest live URL: deterministic across restarts
+    // even when a collection spans URL schemes mid-migration.
+    let corpus_rows: u64 = dir
+        .segments
+        .iter()
+        .filter(|s| url_by_name.contains_key(&s.name))
+        .map(|s| s.rows_covered)
+        .sum();
+    let first_url = url_by_name.values().min().map(String::as_str).unwrap_or("");
     let rowgroup_bytes =
         proximadb_storage_common::iops_budget::IopsBudget::for_path(first_url).target_block_bytes();
     // `DirectoryCell` carries no Region-A extents (those live in each

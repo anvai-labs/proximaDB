@@ -100,7 +100,13 @@ the planner plans in the unit the bill is written in.
 * **Collection-level `probe.*` properties** — land WITH the search-path
   property carrier (service-resolved properties into the search arc), in
   the SAME PR so the keys are never accepted-but-inert. The chain
-  resolver + SET validation ship now, un-wired.
+  resolver + SET validation ship now, un-wired. KNOWN SCALING CAVEAT
+  until then: the per-segment fallback path (filtered queries where
+  `row_allow` is set, or pre-directorypublication) scales a byte_budget
+  by SEGMENT rows — more probes than the collection-level plan takes,
+  bounded by the cap; the filtered probe's own adaptive row-matching
+  semantics and `cap_bytes`/`max_cells` keep it from being linear
+  fan-out, but the collection path is the authoritative one.
 * **Axis advisor mirror** — `ivf_param_advisor` keeps its own curves:
   its nprobe model is recall-target-driven (better than any blind power
   law where it matters). Revisit only if the PAX and in-memory bands

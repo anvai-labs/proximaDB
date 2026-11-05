@@ -635,9 +635,9 @@ fn cp_cfg(mult: f32) -> crate::core::config::CoarseProbeConfig {
 
 #[test]
 fn default_probe_quality_and_backend_ranges_match_sift_acceptance() {
-    let defaults: CoarseProbeSettings = crate::core::config::CoarseProbeConfig::default().into();
+    init_coarse_probe_settings(None);
     assert_eq!(
-        geometric_nprobe_root(30, defaults),
+        geometric_nprobe_root(30),
         11,
         "the one-segment SIFT1M geometry needs 11/30 cells for recall@10 >= 0.98"
     );
@@ -878,8 +878,11 @@ fn toml_coarse_probe_config_wins_over_default_init() {
     init_coarse_probe_settings(None);
     assert!((coarse_probe_settings().nprobe_multiplier - 1.5).abs() < 1e-6);
     // The multiplier actually reaches nprobe: sqrt(64)*1.5 = 12 vs *1.0 = 8.
-    assert_eq!(geometric_nprobe_root(64, coarse_probe_settings()), 12);
-    assert_eq!(geometric_nprobe_root(64, cp_cfg(1.0).into()), 8);
+    assert_eq!(geometric_nprobe_root(64), 12);
+    // Re-seed with multiplier 1.0 — the resolved policy cache must
+    // invalidate with the settings (sqrt(64)*1.0 = 8).
+    init_coarse_probe_settings(Some(&cp_cfg(1.0)));
+    assert_eq!(geometric_nprobe_root(64), 8);
 }
 
 /// TD-CACHE-2 S2b: Region A and control bytes are separate eviction

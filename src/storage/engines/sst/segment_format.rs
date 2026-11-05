@@ -3679,6 +3679,11 @@ static SHARED_COARSE_PROBE: std::sync::RwLock<Option<CoarseProbeSettings>> =
 /// `SstEngine::new()`) only fills the default if nothing real was set yet.
 /// Poison-safe (no-panic mandate #4).
 pub fn init_coarse_probe_settings(cfg: Option<&crate::core::config::CoarseProbeConfig>) {
+    // The resolved probe policy derives from these settings — drop the
+    // cache so an authority rewrite re-resolves (TD-RDSTRAT-14).
+    if let Ok(mut cached) = RESOLVED_PROBE_POLICY.write() {
+        *cached = None;
+    }
     if let Ok(mut g) = SHARED_COARSE_PROBE.write() {
         match cfg {
             Some(c) => *g = Some(c.clone().into()),
@@ -3704,10 +3709,20 @@ impl From<crate::core::config::CoarseProbeConfig> for CoarseProbeSettings {
             nprobe_min: c.nprobe_min,
             nprobe_max: c.nprobe_max,
             ncomp_floor: c.ncomp_floor,
-            probe_algorithm: proximadb_storage_common::probe_policy::ProbeAlgorithm::parse(
-                &c.algorithm,
-            )
-            .unwrap_or_default(),
+            probe_algorithm:
+                proximadb_storage_common::probe_policy::ProbeAlgorithm::parse(&c.algorithm)
+                    .unwrap_or_else(|| {
+                        // The loader aborts on an unknown name; this is the
+                        // non-loader path (programmatic/embedded/test
+                        // construction). Loud, never silent: a silently
+                        // ignored algorithm would invalidate the ladder
+                        // experiment this dial exists for.
+                        tracing::warn!(
+                            algorithm = %c.algorithm,
+                            "coarse_probe.algorithm is not a known probe algorithm                              (sqrt|cbrt|fourth_root|log|fixed|byte_budget);                              falling back to sqrt — fix the construction site"
+                        );
+                        Default::default()
+                    }),
             probe_base_bytes: c.base_mb * 1024 * 1024,
             probe_cap_bytes: c.cap_mb * 1024 * 1024,
         }
@@ -3725,37 +3740,94 @@ pub(crate) fn coarse_probe_settings() -> CoarseProbeSettings {
 /// Fold the flat settings (the historical root-form params) into the
 /// TD-RDSTRAT-9 probe policy. All probe-band formulas live in
 /// `proximadb-storage-common::probe_policy` — tuned in ONE place.
+// TD-RDSTRAT-14: the RESOLVED policy, cached beside the settings — env
+// scans are not free and this sits on the per-query probe path. Cleared
+// when settings re-seed so a test/authority rewrite re-resolves.
+static RESOLVED_PROBE_POLICY: std::sync::RwLock<
+    Option<proximadb_storage_common::probe_policy::ProbePolicy>,
+> = std::sync::RwLock::new(None);
+
+fn warn_junk_env(name: &str, value: &str, expected: &str) {
+    tracing::warn!(
+        env = name,
+        value,
+        expected,
+        "PROXIMADB_PROBE_* override is unparseable and is being IGNORED — \
+         a typo here silently runs the wrong experiment arm"
+    );
+}
+
+/// The env layer of the chain (env > TOML > code — the same precedence
+/// every other probe knob has), expressed as a [`ServerProbePolicy`] so
+/// resolution goes through the ONE exported path
+/// (`resolve_probe_policy`): no parallel hand-rolled resolver can drift.
+fn env_probe_layer() -> proximadb_storage_common::probe_policy::ServerProbePolicy {
+    let mut server = proximadb_storage_common::probe_policy::ServerProbePolicy::default();
+    if let Ok(name) = std::env::var("PROXIMADB_PROBE_ALGORITHM") {
+        match proximadb_storage_common::probe_policy::ProbeAlgorithm::parse(&name) {
+            Some(algorithm) => server.algorithm = Some(algorithm.as_str().to_string()),
+            None => warn_junk_env(
+                "PROXIMADB_PROBE_ALGORITHM",
+                &name,
+                "sqrt|cbrt|fourth_root|log|fixed|byte_budget",
+            ),
+        }
+    }
+    if let Ok(base) = std::env::var("PROXIMADB_PROBE_BASE_MB") {
+        match base.trim().parse::<u64>() {
+            Ok(mb) if mb > 0 => server.base_bytes = Some(mb * 1024 * 1024),
+            _ => warn_junk_env("PROXIMADB_PROBE_BASE_MB", &base, "a positive integer"),
+        }
+    }
+    if let Ok(cap) = std::env::var("PROXIMADB_PROBE_CAP_MB") {
+        match cap.trim().parse::<u64>() {
+            Ok(mb) if mb > 0 => server.cap_bytes = Some(mb * 1024 * 1024),
+            _ => warn_junk_env("PROXIMADB_PROBE_CAP_MB", &cap, "a positive integer"),
+        }
+    }
+    server
+}
+
 fn settings_policy(s: &CoarseProbeSettings) -> proximadb_storage_common::probe_policy::ProbePolicy {
-    let mut policy = proximadb_storage_common::probe_policy::ProbePolicy {
-        algorithm: s.probe_algorithm,
-        multiplier: s.nprobe_multiplier as f64,
-        min_cells: s.nprobe_min,
-        max_cells: s.nprobe_max,
-        base_bytes: s.probe_base_bytes,
-        cap_bytes: s.probe_cap_bytes,
+    // The TOML settings become the server layer's BASE; the env layer sits
+    // above it; the code default below. Properties/tags are empty until
+    // the collection-level carrier lands (TD-RDSTRAT-14 §Deferred).
+    let mut server = proximadb_storage_common::probe_policy::ServerProbePolicy {
+        algorithm: Some(s.probe_algorithm.as_str().to_string()),
+        multiplier: Some(s.nprobe_multiplier as f64),
+        min_cells: Some(s.nprobe_min),
+        max_cells: Some(s.nprobe_max),
+        base_bytes: Some(s.probe_base_bytes),
+        cap_bytes: Some(s.probe_cap_bytes),
     };
-    // TD-RDSTRAT-9 env overrides (the bench-harness and operator escape
-    // hatch — the same precedence every other probe knob has):
-    // env > TOML > code default.
-    if let Ok(name) = std::env::var("PROXIMADB_PROBE_ALGORITHM")
-        && let Some(algorithm) =
-            proximadb_storage_common::probe_policy::ProbeAlgorithm::parse(&name)
-    {
-        policy.algorithm = algorithm;
+    let env = env_probe_layer();
+    if env.algorithm.is_some() {
+        server.algorithm = env.algorithm;
     }
-    if let Ok(base) = std::env::var("PROXIMADB_PROBE_BASE_MB")
-        && let Ok(base) = base.trim().parse::<u64>()
-        && base > 0
-    {
-        policy.base_bytes = base * 1024 * 1024;
+    if env.base_bytes.is_some() {
+        server.base_bytes = env.base_bytes;
     }
-    if let Ok(cap) = std::env::var("PROXIMADB_PROBE_CAP_MB")
-        && let Ok(cap) = cap.trim().parse::<u64>()
-        && cap > 0
-    {
-        policy.cap_bytes = cap * 1024 * 1024;
+    if env.cap_bytes.is_some() {
+        server.cap_bytes = env.cap_bytes;
     }
-    policy
+    proximadb_storage_common::probe_policy::resolve_probe_policy(
+        &std::collections::HashMap::new(),
+        &[],
+        &server,
+    )
+}
+
+fn cached_probe_policy() -> proximadb_storage_common::probe_policy::ProbePolicy {
+    if let Ok(g) = RESOLVED_PROBE_POLICY.read()
+        && let Some(policy) = g.as_ref()
+    {
+        return policy.clone();
+    }
+    let resolved = settings_policy(&coarse_probe_settings());
+    if let Ok(mut g) = RESOLVED_PROBE_POLICY.write() {
+        g.get_or_insert(resolved.clone());
+    }
+    resolved
 }
 
 /// Policy nprobe (TD-RDSTRAT-9): the resolved plan's cell count for a pool of
@@ -3766,13 +3838,12 @@ fn settings_policy(s: &CoarseProbeSettings) -> proximadb_storage_common::probe_p
 /// (`byte_budget`) scale correctly; root forms ignore them.
 fn geometric_nprobe(
     k_c: usize,
-    s: CoarseProbeSettings,
     corpus_rows: u64,
     rowgroup_bytes: u64,
     avg_cell_bytes: u64,
 ) -> usize {
     let plan = proximadb_storage_common::probe_policy::resolve_probe_plan(
-        &settings_policy(&s),
+        &cached_probe_policy(),
         k_c,
         corpus_rows,
         rowgroup_bytes,
@@ -3783,8 +3854,8 @@ fn geometric_nprobe(
 
 /// Root-form compatibility shim: the historical two-argument call. Root forms
 /// are corpus/geometry-invariant, so the extra inputs are neutral defaults.
-fn geometric_nprobe_root(k_c: usize, s: CoarseProbeSettings) -> usize {
-    geometric_nprobe(k_c, s, 0, 4 * 1024 * 1024, 0)
+fn geometric_nprobe_root(k_c: usize) -> usize {
+    geometric_nprobe(k_c, 0, 4 * 1024 * 1024, 0)
 }
 
 /// TD-RDSTRAT-8 PR-B gate: engage the Region-A0 coarse probe on v3 segments.
@@ -3833,15 +3904,7 @@ fn coarse_probe_nprobe(
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|n| *n > 0)
-        .unwrap_or_else(|| {
-            geometric_nprobe(
-                k_c,
-                coarse_probe_settings(),
-                corpus_rows,
-                rowgroup_bytes,
-                avg_cell_bytes,
-            )
-        })
+        .unwrap_or_else(|| geometric_nprobe(k_c, corpus_rows, rowgroup_bytes, avg_cell_bytes))
         .min(k_c.max(1))
 }
 
@@ -3862,13 +3925,7 @@ pub(crate) fn centroid_directory_nprobe(
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|n| *n > 0)
         .unwrap_or_else(|| {
-            geometric_nprobe(
-                total_cells,
-                coarse_probe_settings(),
-                corpus_rows,
-                rowgroup_bytes,
-                avg_cell_bytes,
-            )
+            geometric_nprobe(total_cells, corpus_rows, rowgroup_bytes, avg_cell_bytes)
         })
         .min(total_cells.max(1))
 }
