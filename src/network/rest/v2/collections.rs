@@ -3381,15 +3381,11 @@ pub struct CompactRequest {
 pub struct CompactResponse {
     pub collection_id: String,
     pub full: bool,
-    pub segments_before: Option<usize>,
-    pub segments_after: Option<usize>,
-    pub passes: Option<usize>,
-    pub reached_target: Option<bool>,
-    pub stop_reason: Option<String>,
-    pub pending_files: Option<usize>,
-    pub bytes_read: Option<u64>,
-    pub bytes_written: Option<u64>,
-    pub duration_ms: Option<u64>,
+    /// The provenance fields, EMBEDDED rather than hand-copied: a field added
+    /// to `FullCompactionMetrics` reaches this wire automatically (#2418
+    /// review round 16; the hand-copy drift was TD-COMPACT-15 F4).
+    #[serde(flatten)]
+    pub metrics: crate::storage::traits::FullCompactionMetrics,
 }
 
 /// `PATCH /api/v2/collections/{id}/properties` — set/update table properties.
@@ -3413,6 +3409,12 @@ pub async fn patch_collection_properties_v2(
     // after the catalog read below; this catches standalone errors early).
     proximadb_cache::policy::validate_cache_properties(&request.properties)
         .map_err(|e| ApiError::InvalidArgument(format!("invalid cache property: {e}")))?;
+    // compaction.* too (#2418 review round 16): every other door (ALTER
+    // TABLE SET, CREATE TABLE WITH) refuses `strategy='consolidate'` and the
+    // unconsumed target size; accepting them HERE answered 200 for keys the
+    // flush resolver would never honour.
+    proximadb_storage_common::validate_compaction_properties(&request.properties)
+        .map_err(|e| ApiError::InvalidArgument(format!("invalid table property: {e}")))?;
 
     // TODO: read current properties from the catalog, merge, validate the
     // merged set (case-variant duplicates), write back. For now the
@@ -3488,15 +3490,7 @@ pub async fn post_collection_compact_v2(
     Ok(Json(CompactResponse {
         collection_id,
         full,
-        segments_before: metrics.segments_before,
-        segments_after: metrics.segments_after,
-        passes: metrics.passes,
-        reached_target: metrics.reached_target,
-        stop_reason: metrics.stop_reason,
-        pending_files: metrics.pending_files,
-        bytes_read: metrics.bytes_read,
-        bytes_written: metrics.bytes_written,
-        duration_ms: metrics.duration_ms,
+        metrics,
     }))
 }
 

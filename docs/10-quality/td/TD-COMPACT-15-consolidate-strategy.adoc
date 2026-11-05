@@ -442,3 +442,20 @@ section's deprecated values are reported at startup too. The FULL byte
 counters are a lower bound on the wire as well as in the struct doc (worker
 follow-ups are not summed) — documented in TD-COMPACT-14; giving the wire
 fields an explicit scope marker is filed with F5/F6.
+
+Round 16 (#2418): the FULL byte counters carry their scope on the wire
+(`bytes_scope: "request_passes_lower_bound"` in FullCompactionMetrics, so
+REST/Flight/DDL cannot present them as the request's total I/O), and the
+REST/DDL provenance structs EMBED FullCompactionMetrics instead of hand-
+copying nine fields (the drift TD-COMPACT-15 F4 flagged). The dead server
+layer is gone from `resolve_effective_strategy` (property > tag > code; the
+`None` parameter invited wiring a server default back without the
+convergence gate) along with `consolidate_write_amp_limit_or_default` and
+`DEFAULT_CONSOLIDATE_WRITE_AMP_LIMIT` (no callers); the field stays only so
+a config naming it parses and gets the deprecation note. PATCH /properties
+on this branch validates `compaction.*` like every other door. The
+'untrained' predicate is defined once (the boolean view of
+untrained_segment_size_on). The legacy `strategy` error names its
+case-sensitive match; strictness stays (a case variant booted before but
+silently ran as hybrid — that is the dead-config class, named at boot).
+F4 is CLOSED by the embedded structs.

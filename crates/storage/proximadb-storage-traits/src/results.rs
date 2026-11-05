@@ -156,7 +156,17 @@ pub struct FullCompactionMetrics {
     pub bytes_read: Option<u64>,
     pub bytes_written: Option<u64>,
     pub duration_ms: Option<u64>,
+    /// The SCOPE of the byte counters, so the wire cannot present them as
+    /// the request's total I/O: [`FULL_BYTES_SCOPE`] — the passes this
+    /// request's own loop executed. Worker follow-up merges (including
+    /// floor-bounded ones and single-input training rewrites) carry their own
+    /// output keys and are NOT summed, so `bytes_*` is a measured LOWER
+    /// bound for every target (#2418 review round 16).
+    pub bytes_scope: Option<String>,
 }
+
+/// The value of [`FullCompactionMetrics::bytes_scope`].
+pub const FULL_BYTES_SCOPE: &str = "request_passes_lower_bound";
 
 impl StorageCompactionResult {
     /// Extract the FULL provenance from `engine_metrics` (keys written by
@@ -188,6 +198,7 @@ impl StorageCompactionResult {
             bytes_read: metric_u64("bytes_read").or(self.bytes_read),
             bytes_written: metric_u64("bytes_written").or(self.bytes_written),
             duration_ms: metric_u64("duration_ms").or(self.duration_ms),
+            bytes_scope: Some(FULL_BYTES_SCOPE.to_string()),
         }
     }
 }

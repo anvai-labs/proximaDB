@@ -1041,10 +1041,10 @@ pub struct CompactionConfig {
     #[serde(default)]
     pub consolidate_target_file_size_mb: Option<u64>,
     /// TD-COMPACT-15: the write-amplification limit above which the
-    /// consolidate strategy degrades to hybrid (guards against rewriting
-    /// the entire collection per flush). `Option` for the same reason as
-    /// the field above; read it through
-    /// [`CompactionConfig::consolidate_write_amp_limit_or_default`].
+    /// consolidate strategy used to degrade to hybrid. Read by NOTHING while
+    /// background consolidate is refused (TD-COMPACT-16); kept only so a
+    /// config naming it still parses and gets the deprecation note at
+    /// startup.
     #[serde(default)]
     pub consolidate_write_amp_limit: Option<u64>,
     /// TD-COMPACT-15: the server-level DEFAULT compaction strategy. Only
@@ -1072,7 +1072,7 @@ impl CompactionConfig {
         // this validation exists to kill, one layer down.
         if !matches!(self.strategy.as_str(), "count" | "size" | "hybrid") {
             return Err(format!(
-                "{section}.strategy must be 'count', 'size' or 'hybrid' (got '{}'); to collapse a collection's segments use COMPACT TABLE ... FULL (background consolidate is refused, TD-COMPACT-16)",
+                "{section}.strategy must be exactly 'count', 'size' or 'hybrid' (lowercase, no surrounding whitespace — the level heuristic matches case-sensitively; got '{}'); to collapse a collection's segments use COMPACT TABLE ... FULL (background consolidate is refused, TD-COMPACT-16)",
                 self.strategy
             ));
         }
@@ -1176,20 +1176,13 @@ fn default_full_timeout_ms() -> u64 {
 
 /// The consolidate target file size when the operator stated none (MiB).
 pub const DEFAULT_CONSOLIDATE_TARGET_FILE_SIZE_MB: u64 = 512;
-/// The consolidate write-amplification limit when the operator stated none.
-pub const DEFAULT_CONSOLIDATE_WRITE_AMP_LIMIT: u64 = 100;
 
 impl CompactionConfig {
-    /// The consolidate target file size, defaulted.
+    /// The consolidate target file size, defaulted. Read by the FULL merge's
+    /// smallest-first grouping.
     pub fn consolidate_target_file_size_mb_or_default(&self) -> u64 {
         self.consolidate_target_file_size_mb
             .unwrap_or(DEFAULT_CONSOLIDATE_TARGET_FILE_SIZE_MB)
-    }
-
-    /// The consolidate write-amp limit, defaulted.
-    pub fn consolidate_write_amp_limit_or_default(&self) -> u64 {
-        self.consolidate_write_amp_limit
-            .unwrap_or(DEFAULT_CONSOLIDATE_WRITE_AMP_LIMIT)
     }
 
     /// Merge an SST-section override over the top-level config, per FIELD.

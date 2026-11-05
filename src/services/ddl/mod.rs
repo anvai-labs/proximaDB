@@ -503,15 +503,9 @@ pub trait TableMaterializer: Send + Sync {
 pub struct CompactSummary {
     pub collection_id: String,
     pub full: bool,
-    pub segments_before: Option<usize>,
-    pub segments_after: Option<usize>,
-    pub passes: Option<usize>,
-    pub reached_target: Option<bool>,
-    pub stop_reason: Option<String>,
-    pub pending_files: Option<usize>,
-    pub bytes_read: Option<u64>,
-    pub bytes_written: Option<u64>,
-    pub duration_ms: Option<u64>,
+    /// The provenance fields, EMBEDDED rather than hand-copied (#2418 review
+    /// round 16).
+    pub metrics: crate::storage::traits::FullCompactionMetrics,
 }
 
 impl CompactSummary {
@@ -527,15 +521,7 @@ impl CompactSummary {
         Self {
             collection_id: collection_id.to_string(),
             full,
-            segments_before: metrics.segments_before,
-            segments_after: metrics.segments_after,
-            passes: metrics.passes,
-            reached_target: metrics.reached_target,
-            stop_reason: metrics.stop_reason,
-            pending_files: metrics.pending_files,
-            bytes_read: metrics.bytes_read,
-            bytes_written: metrics.bytes_written,
-            duration_ms: metrics.duration_ms,
+            metrics,
         }
     }
 }
@@ -833,28 +819,31 @@ impl DdlService {
                 let summary = compactor.compact(tenant, &name, full).await?;
                 self.check_lease_for_write(tenant, &name).await?;
                 let before = summary
+                    .metrics
                     .segments_before
                     .map(|value| value.to_string())
                     .unwrap_or_else(|| "?".to_string());
                 let after = summary
+                    .metrics
                     .segments_after
                     .map(|value| value.to_string())
                     .unwrap_or_else(|| "?".to_string());
                 // TD-COMPACT-15: measured I/O + why the loop stopped — the
                 // provenance an operator needs to trust the message.
-                let io_note = match (summary.bytes_read, summary.bytes_written) {
+                let io_note = match (summary.metrics.bytes_read, summary.metrics.bytes_written) {
                     // Only state a duration that was MEASURED: unwrap_or(0)
                     // printed a fabricated "in 0ms" as provenance whenever a
                     // path set the byte counters but not the clock (now
                     // reachable, since the metrics extractor falls back to the
                     // canonical top-level byte fields).
-                    (Some(read), Some(written)) => match summary.duration_ms {
+                    (Some(read), Some(written)) => match summary.metrics.duration_ms {
                         Some(ms) => format!(", {read} read / {written} written in {ms}ms"),
                         None => format!(", {read} read / {written} written"),
                     },
                     _ => String::new(),
                 };
-                let stop_note = match (&summary.stop_reason, summary.reached_target) {
+                let stop_note = match (&summary.metrics.stop_reason, summary.metrics.reached_target)
+                {
                     (Some(reason), _) => format!(" (stopped: {reason})"),
                     (None, Some(false)) => " (stopped before target)".to_string(),
                     _ => String::new(),
@@ -862,7 +851,7 @@ impl DdlService {
                 Ok(DdlResult::success(format!(
                     "Compacted table '{name}' (full={full}): {before} -> {after} segments \
                      in {} passes{stop_note}{io_note}",
-                    summary.passes.unwrap_or(0),
+                    summary.metrics.passes.unwrap_or(0),
                 )))
             }
             DdlStatement::MaterializeTable { name } => {
@@ -2787,15 +2776,13 @@ mod tests {
             Ok(CompactSummary {
                 collection_id: table.to_string(),
                 full,
-                segments_before: Some(3),
-                segments_after: Some(1),
-                passes: Some(2),
-                reached_target: Some(true),
-                stop_reason: None,
-                pending_files: None,
-                bytes_read: None,
-                bytes_written: None,
-                duration_ms: None,
+                metrics: crate::storage::traits::FullCompactionMetrics {
+                    segments_before: Some(3),
+                    segments_after: Some(1),
+                    passes: Some(2),
+                    reached_target: Some(true),
+                    ..Default::default()
+                },
             })
         }
     }

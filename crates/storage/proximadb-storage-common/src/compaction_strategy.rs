@@ -9,9 +9,8 @@
 //!
 //! The strategy is resolved through [`resolve_effective_strategy`]:
 //! collection property > operator tag (`compaction.strategy:<s>`) > code
-//! default. Its server-layer parameter is always `None` in production today:
-//! background consolidate is refused (TD-COMPACT-16), so no server default
-//! exists to apply; the parameter is kept for that rework.
+//! default. There is no server layer while background consolidate is refused
+//! (TD-COMPACT-16).
 //! The `compaction:off` TAG always wins over any strategy (it disarms all
 //! background compaction including consolidate).
 
@@ -101,21 +100,19 @@ pub(crate) fn resolve_strategy_explicit_from_properties(
 }
 
 /// The full precedence chain, as one pure function (unit-testable without
-/// an engine): **collection property > operator tag > server TOML > code**.
-/// An explicit `hybrid` at any layer WINS over a consolidate default at a
-/// lower layer — silence falls through, an explicit choice does not.
+/// an engine): **collection property > operator tag > code default**.
+///
+/// There is NO server layer while background consolidate is refused
+/// (TD-COMPACT-16): the parameter that used to sit here was `None` at every
+/// production call site, and keeping it invited wiring a server default back
+/// in without the convergence gate that TD requires. The rework re-adds the
+/// layer together with the merge that honours it.
 pub fn resolve_effective_strategy(
     properties: &HashMap<String, String>,
     tags: &[String],
-    server_consolidate_strategy: Option<&str>,
 ) -> CompactionStrategy {
     resolve_strategy_explicit_from_properties(properties)
         .or_else(|| resolve_strategy_explicit_from_tags(tags))
-        .or_else(|| {
-            server_consolidate_strategy
-                .and_then(parse_strategy)
-                .filter(|s| *s == CompactionStrategy::Consolidate)
-        })
         .unwrap_or_default()
 }
 
@@ -263,51 +260,32 @@ mod tests {
     }
 
     #[test]
-    fn effective_strategy_chain_property_tag_server_code() {
-        let hybrid_tag = vec!["compaction.strategy:hybrid".to_string()];
+    fn effective_strategy_chain_property_over_tag_over_code() {
         let consolidate_tag = vec!["compaction.strategy:consolidate".to_string()];
-        // Property wins over tag and server.
-        assert_eq!(
-            resolve_effective_strategy(
-                &props(&[("compaction.strategy", "consolidate")]),
-                &hybrid_tag,
-                Some("hybrid"),
-            ),
-            CompactionStrategy::Consolidate
-        );
-        // Explicit tag wins over server (and absent property).
-        assert_eq!(
-            resolve_effective_strategy(&HashMap::new(), &consolidate_tag, Some("hybrid")),
-            CompactionStrategy::Consolidate
-        );
-        // An EXPLICIT hybrid at a higher layer beats a consolidate default
-        // below it — silence falls through, an explicit choice does not.
-        assert_eq!(
-            resolve_effective_strategy(&HashMap::new(), &hybrid_tag, Some("consolidate")),
-            CompactionStrategy::Hybrid
-        );
+        let hybrid_tag = vec!["compaction.strategy:hybrid".to_string()];
+        // Property > tag.
         assert_eq!(
             resolve_effective_strategy(
                 &props(&[("compaction.strategy", "hybrid")]),
-                &consolidate_tag,
-                Some("consolidate"),
+                &consolidate_tag
             ),
             CompactionStrategy::Hybrid
         );
-        // Server default applies only when both collection layers are silent.
+        // Tag > code.
         assert_eq!(
-            resolve_effective_strategy(&HashMap::new(), &[], Some("consolidate")),
+            resolve_effective_strategy(&HashMap::new(), &consolidate_tag),
             CompactionStrategy::Consolidate
         );
-        // Code default last.
+        // An explicit hybrid tag wins over nothing below it (there is no
+        // server layer while background consolidate is refused,
+        // TD-COMPACT-16).
         assert_eq!(
-            resolve_effective_strategy(&HashMap::new(), &[], None),
+            resolve_effective_strategy(&HashMap::new(), &hybrid_tag),
             CompactionStrategy::Hybrid
         );
-        // A junk server value is inert (config load rejects it, but the
-        // resolver must not invent a strategy).
+        // Code default.
         assert_eq!(
-            resolve_effective_strategy(&HashMap::new(), &[], Some("aggressive")),
+            resolve_effective_strategy(&HashMap::new(), &[]),
             CompactionStrategy::Hybrid
         );
     }
@@ -315,14 +293,15 @@ mod tests {
     #[test]
     fn invalid_explicit_property_fails_safe_instead_of_inheriting() {
         // #2418 review F7: a present-but-unparseable property is an explicit
-        // (broken) choice. It must NOT fall through to a tag or server layer
-        // that says `consolidate` — it resolves to the safe code default.
+        // (broken) choice. It must NOT fall through to a tag layer that says
+        // `consolidate` — it resolves to the safe code default. (There is no
+        // server layer while background consolidate is refused,
+        // TD-COMPACT-16.)
         let consolidate_tag = vec!["compaction.strategy:consolidate".to_string()];
         assert_eq!(
             resolve_effective_strategy(
                 &props(&[("compaction.strategy", "consolidat")]),
                 &consolidate_tag,
-                Some("consolidate"),
             ),
             CompactionStrategy::Hybrid
         );
@@ -331,13 +310,12 @@ mod tests {
             resolve_effective_strategy(
                 &props(&[("Compaction.Strategy", "garbage")]),
                 &consolidate_tag,
-                Some("consolidate"),
             ),
             CompactionStrategy::Hybrid
         );
         // An ABSENT property still falls through, as designed.
         assert_eq!(
-            resolve_effective_strategy(&HashMap::new(), &consolidate_tag, None),
+            resolve_effective_strategy(&HashMap::new(), &consolidate_tag),
             CompactionStrategy::Consolidate
         );
     }

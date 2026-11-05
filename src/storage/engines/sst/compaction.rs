@@ -2160,9 +2160,10 @@ impl Compaction {
                                     // promotion round 11 exists to keep. Without
                                     // the live count, the only safe follow-up is
                                     // one that cannot reduce it: a single-input
-                                    // rewrite. Its `input_bytes` stays the
-                                    // untrimmed sum, an over-estimate, which is
-                                    // the safe direction for admission.
+                                    // rewrite. `narrow_to_promotion_candidate`
+                                    // sets `input_bytes` to the chosen file's
+                                    // REAL size (the old over-estimate claim is
+                                    // stale, #2418 review round 16).
                                     Err(error) if promotes => {
                                         // Same picker as the normal path (an
                                         // untrained input worth training, with
