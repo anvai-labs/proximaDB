@@ -44,9 +44,20 @@ ignore = [
 
     # --- unmaintained (transitive; no patched line exists) ---
 
-    # async-std discontinued (RUSTSEC-2025-0052) — pulled by a transitive
-    # runtime dep; no runtime code of ours executes on it.
+    # async-std discontinued (RUSTSEC-2025-0052) and its dependency pin-utils
+    # unmaintained (RUSTSEC-2026-0441, entered the advisory DB 2026-11-05 and
+    # failed every PR's Security Audit that day). ONE chain, DEV-ONLY:
+    #   httpmock 0.7 -> async-std 1.13.2 -> pin-utils 0.1.1
+    # httpmock is declared only under [dev-dependencies] (root Cargo.toml and
+    # clients/rust/Cargo.toml). Verified absent from every production build:
+    #   cargo tree -i async-std -e normal --workspace --target all   -> nothing
+    #   cargo tree -i pin-utils -e normal --workspace --target all   -> nothing
+    # (This entry previously called async-std "a transitive runtime dep"; it is
+    # not one.) Both are unmaintained/discontinued notices, not vulnerabilities.
+    # Retire both entries together when httpmock is upgraded off async-std or
+    # replaced (e.g. wiremock, which runs on tokio).
     "RUSTSEC-2025-0052",
+    "RUSTSEC-2026-0441",
     # bincode 1.x unmaintained (RUSTSEC-2025-0141) — 2.x is a different API.
     # bincode is a DIRECT production dependency of the root crate (and ~17
     # workspace crates); the ignore stands only because the 1.x -> 2.x migration
