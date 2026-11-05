@@ -3886,10 +3886,13 @@ fn settings_policy(s: &CoarseProbeSettings) -> proximadb_storage_common::probe_p
         // only; inf survived to be dropped downstream = 2.0). Both now take
         // ONE: unusable -> warn -> the default (#2419 review round 13).
         multiplier: {
-            let m = (s.nprobe_multiplier as f64).max(0.0);
-            if proximadb_storage_common::probe_policy::is_valid_multiplier(m)
-                && !(s.nprobe_multiplier as f64).is_nan()
-            {
+            // Finiteness is judged BEFORE the negative clamp: `.max(0.0)`
+            // turned -inf into 0 ("floor only") without a warning while +inf
+            // warned and used the default (#2419 review round 15). Only a
+            // FINITE negative keeps its historical floor-only meaning.
+            let raw = s.nprobe_multiplier as f64;
+            let m = raw.max(0.0);
+            if raw.is_finite() && proximadb_storage_common::probe_policy::is_valid_multiplier(m) {
                 Some(m)
             } else {
                 tracing::warn!(

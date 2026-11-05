@@ -3364,8 +3364,9 @@ async fn ensure_collection_exists(
 }
 
 /// Body of `PATCH /api/v2/collections/{id}/properties`. The endpoint does
-/// NOT persist yet: keys are validated through the one policy door, then any
-/// non-empty request is answered 501 (see `patch_collection_properties_v2`).
+/// NOT persist yet: keys are validated through the one policy door, then
+/// EVERY request — an empty map included — is answered 501 (see
+/// `patch_collection_properties_v2`).
 #[derive(Debug, serde::Deserialize)]
 pub struct UpdatePropertiesRequest {
     pub properties: std::collections::HashMap<String, String>,
@@ -3399,7 +3400,8 @@ pub struct CompactResponse {
 ///
 /// The intended contract is merge semantics (keys in the request set/update,
 /// absent keys unchanged), but the service-side merge + catalog write is not
-/// wired, so this answers **501 Not Implemented** for any non-empty request
+/// wired, so this answers **501 Not Implemented** for every request — an
+/// empty map included, which would otherwise read back as "no properties" —
 /// instead of a 200 that would report an unpersisted write as done. Keys are
 /// validated first through the one policy door (`cache.*`, `compaction.*`,
 /// `probe.*`), so a bad key is still a 400. The refusal runs before the

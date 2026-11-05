@@ -814,7 +814,11 @@ impl IcebergRestService {
         // refused `probe.*` key was accepted here and rejected everywhere
         // else (#2419 review round 14).
         proximadb_storage_common::validate_policy_properties(&req.properties)
-            .map_err(|e| anyhow::anyhow!("invalid table property: {e}"))?;
+            // "Bad request:" is the prefix the Iceberg REST layer maps to 400
+            // BadRequestException. Without it the refusal surfaced as 500
+            // ServiceUnavailable, which Iceberg clients RETRY forever and
+            // never show the user (#2419 review round 15).
+            .map_err(|e| anyhow::anyhow!("Bad request: invalid table property: {e}"))?;
         let schema = self.iceberg_schema_to_catalog(&req.schema, &req.name, req.properties.clone());
 
         let created = catalog.create_table(&identifier, schema).await?;

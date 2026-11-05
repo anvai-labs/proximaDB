@@ -480,13 +480,21 @@ pub fn resolve_probe_policy_gated(
     }
 
     // Operator tag layer (algorithm only — the legacy channel shape).
+    // Case-insensitive prefix like the property layer, and the gate is applied
+    // PER TAG before "last valid wins": gating after the pick let a later,
+    // gated-out tag discard an earlier admissible one (#2419 review round 15).
+    let admitted = |algorithm: ProbeAlgorithm| !algorithm.is_experimental() || admit_experimental;
     let mut tag_algorithm = None;
     for tag in tags {
-        if let Some(parsed) = tag
-            .trim()
-            .strip_prefix(PROBE_ALGORITHM_TAG_PREFIX)
-            .and_then(ProbeAlgorithm::parse)
-        {
+        let tag = tag.trim();
+        let Some(value) = tag
+            .get(..PROBE_ALGORITHM_TAG_PREFIX.len())
+            .filter(|head| head.eq_ignore_ascii_case(PROBE_ALGORITHM_TAG_PREFIX))
+            .map(|_| &tag[PROBE_ALGORITHM_TAG_PREFIX.len()..])
+        else {
+            continue;
+        };
+        if let Some(parsed) = ProbeAlgorithm::parse(value).filter(|a| admitted(*a)) {
             tag_algorithm = Some(parsed);
         }
     }
@@ -496,8 +504,7 @@ pub fn resolve_probe_policy_gated(
     // `probe.algorithm:` tag must not select an ungated algorithm (#2419
     // review round 14). An experimental pick without the gate is ignored, so
     // the layer below decides.
-    let admitted = |algorithm: ProbeAlgorithm| !algorithm.is_experimental() || admit_experimental;
-    if let Some(algorithm) = tag_algorithm.filter(|a| admitted(*a)) {
+    if let Some(algorithm) = tag_algorithm {
         policy.algorithm = algorithm;
     }
 
@@ -1071,5 +1078,23 @@ mod tests {
         assert_eq!(pick(false), ProbeAlgorithm::Sqrt);
         // Gate open: the property (top layer) wins, as the chain says.
         assert_eq!(pick(true), ProbeAlgorithm::ByteBudget);
+    }
+
+    #[test]
+    fn tag_layer_is_case_insensitive_and_gates_per_tag() {
+        let tags = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let pick = |t: &[String], admit| {
+            resolve_probe_policy_gated(&HashMap::new(), t, &ServerProbePolicy::default(), admit)
+                .algorithm
+        };
+        // A gated-out LATER tag must not discard an earlier admissible one.
+        let mixed = tags(&["probe.algorithm:sqrt", "probe.algorithm:cbrt"]);
+        assert_eq!(pick(&mixed, false), ProbeAlgorithm::Sqrt);
+        assert_eq!(pick(&mixed, true), ProbeAlgorithm::CubeRoot);
+        // The prefix matches case-insensitively, like the property layer.
+        assert_eq!(
+            pick(&tags(&["Probe.Algorithm:cbrt"]), true),
+            ProbeAlgorithm::CubeRoot
+        );
     }
 }

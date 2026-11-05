@@ -315,3 +315,13 @@ boot). Filed:
   now call `validate_policy_properties`; every new door must remember to.
   Validating once in the catalog's create/evolution path (the crate already
   depends on storage-common) would make a forgotten door impossible.
+
+Round 15 (#2419): the Iceberg createTable refusal carries the "Bad request:"
+prefix the Iceberg REST layer maps to 400 (it surfaced as a retryable 500
+ServiceUnavailable); finiteness is judged before the negative clamp, so -inf
+takes the same warn-and-default path as +inf instead of silently probing the
+floor; the tag layer matches its prefix case-insensitively and applies the
+experimental gate per tag before "last valid wins"; the PATCH docs say every
+request gets 501. Raised again and kept filed: F2, F3, F6, F10. Pre-existing
+case-variant duplicates already stored (before round 8) are collapsed only
+when that knob is SET again — part of F12 (persist the normalized key).
