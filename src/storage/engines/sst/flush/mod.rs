@@ -1156,10 +1156,23 @@ impl SstEngine {
             None,
         ) == proximadb_storage_common::CompactionStrategy::Consolidate
         {
-            tracing::warn!(
-                storage_url = %storage_url,
-                "TD-COMPACT-16: background consolidate is not supported (it does not converge); running the hybrid policy. Use COMPACT TABLE ... FULL to collapse"
-            );
+            // Once per collection, not per flush: an ingest-heavy collection
+            // carrying the tag would otherwise emit this on every flush
+            // (#2418 review round 11). Poison-safe; a poisoned set just
+            // re-warns.
+            static WARNED: std::sync::LazyLock<
+                std::sync::Mutex<std::collections::HashSet<String>>,
+            > = std::sync::LazyLock::new(Default::default);
+            let first = WARNED
+                .lock()
+                .map(|mut warned| warned.insert(storage_url.to_string()))
+                .unwrap_or(true);
+            if first {
+                tracing::warn!(
+                    storage_url = %storage_url,
+                    "TD-COMPACT-16: background consolidate is not supported (it does not converge); running the hybrid policy. Use COMPACT TABLE ... FULL to collapse (logged once per collection)"
+                );
+            }
         }
         let threshold =
             proximadb_storage_common::resolve_l0_threshold(tags, L0_COMPACTION_THRESHOLD);

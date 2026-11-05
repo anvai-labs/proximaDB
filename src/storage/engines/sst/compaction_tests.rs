@@ -251,7 +251,7 @@ async fn test_compaction_task_scheduling() {
         rg_layout: None,
         vector_quant: None,
         access_tier: None,
-        suppress_follow_up: false,
+        min_live_segments: None,
     };
 
     assert!(manager.schedule_compaction(task).await.is_ok());
@@ -280,7 +280,7 @@ async fn td_compact6_schedule_dedups_same_output_at_enqueue() {
         rg_layout: None,
         vector_quant: None,
         access_tier: None,
-        suppress_follow_up: false,
+        min_live_segments: None,
     };
     assert!(manager.schedule_compaction(mk_task()).await.unwrap());
     // Second schedule for the same output file is deduped at enqueue (the
@@ -324,7 +324,7 @@ async fn compaction_morsel_admission_rejects_overlapping_inputs() {
         rg_layout: None,
         vector_quant: None,
         access_tier: None,
-        suppress_follow_up: false,
+        min_live_segments: None,
     };
 
     assert!(manager.schedule_compaction(task(1)).await.unwrap());
@@ -520,7 +520,7 @@ fn sc5_tier_task(output: &str, access_tier: Option<ObjectAccessTier>) -> Compact
         rg_layout: None,
         vector_quant: None,
         access_tier,
-        suppress_follow_up: false,
+        min_live_segments: None,
     }
 }
 
@@ -762,7 +762,7 @@ async fn td_compact6_worker_clears_training_in_flight_after_completion() {
         rg_layout: None,
         vector_quant: None,
         access_tier: None,
-        suppress_follow_up: false,
+        min_live_segments: None,
     };
     manager.schedule_compaction(task).await.unwrap();
 
@@ -906,7 +906,7 @@ async fn test_sst_compaction_expired_deletion_unit() -> anyhow::Result<()> {
         rg_layout: None,
         vector_quant: None,
         access_tier: None,
-        suppress_follow_up: false,
+        min_live_segments: None,
     };
 
     // Create config and perform compaction
@@ -1313,7 +1313,7 @@ async fn check_canonical_compaction_listing(
         rg_layout: None,
         vector_quant: None,
         access_tier: None,
-        suppress_follow_up: false,
+        min_live_segments: None,
     };
     if cancel_after_move {
         return assert_listing_after_cancelled_publication(
@@ -1536,7 +1536,7 @@ async fn check_local_spill_compaction_listing(
         rg_layout: None,
         vector_quant: None,
         access_tier: None,
-        suppress_follow_up: false,
+        min_live_segments: None,
     };
     let assert_no_task_scratch = |root: &std::path::Path| -> anyhow::Result<()> {
         for owner in std::fs::read_dir(root)? {
@@ -2064,7 +2064,7 @@ async fn spill_quant_fixture(
         rg_layout: None,
         vector_quant: Some(collection_quant),
         access_tier: None,
-        suppress_follow_up: false,
+        min_live_segments: None,
     };
     Ok(SpillQuantFixture {
         _root: root,
@@ -2253,7 +2253,7 @@ async fn tier_probe_read_error_aborts_and_keeps_exact_inputs() -> anyhow::Result
         rg_layout: None,
         vector_quant: None,
         access_tier: None,
-        suppress_follow_up: false,
+        min_live_segments: None,
     };
     let result = compaction
         .perform_compaction_enhanced(&task, &config, None, None)
@@ -2372,7 +2372,7 @@ async fn shared_model_gate_classifies_compaction_output_with_the_collection_mode
         rg_layout: None,
         vector_quant: None,
         access_tier: None,
-        suppress_follow_up: false,
+        min_live_segments: None,
     };
     compaction
         .perform_compaction_enhanced(&task, &config, None, None)
@@ -2414,4 +2414,24 @@ async fn shared_model_gate_classifies_compaction_output_with_the_collection_mode
         .collect();
     assert_eq!(covered, ["segment_L1_compacted.pax"]);
     Ok(())
+}
+
+/// #2418 review round 11: a pinned floor BOUNDS the follow-up chain instead
+/// of suppressing it, so the layout/training promotion still runs and the
+/// chain can never merge below the operator's stop point.
+#[test]
+fn follow_up_is_bounded_by_the_pinned_floor() {
+    use super::follow_up_input_cap as cap;
+    // Room to merge: the follow-up keeps its inputs.
+    assert_eq!(cap(6, 2, 3, false), Some(3)); // 6 -> 4 >= 2
+    // Would overshoot: trimmed to exactly what lands on the floor.
+    assert_eq!(cap(4, 2, 4, false), Some(3)); // 4 -> 2
+    // At the floor: a plain merge is skipped...
+    assert_eq!(cap(2, 2, 2, false), None);
+    // ...but the TRAINING promotion still runs, as a single-input rewrite
+    // that cannot change the segment count (what suppression used to drop).
+    assert_eq!(cap(2, 2, 2, true), Some(1));
+    // Below the floor already (a concurrent merge): same rule, never worse.
+    assert_eq!(cap(1, 2, 2, true), Some(1));
+    assert_eq!(cap(1, 2, 2, false), None);
 }

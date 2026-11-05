@@ -165,36 +165,27 @@ a per-collection value, so accepting it would be inert. Both read the
 server `consolidate_target_file_size_mb` (default 512). See KNOWN GAP
 below for what closing it takes.
 
-KNOWN TRADE-OFF (#2418 review round 5): `suppress_follow_up` keeps a
-pinned `target_segments > 1` from being undone by a follow-up morsel
-(measured: without it a target-2 request collapses to 1), but the same
-branch schedules the layout/training promotion chain, so a suppressed
-pass can leave its outputs pending promotion (~180 GETs/104 MB per query
-untrained vs 20-51 trained). The pinned target wins because it is the
-contract both API surfaces and the harness assert, and the exposure is
-narrow: suppression engages only for target > 1, so the collapse-to-one
-path and every S=1 arm are unaffected.
+PINNED TARGETS BOUND THE FOLLOW-UP CHAIN (final design, #2418 review
+round 11). A per-request `target_segments > 1` sets a live-segment floor
+(`SstCompactionTask.min_live_segments`) that every follow-up inherits. The
+worker still runs the follow-up chain, including the layout/training
+promotion, but `follow_up_input_cap` trims each follow-up to at most
+`live - floor + 1` inputs (merging `g` inputs removes `g - 1` segments). At
+the floor a plain merge is skipped, while a TRAINING follow-up still runs as
+a single-input rewrite that trains without changing the count.
 
-CORRECTION (#2418 review round 6): the "self-healing" half of that
-argument does NOT hold for the case that motivates `target_segments` in
-the first place. A bench arm pins a target on a SETTLED bed and then
-measures queries, so no further write arrives and "the next ordinary
-compaction round performs the promotion" never happens — an S=2 arm can
-therefore measure untrained geometry and publish a number that is not
-comparable to a trained S=1 arm. Since the pinned target must stay (it is
-the contract both API surfaces and the harness assert), the state is made
-OBSERVABLE instead of argued away:
+History: rounds 5-10 SUPPRESSED the follow-up instead (measured: without
+any bound a target-2 request collapses to 1). That kept the target but left
+outputs untrained (~180 GETs/104 MB per query vs 20-51 trained), could drop
+a concurrent flush's training guard, and was then patched with a counter,
+a WARN and a harness delta. Bounding the merge removes the cause, so the
+counter and the harness delta are gone; the harness's trained-geometry gate
+(every settled segment must carry a coarse A0 directory) remains the
+refusal for an untrained arm.
 
-* `proximadb_compaction_training_promotion_suppressed_total` counts every
-  pass where this happened, plus a WARN naming it;
-* the harness records the MEASURED counter delta around its FULL request
-  (`training_promotions_suppressed` in `result.json`), whatever pinned the
-  target — the request or the server's `full_target_segments`;
-* the harness's existing trained-geometry gate (every settled segment must
-  carry a coarse A0 directory) is what actually refuses an untrained arm.
-  (Round 6 briefly added a flag-based pre-flight refusal; round 7 removed
-  it: it missed server-level targets and blocked S=2 arms that end up
-  trained.)
+Scope of "exact stop": the floor binds THIS request's chain. A flush-driven
+background morsel from a concurrent WRITE can still merge below it. On a
+settled bed — the case the override exists for — no such write arrives.
 
 KNOWN GAP (open slice, found by the #2418 review round 3): the FULL
 collapse's group-size target reads the SERVER
@@ -389,3 +380,24 @@ slip are gone; the FULL `error` metric documents what it does not count;
 the dead-config regression test is now pure (no process-global mutation,
 mandate #11). F1 (partial section merge) and F3 (catalog property clones)
 were raised again and stay filed.
+
+Round 11 (#2418): suppression replaced by the floor-bounded follow-up (see
+PINNED TARGETS BOUND THE FOLLOW-UP CHAIN); `CREATE TABLE ... WITH` now
+validates `compaction.*` like `ALTER TABLE ... SET`; any stated
+`consolidate_strategy` fails boot (it is read by nothing while background
+consolidate is refused, and "hybrid" is already the default); the
+refused-consolidate WARN is logged once per collection. Filed:
+
+* *COMPACT-15-F5 — seam refusals surface as 500 / INTERNAL.* The trait-seam
+  bails ("engine has no cross-level FULL", zero target, target without
+  full) are mapped to `ApiError::Internal` / `TonicStatus::internal`, so a
+  permanent client error looks transient. Only reachable from an engine
+  without FULL today (REST/Flight front SST). Map seam validation errors to
+  400 / INVALID_ARGUMENT with a typed error.
+* *COMPACT-15-F6 — the target rule lives in four places* (REST, Flight, the
+  trait seam, `compact_collection_full`) with different wording. Keep the
+  seam as the authority and reduce the surfaces to error mapping.
+* *COMPACT-15-F7 — the loaded/not-loaded property carrier has no live
+  consumer* beyond the refused-consolidate WARN. It is kept deliberately as
+  TD-COMPACT-16's prerequisite (the background rework needs to know whether
+  the catalog was consulted); if that rework is abandoned, remove it.

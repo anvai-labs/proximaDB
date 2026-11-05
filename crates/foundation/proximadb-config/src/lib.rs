@@ -1072,25 +1072,18 @@ impl CompactionConfig {
         // this validation exists to kill, one layer down.
         if !matches!(self.strategy.as_str(), "count" | "size" | "hybrid") {
             return Err(format!(
-                "{section}.strategy must be 'count', 'size' or 'hybrid' \
-                 (got '{}'); the consolidate strategy is selected via \
-                 {section}.consolidate_strategy or the per-collection \
-                 compaction.strategy property",
+                "{section}.strategy must be 'count', 'size' or 'hybrid' (got '{}'); to collapse a collection's segments use COMPACT TABLE ... FULL (background consolidate is refused, TD-COMPACT-16)",
                 self.strategy
             ));
         }
+        // Read by nothing while background consolidate is refused
+        // (TD-COMPACT-16): "consolidate" would not converge, and "hybrid" is
+        // already the code default, so ANY stated value is dead config — the
+        // hazard this validator exists to kill (#2418 review round 11).
         if let Some(strategy) = &self.consolidate_strategy {
-            let value = strategy.trim().to_ascii_lowercase();
-            if value == "consolidate" {
-                return Err(format!(
-                    "{section}.consolidate_strategy = \"consolidate\" is not supported: background consolidate does not converge (TD-COMPACT-16). Collapse with COMPACT TABLE ... FULL instead"
-                ));
-            }
-            if value != "hybrid" {
-                return Err(format!(
-                    "{section}.consolidate_strategy must be 'hybrid' (got '{strategy}')"
-                ));
-            }
+            return Err(format!(
+                "{section}.consolidate_strategy is not consumed (got '{strategy}'): background consolidate is refused until TD-COMPACT-16 and hybrid is already the default. Remove it; collapse with COMPACT TABLE ... FULL"
+            ));
         }
         // Read only by the background consolidate trigger, which is refused
         // (TD-COMPACT-16): accepting a stated value would be dead config.
@@ -1172,10 +1165,9 @@ impl CompactionConfig {
 
     /// Merge an SST-section override over the top-level config, per FIELD.
     ///
-    /// The single implementation of this merge (#2418 review round 6,
-    /// finding 6): `database.rs` field-merged while `effective_sst_config`
-    /// picked wholesale, so the two would have drifted the first time a
-    /// flush was served by a config-carrying instance. Both now call this.
+    /// Used by `effective_sst_config`. It merges only the `consolidate_*`
+    /// fields per field; every other field is still taken from the section
+    /// as a whole (TD-COMPACT-15 F1).
     ///
     /// A wholesale pick is wrong because an operator who declares
     /// `[storage.sst_config.compaction_config]` for one knob (say
@@ -1504,9 +1496,12 @@ mod tests {
             ..Default::default()
         };
         let error = config.validate("storage.compaction_config").unwrap_err();
+        // It must point at the path that WORKS: consolidate_strategy is
+        // refused too (TD-COMPACT-16), so sending operators there would be a
+        // second dead end.
         assert!(
-            error.contains("consolidate_strategy"),
-            "error should point at the right knob: {error}"
+            error.contains("COMPACT TABLE"),
+            "error should point at the working path: {error}"
         );
         // Typos AND case/whitespace variants fail — the consumer would
         // silently treat each as the `_` (hybrid) arm.
@@ -1533,11 +1528,10 @@ mod tests {
             }
             .validate("storage.compaction_config")
         };
-        assert!(validate("hybrid").is_ok());
-        assert!(validate(" Hybrid ").is_ok());
-        // Background consolidate is refused (TD-COMPACT-16), with a pointer
-        // to the operator path that converges.
-        for value in ["consolidate", "Consolidate"] {
+        // Any stated value is dead config while background consolidate is
+        // refused (TD-COMPACT-16) — including "hybrid", the code default —
+        // and the refusal points at the operator path that converges.
+        for value in ["hybrid", " Hybrid ", "consolidate", "Consolidate"] {
             let error = validate(value).expect_err("background consolidate must fail boot");
             assert!(error.contains("COMPACT TABLE"), "{error}");
         }

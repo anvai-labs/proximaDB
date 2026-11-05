@@ -266,12 +266,14 @@ pub struct SstCompactionTask {
     /// object, resolved by the task producer from the collection config.
     /// `None` = the account default (also what config-free producers set).
     pub access_tier: Option<proximadb_storage_filesystem_types::ObjectAccessTier>,
-    /// TD-COMPACT-15: set by FULL passes that carry an operator-pinned
-    /// `target_segments` — the request's own loop drives the remaining
-    /// passes, so the worker's background follow-up chain stands down for
-    /// this task (it would merge below the requested count and undo the
-    /// operator's stop point).
-    pub suppress_follow_up: bool,
+    /// TD-COMPACT-15: the live-segment FLOOR a per-request pinned
+    /// `target_segments > 1` sets for this task and every follow-up it
+    /// spawns. The worker still runs the follow-up chain — including the
+    /// layout/training promotion — but bounds each follow-up's inputs so the
+    /// chain can never merge below the operator's stop point (#2418 review
+    /// round 11: suppressing the chain instead left outputs untrained and
+    /// could drop a concurrent flush's training guard).
+    pub min_live_segments: Option<usize>,
 }
 
 impl SstCompactionTask {
@@ -339,6 +341,9 @@ impl SstCompactionTask {
         self.block_size_kb = origin.block_size_kb;
         self.compression_config = origin.compression_config.clone();
         self.access_tier = origin.access_tier;
+        // The pinned floor is part of the request's intent: a follow-up's own
+        // follow-up must respect it too.
+        self.min_live_segments = origin.min_live_segments;
     }
 }
 
@@ -667,6 +672,27 @@ fn atomic_coordinator_staging(task: &SstCompactionTask) -> Result<StagingConfig>
         skip_uuid_subdir: true,
         ..Default::default()
     })
+}
+
+/// How many inputs a follow-up may keep so the chain cannot merge below a
+/// pinned live-segment `floor`: merging `g` inputs removes `g - 1` segments,
+/// so at most `live - floor + 1`. `None` = do not schedule it — a single-input
+/// follow-up is a rewrite, worth running only when it carries the
+/// layout/training promotion (TD-COMPACT-15; #2418 review round 11).
+fn follow_up_input_cap(
+    live: usize,
+    floor: usize,
+    inputs: usize,
+    is_training: bool,
+) -> Option<usize> {
+    let allowed = live.saturating_sub(floor).saturating_add(1);
+    if inputs <= allowed {
+        return Some(inputs);
+    }
+    if allowed < 2 && !is_training {
+        return None;
+    }
+    Some(allowed.max(1))
 }
 
 impl Compaction {
@@ -1407,12 +1433,10 @@ impl Compaction {
             ));
         }
         let target = target_override.unwrap_or(cfg.full_target_segments.max(1));
-        // Suppression of the follow-up chain is reserved for the per-request
-        // override this TD added. A config-level full_target_segments > 1
-        // predates it and has always run the follow-up chain (incl. the
-        // layout/training promotion); suppressing it there would leave every
-        // FULL on such a config untrained (#2418 review round 9).
-        let suppress_follow_up = target_override.is_some_and(|t| t > 1);
+        // The follow-up floor is reserved for the per-request override this
+        // TD added; a config-level full_target_segments predates it and keeps
+        // its unbounded follow-up chain (#2418 review round 9).
+        let min_live_segments = target_override.filter(|t| *t > 1);
         let max_passes = cfg.full_max_passes.max(1);
         let deadline = started + timeout;
         let (mut total_bytes_read, mut total_bytes_written) = (0u64, 0u64);
@@ -1559,11 +1583,8 @@ impl Compaction {
                     Self::level_tier_policy(collection_tags).as_deref(),
                     1,
                 ),
-                // A per-request pinned stop point drives its own passes; the
-                // background follow-up would merge below it. See the
-                // `suppress_follow_up` binding for why config-level targets
-                // are excluded.
-                suppress_follow_up,
+                // Bounds the follow-up chain to the per-request stop point.
+                min_live_segments,
             };
             let output_key = task.output_file.to_string_lossy().to_string();
             if !self.schedule_compaction(task).await? {
@@ -1640,6 +1661,63 @@ impl Compaction {
             bytes_written: total_bytes_written,
             duration_ms: started.elapsed().as_millis() as u64,
         })
+    }
+
+    /// Bound a follow-up so the chain can never merge below a pinned
+    /// live-segment `floor` (TD-COMPACT-15; #2418 review round 11).
+    ///
+    /// Merging `g` inputs removes `g - 1` live segments, so with `live`
+    /// segments a follow-up may take at most `live - floor + 1` inputs. Over
+    /// that, the inputs are trimmed (and `input_bytes` recomputed from the
+    /// same discovery the FULL loop uses). A follow-up trimmed to ONE input is
+    /// a rewrite, which is only worth running when it carries the
+    /// layout/training promotion (`is_training`) — that is the case the
+    /// previous suppression wrongly dropped. Returns whether to schedule it.
+    pub(crate) async fn bound_follow_up_to_floor(
+        &self,
+        follow_up: &mut SstCompactionTask,
+        collection_dir: &Path,
+        floor: usize,
+        is_training: bool,
+    ) -> Result<bool> {
+        use crate::storage::common::compaction_utils::CompactionFileDiscovery;
+        let collection_id_text = follow_up.collection_object_id.to_string();
+        let collection_path = collection_dir.to_string_lossy().to_string();
+        let files = CompactionFileDiscovery::new(self.filesystem_factory.clone())
+            .discover_compactable_files(
+                &collection_id_text,
+                &collection_path,
+                "pax",
+                CompactionEngineType::SST,
+            )
+            .await
+            .map_err(|e| crate::core::StorageError::SstEngine(e.to_string()))?;
+        let sizes: std::collections::HashMap<String, u64> = files
+            .compactable_files
+            .values()
+            .flatten()
+            .map(|f| (f.path.clone(), f.size_bytes))
+            .collect();
+        let Some(keep) =
+            follow_up_input_cap(sizes.len(), floor, follow_up.input_files.len(), is_training)
+        else {
+            return Ok(false);
+        };
+        if keep == follow_up.input_files.len() {
+            return Ok(true);
+        }
+        follow_up.input_files.truncate(keep);
+        follow_up.input_bytes = follow_up
+            .input_files
+            .iter()
+            .map(|path| {
+                sizes
+                    .get(&path.to_string_lossy().to_string())
+                    .copied()
+                    .unwrap_or(0)
+            })
+            .sum();
+        Ok(true)
     }
 
     pub async fn check_compaction_needed(
@@ -1748,7 +1826,7 @@ impl Compaction {
                 rg_layout: None,
                 vector_quant: None,
                 access_tier: None,
-                suppress_follow_up: false,
+                min_live_segments: None,
             }));
         }
 
@@ -2001,47 +2079,7 @@ impl Compaction {
                     task.level,
                     &task.output_file,
                 );
-                // TD-COMPACT-15: a pinned FULL target drives its own passes,
-                // so a follow-up would merge below the requested stop point
-                // and undo it. Measured: allowing it collapses a target-2
-                // request to 1 (pinned by
-                // `full_compaction_honors_target_override_and_reports_provenance`).
-                //
-                // KNOWN TRADE-OFF (#2418 review round 5): this branch also
-                // schedules the LAYOUT/TRAINING promotion chain (the
-                // threshold-1 rescan), so a suppressed pass can leave its
-                // outputs pending promotion — the R6 mode costing ~180
-                // GETs/104 MB per query against 20-51 trained. We keep the
-                // pinned target, because it is the contract both API surfaces
-                // and the bench harness assert. Suppression only engages for
-                // target > 1, so the collapse-to-one path and every S=1 arm
-                // run the training chain normally.
-                //
-                // It is NOT self-healing in the case that matters: a bench
-                // arm pins a target on a SETTLED bed, no later write
-                // arrives, and the outputs stay untrained (#2418 review
-                // round 6). So the state is made observable instead — the
-                // counter below, this WARN, and the harness refusing / the
-                // result.json stamp. Do not remove those as redundant.
-                if task.suppress_follow_up {
-                    // Only a SUCCESSFUL pass publishes outputs that can be
-                    // left untrained; a failed morsel published nothing, so
-                    // it must not move the counter operators are told to
-                    // trust (#2418 review round 7).
-                    if succeeded && follow_up_threshold.is_some() {
-                        crate::metrics::operational_metrics::COMPACTION_TRAINING_PROMOTION_SUPPRESSED
-                            .inc();
-                        warn!(
-                            collection_object_id = task.collection_object_id,
-                            "Pinned FULL target suppressed a follow-up carrying a layout/training promotion: outputs stay untrained until the next ordinary compaction round (TD-COMPACT-15 known trade-off)"
-                        );
-                    } else {
-                        debug!(
-                            collection_object_id = task.collection_object_id,
-                            "Follow-up suppressed: pinned FULL target owns the collapse"
-                        );
-                    }
-                } else if succeeded
+                if succeeded
                     && !shutdown_signal.load(Ordering::SeqCst)
                     && let Some(collection_dir) = task.output_file.parent()
                 {
@@ -2061,30 +2099,63 @@ impl Compaction {
                             // drift between compaction rounds.
                             follow_up.inherit_collection_intent(&task);
                             let follow_up_level = follow_up.level;
-                            match compaction.schedule_compaction(follow_up).await {
-                                Ok(true) => {
-                                    scheduled_follow_up_level = Some(follow_up_level);
-                                    info!(
+                            // A pinned floor bounds the follow-up instead of
+                            // suppressing it: the chain (and its training
+                            // promotion) still runs, but can never merge
+                            // below the operator's stop point.
+                            let keep = match follow_up.min_live_segments {
+                                None => true,
+                                Some(floor) => match compaction
+                                    .bound_follow_up_to_floor(
+                                        &mut follow_up,
+                                        collection_dir,
+                                        floor,
+                                        follow_up_threshold.is_some(),
+                                    )
+                                    .await
+                                {
+                                    Ok(keep) => keep,
+                                    Err(error) => {
+                                        warn!(
+                                            collection_object_id = task.collection_object_id,
+                                            "Compaction follow-up floor check failed; not scheduling: {error}"
+                                        );
+                                        false
+                                    }
+                                },
+                            };
+                            if keep {
+                                match compaction.schedule_compaction(follow_up).await {
+                                    Ok(true) => {
+                                        scheduled_follow_up_level = Some(follow_up_level);
+                                        info!(
+                                            collection_object_id = task.collection_object_id,
+                                            layout_promotion_chain = follow_up_threshold.is_some(),
+                                            "Compaction follow-up morsel enqueued after level {}",
+                                            task.level
+                                        );
+                                    }
+                                    Ok(false) => {
+                                        // Another active task owns this work. Keep
+                                        // the training guard when that owner is an
+                                        // L0 morsel so it inherits threshold one.
+                                        scheduled_follow_up_level = Some(follow_up_level);
+                                        debug!(
+                                            collection_object_id = task.collection_object_id,
+                                            "Compaction follow-up already owned by another morsel"
+                                        );
+                                    }
+                                    Err(error) => warn!(
                                         collection_object_id = task.collection_object_id,
-                                        layout_promotion_chain = follow_up_threshold.is_some(),
-                                        "Compaction follow-up morsel enqueued after level {}",
-                                        task.level
-                                    );
+                                        "Compaction follow-up enqueue failed: {error}"
+                                    ),
                                 }
-                                Ok(false) => {
-                                    // Another active task owns this work. Keep
-                                    // the training guard when that owner is an
-                                    // L0 morsel so it inherits threshold one.
-                                    scheduled_follow_up_level = Some(follow_up_level);
-                                    debug!(
-                                        collection_object_id = task.collection_object_id,
-                                        "Compaction follow-up already owned by another morsel"
-                                    );
-                                }
-                                Err(error) => warn!(
+                            } else {
+                                debug!(
                                     collection_object_id = task.collection_object_id,
-                                    "Compaction follow-up enqueue failed: {error}"
-                                ),
+                                    floor = follow_up.min_live_segments,
+                                    "Compaction follow-up skipped: at the pinned live-segment floor"
+                                );
                             }
                         }
                         Ok(None) => {}
@@ -4321,7 +4392,7 @@ mod compaction_format_tests {
             rg_layout: None,
             vector_quant,
             access_tier: None,
-            suppress_follow_up: false,
+            min_live_segments: None,
         }
     }
 

@@ -257,22 +257,6 @@ lazy_static! {
         "COMPACT FULL request outcomes by stop reason (TD-COMPACT-15)",
         &["reason"],
     );
-    /// TD-COMPACT-15: FULL passes whose pinned `target_segments > 1`
-    /// suppressed a follow-up that carried a layout/TRAINING promotion, so
-    /// the outputs stay untrained until the next ordinary compaction round
-    /// (~180 GETs/104 MB per query untrained vs 20-51 trained).
-    ///
-    /// Why a metric and not just a WARN (#2418 review round 6): the "the
-    /// next write heals it" mitigation does NOT hold for the case that
-    /// motivates `target_segments` in the first place — a bench arm pins a
-    /// target on a SETTLED bed and then measures queries, so no further
-    /// write ever arrives. A measured arm must be able to detect that its
-    /// geometry is untrained and therefore not comparable to a trained arm,
-    /// rather than silently publishing the wrong number.
-    pub static ref COMPACTION_TRAINING_PROMOTION_SUPPRESSED: IntCounter = counter(
-        "proximadb_compaction_training_promotion_suppressed_total",
-        "FULL passes whose pinned target suppressed a layout/training promotion (TD-COMPACT-15)",
-    );
     pub static ref COMPACTION_QUEUE_DEPTH: IntGauge = gauge(
         "proximadb_compaction_queue_depth",
         "Compaction tasks queued across all collections",

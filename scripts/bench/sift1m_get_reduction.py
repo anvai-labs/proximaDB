@@ -1510,28 +1510,6 @@ def scrape_text(server: str) -> str:
     )
 
 
-TRAINING_PROMOTION_SUPPRESSED_METRIC = (
-    "proximadb_compaction_training_promotion_suppressed_total"
-)
-
-
-def training_promotions_suppressed(server: str) -> float:
-    """Current value of the TD-COMPACT-15 suppression counter (0 if absent)."""
-    total = 0.0
-    for raw_line in scrape_text(server).splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
-            continue
-        token, _, raw_value = line.partition(" ")
-        if token.split("{", 1)[0] != TRAINING_PROMOTION_SUPPRESSED_METRIC:
-            continue
-        try:
-            total += float(raw_value.strip().split()[0])
-        except (ValueError, IndexError):
-            continue
-    return total
-
-
 def scrape(server: str) -> dict[str, float]:
     text = scrape_text(server)
     totals = parse_prometheus(text)
@@ -4080,7 +4058,6 @@ def main() -> int:
                     for s in geometry["segments"]
                 ],
             }
-            suppressed_before = training_promotions_suppressed(server_url)
             action = compact_via_flight(
                 "127.0.0.1",
                 args.port,
@@ -4093,19 +4070,6 @@ def main() -> int:
             result["compact_full_before_measure"] = {
                 "before": before,
                 "action": action,
-                # TD-COMPACT-15: MEASURED, not inferred from the CLI flag. A
-                # pinned target > 1 — from this request OR the server's
-                # full_target_segments — suppresses the follow-up carrying the
-                # training promotion. This records how often it happened; the
-                # trained-geometry check below (every segment must carry a
-                # coarse A0 directory) is what actually refuses an untrained
-                # arm, whatever pinned the target. The counter carries no
-                # collection label, so the delta is exact only because this
-                # harness drives ONE collection on a server it owns; another
-                # collection compacting concurrently would inflate it.
-                "training_promotions_suppressed": (
-                    training_promotions_suppressed(server_url) - suppressed_before
-                ),
                 "after": {
                     "segment_count": geometry["segment_count"],
                     "bytes": geometry["bytes"],

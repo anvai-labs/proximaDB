@@ -1783,6 +1783,12 @@ impl DdlService {
         // System-written properties (a collection's record, its owner) are
         // never client-settable.
         proximadb_catalog::table_properties::ensure_no_reserved_table_properties(&properties)?;
+        // CREATE TABLE ... WITH is a property write door too (#2418 review
+        // round 11): it stored policy keys verbatim, so the refusals that
+        // ALTER TABLE ... SET enforces (background consolidate, the
+        // unconsumed target size) could be bypassed at create time.
+        proximadb_storage_common::validate_compaction_properties(&properties)
+            .map_err(|e| anyhow::anyhow!("invalid table property: {e}"))?;
         let mut schema = CatalogTableSchema::new(table_name);
         schema.properties = properties;
 
