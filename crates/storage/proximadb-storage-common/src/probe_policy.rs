@@ -560,8 +560,20 @@ pub fn resolve_probe_policy_gated(
     if let Some(max) = property_usize(properties, PROBE_MAX_CELLS_KEY) {
         policy.max_cells = max;
     }
+    // Same `base == 0` guard as the server layer above (#2419 review round
+    // 21): `property_usize` has no `> 0` filter — deliberately, for the 0
+    // sentinels on min/max/cap — so `probe.base_mb = "0"` would set a ZERO
+    // budget that `snap_to_band` then rounds up to the smallest rung, a
+    // third behaviour for one value. Latent today (the door refuses every
+    // `probe.*` key) but live the moment the carrier lands.
     if let Some(base) = property_u64_mb(properties, PROBE_BASE_MB_KEY) {
-        policy.base_bytes = base;
+        if base == 0 && policy.algorithm == ProbeAlgorithm::ByteBudget {
+            tracing::warn!(
+                "probe.base_mb = 0 has no meaning under byte_budget; using the default budget"
+            );
+        } else if base > 0 {
+            policy.base_bytes = base;
+        }
     }
     if let Some(cap) = property_u64_mb(properties, PROBE_CAP_MB_KEY) {
         policy.cap_bytes = cap;
@@ -1151,5 +1163,31 @@ mod tests {
         assert_eq!(snapped, 4 * mib, "nearest rung not above the cap");
         // A cap below every rung is honoured as-is (sub-ladder case).
         assert_eq!(snap_to_band(9 * mib, 4 * mib, 300 * 1024), 300 * 1024);
+    }
+    #[test]
+    fn a_zero_base_budget_is_refused_on_both_layers() {
+        // The server layer and the property layer must agree: a 0 base
+        // budget under byte_budget keeps the DEFAULT, never a zero budget
+        // that snap_to_band would round up to the smallest rung (#2419
+        // review round 21).
+        let default_base = ProbePolicy::default().base_bytes;
+        let server = resolve_probe_policy_gated(
+            &HashMap::new(),
+            &[],
+            &ServerProbePolicy {
+                algorithm: Some("byte_budget".to_string()),
+                base_bytes: Some(0),
+                ..Default::default()
+            },
+            true,
+        );
+        assert_eq!(server.base_bytes, default_base, "server layer");
+        let property = resolve_probe_policy_gated(
+            &props(&[("probe.algorithm", "byte_budget"), ("probe.base_mb", "0")]),
+            &[],
+            &ServerProbePolicy::default(),
+            true,
+        );
+        assert_eq!(property.base_bytes, default_base, "property layer");
     }
 }

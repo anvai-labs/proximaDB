@@ -2803,14 +2803,22 @@ jobs:
           RUST_MIN_STACK: "8388608"
         run: |
           # Run only explicitly named storage test files (avoids compiling all tests)
-          for test_file in tests/*sst*.rs tests/*storage*.rs tests/*wal*.rs tests/embedded_tenant_context.rs tests/td112_postflush_recall_e2e.rs tests/v2_post_flush_search_e2e.rs tests/mlflow_run_store_test.rs tests/iceberg_interop_e2e.rs; do
+          # recall_tune_auth_e2e carries the REST property-door contracts
+          # (TD-RDSTRAT-14 / #2419: create refuses unpersisted properties, the
+          # PATCH route is gone). It was in NO lane, so those assertions never
+          # gated — a re-added route or a relaxed guard would have shipped.
+          for test_file in tests/*sst*.rs tests/*storage*.rs tests/*wal*.rs tests/embedded_tenant_context.rs tests/td112_postflush_recall_e2e.rs tests/v2_post_flush_search_e2e.rs tests/recall_tune_auth_e2e.rs tests/mlflow_run_store_test.rs tests/iceberg_interop_e2e.rs; do
             if [ -f "$test_file" ]; then
               test_name=$(basename "$test_file" .rs)
               echo "Running $test_name..."
-              if [ "$test_name" = "v2_post_flush_search_e2e" ]; then
+              if [ "$test_name" = "v2_post_flush_search_e2e" ] \
+                || [ "$test_name" = "recall_tune_auth_e2e" ]; then
                 # The canonical flush engine is process-global, while each
                 # tokio::test owns its runtime and compaction workers. Give
                 # each server test a fresh process so workers stay alive.
+                # (recall_tune_auth_e2e also boots a server — and the WAL
+                # manifest is a set-once singleton, so it needs the same
+                # process-per-test isolation.)
                 cargo nextest run --test "$test_name" --profile integration --retries 0
               else
                 cargo test --test "$test_name" -- --test-threads=1

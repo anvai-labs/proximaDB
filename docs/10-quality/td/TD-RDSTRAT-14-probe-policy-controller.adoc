@@ -406,3 +406,29 @@ duplicate append); `geometric_nprobe` is #[cfg(test)] (production callers
 use `geometric_nprobe_with` with a policy read once); the probe.* refusal
 derives its prefix from POLICY_PROPERTY_PREFIXES and the doc-slip on
 `validate_policy_properties` is gone.
+
+Round 21 (#2419): the Iceberg `createTable` door STRIPS system-written keys
+again instead of refusing them. Round 17 made it a refusal, which broke
+standard third-party DDL: Spark adds `owner` to every
+`CREATE TABLE ... USING iceberg` (`CatalogV2Util.withDefaultOwnership`),
+Trino/Flink likewise — refusing a key the client cannot choose not to send
+is a broken door, not a closed one. The two doors now differ ON PURPOSE and
+`without_reserved_table_properties` documents why: SQL DDL refuses
+(its callers are ours), the Iceberg surface strips, and POLICY namespaces
+are validated on BOTH. The property layer gained the server layer's
+`base == 0` guard (a zero budget would be rounded up to the smallest rung —
+a third behaviour), pinned by a both-layers symmetry test. And
+`tests/recall_tune_auth_e2e.rs` — which carries the create/PATCH contract
+assertions — was in NO workflow lane, so those assertions never gated; it
+now runs in the storage integration lane with process-per-test isolation.
+
+Not fixed here, by design: `resolve_strategy_from_properties` and
+`resolve_target_file_size_mb` still use a non-deterministic `.find()` over
+case-variant keys — both functions are DELETED by #2418 (verified), so
+patching them here would conflict and fix dying code.
+
+The SetProperties commit refusal stays ATOMIC (round 20). Round 21 noted it
+turns a previously-"succeeding" bundled commit into a 400; that success was
+the bug — the property write was silently discarded — and applying the
+snapshot while dropping the property would leave the client believing both
+landed, which retries make worse.

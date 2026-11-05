@@ -30,6 +30,31 @@ pub fn is_reserved_table_property(key: &str) -> bool {
             .any(|prefix| key.starts_with(prefix))
 }
 
+/// Drop the reserved (system-written) keys from a client-supplied property
+/// map, keeping everything else.
+///
+/// The two doors differ ON PURPOSE (#2419 review round 21). SQL DDL
+/// (`CREATE TABLE … WITH`, `ALTER TABLE … SET`) REFUSES a reserved key via
+/// [`ensure_no_reserved_table_properties`], because its callers are ours and
+/// a reserved key there is an operator mistake worth naming. The Iceberg
+/// REST surface STRIPS instead: third-party engines send `owner`
+/// unconditionally — Spark adds `TableCatalog.PROP_OWNER` through
+/// `CatalogV2Util.withDefaultOwnership` on every `CREATE TABLE … USING
+/// iceberg`, and Trino/Flink do the same — so refusing it would fail every
+/// standard Iceberg create for a key the client cannot choose not to send.
+/// Refusing something a caller cannot avoid is a broken door, not a closed
+/// one. POLICY namespaces (`cache.*` / `compaction.*` / `probe.*`) are
+/// validated on BOTH doors; only the system-owned keys are treated
+/// differently.
+pub fn without_reserved_table_properties(
+    properties: HashMap<String, String>,
+) -> HashMap<String, String> {
+    properties
+        .into_iter()
+        .filter(|(key, _)| !is_reserved_table_property(key))
+        .collect()
+}
+
 /// Refuse client-supplied table properties that include a reserved key.
 pub fn ensure_no_reserved_table_properties(
     properties: &HashMap<String, String>,
@@ -75,5 +100,10 @@ mod tests {
         assert!(ensure_no_reserved_table_properties(&props).is_ok());
         props.insert("collection.id".to_string(), "1".to_string());
         assert!(ensure_no_reserved_table_properties(&props).is_err());
+        // The Iceberg surface STRIPS the same keys instead of refusing them
+        // (see the helper's doc): a Spark create carrying `owner` must
+        // succeed with `owner` dropped, keeping the client's own keys.
+        let stripped = without_reserved_table_properties(props);
+        assert_eq!(stripped.keys().collect::<Vec<_>>(), vec!["engine"]);
     }
 }

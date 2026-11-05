@@ -819,18 +819,13 @@ impl IcebergRestService {
             // ServiceUnavailable, which Iceberg clients RETRY forever and
             // never show the user (#2419 review round 15).
             .map_err(|e| anyhow::anyhow!("Bad request: invalid table property: {e}"))?;
-        // System-written properties are never taken from a client request —
-        // and never silently DROPPED either: stripping them returned 200 for
-        // keys every other door refuses ("reserved and cannot be set"), a
-        // write the 200 reported but that never happened (#2419 review
-        // round 17). Refuse them like CREATE TABLE ... WITH does.
-        if let Some(key) = req
-            .properties
-            .keys()
-            .find(|key| crate::table_properties::is_reserved_table_property(key))
-        {
-            anyhow::bail!("Bad request: table property '{key}' is reserved and cannot be set");
-        }
+        // System-written keys (`owner`, `tags`, …) are STRIPPED here, not
+        // refused: Spark/Trino/Flink add `owner` to every Iceberg
+        // `CREATE TABLE`, so refusing it would fail standard creates for a
+        // key the client cannot choose not to send (#2419 review round 21 —
+        // round 17 made this a refusal and broke exactly that). The POLICY
+        // namespaces are still validated above, on every door. See
+        // `without_reserved_table_properties` for the full rationale.
         let schema = self.iceberg_schema_to_catalog(&req.schema, &req.name, req.properties.clone());
 
         let created = catalog.create_table(&identifier, schema).await?;
@@ -1420,9 +1415,9 @@ impl IcebergRestService {
         properties: HashMap<String, String>,
     ) -> CatalogTableSchema {
         let mut schema = CatalogTableSchema::new(table_name);
-        // Reserved keys are refused by the CALLER (which returns Result);
-        // nothing is silently stripped here.
-        schema.properties = properties;
+        // System-written keys are dropped (never taken from a client
+        // request); the caller validated the policy namespaces.
+        schema.properties = crate::table_properties::without_reserved_table_properties(properties);
 
         for (i, f) in iceberg_schema.fields.iter().enumerate() {
             let data_type = iceberg_type_to_catalog(&f.field_type);
