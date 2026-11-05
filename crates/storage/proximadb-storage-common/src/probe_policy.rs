@@ -480,8 +480,19 @@ pub fn resolve_probe_policy_gated(
     if let Some(max) = server.max_cells {
         policy.max_cells = max;
     }
-    if let Some(base) = server.base_bytes.filter(|b| *b > 0) {
-        policy.base_bytes = base;
+    // `base_mb = 0` is refused at boot under byte_budget (the only form that
+    // reads it); silently dropping it here gave a non-loader construction a
+    // third behaviour and a mislabelled experiment arm (#2419 review round
+    // 18). Loud instead — the resolver is pure, but a warn is side-effect
+    // free and this is a configuration defect.
+    if let Some(base) = server.base_bytes {
+        if base == 0 && policy.algorithm == ProbeAlgorithm::ByteBudget {
+            tracing::warn!(
+                "probe base_mb = 0 has no meaning under byte_budget (boot refuses it on the loader path); using the default budget — fix the construction site"
+            );
+        } else if base > 0 {
+            policy.base_bytes = base;
+        }
     }
     if let Some(cap) = server.cap_bytes {
         policy.cap_bytes = cap;

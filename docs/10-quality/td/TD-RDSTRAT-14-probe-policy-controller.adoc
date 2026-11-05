@@ -354,3 +354,24 @@ tests stay env-free); the property-doors e2e rides the file's single-boot
 test instead of starting a second ProximaDB (the WAL manifest is a set-once
 singleton under the libtest fallback); the registry rows state the snapshot
 semantics; the resolver's multiplier comment matches the shipped rules.
+
+Round 18 (#2419): Iceberg `commit_table` SetProperties refuses table-property
+writes instead of `let _ = updates` + success (Spark/Flink set table
+properties exactly this way — silently discarded); the dead
+`without_reserved_table_properties` helper is deleted with its test (the
+refusal replaced it; two competing policies invited rewiring the strip);
+`coarse_probe_nprobe` reads the policy ONCE and threads it through a new
+`geometric_nprobe_with` (a re-seed between two reads could plan byte_budget
+with the zeroed fallback geometry — a one-query full-pool probe); the
+non-loader clamps are LOUD (cap/base over the bound warns on clamp, base=0
+under byte_budget warns on default) — the loader aborts on these, so
+silence gave embedded/programmatic configs a third behaviour and mislabelled
+arms; CoarseProbeConfig's doc states which envs are per-call and which are
+snapshotted. Filed:
+
+* *RDSTRAT-14-F14 — directory rowgroup geometry from the lex-min live URL.*
+  `plan_segments` derives the byte_budget band ladder from the
+  lexicographically smallest live URL, so it flips when that segment
+  compacts away or a scheme migration advances (1 MiB local vs 4 MiB cloud
+  rungs, mid-experiment, no config change). Plumb the CONFIGURED storage
+  location's budget instead. byte_budget arms only (experimental-gated).

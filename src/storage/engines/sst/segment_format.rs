@@ -3706,8 +3706,25 @@ impl Default for CoarseProbeSettings {
     }
 }
 
+/// Clamp a probe MiB knob to the budget bound, LOUDLY: the loader aborts
+/// boot on an over-bound value, so silently clamping here gave a non-loader
+/// (embedded/programmatic) config a third behaviour — and a mislabelled
+/// experiment arm (#2419 review round 18).
+fn bounded_probe_mb(name: &str, mb: u64, max_mb: u64) -> u64 {
+    if mb > max_mb {
+        tracing::warn!(
+            knob = name,
+            value_mb = mb,
+            max_mb,
+            "coarse_probe.{name} exceeds the probe budget bound; clamping — the loader refuses this at boot, so fix the construction site"
+        );
+    }
+    mb.min(max_mb)
+}
+
 impl From<crate::core::config::CoarseProbeConfig> for CoarseProbeSettings {
     fn from(c: crate::core::config::CoarseProbeConfig) -> Self {
+        let max_mb = proximadb_storage_common::probe_policy::MAX_PROBE_BUDGET_MB as u64;
         Self {
             enable_read_probe: c.enable_read_probe,
             enable_write_train: c.enable_write_train,
@@ -3734,14 +3751,14 @@ impl From<crate::core::config::CoarseProbeConfig> for CoarseProbeSettings {
                 Default::default()
             }),
             // Bounded like the property path: an unbounded MiB->bytes
-            // multiply overflows (mandate #4 forbids the debug panic).
-            probe_base_bytes: c
-                .base_mb
-                .min(proximadb_storage_common::probe_policy::MAX_PROBE_BUDGET_MB as u64)
+            // multiply overflows (mandate #4 forbids the debug panic). A
+            // value OVER the bound is LOUD here: the loader aborts boot on
+            // it, so silently clamping gave a non-loader (embedded/
+            // programmatic) config a third behavior — and a mislabelled
+            // experiment arm (#2419 review round 18).
+            probe_base_bytes: bounded_probe_mb("base_mb", c.base_mb, max_mb)
                 .saturating_mul(1024 * 1024),
-            probe_cap_bytes: c
-                .cap_mb
-                .min(proximadb_storage_common::probe_policy::MAX_PROBE_BUDGET_MB as u64)
+            probe_cap_bytes: bounded_probe_mb("cap_mb", c.cap_mb, max_mb)
                 .saturating_mul(1024 * 1024),
         }
     }
@@ -3969,8 +3986,27 @@ fn geometric_nprobe(
     rowgroup_bytes: u64,
     avg_cell_bytes: u64,
 ) -> usize {
-    let plan = proximadb_storage_common::probe_policy::resolve_probe_plan(
+    geometric_nprobe_with(
         &cached_probe_policy(),
+        k_c,
+        corpus_rows,
+        rowgroup_bytes,
+        avg_cell_bytes,
+    )
+}
+
+/// [`geometric_nprobe`] with the policy as an INPUT, so a caller that has
+/// already read it (and branched on the algorithm) cannot be split across a
+/// re-seed.
+fn geometric_nprobe_with(
+    policy: &proximadb_storage_common::probe_policy::ProbePolicy,
+    k_c: usize,
+    corpus_rows: u64,
+    rowgroup_bytes: u64,
+    avg_cell_bytes: u64,
+) -> usize {
+    let plan = proximadb_storage_common::probe_policy::resolve_probe_plan(
+        policy,
         k_c,
         corpus_rows,
         rowgroup_bytes,
@@ -4031,10 +4067,16 @@ fn coarse_probe_nprobe(
             // functions; the parity is pinned by test). Gather them lazily,
             // inside the closure, and only for byte_budget, so the DEFAULT
             // sqrt path pays none of it (#2419 review round 17; was F2).
-            if cached_probe_policy().algorithm
+            //
+            // The policy is read ONCE and threaded through: reading it again
+            // inside geometric_nprobe let a settings re-seed between the two
+            // reads plan byte_budget with the zeroed fallback geometry — a
+            // full-pool probe for one query (#2419 review round 18).
+            let policy = cached_probe_policy();
+            if policy.algorithm
                 != proximadb_storage_common::probe_policy::ProbeAlgorithm::ByteBudget
             {
-                return geometric_nprobe(k_c, 0, 0, 0);
+                return geometric_nprobe_with(&policy, k_c, 0, 0, 0);
             }
             let corpus_rows = dir.cells.iter().map(|c| c.row_end).max().unwrap_or(0);
             // Average over NON-EMPTY cells only: the probe never reads a
@@ -4054,7 +4096,7 @@ fn coarse_probe_nprobe(
             };
             let rowgroup_bytes = proximadb_storage_common::iops_budget::IopsBudget::for_path(path)
                 .target_block_bytes();
-            geometric_nprobe(k_c, corpus_rows, rowgroup_bytes, avg_cell_bytes)
+            geometric_nprobe_with(&policy, k_c, corpus_rows, rowgroup_bytes, avg_cell_bytes)
         })
         .min(k_c.max(1))
 }

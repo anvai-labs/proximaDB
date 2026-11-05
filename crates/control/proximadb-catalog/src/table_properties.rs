@@ -49,16 +49,6 @@ pub fn ensure_no_reserved_table_properties(
     )
 }
 
-/// Drop reserved keys from client-supplied table properties.
-pub fn without_reserved_table_properties(
-    properties: HashMap<String, String>,
-) -> HashMap<String, String> {
-    properties
-        .into_iter()
-        .filter(|(key, _)| !is_reserved_table_property(key))
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -85,11 +75,5 @@ mod tests {
         assert!(ensure_no_reserved_table_properties(&props).is_ok());
         props.insert("collection.id".to_string(), "1".to_string());
         assert!(ensure_no_reserved_table_properties(&props).is_err());
-        assert_eq!(
-            without_reserved_table_properties(props)
-                .keys()
-                .collect::<Vec<_>>(),
-            vec!["engine"]
-        );
     }
 }

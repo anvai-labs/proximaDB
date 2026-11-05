@@ -1717,8 +1717,11 @@ pub struct SstConfig {
 /// `enable_write_train` is on; search probes the nearest `nprobe` cells when
 /// `enable_read_probe` is on. `nprobe` defaults to the geometric
 /// `ceil(sqrt(ncells) × multiplier)` (sub-linear in corpus: V^0.25; ~56× fewer
-/// ranks than full-scan at 1M), clamped to `[nprobe_min, nprobe_max]`. Env vars
-/// override per-field at call time (see `segment_format.rs`).
+/// ranks than full-scan at 1M), clamped to `[nprobe_min, nprobe_max]`. Env vars:
+/// `PROXIMADB_PAX_READ_COARSE_NPROBE` and `_CENTROID_DIRECTORY_NPROBE`
+/// override per call; the `PROXIMADB_PAX_READ_PROBE_*` policy envs are
+/// SNAPSHOTTED once per settings generation (a live-process change needs a
+/// re-seed; see ENV_GATE_REGISTRY).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CoarseProbeConfig {
     /// READ kill-switch: search probes the A0 coarse directory. Default ON.

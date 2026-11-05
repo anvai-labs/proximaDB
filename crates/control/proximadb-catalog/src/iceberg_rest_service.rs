@@ -1113,9 +1113,24 @@ impl IcebergRestService {
         for update in &req.updates {
             match update {
                 IcebergTableUpdate::SetProperties { updates } => {
-                    // Update table properties in catalog (best-effort via statistics or properties)
-                    debug!("Commit: SetProperties on {}.{}", namespace.join("."), table);
-                    let _ = updates;
+                    // Table properties are NOT writable through Iceberg
+                    // commits: this arm used to `let _ = updates` and return
+                    // success — Spark/Flink set table properties exactly this
+                    // way, so their writes were silently discarded (the
+                    // accepted-but-inert class; #2419 review round 18). Fail
+                    // closed with the working path. (Snapshot/metadata
+                    // properties are a different map and unaffected.)
+                    if !updates.is_empty() {
+                        anyhow::bail!(
+                            "Bad request: table properties cannot be set through an Iceberg commit; use ALTER TABLE {} SET (...) over pgwire",
+                            table
+                        );
+                    }
+                    debug!(
+                        "Commit: empty SetProperties on {}.{}",
+                        namespace.join("."),
+                        table
+                    );
                 }
                 IcebergTableUpdate::AddSnapshot { snapshot } => {
                     debug!(
