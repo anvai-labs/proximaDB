@@ -248,6 +248,13 @@ impl UnifiedStorageFormat for SstEngine {
         // TD-COMPACT-14: an operator FULL request collapses the collection
         // across levels instead of running one policy morsel.
         if params.full {
+            // Refuse an invalid target BEFORE the metered region: a request
+            // rejected as invalid input is not a FULL that failed, and must
+            // not move the `error` series operators alert on (#2418 review
+            // round 13).
+            if params.full_target_segments == Some(0) {
+                anyhow::bail!("target_segments must be >= 1 (got 0)");
+            }
             let full_config = self.config().compaction_config.clone().unwrap_or_default();
             let timeout = std::time::Duration::from_millis(
                 params.timeout_ms.unwrap_or(full_config.full_timeout_ms),

@@ -70,8 +70,9 @@ Add an operator-triggered compaction with PostgreSQL-style permissioning:
   scoped to the passes the request's own loop ran. When the resolved target
   is 1 the worker's follow-up chain may merge further after a pass publishes;
   those morsels carry their own output keys, so the reported bytes are a
-  measured LOWER BOUND on that path, and exact when a target > 1 suppresses
-  the follow-up chain.
+  measured LOWER BOUND for every target: worker follow-ups (including those
+  bounded by a pinned floor, and single-input training rewrites) are not
+  summed.
 - Observability: `proximadb_compaction_full_stop_total{reason}` counts
   every FULL request outcome (`completed` / `at_target` / the engine stop
   reasons) — the first per-request compaction outcome metric.

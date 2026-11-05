@@ -8,11 +8,10 @@
 //!   or batch-loaded collections.
 //!
 //! The strategy is resolved through [`resolve_effective_strategy`]:
-//! collection property > operator tag (`compaction.strategy:<s>`) > server
-//! TOML > code default. The server layer is consulted only when the flush
-//! carries LOADED catalog properties (`FlushParameters.collection_properties
-//! = Some`), so a path that never consulted the catalog cannot override an
-//! opt-out it cannot see.
+//! collection property > operator tag (`compaction.strategy:<s>`) > code
+//! default. Its server-layer parameter is always `None` in production today:
+//! background consolidate is refused (TD-COMPACT-16), so no server default
+//! exists to apply; the parameter is kept for that rework.
 //! The `compaction:off` TAG always wins over any strategy (it disarms all
 //! background compaction including consolidate).
 

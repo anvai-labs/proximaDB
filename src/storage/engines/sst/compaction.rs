@@ -1431,10 +1431,13 @@ impl Compaction {
             ));
         }
         let target = target_override.unwrap_or(cfg.full_target_segments.max(1));
-        // The follow-up floor is reserved for the per-request override this
-        // TD added; a config-level full_target_segments predates it and keeps
-        // its unbounded follow-up chain (#2418 review round 9).
-        let min_live_segments = target_override.filter(|t| *t > 1);
+        // Any resolved target > 1 — per-request OR config-level — bounds the
+        // follow-up chain. Round 9 exempted config targets because the old
+        // SUPPRESSION dropped the training promotion; the floor keeps it (as
+        // a single-input rewrite), so the exemption only let a configured
+        // full_target_segments = 2 be merged down to 1 behind the operator's
+        // back (#2418 review round 13).
+        let min_live_segments = (target > 1).then_some(target);
         let max_passes = cfg.full_max_passes.max(1);
         let deadline = started + timeout;
         let (mut total_bytes_read, mut total_bytes_written) = (0u64, 0u64);

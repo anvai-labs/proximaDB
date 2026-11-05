@@ -1076,21 +1076,33 @@ impl CompactionConfig {
                 self.strategy
             ));
         }
-        // Read by nothing while background consolidate is refused
-        // (TD-COMPACT-16): "consolidate" would not converge, and "hybrid" is
-        // already the code default, so ANY stated value is dead config — the
-        // hazard this validator exists to kill (#2418 review round 11).
+        // Background consolidate is refused (TD-COMPACT-16). An explicit
+        // REQUEST for it fails boot — silently not consolidating would leave
+        // the operator believing it runs. The knobs that are merely dead now
+        // ("hybrid" is already the default; the write-amp limit was read only
+        // by the removed trigger) shipped as accepted settings in #2407, so
+        // failing boot on them would turn an upgrade into an outage: they are
+        // warned about instead (#2418 review round 13).
         if let Some(strategy) = &self.consolidate_strategy {
-            return Err(format!(
-                "{section}.consolidate_strategy is not consumed (got '{strategy}'): background consolidate is refused until TD-COMPACT-16 and hybrid is already the default. Remove it; collapse with COMPACT TABLE ... FULL"
-            ));
+            let value = strategy.trim().to_ascii_lowercase();
+            if value == "consolidate" {
+                return Err(format!(
+                    "{section}.consolidate_strategy = \"consolidate\" is not supported: background consolidate does not converge (TD-COMPACT-16). Collapse with COMPACT TABLE ... FULL instead"
+                ));
+            }
+            if value != "hybrid" {
+                return Err(format!(
+                    "{section}.consolidate_strategy must be 'hybrid' (got '{strategy}')"
+                ));
+            }
+            tracing::warn!(
+                "{section}.consolidate_strategy = \"hybrid\" is deprecated and has no effect (hybrid is the default); remove it"
+            );
         }
-        // Read only by the background consolidate trigger, which is refused
-        // (TD-COMPACT-16): accepting a stated value would be dead config.
         if self.consolidate_write_amp_limit.is_some() {
-            return Err(format!(
-                "{section}.consolidate_write_amp_limit is not consumed (background consolidate is refused until TD-COMPACT-16); remove it"
-            ));
+            tracing::warn!(
+                "{section}.consolidate_write_amp_limit is deprecated and has no effect (background consolidate is refused, TD-COMPACT-16); remove it"
+            );
         }
         // A stated 0 MiB target has no meaning (it was silently clamped to
         // 1 MiB by the FULL merge's grouping). Fail closed at boot.
@@ -1528,22 +1540,28 @@ mod tests {
             }
             .validate("storage.compaction_config")
         };
-        // Any stated value is dead config while background consolidate is
-        // refused (TD-COMPACT-16) — including "hybrid", the code default —
-        // and the refusal points at the operator path that converges.
-        for value in ["hybrid", " Hybrid ", "consolidate", "Consolidate"] {
+        // A dead knob shipped by #2407 ("hybrid" is already the default) is
+        // accepted with a deprecation warning, so an upgrade still boots.
+        assert!(validate("hybrid").is_ok());
+        assert!(validate(" Hybrid ").is_ok());
+        // An explicit request for the refused behaviour fails, pointing at
+        // the operator path that converges.
+        for value in ["consolidate", "Consolidate"] {
             let error = validate(value).expect_err("background consolidate must fail boot");
             assert!(error.contains("COMPACT TABLE"), "{error}");
         }
-        // The write-amp limit is read only by that refused trigger.
+        // The write-amp limit is read only by that refused trigger; an
+        // existing config naming it must still boot (deprecation warning).
         assert!(
             CompactionConfig {
                 consolidate_write_amp_limit: Some(50),
                 ..Default::default()
             }
             .validate("storage.compaction_config")
-            .is_err()
+            .is_ok()
         );
+        // Typos are still refused.
+        assert!(validate("hybird").is_err());
         assert!(
             CompactionConfig {
                 consolidate_strategy: Some("aggressive".to_string()),

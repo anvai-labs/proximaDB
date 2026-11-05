@@ -53,6 +53,9 @@ the cache policy:
 collection property > server [storage.compaction_config] > code default
 ```
 
+(As designed. Background consolidate is refused — TD-COMPACT-16 — so this
+chain is not live; see the status banner.)
+
 | value | behavior | best for |
 |---|---|---|
 | `hybrid` (default) | current leveled policy | write-heavy |
@@ -137,7 +140,13 @@ would rewrite the entire 1 TB on every flush. The guardrail:
   degrade to `hybrid` for that collection
 * The degradation is reported in the collection's status
 
-=== Property surface — as implemented (#2407 + this PR)
+=== Property surface — as designed (#2407); the background half is refused
+
+NOTE: this section records the background-consolidate resolution as it was
+designed and reviewed. That half is refused (TD-COMPACT-16): today the
+server layer below is never consulted and `consolidate` is refused at every
+door. See "Surfaces, AS SHIPPED" further down for live behaviour.
+
 
 Resolution is a 4-layer chain resolved by one pure function
 (`resolve_effective_strategy`: property > tag > server > code). An
@@ -200,36 +209,30 @@ compaction task alongside `full_target_segments`, then lifting the
 refusal in the same change; until then operators wanting a specific merge
 size must set the server value.
 
-SERVER-DEFAULT VISIBILITY (#2418 review round 8, the final design):
-`FlushParameters.collection_properties` is `Option`. `Some(map)` — the
-materializer built the plan from catalog meta, so the server
-`consolidate_strategy` applies to a collection that set nothing (an empty
-map). `None` — bulk-ingest, the WAL flush coordinator, recovery and VIPER
-never consult the catalog, so the server default is withheld there (an
-opt-out would be invisible) and the code default (hybrid) applies; an
-explicit strategy TAG still decides on every path. Rounds 5-7 inferred
-"consulted" from map emptiness and then from tags, which either left the
-server default inert for every property-less collection or applied it over
-invisible opt-outs. The decision is the pure `flush_compaction_strategy`,
-table-tested.
+SERVER-DEFAULT VISIBILITY (history, superseded by TD-COMPACT-16):
+rounds 5-8 built a server `consolidate_strategy` default and made
+`FlushParameters.collection_properties` an `Option` so it applied only where
+the catalog had been consulted. Background consolidate is now refused, so
+that server layer and its decision function are gone; the `Option` carrier
+stays as TD-COMPACT-16's prerequisite (F7).
 
-Surfaces:
-* `ALTER TABLE t SET ('compaction.strategy' = 'consolidate')` — validated
-  at SET time (`compaction.target_file_size_mb` is refused, see above)
-  (`validate_compaction_properties`), resolved at flush
-* Collection tag `compaction.strategy:consolidate` (legacy channel)
-* NOT YET A WRITE PATH (found by the #2418 review round 4): `PATCH
-  /collections/{id}/properties` is a stub — `update_collection_properties`
-  logs "merge + catalog write not yet wired; returning input" and returns
-  the request unchanged, so a `PATCH` of `compaction.strategy` answers 200
-  with the key echoed back while `schema.properties` is untouched and the
-  flush resolver never sees it. `POST /collections`'s `properties` field is
-  likewise declared and never read. Until those are wired, **`ALTER TABLE
-  … SET` is the only surface that reaches `schema.properties`** — do not
-  document the REST doors as live.
-* Server TOML: `consolidate_strategy`, `consolidate_target_file_size_mb`,
-  `consolidate_write_amp_limit` — all validated fail-closed at config
-  load (below)
+Surfaces, AS SHIPPED:
+* `COMPACT TABLE t [FULL]`, REST `POST /collections/{id}/compact` and the
+  Flight `compact_collection` action, with optional `target_segments` — the
+  live surface.
+* `ALTER TABLE t SET (...)` / `CREATE TABLE ... WITH (...)` — validate
+  `compaction.*`: `compaction.strategy = 'hybrid'` is accepted; `'consolidate'`
+  and `compaction.target_file_size_mb` are REFUSED, each naming the reason.
+* Collection tag `compaction.strategy:consolidate` — not validated at create;
+  it runs hybrid with a once-per-collection WARN.
+* REST `PATCH /collections/{id}/properties` and `POST /collections`
+  `properties` persist nothing on this branch (stubs); #2419 makes both fail
+  closed.
+* Server TOML: `consolidate_target_file_size_mb` (read by the FULL merge's
+  grouping; 0 fails boot); `consolidate_strategy = "consolidate"` fails boot;
+  `consolidate_strategy = "hybrid"` and `consolidate_write_amp_limit` are
+  accepted with a deprecation WARN (they shipped as settings in #2407, so
+  refusing them would break upgrades).
 
 NOTE: the legacy `[storage.compaction_config] strategy` field is the
 count|size level heuristic (`compaction_utils.rs`). Since this PR it is
