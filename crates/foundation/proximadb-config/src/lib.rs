@@ -1083,6 +1083,15 @@ impl CompactionConfig {
         // by the removed trigger) shipped as accepted settings in #2407, so
         // failing boot on them would turn an upgrade into an outage: they are
         // warned about instead (#2418 review round 13).
+        // full_target_segments = 0 is the same knob-silently-rewritten
+        // hazard the four Some(0) doors (REST, Flight, trait seam, engine)
+        // reject: `.max(1)` would collapse every bare FULL to 1 while the
+        // operator believes they stated 0 (#2418 review round 20).
+        if self.full_target_segments == 0 {
+            return Err(format!(
+                "{section}.full_target_segments must be >= 1 (got 0)"
+            ));
+        }
         if let Some(strategy) = &self.consolidate_strategy {
             let value = strategy.trim().to_ascii_lowercase();
             if value == "consolidate" {
@@ -1497,6 +1506,37 @@ mod tests {
         );
     }
     use super::*;
+
+    /// #2418 review round 20: a config-level `full_target_segments = 0` was
+    /// silently clamped to 1 by `.max(1)` — the knob-silently-rewritten
+    /// hazard the four per-request `Some(0)` doors (REST, Flight, the trait
+    /// seam, the engine) all refuse. It must fail boot like they do.
+    #[test]
+    fn config_level_full_target_segments_zero_fails_boot() {
+        let config = CompactionConfig {
+            full_target_segments: 0,
+            ..Default::default()
+        };
+        let error = config
+            .validate("storage.compaction_config")
+            .expect_err("a zero config target must not be silently clamped to 1");
+        assert!(error.contains("full_target_segments"), "{error}");
+        assert!(error.contains(">= 1"), "{error}");
+        // The shipped default (and any positive value) still validates.
+        assert!(
+            CompactionConfig::default()
+                .validate("storage.compaction_config")
+                .is_ok()
+        );
+        assert!(
+            CompactionConfig {
+                full_target_segments: 3,
+                ..Default::default()
+            }
+            .validate("storage.compaction_config")
+            .is_ok()
+        );
+    }
 
     #[test]
     fn compaction_strategy_validation_fails_closed() {

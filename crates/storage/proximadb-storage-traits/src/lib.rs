@@ -737,9 +737,10 @@ pub trait UnifiedStorageFormat: Send + Sync {
     }
 
     /// Whether this engine implements the cross-level FULL collapse (and so
-    /// honours `full` / `full_target_segments`). Engines without it keep the
-    /// single-pass semantics of [`Self::compact_collection`]; the default is
-    /// `false` so a new engine cannot silently accept the knob.
+    /// honours `full` / `full_target_segments`). Engines WITHOUT it get
+    /// `full: true` REFUSED by `compact_collection_full` — fail closed, no
+    /// silent fallback to a plain pass; the default is `false` so a new
+    /// engine cannot silently accept the knob.
     fn supports_full_compaction(&self) -> bool {
         false
     }

@@ -476,3 +476,18 @@ request_total for a plain compaction whose bytes are the top-level
 canonical fields. The refused-consolidate WARNED set is bounded (clears at
 1024 URLs). F5 (500 for seam refusals) was raised again and stays filed —
 reachable only on non-SST engines today.
+
+Round 20 (#2418, on the rebased final head): the loop-top live-count
+stagnation break is REMOVED — a flat count with passes completing means
+concurrent ingest is offsetting the merges (the collapse is working; run to
+max_passes/deadline), and the same break shadowed the schedule-time
+"contended" reason; completions (journal or eviction-inferred) now reset
+the contention counter, and only the schedule-false branch produces
+"contended". bound_follow_up_to_floor gathers the kept sizes BEFORE
+mutating the task, so an Err leaves it untouched (truncation-then-lookup
+left a torn task: the retry scheduled a 2-input morsel with the 4-input
+byte sum, and the promotion fallback narrowed a list that may have lost
+the untrained input). Config-level full_target_segments = 0 fails boot
+(.max(1) was the knob-silently-rewritten hazard the four Some(0) doors
+reject). supports_full_compaction's doc states the fail-closed contract.
+F4 (re-LIST per follow-up) stays filed as F8.

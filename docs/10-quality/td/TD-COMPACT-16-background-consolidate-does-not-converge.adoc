@@ -65,3 +65,13 @@ Background consolidate is **refused** rather than shipped non-convergent:
 4. Gate the re-enable on a convergence test (a settled L1+ ladder reaches
    the target within N flushes and then stays quiet) plus the write-amp
    guardrail, then lift the three refusals in the same change.
+
+== Round-20 notes (#2418)
+
+The refusal NOTICE is path-dependent: the once-per-collection WARN fires
+only on flush paths that LOAD catalog properties (materializer,
+auto-flush). Bulk-ingest, the WAL flush coordinator and recovery carry
+`collection_properties: None` (the opt-out would be invisible there), so a
+stored consolidate property on a collection flushed only through those
+paths downgrades to hybrid SILENTLY. Closing this needs the same carrier
+as item 2 below — noted here so the gap is visible, not discovered.

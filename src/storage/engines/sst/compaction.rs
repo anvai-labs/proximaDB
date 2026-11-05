@@ -1449,17 +1449,16 @@ impl Compaction {
         let mut segments_before: Option<usize> = None;
         let mut passes = 0usize;
         let mut no_progress_rounds = 0usize;
-        // #2418 review round 17: progress is measured from the LIVE COUNT,
-        // not from the pass-outcome journal. The journal is bounded (64) and
-        // shared with every background morsel in the process, so on a busy
-        // server a FULL pass's entry can be EVICTED between insert and take —
-        // reading that as "no progress" stopped collapses early with a false
-        // no_progress and under-counted the pass provenance. A journal miss
-        // after quiescence is an eviction artifact: the pass RAN (it was
-        // scheduled and the system quiesced), so it counts, and stagnation is
-        // detected where it is actually observable — the live count.
-        let mut prev_live = usize::MAX;
-        let mut no_drop_rounds = 0usize;
+        // #2418 review rounds 17+20 on progress detection: a journal miss
+        // after quiescence is an EVICTION artifact (the journal is bounded at
+        // 64 and shared process-wide) — the pass ran, so it counts. Round 17
+        // also broke on a flat LIVE COUNT, but a flat count with passes
+        // completing means concurrent ingest is offsetting the merges — the
+        // collapse is working and should continue to max_passes/deadline, not
+        // stop early with a false no_progress (and that same break shadowed
+        // the schedule-time "contended" reason). So: completions (journal or
+        // eviction-inferred) reset the contention counter, and only the
+        // schedule-false branch produces "contended".
         let stop_reason = loop {
             let files = discovery
                 .discover_compactable_files(
@@ -1481,17 +1480,6 @@ impl Compaction {
             if segments_before.is_none() {
                 segments_before = Some(live + pending);
             }
-            // Genuine stagnation: passes are being scheduled and quiescing,
-            // yet the live count is not coming down.
-            if live >= prev_live {
-                no_drop_rounds += 1;
-                if no_drop_rounds >= 3 {
-                    break Some("no_progress");
-                }
-            } else {
-                no_drop_rounds = 0;
-            }
-            prev_live = live;
             if live <= target {
                 // At target, but AXIS-pending segments would push past it once
                 // their rebuild publishes: report why the count can still move.
@@ -1784,24 +1772,27 @@ impl Compaction {
             // 14-15: same size floor as the flush trigger).
             return Ok(self.narrow_to_promotion_candidate(follow_up).await);
         }
-        follow_up.input_files.truncate(keep);
-        // A kept input missing from THIS discovery must not count as 0 bytes:
-        // a 0 under-states the merge input and lets memory admission reserve
-        // for less than will be read — the condition admission exists to
-        // prevent (#2418 review round 17). Treat it as a transient discovery
-        // mismatch (the caller's error path: the promotion falls back to the
-        // per-file picker, a plain merge is retried/skipped).
-        let mut sum = 0u64;
-        for path in &follow_up.input_files {
+        // Gather the kept sizes BEFORE mutating the task, so an Err leaves
+        // it untouched: round 20's truncation-then-lookup left a torn task
+        // (truncated inputs + the pre-truncation byte sum) for both caller
+        // fallbacks to act on — the retry saw cap == len and scheduled the
+        // morsel with the untrimmed sum (admission over-reserved), and the
+        // promotion fallback narrowed an already-truncated list that may
+        // have lost the untrained input.
+        let mut kept_sizes = Vec::with_capacity(keep);
+        for path in follow_up.input_files.iter().take(keep) {
             let Some(size) = sizes.get(&path.to_string_lossy().to_string()).copied() else {
+                // Also not 0 bytes: a 0 under-states the merge input and
+                // lets admission under-reserve (#2418 review round 17).
                 return Err(crate::core::StorageError::SstEngine(format!(
                     "input {} missing from the floor discovery",
                     path.display()
                 )));
             };
-            sum += size;
+            kept_sizes.push((path.clone(), size));
         }
-        follow_up.input_bytes = sum;
+        follow_up.input_files = kept_sizes.iter().map(|(p, _)| p.clone()).collect();
+        follow_up.input_bytes = kept_sizes.iter().map(|(_, s)| s).sum();
         Ok(true)
     }
 
