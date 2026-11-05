@@ -4088,7 +4088,8 @@ def main() -> int:
                 full=True,
                 target_segments=args.compact_full_target_segments,
             )
-            geometry = settle(args.compact_full_target_segments or args.max_segments)
+            # The two are equal (enforced at parse time), so settle on the one.
+            geometry = settle(args.max_segments)
             result["compact_full_before_measure"] = {
                 "before": before,
                 "action": action,
@@ -4098,7 +4099,10 @@ def main() -> int:
                 # training promotion. This records how often it happened; the
                 # trained-geometry check below (every segment must carry a
                 # coarse A0 directory) is what actually refuses an untrained
-                # arm, whatever pinned the target.
+                # arm, whatever pinned the target. The counter carries no
+                # collection label, so the delta is exact only because this
+                # harness drives ONE collection on a server it owns; another
+                # collection compacting concurrently would inflate it.
                 "training_promotions_suppressed": (
                     training_promotions_suppressed(server_url) - suppressed_before
                 ),

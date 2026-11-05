@@ -694,7 +694,9 @@ async fn materialize_collection_with_coordinator_mode(
         collection_config: Some(collection_config),
         // TD-COMPACT-15: policy properties ride the flush so the
         // compaction-strategy resolver sees the property channel.
-        collection_properties: plan.properties.clone(),
+        // The plan is built from catalog meta, so its properties are
+        // LOADED (an empty map = the collection set none).
+        collection_properties: Some(plan.properties.clone()),
         ..Default::default()
     };
 

@@ -146,7 +146,7 @@ mod raptor_recall_tests {
             trigger_compaction: false,
             collection_config: Some(collection.clone()),
             estimated_size: 1024 * 1024 * 100, // 100MB estimate
-            collection_properties: std::collections::HashMap::new(),
+            collection_properties: None,
         };
 
         let insert_start = std::time::Instant::now();

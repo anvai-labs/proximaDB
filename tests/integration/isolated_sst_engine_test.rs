@@ -563,7 +563,7 @@ async fn test_isolated_sst_concurrent_read_operations() -> Result<()> {
         trigger_compaction: false,
         batch_ids: vec![],
         estimated_size: num_vectors * 1024,
-        collection_properties: std::collections::HashMap::new(),
+        collection_properties: None,
     };
 
     let flush_result = engine.do_flush(&flush_params).await?;
@@ -661,7 +661,7 @@ async fn test_isolated_sst_data_persistence_across_restarts() -> Result<()> {
             trigger_compaction: false,
             batch_ids: vec![],
             estimated_size: 1024 * original_vectors.len(), // Rough estimate
-            collection_properties: std::collections::HashMap::new(),
+            collection_properties: None,
         };
         let result = engine.do_flush(&flush_params).await?;
         assert!(result.success, "Flush should succeed");
@@ -749,7 +749,7 @@ async fn test_isolated_sst_multi_collection_data_isolation() -> Result<()> {
             trigger_compaction: false,
             batch_ids: vec![],
             estimated_size: 1024 * vectors.len(), // Rough estimate
-            collection_properties: std::collections::HashMap::new(),
+            collection_properties: None,
         };
         let result = engine.do_flush(&flush_params).await?;
         assert!(result.success, "Flush should succeed");
@@ -903,7 +903,7 @@ async fn test_isolated_sst_multiple_distance_metrics() -> Result<()> {
         trigger_compaction: false,
         batch_ids: vec![],
         estimated_size: 1024 * vectors.len(), // Rough estimate
-        collection_properties: std::collections::HashMap::new(),
+        collection_properties: None,
     };
     let result = engine.do_flush(&flush_params).await?;
     assert!(result.success, "Flush should succeed");
@@ -1043,7 +1043,7 @@ async fn test_isolated_sst_large_dataset_performance() -> Result<()> {
             trigger_compaction: false,
             batch_ids: vec![],
             estimated_size: 1024 * vectors.len(), // Rough estimate
-            collection_properties: std::collections::HashMap::new(),
+            collection_properties: None,
         };
         let result = engine.do_flush(&flush_params).await?;
         assert!(result.success, "Flush should succeed");

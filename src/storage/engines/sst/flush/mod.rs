@@ -83,6 +83,48 @@ pub fn init_server_compaction_config(cfg: Option<&crate::core::config::Compactio
 fn effective_consolidate_knobs(
     engine: Option<&crate::core::config::CompactionConfig>,
 ) -> (Option<String>, u64, u64) {
+    let installed = SHARED_COMPACTION_CONFIG.read().ok();
+    consolidate_knobs_from(engine, installed.as_ref().and_then(|g| g.as_ref()))
+}
+
+/// The flush-side strategy decision (TD-COMPACT-15), as a pure function.
+///
+/// Precedence: collection property > operator tag > server default > code
+/// default (hybrid). The server default is consulted ONLY when the catalog
+/// was consulted (`loaded_properties = Some`): an empty map then means the
+/// collection set nothing, so the operator's default is the right answer,
+/// while `None` means this flush path never looked, so an opt-out would be
+/// invisible and the broader server default is withheld.
+///
+/// Rounds 5-7 of the #2418 review inferred "consulted" from map emptiness or
+/// tags, which either left the server default inert for every
+/// property-less collection or applied it over invisible opt-outs; the
+/// `Option` makes the distinction a fact instead of a heuristic.
+fn flush_compaction_strategy(
+    loaded_properties: Option<&std::collections::HashMap<String, String>>,
+    tags: &[String],
+    server_strategy: Option<&str>,
+) -> proximadb_storage_common::CompactionStrategy {
+    let empty = std::collections::HashMap::new();
+    proximadb_storage_common::resolve_effective_strategy(
+        loaded_properties.unwrap_or(&empty),
+        tags,
+        loaded_properties.and(server_strategy),
+    )
+}
+
+/// The PURE resolution behind [`effective_consolidate_knobs`]: the engine's
+/// own config, else the installed server config, else the code defaults.
+///
+/// Split out so tests exercise the precedence WITHOUT touching the
+/// process-global install (#2418 review round 8): mutating it from a test
+/// raced sibling `should_trigger_compaction` tests under the shared-process
+/// `cargo test` fallback, and a drop guard only narrowed that window
+/// (mandate #11).
+fn consolidate_knobs_from(
+    engine: Option<&crate::core::config::CompactionConfig>,
+    installed: Option<&crate::core::config::CompactionConfig>,
+) -> (Option<String>, u64, u64) {
     let pick = |cfg: &crate::core::config::CompactionConfig| {
         (
             cfg.consolidate_strategy.clone(),
@@ -90,23 +132,9 @@ fn effective_consolidate_knobs(
             cfg.consolidate_write_amp_limit_or_default(),
         )
     };
-    if let Some(cfg) = engine {
-        return pick(cfg);
-    }
-    if let Ok(g) = SHARED_COMPACTION_CONFIG.read()
-        && let Some(cfg) = g.as_ref()
-    {
-        return pick(cfg);
-    }
-    pick(&crate::core::config::CompactionConfig::default())
-}
-
-/// Test-only: drop the authoritative install so a test cannot leak its
-/// config into later tests sharing the process (the libtest fallback).
-#[cfg(test)]
-fn reset_server_compaction_config() {
-    if let Ok(mut g) = SHARED_COMPACTION_CONFIG.write() {
-        *g = None;
+    match engine.or(installed) {
+        Some(cfg) => pick(cfg),
+        None => pick(&crate::core::config::CompactionConfig::default()),
     }
 }
 
@@ -962,7 +990,7 @@ impl SstEngine {
             self.should_trigger_compaction(
                 storage_url,
                 collection_tags,
-                &params.collection_properties,
+                params.collection_properties.as_ref(),
             )
             .await?
         };
@@ -1199,79 +1227,26 @@ impl SstEngine {
         &self,
         storage_url: &str,
         tags: &[String],
-        properties: &std::collections::HashMap<String, String>,
+        loaded_properties: Option<&std::collections::HashMap<String, String>>,
     ) -> Result<Option<usize>> {
         if !proximadb_storage_common::resolve_compaction_armed(tags) {
             return Ok(None);
         }
-        // TD-COMPACT-15: the consolidate strategy targets a file count
-        // derived from total_bytes / target_file_size_mb, not an L0
-        // threshold. When the live segment count exceeds that target,
-        // compaction fires immediately (the greedy smallest-first group in
-        // compact_collection_full does the merge). The chain is resolved by
-        // one pure function: collection PROPERTY > operator tag > server
-        // TOML `consolidate_strategy` > code default (hybrid) — an explicit
-        // `hybrid` anywhere above beats a consolidate default below it.
-        // Read the two policy fields by reference — the default hybrid path
-        // must not pay a full CompactionConfig clone per flush trigger.
-        // A `None` compaction_config is the PRODUCTION shape (every
-        // `SstConfig::default()` construction: factory, `SstEngine::new`,
-        // legacy ops), not a test artifact. Falling back to zeros here made
-        // `target_mb` 1 MiB and the write-amp limit 0 — so consolidate was
-        // always "at target" and never fired, and it disagreed with
-        // `compact_collection_full`'s `unwrap_or_default()` (512 MiB). The
-        // numeric fallbacks must be the real config defaults; the default
-        // struct is built only on the None path, so the common path still
-        // does not allocate.
-        // Resolve against the engine's config when it has one, else the
-        // authoritative server install — `SstEngine::new()` (the production
-        // flush engine) carries none, so reading only `self.config()` made
-        // every `[storage.compaction_config]` consolidate knob dead config.
-        let (server_strategy_owned, server_target_mb, write_amp_limit) =
+        // TD-COMPACT-15: the consolidate strategy targets a file count derived
+        // from total bytes / the server's consolidate target, not an L0
+        // threshold. The knobs come from the engine's own config, else the
+        // authoritative server install (the production flush engine is built
+        // from `SstConfig::default()` and carries none), else code defaults.
+        let (server_strategy, server_target_mb, write_amp_limit) =
             effective_consolidate_knobs(self.config().compaction_config.as_ref());
-        // TD-COMPACT-15 (#2418 review round 5): only the materializer flush
-        // carries `collection_properties`; bulk-ingest, the WAL flush
-        // coordinator, both recovery sites, the document service and the
-        // multimodel facade all pass an empty map. Applying a server
-        // `consolidate_strategy` there would INVERT the precedence — a
-        // collection that explicitly opted out with
-        // `compaction.strategy = 'hybrid'` is honoured on a materializer
-        // flush and silently overridden on a recovery flush, getting the
-        // whole-collection rewrites the operator disabled.
-        //
-        // So the server default applies only where the opt-out is VISIBLE.
-        // With no properties and no tags we cannot distinguish "did not opt
-        // out" from "we cannot see it", and the conservative answer is the
-        // code default (hybrid) — never the broader rewrite.
-        // "Any tag" was the WRONG proxy (#2418 review round 6): `tags` comes
-        // from `collection_config` and is populated on EVERY flush path,
-        // while `properties` is populated only by the materializer. So a
-        // collection carrying any unrelated tag (a tier policy, a WLP
-        // profile) satisfied the guard on a recovery flush where the property
-        // opt-out was still invisible — leaving it protecting only
-        // collections with zero tags, which is not the set it documents.
-        //
-        // The channels are independent, so test each for what it can
-        // actually say: properties are visible when non-empty, and the tag
-        // channel counts only when it explicitly STATES a strategy.
-        // Decided by the SAME parse resolution uses: a looser prefix test
-        // let a miscased/garbage tag count as visible while resolving to
-        // nothing, so the server default overrode the opt-out.
-        let tags_state_a_strategy = proximadb_storage_common::tags_state_compaction_strategy(tags);
-        let opt_out_visible = !properties.is_empty() || tags_state_a_strategy;
-        let server_strategy = if opt_out_visible {
-            server_strategy_owned.as_deref()
-        } else {
-            if server_strategy_owned.is_some() {
-                tracing::debug!(
-                    storage_url = %storage_url,
-                    "TD-COMPACT-15: server consolidate_strategy not applied — this flush path carries no collection properties, so a per-collection opt-out would be invisible; falling back to the code default"
-                );
-            }
-            None
-        };
+        if loaded_properties.is_none() && server_strategy.is_some() {
+            tracing::debug!(
+                storage_url = %storage_url,
+                "TD-COMPACT-15: server consolidate_strategy not applied — this flush path never consulted the catalog, so a per-collection opt-out would be invisible"
+            );
+        }
         let strategy =
-            proximadb_storage_common::resolve_effective_strategy(properties, tags, server_strategy);
+            flush_compaction_strategy(loaded_properties, tags, server_strategy.as_deref());
         if strategy == proximadb_storage_common::CompactionStrategy::Consolidate {
             crate::metrics::operational_metrics::CONSOLIDATE_CHECKS.inc();
             // Target: the SERVER value only. The per-collection
@@ -2086,38 +2061,74 @@ mod tests {
     /// dead config on the path that actually flushes. The authoritative
     /// server install must be what a `None` engine config falls back to —
     /// not the code defaults.
+    /// #2418 review round 8: a server `consolidate` default must reach an
+    /// ordinary property-less collection on the materializer path, and must
+    /// NOT be applied on a path that never consulted the catalog.
+    #[test]
+    fn server_default_applies_exactly_when_the_catalog_was_consulted() {
+        use proximadb_storage_common::CompactionStrategy::{Consolidate, Hybrid};
+        let none_set = std::collections::HashMap::new();
+        let opted_out: std::collections::HashMap<String, String> =
+            [("compaction.strategy".to_string(), "hybrid".to_string())].into();
+        let no_tags: Vec<String> = Vec::new();
+        let unrelated_tags = vec!["tier:hot".to_string()];
+        let server = Some("consolidate");
+
+        // Loaded, collection set nothing -> the operator's default applies.
+        // (Rounds 5-7 returned Hybrid here: the headline knob was inert.)
+        assert_eq!(
+            flush_compaction_strategy(Some(&none_set), &no_tags, server),
+            Consolidate
+        );
+        // ...and unrelated tags do not change that.
+        assert_eq!(
+            flush_compaction_strategy(Some(&none_set), &unrelated_tags, server),
+            Consolidate
+        );
+        // Loaded, collection opted out -> the opt-out wins.
+        assert_eq!(
+            flush_compaction_strategy(Some(&opted_out), &no_tags, server),
+            Hybrid
+        );
+        // Never consulted -> withheld, whatever the tags say about other things.
+        assert_eq!(flush_compaction_strategy(None, &no_tags, server), Hybrid);
+        assert_eq!(
+            flush_compaction_strategy(None, &unrelated_tags, server),
+            Hybrid
+        );
+        // An explicit strategy TAG is visible on every path, so it still decides.
+        let consolidate_tag = vec!["compaction.strategy:consolidate".to_string()];
+        assert_eq!(
+            flush_compaction_strategy(None, &consolidate_tag, None),
+            Consolidate
+        );
+        // No server default -> code default.
+        assert_eq!(
+            flush_compaction_strategy(Some(&none_set), &no_tags, None),
+            Hybrid
+        );
+    }
+
     #[test]
     fn server_compaction_config_reaches_an_engine_that_carries_none() {
-        // Before any install, a None engine config yields the code defaults.
+        // Exercises the PURE resolver: no process-global install is read or
+        // written, so this cannot race sibling trigger tests (mandate #11).
         let defaults = crate::core::config::CompactionConfig::default();
-        let (before_strategy, before_target, _) = effective_consolidate_knobs(None);
+        let (before_strategy, before_target, _) = consolidate_knobs_from(None, None);
         assert_eq!(
             before_target,
             defaults.consolidate_target_file_size_mb_or_default()
         );
         assert!(before_strategy.is_none());
 
-        // Install an operator config the way `ProximaDB::start` does.
+        // An installed operator config reaches an engine that carries none.
         let server = crate::core::config::CompactionConfig {
             consolidate_strategy: Some("consolidate".to_string()),
             consolidate_target_file_size_mb: Some(4096),
             consolidate_write_amp_limit: Some(7),
             ..Default::default()
         };
-        init_server_compaction_config(Some(&server));
-        // The install is process-wide: leaking it would push sibling tests
-        // that build a config-free engine onto the consolidate branch under
-        // the shared-process libtest fallback. Reset before every return.
-        struct ResetOnDrop;
-        impl Drop for ResetOnDrop {
-            fn drop(&mut self) {
-                reset_server_compaction_config();
-            }
-        }
-        let _reset = ResetOnDrop;
-
-        // A None engine config now resolves the OPERATOR's values.
-        let (strategy, target, limit) = effective_consolidate_knobs(None);
+        let (strategy, target, limit) = consolidate_knobs_from(None, Some(&server));
         assert_eq!(strategy.as_deref(), Some("consolidate"));
         assert_eq!(target, 4096);
         assert_eq!(limit, 7);
@@ -2127,7 +2138,7 @@ mod tests {
             consolidate_target_file_size_mb: Some(128),
             ..Default::default()
         };
-        assert_eq!(effective_consolidate_knobs(Some(&engine)).1, 128);
+        assert_eq!(consolidate_knobs_from(Some(&engine), Some(&server)).1, 128);
     }
 
     use crate::storage::engines::sst::SstConfig;
@@ -2594,7 +2605,7 @@ mod tests {
             batch_ids: vec![],
             collection_config: Some(collection),
             estimated_size: 0,
-            collection_properties: std::collections::HashMap::new(),
+            collection_properties: None,
         };
 
         let result = engine
@@ -2743,7 +2754,7 @@ mod tests {
             batch_ids: vec![],
             collection_config: Some(collection),
             estimated_size: 0,
-            collection_properties: std::collections::HashMap::new(),
+            collection_properties: None,
         };
 
         let first = engine
@@ -2866,7 +2877,7 @@ mod tests {
             batch_ids: vec![],
             collection_config: Some(collection),
             estimated_size: 0,
-            collection_properties: std::collections::HashMap::new(),
+            collection_properties: None,
         };
         let result = engine
             .do_flush(&params)
@@ -2938,7 +2949,11 @@ mod tests {
         );
         assert_eq!(
             engine
-                .should_trigger_compaction(storage_url, &tags, &std::collections::HashMap::new())
+                .should_trigger_compaction(
+                    storage_url,
+                    &tags,
+                    Some(&std::collections::HashMap::new())
+                )
                 .await
                 .unwrap(),
             Some(1),
@@ -2958,7 +2973,11 @@ mod tests {
         );
         assert_eq!(
             engine
-                .should_trigger_compaction(storage_url, &tags, &std::collections::HashMap::new())
+                .should_trigger_compaction(
+                    storage_url,
+                    &tags,
+                    Some(&std::collections::HashMap::new())
+                )
                 .await
                 .unwrap(),
             Some(L0_COMPACTION_THRESHOLD),
@@ -2980,7 +2999,11 @@ mod tests {
             .insert(storage_url.to_string());
         assert_eq!(
             engine
-                .should_trigger_compaction(storage_url, &tags, &std::collections::HashMap::new())
+                .should_trigger_compaction(
+                    storage_url,
+                    &tags,
+                    Some(&std::collections::HashMap::new())
+                )
                 .await
                 .unwrap(),
             Some(L0_COMPACTION_THRESHOLD)

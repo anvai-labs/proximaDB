@@ -192,9 +192,20 @@ reach and re-arm on every flush, which is why it is refused rather than
 half-honoured. Closing it means plumbing the resolved target into the
 compaction task alongside `full_target_segments`, then lifting the
 refusal in the same change; until then operators wanting a specific merge
-size must set the server value. Flush entry points without a catalog schema at
-hand (recovery, coordinator, embedded) degrade to the server/code
-defaults — graceful, never stale.
+size must set the server value.
+
+SERVER-DEFAULT VISIBILITY (#2418 review round 8, the final design):
+`FlushParameters.collection_properties` is `Option`. `Some(map)` — the
+materializer built the plan from catalog meta, so the server
+`consolidate_strategy` applies to a collection that set nothing (an empty
+map). `None` — bulk-ingest, the WAL flush coordinator, recovery and VIPER
+never consult the catalog, so the server default is withheld there (an
+opt-out would be invisible) and the code default (hybrid) applies; an
+explicit strategy TAG still decides on every path. Rounds 5-7 inferred
+"consulted" from map emptiness and then from tags, which either left the
+server default inert for every property-less collection or applied it over
+invisible opt-outs. The decision is the pure `flush_compaction_strategy`,
+table-tested.
 
 Surfaces:
 * `ALTER TABLE t SET ('compaction.strategy' = 'consolidate')` — validated
@@ -326,8 +337,8 @@ Verify the guardrail prevents the 1 TB rewrite catastrophe.
 The merge gate was set to "no correctness or mandate findings"
 (2026-11-05). Round 7's correctness items were fixed in-PR: the inert
 `compaction.target_file_size_mb` property is refused at the door; tag
-opt-out visibility uses the same parse as resolution (a miscased tag no
-longer lets the server default override an opt-out); the harness measures
+opt-out visibility was tightened (later superseded by the round-8
+`Option` carrier, see SERVER-DEFAULT VISIBILITY above); the harness measures
 promotion suppression instead of inferring it from a CLI flag; a stated 0
 for either consolidate knob fails boot; the suppression counter moves
 only on a successful pass. Filed, not fixed:
@@ -354,3 +365,12 @@ only on a successful pass. Filed, not fixed:
   Flight serializes the struct; REST `CompactResponse` and DDL
   `CompactSummary` copy all nine fields by hand, so a new field silently
   misses two surfaces. Embed with `#[serde(flatten)]` / hold the struct.
+
+Round 8 (#2418): the server default was inert for every property-less
+collection — fixed by the `Option` carrier above. Also fixed: the
+`compaction.target_file_size_mb` unknown-key hint no longer suggests a
+refused key; the dead `tags_state_compaction_strategy` helper and its doc
+slip are gone; the FULL `error` metric documents what it does not count;
+the dead-config regression test is now pure (no process-global mutation,
+mandate #11). F1 (partial section merge) and F3 (catalog property clones)
+were raised again and stay filed.

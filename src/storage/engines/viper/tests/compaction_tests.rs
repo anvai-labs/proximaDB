@@ -196,7 +196,7 @@ async fn test_insert_flush_compact_flow() {
             collection_id,
             temp_dir.path().to_str().unwrap(),
         )),
-        collection_properties: std::collections::HashMap::new(),
+        collection_properties: None,
     };
 
     let flush_result = engine
@@ -495,7 +495,7 @@ async fn test_basic_compaction() {
                 collection_id,
                 temp_dir.path().to_str().unwrap(),
             )),
-            collection_properties: std::collections::HashMap::new(),
+            collection_properties: None,
         };
         debug!("🔄 Flushing batch {} with {} vectors", batch, vector_count);
         let flush_result = engine.do_flush(&flush_params).await.unwrap();
@@ -908,7 +908,7 @@ async fn test_concurrent_compaction_and_reads() {
             collection_id,
             temp_dir.path().to_str().unwrap(),
         )),
-        collection_properties: std::collections::HashMap::new(),
+        collection_properties: None,
     };
     engine.do_flush(&flush_params).await.unwrap();
 
@@ -937,7 +937,7 @@ async fn test_concurrent_compaction_and_reads() {
                 collection_id,
                 temp_dir.path().to_str().unwrap(),
             )),
-            collection_properties: std::collections::HashMap::new(),
+            collection_properties: None,
         };
         engine.do_flush(&flush_params).await.unwrap();
     }
@@ -1096,7 +1096,7 @@ async fn test_concurrent_compaction_across_collections() {
             trigger_compaction: false,
             estimated_size: 1024 * 1024, // 1MB estimated
             collection_config: Some(collection.clone()),
-            collection_properties: std::collections::HashMap::new(),
+            collection_properties: None,
         };
         engine.do_flush(&flush_params).await.unwrap();
 
@@ -1121,7 +1121,7 @@ async fn test_concurrent_compaction_across_collections() {
                 trigger_compaction: false,
                 estimated_size: 1024 * 1024, // 1MB estimated
                 collection_config: Some(collection.clone()),
-                collection_properties: std::collections::HashMap::new(),
+                collection_properties: None,
             };
             engine.do_flush(&flush_params).await.unwrap();
         }
@@ -1231,7 +1231,7 @@ async fn test_atomic_coordinator_prevents_concurrent_same_collection_compaction(
         trigger_compaction: false,
         estimated_size: 1024 * 1024, // 1MB estimated
         collection_config: Some(collection.clone()),
-        collection_properties: std::collections::HashMap::new(),
+        collection_properties: None,
     };
     debug!(
         "⚡ Starting flush operation with {} vectors",
@@ -1424,7 +1424,7 @@ async fn test_size_tiered_compaction_strategy() {
                 collection_id,
                 temp_dir.path().to_str().unwrap(),
             )),
-            collection_properties: std::collections::HashMap::new(),
+            collection_properties: None,
         };
         engine.do_flush(&flush_params).await.unwrap();
     }
@@ -1560,7 +1560,7 @@ async fn test_compaction_with_metadata_filtering() {
             trigger_compaction: false,
             estimated_size: 1024 * 1024, // 1MB estimated
             collection_config: Some(collection),
-            collection_properties: std::collections::HashMap::new(),
+            collection_properties: None,
         };
         engine.do_flush(&flush_params).await.unwrap();
     }
@@ -1767,7 +1767,7 @@ async fn test_incremental_compaction() {
             trigger_compaction: false,
             estimated_size: 1024 * 1024, // 1MB estimated
             collection_config: Some(create_test_collection(collection_id, test_dir)),
-            collection_properties: std::collections::HashMap::new(),
+            collection_properties: None,
         };
 
         let flush_result = engine.do_flush(&flush_params).await.unwrap();

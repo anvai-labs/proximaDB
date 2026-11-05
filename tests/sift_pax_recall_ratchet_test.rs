@@ -372,7 +372,7 @@ async fn flush_batch(engine: &SstEngine, collection: &Collection, batch: Vec<Vec
         batch_ids: vec![],
         collection_config: Some(collection.clone()),
         estimated_size: 0,
-        collection_properties: std::collections::HashMap::new(),
+        collection_properties: None,
     };
     let result = engine.do_flush(&params).await.expect("flush succeeds");
     assert!(result.success, "flush should succeed");

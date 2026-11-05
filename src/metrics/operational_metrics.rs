@@ -253,8 +253,11 @@ lazy_static! {
     );
     /// TD-COMPACT-15: outcome of each COMPACT FULL request, by stop reason:
     /// `completed` (reached target with passes), `at_target` (no-op),
-    /// **`error`** (the request failed — declined, stalled, timed out; this
-    /// bucket is the reason the recording sits off the `?` path), else the
+    /// **`error`** (the FULL loop itself failed — stalled, timed out; this
+    /// bucket is the reason the recording sits off the `?` path; requests
+    /// refused BEFORE the loop starts — missing catalog meta, an unresolvable
+    /// collection, no compaction manager, a target_segments-without-full bail
+    /// — are not counted here, they surface as the API error), else the
     /// engine's stop reason: `max_passes` / `deadline` / `axis_pending` /
     /// `contended` / `no_progress`.
     pub static ref COMPACTION_FULL_STOP: Option<IntCounterVec> = counter_vec(

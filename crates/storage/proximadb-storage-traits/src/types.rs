@@ -56,11 +56,19 @@ pub struct FlushParameters {
     /// resolvers see the property channel without mutating the
     /// engine-facing Collection proto (which has no properties field —
     /// derived tags would leak into read-modify-write catalog saves).
-    /// Populated by the catalog walk at flush-plan build time; empty means
-    /// the server/code defaults apply (graceful degradation for
-    /// recovery/coordinator paths).
+    /// Populated by the catalog walk at flush-plan build time.
+    ///
+    /// `Option` so "loaded" is distinguishable from "not loaded" (#2418
+    /// review round 8): `Some(map)` — the catalog was consulted, and an EMPTY
+    /// map means the collection set nothing, so server defaults apply as
+    /// normal; `None` — this flush path never consulted the catalog
+    /// (bulk-ingest, the WAL flush coordinator, recovery, VIPER), so a
+    /// per-collection opt-out would be invisible and the server's broader
+    /// defaults must not be applied on its behalf. A bare `HashMap` forced
+    /// an emptiness heuristic that either left the server default inert for
+    /// every property-less collection or applied it over invisible opt-outs.
     #[serde(default)]
-    pub collection_properties: HashMap<String, String>,
+    pub collection_properties: Option<HashMap<String, String>>,
 
     /// Estimated size in bytes for metrics tracking
     pub estimated_size: usize,

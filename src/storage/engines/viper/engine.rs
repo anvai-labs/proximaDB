@@ -3157,7 +3157,7 @@ mod minimal_compaction_tests {
             trigger_compaction: false,
             collection_config,
             estimated_size: 1024, // 1KB estimated size
-            collection_properties: std::collections::HashMap::new(),
+            collection_properties: None,
         };
 
         let flush_result = engine.do_flush(&flush_params).await?;

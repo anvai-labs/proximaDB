@@ -83,7 +83,7 @@ async fn test_raptor_engine_creation_and_insertion() {
         trigger_compaction: false,
         collection_config: Some(collection),
         estimated_size: 1024 * 1024,
-        collection_properties: std::collections::HashMap::new(),
+        collection_properties: None,
     };
 
     let flush_result = raptor_engine.flush(flush_params).await.unwrap();

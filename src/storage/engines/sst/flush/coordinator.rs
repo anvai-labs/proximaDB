@@ -201,7 +201,7 @@ mod tests {
             timeout_ms: None,
             trigger_compaction: false,
             estimated_size: 0,
-            collection_properties: std::collections::HashMap::new(),
+            collection_properties: None,
         };
 
         assert!(coordinator.validate_flush_parameters(&params).is_err());
