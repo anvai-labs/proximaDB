@@ -1868,6 +1868,12 @@ impl CoarseProbeConfig {
                 self.algorithm
             ));
         }
+        if !self.nprobe_multiplier.is_finite() || self.nprobe_multiplier <= 0.0 {
+            return Err(format!(
+                "{section}.nprobe_multiplier must be a positive finite number (got {})",
+                self.nprobe_multiplier
+            ));
+        }
         if self.base_mb == 0 || self.cap_mb != 0 && self.cap_mb < self.base_mb {
             return Err(format!(
                 "{section}.base_mb/cap_mb must be a positive base with cap >= base \

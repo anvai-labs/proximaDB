@@ -3694,6 +3694,7 @@ pub fn init_coarse_probe_settings(cfg: Option<&crate::core::config::CoarseProbeC
             }
         }
     }
+    COARSE_PROBE_GENERATION.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     if let Ok(mut cached) = RESOLVED_PROBE_POLICY.write() {
         *cached = None;
     }
@@ -3761,8 +3762,14 @@ pub(crate) fn coarse_probe_settings() -> CoarseProbeSettings {
 // scans are not free and this sits on the per-query probe path. Cleared
 // when settings re-seed so a test/authority rewrite re-resolves.
 static RESOLVED_PROBE_POLICY: std::sync::RwLock<
-    Option<proximadb_storage_common::probe_policy::ProbePolicy>,
+    Option<(u64, proximadb_storage_common::probe_policy::ProbePolicy)>,
 > = std::sync::RwLock::new(None);
+
+/// Bumped every time the coarse-probe settings are installed. The resolved
+/// policy is cached WITH the generation it was derived from, so a resolver
+/// that was in flight across a re-seed cannot store its stale value back
+/// (last-write-wins alone allowed exactly that).
+static COARSE_PROBE_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn warn_junk_env(name: &str, value: &str, expected: &str) {
     tracing::warn!(
@@ -3778,6 +3785,13 @@ fn warn_junk_env(name: &str, value: &str, expected: &str) {
 /// every other probe knob has), expressed as a [`ServerProbePolicy`] so
 /// resolution goes through the ONE exported path
 /// (`resolve_probe_policy`): no parallel hand-rolled resolver can drift.
+/// Bounded like the property and TOML paths: dev/test build with
+/// overflow-checks, so an unbounded MiB->bytes multiply would abort the
+/// query path (mandate #4); in release it wraps, and `mb = 2^44` would
+/// yield `cap_bytes = 0`, which resolution honours as the "no cap"
+/// sentinel — silently removing the cap a typo meant to set.
+const MAX_PROBE_MB: u64 = proximadb_storage_common::probe_policy::MAX_PROBE_BUDGET_MB as u64;
+
 fn env_probe_layer() -> proximadb_storage_common::probe_policy::ServerProbePolicy {
     let mut server = proximadb_storage_common::probe_policy::ServerProbePolicy::default();
     if let Ok(name) = std::env::var("PROXIMADB_PAX_READ_PROBE_ALGORITHM") {
@@ -3792,21 +3806,25 @@ fn env_probe_layer() -> proximadb_storage_common::probe_policy::ServerProbePolic
     }
     if let Ok(base) = std::env::var("PROXIMADB_PAX_READ_PROBE_BASE_MB") {
         match base.trim().parse::<u64>() {
-            Ok(mb) if mb > 0 => server.base_bytes = Some(mb * 1024 * 1024),
+            Ok(mb) if mb > 0 && mb <= MAX_PROBE_MB => {
+                server.base_bytes = Some(mb.saturating_mul(1024 * 1024))
+            }
             _ => warn_junk_env(
                 "PROXIMADB_PAX_READ_PROBE_BASE_MB",
                 &base,
-                "a positive integer",
+                "a positive integer of at most 1048576 (MiB)",
             ),
         }
     }
     if let Ok(cap) = std::env::var("PROXIMADB_PAX_READ_PROBE_CAP_MB") {
         match cap.trim().parse::<u64>() {
-            Ok(mb) if mb > 0 => server.cap_bytes = Some(mb * 1024 * 1024),
+            Ok(mb) if mb > 0 && mb <= MAX_PROBE_MB => {
+                server.cap_bytes = Some(mb.saturating_mul(1024 * 1024))
+            }
             _ => warn_junk_env(
                 "PROXIMADB_PAX_READ_PROBE_CAP_MB",
                 &cap,
-                "a positive integer",
+                "a positive integer of at most 1048576 (MiB)",
             ),
         }
     }
@@ -3843,17 +3861,23 @@ fn settings_policy(s: &CoarseProbeSettings) -> proximadb_storage_common::probe_p
 }
 
 fn cached_probe_policy() -> proximadb_storage_common::probe_policy::ProbePolicy {
+    let generation = COARSE_PROBE_GENERATION.load(std::sync::atomic::Ordering::Acquire);
     if let Ok(g) = RESOLVED_PROBE_POLICY.read()
-        && let Some(policy) = g.as_ref()
+        && let Some((cached_generation, policy)) = g.as_ref()
+        && *cached_generation == generation
     {
         return policy.clone();
     }
     let resolved = settings_policy(&coarse_probe_settings());
     if let Ok(mut g) = RESOLVED_PROBE_POLICY.write() {
-        // Last write wins: concurrent resolvers compute the same policy from
-        // the same settings, and a store must never be able to pin a value
-        // derived from settings that have since been replaced.
-        *g = Some(resolved.clone());
+        // Store ONLY if the settings have not been re-seeded since we read
+        // them. Without this check a resolver that started before a re-seed
+        // could write back a policy derived from the old settings and pin
+        // it for the rest of the process — the TD-COMPACT-9 failure mode
+        // through a narrower window.
+        if COARSE_PROBE_GENERATION.load(std::sync::atomic::Ordering::Acquire) == generation {
+            *g = Some((generation, resolved.clone()));
+        }
     }
     resolved
 }
@@ -3882,6 +3906,7 @@ fn geometric_nprobe(
 
 /// Root-form compatibility shim: the historical two-argument call. Root forms
 /// are corpus/geometry-invariant, so the extra inputs are neutral defaults.
+#[cfg(test)]
 fn geometric_nprobe_root(k_c: usize) -> usize {
     geometric_nprobe(k_c, 0, 4 * 1024 * 1024, 0)
 }

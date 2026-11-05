@@ -635,7 +635,10 @@ fn cp_cfg(mult: f32) -> crate::core::config::CoarseProbeConfig {
 
 #[test]
 fn default_probe_quality_and_backend_ranges_match_sift_acceptance() {
-    init_coarse_probe_settings(None);
+    // Install the defaults AUTHORITATIVELY: `init_coarse_probe_settings(None)`
+    // is get_or_insert by design, so under the libtest fallback (one
+    // process) it would inherit whatever a previously-run test installed.
+    init_coarse_probe_settings(Some(&crate::core::config::CoarseProbeConfig::default()));
     assert_eq!(
         geometric_nprobe_root(30),
         11,

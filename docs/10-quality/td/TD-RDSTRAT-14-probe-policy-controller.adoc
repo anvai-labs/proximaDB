@@ -99,8 +99,13 @@ the planner plans in the unit the bill is written in.
 
 * **Collection-level `probe.*` properties** — land WITH the search-path
   property carrier (service-resolved properties into the search arc), in
-  the SAME PR so the keys are never accepted-but-inert. The chain
-  resolver + SET validation ship now, un-wired. KNOWN SCALING CAVEAT
+  the SAME PR so the keys are never accepted-but-inert. The chain resolver
+  and the value validator ship now; until the carrier lands every write
+  door (`CREATE`, `SET`, `PATCH`) **REFUSES** a `probe.*` property with an
+  error naming the knobs that do work (`[storage.sst_config.coarse_probe]`,
+  `PROXIMADB_PAX_READ_PROBE_*`). Accepting a key that cannot take effect is
+  the bug class the boundary exists to prevent, so the honest interim
+  answer is a refusal, not a silent success. KNOWN SCALING CAVEAT
   until then: the per-segment fallback path (filtered queries where
   `row_allow` is set, or pre-directorypublication) scales a byte_budget
   by SEGMENT rows — more probes than the collection-level plan takes,

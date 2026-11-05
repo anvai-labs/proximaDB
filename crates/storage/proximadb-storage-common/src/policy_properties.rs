@@ -35,7 +35,24 @@ pub fn validate_policy_properties(properties: &HashMap<String, String>) -> Resul
     proximadb_cache::policy::validate_cache_properties(properties)
         .map_err(|error| error.to_string())?;
     crate::compaction_strategy::validate_compaction_properties(properties)?;
+    // `probe.*` is validated for SHAPE (so the carrier work inherits a
+    // correct validator) but REFUSED at the door, because nothing consumes
+    // the property channel yet: `resolve_probe_policy` is only reached from
+    // the process-global settings path, which passes no properties. Storing
+    // a key that cannot take effect is the accepted-but-inert bug this
+    // boundary exists to prevent — so until the per-collection carrier
+    // lands (TD-RDSTRAT-14 "Deferred slices"), the honest answer to
+    // `SET ('probe.algorithm', …)` is a refusal that names the knob that
+    // does work, not a silent success.
     crate::probe_policy::validate_probe_properties(properties)?;
+    if let Some((key, _)) = properties
+        .iter()
+        .find(|(key, _)| key.trim().to_ascii_lowercase().starts_with("probe."))
+    {
+        return Err(format!(
+            "{key}: per-collection probe properties are not consumed yet              (TD-RDSTRAT-14 deferred the search-path carrier). Configure the              probe policy with [storage.sst_config.coarse_probe] or              PROXIMADB_PAX_READ_PROBE_* until it lands"
+        ));
+    }
     Ok(())
 }
 
@@ -59,10 +76,16 @@ mod tests {
             validate_policy_properties(&props(&[("compaction.strategy", "consolidat")])).is_err()
         );
         assert!(validate_policy_properties(&props(&[("probe.algorithm", "sqrt2")])).is_err());
+        // Even a SHAPE-VALID probe property is refused while the channel is
+        // unconsumed — accepting it would store an inert key.
+        let refusal = validate_policy_properties(&props(&[("probe.algorithm", "cbrt")]))
+            .expect_err("probe.* must be refused until the carrier lands");
+        assert!(refusal.contains("not consumed yet"), "{refusal}");
         assert!(
             validate_policy_properties(&props(&[("compaction.target_file_size_mb", "0")])).is_err()
         );
         assert!(validate_policy_properties(&props(&[("probe.base_mb", "nope")])).is_err());
+        assert!(validate_policy_properties(&props(&[("probe.base_mb", "8")])).is_err());
     }
 
     #[test]
@@ -72,8 +95,6 @@ mod tests {
                 ("cache.index.mode", "pin"),
                 ("compaction.strategy", "consolidate"),
                 ("compaction.target_file_size_mb", "1024"),
-                ("probe.algorithm", "byte_budget"),
-                ("probe.base_mb", "8"),
             ]))
             .is_ok()
         );

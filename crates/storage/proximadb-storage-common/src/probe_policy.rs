@@ -44,8 +44,9 @@ pub enum ProbeAlgorithm {
     /// `ceil(cells^0.25 × multiplier)` — the aggressive end of the root
     /// ladder.
     FourthRoot,
-    /// `ceil(log2(cells) × multiplier + log2(base_bytes))` — logarithmic
-    /// growth; the base budget scales the ladder's step.
+    /// `ceil(multiplier × log2(cells + 1))` — logarithmic growth. A PURE
+    /// cell-count form: `base_bytes` is deliberately NOT an input (adding a
+    /// byte magnitude to a cell count made this arm a silent full scan).
     Log,
     /// `min_cells` passthrough (clamped) — exact control arm.
     Fixed,
@@ -93,7 +94,8 @@ pub struct ProbePolicy {
     pub min_cells: usize,
     /// Ceiling on the probe count (TOML `nprobe_max`; 0 = unlimited).
     pub max_cells: usize,
-    /// Base per-query probe byte budget for `ByteBudget`/`Log` (bytes).
+    /// Base per-query probe byte budget for `ByteBudget` (bytes). The
+    /// root and `Log` forms are cell-count functions and ignore it.
     pub base_bytes: u64,
     /// Hard per-query probe byte cap (bytes; 0 = none). Note that `0` only
     /// removes this ADDITIONAL bound — a plan is still snapped to
@@ -139,7 +141,7 @@ pub struct ProbePlan {
 }
 
 /// The discrete band ladder, DERIVED from the rowgroup geometry:
-/// rungs `[rg/4, rg/2, rg, 2·rg, 4·rg]` filtered to sane bounds (sub-512 KiB
+/// rungs `[rg/4, rg/2, rg, 2·rg, 4·rg, 8·rg]` filtered to sane bounds (sub-512 KiB
 /// probes are pointless; unbounded above is fine — `cap_bytes` bounds).
 /// Band edges live HERE and nowhere else.
 pub fn band_ladder(rowgroup_bytes: u64) -> Vec<u64> {
@@ -240,7 +242,13 @@ pub fn resolve_probe_plan(
                 budget = budget.min(policy.cap_bytes as f64);
             }
             let snapped = snap_to_band(budget as u64, rowgroup_bytes, policy.cap_bytes).max(1);
-            let by_budget = ((snapped as f64) / (cell_bytes as f64)).ceil() as usize;
+            // FLOOR, not ceil: ceil let the plan exceed the cap by up to one
+            // cell (cap 1 MiB with 0.75 MiB cells planned 2 cells = 1.5 MiB,
+            // 50% over a cap the registry advertises as bounding the CELL
+            // COUNT). The floor can only underspend. One cell is the
+            // irreducible minimum, so a cap below one cell still probes one
+            // — the single documented overshoot.
+            let by_budget = ((snapped / cell_bytes.max(1)) as usize).max(1);
             // The recall floor (min_cells) can never exceed what the cap
             // affords: the CAP is the contract (it bounds fan-out), the
             // floor only raises the count when the budget has room.
@@ -354,7 +362,11 @@ pub fn resolve_probe_policy(
     if let Some(algorithm) = server.algorithm.as_deref().and_then(ProbeAlgorithm::parse) {
         policy.algorithm = algorithm;
     }
-    if let Some(multiplier) = server.multiplier.filter(|m| *m > 0.0) {
+    // A non-positive/non-finite multiplier is rejected at config load
+    // (`CoarseProbeConfig::validate`), so reaching here means a
+    // non-loader construction path; keep the shipped default rather than
+    // producing a zero/negative probe count.
+    if let Some(multiplier) = server.multiplier.filter(|m| *m > 0.0 && m.is_finite()) {
         policy.multiplier = multiplier;
     }
     // `Some(0)` is a documented SENTINEL on the server layer, not junk:
