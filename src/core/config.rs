@@ -1869,7 +1869,7 @@ impl CoarseProbeConfig {
         if let Some(algorithm) =
             proximadb_storage_common::probe_policy::ProbeAlgorithm::parse(&self.algorithm)
             && algorithm.is_experimental()
-            && !crate::storage::engines::sst::segment_format::probe_experimental_enabled()
+            && !proximadb_storage_common::probe_policy::experimental_algorithms_enabled()
         {
             return Err(format!(
                 "{section}.algorithm = \"{}\" is experimental (no recall@k eval gates it yet, mandate #13); set PROXIMADB_PAX_READ_PROBE_EXPERIMENTAL=1 for bench/staging use, or keep \"sqrt\"",

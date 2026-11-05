@@ -3849,8 +3849,7 @@ fn env_probe_layer() -> proximadb_storage_common::probe_policy::ServerProbePolic
 /// (`PROXIMADB_PAX_READ_PROBE_EXPERIMENTAL=1`; see
 /// `proximadb_storage_common::probe_policy::PROBE_EXPERIMENTAL_ENV`).
 pub(crate) fn probe_experimental_enabled() -> bool {
-    std::env::var(proximadb_storage_common::probe_policy::PROBE_EXPERIMENTAL_ENV)
-        .is_ok_and(|value| value.trim() == "1")
+    proximadb_storage_common::probe_policy::experimental_algorithms_enabled()
 }
 
 /// Fold the flat settings (the historical root-form params) into the
@@ -3878,8 +3877,21 @@ fn settings_policy(s: &CoarseProbeSettings) -> proximadb_storage_common::probe_p
         algorithm: Some(algorithm.as_str().to_string()),
         // Negative = 0 ("floor only"), its historical behaviour; the server
         // layer drops negatives, which would otherwise silently swap in the
-        // 2.0 default instead (#2419 review round 9).
-        multiplier: Some((s.nprobe_multiplier as f64).max(0.0)),
+        // 2.0 default instead (#2419 review round 9). A NON-FINITE multiplier
+        // is refused at boot; a Config built without the loader reaches here,
+        // and the server layer drops it to the 2.0 default — so say so
+        // instead of silently probing approximately where `inf` used to mean
+        // every cell (#2419 review round 12).
+        multiplier: Some({
+            let m = s.nprobe_multiplier as f64;
+            if !m.is_finite() {
+                tracing::warn!(
+                    nprobe_multiplier = m,
+                    "TD-RDSTRAT-14: non-finite nprobe_multiplier is not supported (it used to mean a full scan); using the default. Use an exact search mode for exhaustive probing"
+                );
+            }
+            m.max(0.0)
+        }),
         min_cells: Some(s.nprobe_min),
         max_cells: Some(s.nprobe_max),
         base_bytes: Some(s.probe_base_bytes),

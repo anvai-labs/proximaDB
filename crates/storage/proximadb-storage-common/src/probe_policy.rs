@@ -162,6 +162,15 @@ impl ProbeAlgorithm {
     }
 }
 
+/// Whether the experimental algorithms are admitted
+/// (`PROXIMADB_PAX_READ_PROBE_EXPERIMENTAL=1`). Lives beside the gate's name
+/// so config validation and the engine read it through this stable crate
+/// path — `core/config` must not reach into an engine module for it
+/// (mandate #17a; #2419 review round 12).
+pub fn experimental_algorithms_enabled() -> bool {
+    std::env::var(PROBE_EXPERIMENTAL_ENV).is_ok_and(|value| value.trim() == "1")
+}
+
 /// The discrete band ladder, DERIVED from the rowgroup geometry and the cap:
 /// rungs `rg/4, rg/2, rg`, then doubling until the top rung reaches
 /// `max(8·rg, cap_bytes)`, filtered to sane bounds (sub-512 KiB probes are
@@ -281,9 +290,14 @@ pub fn resolve_probe_plan(
             // FLOOR, not ceil: ceil let the plan exceed the cap by up to one
             // cell (cap 1 MiB with 0.75 MiB cells planned 2 cells = 1.5 MiB,
             // 50% over a cap the registry advertises as bounding the CELL
-            // COUNT). The floor can only underspend. One cell is the
-            // irreducible minimum, so a cap below one cell still probes one
-            // — the single documented overshoot.
+            // COUNT). The floor underspends the SNAPPED BAND, never the cap.
+            // It is not a bound on the raw budget: the band snaps to the
+            // NEAREST rung, which can sit above `base x (rows/1M)^0.25` (a
+            // 6.1 MiB budget snaps up to 8 MiB; a sub-rung budget snaps up to
+            // the smallest rung), so a plan may exceed its raw budget by up to
+            // one rung step while staying within the cap (#2419 review round
+            // 12). One cell is the irreducible minimum, so a cap below one
+            // cell still probes one.
             let by_budget = ((snapped / cell_bytes.max(1)) as usize).max(1);
             // The RECALL FLOOR wins over the byte cap, matching the
             // documented exception below: clamping the floor to the cap let

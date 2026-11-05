@@ -3407,9 +3407,12 @@ pub struct CompactResponse {
 /// than 404. Use `ALTER TABLE <name> SET (...)` over pgwire meanwhile.
 pub async fn patch_collection_properties_v2(
     Path(collection_id): Path<String>,
-    Extension(tenant): Extension<TenantContext>,
+    // Kept while the write is unwired: the tenant extractor still makes the
+    // route refuse a request without tenant context, and both are needed
+    // again when the merge + catalog write lands.
+    Extension(_tenant): Extension<TenantContext>,
     user_context: Option<Extension<crate::security::rbac_service::UnifiedUserContext>>,
-    State(state): State<AppState>,
+    State(_state): State<AppState>,
     axum::Json(request): axum::Json<UpdatePropertiesRequest>,
 ) -> ApiResult<Json<PropertiesResponse>> {
     if collection_id.is_empty() {
@@ -3438,19 +3441,13 @@ pub async fn patch_collection_properties_v2(
             "PATCH /collections/{id}/properties does not persist yet; use ALTER TABLE <name> SET ('key' = 'value', ...) over pgwire".to_string(),
         ));
     }
-    let updated = state
-        .collection_service
-        .update_collection_properties(
-            &collection_id,
-            Some(&crate::storage::tenant::context::StorageTenantContext::from(&tenant)),
-            request.properties,
-        )
-        .await
-        .map_err(|e| ApiError::Internal(format!("property update: {e}")))?;
-
+    // Only an EMPTY request reaches here, and it changes nothing — answer it
+    // directly rather than round-tripping to the stub that echoes its input
+    // (#2419 review round 12). Restore the service call with the merge +
+    // catalog write.
     Ok(Json(PropertiesResponse {
         collection_id,
-        properties: updated,
+        properties: std::collections::HashMap::new(),
     }))
 }
 

@@ -55,10 +55,14 @@ region in one PAX object. This TD makes the tier-1 fan-out POLICY.
 * `resolve_probe_plan(policy, cells, corpus_rows, rowgroup_bytes,
   avg_cell_bytes) -> ProbePlan{cells, probe_bytes, band}` — THE one pure
   function both consumers call.
-* `band_ladder(rowgroup_bytes)` — discrete rungs DERIVED from the
+* `band_ladder(rowgroup_bytes, reach)` — discrete rungs DERIVED from the
   rowgroup geometry (the per-backend IOPS budget: 4 MiB cloud/Azure,
-  8 MiB S3, 1 MiB local): `[rg/4, rg/2, rg, 2rg, 4rg, 8rg]` — the 8x rung is REQUIRED: stopping at 4x put every budget above it on one rung, so the `byte_budget@8MB` and `@16MB` arms tied and the 32 MiB cap was unreachable (two tests pin this). Band edges live
-  here and nowhere else.
+  8 MiB S3, 1 MiB local): `rg/4, rg/2, rg`, then doubling until the top
+  rung reaches `max(8·rg, reach)`, where `reach` is the cap (or, uncapped,
+  the budget itself). A fixed top made budget arms above it tie — at 4x on
+  cloud (round 3) and at 8x on local disk (round 8) — and made "uncapped"
+  probe less than the capped default (round 10). Band edges live here and
+  nowhere else.
 * `resolve_probe_policy(properties, tags, server)` — the 4-layer chain
   (property > tag > server TOML > code; **only the server layer is fed
   today** — the caller passes empty properties and tags until the carrier
@@ -158,8 +162,8 @@ fixed in-PR: POST /collections and PATCH /properties now fail closed
 instead of returning 200 for properties they never persist, `unreachable!()`
 was removed from the probe path (mandate #4), and boot validation no longer
 rejects `nprobe_multiplier = 0` ("floor only") or `cap_mb < base_mb`, both of
-which booted before (negative / non-finite multipliers ARE now rejected,
-deliberately — see above). These are filed, not fixed:
+which booted before (round 9 later restored negatives too: only a
+NON-FINITE multiplier fails boot — see the boot-change bullet above). These are filed, not fixed:
 
 * *RDSTRAT-14-F1 — tag channel is inert and unvalidated.* A
   `probe.algorithm:` tag is stored and never read; nothing validates tags
@@ -266,3 +270,16 @@ byte_budget server; two doc blocks reattached to their items. Filed:
   even when nothing changed, forcing an env re-scan (and repeat WARNs for
   junk values) on the next query. Bump only when the stored settings
   change.
+
+Round 12 (#2419): the experimental-gate env read moved into
+`probe_policy::experimental_algorithms_enabled`, so `core/config` no longer
+reaches into an engine module (mandate #17a); a non-finite multiplier on a
+non-loader config path is warned about instead of silently becoming the 2.0
+default; the "the floor can only underspend" comment is corrected (the band
+snaps to the NEAREST rung, so a plan can exceed its raw budget by one rung
+step while staying within the cap); the registry calls CAP_MB per probe POOL,
+not per query (segments × cap with the directory off); two contradictory TD
+passages are fixed; PATCH answers an empty request without calling the stub.
+Still filed: F1 (tag channel), F2 (hot-path inputs), F10 (inline
+normalization), F11 (no-op invalidation), and the per-segment budget scaling
+under F2.
