@@ -1164,7 +1164,16 @@ impl SstEngine {
             > = std::sync::LazyLock::new(Default::default);
             let first = WARNED
                 .lock()
-                .map(|mut warned| warned.insert(storage_url.to_string()))
+                .map(|mut warned| {
+                    // Bounded: a multi-tenant server churning collections
+                    // would otherwise grow the set forever (#2418 review
+                    // round 17). Resetting the window may re-warn old URLs —
+                    // harmless for a once-per-collection notice.
+                    if warned.len() >= 1024 {
+                        warned.clear();
+                    }
+                    warned.insert(storage_url.to_string())
+                })
                 .unwrap_or(true);
             if first {
                 tracing::warn!(

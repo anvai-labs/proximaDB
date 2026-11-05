@@ -1449,6 +1449,17 @@ impl Compaction {
         let mut segments_before: Option<usize> = None;
         let mut passes = 0usize;
         let mut no_progress_rounds = 0usize;
+        // #2418 review round 17: progress is measured from the LIVE COUNT,
+        // not from the pass-outcome journal. The journal is bounded (64) and
+        // shared with every background morsel in the process, so on a busy
+        // server a FULL pass's entry can be EVICTED between insert and take —
+        // reading that as "no progress" stopped collapses early with a false
+        // no_progress and under-counted the pass provenance. A journal miss
+        // after quiescence is an eviction artifact: the pass RAN (it was
+        // scheduled and the system quiesced), so it counts, and stagnation is
+        // detected where it is actually observable — the live count.
+        let mut prev_live = usize::MAX;
+        let mut no_drop_rounds = 0usize;
         let stop_reason = loop {
             let files = discovery
                 .discover_compactable_files(
@@ -1470,6 +1481,17 @@ impl Compaction {
             if segments_before.is_none() {
                 segments_before = Some(live + pending);
             }
+            // Genuine stagnation: passes are being scheduled and quiescing,
+            // yet the live count is not coming down.
+            if live >= prev_live {
+                no_drop_rounds += 1;
+                if no_drop_rounds >= 3 {
+                    break Some("no_progress");
+                }
+            } else {
+                no_drop_rounds = 0;
+            }
+            prev_live = live;
             if live <= target {
                 // At target, but AXIS-pending segments would push past it once
                 // their rebuild publishes: report why the count can still move.
@@ -1633,10 +1655,12 @@ impl Compaction {
                     )));
                 }
                 None => {
-                    no_progress_rounds += 1;
-                    if no_progress_rounds >= 3 {
-                        break Some("no_progress");
-                    }
+                    // Scheduled + quiesced, so the pass ran; the journal
+                    // entry was evicted (cap 64, shared process-wide). Its
+                    // bytes are lost — `bytes_scope` already declares the
+                    // counters a lower bound — but the PASS happened.
+                    passes += 1;
+                    no_progress_rounds = 0;
                 }
             }
         };
@@ -1740,16 +1764,23 @@ impl Compaction {
             return Ok(self.narrow_to_promotion_candidate(follow_up).await);
         }
         follow_up.input_files.truncate(keep);
-        follow_up.input_bytes = follow_up
-            .input_files
-            .iter()
-            .map(|path| {
-                sizes
-                    .get(&path.to_string_lossy().to_string())
-                    .copied()
-                    .unwrap_or(0)
-            })
-            .sum();
+        // A kept input missing from THIS discovery must not count as 0 bytes:
+        // a 0 under-states the merge input and lets memory admission reserve
+        // for less than will be read — the condition admission exists to
+        // prevent (#2418 review round 17). Treat it as a transient discovery
+        // mismatch (the caller's error path: the promotion falls back to the
+        // per-file picker, a plain merge is retried/skipped).
+        let mut sum = 0u64;
+        for path in &follow_up.input_files {
+            let Some(size) = sizes.get(&path.to_string_lossy().to_string()).copied() else {
+                return Err(crate::core::StorageError::SstEngine(format!(
+                    "input {} missing from the floor discovery",
+                    path.display()
+                )));
+            };
+            sum += size;
+        }
+        follow_up.input_bytes = sum;
         Ok(true)
     }
 
@@ -2085,6 +2116,10 @@ impl Compaction {
                     let mut journal = compaction.pass_outcomes.write().await;
                     if journal.len() >= 64 {
                         // Bounded: drop an arbitrary (oldest-iteration) entry.
+                        // Eviction is BENIGN for the FULL loop since round 17:
+                        // it counts a scheduled-and-quiesced pass on a miss
+                        // (bytes lost, passes kept) and measures progress from
+                        // the live count instead.
                         if let Some(key) = journal.keys().next().cloned() {
                             journal.remove(&key);
                         }
@@ -2179,12 +2214,32 @@ impl Compaction {
                                         );
                                         keep
                                     }
-                                    Err(error) => {
-                                        warn!(
-                                            collection_object_id = task.collection_object_id,
-                                            "Compaction follow-up floor check failed; not scheduling a plain merge: {error}"
-                                        );
-                                        false
+                                    Err(first_err) => {
+                                        // One retry: a transient object-store
+                                        // blip on the floor LIST permanently
+                                        // dropped a FLOOR-LEGAL merge on a
+                                        // settled bed, where nothing re-drives
+                                        // it (#2418 review round 17).
+                                        let retried = compaction
+                                            .bound_follow_up_to_floor(
+                                                &mut follow_up,
+                                                collection_dir,
+                                                floor,
+                                                promotes,
+                                            )
+                                            .await;
+                                        match retried {
+                                            Ok(keep) => keep,
+                                            Err(second_err) => {
+                                                warn!(
+                                                    collection_object_id = task.collection_object_id,
+                                                    first = %first_err,
+                                                    second = %second_err,
+                                                    "Compaction follow-up floor check failed twice; not scheduling a plain merge"
+                                                );
+                                                false
+                                            }
+                                        }
                                     }
                                 },
                             };

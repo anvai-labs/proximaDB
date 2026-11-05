@@ -459,3 +459,20 @@ untrained_segment_size_on). The legacy `strategy` error names its
 case-sensitive match; strictness stays (a case variant booted before but
 silently ran as hybrid — that is the dead-config class, named at boot).
 F4 is CLOSED by the embedded structs.
+
+Round 17 (#2418): FULL-loop progress is measured from the LIVE COUNT, not
+the pass-outcome journal — the journal is bounded (64) and shared
+process-wide, so a busy server could evict a live pass's entry between
+insert and take, ending the collapse with a false no_progress and
+under-counting the provenance; a journal miss after quiescence now counts
+as the pass it was (bytes lost, scope already says lower bound), and
+stagnation is three scheduled-and-quiesced passes that do not reduce the
+live count. A kept input missing from the floor's re-LIST no longer counts
+as 0 bytes (memory admission would under-reserve); it fails the bound to
+the safe paths. The floor LIST gets ONE retry before dropping a floor-legal
+plain merge (nothing re-drives it on a settled bed). bytes_scope follows
+the extraction source — request_passes_lower_bound for FULL,
+request_total for a plain compaction whose bytes are the top-level
+canonical fields. The refused-consolidate WARNED set is bounded (clears at
+1024 URLs). F5 (500 for seam refusals) was raised again and stays filed —
+reachable only on non-SST engines today.

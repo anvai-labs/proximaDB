@@ -156,17 +156,23 @@ pub struct FullCompactionMetrics {
     pub bytes_read: Option<u64>,
     pub bytes_written: Option<u64>,
     pub duration_ms: Option<u64>,
-    /// The SCOPE of the byte counters, so the wire cannot present them as
-    /// the request's total I/O: [`FULL_BYTES_SCOPE`] — the passes this
-    /// request's own loop executed. Worker follow-up merges (including
-    /// floor-bounded ones and single-input training rewrites) carry their own
-    /// output keys and are NOT summed, so `bytes_*` is a measured LOWER
-    /// bound for every target (#2418 review round 16).
+    /// The SCOPE of the byte counters, so the wire cannot present a partial
+    /// count as the request's total I/O or vice versa:
+    /// [`FULL_BYTES_SCOPE`] for a FULL collapse — the passes this request's
+    /// own loop executed; worker follow-up merges (floor-bounded ones and
+    /// single-input training rewrites) carry their own output keys and are
+    /// NOT summed, so `bytes_*` is a measured LOWER BOUND. For a PLAIN
+    /// (non-FULL) compaction the top-level canonical fields ARE the whole
+    /// request's I/O: [`PLAIN_BYTES_SCOPE`].
     pub bytes_scope: Option<String>,
 }
 
-/// The value of [`FullCompactionMetrics::bytes_scope`].
+/// The value of [`FullCompactionMetrics::bytes_scope`] for a FULL collapse.
 pub const FULL_BYTES_SCOPE: &str = "request_passes_lower_bound";
+/// The value of [`FullCompactionMetrics::bytes_scope`] for a plain
+/// (non-FULL) compaction whose bytes come from the canonical top-level
+/// fields — the complete I/O of that one request.
+pub const PLAIN_BYTES_SCOPE: &str = "request_total";
 
 impl StorageCompactionResult {
     /// Extract the FULL provenance from `engine_metrics` (keys written by
@@ -198,7 +204,16 @@ impl StorageCompactionResult {
             bytes_read: metric_u64("bytes_read").or(self.bytes_read),
             bytes_written: metric_u64("bytes_written").or(self.bytes_written),
             duration_ms: metric_u64("duration_ms").or(self.duration_ms),
-            bytes_scope: Some(FULL_BYTES_SCOPE.to_string()),
+            // The scope follows the SOURCE: engine_metrics keys are written
+            // only by the FULL branch (a partial count); the top-level
+            // fallback is a plain compaction's complete accounting (#2418
+            // review round 17 — labelling a plain result "lower bound" told
+            // operators the number excluded work it included).
+            bytes_scope: if self.engine_metrics.contains_key("segments_after") {
+                Some(FULL_BYTES_SCOPE.to_string())
+            } else {
+                Some(PLAIN_BYTES_SCOPE.to_string())
+            },
         }
     }
 }
