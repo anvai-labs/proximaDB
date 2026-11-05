@@ -447,8 +447,17 @@ pub fn resolve_probe_policy_gated(
 ) -> ProbePolicy {
     let mut policy = ProbePolicy::default();
 
-    // Server TOML layer (validated at load; junk is inert here, rejected there).
-    if let Some(algorithm) = server.algorithm.as_deref().and_then(ProbeAlgorithm::parse) {
+    // Server TOML layer (validated at load; junk is inert here, rejected
+    // there). The experimental gate applies HERE too, not only at the
+    // env/TOML doors: a second caller of the exported entry (the deferred
+    // collection carrier) must not be able to select an ungated algorithm by
+    // filling the server layer (#2419 review round 16).
+    if let Some(algorithm) = server
+        .algorithm
+        .as_deref()
+        .and_then(ProbeAlgorithm::parse)
+        .filter(|a| !a.is_experimental() || admit_experimental)
+    {
         policy.algorithm = algorithm;
     }
     // A non-positive/non-finite multiplier is rejected at config load
@@ -1061,6 +1070,28 @@ mod tests {
             resolve_probe_plan(&policy, 30, 0, 4 * 1024 * 1024, 0).cells,
             1
         );
+    }
+
+    #[test]
+    fn experimental_gate_holds_on_the_server_layer_too() {
+        let pick = |admit| {
+            resolve_probe_policy_gated(
+                &HashMap::new(),
+                &[],
+                &ServerProbePolicy {
+                    algorithm: Some("byte_budget".to_string()),
+                    ..Default::default()
+                },
+                admit,
+            )
+            .algorithm
+        };
+        assert_eq!(
+            pick(false),
+            ProbeAlgorithm::Sqrt,
+            "the gate must hold here too"
+        );
+        assert_eq!(pick(true), ProbeAlgorithm::ByteBudget);
     }
 
     #[test]

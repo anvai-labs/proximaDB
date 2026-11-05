@@ -2265,24 +2265,6 @@ impl CollectionService {
     }
 
     /// Update collection - type-safe method with native parameters
-    /// TD-COMPACT-2b: update a collection's table properties (merge
-    /// semantics) — NOT IMPLEMENTED. The merge + catalog write needs the
-    /// schema-properties seam. It used to echo its input as if it had been
-    /// applied, which is how PATCH answered 200 for writes that never
-    /// happened; it now fails explicitly so no caller can wire it in and
-    /// revive that bug (#2419 review round 14). The PATCH handler refuses
-    /// before reaching here.
-    pub async fn update_collection_properties(
-        &self,
-        collection_id: &str,
-        _tenant: Option<&crate::storage::tenant::TenantContext>,
-        _new_properties: std::collections::HashMap<String, String>,
-    ) -> Result<std::collections::HashMap<String, String>> {
-        anyhow::bail!(
-            "update_collection_properties is not implemented (collection '{collection_id}'): the merge + catalog write is not wired; use ALTER TABLE ... SET"
-        )
-    }
-
     pub async fn update_collection(
         &self,
         identifier: &str,

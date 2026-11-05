@@ -359,13 +359,14 @@ async fn unified_port_auth_converged_recall_tune_e2e() {
     );
 }
 
-/// #2419 review round 7: POST /collections and PATCH /properties used to
-/// answer 200 for properties they never persist (create builds a
-/// `CollectionConfig` with no properties field; PATCH's service method is a
-/// stub that echoes its input). Both must now fail closed so a client cannot
-/// believe a policy key took effect when it did not.
+/// #2419 review round 16: POST /collections refuses a non-empty
+/// `properties` map (400, naming the working path) — those keys were never
+/// persisted, so the 200 reported a write that did not happen. The
+/// PATCH /properties ROUTE is REMOVED outright: it could only ever refuse
+/// (the merge + catalog write does not exist), so it was an advertised
+/// capability that isn't there. Set properties with ALTER TABLE ... SET.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn create_and_patch_refuse_properties_they_cannot_persist() {
+async fn create_refuses_unpersisted_properties_and_patch_route_is_gone() {
     let server = AuthTestServer::start().await.expect("server start");
     let http = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
@@ -397,7 +398,7 @@ async fn create_and_patch_refuse_properties_they_cannot_persist() {
         "the refusal must name the working path: {body}"
     );
 
-    // Create WITHOUT properties still succeeds (and gives PATCH a target).
+    // Create WITHOUT properties still succeeds.
     let resp = http
         .post(server.url("/api/v2/collections"))
         .header("Authorization", "Api-Key dev-key")
@@ -415,53 +416,19 @@ async fn create_and_patch_refuse_properties_they_cannot_persist() {
         status, 200,
         "a property-free create must still succeed; body={body}"
     );
-    let created: serde_json::Value = serde_json::from_str(&body).expect("create json");
-    let collection_id = created
-        .get("collection_id")
-        .and_then(|v| {
-            v.as_str()
-                .map(str::to_string)
-                .or_else(|| v.as_u64().map(|n| n.to_string()))
-        })
-        .expect("collection_id in create response");
 
-    // PATCH a VALID key -> 501, not a 200 that echoes it as applied.
+    // The PATCH route is GONE, not a 501 stub: restoring a write door
+    // should be a conscious route addition, not a status-code flip.
     let resp = http
-        .patch(server.url(&format!("/api/v2/collections/{collection_id}/properties")))
+        .patch(server.url("/api/v2/collections/props_target/properties"))
         .header("Authorization", "Api-Key dev-key")
         .json(&serde_json::json!({"properties": {"cache.index.mode": "pin"}}))
         .send()
         .await
-        .expect("send patch valid");
-    let status = resp.status().as_u16();
-    let body = resp.text().await.unwrap_or_default();
-    assert_eq!(
-        status, 501,
-        "PATCH must not report an unpersisted write as done; body={body}"
-    );
-
-    // PATCH an INVALID key -> still 400: validation runs before the refusal.
-    let resp = http
-        .patch(server.url(&format!("/api/v2/collections/{collection_id}/properties")))
-        .header("Authorization", "Api-Key dev-key")
-        .json(&serde_json::json!({"properties": {"cache.index.mode": "pinn"}}))
-        .send()
-        .await
-        .expect("send patch invalid");
-    assert_eq!(resp.status().as_u16(), 400, "a bad key is a 400, not a 501");
-
-    // An EMPTY PATCH is refused too: answering it 200 with `properties: {}`
-    // read back as "this collection has no properties" (#2419 round 14).
-    let resp = http
-        .patch(server.url(&format!("/api/v2/collections/{collection_id}/properties")))
-        .header("Authorization", "Api-Key dev-key")
-        .json(&serde_json::json!({"properties": {}}))
-        .send()
-        .await
-        .expect("send patch empty");
+        .expect("send patch");
     assert_eq!(
         resp.status().as_u16(),
-        501,
-        "an empty PATCH must not report an empty property set"
+        404,
+        "PATCH /properties is removed until the merge + catalog write lands"
     );
 }

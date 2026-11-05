@@ -3926,14 +3926,25 @@ fn settings_policy(s: &CoarseProbeSettings) -> proximadb_storage_common::probe_p
 
 fn cached_probe_policy() -> proximadb_storage_common::probe_policy::ProbePolicy {
     let generation = COARSE_PROBE_GENERATION.load(std::sync::atomic::Ordering::Acquire);
-    if let Ok(g) = RESOLVED_PROBE_POLICY.read()
+    // Poison-safe (mandate #4): a panic elsewhere while the lock was held
+    // must not disable the cache forever — that re-ran settings_policy (env
+    // reads + WARNs) on EVERY probe query. Recover the guard; the cached
+    // value is still a valid (generation, policy) pair.
+    if let g = RESOLVED_PROBE_POLICY
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
         && let Some((cached_generation, policy)) = g.as_ref()
         && *cached_generation == generation
     {
         return policy.clone();
     }
     let resolved = settings_policy(&coarse_probe_settings());
-    if let Ok(mut g) = RESOLVED_PROBE_POLICY.write() {
+    {
+        // Poison-safe (see the read above); `into_inner` always yields a
+        // guard, so no `if let`.
+        let mut g = RESOLVED_PROBE_POLICY
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         // Store ONLY if the settings have not been re-seeded since we read
         // them. Without this check a resolver that started before a re-seed
         // could write back a policy derived from the old settings and pin

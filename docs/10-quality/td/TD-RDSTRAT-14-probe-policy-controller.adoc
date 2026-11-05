@@ -325,3 +325,17 @@ experimental gate per tag before "last valid wins"; the PATCH docs say every
 request gets 501. Raised again and kept filed: F2, F3, F6, F10. Pre-existing
 case-variant duplicates already stored (before round 8) are collapsed only
 when that knob is SET again — part of F12 (persist the normalized key).
+
+Round 16 (#2419): `PATCH /collections/{id}/properties` is REMOVED (route,
+handler, request/response types and the service stub). It shipped in #2405
+as a write door that never persisted anything — first echoing its input as
+applied, then refusing 501 — and a route that can only refuse is an
+advertised capability that does not exist (the capability-facade ratchet
+correctly flagged it; deleting is the fix, not rewording). Restore a PATCH
+door together with the merge + catalog write. The create door keeps its
+fail-closed 400; the e2e pins the removal with a 404. Also: the experimental
+gate now holds on the server layer of the resolution path (not just the
+env/TOML doors and the property/tag layers), so no future caller of the
+exported entry can select an ungated algorithm; the resolved-policy cache is
+poison-safe (a poisoned RwLock disabled it forever, re-running the env scan
+and its WARNs per query).

@@ -3363,21 +3363,13 @@ async fn ensure_collection_exists(
     Ok(())
 }
 
-/// Body of `PATCH /api/v2/collections/{id}/properties`. The endpoint does
-/// NOT persist yet: keys are validated through the one policy door, then
-/// EVERY request — an empty map included — is answered 501 (see
-/// `patch_collection_properties_v2`).
-#[derive(Debug, serde::Deserialize)]
-pub struct UpdatePropertiesRequest {
-    pub properties: std::collections::HashMap<String, String>,
-}
-
-/// Response: the full property set after the merge.
-#[derive(Debug, serde::Serialize)]
-pub struct PropertiesResponse {
-    pub collection_id: String,
-    pub properties: std::collections::HashMap<String, String>,
-}
+// `PATCH /api/v2/collections/{id}/properties` was REMOVED (#2419 review
+// round 16). It shipped in #2405 as a stub that never persisted anything —
+// first echoing its input as if applied, then (rounds 7-14) refusing with
+// 501. A route that can only ever refuse is a capability that does not exist,
+// so it is deleted rather than kept as an advertised facade. Set table
+// properties with `ALTER TABLE <name> SET (...)` over pgwire; restore a PATCH
+// door together with the merge + catalog write it needs.
 
 #[derive(Debug, serde::Deserialize)]
 pub struct CompactRequest {
@@ -3394,59 +3386,6 @@ pub struct CompactResponse {
     pub passes: Option<usize>,
     pub reached_target: Option<bool>,
     pub stop_reason: Option<String>,
-}
-
-/// `PATCH /api/v2/collections/{id}/properties` — NOT YET A WRITE PATH.
-///
-/// The intended contract is merge semantics (keys in the request set/update,
-/// absent keys unchanged), but the service-side merge + catalog write is not
-/// wired, so this answers **501 Not Implemented** for every request — an
-/// empty map included, which would otherwise read back as "no properties" —
-/// instead of a 200 that would report an unpersisted write as done. Keys are
-/// validated first through the one policy door (`cache.*`, `compaction.*`,
-/// `probe.*`), so a bad key is still a 400. The refusal runs before the
-/// collection is resolved, so an unknown collection id also gets 501 rather
-/// than 404. Use `ALTER TABLE <name> SET (...)` over pgwire meanwhile.
-pub async fn patch_collection_properties_v2(
-    Path(collection_id): Path<String>,
-    // Kept while the write is unwired: the tenant extractor still makes the
-    // route refuse a request without tenant context, and both are needed
-    // again when the merge + catalog write lands.
-    Extension(_tenant): Extension<TenantContext>,
-    user_context: Option<Extension<crate::security::rbac_service::UnifiedUserContext>>,
-    State(_state): State<AppState>,
-    axum::Json(request): axum::Json<UpdatePropertiesRequest>,
-) -> ApiResult<Json<PropertiesResponse>> {
-    if collection_id.is_empty() {
-        return Err(ApiError::InvalidArgument(
-            "Collection ID is required".to_string(),
-        ));
-    }
-    require_maintain(user_context.as_ref().map(|e| &e.0), "properties")?;
-
-    // Validate every policy family in the request (cache.*, compaction.*,
-    // probe.*) through the one boundary. Before this, PATCH validated only
-    // cache.* — so `{"compaction.strategy": "typo"}` was accepted here and
-    // rejected through SQL, the accepted-but-inert split this consolidates.
-    proximadb_storage_common::validate_policy_properties(&request.properties)
-        .map_err(|e| ApiError::InvalidArgument(format!("invalid table property: {e}")))?;
-
-    // FAIL CLOSED (#2419 review round 7): `update_collection_properties` is
-    // a stub that logs "merge + catalog write not yet wired; returning
-    // input" and echoes the request, so this endpoint answered 200 with the
-    // keys "applied" while `schema.properties` was untouched. Validation
-    // above stays (a bad key is still a 400, not a 501), but a valid request
-    // is refused rather than reported as done. Remove this when the merge +
-    // catalog write lands.
-    // EVERY request is refused, the empty one included: answering an empty
-    // PATCH with `properties: {}` (round 12) told a client reading back a
-    // pinned collection that it had no properties, and answered 200 for an
-    // unknown id (#2419 review round 14). The response field means "the set
-    // after the merge", which this endpoint cannot produce yet.
-    let _ = collection_id;
-    Err(ApiError::NotImplemented(
-        "PATCH /collections/{id}/properties does not persist yet; use ALTER TABLE <name> SET ('key' = 'value', ...) over pgwire".to_string(),
-    ))
 }
 
 /// `POST /api/v2/collections/{id}/compact` body `{"full": bool}` (an omitted
