@@ -283,7 +283,12 @@ pub fn resolve_probe_plan(
                 // 100k). Operators have recall-tuned that multiplier, so
                 // the default path must stay byte-identical, not just at
                 // the shipped 2.0.
-                ProbeAlgorithm::Sqrt => {
+                // ByteBudget never reaches this arm (the outer match takes
+                // it); it shares the historical sqrt form here instead of an
+                // `unreachable!()`, because mandate #4 forbids panic macros
+                // in production code and a later edit to the outer match
+                // would otherwise turn into a query-path panic.
+                ProbeAlgorithm::Sqrt | ProbeAlgorithm::ByteBudget => {
                     ((pool as f32).sqrt() * (policy.multiplier as f32)).ceil() as f64
                 }
                 ProbeAlgorithm::CubeRoot => (pool.cbrt() * policy.multiplier).ceil(),
@@ -295,7 +300,6 @@ pub fn resolve_probe_plan(
                 // i.e. a silent full scan.
                 ProbeAlgorithm::Log => (policy.multiplier * (pool + 1.0).log2()).ceil(),
                 ProbeAlgorithm::Fixed => policy.min_cells.max(1) as f64,
-                ProbeAlgorithm::ByteBudget => unreachable!("handled above"),
             };
             let raw = raw.max(1.0) as usize;
             let floored = raw.max(policy.min_cells.max(1));
@@ -343,25 +347,6 @@ fn property_usize(properties: &HashMap<String, String>, key: &str) -> Option<usi
 /// garbage cap).
 pub const MAX_PROBE_BUDGET_MB: usize = 1024 * 1024;
 
-/// The probe keys this module recognises. `probe.` is NOT a reserved
-/// namespace, so only these are policy knobs — anything else under the
-/// prefix (`probe.owner`, say) is ordinary tenant metadata and must keep
-/// being stored verbatim rather than 400ing.
-pub const PROBE_POLICY_KEYS: [&str; 6] = [
-    PROBE_ALGORITHM_PROPERTY_KEY,
-    PROBE_MULTIPLIER_KEY,
-    PROBE_MIN_CELLS_KEY,
-    PROBE_MAX_CELLS_KEY,
-    PROBE_BASE_MB_KEY,
-    PROBE_CAP_MB_KEY,
-];
-
-/// Whether `key` is one of the recognised probe POLICY knobs.
-pub fn is_probe_policy_key(key: &str) -> bool {
-    let key = key.trim().to_ascii_lowercase();
-    PROBE_POLICY_KEYS.contains(&key.as_str())
-}
-
 fn property_u64_mb(properties: &HashMap<String, String>, key: &str) -> Option<u64> {
     property_usize(properties, key)
         .map(|mb| mb.min(MAX_PROBE_BUDGET_MB) as u64)
@@ -376,6 +361,13 @@ fn property_u64_mb(properties: &HashMap<String, String>, key: &str) -> Option<u6
 /// Per key: collection property > operator tag (algorithm only) > server
 /// TOML > code default. An explicit value at any layer wins over defaults
 /// below it; silence falls through.
+///
+/// TODAY only the server layer is fed: the one production caller
+/// (`settings_policy` in segment_format.rs) passes empty properties AND
+/// empty tags until the search-path carrier lands (TD-RDSTRAT-14
+/// §Deferred). `probe.*` properties are refused at the door for that
+/// reason; a `probe.algorithm:` TAG is not yet validated anywhere, so it is
+/// stored and ignored — tracked as RDSTRAT-14-F1, not yet closed.
 pub fn resolve_probe_policy(
     properties: &HashMap<String, String>,
     tags: &[String],
@@ -391,7 +383,11 @@ pub fn resolve_probe_policy(
     // (`CoarseProbeConfig::validate`), so reaching here means a
     // non-loader construction path; keep the shipped default rather than
     // producing a zero/negative probe count.
-    if let Some(multiplier) = server.multiplier.filter(|m| *m > 0.0 && m.is_finite()) {
+    // `>= 0`, not `> 0`: a multiplier of 0 historically meant "probe exactly
+    // the floor" (ceil(sqrt(k) x 0) = 0, clamped up to min_cells), and
+    // filtering it out silently swapped it for the 2.0 default — so a
+    // config that set it got a different nprobe than before this module.
+    if let Some(multiplier) = server.multiplier.filter(|m| m.is_finite() && *m >= 0.0) {
         policy.multiplier = multiplier;
     }
     // `Some(0)` is a documented SENTINEL on the server layer, not junk:
@@ -444,7 +440,7 @@ pub fn resolve_probe_policy(
         // positivity check, then saturates nprobe to usize::MAX — the exact
         // silent full scan this module removed from the `log` arm. Matches
         // the server layer's filter.
-        .filter(|m| m.is_finite() && *m > 0.0)
+        .filter(|m| m.is_finite() && *m >= 0.0)
     {
         policy.multiplier = multiplier;
     }
@@ -480,10 +476,12 @@ pub fn validate_probe_properties(properties: &HashMap<String, String>) -> Result
                 }
             }
             PROBE_MULTIPLIER_KEY => {
-                let parsed = raw_value.trim().parse::<f64>().unwrap_or(0.0);
-                if parsed <= 0.0 || !parsed.is_finite() {
+                // Non-negative finite: 0 is the historical "floor only"
+                // setting and must stay expressible (see the server layer).
+                let parsed = raw_value.trim().parse::<f64>().unwrap_or(f64::NAN);
+                if !parsed.is_finite() || parsed < 0.0 {
                     return Err(format!(
-                        "probe.multiplier: expected a positive finite number, got '{raw_value}'"
+                        "probe.multiplier: expected a non-negative finite number, got '{raw_value}'"
                     ));
                 }
             }
@@ -861,7 +859,9 @@ mod tests {
         // Non-compaction keys are ignored.
         assert!(validate_probe_properties(&props(&[("cache.index.mode", "pin")])).is_ok());
         assert!(validate_probe_properties(&props(&[("probe.algorithm", "sqrt2")])).is_err());
-        assert!(validate_probe_properties(&props(&[("probe.multiplier", "0")])).is_err());
+        // 0 = "probe exactly the floor" (historical); negatives fail closed.
+        assert!(validate_probe_properties(&props(&[("probe.multiplier", "0")])).is_ok());
+        assert!(validate_probe_properties(&props(&[("probe.multiplier", "-1")])).is_err());
         // "inf" parses as f64 and passes a bare `> 0` check, then saturates
         // nprobe to usize::MAX — a silent full scan (#2419 review round 5).
         assert!(validate_probe_properties(&props(&[("probe.multiplier", "inf")])).is_err());

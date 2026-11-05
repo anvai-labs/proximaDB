@@ -1383,12 +1383,15 @@ type CreateCollectionV2Request struct {
 	// admission with the configured ids listed.
 	PoolId *string `json:"pool_id,omitempty"`
 
-	// Properties Per-collection table properties (Hive TBLPROPERTIES-style). Three
-	// namespaces are RESERVED for policy and validated at create time, with
-	// unknown keys inside them rejected: `cache.*` (per-collection cache
-	// policy, TD-COMPACT-2b — `{"cache.index.mode": "pin"}` pins Region A),
-	// `compaction.*` (TD-COMPACT-15) and `probe.*` (TD-RDSTRAT-14). Keys
-	// outside those three namespaces are stored verbatim.
+	// Properties Per-collection table properties (Hive TBLPROPERTIES-style).
+	//
+	// NOT persisted by this endpoint yet: a non-empty map is rejected with
+	// 400. Create the collection, then set properties with `ALTER TABLE
+	// <name> SET (...)` over pgwire. Three namespaces are reserved for policy
+	// there, with unknown keys rejected: `cache.*` (TD-COMPACT-2b),
+	// `compaction.*` (TD-COMPACT-15) and `probe.*` (TD-RDSTRAT-14). Every
+	// `probe.*` key, valid or not, is currently refused because nothing
+	// consumes it yet.
 	Properties *map[string]string `json:"properties,omitempty"`
 
 	// Quantization REST input for quantization config (mirrors proto `QuantizationConfig`;

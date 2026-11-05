@@ -60,7 +60,9 @@ region in one PAX object. This TD makes the tier-1 fan-out POLICY.
   8 MiB S3, 1 MiB local): `[rg/4, rg/2, rg, 2rg, 4rg, 8rg]` — the 8x rung is REQUIRED: stopping at 4x put every budget above it on one rung, so the `byte_budget@8MB` and `@16MB` arms tied and the 32 MiB cap was unreachable (two tests pin this). Band edges live
   here and nowhere else.
 * `resolve_probe_policy(properties, tags, server)` — the 4-layer chain
-  (property > tag > server TOML > code), exported as the ONLY resolution
+  (property > tag > server TOML > code; **only the server layer is fed
+  today** — the caller passes empty properties and tags until the carrier
+  lands), exported as the ONLY resolution
   path (no single-channel resolvers — the inert-property bug class stays
   dead at the type level).
 * `validate_probe_properties` — fail-closed SET-time validation.
@@ -140,3 +142,36 @@ scale adaptation and is expected to win outright.
 * TD-RDSTRAT-13 — morsel-parallel rank downstream of the probe
 * TD-COMPACT-2b / TD-COMPACT-15 — the policy-chain pattern this follows
 * The competitive analysis (2026-11) — the 10M GET fan-out is lever #1
+
+== Review follow-ups (#2419 round 7, deferred by decision)
+
+The #2419 merge gate was set to "no correctness or mandate findings"
+(2026-11-05) after seven review rounds. Round 7's must-fix items were
+fixed in-PR: POST /collections and PATCH /properties now fail closed
+instead of returning 200 for properties they never persist, `unreachable!()`
+was removed from the probe path (mandate #4), and boot validation no longer
+rejects configs that booted before (`nprobe_multiplier = 0` = "floor only",
+`cap_mb < base_mb`). These are filed, not fixed:
+
+* *RDSTRAT-14-F1 — tag channel is inert and unvalidated.* A
+  `probe.algorithm:` tag is stored and never read; nothing validates tags
+  at create. Close together with the carrier, or refuse the tag prefix at
+  create the way `probe.*` properties are refused.
+* *RDSTRAT-14-F2 — wasted per-segment work.* `coarse_probe_nprobe(k_c,
+  path, &dir)` walks all cells and parses the path on every segment even
+  when the directory plan replaces `probed`, the env override is set, or
+  the sqrt form ignores those inputs. Compute only when `directory_cells`
+  is `None`, and gather byte/row inputs only for ByteBudget.
+* *RDSTRAT-14-F3 — `ProbePlan` name collision + unmetered plan.* A second
+  `ProbePlan` shares the crate with `centroid_directory::ProbePlan` (the
+  root re-export picks the new one), and its `probe_bytes`/`band` are
+  dropped by the only production caller, so the plan never reaches the
+  query I/O trace the co-design mandate requires. Rename and emit it, or
+  return a count.
+* *RDSTRAT-14-F4 — mis-attached rustdoc.* The "Fold the flat settings …"
+  doc block attaches to `static RESOLVED_PROBE_POLICY`, not
+  `settings_policy`.
+* *RDSTRAT-14-F5 — test can leak process-global settings on failure.*
+  `toml_coarse_probe_config_wins_over_default_init` restores the default
+  only on success; use a drop guard (nextest's process isolation hides it
+  in CI).

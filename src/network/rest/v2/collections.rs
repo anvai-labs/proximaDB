@@ -264,12 +264,15 @@ pub struct CreateCollectionV2Request {
     /// `"target_vector_count:1000"`, `"modalities:text,image"`. Consumed by the
     /// recall advisor / route-health (`services/collection/recall_target.rs`).
     pub tags: Option<Vec<String>>,
-    /// Per-collection table properties (Hive TBLPROPERTIES-style). Three
-    /// namespaces are RESERVED for policy and validated at create time, with
-    /// unknown keys inside them rejected: `cache.*` (per-collection cache
-    /// policy, TD-COMPACT-2b — `{"cache.index.mode": "pin"}` pins Region A),
-    /// `compaction.*` (TD-COMPACT-15) and `probe.*` (TD-RDSTRAT-14). Keys
-    /// outside those three namespaces are stored verbatim.
+    /// Per-collection table properties (Hive TBLPROPERTIES-style).
+    ///
+    /// NOT persisted by this endpoint yet: a non-empty map is rejected with
+    /// 400. Create the collection, then set properties with `ALTER TABLE
+    /// <name> SET (...)` over pgwire. Three namespaces are reserved for policy
+    /// there, with unknown keys rejected: `cache.*` (TD-COMPACT-2b),
+    /// `compaction.*` (TD-COMPACT-15) and `probe.*` (TD-RDSTRAT-14). Every
+    /// `probe.*` key, valid or not, is currently refused because nothing
+    /// consumes it yet.
     pub properties: Option<std::collections::HashMap<String, String>>,
     /// Quantization config (gRPC-v2 parity). When omitted, quantization is
     /// left unset (engine default).
@@ -725,16 +728,21 @@ async fn create_collection_v2_checked(
         ));
     }
 
-    // Validate policy properties at CREATE through the same one boundary as
-    // SET and PATCH. The request's own doc comment claimed cache.* keys were
-    // "validated at create time" — they were not validated anywhere on this
-    // path, so a typo was stored verbatim and silently did nothing.
-    if let Some(properties) = request.properties.as_ref()
-        && let Err(error) = proximadb_storage_common::validate_policy_properties(properties)
+    // FAIL CLOSED on create-time properties (#2419 review round 7). This
+    // handler builds a `CollectionConfig`, which has no properties field, so
+    // `request.properties` was never persisted: a valid
+    // `{"cache.index.mode": "pin"}` returned 200 and pinned nothing — the
+    // accepted-but-inert class the policy door exists to close, and
+    // validating the keys first only made the 200 look more trustworthy.
+    // Until create persists them, refuse and name the path that works.
+    if request
+        .properties
+        .as_ref()
+        .is_some_and(|properties| !properties.is_empty())
     {
-        return Err(ApiError::InvalidArgument(format!(
-            "invalid table property: {error}"
-        )));
+        return Err(ApiError::InvalidArgument(
+            "properties are not persisted by POST /collections yet; create the collection, then set them with ALTER TABLE <name> SET ('key' = 'value', ...) over pgwire".to_string(),
+        ));
     }
 
     if request.dimension == 0 {
@@ -3419,9 +3427,18 @@ pub async fn patch_collection_properties_v2(
     proximadb_storage_common::validate_policy_properties(&request.properties)
         .map_err(|e| ApiError::InvalidArgument(format!("invalid table property: {e}")))?;
 
-    // TODO: read current properties from the catalog, merge, validate the
-    // merged set (case-variant duplicates), write back. For now the
-    // collection service handles the merge.
+    // FAIL CLOSED (#2419 review round 7): `update_collection_properties` is
+    // a stub that logs "merge + catalog write not yet wired; returning
+    // input" and echoes the request, so this endpoint answered 200 with the
+    // keys "applied" while `schema.properties` was untouched. Validation
+    // above stays (a bad key is still a 400, not a 501), but a valid request
+    // is refused rather than reported as done. Remove this when the merge +
+    // catalog write lands.
+    if !request.properties.is_empty() {
+        return Err(ApiError::NotImplemented(
+            "PATCH /collections/{id}/properties does not persist yet; use ALTER TABLE <name> SET ('key' = 'value', ...) over pgwire".to_string(),
+        ));
+    }
     let updated = state
         .collection_service
         .update_collection_properties(

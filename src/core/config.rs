@@ -1869,17 +1869,27 @@ impl CoarseProbeConfig {
                 self.algorithm
             ));
         }
-        if !self.nprobe_multiplier.is_finite() || self.nprobe_multiplier <= 0.0 {
+        // Reject only what never had a meaning. A multiplier of 0 booted
+        // before this module and meant "probe exactly nprobe_min", so it
+        // stays legal; a negative or non-finite one never did.
+        if !self.nprobe_multiplier.is_finite() || self.nprobe_multiplier < 0.0 {
             return Err(format!(
-                "{section}.nprobe_multiplier must be a positive finite number (got {})",
+                "{section}.nprobe_multiplier must be a non-negative finite number (got {})",
                 self.nprobe_multiplier
             ));
         }
-        if self.base_mb == 0 || self.cap_mb != 0 && self.cap_mb < self.base_mb {
+        // base_mb is consulted ONLY by byte_budget, so it is checked only
+        // there: rejecting it under the default sqrt form would fail a boot
+        // over a knob that form never reads. cap < base is NOT rejected — the
+        // resolver applies the cap after the budget (cap wins), and the env
+        // and property layers accept it, so boot must not be the one layer
+        // that disagrees.
+        let byte_budget =
+            proximadb_storage_common::probe_policy::ProbeAlgorithm::parse(&self.algorithm)
+                == Some(proximadb_storage_common::probe_policy::ProbeAlgorithm::ByteBudget);
+        if byte_budget && self.base_mb == 0 {
             return Err(format!(
-                "{section}.base_mb/cap_mb must be a positive base with cap >= base \
-                 (base_mb={}, cap_mb={})",
-                self.base_mb, self.cap_mb
+                "{section}.base_mb must be positive when algorithm = \"byte_budget\" (got 0)"
             ));
         }
         Ok(())

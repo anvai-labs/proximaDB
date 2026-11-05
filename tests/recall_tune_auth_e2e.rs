@@ -358,3 +358,95 @@ async fn unified_port_auth_converged_recall_tune_e2e() {
         "read-only Api-Key must be authenticated but forbidden on recall-tune"
     );
 }
+
+/// #2419 review round 7: POST /collections and PATCH /properties used to
+/// answer 200 for properties they never persist (create builds a
+/// `CollectionConfig` with no properties field; PATCH's service method is a
+/// stub that echoes its input). Both must now fail closed so a client cannot
+/// believe a policy key took effect when it did not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn create_and_patch_refuse_properties_they_cannot_persist() {
+    let server = AuthTestServer::start().await.expect("server start");
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .no_proxy()
+        .build()
+        .expect("http client");
+
+    // Create WITH properties -> 400, naming the working path.
+    let resp = http
+        .post(server.url("/api/v2/collections"))
+        .header("Authorization", "Api-Key dev-key")
+        .json(&serde_json::json!({
+            "name": "props_refused",
+            "dimension": 8,
+            "distance_metric": "cosine",
+            "properties": {"cache.index.mode": "pin"}
+        }))
+        .send()
+        .await
+        .expect("send create with properties");
+    let status = resp.status().as_u16();
+    let body = resp.text().await.unwrap_or_default();
+    assert_eq!(
+        status, 400,
+        "create must refuse unpersisted properties; body={body}"
+    );
+    assert!(
+        body.contains("ALTER TABLE"),
+        "the refusal must name the working path: {body}"
+    );
+
+    // Create WITHOUT properties still succeeds (and gives PATCH a target).
+    let resp = http
+        .post(server.url("/api/v2/collections"))
+        .header("Authorization", "Api-Key dev-key")
+        .json(&serde_json::json!({
+            "name": "props_target",
+            "dimension": 8,
+            "distance_metric": "cosine"
+        }))
+        .send()
+        .await
+        .expect("send plain create");
+    let status = resp.status().as_u16();
+    let body = resp.text().await.unwrap_or_default();
+    assert_eq!(
+        status, 200,
+        "a property-free create must still succeed; body={body}"
+    );
+    let created: serde_json::Value = serde_json::from_str(&body).expect("create json");
+    let collection_id = created
+        .get("collection_id")
+        .and_then(|v| {
+            v.as_str()
+                .map(str::to_string)
+                .or_else(|| v.as_u64().map(|n| n.to_string()))
+        })
+        .expect("collection_id in create response");
+
+    // PATCH a VALID key -> 501, not a 200 that echoes it as applied.
+    let resp = http
+        .patch(server.url(&format!("/api/v2/collections/{collection_id}/properties")))
+        .header("Authorization", "Api-Key dev-key")
+        .json(&serde_json::json!({"properties": {"cache.index.mode": "pin"}}))
+        .send()
+        .await
+        .expect("send patch valid");
+    let status = resp.status().as_u16();
+    let body = resp.text().await.unwrap_or_default();
+    assert_eq!(
+        status, 501,
+        "PATCH must not report an unpersisted write as done; body={body}"
+    );
+
+    // PATCH an INVALID key -> still 400: validation runs before the refusal.
+    let resp = http
+        .patch(server.url(&format!("/api/v2/collections/{collection_id}/properties")))
+        .header("Authorization", "Api-Key dev-key")
+        .json(&serde_json::json!({"properties": {"cache.index.mode": "pinn"}}))
+        .send()
+        .await
+        .expect("send patch invalid");
+    assert_eq!(resp.status().as_u16(), 400, "a bad key is a 400, not a 501");
+}
