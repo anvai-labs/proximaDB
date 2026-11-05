@@ -900,8 +900,13 @@ impl UnifiedSwiftReader {
         _meta: &SuperBlockMetadata,
         _id_filter: &Option<Vec<String>>,
     ) -> Result<bool> {
-        // Check if we should read bloom filter
-        Ok(_id_filter.is_some() && _meta.bloom_filter_size > 0)
+        // Claim nothing (TD-FACADE-1). This used to answer
+        // `id_filter.is_some() && meta.bloom_filter_size > 0` -- a size test
+        // wearing a bloom name -- and returned `true` into a path whose very
+        // next step (`read_bloom_filter`, below) always errors. Saying "no" is
+        // consistent with the three siblings that honestly report the
+        // capability as unimplemented, and keeps callers on the full-read path.
+        Ok(false)
     }
 
     async fn read_bloom_filter(&self, _sb_id: u32) -> Result<Vec<u8>> {

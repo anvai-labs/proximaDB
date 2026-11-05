@@ -5,7 +5,6 @@
 
 use anyhow::Result;
 use futures::future::join_all;
-use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, error, info, trace, warn};
 
@@ -16,46 +15,42 @@ use crate::storage::persistence::filesystem::FileSystem;
 use proximadb_distance_kernel::DistanceMetric;
 
 use super::SStableMetadata;
-// Filter evaluator now uses unified module from core
-use crate::storage::engines::core::formats::proximablocks::bloom_filter::{
-    SerializedBloomFilter, factory::BloomFilterFactory,
-};
 
 /// Check if SSTable might contain specific vector IDs using bloom filter
 pub async fn check_bloom_filter(
     sstable: &SStableMetadata,
     vector_ids: &[String],
 ) -> Result<Vec<bool>> {
-    if let Some(ref bloom_data) = sstable.bloom_filter {
-        // Create SerializedBloomFilter structure from raw data
-        // We need to parse the serialized format properly
-        // For now, use the factory directly with appropriate config
-        let config = crate::core::bloom::BloomFilterConfig {
-            bits_per_key: 10,
-            expected_items: 10000,
-            enabled: true,
-            ..Default::default()
-        };
-
-        let serialized = SerializedBloomFilter {
-            strategy_type: crate::core::bloom::BloomStrategy::ByteAligned,
-            version: SerializedBloomFilter::CURRENT_VERSION,
-            config: config.clone(),
-            data: bloom_data.clone(),
-            metadata: HashMap::new(),
-        };
-        let bloom = BloomFilterFactory::from_serialized(&serialized)?;
-
-        // Check each ID
-        let results: Vec<bool> = vector_ids
-            .iter()
-            .map(|id| bloom.might_contain(id.as_bytes()))
-            .collect();
-        Ok(results)
-    } else {
-        // No bloom filter, assume all might be present
-        Ok(vec![true; vector_ids.len()])
+    // Bloom checking is not implemented here. CONSERVATIVE: every id "might
+    // be present" -- no pruning (TD-BLOOM-1 / TD-FACADE-1). This function stays
+    // on the capability-facade count on purpose: answering safely is a
+    // severity fix, not an implementation.
+    //
+    // HELIX background compaction DOES write real filters into
+    // `bloom_filter` (`helix/compaction.rs`: `BloomFilterConfig::for_sstable(
+    // chunk.len())` -> `Some(bloom.serialize())`). What it does not persist is
+    // the filter's parameters. This reader used to rebuild a filter around
+    // those bytes with *invented* ones -- `bits_per_key: 10`,
+    // `expected_items: 10000`, `ByteAligned` -- while the writer sized for
+    // `chunk.len()` items. `might_contain` is only meaningful under the
+    // writer's (k, m, strategy), so its answers were arbitrary, and the false
+    // ones are consumed by `search_sstable` as "prune this SSTable" => silently
+    // dropped results.
+    //
+    // Answering "maybe present" is the safe answer that exists, so it wins over
+    // a refusal: an `Err` here would propagate through `?` in every caller and
+    // fail the whole query the day someone passes `candidate_ids`. (Today all
+    // three `search_sstable` callers pass `candidate_ids: None`, so this
+    // function is not reached at all.) Making pruning real means persisting the
+    // parameters next to the bits and parsing them here -- an on-disk format
+    // change under CLAUDE.md #8.
+    if sstable.bloom_filter.is_some() {
+        debug!(
+            "HELIX bloom bytes present but filter parameters are not persisted; \
+             not pruning (TD-BLOOM-1)"
+        );
     }
+    Ok(vec![true; vector_ids.len()])
 }
 
 /// Search an SSTable for nearest vectors with type-safe FilterExpression support

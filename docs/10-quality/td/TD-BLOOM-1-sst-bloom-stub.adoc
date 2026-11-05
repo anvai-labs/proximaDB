@@ -5,9 +5,9 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | **Open (2026-11-04). Filed from the post-program victor clone scan (cluster A2 bonus find).**
-| Priority | P2 — the stub can produce FALSE NEGATIVES (skip a file that contains the id) if any writer emits real bloom bytes; today it likely only misestimates, but nothing documents the contract.
-| Relates to | link:TD-SDKERR-1-python-sdk-hides-failures-and-drops-filters.adoc[TD-SDKERR-1] (same fake-implementation-shadows-real-primitive shape); format-migration discipline #8 in CLAUDE.md
+| Status | **Mitigated (2026-11-05): the probe is removed and `can_skip_file` answers conservatively; real bloom pruning remains UNBUILT.** Opened 2026-11-04 from the post-program victor clone scan (cluster A2 bonus find). The direction question below is now answered — see <<answer>>.
+| Priority | **P1** (re-graded from P2). The failure direction is confirmed silent data loss on read, and the trigger is a one-line integration: the module doc at `src/storage/engines/core/io/zero_copy/mod.rs` advertises `optimize_file_access` as the entry point, and anyone who wires it on trust would have shipped skipped files on that commit. Mitigated, not closed, because the capability the name promises still does not exist.
+| Relates to | link:TD-FACADE-1-capability-facades.adoc[TD-FACADE-1] (the class — this TD is its founding instance alongside TD-WAL-6); link:TD-SDKERR-1-python-sdk-hides-failures-and-drops-filters.adoc[TD-SDKERR-1] (same fake-implementation-shadows-real-primitive shape); format-migration discipline #8 in CLAUDE.md
 | Component | `crates/storage/proximadb-engine-core/src/proximablocks/sst_metadata.rs` (`check_bloom_simple`, used once inside `can_skip_file`), `src/storage/engines/sst/collections.rs` (neighboring prototype `check_bloom_filter`)
 | Evidence | `check_bloom_simple` is a 1-byte-probe placeholder ("In practice, would use proper bloom filter implementation") over `variable_data[bloom_filter_offset..+size]`. REAL bloom implementations exist and are unused on this path: `crates/foundation/proximadb-bloom` (`SstableBloomFilter`, builders, fpr sizing) and the re-export module `proximablocks/bloom_filter.rs`. The neighboring `collections.rs` path is also prototype-grade ("In a real implementation, this would…") and conservatively returns true.
 |===
@@ -33,6 +33,74 @@ read by the stub = systematic false negatives = silently missing vectors.
 3. If no writer exists: either build the writer (feature work, out of TD
    scope) or delete the bloom branch of `can_skip_file` (conservative false,
    honest) until one exists.
+
+[[answer]]
+== Answer (traced 2026-11-05): option 3 — no writer exists, and the reader fabricated one
+
+Direction question 1 above, answered with code evidence:
+
+* **There is no writer.** Nothing emits filter bytes into the region this path
+  read. The reader *fabricated* the buffer itself: `extract_metadata` did
+  `fs.read_range(file_path, BLOOM_OFFSET = 0, BLOOM_SIZE = 4096)` and stored
+  those bytes as the "global bloom filter". Offset 0 is the file's **magic +
+  header** — the real SST reader locates the filter at `8 + header.header_size`
+  (`src/storage/engines/sst/readers/sst_query_engine.rs`). That is why no length
+  check ever tripped: the buffer was always a plausible 4 KiB.
+* **The direction is false negatives.** `check_bloom_simple` returned
+  `bloom_data[hash % len] != 0`, and `can_skip_file` consumed a `false` as
+  "definitely absent" → `return true` (skip the whole file). Header regions are
+  padding-heavy, so `0x00` was the *likely* byte — skipping files that hold the
+  id. (The likelihood is inferred; the direction is not.)
+* **Two more defects in the same six lines:** `DefaultHasher` is explicitly not
+  stable across Rust releases; and the override dropped the empty-buffer guard
+  that the trait default in `proximadb-storage-common::zero_copy_traits` has,
+  so `bloom_filter_size == 0` would panic on `hash % 0`. The unbounded slice
+  `variable_data[offset..offset+size]` was a second panic site.
+* **Why it was not a live bug:** zero production callers. The only wrapper
+  (`zero_copy/metadata_cache.rs`) is `#[allow(dead_code)]`; its owning
+  `ZeroCopyMetadataCache` is constructed only under `#[cfg(test)]`; the
+  *production* cache is a different type (`FilesystemMetadataStore`) whose
+  `can_skip` flag is hard-written `false`. Latent, not active.
+* **The real primitive was already in hand:** `SstMetadata` imports
+  `proximadb_bloom::SstableBloomFilter` and declares a `global_bloom` field of
+  that type (`#[allow(dead_code)]`, never populated). One caution recorded in
+  TD-FACADE-1: that crate's `xxhash64`/`cityhash64` are themselves
+  self-declared placeholders, so "use `proximadb-bloom`" means use it with
+  `murmur3_32`, or replace those first.
+
+=== What shipped (remedy 3)
+
+* The bloom branch of `can_skip_file` is removed; ID lookups now fall through
+  to "cannot skip" (conservative, honest), with an in-code DO-NOT-REINTRODUCE
+  note explaining all of the above.
+* `check_bloom_simple` is deleted.
+* The fabricated 4 KiB read is deleted (one fewer range read per metadata
+  load); the header reports `bloom_filter_{offset,size} = 0/0` = no filter.
+  0-size was already representable in the serialized metadata, so this changes
+  values, not layout — no format migration.
+* The HELIX and SWIFT readers had the same shape (guessed parameters; a size
+  test wearing a bloom name) and now answer conservatively ("might be
+  present" / claim nothing). HELIX does have a real writer — compaction stores
+  real filter bits — but no persisted parameters, so the bits cannot be read
+  back correctly. RAPTOR's all-zero-bitmap serializer now errors. All recorded
+  in TD-FACADE-1.
+* **Downgrade hazard (layout-safe, not rollback-safe).** SST metadata blobs can
+  persist across restarts via the zero-copy mmap metadata cache
+  (`zero_copy/metadata_cache.rs`, `serialize_metadata` → disk → `load_from_disk`).
+  Old blob + new binary is fine: the new `can_skip_file` ignores the bloom
+  fields, and nothing indexes `variable_data` by a hardcoded index offset (the
+  4096 → 0 shift is harmless). New blob (0/0) + an *older* binary would reach
+  the old probe's `hash % 0` and panic. Inert today — `ZeroCopyMetadataCache`
+  has no production construction site — but anyone activating that cache
+  must not roll back across this change.
+
+=== Still open
+
+Building real bloom pruning: a writer that emits a real filter **with its
+parameters**, and a reader that parses them — under discipline #8 (version or
+magic marker, legacy fallback when absent, default-OFF until baked, round-trip +
+recall gate against the unpruned baseline). Until then, `can_skip_file` must
+never answer "absent" for an ID lookup.
 
 == Non-goals
 

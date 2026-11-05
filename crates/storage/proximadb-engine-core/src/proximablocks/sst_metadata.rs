@@ -142,23 +142,26 @@ impl SstMetadataSerializer {
         // Parse footer to get block locations
         let block_locations = self.parse_footer(&footer_data)?;
 
-        // Read global bloom filter
-        const BLOOM_OFFSET: u64 = 0;
-        const BLOOM_SIZE: u64 = 4096;
-        let global_bloom_data = fs.read_range(file_path, BLOOM_OFFSET, BLOOM_SIZE).await?;
+        // NO global-bloom read (TD-BLOOM-1). This used to be
+        // `fs.read_range(file_path, 0, 4096)` labelled "global bloom filter",
+        // but offset 0 is the file's magic + header -- the real filter lives at
+        // `8 + header.header_size` and no writer emits one here. Reading it
+        // bought nothing except a 4 KiB range read per metadata load and a
+        // plausible-looking buffer that made the `can_skip_file` probe's
+        // "definitely absent" answers look legitimate. The header's
+        // bloom_filter_{offset,size} are reported as 0 below = honestly "no
+        // filter present"; 0-size is already representable in the serialized
+        // metadata format, so this changes values, not layout.
 
-        // Read index block
-        const INDEX_OFFSET: u64 = BLOOM_SIZE;
+        // Read index block. The 4 KiB start offset is the pre-existing file
+        // layout assumption and is deliberately unchanged here.
+        const INDEX_OFFSET: u64 = 4096;
         const INDEX_SIZE: u64 = 60 * 1024; // 60KB
         let index_data = fs.read_range(file_path, INDEX_OFFSET, INDEX_SIZE).await?;
 
         // Extract statistics from blocks
         let mut blocks = Vec::new();
         let mut variable_data = Vec::new();
-
-        // Add global bloom filter to variable data
-        let bloom_offset = variable_data.len();
-        variable_data.extend_from_slice(&global_bloom_data);
 
         // Add index data to variable data
         let index_offset = variable_data.len();
@@ -192,8 +195,9 @@ impl SstMetadataSerializer {
         let global = SstGlobalHeader {
             file_size,
             num_blocks: blocks.len() as u32,
-            bloom_filter_offset: bloom_offset as u32,
-            bloom_filter_size: global_bloom_data.len() as u32,
+            // 0/0 = no global filter present (TD-BLOOM-1); see the read above.
+            bloom_filter_offset: 0,
+            bloom_filter_size: 0,
             index_offset: index_offset as u32,
             index_size: index_data.len() as u32,
             total_records: blocks.iter().map(|b| b.record_count as u64).sum(),
@@ -492,27 +496,37 @@ impl MetadataSerializer for SstMetadataSerializer {
             return true; // Entire file is expired
         }
 
-        // Check global bloom filter for ID lookups
-        if !query_context.id_lookups.is_empty() {
-            // Load and check global bloom filter
-            let global_bloom_data =
-                &sst_metadata.variable_data[sst_metadata.global.bloom_filter_offset as usize
-                    ..(sst_metadata.global.bloom_filter_offset
-                        + sst_metadata.global.bloom_filter_size) as usize];
-
-            // Simple bloom check (would use proper bloom filter implementation)
-            let mut any_might_exist = false;
-            for id in &query_context.id_lookups {
-                if self.check_bloom_simple(global_bloom_data, id.as_bytes()) {
-                    any_might_exist = true;
-                    break;
-                }
-            }
-
-            if !any_might_exist {
-                return true; // None of the IDs exist in this file
-            }
-        }
+        // NO BLOOM PRUNING FOR ID LOOKUPS -- deliberately (TD-BLOOM-1).
+        //
+        // This branch used to probe `variable_data[bloom_filter_offset..]` with a
+        // one-byte-per-key "simple bloom check" and treat a zero byte as
+        // "definitely absent", returning `true` = skip the whole file. Three
+        // things were wrong with it, and the combination is silent data loss on
+        // read rather than a slow path:
+        //
+        //   1. Those bytes are not a filter. `extract_metadata` reads
+        //      `BLOOM_OFFSET = 0, BLOOM_SIZE = 4096` -- the file's magic +
+        //      header region -- and labels it the global bloom. The real SST
+        //      reader puts the filter at `8 + header.header_size`
+        //      (`sst/readers/sst_query_engine.rs`). No writer emits filter bytes
+        //      at offset 0, so the probe sampled header padding, where `0x00` is
+        //      the likely value => "absent" => skip a file that holds the id.
+        //   2. The hash was `DefaultHasher`, which is explicitly not stable
+        //      across Rust releases, so even a self-consistent writer/reader
+        //      pair would diverge on a toolchain bump.
+        //   3. Both the slice above and `hash % bloom_data.len()` could panic
+        //      (out-of-range offsets; empty filter), violating the no-panic
+        //      policy. The sibling trait default in
+        //      `proximadb-storage-common::zero_copy_traits` guards the empty
+        //      case; this override had silently dropped that guard.
+        //
+        // An absent capability must answer conservatively: fall through and read
+        // the file. Wiring real pruning means populating `global_bloom` (the
+        // field is declared below and already imports
+        // `proximadb_bloom::SstableBloomFilter`) from bytes a writer actually
+        // emits, which is an on-disk format change under CLAUDE.md #8 -- not a
+        // one-line re-enable here. DO NOT reintroduce a probe that can answer
+        // "absent"; see TD-BLOOM-1 and TD-FACADE-1.
 
         // Check vector similarity threshold
         if let Some(threshold) = query_context.distance_threshold {
@@ -584,14 +598,6 @@ impl MetadataSerializer for SstMetadataSerializer {
     }
 
     // Helper methods
-    fn check_bloom_simple(&self, bloom_data: &[u8], key: &[u8]) -> bool {
-        // Simplified bloom filter check
-        // In practice, would use proper bloom filter implementation
-        let hash = self.hash_bytes(key);
-        let index = (hash % bloom_data.len() as u64) as usize;
-        bloom_data[index] != 0
-    }
-
     fn hash_string(&self, s: &str) -> u64 {
         self.hash_bytes(s.as_bytes())
     }
@@ -651,5 +657,75 @@ impl Clone for SstMetadata {
             global_bloom: parking_lot::RwLock::new(None), // Reset lazy-loaded data
             block_blooms: parking_lot::RwLock::new(HashMap::new()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A metadata record shaped exactly like the pre-TD-BLOOM-1 reader built
+    /// it: a header claiming a 4 KiB "global bloom" at offset 0, over bytes that
+    /// are all zero (header padding). `max_timestamp` is caller-chosen so the
+    /// TTL branch can be exercised independently.
+    fn fabricated_bloom_metadata(max_timestamp: u64) -> SstMetadata {
+        const FAKE_BLOOM_LEN: u32 = 4096;
+        SstMetadata {
+            global: SstGlobalHeader {
+                file_size: 1 << 20,
+                num_blocks: 0,
+                bloom_filter_offset: 0,
+                bloom_filter_size: FAKE_BLOOM_LEN,
+                index_offset: FAKE_BLOOM_LEN,
+                index_size: 0,
+                total_records: 100,
+                min_timestamp: 0,
+                max_timestamp,
+                compression_ratio: 0,
+                reserved: [0; 7],
+            },
+            blocks: Vec::new(),
+            variable_data: vec![0u8; FAKE_BLOOM_LEN as usize],
+            global_bloom: parking_lot::RwLock::new(None),
+            block_blooms: parking_lot::RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// TD-BLOOM-1 pin. This is the exact scenario the removed probe got wrong:
+    /// every byte it sampled was 0x00, so it answered "definitely absent" for
+    /// every id and `can_skip_file` skipped a file that may hold them. With no
+    /// real filter behind the bytes, an ID lookup must never be pruned.
+    #[test]
+    fn id_lookup_is_never_pruned_without_a_real_filter() {
+        let serializer = SstMetadataSerializer::new(crate::testutil::noop_filesystem_port());
+        let metadata = fabricated_bloom_metadata(u64::MAX);
+        let ctx = QueryContext::for_id_lookup(vec![
+            "id-present-in-file".to_string(),
+            "another-id".to_string(),
+        ]);
+
+        assert!(
+            !serializer.can_skip_file(&metadata, &ctx),
+            "can_skip_file pruned an ID lookup on bytes that are not a bloom filter \
+             (TD-BLOOM-1): this is the false-negative / silent-data-loss direction"
+        );
+    }
+
+    /// Positive control for the pin above: `can_skip_file` must still be able to
+    /// answer `true` when a real criterion holds, or the pin would pass merely
+    /// because the function had been reduced to `false`. The TTL branch is that
+    /// criterion: every record is older than the threshold.
+    #[test]
+    fn ttl_expiry_still_prunes_the_whole_file() {
+        let serializer = SstMetadataSerializer::new(crate::testutil::noop_filesystem_port());
+        let metadata = fabricated_bloom_metadata(1_000);
+        let mut ctx = QueryContext::for_id_lookup(vec!["any".to_string()]);
+        ctx.metadata_filters
+            .insert("ttl_threshold".to_string(), "2000".to_string());
+
+        assert!(
+            serializer.can_skip_file(&metadata, &ctx),
+            "TTL pruning must still fire when max_timestamp < ttl_threshold"
+        );
     }
 }

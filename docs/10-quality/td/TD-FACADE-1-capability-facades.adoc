@@ -1,0 +1,235 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-FACADE-1: capability facades — code named for a capability it does not implement
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open (2026-11-05), ratcheted.** The class is now gated by `scripts/count_capability_facades.py` (`make capability-facade-no-regression` in `work-commit-check`, plus its own CI step): a new self-declared facade in any file fails CI, and removals must lower the baseline. Limits are listed under <<limits>>. The bloom founding instance is mitigated (link:TD-BLOOM-1-sst-bloom-stub.adoc[TD-BLOOM-1]); the inventory below remains.
+| Priority | P1 for the class (live-path and public-uncalled tiers); individual entries graded below.
+| Relates to | link:TD-WAL-6-proto-and-avro-wal-slots-are-bincode-facade.adoc[TD-WAL-6] and link:TD-BLOOM-1-sst-bloom-stub.adoc[TD-BLOOM-1] (founding instances); link:TD-SDKERR-1-python-sdk-hides-failures-and-drops-filters.adoc[TD-SDKERR-1] (the Python SDK twin — `count_silent_failures.py` is this guard's sibling); CLAUDE.md #12 ("silent duplication of an existing primitive"), #6 (measure, don't assert), #16 (read-path correctness), #19 (retire dead twins)
+| Found | 2026-11-05: 32 of the 197 B-harness findings (`report/llm_module_analysis/`) shared one shape; a census of `src/` + `crates/` then traced liveness per site by hand.
+|===
+
+== The defect
+
+A *capability facade* is a function, type or config variant whose **name,
+signature or documentation promises a capability its body does not implement** —
+usually while a real implementation of that capability exists elsewhere in the
+workspace. It is worse than a missing feature because the caller cannot tell:
+everything visible reads as working, so the next integrator wires it and ships
+the consequence.
+
+Canonical example (TD-BLOOM-1, before this TD's PR):
+
+[source,rust]
+----
+fn check_bloom_simple(&self, bloom_data: &[u8], key: &[u8]) -> bool {
+    // Simplified bloom filter check
+    // In practice, would use proper bloom filter implementation
+    let hash = self.hash_bytes(key);
+    bloom_data[(hash % bloom_data.len() as u64) as usize] != 0
+}
+----
+
+…probing bytes that were the file's header, consumed as "definitely absent →
+skip the file", while `proximadb_bloom::SstableBloomFilter` was imported into the
+very same struct and never populated.
+
+== Severity model — liveness decides, not shape
+
+The same facade is a bug or debt depending only on whether anything reaches it.
+Three tiers; every entry below is graded by a traced call chain, not a name-grep:
+
+[cols="1,3"]
+|===
+| **Live-path** | Production callers reach it. A bug *now*.
+| **Public-uncalled** | Zero callers, but `pub`, documented as working, often named identically to a live sibling. A **trap**: the TD-TENANT-4 "built-never-called" class — the integration that activates it is one line and looks safe.
+| **Private/dead** | Unreachable and not advertised. Debt.
+|===
+
+The **failure direction** matters as much as the tier. A facade that answers
+*conservatively* (never prune, cannot skip, `Err`) costs performance at worst. A
+facade that answers *permissively* — claims absence, claims presence, claims a
+prune or a save happened — produces wrong results or lying metrics. The model
+for a legitimate deliberate narrowing is
+`src/cluster/partition_lease.rs` `LockIntent::is_compatible_with`: it returns
+`false` for every pair (conservative) and its doc says exactly why ("MVP DML
+locking uses the existing single-holder object-store lease … intentionally not
+claimed here"). Conservative answer, stated reason — that is not a facade.
+
+== The founding finding: bloom pruning
+
+**Bloom-filter pruning was advertised across four storage engines and
+implemented in none.** Fixed in this TD's PR (all now conservative or refusing;
+no wire/format change):
+
+[cols="1,3,2"]
+|===
+| Site | Facade | Now
+
+| SST `proximablocks/sst_metadata.rs` `can_skip_file`/`check_bloom_simple`
+| Probed the file's magic+header (read from offset 0) as a filter; `0x00` ⇒ skip file. `DefaultHasher`; two panic sites. Public-uncalled.
+| Branch + probe + fabricated 4 KiB read removed; header reports 0/0. See TD-BLOOM-1.
+
+| HELIX `helix/readers.rs` `check_bloom_filter`
+| Built a filter around stored bytes with **invented** `(bits_per_key=10, expected_items=10000, ByteAligned)`. A real writer **does** exist — background compaction (`helix/compaction.rs`) stores `Some(bloom.serialize())` sized `for_sstable(chunk.len())` — but persists no parameters, so the reader's guesses never matched it. Not reached today: all three `search_sstable` callers pass `candidate_ids: None`.
+| Answers "might be present" (no pruning). A refusal was rejected in review: it would fail every query through `?` the day `candidate_ids` is wired.
+
+| SWIFT `swift/proximablocks_compact_reader.rs` `should_read_superblock_bloom`
+| A `size > 0` test wearing a bloom name; returned `true` into a path whose next step always errors. Its three siblings honestly said "not yet implemented".
+| Returns `false` (claims nothing).
+
+| RAPTOR `raptor/artus_bloom.rs` `serialize_bloom`
+| Wrote an **all-zero** bitmap (`BloomFilterStrategy` exposes no bit accessor) ⇒ a correct filter deserialised to "absent for every key". Dead (tests + `experimental-engines`).
+| Returns an error.
+
+| SST IO `proximablocks/sst_io_layer.rs` `check_bloom` / `find_block_for_key`
+| `check_bloom` was `true // Placeholder` (safe, but named as a filter). `find_block_for_key` returned block 0 for every key; its `None` arm would have reported existing keys absent **and** credited `stats.bytes_saved`. Its callers `read_record` / `batch_read_with_filtering` have zero callers.
+| Renamed `bloom_might_contain_unfiltered` (documented conservative); `find_block_for_key` errors.
+
+| DataFusion `engine_adapters/sst_adapter.rs`
+| Set `bloom_filter = Some(vec![])` — an empty `Some` is not `None` to a pruner.
+| No longer set.
+|===
+
+**Coverage gap: the RAPTOR pin does not run in CI, and the SWIFT change has no
+pin at all.** Both engines are behind `experimental-engines`, and that
+feature-matrix leg runs only `cargo check --tests`. The RAPTOR refusal pin
+(`artus_bloom.rs` `test_serialize_deserialize_blooms`) passes locally
+(`cargo nextest run -p proximadb --lib --features experimental-engines`), but a
+reintroduced all-zero serializer would fail it while CI stays green. The SWIFT
+`should_read_superblock_bloom → false` change is untested. Both engines are
+slated for removal (TD-152); until then, run that lane locally when touching
+them.
+
+**The "real implementation" is itself partly a facade.** `crates/foundation/proximadb-bloom/src/lib.rs`
+has real filter machinery (`SstableBloomFilter`, FPR sizing, serialize/deserialize,
+`murmur3_32`), but its `hash::xxhash64` and `hash::cityhash64` are self-declared
+placeholders ("Simple placeholder - in production, use xxhash-rust crate"), and
+`cityhash64`'s doc calls it "FNV-1a" while the body is neither. The guard found
+this; it falsified the claim, made while planning this TD, that the crate was
+"complete". Building real bloom pruning must use `murmur3_32` or replace those
+two first.
+
+== Open inventory (not fixed by this PR)
+
+Graded by traced liveness. Entries marked *(inferred)* were not traced to a
+request.
+
+[cols="1,2,1,1"]
+|===
+| Site | Facade | Tier | Direction
+
+| `src/storage/engines/sst/trait_impl.rs` `vector_by_id` + `sst/collections.rs` `contains_vector`
+| `contains_vector` returns `true` if any `.sst` exists (its bloom check is `Ok(true)`); `vector_by_id` then returns `None` regardless ("For now, return None as a placeholder").
+| Live surface — `SstEngine` is constructed in production; a request path to `vectors_by_ids` was **not** found *(inferred)*
+| Wrong results (absent)
+
+| `crates/storage/proximadb-storage-common/src/text_search/fulltext_index.rs` `TokenizerType::Simple`
+| Six advertised tokenizers, five implemented: `tokenize_simple` is `{ self.tokenize_standard(text) }`, and the two docs are swapped. **Invisible to the guard** (no marker comment).
+| Live — `for_semantic_search()` selects `Simple`
+| Lying config; "fixing" it silently changes indexing and invalidates existing indexes
+
+| `src/network/auth/rbac.rs` `user_belongs_to_tenant` (+ `user_has_collection_access`)
+| Returns `true` unconditionally — it is the tenant-isolation gate inside `check_permission_with_context`.
+| One wiring step from live — it HAS callers (`src/network/auth/middleware.rs`, two sites) and the middleware is already written; the chain is dead only because the network `AuthService` is never constructed outside `src/network/auth/`. A `pub struct RbacService` named identically to the live `src/security/rbac_service.rs`. **Highest misadoption risk in the census.**
+| Cross-tenant authorization bypass if adopted
+
+| `src/security/rbac_service.rs` `get_accessible_collections`
+| Returns `vec!["*"]` ("Placeholder").
+| Live service; consumers **not** audited *(inferred)*
+| Wrong if any caller treats the vec as literal ids
+
+| `crates/foundation/proximadb-distance-kernel/src/quantized.rs` `compute_batch_distances_simd`, `evict_pq_cache_entries`
+| `_simd` is a scalar loop ("For now, fall back to individual processing") while `engine.rs` in the same crate has ~50 real SIMD sites; LRU eviction drops the first 10 HashMap keys (arbitrary, not LRU); other policies are no-ops.
+| Reached only via NOVA `advanced_search`, which has **zero callers** — public-uncalled
+| Perf claim with no evidence (CLAUDE.md #6); lying cache-policy config
+
+| `src/storage/engines/nova/columnar_integration.rs` `advanced_search`
+| Both branches compute distances, discard them (`let _distances`), return `Vec::new()` ("a placeholder that won't work in production").
+| Public-uncalled
+| Silent empty results if wired
+
+| `src/core/search/hybrid/reranker.rs` `Reranker`
+| `rerank` truncates; `apply_filters` returns results **unfiltered**; `boost` ignores its args. Real reranker: `proximadb_query::reranking::CrossModalReranker`.
+| Dead (tests only), `pub`
+| Filter bypass if adopted
+
+| `src/storage/engines/core/search/progressive_search.rs` PQ scoring
+| "Asymmetric distance" that never reads the query (`let _query_sub`); ranks by stored code alone.
+| Dead
+| Recall-destroying ordering if adopted
+
+| `src/graph/query/executor.rs`, `pattern.rs`, `planner.rs`
+| Execution returns `Ok(vec![])` / empty `RecordBatch`; validation is `Ok(())`. Honestly self-labelled stubs.
+| Dead
+| Empty == "no matches"
+
+| `src/security/advanced_features.rs` IP-range check; `src/network/auth/providers.rs` LDAP
+| "simplified implementation" / "would use an LDAP client".
+| Not traced *(inferred)*
+| Security-relevant; audit before relying
+|===
+
+== The guard
+
+`scripts/count_capability_facades.py`, modelled on `count_silent_failures.py`.
+It counts **self-declared non-implementations** — a facade marker
+(`placeholder`, `not (yet) implemented`, `in a real implementation`,
+`in practice, would`, `would use/implement/need/require`, `simplified`, `stub`,
+`for now,`/`for now.`, `won't work in production`) in a function's doc or body,
+across non-test Rust under `src/`, `crates/`, `apps/`. Per-file,
+bidirectional ratchet against
+`docs/_internal/roadmap/CAPABILITY_FACADE_BASELINE.json`; `--callers` adds an
+advisory triage hint. It runs in `make work-commit-check` and as its own CI step,
+behind a dedicated `capability_facade` change filter that lists the script and
+baseline themselves, so a PR that edits only the guard still runs it.
+
+Calibrated against ten hand-confirmed facades (2026-11-05): catches all 8 that
+self-declare; misses the 2 that do not (`tokenize_simple`,
+`should_read_superblock_bloom`). Body shape is deliberately *not* a filter —
+the motivating `check_bloom_simple` has three real statements, uses its
+parameters and returns an expression. `TODO` and `Deferred:` are deliberately
+excluded: they mark future enhancement of working code, and `Deferred:` alone
+inflated the count by about 500 without adding a real defect (measured before
+the doc-comment fix below, so the absolute figures from that run are stale).
+
+**Baseline at introduction: 1039 sites** (develop, same parser: 1042; this PR's
+−3 are real removals). That number is the finding: about a thousand places in
+non-test Rust where the code says, in its own comments, that it is not what it
+is named.
+
+[[limits]]
+=== What the guard does NOT certify
+
+* **Facades that do not admit themselves** are invisible (recall bound, above).
+* **Honest refusals are counted** (`Err("... not implemented ...")`): making a
+  facade honest is a severity fix and leaves the count unchanged; only
+  implementing or deleting lowers it. Rewording a message to drop a marker is
+  the one way to game it, and is forbidden in the script's docstring.
+* **A site that moves within one file** (one marker removed, one added) keeps
+  that file's count flat and is not seen. Cross-file trades *are* caught.
+
+=== Defects found in the guard by its own review
+
+The fresh-agent review of the introducing PR found the first version read doc
+comments only for `pub fn`/`pub(crate) fn`: slicing at the `fn` token left the
+method's indentation (or `async `/`const `/`unsafe `) as a "blank" line, ending
+the scan. About 50 doc-only markers were hidden, and one site in this very PR
+(`check_bloom` → `bloom_might_contain_unfiltered`) had dropped out of the count
+only because its marker moved from body to doc — the rewording loophole, reached
+by accident. Fixed before merge, with three latent parser issues (`'\u{..}'`
+char literals, raw strings, `#[cfg(test)]` on a non-`mod` item) and a
+total-only comparison (now per-file).
+
+== Direction
+
+. Burn down the **public-uncalled** tier first: each is one line from becoming a
+  live bug. For each: implement it, delete it, or make it refuse
+  conservatively with a stated reason (the `partition_lease.rs` model).
+. Trace the two *(inferred)* live items (SST `vector_by_id`;
+  `get_accessible_collections` consumers) before grading them further.
+. Real bloom pruning is a separate feature build under CLAUDE.md #8 (see
+  TD-BLOOM-1 "Still open"), and must not use the placeholder hashes above.
+. Every PR that removes a facade lowers the baseline in the same commit.
