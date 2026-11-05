@@ -57,7 +57,7 @@ region in one PAX object. This TD makes the tier-1 fan-out POLICY.
   function both consumers call.
 * `band_ladder(rowgroup_bytes)` — discrete rungs DERIVED from the
   rowgroup geometry (the per-backend IOPS budget: 4 MiB cloud/Azure,
-  8 MiB S3, 1 MiB local): `[rg/4, rg/2, rg, 2rg, 4rg]`. Band edges live
+  8 MiB S3, 1 MiB local): `[rg/4, rg/2, rg, 2rg, 4rg, 8rg]` — the 8x rung is REQUIRED: stopping at 4x put every budget above it on one rung, so the `byte_budget@8MB` and `@16MB` arms tied and the 32 MiB cap was unreachable (two tests pin this). Band edges live
   here and nowhere else.
 * `resolve_probe_policy(properties, tags, server)` — the 4-layer chain
   (property > tag > server TOML > code), exported as the ONLY resolution

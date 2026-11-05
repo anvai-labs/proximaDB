@@ -635,12 +635,20 @@ fn cp_cfg(mult: f32) -> crate::core::config::CoarseProbeConfig {
 
 #[test]
 fn default_probe_quality_and_backend_ranges_match_sift_acceptance() {
-    // Install the defaults AUTHORITATIVELY: `init_coarse_probe_settings(None)`
-    // is get_or_insert by design, so under the libtest fallback (one
-    // process) it would inherit whatever a previously-run test installed.
-    init_coarse_probe_settings(Some(&crate::core::config::CoarseProbeConfig::default()));
+    // Assert the PURE resolver against the default policy: this test must
+    // not read OR write the process-global coarse-probe settings. Reading it
+    // let a prior test's install leak in; writing it (the round-2 fix) let
+    // this test clobber `toml_coarse_probe_config_wins_over_default_init`
+    // mid-assertion under the shared-process libtest fallback.
     assert_eq!(
-        geometric_nprobe_root(30),
+        proximadb_storage_common::probe_policy::resolve_probe_plan(
+            &proximadb_storage_common::probe_policy::ProbePolicy::default(),
+            30,
+            0,
+            4 * 1024 * 1024,
+            0,
+        )
+        .cells,
         11,
         "the one-segment SIFT1M geometry needs 11/30 cells for recall@10 >= 0.98"
     );

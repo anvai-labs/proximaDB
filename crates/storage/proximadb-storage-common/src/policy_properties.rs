@@ -50,7 +50,7 @@ pub fn validate_policy_properties(properties: &HashMap<String, String>) -> Resul
         .find(|(key, _)| key.trim().to_ascii_lowercase().starts_with("probe."))
     {
         return Err(format!(
-            "{key}: per-collection probe properties are not consumed yet              (TD-RDSTRAT-14 deferred the search-path carrier). Configure the              probe policy with [storage.sst_config.coarse_probe] or              PROXIMADB_PAX_READ_PROBE_* until it lands"
+            "{key}: per-collection probe properties are not consumed yet (TD-RDSTRAT-14 deferred the search-path carrier). Configure the probe policy with [storage.sst_config.coarse_probe] or PROXIMADB_PAX_READ_PROBE_* until it lands"
         ));
     }
     Ok(())

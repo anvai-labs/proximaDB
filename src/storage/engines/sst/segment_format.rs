@@ -3656,7 +3656,7 @@ pub struct CoarseProbeSettings {
     /// TD-IVF-3 write-side floor on the coarse-PCA projection width; 0 = legacy
     /// formula. Read by `block_cluster::ivf_ncomp_floor()`.
     pub ncomp_floor: usize,
-    /// TD-RDSTRAT-9: the resolved probe policy (algorithm + budgets). The
+    /// TD-RDSTRAT-14: the resolved probe policy (algorithm + budgets). The
     /// numeric fields above are the policy's root-form params — kept flat
     /// because they predate it; `policy()` folds them.
     pub probe_algorithm: proximadb_storage_common::probe_policy::ProbeAlgorithm,
@@ -3756,7 +3756,7 @@ pub(crate) fn coarse_probe_settings() -> CoarseProbeSettings {
 }
 
 /// Fold the flat settings (the historical root-form params) into the
-/// TD-RDSTRAT-9 probe policy. All probe-band formulas live in
+/// TD-RDSTRAT-14 probe policy. All probe-band formulas live in
 /// `proximadb-storage-common::probe_policy` — tuned in ONE place.
 // TD-RDSTRAT-14: the RESOLVED policy, cached beside the settings — env
 // scans are not free and this sits on the per-query probe path. Cleared
@@ -3785,6 +3785,13 @@ fn warn_junk_env(name: &str, value: &str, expected: &str) {
 /// every other probe knob has), expressed as a [`ServerProbePolicy`] so
 /// resolution goes through the ONE exported path
 /// (`resolve_probe_policy`): no parallel hand-rolled resolver can drift.
+/// NOTE on timing: unlike the other probe env knobs (which are read per
+/// call), `PROXIMADB_PAX_READ_PROBE_*` is folded into the resolved policy
+/// and memoized per settings generation — so an in-process change after the
+/// first probe query is not picked up until the settings are re-seeded.
+/// That matches how the bench harness uses them (set once, per spawned
+/// server) and keeps the env scan off the per-query path.
+///
 /// Bounded like the property and TOML paths: dev/test build with
 /// overflow-checks, so an unbounded MiB->bytes multiply would abort the
 /// query path (mandate #4); in release it wraps, and `mb = 2^44` would
@@ -3882,7 +3889,7 @@ fn cached_probe_policy() -> proximadb_storage_common::probe_policy::ProbePolicy 
     resolved
 }
 
-/// Policy nprobe (TD-RDSTRAT-9): the resolved plan's cell count for a pool of
+/// Policy nprobe (TD-RDSTRAT-14): the resolved plan's cell count for a pool of
 /// `cells` candidates. The default (`sqrt`) is byte-for-byte the historical
 /// `ceil(sqrt(k_c) × multiplier)` clamped `[min, max]` then to the pool (the
 /// module's regression test pins equality across k_c 1..4096). Callers with
@@ -3937,7 +3944,7 @@ pub fn coarse_probe_enabled() -> bool {
 /// `ceil(sqrt(k_c) × multiplier)` from the TOML config
 /// (`[storage.sst_config.coarse_probe] nprobe_multiplier/min/max`), clamped to
 /// `k_c`. `>= k_c` is exact mode (every cell).
-/// TD-RDSTRAT-9: per-segment nprobe with the probe context the policy
+/// TD-RDSTRAT-14: per-segment nprobe with the probe context the policy
 /// needs (`path` → the rowgroup/IOPS geometry; the parsed directory →
 /// corpus rows and mean cell bytes). Env override precedence unchanged.
 fn coarse_probe_nprobe(

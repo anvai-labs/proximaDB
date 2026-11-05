@@ -3425,7 +3425,7 @@ def main() -> int:
     parser.add_argument(
         "--probe-base-mb",
         type=int,
-        help="byte_budget/log base probe budget in MiB (PROXIMADB_PAX_READ_PROBE_BASE_MB)",
+        help="byte_budget base probe budget in MiB; the root and log forms ignore it (PROXIMADB_PAX_READ_PROBE_BASE_MB)",
     )
     parser.add_argument(
         "--probe-cap-mb",

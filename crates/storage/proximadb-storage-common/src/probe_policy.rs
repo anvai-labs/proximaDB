@@ -1,4 +1,4 @@
-//! TD-RDSTRAT-9: the policy-driven probe-band controller — the single place
+//! TD-RDSTRAT-14: the policy-driven probe-band controller — the single place
 //! the coarse-probe fan-out formula lives.
 //!
 //! The probe count is the recall↔GETs dial of the IVF-family read path: rank
