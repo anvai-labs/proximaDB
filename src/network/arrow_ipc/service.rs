@@ -2537,10 +2537,19 @@ impl FlightService for ProximaFlightService {
                     )));
                 }
 
-                let full = params
-                    .get("full")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
+                // A present `full` must be a boolean: `"true"` or `1` used to
+                // become a silent plain compaction reporting success — the
+                // accepted-then-dropped knob this action refuses for
+                // target_segments (#2418 review round 14). Absent/null = false.
+                let full = match params.get("full") {
+                    None | Some(serde_json::Value::Null) => false,
+                    Some(serde_json::Value::Bool(value)) => *value,
+                    Some(other) => {
+                        return Err(TonicStatus::invalid_argument(format!(
+                            "full must be a boolean, got {other}"
+                        )));
+                    }
+                };
                 // TD-COMPACT-15 Experiment 3: optional per-request override
                 // of the FULL collapse target. Validated fail-closed — an
                 // invalid value (0, non-integer) is rejected, NOT silently

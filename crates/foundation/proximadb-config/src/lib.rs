@@ -1095,14 +1095,10 @@ impl CompactionConfig {
                     "{section}.consolidate_strategy must be 'hybrid' (got '{strategy}')"
                 ));
             }
-            tracing::warn!(
-                "{section}.consolidate_strategy = \"hybrid\" is deprecated and has no effect (hybrid is the default); remove it"
-            );
-        }
-        if self.consolidate_write_amp_limit.is_some() {
-            tracing::warn!(
-                "{section}.consolidate_write_amp_limit is deprecated and has no effect (background consolidate is refused, TD-COMPACT-16); remove it"
-            );
+            // "hybrid": accepted; reported by `deprecation_notes` once logging
+            // is up (validate runs during config load, BEFORE the tracing
+            // subscriber exists, so a warn! here was silently dropped —
+            // #2418 review round 14).
         }
         // A stated 0 MiB target has no meaning (it was silently clamped to
         // 1 MiB by the FULL merge's grouping). Fail closed at boot.
@@ -1112,6 +1108,27 @@ impl CompactionConfig {
             ));
         }
         Ok(())
+    }
+}
+
+impl CompactionConfig {
+    /// Deprecated-but-accepted settings to report once logging is up. Kept
+    /// out of `validate`, which runs during config load before any tracing
+    /// subscriber exists (a warning there never reached an operator). The
+    /// caller (`ProximaDB::start`) logs each note at WARN.
+    pub fn deprecation_notes(&self, section: &str) -> Vec<String> {
+        let mut notes = Vec::new();
+        if self.consolidate_strategy.is_some() {
+            notes.push(format!(
+                "{section}.consolidate_strategy is deprecated and has no effect (hybrid is the default; background consolidate is refused, TD-COMPACT-16); remove it"
+            ));
+        }
+        if self.consolidate_write_amp_limit.is_some() {
+            notes.push(format!(
+                "{section}.consolidate_write_amp_limit is deprecated and has no effect (background consolidate is refused, TD-COMPACT-16); remove it"
+            ));
+        }
+        notes
     }
 }
 
@@ -1541,8 +1558,23 @@ mod tests {
             .validate("storage.compaction_config")
         };
         // A dead knob shipped by #2407 ("hybrid" is already the default) is
-        // accepted with a deprecation warning, so an upgrade still boots.
+        // accepted, so an upgrade still boots, and reported as deprecated.
         assert!(validate("hybrid").is_ok());
+        assert_eq!(
+            CompactionConfig {
+                consolidate_strategy: Some("hybrid".to_string()),
+                consolidate_write_amp_limit: Some(50),
+                ..Default::default()
+            }
+            .deprecation_notes("storage.compaction_config")
+            .len(),
+            2
+        );
+        assert!(
+            CompactionConfig::default()
+                .deprecation_notes("s")
+                .is_empty()
+        );
         assert!(validate(" Hybrid ").is_ok());
         // An explicit request for the refused behaviour fails, pointing at
         // the operator path that converges.

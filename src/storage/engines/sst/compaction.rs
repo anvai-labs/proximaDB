@@ -1706,6 +1706,33 @@ impl Compaction {
         if keep == follow_up.input_files.len() {
             return Ok(true);
         }
+        if keep == 1 {
+            // A single-input rewrite is only worth running to PROMOTE an
+            // untrained segment: pick one that actually is, rather than
+            // `input_files[0]`, and skip when none is (#2418 review round
+            // 14: rewriting an already-trained L0 changes nothing and costs
+            // a full segment of write amplification).
+            let mut chosen = None;
+            for path in &follow_up.input_files {
+                let url = path.to_string_lossy();
+                if super::flush::segment_is_untrained_on(&self.filesystem_factory, &url, 0)
+                    .await
+                    .unwrap_or(false)
+                {
+                    chosen = Some(path.clone());
+                    break;
+                }
+            }
+            let Some(untrained) = chosen else {
+                return Ok(false);
+            };
+            follow_up.input_bytes = sizes
+                .get(&untrained.to_string_lossy().to_string())
+                .copied()
+                .unwrap_or(0);
+            follow_up.input_files = vec![untrained];
+            return Ok(true);
+        }
         follow_up.input_files.truncate(keep);
         follow_up.input_bytes = follow_up
             .input_files

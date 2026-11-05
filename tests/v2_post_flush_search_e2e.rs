@@ -1073,7 +1073,7 @@ async fn v2_compact_full_response_reports_provenance_and_target_override() {
 
     let compact = http
         .post(format!("{base}/api/v2/collections/{name}/compact"))
-        .json(&json!({"full": true, "target_segments": 1}))
+        .json(&json!({"full": true, "target_segments": 2}))
         .send()
         .await
         .expect("compact request");
@@ -1086,8 +1086,15 @@ async fn v2_compact_full_response_reports_provenance_and_target_override() {
     assert_eq!(body["full"], json!(true), "echoes the request mode");
     let before = body["segments_before"].as_u64().expect("segments_before");
     let after = body["segments_after"].as_u64().expect("segments_after");
-    assert!(before >= 2, "multi-segment fixture, got {before}");
-    assert_eq!(after, 1, "target_segments=1 collapses to one: {body}");
+    assert!(before >= 3, "multi-segment fixture, got {before}");
+    // 2, not 1: the config default is 1, so only a NON-default target
+    // proves the per-request override reaches the engine, and only a stop
+    // above 1 exercises the follow-up floor end to end (#2418 review round
+    // 14). The 4-segment fixture must land on exactly 2, not 1.
+    assert_eq!(
+        after, 2,
+        "target_segments=2 must stop at exactly two: {body}"
+    );
     assert!(
         body["passes"].as_u64().unwrap_or(0) >= 1,
         "at least one pass"

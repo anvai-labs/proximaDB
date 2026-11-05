@@ -417,3 +417,16 @@ rewrite. Filed:
   `check_compaction_needed` did the same discovery, one extra object-store
   round trip per bounded follow-up (operator FULL with a target > 1 only).
   Return the live count and sizes with the task instead.
+
+Round 14 (#2418): the deprecation notes for dead #2407 knobs are emitted
+from `ProximaDB::start` (via `CompactionConfig::deprecation_notes`) — config
+validation runs before the tracing subscriber exists, so a warning there was
+dropped; the floor's single-input rewrite picks an input that is actually
+UNTRAINED (shared `segment_is_untrained_on`) and is skipped when none is;
+the Flight `full` field must be a boolean (`"true"` used to run a silent
+plain compaction); both e2e compact contracts now request
+`target_segments: 2` — the config default is 1, so only a non-default target
+proves the override reaches the engine and exercises the floor end to end.
+Scope note: the floor binds this request's own follow-up chain; a morsel
+from another worker or a concurrent flush can still merge below it. Raised
+again and kept filed: F1, F3, F5/F6, F7.

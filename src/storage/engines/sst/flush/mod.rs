@@ -1252,24 +1252,34 @@ impl SstEngine {
     /// TD-COMPACT-5: is this segment untrained (no A0 coarse directory) and
     /// big enough to be worth a training pass? One stat + one 72-byte read.
     async fn segment_is_untrained(&self, path: &str, min_bytes: u64) -> Result<bool> {
-        use proximadb_storage_common::segment_layout::{
-            SEG_HEADER_PREFIX_LEN, SegmentHeaderPrefix,
-        };
-        let fs = self.filesystem().get_filesystem(path)?;
-        let meta = fs.metadata(path).await?;
-        if meta.size < min_bytes {
-            return Ok(false);
-        }
-        let header_bytes = fs
-            .read_range(path, 0, (SEG_HEADER_PREFIX_LEN as u64).min(meta.size))
-            .await?;
-        Ok(match SegmentHeaderPrefix::parse(&header_bytes) {
-            Ok(h) => h.a0_len == 0,
-            // Not a coalesced segment (legacy layout) — training does not
-            // apply; leave it to the count arm.
-            Err(_) => false,
-        })
+        segment_is_untrained_on(self.filesystem(), path, min_bytes).await
     }
+}
+
+/// TD-COMPACT-5: is this segment untrained (no A0 coarse directory) and at
+/// least `min_bytes`? One stat + one 72-byte read. Shared by the flush
+/// trigger and the compaction worker's floor bound, so both agree on what
+/// "untrained" means.
+pub(crate) async fn segment_is_untrained_on(
+    filesystem: &crate::storage::persistence::filesystem::FilesystemFactory,
+    path: &str,
+    min_bytes: u64,
+) -> Result<bool> {
+    use proximadb_storage_common::segment_layout::{SEG_HEADER_PREFIX_LEN, SegmentHeaderPrefix};
+    let fs = filesystem.get_filesystem(path)?;
+    let meta = fs.metadata(path).await?;
+    if meta.size < min_bytes {
+        return Ok(false);
+    }
+    let header_bytes = fs
+        .read_range(path, 0, (SEG_HEADER_PREFIX_LEN as u64).min(meta.size))
+        .await?;
+    Ok(match SegmentHeaderPrefix::parse(&header_bytes) {
+        Ok(h) => h.a0_len == 0,
+        // Not a coalesced segment (legacy layout) — training does not
+        // apply; leave it to the count arm.
+        Err(_) => false,
+    })
 }
 
 /// Whether a segment URL names an L0 file the compaction executor can act

@@ -2665,7 +2665,7 @@ async fn flight_compact_collection_payload_carries_provenance() {
     let compact = arrow_flight::Action {
         r#type: "compact_collection".to_string(),
         body: serde_json::to_vec(&json!({
-            "collection_id": name, "full": true, "target_segments": 1
+            "collection_id": name, "full": true, "target_segments": 2
         }))
         .expect("compact body")
         .into(),
@@ -2689,10 +2689,17 @@ async fn flight_compact_collection_payload_carries_provenance() {
         .expect("segments_before");
     let after = payload["segments_after"].as_u64().expect("segments_after");
     assert!(
-        before >= 2,
+        before >= 3,
         "multi-segment fixture, got {before}: {payload}"
     );
-    assert_eq!(after, 1, "target_segments=1 collapses to one: {payload}");
+    // 2, not 1: the config default is 1, so only a NON-default target
+    // proves the per-request override reaches the engine, and only a stop
+    // above 1 exercises the follow-up floor end to end (#2418 review round
+    // 14). The 4-segment fixture must land on exactly 2, not 1.
+    assert_eq!(
+        after, 2,
+        "target_segments=2 must stop at exactly two: {payload}"
+    );
     assert_eq!(payload["reached_target"], json!(true));
     assert!(
         payload["stop_reason"].is_null(),
