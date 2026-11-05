@@ -299,3 +299,19 @@ the result.json label. Filed:
   is still persisted with its whitespace, so every resolver re-normalizes on
   read and only the SET door deduplicates. Persist the normalized key for
   policy namespaces and the resolvers' tie-breaks go away.
+
+Round 14 (#2419): the Iceberg REST `createTable` door (a fifth property
+door) now validates through `validate_policy_properties`; the experimental
+gate holds on the property and tag layers of the one resolution path, via a
+pure `resolve_probe_policy_gated` (the public entry passes the env value) so
+the future carrier cannot select an ungated algorithm; PATCH refuses an empty
+request too (it read back as "no properties"); `update_collection_properties`
+fails explicitly instead of echoing input, so it cannot be wired in and
+revive the 200-but-unpersisted bug; config validation parses the algorithm
+once; the multiplier rule is stated as shipped (non-finite or > 1e6 fails
+boot). Filed:
+
+* *RDSTRAT-14-F13 — validate at the catalog SINK, not per door.* Five doors
+  now call `validate_policy_properties`; every new door must remember to.
+  Validating once in the catalog's create/evolution path (the crate already
+  depends on storage-common) would make a forgotten door impossible.

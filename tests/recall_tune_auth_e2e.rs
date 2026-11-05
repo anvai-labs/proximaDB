@@ -449,4 +449,19 @@ async fn create_and_patch_refuse_properties_they_cannot_persist() {
         .await
         .expect("send patch invalid");
     assert_eq!(resp.status().as_u16(), 400, "a bad key is a 400, not a 501");
+
+    // An EMPTY PATCH is refused too: answering it 200 with `properties: {}`
+    // read back as "this collection has no properties" (#2419 round 14).
+    let resp = http
+        .patch(server.url(&format!("/api/v2/collections/{collection_id}/properties")))
+        .header("Authorization", "Api-Key dev-key")
+        .json(&serde_json::json!({"properties": {}}))
+        .send()
+        .await
+        .expect("send patch empty");
+    assert_eq!(
+        resp.status().as_u16(),
+        501,
+        "an empty PATCH must not report an empty property set"
+    );
 }

@@ -2265,33 +2265,22 @@ impl CollectionService {
     }
 
     /// Update collection - type-safe method with native parameters
-    /// TD-COMPACT-2b: update a collection's table properties (merge semantics).
-    /// `cache.*` keys are validated; non-cache keys are stored verbatim. Keys
-    /// absent from `new_properties` are unchanged. Returns the full property
-    /// set after the merge.
+    /// TD-COMPACT-2b: update a collection's table properties (merge
+    /// semantics) — NOT IMPLEMENTED. The merge + catalog write needs the
+    /// schema-properties seam. It used to echo its input as if it had been
+    /// applied, which is how PATCH answered 200 for writes that never
+    /// happened; it now fails explicitly so no caller can wire it in and
+    /// revive that bug (#2419 review round 14). The PATCH handler refuses
+    /// before reaching here.
     pub async fn update_collection_properties(
         &self,
         collection_id: &str,
-        tenant: Option<&crate::storage::tenant::TenantContext>,
-        new_properties: std::collections::HashMap<String, String>,
+        _tenant: Option<&crate::storage::tenant::TenantContext>,
+        _new_properties: std::collections::HashMap<String, String>,
     ) -> Result<std::collections::HashMap<String, String>> {
-        // Resolve the collection (tenant-scoped).
-        let collection = self
-            .get_collection_with_tenant_context(collection_id, tenant)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("collection '{collection_id}' not found"))?;
-
-        // TODO: read current properties from the catalog schema, merge the new
-        // ones, validate cache.* keys on the MERGED set (case-variant
-        // duplicates), write back through the catalog's schema evolution.
-        // For now: return the new properties (the merge + catalog write needs
-        // the schema-properties seam, which is a focused follow-up).
-        tracing::warn!(
-            collection_id = %collection.id,
-            keys = ?new_properties.keys().collect::<Vec<_>>(),
-            "update_collection_properties: merge + catalog write not yet wired; returning input"
-        );
-        Ok(new_properties)
+        anyhow::bail!(
+            "update_collection_properties is not implemented (collection '{collection_id}'): the merge + catalog write is not wired; use ALTER TABLE ... SET"
+        )
     }
 
     pub async fn update_collection(

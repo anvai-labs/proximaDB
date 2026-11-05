@@ -3465,7 +3465,7 @@ def main() -> int:
     parser.add_argument(
         "--probe-cap-mb",
         type=int,
-        help="hard per-query probe byte cap in MiB (PROXIMADB_PAX_READ_PROBE_CAP_MB)",
+        help="byte_budget per-probe-POOL byte cap in MiB, 0 = none (PROXIMADB_PAX_READ_PROBE_CAP_MB); not per query: with the directory off each segment is its own pool",
     )
     parser.add_argument(
         "--adaptive-read-strategy",

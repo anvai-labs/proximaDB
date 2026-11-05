@@ -3436,19 +3436,15 @@ pub async fn patch_collection_properties_v2(
     // above stays (a bad key is still a 400, not a 501), but a valid request
     // is refused rather than reported as done. Remove this when the merge +
     // catalog write lands.
-    if !request.properties.is_empty() {
-        return Err(ApiError::NotImplemented(
-            "PATCH /collections/{id}/properties does not persist yet; use ALTER TABLE <name> SET ('key' = 'value', ...) over pgwire".to_string(),
-        ));
-    }
-    // Only an EMPTY request reaches here, and it changes nothing — answer it
-    // directly rather than round-tripping to the stub that echoes its input
-    // (#2419 review round 12). Restore the service call with the merge +
-    // catalog write.
-    Ok(Json(PropertiesResponse {
-        collection_id,
-        properties: std::collections::HashMap::new(),
-    }))
+    // EVERY request is refused, the empty one included: answering an empty
+    // PATCH with `properties: {}` (round 12) told a client reading back a
+    // pinned collection that it had no properties, and answered 200 for an
+    // unknown id (#2419 review round 14). The response field means "the set
+    // after the merge", which this endpoint cannot produce yet.
+    let _ = collection_id;
+    Err(ApiError::NotImplemented(
+        "PATCH /collections/{id}/properties does not persist yet; use ALTER TABLE <name> SET ('key' = 'value', ...) over pgwire".to_string(),
+    ))
 }
 
 /// `POST /api/v2/collections/{id}/compact` body `{"full": bool}` (an omitted

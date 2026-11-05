@@ -808,6 +808,13 @@ impl IcebergRestService {
         if catalog.table_exists(&identifier).await? {
             return Err(anyhow::anyhow!("Table '{}' already exists", req.name));
         }
+        // The Iceberg REST createTable door validates policy properties like
+        // every other door (ALTER TABLE SET, CREATE TABLE WITH, REST create /
+        // PATCH): it stored them verbatim, so a typo'd `cache.index.mode` or a
+        // refused `probe.*` key was accepted here and rejected everywhere
+        // else (#2419 review round 14).
+        proximadb_storage_common::validate_policy_properties(&req.properties)
+            .map_err(|e| anyhow::anyhow!("invalid table property: {e}"))?;
         let schema = self.iceberg_schema_to_catalog(&req.schema, &req.name, req.properties.clone());
 
         let created = catalog.create_table(&identifier, schema).await?;

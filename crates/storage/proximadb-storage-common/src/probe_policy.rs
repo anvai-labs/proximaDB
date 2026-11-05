@@ -432,6 +432,19 @@ pub fn resolve_probe_policy(
     tags: &[String],
     server: &ServerProbePolicy,
 ) -> ProbePolicy {
+    resolve_probe_policy_gated(properties, tags, server, experimental_algorithms_enabled())
+}
+
+/// [`resolve_probe_policy`] with the experimental gate as an explicit INPUT
+/// rather than an env read, so the chain is a pure function: the public entry
+/// passes the env value, and tests exercise both gate states without touching
+/// process-global env (mandate #11).
+pub fn resolve_probe_policy_gated(
+    properties: &HashMap<String, String>,
+    tags: &[String],
+    server: &ServerProbePolicy,
+    admit_experimental: bool,
+) -> ProbePolicy {
     let mut policy = ProbePolicy::default();
 
     // Server TOML layer (validated at load; junk is inert here, rejected there).
@@ -477,7 +490,14 @@ pub fn resolve_probe_policy(
             tag_algorithm = Some(parsed);
         }
     }
-    if let Some(algorithm) = tag_algorithm {
+    // The experimental gate (mandate #13) holds on EVERY layer of the ONE
+    // resolution path, not only at the env/TOML doors: when the
+    // collection-level carrier lands, a `probe.algorithm` property or a
+    // `probe.algorithm:` tag must not select an ungated algorithm (#2419
+    // review round 14). An experimental pick without the gate is ignored, so
+    // the layer below decides.
+    let admitted = |algorithm: ProbeAlgorithm| !algorithm.is_experimental() || admit_experimental;
+    if let Some(algorithm) = tag_algorithm.filter(|a| admitted(*a)) {
         policy.algorithm = algorithm;
     }
 
@@ -487,6 +507,7 @@ pub fn resolve_probe_policy(
         .filter(|(k, _)| k.trim().to_ascii_lowercase() == PROBE_ALGORITHM_PROPERTY_KEY)
         .min_by_key(|(k, _)| k.as_str())
         .and_then(|(_, v)| ProbeAlgorithm::parse(v))
+        .filter(|a| admitted(*a))
     {
         policy.algorithm = algorithm;
     }
@@ -931,6 +952,12 @@ mod tests {
 
     #[test]
     fn policy_chain_property_over_tag_over_server_over_code() {
+        // PRECEDENCE, not the gate: run with experimental algorithms admitted
+        // (the gate has its own test) through the pure entry point.
+        let resolve_probe_policy =
+            |p: &HashMap<String, String>, t: &[String], s: &ServerProbePolicy| {
+                resolve_probe_policy_gated(p, t, s, true)
+            };
         let tag = vec!["probe.algorithm:cbrt".to_string()];
         let server = ServerProbePolicy {
             algorithm: Some("fourth_root".to_string()),
@@ -1027,5 +1054,22 @@ mod tests {
             resolve_probe_plan(&policy, 30, 0, 4 * 1024 * 1024, 0).cells,
             1
         );
+    }
+
+    #[test]
+    fn experimental_gate_holds_on_the_property_and_tag_layers() {
+        let pick = |admit| {
+            resolve_probe_policy_gated(
+                &props(&[("probe.algorithm", "byte_budget")]),
+                &["probe.algorithm:log".to_string()],
+                &ServerProbePolicy::default(),
+                admit,
+            )
+            .algorithm
+        };
+        // Gate closed: neither layer may select an experimental algorithm.
+        assert_eq!(pick(false), ProbeAlgorithm::Sqrt);
+        // Gate open: the property (top layer) wins, as the chain says.
+        assert_eq!(pick(true), ProbeAlgorithm::ByteBudget);
     }
 }

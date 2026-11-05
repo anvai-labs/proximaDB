@@ -1866,70 +1866,60 @@ impl CoarseProbeConfig {
     /// aborts boot with the section and the valid names (never a silent
     /// fallback to sqrt, the dead-config hazard).
     pub fn validate(&self, section: &str) -> Result<(), String> {
-        if let Some(algorithm) =
-            proximadb_storage_common::probe_policy::ProbeAlgorithm::parse(&self.algorithm)
-            && algorithm.is_experimental()
-            && !proximadb_storage_common::probe_policy::experimental_algorithms_enabled()
-        {
+        use proximadb_storage_common::probe_policy::{
+            MAX_PROBE_BUDGET_MB, MAX_PROBE_MULTIPLIER, ProbeAlgorithm,
+            experimental_algorithms_enabled,
+        };
+        // Parsed ONCE: the rules below all key on it, and separate parses let
+        // two copies of the same condition drift (#2419 review round 14).
+        let Some(algorithm) = ProbeAlgorithm::parse(&self.algorithm) else {
+            return Err(format!(
+                "{section}.algorithm must be one of sqrt|cbrt|fourth_root|log|fixed|byte_budget (got '{}')",
+                self.algorithm
+            ));
+        };
+        if algorithm.is_experimental() && !experimental_algorithms_enabled() {
             return Err(format!(
                 "{section}.algorithm = \"{}\" is experimental (no recall@k eval gates it yet, mandate #13); set PROXIMADB_PAX_READ_PROBE_EXPERIMENTAL=1 for bench/staging use, or keep \"sqrt\"",
                 self.algorithm
             ));
         }
-        if proximadb_storage_common::probe_policy::ProbeAlgorithm::parse(&self.algorithm).is_none()
-        {
-            return Err(format!(
-                "{section}.algorithm must be one of sqrt|cbrt|fourth_root|log|fixed|byte_budget \
-                 (got '{}')",
-                self.algorithm
-            ));
-        }
-        // A NEGATIVE multiplier booted before this module and behaved
-        // exactly like 0 (`ceil(sqrt(k) x -m)` is <= 0, clamped up to
-        // nprobe_min), so it keeps booting and keeps that meaning (clamped
-        // to 0 in the settings conversion) — rejecting it broke upgrades
-        // (#2419 review round 9). Only a NON-FINITE multiplier fails: `inf`
-        // used to mean a silent full scan and NaN had no defined behaviour,
-        // neither a setting anyone should be running (pre-GA, deliberate).
+        let byte_budget = algorithm == ProbeAlgorithm::ByteBudget;
+        // A NEGATIVE multiplier booted before this module and behaved exactly
+        // like 0 (`ceil(sqrt(k) x -m)` is <= 0, clamped up to nprobe_min), so
+        // it keeps booting with that meaning (round 9). What fails boot is a
+        // multiplier that is NON-FINITE or above MAX_PROBE_MULTIPLIER (1e6):
+        // both used to mean "probe every cell" (the f32 sqrt arm narrows a
+        // huge value to inf), a silent full scan nobody should be running
+        // (pre-GA, deliberate). Use an exact search mode for exhaustive
+        // probing.
         if !self.nprobe_multiplier.is_finite()
-            || f64::from(self.nprobe_multiplier)
-                > proximadb_storage_common::probe_policy::MAX_PROBE_MULTIPLIER
+            || f64::from(self.nprobe_multiplier) > MAX_PROBE_MULTIPLIER
         {
             return Err(format!(
-                "{section}.nprobe_multiplier must be a finite number of at most {} (got {})",
-                proximadb_storage_common::probe_policy::MAX_PROBE_MULTIPLIER,
+                "{section}.nprobe_multiplier must be a finite number of at most {MAX_PROBE_MULTIPLIER} (got {}); use an exact search mode for exhaustive probing",
                 self.nprobe_multiplier
             ));
         }
-        // The MiB bounds every other layer enforces (the property layer
-        // rejects, the env layer warns-and-ignores). The TOML conversion used
-        // to clamp silently, so one input resolved three ways; boot now
-        // refuses an out-of-range value like the property door does.
-        let max_mb = proximadb_storage_common::probe_policy::MAX_PROBE_BUDGET_MB as u64;
-        // Only byte_budget reads base/cap, so only byte_budget fails boot on
-        // them — the same rule as base_mb below (#2419 review round 13).
-        let reads_budget =
-            proximadb_storage_common::probe_policy::ProbeAlgorithm::parse(&self.algorithm)
-                == Some(proximadb_storage_common::probe_policy::ProbeAlgorithm::ByteBudget);
-        if reads_budget && (self.base_mb > max_mb || self.cap_mb > max_mb) {
-            return Err(format!(
-                "{section}.base_mb/cap_mb must be at most {max_mb} MiB (base_mb={}, cap_mb={})",
-                self.base_mb, self.cap_mb
-            ));
-        }
-        // base_mb is consulted ONLY by byte_budget, so it is checked only
-        // there: rejecting it under the default sqrt form would fail a boot
-        // over a knob that form never reads. cap < base is NOT rejected — the
-        // resolver applies the cap after the budget (cap wins), and the env
-        // and property layers accept it, so boot must not be the one layer
-        // that disagrees.
-        let byte_budget =
-            proximadb_storage_common::probe_policy::ProbeAlgorithm::parse(&self.algorithm)
-                == Some(proximadb_storage_common::probe_policy::ProbeAlgorithm::ByteBudget);
-        if byte_budget && self.base_mb == 0 {
-            return Err(format!(
-                "{section}.base_mb must be positive when algorithm = \"byte_budget\" (got 0)"
-            ));
+        // base_mb / cap_mb are read ONLY by byte_budget, so only byte_budget
+        // fails boot on them (rejecting them under sqrt would fail a boot
+        // over knobs that form never reads). Within byte_budget: the 1 TiB
+        // ceiling every other layer enforces, and a positive base. cap < base
+        // is NOT rejected — the resolver applies the cap after the budget
+        // (cap wins), and the env and property layers accept it.
+        if byte_budget {
+            let max_mb = MAX_PROBE_BUDGET_MB as u64;
+            if self.base_mb > max_mb || self.cap_mb > max_mb {
+                return Err(format!(
+                    "{section}.base_mb/cap_mb must be at most {max_mb} MiB (base_mb={}, cap_mb={})",
+                    self.base_mb, self.cap_mb
+                ));
+            }
+            if self.base_mb == 0 {
+                return Err(format!(
+                    "{section}.base_mb must be positive when algorithm = \"byte_budget\" (got 0)"
+                ));
+            }
         }
         Ok(())
     }
