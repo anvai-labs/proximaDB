@@ -132,9 +132,9 @@ request.
 | Lying config; "fixing" it silently changes indexing and invalidates existing indexes
 
 | `src/network/auth/rbac.rs` `user_belongs_to_tenant` (+ `user_has_collection_access`)
-| Returns `true` unconditionally — it is the tenant-isolation gate inside `check_permission_with_context`.
-| One wiring step from live — it HAS callers (`src/network/auth/middleware.rs`, two sites) and the middleware is already written; the chain is dead only because the network `AuthService` is never constructed outside `src/network/auth/`. A `pub struct RbacService` named identically to the live `src/security/rbac_service.rs`. **Highest misadoption risk in the census.**
-| Cross-tenant authorization bypass if adopted
+| Returned `true` unconditionally — the tenant-isolation gate inside `check_permission_with_context`. **MITIGATED (2026-11-05):** the predicate is now fail-closed (`false` — this layer holds no membership data, so any asserted tenant is denied), the middleware no longer echoes the caller's own tenant into the permission context (it was circular and would now deny everything), and `user_has_collection_access` is documented as reducing to role permissions. Pinned by `tenant_asserted_context_is_denied_fail_closed` + `no_tenant_context_allows_permitted_operation` + `test_build_permission_context_never_asserts_a_tenant`.
+| Was one wiring step from live — it HAS callers (`src/network/auth/middleware.rs`, two sites); the chain was dead only because the network `AuthService` is never constructed outside `src/network/auth/`. A `pub struct RbacService` named identically to the live `src/security/rbac_service.rs`. Real membership validation still needs a membership store; tenancy remains structural (`TenantContext` + `DrPathBuilder`).
+| Was a cross-tenant authorization bypass if adopted; now fail-closed. Middleware behavior unchanged (no tenant asserted); direct callers asserting any tenant are denied.
 
 | `src/security/rbac_service.rs` `get_accessible_collections`
 | Returns `vec!["*"]` ("Placeholder").
