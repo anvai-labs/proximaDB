@@ -724,6 +724,18 @@ async fn create_collection_v2_checked(
         ));
     }
 
+    // Validate policy properties at CREATE through the same one boundary as
+    // SET and PATCH. The request's own doc comment claimed cache.* keys were
+    // "validated at create time" — they were not validated anywhere on this
+    // path, so a typo was stored verbatim and silently did nothing.
+    if let Some(properties) = request.properties.as_ref()
+        && let Err(error) = proximadb_storage_common::validate_policy_properties(properties)
+    {
+        return Err(ApiError::InvalidArgument(format!(
+            "invalid table property: {error}"
+        )));
+    }
+
     if request.dimension == 0 {
         return Err(ApiError::InvalidArgument(
             "Vector dimension must be greater than 0".to_string(),
@@ -3399,10 +3411,12 @@ pub async fn patch_collection_properties_v2(
     }
     require_maintain(user_context.as_ref().map(|e| &e.0), "properties")?;
 
-    // Validate cache.* keys in the request (the merged set is validated
-    // after the catalog read below; this catches standalone errors early).
-    proximadb_cache::policy::validate_cache_properties(&request.properties)
-        .map_err(|e| ApiError::InvalidArgument(format!("invalid cache property: {e}")))?;
+    // Validate every policy family in the request (cache.*, compaction.*,
+    // probe.*) through the one boundary. Before this, PATCH validated only
+    // cache.* — so `{"compaction.strategy": "typo"}` was accepted here and
+    // rejected through SQL, the accepted-but-inert split this consolidates.
+    proximadb_storage_common::validate_policy_properties(&request.properties)
+        .map_err(|e| ApiError::InvalidArgument(format!("invalid table property: {e}")))?;
 
     // TODO: read current properties from the catalog, merge, validate the
     // merged set (case-variant duplicates), write back. For now the

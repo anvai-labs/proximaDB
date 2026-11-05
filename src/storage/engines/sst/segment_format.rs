@@ -3752,7 +3752,7 @@ fn warn_junk_env(name: &str, value: &str, expected: &str) {
         env = name,
         value,
         expected,
-        "PROXIMADB_PROBE_* override is unparseable and is being IGNORED — \
+        "PROXIMADB_PAX_READ_PROBE_* override is unparseable and is being IGNORED — \
          a typo here silently runs the wrong experiment arm"
     );
 }
@@ -3763,26 +3763,34 @@ fn warn_junk_env(name: &str, value: &str, expected: &str) {
 /// (`resolve_probe_policy`): no parallel hand-rolled resolver can drift.
 fn env_probe_layer() -> proximadb_storage_common::probe_policy::ServerProbePolicy {
     let mut server = proximadb_storage_common::probe_policy::ServerProbePolicy::default();
-    if let Ok(name) = std::env::var("PROXIMADB_PROBE_ALGORITHM") {
+    if let Ok(name) = std::env::var("PROXIMADB_PAX_READ_PROBE_ALGORITHM") {
         match proximadb_storage_common::probe_policy::ProbeAlgorithm::parse(&name) {
             Some(algorithm) => server.algorithm = Some(algorithm.as_str().to_string()),
             None => warn_junk_env(
-                "PROXIMADB_PROBE_ALGORITHM",
+                "PROXIMADB_PAX_READ_PROBE_ALGORITHM",
                 &name,
                 "sqrt|cbrt|fourth_root|log|fixed|byte_budget",
             ),
         }
     }
-    if let Ok(base) = std::env::var("PROXIMADB_PROBE_BASE_MB") {
+    if let Ok(base) = std::env::var("PROXIMADB_PAX_READ_PROBE_BASE_MB") {
         match base.trim().parse::<u64>() {
             Ok(mb) if mb > 0 => server.base_bytes = Some(mb * 1024 * 1024),
-            _ => warn_junk_env("PROXIMADB_PROBE_BASE_MB", &base, "a positive integer"),
+            _ => warn_junk_env(
+                "PROXIMADB_PAX_READ_PROBE_BASE_MB",
+                &base,
+                "a positive integer",
+            ),
         }
     }
-    if let Ok(cap) = std::env::var("PROXIMADB_PROBE_CAP_MB") {
+    if let Ok(cap) = std::env::var("PROXIMADB_PAX_READ_PROBE_CAP_MB") {
         match cap.trim().parse::<u64>() {
             Ok(mb) if mb > 0 => server.cap_bytes = Some(mb * 1024 * 1024),
-            _ => warn_junk_env("PROXIMADB_PROBE_CAP_MB", &cap, "a positive integer"),
+            _ => warn_junk_env(
+                "PROXIMADB_PAX_READ_PROBE_CAP_MB",
+                &cap,
+                "a positive integer",
+            ),
         }
     }
     server

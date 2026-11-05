@@ -86,8 +86,8 @@ the planner plans in the unit the bill is written in.
   `cap_mb` (32). Fail-closed at load: an unknown name aborts boot naming
   the section.
 * Env overrides (the harness/operator escape hatch, same precedence as
-  every other probe knob): `PROXIMADB_PROBE_ALGORITHM`,
-  `PROXIMADB_PROBE_BASE_MB`, `PROXIMADB_PROBE_CAP_MB`.
+  every other probe knob): `PROXIMADB_PAX_READ_PROBE_ALGORITHM`,
+  `PROXIMADB_PAX_READ_PROBE_BASE_MB`, `PROXIMADB_PAX_READ_PROBE_CAP_MB`.
 * Both consumers rewired through the module: the per-segment probe
   (`coarse_probe_nprobe` — now carries `path` for the IOPS geometry and
   the parsed directory for rows/cell bytes) and the collection directory

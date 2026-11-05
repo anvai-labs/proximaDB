@@ -2148,26 +2148,19 @@ impl DdlService {
                     }
                 }
                 AlterTableChange::SetTableOption { key, value } => {
-                    // TD-COMPACT-2b: validate cache.* keys at SET time so a
-                    // typo fails immediately rather than silently doing nothing.
-                    // TD-COMPACT-15: validate compaction.* keys at SET time.
-                    if key.trim().to_ascii_lowercase().starts_with("compaction.") {
-                        let mut probe = std::collections::HashMap::new();
-                        probe.insert(key.clone(), value.clone());
-                        if let Err(error) =
-                            proximadb_storage_common::validate_compaction_properties(&probe)
-                        {
-                            anyhow::bail!("invalid compaction property: {error}");
-                        }
-                    }
-                    if key.trim().to_ascii_lowercase().starts_with("cache.") {
-                        let mut probe = std::collections::HashMap::new();
-                        probe.insert(key.clone(), value.clone());
-                        if let Err(error) =
-                            proximadb_cache::policy::validate_cache_properties(&probe)
-                        {
-                            anyhow::bail!("invalid cache property: {error}");
-                        }
+                    // Validate EVERY policy family at SET time through the
+                    // one boundary (`validate_policy_properties`): cache.*
+                    // (TD-COMPACT-2b), compaction.* (TD-COMPACT-15) and
+                    // probe.* (TD-RDSTRAT-14). A typo fails here instead of
+                    // being stored and silently doing nothing, and a fourth
+                    // family cannot be half-wired — it is one line in that
+                    // function, not a new arm in every door.
+                    let mut candidate = std::collections::HashMap::new();
+                    candidate.insert(key.clone(), value.clone());
+                    if let Err(error) =
+                        proximadb_storage_common::validate_policy_properties(&candidate)
+                    {
+                        anyhow::bail!("invalid table property: {error}");
                     }
                     SchemaChange::SetTableOption { key, value }
                 }

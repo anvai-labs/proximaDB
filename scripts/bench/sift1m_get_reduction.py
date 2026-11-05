@@ -2500,11 +2500,11 @@ class OwnedServer:
                 else "PROXIMADB_PAX_READ_COARSE_NPROBE"
             ] = str(self.nprobe)
         if self.probe_algorithm is not None:
-            environment["PROXIMADB_PROBE_ALGORITHM"] = self.probe_algorithm
+            environment["PROXIMADB_PAX_READ_PROBE_ALGORITHM"] = self.probe_algorithm
         if self.probe_base_mb is not None:
-            environment["PROXIMADB_PROBE_BASE_MB"] = str(self.probe_base_mb)
+            environment["PROXIMADB_PAX_READ_PROBE_BASE_MB"] = str(self.probe_base_mb)
         if self.probe_cap_mb is not None:
-            environment["PROXIMADB_PROBE_CAP_MB"] = str(self.probe_cap_mb)
+            environment["PROXIMADB_PAX_READ_PROBE_CAP_MB"] = str(self.probe_cap_mb)
         if self.training_compaction_min_mb is not None:
             environment["PROXIMADB_TRAINING_COMPACTION_MIN_MB"] = str(
                 self.training_compaction_min_mb
@@ -3418,19 +3418,19 @@ def main() -> int:
         "--probe-algorithm",
         choices=["sqrt", "cbrt", "fourth_root", "log", "fixed", "byte_budget"],
         help=(
-            "TD-RDSTRAT-9 probe-band algorithm (PROXIMADB_PROBE_ALGORITHM); "
+            "TD-RDSTRAT-14 probe-band algorithm (PROXIMADB_PAX_READ_PROBE_ALGORITHM); "
             "default sqrt. The recall-vs-GETs dial for the ladder experiment"
         ),
     )
     parser.add_argument(
         "--probe-base-mb",
         type=int,
-        help="byte_budget/log base probe budget in MiB (PROXIMADB_PROBE_BASE_MB)",
+        help="byte_budget/log base probe budget in MiB (PROXIMADB_PAX_READ_PROBE_BASE_MB)",
     )
     parser.add_argument(
         "--probe-cap-mb",
         type=int,
-        help="hard per-query probe byte cap in MiB (PROXIMADB_PROBE_CAP_MB)",
+        help="hard per-query probe byte cap in MiB (PROXIMADB_PAX_READ_PROBE_CAP_MB)",
     )
     parser.add_argument(
         "--adaptive-read-strategy",
