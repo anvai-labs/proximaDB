@@ -169,7 +169,15 @@ Surfaces:
   'compaction.target_file_size_mb' = '1024')` — validated at SET time
   (`validate_compaction_properties`), resolved at flush
 * Collection tag `compaction.strategy:consolidate` (legacy channel)
-* `POST /collections {"properties": ...}` / `PATCH .../properties` (#2405)
+* NOT YET A WRITE PATH (found by the #2418 review round 4): `PATCH
+  /collections/{id}/properties` is a stub — `update_collection_properties`
+  logs "merge + catalog write not yet wired; returning input" and returns
+  the request unchanged, so a `PATCH` of `compaction.strategy` answers 200
+  with the key echoed back while `schema.properties` is untouched and the
+  flush resolver never sees it. `POST /collections`'s `properties` field is
+  likewise declared and never read. Until those are wired, **`ALTER TABLE
+  … SET` is the only surface that reaches `schema.properties`** — do not
+  document the REST doors as live.
 * Server TOML: `consolidate_strategy`, `consolidate_target_file_size_mb`,
   `consolidate_write_amp_limit` — all validated fail-closed at config
   load (below)

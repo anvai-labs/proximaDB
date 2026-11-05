@@ -72,21 +72,42 @@ pub fn init_server_compaction_config(cfg: Option<&crate::core::config::Compactio
     }
 }
 
-/// The compaction config the consolidate policy resolves against: the
-/// engine's own when it has one, else the authoritative server install,
-/// else the code defaults.
-fn effective_compaction_config(
+/// The three consolidate knobs the policy resolves against:
+/// `(consolidate_strategy, target_file_size_mb, write_amp_limit)` — taken
+/// from the engine's own config when it has one, else the authoritative
+/// server install, else the code defaults.
+///
+/// Returns the resolved VALUES rather than a config, so no path clones the
+/// whole `CompactionConfig` (only the small strategy `String`, and only
+/// when one is set).
+fn effective_consolidate_knobs(
     engine: Option<&crate::core::config::CompactionConfig>,
-) -> crate::core::config::CompactionConfig {
+) -> (Option<String>, u64, u64) {
+    let pick = |cfg: &crate::core::config::CompactionConfig| {
+        (
+            cfg.consolidate_strategy.clone(),
+            cfg.consolidate_target_file_size_mb,
+            cfg.consolidate_write_amp_limit,
+        )
+    };
     if let Some(cfg) = engine {
-        return cfg.clone();
+        return pick(cfg);
     }
     if let Ok(g) = SHARED_COMPACTION_CONFIG.read()
         && let Some(cfg) = g.as_ref()
     {
-        return cfg.clone();
+        return pick(cfg);
     }
-    crate::core::config::CompactionConfig::default()
+    pick(&crate::core::config::CompactionConfig::default())
+}
+
+/// Test-only: drop the authoritative install so a test cannot leak its
+/// config into later tests sharing the process (the libtest fallback).
+#[cfg(test)]
+fn reset_server_compaction_config() {
+    if let Ok(mut g) = SHARED_COMPACTION_CONFIG.write() {
+        *g = None;
+    }
 }
 
 impl SstEngine {
@@ -1206,12 +1227,9 @@ impl SstEngine {
         // authoritative server install — `SstEngine::new()` (the production
         // flush engine) carries none, so reading only `self.config()` made
         // every `[storage.compaction_config]` consolidate knob dead config.
-        let cfg = effective_compaction_config(self.config().compaction_config.as_ref());
-        let server_strategy = cfg.consolidate_strategy.as_deref();
-        let (server_target_mb, write_amp_limit) = (
-            cfg.consolidate_target_file_size_mb,
-            cfg.consolidate_write_amp_limit,
-        );
+        let (server_strategy_owned, server_target_mb, write_amp_limit) =
+            effective_consolidate_knobs(self.config().compaction_config.as_ref());
+        let server_strategy = server_strategy_owned.as_deref();
         let strategy =
             proximadb_storage_common::resolve_effective_strategy(properties, tags, server_strategy);
         if strategy == proximadb_storage_common::CompactionStrategy::Consolidate {
@@ -2024,12 +2042,9 @@ mod tests {
     fn server_compaction_config_reaches_an_engine_that_carries_none() {
         // Before any install, a None engine config yields the code defaults.
         let defaults = crate::core::config::CompactionConfig::default();
-        let before = effective_compaction_config(None);
-        assert_eq!(
-            before.consolidate_target_file_size_mb,
-            defaults.consolidate_target_file_size_mb
-        );
-        assert!(before.consolidate_strategy.is_none());
+        let (before_strategy, before_target, _) = effective_consolidate_knobs(None);
+        assert_eq!(before_target, defaults.consolidate_target_file_size_mb);
+        assert!(before_strategy.is_none());
 
         // Install an operator config the way `ProximaDB::start` does.
         let server = crate::core::config::CompactionConfig {
@@ -2039,25 +2054,29 @@ mod tests {
             ..Default::default()
         };
         init_server_compaction_config(Some(&server));
+        // The install is process-wide: leaking it would push sibling tests
+        // that build a config-free engine onto the consolidate branch under
+        // the shared-process libtest fallback. Reset before every return.
+        struct ResetOnDrop;
+        impl Drop for ResetOnDrop {
+            fn drop(&mut self) {
+                reset_server_compaction_config();
+            }
+        }
+        let _reset = ResetOnDrop;
 
         // A None engine config now resolves the OPERATOR's values.
-        let resolved = effective_compaction_config(None);
-        assert_eq!(
-            resolved.consolidate_strategy.as_deref(),
-            Some("consolidate")
-        );
-        assert_eq!(resolved.consolidate_target_file_size_mb, 4096);
-        assert_eq!(resolved.consolidate_write_amp_limit, 7);
+        let (strategy, target, limit) = effective_consolidate_knobs(None);
+        assert_eq!(strategy.as_deref(), Some("consolidate"));
+        assert_eq!(target, 4096);
+        assert_eq!(limit, 7);
 
         // An engine that DOES carry a config still wins (it is more specific).
         let engine = crate::core::config::CompactionConfig {
             consolidate_target_file_size_mb: 128,
             ..Default::default()
         };
-        assert_eq!(
-            effective_compaction_config(Some(&engine)).consolidate_target_file_size_mb,
-            128
-        );
+        assert_eq!(effective_consolidate_knobs(Some(&engine)).1, 128);
     }
 
     use super::*;

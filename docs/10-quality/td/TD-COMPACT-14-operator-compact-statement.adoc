@@ -34,13 +34,16 @@ Add an operator-triggered compaction with PostgreSQL-style permissioning:
   is a 400; `target_segments` must be > 0). An operator endpoint following
   the suspend/resume convention: NOT in the published OpenAPI spec (no
   utoipa annotation), so no SDK regeneration is required.
-- **Arrow Flight:** the existing `compact_collection` / `flush_and_compact`
-  actions accept an optional `"full": true` and (compact only)
+- **Arrow Flight:** `compact_collection` accepts an optional `"full": true`
+  and
   `"target_segments"` — the per-request override of the FULL collapse
   target (TD-COMPACT-15 Experiment 3). Since TD-COMPACT-15 the
   `compact_collection` payload carries the full provenance: `full`,
   `segments_before/after`, `passes`, `reached_target`, `stop_reason`,
   `pending_files`, `bytes_read/bytes_written`, `duration_ms`.
+  `flush_and_compact` deliberately does NOT take `full`: it hardcodes a
+  flush plus one plain policy morsel. (It previously read as accepting
+  `full` here, which would have been a knob silently dropped.)
 
 === Semantics
 

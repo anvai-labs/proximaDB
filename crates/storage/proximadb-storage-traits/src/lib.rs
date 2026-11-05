@@ -770,7 +770,7 @@ pub trait UnifiedStorageFormat: Send + Sync {
         // of returning 200 with null provenance.
         if full_target_segments.is_some() && !self.supports_full_compaction() {
             anyhow::bail!(
-                "this engine has no cross-level FULL collapse, so target_segments                  cannot be honoured; omit it (the request would otherwise report                  success for a bound that was never applied)"
+                "this engine has no cross-level FULL collapse, so target_segments cannot be honoured; omit it (the request would otherwise report success for a bound that was never applied)"
             );
         }
         let params = CompactionParameters {
