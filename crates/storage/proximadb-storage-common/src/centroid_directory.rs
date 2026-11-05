@@ -1030,7 +1030,10 @@ impl PaxCentroidDirectory {
         &self,
         query: &[f32],
         live: &[LiveSegment],
-        nprobe_for_cells: impl Fn(usize) -> usize,
+        // (usable_cells, usable_rows) — the caller must size a byte budget
+        // against the set this plan actually probes (live + stamp-matched),
+        // not a looser count derived outside.
+        nprobe_for_cells: impl Fn(usize, u64) -> usize,
         min_rows_for_rows: impl Fn(u64) -> u64,
     ) -> Option<ProbePlan> {
         let live_sizes: HashMap<&str, u64> = live
@@ -1061,7 +1064,7 @@ impl PaxCentroidDirectory {
             .sum();
         let selected = self.select_usable_cells(
             query,
-            nprobe_for_cells(usable_cells),
+            nprobe_for_cells(usable_cells, usable_rows),
             min_rows_for_rows(usable_rows),
             |segment_idx| usable[segment_idx as usize],
         )?;
@@ -1885,7 +1888,7 @@ mod tests {
             .plan_probe(
                 &query,
                 &live(&[("a.pax", 100), ("b.pax", 200), ("l0.pax", 50)]),
-                |_| 99,
+                |_, _| 99,
                 |_| 0,
             )
             .unwrap();
@@ -1903,7 +1906,7 @@ mod tests {
             .plan_probe(
                 &query,
                 &live(&[("a.pax", 100), ("b.pax", 200)]),
-                |_| 1,
+                |_, _| 1,
                 |_| 0,
             )
             .unwrap();
@@ -1915,7 +1918,7 @@ mod tests {
         let stale = dir.plan_probe(
             &query,
             &live(&[("a.pax", 101), ("c.pax", 9)]),
-            |_| 99,
+            |_, _| 99,
             |_| 0,
         );
         assert_eq!(stale, None, "nothing usable");
@@ -1923,14 +1926,14 @@ mod tests {
             .plan_probe(
                 &query,
                 &live(&[("a.pax", 101), ("b.pax", 200)]),
-                |n| n,
+                |n, _| n,
                 |_| 0,
             )
             .unwrap();
         assert_eq!(partial.usable_cells, 2);
         assert!(!partial.cells_by_segment.contains_key("a.pax"));
         assert_eq!(
-            dir.plan_probe(&[0.0; 3], &live(&[("b.pax", 200)]), |n| n, |_| 0),
+            dir.plan_probe(&[0.0; 3], &live(&[("b.pax", 200)]), |n, _| n, |_| 0),
             None
         );
     }
@@ -1958,9 +1961,9 @@ mod tests {
             },
         ];
         let query = [0.1f32, 0.1, 0.0, 0.0];
-        let plan = dir.plan_probe(&query, &live, |n| n, |_| 0).unwrap();
+        let plan = dir.plan_probe(&query, &live, |n, _| n, |_| 0).unwrap();
         assert_eq!(plan.usable_cells, 3, "distinct cells, not 5 entries");
-        let one = dir.plan_probe(&query, &live, |_| 1, |_| 0).unwrap();
+        let one = dir.plan_probe(&query, &live, |_, _| 1, |_| 0).unwrap();
         assert_eq!(one.cells_by_segment["s1.pax"], [0]);
         assert_eq!(
             one.cells_by_segment["s2.pax"],
@@ -1969,7 +1972,7 @@ mod tests {
         );
         // The row floor counts a cell's rows across all its segments: cell 0
         // holds 4 + 3 rows, so a floor of 8 needs a second cell.
-        let floor = dir.plan_probe(&query, &live, |_| 1, |_| 8).unwrap();
+        let floor = dir.plan_probe(&query, &live, |_, _| 1, |_| 8).unwrap();
         assert_eq!(floor.cells_by_segment["s1.pax"].len(), 2);
     }
 
@@ -2243,9 +2246,9 @@ mod tests {
                 size_bytes: 1,
             },
         ];
-        let plan = dir.plan_probe(&[0.0; 4], &live, |n| n, |_| 0).unwrap();
+        let plan = dir.plan_probe(&[0.0; 4], &live, |n, _| n, |_| 0).unwrap();
         assert_eq!(plan.usable_cells, 3, "cell 0 of a and cell 0 of b differ");
-        let one = dir.plan_probe(&[0.0; 4], &live, |_| 1, |_| 0).unwrap();
+        let one = dir.plan_probe(&[0.0; 4], &live, |_, _| 1, |_| 0).unwrap();
         assert_eq!(one.cells_by_segment["a.pax"], [0]);
         assert!(one.cells_by_segment["b.pax"].is_empty());
         let shared = dir.collection_model().unwrap();

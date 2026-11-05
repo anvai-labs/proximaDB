@@ -1766,6 +1766,14 @@ impl DdlService {
         // System-written properties (a collection's record, its owner) are
         // never client-settable.
         proximadb_catalog::table_properties::ensure_no_reserved_table_properties(&properties)?;
+        // The FOURTH door: `CREATE TABLE … WITH (…)` and `create_collection`
+        // land here. Without this, a policy typo was stored verbatim and
+        // inert at create while the identical key through
+        // `ALTER TABLE … SET` was rejected — the accepted-but-inert split
+        // the single boundary exists to close.
+        if let Err(error) = proximadb_storage_common::validate_policy_properties(&properties) {
+            anyhow::bail!("invalid table property: {error}");
+        }
         let mut schema = CatalogTableSchema::new(table_name);
         schema.properties = properties;
 

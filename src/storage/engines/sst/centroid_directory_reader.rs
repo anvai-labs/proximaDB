@@ -238,19 +238,15 @@ pub(crate) fn plan_segments<'a>(
             size_bytes,
         });
     }
-    // TD-RDSTRAT-9: the probe policy needs corpus/geometry context. Only
-    // LIVE segments count toward corpus rows — plan_probe plans over the
-    // live+size-matched set, and a directory still covering compacted-away
-    // segments would otherwise inflate a byte-budget policy by up to
-    // (dead/live)^0.25. The rowgroup geometry comes from the
-    // lexicographically-smallest live URL: deterministic across restarts
-    // even when a collection spans URL schemes mid-migration.
-    let corpus_rows: u64 = dir
-        .segments
-        .iter()
-        .filter(|s| url_by_name.contains_key(&s.name))
-        .map(|s| s.rows_covered)
-        .sum();
+    // TD-RDSTRAT-14: the probe policy needs corpus/geometry context. The
+    // corpus size comes from plan_probe itself (`usable_rows` — the
+    // live AND stamp-matched set it actually plans over), handed to the
+    // closure below. Deriving it here from the directory's segment list
+    // counted entries whose size no longer matches the live object, which
+    // inflated a byte_budget plan by (counted/usable)^0.25 mid-compaction.
+    // The rowgroup geometry comes from the lexicographically-smallest live
+    // URL: deterministic across restarts even when a collection spans URL
+    // schemes mid-migration.
     let first_url = url_by_name.values().min().map(String::as_str).unwrap_or("");
     let rowgroup_bytes =
         proximadb_storage_common::iops_budget::IopsBudget::for_path(first_url).target_block_bytes();
@@ -260,7 +256,9 @@ pub(crate) fn plan_segments<'a>(
     let plan = dir.plan_probe(
         query,
         &live,
-        |total_cells: usize| centroid_directory_nprobe(total_cells, corpus_rows, rowgroup_bytes, 0),
+        |total_cells: usize, usable_rows: u64| {
+            centroid_directory_nprobe(total_cells, usable_rows, rowgroup_bytes, 0)
+        },
         |rows| {
             let rows = usize::try_from(rows).unwrap_or(usize::MAX);
             pax_rabitq_pool_for_top_k(k, rows) as u64

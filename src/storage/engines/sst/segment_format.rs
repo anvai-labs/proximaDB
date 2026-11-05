@@ -3679,11 +3679,13 @@ static SHARED_COARSE_PROBE: std::sync::RwLock<Option<CoarseProbeSettings>> =
 /// `SstEngine::new()`) only fills the default if nothing real was set yet.
 /// Poison-safe (no-panic mandate #4).
 pub fn init_coarse_probe_settings(cfg: Option<&crate::core::config::CoarseProbeConfig>) {
-    // The resolved probe policy derives from these settings — drop the
-    // cache so an authority rewrite re-resolves (TD-RDSTRAT-14).
-    if let Ok(mut cached) = RESOLVED_PROBE_POLICY.write() {
-        *cached = None;
-    }
+    // Install the settings FIRST, then drop the derived policy cache.
+    // Clearing first opened a window where a query resolved and cached a
+    // policy from the OLD settings; because the repopulate used
+    // `get_or_insert` (first writer wins), that stale entry then survived
+    // the authoritative `Some(cfg)` write for the whole process — exactly
+    // the TD-COMPACT-9 "TOML silently dead" failure this RwLock replaced an
+    // OnceLock to fix.
     if let Ok(mut g) = SHARED_COARSE_PROBE.write() {
         match cfg {
             Some(c) => *g = Some(c.clone().into()),
@@ -3691,6 +3693,9 @@ pub fn init_coarse_probe_settings(cfg: Option<&crate::core::config::CoarseProbeC
                 g.get_or_insert_with(CoarseProbeSettings::default);
             }
         }
+    }
+    if let Ok(mut cached) = RESOLVED_PROBE_POLICY.write() {
+        *cached = None;
     }
 }
 
@@ -3709,22 +3714,34 @@ impl From<crate::core::config::CoarseProbeConfig> for CoarseProbeSettings {
             nprobe_min: c.nprobe_min,
             nprobe_max: c.nprobe_max,
             ncomp_floor: c.ncomp_floor,
-            probe_algorithm:
-                proximadb_storage_common::probe_policy::ProbeAlgorithm::parse(&c.algorithm)
-                    .unwrap_or_else(|| {
-                        // The loader aborts on an unknown name; this is the
-                        // non-loader path (programmatic/embedded/test
-                        // construction). Loud, never silent: a silently
-                        // ignored algorithm would invalidate the ladder
-                        // experiment this dial exists for.
-                        tracing::warn!(
-                            algorithm = %c.algorithm,
-                            "coarse_probe.algorithm is not a known probe algorithm                              (sqrt|cbrt|fourth_root|log|fixed|byte_budget);                              falling back to sqrt — fix the construction site"
-                        );
-                        Default::default()
-                    }),
-            probe_base_bytes: c.base_mb * 1024 * 1024,
-            probe_cap_bytes: c.cap_mb * 1024 * 1024,
+            probe_algorithm: proximadb_storage_common::probe_policy::ProbeAlgorithm::parse(
+                &c.algorithm,
+            )
+            .unwrap_or_else(|| {
+                // The loader aborts on an unknown name; this is the
+                // non-loader path (programmatic/embedded/test
+                // construction). Loud, never silent: a silently
+                // ignored algorithm would invalidate the ladder
+                // experiment this dial exists for.
+                tracing::warn!(
+                    algorithm = %c.algorithm,
+                    "coarse_probe.algorithm is not a known probe \
+                     algorithm (sqrt/cbrt/fourth_root/log/fixed/\
+                     byte_budget); falling back to sqrt — fix the \
+                     construction site"
+                );
+                Default::default()
+            }),
+            // Bounded like the property path: an unbounded MiB->bytes
+            // multiply overflows (mandate #4 forbids the debug panic).
+            probe_base_bytes: c
+                .base_mb
+                .min(proximadb_storage_common::probe_policy::MAX_PROBE_BUDGET_MB as u64)
+                .saturating_mul(1024 * 1024),
+            probe_cap_bytes: c
+                .cap_mb
+                .min(proximadb_storage_common::probe_policy::MAX_PROBE_BUDGET_MB as u64)
+                .saturating_mul(1024 * 1024),
         }
     }
 }
@@ -3833,7 +3850,10 @@ fn cached_probe_policy() -> proximadb_storage_common::probe_policy::ProbePolicy 
     }
     let resolved = settings_policy(&coarse_probe_settings());
     if let Ok(mut g) = RESOLVED_PROBE_POLICY.write() {
-        g.get_or_insert(resolved.clone());
+        // Last write wins: concurrent resolvers compute the same policy from
+        // the same settings, and a store must never be able to pin a value
+        // derived from settings that have since been replaced.
+        *g = Some(resolved.clone());
     }
     resolved
 }
