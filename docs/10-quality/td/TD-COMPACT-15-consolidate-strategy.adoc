@@ -148,6 +148,19 @@ consolidate (checked first, unchanged from TD-WLP-2).
 (`consolidate_target_file_size_mb`, 512) > code, via the same
 FlushParameters channel — **for the trigger's due-ness decision only**.
 
+KNOWN TRADE-OFF (#2418 review round 5): `suppress_follow_up` keeps a
+pinned `target_segments > 1` from being undone by a follow-up morsel
+(measured: without it a target-2 request collapses to 1), but the same
+branch schedules the layout/training promotion chain, so a suppressed
+pass can leave its outputs pending promotion (~180 GETs/104 MB per query
+untrained vs 20-51 trained). The pinned target wins because it is the
+contract both API surfaces and the harness assert, and the exposure is
+narrow + self-healing: suppression engages only for target > 1 (so the
+collapse-to-one path and every S=1 arm are unaffected) and is per-task,
+so the next ordinary compaction round performs the promotion. The
+residual case — a collection going read-only right after a target > 1
+FULL — logs a WARN rather than passing silently.
+
 KNOWN GAP (open slice, found by the #2418 review round 3): the FULL
 collapse's group-size target reads the SERVER
 `consolidate_target_file_size_mb` directly

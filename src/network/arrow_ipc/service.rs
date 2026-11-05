@@ -2622,6 +2622,17 @@ impl FlightService for ProximaFlightService {
                         TonicStatus::invalid_argument(format!("Invalid JSON body: {}", e))
                     })?;
 
+                // TD-COMPACT-15: this action runs a flush plus ONE plain
+                // policy morsel and has no FULL mode. Reject the FULL knobs
+                // instead of ignoring them — the sibling `compact_collection`
+                // arm fail-closes on the same inputs, and accepting them here
+                // returned `success: true` for a collapse that never ran.
+                if params.get("full").is_some() || params.get("target_segments").is_some() {
+                    return Err(TonicStatus::invalid_argument(
+                        "flush_and_compact does not support full/target_segments: it runs a flush plus one plain policy morsel. Use the compact_collection action for a FULL collapse",
+                    ));
+                }
+
                 let collection_id = params
                     .get("collection_id")
                     .and_then(|v| v.as_str())

@@ -758,19 +758,25 @@ pub trait UnifiedStorageFormat: Send + Sync {
         full: bool,
         full_target_segments: Option<usize>,
     ) -> Result<CompactionResult> {
+        // Checked BEFORE the !full early return: a caller passing
+        // (full = false, Some(n)) otherwise dropped the bound silently,
+        // which is the very case this guard exists for.
+        if full_target_segments.is_some() && !self.supports_full_compaction() {
+            anyhow::bail!(
+                "this engine has no cross-level FULL collapse, so target_segments cannot be honoured; omit it (the request would otherwise report success for a bound that was never applied)"
+            );
+        }
         if !full {
             return self
                 .compact_collection(collection_id, collection_config)
                 .await;
         }
-        // A knob accepted and then silently dropped reports success for work
-        // that never happened — the same reasoning both API surfaces use to
-        // reject `0` and `full: false`. Engines without a cross-level mode
-        // ignore `full`/`full_target_segments` entirely, so say so instead
-        // of returning 200 with null provenance.
-        if full_target_segments.is_some() && !self.supports_full_compaction() {
+        // Likewise for a bare `full: true`: engines without the mode ignore
+        // it and would run one plain pass, then report success with null
+        // provenance.
+        if !self.supports_full_compaction() {
             anyhow::bail!(
-                "this engine has no cross-level FULL collapse, so target_segments cannot be honoured; omit it (the request would otherwise report success for a bound that was never applied)"
+                "this engine has no cross-level FULL collapse, so full: true cannot be honoured; use a plain compaction request instead (this would otherwise report success for a collapse that never ran)"
             );
         }
         let params = CompactionParameters {

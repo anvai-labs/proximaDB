@@ -1229,15 +1229,48 @@ impl SstEngine {
         // every `[storage.compaction_config]` consolidate knob dead config.
         let (server_strategy_owned, server_target_mb, write_amp_limit) =
             effective_consolidate_knobs(self.config().compaction_config.as_ref());
-        let server_strategy = server_strategy_owned.as_deref();
+        // TD-COMPACT-15 (#2418 review round 5): only the materializer flush
+        // carries `collection_properties`; bulk-ingest, the WAL flush
+        // coordinator, both recovery sites, the document service and the
+        // multimodel facade all pass an empty map. Applying a server
+        // `consolidate_strategy` there would INVERT the precedence — a
+        // collection that explicitly opted out with
+        // `compaction.strategy = 'hybrid'` is honoured on a materializer
+        // flush and silently overridden on a recovery flush, getting the
+        // whole-collection rewrites the operator disabled.
+        //
+        // So the server default applies only where the opt-out is VISIBLE.
+        // With no properties and no tags we cannot distinguish "did not opt
+        // out" from "we cannot see it", and the conservative answer is the
+        // code default (hybrid) — never the broader rewrite.
+        let opt_out_visible = !properties.is_empty() || !tags.is_empty();
+        let server_strategy = if opt_out_visible {
+            server_strategy_owned.as_deref()
+        } else {
+            if server_strategy_owned.is_some() {
+                tracing::debug!(
+                    storage_url = %storage_url,
+                    "TD-COMPACT-15: server consolidate_strategy not applied — this flush path                      carries no collection properties, so a per-collection opt-out would be                      invisible; falling back to the code default"
+                );
+            }
+            None
+        };
         let strategy =
             proximadb_storage_common::resolve_effective_strategy(properties, tags, server_strategy);
         if strategy == proximadb_storage_common::CompactionStrategy::Consolidate {
             crate::metrics::operational_metrics::CONSOLIDATE_CHECKS.inc();
-            // Target: collection property > server default.
-            let target_mb =
-                proximadb_storage_common::resolve_target_file_size_mb(properties, server_target_mb)
-                    .max(1);
+            // Target: the SERVER value only. The per-collection
+            // `compaction.target_file_size_mb` property reaches this
+            // due-ness decision but NOT the merge geometry
+            // (`compact_collection_full` reads the server value, and
+            // `CompactionParameters` carries no properties), so honouring it
+            // here computed a target the merge could never reach and the arm
+            // re-armed on every flush indefinitely — bounded only by the
+            // write-amp guardrail, not by convergence. Trigger and merge now
+            // agree. Plumbing the property into the merge is the named open
+            // slice in the TD; when it lands, restore
+            // `resolve_target_file_size_mb` here in the same change.
+            let target_mb = server_target_mb.max(1);
             let files = self
                 .discover_sstable_files(storage_url)
                 .await

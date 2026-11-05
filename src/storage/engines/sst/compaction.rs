@@ -1981,14 +1981,42 @@ impl Compaction {
                     task.level,
                     &task.output_file,
                 );
-                // TD-COMPACT-15: an operator-pinned FULL target drives its
-                // own passes — a follow-up morsel would merge below the
-                // requested stop point and undo it.
+                // TD-COMPACT-15: a pinned FULL target drives its own passes,
+                // so a follow-up would merge below the requested stop point
+                // and undo it. Measured: allowing it collapses a target-2
+                // request to 1 (pinned by
+                // `full_compaction_honors_target_override_and_reports_provenance`).
+                //
+                // KNOWN TRADE-OFF (#2418 review round 5): this branch also
+                // schedules the LAYOUT/TRAINING promotion chain (the
+                // threshold-1 rescan), so a suppressed pass can leave its
+                // outputs pending promotion — the R6 mode costing ~180
+                // GETs/104 MB per query against 20-51 trained. We keep the
+                // pinned target, because it is the contract both API surfaces
+                // and the bench harness assert, and because the exposure is
+                // narrow and self-healing:
+                //   * suppression only engages for target > 1, so the common
+                //     collapse-to-one path (and every S=1 experiment arm)
+                //     runs the training chain normally;
+                //   * suppression is per-TASK, so the next ordinary
+                //     (non-suppressed) compaction round recomputes
+                //     `training_follow_up_threshold` and performs the
+                //     promotion.
+                // The residual gap is a collection that goes read-only right
+                // after a target > 1 FULL: it stays pending until the next
+                // write. That is why this warns rather than debug-logs.
                 if task.suppress_follow_up {
-                    debug!(
-                        collection_object_id = task.collection_object_id,
-                        "Follow-up suppressed: operator-pinned FULL target owns the collapse"
-                    );
+                    if follow_up_threshold.is_some() {
+                        warn!(
+                            collection_object_id = task.collection_object_id,
+                            "Pinned FULL target suppressed a follow-up carrying a layout/training promotion: outputs stay untrained until the next ordinary compaction round (TD-COMPACT-15 known trade-off)"
+                        );
+                    } else {
+                        debug!(
+                            collection_object_id = task.collection_object_id,
+                            "Follow-up suppressed: pinned FULL target owns the collapse"
+                        );
+                    }
                 } else if succeeded
                     && !shutdown_signal.load(Ordering::SeqCst)
                     && let Some(collection_dir) = task.output_file.parent()

@@ -887,14 +887,44 @@ impl ProximaDB {
         // `[storage.compaction_config]` authoritatively too. The SST
         // section's override wins when present (matching
         // `effective_sst_config`).
-        crate::storage::engines::sst::flush::init_server_compaction_config(
-            self._config
+        // Field-level merge, NOT a wholesale pick: an operator with an
+        // explicit [storage.sst_config.compaction_config] section (say to set
+        // l0_file_threshold) would otherwise have
+        // [storage.compaction_config] consolidate_strategy silently ignored —
+        // recreating the dead-config hazard this install exists to kill. The
+        // SST section wins per-field only where it actually states a value.
+        let merged_compaction = {
+            let top = &self._config.storage.compaction_config;
+            match self
+                ._config
                 .storage
                 .sst_config
                 .as_ref()
                 .and_then(|sst| sst.compaction_config.as_ref())
-                .or(Some(&self._config.storage.compaction_config)),
-        );
+            {
+                Some(sst) => {
+                    let defaults = crate::core::config::CompactionConfig::default();
+                    let mut merged = sst.clone();
+                    if merged.consolidate_strategy.is_none() {
+                        merged.consolidate_strategy = top.consolidate_strategy.clone();
+                    }
+                    if merged.consolidate_target_file_size_mb
+                        == defaults.consolidate_target_file_size_mb
+                    {
+                        merged.consolidate_target_file_size_mb =
+                            top.consolidate_target_file_size_mb;
+                    }
+                    if merged.consolidate_write_amp_limit == defaults.consolidate_write_amp_limit {
+                        merged.consolidate_write_amp_limit = top.consolidate_write_amp_limit;
+                    }
+                    merged
+                }
+                None => top.clone(),
+            }
+        };
+        crate::storage::engines::sst::flush::init_server_compaction_config(Some(
+            &merged_compaction,
+        ));
 
         // TD-IOBUDGET-1: register per-location I/O budgets authoritatively from
         // the loaded config — same overwritable-seed shape as the coarse probe

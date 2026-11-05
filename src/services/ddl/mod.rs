@@ -843,10 +843,15 @@ impl DdlService {
                 // TD-COMPACT-15: measured I/O + why the loop stopped — the
                 // provenance an operator needs to trust the message.
                 let io_note = match (summary.bytes_read, summary.bytes_written) {
-                    (Some(read), Some(written)) => format!(
-                        ", {read} read / {written} written in {}ms",
-                        summary.duration_ms.unwrap_or(0)
-                    ),
+                    // Only state a duration that was MEASURED: unwrap_or(0)
+                    // printed a fabricated "in 0ms" as provenance whenever a
+                    // path set the byte counters but not the clock (now
+                    // reachable, since the metrics extractor falls back to the
+                    // canonical top-level byte fields).
+                    (Some(read), Some(written)) => match summary.duration_ms {
+                        Some(ms) => format!(", {read} read / {written} written in {ms}ms"),
+                        None => format!(", {read} read / {written} written"),
+                    },
                     _ => String::new(),
                 };
                 let stop_note = match (&summary.stop_reason, summary.reached_target) {
