@@ -3,7 +3,7 @@
 //! This module provides clean serialization/deserialization interfaces
 //! without any I/O operations, memtable management, or other concerns.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use proximadb_records::ProximaRecord;
 
 /// Trait for vector batch serialization
@@ -159,28 +159,33 @@ pub trait VectorBatchSerializer: Send + Sync {
 /// `ProtocolBuffersSerializer` and `AvroSerializer` both encode WAL slots
 /// with plain `bincode` — neither emits protobuf nor Avro bytes. This helper
 /// is the ONE copy of that v1 encoding so the two named formats cannot drift
-/// apart. `what` names the slot for the error context.
+/// apart. `what` names the slot for the error context. The bincode cause is
+/// INLINED in the message (not chained behind `.source()`) so recovery-side
+/// `{}` Display keeps the corruption detail — e.g. flush_coordinator wraps
+/// this with its own context and only the outermost message shows.
 pub(super) fn serialize_bincode_batch(
     records: &[ProximaRecord],
     what: &'static str,
 ) -> Result<Vec<u8>> {
     ::bincode::serialize(records)
-        .with_context(|| format!("Failed to serialize ProximaRecords for {what}"))
+        .map_err(|e| anyhow::anyhow!("Failed to serialize ProximaRecords for {what}: {e}"))
 }
 
 /// Deserialize a batch with the shared v1 bincode encoding (TD-WAL-6).
 ///
-/// See [`serialize_bincode_batch`]; same one-copy rationale.
+/// See [`serialize_bincode_batch`]; same one-copy and cause-inlining
+/// rationale.
 pub(super) fn deserialize_bincode_batch(
     data: &[u8],
     what: &'static str,
 ) -> Result<Vec<ProximaRecord>> {
     ::bincode::deserialize(data)
-        .with_context(|| format!("Failed to deserialize ProximaRecords from {what}"))
+        .map_err(|e| anyhow::anyhow!("Failed to deserialize ProximaRecords from {what}: {e}"))
 }
 
-/// Shared test fixture: a minimal Fp32 `ProximaRecord` used by every
-/// serializer's round-trip tests (was copy-pasted per serializer).
+/// Shared test fixture: a minimal Fp32 `ProximaRecord` used by the proto and
+/// avro slot round-trip tests (was copy-pasted per serializer; the bincode
+/// serializer keeps its own richer fixture with an origin field).
 #[cfg(test)]
 pub(super) mod test_util {
     use proximadb_data_model::ProximaValue;
@@ -325,5 +330,38 @@ mod tests {
         let bincode_bytes = ::bincode::serialize(&vectors).expect("raw bincode");
         assert_eq!(proto_bytes, bincode_bytes);
         assert_eq!(avro_bytes, bincode_bytes);
+    }
+
+    // TD-WAL-6: the named slots inherit the trait's v2 default, which
+    // delegates to the v1 encoding — pin that equality so a future
+    // precision-conditional divergence in either slot is caught here, not
+    // in a durability incident.
+    #[test]
+    fn test_named_slots_v2_default_equals_v1_bytes() {
+        let vectors = vec![test_util::create_test_vector()];
+        for format in [
+            SerializationFormat::ProtocolBuffers,
+            SerializationFormat::Avro,
+        ] {
+            let serializer = SerializerFactory::create(format);
+            let v1 = serializer.serialize_batch(&vectors).expect("v1");
+            let v2 = serializer.serialize_batch_v2(&vectors).expect("v2 default");
+            assert_eq!(v1, v2, "{format:?} v2 default must delegate to v1");
+        }
+    }
+
+    // TD-WAL-6: the shared helper's error path must inline both the slot
+    // context and the bincode cause in the Display message — recovery-side
+    // `{}` shows only the outermost message.
+    #[test]
+    fn test_shared_helper_error_inlines_cause() {
+        let garbage: &[u8] = &[0xFF, 0xFF, 0xFF, 0xFF];
+        let err = deserialize_bincode_batch(garbage, "Avro WAL slot")
+            .expect_err("garbage bytes must not decode");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("Failed to deserialize ProximaRecords from Avro WAL slot"),
+            "message missing slot context: {msg}"
+        );
     }
 }

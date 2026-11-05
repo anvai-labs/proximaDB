@@ -33,10 +33,10 @@ duplicate class the dedup program hunts, but with a lying contract on top.
 
 == What shipped (this TD's mitigation)
 
-* ONE shared copy of the v1 encoding: `serialize_bincode_batch(records, what)` / `deserialize_bincode_batch(data, what)` in `serialization/mod.rs`, parameterized only by the error-context string. Both named slots delegate.
+* ONE shared copy of the v1 encoding: `serialize_bincode_batch(records, what)` / `deserialize_bincode_batch(data, what)` in `serialization/mod.rs`, parameterized only by the error-context string (cause INLINED in the message so recovery-side Display keeps the corruption detail). Both named slots delegate.
 * Honest doc comments on both serializers, the module headers, and the `SerializationFormat` variants: named slot, bincode-backed, no protobuf/Avro bytes, no v2 wire override.
-* Pin test `test_named_slots_are_bincode_v1_bytes`: both slots must remain byte-identical with raw `bincode::serialize` — the pin that makes "no wire change" a tested property instead of a claim (mixed-read-safe by construction: the bytes were already bincode and still are).
-* Shared test fixture (`test_util::create_test_vector`) replacing the copy-pasted per-serializer fixture.
+* Pin tests: `test_named_slots_are_bincode_v1_bytes` (both slots byte-identical with raw `bincode::serialize`) and `test_named_slots_v2_default_equals_v1_bytes` (the inherited v2 default delegates to v1 — a precision-conditional divergence in a named slot fails CI, not durability).
+* Shared test fixture (`test_util::create_test_vector`) replacing the copy-pasted proto/avro fixture. The bincode serializer keeps its own richer fixture (carries an `origin` field its tests assert on) — 2-of-3 consolidation, disclosed.
 
 No wire format, enum value, config string, or factory mapping changed.
 
@@ -52,5 +52,6 @@ holds the two slots together.
 
 == Residual
 
+* **Same-named memtable twin:** `src/storage/memtable/serialization/avro.rs` is ALSO a bincode facade (its own inline comment says "Placeholder - implement actual Avro"). This TD's fix covers the WAL serialization module only; the memtable twin folds into the same collapse-vs-implement decision.
 * `wal_behavior.rs` (memtable) selects `AvroSerializer` directly — under option 1 that call site should migrate to the canonical alias in the same PR that collapses the variants.
 * The v1-fp32-only refuse-error on non-Fp32 records for the named slots is pre-existing behavior, unchanged here; it folds into whichever end-state is chosen.
