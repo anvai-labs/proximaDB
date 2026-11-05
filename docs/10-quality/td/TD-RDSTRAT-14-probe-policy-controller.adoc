@@ -87,11 +87,13 @@ the planner plans in the unit the bill is written in.
   module's regression test pins equality across k_c 1..4096), `base_mb`
   (4), `cap_mb` (32). Fail-closed at load: an unknown name aborts boot
   naming the section.
-* DELIBERATE boot change (pre-GA, #2419 review round 8): a NEGATIVE or
-  non-finite `nprobe_multiplier` now fails boot. Before this module a
-  negative clamped to `nprobe_min` and `inf` meant a silent full scan;
-  neither is a setting anyone should be running, so it is rejected rather
-  than preserved. `0` (floor only) and `cap_mb < base_mb` remain legal.
+* DELIBERATE boot change (pre-GA): a NON-FINITE `nprobe_multiplier`
+  (`inf`, NaN) fails boot — `inf` used to mean a silent full scan. A
+  NEGATIVE multiplier keeps booting and keeps its historical meaning
+  (same as 0: probe exactly `nprobe_min`), as do `0` and `cap_mb <
+  base_mb` (round 9 restored negatives; round 8 had rejected them).
+  `base_mb`/`cap_mb` above 1 TiB now fail boot instead of clamping
+  silently, matching the property door.
 * Env overrides (the harness/operator escape hatch, same precedence as
   every other probe knob): `PROXIMADB_PAX_READ_PROBE_ALGORITHM`,
   `PROXIMADB_PAX_READ_PROBE_BASE_MB`, `PROXIMADB_PAX_READ_PROBE_CAP_MB`.

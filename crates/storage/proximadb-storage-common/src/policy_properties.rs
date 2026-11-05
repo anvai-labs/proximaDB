@@ -22,6 +22,18 @@
 
 use std::collections::HashMap;
 
+/// The policy table-property namespaces. Keys under these are validated by
+/// [`validate_policy_properties`] and resolved CASE- AND
+/// WHITESPACE-insensitively (`trim().to_ascii_lowercase()`), so the catalog
+/// imports this list for its SET apply instead of keeping its own copy. A
+/// fourth family is added HERE and every consumer sees it.
+pub const POLICY_PROPERTY_PREFIXES: [&str; 3] = ["cache.", "compaction.", "probe."];
+
+/// The normalized form every policy resolver keys on.
+pub fn normalize_policy_key(key: &str) -> String {
+    key.trim().to_ascii_lowercase()
+}
+
 /// Validate every policy-property family at a write boundary (create, SET,
 /// PATCH). Each family's validator ignores keys outside its own prefix, so
 /// composition is order-independent and unknown non-policy keys pass through

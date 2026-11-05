@@ -2298,16 +2298,17 @@ def effective_flush_interval(
     return 3600 if explicit_flush_every_rows is not None else 12
 
 
-# TD-PAXDIR-1 D7: the gates the --centroid-directory arm turns on — publish the
-# collection directory with decode keys (D1, D6), plan queries on it (D2), ride
-# the rerank on the probe wave (D5), and use the keys on the query path (D6).
-# TD-RDSTRAT-14 probe-policy env gates; scrubbed per spawn (see OwnedServer).
+# TD-RDSTRAT-14 probe-policy env gates; scrubbed per spawn with the other
+# inherited gates (see OwnedServer).
 PROBE_POLICY_GATES = (
     "PROXIMADB_PAX_READ_PROBE_ALGORITHM",
     "PROXIMADB_PAX_READ_PROBE_BASE_MB",
     "PROXIMADB_PAX_READ_PROBE_CAP_MB",
 )
 
+# TD-PAXDIR-1 D7: the gates the --centroid-directory arm turns on — publish the
+# collection directory with decode keys (D1, D6), plan queries on it (D2), ride
+# the rerank on the probe wave (D5), and use the keys on the query path (D6).
 CENTROID_DIRECTORY_GATES = (
     "PROXIMADB_PAX_WRITE_CENTROID_DIRECTORY",
     "PROXIMADB_PAX_WRITE_DIRECTORY_DECODE_KEYS",
@@ -2406,6 +2407,7 @@ class OwnedServer:
             # "default"/"on" arms, so an operator export must not leak (the
             # TD-IOBUDGET-2 hole class).
             *CENTROID_DIRECTORY_GATES,
+            *PROBE_POLICY_GATES,
             "PROXIMADB_PAX_WRITE_SHARED_MODEL",
             "PROXIMADB_PAX_READ_CENTROID_DIRECTORY_NPROBE",
             # S3 endpoint identity comes from --s3-endpoint/--s3-region only;
@@ -2506,13 +2508,6 @@ class OwnedServer:
                 if self.centroid_directory in ("on", "default")
                 else "PROXIMADB_PAX_READ_COARSE_NPROBE"
             ] = str(self.nprobe)
-        # Scrub inherited probe gates FIRST (#2419 review round 8): the env
-        # starts from os.environ, so a value exported by an earlier arm would
-        # engage the server while result.json records this arm as the null
-        # control — the same reason this file already scrubs the chooser and
-        # local-disk gates.
-        for gate in PROBE_POLICY_GATES:
-            environment.pop(gate, None)
         if self.probe_algorithm is not None:
             environment["PROXIMADB_PAX_READ_PROBE_ALGORITHM"] = self.probe_algorithm
         if self.probe_base_mb is not None:
@@ -3552,12 +3547,17 @@ def main() -> int:
         raise RuntimeError(f"--probe-cap-mb must be in 0..={max_probe_mb} (0 = no cap)")
     # base/cap are read ONLY by byte_budget; recording them on another arm
     # labels it with knobs the server never consulted (#2419 review round 8).
-    if args.probe_algorithm != "byte_budget" and (
-        args.probe_base_mb is not None or args.probe_cap_mb is not None
+    # Refused only when the arm EXPLICITLY picks another algorithm: with no
+    # --probe-algorithm the server's TOML may already be byte_budget, which
+    # does read them.
+    if (
+        args.probe_algorithm is not None
+        and args.probe_algorithm != "byte_budget"
+        and (args.probe_base_mb is not None or args.probe_cap_mb is not None)
     ):
         raise RuntimeError(
-            "--probe-base-mb/--probe-cap-mb are read only by --probe-algorithm "
-            "byte_budget; on any other arm they would be recorded but ignored"
+            "--probe-base-mb/--probe-cap-mb are read only by byte_budget; with "
+            f"--probe-algorithm {args.probe_algorithm} they would be recorded but ignored"
         )
     if (
         args.training_compaction_min_mb is not None
@@ -3892,7 +3892,12 @@ def main() -> int:
             "ivf_k_override": args.ivf_k,
             "n_comp_override": args.n_comp,
             "nprobe_override": args.nprobe,
-            "probe_policy": {
+            # The PROXIMADB_PAX_READ_PROBE_* env OVERRIDES this run set
+            # (None = not set). NOT the resolved policy: a server TOML
+            # [storage.sst_config.coarse_probe] still applies beneath them,
+            # so a None row is the control only against the default config
+            # (#2419 review round 9).
+            "probe_policy_env_overrides": {
                 "algorithm": args.probe_algorithm,
                 "base_mb": args.probe_base_mb,
                 "cap_mb": args.probe_cap_mb,

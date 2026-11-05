@@ -17,11 +17,6 @@ use crate::{
     CatalogTableSchema, ColumnConstraint, SchemaChange, system_columns,
 };
 
-/// Table-property namespaces whose keys are resolved case-insensitively by
-/// their policy validators (cache: TD-COMPACT-2b, compaction: TD-COMPACT-15,
-/// probe: TD-RDSTRAT-14). See the `SetTableOption` apply arm.
-const POLICY_PROPERTY_PREFIXES: [&str; 3] = ["cache.", "compaction.", "probe."];
-
 /// Validate a schema for internal consistency.
 pub fn validate_schema(schema: &CatalogTableSchema) -> Result<()> {
     if schema.name.is_empty() {
@@ -849,14 +844,21 @@ pub fn apply_evolution(
                         // as ambiguous (#2419 review round 8). A SET of a
                         // policy key therefore REPLACES any case-variant of
                         // it. Other keys keep exact-key semantics.
-                        let lowered = key.to_ascii_lowercase();
-                        if POLICY_PROPERTY_PREFIXES
+                        // Normalized exactly as the resolvers normalize
+                        // (trim + lowercase): comparing only lowercase let a
+                        // whitespace variant (' cache.index.mode') survive
+                        // beside its canonical twin (#2419 review round 9).
+                        let normalized =
+                            proximadb_storage_common::policy_properties::normalize_policy_key(key);
+                        if proximadb_storage_common::policy_properties::POLICY_PROPERTY_PREFIXES
                             .iter()
-                            .any(|prefix| lowered.starts_with(prefix))
+                            .any(|prefix| normalized.starts_with(prefix))
                         {
-                            new_schema
-                                .properties
-                                .retain(|existing, _| existing.to_ascii_lowercase() != lowered);
+                            new_schema.properties.retain(|existing, _| {
+                                proximadb_storage_common::policy_properties::normalize_policy_key(
+                                    existing,
+                                ) != normalized
+                            });
                         }
                         // Unknown options are stored as table properties so
                         // they round-trip without data loss.
@@ -1911,6 +1913,19 @@ mod tests {
             .collect();
         assert_eq!(variants.len(), 1, "one key per policy knob: {variants:?}");
         assert_eq!(variants[0].1, "off", "the later SET wins");
+
+        // Whitespace variants are the same knob too.
+        let third = set(&second, " cache.index.mode ", "pin");
+        assert_eq!(
+            third
+                .properties
+                .keys()
+                .filter(|k| k.trim().eq_ignore_ascii_case("cache.index.mode"))
+                .count(),
+            1,
+            "{:?}",
+            third.properties
+        );
 
         // Ordinary keys keep exact-key semantics.
         let a = set(&base_schema(), "custom", "1");

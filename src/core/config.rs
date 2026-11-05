@@ -1874,13 +1874,28 @@ impl CoarseProbeConfig {
                 self.algorithm
             ));
         }
-        // Reject only what never had a meaning. A multiplier of 0 booted
-        // before this module and meant "probe exactly nprobe_min", so it
-        // stays legal; a negative or non-finite one never did.
-        if !self.nprobe_multiplier.is_finite() || self.nprobe_multiplier < 0.0 {
+        // A NEGATIVE multiplier booted before this module and behaved
+        // exactly like 0 (`ceil(sqrt(k) x -m)` is <= 0, clamped up to
+        // nprobe_min), so it keeps booting and keeps that meaning (clamped
+        // to 0 in the settings conversion) — rejecting it broke upgrades
+        // (#2419 review round 9). Only a NON-FINITE multiplier fails: `inf`
+        // used to mean a silent full scan and NaN had no defined behaviour,
+        // neither a setting anyone should be running (pre-GA, deliberate).
+        if !self.nprobe_multiplier.is_finite() {
             return Err(format!(
-                "{section}.nprobe_multiplier must be a non-negative finite number (got {})",
+                "{section}.nprobe_multiplier must be a finite number (got {})",
                 self.nprobe_multiplier
+            ));
+        }
+        // The MiB bounds every other layer enforces (the property layer
+        // rejects, the env layer warns-and-ignores). The TOML conversion used
+        // to clamp silently, so one input resolved three ways; boot now
+        // refuses an out-of-range value like the property door does.
+        let max_mb = proximadb_storage_common::probe_policy::MAX_PROBE_BUDGET_MB as u64;
+        if self.base_mb > max_mb || self.cap_mb > max_mb {
+            return Err(format!(
+                "{section}.base_mb/cap_mb must be at most {max_mb} MiB (base_mb={}, cap_mb={})",
+                self.base_mb, self.cap_mb
             ));
         }
         // base_mb is consulted ONLY by byte_budget, so it is checked only

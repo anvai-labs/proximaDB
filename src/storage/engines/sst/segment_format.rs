@@ -3846,7 +3846,10 @@ fn settings_policy(s: &CoarseProbeSettings) -> proximadb_storage_common::probe_p
     // the collection-level carrier lands (TD-RDSTRAT-14 §Deferred).
     let mut server = proximadb_storage_common::probe_policy::ServerProbePolicy {
         algorithm: Some(s.probe_algorithm.as_str().to_string()),
-        multiplier: Some(s.nprobe_multiplier as f64),
+        // Negative = 0 ("floor only"), its historical behaviour; the server
+        // layer drops negatives, which would otherwise silently swap in the
+        // 2.0 default instead (#2419 review round 9).
+        multiplier: Some((s.nprobe_multiplier as f64).max(0.0)),
         min_cells: Some(s.nprobe_min),
         max_cells: Some(s.nprobe_max),
         base_bytes: Some(s.probe_base_bytes),
