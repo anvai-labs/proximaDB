@@ -1071,9 +1071,12 @@ pub(crate) async fn resolve_collection_meta_from_catalog(
                 &table_id, &schema,
             )
     {
+        // MOVED, not cloned: `schema` is owned here, so a caller that only
+        // wants the collection (the WAL batch-write path, path resolution)
+        // pays nothing for the properties (#2418 review round 9).
         return Some(CatalogCollectionMeta {
             collection,
-            properties: schema.properties.clone(),
+            properties: schema.properties,
         });
     }
 
@@ -1102,7 +1105,7 @@ pub(crate) async fn resolve_collection_meta_from_catalog(
             {
                 return Some(CatalogCollectionMeta {
                     collection,
-                    properties: schema.properties.clone(),
+                    properties: schema.properties, // moved, see the fast path
                 });
             }
         }
@@ -1169,7 +1172,7 @@ async fn collections_from_catalog_walk(
                     // Policy properties ride alongside (TD-COMPACT-15): the
                     // proto cannot carry them and derived tags would leak
                     // into catalog read-modify-write saves.
-                    properties: schema.properties.clone(),
+                    properties: schema.properties, // moved: `schema` is owned per iteration
                 });
             }
         }
@@ -1282,8 +1285,10 @@ fn spawn_inline_flush(collection_id: String) {
             );
             return;
         };
-        let plan = match flush_plan_from_collection_meta(&meta.collection, meta.properties.clone())
-        {
+        let plan = match flush_plan_from_collection_meta(
+            &meta.collection,
+            Some(meta.properties.clone()),
+        ) {
             Ok(plan) => plan,
             Err(error) => {
                 tracing::warn!(
@@ -2079,7 +2084,7 @@ impl WriteAheadLogManager {
             .with_context(|| {
                 format!("cannot flush collection {collection_id:?}: catalog metadata was not found")
             })?;
-        let plan = flush_plan_from_collection_meta(&meta.collection, meta.properties)?;
+        let plan = flush_plan_from_collection_meta(&meta.collection, Some(meta.properties))?;
         #[cfg(feature = "axis")]
         let axis = crate::index::get_global_axis_manager();
         #[cfg(feature = "axis")]

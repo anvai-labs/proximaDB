@@ -1288,6 +1288,24 @@ impl SstEngine {
                 tracing::debug!("metric recorded");
                 // Fall through to the hybrid path below
             } else {
+                // TD-COMPACT-8 applies here too (#2418 review round 9): this
+                // arm returns threshold 1, which the caller treats as a
+                // training-arm compaction and marks in flight. Without the
+                // same skip the hybrid arm has, every flush re-armed while
+                // one was still queued or running — the redundant re-training
+                // loop TD-COMPACT-8 exists to prevent, now enabled
+                // server-wide by one consolidate_strategy switch.
+                if self
+                    .training_in_flight
+                    .lock()
+                    .is_ok_and(|guard| guard.contains(storage_url))
+                {
+                    tracing::debug!(
+                        storage_url = %storage_url,
+                        "TD-COMPACT-15: consolidate compaction already in flight; not re-arming"
+                    );
+                    return Ok(None);
+                }
                 return Ok(Some(1)); // always compact (smallest-first)
             }
         }

@@ -396,18 +396,20 @@ impl StorageEngine {
                 continue;
             };
 
-            let plan =
-                match flush_plan_from_collection_meta(&meta.collection, meta.properties.clone()) {
-                    Ok(plan) => plan,
-                    Err(error) => {
-                        tracing::warn!(
-                            collection_id,
-                            "STORAGE_ENGINE: catalog identity resolution failed: {error}"
-                        );
-                        failed_collections.push((collection_id.clone(), error.to_string()));
-                        continue;
-                    }
-                };
+            let plan = match flush_plan_from_collection_meta(
+                &meta.collection,
+                Some(meta.properties.clone()),
+            ) {
+                Ok(plan) => plan,
+                Err(error) => {
+                    tracing::warn!(
+                        collection_id,
+                        "STORAGE_ENGINE: catalog identity resolution failed: {error}"
+                    );
+                    failed_collections.push((collection_id.clone(), error.to_string()));
+                    continue;
+                }
+            };
 
             // A6 fence is applied inside `materialize_collection` (default-OFF), so a
             // pod displaced by a lease takeover is rejected before the storage write.

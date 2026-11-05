@@ -1396,11 +1396,23 @@ impl Compaction {
 
         let started = std::time::Instant::now();
         let cfg = self.config.compaction_config.clone().unwrap_or_default();
-        // Per-request override (TD-COMPACT-15 Experiment 3): the API layer
-        // validates > 0; clamp defensively regardless.
-        let target = target_override
-            .map(|t| t.max(1))
-            .unwrap_or(cfg.full_target_segments.max(1));
+        // Per-request override (TD-COMPACT-15 Experiment 3). Rejected, not
+        // clamped, at 0: both API surfaces refuse it, and silently turning an
+        // internal caller's Some(0) into a successful collapse to 1 is the
+        // knob-silently-rewritten class those surfaces exist to prevent
+        // (#2418 review round 9).
+        if target_override == Some(0) {
+            return Err(crate::core::StorageError::SstEngine(
+                "target_segments must be >= 1 (got 0)".to_string(),
+            ));
+        }
+        let target = target_override.unwrap_or(cfg.full_target_segments.max(1));
+        // Suppression of the follow-up chain is reserved for the per-request
+        // override this TD added. A config-level full_target_segments > 1
+        // predates it and has always run the follow-up chain (incl. the
+        // layout/training promotion); suppressing it there would leave every
+        // FULL on such a config untrained (#2418 review round 9).
+        let suppress_follow_up = target_override.is_some_and(|t| t > 1);
         let max_passes = cfg.full_max_passes.max(1);
         let deadline = started + timeout;
         let (mut total_bytes_read, mut total_bytes_written) = (0u64, 0u64);
@@ -1453,8 +1465,14 @@ impl Compaction {
             // always fits; outputs cascade upward naturally).
             pair.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
             let budget = current_compaction_input_budget(&cfg);
-            let target_file_size =
-                cfg.consolidate_target_file_size_mb_or_default().max(1) * 1_048_576;
+            // saturating: config validation rejects only 0, so a huge stated
+            // value must not overflow (debug panic, mandate #4; release wrap
+            // to a tiny target) — and must agree with the flush trigger,
+            // which already saturates the same product.
+            let target_file_size = cfg
+                .consolidate_target_file_size_mb_or_default()
+                .max(1)
+                .saturating_mul(1_048_576);
             // TD-COMPACT-15 greedy smallest-first: accumulate segments from
             // the ascending-sorted list until the combined size reaches the
             // target file size (producing uniform segments) or the
@@ -1541,10 +1559,11 @@ impl Compaction {
                     Self::level_tier_policy(collection_tags).as_deref(),
                     1,
                 ),
-                // A pinned stop point — per-request override OR a
-                // config-level full_target_segments > 1 — drives its own
-                // passes; the background follow-up would merge below it.
-                suppress_follow_up: target > 1,
+                // A per-request pinned stop point drives its own passes; the
+                // background follow-up would merge below it. See the
+                // `suppress_follow_up` binding for why config-level targets
+                // are excluded.
+                suppress_follow_up,
             };
             let output_key = task.output_file.to_string_lossy().to_string();
             if !self.schedule_compaction(task).await? {

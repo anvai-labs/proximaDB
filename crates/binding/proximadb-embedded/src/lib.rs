@@ -1022,7 +1022,10 @@ impl EmbeddedProximaDB {
                 let Ok(plan) =
                     proximadb::storage::flush_materializer::flush_plan_from_collection_meta(
                         &collection,
-                        std::collections::HashMap::new(),
+                        // Embedded never reads the catalog properties here:
+                        // NOT loaded, so the server consolidate default is
+                        // withheld rather than applied over an invisible opt-out.
+                        None,
                     )
                 else {
                     continue;
@@ -2494,7 +2497,7 @@ impl EmbeddedProximaDB {
                     // unified SST engine as the create-failure fallback.
                     let plan = match proximadb::storage::flush_materializer::flush_plan_from_collection_meta(
                         &collection_metadata,
-                        std::collections::HashMap::new(),
+                        None, // not catalog-loaded (see the sibling site)
                     ) {
                         Ok(plan) => plan,
                         Err(error) => {

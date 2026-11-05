@@ -765,6 +765,11 @@ pub trait UnifiedStorageFormat: Send + Sync {
         // knob could never be honoured and let it through on SstEngine —
         // the single engine behind every production caller, i.e. the one
         // case that mattered (#2418 review round 6).
+        // One validating check for every surface (REST, Flight, DDL, internal
+        // callers): 0 is rejected here rather than clamped to 1 below.
+        if full_target_segments == Some(0) {
+            anyhow::bail!("target_segments must be >= 1 (got 0)");
+        }
         if full_target_segments.is_some() && !full {
             anyhow::bail!(
                 "target_segments requires full: true — a plain compaction pass cannot honour a segment-count bound (this would otherwise report success for a bound that was never applied)"
@@ -796,7 +801,7 @@ pub trait UnifiedStorageFormat: Send + Sync {
             force: true,
             synchronous: true,
             full: true,
-            full_target_segments: full_target_segments.map(|t| t.max(1)),
+            full_target_segments, // validated >= 1 above
             ..Default::default()
         };
         self.do_compact(&params).await

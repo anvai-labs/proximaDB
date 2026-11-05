@@ -123,7 +123,12 @@ pub fn resolve_effective_strategy(
 /// server default. Property: `compaction.target_file_size_mb = "1024"`.
 /// Deterministic under case-duplicate keys (canonical spelling first), for
 /// the same reason as [`resolve_strategy_explicit_from_properties`].
-pub fn resolve_target_file_size_mb(
+// Kept crate-private until the slice that feeds the property into the
+// merge geometry lands: exporting it invited wiring the per-collection
+// target into the trigger alone, recreating the non-converging re-arm loop
+// (#2418 review round 9). Its determinism tests stay for that slice.
+#[allow(dead_code)]
+pub(crate) fn resolve_target_file_size_mb(
     properties: &HashMap<String, String>,
     server_default_mb: u64,
 ) -> u64 {
@@ -165,7 +170,6 @@ pub fn validate_compaction_properties(properties: &HashMap<String, String>) -> R
                 // reads it, so accepting it at SET would be exactly the
                 // accepted-but-inert class this door exists to close. The
                 // same carrier-pending refusal `probe.*` uses.
-                let _ = raw_value;
                 return Err(
                     "compaction.target_file_size_mb is not consumed yet (the merge geometry does not read per-collection properties; TD-COMPACT-15 open slice). Set [storage.compaction_config] consolidate_target_file_size_mb on the server instead".to_string(),
                 );

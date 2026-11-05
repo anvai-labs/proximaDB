@@ -185,7 +185,8 @@ impl AutoFlushDriver {
             };
             let plan = match crate::storage::flush_materializer::flush_plan_from_collection_meta(
                 &meta.collection,
-                meta.properties.clone(),
+                // Read from the catalog: LOADED (empty = the collection set none).
+                Some(meta.properties.clone()),
             ) {
                 Ok(plan) => plan,
                 Err(error) => {
