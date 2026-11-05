@@ -130,6 +130,12 @@ impl UnifiedStorageFormat for SstEngine {
     }
 
     /// Delegate compaction to the compaction module
+    /// SST implements the cross-level FULL collapse (`compact_collection_full`),
+    /// so it honours `full` and `full_target_segments`.
+    fn supports_full_compaction(&self) -> bool {
+        true
+    }
+
     async fn do_compact(&self, params: &CompactionParameters) -> Result<CompactionResult> {
         info!("🔄 SST: Starting compaction operation");
 

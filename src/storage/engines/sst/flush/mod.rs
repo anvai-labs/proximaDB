@@ -46,6 +46,49 @@ pub use coordinator::FlushCoordinator;
 pub use operations::FlushOperations;
 pub use optimizer::FlushOptimizer;
 
+/// TD-COMPACT-15: the authoritative server compaction config, installed
+/// once from the LOADED config at startup.
+///
+/// Why this exists: the engine that runs production flushes is built by
+/// `FlushExecutionCoordinator::engine_for` -> `SstEngine::new()`, which
+/// uses `SstConfig::default()` — so its `compaction_config` is `None` and
+/// the operator's `[storage.compaction_config]` never reached the
+/// consolidate resolution. Only `StorageEngine::start` and
+/// `SharedServices::new` build from `effective_sst_config()`, and those are
+/// different instances. That is the same construction-order trap
+/// TD-COMPACT-9 hit with the coarse-probe TOML, so this mirrors its fix:
+/// an overwritable global (a real `Some` always wins) consulted whenever
+/// the engine's own config carries none.
+static SHARED_COMPACTION_CONFIG: std::sync::RwLock<Option<crate::core::config::CompactionConfig>> =
+    std::sync::RwLock::new(None);
+
+/// Install the authoritative server compaction config (called once from
+/// `ProximaDB::start`). Poison-safe (no-panic mandate #4).
+pub fn init_server_compaction_config(cfg: Option<&crate::core::config::CompactionConfig>) {
+    if let Ok(mut g) = SHARED_COMPACTION_CONFIG.write()
+        && let Some(cfg) = cfg
+    {
+        *g = Some(cfg.clone());
+    }
+}
+
+/// The compaction config the consolidate policy resolves against: the
+/// engine's own when it has one, else the authoritative server install,
+/// else the code defaults.
+fn effective_compaction_config(
+    engine: Option<&crate::core::config::CompactionConfig>,
+) -> crate::core::config::CompactionConfig {
+    if let Some(cfg) = engine {
+        return cfg.clone();
+    }
+    if let Ok(g) = SHARED_COMPACTION_CONFIG.read()
+        && let Some(cfg) = g.as_ref()
+    {
+        return cfg.clone();
+    }
+    crate::core::config::CompactionConfig::default()
+}
+
 impl SstEngine {
     /// Register just-flushed vectors into the per-collection AXIS ANN index (TD-112).
     ///
@@ -1159,22 +1202,16 @@ impl SstEngine {
         // numeric fallbacks must be the real config defaults; the default
         // struct is built only on the None path, so the common path still
         // does not allocate.
-        let cfg = self.config().compaction_config.as_ref();
-        let server_strategy = cfg.and_then(|cfg| cfg.consolidate_strategy.as_deref());
-        let (server_target_mb, write_amp_limit) = cfg
-            .map(|cfg| {
-                (
-                    cfg.consolidate_target_file_size_mb,
-                    cfg.consolidate_write_amp_limit,
-                )
-            })
-            .unwrap_or_else(|| {
-                let defaults = crate::core::config::CompactionConfig::default();
-                (
-                    defaults.consolidate_target_file_size_mb,
-                    defaults.consolidate_write_amp_limit,
-                )
-            });
+        // Resolve against the engine's config when it has one, else the
+        // authoritative server install — `SstEngine::new()` (the production
+        // flush engine) carries none, so reading only `self.config()` made
+        // every `[storage.compaction_config]` consolidate knob dead config.
+        let cfg = effective_compaction_config(self.config().compaction_config.as_ref());
+        let server_strategy = cfg.consolidate_strategy.as_deref();
+        let (server_target_mb, write_amp_limit) = (
+            cfg.consolidate_target_file_size_mb,
+            cfg.consolidate_write_amp_limit,
+        );
         let strategy =
             proximadb_storage_common::resolve_effective_strategy(properties, tags, server_strategy);
         if strategy == proximadb_storage_common::CompactionStrategy::Consolidate {
@@ -1974,6 +2011,55 @@ mod statistics_observe_tests {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    /// TD-COMPACT-15 (#2418 review round 3): the production flush engine is
+    /// built by `SstEngine::new()` from `SstConfig::default()`, whose
+    /// `compaction_config` is `None`. Reading only the engine's own config
+    /// therefore made every `[storage.compaction_config]` consolidate knob
+    /// dead config on the path that actually flushes. The authoritative
+    /// server install must be what a `None` engine config falls back to —
+    /// not the code defaults.
+    #[test]
+    fn server_compaction_config_reaches_an_engine_that_carries_none() {
+        // Before any install, a None engine config yields the code defaults.
+        let defaults = crate::core::config::CompactionConfig::default();
+        let before = effective_compaction_config(None);
+        assert_eq!(
+            before.consolidate_target_file_size_mb,
+            defaults.consolidate_target_file_size_mb
+        );
+        assert!(before.consolidate_strategy.is_none());
+
+        // Install an operator config the way `ProximaDB::start` does.
+        let server = crate::core::config::CompactionConfig {
+            consolidate_strategy: Some("consolidate".to_string()),
+            consolidate_target_file_size_mb: 4096,
+            consolidate_write_amp_limit: 7,
+            ..Default::default()
+        };
+        init_server_compaction_config(Some(&server));
+
+        // A None engine config now resolves the OPERATOR's values.
+        let resolved = effective_compaction_config(None);
+        assert_eq!(
+            resolved.consolidate_strategy.as_deref(),
+            Some("consolidate")
+        );
+        assert_eq!(resolved.consolidate_target_file_size_mb, 4096);
+        assert_eq!(resolved.consolidate_write_amp_limit, 7);
+
+        // An engine that DOES carry a config still wins (it is more specific).
+        let engine = crate::core::config::CompactionConfig {
+            consolidate_target_file_size_mb: 128,
+            ..Default::default()
+        };
+        assert_eq!(
+            effective_compaction_config(Some(&engine)).consolidate_target_file_size_mb,
+            128
+        );
+    }
+
     use super::*;
     use crate::storage::engines::sst::SstConfig;
     use crate::storage::persistence::filesystem::FilesystemFactory;

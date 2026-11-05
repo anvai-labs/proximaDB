@@ -736,6 +736,14 @@ pub trait UnifiedStorageFormat: Send + Sync {
         self.do_compact(&params).await
     }
 
+    /// Whether this engine implements the cross-level FULL collapse (and so
+    /// honours `full` / `full_target_segments`). Engines without it keep the
+    /// single-pass semantics of [`Self::compact_collection`]; the default is
+    /// `false` so a new engine cannot silently accept the knob.
+    fn supports_full_compaction(&self) -> bool {
+        false
+    }
+
     /// Operator compaction with an explicit mode. `full = true` asks the
     /// engine to collapse the collection toward
     /// `CompactionConfig::full_target_segments` (or `full_target_segments`
@@ -754,6 +762,16 @@ pub trait UnifiedStorageFormat: Send + Sync {
             return self
                 .compact_collection(collection_id, collection_config)
                 .await;
+        }
+        // A knob accepted and then silently dropped reports success for work
+        // that never happened — the same reasoning both API surfaces use to
+        // reject `0` and `full: false`. Engines without a cross-level mode
+        // ignore `full`/`full_target_segments` entirely, so say so instead
+        // of returning 200 with null provenance.
+        if full_target_segments.is_some() && !self.supports_full_compaction() {
+            anyhow::bail!(
+                "this engine has no cross-level FULL collapse, so target_segments                  cannot be honoured; omit it (the request would otherwise report                  success for a bound that was never applied)"
+            );
         }
         let params = CompactionParameters {
             collection_id: Some(collection_id.to_string()),

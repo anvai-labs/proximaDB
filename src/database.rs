@@ -881,6 +881,20 @@ impl ProximaDB {
                 .as_ref()
                 .and_then(|sst| sst.coarse_probe.as_ref()),
         );
+        // TD-COMPACT-15: same construction-order trap for the consolidate
+        // knobs — the production flush engine is built from
+        // `SstConfig::default()`, so install the loaded
+        // `[storage.compaction_config]` authoritatively too. The SST
+        // section's override wins when present (matching
+        // `effective_sst_config`).
+        crate::storage::engines::sst::flush::init_server_compaction_config(
+            self._config
+                .storage
+                .sst_config
+                .as_ref()
+                .and_then(|sst| sst.compaction_config.as_ref())
+                .or(Some(&self._config.storage.compaction_config)),
+        );
 
         // TD-IOBUDGET-1: register per-location I/O budgets authoritatively from
         // the loaded config — same overwritable-seed shape as the coarse probe

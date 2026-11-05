@@ -146,7 +146,21 @@ The `compaction:off` tag disarms all background compaction including
 consolidate (checked first, unchanged from TD-WLP-2).
 `compaction.target_file_size_mb` resolves property > server
 (`consolidate_target_file_size_mb`, 512) > code, via the same
-FlushParameters channel. Flush entry points without a catalog schema at
+FlushParameters channel — **for the trigger's due-ness decision only**.
+
+KNOWN GAP (open slice, found by the #2418 review round 3): the FULL
+collapse's group-size target reads the SERVER
+`consolidate_target_file_size_mb` directly
+(`compaction.rs` `compact_collection_full`), and `CompactionParameters`
+carries no properties, so a per-collection
+`compaction.target_file_size_mb` does not reach the merge geometry. A
+collection that sets it therefore computes a trigger target the merge
+cannot reach, and the consolidate arm re-arms on each flush (bounded by
+the write-amp guardrail, not by convergence). Closing it means plumbing
+the resolved target into the compaction task alongside
+`full_target_segments`; until then the property is a trigger-sensitivity
+knob, not a geometry knob, and operators wanting a specific merge size
+must set the server value. Flush entry points without a catalog schema at
 hand (recovery, coordinator, embedded) degrade to the server/code
 defaults — graceful, never stale.
 

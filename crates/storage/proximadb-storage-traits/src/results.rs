@@ -180,9 +180,14 @@ impl StorageCompactionResult {
                 .get("stop_reason")
                 .and_then(|value| value.as_str().map(str::to_string)),
             pending_files: metric_u64("pending_files").map(|v| v as usize),
-            bytes_read: metric_u64("bytes_read"),
-            bytes_written: metric_u64("bytes_written"),
-            duration_ms: metric_u64("duration_ms"),
+            // Fall back to the canonical top-level fields: a path that sets
+            // the struct fields but not the engine_metrics map (SST's plain
+            // non-FULL compaction, other engines) still reports its measured
+            // bytes instead of null. Otherwise this "single extraction
+            // point" silently loses data it was built to centralize.
+            bytes_read: metric_u64("bytes_read").or(self.bytes_read),
+            bytes_written: metric_u64("bytes_written").or(self.bytes_written),
+            duration_ms: metric_u64("duration_ms").or(self.duration_ms),
         }
     }
 }
