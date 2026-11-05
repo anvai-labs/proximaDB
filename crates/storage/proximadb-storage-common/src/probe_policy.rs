@@ -101,10 +101,11 @@ pub struct ProbePolicy {
     /// Base per-query probe byte budget for `ByteBudget` (bytes). The
     /// root and `Log` forms are cell-count functions and ignore it.
     pub base_bytes: u64,
-    /// Hard per-query probe byte cap (bytes; 0 = none). Note that `0` only
-    /// removes this ADDITIONAL bound — a plan is still snapped to
-    /// [`band_ladder`], whose top rung (8x the rowgroup target) bounds
-    /// fan-out regardless.
+    /// Per-probe-pool byte cap for `ByteBudget` (bytes; 0 = none). With `0`
+    /// the plan is genuinely uncapped: the ladder is built up to the budget
+    /// itself, so fan-out is bounded only by the corpus-scaled budget
+    /// (`base_bytes`, itself <= [`MAX_PROBE_BUDGET_MB`]) and the cell pool.
+    /// Set a cap whenever per-query GET bytes must be bounded.
     pub cap_bytes: u64,
 }
 
@@ -764,17 +765,35 @@ mod tests {
         );
         assert_eq!(resolved.min_cells, 0, "explicit 0 floor must survive");
         assert_eq!(resolved.cap_bytes, 0, "explicit 0 cap means no cap");
-        // With no cap the plan is still bounded by the ladder's TOP RUNG
-        // (8x the rowgroup target) — "no cap" removes the extra bound, it
-        // does not uncap fan-out. 40 MiB of raw budget snaps to 32 MiB.
-        let policy = ProbePolicy {
-            algorithm: ProbeAlgorithm::ByteBudget,
-            cap_bytes: 0,
-            ..Default::default()
+        // "No cap" is genuinely uncapped: the plan follows the corpus-scaled
+        // budget past the default 32 MiB cap instead of stopping at a fixed
+        // top rung (the doc said 8x the rowgroup bounded it; round 10 made
+        // the ladder reach the budget, so that is no longer true).
+        let mib: u64 = 1024 * 1024;
+        let plan = |cap_bytes: u64| {
+            resolve_probe_plan(
+                &ProbePolicy {
+                    algorithm: ProbeAlgorithm::ByteBudget,
+                    cap_bytes,
+                    ..Default::default()
+                },
+                100_000,
+                1_000_000_000_000, // 4 MiB x (1e6)^0.25 = ~126 MiB of budget
+                4 * mib,
+                512 * 1024,
+            )
         };
-        let plan = resolve_probe_plan(&policy, 10_000, 10_000_000_000, 4 * 1024 * 1024, 512 * 1024);
-        assert_eq!(plan.band, 32 * 1024 * 1024, "{plan:?}");
-        assert_eq!(plan.probe_bytes, 32 * 1024 * 1024, "{plan:?}");
+        let (capped, uncapped) = (plan(32 * mib), plan(0));
+        assert_eq!(capped.band, 32 * mib, "{capped:?}");
+        assert!(
+            uncapped.band > 32 * mib,
+            "uncapped must exceed the default cap: {uncapped:?}"
+        );
+        assert_eq!(
+            uncapped.band,
+            128 * mib,
+            "126 MiB snaps to the 128 MiB rung: {uncapped:?}"
+        );
     }
 
     #[test]

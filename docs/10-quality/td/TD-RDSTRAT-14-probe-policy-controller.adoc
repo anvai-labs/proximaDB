@@ -251,3 +251,18 @@ Filed:
   times in `probe_policy.rs` (and the filter + `min_by_key` lookup three
   times) instead of calling `normalize_policy_key`; route them through it so
   resolvers and the catalog dedup cannot drift.
+
+Round 11 (#2419): the experimental gate is also enforced in
+`settings_policy`, where the policy is built — a Config assembled without
+ConfigLoader (embedded, programmatic start, tests) fell back to no check;
+`cap_mb = 0` is documented as genuinely uncapped (bounded by the
+corpus-scaled budget and the pool, not a fixed top rung); the harness sets
+the gate for `--probe-base-mb/--probe-cap-mb` arms against a TOML
+byte_budget server; two doc blocks reattached to their items. Filed:
+
+* *RDSTRAT-14-F11 — `init_coarse_probe_settings` invalidates on no-op
+  calls.* Every `SstEngine::new()` makes the `None` "fill default if
+  unset" call, which bumps the generation and clears the resolved policy
+  even when nothing changed, forcing an env re-scan (and repeat WARNs for
+  junk values) on the next query. Bump only when the stored settings
+  change.

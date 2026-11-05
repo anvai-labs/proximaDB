@@ -3755,12 +3755,9 @@ pub(crate) fn coarse_probe_settings() -> CoarseProbeSettings {
         .unwrap_or_default()
 }
 
-/// Fold the flat settings (the historical root-form params) into the
-/// TD-RDSTRAT-14 probe policy. All probe-band formulas live in
-/// `proximadb-storage-common::probe_policy` — tuned in ONE place.
-// TD-RDSTRAT-14: the RESOLVED policy, cached beside the settings — env
-// scans are not free and this sits on the per-query probe path. Cleared
-// when settings re-seed so a test/authority rewrite re-resolves.
+/// TD-RDSTRAT-14: the RESOLVED policy, cached beside the settings — env
+/// scans are not free and this sits on the per-query probe path. Cleared
+/// when settings re-seed so a test/authority rewrite re-resolves.
 static RESOLVED_PROBE_POLICY: std::sync::RwLock<
     Option<(u64, proximadb_storage_common::probe_policy::ProbePolicy)>,
 > = std::sync::RwLock::new(None);
@@ -3781,6 +3778,13 @@ fn warn_junk_env(name: &str, value: &str, expected: &str) {
     );
 }
 
+/// Bounded like the property and TOML paths: dev/test build with
+/// overflow-checks, so an unbounded MiB->bytes multiply would abort the
+/// query path (mandate #4); in release it wraps, and `mb = 2^44` would
+/// yield `cap_bytes = 0`, which resolution honours as the "no cap"
+/// sentinel — silently removing the cap a typo meant to set.
+const MAX_PROBE_MB: u64 = proximadb_storage_common::probe_policy::MAX_PROBE_BUDGET_MB as u64;
+
 /// The env layer of the chain (env > TOML > code — the same precedence
 /// every other probe knob has), expressed as a [`ServerProbePolicy`] so
 /// resolution goes through the ONE exported path
@@ -3791,14 +3795,6 @@ fn warn_junk_env(name: &str, value: &str, expected: &str) {
 /// first probe query is not picked up until the settings are re-seeded.
 /// That matches how the bench harness uses them (set once, per spawned
 /// server) and keeps the env scan off the per-query path.
-///
-/// Bounded like the property and TOML paths: dev/test build with
-/// overflow-checks, so an unbounded MiB->bytes multiply would abort the
-/// query path (mandate #4); in release it wraps, and `mb = 2^44` would
-/// yield `cap_bytes = 0`, which resolution honours as the "no cap"
-/// sentinel — silently removing the cap a typo meant to set.
-const MAX_PROBE_MB: u64 = proximadb_storage_common::probe_policy::MAX_PROBE_BUDGET_MB as u64;
-
 fn env_probe_layer() -> proximadb_storage_common::probe_policy::ServerProbePolicy {
     let mut server = proximadb_storage_common::probe_policy::ServerProbePolicy::default();
     if let Ok(name) = std::env::var("PROXIMADB_PAX_READ_PROBE_ALGORITHM") {
@@ -3857,12 +3853,29 @@ pub(crate) fn probe_experimental_enabled() -> bool {
         .is_ok_and(|value| value.trim() == "1")
 }
 
+/// Fold the flat settings (the historical root-form params) into the
+/// TD-RDSTRAT-14 probe policy. All probe-band formulas live in
+/// `proximadb-storage-common::probe_policy` — tuned in ONE place.
 fn settings_policy(s: &CoarseProbeSettings) -> proximadb_storage_common::probe_policy::ProbePolicy {
     // The TOML settings become the server layer's BASE; the env layer sits
     // above it; the code default below. Properties/tags are empty until
     // the collection-level carrier lands (TD-RDSTRAT-14 §Deferred).
+    // The experimental gate is enforced HERE, where the policy is built, not
+    // only at ConfigLoader: an embedded binding, a programmatic
+    // `ProximaDB::start` or a test builds its Config without the loader, so
+    // a boot-time-only check let an ungated algorithm through (#2419 review
+    // round 11). Same treatment as the env layer: warn and keep sqrt.
+    let algorithm = if s.probe_algorithm.is_experimental() && !probe_experimental_enabled() {
+        tracing::warn!(
+            algorithm = s.probe_algorithm.as_str(),
+            "TD-RDSTRAT-14: experimental probe algorithm configured without PROXIMADB_PAX_READ_PROBE_EXPERIMENTAL=1; using sqrt"
+        );
+        proximadb_storage_common::probe_policy::ProbeAlgorithm::Sqrt
+    } else {
+        s.probe_algorithm
+    };
     let mut server = proximadb_storage_common::probe_policy::ServerProbePolicy {
-        algorithm: Some(s.probe_algorithm.as_str().to_string()),
+        algorithm: Some(algorithm.as_str().to_string()),
         // Negative = 0 ("floor only"), its historical behaviour; the server
         // layer drops negatives, which would otherwise silently swap in the
         // 2.0 default instead (#2419 review round 9).

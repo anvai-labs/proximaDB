@@ -645,6 +645,25 @@ fn experimental_probe_algorithms_need_the_explicit_gate_at_boot() {
     }
 }
 
+/// #2419 review round 11: the gate also holds where the policy is BUILT,
+/// so a Config made without ConfigLoader (embedded, programmatic start,
+/// tests) cannot install an experimental algorithm either.
+#[test]
+fn settings_policy_falls_back_to_sqrt_without_the_experimental_gate() {
+    if probe_experimental_enabled() {
+        return; // an operator exported the gate; the fallback is not testable here
+    }
+    let settings: CoarseProbeSettings = crate::core::config::CoarseProbeConfig {
+        algorithm: "byte_budget".to_string(),
+        ..Default::default()
+    }
+    .into();
+    assert_eq!(
+        settings_policy(&settings).algorithm,
+        proximadb_storage_common::probe_policy::ProbeAlgorithm::Sqrt
+    );
+}
+
 fn cp_cfg(mult: f32) -> crate::core::config::CoarseProbeConfig {
     crate::core::config::CoarseProbeConfig {
         enable_read_probe: true,

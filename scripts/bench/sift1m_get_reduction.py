@@ -2516,6 +2516,12 @@ class OwnedServer:
             # gate, so a ladder arm must set it or it silently runs sqrt.
             if self.probe_algorithm != "sqrt":
                 environment["PROXIMADB_PAX_READ_PROBE_EXPERIMENTAL"] = "1"
+        elif self.probe_base_mb is not None or self.probe_cap_mb is not None:
+            # base/cap with no --probe-algorithm only matter if the server's
+            # TOML is already byte_budget — which the gate must admit, or boot
+            # refuses the very arm the parse-time check allows (#2419 review
+            # round 11).
+            environment["PROXIMADB_PAX_READ_PROBE_EXPERIMENTAL"] = "1"
         if self.probe_base_mb is not None:
             environment["PROXIMADB_PAX_READ_PROBE_BASE_MB"] = str(self.probe_base_mb)
         if self.probe_cap_mb is not None:
@@ -3905,7 +3911,11 @@ def main() -> int:
             # (#2419 review round 9).
             "probe_policy_env_overrides": {
                 "experimental_gate": bool(
-                    args.probe_algorithm and args.probe_algorithm != "sqrt"
+                    (args.probe_algorithm and args.probe_algorithm != "sqrt")
+                    or (
+                        args.probe_algorithm is None
+                        and (args.probe_base_mb is not None or args.probe_cap_mb is not None)
+                    )
                 ),
                 "algorithm": args.probe_algorithm,
                 "base_mb": args.probe_base_mb,
