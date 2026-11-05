@@ -263,20 +263,28 @@ impl ArtusBloomManager {
         (1.0_f64 - (-k * n / m).exp()).powf(k)
     }
 
-    /// Custom serialization for bloom filter
-    fn serialize_bloom(&self, bloom: &dyn BloomFilterStrategy) -> Result<Vec<u8>> {
-        // Simple serialization: store bitmap and parameters
-        let mut bytes = Vec::new();
-
-        // Write parameters
-        bytes.extend_from_slice(&(bloom.bit_count() as u64).to_le_bytes());
-        bytes.extend_from_slice(&(bloom.hash_count() as u64).to_le_bytes());
-
-        // Write bitmap (simplified - actual implementation would use bloom's bitmap)
-        // This is a placeholder - real implementation would access bloom's internal bitmap
-        bytes.extend_from_slice(&vec![0u8; bloom.bit_count() / 8]);
-
-        Ok(bytes)
+    /// Serialization for bloom filters — refuses rather than emitting a filter
+    /// that answers "absent" for every key.
+    ///
+    /// This used to write the parameter header followed by
+    /// `vec![0u8; bit_count / 8]` — an all-zero bitmap, because
+    /// `BloomFilterStrategy` exposes no accessor for its internal bits. A
+    /// correct, fully-populated filter therefore round-tripped through
+    /// `serialize_bloom` → `deserialize_bloom` into one that reports every key
+    /// as *definitely absent*, which is the data-loss direction: callers prune
+    /// records that exist. Refusing is strictly safer than returning bytes that
+    /// decode to a wrong answer (TD-FACADE-1).
+    ///
+    /// To implement: either extend `BloomFilterStrategy` with bitmap access, or
+    /// use `proximadb_bloom::SstableBloomFilter`, which already has real
+    /// `serialize`/`deserialize`. Note its `xxhash64`/`cityhash64` are
+    /// themselves placeholders (see TD-FACADE-1), so pick `murmur3_32`.
+    fn serialize_bloom(&self, _bloom: &dyn BloomFilterStrategy) -> Result<Vec<u8>> {
+        Err(anyhow::anyhow!(
+            "RAPTOR bloom serialization is not implemented: BloomFilterStrategy exposes \
+             no bitmap accessor, and emitting an all-zero bitmap would make the \
+             deserialized filter report every key as absent. See TD-FACADE-1."
+        ))
     }
 
     /// Custom deserialization for bloom filter
@@ -625,12 +633,20 @@ mod tests {
         manager.create_column_bloom(stats).unwrap();
         manager.add_to_bloom("ser_col", "test_value");
 
-        let serialized = manager.serialize_blooms().unwrap();
-        assert!(serialized.contains_key("ser_col"));
-        let bytes = &serialized["ser_col"];
-        assert!(!bytes.is_empty());
-        // Verify structure: first 16 bytes are parameters
-        assert!(bytes.len() >= 16);
+        // TD-FACADE-1 pin. This test used to assert only byte *structure*
+        // (non-empty, >= 16 bytes) and passed while the payload was an all-zero
+        // bitmap — i.e. it was green over a filter that deserialised to
+        // "absent for every key", never checking that "test_value" survived.
+        // Serialization now refuses until a real bitmap can be written; a
+        // future implementation must replace this with a membership round-trip
+        // (add -> serialize -> deserialize -> might_contain("test_value")).
+        let err = manager
+            .serialize_blooms()
+            .expect_err("serialization must refuse rather than emit an all-zero bitmap");
+        assert!(
+            err.to_string().contains("not implemented"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

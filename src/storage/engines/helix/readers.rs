@@ -5,7 +5,6 @@
 
 use anyhow::Result;
 use futures::future::join_all;
-use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, error, info, trace, warn};
 
@@ -16,44 +15,36 @@ use crate::storage::persistence::filesystem::FileSystem;
 use proximadb_distance_kernel::DistanceMetric;
 
 use super::SStableMetadata;
-// Filter evaluator now uses unified module from core
-use crate::storage::engines::core::formats::proximablocks::bloom_filter::{
-    SerializedBloomFilter, factory::BloomFilterFactory,
-};
 
 /// Check if SSTable might contain specific vector IDs using bloom filter
 pub async fn check_bloom_filter(
     sstable: &SStableMetadata,
     vector_ids: &[String],
 ) -> Result<Vec<bool>> {
-    if let Some(ref bloom_data) = sstable.bloom_filter {
-        // Create SerializedBloomFilter structure from raw data
-        // We need to parse the serialized format properly
-        // For now, use the factory directly with appropriate config
-        let config = crate::core::bloom::BloomFilterConfig {
-            bits_per_key: 10,
-            expected_items: 10000,
-            enabled: true,
-            ..Default::default()
-        };
-
-        let serialized = SerializedBloomFilter {
-            strategy_type: crate::core::bloom::BloomStrategy::ByteAligned,
-            version: SerializedBloomFilter::CURRENT_VERSION,
-            config: config.clone(),
-            data: bloom_data.clone(),
-            metadata: HashMap::new(),
-        };
-        let bloom = BloomFilterFactory::from_serialized(&serialized)?;
-
-        // Check each ID
-        let results: Vec<bool> = vector_ids
-            .iter()
-            .map(|id| bloom.might_contain(id.as_bytes()))
-            .collect();
-        Ok(results)
+    if sstable.bloom_filter.is_some() {
+        // REFUSE RATHER THAN GUESS (TD-BLOOM-1 / TD-FACADE-1).
+        //
+        // This used to synthesise a `SerializedBloomFilter` around the raw
+        // bytes using *invented* parameters -- `bits_per_key: 10`,
+        // `expected_items: 10000`, `strategy: ByteAligned` -- none of which was
+        // read from the stored data. `might_contain` is only meaningful under
+        // the same (k, m, strategy) the writer used, so if a writer ever
+        // emitted anything else, every answer here would be arbitrary, and the
+        // false ones are consumed by `search_sstable` as "prune this SSTable"
+        // => silently dropped results.
+        //
+        // No writer populates this field today (every `SStableMetadata`
+        // construction site in the HELIX engine sets `bloom_filter: None`), so
+        // this arm is unreachable and refusing costs nothing. Making it real
+        // means persisting the filter's parameters alongside its bits and
+        // parsing them here -- an on-disk format change under CLAUDE.md #8.
+        Err(anyhow::anyhow!(
+            "HELIX bloom pruning is not implemented: SSTable carries bloom bytes but \
+             no filter parameters are persisted, and guessing (k, m, strategy) would \
+             make pruning answers arbitrary. See TD-BLOOM-1."
+        ))
     } else {
-        // No bloom filter, assume all might be present
+        // No bloom filter: conservative -- every id might be present.
         Ok(vec![true; vector_ids.len()])
     }
 }

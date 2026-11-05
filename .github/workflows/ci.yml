@@ -817,6 +817,15 @@ jobs:
       # ~40s: npx fetch + 4s scan.
       - name: Duplication ratchet
         run: make dup-ratchet-check
+      # Capability-facade ratchet (TD-FACADE-1): counts functions whose own
+      # comments say they are not the implementation their name promises
+      # ("Placeholder", "in a real implementation", "For now, fall back"...).
+      # Bidirectional: a rise fails and names the new site; a fall fails until
+      # the baseline is lowered in the same commit. Runs here, not only in
+      # `make work-commit-check`, because CI never invokes that target -- the
+      # same reason the env-gate check above was promoted. Stdlib-only, ~15s.
+      - name: Capability-facade ratchet
+        run: python3 scripts/count_capability_facades.py --mode no-regression
 
   deterministic-commit-contract:
     name: Deterministic Commit Contract
