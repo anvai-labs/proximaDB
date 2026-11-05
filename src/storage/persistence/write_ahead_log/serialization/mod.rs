@@ -3,7 +3,7 @@
 //! This module provides clean serialization/deserialization interfaces
 //! without any I/O operations, memtable management, or other concerns.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use proximadb_records::ProximaRecord;
 
 /// Trait for vector batch serialization
@@ -154,14 +154,71 @@ pub trait VectorBatchSerializer: Send + Sync {
     }
 }
 
+/// Serialize a batch with the shared v1 bincode encoding (TD-WAL-6).
+///
+/// `ProtocolBuffersSerializer` and `AvroSerializer` both encode WAL slots
+/// with plain `bincode` — neither emits protobuf nor Avro bytes. This helper
+/// is the ONE copy of that v1 encoding so the two named formats cannot drift
+/// apart. `what` names the slot for the error context.
+pub(super) fn serialize_bincode_batch(
+    records: &[ProximaRecord],
+    what: &'static str,
+) -> Result<Vec<u8>> {
+    ::bincode::serialize(records)
+        .with_context(|| format!("Failed to serialize ProximaRecords for {what}"))
+}
+
+/// Deserialize a batch with the shared v1 bincode encoding (TD-WAL-6).
+///
+/// See [`serialize_bincode_batch`]; same one-copy rationale.
+pub(super) fn deserialize_bincode_batch(
+    data: &[u8],
+    what: &'static str,
+) -> Result<Vec<ProximaRecord>> {
+    ::bincode::deserialize(data)
+        .with_context(|| format!("Failed to deserialize ProximaRecords from {what}"))
+}
+
+/// Shared test fixture: a minimal Fp32 `ProximaRecord` used by every
+/// serializer's round-trip tests (was copy-pasted per serializer).
+#[cfg(test)]
+pub(super) mod test_util {
+    use proximadb_data_model::ProximaValue;
+    use proximadb_records::{EmbeddingCell, ProximaRecord, ProximaTree, ProximaTreeNode};
+
+    pub fn create_test_vector() -> ProximaRecord {
+        let mut props = ProximaTree::new();
+        props.insert(
+            "category".to_string(),
+            ProximaTreeNode::Value(ProximaValue::String("test".to_string())),
+        );
+
+        ProximaRecord {
+            oid: "test_vector_1".to_string(),
+            embeddings: vec![EmbeddingCell::new_fp32(
+                "default",
+                "vector",
+                4,
+                vec![0.1, 0.2, 0.3, 0.4],
+            )],
+            props,
+            record_version: 1,
+            ..Default::default()
+        }
+    }
+}
+
 /// Supported serialization formats
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SerializationFormat {
-    /// Protocol Buffers - default for proto-first architecture
+    /// Named "proto" for the canonical WAL slot; the bytes are the shared v1
+    /// bincode encoding (TD-WAL-6) — no protobuf encoding exists.
     ProtocolBuffers,
-    /// Bincode - optimized for performance
+    /// Bincode - optimized for performance (the only format with a v2
+    /// precision-aware wire override)
     Bincode,
-    /// Apache Avro - for schema evolution
+    /// Named "avro" for the WAL slot; the bytes are the shared v1 bincode
+    /// encoding (TD-WAL-6) — no Avro encoding or schema evolution exists.
     Avro,
 }
 
@@ -252,5 +309,21 @@ mod tests {
 
         let bincode_serializer = SerializerFactory::from_string("bincode").unwrap();
         assert_eq!(bincode_serializer.format(), SerializationFormat::Bincode);
+    }
+
+    // TD-WAL-6 pin: the two named-slot serializers must stay byte-identical
+    // with the honest Bincode v1 encoding — they share ONE copy of it.
+    #[test]
+    fn test_named_slots_are_bincode_v1_bytes() {
+        let vectors = vec![test_util::create_test_vector()];
+        let proto_bytes = SerializerFactory::create(SerializationFormat::ProtocolBuffers)
+            .serialize_batch(&vectors)
+            .expect("proto slot serialize");
+        let avro_bytes = SerializerFactory::create(SerializationFormat::Avro)
+            .serialize_batch(&vectors)
+            .expect("avro slot serialize");
+        let bincode_bytes = ::bincode::serialize(&vectors).expect("raw bincode");
+        assert_eq!(proto_bytes, bincode_bytes);
+        assert_eq!(avro_bytes, bincode_bytes);
     }
 }
