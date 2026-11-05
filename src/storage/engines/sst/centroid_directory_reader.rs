@@ -259,7 +259,15 @@ pub(crate) fn plan_segments<'a>(
     // data instead: mean rows per cell x the exact Region-A stride for this
     // model's dim (`code_stride(dim) = 8 + ceil(dim/8)`).
     let avg_cell_bytes = {
-        let cells = dir.cells.len() as u64;
+        // Count DISTINCT cell groups, not (segment, cell) entries: nprobe
+        // and the pool count cell GROUPS, and probing one group reads every
+        // segment's entry for it. Dividing by `dir.cells.len()` therefore
+        // under-estimated per-group bytes by the S-segment fan-out factor
+        // and re-introduced the very cap breach this estimate fixes.
+        let mut distinct: Vec<u32> = dir.cells.iter().map(|c| c.a0_cell).collect();
+        distinct.sort_unstable();
+        distinct.dedup();
+        let cells = distinct.len() as u64;
         let rows: u64 = dir.segments.iter().map(|s| s.rows_covered).sum();
         // `DirectoryModel` carries no `dim`, but `pca_components` is
         // row-major `n_comp x dim`, so the embedding dim is exact.

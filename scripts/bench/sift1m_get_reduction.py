@@ -3416,7 +3416,11 @@ def main() -> int:
     )
     parser.add_argument(
         "--probe-algorithm",
-        choices=["sqrt", "cbrt", "fourth_root", "log", "fixed", "byte_budget"],
+        # `fixed` is deliberately NOT offered: it probes exactly
+        # `min_cells`, and the harness has no flag for that, so the arm
+        # would silently always run at the default 3 cells. Set it via
+        # TOML/collection property if you want a pinned-count arm.
+        choices=["sqrt", "cbrt", "fourth_root", "log", "byte_budget"],
         help=(
             "TD-RDSTRAT-14 probe-band algorithm (PROXIMADB_PAX_READ_PROBE_ALGORITHM); "
             "default sqrt. The recall-vs-GETs dial for the ladder experiment"

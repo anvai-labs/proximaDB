@@ -253,15 +253,13 @@ pub fn resolve_probe_plan(
             // irreducible minimum, so a cap below one cell still probes one
             // — the single documented overshoot.
             let by_budget = ((snapped / cell_bytes.max(1)) as usize).max(1);
-            // The recall floor (min_cells) can never exceed what the cap
-            // affords: the CAP is the contract (it bounds fan-out), the
-            // floor only raises the count when the budget has room.
-            let cap_cells = if policy.cap_bytes > 0 {
-                ((policy.cap_bytes / cell_bytes.max(1)) as usize).max(1)
-            } else {
-                usize::MAX
-            };
-            let floor = policy.min_cells.max(1).min(cap_cells);
+            // The RECALL FLOOR wins over the byte cap, matching the
+            // documented exception below: clamping the floor to the cap let
+            // a small cap collapse the probe to 1 cell — which breached the
+            // cap anyway whenever one cell alone exceeds it, so the clamp
+            // bought nothing and cost recall. A cost knob never silently
+            // trades away recall.
+            let floor = policy.min_cells.max(1);
             let floored = by_budget.max(floor);
             let bounded = if policy.max_cells > 0 {
                 floored.min(policy.max_cells)
@@ -419,7 +417,11 @@ pub fn resolve_probe_policy(
         .filter(|(k, _)| k.trim().to_ascii_lowercase() == PROBE_MULTIPLIER_KEY)
         .min_by_key(|(k, _)| k.as_str())
         .and_then(|(_, v)| v.trim().parse::<f64>().ok())
-        .filter(|m| *m > 0.0)
+        // is_finite() as well as > 0: "inf" parses and passes a bare
+        // positivity check, then saturates nprobe to usize::MAX — the exact
+        // silent full scan this module removed from the `log` arm. Matches
+        // the server layer's filter.
+        .filter(|m| m.is_finite() && *m > 0.0)
     {
         policy.multiplier = multiplier;
     }
@@ -463,8 +465,18 @@ pub fn validate_probe_properties(properties: &HashMap<String, String>) -> Result
                 }
             }
             PROBE_MIN_CELLS_KEY | PROBE_MAX_CELLS_KEY | PROBE_BASE_MB_KEY | PROBE_CAP_MB_KEY => {
-                let parsed = raw_value.trim().parse::<usize>().unwrap_or(0);
-                if parsed == 0 {
+                let Ok(parsed) = raw_value.trim().parse::<usize>() else {
+                    return Err(format!(
+                        "{key}: expected a non-negative integer, got '{raw_value}'"
+                    ));
+                };
+                // 0 is the documented sentinel on min_cells (no floor),
+                // max_cells (unlimited) and cap_mb (no cap) — the TOML
+                // fields these mirror honour it, and `resolve_probe_policy`
+                // honours `Some(0)`, so rejecting it here meant the property
+                // channel could not express what the TOML field can. Only
+                // base_mb must be positive: a zero base budget plans nothing.
+                if parsed == 0 && key.as_str() == PROBE_BASE_MB_KEY {
                     return Err(format!(
                         "{key}: expected a positive integer, got '{raw_value}'"
                     ));
@@ -562,23 +574,58 @@ mod tests {
 
     #[test]
     fn byte_budget_cap_bounds_cells_not_just_labels() {
-        // The review regression: with a cap of 1 MiB and 0.5 MiB cells, no
-        // corpus size may plan more than 2 cells — the cap limits the CELL
-        // COUNT, not merely the reported bytes.
+        // The review regression: the cap limits the CELL COUNT, not merely
+        // the reported bytes. With a 4 MiB cap and 0.5 MiB cells, no corpus
+        // size may plan more than 8 cells.
+        //
+        // The cap is stated ABOVE the recall floor on purpose — see the
+        // sibling test for what happens when they conflict.
+        let policy = ProbePolicy {
+            algorithm: ProbeAlgorithm::ByteBudget,
+            base_bytes: 4 * 1024 * 1024,
+            cap_bytes: 4 * 1024 * 1024,
+            ..Default::default()
+        };
+        assert!(
+            policy.min_cells <= 8,
+            "this test needs the cap to sit above the recall floor"
+        );
+        for rows in [1_000_000u64, 10_000_000_000, 1_000_000_000_000] {
+            let plan = resolve_probe_plan(&policy, 100_000, rows, 4 * 1024 * 1024, 512 * 1024);
+            assert!(plan.cells <= 8, "rows={rows}: {plan:?}");
+            assert!(
+                plan.probe_bytes <= policy.cap_bytes,
+                "rows={rows}: {plan:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn recall_floor_wins_when_the_byte_cap_cannot_afford_it() {
+        // #2419 review round 5: `floor = min_cells.min(cap_cells)` let the
+        // byte cap override the RECALL floor. With a 1 MiB cap and 0.5 MiB
+        // cells the cap affords 2 cells against a floor of 3, and the clamp
+        // bought nothing whenever one cell alone exceeds the cap (the plan
+        // breached it regardless) while costing recall every time.
+        //
+        // A cost knob never silently trades away recall: the floor wins, and
+        // `probe_bytes` then reports the honest cost of it rather than a
+        // figure massaged to fit the cap.
         let policy = ProbePolicy {
             algorithm: ProbeAlgorithm::ByteBudget,
             base_bytes: 4 * 1024 * 1024,
             cap_bytes: 1024 * 1024,
             ..Default::default()
         };
-        for rows in [1_000_000u64, 10_000_000_000, 1_000_000_000_000] {
-            let plan = resolve_probe_plan(&policy, 100_000, rows, 4 * 1024 * 1024, 512 * 1024);
-            assert!(plan.cells <= 2, "rows={rows}: {plan:?}");
-            assert!(
-                plan.probe_bytes <= policy.cap_bytes,
-                "rows={rows}: {plan:?}"
-            );
-        }
+        let plan = resolve_probe_plan(&policy, 100_000, 10_000_000, 4 * 1024 * 1024, 512 * 1024);
+        assert_eq!(
+            plan.cells, policy.min_cells,
+            "the floor must survive a cap that cannot afford it: {plan:?}"
+        );
+        assert!(
+            plan.probe_bytes > policy.cap_bytes,
+            "probe_bytes must report the floor's real cost, not a capped fiction: {plan:?}"
+        );
     }
 
     #[test]
@@ -792,7 +839,21 @@ mod tests {
         assert!(validate_probe_properties(&props(&[("cache.index.mode", "pin")])).is_ok());
         assert!(validate_probe_properties(&props(&[("probe.algorithm", "sqrt2")])).is_err());
         assert!(validate_probe_properties(&props(&[("probe.multiplier", "0")])).is_err());
-        assert!(validate_probe_properties(&props(&[("probe.min_cells", "0")])).is_err());
+        // "inf" parses as f64 and passes a bare `> 0` check, then saturates
+        // nprobe to usize::MAX — a silent full scan (#2419 review round 5).
+        assert!(validate_probe_properties(&props(&[("probe.multiplier", "inf")])).is_err());
+        assert!(validate_probe_properties(&props(&[("probe.multiplier", "NaN")])).is_err());
+        // 0 is the documented SENTINEL on these three — no floor, unlimited,
+        // no cap — and `resolve_probe_policy` honours `Some(0)`, so rejecting
+        // it meant the property channel could not express what the TOML field
+        // it mirrors can (#2419 review round 5).
+        assert!(validate_probe_properties(&props(&[("probe.min_cells", "0")])).is_ok());
+        assert!(validate_probe_properties(&props(&[("probe.max_cells", "0")])).is_ok());
+        assert!(validate_probe_properties(&props(&[("probe.cap_mb", "0")])).is_ok());
+        // base_mb is the exception: a zero base budget plans nothing.
+        assert!(validate_probe_properties(&props(&[("probe.base_mb", "0")])).is_err());
+        // Non-numeric still fails closed on every one of them.
+        assert!(validate_probe_properties(&props(&[("probe.min_cells", "lots")])).is_err());
         assert!(validate_probe_properties(&props(&[("probe.unknown", "1")])).is_err());
     }
 }
