@@ -197,10 +197,10 @@ impl StorageCompactionResult {
                 .and_then(|value| value.as_str().map(str::to_string)),
             pending_files: metric_u64("pending_files").map(|v| v as usize),
             // Fall back to the canonical top-level fields: a path that sets
-            // the struct fields but not the engine_metrics map (SST's plain
-            // non-FULL compaction, other engines) still reports its measured
-            // bytes instead of null. Otherwise this "single extraction
-            // point" silently loses data it was built to centralize.
+            // the struct fields but not the engine_metrics map still reports
+            // its measured bytes instead of null. (SST's PLAIN do_compact
+            // sets none of them, so a plain SST compact reports nulls — and
+            // no bytes_scope, per the scope match below.)
             bytes_read: metric_u64("bytes_read").or(self.bytes_read),
             bytes_written: metric_u64("bytes_written").or(self.bytes_written),
             duration_ms: metric_u64("duration_ms").or(self.duration_ms),
@@ -209,10 +209,19 @@ impl StorageCompactionResult {
             // fallback is a plain compaction's complete accounting (#2418
             // review round 17 — labelling a plain result "lower bound" told
             // operators the number excluded work it included).
-            bytes_scope: if self.engine_metrics.contains_key("segments_after") {
-                Some(FULL_BYTES_SCOPE.to_string())
-            } else {
-                Some(PLAIN_BYTES_SCOPE.to_string())
+            // Scope is stated ONLY when there are bytes to scope: a plain
+            // SST compaction reports null counters (its do_compact branch
+            // sets none), and "request_total" over nulls is a label with
+            // nothing under it (#2418 review round 18).
+            bytes_scope: match (
+                self.engine_metrics.contains_key("segments_after"),
+                metric_u64("bytes_read")
+                    .or(self.bytes_read)
+                    .or(metric_u64("bytes_written").or(self.bytes_written)),
+            ) {
+                (true, Some(_)) => Some(FULL_BYTES_SCOPE.to_string()),
+                (false, Some(_)) => Some(PLAIN_BYTES_SCOPE.to_string()),
+                (_, None) => None,
             },
         }
     }

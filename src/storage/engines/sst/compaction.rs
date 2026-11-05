@@ -1395,13 +1395,13 @@ impl Compaction {
         self.pass_outcomes.write().await.remove(output_key)
     }
 
-    /// Operator FULL compaction: collapse the collection toward
-    /// `full_target_segments` by repeatedly pairing the two largest live
-    /// segments ACROSS levels — geometry the background policy never merges
-    /// (one file per level never triggers; morsels are single-level). Every
-    /// pass uses the same admission, dedup and executors as a normal morsel.
-    /// Partial progress is durable and idempotent: every stop except an error
-    /// is reported in the summary, not raised.
+    /// Collapse the collection toward `full_target_segments` — the
+    /// per-request target or the config default — with the SMALLEST-FIRST
+    /// greedy grouping (TD-COMPACT-15: ~3.6x less write amplification than
+    /// largest-first; each pass merges the smallest viable group, capped at
+    /// `live - target + 1` inputs so it can never overshoot below the
+    /// target), looping passes until the target is reached or a stop
+    /// condition fires.
     #[allow(clippy::too_many_arguments)]
     pub async fn compact_collection_full(
         &self,
@@ -1528,7 +1528,10 @@ impl Compaction {
             // inputs would overshoot BELOW the requested count (more write
             // amplification than the operator asked for). With target=1 the
             // cap is the whole list — the S=1 collapse behavior.
-            let live = pair.len();
+            // `pair` was only re-sorted since the loop-top `live`, never
+            // filtered — same count, named once instead of shadowed so the
+            // cap math visibly uses the same figure as the loop-target
+            // check above (#2418 review round 18).
             let max_group_inputs = live.saturating_sub(target).saturating_add(1);
             let mut group: Vec<(String, u64, u32)> = Vec::new();
             let mut group_bytes: u64 = 0;
@@ -1698,17 +1701,35 @@ impl Compaction {
         follow_up: &mut SstCompactionTask,
     ) -> bool {
         let min_bytes = super::flush::training_compaction_min_bytes();
+        let mut errored = false;
         for path in &follow_up.input_files {
             let url = path.to_string_lossy();
-            if let Ok(Some(size)) =
-                super::flush::untrained_segment_size_on(&self.filesystem_factory, &url, min_bytes)
-                    .await
+            match super::flush::untrained_segment_size_on(&self.filesystem_factory, &url, min_bytes)
+                .await
             {
-                let chosen = path.clone();
-                follow_up.input_files = vec![chosen];
-                follow_up.input_bytes = size;
-                return true;
+                Ok(Some(size)) => {
+                    let chosen = path.clone();
+                    follow_up.input_files = vec![chosen];
+                    follow_up.input_bytes = size;
+                    return true;
+                }
+                Ok(None) => {}
+                // Loud: silently skipping left the caller's "skipped: at the
+                // floor" debug! naming the floor as the cause when the real
+                // cause was a transient object-store error — the exact
+                // misdiagnosis the training-regression fights relied on
+                // (#2418 review round 18).
+                Err(error) => {
+                    errored = true;
+                    warn!(
+                        segment = %url,
+                        "promotion-candidate header check failed: {error}"
+                    );
+                }
             }
+        }
+        if errored {
+            warn!("no promotion candidate readable; not narrowing the follow-up");
         }
         false
     }

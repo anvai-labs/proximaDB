@@ -1022,9 +1022,10 @@ impl EmbeddedProximaDB {
                 let Ok(plan) =
                     proximadb::storage::flush_materializer::flush_plan_from_collection_meta(
                         &collection,
-                        // Embedded never reads the catalog properties here:
-                        // NOT loaded, so the server consolidate default is
-                        // withheld rather than applied over an invisible opt-out.
+                        // Embedded never reads the catalog properties at
+                        // this call site: NOT loaded. (Properties are simply
+                        // not consulted here — the same reason as the sibling
+                        // site below.)
                         None,
                     )
                 else {

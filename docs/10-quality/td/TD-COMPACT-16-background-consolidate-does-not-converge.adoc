@@ -33,9 +33,11 @@ making the server `consolidate_strategy` default actually apply.
 Background consolidate is **refused** rather than shipped non-convergent:
 
 * boot rejects `[storage.compaction_config] consolidate_strategy =
-  "consolidate"` (only `"hybrid"` is accepted) and any stated
-  `consolidate_write_amp_limit` (read only by the refused trigger), each
-  with a message pointing at `COMPACT TABLE ... FULL`;
+  "consolidate"` with a message pointing at `COMPACT TABLE ... FULL`;
+  `consolidate_strategy = "hybrid"` and any stated
+  `consolidate_write_amp_limit` are ACCEPTED with a deprecation warning
+  logged at startup (they shipped as settings in #2407, so refusing them
+  would turn an upgrade into an outage) — read by nothing;
 * the property door (`ALTER TABLE ... SET` / `CREATE TABLE ... WITH`)
   rejects `compaction.strategy = 'consolidate'`;
 * a consolidate strategy that still reaches the trigger — a legacy

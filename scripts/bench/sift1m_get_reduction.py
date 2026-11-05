@@ -3444,29 +3444,20 @@ def main() -> int:
     args = parser.parse_args()
     if args.skip_ingest and not args.collection_id:
         raise SystemExit("--skip-ingest requires --collection-id")
-    if (
-        args.compact_full_target_segments is not None
-        and args.compact_full_target_segments != args.max_segments
+    if args.compact_full_before_measure and (
+        args.compact_full_target_segments is None
+        or args.compact_full_target_segments != args.max_segments
     ):
         # The post-compact settle gate uses the override, so a mismatch let an
         # arm settle at one geometry while result.json reported another. The
         # --help text only ADVISED consistency; enforce it.
         raise SystemExit(
-            "--compact-full-target-segments "
-            f"({args.compact_full_target_segments}) must equal --max-segments "
-            f"({args.max_segments}): the post-compact gate asserts the "
-            "override, so a mismatch records a geometry the run did not measure"
+            "--compact-full-before-measure requires "
+            f"--compact-full-target-segments == --max-segments ({args.max_segments}): "
+            "without the override the server collapses to the config default "
+            "(1), so the settle gate and result.json would record a geometry "
+            "the run did not measure",
         )
-    if args.compact_full_target_segments is not None:
-        # Range-check at PARSE time: this used to live inside
-        # compact_via_flight, which runs after the full ingest and settle —
-        # so a typo'd 0 discarded a multi-hour run.
-        if args.compact_full_target_segments < 1:
-            raise SystemExit("--compact-full-target-segments must be >= 1")
-        if not args.compact_full_before_measure:
-            raise SystemExit(
-                "--compact-full-target-segments requires --compact-full-before-measure"
-            )
     if not (
         args.coalesce_gap_mb >= 0
         and args.coalesce_range_mb > 0
