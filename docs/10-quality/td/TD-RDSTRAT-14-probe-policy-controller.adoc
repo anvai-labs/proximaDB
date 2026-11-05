@@ -392,3 +392,17 @@ case-insensitive lookups, and the probe.* refusal keys on
 `normalize_policy_key`. The dead tag channel was raised again (F1): when
 the carrier lands it must validate at the same doors, or the tag prefix
 must be refused until then.
+
+Round 20 (#2419, on the rebased final head): probe_bytes multiplies are
+saturating (the round-19 fix covered the sums but missed the products);
+the cross-PR policy test no longer asserts either behaviour for
+`compaction.strategy = "consolidate"` (#2418 refuses it at the same door —
+an assertion for either side breaks whichever PR merges second; end-state
+refused); the SetProperties refusal is ATOMIC, before the update loop —
+round 19's collect-then-bail claimed bundled data updates were applied
+first, but the loop's AddSnapshot arm is a debug no-op, and once snapshot
+handling lands that ordering would half-apply a commit then 400 (retry →
+duplicate append); `geometric_nprobe` is #[cfg(test)] (production callers
+use `geometric_nprobe_with` with a policy read once); the probe.* refusal
+derives its prefix from POLICY_PROPERTY_PREFIXES and the doc-slip on
+`validate_policy_properties` is gone.

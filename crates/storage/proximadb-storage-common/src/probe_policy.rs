@@ -339,7 +339,7 @@ pub fn resolve_probe_plan(
             let chosen = bounded.min(cells.max(1));
             ProbePlan {
                 cells: chosen,
-                probe_bytes: chosen as u64 * cell_bytes,
+                probe_bytes: (chosen as u64).saturating_mul(cell_bytes), // saturating: cell_bytes is file-derived (round 20)
                 band: snapped,
             }
         }
@@ -381,7 +381,7 @@ pub fn resolve_probe_plan(
             let chosen = bounded.min(cells.max(1));
             ProbePlan {
                 cells: chosen,
-                probe_bytes: chosen as u64 * cell_bytes,
+                probe_bytes: (chosen as u64).saturating_mul(cell_bytes), // saturating: cell_bytes is file-derived (round 20)
                 band: 0,
             }
         }

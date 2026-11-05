@@ -53,8 +53,6 @@ pub fn normalize_policy_key(key: &str) -> String {
 /// untouched (they are stored verbatim by design).
 ///
 /// Returns the first family error, already phrased for an operator.
-const PROBE_PREFIX_CANARY: &str = "probe.";
-
 pub fn validate_policy_properties(properties: &HashMap<String, String>) -> Result<(), String> {
     // One map may not name the same policy knob twice. The resolvers key on
     // `normalize_policy_key`, so 'compaction.strategy' and
@@ -105,7 +103,9 @@ pub fn validate_policy_properties(properties: &HashMap<String, String>) -> Resul
         // comment promises; the doc is corrected rather than the guard
         // loosened.
         .find(|(key, _)| {
-            normalize_policy_key(key).starts_with(&normalize_policy_key(PROBE_PREFIX_CANARY))
+            // The probe family's prefix from the ONE list (index 2); a
+            // second "probe." literal could drift from it.
+            normalize_policy_key(key).starts_with(POLICY_PROPERTY_PREFIXES[2])
         })
     {
         return Err(format!(
@@ -135,6 +135,10 @@ mod tests {
             validate_policy_properties(&props(&[("compaction.strategy", "consolidat")])).is_err()
         );
         assert!(validate_policy_properties(&props(&[("probe.algorithm", "sqrt2")])).is_err());
+        // NOTE: `compaction.strategy = "consolidate"` is deliberately NOT
+        // asserted here — #2418 refuses it at this same door (TD-COMPACT-16),
+        // and an assertion for either behavior breaks whichever PR merges
+        // second. End-state (both merged): refused.
         // Even a SHAPE-VALID probe property is refused while the channel is
         // unconsumed — accepting it would store an inert key.
         // `probe.*` is reserved: an unrecognised key in it fails closed,
@@ -169,11 +173,10 @@ mod tests {
     fn valid_properties_and_unknown_namespaces_pass() {
         assert!(
             validate_policy_properties(&props(&[
-                ("cache.index.mode", "pin"),
-                // compaction.target_file_size_mb deliberately absent: #2418
-                // refuses it at the door until the merge consumes it, and
-                // this test must hold on develop with both PRs merged.
-                ("compaction.strategy", "consolidate"),
+                ("cache.index.mode", "pin"), // Aligns with #2418 (TD-COMPACT-16): background consolidate is refused
+                // at every door — this test must hold on develop with BOTH PRs
+                // merged, whichever lands second.
+                ("compaction.strategy", "hybrid"),
             ]))
             .is_ok()
         );

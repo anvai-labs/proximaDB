@@ -3980,6 +3980,10 @@ fn cached_probe_policy() -> proximadb_storage_common::probe_policy::ProbePolicy 
 /// module's regression test pins equality across k_c 1..4096). Callers with
 /// corpus/rowgroup/cell-byte context at hand pass them so non-root forms
 /// (`byte_budget`) scale correctly; root forms ignore them.
+/// Test-only since round 20: every production caller reads the policy once
+/// and calls [`geometric_nprobe_with`] (a second cached read could straddle
+/// a settings re-seed). The wrapper remains for the `#[cfg(test)]` shim.
+#[cfg(test)]
 fn geometric_nprobe(
     k_c: usize,
     corpus_rows: u64,

@@ -1109,31 +1109,31 @@ impl IcebergRestService {
             return Err(Self::refuse_collection(&table));
         }
 
+        // Table properties are NOT writable through Iceberg commits, and a
+        // commit containing such a write is refused ATOMICALLY, BEFORE the
+        // update loop: this arm used to `let _ = updates` + success
+        // (Spark/Flink set table properties exactly this way — silently
+        // discarded). Round 19 tried collecting the refusal and bailing
+        // after the loop "so data updates apply first", but the loop's
+        // AddSnapshot arm is itself a debug-log no-op — nothing was applied,
+        // and once snapshot handling IS implemented that ordering would
+        // half-apply a commit and then 400 (client retries → duplicate
+        // append). Refuse the whole commit up front; it contains a write
+        // this surface cannot honour (#2419 review round 20).
+        if req.updates.iter().any(|update| {
+            matches!(update, IcebergTableUpdate::SetProperties { updates } if !updates.is_empty())
+        }) {
+            anyhow::bail!(
+                "Bad request: table properties cannot be set through an Iceberg commit; use ALTER TABLE {} SET (...) over pgwire",
+                table
+            );
+        }
         // Apply updates: handle SetProperties and AddSchema
-        let mut property_write_refusals: Vec<String> = Vec::new();
         for update in &req.updates {
             match update {
-                IcebergTableUpdate::SetProperties { updates } => {
-                    // Table properties are NOT writable through Iceberg
-                    // commits: this arm used to `let _ = updates` and return
-                    // success — Spark/Flink set table properties exactly this
-                    // way, so their writes were silently discarded (the
-                    // accepted-but-inert class; #2419 review round 18). Fail
-                    // closed with the working path. (Snapshot/metadata
-                    // properties are a different map and unaffected.)
-                    // The refusal is COLLECTED, not bailed mid-loop:
-                    // Iceberg clients bundle set-properties WITH
-                    // add-snapshot in one commit, and bailing aborted the
-                    // loop before the data append was applied — rejecting
-                    // the write, not just the property change (#2419
-                    // review round 19).
-                    if !updates.is_empty() {
-                        property_write_refusals.push(format!(
-                            "table properties cannot be set through an Iceberg commit; use ALTER TABLE {} SET (...) over pgwire",
-                            table
-                        ));
-                    }
-                }
+                // Unreachable for non-empty maps (refused before the
+                // loop); an EMPTY SetProperties carries no write.
+                IcebergTableUpdate::SetProperties { updates: _ } => {}
                 IcebergTableUpdate::AddSnapshot { snapshot } => {
                     debug!(
                         "Commit: AddSnapshot {} on {}.{}",
@@ -1150,12 +1150,6 @@ impl IcebergRestService {
                     );
                 }
             }
-        }
-        // Refuse AFTER the loop applied the data updates it could: the
-        // commit still fails (properties are not writable here), but the
-        // failure names every refusal rather than aborting mid-sequence.
-        if let Some(first) = property_write_refusals.first() {
-            anyhow::bail!("Bad request: {first}");
         }
 
         let metadata = self.catalog_schema_to_iceberg_metadata(&identifier, &schema);
