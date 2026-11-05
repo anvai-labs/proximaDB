@@ -274,7 +274,7 @@ proximadb-metrics = { path = "crates/control/proximadb-metrics" }
 arc-swap = "1.7"
 dashmap = "6.1.0"
 moka = { version = "0.12", features = ["future"] }
-parking_lot = "0.12"
+parking_lot = "0.13"
 tracing = "0.1"
 # Mirrors the root `[dependencies]` declaration (#2006) at the WORKSPACE level,
 # because 68 members inherit this entry via `serde_json.workspace = true`. Cargo
