@@ -3,6 +3,21 @@
 :date: 2026-11-03
 :tags: [compaction, lsm, policy, performance]
 
+[IMPORTANT]
+====
+**Status as of 2026-11-05 (#2418):** only the OPERATOR half of this TD
+ships — `COMPACT TABLE ... FULL` with the smallest-first grouping, the
+per-request `target_segments` override and measured provenance. The
+BACKGROUND consolidate strategy (server `consolidate_strategy`, the
+`compaction.strategy` property and tag) is **refused** because its trigger
+scheduled an ordinary L0 morsel rather than the consolidate merge and could
+re-fire on every flush without converging; see
+xref:TD-COMPACT-16-background-consolidate-does-not-converge.adoc[TD-COMPACT-16].
+Sections below that describe the background trigger, the server-default
+install, the visibility carrier and the write-amp guardrail record how that
+path was built and reviewed; they are not live behaviour.
+====
+
 == Problem
 
 The leveled compaction policy never merges across levels and never triggers

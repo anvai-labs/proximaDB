@@ -1047,10 +1047,12 @@ pub struct CompactionConfig {
     /// [`CompactionConfig::consolidate_write_amp_limit_or_default`].
     #[serde(default)]
     pub consolidate_write_amp_limit: Option<u64>,
-    /// TD-COMPACT-15: the server-level DEFAULT compaction strategy for
-    /// collections that set neither the `compaction.strategy` property nor
-    /// a tag — `"hybrid"` or `"consolidate"`. `None` keeps the code default
-    /// (hybrid). Resolution: collection property > tag > this > code.
+    /// TD-COMPACT-15: the server-level DEFAULT compaction strategy. Only
+    /// `"hybrid"` (the code default) is accepted today: BACKGROUND
+    /// consolidate is refused until TD-COMPACT-16, because its trigger
+    /// scheduled an ordinary L0 morsel rather than the consolidate merge and
+    /// could re-fire every flush without converging. Collapse a collection
+    /// with `COMPACT TABLE ... FULL` instead.
     #[serde(default)]
     pub consolidate_strategy: Option<String>,
 }
@@ -1079,25 +1081,29 @@ impl CompactionConfig {
         }
         if let Some(strategy) = &self.consolidate_strategy {
             let value = strategy.trim().to_ascii_lowercase();
-            if !matches!(value.as_str(), "hybrid" | "consolidate") {
+            if value == "consolidate" {
                 return Err(format!(
-                    "{section}.consolidate_strategy must be 'hybrid' or \
-                     'consolidate' (got '{strategy}')"
+                    "{section}.consolidate_strategy = \"consolidate\" is not supported: background consolidate does not converge (TD-COMPACT-16). Collapse with COMPACT TABLE ... FULL instead"
+                ));
+            }
+            if value != "hybrid" {
+                return Err(format!(
+                    "{section}.consolidate_strategy must be 'hybrid' (got '{strategy}')"
                 ));
             }
         }
-        // A stated 0 has no meaning for either knob: a 0 MiB target was
-        // silently clamped to 1 MiB (every collection "over target"), and a
-        // 0 write-amp limit degraded every collection >= 128 MiB to hybrid on
-        // every flush, so consolidate could never run. Fail closed at boot.
+        // Read only by the background consolidate trigger, which is refused
+        // (TD-COMPACT-16): accepting a stated value would be dead config.
+        if self.consolidate_write_amp_limit.is_some() {
+            return Err(format!(
+                "{section}.consolidate_write_amp_limit is not consumed (background consolidate is refused until TD-COMPACT-16); remove it"
+            ));
+        }
+        // A stated 0 MiB target has no meaning (it was silently clamped to
+        // 1 MiB by the FULL merge's grouping). Fail closed at boot.
         if self.consolidate_target_file_size_mb == Some(0) {
             return Err(format!(
                 "{section}.consolidate_target_file_size_mb must be positive (got 0)"
-            ));
-        }
-        if self.consolidate_write_amp_limit == Some(0) {
-            return Err(format!(
-                "{section}.consolidate_write_amp_limit must be positive (got 0)"
             ));
         }
         Ok(())
@@ -1520,16 +1526,30 @@ mod tests {
     #[test]
     fn consolidate_strategy_field_validated_and_default_none() {
         assert!(CompactionConfig::default().consolidate_strategy.is_none());
-        for value in ["hybrid", "consolidate", "Consolidate"] {
-            let config = CompactionConfig {
+        let validate = |value: &str| {
+            CompactionConfig {
                 consolidate_strategy: Some(value.to_string()),
                 ..Default::default()
-            };
-            assert!(
-                config.validate("storage.compaction_config").is_ok(),
-                "expected '{value}' valid"
-            );
+            }
+            .validate("storage.compaction_config")
+        };
+        assert!(validate("hybrid").is_ok());
+        assert!(validate(" Hybrid ").is_ok());
+        // Background consolidate is refused (TD-COMPACT-16), with a pointer
+        // to the operator path that converges.
+        for value in ["consolidate", "Consolidate"] {
+            let error = validate(value).expect_err("background consolidate must fail boot");
+            assert!(error.contains("COMPACT TABLE"), "{error}");
         }
+        // The write-amp limit is read only by that refused trigger.
+        assert!(
+            CompactionConfig {
+                consolidate_write_amp_limit: Some(50),
+                ..Default::default()
+            }
+            .validate("storage.compaction_config")
+            .is_err()
+        );
         assert!(
             CompactionConfig {
                 consolidate_strategy: Some("aggressive".to_string()),

@@ -239,18 +239,10 @@ lazy_static! {
         "proximadb_compaction_memory_admission_waits_total",
         "Compaction tasks that waited for process-wide weighted memory admission",
     );
-    /// TD-COMPACT-15: consolidate strategy — how many times the check ran
-    /// (after every flush, when the strategy is active).
-    pub static ref CONSOLIDATE_CHECKS: IntCounter = counter(
-        "proximadb_consolidate_checks_total",
-        "Consolidate strategy trigger checks (TD-COMPACT-15)",
-    );
-    /// TD-COMPACT-15: consolidate strategy — guardrail degradations to
-    /// hybrid (write amplification exceeded the limit).
-    pub static ref CONSOLIDATE_DEGRADED: IntCounter = counter(
-        "proximadb_consolidate_degraded_total",
-        "Consolidate strategy degradations to hybrid (write-amp guardrail, TD-COMPACT-15)",
-    );
+    // proximadb_consolidate_checks_total / proximadb_consolidate_degraded_total
+    // were removed with the background consolidate trigger (TD-COMPACT-16):
+    // nothing can increment them, and a series stuck at 0 reads as "checked,
+    // never degraded" rather than "not running".
     /// TD-COMPACT-15: outcome of each COMPACT FULL request, by stop reason:
     /// `completed` (reached target with passes), `at_target` (no-op),
     /// **`error`** (the FULL loop itself failed — stalled, timed out; this

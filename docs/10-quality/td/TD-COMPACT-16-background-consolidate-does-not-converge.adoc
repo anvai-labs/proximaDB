@@ -1,0 +1,65 @@
+= TD-COMPACT-16: Background consolidate does not converge — refused until the trigger drives the real merge
+:status: Open
+:date: 2026-11-05
+:tags: [compaction, lsm, policy, correctness]
+
+== Problem
+
+TD-COMPACT-15's consolidate strategy has two halves, and only one of them
+works:
+
+* **Operator collapse** — `COMPACT TABLE ... FULL` (and the REST/Flight
+  `full: true` actions) runs `compact_collection_full`: the smallest-first
+  greedy grouping toward a byte target, looping passes until the live
+  segment count reaches the target. It converges and reports provenance.
+* **Background consolidate** — the flush-time trigger
+  (`should_trigger_compaction`) counted live files across ALL levels
+  against `ceil(total_bytes / consolidate_target_file_size_mb)` and, when
+  over target, returned `Some(1)`. That threshold is consumed by the
+  ordinary level-compaction path (`check_compaction_needed` /
+  `enqueue_due_compaction`), which schedules an **L0 threshold-1 morsel**,
+  not the cross-level consolidate merge.
+
+So the trigger and the work it schedules disagree. For a collection whose
+segments sit at L1+ and whose count exceeds the target, every flush
+returned `Some(1)`, marked training in flight, and enqueued an L0-only
+morsel that cannot reduce the cross-level count: the arm re-fired on every
+flush without converging (found by the #2418 review, round 10). The gap
+dates from #2407; #2418's rounds 3–8 made it reachable server-wide by
+making the server `consolidate_strategy` default actually apply.
+
+== Decision (interim, #2418)
+
+Background consolidate is **refused** rather than shipped non-convergent:
+
+* boot rejects `[storage.compaction_config] consolidate_strategy =
+  "consolidate"` (only `"hybrid"` is accepted) and any stated
+  `consolidate_write_amp_limit` (read only by the refused trigger), each
+  with a message pointing at `COMPACT TABLE ... FULL`;
+* the property door (`ALTER TABLE ... SET` / `CREATE TABLE ... WITH`)
+  rejects `compaction.strategy = 'consolidate'`;
+* a consolidate strategy that still reaches the trigger — a legacy
+  `compaction.strategy:consolidate` tag, or a property stored by #2407
+  before this change — runs the hybrid policy with a WARN;
+* the trigger arm, the server-default install
+  (`SHARED_COMPACTION_CONFIG` / `init_server_compaction_config`) and the
+  now-unincrementable `proximadb_consolidate_{checks,degraded}_total`
+  metrics are removed. `consolidate_target_file_size_mb` stays: the FULL
+  merge's grouping reads it.
+
+== To close
+
+1. The background arm must enqueue the consolidate merge itself — a task
+   that carries the target and runs the smallest-first grouping (the
+   `compact_collection_full` loop, or one pass of it per trigger) — not a
+   threshold that the level path reinterprets.
+2. Trigger and merge must read the same knobs through the same resolution
+   (today the engine's compaction manager reads its own
+   `compaction_config.unwrap_or_default()`; see TD-COMPACT-15 F2: build the
+   flush engine from `effective_sst_config()` instead of a global).
+3. Respect TD-COMPACT-8: a consolidate task in flight must suppress
+   re-arming without disabling the count arm (the hybrid arm returns
+   `count_due`, not `None`).
+4. Gate the re-enable on a convergence test (a settled L1+ ladder reaches
+   the target within N flushes and then stays quiet) plus the write-amp
+   guardrail, then lift the three refusals in the same change.

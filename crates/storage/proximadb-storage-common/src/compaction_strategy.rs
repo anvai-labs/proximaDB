@@ -88,8 +88,9 @@ pub(crate) fn resolve_strategy_explicit_from_properties(
     // A key that is PRESENT but unparseable is an explicit (if broken)
     // operator choice, so it must not fall through and inherit a lower
     // layer that might say `consolidate`. It fails safe to the code
-    // default instead. (Validation rejects such values at every write
-    // door; this covers a catalog written by a path that bypassed them.)
+    // default instead. (`ALTER TABLE ... SET` and `CREATE TABLE ... WITH`
+    // validate; REST create/PATCH on this branch persist no properties at
+    // all. This covers a catalog written before validation existed.)
     if let Some(value) = properties.get(COMPACTION_STRATEGY_PROPERTY_KEY) {
         return Some(parse_strategy(value).unwrap_or_default());
     }
@@ -119,34 +120,6 @@ pub fn resolve_effective_strategy(
         .unwrap_or_default()
 }
 
-/// Resolve the target file size (MB) from properties, falling back to the
-/// server default. Property: `compaction.target_file_size_mb = "1024"`.
-/// Deterministic under case-duplicate keys (canonical spelling first), for
-/// the same reason as [`resolve_strategy_explicit_from_properties`].
-// Kept crate-private until the slice that feeds the property into the
-// merge geometry lands: exporting it invited wiring the per-collection
-// target into the trigger alone, recreating the non-converging re-arm loop
-// (#2418 review round 9). Its determinism tests stay for that slice.
-#[allow(dead_code)]
-pub(crate) fn resolve_target_file_size_mb(
-    properties: &HashMap<String, String>,
-    server_default_mb: u64,
-) -> u64 {
-    let parse_valid =
-        |v: &str| -> Option<u64> { v.trim().parse::<u64>().ok().filter(|mb| *mb > 0) };
-    if let Some(value) = properties.get(COMPACTION_TARGET_FILE_SIZE_PROPERTY_KEY) {
-        return parse_valid(value).unwrap_or(server_default_mb);
-    }
-    properties
-        .iter()
-        .filter(|(key, _)| {
-            key.trim().to_ascii_lowercase() == COMPACTION_TARGET_FILE_SIZE_PROPERTY_KEY
-        })
-        .min_by_key(|(key, _)| key.as_str())
-        .and_then(|(_, value)| parse_valid(value))
-        .unwrap_or(server_default_mb)
-}
-
 /// Validate a `compaction.*` property at SET time. Returns `Err` with a
 /// human-readable message for unknown keys or invalid values.
 pub fn validate_compaction_properties(properties: &HashMap<String, String>) -> Result<(), String> {
@@ -156,13 +129,22 @@ pub fn validate_compaction_properties(properties: &HashMap<String, String>) -> R
             continue;
         }
         match key.as_str() {
-            COMPACTION_STRATEGY_PROPERTY_KEY => {
-                if parse_strategy(raw_value).is_none() {
+            COMPACTION_STRATEGY_PROPERTY_KEY => match parse_strategy(raw_value) {
+                Some(CompactionStrategy::Hybrid) => {}
+                // Refused (TD-COMPACT-16): the background consolidate trigger
+                // scheduled an ordinary L0 morsel, not the consolidate merge,
+                // so it could re-fire every flush without converging.
+                Some(CompactionStrategy::Consolidate) => {
+                    return Err(
+                        "compaction.strategy = 'consolidate' is not supported: background consolidate does not converge (TD-COMPACT-16). Collapse with COMPACT TABLE ... FULL instead".to_string(),
+                    );
+                }
+                None => {
                     return Err(format!(
-                        "compaction.strategy: expected 'hybrid' or 'consolidate', got '{raw_value}'"
+                        "compaction.strategy: expected 'hybrid', got '{raw_value}'"
                     ));
                 }
-            }
+            },
             COMPACTION_TARGET_FILE_SIZE_PROPERTY_KEY => {
                 // REFUSED until the merge consumes it (#2418 review round
                 // 7). Neither the consolidate trigger (which must agree with
@@ -249,34 +231,19 @@ mod tests {
                 resolve_strategy_explicit_from_properties(&properties),
                 Some(CompactionStrategy::Consolidate)
             );
-            let target = props(&[
-                ("Compaction.Target_File_Size_MB", "256"),
-                ("COMPACTION.TARGET_FILE_SIZE_MB", "1024"),
-            ]);
-            assert_eq!(resolve_target_file_size_mb(&target, 512), 1024);
         }
-    }
-
-    #[test]
-    fn target_file_size_resolves_with_fallback() {
-        assert_eq!(resolve_target_file_size_mb(&HashMap::new(), 512), 512);
-        assert_eq!(
-            resolve_target_file_size_mb(&props(&[("compaction.target_file_size_mb", "1024")]), 512),
-            1024
-        );
-        // Invalid falls back
-        assert_eq!(
-            resolve_target_file_size_mb(&props(&[("compaction.target_file_size_mb", "0")]), 512),
-            512
-        );
     }
 
     #[test]
     fn validation_rejects_unknown_and_invalid() {
         assert!(
-            validate_compaction_properties(&props(&[("compaction.strategy", "consolidate")]))
-                .is_ok()
+            validate_compaction_properties(&props(&[("compaction.strategy", "hybrid")])).is_ok()
         );
+        // Background consolidate is refused, pointing at the path that works.
+        let refusal =
+            validate_compaction_properties(&props(&[("compaction.strategy", "consolidate")]))
+                .expect_err("background consolidate must be refused (TD-COMPACT-16)");
+        assert!(refusal.contains("COMPACT TABLE"), "{refusal}");
         // Refused until the merge consumes it: accepting it would be inert.
         let refusal =
             validate_compaction_properties(&props(&[("compaction.target_file_size_mb", "1024")]))
@@ -406,17 +373,6 @@ mod tests {
                 resolve_strategy_explicit_from_properties(&properties),
                 Some(CompactionStrategy::Consolidate)
             );
-        }
-    }
-
-    #[test]
-    fn target_deterministic_under_case_duplicates() {
-        for _ in 0..20 {
-            let properties = props(&[
-                ("Compaction.Target_File_Size_MB", "256"),
-                ("compaction.target_file_size_mb", "1024"),
-            ]);
-            assert_eq!(resolve_target_file_size_mb(&properties, 512), 1024);
         }
     }
 }
