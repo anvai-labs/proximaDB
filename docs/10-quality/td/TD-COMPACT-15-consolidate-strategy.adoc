@@ -144,9 +144,11 @@ collection PROPERTY `compaction.strategy`
 
 The `compaction:off` tag disarms all background compaction including
 consolidate (checked first, unchanged from TD-WLP-2).
-`compaction.target_file_size_mb` resolves property > server
-(`consolidate_target_file_size_mb`, 512) > code, via the same
-FlushParameters channel — **for the trigger's due-ness decision only**.
+`compaction.target_file_size_mb` is **refused at the door** (#2418 review
+round 7): neither the consolidate trigger nor the FULL merge geometry reads
+a per-collection value, so accepting it would be inert. Both read the
+server `consolidate_target_file_size_mb` (default 512). See KNOWN GAP
+below for what closing it takes.
 
 KNOWN TRADE-OFF (#2418 review round 5): `suppress_follow_up` keeps a
 pinned `target_segments > 1` from being undone by a follow-up morsel
@@ -170,10 +172,14 @@ OBSERVABLE instead of argued away:
 
 * `proximadb_compaction_training_promotion_suppressed_total` counts every
   pass where this happened, plus a WARN naming it;
-* the harness REFUSES `--compact-full-target-segments > 1` unless
-  `--allow-untrained-geometry` is passed, and stamps
-  `untrained_geometry_risk` into `result.json` either way, so a measured
-  arm cannot silently look comparable when it is not.
+* the harness records the MEASURED counter delta around its FULL request
+  (`training_promotions_suppressed` in `result.json`), whatever pinned the
+  target — the request or the server's `full_target_segments`;
+* the harness's existing trained-geometry gate (every settled segment must
+  carry a coarse A0 directory) is what actually refuses an untrained arm.
+  (Round 6 briefly added a flag-based pre-flight refusal; round 7 removed
+  it: it missed server-level targets and blocked S=2 arms that end up
+  trained.)
 
 KNOWN GAP (open slice, found by the #2418 review round 3): the FULL
 collapse's group-size target reads the SERVER
@@ -181,19 +187,18 @@ collapse's group-size target reads the SERVER
 (`compaction.rs` `compact_collection_full`), and `CompactionParameters`
 carries no properties, so a per-collection
 `compaction.target_file_size_mb` does not reach the merge geometry. A
-collection that sets it therefore computes a trigger target the merge
-cannot reach, and the consolidate arm re-arms on each flush (bounded by
-the write-amp guardrail, not by convergence). Closing it means plumbing
-the resolved target into the compaction task alongside
-`full_target_segments`; until then the property is a trigger-sensitivity
-knob, not a geometry knob, and operators wanting a specific merge size
-must set the server value. Flush entry points without a catalog schema at
+collection honouring it would compute a trigger target the merge cannot
+reach and re-arm on every flush, which is why it is refused rather than
+half-honoured. Closing it means plumbing the resolved target into the
+compaction task alongside `full_target_segments`, then lifting the
+refusal in the same change; until then operators wanting a specific merge
+size must set the server value. Flush entry points without a catalog schema at
 hand (recovery, coordinator, embedded) degrade to the server/code
 defaults — graceful, never stale.
 
 Surfaces:
-* `ALTER TABLE t SET ('compaction.strategy' = 'consolidate',
-  'compaction.target_file_size_mb' = '1024')` — validated at SET time
+* `ALTER TABLE t SET ('compaction.strategy' = 'consolidate')` — validated
+  at SET time (`compaction.target_file_size_mb` is refused, see above)
   (`validate_compaction_properties`), resolved at flush
 * Collection tag `compaction.strategy:consolidate` (legacy channel)
 * NOT YET A WRITE PATH (found by the #2418 review round 4): `PATCH
@@ -315,3 +320,37 @@ Verify the guardrail prevents the 1 TB rewrite catastrophe.
 * TD-TIER-1 E1 — the fragment ladder (the admission ceiling analysis
   that identified the compaction-policy gap)
 * ADR-076 / ADR-086 / ADR-088 — the compaction admission framework
+
+== Review follow-ups (#2418 round 7, deferred by decision)
+
+The merge gate was set to "no correctness or mandate findings"
+(2026-11-05). Round 7's correctness items were fixed in-PR: the inert
+`compaction.target_file_size_mb` property is refused at the door; tag
+opt-out visibility uses the same parse as resolution (a miscased tag no
+longer lets the server default override an opt-out); the harness measures
+promotion suppression instead of inferring it from a CLI flag; a stated 0
+for either consolidate knob fails boot; the suppression counter moves
+only on a successful pass. Filed, not fixed:
+
+* *COMPACT-15-F1 — `merge_section_over` covers only the three
+  `consolidate_*` fields.* `full_target_segments`, `full_max_passes`,
+  `full_timeout_ms`, `spill_enabled`, the thresholds etc. are still taken
+  wholesale from an SST section, as before this TD. Closing it means
+  making every `CompactionConfig` field `Option` (or merging from raw
+  TOML).
+* *COMPACT-15-F2 — the process-global `SHARED_COMPACTION_CONFIG` is a
+  symptom fix.* The real defect is `FlushExecutionCoordinator::engine_for`
+  building the flush engine with `SstEngine::new()` /
+  `SstConfig::default()`, so its compaction manager also runs default
+  budget/spill/FULL knobs, and the global is last-writer-wins across
+  in-process `ProximaDB` instances. Build that engine from
+  `effective_sst_config()` instead and delete the global.
+* *COMPACT-15-F3 — catalog property clones.* `CatalogCollectionMeta`
+  clones each collection's whole `schema.properties` (incl.
+  `collection.config_json`, `stats.*`) on every catalog walk, including
+  for callers that discard it, and `auto_flush_driver` does so twice per
+  tick. Filter to the `compaction.`/`cache.` prefixes at construction.
+* *COMPACT-15-F4 — REST/DDL copy `FullCompactionMetrics` field-by-field.*
+  Flight serializes the struct; REST `CompactResponse` and DDL
+  `CompactSummary` copy all nine fields by hand, so a new field silently
+  misses two surfaces. Embed with `#[serde(flatten)]` / hold the struct.

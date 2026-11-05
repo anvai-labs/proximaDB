@@ -1510,6 +1510,28 @@ def scrape_text(server: str) -> str:
     )
 
 
+TRAINING_PROMOTION_SUPPRESSED_METRIC = (
+    "proximadb_compaction_training_promotion_suppressed_total"
+)
+
+
+def training_promotions_suppressed(server: str) -> float:
+    """Current value of the TD-COMPACT-15 suppression counter (0 if absent)."""
+    total = 0.0
+    for raw_line in scrape_text(server).splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        token, _, raw_value = line.partition(" ")
+        if token.split("{", 1)[0] != TRAINING_PROMOTION_SUPPRESSED_METRIC:
+            continue
+        try:
+            total += float(raw_value.strip().split()[0])
+        except (ValueError, IndexError):
+            continue
+    return total
+
+
 def scrape(server: str) -> dict[str, float]:
     text = scrape_text(server)
     totals = parse_prometheus(text)
@@ -2690,7 +2712,9 @@ def compact_via_flight(
     """Trigger a compaction. ``full=True`` asks for the cross-level collapse
     (TD-COMPACT-14); ``target_segments`` overrides the FULL collapse target
     (TD-COMPACT-15 Experiment 3) — both ride the action body."""
-    body = {"full": full}
+    # Send `full` only when asked: a plain compaction keeps the exact body it
+    # always had ({"collection_id": ...}), which the harness test pins.
+    body: dict[str, object] = {"full": True} if full else {}
     if target_segments is not None:
         body["target_segments"] = target_segments
     return storage_action_via_flight(
@@ -3263,17 +3287,6 @@ def main() -> int:
             "--compact-full-before-measure; --max-segments must match"
         ),
     )
-    parser.add_argument(
-        "--allow-untrained-geometry",
-        action="store_true",
-        help=(
-            "record a --compact-full-target-segments > 1 arm even though its "
-            "segments may be UNTRAINED (the pinned target suppresses the "
-            "training promotion, and a settled bed never triggers the round "
-            "that would perform it). Stamps untrained_geometry_risk into "
-            "result.json; see TD-COMPACT-15"
-        ),
-    )
     parser.add_argument("--top-k", type=int, default=10)
     parser.add_argument("--settle-timeout-secs", type=int, default=1_200)
     parser.add_argument(
@@ -3453,27 +3466,6 @@ def main() -> int:
     args = parser.parse_args()
     if args.skip_ingest and not args.collection_id:
         raise SystemExit("--skip-ingest requires --collection-id")
-    if (
-        args.compact_full_target_segments is not None
-        and args.compact_full_target_segments > 1
-        and not args.allow_untrained_geometry
-    ):
-        # #2418 review round 6: a pinned target > 1 suppresses the follow-up
-        # carrying the layout/TRAINING promotion, and "the next write heals
-        # it" cannot apply here — this harness pins a target on a SETTLED bed
-        # and then measures queries, so no further write arrives. The outputs
-        # can stay untrained (~180 GETs/query vs 20-51), making the arm NOT
-        # comparable to a trained S=1 arm. Refuse rather than publish a
-        # number that looks comparable and is not.
-        raise SystemExit(
-            "--compact-full-target-segments > 1 can leave the collapsed segments "
-            "untrained (the pinned target suppresses the training promotion, and a "
-            "settled bed never triggers the next round that would perform it), so the "
-            "arm is not comparable to a trained S=1 arm. Check the "
-            "proximadb_compaction_training_promotion_suppressed_total counter; pass "
-            "--allow-untrained-geometry to record it anyway with the caveat stamped "
-            "into result.json"
-        )
     if (
         args.compact_full_target_segments is not None
         and args.compact_full_target_segments != args.max_segments
@@ -3945,13 +3937,6 @@ def main() -> int:
             "local_disk_warm_max_p50_ms": args.local_warm_max_p50_ms,
             "object_cold_max_p50_ms": args.max_p50_ms,
             "max_segments": args.max_segments,
-            # TD-COMPACT-15: a pinned target > 1 may leave segments untrained,
-            # so an arm recorded with --allow-untrained-geometry carries the
-            # caveat rather than reading as directly comparable.
-            "untrained_geometry_risk": bool(
-                args.compact_full_target_segments
-                and args.compact_full_target_segments > 1
-            ),
         },
         "phases": {},
     }
@@ -4095,6 +4080,7 @@ def main() -> int:
                     for s in geometry["segments"]
                 ],
             }
+            suppressed_before = training_promotions_suppressed(server_url)
             action = compact_via_flight(
                 "127.0.0.1",
                 args.port,
@@ -4106,6 +4092,16 @@ def main() -> int:
             result["compact_full_before_measure"] = {
                 "before": before,
                 "action": action,
+                # TD-COMPACT-15: MEASURED, not inferred from the CLI flag. A
+                # pinned target > 1 — from this request OR the server's
+                # full_target_segments — suppresses the follow-up carrying the
+                # training promotion. This records how often it happened; the
+                # trained-geometry check below (every segment must carry a
+                # coarse A0 directory) is what actually refuses an untrained
+                # arm, whatever pinned the target.
+                "training_promotions_suppressed": (
+                    training_promotions_suppressed(server_url) - suppressed_before
+                ),
                 "after": {
                     "segment_count": geometry["segment_count"],
                     "bytes": geometry["bytes"],

@@ -1086,6 +1086,20 @@ impl CompactionConfig {
                 ));
             }
         }
+        // A stated 0 has no meaning for either knob: a 0 MiB target was
+        // silently clamped to 1 MiB (every collection "over target"), and a
+        // 0 write-amp limit degraded every collection >= 128 MiB to hybrid on
+        // every flush, so consolidate could never run. Fail closed at boot.
+        if self.consolidate_target_file_size_mb == Some(0) {
+            return Err(format!(
+                "{section}.consolidate_target_file_size_mb must be positive (got 0)"
+            ));
+        }
+        if self.consolidate_write_amp_limit == Some(0) {
+            return Err(format!(
+                "{section}.consolidate_write_amp_limit must be positive (got 0)"
+            ));
+        }
         Ok(())
     }
 }

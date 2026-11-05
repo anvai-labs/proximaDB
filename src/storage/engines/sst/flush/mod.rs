@@ -1254,11 +1254,10 @@ impl SstEngine {
         // The channels are independent, so test each for what it can
         // actually say: properties are visible when non-empty, and the tag
         // channel counts only when it explicitly STATES a strategy.
-        let tags_state_a_strategy = tags.iter().any(|tag| {
-            tag.trim()
-                .to_ascii_lowercase()
-                .starts_with(proximadb_storage_common::COMPACTION_STRATEGY_TAG_PREFIX)
-        });
+        // Decided by the SAME parse resolution uses: a looser prefix test
+        // let a miscased/garbage tag count as visible while resolving to
+        // nothing, so the server default overrode the opt-out.
+        let tags_state_a_strategy = proximadb_storage_common::tags_state_compaction_strategy(tags);
         let opt_out_visible = !properties.is_empty() || tags_state_a_strategy;
         let server_strategy = if opt_out_visible {
             server_strategy_owned.as_deref()
@@ -2131,7 +2130,6 @@ mod tests {
         assert_eq!(effective_consolidate_knobs(Some(&engine)).1, 128);
     }
 
-    use super::*;
     use crate::storage::engines::sst::SstConfig;
     use crate::storage::persistence::filesystem::FilesystemFactory;
     use proximadb_distance_kernel::engine::UnifiedDistanceCompute;

@@ -59,6 +59,19 @@ pub fn parse_strategy(value: &str) -> Option<CompactionStrategy> {
 /// Single-channel resolution is deliberately NOT exported: a caller
 /// resolving only tags silently misses the property/server layers (the
 /// "property set but inert" bug class).
+/// Whether the tag channel EXPLICITLY states a strategy, decided by the same
+/// parse `resolve_effective_strategy` uses.
+///
+/// Callers deciding whether a per-collection opt-out is visible must use this
+/// rather than a looser prefix test: a miscased or garbage strategy tag
+/// (`Compaction.Strategy:hybrid`, `compaction.strategy:hybird`) passed a
+/// lowercase `starts_with` check while resolving to no explicit choice, which
+/// made the opt-out look visible and let the server default override it
+/// (#2418 review round 7).
+pub fn tags_state_compaction_strategy(tags: &[String]) -> bool {
+    resolve_strategy_explicit_from_tags(tags).is_some()
+}
+
 pub(crate) fn resolve_strategy_explicit_from_tags(tags: &[String]) -> Option<CompactionStrategy> {
     let mut explicit = None;
     for tag in tags {
@@ -155,12 +168,16 @@ pub fn validate_compaction_properties(properties: &HashMap<String, String>) -> R
                 }
             }
             COMPACTION_TARGET_FILE_SIZE_PROPERTY_KEY => {
-                let mb = raw_value.trim().parse::<u64>().unwrap_or(0);
-                if mb == 0 {
-                    return Err(format!(
-                        "compaction.target_file_size_mb: expected a positive integer, got '{raw_value}'"
-                    ));
-                }
+                // REFUSED until the merge consumes it (#2418 review round
+                // 7). Neither the consolidate trigger (which must agree with
+                // the merge, see flush/mod.rs) nor the FULL merge geometry
+                // reads it, so accepting it at SET would be exactly the
+                // accepted-but-inert class this door exists to close. The
+                // same carrier-pending refusal `probe.*` uses.
+                let _ = raw_value;
+                return Err(
+                    "compaction.target_file_size_mb is not consumed yet (the merge geometry does not read per-collection properties; TD-COMPACT-15 open slice). Set [storage.compaction_config] consolidate_target_file_size_mb on the server instead".to_string(),
+                );
             }
             _ => {
                 return Err(format!(
@@ -265,10 +282,11 @@ mod tests {
             validate_compaction_properties(&props(&[("compaction.strategy", "consolidate")]))
                 .is_ok()
         );
-        assert!(
+        // Refused until the merge consumes it: accepting it would be inert.
+        let refusal =
             validate_compaction_properties(&props(&[("compaction.target_file_size_mb", "1024")]))
-                .is_ok()
-        );
+                .expect_err("an unconsumed property must be refused at the door");
+        assert!(refusal.contains("not consumed yet"), "{refusal}");
         assert!(
             validate_compaction_properties(&props(&[("compaction.strategy", "always")])).is_err()
         );
@@ -405,5 +423,22 @@ mod tests {
             ]);
             assert_eq!(resolve_target_file_size_mb(&properties, 512), 1024);
         }
+    }
+
+    #[test]
+    fn tag_visibility_agrees_with_tag_resolution() {
+        let tags = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(tags_state_compaction_strategy(&tags(&[
+            "compaction.strategy:hybrid"
+        ])));
+        // Miscased or garbage tags resolve to nothing, so they must not count
+        // as a visible opt-out either.
+        assert!(!tags_state_compaction_strategy(&tags(&[
+            "Compaction.Strategy:hybrid"
+        ])));
+        assert!(!tags_state_compaction_strategy(&tags(&[
+            "compaction.strategy:hybird"
+        ])));
+        assert!(!tags_state_compaction_strategy(&tags(&["tier:hot"])));
     }
 }

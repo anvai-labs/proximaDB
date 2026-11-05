@@ -1994,20 +1994,22 @@ impl Compaction {
                 // outputs pending promotion — the R6 mode costing ~180
                 // GETs/104 MB per query against 20-51 trained. We keep the
                 // pinned target, because it is the contract both API surfaces
-                // and the bench harness assert, and because the exposure is
-                // narrow and self-healing:
-                //   * suppression only engages for target > 1, so the common
-                //     collapse-to-one path (and every S=1 experiment arm)
-                //     runs the training chain normally;
-                //   * suppression is per-TASK, so the next ordinary
-                //     (non-suppressed) compaction round recomputes
-                //     `training_follow_up_threshold` and performs the
-                //     promotion.
-                // The residual gap is a collection that goes read-only right
-                // after a target > 1 FULL: it stays pending until the next
-                // write. That is why this warns rather than debug-logs.
+                // and the bench harness assert. Suppression only engages for
+                // target > 1, so the collapse-to-one path and every S=1 arm
+                // run the training chain normally.
+                //
+                // It is NOT self-healing in the case that matters: a bench
+                // arm pins a target on a SETTLED bed, no later write
+                // arrives, and the outputs stay untrained (#2418 review
+                // round 6). So the state is made observable instead — the
+                // counter below, this WARN, and the harness refusing / the
+                // result.json stamp. Do not remove those as redundant.
                 if task.suppress_follow_up {
-                    if follow_up_threshold.is_some() {
+                    // Only a SUCCESSFUL pass publishes outputs that can be
+                    // left untrained; a failed morsel published nothing, so
+                    // it must not move the counter operators are told to
+                    // trust (#2418 review round 7).
+                    if succeeded && follow_up_threshold.is_some() {
                         crate::metrics::operational_metrics::COMPACTION_TRAINING_PROMOTION_SUPPRESSED
                             .inc();
                         warn!(

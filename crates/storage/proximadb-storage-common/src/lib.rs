@@ -228,5 +228,5 @@ pub use zero_copy_traits::{
 pub mod compaction_strategy;
 pub use compaction_strategy::{
     COMPACTION_STRATEGY_TAG_PREFIX, CompactionStrategy, resolve_effective_strategy,
-    resolve_target_file_size_mb, validate_compaction_properties,
+    resolve_target_file_size_mb, tags_state_compaction_strategy, validate_compaction_properties,
 };
