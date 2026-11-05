@@ -3363,17 +3363,9 @@ async fn ensure_collection_exists(
     Ok(())
 }
 
-/// `POST /api/v2/collections/:id/suspend` — Phase 8 F4a. Evicts the collection's
-/// in-memory IVF index to free memory (the persisted `ivf.bin` + catalog
-/// metadata stay); the next query (or `/resume`) warm-loads it. Admin-gated.
-/// `POST /api/v2/collections/{id}/compact` body `{"full": bool}` (an
-/// omitted body — no Content-Type — compacts plainly). Operator endpoint (TD-COMPACT-14): NOT utoipa-annotated, so it is
-/// not part of the published OpenAPI spec — same convention as
-/// suspend/resume and the `_diagnostics` actions.
-/// `PATCH /api/v2/collections/{id}/properties` — set/update table properties
-/// (TD-COMPACT-2b). `cache.*` keys are validated; non-cache keys are stored
-/// verbatim. Keys not present in the request are left unchanged (merge
-/// semantics, not replace).
+/// Body of `PATCH /api/v2/collections/{id}/properties`. The endpoint does
+/// NOT persist yet: keys are validated through the one policy door, then any
+/// non-empty request is answered 501 (see `patch_collection_properties_v2`).
 #[derive(Debug, serde::Deserialize)]
 pub struct UpdatePropertiesRequest {
     pub properties: std::collections::HashMap<String, String>,
@@ -3462,6 +3454,11 @@ pub async fn patch_collection_properties_v2(
     }))
 }
 
+/// `POST /api/v2/collections/{id}/compact` body `{"full": bool}` (an omitted
+/// body — no Content-Type — compacts plainly). Operator endpoint
+/// (TD-COMPACT-14): NOT utoipa-annotated, so it is not part of the published
+/// OpenAPI spec — same convention as suspend/resume and the `_diagnostics`
+/// actions.
 pub async fn post_collection_compact_v2(
     Path(collection_id): Path<String>,
     Extension(tenant): Extension<TenantContext>,
@@ -3518,6 +3515,10 @@ pub async fn post_collection_compact_v2(
     }))
 }
 
+/// `POST /api/v2/collections/:id/suspend` — Phase 8 F4a. Evicts the
+/// collection's in-memory IVF index to free memory (the persisted `ivf.bin` +
+/// catalog metadata stay); the next query (or `/resume`) warm-loads it.
+/// Admin-gated.
 pub async fn post_collection_suspend_v2(
     Path(collection_id): Path<String>,
     Extension(tenant): Extension<TenantContext>,

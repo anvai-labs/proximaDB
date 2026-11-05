@@ -1,5 +1,9 @@
 //! TD-RDSTRAT-14: the policy-driven probe-band controller — the single place
-//! the coarse-probe fan-out formula lives.
+//! the PAX coarse-probe fan-out formula lives (both PAX consumers: the
+//! per-segment A0 probe and the collection centroid directory). The generic
+//! IVF `ApproximateSearchStrategy::calculate_nprobe` still carries its own
+//! `ceil(sqrt(n) × multiplier)` and does not follow this policy yet
+//! (RDSTRAT-14-F8).
 //!
 //! The probe count is the recall↔GETs dial of the IVF-family read path: rank
 //! cells in RAM, then read the chosen cells' extents as coalesced ranges.
@@ -140,28 +144,33 @@ pub struct ProbePlan {
     pub band: u64,
 }
 
-/// The discrete band ladder, DERIVED from the rowgroup geometry:
-/// rungs `[rg/4, rg/2, rg, 2·rg, 4·rg, 8·rg]` filtered to sane bounds (sub-512 KiB
-/// probes are pointless; unbounded above is fine — `cap_bytes` bounds).
-/// Band edges live HERE and nowhere else.
-pub fn band_ladder(rowgroup_bytes: u64) -> Vec<u64> {
+/// The discrete band ladder, DERIVED from the rowgroup geometry and the cap:
+/// rungs `rg/4, rg/2, rg`, then doubling until the top rung reaches
+/// `max(8·rg, cap_bytes)`, filtered to sane bounds (sub-512 KiB probes are
+/// pointless). Band edges live HERE and nowhere else.
+///
+/// The ladder MUST be able to reach the cap, or every budget above the top
+/// rung collapses onto it and the ladder experiment cannot tell its own arms
+/// apart. A fixed `8·rg` top did that on local disk (#2419 review round 8):
+/// a 1 MiB rowgroup target topped out at 8 MiB under the 32 MiB default cap,
+/// so `byte_budget@8MB` and `@16MB` planned identically. The loop is bounded:
+/// the cap is clamped to [`MAX_PROBE_BUDGET_MB`] upstream, and the rung
+/// doubles (saturating), so it terminates in at most ~64 steps.
+pub fn band_ladder(rowgroup_bytes: u64, cap_bytes: u64) -> Vec<u64> {
     let rg = rowgroup_bytes.max(1);
-    // Up to 8x the rowgroup target: the ladder MUST be able to reach the
-    // cap, or every budget above the top rung collapses onto it. With the
-    // 4 MiB cloud target and the 32 MiB default cap, stopping at 4x made
-    // `byte_budget@8MB` and `@16MB` plan the same 16 MiB at >=3M rows —
-    // the ladder experiment could not tell its own arms apart.
-    [
-        rg / 4,
-        rg / 2,
-        rg,
-        rg.saturating_mul(2),
-        rg.saturating_mul(4),
-        rg.saturating_mul(8),
-    ]
-    .into_iter()
-    .filter(|rung| *rung >= 512 * 1024)
-    .collect()
+    let top = rg.saturating_mul(8).max(cap_bytes);
+    let mut rungs = vec![rg / 4, rg / 2, rg];
+    let mut rung = rg;
+    while rung < top {
+        let next = rung.saturating_mul(2);
+        if next == rung {
+            break; // saturated at u64::MAX
+        }
+        rung = next;
+        rungs.push(rung);
+    }
+    rungs.retain(|rung| *rung >= 512 * 1024);
+    rungs
 }
 
 /// Snap `bytes` to the nearest ladder rung (ties keep the LOWER rung —
@@ -173,7 +182,7 @@ fn snap_to_band(bytes: u64, rowgroup_bytes: u64, cap_bytes: u64) -> u64 {
     if cap_bytes > 0 {
         target = target.min(cap_bytes);
     }
-    let ladder = band_ladder(rowgroup_bytes);
+    let ladder = band_ladder(rowgroup_bytes, cap_bytes);
     if ladder.is_empty() {
         return target;
     }
@@ -781,21 +790,48 @@ mod tests {
 
     #[test]
     fn band_ladder_derives_from_rowgroup_geometry() {
-        let rungs = band_ladder(4 * 1024 * 1024);
+        let mib = 1024 * 1024;
+        // Cloud target, default cap: the 8x floor already reaches the cap.
         assert_eq!(
-            rungs,
-            vec![
-                1024 * 1024,
-                2 * 1024 * 1024,
-                4 * 1024 * 1024,
-                8 * 1024 * 1024,
-                16 * 1024 * 1024,
-                32 * 1024 * 1024
-            ],
-            "the ladder must reach the default 32 MiB cap, or budgets above              the top rung all collapse onto it"
+            band_ladder(4 * mib, 32 * mib),
+            vec![mib, 2 * mib, 4 * mib, 8 * mib, 16 * mib, 32 * mib],
+            "the ladder must reach the default 32 MiB cap"
         );
-        // Sub-megabyte rungs are pointless and filtered.
-        assert!(band_ladder(1024).iter().all(|r| *r >= 512 * 1024));
+        // Local-disk target (1 MiB): the ladder must STILL reach the cap,
+        // not stop at 8 MiB (#2419 review round 8).
+        let local = band_ladder(mib, 32 * mib);
+        assert_eq!(local.last().copied(), Some(32 * mib), "{local:?}");
+        // Uncapped: the 8x floor.
+        assert_eq!(band_ladder(mib, 0).last().copied(), Some(8 * mib));
+        // Sub-512 KiB rungs are pointless and filtered.
+        assert!(band_ladder(1024, 0).iter().all(|r| *r >= 512 * 1024));
+        // Saturation cannot loop forever.
+        assert!(!band_ladder(u64::MAX / 2, u64::MAX).is_empty());
+    }
+
+    #[test]
+    fn byte_budget_arms_are_distinguishable_on_local_disk() {
+        // The local-disk twin of the cloud distinguishability test: with a
+        // 1 MiB rowgroup target the 8 MiB and 16 MiB budget arms must plan
+        // DIFFERENT bands at a corpus where both budgets are reachable.
+        let mib: u64 = 1024 * 1024;
+        let plan = |base_mb: u64| {
+            resolve_probe_plan(
+                &ProbePolicy {
+                    algorithm: ProbeAlgorithm::ByteBudget,
+                    base_bytes: base_mb * mib,
+                    cap_bytes: 32 * mib,
+                    ..Default::default()
+                },
+                100_000,
+                1_000_000,
+                mib,
+                128 * 1024,
+            )
+        };
+        let (eight, sixteen) = (plan(8), plan(16));
+        assert_ne!(eight.band, sixteen.band, "8MB={eight:?} 16MB={sixteen:?}");
+        assert_eq!(sixteen.band, 16 * mib, "{sixteen:?}");
     }
 
     #[test]

@@ -104,8 +104,10 @@ mod tests {
         assert!(
             validate_policy_properties(&props(&[
                 ("cache.index.mode", "pin"),
+                // compaction.target_file_size_mb deliberately absent: #2418
+                // refuses it at the door until the merge consumes it, and
+                // this test must hold on develop with both PRs merged.
                 ("compaction.strategy", "consolidate"),
-                ("compaction.target_file_size_mb", "1024"),
             ]))
             .is_ok()
         );

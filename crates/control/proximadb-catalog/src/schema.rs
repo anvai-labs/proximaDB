@@ -17,6 +17,11 @@ use crate::{
     CatalogTableSchema, ColumnConstraint, SchemaChange, system_columns,
 };
 
+/// Table-property namespaces whose keys are resolved case-insensitively by
+/// their policy validators (cache: TD-COMPACT-2b, compaction: TD-COMPACT-15,
+/// probe: TD-RDSTRAT-14). See the `SetTableOption` apply arm.
+const POLICY_PROPERTY_PREFIXES: [&str; 3] = ["cache.", "compaction.", "probe."];
+
 /// Validate a schema for internal consistency.
 pub fn validate_schema(schema: &CatalogTableSchema) -> Result<()> {
     if schema.name.is_empty() {
@@ -835,6 +840,24 @@ pub fn apply_evolution(
                             matches!(value.to_lowercase().as_str(), "enabled" | "true" | "1");
                     }
                     _ => {
+                        // Policy namespaces (cache.* / compaction.* / probe.*)
+                        // resolve their keys CASE-INSENSITIVELY, and their
+                        // validators reject case-variant duplicates. SET
+                        // validates one statement's key in isolation, so two
+                        // statements could otherwise store `cache.index.mode`
+                        // AND `Cache.Index.Mode` — a map the resolver rejects
+                        // as ambiguous (#2419 review round 8). A SET of a
+                        // policy key therefore REPLACES any case-variant of
+                        // it. Other keys keep exact-key semantics.
+                        let lowered = key.to_ascii_lowercase();
+                        if POLICY_PROPERTY_PREFIXES
+                            .iter()
+                            .any(|prefix| lowered.starts_with(prefix))
+                        {
+                            new_schema
+                                .properties
+                                .retain(|existing, _| existing.to_ascii_lowercase() != lowered);
+                        }
                         // Unknown options are stored as table properties so
                         // they round-trip without data loss.
                         new_schema.properties.insert(key.clone(), value.clone());
@@ -1861,6 +1884,39 @@ mod tests {
             evolved.properties.get("custom_option").map(String::as_str),
             Some("x")
         );
+    }
+
+    #[test]
+    fn set_of_a_policy_key_replaces_its_case_variants() {
+        // #2419 review round 8: two SETs differing only in case must not leave
+        // both keys stored — the policy resolvers reject such a map.
+        let set = |schema: &CatalogTableSchema, key: &str, value: &str| {
+            apply_evolution(
+                schema,
+                &CatalogSchemaEvolution {
+                    changes: vec![SchemaChange::SetTableOption {
+                        key: key.to_string(),
+                        value: value.to_string(),
+                    }],
+                },
+            )
+            .expect("valid SET")
+        };
+        let first = set(&base_schema(), "cache.index.mode", "pin");
+        let second = set(&first, "Cache.Index.Mode", "off");
+        let variants: Vec<_> = second
+            .properties
+            .iter()
+            .filter(|(k, _)| k.eq_ignore_ascii_case("cache.index.mode"))
+            .collect();
+        assert_eq!(variants.len(), 1, "one key per policy knob: {variants:?}");
+        assert_eq!(variants[0].1, "off", "the later SET wins");
+
+        // Ordinary keys keep exact-key semantics.
+        let a = set(&base_schema(), "custom", "1");
+        let b = set(&a, "Custom", "2");
+        assert_eq!(b.properties.get("custom").map(String::as_str), Some("1"));
+        assert_eq!(b.properties.get("Custom").map(String::as_str), Some("2"));
     }
 
     #[test]

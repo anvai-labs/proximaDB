@@ -187,3 +187,31 @@ deliberately — see above). These are filed, not fixed:
   back; the case-insensitive key lookup is hand-copied for algorithm and
   multiplier beside `property_usize`. Use `Option<ProbeAlgorithm>` and one
   `property_str` helper.
+* *RDSTRAT-14-F7 — persist create-time properties instead of refusing.*
+  POST /collections now 400s any non-empty `properties`, including plain
+  keys like `team`. That is a status change (200 -> 400) but not a
+  behaviour change: those keys were never stored either — the handler
+  builds a `CollectionConfig` with no properties field, so the 200 was
+  reporting a write that did not happen. The real fix routes
+  `request.properties` into the path `CREATE TABLE ... WITH` uses (which
+  persists and validates them), then lifts the refusal.
+* *RDSTRAT-14-F8 — the generic IVF strategy has its own formula.*
+  `ApproximateSearchStrategy::calculate_nprobe`
+  (`src/core/search/strategies/approximate.rs`) hand-rolls
+  `ceil(sqrt(n) × multiplier)` and does not follow the probe policy; the
+  module doc now says so. Route it through `resolve_probe_plan` once its
+  bounds semantics are reconciled.
+
+== Round 8 (#2419) — fixed in-PR
+
+Harness: inherited probe gates scrubbed per spawn; `--nprobe` refused with
+a probe-policy flag; base/cap bounds mirror the server exactly and are
+refused on arms that do not read them. Ladder: extends to the cap (a fixed
+8x top made local-disk budget arms indistinguishable). Catalog: a SET of a
+policy key replaces its case-variants (two SETs could store
+`cache.index.mode` and `Cache.Index.Mode`, a map the resolver rejects).
+Docs: parity claim scoped to `nprobe_min >= 1`; `cap_mb` documented as
+byte_budget-only and per-pool; the module's "single place" claim scoped to
+the PAX consumers; three handler docs that had slipped onto
+`UpdatePropertiesRequest` reattached. A policy-properties test no longer
+depends on `compaction.target_file_size_mb`, which #2418 refuses.

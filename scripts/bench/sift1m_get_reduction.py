@@ -3542,12 +3542,23 @@ def main() -> int:
             f"{', '.join(probe_policy_flags)}: the arm would be labelled with an "
             "algorithm it never ran"
         )
-    # Mirror the server's env bounds so result.json cannot record a value the
-    # server warns about and ignores (it would run the default instead).
-    if args.probe_base_mb is not None and args.probe_base_mb <= 0:
-        raise RuntimeError("--probe-base-mb must be positive")
-    if args.probe_cap_mb is not None and args.probe_cap_mb < 0:
-        raise RuntimeError("--probe-cap-mb must be >= 0 (0 = no cap)")
+    # Mirror the server's env bounds EXACTLY so result.json cannot record a
+    # value the server warns about and ignores (it would run the default).
+    # MAX_PROBE_MB mirrors segment_format.rs / MAX_PROBE_BUDGET_MB (1 TiB).
+    max_probe_mb = 1024 * 1024
+    if args.probe_base_mb is not None and not 0 < args.probe_base_mb <= max_probe_mb:
+        raise RuntimeError(f"--probe-base-mb must be in 1..={max_probe_mb}")
+    if args.probe_cap_mb is not None and not 0 <= args.probe_cap_mb <= max_probe_mb:
+        raise RuntimeError(f"--probe-cap-mb must be in 0..={max_probe_mb} (0 = no cap)")
+    # base/cap are read ONLY by byte_budget; recording them on another arm
+    # labels it with knobs the server never consulted (#2419 review round 8).
+    if args.probe_algorithm != "byte_budget" and (
+        args.probe_base_mb is not None or args.probe_cap_mb is not None
+    ):
+        raise RuntimeError(
+            "--probe-base-mb/--probe-cap-mb are read only by --probe-algorithm "
+            "byte_budget; on any other arm they would be recorded but ignored"
+        )
     if (
         args.training_compaction_min_mb is not None
         and args.training_compaction_min_mb <= 0

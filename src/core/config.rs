@@ -1784,7 +1784,12 @@ pub struct CoarseProbeConfig {
     /// (pinned by a unit test). Default 4.
     #[serde(default = "default_probe_base_mb")]
     pub base_mb: u64,
-    /// Hard per-query probe byte cap (MiB; 0 = none). Default 32.
+    /// Probe byte cap (MiB; 0 = none). Default 32. Read ONLY by the
+    /// `byte_budget` algorithm — the root/log/fixed forms are cell-count
+    /// functions and ignore it — and it sizes ONE probe pool: on the
+    /// per-segment (filtered) path each segment resolves its own cap, and
+    /// the collection-directory path may exceed it to meet the top-k row
+    /// floor (recall floor beats a cost knob).
     #[serde(default = "default_probe_cap_mb")]
     pub cap_mb: u64,
 }
