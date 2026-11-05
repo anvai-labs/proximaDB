@@ -3658,7 +3658,7 @@ pub struct CoarseProbeSettings {
     pub ncomp_floor: usize,
     /// TD-RDSTRAT-14: the resolved probe policy (algorithm + budgets). The
     /// numeric fields above are the policy's root-form params — kept flat
-    /// because they predate it; `policy()` folds them.
+    /// because they predate it; `settings_policy` folds them.
     pub probe_algorithm: proximadb_storage_common::probe_policy::ProbeAlgorithm,
     pub probe_base_bytes: u64,
     pub probe_cap_bytes: u64,

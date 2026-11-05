@@ -2301,6 +2301,13 @@ def effective_flush_interval(
 # TD-PAXDIR-1 D7: the gates the --centroid-directory arm turns on — publish the
 # collection directory with decode keys (D1, D6), plan queries on it (D2), ride
 # the rerank on the probe wave (D5), and use the keys on the query path (D6).
+# TD-RDSTRAT-14 probe-policy env gates; scrubbed per spawn (see OwnedServer).
+PROBE_POLICY_GATES = (
+    "PROXIMADB_PAX_READ_PROBE_ALGORITHM",
+    "PROXIMADB_PAX_READ_PROBE_BASE_MB",
+    "PROXIMADB_PAX_READ_PROBE_CAP_MB",
+)
+
 CENTROID_DIRECTORY_GATES = (
     "PROXIMADB_PAX_WRITE_CENTROID_DIRECTORY",
     "PROXIMADB_PAX_WRITE_DIRECTORY_DECODE_KEYS",
@@ -2499,6 +2506,13 @@ class OwnedServer:
                 if self.centroid_directory in ("on", "default")
                 else "PROXIMADB_PAX_READ_COARSE_NPROBE"
             ] = str(self.nprobe)
+        # Scrub inherited probe gates FIRST (#2419 review round 8): the env
+        # starts from os.environ, so a value exported by an earlier arm would
+        # engage the server while result.json records this arm as the null
+        # control — the same reason this file already scrubs the chooser and
+        # local-disk gates.
+        for gate in PROBE_POLICY_GATES:
+            environment.pop(gate, None)
         if self.probe_algorithm is not None:
             environment["PROXIMADB_PAX_READ_PROBE_ALGORITHM"] = self.probe_algorithm
         if self.probe_base_mb is not None:
@@ -2703,7 +2717,11 @@ def compact_via_flight(
         "compact_collection",
         "compact",
         flight_module,
-        extra_body={"full": full},
+        # Send `full` only when asked: a plain compaction keeps the exact
+        # body it always had ({"collection_id": ...}). Sending
+        # `"full": false` unconditionally broke
+        # test_explicit_compaction_uses_supported_flight_action on develop.
+        extra_body={"full": True} if full else {},
     )
 
 
@@ -3506,6 +3524,30 @@ def main() -> int:
         raise RuntimeError("--n-comp must be positive")
     if args.nprobe is not None and args.nprobe <= 0:
         raise RuntimeError("--nprobe must be positive")
+    # #2419 review round 8: --nprobe sets a probe-count env override that
+    # takes precedence over the probe policy, so combining it with a policy
+    # flag ran a fixed-count probe while result.json recorded the algorithm.
+    probe_policy_flags = [
+        name
+        for name, value in (
+            ("--probe-algorithm", args.probe_algorithm),
+            ("--probe-base-mb", args.probe_base_mb),
+            ("--probe-cap-mb", args.probe_cap_mb),
+        )
+        if value is not None
+    ]
+    if args.nprobe is not None and probe_policy_flags:
+        raise RuntimeError(
+            f"--nprobe overrides the probe policy, so it cannot be combined with "
+            f"{', '.join(probe_policy_flags)}: the arm would be labelled with an "
+            "algorithm it never ran"
+        )
+    # Mirror the server's env bounds so result.json cannot record a value the
+    # server warns about and ignores (it would run the default instead).
+    if args.probe_base_mb is not None and args.probe_base_mb <= 0:
+        raise RuntimeError("--probe-base-mb must be positive")
+    if args.probe_cap_mb is not None and args.probe_cap_mb < 0:
+        raise RuntimeError("--probe-cap-mb must be >= 0 (0 = no cap)")
     if (
         args.training_compaction_min_mb is not None
         and args.training_compaction_min_mb <= 0

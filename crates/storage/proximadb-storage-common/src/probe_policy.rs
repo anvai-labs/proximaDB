@@ -26,7 +26,7 @@
 //! [`band_ladder`] and nowhere else.
 //!
 //! Default policy = `Sqrt` with the shipped multiplier/min/max: byte-for-byte
-//! the previous behavior. A different default requires the bed experiment
+//! the previous behavior for `nprobe_min >= 1` (with `nprobe_min = 0` and a multiplier small enough to plan 0, the old formula probed ZERO cells — an empty result — and this plans 1). A different default requires the bed experiment
 //! (recall-gated) + a ledger claim — the storage-format migration doctrine.
 
 use std::collections::HashMap;
@@ -436,10 +436,10 @@ pub fn resolve_probe_policy(
         .filter(|(k, _)| k.trim().to_ascii_lowercase() == PROBE_MULTIPLIER_KEY)
         .min_by_key(|(k, _)| k.as_str())
         .and_then(|(_, v)| v.trim().parse::<f64>().ok())
-        // is_finite() as well as > 0: "inf" parses and passes a bare
-        // positivity check, then saturates nprobe to usize::MAX — the exact
-        // silent full scan this module removed from the `log` arm. Matches
-        // the server layer's filter.
+        // is_finite() and >= 0: "inf" parses and would saturate nprobe to
+        // usize::MAX (the silent full scan this module removed from the
+        // `log` arm); 0 is the historical "floor only" setting and stays
+        // legal. Matches the server layer's filter.
         .filter(|m| m.is_finite() && *m >= 0.0)
     {
         policy.multiplier = multiplier;
@@ -856,7 +856,7 @@ mod tests {
         assert!(validate_probe_properties(&props(&[("probe.algorithm", "cbrt")])).is_ok());
         assert!(validate_probe_properties(&props(&[("probe.multiplier", "1.5")])).is_ok());
         assert!(validate_probe_properties(&props(&[("probe.base_mb", "8")])).is_ok());
-        // Non-compaction keys are ignored.
+        // Keys outside the probe.* namespace are ignored by this validator.
         assert!(validate_probe_properties(&props(&[("cache.index.mode", "pin")])).is_ok());
         assert!(validate_probe_properties(&props(&[("probe.algorithm", "sqrt2")])).is_err());
         // 0 = "probe exactly the floor" (historical); negatives fail closed.
@@ -878,5 +878,21 @@ mod tests {
         // Non-numeric still fails closed on every one of them.
         assert!(validate_probe_properties(&props(&[("probe.min_cells", "lots")])).is_err());
         assert!(validate_probe_properties(&props(&[("probe.unknown", "1")])).is_err());
+    }
+
+    #[test]
+    fn zero_floor_zero_multiplier_plans_one_cell_not_zero() {
+        // The one documented departure from the historical formula: with
+        // nprobe_min = 0 and multiplier 0 it planned ZERO cells (an empty
+        // result for every query). The module never plans fewer than 1.
+        let policy = ProbePolicy {
+            multiplier: 0.0,
+            min_cells: 0,
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_probe_plan(&policy, 30, 0, 4 * 1024 * 1024, 0).cells,
+            1
+        );
     }
 }

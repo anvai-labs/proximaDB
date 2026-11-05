@@ -3403,9 +3403,16 @@ pub struct CompactResponse {
     pub stop_reason: Option<String>,
 }
 
-/// `PATCH /api/v2/collections/{id}/properties` — set/update table properties.
-/// Merge semantics: keys in the request are set/updated; absent keys are
-/// unchanged. `cache.*` keys are validated (TD-COMPACT-2b).
+/// `PATCH /api/v2/collections/{id}/properties` — NOT YET A WRITE PATH.
+///
+/// The intended contract is merge semantics (keys in the request set/update,
+/// absent keys unchanged), but the service-side merge + catalog write is not
+/// wired, so this answers **501 Not Implemented** for any non-empty request
+/// instead of a 200 that would report an unpersisted write as done. Keys are
+/// validated first through the one policy door (`cache.*`, `compaction.*`,
+/// `probe.*`), so a bad key is still a 400. The refusal runs before the
+/// collection is resolved, so an unknown collection id also gets 501 rather
+/// than 404. Use `ALTER TABLE <name> SET (...)` over pgwire meanwhile.
 pub async fn patch_collection_properties_v2(
     Path(collection_id): Path<String>,
     Extension(tenant): Extension<TenantContext>,

@@ -83,10 +83,15 @@ the planner plans in the unit the bill is written in.
 === Surfaces (this PR)
 
 * Server TOML: `[storage.sst_config.coarse_probe]` gains `algorithm`
-  ("sqrt" default — byte-for-byte the historical formula; the module's
-  regression test pins equality across k_c 1..4096), `base_mb` (4),
-  `cap_mb` (32). Fail-closed at load: an unknown name aborts boot naming
-  the section.
+  ("sqrt" default — byte-for-byte the historical formula for `nprobe_min >= 1` (with `nprobe_min = 0` and a multiplier small enough to plan 0, the old formula probed ZERO cells — an empty result — and this plans 1); the
+  module's regression test pins equality across k_c 1..4096), `base_mb`
+  (4), `cap_mb` (32). Fail-closed at load: an unknown name aborts boot
+  naming the section.
+* DELIBERATE boot change (pre-GA, #2419 review round 8): a NEGATIVE or
+  non-finite `nprobe_multiplier` now fails boot. Before this module a
+  negative clamped to `nprobe_min` and `inf` meant a silent full scan;
+  neither is a setting anyone should be running, so it is rejected rather
+  than preserved. `0` (floor only) and `cap_mb < base_mb` remain legal.
 * Env overrides (the harness/operator escape hatch, same precedence as
   every other probe knob): `PROXIMADB_PAX_READ_PROBE_ALGORITHM`,
   `PROXIMADB_PAX_READ_PROBE_BASE_MB`, `PROXIMADB_PAX_READ_PROBE_CAP_MB`.
@@ -150,8 +155,9 @@ The #2419 merge gate was set to "no correctness or mandate findings"
 fixed in-PR: POST /collections and PATCH /properties now fail closed
 instead of returning 200 for properties they never persist, `unreachable!()`
 was removed from the probe path (mandate #4), and boot validation no longer
-rejects configs that booted before (`nprobe_multiplier = 0` = "floor only",
-`cap_mb < base_mb`). These are filed, not fixed:
+rejects `nprobe_multiplier = 0` ("floor only") or `cap_mb < base_mb`, both of
+which booted before (negative / non-finite multipliers ARE now rejected,
+deliberately — see above). These are filed, not fixed:
 
 * *RDSTRAT-14-F1 — tag channel is inert and unvalidated.* A
   `probe.algorithm:` tag is stored and never read; nothing validates tags
@@ -175,3 +181,9 @@ rejects configs that booted before (`nprobe_multiplier = 0` = "floor only",
   `toml_coarse_probe_config_wins_over_default_init` restores the default
   only on success; use a drop guard (nextest's process isolation hides it
   in CI).
+* *RDSTRAT-14-F6 — redundant enum/string round trip.*
+  `ServerProbePolicy.algorithm` is `Option<String>`, so `settings_policy`
+  stringifies an already-parsed enum and `resolve_probe_policy` parses it
+  back; the case-insensitive key lookup is hand-copied for algorithm and
+  multiplier beside `property_usize`. Use `Option<ProbeAlgorithm>` and one
+  `property_str` helper.

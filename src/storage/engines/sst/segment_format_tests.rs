@@ -640,9 +640,16 @@ fn default_probe_quality_and_backend_ranges_match_sift_acceptance() {
     // let a prior test's install leak in; writing it (the round-2 fix) let
     // this test clobber `toml_coarse_probe_config_wins_over_default_init`
     // mid-assertion under the shared-process libtest fallback.
+    //
+    // It still goes through the PRODUCTION default chain —
+    // `CoarseProbeConfig::default()` -> `CoarseProbeSettings` (From) ->
+    // `settings_policy` — so a drift in the config defaults, the conversion
+    // or the folding is caught (#2419 review round 8), not just the pure
+    // module default.
+    let settings: CoarseProbeSettings = crate::core::config::CoarseProbeConfig::default().into();
     assert_eq!(
         proximadb_storage_common::probe_policy::resolve_probe_plan(
-            &proximadb_storage_common::probe_policy::ProbePolicy::default(),
+            &settings_policy(&settings),
             30,
             0,
             4 * 1024 * 1024,
