@@ -1663,6 +1663,32 @@ impl Compaction {
         })
     }
 
+    /// Narrow a follow-up to ONE untrained input worth promoting (the
+    /// TD-COMPACT-5 header check and size floor the flush trigger uses), with
+    /// `input_bytes` set to that file's real size. Returns false when no input
+    /// qualifies — a single-input rewrite of anything else changes nothing.
+    /// Needs only per-file reads, so it also serves the path where the
+    /// directory LIST failed.
+    pub(crate) async fn narrow_to_promotion_candidate(
+        &self,
+        follow_up: &mut SstCompactionTask,
+    ) -> bool {
+        let min_bytes = super::flush::training_compaction_min_bytes();
+        for path in &follow_up.input_files {
+            let url = path.to_string_lossy();
+            if let Ok(Some(size)) =
+                super::flush::untrained_segment_size_on(&self.filesystem_factory, &url, min_bytes)
+                    .await
+            {
+                let chosen = path.clone();
+                follow_up.input_files = vec![chosen];
+                follow_up.input_bytes = size;
+                return true;
+            }
+        }
+        false
+    }
+
     /// Bound a follow-up so the chain can never merge below a pinned
     /// live-segment `floor` (TD-COMPACT-15; #2418 review round 11).
     ///
@@ -1708,30 +1734,10 @@ impl Compaction {
         }
         if keep == 1 {
             // A single-input rewrite is only worth running to PROMOTE an
-            // untrained segment: pick one that actually is, rather than
-            // `input_files[0]`, and skip when none is (#2418 review round
-            // 14: rewriting an already-trained L0 changes nothing and costs
-            // a full segment of write amplification).
-            let mut chosen = None;
-            for path in &follow_up.input_files {
-                let url = path.to_string_lossy();
-                if super::flush::segment_is_untrained_on(&self.filesystem_factory, &url, 0)
-                    .await
-                    .unwrap_or(false)
-                {
-                    chosen = Some(path.clone());
-                    break;
-                }
-            }
-            let Some(untrained) = chosen else {
-                return Ok(false);
-            };
-            follow_up.input_bytes = sizes
-                .get(&untrained.to_string_lossy().to_string())
-                .copied()
-                .unwrap_or(0);
-            follow_up.input_files = vec![untrained];
-            return Ok(true);
+            // untrained segment worth training: pick one that is, rather than
+            // `input_files[0]`, and skip when none is (#2418 review rounds
+            // 14-15: same size floor as the flush trigger).
+            return Ok(self.narrow_to_promotion_candidate(follow_up).await);
         }
         follow_up.input_files.truncate(keep);
         follow_up.input_bytes = follow_up
@@ -2158,12 +2164,19 @@ impl Compaction {
                                     // untrimmed sum, an over-estimate, which is
                                     // the safe direction for admission.
                                     Err(error) if promotes => {
+                                        // Same picker as the normal path (an
+                                        // untrained input worth training, with
+                                        // its real size), which needs only
+                                        // per-file reads (#2418 review round 15).
+                                        let keep = compaction
+                                            .narrow_to_promotion_candidate(&mut follow_up)
+                                            .await;
                                         warn!(
                                             collection_object_id = task.collection_object_id,
-                                            "Compaction follow-up floor check failed; scheduling the training promotion as a single-input rewrite: {error}"
+                                            promoting = keep,
+                                            "Compaction follow-up floor check failed; promotion falls back to a single-input rewrite of an untrained segment when one exists: {error}"
                                         );
-                                        follow_up.input_files.truncate(1);
-                                        true
+                                        keep
                                     }
                                     Err(error) => {
                                         warn!(

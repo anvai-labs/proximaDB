@@ -2643,7 +2643,19 @@ impl FlightService for ProximaFlightService {
                 // reads as Some(Value::Null) from `Map::get`. The sibling
                 // `compact_collection` arm already treats null as absent, so
                 // a presence check made the two arms disagree on one input.
-                let asks_for_full = params.get("full").and_then(|v| v.as_bool()) == Some(true);
+                // A present non-boolean `full` ("true", 1) is refused like
+                // the sibling compact_collection arm refuses it, instead of
+                // being read as "no collapse" and reporting success (#2418
+                // review round 15). Absent / null / false = no FULL.
+                let asks_for_full = match params.get("full") {
+                    None | Some(serde_json::Value::Null) => false,
+                    Some(serde_json::Value::Bool(value)) => *value,
+                    Some(other) => {
+                        return Err(TonicStatus::invalid_argument(format!(
+                            "full must be a boolean, got {other}"
+                        )));
+                    }
+                };
                 let asks_for_target = params.get("target_segments").is_some_and(|v| !v.is_null());
                 if asks_for_full || asks_for_target {
                     return Err(TonicStatus::invalid_argument(

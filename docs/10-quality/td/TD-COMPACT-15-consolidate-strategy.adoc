@@ -430,3 +430,15 @@ proves the override reaches the engine and exercises the floor end to end.
 Scope note: the floor binds this request's own follow-up chain; a morsel
 from another worker or a concurrent flush can still merge below it. Raised
 again and kept filed: F1, F3, F5/F6, F7.
+
+Round 15 (#2418): the promotion picker is one function,
+`narrow_to_promotion_candidate`, used by the normal path AND the
+LIST-failure fallback (which had kept `input_files[0]` with a stale
+multi-file `input_bytes`); it applies the same size floor as the flush
+trigger (`training_compaction_min_bytes`, PROXIMADB_TRAINING_COMPACTION_MIN_MB)
+and sets `input_bytes` to the chosen file's real size. `flush_and_compact`
+refuses a non-boolean `full` like `compact_collection`; the VIPER compaction
+section's deprecated values are reported at startup too. The FULL byte
+counters are a lower bound on the wire as well as in the struct doc (worker
+follow-ups are not summed) — documented in TD-COMPACT-14; giving the wire
+fields an explicit scope marker is filed with F5/F6.

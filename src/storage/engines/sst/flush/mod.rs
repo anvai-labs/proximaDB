@@ -1224,11 +1224,7 @@ impl SstEngine {
         }
         // Best-effort header sniffing (72 bytes/file); any error means "not
         // yet", never fails the flush.
-        let min_bytes = std::env::var("PROXIMADB_TRAINING_COMPACTION_MIN_MB")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(32)
-            .saturating_mul(1024 * 1024);
+        let min_bytes = training_compaction_min_bytes();
         // Only L0 files: a threshold-1 task builds an L0 morsel, so an
         // untrained L1+ file (block clustering off, a trainer fallback, a
         // pre-trainer legacy file) could never self-clear and would re-arm a
@@ -1254,6 +1250,41 @@ impl SstEngine {
     async fn segment_is_untrained(&self, path: &str, min_bytes: u64) -> Result<bool> {
         segment_is_untrained_on(self.filesystem(), path, min_bytes).await
     }
+}
+
+/// TD-COMPACT-5: the minimum on-disk size for a segment to be WORTH a
+/// training rewrite (`PROXIMADB_TRAINING_COMPACTION_MIN_MB`, default 32).
+/// One accessor so the flush trigger and the compaction worker's floor bound
+/// agree on which segments a promotion should touch (#2418 review round 15).
+pub(crate) fn training_compaction_min_bytes() -> u64 {
+    std::env::var("PROXIMADB_TRAINING_COMPACTION_MIN_MB")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(32)
+        .saturating_mul(1024 * 1024)
+}
+
+/// The size of `path` when it is an untrained segment worth promoting (no A0
+/// coarse directory and at least `min_bytes`), else `None`. Callers that pick
+/// a promotion candidate need the size too, for the task's `input_bytes`.
+pub(crate) async fn untrained_segment_size_on(
+    filesystem: &crate::storage::persistence::filesystem::FilesystemFactory,
+    path: &str,
+    min_bytes: u64,
+) -> Result<Option<u64>> {
+    use proximadb_storage_common::segment_layout::{SEG_HEADER_PREFIX_LEN, SegmentHeaderPrefix};
+    let fs = filesystem.get_filesystem(path)?;
+    let meta = fs.metadata(path).await?;
+    if meta.size < min_bytes {
+        return Ok(None);
+    }
+    let header_bytes = fs
+        .read_range(path, 0, (SEG_HEADER_PREFIX_LEN as u64).min(meta.size))
+        .await?;
+    Ok(match SegmentHeaderPrefix::parse(&header_bytes) {
+        Ok(h) if h.a0_len == 0 => Some(meta.size),
+        _ => None,
+    })
 }
 
 /// TD-COMPACT-5: is this segment untrained (no A0 coarse directory) and at

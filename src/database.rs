@@ -898,6 +898,16 @@ impl ProximaDB {
                     .as_ref()
                     .and_then(|sst| sst.compaction_config.as_ref()),
             ),
+            // Validated at load like the other two, so its deprecated values
+            // must be reported too (#2418 review round 15).
+            (
+                "storage.viper_config.compaction_config",
+                self._config
+                    .storage
+                    .viper_config
+                    .as_ref()
+                    .and_then(|viper| viper.compaction_config.as_ref()),
+            ),
         ] {
             for note in cfg
                 .map(|c| c.deprecation_notes(section))
