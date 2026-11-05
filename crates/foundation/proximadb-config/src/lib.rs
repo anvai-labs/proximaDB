@@ -1055,8 +1055,12 @@ impl CompactionConfig {
     /// the consolidate/hybrid switch — reject the common mistake of
     /// setting `strategy = "consolidate"` there.
     pub fn validate(&self, section: &str) -> Result<(), String> {
-        let legacy = self.strategy.trim().to_ascii_lowercase();
-        if !matches!(legacy.as_str(), "count" | "size" | "hybrid") {
+        // Validate EXACTLY what the consumer honors. `compaction_utils`
+        // matches `config.strategy.as_str()` raw and case-sensitively, so
+        // trimming/lowercasing here let "Size" or " size" pass boot and then
+        // fall through to the `_` arm as hybrid — the dead-config hazard
+        // this validation exists to kill, one layer down.
+        if !matches!(self.strategy.as_str(), "count" | "size" | "hybrid") {
             return Err(format!(
                 "{section}.strategy must be 'count', 'size' or 'hybrid' \
                  (got '{}'); the consolidate strategy is selected via \
@@ -1414,7 +1418,8 @@ mod tests {
     #[test]
     fn compaction_strategy_validation_fails_closed() {
         // Valid legacy values pass, including the default.
-        for strategy in ["count", "size", "hybrid", "Hybrid"] {
+        // Only the exact forms the consumer matches — "Hybrid" must FAIL.
+        for strategy in ["count", "size", "hybrid"] {
             let config = CompactionConfig {
                 strategy: strategy.to_string(),
                 ..Default::default()
@@ -1434,15 +1439,19 @@ mod tests {
             error.contains("consolidate_strategy"),
             "error should point at the right knob: {error}"
         );
-        // Typos fail too — no silent `_` fallback at boot.
-        assert!(
-            CompactionConfig {
-                strategy: "hybrd".to_string(),
-                ..Default::default()
-            }
-            .validate("storage.compaction_config")
-            .is_err()
-        );
+        // Typos AND case/whitespace variants fail — the consumer would
+        // silently treat each as the `_` (hybrid) arm.
+        for bad in ["hybrd", "Hybrid", "SIZE", " size", "size "] {
+            assert!(
+                CompactionConfig {
+                    strategy: bad.to_string(),
+                    ..Default::default()
+                }
+                .validate("storage.compaction_config")
+                .is_err(),
+                "expected '{bad}' rejected"
+            );
+        }
     }
 
     #[test]

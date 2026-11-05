@@ -2558,6 +2558,16 @@ impl FlightService for ProximaFlightService {
                         Some(parsed as usize)
                     }
                 };
+                // Same fail-closed reasoning as rejecting 0: a knob accepted
+                // and then discarded by the non-full delegation would report
+                // success for work that never happened. REST rejects this
+                // combination, so Flight must too or the surfaces disagree.
+                if target_segments.is_some() && !full {
+                    return Err(TonicStatus::invalid_argument(
+                        "target_segments requires \"full\": true (it bounds the \
+                         cross-level collapse)",
+                    ));
+                }
                 let compaction = self
                     .trigger_collection_compaction(collection_id, full, target_segments)
                     .await

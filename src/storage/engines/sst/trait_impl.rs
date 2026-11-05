@@ -258,23 +258,30 @@ impl UnifiedStorageFormat for SstEngine {
                     rg_tags,
                     params.full_target_segments,
                 )
-                .await?;
+                .await;
             // TD-COMPACT-15: one observation per FULL request — the first
-            // place pass outcomes are counted. `None` means the engine
-            // finished at/below target: distinguish a real collapse from a
-            // no-op so the counter is diagnosable.
-            let stop_label = summary
-                .stop_reason
-                .unwrap_or(if summary.passes_executed > 0 {
-                    "completed"
-                } else {
-                    "at_target"
-                });
+            // place pass outcomes are counted, and EVERY outcome counts.
+            // Recording only on the `Ok` path (the call used `?`) meant a
+            // declined, failed, stalled or timed-out FULL emitted no sample
+            // at all, contradicting both the metric's doc and TD-COMPACT-14.
+            // `None` means the engine finished at/below target: distinguish
+            // a real collapse from a no-op so the counter is diagnosable.
+            let stop_label = match summary.as_ref() {
+                Ok(summary) => summary
+                    .stop_reason
+                    .unwrap_or(if summary.passes_executed > 0 {
+                        "completed"
+                    } else {
+                        "at_target"
+                    }),
+                Err(_) => "error",
+            };
             if let Some(stop_metric) =
                 crate::metrics::operational_metrics::COMPACTION_FULL_STOP.as_ref()
             {
                 stop_metric.with_label_values(&[stop_label]).inc();
             }
+            let summary = summary?;
             return Ok(CompactionResult {
                 success: true,
                 collections_affected: vec![collection_id],

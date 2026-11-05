@@ -3371,7 +3371,8 @@ pub struct CompactRequest {
     pub full: bool,
     /// TD-COMPACT-15 Experiment 3: per-request override of the FULL
     /// collapse target (`[storage.compaction_config] full_target_segments`).
-    /// Ignored when `full` is false; must be > 0.
+    /// Must be > 0, and requires `full: true` — sending it with
+    /// `full: false` is a 400 rather than a silently dropped knob.
     #[serde(default)]
     pub target_segments: Option<usize>,
 }

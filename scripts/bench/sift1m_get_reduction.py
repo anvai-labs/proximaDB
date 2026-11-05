@@ -2692,8 +2692,6 @@ def compact_via_flight(
     (TD-COMPACT-15 Experiment 3) — both ride the action body."""
     body = {"full": full}
     if target_segments is not None:
-        if target_segments < 1:
-            raise SystemExit("--compact-full-target-segments must be >= 1")
         body["target_segments"] = target_segments
     return storage_action_via_flight(
         host,
@@ -3444,10 +3442,16 @@ def main() -> int:
     args = parser.parse_args()
     if args.skip_ingest and not args.collection_id:
         raise SystemExit("--skip-ingest requires --collection-id")
-    if args.compact_full_target_segments is not None and not args.compact_full_before_measure:
-        raise SystemExit(
-            "--compact-full-target-segments requires --compact-full-before-measure"
-        )
+    if args.compact_full_target_segments is not None:
+        # Range-check at PARSE time: this used to live inside
+        # compact_via_flight, which runs after the full ingest and settle —
+        # so a typo'd 0 discarded a multi-hour run.
+        if args.compact_full_target_segments < 1:
+            raise SystemExit("--compact-full-target-segments must be >= 1")
+        if not args.compact_full_before_measure:
+            raise SystemExit(
+                "--compact-full-target-segments requires --compact-full-before-measure"
+            )
     if not (
         args.coalesce_gap_mb >= 0
         and args.coalesce_range_mb > 0
