@@ -619,6 +619,32 @@ async fn oid_prefetch_fallback_records_each_physical_get_once() {
     unsafe { std::env::remove_var("PROXIMADB_TRACE_GETS") };
 }
 
+/// Mandate #13 gate (#2419 review round 10): a non-sqrt TOML algorithm fails
+/// boot unless `PROXIMADB_PAX_READ_PROBE_EXPERIMENTAL=1`, with a message that
+/// names the gate; `sqrt` (the production default) always validates. Reads
+/// the gate but never sets it, so it cannot leak into sibling tests.
+#[test]
+fn experimental_probe_algorithms_need_the_explicit_gate_at_boot() {
+    if probe_experimental_enabled() {
+        return; // an operator exported the gate; the refusal is not testable here
+    }
+    let validate = |algorithm: &str| {
+        crate::core::config::CoarseProbeConfig {
+            algorithm: algorithm.to_string(),
+            ..Default::default()
+        }
+        .validate("storage.sst_config.coarse_probe")
+    };
+    assert!(validate("sqrt").is_ok());
+    for algorithm in ["cbrt", "fourth_root", "log", "fixed", "byte_budget"] {
+        let error = validate(algorithm).expect_err("experimental algorithm must need the gate");
+        assert!(
+            error.contains("PROXIMADB_PAX_READ_PROBE_EXPERIMENTAL"),
+            "{algorithm}: {error}"
+        );
+    }
+}
+
 fn cp_cfg(mult: f32) -> crate::core::config::CoarseProbeConfig {
     crate::core::config::CoarseProbeConfig {
         enable_read_probe: true,

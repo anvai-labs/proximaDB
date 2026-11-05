@@ -2304,6 +2304,7 @@ PROBE_POLICY_GATES = (
     "PROXIMADB_PAX_READ_PROBE_ALGORITHM",
     "PROXIMADB_PAX_READ_PROBE_BASE_MB",
     "PROXIMADB_PAX_READ_PROBE_CAP_MB",
+    "PROXIMADB_PAX_READ_PROBE_EXPERIMENTAL",
 )
 
 # TD-PAXDIR-1 D7: the gates the --centroid-directory arm turns on — publish the
@@ -2510,6 +2511,11 @@ class OwnedServer:
             ] = str(self.nprobe)
         if self.probe_algorithm is not None:
             environment["PROXIMADB_PAX_READ_PROBE_ALGORITHM"] = self.probe_algorithm
+            # Non-sqrt algorithms are experimental (no recall@k eval gates
+            # them yet, mandate #13); the server ignores them without this
+            # gate, so a ladder arm must set it or it silently runs sqrt.
+            if self.probe_algorithm != "sqrt":
+                environment["PROXIMADB_PAX_READ_PROBE_EXPERIMENTAL"] = "1"
         if self.probe_base_mb is not None:
             environment["PROXIMADB_PAX_READ_PROBE_BASE_MB"] = str(self.probe_base_mb)
         if self.probe_cap_mb is not None:
@@ -3898,6 +3904,9 @@ def main() -> int:
             # so a None row is the control only against the default config
             # (#2419 review round 9).
             "probe_policy_env_overrides": {
+                "experimental_gate": bool(
+                    args.probe_algorithm and args.probe_algorithm != "sqrt"
+                ),
                 "algorithm": args.probe_algorithm,
                 "base_mb": args.probe_base_mb,
                 "cap_mb": args.probe_cap_mb,

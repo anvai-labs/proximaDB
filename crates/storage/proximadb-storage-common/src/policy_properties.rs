@@ -41,6 +41,28 @@ pub fn normalize_policy_key(key: &str) -> String {
 ///
 /// Returns the first family error, already phrased for an operator.
 pub fn validate_policy_properties(properties: &HashMap<String, String>) -> Result<(), String> {
+    // One map may not name the same policy knob twice. The resolvers key on
+    // `normalize_policy_key`, so 'compaction.strategy' and
+    // 'Compaction.Strategy ' are ONE knob; storing both left the effective
+    // value to HashMap iteration order (per-process hash seed), which can
+    // flip between restarts or replicas (#2419 review round 10). Only the
+    // cache validator caught this before; it is enforced here for every
+    // policy family at once.
+    let mut seen: std::collections::HashMap<String, &str> = std::collections::HashMap::new();
+    for key in properties.keys() {
+        let normalized = normalize_policy_key(key);
+        if !POLICY_PROPERTY_PREFIXES
+            .iter()
+            .any(|prefix| normalized.starts_with(prefix))
+        {
+            continue;
+        }
+        if let Some(previous) = seen.insert(normalized.clone(), key.as_str()) {
+            return Err(format!(
+                "duplicate policy property: '{previous}' and '{key}' name the same knob ({normalized}); keep one"
+            ));
+        }
+    }
     // The cache family carries a typed error; the other two are already
     // operator-phrased strings. Normalise to one string so every door gets
     // the same shape.
@@ -109,6 +131,21 @@ mod tests {
         );
         assert!(validate_policy_properties(&props(&[("probe.base_mb", "nope")])).is_err());
         assert!(validate_policy_properties(&props(&[("probe.base_mb", "8")])).is_err());
+    }
+
+    #[test]
+    fn variants_of_one_policy_knob_are_refused_in_a_single_map() {
+        for (a, b) in [
+            ("compaction.strategy", "Compaction.Strategy"),
+            ("cache.index.mode", " cache.index.mode"),
+            ("probe.algorithm", "PROBE.ALGORITHM"),
+        ] {
+            let error = validate_policy_properties(&props(&[(a, "hybrid"), (b, "hybrid")]))
+                .expect_err("two spellings of one knob must be refused");
+            assert!(error.contains("duplicate policy property"), "{error}");
+        }
+        // Non-policy keys keep exact-key semantics.
+        assert!(validate_policy_properties(&props(&[("team", "a"), ("Team", "b")])).is_ok());
     }
 
     #[test]

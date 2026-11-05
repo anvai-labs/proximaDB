@@ -221,3 +221,33 @@ byte_budget-only and per-pool; the module's "single place" claim scoped to
 the PAX consumers; three handler docs that had slipped onto
 `UpdatePropertiesRequest` reattached. A policy-properties test no longer
 depends on `compaction.target_file_size_mb`, which #2418 refuses.
+
+== Experimental gate (#2419 round 10, by decision)
+
+Mandate #13 requires a recall eval for any surface that changes ranking.
+Only `sqrt` — the historical, recall-ratcheted formula and the default — is
+a production option. `cbrt` / `fourth_root` / `log` / `fixed` /
+`byte_budget` change ANN recall and have no recall@k eval in CI yet, so they
+are admitted only with `PROXIMADB_PAX_READ_PROBE_EXPERIMENTAL=1`: a non-sqrt
+TOML `algorithm` fails boot without it, a non-sqrt env override is warned
+and ignored, and `probe.*` properties stay refused outright. The bench
+harness sets the gate for its ladder arms and records it. An algorithm
+leaves the experimental set only through the ladder experiment + recall
+ratchet + ledger claim this TD already requires for a default flip.
+
+Round 10 also fixed: a single `CREATE TABLE ... WITH` naming one policy knob
+twice (case or whitespace variants) is refused for every policy family (the
+effective value had depended on HashMap order); `cap_mb = 0` no longer
+clamps the band to 8x the rowgroup (an "uncapped" plan probed fewer cells
+than the capped default).
+
+Filed:
+
+* *RDSTRAT-14-F9 — `plan_probe` walks the directory cells twice* (once for
+  per-group bytes, once inside `select_usable_cells` for per-group rows)
+  with identical grouping; one pass computing `(rows, bytes)` per group
+  halves the per-query planning work.
+* *RDSTRAT-14-F10 — key normalization is re-implemented inline* about six
+  times in `probe_policy.rs` (and the filter + `min_by_key` lookup three
+  times) instead of calling `normalize_policy_key`; route them through it so
+  resolvers and the catalog dedup cannot drift.

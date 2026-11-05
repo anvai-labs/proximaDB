@@ -144,6 +144,23 @@ pub struct ProbePlan {
     pub band: u64,
 }
 
+/// The env gate that admits the non-default (EXPERIMENTAL) algorithms.
+///
+/// Only `sqrt` — the historical formula, recall-ratcheted — is a production
+/// option. The others change ANN recall and have no recall@k eval gating
+/// them in CI (mandate #13), so they are a bench/staging surface: admitted
+/// only when this gate is `1`. One becomes a production option through the
+/// ladder experiment + recall ratchet + ledger claim this TD requires for a
+/// default flip, at which point it leaves this set.
+pub const PROBE_EXPERIMENTAL_ENV: &str = "PROXIMADB_PAX_READ_PROBE_EXPERIMENTAL";
+
+impl ProbeAlgorithm {
+    /// Whether selecting this algorithm requires [`PROBE_EXPERIMENTAL_ENV`].
+    pub fn is_experimental(self) -> bool {
+        self != ProbeAlgorithm::Sqrt
+    }
+}
+
 /// The discrete band ladder, DERIVED from the rowgroup geometry and the cap:
 /// rungs `rg/4, rg/2, rg`, then doubling until the top rung reaches
 /// `max(8·rg, cap_bytes)`, filtered to sane bounds (sub-512 KiB probes are
@@ -182,7 +199,12 @@ fn snap_to_band(bytes: u64, rowgroup_bytes: u64, cap_bytes: u64) -> u64 {
     if cap_bytes > 0 {
         target = target.min(cap_bytes);
     }
-    let ladder = band_ladder(rowgroup_bytes, cap_bytes);
+    // Uncapped (`cap_bytes = 0`) means the budget itself is the ceiling the
+    // ladder must reach: building it to `8·rg` instead clamped an "uncapped"
+    // plan BELOW the default 32 MiB cap on local disk and S3, probing fewer
+    // cells than the capped default (#2419 review round 10).
+    let reach = if cap_bytes > 0 { cap_bytes } else { target };
+    let ladder = band_ladder(rowgroup_bytes, reach);
     if ladder.is_empty() {
         return target;
     }
@@ -807,6 +829,33 @@ mod tests {
         assert!(band_ladder(1024, 0).iter().all(|r| *r >= 512 * 1024));
         // Saturation cannot loop forever.
         assert!(!band_ladder(u64::MAX / 2, u64::MAX).is_empty());
+    }
+
+    #[test]
+    fn uncapped_never_plans_below_the_capped_default() {
+        // Local disk, byte_budget base 16 MiB: removing the cap must not
+        // shrink the band below what the default 32 MiB cap allows.
+        let mib: u64 = 1024 * 1024;
+        let plan = |cap_bytes: u64| {
+            resolve_probe_plan(
+                &ProbePolicy {
+                    algorithm: ProbeAlgorithm::ByteBudget,
+                    base_bytes: 16 * mib,
+                    cap_bytes,
+                    ..Default::default()
+                },
+                100_000,
+                1_000_000,
+                mib,
+                128 * 1024,
+            )
+        };
+        let (capped, uncapped) = (plan(32 * mib), plan(0));
+        assert!(
+            uncapped.band >= capped.band,
+            "capped={capped:?} uncapped={uncapped:?}"
+        );
+        assert_eq!(uncapped.band, 16 * mib, "{uncapped:?}");
     }
 
     #[test]

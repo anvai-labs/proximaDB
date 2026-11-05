@@ -3803,6 +3803,15 @@ fn env_probe_layer() -> proximadb_storage_common::probe_policy::ServerProbePolic
     let mut server = proximadb_storage_common::probe_policy::ServerProbePolicy::default();
     if let Ok(name) = std::env::var("PROXIMADB_PAX_READ_PROBE_ALGORITHM") {
         match proximadb_storage_common::probe_policy::ProbeAlgorithm::parse(&name) {
+            // Experimental algorithms need the explicit gate; without it the
+            // override is ignored (warned), like any other refused env value.
+            Some(algorithm) if algorithm.is_experimental() && !probe_experimental_enabled() => {
+                warn_junk_env(
+                    "PROXIMADB_PAX_READ_PROBE_ALGORITHM",
+                    &name,
+                    "sqrt (other algorithms are experimental: set PROXIMADB_PAX_READ_PROBE_EXPERIMENTAL=1)",
+                )
+            }
             Some(algorithm) => server.algorithm = Some(algorithm.as_str().to_string()),
             None => warn_junk_env(
                 "PROXIMADB_PAX_READ_PROBE_ALGORITHM",
@@ -3838,6 +3847,14 @@ fn env_probe_layer() -> proximadb_storage_common::probe_policy::ServerProbePolic
         }
     }
     server
+}
+
+/// Whether the experimental probe algorithms are admitted
+/// (`PROXIMADB_PAX_READ_PROBE_EXPERIMENTAL=1`; see
+/// `proximadb_storage_common::probe_policy::PROBE_EXPERIMENTAL_ENV`).
+pub(crate) fn probe_experimental_enabled() -> bool {
+    std::env::var(proximadb_storage_common::probe_policy::PROBE_EXPERIMENTAL_ENV)
+        .is_ok_and(|value| value.trim() == "1")
 }
 
 fn settings_policy(s: &CoarseProbeSettings) -> proximadb_storage_common::probe_policy::ProbePolicy {
