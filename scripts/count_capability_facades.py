@@ -71,8 +71,13 @@ Modes mirror the sibling scripts:
   no-regression  -> fail if the total differs from the baseline
   baseline       -> rewrite the baseline from the current tree
 
-The check is BIDIRECTIONAL. A total *below* the baseline also fails, because a
-baseline that silently drifts down records nothing and stops being a ratchet.
+The check is PER-FILE and BIDIRECTIONAL. Any file whose count rose fails,
+even if a removal elsewhere keeps the total flat -- comparing totals alone let
+one commit trade a dead facade for a live one and stay green. Any file whose
+count fell also fails until the baseline is lowered in the same commit, because
+a baseline that silently drifts down records nothing and stops being a ratchet.
+Known residual: a site that MOVES within one file (one marker removed, another
+added, same file) is still invisible, as is a marker reworded away.
 """
 
 from __future__ import annotations
@@ -129,6 +134,10 @@ def _blank_preserving_lines(text: str, start: int, end: int) -> str:
     return text[:start] + re.sub(r"[^\n]", "", text[start:end]) + text[end:]
 
 
+def _ident(ch: str) -> bool:
+    return ch.isalnum() or ch == "_"
+
+
 def _match_brace(text: str, open_idx: int) -> int:
     """Index just past the `}` matching the `{` at open_idx; len(text) if unbalanced.
 
@@ -149,10 +158,22 @@ def _match_brace(text: str, open_idx: int) -> int:
             j = text.find("*/", i + 2)
             i = n if j == -1 else j + 2
             continue
+        if c == "r" and (
+            i == 0
+            or not _ident(text[i - 1])
+            or (text[i - 1] == "b" and (i < 2 or not _ident(text[i - 2])))
+        ):
+            # Raw string r"..", r#".."#, br#".."#: no escapes inside, closed by
+            # `"` plus the same number of `#`. Braces inside must not count.
+            j = i + 1
+            while j < n and text[j] == "#":
+                j += 1
+            if j < n and text[j] == '"':
+                close = '"' + "#" * (j - i - 1)
+                k = text.find(close, j + 1)
+                i = n if k == -1 else k + len(close)
+                continue
         if c == '"':
-            # Raw strings (r"..", r#".."#) would need the hash count; they are
-            # rare inside fn bodies here and a miscount only shifts a boundary,
-            # never silently drops a marker (the file still scans).
             i += 1
             while i < n:
                 if text[i] == "\\":
@@ -164,14 +185,17 @@ def _match_brace(text: str, open_idx: int) -> int:
                 i += 1
             continue
         if c == "'":
-            # char literal or lifetime; skip one escaped char at most
-            if i + 2 < n and text[i + 1] == "\\":
-                i += 4
+            # Escaped char literal ('\n', '\'', '\u{1f}'): skip to the closing
+            # quote. A fixed-width skip lands inside `\u{..}` and lets its `}`
+            # decrement the depth, ending the body early.
+            if i + 1 < n and text[i + 1] == "\\":
+                k = text.find("'", i + 3)
+                i = n if k == -1 else k + 1
                 continue
             if i + 2 < n and text[i + 2] == "'":
-                i += 3
+                i += 3  # plain char literal 'x'
                 continue
-            i += 1
+            i += 1  # lifetime 'a
             continue
         if c == "{":
             depth += 1
@@ -183,16 +207,23 @@ def _match_brace(text: str, open_idx: int) -> int:
     return n
 
 
+#: Only a `mod` item may follow `#[cfg(test)]` (other attributes and a
+#: visibility in between are fine). Anything else -- a struct field, a `use`
+#: group, a single fn -- must NOT trigger blanking, or the scan would run to the
+#: next `{` and could swallow a production fn.
+_CFG_TEST_MOD = re.compile(
+    r"\A\s*(?:#\[[^\]]*\]\s*)*(?:pub(?:\([^)]*\))?\s+)?mod\s+[A-Za-z_][A-Za-z0-9_]*\s*\Z"
+)
+
+
 def _strip_cfg_test(text: str) -> str:
-    """Blank out `#[cfg(test)] mod ... { ... }` blocks, preserving line count."""
+    """Blank out `#[cfg(test)] mod name { ... }` blocks, preserving line count."""
     out = text
     for m in reversed(list(re.finditer(r"#\[cfg\(test\)\]", out))):
         brace = out.find("{", m.end())
         if brace == -1:
             continue
-        # Only treat it as a block if a `mod`/`impl`/`fn` intervenes with no `;`
-        between = out[m.end() : brace]
-        if ";" in between:
+        if not _CFG_TEST_MOD.match(out[m.end() : brace]):
             continue
         end = _match_brace(out, brace)
         out = _blank_preserving_lines(out, m.start(), end)
@@ -200,20 +231,26 @@ def _strip_cfg_test(text: str) -> str:
 
 
 def _leading_comment_block(text: str, fn_start: int) -> str:
-    """The contiguous `///`/`//`/attribute lines immediately above a fn."""
-    lines = text[:fn_start].splitlines()
+    """The contiguous `///`/`//`/attribute lines immediately above a fn.
+
+    Scanning starts at the beginning of the line that holds `fn`, NOT at the
+    `fn` token. Slicing at the token leaves the partial line before it (the
+    indentation of a method, or `async `/`const `/`unsafe `/`pub async `) as
+    the last element; for an indented method that strips to "" and was read as
+    a blank line, ending the scan before any doc comment. That bug hid ~50
+    doc-only markers and let a rename that moved a marker from body to doc
+    "lower" the count -- found by adversarial review of the PR that introduced
+    this guard.
+    """
+    line_start = text.rfind("\n", 0, fn_start) + 1
+    lines = text[:line_start].splitlines()
     collected: list[str] = []
     for line in reversed(lines):
         s = line.strip()
         if s.startswith("///") or s.startswith("//") or s.startswith("#["):
             collected.append(s)
             continue
-        if s in ("", "pub", "pub(crate)"):
-            # a blank line ends the doc block
-            if s == "":
-                break
-            continue
-        break
+        break  # a blank line, code, or `}` ends the leading block
     return "\n".join(reversed(collected))
 
 
@@ -376,23 +413,31 @@ def main() -> int:
         return 1
     baseline = json.loads(args.baseline.read_text())
     expected = baseline["total"]
+    base_files: dict[str, int] = baseline["by_file"]
+    cur_files: dict[str, int] = current["by_file"]
 
-    if current["total"] > expected:
-        added = [
-            s
-            for s in sites
-            if s["file"] not in baseline["by_file"]
-            or current["by_file"][s["file"]] > baseline["by_file"].get(s["file"], 0)
-        ]
+    # PER-FILE, not just the total: comparing totals alone lets one commit
+    # delete a facade in file A and add one in file B and stay green (found by
+    # adversarial review). Any file whose count rose is a new facade, whatever
+    # the total does.
+    rose = sorted(f for f, n in cur_files.items() if n > base_files.get(f, 0))
+    fell = sorted(f for f, n in base_files.items() if cur_files.get(f, 0) < n)
+
+    if rose:
+        added = [s for s in sites if s["file"] in rose]
         print(
-            f"::error::capability-facade sites rose {expected} -> {current['total']}. "
+            f"::error::capability-facade sites rose in {len(rose)} file(s) "
+            f"(total {expected} -> {current['total']}). "
             "A function whose own comments say it is not the real implementation, "
             "behind a name and signature that read as working, is a trap for the "
             "next integrator. Implement it, or make it refuse explicitly and "
             "conservatively (see src/cluster/partition_lease.rs is_compatible_with), "
-            "and record it in TD-FACADE-1.",
+            "and record it in TD-FACADE-1. A removal elsewhere in the same commit "
+            "does not offset it.",
             file=sys.stderr,
         )
+        for f in rose:
+            print(f"  {f}: {base_files.get(f, 0)} -> {cur_files[f]}", file=sys.stderr)
         for s in added[:10]:
             print(
                 f"  candidate: {s['file']}:{s['line']} {s['fn']}() -> {s['marker']}",
@@ -400,14 +445,17 @@ def main() -> int:
             )
         return 1
 
-    if current["total"] < expected:
+    if fell or current["total"] != expected:
         print(
-            f"::error::capability-facade sites FELL {expected} -> {current['total']}. "
+            f"::error::capability-facade sites FELL in {len(fell)} file(s) "
+            f"(total {expected} -> {current['total']}). "
             "Good -- now lower the baseline in the same commit: "
             "`python3 scripts/count_capability_facades.py --mode baseline`. "
             "A baseline that drifts silently is not a ratchet.",
             file=sys.stderr,
         )
+        for f in fell[:10]:
+            print(f"  {f}: {base_files[f]} -> {cur_files.get(f, 0)}", file=sys.stderr)
         return 1
 
     print(f"capability-facade ratchet holds at {expected}")

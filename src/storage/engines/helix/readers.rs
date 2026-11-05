@@ -21,32 +21,36 @@ pub async fn check_bloom_filter(
     sstable: &SStableMetadata,
     vector_ids: &[String],
 ) -> Result<Vec<bool>> {
+    // Bloom checking is not implemented here. CONSERVATIVE: every id "might
+    // be present" -- no pruning (TD-BLOOM-1 / TD-FACADE-1). This function stays
+    // on the capability-facade count on purpose: answering safely is a
+    // severity fix, not an implementation.
+    //
+    // HELIX background compaction DOES write real filters into
+    // `bloom_filter` (`helix/compaction.rs`: `BloomFilterConfig::for_sstable(
+    // chunk.len())` -> `Some(bloom.serialize())`). What it does not persist is
+    // the filter's parameters. This reader used to rebuild a filter around
+    // those bytes with *invented* ones -- `bits_per_key: 10`,
+    // `expected_items: 10000`, `ByteAligned` -- while the writer sized for
+    // `chunk.len()` items. `might_contain` is only meaningful under the
+    // writer's (k, m, strategy), so its answers were arbitrary, and the false
+    // ones are consumed by `search_sstable` as "prune this SSTable" => silently
+    // dropped results.
+    //
+    // Answering "maybe present" is the safe answer that exists, so it wins over
+    // a refusal: an `Err` here would propagate through `?` in every caller and
+    // fail the whole query the day someone passes `candidate_ids`. (Today all
+    // three `search_sstable` callers pass `candidate_ids: None`, so this
+    // function is not reached at all.) Making pruning real means persisting the
+    // parameters next to the bits and parsing them here -- an on-disk format
+    // change under CLAUDE.md #8.
     if sstable.bloom_filter.is_some() {
-        // REFUSE RATHER THAN GUESS (TD-BLOOM-1 / TD-FACADE-1).
-        //
-        // This used to synthesise a `SerializedBloomFilter` around the raw
-        // bytes using *invented* parameters -- `bits_per_key: 10`,
-        // `expected_items: 10000`, `strategy: ByteAligned` -- none of which was
-        // read from the stored data. `might_contain` is only meaningful under
-        // the same (k, m, strategy) the writer used, so if a writer ever
-        // emitted anything else, every answer here would be arbitrary, and the
-        // false ones are consumed by `search_sstable` as "prune this SSTable"
-        // => silently dropped results.
-        //
-        // No writer populates this field today (every `SStableMetadata`
-        // construction site in the HELIX engine sets `bloom_filter: None`), so
-        // this arm is unreachable and refusing costs nothing. Making it real
-        // means persisting the filter's parameters alongside its bits and
-        // parsing them here -- an on-disk format change under CLAUDE.md #8.
-        Err(anyhow::anyhow!(
-            "HELIX bloom pruning is not implemented: SSTable carries bloom bytes but \
-             no filter parameters are persisted, and guessing (k, m, strategy) would \
-             make pruning answers arbitrary. See TD-BLOOM-1."
-        ))
-    } else {
-        // No bloom filter: conservative -- every id might be present.
-        Ok(vec![true; vector_ids.len()])
+        debug!(
+            "HELIX bloom bytes present but filter parameters are not persisted; \
+             not pruning (TD-BLOOM-1)"
+        );
     }
+    Ok(vec![true; vector_ids.len()])
 }
 
 /// Search an SSTable for nearest vectors with type-safe FilterExpression support

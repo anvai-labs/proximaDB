@@ -1079,9 +1079,8 @@ impl SharedSstFormatReader {
     /// `stats.bytes_saved` for a prune that never happened. An unimplemented
     /// index must refuse, not answer (TD-FACADE-1).
     ///
-    /// `read_record`/`read_records_batch` have no callers today, so this is
+    /// `read_record`/`batch_read_with_filtering` have no callers today, so this is
     /// inert; implementing it means a real binary search over the index block.
-    #[allow(dead_code)]
     fn find_block_for_key(
         &self,
         _index_data: &[u8],

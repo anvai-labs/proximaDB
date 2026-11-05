@@ -79,8 +79,20 @@ Direction question 1 above, answered with code evidence:
   0-size was already representable in the serialized metadata, so this changes
   values, not layout — no format migration.
 * The HELIX and SWIFT readers had the same shape (guessed parameters; a size
-  test wearing a bloom name) and now refuse or claim nothing. RAPTOR's
-  all-zero-bitmap serializer now errors. All recorded in TD-FACADE-1.
+  test wearing a bloom name) and now answer conservatively ("might be
+  present" / claim nothing). HELIX does have a real writer — compaction stores
+  real filter bits — but no persisted parameters, so the bits cannot be read
+  back correctly. RAPTOR's all-zero-bitmap serializer now errors. All recorded
+  in TD-FACADE-1.
+* **Downgrade hazard (layout-safe, not rollback-safe).** SST metadata blobs can
+  persist across restarts via the zero-copy mmap metadata cache
+  (`zero_copy/metadata_cache.rs`, `serialize_metadata` → disk → `load_from_disk`).
+  Old blob + new binary is fine: the new `can_skip_file` ignores the bloom
+  fields, and nothing indexes `variable_data` by a hardcoded index offset (the
+  4096 → 0 shift is harmless). New blob (0/0) + an *older* binary would reach
+  the old probe's `hash % 0` and panic. Inert today — `ZeroCopyMetadataCache`
+  has no production construction site — but anyone activating that cache
+  must not roll back across this change.
 
 === Still open
 

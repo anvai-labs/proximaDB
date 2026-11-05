@@ -5,7 +5,7 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | **Open (2026-11-05), ratcheted.** The class is now gated by `scripts/count_capability_facades.py` (`make capability-facade-no-regression`, in `work-commit-check`): new self-declared facades fail CI, removals must lower the baseline. The bloom founding instance is mitigated (link:TD-BLOOM-1-sst-bloom-stub.adoc[TD-BLOOM-1]); the inventory below remains.
+| Status | **Open (2026-11-05), ratcheted.** The class is now gated by `scripts/count_capability_facades.py` (`make capability-facade-no-regression` in `work-commit-check`, plus its own CI step): a new self-declared facade in any file fails CI, and removals must lower the baseline. Limits are listed under <<limits>>. The bloom founding instance is mitigated (link:TD-BLOOM-1-sst-bloom-stub.adoc[TD-BLOOM-1]); the inventory below remains.
 | Priority | P1 for the class (live-path and public-uncalled tiers); individual entries graded below.
 | Relates to | link:TD-WAL-6-proto-and-avro-wal-slots-are-bincode-facade.adoc[TD-WAL-6] and link:TD-BLOOM-1-sst-bloom-stub.adoc[TD-BLOOM-1] (founding instances); link:TD-SDKERR-1-python-sdk-hides-failures-and-drops-filters.adoc[TD-SDKERR-1] (the Python SDK twin — `count_silent_failures.py` is this guard's sibling); CLAUDE.md #12 ("silent duplication of an existing primitive"), #6 (measure, don't assert), #16 (read-path correctness), #19 (retire dead twins)
 | Found | 2026-11-05: 32 of the 197 B-harness findings (`report/llm_module_analysis/`) shared one shape; a census of `src/` + `crates/` then traced liveness per site by hand.
@@ -73,8 +73,8 @@ no wire/format change):
 | Branch + probe + fabricated 4 KiB read removed; header reports 0/0. See TD-BLOOM-1.
 
 | HELIX `helix/readers.rs` `check_bloom_filter`
-| Built a filter around stored bytes with **invented** `(bits_per_key=10, expected_items=10000, ByteAligned)`. Unreachable: every writer sets `bloom_filter: None`.
-| Bytes-present arm returns a typed error instead of guessing.
+| Built a filter around stored bytes with **invented** `(bits_per_key=10, expected_items=10000, ByteAligned)`. A real writer **does** exist — background compaction (`helix/compaction.rs`) stores `Some(bloom.serialize())` sized `for_sstable(chunk.len())` — but persists no parameters, so the reader's guesses never matched it. Not reached today: all three `search_sstable` callers pass `candidate_ids: None`.
+| Answers "might be present" (no pruning). A refusal was rejected in review: it would fail every query through `?` the day `candidate_ids` is wired.
 
 | SWIFT `swift/proximablocks_compact_reader.rs` `should_read_superblock_bloom`
 | A `size > 0` test wearing a bloom name; returned `true` into a path whose next step always errors. Its three siblings honestly said "not yet implemented".
@@ -85,13 +85,23 @@ no wire/format change):
 | Returns an error.
 
 | SST IO `proximablocks/sst_io_layer.rs` `check_bloom` / `find_block_for_key`
-| `check_bloom` was `true // Placeholder` (safe, but named as a filter). `find_block_for_key` returned block 0 for every key; its `None` arm would have reported existing keys absent **and** credited `stats.bytes_saved`. Zero callers.
+| `check_bloom` was `true // Placeholder` (safe, but named as a filter). `find_block_for_key` returned block 0 for every key; its `None` arm would have reported existing keys absent **and** credited `stats.bytes_saved`. Its callers `read_record` / `batch_read_with_filtering` have zero callers.
 | Renamed `bloom_might_contain_unfiltered` (documented conservative); `find_block_for_key` errors.
 
 | DataFusion `engine_adapters/sst_adapter.rs`
 | Set `bloom_filter = Some(vec![])` — an empty `Some` is not `None` to a pruner.
 | No longer set.
 |===
+
+**Coverage gap: the RAPTOR pin does not run in CI, and the SWIFT change has no
+pin at all.** Both engines are behind `experimental-engines`, and that
+feature-matrix leg runs only `cargo check --tests`. The RAPTOR refusal pin
+(`artus_bloom.rs` `test_serialize_deserialize_blooms`) passes locally
+(`cargo nextest run -p proximadb --lib --features experimental-engines`), but a
+reintroduced all-zero serializer would fail it while CI stays green. The SWIFT
+`should_read_superblock_bloom → false` change is untested. Both engines are
+slated for removal (TD-152); until then, run that lane locally when touching
+them.
 
 **The "real implementation" is itself partly a facade.** `crates/foundation/proximadb-bloom/src/lib.rs`
 has real filter machinery (`SstableBloomFilter`, FPR sizing, serialize/deserialize,
@@ -123,7 +133,7 @@ request.
 
 | `src/network/auth/rbac.rs` `user_belongs_to_tenant` (+ `user_has_collection_access`)
 | Returns `true` unconditionally — it is the tenant-isolation gate inside `check_permission_with_context`.
-| Public-uncalled — a `pub struct RbacService` named identically to the live `src/security/rbac_service.rs`. **Highest misadoption risk in the census.**
+| One wiring step from live — it HAS callers (`src/network/auth/middleware.rs`, two sites) and the middleware is already written; the chain is dead only because the network `AuthService` is never constructed outside `src/network/auth/`. A `pub struct RbacService` named identically to the live `src/security/rbac_service.rs`. **Highest misadoption risk in the census.**
 | Cross-tenant authorization bypass if adopted
 
 | `src/security/rbac_service.rs` `get_accessible_collections`
@@ -169,23 +179,49 @@ It counts **self-declared non-implementations** — a facade marker
 (`placeholder`, `not (yet) implemented`, `in a real implementation`,
 `in practice, would`, `would use/implement/need/require`, `simplified`, `stub`,
 `for now,`/`for now.`, `won't work in production`) in a function's doc or body,
-across non-test Rust under `src/`, `crates/`, `apps/`. Bidirectional ratchet
-against `docs/_internal/roadmap/CAPABILITY_FACADE_BASELINE.json`; `--callers`
-adds an advisory triage hint.
+across non-test Rust under `src/`, `crates/`, `apps/`. Per-file,
+bidirectional ratchet against
+`docs/_internal/roadmap/CAPABILITY_FACADE_BASELINE.json`; `--callers` adds an
+advisory triage hint. It runs in `make work-commit-check` and as its own CI step,
+behind a dedicated `capability_facade` change filter that lists the script and
+baseline themselves, so a PR that edits only the guard still runs it.
 
 Calibrated against ten hand-confirmed facades (2026-11-05): catches all 8 that
 self-declare; misses the 2 that do not (`tokenize_simple`,
 `should_read_superblock_bloom`). Body shape is deliberately *not* a filter —
 the motivating `check_bloom_simple` has three real statements, uses its
 parameters and returns an expression. `TODO` and `Deferred:` are deliberately
-excluded (they mark future enhancement of working code; `Deferred:` alone
-inflated the count 696 → 1195 without adding a real defect).
+excluded: they mark future enhancement of working code, and `Deferred:` alone
+inflated the count by about 500 without adding a real defect (measured before
+the doc-comment fix below, so the absolute figures from that run are stale).
 
-Baseline at introduction: **992 sites**. That number is the finding: roughly a
-thousand places in non-test Rust where the code says, in its own comments, that
-it is not what it is named. The ratchet does not certify that none remain — a
-facade that does not admit itself is invisible to it — it raises the cost of
-adding one and makes every removal visible.
+**Baseline at introduction: 1039 sites** (develop, same parser: 1042; this PR's
+−3 are real removals). That number is the finding: about a thousand places in
+non-test Rust where the code says, in its own comments, that it is not what it
+is named.
+
+[[limits]]
+=== What the guard does NOT certify
+
+* **Facades that do not admit themselves** are invisible (recall bound, above).
+* **Honest refusals are counted** (`Err("... not implemented ...")`): making a
+  facade honest is a severity fix and leaves the count unchanged; only
+  implementing or deleting lowers it. Rewording a message to drop a marker is
+  the one way to game it, and is forbidden in the script's docstring.
+* **A site that moves within one file** (one marker removed, one added) keeps
+  that file's count flat and is not seen. Cross-file trades *are* caught.
+
+=== Defects found in the guard by its own review
+
+The fresh-agent review of the introducing PR found the first version read doc
+comments only for `pub fn`/`pub(crate) fn`: slicing at the `fn` token left the
+method's indentation (or `async `/`const `/`unsafe `) as a "blank" line, ending
+the scan. About 50 doc-only markers were hidden, and one site in this very PR
+(`check_bloom` → `bloom_might_contain_unfiltered`) had dropped out of the count
+only because its marker moved from body to doc — the rewording loophole, reached
+by accident. Fixed before merge, with three latent parser issues (`'\u{..}'`
+char literals, raw strings, `#[cfg(test)]` on a non-`mod` item) and a
+total-only comparison (now per-file).
 
 == Direction
 
