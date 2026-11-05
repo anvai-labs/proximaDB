@@ -396,6 +396,10 @@ faer = { version = "0.24", default-features = false, features = ["std"] }
 statrs = "0.19"
 
 # Python embedded library (cdylib for PyO3)
+# Dev-only HTTP mocking (root integration tests + the Rust SDK contract gate,
+# clients/rust/tests/openapi_contract.rs). Declared HERE so both crates
+# inherit one version (#2430 review).
+httpmock = "0.9"
 [lib]
 name = "proximadb"
 # Default: rlib only (for testing and normal Rust usage)
@@ -842,7 +846,7 @@ proximadb-sdk = { path = "clients/rust", default-features = false, features = ["
 # and tests/connectors_flight_contract.rs). httpmock is the same crate the SDK
 # gate uses at clients/rust/tests/openapi_contract.rs; serde_yaml lets the
 # gates load docs/openapi/proximadb-openapi.yaml directly.
-httpmock = "0.7"
+httpmock.workspace = true
 serde_yaml = "0.9"
 # Test-only: integration tests use EmbeddedProximaDB from the embedded crate.
 # Dev-deps don't create build cycles (test-mode only).

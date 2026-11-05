@@ -227,7 +227,7 @@ async fn update_collection_schema_matches_spec() {
                 .path("/api/v2/collections/col_abc/schema")
                 .header("content-type", "application/json")
                 // Body must contain spec-required `columns` field.
-                .json_body_partial(r#"{"columns": [{"name": "title", "data_type": "text"}]}"#);
+                .json_body_includes(r#"{"columns": [{"name": "title", "data_type": "text"}]}"#);
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!({
@@ -290,7 +290,7 @@ async fn execute_query_matches_spec() {
             when.method(Method::POST)
                 .path("/api/v2/query")
                 .header("content-type", "application/json")
-                .json_body_partial(r#"{"language": "uql", "query": "SELECT 1"}"#);
+                .json_body_includes(r#"{"language": "uql", "query": "SELECT 1"}"#);
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!({
@@ -327,7 +327,7 @@ async fn explain_query_matches_spec() {
             when.method(Method::POST)
                 .path("/api/v2/query/explain")
                 .header("content-type", "application/json")
-                .json_body_partial(r#"{"language": "uql", "query": "SELECT 1"}"#);
+                .json_body_includes(r#"{"language": "uql", "query": "SELECT 1"}"#);
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!({
@@ -369,7 +369,7 @@ async fn create_collection_matches_spec() {
             when.method(Method::POST)
                 .path("/api/v2/collections")
                 .header("content-type", "application/json")
-                .json_body_partial(r#"{"name": "items", "dimension": 384}"#);
+                .json_body_includes(r#"{"name": "items", "dimension": 384}"#);
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!({
@@ -589,7 +589,7 @@ async fn create_graph_matches_spec() {
             when.method(Method::POST)
                 .path("/api/v2/graphs")
                 .header("content-type", "application/json")
-                .json_body_partial(r#"{"graph_id": "knowledge"}"#);
+                .json_body_includes(r#"{"graph_id": "knowledge"}"#);
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!({"graph_id": "knowledge", "success": true}));
@@ -684,7 +684,7 @@ async fn create_node_matches_spec() {
             when.method(Method::POST)
                 .path("/api/v2/graphs/knowledge/nodes")
                 .header("content-type", "application/json")
-                .json_body_partial(r#"{"node": {"id": "person_1"}}"#);
+                .json_body_includes(r#"{"node": {"id": "person_1"}}"#);
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!({
@@ -830,7 +830,7 @@ async fn create_edge_matches_spec() {
             when.method(Method::POST)
                 .path("/api/v2/graphs/knowledge/edges")
                 .header("content-type", "application/json")
-                .json_body_partial(
+                .json_body_includes(
                     r#"{"edge": {"id": "e1", "from_node_id": "person_1", "to_node_id": "person_2", "edge_type": "KNOWS"}}"#,
                 );
             then.status(200)
@@ -878,7 +878,7 @@ async fn traverse_graph_matches_spec() {
             when.method(Method::POST)
                 .path("/api/v2/graphs/knowledge/traverse")
                 .header("content-type", "application/json")
-                .json_body_partial(r#"{"start_node_id": "person_1"}"#);
+                .json_body_includes(r#"{"start_node_id": "person_1"}"#);
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!({
@@ -943,7 +943,7 @@ async fn batch_create_nodes_matches_spec() {
             when.method(Method::POST)
                 .path("/api/v2/graphs/knowledge/nodes/batch")
                 .header("content-type", "application/json")
-                .json_body_partial(r#"{"nodes": [{"id": "person_1"}]}"#);
+                .json_body_includes(r#"{"nodes": [{"id": "person_1"}]}"#);
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!({
@@ -988,7 +988,7 @@ async fn batch_create_edges_matches_spec() {
             when.method(Method::POST)
                 .path("/api/v2/graphs/knowledge/edges/batch")
                 .header("content-type", "application/json")
-                .json_body_partial(
+                .json_body_includes(
                     r#"{"edges": [{"id": "person_1-KNOWS-person_2", "from_node_id": "person_1", "to_node_id": "person_2", "edge_type": "KNOWS"}]}"#,
                 );
             then.status(200)

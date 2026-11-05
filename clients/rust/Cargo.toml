@@ -51,7 +51,7 @@ client = []
 [dev-dependencies]
 tokio = { version = "1.37", features = ["full", "test-util"] }
 # OpenAPI contract gate (tests/openapi_contract.rs)
-httpmock = "0.7"
+httpmock.workspace = true
 serde_yaml = "0.9"
 
 [[example]]
