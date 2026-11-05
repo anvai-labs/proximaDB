@@ -47,6 +47,14 @@ pub fn validate_policy_properties(properties: &HashMap<String, String>) -> Resul
     crate::probe_policy::validate_probe_properties(properties)?;
     if let Some((key, _)) = properties
         .iter()
+        // `probe.*` is a RESERVED policy namespace, like `cache.*` (whose
+        // validator likewise rejects unknown keys in it — see
+        // proximadb-cache/src/policy.rs). Rejecting an unrecognised
+        // `probe.algoritm` beats storing it inertly, which is the
+        // accepted-but-inert class this door exists to close. The #2419
+        // review raised that this narrows what the REST `properties` doc
+        // comment promises; the doc is corrected rather than the guard
+        // loosened.
         .find(|(key, _)| key.trim().to_ascii_lowercase().starts_with("probe."))
     {
         return Err(format!(
@@ -78,6 +86,9 @@ mod tests {
         assert!(validate_policy_properties(&props(&[("probe.algorithm", "sqrt2")])).is_err());
         // Even a SHAPE-VALID probe property is refused while the channel is
         // unconsumed — accepting it would store an inert key.
+        // `probe.*` is reserved: an unrecognised key in it fails closed,
+        // matching `cache.*`.
+        assert!(validate_policy_properties(&props(&[("probe.owner", "team-search")])).is_err());
         let refusal = validate_policy_properties(&props(&[("probe.algorithm", "cbrt")]))
             .expect_err("probe.* must be refused until the carrier lands");
         assert!(refusal.contains("not consumed yet"), "{refusal}");

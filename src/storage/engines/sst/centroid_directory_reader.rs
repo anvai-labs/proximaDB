@@ -250,47 +250,13 @@ pub(crate) fn plan_segments<'a>(
     let first_url = url_by_name.values().min().map(String::as_str).unwrap_or("");
     let rowgroup_bytes =
         proximadb_storage_common::iops_budget::IopsBudget::for_path(first_url).target_block_bytes();
-    // `DirectoryCell` carries no Region-A extents (those live in each
-    // segment's own A0 directory), but passing 0 made the policy size cells
-    // — and therefore enforce `cap_bytes` — against a blind
-    // `rowgroup_bytes/8` constant: with real 2 MiB cells a 32 MiB cap
-    // planned 64 cells = 128 MiB of reads, 4x the advertised cap, on the
-    // path the TD calls authoritative. Estimate it from the directory's own
-    // data instead: mean rows per cell x the exact Region-A stride for this
-    // model's dim (`code_stride(dim) = 8 + ceil(dim/8)`).
-    let avg_cell_bytes = {
-        // Count DISTINCT cell groups, not (segment, cell) entries: nprobe
-        // and the pool count cell GROUPS, and probing one group reads every
-        // segment's entry for it. Dividing by `dir.cells.len()` therefore
-        // under-estimated per-group bytes by the S-segment fan-out factor
-        // and re-introduced the very cap breach this estimate fixes.
-        let mut distinct: Vec<u32> = dir.cells.iter().map(|c| c.a0_cell).collect();
-        distinct.sort_unstable();
-        distinct.dedup();
-        let cells = distinct.len() as u64;
-        let rows: u64 = dir.segments.iter().map(|s| s.rows_covered).sum();
-        // `DirectoryModel` carries no `dim`, but `pca_components` is
-        // row-major `n_comp x dim`, so the embedding dim is exact.
-        let stride = dir
-            .models
-            .first()
-            .filter(|model| model.n_comp > 0)
-            .map(|model| {
-                let dim = (model.pca_components.len() / model.n_comp as usize) as u32;
-                proximadb_block_format::coalesced_rabitq::code_stride(dim) as u64
-            })
-            .unwrap_or(0);
-        if cells > 0 && stride > 0 {
-            (rows / cells).saturating_mul(stride)
-        } else {
-            0
-        }
-    };
     let plan = dir.plan_probe(
         query,
         &live,
-        |total_cells: usize, usable_rows: u64| {
-            centroid_directory_nprobe(total_cells, usable_rows, rowgroup_bytes, avg_cell_bytes)
+        // `avg_group_bytes` comes from `plan_probe`, which alone knows the
+        // usable, stamp-matched set and the real grouping — see its doc.
+        |total_cells: usize, usable_rows: u64, avg_group_bytes: u64| {
+            centroid_directory_nprobe(total_cells, usable_rows, rowgroup_bytes, avg_group_bytes)
         },
         |rows| {
             let rows = usize::try_from(rows).unwrap_or(usize::MAX);

@@ -2706,11 +2706,12 @@ export interface components {
              */
             tags?: string[] | null;
             /**
-             * @description Per-collection table properties (Hive TBLPROPERTIES-style). Keys in
-             *     the `cache.*` namespace configure the per-collection cache policy
-             *     (TD-COMPACT-2b): `{"cache.index.mode": "pin"}` pins Region A. All
-             *     `cache.*` keys are validated at create time; unknown keys in that
-             *     namespace are rejected. Non-`cache.*` keys are stored verbatim.
+             * @description Per-collection table properties (Hive TBLPROPERTIES-style). Three
+             *     namespaces are RESERVED for policy and validated at create time, with
+             *     unknown keys inside them rejected: `cache.*` (per-collection cache
+             *     policy, TD-COMPACT-2b — `{"cache.index.mode": "pin"}` pins Region A),
+             *     `compaction.*` (TD-COMPACT-15) and `probe.*` (TD-RDSTRAT-14). Keys
+             *     outside those three namespaces are stored verbatim.
              */
             properties?: {
                 [key: string]: string;

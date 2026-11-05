@@ -4289,7 +4289,7 @@ pub mod types {
     ///      ]
     ///    },
     ///    "properties": {
-    ///      "description": "Per-collection table properties (Hive TBLPROPERTIES-style). Keys in\nthe `cache.*` namespace configure the per-collection cache policy\n(TD-COMPACT-2b): `{\"cache.index.mode\": \"pin\"}` pins Region A. All\n`cache.*` keys are validated at create time; unknown keys in that\nnamespace are rejected. Non-`cache.*` keys are stored verbatim.",
+    ///      "description": "Per-collection table properties (Hive TBLPROPERTIES-style). Three\nnamespaces are RESERVED for policy and validated at create time, with\nunknown keys inside them rejected: `cache.*` (per-collection cache\npolicy, TD-COMPACT-2b — `{\"cache.index.mode\": \"pin\"}` pins Region A),\n`compaction.*` (TD-COMPACT-15) and `probe.*` (TD-RDSTRAT-14). Keys\noutside those three namespaces are stored verbatim.",
     ///      "type": [
     ///        "object",
     ///        "null"
@@ -4404,11 +4404,12 @@ pub mod types {
         /// admission with the configured ids listed.
         #[serde(default, skip_serializing_if = "::std::option::Option::is_none")]
         pub pool_id: ::std::option::Option<::std::string::String>,
-        /// Per-collection table properties (Hive TBLPROPERTIES-style). Keys in
-        /// the `cache.*` namespace configure the per-collection cache policy
-        /// (TD-COMPACT-2b): `{"cache.index.mode": "pin"}` pins Region A. All
-        /// `cache.*` keys are validated at create time; unknown keys in that
-        /// namespace are rejected. Non-`cache.*` keys are stored verbatim.
+        /// Per-collection table properties (Hive TBLPROPERTIES-style). Three
+        /// namespaces are RESERVED for policy and validated at create time, with
+        /// unknown keys inside them rejected: `cache.*` (per-collection cache
+        /// policy, TD-COMPACT-2b — `{"cache.index.mode": "pin"}` pins Region A),
+        /// `compaction.*` (TD-COMPACT-15) and `probe.*` (TD-RDSTRAT-14). Keys
+        /// outside those three namespaces are stored verbatim.
         #[serde(default, skip_serializing_if = "::std::option::Option::is_none")]
         pub properties: ::std::option::Option<
             ::std::collections::HashMap<::std::string::String, ::std::string::String>,

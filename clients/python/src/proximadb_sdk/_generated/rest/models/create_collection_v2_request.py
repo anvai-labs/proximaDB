@@ -93,11 +93,12 @@ class CreateCollectionV2Request:
                 `"target_vector_count:1000"`, `"modalities:text,image"`. Consumed by the
                 recall advisor / route-health (`services/collection/recall_target.rs`).
             properties (CreateCollectionV2RequestPropertiesType0 | None | Unset): Per-collection table properties (Hive
-                TBLPROPERTIES-style). Keys in
-                the `cache.*` namespace configure the per-collection cache policy
-                (TD-COMPACT-2b): `{"cache.index.mode": "pin"}` pins Region A. All
-                `cache.*` keys are validated at create time; unknown keys in that
-                namespace are rejected. Non-`cache.*` keys are stored verbatim.
+                TBLPROPERTIES-style). Three
+                namespaces are RESERVED for policy and validated at create time, with
+                unknown keys inside them rejected: `cache.*` (per-collection cache
+                policy, TD-COMPACT-2b — `{"cache.index.mode": "pin"}` pins Region A),
+                `compaction.*` (TD-COMPACT-15) and `probe.*` (TD-RDSTRAT-14). Keys
+                outside those three namespaces are stored verbatim.
             quantization (None | QuantizationConfigInput | Unset):
             index_policy (IndexPolicyInput | None | Unset):
             description (None | str | Unset): Free-text description, persisted on the collection config.

@@ -330,7 +330,11 @@ fn property_usize(properties: &HashMap<String, String>, key: &str) -> Option<usi
         .filter(|(k, _)| k.trim().to_ascii_lowercase() == key)
         .min_by_key(|(k, _)| k.as_str())
         .and_then(|(_, v)| v.trim().parse::<usize>().ok())
-        .filter(|v| *v > 0)
+    // NO `> 0` filter: 0 is the sentinel (no floor / unlimited / no cap) that
+    // `validate_probe_properties` accepts and the server layer honours, so
+    // dropping it here resolved `probe.cap_mb=0` silently back to the code
+    // default — the property channel validating a value it then ignored.
+    // `base_mb = 0` is refused at the validation door instead.
 }
 
 /// The largest MiB value any probe budget knob accepts (1 TiB). Bounds the
@@ -338,6 +342,25 @@ fn property_usize(properties: &HashMap<String, String>, key: &str) -> Option<usi
 /// (debug: arithmetic panic, which mandate #4 forbids; release: a wrapped
 /// garbage cap).
 pub const MAX_PROBE_BUDGET_MB: usize = 1024 * 1024;
+
+/// The probe keys this module recognises. `probe.` is NOT a reserved
+/// namespace, so only these are policy knobs — anything else under the
+/// prefix (`probe.owner`, say) is ordinary tenant metadata and must keep
+/// being stored verbatim rather than 400ing.
+pub const PROBE_POLICY_KEYS: [&str; 6] = [
+    PROBE_ALGORITHM_PROPERTY_KEY,
+    PROBE_MULTIPLIER_KEY,
+    PROBE_MIN_CELLS_KEY,
+    PROBE_MAX_CELLS_KEY,
+    PROBE_BASE_MB_KEY,
+    PROBE_CAP_MB_KEY,
+];
+
+/// Whether `key` is one of the recognised probe POLICY knobs.
+pub fn is_probe_policy_key(key: &str) -> bool {
+    let key = key.trim().to_ascii_lowercase();
+    PROBE_POLICY_KEYS.contains(&key.as_str())
+}
 
 fn property_u64_mb(properties: &HashMap<String, String>, key: &str) -> Option<u64> {
     property_usize(properties, key)

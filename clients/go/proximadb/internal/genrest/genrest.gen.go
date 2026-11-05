@@ -1383,11 +1383,12 @@ type CreateCollectionV2Request struct {
 	// admission with the configured ids listed.
 	PoolId *string `json:"pool_id,omitempty"`
 
-	// Properties Per-collection table properties (Hive TBLPROPERTIES-style). Keys in
-	// the `cache.*` namespace configure the per-collection cache policy
-	// (TD-COMPACT-2b): `{"cache.index.mode": "pin"}` pins Region A. All
-	// `cache.*` keys are validated at create time; unknown keys in that
-	// namespace are rejected. Non-`cache.*` keys are stored verbatim.
+	// Properties Per-collection table properties (Hive TBLPROPERTIES-style). Three
+	// namespaces are RESERVED for policy and validated at create time, with
+	// unknown keys inside them rejected: `cache.*` (per-collection cache
+	// policy, TD-COMPACT-2b — `{"cache.index.mode": "pin"}` pins Region A),
+	// `compaction.*` (TD-COMPACT-15) and `probe.*` (TD-RDSTRAT-14). Keys
+	// outside those three namespaces are stored verbatim.
 	Properties *map[string]string `json:"properties,omitempty"`
 
 	// Quantization REST input for quantization config (mirrors proto `QuantizationConfig`;
