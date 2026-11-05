@@ -232,8 +232,12 @@ pub fn resolve_probe_plan(
     };
     match policy.algorithm {
         // ByteBudget plans in BYTES end-to-end: budget → cap → band → cells,
-        // so the cell count, the planned bytes and the band can never
-        // contradict each other and the cap genuinely bounds fan-out.
+        // so the cap genuinely bounds fan-out rather than just relabelling
+        // the plan. One documented exception: `min_cells` is a RECALL floor
+        // and wins over the byte budget, so when it raises the count above
+        // what the band affords, `probe_bytes` exceeds `band` (recall is
+        // not negotiable for a cost knob). `band` is then the budget rung
+        // and `probe_bytes` the honest cost of the floor.
         ProbeAlgorithm::ByteBudget => {
             // Budget grows quarter-power with corpus; 1M rows is the base.
             let scale = (corpus_rows.max(1) as f64 / 1_000_000.0).powf(0.25);

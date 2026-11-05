@@ -3825,13 +3825,15 @@ fn env_probe_layer() -> proximadb_storage_common::probe_policy::ServerProbePolic
     }
     if let Ok(cap) = std::env::var("PROXIMADB_PAX_READ_PROBE_CAP_MB") {
         match cap.trim().parse::<u64>() {
-            Ok(mb) if mb > 0 && mb <= MAX_PROBE_MB => {
-                server.cap_bytes = Some(mb.saturating_mul(1024 * 1024))
-            }
+            // 0 is the documented "no cap" sentinel on the TOML field this
+            // mirrors; warning-and-ignoring it meant the env could not
+            // express it and the arm silently ran capped at the default.
+            Ok(0) => server.cap_bytes = Some(0),
+            Ok(mb) if mb <= MAX_PROBE_MB => server.cap_bytes = Some(mb.saturating_mul(1024 * 1024)),
             _ => warn_junk_env(
                 "PROXIMADB_PAX_READ_PROBE_CAP_MB",
                 &cap,
-                "a positive integer of at most 1048576 (MiB)",
+                "an integer of at most 1048576 (MiB); 0 = no cap",
             ),
         }
     }
@@ -3953,10 +3955,20 @@ fn coarse_probe_nprobe(
     dir: &proximadb_storage_common::coarse_directory::CoarseDirectory,
 ) -> usize {
     let corpus_rows = dir.cells.iter().map(|c| c.row_end).max().unwrap_or(0);
-    let avg_cell_bytes = if k_c > 0 {
-        dir.cells.iter().map(|c| c.a_len).sum::<u64>() / k_c as u64
-    } else {
-        0
+    // Average over NON-EMPTY cells only: the probe never reads a zero-length
+    // cell, so including them biased the mean low and made a band under-read
+    // its budget (10 empty of 30 cells turned an 8 MiB band into ~11 MiB of
+    // actual reads).
+    let avg_cell_bytes = {
+        let mut bytes = 0u64;
+        let mut count = 0u64;
+        for cell in &dir.cells {
+            if cell.a_len > 0 {
+                bytes += cell.a_len;
+                count += 1;
+            }
+        }
+        bytes.checked_div(count).unwrap_or(0)
     };
     let rowgroup_bytes =
         proximadb_storage_common::iops_budget::IopsBudget::for_path(path).target_block_bytes();

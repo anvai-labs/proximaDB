@@ -894,6 +894,11 @@ fn toml_coarse_probe_config_wins_over_default_init() {
     // invalidate with the settings (sqrt(64)*1.0 = 8).
     init_coarse_probe_settings(Some(&cp_cfg(1.0)));
     assert_eq!(geometric_nprobe_root(64), 8);
+    // Restore the shipped default: the settings are process-wide, and
+    // leaving 1.0 installed would make later probe-path tests resolve an
+    // nprobe below the recall floor under the shared-process libtest
+    // fallback.
+    init_coarse_probe_settings(Some(&crate::core::config::CoarseProbeConfig::default()));
 }
 
 /// TD-CACHE-2 S2b: Region A and control bytes are separate eviction
