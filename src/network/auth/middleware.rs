@@ -433,8 +433,13 @@ fn authz_response(
 
 /// Determine if authentication should be skipped for this path
 fn should_skip_auth(path: &str) -> bool {
-    // Health endpoints
-    if path.starts_with("/health") {
+    // Health endpoints — via the ONE shared predicate (TD-PROBE-1 review M1:
+    // this was a private literal `starts_with("/health")`, so the auth skip
+    // and the tenant-layer probe exemption were two independent literals
+    // whose match sets merely happened to be identical — exactly the drift
+    // shape the tenant exemption's comment claims to preclude. Route both
+    // through `is_health_endpoint` and they agree by construction).
+    if proximadb_network_middleware::rate_limit::is_health_endpoint(path) {
         return true;
     }
 

@@ -779,21 +779,28 @@ pub async fn tenant_middleware(
 ) -> Response {
     // TD-PROBE-1: liveness/readiness probes are EXEMPT from tenant assertion.
     //
-    // The auth layer already exempts `/health*` from credential extraction
-    // (`require_auth_for_health: false` → `is_health_endpoint`), so no
-    // authenticated identity is ever attached to a probe. This layer then saw
-    // a bare assertion and rejected it — 400 with no header, 403 with a bare
-    // `X-Tenant-ID`, and 403 EVEN WITH a valid tenant-bound credential,
-    // because the layer that would have consumed that credential was skipped.
-    // Multi-tenant serving requires a security coordinator
-    // (`validate_listener_security`), so that pair IS the intended production
-    // posture and no Kubernetes liveness probe could pass.
+    // The auth layer (`should_skip_auth`) skips credential extraction for
+    // `/health*`, so no authenticated identity is ever attached to a probe.
+    // This layer then saw a bare assertion and rejected it — 400 with no
+    // header, 403 with a bare `X-Tenant-ID`, and 403 EVEN WITH a valid
+    // tenant-bound credential, because the layer that would have consumed
+    // that credential was skipped. Multi-tenant serving requires a security
+    // coordinator (`validate_listener_security`), so that pair IS the
+    // intended production posture and no Kubernetes liveness probe could pass.
     //
-    // The exemption reuses the SAME predicate the auth layer uses, so the two
-    // layers agree by construction instead of through two literal lists that
-    // can drift. No tenant identity is attached: a probe must never assert or
-    // acquire one, and the health handlers need none (`liveness_check` /
-    // `readiness_check` take only `State(AppState)`).
+    // The exemption reuses the SAME predicate the auth layer routes through
+    // (`is_health_endpoint` — review M1 pointed `should_skip_auth` at it in
+    // this PR), so the two layers agree by construction instead of through
+    // two literal lists that can drift.
+    //
+    // No tenant identity is attached BY THIS LAYER: a probe must never assert
+    // or acquire one, and none of the health handlers need one —
+    // `liveness_check` / `readiness_check` take only `State(AppState)`, and
+    // `/health` (`comprehensive_health_check`) adds only a `Query` extractor.
+    // (`default_tenant_if_unresolved`, applied inside `create_router`, still
+    // backfills a default TenantContext for every route — health included —
+    // harmless: no health-path consumer reads it, and it backstops any inner
+    // consumer that ever starts.)
     if proximadb_network_middleware::rate_limit::is_health_endpoint(req.uri().path()) {
         return next.run(req).await;
     }
