@@ -27,6 +27,40 @@ from ..models import (
 from ..models_v2 import ProximaRecord
 
 
+class RecordOpsMixin:
+    """Shared record-operation helpers for transport/embedded adapters.
+
+    The former per-adapter copies (REST, gRPC, embedded) were byte-identical
+    (R4 discovery; one drifted silently in v1 — the TD-SDK-3 lesson). Mixin
+    FIRST in bases so these win over any adapter-local default.
+    """
+
+    @staticmethod
+    def _record_payloads(records: list[ProximaRecord] | list[dict[str, Any]]):
+        from ..proto_conversion import ProtoConverter
+
+        payloads = []
+        for record in records:
+            if isinstance(record, dict):
+                payloads.append(record)
+            elif hasattr(record, "model_dump"):
+                payloads.append(record.model_dump(exclude_none=True))
+            else:
+                payloads.append(ProtoConverter.vector_record_to_dict(record))
+        return payloads
+
+    @staticmethod
+    def _batch_to_vector_response(
+        result: BatchResult, operation: str
+    ) -> VectorOperationResponse:
+        return VectorOperationResponse(
+            success=result.success,
+            operation=operation,
+            metrics=result.metrics,
+            error_message="; ".join(result.errors) if result.errors else None,
+        )
+
+
 class BaseProtocolAdapter(ABC):
     """Abstract base class for SDK adapters.
 

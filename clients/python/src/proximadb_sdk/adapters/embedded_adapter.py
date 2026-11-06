@@ -36,7 +36,7 @@ from ..models import (
 )
 from ..models_v2 import ProximaRecord
 from ..proto_conversion import ProtoConverter
-from .base import BaseProtocolAdapter
+from .base import BaseProtocolAdapter, RecordOpsMixin
 
 logger = logging.getLogger(__name__)
 
@@ -49,7 +49,7 @@ def _is_coroutine_fn(fn) -> bool:
     return asyncio.iscoroutinefunction(fn)
 
 
-class EmbeddedProtocolAdapter(BaseProtocolAdapter):
+class EmbeddedProtocolAdapter(RecordOpsMixin, BaseProtocolAdapter):
     """Embedded adapter implementing BaseProtocolAdapter.
 
     Wraps the PyO3 EmbeddedProximaDB bindings to provide a consistent
@@ -530,17 +530,6 @@ class EmbeddedProtocolAdapter(BaseProtocolAdapter):
             failed=response.metrics.failed_count,
             errors=[response.error_message] if response.error_message else [],
             metrics=response.metrics,
-        )
-
-    @staticmethod
-    def _batch_to_vector_response(
-        result: BatchResult, operation: str
-    ) -> VectorOperationResponse:
-        return VectorOperationResponse(
-            success=result.success,
-            operation=operation,
-            metrics=result.metrics,
-            error_message="; ".join(result.errors) if result.errors else None,
         )
 
     def insert_records(

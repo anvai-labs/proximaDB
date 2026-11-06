@@ -28,14 +28,13 @@ from ..models import (
     VectorRecord,
 )
 from ..models_v2 import ProximaRecord
-from ..proto_conversion import ProtoConverter
 from ._sync_graph_delegations import SyncGraphDelegations
-from .base import BaseProtocolAdapter
+from .base import BaseProtocolAdapter, RecordOpsMixin
 
 logger = logging.getLogger(__name__)
 
 
-class RestProtocolAdapter(SyncGraphDelegations, BaseProtocolAdapter):
+class RestProtocolAdapter(RecordOpsMixin, SyncGraphDelegations, BaseProtocolAdapter):
     """REST protocol adapter implementing BaseProtocolAdapter.
 
     Wraps the existing ProximaDBClient (REST) to provide a consistent
@@ -205,18 +204,6 @@ class RestProtocolAdapter(SyncGraphDelegations, BaseProtocolAdapter):
     # ==========================================================================
 
     @staticmethod
-    def _record_payloads(records: list[ProximaRecord] | list[dict[str, Any]]):
-        payloads = []
-        for record in records:
-            if isinstance(record, dict):
-                payloads.append(record)
-            elif hasattr(record, "model_dump"):
-                payloads.append(record.model_dump(exclude_none=True))
-            else:
-                payloads.append(ProtoConverter.vector_record_to_dict(record))
-        return payloads
-
-    @staticmethod
     def _to_batch_result(result: Any, total_count: int) -> BatchResult:
         if isinstance(result, BatchResult):
             return result
@@ -261,17 +248,6 @@ class RestProtocolAdapter(SyncGraphDelegations, BaseProtocolAdapter):
                 successful_count=successful,
                 failed_count=failed,
             ),
-        )
-
-    @staticmethod
-    def _batch_to_vector_response(
-        result: BatchResult, operation: str
-    ) -> VectorOperationResponse:
-        return VectorOperationResponse(
-            success=result.success,
-            operation=operation,
-            metrics=result.metrics,
-            error_message="; ".join(result.errors) if result.errors else None,
         )
 
     def insert_records(
