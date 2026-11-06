@@ -597,3 +597,18 @@ unbounded), now registered only after a successful schedule; the stale
 corrected; and `--compact-full-target-segments` without
 `--compact-full-before-measure` now refuses at parse time instead of being
 silently dropped while result.json implied the geometry was pinned.
+
+Scoped verification of the round-23 commit (fresh-context): the one must-fix
+(the duplicate `#[test]` stacked by the repair inserts) plus the round-20
+doc still glued to the exhaustiveness guard are fixed here; a pre-existing
+same-class stranding (`check_compaction_needed`'s doc on
+`take_pass_outcome`) moved home too. One residual filed, not fixed —
+**COMPACT-15-F11**: `awaited_outcomes` keys inserted before the
+`await_compaction_quiescence` await are leak-free on every enumerated
+SYNCHRONOUS exit, but if the handler future is DROPPED at that await (a
+client disconnect during the full remaining deadline), the key stays in the
+process-lifetime set forever and permanently pins its journal entry; with
+>=64 pinned, journal eviction stops entirely. Round 23 narrowed the leak
+(parent also leaked on contended/schedule-error paths) but did not close
+this window. To close: register via a guard struct whose Drop removes the
+key (RAII), so a cancelled future unwinds the registration.

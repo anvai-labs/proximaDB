@@ -1574,10 +1574,6 @@ mod tests {
     }
     use super::*;
 
-    /// #2418 review round 20: a config-level `full_target_segments = 0` was
-    /// silently clamped to 1 by `.max(1)` — the knob-silently-rewritten
-    /// hazard the four per-request `Some(0)` doors (REST, Flight, the trait
-    /// seam, the engine) all refuse. It must fail boot like they do.
     /// Exhaustiveness guard for `merge_section_over` (#2418 review round 22).
     ///
     /// This destructures `CompactionConfig` with no `..` rest pattern, so
@@ -1656,7 +1652,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn config_level_full_max_passes_zero_fails_boot() {
         // Round 23: `full_max_passes` was clamped to 1 at use, so 0 booted
         // happily and silently meant "one pass", not "unbounded" — the same
@@ -1674,6 +1669,10 @@ mod tests {
         );
     }
 
+    /// #2418 review round 20: a config-level `full_target_segments = 0` was
+    /// silently clamped to 1 by `.max(1)` — the knob-silently-rewritten
+    /// hazard the four per-request `Some(0)` doors (REST, Flight, the trait
+    /// seam, the engine) all refuse. It must fail boot like they do.
     #[test]
     fn config_level_full_target_segments_zero_fails_boot() {
         let config = CompactionConfig {

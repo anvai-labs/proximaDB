@@ -1407,13 +1407,6 @@ impl Compaction {
         self.schedule_compaction(task).await
     }
 
-    /// Check if compaction is needed for the given collection and level.
-    ///
-    /// `l0_threshold_override` (TD-WLP-7 / TD-WLP-2): when `Some`, the L0
-    /// file-count threshold the unified builder gates on is replaced with the
-    /// per-collection value resolved from the `l0_threshold:` tag, so this stays
-    /// consistent with the flush-path `should_trigger_compaction` decision.
-    /// `None` uses the deployment `CompactionConfig` default.
     /// Take (and remove) the recorded outcome of the morsel that wrote
     /// `output_key`, if any.
     pub async fn take_pass_outcome(&self, output_key: &str) -> Option<PassOutcome> {
@@ -1911,6 +1904,13 @@ impl Compaction {
         Ok(true)
     }
 
+    /// Check if compaction is needed for the given collection and level.
+    ///
+    /// `l0_threshold_override` (TD-WLP-7 / TD-WLP-2): when `Some`, the L0
+    /// file-count threshold the unified builder gates on is replaced with the
+    /// per-collection value resolved from the `l0_threshold:` tag, so this stays
+    /// consistent with the flush-path `should_trigger_compaction` decision.
+    /// `None` uses the deployment `CompactionConfig` default.
     pub async fn check_compaction_needed(
         &self,
         collection_object_id: crate::core::stable_id::CollectionObjectId,
