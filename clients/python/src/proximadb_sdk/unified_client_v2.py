@@ -26,6 +26,7 @@ from ._graph_validation import (
     validate_traverse_graph_args,
 )
 from .adapters import BaseProtocolAdapter, create_adapter
+from .adapters.base import RecordOpsMixin
 from .auth import AuthConfig, AuthMethod
 from .config import ClientConfig, Protocol, load_config
 from .exceptions import (
@@ -50,7 +51,7 @@ from .models_v2 import ProximaRecord
 logger = logging.getLogger(__name__)
 
 
-class ProximaDBClient:
+class ProximaDBClient(RecordOpsMixin):
     """
     Unified ProximaDB Python Client (v2 - Adapter Pattern)
 
@@ -379,17 +380,6 @@ class ProximaDBClient:
     # ==========================================================================
     # Record Operations
     # ==========================================================================
-
-    @staticmethod
-    def _batch_to_vector_response(
-        result: BatchResult, operation: str
-    ) -> VectorOperationResponse:
-        return VectorOperationResponse(
-            success=result.success,
-            operation=operation,
-            metrics=result.metrics,
-            error_message="; ".join(result.errors) if result.errors else None,
-        )
 
     def insert_records(
         self,
@@ -789,6 +779,25 @@ class ProximaDBClient:
             limit=limit,
         )
 
+    def _execute_lang(
+        self,
+        query: str,
+        language: str,
+        *,
+        parameters: list[Any] | None = None,
+        collection: str | None = None,
+        limit: int | None = None,
+    ) -> dict[str, Any]:
+        """Shared body of the execute_{uql,aql,federated} language wrappers
+        (R4: the three former copies were byte-identical modulo the literal)."""
+        return self.execute_query(
+            query,
+            language=language,
+            parameters=parameters,
+            collection=collection,
+            limit=limit,
+        )
+
     def execute_uql(
         self,
         query: str,
@@ -798,12 +807,8 @@ class ProximaDBClient:
         limit: int | None = None,
     ) -> dict[str, Any]:
         """Execute a UQL query through the OpenAPI v2 REST query surface."""
-        return self.execute_query(
-            query,
-            language="uql",
-            parameters=parameters,
-            collection=collection,
-            limit=limit,
+        return self._execute_lang(
+            query, "uql", parameters=parameters, collection=collection, limit=limit
         )
 
     def execute_aql(
@@ -815,12 +820,8 @@ class ProximaDBClient:
         limit: int | None = None,
     ) -> dict[str, Any]:
         """Execute an AQL query through the OpenAPI v2 REST query surface."""
-        return self.execute_query(
-            query,
-            language="aql",
-            parameters=parameters,
-            collection=collection,
-            limit=limit,
+        return self._execute_lang(
+            query, "aql", parameters=parameters, collection=collection, limit=limit
         )
 
     def execute_federated(
@@ -832,9 +833,9 @@ class ProximaDBClient:
         limit: int | None = None,
     ) -> dict[str, Any]:
         """Execute federated SQL extensions through the OpenAPI v2 REST surface."""
-        return self.execute_query(
+        return self._execute_lang(
             query,
-            language="federated",
+            "federated",
             parameters=parameters,
             collection=collection,
             limit=limit,
