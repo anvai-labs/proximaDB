@@ -1419,7 +1419,7 @@ mod tests {
 
         // Seed the parent region with one cache (persists to the L2 store)...
         let seeder = SurvivorRangeCache::with_resolver_and_l2(1 << 20, None, Some(store.clone()));
-        let parent: Arc<[u8]> = Arc::from((0u8..4096).collect::<Vec<_>>());
+        let parent: Arc<[u8]> = Arc::from((0u8..=255).cycle().take(4096).collect::<Vec<_>>());
         seeder
             .seed_parent_region("seg.pax", 0, parent)
             .await

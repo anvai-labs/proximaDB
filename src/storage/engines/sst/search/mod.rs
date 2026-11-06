@@ -4942,8 +4942,8 @@ mod tests {
         use crate::core::search::SearchParams;
         use crate::storage::traits::{FlushParameters, StorageQueryContext, StorageQueryMetadata};
         use proximadb_records::{EmbeddingCell, ProximaRecord};
-        use std::sync::atomic::Ordering;
-        use std::sync::{Arc, AtomicBool};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
 
         let dim = 64usize;
         let cid = "scandeg_arc_test";
