@@ -481,7 +481,7 @@ class ProximaDBSyncGrpcClient:
             kwargs["metadata"] = self.metadata
         return kwargs
 
-    def _grpc_stub(self, module_name: str, class_name: str, service_label: str):
+    def _grpc_stub(self, module_name: str | None, class_name: str, service_label: str):
         """Resolve a gRPC stub class, with the per-service availability guard.
 
         ``module_name`` is a ``proximadb.v2`` submodule resolved lazily (the
@@ -490,13 +490,16 @@ class ProximaDBSyncGrpcClient:
         ``v2_record_pb2_grpc`` modules chosen by ``class_name``.
         """
         if module_name is None:
+            # GRPC_AVAILABLE is checked FIRST on every path: a missing grpcio
+            # must tell the user to install grpcio, never to regenerate stubs
+            # (review round 1 — the collection path briefly regressed this).
+            if not GRPC_AVAILABLE:
+                raise ProximaDBError(
+                    "gRPC not available. Install with: pip install grpcio grpcio-tools"
+                )
             if class_name == "VectorServiceStub":
-                if not GRPC_AVAILABLE:
-                    raise ProximaDBError(
-                        "gRPC not available. Install with: pip install grpcio grpcio-tools"
-                    )
                 return v1_vector_pb2_grpc.VectorServiceStub
-            if not GRPC_AVAILABLE or v2_record_pb2_grpc is None:
+            if v2_record_pb2_grpc is None:
                 raise ProximaDBError(
                     "v2 record gRPC stubs not available. Regenerate Python protobuf stubs."
                 )
