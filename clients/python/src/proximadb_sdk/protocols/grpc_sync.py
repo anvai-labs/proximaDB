@@ -8,6 +8,7 @@ Features:
 - Thread-safe concurrent operations
 """
 
+import importlib
 import logging
 from dataclasses import dataclass
 from datetime import UTC
@@ -480,189 +481,99 @@ class ProximaDBSyncGrpcClient:
             kwargs["metadata"] = self.metadata
         return kwargs
 
+    def _grpc_stub(self, module_name: str, class_name: str, service_label: str):
+        """Resolve a gRPC stub class, with the per-service availability guard.
+
+        ``module_name`` is a ``proximadb.v2`` submodule resolved lazily (the
+        v2 stubs ship separately from the core grpc dependency); passing
+        ``None`` uses the always-imported ``v1_vector_pb2_grpc`` /
+        ``v2_record_pb2_grpc`` modules chosen by ``class_name``.
+        """
+        if module_name is None:
+            if class_name == "VectorServiceStub":
+                if not GRPC_AVAILABLE:
+                    raise ProximaDBError(
+                        "gRPC not available. Install with: pip install grpcio grpcio-tools"
+                    )
+                return v1_vector_pb2_grpc.VectorServiceStub
+            if not GRPC_AVAILABLE or v2_record_pb2_grpc is None:
+                raise ProximaDBError(
+                    "v2 record gRPC stubs not available. Regenerate Python protobuf stubs."
+                )
+            return getattr(v2_record_pb2_grpc, class_name)
+        try:
+            module = importlib.import_module(f"proximadb.v2.{module_name}")
+        except ImportError:
+            raise ProximaDBError(
+                f"v2 {service_label} gRPC stubs not available. "
+                "Regenerate Python protobuf stubs."
+            )
+        if not GRPC_AVAILABLE:
+            raise ProximaDBError(
+                "gRPC not available. Install with: pip install grpcio grpcio-tools"
+            )
+        return getattr(module, class_name)
+
+    def _execute_stub_with_pool(
+        self, operation_name: str, operation_func, stub_factory
+    ):
+        """Execute ``operation_func`` on a pooled channel with one shared
+        error-translation tail (R4: the six former per-service copies of this
+        body were byte-identical below the stub line)."""
+        try:
+            with GrpcChannelContext(self._connection_pool) as channel:
+                stub = _StubWithDefaultRpcKwargs(
+                    stub_factory(channel), self._rpc_kwargs()
+                )
+                return operation_func(stub)
+
+        except grpc.RpcError as e:
+            logger.error(f"gRPC {operation_name} RPC error: {e.code()} - {e.details()}")
+            details = e.details() or str(e)
+            if e.code() == grpc.StatusCode.UNAVAILABLE or "connect" in details.lower():
+                raise ProximaDBError(f"{operation_name} connection failed: {details}")
+            raise ProximaDBError(f"{operation_name} RPC failed: {details}")
+        except Exception as e:
+            logger.error(f"gRPC {operation_name} failed: {e}")
+            raise ProximaDBError(f"{operation_name} failed: {e}")
+
     def _execute_with_pool(self, operation_name: str, operation_func):
         """Execute operation using connection pool with automatic error handling"""
-        if not GRPC_AVAILABLE:
-            raise ProximaDBError(
-                "gRPC not available. Install with: pip install grpcio grpcio-tools"
-            )
-
-        try:
-            with GrpcChannelContext(self._connection_pool) as channel:
-                # Create stub for this operation
-                # Use versioned VectorService exclusively (v1)
-                stub = _StubWithDefaultRpcKwargs(
-                    v1_vector_pb2_grpc.VectorServiceStub(channel), self._rpc_kwargs()
-                )
-
-                # Execute the operation with timeout
-                return operation_func(stub)
-
-        except grpc.RpcError as e:
-            logger.error(f"gRPC {operation_name} RPC error: {e.code()} - {e.details()}")
-            details = e.details() or str(e)
-            if e.code() == grpc.StatusCode.UNAVAILABLE or "connect" in details.lower():
-                raise ProximaDBError(f"{operation_name} connection failed: {details}")
-            raise ProximaDBError(f"{operation_name} RPC failed: {details}")
-        except Exception as e:
-            logger.error(f"gRPC {operation_name} failed: {e}")
-            raise ProximaDBError(f"{operation_name} failed: {e}")
+        stub_cls = self._grpc_stub(None, "VectorServiceStub", "vector")
+        return self._execute_stub_with_pool(operation_name, operation_func, stub_cls)
 
     def _execute_collection_with_pool(self, operation_name: str, operation_func):
-        """Execute collection operation using connection pool with CollectionService"""
-        if not GRPC_AVAILABLE:
-            raise ProximaDBError(
-                "gRPC not available. Install with: pip install grpcio grpcio-tools"
-            )
-
-        try:
-            with GrpcChannelContext(self._connection_pool) as channel:
-                # v2: collection ops are served by ProximaRecordService (v1 gRPC
-                # CollectionService is flag-gated off). RPC names match v1.
-                stub = _StubWithDefaultRpcKwargs(
-                    v2_record_pb2_grpc.ProximaRecordServiceStub(channel),
-                    self._rpc_kwargs(),
-                )
-
-                # Execute the operation with timeout
-                return operation_func(stub)
-
-        except grpc.RpcError as e:
-            logger.error(f"gRPC {operation_name} RPC error: {e.code()} - {e.details()}")
-            details = e.details() or str(e)
-            if e.code() == grpc.StatusCode.UNAVAILABLE or "connect" in details.lower():
-                raise ProximaDBError(f"{operation_name} connection failed: {details}")
-            raise ProximaDBError(f"{operation_name} RPC failed: {details}")
-        except Exception as e:
-            logger.error(f"gRPC {operation_name} failed: {e}")
-            raise ProximaDBError(f"{operation_name} failed: {e}")
+        """Execute collection operation using connection pool (v2:
+        collection ops are served by ProximaRecordService — the v1 gRPC
+        CollectionService is flag-gated off; RPC names match v1)."""
+        stub_cls = self._grpc_stub(None, "ProximaRecordServiceStub", "record")
+        return self._execute_stub_with_pool(operation_name, operation_func, stub_cls)
 
     def _execute_record_with_pool(self, operation_name: str, operation_func):
         """Execute record operation using the v2 ProximaRecordService."""
-        if not GRPC_AVAILABLE or v2_record_pb2_grpc is None:
-            raise ProximaDBError(
-                "v2 record gRPC stubs not available. Regenerate Python protobuf stubs."
-            )
-
-        try:
-            with GrpcChannelContext(self._connection_pool) as channel:
-                stub = _StubWithDefaultRpcKwargs(
-                    v2_record_pb2_grpc.ProximaRecordServiceStub(channel),
-                    self._rpc_kwargs(),
-                )
-                return operation_func(stub)
-
-        except grpc.RpcError as e:
-            logger.error(f"gRPC {operation_name} RPC error: {e.code()} - {e.details()}")
-            details = e.details() or str(e)
-            if e.code() == grpc.StatusCode.UNAVAILABLE or "connect" in details.lower():
-                raise ProximaDBError(f"{operation_name} connection failed: {details}")
-            raise ProximaDBError(f"{operation_name} RPC failed: {details}")
-        except Exception as e:
-            logger.error(f"gRPC {operation_name} failed: {e}")
-            raise ProximaDBError(f"{operation_name} failed: {e}")
+        stub_cls = self._grpc_stub(None, "ProximaRecordServiceStub", "record")
+        return self._execute_stub_with_pool(operation_name, operation_func, stub_cls)
 
     def _execute_fusion_with_pool(self, operation_name: str, operation_func):
         """Execute fusion operation using the v2 ProximaFusionService."""
-        try:
-            from proximadb.v2 import (
-                fusion_pb2_grpc as v2_fusion_pb2_grpc,  # type: ignore
-            )
-        except ImportError:
-            raise ProximaDBError(
-                "v2 fusion gRPC stubs not available. Regenerate Python protobuf stubs."
-            )
-
-        if not GRPC_AVAILABLE:
-            raise ProximaDBError(
-                "gRPC not available. Install with: pip install grpcio grpcio-tools"
-            )
-
-        try:
-            with GrpcChannelContext(self._connection_pool) as channel:
-                stub = _StubWithDefaultRpcKwargs(
-                    v2_fusion_pb2_grpc.ProximaFusionServiceStub(channel),
-                    self._rpc_kwargs(),
-                )
-                return operation_func(stub)
-
-        except grpc.RpcError as e:
-            logger.error(f"gRPC {operation_name} RPC error: {e.code()} - {e.details()}")
-            details = e.details() or str(e)
-            if e.code() == grpc.StatusCode.UNAVAILABLE or "connect" in details.lower():
-                raise ProximaDBError(f"{operation_name} connection failed: {details}")
-            raise ProximaDBError(f"{operation_name} RPC failed: {details}")
-        except Exception as e:
-            logger.error(f"gRPC {operation_name} failed: {e}")
-            raise ProximaDBError(f"{operation_name} failed: {e}")
+        stub_cls = self._grpc_stub(
+            "fusion_pb2_grpc", "ProximaFusionServiceStub", "fusion"
+        )
+        return self._execute_stub_with_pool(operation_name, operation_func, stub_cls)
 
     def _execute_entity_with_pool(self, operation_name: str, operation_func):
         """Execute entity operation using the v2 ProximaEntityService."""
-        try:
-            from proximadb.v2 import (
-                entity_pb2_grpc as v2_entity_pb2_grpc,  # type: ignore
-            )
-        except ImportError:
-            raise ProximaDBError(
-                "v2 entity gRPC stubs not available. Regenerate Python protobuf stubs."
-            )
-
-        if not GRPC_AVAILABLE:
-            raise ProximaDBError(
-                "gRPC not available. Install with: pip install grpcio grpcio-tools"
-            )
-
-        try:
-            with GrpcChannelContext(self._connection_pool) as channel:
-                stub = _StubWithDefaultRpcKwargs(
-                    v2_entity_pb2_grpc.ProximaEntityServiceStub(channel),
-                    self._rpc_kwargs(),
-                )
-                return operation_func(stub)
-
-        except grpc.RpcError as e:
-            logger.error(f"gRPC {operation_name} RPC error: {e.code()} - {e.details()}")
-            details = e.details() or str(e)
-            if e.code() == grpc.StatusCode.UNAVAILABLE or "connect" in details.lower():
-                raise ProximaDBError(f"{operation_name} connection failed: {details}")
-            raise ProximaDBError(f"{operation_name} RPC failed: {details}")
-        except Exception as e:
-            logger.error(f"gRPC {operation_name} failed: {e}")
-            raise ProximaDBError(f"{operation_name} failed: {e}")
+        stub_cls = self._grpc_stub(
+            "entity_pb2_grpc", "ProximaEntityServiceStub", "entity"
+        )
+        return self._execute_stub_with_pool(operation_name, operation_func, stub_cls)
 
     def _execute_document_with_pool(self, operation_name: str, operation_func):
         """Execute document operation using the v2 ProximaDocumentService."""
-        try:
-            from proximadb.v2 import (
-                document_pb2_grpc as v2_document_pb2_grpc,  # type: ignore
-            )
-        except ImportError:
-            raise ProximaDBError(
-                "v2 document gRPC stubs not available. Regenerate Python protobuf stubs."
-            )
-
-        if not GRPC_AVAILABLE:
-            raise ProximaDBError(
-                "gRPC not available. Install with: pip install grpcio grpcio-tools"
-            )
-
-        try:
-            with GrpcChannelContext(self._connection_pool) as channel:
-                stub = _StubWithDefaultRpcKwargs(
-                    v2_document_pb2_grpc.ProximaDocumentServiceStub(channel),
-                    self._rpc_kwargs(),
-                )
-                return operation_func(stub)
-
-        except grpc.RpcError as e:
-            logger.error(f"gRPC {operation_name} RPC error: {e.code()} - {e.details()}")
-            details = e.details() or str(e)
-            if e.code() == grpc.StatusCode.UNAVAILABLE or "connect" in details.lower():
-                raise ProximaDBError(f"{operation_name} connection failed: {details}")
-            raise ProximaDBError(f"{operation_name} RPC failed: {details}")
-        except Exception as e:
-            logger.error(f"gRPC {operation_name} failed: {e}")
-            raise ProximaDBError(f"{operation_name} failed: {e}")
+        stub_cls = self._grpc_stub(
+            "document_pb2_grpc", "ProximaDocumentServiceStub", "document"
+        )
+        return self._execute_stub_with_pool(operation_name, operation_func, stub_cls)
 
     def get_pool_metrics(self):
         """Get connection pool performance metrics"""
