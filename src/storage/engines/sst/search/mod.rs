@@ -2894,8 +2894,22 @@ self.try_pax_cascade(
             return Ok(all_files);
         }
 
-        // Load headers and compute centroid distances
+        // Load headers and compute centroid distances. `resolved` counts the
+        // files that produced a REAL, dimension-matched distance — the 0.0
+        // pushed for an absent centroid, a dimension mismatch, or a read
+        // error is NOT a distance, it is "unknown", and the sort below reads
+        // it as closest-possible. A file set that is not fully resolved
+        // therefore cannot be ranked: an all-PAX collection ties at 0.0 and
+        // `.take(nprobe)` keeps an input-order subset unrelated to the query
+        // (recorded, until TD-ANNPRUNE-1, as a justified prune), and a mixed
+        // collection puts every unknown file AHEAD of every genuinely ranked
+        // one, evicting the best-ranked legacy files. PAX probe selection
+        // belongs to the trained Region-A0 centroid directory
+        // (`centroid_directory_nprobe_for`), which runs downstream of
+        // discovery; this legacy header-centroid prune must not pretend to
+        // substitute for it.
         let mut file_distances: Vec<(String, f32)> = Vec::new();
+        let mut resolved = 0usize;
 
         for file_path in &all_files {
             match self.load_sst_header_centroid(&file_path.url).await {
@@ -2908,6 +2922,7 @@ self.try_pax_cascade(
                             distance_metric,
                         );
                         file_distances.push((file_path.url.clone(), distance));
+                        resolved += 1;
                     } else {
                         // Dimension mismatch - include file anyway
                         file_distances.push((file_path.url.clone(), 0.0));
@@ -2926,6 +2941,23 @@ self.try_pax_cascade(
                     file_distances.push((file_path.url.clone(), 0.0));
                 }
             }
+        }
+
+        // The prune REQUIRES complete ranking input: a partial ranking is
+        // not a weaker prune, it is an arbitrary one (TD-ANNPRUNE-1).
+        // Anything unresolved returns every file. Note this cannot fire on
+        // the Ok(None) `.pax` fast path alone unless every other file ALSO
+        // resolved — the mixed case — which is exactly the eviction hazard
+        // above.
+        if resolved < all_files.len() {
+            tracing::debug!(
+                "SST centroid prune skipped: {}/{} files resolved a real centroid distance \
+                 (PAX segments carry no header centroid); searching all files. PAX probe \
+                 selection is the Region-A0 directory's job.",
+                resolved,
+                all_files.len()
+            );
+            return Ok(all_files);
         }
 
         // Sort by distance (ascending - closest first for similarity search)
@@ -4608,5 +4640,163 @@ mod tests {
             !caller.block_prune.force_exact,
             "caller intent stays immutable"
         );
+    }
+
+    // ---- TD-ANNPRUNE-1: the header-centroid prune requires complete
+    // ranking input. Before the fix, the 0.0 pushed for an unresolved file
+    // (no centroid / dimension mismatch / read error) sorted as
+    // closest-possible: an all-PAX collection tied at 0.0 and take(nprobe)
+    // kept an input-order lottery, and a mixed collection ranked every PAX
+    // file ahead of every genuinely-ranked legacy one. ----
+
+    /// Minimal SST1 file bytes carrying a header centroid, for the
+    /// fully-resolved positive test. Layout mirrors `load_sst_header_centroid`:
+    /// `SST1` + LE u32 header_len + bincode(SstableHeader).
+    fn sst1_bytes_with_centroid(centroid: &[f32]) -> Vec<u8> {
+        use crate::storage::engines::sst::SstableHeader;
+        let header = SstableHeader {
+            version: 1,
+            level: 0,
+            entry_count: 1,
+            min_key: "a".to_string(),
+            max_key: "z".to_string(),
+            timestamp: 0,
+            algorithm: proximadb_compression::CompressionAlgorithm::None,
+            compression_level: 0,
+            has_bloom_filter: false,
+            has_global_bloom: false,
+            has_block_blooms: false,
+            metadata_column_count: 0,
+            block_size: 0,
+            batch_size: 0,
+            block_count: 0,
+            header_size: 0,
+            index_size: 0,
+            data_size: 0,
+            global_bloom_offset: 0,
+            global_bloom_size: 0,
+            block_index_offset: 0,
+            block_index_size: 0,
+            data_blocks_offset: 0,
+            vector_format: crate::storage::engines::sst::VectorFormat::Variable,
+            fixed_dimension: Some(centroid.len() as u32),
+            compression_ratio: 1.0,
+            centroid: Some(centroid.to_vec()),
+            centroid_distance_sum: None,
+            min_distance_to_centroid: None,
+            max_distance_to_centroid: Some(1.0),
+            schema_id: None,
+            schema_version: None,
+            schema_fingerprint: None,
+        };
+        let body = bincode::serialize(&header).expect("SstableHeader must serialize for the test");
+        let mut bytes = Vec::with_capacity(8 + body.len());
+        bytes.extend_from_slice(b"SST1");
+        bytes.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&body);
+        bytes
+    }
+
+    async fn prune_test_engine()
+    -> anyhow::Result<(crate::storage::engines::sst::SstEngine, tempfile::TempDir)> {
+        use crate::storage::engines::sst::{SstConfig, SstEngine};
+        use crate::storage::persistence::filesystem::FilesystemFactory;
+        use proximadb_distance_kernel::engine::UnifiedDistanceCompute;
+        use std::sync::Arc;
+
+        let filesystem = Arc::new(FilesystemFactory::create(Default::default()).await?);
+        let distance_compute = Arc::new(UnifiedDistanceCompute::default());
+        let engine =
+            SstEngine::new_with_config(SstConfig::default(), filesystem, distance_compute).await?;
+        Ok((engine, tempfile::tempdir()?))
+    }
+
+    async fn prune_call(
+        engine: &crate::storage::engines::sst::SstEngine,
+        storage_url: &str,
+    ) -> anyhow::Result<Vec<DiscoveredSstFile>> {
+        use crate::core::search::{BlockPruneConfig, SearchMode};
+        use proximadb_distance_kernel::DistanceMetric;
+
+        // > MIN_FILES_FOR_PRUNING (10) files, Approximate with an explicit
+        // nprobe < file count, so every guard above the resolution check
+        // passes and the prune decision is reached.
+        Ok(engine
+            .discover_sstable_files_with_centroid_pruning(
+                storage_url,
+                &[1.0, 0.0, 0.0, 0.0],
+                DistanceMetric::Euclidean,
+                &SearchMode::Approximate { nprobe: Some(3) },
+                &BlockPruneConfig {
+                    force_exact: false,
+                    ..Default::default()
+                },
+            )
+            .await?)
+    }
+
+    /// All-PAX: every file resolves `Ok(None)` (the `.pax` suffix fast
+    /// path), so resolved == 0 and the prune MUST be refused — all files
+    /// returned. Before TD-ANNPRUNE-1 this kept an arbitrary 3.
+    #[tokio::test]
+    async fn all_pax_files_are_never_pruned_by_header_centroids() -> anyhow::Result<()> {
+        let (engine, dir) = prune_test_engine().await?;
+        for i in 0..12 {
+            std::fs::write(dir.path().join(format!("L0_{i:03}.pax")), b"")?;
+        }
+        let url = format!("file://{}", dir.path().display());
+        let selected = prune_call(&engine, &url).await?;
+        assert_eq!(
+            selected.len(),
+            12,
+            "an all-PAX collection cannot be ranked by header centroids; the prune must be refused"
+        );
+        Ok(())
+    }
+
+    /// Mixed PAX + unparseable-legacy: still not fully resolved, so the
+    /// prune is refused. (The strongest pre-fix failure was a MIX of PAX
+    /// and ranked files: the PAX 0.0s evicted the best-ranked legacy files.)
+    #[tokio::test]
+    async fn mixed_unresolved_files_are_never_pruned() -> anyhow::Result<()> {
+        let (engine, dir) = prune_test_engine().await?;
+        for i in 0..6 {
+            std::fs::write(dir.path().join(format!("L0_p{i:03}.pax")), b"")?;
+            // Valid SST1 headers — genuinely ranked files.
+            std::fs::write(
+                dir.path().join(format!("L0_s{i:03}.sst")),
+                sst1_bytes_with_centroid(&[1.0, 0.0, 0.0, 0.0]),
+            )?;
+        }
+        let url = format!("file://{}", dir.path().display());
+        let selected = prune_call(&engine, &url).await?;
+        assert_eq!(
+            selected.len(),
+            12,
+            "a partially-resolved file set must not be pruned: unresolved 0.0s sort ahead of real distances and evict ranked files"
+        );
+        Ok(())
+    }
+
+    /// Fully-resolved: the prune still works where it is honest. Guards
+    /// against overcorrection — 12 valid SST1 headers, nprobe 3, expect 3.
+    #[tokio::test]
+    async fn fully_resolved_files_still_prune() -> anyhow::Result<()> {
+        let (engine, dir) = prune_test_engine().await?;
+        for i in 0..12 {
+            let centroid = [1.0, (i as f32) * 0.1, 0.0, 0.0];
+            std::fs::write(
+                dir.path().join(format!("L0_{i:03}.sst")),
+                sst1_bytes_with_centroid(&centroid),
+            )?;
+        }
+        let url = format!("file://{}", dir.path().display());
+        let selected = prune_call(&engine, &url).await?;
+        assert_eq!(
+            selected.len(),
+            3,
+            "a fully-resolved file set must still prune to nprobe"
+        );
+        Ok(())
     }
 }
