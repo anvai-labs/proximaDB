@@ -22,7 +22,7 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use std::collections::HashMap;
-use tracing::{debug, info};
+use tracing::info;
 
 use crate::core::search::results::OptimizedSearchRecord;
 use crate::storage::engines::sst::core::SstEngine;
