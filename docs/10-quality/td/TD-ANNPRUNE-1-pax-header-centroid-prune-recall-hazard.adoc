@@ -1,0 +1,56 @@
+= TD-ANNPRUNE-1: Header-centroid file prune ranks unresolved files as closest — recall hazard on PAX
+:status: Accepted
+:date: 2026-11-06
+:tags: [ann, recall, pax, pruning]
+
+== Problem
+
+`discover_sstable_files_with_centroid_pruning`
+(`src/storage/engines/sst/search/mod.rs`) ranked the discovered segment set
+by legacy SST1 header-centroid distance and kept the top `nprobe` files.
+Every file that did not resolve a real centroid — the `.pax` fast path's
+`Ok(None)` (deliberate: it avoids one paid ranged GET per PAX segment per
+query), a dimension mismatch, or a header read error — was pushed at
+distance `0.0`. The ascending sort reads `0.0` as closest-possible:
+
+* **All-PAX collections** (> `MIN_FILES_FOR_PRUNING` = 10 live segments,
+  Approximate or large-Adaptive search): every file ties at 0.0, the stable
+  sort preserves input order, and `.take(nprobe)` keeps an arbitrary subset
+  unrelated to the query. The segment holding the true nearest neighbours
+  is excluded with probability `1 - nprobe/N` regardless of the query.
+  `record_vector_ann_proof()` then recorded the arbitrary subset as a
+  justified prune.
+* **Mixed PAX + legacy collections** (the sharper case found while fixing):
+  the PAX files' fake 0.0 beats every REAL distance, so PAX files
+  monopolise the probe and the genuinely-ranked legacy files are evicted
+  first — the prune inverts its own ranking exactly when it has real input.
+
+== Decision
+
+The prune requires **complete ranking input**: `resolved == all_files.len()`
+(real, dimension-matched header distances). Anything less returns every
+file. A partial ranking is not a weaker prune, it is an arbitrary one.
+
+PAX probe selection belongs to the trained Region-A0 centroid directory
+(`centroid_directory_nprobe_for`), which runs downstream of discovery and
+has been default-ON since TD-PAXDIR-1 D1–D8. The legacy header-centroid
+prune must not pretend to substitute for it.
+
+`record_vector_ann_proof()` is unchanged: it is gated on
+`selected_files.len() < all_files.len()`, which after the guard is
+reachable only when the ranking was real.
+
+== Cost note
+
+GETs rise on unconsolidated all-PAX collections (the lottery becomes a full
+scan). Mitigations: the A0 directory prune downstream, `COMPACT TABLE …
+FULL` consolidation (#2418) collapsing segment counts toward the target, and
+the removed behaviour being a recall hazard rather than a saving.
+
+== Gates
+
+Three unit tests beside the function: all-PAX never pruned; mixed
+unresolved never pruned (the eviction case); fully-resolved still prunes to
+nprobe (guards against overcorrection). The `sift_pax_recall_ratchet_test`
+lane is the recall ratchet. Test SST1 fixtures are hand-built through the
+real bincode `SstableHeader` path.
