@@ -538,6 +538,13 @@ pub(crate) fn collection_from_catalog_schema(
     {
         config = full;
     }
+    // TD-COMPACT-15: policy PROPERTIES deliberately do NOT project onto the
+    // Collection here — a derived tag would leak into the read-modify-write
+    // catalog saves that also load through this mapping (update_stats,
+    // update_collection), baking policy into `tags`/`config_json` and
+    // surviving property removal. The properties ride alongside the
+    // Collection instead (`CatalogCollectionMeta` → `CollectionFlushPlan`
+    // → `FlushParameters.collection_properties`).
 
     let location = schema
         .storage_layouts

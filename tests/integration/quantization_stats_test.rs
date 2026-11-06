@@ -257,6 +257,7 @@ async fn run_quantization_test(
         batch_ids: vec![],
         collection_config: Some(collection.clone()),
         estimated_size: 0,
+        collection_properties: None,
     };
 
     // Vectors are already in flush_params, no need for insert_batch

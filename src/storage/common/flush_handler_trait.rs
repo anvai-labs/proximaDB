@@ -195,6 +195,7 @@ impl FlushHandler for NovaFlushHandler {
     ) -> Result<()> {
         // Implement Nova-specific compaction using unified framework
         let _compaction_params = crate::storage::traits::CompactionParameters {
+            full_target_segments: None,
             full: false,
             collection_id: Some(collection_id.to_string()),
             force: false,
@@ -247,6 +248,7 @@ impl FlushHandler for SwiftFlushHandler {
     ) -> Result<()> {
         // Implement Swift-specific compaction using unified framework
         let _compaction_params = crate::storage::traits::CompactionParameters {
+            full_target_segments: None,
             full: false,
             collection_id: Some(collection_id.to_string()),
             force: false,
@@ -298,6 +300,7 @@ impl FlushHandler for HelixFlushHandler {
     ) -> Result<()> {
         // Implement Helix-specific compaction using unified framework
         let _compaction_params = crate::storage::traits::CompactionParameters {
+            full_target_segments: None,
             full: false,
             collection_id: Some(collection_id.to_string()),
             force: false,
@@ -349,6 +352,7 @@ impl FlushHandler for RaptorFlushHandler {
     ) -> Result<()> {
         // Implement Raptor-specific compaction using unified framework
         let _compaction_params = crate::storage::traits::CompactionParameters {
+            full_target_segments: None,
             full: false,
             collection_id: Some(collection_id.to_string()),
             force: false,

@@ -129,7 +129,13 @@ impl UnifiedStorageFormat for SstEngine {
         ))
     }
 
-    /// Delegate compaction to the compaction module
+    /// SST implements the cross-level FULL collapse (`compact_collection_full`),
+    /// so it honours `full` and `full_target_segments`.
+    fn supports_full_compaction(&self) -> bool {
+        true
+    }
+
+    /// Delegate compaction to the compaction module.
     async fn do_compact(&self, params: &CompactionParameters) -> Result<CompactionResult> {
         info!("🔄 SST: Starting compaction operation");
 
@@ -242,6 +248,13 @@ impl UnifiedStorageFormat for SstEngine {
         // TD-COMPACT-14: an operator FULL request collapses the collection
         // across levels instead of running one policy morsel.
         if params.full {
+            // Refuse an invalid target BEFORE the metered region: a request
+            // rejected as invalid input is not a FULL that failed, and must
+            // not move the `error` series operators alert on (#2418 review
+            // round 13).
+            if params.full_target_segments == Some(0) {
+                anyhow::bail!("target_segments must be >= 1 (got 0)");
+            }
             let full_config = self.config().compaction_config.clone().unwrap_or_default();
             let timeout = std::time::Duration::from_millis(
                 params.timeout_ms.unwrap_or(full_config.full_timeout_ms),
@@ -256,11 +269,38 @@ impl UnifiedStorageFormat for SstEngine {
                     access_tier,
                     timeout,
                     rg_tags,
+                    params.full_target_segments,
                 )
-                .await?;
+                .await;
+            // TD-COMPACT-15: one observation per FULL request — the first
+            // place pass outcomes are counted, and EVERY outcome counts.
+            // Recording only on the `Ok` path (the call used `?`) meant a
+            // declined, failed, stalled or timed-out FULL emitted no sample
+            // at all, contradicting both the metric's doc and TD-COMPACT-14.
+            // `None` means the engine finished at/below target: distinguish
+            // a real collapse from a no-op so the counter is diagnosable.
+            let stop_label = match summary.as_ref() {
+                Ok(summary) => summary
+                    .stop_reason
+                    .unwrap_or(if summary.passes_executed > 0 {
+                        "completed"
+                    } else {
+                        "at_target"
+                    }),
+                Err(_) => "error",
+            };
+            if let Some(stop_metric) =
+                crate::metrics::operational_metrics::COMPACTION_FULL_STOP.as_ref()
+            {
+                stop_metric.with_label_values(&[stop_label]).inc();
+            }
+            let summary = summary?;
             return Ok(CompactionResult {
                 success: true,
                 collections_affected: vec![collection_id],
+                bytes_read: Some(summary.bytes_read),
+                bytes_written: Some(summary.bytes_written),
+                duration_ms: Some(summary.duration_ms),
                 completed_at: chrono::Utc::now(),
                 engine_metrics: HashMap::from([
                     ("full".to_string(), serde_json::json!(true)),
@@ -287,6 +327,35 @@ impl UnifiedStorageFormat for SstEngine {
                     (
                         "pending_files".to_string(),
                         serde_json::json!(summary.pending_files),
+                    ),
+                    // Non-zero ⇒ `passes`/`bytes_*` are a lower bound (the
+                    // journal entry for that pass was gone before the loop
+                    // read it). Emitted always, so a consumer can tell
+                    // "complete" from "incomplete" without inferring it
+                    // from a zero (#2418 review round 22).
+                    (
+                        "unobserved_passes".to_string(),
+                        serde_json::json!(summary.unobserved_passes),
+                    ),
+                    // The population the loop's target actually compared
+                    // against; `segments_after` also counts AXIS-pending
+                    // segments the collapse was never able to touch
+                    // (#2418 review round 22).
+                    (
+                        "segments_compactable_after".to_string(),
+                        serde_json::json!(summary.segments_compactable_after),
+                    ),
+                    (
+                        "bytes_read".to_string(),
+                        serde_json::json!(summary.bytes_read),
+                    ),
+                    (
+                        "bytes_written".to_string(),
+                        serde_json::json!(summary.bytes_written),
+                    ),
+                    (
+                        "duration_ms".to_string(),
+                        serde_json::json!(summary.duration_ms),
                     ),
                 ]),
                 ..Default::default()

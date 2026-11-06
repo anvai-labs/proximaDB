@@ -103,6 +103,7 @@ async fn test_swift_engine_creation_and_insertion() {
         trigger_compaction: false,
         collection_config: Some(collection),
         estimated_size: 1024 * 1024, // 1MB estimate
+        collection_properties: None,
     };
 
     let flush_result = swift_engine.flush(flush_params).await.unwrap();

@@ -140,6 +140,7 @@ mod helix_integration_tests {
             batch_ids: vec![],
             collection_config: Some(collection_config),
             estimated_size: 0,
+            collection_properties: None,
         };
 
         let flush_result = engine.do_flush(&flush_params).await.unwrap();
@@ -243,6 +244,7 @@ mod helix_integration_tests {
                 batch_ids: vec![],
                 collection_config: Some(collection_config.clone()),
                 estimated_size: 0,
+                collection_properties: None,
             };
             engine.do_flush(&flush_params).await.unwrap();
         }
@@ -258,6 +260,7 @@ mod helix_integration_tests {
             priority: OperationPriority::Medium,
             collection_config: Some(collection_config.clone()),
             estimated_input_size: 0,
+            full_target_segments: None,
         };
 
         let compact_result = engine.do_compact(&compact_params).await.unwrap();
@@ -401,6 +404,7 @@ mod helix_integration_tests {
             batch_ids: vec![],
             collection_config: Some(collection_config),
             estimated_size: 0,
+            collection_properties: None,
         };
         engine.do_flush(&flush_params).await.unwrap();
 
@@ -585,6 +589,7 @@ mod helix_integration_tests {
             batch_ids: vec![],
             collection_config: Some(collection_config),
             estimated_size: 0,
+            collection_properties: None,
         };
         engine.do_flush(&flush_params).await.unwrap();
 
@@ -760,6 +765,7 @@ mod helix_integration_tests {
                 trigger_compaction: false,
                 batch_ids: vec![],
                 collection_config: Some(collection_config.clone()),
+                collection_properties: None,
                 estimated_size: 0,
             })
             .await
@@ -876,6 +882,7 @@ mod helix_integration_tests {
                 trigger_compaction: false,
                 batch_ids: vec![],
                 collection_config: Some(collection_config.clone()),
+                collection_properties: None,
                 estimated_size: 0,
             })
             .await

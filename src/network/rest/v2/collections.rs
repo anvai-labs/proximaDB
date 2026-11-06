@@ -3369,17 +3369,23 @@ pub struct PropertiesResponse {
 pub struct CompactRequest {
     #[serde(default)]
     pub full: bool,
+    /// TD-COMPACT-15 Experiment 3: per-request override of the FULL
+    /// collapse target (`[storage.compaction_config] full_target_segments`).
+    /// Must be > 0, and requires `full: true` — sending it with
+    /// `full: false` is a 400 rather than a silently dropped knob.
+    #[serde(default)]
+    pub target_segments: Option<usize>,
 }
 
 #[derive(Debug, serde::Serialize)]
 pub struct CompactResponse {
     pub collection_id: String,
     pub full: bool,
-    pub segments_before: Option<usize>,
-    pub segments_after: Option<usize>,
-    pub passes: Option<usize>,
-    pub reached_target: Option<bool>,
-    pub stop_reason: Option<String>,
+    /// The provenance fields, EMBEDDED rather than hand-copied: a field added
+    /// to `FullCompactionMetrics` reaches this wire automatically (#2418
+    /// review round 16; the hand-copy drift was TD-COMPACT-15 F4).
+    #[serde(flatten)]
+    pub metrics: crate::storage::traits::FullCompactionMetrics,
 }
 
 /// `PATCH /api/v2/collections/{id}/properties` — set/update table properties.
@@ -3403,6 +3409,12 @@ pub async fn patch_collection_properties_v2(
     // after the catalog read below; this catches standalone errors early).
     proximadb_cache::policy::validate_cache_properties(&request.properties)
         .map_err(|e| ApiError::InvalidArgument(format!("invalid cache property: {e}")))?;
+    // compaction.* too (#2418 review round 16): every other door (ALTER
+    // TABLE SET, CREATE TABLE WITH) refuses `strategy='consolidate'` and the
+    // unconsumed target size; accepting them HERE answered 200 for keys the
+    // flush resolver would never honour.
+    proximadb_storage_common::validate_compaction_properties(&request.properties)
+        .map_err(|e| ApiError::InvalidArgument(format!("invalid table property: {e}")))?;
 
     // TODO: read current properties from the catalog, merge, validate the
     // merged set (case-variant duplicates), write back. For now the
@@ -3448,34 +3460,37 @@ pub async fn post_collection_compact_v2(
     else {
         return Err(ApiError::CollectionNotFound(collection_id.clone()));
     };
-    let full = body.map(|Json(request)| request.full).unwrap_or(false);
+    let (full, target_segments) = body
+        .map(|Json(request)| (request.full, request.target_segments))
+        .unwrap_or((false, None));
+    if target_segments.is_some_and(|t| t == 0) {
+        return Err(ApiError::InvalidArgument(
+            "target_segments must be greater than zero".to_string(),
+        ));
+    }
+    // Fail closed on the same reasoning the Flight side rejects 0: a knob
+    // that is accepted and then silently dropped reports success for work
+    // that never happened. `target_segments` only means anything to the
+    // cross-level collapse.
+    if target_segments.is_some() && !full {
+        return Err(ApiError::InvalidArgument(
+            "target_segments requires \"full\": true (it bounds the cross-level collapse)"
+                .to_string(),
+        ));
+    }
     let result = state
         .vector_operations_service
         .unified_engine()
-        .compact_collection_full(&collection.id, Some(&collection), full)
+        .compact_collection_full(&collection.id, Some(&collection), full, target_segments)
         .await
         .map_err(|e| ApiError::Internal(format!("compaction: {e}")))?;
-    let metric = |key: &str| {
-        result
-            .engine_metrics
-            .get(key)
-            .and_then(|value| value.as_u64())
-            .map(|value| value as usize)
-    };
+    // Extracted once so REST, Flight and DDL report the same keys and
+    // cannot drift (TD-COMPACT-15 review).
+    let metrics = result.full_compaction_metrics();
     Ok(Json(CompactResponse {
         collection_id,
         full,
-        segments_before: metric("segments_before"),
-        segments_after: metric("segments_after"),
-        passes: metric("passes"),
-        reached_target: result
-            .engine_metrics
-            .get("reached_target")
-            .and_then(|value| value.as_bool()),
-        stop_reason: result
-            .engine_metrics
-            .get("stop_reason")
-            .and_then(|value| value.as_str().map(str::to_string)),
+        metrics,
     }))
 }
 

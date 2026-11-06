@@ -1012,9 +1012,16 @@ impl StorageConfig {
     /// from silently falling back to code defaults while another honors TOML.
     pub fn effective_sst_config(&self) -> SstConfig {
         let mut config = self.sst_config.clone().unwrap_or_default();
-        if config.compaction_config.is_none() {
-            config.compaction_config = Some(self.compaction_config.clone());
-        }
+        // Field-level merge for EVERY field via
+        // `CompactionConfig::merge_section_over` — the section states its
+        // knobs, the top level supplies whatever the section leaves
+        // unstated (TD-COMPACT-15 F1, closed for all 23 fields in
+        // #2418 review round 22; the doc on that function carries the
+        // presence rules and the one residual edge).
+        config.compaction_config = Some(CompactionConfig::merge_section_over(
+            &self.compaction_config,
+            config.compaction_config.as_ref(),
+        ));
         config
     }
 

@@ -3,6 +3,21 @@
 :date: 2026-11-03
 :tags: [compaction, lsm, policy, performance]
 
+[IMPORTANT]
+====
+**Status as of 2026-11-05 (#2418):** only the OPERATOR half of this TD
+ships — `COMPACT TABLE ... FULL` with the smallest-first grouping, the
+per-request `target_segments` override and measured provenance. The
+BACKGROUND consolidate strategy (server `consolidate_strategy`, the
+`compaction.strategy` property and tag) is **refused** because its trigger
+scheduled an ordinary L0 morsel rather than the consolidate merge and could
+re-fire on every flush without converging; see
+xref:TD-COMPACT-16-background-consolidate-does-not-converge.adoc[TD-COMPACT-16].
+Sections below that describe the background trigger, the server-default
+install, the visibility carrier and the write-amp guardrail record how that
+path was built and reviewed; they are not live behaviour.
+====
+
 == Problem
 
 The leveled compaction policy never merges across levels and never triggers
@@ -37,6 +52,9 @@ the cache policy:
 ```
 collection property > server [storage.compaction_config] > code default
 ```
+
+(As designed. Background consolidate is refused — TD-COMPACT-16 — so this
+chain is not live; see the status banner.)
 
 | value | behavior | best for |
 |---|---|---|
@@ -122,36 +140,105 @@ would rewrite the entire 1 TB on every flush. The guardrail:
   degrade to `hybrid` for that collection
 * The degradation is reported in the collection's status
 
-=== Property surface — as implemented (#2407)
+=== Property surface — as designed (#2407); the background half is refused
 
-Resolution is layered like the cache policy (TD-COMPACT-2b), but only the
-tag channel is resolved at flush time today:
+NOTE: this section records the background-consolidate resolution as it was
+designed and reviewed. That half is refused (TD-COMPACT-16): today the
+server layer below is never consulted and `consolidate` is refused at every
+door. See "Surfaces, AS SHIPPED" further down for live behaviour.
+
+
+Resolution is a 4-layer chain resolved by one pure function
+(`resolve_effective_strategy`: property > tag > server > code). An
+explicit `hybrid` at any layer WINS over a consolidate default below it —
+silence falls through, an explicit choice does not:
 
 ```
-flush trigger:  TAG `compaction.strategy:consolidate` (resolve_strategy_from_tags)
-                  — the `compaction:off` tag disarms everything (wins first)
-server TOML:     [storage.compaction_config] consolidate_target_file_size_mb (512),
-                  consolidate_write_amp_limit (100) — knobs only, NO strategy field
-code default:    hybrid (the current behavior)
+collection PROPERTY `compaction.strategy`
+    (carried on the flush path: catalog walk -> CatalogCollectionMeta
+     -> CollectionFlushPlan.properties -> FlushParameters
+     .collection_properties — the engine-facing proto Collection has no
+     properties field, and projecting onto its tags would leak into
+     read-modify-write catalog saves, baking policy into `tags`/
+     `config_json` and surviving property removal)
+  > operator TAG `compaction.strategy:consolidate` (legacy channel)
+  > server TOML  [storage.compaction_config] consolidate_strategy = "hybrid"|"consolidate"
+  > code default hybrid
 ```
 
-Live surfaces:
-* Collection tag `compaction.strategy:consolidate` (the resolved channel)
-* `ALTER TABLE t SET ('compaction.*')` — validated at SET time
-  (`validate_compaction_properties`; unknown keys/values rejected)
-* Server TOML knobs above
+The `compaction:off` tag disarms all background compaction including
+consolidate (checked first, unchanged from TD-WLP-2).
+`compaction.target_file_size_mb` is **refused at the door** (#2418 review
+round 7): neither the consolidate trigger nor the FULL merge geometry reads
+a per-collection value, so accepting it would be inert. Both read the
+server `consolidate_target_file_size_mb` (default 512). See KNOWN GAP
+below for what closing it takes.
+
+PINNED TARGETS BOUND THE FOLLOW-UP CHAIN (final design, #2418 review
+round 11). A per-request `target_segments > 1` sets a live-segment floor
+(`SstCompactionTask.min_live_segments`) that every follow-up inherits. The
+worker still runs the follow-up chain, including the layout/training
+promotion, but `follow_up_input_cap` trims each follow-up to at most
+`live - floor + 1` inputs (merging `g` inputs removes `g - 1` segments). At
+the floor a plain merge is skipped, while a TRAINING follow-up still runs as
+a single-input rewrite that trains without changing the count.
+
+History: rounds 5-10 SUPPRESSED the follow-up instead (measured: without
+any bound a target-2 request collapses to 1). That kept the target but left
+outputs untrained (~180 GETs/104 MB per query vs 20-51 trained), could drop
+a concurrent flush's training guard, and was then patched with a counter,
+a WARN and a harness delta. Bounding the merge removes the cause, so the
+counter and the harness delta are gone; the harness's trained-geometry gate
+(every settled segment must carry a coarse A0 directory) remains the
+refusal for an untrained arm.
+
+Scope of "exact stop": the floor binds THIS request's chain. A flush-driven
+background morsel from a concurrent WRITE can still merge below it. On a
+settled bed — the case the override exists for — no such write arrives.
+
+KNOWN GAP (open slice, found by the #2418 review round 3): the FULL
+collapse's group-size target reads the SERVER
+`consolidate_target_file_size_mb` directly
+(`compaction.rs` `compact_collection_full`), and `CompactionParameters`
+carries no properties, so a per-collection
+`compaction.target_file_size_mb` does not reach the merge geometry. A
+collection honouring it would compute a trigger target the merge cannot
+reach and re-arm on every flush, which is why it is refused rather than
+half-honoured. Closing it means plumbing the resolved target into the
+compaction task alongside `full_target_segments`, then lifting the
+refusal in the same change; until then operators wanting a specific merge
+size must set the server value.
+
+SERVER-DEFAULT VISIBILITY (history, superseded by TD-COMPACT-16):
+rounds 5-8 built a server `consolidate_strategy` default and made
+`FlushParameters.collection_properties` an `Option` so it applied only where
+the catalog had been consulted. Background consolidate is now refused, so
+that server layer and its decision function are gone; the `Option` carrier
+stays as TD-COMPACT-16's prerequisite (F7).
+
+Surfaces, AS SHIPPED:
+* `COMPACT TABLE t [FULL]`, REST `POST /collections/{id}/compact` and the
+  Flight `compact_collection` action, with optional `target_segments` — the
+  live surface.
+* `ALTER TABLE t SET (...)` / `CREATE TABLE ... WITH (...)` — validate
+  `compaction.*`: `compaction.strategy = 'hybrid'` is accepted; `'consolidate'`
+  and `compaction.target_file_size_mb` are REFUSED, each naming the reason.
+* Collection tag `compaction.strategy:consolidate` — not validated at create;
+  it runs hybrid with a once-per-collection WARN.
+* REST `PATCH /collections/{id}/properties` and `POST /collections`
+  `properties` persist nothing on this branch (stubs); #2419 makes both fail
+  closed.
+* Server TOML: `consolidate_target_file_size_mb` (read by the FULL merge's
+  grouping; 0 fails boot); `consolidate_strategy = "consolidate"` fails boot;
+  `consolidate_strategy = "hybrid"` and `consolidate_write_amp_limit` are
+  accepted with a deprecation WARN (they shipped as settings in #2407, so
+  refusing them would break upgrades).
 
 NOTE: the legacy `[storage.compaction_config] strategy` field is the
-count|size level heuristic (`compaction_utils.rs`) — setting it to
-`consolidate` is dead config (falls through the `_` arm to count/size).
-Do not use it for this strategy; a dedicated server-level default needs
-its own field if ever wanted.
-
-Wiring follow-up (open): `resolve_strategy_from_properties` is exported
-but has no caller — the `compaction.strategy` PROPERTY is validated at
-SET yet not resolved at flush, so property-only configuration is inert
-until the property channel is plumbed into the flush trigger (or
-properties are bridged to tags at collection load).
+count|size level heuristic (`compaction_utils.rs`). Since this PR it is
+strictly validated (`count|size|hybrid`) — setting `consolidate` (or a
+typo) aborts startup with an actionable message instead of silently
+falling through the `_` arm to count/size (the dead-config hazard).
 
 === Interaction with COMPACT TABLE FULL
 
@@ -223,11 +310,11 @@ not yet measured end-to-end).
 === 3. Various targets — partially measured
 
 Build-time S=1/2/3/4 curve above; the compact-path curve (S=1, S=2 on
-the same collapsed bed) is open. NOTE: the compact path currently has
-no target plumbing — the Flight `compact_collection` body carries only
-`full` (collapses to the `full_target_segments` default of 1) — so an
-S=2 arm needs either a `target_segments` body field or the wired
-`compaction.*` property channel, not just `--max-segments 2`.
+the same collapsed bed) is open. UNLOCKED by this PR: the Flight
+`compact_collection` body now accepts `target_segments` (validated > 0,
+overriding `[storage.compaction_config] full_target_segments`) and the
+harness wires it as `--compact-full-target-segments`; an S=2 arm no
+longer needs hand-edited server config.
 
 === 4. Write-heavy stress — open
 
@@ -253,3 +340,275 @@ Verify the guardrail prevents the 1 TB rewrite catastrophe.
 * TD-TIER-1 E1 — the fragment ladder (the admission ceiling analysis
   that identified the compaction-policy gap)
 * ADR-076 / ADR-086 / ADR-088 — the compaction admission framework
+
+== Review follow-ups (#2418 round 7, deferred by decision)
+
+The merge gate was set to "no correctness or mandate findings"
+(2026-11-05). Round 7's correctness items were fixed in-PR: the inert
+`compaction.target_file_size_mb` property is refused at the door; tag
+opt-out visibility was tightened (later superseded by the round-8
+`Option` carrier, see SERVER-DEFAULT VISIBILITY above); the harness measures
+promotion suppression instead of inferring it from a CLI flag; a stated 0
+for either consolidate knob fails boot; the suppression counter moves
+only on a successful pass. Filed, not fixed:
+
+* *COMPACT-15-F1 — `merge_section_over` covers only the three
+  `consolidate_*` fields.* `full_target_segments`, `full_max_passes`,
+  `full_timeout_ms`, `spill_enabled`, the thresholds etc. are still taken
+  wholesale from an SST section, as before this TD. Closing it means
+  making every `CompactionConfig` field `Option` (or merging from raw
+  TOML).
+* *COMPACT-15-F2 — the process-global `SHARED_COMPACTION_CONFIG` is a
+  symptom fix.* The real defect is `FlushExecutionCoordinator::engine_for`
+  building the flush engine with `SstEngine::new()` /
+  `SstConfig::default()`, so its compaction manager also runs default
+  budget/spill/FULL knobs, and the global is last-writer-wins across
+  in-process `ProximaDB` instances. Build that engine from
+  `effective_sst_config()` instead and delete the global.
+* *COMPACT-15-F3 — catalog property clones.* `CatalogCollectionMeta`
+  clones each collection's whole `schema.properties` (incl.
+  `collection.config_json`, `stats.*`) on every catalog walk, including
+  for callers that discard it, and `auto_flush_driver` does so twice per
+  tick. Filter to the `compaction.`/`cache.` prefixes at construction.
+* *COMPACT-15-F4 — REST/DDL copy `FullCompactionMetrics` field-by-field.*
+  Flight serializes the struct; REST `CompactResponse` and DDL
+  `CompactSummary` copy all nine fields by hand, so a new field silently
+  misses two surfaces. Embed with `#[serde(flatten)]` / hold the struct.
+
+Round 8 (#2418): the server default was inert for every property-less
+collection — fixed by the `Option` carrier above. Also fixed: the
+`compaction.target_file_size_mb` unknown-key hint no longer suggests a
+refused key; the dead `tags_state_compaction_strategy` helper and its doc
+slip are gone; the FULL `error` metric documents what it does not count;
+the dead-config regression test is now pure (no process-global mutation,
+mandate #11). F1 (partial section merge) and F3 (catalog property clones)
+were raised again and stay filed.
+
+Round 11 (#2418): suppression replaced by the floor-bounded follow-up (see
+PINNED TARGETS BOUND THE FOLLOW-UP CHAIN); `CREATE TABLE ... WITH` now
+validates `compaction.*` like `ALTER TABLE ... SET`; any stated
+`consolidate_strategy` fails boot (it is read by nothing while background
+consolidate is refused, and "hybrid" is already the default); the
+refused-consolidate WARN is logged once per collection. Filed:
+
+* *COMPACT-15-F5 — seam refusals surface as 500 / INTERNAL.* The trait-seam
+  bails ("engine has no cross-level FULL", zero target, target without
+  full) are mapped to `ApiError::Internal` / `TonicStatus::internal`, so a
+  permanent client error looks transient. Only reachable from an engine
+  without FULL today (REST/Flight front SST). Map seam validation errors to
+  400 / INVALID_ARGUMENT with a typed error.
+* *COMPACT-15-F6 — the target rule lives in four places* (REST, Flight, the
+  trait seam, `compact_collection_full`) with different wording. Keep the
+  seam as the authority and reduce the surfaces to error mapping.
+* *COMPACT-15-F7 — the loaded/not-loaded property carrier has no live
+  consumer* beyond the refused-consolidate WARN. It is kept deliberately as
+  TD-COMPACT-16's prerequisite (the background rework needs to know whether
+  the catalog was consulted); if that rework is abandoned, remove it.
+
+Round 12 (#2418): the floor's single-input rewrite is reserved for an L0
+follow-up in the training chain (the threshold alone also matched every
+follow-up after an L0-sourced pass, so it could rewrite a trained L1+
+segment); a transient LIST failure no longer drops the promotion — it falls
+back to the one follow-up that cannot reduce the count, a single-input
+rewrite. Filed:
+
+* *COMPACT-15-F8 — the floor check re-LISTs.* `bound_follow_up_to_floor`
+  runs its own `discover_compactable_files` right after
+  `check_compaction_needed` did the same discovery, one extra object-store
+  round trip per bounded follow-up (operator FULL with a target > 1 only).
+  Return the live count and sizes with the task instead.
+
+Round 14 (#2418): the deprecation notes for dead #2407 knobs are emitted
+from `ProximaDB::start` (via `CompactionConfig::deprecation_notes`) — config
+validation runs before the tracing subscriber exists, so a warning there was
+dropped; the floor's single-input rewrite picks an input that is actually
+UNTRAINED (shared `segment_is_untrained_on`) and is skipped when none is;
+the Flight `full` field must be a boolean (`"true"` used to run a silent
+plain compaction); both e2e compact contracts now request
+`target_segments: 2` — the config default is 1, so only a non-default target
+proves the override reaches the engine and exercises the floor end to end.
+Scope note: the floor binds this request's own follow-up chain; a morsel
+from another worker or a concurrent flush can still merge below it. Raised
+again and kept filed: F1, F3, F5/F6, F7.
+
+Round 15 (#2418): the promotion picker is one function,
+`narrow_to_promotion_candidate`, used by the normal path AND the
+LIST-failure fallback (which had kept `input_files[0]` with a stale
+multi-file `input_bytes`); it applies the same size floor as the flush
+trigger (`training_compaction_min_bytes`, PROXIMADB_TRAINING_COMPACTION_MIN_MB)
+and sets `input_bytes` to the chosen file's real size. `flush_and_compact`
+refuses a non-boolean `full` like `compact_collection`; the VIPER compaction
+section's deprecated values are reported at startup too. The FULL byte
+counters are a lower bound on the wire as well as in the struct doc (worker
+follow-ups are not summed) — documented in TD-COMPACT-14; giving the wire
+fields an explicit scope marker is filed with F5/F6.
+
+Round 16 (#2418): the FULL byte counters carry their scope on the wire
+(`bytes_scope: "request_passes_lower_bound"` in FullCompactionMetrics, so
+REST/Flight/DDL cannot present them as the request's total I/O), and the
+REST/DDL provenance structs EMBED FullCompactionMetrics instead of hand-
+copying nine fields (the drift TD-COMPACT-15 F4 flagged). The dead server
+layer is gone from `resolve_effective_strategy` (property > tag > code; the
+`None` parameter invited wiring a server default back without the
+convergence gate) along with `consolidate_write_amp_limit_or_default` and
+`DEFAULT_CONSOLIDATE_WRITE_AMP_LIMIT` (no callers); the field stays only so
+a config naming it parses and gets the deprecation note. PATCH /properties
+on this branch validates `compaction.*` like every other door. The
+'untrained' predicate is defined once (the boolean view of
+untrained_segment_size_on). The legacy `strategy` error names its
+case-sensitive match; strictness stays (a case variant booted before but
+silently ran as hybrid — that is the dead-config class, named at boot).
+F4 is CLOSED by the embedded structs.
+
+Round 17 (#2418): FULL-loop progress is measured from the LIVE COUNT, not
+the pass-outcome journal — the journal is bounded (64) and shared
+process-wide, so a busy server could evict a live pass's entry between
+insert and take, ending the collapse with a false no_progress and
+under-counting the provenance; a journal miss after quiescence now counts
+as the pass it was (bytes lost, scope already says lower bound), and
+stagnation is three scheduled-and-quiesced passes that do not reduce the
+live count. A kept input missing from the floor's re-LIST no longer counts
+as 0 bytes (memory admission would under-reserve); it fails the bound to
+the safe paths. The floor LIST gets ONE retry before dropping a floor-legal
+plain merge (nothing re-drives it on a settled bed). bytes_scope follows
+the extraction source — request_passes_lower_bound for FULL,
+request_total for a plain compaction whose bytes are the top-level
+canonical fields. The refused-consolidate WARNED set is bounded (clears at
+1024 URLs). F5 (500 for seam refusals) was raised again and stays filed —
+reachable only on non-SST engines today.
+
+Round 20 (#2418, on the rebased final head): the loop-top live-count
+stagnation break is REMOVED — a flat count with passes completing means
+concurrent ingest is offsetting the merges (the collapse is working; run to
+max_passes/deadline), and the same break shadowed the schedule-time
+"contended" reason; completions (journal or eviction-inferred) now reset
+the contention counter, and only the schedule-false branch produces
+"contended". bound_follow_up_to_floor gathers the kept sizes BEFORE
+mutating the task, so an Err leaves it untouched (truncation-then-lookup
+left a torn task: the retry scheduled a 2-input morsel with the 4-input
+byte sum, and the promotion fallback narrowed a list that may have lost
+the untrained input). Config-level full_target_segments = 0 fails boot
+(.max(1) was the knob-silently-rewritten hazard the four Some(0) doors
+reject). supports_full_compaction's doc states the fail-closed contract.
+F4 (re-LIST per follow-up) stays filed as F8.
+
+Round 21 (#2418): two defects in the round-20 fixes.
+
+* `passes` is measured provenance again — observed completions only. Round
+  20 counted a journal MISS as an executed pass, but `pass_outcomes` is a
+  shared 64-entry map that evicts an arbitrary key, and a pass's OWN
+  follow-up can evict its entry before quiescence returns, so `passes` (and
+  the `completed` vs `at_target` metric label derived from it) over-reported
+  real merges. A miss is now neither a completion nor stagnation: a separate
+  `rounds` counter bounds the loop against `full_max_passes`, the deadline
+  still applies, and the contention counter is named `contended_rounds` for
+  what it actually tracks. `no_progress` is therefore not a reachable stop
+  reason, and the metric's doc says so.
+* The floor trim kept the FIRST `keep` inputs, but the task's input list
+  arrives sorted oldest-first and in an LSM the oldest segments have
+  absorbed the most merges — i.e. they are the LARGEST. A floor-bounded
+  follow-up was rewriting the biggest segments, inverting the smallest-first
+  policy (and the ~3.6x write-amp advantage) the FULL loop itself applies.
+  It now sorts the kept set by the sizes already gathered.
+* An input absent from the fresh floor discovery was retired by a concurrent
+  flush/compaction; it is DROPPED (not ours to merge) instead of raising an
+  error that the round-20 retry then re-raised identically — a no-op retry
+  for a deterministic failure. The retry remains for a genuinely transient
+  LIST error.
+* The harness gate no longer kills every prior invocation: an absent
+  `--compact-full-target-segments` DEFAULTS to `--max-segments` (the
+  reproduce command this TD documents was among the casualties); a
+  DISAGREEING override is still refused. Both verified by running it.
+
+Filed:
+
+* *COMPACT-15-F9 — REST compact drops `full`/`target_segments` when a body
+  arrives without a Content-Type.* `Option<Json<CompactRequest>>` yields
+  `None` under axum 0.8's `OptionalFromRequest` both for "no body" (the
+  documented plain-compact form) and for "body present, no Content-Type",
+  so the latter answers 200 with `full: false` after a plain pass — the
+  silent-drop class this PR fail-closes elsewhere. Pre-existing for `full`.
+  Fixing it means either requiring the extractor (an API break for the
+  documented body-less form) or inspecting Content-Length, so it needs a
+  deliberate API decision rather than a review-round patch.
+
+== Round 22 (#2418)
+
+Two correctness defects, both in code earlier rounds had touched:
+
+* **F1 widened.** `merge_section_over` closed the lose-the-top-level class
+  for 3 of **23** fields — and the 20 left included `full_target_segments`,
+  which THIS PR made load-bearing (the FULL collapse target and the
+  follow-up floor both read it). An operator setting top-level
+  `full_target_segments = 3` plus an SST section holding only
+  `l0_file_threshold = 8` got `full_target_segments = 1` (the section's
+  serde default), so a bare `COMPACT TABLE ... FULL` collapsed to one
+  segment. The merge is now per-field for every field: `Option` fields keep
+  their true `is_none()` presence signal, concrete fields treat "equals the
+  code default" as unstated. `merge_section_over_covers_every_field`
+  destructures the struct with no rest pattern, so adding a field FAILS TO
+  COMPILE until it is listed.
+* **Provenance under-reporting.** Round 21 stopped counting an unobserved
+  pass, which was right, but left the journal evicting an ARBITRARY key —
+  so a real multi-segment collapse could report `passes: 0, bytes_read: 0`
+  beside `reached_target: true`. Eviction now skips keys a FULL loop is
+  awaiting, and a miss that still happens is counted into a new
+  `unobserved_passes` (summary + `engine_metrics`) so the figures are
+  declared a lower bound instead of presenting a silent zero as fact.
+
+Also fixed: `full_max_passes = 0` now fails boot (it was clamped to 1, so 0
+silently meant "one pass", not "unbounded" — the same knob-silently-rewritten
+class as `full_target_segments`); the floor-bounded follow-up returns
+"do not schedule" rather than `Err` when its inputs were concurrently
+retired (an `Err` there spent a second full LIST to fail identically — the
+no-op-retry class round 21 claimed to remove, left on this path);
+`narrow_to_promotion_candidate` picks the SMALLEST qualifying input instead
+of the first, which is oldest and therefore largest in an LSM (the same
+inversion round 21 fixed for the multi-input path); the flush path's
+`collection_properties: None` now emits a once-per-collection DEBUG naming
+the blind spot, so the `Option` is no longer inert at its only consumer; and
+`segments_compactable_after` is reported beside `segments_after`, which also
+counts AXIS-pending segments the collapse could never touch.
+
+Harness: `--compact-full-target-segments` is NOT defaulted to
+`--max-segments`. Defaulting it silently changed what an existing
+`--compact-full-before-measure` run measures (the bed settled at two
+segments where it had settled at one), so runs recorded either side of this
+PR would both pass the gate while being incomparable in the evidence ledger.
+Unset keeps the server-resolved behaviour; a stated value must still agree.
+
+Filed: **COMPACT-15-F10** — observing section presence properly needs an
+all-`Option` overlay type for `[storage.sst_config.compaction_config]`. The
+residual edge until then: an operator who writes a section value EQUAL to
+the code default while the top level differs gets the top-level value. Both
+readings lose that intent today, and the common case (a section stating one
+knob) is now correct for all 23 fields.
+
+Round 23 (#2418): the round-22 commit itself carried a stranded `#[test]` —
+the round-20 boot-door test `config_level_full_target_segments_zero_fails_boot`
+lost its attribute to an insert that anchored on the bare `fn` line, so it
+NEVER RAN while the suite stayed green (the orphaned attribute duplicated
+onto the new exhaustiveness guard instead). Restored, and the missing
+`full_max_passes = 0` boot-door coverage added beside it. Also:
+`awaited_outcomes` entries leaked on the contended/schedule-error paths
+(insert before `schedule_compaction`; the key is process-lifetime and
+unbounded), now registered only after a successful schedule; the stale
+`effective_sst_config` comment still describing the 3-field merge is
+corrected; and `--compact-full-target-segments` without
+`--compact-full-before-measure` now refuses at parse time instead of being
+silently dropped while result.json implied the geometry was pinned.
+
+Scoped verification of the round-23 commit (fresh-context): the one must-fix
+(the duplicate `#[test]` stacked by the repair inserts) plus the round-20
+doc still glued to the exhaustiveness guard are fixed here; a pre-existing
+same-class stranding (`check_compaction_needed`'s doc on
+`take_pass_outcome`) moved home too. One residual filed, not fixed —
+**COMPACT-15-F11**: `awaited_outcomes` keys inserted before the
+`await_compaction_quiescence` await are leak-free on every enumerated
+SYNCHRONOUS exit, but if the handler future is DROPPED at that await (a
+client disconnect during the full remaining deadline), the key stays in the
+process-lifetime set forever and permanently pins its journal entry; with
+>=64 pinned, journal eviction stops entirely. Round 23 narrowed the leak
+(parent also leaked on contended/schedule-error paths) but did not close
+this window. To close: register via a guard struct whose Drop removes the
+key (RAII), so a cancelled future unwinds the registration.

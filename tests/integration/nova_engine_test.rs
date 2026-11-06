@@ -116,6 +116,7 @@ async fn flush_one(
         trigger_compaction: false,
         collection_config: Some(collection.clone()),
         estimated_size: 1024,
+        collection_properties: None,
     };
     let result = nova_engine.flush(flush_params).await.unwrap();
     assert!(result.success, "flush must succeed");
@@ -152,6 +153,7 @@ async fn test_nova_engine_creation_and_insertion() {
         trigger_compaction: false,
         collection_config: Some(collection),
         estimated_size: 1024 * 1024,
+        collection_properties: None,
     };
 
     println!(
@@ -222,6 +224,7 @@ async fn test_nova_flush_basic() {
         trigger_compaction: false,
         collection_config: Some(collection),
         estimated_size: 1024 * 1024,
+        collection_properties: None,
     };
 
     println!(
@@ -305,6 +308,7 @@ async fn test_nova_search_basic() {
         trigger_compaction: false,
         collection_config: Some(collection.clone()),
         estimated_size: 1024 * 1024,
+        collection_properties: None,
     };
 
     println!("🧪 Test: Flushing {} vectors", vectors.len());
@@ -402,6 +406,7 @@ async fn test_nova_compact_basic() {
             trigger_compaction: false,
             collection_config: Some(collection.clone()),
             estimated_size: 1024 * 1024,
+            collection_properties: None,
         };
 
         println!("🧪 Test: Flushing batch {}", i);
@@ -411,6 +416,7 @@ async fn test_nova_compact_basic() {
 
     // Compact
     let compact_params = CompactionParameters {
+        full_target_segments: None,
         full: false,
         collection_id: Some(collection_id.to_string()),
         collection_config: Some(collection),

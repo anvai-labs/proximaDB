@@ -895,8 +895,12 @@ impl SstEngine {
         let compaction_due_threshold = if suppress_recovery_compaction {
             None
         } else {
-            self.should_trigger_compaction(storage_url, collection_tags)
-                .await?
+            self.should_trigger_compaction(
+                storage_url,
+                collection_tags,
+                params.collection_properties.as_ref(),
+            )
+            .await?
         };
 
         // TD-WLP-7 (ADR-061 D3): schedule compaction when armed. Before
@@ -1131,49 +1135,82 @@ impl SstEngine {
         &self,
         storage_url: &str,
         tags: &[String],
+        loaded_properties: Option<&std::collections::HashMap<String, String>>,
     ) -> Result<Option<usize>> {
         if !proximadb_storage_common::resolve_compaction_armed(tags) {
             return Ok(None);
         }
-        // TD-COMPACT-15: the consolidate strategy targets a file count
-        // derived from total_bytes / target_file_size_mb, not an L0
-        // threshold. When the live segment count exceeds that target,
-        // compaction fires immediately (the greedy smallest-first group in
-        // compact_collection_full does the merge).
-        let strategy = proximadb_storage_common::resolve_strategy_from_tags(tags);
-        if strategy == proximadb_storage_common::CompactionStrategy::Consolidate {
-            crate::metrics::operational_metrics::CONSOLIDATE_CHECKS.inc();
-            let cfg = self.config().compaction_config.clone().unwrap_or_default();
-            let target_mb = cfg.consolidate_target_file_size_mb.max(1);
-            let write_amp_limit = cfg.consolidate_write_amp_limit;
-            let files = self
-                .discover_sstable_files(storage_url)
-                .await
-                .unwrap_or_default();
-            let total_bytes: u64 = files.iter().map(|f| f.size_bytes.unwrap_or(0)).sum();
-            let target_segments = total_bytes
-                .div_ceil(target_mb.saturating_mul(1_048_576))
-                .max(1);
-            if (files.len() as u64) <= target_segments {
-                return Ok(None); // at target — nothing due
+        // TD-COMPACT-16 (#2418 review round 10, by decision): BACKGROUND
+        // consolidate is refused. Its trigger arm returned threshold 1, which
+        // schedules an ordinary L0 threshold-1 morsel — NOT the smallest-first
+        // consolidate merge — so on L1+ segments it re-fired on every flush
+        // without converging. Boot and the property door now refuse it; a
+        // consolidate strategy that still reaches here (a legacy tag, or a
+        // property stored before this change) runs the hybrid policy below
+        // with a warning. Operators collapse with `COMPACT TABLE ... FULL`,
+        // which converges.
+        // `None` ≠ "no properties": it means THIS flush path never consulted
+        // the catalog (bulk-ingest, the WAL flush coordinator, recovery,
+        // VIPER). Collapsing the two would make a stored
+        // `compaction.strategy = 'consolidate'` invisible on those paths —
+        // the refusal NOTICE would never fire for exactly the collections
+        // whose operator needs telling (#2418 review round 22; the gap is
+        // TD-COMPACT-16's round-20 note). Can't resolve it here — the
+        // properties genuinely are not in hand — so make the blind spot
+        // OBSERVABLE instead of silent, once per collection.
+        let empty = std::collections::HashMap::new();
+        if loaded_properties.is_none() {
+            static UNCHECKED: std::sync::LazyLock<
+                std::sync::Mutex<std::collections::HashSet<String>>,
+            > = std::sync::LazyLock::new(Default::default);
+            let first = UNCHECKED
+                .lock()
+                .map(|mut seen| {
+                    if seen.len() >= 1024 {
+                        seen.clear();
+                    }
+                    seen.insert(storage_url.to_string())
+                })
+                .unwrap_or(true);
+            if first {
+                debug!(
+                    collection = %storage_url,
+                    "flush path did not load catalog properties; a stored \
+                     compaction.strategy property cannot be seen here (tags only). \
+                     TD-COMPACT-16 item 2 carries the fix."
+                );
             }
-            // Guardrail: if the collection is large relative to a typical
-            // flush, consolidating on every flush means rewriting
-            // everything each time — degrade to hybrid.
-            let expected_flush_bytes = 128u64.saturating_mul(1_048_576);
-            let write_amp = total_bytes / expected_flush_bytes.max(1);
-            if write_amp > write_amp_limit {
+        }
+        if proximadb_storage_common::resolve_effective_strategy(
+            loaded_properties.unwrap_or(&empty),
+            tags,
+        ) == proximadb_storage_common::CompactionStrategy::Consolidate
+        {
+            // Once per collection, not per flush: an ingest-heavy collection
+            // carrying the tag would otherwise emit this on every flush
+            // (#2418 review round 11). Poison-safe; a poisoned set just
+            // re-warns.
+            static WARNED: std::sync::LazyLock<
+                std::sync::Mutex<std::collections::HashSet<String>>,
+            > = std::sync::LazyLock::new(Default::default);
+            let first = WARNED
+                .lock()
+                .map(|mut warned| {
+                    // Bounded: a multi-tenant server churning collections
+                    // would otherwise grow the set forever (#2418 review
+                    // round 17). Resetting the window may re-warn old URLs —
+                    // harmless for a once-per-collection notice.
+                    if warned.len() >= 1024 {
+                        warned.clear();
+                    }
+                    warned.insert(storage_url.to_string())
+                })
+                .unwrap_or(true);
+            if first {
                 tracing::warn!(
                     storage_url = %storage_url,
-                    write_amp,
-                    limit = write_amp_limit,
-                    "TD-COMPACT-15 consolidate guardrail: degrading to hybrid"
+                    "TD-COMPACT-16: background consolidate is not supported (it does not converge); running the hybrid policy. Use COMPACT TABLE ... FULL to collapse (logged once per collection)"
                 );
-                crate::metrics::operational_metrics::CONSOLIDATE_DEGRADED.inc();
-                tracing::debug!("metric recorded");
-                // Fall through to the hybrid path below
-            } else {
-                return Ok(Some(1)); // always compact (smallest-first)
             }
         }
         let threshold =
@@ -1226,11 +1263,7 @@ impl SstEngine {
         }
         // Best-effort header sniffing (72 bytes/file); any error means "not
         // yet", never fails the flush.
-        let min_bytes = std::env::var("PROXIMADB_TRAINING_COMPACTION_MIN_MB")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(32)
-            .saturating_mul(1024 * 1024);
+        let min_bytes = training_compaction_min_bytes();
         // Only L0 files: a threshold-1 task builds an L0 morsel, so an
         // untrained L1+ file (block clustering off, a trainer fallback, a
         // pre-trainer legacy file) could never self-clear and would re-arm a
@@ -1254,24 +1287,58 @@ impl SstEngine {
     /// TD-COMPACT-5: is this segment untrained (no A0 coarse directory) and
     /// big enough to be worth a training pass? One stat + one 72-byte read.
     async fn segment_is_untrained(&self, path: &str, min_bytes: u64) -> Result<bool> {
-        use proximadb_storage_common::segment_layout::{
-            SEG_HEADER_PREFIX_LEN, SegmentHeaderPrefix,
-        };
-        let fs = self.filesystem().get_filesystem(path)?;
-        let meta = fs.metadata(path).await?;
-        if meta.size < min_bytes {
-            return Ok(false);
-        }
-        let header_bytes = fs
-            .read_range(path, 0, (SEG_HEADER_PREFIX_LEN as u64).min(meta.size))
-            .await?;
-        Ok(match SegmentHeaderPrefix::parse(&header_bytes) {
-            Ok(h) => h.a0_len == 0,
-            // Not a coalesced segment (legacy layout) — training does not
-            // apply; leave it to the count arm.
-            Err(_) => false,
-        })
+        segment_is_untrained_on(self.filesystem(), path, min_bytes).await
     }
+}
+
+/// TD-COMPACT-5: the minimum on-disk size for a segment to be WORTH a
+/// training rewrite (`PROXIMADB_TRAINING_COMPACTION_MIN_MB`, default 32).
+/// One accessor so the flush trigger and the compaction worker's floor bound
+/// agree on which segments a promotion should touch (#2418 review round 15).
+pub(crate) fn training_compaction_min_bytes() -> u64 {
+    std::env::var("PROXIMADB_TRAINING_COMPACTION_MIN_MB")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(32)
+        .saturating_mul(1024 * 1024)
+}
+
+/// The size of `path` when it is an untrained segment worth promoting (no A0
+/// coarse directory and at least `min_bytes`), else `None`. Callers that pick
+/// a promotion candidate need the size too, for the task's `input_bytes`.
+pub(crate) async fn untrained_segment_size_on(
+    filesystem: &crate::storage::persistence::filesystem::FilesystemFactory,
+    path: &str,
+    min_bytes: u64,
+) -> Result<Option<u64>> {
+    use proximadb_storage_common::segment_layout::{SEG_HEADER_PREFIX_LEN, SegmentHeaderPrefix};
+    let fs = filesystem.get_filesystem(path)?;
+    let meta = fs.metadata(path).await?;
+    if meta.size < min_bytes {
+        return Ok(None);
+    }
+    let header_bytes = fs
+        .read_range(path, 0, (SEG_HEADER_PREFIX_LEN as u64).min(meta.size))
+        .await?;
+    Ok(match SegmentHeaderPrefix::parse(&header_bytes) {
+        Ok(h) if h.a0_len == 0 => Some(meta.size),
+        _ => None,
+    })
+}
+
+/// TD-COMPACT-5: is this segment untrained (no A0 coarse directory) and at
+/// least `min_bytes`? One stat + one 72-byte read. Defined ONCE, as the
+/// boolean view of [`untrained_segment_size_on`], so the flush trigger and
+/// the compaction worker's floor bound cannot disagree on what "untrained"
+/// means (#2418 review round 16).
+pub(crate) async fn segment_is_untrained_on(
+    filesystem: &crate::storage::persistence::filesystem::FilesystemFactory,
+    path: &str,
+    min_bytes: u64,
+) -> Result<bool> {
+    Ok(untrained_segment_size_on(filesystem, path, min_bytes)
+        .await?
+        .is_some())
 }
 
 /// Whether a segment URL names an L0 file the compaction executor can act
@@ -1938,6 +2005,7 @@ mod statistics_observe_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use crate::storage::engines::sst::SstConfig;
     use crate::storage::persistence::filesystem::FilesystemFactory;
     use proximadb_distance_kernel::engine::UnifiedDistanceCompute;
@@ -2402,6 +2470,7 @@ mod tests {
             batch_ids: vec![],
             collection_config: Some(collection),
             estimated_size: 0,
+            collection_properties: None,
         };
 
         let result = engine
@@ -2550,6 +2619,7 @@ mod tests {
             batch_ids: vec![],
             collection_config: Some(collection),
             estimated_size: 0,
+            collection_properties: None,
         };
 
         let first = engine
@@ -2672,6 +2742,7 @@ mod tests {
             batch_ids: vec![],
             collection_config: Some(collection),
             estimated_size: 0,
+            collection_properties: None,
         };
         let result = engine
             .do_flush(&params)
@@ -2743,7 +2814,11 @@ mod tests {
         );
         assert_eq!(
             engine
-                .should_trigger_compaction(storage_url, &tags)
+                .should_trigger_compaction(
+                    storage_url,
+                    &tags,
+                    Some(&std::collections::HashMap::new())
+                )
                 .await
                 .unwrap(),
             Some(1),
@@ -2763,7 +2838,11 @@ mod tests {
         );
         assert_eq!(
             engine
-                .should_trigger_compaction(storage_url, &tags)
+                .should_trigger_compaction(
+                    storage_url,
+                    &tags,
+                    Some(&std::collections::HashMap::new())
+                )
                 .await
                 .unwrap(),
             Some(L0_COMPACTION_THRESHOLD),
@@ -2785,7 +2864,11 @@ mod tests {
             .insert(storage_url.to_string());
         assert_eq!(
             engine
-                .should_trigger_compaction(storage_url, &tags)
+                .should_trigger_compaction(
+                    storage_url,
+                    &tags,
+                    Some(&std::collections::HashMap::new())
+                )
                 .await
                 .unwrap(),
             Some(L0_COMPACTION_THRESHOLD)

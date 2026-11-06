@@ -188,6 +188,7 @@ mod helix_cold_search_recall {
                 batch_ids: vec![],
                 collection_config: Some(collection.clone()),
                 estimated_size: 0,
+                collection_properties: None,
             };
 
             let flush_result = engine.do_flush(&flush_params).await.unwrap();
@@ -329,6 +330,7 @@ mod helix_cold_search_recall {
             batch_ids: vec![],
             collection_config: Some(helix_collection.clone()),
             estimated_size: 0,
+            collection_properties: None,
         };
 
         engine.do_flush(&flush_params).await.unwrap();

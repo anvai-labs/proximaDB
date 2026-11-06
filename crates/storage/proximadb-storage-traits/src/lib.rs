@@ -68,7 +68,9 @@ pub use query::{
     ParsedQuantizationConfig, QuantizationLevel, QuantizationType, RlsRecordPredicate,
     StorageQueryContext, StorageQueryMetadata, collection_declares_axis_index,
 };
-pub use results::{CompactionResult, EngineHealth, EngineStatistics, FlushResult};
+pub use results::{
+    CompactionResult, EngineHealth, EngineStatistics, FlushResult, FullCompactionMetrics,
+};
 pub use types::{
     CompactionParameters, FlushParameters, OperationPriority, PerformanceTier,
     StorageEngineStrategy, StorageFormatStrategy,
@@ -734,22 +736,63 @@ pub trait UnifiedStorageFormat: Send + Sync {
         self.do_compact(&params).await
     }
 
+    /// Whether this engine implements the cross-level FULL collapse (and so
+    /// honours `full` / `full_target_segments`). Engines WITHOUT it get
+    /// `full: true` REFUSED by `compact_collection_full` — fail closed, no
+    /// silent fallback to a plain pass; the default is `false` so a new
+    /// engine cannot silently accept the knob.
+    fn supports_full_compaction(&self) -> bool {
+        false
+    }
+
     /// Operator compaction with an explicit mode. `full = true` asks the
     /// engine to collapse the collection toward
-    /// `CompactionConfig::full_target_segments`, crossing levels the
-    /// background policy never crosses (PG `VACUUM FULL` / Delta `OPTIMIZE`
-    /// analog). Engines without a cross-level mode keep the single explicit
-    /// pass semantics of [`Self::compact_collection`].
+    /// `CompactionConfig::full_target_segments` (or `full_target_segments`
+    /// when given), crossing levels the background policy never crosses
+    /// (PG `VACUUM FULL` / Delta `OPTIMIZE` analog). Engines without a
+    /// cross-level mode keep the single explicit pass semantics of
+    /// [`Self::compact_collection`].
     async fn compact_collection_full(
         &self,
         collection_id: &str,
         collection_config: Option<&Collection>,
         full: bool,
+        full_target_segments: Option<usize>,
     ) -> Result<CompactionResult> {
+        // Checked BEFORE the !full early return, and WITHOUT an engine
+        // condition: `target_segments` without `full` is incoherent on every
+        // engine, including the one that supports FULL. Gating this on
+        // `!supports_full_compaction()` meant the guard fired only where the
+        // knob could never be honoured and let it through on SstEngine —
+        // the single engine behind every production caller, i.e. the one
+        // case that mattered (#2418 review round 6).
+        // One validating check for every surface (REST, Flight, DDL, internal
+        // callers): 0 is rejected here rather than clamped to 1 below.
+        if full_target_segments == Some(0) {
+            anyhow::bail!("target_segments must be >= 1 (got 0)");
+        }
+        if full_target_segments.is_some() && !full {
+            anyhow::bail!(
+                "target_segments requires full: true — a plain compaction pass cannot honour a segment-count bound (this would otherwise report success for a bound that was never applied)"
+            );
+        }
+        if full_target_segments.is_some() && !self.supports_full_compaction() {
+            anyhow::bail!(
+                "this engine has no cross-level FULL collapse, so target_segments cannot be honoured; omit it (the request would otherwise report success for a bound that was never applied)"
+            );
+        }
         if !full {
             return self
                 .compact_collection(collection_id, collection_config)
                 .await;
+        }
+        // Likewise for a bare `full: true`: engines without the mode ignore
+        // it and would run one plain pass, then report success with null
+        // provenance.
+        if !self.supports_full_compaction() {
+            anyhow::bail!(
+                "this engine has no cross-level FULL collapse, so full: true cannot be honoured; use a plain compaction request instead (this would otherwise report success for a collapse that never ran)"
+            );
         }
         let params = CompactionParameters {
             collection_id: Some(collection_id.to_string()),
@@ -759,6 +802,7 @@ pub trait UnifiedStorageFormat: Send + Sync {
             force: true,
             synchronous: true,
             full: true,
+            full_target_segments, // validated >= 1 above
             ..Default::default()
         };
         self.do_compact(&params).await
