@@ -2894,16 +2894,37 @@ self.try_pax_cascade(
             return Ok(all_files);
         }
 
+        // The prune REQUIRES complete ranking input, and the refuse decision
+        // is decidable from URL suffixes alone for two file families: a
+        // `.pax` segment can never resolve a header centroid (the suffix
+        // fast path returns Ok(None) by design), and a `.arrow` segment
+        // fails the SST1 magic check. Deciding BEFORE the loop (#2439
+        // review F2) keeps a mixed collection from paying two ranged reads
+        // per legacy `.sst` file per query for a ranking the guard below
+        // would then discard.
+        if all_files
+            .iter()
+            .any(|f| f.url.ends_with(".pax") || f.url.ends_with(".arrow"))
+        {
+            tracing::debug!(
+                "SST centroid prune skipped: collection contains PAX/Arrow segments that \
+                 cannot resolve a header centroid; searching all files. PAX probe selection \
+                 is the Region-A0 directory's job."
+            );
+            return Ok(all_files);
+        }
+
         // Load headers and compute centroid distances. `resolved` counts the
-        // files that produced a REAL, dimension-matched distance — the 0.0
-        // pushed for an absent centroid, a dimension mismatch, or a read
-        // error is NOT a distance, it is "unknown", and the sort below reads
-        // it as closest-possible. A file set that is not fully resolved
-        // therefore cannot be ranked: an all-PAX collection ties at 0.0 and
-        // `.take(nprobe)` keeps an input-order subset unrelated to the query
-        // (recorded, until TD-ANNPRUNE-1, as a justified prune), and a mixed
-        // collection puts every unknown file AHEAD of every genuinely ranked
-        // one, evicting the best-ranked legacy files. PAX probe selection
+        // files that produced a REAL, dimension-matched distance — a file
+        // that yields no usable centroid (dimension mismatch, absent
+        // centroid, read error) is NOT rankable, and ranking it at any
+        // sentinel value sorts it as closest-possible. A file set that is
+        // not fully resolved therefore cannot be ranked: the pre-fix code
+        // pushed 0.0 for such files, so a mixed collection put every
+        // unresolved file AHEAD of every genuinely ranked one, evicting the
+        // best-ranked legacy files — and an all-PAX collection tied at 0.0,
+        // keeping an input-order subset unrelated to the query (recorded,
+        // until TD-ANNPRUNE-1, as a justified prune). PAX probe selection
         // belongs to the trained Region-A0 centroid directory
         // (`centroid_directory_nprobe_for`), which runs downstream of
         // discovery; this legacy header-centroid prune must not pretend to
@@ -2923,37 +2944,31 @@ self.try_pax_cascade(
                         );
                         file_distances.push((file_path.url.clone(), distance));
                         resolved += 1;
-                    } else {
-                        // Dimension mismatch - include file anyway
-                        file_distances.push((file_path.url.clone(), 0.0));
                     }
+                    // Dimension mismatch: unrankable — leave it out and let
+                    // the completeness guard refuse the prune.
                 }
                 Ok(None) => {
-                    // No centroid - include file anyway (for backwards compatibility)
-                    file_distances.push((file_path.url.clone(), 0.0));
+                    // No centroid: unrankable — same.
                 }
                 Err(e) => {
-                    tracing::warn!(
-                        "Failed to load centroid from {}: {}, including anyway",
-                        file_path.url,
-                        e
-                    );
-                    file_distances.push((file_path.url.clone(), 0.0));
+                    tracing::warn!("Failed to load centroid from {}: {}", file_path.url, e);
+                    // Unrankable — same.
                 }
             }
         }
 
-        // The prune REQUIRES complete ranking input: a partial ranking is
-        // not a weaker prune, it is an arbitrary one (TD-ANNPRUNE-1).
-        // Anything unresolved returns every file. Note this cannot fire on
-        // the Ok(None) `.pax` fast path alone unless every other file ALSO
-        // resolved — the mixed case — which is exactly the eviction hazard
-        // above.
+        // A SINGLE unresolved file always refuses the prune (resolved counts
+        // strictly below the file count); the mixed collection is where the
+        // pre-fix 0.0 eviction was sharpest, but the guard owes nothing to
+        // that asymmetry — a partial ranking is not a weaker prune, it is an
+        // arbitrary one (TD-ANNPRUNE-1). Reaching the sort therefore
+        // guarantees every entry in `file_distances` is a real, ranked
+        // distance.
         if resolved < all_files.len() {
             tracing::debug!(
-                "SST centroid prune skipped: {}/{} files resolved a real centroid distance \
-                 (PAX segments carry no header centroid); searching all files. PAX probe \
-                 selection is the Region-A0 directory's job.",
+                "SST centroid prune skipped: {}/{} files resolved a real centroid distance; \
+                 searching all files. PAX probe selection is the Region-A0 directory's job.",
                 resolved,
                 all_files.len()
             );
@@ -3008,6 +3023,20 @@ self.try_pax_cascade(
         // Read just the first part of the file to get header
         // Format: SST1 (4 bytes) + header_len (4 bytes) + header data
         let header_prefix = fs.read_range_resident(file_path, 0, 8).await?;
+
+        // A truncated or empty non-PAX segment (a crash-created 0-7 byte
+        // .sst/.arrow) returns a short read on a local backend — indexing
+        // into it panicked the query task (#2439 review F1; the sibling
+        // legacy_sst_entry_count guards the same way). Treat it as
+        // unresolved: the caller's completeness guard refuses the prune.
+        if header_prefix.len() < 8 {
+            tracing::debug!(
+                segment = %file_path,
+                prefix_bytes = header_prefix.len(),
+                "segment too short for an SST1 header prefix; treating as unresolved"
+            );
+            return Ok(None);
+        }
 
         // Verify magic — a coalesced segment (PXH1, ADR-065) has no legacy SST1
         // centroid; return None cleanly (no error) so partition-aware search skips it.
@@ -4774,6 +4803,59 @@ mod tests {
             selected.len(),
             12,
             "a partially-resolved file set must not be pruned: unresolved 0.0s sort ahead of real distances and evict ranked files"
+        );
+        Ok(())
+    }
+
+    /// Dimension mismatch: a valid SST1 header whose centroid length differs
+    /// from the query's is unrankable (the pre-fix 0.0 push ranked it
+    /// closest-possible). One such file among ranked files refuses the prune
+    /// (#2439 review F5: this branch of the guard was untested).
+    #[tokio::test]
+    async fn dimension_mismatch_files_are_never_pruned() -> anyhow::Result<()> {
+        let (engine, dir) = prune_test_engine().await?;
+        for i in 0..11 {
+            std::fs::write(
+                dir.path().join(format!("L0_{i:03}.sst")),
+                sst1_bytes_with_centroid(&[1.0, (i as f32) * 0.1, 0.0, 0.0]),
+            )?;
+        }
+        // The 12th carries a 3-dim centroid against a 4-dim query.
+        std::fs::write(
+            dir.path().join("L0_mismatch.sst"),
+            sst1_bytes_with_centroid(&[1.0, 0.5, 0.0]),
+        )?;
+        let url = format!("file://{}", dir.path().display());
+        let selected = prune_call(&engine, &url).await?;
+        assert_eq!(
+            selected.len(),
+            12,
+            "a dimension-mismatched centroid cannot be ranked against the query; the prune must be refused"
+        );
+        Ok(())
+    }
+
+    /// A truncated non-PAX segment (crash-created 0-7 byte .sst) must flow
+    /// into the unresolved branch, not panic on the header-prefix slice —
+    /// the pre-fix code indexed header_prefix[0..4] unconditionally
+    /// (#2439 review F1; regression test for the length guard).
+    #[tokio::test]
+    async fn truncated_legacy_file_does_not_panic_and_refuses_prune() -> anyhow::Result<()> {
+        let (engine, dir) = prune_test_engine().await?;
+        for i in 0..11 {
+            std::fs::write(
+                dir.path().join(format!("L0_{i:03}.sst")),
+                sst1_bytes_with_centroid(&[1.0, (i as f32) * 0.1, 0.0, 0.0]),
+            )?;
+        }
+        // 3 bytes: shorter than the 8-byte magic+length prefix.
+        std::fs::write(dir.path().join("L0_trunc.sst"), b"SST")?;
+        let url = format!("file://{}", dir.path().display());
+        let selected = prune_call(&engine, &url).await?;
+        assert_eq!(
+            selected.len(),
+            12,
+            "a truncated segment resolves no centroid; the prune must be refused, not panic"
         );
         Ok(())
     }

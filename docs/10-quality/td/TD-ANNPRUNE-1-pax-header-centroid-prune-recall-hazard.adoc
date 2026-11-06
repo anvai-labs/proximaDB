@@ -43,9 +43,36 @@ reachable only when the ranking was real.
 == Cost note
 
 GETs rise on unconsolidated all-PAX collections (the lottery becomes a full
-scan). Mitigations: the A0 directory prune downstream, `COMPACT TABLE …
-FULL` consolidation (#2418) collapsing segment counts toward the target, and
-the removed behaviour being a recall hazard rather than a saving.
+scan). Mitigations, with their precise scope (#2439 review F3): the A0
+directory prune downstream mitigates CASCADE-path queries only —
+`centroid_directory_cells` returns no pruning when a filter expression is
+present, under `force_exact`, for non-L2/Cosine/Dot metrics, or when either
+read gate is off; on those paths this fix deliberately trades the (bogus)
+bounded probe for an unmitigated full scan, because the bounded probe was a
+recall lottery. `COMPACT TABLE … FULL` consolidation (#2418) collapsing
+segment counts toward the target remains the structural mitigation for
+every path. The cost claim is unmeasured per path (no
+`BENCHMARK_EVIDENCE.toml` entry) — a measured per-query trace on a filtered
+Approximate workload is the follow-up that would let the A0-for-filtered
+gap itself be closed.
+
+Observability note (#2439 review F4, filed not fixed): an Approximate query
+that engages neither the cascade, nor AXIS, nor a real prune now records NO
+VectorAccessPath, where the pre-fix code recorded a FALSE `Ann` proof. Per
+the "never warm an ANN cell without an engagement proof" contract this is
+the honest outcome, but such queries vanish from the vector access trace
+(cache pattern tracking, ANN cost-cell warming) until a truthful proof
+event is defined for the full-scan-on-unrankable path.
+
+Review F1/F2/F5/F6 (all fixed in-PR): `load_sst_header_centroid` guarded
+its 8-byte prefix slice (a crash-truncated 0-7 byte `.sst` panicked the
+query task — mandate #4); the refuse-on-unrankable decision is now made
+from URL suffixes BEFORE the header loop (a mixed collection was paying two
+ranged reads per legacy file for a ranking the guard discarded); the
+dimension-mismatch and read-error branches of the guard gained tests; and
+the guard comment no longer reads backwards (a single unrankable file
+always refuses the prune — the mixed case is only where the pre-fix
+eviction was sharpest).
 
 == Gates
 
