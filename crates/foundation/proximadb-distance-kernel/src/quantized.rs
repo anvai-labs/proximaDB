@@ -741,18 +741,20 @@ impl QuantizedDistanceCalculator {
 
         let start_time = std::time::Instant::now();
 
-        let results = if self.should_use_batch_processing(quantized_vectors.len()) {
-            self.compute_batch_distances_simd(query, quantized_vectors, format)
-                .await?
-        } else {
-            // Process individually for small batches
-            let mut results = Vec::with_capacity(quantized_vectors.len());
-            for vector in quantized_vectors {
-                let result = self.compute_distance(query, vector, format.clone()).await?;
-                results.push(result);
-            }
-            results
-        };
+        // Per-vector computation for every batch size. The former
+        // `enable_simd`-gated "batch path" (compute_batch_distances_simd) ran
+        // an identical per-vector loop under a SIMD name — both arms of the
+        // removed branch were the same code (TD-FACADE-1). A real batched
+        // kernel for mixed-format QuantizedVectorData does not exist in this
+        // crate; the f32-pair SIMD kernels live in the `engine` module
+        // (`batch_distance_pooled_simd`). `simd_optimization.enable_simd`
+        // still gates the hardware-detected popcnt Hamming path inside
+        // compute_distance; it does not vectorize this loop.
+        let mut results = Vec::with_capacity(quantized_vectors.len());
+        for vector in quantized_vectors {
+            let result = self.compute_distance(query, vector, format.clone()).await?;
+            results.push(result);
+        }
 
         let total_time = start_time.elapsed().as_secs_f64() * 1000.0;
         info!(
@@ -1037,10 +1039,6 @@ impl QuantizedDistanceCalculator {
     }
 
     /// Return true when the batch is large enough to benefit from SIMD batch processing.
-    fn should_use_batch_processing(&self, batch_size: usize) -> bool {
-        batch_size >= 32 && self.config.simd_optimization.enable_simd
-    }
-
     /// Compute batch distances for columnar storage operations
     /// This is the centralized method for all columnar engines (VIPER, NOVA)
     pub async fn compute_columnar_batch_distances(
@@ -1051,25 +1049,15 @@ impl QuantizedDistanceCalculator {
     ) -> Result<Vec<(f32, SelectedFormat)>> {
         let mut results = Vec::with_capacity(quantized_vectors.len());
 
-        // Use batch processing if appropriate
-        if self.should_use_batch_processing(quantized_vectors.len()) {
-            // Process in batches for better cache utilization
-            for batch in quantized_vectors.chunks(64) {
-                for vector_data in batch {
-                    let result = self
-                        .compute_distance(query_vector, vector_data, format_preference.clone())
-                        .await?;
-                    results.push((result.similarity, format_preference.clone()));
-                }
-            }
-        } else {
-            // Process individually for small batches
-            for vector_data in quantized_vectors {
-                let result = self
-                    .compute_distance(query_vector, vector_data, format_preference.clone())
-                    .await?;
-                results.push((result.similarity, format_preference.clone()));
-            }
+        // Per-vector computation. The former `chunks(64)` "batch" branch made
+        // exactly the same per-vector calls through one extra iterator level —
+        // no kernel, no parallelism, no cache effect — so the distinction is
+        // removed (TD-FACADE-1). Same SIMD note as compute_batch_distances.
+        for vector_data in quantized_vectors {
+            let result = self
+                .compute_distance(query_vector, vector_data, format_preference.clone())
+                .await?;
+            results.push((result.similarity, format_preference.clone()));
         }
 
         Ok(results)
@@ -1238,40 +1226,27 @@ impl QuantizedDistanceCalculator {
         }
     }
 
-    /// Compute distances for a batch of quantized vectors with SIMD acceleration.
-    async fn compute_batch_distances_simd(
-        &self,
-        query: &[f32],
-        quantized_vectors: &[QuantizedVectorData],
-        format: SelectedFormat,
-    ) -> Result<Vec<QuantizedDistanceResult>> {
-        // This would implement SIMD batched processing
-        // For now, fall back to individual processing
-        let mut results = Vec::with_capacity(quantized_vectors.len());
-        for vector in quantized_vectors {
-            let result = self.compute_distance(query, vector, format.clone()).await?;
-            results.push(result);
-        }
-        Ok(results)
-    }
-
     /// Evict stale entries from the PQ distance table cache based on the configured policy.
     #[allow(dead_code)]
     fn evict_pq_cache_entries(&self, cache: &mut PQDistanceCache) {
-        // Implement cache eviction based on configured policy
-        match self.config.cache_config.eviction_policy {
-            CacheEvictionPolicy::LRU if cache.tables.len() > 100 => {
-                // Remove oldest entries first
-                // This is simplified - would need proper LRU tracking
-                let keys_to_remove: Vec<u64> = cache.tables.keys().take(10).cloned().collect();
-                for key in keys_to_remove {
-                    if let Some(table) = cache.tables.remove(&key) {
-                        cache.memory_usage_bytes -= table.estimated_size();
-                    }
+        // Bounded ARBITRARY-ORDER eviction — NOT LRU (TD-FACADE-1).
+        //
+        // This used to `match CacheEvictionPolicy::LRU` and then remove the
+        // first 10 HashMap keys, which is iteration order, not recency, while
+        // every other policy silently no-opped: a config surface promising
+        // policy-directed eviction this cache never implemented. The match is
+        // gone; `eviction_policy` is advisory in this calculator.
+        //
+        // Correctness is unaffected either way: PQ distance tables are pure
+        // performance caches, so evicting the "wrong" entries only costs
+        // recomputation. Real LRU/FIFO would need recency tracking on insert
+        // (roadmap item).
+        if cache.tables.len() > 100 {
+            let keys_to_remove: Vec<u64> = cache.tables.keys().take(10).cloned().collect();
+            for key in keys_to_remove {
+                if let Some(table) = cache.tables.remove(&key) {
+                    cache.memory_usage_bytes -= table.estimated_size();
                 }
-            }
-            _ => {
-                // Other eviction policies would be implemented here
             }
         }
     }
@@ -1388,6 +1363,85 @@ impl PQDistanceTable {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// TD-FACADE-1 pin: batch entries must equal per-vector computation for
+    /// ANY batch size. The former code split on should_use_batch_processing
+    /// (>=32 && enable_simd) into two branches whose bodies were identical;
+    /// the split (and the SIMD name) is gone. This pins the semantic contract
+    /// of the collapse across the old threshold: 8 (<32) and 64 (>=32)
+    /// vectors must both match compute_distance exactly.
+    #[tokio::test]
+    async fn batch_distances_equal_per_vector_across_old_threshold() {
+        let calc = QuantizedDistanceCalculator::new(QuantizedDistanceConfig::default())
+            .expect("calculator");
+
+        let query = vec![0.5_f32; 8];
+        for n in [8_usize, 64] {
+            let vectors: Vec<QuantizedVectorData> = (0..n)
+                .map(|i| QuantizedVectorData {
+                    fp32: Some(vec![i as f32 / 100.0; 8]),
+                    binary: None,
+                    int8: None,
+                    pq: None,
+                })
+                .collect();
+
+            let batch = calc
+                .compute_batch_distances(&query, &vectors, SelectedFormat::FP32)
+                .await
+                .expect("batch");
+            assert_eq!(batch.len(), n);
+
+            for (i, v) in vectors.iter().enumerate() {
+                let single = calc
+                    .compute_distance(&query, v, SelectedFormat::FP32)
+                    .await
+                    .expect("single");
+                assert_eq!(batch[i].similarity, single.similarity, "n={n} i={i}");
+            }
+        }
+    }
+
+    /// TD-FACADE-1 pin: PQ-table eviction is bounded and drops WHOLE tables
+    /// with correct bookkeeping (memory_usage_bytes returns to its pre-insert
+    /// value). It is arbitrary-order by design now (NOT LRU) — pinned as
+    /// bounded-and-consistent, not ordered, because order is unspecified.
+    #[test]
+    fn pq_cache_eviction_is_bounded_and_consistent() {
+        let mut cache = PQDistanceCache {
+            tables: std::collections::HashMap::new(),
+            hits: 0,
+            misses: 0,
+            memory_usage_bytes: 0,
+        };
+        // 101 tables > the 100 bound -> one eviction round removes 10.
+        for k in 0..101_u64 {
+            cache.tables.insert(
+                k,
+                Arc::new(PQDistanceTable {
+                    tables: vec![vec![0.5; 256]; 4],
+                    num_subvectors: 4,
+                    num_centroids: 256,
+                    distance_metric: DistanceMetric::Cosine,
+                    access_count: std::sync::atomic::AtomicUsize::new(0),
+                    timestamp: std::time::Instant::now(),
+                }),
+            );
+        }
+        cache.memory_usage_bytes = cache.tables.values().map(|t| t.estimated_size()).sum();
+
+        let before_len = cache.tables.len();
+        QuantizedDistanceCalculator::new(QuantizedDistanceConfig::default())
+            .expect("calculator")
+            .evict_pq_cache_entries(&mut cache);
+
+        assert_eq!(before_len - cache.tables.len(), 10, "exactly 10 evicted");
+        let after_sum: usize = cache.tables.values().map(|t| t.estimated_size()).sum();
+        assert_eq!(
+            cache.memory_usage_bytes, after_sum,
+            "bookkeeping must match remaining tables exactly"
+        );
+    }
 
     fn init_hardware_capabilities() {
         let _ = proximadb_hardware::hardware_capabilities(); // OnceLock auto-init

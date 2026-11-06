@@ -142,7 +142,7 @@ request.
 | Wrong if any caller treats the vec as literal ids
 
 | `crates/foundation/proximadb-distance-kernel/src/quantized.rs` `compute_batch_distances_simd`, `evict_pq_cache_entries`
-| `_simd` is a scalar loop ("For now, fall back to individual processing") while `engine.rs` in the same crate has ~50 real SIMD sites; LRU eviction drops the first 10 HashMap keys (arbitrary, not LRU); other policies are no-ops.
+| **MITIGATED (2026-11-05).** Was: `_simd` a scalar loop ("For now, fall back…") beside ~50 real SIMD sites in `engine.rs`; `compute_columnar_batch_distances` had the same disease (a `chunks(64)` "batch" whose arms were identical code); LRU eviction removed the first 10 HashMap keys (iteration order, not recency) and every other policy silently no-opped. Now: the fake branch split is DELETED (both batch entries are one honest per-vector loop, doc'd — the method is gone, which is the only fix that lowers the guard count) and eviction is bounded arbitrary-order with the policy match removed (`eviction_policy` documented as advisory here; PQ tables are pure perf caches, no correctness impact). Pins: `batch_distances_equal_per_vector_across_old_threshold` (contract preserved across the old 32-threshold), `pq_cache_eviction_is_bounded_and_consistent` (exactly 10 evicted; byte bookkeeping exact). Both pins pass on develop too — deliberately: this fix is behavior-neutral by design, and the regression signal is the guard delta (−1), not a test. RESIDUALS: `simd_used` metric fields (`:708`, `:886`) report the config knob, not actual vectorization of these paths; and `src/storage/engines/universal/config.rs` defines a second, shadow `CacheEvictionPolicy` enum.
 | Was reached only via NOVA `advanced_search` (which refused at the top as of 2026-11-05, severing that reachability) and has **zero callers** — public-uncalled
 | Perf claim with no evidence (CLAUDE.md #6); lying cache-policy config
 
@@ -195,7 +195,7 @@ excluded: they mark future enhancement of working code, and `Deferred:` alone
 inflated the count by about 500 without adding a real defect (measured before
 the doc-comment fix below, so the absolute figures from that run are stale).
 
-**Baseline: 1040 sites** (introduced at 1039 with #2428; +1 in the NOVA `advanced_search` PR: splitting the fn into the honest refusal plus the preserved `#[allow(dead_code)]` pipeline made ONE counted fn into TWO — the body was already counted on develop via its own `placeholder` markers, so nothing was hidden or newly revealed, the split simply counts both halves. Disclosed same-commit baseline update. That number is the finding: about a thousand places in
+**Baseline: 1039 sites** (1040 after the #2432 fn-split, back to 1039 when the quantized PR deleted `compute_batch_distances_simd` outright — the only direction that lowers the count; +1 in the NOVA `advanced_search` PR: splitting the fn into the honest refusal plus the preserved `#[allow(dead_code)]` pipeline made ONE counted fn into TWO — the body was already counted on develop via its own `placeholder` markers, so nothing was hidden or newly revealed, the split simply counts both halves. Disclosed same-commit baseline update. That number is the finding: about a thousand places in
 non-test Rust where the code says, in its own comments, that it is not what it
 is named.
 
