@@ -557,7 +557,8 @@ impl NovaUnifiedEngine {
     ///
     /// The production NOVA engine is `NovaEngine` (built by the storage
     /// engine factory) with a real id+score search. The demonstration
-    /// pipeline is preserved verbatim in [`Self::advanced_search_pipeline`].
+    /// pipeline is preserved verbatim in advanced_search_pipeline (private,
+    /// labeled below).
     pub async fn advanced_search(
         &self,
         collection_id: &str,
@@ -1376,6 +1377,7 @@ mod tests {
         );
         Ok(())
     }
+
     #[test]
     fn test_nova_config_defaults() {
         let config = NovaSpecificConfig::default();
