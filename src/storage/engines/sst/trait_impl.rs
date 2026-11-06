@@ -22,7 +22,7 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use std::collections::HashMap;
-use tracing::{debug, info};
+use tracing::info;
 
 use crate::core::search::results::OptimizedSearchRecord;
 use crate::storage::engines::sst::core::SstEngine;
@@ -414,21 +414,29 @@ impl UnifiedStorageFormat for SstEngine {
         _base_path: &str,
         vector_id: &str,
     ) -> Result<Option<proximadb_records::ProximaRecord>> {
-        debug!(
-            "🔍 SST: Looking up vector {} in collection {}",
-            vector_id, collection_id
-        );
-
-        // Check if vector exists using bloom filters
-        let exists = self.contains_vector(collection_id, vector_id).await?;
-
-        if !exists {
-            return Ok(None);
-        }
-
-        // In a real implementation, this would read from SST files
-        // For now, return None as a placeholder
-        Ok(None)
+        // Single-record point-lookup refuses honestly (TD-FACADE-1).
+        //
+        // The former body called contains_vector and then returned None
+        // either way — and contains_vector answers "does ANY .sst file
+        // exist in the collection", not "does this id exist", so a `true`
+        // followed by Ok(None) read as "the record vanished".
+        //
+        // A scan-based lookup DOES exist on this engine (the point_lookup
+        // override below backs the live get-by-id path), but a
+        // single-record answer from it would need the MVCC winner rule,
+        // which is deliberately service-side (read.rs freshest_version;
+        // TD-MEMTABLE-MVCC-1 warns against hand-copying it) — a naive
+        // first-match would reintroduce the superseded-version bug. No
+        // conservative single-record answer exists without that rule, so
+        // this refuses. Zero callers reach this method today (census:
+        // every same-name production call targets the memtable's inherent
+        // method; only engine tests call the trait method).
+        let _ = (collection_id, _base_path, vector_id);
+        Err(anyhow::anyhow!(
+            "SST point-lookup is not implemented: contains_vector reports \
+             file-existence, not id-existence, and a fabricated Ok(None) would \
+             read as 'record missing'. See TD-FACADE-1."
+        ))
     }
 
     /// Delegate search to the search module
@@ -806,6 +814,24 @@ mod tests {
             .await
             .expect_err("a meta-less compaction request must be declined");
         assert!(error.to_string().contains("no catalog collection meta"));
+    }
+
+    /// TD-FACADE-1 pin: the point-lookup must REFUSE, never fabricate
+    /// Ok(None). The former body returned None regardless of
+    /// contains_vector's answer — and contains_vector reports file-existence,
+    /// not id-existence — so a `true` followed by None read as "record
+    /// vanished". Message-asserting deliberately (a bare is_err() would pass
+    /// for many wrong reasons).
+    #[tokio::test]
+    async fn vector_by_id_refuses_instead_of_fabricating_absence() {
+        let engine = create_test_engine().await;
+        let err = engine
+            .vector_by_id("c", "/tmp", "some-id")
+            .await
+            .expect_err("point-lookup must refuse");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("not implemented"), "message: {msg}");
+        assert!(msg.contains("TD-FACADE-1"), "message: {msg}");
     }
 
     async fn create_test_engine() -> SstEngine {
