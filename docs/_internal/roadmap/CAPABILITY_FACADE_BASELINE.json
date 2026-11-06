@@ -1,5 +1,5 @@
 {
-  "total": 1040,
+  "total": 1039,
   "by_file": {
     "apps/proximadb-migrate/src/main.rs": 2,
     "crates/binding/proximadb-embedded/src/lib.rs": 9,
@@ -26,7 +26,7 @@
     "crates/foundation/proximadb-data-model/src/lib.rs": 1,
     "crates/foundation/proximadb-data-model/src/metadata_types.rs": 2,
     "crates/foundation/proximadb-distance-kernel/src/engine.rs": 2,
-    "crates/foundation/proximadb-distance-kernel/src/quantized.rs": 4,
+    "crates/foundation/proximadb-distance-kernel/src/quantized.rs": 3,
     "crates/foundation/proximadb-filter-expression/src/normalize.rs": 1,
     "crates/foundation/proximadb-graph-engine-traits/src/lib.rs": 4,
     "crates/foundation/proximadb-hardware-caps/src/lib.rs": 1,
