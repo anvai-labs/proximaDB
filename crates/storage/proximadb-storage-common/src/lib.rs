@@ -226,6 +226,13 @@ pub use zero_copy_traits::{
     QueryContext as ZeroCopyQueryContext, QueryType,
 };
 pub mod compaction_strategy;
+pub mod policy_properties;
+pub use policy_properties::{is_policy_property, validate_policy_properties};
+pub mod probe_policy;
 pub use compaction_strategy::{
     CompactionStrategy, resolve_effective_strategy, validate_compaction_properties,
+};
+pub use probe_policy::{
+    ProbeAlgorithm, ProbePlan, ProbePolicy, ServerProbePolicy, band_ladder, resolve_probe_plan,
+    resolve_probe_policy, validate_probe_properties,
 };

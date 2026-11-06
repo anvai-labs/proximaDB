@@ -2298,6 +2298,29 @@ def effective_flush_interval(
     return 3600 if explicit_flush_every_rows is not None else 12
 
 
+# TD-RDSTRAT-14 probe-policy env gates; scrubbed per spawn with the other
+# inherited gates (see OwnedServer).
+PROBE_POLICY_GATES = (
+    "PROXIMADB_PAX_READ_PROBE_ALGORITHM",
+    "PROXIMADB_PAX_READ_PROBE_BASE_MB",
+    "PROXIMADB_PAX_READ_PROBE_CAP_MB",
+    "PROXIMADB_PAX_READ_PROBE_EXPERIMENTAL",
+)
+
+def probe_experimental_gate(probe_algorithm, probe_base_mb, probe_cap_mb) -> bool:
+    """Whether a run sets PROXIMADB_PAX_READ_PROBE_EXPERIMENTAL=1.
+
+    ONE decision used both to spawn the server and to record the arm in
+    result.json, so the label cannot drift from what the server got (#2419
+    review round 13). Non-sqrt algorithms need the gate; so do base/cap with
+    no --probe-algorithm, which only matter against a TOML byte_budget
+    server (round 11).
+    """
+    if probe_algorithm is not None:
+        return probe_algorithm != "sqrt"
+    return probe_base_mb is not None or probe_cap_mb is not None
+
+
 # TD-PAXDIR-1 D7: the gates the --centroid-directory arm turns on — publish the
 # collection directory with decode keys (D1, D6), plan queries on it (D2), ride
 # the rerank on the probe wave (D5), and use the keys on the query path (D6).
@@ -2321,6 +2344,9 @@ class OwnedServer:
         ivf_k: int | None = None,
         n_comp: int | None = None,
         nprobe: int | None = None,
+        probe_algorithm: str | None = None,
+        probe_base_mb: int | None = None,
+        probe_cap_mb: int | None = None,
         training_compaction_min_mb: int | None = None,
         azure_emulator: bool = False,
         s3_endpoint: str | None = None,
@@ -2341,6 +2367,9 @@ class OwnedServer:
         self.ivf_k = ivf_k
         self.n_comp = n_comp
         self.nprobe = nprobe
+        self.probe_algorithm = probe_algorithm
+        self.probe_base_mb = probe_base_mb
+        self.probe_cap_mb = probe_cap_mb
         self.training_compaction_min_mb = training_compaction_min_mb
         self.azure_emulator = azure_emulator
         self.s3_endpoint = s3_endpoint
@@ -2393,6 +2422,7 @@ class OwnedServer:
             # "default"/"on" arms, so an operator export must not leak (the
             # TD-IOBUDGET-2 hole class).
             *CENTROID_DIRECTORY_GATES,
+            *PROBE_POLICY_GATES,
             "PROXIMADB_PAX_WRITE_SHARED_MODEL",
             "PROXIMADB_PAX_READ_CENTROID_DIRECTORY_NPROBE",
             # S3 endpoint identity comes from --s3-endpoint/--s3-region only;
@@ -2493,6 +2523,15 @@ class OwnedServer:
                 if self.centroid_directory in ("on", "default")
                 else "PROXIMADB_PAX_READ_COARSE_NPROBE"
             ] = str(self.nprobe)
+        if self.probe_algorithm is not None:
+            environment["PROXIMADB_PAX_READ_PROBE_ALGORITHM"] = self.probe_algorithm
+        # The same decision result.json records (see probe_experimental_gate).
+        if probe_experimental_gate(self.probe_algorithm, self.probe_base_mb, self.probe_cap_mb):
+            environment["PROXIMADB_PAX_READ_PROBE_EXPERIMENTAL"] = "1"
+        if self.probe_base_mb is not None:
+            environment["PROXIMADB_PAX_READ_PROBE_BASE_MB"] = str(self.probe_base_mb)
+        if self.probe_cap_mb is not None:
+            environment["PROXIMADB_PAX_READ_PROBE_CAP_MB"] = str(self.probe_cap_mb)
         if self.training_compaction_min_mb is not None:
             environment["PROXIMADB_TRAINING_COMPACTION_MIN_MB"] = str(
                 self.training_compaction_min_mb
@@ -3424,6 +3463,28 @@ def main() -> int:
         help="force query-time coarse cells (scale experiments only)",
     )
     parser.add_argument(
+        "--probe-algorithm",
+        # `fixed` is deliberately NOT offered: it probes exactly
+        # `min_cells`, and the harness has no flag for that, so the arm
+        # would silently always run at the default 3 cells. Set it via
+        # TOML/collection property if you want a pinned-count arm.
+        choices=["sqrt", "cbrt", "fourth_root", "log", "byte_budget"],
+        help=(
+            "TD-RDSTRAT-14 probe-band algorithm (PROXIMADB_PAX_READ_PROBE_ALGORITHM); "
+            "default sqrt. The recall-vs-GETs dial for the ladder experiment"
+        ),
+    )
+    parser.add_argument(
+        "--probe-base-mb",
+        type=int,
+        help="byte_budget base probe budget in MiB; the root and log forms ignore it (PROXIMADB_PAX_READ_PROBE_BASE_MB)",
+    )
+    parser.add_argument(
+        "--probe-cap-mb",
+        type=int,
+        help="byte_budget per-probe-POOL byte cap in MiB, 0 = none (PROXIMADB_PAX_READ_PROBE_CAP_MB); not per query: with the directory off each segment is its own pool",
+    )
+    parser.add_argument(
         "--adaptive-read-strategy",
         action="store_true",
         help=(
@@ -3536,6 +3597,46 @@ def main() -> int:
         raise RuntimeError("--n-comp must be positive")
     if args.nprobe is not None and args.nprobe <= 0:
         raise RuntimeError("--nprobe must be positive")
+    # #2419 review round 8: --nprobe sets a probe-count env override that
+    # takes precedence over the probe policy, so combining it with a policy
+    # flag ran a fixed-count probe while result.json recorded the algorithm.
+    probe_policy_flags = [
+        name
+        for name, value in (
+            ("--probe-algorithm", args.probe_algorithm),
+            ("--probe-base-mb", args.probe_base_mb),
+            ("--probe-cap-mb", args.probe_cap_mb),
+        )
+        if value is not None
+    ]
+    if args.nprobe is not None and probe_policy_flags:
+        raise RuntimeError(
+            f"--nprobe overrides the probe policy, so it cannot be combined with "
+            f"{', '.join(probe_policy_flags)}: the arm would be labelled with an "
+            "algorithm it never ran"
+        )
+    # Mirror the server's env bounds EXACTLY so result.json cannot record a
+    # value the server warns about and ignores (it would run the default).
+    # MAX_PROBE_MB mirrors segment_format.rs / MAX_PROBE_BUDGET_MB (1 TiB).
+    max_probe_mb = 1024 * 1024
+    if args.probe_base_mb is not None and not 0 < args.probe_base_mb <= max_probe_mb:
+        raise RuntimeError(f"--probe-base-mb must be in 1..={max_probe_mb}")
+    if args.probe_cap_mb is not None and not 0 <= args.probe_cap_mb <= max_probe_mb:
+        raise RuntimeError(f"--probe-cap-mb must be in 0..={max_probe_mb} (0 = no cap)")
+    # base/cap are read ONLY by byte_budget; recording them on another arm
+    # labels it with knobs the server never consulted (#2419 review round 8).
+    # Refused only when the arm EXPLICITLY picks another algorithm: with no
+    # --probe-algorithm the server's TOML may already be byte_budget, which
+    # does read them.
+    if (
+        args.probe_algorithm is not None
+        and args.probe_algorithm != "byte_budget"
+        and (args.probe_base_mb is not None or args.probe_cap_mb is not None)
+    ):
+        raise RuntimeError(
+            "--probe-base-mb/--probe-cap-mb are read only by byte_budget; with "
+            f"--probe-algorithm {args.probe_algorithm} they would be recorded but ignored"
+        )
     if (
         args.training_compaction_min_mb is not None
         and args.training_compaction_min_mb <= 0
@@ -3869,6 +3970,19 @@ def main() -> int:
             "ivf_k_override": args.ivf_k,
             "n_comp_override": args.n_comp,
             "nprobe_override": args.nprobe,
+            # The PROXIMADB_PAX_READ_PROBE_* env OVERRIDES this run set
+            # (None = not set). NOT the resolved policy: a server TOML
+            # [storage.sst_config.coarse_probe] still applies beneath them,
+            # so a None row is the control only against the default config
+            # (#2419 review round 9).
+            "probe_policy_env_overrides": {
+                "experimental_gate": probe_experimental_gate(
+                    args.probe_algorithm, args.probe_base_mb, args.probe_cap_mb
+                ),
+                "algorithm": args.probe_algorithm,
+                "base_mb": args.probe_base_mb,
+                "cap_mb": args.probe_cap_mb,
+            },
             "training_compaction_min_mb_override": (
                 args.training_compaction_min_mb
             ),
@@ -3955,6 +4069,9 @@ def main() -> int:
                 ivf_k=args.ivf_k,
                 n_comp=args.n_comp,
                 nprobe=args.nprobe,
+                probe_algorithm=args.probe_algorithm,
+                probe_base_mb=args.probe_base_mb,
+                probe_cap_mb=args.probe_cap_mb,
                 training_compaction_min_mb=args.training_compaction_min_mb,
                 azure_emulator=args.azurite,
                 s3_endpoint=args.s3_endpoint,

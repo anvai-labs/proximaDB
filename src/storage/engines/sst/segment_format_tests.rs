@@ -619,6 +619,68 @@ async fn oid_prefetch_fallback_records_each_physical_get_once() {
     unsafe { std::env::remove_var("PROXIMADB_TRACE_GETS") };
 }
 
+/// Mandate #13 gate (#2419 review round 10): a non-sqrt TOML algorithm fails
+/// boot unless `PROXIMADB_PAX_READ_PROBE_EXPERIMENTAL=1`, with a message that
+/// names the gate; `sqrt` (the production default) always validates. Reads
+/// the gate but never sets it, so it cannot leak into sibling tests.
+#[test]
+fn experimental_probe_algorithms_need_the_explicit_gate_at_boot() {
+    if probe_experimental_enabled() {
+        return; // an operator exported the gate; the refusal is not testable here
+    }
+    let validate = |algorithm: &str| {
+        crate::core::config::CoarseProbeConfig {
+            algorithm: algorithm.to_string(),
+            ..Default::default()
+        }
+        .validate("storage.sst_config.coarse_probe")
+    };
+    assert!(validate("sqrt").is_ok());
+    for algorithm in ["cbrt", "fourth_root", "log", "fixed", "byte_budget"] {
+        let error = validate(algorithm).expect_err("experimental algorithm must need the gate");
+        assert!(
+            error.contains("PROXIMADB_PAX_READ_PROBE_EXPERIMENTAL"),
+            "{algorithm}: {error}"
+        );
+    }
+}
+
+/// #2419 review round 11: the gate also holds where the policy is BUILT,
+/// so a Config made without ConfigLoader (embedded, programmatic start,
+/// tests) cannot install an experimental algorithm either.
+#[test]
+fn settings_policy_falls_back_to_sqrt_without_the_experimental_gate() {
+    if probe_experimental_enabled() {
+        return; // an operator exported the gate; the fallback is not testable here
+    }
+    let settings: CoarseProbeSettings = crate::core::config::CoarseProbeConfig {
+        algorithm: "byte_budget".to_string(),
+        ..Default::default()
+    }
+    .into();
+    assert_eq!(
+        settings_policy(&settings).algorithm,
+        proximadb_storage_common::probe_policy::ProbeAlgorithm::Sqrt
+    );
+}
+
+/// True when the environment carries any PROXIMADB_PAX_READ_PROBE_* override.
+/// The default-chain tests below assert the SHIPPED defaults through
+/// settings_policy (which folds the env layer), so an exported override — a
+/// leftover bench shell — would fail them for the right behavior. They skip
+/// under contamination instead of flaking (mandate #11); the pure-module
+/// tests in probe_policy.rs stay env-free and always run.
+fn probe_env_overrides_present() -> bool {
+    [
+        "PROXIMADB_PAX_READ_PROBE_ALGORITHM",
+        "PROXIMADB_PAX_READ_PROBE_BASE_MB",
+        "PROXIMADB_PAX_READ_PROBE_CAP_MB",
+        "PROXIMADB_PAX_READ_PROBE_EXPERIMENTAL",
+    ]
+    .iter()
+    .any(|key| std::env::var(key).is_ok())
+}
+
 fn cp_cfg(mult: f32) -> crate::core::config::CoarseProbeConfig {
     crate::core::config::CoarseProbeConfig {
         enable_read_probe: true,
@@ -627,14 +689,46 @@ fn cp_cfg(mult: f32) -> crate::core::config::CoarseProbeConfig {
         nprobe_min: 3,
         nprobe_max: 0,
         ncomp_floor: 0,
+        algorithm: "sqrt".to_string(),
+        base_mb: 4,
+        cap_mb: 32,
     }
 }
 
 #[test]
 fn default_probe_quality_and_backend_ranges_match_sift_acceptance() {
-    let defaults: CoarseProbeSettings = crate::core::config::CoarseProbeConfig::default().into();
+    if probe_env_overrides_present() {
+        // A VISIBLE skip, not a vacuous pass: green output must be
+        // distinguishable from never-ran (#2419 review round 19).
+        eprintln!(
+            "SKIPPED {}: PROXIMADB_PAX_READ_PROBE_* is set in the environment; \
+             the shipped defaults are not observable here",
+            stringify!(default_probe_quality_and_backend_ranges_match_sift_acceptance())
+        );
+        return;
+    }
+
+    // Assert the PURE resolver against the default policy: this test must
+    // not read OR write the process-global coarse-probe settings. Reading it
+    // let a prior test's install leak in; writing it (the round-2 fix) let
+    // this test clobber `toml_coarse_probe_config_wins_over_default_init`
+    // mid-assertion under the shared-process libtest fallback.
+    //
+    // It still goes through the PRODUCTION default chain —
+    // `CoarseProbeConfig::default()` -> `CoarseProbeSettings` (From) ->
+    // `settings_policy` — so a drift in the config defaults, the conversion
+    // or the folding is caught (#2419 review round 8), not just the pure
+    // module default.
+    let settings: CoarseProbeSettings = crate::core::config::CoarseProbeConfig::default().into();
     assert_eq!(
-        geometric_nprobe(30, defaults),
+        proximadb_storage_common::probe_policy::resolve_probe_plan(
+            &settings_policy(&settings),
+            30,
+            0,
+            4 * 1024 * 1024,
+            0,
+        )
+        .cells,
         11,
         "the one-segment SIFT1M geometry needs 11/30 cells for recall@10 >= 0.98"
     );
@@ -866,6 +960,17 @@ async fn local_pax_seed_streams_regions_into_persistent_cache() {
 /// geometric_nprobe. (nextest = process isolation; the static won't leak.)
 #[test]
 fn toml_coarse_probe_config_wins_over_default_init() {
+    if probe_env_overrides_present() {
+        // A VISIBLE skip, not a vacuous pass: green output must be
+        // distinguishable from never-ran (#2419 review round 19).
+        eprintln!(
+            "SKIPPED {}: PROXIMADB_PAX_READ_PROBE_* is set in the environment; \
+             the shipped defaults are not observable here",
+            stringify!(toml_coarse_probe_config_wins_over_default_init())
+        );
+        return;
+    }
+
     // Simulate a default-config engine seeding first...
     init_coarse_probe_settings(None);
     // ...then the authoritative TOML config (server startup) — must override.
@@ -875,8 +980,16 @@ fn toml_coarse_probe_config_wins_over_default_init() {
     init_coarse_probe_settings(None);
     assert!((coarse_probe_settings().nprobe_multiplier - 1.5).abs() < 1e-6);
     // The multiplier actually reaches nprobe: sqrt(64)*1.5 = 12 vs *1.0 = 8.
-    assert_eq!(geometric_nprobe(64, coarse_probe_settings()), 12);
-    assert_eq!(geometric_nprobe(64, cp_cfg(1.0).into()), 8);
+    assert_eq!(geometric_nprobe_root(64), 12);
+    // Re-seed with multiplier 1.0 — the resolved policy cache must
+    // invalidate with the settings (sqrt(64)*1.0 = 8).
+    init_coarse_probe_settings(Some(&cp_cfg(1.0)));
+    assert_eq!(geometric_nprobe_root(64), 8);
+    // Restore the shipped default: the settings are process-wide, and
+    // leaving 1.0 installed would make later probe-path tests resolve an
+    // nprobe below the recall floor under the shared-process libtest
+    // fallback.
+    init_coarse_probe_settings(Some(&crate::core::config::CoarseProbeConfig::default()));
 }
 
 /// TD-CACHE-2 S2b: Region A and control bytes are separate eviction

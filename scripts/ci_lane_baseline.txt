@@ -83,7 +83,6 @@ proximacodec_cross_compatibility_test.rs
 proximacodec_integration_test.rs
 queue_adapter_upgrade_integration_test.rs
 rank_services_e2e_test.rs
-recall_tune_auth_e2e.rs
 release_smoke_v2.rs
 repair_chain_integration_test.rs
 rerank_pgwire_contract_e2e.rs

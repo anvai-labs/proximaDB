@@ -357,4 +357,64 @@ async fn unified_port_auth_converged_recall_tune_e2e() {
         403,
         "read-only Api-Key must be authenticated but forbidden on recall-tune"
     );
+
+    // ── Phase 6: property write doors fail closed (#2419 round 16) ──
+    //
+    // One server for the whole file (the global WAL manifest is a set-once
+    // singleton — see the header), so this rides THIS test rather than
+    // booting a second ProximaDB (which is what the standalone version did;
+    // it failed under the libtest shared-process fallback).
+    let resp = http
+        .post(server.url("/api/v2/collections"))
+        .header("Authorization", "Api-Key dev-key")
+        .json(&serde_json::json!({
+            "name": "props_refused",
+            "dimension": 8,
+            "distance_metric": "cosine",
+            "properties": {"cache.index.mode": "pin"}
+        }))
+        .send()
+        .await
+        .expect("send create with properties");
+    let status = resp.status().as_u16();
+    let body = resp.text().await.unwrap_or_default();
+    assert_eq!(
+        status, 400,
+        "create must refuse unpersisted properties; body={body}"
+    );
+    assert!(
+        body.contains("ALTER TABLE"),
+        "the refusal must name the working path: {body}"
+    );
+    let resp = http
+        .post(server.url("/api/v2/collections"))
+        .header("Authorization", "Api-Key dev-key")
+        .json(&serde_json::json!({
+            "name": "props_target",
+            "dimension": 8,
+            "distance_metric": "cosine"
+        }))
+        .send()
+        .await
+        .expect("send plain create");
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "a property-free create must still succeed"
+    );
+    // The PATCH route is REMOVED (it could only ever refuse — an advertised
+    // capability that does not exist). Restoring a write door should be a
+    // conscious route addition, not a status-code flip.
+    let resp = http
+        .patch(server.url("/api/v2/collections/props_target/properties"))
+        .header("Authorization", "Api-Key dev-key")
+        .json(&serde_json::json!({"properties": {"cache.index.mode": "pin"}}))
+        .send()
+        .await
+        .expect("send patch");
+    assert_eq!(
+        resp.status().as_u16(),
+        404,
+        "PATCH /properties is removed until the merge + catalog write lands"
+    );
 }

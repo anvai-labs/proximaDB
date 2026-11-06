@@ -1,0 +1,514 @@
+= TD-RDSTRAT-14: Probe-policy controller — the algorithm/band dial in one module
+:status: Proposed
+:date: 2026-11-04
+:tags: [read-strategy, ivf, probe, policy, performance]
+
+== Problem
+
+The coarse-probe fan-out is the recall↔GETs dial of the IVF-family read
+path, and it was ONE hardcoded power law: `geometric_nprobe =
+ceil(sqrt(k_c) × multiplier)` clamped `[min, max]` — process-global, no
+collection or query identity (the config doc said so verbatim: "no
+per-collection retune without a signature change (TD-RDSTRAT-9 tracks
+the missing controller)").
+
+Measured consequence (e1 beds, 2026-10/11): cells/query grew 12 → 15 → 43
+across 1M → 3M → 10M at a fixed recall gate — GET fan-out ×3.6 per ×10
+corpus (worse than √N), while bytes/GET fell 4.29 → 2.37 MB (scatter
+defeats coalescing). The 10M $/M-queries cost is ~2× the competitive
+target band.
+
+== Correlation with the known algorithm families
+
+The read path is **IVF-family, deliberately not HNSW**: rank cells in RAM
+(the tiny cached directory), then read the chosen cells' extents as
+coalesced ranges matched to the 4-24 MB GET ladder. HNSW's graph hops are
+random-access — one GET per hop on object storage, structurally wrong for
+the dominant cost term (I/O round-trips). HNSW remains only in the
+in-memory axis index where hops are free.
+
+The cascade maps one-to-one onto the quantization families:
+
+[cols="2,2,3,4"]
+|===
+| scheme | bits/dim | our region | role
+| F32 | 32 | Region C (default-on) | exact distances for final winners
+| F16 | 16 | — (absent by design) | SQ8 owns the middle; C is deliberately exact
+| SQ8 | 8 | Region B | rerank; direct SIMD distance, no LUTs
+| PQ4 | ~4 | — (not used) | needs codebooks + per-query LUTs
+| RaBitQ | ~1 + O(1) | Region A | provable-error binary codes; 2-4× tighter than PQ4
+|===
+
+So: **IVF(RaBitQ codes) → SQ8 rerank → F32 exact** — published math; the
+moat is that each tier is a separately placeable, cacheable, billable
+region in one PAX object. This TD makes the tier-1 fan-out POLICY.
+
+== Design
+
+=== One module, named algorithms (never a formula interpreter)
+
+`crates/storage/proximadb-storage-common/src/probe_policy.rs`:
+
+* `ProbeAlgorithm` — closed enum: `Sqrt | CubeRoot | FourthRoot | Log |
+  Fixed | ByteBudget`. Adding a formula = one variant + one pure fn + one
+  unit test, in this file only.
+* `resolve_probe_plan(policy, cells, corpus_rows, rowgroup_bytes,
+  avg_cell_bytes) -> ProbePlan{cells, probe_bytes, band}` — THE one pure
+  function both consumers call.
+* `band_ladder(rowgroup_bytes, reach)` — discrete rungs DERIVED from the
+  rowgroup geometry (the per-backend IOPS budget: 4 MiB cloud/Azure,
+  8 MiB S3, 1 MiB local): `rg/4, rg/2, rg`, then doubling until the top
+  rung reaches `max(8·rg, reach)`, where `reach` is the cap (or, uncapped,
+  the budget itself). A fixed top made budget arms above it tie — at 4x on
+  cloud (round 3) and at 8x on local disk (round 8) — and made "uncapped"
+  probe less than the capped default (round 10). Band edges live here and
+  nowhere else.
+* `resolve_probe_policy(properties, tags, server)` — the 4-layer chain
+  (property > tag > server TOML > code; **only the server layer is fed
+  today** — the caller passes empty properties and tags until the carrier
+  lands), exported as the ONLY resolution
+  path (no single-channel resolvers — the inert-property bug class stays
+  dead at the type level).
+* `validate_probe_properties` — fail-closed SET-time validation.
+
+A formula string in config would be unvalidatable at SET time,
+untestable, and a security/review surface — the enum is the deliberate
+alternative.
+
+=== ByteBudget — the cost-matched form
+
+`budget = base_bytes × (corpus_rows / 1M)^0.25`, cells = budget /
+avg_cell_bytes, snapped to the band ladder, capped by `cap_bytes`
+(default 4 / 32 MiB). Quarter-power growth means 100× data costs ~3.2×
+probe bytes; the cap bounds worst-case fan-out at ~8 coalesced ranges
+regardless of corpus. This is the form that maps directly to GET bytes —
+the planner plans in the unit the bill is written in.
+
+=== Surfaces (this PR)
+
+* Server TOML: `[storage.sst_config.coarse_probe]` gains `algorithm`
+  ("sqrt" default — byte-for-byte the historical formula for `nprobe_min >= 1` (with `nprobe_min = 0` and a multiplier small enough to plan 0, the old formula probed ZERO cells — an empty result — and this plans 1); the
+  module's regression test pins equality across k_c 1..4096), `base_mb`
+  (4), `cap_mb` (32). Fail-closed at load: an unknown name aborts boot
+  naming the section.
+* DELIBERATE boot change (pre-GA): a NON-FINITE `nprobe_multiplier`
+  (`inf`, NaN) fails boot — `inf` used to mean a silent full scan. A
+  NEGATIVE multiplier keeps booting and keeps its historical meaning
+  (same as 0: probe exactly `nprobe_min`), as do `0` and `cap_mb <
+  base_mb` (round 9 restored negatives; round 8 had rejected them).
+  `base_mb`/`cap_mb` above 1 TiB now fail boot instead of clamping
+  silently, matching the property door.
+* Env overrides (the harness/operator escape hatch, same precedence as
+  every other probe knob): `PROXIMADB_PAX_READ_PROBE_ALGORITHM`,
+  `PROXIMADB_PAX_READ_PROBE_BASE_MB`, `PROXIMADB_PAX_READ_PROBE_CAP_MB`.
+* Both consumers rewired through the module: the per-segment probe
+  (`coarse_probe_nprobe` — now carries `path` for the IOPS geometry and
+  the parsed directory for rows/cell bytes) and the collection directory
+  plan (`centroid_directory_nprobe`, closure into `plan_probe`).
+* Bench harness: `--probe-algorithm/--probe-base-mb/--probe-cap-mb` ->
+  env; the resolved policy pins into result.json.
+
+=== Deferred slices (open)
+
+* **Collection-level `probe.*` properties** — land WITH the search-path
+  property carrier (service-resolved properties into the search arc), in
+  the SAME PR so the keys are never accepted-but-inert. The chain resolver
+  and the value validator ship now; until the carrier lands every write
+  door (`CREATE`, `SET`, `PATCH`) **REFUSES** a `probe.*` property with an
+  error naming the knobs that do work (`[storage.sst_config.coarse_probe]`,
+  `PROXIMADB_PAX_READ_PROBE_*`). Accepting a key that cannot take effect is
+  the bug class the boundary exists to prevent, so the honest interim
+  answer is a refusal, not a silent success. KNOWN SCALING CAVEAT
+  until then: the per-segment fallback path (filtered queries where
+  `row_allow` is set, or pre-directorypublication) scales a byte_budget
+  by SEGMENT rows — more probes than the collection-level plan takes,
+  bounded by the cap; the filtered probe's own adaptive row-matching
+  semantics and `cap_bytes`/`max_cells` keep it from being linear
+  fan-out, but the collection path is the authoritative one.
+* **Axis advisor mirror** — `ivf_param_advisor` keeps its own curves:
+  its nprobe model is recall-target-driven (better than any blind power
+  law where it matters). Revisit only if the PAX and in-memory bands
+  need to co-tune.
+* **Legacy file/block sqrt pruners** (`effective_nprobe`,
+  `BlockPruneMode::Sqrt`, TD-040 seed, helix/swift siblings) — separate
+  BlockPruneConfig plumbing.
+
+== The default-selection experiment
+
+The point of the policy: the DEFAULT becomes a measured decision. Arms
+{sqrt (control), cbrt, fourth_root, log, byte_budget@4MB, @8MB, @16MB}
+× beds {SIFT 1M, 3M (settled + S=1), 10M}; gates recall@10 ≥ 0.97 (plus
+0.98 sensitivity rows); report GETs/q, MB/q, cells/q, $/M. A non-sqrt
+arm holding recall at ≤50% of control GETs on 10M graduates to a default
+-flip PR with the ledger claim + recall ratchet. If no single formula
+dominates, a scale-conditional default (one more pure fn in the module)
+is the fallback — though `byte_budget`'s `(rows/1M)^0.25` factor IS the
+scale adaptation and is expected to win outright.
+
+== Relations
+
+* TD-RDSTRAT-9 — the collection read-cost envelope; this IS its missing
+  controller
+* TD-RDSTRAT-8 PR-B / TD-PAXDIR-1 D2 — the probe consumers this rewires
+* TD-RDSTRAT-13 — morsel-parallel rank downstream of the probe
+* TD-COMPACT-2b / TD-COMPACT-15 — the policy-chain pattern this follows
+* The competitive analysis (2026-11) — the 10M GET fan-out is lever #1
+
+== Review follow-ups (#2419 round 7, deferred by decision)
+
+The #2419 merge gate was set to "no correctness or mandate findings"
+(2026-11-05) after seven review rounds. Round 7's must-fix items were
+fixed in-PR: POST /collections and PATCH /properties now fail closed
+instead of returning 200 for properties they never persist, `unreachable!()`
+was removed from the probe path (mandate #4), and boot validation no longer
+rejects `nprobe_multiplier = 0` ("floor only") or `cap_mb < base_mb`, both of
+which booted before (round 9 later restored negatives too: only a
+NON-FINITE multiplier fails boot — see the boot-change bullet above). These are filed, not fixed:
+
+* *RDSTRAT-14-F1 — tag channel is inert and unvalidated.* A
+  `probe.algorithm:` tag is stored and never read; nothing validates tags
+  at create. Close together with the carrier, or refuse the tag prefix at
+  create the way `probe.*` properties are refused.
+* *RDSTRAT-14-F2 — wasted per-segment work.* `coarse_probe_nprobe(k_c,
+  path, &dir)` walks all cells and parses the path on every segment even
+  when the directory plan replaces `probed`, the env override is set, or
+  the sqrt form ignores those inputs. Compute only when `directory_cells`
+  is `None`, and gather byte/row inputs only for ByteBudget.
+* *RDSTRAT-14-F3 — `ProbePlan` name collision + unmetered plan.* A second
+  `ProbePlan` shares the crate with `centroid_directory::ProbePlan` (the
+  root re-export picks the new one), and its `probe_bytes`/`band` are
+  dropped by the only production caller, so the plan never reaches the
+  query I/O trace the co-design mandate requires. Rename and emit it, or
+  return a count.
+* *RDSTRAT-14-F4 — mis-attached rustdoc.* The "Fold the flat settings …"
+  doc block attaches to `static RESOLVED_PROBE_POLICY`, not
+  `settings_policy`.
+* *RDSTRAT-14-F5 — test can leak process-global settings on failure.*
+  `toml_coarse_probe_config_wins_over_default_init` restores the default
+  only on success; use a drop guard (nextest's process isolation hides it
+  in CI).
+* *RDSTRAT-14-F6 — redundant enum/string round trip.*
+  `ServerProbePolicy.algorithm` is `Option<String>`, so `settings_policy`
+  stringifies an already-parsed enum and `resolve_probe_policy` parses it
+  back; the case-insensitive key lookup is hand-copied for algorithm and
+  multiplier beside `property_usize`. Use `Option<ProbeAlgorithm>` and one
+  `property_str` helper. Same item: `ProbePolicy::default` hard-codes the
+  multiplier/min/base/cap that `CoarseProbeConfig`'s `default_*` functions
+  also define, so a retune in config.rs would leave the code-default layer
+  stale for any field the server layer leaves `None` — derive one from the
+  other.
+* *RDSTRAT-14-F7 — persist create-time properties instead of refusing.*
+  POST /collections now 400s any non-empty `properties`, including plain
+  keys like `team`. That is a status change (200 -> 400) but not a
+  behaviour change: those keys were never stored either — the handler
+  builds a `CollectionConfig` with no properties field, so the 200 was
+  reporting a write that did not happen. The real fix routes
+  `request.properties` into the path `CREATE TABLE ... WITH` uses (which
+  persists and validates them), then lifts the refusal.
+* *RDSTRAT-14-F8 — the generic IVF strategy has its own formula.*
+  `ApproximateSearchStrategy::calculate_nprobe`
+  (`src/core/search/strategies/approximate.rs`) hand-rolls
+  `ceil(sqrt(n) × multiplier)` and does not follow the probe policy; the
+  module doc now says so. Route it through `resolve_probe_plan` once its
+  bounds semantics are reconciled.
+
+== Round 8 (#2419) — fixed in-PR
+
+Harness: inherited probe gates scrubbed per spawn; `--nprobe` refused with
+a probe-policy flag; base/cap bounds mirror the server exactly and are
+refused on arms that do not read them. Ladder: extends to the cap (a fixed
+8x top made local-disk budget arms indistinguishable). Catalog: a SET of a
+policy key replaces its case-variants (two SETs could store
+`cache.index.mode` and `Cache.Index.Mode`, a map the resolver rejects).
+Docs: parity claim scoped to `nprobe_min >= 1`; `cap_mb` documented as
+byte_budget-only and per-pool; the module's "single place" claim scoped to
+the PAX consumers; three handler docs that had slipped onto
+`UpdatePropertiesRequest` reattached. A policy-properties test no longer
+depends on `compaction.target_file_size_mb`, which #2418 refuses.
+
+== Experimental gate (#2419 round 10, by decision)
+
+Mandate #13 requires a recall eval for any surface that changes ranking.
+Only `sqrt` — the historical, recall-ratcheted formula and the default — is
+a production option. `cbrt` / `fourth_root` / `log` / `fixed` /
+`byte_budget` change ANN recall and have no recall@k eval in CI yet, so they
+are admitted only with `PROXIMADB_PAX_READ_PROBE_EXPERIMENTAL=1`: a non-sqrt
+TOML `algorithm` fails boot without it, a non-sqrt env override is warned
+and ignored, and `probe.*` properties stay refused outright. The bench
+harness sets the gate for its ladder arms and records it. An algorithm
+leaves the experimental set only through the ladder experiment + recall
+ratchet + ledger claim this TD already requires for a default flip.
+
+Round 10 also fixed: a single `CREATE TABLE ... WITH` naming one policy knob
+twice (case or whitespace variants) is refused for every policy family (the
+effective value had depended on HashMap order); `cap_mb = 0` no longer
+clamps the band to 8x the rowgroup (an "uncapped" plan probed fewer cells
+than the capped default).
+
+Filed:
+
+* *RDSTRAT-14-F9 — `plan_probe` walks the directory cells twice* (once for
+  per-group bytes, once inside `select_usable_cells` for per-group rows)
+  with identical grouping; one pass computing `(rows, bytes)` per group
+  halves the per-query planning work.
+* *RDSTRAT-14-F10 — key normalization is re-implemented inline* about six
+  times in `probe_policy.rs` (and the filter + `min_by_key` lookup three
+  times) instead of calling `normalize_policy_key`; route them through it so
+  resolvers and the catalog dedup cannot drift.
+
+Round 11 (#2419): the experimental gate is also enforced in
+`settings_policy`, where the policy is built — a Config assembled without
+ConfigLoader (embedded, programmatic start, tests) fell back to no check;
+`cap_mb = 0` is documented as genuinely uncapped (bounded by the
+corpus-scaled budget and the pool, not a fixed top rung); the harness sets
+the gate for `--probe-base-mb/--probe-cap-mb` arms against a TOML
+byte_budget server; two doc blocks reattached to their items. Filed:
+
+* *RDSTRAT-14-F11 — `init_coarse_probe_settings` invalidates on no-op
+  calls.* Every `SstEngine::new()` makes the `None` "fill default if
+  unset" call, which bumps the generation and clears the resolved policy
+  even when nothing changed, forcing an env re-scan (and repeat WARNs for
+  junk values) on the next query. Bump only when the stored settings
+  change.
+
+Round 12 (#2419): the experimental-gate env read moved into
+`probe_policy::experimental_algorithms_enabled`, so `core/config` no longer
+reaches into an engine module (mandate #17a); a non-finite multiplier on a
+non-loader config path is warned about instead of silently becoming the 2.0
+default; the "the floor can only underspend" comment is corrected (the band
+snaps to the NEAREST rung, so a plan can exceed its raw budget by one rung
+step while staying within the cap); the registry calls CAP_MB per probe POOL,
+not per query (segments × cap with the directory off); two contradictory TD
+passages are fixed; PATCH answers an empty request without calling the stub.
+Still filed: F1 (tag channel), F2 (hot-path inputs), F10 (inline
+normalization), F11 (no-op invalidation), and the per-segment budget scaling
+under F2.
+
+Round 13 (#2419; the review ran on the round-11 head, so only findings that
+still held were taken): one multiplier predicate, `is_valid_multiplier`,
+for every layer, bounded at `MAX_PROBE_MULTIPLIER` (1e6) — a finite f64
+above `f32::MAX` passed every check and then narrowed to `inf` in the f32
+sqrt arm, probing every cell; NaN and inf now take one path on non-loader
+configs (warn, use the default); the 1 TiB base/cap bounds fail boot only
+under byte_budget, the one form that reads them; the harness decides the
+experimental gate once (`probe_experimental_gate`) for both the spawn and
+the result.json label. Filed:
+
+* *RDSTRAT-14-F12 — the catalog stores policy keys in their raw spelling.*
+  SET replaces case/whitespace variants (round 8/9), but `' cache.index.mode '`
+  is still persisted with its whitespace, so every resolver re-normalizes on
+  read and only the SET door deduplicates. Persist the normalized key for
+  policy namespaces and the resolvers' tie-breaks go away.
+
+Round 14 (#2419): the Iceberg REST `createTable` door (a fifth property
+door) now validates through `validate_policy_properties`; the experimental
+gate holds on the property and tag layers of the one resolution path, via a
+pure `resolve_probe_policy_gated` (the public entry passes the env value) so
+the future carrier cannot select an ungated algorithm; PATCH refuses an empty
+request too (it read back as "no properties"); `update_collection_properties`
+fails explicitly instead of echoing input, so it cannot be wired in and
+revive the 200-but-unpersisted bug; config validation parses the algorithm
+once; the multiplier rule is stated as shipped (non-finite or > 1e6 fails
+boot). Filed:
+
+* *RDSTRAT-14-F13 — validate at the catalog SINK, not per door.* Five doors
+  now call `validate_policy_properties`; every new door must remember to.
+  Validating once in the catalog's create/evolution path (the crate already
+  depends on storage-common) would make a forgotten door impossible.
+
+Round 15 (#2419): the Iceberg createTable refusal carries the "Bad request:"
+prefix the Iceberg REST layer maps to 400 (it surfaced as a retryable 500
+ServiceUnavailable); finiteness is judged before the negative clamp, so -inf
+takes the same warn-and-default path as +inf instead of silently probing the
+floor; the tag layer matches its prefix case-insensitively and applies the
+experimental gate per tag before "last valid wins"; the PATCH docs say every
+request gets 501. Raised again and kept filed: F2, F3, F6, F10. Pre-existing
+case-variant duplicates already stored (before round 8) are collapsed only
+when that knob is SET again — part of F12 (persist the normalized key).
+
+Round 16 (#2419): `PATCH /collections/{id}/properties` is REMOVED (route,
+handler, request/response types and the service stub). It shipped in #2405
+as a write door that never persisted anything — first echoing its input as
+applied, then refusing 501 — and a route that can only refuse is an
+advertised capability that does not exist (the capability-facade ratchet
+correctly flagged it; deleting is the fix, not rewording). Restore a PATCH
+door together with the merge + catalog write. The create door keeps its
+fail-closed 400; the e2e pins the removal with a 404. Also: the experimental
+gate now holds on the server layer of the resolution path (not just the
+env/TOML doors and the property/tag layers), so no future caller of the
+exported entry can select an ungated algorithm; the resolved-policy cache is
+poison-safe (a poisoned RwLock disabled it forever, re-running the env scan
+and its WARNs per query).
+
+Round 17 (#2419): the Iceberg createTable door REFUSES reserved table
+properties instead of silently stripping them (a 200 that dropped `owner`
+while every other door rejects it); the per-segment corpus/geometry inputs
+(corpus_rows, avg_cell_bytes, IopsBudget::for_path) are gathered lazily,
+ONLY for byte_budget, inside the count closure — the default sqrt path pays
+none of the O(k_c) walks or the registry lookup it provably never reads
+(this was F2's escalation onto the default path; the directory-path
+single-walk merge stays F9); the default-chain tests skip under an exported
+PROXIMADB_PAX_READ_PROBE_* env instead of failing (the settings chain folds
+the env layer — a leftover bench shell changed their answer; the pure-module
+tests stay env-free); the property-doors e2e rides the file's single-boot
+test instead of starting a second ProximaDB (the WAL manifest is a set-once
+singleton under the libtest fallback); the registry rows state the snapshot
+semantics; the resolver's multiplier comment matches the shipped rules.
+
+Round 18 (#2419): Iceberg `commit_table` SetProperties refuses table-property
+writes instead of `let _ = updates` + success (Spark/Flink set table
+properties exactly this way — silently discarded); the dead
+`without_reserved_table_properties` helper is deleted with its test (the
+refusal replaced it; two competing policies invited rewiring the strip);
+`coarse_probe_nprobe` reads the policy ONCE and threads it through a new
+`geometric_nprobe_with` (a re-seed between two reads could plan byte_budget
+with the zeroed fallback geometry — a one-query full-pool probe); the
+non-loader clamps are LOUD (cap/base over the bound warns on clamp, base=0
+under byte_budget warns on default) — the loader aborts on these, so
+silence gave embedded/programmatic configs a third behaviour and mislabelled
+arms; CoarseProbeConfig's doc states which envs are per-call and which are
+snapshotted. Filed:
+
+* *RDSTRAT-14-F14 — directory rowgroup geometry from the lex-min live URL.*
+  `plan_segments` derives the byte_budget band ladder from the
+  lexicographically smallest live URL, so it flips when that segment
+  compacts away or a scheme migration advances (1 MiB local vs 4 MiB cloud
+  rungs, mid-experiment, no config change). Plumb the CONFIGURED storage
+  location's budget instead. byte_budget arms only (experimental-gated).
+
+Round 19 (#2419): the SetProperties refusal is COLLECTED and raised after
+the update loop — bailing mid-loop rejected the bundled add-snapshot too,
+so a Spark `writeTo(...).tableProperty(...)` lost its DATA append, not just
+the property change; the file-derived per-group/cell byte sums are
+saturating (a crafted directory could overflow-panic a debug build);
+the directory path resolves its rowgroup budget lazily, byte_budget-only,
+inside the nprobe closure (the per-query registry+env scan is gone from
+the default path, matching round 17's per-segment rule);
+snap_to_band returns a real ladder rung when the cap sits between rungs
+(`ProbePlan.band` could report a band the ladder never contained); the
+env-guarded default-chain tests print a visible SKIPPED line instead of
+passing vacuously; one `policy_value` helper replaces the hand-copied
+case-insensitive lookups, and the probe.* refusal keys on
+`normalize_policy_key`. The dead tag channel was raised again (F1): when
+the carrier lands it must validate at the same doors, or the tag prefix
+must be refused until then.
+
+Round 20 (#2419, on the rebased final head): probe_bytes multiplies are
+saturating (the round-19 fix covered the sums but missed the products);
+the cross-PR policy test no longer asserts either behaviour for
+`compaction.strategy = "consolidate"` (#2418 refuses it at the same door —
+an assertion for either side breaks whichever PR merges second; end-state
+refused); the SetProperties refusal is ATOMIC, before the update loop —
+round 19's collect-then-bail claimed bundled data updates were applied
+first, but the loop's AddSnapshot arm is a debug no-op, and once snapshot
+handling lands that ordering would half-apply a commit then 400 (retry →
+duplicate append); `geometric_nprobe` is #[cfg(test)] (production callers
+use `geometric_nprobe_with` with a policy read once); the probe.* refusal
+derives its prefix from POLICY_PROPERTY_PREFIXES and the doc-slip on
+`validate_policy_properties` is gone.
+
+Round 21 (#2419): the Iceberg `createTable` door STRIPS system-written keys
+again instead of refusing them. Round 17 made it a refusal, which broke
+standard third-party DDL: Spark adds `owner` to every
+`CREATE TABLE ... USING iceberg` (`CatalogV2Util.withDefaultOwnership`),
+Trino/Flink likewise — refusing a key the client cannot choose not to send
+is a broken door, not a closed one. The two doors now differ ON PURPOSE and
+`without_reserved_table_properties` documents why: SQL DDL refuses
+(its callers are ours), the Iceberg surface strips, and POLICY namespaces
+are validated on BOTH. The property layer gained the server layer's
+`base == 0` guard (a zero budget would be rounded up to the smallest rung —
+a third behaviour), pinned by a both-layers symmetry test. And
+`tests/recall_tune_auth_e2e.rs` — which carries the create/PATCH contract
+assertions — was in NO workflow lane, so those assertions never gated; it
+now runs in the storage integration lane with process-per-test isolation.
+
+Not fixed here, by design: `resolve_strategy_from_properties` and
+`resolve_target_file_size_mb` still use a non-deterministic `.find()` over
+case-variant keys — both functions are DELETED by #2418 (verified), so
+patching them here would conflict and fix dying code.
+
+The SetProperties commit refusal stays ATOMIC (round 20). Round 21 noted it
+turns a previously-"succeeding" bundled commit into a 400; that success was
+the bug — the property write was silently discarded — and applying the
+snapshot while dropping the property would leave the client believing both
+landed, which retries make worse.
+
+Round 22 (#2419): the red "Deterministic Commit Contract" check was the
+LANE-COVERAGE RATCHET — wiring `recall_tune_auth_e2e.rs` into a lane made
+it covered while `scripts/ci_lane_baseline.txt` still listed it as
+uncovered, which `check_ci_lane_coverage.py` fails by design. The entry is
+removed by hand, NOT by `--update-baseline`: the regen strips the inline
+comments five unrelated entries carry ("permanent resident", "not a test
+target", "the dedup-wave owner's call"), which is information this repo
+keeps on purpose.
+
+Also: `commit_table`'s SetProperties now follows the SAME strip-then-judge
+rule as `create_table` — drop the system-written keys, refuse only if a
+client-meaningful one remains. A blanket refusal broke Spark staged
+create/CTAS and `ALTER TABLE ... SET TBLPROPERTIES`, which reach this door
+as an `updateTable` commit carrying the unavoidable `owner`/`write.*`
+keys, and it contradicted the create door one function above.
+`ProbePlan.probe_bytes` is `0` for the cell-count forms instead of
+`cells x 1` — the production callers hand them zero geometry, so
+`cell_bytes` fell back to 1 and the field reported a CELL COUNT labelled as
+bytes, which the first metering consumer would have booked. The doc says
+`0` = not planned in bytes, and a test pins it. The over-bound clamp warn
+fires only under `byte_budget`: `validate` bounds base/cap inside its
+byte_budget branch by design, so the unconditional warn told operators the
+loader refuses a value it had just accepted.
+
+Round 23 (#2419): the round-22 Iceberg fix was WRONG in the way it claimed
+to be right. It stripped `is_reserved_table_property` keys and refused
+whatever remained, on the stated assumption that `write.*` was among them —
+but `RESERVED_TABLE_PROPERTY_PREFIXES` is `asset.`/`collection.`/`vector.`/
+`stats.` plus exact `owner`/`tags`, so `write.parquet.compression-codec`
+(which Spark adds unconditionally when rebuilding create properties)
+survived the strip and 400'd the commit, discarding the AddSchema/AddSnapshot
+updates bundled with it. That is precisely the staged-create/CTAS regression
+round 22 set out to fix, reintroduced by the same patch.
+
+The door now refuses exactly the POLICY namespaces (`cache.`/`compaction.`/
+`probe.`) through one shared predicate, `is_policy_property`, and lets every
+other key through — the Iceberg engine owns `write.*`, `format-version` and
+`commit.*`, and this door has no business judging them. A test pins both
+directions of that split. The refusal also covers `RemoveProperties`: an
+`UNSET TBLPROPERTIES ('cache.index.mode')` previously fell to the
+`_ => debug!("unhandled")` arm and returned SUCCESS while the property
+stayed set — the accepted-but-inert class this PR exists to close, left open
+on the adjacent arm. And it names ALL offending keys, sorted: picking
+`keys().next()` from a `HashMap` made the 400 cite a different key between
+attempts on the same request.
+
+Also: the storage integration lane's path filter now includes
+`src/network/rest/v2/**` and `tests/recall_tune_auth_e2e.rs`. Wiring the
+test into the lane was not enough — the job's `if` gate is
+`storage_changes || core_changes`, and neither filter matched the REST v2
+surface the test asserts on, so a future PR re-adding the PATCH route would
+have skipped the lane and the assertions would not have gated it. Same
+"filter does not track the outcome" failure as TD-RECALL-2/#1406, one
+surface over.
+
+Two smaller ones: the `base_mb = 0` warn is evaluated AFTER the whole
+resolution chain, because at the server layer only the server algorithm has
+been applied and a tag or property can still select `byte_budget` — the
+combination the collection-level carrier will make common. And
+`init_coarse_probe_settings` bumps the generation only when the stored
+settings actually change: every `SstEngine::new()` calls it with `None` to
+fill the default, so an unconditional bump re-ran the env scan and
+re-emitted any junk-value WARN after every engine construction, defeating
+the memo the cache exists for (RDSTRAT-14-F11 closed).
+
+Round 24 (#2419): first round with NO correctness findings. Two minors
+fixed: the commit-door 400 for `probe.*` keys pointed at the pgwire SET
+door, which refuses every probe.* key — it now names the server-level path
+(`[storage.sst_config.coarse_probe]` / `PROXIMADB_PAX_READ_PROBE_*`) when
+any refused key is probe.*; and a one-line doc comment that an insert had
+glued onto `is_policy_property` while it describes `normalize_policy_key`
+moved home.
+
+Scoped verification of the round-24 commit (fresh-context, zero must-fix):
+one LOW filed, not fixed — a MIXED refusal (a cache.*/compaction.* key plus
+a probe.* key) names both but advises only the server-level path, dropping
+the pgwire advice for the non-probe keys. No wrong path is named (the
+any-probe-* rule is deliberate); polish for a follow-up. Also noted there:
+the where_to message branching has no test asserting either variant.

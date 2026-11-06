@@ -1,0 +1,1256 @@
+//! TD-RDSTRAT-14: the policy-driven probe-band controller — the single place
+//! the PAX coarse-probe fan-out formula lives (both PAX consumers: the
+//! per-segment A0 probe and the collection centroid directory). The generic
+//! IVF `ApproximateSearchStrategy::calculate_nprobe` still carries its own
+//! `ceil(sqrt(n) × multiplier)` and does not follow this policy yet
+//! (RDSTRAT-14-F8).
+//!
+//! The probe count is the recall↔GETs dial of the IVF-family read path: rank
+//! cells in RAM, then read the chosen cells' extents as coalesced ranges.
+//! Before this module the fan-out was one hardcoded power law
+//! (`ceil(sqrt(k_c) × multiplier)`, process-global, no collection identity)
+//! and measured GET fan-out grew ×3.6 per ×10 corpus at a fixed recall gate —
+//! worse than √N. Now the formula is a POLICY resolved through the same
+//! chain as the cache and compaction policies:
+//!
+//! ```text
+//! collection property (probe.*) > operator tag (probe.algorithm:x)
+//!   > server TOML [storage.sst_config.coarse_probe] > code default
+//! ```
+//!
+//! The algorithms are a CLOSED ENUM of named pure functions — never a
+//! formula interpreter: an expression string in config would be
+//! unvalidatable at SET time and untestable (and a review/security surface).
+//! Adding "some complex formula" means adding one variant + one pure fn +
+//! one unit test in this file.
+//!
+//! The discrete band ladder is DERIVED from the rowgroup geometry (the
+//! per-backend IOPS budget target — 4 MiB cloud, 8 MiB S3, 1 MiB local),
+//! never configured and never duplicated at call sites: band edges live in
+//! [`band_ladder`] and nowhere else.
+//!
+//! Default policy = `Sqrt` with the shipped multiplier/min/max: byte-for-byte
+//! the previous behavior for `nprobe_min >= 1` (with `nprobe_min = 0` and a multiplier small enough to plan 0, the old formula probed ZERO cells — an empty result — and this plans 1). A different default requires the bed experiment
+//! (recall-gated) + a ledger claim — the storage-format migration doctrine.
+
+use std::collections::HashMap;
+
+/// The named probe-band algorithms. Each is one pure fn below; the policy
+/// selects by name (`sqrt|cbrt|fourth_root|log|fixed|byte_budget`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum ProbeAlgorithm {
+    /// `ceil(cells^0.5 × multiplier)` — the historical default.
+    #[default]
+    Sqrt,
+    /// `ceil(cells^0.333 × multiplier)` — the sub-linear candidate for
+    /// large corpora.
+    CubeRoot,
+    /// `ceil(cells^0.25 × multiplier)` — the aggressive end of the root
+    /// ladder.
+    FourthRoot,
+    /// `ceil(multiplier × log2(cells + 1))` — logarithmic growth. A PURE
+    /// cell-count form: `base_bytes` is deliberately NOT an input (adding a
+    /// byte magnitude to a cell count made this arm a silent full scan).
+    Log,
+    /// `min_cells` passthrough (clamped) — exact control arm.
+    Fixed,
+    /// Probe a fixed BYTE budget per query, sub-linear in corpus:
+    /// `budget = base × (rows / 1M)^0.25`, snapped to the band ladder and
+    /// capped by `cap_bytes`; cells = budget / avg_cell_bytes. The
+    /// cost-matched form: the plan maps directly to GET bytes.
+    ByteBudget,
+}
+
+impl ProbeAlgorithm {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "sqrt" => Some(Self::Sqrt),
+            "cbrt" | "cube_root" => Some(Self::CubeRoot),
+            "fourth_root" | "4th_root" => Some(Self::FourthRoot),
+            "log" | "logarithmic" => Some(Self::Log),
+            "fixed" => Some(Self::Fixed),
+            "byte_budget" | "budget" => Some(Self::ByteBudget),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Sqrt => "sqrt",
+            Self::CubeRoot => "cbrt",
+            Self::FourthRoot => "fourth_root",
+            Self::Log => "log",
+            Self::Fixed => "fixed",
+            Self::ByteBudget => "byte_budget",
+        }
+    }
+}
+
+/// A resolved probe policy (all layers merged). Numeric fields reuse the
+/// `CoarseProbeConfig` names so the TOML surface stays familiar.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProbePolicy {
+    pub algorithm: ProbeAlgorithm,
+    /// Scale factor for the root/log forms (TOML `nprobe_multiplier`,
+    /// default 2.0 — recall-ratcheted).
+    pub multiplier: f64,
+    /// Floor on the probe count (TOML `nprobe_min`, default 3).
+    pub min_cells: usize,
+    /// Ceiling on the probe count (TOML `nprobe_max`; 0 = unlimited).
+    pub max_cells: usize,
+    /// Base per-query probe byte budget for `ByteBudget` (bytes). The
+    /// root and `Log` forms are cell-count functions and ignore it.
+    pub base_bytes: u64,
+    /// Per-probe-pool byte cap for `ByteBudget` (bytes; 0 = none). With `0`
+    /// the plan is genuinely uncapped: the ladder is built up to the budget
+    /// itself, so fan-out is bounded only by the corpus-scaled budget
+    /// (`base_bytes`, itself <= [`MAX_PROBE_BUDGET_MB`]) and the cell pool.
+    /// Set a cap whenever per-query GET bytes must be bounded.
+    pub cap_bytes: u64,
+}
+
+impl Default for ProbePolicy {
+    fn default() -> Self {
+        Self {
+            algorithm: ProbeAlgorithm::Sqrt,
+            multiplier: 2.0,
+            min_cells: 3,
+            max_cells: 0,
+            base_bytes: 4 * 1024 * 1024,
+            cap_bytes: 32 * 1024 * 1024,
+        }
+    }
+}
+
+/// The server-TOML layer of the chain (mirrors `ServerCachePolicy`'s role):
+/// raw config fields, resolved against the code default per key.
+#[derive(Debug, Clone, Default)]
+pub struct ServerProbePolicy {
+    pub algorithm: Option<String>,
+    pub multiplier: Option<f64>,
+    pub min_cells: Option<usize>,
+    pub max_cells: Option<usize>,
+    pub base_bytes: Option<u64>,
+    pub cap_bytes: Option<u64>,
+}
+
+/// The result of one probe-plan computation: the cell count AND the byte
+/// band it snapped to — the plan the caller reads, meters, and bills.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProbePlan {
+    pub cells: usize,
+    /// Planned probe bytes (cells × avg_cell_bytes, band-snapped) — only
+    /// the `ByteBudget` form plans in bytes. `0` means NOT PLANNED IN BYTES
+    /// (the cell-count forms), never "zero bytes": a metering consumer must
+    /// treat 0 as absent rather than booking it.
+    pub probe_bytes: u64,
+    /// The band rung the plan snapped to (0 when not band-constrained).
+    pub band: u64,
+}
+
+/// The largest multiplier any layer accepts. The sqrt arm computes in f32
+/// (byte-identity with the historical formula), so a finite f64 above
+/// `f32::MAX` would narrow to `inf` there and probe every cell — the silent
+/// full scan the finiteness checks exist to block (#2419 review round 13).
+/// 1e6 is far beyond any meaningful fan-out multiplier.
+pub const MAX_PROBE_MULTIPLIER: f64 = 1e6;
+
+/// Whether `m` is a usable multiplier: finite, non-negative (0 = probe
+/// exactly the floor) and at most [`MAX_PROBE_MULTIPLIER`].
+pub fn is_valid_multiplier(m: f64) -> bool {
+    m.is_finite() && (0.0..=MAX_PROBE_MULTIPLIER).contains(&m)
+}
+
+/// The env gate that admits the non-default (EXPERIMENTAL) algorithms.
+///
+/// Only `sqrt` — the historical formula, recall-ratcheted — is a production
+/// option. The others change ANN recall and have no recall@k eval gating
+/// them in CI (mandate #13), so they are a bench/staging surface: admitted
+/// only when this gate is `1`. One becomes a production option through the
+/// ladder experiment + recall ratchet + ledger claim this TD requires for a
+/// default flip, at which point it leaves this set.
+pub const PROBE_EXPERIMENTAL_ENV: &str = "PROXIMADB_PAX_READ_PROBE_EXPERIMENTAL";
+
+impl ProbeAlgorithm {
+    /// Whether selecting this algorithm requires [`PROBE_EXPERIMENTAL_ENV`].
+    pub fn is_experimental(self) -> bool {
+        self != ProbeAlgorithm::Sqrt
+    }
+}
+
+/// Whether the experimental algorithms are admitted
+/// (`PROXIMADB_PAX_READ_PROBE_EXPERIMENTAL=1`). Lives beside the gate's name
+/// so config validation and the engine read it through this stable crate
+/// path — `core/config` must not reach into an engine module for it
+/// (mandate #17a; #2419 review round 12).
+pub fn experimental_algorithms_enabled() -> bool {
+    std::env::var(PROBE_EXPERIMENTAL_ENV).is_ok_and(|value| value.trim() == "1")
+}
+
+/// The discrete band ladder, DERIVED from the rowgroup geometry and the cap:
+/// rungs `rg/4, rg/2, rg`, then doubling until the top rung reaches
+/// `max(8·rg, cap_bytes)`, filtered to sane bounds (sub-512 KiB probes are
+/// pointless). Band edges live HERE and nowhere else.
+///
+/// The ladder MUST be able to reach the cap, or every budget above the top
+/// rung collapses onto it and the ladder experiment cannot tell its own arms
+/// apart. A fixed `8·rg` top did that on local disk (#2419 review round 8):
+/// a 1 MiB rowgroup target topped out at 8 MiB under the 32 MiB default cap,
+/// so `byte_budget@8MB` and `@16MB` planned identically. The loop is bounded:
+/// the cap is clamped to [`MAX_PROBE_BUDGET_MB`] upstream, and the rung
+/// doubles (saturating), so it terminates in at most ~64 steps.
+pub fn band_ladder(rowgroup_bytes: u64, cap_bytes: u64) -> Vec<u64> {
+    let rg = rowgroup_bytes.max(1);
+    let top = rg.saturating_mul(8).max(cap_bytes);
+    let mut rungs = vec![rg / 4, rg / 2, rg];
+    let mut rung = rg;
+    while rung < top {
+        let next = rung.saturating_mul(2);
+        if next == rung {
+            break; // saturated at u64::MAX
+        }
+        rung = next;
+        rungs.push(rung);
+    }
+    rungs.retain(|rung| *rung >= 512 * 1024);
+    rungs
+}
+
+/// Snap `bytes` to the nearest ladder rung (ties keep the LOWER rung —
+/// fewer probes on ambiguity), bounded by `cap_bytes` (a cap above the top
+/// rung still bites: the returned plan never exceeds it). When the ladder
+/// is empty (a sub-512 KiB rowgroup target) the cap applies directly.
+fn snap_to_band(bytes: u64, rowgroup_bytes: u64, cap_bytes: u64) -> u64 {
+    let mut target = bytes;
+    if cap_bytes > 0 {
+        target = target.min(cap_bytes);
+    }
+    // Uncapped (`cap_bytes = 0`) means the budget itself is the ceiling the
+    // ladder must reach: building it to `8·rg` instead clamped an "uncapped"
+    // plan BELOW the default 32 MiB cap on local disk and S3, probing fewer
+    // cells than the capped default (#2419 review round 10).
+    let reach = if cap_bytes > 0 { cap_bytes } else { target };
+    let ladder = band_ladder(rowgroup_bytes, reach);
+    if ladder.is_empty() {
+        return target;
+    }
+    let mut best = ladder[0];
+    let mut best_dist = u64::MAX;
+    for &rung in &ladder {
+        let dist = rung.abs_diff(target);
+        if dist < best_dist {
+            best_dist = dist;
+            best = rung;
+        }
+    }
+    // The result is a LADDER RUNG (its doc contract). When the cap sits
+    // BETWEEN rungs, `min(cap)` returned the cap itself — a value the
+    // ladder never contained, so `ProbePlan.band` reported a band that does
+    // not exist (#2419 review round 19). Take the nearest rung NOT above
+    // the cap instead; a cap below the smallest rung keeps the cap (the
+    // documented sub-ladder case — no rung fits).
+    if cap_bytes > 0 {
+        if best <= cap_bytes {
+            best
+        } else {
+            ladder
+                .into_iter()
+                .filter(|rung| *rung <= cap_bytes)
+                .max()
+                .unwrap_or(cap_bytes)
+        }
+    } else {
+        best
+    }
+}
+
+/// THE one pure function: the probe plan for a query under a policy.
+///
+/// * `cells` — the candidate pool: `k_c` per-segment coarse cells, or the
+///   collection-total usable cells for directory planning.
+/// * `corpus_rows` — rows the candidate pool covers (drives ByteBudget's
+///   sub-linear scaling).
+/// * `rowgroup_bytes` — the per-backend IOPS-budget target
+///   (`IopsBudget::for_path(path).target_block_bytes()`): the band geometry.
+/// * `avg_cell_bytes` — mean Region-A extent per cell (both call sites have
+///   the parsed cell list; 0 falls back to rowgroup_bytes/8).
+///
+/// Clamped `[min_cells, max_cells]` then to `cells`, with the
+/// max-then-min ordering so a pool smaller than `min_cells` cannot panic
+/// (no-panic mandate #4).
+///
+/// SCALING CAVEAT (per-pool semantics): `corpus_rows` scales the budget of
+/// THIS pool. The collection-directory site passes collection-total rows
+/// (the authoritative path); a per-segment caller that lacks collection
+/// context scales per-SEGMENT — more probes than the collection-level plan
+/// would take, bounded by `cap_bytes`/`max_cells`. Callers should prefer
+/// the collection path (TD-RDSTRAT-14 §Deferred).
+pub fn resolve_probe_plan(
+    policy: &ProbePolicy,
+    cells: usize,
+    corpus_rows: u64,
+    rowgroup_bytes: u64,
+    avg_cell_bytes: u64,
+) -> ProbePlan {
+    let pool = cells.max(1) as f64;
+    let cell_bytes = if avg_cell_bytes > 0 {
+        avg_cell_bytes
+    } else {
+        (rowgroup_bytes / 8).max(1)
+    };
+    match policy.algorithm {
+        // ByteBudget plans in BYTES end-to-end: budget → cap → band → cells,
+        // so the cap genuinely bounds fan-out rather than just relabelling
+        // the plan. One documented exception: `min_cells` is a RECALL floor
+        // and wins over the byte budget, so when it raises the count above
+        // what the band affords, `probe_bytes` exceeds `band` (recall is
+        // not negotiable for a cost knob). `band` is then the budget rung
+        // and `probe_bytes` the honest cost of the floor.
+        ProbeAlgorithm::ByteBudget => {
+            // Budget grows quarter-power with corpus; 1M rows is the base.
+            let scale = (corpus_rows.max(1) as f64 / 1_000_000.0).powf(0.25);
+            let mut budget = policy.base_bytes as f64 * scale;
+            if policy.cap_bytes > 0 {
+                budget = budget.min(policy.cap_bytes as f64);
+            }
+            let snapped = snap_to_band(budget as u64, rowgroup_bytes, policy.cap_bytes).max(1);
+            // FLOOR, not ceil: ceil let the plan exceed the cap by up to one
+            // cell (cap 1 MiB with 0.75 MiB cells planned 2 cells = 1.5 MiB,
+            // 50% over a cap the registry advertises as bounding the CELL
+            // COUNT). The floor underspends the SNAPPED BAND, never the cap.
+            // It is not a bound on the raw budget: the band snaps to the
+            // NEAREST rung, which can sit above `base x (rows/1M)^0.25` (a
+            // 6.1 MiB budget snaps up to 8 MiB; a sub-rung budget snaps up to
+            // the smallest rung), so a plan may exceed its raw budget by up to
+            // one rung step while staying within the cap (#2419 review round
+            // 12). One cell is the irreducible minimum, so a cap below one
+            // cell still probes one.
+            let by_budget = ((snapped / cell_bytes.max(1)) as usize).max(1);
+            // The RECALL FLOOR wins over the byte cap, matching the
+            // documented exception below: clamping the floor to the cap let
+            // a small cap collapse the probe to 1 cell — which breached the
+            // cap anyway whenever one cell alone exceeds it, so the clamp
+            // bought nothing and cost recall. A cost knob never silently
+            // trades away recall.
+            let floor = policy.min_cells.max(1);
+            let floored = by_budget.max(floor);
+            let bounded = if policy.max_cells > 0 {
+                floored.min(policy.max_cells)
+            } else {
+                floored
+            };
+            let chosen = bounded.min(cells.max(1));
+            ProbePlan {
+                cells: chosen,
+                probe_bytes: (chosen as u64).saturating_mul(cell_bytes), // saturating: cell_bytes is file-derived (round 20)
+                band: snapped,
+            }
+        }
+        _ => {
+            let raw = match policy.algorithm {
+                // f32 DELIBERATELY: the historical formula was
+                // `((k_c as f32).sqrt() * multiplier_f32).ceil()`, and
+                // widening to f64 changes the ceil for multipliers that are
+                // not exactly representable in f32 (e.g. 1.1 at k_c=100
+                // gives 11 in f32, 12 in f64 — 31 differing k_c below
+                // 100k). Operators have recall-tuned that multiplier, so
+                // the default path must stay byte-identical, not just at
+                // the shipped 2.0.
+                // ByteBudget never reaches this arm (the outer match takes
+                // it); it shares the historical sqrt form here instead of an
+                // `unreachable!()`, because mandate #4 forbids panic macros
+                // in production code and a later edit to the outer match
+                // would otherwise turn into a query-path panic.
+                ProbeAlgorithm::Sqrt | ProbeAlgorithm::ByteBudget => {
+                    ((pool as f32).sqrt() * (policy.multiplier as f32)).ceil() as f64
+                }
+                ProbeAlgorithm::CubeRoot => (pool.cbrt() * policy.multiplier).ceil(),
+                ProbeAlgorithm::FourthRoot => (pool.sqrt().sqrt() * policy.multiplier).ceil(),
+                // A pure cell-count function. It previously added
+                // `log2(base_bytes)` — a BYTE magnitude (~22 for 4 MiB) — to
+                // a cell count, which made the `log` arm probe every cell
+                // of any realistic pool (30/30 at the shipped geometry),
+                // i.e. a silent full scan.
+                ProbeAlgorithm::Log => (policy.multiplier * (pool + 1.0).log2()).ceil(),
+                ProbeAlgorithm::Fixed => policy.min_cells.max(1) as f64,
+            };
+            let raw = raw.max(1.0) as usize;
+            let floored = raw.max(policy.min_cells.max(1));
+            let bounded = if policy.max_cells > 0 {
+                floored.min(policy.max_cells)
+            } else {
+                floored
+            };
+            let chosen = bounded.min(cells.max(1));
+            ProbePlan {
+                cells: chosen,
+                // 0, NOT cells x cell_bytes: the cell-count forms
+                // (sqrt/cbrt/fourth_root/log/fixed) are given zero geometry
+                // by every production caller, so `cell_bytes` fell back to
+                // 1 and this reported a CELL COUNT labelled as bytes —
+                // which the first metering/billing consumer would have
+                // booked as 1 byte per cell (#2419 review round 22).
+                // `0` means "not planned in bytes"; see the field doc.
+                probe_bytes: 0,
+                band: 0,
+            }
+        }
+    }
+}
+
+/// The property key for the algorithm (`probe.algorithm`).
+pub const PROBE_ALGORITHM_PROPERTY_KEY: &str = "probe.algorithm";
+/// The tag prefix for the algorithm channel (`probe.algorithm:x`).
+pub const PROBE_ALGORITHM_TAG_PREFIX: &str = "probe.algorithm:";
+const PROBE_MULTIPLIER_KEY: &str = "probe.multiplier";
+const PROBE_MIN_CELLS_KEY: &str = "probe.min_cells";
+const PROBE_MAX_CELLS_KEY: &str = "probe.max_cells";
+const PROBE_BASE_MB_KEY: &str = "probe.base_mb";
+const PROBE_CAP_MB_KEY: &str = "probe.cap_mb";
+
+fn property_usize(properties: &HashMap<String, String>, key: &str) -> Option<usize> {
+    crate::policy_properties::policy_value(properties, key)
+        .and_then(|v| v.trim().parse::<usize>().ok())
+    // NO `> 0` filter: 0 is the sentinel (no floor / unlimited / no cap) that
+    // `validate_probe_properties` accepts and the server layer honours, so
+    // dropping it here resolved `probe.cap_mb=0` silently back to the code
+    // default — the property channel validating a value it then ignored.
+    // `base_mb = 0` is refused at the validation door instead.
+}
+
+/// The largest MiB value any probe budget knob accepts (1 TiB). Bounds the
+/// MiB->bytes multiply so a hand-written property cannot overflow it
+/// (debug: arithmetic panic, which mandate #4 forbids; release: a wrapped
+/// garbage cap).
+pub const MAX_PROBE_BUDGET_MB: usize = 1024 * 1024;
+
+fn property_u64_mb(properties: &HashMap<String, String>, key: &str) -> Option<u64> {
+    property_usize(properties, key)
+        .map(|mb| mb.min(MAX_PROBE_BUDGET_MB) as u64)
+        .map(|mb| mb.saturating_mul(1024 * 1024))
+}
+
+/// The full precedence chain — the ONLY exported resolution path (no
+/// single-channel resolvers: a caller resolving only tags or only properties
+/// silently misses the other layers, the "property set but inert" bug class
+/// closed at the type level in the compaction policy first).
+///
+/// Per key: collection property > operator tag (algorithm only) > server
+/// TOML > code default. An explicit value at any layer wins over defaults
+/// below it; silence falls through.
+///
+/// TODAY only the server layer is fed: the one production caller
+/// (`settings_policy` in segment_format.rs) passes empty properties AND
+/// empty tags until the search-path carrier lands (TD-RDSTRAT-14
+/// §Deferred). `probe.*` properties are refused at the door for that
+/// reason; a `probe.algorithm:` TAG is not yet validated anywhere, so it is
+/// stored and ignored — tracked as RDSTRAT-14-F1, not yet closed.
+pub fn resolve_probe_policy(
+    properties: &HashMap<String, String>,
+    tags: &[String],
+    server: &ServerProbePolicy,
+) -> ProbePolicy {
+    resolve_probe_policy_gated(properties, tags, server, experimental_algorithms_enabled())
+}
+
+/// [`resolve_probe_policy`] with the experimental gate as an explicit INPUT
+/// rather than an env read, so the chain is a pure function: the public entry
+/// passes the env value, and tests exercise both gate states without touching
+/// process-global env (mandate #11).
+pub fn resolve_probe_policy_gated(
+    properties: &HashMap<String, String>,
+    tags: &[String],
+    server: &ServerProbePolicy,
+    admit_experimental: bool,
+) -> ProbePolicy {
+    let mut policy = ProbePolicy::default();
+
+    // Server TOML layer (validated at load; junk is inert here, rejected
+    // there). The experimental gate applies HERE too, not only at the
+    // env/TOML doors: a second caller of the exported entry (the deferred
+    // collection carrier) must not be able to select an ungated algorithm by
+    // filling the server layer (#2419 review round 16).
+    if let Some(algorithm) = server
+        .algorithm
+        .as_deref()
+        .and_then(ProbeAlgorithm::parse)
+        .filter(|a| !a.is_experimental() || admit_experimental)
+    {
+        policy.algorithm = algorithm;
+    }
+    // The multiplier rules, as shipped (#2419 round 17 corrected this
+    // comment): config load rejects NON-FINITE and >1e6 values but ACCEPTS
+    // negatives and 0 (a negative behaved exactly like 0 before this module
+    // and keeps that meaning; see `CoarseProbeConfig::validate`).
+    // settings_policy clamps negatives to 0 before they reach here, so this
+    // filter is the same rule expressed once more for non-loader paths —
+    // and it must stay in sync with `is_valid_multiplier`, never diverge.
+    if let Some(multiplier) = server.multiplier.filter(|m| is_valid_multiplier(*m)) {
+        policy.multiplier = multiplier;
+    }
+    // `Some(0)` is a documented SENTINEL on the server layer, not junk:
+    // `nprobe_min = 0` means "no floor" and `cap_mb = 0` means "no cap"
+    // (src/core/config.rs). Filtering it out silently substituted the code
+    // defaults (floor 3, cap 32 MiB) — config accepted-but-inert.
+    if let Some(min) = server.min_cells {
+        policy.min_cells = min;
+    }
+    if let Some(max) = server.max_cells {
+        policy.max_cells = max;
+    }
+    // `base_mb = 0` is refused at boot under byte_budget (the only form that
+    // reads it); silently dropping it here gave a non-loader construction a
+    // third behaviour and a mislabelled experiment arm (#2419 review round
+    // 18). Loud instead — the resolver is pure, but a warn is side-effect
+    // free and this is a configuration defect.
+    // Only the ASSIGNMENT happens here. The warn is deferred to the end of
+    // the chain: at this point just the SERVER algorithm has been applied,
+    // and a tag or property can still select byte_budget below — so judging
+    // `policy.algorithm` here skipped the warn for exactly the combination
+    // (server base_mb = 0, byte_budget from a tag/property) that the
+    // collection-level carrier will make common (#2419 review round 23).
+    let server_stated_zero_base = server.base_bytes == Some(0);
+    if let Some(base) = server.base_bytes.filter(|base| *base > 0) {
+        policy.base_bytes = base;
+    }
+    if let Some(cap) = server.cap_bytes {
+        policy.cap_bytes = cap;
+    }
+
+    // Operator tag layer (algorithm only — the legacy channel shape).
+    // Case-insensitive prefix like the property layer, and the gate is applied
+    // PER TAG before "last valid wins": gating after the pick let a later,
+    // gated-out tag discard an earlier admissible one (#2419 review round 15).
+    let admitted = |algorithm: ProbeAlgorithm| !algorithm.is_experimental() || admit_experimental;
+    let mut tag_algorithm = None;
+    for tag in tags {
+        let tag = tag.trim();
+        let Some(value) = tag
+            .get(..PROBE_ALGORITHM_TAG_PREFIX.len())
+            .filter(|head| head.eq_ignore_ascii_case(PROBE_ALGORITHM_TAG_PREFIX))
+            .map(|_| &tag[PROBE_ALGORITHM_TAG_PREFIX.len()..])
+        else {
+            continue;
+        };
+        if let Some(parsed) = ProbeAlgorithm::parse(value).filter(|a| admitted(*a)) {
+            tag_algorithm = Some(parsed);
+        }
+    }
+    // The experimental gate (mandate #13) holds on EVERY layer of the ONE
+    // resolution path, not only at the env/TOML doors: when the
+    // collection-level carrier lands, a `probe.algorithm` property or a
+    // `probe.algorithm:` tag must not select an ungated algorithm (#2419
+    // review round 14). An experimental pick without the gate is ignored, so
+    // the layer below decides.
+    if let Some(algorithm) = tag_algorithm {
+        policy.algorithm = algorithm;
+    }
+
+    // Collection property layer (the top).
+    if let Some(algorithm) =
+        crate::policy_properties::policy_value(properties, PROBE_ALGORITHM_PROPERTY_KEY)
+            .and_then(|v| ProbeAlgorithm::parse(v))
+            .filter(|a| admitted(*a))
+    {
+        policy.algorithm = algorithm;
+    }
+    if let Some(multiplier) =
+        crate::policy_properties::policy_value(properties, PROBE_MULTIPLIER_KEY)
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            // is_finite() and >= 0: "inf" parses and would saturate nprobe to
+            // usize::MAX (the silent full scan this module removed from the
+            // `log` arm); 0 is the historical "floor only" setting and stays
+            // legal. Matches the server layer's filter.
+            .filter(|m| is_valid_multiplier(*m))
+    {
+        policy.multiplier = multiplier;
+    }
+    if let Some(min) = property_usize(properties, PROBE_MIN_CELLS_KEY) {
+        policy.min_cells = min;
+    }
+    if let Some(max) = property_usize(properties, PROBE_MAX_CELLS_KEY) {
+        policy.max_cells = max;
+    }
+    // Same `base == 0` guard as the server layer above (#2419 review round
+    // 21): `property_usize` has no `> 0` filter — deliberately, for the 0
+    // sentinels on min/max/cap — so `probe.base_mb = "0"` would set a ZERO
+    // budget that `snap_to_band` then rounds up to the smallest rung, a
+    // third behaviour for one value. Latent today (the door refuses every
+    // `probe.*` key) but live the moment the carrier lands.
+    if let Some(base) = property_u64_mb(properties, PROBE_BASE_MB_KEY) {
+        if base == 0 && policy.algorithm == ProbeAlgorithm::ByteBudget {
+            tracing::warn!(
+                "probe.base_mb = 0 has no meaning under byte_budget; using the default budget"
+            );
+        } else if base > 0 {
+            policy.base_bytes = base;
+        }
+    }
+    if let Some(cap) = property_u64_mb(properties, PROBE_CAP_MB_KEY) {
+        policy.cap_bytes = cap;
+    }
+
+    // Now the algorithm is final. `base_mb = 0` is refused at boot under
+    // byte_budget (the only form that reads it), so silently dropping it
+    // here would give a non-loader construction a third behaviour and a
+    // mislabelled experiment arm (#2419 review round 18). Loud instead — the
+    // resolver is pure, but a warn is side-effect free and this is a
+    // configuration defect.
+    if server_stated_zero_base && policy.algorithm == ProbeAlgorithm::ByteBudget {
+        tracing::warn!(
+            "probe base_mb = 0 has no meaning under byte_budget (boot refuses it on the loader path); using the default budget — fix the construction site"
+        );
+    }
+    policy
+}
+
+/// Validate `probe.*` properties at SET time — fail-closed with an
+/// actionable message (mirror of `validate_compaction_properties`).
+pub fn validate_probe_properties(properties: &HashMap<String, String>) -> Result<(), String> {
+    for (raw_key, raw_value) in properties {
+        let key = raw_key.trim().to_ascii_lowercase();
+        if !key.starts_with("probe.") {
+            continue;
+        }
+        match key.as_str() {
+            PROBE_ALGORITHM_PROPERTY_KEY => {
+                if ProbeAlgorithm::parse(raw_value).is_none() {
+                    return Err(format!(
+                        "probe.algorithm: expected one of sqrt|cbrt|fourth_root|log|fixed|byte_budget, got '{raw_value}'"
+                    ));
+                }
+            }
+            PROBE_MULTIPLIER_KEY => {
+                // Non-negative finite: 0 is the historical "floor only"
+                // setting and must stay expressible (see the server layer).
+                let parsed = raw_value.trim().parse::<f64>().unwrap_or(f64::NAN);
+                if !is_valid_multiplier(parsed) {
+                    return Err(format!(
+                        "probe.multiplier: expected a finite number in 0..={MAX_PROBE_MULTIPLIER}, got '{raw_value}'"
+                    ));
+                }
+            }
+            PROBE_MIN_CELLS_KEY | PROBE_MAX_CELLS_KEY | PROBE_BASE_MB_KEY | PROBE_CAP_MB_KEY => {
+                let Ok(parsed) = raw_value.trim().parse::<usize>() else {
+                    return Err(format!(
+                        "{key}: expected a non-negative integer, got '{raw_value}'"
+                    ));
+                };
+                // 0 is the documented sentinel on min_cells (no floor),
+                // max_cells (unlimited) and cap_mb (no cap) — the TOML
+                // fields these mirror honour it, and `resolve_probe_policy`
+                // honours `Some(0)`, so rejecting it here meant the property
+                // channel could not express what the TOML field can. Only
+                // base_mb must be positive: a zero base budget plans nothing.
+                if parsed == 0 && key.as_str() == PROBE_BASE_MB_KEY {
+                    return Err(format!(
+                        "{key}: expected a positive integer, got '{raw_value}'"
+                    ));
+                }
+                if matches!(key.as_str(), PROBE_BASE_MB_KEY | PROBE_CAP_MB_KEY)
+                    && parsed > MAX_PROBE_BUDGET_MB
+                {
+                    return Err(format!(
+                        "{key}: at most {MAX_PROBE_BUDGET_MB} (MiB), got '{raw_value}'"
+                    ));
+                }
+            }
+            _ => {
+                return Err(format!(
+                    "unknown probe property '{raw_key}': expected probe.algorithm, probe.multiplier, probe.min_cells, probe.max_cells, probe.base_mb or probe.cap_mb"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn props(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn sqrt_policy_reproduces_the_historical_formula_exactly() {
+        // Regression: the default policy must equal the old geometric_nprobe
+        // across the whole realistic pool range — zero behavior change.
+        let policy = ProbePolicy::default();
+        for k_c in 1..=4096usize {
+            let old = {
+                let raw = ((k_c as f32).sqrt() * 2.0f32).ceil() as usize;
+                let floored = raw.max(3);
+                floored.min(k_c.max(1))
+            };
+            let plan = resolve_probe_plan(&policy, k_c, 1_000_000, 4 * 1024 * 1024, 512 * 1024);
+            assert_eq!(plan.cells, old, "k_c={k_c}");
+        }
+    }
+
+    #[test]
+    fn sublinear_ladders_flatten_fan_out() {
+        let policy = |algorithm| ProbePolicy {
+            algorithm,
+            ..Default::default()
+        };
+        let plan = |p: &ProbePolicy, cells: usize| {
+            resolve_probe_plan(p, cells, 10_000_000, 4 * 1024 * 1024, 256 * 1024).cells
+        };
+        // 10,000-cell pool (multiplier 2.0): sqrt 100×2=200, cbrt
+        // ceil(21.54×2)=44, fourth-root 10×2=20 — strictly flattening.
+        let sqrt = plan(&policy(ProbeAlgorithm::Sqrt), 10_000);
+        let cbrt = plan(&policy(ProbeAlgorithm::CubeRoot), 10_000);
+        let fourth = plan(&policy(ProbeAlgorithm::FourthRoot), 10_000);
+        assert!(sqrt > cbrt && cbrt > fourth, "{sqrt} {cbrt} {fourth}");
+        assert_eq!(sqrt, 200);
+        assert_eq!(cbrt, 44);
+        assert_eq!(fourth, 20);
+    }
+
+    #[test]
+    fn byte_budget_scales_quarter_power_and_snaps_to_bands() {
+        let policy = ProbePolicy {
+            algorithm: ProbeAlgorithm::ByteBudget,
+            ..Default::default() // base 4 MiB, cap 32 MiB
+        };
+        let cell = 512 * 1024; // 0.5 MiB cells
+        let rg = 4 * 1024 * 1024;
+        // 1M rows: budget 4 MiB -> snapped 4 MiB -> 8 cells of 0.5 MiB.
+        let small = resolve_probe_plan(&policy, 10_000, 1_000_000, rg, cell);
+        assert_eq!(small.cells, 8);
+        assert_eq!(small.band, 4 * 1024 * 1024);
+        // 10B rows: raw budget 40 MiB exceeds the 32 MiB cap -> capped to 32
+        // and snapped to the 32 MiB rung (reachable now that the ladder runs
+        // to 8x the rowgroup) -> 64 cells. cells/bytes/band AGREE.
+        let big = resolve_probe_plan(&policy, 10_000, 10_000_000_000, rg, cell);
+        assert_eq!(big.band, 32 * 1024 * 1024);
+        assert_eq!(big.cells, 64);
+        assert_eq!(big.probe_bytes, big.cells as u64 * cell);
+        assert!(big.probe_bytes <= policy.cap_bytes);
+        assert!(
+            big.cells > small.cells,
+            "sub-linear growth: {big:?} vs {small:?}"
+        );
+    }
+
+    #[test]
+    fn byte_budget_cap_bounds_cells_not_just_labels() {
+        // The review regression: the cap limits the CELL COUNT, not merely
+        // the reported bytes. With a 4 MiB cap and 0.5 MiB cells, no corpus
+        // size may plan more than 8 cells.
+        //
+        // The cap is stated ABOVE the recall floor on purpose — see the
+        // sibling test for what happens when they conflict.
+        let policy = ProbePolicy {
+            algorithm: ProbeAlgorithm::ByteBudget,
+            base_bytes: 4 * 1024 * 1024,
+            cap_bytes: 4 * 1024 * 1024,
+            ..Default::default()
+        };
+        assert!(
+            policy.min_cells <= 8,
+            "this test needs the cap to sit above the recall floor"
+        );
+        for rows in [1_000_000u64, 10_000_000_000, 1_000_000_000_000] {
+            let plan = resolve_probe_plan(&policy, 100_000, rows, 4 * 1024 * 1024, 512 * 1024);
+            assert!(plan.cells <= 8, "rows={rows}: {plan:?}");
+            assert!(
+                plan.probe_bytes <= policy.cap_bytes,
+                "rows={rows}: {plan:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn recall_floor_wins_when_the_byte_cap_cannot_afford_it() {
+        // #2419 review round 5: `floor = min_cells.min(cap_cells)` let the
+        // byte cap override the RECALL floor. With a 1 MiB cap and 0.5 MiB
+        // cells the cap affords 2 cells against a floor of 3, and the clamp
+        // bought nothing whenever one cell alone exceeds the cap (the plan
+        // breached it regardless) while costing recall every time.
+        //
+        // A cost knob never silently trades away recall: the floor wins, and
+        // `probe_bytes` then reports the honest cost of it rather than a
+        // figure massaged to fit the cap.
+        let policy = ProbePolicy {
+            algorithm: ProbeAlgorithm::ByteBudget,
+            base_bytes: 4 * 1024 * 1024,
+            cap_bytes: 1024 * 1024,
+            ..Default::default()
+        };
+        let plan = resolve_probe_plan(&policy, 100_000, 10_000_000, 4 * 1024 * 1024, 512 * 1024);
+        assert_eq!(
+            plan.cells, policy.min_cells,
+            "the floor must survive a cap that cannot afford it: {plan:?}"
+        );
+        assert!(
+            plan.probe_bytes > policy.cap_bytes,
+            "probe_bytes must report the floor's real cost, not a capped fiction: {plan:?}"
+        );
+    }
+
+    #[test]
+    fn byte_budget_arms_are_distinguishable_the_experiment_can_tell_them_apart() {
+        // #2419 review: with the ladder stopping at 4x the rowgroup, the
+        // TD's byte_budget@8MB and @16MB arms both planned 16 MiB at >=3M
+        // rows — the ladder experiment could not distinguish its own arms.
+        let arm = |base_mb: u64| ProbePolicy {
+            algorithm: ProbeAlgorithm::ByteBudget,
+            base_bytes: base_mb * 1024 * 1024,
+            ..Default::default()
+        };
+        let rg = 4 * 1024 * 1024;
+        let cell = 512 * 1024;
+        let plan = |mb: u64, rows: u64| resolve_probe_plan(&arm(mb), 100_000, rows, rg, cell).band;
+        for rows in [3_000_000u64, 10_000_000, 100_000_000] {
+            let (b4, b8, b16) = (plan(4, rows), plan(8, rows), plan(16, rows));
+            assert!(b4 < b8 && b8 <= b16, "rows={rows}: {b4} {b8} {b16}");
+            assert!(
+                b8 != b16 || b16 == 32 * 1024 * 1024,
+                "rows={rows}: arms tie below the cap"
+            );
+        }
+    }
+
+    #[test]
+    fn log_form_is_a_cell_count_not_a_byte_magnitude() {
+        // It previously added log2(base_bytes) (~22 for 4 MiB) to a CELL
+        // count, so at the shipped 30-cell geometry the `log` arm probed
+        // 30/30 — a silent full scan — and doubling base_mb moved it by one
+        // cell.
+        let policy = ProbePolicy {
+            algorithm: ProbeAlgorithm::Log,
+            ..Default::default()
+        };
+        let cells = resolve_probe_plan(&policy, 30, 3_000_000, 4 * 1024 * 1024, 512 * 1024).cells;
+        assert!(
+            cells < 30,
+            "log must not degenerate to a full scan: {cells}"
+        );
+        assert_eq!(cells, 10); // ceil(2.0 * log2(31)) = ceil(9.91)
+        // The byte budget must not move a pure cell-count form at all.
+        let bigger_budget = ProbePolicy {
+            base_bytes: 64 * 1024 * 1024,
+            ..policy.clone()
+        };
+        assert_eq!(
+            resolve_probe_plan(&bigger_budget, 30, 3_000_000, 4 * 1024 * 1024, 512 * 1024).cells,
+            cells
+        );
+    }
+
+    #[test]
+    fn fixed_form_probes_exactly_the_floor() {
+        let policy = ProbePolicy {
+            algorithm: ProbeAlgorithm::Fixed,
+            min_cells: 7,
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_probe_plan(&policy, 1_000, 3_000_000, 4 * 1024 * 1024, 512 * 1024).cells,
+            7
+        );
+        // Still bounded by the candidate pool.
+        assert_eq!(
+            resolve_probe_plan(&policy, 3, 3_000_000, 4 * 1024 * 1024, 512 * 1024).cells,
+            3
+        );
+    }
+
+    #[test]
+    fn server_zero_sentinels_survive_resolution() {
+        // `nprobe_min = 0` means "no floor" and `cap_mb = 0` means "no cap"
+        // per the config docs; filtering them out silently substituted the
+        // code defaults (floor 3, cap 32 MiB).
+        let resolved = resolve_probe_policy(
+            &HashMap::new(),
+            &[],
+            &ServerProbePolicy {
+                min_cells: Some(0),
+                cap_bytes: Some(0),
+                ..Default::default()
+            },
+        );
+        assert_eq!(resolved.min_cells, 0, "explicit 0 floor must survive");
+        assert_eq!(resolved.cap_bytes, 0, "explicit 0 cap means no cap");
+        // "No cap" is genuinely uncapped: the plan follows the corpus-scaled
+        // budget past the default 32 MiB cap instead of stopping at a fixed
+        // top rung (the doc said 8x the rowgroup bounded it; round 10 made
+        // the ladder reach the budget, so that is no longer true).
+        let mib: u64 = 1024 * 1024;
+        let plan = |cap_bytes: u64| {
+            resolve_probe_plan(
+                &ProbePolicy {
+                    algorithm: ProbeAlgorithm::ByteBudget,
+                    cap_bytes,
+                    ..Default::default()
+                },
+                100_000,
+                1_000_000_000_000, // 4 MiB x (1e6)^0.25 = ~126 MiB of budget
+                4 * mib,
+                512 * 1024,
+            )
+        };
+        let (capped, uncapped) = (plan(32 * mib), plan(0));
+        assert_eq!(capped.band, 32 * mib, "{capped:?}");
+        assert!(
+            uncapped.band > 32 * mib,
+            "uncapped must exceed the default cap: {uncapped:?}"
+        );
+        assert_eq!(
+            uncapped.band,
+            128 * mib,
+            "126 MiB snaps to the 128 MiB rung: {uncapped:?}"
+        );
+    }
+
+    #[test]
+    fn budget_mb_cannot_overflow_the_bytes_multiply() {
+        // mandate #4: a hand-written property must not panic in debug.
+        let huge = (usize::MAX / 2).to_string();
+        assert!(validate_probe_properties(&props(&[("probe.cap_mb", huge.as_str())])).is_err());
+        let resolved = resolve_probe_policy(
+            &props(&[
+                ("probe.base_mb", huge.as_str()),
+                ("probe.cap_mb", huge.as_str()),
+            ]),
+            &[],
+            &ServerProbePolicy::default(),
+        );
+        // Clamped, not wrapped.
+        assert!(resolved.base_bytes <= MAX_PROBE_BUDGET_MB as u64 * 1024 * 1024);
+        assert!(resolved.cap_bytes <= MAX_PROBE_BUDGET_MB as u64 * 1024 * 1024);
+        let _ = resolve_probe_plan(&resolved, 100, 1_000_000, 4 * 1024 * 1024, 512 * 1024);
+    }
+
+    #[test]
+    fn clamps_respect_min_max_and_pool() {
+        let policy = ProbePolicy {
+            min_cells: 5,
+            max_cells: 10,
+            ..Default::default()
+        };
+        assert_eq!(resolve_probe_plan(&policy, 2, 1000, 1 << 20, 4096).cells, 2);
+        assert_eq!(
+            resolve_probe_plan(&policy, 1_000_000, 1000, 1 << 20, 4096).cells,
+            10
+        );
+    }
+
+    #[test]
+    fn band_ladder_derives_from_rowgroup_geometry() {
+        let mib = 1024 * 1024;
+        // Cloud target, default cap: the 8x floor already reaches the cap.
+        assert_eq!(
+            band_ladder(4 * mib, 32 * mib),
+            vec![mib, 2 * mib, 4 * mib, 8 * mib, 16 * mib, 32 * mib],
+            "the ladder must reach the default 32 MiB cap"
+        );
+        // Local-disk target (1 MiB): the ladder must STILL reach the cap,
+        // not stop at 8 MiB (#2419 review round 8).
+        let local = band_ladder(mib, 32 * mib);
+        assert_eq!(local.last().copied(), Some(32 * mib), "{local:?}");
+        // Uncapped: the 8x floor.
+        assert_eq!(band_ladder(mib, 0).last().copied(), Some(8 * mib));
+        // Sub-512 KiB rungs are pointless and filtered.
+        assert!(band_ladder(1024, 0).iter().all(|r| *r >= 512 * 1024));
+        // Saturation cannot loop forever.
+        assert!(!band_ladder(u64::MAX / 2, u64::MAX).is_empty());
+    }
+
+    #[test]
+    fn uncapped_never_plans_below_the_capped_default() {
+        // Local disk, byte_budget base 16 MiB: removing the cap must not
+        // shrink the band below what the default 32 MiB cap allows.
+        let mib: u64 = 1024 * 1024;
+        let plan = |cap_bytes: u64| {
+            resolve_probe_plan(
+                &ProbePolicy {
+                    algorithm: ProbeAlgorithm::ByteBudget,
+                    base_bytes: 16 * mib,
+                    cap_bytes,
+                    ..Default::default()
+                },
+                100_000,
+                1_000_000,
+                mib,
+                128 * 1024,
+            )
+        };
+        let (capped, uncapped) = (plan(32 * mib), plan(0));
+        assert!(
+            uncapped.band >= capped.band,
+            "capped={capped:?} uncapped={uncapped:?}"
+        );
+        assert_eq!(uncapped.band, 16 * mib, "{uncapped:?}");
+    }
+
+    #[test]
+    fn byte_budget_arms_are_distinguishable_on_local_disk() {
+        // The local-disk twin of the cloud distinguishability test: with a
+        // 1 MiB rowgroup target the 8 MiB and 16 MiB budget arms must plan
+        // DIFFERENT bands at a corpus where both budgets are reachable.
+        let mib: u64 = 1024 * 1024;
+        let plan = |base_mb: u64| {
+            resolve_probe_plan(
+                &ProbePolicy {
+                    algorithm: ProbeAlgorithm::ByteBudget,
+                    base_bytes: base_mb * mib,
+                    cap_bytes: 32 * mib,
+                    ..Default::default()
+                },
+                100_000,
+                1_000_000,
+                mib,
+                128 * 1024,
+            )
+        };
+        let (eight, sixteen) = (plan(8), plan(16));
+        assert_ne!(eight.band, sixteen.band, "8MB={eight:?} 16MB={sixteen:?}");
+        assert_eq!(sixteen.band, 16 * mib, "{sixteen:?}");
+    }
+
+    #[test]
+    fn policy_chain_property_over_tag_over_server_over_code() {
+        // PRECEDENCE, not the gate: run with experimental algorithms admitted
+        // (the gate has its own test) through the pure entry point.
+        let resolve_probe_policy =
+            |p: &HashMap<String, String>, t: &[String], s: &ServerProbePolicy| {
+                resolve_probe_policy_gated(p, t, s, true)
+            };
+        let tag = vec!["probe.algorithm:cbrt".to_string()];
+        let server = ServerProbePolicy {
+            algorithm: Some("fourth_root".to_string()),
+            ..Default::default()
+        };
+        // Property wins over tag and server.
+        assert_eq!(
+            resolve_probe_policy(&props(&[("probe.algorithm", "log")]), &tag, &server).algorithm,
+            ProbeAlgorithm::Log
+        );
+        // Tag wins over server; explicit layers beat the code default.
+        assert_eq!(
+            resolve_probe_policy(&HashMap::new(), &tag, &server).algorithm,
+            ProbeAlgorithm::CubeRoot
+        );
+        assert_eq!(
+            resolve_probe_policy(&HashMap::new(), &[], &server).algorithm,
+            ProbeAlgorithm::FourthRoot
+        );
+        assert_eq!(
+            resolve_probe_policy(&HashMap::new(), &[], &ServerProbePolicy::default()).algorithm,
+            ProbeAlgorithm::Sqrt
+        );
+        // Numeric layers resolve per key: property min over server base.
+        let resolved = resolve_probe_policy(
+            &props(&[("probe.min_cells", "7")]),
+            &[],
+            &ServerProbePolicy {
+                base_bytes: Some(8 * 1024 * 1024),
+                ..Default::default()
+            },
+        );
+        assert_eq!(resolved.min_cells, 7);
+        assert_eq!(resolved.base_bytes, 8 * 1024 * 1024);
+    }
+
+    #[test]
+    fn case_duplicate_properties_resolve_deterministically() {
+        for _ in 0..20 {
+            let properties = props(&[
+                ("PROBE.ALGORITHM", "sqrt"),
+                ("Probe.Algorithm", "byte_budget"),
+            ]);
+            assert_eq!(
+                resolve_probe_policy(&properties, &[], &ServerProbePolicy::default()).algorithm,
+                // "PROBE.ALGORITHM" < "Probe.Algorithm" (ASCII 'R' < 'r')
+                ProbeAlgorithm::Sqrt
+            );
+        }
+    }
+
+    #[test]
+    fn validation_fails_closed() {
+        assert!(validate_probe_properties(&props(&[("probe.algorithm", "cbrt")])).is_ok());
+        assert!(validate_probe_properties(&props(&[("probe.multiplier", "1.5")])).is_ok());
+        assert!(validate_probe_properties(&props(&[("probe.base_mb", "8")])).is_ok());
+        // Keys outside the probe.* namespace are ignored by this validator.
+        assert!(validate_probe_properties(&props(&[("cache.index.mode", "pin")])).is_ok());
+        assert!(validate_probe_properties(&props(&[("probe.algorithm", "sqrt2")])).is_err());
+        // 0 = "probe exactly the floor" (historical); negatives fail closed.
+        assert!(validate_probe_properties(&props(&[("probe.multiplier", "0")])).is_ok());
+        assert!(validate_probe_properties(&props(&[("probe.multiplier", "-1")])).is_err());
+        // "inf" parses as f64 and passes a bare `> 0` check, then saturates
+        // nprobe to usize::MAX — a silent full scan (#2419 review round 5).
+        assert!(validate_probe_properties(&props(&[("probe.multiplier", "inf")])).is_err());
+        assert!(validate_probe_properties(&props(&[("probe.multiplier", "NaN")])).is_err());
+        // Finite but above f32::MAX: would narrow to inf in the f32 sqrt arm.
+        assert!(validate_probe_properties(&props(&[("probe.multiplier", "1e300")])).is_err());
+        // 0 is the documented SENTINEL on these three — no floor, unlimited,
+        // no cap — and `resolve_probe_policy` honours `Some(0)`, so rejecting
+        // it meant the property channel could not express what the TOML field
+        // it mirrors can (#2419 review round 5).
+        assert!(validate_probe_properties(&props(&[("probe.min_cells", "0")])).is_ok());
+        assert!(validate_probe_properties(&props(&[("probe.max_cells", "0")])).is_ok());
+        assert!(validate_probe_properties(&props(&[("probe.cap_mb", "0")])).is_ok());
+        // base_mb is the exception: a zero base budget plans nothing.
+        assert!(validate_probe_properties(&props(&[("probe.base_mb", "0")])).is_err());
+        // Non-numeric still fails closed on every one of them.
+        assert!(validate_probe_properties(&props(&[("probe.min_cells", "lots")])).is_err());
+        assert!(validate_probe_properties(&props(&[("probe.unknown", "1")])).is_err());
+    }
+
+    #[test]
+    fn zero_floor_zero_multiplier_plans_one_cell_not_zero() {
+        // The one documented departure from the historical formula: with
+        // nprobe_min = 0 and multiplier 0 it planned ZERO cells (an empty
+        // result for every query). The module never plans fewer than 1.
+        let policy = ProbePolicy {
+            multiplier: 0.0,
+            min_cells: 0,
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_probe_plan(&policy, 30, 0, 4 * 1024 * 1024, 0).cells,
+            1
+        );
+    }
+
+    #[test]
+    fn experimental_gate_holds_on_the_server_layer_too() {
+        let pick = |admit| {
+            resolve_probe_policy_gated(
+                &HashMap::new(),
+                &[],
+                &ServerProbePolicy {
+                    algorithm: Some("byte_budget".to_string()),
+                    ..Default::default()
+                },
+                admit,
+            )
+            .algorithm
+        };
+        assert_eq!(
+            pick(false),
+            ProbeAlgorithm::Sqrt,
+            "the gate must hold here too"
+        );
+        assert_eq!(pick(true), ProbeAlgorithm::ByteBudget);
+    }
+
+    #[test]
+    fn experimental_gate_holds_on_the_property_and_tag_layers() {
+        let pick = |admit| {
+            resolve_probe_policy_gated(
+                &props(&[("probe.algorithm", "byte_budget")]),
+                &["probe.algorithm:log".to_string()],
+                &ServerProbePolicy::default(),
+                admit,
+            )
+            .algorithm
+        };
+        // Gate closed: neither layer may select an experimental algorithm.
+        assert_eq!(pick(false), ProbeAlgorithm::Sqrt);
+        // Gate open: the property (top layer) wins, as the chain says.
+        assert_eq!(pick(true), ProbeAlgorithm::ByteBudget);
+    }
+
+    #[test]
+    fn tag_layer_is_case_insensitive_and_gates_per_tag() {
+        let tags = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let pick = |t: &[String], admit| {
+            resolve_probe_policy_gated(&HashMap::new(), t, &ServerProbePolicy::default(), admit)
+                .algorithm
+        };
+        // A gated-out LATER tag must not discard an earlier admissible one.
+        let mixed = tags(&["probe.algorithm:sqrt", "probe.algorithm:cbrt"]);
+        assert_eq!(pick(&mixed, false), ProbeAlgorithm::Sqrt);
+        assert_eq!(pick(&mixed, true), ProbeAlgorithm::CubeRoot);
+        // The prefix matches case-insensitively, like the property layer.
+        assert_eq!(
+            pick(&tags(&["Probe.Algorithm:cbrt"]), true),
+            ProbeAlgorithm::CubeRoot
+        );
+    }
+    #[test]
+    fn snap_returns_a_real_rung_when_the_cap_sits_between_rungs() {
+        let mib: u64 = 1024 * 1024;
+        // Ladder for rg=4MiB capped at 7 MiB: the 8 MiB rung is out, the
+        // result must be the 4 MiB rung, not "7 MiB".
+        let snapped = snap_to_band(9 * mib, 4 * mib, 7 * mib);
+        assert_eq!(snapped, 4 * mib, "nearest rung not above the cap");
+        // A cap below every rung is honoured as-is (sub-ladder case).
+        assert_eq!(snap_to_band(9 * mib, 4 * mib, 300 * 1024), 300 * 1024);
+    }
+    #[test]
+    fn a_zero_base_budget_is_refused_on_both_layers() {
+        // The server layer and the property layer must agree: a 0 base
+        // budget under byte_budget keeps the DEFAULT, never a zero budget
+        // that snap_to_band would round up to the smallest rung (#2419
+        // review round 21).
+        let default_base = ProbePolicy::default().base_bytes;
+        let server = resolve_probe_policy_gated(
+            &HashMap::new(),
+            &[],
+            &ServerProbePolicy {
+                algorithm: Some("byte_budget".to_string()),
+                base_bytes: Some(0),
+                ..Default::default()
+            },
+            true,
+        );
+        assert_eq!(server.base_bytes, default_base, "server layer");
+        let property = resolve_probe_policy_gated(
+            &props(&[("probe.algorithm", "byte_budget"), ("probe.base_mb", "0")]),
+            &[],
+            &ServerProbePolicy::default(),
+            true,
+        );
+        assert_eq!(property.base_bytes, default_base, "property layer");
+    }
+    #[test]
+    fn cell_count_forms_report_no_byte_plan() {
+        // The production callers hand the cell-count forms zero geometry, so
+        // a byte figure here would be a cell count in disguise (#2419 round
+        // 22). 0 = not planned in bytes.
+        for algorithm in [
+            ProbeAlgorithm::Sqrt,
+            ProbeAlgorithm::CubeRoot,
+            ProbeAlgorithm::FourthRoot,
+            ProbeAlgorithm::Log,
+            ProbeAlgorithm::Fixed,
+        ] {
+            let plan = resolve_probe_plan(
+                &ProbePolicy {
+                    algorithm,
+                    ..Default::default()
+                },
+                30,
+                0,
+                0,
+                0,
+            );
+            assert_eq!(plan.probe_bytes, 0, "{algorithm:?}: {plan:?}");
+            assert_eq!(plan.band, 0, "{algorithm:?}: {plan:?}");
+            assert!(plan.cells >= 1, "{algorithm:?}: {plan:?}");
+        }
+        // ByteBudget DOES plan in bytes.
+        let mib = 1024 * 1024;
+        let budgeted = resolve_probe_plan(
+            &ProbePolicy {
+                algorithm: ProbeAlgorithm::ByteBudget,
+                ..Default::default()
+            },
+            1_000,
+            1_000_000,
+            4 * mib,
+            512 * 1024,
+        );
+        assert!(budgeted.probe_bytes > 0, "{budgeted:?}");
+    }
+}

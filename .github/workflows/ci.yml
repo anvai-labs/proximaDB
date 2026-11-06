@@ -444,6 +444,17 @@ jobs:
               # TD-RECALL-2/#1406: track what can break the outcome, not who
               # owns the file.
               - 'tests/sift_pax_recall_ratchet_test.rs'
+              # TD-RDSTRAT-14 / #2419 review round 23: this lane now runs
+              # recall_tune_auth_e2e.rs, whose assertions are about the REST
+              # v2 collections surface (create refuses unpersisted
+              # `properties`; the PATCH properties route is GONE -> 404). None
+              # of the globs above match `src/network/**` or the test file
+              # itself, so a future PR that re-adds the PATCH route or relaxes
+              # the create guard would skip this lane and the assertions would
+              # not gate it — the same "filter does not track the outcome"
+              # failure as TD-RECALL-2/#1406 cited above, one surface over.
+              - 'src/network/rest/v2/**'
+              - 'tests/recall_tune_auth_e2e.rs'
               # ADR-097 D3 / TD-SEAM-1: the external Iceberg read-back gate runs in
               # this lane; the writer, the REST catalog and the gate itself feed it.
               - 'crates/storage/proximadb-iceberg-engine/**'
@@ -2803,14 +2814,22 @@ jobs:
           RUST_MIN_STACK: "8388608"
         run: |
           # Run only explicitly named storage test files (avoids compiling all tests)
-          for test_file in tests/*sst*.rs tests/*storage*.rs tests/*wal*.rs tests/embedded_tenant_context.rs tests/td112_postflush_recall_e2e.rs tests/v2_post_flush_search_e2e.rs tests/mlflow_run_store_test.rs tests/iceberg_interop_e2e.rs; do
+          # recall_tune_auth_e2e carries the REST property-door contracts
+          # (TD-RDSTRAT-14 / #2419: create refuses unpersisted properties, the
+          # PATCH route is gone). It was in NO lane, so those assertions never
+          # gated — a re-added route or a relaxed guard would have shipped.
+          for test_file in tests/*sst*.rs tests/*storage*.rs tests/*wal*.rs tests/embedded_tenant_context.rs tests/td112_postflush_recall_e2e.rs tests/v2_post_flush_search_e2e.rs tests/recall_tune_auth_e2e.rs tests/mlflow_run_store_test.rs tests/iceberg_interop_e2e.rs; do
             if [ -f "$test_file" ]; then
               test_name=$(basename "$test_file" .rs)
               echo "Running $test_name..."
-              if [ "$test_name" = "v2_post_flush_search_e2e" ]; then
+              if [ "$test_name" = "v2_post_flush_search_e2e" ] \
+                || [ "$test_name" = "recall_tune_auth_e2e" ]; then
                 # The canonical flush engine is process-global, while each
                 # tokio::test owns its runtime and compaction workers. Give
                 # each server test a fresh process so workers stay alive.
+                # (recall_tune_auth_e2e also boots a server — and the WAL
+                # manifest is a set-once singleton, so it needs the same
+                # process-per-test isolation.)
                 cargo nextest run --test "$test_name" --profile integration --retries 0
               else
                 cargo test --test "$test_name" -- --test-threads=1

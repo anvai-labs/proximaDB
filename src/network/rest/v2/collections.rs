@@ -264,11 +264,15 @@ pub struct CreateCollectionV2Request {
     /// `"target_vector_count:1000"`, `"modalities:text,image"`. Consumed by the
     /// recall advisor / route-health (`services/collection/recall_target.rs`).
     pub tags: Option<Vec<String>>,
-    /// Per-collection table properties (Hive TBLPROPERTIES-style). Keys in
-    /// the `cache.*` namespace configure the per-collection cache policy
-    /// (TD-COMPACT-2b): `{"cache.index.mode": "pin"}` pins Region A. All
-    /// `cache.*` keys are validated at create time; unknown keys in that
-    /// namespace are rejected. Non-`cache.*` keys are stored verbatim.
+    /// Per-collection table properties (Hive TBLPROPERTIES-style).
+    ///
+    /// NOT persisted by this endpoint yet: a non-empty map is rejected with
+    /// 400. Create the collection, then set properties with `ALTER TABLE
+    /// <name> SET (...)` over pgwire. Three namespaces are reserved for policy
+    /// there, with unknown keys rejected: `cache.*` (TD-COMPACT-2b),
+    /// `compaction.*` (TD-COMPACT-15) and `probe.*` (TD-RDSTRAT-14). Every
+    /// `probe.*` key, valid or not, is currently refused because nothing
+    /// consumes it yet.
     pub properties: Option<std::collections::HashMap<String, String>>,
     /// Quantization config (gRPC-v2 parity). When omitted, quantization is
     /// left unset (engine default).
@@ -721,6 +725,23 @@ async fn create_collection_v2_checked(
     if request.name.is_empty() {
         return Err(ApiError::InvalidArgument(
             "Collection name is required".to_string(),
+        ));
+    }
+
+    // FAIL CLOSED on create-time properties (#2419 review round 7). This
+    // handler builds a `CollectionConfig`, which has no properties field, so
+    // `request.properties` was never persisted: a valid
+    // `{"cache.index.mode": "pin"}` returned 200 and pinned nothing — the
+    // accepted-but-inert class the policy door exists to close, and
+    // validating the keys first only made the 200 look more trustworthy.
+    // Until create persists them, refuse and name the path that works.
+    if request
+        .properties
+        .as_ref()
+        .is_some_and(|properties| !properties.is_empty())
+    {
+        return Err(ApiError::InvalidArgument(
+            "properties are not persisted by POST /collections yet; create the collection, then set them with ALTER TABLE <name> SET ('key' = 'value', ...) over pgwire".to_string(),
         ));
     }
 
@@ -3342,28 +3363,13 @@ async fn ensure_collection_exists(
     Ok(())
 }
 
-/// `POST /api/v2/collections/:id/suspend` — Phase 8 F4a. Evicts the collection's
-/// in-memory IVF index to free memory (the persisted `ivf.bin` + catalog
-/// metadata stay); the next query (or `/resume`) warm-loads it. Admin-gated.
-/// `POST /api/v2/collections/{id}/compact` body `{"full": bool}` (an
-/// omitted body — no Content-Type — compacts plainly). Operator endpoint (TD-COMPACT-14): NOT utoipa-annotated, so it is
-/// not part of the published OpenAPI spec — same convention as
-/// suspend/resume and the `_diagnostics` actions.
-/// `PATCH /api/v2/collections/{id}/properties` — set/update table properties
-/// (TD-COMPACT-2b). `cache.*` keys are validated; non-cache keys are stored
-/// verbatim. Keys not present in the request are left unchanged (merge
-/// semantics, not replace).
-#[derive(Debug, serde::Deserialize)]
-pub struct UpdatePropertiesRequest {
-    pub properties: std::collections::HashMap<String, String>,
-}
-
-/// Response: the full property set after the merge.
-#[derive(Debug, serde::Serialize)]
-pub struct PropertiesResponse {
-    pub collection_id: String,
-    pub properties: std::collections::HashMap<String, String>,
-}
+// `PATCH /api/v2/collections/{id}/properties` was REMOVED (#2419 review
+// round 16). It shipped in #2405 as a stub that never persisted anything —
+// first echoing its input as if applied, then (rounds 7-14) refusing with
+// 501. A route that can only ever refuse is a capability that does not exist,
+// so it is deleted rather than kept as an advertised facade. Set table
+// properties with `ALTER TABLE <name> SET (...)` over pgwire; restore a PATCH
+// door together with the merge + catalog write it needs.
 
 #[derive(Debug, serde::Deserialize)]
 pub struct CompactRequest {
@@ -3388,53 +3394,11 @@ pub struct CompactResponse {
     pub metrics: crate::storage::traits::FullCompactionMetrics,
 }
 
-/// `PATCH /api/v2/collections/{id}/properties` — set/update table properties.
-/// Merge semantics: keys in the request are set/updated; absent keys are
-/// unchanged. `cache.*` keys are validated (TD-COMPACT-2b).
-pub async fn patch_collection_properties_v2(
-    Path(collection_id): Path<String>,
-    Extension(tenant): Extension<TenantContext>,
-    user_context: Option<Extension<crate::security::rbac_service::UnifiedUserContext>>,
-    State(state): State<AppState>,
-    axum::Json(request): axum::Json<UpdatePropertiesRequest>,
-) -> ApiResult<Json<PropertiesResponse>> {
-    if collection_id.is_empty() {
-        return Err(ApiError::InvalidArgument(
-            "Collection ID is required".to_string(),
-        ));
-    }
-    require_maintain(user_context.as_ref().map(|e| &e.0), "properties")?;
-
-    // Validate cache.* keys in the request (the merged set is validated
-    // after the catalog read below; this catches standalone errors early).
-    proximadb_cache::policy::validate_cache_properties(&request.properties)
-        .map_err(|e| ApiError::InvalidArgument(format!("invalid cache property: {e}")))?;
-    // compaction.* too (#2418 review round 16): every other door (ALTER
-    // TABLE SET, CREATE TABLE WITH) refuses `strategy='consolidate'` and the
-    // unconsumed target size; accepting them HERE answered 200 for keys the
-    // flush resolver would never honour.
-    proximadb_storage_common::validate_compaction_properties(&request.properties)
-        .map_err(|e| ApiError::InvalidArgument(format!("invalid table property: {e}")))?;
-
-    // TODO: read current properties from the catalog, merge, validate the
-    // merged set (case-variant duplicates), write back. For now the
-    // collection service handles the merge.
-    let updated = state
-        .collection_service
-        .update_collection_properties(
-            &collection_id,
-            Some(&crate::storage::tenant::context::StorageTenantContext::from(&tenant)),
-            request.properties,
-        )
-        .await
-        .map_err(|e| ApiError::Internal(format!("property update: {e}")))?;
-
-    Ok(Json(PropertiesResponse {
-        collection_id,
-        properties: updated,
-    }))
-}
-
+/// `POST /api/v2/collections/{id}/compact` body `{"full": bool}` (an omitted
+/// body — no Content-Type — compacts plainly). Operator endpoint
+/// (TD-COMPACT-14): NOT utoipa-annotated, so it is not part of the published
+/// OpenAPI spec — same convention as suspend/resume and the `_diagnostics`
+/// actions.
 pub async fn post_collection_compact_v2(
     Path(collection_id): Path<String>,
     Extension(tenant): Extension<TenantContext>,
@@ -3494,6 +3458,10 @@ pub async fn post_collection_compact_v2(
     }))
 }
 
+/// `POST /api/v2/collections/:id/suspend` — Phase 8 F4a. Evicts the
+/// collection's in-memory IVF index to free memory (the persisted `ivf.bin` +
+/// catalog metadata stay); the next query (or `/resume`) warm-loads it.
+/// Admin-gated.
 pub async fn post_collection_suspend_v2(
     Path(collection_id): Path<String>,
     Extension(tenant): Extension<TenantContext>,

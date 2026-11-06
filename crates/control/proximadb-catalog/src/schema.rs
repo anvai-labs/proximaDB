@@ -835,6 +835,31 @@ pub fn apply_evolution(
                             matches!(value.to_lowercase().as_str(), "enabled" | "true" | "1");
                     }
                     _ => {
+                        // Policy namespaces (cache.* / compaction.* / probe.*)
+                        // resolve their keys CASE-INSENSITIVELY, and their
+                        // validators reject case-variant duplicates. SET
+                        // validates one statement's key in isolation, so two
+                        // statements could otherwise store `cache.index.mode`
+                        // AND `Cache.Index.Mode` — a map the resolver rejects
+                        // as ambiguous (#2419 review round 8). A SET of a
+                        // policy key therefore REPLACES any case-variant of
+                        // it. Other keys keep exact-key semantics.
+                        // Normalized exactly as the resolvers normalize
+                        // (trim + lowercase): comparing only lowercase let a
+                        // whitespace variant (' cache.index.mode') survive
+                        // beside its canonical twin (#2419 review round 9).
+                        let normalized =
+                            proximadb_storage_common::policy_properties::normalize_policy_key(key);
+                        if proximadb_storage_common::policy_properties::POLICY_PROPERTY_PREFIXES
+                            .iter()
+                            .any(|prefix| normalized.starts_with(prefix))
+                        {
+                            new_schema.properties.retain(|existing, _| {
+                                proximadb_storage_common::policy_properties::normalize_policy_key(
+                                    existing,
+                                ) != normalized
+                            });
+                        }
                         // Unknown options are stored as table properties so
                         // they round-trip without data loss.
                         new_schema.properties.insert(key.clone(), value.clone());
@@ -1861,6 +1886,52 @@ mod tests {
             evolved.properties.get("custom_option").map(String::as_str),
             Some("x")
         );
+    }
+
+    #[test]
+    fn set_of_a_policy_key_replaces_its_case_variants() {
+        // #2419 review round 8: two SETs differing only in case must not leave
+        // both keys stored — the policy resolvers reject such a map.
+        let set = |schema: &CatalogTableSchema, key: &str, value: &str| {
+            apply_evolution(
+                schema,
+                &CatalogSchemaEvolution {
+                    changes: vec![SchemaChange::SetTableOption {
+                        key: key.to_string(),
+                        value: value.to_string(),
+                    }],
+                },
+            )
+            .expect("valid SET")
+        };
+        let first = set(&base_schema(), "cache.index.mode", "pin");
+        let second = set(&first, "Cache.Index.Mode", "off");
+        let variants: Vec<_> = second
+            .properties
+            .iter()
+            .filter(|(k, _)| k.eq_ignore_ascii_case("cache.index.mode"))
+            .collect();
+        assert_eq!(variants.len(), 1, "one key per policy knob: {variants:?}");
+        assert_eq!(variants[0].1, "off", "the later SET wins");
+
+        // Whitespace variants are the same knob too.
+        let third = set(&second, " cache.index.mode ", "pin");
+        assert_eq!(
+            third
+                .properties
+                .keys()
+                .filter(|k| k.trim().eq_ignore_ascii_case("cache.index.mode"))
+                .count(),
+            1,
+            "{:?}",
+            third.properties
+        );
+
+        // Ordinary keys keep exact-key semantics.
+        let a = set(&base_schema(), "custom", "1");
+        let b = set(&a, "Custom", "2");
+        assert_eq!(b.properties.get("custom").map(String::as_str), Some("1"));
+        assert_eq!(b.properties.get("Custom").map(String::as_str), Some("2"));
     }
 
     #[test]
