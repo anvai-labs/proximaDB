@@ -201,20 +201,16 @@ impl CatalogLookup for InMemoryCatalog {
     }
 }
 
-/// TD-OLAP-18: ANSI/PostgreSQL identifier case-folding. Unquoted identifiers
-/// resolve case-insensitively (an exact/declared-case match always wins first);
-/// quoted identifiers stay case-exact. The fold only turns previously-failing
-/// lookups into successes, so it defaults ON; `PROXIMADB_IDENT_CASE_FOLD=0`
-/// restores the legacy case-exact resolution. Consulted only on the exact-miss
-/// cold path, so it costs nothing on today's working queries.
-pub fn ident_case_fold_enabled() -> bool {
-    match std::env::var("PROXIMADB_IDENT_CASE_FOLD") {
-        Ok(v) => !matches!(
-            v.trim().to_ascii_lowercase().as_str(),
-            "0" | "false" | "off" | "no"
-        ),
-        Err(_) => true,
-    }
+// TD-OLAP-18: ANSI/PostgreSQL identifier case-folding. Unquoted identifiers
+// resolve case-insensitively (an exact/declared-case match always wins first);
+// quoted identifiers stay case-exact. The fold only turns previously-failing
+// lookups into successes, so it defaults ON; `PROXIMADB_IDENT_CASE_FOLD=0`
+// restores the legacy case-exact resolution. Consulted only on the exact-miss
+// cold path, so it costs nothing on today's working queries.
+proximadb_config::env_kill_switch! {
+    /// Kill-switch for identifier case folding (TD-GRAPH-1); default ON.
+    /// Not memoized: cold-path only, and e2e tests toggle it mid-process.
+    pub fn ident_case_fold_enabled() { gate: "PROXIMADB_IDENT_CASE_FOLD", default: true }
 }
 
 // =========================================================================

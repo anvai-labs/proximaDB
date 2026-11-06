@@ -942,19 +942,15 @@ impl Default for CatalogManager {
     }
 }
 
-/// TD-OLAP-18 identifier case-fold gate (write path). Mirrors the canonical
-/// `proximadb_relational_frontend::ident_case_fold_enabled()` — read inline
-/// here because this control-layer crate must not depend on the query layer.
-/// Default ON; `PROXIMADB_IDENT_CASE_FOLD=0|false|off|no` restores
-/// case-exact resolution (see ENV_GATE_REGISTRY).
-fn ident_case_fold_env_enabled() -> bool {
-    match std::env::var("PROXIMADB_IDENT_CASE_FOLD") {
-        Ok(v) => !matches!(
-            v.trim().to_ascii_lowercase().as_str(),
-            "0" | "false" | "off" | "no"
-        ),
-        Err(_) => true,
-    }
+// TD-OLAP-18 identifier case-fold gate (write path). One shared macro now
+// (the former inline mirror was byte-identical; the layering concern is
+// moot since the macro lives in foundation `proximadb-config`, legal from
+// every layer). Default ON; `PROXIMADB_IDENT_CASE_FOLD=0|false|off|no`
+// restores case-exact resolution (see ENV_GATE_REGISTRY).
+proximadb_config::env_kill_switch! {
+    /// Kill-switch for identifier case folding (TD-GRAPH-1); default ON.
+    /// Not memoized: cold-path only, and e2e tests toggle it mid-process.
+    fn ident_case_fold_env_enabled() { gate: "PROXIMADB_IDENT_CASE_FOLD", default: true }
 }
 
 // `TableIdentifier` lives in `proximadb_catalog` and is re-exported via
