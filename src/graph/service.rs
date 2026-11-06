@@ -166,7 +166,7 @@ impl GraphPayloadCaches {
 pub(crate) fn cold_payloads_enabled() -> bool {
     // Shared non-memoized read (proximadb-config::env_flag_now): the ORION
     // persistence layer gates on the same switch and tests mutate this var
-    // mid-process, so no OnceLock. Case-insensitive like the registry
+    // mid-process, so no OnceLock. Case-insensitive like the env_gate!
     // convention (the former inline read was case-sensitive).
     proximadb_config::env_flag_now(COLD_PAYLOADS_ENV)
 }

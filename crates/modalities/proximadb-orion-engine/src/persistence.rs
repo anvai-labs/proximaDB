@@ -57,7 +57,7 @@ type Result<T> = std::result::Result<T, ProximaDBError>;
 /// `PROXIMADB_GRAPH_COLD_PAYLOADS`). One shared, NON-memoized read in
 /// `proximadb-config` (`env_flag_now`) — the former inlined twin diverged
 /// from the registry convention only by being case-sensitive; the shared
-/// read normalizes like every other gate.
+/// read normalizes like the env_gate! convention.
 fn cold_payloads_enabled() -> bool {
     proximadb_config::env_flag_now("PROXIMADB_GRAPH_COLD_PAYLOADS")
 }
