@@ -505,3 +505,10 @@ door, which refuses every probe.* key — it now names the server-level path
 any refused key is probe.*; and a one-line doc comment that an insert had
 glued onto `is_policy_property` while it describes `normalize_policy_key`
 moved home.
+
+Scoped verification of the round-24 commit (fresh-context, zero must-fix):
+one LOW filed, not fixed — a MIXED refusal (a cache.*/compaction.* key plus
+a probe.* key) names both but advises only the server-level path, dropping
+the pgwire advice for the non-probe keys. No wrong path is named (the
+any-probe-* rule is deliberate); polish for a follow-up. Also noted there:
+the where_to message branching has no test asserting either variant.
