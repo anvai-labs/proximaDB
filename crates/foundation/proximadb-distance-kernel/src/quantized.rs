@@ -1038,7 +1038,6 @@ impl QuantizedDistanceCalculator {
             && self.has_simd
     }
 
-    /// Return true when the batch is large enough to benefit from SIMD batch processing.
     /// Compute batch distances for columnar storage operations
     /// This is the centralized method for all columnar engines (VIPER, NOVA)
     pub async fn compute_columnar_batch_distances(
@@ -1226,7 +1225,8 @@ impl QuantizedDistanceCalculator {
         }
     }
 
-    /// Evict stale entries from the PQ distance table cache based on the configured policy.
+    /// Evict PQ distance-table cache entries when the table count exceeds its bound
+    /// (arbitrary order — see the note inside; NOT policy-directed).
     #[allow(dead_code)]
     fn evict_pq_cache_entries(&self, cache: &mut PQDistanceCache) {
         // Bounded ARBITRARY-ORDER eviction — NOT LRU (TD-FACADE-1).
@@ -1377,12 +1377,21 @@ mod tests {
 
         let query = vec![0.5_f32; 8];
         for n in [8_usize, 64] {
+            // Direction-DISTINCT candidates (review finding): the first cut
+            // used parallel vectors, so cosine gave only two distinct expected
+            // values across the batch and could hide a permutation. Rotating
+            // one-hots give every index a unique expected similarity.
             let vectors: Vec<QuantizedVectorData> = (0..n)
-                .map(|i| QuantizedVectorData {
-                    fp32: Some(vec![i as f32 / 100.0; 8]),
-                    binary: None,
-                    int8: None,
-                    pq: None,
+                .map(|i| {
+                    let mut v = vec![0.0_f32; 8];
+                    v[i % 8] = 1.0;
+                    v[7] = (i as f32) / (n as f32) + 0.25; // break parallelism
+                    QuantizedVectorData {
+                        fp32: Some(v),
+                        binary: None,
+                        int8: None,
+                        pq: None,
+                    }
                 })
                 .collect();
 
