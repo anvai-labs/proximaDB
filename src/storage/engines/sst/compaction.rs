@@ -1641,10 +1641,14 @@ impl Compaction {
             };
             let output_key = task.output_file.to_string_lossy().to_string();
             rounds += 1;
-            self.awaited_outcomes
-                .write()
-                .await
-                .insert(output_key.clone());
+            // Registered AFTER the schedule succeeds: on a declined morsel
+            // (`Ok(false)`) or a schedule error (`?`), nothing is awaited, and
+            // inserting before either path leaked the key into this
+            // process-lifetime set forever — one leaked path string per
+            // contended round on a server running periodic FULL alongside
+            // background compaction (#2418 review round 23). Until the insert,
+            // a >64-in-flight eviction could still drop this outcome — the
+            // `unobserved_passes` figure reports that honestly if it happens.
             if !self.schedule_compaction(task).await? {
                 // A background morsel owns one of our inputs. It is also
                 // reducing the segment count; let it finish instead of
@@ -1655,6 +1659,10 @@ impl Compaction {
                 }
                 continue;
             }
+            self.awaited_outcomes
+                .write()
+                .await
+                .insert(output_key.clone());
             // The REQUEST deadline bounds the total; each pass waits at most
             // what remains of it (full_timeout_ms is not per-pass).
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());

@@ -583,3 +583,17 @@ residual edge until then: an operator who writes a section value EQUAL to
 the code default while the top level differs gets the top-level value. Both
 readings lose that intent today, and the common case (a section stating one
 knob) is now correct for all 23 fields.
+
+Round 23 (#2418): the round-22 commit itself carried a stranded `#[test]` —
+the round-20 boot-door test `config_level_full_target_segments_zero_fails_boot`
+lost its attribute to an insert that anchored on the bare `fn` line, so it
+NEVER RAN while the suite stayed green (the orphaned attribute duplicated
+onto the new exhaustiveness guard instead). Restored, and the missing
+`full_max_passes = 0` boot-door coverage added beside it. Also:
+`awaited_outcomes` entries leaked on the contended/schedule-error paths
+(insert before `schedule_compaction`; the key is process-lifetime and
+unbounded), now registered only after a successful schedule; the stale
+`effective_sst_config` comment still describing the 3-field merge is
+corrected; and `--compact-full-target-segments` without
+`--compact-full-before-measure` now refuses at parse time instead of being
+silently dropped while result.json implied the geometry was pinned.

@@ -1578,7 +1578,6 @@ mod tests {
     /// silently clamped to 1 by `.max(1)` — the knob-silently-rewritten
     /// hazard the four per-request `Some(0)` doors (REST, Flight, the trait
     /// seam, the engine) all refuse. It must fail boot like they do.
-    #[test]
     /// Exhaustiveness guard for `merge_section_over` (#2418 review round 22).
     ///
     /// This destructures `CompactionConfig` with no `..` rest pattern, so
@@ -1656,6 +1655,26 @@ mod tests {
         assert_eq!(merged.consolidate_target_file_size_mb, Some(77));
     }
 
+    #[test]
+    #[test]
+    fn config_level_full_max_passes_zero_fails_boot() {
+        // Round 23: `full_max_passes` was clamped to 1 at use, so 0 booted
+        // happily and silently meant "one pass", not "unbounded" — the same
+        // knob-silently-rewritten class as full_target_segments above.
+        let config = CompactionConfig {
+            full_max_passes: 0,
+            ..Default::default()
+        };
+        let error = config
+            .validate("storage.sst_config.compaction_config")
+            .expect_err("full_max_passes = 0 must fail boot");
+        assert!(
+            error.contains("full_max_passes"),
+            "error must name the knob: {error}"
+        );
+    }
+
+    #[test]
     fn config_level_full_target_segments_zero_fails_boot() {
         let config = CompactionConfig {
             full_target_segments: 0,

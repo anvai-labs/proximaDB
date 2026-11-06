@@ -3459,6 +3459,19 @@ def main() -> int:
     # incomparable in BENCHMARK_EVIDENCE.toml. Unset keeps the server-resolved
     # behaviour; a STATED value must still agree with --max-segments below.
     if (
+        # The override is ONLY read inside the --compact-full-before-measure
+        # block, so stating it alone let the arm silently collapse to the
+        # server default while result.json implied the geometry was pinned —
+        # the accepted-then-dropped-knob class (#2418 review round 23).
+        args.compact_full_target_segments is not None
+        and not args.compact_full_before_measure
+    ):
+        raise SystemExit(
+            "--compact-full-target-segments requires --compact-full-before-measure: "
+            "without it the override is never sent and the bed collapses to the "
+            "server default",
+        )
+    if (
         args.compact_full_before_measure
         # Only a STATED override is checked: unset means "let the server
         # resolve it", which is the pre-PR behaviour F8 preserves.
