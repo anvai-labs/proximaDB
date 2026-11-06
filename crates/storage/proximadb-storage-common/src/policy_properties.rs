@@ -42,7 +42,6 @@ pub fn policy_value<'a>(properties: &'a HashMap<String, String>, key: &str) -> O
         .map(|(_, v)| v)
 }
 
-/// The normalized form every policy resolver keys on.
 /// Whether `key` names a ProximaDB POLICY property — the `cache.`,
 /// `compaction.` or `probe.` namespaces this crate validates.
 ///
@@ -58,6 +57,7 @@ pub fn is_policy_property(key: &str) -> bool {
         .any(|prefix| normalized.starts_with(prefix))
 }
 
+/// The normalized form every policy resolver keys on.
 pub fn normalize_policy_key(key: &str) -> String {
     key.trim().to_ascii_lowercase()
 }

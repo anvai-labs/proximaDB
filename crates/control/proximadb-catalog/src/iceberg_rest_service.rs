@@ -1156,11 +1156,24 @@ impl IcebergRestService {
             if !refused.is_empty() {
                 refused.sort_unstable();
                 refused.dedup();
+                // The advice must lead somewhere that accepts the key: the
+                // pgwire SET door validates cache.*/compaction.* but refuses
+                // probe.* (the knob is server-level until the collection
+                // carrier lands), so a probe.* refusal would dead-end there
+                // (#2419 review round 24).
+                let probe_refused = refused
+                    .iter()
+                    .any(|key| key.trim().to_ascii_lowercase().starts_with("probe."));
+                let where_to = if probe_refused {
+                    "set it on the server ([storage.sst_config.coarse_probe] or PROXIMADB_PAX_READ_PROBE_*)"
+                } else {
+                    "use ALTER TABLE ... SET (...) over pgwire"
+                };
                 anyhow::bail!(
-                    "Bad request: policy table propert{} [{}] cannot be {verb} through an Iceberg commit; use ALTER TABLE {} SET (...) over pgwire",
+                    "Bad request: policy table propert{} [{}] cannot be {verb} through an Iceberg commit; {}",
                     if refused.len() == 1 { "y" } else { "ies" },
                     refused.join(", "),
-                    table
+                    where_to
                 );
             }
         }

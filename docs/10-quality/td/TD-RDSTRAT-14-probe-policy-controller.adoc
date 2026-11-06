@@ -497,3 +497,11 @@ settings actually change: every `SstEngine::new()` calls it with `None` to
 fill the default, so an unconditional bump re-ran the env scan and
 re-emitted any junk-value WARN after every engine construction, defeating
 the memo the cache exists for (RDSTRAT-14-F11 closed).
+
+Round 24 (#2419): first round with NO correctness findings. Two minors
+fixed: the commit-door 400 for `probe.*` keys pointed at the pgwire SET
+door, which refuses every probe.* key — it now names the server-level path
+(`[storage.sst_config.coarse_probe]` / `PROXIMADB_PAX_READ_PROBE_*`) when
+any refused key is probe.*; and a one-line doc comment that an insert had
+glued onto `is_policy_property` while it describes `normalize_policy_key`
+moved home.
