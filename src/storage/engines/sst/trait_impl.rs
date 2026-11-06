@@ -414,23 +414,23 @@ impl UnifiedStorageFormat for SstEngine {
         _base_path: &str,
         vector_id: &str,
     ) -> Result<Option<proximadb_records::ProximaRecord>> {
-        debug!(
-            "🔍 SST: Looking up vector {} in collection {}",
-            vector_id, collection_id
-        );
-
-        // Point-lookup is NOT implemented; refuses honestly (TD-FACADE-1).
+        // Single-record point-lookup refuses honestly (TD-FACADE-1).
         //
         // The former body called contains_vector and then returned None
-        // either way — and contains_vector itself answers "does ANY .sst
-        // file exist in the collection", not "does this id exist", so a
-        // `true` followed by Ok(None) read as "the record vanished". There
-        // is no conservative point-lookup answer (a record is either the
-        // right one or it is not), so this refuses: callers must not be
-        // offered an id-shaped None. Zero callers reach this today (the
-        // trait method's only same-name callers target the memtable's
-        // inherent method, verified by census); implementing it means the
-        // SST record reader + a real id index.
+        // either way — and contains_vector answers "does ANY .sst file
+        // exist in the collection", not "does this id exist", so a `true`
+        // followed by Ok(None) read as "the record vanished".
+        //
+        // A scan-based lookup DOES exist on this engine (the point_lookup
+        // override below backs the live get-by-id path), but a
+        // single-record answer from it would need the MVCC winner rule,
+        // which is deliberately service-side (read.rs freshest_version;
+        // TD-MEMTABLE-MVCC-1 warns against hand-copying it) — a naive
+        // first-match would reintroduce the superseded-version bug. No
+        // conservative single-record answer exists without that rule, so
+        // this refuses. Zero callers reach this method today (census:
+        // every same-name production call targets the memtable's inherent
+        // method; only engine tests call the trait method).
         let _ = (collection_id, _base_path, vector_id);
         Err(anyhow::anyhow!(
             "SST point-lookup is not implemented: contains_vector reports \

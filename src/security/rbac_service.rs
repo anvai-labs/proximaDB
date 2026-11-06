@@ -821,7 +821,7 @@ impl ConsolidatedRBACManager {
             // this method), so the sentinel is a contract, not a live answer;
             // a consumer must match on "*" explicitly, never treat the vec as
             // literal ids. Enumerating real ids needs the collection-service
-            // integration named above.
+            // integration described above.
             return Ok(vec!["*".to_string()]);
         }
 

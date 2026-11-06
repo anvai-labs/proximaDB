@@ -173,7 +173,14 @@ impl SstEngine {
         Ok(metadata)
     }
 
-    /// Check if a vector exists in the collection using bloom filters
+    /// Whether the vector MIGHT exist — currently answers file-existence, not
+    /// id-existence: true when any `.sst` file exists in the collection (the
+    /// bloom check inside is a conservative `Ok(true)` placeholder,
+    /// TD-BLOOM-1). ORPHANED as of 2026-11-06: its only caller
+    /// (`vector_by_id`, which then returned None regardless) now refuses,
+    /// so nothing reaches this — kept as the documented trap it is. A
+    /// caller wiring this for a real existence check gets `true` for any
+    /// id in any non-empty collection (TD-FACADE-1).
     pub async fn contains_vector(&self, collection_id: &str, id: &str) -> Result<bool> {
         debug!(
             "🔍 SST: Checking if vector {} exists in collection {}",

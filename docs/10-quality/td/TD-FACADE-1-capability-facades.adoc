@@ -122,7 +122,7 @@ request.
 | Site | Facade | Tier | Direction
 
 | `src/storage/engines/sst/trait_impl.rs` `vector_by_id` + `sst/collections.rs` `contains_vector`
-| **MITIGATED (2026-11-06).** Was: `contains_vector` answered "does any `.sst` exist" (bloom check `Ok(true)`), and `vector_by_id` returned `None` regardless — a `true` followed by None read as "record vanished". **Trace verdict: the inferred-live grading was WRONG** — the memtable's same-named `vector_by_id` is an inherent method reading only in-memory partitions (no engine fallthrough); the trait method has zero reachable callers. `vector_by_id` now refuses honestly (no conservative point-lookup exists).
+| **MITIGATED (2026-11-06).** Was: `contains_vector` answered "does any `.sst` exist" (bloom check `Ok(true)`), and `vector_by_id` returned `None` regardless — a `true` followed by None read as "record vanished". **Trace verdict: the inferred-live grading was WRONG** — the memtable's same-named `vector_by_id` is an inherent method reading only in-memory partitions (no engine fallthrough); the trait method has zero reachable callers. `vector_by_id` now refuses honestly (no conservative SINGLE-RECORD answer without duplicating the service-side MVCC winner rule — the scan-based `point_lookup` override stays the live get-by-id path). NOTE: this orphaned `contains_vector` (its only caller was the removed body) — still `pub`, still file-existence-as-id-existence, now callerless: a fresh public-uncalled instance, annotated in place.
 | Was inferred-live; actually public-uncalled (engine trait surface)
 | Was wrong results (absent); now a typed refusal
 
@@ -227,7 +227,7 @@ total-only comparison (now per-file).
 . Burn down the **public-uncalled** tier first: each is one line from becoming a
   live bug. For each: implement it, delete it, or make it refuse
   conservatively with a stated reason (the `partition_lease.rs` model).
-. ~~Trace the two *(inferred)* live items~~ **DONE (2026-11-06): both gradings were wrong.** SST `vector_by_id` — the memtable same-name method is inherent (no engine fallthrough), zero reach, now refuses honestly; `get_accessible_collections` — zero callers, `"*"` documented as a wildcard contract. **The inferred-live tier is EMPTY.**
+. ~~Trace the two *(inferred)* live items~~ **DONE (2026-11-06): both gradings were wrong.** SST `vector_by_id` — the memtable same-name method is inherent (no engine fallthrough), zero reach, now refuses honestly; `get_accessible_collections` — zero callers, `"*"` documented as a wildcard contract. **No item remains graded live-by-inference.** (One *ungraded* inferred row — the `advanced_features.rs` IP-range / LDAP providers below — still needs tracing.)
 . Real bloom pruning is a separate feature build under CLAUDE.md #8 (see
   TD-BLOOM-1 "Still open"), and must not use the placeholder hashes above.
 . Every PR that removes a facade lowers the baseline in the same commit.
