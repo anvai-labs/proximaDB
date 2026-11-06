@@ -2555,6 +2555,18 @@ self.try_pax_cascade(
             .min(file_count)
             .max(1);
 
+        // TD-SCANDEG-1: count this scan in-flight for the lifetime of the
+        // per-file work, exactly as the legacy `direct_search_with` path
+        // does. Without this, `INFLIGHT_SCANS` stayed 0 on the production
+        // arc path, `.max(1)` turned it into 1, and `morsel_degree()` was
+        // ALWAYS `cores` — the adaptive back-off (sequential rank under
+        // concurrency, "total CPU workers ≈ cores") never engaged, so every
+        // concurrent query spawned its own all-core rank and oversubscribed
+        // the box by c×cores. The guard is held to the end of this function,
+        // which awaits every per-file handle, so it covers the real scan
+        // duration.
+        let _scan_guard = ScanGuard::enter();
+
         let use_pipeline = ctx.search_params.enable_pipeline_execution.unwrap_or(false);
         let use_parallel_morsels = ctx.search_params.enable_parallel_morsels.unwrap_or(false);
         let use_vectorized = ctx
@@ -4880,5 +4892,152 @@ mod tests {
             "a fully-resolved file set must still prune to nprobe"
         );
         Ok(())
+    }
+
+    // ---- TD-SCANDEG-1: the adaptive morsel degree's back-off must actually
+    // engage. Until the arc path entered ScanGuard, INFLIGHT_SCANS stayed 0
+    // and morsel_degree() was ALWAYS `cores` — c×cores oversubscription at
+    // client concurrency c, while the doc promised "total CPU workers ≈
+    // cores". ----
+
+    #[test]
+    fn morsel_degree_backs_off_under_concurrent_scans() {
+        use std::sync::atomic::Ordering;
+        // SAFETY: nextest runs each test in its own process.
+        unsafe { std::env::remove_var("PROXIMADB_SEARCH_MORSEL_DEGREE") };
+        assert_eq!(
+            INFLIGHT_SCANS.load(Ordering::Relaxed),
+            0,
+            "test starts with no scans in flight (process-per-test isolation)"
+        );
+        let cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        let g1 = ScanGuard::enter();
+        assert_eq!(
+            morsel_degree(),
+            cores,
+            "a lone scan spreads across every core"
+        );
+        let g2 = ScanGuard::enter();
+        assert_eq!(
+            morsel_degree(),
+            1,
+            "a second concurrent scan must back off to the sequential rank"
+        );
+        drop(g2);
+        assert_eq!(morsel_degree(), cores, "back-off releases with the guard");
+        drop(g1);
+        assert_eq!(INFLIGHT_SCANS.load(Ordering::Relaxed), 0);
+    }
+
+    /// The production arc path must COUNT ITSELF in INFLIGHT_SCANS: pre-fix,
+    /// the only ScanGuard::enter() lived on the legacy `&self` path, so the
+    /// arc path never moved the counter and the adaptive degree never saw
+    /// concurrency. A dedicated std sampling thread reads the atomic in a
+    /// tight loop (a tokio yield-loop can miss a sub-millisecond scan).
+    #[tokio::test]
+    #[serial]
+    async fn arc_direct_search_counts_itself_in_inflight_scans() {
+        use crate::core::search::SearchParams;
+        use crate::storage::traits::{FlushParameters, StorageQueryContext, StorageQueryMetadata};
+        use proximadb_records::{EmbeddingCell, ProximaRecord};
+        use std::sync::atomic::Ordering;
+        use std::sync::{Arc, AtomicBool};
+
+        let dim = 64usize;
+        let cid = "scandeg_arc_test";
+        let (engine, collection) = file_backed_test_engine(cid, dim, Some("ArrowBlock")).await;
+
+        let mk_rec = |idx: usize| {
+            let id = format!("b_{}", idx);
+            let ts_ns = (idx as i64).saturating_mul(1_000_000);
+            ProximaRecord {
+                oid: id.clone(),
+                local_id: Some(id),
+                created_at_ns: ts_ns,
+                updated_at_ns: ts_ns,
+                record_version: 1,
+                embeddings: vec![EmbeddingCell::new_fp32(
+                    "test",
+                    "dense_vector",
+                    dim as u32,
+                    (0..dim)
+                        .map(|j| ((idx as f32) * 0.1 + (j as f32) * 0.01).sin())
+                        .collect(),
+                )],
+                ..ProximaRecord::default()
+            }
+        };
+        // 3 flushed files of 200 records each: enough rank work that the
+        // scan window comfortably outlasts the sampler's first read.
+        for b in 0..3u32 {
+            let start = (b as usize) * 200;
+            let recs: Vec<ProximaRecord> = (start..start + 200).map(mk_rec).collect();
+            let params = FlushParameters {
+                collection_id: Some(cid.to_string()),
+                vector_records: recs,
+                force: true,
+                synchronous: true,
+                collection_config: Some(collection.clone()),
+                ..Default::default()
+            };
+            let r = engine.do_flush(&params).await.unwrap();
+            assert!(r.success, "flush batch {} failed", b);
+        }
+
+        let query: Vec<f32> = (0..dim).map(|j| ((j as f32) * 0.01).sin()).collect();
+        let ctx = StorageQueryContext {
+            search_params: Arc::new(SearchParams {
+                vector: Some(query),
+                top_k: Some(10),
+                filters: None,
+                filter_expression: None,
+                ..Default::default()
+            }),
+            collection: Arc::new(collection),
+            metadata: StorageQueryMetadata {
+                collection_id: cid.to_string(),
+                ..Default::default()
+            },
+            user_context: None,
+            tenant_context: None,
+        };
+        // Multi-core inter-file path so the per-file spawns really happen.
+        // SAFETY: nextest process-per-test isolation + #[serial].
+        unsafe { std::env::set_var("PROXIMADB_SEARCH_PARALLEL_FILES", "4") };
+
+        let engine_arc = Arc::new(engine);
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_sampler = Arc::clone(&stop);
+        let sampler = std::thread::spawn(move || {
+            let mut observed_max = 0usize;
+            while !stop_sampler.load(Ordering::Relaxed) {
+                let v = INFLIGHT_SCANS.load(Ordering::Relaxed);
+                if v > observed_max {
+                    observed_max = v;
+                }
+                std::hint::spin_loop();
+            }
+            observed_max
+        });
+
+        let result = engine_arc.search_vectors_unified_arc(&ctx).await;
+        stop.store(true, Ordering::Relaxed);
+        let observed_max = sampler.join().unwrap_or(0);
+        assert!(
+            result.is_ok(),
+            "arc search must succeed: {:?}",
+            result.err()
+        );
+        assert!(
+            observed_max >= 1,
+            "the arc path must count itself in INFLIGHT_SCANS while scanning              (observed max {observed_max}; pre-fix it never left 0, so the              adaptive morsel degree never saw concurrency)"
+        );
+        assert_eq!(
+            INFLIGHT_SCANS.load(Ordering::Relaxed),
+            0,
+            "the guard must release when the scan completes"
+        );
     }
 }

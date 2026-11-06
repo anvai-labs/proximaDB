@@ -306,6 +306,38 @@ impl SurvivorRangeCache {
         F: FnOnce() -> Fut,
         Fut: Future<Output = FsResult<Vec<u8>>>,
     {
+        // TD-SCANDEG-1 sibling (peek/discard re-read): no peeked bytes on
+        // this path — byte-identical to the pre-seam behaviour.
+        self.get_or_fetch_in_parent_impl(kind, path, off, len, parent_off, parent_len, None, loader)
+            .await
+    }
+
+    /// The peek-aware core of [`get_or_fetch_in_parent`]. `peeked` carries
+    /// bytes a prior `peek_parent_residency` ALREADY read from disk: when the
+    /// exact-range L1 misses and the peeked buffer has exactly this range's
+    /// length, it is served here instead of re-reading the identical range
+    /// from the parent L2 store (peek step 3) or the loader — the
+    /// peek-then-discard-then-re-read pattern paid the full local-disk read
+    /// stack (open + seek + read + CRC) twice per range. A peeked buffer of a
+    /// DIFFERENT length is the parent-region buffer (peek step 2); it is
+    /// ignored here and the ordinary parent-L1 slice arm below serves it from
+    /// DRAM at no disk cost.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn get_or_fetch_in_parent_impl<F, Fut>(
+        &self,
+        kind: CacheKind,
+        path: &str,
+        off: u64,
+        len: u64,
+        parent_off: u64,
+        parent_len: u64,
+        peeked: Option<Arc<[u8]>>,
+        loader: F,
+    ) -> FsResult<Arc<[u8]>>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = FsResult<Vec<u8>>>,
+    {
         let Some(relative_off) = off.checked_sub(parent_off) else {
             return self.get_or_fetch(kind, path, off, len, loader).await;
         };
@@ -333,6 +365,23 @@ impl SurvivorRangeCache {
             );
             self.sync_prometheus();
             return Ok(exact);
+        }
+        // Serve bytes the peek already paid for. Accounting mirrors the
+        // parent-L2 arm below: the disk read happened (at peek time, on the
+        // raw store, uncounted there), so it is counted HERE — one
+        // parent-L2-style hit, plus the same L1 promotion the L2 arm does.
+        if let Some(bytes) = peeked
+            && bytes.len() == slice_len
+        {
+            self.parent_l2_hits
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            crate::observability::io_trace::record_l2s(1, 0);
+            self.inner
+                .insert_memory_only(exact_key, weight, bytes.clone())
+                .await;
+            crate::observability::io_trace::record_survivor_l1s(0, 1);
+            self.sync_prometheus();
+            return Ok(bytes);
         }
         let end = start.saturating_add(slice_len);
         if let Some((parent, outcome)) = self.inner.get_with_outcome(&parent_key).await
@@ -1350,6 +1399,138 @@ mod tests {
             cache.inner.l2_stats().misses,
             inner_l2_before.misses,
             "peek must not move the exact-L2 traced counters"
+        );
+    }
+    // ---- TD-SCANDEG-1 sibling: the peeked-bytes serve seam. Pre-fix, the
+    // classification peeked residency, DISCARDED the bytes, and the consume
+    // re-read the identical range — twice the local-disk read stack per
+    // survivor range. ----
+
+    /// Peeked bytes of the exact range length are served WITHOUT a second
+    /// L2 read: after the peek pays the raw-store read, the persistent entry
+    /// is deleted so any consume-side re-probe would miss — only the carried
+    /// bytes can answer. The loader must not run, and the exact-range L1
+    /// promotion the parent-L2 arm performs must still happen.
+    #[tokio::test]
+    async fn peeked_parent_residency_bytes_are_served_without_a_second_l2_read() {
+        let dir = tempfile::tempdir().expect("test tempdir");
+        let store =
+            Arc::new(PersistentByteStore::open(dir.path(), 1 << 20).expect("open persistent L2"));
+
+        // Seed the parent region with one cache (persists to the L2 store)...
+        let seeder = SurvivorRangeCache::with_resolver_and_l2(1 << 20, None, Some(store.clone()));
+        let parent: Arc<[u8]> = Arc::from((0u8..4096).collect::<Vec<_>>());
+        seeder
+            .seed_parent_region("seg.pax", 0, parent)
+            .await
+            .expect("seed parent");
+
+        // ...then consume with a FRESH cache over the same store (empty L1).
+        let cache = SurvivorRangeCache::with_resolver_and_l2(1 << 20, None, Some(store.clone()));
+        let peeked = cache
+            .peek_parent_residency(CacheKind::QuantizedCodes, "seg.pax", 256, 512, 0, 4096)
+            .await
+            .expect("peek must see the persisted parent");
+        assert_eq!(peeked.len(), 512, "peek step 3 returns the exact range");
+
+        // Delete the persistent entry: a consume-side L2 re-probe now misses,
+        // so only the carried bytes can serve this range.
+        store
+            .remove_where(|key| key.starts_with("survivor-parent/"))
+            .await;
+
+        let ran = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let ran_loader = Arc::clone(&ran);
+        let sentinel: Arc<[u8]> = Arc::from(vec![0xEEu8; 512].as_slice());
+        let served = cache
+            .get_or_fetch_in_parent_impl(
+                CacheKind::QuantizedCodes,
+                "seg.pax",
+                256,
+                512,
+                0,
+                4096,
+                Some(peeked.clone()),
+                move || {
+                    let sentinel = sentinel.clone();
+                    async move {
+                        ran_loader.fetch_add(1, Ordering::SeqCst);
+                        Ok(sentinel.to_vec())
+                    }
+                },
+            )
+            .await
+            .expect("peeked serve");
+        assert_eq!(
+            &*served, &*peeked,
+            "the carried peek bytes must be served, not the loader sentinel"
+        );
+        assert_eq!(
+            ran.load(Ordering::SeqCst),
+            0,
+            "the loader must not run when peeked bytes answer the range"
+        );
+        assert!(
+            cache
+                .peek_memory_exact(CacheKind::QuantizedCodes, "seg.pax", 256, 512)
+                .await
+                .is_some(),
+            "the serve must promote the exact range into L1 like the parent-L2 arm"
+        );
+    }
+
+    /// A peeked buffer of the WRONG length is the parent-region buffer
+    /// (peek step 2, DRAM): the seam must ignore it and let the ordinary
+    /// parent-L1 slice arm serve the demanded sub-range — never the loader.
+    #[tokio::test]
+    async fn peeked_bytes_of_wrong_length_fall_back_to_tier_walk() {
+        let dir = tempfile::tempdir().expect("test tempdir");
+        let store =
+            Arc::new(PersistentByteStore::open(dir.path(), 1 << 20).expect("open persistent L2"));
+        let cache = SurvivorRangeCache::with_resolver_and_l2(1 << 20, None, Some(store.clone()));
+        let parent: Arc<[u8]> = Arc::from((0u8..128).collect::<Vec<_>>());
+        cache
+            .seed_parent_region("seed.pax", 0, parent.clone())
+            .await
+            .expect("seed parent");
+
+        // Peek step 2 returns the WHOLE 128-byte parent, not the 8-byte range.
+        let peeked = cache
+            .peek_parent_residency(CacheKind::QuantizedCodes, "seed.pax", 16, 8, 0, 128)
+            .await
+            .expect("parent L1 must be visible");
+        assert_eq!(peeked.len(), 128, "peek step 2 carries the parent buffer");
+
+        let ran = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let ran_loader = Arc::clone(&ran);
+        let served = cache
+            .get_or_fetch_in_parent_impl(
+                CacheKind::QuantizedCodes,
+                "seed.pax",
+                16,
+                8,
+                0,
+                128,
+                Some(peeked),
+                move || {
+                    let ran_loader = ran_loader;
+                    async move {
+                        ran_loader.fetch_add(1, Ordering::SeqCst);
+                        Ok(vec![0xEEu8; 8])
+                    }
+                },
+            )
+            .await
+            .expect("tier-walk serve");
+        assert_eq!(
+            &*served,
+            &parent[16..24],
+            "the parent-L1 slice arm must serve the demanded sub-range"
+        );
+        assert_eq!(
+            ran.load(Ordering::SeqCst),
+            0,
+            "a DRAM-resident parent must never reach the loader"
         );
     }
 }
