@@ -164,9 +164,11 @@ impl GraphPayloadCaches {
 /// `pub(crate)` so the Orion persistence layer can gate topology-only snapshots on
 /// the same switch (TD-168 Phase 1b).
 pub(crate) fn cold_payloads_enabled() -> bool {
-    std::env::var(COLD_PAYLOADS_ENV)
-        .map(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"))
-        .unwrap_or(false)
+    // Shared non-memoized read (proximadb-config::env_flag_now): the ORION
+    // persistence layer gates on the same switch and tests mutate this var
+    // mid-process, so no OnceLock. Case-insensitive like the env_gate!
+    // convention (the former inline read was case-sensitive).
+    proximadb_config::env_flag_now(COLD_PAYLOADS_ENV)
 }
 
 /// True when the cold-payload tier should use the batched segment store
