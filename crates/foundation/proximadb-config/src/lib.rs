@@ -78,7 +78,7 @@ macro_rules! env_gate {
 ///
 /// ```ignore
 /// proximadb_config::env_kill_switch! {
-///     /// Kill-switch: identifier case folding (TD-GRAPH-1). Default ON.
+///     /// Kill-switch: identifier case folding (TD-OLAP-18). Default ON.
 ///     pub fn ident_case_fold_enabled() { gate: "PROXIMADB_IDENT_CASE_FOLD", default: true }
 /// }
 /// ```

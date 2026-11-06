@@ -786,11 +786,11 @@ impl CatalogManager {
     /// namespace (declared-case always wins; ambiguous case-variants stay
     /// unresolved). This is the write-path mirror of the relational frontend's
     /// read-path fold — `INSERT INTO casetbl` after `CREATE TABLE CaseTbl`
-    /// resolves. The gate env var is read inline (the canonical
-    /// `ident_case_fold_enabled()` lives in the query-layer
-    /// `proximadb-relational-frontend`, which this control-layer crate must not
-    /// depend on); the name and semantics are those of the registered gate
-    /// `PROXIMADB_IDENT_CASE_FOLD` (see ENV_GATE_REGISTRY).
+    /// resolves. The gate is the shared `env_kill_switch!` invocation below
+    /// (foundation `proximadb-config`, legal from every layer — the former
+    /// no-query-layer-dependency concern is moot); the name and semantics
+    /// are those of the registered gate `PROXIMADB_IDENT_CASE_FOLD`
+    /// (see ENV_GATE_REGISTRY).
     pub async fn resolve_table_scoped(
         &self,
         fqn: &str,
@@ -948,7 +948,7 @@ impl Default for CatalogManager {
 // every layer). Default ON; `PROXIMADB_IDENT_CASE_FOLD=0|false|off|no`
 // restores case-exact resolution (see ENV_GATE_REGISTRY).
 proximadb_config::env_kill_switch! {
-    /// Kill-switch for identifier case folding (TD-GRAPH-1); default ON.
+    /// Kill-switch for identifier case folding (TD-OLAP-18); default ON.
     /// Not memoized: cold-path only, and e2e tests toggle it mid-process.
     fn ident_case_fold_env_enabled() { gate: "PROXIMADB_IDENT_CASE_FOLD", default: true }
 }
