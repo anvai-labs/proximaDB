@@ -3444,18 +3444,23 @@ def main() -> int:
     args = parser.parse_args()
     if args.skip_ingest and not args.collection_id:
         raise SystemExit("--skip-ingest requires --collection-id")
+    # An ABSENT override DEFAULTS to --max-segments rather than erroring:
+    # requiring it killed every previously valid invocation, including the
+    # reproduce command TD-COMPACT-15 documents for this PR's own evidence
+    # (#2418 review round 21). An override that DISAGREES with --max-segments
+    # is still refused — that is the mismatch the gate exists for.
+    if args.compact_full_before_measure and args.compact_full_target_segments is None:
+        args.compact_full_target_segments = args.max_segments
     if args.compact_full_before_measure and (
-        args.compact_full_target_segments is None
-        or args.compact_full_target_segments != args.max_segments
+        args.compact_full_target_segments != args.max_segments
     ):
         # The post-compact settle gate uses the override, so a mismatch let an
         # arm settle at one geometry while result.json reported another. The
         # --help text only ADVISED consistency; enforce it.
         raise SystemExit(
-            "--compact-full-before-measure requires "
-            f"--compact-full-target-segments == --max-segments ({args.max_segments}): "
-            "without the override the server collapses to the config default "
-            "(1), so the settle gate and result.json would record a geometry "
+            f"--compact-full-target-segments ({args.compact_full_target_segments}) "
+            f"must equal --max-segments ({args.max_segments}): the post-compact "
+            "settle gate asserts the override, so a mismatch records a geometry "
             "the run did not measure",
         )
     if not (

@@ -491,3 +491,43 @@ the untrained input). Config-level full_target_segments = 0 fails boot
 (.max(1) was the knob-silently-rewritten hazard the four Some(0) doors
 reject). supports_full_compaction's doc states the fail-closed contract.
 F4 (re-LIST per follow-up) stays filed as F8.
+
+Round 21 (#2418): two defects in the round-20 fixes.
+
+* `passes` is measured provenance again — observed completions only. Round
+  20 counted a journal MISS as an executed pass, but `pass_outcomes` is a
+  shared 64-entry map that evicts an arbitrary key, and a pass's OWN
+  follow-up can evict its entry before quiescence returns, so `passes` (and
+  the `completed` vs `at_target` metric label derived from it) over-reported
+  real merges. A miss is now neither a completion nor stagnation: a separate
+  `rounds` counter bounds the loop against `full_max_passes`, the deadline
+  still applies, and the contention counter is named `contended_rounds` for
+  what it actually tracks. `no_progress` is therefore not a reachable stop
+  reason, and the metric's doc says so.
+* The floor trim kept the FIRST `keep` inputs, but the task's input list
+  arrives sorted oldest-first and in an LSM the oldest segments have
+  absorbed the most merges — i.e. they are the LARGEST. A floor-bounded
+  follow-up was rewriting the biggest segments, inverting the smallest-first
+  policy (and the ~3.6x write-amp advantage) the FULL loop itself applies.
+  It now sorts the kept set by the sizes already gathered.
+* An input absent from the fresh floor discovery was retired by a concurrent
+  flush/compaction; it is DROPPED (not ours to merge) instead of raising an
+  error that the round-20 retry then re-raised identically — a no-op retry
+  for a deterministic failure. The retry remains for a genuinely transient
+  LIST error.
+* The harness gate no longer kills every prior invocation: an absent
+  `--compact-full-target-segments` DEFAULTS to `--max-segments` (the
+  reproduce command this TD documents was among the casualties); a
+  DISAGREEING override is still refused. Both verified by running it.
+
+Filed:
+
+* *COMPACT-15-F9 — REST compact drops `full`/`target_segments` when a body
+  arrives without a Content-Type.* `Option<Json<CompactRequest>>` yields
+  `None` under axum 0.8's `OptionalFromRequest` both for "no body" (the
+  documented plain-compact form) and for "body present, no Content-Type",
+  so the latter answers 200 with `full: false` after a plain pass — the
+  silent-drop class this PR fail-closes elsewhere. Pre-existing for `full`.
+  Fixing it means either requiring the extractor (an API break for the
+  documented body-less form) or inspecting Content-Length, so it needs a
+  deliberate API decision rather than a review-round patch.

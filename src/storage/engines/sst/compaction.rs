@@ -1447,8 +1447,21 @@ impl Compaction {
         let discovery = CompactionFileDiscovery::new(self.filesystem_factory.clone());
 
         let mut segments_before: Option<usize> = None;
+        // ROUNDS bound the loop; PASSES are the measured provenance (observed
+        // completions only). Round 20 counted a journal MISS as a pass, but
+        // the journal is a shared 64-entry map that evicts an arbitrary key
+        // and the pass's OWN follow-up can evict its entry before quiescence
+        // returns — so `passes` (and the completed/at_target metric label
+        // derived from it) over-reported real merges. A miss is now neither:
+        // it does not inflate the provenance and it does not stall the loop
+        // (#2418 review round 21).
+        let mut rounds = 0usize;
         let mut passes = 0usize;
-        let mut no_progress_rounds = 0usize;
+        // Contention only: three consecutive rounds where a background
+        // morsel owned one of our inputs. (Round 21: the journal-miss and
+        // live-count paths no longer feed this, so "no_progress" is not a
+        // reachable stop reason — the metric doc says so.)
+        let mut contended_rounds = 0usize;
         // #2418 review rounds 17+20 on progress detection: a journal miss
         // after quiescence is an EVICTION artifact (the journal is bounded at
         // 64 and shared process-wide) — the pass ran, so it counts. Round 17
@@ -1488,7 +1501,7 @@ impl Compaction {
                 }
                 break None;
             }
-            if passes >= max_passes {
+            if rounds >= max_passes {
                 break Some("max_passes");
             }
             if std::time::Instant::now() >= deadline {
@@ -1600,12 +1613,13 @@ impl Compaction {
                 min_live_segments,
             };
             let output_key = task.output_file.to_string_lossy().to_string();
+            rounds += 1;
             if !self.schedule_compaction(task).await? {
                 // A background morsel owns one of our inputs. It is also
                 // reducing the segment count; let it finish instead of
                 // fighting it.
-                no_progress_rounds += 1;
-                if no_progress_rounds >= 3 {
+                contended_rounds += 1;
+                if contended_rounds >= 3 {
                     break Some("contended");
                 }
                 continue;
@@ -1628,7 +1642,7 @@ impl Compaction {
                     passes += 1;
                     total_bytes_read += bytes_read;
                     total_bytes_written += bytes_written;
-                    no_progress_rounds = 0;
+                    contended_rounds = 0;
                     // The worker's follow-up chain may have merged more; the
                     // next discovery reflects it.
                 }
@@ -1646,12 +1660,13 @@ impl Compaction {
                     )));
                 }
                 None => {
-                    // Scheduled + quiesced, so the pass ran; the journal
-                    // entry was evicted (cap 64, shared process-wide). Its
-                    // bytes are lost — `bytes_scope` already declares the
-                    // counters a lower bound — but the PASS happened.
-                    passes += 1;
-                    no_progress_rounds = 0;
+                    // The journal entry was evicted (cap 64, shared
+                    // process-wide — possibly by this pass's own follow-up).
+                    // The pass was scheduled and the system quiesced, so it
+                    // is NOT stagnation; but it was never OBSERVED, so it
+                    // must not inflate `passes` either — `rounds` already
+                    // bounds the loop and the deadline still applies.
+                    contended_rounds = 0;
                 }
             }
         };
@@ -1779,18 +1794,40 @@ impl Compaction {
         // morsel with the untrimmed sum (admission over-reserved), and the
         // promotion fallback narrowed an already-truncated list that may
         // have lost the untrained input.
-        let mut kept_sizes = Vec::with_capacity(keep);
-        for path in follow_up.input_files.iter().take(keep) {
-            let Some(size) = sizes.get(&path.to_string_lossy().to_string()).copied() else {
-                // Also not 0 bytes: a 0 under-states the merge input and
-                // lets admission under-reserve (#2418 review round 17).
-                return Err(crate::core::StorageError::SstEngine(format!(
-                    "input {} missing from the floor discovery",
-                    path.display()
-                )));
-            };
-            kept_sizes.push((path.clone(), size));
+        // SMALLEST-first, not first-N: the task's input list arrives sorted
+        // by timestamp (oldest first), and in an LSM the oldest segments have
+        // absorbed the most merges — i.e. they are the LARGEST. Taking the
+        // first `keep` therefore rewrote the biggest segments, inverting the
+        // smallest-first policy the FULL loop itself applies (and the ~3.6x
+        // write-amp advantage it is built on) — #2418 review round 21.
+        //
+        // An input ABSENT from this fresh discovery was retired by a
+        // concurrent flush/compaction between the task's own discovery and
+        // this one: it is not ours to merge, so it is dropped (round 20
+        // returned Err, and the retry then re-discovered the same missing
+        // path and failed identically — a no-op retry for a deterministic
+        // error). Zero bytes is never substituted: that would under-state
+        // the input and let admission under-reserve.
+        let mut candidates: Vec<(std::path::PathBuf, u64)> = follow_up
+            .input_files
+            .iter()
+            .filter_map(|path| {
+                sizes
+                    .get(&path.to_string_lossy().to_string())
+                    .copied()
+                    .map(|size| (path.clone(), size))
+            })
+            .collect();
+        if candidates.len() < 2 {
+            return Err(crate::core::StorageError::SstEngine(format!(
+                "floor-bounded follow-up has {} live inputs after discovery; nothing to merge",
+                candidates.len()
+            )));
         }
+        candidates.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+        let keep = keep.min(candidates.len());
+        let kept_sizes: Vec<(std::path::PathBuf, u64)> =
+            candidates.into_iter().take(keep).collect();
         follow_up.input_files = kept_sizes.iter().map(|(p, _)| p.clone()).collect();
         follow_up.input_bytes = kept_sizes.iter().map(|(_, s)| s).sum();
         Ok(true)

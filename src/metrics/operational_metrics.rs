@@ -251,7 +251,10 @@ lazy_static! {
     /// collection, no compaction manager, a target_segments-without-full bail
     /// — are not counted here, they surface as the API error), else the
     /// engine's stop reason: `max_passes` / `deadline` / `axis_pending` /
-    /// `contended` / `no_progress`.
+    /// `contended`. (`no_progress` is NOT emitted: a pass-journal miss is an
+    /// eviction artifact and a flat live count means concurrent ingest is
+    /// offsetting the merges — neither is stagnation, #2418 review rounds
+    /// 20-21.)
     pub static ref COMPACTION_FULL_STOP: Option<IntCounterVec> = counter_vec(
         "proximadb_compaction_full_stop_total",
         "COMPACT FULL request outcomes by stop reason (TD-COMPACT-15)",
