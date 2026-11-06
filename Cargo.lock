@@ -8265,6 +8265,7 @@ dependencies = [
  "memmap2",
  "parking_lot",
  "proximadb-compression-types",
+ "proximadb-config",
  "proximadb-distance-kernel",
  "proximadb-graph",
  "proximadb-graph-engine-traits",

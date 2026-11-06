@@ -19,6 +19,7 @@
 //! vector via `TenantContext`, provenance document via the scoped collection key.
 //! Never a `{tenant}::collection` name fold, never a per-query predicate.
 
+use crate::services::entity_orchestrator::EntityOrchestrator;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -27,7 +28,7 @@ use tracing::{debug, error, warn};
 
 use crate::core::search::cross_modal_fusion::FusionPolicy;
 use crate::graph::{
-    Edge, GraphOperationsService, Node, NodeId, NodeQuery, PropertyFilter, PropertyValue,
+    Edge, GraphOperationsService, Node, NodeQuery, PropertyFilter, PropertyValue,
     property_value::Value as GraphValue,
 };
 use crate::network::grpc::auth as grpc_auth;
@@ -78,31 +79,6 @@ impl ProximaEntityServiceImpl {
     /// Convert to a tonic server.
     pub fn into_server(self) -> ProximaEntityServiceServer<Self> {
         ProximaEntityServiceServer::new(self)
-    }
-
-    /// Generate a unique node ID for this entity in the graph.
-    fn entity_node_id(collection_id: &str, entity_id: &str) -> NodeId {
-        format!("entity:{collection_id}:{entity_id}")
-    }
-
-    /// Generate a unique auxiliary ID (embedding vector / provenance document)
-    /// for an entity. The entity **node id** is the recoverable prefix (split on
-    /// the last `/`), so fusion results — which carry only the vector `oid` —
-    /// project back to their entity node without a re-fetch. The `/` delimiter
-    /// matches the codebase's canonical-oid convention (`graph/{id}/node/{id}`).
-    fn auxiliary_id(collection_id: &str, entity_id: &str, model_id: &str) -> String {
-        format!(
-            "{}/{model_id}",
-            Self::entity_node_id(collection_id, entity_id)
-        )
-    }
-
-    /// Recover the entity node id from an auxiliary (vector/provenance) oid.
-    /// Inverse of [`Self::auxiliary_id`].
-    fn node_id_from_auxiliary_oid(oid: &str) -> &str {
-        oid.rsplit_once('/')
-            .map(|(node_id, _)| node_id)
-            .unwrap_or(oid)
     }
 
     /// Server-side embedding hop (TD-146 residual): embed a text query via the global
@@ -177,7 +153,7 @@ impl ProximaEntityService for ProximaEntityServiceImpl {
         debug!("v2 gRPC UpsertEntity collection={collection} entity_id={entity_id}");
 
         // Step 1: Create/update the graph node (authoritative entity record).
-        let node_id = Self::entity_node_id(&collection, &entity_id);
+        let node_id = EntityOrchestrator::entity_node_id(&collection, &entity_id);
         let mut node_properties = HashMap::new();
         for (k, v) in &entity.flexible_metadata {
             let pv = typed_value_to_property_value(v).map_err(|reason| {
@@ -187,8 +163,14 @@ impl ProximaEntityService for ProximaEntityServiceImpl {
             })?;
             node_properties.insert(k.clone(), pv);
         }
-        node_properties.insert("_entity_type".to_string(), str_property("entity"));
-        node_properties.insert("_collection_id".to_string(), str_property(&collection));
+        node_properties.insert(
+            "_entity_type".to_string(),
+            EntityOrchestrator::str_property("entity"),
+        );
+        node_properties.insert(
+            "_collection_id".to_string(),
+            EntityOrchestrator::str_property(&collection),
+        );
 
         let now_ms = chrono::Utc::now().timestamp_millis();
         let node = Node {
@@ -224,7 +206,8 @@ impl ProximaEntityService for ProximaEntityServiceImpl {
 
         // Step 2: Upsert embedding vectors (best-effort; non-fatal on failure).
         for embedding in &entity.embeddings {
-            let vector_id = Self::auxiliary_id(&collection, &entity_id, &embedding.model_id);
+            let vector_id =
+                EntityOrchestrator::auxiliary_id(&collection, &entity_id, &embedding.model_id);
             let mut props = ProximaTree::new();
             props.insert(
                 "_entity_id".to_string(),
@@ -282,7 +265,7 @@ impl ProximaEntityService for ProximaEntityServiceImpl {
 
         // Step 3: Store provenance as a document chunk if present (best-effort).
         if let Some(provenance) = entity.provenance.as_ref() {
-            let doc_id = Self::auxiliary_id(&collection, &entity_id, "provenance");
+            let doc_id = EntityOrchestrator::auxiliary_id(&collection, &entity_id, "provenance");
             let mut tree = ProximaTree::new();
             tree.insert(
                 "source_id".to_string(),
@@ -346,15 +329,20 @@ impl ProximaEntityService for ProximaEntityServiceImpl {
 
         // Step 4: Create relation edges (best-effort; non-fatal on failure).
         for relation in &entity.relations {
-            let source = Self::entity_node_id(&collection, &relation.source_entity_id);
-            let target = Self::entity_node_id(&collection, &relation.target_entity_id);
+            let source =
+                EntityOrchestrator::entity_node_id(&collection, &relation.source_entity_id);
+            let target =
+                EntityOrchestrator::entity_node_id(&collection, &relation.target_entity_id);
             let edge_id = format!("{source}:{}->{target}", relation.relation_type);
 
             let mut edge_properties = HashMap::new();
             for (k, v) in &relation.properties {
-                edge_properties.insert(k.clone(), str_property(v));
+                edge_properties.insert(k.clone(), EntityOrchestrator::str_property(v));
             }
-            edge_properties.insert("_entity_relation".to_string(), str_property("true"));
+            edge_properties.insert(
+                "_entity_relation".to_string(),
+                EntityOrchestrator::str_property("true"),
+            );
 
             let edge = Edge {
                 id: edge_id.clone(),
@@ -398,7 +386,7 @@ impl ProximaEntityService for ProximaEntityServiceImpl {
             req.entity_id
         );
 
-        let node_id = Self::entity_node_id(&collection, &req.entity_id);
+        let node_id = EntityOrchestrator::entity_node_id(&collection, &req.entity_id);
         let node = self
             .graph_service
             .for_tenant(&tenant)
@@ -425,7 +413,7 @@ impl ProximaEntityService for ProximaEntityServiceImpl {
             req.entity_id
         );
 
-        let node_id = Self::entity_node_id(&collection, &req.entity_id);
+        let node_id = EntityOrchestrator::entity_node_id(&collection, &req.entity_id);
         let deleted = self
             .graph_service
             .for_tenant(&tenant)
@@ -558,7 +546,7 @@ impl ProximaEntityService for ProximaEntityServiceImpl {
             // serial GET per result.
             let node_ids: Vec<String> = items
                 .iter()
-                .map(|item| Self::node_id_from_auxiliary_oid(&item.oid).to_owned())
+                .map(|item| EntityOrchestrator::node_id_from_auxiliary_oid(&item.oid).to_owned())
                 .collect();
             let nodes = self
                 .graph_service
@@ -667,13 +655,6 @@ fn node_to_entity(node: &Node, collection: &str) -> pv2::Entity {
         provenance: None,
         relations: vec![],
         temporal: None,
-    }
-}
-
-/// Create a string graph [`PropertyValue`].
-fn str_property(s: impl Into<String>) -> PropertyValue {
-    PropertyValue {
-        value: Some(GraphValue::StringValue(s.into())),
     }
 }
 

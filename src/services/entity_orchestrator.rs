@@ -124,7 +124,7 @@ impl EntityOrchestrator {
             .unwrap_or(oid)
     }
 
-    fn str_property(s: impl Into<String>) -> PropertyValue {
+    pub(crate) fn str_property(s: impl Into<String>) -> PropertyValue {
         PropertyValue {
             value: Some(GraphValue::StringValue(s.into())),
         }

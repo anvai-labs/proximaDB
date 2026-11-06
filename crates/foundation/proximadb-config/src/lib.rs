@@ -65,6 +65,20 @@ macro_rules! env_gate {
     };
 }
 
+/// Non-memoized boolean env-gate read (the plain-fn sibling of [`env_gate!`]).
+///
+/// Same truthy set as the macro (`1 | true | on | yes`, case-insensitive),
+/// default false when unset — but read on EVERY call: for gates consulted on
+/// cold paths, or whose value tests mutate mid-process, the macro's
+/// `OnceLock` memoization would freeze the first read forever
+/// (`cold_payloads_enabled` is the canonical example — six tests set and
+/// unset it around individual cases).
+pub fn env_flag_now(name: &str) -> bool {
+    std::env::var(name)
+        .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "on" | "yes"))
+        .unwrap_or(false)
+}
+
 /// TLS transport security configuration shared by protocol listeners.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TlsConfig {

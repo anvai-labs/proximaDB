@@ -53,13 +53,13 @@ use tracing::{debug, info, warn};
 
 type Result<T> = std::result::Result<T, ProximaDBError>;
 
-/// Whether the cold-payload tier is enabled. Mirrors `graph::service::cold_payloads_enabled`
-/// (reads `PROXIMADB_GRAPH_COLD_PAYLOADS`) — inlined here so this module has no root
-/// `crate::graph::service` dependency (ORION crate extraction).
+/// Whether the cold-payload tier is enabled (reads
+/// `PROXIMADB_GRAPH_COLD_PAYLOADS`). One shared, NON-memoized read in
+/// `proximadb-config` (`env_flag_now`) — the former inlined twin diverged
+/// from the registry convention only by being case-sensitive; the shared
+/// read normalizes like every other gate.
 fn cold_payloads_enabled() -> bool {
-    std::env::var("PROXIMADB_GRAPH_COLD_PAYLOADS")
-        .map(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"))
-        .unwrap_or(false)
+    proximadb_config::env_flag_now("PROXIMADB_GRAPH_COLD_PAYLOADS")
 }
 
 /// Serializable snapshot of the ORION engine state
@@ -381,37 +381,15 @@ impl OrionPersistence {
     /// can confirm "did my graph checkpoint actually land durably?"
     /// before the follow-up slice changes recovery behavior to use the
     /// LSN as a replay bound.
+    /// LSN of the newest canonical checkpoint covering this graph. Thin
+    /// wrapper over [`Self::canonical_checkpoint_with_timestamp`] (its strict
+    /// superset) — the two were ~28 duplicated lines until the duplicate was
+    /// collapsed; on read failure the warn now carries the companion's
+    /// `canonical_checkpoint_with_timestamp` label instead of this fn's name.
     pub async fn canonical_checkpoint_lsn(&self) -> Option<u64> {
-        let path = self.canonical_wal_path.as_ref()?;
-        if !tokio::fs::try_exists(path).await.unwrap_or(false) {
-            return None;
-        }
-        let entries = match self.canonical_wal_reader.read_entries(path).await {
-            Ok(entries) => entries,
-            Err(err) => {
-                tracing::warn!(
-                    graph_id = %self.graph_id,
-                    canonical_wal_path = %path.display(),
-                    error = %err,
-                    "ORION canonical_checkpoint_lsn: failed to read canonical WAL; \
-                     returning None and falling back to engine-WAL-only recovery"
-                );
-                return None;
-            }
-        };
-
-        let graph_id = self.graph_id.as_str();
-        entries
-            .iter()
-            .filter_map(|entry| match &entry.operation {
-                proximadb_storage_common::CanonicalOperation::Checkpoint(manifest)
-                    if manifest.collection_ids.iter().any(|id| id == graph_id) =>
-                {
-                    Some(manifest.sequence_number)
-                }
-                _ => None,
-            })
-            .max()
+        self.canonical_checkpoint_with_timestamp()
+            .await
+            .map(|(lsn, _)| lsn)
     }
 
     /// Companion to [`Self::canonical_checkpoint_lsn`] that also returns
