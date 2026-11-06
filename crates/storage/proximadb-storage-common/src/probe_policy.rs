@@ -139,7 +139,10 @@ pub struct ServerProbePolicy {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProbePlan {
     pub cells: usize,
-    /// Planned probe bytes (cells × avg_cell_bytes, band-snapped).
+    /// Planned probe bytes (cells × avg_cell_bytes, band-snapped) — only
+    /// the `ByteBudget` form plans in bytes. `0` means NOT PLANNED IN BYTES
+    /// (the cell-count forms), never "zero bytes": a metering consumer must
+    /// treat 0 as absent rather than booking it.
     pub probe_bytes: u64,
     /// The band rung the plan snapped to (0 when not band-constrained).
     pub band: u64,
@@ -381,7 +384,14 @@ pub fn resolve_probe_plan(
             let chosen = bounded.min(cells.max(1));
             ProbePlan {
                 cells: chosen,
-                probe_bytes: (chosen as u64).saturating_mul(cell_bytes), // saturating: cell_bytes is file-derived (round 20)
+                // 0, NOT cells x cell_bytes: the cell-count forms
+                // (sqrt/cbrt/fourth_root/log/fixed) are given zero geometry
+                // by every production caller, so `cell_bytes` fell back to
+                // 1 and this reported a CELL COUNT labelled as bytes —
+                // which the first metering/billing consumer would have
+                // booked as 1 byte per cell (#2419 review round 22).
+                // `0` means "not planned in bytes"; see the field doc.
+                probe_bytes: 0,
                 band: 0,
             }
         }
@@ -1189,5 +1199,45 @@ mod tests {
             true,
         );
         assert_eq!(property.base_bytes, default_base, "property layer");
+    }
+    #[test]
+    fn cell_count_forms_report_no_byte_plan() {
+        // The production callers hand the cell-count forms zero geometry, so
+        // a byte figure here would be a cell count in disguise (#2419 round
+        // 22). 0 = not planned in bytes.
+        for algorithm in [
+            ProbeAlgorithm::Sqrt,
+            ProbeAlgorithm::CubeRoot,
+            ProbeAlgorithm::FourthRoot,
+            ProbeAlgorithm::Log,
+            ProbeAlgorithm::Fixed,
+        ] {
+            let plan = resolve_probe_plan(
+                &ProbePolicy {
+                    algorithm,
+                    ..Default::default()
+                },
+                30,
+                0,
+                0,
+                0,
+            );
+            assert_eq!(plan.probe_bytes, 0, "{algorithm:?}: {plan:?}");
+            assert_eq!(plan.band, 0, "{algorithm:?}: {plan:?}");
+            assert!(plan.cells >= 1, "{algorithm:?}: {plan:?}");
+        }
+        // ByteBudget DOES plan in bytes.
+        let mib = 1024 * 1024;
+        let budgeted = resolve_probe_plan(
+            &ProbePolicy {
+                algorithm: ProbeAlgorithm::ByteBudget,
+                ..Default::default()
+            },
+            1_000,
+            1_000_000,
+            4 * mib,
+            512 * 1024,
+        );
+        assert!(budgeted.probe_bytes > 0, "{budgeted:?}");
     }
 }

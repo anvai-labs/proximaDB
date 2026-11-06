@@ -432,3 +432,27 @@ turns a previously-"succeeding" bundled commit into a 400; that success was
 the bug — the property write was silently discarded — and applying the
 snapshot while dropping the property would leave the client believing both
 landed, which retries make worse.
+
+Round 22 (#2419): the red "Deterministic Commit Contract" check was the
+LANE-COVERAGE RATCHET — wiring `recall_tune_auth_e2e.rs` into a lane made
+it covered while `scripts/ci_lane_baseline.txt` still listed it as
+uncovered, which `check_ci_lane_coverage.py` fails by design. The entry is
+removed by hand, NOT by `--update-baseline`: the regen strips the inline
+comments five unrelated entries carry ("permanent resident", "not a test
+target", "the dedup-wave owner's call"), which is information this repo
+keeps on purpose.
+
+Also: `commit_table`'s SetProperties now follows the SAME strip-then-judge
+rule as `create_table` — drop the system-written keys, refuse only if a
+client-meaningful one remains. A blanket refusal broke Spark staged
+create/CTAS and `ALTER TABLE ... SET TBLPROPERTIES`, which reach this door
+as an `updateTable` commit carrying the unavoidable `owner`/`write.*`
+keys, and it contradicted the create door one function above.
+`ProbePlan.probe_bytes` is `0` for the cell-count forms instead of
+`cells x 1` — the production callers hand them zero geometry, so
+`cell_bytes` fell back to 1 and the field reported a CELL COUNT labelled as
+bytes, which the first metering consumer would have booked. The doc says
+`0` = not planned in bytes, and a test pins it. The over-bound clamp warn
+fires only under `byte_budget`: `validate` bounds base/cap inside its
+byte_budget branch by design, so the unconditional warn told operators the
+loader refuses a value it had just accepted.

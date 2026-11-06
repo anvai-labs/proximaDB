@@ -3710,13 +3710,19 @@ impl Default for CoarseProbeSettings {
 /// boot on an over-bound value, so silently clamping here gave a non-loader
 /// (embedded/programmatic) config a third behaviour — and a mislabelled
 /// experiment arm (#2419 review round 18).
-fn bounded_probe_mb(name: &str, mb: u64, max_mb: u64) -> u64 {
-    if mb > max_mb {
+fn bounded_probe_mb(name: &str, mb: u64, max_mb: u64, reads_budget: bool) -> u64 {
+    if mb > max_mb && reads_budget {
+        // Only warned when the chosen algorithm actually READS the knob:
+        // `CoarseProbeConfig::validate` bounds base/cap inside its
+        // `byte_budget` branch (rejecting them under sqrt would fail a boot
+        // over a knob that form never reads), so warning unconditionally
+        // told operators the loader refuses a value it had just accepted
+        // (#2419 review round 22).
         tracing::warn!(
             knob = name,
             value_mb = mb,
             max_mb,
-            "coarse_probe.{name} exceeds the probe budget bound; clamping — the loader refuses this at boot, so fix the construction site"
+            "coarse_probe.{name} exceeds the probe budget bound; clamping — the loader refuses this at boot under byte_budget, so fix the construction site"
         );
     }
     mb.min(max_mb)
@@ -3725,6 +3731,9 @@ fn bounded_probe_mb(name: &str, mb: u64, max_mb: u64) -> u64 {
 impl From<crate::core::config::CoarseProbeConfig> for CoarseProbeSettings {
     fn from(c: crate::core::config::CoarseProbeConfig) -> Self {
         let max_mb = proximadb_storage_common::probe_policy::MAX_PROBE_BUDGET_MB as u64;
+        let reads_budget =
+            proximadb_storage_common::probe_policy::ProbeAlgorithm::parse(&c.algorithm)
+                == Some(proximadb_storage_common::probe_policy::ProbeAlgorithm::ByteBudget);
         Self {
             enable_read_probe: c.enable_read_probe,
             enable_write_train: c.enable_write_train,
@@ -3756,9 +3765,9 @@ impl From<crate::core::config::CoarseProbeConfig> for CoarseProbeSettings {
             // it, so silently clamping gave a non-loader (embedded/
             // programmatic) config a third behavior — and a mislabelled
             // experiment arm (#2419 review round 18).
-            probe_base_bytes: bounded_probe_mb("base_mb", c.base_mb, max_mb)
+            probe_base_bytes: bounded_probe_mb("base_mb", c.base_mb, max_mb, reads_budget)
                 .saturating_mul(1024 * 1024),
-            probe_cap_bytes: bounded_probe_mb("cap_mb", c.cap_mb, max_mb)
+            probe_cap_bytes: bounded_probe_mb("cap_mb", c.cap_mb, max_mb, reads_budget)
                 .saturating_mul(1024 * 1024),
         }
     }

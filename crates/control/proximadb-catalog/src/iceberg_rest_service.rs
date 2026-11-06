@@ -1115,19 +1115,34 @@ impl IcebergRestService {
         // half-apply a commit and then 400 (client retries → duplicate
         // append). Refuse the whole commit up front; it contains a write
         // this surface cannot honour (#2419 review round 20).
-        if req.updates.iter().any(|update| {
-            matches!(update, IcebergTableUpdate::SetProperties { updates } if !updates.is_empty())
-        }) {
-            anyhow::bail!(
-                "Bad request: table properties cannot be set through an Iceberg commit; use ALTER TABLE {} SET (...) over pgwire",
-                table
-            );
+        //
+        // The SAME strip-then-judge rule `create_table` uses (#2419 review
+        // round 22): Spark's staged create / CTAS and
+        // `ALTER TABLE ... SET TBLPROPERTIES` reach this door as an
+        // `updateTable` commit whose SetProperties carries the unavoidable
+        // system keys (`owner`, `write.*` defaults). A blanket refusal failed
+        // those commits — and contradicted the create door one function
+        // above, which strips exactly those keys. So: drop the
+        // system-written keys, then refuse only if a CLIENT-MEANINGFUL key
+        // remains (that one really cannot be honoured here).
+        for update in &req.updates {
+            if let IcebergTableUpdate::SetProperties { updates } = update {
+                let meaningful =
+                    crate::table_properties::without_reserved_table_properties(updates.clone());
+                if let Some(key) = meaningful.keys().next() {
+                    anyhow::bail!(
+                        "Bad request: table property '{key}' cannot be set through an Iceberg commit; use ALTER TABLE {} SET (...) over pgwire",
+                        table
+                    );
+                }
+            }
         }
         // Apply updates: handle SetProperties and AddSchema
         for update in &req.updates {
             match update {
-                // Unreachable for non-empty maps (refused before the
-                // loop); an EMPTY SetProperties carries no write.
+                // Only system-written keys can reach here (a
+                // client-meaningful one is refused before the loop); they
+                // are dropped, exactly as `create_table` drops them.
                 IcebergTableUpdate::SetProperties { updates: _ } => {}
                 IcebergTableUpdate::AddSnapshot { snapshot } => {
                     debug!(
