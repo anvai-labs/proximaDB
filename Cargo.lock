@@ -7312,6 +7312,7 @@ dependencies = [
  "proximadb-cache",
  "proximadb-catalog-schema",
  "proximadb-compression-types",
+ "proximadb-config",
  "proximadb-data-model",
  "proximadb-distance-types",
  "proximadb-filter-expression",
@@ -8684,6 +8685,7 @@ dependencies = [
 name = "proximadb-relational-frontend"
 version = "0.5.1"
 dependencies = [
+ "proximadb-config",
  "proximadb-data-model",
  "proximadb-functions",
  "proximadb-relational-algebra",

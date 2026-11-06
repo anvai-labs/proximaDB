@@ -65,6 +65,40 @@ macro_rules! env_gate {
     };
 }
 
+/// Declare a KILL-SWITCH env gate: ON by default (or `$default`), switched
+/// OFF by `0 | false | off | no` (case-insensitive, surrounding whitespace
+/// tolerated). The dual of [`env_gate!`] — opt-in gates default OFF and
+/// enable; kill-switches default ON and disable.
+///
+/// DELIBERATELY NOT MEMOIZED, unlike `env_gate!`: kill-switches sit on
+/// cold/error paths where the read cost is irrelevant, and tests flip them
+/// mid-process (e.g. `ident_case_fold_e2e.rs` toggles the gate between
+/// cases) — a `OnceLock` would freeze the first read forever. Prefer
+/// `env_gate!` for hot-path opt-in gates.
+///
+/// ```ignore
+/// proximadb_config::env_kill_switch! {
+///     /// Kill-switch: identifier case folding (TD-OLAP-18). Default ON.
+///     pub fn ident_case_fold_enabled() { gate: "PROXIMADB_IDENT_CASE_FOLD", default: true }
+/// }
+/// ```
+#[macro_export]
+macro_rules! env_kill_switch {
+    ($(#[$meta:meta])* $vis:vis fn $name:ident() { gate: $gate:literal, default: $default:expr }) => {
+        $(#[$meta])*
+        $vis fn $name() -> bool {
+            std::env::var($gate)
+                .map(|v| {
+                    !matches!(
+                        v.trim().to_ascii_lowercase().as_str(),
+                        "0" | "false" | "off" | "no"
+                    )
+                })
+                .unwrap_or($default)
+        }
+    };
+}
+
 /// Non-memoized boolean env-gate read (the plain-fn sibling of [`env_gate!`]).
 ///
 /// Same truthy set as the macro (`1 | true | on | yes`, case-insensitive),

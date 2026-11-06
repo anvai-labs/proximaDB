@@ -55,6 +55,7 @@ parking_lot.workspace = true
 reqwest = { version = "0.12", optional = true, features = ["json"] }
 urlencoding = { version = "2", optional = true }
 proximadb-compression-types = { workspace = true }
+proximadb-config.workspace = true
 proximadb-data-model = { workspace = true }
 proximadb-distance-types = { workspace = true }
 proximadb-quantization-types = { workspace = true }
