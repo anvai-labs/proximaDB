@@ -28,7 +28,6 @@ from ..models import (
     VectorRecord,
 )
 from ..models_v2 import ProximaRecord
-from ..proto_conversion import ProtoConverter
 from ._sync_graph_delegations import SyncGraphDelegations
 from .base import BaseProtocolAdapter, RecordOpsMixin
 
