@@ -814,9 +814,15 @@ impl ConsolidatedRBACManager {
             .effective_permissions
             .contains(&UnifiedPermission::SystemAdmin)
         {
-            // Return all collections for system admin
-            // This would need integration with collection service
-            return Ok(vec!["*".to_string()]); // Placeholder
+            // SystemAdmin: enumerate-everything is not implemented against
+            // the collection service, so a "*" WILDCARD sentinel is returned —
+            // the documented convention for "all collections" (TD-FACADE-1).
+            // No current consumer reads this value (census: zero callers of
+            // this method), so the sentinel is a contract, not a live answer;
+            // a consumer must match on "*" explicitly, never treat the vec as
+            // literal ids. Enumerating real ids needs the collection-service
+            // integration named above.
+            return Ok(vec!["*".to_string()]);
         }
 
         // Check specific collection permissions

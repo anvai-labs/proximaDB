@@ -419,16 +419,24 @@ impl UnifiedStorageFormat for SstEngine {
             vector_id, collection_id
         );
 
-        // Check if vector exists using bloom filters
-        let exists = self.contains_vector(collection_id, vector_id).await?;
-
-        if !exists {
-            return Ok(None);
-        }
-
-        // In a real implementation, this would read from SST files
-        // For now, return None as a placeholder
-        Ok(None)
+        // Point-lookup is NOT implemented; refuses honestly (TD-FACADE-1).
+        //
+        // The former body called contains_vector and then returned None
+        // either way — and contains_vector itself answers "does ANY .sst
+        // file exist in the collection", not "does this id exist", so a
+        // `true` followed by Ok(None) read as "the record vanished". There
+        // is no conservative point-lookup answer (a record is either the
+        // right one or it is not), so this refuses: callers must not be
+        // offered an id-shaped None. Zero callers reach this today (the
+        // trait method's only same-name callers target the memtable's
+        // inherent method, verified by census); implementing it means the
+        // SST record reader + a real id index.
+        let _ = (collection_id, _base_path, vector_id);
+        Err(anyhow::anyhow!(
+            "SST point-lookup is not implemented: contains_vector reports \
+             file-existence, not id-existence, and a fabricated Ok(None) would \
+             read as 'record missing'. See TD-FACADE-1."
+        ))
     }
 
     /// Delegate search to the search module
@@ -806,6 +814,24 @@ mod tests {
             .await
             .expect_err("a meta-less compaction request must be declined");
         assert!(error.to_string().contains("no catalog collection meta"));
+    }
+
+    /// TD-FACADE-1 pin: the point-lookup must REFUSE, never fabricate
+    /// Ok(None). The former body returned None regardless of
+    /// contains_vector's answer — and contains_vector reports file-existence,
+    /// not id-existence — so a `true` followed by None read as "record
+    /// vanished". Message-asserting deliberately (a bare is_err() would pass
+    /// for many wrong reasons).
+    #[tokio::test]
+    async fn vector_by_id_refuses_instead_of_fabricating_absence() {
+        let engine = create_test_engine().await;
+        let err = engine
+            .vector_by_id("c", "/tmp", "some-id")
+            .await
+            .expect_err("point-lookup must refuse");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("not implemented"), "message: {msg}");
+        assert!(msg.contains("TD-FACADE-1"), "message: {msg}");
     }
 
     async fn create_test_engine() -> SstEngine {

@@ -122,9 +122,9 @@ request.
 | Site | Facade | Tier | Direction
 
 | `src/storage/engines/sst/trait_impl.rs` `vector_by_id` + `sst/collections.rs` `contains_vector`
-| `contains_vector` returns `true` if any `.sst` exists (its bloom check is `Ok(true)`); `vector_by_id` then returns `None` regardless ("For now, return None as a placeholder").
-| Live surface — `SstEngine` is constructed in production; a request path to `vectors_by_ids` was **not** found *(inferred)*
-| Wrong results (absent)
+| **MITIGATED (2026-11-06).** Was: `contains_vector` answered "does any `.sst` exist" (bloom check `Ok(true)`), and `vector_by_id` returned `None` regardless — a `true` followed by None read as "record vanished". **Trace verdict: the inferred-live grading was WRONG** — the memtable's same-named `vector_by_id` is an inherent method reading only in-memory partitions (no engine fallthrough); the trait method has zero reachable callers. `vector_by_id` now refuses honestly (no conservative point-lookup exists).
+| Was inferred-live; actually public-uncalled (engine trait surface)
+| Was wrong results (absent); now a typed refusal
 
 | `crates/storage/proximadb-storage-common/src/text_search/fulltext_index.rs` `TokenizerType::Simple`
 | Six advertised tokenizers, five implemented: `tokenize_simple` is `{ self.tokenize_standard(text) }`, and the two docs are swapped. **Invisible to the guard** (no marker comment).
@@ -137,9 +137,9 @@ request.
 | Was a cross-tenant authorization bypass if adopted; now fail-closed. Middleware behavior unchanged (no tenant asserted); direct callers asserting any tenant are denied.
 
 | `src/security/rbac_service.rs` `get_accessible_collections`
-| Returns `vec!["*"]` ("Placeholder").
-| Live service; consumers **not** audited *(inferred)*
-| Wrong if any caller treats the vec as literal ids
+| **MITIGATED (2026-11-06).** Was: returned `vec!["*"]` labelled "Placeholder". **Trace verdict: inferred-live grading wrong in the other direction** — the method has ZERO callers workspace-wide (the service is live; this method is unreached). The SystemAdmin `"*"` is now documented as a deliberate wildcard-sentinel contract (match on `"*"`, never treat the vec as literal ids); enumerating real ids needs the collection-service integration (roadmap).
+| Live service, uncalled method — public-uncalled
+| None today; a future literal-id consumer is warned off in the doc
 
 | `crates/foundation/proximadb-distance-kernel/src/quantized.rs` `compute_batch_distances_simd`, `evict_pq_cache_entries`
 | **MITIGATED (2026-11-05).** Was: `_simd` a scalar loop ("For now, fall back…") beside ~50 real SIMD sites in `engine.rs`; `compute_columnar_batch_distances` had the same disease (a `chunks(64)` "batch" whose arms were identical code); LRU eviction removed the first 10 HashMap keys (iteration order, not recency) and every other policy silently no-opped. Now: the fake branch split is DELETED (both batch entries are one honest per-vector loop, doc'd — the method is gone, which is the only fix that lowers the guard count) and eviction is bounded arbitrary-order with the policy match removed (`eviction_policy` documented as advisory here; PQ tables are pure perf caches, no correctness impact). Pins: `batch_distances_equal_per_vector_across_old_threshold` (contract preserved across the old 32-threshold), `pq_cache_eviction_is_bounded_and_consistent` (exactly 10 evicted; byte bookkeeping exact). Both pins pass on develop too — deliberately: this fix is behavior-neutral by design, and the regression signal is the guard delta (−1), not a test. RESIDUALS: `simd_used` metric fields (`:708`, `:887`) report the config knob, not actual vectorization of these paths; and `src/storage/engines/universal/config.rs` defines a second, shadow `CacheEvictionPolicy` enum.
@@ -227,8 +227,7 @@ total-only comparison (now per-file).
 . Burn down the **public-uncalled** tier first: each is one line from becoming a
   live bug. For each: implement it, delete it, or make it refuse
   conservatively with a stated reason (the `partition_lease.rs` model).
-. Trace the two *(inferred)* live items (SST `vector_by_id`;
-  `get_accessible_collections` consumers) before grading them further.
+. ~~Trace the two *(inferred)* live items~~ **DONE (2026-11-06): both gradings were wrong.** SST `vector_by_id` — the memtable same-name method is inherent (no engine fallthrough), zero reach, now refuses honestly; `get_accessible_collections` — zero callers, `"*"` documented as a wildcard contract. **The inferred-live tier is EMPTY.**
 . Real bloom pruning is a separate feature build under CLAUDE.md #8 (see
   TD-BLOOM-1 "Still open"), and must not use the placeholder hashes above.
 . Every PR that removes a facade lowers the baseline in the same commit.
