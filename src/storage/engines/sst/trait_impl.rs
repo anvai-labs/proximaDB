@@ -328,6 +328,23 @@ impl UnifiedStorageFormat for SstEngine {
                         "pending_files".to_string(),
                         serde_json::json!(summary.pending_files),
                     ),
+                    // Non-zero ⇒ `passes`/`bytes_*` are a lower bound (the
+                    // journal entry for that pass was gone before the loop
+                    // read it). Emitted always, so a consumer can tell
+                    // "complete" from "incomplete" without inferring it
+                    // from a zero (#2418 review round 22).
+                    (
+                        "unobserved_passes".to_string(),
+                        serde_json::json!(summary.unobserved_passes),
+                    ),
+                    // The population the loop's target actually compared
+                    // against; `segments_after` also counts AXIS-pending
+                    // segments the collapse was never able to touch
+                    // (#2418 review round 22).
+                    (
+                        "segments_compactable_after".to_string(),
+                        serde_json::json!(summary.segments_compactable_after),
+                    ),
                     (
                         "bytes_read".to_string(),
                         serde_json::json!(summary.bytes_read),

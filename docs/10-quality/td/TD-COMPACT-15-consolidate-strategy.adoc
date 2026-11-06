@@ -531,3 +531,55 @@ Filed:
   Fixing it means either requiring the extractor (an API break for the
   documented body-less form) or inspecting Content-Length, so it needs a
   deliberate API decision rather than a review-round patch.
+
+== Round 22 (#2418)
+
+Two correctness defects, both in code earlier rounds had touched:
+
+* **F1 widened.** `merge_section_over` closed the lose-the-top-level class
+  for 3 of **23** fields — and the 20 left included `full_target_segments`,
+  which THIS PR made load-bearing (the FULL collapse target and the
+  follow-up floor both read it). An operator setting top-level
+  `full_target_segments = 3` plus an SST section holding only
+  `l0_file_threshold = 8` got `full_target_segments = 1` (the section's
+  serde default), so a bare `COMPACT TABLE ... FULL` collapsed to one
+  segment. The merge is now per-field for every field: `Option` fields keep
+  their true `is_none()` presence signal, concrete fields treat "equals the
+  code default" as unstated. `merge_section_over_covers_every_field`
+  destructures the struct with no rest pattern, so adding a field FAILS TO
+  COMPILE until it is listed.
+* **Provenance under-reporting.** Round 21 stopped counting an unobserved
+  pass, which was right, but left the journal evicting an ARBITRARY key —
+  so a real multi-segment collapse could report `passes: 0, bytes_read: 0`
+  beside `reached_target: true`. Eviction now skips keys a FULL loop is
+  awaiting, and a miss that still happens is counted into a new
+  `unobserved_passes` (summary + `engine_metrics`) so the figures are
+  declared a lower bound instead of presenting a silent zero as fact.
+
+Also fixed: `full_max_passes = 0` now fails boot (it was clamped to 1, so 0
+silently meant "one pass", not "unbounded" — the same knob-silently-rewritten
+class as `full_target_segments`); the floor-bounded follow-up returns
+"do not schedule" rather than `Err` when its inputs were concurrently
+retired (an `Err` there spent a second full LIST to fail identically — the
+no-op-retry class round 21 claimed to remove, left on this path);
+`narrow_to_promotion_candidate` picks the SMALLEST qualifying input instead
+of the first, which is oldest and therefore largest in an LSM (the same
+inversion round 21 fixed for the multi-input path); the flush path's
+`collection_properties: None` now emits a once-per-collection DEBUG naming
+the blind spot, so the `Option` is no longer inert at its only consumer; and
+`segments_compactable_after` is reported beside `segments_after`, which also
+counts AXIS-pending segments the collapse could never touch.
+
+Harness: `--compact-full-target-segments` is NOT defaulted to
+`--max-segments`. Defaulting it silently changed what an existing
+`--compact-full-before-measure` run measures (the bed settled at two
+segments where it had settled at one), so runs recorded either side of this
+PR would both pass the gate while being incomparable in the evidence ledger.
+Unset keeps the server-resolved behaviour; a stated value must still agree.
+
+Filed: **COMPACT-15-F10** — observing section presence properly needs an
+all-`Option` overlay type for `[storage.sst_config.compaction_config]`. The
+residual edge until then: an operator who writes a section value EQUAL to
+the code default while the top level differs gets the top-level value. Both
+readings lose that intent today, and the common case (a section stating one
+knob) is now correct for all 23 fields.

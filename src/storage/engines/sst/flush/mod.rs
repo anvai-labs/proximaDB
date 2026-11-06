@@ -1149,7 +1149,38 @@ impl SstEngine {
         // property stored before this change) runs the hybrid policy below
         // with a warning. Operators collapse with `COMPACT TABLE ... FULL`,
         // which converges.
+        // `None` ≠ "no properties": it means THIS flush path never consulted
+        // the catalog (bulk-ingest, the WAL flush coordinator, recovery,
+        // VIPER). Collapsing the two would make a stored
+        // `compaction.strategy = 'consolidate'` invisible on those paths —
+        // the refusal NOTICE would never fire for exactly the collections
+        // whose operator needs telling (#2418 review round 22; the gap is
+        // TD-COMPACT-16's round-20 note). Can't resolve it here — the
+        // properties genuinely are not in hand — so make the blind spot
+        // OBSERVABLE instead of silent, once per collection.
         let empty = std::collections::HashMap::new();
+        if loaded_properties.is_none() {
+            static UNCHECKED: std::sync::LazyLock<
+                std::sync::Mutex<std::collections::HashSet<String>>,
+            > = std::sync::LazyLock::new(Default::default);
+            let first = UNCHECKED
+                .lock()
+                .map(|mut seen| {
+                    if seen.len() >= 1024 {
+                        seen.clear();
+                    }
+                    seen.insert(storage_url.to_string())
+                })
+                .unwrap_or(true);
+            if first {
+                debug!(
+                    collection = %storage_url,
+                    "flush path did not load catalog properties; a stored \
+                     compaction.strategy property cannot be seen here (tags only). \
+                     TD-COMPACT-16 item 2 carries the fix."
+                );
+            }
+        }
         if proximadb_storage_common::resolve_effective_strategy(
             loaded_properties.unwrap_or(&empty),
             tags,

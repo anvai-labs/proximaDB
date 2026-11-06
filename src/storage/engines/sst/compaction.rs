@@ -461,7 +461,16 @@ pub enum PassOutcome {
 #[derive(Debug, Clone, Copy)]
 pub struct FullCompactionSummary {
     pub segments_before: usize,
+    /// ALL live segments after the collapse — compactable PLUS AXIS-pending.
+    /// The loop exits on the compactable count alone, so with pending
+    /// segments present this can exceed `target` (and `reached_target` be
+    /// false) even though the collapse hit the requested count; those
+    /// segments were never candidates. `segments_compactable_after` is the
+    /// population the loop actually drove (#2418 review round 22).
     pub segments_after: usize,
+    /// The segments the collapse could act on — `segments_after` minus the
+    /// AXIS-pending ones. This is what the loop's target comparison used.
+    pub segments_compactable_after: usize,
     pub passes_executed: usize,
     pub reached_target: bool,
     pub stop_reason: Option<&'static str>,
@@ -476,6 +485,14 @@ pub struct FullCompactionSummary {
     /// Wall-clock duration of the whole request, including discovery and
     /// inter-pass quiescence waits.
     pub duration_ms: u64,
+    /// Passes that ran but whose journal entry was gone before the loop read
+    /// it, so their bytes are NOT in `bytes_read`/`bytes_written` and they are
+    /// NOT in `passes_executed`. Non-zero means those three figures are a
+    /// lower bound, not a measurement; `segments_before`/`segments_after`/
+    /// `reached_target` are unaffected (they come from a fresh discovery).
+    /// Reachable only with >64 FULL requests in flight at once, since
+    /// eviction skips awaited keys (#2418 review round 22).
+    pub unobserved_passes: usize,
 }
 
 /// Backwards-compat alias for [`SstCompactionStats`].
@@ -580,6 +597,13 @@ pub struct Compaction {
     /// [`Compaction::take_pass_outcome`] (the FULL collapse loop). Bounded;
     /// entries nobody reads are dropped.
     pass_outcomes: Arc<tokio::sync::RwLock<HashMap<String, PassOutcome>>>,
+    /// Output keys a FULL loop is currently waiting to read an outcome for.
+    ///
+    /// The journal is a bounded, process-wide map, so without this the
+    /// eviction below could drop the very entry a FULL request was about to
+    /// read — reporting a real multi-segment collapse as `passes: 0,
+    /// bytes_read: 0` (#2418 review round 22). Eviction skips awaited keys.
+    awaited_outcomes: Arc<tokio::sync::RwLock<std::collections::HashSet<String>>>,
     /// Set-once resolver — initialized after bootstrap once the catalog
     /// handle becomes available (the storage engine constructs Compaction
     /// before SharedServices does, so the resolver can't be injected at
@@ -836,6 +860,7 @@ impl Compaction {
             active_compactions: Arc::new(RwLock::new(HashMap::new())),
             atomic_coordinator,
             pass_outcomes: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            awaited_outcomes: Arc::new(tokio::sync::RwLock::new(std::collections::HashSet::new())),
             unified_reader,
             sst_compactor,
             filesystem_factory,
@@ -1462,6 +1487,8 @@ impl Compaction {
         // live-count paths no longer feed this, so "no_progress" is not a
         // reachable stop reason — the metric doc says so.)
         let mut contended_rounds = 0usize;
+        // Passes that ran but whose journal entry was gone before we read it.
+        let mut unobserved_passes = 0usize;
         // #2418 review rounds 17+20 on progress detection: a journal miss
         // after quiescence is an EVICTION artifact (the journal is bounded at
         // 64 and shared process-wide) — the pass ran, so it counts. Round 17
@@ -1614,6 +1641,10 @@ impl Compaction {
             };
             let output_key = task.output_file.to_string_lossy().to_string();
             rounds += 1;
+            self.awaited_outcomes
+                .write()
+                .await
+                .insert(output_key.clone());
             if !self.schedule_compaction(task).await? {
                 // A background morsel owns one of our inputs. It is also
                 // reducing the segment count; let it finish instead of
@@ -1628,13 +1659,16 @@ impl Compaction {
             // what remains of it (full_timeout_ms is not per-pass).
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             if !self.await_compaction_quiescence(remaining).await {
+                self.awaited_outcomes.write().await.remove(&output_key);
                 return Err(crate::core::StorageError::SstEngine(format!(
                     "FULL compaction for {collection_object_id} did not quiesce within the \
                      request deadline ({}ms remaining); a pass may still be in flight",
                     remaining.as_millis()
                 )));
             }
-            match self.take_pass_outcome(&output_key).await {
+            let taken = self.take_pass_outcome(&output_key).await;
+            self.awaited_outcomes.write().await.remove(&output_key);
+            match taken {
                 Some(PassOutcome::Completed {
                     bytes_read,
                     bytes_written,
@@ -1660,12 +1694,16 @@ impl Compaction {
                     )));
                 }
                 None => {
-                    // The journal entry was evicted (cap 64, shared
-                    // process-wide — possibly by this pass's own follow-up).
-                    // The pass was scheduled and the system quiesced, so it
-                    // is NOT stagnation; but it was never OBSERVED, so it
-                    // must not inflate `passes` either — `rounds` already
-                    // bounds the loop and the deadline still applies.
+                    // The journal entry was evicted. Eviction now skips
+                    // awaited keys, so this is reachable only when >64 FULL
+                    // requests are in flight at once. The pass was scheduled
+                    // and the system quiesced, so it is NOT stagnation; it was
+                    // never OBSERVED, so it must not inflate `passes` either
+                    // (`rounds` bounds the loop, the deadline still applies).
+                    // It IS counted here so the summary can say its pass and
+                    // byte figures are incomplete rather than present a
+                    // silent zero as fact (#2418 review round 22).
+                    unobserved_passes += 1;
                     contended_rounds = 0;
                 }
             }
@@ -1683,6 +1721,9 @@ impl Compaction {
         Ok(FullCompactionSummary {
             segments_before: segments_before.unwrap_or(after),
             segments_after: after,
+            // The same expression the loop's `live` uses, so the reported
+            // population and the one the target compared against cannot drift.
+            segments_compactable_after: files.compactable_files.values().flatten().count(),
             passes_executed: passes,
             reached_target: after <= target,
             stop_reason,
@@ -1690,6 +1731,7 @@ impl Compaction {
             bytes_read: total_bytes_read,
             bytes_written: total_bytes_written,
             duration_ms: started.elapsed().as_millis() as u64,
+            unobserved_passes,
         })
     }
 
@@ -1705,16 +1747,31 @@ impl Compaction {
     ) -> bool {
         let min_bytes = super::flush::training_compaction_min_bytes();
         let mut errored = false;
+        // SMALLEST qualifying input, not the first. `input_files` arrives in
+        // task order, which `bound_follow_up_to_floor` establishes is
+        // timestamp order (oldest first) — and in an LSM the oldest segments
+        // have absorbed the most merges, so they are the LARGEST. Taking the
+        // first therefore rewrote the biggest candidate, maximising write
+        // amplification for a rewrite whose only purpose is to attach a
+        // training header; it was the same inversion round 21 fixed for the
+        // multi-input path, left in place on this one (#2418 review round 22).
+        let mut best: Option<(std::path::PathBuf, u64)> = None;
         for path in &follow_up.input_files {
             let url = path.to_string_lossy();
             match super::flush::untrained_segment_size_on(&self.filesystem_factory, &url, min_bytes)
                 .await
             {
                 Ok(Some(size)) => {
-                    let chosen = path.clone();
-                    follow_up.input_files = vec![chosen];
-                    follow_up.input_bytes = size;
-                    return true;
+                    // Tie-break on path so the choice is deterministic.
+                    let better = match &best {
+                        Some((best_path, best_size)) => {
+                            (size, path.as_path()) < (*best_size, best_path.as_path())
+                        }
+                        None => true,
+                    };
+                    if better {
+                        best = Some((path.clone(), size));
+                    }
                 }
                 Ok(None) => {}
                 // Loud: silently skipping left the caller's "skipped: at the
@@ -1730,6 +1787,11 @@ impl Compaction {
                     );
                 }
             }
+        }
+        if let Some((chosen, size)) = best {
+            follow_up.input_files = vec![chosen];
+            follow_up.input_bytes = size;
+            return true;
         }
         if errored {
             warn!("no promotion candidate readable; not narrowing the follow-up");
@@ -1819,10 +1881,18 @@ impl Compaction {
             })
             .collect();
         if candidates.len() < 2 {
-            return Err(crate::core::StorageError::SstEngine(format!(
-                "floor-bounded follow-up has {} live inputs after discovery; nothing to merge",
-                candidates.len()
-            )));
+            // `Ok(false)` ("do not schedule"), NOT `Err`: the inputs were
+            // concurrently retired, which a re-discovery reports identically,
+            // so the non-promoting caller's one retry would spend a second
+            // full object-store LIST to fail the same way. Err is reserved
+            // for a genuinely transient LIST error, where the retry can
+            // succeed (#2418 review round 22 — the no-op-retry class round 21
+            // claimed to remove, reintroduced on this path).
+            debug!(
+                live_inputs = candidates.len(),
+                "floor-bounded follow-up has nothing left to merge; not scheduling"
+            );
+            return Ok(false);
         }
         candidates.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
         let keep = keep.min(candidates.len());
@@ -2164,12 +2234,23 @@ impl Compaction {
                 if let Some(outcome) = journal_outcome {
                     let mut journal = compaction.pass_outcomes.write().await;
                     if journal.len() >= 64 {
-                        // Bounded: drop an arbitrary (oldest-iteration) entry.
-                        // Eviction is BENIGN for the FULL loop since round 17:
-                        // it counts a scheduled-and-quiesced pass on a miss
-                        // (bytes lost, passes kept) and measures progress from
-                        // the live count instead.
-                        if let Some(key) = journal.keys().next().cloned() {
+                        // Bounded. Evict an entry NO FULL loop is waiting on:
+                        // dropping an awaited entry would make a real collapse
+                        // report `passes: 0, bytes_read: 0` while
+                        // `reached_target` says it worked (#2418 review round
+                        // 22 — the under-reporting mirror of the over-reporting
+                        // round 21 fixed). The round-17 claim that eviction is
+                        // "benign for the FULL loop" has not held since round
+                        // 21 stopped counting an unobserved pass.
+                        let awaited = compaction.awaited_outcomes.read().await;
+                        let victim = journal.keys().find(|k| !awaited.contains(*k)).cloned();
+                        // `None` = every entry is awaited: keep them all
+                        // rather than corrupt one request's provenance. The
+                        // map exceeds 64 only while that many FULL requests
+                        // are in flight, and each removes its own key when it
+                        // takes its outcome.
+                        drop(awaited);
+                        if let Some(key) = victim {
                             journal.remove(&key);
                         }
                     }

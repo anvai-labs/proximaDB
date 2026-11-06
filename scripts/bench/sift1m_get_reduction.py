@@ -3449,10 +3449,21 @@ def main() -> int:
     # reproduce command TD-COMPACT-15 documents for this PR's own evidence
     # (#2418 review round 21). An override that DISAGREES with --max-segments
     # is still refused — that is the mismatch the gate exists for.
-    if args.compact_full_before_measure and args.compact_full_target_segments is None:
-        args.compact_full_target_segments = args.max_segments
-    if args.compact_full_before_measure and (
-        args.compact_full_target_segments != args.max_segments
+    # NOT defaulted to --max-segments (#2418 review round 22). --max-segments
+    # defaults to 2 while the server's full_target_segments defaults to 1, so
+    # defaulting here would silently change what an existing
+    # --compact-full-before-measure invocation measures: the bed would settle
+    # at two segments where it previously settled at one. Segment count is the
+    # dominant variable in this harness's GET-reduction result, so runs
+    # recorded before and after would both pass the gate while being
+    # incomparable in BENCHMARK_EVIDENCE.toml. Unset keeps the server-resolved
+    # behaviour; a STATED value must still agree with --max-segments below.
+    if (
+        args.compact_full_before_measure
+        # Only a STATED override is checked: unset means "let the server
+        # resolve it", which is the pre-PR behaviour F8 preserves.
+        and args.compact_full_target_segments is not None
+        and args.compact_full_target_segments != args.max_segments
     ):
         # The post-compact settle gate uses the override, so a mismatch let an
         # arm settle at one geometry while result.json reported another. The

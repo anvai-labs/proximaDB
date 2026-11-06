@@ -1087,6 +1087,17 @@ impl CompactionConfig {
         // hazard the four Some(0) doors (REST, Flight, trait seam, engine)
         // reject: `.max(1)` would collapse every bare FULL to 1 while the
         // operator believes they stated 0 (#2418 review round 20).
+        // Same knob-silently-rewritten class as `full_target_segments`
+        // below: `compact_collection_full` applies `.max(1)` to this, so 0
+        // boots and behaves as 1 — a FULL on a 10-segment collection does one
+        // round and reports `stop_reason: "max_passes"`, `reached_target:
+        // false`, while the operator believes they removed the bound
+        // (#2418 review round 22).
+        if self.full_max_passes == 0 {
+            return Err(format!(
+                "{section}.full_max_passes must be >= 1 (got 0); it is clamped to 1 at use,                  so 0 would silently mean 'one pass', not 'unbounded'"
+            ));
+        }
         if self.full_target_segments == 0 {
             return Err(format!(
                 "{section}.full_target_segments must be >= 1 (got 0)"
@@ -1194,23 +1205,44 @@ impl CompactionConfig {
             .unwrap_or(DEFAULT_CONSOLIDATE_TARGET_FILE_SIZE_MB)
     }
 
-    /// Merge an SST-section override over the top-level config, per FIELD.
+    /// Merge an SST-section override over the top-level config, per FIELD —
+    /// for EVERY field, not just the `consolidate_*` ones.
     ///
-    /// Used by `effective_sst_config`. It merges only the `consolidate_*`
-    /// fields per field; every other field is still taken from the section
-    /// as a whole (TD-COMPACT-15 F1).
+    /// Used by `effective_sst_config`. A wholesale pick is wrong because an
+    /// operator who declares `[storage.sst_config.compaction_config]` for one
+    /// knob (say `l0_file_threshold`) would silently lose every top-level
+    /// value — including `full_target_segments`, which the FULL collapse and
+    /// its follow-up floor both read (TD-COMPACT-15 F1, widened by the #2418
+    /// review round 22: closing this for 3 of 23 fields left the other 20,
+    /// among them the one this PR made load-bearing).
     ///
-    /// A wholesale pick is wrong because an operator who declares
-    /// `[storage.sst_config.compaction_config]` for one knob (say
-    /// `l0_file_threshold`) would silently lose every top-level
-    /// `consolidate_*` value.
+    /// Two presence rules, because the struct has two kinds of field:
+    ///
+    /// * The `consolidate_*` fields are `Option`, so `is_none()` is a TRUE
+    ///   presence signal — genuinely unstated, not "happens to equal the
+    ///   default".
+    /// * Every other field is concrete with a serde default, so presence
+    ///   CANNOT be observed after deserialization. There, a section value
+    ///   equal to the code default is treated as unstated and inherits the
+    ///   top-level value.
+    ///
+    /// The residual edge of that second rule, stated plainly rather than
+    /// left to be discovered: an operator who writes a section value that
+    /// EQUALS the code default while the top level says something else gets
+    /// the top-level value, not their explicit restatement of the default.
+    /// Both readings lose that intent today (the wholesale pick discarded
+    /// the top-level value outright), and the common case — a section
+    /// stating one knob — is now correct for all 23 fields. Observing
+    /// presence properly needs an all-`Option` overlay type for the section;
+    /// filed as TD-COMPACT-15 F10, not faked here.
+    #[allow(clippy::float_cmp)] // comparing against the code default is exact by construction
     pub fn merge_section_over(top: &CompactionConfig, section: Option<&CompactionConfig>) -> Self {
         let Some(section) = section else {
             return top.clone();
         };
+        let defaults = CompactionConfig::default();
         let mut merged = section.clone();
-        // Each field is Option, so `is_none()` means genuinely unstated —
-        // not "happens to equal the default".
+
         if merged.consolidate_strategy.is_none() {
             merged.consolidate_strategy = top.consolidate_strategy.clone();
         }
@@ -1220,6 +1252,41 @@ impl CompactionConfig {
         if merged.consolidate_write_amp_limit.is_none() {
             merged.consolidate_write_amp_limit = top.consolidate_write_amp_limit;
         }
+
+        macro_rules! inherit_if_default {
+            ($($field:ident),+ $(,)?) => {
+                $(
+                    if merged.$field == defaults.$field {
+                        merged.$field = top.$field.clone();
+                    }
+                )+
+            };
+        }
+        // Every concrete field. `merge_section_over_covers_every_field` is a
+        // destructuring guard that fails to COMPILE if a field is added
+        // without being listed here.
+        inherit_if_default!(
+            l0_file_threshold,
+            higher_level_file_threshold,
+            l0_size_threshold_mb,
+            level_multiplier,
+            max_levels,
+            strategy,
+            target_file_size_mb,
+            memory_amplification_factor,
+            memory_budget_fraction,
+            available_memory_fraction,
+            max_memory_mb,
+            spill_enabled,
+            spill_directory,
+            spill_working_memory_mb,
+            spill_scratch_amplification_factor,
+            spill_available_disk_fraction,
+            spill_max_disk_mb,
+            full_target_segments,
+            full_max_passes,
+            full_timeout_ms,
+        );
         merged
     }
 }
@@ -1512,6 +1579,83 @@ mod tests {
     /// hazard the four per-request `Some(0)` doors (REST, Flight, the trait
     /// seam, the engine) all refuse. It must fail boot like they do.
     #[test]
+    /// Exhaustiveness guard for `merge_section_over` (#2418 review round 22).
+    ///
+    /// This destructures `CompactionConfig` with no `..` rest pattern, so
+    /// ADDING A FIELD BREAKS THIS TEST'S COMPILATION. That is the point: the
+    /// new field must be added to `inherit_if_default!` (or given `Option`
+    /// presence) in the same change. Without the guard, a field added later
+    /// is silently discarded whenever an operator states any one knob in
+    /// `[storage.sst_config.compaction_config]` — the exact class this
+    /// review round reopened after it was closed for only 3 of 23 fields.
+    #[test]
+    fn merge_section_over_covers_every_field() {
+        let CompactionConfig {
+            // concrete fields — each must appear in `inherit_if_default!`
+            l0_file_threshold: _,
+            higher_level_file_threshold: _,
+            l0_size_threshold_mb: _,
+            level_multiplier: _,
+            max_levels: _,
+            strategy: _,
+            target_file_size_mb: _,
+            memory_amplification_factor: _,
+            memory_budget_fraction: _,
+            available_memory_fraction: _,
+            max_memory_mb: _,
+            spill_enabled: _,
+            spill_directory: _,
+            spill_working_memory_mb: _,
+            spill_scratch_amplification_factor: _,
+            spill_available_disk_fraction: _,
+            spill_max_disk_mb: _,
+            full_target_segments: _,
+            full_max_passes: _,
+            full_timeout_ms: _,
+            // Option fields — carried by the `is_none()` arms
+            consolidate_target_file_size_mb: _,
+            consolidate_write_amp_limit: _,
+            consolidate_strategy: _,
+        } = CompactionConfig::default();
+    }
+
+    /// A section stating ONE knob must not discard the operator's other
+    /// top-level values — above all `full_target_segments`, which this PR
+    /// made load-bearing for both the FULL collapse and its follow-up floor.
+    #[test]
+    fn section_stating_one_knob_keeps_every_other_top_level_value() {
+        let top = CompactionConfig {
+            full_target_segments: 3,
+            full_max_passes: 9,
+            full_timeout_ms: 123_456,
+            spill_enabled: !CompactionConfig::default().spill_enabled,
+            max_memory_mb: 4242,
+            strategy: "size".to_string(),
+            consolidate_target_file_size_mb: Some(77),
+            ..CompactionConfig::default()
+        };
+        // The operator declares the section for ONE unrelated knob.
+        let section = CompactionConfig {
+            l0_file_threshold: 8,
+            ..CompactionConfig::default()
+        };
+
+        let merged = CompactionConfig::merge_section_over(&top, Some(&section));
+
+        assert_eq!(merged.l0_file_threshold, 8, "the stated knob must win");
+        // Everything else the operator set at the top level must survive.
+        assert_eq!(
+            merged.full_target_segments, 3,
+            "full_target_segments was silently reset to the serde default before round 22"
+        );
+        assert_eq!(merged.full_max_passes, 9);
+        assert_eq!(merged.full_timeout_ms, 123_456);
+        assert_eq!(merged.spill_enabled, top.spill_enabled);
+        assert_eq!(merged.max_memory_mb, 4242);
+        assert_eq!(merged.strategy, "size");
+        assert_eq!(merged.consolidate_target_file_size_mb, Some(77));
+    }
+
     fn config_level_full_target_segments_zero_fails_boot() {
         let config = CompactionConfig {
             full_target_segments: 0,
