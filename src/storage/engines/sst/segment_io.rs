@@ -1551,11 +1551,16 @@ mod tests {
                             // loudly instead: the guard's own preparation is
                             // the thing under test here.
                             balanced_brace_end(source, at).unwrap_or_else(|| {
+                                // Line of the PREPARED buffer (post comment-strip),
+                                // not the on-disk byte offset — greppable in the
+                                // file even when stripping shifted positions.
+                                let line = source[..at].matches('\n').count() + 1;
                                 panic!(
-                                    "{file}: a #[cfg(test)] item at byte {at} never closes its \
-                                     braces, so the guard would silently stop pinning the rest \
-                                     of the file (string/char literal holding an unmatched brace \
-                                     inside a test body is the known cause)"
+                                    "{file}: a #[cfg(test)] item (prepared line {line}) never \
+                                     closes its braces, so the guard would silently stop \
+                                     pinning the rest of the file (string/char literal \
+                                     holding an unmatched brace inside a test body is the \
+                                     known cause)"
                                 )
                             })
                         }
@@ -1583,6 +1588,61 @@ mod tests {
         // and only lines 1-1437 of sst_query_engine.rs. Each sentinel names
         // a production identifier from deep inside the previously-truncated
         // region.
+        // Self-tests of the PREPARATION itself on synthetic source (review
+        // round-2 NIT-3: the durable replacement for a mutation run — both
+        // prior live mutation attempts were killed by external factors, so
+        // the helpers' behavior is pinned here on inputs whose expected
+        // outcome is known by construction):
+        //   (a) interleaved #[cfg(test)] items are cut and production on
+        //       BOTH sides survives — the round-1 B1 shape;
+        //   (b) a cfg(test) mentioned only in a comment does not arm the
+        //       scanner — the line-33 shape;
+        //   (c) an unbalanced brace inside a test body fails LOUDLY, naming
+        //       the file and a prepared line number — the round-2 root cause.
+        {
+            let synthetic = concat!(
+                "fn before() {}\n",
+                "// see the #[cfg(test)] mod below\n",
+                "fn middle() {}\n",
+                // The test body's braces BALANCE under the scanner's counting
+                // (a brace PAIR inside a string literal nets to zero) — an
+                // unbalanced one belongs to the (c) fixture below.
+                "#[cfg(test)]\nmod tests {\n    fn t() { let s = \"{}\"; }\n}\n",
+                "fn after() {}\n",
+            );
+            let prepared = production_source("synthetic_a.rs", synthetic);
+            let normalized = norm(&prepared);
+            assert!(
+                normalized.contains("fnbefore(){}"),
+                "production before the test mod kept"
+            );
+            assert!(
+                normalized.contains("fnmiddle(){}"),
+                "production between comment and test mod kept"
+            );
+            assert!(
+                normalized.contains("fnafter(){}"),
+                "production after the test mod kept (the B1 cut lost exactly this)"
+            );
+            assert!(!normalized.contains("fnt()"), "test item actually cut");
+
+            let unbalanced = concat!(
+                "fn prod() {}\n",
+                "#[cfg(test)]\nmod tests {\n    fn t() { let s = \"{\"; }\n",
+            );
+            let panicked =
+                std::panic::catch_unwind(|| production_source("synthetic_b.rs", unbalanced));
+            let message = panicked
+                .expect_err("an unbalanced test item must fail loudly")
+                .downcast_ref::<String>()
+                .cloned()
+                .unwrap_or_default();
+            assert!(
+                message.contains("synthetic_b.rs") && message.contains("never closes its braces"),
+                "the panic names the file and the cause: {message}"
+            );
+        }
+
         let segment_format =
             production_source("segment_format.rs", include_str!("segment_format.rs"));
         assert!(
@@ -1608,13 +1668,30 @@ mod tests {
 
         // Round-2 residual: these four pins carried NO sentinel, so a
         // preparation regression in them unpinned the file SILENTLY (the
-        // brace-scanner over-cut is the known shape). Each names a production
-        // identifier at the file's last `#[cfg(test)]` boundary.
+        // brace-scanner over-cut is the known shape). Each sentinel is
+        // TWO-LEGGED (review round-2 on this PR):
+        //   1. an identifier from the file's final production region — but
+        //      identifiers can occur EARLIER too (read_segment_resolver has a
+        //      call site at ~:72 before its fn at ~:82; SearchOperationStats
+        //      a return type at ~:306 before the struct at ~:359), so this
+        //      leg alone pins only up to the FIRST occurrence;
+        //   2. `ends_with` on the normalized production TAIL — the file's
+        //      final production statement, position-asserted, so ANY cut that
+        //      loses tail production fails no matter where the identifier
+        //      occurs. This leg is what makes "the preparation reaches the
+        //      END of production code" literally true.
+        // oid_resolve.rs has NO #[cfg(test)] items — nothing is ever cut from
+        // it — so its sentinel is belt-and-braces for file completeness (the
+        // ends_with leg still guards against a future test mod appearing).
         let oid_resolve = production_source("oid_resolve.rs", include_str!("oid_resolve.rs"));
         assert!(
             oid_resolve.contains("read_segment_resolver"),
             "oid_resolve.rs preparation truncated: read_segment_resolver (its \
              last production fn, ~line 82) is gone"
+        );
+        assert!(
+            norm(&oid_resolve).ends_with(&norm("Ok(Some(Arc::new(resolver)))\n}")),
+            "oid_resolve.rs preparation lost the file's production tail"
         );
         let centroid_reader = production_source(
             "centroid_directory_reader.rs",
@@ -1625,11 +1702,22 @@ mod tests {
             "centroid_directory_reader.rs preparation truncated: plan_segments \
              (~line 222, the last production fn before the tests mod) is gone"
         );
+        assert!(
+            // plan_segments' final statement: the DirectoryChoice build-up.
+            norm(&centroid_reader).ends_with(&norm(
+                "blocks: Mutex::default(),\n                        }),\n                    )\n                })\n            })\n            .collect(),\n    )\n}",
+            )),
+            "centroid_directory_reader.rs preparation lost the file's production tail"
+        );
         let trait_impl = production_source("trait_impl.rs", include_str!("trait_impl.rs"));
         assert!(
             trait_impl.contains("collect_performance_metrics"),
             "trait_impl.rs preparation truncated: collect_performance_metrics \
              (~line 687, the last production fn before the tests mod) is gone"
+        );
+        assert!(
+            norm(&trait_impl).ends_with(&norm("Ok(metrics)\n    }\n}")),
+            "trait_impl.rs preparation lost the file's production tail"
         );
         let search_operations =
             production_source("search/operations.rs", include_str!("search/operations.rs"));
@@ -1637,6 +1725,10 @@ mod tests {
             search_operations.contains("SearchOperationStats"),
             "search/operations.rs preparation truncated: SearchOperationStats \
              (~line 359, the last production item before the tests mod) is gone"
+        );
+        assert!(
+            norm(&search_operations).ends_with(&norm("pub cache_misses: u64,\n}")),
+            "search/operations.rs preparation lost the file's production tail"
         );
 
         // STRICT pins: files whose every production read routes through the
