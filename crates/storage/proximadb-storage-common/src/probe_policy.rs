@@ -503,14 +503,15 @@ pub fn resolve_probe_policy_gated(
     // third behaviour and a mislabelled experiment arm (#2419 review round
     // 18). Loud instead — the resolver is pure, but a warn is side-effect
     // free and this is a configuration defect.
-    if let Some(base) = server.base_bytes {
-        if base == 0 && policy.algorithm == ProbeAlgorithm::ByteBudget {
-            tracing::warn!(
-                "probe base_mb = 0 has no meaning under byte_budget (boot refuses it on the loader path); using the default budget — fix the construction site"
-            );
-        } else if base > 0 {
-            policy.base_bytes = base;
-        }
+    // Only the ASSIGNMENT happens here. The warn is deferred to the end of
+    // the chain: at this point just the SERVER algorithm has been applied,
+    // and a tag or property can still select byte_budget below — so judging
+    // `policy.algorithm` here skipped the warn for exactly the combination
+    // (server base_mb = 0, byte_budget from a tag/property) that the
+    // collection-level carrier will make common (#2419 review round 23).
+    let server_stated_zero_base = server.base_bytes == Some(0);
+    if let Some(base) = server.base_bytes.filter(|base| *base > 0) {
+        policy.base_bytes = base;
     }
     if let Some(cap) = server.cap_bytes {
         policy.cap_bytes = cap;
@@ -587,6 +588,18 @@ pub fn resolve_probe_policy_gated(
     }
     if let Some(cap) = property_u64_mb(properties, PROBE_CAP_MB_KEY) {
         policy.cap_bytes = cap;
+    }
+
+    // Now the algorithm is final. `base_mb = 0` is refused at boot under
+    // byte_budget (the only form that reads it), so silently dropping it
+    // here would give a non-loader construction a third behaviour and a
+    // mislabelled experiment arm (#2419 review round 18). Loud instead — the
+    // resolver is pure, but a warn is side-effect free and this is a
+    // configuration defect.
+    if server_stated_zero_base && policy.algorithm == ProbeAlgorithm::ByteBudget {
+        tracing::warn!(
+            "probe base_mb = 0 has no meaning under byte_budget (boot refuses it on the loader path); using the default budget — fix the construction site"
+        );
     }
     policy
 }

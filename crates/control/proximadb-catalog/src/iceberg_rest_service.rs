@@ -1116,33 +1116,62 @@ impl IcebergRestService {
         // append). Refuse the whole commit up front; it contains a write
         // this surface cannot honour (#2419 review round 20).
         //
-        // The SAME strip-then-judge rule `create_table` uses (#2419 review
-        // round 22): Spark's staged create / CTAS and
-        // `ALTER TABLE ... SET TBLPROPERTIES` reach this door as an
-        // `updateTable` commit whose SetProperties carries the unavoidable
-        // system keys (`owner`, `write.*` defaults). A blanket refusal failed
-        // those commits — and contradicted the create door one function
-        // above, which strips exactly those keys. So: drop the
-        // system-written keys, then refuse only if a CLIENT-MEANINGFUL key
-        // remains (that one really cannot be honoured here).
+        // Refuse exactly the POLICY namespaces (`cache.` / `compaction.` /
+        // `probe.`) — the properties this server cannot honour through an
+        // Iceberg commit — and let every other key through.
+        //
+        // Round 22 got this wrong in a way round 23 caught: it stripped
+        // `is_reserved_table_property` keys and refused whatever remained,
+        // on the stated assumption that `write.*` was among them. It is NOT
+        // (`RESERVED_TABLE_PROPERTY_PREFIXES` is asset./collection./vector./
+        // stats. plus exact owner/tags), so `write.parquet.compression-codec`
+        // — which Spark adds unconditionally when rebuilding create
+        // properties — survived the strip and 400'd the commit, discarding
+        // the AddSchema/AddSnapshot updates bundled with it. That is the
+        // staged-create/CTAS regression round 22 set out to fix, reintroduced
+        // by the same patch.
+        //
+        // Scoping to the policy namespaces is also the honest rule: the
+        // Iceberg engine owns `write.*`, `format-version` and `commit.*`, and
+        // this door has no business judging them.
         for update in &req.updates {
-            if let IcebergTableUpdate::SetProperties { updates } = update {
-                let meaningful =
-                    crate::table_properties::without_reserved_table_properties(updates.clone());
-                if let Some(key) = meaningful.keys().next() {
-                    anyhow::bail!(
-                        "Bad request: table property '{key}' cannot be set through an Iceberg commit; use ALTER TABLE {} SET (...) over pgwire",
-                        table
-                    );
+            // BOTH directions. An unset that silently succeeded while the
+            // property stayed set is the same accepted-but-inert class this
+            // PR exists to close (#2419 review round 23, finding 2).
+            let (keys, verb): (Vec<&String>, &str) = match update {
+                IcebergTableUpdate::SetProperties { updates } => (updates.keys().collect(), "set"),
+                IcebergTableUpdate::RemoveProperties { removals } => {
+                    (removals.iter().collect(), "unset")
                 }
+                _ => continue,
+            };
+            // Sorted, and ALL of them: `HashMap` iteration order is seeded
+            // per process, so naming one arbitrary key made the 400 differ
+            // between attempts on the same request (round 23, finding 5).
+            let mut refused: Vec<&str> = keys
+                .into_iter()
+                .filter(|key| proximadb_storage_common::is_policy_property(key))
+                .map(String::as_str)
+                .collect();
+            if !refused.is_empty() {
+                refused.sort_unstable();
+                refused.dedup();
+                anyhow::bail!(
+                    "Bad request: policy table propert{} [{}] cannot be {verb} through an Iceberg commit; use ALTER TABLE {} SET (...) over pgwire",
+                    if refused.len() == 1 { "y" } else { "ies" },
+                    refused.join(", "),
+                    table
+                );
             }
         }
         // Apply updates: handle SetProperties and AddSchema
         for update in &req.updates {
             match update {
-                // Only system-written keys can reach here (a
-                // client-meaningful one is refused before the loop); they
-                // are dropped, exactly as `create_table` drops them.
+                // No POLICY key can reach here (refused before the loop).
+                // Reserved system-written keys are dropped exactly as
+                // `create_table` drops them; Iceberg engine-owned keys
+                // (`write.*`, `format-version`, `commit.*`) are the engine's
+                // own and pass through.
                 IcebergTableUpdate::SetProperties { updates: _ } => {}
                 IcebergTableUpdate::AddSnapshot { snapshot } => {
                     debug!(

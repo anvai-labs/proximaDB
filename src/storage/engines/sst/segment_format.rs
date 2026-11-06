@@ -3646,7 +3646,7 @@ pub fn drain_probe_trace() -> Vec<(u64, u64, u64, u64)> {
 
 /// Resolved coarse-probe settings (TOML-derived; env overrides applied at call
 /// sites, not here). Defaults replicate `CoarseProbeConfig::default()`.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CoarseProbeSettings {
     pub enable_read_probe: bool,
     pub enable_write_train: bool,
@@ -3686,13 +3686,31 @@ pub fn init_coarse_probe_settings(cfg: Option<&crate::core::config::CoarseProbeC
     // the authoritative `Some(cfg)` write for the whole process — exactly
     // the TD-COMPACT-9 "TOML silently dead" failure this RwLock replaced an
     // OnceLock to fix.
+    // Bump the generation (invalidating the resolved-policy memo) only when
+    // the stored settings actually CHANGE. Every `SstEngine::new()` calls
+    // this with `None` to fill the default if unset, so an unconditional bump
+    // meant a server building one engine per collection re-ran the env scan —
+    // and re-emitted any WARN for a junk PROXIMADB_PAX_READ_PROBE_* value —
+    // on the next probe query after every construction, defeating the memo
+    // the cache exists for (#2419 review round 23).
+    let mut changed = false;
     if let Ok(mut g) = SHARED_COARSE_PROBE.write() {
         match cfg {
-            Some(c) => *g = Some(c.clone().into()),
+            Some(c) => {
+                let next: CoarseProbeSettings = c.clone().into();
+                changed = g.as_ref() != Some(&next);
+                *g = Some(next);
+            }
             None => {
-                g.get_or_insert_with(CoarseProbeSettings::default);
+                if g.is_none() {
+                    *g = Some(CoarseProbeSettings::default());
+                    changed = true;
+                }
             }
         }
+    }
+    if !changed {
+        return;
     }
     COARSE_PROBE_GENERATION.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     if let Ok(mut cached) = RESOLVED_PROBE_POLICY.write() {

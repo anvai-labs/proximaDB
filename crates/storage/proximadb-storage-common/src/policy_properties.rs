@@ -43,6 +43,21 @@ pub fn policy_value<'a>(properties: &'a HashMap<String, String>, key: &str) -> O
 }
 
 /// The normalized form every policy resolver keys on.
+/// Whether `key` names a ProximaDB POLICY property — the `cache.`,
+/// `compaction.` or `probe.` namespaces this crate validates.
+///
+/// Used by the Iceberg commit door to refuse exactly these and nothing else.
+/// It must NOT be confused with `is_reserved_table_property` (the
+/// system-WRITTEN keys): the Iceberg engine's own namespaces (`write.*`,
+/// `format-version`, `commit.*`) are neither, and must pass through
+/// untouched or standard Spark CTAS breaks (#2419 review round 23).
+pub fn is_policy_property(key: &str) -> bool {
+    let normalized = normalize_policy_key(key);
+    POLICY_PROPERTY_PREFIXES
+        .iter()
+        .any(|prefix| normalized.starts_with(prefix))
+}
+
 pub fn normalize_policy_key(key: &str) -> String {
     key.trim().to_ascii_lowercase()
 }
@@ -196,5 +211,30 @@ mod tests {
         // registered, not silently stored.
         assert!(validate_policy_properties(&props(&[("probe.nonsense", "1")])).is_err());
         assert!(validate_policy_properties(&props(&[("compaction.nonsense", "1")])).is_err());
+    }
+    #[test]
+    fn policy_predicate_excludes_iceberg_engine_namespaces() {
+        // The round-22 refusal assumed `write.*` was stripped as a reserved
+        // key. It is not reserved, so it reached the bail and 400'd standard
+        // Spark CTAS. These must NOT be policy properties.
+        for key in [
+            "write.parquet.compression-codec",
+            "write.format.default",
+            "format-version",
+            "commit.retry.num-retries",
+            "owner",
+            "sort-order",
+        ] {
+            assert!(!is_policy_property(key), "{key} must pass the commit door");
+        }
+        // These must be refused there.
+        for key in [
+            "cache.index.mode",
+            "compaction.strategy",
+            "probe.algorithm",
+            "  Probe.Algorithm  ",
+        ] {
+            assert!(is_policy_property(key), "{key} must be refused");
+        }
     }
 }

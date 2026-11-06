@@ -456,3 +456,44 @@ bytes, which the first metering consumer would have booked. The doc says
 fires only under `byte_budget`: `validate` bounds base/cap inside its
 byte_budget branch by design, so the unconditional warn told operators the
 loader refuses a value it had just accepted.
+
+Round 23 (#2419): the round-22 Iceberg fix was WRONG in the way it claimed
+to be right. It stripped `is_reserved_table_property` keys and refused
+whatever remained, on the stated assumption that `write.*` was among them —
+but `RESERVED_TABLE_PROPERTY_PREFIXES` is `asset.`/`collection.`/`vector.`/
+`stats.` plus exact `owner`/`tags`, so `write.parquet.compression-codec`
+(which Spark adds unconditionally when rebuilding create properties)
+survived the strip and 400'd the commit, discarding the AddSchema/AddSnapshot
+updates bundled with it. That is precisely the staged-create/CTAS regression
+round 22 set out to fix, reintroduced by the same patch.
+
+The door now refuses exactly the POLICY namespaces (`cache.`/`compaction.`/
+`probe.`) through one shared predicate, `is_policy_property`, and lets every
+other key through — the Iceberg engine owns `write.*`, `format-version` and
+`commit.*`, and this door has no business judging them. A test pins both
+directions of that split. The refusal also covers `RemoveProperties`: an
+`UNSET TBLPROPERTIES ('cache.index.mode')` previously fell to the
+`_ => debug!("unhandled")` arm and returned SUCCESS while the property
+stayed set — the accepted-but-inert class this PR exists to close, left open
+on the adjacent arm. And it names ALL offending keys, sorted: picking
+`keys().next()` from a `HashMap` made the 400 cite a different key between
+attempts on the same request.
+
+Also: the storage integration lane's path filter now includes
+`src/network/rest/v2/**` and `tests/recall_tune_auth_e2e.rs`. Wiring the
+test into the lane was not enough — the job's `if` gate is
+`storage_changes || core_changes`, and neither filter matched the REST v2
+surface the test asserts on, so a future PR re-adding the PATCH route would
+have skipped the lane and the assertions would not have gated it. Same
+"filter does not track the outcome" failure as TD-RECALL-2/#1406, one
+surface over.
+
+Two smaller ones: the `base_mb = 0` warn is evaluated AFTER the whole
+resolution chain, because at the server layer only the server algorithm has
+been applied and a tag or property can still select `byte_budget` — the
+combination the collection-level carrier will make common. And
+`init_coarse_probe_settings` bumps the generation only when the stored
+settings actually change: every `SstEngine::new()` calls it with `None` to
+fill the default, so an unconditional bump re-ran the env scan and
+re-emitted any junk-value WARN after every engine construction, defeating
+the memo the cache exists for (RDSTRAT-14-F11 closed).

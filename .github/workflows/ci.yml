@@ -444,6 +444,17 @@ jobs:
               # TD-RECALL-2/#1406: track what can break the outcome, not who
               # owns the file.
               - 'tests/sift_pax_recall_ratchet_test.rs'
+              # TD-RDSTRAT-14 / #2419 review round 23: this lane now runs
+              # recall_tune_auth_e2e.rs, whose assertions are about the REST
+              # v2 collections surface (create refuses unpersisted
+              # `properties`; the PATCH properties route is GONE -> 404). None
+              # of the globs above match `src/network/**` or the test file
+              # itself, so a future PR that re-adds the PATCH route or relaxes
+              # the create guard would skip this lane and the assertions would
+              # not gate it — the same "filter does not track the outcome"
+              # failure as TD-RECALL-2/#1406 cited above, one surface over.
+              - 'src/network/rest/v2/**'
+              - 'tests/recall_tune_auth_e2e.rs'
               # ADR-097 D3 / TD-SEAM-1: the external Iceberg read-back gate runs in
               # this lane; the writer, the REST catalog and the gate itself feed it.
               - 'crates/storage/proximadb-iceberg-engine/**'
