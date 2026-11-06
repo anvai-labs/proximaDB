@@ -503,11 +503,9 @@ pub trait TableMaterializer: Send + Sync {
 pub struct CompactSummary {
     pub collection_id: String,
     pub full: bool,
-    pub segments_before: Option<usize>,
-    pub segments_after: Option<usize>,
-    pub passes: Option<usize>,
-    pub reached_target: Option<bool>,
-    pub stop_reason: Option<String>,
+    /// The provenance fields, EMBEDDED rather than hand-copied (#2418 review
+    /// round 16).
+    pub metrics: crate::storage::traits::FullCompactionMetrics,
 }
 
 impl CompactSummary {
@@ -518,21 +516,12 @@ impl CompactSummary {
         full: bool,
         result: &crate::storage::traits::CompactionResult,
     ) -> Self {
-        let metric = |key: &str| result.engine_metrics.get(key).cloned();
+        // The single extraction point shared with REST and Flight.
+        let metrics = result.full_compaction_metrics();
         Self {
             collection_id: collection_id.to_string(),
             full,
-            segments_before: metric("segments_before")
-                .and_then(|v| v.as_u64())
-                .map(|v| v as usize),
-            segments_after: metric("segments_after")
-                .and_then(|v| v.as_u64())
-                .map(|v| v as usize),
-            passes: metric("passes")
-                .and_then(|v| v.as_u64())
-                .map(|v| v as usize),
-            reached_target: metric("reached_target").and_then(|v| v.as_bool()),
-            stop_reason: metric("stop_reason").and_then(|v| v.as_str().map(str::to_string)),
+            metrics,
         }
     }
 }
@@ -830,22 +819,39 @@ impl DdlService {
                 let summary = compactor.compact(tenant, &name, full).await?;
                 self.check_lease_for_write(tenant, &name).await?;
                 let before = summary
+                    .metrics
                     .segments_before
                     .map(|value| value.to_string())
                     .unwrap_or_else(|| "?".to_string());
                 let after = summary
+                    .metrics
                     .segments_after
                     .map(|value| value.to_string())
                     .unwrap_or_else(|| "?".to_string());
+                // TD-COMPACT-15: measured I/O + why the loop stopped — the
+                // provenance an operator needs to trust the message.
+                let io_note = match (summary.metrics.bytes_read, summary.metrics.bytes_written) {
+                    // Only state a duration that was MEASURED: unwrap_or(0)
+                    // printed a fabricated "in 0ms" as provenance whenever a
+                    // path set the byte counters but not the clock (now
+                    // reachable, since the metrics extractor falls back to the
+                    // canonical top-level byte fields).
+                    (Some(read), Some(written)) => match summary.metrics.duration_ms {
+                        Some(ms) => format!(", {read} read / {written} written in {ms}ms"),
+                        None => format!(", {read} read / {written} written"),
+                    },
+                    _ => String::new(),
+                };
+                let stop_note = match (&summary.metrics.stop_reason, summary.metrics.reached_target)
+                {
+                    (Some(reason), _) => format!(" (stopped: {reason})"),
+                    (None, Some(false)) => " (stopped before target)".to_string(),
+                    _ => String::new(),
+                };
                 Ok(DdlResult::success(format!(
                     "Compacted table '{name}' (full={full}): {before} -> {after} segments \
-                     in {} passes{}",
-                    summary.passes.unwrap_or(0),
-                    if summary.reached_target == Some(false) {
-                        " (stopped before target)"
-                    } else {
-                        ""
-                    },
+                     in {} passes{stop_note}{io_note}",
+                    summary.metrics.passes.unwrap_or(0),
                 )))
             }
             DdlStatement::MaterializeTable { name } => {
@@ -2765,11 +2771,13 @@ mod tests {
             Ok(CompactSummary {
                 collection_id: table.to_string(),
                 full,
-                segments_before: Some(3),
-                segments_after: Some(1),
-                passes: Some(2),
-                reached_target: Some(true),
-                stop_reason: None,
+                metrics: crate::storage::traits::FullCompactionMetrics {
+                    segments_before: Some(3),
+                    segments_after: Some(1),
+                    passes: Some(2),
+                    reached_target: Some(true),
+                    ..Default::default()
+                },
             })
         }
     }

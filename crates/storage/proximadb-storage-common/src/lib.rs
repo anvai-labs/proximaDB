@@ -230,8 +230,7 @@ pub mod policy_properties;
 pub use policy_properties::{is_policy_property, validate_policy_properties};
 pub mod probe_policy;
 pub use compaction_strategy::{
-    CompactionStrategy, resolve_strategy_from_properties, resolve_strategy_from_tags,
-    resolve_target_file_size_mb, validate_compaction_properties,
+    CompactionStrategy, resolve_effective_strategy, validate_compaction_properties,
 };
 pub use probe_policy::{
     ProbeAlgorithm, ProbePlan, ProbePolicy, ServerProbePolicy, band_ladder, resolve_probe_plan,

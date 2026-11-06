@@ -882,6 +882,41 @@ impl ProximaDB {
                 .and_then(|sst| sst.coarse_probe.as_ref()),
         );
 
+        // TD-COMPACT-16: report deprecated-but-accepted compaction settings
+        // HERE, once the tracing subscriber exists — config validation runs
+        // during load, before logging is up, so a warning there was dropped.
+        for (section, cfg) in [
+            (
+                "storage.compaction_config",
+                Some(&self._config.storage.compaction_config),
+            ),
+            (
+                "storage.sst_config.compaction_config",
+                self._config
+                    .storage
+                    .sst_config
+                    .as_ref()
+                    .and_then(|sst| sst.compaction_config.as_ref()),
+            ),
+            // Validated at load like the other two, so its deprecated values
+            // must be reported too (#2418 review round 15).
+            (
+                "storage.viper_config.compaction_config",
+                self._config
+                    .storage
+                    .viper_config
+                    .as_ref()
+                    .and_then(|viper| viper.compaction_config.as_ref()),
+            ),
+        ] {
+            for note in cfg
+                .map(|c| c.deprecation_notes(section))
+                .unwrap_or_default()
+            {
+                tracing::warn!("{note}");
+            }
+        }
+
         // TD-IOBUDGET-1: register per-location I/O budgets authoritatively from
         // the loaded config — same overwritable-seed shape as the coarse probe
         // above. Validation is fail-closed (invalid budgets abort startup) and
@@ -971,8 +1006,9 @@ impl ProximaDB {
                     let mut tenant_set: std::collections::HashSet<String> =
                         crate::storage::persistence::write_ahead_log::list_collections_from_catalog()
                             .await
-                            .iter()
-                            .filter_map(proximadb_tenant::tenant_id_of)
+                            .into_iter()
+                            .map(|meta| meta.collection)
+                            .filter_map(|collection| proximadb_tenant::tenant_id_of(&collection))
                             .collect();
                     tenant_set.insert("default".to_string());
                     let tenants: Vec<String> = tenant_set.into_iter().collect();

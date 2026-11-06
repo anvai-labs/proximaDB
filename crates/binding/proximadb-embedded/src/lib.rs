@@ -1022,6 +1022,11 @@ impl EmbeddedProximaDB {
                 let Ok(plan) =
                     proximadb::storage::flush_materializer::flush_plan_from_collection_meta(
                         &collection,
+                        // Embedded never reads the catalog properties at
+                        // this call site: NOT loaded. (Properties are simply
+                        // not consulted here — the same reason as the sibling
+                        // site below.)
+                        None,
                     )
                 else {
                     continue;
@@ -2493,6 +2498,7 @@ impl EmbeddedProximaDB {
                     // unified SST engine as the create-failure fallback.
                     let plan = match proximadb::storage::flush_materializer::flush_plan_from_collection_meta(
                         &collection_metadata,
+                        None, // not catalog-loaded (see the sibling site)
                     ) {
                         Ok(plan) => plan,
                         Err(error) => {

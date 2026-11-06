@@ -387,7 +387,7 @@ impl StorageEngine {
 
         for collection_id in &collections_to_flush {
             // The server keys the write buffer by the catalog L1 object id.
-            let Some(meta) = catalog.iter().find(|c| &c.id == collection_id) else {
+            let Some(meta) = catalog.iter().find(|m| &m.collection.id == collection_id) else {
                 tracing::warn!(
                     "⚠️ STORAGE_ENGINE: No catalog metadata for collection '{}'; cannot resolve engine, skipping",
                     collection_id
@@ -396,7 +396,10 @@ impl StorageEngine {
                 continue;
             };
 
-            let plan = match flush_plan_from_collection_meta(meta) {
+            let plan = match flush_plan_from_collection_meta(
+                &meta.collection,
+                Some(meta.properties.clone()),
+            ) {
                 Ok(plan) => plan,
                 Err(error) => {
                     tracing::warn!(
@@ -505,7 +508,11 @@ impl StorageEngine {
 
         // Get all collections from the catalog (sole authority for metadata).
         let collections =
-            crate::storage::persistence::write_ahead_log::list_collections_from_catalog().await;
+            crate::storage::persistence::write_ahead_log::list_collections_from_catalog()
+                .await
+                .into_iter()
+                .map(|meta| meta.collection)
+                .collect::<Vec<_>>();
         if collections.is_empty() {
             info!("📋 STORAGE_ENGINE: No collections in catalog to recover");
             return Ok(());
@@ -589,7 +596,11 @@ impl StorageEngine {
 
         // Get all collections from the catalog (sole authority for metadata).
         let collections =
-            crate::storage::persistence::write_ahead_log::list_collections_from_catalog().await;
+            crate::storage::persistence::write_ahead_log::list_collections_from_catalog()
+                .await
+                .into_iter()
+                .map(|meta| meta.collection)
+                .collect::<Vec<_>>();
         if collections.is_empty() {
             info!("📋 No collections in catalog, skipping registration");
             return Ok(());
@@ -938,7 +949,11 @@ impl StorageEngine {
 
         // Get collections from the catalog (sole authority for metadata).
         let collections =
-            crate::storage::persistence::write_ahead_log::list_collections_from_catalog().await;
+            crate::storage::persistence::write_ahead_log::list_collections_from_catalog()
+                .await
+                .into_iter()
+                .map(|meta| meta.collection)
+                .collect::<Vec<_>>();
         tracing::info!("📋 Found {} collections in catalog", collections.len());
 
         if collections.is_empty() {

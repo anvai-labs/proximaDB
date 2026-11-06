@@ -1,5 +1,5 @@
 {
-  "total": 1039,
+  "total": 1040,
   "by_file": {
     "apps/proximadb-migrate/src/main.rs": 2,
     "crates/binding/proximadb-embedded/src/lib.rs": 9,
@@ -351,7 +351,7 @@
     "src/storage/engines/helix/readers.rs": 2,
     "src/storage/engines/migration/migrator.rs": 2,
     "src/storage/engines/nova/batch_operations.rs": 3,
-    "src/storage/engines/nova/columnar_integration.rs": 10,
+    "src/storage/engines/nova/columnar_integration.rs": 11,
     "src/storage/engines/nova/columnar_search.rs": 8,
     "src/storage/engines/nova/engine.rs": 4,
     "src/storage/engines/nova/nova_meta_collector.rs": 1,

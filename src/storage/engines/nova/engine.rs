@@ -1943,6 +1943,7 @@ impl UnifiedStorageFormat for NovaEngine {
         info!("NOVA optimize: collection={}", collection_id);
         // Trigger compaction for optimization
         let params = CompactionParameters {
+            full_target_segments: None,
             full: false,
             collection_id: Some(collection_id.to_string()),
             force: false,

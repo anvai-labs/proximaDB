@@ -2719,10 +2719,21 @@ def force_flush_via_flight(
 
 
 def compact_via_flight(
-    host: str, port: int, collection_id: str, flight_module=None, full: bool = False
+    host: str,
+    port: int,
+    collection_id: str,
+    flight_module=None,
+    full: bool = False,
+    target_segments: int | None = None,
 ) -> dict:
     """Trigger a compaction. ``full=True`` asks for the cross-level collapse
-    (TD-COMPACT-14); the action body carries the flag through."""
+    (TD-COMPACT-14); ``target_segments`` overrides the FULL collapse target
+    (TD-COMPACT-15 Experiment 3) — both ride the action body."""
+    # Send `full` only when asked: a plain compaction keeps the exact body it
+    # always had ({"collection_id": ...}), which the harness test pins.
+    body: dict[str, object] = {"full": True} if full else {}
+    if target_segments is not None:
+        body["target_segments"] = target_segments
     return storage_action_via_flight(
         host,
         port,
@@ -2730,11 +2741,7 @@ def compact_via_flight(
         "compact_collection",
         "compact",
         flight_module,
-        # Send `full` only when asked: a plain compaction keeps the exact
-        # body it always had ({"collection_id": ...}). Sending
-        # `"full": false` unconditionally broke
-        # test_explicit_compaction_uses_supported_flight_action on develop.
-        extra_body={"full": True} if full else {},
+        extra_body=body,
     )
 
 
@@ -3287,6 +3294,16 @@ def main() -> int:
             "bed collapsed in place"
         ),
     )
+    parser.add_argument(
+        "--compact-full-target-segments",
+        type=int,
+        help=(
+            "TD-COMPACT-15 Experiment 3: per-request override of the FULL "
+            "collapse target (server [storage.compaction_config] "
+            "full_target_segments, default 1). Requires "
+            "--compact-full-before-measure; --max-segments must match"
+        ),
+    )
     parser.add_argument("--top-k", type=int, default=10)
     parser.add_argument("--settle-timeout-secs", type=int, default=1_200)
     parser.add_argument(
@@ -3488,6 +3505,49 @@ def main() -> int:
     args = parser.parse_args()
     if args.skip_ingest and not args.collection_id:
         raise SystemExit("--skip-ingest requires --collection-id")
+    # An ABSENT override DEFAULTS to --max-segments rather than erroring:
+    # requiring it killed every previously valid invocation, including the
+    # reproduce command TD-COMPACT-15 documents for this PR's own evidence
+    # (#2418 review round 21). An override that DISAGREES with --max-segments
+    # is still refused — that is the mismatch the gate exists for.
+    # NOT defaulted to --max-segments (#2418 review round 22). --max-segments
+    # defaults to 2 while the server's full_target_segments defaults to 1, so
+    # defaulting here would silently change what an existing
+    # --compact-full-before-measure invocation measures: the bed would settle
+    # at two segments where it previously settled at one. Segment count is the
+    # dominant variable in this harness's GET-reduction result, so runs
+    # recorded before and after would both pass the gate while being
+    # incomparable in BENCHMARK_EVIDENCE.toml. Unset keeps the server-resolved
+    # behaviour; a STATED value must still agree with --max-segments below.
+    if (
+        # The override is ONLY read inside the --compact-full-before-measure
+        # block, so stating it alone let the arm silently collapse to the
+        # server default while result.json implied the geometry was pinned —
+        # the accepted-then-dropped-knob class (#2418 review round 23).
+        args.compact_full_target_segments is not None
+        and not args.compact_full_before_measure
+    ):
+        raise SystemExit(
+            "--compact-full-target-segments requires --compact-full-before-measure: "
+            "without it the override is never sent and the bed collapses to the "
+            "server default",
+        )
+    if (
+        args.compact_full_before_measure
+        # Only a STATED override is checked: unset means "let the server
+        # resolve it", which is the pre-PR behaviour F8 preserves.
+        and args.compact_full_target_segments is not None
+        and args.compact_full_target_segments != args.max_segments
+    ):
+        # The post-compact settle gate uses the override, so a mismatch let an
+        # arm settle at one geometry while result.json reported another. The
+        # --help text only ADVISED consistency; enforce it.
+        raise SystemExit(
+            f"--compact-full-target-segments ({args.compact_full_target_segments}) "
+            f"must equal --max-segments ({args.max_segments}): the post-compact "
+            "settle gate asserts the override, so a mismatch records a geometry "
+            "the run did not measure",
+        )
     if not (
         args.coalesce_gap_mb >= 0
         and args.coalesce_range_mb > 0
@@ -4124,7 +4184,9 @@ def main() -> int:
             # rows/model/queries against a smaller segment count. The
             # validations that follow (layout, trained, ivf_k, n_comp) then
             # gate the final measured geometry, and --max-segments turns
-            # into the collapse assertion (S=1 arms pass --max-segments 1).
+            # into the collapse assertion (S=1 arms pass --max-segments 1),
+            # and --compact-full-target-segments must match it (enforced at
+            # parse time) so the gate and the recorded config agree.
             before = {
                 "segment_count": geometry["segment_count"],
                 "bytes": geometry["bytes"],
@@ -4134,8 +4196,13 @@ def main() -> int:
                 ],
             }
             action = compact_via_flight(
-                "127.0.0.1", args.port, collection_id, full=True
+                "127.0.0.1",
+                args.port,
+                collection_id,
+                full=True,
+                target_segments=args.compact_full_target_segments,
             )
+            # The two are equal (enforced at parse time), so settle on the one.
             geometry = settle(args.max_segments)
             result["compact_full_before_measure"] = {
                 "before": before,

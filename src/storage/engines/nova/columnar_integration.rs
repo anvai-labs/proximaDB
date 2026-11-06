@@ -546,8 +546,46 @@ impl NovaUnifiedEngine {
         })
     }
 
-    /// Advanced search with hierarchical pruning and progressive refinement
+    /// Advanced search — NOT IMPLEMENTED; refuses honestly (TD-FACADE-1).
+    ///
+    /// `NovaUnifiedEngine` is a demonstration layer (see the module docs) and
+    /// this method's five-phase pipeline is placeholders end to end: the
+    /// collection-metadata cache it reads is never populated, the vector
+    /// loader fabricates constant vectors, and the ranker fabricates result
+    /// ids. Before this refusal it failed with a misleading
+    /// "collection metadata not found" error that hid all of that.
+    ///
+    /// The production NOVA engine is `NovaEngine` (built by the storage
+    /// engine factory) with a real id+score search. The demonstration
+    /// pipeline is preserved verbatim in advanced_search_pipeline (private,
+    /// labeled below).
     pub async fn advanced_search(
+        &self,
+        collection_id: &str,
+        query_vector: Vec<f32>,
+        top_k: usize,
+        search_options: AdvancedSearchOptions,
+    ) -> Result<AdvancedSearchResult> {
+        let _ = (collection_id, &query_vector, top_k, &search_options);
+        anyhow::bail!(
+            "NOVA advanced_search is not implemented: this is a demonstration layer whose \
+             five-phase pipeline is placeholders (the collection-metadata cache is never \
+             populated, loaded vectors are fabricated, and result ids are fabricated). Use \
+             the production NovaEngine search via the storage engine factory. See \
+             TD-FACADE-1."
+        )
+    }
+
+    /// Preserved demonstration of the intended five-phase design (TD-FACADE-1).
+    ///
+    /// Unreachable: kept verbatim as the template a real implementation would
+    /// start from. Its phases are placeholders — the pruning stages return
+    /// everything unpruned, `load_vectors_from_zones` fabricates vectors, and
+    /// `rank_and_filter_results` fabricates ids. A real implementation must
+    /// also populate the collection-metadata cache and map results back to
+    /// real ids (the working pattern is `columnar_search::full_precision_stage`).
+    #[allow(dead_code)]
+    async fn advanced_search_pipeline(
         &self,
         collection_id: &str,
         query_vector: Vec<f32>,
@@ -1298,6 +1336,47 @@ impl Default for NovaColumnarProgressiveSearchConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// TD-FACADE-1 pin: `advanced_search` must refuse with an error that
+    /// names the REAL reason. On develop it already errored — with a
+    /// misleading "collection metadata not found" (the cache is never
+    /// populated) — so a bare `is_err()` pin would pass on both versions and
+    /// prove nothing. The message is the regression signal.
+    #[tokio::test]
+    async fn advanced_search_refuses_with_the_real_reason() -> anyhow::Result<()> {
+        let engine = NovaUnifiedEngine::new(
+            Arc::new(FilesystemFactory::create(Default::default()).await?),
+            NovaSpecificConfig::default(),
+        )
+        .await
+        .expect("engine constructs with defaults");
+
+        let err = engine
+            .advanced_search(
+                "pin_collection",
+                vec![0.1; 8],
+                5,
+                AdvancedSearchOptions {
+                    target_quality: 0.9,
+                    enable_progressive: true,
+                    max_vectors_to_evaluate: None,
+                    format_preference: None,
+                    enable_hierarchical_pruning: true,
+                    enable_zone_map_pruning: true,
+                },
+            )
+            .await
+            .expect_err("advanced_search must refuse instead of running placeholder phases");
+
+        let msg = format!("{err:#}");
+        assert!(msg.contains("not implemented"), "message: {msg}");
+        assert!(msg.contains("TD-FACADE-1"), "message: {msg}");
+        assert!(
+            !msg.contains("metadata not found"),
+            "the old misleading error must be gone: {msg}"
+        );
+        Ok(())
+    }
 
     #[test]
     fn test_nova_config_defaults() {

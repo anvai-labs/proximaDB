@@ -1032,13 +1032,124 @@ pub struct CompactionConfig {
     /// TD-COMPACT-15: the target file size (MB) for the consolidate
     /// strategy — segments merge smallest-first until each output
     /// reaches this size, producing uniform I/O units.
-    #[serde(default = "default_consolidate_target_file_size_mb")]
-    pub consolidate_target_file_size_mb: u64,
+    ///
+    /// `Option` so that "the operator stated this" is distinguishable from
+    /// "absent": the SST-section merge needs to know, and comparing against
+    /// the default value cannot tell them apart (an operator explicitly
+    /// setting 512 to override a top-level 4096 looked absent). Read it
+    /// through [`CompactionConfig::consolidate_target_file_size_mb_or_default`].
+    #[serde(default)]
+    pub consolidate_target_file_size_mb: Option<u64>,
     /// TD-COMPACT-15: the write-amplification limit above which the
-    /// consolidate strategy degrades to hybrid (guards against rewriting
-    /// the entire collection per flush).
-    #[serde(default = "default_consolidate_write_amp_limit")]
-    pub consolidate_write_amp_limit: u64,
+    /// consolidate strategy used to degrade to hybrid. Read by NOTHING while
+    /// background consolidate is refused (TD-COMPACT-16); kept only so a
+    /// config naming it still parses and gets the deprecation note at
+    /// startup.
+    #[serde(default)]
+    pub consolidate_write_amp_limit: Option<u64>,
+    /// TD-COMPACT-15: the server-level DEFAULT compaction strategy. Only
+    /// `"hybrid"` (the code default) is accepted today: BACKGROUND
+    /// consolidate is refused until TD-COMPACT-16, because its trigger
+    /// scheduled an ordinary L0 morsel rather than the consolidate merge and
+    /// could re-fire every flush without converging. Collapse a collection
+    /// with `COMPACT TABLE ... FULL` instead.
+    #[serde(default)]
+    pub consolidate_strategy: Option<String>,
+}
+
+impl CompactionConfig {
+    /// Validate strategy fields fail-closed: an unknown value must abort
+    /// startup with an actionable message, never silently fall back (the
+    /// dead-config failure mode TD-COMPACT-9 documented). The legacy
+    /// `strategy` field drives the count/size level heuristic; it is NOT
+    /// the consolidate/hybrid switch — reject the common mistake of
+    /// setting `strategy = "consolidate"` there.
+    pub fn validate(&self, section: &str) -> Result<(), String> {
+        // Validate EXACTLY what the consumer honors. `compaction_utils`
+        // matches `config.strategy.as_str()` raw and case-sensitively, so
+        // trimming/lowercasing here let "Size" or " size" pass boot and then
+        // fall through to the `_` arm as hybrid — the dead-config hazard
+        // this validation exists to kill, one layer down.
+        if !matches!(self.strategy.as_str(), "count" | "size" | "hybrid") {
+            return Err(format!(
+                "{section}.strategy must be exactly 'count', 'size' or 'hybrid' (lowercase, no surrounding whitespace — the level heuristic matches case-sensitively; got '{}'); to collapse a collection's segments use COMPACT TABLE ... FULL (background consolidate is refused, TD-COMPACT-16)",
+                self.strategy
+            ));
+        }
+        // Background consolidate is refused (TD-COMPACT-16). An explicit
+        // REQUEST for it fails boot — silently not consolidating would leave
+        // the operator believing it runs. The knobs that are merely dead now
+        // ("hybrid" is already the default; the write-amp limit was read only
+        // by the removed trigger) shipped as accepted settings in #2407, so
+        // failing boot on them would turn an upgrade into an outage: they are
+        // warned about instead (#2418 review round 13).
+        // full_target_segments = 0 is the same knob-silently-rewritten
+        // hazard the four Some(0) doors (REST, Flight, trait seam, engine)
+        // reject: `.max(1)` would collapse every bare FULL to 1 while the
+        // operator believes they stated 0 (#2418 review round 20).
+        // Same knob-silently-rewritten class as `full_target_segments`
+        // below: `compact_collection_full` applies `.max(1)` to this, so 0
+        // boots and behaves as 1 — a FULL on a 10-segment collection does one
+        // round and reports `stop_reason: "max_passes"`, `reached_target:
+        // false`, while the operator believes they removed the bound
+        // (#2418 review round 22).
+        if self.full_max_passes == 0 {
+            return Err(format!(
+                "{section}.full_max_passes must be >= 1 (got 0); it is clamped to 1 at use,                  so 0 would silently mean 'one pass', not 'unbounded'"
+            ));
+        }
+        if self.full_target_segments == 0 {
+            return Err(format!(
+                "{section}.full_target_segments must be >= 1 (got 0)"
+            ));
+        }
+        if let Some(strategy) = &self.consolidate_strategy {
+            let value = strategy.trim().to_ascii_lowercase();
+            if value == "consolidate" {
+                return Err(format!(
+                    "{section}.consolidate_strategy = \"consolidate\" is not supported: background consolidate does not converge (TD-COMPACT-16). Collapse with COMPACT TABLE ... FULL instead"
+                ));
+            }
+            if value != "hybrid" {
+                return Err(format!(
+                    "{section}.consolidate_strategy must be 'hybrid' (got '{strategy}')"
+                ));
+            }
+            // "hybrid": accepted; reported by `deprecation_notes` once logging
+            // is up (validate runs during config load, BEFORE the tracing
+            // subscriber exists, so a warn! here was silently dropped —
+            // #2418 review round 14).
+        }
+        // A stated 0 MiB target has no meaning (it was silently clamped to
+        // 1 MiB by the FULL merge's grouping). Fail closed at boot.
+        if self.consolidate_target_file_size_mb == Some(0) {
+            return Err(format!(
+                "{section}.consolidate_target_file_size_mb must be positive (got 0)"
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl CompactionConfig {
+    /// Deprecated-but-accepted settings to report once logging is up. Kept
+    /// out of `validate`, which runs during config load before any tracing
+    /// subscriber exists (a warning there never reached an operator). The
+    /// caller (`ProximaDB::start`) logs each note at WARN.
+    pub fn deprecation_notes(&self, section: &str) -> Vec<String> {
+        let mut notes = Vec::new();
+        if self.consolidate_strategy.is_some() {
+            notes.push(format!(
+                "{section}.consolidate_strategy is deprecated and has no effect (hybrid is the default; background consolidate is refused, TD-COMPACT-16); remove it"
+            ));
+        }
+        if self.consolidate_write_amp_limit.is_some() {
+            notes.push(format!(
+                "{section}.consolidate_write_amp_limit is deprecated and has no effect (background consolidate is refused, TD-COMPACT-16); remove it"
+            ));
+        }
+        notes
+    }
 }
 
 impl Default for CompactionConfig {
@@ -1064,8 +1175,9 @@ impl Default for CompactionConfig {
             full_target_segments: default_full_target_segments(),
             full_max_passes: default_full_max_passes(),
             full_timeout_ms: default_full_timeout_ms(),
-            consolidate_target_file_size_mb: default_consolidate_target_file_size_mb(),
-            consolidate_write_amp_limit: default_consolidate_write_amp_limit(),
+            consolidate_target_file_size_mb: None,
+            consolidate_write_amp_limit: None,
+            consolidate_strategy: None,
         }
     }
 }
@@ -1082,12 +1194,101 @@ fn default_full_timeout_ms() -> u64 {
     3_600_000
 }
 
-fn default_consolidate_target_file_size_mb() -> u64 {
-    512
-}
+/// The consolidate target file size when the operator stated none (MiB).
+pub const DEFAULT_CONSOLIDATE_TARGET_FILE_SIZE_MB: u64 = 512;
 
-fn default_consolidate_write_amp_limit() -> u64 {
-    100
+impl CompactionConfig {
+    /// The consolidate target file size, defaulted. Read by the FULL merge's
+    /// smallest-first grouping.
+    pub fn consolidate_target_file_size_mb_or_default(&self) -> u64 {
+        self.consolidate_target_file_size_mb
+            .unwrap_or(DEFAULT_CONSOLIDATE_TARGET_FILE_SIZE_MB)
+    }
+
+    /// Merge an SST-section override over the top-level config, per FIELD —
+    /// for EVERY field, not just the `consolidate_*` ones.
+    ///
+    /// Used by `effective_sst_config`. A wholesale pick is wrong because an
+    /// operator who declares `[storage.sst_config.compaction_config]` for one
+    /// knob (say `l0_file_threshold`) would silently lose every top-level
+    /// value — including `full_target_segments`, which the FULL collapse and
+    /// its follow-up floor both read (TD-COMPACT-15 F1, widened by the #2418
+    /// review round 22: closing this for 3 of 23 fields left the other 20,
+    /// among them the one this PR made load-bearing).
+    ///
+    /// Two presence rules, because the struct has two kinds of field:
+    ///
+    /// * The `consolidate_*` fields are `Option`, so `is_none()` is a TRUE
+    ///   presence signal — genuinely unstated, not "happens to equal the
+    ///   default".
+    /// * Every other field is concrete with a serde default, so presence
+    ///   CANNOT be observed after deserialization. There, a section value
+    ///   equal to the code default is treated as unstated and inherits the
+    ///   top-level value.
+    ///
+    /// The residual edge of that second rule, stated plainly rather than
+    /// left to be discovered: an operator who writes a section value that
+    /// EQUALS the code default while the top level says something else gets
+    /// the top-level value, not their explicit restatement of the default.
+    /// Both readings lose that intent today (the wholesale pick discarded
+    /// the top-level value outright), and the common case — a section
+    /// stating one knob — is now correct for all 23 fields. Observing
+    /// presence properly needs an all-`Option` overlay type for the section;
+    /// filed as TD-COMPACT-15 F10, not faked here.
+    #[allow(clippy::float_cmp)] // comparing against the code default is exact by construction
+    pub fn merge_section_over(top: &CompactionConfig, section: Option<&CompactionConfig>) -> Self {
+        let Some(section) = section else {
+            return top.clone();
+        };
+        let defaults = CompactionConfig::default();
+        let mut merged = section.clone();
+
+        if merged.consolidate_strategy.is_none() {
+            merged.consolidate_strategy = top.consolidate_strategy.clone();
+        }
+        if merged.consolidate_target_file_size_mb.is_none() {
+            merged.consolidate_target_file_size_mb = top.consolidate_target_file_size_mb;
+        }
+        if merged.consolidate_write_amp_limit.is_none() {
+            merged.consolidate_write_amp_limit = top.consolidate_write_amp_limit;
+        }
+
+        macro_rules! inherit_if_default {
+            ($($field:ident),+ $(,)?) => {
+                $(
+                    if merged.$field == defaults.$field {
+                        merged.$field = top.$field.clone();
+                    }
+                )+
+            };
+        }
+        // Every concrete field. `merge_section_over_covers_every_field` is a
+        // destructuring guard that fails to COMPILE if a field is added
+        // without being listed here.
+        inherit_if_default!(
+            l0_file_threshold,
+            higher_level_file_threshold,
+            l0_size_threshold_mb,
+            level_multiplier,
+            max_levels,
+            strategy,
+            target_file_size_mb,
+            memory_amplification_factor,
+            memory_budget_fraction,
+            available_memory_fraction,
+            max_memory_mb,
+            spill_enabled,
+            spill_directory,
+            spill_working_memory_mb,
+            spill_scratch_amplification_factor,
+            spill_available_disk_fraction,
+            spill_max_disk_mb,
+            full_target_segments,
+            full_max_passes,
+            full_timeout_ms,
+        );
+        merged
+    }
 }
 
 fn default_higher_level_file_threshold() -> usize {
@@ -1372,6 +1573,231 @@ mod tests {
         );
     }
     use super::*;
+
+    /// Exhaustiveness guard for `merge_section_over` (#2418 review round 22).
+    ///
+    /// This destructures `CompactionConfig` with no `..` rest pattern, so
+    /// ADDING A FIELD BREAKS THIS TEST'S COMPILATION. That is the point: the
+    /// new field must be added to `inherit_if_default!` (or given `Option`
+    /// presence) in the same change. Without the guard, a field added later
+    /// is silently discarded whenever an operator states any one knob in
+    /// `[storage.sst_config.compaction_config]` — the exact class this
+    /// review round reopened after it was closed for only 3 of 23 fields.
+    #[test]
+    fn merge_section_over_covers_every_field() {
+        let CompactionConfig {
+            // concrete fields — each must appear in `inherit_if_default!`
+            l0_file_threshold: _,
+            higher_level_file_threshold: _,
+            l0_size_threshold_mb: _,
+            level_multiplier: _,
+            max_levels: _,
+            strategy: _,
+            target_file_size_mb: _,
+            memory_amplification_factor: _,
+            memory_budget_fraction: _,
+            available_memory_fraction: _,
+            max_memory_mb: _,
+            spill_enabled: _,
+            spill_directory: _,
+            spill_working_memory_mb: _,
+            spill_scratch_amplification_factor: _,
+            spill_available_disk_fraction: _,
+            spill_max_disk_mb: _,
+            full_target_segments: _,
+            full_max_passes: _,
+            full_timeout_ms: _,
+            // Option fields — carried by the `is_none()` arms
+            consolidate_target_file_size_mb: _,
+            consolidate_write_amp_limit: _,
+            consolidate_strategy: _,
+        } = CompactionConfig::default();
+    }
+
+    /// A section stating ONE knob must not discard the operator's other
+    /// top-level values — above all `full_target_segments`, which this PR
+    /// made load-bearing for both the FULL collapse and its follow-up floor.
+    #[test]
+    fn section_stating_one_knob_keeps_every_other_top_level_value() {
+        let top = CompactionConfig {
+            full_target_segments: 3,
+            full_max_passes: 9,
+            full_timeout_ms: 123_456,
+            spill_enabled: !CompactionConfig::default().spill_enabled,
+            max_memory_mb: 4242,
+            strategy: "size".to_string(),
+            consolidate_target_file_size_mb: Some(77),
+            ..CompactionConfig::default()
+        };
+        // The operator declares the section for ONE unrelated knob.
+        let section = CompactionConfig {
+            l0_file_threshold: 8,
+            ..CompactionConfig::default()
+        };
+
+        let merged = CompactionConfig::merge_section_over(&top, Some(&section));
+
+        assert_eq!(merged.l0_file_threshold, 8, "the stated knob must win");
+        // Everything else the operator set at the top level must survive.
+        assert_eq!(
+            merged.full_target_segments, 3,
+            "full_target_segments was silently reset to the serde default before round 22"
+        );
+        assert_eq!(merged.full_max_passes, 9);
+        assert_eq!(merged.full_timeout_ms, 123_456);
+        assert_eq!(merged.spill_enabled, top.spill_enabled);
+        assert_eq!(merged.max_memory_mb, 4242);
+        assert_eq!(merged.strategy, "size");
+        assert_eq!(merged.consolidate_target_file_size_mb, Some(77));
+    }
+
+    #[test]
+    fn config_level_full_max_passes_zero_fails_boot() {
+        // Round 23: `full_max_passes` was clamped to 1 at use, so 0 booted
+        // happily and silently meant "one pass", not "unbounded" — the same
+        // knob-silently-rewritten class as full_target_segments above.
+        let config = CompactionConfig {
+            full_max_passes: 0,
+            ..Default::default()
+        };
+        let error = config
+            .validate("storage.sst_config.compaction_config")
+            .expect_err("full_max_passes = 0 must fail boot");
+        assert!(
+            error.contains("full_max_passes"),
+            "error must name the knob: {error}"
+        );
+    }
+
+    /// #2418 review round 20: a config-level `full_target_segments = 0` was
+    /// silently clamped to 1 by `.max(1)` — the knob-silently-rewritten
+    /// hazard the four per-request `Some(0)` doors (REST, Flight, the trait
+    /// seam, the engine) all refuse. It must fail boot like they do.
+    #[test]
+    fn config_level_full_target_segments_zero_fails_boot() {
+        let config = CompactionConfig {
+            full_target_segments: 0,
+            ..Default::default()
+        };
+        let error = config
+            .validate("storage.compaction_config")
+            .expect_err("a zero config target must not be silently clamped to 1");
+        assert!(error.contains("full_target_segments"), "{error}");
+        assert!(error.contains(">= 1"), "{error}");
+        // The shipped default (and any positive value) still validates.
+        assert!(
+            CompactionConfig::default()
+                .validate("storage.compaction_config")
+                .is_ok()
+        );
+        assert!(
+            CompactionConfig {
+                full_target_segments: 3,
+                ..Default::default()
+            }
+            .validate("storage.compaction_config")
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn compaction_strategy_validation_fails_closed() {
+        // Valid legacy values pass, including the default.
+        // Only the exact forms the consumer matches — "Hybrid" must FAIL.
+        for strategy in ["count", "size", "hybrid"] {
+            let config = CompactionConfig {
+                strategy: strategy.to_string(),
+                ..Default::default()
+            };
+            assert!(
+                config.validate("storage.compaction_config").is_ok(),
+                "expected '{strategy}' valid"
+            );
+        }
+        // The common dead-config mistake: 'consolidate' in the legacy field.
+        let config = CompactionConfig {
+            strategy: "consolidate".to_string(),
+            ..Default::default()
+        };
+        let error = config.validate("storage.compaction_config").unwrap_err();
+        // It must point at the path that WORKS: consolidate_strategy is
+        // refused too (TD-COMPACT-16), so sending operators there would be a
+        // second dead end.
+        assert!(
+            error.contains("COMPACT TABLE"),
+            "error should point at the working path: {error}"
+        );
+        // Typos AND case/whitespace variants fail — the consumer would
+        // silently treat each as the `_` (hybrid) arm.
+        for bad in ["hybrd", "Hybrid", "SIZE", " size", "size "] {
+            assert!(
+                CompactionConfig {
+                    strategy: bad.to_string(),
+                    ..Default::default()
+                }
+                .validate("storage.compaction_config")
+                .is_err(),
+                "expected '{bad}' rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn consolidate_strategy_field_validated_and_default_none() {
+        assert!(CompactionConfig::default().consolidate_strategy.is_none());
+        let validate = |value: &str| {
+            CompactionConfig {
+                consolidate_strategy: Some(value.to_string()),
+                ..Default::default()
+            }
+            .validate("storage.compaction_config")
+        };
+        // A dead knob shipped by #2407 ("hybrid" is already the default) is
+        // accepted, so an upgrade still boots, and reported as deprecated.
+        assert!(validate("hybrid").is_ok());
+        assert_eq!(
+            CompactionConfig {
+                consolidate_strategy: Some("hybrid".to_string()),
+                consolidate_write_amp_limit: Some(50),
+                ..Default::default()
+            }
+            .deprecation_notes("storage.compaction_config")
+            .len(),
+            2
+        );
+        assert!(
+            CompactionConfig::default()
+                .deprecation_notes("s")
+                .is_empty()
+        );
+        assert!(validate(" Hybrid ").is_ok());
+        // An explicit request for the refused behaviour fails, pointing at
+        // the operator path that converges.
+        for value in ["consolidate", "Consolidate"] {
+            let error = validate(value).expect_err("background consolidate must fail boot");
+            assert!(error.contains("COMPACT TABLE"), "{error}");
+        }
+        // The write-amp limit is read only by that refused trigger; an
+        // existing config naming it must still boot (deprecation warning).
+        assert!(
+            CompactionConfig {
+                consolidate_write_amp_limit: Some(50),
+                ..Default::default()
+            }
+            .validate("storage.compaction_config")
+            .is_ok()
+        );
+        // Typos are still refused.
+        assert!(validate("hybird").is_err());
+        assert!(
+            CompactionConfig {
+                consolidate_strategy: Some("aggressive".to_string()),
+                ..Default::default()
+            }
+            .validate("storage.compaction_config")
+            .is_err()
+        );
+    }
 
     #[test]
     fn hardware_defaults_match_root_runtime_expectations() {
