@@ -2252,43 +2252,6 @@ impl VectorOperationsService {
     /// so BoundedStale can apply its time-bound check. `None` when the
     /// directory cache or its inputs aren't available (same fallback
     /// path as the LSN-only helper).
-    pub(crate) async fn cached_directory_watermark(
-        &self,
-        collection_id: &str,
-    ) -> Option<(u64, i64)> {
-        let cache = self.directory_cache.as_ref()?;
-
-        // collection_root comes from the collection's storage assignment.
-        // Without it we can't resolve the sidecar URL, so fall back.
-        let collection = self.get_or_load_collection(collection_id).await.ok()?;
-        let collection_root = collection
-            .storage_assignment
-            .as_ref()
-            .map(|a| a.base_location.clone())?;
-
-        // Filesystem reference comes from the SST engine's factory.
-        let fs_factory = self.storage_engine.filesystem().clone();
-        let fs = fs_factory.get_filesystem(&collection_root).ok()?;
-
-        let entry = cache
-            .handle_for(collection_id)
-            .get_or_load(|| async {
-                crate::storage::engines::sst::object_economy_directory::load_directory_for(
-                    &*fs,
-                    collection_id,
-                    &collection_root,
-                    /*storage_epoch*/ 0,
-                    proximadb_catalog::CatalogAuthorityMode::RebuildableProjection,
-                )
-                .await
-            })
-            .await;
-        Some((
-            entry.directory.freshness_watermark_lsn,
-            entry.directory.freshness_watermark_ns,
-        ))
-    }
-
     /// Apply the WAL/memtable delta merge to a set of canonical engine
     /// results and build the structured EXPLAIN payload for the route.
     ///
@@ -2341,14 +2304,18 @@ impl VectorOperationsService {
         // Use the request's effective metric for WAL delta re-score. It is the
         // collection metric for ordinary calls and the SQL operator metric for
         // pgvector calls; either way directory and delta scores share a scale.
-        // Slice 5.10: fetch both LSN and ns watermarks so BoundedStale
-        // can apply its time-bound check. When unavailable, fall back
-        // to (0, 0) — the scan helper treats ns=0 as "time unknown"
-        // and conservatively scans (LSN-only behaviour).
-        let (watermark, watermark_ns) = self
-            .cached_directory_watermark(collection_id)
-            .await
-            .unwrap_or((0, 0));
+        // TD-OEDIRWM-1: the read-side directory-watermark fetch is REMOVED.
+        // It cost a real object-store GET per collection per >=30s idle gap
+        // (the directory cache's sliding recheck TTL) on every Strong and
+        // BoundedStale query, and its only live consumer skipped what the
+        // scan helper itself calls a cheap-when-empty memtable scan — a
+        // strictly negative trade on the I/O-round-trip cost spine. The VOE
+        // directory's CONTENTS have no live reader (TD-RDSTRAT-5/-11 both
+        // Superseded). (0, 0) is exactly the fallback the fetch already
+        // produced for sidecar-less collections: the scan helper treats
+        // ns=0 as "time unknown" and conservatively scans. Correctness is
+        // byte-identical; the delta scan now always runs for Strict modes.
+        let (watermark, watermark_ns) = (0u64, 0i64);
         // Read the WAL cursor independently of the scan helper so the
         // EXPLAIN payload carries the value even when no scan ran
         // (watermark already covers the cursor). Two cheap singleton
