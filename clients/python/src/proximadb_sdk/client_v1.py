@@ -160,6 +160,12 @@ class ProximaDBClientV1:
                 6: "raptor",
                 7: "mmap",
                 8: "hybrid",
+                # proto engines — decode truthfully (the former truncation
+                # silently decoded 9-12 as "sst")
+                9: "tst",
+                10: "cedar",
+                11: "titan",
+                12: "chrono",
             }
 
             dm_val = response.config.distance_metric if response.config else 0

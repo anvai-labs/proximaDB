@@ -839,6 +839,9 @@ class ProximaDBClient:
         # Add filterable_columns if directly specified (higher priority)
         if config.filterable_columns:
             # Map FilterableDataType to proto integer values
+            # Full proto range (proto skips 9); the former 1-8 truncation
+            # silently coerced rich types to STRING=1 on encode (#2444
+            # review follow-up).
             FILTERABLE_DATATYPE_MAP = {
                 "string": 1,
                 "integer": 2,
@@ -848,6 +851,19 @@ class ProximaDBClient:
                 "array_string": 6,
                 "array_integer": 7,
                 "array_float": 8,
+                "text": 10,
+                "text_large": 11,
+                "decimal": 12,
+                "timestamp_tz": 13,
+                "date": 14,
+                "time": 15,
+                "uuid": 16,
+                "binary": 17,
+                "json": 18,
+                "array_boolean": 19,
+                "array_uuid": 20,
+                "map_string_string": 21,
+                "map_string_any": 22,
             }
 
             # Serialize FilterableColumn objects to dicts with proto integer data_type
@@ -1003,6 +1019,13 @@ class ProximaDBClient:
                 6: "raptor",
                 7: "mmap",
                 8: "hybrid",
+                # proto engines the SDK does not explicitly model — decode
+                # truthfully rather than silently as "viper" (the former
+                # truncation's .get default)
+                9: "tst",
+                10: "cedar",
+                11: "titan",
+                12: "chrono",
             }
 
             # Extract and convert distance_metric
@@ -1031,6 +1054,8 @@ class ProximaDBClient:
                 from proximadb_sdk.models import FilterableColumn
 
                 # Map proto integer values to FilterableDataType strings
+                # Full proto range — the former 1-8 truncation silently
+                # decoded TEXT..MAP_STRING_ANY as "string".
                 FILTERABLE_DATATYPE_REVERSE_MAP = {
                     0: "string",
                     1: "string",
@@ -1041,6 +1066,19 @@ class ProximaDBClient:
                     6: "array_string",
                     7: "array_integer",
                     8: "array_float",
+                    10: "text",
+                    11: "text_large",
+                    12: "decimal",
+                    13: "timestamp_tz",
+                    14: "date",
+                    15: "time",
+                    16: "uuid",
+                    17: "binary",
+                    18: "json",
+                    19: "array_boolean",
+                    20: "array_uuid",
+                    21: "map_string_string",
+                    22: "map_string_any",
                 }
 
                 filterable_columns = [
@@ -1302,6 +1340,13 @@ class ProximaDBClient:
                 6: "raptor",
                 7: "mmap",
                 8: "hybrid",
+                # proto engines the SDK does not explicitly model — decode
+                # truthfully rather than silently as "viper" (the former
+                # truncation's .get default)
+                9: "tst",
+                10: "cedar",
+                11: "titan",
+                12: "chrono",
             }
 
             dm_val = cfg_src.get("distance_metric", cfg_src.get("metric"))

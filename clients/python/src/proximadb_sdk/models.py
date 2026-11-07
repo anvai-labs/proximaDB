@@ -256,7 +256,14 @@ class IndexUpdateMode(str, Enum):
 
 
 class FilterableDataType(str, Enum):
-    """Filterable data types"""
+    """Filterable data types.
+
+    Rich types (TEXT through MAP_STRING_ANY) mirror
+    proto/proximadb/v1/vector_types.proto FilterableDataType 10-22 —
+    guarded by TestProtoDriftGuard (the former 8-value truncation made the
+    wire-map extensions in rest_sync unreachable AND crashed decode of
+    server rich types with a pydantic ValidationError; #2446 review).
+    """
 
     STRING = "string"
     INTEGER = "integer"
@@ -266,6 +273,19 @@ class FilterableDataType(str, Enum):
     ARRAY_STRING = "array_string"
     ARRAY_INTEGER = "array_integer"
     ARRAY_FLOAT = "array_float"
+    TEXT = "text"
+    TEXT_LARGE = "text_large"
+    DECIMAL = "decimal"
+    TIMESTAMP_TZ = "timestamp_tz"
+    DATE = "date"
+    TIME = "time"
+    UUID = "uuid"
+    BINARY = "binary"
+    JSON = "json"
+    ARRAY_BOOLEAN = "array_boolean"
+    ARRAY_UUID = "array_uuid"
+    MAP_STRING_STRING = "map_string_string"
+    MAP_STRING_ANY = "map_string_any"
 
 
 class CompressionAlgorithm(str, Enum):

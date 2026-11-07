@@ -80,6 +80,14 @@ class ProtoConverter:
         # Legacy fallbacks (map to viper)
         "mmap": 1,
         "hybrid": 1,
+        # Encode parity for the proto engines the SDK does not explicitly
+        # model (#2446 review MEDIUM-6): decode is truthful (reverse table
+        # below), so encode must round-trip the same names rather than
+        # silently coerce read-then-recreate traffic to SST.
+        "tst": 9,
+        "cedar": 10,
+        "titan": 11,
+        "chrono": 12,
     }
 
     _STORAGE_ENGINE_INT_TO_STR: dict[int, str] = {
@@ -90,6 +98,16 @@ class ProtoConverter:
         4: "helix",
         5: "swift",
         6: "raptor",
+        # Decode truthfully what the server sent. The FORWARD aliases
+        # above (mmap/hybrid -> viper) are the deliberate TD-SDKENG-1
+        # deprecation design and stay; but a server response carrying
+        # MMAP=7 must not silently decode as "sst"/"viper".
+        7: "mmap",
+        8: "hybrid",
+        9: "tst",
+        10: "cedar",
+        11: "titan",
+        12: "chrono",
     }
 
     # =========================================================================
