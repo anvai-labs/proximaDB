@@ -1,0 +1,5 @@
+{
+  "redundant_definitions": 752,
+  "colliding_names": 563,
+  "note": "TD-NAMING-1 ratchet; lower via --mode baseline in the PR that burns collisions down"
+}
