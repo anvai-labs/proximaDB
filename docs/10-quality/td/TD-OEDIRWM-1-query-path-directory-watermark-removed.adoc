@@ -63,9 +63,7 @@ The first three follow-ups recorded with #2443 are closed:
   `VectorOperationsService` and `SharedServices` `directory_cache` fields and
   builders, `touch_object_economy_directory_for_search`,
   `cached_object_economy_directory_status`, and the `SstableWriter`
-  `directory_emission` opt-in. Route-health now reports
-  `directory_format_present: false` (response shape unchanged; no contract
-  change).
+  `directory_emission` opt-in.
 * **The constant watermark parameters are gone** from
   `scan_wal_delta_if_needed`: with no watermark the decision is exactly
   `requires_delta_merge()` (every mode but `StaleOk` scans). The helper
@@ -76,7 +74,15 @@ The first three follow-ups recorded with #2443 are closed:
   it as the deletion-vector snapshot LSN. Its engine accessor is gated on
   that feature.
 
-Route-health no longer advertises `route_hint: "object_economy"` for SST.
+**Observable route-health change (shape unchanged, values changed):** for
+SST collections `directory_format_present` goes `true → false` (it now means
+"a directory sidecar is produced", not "the engine has the format") and
+`route_hint` goes `"object_economy" → null`. `eligible` stays `true`
+(engine type). EXPLAIN reports `current_lsn_at_query: None` when the WAL
+cursor was not read, instead of 0. Measurement note: harnesses that sum the
+collection directory's bytes (e.g. `persisted_bytes` in
+`sift_pax_recall_ratchet_test`) now exclude the sidecar — that drop is not
+a storage-format gain.
 
 Left in place, deliberately:
 
@@ -89,8 +95,17 @@ Left in place, deliberately:
   collection, no reader. Delete them with the module cleanup (or a one-off
   sweep); never re-read them — they list files compaction has since retired.
 * `OBJECT_ECONOMY_LIVE_STATUS_NOT_REACHABLE` still appears in route-health's
-  degraded reasons (it already did after #2443). Retiring that reason is a
-  response-contract change, left to the module cleanup.
+  degraded reasons (it already did after #2443), and
+  `OBJECT_ECONOMY_DIRECTORY_DEGRADED` can no longer fire (its branch and
+  test fixtures remain). Retiring either reason is a response-contract
+  change, left to the module cleanup.
+* Other dependents the module cleanup must handle: `query/explain.rs`
+  `record_directory_load` (takes `DirectoryLoadStatus`; test-only callers),
+  the `StaticLsnSource` test double, the `ObjectEconomyCostFactors` /
+  RL-planner object-economy features (no directory input any more), the
+  `merge_delta_with_directory_results` / `merge_input_directory_records`
+  naming (a trace-field rename), and the now-inert
+  `PROXIMADB_DIRECTORY_CACHE_RECHECK_MS` gate.
 * `FreshnessLsnSource` is still wired in a default build, where only the
   feature-gated path reads it; gating the field and wiring too is part of
   the same cleanup.

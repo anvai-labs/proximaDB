@@ -8,7 +8,8 @@
 //!
 //! Counterpart to `bench_vector_object_economy.rs`, which measures
 //! the building-block CPU costs in isolation. This bench drives the
-//! full directory-routed read path: SstEngine + flush + searches
+//! full SST read path (no directory routing since TD-OEDIRWM-1):
+//! SstEngine + flush + searches
 //! against a tempdir-backed local filesystem.
 //!
 //! Output is intentionally shaped to be compared head-to-head with
@@ -20,8 +21,9 @@
 //! ## What this bench measures
 //!
 //! * **Insert + flush throughput** — how long it takes to land N
-//!   synthetic vectors and trigger the SST flush that populates the
-//!   per-collection object-economy directory.
+//!   synthetic vectors and trigger the SST flush. (Since TD-OEDIRWM-1
+//!   the flush no longer writes the object-economy directory sidecar,
+//!   so results are not comparable with pre-retirement reports.)
 //! * **Cold p50/p99 query latency** — first query against a freshly
 //!   constructed engine. Page cache cold, index cold, block cache cold.
 //! * **Warm p50/p99 query latency** — subsequent queries against the
@@ -41,8 +43,9 @@
 //!   recall measurement against SIFT/GIST ground truth is a separate
 //!   slice.
 //! * **WAL delta merge cost** — there are no in-flight writes during
-//!   the search loop, so the strong-route delta scan exits early
-//!   (current_lsn ≤ watermark). Measuring the merge cost under
+//!   the search loop, so the strong-route delta scan finds an empty
+//!   memtable (it always runs; there is no watermark skip since
+//!   TD-OEDIRWM-1). Measuring the merge cost under
 //!   concurrent write + read load is a separate slice.
 //!
 //! ## Scale control

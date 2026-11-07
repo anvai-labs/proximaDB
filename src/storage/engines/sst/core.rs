@@ -849,7 +849,8 @@ impl SstEngine {
     }
 
     /// True when [`Self::with_freshness_lsn_source`] has supplied a
-    /// source. Used by tests/operators to confirm wiring.
+    /// source. (No in-tree caller today; kept as the public wiring probe
+    /// until the TD-OEDIRWM-1 module cleanup gates the source.)
     pub fn freshness_lsn_source_configured(&self) -> bool {
         self.freshness_lsn_source.is_some()
     }

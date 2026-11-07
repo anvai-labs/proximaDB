@@ -2259,7 +2259,7 @@ impl VectorOperationsService {
             collection_id = %collection_id,
             route_kind = %explain.route_kind,
             freshness_mode = %explain.freshness_mode_used.as_deref().unwrap_or("unknown"),
-            current_lsn = explain.current_lsn_at_query.unwrap_or(0),
+            current_lsn = ?explain.current_lsn_at_query, // None = cursor not read
             watermark_lsn = ?explain.freshness_watermark_lsn, // None = not wired (TD-OEDIRWM-1)
             wal_delta_searched = explain.wal_delta_searched,
             wal_delta_records_scanned = explain.wal_delta_records_scanned.unwrap_or(0),
@@ -2280,8 +2280,8 @@ impl VectorOperationsService {
     /// caller merges the delta with the engine results.
     ///
     /// Returns `(current_lsn, delta)`, where `current_lsn` is the WAL cursor
-    /// read once here (0 when no manifest service is registered) so the
-    /// caller's EXPLAIN reuses it, and `delta` is:
+    /// read once here (`None` when it was not read: `StaleOk`, or no
+    /// manifest service) so the caller's EXPLAIN reuses it, and `delta` is:
     /// * `None` — no scan ran (mode is `StaleOk`, or no manifest service).
     /// * `Some(records)` — delta records, possibly empty. Tombstone
     ///   markers are preserved so the merge step can suppress older
@@ -2298,13 +2298,13 @@ impl VectorOperationsService {
         metadata_filters: Option<&crate::core::search::FilterExpression>,
         freshness_mode: &crate::core::search::VectorFreshnessMode,
     ) -> Result<(
-        u64,
+        Option<u64>,
         Option<Vec<crate::core::search::results::OptimizedSearchRecord>>,
     )> {
         // StaleOk short-circuits before we even ask the WAL — saves the
         // singleton lookup on the cheap-read path.
         if !freshness_mode.requires_delta_merge() {
-            return Ok((0, None));
+            return Ok((None, None));
         }
 
         // Without a global manifest service the WAL cursor is unavailable,
@@ -2328,7 +2328,7 @@ impl VectorOperationsService {
                          In server mode this means freshly-written WAL records may not be \
                          visible to search. Call `manifest::init(&wal_config)` once at startup."
                     );
-                    return Ok((0, None));
+                    return Ok((None, None));
                 }
             };
 
@@ -2348,7 +2348,7 @@ impl VectorOperationsService {
                 /* include_metadata */ true,
             )
             .await?;
-        Ok((current_lsn, Some(records)))
+        Ok((Some(current_lsn), Some(records)))
     }
 
     /// Attach orchestrator (builder-style)

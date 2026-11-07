@@ -275,12 +275,14 @@ impl VectorObjectEconomyExplain {
     pub fn record_wal_delta_scan(
         mut self,
         mode: &crate::core::search::VectorFreshnessMode,
-        current_lsn: u64,
+        current_lsn: Option<u64>,
         scanned_records: Option<u64>,
         scanned_bytes: Option<u64>,
     ) -> Self {
         self.freshness_mode_used = Some(mode.explain_label().to_string());
-        self.current_lsn_at_query = Some(current_lsn);
+        // `None` = the WAL cursor was not read (e.g. no manifest service);
+        // never a fabricated 0.
+        self.current_lsn_at_query = current_lsn;
         self.wal_delta_records_scanned = scanned_records;
         self.wal_delta_bytes = scanned_bytes;
         // `wal_delta_searched` is the existing bool field; flip it
@@ -2559,7 +2561,7 @@ mod tests {
 
         let explain = VectorObjectEconomyExplain::default().record_wal_delta_scan(
             &VectorFreshnessMode::Strong,
-            /*current_lsn*/ 250,
+            /*current_lsn*/ Some(250),
             /*scanned_records*/ Some(7),
             /*scanned_bytes*/ Some(4096),
         );
@@ -2577,7 +2579,7 @@ mod tests {
 
         let explain = VectorObjectEconomyExplain::default().record_wal_delta_scan(
             &VectorFreshnessMode::StaleOk,
-            /*current_lsn*/ 250,
+            /*current_lsn*/ Some(250),
             /*scanned_records*/ None,
             /*scanned_bytes*/ None,
         );
@@ -2597,7 +2599,7 @@ mod tests {
             &VectorFreshnessMode::BoundedStale {
                 max_staleness_ms: 5_000,
             },
-            42,
+            Some(42),
             Some(3),
             Some(128),
         );
