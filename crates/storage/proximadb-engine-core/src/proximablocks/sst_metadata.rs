@@ -244,6 +244,66 @@ impl SstMetadataSerializer {
         // For demo, return reasonable values
         Ok((1000, 0x1000_0000_0000_0000, 0x8000_0000_0000_0000))
     }
+
+    /// Encode an [`SstMetadata`] into the wire envelope read back by
+    /// [`MetadataSerializer::deserialize_metadata`]:
+    /// `[global: 60B][u32 block_count][blocks: 52B each][u32 var_len][variable_data]`.
+    ///
+    /// Wire sizes are the *packed* field sizes — `repr(C)` padding is never
+    /// serialized, so `size_of::<SstBlockHeader>()` (56) must NOT be used as
+    /// the block stride anywhere in this envelope. Count/length prefixes are
+    /// checked-converted to u32 (a truncating `as` cast would wrap ≥ 2^32
+    /// and silently drop the tail on decode).
+    fn encode_metadata(metadata: &SstMetadata) -> Result<Vec<u8>, ProximaDBError> {
+        let mut buffer = Vec::new();
+
+        // Global header (60 bytes on the wire)
+        buffer.extend_from_slice(&metadata.global.file_size.to_le_bytes());
+        buffer.extend_from_slice(&metadata.global.num_blocks.to_le_bytes());
+        buffer.extend_from_slice(&metadata.global.bloom_filter_offset.to_le_bytes());
+        buffer.extend_from_slice(&metadata.global.bloom_filter_size.to_le_bytes());
+        buffer.extend_from_slice(&metadata.global.index_offset.to_le_bytes());
+        buffer.extend_from_slice(&metadata.global.index_size.to_le_bytes());
+        buffer.extend_from_slice(&metadata.global.total_records.to_le_bytes());
+        buffer.extend_from_slice(&metadata.global.min_timestamp.to_le_bytes());
+        buffer.extend_from_slice(&metadata.global.max_timestamp.to_le_bytes());
+        buffer.extend_from_slice(&metadata.global.compression_ratio.to_le_bytes());
+        buffer.extend_from_slice(&metadata.global.reserved);
+
+        // Block count (checked: > u32::MAX blocks cannot be encoded)
+        let block_count = u32::try_from(metadata.blocks.len()).map_err(|_| {
+            ProximaDBError::InvalidInput("SST metadata block count exceeds u32".into())
+        })?;
+        buffer.extend_from_slice(&block_count.to_le_bytes());
+
+        // Block headers (52 bytes each on the wire)
+        for block in &metadata.blocks {
+            buffer.extend_from_slice(&block.offset.to_le_bytes());
+            buffer.extend_from_slice(&block.compressed_size.to_le_bytes());
+            buffer.extend_from_slice(&block.uncompressed_size.to_le_bytes());
+            buffer.extend_from_slice(&block.record_count.to_le_bytes());
+            buffer.extend_from_slice(&block.bloom_offset.to_le_bytes());
+            buffer.extend_from_slice(&block.bloom_size.to_le_bytes());
+            buffer.extend_from_slice(&block.min_key_hash.to_le_bytes());
+            buffer.extend_from_slice(&block.max_key_hash.to_le_bytes());
+            buffer.extend_from_slice(&block.priority.to_le_bytes());
+            buffer.extend_from_slice(&block.reserved);
+        }
+
+        // Variable-data length prefix: u32, matching what the reader consumes.
+        // (A usize prefix would shift every round-tripped buffer by 4 stray
+        // bytes — this exact bug shipped and is pinned by the round-trip test.
+        // Checked: > 4 GiB of variable data cannot be length-prefixed as u32.)
+        let var_data_len = u32::try_from(metadata.variable_data.len()).map_err(|_| {
+            ProximaDBError::InvalidInput("SST metadata variable data exceeds u32".into())
+        })?;
+        buffer.extend_from_slice(&var_data_len.to_le_bytes());
+
+        // Variable data (compressed with bincode if enabled)
+        buffer.extend_from_slice(&metadata.variable_data);
+
+        Ok(buffer)
+    }
 }
 
 impl MetadataSerializer for SstMetadataSerializer {
@@ -262,52 +322,15 @@ impl MetadataSerializer for SstMetadataSerializer {
             tokio::runtime::Handle::current().block_on(self.extract_metadata(file_path))
         })?;
 
-        let mut buffer = Vec::new();
-
-        // Serialize global header manually
-        buffer.extend_from_slice(&metadata.global.file_size.to_le_bytes());
-        buffer.extend_from_slice(&metadata.global.num_blocks.to_le_bytes());
-        buffer.extend_from_slice(&metadata.global.bloom_filter_offset.to_le_bytes());
-        buffer.extend_from_slice(&metadata.global.bloom_filter_size.to_le_bytes());
-        buffer.extend_from_slice(&metadata.global.index_offset.to_le_bytes());
-        buffer.extend_from_slice(&metadata.global.index_size.to_le_bytes());
-        buffer.extend_from_slice(&metadata.global.total_records.to_le_bytes());
-        buffer.extend_from_slice(&metadata.global.min_timestamp.to_le_bytes());
-        buffer.extend_from_slice(&metadata.global.max_timestamp.to_le_bytes());
-        buffer.extend_from_slice(&metadata.global.compression_ratio.to_le_bytes());
-        buffer.extend_from_slice(&metadata.global.reserved);
-
-        // Serialize block count
-        buffer.extend_from_slice(&(metadata.blocks.len() as u32).to_le_bytes());
-
-        // Serialize block headers manually
-        for block in &metadata.blocks {
-            buffer.extend_from_slice(&block.offset.to_le_bytes());
-            buffer.extend_from_slice(&block.compressed_size.to_le_bytes());
-            buffer.extend_from_slice(&block.uncompressed_size.to_le_bytes());
-            buffer.extend_from_slice(&block.record_count.to_le_bytes());
-            buffer.extend_from_slice(&block.bloom_offset.to_le_bytes());
-            buffer.extend_from_slice(&block.bloom_size.to_le_bytes());
-            buffer.extend_from_slice(&block.min_key_hash.to_le_bytes());
-            buffer.extend_from_slice(&block.max_key_hash.to_le_bytes());
-            buffer.extend_from_slice(&block.priority.to_le_bytes());
-            buffer.extend_from_slice(&block.reserved);
-        }
-
-        // Serialize variable data size
-        buffer.extend_from_slice(&(metadata.variable_data.len()).to_le_bytes());
-
-        // Serialize variable data (compressed with bincode if enabled)
-        buffer.extend_from_slice(&metadata.variable_data);
-
-        Ok(buffer)
+        Self::encode_metadata(&metadata)
     }
 
     fn deserialize_metadata(&self, data: &[u8]) -> Result<Box<dyn EngineMetadata>, ProximaDBError> {
         let mut offset = 0;
 
-        // Deserialize global header manually
-        if data.len() < offset + 64 {
+        // Deserialize global header manually (60 bytes on the wire; do not
+        // use size_of::<SstGlobalHeader>() — repr(C) padding is not serialized)
+        if data.len() < offset + 60 {
             // Size of header
             return Err(ProximaDBError::InvalidInput(
                 "Invalid SST metadata size".into(),
@@ -376,7 +399,10 @@ impl MetadataSerializer for SstMetadataSerializer {
         offset += 4;
 
         // Deserialize block headers manually
-        let block_header_size = 56; // Size of SstBlockHeader
+        // 52 bytes per block header on the wire (packed field sizes; the
+        // repr(C) size is 56 and striding by it corrupts every block after
+        // the first — pinned by the round-trip test below)
+        let block_header_size = 52;
         let total_block_size = block_count as usize * block_header_size;
 
         if data.len() < offset + total_block_size {
@@ -726,6 +752,117 @@ mod tests {
         assert!(
             serializer.can_skip_file(&metadata, &ctx),
             "TTL pruning must still fire when max_timestamp < ttl_threshold"
+        );
+    }
+
+    /// Encode→decode round-trip — the inverse-pair test this serializer never
+    /// had. It pins the two wire bugs that shipped silently:
+    /// (1) the reader strided block headers by `size_of::<SstBlockHeader>()`
+    ///     (56) while the writer emits 52 packed bytes, corrupting every
+    ///     block after the first;
+    /// (2) the writer emitted a `usize` (8-byte) variable-data length prefix
+    ///     while the reader consumes `u32`, shifting the payload by 4 stray
+    ///     bytes.
+    /// Three blocks with distinct fields + 1000 bytes of patterned variable
+    /// data exercise both paths (fails on either bug).
+    #[test]
+    fn encode_decode_round_trip_is_lossless() {
+        let serializer = SstMetadataSerializer::new(crate::testutil::noop_filesystem_port());
+
+        let blocks: Vec<SstBlockHeader> = (0..3u64)
+            .map(|i| SstBlockHeader {
+                offset: 4096 + i * (4 * 1024 * 1024),
+                compressed_size: 1000 + i as u32,
+                uncompressed_size: 2000 + i as u32,
+                record_count: 300 + i as u32,
+                bloom_offset: 0,
+                bloom_size: 0,
+                min_key_hash: 0x1000_0000_0000_0000 + i,
+                max_key_hash: 0x8000_0000_0000_0000 + i,
+                priority: 255 - i as u8,
+                reserved: [i as u8; 7],
+            })
+            .collect();
+
+        let original = SstMetadata {
+            global: SstGlobalHeader {
+                file_size: 16 * 1024 * 1024,
+                num_blocks: blocks.len() as u32,
+                // Distinct values: three 0-valued u32 offset fields would be
+                // swap-blind (a writer/reader offset swap among them would
+                // still round-trip).
+                bloom_filter_offset: 111,
+                bloom_filter_size: 222,
+                index_offset: 333,
+                index_size: 60 * 1024,
+                total_records: 903,
+                min_timestamp: 17,
+                max_timestamp: 1_700_000_000_000,
+                compression_ratio: 42,
+                reserved: [9; 7],
+            },
+            blocks,
+            variable_data: (0..1000u32).map(|i| (i % 251) as u8).collect(),
+            global_bloom: parking_lot::RwLock::new(None),
+            block_blooms: parking_lot::RwLock::new(HashMap::new()),
+        };
+
+        let encoded = SstMetadataSerializer::encode_metadata(&original)
+            .expect("encode must succeed for a well-formed fixture");
+        let decoded = serializer
+            .deserialize_metadata(&encoded)
+            .expect("round-trip decode must succeed");
+        let decoded = decoded
+            .as_any()
+            .downcast_ref::<SstMetadata>()
+            .expect("decoded metadata must be SstMetadata");
+
+        assert_eq!(decoded.global.file_size, original.global.file_size);
+        assert_eq!(decoded.global.num_blocks, 3);
+        assert_eq!(
+            decoded.global.bloom_filter_offset,
+            original.global.bloom_filter_offset
+        );
+        assert_eq!(
+            decoded.global.bloom_filter_size,
+            original.global.bloom_filter_size
+        );
+        assert_eq!(decoded.global.index_offset, original.global.index_offset);
+        assert_eq!(decoded.global.index_size, original.global.index_size);
+        assert_eq!(decoded.global.total_records, original.global.total_records);
+        assert_eq!(decoded.global.min_timestamp, original.global.min_timestamp);
+        assert_eq!(decoded.global.max_timestamp, original.global.max_timestamp);
+        assert_eq!(decoded.global.compression_ratio, 42);
+        assert_eq!(decoded.global.reserved, [9; 7]);
+
+        assert_eq!(decoded.blocks.len(), 3, "block count must survive");
+        for (i, (got, want)) in decoded
+            .blocks
+            .iter()
+            .zip(original.blocks.iter())
+            .enumerate()
+        {
+            assert_eq!(got.offset, want.offset, "block {i} offset (stride bug)");
+            assert_eq!(got.compressed_size, want.compressed_size, "block {i}");
+            assert_eq!(got.uncompressed_size, want.uncompressed_size, "block {i}");
+            assert_eq!(got.record_count, want.record_count, "block {i}");
+            assert_eq!(got.bloom_offset, want.bloom_offset, "block {i}");
+            assert_eq!(got.bloom_size, want.bloom_size, "block {i}");
+            assert_eq!(
+                got.min_key_hash, want.min_key_hash,
+                "block {i} (stride bug)"
+            );
+            assert_eq!(
+                got.max_key_hash, want.max_key_hash,
+                "block {i} (stride bug)"
+            );
+            assert_eq!(got.priority, want.priority, "block {i}");
+            assert_eq!(got.reserved, want.reserved, "block {i}");
+        }
+
+        assert_eq!(
+            decoded.variable_data, original.variable_data,
+            "variable data must survive (length-prefix width bug)"
         );
     }
 }

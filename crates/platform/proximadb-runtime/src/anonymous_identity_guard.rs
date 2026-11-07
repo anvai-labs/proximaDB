@@ -114,7 +114,7 @@ mod tests {
              ownership rule on its result",
         ),
         ("src/services/ddl/mod.rs", 5, "unit tests"),
-        ("src/services/dml/tests.rs", 21, "unit tests"),
+        ("src/services/dml/tests.rs", 24, "unit tests"),
         (
             "src/services/external_collection/service.rs",
             1,
@@ -1060,6 +1060,11 @@ mod tests {
             "test router (inside a test module)",
         ),
         (
+            "src/network/middleware/auth_failclosed.rs",
+            "/health/ready",
+            "test router (inside a test module)",
+        ),
+        (
             "src/network/middleware/tls.rs",
             "/api/v1/secure",
             "test router (inside a test module)",
@@ -1067,6 +1072,31 @@ mod tests {
         (
             "src/network/middleware/tenant.rs",
             "/api/v1/collections",
+            "test router (inside a test module)",
+        ),
+        (
+            "src/network/middleware/tenant.rs",
+            "/api/v2/collections",
+            "test router (inside a test module)",
+        ),
+        (
+            "src/network/middleware/tenant.rs",
+            "/health",
+            "test router (inside a test module)",
+        ),
+        (
+            "src/network/middleware/tenant.rs",
+            "/health/live",
+            "test router (inside a test module)",
+        ),
+        (
+            "src/network/middleware/tenant.rs",
+            "/health/ready",
+            "test router (inside a test module)",
+        ),
+        (
+            "src/network/middleware/tenant.rs",
+            "/metrics/health",
             "test router (inside a test module)",
         ),
         (
