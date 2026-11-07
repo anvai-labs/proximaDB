@@ -19,10 +19,6 @@ use proximadb_storage_ports::StorageQuantizationEnginePort;
 // use proximadb_distance_kernel::create_distance_calculator;
 use proximadb_hardware::{SimdLevel, best_simd_level};
 
-/// StorageQuantizationConfig moved to foundation `proximadb-quantization-model`
-/// (foundation-pure data struct; TD-DECOMP-72) so storage-tier crates can hold
-/// it without a storage→modality up-edge — same pattern as StorageQuantizedData.
-/// Re-exported here so this crate's public API + internal usage are unchanged.
 pub use proximadb_quantization_model::StorageQuantizationConfig;
 
 // Slice D pre-extraction: StorageQuantizedData now lives in foundation
@@ -30,57 +26,36 @@ pub use proximadb_quantization_model::StorageQuantizationConfig;
 // public API + internal usage are unchanged.
 pub use proximadb_quantization_model::StorageQuantizedData;
 
-/// Search stages for progressive resolution
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SearchStage {
-    /// Stage 1: Binary filtering (95% reduction)
     BinaryFilter,
-    /// Stage 2: Fast approximation (INT8)
     FastApproximation,
-    /// Stage 3: PQ ranking (further refinement)
     PQRanking,
-    /// Stage 4: Full precision (100% accuracy)
     FullPrecision,
 }
 
-/// Result from a search stage
 #[derive(Debug, Clone)]
 pub struct SearchStageResult {
-    /// Stage that was executed
     pub stage: SearchStage,
-    /// Candidate indices that passed this stage
     pub candidates: Vec<usize>,
-    /// Optional distances/scores
     pub scores: Option<Vec<f32>>,
-    /// Metrics about the stage
     pub metrics: StageMetrics,
 }
 
-/// Metrics for a search stage
 #[derive(Debug, Clone, Default)]
 pub struct StageMetrics {
-    /// Number of candidates entering stage
     pub input_count: usize,
-    /// Number of candidates passing stage
     pub output_count: usize,
-    /// Time taken in microseconds
     pub time_us: u64,
-    /// Reduction percentage
     pub reduction_percent: f32,
 }
 
-/// Common storage quantization engine
 #[derive(Debug)]
 pub struct StorageQuantizationEngine {
-    /// Underlying unified quantization engine
     unified_engine: Arc<UnifiedQuantizationEngine>,
-    /// Distance computation engine
     distance_compute: Arc<UnifiedDistanceCompute>,
-    /// Configuration
     config: StorageQuantizationConfig,
-    /// Cached codebooks
     codebooks: Arc<DashMap<String, Arc<Vec<Vec<f32>>>>>,
-    /// SIMD level (None means scalar-only)
     hardware: Option<SimdLevel>,
 }
 
@@ -284,11 +259,6 @@ impl StorageQuantizationEngine {
         Ok(results)
     }
 
-    /// Quantize a batch of vector slices (zero-copy version)
-    /// This avoids cloning vectors and works directly with references
-
-    /// Quantize a batch of vector slices with a specific level (zero-copy version)
-
     /// Progressive search through stages
     pub async fn progressive_search(
         &self,
@@ -347,7 +317,6 @@ impl StorageQuantizationEngine {
         Ok(results)
     }
 
-    /// Binary filtering stage
     async fn binary_filter_stage(
         &self,
         query: &[f32],
@@ -405,9 +374,6 @@ impl StorageQuantizationEngine {
             },
         })
     }
-
-    /// Precompute distance lookup table for PQ quantization
-    /// This significantly speeds up PQ-based similarity calculations
 
     /// SIMD-optimized distance calculation leveraging existing infrastructure
     fn calculate_simd_optimized_distance(
@@ -658,10 +624,7 @@ impl StorageQuantizationEngine {
         Ok(lookup_tables)
     }
 
-    /// Get or create PQ codebook for vector
     #[allow(dead_code)]
-
-    /// Fast approximation stage using INT8
     async fn fast_approximation_stage(
         &self,
         query: &[f32],
@@ -713,7 +676,6 @@ impl StorageQuantizationEngine {
         })
     }
 
-    /// PQ ranking stage with optimized distance table precomputation
     async fn pq_ranking_stage(
         &self,
         query: &[f32],
@@ -895,12 +857,6 @@ impl StorageQuantizationEngine {
     pub fn get_cached_codebook(&self, codebook_id: &str) -> Option<Arc<Vec<Vec<f32>>>> {
         self.codebooks.get(codebook_id).map(|entry| entry.clone())
     }
-
-    /// Check if codebook is cached
-
-    /// Clear all cached codebooks
-
-    /// Get number of cached codebooks
 
     /// List all cached codebook IDs
     pub fn list_cached_codebooks(&self) -> Vec<String> {
