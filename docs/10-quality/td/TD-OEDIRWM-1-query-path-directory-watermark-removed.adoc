@@ -62,7 +62,11 @@ The first three follow-ups recorded with #2443 are closed:
   clustering produced centroids (default ON; `PROXIMADB_PAX_BLOCK_CLUSTER=0`
   disables it). Removed with its helper (`pax_write_outcome`). Such a flush
   is one GET + one PUT cheaper; derived from the code path, not
-  benchmarked.
+  benchmarked. The writer still COMPUTES per-block centroids and radii when
+  clustering is on (`.with_block_centroids(cluster)` in `segment_format.rs`):
+  no production path reads them now, but
+  `tests/sst_compaction_reclustering_test.rs` uses the radii as its
+  clustering-quality gate, so the computation stays.
 * **The dead directory-cache wiring is gone:** the `SstEngine`,
   `VectorOperationsService` and `SharedServices` `directory_cache` fields and
   builders, `touch_object_economy_directory_for_search`,
@@ -72,13 +76,11 @@ The first three follow-ups recorded with #2443 are closed:
   `scan_wal_delta_if_needed`: with no watermark the decision is exactly
   `requires_delta_merge()` (every mode but `StaleOk` scans). The helper
   returns the WAL cursor it reads, so a strict query reads `current_lsn`
-  once there instead of twice. The cursor no longer gates anything, so a
-  process with no manifest service (embedded/tests without
-  `manifest::init`) now STILL scans the delta — before, a Strong read
-  there silently skipped unflushed rows. EXPLAIN reports the unread cursor
-  as `None`, and a missing manifest is still warned about, once per
-  process (it still means no `FreshnessLsnSource` is wired). The `VectorFreshnessMode::should_scan_delta*`
-  crate API is kept (its unit tests and the object-economy bench use it).
+  once there instead of twice. With no manifest service (embedded/tests
+  without `manifest::init`) the scan is skipped and warned about exactly as
+  before — unflushed rows are not lost there, because Stage 1 of
+  `execute_unified_plan` already scores the WAL with vectors on every query
+  (see TD-DELTASCAN-1). EXPLAIN reports an unread cursor as `None`.
 * `FreshnessLsnSource` stays: the `cold-deletion-vectors` search path uses
   it as the deletion-vector snapshot LSN. Its engine accessor is gated on
   that feature.
@@ -108,11 +110,11 @@ Left in place, deliberately:
   each SST collection's data root) are not removed: one small object per
   collection, no reader. Delete them with the module cleanup (or a one-off
   sweep); never re-read them — they list files compaction has since retired.
-* `OBJECT_ECONOMY_LIVE_STATUS_NOT_REACHABLE` still appears in route-health's
-  degraded reasons (it already did after #2443), and
-  `OBJECT_ECONOMY_DIRECTORY_DEGRADED` can no longer fire (its branch and
-  test fixtures remain). Retiring either reason is a response-contract
-  change, left to the module cleanup.
+* `OBJECT_ECONOMY_LIVE_STATUS_NOT_REACHABLE` is now emitted only for an
+  eligible route, so it no longer flags every collection (values change; the
+  enum is unchanged). It and `OBJECT_ECONOMY_DIRECTORY_DEGRADED` can no
+  longer fire; retiring the variants is a response-contract change, left to
+  the module cleanup.
 * Other dependents the module cleanup must handle: `query/explain.rs`
   `record_directory_load` (takes `DirectoryLoadStatus`; test-only callers),
   the `StaticLsnSource` test double, the `ObjectEconomyCostFactors` /
@@ -120,14 +122,10 @@ Left in place, deliberately:
   `merge_delta_with_directory_results` / `merge_input_directory_records`
   naming (a trace-field rename), and the now-inert
   `PROXIMADB_DIRECTORY_CACHE_RECHECK_MS` gate.
-* Pre-existing, not introduced here: the delta scan always passes
-  `include_vectors=false`, so when an OID's freshest copy is still in the
-  WAL a Strong search with `include_vectors=true` returns that hit without
-  its vector. Servers (always manifest-wired) already behaved this way; the
-  no-manifest change extends it to embedded/test processes, which before
-  dropped such unflushed rows entirely. Fix: thread `include_vectors` into
-  `scan_wal_delta_if_needed` (or backfill from the engine copy in the
-  merge).
+* Pre-existing, not introduced here: a strict search scans the unflushed
+  WAL twice, and the second, vector-less scan wins the exact-tie merge, so
+  an unflushed hit can come back without its vector — filed as
+  TD-DELTASCAN-1.
 * `VectorFreshnessMode::should_scan_delta` / `should_scan_delta_with_time`
   (search-types crate) have no production caller now — only their unit
   tests (duplicated in `core/search/mod.rs`) and the in-memory
