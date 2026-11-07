@@ -332,6 +332,52 @@ class TestProtoDriftGuard:
                 f"table says {ours.get(name)}"
             )
 
+    def test_inline_reverse_maps_match_proto(self) -> None:
+        """Every hand-written int->str DistanceMetric dict in the SDK must
+        decode proto values correctly (review round 1 found a sixth drifted
+        site in client_v1 and a 1-5 truncation in rest_sync get_collection
+        that this guard's absence let live). Parses the source files for
+        int-literal -> "name" dict entries and compares each to the proto.
+        """
+        import re
+
+        from pathlib import Path
+
+        sdk_src = Path(__file__).parents[2] / "src" / "proximadb_sdk"
+        from proximadb_sdk.v1 import vector_types_pb2 as types_pb2
+
+        proto = {
+            v.number: v.name.lower() for v in types_pb2.DistanceMetric.DESCRIPTOR.values
+        }
+        proto[0] = "cosine"  # client_v1 maps 0->cosine as a safe default
+
+        files = [
+            sdk_src / "protocols" / "rest_sync.py",
+            sdk_src / "client_v1.py",
+        ]
+        checked = 0
+        for f in files:
+            text = f.read_text()
+            for m in re.finditer(r"(\d+):\s*\"(\w+)\"", text):
+                num, name = int(m.group(1)), m.group(2)
+                if (
+                    num in proto
+                    and name
+                    in (
+                        "cosine euclidean dot_product hamming manhattan jaccard "
+                        "angular chebyshev canberra minkowski bray_curtis "
+                        "hellinger custom"
+                    ).split()
+                ):
+                    assert proto[num] == name, (
+                        f"{f.name}:{text[:m.start()].count(chr(10)) + 1} "
+                        f"drifted: {num} should be {proto[num]}, says {name}"
+                    )
+                    checked += 1
+        # the maps must actually be found — a rename that hides them from
+        # the regex is itself drift-shaped
+        assert checked >= 40, f"only {checked} entries found — maps moved?"
+
     def test_distance_metric_intenum_matches_proto(self) -> None:
         from proximadb_sdk.models import DistanceMetricType
         from proximadb_sdk.v1 import vector_types_pb2 as types_pb2

@@ -66,7 +66,7 @@ class DistanceMetric(str, Enum):
 class DistanceMetricType(int, Enum):
     """Distance metric types for gRPC API (integer-based, matches v1 proto)
 
-    Maps to proximadb.v1.types_pb2.DistanceMetric enum.
+    Maps to the proximadb.v1 vector_types.proto DistanceMetric enum.
     Use these constants when working with gRPC to avoid magic numbers.
 
     Example:

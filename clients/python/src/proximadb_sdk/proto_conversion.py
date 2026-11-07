@@ -57,7 +57,12 @@ class ProtoConverter:
     }
 
     _DISTANCE_METRIC_INT_TO_STR: dict[int, str] = {
-        v: k for k, v in _DISTANCE_METRIC_STR_TO_INT.items()
+        v: k
+        for k, v in _DISTANCE_METRIC_STR_TO_INT.items()
+        # skip alias keys so the fully-qualified form cannot win the
+        # last-key-wins comprehension (review round 1: 0 decoded as
+        # "distance_metric_unspecified" instead of "unspecified")
+        if not (k.endswith("_unspecified") and k != "unspecified")
     }
 
     # =========================================================================

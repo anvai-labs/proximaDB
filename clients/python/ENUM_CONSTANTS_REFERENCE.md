@@ -32,13 +32,13 @@ client.create_collection(
 | `DistanceMetricType.COSINE` | 1 | Text embeddings, normalized vectors (most common) |
 | `DistanceMetricType.EUCLIDEAN` | 2 | Spatial data, image embeddings |
 | `DistanceMetricType.DOT_PRODUCT` | 3 | Recommendation systems, ranking |
-| `DistanceMetricType.MANHATTAN` | 4 | Grid-based distances, city block distance |
-| `DistanceMetricType.HAMMING` | 5 | Binary vectors, error detection |
+| `DistanceMetricType.MANHATTAN` | 5 | Grid-based distances, city block distance |
+| `DistanceMetricType.HAMMING` | 4 | Binary vectors, error detection |
 | `DistanceMetricType.JACCARD` | 6 | Set similarity, document comparison |
-| `DistanceMetricType.CHEBYSHEV` | 7 | Max difference, chessboard distance |
-| `DistanceMetricType.CANBERRA` | 8 | Sensitive to small changes near zero |
-| `DistanceMetricType.MINKOWSKI` | 9 | Generalized distance metric |
-| `DistanceMetricType.ANGULAR` | 10 | Angular distance, rotation-invariant |
+| `DistanceMetricType.CHEBYSHEV` | 8 | Max difference, chessboard distance |
+| `DistanceMetricType.CANBERRA` | 9 | Sensitive to small changes near zero |
+| `DistanceMetricType.MINKOWSKI` | 10 | Generalized distance metric |
+| `DistanceMetricType.ANGULAR` | 7 | Angular distance, rotation-invariant |
 | `DistanceMetricType.BRAY_CURTIS` | 11 | Ecological data, compositional data |
 | `DistanceMetricType.HELLINGER` | 12 | Probability distributions |
 | `DistanceMetricType.CUSTOM` | 13 | Custom distance function |
