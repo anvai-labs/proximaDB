@@ -67,55 +67,175 @@ fn request_cache_scope() -> CacheScope {
         .unwrap_or(CacheScope::Shared)
 }
 
-/// TD-CACHEC-1: distinct `(tenant, collection)` series kept before new pairs
-/// fold into `("other", "other")`, so label cardinality is strictly bounded.
-const COLLECTION_SERIES_CAP: usize = 200;
+/// TD-CACHEC-1: outcome label of one logical survivor lookup, as the CACHE
+/// served it: `hot` = DRAM, `l2` = the persistent local store, `cold` = the
+/// loader ran. Some callers prefetch a range in a batched wave BEFORE the
+/// lookup and hand the bytes to the loader; if a concurrent query filled the
+/// key in between, the lookup is `hot` although that wave's GET was paid.
+/// The GET is still metered by the object-store counters; this label says
+/// which tier served the bytes, not whether a GET happened.
+const OUTCOMES: [(CacheReadOutcome, &str); 3] = [
+    (CacheReadOutcome::MemoryHit, "hot"),
+    (CacheReadOutcome::PersistentHit, "l2"),
+    (CacheReadOutcome::Loaded, "cold"),
+];
 
-/// Pairs admitted as their own series (insert-only; bounded by the cap).
-static COLLECTION_SERIES: std::sync::LazyLock<dashmap::DashSet<(String, String)>> =
-    std::sync::LazyLock::new(dashmap::DashSet::new);
-
-/// Outcome label of one logical survivor lookup: `hot` = served from DRAM
-/// (no local-disk or object-store read), `l2` = served from the persistent
-/// local store, `cold` = the authoritative loader ran.
-fn outcome_label(outcome: CacheReadOutcome) -> &'static str {
+fn outcome_index(outcome: CacheReadOutcome) -> usize {
     match outcome {
-        CacheReadOutcome::MemoryHit => "hot",
-        CacheReadOutcome::PersistentHit => "l2",
-        CacheReadOutcome::Loaded => "cold",
+        CacheReadOutcome::MemoryHit => 0,
+        CacheReadOutcome::PersistentHit => 1,
+        CacheReadOutcome::Loaded => 2,
     }
 }
 
-/// Record ONE logical lookup outcome: the per-query io_trace L1 counters (as
-/// before) and, when the search path stamped a collection, the
-/// per-collection attribution counter (TD-CACHEC-1). Outside a stamped scope
-/// (flush seeding, compaction, warm replay) nothing is attributed.
-fn record_outcome(outcome: CacheReadOutcome) {
-    let hit = outcome == CacheReadOutcome::MemoryHit;
+/// One admitted (tenant, collection) series: its three counter handles
+/// (resolved once, so the hot path does no label hashing) and when it was
+/// last read, for idle eviction.
+struct AdmittedSeries {
+    labels: [String; 2],
+    counters: [prometheus::IntCounter; 3],
+    last_seen_secs: std::sync::atomic::AtomicU64,
+}
+
+/// TD-CACHEC-1: bounded registry of per-(tenant, collection) series.
+///
+/// At most `cap` pairs hold their own series. A new pair arriving at the cap
+/// first evicts pairs idle for `idle_evict_secs` (their series are removed
+/// from the family, so a dropped or idle collection never holds a slot
+/// forever); if none are idle it counts under `other`/`other`. Admission and
+/// eviction run under one lock, so the bound is exact; the per-lookup fast
+/// path is a sharded map read.
+struct CollectionSeries {
+    family: prometheus::IntCounterVec,
+    cap: usize,
+    idle_evict_secs: u64,
+    admitted: dashmap::DashMap<(CacheScope, Arc<str>), AdmittedSeries>,
+    admit_lock: std::sync::Mutex<()>,
+    overflow: [prometheus::IntCounter; 3],
+}
+
+impl CollectionSeries {
+    fn new(family: prometheus::IntCounterVec, cap: usize, idle_evict_secs: u64) -> Self {
+        let overflow = OUTCOMES.map(|(_, o)| family.with_label_values(&["other", "other", o]));
+        Self {
+            family,
+            cap,
+            idle_evict_secs,
+            admitted: dashmap::DashMap::new(),
+            admit_lock: std::sync::Mutex::new(()),
+            overflow,
+        }
+    }
+
+    fn record(
+        &self,
+        scope: &CacheScope,
+        collection: &Arc<str>,
+        outcome: CacheReadOutcome,
+        now_secs: u64,
+    ) {
+        let idx = outcome_index(outcome);
+        let key = (scope.clone(), collection.clone());
+        if let Some(series) = self.admitted.get(&key) {
+            series
+                .last_seen_secs
+                .store(now_secs, std::sync::atomic::Ordering::Relaxed);
+            series.counters[idx].inc();
+            return;
+        }
+        let _admit = self.admit_lock.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(series) = self.admitted.get(&key) {
+            series
+                .last_seen_secs
+                .store(now_secs, std::sync::atomic::Ordering::Relaxed);
+            series.counters[idx].inc();
+            return;
+        }
+        if self.admitted.len() >= self.cap {
+            self.evict_idle(now_secs);
+        }
+        if self.admitted.len() >= self.cap {
+            self.overflow[idx].inc();
+            return;
+        }
+        let labels = [scope.label(), collection.to_string()];
+        let counters = OUTCOMES.map(|(_, o)| {
+            self.family
+                .with_label_values(&[labels[0].as_str(), labels[1].as_str(), o])
+        });
+        counters[idx].inc();
+        self.admitted.insert(
+            key,
+            AdmittedSeries {
+                labels,
+                counters,
+                last_seen_secs: std::sync::atomic::AtomicU64::new(now_secs),
+            },
+        );
+    }
+
+    /// Caller holds `admit_lock`.
+    fn evict_idle(&self, now_secs: u64) {
+        let idle: Vec<_> = self
+            .admitted
+            .iter()
+            .filter(|e| {
+                now_secs.saturating_sub(e.last_seen_secs.load(std::sync::atomic::Ordering::Relaxed))
+                    >= self.idle_evict_secs
+            })
+            .map(|e| e.key().clone())
+            .collect();
+        for key in idle {
+            if let Some((_, series)) = self.admitted.remove(&key) {
+                for (_, o) in OUTCOMES {
+                    let _ = self.family.remove_label_values(&[
+                        series.labels[0].as_str(),
+                        series.labels[1].as_str(),
+                        o,
+                    ]);
+                }
+            }
+        }
+    }
+}
+
+/// Production registry: 200 series, a pair idle for an hour gives up its slot.
+static COLLECTION_SERIES: std::sync::LazyLock<Option<CollectionSeries>> =
+    std::sync::LazyLock::new(|| {
+        crate::metrics::operational_metrics::SURVIVOR_CACHE_COLLECTION_READS_TOTAL
+            .clone()
+            .map(|family| CollectionSeries::new(family, 200, 3_600))
+    });
+
+/// Monotonic seconds since first use (idle eviction clock).
+fn monotonic_secs() -> u64 {
+    static START: std::sync::LazyLock<std::time::Instant> =
+        std::sync::LazyLock::new(std::time::Instant::now);
+    START.elapsed().as_secs()
+}
+
+/// Record ONE logical lookup: the per-query io_trace L1 counters and, inside
+/// a search that stamped its collection, the per-collection attribution
+/// counter (TD-CACHEC-1). `None` = the lookup failed: an L1 miss, never
+/// attributed. Outside a stamped search (flush seeding, compaction, warm
+/// replay) nothing is attributed.
+fn record_lookup(outcome: Option<CacheReadOutcome>) {
+    let hit = outcome == Some(CacheReadOutcome::MemoryHit);
     crate::observability::io_trace::record_survivor_l1s(u64::from(hit), u64::from(!hit));
+    let Some(outcome) = outcome else {
+        return;
+    };
     let Some(collection) = crate::observability::io_trace::current_collection_id() else {
         return;
     };
-    let Some(family) =
-        crate::metrics::operational_metrics::SURVIVOR_CACHE_COLLECTION_READS_TOTAL.as_ref()
-    else {
-        return;
-    };
-    let tenant = request_cache_scope().label();
-    let pair = (tenant, collection);
-    let admitted = COLLECTION_SERIES.contains(&pair)
-        || (COLLECTION_SERIES.len() < COLLECTION_SERIES_CAP && {
-            COLLECTION_SERIES.insert(pair.clone());
-            true
-        });
-    let (tenant, collection) = if admitted {
-        (pair.0.as_str(), pair.1.as_str())
-    } else {
-        ("other", "other")
-    };
-    family
-        .with_label_values(&[tenant, collection, outcome_label(outcome)])
-        .inc();
+    if let Some(series) = COLLECTION_SERIES.as_ref() {
+        series.record(
+            &request_cache_scope(),
+            &collection,
+            outcome,
+            monotonic_secs(),
+        );
+    }
 }
 
 /// Persistent-L2 backend wrapper that forwards each exact-key probe outcome
@@ -378,7 +498,7 @@ impl SurvivorRangeCache {
             return self.get_or_fetch(kind, path, off, len, loader).await;
         };
         if let Some((exact, outcome)) = self.inner.get_with_outcome(&exact_key).await {
-            record_outcome(outcome);
+            record_lookup(Some(outcome));
             self.sync_prometheus();
             return Ok(exact);
         }
@@ -386,7 +506,7 @@ impl SurvivorRangeCache {
         if let Some((parent, outcome)) = self.inner.get_with_outcome(&parent_key).await
             && let Some(slice) = parent.get(start..end)
         {
-            record_outcome(outcome);
+            record_lookup(Some(outcome));
             // A complete write-time seed already occupies the useful cache
             // slot. Do not admit every query-dependent slice as another exact
             // entry: doing so duplicates the region, evicts its parent, and
@@ -406,7 +526,7 @@ impl SurvivorRangeCache {
                 self.inner
                     .insert_memory_only(exact_key, weight, bytes.clone())
                     .await;
-                record_outcome(CacheReadOutcome::PersistentHit);
+                record_lookup(Some(CacheReadOutcome::PersistentHit));
                 self.sync_prometheus();
                 return Ok(bytes);
             }
@@ -420,12 +540,9 @@ impl SurvivorRangeCache {
                 Ok::<Arc<[u8]>, FilesystemError>(Arc::from(loader().await?))
             })
             .await;
-        match &result {
-            // The real outcome: a concurrent fill or the exact-key L2 can serve
-            // this lookup, so it is not always a load.
-            Ok((_, outcome)) => record_outcome(*outcome),
-            Err(_) => crate::observability::io_trace::record_survivor_l1s(0, 1),
-        }
+        // The real outcome: a concurrent fill or the exact-key L2 can serve
+        // this lookup, so it is not always a load.
+        record_lookup(result.as_ref().ok().map(|(_, outcome)| *outcome));
         self.sync_prometheus();
         result.map(|(value, _)| value)
     }
@@ -541,9 +658,7 @@ impl SurvivorRangeCache {
                 Ok::<Arc<[u8]>, FilesystemError>(Arc::from(bytes))
             })
             .await;
-        if let Ok((_, outcome)) = &result {
-            record_outcome(*outcome);
-        }
+        record_lookup(result.as_ref().ok().map(|(_, outcome)| *outcome));
         self.sync_prometheus();
         result.map(|(value, _)| value)
     }
@@ -1412,7 +1527,7 @@ mod tests {
             .get()
     }
 
-    fn has_series_for_tenant(tenant: &str) -> bool {
+    fn has_series(tenant: &str, collection: &str) -> bool {
         use prometheus::core::Collector;
         crate::metrics::operational_metrics::SURVIVOR_CACHE_COLLECTION_READS_TOTAL
             .as_ref()
@@ -1421,16 +1536,22 @@ mod tests {
             .iter()
             .flat_map(|family| family.get_metric().iter())
             .any(|m| {
-                m.get_label()
-                    .iter()
-                    .any(|l| l.name() == "tenant_id" && l.value() == tenant)
+                let label = |name: &str| {
+                    m.get_label()
+                        .iter()
+                        .find(|l| l.name() == name)
+                        .map(|l| l.value().to_string())
+                };
+                label("tenant_id").as_deref() == Some(tenant)
+                    && label("collection_id").as_deref() == Some(collection)
             })
     }
 
-    /// A stamped search scope attributes each logical lookup to its
-    /// (tenant, catalog collection) with the real outcome: the loader ran
-    /// (`cold`), DRAM served it (`hot`), the persistent store served it after
-    /// L1 was lost (`l2`).
+    /// A stamped search attributes each logical lookup to its (tenant,
+    /// catalog collection) with the real outcome: the loader ran (`cold`),
+    /// DRAM served it (`hot`), the persistent store served it after L1 was
+    /// lost (`l2`). A lookup after the search's stamp is dropped is not
+    /// attributed.
     #[tokio::test]
     async fn collection_reads_attribute_hot_l2_and_cold_outcomes() {
         let dir = tempfile::tempdir().expect("test tempdir");
@@ -1443,22 +1564,36 @@ mod tests {
             Some(910_001),
             "test",
             async {
-                crate::observability::io_trace::set_current_collection_id("cachec1-outcomes");
-                for cache in [&warm, &warm, &fresh] {
-                    cache
-                        .get_or_fetch(CacheKind::Other, "seg.pax", 64, 4, || async {
-                            Ok(vec![1, 2, 3, 4])
-                        })
-                        .await
-                        .expect("lookup");
+                {
+                    let _stamp = crate::observability::io_trace::stamp_current_collection_id(
+                        "cachec1-outcomes",
+                    );
+                    for cache in [&warm, &warm, &fresh] {
+                        cache
+                            .get_or_fetch(CacheKind::Other, "seg.pax", 64, 4, || async {
+                                Ok(vec![1, 2, 3, 4])
+                            })
+                            .await
+                            .expect("lookup");
+                    }
                 }
+                // After the search: unattributed.
+                warm.get_or_fetch(CacheKind::Other, "seg.pax", 64, 4, || async {
+                    Ok(vec![1, 2, 3, 4])
+                })
+                .await
+                .expect("lookup");
             },
         )
         .await;
         let t = "910001";
         let c = "cachec1-outcomes";
         assert_eq!(collection_reads(t, c, "cold"), 1, "first lookup loads");
-        assert_eq!(collection_reads(t, c, "hot"), 1, "second lookup is DRAM");
+        assert_eq!(
+            collection_reads(t, c, "hot"),
+            1,
+            "second lookup is DRAM; none after the stamp"
+        );
         assert_eq!(
             collection_reads(t, c, "l2"),
             1,
@@ -1466,8 +1601,8 @@ mod tests {
         );
     }
 
-    /// Without a collection stamp (flush seeding, compaction, warm replay, or a
-    /// scope the search path never stamped) nothing is attributed.
+    /// Without a collection stamp (flush seeding, compaction, warm replay, or
+    /// a surface that opens no search stamp) nothing is attributed.
     #[tokio::test]
     async fn collection_reads_require_a_collection_stamp() {
         let cache = SurvivorRangeCache::new(1 << 20);
@@ -1485,37 +1620,63 @@ mod tests {
             },
         )
         .await;
-        assert!(!has_series_for_tenant("910002"));
+        use prometheus::core::Collector;
+        let any_for_tenant =
+            crate::metrics::operational_metrics::SURVIVOR_CACHE_COLLECTION_READS_TOTAL
+                .as_ref()
+                .expect("family")
+                .collect()
+                .iter()
+                .flat_map(|f| f.get_metric().iter())
+                .any(|m| {
+                    m.get_label()
+                        .iter()
+                        .any(|l| l.name() == "tenant_id" && l.value() == "910002")
+                });
+        assert!(!any_for_tenant);
     }
 
-    /// Label cardinality is bounded: once the cap of distinct (tenant,
-    /// collection) pairs is reached, a new pair counts under `other`/`other`
-    /// and never gets its own series.
-    #[tokio::test]
-    async fn collection_series_cap_folds_new_pairs_into_other() {
-        crate::observability::io_trace::instrument_with_stable_tenant(
-            Some("t".to_string()),
-            Some(910_003),
-            "test",
-            async {
-                let mut i = 0usize;
-                while COLLECTION_SERIES.len() < COLLECTION_SERIES_CAP {
-                    crate::observability::io_trace::set_current_collection_id(&format!(
-                        "cachec1-fill-{i}"
-                    ));
-                    record_outcome(CacheReadOutcome::Loaded);
-                    i += 1;
-                }
-                let before = collection_reads("other", "other", "cold");
-                crate::observability::io_trace::set_current_collection_id("cachec1-overflow");
-                record_outcome(CacheReadOutcome::Loaded);
-                assert_eq!(collection_reads("other", "other", "cold"), before + 1);
-            },
+    fn registry(cap: usize, idle: u64) -> CollectionSeries {
+        CollectionSeries::new(
+            crate::metrics::operational_metrics::SURVIVOR_CACHE_COLLECTION_READS_TOTAL
+                .clone()
+                .expect("family"),
+            cap,
+            idle,
         )
-        .await;
-        assert_eq!(COLLECTION_SERIES.len(), COLLECTION_SERIES_CAP);
-        assert!(
-            !COLLECTION_SERIES.contains(&("910003".to_string(), "cachec1-overflow".to_string()))
-        );
+    }
+
+    /// At the cap a new pair folds into `other`/`other` and gets no series
+    /// of its own (the bound is exact: admission is under one lock).
+    #[test]
+    fn collection_series_cap_folds_new_pairs_into_other() {
+        let reg = registry(2, 3_600);
+        let scope = CacheScope::stable_tenant(910_003);
+        let c = |s: &str| -> Arc<str> { Arc::from(s) };
+        reg.record(&scope, &c("cachec1-cap-a"), CacheReadOutcome::Loaded, 0);
+        reg.record(&scope, &c("cachec1-cap-b"), CacheReadOutcome::Loaded, 0);
+        let before = collection_reads("other", "other", "cold");
+        reg.record(&scope, &c("cachec1-cap-c"), CacheReadOutcome::Loaded, 10);
+        assert_eq!(collection_reads("other", "other", "cold"), before + 1);
+        assert_eq!(reg.admitted.len(), 2);
+        assert!(!has_series("910003", "cachec1-cap-c"));
+        assert!(has_series("910003", "cachec1-cap-a"));
+    }
+
+    /// A pair idle past the eviction window gives up its slot (and its series
+    /// leaves the family), so dropped collections never pin the cap forever.
+    #[test]
+    fn idle_collection_series_are_evicted_to_admit_new_pairs() {
+        let reg = registry(1, 100);
+        let scope = CacheScope::stable_tenant(910_004);
+        let old: Arc<str> = Arc::from("cachec1-idle-old");
+        let new: Arc<str> = Arc::from("cachec1-idle-new");
+        reg.record(&scope, &old, CacheReadOutcome::MemoryHit, 0);
+        reg.record(&scope, &new, CacheReadOutcome::MemoryHit, 50); // not idle yet: folded
+        assert!(!has_series("910004", "cachec1-idle-new"));
+        reg.record(&scope, &new, CacheReadOutcome::MemoryHit, 150); // old idle 150s: evicted
+        assert!(!has_series("910004", "cachec1-idle-old"));
+        assert_eq!(collection_reads("910004", "cachec1-idle-new", "hot"), 1);
+        assert_eq!(reg.admitted.len(), 1);
     }
 }

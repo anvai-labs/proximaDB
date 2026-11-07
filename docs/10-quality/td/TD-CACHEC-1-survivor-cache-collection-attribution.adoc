@@ -22,22 +22,35 @@ GETs were unbilled.
 
 == Fix
 
-* `IoTrace` carries an always-compiled `collection_id`, stamped once by
-  `unified_search_v1_inner` with the immutable catalog `CollectionObjectId`
-  (never the mutable name), right after the catalog resolves it. Every search
-  surface (REST v2, gRPC v2, Flight, v1, AQL, MCP, the SQL executor) converges
-  there. Spawned scan tasks rebind the same `Arc<IoTrace>`, so they see it.
-* `survivor_range_cache::record_outcome` is the single recording point for one
-  logical lookup (it replaced the five inline `record_survivor_l1s` sites). The
-  in-parent loader site now records the REAL outcome: it hard-coded a miss even
-  when a concurrent fill or the exact-key L2 served the lookup.
+* `IoTrace` carries an always-compiled `collection_id`. `unified_search_v1_inner`
+  stamps it with the immutable catalog `CollectionObjectId` (never the mutable
+  name) right after the catalog resolves it, through a guard
+  (`stamp_current_collection_id`) that restores the previous value when the
+  search returns. Reads after that search, or of the next collection in the
+  same scope, are never credited to it. Spawned scan tasks rebind the same
+  `Arc<IoTrace>`, so they see the stamp.
+* `survivor_range_cache::record_lookup` is the single recording point for one
+  logical lookup (it replaced the five inline `record_survivor_l1s` sites; both
+  lookup seams now treat a failed load the same way: an L1 miss, never
+  attributed). The in-parent loader site records the REAL outcome: it
+  hard-coded a miss even when a concurrent fill or the exact-key L2 served the
+  lookup. That fix only matters under a concurrent-fill race, so it is not
+  pinned by a deterministic test.
 * `proximadb_survivor_cache_collection_reads_total{tenant_id, collection_id,
   outcome}` with outcome `hot` (DRAM), `l2` (persistent local store) or `cold`
   (the loader ran). It holds true counters and only counts inside a stamped
   scope, so flush seeding, compaction and warm replay are never attributed.
   `tenant_id` uses the same label as the per-tenant survivor series (stable id,
-  or `shared`). At most 200 distinct (tenant, collection) pairs get their own
-  series; later pairs count under `other`/`other`.
+  or `shared`). At most 200 (tenant, collection) pairs hold their own series
+  (admission is under one lock, so the bound is exact). A new pair arriving at
+  the cap first evicts pairs idle for an hour, removing their series, so
+  dropped collections never pin the cap. If none are idle, the new pair counts
+  under `other`/`other`. Counter handles are resolved once per pair, so the
+  per-lookup path does no label hashing.
+* `hot` means the cache served the bytes from DRAM. Some callers prefetch a
+  range in a batched wave before the lookup; if a concurrent query filled the
+  key meanwhile, the lookup is `hot` though the wave's GET was paid. That GET is
+  still metered by the object-store counters.
 * gRPC v2 `search` / `search_stream` run inside
   `instrument_with_stable_tenant` with the authenticated port identity
   (`grpc_auth::port_identity`, the same identity the request is authorised
@@ -55,11 +68,21 @@ Hot-hit ratio per collection = `hot / (hot + l2 + cold)`.
   shared-scoped), and a persistent-L2 hit counts as an L1 miss. Prefer the new
   per-collection counter for ratios; aligning the tenant series to logical
   lookups is follow-up work.
-* The cap is admission-ordered (first 200 pairs win), not ranked by traffic,
-  and the admission check is not atomic. Concurrent first lookups can admit a
-  few pairs past 200, bounded by the number of concurrent queries.
-* A scope that reads several collections (AQL/SQL joining two vector
-  collections) attributes reads to the most recently stamped one.
+* Attribution needs a request io_trace scope. Today only REST v2 records
+  search, gRPC v2 search / search_stream, Arrow Flight and pgwire open one.
+  REST v1, AQL, MCP, fusion search, gRPC entity search and `execute_query`
+  open no scope (where they reach `unified_search_v1_inner` the stamp is a
+  no-op), so their reads (and their KRU / object-store meters) are not
+  recorded. Opening scopes there is a billing
+  change per surface and is follow-up work. gRPC still records no egress (KOU)
+  inside its scope, unlike REST v2.
+* Admission is first-come among non-idle pairs, not ranked by traffic; a
+  busy 201st pair counts under `other` until some pair idles for an hour.
+* Rejected alternative: deriving tenant and collection from the DrPath inside
+  the cache key. Legacy `{base}/{id}/data/` and typed
+  `accounts/{a}/{n}/{c}/data/` layouts coexist and can flip at restart, and
+  the key carries no catalog id in the legacy layout, so parsing it would
+  attribute by path shape rather than identity.
 * pgwire scopes carry no stable tenant id, so their reads label as `shared`
   (pre-existing; same as the tenant series).
 
