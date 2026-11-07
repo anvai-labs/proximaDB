@@ -1169,10 +1169,7 @@ async fn sift_coalesced_rabitq_scan_rerank_eval() {
         "sift_coalesced_eval",
         temp_dir.path().to_string_lossy().into_owned(),
     );
-    let engine = SstEngine::new().await.unwrap()
-        .with_directory_cache(Arc::new(
-            proximadb::storage::engines::sst::object_economy_directory::VectorObjectEconomyDirectoryCache::new(),
-        ));
+    let engine = SstEngine::new().await.unwrap();
     // ADR-065 Q3: opt-in ranged survivor/OID cache. Set
     // PROXIMADB_SURVIVOR_CACHE_BUDGET_MB (default unset → uncached baseline) to
     // measure the GET/bytes win on the repeated-query working set.

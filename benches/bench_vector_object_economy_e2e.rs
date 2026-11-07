@@ -8,7 +8,8 @@
 //!
 //! Counterpart to `bench_vector_object_economy.rs`, which measures
 //! the building-block CPU costs in isolation. This bench drives the
-//! full directory-routed read path: SstEngine + flush + searches
+//! full SST read path (no directory routing since TD-OEDIRWM-1):
+//! SstEngine + flush + searches
 //! against a tempdir-backed local filesystem.
 //!
 //! Output is intentionally shaped to be compared head-to-head with
@@ -20,8 +21,10 @@
 //! ## What this bench measures
 //!
 //! * **Insert + flush throughput** — how long it takes to land N
-//!   synthetic vectors and trigger the SST flush that populates the
-//!   per-collection object-economy directory.
+//!   synthetic vectors and trigger the SST flush. (This bench's engine
+//!   never wired the directory cache, so it never wrote the
+//!   object-economy sidecar — TD-OEDIRWM-1's retirement does not change
+//!   what it measures.)
 //! * **Cold p50/p99 query latency** — first query against a freshly
 //!   constructed engine. Page cache cold, index cold, block cache cold.
 //! * **Warm p50/p99 query latency** — subsequent queries against the
@@ -40,9 +43,10 @@
 //!   yields 100% recall by definition. Adding an approximate-mode
 //!   recall measurement against SIFT/GIST ground truth is a separate
 //!   slice.
-//! * **WAL delta merge cost** — there are no in-flight writes during
-//!   the search loop, so the strong-route delta scan exits early
-//!   (current_lsn ≤ watermark). Measuring the merge cost under
+//! * **WAL delta merge cost** — NOT measured: this bench calls the
+//!   engine's `search_vectors_unified` directly, so the service-level
+//!   delta scan + merge (`VectorOperationsService`) never runs. Measuring
+//!   the merge cost under
 //!   concurrent write + read load is a separate slice.
 //!
 //! ## Scale control

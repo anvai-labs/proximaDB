@@ -360,23 +360,6 @@ pub struct SstEngine {
         >,
     >,
 
-    /// **Vector Object Economy Directory Cache** (Optional, Phase 4)
-    ///
-    /// Process-wide per-collection cache populated by the read-side and
-    /// invalidated by the writer/compactor. When `Some`, the SST engine's
-    /// flush implementation emits a directory entry after each
-    /// successful atomic commit and calls `cache.invalidate(collection_id)`
-    /// so the next reader sees the new file.
-    ///
-    /// When `None` (default), directory emission is skipped entirely —
-    /// no path derivation, no fallback inference. Pre-existing call
-    /// sites are unaffected until they opt in via
-    /// [`Self::with_directory_cache`].
-    directory_cache: Option<
-        Arc<
-            crate::storage::engines::sst::object_economy_directory::VectorObjectEconomyDirectoryCache,
-        >,
-    >,
     /// PR2: per-segment invariants cache (header+region+footer). Hot queries
     /// skip the 3 read_range calls → 3 GETs → 0.
     pub(crate) segment_invariants_cache:
@@ -420,21 +403,19 @@ pub struct SstEngine {
     /// When `None` (default), all these calls become no-ops — preserving
     /// the legacy "everything is hot" behavior until an operator opts in
     /// via [`Self::with_tiering_integration`] and config enables it.
-    tiering_integration: Option<
-        Arc<crate::storage::engines::sst::tiering_integration::SstTieringIntegration>,
-    >,
+    tiering_integration:
+        Option<Arc<crate::storage::engines::sst::tiering_integration::SstTieringIntegration>>,
 
-    /// **Vector Object Economy Freshness Source** (Optional, Phase 5)
+    /// **Committed-LSN source** (Optional)
     ///
-    /// Provides the "current committed LSN" used as the directory's
-    /// `freshness_watermark_lsn` at emission time. When `None`, the
-    /// emit path uses `0` — a conservative value that forces strong-route
-    /// readers to always re-scan the WAL delta. Wired by
-    /// `SharedServices::new` with a `WalCursorLsnSource` that delegates
-    /// to the global manifest service.
-    freshness_lsn_source: Option<
-        Arc<dyn crate::storage::engines::sst::object_economy_directory::FreshnessLsnSource>,
-    >,
+    /// Provides the collection's "current committed LSN". Read only by the
+    /// `cold-deletion-vectors` search path, which stamps it as the snapshot
+    /// LSN for deletion-vector visibility. (It formerly also fed the
+    /// object-economy directory sidecar's freshness watermark; that sidecar
+    /// write was retired — TD-OEDIRWM-1.) Wired by `SharedServices::new` with
+    /// a `WalCursorLsnSource` that delegates to the global manifest service.
+    freshness_lsn_source:
+        Option<Arc<dyn crate::storage::engines::sst::object_economy_directory::FreshnessLsnSource>>,
 
     /// DIP storage-URL resolver (optional). When set, `get_collection_storage_url`
     /// resolves the collection's real `base_location` through it (catalog → config
@@ -789,7 +770,6 @@ impl SstEngine {
             orchestrator,
             axis_manager,
             pca_model_cache: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
-            directory_cache: None,
             segment_invariants_cache,
             survivor_cache,
             #[cfg(feature = "cold-deletion-vectors")]
@@ -829,21 +809,6 @@ impl SstEngine {
         self.tiering_integration.as_ref()
     }
 
-    /// Attach the Vector Object Economy per-collection directory cache.
-    /// Called by `SharedServices::new` so the engine's flush path can
-    /// emit directory updates and invalidate the read-side cache after
-    /// each successful atomic commit. When unset (default), directory
-    /// emission is skipped.
-    pub fn with_directory_cache(
-        mut self,
-        cache: Arc<
-            crate::storage::engines::sst::object_economy_directory::VectorObjectEconomyDirectoryCache,
-        >,
-    ) -> Self {
-        self.directory_cache = Some(cache);
-        self
-    }
-
     /// Replace both query-side warm tiers as one policy boundary. Passing
     /// `None` explicitly disables a tier, which keeps paired benchmarks from
     /// inheriting process-global cache state accidentally.
@@ -861,29 +826,8 @@ impl SstEngine {
         self
     }
 
-    /// True when [`Self::with_directory_cache`] has supplied a cache.
-    /// Regression-tested so the default (no emission) cannot silently
-    /// flip to "always emit."
-    pub fn directory_cache_configured(&self) -> bool {
-        self.directory_cache.is_some()
-    }
-
-    /// Borrow the configured cache, if any. Used by the flush
-    /// implementation to construct hooks at the call site.
-    pub(crate) fn directory_cache_ref(
-        &self,
-    ) -> Option<
-        &Arc<
-            crate::storage::engines::sst::object_economy_directory::VectorObjectEconomyDirectoryCache,
-        >,
-    >{
-        self.directory_cache.as_ref()
-    }
-
-    /// Attach the [`FreshnessLsnSource`] used to populate the directory's
-    /// `freshness_watermark_lsn` at emission time. When unset (default),
-    /// the engine emits `0` — making strong-route readers always re-scan
-    /// the WAL delta.
+    /// Attach the committed-LSN [`FreshnessLsnSource`] (see the
+    /// `freshness_lsn_source` field).
     pub fn with_freshness_lsn_source(
         mut self,
         source: Arc<dyn crate::storage::engines::sst::object_economy_directory::FreshnessLsnSource>,
@@ -905,14 +849,15 @@ impl SstEngine {
     }
 
     /// True when [`Self::with_freshness_lsn_source`] has supplied a
-    /// source. Used by tests/operators to confirm wiring.
+    /// source. (No in-tree caller today; kept as the public wiring probe
+    /// until the TD-OEDIRWM-1 module cleanup gates the source.)
     pub fn freshness_lsn_source_configured(&self) -> bool {
         self.freshness_lsn_source.is_some()
     }
 
-    /// Borrow the configured freshness source, if any. Used by the
-    /// flush implementation to resolve the watermark before constructing
-    /// hooks.
+    /// Borrow the configured committed-LSN source, if any. Only the
+    /// `cold-deletion-vectors` search path reads it.
+    #[cfg(feature = "cold-deletion-vectors")]
     pub(crate) fn freshness_lsn_source_ref(
         &self,
     ) -> Option<&Arc<dyn crate::storage::engines::sst::object_economy_directory::FreshnessLsnSource>>
