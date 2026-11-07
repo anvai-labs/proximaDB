@@ -256,41 +256,6 @@ impl ZeroCopyIOSystem {
         Ok(system)
     }
 
-    /// Create orchestrator with all engine serializers registered
-    pub async fn with_all_engines(
-        config: ZeroCopyIOConfig,
-        filesystem: Arc<FilesystemFactory>,
-    ) -> Result<Self, ProximaDBError> {
-        // Import all engine serializers
-        use crate::storage::engines::core::formats::columnar::nova_metadata::NovaMetadataSerializer;
-        use crate::storage::engines::core::formats::columnar::parquet_metadata::ParquetMetadataSerializer;
-        use crate::storage::engines::core::formats::proximablocks::sst_metadata::SstMetadataSerializer;
-        use crate::storage::engines::core::formats::proximablocks::swift_metadata::SwiftMetadataSerializer;
-
-        // Create all engine serializers
-        let serializers: Vec<Box<dyn MetadataSerializer>> = vec![
-            Box::new(SstMetadataSerializer::new(
-                filesystem.clone() as Arc<dyn proximadb_storage_ports::FilesystemPort>
-            )),
-            Box::new(SwiftMetadataSerializer::new(
-                filesystem.clone() as Arc<dyn proximadb_storage_ports::FilesystemPort>
-            )),
-            Box::new(ParquetMetadataSerializer::new(
-                filesystem.clone() as Arc<dyn proximadb_storage_ports::FilesystemPort>
-            )),
-            Box::new(NovaMetadataSerializer::new(
-                filesystem.clone() as Arc<dyn proximadb_storage_ports::FilesystemPort>
-            )),
-        ];
-
-        info!(
-            "Creating zero-copy I/O orchestrator with {} engine serializers",
-            serializers.len()
-        );
-
-        Self::new(config, filesystem, serializers).await
-    }
-
     /// Optimize single file access
     pub async fn optimize_file_access(
         &self,

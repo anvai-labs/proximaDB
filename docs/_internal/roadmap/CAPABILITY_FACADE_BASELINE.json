@@ -1,5 +1,5 @@
 {
-  "total": 1035,
+  "total": 1028,
   "by_file": {
     "apps/proximadb-migrate/src/main.rs": 2,
     "crates/binding/proximadb-embedded/src/lib.rs": 9,
@@ -103,12 +103,10 @@
     "crates/storage/proximadb-engine-core/src/proximablocks/columnar_serialization.rs": 4,
     "crates/storage/proximadb-engine-core/src/proximablocks/columnar_utilities.rs": 2,
     "crates/storage/proximadb-engine-core/src/proximablocks/index_structures.rs": 2,
-    "crates/storage/proximadb-engine-core/src/proximablocks/nova_metadata.rs": 5,
     "crates/storage/proximadb-engine-core/src/proximablocks/parquet_metadata.rs": 2,
     "crates/storage/proximadb-engine-core/src/proximablocks/spatial_traits.rs": 1,
     "crates/storage/proximadb-engine-core/src/proximablocks/sst_io_layer.rs": 4,
     "crates/storage/proximadb-engine-core/src/proximablocks/sst_metadata.rs": 2,
-    "crates/storage/proximadb-engine-core/src/proximablocks/swift_metadata.rs": 2,
     "crates/storage/proximadb-engine-core/src/proximablocks/utilities.rs": 4,
     "crates/storage/proximadb-engine-core/src/sst_format_types.rs": 1,
     "crates/storage/proximadb-engine-core/src/testutil.rs": 1,

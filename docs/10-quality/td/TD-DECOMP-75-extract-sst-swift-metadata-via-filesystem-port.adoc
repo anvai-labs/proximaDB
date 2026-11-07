@@ -22,3 +22,9 @@ link:TD-DECOMP-76-extract-factory-coupled-wave2.adoc[TD-DECOMP-76]–link:TD-DEC
 * Caveat that still applies: swift's `extract_metadata` is a PLACEHOLDER (synthesizes a header, never reads
   the filesystem; still true 2026-10-15), so its tests inject a no-op port (`test_fs_port::noop_port`).
   When it gains a real read path, those tests must switch back to a real filesystem.
+* Resolved (2026-11-07): `swift_metadata.rs` is DELETED. The caveat above outlived the module's
+  usefulness — swift's serializer only ever fabricated placeholder metadata, and its sole registration
+  path (`ZeroCopyIOSystem::with_all_engines`, zero callers repo-wide) died in the same change. If a real
+  Swift metadata read path is ever built, it belongs in the builder's `register_default_serializers`
+  (`config.rs`), not a second divergent registration path. `sst_metadata.rs` survives with its read path
+  and a new encode→decode round-trip test.
