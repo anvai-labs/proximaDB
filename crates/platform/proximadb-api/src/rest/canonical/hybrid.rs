@@ -30,38 +30,6 @@ pub struct HybridRestState {
     pub bm25_port: Option<Arc<dyn BM25IndexPort>>,
 }
 
-// ── Legacy stub types kept for re-export compatibility ────────────────────────
-
-/// Hybrid search handler stub.
-pub struct HybridSearchHandler;
-
-impl HybridSearchHandler {
-    pub fn new() -> Self {
-        Self
-    }
-}
-
-impl Default for HybridSearchHandler {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// Progressive search handler stub.
-pub struct ProgressiveSearchHandler;
-
-impl ProgressiveSearchHandler {
-    pub fn new() -> Self {
-        Self
-    }
-}
-
-impl Default for ProgressiveSearchHandler {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 // ── Hybrid search request/response types ──────────────────────────────────────
 
 /// Request body for `POST /api/v2/hybrid/search`.
@@ -521,8 +489,6 @@ mod tests {
     #[test]
     fn default_top_k_and_legacy_handler_stubs_construct() {
         assert_eq!(default_top_k(), 10);
-        let _hybrid = HybridSearchHandler;
-        let _progressive = ProgressiveSearchHandler::new();
         let _hybrid_router = create_hybrid_search_router();
     }
 

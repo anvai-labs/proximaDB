@@ -66,32 +66,6 @@ pub struct GraphRestState {
     pub graph_port: Arc<dyn GraphPort>,
 }
 
-// ── Handler marker structs ────────────────────────────────────────────────────
-
-pub struct GraphHandler;
-pub struct GraphTraversalHandler;
-
-impl GraphHandler {
-    pub fn new() -> Self {
-        Self
-    }
-}
-impl Default for GraphHandler {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-impl GraphTraversalHandler {
-    pub fn new() -> Self {
-        Self
-    }
-}
-impl Default for GraphTraversalHandler {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 // ── Canonical response types (inlined — no root-crate dep) ───────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2679,7 +2653,5 @@ mod tests {
         );
 
         let _router = create_graph_router();
-        let _graph_handler = GraphHandler;
-        let _traversal_handler = GraphTraversalHandler::new();
     }
 }
