@@ -293,6 +293,15 @@ impl PersistentByteStore {
         Some(meta.value_len)
     }
 
+    /// Test support: an entry's LRU recency tick.
+    #[cfg(test)]
+    fn touch_of(&self, key: &str) -> Option<u64> {
+        self.inner
+            .entries
+            .get(key)
+            .map(|meta| meta.touch.load(Ordering::Relaxed))
+    }
+
     /// Whether any protection group is registered (lock-free). With none,
     /// no grant asks for residency (SC4-4 read fast path).
     pub fn policy_active(&self) -> bool {
@@ -900,10 +909,6 @@ impl PersistentByteStore {
 
         if let Some(meta) = write_meta {
             let file_len = meta.file_len;
-            // A new entry is the most recently used (TD-IOBUDGET-3): with the
-            // default tick of 1 it tied every never-read entry and lost the LRU
-            // race to hash order — including to entries it should outlive.
-            meta.touch.store(self.next_tick(), Ordering::Relaxed);
             if let Some(old) = self.inner.entries.insert(key, Arc::new(meta)) {
                 self.inner
                     .resident_bytes
@@ -925,10 +930,6 @@ impl PersistentByteStore {
                     .fetch_add(meta.file_len, Ordering::Relaxed);
                 self.inner.class_resident_bytes[meta.class as usize]
                     .fetch_add(meta.file_len, Ordering::Relaxed);
-                // A new entry is the most recently used (TD-IOBUDGET-3): with the
-                // default tick of 1 it tied every never-read entry and lost the LRU
-                // race to hash order — including to entries it should outlive.
-                meta.touch.store(self.next_tick(), Ordering::Relaxed);
                 self.inner.entries.insert(key, Arc::new(meta));
             }
         }
@@ -996,10 +997,6 @@ impl PersistentByteStore {
 
         if let Some(meta) = write_meta {
             let file_len = meta.file_len;
-            // A new entry is the most recently used (TD-IOBUDGET-3): with the
-            // default tick of 1 it tied every never-read entry and lost the LRU
-            // race to hash order — including to entries it should outlive.
-            meta.touch.store(self.next_tick(), Ordering::Relaxed);
             if let Some(old) = self.inner.entries.insert(key, Arc::new(meta)) {
                 self.inner
                     .resident_bytes
@@ -1020,10 +1017,6 @@ impl PersistentByteStore {
                 .fetch_add(meta.file_len, Ordering::Relaxed);
             self.inner.class_resident_bytes[meta.class as usize]
                 .fetch_add(meta.file_len, Ordering::Relaxed);
-            // A new entry is the most recently used (TD-IOBUDGET-3): with the
-            // default tick of 1 it tied every never-read entry and lost the LRU
-            // race to hash order — including to entries it should outlive.
-            meta.touch.store(self.next_tick(), Ordering::Relaxed);
             self.inner.entries.insert(key, Arc::new(meta));
         }
         self.protect_on_admit(&admit_key);
@@ -1133,8 +1126,13 @@ impl PersistentByteStore {
         removed
     }
 
+    /// Recency tick for a READ or classification. Always >= 2: new entries
+    /// (and entries restored at open) sit at touch 1, so any entry that has
+    /// been read or classified resident since outranks every never-read one
+    /// in LRU eviction (scan resistance), with no tie against them to fall
+    /// to hash order (TD-IOBUDGET-3).
     fn next_tick(&self) -> u64 {
-        self.inner.clock.fetch_add(1, Ordering::Relaxed)
+        self.inner.clock.fetch_add(1, Ordering::Relaxed) + 1
     }
 
     fn entry_path(&self, key: &str) -> PathBuf {
@@ -1908,6 +1906,29 @@ mod tests {
     use std::io::{Seek, SeekFrom, Write};
     use std::sync::Arc;
 
+    /// TD-IOBUDGET-3: a never-read entry sits at tick 1; classification
+    /// (`touch_entry_len`) and reads tick strictly above it, even on a fresh
+    /// store whose clock has not advanced.
+    #[tokio::test]
+    async fn classification_ticks_above_every_never_read_entry() {
+        let dir = tempfile::tempdir().expect("test tempdir");
+        let store = PersistentByteStore::open(dir.path(), 1 << 20).expect("open");
+        let value: Arc<[u8]> = Arc::from(vec![1u8; 64].as_slice());
+        for key in ["a", "b"] {
+            store
+                .put(key, L2Class::Survivor, value.clone())
+                .await
+                .expect("put");
+        }
+        assert_eq!(store.touch_of("a"), Some(1), "a new entry is never-read");
+        assert_eq!(store.touch_entry_len("a"), Some(64));
+        let classified = store.touch_of("a").expect("indexed");
+        assert!(
+            classified > store.touch_of("b").expect("indexed"),
+            "classified entry {classified} must outrank the never-read tick"
+        );
+    }
+
     /// TD-IOBUDGET-3: `touch_entry_len` refreshes recency without a read, so
     /// a classified-resident entry outlives an older untouched one when the
     /// next write-through forces an eviction.
@@ -1938,9 +1959,13 @@ mod tests {
             store.entry_len("a").is_some(),
             "the touched entry must survive"
         );
-        assert!(
-            store.entry_len("b").is_none(),
-            "the untouched LRU entry is evicted"
+        // `c` and the untouched `b` both sit at the never-read tick, so which
+        // of them goes is unspecified; the classified entry must not.
+        assert_eq!(
+            usize::from(store.entry_len("b").is_some())
+                + usize::from(store.entry_len("c").is_some()),
+            1,
+            "exactly one never-read entry is evicted"
         );
     }
 

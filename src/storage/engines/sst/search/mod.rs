@@ -290,6 +290,13 @@ pub fn morsel_degree() -> usize {
     if inflight == 1 { cores } else { 1 }
 }
 
+/// `PROXIMADB_SEARCH_PARALLEL_FILES`, when set to a parsable degree.
+fn env_parallel_override() -> Option<u16> {
+    std::env::var("PROXIMADB_SEARCH_PARALLEL_FILES")
+        .ok()
+        .and_then(|v| v.trim().parse::<u16>().ok())
+}
+
 /// TD-SEARCH-2: resolve the inter-file search parallelism degree.
 ///
 /// Config field `search_parallel_files` (from `[storage.optimization]` in TOML):
@@ -304,9 +311,7 @@ pub fn morsel_degree() -> usize {
 /// over the config field — operators can tune without a restart.
 fn resolve_search_parallelism(config_value: u16) -> u16 {
     // Env override (hot-path tuning)
-    if let Ok(v) = std::env::var("PROXIMADB_SEARCH_PARALLEL_FILES")
-        && let Ok(n) = v.trim().parse::<u16>()
-    {
+    if let Some(n) = env_parallel_override() {
         return resolve_parallel_degree(n);
     }
     // Production has no in-flight back-off (TD-SCANDEG-1); the S2b division
@@ -319,12 +324,7 @@ fn resolve_search_parallelism(config_value: u16) -> u16 {
 #[cfg(test)]
 fn resolve_arc_search_parallelism(config_value: u16) -> u16 {
     let base = resolve_search_parallelism(config_value);
-    // Mirror resolve_search_parallelism: only a PARSABLE env value overrides.
-    let env_override = std::env::var("PROXIMADB_SEARCH_PARALLEL_FILES")
-        .ok()
-        .and_then(|v| v.trim().parse::<u16>().ok())
-        .is_some();
-    if config_value == 0 && !env_override {
+    if config_value == 0 && env_parallel_override().is_none() {
         adaptive_degree(
             base,
             IN_FLIGHT_SEARCHES.load(std::sync::atomic::Ordering::Relaxed),
