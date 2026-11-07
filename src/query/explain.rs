@@ -228,7 +228,9 @@ pub struct VectorObjectEconomyExplain {
     pub freshness_mode_used: Option<String>,
     /// WAL cursor read when the delta scan ran. Informational only: no
     /// watermark gates the scan since TD-OEDIRWM-1. `None` when the cursor
-    /// was not read (StaleOk, or no manifest service registered).
+    /// was not read (StaleOk, or no manifest service registered) — in that
+    /// case the field is OMITTED from serialized payloads (`null` never
+    /// appears), so key-presence is the signal for integrators.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_lsn_at_query: Option<u64>,
 }

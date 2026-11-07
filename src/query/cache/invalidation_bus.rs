@@ -16,9 +16,11 @@
 //!   write (TD-CACHE-10's original constraint).
 //! * **Subscribe** (every other pod): consumer group keyed by pod id; each
 //!   admitted event drives
-//!   `CacheInvalidationCoordinator::invalidate_collection`. (It formerly also
-//!   dropped the object-economy directory cache; no server component creates
-//!   that cache since TD-OEDIRWM-1.)
+//!   `CacheInvalidationCoordinator::invalidate_collection`. (The bus has no
+//!   production subscriber — the only production caller that ever dropped
+//!   the object-economy directory cache was the writer-side
+//!   `SstableWriterDirectoryHooks::emit_after_flush`, whose call site this
+//!   retirement removes; see TD-OEDIRWM-1.)
 //!
 //! Ordering/dedup: `GlobalLsnAllocator` LSNs are PER-POD monotonic atomics,
 //! so events carry `(pod_id, lsn)` and admission is "lsn strictly greater

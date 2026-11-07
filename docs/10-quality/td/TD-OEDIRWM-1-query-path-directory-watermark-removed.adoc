@@ -91,7 +91,9 @@ SST collections `directory_format_present` goes `true → false` (it now means
 `route_hint` goes `"object_economy" → null`, `eligible` goes `true → false`
 and `live_status` goes `"not_checked" → "not_applicable"` — the route is
 not applicable to any engine. EXPLAIN reports `current_lsn_at_query: None` when the WAL
-cursor was not read, instead of 0 — and the `proximadb.vector_route.explain`
+cursor was not read, instead of 0 — serialized as the field's ABSENCE
+(`skip_serializing_if`), never `null`, so key-presence distinguishes
+"cursor not read" from a truncated payload — and the `proximadb.vector_route.explain`
 trace event's `current_lsn` field is now Debug-formatted (`Some(42)` /
 `None`), not a bare number; structured-log consumers parsing it as an
 integer must adapt. (The object-economy e2e bench is unaffected: its
