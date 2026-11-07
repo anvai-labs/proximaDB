@@ -41,8 +41,6 @@ pub struct ObservabilityRestState {
     pub observability_port: Arc<dyn ObservabilityPort>,
 }
 
-// ── Legacy stub types kept for re-export compatibility ────────────────────────
-
 // ── Request / Response types ──────────────────────────────────────────────────
 
 /// REST request body for observability-namespace creation.

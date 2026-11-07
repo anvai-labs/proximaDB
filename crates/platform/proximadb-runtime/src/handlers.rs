@@ -36,10 +36,6 @@ use crate::service_ports::{
     CollectionPort, PortIdentity, QueryAdapterPort, SqlExecutionResult, VectorOpsPort,
 };
 
-// ── Collection ID cache ───────────────────────────────────────────────────────
-
-// ── Placeholder for hybrid runtime config ─────────────────────────────────────
-
 // ── UnifiedHandlers ───────────────────────────────────────────────────────────
 
 /// Canonical runtime-native API handler — the seam new schema/port work targets.

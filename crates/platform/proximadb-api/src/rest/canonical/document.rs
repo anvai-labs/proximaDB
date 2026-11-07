@@ -49,8 +49,6 @@ pub struct DocumentRestState {
     pub document_port: Arc<dyn DocumentPort>,
 }
 
-// ── Legacy stub types kept for re-export compatibility ────────────────────────
-
 // ── Request / Response types ──────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]

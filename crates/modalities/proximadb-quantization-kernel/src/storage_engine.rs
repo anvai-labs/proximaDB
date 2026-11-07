@@ -19,6 +19,10 @@ use proximadb_storage_ports::StorageQuantizationEnginePort;
 // use proximadb_distance_kernel::create_distance_calculator;
 use proximadb_hardware::{SimdLevel, best_simd_level};
 
+/// StorageQuantizationConfig moved to foundation `proximadb-quantization-model`
+/// (foundation-pure data struct; TD-DECOMP-72) so storage-tier crates can hold
+/// it without a storage->modality up-edge — same pattern as StorageQuantizedData.
+/// Re-exported here so this crate's public API + internal usage are unchanged.
 pub use proximadb_quantization_model::StorageQuantizationConfig;
 
 // Slice D pre-extraction: StorageQuantizedData now lives in foundation
@@ -26,6 +30,7 @@ pub use proximadb_quantization_model::StorageQuantizationConfig;
 // public API + internal usage are unchanged.
 pub use proximadb_quantization_model::StorageQuantizedData;
 
+/// Search stages for progressive resolution
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SearchStage {
     BinaryFilter,
@@ -34,9 +39,12 @@ pub enum SearchStage {
     FullPrecision,
 }
 
+/// Result from a search stage
 #[derive(Debug, Clone)]
 pub struct SearchStageResult {
+    /// Stage that was executed
     pub stage: SearchStage,
+    /// Candidate indices that passed this stage
     pub candidates: Vec<usize>,
     pub scores: Option<Vec<f32>>,
     pub metrics: StageMetrics,
@@ -260,6 +268,11 @@ impl StorageQuantizationEngine {
     }
 
     /// Progressive search through stages
+    ///
+    /// Stage 1: Binary filtering (95% reduction)
+    /// Stage 2: Fast approximation (INT8)
+    /// Stage 3: PQ ranking (further refinement)
+    /// Stage 4: Full precision (100% accuracy)
     pub async fn progressive_search(
         &self,
         query: &[f32],
