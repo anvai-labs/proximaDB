@@ -2,7 +2,6 @@
 mod tests {
     use proximadb_records::{EmbeddingCell, ProximaRecord};
     use std::collections::BTreeMap;
-    use std::sync::Arc;
     use tempfile::NamedTempFile;
 
     fn test_record(id: impl Into<String>, vector: Vec<f32>) -> ProximaRecord {

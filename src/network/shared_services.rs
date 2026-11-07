@@ -1361,12 +1361,11 @@ impl SharedServices {
         };
         debug!("✅ SharedServices::new - WAL manager created successfully");
 
-        // Phase 5 (Slice 5.2): try to resolve the global manifest
-        // singleton and wrap it as a `FreshnessLsnSource`. When the
-        // singleton hasn't been initialised yet (some embedded/test
-        // paths), the engine falls back to emitting `freshness_lsn = 0`
-        // — strong-route readers will simply always re-scan the WAL
-        // delta, which is correct but more expensive.
+        // Resolve the global manifest singleton as the engine's committed-LSN
+        // source. Only the `cold-deletion-vectors` search path reads it (as
+        // the deletion-vector snapshot LSN); without a source that path sees
+        // every delete (`u64::MAX`). It no longer feeds any directory
+        // watermark (TD-OEDIRWM-1).
         let freshness_lsn_source: Option<
             Arc<dyn crate::storage::engines::sst::object_economy_directory::FreshnessLsnSource>,
         > = crate::storage::persistence::write_ahead_log::manifest::get_service().map(|svc| {

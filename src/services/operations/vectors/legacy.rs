@@ -2310,11 +2310,10 @@ impl VectorOperationsService {
             return Ok((0, None));
         }
 
-        // Without a global manifest service we can't decide whether the
-        // WAL has newer data, so the safe default is to skip and let
-        // the directory-routed result stand. Strong-route correctness
-        // is then advertised only when the manifest is wired (which is
-        // the common production case via `SharedServices::new`).
+        // Without a global manifest service the WAL cursor is unavailable,
+        // so the delta scan is skipped and the engine results stand.
+        // Strong-route freshness therefore holds only when the manifest is
+        // wired (the common production case via `SharedServices::new`).
         //
         // Log loud on miss: a missing manifest in a server-mode process is a
         // bug (the v2 INSERT→SEARCH gap reconciled 2026-05-28 traced to this

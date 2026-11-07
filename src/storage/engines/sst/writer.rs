@@ -57,7 +57,6 @@ use std::sync::Arc;
 
 use crate::storage::persistence::filesystem::FilesystemFactory;
 
-use super::IndexEntry;
 use crate::core::bloom::{BloomFilterConfig, HashAlgorithm};
 use crate::storage::engines::core::formats::proximablocks::ProximaBlockMetadata;
 
@@ -142,30 +141,6 @@ struct BlockIndexEntry {
 }
 
 /// SSTable writer with atomic write optimization and quantization support
-/// Metadata returned by [`SstableWriter::write_sorted_vector_records`] and
-/// its delegators so callers (the flush coordinator, compaction, tests)
-/// can use the writer's internal index state without re-reading the
-/// freshly-written SST. Carries the inputs `SstableWriterDirectoryHooks`
-/// needs to populate an object-economy directory entry — that's the
-/// motivating consumer, but the struct is generally useful.
-///
-/// Pre-existing callers that ignore the return value via `?` are
-/// unaffected.
-#[derive(Debug, Clone)]
-pub struct SstableWriteOutcome {
-    /// Sorted index entries for every block written, in key order. Used
-    /// by the directory emitter to build the per-block metadata layer.
-    pub index_entries: Vec<IndexEntry>,
-    /// Offset where the block index section begins in the SST file.
-    pub block_index_offset: u64,
-    /// Length of the block index section in bytes.
-    pub block_index_size: u32,
-    /// Total serialized SST file size in bytes.
-    pub file_size_bytes: u64,
-    /// Number of records written.
-    pub record_count: u64,
-}
-
 /// MIGRATED: Now uses universal adapters to eliminate code duplication
 pub struct SstableWriter {
     /// Output file path
