@@ -95,9 +95,14 @@ tokio::task_local! {
     /// reading. Scoped around the engine's search FUTURE (not stored on the
     /// shared per-query trace), so a concurrent sibling future in the same
     /// request (`tokio::join!` in the SQL executor) never sees it and no read
-    /// is credited to another collection. The production search path makes no
-    /// async cache reads from spawned tasks (its `spawn_blocking` work is
-    /// synchronous ranking), so nothing needs rebinding.
+    /// is credited to another collection. The production multi-file route
+    /// (`direct_search_with`) drives its per-file cascades via `join_all`
+    /// IN-TASK, so they all see this scope. The one route that does NOT is
+    /// the spawned inter-file scan (`fallback_to_direct_search_arc`, the
+    /// Arc/coordinator entry — TD-SEARCH-2 S2): `tokio::task_local!` does not
+    /// cross `tokio::spawn`, so that spawn site re-binds THIS scope in each
+    /// child with the scan's own collection id (the io_trace-handle pattern).
+    /// The `spawn_blocking` work is synchronous ranking and reads no cache.
     static READ_COLLECTION: Arc<str>;
 }
 
@@ -136,12 +141,13 @@ struct CollectionSeries {
     /// While full: the earliest time any admitted pair can be idle.
     next_evict_secs: std::sync::atomic::AtomicU64,
     admit_lock: std::sync::Mutex<()>,
-    overflow: [prometheus::IntCounter; 3],
+    /// Minted lazily on the first overflow inc, so a quiet deployment never
+    /// exposes zero-value `other/other` series on every scrape.
+    overflow: std::sync::OnceLock<[prometheus::IntCounter; 3]>,
 }
 
 impl CollectionSeries {
     fn new(family: prometheus::IntCounterVec, cap: usize, idle_evict_secs: u64) -> Self {
-        let overflow = OUTCOME_LABELS.map(|o| family.with_label_values(&["other", "other", o]));
         Self {
             family,
             cap,
@@ -150,8 +156,14 @@ impl CollectionSeries {
             admitted_count: std::sync::atomic::AtomicUsize::new(0),
             next_evict_secs: std::sync::atomic::AtomicU64::new(0),
             admit_lock: std::sync::Mutex::new(()),
-            overflow,
+            overflow: std::sync::OnceLock::new(),
         }
+    }
+
+    fn overflow_counters(&self) -> &[prometheus::IntCounter; 3] {
+        self.overflow.get_or_init(|| {
+            OUTCOME_LABELS.map(|o| self.family.with_label_values(&["other", "other", o]))
+        })
     }
 
     fn try_fast(&self, key: &SeriesKey, idx: usize, now_secs: u64) -> bool {
@@ -184,22 +196,20 @@ impl CollectionSeries {
         if self.admitted_count.load(Relaxed) >= self.cap
             && now_secs < self.next_evict_secs.load(Relaxed)
         {
-            self.overflow[idx].inc();
+            self.overflow_counters()[idx].inc();
             return;
         }
-        // While full, never block a lookup on admission: if another lookup
-        // holds the lock (evicting), count this one as overflow.
-        let _admit = if self.admitted_count.load(Relaxed) >= self.cap {
-            match self.admit_lock.try_lock() {
-                Ok(guard) => guard,
-                Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
-                Err(std::sync::TryLockError::WouldBlock) => {
-                    self.overflow[idx].inc();
-                    return;
-                }
+        // Never block a lookup on admission — not even when the registry is
+        // below cap (an in-flight eviction dips the count under the cap while
+        // still holding the lock): if another lookup holds the lock, count
+        // this one as overflow instead of parking an async worker.
+        let _admit = match self.admit_lock.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                self.overflow_counters()[idx].inc();
+                return;
             }
-        } else {
-            self.admit_lock.lock().unwrap_or_else(|p| p.into_inner())
         };
         if self.try_fast(&key, idx, now_secs) {
             return;
@@ -208,7 +218,7 @@ impl CollectionSeries {
             self.evict_idle(now_secs);
         }
         if self.admitted_count.load(Relaxed) >= self.cap {
-            self.overflow[idx].inc();
+            self.overflow_counters()[idx].inc();
             return;
         }
         let labels = [scope.label(), collection.to_string()];

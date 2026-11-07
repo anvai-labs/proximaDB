@@ -32,9 +32,16 @@ GETs were unbilled.
   The scope belongs to that FUTURE, so a concurrent sibling future in the same
   request (`tokio::join!` in the SQL executor) never sees it, and no read is
   ever credited to another collection. Reads after the search returns are
-  never credited either. The production search path makes no async cache
-  reads from spawned tasks (its `spawn_blocking` work is synchronous ranking),
-  so nothing needs rebinding. Two rejected designs, for the record:
+  never credited either. The production multi-file route
+  (`direct_search_with`) drives its per-file cascades via `join_all` IN-TASK,
+  so they inherit this scope — no re-binding needed there. The one exception
+  is the spawned inter-file scan (`fallback_to_direct_search_arc`, the
+  Arc/`SearchCoordinator` entry, TD-SEARCH-2 S2 — not production-reachable
+  today): `tokio::task_local!` does not cross `tokio::spawn`, so its spawn
+  site re-binds THIS scope in each child with the scan's own collection id
+  (the io_trace-handle pattern; the `spawned_inter_file_route...` ratchet,
+  which drives the Arc entry, pins it). The `spawn_blocking` work is
+  synchronous ranking and reads no cache. Two rejected designs, for the record:
   - an ambient collection slot on the shared per-query `IoTrace`: concurrent
     unstamped sibling reads were credited to the stamped collection;
   - stamping in one service kernel: `unified_search_native` (pgwire `<->`,
