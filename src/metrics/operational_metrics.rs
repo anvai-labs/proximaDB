@@ -175,7 +175,7 @@ lazy_static! {
     /// pairs fold into `other`/`other`.
     pub static ref SURVIVOR_CACHE_COLLECTION_READS_TOTAL: Option<IntCounterVec> = counter_vec(
         "proximadb_survivor_cache_collection_reads_total",
-        "Survivor-cache logical lookups per tenant and catalog collection id, by outcome (hot|l2|cold)",
+        "Survivor-cache logical lookups (lookup-weighted, not bytes) per stable tenant id and catalog collection id, by outcome (hot|l2|cold)",
         &["tenant_stable_id", "collection_id", "outcome"],
     );
 

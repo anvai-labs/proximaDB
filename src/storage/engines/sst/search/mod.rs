@@ -989,7 +989,7 @@ impl SstEngine {
         // catalog collection id. Here, not in the trait impl, so callers
         // holding a concrete `SstEngine` (inherent method wins) are covered
         // too. An unidentified context is left unattributed.
-        let collection_id = ctx.collection.id.as_str();
+        let collection_id = ctx.collection_id();
         let search = scope_discovery_memo(self.search_vectors_unified_inner(ctx));
         if collection_id.is_empty() {
             return search.await;

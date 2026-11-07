@@ -75,7 +75,17 @@ GETs were unbilled.
   where there was none; it does not double-count, because no other path
   emitted these meters for gRPC.
 
-Hot-hit ratio per collection = `hot / (hot + l2 + cold)`.
+Hot-hit ratio per collection = `hot / (hot + l2 + cold)`. It is
+LOOKUP-weighted: a tiny OID range and a multi-MiB SQ8 region count once each,
+and a region read through the wave-split fallback counts once per chunk. Bytes
+are metered by the object-store and cache-byte families. A bytes-weighted
+ratio is a follow-up (a second family; it doubles cardinality).
+
+* Restart warm replay now runs under the stable tenant scope its manifest was
+  recorded in. Manifests are keyed by `CacheScope::label()`, and replay
+  (`warming::replay_stable_id`) inverts that rendering. Before, replay always
+  filled `Shared` keys, which tenant-scoped lookups (REST v2 already, and gRPC
+  with this change) never hit, so every restart served those tenants cold.
 
 == Residuals (not fixed here)
 
@@ -99,8 +109,9 @@ Hot-hit ratio per collection = `hot / (hot + l2 + cold)`.
   inside its scope, unlike REST v2.
 * The gRPC scope also moves gRPC searches' survivor-cache scope from `shared`
   to the tenant (as REST v2 already is), so tenant fair-share floors and
-  ceilings now apply to them; the first gRPC queries after deploy re-warm
-  under the tenant scope. No test pins that a gRPC search reaches the billing
+  ceilings now apply to them. The first gRPC queries after THIS deploy re-warm
+  under the tenant scope; later restarts replay into it (see the warm-replay
+  fix above). No test pins that a gRPC search reaches the billing
   observer, because the service holds a concrete `RecordOpsService`. A tower
   layer opening the scope for every data-plane RPC is the structural
   follow-up.
@@ -109,6 +120,15 @@ Hot-hit ratio per collection = `hot / (hot + l2 + cold)`.
   reset, but drop the first sample of a new series. A collection read less
   often than once a day while the registry is full is therefore undercounted.
   The day-long window keeps daily collections resident.
+* The test-only `search_vectors_unified_arc` entry (and its `tokio::spawn`
+  fan-out) is not scoped. It has no production caller (TD-SCANDEG-1).
+* Eviction trades counter continuity for a bounded cap. Keeping evicted
+  pairs' series instead would make the cap permanent again (the original
+  insert-only defect).
+* Per-lookup cost is one `Arc` clone, one string-hash map probe and one
+  `IntCounter` increment. Resolving the series once per search and holding
+  its handles in the task-local was rejected: an eviction during the search
+  would leave those handles detached, losing the counts silently.
 * Admission is first-come among non-idle pairs, not ranked by traffic; a
   busy 201st pair counts under `other` until some pair idles for a day.
 * Rejected alternative: deriving tenant and collection from the DrPath inside
