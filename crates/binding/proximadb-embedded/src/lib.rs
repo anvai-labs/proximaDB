@@ -5053,11 +5053,18 @@ impl EmbeddedProximaDB {
         SqlObject { fields }
     }
 
-    /// Convert serde_json::Value to SqlValue
+    /// Convert serde_json::Value to SqlValue — canonical conversion in
+    /// proximadb-proto (`serde_impls`). This path previously routed through
+    /// `json_to_proxima_value` + `proxima_value_to_sql_value`, whose u64
+    /// branch silently wrapped values above i64::MAX to `Int64Value`; the
+    /// canonical fn approximates those as f64 `NumberValue` instead
+    /// (pinned by the proto guard test). JSON `null` also changes shape —
+    /// `SqlValue { value: None }` → `Some(NullValue(0))` — which every
+    /// downstream consumer (Serialize, `sql_value_to_json`,
+    /// `sql_value_to_proxima_value`, tree-node conversion) maps identically;
+    /// only the raw oneof presence on the wire differs.
     fn json_to_sql_value(value: &serde_json::Value) -> proximadb::proto::proximadb_v1::SqlValue {
-        proximadb::core::search::results::proxima_value_to_sql_value(json_to_proxima_value(
-            value.clone(),
-        ))
+        proximadb::proto::serde_impls::json_to_sql_value(value)
     }
 
     /// Convert SqlObject to serde_json::Value

@@ -1881,14 +1881,17 @@ pub struct ExecutableGraphQuery {
     /// Graph ID to execute against
     pub graph_id: String,
     /// Query type
-    pub query_type: GraphQueryType,
+    pub query_type: ExecutableGraphQueryType,
     /// Query parameters
     pub parameters: HashMap<String, serde_json::Value>,
     /// Timeout in milliseconds
     pub timeout_ms: Option<u64>,
 }
 
-/// Types of graph queries.
+/// Types of executable graph queries (the parsed Cypher statement opcode).
+///
+/// Renamed from `GraphQueryType` 2026-11-07 to complete the #2447 disambiguation:
+/// `query::GraphQueryType` (the traversal algorithm selector) shared the name.
 ///
 /// The MATCH variant carries a much heavier payload than the others
 /// (multiple `Pattern`/`Constraint`/`Order` lists). Boxing it would
@@ -1897,7 +1900,7 @@ pub struct ExecutableGraphQuery {
 /// settled. See `clippy::large_enum_variant`.
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
-pub enum GraphQueryType {
+pub enum ExecutableGraphQueryType {
     /// Read-only pattern match
     Match {
         /// Patterns to match in the graph
@@ -1962,7 +1965,7 @@ pub fn cypher_to_graph_query(
 
     Ok(ExecutableGraphQuery {
         graph_id: graph_id.to_string(),
-        query_type: GraphQueryType::Match {
+        query_type: ExecutableGraphQueryType::Match {
             patterns,
             return_spec: cypher.return_spec.clone().unwrap_or_else(|| ReturnSpec {
                 items: vec![],
@@ -1988,6 +1991,12 @@ pub fn cypher_to_graph_query(
     note = "renamed ExecutableGraphQuery 2026-11-07 (three same-named GraphQuery types in one crate); alias kept for source compatibility"
 )]
 pub type GraphQuery = ExecutableGraphQuery;
+
+#[deprecated(
+    since = "0.5.1",
+    note = "renamed ExecutableGraphQueryType 2026-11-07 (shadowed query::GraphQueryType, the traversal selector); alias kept for source compatibility"
+)]
+pub type GraphQueryType = ExecutableGraphQueryType;
 
 #[cfg(test)]
 mod step2_decisions {
@@ -2210,7 +2219,7 @@ mod tests {
         assert_eq!(graph_query.graph_id, "test_graph");
         assert!(matches!(
             graph_query.query_type,
-            GraphQueryType::Match { .. }
+            ExecutableGraphQueryType::Match { .. }
         ));
     }
 

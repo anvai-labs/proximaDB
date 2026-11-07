@@ -242,5 +242,6 @@ pub use parsers::{
 // Re-export Cypher parser types - Graph query language support
 pub use parsers::{
     CypherFunction, CypherLexer, CypherParser, CypherQueryValidator, CypherToken, CypherVisitor,
-    GraphQuery, GraphQueryType, LocatedToken, ToGraphQuery, cypher_to_graph_query,
+    ExecutableGraphQueryType, GraphQuery, GraphQueryType, LocatedToken, ToGraphQuery,
+    cypher_to_graph_query,
 };

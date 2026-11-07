@@ -217,7 +217,6 @@
     "GraphError": 1,
     "GraphOperation": 2,
     "GraphPath": 1,
-    "GraphQueryType": 1,
     "GraphResponse": 1,
     "GraphSchema": 1,
     "GraphStatistics": 1,

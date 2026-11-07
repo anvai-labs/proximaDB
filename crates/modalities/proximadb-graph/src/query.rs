@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TraversalQuery {
     /// Query type
-    pub query_type: GraphQueryType,
+    pub query_type: TraversalQueryType,
     /// Starting node(s) for traversal
     pub start_nodes: Vec<QueryNode>,
     /// Traversal pattern
@@ -21,7 +21,7 @@ pub struct TraversalQuery {
 }
 
 impl TraversalQuery {
-    pub fn new(query_type: GraphQueryType) -> Self {
+    pub fn new(query_type: TraversalQueryType) -> Self {
         Self {
             query_type,
             start_nodes: Vec::new(),
@@ -49,13 +49,17 @@ impl TraversalQuery {
 
 impl Default for TraversalQuery {
     fn default() -> Self {
-        Self::new(GraphQueryType::Traversal)
+        Self::new(TraversalQueryType::Traversal)
     }
 }
 
-/// Graph query types
+/// Traversal-query algorithm selector (the style of read-only traversal).
+///
+/// Renamed from `GraphQueryType` 2026-11-07 to complete the #2447 disambiguation:
+/// a same-named enum in `cypher_parser` (the Cypher statement opcode) shadowed this
+/// one at the root re-export path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum GraphQueryType {
+pub enum TraversalQueryType {
     /// Basic graph traversal
     Traversal,
     /// Shortest path query
@@ -209,13 +213,19 @@ impl Default for QueryExecutor {
 )]
 pub type GraphQuery = TraversalQuery;
 
+#[deprecated(
+    since = "0.5.1",
+    note = "renamed TraversalQueryType 2026-11-07 (shadowed by cypher_parser's same-named statement opcode); alias kept for source compatibility"
+)]
+pub type GraphQueryType = TraversalQueryType;
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn test_query_construction() {
-        let query = TraversalQuery::new(GraphQueryType::Traversal)
+        let query = TraversalQuery::new(TraversalQueryType::Traversal)
             .with_start_node(QueryNode::by_label("Person"))
             .with_pattern(TraversalPattern {
                 direction: EdgeDirection::Outgoing,
