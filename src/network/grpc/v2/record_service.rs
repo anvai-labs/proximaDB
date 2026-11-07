@@ -1474,15 +1474,26 @@ impl ProximaRecordService for ProximaRecordServiceImpl {
         // any AxisManager-deep shortfall is captured here. Phase K: also
         // lift the TurboQuant EXPLAIN payload — task-local binding ends
         // when the scoped future returns, so the take MUST happen inside.
+        //
+        // TD-CACHEC-1: open the per-query io_trace scope, as REST v2 and Arrow
+        // Flight do. Without it a gRPC search had no ambient tenant (shared
+        // cache fair-share scope, no collection attribution) and never reached
+        // the billing observer, so its KRU / object-store meters were dropped.
+        // The tenant + stable id are the authenticated port identity above.
         let (search_outcome, _turboquant_hints) =
-            crate::observability::predicate_diagnostics::scope(async {
-                let outcome = self
-                    .record_ops
-                    .handle_record_search_for_tenant(search_request, identity.as_borrowed())
-                    .await;
-                let tq = crate::observability::predicate_diagnostics::take_turboquant_hints();
-                (outcome, tq)
-            })
+            crate::observability::io_trace::instrument_with_stable_tenant(
+                identity.tenant_id.clone(),
+                identity.tenant_stable_id,
+                "grpc.v2.records.search",
+                crate::observability::predicate_diagnostics::scope(async {
+                    let outcome = self
+                        .record_ops
+                        .handle_record_search_for_tenant(search_request, identity.as_borrowed())
+                        .await;
+                    let tq = crate::observability::predicate_diagnostics::take_turboquant_hints();
+                    (outcome, tq)
+                }),
+            )
             .await;
 
         match search_outcome {
@@ -1564,18 +1575,23 @@ impl ProximaRecordService for ProximaRecordServiceImpl {
 
         let include_vector = req.include_vector;
 
-        // Execute search
-        let response = self
-            .record_ops
-            .handle_record_search_for_tenant(search_request, identity.as_borrowed())
-            .await
-            .map_err(|e| {
-                if crate::services::operations::vectors::is_client_argument_error(&e) {
-                    Status::invalid_argument(e.to_string())
-                } else {
-                    Status::internal(format!("Search stream failed: {}", e))
-                }
-            })?;
+        // Execute search inside the per-query io_trace scope (TD-CACHEC-1; see
+        // `search`).
+        let response = crate::observability::io_trace::instrument_with_stable_tenant(
+            identity.tenant_id.clone(),
+            identity.tenant_stable_id,
+            "grpc.v2.records.search_stream",
+            self.record_ops
+                .handle_record_search_for_tenant(search_request, identity.as_borrowed()),
+        )
+        .await
+        .map_err(|e| {
+            if crate::services::operations::vectors::is_client_argument_error(&e) {
+                Status::invalid_argument(e.to_string())
+            } else {
+                Status::internal(format!("Search stream failed: {}", e))
+            }
+        })?;
 
         // Create a channel for streaming results
         let (tx, rx) = tokio::sync::mpsc::channel(128);

@@ -1,0 +1,67 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-CACHEC-1: Survivor-cache reads were not attributable per collection, and gRPC searches were unmetered
+:status: Resolved
+:date: 2026-11-06
+:tags: [cache, metering, billing, observability, grpc]
+
+== Problem
+
+The warm-rate read SKU prices a collection by its hot-hit ratio, but the
+survivor range cache only exposed per-TENANT hit/miss (TD-CACHE-3 S1). There
+was no collection dimension, so the ratio could not be computed per
+collection.
+
+While wiring it, a second gap surfaced: the gRPC v2 `search` and
+`search_stream` handlers never opened a per-query io_trace scope (REST v2 and
+Arrow Flight do). A gRPC search therefore ran with no ambient tenant (cache
+fair-share scope `shared`) and never reached the io_trace billing observer
+(`consumption_metrics::install_billing_observer`), the single source of the
+KRU and object-store GET / byte / request meters. gRPC search compute and
+GETs were unbilled.
+
+== Fix
+
+* `IoTrace` carries an always-compiled `collection_id`, stamped once by
+  `unified_search_v1_inner` with the immutable catalog `CollectionObjectId`
+  (never the mutable name), right after the catalog resolves it. Every search
+  surface (REST v2, gRPC v2, Flight, v1, AQL, MCP, the SQL executor) converges
+  there. Spawned scan tasks rebind the same `Arc<IoTrace>`, so they see it.
+* `survivor_range_cache::record_outcome` is the single recording point for one
+  logical lookup (it replaced the five inline `record_survivor_l1s` sites). The
+  in-parent loader site now records the REAL outcome: it hard-coded a miss even
+  when a concurrent fill or the exact-key L2 served the lookup.
+* `proximadb_survivor_cache_collection_reads_total{tenant_id, collection_id,
+  outcome}` with outcome `hot` (DRAM), `l2` (persistent local store) or `cold`
+  (the loader ran). It holds true counters and only counts inside a stamped
+  scope, so flush seeding, compaction and warm replay are never attributed.
+  `tenant_id` uses the same label as the per-tenant survivor series (stable id,
+  or `shared`). At most 200 distinct (tenant, collection) pairs get their own
+  series; later pairs count under `other`/`other`.
+* gRPC v2 `search` / `search_stream` run inside
+  `instrument_with_stable_tenant` with the authenticated port identity
+  (`grpc_auth::port_identity`, the same identity the request is authorised
+  with). The billing observer now meters gRPC searches. This adds billing
+  where there was none; it does not double-count, because no other path
+  emitted these meters for gRPC.
+
+Hot-hit ratio per collection = `hot / (hot + l2 + cold)`.
+
+== Residuals (not fixed here)
+
+* The per-TENANT survivor series (`SURVIVOR_CACHE_TENANT_HITS/MISSES`) count
+  PROBES, not lookups: an exact-key miss followed by a parent probe records two
+  misses, a parent-slice hit is credited to `shared` (the parent key is
+  shared-scoped), and a persistent-L2 hit counts as an L1 miss. Prefer the new
+  per-collection counter for ratios; aligning the tenant series to logical
+  lookups is follow-up work.
+* The cap is admission-ordered (first 200 pairs win), not ranked by traffic,
+  and the admission check is not atomic. Concurrent first lookups can admit a
+  few pairs past 200, bounded by the number of concurrent queries.
+* A scope that reads several collections (AQL/SQL joining two vector
+  collections) attributes reads to the most recently stamped one.
+* pgwire scopes carry no stable tenant id, so their reads label as `shared`
+  (pre-existing; same as the tenant series).
+
+Related: TD-CACHE-3 (per-tenant series), ADR-030 (billing observer), the
+AnvaiOps warm-rate KRU SKU.

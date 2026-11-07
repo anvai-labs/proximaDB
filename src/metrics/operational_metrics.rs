@@ -165,6 +165,16 @@ lazy_static! {
         "Cumulative survivor-cache misses per tenant (top tenants only)",
         &["tenant_id"],
     );
+    /// TD-CACHEC-1: logical survivor-cache lookups per (tenant, collection),
+    /// by outcome: `hot` (DRAM), `l2` (persistent local store), `cold`
+    /// (loader ran). The per-collection hot-hit ratio the warm-rate SKU
+    /// prices. True counters; at most 200 (tenant, collection) pairs, later
+    /// pairs fold into `other`/`other`.
+    pub static ref SURVIVOR_CACHE_COLLECTION_READS_TOTAL: Option<IntCounterVec> = counter_vec(
+        "proximadb_survivor_cache_collection_reads_total",
+        "Survivor-cache logical lookups per tenant and catalog collection id, by outcome (hot|l2|cold)",
+        &["tenant_id", "collection_id", "outcome"],
+    );
 
     /// Segment-invariants cache (footer/region-A metadata; a hit skips 3
     /// ranged GETs per segment per query).
@@ -303,6 +313,7 @@ pub fn touch() {
     SURVIVOR_CACHE_HITS.get();
     SURVIVOR_CACHE_MISSES.get();
     SURVIVOR_CACHE_BYTES.get();
+    let _ = SURVIVOR_CACHE_COLLECTION_READS_TOTAL.as_ref();
     SEGMENT_INVARIANTS_CACHE_HITS_TOTAL.get();
     SEGMENT_INVARIANTS_CACHE_MISSES_TOTAL.get();
     SEGMENT_INVARIANTS_CACHE_BYTES.get();

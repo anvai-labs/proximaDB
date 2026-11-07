@@ -420,6 +420,11 @@ pub struct IoTrace {
     /// cache fair-sharing, and authorization joins. Unlike `tenant_id`, this
     /// stays numeric and is never derived from an alias.
     tenant_stable_id: Mutex<Option<u64>>,
+    /// TD-CACHEC-1: the catalog collection id (numeric `CollectionObjectId`
+    /// text, never the mutable display name) the query is reading, stamped
+    /// once the search path resolves it. Feeds per-collection cache
+    /// attribution. Last write wins when one scope reads several collections.
+    collection_id: Mutex<Option<String>>,
 }
 
 /// Per-query cap on recorded request intervals (TD-PAXDIR-1 D7). A P5b
@@ -743,6 +748,19 @@ impl IoTrace {
             .tenant_stable_id
             .lock()
             .unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Stamp the catalog collection id this scope is reading (TD-CACHEC-1).
+    pub fn set_collection_id(&self, collection_id: Option<String>) {
+        *self.collection_id.lock().unwrap_or_else(|p| p.into_inner()) = collection_id;
+    }
+
+    /// The stamped catalog collection id, if any.
+    pub fn collection_id(&self) -> Option<String> {
+        self.collection_id
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
     }
 
     /// The stamped per-query id, if any.
@@ -2139,6 +2157,19 @@ pub fn current_tenant_stable_id() -> Option<u64> {
     IO_TRACE.try_with(|t| t.tenant_stable_id()).ok().flatten()
 }
 
+/// TD-CACHEC-1: stamp the catalog collection id onto the active query trace.
+/// Silently no-ops outside an instrumented scope. Always compiled (unlike the
+/// `io-trace`-gated perf counters): it feeds attribution metrics.
+pub fn set_current_collection_id(collection_id: &str) {
+    let _ = IO_TRACE.try_with(|t| t.set_collection_id(Some(collection_id.to_string())));
+}
+
+/// TD-CACHEC-1: the catalog collection id of the current instrumented
+/// request, if the search path stamped one. `None` outside a scope.
+pub fn current_collection_id() -> Option<String> {
+    IO_TRACE.try_with(|t| t.collection_id()).ok().flatten()
+}
+
 pub async fn instrument<F>(
     tenant_id: Option<String>,
     route: impl Into<String>,
@@ -2959,5 +2990,26 @@ mod tests {
         let back: IoTraceSnapshot = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(s, back);
         assert_eq!(back.total_embedding_tokens(), 3000);
+    }
+
+    /// TD-CACHEC-1: the collection stamp is scope-local, visible to spawned
+    /// children that rebind the shared handle, and a no-op outside a scope.
+    #[tokio::test]
+    async fn collection_id_stamp_is_scoped_and_reaches_spawned_children() {
+        assert_eq!(current_collection_id(), None);
+        set_current_collection_id("42"); // outside any scope: no-op, no panic
+        assert_eq!(current_collection_id(), None);
+        instrument_with_stable_tenant(Some("t".into()), Some(7), "test", async {
+            assert_eq!(current_collection_id(), None);
+            set_current_collection_id("42");
+            assert_eq!(current_collection_id().as_deref(), Some("42"));
+            let handle = current_handle().expect("scope handle");
+            let seen = tokio::spawn(scope_with_handle(handle, async { current_collection_id() }))
+                .await
+                .expect("join");
+            assert_eq!(seen.as_deref(), Some("42"));
+        })
+        .await;
+        assert_eq!(current_collection_id(), None);
     }
 }

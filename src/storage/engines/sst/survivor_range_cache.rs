@@ -67,6 +67,57 @@ fn request_cache_scope() -> CacheScope {
         .unwrap_or(CacheScope::Shared)
 }
 
+/// TD-CACHEC-1: distinct `(tenant, collection)` series kept before new pairs
+/// fold into `("other", "other")`, so label cardinality is strictly bounded.
+const COLLECTION_SERIES_CAP: usize = 200;
+
+/// Pairs admitted as their own series (insert-only; bounded by the cap).
+static COLLECTION_SERIES: std::sync::LazyLock<dashmap::DashSet<(String, String)>> =
+    std::sync::LazyLock::new(dashmap::DashSet::new);
+
+/// Outcome label of one logical survivor lookup: `hot` = served from DRAM
+/// (no local-disk or object-store read), `l2` = served from the persistent
+/// local store, `cold` = the authoritative loader ran.
+fn outcome_label(outcome: CacheReadOutcome) -> &'static str {
+    match outcome {
+        CacheReadOutcome::MemoryHit => "hot",
+        CacheReadOutcome::PersistentHit => "l2",
+        CacheReadOutcome::Loaded => "cold",
+    }
+}
+
+/// Record ONE logical lookup outcome: the per-query io_trace L1 counters (as
+/// before) and, when the search path stamped a collection, the
+/// per-collection attribution counter (TD-CACHEC-1). Outside a stamped scope
+/// (flush seeding, compaction, warm replay) nothing is attributed.
+fn record_outcome(outcome: CacheReadOutcome) {
+    let hit = outcome == CacheReadOutcome::MemoryHit;
+    crate::observability::io_trace::record_survivor_l1s(u64::from(hit), u64::from(!hit));
+    let Some(collection) = crate::observability::io_trace::current_collection_id() else {
+        return;
+    };
+    let Some(family) =
+        crate::metrics::operational_metrics::SURVIVOR_CACHE_COLLECTION_READS_TOTAL.as_ref()
+    else {
+        return;
+    };
+    let tenant = request_cache_scope().label();
+    let pair = (tenant, collection);
+    let admitted = COLLECTION_SERIES.contains(&pair)
+        || (COLLECTION_SERIES.len() < COLLECTION_SERIES_CAP && {
+            COLLECTION_SERIES.insert(pair.clone());
+            true
+        });
+    let (tenant, collection) = if admitted {
+        (pair.0.as_str(), pair.1.as_str())
+    } else {
+        ("other", "other")
+    };
+    family
+        .with_label_values(&[tenant, collection, outcome_label(outcome)])
+        .inc();
+}
+
 /// Persistent-L2 backend wrapper that forwards each exact-key probe outcome
 /// into the ambient per-query io_trace (TD-IOTRACE-4). It lives at the engine
 /// layer because the cache crate (foundation) must not depend on the
@@ -327,10 +378,7 @@ impl SurvivorRangeCache {
             return self.get_or_fetch(kind, path, off, len, loader).await;
         };
         if let Some((exact, outcome)) = self.inner.get_with_outcome(&exact_key).await {
-            crate::observability::io_trace::record_survivor_l1s(
-                u64::from(outcome == CacheReadOutcome::MemoryHit),
-                u64::from(outcome != CacheReadOutcome::MemoryHit),
-            );
+            record_outcome(outcome);
             self.sync_prometheus();
             return Ok(exact);
         }
@@ -338,10 +386,7 @@ impl SurvivorRangeCache {
         if let Some((parent, outcome)) = self.inner.get_with_outcome(&parent_key).await
             && let Some(slice) = parent.get(start..end)
         {
-            crate::observability::io_trace::record_survivor_l1s(
-                u64::from(outcome == CacheReadOutcome::MemoryHit),
-                u64::from(outcome != CacheReadOutcome::MemoryHit),
-            );
+            record_outcome(outcome);
             // A complete write-time seed already occupies the useful cache
             // slot. Do not admit every query-dependent slice as another exact
             // entry: doing so duplicates the region, evicts its parent, and
@@ -361,7 +406,7 @@ impl SurvivorRangeCache {
                 self.inner
                     .insert_memory_only(exact_key, weight, bytes.clone())
                     .await;
-                crate::observability::io_trace::record_survivor_l1s(0, 1);
+                record_outcome(CacheReadOutcome::PersistentHit);
                 self.sync_prometheus();
                 return Ok(bytes);
             }
@@ -375,7 +420,12 @@ impl SurvivorRangeCache {
                 Ok::<Arc<[u8]>, FilesystemError>(Arc::from(loader().await?))
             })
             .await;
-        crate::observability::io_trace::record_survivor_l1s(0, 1);
+        match &result {
+            // The real outcome: a concurrent fill or the exact-key L2 can serve
+            // this lookup, so it is not always a load.
+            Ok((_, outcome)) => record_outcome(*outcome),
+            Err(_) => crate::observability::io_trace::record_survivor_l1s(0, 1),
+        }
         self.sync_prometheus();
         result.map(|(value, _)| value)
     }
@@ -492,10 +542,7 @@ impl SurvivorRangeCache {
             })
             .await;
         if let Ok((_, outcome)) = &result {
-            crate::observability::io_trace::record_survivor_l1s(
-                u64::from(*outcome == CacheReadOutcome::MemoryHit),
-                u64::from(*outcome != CacheReadOutcome::MemoryHit),
-            );
+            record_outcome(*outcome);
         }
         self.sync_prometheus();
         result.map(|(value, _)| value)
@@ -1352,6 +1399,123 @@ mod tests {
             cache.inner.l2_stats().misses,
             inner_l2_before.misses,
             "peek must not move the exact-L2 traced counters"
+        );
+    }
+
+    // ---- TD-CACHEC-1: per-collection lookup attribution -----------------
+
+    fn collection_reads(tenant: &str, collection: &str, outcome: &str) -> u64 {
+        crate::metrics::operational_metrics::SURVIVOR_CACHE_COLLECTION_READS_TOTAL
+            .as_ref()
+            .expect("collection reads family registered")
+            .with_label_values(&[tenant, collection, outcome])
+            .get()
+    }
+
+    fn has_series_for_tenant(tenant: &str) -> bool {
+        use prometheus::core::Collector;
+        crate::metrics::operational_metrics::SURVIVOR_CACHE_COLLECTION_READS_TOTAL
+            .as_ref()
+            .expect("collection reads family registered")
+            .collect()
+            .iter()
+            .flat_map(|family| family.get_metric().iter())
+            .any(|m| {
+                m.get_label()
+                    .iter()
+                    .any(|l| l.name() == "tenant_id" && l.value() == tenant)
+            })
+    }
+
+    /// A stamped search scope attributes each logical lookup to its
+    /// (tenant, catalog collection) with the real outcome: the loader ran
+    /// (`cold`), DRAM served it (`hot`), the persistent store served it after
+    /// L1 was lost (`l2`).
+    #[tokio::test]
+    async fn collection_reads_attribute_hot_l2_and_cold_outcomes() {
+        let dir = tempfile::tempdir().expect("test tempdir");
+        let store =
+            Arc::new(PersistentByteStore::open(dir.path(), 1 << 20).expect("open persistent L2"));
+        let warm = SurvivorRangeCache::with_resolver_and_l2(1 << 20, None, Some(store.clone()));
+        let fresh = SurvivorRangeCache::with_resolver_and_l2(1 << 20, None, Some(store.clone()));
+        crate::observability::io_trace::instrument_with_stable_tenant(
+            Some("t".to_string()),
+            Some(910_001),
+            "test",
+            async {
+                crate::observability::io_trace::set_current_collection_id("cachec1-outcomes");
+                for cache in [&warm, &warm, &fresh] {
+                    cache
+                        .get_or_fetch(CacheKind::Other, "seg.pax", 64, 4, || async {
+                            Ok(vec![1, 2, 3, 4])
+                        })
+                        .await
+                        .expect("lookup");
+                }
+            },
+        )
+        .await;
+        let t = "910001";
+        let c = "cachec1-outcomes";
+        assert_eq!(collection_reads(t, c, "cold"), 1, "first lookup loads");
+        assert_eq!(collection_reads(t, c, "hot"), 1, "second lookup is DRAM");
+        assert_eq!(
+            collection_reads(t, c, "l2"),
+            1,
+            "a fresh L1 over the same store is served by the persistent L2"
+        );
+    }
+
+    /// Without a collection stamp (flush seeding, compaction, warm replay, or a
+    /// scope the search path never stamped) nothing is attributed.
+    #[tokio::test]
+    async fn collection_reads_require_a_collection_stamp() {
+        let cache = SurvivorRangeCache::new(1 << 20);
+        crate::observability::io_trace::instrument_with_stable_tenant(
+            Some("t".to_string()),
+            Some(910_002),
+            "test",
+            async {
+                cache
+                    .get_or_fetch(CacheKind::Other, "seg.pax", 0, 4, || async {
+                        Ok(vec![0; 4])
+                    })
+                    .await
+                    .expect("lookup");
+            },
+        )
+        .await;
+        assert!(!has_series_for_tenant("910002"));
+    }
+
+    /// Label cardinality is bounded: once the cap of distinct (tenant,
+    /// collection) pairs is reached, a new pair counts under `other`/`other`
+    /// and never gets its own series.
+    #[tokio::test]
+    async fn collection_series_cap_folds_new_pairs_into_other() {
+        crate::observability::io_trace::instrument_with_stable_tenant(
+            Some("t".to_string()),
+            Some(910_003),
+            "test",
+            async {
+                let mut i = 0usize;
+                while COLLECTION_SERIES.len() < COLLECTION_SERIES_CAP {
+                    crate::observability::io_trace::set_current_collection_id(&format!(
+                        "cachec1-fill-{i}"
+                    ));
+                    record_outcome(CacheReadOutcome::Loaded);
+                    i += 1;
+                }
+                let before = collection_reads("other", "other", "cold");
+                crate::observability::io_trace::set_current_collection_id("cachec1-overflow");
+                record_outcome(CacheReadOutcome::Loaded);
+                assert_eq!(collection_reads("other", "other", "cold"), before + 1);
+            },
+        )
+        .await;
+        assert_eq!(COLLECTION_SERIES.len(), COLLECTION_SERIES_CAP);
+        assert!(
+            !COLLECTION_SERIES.contains(&("910003".to_string(), "cachec1-overflow".to_string()))
         );
     }
 }
