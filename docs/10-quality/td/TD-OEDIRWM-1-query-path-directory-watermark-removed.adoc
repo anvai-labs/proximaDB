@@ -33,8 +33,8 @@
   enforced (it never effectively was: the skip never fired). Route-health
   reports `bounded_stale_time_bound_check: false` and says so; EXPLAIN and its
   trace event report the watermark as `None` (not wired), not a fabricated 0.
-* Route-health's object-economy status stays a NO-I/O read. It reports
-  `not_checked`, and its notes say why.
+* Route-health's object-economy status stays a NO-I/O read. #2443 left it
+  reporting `not_checked`; the follow-up below makes it `not_applicable`.
 * One root composition, `collection_data_path_for_assignment`, now used by
   the flush writer and the record read-back. Sites still composing it by
   hand: the storage-traits `collection_storage_path`,
@@ -120,6 +120,14 @@ Left in place, deliberately:
   `merge_delta_with_directory_results` / `merge_input_directory_records`
   naming (a trace-field rename), and the now-inert
   `PROXIMADB_DIRECTORY_CACHE_RECHECK_MS` gate.
+* Pre-existing, not introduced here: the delta scan always passes
+  `include_vectors=false`, so when an OID's freshest copy is still in the
+  WAL a Strong search with `include_vectors=true` returns that hit without
+  its vector. Servers (always manifest-wired) already behaved this way; the
+  no-manifest change extends it to embedded/test processes, which before
+  dropped such unflushed rows entirely. Fix: thread `include_vectors` into
+  `scan_wal_delta_if_needed` (or backfill from the engine copy in the
+  merge).
 * `VectorFreshnessMode::should_scan_delta` / `should_scan_delta_with_time`
   (search-types crate) have no production caller now — only their unit
   tests (duplicated in `core/search/mod.rs`) and the in-memory

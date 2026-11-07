@@ -2328,6 +2328,7 @@ impl VectorOperationsService {
                     WARNED.call_once(|| {
                         tracing::warn!(
                             target: "proximadb::services::vectors::delta_merge",
+                            first_collection_id = %collection_id,
                             "global manifest service not registered: the WAL cursor is \
                              unavailable (EXPLAIN reports None) and no FreshnessLsnSource \
                              is wired; the delta scan still runs. In server mode call \
@@ -6146,7 +6147,10 @@ mod index_first_search_tests {
             )
             .await
             .unwrap();
-        assert_eq!(current_lsn, None, "cursor not read without a manifest");
+        // `current_lsn` is deliberately NOT asserted: another test in a shared
+        // `cargo test` process could register the global manifest between the
+        // skip check above and the scan. The visible row is the invariant.
+        let _ = current_lsn;
         let ids: Vec<String> = delta
             .expect("a Strong read must scan the delta even without a manifest")
             .into_iter()
