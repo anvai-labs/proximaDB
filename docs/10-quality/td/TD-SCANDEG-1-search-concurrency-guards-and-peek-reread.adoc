@@ -35,13 +35,6 @@ Two adaptive back-offs and one read path, each half-wired:
 * The legacy OID tail is untouched: its peek is DRAM-only, so there was no
   duplicated disk read to remove.
 
-== Follow-up (filed, not fixed): TD-SCANDEG-2 — worker granularity
+== Follow-up
 
-The guards count QUERIES, not rank workers. A lone query fanning out over
-D files gives each per-file rank `morsel_degree() == cores`, so one query can
-still run `D × cores` workers. Restoring "total workers ≈ cores" needs the
-morsel degree to divide by the query's own inter-file degree as well. The
-2026-07-25 sweep found every mid/high-concurrency posture inside the box's
-±30% run-to-run variance, so the change must be MEASURED (QPS + p95 at
-c=1/4/8 on a quiet box) before it ships — it is a posture change, not a
-defect fix.
+Worker-granularity back-off is filed separately as TD-SCANDEG-2.

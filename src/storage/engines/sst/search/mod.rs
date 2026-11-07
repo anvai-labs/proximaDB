@@ -236,8 +236,10 @@ pub(crate) struct DiscoveredSstFile {
 }
 
 /// TD-SEARCH-2 S2: process-wide in-flight cold-scan counter — the input to
-/// the adaptive morsel degree. Incremented per `fallback_to_direct_search`
-/// (the segment-scan path; memtable/index serves don't burn scan CPU).
+/// the adaptive morsel degree. Incremented by BOTH segment-scan entries —
+/// the legacy `direct_search_with` and the production arc
+/// `direct_search_arc_with` (TD-SCANDEG-1; memtable/index serves don't burn
+/// scan CPU). It counts in-flight QUERIES, not rank workers (TD-SCANDEG-2).
 pub static INFLIGHT_SCANS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// RAII guard for [`INFLIGHT_SCANS`].
@@ -4912,20 +4914,21 @@ mod tests {
         use std::sync::atomic::Ordering;
         // SAFETY: nextest runs each test in its own process.
         unsafe { std::env::remove_var("PROXIMADB_SEARCH_MORSEL_DEGREE") };
-        assert_eq!(
-            INFLIGHT_SCANS.load(Ordering::Relaxed),
-            0,
-            "test starts with no scans in flight (process-per-test isolation)"
-        );
+        // Relative to the starting count, so the test also holds under the
+        // shared-process `cargo test` fallback, where another search test may
+        // be mid-scan (#2442 review F8).
+        let base = INFLIGHT_SCANS.load(Ordering::Relaxed);
         let cores = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(1);
         let g1 = ScanGuard::enter();
-        assert_eq!(
-            morsel_degree(),
-            cores,
-            "a lone scan spreads across every core"
-        );
+        if base == 0 {
+            assert_eq!(
+                morsel_degree(),
+                cores,
+                "a lone scan spreads across every core"
+            );
+        }
         let g2 = ScanGuard::enter();
         assert_eq!(
             morsel_degree(),
@@ -4933,9 +4936,11 @@ mod tests {
             "a second concurrent scan must back off to the sequential rank"
         );
         drop(g2);
-        assert_eq!(morsel_degree(), cores, "back-off releases with the guard");
+        if base == 0 {
+            assert_eq!(morsel_degree(), cores, "back-off releases with the guard");
+        }
         drop(g1);
-        assert_eq!(INFLIGHT_SCANS.load(Ordering::Relaxed), 0);
+        assert_eq!(INFLIGHT_SCANS.load(Ordering::Relaxed), base);
     }
 
     /// The production arc path must COUNT ITSELF in INFLIGHT_SCANS: pre-fix,
@@ -5030,6 +5035,9 @@ mod tests {
         });
 
         let result = engine_arc.search_vectors_unified_arc(&ctx).await;
+        // Restore the process env before any assert can return early (F8).
+        // SAFETY: #[serial] + nextest process-per-test isolation.
+        unsafe { std::env::remove_var("PROXIMADB_SEARCH_PARALLEL_FILES") };
         stop.store(true, Ordering::Relaxed);
         let observed_max = sampler.join().unwrap_or(0);
         assert!(

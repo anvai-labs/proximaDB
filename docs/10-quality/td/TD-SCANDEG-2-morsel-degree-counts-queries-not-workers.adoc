@@ -1,0 +1,31 @@
+= TD-SCANDEG-2: The morsel degree counts in-flight queries, not rank workers
+:status: Open
+:date: 2026-11-06
+:tags: [search, concurrency, cpu]
+
+== Problem
+
+`morsel_degree()` returns `cores` when `INFLIGHT_SCANS == 1`. The counter
+counts in-flight QUERIES (TD-SCANDEG-1 made every entry count itself), but a
+single query fans out over D files concurrently (inter-file degree, default
+cores/2), and EACH per-file rank reads the same count of 1 — so one lone
+query can run `D × cores` rank workers. On a 16-core box with 8 segments that
+is up to 128 rank workers on 16 cores. The documented "total CPU workers ≈
+cores" invariant therefore holds across queries but not within one.
+
+== Why it is not fixed in TD-SCANDEG-1
+
+Dividing the morsel degree by the query's own inter-file degree is a POSTURE
+change, not a defect fix: the 2026-07-25 cold A/B sweep found every
+mid/high-concurrency configuration inside the box's ±30% run-to-run
+throughput variance, with regressions in matched pairs. It must be measured
+before it ships.
+
+== To close
+
+1. Pass the query's inter-file degree into the rank (or count per-file ranks
+   in a second counter) so `morsel_degree = clamp(cores / (inflight ×
+   files_in_flight), 1, cores)`.
+2. Measure QPS + p95 at client concurrency 1/4/8 on a quiet box against the
+   current posture; ship only if c=1 latency holds and c≥4 throughput does
+   not regress beyond variance.

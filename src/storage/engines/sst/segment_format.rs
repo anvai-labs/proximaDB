@@ -1760,8 +1760,8 @@ fn stage_f_decode_block(
 
 /// Process-wide bound on Stage F decode workers: one per core across every
 /// query and segment. `morsel_degree()` alone does not bound the total — the
-/// multi-file search path decodes several segments at once, and not every
-/// search path counts itself in `INFLIGHT_SCANS` — so concurrent filtered
+/// multi-file search path decodes several segments at once (each one's rank
+/// sees the same per-QUERY in-flight count — TD-SCANDEG-2) — so concurrent filtered
 /// searches queue here for cores instead of oversubscribing them.
 fn stage_f_decode_permits() -> &'static std::sync::Arc<tokio::sync::Semaphore> {
     static PERMITS: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> =
@@ -5297,6 +5297,34 @@ pub async fn rabitq_search_segment_coalesced(
     .await
 }
 
+/// Bound on peeked bytes a planner may carry from classification to consume,
+/// per arm (#2442 review F3): the D4 wave bound. Past it a range degrades to
+/// the pre-fix re-probe, so the worst case is the status quo ante.
+const CARRIED_PEEK_BUDGET_BYTES: u64 = 32 * 4 * 1024 * 1024;
+
+/// Decide whether a peek hit's bytes are worth carrying to the consume —
+/// the ONE rule both the SQ8 survivor arm and the OID-chunk arm use (F9).
+///
+/// A parent-L1 buffer is NOT carried and NOT charged (F5): it is the whole
+/// parent region already resident in DRAM, the consume slices it for free,
+/// and charging its full size against the budget starved the tiers whose
+/// carried bytes actually save a disk read (parent-L2, exact-L2).
+fn carry_peeked(
+    peeked: crate::storage::engines::sst::survivor_range_cache::PeekedBytes,
+    carried: &mut u64,
+) -> Option<crate::storage::engines::sst::survivor_range_cache::PeekedBytes> {
+    use crate::storage::engines::sst::survivor_range_cache::PeekTier;
+    if peeked.tier == PeekTier::ParentL1 {
+        return None;
+    }
+    let n = peeked.bytes.len() as u64;
+    if carried.saturating_add(n) > CARRIED_PEEK_BUDGET_BYTES {
+        return None;
+    }
+    *carried += n;
+    Some(peeked)
+}
+
 /// ADR-089 / TD-FPRUNE-1 P1: [`rabitq_search_segment_coalesced`] restricted to
 /// an optional predicate row allow-set (global row ordinals). When `Some`,
 /// Stage-1 ranks ONLY allowed rows — the survivor pool holds
@@ -5850,7 +5878,6 @@ pub async fn rabitq_search_segment_coalesced_allowed(
         // the budget a peek-hit range degrades to SiteServed(None) — the
         // consume re-probes, which is exactly the old behaviour, so the
         // worst case is the status quo ante, never worse.
-        const CARRIED_PEEK_BUDGET_BYTES: u64 = 32 * 4 * 1024 * 1024;
         let mut carried_bytes: u64 = 0;
         for fetch in &sq8_fetches {
             match survivor_cache {
@@ -5866,16 +5893,10 @@ pub async fn rabitq_search_segment_coalesced_allowed(
                         )
                         .await
                     {
-                        let budget_ok = carried_bytes.saturating_add(peeked.bytes.len() as u64)
-                            <= CARRIED_PEEK_BUDGET_BYTES;
-                        if budget_ok {
-                            carried_bytes += peeked.bytes.len() as u64;
-                            slots.push(RegionBSlot::SiteServed(Some(peeked)));
-                        } else {
-                            // Over budget: do not retain the buffer (F3);
-                            // the consume falls back to the tier walk.
-                            slots.push(RegionBSlot::SiteServed(None));
-                        }
+                        slots.push(RegionBSlot::SiteServed(carry_peeked(
+                            peeked,
+                            &mut carried_bytes,
+                        )));
                     } else {
                         match prefetched_range(&prefetched_b, fetch.start, fetch.end) {
                             Some((extent, rel)) => slots.push(RegionBSlot::Prefetched(extent, rel)),
@@ -6245,8 +6266,6 @@ pub async fn rabitq_search_segment_coalesced_allowed(
         }
         let mut chunk_slots: Vec<ChunkSlot> = Vec::with_capacity(chunk_descs.len());
         let mut chunk_cold_ranges: Vec<std::ops::Range<u64>> = Vec::new();
-        // F3 budget for the chunk arm (its own scope; same bound).
-        const CHUNK_CARRIED_PEEK_BUDGET_BYTES: u64 = 32 * 4 * 1024 * 1024;
         let mut chunk_carried_bytes: u64 = 0;
         for (desc_i, (_bi, _locals)) in block_rows.iter().enumerate() {
             let desc = &chunk_descs[desc_i];
@@ -6261,15 +6280,10 @@ pub async fn rabitq_search_segment_coalesced_allowed(
                         .peek_exact_residency(CacheKind::Other, path, desc.start, desc.range_len)
                         .await
                     {
-                        let budget_ok = chunk_carried_bytes
-                            .saturating_add(peeked.bytes.len() as u64)
-                            <= CHUNK_CARRIED_PEEK_BUDGET_BYTES;
-                        if budget_ok {
-                            chunk_carried_bytes += peeked.bytes.len() as u64;
-                            chunk_slots.push(ChunkSlot::SiteServed(Some(peeked)));
-                        } else {
-                            chunk_slots.push(ChunkSlot::SiteServed(None));
-                        }
+                        chunk_slots.push(ChunkSlot::SiteServed(carry_peeked(
+                            peeked,
+                            &mut chunk_carried_bytes,
+                        )));
                     } else {
                         chunk_slots.push(ChunkSlot::Cold(chunk_cold_ranges.len()));
                         chunk_cold_ranges.push(desc.start..desc.start + desc.range_len);
