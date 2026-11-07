@@ -39,16 +39,14 @@ impl RLPlannerIntegration {
 
     /// Extract object economy features from query context
     ///
-    /// Uses VectorObjectEconomyDirectory if available to extract block-level
-    /// statistics for cost-aware routing. Returns disabled features if
-    /// object economy directory is not available.
+    /// Always returns disabled features: no object-economy directory is
+    /// produced since TD-OEDIRWM-1. Do NOT wire a reader for the retired
+    /// `oedir/v*.bin` sidecars — any left by earlier builds list segment
+    /// files compaction has since retired.
     fn extract_object_economy_features(
         &self,
         _context: &UnifiedQueryContext<'_>,
     ) -> ObjectEconomyFeatures {
-        // TODO: Extract from context.object_economy_directory when available
-        // For now, return disabled features
-        // This will be wired in Task 5 when we load the directory at query planning time
         ObjectEconomyFeatures::disabled()
     }
 

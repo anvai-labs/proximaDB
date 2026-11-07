@@ -226,9 +226,11 @@ pub struct VectorObjectEconomyExplain {
     /// existing `freshness_mode` (which is the projection-side label).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub freshness_mode_used: Option<String>,
-    /// Current WAL cursor observed at query plan time. Compared
-    /// against `freshness_watermark_lsn` to decide whether a delta
-    /// scan was needed. `None` when no source was wired.
+    /// WAL cursor read when the delta scan ran. Informational only: no
+    /// watermark gates the scan since TD-OEDIRWM-1. `None` when the cursor
+    /// was not read (StaleOk, or no manifest service registered) — in that
+    /// case the field is OMITTED from serialized payloads (`null` never
+    /// appears), so key-presence is the signal for integrators.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_lsn_at_query: Option<u64>,
 }
@@ -268,19 +270,22 @@ impl VectorObjectEconomyExplain {
     /// touch them individually.
     ///
     /// * `mode` — the freshness mode the service honored.
-    /// * `current_lsn` — WAL cursor read at query plan time.
+    /// * `current_lsn` — WAL cursor read at query time; `None` when it was
+    ///   not read (no manifest service registered).
     /// * `scanned_records` / `scanned_bytes` — `None` when no scan ran
-    ///   (StaleOk, or watermark already covered the WAL); `Some(0)` if
-    ///   the scan ran but returned nothing.
+    ///   (StaleOk; there is no watermark skip since TD-OEDIRWM-1);
+    ///   `Some(0)` if the scan ran but returned nothing.
     pub fn record_wal_delta_scan(
         mut self,
         mode: &crate::core::search::VectorFreshnessMode,
-        current_lsn: u64,
+        current_lsn: Option<u64>,
         scanned_records: Option<u64>,
         scanned_bytes: Option<u64>,
     ) -> Self {
         self.freshness_mode_used = Some(mode.explain_label().to_string());
-        self.current_lsn_at_query = Some(current_lsn);
+        // `None` = the WAL cursor was not read (e.g. no manifest service);
+        // never a fabricated 0.
+        self.current_lsn_at_query = current_lsn;
         self.wal_delta_records_scanned = scanned_records;
         self.wal_delta_bytes = scanned_bytes;
         // `wal_delta_searched` is the existing bool field; flip it
@@ -2559,7 +2564,7 @@ mod tests {
 
         let explain = VectorObjectEconomyExplain::default().record_wal_delta_scan(
             &VectorFreshnessMode::Strong,
-            /*current_lsn*/ 250,
+            /*current_lsn*/ Some(250),
             /*scanned_records*/ Some(7),
             /*scanned_bytes*/ Some(4096),
         );
@@ -2577,13 +2582,14 @@ mod tests {
 
         let explain = VectorObjectEconomyExplain::default().record_wal_delta_scan(
             &VectorFreshnessMode::StaleOk,
-            /*current_lsn*/ 250,
+            /*current_lsn*/ None,
             /*scanned_records*/ None,
             /*scanned_bytes*/ None,
         );
 
         assert_eq!(explain.freshness_mode_used.as_deref(), Some("stale_ok"));
-        assert_eq!(explain.current_lsn_at_query, Some(250));
+        // StaleOk never reads the WAL cursor: None, not a fabricated value.
+        assert_eq!(explain.current_lsn_at_query, None);
         assert!(explain.wal_delta_records_scanned.is_none());
         assert!(explain.wal_delta_bytes.is_none());
         assert!(!explain.wal_delta_searched);
@@ -2597,7 +2603,7 @@ mod tests {
             &VectorFreshnessMode::BoundedStale {
                 max_staleness_ms: 5_000,
             },
-            42,
+            Some(42),
             Some(3),
             Some(128),
         );
