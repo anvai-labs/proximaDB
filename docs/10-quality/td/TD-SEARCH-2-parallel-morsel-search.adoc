@@ -5,7 +5,7 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | **Partial: S1 inter-file `join_all` parallelism (#1161), S2 true multi-core morsel rank with adaptive degree (#1190, #1194, #1196) shipped; S3 SearchParams audit resolved (type downsizing already done; String→enum churn declined, #1199). Open: the object-store pressure validation of S1's predicted ~6× I/O-overlap speedup (Azurite degree 1 vs 5) has not been recorded here.**
+| Status | **Partial: S1 inter-file `join_all` parallelism (#1161), S2 true multi-core morsel rank with adaptive degree (#1190, #1194, #1196) shipped — CORRECTION 2026-11-06 (TD-SCANDEG-1): the S2 multi-core inter-file `tokio::spawn` fan-out and the S2b in-flight back-off live only on the test-only ARC entry; production (`direct_search_with`) runs S1's unbounded `join_all` with no in-flight back-off; S3 SearchParams audit resolved (type downsizing already done; String→enum churn declined, #1199). Open: the object-store pressure validation of S1's predicted ~6× I/O-overlap speedup (Azurite degree 1 vs 5) has not been recorded here.**
 | Priority | **P1** (S1) — on object storage, 157 GETs/query × 50 ms ≈ 7.9 s sequential, so parallelism is critical.
 | Component | `src/storage/engines/sst/search/` (`fallback_to_direct_search`); `src/core/config.rs` (`SstConfig.search_parallel_files`); `proximadb-block-format` (`RaBitQRegion::rank_range_scored`)
 | Relates to | link:../../12-design/adr/ADR-070-axis-not-needed-for-codesign-collections.adoc[ADR-070]; link:TD-RDSTRAT-13-object-cold-probe-rank-morsels-and-round-collapse.adoc[TD-RDSTRAT-13] (reuses `PROXIMADB_SEARCH_MORSEL_DEGREE` for the coarse-probe rank); link:TD-RDSTRAT-12-bounded-parallel-read-ranges.adoc[TD-RDSTRAT-12]; TD-CACHE-1, TD-CACHE-2

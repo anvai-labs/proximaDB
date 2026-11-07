@@ -19,8 +19,9 @@
   file is driven with `join_all` on one task. So the S2b division, even if
   wired, would change behaviour only by flipping that boolean.
 * The arc entry's doc comment called it the "Arc-receiver production entry";
-  corrected in this PR. That mislabel is what made #2442's original premise
-  (fix the "dead back-off on the production arc path") look right.
+  corrected (2026-11-06, with the S2b and `search_parallel_files` comments
+  and config docs, which also described arc-only behaviour as production).
+  That mislabel made an attempted fix target the wrong entry (#2442).
 
 == Why there is no fix here
 
@@ -43,3 +44,11 @@ posture decision that needs measurement first.
    `cascade_rehydrate_reuses_the_top_k_block_fetch`, the arc half of
    `deferred_rehydrate_matches_per_segment`, and
    `centroid_directory_search_test.rs`.
+4. Enforce, don't describe: make the arc entry and the re-exported
+   `SearchCoordinator` `pub(crate)` / `#[cfg(test)]` so nothing new wires
+   into the drifted copy of the direct-search loop.
+5. Give the PRODUCTION entry its own Mandate-16a regression test:
+   `ttl_expired_pax_rows_never_return_live` runs only the arc entry; loop it
+   over both entries, as `deferred_rehydrate_matches_per_segment` already does.
+
+Related: TD-SEARCH-2 (whose S2/S2b status this corrects), TD-SCANDEG-2, TD-SCANDEG-3.

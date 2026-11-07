@@ -26,3 +26,5 @@ rank workers. If bounding: reuse the existing process-wide
 `stage_f_decode_permits()` semaphore pattern (which already bounds this same
 fan-out for Stage F decode), do not reintroduce a cores/inflight-style
 division (the rejected posture), and measure c=1 and c>=4 before and after.
+
+Related: TD-SCANDEG-1, TD-SEARCH-2.

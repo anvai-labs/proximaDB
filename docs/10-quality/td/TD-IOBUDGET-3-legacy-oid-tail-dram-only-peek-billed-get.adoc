@@ -1,6 +1,6 @@
 // Copyright (C) 2026 ProximaDB
 // SPDX-License-Identifier: Apache-2.0
-= TD-IOBUDGET-3: The legacy OID tail's DRAM-only peek pays a billed GET for L2-resident ranges
+= TD-IOBUDGET-3: DRAM-only residency peeks pay a billed GET for L2-resident ranges (legacy OID tail, Region-A coarse probe)
 :status: Open
 :date: 2026-11-06
 :tags: [cost, billing, survivor-cache, object-store]
@@ -16,12 +16,16 @@ consume's `get_or_fetch` (whose `get_or_load` checks exact-key L2) then
 serves the range from L2 without running the loader, discarding the wave
 bytes. The tenant pays for a GET it did not need.
 
+The same pattern is in `coarse_probe_survivors` (Region A, the
+`peek_memory_exact` classification feeding its `Slot::Cold` wave, consumed by
+`get_or_fetch`). Both sites live in `rabitq_search_segment_coalesced_allowed`,
+the same function as the Region B / Region D planners, which production
+search reaches.
+
 == To close
 
-1. Verify production reachability of the legacy OID tail first (trace a real
-   request to it — see TD-SCANDEG-1 for why).
-2. If reachable: switch its classification to the L2-aware
-   `peek_exact_residency`, as TD-IOBUDGET-2 did for Region D, with a test
-   that keeps the L2 entry present and asserts no wave GET is issued.
+Switch both sites' classification to the L2-aware `peek_exact_residency`, as
+TD-IOBUDGET-2 did for Region D, each with a test that keeps the L2 entry
+PRESENT and asserts no wave GET is issued for it.
 
 Related: TD-IOBUDGET-2, TD-SCANDEG-3.
