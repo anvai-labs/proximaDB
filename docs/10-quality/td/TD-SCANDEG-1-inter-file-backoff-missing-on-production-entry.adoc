@@ -8,9 +8,14 @@
 `resolve_search_parallelism` divides the inter-file scan degree by the
 number of in-flight searches (`IN_FLIGHT_SEARCHES`, S2b). That counter is
 incremented only by `InFlightSearchGuard`, acquired only in
-`search_vectors_unified_arc_inner` — the ARC entry. The arc entry is reached
-only through `SearchCoordinator`, and `SearchCoordinator::new` is constructed
-only in `coordinator.rs`'s own test module. Production traffic enters through
+`search_vectors_unified_arc_inner` — the ARC entry. No PRODUCTION request
+reaches the arc entry: its callers are `SearchCoordinator` (constructed only
+in `coordinator.rs`'s own test module) and tests that call
+`search_vectors_unified_arc` / `fallback_to_direct_search_arc` directly
+(`centroid_directory_search_test.rs`, the S2 multicore equivalence tests in
+`search/mod.rs`). Its doc comment still calls it the "Arc-receiver
+production entry" — that mislabel is what made #2442's premise look right,
+and should be corrected. Production traffic enters through
 `trait_impl.rs` → `search_vectors_unified` → `direct_search_with` (the legacy
 entry), which never acquires the guard. So on server traffic
 `IN_FLIGHT_SEARCHES` is always 0 and every concurrent query uses the full
@@ -37,12 +42,22 @@ production); review caught it, and the PR was reduced to this record.
 == To close — measure first
 
 1. On a quiet box, measure QPS + p50/p95 + object-store GETs/query at client
-   concurrency 1/4/8 against the current posture, cold and warm.
+   concurrency 1/4/8 against the current posture, cold and warm. Preconditions,
+   or both arms are identical and the null result means nothing: the AUTO
+   degree must be in effect (`search_parallel_files = 0` and
+   `PROXIMADB_SEARCH_PARALLEL_FILES` unset — `resolve_search_parallelism`
+   only divides in that case), and the bed needs more live segments than the
+   degree (it is capped at `file_count`).
 2. Only if c>=4 throughput improves without a cold-p95 regression, acquire
-   the guard on the production entry — in ONE shared place (e.g. the
-   `scope_discovery_memo` wrapper both entries use), scoped to the scan
-   itself, never to non-scan work.
-3. Delete or consolidate the test-only arc entry (`search_vectors_unified_arc`
-   / `direct_search_arc_with`): the two near-duplicate entries are how each
-   guard ended up on only one of them. Related: TD-SCANDEG-2 (worker
+   the guard on the production entry, scoped to the SCAN itself — next to
+   `ScanGuard::enter()` in `direct_search_with`, or a scan helper both entries
+   share. NOT in `scope_discovery_memo`: it wraps the whole search, including
+   the exact-route decision, AXIS rebuilds and memtable/orchestrated serves,
+   so idle-in-non-scan queries would shrink everyone's degree.
+3. Consolidate the two near-duplicate entries (`search_vectors_unified` /
+   `_arc`, `direct_search_with` / `direct_search_arc_with`) — that duplication
+   is how each guard ended up on only one of them. Port the tests that call
+   the arc entry directly (the S2 degree=1-vs-parallel equivalence test and
+   `centroid_directory_search_test.rs`) to the surviving entry first; they are
+   the only coverage of the multi-core inter-file scan. Related: TD-SCANDEG-2 (worker
    granularity), TD-SCANDEG-3 (peek re-read).

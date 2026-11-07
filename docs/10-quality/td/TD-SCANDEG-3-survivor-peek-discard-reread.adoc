@@ -12,8 +12,25 @@ bytes; the planner keeps only `.is_some()`, and the consume then reads the
 identical range again through `get_or_fetch_in_parent` / `get_or_fetch`. For
 a peek served from a DISK tier (parent-key L2 or exact-key L2), the full
 local-disk read stack (open + seek + read + CRC) is paid twice per range.
-DRAM-tier peeks cost nothing either way. The legacy OID tail peeks DRAM only
-and is unaffected.
+DRAM-tier peeks cost nothing either way.
+
+**A worse sibling — a billed GET, not a disk read.** The legacy OID tail and
+its slot planner peek DRAM ONLY (`peek_memory_exact`). A range evicted from
+L1 but still in the exact-key L2 is therefore classified Cold and put in the
+`read_ranges_prefetch_resident` wave — a BILLED object-store GET — and then
+the consume's `get_or_fetch` (whose `get_or_load` checks exact-key L2) serves
+it from L2 without running the loader, discarding the wave bytes. TD-IOBUDGET-2
+fixed exactly this for the Region-D chunk planner by making its peek
+L2-aware; the legacy OID tail never got that fix. This is the higher-priority
+half of this TD: a wasted billed GET per such range.
+
+== The disk-tier probe itself is deliberate — do not remove it
+
+`peek_parent_residency` / `peek_exact_residency` probe the L2 tiers ON
+PURPOSE and document the local-disk read as an accepted cost: without the L2
+step, L1-evicted-but-L2-resident ranges are classified Cold and re-fetched
+from object storage (the TD-IOBUDGET-2 warm-phase billing regression). The
+fix is to stop reading the SAME range twice, never to drop the probe.
 
 == Why it is not fixed yet — two designs, both with measured-in-review costs
 
@@ -26,7 +43,10 @@ chosen design's real cost:
 
 | A. Carry the bytes
 | Planner keeps the peeked `Arc<[u8]>` in the slot and serves it at consume
-  through a peek-aware seam.
+  through a peek-aware seam. Caveat: a parent-L1 peek returns the WHOLE
+  parent region, not the range — it must be sliced to `[off, off+len)` (or
+  not carried at all; the DRAM slice is free at consume), and the memory
+  estimate must not count parent hits, which share the cached Arc.
 | Transient memory the old code never held: budget is per arm per segment, so
   a query at inter-file degree 8 and 2 arms can hold ~2 GiB; the serve
   bypasses `TenantCache`'s per-tenant and L2 counters; ranges outside the

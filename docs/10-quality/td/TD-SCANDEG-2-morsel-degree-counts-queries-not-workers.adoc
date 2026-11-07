@@ -13,19 +13,24 @@ query can run `D × cores` rank workers. On a 16-core box with 8 segments that
 is up to 128 rank workers on 16 cores. The documented "total CPU workers ≈
 cores" invariant therefore holds across queries but not within one.
 
-== Why it is not fixed in TD-SCANDEG-1
+== What the evidence actually says
 
-Dividing the morsel degree by the query's own inter-file degree is a POSTURE
-change, not a defect fix: the 2026-07-25 cold A/B sweep found every
-mid/high-concurrency configuration inside the box's ±30% run-to-run
-throughput variance, with regressions in matched pairs. It must be measured
-before it ships.
+The only measurement on record — the 2026-07-25 cold A/B sweep — found the
+lone-query win (c=1 cold 5.8 -> 10.4 QPS on 3 segments) WITH this D x cores
+oversubscription, and found dividing ACROSS queries (cores/inflight) within
+noise, with regressions in matched pairs; hence today's deliberately binary
+`if inflight == 1 { cores } else { 1 }`. So the within-query oversubscription
+is NOT an established cost — it may be part of the measured c=1 win. This
+TD records the gap in the invariant's wording, not a known defect.
 
-== To close
+== If it is ever pursued
 
-1. Pass the query's inter-file degree into the rank (or count per-file ranks
-   in a second counter) so `morsel_degree = clamp(cores / (inflight ×
-   files_in_flight), 1, cores)`.
-2. Measure QPS + p95 at client concurrency 1/4/8 on a quiet box against the
-   current posture; ship only if c=1 latency holds and c≥4 throughput does
-   not regress beyond variance.
+* Do NOT reintroduce a `cores / (inflight x files_in_flight)` formula: that
+  is the cross-query division the sweep rejected, and it would shrink the
+  measured c=1 degree.
+* Reuse the existing mechanism: Stage F decode already bounds this same
+  D x cores fan-out with the process-wide `stage_f_decode_permits()`
+  semaphore (`cores` permits; its doc notes `morsel_degree()` alone does not
+  bound the total). Gating rank `spawn_blocking` work on the same kind of
+  permit caps total rank threads at `cores` without changing the c=1 degree.
+* Measure c=1 and c>=4 before and after; ship only if c=1 latency holds.
