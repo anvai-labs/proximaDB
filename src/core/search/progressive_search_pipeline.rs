@@ -841,14 +841,18 @@ impl Default for PipelineConfig {
     }
 }
 
-/// TD-FILT-1: metadata filtering is fail-loud by default. Operators can temporarily
-/// restore legacy silent-drop behavior with an explicit false value while migrating
-/// affected queries.
-fn filter_strict_enabled() -> bool {
-    let value = std::env::var("PROXIMADB_FILTER_STRICT").ok();
-    filter_strict_for_value(value.as_deref())
+// TD-FILT-1: metadata filtering is fail-loud by default. Operators can temporarily
+// restore legacy silent-drop behavior with an explicit false value while migrating
+// affected queries.
+// Env read via the shared env_kill_switch! macro (#2438 follow-up sweep);
+// filter_strict_for_value below remains as the test seam and MUST mirror
+// the macro's kill set (0|false|off|no, trimmed, case-insensitive).
+proximadb_config::env_kill_switch! {
+    /// TD-FILT-1 fail-loud metadata filtering kill-switch; default ON.
+    fn filter_strict_enabled() { gate: "PROXIMADB_FILTER_STRICT", default: true }
 }
 
+#[cfg(test)]
 fn filter_strict_for_value(value: Option<&str>) -> bool {
     !matches!(
         value.map(str::trim).map(str::to_ascii_lowercase).as_deref(),

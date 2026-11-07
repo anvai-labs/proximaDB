@@ -35,27 +35,20 @@ pub struct ClusterPlan {
     pub runs: Vec<OrderedClusterRun>,
 }
 
-/// Sort-by-code block clustering at PAX write (TD-RDSTRAT-5 S1, default ON
-/// since TD-WLP-4 / ADR-061 D3 — pre-GA "arm defaults" directive). Records are
-/// reordered by locality key at flush so blocks are spatially coherent and
-/// centroids+radii are emitted for the VOE directory. Reordering is
-/// result-preserving, so the only escape needed is the kill-switch:
-/// `PROXIMADB_PAX_BLOCK_CLUSTER=0|false|off|no` restores insertion-order
-/// writes (no centroids).
-pub fn block_cluster_enabled() -> bool {
-    !env_flag_off("PROXIMADB_PAX_BLOCK_CLUSTER")
-}
-
-/// True when `var` is explicitly set to a falsy value (kill-switch semantics:
-/// unset/unrecognized → not off).
-fn env_flag_off(var: &str) -> bool {
-    match std::env::var(var).ok().as_deref().map(str::trim) {
-        Some(v) => matches!(
-            v.to_ascii_lowercase().as_str(),
-            "0" | "false" | "off" | "no"
-        ),
-        None => false,
-    }
+// Sort-by-code block clustering at PAX write (TD-RDSTRAT-5 S1, default ON
+// since TD-WLP-4 / ADR-061 D3 — pre-GA "arm defaults" directive). Records are
+// reordered by locality key at flush so blocks are spatially coherent and
+// centroids+radii are emitted for the VOE directory. Reordering is
+// result-preserving, so the only escape needed is the kill-switch:
+// `PROXIMADB_PAX_BLOCK_CLUSTER=0|false|off|no` restores insertion-order
+// writes (no centroids).
+// Kill-switch read via the shared env_kill_switch! macro (#2438 follow-up
+// sweep); formerly the local env_flag_off helper — same kill set.
+proximadb_config::env_kill_switch! {
+    /// PAX block-cluster mode kill-switch: ON unless
+    /// PROXIMADB_PAX_BLOCK_CLUSTER=0|false|off|no restores insertion-order
+    /// writes (no centroids).
+    pub fn block_cluster_enabled() { gate: "PROXIMADB_PAX_BLOCK_CLUSTER", default: true }
 }
 
 /// TD-WLP-4/WLP-9 eval opt-in: upgrade the **flush** (L0) ordering from the
@@ -697,13 +690,14 @@ pub(crate) fn finish_ivf_probe_classifier(
     })
 }
 
-/// TD-PAXDIR-1 D3: WRITE gate — compaction classifies its output with the
-/// collection's shared coarse model (the directory's dominant model) instead
-/// of training a new one, so every compacted segment speaks one cell space.
-/// Default ON since D8 (the P5b gate run passed); kill-switch like every
-/// PAXDIR gate.
-pub fn shared_model_enabled() -> bool {
-    env_kill_switch_off("PROXIMADB_PAX_WRITE_SHARED_MODEL")
+// TD-PAXDIR-1 D3: WRITE gate — compaction classifies its output with the
+// collection's shared coarse model (the directory's dominant model) instead
+// of training a new one, so every compacted segment speaks one cell space.
+// Default ON since D8 (the P5b gate run passed); kill-switch like every
+// PAXDIR gate.
+proximadb_config::env_kill_switch! {
+    /// Kill-switch gate; default ON (0|false|off|no disables).
+    pub fn shared_model_enabled() { gate: "PROXIMADB_PAX_WRITE_SHARED_MODEL", default: true }
 }
 
 /// Retrain when more than this fraction of an output's rows fall outside
@@ -1096,18 +1090,6 @@ fn gate_value_on(value: Option<&str>) -> bool {
             "1" | "true" | "on" | "yes"
         )
     })
-}
-
-/// Kill-switch read: ON unless set to `0|off|false|no` (unset is ON).
-pub(crate) fn env_kill_switch_off(name: &str) -> bool {
-    std::env::var(name)
-        .map(|v| {
-            !matches!(
-                v.trim().to_ascii_lowercase().as_str(),
-                "0" | "off" | "false" | "no"
-            )
-        })
-        .unwrap_or(true)
 }
 
 pub(crate) fn env_gate_on(name: &str) -> bool {

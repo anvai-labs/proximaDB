@@ -35,12 +35,11 @@ use crate::storage::engines::sst::segment_format::CascadeHit;
 /// The tracing target of the deferred path.
 pub(crate) const TRACE_TARGET: &str = "proximadb::sst::deferred";
 
-/// O1 kill switch: `PROXIMADB_PAX_READ_DEFERRED_REHYDRATE=0|off|false|no`
-/// resolves OIDs per segment before the merge, as before.
-pub(crate) fn deferred_rehydrate_enabled() -> bool {
-    crate::storage::engines::sst::block_cluster::env_kill_switch_off(
-        "PROXIMADB_PAX_READ_DEFERRED_REHYDRATE",
-    )
+// O1 kill switch: `PROXIMADB_PAX_READ_DEFERRED_REHYDRATE=0|off|false|no`
+// resolves OIDs per segment before the merge, as before.
+proximadb_config::env_kill_switch! {
+    /// O1 deferred rehydration kill-switch; default ON.
+    pub(crate) fn deferred_rehydrate_enabled() { gate: "PROXIMADB_PAX_READ_DEFERRED_REHYDRATE", default: true }
 }
 
 /// A fresh deferred table when O1 is on (`None` otherwise), logging the
