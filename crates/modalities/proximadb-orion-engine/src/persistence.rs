@@ -189,7 +189,6 @@ pub struct OrionPersistence {
 
     /// Snapshot configuration
     max_snapshots: usize,
-    incremental_snapshots: bool,
 }
 
 impl std::fmt::Debug for OrionPersistence {
@@ -203,7 +202,6 @@ impl std::fmt::Debug for OrionPersistence {
             .field("compression", &self.compression)
             .field("compression_level", &self.compression_level)
             .field("max_snapshots", &self.max_snapshots)
-            .field("incremental_snapshots", &self.incremental_snapshots)
             .finish()
     }
 }
@@ -330,7 +328,6 @@ impl OrionPersistence {
             compression: CompressionAlgorithm::Zstd,
             compression_level: 3,
             max_snapshots: 10,
-            incremental_snapshots: false,
             last_replay_applied: std::sync::atomic::AtomicU64::new(0),
             last_truncate_reclaimed: std::sync::atomic::AtomicU64::new(0),
             replaying: std::sync::atomic::AtomicBool::new(false),

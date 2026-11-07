@@ -80,14 +80,6 @@ fn record_vector(record: &ProximaRecord) -> &[f32] {
         .unwrap_or(&[])
 }
 
-/// File type enum for cache key discrimination
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum FileType {
-    SST,
-    Parquet,
-    Index,
-}
-
 /// Wrapper for either memory-mapped data or owned Vec
 /// Enables zero-copy reads on local filesystem while maintaining cloud compatibility
 pub enum MmapOrVec {
@@ -160,44 +152,6 @@ pub struct SharedSstFormatReader {
     /// ✅ Reusable distance compute engine - created once and passed to all search operations
     #[allow(dead_code)]
     distance_compute: Arc<proximadb_distance_kernel::engine::UnifiedDistanceCompute>,
-}
-
-/// Shared SST format writer with compression and Proxima encoding
-/// Complements the reader for full read/write support
-pub struct SharedSstFormatWriter {
-    /// Filesystem port for I/O operations (TD-DECOMP-75 seam)
-    #[allow(dead_code)]
-    filesystem: Arc<dyn FilesystemPort>,
-
-    /// Unified filesystem for write operations
-    #[allow(dead_code)]
-    caching_filesystem: Arc<dyn proximadb_storage_filesystem_types::FileSystem>,
-
-    /// Collection ID for filename-based cache keys
-    #[allow(dead_code)]
-    collection_id: String,
-
-    /// Compression configuration
-    #[allow(dead_code)]
-    compression_config: Option<proximadb_proto::proximadb_v1::CompressionConfig>,
-
-    /// Stats for monitoring writes
-    #[allow(dead_code)]
-    stats: Arc<WriterStats>,
-}
-
-/// Writer statistics for monitoring
-pub struct WriterStats {
-    #[allow(dead_code)]
-    blocks_written: AtomicU64,
-    #[allow(dead_code)]
-    bytes_written: AtomicU64,
-    #[allow(dead_code)]
-    bytes_compressed: AtomicU64,
-    #[allow(dead_code)]
-    compression_time_ms: AtomicU64,
-    #[allow(dead_code)]
-    writes_total: AtomicU64,
 }
 
 #[derive(Clone)]

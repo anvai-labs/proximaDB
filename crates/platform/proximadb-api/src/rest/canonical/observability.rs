@@ -43,36 +43,6 @@ pub struct ObservabilityRestState {
 
 // ── Legacy stub types kept for re-export compatibility ────────────────────────
 
-/// Logs handler stub.
-pub struct LogsHandler;
-
-impl LogsHandler {
-    pub fn new() -> Self {
-        Self
-    }
-}
-
-impl Default for LogsHandler {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// Metrics handler stub.
-pub struct MetricsHandler;
-
-impl MetricsHandler {
-    pub fn new() -> Self {
-        Self
-    }
-}
-
-impl Default for MetricsHandler {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 // ── Request / Response types ──────────────────────────────────────────────────
 
 /// REST request body for observability-namespace creation.
@@ -1131,7 +1101,5 @@ mod tests {
         assert!(matches!(query, RestError::NotImplemented(_)));
 
         let _router = create_observability_router();
-        let _logs = LogsHandler;
-        let _metrics = MetricsHandler::new();
     }
 }

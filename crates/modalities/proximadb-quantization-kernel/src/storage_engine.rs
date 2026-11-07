@@ -286,95 +286,8 @@ impl StorageQuantizationEngine {
 
     /// Quantize a batch of vector slices (zero-copy version)
     /// This avoids cloning vectors and works directly with references
-    pub async fn quantize_batch_slices(
-        &self,
-        vectors: &[&[f32]],
-        ids: Option<&[String]>,
-    ) -> Result<Vec<StorageQuantizedData>> {
-        let mut results = Vec::with_capacity(vectors.len());
-
-        for (i, vector) in vectors.iter().enumerate() {
-            let id = ids.map_or_else(|| format!("vec_{}", i), |ids| ids[i].clone());
-
-            let mut data = StorageQuantizedData {
-                id,
-                primary: None,
-                filter: None,
-                fast: None,
-                dimension: vector.len(),
-                metadata: QuantizationMetadata {
-                    codebook_id: None,
-                    scale: None,
-                    offset: None,
-                    norm: None,
-                },
-            };
-
-            // Generate primary quantization with selected level
-            if let Some(ref level) = self.config.primary_level {
-                // Check if it's a PQ level by examining the internal structure
-                let level_with_codebook = if let Some(QuantizationScheme::Pq(_)) = &level.level_type
-                {
-                    // For PQ levels, use the configured level directly
-                    level.clone()
-                } else {
-                    level.clone()
-                };
-                // Pass slice directly - no conversion needed
-                data.primary = Some(
-                    self.unified_engine
-                        .quantize(vector, &level_with_codebook)
-                        .await?,
-                );
-            }
-
-            // Generate filter quantization
-            if let Some(ref level) = self.config.filter_level {
-                // Pass slice directly - no conversion needed
-                data.filter = Some(self.unified_engine.quantize(vector, level).await?);
-            }
-
-            // Generate fast quantization
-            if let Some(ref level) = self.config.fast_level {
-                // Pass slice directly - no conversion needed
-                data.fast = Some(self.unified_engine.quantize(vector, level).await?);
-            }
-
-            results.push(data);
-        }
-
-        Ok(results)
-    }
 
     /// Quantize a batch of vector slices with a specific level (zero-copy version)
-    pub async fn quantize_batch_slices_with_level(
-        &self,
-        vectors: &[&[f32]],
-        level: UnifiedQuantizationLevel,
-    ) -> Result<Vec<StorageQuantizedData>> {
-        let mut results = Vec::with_capacity(vectors.len());
-
-        for (i, vector) in vectors.iter().enumerate() {
-            // Pass slice directly - no conversion needed
-            let quantized = self.unified_engine.quantize(vector, &level).await?;
-
-            results.push(StorageQuantizedData {
-                id: format!("vec_{}", i),
-                primary: Some(quantized),
-                filter: None,
-                fast: None,
-                dimension: vector.len(),
-                metadata: QuantizationMetadata {
-                    codebook_id: None,
-                    scale: None,
-                    offset: None,
-                    norm: None,
-                },
-            });
-        }
-
-        Ok(results)
-    }
 
     /// Progressive search through stages
     pub async fn progressive_search(
@@ -495,40 +408,6 @@ impl StorageQuantizationEngine {
 
     /// Precompute distance lookup table for PQ quantization
     /// This significantly speeds up PQ-based similarity calculations
-    fn precompute_pq_distance_table(
-        &self,
-        query: &[f32],
-        num_subvectors: usize,
-        bits_per_code: u8,
-    ) -> Result<Vec<Vec<f32>>> {
-        let subvector_dim = query.len() / num_subvectors;
-        let num_centroids = 1 << bits_per_code; // 2^bits_per_code
-
-        // Create distance table: [num_subvectors][num_centroids]
-        let mut distance_table = Vec::with_capacity(num_subvectors);
-
-        for subvec_idx in 0..num_subvectors {
-            let start_idx = subvec_idx * subvector_dim;
-            let end_idx = start_idx + subvector_dim;
-            let query_subvec = &query[start_idx..end_idx];
-
-            // Compute distances to all centroids for this subvector
-            let mut distances = Vec::with_capacity(num_centroids);
-
-            // For now, use squared L2 distance (most common for PQ)
-            // In a real implementation, this would use the actual codebook centroids
-            for _centroid_idx in 0..num_centroids {
-                // Placeholder: In practice, retrieve actual centroid from codebook
-                // For now, just compute a dummy distance
-                let distance = query_subvec.iter().map(|&x| x * x).sum::<f32>().sqrt();
-                distances.push(distance);
-            }
-
-            distance_table.push(distances);
-        }
-
-        Ok(distance_table)
-    }
 
     /// SIMD-optimized distance calculation leveraging existing infrastructure
     fn calculate_simd_optimized_distance(
@@ -781,22 +660,6 @@ impl StorageQuantizationEngine {
 
     /// Get or create PQ codebook for vector
     #[allow(dead_code)]
-    fn get_or_create_codebook(&self, _quantized_vector: &QuantizedVector) -> Result<Vec<Vec<f32>>> {
-        // For now, return a dummy codebook
-        // In practice, this would be stored during training
-        let subvectors = 8; // Example: 8 subvectors
-        let centroids_per_subvector = 256; // Example: 256 centroids
-        let subvector_dim = 4; // Example: 4 dimensions per subvector
-
-        let mut codebook = Vec::with_capacity(subvectors);
-        for _ in 0..subvectors {
-            let size = centroids_per_subvector * subvector_dim;
-            let centroid_data = vec![0.1; size]; // Placeholder values
-            codebook.push(centroid_data);
-        }
-
-        Ok(codebook)
-    }
 
     /// Fast approximation stage using INT8
     async fn fast_approximation_stage(
@@ -882,27 +745,10 @@ impl StorageQuantizationEngine {
             });
         }
 
-        // Check if we have PQ quantization configuration and precompute distance table
-        if let Some(ref level) = self.config.primary_level
-            && let Some(QuantizationScheme::Pq(pq)) = &level.level_type
-        {
-            // Precompute distance table for faster PQ distance calculations
-            let _distance_table = self.precompute_pq_distance_table(
-                query,
-                pq.num_subvectors as usize,
-                pq.bits_per_code as u8,
-            )?;
-            debug!(
-                "Precomputed distance table for PQ ranking with {} subvectors",
-                pq.num_subvectors
-            );
-            // Note: The distance table would be used in an optimized version of
-            // calculate_batch_distances that accepts precomputed tables
-        }
-
-        // Calculate distances
-        // Note: Distance table optimization is prepared but the actual optimized computation
-        // would need to be implemented in the unified_engine.calculate_batch_distances method
+        // NOTE (R4 dead-code wave): a "precompute PQ distance table" block used to
+        // run here — its result was bound to `_distance_table` and discarded
+        // (the optimized calculate_batch_distances was never built). The dummy
+        // fn and the dead block are deleted together.
         let distances = self
             .unified_engine
             .calculate_batch_distances(query, &pq_batch, metric)
@@ -1051,19 +897,10 @@ impl StorageQuantizationEngine {
     }
 
     /// Check if codebook is cached
-    pub fn has_cached_codebook(&self, codebook_id: &str) -> bool {
-        self.codebooks.contains_key(codebook_id)
-    }
 
     /// Clear all cached codebooks
-    pub fn clear_codebook_cache(&self) {
-        self.codebooks.clear();
-    }
 
     /// Get number of cached codebooks
-    pub fn cached_codebook_count(&self) -> usize {
-        self.codebooks.len()
-    }
 
     /// List all cached codebook IDs
     pub fn list_cached_codebooks(&self) -> Vec<String> {
