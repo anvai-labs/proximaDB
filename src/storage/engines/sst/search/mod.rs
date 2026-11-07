@@ -985,7 +985,20 @@ impl SstEngine {
         &self,
         ctx: &StorageQueryContext,
     ) -> Result<Vec<OptimizedSearchRecord>> {
-        scope_discovery_memo(self.search_vectors_unified_inner(ctx)).await
+        // TD-CACHEC-1: scope survivor-cache reads of THIS search future to its
+        // catalog collection id. Here, not in the trait impl, so callers
+        // holding a concrete `SstEngine` (inherent method wins) are covered
+        // too. An unidentified context is left unattributed.
+        let collection_id = ctx.collection.id.as_str();
+        let search = scope_discovery_memo(self.search_vectors_unified_inner(ctx));
+        if collection_id.is_empty() {
+            return search.await;
+        }
+        crate::storage::engines::sst::survivor_range_cache::with_read_collection(
+            collection_id,
+            search,
+        )
+        .await
     }
 
     async fn search_vectors_unified_inner(

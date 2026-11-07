@@ -85,9 +85,8 @@ fn outcome_index(outcome: CacheReadOutcome) -> usize {
     }
 }
 
-/// Series key: the requesting cache scope (rendered by [`CacheScope::label`],
-/// the same tenant label the per-tenant survivor series use) and the catalog
-/// collection id. Request scopes are only `StableTenant` or `Shared`, so
+/// Series key: the requesting cache scope (rendered by [`CacheScope::label`]:
+/// the numeric stable tenant id, or `shared`) and the catalog collection id. Request scopes are only `StableTenant` or `Shared`, so
 /// distinct keys render distinct labels.
 type SeriesKey = (CacheScope, Arc<str>);
 
@@ -158,7 +157,11 @@ impl CollectionSeries {
     fn try_fast(&self, key: &SeriesKey, idx: usize, now_secs: u64) -> bool {
         use std::sync::atomic::Ordering::Relaxed;
         if let Some(series) = self.admitted.get(key) {
-            series.last_seen_secs.store(now_secs, Relaxed);
+            // Store only when the second changed: avoids bouncing one cache
+            // line across cores on every lookup of a hot collection.
+            if series.last_seen_secs.load(Relaxed) != now_secs {
+                series.last_seen_secs.store(now_secs, Relaxed);
+            }
             series.counters[idx].inc();
             return true;
         }
@@ -184,7 +187,20 @@ impl CollectionSeries {
             self.overflow[idx].inc();
             return;
         }
-        let _admit = self.admit_lock.lock().unwrap_or_else(|p| p.into_inner());
+        // While full, never block a lookup on admission: if another lookup
+        // holds the lock (evicting), count this one as overflow.
+        let _admit = if self.admitted_count.load(Relaxed) >= self.cap {
+            match self.admit_lock.try_lock() {
+                Ok(guard) => guard,
+                Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    self.overflow[idx].inc();
+                    return;
+                }
+            }
+        } else {
+            self.admit_lock.lock().unwrap_or_else(|p| p.into_inner())
+        };
         if self.try_fast(&key, idx, now_secs) {
             return;
         }
@@ -249,12 +265,13 @@ impl CollectionSeries {
     }
 }
 
-/// Production registry: 200 series, a pair idle for an hour gives up its slot.
+/// Production registry: 200 series; a pair idle for a day gives up its slot
+/// (long enough that a collection queried daily keeps its series).
 static COLLECTION_SERIES: std::sync::LazyLock<Option<CollectionSeries>> =
     std::sync::LazyLock::new(|| {
         crate::metrics::operational_metrics::SURVIVOR_CACHE_COLLECTION_READS_TOTAL
             .clone()
-            .map(|family| CollectionSeries::new(family, 200, 3_600))
+            .map(|family| CollectionSeries::new(family, 200, 86_400))
     });
 
 /// Monotonic seconds since first use (idle eviction clock).
@@ -265,7 +282,7 @@ fn monotonic_secs() -> u64 {
 }
 
 /// Record ONE logical lookup that returned bytes, for the requesting
-/// `scope`: the per-query io_trace L1 counters (unchanged semantics) and,
+/// `scope`: the per-query io_trace L1 counters and,
 /// inside an SST engine search, the per-collection attribution counter
 /// (TD-CACHEC-1). Outside an engine search (flush seeding, compaction, warm
 /// replay) nothing is attributed.
@@ -528,8 +545,7 @@ impl SurvivorRangeCache {
         }
         let scope = request_cache_scope();
         self.track_hot_key(&scope, kind, path, off, len);
-        let record_scope = scope.clone();
-        let exact_key = CacheKey::with_scope(scope, kind, format!("{path}:{off}:{len}"));
+        let exact_key = CacheKey::with_scope(scope.clone(), kind, format!("{path}:{off}:{len}"));
         let weight = len.try_into().unwrap_or(u32::MAX);
         let parent_key = CacheKey::shared(
             CacheKind::QuantizedCodes,
@@ -542,7 +558,7 @@ impl SurvivorRangeCache {
             return self.get_or_fetch(kind, path, off, len, loader).await;
         };
         if let Some((exact, outcome)) = self.inner.get_with_outcome(&exact_key).await {
-            record_lookup(&record_scope, outcome);
+            record_lookup(&scope, outcome);
             self.sync_prometheus();
             return Ok(exact);
         }
@@ -550,7 +566,7 @@ impl SurvivorRangeCache {
         if let Some((parent, outcome)) = self.inner.get_with_outcome(&parent_key).await
             && let Some(slice) = parent.get(start..end)
         {
-            record_lookup(&record_scope, outcome);
+            record_lookup(&scope, outcome);
             // A complete write-time seed already occupies the useful cache
             // slot. Do not admit every query-dependent slice as another exact
             // entry: doing so duplicates the region, evicts its parent, and
@@ -570,7 +586,7 @@ impl SurvivorRangeCache {
                 self.inner
                     .insert_memory_only(exact_key, weight, bytes.clone())
                     .await;
-                record_lookup(&record_scope, CacheReadOutcome::PersistentHit);
+                record_lookup(&scope, CacheReadOutcome::PersistentHit);
                 self.sync_prometheus();
                 return Ok(bytes);
             }
@@ -585,9 +601,10 @@ impl SurvivorRangeCache {
             })
             .await;
         match &result {
-            // The real outcome: a concurrent fill or the exact-key L2 can serve
-            // this lookup, so it is not always a load.
-            Ok((_, outcome)) => record_lookup(&record_scope, *outcome),
+            // CHANGED (TD-CACHEC-1): the real outcome, for io_trace too. A
+            // concurrent fill or the exact-key L2 can serve this lookup; it
+            // used to be recorded as a miss unconditionally.
+            Ok((_, outcome)) => record_lookup(&scope, *outcome),
             // Unchanged: this seam has always counted a failed load as a miss.
             Err(_) => crate::observability::io_trace::record_survivor_l1s(0, 1),
         }
@@ -696,8 +713,7 @@ impl SurvivorRangeCache {
         // TD-CACHE-1 S2: count this range toward the tenant's warm set (the
         // shutdown manifest's source). Bounded map; low-hit half pruned at cap.
         self.track_hot_key(&scope, kind, path, off, len);
-        let record_scope = scope.clone();
-        let key = CacheKey::with_scope(scope, kind, format!("{path}:{off}:{len}"));
+        let key = CacheKey::with_scope(scope.clone(), kind, format!("{path}:{off}:{len}"));
         // Ranges are ≤ a few MiB; cap the weight at u32::MAX defensively.
         let weight: u32 = len.try_into().unwrap_or(u32::MAX);
         let result = self
@@ -709,7 +725,7 @@ impl SurvivorRangeCache {
             .await;
         // Unchanged: this seam has never recorded a failed load.
         if let Ok((_, outcome)) = &result {
-            record_lookup(&record_scope, *outcome);
+            record_lookup(&scope, *outcome);
         }
         self.sync_prometheus();
         result.map(|(value, _)| value)
@@ -1664,7 +1680,7 @@ mod tests {
                 .any(|m| {
                     m.get_label()
                         .iter()
-                        .any(|l| l.name() == "tenant_id" && l.value() == "910002")
+                        .any(|l| l.name() == "tenant_stable_id" && l.value() == "910002")
                 });
         assert!(!any_for_tenant);
     }
@@ -1674,7 +1690,7 @@ mod tests {
     fn registry(cap: usize, idle: u64) -> CollectionSeries {
         let family = prometheus::IntCounterVec::new(
             prometheus::Opts::new("test_collection_reads_total", "test"),
-            &["tenant_id", "collection_id", "outcome"],
+            &["tenant_stable_id", "collection_id", "outcome"],
         )
         .expect("valid test family");
         CollectionSeries::new(family, cap, idle)
@@ -1699,7 +1715,7 @@ mod tests {
                         .find(|l| l.name() == name)
                         .map(|l| l.value().to_string())
                 };
-                label("tenant_id").as_deref() == Some(tenant)
+                label("tenant_stable_id").as_deref() == Some(tenant)
                     && label("collection_id").as_deref() == Some(collection)
             })
     }

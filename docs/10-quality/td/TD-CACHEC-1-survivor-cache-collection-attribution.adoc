@@ -22,9 +22,11 @@ GETs were unbilled.
 
 == Fix
 
-* The SST engine's search entry (`SstEngine::search_vectors_unified`, the
-  trait impl every search kernel reaches, `unified_search_v1` and
-  `unified_search_native` alike) runs the search future inside
+* The SST engine's search entry (the inherent
+  `SstEngine::search_vectors_unified`, which the `UnifiedStorageFormat` trait
+  impl delegates to and which concrete-typed callers reach directly; every
+  search kernel, `unified_search_v1` and `unified_search_native` alike, lands
+  here) runs the search future inside
   `survivor_range_cache::with_read_collection(ctx.collection.id, ..)`, a
   `tokio::task_local!` scope holding the immutable catalog collection id.
   The scope belongs to that FUTURE, so a concurrent sibling future in the same
@@ -40,23 +42,26 @@ GETs were unbilled.
 * `survivor_range_cache::record_lookup` is the single recording point for one
   logical lookup that returned bytes; it replaced the five inline
   `record_survivor_l1s` sites. The in-parent loader site records the REAL
-  outcome: it hard-coded a miss even when a concurrent fill or the exact-key
-  L2 served the lookup. That fix only matters under a concurrent-fill race, so
+  outcome, in io_trace too (a deliberate change): it hard-coded a miss even
+  when a concurrent fill or the exact-key L2 served the lookup. That fix only matters under a concurrent-fill race, so
   no deterministic test pins it. Failed loads keep each seam's existing io_trace
   accounting: the in-parent seam counts a miss, `get_or_fetch` records nothing.
   They are never attributed. Changing L1 semantics is out of scope here.
-* `proximadb_survivor_cache_collection_reads_total{tenant_id, collection_id,
-  outcome}` with outcome `hot` (DRAM), `l2` (persistent local store) or `cold`
+* `proximadb_survivor_cache_collection_reads_total{tenant_stable_id,
+  collection_id, outcome}` with outcome `hot` (DRAM), `l2` (persistent local store) or `cold`
   (the loader ran). It holds true counters and only counts inside an engine
   search scope, so flush seeding, compaction and warm replay are never
   attributed.
-  `tenant_id` uses the same label as the per-tenant survivor series (stable id,
-  or `shared`). At most 200 (tenant, collection) pairs hold their own series
+  `tenant_stable_id` is the catalog stable tenant id (or `shared`), the value
+  the per-tenant survivor series render. It is deliberately NOT named
+  `tenant_id`: the billing families label `tenant_id` with the tenant name, so
+  joining the two needs the catalog id mapping. At most 200 (tenant, collection) pairs hold their own series
   (admission is under one lock, so the bound is exact). A new pair arriving at
-  the cap first evicts pairs idle for an hour, removing their series (with a
+  the cap first evicts pairs idle for a day, removing their series (with a
   re-check at removal, so a concurrently read pair is kept), so dropped
   collections never pin the cap. While the registry is full and no pair can be
-  idle yet, overflow lookups skip the lock. If none are idle, the new pair counts
+  idle yet, overflow lookups skip the lock, and a saturated lookup never
+  blocks on another's eviction (it `try_lock`s and counts as overflow). If none are idle, the new pair counts
   under `other`/`other`. Counter handles are resolved once per pair, so the
   per-lookup path does no label hashing.
 * `hot` means the cache served the bytes from DRAM. Some callers prefetch a
@@ -80,6 +85,10 @@ Hot-hit ratio per collection = `hot / (hot + l2 + cold)`.
   shared-scoped), and a persistent-L2 hit counts as an L1 miss. Prefer the new
   per-collection counter for ratios; aligning the tenant series to logical
   lookups is follow-up work.
+* The engine-level attribution test depends on process state (the
+  shared survivor cache's budget, the global registry). It is reliable under
+  nextest's process-per-test isolation (the project runner) but can fold
+  into `other` under a long shared-process `cargo test` run.
 * The TENANT label needs a request io_trace scope (the collection does not).
   Today only REST v2 records search, gRPC v2 search / search_stream, Arrow
   Flight and pgwire open one; elsewhere reads label as `shared`.
@@ -97,9 +106,11 @@ Hot-hit ratio per collection = `hot / (hot + l2 + cold)`.
   follow-up.
 * Idle eviction removes a pair's series; if the pair returns, its counters
   restart at 0. Prometheus `rate()` / `increase()` treat that as a counter
-  reset; a consumer of raw cumulative values must do the same.
+  reset, but drop the first sample of a new series. A collection read less
+  often than once a day while the registry is full is therefore undercounted.
+  The day-long window keeps daily collections resident.
 * Admission is first-come among non-idle pairs, not ranked by traffic; a
-  busy 201st pair counts under `other` until some pair idles for an hour.
+  busy 201st pair counts under `other` until some pair idles for a day.
 * Rejected alternative: deriving tenant and collection from the DrPath inside
   the cache key. Legacy `{base}/{id}/data/` and typed
   `accounts/{a}/{n}/{c}/data/` layouts coexist and can flip at restart, and
