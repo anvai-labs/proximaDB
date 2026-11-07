@@ -29,7 +29,6 @@ ProximaDB's intelligent storage engines automatically optimize for your specific
 .ProximaDB automatically selects the optimal storage engine for your workload
 image::https://raw.githubusercontent.com/anvai-labs/proximaDB/main/docs/assets/storage-engines-hero.svg[Storage Engine Selection,700,align=center]
 
-
 [source,mermaid]
 ----
 %%{init: {"theme": "base", "themeVariables": {"primaryColor": "#4a90e2", "primaryTextColor": "#ffffff", "primaryBorderColor": "#2e5c8a", "lineColor": "#5a5a5a", "sectionBkgColor": "#f8fafc", "altSectionBkgColor": "#e2e8f0", "gridColor": "#cbd5e0", "tertiaryColor": "#f7fafc", "background": "#ffffff"}}%%
@@ -235,7 +234,7 @@ test-only (`#[cfg(test)]`, TD-SCANDEG-1). Production SST search enters at
 `SstEngine::search_vectors_unified` -> `fallback_to_direct_search` ->
 `direct_search_with`.
 
-**Location**: `src/storage/engines/impls/sst/search/coordinator.rs`
+**Location**: `src/storage/engines/sst/search/coordinator.rs` (test-only)
 
 The Search Coordinator provides intelligent strategy selection for optimal query performance:
 

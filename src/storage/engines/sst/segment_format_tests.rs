@@ -6291,7 +6291,9 @@ async fn small_rabitq_segment(
 struct TraceGetsGuard;
 impl TraceGetsGuard {
     fn on() -> Self {
-        // SAFETY: these tests are #[serial]; nextest also isolates processes.
+        // SAFETY: nextest (the supported runner) gives each test its own
+        // process. Under `cargo test`, non-#[serial] tests elsewhere share the
+        // env and the global GET trace — run these under nextest.
         unsafe { std::env::set_var("PROXIMADB_TRACE_GETS", "1") };
         Self
     }

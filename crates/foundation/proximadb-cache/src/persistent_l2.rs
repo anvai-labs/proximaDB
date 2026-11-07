@@ -281,6 +281,18 @@ impl PersistentByteStore {
         self.inner.entries.get(key).map(|meta| meta.value_len)
     }
 
+    /// [`Self::entry_len`] that also refreshes the entry's LRU recency — the
+    /// residency CLASSIFICATION probe (TD-IOBUDGET-3). A range a planner
+    /// classifies resident is about to be read; without the tick, the same
+    /// query's write-through `put`s for its cold ranges would evict exactly
+    /// those untouched entries first. Index-only: no disk read, no CRC, no
+    /// protection-group hit (the consume read records that once).
+    pub fn touch_entry_len(&self, key: &str) -> Option<u64> {
+        let meta = self.inner.entries.get(key)?;
+        meta.touch.store(self.next_tick(), Ordering::Relaxed);
+        Some(meta.value_len)
+    }
+
     /// Whether any protection group is registered (lock-free). With none,
     /// no grant asks for residency (SC4-4 read fast path).
     pub fn policy_active(&self) -> bool {
@@ -1879,6 +1891,42 @@ mod tests {
     };
     use std::io::{Seek, SeekFrom, Write};
     use std::sync::Arc;
+
+    /// TD-IOBUDGET-3: `touch_entry_len` refreshes recency without a read, so
+    /// a classified-resident entry outlives an older untouched one when the
+    /// next write-through forces an eviction.
+    #[tokio::test]
+    async fn touch_entry_len_protects_a_classified_entry_from_lru_eviction() {
+        let dir = tempfile::tempdir().expect("test tempdir");
+        let value: Arc<[u8]> = Arc::from(vec![1u8; 4096].as_slice());
+        let one = PersistentByteStore::stored_size("a", 4096);
+        // Room for two entries, not three.
+        let store = PersistentByteStore::open(dir.path(), one * 2 + one / 2).expect("open");
+        for key in ["a", "b"] {
+            store
+                .put(key, L2Class::Survivor, value.clone())
+                .await
+                .expect("put");
+        }
+        assert_eq!(
+            store.touch_entry_len("a"),
+            Some(4096),
+            "touch reports the length"
+        );
+        assert_eq!(store.touch_entry_len("missing"), None);
+        store
+            .put("c", L2Class::Survivor, value.clone())
+            .await
+            .expect("put c");
+        assert!(
+            store.entry_len("a").is_some(),
+            "the touched entry must survive"
+        );
+        assert!(
+            store.entry_len("b").is_none(),
+            "the untouched LRU entry is evicted"
+        );
+    }
 
     #[tokio::test]
     async fn value_survives_store_reopen() {

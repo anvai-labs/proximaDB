@@ -34,7 +34,9 @@ Related: TD-IOBUDGET-2, TD-SCANDEG-3.
 
 Both sites — and Region D, which TD-IOBUDGET-2 had moved to a byte-reading
 L2 peek — now classify with `SurvivorRangeCache::is_exact_resident`: DRAM, or
-the exact-key L2 INDEX (`PersistentByteStore::entry_len`). No bytes are read
+the exact-key L2 INDEX (`PersistentByteStore::touch_entry_len`: key
+presence plus an LRU recency tick, so the same query's write-through cannot
+evict a range it just classified resident). No bytes are read
 to classify, so a resident range is read once (at consume), classification
 costs map lookups rather than serial disk reads, and no L2 group-hit stats
 are double-counted. The consume arms are unchanged; a classification that
@@ -54,6 +56,5 @@ tail is narrower (non-RG segments, plus deferral off or a deferred-resolve
 retry, plus a hand-off over its fetch budget).
 
 Accepted residual: an L2 entry evicted between classification and consume
-(e.g. by an earlier slot's write-through on a near-full store) costs one
-unbatched ranged GET instead of riding the wave — the same window the DRAM
-race already had.
+(the recency tick makes this unlikely, but a write-through burst can still
+exceed it) costs one unbatched ranged GET instead of riding the wave.

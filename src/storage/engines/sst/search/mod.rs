@@ -309,19 +309,24 @@ fn resolve_search_parallelism(config_value: u16) -> u16 {
     {
         return resolve_parallel_degree(n);
     }
-    let base = resolve_parallel_degree(config_value);
-    // S2b: when auto (config_value == 0), divide by in-flight queries. Only
-    // the test-only arc entry counts in-flight searches, so the division is
-    // compiled into test builds only — production has no in-flight back-off
-    // (TD-SCANDEG-1).
-    #[cfg(test)]
-    if config_value == 0 {
-        return adaptive_degree(
+    // Production has no in-flight back-off (TD-SCANDEG-1); the S2b division
+    // lives in the test-only arc caller, so this function is identical in
+    // test and release builds.
+    resolve_parallel_degree(config_value)
+}
+
+/// S2b (test-only arc entry): the auto degree divided by in-flight searches.
+#[cfg(test)]
+fn resolve_arc_search_parallelism(config_value: u16) -> u16 {
+    let base = resolve_search_parallelism(config_value);
+    if config_value == 0 && std::env::var("PROXIMADB_SEARCH_PARALLEL_FILES").is_err() {
+        adaptive_degree(
             base,
             IN_FLIGHT_SEARCHES.load(std::sync::atomic::Ordering::Relaxed),
-        );
+        )
+    } else {
+        base
     }
-    base
 }
 
 fn resolve_parallel_degree(requested: u16) -> u16 {
@@ -2570,7 +2575,7 @@ self.try_pax_cascade(
         });
 
         let file_count = u16::try_from(sstable_files.len()).unwrap_or(u16::MAX);
-        let degree = resolve_search_parallelism(self.config().search_parallel_files)
+        let degree = resolve_arc_search_parallelism(self.config().search_parallel_files)
             .min(file_count)
             .max(1);
 

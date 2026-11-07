@@ -58,7 +58,14 @@ group-hit side effects). The exact-key planners — Region D, Region A
 resident range once. It carries none of design A's transient memory or
 counter bypass, nor design B's promotion-eviction cascade.
 
-Still open: Region B's `peek_parent_residency`, whose parent-L1 tier returns
-the whole parent region and whose L2 tier is a byte-reading probe. Design C
-applies to its exact-key and parent-key L2 steps only if the parent store
-indexes the sub-range; measure before choosing.
+Still open: Region B's `peek_parent_residency`. Its step 4 (exact-key L2)
+is a direct design-C candidate (same key, index lookup), but the function
+returns bytes and its tests assert them, so converting it changes its
+contract; its parent-key L2 step needs the parent store to index the
+sub-range. Measure before choosing.
+
+Accepted trade (co-design: the dominant term is billed GET round-trips):
+L2-resident ranges are now read at consume one at a time (local disk, ~ms)
+where they used to ride one concurrent object-store wave (one RTT, billed).
+If a trace shows N serial L2 reads exceeding a wave RTT, issue the
+classified-resident reads concurrently before the consume loop.

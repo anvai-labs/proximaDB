@@ -534,7 +534,9 @@ impl SurvivorRangeCache {
     ///
     /// The L2 step is an INDEX lookup (`PersistentByteStore::entry_len`): no
     /// disk read, no CRC check, no group-hit/touch/heal side effects, no
-    /// io_trace or l2 counters. So the planner reads a resident range ONCE
+    /// io_trace or l2 counters — only an LRU recency tick, so the same query's
+    /// write-through cannot evict a range it just classified resident. So the
+    /// planner reads a resident range ONCE
     /// (at consume), not twice, and classifying N ranges costs N map lookups
     /// rather than N serial disk reads. Without the L2 step an L1-evicted but
     /// L2-resident range is classified cold and re-GET from object storage,
@@ -550,13 +552,18 @@ impl SurvivorRangeCache {
         if self.inner.peek_memory(&key).await.is_some() {
             return true;
         }
+        // Key presence, not length equality: the consume serves whatever is
+        // stored under the exact key (a loader may have returned fewer bytes
+        // at end of file), so any length must classify resident.
         self.l2_store.as_ref().is_some_and(|store| {
-            store.entry_len(&key.persistent_key(L2_EXACT_NAMESPACE)) == Some(len)
+            store
+                .touch_entry_len(&key.persistent_key(L2_EXACT_NAMESPACE))
+                .is_some()
         })
     }
 
     /// TD-RDSTRAT-12 §3 (round 4): the [`Self::get_or_fetch_in_parent`] mirror
-    /// of [`Self::peek_memory_exact`] — `Some(bytes)` iff a subsequent
+    /// of the exact-key residency check — `Some(bytes)` iff a subsequent
     /// `get_or_fetch_in_parent(kind, path, off, len, parent_off, parent_len)`
     /// would be served WITHOUT running its loader. Probes, in the same order
     /// as the real method and ALL side-effect-free (no `track_hot_key`, no
@@ -1172,10 +1179,6 @@ mod tests {
         assert_eq!(fetches.load(Ordering::SeqCst), 2);
     }
 
-    /// TD-RDSTRAT-12 §3: `peek_memory_exact` uses THE SAME scoped key as
-    /// `get_or_fetch`, so a peek-None followed by a load makes the next peek
-    /// Some — and a peek-Some guarantees the consume loader never runs (the
-    /// property the batch-prefetch planner leans on).
     /// TD-IOBUDGET-3 design C: `is_exact_resident` answers from DRAM OR the
     /// L2 index — an L1-evicted (fresh cache) but L2-resident range is
     /// resident, its consume never runs the loader, and a range of a
@@ -1232,6 +1235,10 @@ mod tests {
         assert_eq!(bytes.as_ref(), &[7u8; 1024][..]);
     }
 
+    /// TD-RDSTRAT-12 §3: `peek_memory_exact` uses THE SAME scoped key as
+    /// `get_or_fetch`, so a peek-None followed by a load makes the next peek
+    /// Some — and a peek-Some guarantees the consume loader never runs (the
+    /// property the batch-prefetch planner leans on).
     #[tokio::test]
     async fn peek_memory_exact_key_matches_get_or_fetch() {
         let cache = SurvivorRangeCache::new(16 * 1024 * 1024);
