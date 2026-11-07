@@ -36,7 +36,13 @@ pub(crate) fn counter(name: &str, help: &str) -> IntCounter {
     })
 }
 
-lazy_static::lazy_static! {
+/// TD-CACHEC-1: registry bound shared with the survivor-cache code (the
+/// metric docs and the LazyLock must not drift).
+pub const SURVIVOR_CACHE_COLLECTION_SERIES_CAP: usize = 200;
+/// TD-CACHEC-1: a pair idle this long gives up its series slot.
+pub const SURVIVOR_CACHE_COLLECTION_SERIES_IDLE_SECS: u64 = 86_400;
+
+lazy_static! {
     /// TD-COMPACT-13: compaction input deletes that failed and are pending
     /// reconciliation. >0 means superseded segments are still serving (cost
     /// defect, results correct) — observable rot, never silent.
@@ -164,6 +170,20 @@ lazy_static! {
         "proximadb_survivor_cache_tenant_misses",
         "Cumulative survivor-cache misses per tenant (top tenants only)",
         &["tenant_id"],
+    );
+    /// TD-CACHEC-1: logical survivor-cache lookups per (tenant, collection).
+    /// `tenant_stable_id` is the catalog stable tenant id (or `shared`), NOT
+    /// the tenant name the billing families label `tenant_id`; join through
+    /// the catalog id mapping. Counted
+    /// by outcome: `hot` (DRAM), `l2` (persistent local store), `cold`
+    /// (loader ran). The per-collection hot-hit ratio the warm-rate SKU
+    /// prices. True counters; at most
+    /// `SURVIVOR_CACHE_COLLECTION_SERIES_CAP` (tenant, collection) pairs,
+    /// later pairs fold into `other`/`other`.
+    pub static ref SURVIVOR_CACHE_COLLECTION_READS_TOTAL: Option<IntCounterVec> = counter_vec(
+        "proximadb_survivor_cache_collection_reads_total",
+        "Survivor-cache logical lookups (lookup-weighted, not bytes) per stable tenant id and catalog collection id, by outcome (hot|l2|cold)",
+        &["tenant_stable_id", "collection_id", "outcome"],
     );
 
     /// Segment-invariants cache (footer/region-A metadata; a hit skips 3
@@ -303,6 +323,7 @@ pub fn touch() {
     SURVIVOR_CACHE_HITS.get();
     SURVIVOR_CACHE_MISSES.get();
     SURVIVOR_CACHE_BYTES.get();
+    let _ = SURVIVOR_CACHE_COLLECTION_READS_TOTAL.as_ref();
     SEGMENT_INVARIANTS_CACHE_HITS_TOTAL.get();
     SEGMENT_INVARIANTS_CACHE_MISSES_TOTAL.get();
     SEGMENT_INVARIANTS_CACHE_BYTES.get();

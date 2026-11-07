@@ -1137,6 +1137,7 @@ impl ProximaRecordService for ProximaRecordServiceImpl {
         request: Request<ProximaRecordBatch>,
     ) -> Result<Response<ProximaRecordBatchResponse>, Status> {
         let tenant_id = grpc_auth::resolved_tenant_id(&request)?;
+        let tenant_stable_id = grpc_auth::tenant_stable_id(&request);
         grpc_auth::enforce_data_plane_request(
             &request,
             "ingest",
@@ -1196,10 +1197,14 @@ impl ProximaRecordService for ProximaRecordServiceImpl {
         lane.require_wal_lane("gRPC InsertRecords")
             .map_err(|e| Status::invalid_argument(e.to_string()))?;
 
-        match self
-            .record_ops
-            .handle_record_batch_for_tenant(rich_batch, Some(tenant_id.as_str()))
-            .await
+        match crate::observability::io_trace::instrument_with_stable_tenant(
+            Some(tenant_id.clone()),
+            tenant_stable_id,
+            "grpc.v2.records.insert_records",
+            self.record_ops
+                .handle_record_batch_for_tenant(rich_batch, Some(tenant_id.as_str())),
+        )
+        .await
         {
             Ok(result) => {
                 if let Some(registry) = &self.segment_registry
@@ -1226,6 +1231,7 @@ impl ProximaRecordService for ProximaRecordServiceImpl {
         request: Request<ProximaRecordBatch>,
     ) -> Result<Response<ProximaRecordBatchResponse>, Status> {
         let tenant_id = grpc_auth::resolved_tenant_id(&request)?;
+        let tenant_stable_id = grpc_auth::tenant_stable_id(&request);
         grpc_auth::enforce_data_plane_request(
             &request,
             "ingest",
@@ -1272,10 +1278,14 @@ impl ProximaRecordService for ProximaRecordServiceImpl {
         lane.require_wal_lane("gRPC UpsertRecords")
             .map_err(|e| Status::invalid_argument(e.to_string()))?;
 
-        match self
-            .record_ops
-            .handle_record_batch_for_tenant(rich_batch, Some(tenant_id.as_str()))
-            .await
+        match crate::observability::io_trace::instrument_with_stable_tenant(
+            Some(tenant_id.clone()),
+            tenant_stable_id,
+            "grpc.v2.records.upsert_records",
+            self.record_ops
+                .handle_record_batch_for_tenant(rich_batch, Some(tenant_id.as_str())),
+        )
+        .await
         {
             Ok(result) => {
                 if let Some(registry) = &self.segment_registry
@@ -1302,6 +1312,7 @@ impl ProximaRecordService for ProximaRecordServiceImpl {
         request: Request<ProximaRecordBatch>,
     ) -> Result<Response<ProximaRecordBatchResponse>, Status> {
         let tenant_id = grpc_auth::resolved_tenant_id(&request)?;
+        let tenant_stable_id = grpc_auth::tenant_stable_id(&request);
         grpc_auth::enforce_data_plane_request(
             &request,
             "ingest",
@@ -1340,10 +1351,14 @@ impl ProximaRecordService for ProximaRecordServiceImpl {
         lane.require_wal_lane("gRPC UpdateRecords")
             .map_err(|e| Status::invalid_argument(e.to_string()))?;
 
-        match self
-            .record_ops
-            .handle_record_batch_for_tenant(rich_batch, Some(tenant_id.as_str()))
-            .await
+        match crate::observability::io_trace::instrument_with_stable_tenant(
+            Some(tenant_id.clone()),
+            tenant_stable_id,
+            "grpc.v2.records.update_records",
+            self.record_ops
+                .handle_record_batch_for_tenant(rich_batch, Some(tenant_id.as_str())),
+        )
+        .await
         {
             Ok(result) => Ok(Response::new(Self::batch_result_to_response(
                 result,
@@ -1363,6 +1378,7 @@ impl ProximaRecordService for ProximaRecordServiceImpl {
         request: Request<ProximaRecordBatch>,
     ) -> Result<Response<ProximaRecordBatchResponse>, Status> {
         let tenant_id = grpc_auth::resolved_tenant_id(&request)?;
+        let tenant_stable_id = grpc_auth::tenant_stable_id(&request);
         grpc_auth::enforce_data_plane_request(
             &request,
             "ingest",
@@ -1408,16 +1424,19 @@ impl ProximaRecordService for ProximaRecordServiceImpl {
         lane.require_wal_lane("gRPC DeleteRecords")
             .map_err(|e| Status::invalid_argument(e.to_string()))?;
 
-        match self
-            .record_ops
-            .handle_record_delete_batch_for_tenant(
+        match crate::observability::io_trace::instrument_with_stable_tenant(
+            Some(tenant_id.clone()),
+            tenant_stable_id,
+            "grpc.v2.records.delete_records",
+            self.record_ops.handle_record_delete_batch_for_tenant(
                 RichRecordDeleteBatchRequest {
                     collection_id: batch.collection_id.clone(),
                     record_ids: record_ids.clone(),
                 },
                 Some(tenant_id.as_str()),
-            )
-            .await
+            ),
+        )
+        .await
         {
             Ok(result) => Ok(Response::new(Self::batch_result_to_response(
                 result,
@@ -1474,15 +1493,26 @@ impl ProximaRecordService for ProximaRecordServiceImpl {
         // any AxisManager-deep shortfall is captured here. Phase K: also
         // lift the TurboQuant EXPLAIN payload — task-local binding ends
         // when the scoped future returns, so the take MUST happen inside.
+        //
+        // TD-CACHEC-1: open the per-query io_trace scope, as REST v2 and Arrow
+        // Flight do. Without it a gRPC search had no ambient tenant (shared
+        // cache fair-share scope, no collection attribution) and never reached
+        // the billing observer, so its KRU / object-store meters were dropped.
+        // The tenant + stable id are the authenticated port identity above.
         let (search_outcome, _turboquant_hints) =
-            crate::observability::predicate_diagnostics::scope(async {
-                let outcome = self
-                    .record_ops
-                    .handle_record_search_for_tenant(search_request, identity.as_borrowed())
-                    .await;
-                let tq = crate::observability::predicate_diagnostics::take_turboquant_hints();
-                (outcome, tq)
-            })
+            crate::observability::io_trace::instrument_with_stable_tenant(
+                identity.tenant_id.clone(),
+                identity.tenant_stable_id,
+                "grpc.v2.records.search",
+                crate::observability::predicate_diagnostics::scope(async {
+                    let outcome = self
+                        .record_ops
+                        .handle_record_search_for_tenant(search_request, identity.as_borrowed())
+                        .await;
+                    let tq = crate::observability::predicate_diagnostics::take_turboquant_hints();
+                    (outcome, tq)
+                }),
+            )
             .await;
 
         match search_outcome {
@@ -1564,18 +1594,23 @@ impl ProximaRecordService for ProximaRecordServiceImpl {
 
         let include_vector = req.include_vector;
 
-        // Execute search
-        let response = self
-            .record_ops
-            .handle_record_search_for_tenant(search_request, identity.as_borrowed())
-            .await
-            .map_err(|e| {
-                if crate::services::operations::vectors::is_client_argument_error(&e) {
-                    Status::invalid_argument(e.to_string())
-                } else {
-                    Status::internal(format!("Search stream failed: {}", e))
-                }
-            })?;
+        // Execute search inside the per-query io_trace scope (TD-CACHEC-1; see
+        // `search`).
+        let response = crate::observability::io_trace::instrument_with_stable_tenant(
+            identity.tenant_id.clone(),
+            identity.tenant_stable_id,
+            "grpc.v2.records.search_stream",
+            self.record_ops
+                .handle_record_search_for_tenant(search_request, identity.as_borrowed()),
+        )
+        .await
+        .map_err(|e| {
+            if crate::services::operations::vectors::is_client_argument_error(&e) {
+                Status::invalid_argument(e.to_string())
+            } else {
+                Status::internal(format!("Search stream failed: {}", e))
+            }
+        })?;
 
         // Create a channel for streaming results
         let (tx, rx) = tokio::sync::mpsc::channel(128);
@@ -2450,22 +2485,34 @@ impl ProximaRecordService for ProximaRecordServiceImpl {
         } else {
             Some(q.collection_id.clone())
         };
-        let resp = self
-            .api_handlers
-            .execute_sql(q.query, None, collection, identity.as_borrowed())
-            .await
-            .map_err(|e| {
-                // A DML lock conflict → ABORTED (retryable); other errors → INTERNAL.
-                if let Some((resource, holder)) = crate::errors::extract_dml_lock_conflict(&e) {
-                    let msg = match holder {
-                        Some(h) => format!("DML lock conflict on {resource} held by {h}"),
-                        None => format!("DML lock conflict on {resource}"),
-                    };
-                    Status::aborted(msg)
-                } else {
-                    Status::internal(format!("ExecuteQuery failed: {e}"))
-                }
-            })?;
+        // TD-CACHEC-1 (review round-9): open the io_trace scope here too —
+        // execute_query lowers SQL (including vector search) to the engines,
+        // and without the scope its KRU / object-store meters were dropped
+        // and its survivor-cache reads labeled `shared`, exactly like the
+        // search/search_stream handlers before their fix.
+        let resp = crate::observability::io_trace::instrument_with_stable_tenant(
+            identity.tenant_id.clone(),
+            identity.tenant_stable_id,
+            "grpc.v2.records.execute_query",
+            async {
+                self.api_handlers
+                    .execute_sql(q.query, None, collection, identity.as_borrowed())
+                    .await
+            },
+        )
+        .await
+        .map_err(|e| {
+            // A DML lock conflict → ABORTED (retryable); other errors → INTERNAL.
+            if let Some((resource, holder)) = crate::errors::extract_dml_lock_conflict(&e) {
+                let msg = match holder {
+                    Some(h) => format!("DML lock conflict on {resource} held by {h}"),
+                    None => format!("DML lock conflict on {resource}"),
+                };
+                Status::aborted(msg)
+            } else {
+                Status::internal(format!("ExecuteQuery failed: {e}"))
+            }
+        })?;
         let rows_returned = resp.rows_affected.unwrap_or(resp.rows.len() as u64);
         let rows = resp
             .rows

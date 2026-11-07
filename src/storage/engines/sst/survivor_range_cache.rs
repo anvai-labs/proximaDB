@@ -67,6 +67,287 @@ fn request_cache_scope() -> CacheScope {
         .unwrap_or(CacheScope::Shared)
 }
 
+/// TD-CACHEC-1: outcome labels of one logical survivor lookup, as the CACHE
+/// served it, indexed by [`outcome_index`]: `hot` = DRAM, `l2` = the
+/// persistent local store, `cold` = the loader ran. Some callers prefetch a
+/// range in a batched wave BEFORE the lookup and hand the bytes to the loader;
+/// if a concurrent query filled the key in between, the lookup is `hot`
+/// although that wave's GET was paid. The GET is still metered by the
+/// object-store counters; this label says which tier served the bytes, not
+/// whether a GET happened.
+const OUTCOME_LABELS: [&str; 3] = ["hot", "l2", "cold"];
+
+fn outcome_index(outcome: CacheReadOutcome) -> usize {
+    match outcome {
+        CacheReadOutcome::MemoryHit => 0,
+        CacheReadOutcome::PersistentHit => 1,
+        CacheReadOutcome::Loaded => 2,
+    }
+}
+
+/// Series key: the requesting cache scope (rendered by [`CacheScope::label`]:
+/// the numeric stable tenant id, or `shared`) and the catalog collection id. Request scopes are only `StableTenant` or `Shared`, so
+/// distinct keys render distinct labels.
+type SeriesKey = (CacheScope, Arc<str>);
+
+tokio::task_local! {
+    /// TD-CACHEC-1: the catalog collection the current SST engine search is
+    /// reading. Scoped around the engine's search FUTURE (not stored on the
+    /// shared per-query trace), so a concurrent sibling future in the same
+    /// request (`tokio::join!` in the SQL executor) never sees it and no read
+    /// is credited to another collection. The production multi-file route
+    /// (`direct_search_with`) drives its per-file cascades via `join_all`
+    /// IN-TASK, so they all see this scope. The one route that does NOT is
+    /// the spawned inter-file scan (`fallback_to_direct_search_arc`, the
+    /// Arc/coordinator entry — TD-SEARCH-2 S2): `tokio::task_local!` does not
+    /// cross `tokio::spawn`, so that spawn site re-binds THIS scope in each
+    /// child with the scan's own collection id (the io_trace-handle pattern).
+    /// The `spawn_blocking` work is synchronous ranking and reads no cache.
+    static READ_COLLECTION: Arc<str>;
+}
+
+/// Run `fut` (an SST engine search) with its catalog collection id as the
+/// attribution scope for survivor-cache reads (TD-CACHEC-1).
+pub(crate) async fn with_read_collection<F: Future>(collection_id: &str, fut: F) -> F::Output {
+    READ_COLLECTION.scope(Arc::from(collection_id), fut).await
+}
+
+fn current_read_collection() -> Option<Arc<str>> {
+    READ_COLLECTION.try_with(Arc::clone).ok()
+}
+
+/// One admitted series: its counter handles (resolved once, so the hot path
+/// does no label hashing) and when it was last read, for idle eviction.
+struct AdmittedSeries {
+    counters: [prometheus::IntCounter; 3],
+    last_seen_secs: std::sync::atomic::AtomicU64,
+}
+
+/// TD-CACHEC-1: bounded registry of per-(tenant, collection) series.
+///
+/// At most `cap` pairs hold their own series. A new pair arriving at the cap
+/// first evicts pairs idle for `idle_evict_secs` (their series are removed,
+/// so a dropped or idle collection never holds a slot forever); if none are
+/// idle it counts under `other`/`other`. Admission and eviction run under one
+/// lock and the count is maintained there, so the bound is exact. The
+/// per-lookup fast path is a sharded map read; while the registry is full and
+/// nothing can be idle yet, overflow lookups also skip the lock.
+struct CollectionSeries {
+    family: prometheus::IntCounterVec,
+    cap: usize,
+    idle_evict_secs: u64,
+    admitted: dashmap::DashMap<SeriesKey, AdmittedSeries>,
+    admitted_count: std::sync::atomic::AtomicUsize,
+    /// While full: the earliest time any admitted pair can be idle.
+    next_evict_secs: std::sync::atomic::AtomicU64,
+    admit_lock: std::sync::Mutex<()>,
+    /// Minted lazily on the first overflow inc, so a quiet deployment never
+    /// exposes zero-value `other/other` series on every scrape.
+    overflow: std::sync::OnceLock<[prometheus::IntCounter; 3]>,
+}
+
+impl CollectionSeries {
+    fn new(family: prometheus::IntCounterVec, cap: usize, idle_evict_secs: u64) -> Self {
+        Self {
+            family,
+            cap,
+            idle_evict_secs,
+            admitted: dashmap::DashMap::new(),
+            admitted_count: std::sync::atomic::AtomicUsize::new(0),
+            next_evict_secs: std::sync::atomic::AtomicU64::new(0),
+            admit_lock: std::sync::Mutex::new(()),
+            overflow: std::sync::OnceLock::new(),
+        }
+    }
+
+    fn overflow_counters(&self) -> &[prometheus::IntCounter; 3] {
+        self.overflow.get_or_init(|| {
+            OUTCOME_LABELS.map(|o| self.family.with_label_values(&["other", "other", o]))
+        })
+    }
+
+    fn try_fast(&self, key: &SeriesKey, idx: usize, now_secs: u64) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        if let Some(series) = self.admitted.get(key) {
+            // Store only when the second changed: avoids bouncing one cache
+            // line across cores on every lookup of a hot collection.
+            if series.last_seen_secs.load(Relaxed) != now_secs {
+                series.last_seen_secs.store(now_secs, Relaxed);
+            }
+            series.counters[idx].inc();
+            return true;
+        }
+        false
+    }
+
+    fn record(
+        &self,
+        scope: &CacheScope,
+        collection: &Arc<str>,
+        outcome: CacheReadOutcome,
+        now_secs: u64,
+    ) {
+        use std::sync::atomic::Ordering::Relaxed;
+        // The registry renders scope LABELS, so a Named scope whose name is a
+        // numeric id would alias a StableTenant label: two map slots sharing
+        // one prometheus child, and evicting either detaches the other's
+        // counters silently. Request scopes are only StableTenant | Shared
+        // (TD-CACHEC-1); anything else is refused, never minted.
+        if !matches!(scope, CacheScope::StableTenant(_) | CacheScope::Shared) {
+            static REFUSED_SCOPE_WARNED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !REFUSED_SCOPE_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                tracing::warn!(
+                    scope = %scope.label(),
+                    "survivor-cache attribution refused a non-canonical cache scope (request scopes are StableTenant|Shared only); reads from this surface stay unattributed until the caller is fixed"
+                );
+            }
+            return;
+        }
+        let idx = outcome_index(outcome);
+        let key = (scope.clone(), collection.clone());
+        if self.try_fast(&key, idx, now_secs) {
+            return;
+        }
+        if self.admitted_count.load(Relaxed) >= self.cap
+            && now_secs < self.next_evict_secs.load(Relaxed)
+        {
+            self.overflow_counters()[idx].inc();
+            return;
+        }
+        // Admission policy: below the cap, block on the lock — its critical
+        // sections are series mints (3 label lookups + one map insert,
+        // microseconds) and mid-flight eviction sweeps (rare: at-cap
+        // registries with idle candidates; bounded: one evict_idle pass), and
+        // a contended lookup must land in ITS series, never mis-priced into
+        // other/other. At the cap, try_lock: a lookup arriving while the
+        // evictor holds the lock counts as overflow instead of parking an
+        // async worker against an O(cap) sweep.
+        let _admit = if self.admitted_count.load(Relaxed) >= self.cap {
+            match self.admit_lock.try_lock() {
+                Ok(guard) => guard,
+                Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    // The at-cap decision came from a lock-free count read: a
+                    // concurrent eviction may have freed a slot since, and a
+                    // minter's microsecond mint would hold the lock now. If
+                    // the registry is below cap on re-check, block on the
+                    // lock and admit into the lookup's OWN series; only a
+                    // genuinely-full registry folds into the aggregate.
+                    if self.admitted_count.load(Relaxed) < self.cap {
+                        self.admit_lock.lock().unwrap_or_else(|p| p.into_inner())
+                    } else {
+                        self.overflow_counters()[idx].inc();
+                        return;
+                    }
+                }
+            }
+        } else {
+            self.admit_lock.lock().unwrap_or_else(|p| p.into_inner())
+        };
+        if self.try_fast(&key, idx, now_secs) {
+            return;
+        }
+        if self.admitted_count.load(Relaxed) >= self.cap {
+            self.evict_idle(now_secs);
+        }
+        if self.admitted_count.load(Relaxed) >= self.cap {
+            self.overflow_counters()[idx].inc();
+            return;
+        }
+        let labels = [scope.label(), collection.to_string()];
+        let counters = OUTCOME_LABELS.map(|o| {
+            self.family
+                .with_label_values(&[labels[0].as_str(), labels[1].as_str(), o])
+        });
+        counters[idx].inc();
+        self.admitted.insert(
+            key,
+            AdmittedSeries {
+                counters,
+                last_seen_secs: std::sync::atomic::AtomicU64::new(now_secs),
+            },
+        );
+        self.admitted_count.fetch_add(1, Relaxed);
+    }
+
+    /// Caller holds `admit_lock`. Evicts pairs idle for the window,
+    /// re-checking idleness at removal so a concurrent fast-path read keeps
+    /// its pair; then records when the next pair can become idle.
+    fn evict_idle(&self, now_secs: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let idle = |v: &AdmittedSeries| {
+            now_secs.saturating_sub(v.last_seen_secs.load(Relaxed)) >= self.idle_evict_secs
+        };
+        let candidates: Vec<SeriesKey> = self
+            .admitted
+            .iter()
+            .filter(|e| idle(e.value()))
+            .map(|e| e.key().clone())
+            .collect();
+        for key in candidates {
+            if self.admitted.remove_if(&key, |_, v| idle(v)).is_some() {
+                self.admitted_count.fetch_sub(1, Relaxed);
+                let labels = [key.0.label(), key.1.to_string()];
+                for o in OUTCOME_LABELS {
+                    let _ = self.family.remove_label_values(&[
+                        labels[0].as_str(),
+                        labels[1].as_str(),
+                        o,
+                    ]);
+                }
+            }
+        }
+        let oldest = self
+            .admitted
+            .iter()
+            .map(|e| e.value().last_seen_secs.load(Relaxed))
+            .min()
+            .unwrap_or(now_secs);
+        self.next_evict_secs
+            .store(oldest.saturating_add(self.idle_evict_secs), Relaxed);
+    }
+}
+
+/// Production registry: 200 series; a pair idle for a day gives up its slot
+/// (long enough that a collection queried daily keeps its series).
+static COLLECTION_SERIES: std::sync::LazyLock<Option<CollectionSeries>> =
+    std::sync::LazyLock::new(|| {
+        crate::metrics::operational_metrics::SURVIVOR_CACHE_COLLECTION_READS_TOTAL
+            .clone()
+            .map(|family| {
+                CollectionSeries::new(
+                    family,
+                    crate::metrics::operational_metrics::SURVIVOR_CACHE_COLLECTION_SERIES_CAP,
+                    crate::metrics::operational_metrics::SURVIVOR_CACHE_COLLECTION_SERIES_IDLE_SECS,
+                )
+            })
+    });
+
+/// Monotonic seconds since first use (idle eviction clock).
+fn monotonic_secs() -> u64 {
+    static START: std::sync::LazyLock<std::time::Instant> =
+        std::sync::LazyLock::new(std::time::Instant::now);
+    START.elapsed().as_secs()
+}
+
+/// Record ONE logical lookup that returned bytes, for the requesting
+/// `scope`: the per-query io_trace L1 counters and,
+/// inside an SST engine search, the per-collection attribution counter
+/// (TD-CACHEC-1). Outside an engine search (flush seeding, compaction, warm
+/// replay) nothing is attributed.
+fn record_lookup(scope: &CacheScope, outcome: CacheReadOutcome) {
+    let hit = outcome == CacheReadOutcome::MemoryHit;
+    crate::observability::io_trace::record_survivor_l1s(u64::from(hit), u64::from(!hit));
+    let Some(series) = COLLECTION_SERIES.as_ref() else {
+        return;
+    };
+    let Some(collection) = current_read_collection() else {
+        return;
+    };
+    series.record(scope, &collection, outcome, monotonic_secs());
+}
+
 /// Persistent-L2 backend wrapper that forwards each exact-key probe outcome
 /// into the ambient per-query io_trace (TD-IOTRACE-4). It lives at the engine
 /// layer because the cache crate (foundation) must not depend on the
@@ -314,7 +595,7 @@ impl SurvivorRangeCache {
         }
         let scope = request_cache_scope();
         self.track_hot_key(&scope, kind, path, off, len);
-        let exact_key = CacheKey::with_scope(scope, kind, format!("{path}:{off}:{len}"));
+        let exact_key = CacheKey::with_scope(scope.clone(), kind, format!("{path}:{off}:{len}"));
         let weight = len.try_into().unwrap_or(u32::MAX);
         let parent_key = CacheKey::shared(
             CacheKind::QuantizedCodes,
@@ -327,10 +608,7 @@ impl SurvivorRangeCache {
             return self.get_or_fetch(kind, path, off, len, loader).await;
         };
         if let Some((exact, outcome)) = self.inner.get_with_outcome(&exact_key).await {
-            crate::observability::io_trace::record_survivor_l1s(
-                u64::from(outcome == CacheReadOutcome::MemoryHit),
-                u64::from(outcome != CacheReadOutcome::MemoryHit),
-            );
+            record_lookup(&scope, outcome);
             self.sync_prometheus();
             return Ok(exact);
         }
@@ -338,10 +616,7 @@ impl SurvivorRangeCache {
         if let Some((parent, outcome)) = self.inner.get_with_outcome(&parent_key).await
             && let Some(slice) = parent.get(start..end)
         {
-            crate::observability::io_trace::record_survivor_l1s(
-                u64::from(outcome == CacheReadOutcome::MemoryHit),
-                u64::from(outcome != CacheReadOutcome::MemoryHit),
-            );
+            record_lookup(&scope, outcome);
             // A complete write-time seed already occupies the useful cache
             // slot. Do not admit every query-dependent slice as another exact
             // entry: doing so duplicates the region, evicts its parent, and
@@ -361,7 +636,7 @@ impl SurvivorRangeCache {
                 self.inner
                     .insert_memory_only(exact_key, weight, bytes.clone())
                     .await;
-                crate::observability::io_trace::record_survivor_l1s(0, 1);
+                record_lookup(&scope, CacheReadOutcome::PersistentHit);
                 self.sync_prometheus();
                 return Ok(bytes);
             }
@@ -375,7 +650,14 @@ impl SurvivorRangeCache {
                 Ok::<Arc<[u8]>, FilesystemError>(Arc::from(loader().await?))
             })
             .await;
-        crate::observability::io_trace::record_survivor_l1s(0, 1);
+        match &result {
+            // CHANGED (TD-CACHEC-1): the real outcome, for io_trace too. A
+            // concurrent fill or the exact-key L2 can serve this lookup; it
+            // used to be recorded as a miss unconditionally.
+            Ok((_, outcome)) => record_lookup(&scope, *outcome),
+            // Unchanged: this seam has always counted a failed load as a miss.
+            Err(_) => crate::observability::io_trace::record_survivor_l1s(0, 1),
+        }
         self.sync_prometheus();
         result.map(|(value, _)| value)
     }
@@ -481,7 +763,7 @@ impl SurvivorRangeCache {
         // TD-CACHE-1 S2: count this range toward the tenant's warm set (the
         // shutdown manifest's source). Bounded map; low-hit half pruned at cap.
         self.track_hot_key(&scope, kind, path, off, len);
-        let key = CacheKey::with_scope(scope, kind, format!("{path}:{off}:{len}"));
+        let key = CacheKey::with_scope(scope.clone(), kind, format!("{path}:{off}:{len}"));
         // Ranges are ≤ a few MiB; cap the weight at u32::MAX defensively.
         let weight: u32 = len.try_into().unwrap_or(u32::MAX);
         let result = self
@@ -491,11 +773,9 @@ impl SurvivorRangeCache {
                 Ok::<Arc<[u8]>, FilesystemError>(Arc::from(bytes))
             })
             .await;
+        // Unchanged: this seam has never recorded a failed load.
         if let Ok((_, outcome)) = &result {
-            crate::observability::io_trace::record_survivor_l1s(
-                u64::from(*outcome == CacheReadOutcome::MemoryHit),
-                u64::from(*outcome != CacheReadOutcome::MemoryHit),
-            );
+            record_lookup(&scope, *outcome);
         }
         self.sync_prometheus();
         result.map(|(value, _)| value)
@@ -722,7 +1002,7 @@ impl SurvivorRangeCache {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[tokio::test]
@@ -1353,5 +1633,240 @@ mod tests {
             inner_l2_before.misses,
             "peek must not move the exact-L2 traced counters"
         );
+    }
+
+    // ---- TD-CACHEC-1: per-collection lookup attribution -----------------
+
+    /// Read a production-family counter WITHOUT creating the series (a
+    /// `with_label_values` probe would mint a series outside the registry's
+    /// cap and eviction accounting).
+    pub(crate) fn collection_reads(tenant: &str, collection: &str, outcome: &str) -> u64 {
+        use prometheus::core::Collector;
+        crate::metrics::operational_metrics::SURVIVOR_CACHE_COLLECTION_READS_TOTAL
+            .as_ref()
+            .expect("collection reads family registered")
+            .collect()
+            .iter()
+            .flat_map(|family| family.get_metric().iter())
+            .find(|m| {
+                let label = |name: &str| {
+                    m.get_label()
+                        .iter()
+                        .find(|l| l.name() == name)
+                        .map(|l| l.value().to_string())
+                };
+                label("tenant_stable_id").as_deref() == Some(tenant)
+                    && label("collection_id").as_deref() == Some(collection)
+                    && label("outcome").as_deref() == Some(outcome)
+            })
+            .map_or(0, |m| m.get_counter().value() as u64)
+    }
+
+    /// An engine search attributes each logical lookup to its (tenant,
+    /// catalog collection) with the real outcome: the loader ran (`cold`),
+    /// DRAM served it (`hot`), the persistent store served it after L1 was
+    /// lost (`l2`). A concurrent sibling future outside the search scope (the
+    /// `tokio::join!` shape in the SQL executor) is NOT credited to it.
+    #[tokio::test]
+    async fn collection_reads_attribute_outcomes_only_inside_the_search_scope() {
+        let dir = tempfile::tempdir().expect("test tempdir");
+        let store =
+            Arc::new(PersistentByteStore::open(dir.path(), 1 << 20).expect("open persistent L2"));
+        let warm = SurvivorRangeCache::with_resolver_and_l2(1 << 20, None, Some(store.clone()));
+        let fresh = SurvivorRangeCache::with_resolver_and_l2(1 << 20, None, Some(store.clone()));
+        let sibling = SurvivorRangeCache::new(1 << 20);
+        crate::observability::io_trace::instrument_with_stable_tenant(
+            Some("t".to_string()),
+            Some(910_001),
+            "test",
+            async {
+                let search = with_read_collection("cachec1-outcomes", async {
+                    for cache in [&warm, &warm, &fresh] {
+                        cache
+                            .get_or_fetch(CacheKind::Other, "seg.pax", 64, 4, || async {
+                                Ok(vec![1, 2, 3, 4])
+                            })
+                            .await
+                            .expect("lookup");
+                    }
+                });
+                let other = async {
+                    sibling
+                        .get_or_fetch(CacheKind::Other, "other.pax", 0, 4, || async {
+                            Ok(vec![0; 4])
+                        })
+                        .await
+                        .expect("sibling lookup");
+                };
+                tokio::join!(search, other);
+            },
+        )
+        .await;
+        let t = "910001";
+        let c = "cachec1-outcomes";
+        assert_eq!(
+            collection_reads(t, c, "cold"),
+            1,
+            "only the search's first lookup loads; the sibling's load is not credited"
+        );
+        assert_eq!(collection_reads(t, c, "hot"), 1, "second lookup is DRAM");
+        assert_eq!(
+            collection_reads(t, c, "l2"),
+            1,
+            "a fresh L1 over the same store is served by the persistent L2"
+        );
+    }
+
+    /// Outside an engine search scope (flush seeding, compaction, warm replay)
+    /// nothing is attributed.
+    #[tokio::test]
+    async fn collection_reads_require_an_engine_search_scope() {
+        let cache = SurvivorRangeCache::new(1 << 20);
+        crate::observability::io_trace::instrument_with_stable_tenant(
+            Some("t".to_string()),
+            Some(910_002),
+            "test",
+            async {
+                cache
+                    .get_or_fetch(CacheKind::Other, "seg.pax", 0, 4, || async {
+                        Ok(vec![0; 4])
+                    })
+                    .await
+                    .expect("lookup");
+            },
+        )
+        .await;
+        use prometheus::core::Collector;
+        let any_for_tenant =
+            crate::metrics::operational_metrics::SURVIVOR_CACHE_COLLECTION_READS_TOTAL
+                .as_ref()
+                .expect("family")
+                .collect()
+                .iter()
+                .flat_map(|f| f.get_metric().iter())
+                .any(|m| {
+                    m.get_label()
+                        .iter()
+                        .any(|l| l.name() == "tenant_stable_id" && l.value() == "910002")
+                });
+        assert!(!any_for_tenant);
+    }
+
+    /// A registry over its OWN unregistered family: no shared global state,
+    /// so these tests are order-independent under any runner.
+    fn registry(cap: usize, idle: u64) -> CollectionSeries {
+        let family = prometheus::IntCounterVec::new(
+            prometheus::Opts::new("test_collection_reads_total", "test"),
+            &["tenant_stable_id", "collection_id", "outcome"],
+        )
+        .expect("valid test family");
+        CollectionSeries::new(family, cap, idle)
+    }
+
+    fn reads(reg: &CollectionSeries, tenant: &str, collection: &str, outcome: &str) -> u64 {
+        reg.family
+            .with_label_values(&[tenant, collection, outcome])
+            .get()
+    }
+
+    fn present(reg: &CollectionSeries, tenant: &str, collection: &str) -> bool {
+        use prometheus::core::Collector;
+        reg.family
+            .collect()
+            .iter()
+            .flat_map(|f| f.get_metric().iter())
+            .any(|m| {
+                let label = |name: &str| {
+                    m.get_label()
+                        .iter()
+                        .find(|l| l.name() == name)
+                        .map(|l| l.value().to_string())
+                };
+                label("tenant_stable_id").as_deref() == Some(tenant)
+                    && label("collection_id").as_deref() == Some(collection)
+            })
+    }
+
+    /// At the cap a new pair folds into `other`/`other` and gets no series
+    /// of its own (the bound is exact: admission is under one lock).
+    #[test]
+    fn collection_series_cap_folds_new_pairs_into_other() {
+        let reg = registry(2, 3_600);
+        let c = |s: &str| -> Arc<str> { Arc::from(s) };
+        reg.record(
+            &CacheScope::stable_tenant(7),
+            &c("a"),
+            CacheReadOutcome::Loaded,
+            0,
+        );
+        reg.record(
+            &CacheScope::stable_tenant(7),
+            &c("b"),
+            CacheReadOutcome::Loaded,
+            0,
+        );
+        reg.record(
+            &CacheScope::stable_tenant(7),
+            &c("c"),
+            CacheReadOutcome::Loaded,
+            10,
+        );
+        reg.record(
+            &CacheScope::stable_tenant(7),
+            &c("c"),
+            CacheReadOutcome::Loaded,
+            11,
+        ); // lock-free overflow path
+        assert_eq!(reads(&reg, "other", "other", "cold"), 2);
+        assert_eq!(reg.admitted.len(), 2);
+        assert!(!present(&reg, "7", "c"));
+        assert!(present(&reg, "7", "a"));
+    }
+
+    /// A pair idle past the eviction window gives up its slot (and its series
+    /// leaves the family), so dropped collections never pin the cap forever.
+    #[test]
+    fn idle_collection_series_are_evicted_to_admit_new_pairs() {
+        let reg = registry(1, 100);
+        let old: Arc<str> = Arc::from("old");
+        let new: Arc<str> = Arc::from("new");
+        reg.record(
+            &CacheScope::stable_tenant(4),
+            &old,
+            CacheReadOutcome::MemoryHit,
+            0,
+        );
+        reg.record(
+            &CacheScope::stable_tenant(4),
+            &new,
+            CacheReadOutcome::MemoryHit,
+            50,
+        ); // not idle yet: folded
+        assert!(!present(&reg, "4", "new"));
+        reg.record(
+            &CacheScope::stable_tenant(4),
+            &new,
+            CacheReadOutcome::MemoryHit,
+            150,
+        ); // old idle 150s: evicted
+        assert!(!present(&reg, "4", "old"));
+        assert_eq!(reads(&reg, "4", "new", "hot"), 1);
+        assert_eq!(reg.admitted.len(), 1);
+    }
+
+    /// The shared scope and a stable tenant never share a series.
+    #[test]
+    fn shared_and_stable_tenant_scopes_get_distinct_series() {
+        let reg = registry(4, 3_600);
+        let c: Arc<str> = Arc::from("c");
+        reg.record(&CacheScope::Shared, &c, CacheReadOutcome::Loaded, 0);
+        reg.record(
+            &CacheScope::stable_tenant(9),
+            &c,
+            CacheReadOutcome::Loaded,
+            0,
+        );
+        assert_eq!(reads(&reg, "shared", "c", "cold"), 1);
+        assert_eq!(reads(&reg, "9", "c", "cold"), 1);
     }
 }

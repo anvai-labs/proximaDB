@@ -1,0 +1,182 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-CACHEC-1: Survivor-cache reads were not attributable per collection, and gRPC searches were unmetered
+:status: Resolved
+:date: 2026-11-06
+:tags: [cache, metering, billing, observability, grpc]
+
+== Problem
+
+The warm-rate read SKU prices a collection by its hot-hit ratio, but the
+survivor range cache only exposed per-TENANT hit/miss (TD-CACHE-3 S1). There
+was no collection dimension, so the ratio could not be computed per
+collection.
+
+While wiring it, a second gap surfaced: the gRPC v2 `search` and
+`search_stream` handlers never opened a per-query io_trace scope (REST v2 and
+Arrow Flight do). A gRPC search therefore ran with no ambient tenant (cache
+fair-share scope `shared`) and never reached the io_trace billing observer
+(`consumption_metrics::install_billing_observer`), the single source of the
+KRU and object-store GET / byte / request meters. gRPC search compute and
+GETs were unbilled.
+
+== Fix
+
+* The SST engine's search entry (the inherent
+  `SstEngine::search_vectors_unified`, which the `UnifiedStorageFormat` trait
+  impl delegates to and which concrete-typed callers reach directly; every
+  search kernel, `unified_search_v1` and `unified_search_native` alike, lands
+  here) runs the search future inside
+  `survivor_range_cache::with_read_collection(ctx.collection.id, ..)`, a
+  `tokio::task_local!` scope holding the immutable catalog collection id.
+  The scope belongs to that FUTURE, so a concurrent sibling future in the same
+  request (`tokio::join!` in the SQL executor) never sees it, and no read is
+  ever credited to another collection. Reads after the search returns are
+  never credited either. The production multi-file route
+  (`direct_search_with`) drives its per-file cascades via `join_all` IN-TASK,
+  so they inherit this scope — no re-binding needed there. The one exception
+  is the spawned inter-file scan (`fallback_to_direct_search_arc`, the
+  Arc/`SearchCoordinator` entry, TD-SEARCH-2 S2 — not production-reachable
+  today): `tokio::task_local!` does not cross `tokio::spawn`, so its spawn
+  site re-binds THIS scope in each child with the scan's own collection id
+  (the io_trace-handle pattern; the `spawned_inter_file_route...` ratchet,
+  which drives the Arc entry, pins it). The `spawn_blocking` work is
+  synchronous ranking and reads no cache. Two rejected designs, for the record:
+  - an ambient collection slot on the shared per-query `IoTrace`: concurrent
+    unstamped sibling reads were credited to the stamped collection;
+  - stamping in one service kernel: `unified_search_native` (pgwire `<->`,
+    the vector UDTF, hybrid, fusion) was missed.
+* `survivor_range_cache::record_lookup` is the single recording point for one
+  logical lookup that returned bytes; it replaced the five inline
+  `record_survivor_l1s` sites. The in-parent loader site records the REAL
+  outcome, in io_trace too (a deliberate change): it hard-coded a miss even
+  when a concurrent fill served the lookup. Scope note: only the
+  concurrent-fill MemoryHit case changes io_trace — an exact-key L2
+  `PersistentHit` still records an io_trace miss (an L1 miss), so io_trace
+  survivor hit/miss measures DRAM hit-rate, not persistence hit-rate. The
+  fix only matters under a concurrent-fill race, so no deterministic test
+  pins it. ROUTING NOTE: `survivor_l1_hits/misses` feed
+  `VectorCacheOutcome::from_snapshot` (route_cost_model.rs), which the
+  ComputeScheduler uses to classify routes Warm/Mixed/Cold — so this seam
+  change can flip a route's cache-outcome class under exactly that race.
+  The direction is toward truth (the outcome reflects where the bytes
+  actually came from), and the affected class of queries is
+  concurrent-fill racing the same lookup — rare; not separately pinned.
+  Failed loads keep each seam's existing io_trace
+  accounting: the in-parent seam counts a miss, `get_or_fetch` records nothing.
+  They are never attributed. Changing L1 semantics is out of scope here.
+* `proximadb_survivor_cache_collection_reads_total{tenant_stable_id,
+  collection_id, outcome}` with outcome `hot` (DRAM), `l2` (persistent local store) or `cold`
+  (the loader ran). It holds true counters and only counts inside an engine
+  search scope, so flush seeding, compaction and warm replay are never
+  attributed.
+  `tenant_stable_id` is the catalog stable tenant id (or `shared`), the value
+  the per-tenant survivor series render. It is deliberately NOT named
+  `tenant_id`: the billing families label `tenant_id` with the tenant name, so
+  joining the two needs the catalog id mapping. At most 200 (tenant, collection) pairs hold their own series
+  (admission is under one lock, so the bound is exact). A new pair arriving at
+  the cap first evicts pairs idle for a day, removing their series (with a
+  re-check at removal, so a concurrently read pair is kept), so dropped
+  collections never pin the cap. While the registry is full and no pair can be
+  idle yet, overflow lookups skip the lock, and a saturated lookup never
+  blocks on another's eviction (it `try_lock`s and counts as overflow). If none are idle, the new pair counts
+  under `other`/`other`. Counter handles are resolved once per pair, so the
+  per-lookup path does no label hashing.
+* `hot` means the cache served the bytes from DRAM. Some callers prefetch a
+  range in a batched wave before the lookup; if a concurrent query filled the
+  key meanwhile, the lookup is `hot` though the wave's GET was paid. That GET is
+  still metered by the object-store counters.
+* gRPC v2 `search` / `search_stream` run inside
+  `instrument_with_stable_tenant` with the authenticated port identity
+  (`grpc_auth::port_identity`, the same identity the request is authorised
+  with). The billing observer now meters gRPC searches. This adds billing
+  where there was none; it does not double-count, because no other path
+  emitted these meters for gRPC.
+
+Hot-hit ratio per collection = `hot / (hot + l2 + cold)`. It is
+LOOKUP-weighted: a tiny OID range and a multi-MiB SQ8 region count once each,
+and a region read through the wave-split fallback counts once per chunk. Bytes
+are metered by the object-store and cache-byte families. A bytes-weighted
+ratio is a follow-up (a second family; it doubles cardinality).
+
+== Residuals (not fixed here)
+
+* The per-TENANT survivor series (`SURVIVOR_CACHE_TENANT_HITS/MISSES`) count
+  PROBES, not lookups: an exact-key miss followed by a parent probe records two
+  misses, a parent-slice hit is credited to `shared` (the parent key is
+  shared-scoped), and a persistent-L2 hit counts as an L1 miss. Prefer the new
+  per-collection counter for ratios; aligning the tenant series to logical
+  lookups is follow-up work.
+* The engine-level attribution test depends on process state (the
+  shared survivor cache's budget, the global registry). It is reliable under
+  nextest's process-per-test isolation (the project runner) but can fold
+  into `other` under a long shared-process `cargo test` run.
+* The TENANT label needs a request io_trace scope (the collection does not).
+  Today REST v2 records search, gRPC v2 search / search_stream /
+  execute_query / insert / upsert / update / delete, Arrow Flight and pgwire
+  open one; elsewhere reads label as `shared`. REST v1, AQL, MCP, fusion
+  search and gRPC entity search open no scope, so their reads label as
+  tenant `shared` and their KRU / object-store meters are not recorded.
+  Opening scopes there is a billing change per surface and is follow-up
+  work (a tower layer opening the scope for every data-plane RPC is the
+  structural fix). gRPC still records no egress (KOU) inside its scope,
+  unlike REST v2.
+* The gRPC scope also moves gRPC searches' survivor-cache scope from `shared`
+  to the tenant (as REST v2 already is), so tenant fair-share floors and
+  ceilings now apply to them. After this deploy, entries already resident
+  under `shared` are unreachable to gRPC tenants until LRU evicts them, and
+  gRPC re-warms under its tenant keys once. Restart warming regresses nothing:
+  replay was already inert for every tenant (TD-CACHE-11, found during this
+  review; a replay-side patch was tried and reverted because it parsed tenant
+  names as stable ids). No test pins that a gRPC search reaches the billing
+  observer, because the service holds a concrete `RecordOpsService`. A tower
+  layer opening the scope for every data-plane RPC is the structural
+  follow-up.
+* Idle eviction removes a pair's series; if the pair returns, its counters
+  restart at 0. Prometheus `rate()` / `increase()` treat that as a counter
+  reset, but drop the first sample of a new series. A collection read less
+  often than once a day while the registry is full is therefore undercounted.
+  The day-long window keeps daily collections resident.
+* The test-only `search_vectors_unified_arc` entry carries no TENANT
+  io_trace scope (its collection scope IS stamped — in-parent on the
+  sequential branch and re-bound in every spawned child; the
+  `spawned_inter_file_route...` ratchet pins the fan-out). It has no
+  production caller (TD-SCANDEG-1).
+* Eviction trades counter continuity for a bounded cap. Keeping evicted
+  pairs' series instead would make the cap permanent again (the original
+  insert-only defect).
+* Per-lookup cost is one `Arc` clone, one string-hash map probe, one
+  `IntCounter` increment and one `monotonic_secs()` read (vdso, ~ns — it
+  refreshes `last_seen` for eviction on the fast path, since a lookup
+  that never refreshed would let a HOT pair be evicted). If profiling
+  ever shows the clock read matters, refresh coarsely (every Nth lookup)
+  or stamp the scope-entry time into the task-local — day-granularity
+  eviction tolerates both; not built without evidence. Resolving the series once per search and holding
+  its handles in the task-local was rejected: an eviction during the search
+  would leave those handles detached, losing the counts silently.
+* Admission is first-come among non-idle pairs, not ranked by traffic; a
+  busy 201st pair counts under `other` until some pair idles for a day.
+  A fleet with MORE than 200 daily-active (tenant, collection) pairs
+  therefore never frees a slot: the 200 series are the boot/onboarding-
+  order winners, the rest are permanently aggregated into `other`, and
+  per-collection pricing silently undercounts exactly the largest fleets
+  (review finding). If that fleet shape materializes, the cap becomes a
+  config knob (per-TENANT caps or LRU-by-traffic admission) — deliberately
+  not built now; the cap is the Prometheus-cardinality guardrail.
+* At a FULL registry, a lookup arriving while an eviction sweep holds the
+  admit lock counts under `other`/`other` even if the sweep just evicted
+  THAT collection's own series (the resumed-collection race). The window
+  is one sweep; the collection re-admits on its next lookup after it, but
+  the in-window reads stay mis-priced in the aggregate (review finding —
+  accepted: a sleep-and-retry on the hot path costs more than the rare
+  mis-priced reads).
+* Rejected alternative: deriving tenant and collection from the DrPath inside
+  the cache key. Legacy `{base}/{id}/data/` and typed
+  `accounts/{a}/{n}/{c}/data/` layouts coexist and can flip at restart, and
+  the key carries no catalog id in the legacy layout, so parsing it would
+  attribute by path shape rather than identity.
+* pgwire scopes carry no stable tenant id, so their reads label as `shared`
+  (pre-existing; same as the tenant series).
+
+Related: TD-CACHE-3 (per-tenant series), ADR-030 (billing observer), the
+AnvaiOps warm-rate KRU SKU.

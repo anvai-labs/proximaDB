@@ -985,7 +985,20 @@ impl SstEngine {
         &self,
         ctx: &StorageQueryContext,
     ) -> Result<Vec<OptimizedSearchRecord>> {
-        scope_discovery_memo(self.search_vectors_unified_inner(ctx)).await
+        // TD-CACHEC-1: scope survivor-cache reads of THIS search future to its
+        // catalog collection id. Here, not in the trait impl, so callers
+        // holding a concrete `SstEngine` (inherent method wins) are covered
+        // too. An unidentified context is left unattributed.
+        let collection_id = ctx.collection_id();
+        let search = scope_discovery_memo(self.search_vectors_unified_inner(ctx));
+        if collection_id.is_empty() {
+            return search.await;
+        }
+        crate::storage::engines::sst::survivor_range_cache::with_read_collection(
+            collection_id,
+            search,
+        )
+        .await
     }
 
     async fn search_vectors_unified_inner(
@@ -2638,29 +2651,44 @@ self.try_pax_cascade(
                     path,
                     tokio::spawn(async move {
                         let _permit = permit; // released on task drop
-                        // `engine` is `Arc<SstEngine>`; method-call auto-derefs to `&self`.
-                        let scan = engine.scan_single_file(
-                            &scan_path,
-                            &collection,
-                            &query[..],
-                            filter.as_ref(),
-                            k,
-                            distance_metric,
+                        // TD-CACHEC-1: task-locals do not cross `tokio::spawn`,
+                        // and this scan's PAX cascade performs the survivor-cache
+                        // reads — re-bind the collection scope INSIDE the child
+                        // (same pattern as the io_trace handle below) so every
+                        // per-file lookup on this Arc/coordinator route is
+                        // attributed to this scan's collection. The production
+                        // entry joins per-file futures in-task and inherits the
+                        // outer scope; only THIS spawned route needs the re-bind.
+                        crate::storage::engines::sst::survivor_range_cache::with_read_collection(
                             &cid,
-                            &url,
-                            &prune,
-                            use_pipeline,
-                            use_parallel_morsels,
-                            use_vectorized,
-                            known_size,
-                            deferred.as_deref(),
-                        );
-                        let scan = scope_directory_cells(cells, scan);
-                        if let Some(trace) = trace {
-                            crate::observability::io_trace::scope_with_handle(trace, scan).await
-                        } else {
-                            scan.await
-                        }
+                            async {
+                                // `engine` is `Arc<SstEngine>`; method-call auto-derefs to `&self`.
+                                let scan = engine.scan_single_file(
+                                    &scan_path,
+                                    &collection,
+                                    &query[..],
+                                    filter.as_ref(),
+                                    k,
+                                    distance_metric,
+                                    &cid,
+                                    &url,
+                                    &prune,
+                                    use_pipeline,
+                                    use_parallel_morsels,
+                                    use_vectorized,
+                                    known_size,
+                                    deferred.as_deref(),
+                                );
+                                let scan = scope_directory_cells(cells, scan);
+                                if let Some(trace) = trace {
+                                    crate::observability::io_trace::scope_with_handle(trace, scan)
+                                        .await
+                                } else {
+                                    scan.await
+                                }
+                            },
+                        )
+                        .await
                     }),
                 ));
             }
@@ -2683,33 +2711,46 @@ self.try_pax_cascade(
             }
         } else {
             // degree == 1 / single file: sequential, no spawn overhead.
-            for discovered in &sstable_files {
-                let scan = self.scan_single_file(
-                    &discovered.url,
-                    &collection,
-                    &query_arc[..],
-                    filter_owned.as_ref(),
-                    k,
-                    distance_metric,
-                    collection_id,
-                    storage_url,
-                    prune_config,
-                    use_pipeline,
-                    use_parallel_morsels,
-                    use_vectorized,
-                    discovered.size_bytes,
-                    deferred.as_deref(),
-                );
-                let cells = directory_cells.get(&discovered.url).cloned();
-                match scope_directory_cells(cells, scan).await {
-                    Ok(recs) => all_candidates.extend(recs),
-                    Err(e) => Self::handle_per_file_scan_failure(
-                        &discovered.url,
-                        &e,
-                        prune_config.force_exact,
-                    )?,
-                }
-            }
+            // TD-CACHEC-1: the Arc/coordinator entry has no outer collection
+            // scope (only the spawn site re-binds), so the in-parent scans of
+            // THIS branch need the scope too — a single-file host or
+            // single-core degree must attribute the same as the spawned path.
+            // One scope around the loop: every file here shares the search's
+            // collection id (mirrors the spawned branch's single re-bind).
+            crate::storage::engines::sst::survivor_range_cache::with_read_collection(
+                collection_id,
+                async {
+                    for discovered in &sstable_files {
+                        let scan = self.scan_single_file(
+                            &discovered.url,
+                            &collection,
+                            &query_arc[..],
+                            filter_owned.as_ref(),
+                            k,
+                            distance_metric,
+                            collection_id,
+                            storage_url,
+                            prune_config,
+                            use_pipeline,
+                            use_parallel_morsels,
+                            use_vectorized,
+                            discovered.size_bytes,
+                            deferred.as_deref(),
+                        );
+                        let cells = directory_cells.get(&discovered.url).cloned();
+                        match scope_directory_cells(cells, scan).await {
+                            Ok(recs) => all_candidates.extend(recs),
+                            Err(e) => Self::handle_per_file_scan_failure(
+                                &discovered.url,
+                                &e,
+                                prune_config.force_exact,
+                            )?,
+                        }
+                    }
+                    anyhow::Ok(())
+                },
+            )
+            .await?;
         }
 
         // --- merge + finalize (mirrors fallback_to_direct_search) ---
@@ -4336,6 +4377,176 @@ mod tests {
             err.downcast_ref::<deferred::DeferredResolveError>()
                 .is_some(),
             "the retry loop recognizes the error: {err}"
+        );
+    }
+
+    /// TD-CACHEC-1: the SST engine's production search entry (the
+    /// `UnifiedStorageFormat` trait impl every search kernel reaches) scopes
+    /// its survivor-cache reads to the catalog collection id.
+    #[tokio::test]
+    async fn trait_search_entry_attributes_survivor_reads_to_its_collection() {
+        let dim = 16usize;
+        let cid = "cachec1_trait_entry";
+        let (engine, collection) = file_backed_test_engine(cid, dim, None).await;
+        let recs = (0..120usize)
+            .map(|idx| {
+                let vector = (0..dim)
+                    .map(|j| ((idx * 7 + j * 3) % 97) as f32 * 0.01)
+                    .collect();
+                half_tagged_record(idx, dim, 1, vector)
+            })
+            .collect();
+        flush_into(&engine, cid, &collection, recs).await;
+        let query: Vec<f32> = (0..dim).map(|j| (j * 5 % 97) as f32 * 0.01).collect();
+        let ctx = approximate_ctx(cid, &collection, &query, 10, None);
+        crate::observability::io_trace::instrument_with_stable_tenant(
+            Some("t".to_string()),
+            Some(910_005),
+            "test",
+            async {
+                for _ in 0..2 {
+                    proximadb_storage_traits::UnifiedStorageFormat::search_vectors_unified(
+                        &engine, &ctx,
+                    )
+                    .await
+                    .expect("search");
+                }
+            },
+        )
+        .await;
+        let total: u64 = ["hot", "l2", "cold"]
+            .iter()
+            .map(|o| {
+                crate::storage::engines::sst::survivor_range_cache::tests::collection_reads(
+                    "910005", cid, o,
+                )
+            })
+            .sum();
+        assert!(
+            total > 0,
+            "survivor reads of a trait-entry search must be attributed to its collection"
+        );
+    }
+
+    /// TD-CACHEC-1: the SPAWNED inter-file route attributes too.
+    /// `tokio::task_local!` does not cross `tokio::spawn`, and only the
+    /// Arc/coordinator entry (`search_vectors_unified_arc` →
+    /// `fallback_to_direct_search_arc`, TD-SEARCH-2 S2) spawns per-file scan
+    /// tasks — the production entry joins them in-task. This ratchet drives
+    /// the Arc entry with two flushed segment files and
+    /// `PROXIMADB_SEARCH_PARALLEL_FILES=4`, so the survivor-cache reads run
+    /// inside the spawned children; a regression to the un-bound behavior
+    /// keeps this counter at zero. Process-per-test isolation (nextest) makes
+    /// the env-set safe, as in `s2_multicore_arc_matches_sequential`.
+    #[tokio::test]
+    #[serial]
+    async fn spawned_inter_file_route_attributes_survivor_reads_to_its_collection() {
+        let dim = 16usize;
+        let cid = "cachec1_spawned_route";
+        let (engine, collection) = file_backed_test_engine(cid, dim, None).await;
+        for batch in 0..2usize {
+            let recs: Vec<_> = (0..120usize)
+                .map(|idx| {
+                    let vector = (0..dim)
+                        .map(|j| (((batch * 120 + idx) * 7 + j * 3) % 97) as f32 * 0.01)
+                        .collect();
+                    half_tagged_record(batch * 120 + idx, dim, 1, vector)
+                })
+                .collect();
+            flush_into(&engine, cid, &collection, recs).await;
+        }
+        let engine = std::sync::Arc::new(engine);
+        let query: Vec<f32> = (0..dim).map(|j| (j * 5 % 97) as f32 * 0.01).collect();
+        let ctx = approximate_ctx(cid, &collection, &query, 10, None);
+        // Deferred rehydrate resolves the merged winners IN-PARENT (after the
+        // per-file join), so its reads would satisfy the attribution assert
+        // even if the spawn site forgot to re-bind the scope. Kill it so
+        // rehydration happens per-segment INSIDE the spawned tasks — the
+        // assert then counts ONLY spawn-side reads, which is the regression
+        // this test exists to catch.
+        // SAFETY: nextest runs each test in its own process; no other thread
+        // reads these env vars concurrently. Forces the inter-file spawn
+        // route regardless of the host core count.
+        // Restore the process env after the search so a same-process `cargo
+        // test` run (the CLAUDE.md fallback; nextest needs none of this) does
+        // not leak the forced degree / disabled rehydrate into later tests —
+        // the O1 oracle below pins the rehydration shape these two would
+        // break. RESTORES, not removes: an ambient PROXIMADB_SEARCH_PARALLEL_
+        // FILES (a documented query-time override) must survive the test.
+        struct EnvGuard(Option<String>, Option<String>);
+        impl EnvGuard {
+            unsafe fn force(parallel: &str, deferred: &str) -> Self {
+                let prev_parallel = std::env::var("PROXIMADB_SEARCH_PARALLEL_FILES").ok();
+                let prev_deferred = std::env::var("PROXIMADB_PAX_READ_DEFERRED_REHYDRATE").ok();
+                std::env::set_var("PROXIMADB_SEARCH_PARALLEL_FILES", parallel);
+                std::env::set_var("PROXIMADB_PAX_READ_DEFERRED_REHYDRATE", deferred);
+                Self(prev_parallel, prev_deferred)
+            }
+        }
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                unsafe {
+                    match &self.0 {
+                        Some(v) => std::env::set_var("PROXIMADB_SEARCH_PARALLEL_FILES", v),
+                        None => std::env::remove_var("PROXIMADB_SEARCH_PARALLEL_FILES"),
+                    }
+                    match &self.1 {
+                        Some(v) => std::env::set_var("PROXIMADB_PAX_READ_DEFERRED_REHYDRATE", v),
+                        None => std::env::remove_var("PROXIMADB_PAX_READ_DEFERRED_REHYDRATE"),
+                    }
+                }
+            }
+        }
+        let _env_guard = unsafe { EnvGuard::force("4", "0") };
+        let engine_for_spawn = engine.clone();
+        crate::observability::io_trace::instrument_with_stable_tenant(
+            Some("t".to_string()),
+            Some(910_006),
+            "test",
+            async {
+                engine_for_spawn
+                    .search_vectors_unified_arc(&ctx)
+                    .await
+                    .expect("search");
+            },
+        )
+        .await;
+        drop(_env_guard);
+        let reads = |outcome: [&str; 3]| -> u64 {
+            outcome
+                .iter()
+                .map(|o| {
+                    crate::storage::engines::sst::survivor_range_cache::tests::collection_reads(
+                        "910006", cid, o,
+                    )
+                })
+                .sum()
+        };
+        let total_spawned = reads(["hot", "l2", "cold"]);
+        assert!(
+            total_spawned > 0,
+            "survivor reads on the spawned inter-file route must be attributed to the collection"
+        );
+        // degree == 1 on the SAME Arc entry: the sequential branch runs its
+        // scans in-parent and must attribute too — pin both shapes of the route.
+        let guard = unsafe { EnvGuard::force("1", "0") };
+        crate::observability::io_trace::instrument_with_stable_tenant(
+            Some("t".to_string()),
+            Some(910_006),
+            "test",
+            async {
+                engine
+                    .search_vectors_unified_arc(&ctx)
+                    .await
+                    .expect("sequential search");
+            },
+        )
+        .await;
+        drop(guard);
+        let total_sequential = reads(["hot", "l2", "cold"]);
+        assert!(
+            total_sequential > total_spawned,
+            "survivor reads on the sequential Arc branch must be attributed as well"
         );
     }
 
