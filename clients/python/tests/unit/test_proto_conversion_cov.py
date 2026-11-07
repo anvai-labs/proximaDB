@@ -377,6 +377,27 @@ class TestProtoDriftGuard:
         # the regex is itself drift-shaped
         assert checked >= 40, f"only {checked} entries found — maps moved?"
 
+    def test_storage_engine_reverse_covers_proto(self) -> None:
+        """Decode-side coverage: every proto StorageEngine number must decode
+        truthfully (the forward aliases are the deliberate TD-SDKENG-1
+        design; the reverse truncation silently decoded 7-12)."""
+        from proximadb_sdk.v1 import vector_types_pb2 as types_pb2
+
+        for v in types_pb2.StorageEngine.DESCRIPTOR.values:
+            name = v.name.lower().removeprefix("storage_engine_")
+            decoded = ProtoConverter._STORAGE_ENGINE_INT_TO_STR.get(v.number)
+            if decoded is not None:
+                assert decoded == name or decoded in ("viper",), (
+                    f"StorageEngine decode drift: {v.number} decoded "
+                    f"{decoded!r}, proto member {name!r}"
+                )
+            # members the table deliberately aliases may be absent; the
+            # proto numbers 7-12 MUST be present (no silent truncation)
+        for n in (7, 8, 9, 10, 11, 12):
+            assert (
+                n in ProtoConverter._STORAGE_ENGINE_INT_TO_STR
+            ), f"StorageEngine reverse truncated: {n} missing"
+
     def test_distance_metric_intenum_matches_proto(self) -> None:
         from proximadb_sdk.models import DistanceMetricType
         from proximadb_sdk.v1 import vector_types_pb2 as types_pb2

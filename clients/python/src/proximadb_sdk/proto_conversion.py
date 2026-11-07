@@ -90,6 +90,16 @@ class ProtoConverter:
         4: "helix",
         5: "swift",
         6: "raptor",
+        # Decode truthfully what the server sent. The FORWARD aliases
+        # above (mmap/hybrid -> viper) are the deliberate TD-SDKENG-1
+        # deprecation design and stay; but a server response carrying
+        # MMAP=7 must not silently decode as "sst"/"viper".
+        7: "mmap",
+        8: "hybrid",
+        9: "tst",
+        10: "cedar",
+        11: "titan",
+        12: "chrono",
     }
 
     # =========================================================================
