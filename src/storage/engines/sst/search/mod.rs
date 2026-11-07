@@ -2711,22 +2711,32 @@ self.try_pax_cascade(
             }
         } else {
             // degree == 1 / single file: sequential, no spawn overhead.
+            // TD-CACHEC-1: the Arc/coordinator entry has no outer collection
+            // scope (only the spawn site re-binds), so the in-parent scans of
+            // THIS branch need the scope too — a single-file host or
+            // single-core degree must attribute the same as the spawned path.
             for discovered in &sstable_files {
-                let scan = self.scan_single_file(
-                    &discovered.url,
-                    &collection,
-                    &query_arc[..],
-                    filter_owned.as_ref(),
-                    k,
-                    distance_metric,
+                let scan = crate::storage::engines::sst::survivor_range_cache::with_read_collection(
                     collection_id,
-                    storage_url,
-                    prune_config,
-                    use_pipeline,
-                    use_parallel_morsels,
-                    use_vectorized,
-                    discovered.size_bytes,
-                    deferred.as_deref(),
+                    async {
+                        self.scan_single_file(
+                            &discovered.url,
+                            &collection,
+                            &query_arc[..],
+                            filter_owned.as_ref(),
+                            k,
+                            distance_metric,
+                            collection_id,
+                            storage_url,
+                            prune_config,
+                            use_pipeline,
+                            use_parallel_morsels,
+                            use_vectorized,
+                            discovered.size_bytes,
+                            deferred.as_deref(),
+                        )
+                        .await
+                    },
                 );
                 let cells = directory_cells.get(&discovered.url).cloned();
                 match scope_directory_cells(cells, scan).await {
@@ -4456,6 +4466,53 @@ mod tests {
         // route regardless of the host core count.
         unsafe { std::env::set_var("PROXIMADB_SEARCH_PARALLEL_FILES", "4") };
         unsafe { std::env::set_var("PROXIMADB_PAX_READ_DEFERRED_REHYDRATE", "0") };
+        // Restore the process env after the search so a same-process `cargo
+        // test` run (the CLAUDE.md fallback; nextest needs none of this) does
+        // not leak the forced degree / disabled rehydrate into later tests —
+        // the O1 oracle below pins the rehydration shape these two would break.
+        struct EnvGuard;
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                unsafe {
+                    std::env::remove_var("PROXIMADB_SEARCH_PARALLEL_FILES");
+                    std::env::remove_var("PROXIMADB_PAX_READ_DEFERRED_REHYDRATE");
+                }
+            }
+        }
+        let _env_guard = EnvGuard;
+        let engine_for_spawn = engine.clone();
+        crate::observability::io_trace::instrument_with_stable_tenant(
+            Some("t".to_string()),
+            Some(910_006),
+            "test",
+            async {
+                engine_for_spawn
+                    .search_vectors_unified_arc(&ctx)
+                    .await
+                    .expect("search");
+            },
+        )
+        .await;
+        drop(_env_guard);
+        let reads = |outcome: [&str; 3]| -> u64 {
+            outcome
+                .iter()
+                .map(|o| {
+                    crate::storage::engines::sst::survivor_range_cache::tests::collection_reads(
+                        "910006", cid, o,
+                    )
+                })
+                .sum()
+        };
+        let total_spawned = reads(["hot", "l2", "cold"]);
+        assert!(
+            total_spawned > 0,
+            "survivor reads on the spawned inter-file route must be attributed to the collection"
+        );
+        // degree == 1 on the SAME Arc entry: the sequential branch runs its
+        // scans in-parent and must attribute too — pin both shapes of the route.
+        unsafe { std::env::set_var("PROXIMADB_SEARCH_PARALLEL_FILES", "1") };
+        let guard = EnvGuard;
         crate::observability::io_trace::instrument_with_stable_tenant(
             Some("t".to_string()),
             Some(910_006),
@@ -4464,21 +4521,15 @@ mod tests {
                 engine
                     .search_vectors_unified_arc(&ctx)
                     .await
-                    .expect("search");
+                    .expect("sequential search");
             },
         )
         .await;
-        let total: u64 = ["hot", "l2", "cold"]
-            .iter()
-            .map(|o| {
-                crate::storage::engines::sst::survivor_range_cache::tests::collection_reads(
-                    "910006", cid, o,
-                )
-            })
-            .sum();
+        drop(guard);
+        let total_sequential = reads(["hot", "l2", "cold"]);
         assert!(
-            total > 0,
-            "survivor reads on the spawned inter-file route must be attributed to the collection"
+            total_sequential > total_spawned,
+            "survivor reads on the sequential Arc branch must be attributed as well"
         );
     }
 

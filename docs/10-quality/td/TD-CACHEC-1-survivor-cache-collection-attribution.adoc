@@ -124,8 +124,11 @@ ratio is a follow-up (a second family; it doubles cardinality).
   reset, but drop the first sample of a new series. A collection read less
   often than once a day while the registry is full is therefore undercounted.
   The day-long window keeps daily collections resident.
-* The test-only `search_vectors_unified_arc` entry (and its `tokio::spawn`
-  fan-out) is not scoped. It has no production caller (TD-SCANDEG-1).
+* The test-only `search_vectors_unified_arc` entry carries no TENANT
+  io_trace scope (its collection scope IS stamped — in-parent on the
+  sequential branch and re-bound in every spawned child; the
+  `spawned_inter_file_route...` ratchet pins the fan-out). It has no
+  production caller (TD-SCANDEG-1).
 * Eviction trades counter continuity for a bounded cap. Keeping evicted
   pairs' series instead would make the cap permanent again (the original
   insert-only defect).
@@ -135,6 +138,13 @@ ratio is a follow-up (a second family; it doubles cardinality).
   would leave those handles detached, losing the counts silently.
 * Admission is first-come among non-idle pairs, not ranked by traffic; a
   busy 201st pair counts under `other` until some pair idles for a day.
+  A fleet with MORE than 200 daily-active (tenant, collection) pairs
+  therefore never frees a slot: the 200 series are the boot/onboarding-
+  order winners, the rest are permanently aggregated into `other`, and
+  per-collection pricing silently undercounts exactly the largest fleets
+  (review finding). If that fleet shape materializes, the cap becomes a
+  config knob (per-TENANT caps or LRU-by-traffic admission) — deliberately
+  not built now; the cap is the Prometheus-cardinality guardrail.
 * Rejected alternative: deriving tenant and collection from the DrPath inside
   the cache key. Legacy `{base}/{id}/data/` and typed
   `accounts/{a}/{n}/{c}/data/` layouts coexist and can flip at restart, and

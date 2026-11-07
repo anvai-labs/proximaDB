@@ -199,17 +199,24 @@ impl CollectionSeries {
             self.overflow_counters()[idx].inc();
             return;
         }
-        // Never block a lookup on admission — not even when the registry is
-        // below cap (an in-flight eviction dips the count under the cap while
-        // still holding the lock): if another lookup holds the lock, count
-        // this one as overflow instead of parking an async worker.
-        let _admit = match self.admit_lock.try_lock() {
-            Ok(guard) => guard,
-            Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
-            Err(std::sync::TryLockError::WouldBlock) => {
-                self.overflow_counters()[idx].inc();
-                return;
+        // Admission policy: below the cap, block on the lock — the only time
+        // it is held while the count reads below cap is a mid-flight eviction
+        // (rare: at-cap registries with idle candidates; bounded: one
+        // evict_idle sweep), and a contended lookup must land in ITS series,
+        // never mis-priced into other/other. At the cap, try_lock: a lookup
+        // arriving while the evictor holds the lock counts as overflow
+        // instead of parking an async worker against an O(cap) sweep.
+        let _admit = if self.admitted_count.load(Relaxed) >= self.cap {
+            match self.admit_lock.try_lock() {
+                Ok(guard) => guard,
+                Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    self.overflow_counters()[idx].inc();
+                    return;
+                }
             }
+        } else {
+            self.admit_lock.lock().unwrap_or_else(|p| p.into_inner())
         };
         if self.try_fast(&key, idx, now_secs) {
             return;
