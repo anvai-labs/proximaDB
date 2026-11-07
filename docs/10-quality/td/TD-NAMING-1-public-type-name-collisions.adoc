@@ -5,7 +5,7 @@
 
 == Problem
 
-Baseline 2026-11-06 (`scripts/count_type_name_collisions.py`): 797 redundant definitions across 596 names.
+Baseline 2026-11-06 (`scripts/count_type_name_collisions.py`): 792 redundant definitions across 591 names.
 
 The same `pub struct` / `enum` / `union` / `trait` name defined at several
 sites causes two harms:
@@ -39,8 +39,13 @@ sites causes two harms:
 
 == Counting rules
 
-* Sites, not files; cfg-gated alternatives of one type (on the items or on
-  enclosing `mod` blocks) are one definition.
+* Bare `pub` only — `pub(crate)` / `pub(super)` types cannot collide across
+  a crate boundary or be re-exported.
+* Sites are MODULE SCOPES: same-named types in different modules (even of one
+  file) collide; same-named items in ONE scope count once — rustc only allows
+  that for mutually exclusive cfg alternatives, so the collapse is sound and
+  an always-true `#[cfg(all())]` cannot hide a collision across modules.
+  Same-named cfg'd `mod imp { .. }` alternatives share a scope path.
 * Not counted: `type` aliases; generated protobuf; test code (`tests/`,
   `benches/`, `examples/`, `*_test(s).rs`, `tests.rs`, out-of-line
   `#[cfg(test)] mod x;` files, `#[cfg(test)]` / `#[cfg(all(test, ..))]`
@@ -59,6 +64,16 @@ sites causes two harms:
   proto mirrors that are legitimately re-exported, and module-level `cfg`
   all need real path resolution.
 * Macro-generated definitions are not seen.
+* Out-of-line module handling is one level deep: a `#[cfg(test)] mod x;`
+  file is excluded, but not modules it declares in turn, nor a `#[path]`
+  target; out-of-line cfg alternatives (`#[cfg(unix)] mod unix;` /
+  `#[cfg(windows)] mod windows;`) each count.
+* Concurrent burn-downs of the SAME name in two PRs can leave develop red
+  (both lower the same baseline line identically; the merged tree is lower
+  still) — the same property as the capability-facade ratchet; re-baseline
+  in a follow-up.
+* Local runs see only tracked files (`git ls-files`); a not-yet-added file
+  is checked in CI.
 
 == Decision
 

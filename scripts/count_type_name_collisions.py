@@ -39,7 +39,6 @@ Macro-generated definitions are not seen.
 from __future__ import annotations
 
 import argparse
-import importlib.util
 import json
 import re
 import subprocess
@@ -56,27 +55,32 @@ GENERATED_PREFIXES = ("crates/foundation/proximadb-proto/src/proto/",)
 TEST_DIR_NAMES = {"tests", "benches", "examples", "target"}
 TEST_FILE_SUFFIXES = ("_tests.rs", "_test.rs")
 
-# Reuse the capability-facade ratchet's string/char/raw-string/comment-aware
-# brace matcher rather than a second hand-rolled one (#2445 review).
-_facades_spec = importlib.util.spec_from_file_location(
-    "count_capability_facades", Path(__file__).resolve().parent / "count_capability_facades.py"
-)
-_facades = importlib.util.module_from_spec(_facades_spec)
-_facades_spec.loader.exec_module(_facades)
-match_brace = _facades._match_brace
+def match_brace(code: str, open_idx: int) -> int:
+    """Index just past the `}` matching `{` at open_idx, on MASKED code (no
+    comments or literal contents remain, so a plain depth count is exact)."""
+    depth = 0
+    for i in range(open_idx, len(code)):
+        if code[i] == "{":
+            depth += 1
+        elif code[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return i + 1
+    return len(code)
 
 ATTR = r"(?:#\[[^\]]*\]\s*)*"
-VIS = r"pub(?:\([^)]*\))?\s+"
+VIS = r"pub\s+"  # bare `pub` only: pub(crate)/pub(super) cannot collide across crates
 # An item starts at a line start or right after `{` / `}` / `;`.
 DEF_RE = re.compile(
     rf"(?:^|(?<=[{{}};]))\s*({ATTR}){VIS}(?:unsafe\s+)?(?:struct|enum|union|trait)\s+([A-Z][A-Za-z0-9_]*)",
     re.MULTILINE,
 )
-TEST_CFG = r"#\[cfg\(\s*(?:test\s*\)|all\(\s*test\b)[^\]]*\]"
+TEST_CFG = r"#\[cfg\(\s*(?:test\s*\)|all\((?:(?!not\()[^\]])*\btest\b)[^\]]*\]"
 TEST_CFG_RE = re.compile(TEST_CFG)
 CFG_ATTR_RE = re.compile(r"#\[cfg\(")
-INLINE_MOD_RE = re.compile(rf"({ATTR})(?:{VIS})?mod\s+[A-Za-z_]\w*\s*\{{")
-OUTLINE_TEST_MOD_RE = re.compile(rf"{TEST_CFG}\s*{ATTR}(?:{VIS})?mod\s+([A-Za-z_]\w*)\s*;")
+MODVIS = r"pub(?:\([^)]*\))?\s+"  # modules: any visibility (restricted test mods are common)
+INLINE_MOD_RE = re.compile(rf"({ATTR})(?:{MODVIS})?mod\s+[A-Za-z_]\w*\s*\{{")
+OUTLINE_TEST_MOD_RE = re.compile(rf"{TEST_CFG}\s*{ATTR}(?:{MODVIS})?mod\s+([A-Za-z_]\w*)\s*;")
 
 
 class UnreadableSource(Exception):
@@ -116,8 +120,15 @@ def mask_non_code(text: str) -> str:
             i = j
             continue
         if two == "/*":
-            j = text.find("*/", i + 2)
-            j = n if j == -1 else j + 2
+            # Rust block comments NEST.
+            depth, j = 1, i + 2
+            while j < n and depth:
+                if text[j : j + 2] == "/*":
+                    depth, j = depth + 1, j + 2
+                elif text[j : j + 2] == "*/":
+                    depth, j = depth - 1, j + 2
+                else:
+                    j += 1
             blank(i, j)
             i = j
             continue
@@ -166,6 +177,20 @@ def test_and_gated_spans(code: str) -> tuple[list[tuple[int, int]], list[tuple[i
     return tests, gated
 
 
+NAMED_MOD_RE = re.compile(rf"{ATTR}(?:{MODVIS})?mod\s+([A-Za-z_]\w*)\s*\{{")
+
+
+def module_scopes(code: str) -> list[tuple[int, int, str]]:
+    """(start, end, name) for every inline `mod name { .. }` block."""
+    return [(m.start(), match_brace(code, m.end() - 1), m.group(1)) for m in NAMED_MOD_RE.finditer(code)]
+
+
+def scope_of(pos: int, scopes: list[tuple[int, int, str]]) -> str:
+    """Module path of `pos` inside its file, e.g. `outer::imp` (`` = file root)."""
+    enclosing = sorted((a, name) for a, b, name in scopes if a <= pos < b)
+    return "::".join(name for _, name in enclosing)
+
+
 def inside(pos: int, spans: list[tuple[int, int]]) -> bool:
     return any(a <= pos < b for a, b in spans)
 
@@ -173,9 +198,10 @@ def inside(pos: int, spans: list[tuple[int, int]]) -> bool:
 def enumerate_files(root: Path) -> list[str]:
     try:
         listed = subprocess.run(
-            ["git", "-C", str(root), "ls-files", "--", *(f"{s}/*.rs" for s in SCAN_ROOTS)],
+            ["git", "-C", str(root), "ls-files", "-z", "--", *(f"{s}/*.rs" for s in SCAN_ROOTS)],
             capture_output=True, text=True, check=True,
-        ).stdout.split()
+        ).stdout.split("\0")
+        listed = [rel for rel in listed if rel]
         if listed:
             return sorted(rel for rel in listed if (root / rel).exists())
     except (OSError, subprocess.CalledProcessError):
@@ -212,28 +238,29 @@ def collect(root: Path) -> dict[str, int]:
     excluded = set()
     for rel, code in codes.items():
         excluded |= outline_test_module_files(rel, code)
+        # A whole file gated by an inner `#![cfg(test)]` is test code.
+        if re.match(r"\s*(?:#!\[[^\]]*\]\s*)*#!\[cfg\(test\)\]", code):
+            excluded.add(rel)
 
     sites: dict[str, list[tuple[str, bool]]] = defaultdict(list)
     for rel, code in codes.items():
         if rel in excluded:
             continue
         tests, gated = test_and_gated_spans(code)
+        scopes = module_scopes(code)
         for m in DEF_RE.finditer(code):
             pos, attrs, name = m.start(2), m.group(1), m.group(2)
             if TEST_CFG_RE.search(attrs) or inside(pos, tests):
                 continue
-            is_gated = bool(CFG_ATTR_RE.search(attrs)) or inside(pos, gated)
-            sites[name].append((rel, is_gated))
+            sites[name].append((f"{rel}::{scope_of(pos, scopes)}", True))
 
     result = {}
     for name, entries in sites.items():
-        per_file: dict[str, list[bool]] = defaultdict(list)
-        for rel, is_gated in entries:
-            per_file[rel].append(is_gated)
-        # In one file, all cfg-gated alternatives together are ONE definition.
-        effective = sum(
-            sum(1 for g in gs if not g) + (1 if any(gs) else 0) for gs in per_file.values()
-        )
+        # Same-named items in ONE module scope can only coexist as mutually
+        # exclusive cfg alternatives (rustc rejects anything else), so a scope
+        # holds ONE definition however many cfg'd copies it has. Different
+        # scopes — other modules, other files — each count.
+        effective = len({scope for scope, _ in entries})
         if effective > 1:
             result[name] = effective - 1
     return result
@@ -256,6 +283,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--baseline", type=Path, default=DEFAULT_BASELINE)
     ap.add_argument("--root", type=Path, default=REPO_ROOT)
     ap.add_argument("--top", type=int, default=15)
+    ap.add_argument(
+        "--init",
+        action="store_true",
+        help="allow --mode baseline to create a baseline when none is readable",
+    )
     args = ap.parse_args(argv)
 
     try:
@@ -277,6 +309,11 @@ def main(argv: list[str] | None = None) -> int:
     ]
 
     if args.mode == "baseline":
+        if baseline is None and not args.init:
+            print("type-name ratchet: no readable baseline to lower; refusing to write one "
+                  "(a missing/corrupt baseline must not become a way to bake in collisions). "
+                  "Pass --init only when deliberately creating it.", file=sys.stderr)
+            return 1
         if rises:
             print("type-name ratchet: refusing to RAISE the baseline (it may only be lowered):",
                   file=sys.stderr)
