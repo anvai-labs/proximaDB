@@ -1760,8 +1760,8 @@ fn stage_f_decode_block(
 
 /// Process-wide bound on Stage F decode workers: one per core across every
 /// query and segment. `morsel_degree()` alone does not bound the total — the
-/// multi-file search path decodes several segments at once (each one's rank
-/// sees the same per-QUERY in-flight count — TD-SCANDEG-2) — so concurrent filtered
+/// multi-file search path decodes several segments at once, and not every
+/// search path counts itself in `INFLIGHT_SCANS` — so concurrent filtered
 /// searches queue here for cores instead of oversubscribing them.
 fn stage_f_decode_permits() -> &'static std::sync::Arc<tokio::sync::Semaphore> {
     static PERMITS: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> =

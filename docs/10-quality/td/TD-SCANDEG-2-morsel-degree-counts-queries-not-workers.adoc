@@ -6,7 +6,7 @@
 == Problem
 
 `morsel_degree()` returns `cores` when `INFLIGHT_SCANS == 1`. The counter
-counts in-flight QUERIES (TD-SCANDEG-1 made every entry count itself), but a
+counts in-flight QUERIES (via `ScanGuard`, taken by the production entry), but a
 single query fans out over D files concurrently (inter-file degree, default
 cores/2), and EACH per-file rank reads the same count of 1 — so one lone
 query can run `D × cores` rank workers. On a 16-core box with 8 segments that

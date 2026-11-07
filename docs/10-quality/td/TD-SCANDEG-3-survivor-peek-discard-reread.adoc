@@ -17,7 +17,7 @@ and is unaffected.
 
 == Why it is not fixed yet — two designs, both with measured-in-review costs
 
-#2442 tried both over four adversarial review rounds; each round found the
+#2442 tried both over four adversarial review rounds (that PR was ultimately reduced to these records); each round found the
 chosen design's real cost:
 
 [cols="1,2,2",options="header"]

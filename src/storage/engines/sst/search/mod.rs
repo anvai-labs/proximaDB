@@ -236,10 +236,8 @@ pub(crate) struct DiscoveredSstFile {
 }
 
 /// TD-SEARCH-2 S2: process-wide in-flight cold-scan counter — the input to
-/// the adaptive morsel degree. Incremented by BOTH segment-scan entries —
-/// the legacy `direct_search_with` and the production arc
-/// `direct_search_arc_with` (TD-SCANDEG-1; memtable/index serves don't burn
-/// scan CPU). It counts in-flight QUERIES, not rank workers (TD-SCANDEG-2).
+/// the adaptive morsel degree. Incremented per `fallback_to_direct_search`
+/// (the segment-scan path; memtable/index serves don't burn scan CPU).
 pub static INFLIGHT_SCANS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// RAII guard for [`INFLIGHT_SCANS`].
@@ -971,12 +969,6 @@ impl SstEngine {
         ctx: &StorageQueryContext,
     ) -> Result<Vec<OptimizedSearchRecord>> {
         let _search_start = std::time::Instant::now();
-        // S2b mirror (#2442 review F1): the adaptive inter-file degree's
-        // in-flight guard was acquired ONLY on the arc entry, so REST/service
-        // traffic arriving here left IN_FLIGHT_SEARCHES at 0 and
-        // resolve_search_parallelism never divided by concurrency — the same
-        // guard-on-one-entry defect this PR fixes for INFLIGHT_SCANS.
-        let _in_flight_guard = InFlightSearchGuard::acquire();
         // ADR-030 / TD-158: attribute this query's SST compute to KRU on any exit
         // path (records the elapsed time to the active io_trace on drop).
         let _compute_guard = ComputeMsGuard::new("sst");
@@ -2563,30 +2555,6 @@ self.try_pax_cascade(
             .min(file_count)
             .max(1);
 
-        // TD-SCANDEG-1: count this scan in-flight for the lifetime of the
-        // per-file work, exactly as the legacy `direct_search_with` path
-        // does. Without this, `INFLIGHT_SCANS` stayed 0 on the production
-        // arc path, `.max(1)` turned it into 1, and `morsel_degree()` was
-        // ALWAYS `cores` — the adaptive back-off (sequential rank under
-        // concurrency, "total CPU workers ≈ cores") never engaged, so every
-        // concurrent query spawned its own all-core rank and oversubscribed
-        // the box by c×cores. The guard is held to the end of this function,
-        // which awaits every per-file handle, so it covers the real scan
-        // duration.
-        // The guard is SHARED into every spawned per-file task, so the
-        // in-flight count lives until the LAST task ends — a cancelled or
-        // early-returning parent must not decrement while its orphaned spawns
-        // keep ranking (#2442 round 3, F3). Consequence, by design (round 4,
-        // F7): a deferred-retry attempt that starts while attempt 1's orphans
-        // still rank sees itself as NOT alone and ranks sequentially — correct,
-        // since those orphans really are using the cores.
-        //
-        // Scope: this guard counts in-flight QUERIES. It restores the
-        // cross-query back-off; it does NOT bound workers WITHIN one query
-        // (a lone query over D files can still run D x cores rank workers) —
-        // that is TD-SCANDEG-2.
-        let scan_guard = std::sync::Arc::new(ScanGuard::enter());
-
         let use_pipeline = ctx.search_params.enable_pipeline_execution.unwrap_or(false);
         let use_parallel_morsels = ctx.search_params.enable_parallel_morsels.unwrap_or(false);
         let use_vectorized = ctx
@@ -2637,12 +2605,10 @@ self.try_pax_cascade(
                 let scan_path = path.clone();
                 let cells = directory_cells.get(&path).cloned();
                 let deferred = deferred.clone();
-                let task_scan_guard = std::sync::Arc::clone(&scan_guard);
                 handles.push((
                     path,
                     tokio::spawn(async move {
                         let _permit = permit; // released on task drop
-                        let _scan_guard = task_scan_guard; // held to task end (F3)
                         // `engine` is `Arc<SstEngine>`; method-call auto-derefs to `&self`.
                         let scan = engine.scan_single_file(
                             &scan_path,
@@ -4914,171 +4880,5 @@ mod tests {
             "a fully-resolved file set must still prune to nprobe"
         );
         Ok(())
-    }
-
-    // ---- TD-SCANDEG-1: the adaptive morsel degree's back-off must actually
-    // engage. Until the arc path entered ScanGuard, INFLIGHT_SCANS stayed 0
-    // and morsel_degree() was ALWAYS `cores` — c×cores oversubscription at
-    // client concurrency c, while the doc promised "total CPU workers ≈
-    // cores". ----
-
-    #[test]
-    #[serial]
-    fn morsel_degree_backs_off_under_concurrent_scans() {
-        use std::sync::atomic::Ordering;
-        // SAFETY: nextest runs each test in its own process.
-        unsafe { std::env::remove_var("PROXIMADB_SEARCH_MORSEL_DEGREE") };
-        // Relative to the starting count, so the test also holds under the
-        // shared-process `cargo test` fallback, where another search test may
-        // be mid-scan (#2442 review F8).
-        let base = INFLIGHT_SCANS.load(Ordering::Relaxed);
-        let cores = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1);
-        let g1 = ScanGuard::enter();
-        if base == 0 {
-            assert_eq!(
-                morsel_degree(),
-                cores,
-                "a lone scan spreads across every core"
-            );
-        }
-        let g2 = ScanGuard::enter();
-        assert_eq!(
-            morsel_degree(),
-            1,
-            "a second concurrent scan must back off to the sequential rank"
-        );
-        drop(g2);
-        if base == 0 {
-            assert_eq!(morsel_degree(), cores, "back-off releases with the guard");
-        }
-        drop(g1);
-        assert_eq!(INFLIGHT_SCANS.load(Ordering::Relaxed), base);
-    }
-
-    /// The production arc path must COUNT ITSELF in INFLIGHT_SCANS: pre-fix,
-    /// the only ScanGuard::enter() lived on the legacy `&self` path, so the
-    /// arc path never moved the counter and the adaptive degree never saw
-    /// concurrency. A dedicated std sampling thread reads the atomic in a
-    /// tight loop (a tokio yield-loop can miss a sub-millisecond scan).
-    #[tokio::test]
-    #[serial]
-    async fn arc_direct_search_counts_itself_in_inflight_scans() {
-        use crate::core::search::SearchParams;
-        use crate::storage::traits::{FlushParameters, StorageQueryContext, StorageQueryMetadata};
-        use proximadb_records::{EmbeddingCell, ProximaRecord};
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicBool, Ordering};
-
-        let dim = 64usize;
-        let cid = "scandeg_arc_test";
-        let (engine, collection) = file_backed_test_engine(cid, dim, Some("ArrowBlock")).await;
-
-        let mk_rec = |idx: usize| {
-            let id = format!("b_{}", idx);
-            let ts_ns = (idx as i64).saturating_mul(1_000_000);
-            ProximaRecord {
-                oid: id.clone(),
-                local_id: Some(id),
-                created_at_ns: ts_ns,
-                updated_at_ns: ts_ns,
-                record_version: 1,
-                embeddings: vec![EmbeddingCell::new_fp32(
-                    "test",
-                    "dense_vector",
-                    dim as u32,
-                    (0..dim)
-                        .map(|j| ((idx as f32) * 0.1 + (j as f32) * 0.01).sin())
-                        .collect(),
-                )],
-                ..ProximaRecord::default()
-            }
-        };
-        // 3 flushed files of 2,000 records each: a scan window of many
-        // milliseconds, so a sampler that is already running (see the
-        // barrier below) reliably observes the guard (#2442 round 4, F9).
-        for b in 0..3u32 {
-            let start = (b as usize) * 2000;
-            let recs: Vec<ProximaRecord> = (start..start + 2000).map(mk_rec).collect();
-            let params = FlushParameters {
-                collection_id: Some(cid.to_string()),
-                vector_records: recs,
-                force: true,
-                synchronous: true,
-                collection_config: Some(collection.clone()),
-                ..Default::default()
-            };
-            let r = engine.do_flush(&params).await.unwrap();
-            assert!(r.success, "flush batch {} failed", b);
-        }
-
-        let query: Vec<f32> = (0..dim).map(|j| ((j as f32) * 0.01).sin()).collect();
-        let ctx = StorageQueryContext {
-            search_params: Arc::new(SearchParams {
-                vector: Some(query),
-                top_k: Some(10),
-                filters: None,
-                filter_expression: None,
-                ..Default::default()
-            }),
-            collection: Arc::new(collection),
-            metadata: StorageQueryMetadata {
-                collection_id: cid.to_string(),
-                ..Default::default()
-            },
-            user_context: None,
-            tenant_context: None,
-        };
-        // Multi-core inter-file path so the per-file spawns really happen.
-        // SAFETY: nextest process-per-test isolation + #[serial].
-        unsafe { std::env::set_var("PROXIMADB_SEARCH_PARALLEL_FILES", "4") };
-
-        // Baseline-relative: the shared-process `cargo test` fallback may have
-        // another search mid-scan (round 3, F4).
-        let base = INFLIGHT_SCANS.load(Ordering::Relaxed);
-        let engine_arc = Arc::new(engine);
-        let stop = Arc::new(AtomicBool::new(false));
-        let stop_sampler = Arc::clone(&stop);
-        // The search must not start until the sampler is actually spinning:
-        // a freshly spawned OS thread may not be scheduled before a short
-        // scan finishes, which made this test flaky (round 4, F9).
-        let ready = Arc::new(std::sync::Barrier::new(2));
-        let sampler_ready = Arc::clone(&ready);
-        let sampler = std::thread::spawn(move || {
-            let mut observed_max = 0usize;
-            sampler_ready.wait();
-            while !stop_sampler.load(Ordering::Relaxed) {
-                let v = INFLIGHT_SCANS.load(Ordering::Relaxed);
-                if v > observed_max {
-                    observed_max = v;
-                }
-                std::hint::spin_loop();
-            }
-            observed_max
-        });
-
-        ready.wait();
-        let result = engine_arc.search_vectors_unified_arc(&ctx).await;
-        // Restore the process env before any assert can return early (F8).
-        // SAFETY: #[serial] + nextest process-per-test isolation.
-        unsafe { std::env::remove_var("PROXIMADB_SEARCH_PARALLEL_FILES") };
-        stop.store(true, Ordering::Relaxed);
-        let observed_max = sampler.join().unwrap_or(0);
-        assert!(
-            result.is_ok(),
-            "arc search must succeed: {:?}",
-            result.err()
-        );
-        assert_eq!(
-            observed_max,
-            base + 1,
-            "the arc path must count ITSELF — exactly once; a nested or double enter would spuriously force sequential ranks — in INFLIGHT_SCANS while scanning; pre-fix it never left 0"
-        );
-        assert_eq!(
-            INFLIGHT_SCANS.load(Ordering::Relaxed),
-            base,
-            "the guard must release when the scan completes"
-        );
     }
 }

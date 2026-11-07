@@ -1,0 +1,48 @@
+= TD-SCANDEG-1: The S2b inter-file concurrency back-off never runs on the production search entry
+:status: Open
+:date: 2026-11-06
+:tags: [search, concurrency, cpu, io, measure-first]
+
+== Finding (verified against the call graph)
+
+`resolve_search_parallelism` divides the inter-file scan degree by the
+number of in-flight searches (`IN_FLIGHT_SEARCHES`, S2b). That counter is
+incremented only by `InFlightSearchGuard`, acquired only in
+`search_vectors_unified_arc_inner` — the ARC entry. The arc entry is reached
+only through `SearchCoordinator`, and `SearchCoordinator::new` is constructed
+only in `coordinator.rs`'s own test module. Production traffic enters through
+`trait_impl.rs` → `search_vectors_unified` → `direct_search_with` (the legacy
+entry), which never acquires the guard. So on server traffic
+`IN_FLIGHT_SEARCHES` is always 0 and every concurrent query uses the full
+default inter-file degree (cores/2).
+
+The intra-file morsel back-off (`INFLIGHT_SCANS` / `ScanGuard`) IS wired on
+the production entry (`direct_search_with` takes `ScanGuard`); only the
+test-only arc entry lacked it, which affects no production traffic.
+
+== Why this is not simply "add the guard"
+
+Acquiring the guard on the production entry is a POSTURE change, not a
+defect fix: at client concurrency c it divides every query's inter-file
+degree to roughly cores/2/c. On cold object storage that can REDUCE GET
+overlap and regress p95 at c>1 — the inter-file degree is also an I/O
+concurrency knob, not only a CPU one. The guard's scope also covers non-scan
+work (exact-route decisions, AXIS rebuilds, memtable serves), so idle-in-scan
+queries would shrink everyone's degree.
+
+#2442 first shipped exactly this change unmeasured (it was framed as fixing
+a "dead production back-off" — a premise that was wrong about which entry is
+production); review caught it, and the PR was reduced to this record.
+
+== To close — measure first
+
+1. On a quiet box, measure QPS + p50/p95 + object-store GETs/query at client
+   concurrency 1/4/8 against the current posture, cold and warm.
+2. Only if c>=4 throughput improves without a cold-p95 regression, acquire
+   the guard on the production entry — in ONE shared place (e.g. the
+   `scope_discovery_memo` wrapper both entries use), scoped to the scan
+   itself, never to non-scan work.
+3. Delete or consolidate the test-only arc entry (`search_vectors_unified_arc`
+   / `direct_search_arc_with`): the two near-duplicate entries are how each
+   guard ended up on only one of them. Related: TD-SCANDEG-2 (worker
+   granularity), TD-SCANDEG-3 (peek re-read).
