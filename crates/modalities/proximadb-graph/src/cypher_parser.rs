@@ -1875,7 +1875,7 @@ impl CypherVisitor for QueryValidator {
 /// ExecutableGraphQuery represents an executable graph query (renamed
 /// from GraphQuery 2026-11-07: three same-named types in one crate made
 /// the crate's public GraphQuery ambiguous — this one is the executable
-/// envelope built by cypher_query_to_graph_query)
+/// envelope built by cypher_to_graph_query)
 #[derive(Debug, Clone)]
 pub struct ExecutableGraphQuery {
     /// Graph ID to execute against
@@ -1982,6 +1982,12 @@ pub fn cypher_to_graph_query(
 // ============================================================================
 // TESTS
 // ============================================================================
+
+#[deprecated(
+    since = "0.5.1",
+    note = "renamed ExecutableGraphQuery 2026-11-07 (three same-named GraphQuery types in one crate); alias kept for source compatibility"
+)]
+pub type GraphQuery = ExecutableGraphQuery;
 
 #[cfg(test)]
 mod step2_decisions {

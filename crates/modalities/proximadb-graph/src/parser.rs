@@ -62,10 +62,10 @@ pub fn parse_query(_input: &str) -> Result<StubParseResult, String> {
 }
 
 #[deprecated(
-    since = "0.5.2",
+    since = "0.5.1",
     note = "stub type renamed StubGraphQuery; the crate's public GraphQuery re-export pointed at this STUB while nothing consumed it — use the canonical parsers instead"
 )]
 pub type GraphQuery = StubGraphQuery;
 
-#[deprecated(since = "0.5.2", note = "stub type renamed StubParseResult")]
+#[deprecated(since = "0.5.1", note = "stub type renamed StubParseResult")]
 pub type ParseResult = StubParseResult;

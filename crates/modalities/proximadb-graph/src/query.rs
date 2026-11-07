@@ -203,6 +203,12 @@ impl Default for QueryExecutor {
     }
 }
 
+#[deprecated(
+    since = "0.5.1",
+    note = "renamed TraversalQuery 2026-11-07 (three same-named GraphQuery types in one crate); alias kept for source compatibility"
+)]
+pub type GraphQuery = TraversalQuery;
+
 #[cfg(test)]
 mod tests {
     use super::*;
