@@ -72,8 +72,26 @@ sites causes two harms:
   proto mirrors that are legitimately re-exported, and module-level `cfg`
   all need real path resolution.
 * Macro-generated definitions are not seen.
-* Attributes are matched with ONE level of nested brackets (`json!([1])`);
-  deeper nesting before a `#[cfg(test)]` can still hide it.
+* Attributes are matched with ONE level of nested brackets (`json!([1])`).
+  Deeper nesting (`json!([[1]])`) breaks the attribute match: on the SAME
+  line as the item it hides the item (a false negative); on its own line
+  after a `#[cfg(test)]` it drops the cfg, so a test-only item is counted (a
+  false positive).
+* Items inside `fn` bodies and `const _: () = { .. }` blocks are scoped to
+  their enclosing module, so two same-named items in two different fn bodies
+  collapse to one (false negative). rustc allows those; the scope rule's
+  soundness argument holds for module scopes only.
+* `cr"..."` C-string literals are lexed as ordinary strings; an escape-like
+  sequence inside one can mis-mask the rest of the file.
+* Out-of-line `#[cfg(test)] mod x;` paths are resolved for `mod.rs` /
+  `lib.rs` / `main.rs` / `<name>.rs` parents only — not `src/bin/*.rs` crate
+  roots or declarations inside an inline `mod outer { .. }`.
+* Platform-alternative modules with different names (`#[cfg(unix)] mod unix`
+  / `#[cfg(windows)] mod windows`, each defining `Imp`) count as a collision.
+* If `git ls-files` fails (e.g. a dubious-ownership checkout), enumeration
+  falls back to walking the tree, which includes untracked files.
+* ~12s per run (a per-character Python masking pass); a token-regex lexer
+  would be faster.
 * The lexer (comment/literal masking) is separate from the capability-facade
   ratchet's `_match_brace` by decision: masking is a different operation from
   in-place brace matching, and coupling two ratchets through a private

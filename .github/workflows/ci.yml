@@ -855,8 +855,8 @@ jobs:
       - name: Capability-facade ratchet
         run: python3 scripts/count_capability_facades.py --mode no-regression
       - name: Type-name collision ratchet
-        # TD-NAMING-1: a new pub struct/enum/trait may not reuse a name
-        # already defined elsewhere (fails only when the count RISES).
+        # TD-NAMING-1: per-name ratchet — fails if any name's count rises, or if
+        # the total falls without the baseline being lowered in the same PR.
         run: python3 scripts/count_type_name_collisions.py --mode no-regression
 
   deterministic-commit-contract:
