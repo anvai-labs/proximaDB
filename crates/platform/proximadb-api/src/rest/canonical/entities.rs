@@ -1,5 +1,5 @@
-//! Canonical entity REST types.
+//! Tombstone: the v1 entity/vector handler stubs lived here.
 //!
-//! The v1 handler stubs were removed with the rest of the compatibility
-//! family (R4 dead-code wave, #2451 follow-up): the canonical v2 router
-//! serves all entity operations.
+//! Removed with the rest of the compatibility-stub family (R4 dead-code
+//! wave, #2451 + #2453). The canonical v2 router serves all entity
+//! operations. The module is kept (empty) for path stability.
