@@ -2151,9 +2151,10 @@ impl ColdServingHealth {
     }
 }
 
-/// Object-economy directory state. The directory format and sidecar live in
-/// the SST engine; route-health reports cached in-process status when present
-/// without forcing an object-storage read.
+/// Object-economy directory state. Since TD-OEDIRWM-1 the SST flush no longer
+/// writes the directory sidecar and the query path never read it, so for SST
+/// this reports `directory_format_present: false` and `live_status:
+/// "not_checked"`. The shape is kept unchanged for the response contract.
 #[derive(Debug, Serialize, PartialEq)]
 pub struct ObjectEconomyHealth {
     pub eligible: bool,
@@ -2302,7 +2303,6 @@ fn build_route_health(
         record_count,
         storage_size_bytes,
         index_size_bytes,
-        None,
         RecallProbeLiveState::Unwired,
         None,
     )
@@ -2327,7 +2327,6 @@ fn build_route_health_with_live_state(
     record_count: u64,
     storage_size_bytes: u64,
     index_size_bytes: u64,
-    cached_object_economy_status: Option<&'static str>,
     recall_probe_state: RecallProbeLiveState,
     pin_state: Option<crate::storage::collection_pinning::PinState>,
 ) -> CollectionRouteHealthV2 {
@@ -2377,25 +2376,21 @@ fn build_route_health_with_live_state(
                 Collection-default modes are not yet stored on the catalog.",
     };
     let object_economy_eligible = engine == "sst";
-    let object_economy_live_status = if object_economy_eligible {
-        cached_object_economy_status.unwrap_or("not_checked")
-    } else {
-        "not_applicable"
-    };
-    let object_economy_live_status_in_app_state =
-        object_economy_eligible && cached_object_economy_status.is_some();
     let object_economy = ObjectEconomyHealth {
         eligible: object_economy_eligible,
-        directory_format_present: object_economy_eligible,
-        live_status_in_app_state: object_economy_live_status_in_app_state,
-        live_status: object_economy_live_status,
+        // TD-OEDIRWM-1: no directory sidecar is written or read any more.
+        directory_format_present: false,
+        live_status_in_app_state: false,
+        live_status: if object_economy_eligible {
+            "not_checked"
+        } else {
+            "not_applicable"
+        },
         route_hint: object_economy_eligible.then_some("object_economy"),
-        notes: if object_economy_eligible && cached_object_economy_status.is_some() {
-            "VectorObjectEconomyDirectory status was read from the in-process \
-             cache without object-storage I/O."
-        } else if object_economy_eligible {
-            "VectorObjectEconomyDirectory exists for SST; the query path does not \
-             read it (TD-OEDIRWM-1), so no live status is cached in AppState."
+        notes: if object_economy_eligible {
+            "The SST flush no longer writes the VectorObjectEconomyDirectory \
+             sidecar and the query path does not read it (TD-OEDIRWM-1), so \
+             there is no live directory status to report."
         } else {
             "Vector object-economy directory is currently SST-specific."
         },
@@ -2471,19 +2466,6 @@ fn build_route_health_with_live_state(
         // cold→warm serving state from the AXIS manager (ADR-023 R3 (c)).
         cold_serving: ColdServingHealth::unobservable(),
         degraded_reasons,
-    }
-}
-
-fn object_economy_status_label(
-    status: &crate::storage::engines::sst::object_economy_directory::DirectoryLoadStatus,
-) -> &'static str {
-    use crate::storage::engines::sst::object_economy_directory::DirectoryLoadStatus;
-
-    match status {
-        DirectoryLoadStatus::Loaded => "loaded",
-        DirectoryLoadStatus::Missing => "missing",
-        DirectoryLoadStatus::Corrupt(_) => "corrupt",
-        DirectoryLoadStatus::Mismatch { .. } => "mismatch",
     }
 }
 
@@ -2684,16 +2666,6 @@ pub async fn get_collection_route_health_v2(
 
     let engine_str = collection_storage_engine_label(config.storage_engine).to_string();
     let distance_metric_str = collection_distance_metric_label(config.distance_metric).to_string();
-    let cached_object_economy_status = if engine_str == "sst" {
-        state
-            .vector_operations_service
-            .cached_object_economy_directory_status(&collection_id)
-            .as_ref()
-            .map(object_economy_status_label)
-    } else {
-        None
-    };
-
     let recall_probe_state = match &state.recall_probe_gate {
         Some(gate) => {
             let scope =
@@ -2716,7 +2688,6 @@ pub async fn get_collection_route_health_v2(
         non_negative_stat(stats.vector_count),
         non_negative_stat(stats.data_size_bytes),
         non_negative_stat(stats.index_size_bytes),
-        cached_object_economy_status,
         recall_probe_state,
         pin_state,
     );
@@ -4210,7 +4181,9 @@ mod tests {
             0,
         );
         assert!(sst.object_economy.eligible);
-        assert!(sst.object_economy.directory_format_present);
+        // TD-OEDIRWM-1: the sidecar is neither written nor read.
+        assert!(!sst.object_economy.directory_format_present);
+        assert!(!sst.object_economy.live_status_in_app_state);
         assert_eq!(sst.object_economy.live_status, "not_checked");
         assert_eq!(sst.object_economy.route_hint, Some("object_economy"));
 
@@ -4836,60 +4809,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn route_health_object_economy_reports_cached_loaded_status() {
-        let h = build_route_health_with_live_state(
-            "c".to_string(),
-            "sst".to_string(),
-            8,
-            "cosine".to_string(),
-            0,
-            0,
-            0,
-            Some("loaded"),
-            RecallProbeLiveState::Unwired,
-            None,
-        );
-
-        assert!(h.object_economy.live_status_in_app_state);
-        assert_eq!(h.object_economy.live_status, "loaded");
-        assert!(
-            !h.degraded_reasons
-                .contains(&DegradedReason::ObjectEconomyLiveStatusNotReachable)
-        );
-        assert!(
-            !h.degraded_reasons
-                .contains(&DegradedReason::ObjectEconomyDirectoryDegraded)
-        );
-    }
-
-    #[test]
-    fn route_health_object_economy_reports_cached_degraded_status() {
-        let h = build_route_health_with_live_state(
-            "c".to_string(),
-            "sst".to_string(),
-            8,
-            "cosine".to_string(),
-            0,
-            0,
-            0,
-            Some("missing"),
-            RecallProbeLiveState::Unwired,
-            None,
-        );
-
-        assert!(h.object_economy.live_status_in_app_state);
-        assert_eq!(h.object_economy.live_status, "missing");
-        assert!(
-            !h.degraded_reasons
-                .contains(&DegradedReason::ObjectEconomyLiveStatusNotReachable)
-        );
-        assert!(
-            h.degraded_reasons
-                .contains(&DegradedReason::ObjectEconomyDirectoryDegraded)
-        );
-    }
-
     // ------------------------------------------------------------------
     // RecallProbeLiveState branch coverage — exercises both the Unwired
     // path (default, no AppState slot) and the Wired path (gate reachable
@@ -4933,7 +4852,6 @@ mod tests {
             0,
             0,
             0,
-            None,
             RecallProbeLiveState::Wired { gate_open: true },
             None,
         );
@@ -4954,33 +4872,6 @@ mod tests {
     // AppState::new); the per-collection pin is Some only when an
     // operator has explicitly pinned the collection.
     // ------------------------------------------------------------------
-
-    #[test]
-    fn object_economy_status_label_covers_all_directory_load_status_variants() {
-        // Closed-enum mapping canary: if a future DirectoryLoadStatus variant
-        // lands without an arm here, the route-health response would silently
-        // misrender the status. Pin each variant → label pair.
-        use crate::storage::engines::sst::object_economy_directory::DirectoryLoadStatus;
-        assert_eq!(
-            object_economy_status_label(&DirectoryLoadStatus::Loaded),
-            "loaded"
-        );
-        assert_eq!(
-            object_economy_status_label(&DirectoryLoadStatus::Missing),
-            "missing"
-        );
-        assert_eq!(
-            object_economy_status_label(&DirectoryLoadStatus::Corrupt("bad header".to_string())),
-            "corrupt"
-        );
-        assert_eq!(
-            object_economy_status_label(&DirectoryLoadStatus::Mismatch {
-                expected_collection: "products".to_string(),
-                found_collection: "orders".to_string(),
-            }),
-            "mismatch"
-        );
-    }
 
     #[test]
     fn route_health_pinning_reports_no_pin_by_default() {
@@ -5013,7 +4904,6 @@ mod tests {
             0,
             0,
             0,
-            None,
             RecallProbeLiveState::Unwired,
             Some(pin),
         );
@@ -5036,7 +4926,6 @@ mod tests {
             0,
             0,
             0,
-            None,
             RecallProbeLiveState::Wired { gate_open: false },
             None,
         );

@@ -182,14 +182,6 @@ pub struct SstableWriter {
     /// Compression configuration from flush parameters
     compression_config: Option<CompressionConfig>,
     // SIMD encoding now handled internally by ProximaDataBlock
-    /// Optional Vector Object Economy directory emission hooks. When set
-    /// by [`Self::with_directory_emission`], `finalize_sstable` (and the
-    /// write path it shares with compaction) appends a directory file
-    /// entry after the atomic SST write succeeds and invalidates the
-    /// read-side cache. When `None`, directory emission is skipped
-    /// entirely — pre-existing callers are unaffected until they opt in.
-    directory_emission:
-        Option<crate::storage::engines::sst::object_economy_directory::SstableWriterDirectoryHooks>,
 }
 
 impl SstableWriter {
@@ -220,7 +212,6 @@ impl SstableWriter {
             filesystem,
             compression_provider,
             compression_config: None,
-            directory_emission: None,
         }
     }
 
@@ -252,7 +243,6 @@ impl SstableWriter {
             filesystem,
             compression_provider,
             compression_config,
-            directory_emission: None,
         }
     }
 
@@ -271,28 +261,6 @@ impl SstableWriter {
         // Update compression configuration (stored in compression_config field)
         self.compression_config = config;
         self
-    }
-
-    /// Opt in to Vector Object Economy directory emission after each
-    /// successful SST write. Constructor-injected: when the caller
-    /// (flush coordinator) supplies hooks, the writer appends a file
-    /// entry to the per-collection sidecar and invalidates the read-side
-    /// cache. When `None` (default), directory emission is skipped — no
-    /// path derivation, no fallback inference.
-    pub fn with_directory_emission(
-        mut self,
-        hooks: crate::storage::engines::sst::object_economy_directory::SstableWriterDirectoryHooks,
-    ) -> Self {
-        self.directory_emission = Some(hooks);
-        self
-    }
-
-    /// True when [`Self::with_directory_emission`] has supplied hooks for
-    /// this writer. Used by operators (and the regression test) to verify
-    /// that opt-in is explicit — newly-constructed writers MUST NOT emit
-    /// directory updates by default.
-    pub fn directory_emission_configured(&self) -> bool {
-        self.directory_emission.is_some()
     }
 
     /// Write `records` as a native PAX segment (ADR-049 M1-2). ProximaRecord-native:

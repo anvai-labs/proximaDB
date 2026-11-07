@@ -268,24 +268,6 @@ pub struct SharedServices {
     /// gives both paths a shared backing.
     pub fulltext_indexes: crate::network::hybrid_search::HybridFullTextIndexMap,
 
-    /// Process-wide cache of per-collection Vector Object Economy
-    /// directories. Search paths fetch a [`CachedDirectoryHandle`] via
-    /// `directory_cache.handle_for(collection_id)` and then `get_or_load`
-    /// against a loader closure (typically wrapping
-    /// [`load_directory_for`](crate::storage::engines::sst::object_economy_directory::load_directory_for)).
-    /// First reader per collection pays the cost of loading the sidecar;
-    /// subsequent readers reuse the cached `Arc<CachedDirectoryEntry>`.
-    ///
-    /// Writer/compactor will call
-    /// [`VectorObjectEconomyDirectoryCache::invalidate`](crate::storage::engines::sst::object_economy_directory::VectorObjectEconomyDirectoryCache::invalidate)
-    /// after `upsert_and_persist` lands a new directory version so the
-    /// next reader picks up the change. That wiring is the next step
-    /// after this slot exists — see the VECTOR_OBJECT_ECONOMY_ROUTE
-    /// design doc.
-    pub directory_cache: Arc<
-        crate::storage::engines::sst::object_economy_directory::VectorObjectEconomyDirectoryCache,
-    >,
-
     /// Process-wide per-collection pinning registry (Phase 6 control
     /// surface). Operators PATCH `/api/v1/collections/:id/pin` to
     /// record an explicit tier override; the `AxisTieringManager`
@@ -1240,16 +1222,6 @@ impl SharedServices {
         );
         debug!("✅ SharedServices::new - VIPER engine created successfully");
 
-        // Vector Object Economy Phase 4 (1-B + 2-B): construct the
-        // process-wide per-collection directory cache up front so both
-        // the SST engine (producer side — emits directory updates after
-        // atomic commit) and the vector operations service (consumer
-        // side — loads cached directories during search) hold the same
-        // `Arc`.
-        let directory_cache = Arc::new(
-            crate::storage::engines::sst::object_economy_directory::VectorObjectEconomyDirectoryCache::new(),
-        );
-
         // Phase 6: per-collection pinning registry constructed up
         // front so REST handlers (control plane) and the SST
         // tier-migration integration (data plane) share the same
@@ -1419,8 +1391,7 @@ impl SharedServices {
                 filesystem_factory.clone(),
                 distance_compute,
             )
-            .await?
-            .with_directory_cache(directory_cache.clone());
+            .await?;
             if let Some(src) = freshness_lsn_source.clone() {
                 engine = engine.with_freshness_lsn_source(src);
             }
@@ -1721,9 +1692,6 @@ impl SharedServices {
         #[cfg(feature = "abac-policy")]
         let abac_enforcer = abac_stores.as_ref().map(Self::build_enforcer_from_stores);
 
-        // `directory_cache` constructed earlier (before SstEngine) so the
-        // engine, the vector ops service, and the SharedServices public
-        // field all share the same `Arc`.
         let vector_operations_service = {
             let svc = {
                 #[cfg(feature = "axis")]
@@ -1745,7 +1713,6 @@ impl SharedServices {
                 }
             }
             .with_orchestrator(Some(orchestrator.clone()))
-            .with_directory_cache(directory_cache.clone())
             // Phase 7.2: thread the same affinity registry held by
             // the SharedServices field so search-path recordings and
             // operator inspection share state.
@@ -3319,12 +3286,6 @@ impl SharedServices {
                 // retrieval. Same in-process map serves REST, gRPC, and the
                 // R-7c rank-pipeline BM25 leg (`ProductionHybridBackend`).
                 fulltext_indexes,
-                // Vector Object Economy Phase 4 (2-B): process-wide
-                // per-collection directory cache. The same Arc is also
-                // attached to `vector_operations_service` via
-                // `with_directory_cache` above so the search service can
-                // touch the cache without re-resolving SharedServices.
-                directory_cache,
                 // Phase 6: per-collection pinning registry.
                 // Constructed up front (line ~322) so REST handlers
                 // (control plane) and the SST tier-migration

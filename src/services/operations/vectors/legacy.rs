@@ -562,10 +562,7 @@ pub struct VectorOperationsService {
     /// Dynamic engine cache keyed by the catalog's globally unique object id.
     /// This enables each collection to use its configured engine (SST, HELIX, VIPER, etc.)
     engine_cache: Arc<
-        dashmap::DashMap<
-            crate::core::stable_id::CollectionObjectId,
-            Arc<dyn UnifiedStorageFormat>,
-        >,
+        dashmap::DashMap<crate::core::stable_id::CollectionObjectId, Arc<dyn UnifiedStorageFormat>>,
     >,
 
     /// WAL/Memtable for unflushed vectors (required for two-stage search)
@@ -576,9 +573,8 @@ pub struct VectorOperationsService {
 
     /// Collection metadata cache keyed by catalog object id. Names/aliases are
     /// resolved before this cache boundary.
-    collection_cache: Arc<
-        dashmap::DashMap<crate::core::stable_id::CollectionObjectId, Arc<Collection>>,
-    >,
+    collection_cache:
+        Arc<dashmap::DashMap<crate::core::stable_id::CollectionObjectId, Arc<Collection>>>,
 
     /// Query result cache - unified for all query sources (SQL, REST API, gRPC)
     query_cache: Arc<QueryCache>,
@@ -627,19 +623,6 @@ pub struct VectorOperationsService {
     /// Per tenant+collection guard for insert-only check-and-append operations.
     insert_only_locks: Arc<dashmap::DashMap<String, Arc<Mutex<()>>>>,
 
-    /// Vector Object Economy per-collection directory cache. `None` until
-    /// wired by `SharedServices::new` via `with_directory_cache`. The cache
-    /// is the search-side counterpart to the writer/compactor's
-    /// `upsert_and_persist` — first reader per collection loads the
-    /// sidecar; subsequent readers reuse the cached entry.
-    ///
-    /// Used by [`Self::touch_object_economy_directory_for_search`] today as
-    /// a smoke-test seam. Future EXPLAIN/route work will consume the cached
-    /// entry in the search planner.
-    directory_cache: Option<
-        Arc<crate::storage::engines::sst::object_economy_directory::VectorObjectEconomyDirectoryCache>,
-    >,
-
     /// Phase 7.2 cache-affinity registry. `None` until wired by
     /// `SharedServices::new` via `with_affinity_registry`. When set,
     /// every successful unified search invocation calls
@@ -648,8 +631,7 @@ pub struct VectorOperationsService {
     /// single-node deploys (the only node the registry will ever
     /// see); a future cluster path will plumb the actual node id
     /// through.
-    affinity_registry:
-        Option<Arc<crate::cluster::cache_affinity::CacheAffinityRegistry>>,
+    affinity_registry: Option<Arc<crate::cluster::cache_affinity::CacheAffinityRegistry>>,
 }
 
 /// FA-2 (abac-policy): a `FilterExpression` is AXIS push-down-compatible iff it
@@ -2086,7 +2068,6 @@ impl VectorOperationsService {
             metadata_validator: MetadataValidator::default(),
             pseudo_query_generator: Arc::new(DefaultPseudoQueryGenerator),
             insert_only_locks: Arc::new(dashmap::DashMap::new()),
-            directory_cache: None,
             affinity_registry: None,
         }
     }
@@ -2138,20 +2119,6 @@ impl VectorOperationsService {
         self
     }
 
-    /// Attach the Vector Object Economy per-collection directory cache.
-    /// Called once by `SharedServices::new` after both the service and
-    /// the cache have been constructed. Subsequent calls overwrite the
-    /// previous cache reference.
-    pub fn with_directory_cache(
-        mut self,
-        cache: Arc<
-            crate::storage::engines::sst::object_economy_directory::VectorObjectEconomyDirectoryCache,
-        >,
-    ) -> Self {
-        self.directory_cache = Some(cache);
-        self
-    }
-
     /// Wire the process-wide cache-affinity registry (Phase 7.2).
     /// When wired, the unified search path calls `record_query`
     /// after each successful read so the registry reflects which
@@ -2183,60 +2150,6 @@ impl VectorOperationsService {
         if let Some(reg) = &self.affinity_registry {
             reg.record_query(collection_id, self.local_node_id_for_affinity());
         }
-    }
-
-    /// Smoke-test seam for the object-economy directory cache.
-    ///
-    /// Calls `directory_cache.handle_for(collection_id).get_or_load(...)`
-    /// using `load_directory_for` with safe defaults (`storage_epoch = 0`,
-    /// `authority_mode = RebuildableProjection`) so the cache surface is
-    /// exercised end-to-end without depending on writer-wiring source
-    /// values. Returns `None` when the cache has not been wired (test
-    /// scenarios that bypass `SharedServices`).
-    ///
-    /// Today this is only meant to verify the integration is sound. Once
-    /// the writer call-site lands and the directory has real content,
-    /// production routing/EXPLAIN code will consume the cached entry
-    /// directly via `directory_cache.handle_for(...)`. Then this helper
-    /// should be removed or repurposed.
-    pub async fn touch_object_economy_directory_for_search(
-        &self,
-        collection_id: &str,
-        fs: &dyn crate::storage::persistence::filesystem::FileSystem,
-        collection_root: &str,
-    ) -> Option<crate::storage::engines::sst::object_economy_directory::DirectoryLoadStatus> {
-        use proximadb_catalog::CatalogAuthorityMode;
-        let cache = self.directory_cache.as_ref()?;
-        let entry = cache
-            .handle_for(collection_id)
-            .get_or_load(|| async {
-                crate::storage::engines::sst::object_economy_directory::load_directory_for(
-                    fs,
-                    collection_id,
-                    collection_root,
-                    0,
-                    CatalogAuthorityMode::RebuildableProjection,
-                )
-                .await
-            })
-            .await;
-        Some(entry.status.clone())
-    }
-
-    /// Return the cached object-economy directory status for a collection
-    /// without creating a handle or loading from object storage.
-    ///
-    /// Diagnostics endpoints use this to report live in-process cache state
-    /// while preserving the "no surprise I/O" contract.
-    pub(crate) fn cached_object_economy_directory_status(
-        &self,
-        collection_id: &str,
-    ) -> Option<crate::storage::engines::sst::object_economy_directory::DirectoryLoadStatus> {
-        self.directory_cache
-            .as_ref()?
-            .get_handle(collection_id)?
-            .get_cached()
-            .map(|entry| entry.status.clone())
     }
 
     /// Apply the WAL/memtable delta merge to a set of canonical engine
@@ -2295,19 +2208,10 @@ impl VectorOperationsService {
         // per-pod — a sidecar written by pod A would let pod B skip its own
         // unflushed rows. Every Strong/BoundedStale query therefore scans the
         // delta (production already behaved this way: until #2443 the reader
-        // looked in the wrong place and never found a sidecar). (0, 0) means
-        // "always scan"; no sidecar GET is made per query.
-        let (watermark, watermark_ns) = (0u64, 0i64);
-        // Read the WAL cursor independently of the scan helper so the
-        // EXPLAIN payload carries the value even when no scan ran
-        // (watermark already covers the cursor). Two cheap singleton
-        // calls in exchange for operator visibility.
-        let current_lsn =
-            match crate::storage::persistence::write_ahead_log::manifest::get_service() {
-                Some(svc) => svc.current_lsn().await,
-                None => 0,
-            };
-        let delta_outcome = self
+        // looked in the wrong place and never found a sidecar). No sidecar
+        // GET is made per query. The helper returns the WAL cursor it read,
+        // so EXPLAIN reuses that one read.
+        let (current_lsn, delta_outcome) = self
             .scan_wal_delta_if_needed(
                 collection_id,
                 query_vector,
@@ -2315,8 +2219,6 @@ impl VectorOperationsService {
                 distance_metric,
                 filter,
                 freshness_mode,
-                watermark,
-                watermark_ns,
             )
             .await?;
         let scanned_records = delta_outcome.as_ref().map(|d| d.len() as u64);
@@ -2369,26 +2271,24 @@ impl VectorOperationsService {
         Ok((final_results, Some(explain)))
     }
 
-    /// Scan the WAL/memtable delta for records committed after the
-    /// directory's freshness watermark, when the request's freshness
-    /// mode requires it.
+    /// Scan the WAL/memtable delta when the request's freshness mode
+    /// requires it (every mode except `StaleOk`).
     ///
-    /// Phase 5 Slice 5.3: this method delegates the decision to
-    /// [`VectorFreshnessMode::should_scan_delta`] (pure logic, fully
-    /// unit-tested in `core/search`) and the actual scan to the
-    /// existing `WriteAheadLogManager::search_unflushed_vectors`. It is
-    /// deliberately separate from the merge step that lands in Slice
-    /// 5.4 — this slice just returns the delta candidate set; the
-    /// caller decides how to combine it with directory-routed results.
+    /// There is no watermark-based skip: no sound freshness watermark
+    /// exists (TD-OEDIRWM-1), so Strong and BoundedStale always scan. The
+    /// scan itself is `WriteAheadLogManager::search_unflushed_vectors`; the
+    /// caller merges the delta with the engine results.
     ///
-    /// Returns:
-    /// * `Ok(None)` — no scan was needed (mode is `StaleOk`, watermark
-    ///   already covers the WAL, or no WAL cursor available).
-    /// * `Ok(Some(records))` — delta records, possibly empty. Tombstone
+    /// Returns `(current_lsn, delta)`, where `current_lsn` is the WAL cursor
+    /// read once here (0 when no manifest service is registered) so the
+    /// caller's EXPLAIN reuses it, and `delta` is:
+    /// * `None` — no scan ran (mode is `StaleOk`, or no manifest service).
+    /// * `Some(records)` — delta records, possibly empty. Tombstone
     ///   markers are preserved so the merge step can suppress older
-    ///   directory results.
-    /// * `Err(_)` — WAL scan failed; caller decides whether to fail the
-    ///   query or fall back to directory-only results.
+    ///   engine results.
+    ///
+    /// `Err(_)` means the WAL scan failed; the caller decides whether to
+    /// fail the query or fall back to engine-only results.
     pub async fn scan_wal_delta_if_needed(
         &self,
         collection_id: &str,
@@ -2397,16 +2297,14 @@ impl VectorOperationsService {
         distance_metric: crate::compute::distance_computation::DistanceMetric,
         metadata_filters: Option<&crate::core::search::FilterExpression>,
         freshness_mode: &crate::core::search::VectorFreshnessMode,
-        directory_watermark_lsn: u64,
-        directory_watermark_ns: i64,
-    ) -> Result<Option<Vec<crate::core::search::results::OptimizedSearchRecord>>> {
+    ) -> Result<(
+        u64,
+        Option<Vec<crate::core::search::results::OptimizedSearchRecord>>,
+    )> {
         // StaleOk short-circuits before we even ask the WAL — saves the
         // singleton lookup on the cheap-read path.
-        if matches!(
-            freshness_mode,
-            crate::core::search::VectorFreshnessMode::StaleOk
-        ) {
-            return Ok(None);
+        if !freshness_mode.requires_delta_merge() {
+            return Ok((0, None));
         }
 
         // Without a global manifest service we can't decide whether the
@@ -2431,23 +2329,9 @@ impl VectorOperationsService {
                          In server mode this means freshly-written WAL records may not be \
                          visible to search. Call `manifest::init(&wal_config)` once at startup."
                     );
-                    return Ok(None);
+                    return Ok((0, None));
                 }
             };
-
-        let now_ns = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as i64)
-            .unwrap_or(0);
-
-        if !freshness_mode.should_scan_delta_with_time(
-            current_lsn,
-            directory_watermark_lsn,
-            directory_watermark_ns,
-            now_ns,
-        ) {
-            return Ok(None);
-        }
 
         // Delta scan: oversample (top_k * 2) so the eventual merge step
         // still has enough candidates after dedupe + tombstone
@@ -2465,7 +2349,7 @@ impl VectorOperationsService {
                 /* include_metadata */ true,
             )
             .await?;
-        Ok(Some(records))
+        Ok((current_lsn, Some(records)))
     }
 
     /// Attach orchestrator (builder-style)
