@@ -24,9 +24,10 @@
 
 == Decision (#2443, after four review rounds)
 
-* The query path no longer reads the directory: `(0, 0)` is passed to the
-  delta-scan decision, so every strict query scans the delta — exactly what
-  production already did. Zero sidecar GETs per query.
+* The query path no longer reads the directory, so every strict query scans
+  the delta — exactly what production already did. Zero sidecar GETs per
+  query. (#2443 passed a constant `(0, 0)` watermark; the follow-up below
+  removed the parameters.)
 * BoundedStale always scans the delta, but — unlike Strong — may still be
   served from the 300s query cache, so its `max_staleness_ms` bound is NOT
   enforced (it never effectively was: the skip never fired). Route-health
@@ -75,9 +76,24 @@ The first three follow-ups recorded with #2443 are closed:
   it as the deletion-vector snapshot LSN. Its engine accessor is gated on
   that feature.
 
-The `object_economy_directory` module (format, store, cache types) remains
-for the bench and `FreshnessLsnSource`; with no producer or consumer in the
-server, deleting it is a separate cleanup.
+Route-health no longer advertises `route_hint: "object_economy"` for SST.
+
+Left in place, deliberately:
+
+* The `object_economy_directory` module (format, store, hooks, cache types)
+  remains for the bench and `FreshnessLsnSource`; with no producer or
+  consumer in the server it is dead production code, and deleting it is a
+  separate cleanup.
+* Sidecars already written by earlier builds (`oedir/v{epoch}.bin` under
+  each SST collection's data root) are not removed: one small object per
+  collection, no reader. Delete them with the module cleanup (or a one-off
+  sweep); never re-read them — they list files compaction has since retired.
+* `OBJECT_ECONOMY_LIVE_STATUS_NOT_REACHABLE` still appears in route-health's
+  degraded reasons (it already did after #2443). Retiring that reason is a
+  response-contract change, left to the module cleanup.
+* `FreshnessLsnSource` is still wired in a default build, where only the
+  feature-gated path reads it; gating the field and wiring too is part of
+  the same cleanup.
 
 == Remaining follow-up
 

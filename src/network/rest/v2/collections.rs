@@ -2386,7 +2386,8 @@ fn build_route_health_with_live_state(
         } else {
             "not_applicable"
         },
-        route_hint: object_economy_eligible.then_some("object_economy"),
+        // No directory is produced (TD-OEDIRWM-1), so no route is advertised.
+        route_hint: None,
         notes: if object_economy_eligible {
             "The SST flush no longer writes the VectorObjectEconomyDirectory \
              sidecar and the query path does not read it (TD-OEDIRWM-1), so \
@@ -4185,7 +4186,7 @@ mod tests {
         assert!(!sst.object_economy.directory_format_present);
         assert!(!sst.object_economy.live_status_in_app_state);
         assert_eq!(sst.object_economy.live_status, "not_checked");
-        assert_eq!(sst.object_economy.route_hint, Some("object_economy"));
+        assert_eq!(sst.object_economy.route_hint, None);
 
         let viper = build_route_health(
             "c".to_string(),
