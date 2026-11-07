@@ -61,6 +61,53 @@ use proximadb_storage_filesystem_types::{FilesystemError, FsResult};
 /// Resolve the fair-share owner from the request trace. Missing control-plane
 /// resolution uses the shared scope; aliases are never parsed or hashed into a
 /// synthetic stable id. Data isolation remains structural in the `DrPath`.
+/// Which tier a `peek_parent_residency`/`peek_exact_residency` hit read from.
+/// The consume-side serve books its counters by this tier (#2442 review F6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PeekTier {
+    /// DRAM exact-range entry (may evict before the consume).
+    ExactL1,
+    /// The whole write-time parent region, resident in DRAM.
+    ParentL1,
+    /// The parent-key persistent L2 store.
+    ParentL2,
+    /// An exact-key persistent-L2 write-through entry.
+    ExactL2,
+}
+
+/// Bytes a peek already read, with the tier they came from.
+pub(crate) struct PeekedBytes {
+    pub(crate) bytes: Arc<[u8]>,
+    pub(crate) tier: PeekTier,
+}
+
+impl PeekedBytes {
+    pub(crate) fn exact_l1(bytes: Arc<[u8]>) -> Self {
+        Self {
+            bytes,
+            tier: PeekTier::ExactL1,
+        }
+    }
+    pub(crate) fn parent_l1(bytes: Arc<[u8]>) -> Self {
+        Self {
+            bytes,
+            tier: PeekTier::ParentL1,
+        }
+    }
+    pub(crate) fn parent_l2(bytes: Arc<[u8]>) -> Self {
+        Self {
+            bytes,
+            tier: PeekTier::ParentL2,
+        }
+    }
+    pub(crate) fn exact_l2(bytes: Arc<[u8]>) -> Self {
+        Self {
+            bytes,
+            tier: PeekTier::ExactL2,
+        }
+    }
+}
+
 fn request_cache_scope() -> CacheScope {
     crate::observability::io_trace::current_tenant_stable_id()
         .map(CacheScope::stable_tenant)
@@ -289,6 +336,26 @@ impl SurvivorRangeCache {
         Ok(true)
     }
 
+    /// Serve + account + promote an exact-range value that a lower tier
+    /// supplied, the ONE way (parent-L2 arm and peeked arm share it —
+    /// #2422 review F7: two copies of the promotion policy could drift).
+    async fn serve_from_lower_tier(
+        &self,
+        exact_key: CacheKey,
+        weight: u32,
+        bytes: Arc<[u8]>,
+    ) -> FsResult<Arc<[u8]>> {
+        // Promote only the demanded range. `insert_memory_only` deliberately
+        // avoids writing an exact-range duplicate beside the durable parent
+        // entry.
+        self.inner
+            .insert_memory_only(exact_key, weight, bytes.clone())
+            .await;
+        crate::observability::io_trace::record_survivor_l1s(0, 1);
+        self.sync_prometheus();
+        Ok(bytes)
+    }
+
     /// Read through the exact-range cache, then a write-time parent-region
     /// seed, and only then the authoritative loader.
     #[allow(clippy::too_many_arguments)]
@@ -331,7 +398,7 @@ impl SurvivorRangeCache {
         len: u64,
         parent_off: u64,
         parent_len: u64,
-        peeked: Option<Arc<[u8]>>,
+        peeked: Option<PeekedBytes>,
         loader: F,
     ) -> FsResult<Arc<[u8]>>
     where
@@ -366,22 +433,43 @@ impl SurvivorRangeCache {
             self.sync_prometheus();
             return Ok(exact);
         }
-        // Serve bytes the peek already paid for. Accounting mirrors the
-        // parent-L2 arm below: the disk read happened (at peek time, on the
-        // raw store, uncounted there), so it is counted HERE — one
-        // parent-L2-style hit, plus the same L1 promotion the L2 arm does.
-        if let Some(bytes) = peeked
-            && bytes.len() == slice_len
+        // Serve bytes the peek already paid for, accounted by the tier the
+        // peek actually read (#2442 review F6: booking every serve as a
+        // parent-L2 hit skewed the survivor L2 hit ratio — the pinned-vs-
+        // entitled capacity signal — on peek-heavy workloads).
+        if let Some(peeked) = peeked
+            && peeked.bytes.len() == slice_len
         {
-            self.parent_l2_hits
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            crate::observability::io_trace::record_l2s(1, 0);
-            self.inner
-                .insert_memory_only(exact_key, weight, bytes.clone())
-                .await;
-            crate::observability::io_trace::record_survivor_l1s(0, 1);
-            self.sync_prometheus();
-            return Ok(bytes);
+            match peeked.tier {
+                PeekTier::ExactL1 => {
+                    // DRAM at peek time, evicted before consume: a memory
+                    // serve, no disk either side.
+                    crate::observability::io_trace::record_l2s(0, 0);
+                    return self
+                        .serve_from_lower_tier(exact_key, weight, peeked.bytes)
+                        .await;
+                }
+                PeekTier::ParentL1 => unreachable!(
+                    "parent-L1 peeks return the parent buffer, whose length never equals the slice"
+                ),
+                PeekTier::ParentL2 => {
+                    self.parent_l2_hits
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    crate::observability::io_trace::record_l2s(1, 0);
+                    return self
+                        .serve_from_lower_tier(exact_key, weight, peeked.bytes)
+                        .await;
+                }
+                PeekTier::ExactL2 => {
+                    // An exact-key L2 write-through entry: the read happened
+                    // (at peek), in the exact namespace — an l2 read, but not
+                    // a PARENT-l2 hit.
+                    crate::observability::io_trace::record_l2s(1, 0);
+                    return self
+                        .serve_from_lower_tier(exact_key, weight, peeked.bytes)
+                        .await;
+                }
+            }
         }
         let end = start.saturating_add(slice_len);
         if let Some((parent, outcome)) = self.inner.get_with_outcome(&parent_key).await
@@ -404,15 +492,7 @@ impl SurvivorRangeCache {
                 self.parent_l2_hits
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 crate::observability::io_trace::record_l2s(1, 0);
-                // Promote only the demanded range. `insert_memory_only`
-                // deliberately avoids writing an exact-range duplicate
-                // beside the durable parent entry.
-                self.inner
-                    .insert_memory_only(exact_key, weight, bytes.clone())
-                    .await;
-                crate::observability::io_trace::record_survivor_l1s(0, 1);
-                self.sync_prometheus();
-                return Ok(bytes);
+                return self.serve_from_lower_tier(exact_key, weight, bytes).await;
             }
             self.parent_l2_misses
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -582,19 +662,68 @@ impl SurvivorRangeCache {
     /// `PersistentByteStore` (never the traced wrapper) so no io_trace or l2
     /// counters move; the only effect is an LRU recency tick plus a local-disk
     /// read attempt (~ms, gated-only).
-    pub async fn peek_exact_residency(
+    pub(crate) async fn peek_exact_residency(
         &self,
         kind: CacheKind,
         path: &str,
         off: u64,
         len: u64,
-    ) -> Option<Arc<[u8]>> {
+    ) -> Option<PeekedBytes> {
         let scope = request_cache_scope();
         let key = CacheKey::with_scope(scope, kind, format!("{path}:{off}:{len}"));
         if let Some(bytes) = self.inner.peek_memory(&key).await {
-            return Some(bytes);
+            return Some(PeekedBytes::exact_l1(bytes));
         }
-        self.peek_exact_l2(&key, len).await
+        self.peek_exact_l2(&key, len)
+            .await
+            .map(PeekedBytes::exact_l2)
+    }
+
+    /// The exact-key consume mirror of the parent-path serve seam (#2442
+    /// review F4: the OID-chunk arm had the identical peek·discard·re-read).
+    /// `peeked` bytes are served after an L1 miss, accounted by tier; the
+    /// public [`Self::get_or_fetch`] keeps its signature for every caller.
+    pub(crate) async fn get_or_fetch_impl<F, Fut>(
+        &self,
+        kind: CacheKind,
+        path: &str,
+        off: u64,
+        len: u64,
+        peeked: Option<PeekedBytes>,
+        loader: F,
+    ) -> FsResult<Arc<[u8]>>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = FsResult<Vec<u8>>>,
+    {
+        let Some(peeked) = peeked else {
+            return self.get_or_fetch(kind, path, off, len, loader).await;
+        };
+        let scope = request_cache_scope();
+        self.track_hot_key(&scope, kind, path, off, len);
+        let key = CacheKey::with_scope(scope, kind, format!("{path}:{off}:{len}"));
+        let weight: u32 = len.try_into().unwrap_or(u32::MAX);
+        if let Some((exact, outcome)) = self.inner.get_with_outcome(&key).await {
+            crate::observability::io_trace::record_survivor_l1s(
+                u64::from(outcome == CacheReadOutcome::MemoryHit),
+                u64::from(outcome != CacheReadOutcome::MemoryHit),
+            );
+            self.sync_prometheus();
+            return Ok(exact);
+        }
+        match peeked.tier {
+            PeekTier::ExactL1 => {
+                // Evicted between peek and consume: a memory serve.
+                crate::observability::io_trace::record_l2s(0, 0);
+            }
+            PeekTier::ExactL2 => {
+                crate::observability::io_trace::record_l2s(1, 0);
+            }
+            // The OID arm peeks exact-key residency only; a parent-tier
+            // buffer cannot arrive here.
+            PeekTier::ParentL1 | PeekTier::ParentL2 => {}
+        }
+        self.serve_from_lower_tier(key, weight, peeked.bytes).await
     }
 
     /// TD-RDSTRAT-12 §3 (round 4): the [`Self::get_or_fetch_in_parent`] mirror
@@ -619,7 +748,7 @@ impl SurvivorRangeCache {
     ///    local-disk read (~ms per 4 MiB range, gated-only) — accepted.
     ///
     /// `None` ⇒ the loader WILL run ⇒ the caller may batch this range.
-    pub async fn peek_parent_residency(
+    pub(crate) async fn peek_parent_residency(
         &self,
         kind: CacheKind,
         path: &str,
@@ -627,38 +756,50 @@ impl SurvivorRangeCache {
         len: u64,
         parent_off: u64,
         parent_len: u64,
-    ) -> Option<Arc<[u8]>> {
+    ) -> Option<PeekedBytes> {
         let scope = request_cache_scope();
         // 1. Exact-range L1 (same key get_or_fetch_in_parent builds).
         let exact_key = CacheKey::with_scope(scope.clone(), kind, format!("{path}:{off}:{len}"));
         if let Some(bytes) = self.inner.peek_memory(&exact_key).await {
-            return Some(bytes);
+            return Some(PeekedBytes::exact_l1(bytes));
         }
         // 2./3. Parent tiers (mirror the real method's coordinate checks).
         let Some(relative_off) = off.checked_sub(parent_off) else {
             // Outside the parent: the real method falls back to plain
             // get_or_fetch semantics — only the exact tiers apply.
-            return self.peek_exact_l2(&exact_key, len).await;
+            return self
+                .peek_exact_l2(&exact_key, len)
+                .await
+                .map(PeekedBytes::exact_l2);
         };
         if relative_off.saturating_add(len) > parent_len {
-            return self.peek_exact_l2(&exact_key, len).await;
+            return self
+                .peek_exact_l2(&exact_key, len)
+                .await
+                .map(PeekedBytes::exact_l2);
         }
         let parent_key = CacheKey::shared(
             CacheKind::QuantizedCodes,
             format!("{path}:{parent_off}:{parent_len}"),
         );
         let Ok(start) = usize::try_from(relative_off) else {
-            return self.peek_exact_l2(&exact_key, len).await;
+            return self
+                .peek_exact_l2(&exact_key, len)
+                .await
+                .map(PeekedBytes::exact_l2);
         };
         let Ok(slice_len) = usize::try_from(len) else {
-            return self.peek_exact_l2(&exact_key, len).await;
+            return self
+                .peek_exact_l2(&exact_key, len)
+                .await
+                .map(PeekedBytes::exact_l2);
         };
         let end = start.saturating_add(slice_len);
         // 2. Parent-region L1 slice.
         if let Some(parent) = self.inner.peek_memory(&parent_key).await
             && parent.get(start..end).is_some()
         {
-            return Some(parent);
+            return Some(PeekedBytes::parent_l1(parent));
         }
         // 3. Parent-key L2 (covers write-time seeds). Raw store, no counters.
         if let Some(store) = &self.l2_store
@@ -670,10 +811,12 @@ impl SurvivorRangeCache {
                 )
                 .await
         {
-            return Some(bytes);
+            return Some(PeekedBytes::parent_l2(bytes));
         }
         // 4. Exact-key L2 (clustered-loop loader write-through entries).
-        self.peek_exact_l2(&exact_key, len).await
+        self.peek_exact_l2(&exact_key, len)
+            .await
+            .map(PeekedBytes::exact_l2)
     }
 
     /// Exact-key L2 probe through the RAW store — no `TracedSurvivorL2`
@@ -1431,7 +1574,17 @@ mod tests {
             .peek_parent_residency(CacheKind::QuantizedCodes, "seg.pax", 256, 512, 0, 4096)
             .await
             .expect("peek must see the persisted parent");
-        assert_eq!(peeked.len(), 512, "peek step 3 returns the exact range");
+        assert_eq!(
+            peeked.bytes.len(),
+            512,
+            "peek step 3 returns the exact range"
+        );
+        assert_eq!(
+            peeked.tier,
+            PeekTier::ParentL2,
+            "a fresh cache can only answer from L2"
+        );
+        let peeked_bytes = peeked.bytes.clone();
 
         // Delete the persistent entry: a consume-side L2 re-probe now misses,
         // so only the carried bytes can serve this range.
@@ -1450,7 +1603,7 @@ mod tests {
                 512,
                 0,
                 4096,
-                Some(peeked.clone()),
+                Some(peeked),
                 move || {
                     let sentinel = sentinel.clone();
                     async move {
@@ -1462,7 +1615,7 @@ mod tests {
             .await
             .expect("peeked serve");
         assert_eq!(
-            &*served, &*peeked,
+            &*served, &*peeked_bytes,
             "the carried peek bytes must be served, not the loader sentinel"
         );
         assert_eq!(
@@ -1499,7 +1652,12 @@ mod tests {
             .peek_parent_residency(CacheKind::QuantizedCodes, "seed.pax", 16, 8, 0, 128)
             .await
             .expect("parent L1 must be visible");
-        assert_eq!(peeked.len(), 128, "peek step 2 carries the parent buffer");
+        assert_eq!(
+            peeked.bytes.len(),
+            128,
+            "peek step 2 carries the parent buffer"
+        );
+        assert_eq!(peeked.tier, PeekTier::ParentL1);
 
         let ran = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let ran_loader = Arc::clone(&ran);
@@ -1532,5 +1690,59 @@ mod tests {
             0,
             "a DRAM-resident parent must never reach the loader"
         );
+    }
+
+    /// #2442 review F4: the exact-key (OID-chunk) seam serves bytes an
+    /// earlier `peek_exact_residency` already read, instead of re-reading the
+    /// identical range. The persistent entry is deleted after the peek so
+    /// only the carried bytes can answer; the loader must not run.
+    #[tokio::test]
+    async fn exact_key_seam_serves_peeked_bytes_without_rereading() {
+        let dir = tempfile::tempdir().expect("test tempdir");
+        let store =
+            Arc::new(PersistentByteStore::open(dir.path(), 1 << 20).expect("open persistent L2"));
+        let writer = SurvivorRangeCache::with_resolver_and_l2(1 << 20, None, Some(store.clone()));
+        let payload: Arc<[u8]> = Arc::from(vec![7u8; 256].as_slice());
+        writer
+            .get_or_fetch(CacheKind::Other, "oid.pax", 1024, 256, || {
+                let payload = payload.clone();
+                async move { Ok(payload.to_vec()) }
+            })
+            .await
+            .expect("write-through load");
+
+        // Fresh cache: L1 empty, so the peek can only answer from exact L2.
+        let cache = SurvivorRangeCache::with_resolver_and_l2(1 << 20, None, Some(store.clone()));
+        let peeked = cache
+            .peek_exact_residency(CacheKind::Other, "oid.pax", 1024, 256)
+            .await
+            .expect("exact-key L2 must be visible to the peek");
+        assert_eq!(peeked.tier, PeekTier::ExactL2);
+        let peeked_bytes = peeked.bytes.clone();
+        store
+            .remove_where(|key| key.starts_with("survivor-exact/"))
+            .await;
+
+        let ran = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let ran_loader = Arc::clone(&ran);
+        let served = cache
+            .get_or_fetch_impl(
+                CacheKind::Other,
+                "oid.pax",
+                1024,
+                256,
+                Some(peeked),
+                move || async move {
+                    ran_loader.fetch_add(1, Ordering::SeqCst);
+                    Ok(vec![0xEEu8; 256])
+                },
+            )
+            .await
+            .expect("peeked exact serve");
+        assert_eq!(
+            &*served, &*peeked_bytes,
+            "carried bytes, not the loader sentinel"
+        );
+        assert_eq!(ran.load(Ordering::SeqCst), 0, "the loader must not run");
     }
 }

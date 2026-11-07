@@ -969,6 +969,12 @@ impl SstEngine {
         ctx: &StorageQueryContext,
     ) -> Result<Vec<OptimizedSearchRecord>> {
         let _search_start = std::time::Instant::now();
+        // S2b mirror (#2442 review F1): the adaptive inter-file degree's
+        // in-flight guard was acquired ONLY on the arc entry, so REST/service
+        // traffic arriving here left IN_FLIGHT_SEARCHES at 0 and
+        // resolve_search_parallelism never divided by concurrency — the same
+        // guard-on-one-entry defect this PR fixes for INFLIGHT_SCANS.
+        let _in_flight_guard = InFlightSearchGuard::acquire();
         // ADR-030 / TD-158: attribute this query's SST compute to KRU on any exit
         // path (records the elapsed time to the active io_trace on drop).
         let _compute_guard = ComputeMsGuard::new("sst");
@@ -4901,6 +4907,7 @@ mod tests {
     // cores". ----
 
     #[test]
+    #[serial]
     fn morsel_degree_backs_off_under_concurrent_scans() {
         use std::sync::atomic::Ordering;
         // SAFETY: nextest runs each test in its own process.
@@ -5030,9 +5037,9 @@ mod tests {
             "arc search must succeed: {:?}",
             result.err()
         );
-        assert!(
-            observed_max >= 1,
-            "the arc path must count itself in INFLIGHT_SCANS while scanning              (observed max {observed_max}; pre-fix it never left 0, so the              adaptive morsel degree never saw concurrency)"
+        assert_eq!(
+            observed_max, 1,
+            "the arc path must count ITSELF — exactly once; a nested or double enter would spuriously force sequential ranks — in INFLIGHT_SCANS while scanning; pre-fix it never left 0"
         );
         assert_eq!(
             INFLIGHT_SCANS.load(Ordering::Relaxed),
