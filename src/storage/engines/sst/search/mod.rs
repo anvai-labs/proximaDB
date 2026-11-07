@@ -319,7 +319,12 @@ fn resolve_search_parallelism(config_value: u16) -> u16 {
 #[cfg(test)]
 fn resolve_arc_search_parallelism(config_value: u16) -> u16 {
     let base = resolve_search_parallelism(config_value);
-    if config_value == 0 && std::env::var("PROXIMADB_SEARCH_PARALLEL_FILES").is_err() {
+    // Mirror resolve_search_parallelism: only a PARSABLE env value overrides.
+    let env_override = std::env::var("PROXIMADB_SEARCH_PARALLEL_FILES")
+        .ok()
+        .and_then(|v| v.trim().parse::<u16>().ok())
+        .is_some();
+    if config_value == 0 && !env_override {
         adaptive_degree(
             base,
             IN_FLIGHT_SEARCHES.load(std::sync::atomic::Ordering::Relaxed),

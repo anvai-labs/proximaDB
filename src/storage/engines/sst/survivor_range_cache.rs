@@ -532,8 +532,8 @@ impl SurvivorRangeCache {
     /// served WITHOUT running its loader: from DRAM (pinned/L1) or from the
     /// persistent exact-key L2.
     ///
-    /// The L2 step is an INDEX lookup (`PersistentByteStore::entry_len`): no
-    /// disk read, no CRC check, no group-hit/touch/heal side effects, no
+    /// The L2 step is an INDEX lookup (`PersistentByteStore::touch_entry_len`):
+    /// no disk read, no CRC check, no group-hit or heal side effects, no
     /// io_trace or l2 counters — only an LRU recency tick, so the same query's
     /// write-through cannot evict a range it just classified resident. So the
     /// planner reads a resident range ONCE

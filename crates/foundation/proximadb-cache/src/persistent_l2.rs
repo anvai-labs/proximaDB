@@ -900,6 +900,10 @@ impl PersistentByteStore {
 
         if let Some(meta) = write_meta {
             let file_len = meta.file_len;
+            // A new entry is the most recently used (TD-IOBUDGET-3): with the
+            // default tick of 1 it tied every never-read entry and lost the LRU
+            // race to hash order — including to entries it should outlive.
+            meta.touch.store(self.next_tick(), Ordering::Relaxed);
             if let Some(old) = self.inner.entries.insert(key, Arc::new(meta)) {
                 self.inner
                     .resident_bytes
@@ -921,6 +925,10 @@ impl PersistentByteStore {
                     .fetch_add(meta.file_len, Ordering::Relaxed);
                 self.inner.class_resident_bytes[meta.class as usize]
                     .fetch_add(meta.file_len, Ordering::Relaxed);
+                // A new entry is the most recently used (TD-IOBUDGET-3): with the
+                // default tick of 1 it tied every never-read entry and lost the LRU
+                // race to hash order — including to entries it should outlive.
+                meta.touch.store(self.next_tick(), Ordering::Relaxed);
                 self.inner.entries.insert(key, Arc::new(meta));
             }
         }
@@ -988,6 +996,10 @@ impl PersistentByteStore {
 
         if let Some(meta) = write_meta {
             let file_len = meta.file_len;
+            // A new entry is the most recently used (TD-IOBUDGET-3): with the
+            // default tick of 1 it tied every never-read entry and lost the LRU
+            // race to hash order — including to entries it should outlive.
+            meta.touch.store(self.next_tick(), Ordering::Relaxed);
             if let Some(old) = self.inner.entries.insert(key, Arc::new(meta)) {
                 self.inner
                     .resident_bytes
@@ -1008,6 +1020,10 @@ impl PersistentByteStore {
                 .fetch_add(meta.file_len, Ordering::Relaxed);
             self.inner.class_resident_bytes[meta.class as usize]
                 .fetch_add(meta.file_len, Ordering::Relaxed);
+            // A new entry is the most recently used (TD-IOBUDGET-3): with the
+            // default tick of 1 it tied every never-read entry and lost the LRU
+            // race to hash order — including to entries it should outlive.
+            meta.touch.store(self.next_tick(), Ordering::Relaxed);
             self.inner.entries.insert(key, Arc::new(meta));
         }
         self.protect_on_admit(&admit_key);

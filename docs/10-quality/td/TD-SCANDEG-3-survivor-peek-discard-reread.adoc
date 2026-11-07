@@ -52,8 +52,8 @@ un-peeked consume.
 == Update 2026-11-06: exact-key sites resolved by design C
 
 C. Classify on the INDEX, not the bytes. `is_exact_resident` answers from
-DRAM or `PersistentByteStore::entry_len` (no read, no CRC, no recency or
-group-hit side effects). The exact-key planners — Region D, Region A
+DRAM or `PersistentByteStore::touch_entry_len` (no read, no CRC, no
+group-hit side effects; only an LRU recency tick). The exact-key planners — Region D, Region A
 (`coarse_probe_survivors`) and the legacy OID tail — use it, so they read a
 resident range once. It carries none of design A's transient memory or
 counter bypass, nor design B's promotion-eviction cascade.

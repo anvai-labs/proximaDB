@@ -58,3 +58,9 @@ retry, plus a hand-off over its fetch budget).
 Accepted residual: an L2 entry evicted between classification and consume
 (the recency tick makes this unlikely, but a write-through burst can still
 exceed it) costs one unbatched ranged GET instead of riding the wave.
+
+Accepted residual: an L2 entry whose file keeps failing with a
+non-rebuildable I/O error (EIO, permission) stays indexed, so it classifies
+resident and each query pays one unbatched GET for it at consume (it used to
+ride the batched wave). A persistently failing cache disk is an operational
+alarm condition; the store does not evict on such errors today.
