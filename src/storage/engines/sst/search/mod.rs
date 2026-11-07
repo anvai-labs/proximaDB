@@ -2573,7 +2573,12 @@ self.try_pax_cascade(
         // the box by c×cores. The guard is held to the end of this function,
         // which awaits every per-file handle, so it covers the real scan
         // duration.
-        let _scan_guard = ScanGuard::enter();
+        // #2442 review round 3 (F3): the guard is SHARED into every spawned
+        // per-file task, so the in-flight count lives until the LAST task ends —
+        // a cancelled or early-returning parent must not decrement while its
+        // orphaned spawns keep ranking (that let the next query see itself
+        // alone and fan out across every core).
+        let scan_guard = std::sync::Arc::new(ScanGuard::enter());
 
         let use_pipeline = ctx.search_params.enable_pipeline_execution.unwrap_or(false);
         let use_parallel_morsels = ctx.search_params.enable_parallel_morsels.unwrap_or(false);
@@ -2625,10 +2630,12 @@ self.try_pax_cascade(
                 let scan_path = path.clone();
                 let cells = directory_cells.get(&path).cloned();
                 let deferred = deferred.clone();
+                let task_scan_guard = std::sync::Arc::clone(&scan_guard);
                 handles.push((
                     path,
                     tokio::spawn(async move {
                         let _permit = permit; // released on task drop
+                        let _scan_guard = task_scan_guard; // held to task end (F3)
                         // `engine` is `Arc<SstEngine>`; method-call auto-derefs to `&self`.
                         let scan = engine.scan_single_file(
                             &scan_path,
@@ -5019,6 +5026,9 @@ mod tests {
         // SAFETY: nextest process-per-test isolation + #[serial].
         unsafe { std::env::set_var("PROXIMADB_SEARCH_PARALLEL_FILES", "4") };
 
+        // Baseline-relative: the shared-process `cargo test` fallback may have
+        // another search mid-scan (round 3, F4).
+        let base = INFLIGHT_SCANS.load(Ordering::Relaxed);
         let engine_arc = Arc::new(engine);
         let stop = Arc::new(AtomicBool::new(false));
         let stop_sampler = Arc::clone(&stop);
@@ -5046,12 +5056,13 @@ mod tests {
             result.err()
         );
         assert_eq!(
-            observed_max, 1,
+            observed_max,
+            base + 1,
             "the arc path must count ITSELF — exactly once; a nested or double enter would spuriously force sequential ranks — in INFLIGHT_SCANS while scanning; pre-fix it never left 0"
         );
         assert_eq!(
             INFLIGHT_SCANS.load(Ordering::Relaxed),
-            0,
+            base,
             "the guard must release when the scan completes"
         );
     }

@@ -5297,34 +5297,6 @@ pub async fn rabitq_search_segment_coalesced(
     .await
 }
 
-/// Bound on peeked bytes a planner may carry from classification to consume,
-/// per arm (#2442 review F3): the D4 wave bound. Past it a range degrades to
-/// the pre-fix re-probe, so the worst case is the status quo ante.
-const CARRIED_PEEK_BUDGET_BYTES: u64 = 32 * 4 * 1024 * 1024;
-
-/// Decide whether a peek hit's bytes are worth carrying to the consume —
-/// the ONE rule both the SQ8 survivor arm and the OID-chunk arm use (F9).
-///
-/// A parent-L1 buffer is NOT carried and NOT charged (F5): it is the whole
-/// parent region already resident in DRAM, the consume slices it for free,
-/// and charging its full size against the budget starved the tiers whose
-/// carried bytes actually save a disk read (parent-L2, exact-L2).
-fn carry_peeked(
-    peeked: crate::storage::engines::sst::survivor_range_cache::PeekedBytes,
-    carried: &mut u64,
-) -> Option<crate::storage::engines::sst::survivor_range_cache::PeekedBytes> {
-    use crate::storage::engines::sst::survivor_range_cache::PeekTier;
-    if peeked.tier == PeekTier::ParentL1 {
-        return None;
-    }
-    let n = peeked.bytes.len() as u64;
-    if carried.saturating_add(n) > CARRIED_PEEK_BUDGET_BYTES {
-        return None;
-    }
-    *carried += n;
-    Some(peeked)
-}
-
 /// ADR-089 / TD-FPRUNE-1 P1: [`rabitq_search_segment_coalesced`] restricted to
 /// an optional predicate row allow-set (global row ordinals). When `Some`,
 /// Stage-1 ranks ONLY allowed rows — the survivor pool holds
@@ -5859,12 +5831,7 @@ pub async fn rabitq_search_segment_coalesced_allowed(
         // planned range into SiteServed (the seam will serve it; loader can
         // only run on an LRU race) vs Cold (the loader WILL run → batch it).
         enum RegionBSlot {
-            /// Carries the bytes `peek_parent_residency` already read
-            /// (TD-SCANDEG-1 sibling: peek·discard·re-read paid the local
-            /// disk read stack twice per range). `None` inside = the peek
-            /// hit a tier whose bytes the consume arm re-derives cheaper
-            /// (e.g. a DRAM parent slice).
-            SiteServed(Option<crate::storage::engines::sst::survivor_range_cache::PeekedBytes>),
+            SiteServed,
             Cold(usize),
             /// D5: carried by the coarse probe's wave (extent, byte range) —
             /// no read here.
@@ -5872,17 +5839,10 @@ pub async fn rabitq_search_segment_coalesced_allowed(
         }
         let mut slots: Vec<RegionBSlot> = Vec::with_capacity(sq8_fetches.len());
         let mut cold_ranges: Vec<std::ops::Range<u64>> = Vec::new();
-        // #2442 review F3: carried peeked buffers are TRANSIENT MEMORY the
-        // pre-PR code never held (it discarded them at the peek). Bound them
-        // to the same order as the D4 cold-wave bound (32 x 4 MiB); beyond
-        // the budget a peek-hit range degrades to SiteServed(None) — the
-        // consume re-probes, which is exactly the old behaviour, so the
-        // worst case is the status quo ante, never worse.
-        let mut carried_bytes: u64 = 0;
         for fetch in &sq8_fetches {
             match survivor_cache {
-                Some(sc) => {
-                    if let Some(peeked) = sc
+                Some(sc)
+                    if sc
                         .peek_parent_residency(
                             CacheKind::QuantizedCodes,
                             path,
@@ -5892,20 +5852,9 @@ pub async fn rabitq_search_segment_coalesced_allowed(
                             header.sq8_len,
                         )
                         .await
-                    {
-                        slots.push(RegionBSlot::SiteServed(carry_peeked(
-                            peeked,
-                            &mut carried_bytes,
-                        )));
-                    } else {
-                        match prefetched_range(&prefetched_b, fetch.start, fetch.end) {
-                            Some((extent, rel)) => slots.push(RegionBSlot::Prefetched(extent, rel)),
-                            None => {
-                                slots.push(RegionBSlot::Cold(cold_ranges.len()));
-                                cold_ranges.push(fetch.start..fetch.end);
-                            }
-                        }
-                    }
+                        .is_some() =>
+                {
+                    slots.push(RegionBSlot::SiteServed);
                 }
                 _ => match prefetched_range(&prefetched_b, fetch.start, fetch.end) {
                     Some((extent, rel)) => slots.push(RegionBSlot::Prefetched(extent, rel)),
@@ -5920,9 +5869,7 @@ pub async fn rabitq_search_segment_coalesced_allowed(
         // unset/≤1 ⇒ the trait runs it sequentially — byte-for-byte baseline).
         // D4 memory bound: wave transient = min(INFLIGHT, N) × max_range_bytes
         // ≤ 32 × 4 MiB = 128 MiB; one bounded read_ranges_prefetch, never an
-        // unbounded join_all. Carried peeked buffers add at most
-        // CARRIED_PEEK_BUDGET_BYTES (F3) on top, released as each consume
-        // iteration takes them.
+        // unbounded join_all.
         //
         // Metrics parity: every buffer corresponds to exactly one physical GET
         // the sequential loop would have issued inside its loader, so the
@@ -5970,20 +5917,13 @@ pub async fn rabitq_search_segment_coalesced_allowed(
         for (fetch_i, fetch) in sq8_fetches.iter().enumerate() {
             let start = fetch.start;
             let range_len = fetch.end - fetch.start;
-            // TD-SCANDEG-1 sibling: take the peeked bytes first — they are
-            // `Arc<[u8]>`, a different type from the wave's `Vec<u8>` `pre`.
-            let peeked: Option<crate::storage::engines::sst::survivor_range_cache::PeekedBytes> =
-                match &mut slots[fetch_i] {
-                    RegionBSlot::SiteServed(p) => p.take(),
-                    _ => None,
-                };
             let pre = match &slots[fetch_i] {
                 RegionBSlot::Cold(i) => Some(cold_bytes[*i].take().ok_or_else(|| {
                     anyhow::anyhow!(
                         "coalesced scan SQ8 survivor fetch {path}: cold fetch {i} missing"
                     )
                 })?),
-                RegionBSlot::SiteServed(_) => None,
+                RegionBSlot::SiteServed => None,
                 RegionBSlot::Prefetched(extent, rel) => {
                     Some(prefetched_b[*extent].1[rel.clone()].to_vec())
                 }
@@ -6012,21 +5952,15 @@ pub async fn rabitq_search_segment_coalesced_allowed(
                             anyhow::anyhow!("coalesced scan SQ8 survivor fetch {path}: {e}")
                         })?,
                     None => {
-                        // SiteServed: the peek already read these bytes; the
-                        // seam serves them instead of re-reading the identical
-                        // range (peek·discard·re-read, TD-SCANDEG-1 sibling).
-                        // `peeked = None` here = a peek/consume race or a
-                        // length-mismatched parent buffer — the original
-                        // baseline loader then runs, and its records fire iff
-                        // it truly runs.
-                        sc.get_or_fetch_in_parent_impl(
+                        // SiteServed (or a peek/consume race): the original
+                        // baseline loader — records fire iff it truly runs.
+                        sc.get_or_fetch_in_parent(
                             CacheKind::QuantizedCodes,
                             path,
                             start,
                             range_len,
                             header.sq8_off,
                             header.sq8_len,
-                            peeked,
                             || async move {
                                 let b = fs.read_range_resident(path, start, range_len).await?;
                                 crate::observability::io_trace::record_pax_region_bytes(
@@ -6258,15 +6192,11 @@ pub async fn rabitq_search_segment_coalesced_allowed(
         }
 
         enum ChunkSlot {
-            /// Carries the peeked bytes (#2442 review F4: the OID arm had the
-            /// identical peek·discard·re-read; the exact-key serve seam now
-            /// consumes them). `None` = over the carried-bytes budget.
-            SiteServed(Option<crate::storage::engines::sst::survivor_range_cache::PeekedBytes>),
+            SiteServed,
             Cold(usize),
         }
         let mut chunk_slots: Vec<ChunkSlot> = Vec::with_capacity(chunk_descs.len());
         let mut chunk_cold_ranges: Vec<std::ops::Range<u64>> = Vec::new();
-        let mut chunk_carried_bytes: u64 = 0;
         for (desc_i, (_bi, _locals)) in block_rows.iter().enumerate() {
             let desc = &chunk_descs[desc_i];
             match survivor_cache {
@@ -6275,19 +6205,13 @@ pub async fn rabitq_search_segment_coalesced_allowed(
                 // the consume call's `get_or_fetch` with ZERO object-store
                 // GETs; classifying it Cold (DRAM-only peek) turned that free
                 // serve into a billed wave GET whose bytes were then dropped.
-                Some(sc) => {
-                    if let Some(peeked) = sc
+                Some(sc)
+                    if sc
                         .peek_exact_residency(CacheKind::Other, path, desc.start, desc.range_len)
                         .await
-                    {
-                        chunk_slots.push(ChunkSlot::SiteServed(carry_peeked(
-                            peeked,
-                            &mut chunk_carried_bytes,
-                        )));
-                    } else {
-                        chunk_slots.push(ChunkSlot::Cold(chunk_cold_ranges.len()));
-                        chunk_cold_ranges.push(desc.start..desc.start + desc.range_len);
-                    }
+                        .is_some() =>
+                {
+                    chunk_slots.push(ChunkSlot::SiteServed);
                 }
                 _ => {
                     chunk_slots.push(ChunkSlot::Cold(chunk_cold_ranges.len()));
@@ -6331,17 +6255,11 @@ pub async fn rabitq_search_segment_coalesced_allowed(
 
         for (desc_i, (bi, locals)) in block_rows.iter().enumerate() {
             let desc = &chunk_descs[desc_i];
-            let chunk_peeked: Option<
-                crate::storage::engines::sst::survivor_range_cache::PeekedBytes,
-            > = match &mut chunk_slots[desc_i] {
-                ChunkSlot::SiteServed(p) => p.take(),
-                _ => None,
-            };
             let pre = match &chunk_slots[desc_i] {
                 ChunkSlot::Cold(i) => Some(chunk_cold_bytes[*i].take().ok_or_else(|| {
                     anyhow::anyhow!("coalesced scan OID-chunk fetch {path}: cold chunk {i} missing")
                 })?),
-                ChunkSlot::SiteServed(_) => None,
+                ChunkSlot::SiteServed => None,
             };
             // ADR-065 Q3: same read-through cache class as the legacy OID path.
             let buf: Arc<[u8]> = if let Some(sc) = survivor_cache {
@@ -6363,17 +6281,13 @@ pub async fn rabitq_search_segment_coalesced_allowed(
                             anyhow::anyhow!("coalesced scan OID-chunk fetch {path}: {e}")
                         })?,
                     None => {
-                        // SiteServed: the peek already read these bytes; the
-                        // exact-key seam serves them instead of re-reading the
-                        // identical range (#2442 review F4). `None` inside =
-                        // over the carried budget or a peek/consume race — the
-                        // original baseline loader, records iff it truly runs.
-                        sc.get_or_fetch_impl(
+                        // SiteServed (or a peek/consume race): the original
+                        // baseline loader — records fire iff it truly runs.
+                        sc.get_or_fetch(
                             CacheKind::Other,
                             path,
                             desc.start,
                             desc.range_len,
-                            chunk_peeked,
                             || async move {
                                 let b = fs
                                     .read_range_resident(path, desc.start, desc.range_len)
@@ -6554,8 +6468,6 @@ pub async fn rabitq_search_segment_coalesced_allowed(
                     None => {
                         // SiteServed (or a peek/consume race): the original
                         // baseline loader — records fire iff it truly runs.
-                        // (Legacy OID tail: its peek is DRAM-only, so there is
-                        // no duplicated disk read to remove here.)
                         sc.get_or_fetch(CacheKind::Other, path, start, range_len, || async move {
                             let b = fs.read_range_resident(path, start, range_len).await?;
                             record_get_physical(CacheTier::ResultPayload, range_len, trace_on);
