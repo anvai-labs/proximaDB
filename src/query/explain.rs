@@ -268,10 +268,11 @@ impl VectorObjectEconomyExplain {
     /// touch them individually.
     ///
     /// * `mode` — the freshness mode the service honored.
-    /// * `current_lsn` — WAL cursor read at query plan time.
+    /// * `current_lsn` — WAL cursor read at query time; `None` when it was
+    ///   not read (no manifest service registered).
     /// * `scanned_records` / `scanned_bytes` — `None` when no scan ran
-    ///   (StaleOk, or watermark already covered the WAL); `Some(0)` if
-    ///   the scan ran but returned nothing.
+    ///   (StaleOk; there is no watermark skip since TD-OEDIRWM-1);
+    ///   `Some(0)` if the scan ran but returned nothing.
     pub fn record_wal_delta_scan(
         mut self,
         mode: &crate::core::search::VectorFreshnessMode,
@@ -2579,13 +2580,14 @@ mod tests {
 
         let explain = VectorObjectEconomyExplain::default().record_wal_delta_scan(
             &VectorFreshnessMode::StaleOk,
-            /*current_lsn*/ Some(250),
+            /*current_lsn*/ None,
             /*scanned_records*/ None,
             /*scanned_bytes*/ None,
         );
 
         assert_eq!(explain.freshness_mode_used.as_deref(), Some("stale_ok"));
-        assert_eq!(explain.current_lsn_at_query, Some(250));
+        // StaleOk never reads the WAL cursor: None, not a fabricated value.
+        assert_eq!(explain.current_lsn_at_query, None);
         assert!(explain.wal_delta_records_scanned.is_none());
         assert!(explain.wal_delta_bytes.is_none());
         assert!(!explain.wal_delta_searched);

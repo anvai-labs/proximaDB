@@ -2280,9 +2280,9 @@ impl VectorOperationsService {
     /// caller merges the delta with the engine results.
     ///
     /// Returns `(current_lsn, delta)`, where `current_lsn` is the WAL cursor
-    /// read once here (`None` when it was not read: `StaleOk`, or no
-    /// manifest service) so the caller's EXPLAIN reuses it, and `delta` is:
-    /// * `None` — no scan ran (mode is `StaleOk`, or no manifest service).
+    /// read once here for EXPLAIN (`None` when it was not read: `StaleOk`,
+    /// or no manifest service — the scan still runs then), and `delta` is:
+    /// * `None` — no scan ran (mode is `StaleOk`).
     /// * `Some(records)` — delta records, possibly empty. Tombstone
     ///   markers are preserved so the merge step can suppress older
     ///   engine results.
@@ -2307,28 +2307,24 @@ impl VectorOperationsService {
             return Ok((None, None));
         }
 
-        // Without a global manifest service the WAL cursor is unavailable,
-        // so the delta scan is skipped and the engine results stand.
-        // Strong-route freshness therefore holds only when the manifest is
-        // wired (the common production case via `SharedServices::new`).
-        //
-        // Log loud on miss: a missing manifest in a server-mode process is a
-        // bug (the v2 INSERT→SEARCH gap reconciled 2026-05-28 traced to this
-        // arm silently dropping delta-merge candidates). Emit a warn so the
-        // path is visible in route-health logs, but keep the Ok(None) so
-        // embedded callers that haven't called manifest::init can still read.
+        // The WAL cursor is read for EXPLAIN only: with no watermark it no
+        // longer gates the scan (TD-OEDIRWM-1). Without a global manifest
+        // service (embedded/test processes that never call
+        // `manifest::init`) it is `None`, and the scan STILL runs — the
+        // memtable lookup needs no manifest, and skipping it would hide
+        // freshly-written rows from a Strong read (the 2026-05-28 v2
+        // INSERT→SEARCH gap was this arm skipping).
         let current_lsn =
             match crate::storage::persistence::write_ahead_log::manifest::get_service() {
-                Some(svc) => svc.current_lsn().await,
+                Some(svc) => Some(svc.current_lsn().await),
                 None => {
-                    tracing::warn!(
+                    tracing::debug!(
                         target: "proximadb::services::vectors::delta_merge",
                         collection_id = %collection_id,
-                        "WAL delta merge skipped: global manifest service is not registered. \
-                         In server mode this means freshly-written WAL records may not be \
-                         visible to search. Call `manifest::init(&wal_config)` once at startup."
+                        "global manifest service not registered: WAL cursor unavailable for \
+                         EXPLAIN; the delta scan still runs"
                     );
-                    return Ok((None, None));
+                    None
                 }
             };
 
@@ -2348,7 +2344,7 @@ impl VectorOperationsService {
                 /* include_metadata */ true,
             )
             .await?;
-        Ok((Some(current_lsn), Some(records)))
+        Ok((current_lsn, Some(records)))
     }
 
     /// Attach orchestrator (builder-style)
@@ -6102,6 +6098,50 @@ mod index_first_search_tests {
             .delete_records_with_tenant_context("1001", vec!["v1".to_string()], None)
             .await
             .unwrap();
+    }
+
+    /// TD-OEDIRWM-1 follow-up: with no manifest service registered (this lib
+    /// test process never calls `manifest::init`), a Strong delta scan must
+    /// still run and surface the freshly-written unflushed row — the WAL
+    /// cursor only feeds EXPLAIN now, so it is `None`, never a reason to skip.
+    #[tokio::test]
+    async fn strong_delta_scan_runs_without_a_manifest_service() {
+        assert!(
+            crate::storage::persistence::write_ahead_log::manifest::get_service().is_none(),
+            "precondition: no manifest service in this test process"
+        );
+        let (service, _temp_dir) = create_test_service().await.unwrap();
+        cache_test_collection(&service, 1001, 3);
+        service
+            .insert_records_with_tenant_context(
+                "1001",
+                vec![record_with_vector("v1", vec![1.0, 2.0, 3.0])],
+                None,
+            )
+            .await
+            .unwrap();
+
+        let (current_lsn, delta) = service
+            .scan_wal_delta_if_needed(
+                "1001",
+                &[1.0, 2.0, 3.0],
+                5,
+                DistanceMetric::Cosine,
+                None,
+                &crate::core::search::VectorFreshnessMode::Strong,
+            )
+            .await
+            .unwrap();
+        assert_eq!(current_lsn, None, "cursor not read without a manifest");
+        let ids: Vec<String> = delta
+            .expect("a Strong read must scan the delta even without a manifest")
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        assert!(
+            ids.contains(&"v1".to_string()),
+            "the unflushed row must be visible to a Strong read: {ids:?}"
+        );
     }
 
     /// TD-PGWIRE-VECDEL-1: the scan behind vector-profile table reads must do

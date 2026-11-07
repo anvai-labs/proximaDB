@@ -2375,27 +2375,17 @@ fn build_route_health_with_live_state(
                 strong bypasses, so its max_staleness_ms bound is not enforced. \
                 Collection-default modes are not yet stored on the catalog.",
     };
-    let object_economy_eligible = engine == "sst";
+    // TD-OEDIRWM-1: no engine produces or reads an object-economy
+    // directory any more, so the route is not applicable anywhere.
     let object_economy = ObjectEconomyHealth {
-        eligible: object_economy_eligible,
-        // TD-OEDIRWM-1: no directory sidecar is written or read any more.
+        eligible: false,
         directory_format_present: false,
         live_status_in_app_state: false,
-        live_status: if object_economy_eligible {
-            "not_checked"
-        } else {
-            "not_applicable"
-        },
-        // No directory is produced (TD-OEDIRWM-1), so no route is advertised.
+        live_status: "not_applicable",
         route_hint: None,
-        notes: if object_economy_eligible {
-            "The SST flush no longer writes the VectorObjectEconomyDirectory \
-             sidecar and the query path does not read it (TD-OEDIRWM-1), so \
-             there is no live directory status to report."
-        } else {
-            "The vector object-economy route was SST-specific and is not produced \
-             for any engine since TD-OEDIRWM-1."
-        },
+        notes: "The vector object-economy directory route is retired: the SST \
+                flush no longer writes the directory sidecar and no query path \
+                reads it (TD-OEDIRWM-1).",
     };
     let (recall_probe_in_app_state, recall_probe_gate_open) = match recall_probe_state {
         RecallProbeLiveState::Unwired => (false, None),
@@ -4172,36 +4162,25 @@ mod tests {
     }
 
     #[test]
-    fn route_health_object_economy_is_explicitly_sst_only() {
-        let sst = build_route_health(
-            "c".to_string(),
-            "sst".to_string(),
-            8,
-            "cosine".to_string(),
-            0,
-            0,
-            0,
-        );
-        assert!(sst.object_economy.eligible);
-        // TD-OEDIRWM-1: the sidecar is neither written nor read.
-        assert!(!sst.object_economy.directory_format_present);
-        assert!(!sst.object_economy.live_status_in_app_state);
-        assert_eq!(sst.object_economy.live_status, "not_checked");
-        assert_eq!(sst.object_economy.route_hint, None);
-
-        let viper = build_route_health(
-            "c".to_string(),
-            "viper".to_string(),
-            8,
-            "cosine".to_string(),
-            0,
-            0,
-            0,
-        );
-        assert!(!viper.object_economy.eligible);
-        assert!(!viper.object_economy.directory_format_present);
-        assert_eq!(viper.object_economy.live_status, "not_applicable");
-        assert_eq!(viper.object_economy.route_hint, None);
+    fn route_health_object_economy_is_retired_for_every_engine() {
+        // TD-OEDIRWM-1: no engine produces or reads the directory, so the
+        // route is not applicable anywhere — including SST.
+        for engine in ["sst", "viper"] {
+            let h = build_route_health(
+                "c".to_string(),
+                engine.to_string(),
+                8,
+                "cosine".to_string(),
+                0,
+                0,
+                0,
+            );
+            assert!(!h.object_economy.eligible, "{engine}");
+            assert!(!h.object_economy.directory_format_present, "{engine}");
+            assert!(!h.object_economy.live_status_in_app_state, "{engine}");
+            assert_eq!(h.object_economy.live_status, "not_applicable", "{engine}");
+            assert_eq!(h.object_economy.route_hint, None, "{engine}");
+        }
     }
 
     #[test]

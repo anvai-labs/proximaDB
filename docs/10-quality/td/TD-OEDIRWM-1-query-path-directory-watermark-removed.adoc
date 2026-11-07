@@ -54,11 +54,15 @@ scoped diagnostics lookup; a refusal that a permanent 403 would turn into
 
 The first three follow-ups recorded with #2443 are closed:
 
-* **The flush no longer writes the sidecar.** Every default PAX flush built a
-  directory outcome from the block centroids and ran `upsert_and_persist`
-  (load = GET, store = create-dir + PUT) for a sidecar nothing read. Removed
-  with its helper (`pax_write_outcome`). Each flush is one GET + one PUT
-  cheaper; derived from the code path, not benchmarked.
+* **The flush no longer writes the sidecar.** A PAX flush built a directory
+  outcome from the block centroids and ran `upsert_and_persist` (load = GET,
+  store = create-dir + PUT) for a sidecar nothing read — whenever the engine
+  had the directory cache wired (server: `SharedServices::new`; not
+  embedded/bench engines), the flush carried a `collection_id`, and block
+  clustering produced centroids (default ON; `PROXIMADB_PAX_BLOCK_CLUSTER=0`
+  disables it). Removed with its helper (`pax_write_outcome`). Such a flush
+  is one GET + one PUT cheaper; derived from the code path, not
+  benchmarked.
 * **The dead directory-cache wiring is gone:** the `SstEngine`,
   `VectorOperationsService` and `SharedServices` `directory_cache` fields and
   builders, `touch_object_economy_directory_for_search`,
@@ -68,7 +72,11 @@ The first three follow-ups recorded with #2443 are closed:
   `scan_wal_delta_if_needed`: with no watermark the decision is exactly
   `requires_delta_merge()` (every mode but `StaleOk` scans). The helper
   returns the WAL cursor it reads, so a strict query reads `current_lsn`
-  once there instead of twice. The `VectorFreshnessMode::should_scan_delta*`
+  once there instead of twice. The cursor no longer gates anything, so a
+  process with no manifest service (embedded/tests without
+  `manifest::init`) now STILL scans the delta — before, a Strong read
+  there silently skipped unflushed rows. EXPLAIN reports the unread cursor
+  as `None`. The `VectorFreshnessMode::should_scan_delta*`
   crate API is kept (its unit tests and the object-economy bench use it).
 * `FreshnessLsnSource` stays: the `cold-deletion-vectors` search path uses
   it as the deletion-vector snapshot LSN. Its engine accessor is gated on
@@ -77,8 +85,9 @@ The first three follow-ups recorded with #2443 are closed:
 **Observable route-health change (shape unchanged, values changed):** for
 SST collections `directory_format_present` goes `true → false` (it now means
 "a directory sidecar is produced", not "the engine has the format") and
-`route_hint` goes `"object_economy" → null`. `eligible` stays `true`
-(engine type). EXPLAIN reports `current_lsn_at_query: None` when the WAL
+`route_hint` goes `"object_economy" → null`, `eligible` goes `true → false`
+and `live_status` goes `"not_checked" → "not_applicable"` — the route is
+not applicable to any engine. EXPLAIN reports `current_lsn_at_query: None` when the WAL
 cursor was not read, instead of 0. Measurement note: harnesses that sum the
 collection directory's bytes (e.g. `persisted_bytes` in
 `sift_pax_recall_ratchet_test`) now exclude the sidecar — that drop is not
@@ -106,6 +115,10 @@ Left in place, deliberately:
   `merge_delta_with_directory_results` / `merge_input_directory_records`
   naming (a trace-field rename), and the now-inert
   `PROXIMADB_DIRECTORY_CACHE_RECHECK_MS` gate.
+* The bench evidence id `object_economy_e2e_latency`
+  (`BENCHMARK_EVIDENCE.toml`) now spans the retirement: runs after it no
+  longer pay the sidecar GET + PUT per flush. Re-baseline that entry before
+  comparing new flush numbers with the 2026-05-28 / 2026-06-16 reports.
 * `FreshnessLsnSource` is still wired in a default build, where only the
   feature-gated path reads it; gating the field and wiring too is part of
   the same cleanup.
