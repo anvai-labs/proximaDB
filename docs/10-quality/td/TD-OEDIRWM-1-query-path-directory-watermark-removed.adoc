@@ -1,0 +1,63 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-OEDIRWM-1: The query path read a directory watermark it could never soundly use — removed
+:status: Accepted
+:date: 2026-11-06
+:tags: [cost, gets, voe-directory, freshness, correctness]
+
+== Verified facts
+
+* **Reachability.** Every REST record search reached the read: canonical
+  handler → `RecordOpsService::handle_record_search_for_tenant` →
+  `search_records_with_tenant_context` → `run_unified_search_v1` →
+  `unified_search_v1_inner` → `apply_delta_merge_with_explain` →
+  `cached_directory_watermark`, which loaded the object-economy directory
+  sidecar on every Strong / BoundedStale query.
+* **The reader looked in the wrong place.** It used the raw tenant
+  `base_location`; the flush writer uses the collection DATA path. The reader
+  never found a real sidecar: every strict query paid a 404 (re-issued after
+  each idle gap), and production NEVER skipped a delta scan on the watermark.
+* **The watermark cannot soundly gate a skip.** It is stamped after the flush
+  commits (not at the flushed snapshot), and the sidecar is shared across pods
+  while each memtable is per-pod, so pod A's sidecar would let pod B skip its
+  own unflushed rows. Fixing only the path would have ACTIVATED that.
+
+== Decision (#2443, after four review rounds)
+
+* The query path no longer reads the directory: `(0, 0)` is passed to the
+  delta-scan decision, so every strict query scans the delta — exactly what
+  production already did. Zero sidecar GETs per query.
+* BoundedStale is served as Strong. Route-health reports
+  `bounded_stale_time_bound_check: false` with notes saying so; EXPLAIN
+  reports the watermark as `None` (not wired), not a fabricated 0.
+* Route-health's object-economy status stays a NO-I/O read of the in-process
+  cache. With nothing on the query path populating it, it reports
+  `not_checked`, and its notes say why.
+* One root composition, `collection_data_path_for_assignment`, now used by
+  the flush writer and the record read-back. Sites still composing it by
+  hand: the storage-traits `collection_storage_path`,
+  `services/operations/vectors/read.rs`, `engines/nova/operations/search.rs`,
+  `services/collection/manager.rs` (two sites).
+
+Rejected along the way, each for a reason a review round found: a negative
+cache, a transient-vs-missing status split, a writer that refuses to
+overwrite an unreadable sidecar, and an on-request diagnostics loader. Once
+the query path stopped reading the directory, each was new machinery serving
+no hot-path reader, and two introduced defects of their own (a non-tenant-
+scoped diagnostics lookup; a refusal that a permanent 403 would turn into
+"never create the sidecar").
+
+== Follow-ups
+
+* The flush side still writes the sidecar (a GET + PUT per flush) though no
+  query reads it. Retire the write side, or define a consumer for it.
+* `scan_wal_delta_if_needed` / `should_scan_delta_with_time` still accept
+  watermark parameters that are now always 0; remove them, or make
+  BoundedStale explicitly equivalent to Strong, when that API is next touched.
+* A sound skip needs a watermark stamped at flush START and scoped per pod
+  (or fenced by memtable epoch), with read-your-writes proven across pods.
+
+== Not measured
+
+The GET reduction (one sidecar GET per strict query per idle gap → zero) is
+derived from the code path; no `BENCHMARK_EVIDENCE.toml` entry is claimed.

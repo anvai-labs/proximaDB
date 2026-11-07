@@ -2223,51 +2223,20 @@ impl VectorOperationsService {
         Some(entry.status.clone())
     }
 
-    /// Load the object-economy directory's status for the DIAGNOSTICS
-    /// route-health endpoint, on request (TD-OEDIRWM-1).
+    /// Return the cached object-economy directory status for a collection
+    /// without creating a handle or loading from object storage.
     ///
-    /// The query path no longer reads the directory at all: its watermark is
-    /// stamped after the flush commits (not at the flushed snapshot) and the
-    /// sidecar is shared across pods while each memtable is per-pod, so it
-    /// cannot soundly gate any delta-scan skip. Loading it here, only when an
-    /// operator asks, keeps route-health's live status truthful without a
-    /// sidecar GET on every strict query. The canonical `collection.id` is
-    /// used for both the cache key and the path, matching the flush writer.
-    pub(crate) async fn object_economy_directory_status_for_diagnostics(
+    /// Diagnostics endpoints use this to report live in-process cache state
+    /// while preserving the "no surprise I/O" contract.
+    pub(crate) fn cached_object_economy_directory_status(
         &self,
         collection_id: &str,
     ) -> Option<crate::storage::engines::sst::object_economy_directory::DirectoryLoadStatus> {
-        let cache = self.directory_cache.as_ref()?;
-        let collection = self.get_or_load_collection(collection_id).await.ok()?;
-        let canonical_id = collection.id.clone();
-        let handle = cache.handle_for(&canonical_id);
-        if let Some(entry) = handle.get_cached() {
-            return Some(entry.status.clone());
-        }
-        let collection_root = collection.storage_assignment.as_ref().map(|a| {
-            crate::storage::trait_components::path_resolver::collection_data_path_for_assignment(
-                a,
-                &canonical_id,
-            )
-        })?;
-        let fs = self
-            .storage_engine
-            .filesystem()
-            .get_filesystem(&collection_root)
-            .ok()?;
-        let entry = handle
-            .get_or_load(|| async {
-                crate::storage::engines::sst::object_economy_directory::load_directory_for(
-                    &*fs,
-                    &canonical_id,
-                    &collection_root,
-                    /*storage_epoch*/ 0,
-                    proximadb_catalog::CatalogAuthorityMode::RebuildableProjection,
-                )
-                .await
-            })
-            .await;
-        Some(entry.status.clone())
+        self.directory_cache
+            .as_ref()?
+            .get_handle(collection_id)?
+            .get_cached()
+            .map(|entry| entry.status.clone())
     }
 
     /// Apply the WAL/memtable delta merge to a set of canonical engine

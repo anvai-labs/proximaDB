@@ -430,17 +430,7 @@ impl<'a> VectorObjectEconomyDirectoryStore<'a> {
                     (empty(), status)
                 }
             },
-            // Only a CONFIRMED absence is `Missing` (and so negative-cached).
-            // Every other failure is `Unavailable`, which keeps the ordinary
-            // recheck TTL — a transient fault must not pin "no sidecar".
-            Err(proximadb_storage_filesystem_types::FilesystemError::NotFound(_)) => {
-                (empty(), DirectoryLoadStatus::Missing)
-            }
-            Err(err) => {
-                let status = DirectoryLoadStatus::Unavailable(err.to_string());
-                tracing::warn!("{}", status.reason(&path));
-                (empty(), status)
-            }
+            Err(_) => (empty(), DirectoryLoadStatus::Missing),
         }
     }
 
@@ -487,18 +477,7 @@ impl<'a> VectorObjectEconomyDirectoryStore<'a> {
         freshness_lsn: u64,
         freshness_ns: i64,
     ) -> Result<()> {
-        let (mut directory, status) = self.load_with_status().await;
-        // A transient read failure says nothing about what is stored. Writing
-        // `empty + this one entry` over it would truncate every earlier file
-        // entry the moment the backend hiccups (#2443 review round 3, F2).
-        // Refuse instead; the flush logs the error and the next flush retries
-        // the read-modify-write. `Corrupt` / `Mismatch` / `Missing` still
-        // rebuild from empty — that is the torn-sidecar recovery contract.
-        if let DirectoryLoadStatus::Unavailable(err) = &status {
-            return Err(anyhow::anyhow!(
-                "object-economy directory sidecar unreadable ({err}); not overwriting it with a partial directory"
-            ));
-        }
+        let mut directory = self.load_or_empty().await;
         directory.upsert_file(file_entry);
         directory = directory.with_freshness_watermark(freshness_lsn, freshness_ns);
         self.store(&directory).await
@@ -512,16 +491,9 @@ impl<'a> VectorObjectEconomyDirectoryStore<'a> {
 pub enum DirectoryLoadStatus {
     /// Sidecar was present, valid, and matched the expected collection.
     Loaded,
-    /// Sidecar object was CONFIRMED absent (the backend reported NotFound).
-    /// Common in pre-flush state; the route falls back to per-SST index
-    /// reads. Negative-cached with a bounded TTL (TD-OEDIRWM-1).
+    /// Sidecar object was not found at the expected path. Common in
+    /// pre-flush state; the route falls back to per-SST index reads.
     Missing,
-    /// The read FAILED for a reason other than NotFound — a timeout, 503
-    /// throttling, a 403 during credential rotation. Unknown whether a sidecar
-    /// exists, so it keeps the ordinary recheck TTL and is NEVER
-    /// negative-cached: pinning a transient fault would silently downgrade
-    /// BoundedStale to Strong for a sidecar that is actually present.
-    Unavailable(String),
     /// Sidecar existed but failed validation/deserialization. The route
     /// falls back to per-SST index reads and the projection should be
     /// rebuilt out-of-band.
@@ -548,9 +520,6 @@ impl DirectoryLoadStatus {
         match self {
             Self::Loaded => format!("object_economy_directory_loaded:{sidecar_path}"),
             Self::Missing => format!("object_economy_directory_missing:{sidecar_path}"),
-            Self::Unavailable(err) => {
-                format!("object_economy_directory_unavailable:{sidecar_path}:{err}")
-            }
             Self::Corrupt(err) => {
                 format!("object_economy_directory_corrupt:{sidecar_path}:{err}")
             }
@@ -644,38 +613,10 @@ impl CachedDirectoryHandle {
             })
             .await
             .clone();
-        // The recheck TTL is deliberately SLIDING (stamped on every read): a
-        // steadily-queried collection does not reload the whole sidecar every
-        // TTL. That is safe because the watermark no longer gates Strong
-        // reads (TD-OEDIRWM-1): a stale entry carries an OLDER watermark,
-        // which can only make BoundedStale scan MORE, never less. (#2443
-        // round 2 made it load-based; round 3 showed that cost a full-sidecar
-        // GET + deserialize per collection per pod per TTL on the hot path.)
         if let Ok(mut at) = self.loaded_at.lock() {
             *at = Some(std::time::Instant::now());
         }
         entry
-    }
-}
-
-/// How much longer a confirmed-missing sidecar stays negative-cached than a
-/// present one stays fresh (TD-OEDIRWM-1).
-const NEGATIVE_TTL_FACTOR: u32 = 10;
-
-/// The recheck TTL that applies to `handle`'s current entry: `Missing`
-/// (confirmed NotFound) is held `NEGATIVE_TTL_FACTOR`x longer; everything
-/// else uses the base TTL.
-fn effective_recheck_ttl(
-    handle: &CachedDirectoryHandle,
-    ttl: std::time::Duration,
-) -> std::time::Duration {
-    let missing = handle
-        .get_cached()
-        .is_some_and(|entry| matches!(entry.status, DirectoryLoadStatus::Missing));
-    if missing {
-        ttl.saturating_mul(NEGATIVE_TTL_FACTOR)
-    } else {
-        ttl
     }
 }
 
@@ -725,18 +666,8 @@ impl VectorObjectEconomyDirectoryCache {
             .entry(collection_id.to_string())
             .or_insert_with(|| Arc::new(CachedDirectoryHandle::new()))
             .clone();
-        // TD-OEDIRWM-1: a CONFIRMED-missing sidecar (`Missing`, i.e. the
-        // backend returned NotFound) is negative-cached for
-        // NEGATIVE_TTL_FACTOR x the recheck TTL instead of 1x. At 1x, a
-        // collection with no sidecar re-issued a 404 GET after every idle gap.
-        // Bounded rather than permanent so a sidecar emitted by ANOTHER pod is
-        // still picked up (cross-pod), and a local flush clears it at once via
-        // `invalidate`. Correctness-safe throughout: `Missing` yields watermark
-        // (0, 0), which means "always run the delta scan". `Unavailable`
-        // (transient fault), `Loaded`, `Corrupt` and `Mismatch` keep the
-        // ordinary TTL.
         if let Some(ttl) = self.recheck_ttl
-            && handle.expired_for(effective_recheck_ttl(&handle, ttl))
+            && handle.expired_for(ttl)
         {
             // Replace only if still the same expired handle (a concurrent
             // invalidate/replace wins over our expiry).
@@ -797,9 +728,6 @@ impl VectorObjectEconomyDirectoryCache {
 ///
 /// `PROXIMADB_DIRECTORY_CACHE_RECHECK_MS`: unset ⇒ 30 s; `0` ⇒ never
 /// re-check (kill value, legacy behavior); garbage ⇒ default.
-/// NOTE: a confirmed-missing sidecar (`Missing`) is held for
-/// `NEGATIVE_TTL_FACTOR` (10) x this TTL, so the cross-pod pickup bound for a
-/// sidecar another pod writes FIRST is 10x the configured value (TD-OEDIRWM-1).
 pub fn directory_recheck_ttl_from_env() -> Option<std::time::Duration> {
     const DEFAULT_MS: u64 = 30_000;
     match std::env::var("PROXIMADB_DIRECTORY_CACHE_RECHECK_MS")
@@ -922,19 +850,15 @@ impl SstableWriterDirectoryHooks {
             .map(|d| d.as_nanos() as i64)
             .unwrap_or(0);
 
-        let written = store
+        store
             .upsert_and_persist(file_entry, self.freshness_lsn, freshness_ns)
-            .await;
+            .await?;
 
         // Drop the read-side cached handle so the next reader allocates a
-        // fresh OnceCell and reloads from the freshly-written sidecar. Done
-        // whether the write returned Ok OR Err: a client-side timeout after
-        // the object committed is an Err with the sidecar present, and
-        // returning early via `?` would leave a negative-cached `Missing`
-        // entry pinned over a sidecar that exists (#2443 review F4).
+        // fresh OnceCell and reloads from the freshly-written sidecar.
         self.cache.invalidate(&self.collection_id);
 
-        written
+        Ok(())
     }
 }
 
@@ -1289,9 +1213,6 @@ mod tests {
     #[derive(Debug, Default)]
     struct InMemoryFs {
         files: Mutex<HashMap<String, Vec<u8>>>,
-        /// When set, every read fails with a NON-NotFound error (a stand-in
-        /// for a 503 / timeout / credential-rotation 403).
-        fail_reads: std::sync::atomic::AtomicBool,
     }
 
     #[async_trait::async_trait]
@@ -1300,11 +1221,6 @@ mod tests {
             self
         }
         async fn read(&self, path: &str) -> FsResult<Vec<u8>> {
-            if self.fail_reads.load(std::sync::atomic::Ordering::SeqCst) {
-                return Err(FilesystemError::Io(std::io::Error::other(
-                    "simulated transient backend failure",
-                )));
-            }
             self.files
                 .lock()
                 .unwrap()
@@ -1870,263 +1786,6 @@ mod tests {
             calls.load(std::sync::atomic::Ordering::SeqCst),
             2,
             "exactly one reload after expiry"
-        );
-    }
-
-    /// TD-OEDIRWM-1: a `Missing` entry is negative-cached. Past the recheck
-    /// TTL the handle is KEPT (no second sidecar GET — on a collection with
-    /// no sidecar that GET is a 404 that repeated after every idle gap,
-    /// forever), and `invalidate` — which the flush-side writer calls when it
-    /// emits a sidecar — clears it so the next reader loads the real one.
-    #[tokio::test]
-    async fn missing_entry_is_negative_cached_until_invalidated() {
-        use std::time::Duration;
-        let cache =
-            VectorObjectEconomyDirectoryCache::with_recheck_ttl(Some(Duration::from_millis(25)));
-        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let load = |epoch: u64, status: DirectoryLoadStatus| {
-            let calls = Arc::clone(&calls);
-            move || {
-                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                std::future::ready((
-                    VectorObjectEconomyDirectory::empty(
-                        "coll",
-                        epoch,
-                        CatalogAuthorityMode::ProximaAuthoritative,
-                    ),
-                    status,
-                ))
-            }
-        };
-
-        let handle = cache.handle_for("coll");
-        handle
-            .get_or_load(load(1, DirectoryLoadStatus::Missing))
-            .await;
-        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
-
-        // Well past the TTL: a Missing handle must NOT be replaced.
-        tokio::time::sleep(Duration::from_millis(60)).await;
-        let same = cache.handle_for("coll");
-        assert!(
-            Arc::ptr_eq(&handle, &same),
-            "a Missing entry must survive the recheck TTL (negative cache)"
-        );
-        same.get_or_load(load(2, DirectoryLoadStatus::Loaded)).await;
-        assert_eq!(
-            calls.load(std::sync::atomic::Ordering::SeqCst),
-            1,
-            "no second sidecar load while negative-cached"
-        );
-
-        // A write invalidates it: the next reader loads the real sidecar.
-        assert!(cache.invalidate("coll"));
-        let fresh = cache.handle_for("coll");
-        let loaded = fresh
-            .get_or_load(load(3, DirectoryLoadStatus::Loaded))
-            .await;
-        assert_eq!(loaded.directory.storage_epoch, 3);
-        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
-    }
-
-    /// Status helper for the TTL-policy tests below.
-    async fn load_with(
-        cache: &VectorObjectEconomyDirectoryCache,
-        status: DirectoryLoadStatus,
-    ) -> Arc<CachedDirectoryHandle> {
-        let handle = cache.handle_for("coll");
-        handle
-            .get_or_load(|| {
-                std::future::ready((
-                    VectorObjectEconomyDirectory::empty(
-                        "coll",
-                        1,
-                        CatalogAuthorityMode::ProximaAuthoritative,
-                    ),
-                    status,
-                ))
-            })
-            .await;
-        handle
-    }
-
-    /// A transient read fault is NOT negative-cached: it keeps the ordinary
-    /// TTL so a present sidecar is retried, rather than pinning "missing"
-    /// and silently downgrading BoundedStale to Strong (#2443 review F2).
-    #[tokio::test]
-    async fn unavailable_entry_keeps_the_ordinary_recheck_ttl() {
-        use std::time::Duration;
-        let cache =
-            VectorObjectEconomyDirectoryCache::with_recheck_ttl(Some(Duration::from_millis(25)));
-        let handle = load_with(&cache, DirectoryLoadStatus::Unavailable("503".into())).await;
-        tokio::time::sleep(Duration::from_millis(60)).await;
-        assert!(
-            !Arc::ptr_eq(&handle, &cache.handle_for("coll")),
-            "an Unavailable entry must expire at the ordinary TTL"
-        );
-    }
-
-    /// Corrupt and Mismatch keep the ordinary TTL too — only a CONFIRMED
-    /// absence gets the longer negative TTL (#2443 review F8).
-    #[tokio::test]
-    async fn corrupt_and_mismatch_keep_the_ordinary_recheck_ttl() {
-        use std::time::Duration;
-        for status in [
-            DirectoryLoadStatus::Corrupt("bad bytes".into()),
-            DirectoryLoadStatus::Mismatch {
-                expected_collection: "coll".into(),
-                found_collection: "other".into(),
-            },
-        ] {
-            let cache = VectorObjectEconomyDirectoryCache::with_recheck_ttl(Some(
-                Duration::from_millis(25),
-            ));
-            let handle = load_with(&cache, status.clone()).await;
-            tokio::time::sleep(Duration::from_millis(60)).await;
-            assert!(
-                !Arc::ptr_eq(&handle, &cache.handle_for("coll")),
-                "{status:?} must expire at the ordinary TTL"
-            );
-        }
-    }
-
-    /// The negative cache is BOUNDED, so a sidecar another pod emits is still
-    /// picked up: a Missing entry outlives the base TTL but not
-    /// NEGATIVE_TTL_FACTOR x it (#2443 review F3).
-    #[tokio::test]
-    async fn missing_entry_negative_ttl_is_bounded() {
-        use std::time::Duration;
-        let cache =
-            VectorObjectEconomyDirectoryCache::with_recheck_ttl(Some(Duration::from_millis(50)));
-        let handle = load_with(&cache, DirectoryLoadStatus::Missing).await;
-        // 150ms: 3x the base TTL, 1/3 of the 500ms negative TTL — a generous
-        // margin each way for a loaded CI runner (#2443 round 3, F3).
-        tokio::time::sleep(Duration::from_millis(150)).await;
-        assert!(
-            Arc::ptr_eq(&handle, &cache.handle_for("coll")),
-            "Missing must survive past the base TTL"
-        );
-        tokio::time::sleep(Duration::from_millis(700)).await; // > 10x (500ms) + margin
-        assert!(
-            !Arc::ptr_eq(&handle, &cache.handle_for("coll")),
-            "Missing must expire at NEGATIVE_TTL_FACTOR x the base TTL (cross-pod pickup)"
-        );
-    }
-
-    /// The recheck TTL is SLIDING by design: steady reads keep a Loaded handle
-    /// alive, so a busy collection does not reload the whole sidecar every
-    /// TTL. Safe because the watermark no longer gates Strong reads — a stale
-    /// entry only ever carries an OLDER watermark (TD-OEDIRWM-1).
-    #[tokio::test]
-    async fn recheck_ttl_slides_under_steady_reads() {
-        use std::time::Duration;
-        let cache =
-            VectorObjectEconomyDirectoryCache::with_recheck_ttl(Some(Duration::from_millis(200)));
-        let handle = load_with(&cache, DirectoryLoadStatus::Loaded).await;
-        // Read every 80ms for 400ms: never idle for a full TTL.
-        for _ in 0..5 {
-            tokio::time::sleep(Duration::from_millis(80)).await;
-            cache
-                .handle_for("coll")
-                .get_or_load(|| {
-                    std::future::ready((
-                        VectorObjectEconomyDirectory::empty(
-                            "coll",
-                            9,
-                            CatalogAuthorityMode::ProximaAuthoritative,
-                        ),
-                        DirectoryLoadStatus::Loaded,
-                    ))
-                })
-                .await;
-        }
-        assert!(
-            Arc::ptr_eq(&handle, &cache.handle_for("coll")),
-            "steady reads must keep a Loaded handle alive (sliding TTL)"
-        );
-    }
-
-    /// A backend NotFound maps to `Missing` (the negative-cacheable status).
-    /// The complementary arm is `load_maps_other_errors_to_unavailable`.
-    #[tokio::test]
-    async fn load_maps_backend_not_found_to_missing() {
-        let fs = InMemoryFs::default();
-        let store = VectorObjectEconomyDirectoryStore::new(
-            &fs,
-            "coll",
-            "s3://bucket/coll",
-            0,
-            CatalogAuthorityMode::ProximaAuthoritative,
-        );
-        let (_, status) = store.load_with_status().await;
-        assert_eq!(
-            status,
-            DirectoryLoadStatus::Missing,
-            "InMemoryFs reports NotFound"
-        );
-    }
-
-    /// The writer must NOT overwrite a sidecar it could not read: a transient
-    /// failure would otherwise replace every earlier file entry with
-    /// `empty + this one entry` (#2443 review round 3, F2).
-    #[tokio::test]
-    async fn writer_refuses_to_overwrite_an_unreadable_sidecar() {
-        let fs = InMemoryFs::default();
-        let store = VectorObjectEconomyDirectoryStore::new(
-            &fs,
-            "coll",
-            "s3://bucket/coll",
-            0,
-            CatalogAuthorityMode::ProximaAuthoritative,
-        );
-        store
-            .upsert_and_persist(sample_file("l0_0001", 0, 0), 10, 1)
-            .await
-            .expect("first write");
-        store
-            .upsert_and_persist(sample_file("l0_0002", 0, 0), 20, 2)
-            .await
-            .expect("second write");
-
-        fs.fail_reads
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-        let refused = store
-            .upsert_and_persist(sample_file("l0_0003", 0, 0), 30, 3)
-            .await;
-        assert!(
-            refused.is_err(),
-            "an unreadable sidecar must not be overwritten"
-        );
-        fs.fail_reads
-            .store(false, std::sync::atomic::Ordering::SeqCst);
-
-        let (directory, status) = store.load_with_status().await;
-        assert_eq!(status, DirectoryLoadStatus::Loaded);
-        assert_eq!(
-            directory.files.len(),
-            2,
-            "both earlier entries must survive the refused write"
-        );
-    }
-
-    /// The other half of the load mapping: a NON-NotFound failure is
-    /// `Unavailable` (retried at the ordinary TTL), never `Missing`.
-    #[tokio::test]
-    async fn load_maps_other_errors_to_unavailable() {
-        let fs = InMemoryFs::default();
-        fs.fail_reads
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-        let store = VectorObjectEconomyDirectoryStore::new(
-            &fs,
-            "coll",
-            "s3://bucket/coll",
-            0,
-            CatalogAuthorityMode::ProximaAuthoritative,
-        );
-        let (_, status) = store.load_with_status().await;
-        assert!(
-            matches!(status, DirectoryLoadStatus::Unavailable(_)),
-            "got {status:?}"
         );
     }
 

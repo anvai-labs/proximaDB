@@ -2366,9 +2366,10 @@ fn build_route_health_with_live_state(
             // directory watermark cannot soundly bound staleness.
             bounded_stale_time_bound_check: false,
         },
-        notes: "Per-request freshness modes (strong/bounded_stale/stale_ok) \
-                are honored by the search path; collection-default modes are \
-                not yet stored on the catalog.",
+        notes: "Per-request freshness modes are accepted; bounded_stale is \
+                served as strong (the delta is always scanned) because no sound \
+                freshness watermark exists yet (TD-OEDIRWM-1). Collection-default \
+                modes are not yet stored on the catalog.",
     };
     let object_economy_eligible = engine == "sst";
     let object_economy_live_status = if object_economy_eligible {
@@ -2388,8 +2389,8 @@ fn build_route_health_with_live_state(
             "VectorObjectEconomyDirectory status was read from the in-process \
              cache without object-storage I/O."
         } else if object_economy_eligible {
-            "VectorObjectEconomyDirectory exists for SST; no cached live status \
-             is currently present in AppState."
+            "VectorObjectEconomyDirectory exists for SST; the query path does not \
+             read it (TD-OEDIRWM-1), so no live status is cached in AppState."
         } else {
             "Vector object-economy directory is currently SST-specific."
         },
@@ -2476,7 +2477,6 @@ fn object_economy_status_label(
     match status {
         DirectoryLoadStatus::Loaded => "loaded",
         DirectoryLoadStatus::Missing => "missing",
-        DirectoryLoadStatus::Unavailable(_) => "unavailable",
         DirectoryLoadStatus::Corrupt(_) => "corrupt",
         DirectoryLoadStatus::Mismatch { .. } => "mismatch",
     }
@@ -2682,8 +2682,7 @@ pub async fn get_collection_route_health_v2(
     let cached_object_economy_status = if engine_str == "sst" {
         state
             .vector_operations_service
-            .object_economy_directory_status_for_diagnostics(&collection_id)
-            .await
+            .cached_object_economy_directory_status(&collection_id)
             .as_ref()
             .map(object_economy_status_label)
     } else {
@@ -4975,10 +4974,6 @@ mod tests {
                 found_collection: "orders".to_string(),
             }),
             "mismatch"
-        );
-        assert_eq!(
-            object_economy_status_label(&DirectoryLoadStatus::Unavailable("503".into())),
-            "unavailable"
         );
     }
 
