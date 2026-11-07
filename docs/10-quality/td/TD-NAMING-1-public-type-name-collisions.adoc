@@ -5,75 +5,90 @@
 
 == Problem
 
-752 redundant definitions across 563 colliding names (baseline 2026-11-06; `scripts/count_type_name_collisions.py`).
-A collision is a `pub struct` / `pub enum` / `pub trait` NAME defined in more
-than one non-test, non-generated source file. Two harms:
+Baseline 2026-11-06 (`scripts/count_type_name_collisions.py`): 798 redundant definitions across 597 names; 987 re-export collisions across 501 names.
 
-* **Wrong-type footgun.** Once two same-named types are reachable from one
-  module — usually via a re-export — an obvious-looking signature compiles
-  against the wrong one. Found in #2443: `trait_components::path_resolver`
-  re-exports the storage-ports `StorageAssignment` beside call sites that need
-  the PROTO `StorageAssignment`; a new helper typed `&StorageAssignment`
-  failed with "expected `StorageAssignment`, found a different
-  `StorageAssignment`". (The ports crate itself already disambiguates
-  internally as `ProtoStorageAssignment`; the re-export loses that.)
-* **Silent duplication of a primitive.** The same concept defined N times —
-  a fix lands in one copy while the others keep the bug. Mandate #12 names
-  "silent duplication of an existing primitive" as a failure mode of
-  generated code to review for.
+Two metrics, two harms:
 
-Worst offenders at baseline:
+* **Re-export collisions — the wrong-type footgun.** A `pub use` exporting a
+  name that is defined at more than one site. Once two same-named types are
+  reachable from one module, an obvious-looking signature compiles against
+  the wrong one. Found in #2443: `trait_components::path_resolver`
+  re-exports the storage-ports `StorageAssignment` while call sites need the
+  PROTO `StorageAssignment`; a new helper typed `&StorageAssignment` failed
+  with "expected `StorageAssignment`, found a different `StorageAssignment`".
+  (The ports crate disambiguates internally as `ProtoStorageAssignment`; the
+  re-export loses that.)
+* **Redundant definitions — silent duplication of a primitive.** The same
+  name defined at several sites; a fix lands in one copy while the others
+  keep the bug (mandate #12).
 
+[cols="3,1",options="header"]
 |===
-| Name | Definitions
-| `OperationType` | 12 |
-| `ColumnData` | 8 |
-| `FilterOperator` | 8 |
-| `Index` | 8 |
-| `WorkloadType` | 8 |
-| `BloomFilter` | 7 |
-| `JoinType` | 7 |
-| `TransactionState` | 7 |
-| `EvictionPolicy` | 6 |
-| `FusionStrategy` | 6 |
-| `QueryType` | 6 |
-| `AlertSeverity` | 5 |
-| `ComparisonOperator` | 5 |
-| `EdgeDirection` | 5 |
-| `FilterCondition` | 5 |
-| `FilterValue` | 5 |
-| `HealthStatus` | 5 |
-| `OptimizationStrategy` | 5 |
-| `StorageType` | 5 |
-| `AccessType` | 4 |
+| Redundant definitions (name) | Definition sites
+| `OperationType` | 12
+| `ColumnData` | 8
+| `FilterOperator` | 8
+| `Index` | 8
+| `JoinType` | 8
+| `TransactionState` | 8
+| `WorkloadType` | 8
+| `BloomFilter` | 7
+| `EdgeDirection` | 6
+| `EvictionPolicy` | 6
+| `FusionStrategy` | 6
+| `QueryType` | 6
 |===
 
-== Not counted (benign by construction)
+[cols="3,1",options="header"]
+|===
+| Re-export collisions (name) | `pub use` sites
+| `DistanceMetric` | 12
+| `MetadataFilter` | 10
+| `StorageEngineType` | 9
+| `TransactionState` | 9
+| `FilterValue` | 8
+| `CompressionAlgorithm` | 7
+| `QuantizationType` | 7
+| `CompactionConfig` | 6
+| `CompactionResult` | 6
+| `FilterExpression` | 6
+| `FilterOperator` | 6
+| `IndexStats` | 6
+|===
 
-* `type` aliases — per-crate `pub type Result<T> = …` is idiomatic Rust.
-* Generated protobuf (`crates/foundation/proximadb-proto/src/proto/`) —
-  v1/v2 mirror domain names by design.
-* Test code — `tests/` / `benches/` / `examples/` trees, `*_tests.rs` /
-  `*_test.rs` / `tests.rs` files, and inline `#[cfg(test)]` modules.
+== Counting rules
+
+* Sites, not files: two same-named types in different modules of one file
+  collide. Mutually exclusive `#[cfg(...)]` alternatives of one type in one
+  file are one definition.
+* Not counted: `type` aliases (per-crate `pub type Result<T>` is idiomatic);
+  generated protobuf, for the DEFINITIONS metric only (v1/v2 mirror domain
+  names by design — proto definitions DO count when something re-exports a
+  same-named type); test code (`tests/` / `benches/` / `examples/`,
+  `*_test(s).rs`, `tests.rs`, `#[cfg(test)]` and `#[cfg(all(test, ..))]`
+  modules and items — but not `cfg(any(test, ..))`, which ships); comments.
+* Files come from `git ls-files`, so a local baseline equals CI's.
 
 == Decision
 
-1. **Ratchet first.** `count_type_name_collisions.py --mode no-regression`
-   runs in CI and fails only when the count RISES — new code may not add a
-   colliding name. No big-bang rename: renaming ~560 names at once would
-   conflict with every open PR across concurrent sessions.
-2. **Naming rule for new types:** a type that crosses a crate boundary (or is
-   re-exported) carries a qualifying name — `ProtoStorageAssignment`,
+1. **Ratchet first, per name, both ways.** CI fails if any name's count rises
+   above its baseline (a fix elsewhere cannot pay for a new collision), and
+   if a total falls without the baseline being lowered in the same PR. No
+   big-bang rename — that would conflict with every open PR across
+   concurrent sessions.
+2. **Naming rule for new types:** a type that crosses a crate boundary or is
+   re-exported carries a qualifying name — `ProtoStorageAssignment`,
    `SstCompactionConfig` — never a bare name already taken elsewhere.
 3. **Burn down in themed batches**, lowering the baseline in each PR:
-   a. re-export collisions first (they actively mislead — start with
-      `StorageAssignment` in `path_resolver`);
-   b. then duplicated-primitive clusters (`OperationType`, `FilterOperator`,
-      `BloomFilter`, `TransactionState`, `JoinType`, `CompactionConfig`):
-      CONSOLIDATE where the copies are the same concept, RENAME where they
-      only share a word.
+   a. re-export collisions first, they actively mislead — start with
+      `StorageAssignment` in `path_resolver`, then the most-re-exported
+      (`DistanceMetric`, `MetadataFilter`, `StorageEngineType`);
+   b. then the redundant-definition clusters (`OperationType`,
+      `FilterOperator`, `TransactionState`, `JoinType`, `BloomFilter`):
+      CONSOLIDATE where the copies are one concept, RENAME where they only
+      share a word.
 
 == To close
 
-The count is low enough that the remaining collisions are each justified
-(documented as intentional) or gone, and the re-export class is zero.
+The re-export metric is zero and every remaining redundant definition is
+documented as intentional.
