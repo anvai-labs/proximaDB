@@ -208,6 +208,20 @@ def check_ci_runner_contract(findings: list[Finding]) -> None:
 
 
 def check_gate_wiring(findings: list[Finding]) -> None:
+    # TD-NAMING-1: the type-name collision ratchet and its tests must stay
+    # wired — removing them would let new colliding names land unnoticed.
+    require_contains(
+        findings,
+        "gate-wiring",
+        ".github/workflows/ci.yml",
+        "run: python3 scripts/count_type_name_collisions.py --mode no-regression",
+    )
+    require_contains(
+        findings,
+        "gate-wiring",
+        ".github/workflows/ci.yml",
+        "-p 'test_type_name_collisions.py'",
+    )
     require_contains(
         findings,
         "gate-wiring",

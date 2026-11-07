@@ -1,0 +1,79 @@
+= TD-NAMING-1: Public Rust type names collide across crates — ratchet now, burn down in batches
+:status: Open
+:date: 2026-11-06
+:tags: [code-health, naming, solid, duplication]
+
+== Problem
+
+752 redundant definitions across 563 colliding names (baseline 2026-11-06; `scripts/count_type_name_collisions.py`).
+A collision is a `pub struct` / `pub enum` / `pub trait` NAME defined in more
+than one non-test, non-generated source file. Two harms:
+
+* **Wrong-type footgun.** Once two same-named types are reachable from one
+  module — usually via a re-export — an obvious-looking signature compiles
+  against the wrong one. Found in #2443: `trait_components::path_resolver`
+  re-exports the storage-ports `StorageAssignment` beside call sites that need
+  the PROTO `StorageAssignment`; a new helper typed `&StorageAssignment`
+  failed with "expected `StorageAssignment`, found a different
+  `StorageAssignment`". (The ports crate itself already disambiguates
+  internally as `ProtoStorageAssignment`; the re-export loses that.)
+* **Silent duplication of a primitive.** The same concept defined N times —
+  a fix lands in one copy while the others keep the bug. Mandate #12 names
+  "silent duplication of an existing primitive" as a failure mode of
+  generated code to review for.
+
+Worst offenders at baseline:
+
+|===
+| Name | Definitions
+| `OperationType` | 12 |
+| `ColumnData` | 8 |
+| `FilterOperator` | 8 |
+| `Index` | 8 |
+| `WorkloadType` | 8 |
+| `BloomFilter` | 7 |
+| `JoinType` | 7 |
+| `TransactionState` | 7 |
+| `EvictionPolicy` | 6 |
+| `FusionStrategy` | 6 |
+| `QueryType` | 6 |
+| `AlertSeverity` | 5 |
+| `ComparisonOperator` | 5 |
+| `EdgeDirection` | 5 |
+| `FilterCondition` | 5 |
+| `FilterValue` | 5 |
+| `HealthStatus` | 5 |
+| `OptimizationStrategy` | 5 |
+| `StorageType` | 5 |
+| `AccessType` | 4 |
+|===
+
+== Not counted (benign by construction)
+
+* `type` aliases — per-crate `pub type Result<T> = …` is idiomatic Rust.
+* Generated protobuf (`crates/foundation/proximadb-proto/src/proto/`) —
+  v1/v2 mirror domain names by design.
+* Test code — `tests/` / `benches/` / `examples/` trees, `*_tests.rs` /
+  `*_test.rs` / `tests.rs` files, and inline `#[cfg(test)]` modules.
+
+== Decision
+
+1. **Ratchet first.** `count_type_name_collisions.py --mode no-regression`
+   runs in CI and fails only when the count RISES — new code may not add a
+   colliding name. No big-bang rename: renaming ~560 names at once would
+   conflict with every open PR across concurrent sessions.
+2. **Naming rule for new types:** a type that crosses a crate boundary (or is
+   re-exported) carries a qualifying name — `ProtoStorageAssignment`,
+   `SstCompactionConfig` — never a bare name already taken elsewhere.
+3. **Burn down in themed batches**, lowering the baseline in each PR:
+   a. re-export collisions first (they actively mislead — start with
+      `StorageAssignment` in `path_resolver`);
+   b. then duplicated-primitive clusters (`OperationType`, `FilterOperator`,
+      `BloomFilter`, `TransactionState`, `JoinType`, `CompactionConfig`):
+      CONSOLIDATE where the copies are the same concept, RENAME where they
+      only share a word.
+
+== To close
+
+The count is low enough that the remaining collisions are each justified
+(documented as intentional) or gone, and the re-export class is zero.
