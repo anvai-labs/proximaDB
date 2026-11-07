@@ -430,7 +430,17 @@ impl<'a> VectorObjectEconomyDirectoryStore<'a> {
                     (empty(), status)
                 }
             },
-            Err(_) => (empty(), DirectoryLoadStatus::Missing),
+            // Only a CONFIRMED absence is `Missing` (and so negative-cached).
+            // Every other failure is `Unavailable`, which keeps the ordinary
+            // recheck TTL — a transient fault must not pin "no sidecar".
+            Err(proximadb_storage_filesystem_types::FilesystemError::NotFound(_)) => {
+                (empty(), DirectoryLoadStatus::Missing)
+            }
+            Err(err) => {
+                let status = DirectoryLoadStatus::Unavailable(err.to_string());
+                tracing::warn!("{}", status.reason(&path));
+                (empty(), status)
+            }
         }
     }
 
@@ -491,9 +501,16 @@ impl<'a> VectorObjectEconomyDirectoryStore<'a> {
 pub enum DirectoryLoadStatus {
     /// Sidecar was present, valid, and matched the expected collection.
     Loaded,
-    /// Sidecar object was not found at the expected path. Common in
-    /// pre-flush state; the route falls back to per-SST index reads.
+    /// Sidecar object was CONFIRMED absent (the backend reported NotFound).
+    /// Common in pre-flush state; the route falls back to per-SST index
+    /// reads. Negative-cached with a bounded TTL (TD-OEDIRWM-1).
     Missing,
+    /// The read FAILED for a reason other than NotFound — a timeout, 503
+    /// throttling, a 403 during credential rotation. Unknown whether a sidecar
+    /// exists, so it keeps the ordinary recheck TTL and is NEVER
+    /// negative-cached: pinning a transient fault would silently downgrade
+    /// BoundedStale to Strong for a sidecar that is actually present.
+    Unavailable(String),
     /// Sidecar existed but failed validation/deserialization. The route
     /// falls back to per-SST index reads and the projection should be
     /// rebuilt out-of-band.
@@ -520,6 +537,9 @@ impl DirectoryLoadStatus {
         match self {
             Self::Loaded => format!("object_economy_directory_loaded:{sidecar_path}"),
             Self::Missing => format!("object_economy_directory_missing:{sidecar_path}"),
+            Self::Unavailable(err) => {
+                format!("object_economy_directory_unavailable:{sidecar_path}:{err}")
+            }
             Self::Corrupt(err) => {
                 format!("object_economy_directory_corrupt:{sidecar_path}:{err}")
             }
@@ -605,18 +625,42 @@ impl CachedDirectoryHandle {
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = (VectorObjectEconomyDirectory, DirectoryLoadStatus)>,
     {
-        let entry = self
-            .cell
+        // `loaded_at` is stamped INSIDE the initializer, i.e. only when a load
+        // actually happens. It used to be stamped on every call, which made
+        // the recheck TTL sliding: a collection queried at least once per TTL
+        // never expired, so the cross-pod staleness bound this TTL exists for
+        // never held (#2443 review F5).
+        self.cell
             .get_or_init(|| async {
                 let (directory, status) = loader().await;
+                if let Ok(mut at) = self.loaded_at.lock() {
+                    *at = Some(std::time::Instant::now());
+                }
                 Arc::new(CachedDirectoryEntry { directory, status })
             })
             .await
-            .clone();
-        if let Ok(mut at) = self.loaded_at.lock() {
-            *at = Some(std::time::Instant::now());
-        }
-        entry
+            .clone()
+    }
+}
+
+/// How much longer a confirmed-missing sidecar stays negative-cached than a
+/// present one stays fresh (TD-OEDIRWM-1).
+const NEGATIVE_TTL_FACTOR: u32 = 10;
+
+/// The recheck TTL that applies to `handle`'s current entry: `Missing`
+/// (confirmed NotFound) is held `NEGATIVE_TTL_FACTOR`x longer; everything
+/// else uses the base TTL.
+fn effective_recheck_ttl(
+    handle: &CachedDirectoryHandle,
+    ttl: std::time::Duration,
+) -> std::time::Duration {
+    let missing = handle
+        .get_cached()
+        .is_some_and(|entry| matches!(entry.status, DirectoryLoadStatus::Missing));
+    if missing {
+        ttl.saturating_mul(NEGATIVE_TTL_FACTOR)
+    } else {
+        ttl
     }
 }
 
@@ -666,25 +710,18 @@ impl VectorObjectEconomyDirectoryCache {
             .entry(collection_id.to_string())
             .or_insert_with(|| Arc::new(CachedDirectoryHandle::new()))
             .clone();
-        // TD-OEDIRWM-1: a cached `Missing` entry is NEGATIVE-CACHED — never
-        // TTL-replaced. Each replacement re-issued the sidecar GET, which on a
-        // collection with no sidecar (never flushed, or a non-SST engine that
-        // never emits one) is a swallowed 404 repeating after every idle gap
-        // longer than the recheck TTL, forever. Pinning `Missing` is
-        // correctness-safe by construction: it yields watermark (0, 0), which
-        // makes every Strong/BoundedStale query run the delta scan — the most
-        // conservative answer. It is cleared exactly when it can become wrong:
-        // the flush-side writer (`emit_after_flush`) calls `invalidate` the
-        // moment a sidecar is written, so the next read loads the real one.
-        // Present sidecars (`Loaded`) and degraded ones (`Corrupt`,
-        // `Mismatch`) keep the recheck TTL, which exists for cross-pod
-        // staleness of a sidecar that DOES exist.
-        let negative_cached = handle
-            .get_cached()
-            .is_some_and(|entry| matches!(entry.status, DirectoryLoadStatus::Missing));
+        // TD-OEDIRWM-1: a CONFIRMED-missing sidecar (`Missing`, i.e. the
+        // backend returned NotFound) is negative-cached for
+        // NEGATIVE_TTL_FACTOR x the recheck TTL instead of 1x. At 1x, a
+        // collection with no sidecar re-issued a 404 GET after every idle gap.
+        // Bounded rather than permanent so a sidecar emitted by ANOTHER pod is
+        // still picked up (cross-pod), and a local flush clears it at once via
+        // `invalidate`. Correctness-safe throughout: `Missing` yields watermark
+        // (0, 0), which means "always run the delta scan". `Unavailable`
+        // (transient fault), `Loaded`, `Corrupt` and `Mismatch` keep the
+        // ordinary TTL.
         if let Some(ttl) = self.recheck_ttl
-            && !negative_cached
-            && handle.expired_for(ttl)
+            && handle.expired_for(effective_recheck_ttl(&handle, ttl))
         {
             // Replace only if still the same expired handle (a concurrent
             // invalidate/replace wins over our expiry).
@@ -867,16 +904,41 @@ impl SstableWriterDirectoryHooks {
             .map(|d| d.as_nanos() as i64)
             .unwrap_or(0);
 
-        store
+        let written = store
             .upsert_and_persist(file_entry, self.freshness_lsn, freshness_ns)
-            .await?;
+            .await;
 
         // Drop the read-side cached handle so the next reader allocates a
-        // fresh OnceCell and reloads from the freshly-written sidecar.
+        // fresh OnceCell and reloads from the freshly-written sidecar. Done
+        // whether the write returned Ok OR Err: a client-side timeout after
+        // the object committed is an Err with the sidecar present, and
+        // returning early via `?` would leave a negative-cached `Missing`
+        // entry pinned over a sidecar that exists (#2443 review F4).
         self.cache.invalidate(&self.collection_id);
 
-        Ok(())
+        written
     }
+}
+
+/// The collection root the directory sidecar lives under — the DrPath-scoped
+/// collection DATA directory, the same root the flush-side writer uses
+/// (`collection_data_path_typed`). The ONE resolver both sides must use.
+///
+/// The read side used the raw `storage_assignment.base_location` (the tenant
+/// base shared by every collection) while the writer used this data path, so
+/// the reader looked for `{base}/oedir/v0.bin` and never found the
+/// `{base}/accounts/{acct}/{ns}/{coll}/data/oedir/v0.bin` the writer wrote.
+/// The read-side watermark had therefore never loaded a real sidecar: every
+/// strict query on every collection fell back to (0, 0) after a 404
+/// (#2443 review, finding 1).
+pub(crate) fn oedir_collection_root(
+    assignment: &crate::proto::proximadb_v1::StorageAssignment,
+    collection_id: &str,
+) -> String {
+    use crate::storage::trait_components::path_resolver as pr;
+    let identity =
+        pr::typed_path_identity(pr::typed_identity_from_storage_assignment(Some(assignment)));
+    pr::collection_data_path_typed(&assignment.base_location, collection_id, identity)
 }
 
 /// Loader-closure helper for [`CachedDirectoryHandle::get_or_load`].
@@ -1860,6 +1922,141 @@ mod tests {
             .await;
         assert_eq!(loaded.directory.storage_epoch, 3);
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    /// Status helper for the TTL-policy tests below.
+    async fn load_with(
+        cache: &VectorObjectEconomyDirectoryCache,
+        status: DirectoryLoadStatus,
+    ) -> Arc<CachedDirectoryHandle> {
+        let handle = cache.handle_for("coll");
+        handle
+            .get_or_load(|| {
+                std::future::ready((
+                    VectorObjectEconomyDirectory::empty(
+                        "coll",
+                        1,
+                        CatalogAuthorityMode::ProximaAuthoritative,
+                    ),
+                    status,
+                ))
+            })
+            .await;
+        handle
+    }
+
+    /// A transient read fault is NOT negative-cached: it keeps the ordinary
+    /// TTL so a present sidecar is retried, rather than pinning "missing"
+    /// and silently downgrading BoundedStale to Strong (#2443 review F2).
+    #[tokio::test]
+    async fn unavailable_entry_keeps_the_ordinary_recheck_ttl() {
+        use std::time::Duration;
+        let cache =
+            VectorObjectEconomyDirectoryCache::with_recheck_ttl(Some(Duration::from_millis(25)));
+        let handle = load_with(&cache, DirectoryLoadStatus::Unavailable("503".into())).await;
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert!(
+            !Arc::ptr_eq(&handle, &cache.handle_for("coll")),
+            "an Unavailable entry must expire at the ordinary TTL"
+        );
+    }
+
+    /// Corrupt and Mismatch keep the ordinary TTL too — only a CONFIRMED
+    /// absence gets the longer negative TTL (#2443 review F8).
+    #[tokio::test]
+    async fn corrupt_and_mismatch_keep_the_ordinary_recheck_ttl() {
+        use std::time::Duration;
+        for status in [
+            DirectoryLoadStatus::Corrupt("bad bytes".into()),
+            DirectoryLoadStatus::Mismatch {
+                expected_collection: "coll".into(),
+                found_collection: "other".into(),
+            },
+        ] {
+            let cache = VectorObjectEconomyDirectoryCache::with_recheck_ttl(Some(
+                Duration::from_millis(25),
+            ));
+            let handle = load_with(&cache, status.clone()).await;
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            assert!(
+                !Arc::ptr_eq(&handle, &cache.handle_for("coll")),
+                "{status:?} must expire at the ordinary TTL"
+            );
+        }
+    }
+
+    /// The negative cache is BOUNDED, so a sidecar another pod emits is still
+    /// picked up: a Missing entry outlives the base TTL but not
+    /// NEGATIVE_TTL_FACTOR x it (#2443 review F3).
+    #[tokio::test]
+    async fn missing_entry_negative_ttl_is_bounded() {
+        use std::time::Duration;
+        let cache =
+            VectorObjectEconomyDirectoryCache::with_recheck_ttl(Some(Duration::from_millis(10)));
+        let handle = load_with(&cache, DirectoryLoadStatus::Missing).await;
+        tokio::time::sleep(Duration::from_millis(40)).await; // > 1x, < 10x
+        assert!(
+            Arc::ptr_eq(&handle, &cache.handle_for("coll")),
+            "Missing must survive past the base TTL"
+        );
+        tokio::time::sleep(Duration::from_millis(120)).await; // > 10x
+        assert!(
+            !Arc::ptr_eq(&handle, &cache.handle_for("coll")),
+            "Missing must expire at NEGATIVE_TTL_FACTOR x the base TTL (cross-pod pickup)"
+        );
+    }
+
+    /// The recheck TTL counts from the LOAD, not the last read: before the
+    /// fix every cache hit re-stamped `loaded_at`, so a collection queried
+    /// at least once per TTL never expired (#2443 review F5).
+    #[tokio::test]
+    async fn recheck_ttl_counts_from_the_load_not_the_last_read() {
+        use std::time::Duration;
+        let cache =
+            VectorObjectEconomyDirectoryCache::with_recheck_ttl(Some(Duration::from_millis(30)));
+        let handle = load_with(&cache, DirectoryLoadStatus::Loaded).await;
+        // Keep reading inside the TTL window; each read is a cache hit.
+        for _ in 0..4 {
+            tokio::time::sleep(Duration::from_millis(12)).await;
+            handle
+                .get_or_load(|| {
+                    std::future::ready((
+                        VectorObjectEconomyDirectory::empty(
+                            "coll",
+                            9,
+                            CatalogAuthorityMode::ProximaAuthoritative,
+                        ),
+                        DirectoryLoadStatus::Loaded,
+                    ))
+                })
+                .await;
+        }
+        assert!(
+            !Arc::ptr_eq(&handle, &cache.handle_for("coll")),
+            "steady reads must not keep a Loaded handle alive past its TTL"
+        );
+    }
+
+    /// A backend NotFound maps to `Missing` (the negative-cacheable status).
+    /// The complementary arm — every OTHER error maps to `Unavailable` — is
+    /// not exercised here (InMemoryFs only fails with NotFound); its TTL
+    /// behaviour is pinned by `unavailable_entry_keeps_the_ordinary_recheck_ttl`.
+    #[tokio::test]
+    async fn load_maps_backend_not_found_to_missing() {
+        let fs = InMemoryFs::default();
+        let store = VectorObjectEconomyDirectoryStore::new(
+            &fs,
+            "coll",
+            "s3://bucket/coll",
+            0,
+            CatalogAuthorityMode::ProximaAuthoritative,
+        );
+        let (_, status) = store.load_with_status().await;
+        assert_eq!(
+            status,
+            DirectoryLoadStatus::Missing,
+            "InMemoryFs reports NotFound"
+        );
     }
 
     #[tokio::test]

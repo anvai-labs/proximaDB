@@ -2292,6 +2292,18 @@ mod tests {
             SstEngine::get_collection_storage_url_from_params(&params).unwrap(),
             expected
         );
+        // TD-OEDIRWM-1: the directory sidecar's READ root must be the root the
+        // flush WRITES under (the writer passes this storage URL as
+        // `collection_root`). They diverged once — the reader used the raw
+        // base_location — and the read side never found a sidecar.
+        assert_eq!(
+            crate::storage::engines::sst::object_economy_directory::oedir_collection_root(
+                &assignment,
+                "13",
+            ),
+            expected,
+            "the oedir reader must resolve the same root the flush writer uses"
+        );
     }
 
     #[test]

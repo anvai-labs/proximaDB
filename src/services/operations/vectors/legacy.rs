@@ -2257,21 +2257,36 @@ impl VectorOperationsService {
         collection_id: &str,
     ) -> Option<(u64, i64)> {
         let cache = self.directory_cache.as_ref()?;
+        let handle = cache.handle_for(collection_id);
 
-        // collection_root comes from the collection's storage assignment.
-        // Without it we can't resolve the sidecar URL, so fall back.
+        // Fast path: a populated, unexpired entry (including a negative-cached
+        // `Missing`) answers without resolving the collection or a filesystem
+        // — strict queries used to pay a collection lookup + filesystem
+        // resolution just to read a cached constant (#2443 review F6).
+        if let Some(entry) = handle.get_cached() {
+            return Some((
+                entry.directory.freshness_watermark_lsn,
+                entry.directory.freshness_watermark_ns,
+            ));
+        }
+
+        // The sidecar lives under the collection DATA directory — resolved by
+        // the SAME helper the flush-side writer's path comes from. This used
+        // the raw tenant `base_location`, so it never found what the writer
+        // wrote (TD-OEDIRWM-1).
         let collection = self.get_or_load_collection(collection_id).await.ok()?;
-        let collection_root = collection
-            .storage_assignment
-            .as_ref()
-            .map(|a| a.base_location.clone())?;
+        let collection_root = collection.storage_assignment.as_ref().map(|a| {
+            crate::storage::engines::sst::object_economy_directory::oedir_collection_root(
+                a,
+                collection_id,
+            )
+        })?;
 
         // Filesystem reference comes from the SST engine's factory.
         let fs_factory = self.storage_engine.filesystem().clone();
         let fs = fs_factory.get_filesystem(&collection_root).ok()?;
 
-        let entry = cache
-            .handle_for(collection_id)
+        let entry = handle
             .get_or_load(|| async {
                 crate::storage::engines::sst::object_economy_directory::load_directory_for(
                     &*fs,

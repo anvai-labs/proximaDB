@@ -2471,6 +2471,7 @@ fn object_economy_status_label(
     match status {
         DirectoryLoadStatus::Loaded => "loaded",
         DirectoryLoadStatus::Missing => "missing",
+        DirectoryLoadStatus::Unavailable(_) => "unavailable",
         DirectoryLoadStatus::Corrupt(_) => "corrupt",
         DirectoryLoadStatus::Mismatch { .. } => "mismatch",
     }
