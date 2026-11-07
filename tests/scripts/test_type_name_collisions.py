@@ -43,10 +43,12 @@ class TypeNameCollisionTests(unittest.TestCase):
         self.write("crates/x/src/b.rs", "pub struct StorageAssignment { x: u8 }\n")
         self.assertEqual(self.defs(), {"StorageAssignment": 1})
 
-    def test_enum_trait_and_generics_count_but_restricted_visibility_does_not(self):
+    def test_enum_trait_generics_and_restricted_visibility_all_count(self):
+        # Restricted visibility counts: duplicating a primitive harms within
+        # the root crate as much as across crates (TD-NAMING-1).
         self.write("src/a.rs", "pub enum Mode { A }\npub trait Port<T> {}\npub(crate) struct Local;\n")
         self.write("src/b.rs", "pub enum Mode<T> { B(T) }\npub trait Port: Send {}\npub(crate) struct Local;\n")
-        self.assertEqual(sorted(self.defs()), ["Mode", "Port"])
+        self.assertEqual(sorted(self.defs()), ["Local", "Mode", "Port"])
 
     def test_unsafe_trait_union_and_same_line_attributes_count(self):
         self.write("src/a.rs", "pub unsafe trait Engine {}\n#[repr(C)] pub union Cell { a: u8 }\n")
@@ -223,6 +225,28 @@ class TypeNameCollisionTests(unittest.TestCase):
         base = self._baseline()
         self.write("src/latin1.rs", b"pub struct Caf\xe9;\n", raw=True)
         self.assertEqual(self._run("--mode", "no-regression", "--baseline", str(base)), 1)
+
+    # ---- cfg predicate evaluation (#2445 round 4) -----------------------
+
+    def test_nested_any_test_inside_all_ships(self):
+        self.write("src/a.rs", "pub struct F;\n")
+        self.write("src/b.rs", '#[cfg(all(unix, any(test, feature = "y")))]\npub mod t { pub struct F; }\n')
+        self.assertEqual(self.defs(), {"F": 1})
+
+    def test_all_with_not_and_test_is_test_only(self):
+        self.write("src/a.rs", "pub struct F;\n")
+        self.write("src/b.rs", '#[cfg(all(not(feature = "aws"), test))]\nmod t { pub struct F; }\n')
+        self.assertEqual(self.defs(), {})
+
+    def test_attribute_with_nested_brackets_does_not_hide_cfg_test(self):
+        self.write("src/a.rs", "pub struct F;\n")
+        self.write("src/b.rs", "#[cfg(test)]\n#[schema(example = json!([1]))]\npub struct F;\n")
+        self.assertEqual(self.defs(), {})
+
+    def test_inner_cfg_all_test_file_is_excluded(self):
+        self.write("src/a.rs", "pub struct F;\n")
+        self.write("src/helpers.rs", "#![cfg(all(test, unix))]\npub struct F;\n")
+        self.assertEqual(self.defs(), {})
 
 
 if __name__ == "__main__":

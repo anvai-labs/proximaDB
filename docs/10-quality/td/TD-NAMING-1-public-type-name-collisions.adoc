@@ -5,7 +5,7 @@
 
 == Problem
 
-Baseline 2026-11-06 (`scripts/count_type_name_collisions.py`): 792 redundant definitions across 591 names.
+Baseline 2026-11-06 (`scripts/count_type_name_collisions.py`): 797 redundant definitions across 596 names.
 
 The same `pub struct` / `enum` / `union` / `trait` name defined at several
 sites causes two harms:
@@ -39,8 +39,16 @@ sites causes two harms:
 
 == Counting rules
 
-* Bare `pub` only — `pub(crate)` / `pub(super)` types cannot collide across
-  a crate boundary or be re-exported.
+* Restricted visibility (`pub(crate)`, `pub(super)`) COUNTS. Decision, after
+  two review rounds argued opposite ways: the primary harm — a primitive
+  duplicated so a fix lands in one copy — is visibility-independent, and most
+  code is in the single root crate, where `pub(crate)` duplicates are exactly
+  that harm. (Cross-crate reachability only matters for the re-export class,
+  which this guard does not measure.)
+* Test-only code is decided by EVALUATING the cfg predicate: `test`;
+  `all(..)` with any test-only child; `any(..)` only if every child is
+  test-only; `not(..)` never. Applied to items, inline and out-of-line
+  modules, and file-level `#![cfg(..)]`.
 * Sites are MODULE SCOPES: same-named types in different modules (even of one
   file) collide; same-named items in ONE scope count once — rustc only allows
   that for mutually exclusive cfg alternatives, so the collapse is sound and
@@ -64,6 +72,13 @@ sites causes two harms:
   proto mirrors that are legitimately re-exported, and module-level `cfg`
   all need real path resolution.
 * Macro-generated definitions are not seen.
+* Attributes are matched with ONE level of nested brackets (`json!([1])`);
+  deeper nesting before a `#[cfg(test)]` can still hide it.
+* The lexer (comment/literal masking) is separate from the capability-facade
+  ratchet's `_match_brace` by decision: masking is a different operation from
+  in-place brace matching, and coupling two ratchets through a private
+  function is its own fragility. A shared module is the right fix if a third
+  ratchet needs a Rust lexer.
 * Out-of-line module handling is one level deep: a `#[cfg(test)] mod x;`
   file is excluded, but not modules it declares in turn, nor a `#[path]`
   target; out-of-line cfg alternatives (`#[cfg(unix)] mod unix;` /

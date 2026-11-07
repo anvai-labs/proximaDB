@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Ratchet redundant public Rust type definitions (TD-NAMING-1).
 
-Counts `pub struct` / `pub enum` / `pub union` / `pub [unsafe] trait` NAMES
+Counts `pub[(..)] struct` / `enum` / `union` / `[unsafe] trait` NAMES (restricted
+visibility included — duplication harms within the root crate too)
 defined at more than one site in non-test, non-generated source. The same
 name defined N times is how a fix lands in one copy while the others keep
 the bug (`OperationType` is defined 12 times), and two same-named types are
@@ -68,19 +69,65 @@ def match_brace(code: str, open_idx: int) -> int:
                 return i + 1
     return len(code)
 
-ATTR = r"(?:#\[[^\]]*\]\s*)*"
-VIS = r"pub\s+"  # bare `pub` only: pub(crate)/pub(super) cannot collide across crates
+ATTR = r"(?:#\[(?:[^\[\]]|\[[^\[\]]*\])*\]\s*)*"  # one level of nested [] (e.g. json!([1]))
+VIS = r"pub(?:\([^)]*\))?\s+"  # restricted visibility counts: duplication harms within the root crate too
 # An item starts at a line start or right after `{` / `}` / `;`.
 DEF_RE = re.compile(
     rf"(?:^|(?<=[{{}};]))\s*({ATTR}){VIS}(?:unsafe\s+)?(?:struct|enum|union|trait)\s+([A-Z][A-Za-z0-9_]*)",
     re.MULTILINE,
 )
-TEST_CFG = r"#\[cfg\(\s*(?:test\s*\)|all\((?:(?!not\()[^\]])*\btest\b)[^\]]*\]"
-TEST_CFG_RE = re.compile(TEST_CFG)
-CFG_ATTR_RE = re.compile(r"#\[cfg\(")
+CFG_ATTR_RE = re.compile(r"#!?\[cfg\(")
+
+
+def _split_args(s: str) -> list[str]:
+    """Split a cfg argument list on top-level commas."""
+    parts, depth, cur = [], 0, ""
+    for ch in s:
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        if ch == "," and depth == 0:
+            parts.append(cur.strip())
+            cur = ""
+        else:
+            cur += ch
+    if cur.strip():
+        parts.append(cur.strip())
+    return parts
+
+
+def _test_only(pred: str) -> bool:
+    """True iff the cfg predicate can only be enabled in a test build:
+    `test`; `all(..)` with any test-only child; `any(..)` whose children are
+    ALL test-only. `not(..)` and everything else may ship."""
+    pred = pred.strip()
+    if pred == "test":
+        return True
+    m = re.fullmatch(r"(all|any|not)\s*\((.*)\)", pred, re.DOTALL)
+    if not m:
+        return False
+    op, args = m.group(1), _split_args(m.group(2))
+    if op == "all":
+        return any(_test_only(a) for a in args)
+    if op == "any":
+        return bool(args) and all(_test_only(a) for a in args)
+    return False  # not(..)
+
+
+def has_test_only_cfg(attrs: str) -> bool:
+    """Any `#[cfg(..)]` / `#![cfg(..)]` in `attrs` whose predicate is test-only."""
+    for m in re.finditer(r"#!?\[cfg\(", attrs):
+        depth, i = 1, m.end()
+        while i < len(attrs) and depth:
+            depth += {"(": 1, ")": -1}.get(attrs[i], 0)
+            i += 1
+        if _test_only(attrs[m.end() : i - 1]):
+            return True
+    return False
 MODVIS = r"pub(?:\([^)]*\))?\s+"  # modules: any visibility (restricted test mods are common)
 INLINE_MOD_RE = re.compile(rf"({ATTR})(?:{MODVIS})?mod\s+[A-Za-z_]\w*\s*\{{")
-OUTLINE_TEST_MOD_RE = re.compile(rf"{TEST_CFG}\s*{ATTR}(?:{MODVIS})?mod\s+([A-Za-z_]\w*)\s*;")
+OUTLINE_MOD_RE = re.compile(rf"({ATTR})(?:{MODVIS})?mod\s+([A-Za-z_]\w*)\s*;")
 
 
 class UnreadableSource(Exception):
@@ -165,24 +212,17 @@ def mask_non_code(text: str) -> str:
     return "".join(out)
 
 
-def test_and_gated_spans(code: str) -> tuple[list[tuple[int, int]], list[tuple[int, int]]]:
-    """(test-only module spans, cfg-gated non-test module spans)."""
-    tests, gated = [], []
+def module_blocks(code: str) -> tuple[list[tuple[int, int]], list[tuple[int, int, str]]]:
+    """ONE pass over inline `mod name { .. }` blocks: (test-only spans,
+    (start, end, name) scopes)."""
+    tests, scopes = [], []
     for m in INLINE_MOD_RE.finditer(code):
-        attrs = m.group(1)
-        if not CFG_ATTR_RE.search(attrs):
-            continue
         end = match_brace(code, m.end() - 1)
-        (tests if TEST_CFG_RE.search(attrs) else gated).append((m.start(), end))
-    return tests, gated
-
-
-NAMED_MOD_RE = re.compile(rf"{ATTR}(?:{MODVIS})?mod\s+([A-Za-z_]\w*)\s*\{{")
-
-
-def module_scopes(code: str) -> list[tuple[int, int, str]]:
-    """(start, end, name) for every inline `mod name { .. }` block."""
-    return [(m.start(), match_brace(code, m.end() - 1), m.group(1)) for m in NAMED_MOD_RE.finditer(code)]
+        name = re.search(r"mod\s+([A-Za-z_]\w*)", m.group(0)).group(1)
+        scopes.append((m.start(), end, name))
+        if has_test_only_cfg(m.group(1)):
+            tests.append((m.start(), end))
+    return tests, scopes
 
 
 def scope_of(pos: int, scopes: list[tuple[int, int, str]]) -> str:
@@ -219,8 +259,10 @@ def outline_test_module_files(rel: str, code: str) -> set[str]:
     stem = Path(rel).stem
     base = parent if stem in ("mod", "lib", "main") else parent / stem
     found = set()
-    for m in OUTLINE_TEST_MOD_RE.finditer(code):
-        name = m.group(1)
+    for m in OUTLINE_MOD_RE.finditer(code):
+        if not has_test_only_cfg(m.group(1)):
+            continue
+        name = m.group(2)
         found.add((base / f"{name}.rs").as_posix())
         found.add((base / name / "mod.rs").as_posix())
     return found
@@ -239,20 +281,20 @@ def collect(root: Path) -> dict[str, int]:
     for rel, code in codes.items():
         excluded |= outline_test_module_files(rel, code)
         # A whole file gated by an inner `#![cfg(test)]` is test code.
-        if re.match(r"\s*(?:#!\[[^\]]*\]\s*)*#!\[cfg\(test\)\]", code):
+        inner = re.match(r"\s*((?:#!\[(?:[^\[\]]|\[[^\[\]]*\])*\]\s*)*)", code)
+        if inner and has_test_only_cfg(inner.group(1)):
             excluded.add(rel)
 
-    sites: dict[str, list[tuple[str, bool]]] = defaultdict(list)
+    sites: dict[str, set[str]] = defaultdict(set)
     for rel, code in codes.items():
         if rel in excluded:
             continue
-        tests, gated = test_and_gated_spans(code)
-        scopes = module_scopes(code)
+        tests, scopes = module_blocks(code)
         for m in DEF_RE.finditer(code):
             pos, attrs, name = m.start(2), m.group(1), m.group(2)
-            if TEST_CFG_RE.search(attrs) or inside(pos, tests):
+            if has_test_only_cfg(attrs) or inside(pos, tests):
                 continue
-            sites[name].append((f"{rel}::{scope_of(pos, scopes)}", True))
+            sites[name].add(f"{rel}::{scope_of(pos, scopes)}")
 
     result = {}
     for name, entries in sites.items():
@@ -260,7 +302,7 @@ def collect(root: Path) -> dict[str, int]:
         # exclusive cfg alternatives (rustc rejects anything else), so a scope
         # holds ONE definition however many cfg'd copies it has. Different
         # scopes — other modules, other files — each count.
-        effective = len({scope for scope, _ in entries})
+        effective = len(entries)
         if effective > 1:
             result[name] = effective - 1
     return result
