@@ -85,18 +85,6 @@ fn already_failed() -> &'static Mutex<HashSet<String>> {
     FAILED.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
-/// Reset the injection state (test isolation helper — nextest runs each test
-/// in its own process, so this is only needed for in-process multi-phase
-/// tests).
-pub fn reset_for_tests() {
-    if let Ok(mut failed) = already_failed().lock() {
-        failed.clear();
-    }
-    if let Ok(mut read) = already_read().lock() {
-        read.clear();
-    }
-}
-
 #[derive(Debug)]
 pub struct FaultInjectingFileSystem {
     inner: std::sync::Arc<dyn FileSystem>,

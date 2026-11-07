@@ -39,7 +39,7 @@ pub use composition::{DIContainer, ServiceComposer};
 pub use document_port::DocumentPort;
 pub use entity_port::EntityPort;
 pub use graph_port::GraphPort;
-pub use handlers::{CollectionIdCache, UnifiedHandlers};
+pub use handlers::UnifiedHandlers;
 pub use hardware::{HardwareCapabilities, SimdLevel, best_simd_level, hardware_capabilities};
 pub use hybrid_port::HybridPort;
 pub use observability_port::ObservabilityPort;

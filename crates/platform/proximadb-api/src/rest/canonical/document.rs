@@ -49,38 +49,6 @@ pub struct DocumentRestState {
     pub document_port: Arc<dyn DocumentPort>,
 }
 
-// ── Legacy stub types kept for re-export compatibility ────────────────────────
-
-/// Document handler stub.
-pub struct DocumentHandler;
-
-impl DocumentHandler {
-    pub fn new() -> Self {
-        Self
-    }
-}
-
-impl Default for DocumentHandler {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// Document query handler stub.
-pub struct DocumentQueryHandler;
-
-impl DocumentQueryHandler {
-    pub fn new() -> Self {
-        Self
-    }
-}
-
-impl Default for DocumentQueryHandler {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 // ── Request / Response types ──────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
@@ -1206,8 +1174,6 @@ mod tests {
         assert_eq!(aggregate.results[0]["name"], "doc");
 
         let _router = create_document_router();
-        let _handler = DocumentHandler;
-        let _query_handler = DocumentQueryHandler::new();
         assert_eq!(crate::rest::canonical::default_limit(), 100);
         assert_eq!(default_index_type(), "btree");
     }

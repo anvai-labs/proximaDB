@@ -407,16 +407,12 @@ impl NovaMetadata {
 }
 
 /// NOVA metadata serializer
-pub struct NovaMetadataSerializer {
-    /// Filesystem interface for reading files
-    #[allow(dead_code)]
-    filesystem: Arc<dyn FilesystemPort>,
-}
+pub struct NovaMetadataSerializer {}
 
 impl NovaMetadataSerializer {
     /// Create new NOVA serializer
-    pub fn new(filesystem: Arc<dyn FilesystemPort>) -> Self {
-        Self { filesystem }
+    pub fn new(_filesystem: Arc<dyn FilesystemPort>) -> Self {
+        Self {}
     }
 
     /// Create placeholder metadata for testing

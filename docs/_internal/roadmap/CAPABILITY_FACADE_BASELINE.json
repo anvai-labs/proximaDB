@@ -1,5 +1,5 @@
 {
-  "total": 1038,
+  "total": 1035,
   "by_file": {
     "apps/proximadb-migrate/src/main.rs": 2,
     "crates/binding/proximadb-embedded/src/lib.rs": 9,
@@ -73,7 +73,7 @@
     "crates/modalities/proximadb-orion-engine/src/persistence.rs": 1,
     "crates/modalities/proximadb-orion-engine/src/traversal.rs": 1,
     "crates/modalities/proximadb-quantization-kernel/src/quantization_engine.rs": 4,
-    "crates/modalities/proximadb-quantization-kernel/src/storage_engine.rs": 5,
+    "crates/modalities/proximadb-quantization-kernel/src/storage_engine.rs": 2,
     "crates/modalities/proximadb-vector/src/index.rs": 1,
     "crates/modalities/proximadb-vector/src/quantization/product.rs": 1,
     "crates/modalities/proximadb-vector/src/quantization/turboquant/id_map.rs": 1,
