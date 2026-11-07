@@ -10,8 +10,8 @@
 //! 2. `delta_results` — records returned by
 //!    [`scan_wal_delta_if_needed`](crate::services::operations::vectors::VectorOperationsService::scan_wal_delta_if_needed)
 //!    for the unflushed WAL/memtable region.
-//!    Tombstones in this set are marked with an empty `vector` plus a
-//!    set `expires_at`.
+//!    Tombstones in this set carry `valid_to_ns == Some(0)` (see
+//!    `is_wal_tombstone`; never infer them from `expires_at`).
 //!
 //! [`merge_delta_with_directory_results`] combines the two with these
 //! rules:

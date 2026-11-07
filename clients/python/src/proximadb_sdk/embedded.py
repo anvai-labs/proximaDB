@@ -1403,9 +1403,9 @@ prefetch_budget = 4
         # `EmbeddedConfig.vector_engine` existed but was never transmitted, so the
         # server fell back to `engine = "auto"` and every embedded collection was
         # created on HELIX regardless of what the caller configured. That is not a
-        # cosmetic default: engine choice gates real capability (for example
-        # `object_economy_eligible` requires "sst"), and PAX-based features such as
-        # the filter-aware cascade only exist on the SST path. Send it.
+        # cosmetic default: engine choice gates real capability (PAX-based
+        # features such as the filter-aware cascade only exist on the SST
+        # path). Send it.
         selected_engine = engine or self.config.vector_engine
         async with self._http_client() as client:
             response = await client.post(

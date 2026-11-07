@@ -2318,12 +2318,19 @@ impl VectorOperationsService {
             match crate::storage::persistence::write_ahead_log::manifest::get_service() {
                 Some(svc) => Some(svc.current_lsn().await),
                 None => {
-                    tracing::debug!(
-                        target: "proximadb::services::vectors::delta_merge",
-                        collection_id = %collection_id,
-                        "global manifest service not registered: WAL cursor unavailable for \
-                         EXPLAIN; the delta scan still runs"
-                    );
+                    // Still a misconfiguration in a server process (no
+                    // FreshnessLsnSource is wired either), so warn — once per
+                    // process, not per query.
+                    static WARNED: std::sync::Once = std::sync::Once::new();
+                    WARNED.call_once(|| {
+                        tracing::warn!(
+                            target: "proximadb::services::vectors::delta_merge",
+                            "global manifest service not registered: the WAL cursor is \
+                             unavailable (EXPLAIN reports None) and no FreshnessLsnSource \
+                             is wired; the delta scan still runs. In server mode call \
+                             `manifest::init(&wal_config)` once at startup."
+                        );
+                    });
                     None
                 }
             };
@@ -6106,10 +6113,14 @@ mod index_first_search_tests {
     /// cursor only feeds EXPLAIN now, so it is `None`, never a reason to skip.
     #[tokio::test]
     async fn strong_delta_scan_runs_without_a_manifest_service() {
-        assert!(
-            crate::storage::persistence::write_ahead_log::manifest::get_service().is_none(),
-            "precondition: no manifest service in this test process"
-        );
+        // The manifest is a process-global singleton another lib test may set
+        // under shared-process `cargo test`; this test is only meaningful
+        // without one, so it skips rather than flaking (nextest's
+        // process-per-test isolation always runs it).
+        if crate::storage::persistence::write_ahead_log::manifest::get_service().is_some() {
+            eprintln!("skip: a manifest service is registered in this process");
+            return;
+        }
         let (service, _temp_dir) = create_test_service().await.unwrap();
         cache_test_collection(&service, 1001, 3);
         service

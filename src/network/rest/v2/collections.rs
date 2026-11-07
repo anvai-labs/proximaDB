@@ -1985,7 +1985,8 @@ pub struct WriteContractHealth {
 ///
 /// * `search_request_modes` — what each individual search request can ask for
 ///   today. All three `VectorFreshnessMode` variants (Strong, BoundedStale,
-///   StaleOk) are wired in the search path via `should_scan_delta_with_time`.
+///   StaleOk) are accepted; the search path scans the delta for every mode
+///   but StaleOk (`requires_delta_merge`, TD-OEDIRWM-1).
 /// * `collection_level_modes_wired` — whether a *default* freshness mode is
 ///   stored on the collection / projection (so callers don't have to set it
 ///   per request). Still `false`: only per-projection `ProjectionFreshness`
@@ -1998,8 +1999,9 @@ pub struct FreshnessHealth {
     pub notes: &'static str,
 }
 
-/// Per-request freshness modes the search path actually honors. Each flag
-/// corresponds to a verifiable arm of `VectorFreshnessMode::should_scan_delta_with_time`.
+/// Per-request freshness modes the search path accepts. Strong and
+/// BoundedStale both scan the delta; StaleOk skips it
+/// (`VectorFreshnessMode::requires_delta_merge`).
 #[derive(Debug, Serialize, PartialEq)]
 pub struct SearchFreshnessModes {
     /// `Strong`: WAL/memtable delta is always merged. Default.

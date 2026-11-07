@@ -21,9 +21,10 @@
 //! ## What this bench measures
 //!
 //! * **Insert + flush throughput** — how long it takes to land N
-//!   synthetic vectors and trigger the SST flush. (Since TD-OEDIRWM-1
-//!   the flush no longer writes the object-economy directory sidecar,
-//!   so results are not comparable with pre-retirement reports.)
+//!   synthetic vectors and trigger the SST flush. (This bench's engine
+//!   never wired the directory cache, so it never wrote the
+//!   object-economy sidecar — TD-OEDIRWM-1's retirement does not change
+//!   what it measures.)
 //! * **Cold p50/p99 query latency** — first query against a freshly
 //!   constructed engine. Page cache cold, index cold, block cache cold.
 //! * **Warm p50/p99 query latency** — subsequent queries against the
@@ -42,10 +43,10 @@
 //!   yields 100% recall by definition. Adding an approximate-mode
 //!   recall measurement against SIFT/GIST ground truth is a separate
 //!   slice.
-//! * **WAL delta merge cost** — there are no in-flight writes during
-//!   the search loop, so the strong-route delta scan finds an empty
-//!   memtable (it always runs; there is no watermark skip since
-//!   TD-OEDIRWM-1). Measuring the merge cost under
+//! * **WAL delta merge cost** — NOT measured: this bench calls the
+//!   engine's `search_vectors_unified` directly, so the service-level
+//!   delta scan + merge (`VectorOperationsService`) never runs. Measuring
+//!   the merge cost under
 //!   concurrent write + read load is a separate slice.
 //!
 //! ## Scale control
