@@ -55,7 +55,14 @@ GETs were unbilled.
   `PersistentHit` still records an io_trace miss (an L1 miss), so io_trace
   survivor hit/miss measures DRAM hit-rate, not persistence hit-rate. The
   fix only matters under a concurrent-fill race, so no deterministic test
-  pins it. Failed loads keep each seam's existing io_trace
+  pins it. ROUTING NOTE: `survivor_l1_hits/misses` feed
+  `VectorCacheOutcome::from_snapshot` (route_cost_model.rs), which the
+  ComputeScheduler uses to classify routes Warm/Mixed/Cold — so this seam
+  change can flip a route's cache-outcome class under exactly that race.
+  The direction is toward truth (the outcome reflects where the bytes
+  actually came from), and the affected class of queries is
+  concurrent-fill racing the same lookup — rare; not separately pinned.
+  Failed loads keep each seam's existing io_trace
   accounting: the in-parent seam counts a miss, `get_or_fetch` records nothing.
   They are never attributed. Changing L1 semantics is out of scope here.
 * `proximadb_survivor_cache_collection_reads_total{tenant_stable_id,
@@ -138,8 +145,13 @@ ratio is a follow-up (a second family; it doubles cardinality).
 * Eviction trades counter continuity for a bounded cap. Keeping evicted
   pairs' series instead would make the cap permanent again (the original
   insert-only defect).
-* Per-lookup cost is one `Arc` clone, one string-hash map probe and one
-  `IntCounter` increment. Resolving the series once per search and holding
+* Per-lookup cost is one `Arc` clone, one string-hash map probe, one
+  `IntCounter` increment and one `monotonic_secs()` read (vdso, ~ns — it
+  refreshes `last_seen` for eviction on the fast path, since a lookup
+  that never refreshed would let a HOT pair be evicted). If profiling
+  ever shows the clock read matters, refresh coarsely (every Nth lookup)
+  or stamp the scope-entry time into the task-local — day-granularity
+  eviction tolerates both; not built without evidence. Resolving the series once per search and holding
   its handles in the task-local was rejected: an eviction during the search
   would leave those handles detached, losing the counts silently.
 * Admission is first-come among non-idle pairs, not ranked by traffic; a
