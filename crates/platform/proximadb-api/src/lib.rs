@@ -37,11 +37,6 @@ pub use pgwire::{PostgresServer, PostgresSession};
 pub use grpc::{GrpcApiHandler, GrpcRequest, GrpcResponse};
 pub use rest::{RestApiHandler, RestRequest, RestResponse};
 
-pub use rest::canonical::{
-    EntityHandler, GraphHandler, GraphTraversalHandler, HybridSearchHandler,
-    ProgressiveSearchHandler, VectorHandler,
-};
-
 // Re-export v2 agentic contracts
 pub use grpc::v2::{
     AgentCheckpointService, AgentEventService, AgentMemoryService, AgenticGrpcBackend,

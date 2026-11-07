@@ -40,11 +40,6 @@ pub use crate::rest::deprecation::{
     apply_v1_deprecation_headers, with_v1_compatibility_headers,
 };
 
-// Re-exports — handler types
-pub use entities::{EntityHandler, VectorHandler};
-pub use graph::{GraphHandler, GraphTraversalHandler};
-pub use hybrid::{HybridSearchHandler, ProgressiveSearchHandler};
-
 // Re-exports — state types
 pub use document::DocumentRestState;
 pub use graph::GraphRestState;

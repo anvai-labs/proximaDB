@@ -15,11 +15,8 @@ pub use errors::{RestError, RestResult};
 pub use state::{RestAppState, TenantContext};
 
 // Re-export canonical REST handler + state types
+pub use canonical::UnifiedQueryRestState;
 pub use canonical::{DocumentRestState, GraphRestState, HybridRestState, ObservabilityRestState};
-pub use canonical::{
-    EntityHandler, GraphHandler, GraphTraversalHandler, HybridSearchHandler,
-    ProgressiveSearchHandler, UnifiedQueryRestState, VectorHandler,
-};
 
 // Re-export canonical REST router builders
 pub use canonical::{
