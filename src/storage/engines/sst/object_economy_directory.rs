@@ -666,7 +666,24 @@ impl VectorObjectEconomyDirectoryCache {
             .entry(collection_id.to_string())
             .or_insert_with(|| Arc::new(CachedDirectoryHandle::new()))
             .clone();
+        // TD-OEDIRWM-1: a cached `Missing` entry is NEGATIVE-CACHED — never
+        // TTL-replaced. Each replacement re-issued the sidecar GET, which on a
+        // collection with no sidecar (never flushed, or a non-SST engine that
+        // never emits one) is a swallowed 404 repeating after every idle gap
+        // longer than the recheck TTL, forever. Pinning `Missing` is
+        // correctness-safe by construction: it yields watermark (0, 0), which
+        // makes every Strong/BoundedStale query run the delta scan — the most
+        // conservative answer. It is cleared exactly when it can become wrong:
+        // the flush-side writer (`emit_after_flush`) calls `invalidate` the
+        // moment a sidecar is written, so the next read loads the real one.
+        // Present sidecars (`Loaded`) and degraded ones (`Corrupt`,
+        // `Mismatch`) keep the recheck TTL, which exists for cross-pod
+        // staleness of a sidecar that DOES exist.
+        let negative_cached = handle
+            .get_cached()
+            .is_some_and(|entry| matches!(entry.status, DirectoryLoadStatus::Missing));
         if let Some(ttl) = self.recheck_ttl
+            && !negative_cached
             && handle.expired_for(ttl)
         {
             // Replace only if still the same expired handle (a concurrent
@@ -1787,6 +1804,62 @@ mod tests {
             2,
             "exactly one reload after expiry"
         );
+    }
+
+    /// TD-OEDIRWM-1: a `Missing` entry is negative-cached. Past the recheck
+    /// TTL the handle is KEPT (no second sidecar GET — on a collection with
+    /// no sidecar that GET is a 404 that repeated after every idle gap,
+    /// forever), and `invalidate` — which the flush-side writer calls when it
+    /// emits a sidecar — clears it so the next reader loads the real one.
+    #[tokio::test]
+    async fn missing_entry_is_negative_cached_until_invalidated() {
+        use std::time::Duration;
+        let cache =
+            VectorObjectEconomyDirectoryCache::with_recheck_ttl(Some(Duration::from_millis(25)));
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let load = |epoch: u64, status: DirectoryLoadStatus| {
+            let calls = Arc::clone(&calls);
+            move || {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                std::future::ready((
+                    VectorObjectEconomyDirectory::empty(
+                        "coll",
+                        epoch,
+                        CatalogAuthorityMode::ProximaAuthoritative,
+                    ),
+                    status,
+                ))
+            }
+        };
+
+        let handle = cache.handle_for("coll");
+        handle
+            .get_or_load(load(1, DirectoryLoadStatus::Missing))
+            .await;
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // Well past the TTL: a Missing handle must NOT be replaced.
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        let same = cache.handle_for("coll");
+        assert!(
+            Arc::ptr_eq(&handle, &same),
+            "a Missing entry must survive the recheck TTL (negative cache)"
+        );
+        same.get_or_load(load(2, DirectoryLoadStatus::Loaded)).await;
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "no second sidecar load while negative-cached"
+        );
+
+        // A write invalidates it: the next reader loads the real sidecar.
+        assert!(cache.invalidate("coll"));
+        let fresh = cache.handle_for("coll");
+        let loaded = fresh
+            .get_or_load(load(3, DirectoryLoadStatus::Loaded))
+            .await;
+        assert_eq!(loaded.directory.storage_epoch, 3);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     #[tokio::test]

@@ -1,0 +1,47 @@
+= TD-OEDIRWM-1: A missing directory sidecar was re-fetched after every idle gap — negative-cache it
+:status: Accepted
+:date: 2026-11-06
+:tags: [cost, gets, voe-directory, freshness]
+
+== Problem
+
+Every Strong/BoundedStale vector query reads the object-economy directory's
+freshness watermark through `cached_directory_watermark`, which loads one
+per-collection sidecar (`{collection_root}/oedir/v0.bin`) through a cache
+with a SLIDING recheck TTL (default 30s; `loaded_at` refreshes per query).
+When the TTL lapses, `handle_for` replaces the handle and the next query
+re-issues the sidecar GET. For a collection with NO sidecar — never flushed,
+or a HELIX/NOVA/VIPER collection (those engines never emit one) — that GET is
+a swallowed 404 that repeats on the first strict query after every idle gap
+longer than the TTL, forever: a `Missing` result was cached like any other
+and dropped by the same TTL.
+
+== Decision
+
+`Missing` entries are NEGATIVE-CACHED: `handle_for` never TTL-replaces a
+handle whose cached status is `Missing`. This is correctness-safe by
+construction — a `Missing` entry yields watermark `(0, 0)`, which makes
+every strict query run the WAL/memtable delta scan (the most conservative
+answer). It is cleared exactly when it could become wrong: the flush-side
+writer (`emit_after_flush`) calls `invalidate` the moment it writes a
+sidecar. `Loaded`, `Corrupt` and `Mismatch` keep the recheck TTL, which
+exists for cross-pod staleness of a sidecar that DOES exist.
+
+== Rejected alternative: removing the read-side fetch
+
+The first cut of #2443 removed the fetch outright (passing `(0, 0)`). The
+review showed that was wrong: it silently degraded BoundedStale to Strong
+while `route-health` still advertised `bounded_stale_time_bound_check`; it
+left `route-health`'s object-economy live status permanently `not_checked`
+(the fetch was the cache's only production populator); EXPLAIN reported a
+fabricated watermark of 0 for collections whose sidecar carried a real one;
+and the flush side kept paying GET+PUT per flush for a sidecar no reader
+consumed. Negative caching removes the actual waste — the repeated 404 —
+and keeps every consumer honest.
+
+== Residual
+
+A sidecar emitted by ANOTHER pod is not discovered by this pod's negative
+entry until a local invalidation or restart. That only forgoes the
+delta-scan skip (an optimisation); it can never produce a wrong answer,
+because the negative entry's `(0, 0)` watermark already means "always scan".
