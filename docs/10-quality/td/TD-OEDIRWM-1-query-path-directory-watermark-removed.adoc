@@ -27,9 +27,11 @@
 * The query path no longer reads the directory: `(0, 0)` is passed to the
   delta-scan decision, so every strict query scans the delta — exactly what
   production already did. Zero sidecar GETs per query.
-* BoundedStale is served as Strong. Route-health reports
-  `bounded_stale_time_bound_check: false` with notes saying so; EXPLAIN
-  reports the watermark as `None` (not wired), not a fabricated 0.
+* BoundedStale always scans the delta, but — unlike Strong — may still be
+  served from the 300s query cache, so its `max_staleness_ms` bound is NOT
+  enforced (it never effectively was: the skip never fired). Route-health
+  reports `bounded_stale_time_bound_check: false` and says so; EXPLAIN and its
+  trace event report the watermark as `None` (not wired), not a fabricated 0.
 * Route-health's object-economy status stays a NO-I/O read of the in-process
   cache. With nothing on the query path populating it, it reports
   `not_checked`, and its notes say why.
@@ -37,7 +39,8 @@
   the flush writer and the record read-back. Sites still composing it by
   hand: the storage-traits `collection_storage_path`,
   `services/operations/vectors/read.rs`, `engines/nova/operations/search.rs`,
-  `services/collection/manager.rs` (two sites).
+  `services/collection/manager.rs` (two sites), `storage/engine.rs`, and
+  `engines/sst/trait_impl.rs`.
 
 Rejected along the way, each for a reason a review round found: a negative
 cache, a transient-vs-missing status split, a writer that refuses to
@@ -51,6 +54,11 @@ scoped diagnostics lookup; a refusal that a permanent 403 would turn into
 
 * The flush side still writes the sidecar (a GET + PUT per flush) though no
   query reads it. Retire the write side, or define a consumer for it.
+* Nothing populates `VectorOperationsService::directory_cache` any more:
+  `touch_object_economy_directory_for_search` has no callers, route-health's
+  object-economy status is permanently `not_checked`, and
+  `directory_format_present` is still reported true. Remove the dead wiring
+  with the write-side retirement, or give the cache a consumer.
 * `scan_wal_delta_if_needed` / `should_scan_delta_with_time` still accept
   watermark parameters that are now always 0; remove them, or make
   BoundedStale explicitly equivalent to Strong, when that API is next touched.

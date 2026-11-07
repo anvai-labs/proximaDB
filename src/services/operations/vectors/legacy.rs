@@ -2358,7 +2358,7 @@ impl VectorOperationsService {
             route_kind = %explain.route_kind,
             freshness_mode = %explain.freshness_mode_used.as_deref().unwrap_or("unknown"),
             current_lsn = explain.current_lsn_at_query.unwrap_or(0),
-            watermark_lsn = explain.freshness_watermark_lsn.unwrap_or(0),
+            watermark_lsn = ?explain.freshness_watermark_lsn, // None = not wired (TD-OEDIRWM-1)
             wal_delta_searched = explain.wal_delta_searched,
             wal_delta_records_scanned = explain.wal_delta_records_scanned.unwrap_or(0),
             merge_input_directory_records = merge_input_directory.unwrap_or(0),

@@ -2284,17 +2284,17 @@ mod tests {
             SstEngine::get_collection_storage_url_from_params(&params).unwrap(),
             expected
         );
-        // TD-OEDIRWM-1: the directory sidecar's READ root must be the root the
-        // flush WRITES under (the writer passes this storage URL as
-        // `collection_root`). They diverged once — the reader used the raw
-        // base_location — and the read side never found a sidecar.
+        // TD-OEDIRWM-1: the shared resolver must produce the explicit
+        // identity + typed-path composition. (A reader once composed its own
+        // root from the raw base_location and never found what the writer
+        // wrote; new readers must call this resolver.)
         assert_eq!(
             crate::storage::trait_components::path_resolver::collection_data_path_for_assignment(
                 &assignment,
                 "13",
             ),
             expected,
-            "the oedir reader must resolve the same root the flush writer uses"
+            "the shared resolver must equal the explicit identity + typed-path composition"
         );
     }
 
