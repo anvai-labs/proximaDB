@@ -68,6 +68,23 @@ pub use proximadb_storage_ports::{
     typed_paths_enabled,
 };
 
+/// The collection DATA directory for a catalog storage assignment — the root
+/// every segment, sidecar and read-back path for the collection lives under.
+/// THE single composition of identity + typed path: the flush writer, the
+/// object-economy directory reader and the record read-back all call this, so
+/// they can never resolve different roots again (TD-OEDIRWM-1: the directory
+/// reader composed its own root from the raw `base_location` and never found
+/// what the writer wrote).
+pub fn collection_data_path_for_assignment(
+    // The PROTO assignment (what the catalog hands out) — not the
+    // storage-ports `StorageAssignment` re-exported above, a different type.
+    assignment: &proximadb_proto::proximadb_v1::StorageAssignment,
+    collection_id: &str,
+) -> String {
+    let identity = typed_path_identity(typed_identity_from_storage_assignment(Some(assignment)));
+    collection_data_path_typed(&assignment.base_location, collection_id, identity)
+}
+
 // ============================================================================
 // Standard Implementations
 // ============================================================================

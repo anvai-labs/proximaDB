@@ -1467,17 +1467,10 @@ impl VectorOperationsService {
                 collection_id
             )
         })?;
-        let typed_identity =
-            crate::storage::trait_components::path_resolver::typed_identity_from_storage_assignment(
-                Some(assignment),
-            );
-        let typed_identity =
-            crate::storage::trait_components::path_resolver::typed_path_identity(typed_identity);
         let storage_url =
-            crate::storage::trait_components::path_resolver::collection_data_path_typed(
-                &assignment.base_location,
+            crate::storage::trait_components::path_resolver::collection_data_path_for_assignment(
+                assignment,
                 &collection_id,
-                typed_identity,
             );
         let engine = self.get_engine_for_collection(&collection_id).await?;
         let storage_records = engine
@@ -2381,7 +2374,16 @@ impl VectorOperationsService {
                 distance_metric,
                 filter,
                 freshness_mode,
-                watermark,
+                // TD-OEDIRWM-1 (#2443 round 3, F1): the directory's LSN is NOT
+                // fed to the skip decision. The writer stamps it with the
+                // global WAL LSN read AFTER the flush commits, not the LSN of
+                // the snapshot it flushed, so rows written during the flush
+                // sit in the memtable "behind" it; skipping on it would hide
+                // them from Strong reads (mandate 16c: Strong always computes
+                // fresh). Passing 0 means Strong always scans; BoundedStale
+                // keeps its time-bound contract via `watermark_ns`. EXPLAIN
+                // still reports the real watermark below.
+                0,
                 watermark_ns,
             )
             .await?;

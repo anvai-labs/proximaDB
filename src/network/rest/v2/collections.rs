@@ -4968,6 +4968,10 @@ mod tests {
             }),
             "mismatch"
         );
+        assert_eq!(
+            object_economy_status_label(&DirectoryLoadStatus::Unavailable("503".into())),
+            "unavailable"
+        );
     }
 
     #[test]
