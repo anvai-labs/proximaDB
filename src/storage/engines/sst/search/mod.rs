@@ -310,16 +310,18 @@ fn resolve_search_parallelism(config_value: u16) -> u16 {
         return resolve_parallel_degree(n);
     }
     let base = resolve_parallel_degree(config_value);
-    // S2b: when auto (config_value == 0), divide by in-flight queries so
-    // concurrent searches don't oversubscribe. Explicit n > 0 is honored.
+    // S2b: when auto (config_value == 0), divide by in-flight queries. Only
+    // the test-only arc entry counts in-flight searches, so the division is
+    // compiled into test builds only — production has no in-flight back-off
+    // (TD-SCANDEG-1).
+    #[cfg(test)]
     if config_value == 0 {
-        adaptive_degree(
+        return adaptive_degree(
             base,
             IN_FLIGHT_SEARCHES.load(std::sync::atomic::Ordering::Relaxed),
-        )
-    } else {
-        base
+        );
     }
+    base
 }
 
 fn resolve_parallel_degree(requested: u16) -> u16 {
@@ -339,10 +341,12 @@ fn resolve_parallel_degree(requested: u16) -> u16 {
 // entry increments it; on the production entry it stays 0, so this division
 // never applies to real traffic (TD-SCANDEG-1). Explicit config/env values
 // bypass the adaptive cap.
+#[cfg(test)]
 static IN_FLIGHT_SEARCHES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// S2b: adaptive degree formula - pure for unit-testing. Divides base by the
 /// in-flight count, floored at 1.
+#[cfg(test)]
 fn adaptive_degree(base: u16, in_flight: usize) -> u16 {
     (base / (in_flight.max(1) as u16)).max(1)
 }

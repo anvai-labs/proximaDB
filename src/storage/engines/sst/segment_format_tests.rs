@@ -6285,6 +6285,24 @@ async fn small_rabitq_segment(
 // ranges cold and paid a billed wave GET whose bytes `get_or_fetch` then
 // dropped because L2 served the range.
 
+/// Sets `PROXIMADB_TRACE_GETS=1` for the test and removes it on drop — even
+/// when an assertion panics — so later tests in the same process never see a
+/// leaked trace switch.
+struct TraceGetsGuard;
+impl TraceGetsGuard {
+    fn on() -> Self {
+        // SAFETY: these tests are #[serial]; nextest also isolates processes.
+        unsafe { std::env::set_var("PROXIMADB_TRACE_GETS", "1") };
+        Self
+    }
+}
+impl Drop for TraceGetsGuard {
+    fn drop(&mut self) {
+        // SAFETY: as in `on`.
+        unsafe { std::env::remove_var("PROXIMADB_TRACE_GETS") };
+    }
+}
+
 /// Run one coalesced search through `survivor` and return the physical GET
 /// trace it produced.
 async fn traced_coalesced_search(
@@ -6306,8 +6324,7 @@ async fn traced_coalesced_search(
 async fn l2_resident_oid_tail_ranges_are_not_refetched() {
     use crate::storage::persistence::filesystem::local::{LocalConfig, LocalFileSystem};
 
-    // SAFETY: nextest runs each test in its own process.
-    unsafe { std::env::set_var("PROXIMADB_TRACE_GETS", "1") };
+    let _trace = TraceGetsGuard::on();
     let dir = tempfile::tempdir().expect("tempdir");
     let seg = dir.path().join("oid-tail-l2.pax");
     // rg_layout = false: no v4 OID chunks, so the legacy OID tail runs.
@@ -6336,7 +6353,6 @@ async fn l2_resident_oid_tail_ranges_are_not_refetched() {
         oid_gets.is_empty(),
         "L2-resident OID ranges must be served from L2, not re-GET: {oid_gets:?}"
     );
-    unsafe { std::env::remove_var("PROXIMADB_TRACE_GETS") };
 }
 
 #[tokio::test]
@@ -6344,8 +6360,7 @@ async fn l2_resident_oid_tail_ranges_are_not_refetched() {
 async fn l2_resident_region_a_probe_ranges_are_not_refetched() {
     use crate::storage::persistence::filesystem::local::{LocalConfig, LocalFileSystem};
 
-    // SAFETY: nextest runs each test in its own process.
-    unsafe { std::env::set_var("PROXIMADB_TRACE_GETS", "1") };
+    let _trace = TraceGetsGuard::on();
     let (corpus, records) = same_wave_fixture();
     let dir = tempfile::tempdir().expect("tempdir");
     let path = write_same_wave_segment(dir.path(), "region-a-l2.pax", &records);
@@ -6374,5 +6389,4 @@ async fn l2_resident_region_a_probe_ranges_are_not_refetched() {
         probe_gets.is_empty(),
         "L2-resident Region-A ranges must be served from L2, not re-GET: {probe_gets:?}"
     );
-    unsafe { std::env::remove_var("PROXIMADB_TRACE_GETS") };
 }

@@ -4742,9 +4742,8 @@ async fn coarse_probe_survivors(
                     // resident in the exact-key L2 store must not join the
                     // billed cold wave (get_or_fetch would serve it from L2 and
                     // drop the wave bytes).
-                    .peek_exact_residency(CacheKind::Other, path, fetch.start, len)
-                    .await
-                    .is_some() =>
+                    .is_exact_resident(CacheKind::Other, path, fetch.start, len)
+                    .await =>
             {
                 slots.push(Slot::SurvivorCached);
             }
@@ -4909,7 +4908,7 @@ async fn coarse_probe_survivors(
             }
             Slot::Ready(b) => std::sync::Arc::from(b.clone()),
             Slot::SurvivorCached => {
-                // peek_exact_residency said resident, but an LRU race could have
+                // is_exact_resident said resident, but an LRU race could have
                 // evicted before we reach the consume call; fail safe to a real
                 // ranged read (the baseline shape), never panic.
                 let sc = match survivor_cache {
@@ -6211,9 +6210,8 @@ pub async fn rabitq_search_segment_coalesced_allowed(
                 // serve into a billed wave GET whose bytes were then dropped.
                 Some(sc)
                     if sc
-                        .peek_exact_residency(CacheKind::Other, path, desc.start, desc.range_len)
-                        .await
-                        .is_some() =>
+                        .is_exact_resident(CacheKind::Other, path, desc.start, desc.range_len)
+                        .await =>
                 {
                     chunk_slots.push(ChunkSlot::SiteServed);
                 }
@@ -6382,7 +6380,7 @@ pub async fn rabitq_search_segment_coalesced_allowed(
         let oid_fetches = plan_coalesced_block_ranges(&footer, &topk_blocks, &oid_policy);
         // TD-RDSTRAT-12 §3 round 4: peek·batch·feed for the OID tail (mirror of
         // W1; plain exact-key seam — no parent tier here). Classification via the
-        // L2-aware `peek_exact_residency` (TD-IOBUDGET-3: a DRAM-only peek sent
+        // L2-aware `is_exact_resident` (TD-IOBUDGET-3: a DRAM-only peek sent
         // L2-resident ranges into the billed wave); one bounded-concurrent
         // wave for the true-cold block ranges (D4 bound: min(INFLIGHT,N) ×
         // max_range_bytes ≤ 128 MiB transient).
@@ -6396,14 +6394,13 @@ pub async fn rabitq_search_segment_coalesced_allowed(
             match survivor_cache {
                 Some(sc)
                     if sc
-                        .peek_exact_residency(
+                        .is_exact_resident(
                             CacheKind::Other,
                             path,
                             fetch.start,
                             fetch.end - fetch.start,
                         )
-                        .await
-                        .is_some() =>
+                        .await =>
                 {
                     oid_slots.push(OidSlot::SiteServed);
                 }

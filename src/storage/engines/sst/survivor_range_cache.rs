@@ -509,6 +509,11 @@ impl SurvivorRangeCache {
     /// `None` answer may still be served from a lower tier by the eventual
     /// consume call, so callers must treat every batched range as payable I/O
     /// they intended to issue anyway.
+    ///
+    /// Test-only: a DRAM-only answer sends L2-resident ranges into a billed
+    /// wave (TD-IOBUDGET-3). Production classification uses
+    /// [`Self::is_exact_resident`].
+    #[cfg(test)]
     pub async fn peek_memory_exact(
         &self,
         kind: CacheKind,
@@ -521,31 +526,33 @@ impl SurvivorRangeCache {
         self.inner.peek_memory(&key).await
     }
 
-    /// TD-IOBUDGET-2 review: exact-key residency probe WITH the L2 step —
-    /// `Some(bytes)` iff a subsequent [`Self::get_or_fetch`] with these exact
-    /// coordinates would be served WITHOUT running its loader, from DRAM
-    /// (pinned/L1) OR from the persistent exact-key L2. Mirrors
-    /// [`Self::peek_parent_residency`]'s steps 1+4: without the L2 probe a
-    /// RAM-only peek classifies L1-evicted-but-L2-resident ranges as cold and
-    /// re-GETs them from the object store (a warm-phase billing regression) —
-    /// the wave GET's bytes are then dropped at the consume call because
-    /// `get_or_fetch` serves the range from L2. Probed through the RAW
-    /// `PersistentByteStore` (never the traced wrapper) so no io_trace or l2
-    /// counters move; the only effect is an LRU recency tick plus a local-disk
-    /// read attempt (~ms, gated-only).
-    pub async fn peek_exact_residency(
-        &self,
-        kind: CacheKind,
-        path: &str,
-        off: u64,
-        len: u64,
-    ) -> Option<Arc<[u8]>> {
+    /// TD-IOBUDGET-3 / TD-SCANDEG-3 (design C): exact-key residency for
+    /// batch-prefetch CLASSIFICATION — `true` iff a subsequent
+    /// [`Self::get_or_fetch`] with these exact coordinates is expected to be
+    /// served WITHOUT running its loader: from DRAM (pinned/L1) or from the
+    /// persistent exact-key L2.
+    ///
+    /// The L2 step is an INDEX lookup (`PersistentByteStore::entry_len`): no
+    /// disk read, no CRC check, no group-hit/touch/heal side effects, no
+    /// io_trace or l2 counters. So the planner reads a resident range ONCE
+    /// (at consume), not twice, and classifying N ranges costs N map lookups
+    /// rather than N serial disk reads. Without the L2 step an L1-evicted but
+    /// L2-resident range is classified cold and re-GET from object storage,
+    /// then dropped at consume (a billed GET for nothing).
+    ///
+    /// A `true` can go stale before consume (eviction by an earlier slot's
+    /// write-through, or a corrupt file the read rejects); the consume's
+    /// `get_or_fetch` then runs its loader — one ranged GET, the same
+    /// fail-safe the DRAM race already had.
+    pub async fn is_exact_resident(&self, kind: CacheKind, path: &str, off: u64, len: u64) -> bool {
         let scope = request_cache_scope();
         let key = CacheKey::with_scope(scope, kind, format!("{path}:{off}:{len}"));
-        if let Some(bytes) = self.inner.peek_memory(&key).await {
-            return Some(bytes);
+        if self.inner.peek_memory(&key).await.is_some() {
+            return true;
         }
-        self.peek_exact_l2(&key, len).await
+        self.l2_store.as_ref().is_some_and(|store| {
+            store.entry_len(&key.persistent_key(L2_EXACT_NAMESPACE)) == Some(len)
+        })
     }
 
     /// TD-RDSTRAT-12 §3 (round 4): the [`Self::get_or_fetch_in_parent`] mirror
@@ -628,7 +635,11 @@ impl SurvivorRangeCache {
     }
 
     /// Exact-key L2 probe through the RAW store — no `TracedSurvivorL2`
-    /// io_trace recording, no L1 promotion, no counters.
+    /// io_trace recording and no L1 promotion. NOT side-effect-free: a hit
+    /// is a full verified disk read, and `get_range` bumps the store's
+    /// recency and protection-group hit stats (TD-SCANDEG-3 — Region B's
+    /// parent-residency peek still pays this; exact-key sites classify with
+    /// [`Self::is_exact_resident`] instead).
     async fn peek_exact_l2(&self, exact_key: &CacheKey, len: u64) -> Option<Arc<[u8]>> {
         let store = self.l2_store.as_ref()?;
         store
@@ -1165,6 +1176,62 @@ mod tests {
     /// `get_or_fetch`, so a peek-None followed by a load makes the next peek
     /// Some — and a peek-Some guarantees the consume loader never runs (the
     /// property the batch-prefetch planner leans on).
+    /// TD-IOBUDGET-3 design C: `is_exact_resident` answers from DRAM OR the
+    /// L2 index — an L1-evicted (fresh cache) but L2-resident range is
+    /// resident, its consume never runs the loader, and a range of a
+    /// different length is not resident.
+    #[tokio::test]
+    async fn is_exact_resident_sees_l2_without_reading_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store =
+            Arc::new(PersistentByteStore::open(dir.path(), 1 << 20).expect("open persistent L2"));
+        let warm = SurvivorRangeCache::with_resolver_and_l2(1 << 20, None, Some(store.clone()));
+        assert!(
+            !warm
+                .is_exact_resident(CacheKind::Other, "seg.pax", 0, 1024)
+                .await
+        );
+        warm.get_or_fetch(CacheKind::Other, "seg.pax", 0, 1024, || async {
+            Ok(vec![7u8; 1024])
+        })
+        .await
+        .unwrap();
+        assert!(
+            warm.is_exact_resident(CacheKind::Other, "seg.pax", 0, 1024)
+                .await
+        );
+
+        // Fresh L1 over the same store: resident via the L2 index only.
+        let evicted = SurvivorRangeCache::with_resolver_and_l2(1 << 20, None, Some(store));
+        assert!(
+            evicted
+                .is_exact_resident(CacheKind::Other, "seg.pax", 0, 1024)
+                .await,
+            "an L2-resident range must classify resident with L1 empty"
+        );
+        assert!(
+            !evicted
+                .is_exact_resident(CacheKind::Other, "seg.pax", 0, 512)
+                .await,
+            "different coordinates are a different key"
+        );
+        let ran = Arc::new(AtomicUsize::new(0));
+        let r = ran.clone();
+        let bytes = evicted
+            .get_or_fetch(CacheKind::Other, "seg.pax", 0, 1024, || async move {
+                r.fetch_add(1, Ordering::SeqCst);
+                Ok(vec![0u8; 1024])
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            ran.load(Ordering::SeqCst),
+            0,
+            "resident ⇒ loader never runs"
+        );
+        assert_eq!(bytes.as_ref(), &[7u8; 1024][..]);
+    }
+
     #[tokio::test]
     async fn peek_memory_exact_key_matches_get_or_fetch() {
         let cache = SurvivorRangeCache::new(16 * 1024 * 1024);

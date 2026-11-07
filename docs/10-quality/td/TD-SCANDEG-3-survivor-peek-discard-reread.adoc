@@ -48,3 +48,17 @@ per-query budget) if plans exceed the tenant's L1 share, otherwise B with
 promotion counted through the same path an un-peeked consume uses. Either way
 `l2_stats()`, per-tenant counters and the io_trace L1/L2 split must match an
 un-peeked consume.
+
+== Update 2026-11-06: exact-key sites resolved by design C
+
+C. Classify on the INDEX, not the bytes. `is_exact_resident` answers from
+DRAM or `PersistentByteStore::entry_len` (no read, no CRC, no recency or
+group-hit side effects). The exact-key planners — Region D, Region A
+(`coarse_probe_survivors`) and the legacy OID tail — use it, so they read a
+resident range once. It carries none of design A's transient memory or
+counter bypass, nor design B's promotion-eviction cascade.
+
+Still open: Region B's `peek_parent_residency`, whose parent-L1 tier returns
+the whole parent region and whose L2 tier is a byte-reading probe. Design C
+applies to its exact-key and parent-key L2 steps only if the parent store
+indexes the sub-range; measure before choosing.
