@@ -101,13 +101,15 @@ ratio is a follow-up (a second family; it doubles cardinality).
   nextest's process-per-test isolation (the project runner) but can fold
   into `other` under a long shared-process `cargo test` run.
 * The TENANT label needs a request io_trace scope (the collection does not).
-  Today only REST v2 records search, gRPC v2 search / search_stream, Arrow
-  Flight and pgwire open one; elsewhere reads label as `shared`.
-  REST v1, AQL, MCP, fusion search, gRPC entity search and `execute_query`
-  open no scope, so their reads label as tenant `shared` and their KRU /
-  object-store meters are not recorded. Opening scopes there is a billing
-  change per surface and is follow-up work. gRPC still records no egress (KOU)
-  inside its scope, unlike REST v2.
+  Today REST v2 records search, gRPC v2 search / search_stream /
+  execute_query / insert / upsert / update / delete, Arrow Flight and pgwire
+  open one; elsewhere reads label as `shared`. REST v1, AQL, MCP, fusion
+  search and gRPC entity search open no scope, so their reads label as
+  tenant `shared` and their KRU / object-store meters are not recorded.
+  Opening scopes there is a billing change per surface and is follow-up
+  work (a tower layer opening the scope for every data-plane RPC is the
+  structural fix). gRPC still records no egress (KOU) inside its scope,
+  unlike REST v2.
 * The gRPC scope also moves gRPC searches' survivor-cache scope from `shared`
   to the tenant (as REST v2 already is), so tenant fair-share floors and
   ceilings now apply to them. After this deploy, entries already resident

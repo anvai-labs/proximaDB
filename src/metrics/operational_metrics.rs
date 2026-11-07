@@ -36,7 +36,13 @@ pub(crate) fn counter(name: &str, help: &str) -> IntCounter {
     })
 }
 
-lazy_static::lazy_static! {
+/// TD-CACHEC-1: registry bound shared with the survivor-cache code (the
+/// metric docs and the LazyLock must not drift).
+pub const SURVIVOR_CACHE_COLLECTION_SERIES_CAP: usize = 200;
+/// TD-CACHEC-1: a pair idle this long gives up its series slot.
+pub const SURVIVOR_CACHE_COLLECTION_SERIES_IDLE_SECS: u64 = 86_400;
+
+lazy_static! {
     /// TD-COMPACT-13: compaction input deletes that failed and are pending
     /// reconciliation. >0 means superseded segments are still serving (cost
     /// defect, results correct) — observable rot, never silent.
@@ -171,8 +177,9 @@ lazy_static! {
     /// the catalog id mapping. Counted
     /// by outcome: `hot` (DRAM), `l2` (persistent local store), `cold`
     /// (loader ran). The per-collection hot-hit ratio the warm-rate SKU
-    /// prices. True counters; at most 200 (tenant, collection) pairs, later
-    /// pairs fold into `other`/`other`.
+    /// prices. True counters; at most
+    /// `SURVIVOR_CACHE_COLLECTION_SERIES_CAP` (tenant, collection) pairs,
+    /// later pairs fold into `other`/`other`.
     pub static ref SURVIVOR_CACHE_COLLECTION_READS_TOTAL: Option<IntCounterVec> = counter_vec(
         "proximadb_survivor_cache_collection_reads_total",
         "Survivor-cache logical lookups (lookup-weighted, not bytes) per stable tenant id and catalog collection id, by outcome (hot|l2|cold)",

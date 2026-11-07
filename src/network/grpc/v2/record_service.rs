@@ -1137,6 +1137,7 @@ impl ProximaRecordService for ProximaRecordServiceImpl {
         request: Request<ProximaRecordBatch>,
     ) -> Result<Response<ProximaRecordBatchResponse>, Status> {
         let tenant_id = grpc_auth::resolved_tenant_id(&request)?;
+        let tenant_stable_id = grpc_auth::tenant_stable_id(&request);
         grpc_auth::enforce_data_plane_request(
             &request,
             "ingest",
@@ -1196,10 +1197,14 @@ impl ProximaRecordService for ProximaRecordServiceImpl {
         lane.require_wal_lane("gRPC InsertRecords")
             .map_err(|e| Status::invalid_argument(e.to_string()))?;
 
-        match self
-            .record_ops
-            .handle_record_batch_for_tenant(rich_batch, Some(tenant_id.as_str()))
-            .await
+        match crate::observability::io_trace::instrument_with_stable_tenant(
+            Some(tenant_id.clone()),
+            tenant_stable_id,
+            "grpc.v2.records.insert_records",
+            self.record_ops
+                .handle_record_batch_for_tenant(rich_batch, Some(tenant_id.as_str())),
+        )
+        .await
         {
             Ok(result) => {
                 if let Some(registry) = &self.segment_registry
@@ -1226,6 +1231,7 @@ impl ProximaRecordService for ProximaRecordServiceImpl {
         request: Request<ProximaRecordBatch>,
     ) -> Result<Response<ProximaRecordBatchResponse>, Status> {
         let tenant_id = grpc_auth::resolved_tenant_id(&request)?;
+        let tenant_stable_id = grpc_auth::tenant_stable_id(&request);
         grpc_auth::enforce_data_plane_request(
             &request,
             "ingest",
@@ -1272,10 +1278,14 @@ impl ProximaRecordService for ProximaRecordServiceImpl {
         lane.require_wal_lane("gRPC UpsertRecords")
             .map_err(|e| Status::invalid_argument(e.to_string()))?;
 
-        match self
-            .record_ops
-            .handle_record_batch_for_tenant(rich_batch, Some(tenant_id.as_str()))
-            .await
+        match crate::observability::io_trace::instrument_with_stable_tenant(
+            Some(tenant_id.clone()),
+            tenant_stable_id,
+            "grpc.v2.records.upsert_records",
+            self.record_ops
+                .handle_record_batch_for_tenant(rich_batch, Some(tenant_id.as_str())),
+        )
+        .await
         {
             Ok(result) => {
                 if let Some(registry) = &self.segment_registry
@@ -1302,6 +1312,7 @@ impl ProximaRecordService for ProximaRecordServiceImpl {
         request: Request<ProximaRecordBatch>,
     ) -> Result<Response<ProximaRecordBatchResponse>, Status> {
         let tenant_id = grpc_auth::resolved_tenant_id(&request)?;
+        let tenant_stable_id = grpc_auth::tenant_stable_id(&request);
         grpc_auth::enforce_data_plane_request(
             &request,
             "ingest",
@@ -1340,10 +1351,14 @@ impl ProximaRecordService for ProximaRecordServiceImpl {
         lane.require_wal_lane("gRPC UpdateRecords")
             .map_err(|e| Status::invalid_argument(e.to_string()))?;
 
-        match self
-            .record_ops
-            .handle_record_batch_for_tenant(rich_batch, Some(tenant_id.as_str()))
-            .await
+        match crate::observability::io_trace::instrument_with_stable_tenant(
+            Some(tenant_id.clone()),
+            tenant_stable_id,
+            "grpc.v2.records.update_records",
+            self.record_ops
+                .handle_record_batch_for_tenant(rich_batch, Some(tenant_id.as_str())),
+        )
+        .await
         {
             Ok(result) => Ok(Response::new(Self::batch_result_to_response(
                 result,
@@ -1363,6 +1378,7 @@ impl ProximaRecordService for ProximaRecordServiceImpl {
         request: Request<ProximaRecordBatch>,
     ) -> Result<Response<ProximaRecordBatchResponse>, Status> {
         let tenant_id = grpc_auth::resolved_tenant_id(&request)?;
+        let tenant_stable_id = grpc_auth::tenant_stable_id(&request);
         grpc_auth::enforce_data_plane_request(
             &request,
             "ingest",
@@ -1408,16 +1424,19 @@ impl ProximaRecordService for ProximaRecordServiceImpl {
         lane.require_wal_lane("gRPC DeleteRecords")
             .map_err(|e| Status::invalid_argument(e.to_string()))?;
 
-        match self
-            .record_ops
-            .handle_record_delete_batch_for_tenant(
+        match crate::observability::io_trace::instrument_with_stable_tenant(
+            Some(tenant_id.clone()),
+            tenant_stable_id,
+            "grpc.v2.records.delete_records",
+            self.record_ops.handle_record_delete_batch_for_tenant(
                 RichRecordDeleteBatchRequest {
                     collection_id: batch.collection_id.clone(),
                     record_ids: record_ids.clone(),
                 },
                 Some(tenant_id.as_str()),
-            )
-            .await
+            ),
+        )
+        .await
         {
             Ok(result) => Ok(Response::new(Self::batch_result_to_response(
                 result,

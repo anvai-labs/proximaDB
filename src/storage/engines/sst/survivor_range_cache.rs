@@ -194,6 +194,14 @@ impl CollectionSeries {
         // counters silently. Request scopes are only StableTenant | Shared
         // (TD-CACHEC-1); anything else is refused, never minted.
         if !matches!(scope, CacheScope::StableTenant(_) | CacheScope::Shared) {
+            static REFUSED_SCOPE_WARNED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !REFUSED_SCOPE_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                tracing::warn!(
+                    scope = %scope.label(),
+                    "survivor-cache per-collection attribution refused a non-canonical                      cache scope (request scopes are StableTenant|Shared only); reads from                      this surface stay unattributed until the caller is fixed"
+                );
+            }
             return;
         }
         let idx = outcome_index(outcome);
@@ -297,7 +305,13 @@ static COLLECTION_SERIES: std::sync::LazyLock<Option<CollectionSeries>> =
     std::sync::LazyLock::new(|| {
         crate::metrics::operational_metrics::SURVIVOR_CACHE_COLLECTION_READS_TOTAL
             .clone()
-            .map(|family| CollectionSeries::new(family, 200, 86_400))
+            .map(|family| {
+                CollectionSeries::new(
+                    family,
+                    crate::metrics::operational_metrics::SURVIVOR_CACHE_COLLECTION_SERIES_CAP,
+                    crate::metrics::operational_metrics::SURVIVOR_CACHE_COLLECTION_SERIES_IDLE_SECS,
+                )
+            })
     });
 
 /// Monotonic seconds since first use (idle eviction clock).
