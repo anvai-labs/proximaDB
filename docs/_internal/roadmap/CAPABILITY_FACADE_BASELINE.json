@@ -1,5 +1,5 @@
 {
-  "total": 1039,
+  "total": 1038,
   "by_file": {
     "apps/proximadb-migrate/src/main.rs": 2,
     "crates/binding/proximadb-embedded/src/lib.rs": 9,
@@ -274,7 +274,6 @@
     "src/query/query_optimizer.rs": 2,
     "src/query/query_router.rs": 5,
     "src/query/read_route.rs": 1,
-    "src/query/rl_planner/integration.rs": 1,
     "src/query/semantic_analysis/analyzer.rs": 5,
     "src/query/sql_frontend/lowering.rs": 4,
     "src/query/sql_frontend/parser.rs": 1,
