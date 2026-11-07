@@ -73,3 +73,11 @@ non-rebuildable I/O error (EIO, permission) stays indexed, so it classifies
 resident and each query pays one unbatched GET for it at consume (it used to
 ride the batched wave). A persistently failing cache disk is an operational
 alarm condition; the store does not evict on such errors today.
+
+Pre-existing, not changed here: the consume step serves whatever the
+exact-key L2 entry holds, through `get_or_fetch`, for Cold and
+resident-classified slots alike — so an entry stored SHORTER than its range
+(a loader that hit end of file) is consumed without a length check, as it was
+before this change. Classification by key presence matches that. Validating
+the served length at consume (fall back to a ranged read on mismatch) is the
+fix if short entries are shown to occur.
