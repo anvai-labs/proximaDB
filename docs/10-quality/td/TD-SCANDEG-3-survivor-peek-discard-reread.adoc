@@ -1,79 +1,50 @@
-= TD-SCANDEG-3: The survivor planner peeks residency, discards the bytes, and re-reads them
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-SCANDEG-3: The survivor planner reads disk-tier peeks twice
 :status: Open
 :date: 2026-11-06
 :tags: [cost, survivor-cache, local-disk, design-decision-needed]
 
-== Problem
+== Verified facts
 
-The coalesced SQ8 survivor planner (`segment_format.rs`, Region B) and the
-Region-D OID-chunk planner classify each planned range with a residency
-peek (`peek_parent_residency` / `peek_exact_residency`). The peek RETURNS the
-bytes; the planner keeps only `.is_some()`, and the consume then reads the
-identical range again through `get_or_fetch_in_parent` / `get_or_fetch`. For
-a peek served from a DISK tier (parent-key L2 or exact-key L2), the full
-local-disk read stack (open + seek + read + CRC) is paid twice per range.
-DRAM-tier peeks cost nothing either way.
+* The coalesced SQ8 survivor planner (Region B) and the Region-D OID-chunk
+  planner classify each range with `peek_parent_residency` /
+  `peek_exact_residency`. The peek RETURNS bytes; the planner keeps only
+  `.is_some()`; the consume reads the same range again. For a disk-tier (L2)
+  peek hit that is the local-disk read stack paid twice per range.
+* The disk-tier probe itself is DELIBERATE and must stay: without it,
+  L1-evicted but L2-resident ranges are classified Cold and re-fetched from
+  object storage (TD-IOBUDGET-2). The fix is to stop reading twice, never to
+  drop the probe.
+* A related, separate billed-GET defect on the legacy OID tail is
+  TD-IOBUDGET-3.
 
-**A worse sibling — a billed GET, not a disk read.** The legacy OID tail and
-its slot planner peek DRAM ONLY (`peek_memory_exact`). A range evicted from
-L1 but still in the exact-key L2 is therefore classified Cold and put in the
-`read_ranges_prefetch_resident` wave — a BILLED object-store GET — and then
-the consume's `get_or_fetch` (whose `get_or_load` checks exact-key L2) serves
-it from L2 without running the loader, discarding the wave bytes. TD-IOBUDGET-2
-fixed exactly this for the Region-D chunk planner by making its peek
-L2-aware; the legacy OID tail never got that fix. This is the higher-priority
-half of this TD: a wasted billed GET per such range.
-
-== The disk-tier probe itself is deliberate — do not remove it
-
-`peek_parent_residency` / `peek_exact_residency` probe the L2 tiers ON
-PURPOSE and document the local-disk read as an accepted cost: without the L2
-step, L1-evicted-but-L2-resident ranges are classified Cold and re-fetched
-from object storage (the TD-IOBUDGET-2 warm-phase billing regression). The
-fix is to stop reading the SAME range twice, never to drop the probe.
-
-== Why it is not fixed yet — two designs, both with measured-in-review costs
-
-#2442 tried both over four adversarial review rounds (that PR was ultimately reduced to these records); each round found the
-chosen design's real cost:
+== Two designs, both tried in #2442 review
 
 [cols="1,2,2",options="header"]
 |===
 | Design | How | Cost found in review
 
 | A. Carry the bytes
-| Planner keeps the peeked `Arc<[u8]>` in the slot and serves it at consume
-  through a peek-aware seam. Caveat: a parent-L1 peek returns the WHOLE
-  parent region, not the range — it must be sliced to `[off, off+len)` (or
-  not carried at all; the DRAM slice is free at consume), and the memory
-  estimate must not count parent hits, which share the cached Arc.
-| Transient memory the old code never held: budget is per arm per segment, so
-  a query at inter-file degree 8 and 2 arms can hold ~2 GiB; the serve
-  bypasses `TenantCache`'s per-tenant and L2 counters; ranges outside the
-  parent region dropped their carried bytes; the seam had to probe L1
-  memory-only or it re-read L2 anyway.
+| Planner keeps the peeked bytes in the slot and serves them at consume
+  through a peek-aware seam.
+| Transient memory the old code never held, sized per arm per segment; the
+  serve bypassed per-tenant and L2 counters; a parent-L1 peek returns the
+  WHOLE parent region, which must be sliced (or not carried).
 
 | B. Promote at peek
 | A disk-tier peek hit inserts the range into L1; the consume's ordinary
   lookup hits L1.
-| The peek stops being side-effect-free: later promotions in one plan can
-  EVICT ranges the planner already classified as resident (or the parent
-  seed), turning them into unbatched object-store GETs at consume; the exact
-  L2 hit bypasses `l2_stats()`; disk-served ranges are recorded as L1 memory
-  hits, inflating the DRAM hit ratio the route costing reads.
+| Later promotions in one plan can evict ranges already classified resident,
+  turning them into unbatched GETs at consume; the exact-L2 hit bypassed
+  `l2_stats()`; disk-served ranges were recorded as L1 memory hits.
 |===
 
-== To close — measure first (co-design mandate: trace before you tune)
+== To close — measure first
 
-Choosing needs a per-query trace on a warm-L2 bed, not more argument:
-
-1. With the current code, record per query: disk-tier peek hits, bytes
-   re-read at consume, and L1 occupancy/eviction during the plan.
-2. If plans regularly exceed the tenant's L1 share, design B's eviction cost
-   dominates → design A with a PER-QUERY (not per-arm-per-segment) budget.
-3. Otherwise design B, with the promotion counted through the same
-   `TenantCache` path the consume would have used, and the planner's
-   residency classification re-checked after promotion.
-
-Either way the accepted fix must keep `l2_stats()`, per-tenant counters and
-the io_trace L1/L2 split identical to an un-peeked consume.
+Record per query on a warm-L2 bed: disk-tier peek hits, bytes re-read at
+consume, and L1 occupancy/evictions during the plan. Pick A (with a
+per-query budget) if plans exceed the tenant's L1 share, otherwise B with
+promotion counted through the same path an un-peeked consume uses. Either way
+`l2_stats()`, per-tenant counters and the io_trace L1/L2 split must match an
+un-peeked consume.

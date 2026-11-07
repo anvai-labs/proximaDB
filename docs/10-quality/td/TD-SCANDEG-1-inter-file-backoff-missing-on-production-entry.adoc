@@ -1,63 +1,45 @@
-= TD-SCANDEG-1: The S2b inter-file concurrency back-off never runs on the production search entry
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-SCANDEG-1: The S2b in-flight back-off is not acquired on the production search entry
 :status: Open
 :date: 2026-11-06
-:tags: [search, concurrency, cpu, io, measure-first]
+:tags: [search, concurrency, investigate-first]
 
-== Finding (verified against the call graph)
+== Verified facts
 
-`resolve_search_parallelism` divides the inter-file scan degree by the
-number of in-flight searches (`IN_FLIGHT_SEARCHES`, S2b). That counter is
-incremented only by `InFlightSearchGuard`, acquired only in
-`search_vectors_unified_arc_inner` — the ARC entry. No PRODUCTION request
-reaches the arc entry: its callers are `SearchCoordinator` (constructed only
-in `coordinator.rs`'s own test module) and tests that call
-`search_vectors_unified_arc` / `fallback_to_direct_search_arc` directly
-(`centroid_directory_search_test.rs`, the S2 multicore equivalence tests in
-`search/mod.rs`). Its doc comment still calls it the "Arc-receiver
-production entry" — that mislabel is what made #2442's premise look right,
-and should be corrected. Production traffic enters through
-`trait_impl.rs` → `search_vectors_unified` → `direct_search_with` (the legacy
-entry), which never acquires the guard. So on server traffic
-`IN_FLIGHT_SEARCHES` is always 0 and every concurrent query uses the full
-default inter-file degree (cores/2).
+* `resolve_search_parallelism` consults `IN_FLIGHT_SEARCHES`, incremented only
+  by `InFlightSearchGuard`, acquired only in `search_vectors_unified_arc_inner`.
+* No production request reaches that arc entry. Its callers are
+  `SearchCoordinator` (constructed only in `coordinator.rs`'s own tests) and
+  tests that call `search_vectors_unified_arc` / `fallback_to_direct_search_arc`
+  directly. Production enters `SstEngine` → `search_vectors_unified` →
+  `direct_search_with`, which never acquires the guard.
+* On the production entry the computed degree does NOT bound the scan: it
+  only selects `enable_parallel = degree > 1`, after which every discovered
+  file is driven with `join_all` on one task. So the S2b division, even if
+  wired, would change behaviour only by flipping that boolean.
+* The arc entry's doc comment called it the "Arc-receiver production entry";
+  corrected in this PR. That mislabel is what made #2442's original premise
+  (fix the "dead back-off on the production arc path") look right.
 
-The intra-file morsel back-off (`INFLIGHT_SCANS` / `ScanGuard`) IS wired on
-the production entry (`direct_search_with` takes `ScanGuard`); only the
-test-only arc entry lacked it, which affects no production traffic.
+== Why there is no fix here
 
-== Why this is not simply "add the guard"
+The production fan-out semantics differ from what S2b assumed. Whether any
+in-flight back-off helps that path is an open question; changing it is a
+posture decision that needs measurement first.
 
-Acquiring the guard on the production entry is a POSTURE change, not a
-defect fix: at client concurrency c it divides every query's inter-file
-degree to roughly cores/2/c. On cold object storage that can REDUCE GET
-overlap and regress p95 at c>1 — the inter-file degree is also an I/O
-concurrency knob, not only a CPU one. The guard's scope also covers non-scan
-work (exact-route decisions, AXIS rebuilds, memtable serves), so idle-in-scan
-queries would shrink everyone's degree.
+== To close — investigate, then decide
 
-#2442 first shipped exactly this change unmeasured (it was framed as fixing
-a "dead production back-off" — a premise that was wrong about which entry is
-production); review caught it, and the PR was reduced to this record.
-
-== To close — measure first
-
-1. On a quiet box, measure QPS + p50/p95 + object-store GETs/query at client
-   concurrency 1/4/8 against the current posture, cold and warm. Preconditions,
-   or both arms are identical and the null result means nothing: the AUTO
-   degree must be in effect (`search_parallel_files = 0` and
-   `PROXIMADB_SEARCH_PARALLEL_FILES` unset — `resolve_search_parallelism`
-   only divides in that case), and the bed needs more live segments than the
-   degree (it is capped at `file_count`).
-2. Only if c>=4 throughput improves without a cold-p95 regression, acquire
-   the guard on the production entry, scoped to the SCAN itself — next to
-   `ScanGuard::enter()` in `direct_search_with`, or a scan helper both entries
-   share. NOT in `scope_discovery_memo`: it wraps the whole search, including
-   the exact-route decision, AXIS rebuilds and memtable/orchestrated serves,
-   so idle-in-non-scan queries would shrink everyone's degree.
-3. Consolidate the two near-duplicate entries (`search_vectors_unified` /
-   `_arc`, `direct_search_with` / `direct_search_arc_with`) — that duplication
-   is how each guard ended up on only one of them. Port the tests that call
-   the arc entry directly (the S2 degree=1-vs-parallel equivalence test and
-   `centroid_directory_search_test.rs`) to the surviving entry first; they are
-   the only coverage of the multi-core inter-file scan. Related: TD-SCANDEG-2 (worker
-   granularity), TD-SCANDEG-3 (peek re-read).
+1. Characterise the production fan-out under load: how many per-file
+   futures are polled concurrently, and what concurrency the object store
+   and CPU actually see, at client concurrency 1/4/8, cold and warm.
+2. Decide from that data whether the production entry needs any bound.
+3. Consolidate the duplicated entries (`search_vectors_unified` / `_arc`,
+   `direct_search_with` / `direct_search_arc_with`). Port every test that
+   calls the arc entry directly to the survivor first, because those tests are
+   the only coverage of their behaviour: the S2 degree-1-vs-parallel
+   equivalence test, `ttl_expired_pax_rows_never_return_live` (a Mandate-16a
+   regression test that today exercises ONLY the test-only entry),
+   `cascade_rehydrate_reuses_the_top_k_block_fetch`, the arc half of
+   `deferred_rehydrate_matches_per_segment`, and
+   `centroid_directory_search_test.rs`.

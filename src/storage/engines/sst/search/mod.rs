@@ -2699,7 +2699,9 @@ self.try_pax_cascade(
         Ok(all_candidates)
     }
 
-    /// TD-SEARCH-2 S2: Arc-receiver production entry. Same routing as
+    /// TD-SEARCH-2 S2: Arc-receiver entry — NOT the production entry: it is
+    /// reached only through `SearchCoordinator` (test-constructed) and tests;
+    /// production goes through `search_vectors_unified` (TD-SCANDEG-1). Same routing as
     /// `search_vectors_unified` (reuses `want_exact_search` +
     /// `use_orchestrated_search`), but the direct-search branch dispatches to
     /// the multi-core `fallback_to_direct_search_arc`. Exact + orchestrated
