@@ -180,30 +180,42 @@ from .unified_client_v2 import connect_embedded
 
 
 # Convenience factory functions
+def _connect(url, defaults, /, **kwargs):
+    """Shared body of the ``connect_*`` factories (2026-11-07 consolidation
+    of five one-kwarg clones + the stamp-free ``connect``).
+
+    ``defaults`` are applied AFTER caller kwargs — the pre-consolidation
+    factories stamped their protocol/port_mode last, silently overriding
+    any caller-supplied value. That overwrite semantics is deliberate and
+    pinned by ``tests/unit/test_connect_factories.py``.
+
+    Params are positional-only so a caller kwarg literally named
+    ``defaults`` flows through ``**kwargs`` to the constructor exactly as
+    it did before the consolidation (where it failed the constructor's
+    fail-closed unknown-kwarg check).
+    """
+    if url:
+        kwargs["url"] = url
+    kwargs.update(defaults)
+    return ProximaDBClient(**kwargs)
+
+
 def connect(url: str = None, **kwargs) -> ProximaDBClient:  # the swapped v2 class
     """Create a ProximaDB client with automatic protocol detection.
 
     Uses unified port mode by default (single port for all protocols).
     """
-    if url:
-        kwargs["url"] = url
-    return ProximaDBClient(**kwargs)
+    return _connect(url, {}, **kwargs)
 
 
 def connect_rest(url: str = None, **kwargs) -> ProximaDBClient:
     """Create a REST-based ProximaDB client"""
-    if url:
-        kwargs["url"] = url
-    kwargs["protocol"] = Protocol.REST
-    return ProximaDBClient(**kwargs)
+    return _connect(url, {"protocol": Protocol.REST}, **kwargs)
 
 
 def connect_grpc(url: str = None, **kwargs) -> ProximaDBClient:
     """Create a gRPC-based ProximaDB client"""
-    if url:
-        kwargs["url"] = url
-    kwargs["protocol"] = Protocol.GRPC
-    return ProximaDBClient(**kwargs)
+    return _connect(url, {"protocol": Protocol.GRPC}, **kwargs)
 
 
 def connect_unified(url: str = None, **kwargs) -> ProximaDBClient:
@@ -215,10 +227,7 @@ def connect_unified(url: str = None, **kwargs) -> ProximaDBClient:
     Example:
         client = connect_unified("http://localhost:5678")
     """
-    if url:
-        kwargs["url"] = url
-    kwargs["port_mode"] = PortMode.UNIFIED
-    return ProximaDBClient(**kwargs)
+    return _connect(url, {"port_mode": PortMode.UNIFIED}, **kwargs)
 
 
 def connect_legacy(url: str = None, **kwargs) -> ProximaDBClient:
@@ -227,10 +236,7 @@ def connect_legacy(url: str = None, **kwargs) -> ProximaDBClient:
     Use this for older deployments with separate ports for REST (5678)
     and gRPC (5679).
     """
-    if url:
-        kwargs["url"] = url
-    kwargs["port_mode"] = PortMode.MULTI
-    return ProximaDBClient(**kwargs)
+    return _connect(url, {"port_mode": PortMode.MULTI}, **kwargs)
 
 
 def connect_arrow_flight(url: str = None, **kwargs) -> ProximaDBClient:
@@ -246,10 +252,7 @@ def connect_arrow_flight(url: str = None, **kwargs) -> ProximaDBClient:
 
     Requires: pip install pyarrow
     """
-    if url:
-        kwargs["url"] = url
-    kwargs["protocol"] = Protocol.ARROW_FLIGHT
-    return ProximaDBClient(**kwargs)
+    return _connect(url, {"protocol": Protocol.ARROW_FLIGHT}, **kwargs)
 
 
 # TD-126 Phase 3: the chunking concern (text chunking, code-aware AST chunking,
