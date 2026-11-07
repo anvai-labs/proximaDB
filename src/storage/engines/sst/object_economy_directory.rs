@@ -938,27 +938,6 @@ impl SstableWriterDirectoryHooks {
     }
 }
 
-/// The collection root the directory sidecar lives under — the DrPath-scoped
-/// collection DATA directory, the same root the flush-side writer uses
-/// (`collection_data_path_typed`). The ONE resolver both sides must use.
-///
-/// The read side used the raw `storage_assignment.base_location` (the tenant
-/// base shared by every collection) while the writer used this data path, so
-/// the reader looked for `{base}/oedir/v0.bin` and never found the
-/// `{base}/accounts/{acct}/{ns}/{coll}/data/oedir/v0.bin` the writer wrote.
-/// The read-side watermark had therefore never loaded a real sidecar: every
-/// strict query on every collection fell back to (0, 0) after a 404
-/// (#2443 review, finding 1).
-pub(crate) fn oedir_collection_root(
-    assignment: &crate::proto::proximadb_v1::StorageAssignment,
-    collection_id: &str,
-) -> String {
-    crate::storage::trait_components::path_resolver::collection_data_path_for_assignment(
-        assignment,
-        collection_id,
-    )
-}
-
 /// Loader-closure helper for [`CachedDirectoryHandle::get_or_load`].
 ///
 /// Construct a [`VectorObjectEconomyDirectoryStore`] from the supplied

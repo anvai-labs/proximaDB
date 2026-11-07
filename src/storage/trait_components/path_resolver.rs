@@ -70,11 +70,13 @@ pub use proximadb_storage_ports::{
 
 /// The collection DATA directory for a catalog storage assignment — the root
 /// every segment, sidecar and read-back path for the collection lives under.
-/// THE single composition of identity + typed path: the flush writer, the
-/// object-economy directory reader and the record read-back all call this, so
-/// they can never resolve different roots again (TD-OEDIRWM-1: the directory
-/// reader composed its own root from the raw `base_location` and never found
-/// what the writer wrote).
+/// The flush writer, the object-economy directory diagnostics loader and the
+/// record read-back resolve their root through this one function, so those
+/// three can never disagree again (TD-OEDIRWM-1: the directory reader used
+/// the raw `base_location` and never found what the writer wrote). Other
+/// sites still compose `typed_identity_from_storage_assignment` +
+/// `collection_data_path_typed` by hand — listed in TD-OEDIRWM-1 for
+/// migration; new code should call this.
 pub fn collection_data_path_for_assignment(
     // The PROTO assignment (what the catalog hands out) — not the
     // storage-ports `StorageAssignment` re-exported above, a different type.

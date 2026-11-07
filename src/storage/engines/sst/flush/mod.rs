@@ -2289,7 +2289,7 @@ mod tests {
         // `collection_root`). They diverged once — the reader used the raw
         // base_location — and the read side never found a sidecar.
         assert_eq!(
-            crate::storage::engines::sst::object_economy_directory::oedir_collection_root(
+            crate::storage::trait_components::path_resolver::collection_data_path_for_assignment(
                 &assignment,
                 "13",
             ),

@@ -2010,8 +2010,11 @@ pub struct SearchFreshnessModes {
     /// `StaleOk`: skip the WAL delta entirely.
     pub stale_ok: bool,
     /// Whether `BoundedStale` is wired with a real time-bound check (vs
-    /// silently degrading to Strong). True since commit e34a06225 wired
-    /// `freshness_watermark_ns` through `scan_wal_delta_if_needed`.
+    /// scanning the delta like Strong). FALSE since TD-OEDIRWM-1: the
+    /// directory watermark is stamped after the flush commits and the sidecar
+    /// is shared across pods while memtables are per-pod, so it cannot
+    /// soundly bound staleness; BoundedStale is served as Strong (correct,
+    /// never stale) until a snapshot-stamped, pod-scoped watermark exists.
     pub bounded_stale_time_bound_check: bool,
 }
 
@@ -2359,7 +2362,9 @@ fn build_route_health_with_live_state(
             strong: true,
             bounded_stale: true,
             stale_ok: true,
-            bounded_stale_time_bound_check: true,
+            // TD-OEDIRWM-1: BoundedStale scans the delta like Strong — the
+            // directory watermark cannot soundly bound staleness.
+            bounded_stale_time_bound_check: false,
         },
         notes: "Per-request freshness modes (strong/bounded_stale/stale_ok) \
                 are honored by the search path; collection-default modes are \
@@ -2677,7 +2682,8 @@ pub async fn get_collection_route_health_v2(
     let cached_object_economy_status = if engine_str == "sst" {
         state
             .vector_operations_service
-            .cached_object_economy_directory_status(&collection_id)
+            .object_economy_directory_status_for_diagnostics(&collection_id)
+            .await
             .as_ref()
             .map(object_economy_status_label)
     } else {
@@ -4171,8 +4177,10 @@ mod tests {
         assert!(h.freshness.search_request_modes.strong);
         assert!(h.freshness.search_request_modes.bounded_stale);
         assert!(h.freshness.search_request_modes.stale_ok);
+        // TD-OEDIRWM-1: honestly reported as NOT wired — BoundedStale is
+        // served as Strong until a sound watermark exists.
         assert!(
-            h.freshness
+            !h.freshness
                 .search_request_modes
                 .bounded_stale_time_bound_check
         );

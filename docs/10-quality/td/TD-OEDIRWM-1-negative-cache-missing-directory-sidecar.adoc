@@ -1,60 +1,64 @@
-= TD-OEDIRWM-1: The directory-watermark reader never found the sidecar; fix the path, negative-cache genuine absence
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-OEDIRWM-1: The query path read a directory watermark it could never soundly use — removed
 :status: Accepted
 :date: 2026-11-06
 :tags: [cost, gets, voe-directory, freshness, correctness]
 
-== Problem
+== Verified facts (#2443 review rounds 1–4)
 
-Every Strong/BoundedStale vector query reads the object-economy directory's
-freshness watermark (`cached_directory_watermark`), loading a per-collection
-sidecar `{collection_root}/oedir/v0.bin` through a cache with a recheck TTL.
-
-. **The reader looked in the wrong place.** It used the raw tenant
-  `storage_assignment.base_location` as `collection_root`; the flush-side
-  writer uses `collection_data_path_typed(base_location, collection_id,
-  identity)` — the DrPath-scoped collection data directory. So the reader
-  looked for `{base}/oedir/v0.bin` and never found the
-  `{base}/accounts/{acct}/{ns}/{coll}/data/oedir/v0.bin` the writer wrote.
-  The read-side watermark had therefore NEVER loaded a real sidecar: every
-  strict query on every collection fell back to watermark (0, 0) after a
-  404, and the delta-scan skip the feature exists for never fired.
-. **Every 404 was retried after each idle gap.** A `Missing` result was
-  cached like any other and dropped by the TTL.
-. **Transient faults were indistinguishable from absence.** Any read error
-  mapped to `Missing`.
-. **The TTL was sliding.** `loaded_at` was re-stamped on every cache hit, so
-  a collection queried at least once per TTL never expired, and the
-  cross-pod staleness bound the TTL exists for never held.
-. **A failed sidecar write skipped invalidation** (`?` returned before
-  `invalidate`), leaving a stale entry over a sidecar that had committed.
+* **Reachability.** Every REST record search reaches the delta merge:
+  canonical handler → `RecordOpsService::handle_record_search_for_tenant` →
+  `VectorOperationsService::search_records_with_tenant_context` →
+  `run_unified_search_v1` → `unified_search_v1` → `unified_search_v1_inner` →
+  `apply_delta_merge_with_explain`, which loaded the object-economy directory
+  sidecar on every Strong / BoundedStale query.
+* **The reader looked in the wrong place.** It used the raw tenant
+  `base_location` as the sidecar root; the flush writer uses the collection
+  DATA path. The reader never found a real sidecar, so every strict query
+  paid a 404 (re-issued after each idle gap) and production NEVER skipped a
+  delta scan on the watermark.
+* **The watermark cannot soundly gate a skip.** It is stamped AFTER the flush
+  commits (not at the flushed snapshot), so rows written during a flush sit
+  behind it; and the sidecar is shared across pods while each memtable is
+  per-pod, so pod A's sidecar would let pod B skip its own unflushed rows (and
+  tombstones) of any age. Fixing the path alone would have ACTIVATED this.
 
 == Decision
 
-* Reader and writer resolve the root through ONE helper,
-  `oedir_collection_root`, pinned by a parity assertion in the existing
-  `flush_storage_path_matches_search_layout_policy` test.
-* `load_with_status` maps only a backend `NotFound` to `Missing`; any other
-  error is the new `DirectoryLoadStatus::Unavailable`, which keeps the
-  ordinary TTL.
-* `Missing` is negative-cached for `NEGATIVE_TTL_FACTOR` (10) x the recheck
-  TTL — long enough to stop the repeated 404, bounded so a sidecar emitted by
-  another pod is still picked up. Correctness-safe: `Missing` yields (0, 0),
-  i.e. "always run the delta scan".
-* `loaded_at` is stamped only on an actual load.
-* `emit_after_flush` invalidates whether the write returned Ok or Err.
-* A cached entry answers before the collection is resolved or a filesystem
-  looked up.
+* **The query path no longer reads the directory.** `(0, 0)` → every
+  Strong/BoundedStale query scans the delta, which is exactly what production
+  already did. Zero sidecar GETs per query.
+* **BoundedStale is served as Strong** (always correct, never stale);
+  route-health reports `bounded_stale_time_bound_check: false` honestly, and
+  EXPLAIN reports the watermark as `None` (not wired), not a fabricated 0.
+* **Diagnostics load on request.** Route-health's live object-economy status
+  loads the sidecar only when the endpoint is called
+  (`object_economy_directory_status_for_diagnostics`), keyed by the canonical
+  `collection.id` to match the writer.
+* **One root composition** — `collection_data_path_for_assignment` — for the
+  flush writer, the diagnostics loader and the record read-back (pinned by a
+  parity assertion). Other hand-composed sites remain: the storage-traits
+  `collection_storage_path`, `services/operations/vectors/read.rs`,
+  `engines/nova/operations/search.rs`, `services/collection/manager.rs`
+  (two sites) — migrate them to the helper.
+* Load mapping: only a backend NotFound is `Missing` (negative-cached at 10x
+  the recheck TTL); any other read error is `Unavailable` (ordinary TTL).
+* Writer: refuses to overwrite a sidecar it could not read (a transient
+  failure no longer truncates every earlier entry to "empty + one"). The
+  refused flush's entry is not re-added later; since the sidecar now feeds
+  diagnostics only, the gap is acceptable and visible as an `Unavailable`
+  warning. `emit_after_flush` invalidates whether the write succeeded or not.
 
-== Rejected: removing the read-side fetch
+== To re-enable a delta-scan skip (future, not planned)
 
-The first cut of #2443 removed the fetch outright. That silently degraded
-BoundedStale to Strong while route-health still advertised the bound, left
-route-health's object-economy live status permanently `not_checked` (the
-fetch was the cache's only production populator), and made EXPLAIN report a
-fabricated watermark. It was reverted in favour of making the feature work.
+Needs a SOUND watermark: stamp the snapshot LSN/ns at flush START, and scope
+it per pod (or fence it by memtable epoch) so a shared sidecar cannot vouch
+for another pod's memtable. Then prove read-your-writes across pods before
+any skip is allowed for Strong.
 
 == Not measured
 
-The GET reduction and the newly-functional delta-scan skip are derived from
-the mechanism (request counts by inspection), not from a per-query trace; no
+The GET reduction (one sidecar GET per strict query per idle gap → zero) is
+derived from the code path, not a per-query trace; no
 `BENCHMARK_EVIDENCE.toml` entry is claimed.
