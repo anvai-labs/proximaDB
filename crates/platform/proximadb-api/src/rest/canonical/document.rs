@@ -18,8 +18,8 @@ use proximadb_proto::v1::{
     DeleteDocumentCollectionRequest, DeleteDocumentRequest, DocIndexType, DocumentCollectionConfig,
     DocumentFilter, DocumentUpdate, GetDocumentRequest, GroupStage, IndexDefinition,
     InsertDocumentRequest, LimitStage, ListDocumentCollectionsRequest, LookupStage, MatchStage,
-    ProjectStage, QueryDocumentsRequest, SkipStage, SortStage, SqlArray, SqlObject, SqlValue,
-    UnwindStage, UpdateDocumentRequest, UpdateOperation, aggregation_stage::Stage as AggStage,
+    ProjectStage, QueryDocumentsRequest, SkipStage, SortStage, SqlObject, SqlValue, UnwindStage,
+    UpdateDocumentRequest, UpdateOperation, aggregation_stage::Stage as AggStage,
 };
 use proximadb_runtime::DocumentPort;
 use serde::{Deserialize, Serialize};
@@ -631,37 +631,10 @@ pub fn json_to_sql_object(value: &serde_json::Value) -> RestResult<SqlObject> {
     }
 }
 
-pub fn json_to_sql_value(value: &serde_json::Value) -> SqlValue {
-    use proximadb_proto::v1::sql_value::Value;
-
-    let inner = match value {
-        serde_json::Value::Null => Some(Value::NullValue(0)),
-        serde_json::Value::Bool(b) => Some(Value::BoolValue(*b)),
-        serde_json::Value::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                Some(Value::Int64Value(i))
-            } else if let Some(f) = n.as_f64() {
-                Some(Value::NumberValue(f))
-            } else {
-                Some(Value::StringValue(n.to_string()))
-            }
-        }
-        serde_json::Value::String(s) => Some(Value::StringValue(s.clone())),
-        serde_json::Value::Array(arr) => {
-            let values: Vec<SqlValue> = arr.iter().map(json_to_sql_value).collect();
-            Some(Value::ArrayValue(SqlArray { values }))
-        }
-        serde_json::Value::Object(map) => {
-            let fields: HashMap<String, SqlValue> = map
-                .iter()
-                .map(|(k, v)| (k.clone(), json_to_sql_value(v)))
-                .collect();
-            Some(Value::ObjectValue(SqlObject { fields }))
-        }
-    };
-
-    SqlValue { value: inner }
-}
+// Simple-format JSON → SqlValue conversion is canonical in proximadb-proto
+// (`serde_impls::json_to_sql_value`); this crate's REST ingest paths
+// previously carried a byte-identical private copy. Re-exported here.
+pub use proximadb_proto::serde_impls::json_to_sql_value;
 
 use proximadb_records::conversions::sql_value_to_json;
 

@@ -56,39 +56,9 @@ use proximadb_data_model::{ProximaValue, TimeUnit};
 use proximadb_records::{EmbeddingCell, ProximaRecord, ProximaTreeNode};
 
 #[cfg(test)]
-/// Convert a JSON value to SqlValue for legacy conversion tests.
-fn json_to_sql_value(value: &serde_json::Value) -> crate::proto::proximadb_v1::SqlValue {
-    use crate::proto::proximadb_v1::sql_value::Value;
-    use crate::proto::proximadb_v1::{SqlArray, SqlObject, SqlValue};
-
-    let inner = match value {
-        serde_json::Value::Null => Value::NullValue(0),
-        serde_json::Value::Bool(b) => Value::BoolValue(*b),
-        serde_json::Value::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                Value::Int64Value(i)
-            } else if let Some(f) = n.as_f64() {
-                Value::NumberValue(f)
-            } else {
-                Value::StringValue(n.to_string())
-            }
-        }
-        serde_json::Value::String(s) => Value::StringValue(s.clone()),
-        serde_json::Value::Array(arr) => {
-            let values: Vec<SqlValue> = arr.iter().map(json_to_sql_value).collect();
-            Value::ArrayValue(SqlArray { values })
-        }
-        serde_json::Value::Object(obj) => {
-            let fields: HashMap<String, SqlValue> = obj
-                .iter()
-                .map(|(k, v)| (k.clone(), json_to_sql_value(v)))
-                .collect();
-            Value::ObjectValue(SqlObject { fields })
-        }
-    };
-
-    SqlValue { value: Some(inner) }
-}
+/// Convert a JSON value to SqlValue for legacy conversion tests — canonical
+/// conversion in proximadb-proto (this was a test-only local copy).
+use crate::proto::serde_impls::json_to_sql_value;
 
 #[cfg(test)]
 /// Convert a JSON value to a FilterClause value.

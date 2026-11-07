@@ -237,25 +237,8 @@ impl<'de> Deserialize<'de> for SqlValue {
         // 1. Proto format: {"string_value": "test"}, {"number_value": 42}
         // 2. Simple format: "test", 42, true, null (MVP-friendly)
         let value = match &json_value {
-            // Handle simple primitive types directly (MVP-friendly format)
-            serde_json::Value::String(s) => Some(SqlValueVariant::StringValue(s.clone())),
-            serde_json::Value::Bool(b) => Some(SqlValueVariant::BoolValue(*b)),
-            serde_json::Value::Null => Some(SqlValueVariant::NullValue(0)),
-            serde_json::Value::Number(n) => {
-                // Prefer integer if it fits, otherwise use float
-                if let Some(i) = n.as_i64() {
-                    Some(SqlValueVariant::Int64Value(i))
-                } else {
-                    n.as_f64().map(SqlValueVariant::NumberValue)
-                }
-            }
-            serde_json::Value::Array(arr) => {
-                // Convert JSON array to SqlArray
-                let values: Vec<SqlValue> = arr.iter().filter_map(json_to_sql_value).collect();
-                Some(SqlValueVariant::ArrayValue(
-                    crate::proto::proximadb_v1::SqlArray { values },
-                ))
-            }
+            // Non-object kinds are exactly the shared simple-format
+            // conversion (see json_to_sql_value below).
             serde_json::Value::Object(obj) => {
                 // Check for proto-style wrapped values first
                 if let Some(v) = obj.get("string_value")
@@ -336,52 +319,64 @@ impl<'de> Deserialize<'de> for SqlValue {
                     });
                 }
 
-                // Treat as a generic object (MVP-friendly nested object)
-                let fields: std::collections::HashMap<String, SqlValue> = obj
-                    .iter()
-                    .filter_map(|(k, v)| json_to_sql_value(v).map(|sv| (k.clone(), sv)))
-                    .collect();
-                Some(SqlValueVariant::ObjectValue(
-                    crate::proto::proximadb_v1::SqlObject { fields },
-                ))
+                // Treat as a generic object (MVP-friendly nested object):
+                // the shared conversion's Object branch does exactly this.
+                return Ok(json_to_sql_value(&json_value));
             }
+            // Every non-object kind is the shared simple-format conversion.
+            _ => json_to_sql_value(&json_value).value,
         };
 
         Ok(SqlValue { value })
     }
 }
 
-/// Helper function to convert serde_json::Value to SqlValue
-fn json_to_sql_value(json: &serde_json::Value) -> Option<SqlValue> {
+/// Simple-format conversion from `serde_json::Value` to [`SqlValue`].
+///
+/// Canonical copy (2026-11-07) of a conversion that previously existed in
+/// five drifting variants across the workspace (api document ingest,
+/// embedded, REST v2 tests, arrow conversion, and this crate's
+/// `Deserialize` impl). Objects become `ObjectValue` and arrays
+/// `ArrayValue` — proto-style tagged objects (`{"string_value": ...}`) are
+/// NOT unwrapped here; only [`Deserialize for SqlValue`] does that.
+///
+/// Number handling: integers that fit `i64` become exact `Int64Value`;
+/// everything else approximates as f64 `NumberValue` (for u64 >
+/// `i64::MAX` the alternative shipped previously was a silent wraparound).
+/// The `StringValue` fallback is unreachable for numbers serde_json can
+/// parse without `arbitrary_precision`; it exists so the fn is total and
+/// lossless if that feature is ever enabled (pinned by the test below).
+pub fn json_to_sql_value(json: &serde_json::Value) -> SqlValue {
     let value = match json {
-        serde_json::Value::String(s) => Some(SqlValueVariant::StringValue(s.clone())),
-        serde_json::Value::Bool(b) => Some(SqlValueVariant::BoolValue(*b)),
-        serde_json::Value::Null => Some(SqlValueVariant::NullValue(0)),
+        serde_json::Value::String(s) => SqlValueVariant::StringValue(s.clone()),
+        serde_json::Value::Bool(b) => SqlValueVariant::BoolValue(*b),
+        serde_json::Value::Null => SqlValueVariant::NullValue(0),
         serde_json::Value::Number(n) => {
             if let Some(i) = n.as_i64() {
-                Some(SqlValueVariant::Int64Value(i))
+                SqlValueVariant::Int64Value(i)
             } else {
-                n.as_f64().map(SqlValueVariant::NumberValue)
+                n.as_f64()
+                    .map(SqlValueVariant::NumberValue)
+                    .unwrap_or(SqlValueVariant::StringValue(n.to_string()))
             }
         }
         serde_json::Value::Array(arr) => {
-            let values: Vec<SqlValue> = arr.iter().filter_map(json_to_sql_value).collect();
-            Some(SqlValueVariant::ArrayValue(
-                crate::proto::proximadb_v1::SqlArray { values },
-            ))
+            SqlValueVariant::ArrayValue(crate::proto::proximadb_v1::SqlArray {
+                values: arr.iter().map(json_to_sql_value).collect(),
+            })
         }
         serde_json::Value::Object(obj) => {
-            let fields: std::collections::HashMap<String, SqlValue> = obj
-                .iter()
-                .filter_map(|(k, v)| json_to_sql_value(v).map(|sv| (k.clone(), sv)))
-                .collect();
-            Some(SqlValueVariant::ObjectValue(
-                crate::proto::proximadb_v1::SqlObject { fields },
-            ))
+            SqlValueVariant::ObjectValue(crate::proto::proximadb_v1::SqlObject {
+                fields: obj
+                    .iter()
+                    .map(|(k, v)| (k.clone(), json_to_sql_value(v)))
+                    .collect(),
+            })
         }
     };
-    value.map(|v| SqlValue { value: Some(v) })
+    SqlValue { value: Some(value) }
 }
+
 impl Serialize for PropertyValue {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -1027,5 +1022,74 @@ impl<'de> Deserialize<'de> for PropertyConstraint {
         }
 
         Ok(PropertyConstraint { constraint: None })
+    }
+}
+
+#[cfg(test)]
+mod json_to_sql_value_tests {
+    use super::*;
+
+    /// Pins the number-fallback decision. The reachable u64-above-i64::MAX
+    /// case must approximate as f64 `NumberValue` — the pre-consolidation
+    /// embedded path silently wrapped it to `Int64Value(i as i64)`.
+    #[test]
+    fn huge_u64_approximates_as_number_value() {
+        let big = serde_json::json!(u64::MAX);
+        assert_eq!(
+            json_to_sql_value(&big).value,
+            Some(SqlValueVariant::NumberValue(u64::MAX as f64))
+        );
+
+        // Small u64s still hit the exact i64 path first.
+        let small = serde_json::json!(42u64);
+        assert_eq!(
+            json_to_sql_value(&small).value,
+            Some(SqlValueVariant::Int64Value(42))
+        );
+
+        let neg = serde_json::json!(-7i64);
+        assert_eq!(
+            json_to_sql_value(&neg).value,
+            Some(SqlValueVariant::Int64Value(-7))
+        );
+    }
+
+    /// Simple forms + nesting convert without surprises.
+    #[test]
+    fn simple_and_nested_forms_convert() {
+        assert_eq!(
+            json_to_sql_value(&serde_json::json!("s")).value,
+            Some(SqlValueVariant::StringValue("s".into()))
+        );
+        assert_eq!(
+            json_to_sql_value(&serde_json::json!(true)).value,
+            Some(SqlValueVariant::BoolValue(true))
+        );
+        assert_eq!(
+            json_to_sql_value(&serde_json::json!(null)).value,
+            Some(SqlValueVariant::NullValue(0))
+        );
+
+        let nested = serde_json::json!({"a": [1, "x", true], "b": {"c": 2.5}});
+        let Some(SqlValueVariant::ObjectValue(obj)) = json_to_sql_value(&nested).value else {
+            panic!("top level must convert to ObjectValue");
+        };
+        let Some(SqlValue {
+            value: Some(SqlValueVariant::ArrayValue(arr)),
+        }) = obj.fields.get("a")
+        else {
+            panic!("field 'a' must convert to ArrayValue");
+        };
+        assert_eq!(arr.values.len(), 3);
+        let Some(SqlValue {
+            value: Some(SqlValueVariant::ObjectValue(inner)),
+        }) = obj.fields.get("b")
+        else {
+            panic!("field 'b' must convert to nested ObjectValue");
+        };
+        assert_eq!(
+            inner.fields.get("c").and_then(|v| v.value.clone()),
+            Some(SqlValueVariant::NumberValue(2.5))
+        );
     }
 }
