@@ -236,7 +236,7 @@ test-only (`#[cfg(test)]`, TD-SCANDEG-1). Production SST search enters at
 
 **Location**: `src/storage/engines/sst/search/coordinator.rs` (test-only)
 
-The Search Coordinator provides intelligent strategy selection for optimal query performance:
+In test builds, the Search Coordinator selects among these strategies (historical design; not on the production path):
 
 ```rust
 pub enum SearchStrategy {

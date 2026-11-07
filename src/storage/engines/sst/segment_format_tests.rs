@@ -6311,20 +6311,22 @@ impl Drop for TraceGetsGuard {
     }
 }
 
-/// Run one coalesced search through `survivor` and return the physical GET
-/// trace it produced.
+/// Run one coalesced search through `survivor`; return its `(oid,
+/// distance)` hits and the physical GET trace it produced.
 async fn traced_coalesced_search(
     fs: &dyn proximadb_storage_filesystem_types::FileSystem,
     path: &str,
     query: &[f32],
     survivor: &SurvivorRangeCache,
-) -> Vec<(CacheTier, u64)> {
+) -> (Vec<(String, f32)>, Vec<(CacheTier, u64)>) {
     let _ = drain_get_trace();
-    rabitq_search_segment_coalesced(fs, path, query, 5, RankMetric::L2, None, Some(survivor))
-        .await
-        .expect("coalesced search")
-        .expect("coalesced segment");
-    drain_get_trace()
+    let hits =
+        rabitq_search_segment_coalesced(fs, path, query, 5, RankMetric::L2, None, Some(survivor))
+            .await
+            .expect("coalesced search")
+            .expect("coalesced segment");
+    let hits = hits.into_iter().map(|h| (h.oid, h.distance)).collect();
+    (hits, drain_get_trace())
 }
 
 #[tokio::test]
@@ -6345,14 +6347,18 @@ async fn l2_resident_oid_tail_ranges_are_not_refetched() {
         Arc::new(PersistentByteStore::open(dir.path().join("l2"), 1 << 24).expect("open L2 store"));
 
     let warm = SurvivorRangeCache::with_resolver_and_l2(1 << 24, None, Some(store.clone()));
-    let first = traced_coalesced_search(&fs, path, &corpus[7], &warm).await;
+    let (cold_hits, first) = traced_coalesced_search(&fs, path, &corpus[7], &warm).await;
     assert!(
         first.iter().any(|(t, _)| *t == CacheTier::ResultPayload),
         "non-vacuity: the cold search must GET the OID tail: {first:?}"
     );
 
     let evicted = SurvivorRangeCache::with_resolver_and_l2(1 << 24, None, Some(store));
-    let second = traced_coalesced_search(&fs, path, &corpus[7], &evicted).await;
+    let (warm_hits, second) = traced_coalesced_search(&fs, path, &corpus[7], &evicted).await;
+    assert_eq!(
+        warm_hits, cold_hits,
+        "L2-served bytes must rank identically"
+    );
     let oid_gets: Vec<_> = second
         .iter()
         .filter(|(t, _)| *t == CacheTier::ResultPayload)
@@ -6379,16 +6385,22 @@ async fn l2_resident_region_a_probe_ranges_are_not_refetched() {
         Arc::new(PersistentByteStore::open(dir.path().join("l2"), 1 << 24).expect("open L2 store"));
 
     // No invariants cache: its Region-A range lookup would otherwise serve
-    // the probe before the survivor-cache peek is reached.
+    // the probe before the survivor-cache peek is reached. In production the
+    // survivor path is taken whenever the invariants cache does not hold the
+    // segment's Region A (e.g. a segment this pod never seeded).
     let warm = SurvivorRangeCache::with_resolver_and_l2(1 << 24, None, Some(store.clone()));
-    let first = traced_coalesced_search(&fs, &path, &corpus[7], &warm).await;
+    let (cold_hits, first) = traced_coalesced_search(&fs, &path, &corpus[7], &warm).await;
     assert!(
         first.iter().any(|(t, _)| *t == CacheTier::ProbeIndex),
         "non-vacuity: the cold search must GET Region A: {first:?}"
     );
 
     let evicted = SurvivorRangeCache::with_resolver_and_l2(1 << 24, None, Some(store));
-    let second = traced_coalesced_search(&fs, &path, &corpus[7], &evicted).await;
+    let (warm_hits, second) = traced_coalesced_search(&fs, &path, &corpus[7], &evicted).await;
+    assert_eq!(
+        warm_hits, cold_hits,
+        "L2-served bytes must rank identically"
+    );
     let probe_gets: Vec<_> = second
         .iter()
         .filter(|(t, _)| *t == CacheTier::ProbeIndex)
