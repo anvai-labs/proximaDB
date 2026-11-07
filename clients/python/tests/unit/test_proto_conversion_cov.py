@@ -340,7 +340,6 @@ class TestProtoDriftGuard:
         int-literal -> "name" dict entries and compares each to the proto.
         """
         import re
-
         from pathlib import Path
 
         sdk_src = Path(__file__).parents[2] / "src" / "proximadb_sdk"
