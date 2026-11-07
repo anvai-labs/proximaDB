@@ -226,9 +226,9 @@ pub struct VectorObjectEconomyExplain {
     /// existing `freshness_mode` (which is the projection-side label).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub freshness_mode_used: Option<String>,
-    /// Current WAL cursor observed at query plan time. Compared
-    /// against `freshness_watermark_lsn` to decide whether a delta
-    /// scan was needed. `None` when no source was wired.
+    /// WAL cursor read when the delta scan ran. Informational only: no
+    /// watermark gates the scan since TD-OEDIRWM-1. `None` when the cursor
+    /// was not read (StaleOk, or no manifest service registered).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_lsn_at_query: Option<u64>,
 }

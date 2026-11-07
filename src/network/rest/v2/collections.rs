@@ -2258,7 +2258,9 @@ fn compute_degraded_reasons(
     if !filtered_ann.post_filter_shortfall_disclosure {
         reasons.push(DegradedReason::PostFilterShortfallNotDisclosed);
     }
-    if !object_economy.live_status_in_app_state {
+    // Only an eligible route can be "not reachable"; since TD-OEDIRWM-1 no
+    // engine is eligible, so this no longer flags every collection.
+    if object_economy.eligible && !object_economy.live_status_in_app_state {
         reasons.push(DegradedReason::ObjectEconomyLiveStatusNotReachable);
     }
     if object_economy.eligible
@@ -4268,7 +4270,6 @@ mod tests {
             0,
         );
         let expected = vec![
-            DegradedReason::ObjectEconomyLiveStatusNotReachable,
             DegradedReason::FreshnessModesNotCollectionLevel,
             DegradedReason::ConditionalWritesUnsupported,
             DegradedReason::FilterWritesUnsupported,
@@ -5175,7 +5176,8 @@ mod tests {
             vec![
                 DegradedReason::FilteredAnnRecordPredicateBridgePartial,
                 DegradedReason::PostFilterShortfallNotDisclosed,
-                DegradedReason::ObjectEconomyLiveStatusNotReachable,
+                // Not ObjectEconomyLiveStatusNotReachable: the route is
+                // ineligible, so it cannot be "not reachable".
                 DegradedReason::RecallProbeNotWired,
                 DegradedReason::FreshnessModesNotCollectionLevel,
                 DegradedReason::ConditionalWritesUnsupported,

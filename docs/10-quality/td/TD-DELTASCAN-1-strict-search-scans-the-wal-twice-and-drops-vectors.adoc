@@ -1,0 +1,60 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-DELTASCAN-1: A strict vector search scans the unflushed WAL twice, and the second, vector-less scan can strip vectors from unflushed hits
+:status: Open
+:date: 2026-11-07
+:tags: [correctness, freshness, wal, search, cost]
+
+== Verified facts (code trace, `develop` after TD-OEDIRWM-1)
+
+* **Stage 1 already covers the unflushed WAL on every query.**
+  `VectorOperationsService::execute_unified_plan`
+  (`src/services/operations/vectors/legacy.rs`) takes one
+  `unflushed_snapshot`, scores it with `score_unflushed(..,
+  include_vectors = true, include_metadata = true)`, and merges it with the
+  AXIS and storage legs through `reconcile_against_wal_state`, which applies
+  the get-by-id MVCC rule and tombstone suppression (mandate 16d).
+* **Strong and BoundedStale then scan the WAL a second time.**
+  `apply_delta_merge_with_explain` → `scan_wal_delta_if_needed` calls
+  `search_unflushed_vectors(.., include_vectors = false, ..)`, takes a NEW
+  snapshot, and merges the result with Stage 1's output through
+  `merge_delta_with_directory_results`.
+* **The second copy wins an exact tie.** That merge tags the delta as
+  `CandidateSource::Wal` and Stage 1's output as `Storage`; `supersedes`
+  resolves an exact `updated_at` tie by source priority, so the delta's
+  vector-less copy of an unflushed row replaces Stage 1's copy, which has
+  its vector. A Strong search with `include_vectors = true` can therefore
+  return an unflushed hit without its vector. Servers always have a manifest
+  service, so this applies to server traffic today.
+* With no manifest service (embedded/test processes) the second scan is
+  skipped and Stage 1's copy stands. #2449 briefly made that path scan
+  as well, which would have extended the defect there; it was reverted
+  before merge.
+
+Not yet reproduced end to end: the lib-test service harness
+(`index_first_search_tests::create_test_service`) cannot run a full search
+("No storage URL in context"), so a regression test needs a harness that
+wires a storage URL, or a server-level e2e test.
+
+== What the second scan contributes
+
+Its only distinct effect is a LATER snapshot: a write that lands between
+Stage 1's snapshot and the delta scan becomes visible to that query.
+Tombstone suppression and the MVCC winner rule are already applied by
+Stage 1. The cost is a second snapshot and a second scoring pass per strict
+query.
+
+== Options
+
+. Remove the second scan for queries whose results come from
+  `execute_unified_plan`, keeping EXPLAIN's `wal_delta_*` fields fed from
+  Stage 1's numbers. Confirm first that every `apply_delta_merge_with_explain`
+  caller runs Stage 1, and decide whether the later-snapshot window matters
+  (Strong's contract is read-after-write for writes that completed before
+  the query started, which Stage 1 already satisfies).
+. Or keep it, but pass `include_vectors` through, or make an exact
+  `updated_at` tie keep the copy that carries a vector.
+
+Option 1 is the subtraction; prefer it if the caller audit holds.
+
+Related: TD-OEDIRWM-1.
