@@ -207,30 +207,6 @@ mod tests {
         assert!(coordinator.validate_flush_parameters(&params).is_err());
     }
 
-    /// Regression: SstEngine MUST NOT emit Vector Object Economy
-    /// directory updates by default. The conservative-by-design
-    /// constructor-injection model means a freshly-constructed engine
-    /// is silent until `with_directory_cache(...)` is called by
-    /// SharedServices. Flipping this default would silently turn on
-    /// directory writes for every test and bench harness.
-    #[tokio::test]
-    async fn sst_engine_default_does_not_emit_directory() {
-        use crate::storage::engines::sst::object_economy_directory::VectorObjectEconomyDirectoryCache;
-        use std::sync::Arc;
-
-        // Default construction: no directory cache configured.
-        let engine = create_test_engine().await;
-        assert!(
-            !engine.directory_cache_configured(),
-            "freshly-constructed SstEngine must NOT emit directory updates"
-        );
-
-        // Opt in via builder — accessor flips.
-        let cache = Arc::new(VectorObjectEconomyDirectoryCache::new());
-        let engine_opted_in = create_test_engine().await.with_directory_cache(cache);
-        assert!(engine_opted_in.directory_cache_configured());
-    }
-
     async fn create_test_engine() -> SstEngine {
         let config = SstConfig::default();
         let filesystem_config =

@@ -451,19 +451,6 @@ impl SstEngine {
         // Count entries for writing
         let entries_written = sorted_vectors.len() as u64;
 
-        // Captured outcome from the underlying writer. M1-3 (ADR-049): the only
-        // arm that populated this (legacy ProximaBlocks streaming) is retired, so
-        // it is always `None` today — the object-economy directory emission below
-        // stays dormant until the PAX writer grows an equivalent outcome
-        // (`write_pax_segment_full` returns `PaxSegmentMeta`, not
-        // `SstableWriteOutcome`). Kept wired so the directory hook revives
-        // unchanged when that lands.
-        // TD-RDSTRAT-5 S2: set from the PAX write when block clustering produced
-        // per-block centroids, so the object-economy directory emission below fires
-        // (write-through of the vector zone-map). Stays `None` when clustering is
-        // off (empty centroids) ⇒ no emission — S2 is default-OFF via the S1 flag.
-        let mut write_outcome: Option<crate::storage::engines::sst::writer::SstableWriteOutcome> =
-            None;
         let cache_on_write = std::env::var("PROXIMADB_CACHE_ON_WRITE")
             .ok()
             .and_then(|value| crate::core::config::CacheOnWritePolicy::parse(&value))
@@ -622,13 +609,6 @@ impl SstEngine {
                     .context("Failed to write PAX vector segment")?
                 };
                 tracing::debug!(blocks = meta.block_count, "PAX segment write completed");
-                // TD-RDSTRAT-5 S2: when block clustering produced per-block centroids,
-                // build an outcome from the segment metadata so the directory emission
-                // below fires with the real vector zone-map. Empty centroids (clustering
-                // off) ⇒ no outcome ⇒ no emission (default-OFF).
-                if !meta.block_centroids.is_empty() {
-                    write_outcome = Some(pax_write_outcome(&meta));
-                }
             }
         }
 
@@ -729,71 +709,6 @@ impl SstEngine {
             bytes = bytes_written,
             "SST flush atomic commit done"
         );
-
-        // Vector Object Economy directory emission (Phase 4, option 1-B).
-        // Emit at the final URL — staging is irrelevant once the atomic
-        // commit succeeded. Skipped entirely when:
-        //   * The engine was constructed without `with_directory_cache`.
-        //   * The block format doesn't carry index metadata (ArrowBlock).
-        //   * The flush carries no collection_id (defensive — validation
-        //     already rejected this case, but keep the guard explicit).
-        // Conservative defaults: storage_epoch=0, freshness_lsn=0,
-        // authority_mode=RebuildableProjection until WAL/manifest sources
-        // are plumbed. Emit failures log and continue — directory is a
-        // rebuildable projection and must not fail the flush.
-        if let (Some(cache), Some(outcome), Some(collection_id)) = (
-            self.directory_cache_ref(),
-            write_outcome.as_ref(),
-            params.collection_id.as_ref(),
-        ) {
-            use crate::storage::engines::sst::object_economy_directory::SstableWriterDirectoryHooks;
-            use proximadb_catalog::CatalogAuthorityMode;
-
-            // Resolve the freshness watermark from the configured source
-            // when present. Without a source the engine emits `0`, which
-            // forces strong-route readers to always re-scan the WAL delta.
-            let freshness_lsn = match self.freshness_lsn_source_ref() {
-                Some(source) => source.current_lsn(collection_id.as_str()).await,
-                None => 0,
-            };
-
-            let hooks = SstableWriterDirectoryHooks {
-                cache: cache.clone(),
-                collection_id: collection_id.clone(),
-                collection_root: storage_url.to_string(),
-                storage_epoch: 0,
-                authority_mode: CatalogAuthorityMode::RebuildableProjection,
-                freshness_lsn,
-                level: 0,
-            };
-            let final_file_url = format!("{}/{}", atomic_op.final_url, filename);
-            let fs_handle = self.filesystem().get_filesystem(&final_file_url)?;
-            if let Err(err) = hooks
-                .emit_after_flush(
-                    &*fs_handle,
-                    &final_file_url,
-                    &final_file_url,
-                    outcome.file_size_bytes,
-                    outcome.block_index_offset,
-                    outcome.block_index_size,
-                    &outcome.index_entries,
-                )
-                .await
-            {
-                tracing::warn!(
-                    "SST Flush: directory emission failed for {} ({}); read-side \
-                     route will degrade to embedded-index path until next flush rebuilds",
-                    final_file_url,
-                    err
-                );
-            } else {
-                tracing::debug!(
-                    "SST Flush: emitted object-economy directory entry for {} (collection={})",
-                    final_file_url,
-                    collection_id
-                );
-            }
-        }
 
         let final_file_path = format!("{}/{}", atomic_op.final_url, filename);
 
@@ -1848,119 +1763,6 @@ fn resolve_pax_rerank_quant(tags: &[String]) -> proximadb_block_format::VectorQu
             _ => proximadb_block_format::VectorQuant::Sq8,
         }
     })
-}
-
-/// TD-RDSTRAT-5 S2: build an [`SstableWriteOutcome`] from a freshly-written PAX
-/// segment's [`SegmentMeta`], so the Vector Object Economy directory emission can
-/// fire with real per-block centroids. The PAX writer lives in a lower crate and
-/// can't construct `IndexEntry` (defined here), so we assemble the entries at the
-/// flush seam from the metadata the writer already returned:
-///
-/// * per-block **offset** = cumulative sum of `block_stats[..i].block_size_bytes`
-///   (blocks are written contiguously from offset 0), **size** = that block's bytes;
-/// * per-block **centroid** = `block_centroids[i]` (the S1 vector zone-map);
-/// * **block_index_offset** = Σ block sizes (the segment index starts after the
-///   last block), **block_index_size** = `size_bytes − Σ − len(SEGMENT_MAGIC)`.
-///
-/// Only the fields the directory consumes are set; the rest default (PAX carries
-/// no key bloom / key ranges — those are the retired ProximaBlocks path's).
-fn pax_write_outcome(
-    meta: &proximadb_storage_common::pax_block::SegmentMeta,
-) -> crate::storage::engines::sst::writer::SstableWriteOutcome {
-    use crate::storage::engines::sst::{IndexEntry, VectorFormat};
-    let mut entries = Vec::with_capacity(meta.block_stats.len());
-    // ADR-062/065: in the coalesced layout the Region D data blocks begin after
-    // the header-prefix + RaBitQ region (A) + SQ8 region (B)
-    // (`rabitq_off + rabitq_len + sq8_len`); for the legacy layout all are 0, so
-    // blocks start at offset 0 (unchanged). Block offsets recorded here are
-    // absolute file offsets (the VOE directory / read path).
-    let mut offset = meta.rabitq_off + meta.rabitq_len + meta.sq8_len;
-    for (block_id, stats) in meta.block_stats.iter().enumerate() {
-        let centroid = meta
-            .block_centroids
-            .get(block_id)
-            .cloned()
-            .unwrap_or_default();
-        let vector_format = if centroid.is_empty() {
-            VectorFormat::Variable
-        } else {
-            VectorFormat::Fixed {
-                dimension: centroid.len(),
-            }
-        };
-        // Lever-3: per-block RMS radius (0.0 when the writer didn't compute
-        // centroids, or for a Fp32-less block) — 1:1 with block_centroids.
-        let block_radius = meta.block_radii.get(block_id).copied().unwrap_or(0.0);
-        entries.push(IndexEntry {
-            offset,
-            size: stats.block_size_bytes,
-            block_id: block_id as u32,
-            block_centroid: centroid,
-            block_radius,
-            vector_format,
-            ..Default::default()
-        });
-        offset += stats.block_size_bytes as u64;
-    }
-    // `offset` is now Σ block sizes = where the segment index begins.
-    let block_index_offset = offset;
-    let magic = proximadb_storage_common::pax_block::SEGMENT_MAGIC.len() as u64;
-    let block_index_size = meta.size_bytes.saturating_sub(block_index_offset + magic) as u32;
-    crate::storage::engines::sst::writer::SstableWriteOutcome {
-        index_entries: entries,
-        block_index_offset,
-        block_index_size,
-        file_size_bytes: meta.size_bytes,
-        record_count: meta.row_count,
-    }
-}
-
-#[cfg(test)]
-mod pax_write_outcome_tests {
-    use super::pax_write_outcome;
-    use proximadb_block_format::BlockStats;
-    use proximadb_storage_common::pax_block::SegmentMeta;
-
-    fn stats(size: u32) -> BlockStats {
-        // `from_metas` with no column metas yields a BlockStats carrying just the
-        // row/size framing this helper reads (BlockStats has no Default).
-        BlockStats::from_metas(2, size, 0, 0, &[])
-    }
-
-    /// The outcome carries one IndexEntry per block with cumulative offsets, the
-    /// S1 centroids threaded through, and a self-consistent segment-index frame
-    /// (Σ sizes + index + 8-byte magic == file size).
-    #[test]
-    fn builds_entries_with_cumulative_offsets_and_centroids() {
-        let meta = SegmentMeta {
-            path: std::path::PathBuf::from("seg.pax"),
-            size_bytes: 100 + 8 + 12, // Σ(40+60) blocks + 12 index + 8 magic
-            block_count: 2,
-            row_count: 4,
-            block_stats: vec![stats(40), stats(60)],
-            block_centroids: vec![vec![1.0, 1.0], vec![2.0, 2.0]],
-            block_radii: vec![0.5, 1.5],
-            rabitq_off: 0,
-            rabitq_len: 0,
-            sq8_off: 0,
-            sq8_len: 0,
-        };
-        let out = pax_write_outcome(&meta);
-        assert_eq!(out.index_entries.len(), 2);
-        assert_eq!(out.index_entries[0].offset, 0);
-        assert_eq!(out.index_entries[0].size, 40);
-        assert_eq!(out.index_entries[1].offset, 40, "cumulative from block 0");
-        assert_eq!(out.index_entries[1].size, 60);
-        assert_eq!(out.index_entries[0].block_centroid, vec![1.0, 1.0]);
-        assert_eq!(out.index_entries[1].block_centroid, vec![2.0, 2.0]);
-        // TD-WLP-3: the per-block RMS radius is carried 1:1 into the entries.
-        assert_eq!(out.index_entries[0].block_radius, 0.5);
-        assert_eq!(out.index_entries[1].block_radius, 1.5);
-        assert_eq!(out.block_index_offset, 100, "Σ block sizes");
-        assert_eq!(out.block_index_size, 12, "size − Σ − 8 magic");
-        assert_eq!(out.file_size_bytes, 120);
-        assert_eq!(out.record_count, 4);
-    }
 }
 
 #[cfg(test)]
