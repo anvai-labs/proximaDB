@@ -2715,11 +2715,13 @@ self.try_pax_cascade(
             // scope (only the spawn site re-binds), so the in-parent scans of
             // THIS branch need the scope too — a single-file host or
             // single-core degree must attribute the same as the spawned path.
-            for discovered in &sstable_files {
-                let scan = crate::storage::engines::sst::survivor_range_cache::with_read_collection(
-                    collection_id,
-                    async {
-                        self.scan_single_file(
+            // One scope around the loop: every file here shares the search's
+            // collection id (mirrors the spawned branch's single re-bind).
+            crate::storage::engines::sst::survivor_range_cache::with_read_collection(
+                collection_id,
+                async {
+                    for discovered in &sstable_files {
+                        let scan = self.scan_single_file(
                             &discovered.url,
                             &collection,
                             &query_arc[..],
@@ -2734,20 +2736,21 @@ self.try_pax_cascade(
                             use_vectorized,
                             discovered.size_bytes,
                             deferred.as_deref(),
-                        )
-                        .await
-                    },
-                );
-                let cells = directory_cells.get(&discovered.url).cloned();
-                match scope_directory_cells(cells, scan).await {
-                    Ok(recs) => all_candidates.extend(recs),
-                    Err(e) => Self::handle_per_file_scan_failure(
-                        &discovered.url,
-                        &e,
-                        prune_config.force_exact,
-                    )?,
-                }
-            }
+                        );
+                        let cells = directory_cells.get(&discovered.url).cloned();
+                        match scope_directory_cells(cells, scan).await {
+                            Ok(recs) => all_candidates.extend(recs),
+                            Err(e) => Self::handle_per_file_scan_failure(
+                                &discovered.url,
+                                &e,
+                                prune_config.force_exact,
+                            )?,
+                        }
+                    }
+                    anyhow::Ok(())
+                },
+            )
+            .await?;
         }
 
         // --- merge + finalize (mirrors fallback_to_direct_search) ---

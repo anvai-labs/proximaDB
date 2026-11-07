@@ -50,8 +50,12 @@ GETs were unbilled.
   logical lookup that returned bytes; it replaced the five inline
   `record_survivor_l1s` sites. The in-parent loader site records the REAL
   outcome, in io_trace too (a deliberate change): it hard-coded a miss even
-  when a concurrent fill or the exact-key L2 served the lookup. That fix only matters under a concurrent-fill race, so
-  no deterministic test pins it. Failed loads keep each seam's existing io_trace
+  when a concurrent fill served the lookup. Scope note: only the
+  concurrent-fill MemoryHit case changes io_trace — an exact-key L2
+  `PersistentHit` still records an io_trace miss (an L1 miss), so io_trace
+  survivor hit/miss measures DRAM hit-rate, not persistence hit-rate. The
+  fix only matters under a concurrent-fill race, so no deterministic test
+  pins it. Failed loads keep each seam's existing io_trace
   accounting: the in-parent seam counts a miss, `get_or_fetch` records nothing.
   They are never attributed. Changing L1 semantics is out of scope here.
 * `proximadb_survivor_cache_collection_reads_total{tenant_stable_id,

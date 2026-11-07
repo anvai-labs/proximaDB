@@ -199,7 +199,7 @@ impl CollectionSeries {
             if !REFUSED_SCOPE_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
                 tracing::warn!(
                     scope = %scope.label(),
-                    "survivor-cache per-collection attribution refused a non-canonical                      cache scope (request scopes are StableTenant|Shared only); reads from                      this surface stay unattributed until the caller is fixed"
+                    "survivor-cache attribution refused a non-canonical cache scope (request scopes are StableTenant|Shared only); reads from this surface stay unattributed until the caller is fixed"
                 );
             }
             return;
@@ -228,8 +228,18 @@ impl CollectionSeries {
                 Ok(guard) => guard,
                 Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
                 Err(std::sync::TryLockError::WouldBlock) => {
-                    self.overflow_counters()[idx].inc();
-                    return;
+                    // The at-cap decision came from a lock-free count read: a
+                    // concurrent eviction may have freed a slot since, and a
+                    // minter's microsecond mint would hold the lock now. If
+                    // the registry is below cap on re-check, block on the
+                    // lock and admit into the lookup's OWN series; only a
+                    // genuinely-full registry folds into the aggregate.
+                    if self.admitted_count.load(Relaxed) < self.cap {
+                        self.admit_lock.lock().unwrap_or_else(|p| p.into_inner())
+                    } else {
+                        self.overflow_counters()[idx].inc();
+                        return;
+                    }
                 }
             }
         } else {
