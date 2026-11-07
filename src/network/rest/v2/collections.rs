@@ -2153,10 +2153,10 @@ impl ColdServingHealth {
     }
 }
 
-/// Object-economy directory state. Since TD-OEDIRWM-1 the SST flush no longer
-/// writes the directory sidecar and the query path never read it, so for SST
-/// this reports `directory_format_present: false` and `live_status:
-/// "not_checked"`. The shape is kept unchanged for the response contract.
+/// Object-economy directory state. Since TD-OEDIRWM-1 no engine produces or
+/// reads the directory, so every engine reports `eligible: false`,
+/// `directory_format_present: false` and `live_status: "not_applicable"`. The
+/// shape is kept unchanged for the response contract.
 #[derive(Debug, Serialize, PartialEq)]
 pub struct ObjectEconomyHealth {
     pub eligible: bool,

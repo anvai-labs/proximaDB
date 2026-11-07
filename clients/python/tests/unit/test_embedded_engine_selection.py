@@ -5,10 +5,10 @@ code indexing" — but `create_collection` never sent it, so the server applied
 `engine = "auto"` and every embedded collection was created on HELIX regardless
 of configuration.
 
-That is not a cosmetic default. Engine choice gates capability server-side
-(`object_economy_eligible` requires "sst"), and PAX-based features such as the
-filter-aware cascade exist only on the SST path — so a caller asking for SST and
-silently getting HELIX loses functionality without any signal.
+That is not a cosmetic default. Engine choice gates capability server-side:
+PAX-based features such as the filter-aware cascade exist only on the SST path —
+so a caller asking for SST and silently getting HELIX loses functionality
+without any signal.
 """
 
 import pytest
