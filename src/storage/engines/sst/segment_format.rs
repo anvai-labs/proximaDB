@@ -4738,7 +4738,11 @@ async fn coarse_probe_survivors(
         match survivor_cache {
             Some(sc)
                 if sc
-                    .peek_memory_exact(CacheKind::Other, path, fetch.start, len)
+                    // TD-IOBUDGET-3: L2-aware — a range evicted from L1 but
+                    // resident in the exact-key L2 store must not join the
+                    // billed cold wave (get_or_fetch would serve it from L2 and
+                    // drop the wave bytes).
+                    .peek_exact_residency(CacheKind::Other, path, fetch.start, len)
                     .await
                     .is_some() =>
             {
@@ -4905,7 +4909,7 @@ async fn coarse_probe_survivors(
             }
             Slot::Ready(b) => std::sync::Arc::from(b.clone()),
             Slot::SurvivorCached => {
-                // peek_memory_exact said resident, but an LRU race could have
+                // peek_exact_residency said resident, but an LRU race could have
                 // evicted before we reach the consume call; fail safe to a real
                 // ranged read (the baseline shape), never panic.
                 let sc = match survivor_cache {
@@ -6378,7 +6382,8 @@ pub async fn rabitq_search_segment_coalesced_allowed(
         let oid_fetches = plan_coalesced_block_ranges(&footer, &topk_blocks, &oid_policy);
         // TD-RDSTRAT-12 §3 round 4: peek·batch·feed for the OID tail (mirror of
         // W1; plain exact-key seam — no parent tier here). Classification via the
-        // existing side-effect-free `peek_memory_exact`; one bounded-concurrent
+        // L2-aware `peek_exact_residency` (TD-IOBUDGET-3: a DRAM-only peek sent
+        // L2-resident ranges into the billed wave); one bounded-concurrent
         // wave for the true-cold block ranges (D4 bound: min(INFLIGHT,N) ×
         // max_range_bytes ≤ 128 MiB transient).
         enum OidSlot {
@@ -6391,7 +6396,7 @@ pub async fn rabitq_search_segment_coalesced_allowed(
             match survivor_cache {
                 Some(sc)
                     if sc
-                        .peek_memory_exact(
+                        .peek_exact_residency(
                             CacheKind::Other,
                             path,
                             fetch.start,

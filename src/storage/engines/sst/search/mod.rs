@@ -28,6 +28,7 @@
 //! - Search coordination and optimization
 //! - File discovery and routing logic
 
+#[cfg(test)] // TD-SCANDEG-1 #4: test-only; production uses search_vectors_unified
 pub mod coordinator;
 pub(crate) mod deferred;
 pub mod operations;
@@ -348,13 +349,16 @@ fn adaptive_degree(base: u16, in_flight: usize) -> u16 {
 
 /// S2b: RAII guard - increments on acquire, decrements on drop. Lives for the
 /// search scope so every exit path (return, ?, unwind) decrements correctly.
+#[cfg(test)] // TD-SCANDEG-1 #4: test-only; production uses search_vectors_unified
 struct InFlightSearchGuard;
+#[cfg(test)] // TD-SCANDEG-1 #4: test-only; production uses search_vectors_unified
 impl InFlightSearchGuard {
     fn acquire() -> Self {
         IN_FLIGHT_SEARCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Self
     }
 }
+#[cfg(test)] // TD-SCANDEG-1 #4: test-only; production uses search_vectors_unified
 impl Drop for InFlightSearchGuard {
     fn drop(&mut self) {
         IN_FLIGHT_SEARCHES.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
@@ -375,6 +379,7 @@ use proximadb_index_traits::{
     IndexHybridQuery, IndexMetadataFilter, IndexSearchEffort, IndexVectorQuery,
 };
 
+#[cfg(test)] // TD-SCANDEG-1 #4: test-only; production uses search_vectors_unified
 pub use coordinator::SearchCoordinator;
 pub use operations::SearchOperations;
 pub use optimizer::SearchOptimizer;
@@ -2221,6 +2226,7 @@ self.try_pax_cascade(
     /// pipeline/morsel/vectorized/scalar). A `&self` helper so the multi-core
     /// `tokio::spawn` path can call it via a cloned `Arc<SstEngine>` (`&*arc`)
     /// — `tokio::spawn` needs `'static`, which a borrowing `&self` closure is not.
+    #[cfg(test)] // TD-SCANDEG-1 #4: test-only; production uses search_vectors_unified
     async fn scan_single_file(
         &self,
         sstable_path: &str,
@@ -2457,6 +2463,7 @@ self.try_pax_cascade(
     /// `scan_single_file` via `&*arc`. Recall-neutral (independent per-file
     /// scans + order-independent `BoundedPriorityQueue` merge). `degree == 1` /
     /// single file stays sequential (no spawn overhead).
+    #[cfg(test)] // TD-SCANDEG-1 #4: test-only; production uses search_vectors_unified
     pub async fn fallback_to_direct_search_arc(
         self: std::sync::Arc<Self>,
         ctx: &StorageQueryContext,
@@ -2501,6 +2508,7 @@ self.try_pax_cascade(
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[cfg(test)] // TD-SCANDEG-1 #4: test-only; production uses search_vectors_unified
     async fn direct_search_arc_with(
         self: std::sync::Arc<Self>,
         ctx: &StorageQueryContext,
@@ -2714,6 +2722,7 @@ self.try_pax_cascade(
     /// the multi-core `fallback_to_direct_search_arc`. Exact + orchestrated
     /// branches delegate to the existing `&self` methods (no spawn needed:
     /// exact is a single segment; orchestrated is in-memory AXIS).
+    #[cfg(test)] // TD-SCANDEG-1 #4: test-only; production uses search_vectors_unified
     pub async fn search_vectors_unified_arc(
         self: std::sync::Arc<Self>,
         ctx: &StorageQueryContext,
@@ -2721,6 +2730,7 @@ self.try_pax_cascade(
         scope_discovery_memo(self.search_vectors_unified_arc_inner(ctx)).await
     }
 
+    #[cfg(test)] // TD-SCANDEG-1 #4: test-only; production uses search_vectors_unified
     async fn search_vectors_unified_arc_inner(
         self: std::sync::Arc<Self>,
         ctx: &StorageQueryContext,
@@ -4106,20 +4116,28 @@ mod tests {
                 user_context: None,
                 tenant_context: None,
             };
-            let results = engine
-                .clone()
-                .search_vectors_unified_arc(&ctx)
-                .await
+            // TD-SCANDEG-1 #5: the PRODUCTION entry (`search_vectors_unified`
+            // -> `direct_search_with`) as well as the test-only arc entry.
+            for arc_entry in [false, true] {
+                let results = if arc_entry {
+                    engine.clone().search_vectors_unified_arc(&ctx).await
+                } else {
+                    engine.search_vectors_unified(&ctx).await
+                }
                 .unwrap();
-            assert!(!results.is_empty(), "{mode:?}: live rows must be found");
-            for r in &results {
-                if r.id == "expired" {
-                    assert!(
-                        r.is_dead(now_ns),
-                        "{mode:?}: an expired PAX row came back LIVE (valid_to_ns={:?}) — \
-                         the service merge cannot drop it",
-                        r.valid_to_ns
-                    );
+                assert!(
+                    !results.is_empty(),
+                    "{mode:?} arc_entry={arc_entry}: live rows must be found"
+                );
+                for r in &results {
+                    if r.id == "expired" {
+                        assert!(
+                            r.is_dead(now_ns),
+                            "{mode:?} arc_entry={arc_entry}: an expired PAX row came back \
+                             LIVE (valid_to_ns={:?}) — the service merge cannot drop it",
+                            r.valid_to_ns
+                        );
+                    }
                 }
             }
         }

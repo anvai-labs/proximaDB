@@ -344,7 +344,9 @@ pub use blocks::SstRecord;
 pub use collections::CollectionSizeInfo;
 pub use core::SstEngine;
 pub use flush::{FlushCoordinator, FlushOperations, FlushOptimizer, SortStats};
-pub use search::{SearchCoordinator, SearchOperations, SearchOptimizer};
+#[cfg(test)]
+pub use search::SearchCoordinator;
+pub use search::{SearchOperations, SearchOptimizer};
 pub use utils::{MemoryEstimate, SortingStats, SstableFileInfo, SstableFileUtils};
 
 // Tiering integration exports (opt-in feature)

@@ -1,7 +1,7 @@
 // Copyright (C) 2026 ProximaDB
 // SPDX-License-Identifier: Apache-2.0
 = TD-IOBUDGET-3: DRAM-only residency peeks pay a billed GET for L2-resident ranges (legacy OID tail, Region-A coarse probe)
-:status: Open
+:status: Resolved
 :date: 2026-11-06
 :tags: [cost, billing, survivor-cache, object-store]
 
@@ -29,3 +29,23 @@ TD-IOBUDGET-2 did for Region D, each with a test that keeps the L2 entry
 PRESENT and asserts no wave GET is issued for it.
 
 Related: TD-IOBUDGET-2, TD-SCANDEG-3.
+
+== Resolution (2026-11-06)
+
+Both sites now classify with the L2-aware `peek_exact_residency` (the
+TD-IOBUDGET-2 Region-D shape); the consume arms are unchanged. Regression
+tests `l2_resident_oid_tail_ranges_are_not_refetched` and
+`l2_resident_region_a_probe_ranges_are_not_refetched`
+(`segment_format_tests.rs`) warm L2 through one cache, search again through a
+fresh cache over the same store, and assert zero `ResultPayload` /
+`ProbeIndex` GETs; each fails with the DRAM-only peek.
+
+Reachability (traced from `search_vectors_unified` -> `direct_search_with`
+-> `try_pax_cascade` -> `rabitq_search_segment_coalesced_allowed`): Region A
+runs with default settings on two-level segments (probe ON); the legacy OID
+tail is narrower (non-RG segments, plus deferral off or a deferred-resolve
+retry, plus a hand-off over its fetch budget).
+
+Residual, unchanged: the peek reads L2 and the consume reads it again — the
+local-disk double read tracked as TD-SCANDEG-3 (measure-first). No billed GET
+remains.
