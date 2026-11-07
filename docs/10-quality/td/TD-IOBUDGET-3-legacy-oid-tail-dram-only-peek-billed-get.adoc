@@ -1,7 +1,7 @@
 // Copyright (C) 2026 ProximaDB
 // SPDX-License-Identifier: Apache-2.0
 = TD-IOBUDGET-3: DRAM-only residency peeks pay a billed GET for L2-resident ranges (legacy OID tail, Region-A coarse probe)
-:status: Open
+:status: Resolved
 :date: 2026-11-06
 :tags: [cost, billing, survivor-cache, object-store]
 
@@ -29,3 +29,55 @@ TD-IOBUDGET-2 did for Region D, each with a test that keeps the L2 entry
 PRESENT and asserts no wave GET is issued for it.
 
 Related: TD-IOBUDGET-2, TD-SCANDEG-3.
+
+== Resolution (2026-11-06)
+
+Both sites — and Region D, which TD-IOBUDGET-2 had moved to a byte-reading
+L2 peek — now classify with `SurvivorRangeCache::is_exact_resident`: DRAM, or
+the exact-key L2 INDEX (`PersistentByteStore::touch_entry_len`: key
+presence plus an LRU recency tick). Ticks are always >= 2 while a newly
+inserted entry sits at 1, so a classified-resident range outranks every
+newly inserted entry — including the same query's write-through puts. (A
+re-put of an EXISTING key ticks too, as on develop.) Store eviction policy for
+new inserts is otherwise unchanged; its no-aging admission problem is
+TD-L2ADMIT-1.
+
+Accepted latency trade: when Region A is wholly L2-resident the probe has no
+cold Region-A wave, so the D5 same-wave Region-B extents and the footer no
+longer ride one; they are fetched as their own round trip. Billed GET count
+is unchanged or lower; latency can rise by one object-store RTT. No bytes are read
+to classify, so a resident range is read once (at consume), classification
+costs map lookups rather than serial disk reads, and no L2 group-hit stats
+are double-counted. The consume arms are unchanged; a classification that
+goes stale before consume falls back to one ranged GET (the existing
+fail-safe). The DRAM-only `peek_memory_exact` and the byte-reading
+`peek_exact_residency` are deleted. Regression
+tests `l2_resident_oid_tail_ranges_are_not_refetched` and
+`l2_resident_region_a_probe_ranges_are_not_refetched`
+(`segment_format_tests.rs`) warm L2 through one cache, search again through a
+fresh cache over the same store, and assert zero `ResultPayload` /
+`ProbeIndex` GETs; each fails with the DRAM-only peek.
+
+Reachability (traced from `search_vectors_unified` -> `direct_search_with`
+-> `try_pax_cascade` -> `rabitq_search_segment_coalesced_allowed`): Region A
+runs with default settings on two-level segments (probe ON); the legacy OID
+tail is narrower (non-RG segments, plus deferral off or a deferred-resolve
+retry, plus a hand-off over its fetch budget).
+
+Accepted residual: an L2 entry evicted between classification and consume
+(the recency tick makes this unlikely, but a write-through burst can still
+exceed it) costs one unbatched ranged GET instead of riding the wave.
+
+Accepted residual: an L2 entry whose file keeps failing with a
+non-rebuildable I/O error (EIO, permission) stays indexed, so it classifies
+resident and each query pays one unbatched GET for it at consume (it used to
+ride the batched wave). A persistently failing cache disk is an operational
+alarm condition; the store does not evict on such errors today.
+
+Pre-existing, not changed here: the consume step serves whatever the
+exact-key L2 entry holds, through `get_or_fetch`, for Cold and
+resident-classified slots alike — so an entry stored SHORTER than its range
+(a loader that hit end of file) is consumed without a length check, as it was
+before this change. Classification by key presence matches that. Validating
+the served length at consume (fall back to a ranged read on mismatch) is the
+fix if short entries are shown to occur.

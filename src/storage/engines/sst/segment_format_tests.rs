@@ -6276,3 +6276,137 @@ async fn small_rabitq_segment(
         .unwrap();
     (dir, path, fs)
 }
+
+// ---- TD-IOBUDGET-3: L1-evicted, L2-resident ranges must not be re-GET ------
+//
+// Both tests warm an exact-key L2 store through cache A, then search again
+// through a FRESH cache B over the same store (L1 empty, L2 resident — the
+// state after an L1 eviction or a restart). A DRAM-only peek classified those
+// ranges cold and paid a billed wave GET whose bytes `get_or_fetch` then
+// dropped because L2 served the range.
+
+/// Sets `PROXIMADB_TRACE_GETS=1` for the test and removes it on drop — even
+/// when an assertion panics — so later tests in the same process never see a
+/// leaked trace switch.
+struct TraceGetsGuard(Option<String>);
+impl TraceGetsGuard {
+    fn on() -> Self {
+        let previous = std::env::var("PROXIMADB_TRACE_GETS").ok();
+        // SAFETY: nextest (the supported runner) gives each test its own
+        // process. Under `cargo test`, non-#[serial] tests elsewhere share the
+        // env and the global GET trace — run these under nextest.
+        unsafe { std::env::set_var("PROXIMADB_TRACE_GETS", "1") };
+        Self(previous)
+    }
+}
+impl Drop for TraceGetsGuard {
+    fn drop(&mut self) {
+        // SAFETY: as in `on`. Restores a caller-exported value.
+        unsafe {
+            match &self.0 {
+                Some(v) => std::env::set_var("PROXIMADB_TRACE_GETS", v),
+                None => std::env::remove_var("PROXIMADB_TRACE_GETS"),
+            }
+        }
+    }
+}
+
+/// Run one coalesced search through `survivor`; return its `(oid,
+/// distance)` hits and the physical GET trace it produced.
+async fn traced_coalesced_search(
+    fs: &dyn proximadb_storage_filesystem_types::FileSystem,
+    path: &str,
+    query: &[f32],
+    survivor: &SurvivorRangeCache,
+) -> (Vec<(String, f32)>, Vec<(CacheTier, u64)>) {
+    let _ = drain_get_trace();
+    let hits =
+        rabitq_search_segment_coalesced(fs, path, query, 5, RankMetric::L2, None, Some(survivor))
+            .await
+            .expect("coalesced search")
+            .expect("coalesced segment");
+    let hits = hits.into_iter().map(|h| (h.oid, h.distance)).collect();
+    (hits, drain_get_trace())
+}
+
+#[tokio::test]
+#[serial]
+async fn l2_resident_oid_tail_ranges_are_not_refetched() {
+    use crate::storage::persistence::filesystem::local::{LocalConfig, LocalFileSystem};
+
+    let _trace = TraceGetsGuard::on();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let seg = dir.path().join("oid-tail-l2.pax");
+    // rg_layout = false: no v4 OID chunks, so the legacy OID tail runs.
+    let corpus = write_oid_failure_fixture(&seg, false);
+    let path = seg.to_str().expect("utf8 path");
+    let fs = LocalFileSystem::new(LocalConfig::default())
+        .await
+        .expect("local filesystem");
+    let store =
+        Arc::new(PersistentByteStore::open(dir.path().join("l2"), 1 << 24).expect("open L2 store"));
+
+    let warm = SurvivorRangeCache::with_resolver_and_l2(1 << 24, None, Some(store.clone()));
+    let (cold_hits, first) = traced_coalesced_search(&fs, path, &corpus[7], &warm).await;
+    assert!(
+        first.iter().any(|(t, _)| *t == CacheTier::ResultPayload),
+        "non-vacuity: the cold search must GET the OID tail: {first:?}"
+    );
+
+    let evicted = SurvivorRangeCache::with_resolver_and_l2(1 << 24, None, Some(store));
+    let (warm_hits, second) = traced_coalesced_search(&fs, path, &corpus[7], &evicted).await;
+    assert_eq!(
+        warm_hits, cold_hits,
+        "L2-served bytes must rank identically"
+    );
+    let oid_gets: Vec<_> = second
+        .iter()
+        .filter(|(t, _)| *t == CacheTier::ResultPayload)
+        .collect();
+    assert!(
+        oid_gets.is_empty(),
+        "L2-resident OID ranges must be served from L2, not re-GET: {oid_gets:?}"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn l2_resident_region_a_probe_ranges_are_not_refetched() {
+    use crate::storage::persistence::filesystem::local::{LocalConfig, LocalFileSystem};
+
+    let _trace = TraceGetsGuard::on();
+    let (corpus, records) = same_wave_fixture();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = write_same_wave_segment(dir.path(), "region-a-l2.pax", &records);
+    let fs = LocalFileSystem::new(LocalConfig::default())
+        .await
+        .expect("local filesystem");
+    let store =
+        Arc::new(PersistentByteStore::open(dir.path().join("l2"), 1 << 24).expect("open L2 store"));
+
+    // No invariants cache: its Region-A range lookup would otherwise serve
+    // the probe before the survivor-cache peek is reached. In production the
+    // survivor path is taken whenever the invariants cache does not hold the
+    // segment's Region A (e.g. a segment this pod never seeded).
+    let warm = SurvivorRangeCache::with_resolver_and_l2(1 << 24, None, Some(store.clone()));
+    let (cold_hits, first) = traced_coalesced_search(&fs, &path, &corpus[7], &warm).await;
+    assert!(
+        first.iter().any(|(t, _)| *t == CacheTier::ProbeIndex),
+        "non-vacuity: the cold search must GET Region A: {first:?}"
+    );
+
+    let evicted = SurvivorRangeCache::with_resolver_and_l2(1 << 24, None, Some(store));
+    let (warm_hits, second) = traced_coalesced_search(&fs, &path, &corpus[7], &evicted).await;
+    assert_eq!(
+        warm_hits, cold_hits,
+        "L2-served bytes must rank identically"
+    );
+    let probe_gets: Vec<_> = second
+        .iter()
+        .filter(|(t, _)| *t == CacheTier::ProbeIndex)
+        .collect();
+    assert!(
+        probe_gets.is_empty(),
+        "L2-resident Region-A ranges must be served from L2, not re-GET: {probe_gets:?}"
+    );
+}

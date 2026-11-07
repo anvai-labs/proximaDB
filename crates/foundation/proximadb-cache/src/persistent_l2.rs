@@ -281,6 +281,27 @@ impl PersistentByteStore {
         self.inner.entries.get(key).map(|meta| meta.value_len)
     }
 
+    /// [`Self::entry_len`] that also refreshes the entry's LRU recency — the
+    /// residency CLASSIFICATION probe (TD-IOBUDGET-3). A range a planner
+    /// classifies resident is about to be read; without the tick, the same
+    /// query's write-through `put`s for its cold ranges would evict exactly
+    /// those untouched entries first. Index-only: no disk read, no CRC, no
+    /// protection-group hit (the consume read records that once).
+    pub fn touch_entry_len(&self, key: &str) -> Option<u64> {
+        let meta = self.inner.entries.get(key)?;
+        meta.touch.store(self.next_tick(), Ordering::Relaxed);
+        Some(meta.value_len)
+    }
+
+    /// Test support: an entry's LRU recency tick.
+    #[cfg(test)]
+    fn touch_of(&self, key: &str) -> Option<u64> {
+        self.inner
+            .entries
+            .get(key)
+            .map(|meta| meta.touch.load(Ordering::Relaxed))
+    }
+
     /// Whether any protection group is registered (lock-free). With none,
     /// no grant asks for residency (SC4-4 read fast path).
     pub fn policy_active(&self) -> bool {
@@ -1105,8 +1126,13 @@ impl PersistentByteStore {
         removed
     }
 
+    /// Recency tick for a READ or classification. Always >= 2: new entries
+    /// (and entries restored at open) sit at touch 1, so any entry that has
+    /// been read or classified resident since outranks every never-read one
+    /// in LRU eviction (scan resistance), with no tie against them to fall
+    /// to hash order (TD-IOBUDGET-3).
     fn next_tick(&self) -> u64 {
-        self.inner.clock.fetch_add(1, Ordering::Relaxed)
+        self.inner.clock.fetch_add(1, Ordering::Relaxed) + 1
     }
 
     fn entry_path(&self, key: &str) -> PathBuf {
@@ -1879,6 +1905,69 @@ mod tests {
     };
     use std::io::{Seek, SeekFrom, Write};
     use std::sync::Arc;
+
+    /// TD-IOBUDGET-3: a never-read entry sits at tick 1; classification
+    /// (`touch_entry_len`) and reads tick strictly above it, even on a fresh
+    /// store whose clock has not advanced.
+    #[tokio::test]
+    async fn classification_ticks_above_every_never_read_entry() {
+        let dir = tempfile::tempdir().expect("test tempdir");
+        let store = PersistentByteStore::open(dir.path(), 1 << 20).expect("open");
+        let value: Arc<[u8]> = Arc::from(vec![1u8; 64].as_slice());
+        for key in ["a", "b"] {
+            store
+                .put(key, L2Class::Survivor, value.clone())
+                .await
+                .expect("put");
+        }
+        assert_eq!(store.touch_of("a"), Some(1), "a new entry is never-read");
+        assert_eq!(store.touch_entry_len("a"), Some(64));
+        let classified = store.touch_of("a").expect("indexed");
+        assert!(
+            classified > store.touch_of("b").expect("indexed"),
+            "classified entry {classified} must outrank the never-read tick"
+        );
+    }
+
+    /// TD-IOBUDGET-3: `touch_entry_len` refreshes recency without a read, so
+    /// a classified-resident entry outlives an older untouched one when the
+    /// next write-through forces an eviction.
+    #[tokio::test]
+    async fn touch_entry_len_protects_a_classified_entry_from_lru_eviction() {
+        let dir = tempfile::tempdir().expect("test tempdir");
+        let value: Arc<[u8]> = Arc::from(vec![1u8; 4096].as_slice());
+        let one = PersistentByteStore::stored_size("a", 4096);
+        // Room for two entries, not three.
+        let store = PersistentByteStore::open(dir.path(), one * 2 + one / 2).expect("open");
+        for key in ["a", "b"] {
+            store
+                .put(key, L2Class::Survivor, value.clone())
+                .await
+                .expect("put");
+        }
+        assert_eq!(
+            store.touch_entry_len("a"),
+            Some(4096),
+            "touch reports the length"
+        );
+        assert_eq!(store.touch_entry_len("missing"), None);
+        store
+            .put("c", L2Class::Survivor, value.clone())
+            .await
+            .expect("put c");
+        assert!(
+            store.entry_len("a").is_some(),
+            "the touched entry must survive"
+        );
+        // `c` and the untouched `b` both sit at the never-read tick, so which
+        // of them goes is unspecified; the classified entry must not.
+        assert_eq!(
+            usize::from(store.entry_len("b").is_some())
+                + usize::from(store.entry_len("c").is_some()),
+            1,
+            "exactly one never-read entry is evicted"
+        );
+    }
 
     #[tokio::test]
     async fn value_survives_store_reopen() {

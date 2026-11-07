@@ -477,7 +477,7 @@
     "SearchOptimizer": 1,
     "SearchQuery": 2,
     "SearchStage": 2,
-    "SearchStrategy": 2,
+    "SearchStrategy": 1,
     "SecurityProtocol": 1,
     "SerializationFormat": 1,
     "SessionConfig": 1,
