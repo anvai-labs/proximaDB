@@ -420,12 +420,9 @@ pub struct IoTrace {
     /// cache fair-sharing, and authorization joins. Unlike `tenant_id`, this
     /// stays numeric and is never derived from an alias.
     tenant_stable_id: Mutex<Option<u64>>,
-    /// TD-CACHEC-1: the catalog collection id (numeric `CollectionObjectId`
-    /// text, never the mutable display name) the current search is reading.
-    /// Set for the duration of one search by [`stamp_current_collection_id`]
-    /// and restored when that search ends, so reads outside it (or of the next
-    /// collection in the same scope) are never credited to it.
-    collection_id: Mutex<Option<Arc<str>>>,
+    /// TD-CACHEC-1: the collection the search(es) currently running in this
+    /// scope are reading; see [`CollectionSlot`].
+    collection_slot: Mutex<CollectionSlot>,
 }
 
 /// Per-query cap on recorded request intervals (TD-PAXDIR-1 D7). A P5b
@@ -751,21 +748,30 @@ impl IoTrace {
             .unwrap_or_else(|p| p.into_inner())
     }
 
-    /// Replace the stamped catalog collection id, returning the previous one
-    /// (TD-CACHEC-1).
-    pub fn replace_collection_id(&self, collection_id: Option<Arc<str>>) -> Option<Arc<str>> {
-        std::mem::replace(
-            &mut *self.collection_id.lock().unwrap_or_else(|p| p.into_inner()),
-            collection_id,
-        )
-    }
-
-    /// The stamped catalog collection id, if any.
-    pub fn collection_id(&self) -> Option<Arc<str>> {
-        self.collection_id
+    /// Enter a search of `collection_id` (TD-CACHEC-1).
+    pub fn enter_collection(&self, collection_id: Arc<str>) {
+        self.collection_slot
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .clone()
+            .enter(collection_id);
+    }
+
+    /// Leave a search entered with [`Self::enter_collection`].
+    pub fn exit_collection(&self) {
+        self.collection_slot
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .exit();
+    }
+
+    /// The collection reads in this scope belong to right now: `None` when no
+    /// stamped search is running, or when searches of DIFFERENT collections
+    /// overlap (the reads cannot be told apart, so none are credited).
+    pub fn collection_id(&self) -> Option<Arc<str>> {
+        self.collection_slot
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .current()
     }
 
     /// The stamped per-query id, if any.
@@ -2162,33 +2168,74 @@ pub fn current_tenant_stable_id() -> Option<u64> {
     IO_TRACE.try_with(|t| t.tenant_stable_id()).ok().flatten()
 }
 
-/// TD-CACHEC-1: restores the previous collection stamp when dropped. Hold it
-/// for exactly the span of reads that belong to the collection.
-#[must_use = "the stamp is undone when this guard drops"]
+/// TD-CACHEC-1: which collection the stamped searches in one io_trace scope
+/// are reading. One scope can run several searches, sequentially (a pgwire
+/// batch) or overlapping (`tokio::join!` in the SQL executor), and they share
+/// this slot. Rule: never credit a read to the wrong collection.
+/// * `depth` counts the stamped searches running now; the slot clears when it
+///   returns to 0, so reads after the last search are never credited.
+/// * Overlapping searches of the SAME collection keep the id.
+/// * Overlapping searches of DIFFERENT collections mark the slot ambiguous:
+///   nothing is credited until all of them end.
+#[derive(Debug, Default)]
+pub struct CollectionSlot {
+    id: Option<Arc<str>>,
+    depth: usize,
+    ambiguous: bool,
+}
+
+impl CollectionSlot {
+    fn enter(&mut self, collection_id: Arc<str>) {
+        match &self.id {
+            None if self.depth == 0 => self.id = Some(collection_id),
+            Some(current) if **current == *collection_id => {}
+            _ => self.ambiguous = true,
+        }
+        self.depth += 1;
+    }
+
+    fn exit(&mut self) {
+        self.depth = self.depth.saturating_sub(1);
+        if self.depth == 0 {
+            *self = Self::default();
+        }
+    }
+
+    fn current(&self) -> Option<Arc<str>> {
+        if self.ambiguous {
+            None
+        } else {
+            self.id.clone()
+        }
+    }
+}
+
+/// TD-CACHEC-1: leaves the stamped search when dropped (including on an early
+/// `?` return). Hold it for exactly the span of the search.
+#[must_use = "the stamp ends when this guard drops"]
 pub struct CollectionStamp {
     trace: Option<Arc<IoTrace>>,
-    previous: Option<Arc<str>>,
 }
 
 impl Drop for CollectionStamp {
     fn drop(&mut self) {
         if let Some(trace) = &self.trace {
-            trace.replace_collection_id(self.previous.take());
+            trace.exit_collection();
         }
     }
 }
 
-/// TD-CACHEC-1: stamp the catalog collection id onto the active query trace
-/// until the returned guard drops. Spawned children that rebind the scope
-/// handle share the stamp. A no-op outside an instrumented scope. Always
+/// TD-CACHEC-1: mark a search of `collection_id` as running in the active
+/// query trace until the returned guard drops. Spawned children that rebind
+/// the scope handle share it. A no-op outside an instrumented scope. Always
 /// compiled (unlike the `io-trace`-gated perf counters): it feeds attribution
 /// metrics.
 pub fn stamp_current_collection_id(collection_id: &str) -> CollectionStamp {
     let trace = current_handle();
-    let previous = trace
-        .as_ref()
-        .and_then(|t| t.replace_collection_id(Some(Arc::from(collection_id))));
-    CollectionStamp { trace, previous }
+    if let Some(t) = &trace {
+        t.enter_collection(Arc::from(collection_id));
+    }
+    CollectionStamp { trace }
 }
 
 /// TD-CACHEC-1: the catalog collection id stamped by the search currently
@@ -3018,12 +3065,19 @@ mod tests {
         assert_eq!(s, back);
         assert_eq!(back.total_embedding_tokens(), 3000);
     }
+}
 
-    /// TD-CACHEC-1: the collection stamp lasts exactly as long as its guard,
-    /// is visible to spawned children that rebind the handle, nests (the
-    /// previous stamp is restored), and is a no-op outside a scope.
+/// TD-CACHEC-1: the collection stamp is always compiled (it feeds attribution
+/// metrics), so its tests must not sit behind the `io-trace` feature gate.
+#[cfg(test)]
+mod collection_tests {
+    use super::*;
+
+    /// TD-CACHEC-1: the stamp lasts exactly as long as its guard, reaches
+    /// spawned children that rebind the handle, and is a no-op outside a
+    /// scope. Sequential searches each attribute their own reads.
     #[tokio::test]
-    async fn collection_stamp_is_guard_scoped_nests_and_reaches_spawned_children() {
+    async fn collection_stamp_is_guard_scoped_and_reaches_spawned_children() {
         drop(stamp_current_collection_id("42")); // outside any scope: no-op
         assert_eq!(current_collection_id(), None);
         instrument_with_stable_tenant(Some("t".into()), Some(7), "test", async {
@@ -3037,18 +3091,44 @@ mod tests {
                         .await
                         .expect("join");
                 assert_eq!(seen.as_deref(), Some("42"));
-                {
-                    let _b = stamp_current_collection_id("43");
-                    assert_eq!(current_collection_id().as_deref(), Some("43"));
-                }
-                assert_eq!(current_collection_id().as_deref(), Some("42"));
             }
             assert_eq!(
                 current_collection_id(),
                 None,
-                "reads after the search are not credited to it"
+                "reads after the search are not credited"
             );
+            let _b = stamp_current_collection_id("43");
+            assert_eq!(current_collection_id().as_deref(), Some("43"));
         })
         .await;
+    }
+
+    /// TD-CACHEC-1: overlapping searches never credit a read to the wrong
+    /// collection. Same collection: kept. Different collections: nothing is
+    /// credited until all of them end, in either finish order, and the slot is
+    /// clean afterwards.
+    #[test]
+    fn overlapping_collection_stamps_never_misattribute() {
+        let mut slot = CollectionSlot::default();
+        slot.enter(Arc::from("A"));
+        slot.enter(Arc::from("A"));
+        assert_eq!(
+            slot.current().as_deref(),
+            Some("A"),
+            "same collection overlaps"
+        );
+        slot.exit();
+        slot.enter(Arc::from("B"));
+        assert_eq!(slot.current(), None, "A and B overlap: ambiguous");
+        slot.exit(); // either one finishes first: exits only count depth
+        assert_eq!(slot.current(), None, "still ambiguous while one runs");
+        slot.exit();
+        assert_eq!(slot.current(), None);
+        slot.enter(Arc::from("C"));
+        assert_eq!(
+            slot.current().as_deref(),
+            Some("C"),
+            "clean after all ended"
+        );
     }
 }
