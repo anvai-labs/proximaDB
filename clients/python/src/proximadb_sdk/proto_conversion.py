@@ -80,6 +80,14 @@ class ProtoConverter:
         # Legacy fallbacks (map to viper)
         "mmap": 1,
         "hybrid": 1,
+        # Encode parity for the proto engines the SDK does not explicitly
+        # model (#2446 review MEDIUM-6): decode is truthful (reverse table
+        # below), so encode must round-trip the same names rather than
+        # silently coerce read-then-recreate traffic to SST.
+        "tst": 9,
+        "cedar": 10,
+        "titan": 11,
+        "chrono": 12,
     }
 
     _STORAGE_ENGINE_INT_TO_STR: dict[int, str] = {

@@ -386,17 +386,117 @@ class TestProtoDriftGuard:
         for v in types_pb2.StorageEngine.DESCRIPTOR.values:
             name = v.name.lower().removeprefix("storage_engine_")
             decoded = ProtoConverter._STORAGE_ENGINE_INT_TO_STR.get(v.number)
+            # Every proto number PRESENT in the decode table must decode
+            # to its proto name — no exceptions (#2446 review MEDIUM-5:
+            # the former ("viper",) exemption was a mutation-proven hole
+            # with zero beneficiaries).
             if decoded is not None:
-                assert decoded == name or decoded in ("viper",), (
+                assert decoded == name, (
                     f"StorageEngine decode drift: {v.number} decoded "
                     f"{decoded!r}, proto member {name!r}"
                 )
-            # members the table deliberately aliases may be absent; the
-            # proto numbers 7-12 MUST be present (no silent truncation)
-        for n in (7, 8, 9, 10, 11, 12):
+        for n in range(0, 13):
             assert (
                 n in ProtoConverter._STORAGE_ENGINE_INT_TO_STR
             ), f"StorageEngine reverse truncated: {n} missing"
+
+    def test_filterable_datatype_enum_matches_proto(self) -> None:
+        """models.FilterableDataType must carry every proto value (the
+        8-value truncation made wire-map extensions unreachable and
+        crashed decode — #2446 review BLOCKER-1)."""
+        from proximadb_sdk.models import FilterableDataType
+        from proximadb_sdk.v1 import vector_types_pb2 as types_pb2
+
+        proto_names = set()
+        for v in types_pb2.FilterableDataType.DESCRIPTOR.values:
+            name = v.name.lower().removeprefix("filterable_")
+            if name == "data_type_unspecified":
+                # proto's fully-qualified UNSPECIFIED; the enum spells
+                # nothing for it (absent = deliberate, same as the wire
+                # maps' 0->"string" default)
+                proto_names.add(name)
+                continue
+            proto_names.add(name)
+            member = getattr(FilterableDataType, name.upper(), None)
+            assert member is not None, f"enum missing proto member {name}"
+            assert member.value == name, f"enum value drift: {name}"
+        proto_names.discard("data_type_unspecified")
+        ours = {m.value for m in FilterableDataType}
+        assert ours == proto_names, f"phantom/missing: {ours ^ proto_names}"
+
+    def test_inline_engine_and_filterable_maps_match_proto(self) -> None:
+        """rest_sync + client_v1 inline StorageEngine/FilterableDataType
+        dicts must decode proto numbers truthfully (the converter-table
+        guard above cannot see them — #2446 review MAJOR-4)."""
+        import re
+        from pathlib import Path
+
+        sdk_src = Path(__file__).parents[2] / "src" / "proximadb_sdk"
+        from proximadb_sdk.v1 import vector_types_pb2 as types_pb2
+
+        engine_proto = {
+            v.number: v.name.lower().removeprefix("storage_engine_")
+            for v in types_pb2.StorageEngine.DESCRIPTOR.values
+        }
+        filt_proto = {
+            v.number: v.name.lower().removeprefix("filterable_")
+            for v in types_pb2.FilterableDataType.DESCRIPTOR.values
+        }
+        filt_names = set(filt_proto.values())
+
+        files = [
+            sdk_src / "protocols" / "rest_sync.py",
+            sdk_src / "client_v1.py",
+        ]
+        engine_checked = filt_checked = 0
+        for f in files:
+            text = f.read_text()
+            for m in re.finditer(r"(\d+):\s*\"(\w+)\"", text):
+                num, name = int(m.group(1)), m.group(2)
+                if num in engine_proto and name in set(engine_proto.values()):
+                    if not (num == 0 and name == "viper"):
+                        assert engine_proto[num] == name, (
+                            f"{f.name} engine drift: {num} should be "
+                            f"{engine_proto[num]}, says {name}"
+                        )
+                    engine_checked += 1
+                if num in filt_proto and name in filt_names:
+                    if not (num == 0 and name == "string"):
+                        assert filt_proto[num] == name, (
+                            f"{f.name} filterable drift: {num} should be "
+                            f"{filt_proto[num]}, says {name}"
+                        )
+                    filt_checked += 1
+        assert engine_checked >= 10, f"only {engine_checked} engine entries found"
+        assert filt_checked >= 20, f"only {filt_checked} filterable entries found"
+
+        # COMPLETENESS: the value checks above only validate entries that
+        # exist — a deleted entry would silently shrink the count (#2446
+        # review NC: re-truncation initially passed). Every proto number
+        # must be present in each file that carries the map family.
+        for f_ in files:
+            text2 = f_.read_text()
+            for num, name in filt_proto.items():
+                if num == 0 or f_.name == "client_v1.py":
+                    continue  # 0 is the deliberate default; client_v1 has no filterable map
+                assert (
+                    f'{num}: "{name}"' in text2
+                ), f"{f_.name} filterable map missing proto {num} ({name})"
+            if f_.name == "rest_sync.py":
+                for num, name in engine_proto.items():
+                    if num == 0:
+                        continue
+                    assert (
+                        f'{num}: "{name}"' in text2
+                    ), f"{f_.name} engine map missing proto {num} ({name})"
+            else:
+                # client_v1: 0/1 both -> "viper" deliberately
+                for num, name in engine_proto.items():
+                    if num in (0, 1):
+                        continue
+                    assert (
+                        f'{num}: "{name}"' in text2
+                    ), f"{f_.name} engine map missing proto {num} ({name})"
 
     def test_distance_metric_intenum_matches_proto(self) -> None:
         from proximadb_sdk.models import DistanceMetricType
