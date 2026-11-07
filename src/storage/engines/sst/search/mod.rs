@@ -2573,11 +2573,18 @@ self.try_pax_cascade(
         // the box by c×cores. The guard is held to the end of this function,
         // which awaits every per-file handle, so it covers the real scan
         // duration.
-        // #2442 review round 3 (F3): the guard is SHARED into every spawned
-        // per-file task, so the in-flight count lives until the LAST task ends —
-        // a cancelled or early-returning parent must not decrement while its
-        // orphaned spawns keep ranking (that let the next query see itself
-        // alone and fan out across every core).
+        // The guard is SHARED into every spawned per-file task, so the
+        // in-flight count lives until the LAST task ends — a cancelled or
+        // early-returning parent must not decrement while its orphaned spawns
+        // keep ranking (#2442 round 3, F3). Consequence, by design (round 4,
+        // F7): a deferred-retry attempt that starts while attempt 1's orphans
+        // still rank sees itself as NOT alone and ranks sequentially — correct,
+        // since those orphans really are using the cores.
+        //
+        // Scope: this guard counts in-flight QUERIES. It restores the
+        // cross-query back-off; it does NOT bound workers WITHIN one query
+        // (a lone query over D files can still run D x cores rank workers) —
+        // that is TD-SCANDEG-2.
         let scan_guard = std::sync::Arc::new(ScanGuard::enter());
 
         let use_pipeline = ctx.search_params.enable_pipeline_execution.unwrap_or(false);
@@ -4988,11 +4995,12 @@ mod tests {
                 ..ProximaRecord::default()
             }
         };
-        // 3 flushed files of 200 records each: enough rank work that the
-        // scan window comfortably outlasts the sampler's first read.
+        // 3 flushed files of 2,000 records each: a scan window of many
+        // milliseconds, so a sampler that is already running (see the
+        // barrier below) reliably observes the guard (#2442 round 4, F9).
         for b in 0..3u32 {
-            let start = (b as usize) * 200;
-            let recs: Vec<ProximaRecord> = (start..start + 200).map(mk_rec).collect();
+            let start = (b as usize) * 2000;
+            let recs: Vec<ProximaRecord> = (start..start + 2000).map(mk_rec).collect();
             let params = FlushParameters {
                 collection_id: Some(cid.to_string()),
                 vector_records: recs,
@@ -5032,8 +5040,14 @@ mod tests {
         let engine_arc = Arc::new(engine);
         let stop = Arc::new(AtomicBool::new(false));
         let stop_sampler = Arc::clone(&stop);
+        // The search must not start until the sampler is actually spinning:
+        // a freshly spawned OS thread may not be scheduled before a short
+        // scan finishes, which made this test flaky (round 4, F9).
+        let ready = Arc::new(std::sync::Barrier::new(2));
+        let sampler_ready = Arc::clone(&ready);
         let sampler = std::thread::spawn(move || {
             let mut observed_max = 0usize;
+            sampler_ready.wait();
             while !stop_sampler.load(Ordering::Relaxed) {
                 let v = INFLIGHT_SCANS.load(Ordering::Relaxed);
                 if v > observed_max {
@@ -5044,6 +5058,7 @@ mod tests {
             observed_max
         });
 
+        ready.wait();
         let result = engine_arc.search_vectors_unified_arc(&ctx).await;
         // Restore the process env before any assert can return early (F8).
         // SAFETY: #[serial] + nextest process-per-test isolation.

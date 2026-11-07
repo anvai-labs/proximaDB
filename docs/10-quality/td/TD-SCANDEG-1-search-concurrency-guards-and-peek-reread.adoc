@@ -1,40 +1,40 @@
-= TD-SCANDEG-1: Concurrency back-off guards were dead on one entry each; peeked bytes were re-read
+= TD-SCANDEG-1: The adaptive concurrency back-offs were each dead on one search entry
 :status: Accepted
 :date: 2026-11-06
-:tags: [search, concurrency, cost, gets, survivor-cache]
+:tags: [search, concurrency, cpu]
 
 == Problem
 
-Two adaptive back-offs and one read path, each half-wired:
+Two adaptive back-offs, each wired on only one of the two segment-scan
+entries (legacy `direct_search_with` / production arc
+`direct_search_arc_with`):
 
 * **Morsel degree (intra-file rank).** `morsel_degree()` returns `cores` when
-  `INFLIGHT_SCANS == 1`, else 1 — "total CPU workers ≈ cores". The only
-  `ScanGuard::enter()` was on the legacy `&self` path; the production arc
-  path never took it, so the degree was ALWAYS `cores`.
+  `INFLIGHT_SCANS == 1`, else 1 — "a lone query uses every core; concurrent
+  queries rank sequentially". The only `ScanGuard::enter()` was on the
+  LEGACY path; the production arc path never took it, so `INFLIGHT_SCANS`
+  stayed 0, `.max(1)` made it 1, and the degree was ALWAYS `cores`: at client
+  concurrency c, every query spawned its own all-core rank.
 * **Inter-file degree (S2b).** The mirror image: `InFlightSearchGuard` was
-  acquired only on the arc entry, so legacy-entry traffic never divided
-  `resolve_search_parallelism` by concurrency (#2442 review F1).
-* **Peek·discard·re-read.** The coalesced SQ8 survivor planner and the
-  Region-D OID-chunk planner peeked residency, discarded the returned bytes,
-  and re-read the identical range on consume — the full local-disk read
-  stack (open + seek + read + CRC) paid twice per range.
+  acquired only on the ARC entry, so legacy-entry traffic never divided
+  `resolve_search_parallelism` by concurrency.
 
 == Decision
 
-* Both entries now take both guards.
-* A peeked-aware serve seam on each consume path
-  (`get_or_fetch_in_parent_impl`, `get_or_fetch_impl`): an exact-length
-  peeked buffer is served and promoted into L1 through ONE shared helper,
-  accounted by the TIER the peek read (exact-L1 / parent-L2 / exact-L2); a
-  different-length buffer is the parent DRAM slice and is ignored. Threading
-  bytes through the loader would not have worked — the consume probes L2
-  BEFORE the loader runs.
-* Carried peeked buffers are bounded (`32 × 4 MiB` per arm, matching the D4
-  wave bound); past the budget a range degrades to the pre-fix re-probe, so
-  the worst case is the status quo ante, never worse.
-* The legacy OID tail is untouched: its peek is DRAM-only, so there was no
-  duplicated disk read to remove.
+Both entries take both guards. On the arc path the `ScanGuard` is shared
+(`Arc`) into every spawned per-file task, so the count lives until the LAST
+task ends: a cancelled or early-returning parent cannot decrement while its
+orphaned spawns keep ranking. By design, a deferred-retry attempt that starts
+while attempt 1's orphans still rank therefore sees itself as not alone —
+correct, since those orphans are using the cores.
 
-== Follow-up
+Both fixes are mutation-verified: removing the arc guard fails
+`arc_direct_search_counts_itself_in_inflight_scans`, which also proves that
+test routes through the arc path.
 
-Worker-granularity back-off is filed separately as TD-SCANDEG-2.
+== Scope / follow-ups
+
+* The guards count in-flight QUERIES; they restore the cross-query back-off
+  but do not bound workers WITHIN one query — TD-SCANDEG-2.
+* The peek·discard·re-read defect originally bundled here was descoped —
+  TD-SCANDEG-3.

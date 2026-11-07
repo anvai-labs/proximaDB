@@ -552,13 +552,10 @@ impl SurvivorRangeCache {
     /// of [`Self::peek_memory_exact`] — `Some(bytes)` iff a subsequent
     /// `get_or_fetch_in_parent(kind, path, off, len, parent_off, parent_len)`
     /// would be served WITHOUT running its loader. Probes, in the same order
-    /// as the real method. The DRAM tiers (1, 2) are side-effect-free (no
-    /// `track_hot_key`, no hit/miss counters, no L1 insert). The disk tiers
-    /// (3, 4) are NOT, deliberately (TD-SCANDEG-1): a hit there is a real
-    /// local-disk read, so it is PROMOTED into L1 under the exact key and
-    /// recorded once (`record_l2s(1, 0)`; tier 3 also `parent_l2_hits`).
-    /// Otherwise the consume re-read the identical range — the disk read
-    /// stack paid twice per range:
+    /// as the real method and ALL side-effect-free (no `track_hot_key`, no
+    /// hit/miss or `parent_l2_*` counters, no `record_l2s`, no L1 promotion —
+    /// every accounting in `get_or_fetch_in_parent` lives in its body, not in
+    /// the stores):
     ///
     /// 1. exact-range L1 (the `{path}:{off}:{len}` scoped key);
     /// 2. parent-region L1 slice (the write-time seed key);
@@ -568,8 +565,9 @@ impl SurvivorRangeCache {
     ///    write-through; without this step a RAM-only peek classifies
     ///    L1-evicted-but-L2-resident ranges as cold and re-GETs them from the
     ///    object store (a warm-phase billing regression). Probed through the
-    ///    RAW `PersistentByteStore` (never the traced wrapper, which would
-    ///    double-record), then promoted as above.
+    ///    RAW `PersistentByteStore` (never the traced wrapper) so no io_trace
+    ///    or l2 counters move. The only effect is an LRU recency tick plus a
+    ///    local-disk read (~ms per 4 MiB range, gated-only) — accepted.
     ///
     /// `None` ⇒ the loader WILL run ⇒ the caller may batch this range.
     pub async fn peek_parent_residency(
@@ -613,9 +611,7 @@ impl SurvivorRangeCache {
         {
             return Some(parent);
         }
-        // 3. Parent-key L2 (covers write-time seeds). A hit is promoted into
-        //    L1 under the exact key so the consume does not read it again
-        //    (TD-SCANDEG-1; see `peek_exact_l2`).
+        // 3. Parent-key L2 (covers write-time seeds). Raw store, no counters.
         if let Some(store) = &self.l2_store
             && let Ok(Some(bytes)) = store
                 .get_range(
@@ -625,47 +621,21 @@ impl SurvivorRangeCache {
                 )
                 .await
         {
-            self.parent_l2_hits
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            self.promote_peeked(exact_key, len, bytes.clone()).await;
             return Some(bytes);
         }
         // 4. Exact-key L2 (clustered-loop loader write-through entries).
         self.peek_exact_l2(&exact_key, len).await
     }
 
-    /// Exact-key L2 probe through the RAW store. On a hit the bytes are
-    /// PROMOTED into L1 under the same exact key (TD-SCANDEG-1).
-    ///
-    /// Why: the planner peeks, then the consume calls `get_or_fetch` /
-    /// `get_or_fetch_in_parent` for the same range. Without promotion the
-    /// consume re-read this exact L2 entry from disk — the full open + seek +
-    /// read + CRC stack paid twice per range. Promoting makes the consume's
-    /// ordinary lookup an L1 hit, counted by the normal path; nothing is
-    /// carried between planner and consume, so there is no extra transient
-    /// memory beyond what the cache itself holds. The disk read that DID
-    /// happen is recorded once, here. If the entry is evicted before the
-    /// consume, the consume simply re-reads (the pre-fix behaviour).
+    /// Exact-key L2 probe through the RAW store — no `TracedSurvivorL2`
+    /// io_trace recording, no L1 promotion, no counters.
     async fn peek_exact_l2(&self, exact_key: &CacheKey, len: u64) -> Option<Arc<[u8]>> {
         let store = self.l2_store.as_ref()?;
-        let bytes = store
+        store
             .get_range(&exact_key.persistent_key(L2_EXACT_NAMESPACE), 0, len)
             .await
             .ok()
-            .flatten()?;
-        self.promote_peeked(exact_key.clone(), len, bytes.clone())
-            .await;
-        Some(bytes)
-    }
-
-    /// Promote bytes a peek read from an L2 tier into L1 under `exact_key`,
-    /// recording the one physical L2 read the peek performed.
-    async fn promote_peeked(&self, exact_key: CacheKey, len: u64, bytes: Arc<[u8]>) {
-        let weight: u32 = len.try_into().unwrap_or(u32::MAX);
-        self.inner
-            .insert_memory_only(exact_key, weight, bytes)
-            .await;
-        crate::observability::io_trace::record_l2s(1, 0);
+            .flatten()
     }
 
     /// TD-CACHE-1 S2: the top-`k` hot ranges per tenant by hit count — the
@@ -1324,9 +1294,8 @@ mod tests {
         );
     }
 
-    /// TD-RDSTRAT-12 §3 round 4: a DRAM-tier peek is SIDE-EFFECT-FREE — no
-    /// hit/miss or parent_l2 counters, no io_trace l2 recordings, no L1
-    /// inserts (disk-tier peeks promote by design — TD-SCANDEG-1). Any
+    /// TD-RDSTRAT-12 §3 round 4: the peek is SIDE-EFFECT-FREE — no hit/miss
+    /// or parent_l2 counters, no io_trace l2 recordings, no L1 inserts. Any
     /// accounting added to the peek distorts hit ratios and the warm-set
     /// manifest, which the batch planner (and evidence) rely on.
     #[tokio::test]
@@ -1381,108 +1350,6 @@ mod tests {
             cache.inner.l2_stats().misses,
             inner_l2_before.misses,
             "peek must not move the exact-L2 traced counters"
-        );
-    }
-
-    // ---- TD-SCANDEG-1: a disk-tier peek promotes into L1, so the consume
-    // does not read the same range from disk a second time. Each test keeps
-    // the L2 entry PRESENT and asserts the consume performs no L2 read of its
-    // own (a test that deletes the entry cannot tell "no second read" from
-    // "carried bytes served" — the round-1 tests hid the defect that way). ----
-
-    #[tokio::test]
-    async fn parent_l2_peek_promotes_so_consume_does_not_reread() {
-        let dir = tempfile::tempdir().expect("test tempdir");
-        let store =
-            Arc::new(PersistentByteStore::open(dir.path(), 1 << 20).expect("open persistent L2"));
-        let seeder = SurvivorRangeCache::with_resolver_and_l2(1 << 20, None, Some(store.clone()));
-        let parent: Arc<[u8]> = Arc::from((0u8..=255).cycle().take(4096).collect::<Vec<_>>());
-        seeder
-            .seed_parent_region("seg.pax", 0, parent.clone())
-            .await
-            .expect("seed parent");
-
-        // Fresh cache over the same store: L1 empty, only the parent L2 answers.
-        let cache = SurvivorRangeCache::with_resolver_and_l2(1 << 20, None, Some(store.clone()));
-        assert!(
-            cache
-                .peek_parent_residency(CacheKind::QuantizedCodes, "seg.pax", 256, 512, 0, 4096)
-                .await
-                .is_some()
-        );
-        let parent_hits_after_peek = cache.parent_l2_hits.load(Ordering::SeqCst);
-        assert_eq!(
-            parent_hits_after_peek, 1,
-            "the peek's disk read is booked once"
-        );
-
-        let ran = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let ran_loader = Arc::clone(&ran);
-        let served = cache
-            .get_or_fetch_in_parent(
-                CacheKind::QuantizedCodes,
-                "seg.pax",
-                256,
-                512,
-                0,
-                4096,
-                move || async move {
-                    ran_loader.fetch_add(1, Ordering::SeqCst);
-                    Ok(vec![0xEEu8; 512])
-                },
-            )
-            .await
-            .expect("consume");
-        assert_eq!(&*served, &parent[256..768]);
-        assert_eq!(ran.load(Ordering::SeqCst), 0, "the loader must not run");
-        assert_eq!(
-            cache.parent_l2_hits.load(Ordering::SeqCst),
-            parent_hits_after_peek,
-            "the consume must not read the parent L2 again — the peek promoted it"
-        );
-    }
-
-    #[tokio::test]
-    async fn exact_l2_peek_promotes_so_consume_does_not_reread() {
-        let dir = tempfile::tempdir().expect("test tempdir");
-        let store =
-            Arc::new(PersistentByteStore::open(dir.path(), 1 << 20).expect("open persistent L2"));
-        let writer = SurvivorRangeCache::with_resolver_and_l2(1 << 20, None, Some(store.clone()));
-        let payload: Arc<[u8]> = Arc::from(vec![7u8; 256].as_slice());
-        writer
-            .get_or_fetch(CacheKind::Other, "oid.pax", 1024, 256, || {
-                let payload = payload.clone();
-                async move { Ok(payload.to_vec()) }
-            })
-            .await
-            .expect("write-through load");
-
-        let cache = SurvivorRangeCache::with_resolver_and_l2(1 << 20, None, Some(store.clone()));
-        assert!(
-            cache
-                .peek_exact_residency(CacheKind::Other, "oid.pax", 1024, 256)
-                .await
-                .is_some(),
-            "exact-key L2 must be visible to the peek"
-        );
-        let l2_before = cache.inner.l2_stats();
-
-        let ran = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let ran_loader = Arc::clone(&ran);
-        let served = cache
-            .get_or_fetch(CacheKind::Other, "oid.pax", 1024, 256, move || async move {
-                ran_loader.fetch_add(1, Ordering::SeqCst);
-                Ok(vec![0xEEu8; 256])
-            })
-            .await
-            .expect("consume");
-        assert_eq!(&*served, &*payload);
-        assert_eq!(ran.load(Ordering::SeqCst), 0, "the loader must not run");
-        let l2_after = cache.inner.l2_stats();
-        assert_eq!(
-            (l2_after.hits, l2_after.misses),
-            (l2_before.hits, l2_before.misses),
-            "the consume must be an L1 hit, not a second exact-L2 read"
         );
     }
 }
