@@ -99,13 +99,6 @@ pub async fn emit_warm_manifests(factory: &Arc<FilesystemFactory>, base_url: &st
     written
 }
 
-/// The stable tenant id a warm manifest label renders, if any: the inverse of
-/// `CacheScope::StableTenant(id).label()`. `shared` (or anything non-numeric)
-/// replays into the shared scope, as it was recorded.
-fn replay_stable_id(manifest_tenant_label: &str) -> Option<u64> {
-    manifest_tenant_label.parse::<u64>().ok()
-}
-
 /// Boot-side: replay one tenant's manifest, if present and fresh. Runs the
 /// replays inside the tenant's `io_trace` scope (tenant-correct cache keys +
 /// metering). Also prefetches the referenced segments' CONTROL invariants
@@ -137,15 +130,7 @@ pub async fn replay_tenant(
     }
 
     let tenant_owned = tenant_id.to_string();
-    // TD-CACHEC-1: replay into the SAME cache scope the recorded lookups used.
-    // The manifest is keyed by `CacheScope::label()`; request scopes are only
-    // `StableTenant` (rendered as its numeric id) or `Shared`, so a numeric
-    // label is this cache's own rendering of a stable id, not a client alias.
-    // Without the stable id the replay filled `Shared` keys that tenant-scoped
-    // lookups (REST v2, gRPC v2, Flight) never hit, so every restart served
-    // those tenants cold.
-    let stable_id = replay_stable_id(tenant_id);
-    crate::observability::io_trace::instrument_with_stable_tenant(Some(tenant_owned), stable_id, "warm.replay", async {
+    crate::observability::io_trace::instrument(Some(tenant_owned), "warm.replay", async {
         let mut loaded = 0usize;
         let mut prefilled = 0usize;
         let mut seen_segments = std::collections::HashSet::new();
@@ -407,17 +392,6 @@ mod tests {
             vec!["acme", "alpha", "beta_corp", "zeta"],
             "no policy = deterministic name order"
         );
-    }
-
-    /// TD-CACHEC-1: a manifest recorded under a stable-tenant scope replays
-    /// into that scope (so tenant-scoped lookups hit after restart); the shared
-    /// scope replays as shared.
-    #[test]
-    fn replay_restores_the_recorded_cache_scope() {
-        use proximadb_cache::CacheScope;
-        let stable = CacheScope::stable_tenant(123).label();
-        assert_eq!(replay_stable_id(&stable), Some(123));
-        assert_eq!(replay_stable_id(&CacheScope::Shared.label()), None);
     }
 }
 

@@ -4386,12 +4386,13 @@ mod tests {
             },
         )
         .await;
-        let family = crate::metrics::operational_metrics::SURVIVOR_CACHE_COLLECTION_READS_TOTAL
-            .as_ref()
-            .expect("family");
         let total: u64 = ["hot", "l2", "cold"]
             .iter()
-            .map(|o| family.with_label_values(&["910005", cid, o]).get())
+            .map(|o| {
+                crate::storage::engines::sst::survivor_range_cache::tests::collection_reads(
+                    "910005", cid, o,
+                )
+            })
             .sum();
         assert!(
             total > 0,

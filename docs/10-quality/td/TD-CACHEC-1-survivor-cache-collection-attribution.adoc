@@ -81,12 +81,6 @@ and a region read through the wave-split fallback counts once per chunk. Bytes
 are metered by the object-store and cache-byte families. A bytes-weighted
 ratio is a follow-up (a second family; it doubles cardinality).
 
-* Restart warm replay now runs under the stable tenant scope its manifest was
-  recorded in. Manifests are keyed by `CacheScope::label()`, and replay
-  (`warming::replay_stable_id`) inverts that rendering. Before, replay always
-  filled `Shared` keys, which tenant-scoped lookups (REST v2 already, and gRPC
-  with this change) never hit, so every restart served those tenants cold.
-
 == Residuals (not fixed here)
 
 * The per-TENANT survivor series (`SURVIVOR_CACHE_TENANT_HITS/MISSES`) count
@@ -109,9 +103,12 @@ ratio is a follow-up (a second family; it doubles cardinality).
   inside its scope, unlike REST v2.
 * The gRPC scope also moves gRPC searches' survivor-cache scope from `shared`
   to the tenant (as REST v2 already is), so tenant fair-share floors and
-  ceilings now apply to them. The first gRPC queries after THIS deploy re-warm
-  under the tenant scope; later restarts replay into it (see the warm-replay
-  fix above). No test pins that a gRPC search reaches the billing
+  ceilings now apply to them. After this deploy, entries already resident
+  under `shared` are unreachable to gRPC tenants until LRU evicts them, and
+  gRPC re-warms under its tenant keys once. Restart warming regresses nothing:
+  replay was already inert for every tenant (TD-CACHE-11, found during this
+  review; a replay-side patch was tried and reverted because it parsed tenant
+  names as stable ids). No test pins that a gRPC search reaches the billing
   observer, because the service holds a concrete `RecordOpsService`. A tower
   layer opening the scope for every data-plane RPC is the structural
   follow-up.

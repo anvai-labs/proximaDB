@@ -952,7 +952,7 @@ impl SurvivorRangeCache {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[tokio::test]
@@ -1587,12 +1587,29 @@ mod tests {
 
     // ---- TD-CACHEC-1: per-collection lookup attribution -----------------
 
-    fn collection_reads(tenant: &str, collection: &str, outcome: &str) -> u64 {
+    /// Read a production-family counter WITHOUT creating the series (a
+    /// `with_label_values` probe would mint a series outside the registry's
+    /// cap and eviction accounting).
+    pub(crate) fn collection_reads(tenant: &str, collection: &str, outcome: &str) -> u64 {
+        use prometheus::core::Collector;
         crate::metrics::operational_metrics::SURVIVOR_CACHE_COLLECTION_READS_TOTAL
             .as_ref()
             .expect("collection reads family registered")
-            .with_label_values(&[tenant, collection, outcome])
-            .get()
+            .collect()
+            .iter()
+            .flat_map(|family| family.get_metric().iter())
+            .find(|m| {
+                let label = |name: &str| {
+                    m.get_label()
+                        .iter()
+                        .find(|l| l.name() == name)
+                        .map(|l| l.value().to_string())
+                };
+                label("tenant_stable_id").as_deref() == Some(tenant)
+                    && label("collection_id").as_deref() == Some(collection)
+                    && label("outcome").as_deref() == Some(outcome)
+            })
+            .map_or(0, |m| m.get_counter().value() as u64)
     }
 
     /// An engine search attributes each logical lookup to its (tenant,
