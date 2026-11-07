@@ -3086,11 +3086,6 @@ impl VectorOperationsService {
             })?;
         let collection_id_text = collection_object_id.to_string();
         let collection_id = collection_id_text.as_str();
-        // TD-CACHEC-1: attribute this search's cache reads to the immutable
-        // catalog id (never the mutable name) until the function returns; the
-        // guard restores the previous stamp. No-op outside an io_trace scope.
-        let _collection_stamp =
-            crate::observability::io_trace::stamp_current_collection_id(collection_id);
         let response_collection_name = collection
             .config
             .as_ref()

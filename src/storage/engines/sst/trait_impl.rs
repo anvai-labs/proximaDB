@@ -446,8 +446,19 @@ impl UnifiedStorageFormat for SstEngine {
     ) -> Result<Vec<OptimizedSearchRecord>> {
         info!("🔍 SST: Starting unified search");
 
-        // Use the modular search implementation
-        self.search_vectors_unified(ctx).await
+        // TD-CACHEC-1: scope survivor-cache reads of THIS search future to its
+        // catalog collection id (every search kernel reaches SST here). An
+        // unidentified context is left unattributed.
+        let collection_id = ctx.collection.id.as_str();
+        if collection_id.is_empty() {
+            return self.search_vectors_unified(ctx).await;
+        }
+        super::survivor_range_cache::with_read_collection(
+            collection_id,
+            // Use the modular search implementation
+            self.search_vectors_unified(ctx),
+        )
+        .await
     }
 
     /// ADR-031 + point-lookup: batch ID-based record retrieval. One

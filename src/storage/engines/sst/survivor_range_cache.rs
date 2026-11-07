@@ -85,13 +85,31 @@ fn outcome_index(outcome: CacheReadOutcome) -> usize {
     }
 }
 
-/// Series key: the requesting tenant's stable id (`None` = the `shared`
-/// scope, the only other request scope) and the catalog collection id. Each
-/// key renders to distinct labels, so no two keys share a series.
-type SeriesKey = (Option<u64>, Arc<str>);
+/// Series key: the requesting cache scope (rendered by [`CacheScope::label`],
+/// the same tenant label the per-tenant survivor series use) and the catalog
+/// collection id. Request scopes are only `StableTenant` or `Shared`, so
+/// distinct keys render distinct labels.
+type SeriesKey = (CacheScope, Arc<str>);
 
-fn tenant_label(tenant: Option<u64>) -> String {
-    tenant.map_or_else(|| "shared".to_string(), |id| id.to_string())
+tokio::task_local! {
+    /// TD-CACHEC-1: the catalog collection the current SST engine search is
+    /// reading. Scoped around the engine's search FUTURE (not stored on the
+    /// shared per-query trace), so a concurrent sibling future in the same
+    /// request (`tokio::join!` in the SQL executor) never sees it and no read
+    /// is credited to another collection. The production search path makes no
+    /// async cache reads from spawned tasks (its `spawn_blocking` work is
+    /// synchronous ranking), so nothing needs rebinding.
+    static READ_COLLECTION: Arc<str>;
+}
+
+/// Run `fut` (an SST engine search) with its catalog collection id as the
+/// attribution scope for survivor-cache reads (TD-CACHEC-1).
+pub(crate) async fn with_read_collection<F: Future>(collection_id: &str, fut: F) -> F::Output {
+    READ_COLLECTION.scope(Arc::from(collection_id), fut).await
+}
+
+fn current_read_collection() -> Option<Arc<str>> {
+    READ_COLLECTION.try_with(Arc::clone).ok()
 }
 
 /// One admitted series: its counter handles (resolved once, so the hot path
@@ -149,14 +167,14 @@ impl CollectionSeries {
 
     fn record(
         &self,
-        tenant: Option<u64>,
+        scope: &CacheScope,
         collection: &Arc<str>,
         outcome: CacheReadOutcome,
         now_secs: u64,
     ) {
         use std::sync::atomic::Ordering::Relaxed;
         let idx = outcome_index(outcome);
-        let key = (tenant, collection.clone());
+        let key = (scope.clone(), collection.clone());
         if self.try_fast(&key, idx, now_secs) {
             return;
         }
@@ -177,7 +195,7 @@ impl CollectionSeries {
             self.overflow[idx].inc();
             return;
         }
-        let labels = [tenant_label(tenant), collection.to_string()];
+        let labels = [scope.label(), collection.to_string()];
         let counters = OUTCOME_LABELS.map(|o| {
             self.family
                 .with_label_values(&[labels[0].as_str(), labels[1].as_str(), o])
@@ -210,7 +228,7 @@ impl CollectionSeries {
         for key in candidates {
             if self.admitted.remove_if(&key, |_, v| idle(v)).is_some() {
                 self.admitted_count.fetch_sub(1, Relaxed);
-                let labels = [tenant_label(key.0), key.1.to_string()];
+                let labels = [key.0.label(), key.1.to_string()];
                 for o in OUTCOME_LABELS {
                     let _ = self.family.remove_label_values(&[
                         labels[0].as_str(),
@@ -246,28 +264,21 @@ fn monotonic_secs() -> u64 {
     START.elapsed().as_secs()
 }
 
-/// Record ONE logical lookup for the requesting `scope`: the per-query
-/// io_trace L1 counters and, inside a stamped search, the per-collection
-/// attribution counter (TD-CACHEC-1). `None` = the load failed. That still
-/// counts as an L1 miss (the cache did miss; the loader ran) on BOTH lookup
-/// seams, but is never attributed. Outside a stamped search (flush seeding,
-/// compaction, warm replay) nothing is attributed.
-fn record_lookup(scope: &CacheScope, outcome: Option<CacheReadOutcome>) {
-    let hit = outcome == Some(CacheReadOutcome::MemoryHit);
+/// Record ONE logical lookup that returned bytes, for the requesting
+/// `scope`: the per-query io_trace L1 counters (unchanged semantics) and,
+/// inside an SST engine search, the per-collection attribution counter
+/// (TD-CACHEC-1). Outside an engine search (flush seeding, compaction, warm
+/// replay) nothing is attributed.
+fn record_lookup(scope: &CacheScope, outcome: CacheReadOutcome) {
+    let hit = outcome == CacheReadOutcome::MemoryHit;
     crate::observability::io_trace::record_survivor_l1s(u64::from(hit), u64::from(!hit));
-    let Some(outcome) = outcome else {
+    let Some(series) = COLLECTION_SERIES.as_ref() else {
         return;
     };
-    let Some(collection) = crate::observability::io_trace::current_collection_id() else {
+    let Some(collection) = current_read_collection() else {
         return;
     };
-    let tenant = match scope {
-        CacheScope::StableTenant(id) => Some(*id),
-        _ => None,
-    };
-    if let Some(series) = COLLECTION_SERIES.as_ref() {
-        series.record(tenant, &collection, outcome, monotonic_secs());
-    }
+    series.record(scope, &collection, outcome, monotonic_secs());
 }
 
 /// Persistent-L2 backend wrapper that forwards each exact-key probe outcome
@@ -531,7 +542,7 @@ impl SurvivorRangeCache {
             return self.get_or_fetch(kind, path, off, len, loader).await;
         };
         if let Some((exact, outcome)) = self.inner.get_with_outcome(&exact_key).await {
-            record_lookup(&record_scope, Some(outcome));
+            record_lookup(&record_scope, outcome);
             self.sync_prometheus();
             return Ok(exact);
         }
@@ -539,7 +550,7 @@ impl SurvivorRangeCache {
         if let Some((parent, outcome)) = self.inner.get_with_outcome(&parent_key).await
             && let Some(slice) = parent.get(start..end)
         {
-            record_lookup(&record_scope, Some(outcome));
+            record_lookup(&record_scope, outcome);
             // A complete write-time seed already occupies the useful cache
             // slot. Do not admit every query-dependent slice as another exact
             // entry: doing so duplicates the region, evicts its parent, and
@@ -559,7 +570,7 @@ impl SurvivorRangeCache {
                 self.inner
                     .insert_memory_only(exact_key, weight, bytes.clone())
                     .await;
-                record_lookup(&record_scope, Some(CacheReadOutcome::PersistentHit));
+                record_lookup(&record_scope, CacheReadOutcome::PersistentHit);
                 self.sync_prometheus();
                 return Ok(bytes);
             }
@@ -573,12 +584,13 @@ impl SurvivorRangeCache {
                 Ok::<Arc<[u8]>, FilesystemError>(Arc::from(loader().await?))
             })
             .await;
-        // The real outcome: a concurrent fill or the exact-key L2 can serve
-        // this lookup, so it is not always a load.
-        record_lookup(
-            &record_scope,
-            result.as_ref().ok().map(|(_, outcome)| *outcome),
-        );
+        match &result {
+            // The real outcome: a concurrent fill or the exact-key L2 can serve
+            // this lookup, so it is not always a load.
+            Ok((_, outcome)) => record_lookup(&record_scope, *outcome),
+            // Unchanged: this seam has always counted a failed load as a miss.
+            Err(_) => crate::observability::io_trace::record_survivor_l1s(0, 1),
+        }
         self.sync_prometheus();
         result.map(|(value, _)| value)
     }
@@ -695,10 +707,10 @@ impl SurvivorRangeCache {
                 Ok::<Arc<[u8]>, FilesystemError>(Arc::from(bytes))
             })
             .await;
-        record_lookup(
-            &record_scope,
-            result.as_ref().ok().map(|(_, outcome)| *outcome),
-        );
+        // Unchanged: this seam has never recorded a failed load.
+        if let Ok((_, outcome)) = &result {
+            record_lookup(&record_scope, *outcome);
+        }
         self.sync_prometheus();
         result.map(|(value, _)| value)
     }
@@ -1567,27 +1579,25 @@ mod tests {
             .get()
     }
 
-    /// A stamped search attributes each logical lookup to its (tenant,
+    /// An engine search attributes each logical lookup to its (tenant,
     /// catalog collection) with the real outcome: the loader ran (`cold`),
     /// DRAM served it (`hot`), the persistent store served it after L1 was
-    /// lost (`l2`). A lookup after the search's stamp is dropped is not
-    /// attributed.
+    /// lost (`l2`). A concurrent sibling future outside the search scope (the
+    /// `tokio::join!` shape in the SQL executor) is NOT credited to it.
     #[tokio::test]
-    async fn collection_reads_attribute_hot_l2_and_cold_outcomes() {
+    async fn collection_reads_attribute_outcomes_only_inside_the_search_scope() {
         let dir = tempfile::tempdir().expect("test tempdir");
         let store =
             Arc::new(PersistentByteStore::open(dir.path(), 1 << 20).expect("open persistent L2"));
         let warm = SurvivorRangeCache::with_resolver_and_l2(1 << 20, None, Some(store.clone()));
         let fresh = SurvivorRangeCache::with_resolver_and_l2(1 << 20, None, Some(store.clone()));
+        let sibling = SurvivorRangeCache::new(1 << 20);
         crate::observability::io_trace::instrument_with_stable_tenant(
             Some("t".to_string()),
             Some(910_001),
             "test",
             async {
-                {
-                    let _stamp = crate::observability::io_trace::stamp_current_collection_id(
-                        "cachec1-outcomes",
-                    );
+                let search = with_read_collection("cachec1-outcomes", async {
                     for cache in [&warm, &warm, &fresh] {
                         cache
                             .get_or_fetch(CacheKind::Other, "seg.pax", 64, 4, || async {
@@ -1596,24 +1606,27 @@ mod tests {
                             .await
                             .expect("lookup");
                     }
-                }
-                // After the search: unattributed.
-                warm.get_or_fetch(CacheKind::Other, "seg.pax", 64, 4, || async {
-                    Ok(vec![1, 2, 3, 4])
-                })
-                .await
-                .expect("lookup");
+                });
+                let other = async {
+                    sibling
+                        .get_or_fetch(CacheKind::Other, "other.pax", 0, 4, || async {
+                            Ok(vec![0; 4])
+                        })
+                        .await
+                        .expect("sibling lookup");
+                };
+                tokio::join!(search, other);
             },
         )
         .await;
         let t = "910001";
         let c = "cachec1-outcomes";
-        assert_eq!(collection_reads(t, c, "cold"), 1, "first lookup loads");
         assert_eq!(
-            collection_reads(t, c, "hot"),
+            collection_reads(t, c, "cold"),
             1,
-            "second lookup is DRAM; none after the stamp"
+            "only the search's first lookup loads; the sibling's load is not credited"
         );
+        assert_eq!(collection_reads(t, c, "hot"), 1, "second lookup is DRAM");
         assert_eq!(
             collection_reads(t, c, "l2"),
             1,
@@ -1621,10 +1634,10 @@ mod tests {
         );
     }
 
-    /// Without a collection stamp (flush seeding, compaction, warm replay, or
-    /// a surface that opens no search stamp) nothing is attributed.
+    /// Outside an engine search scope (flush seeding, compaction, warm replay)
+    /// nothing is attributed.
     #[tokio::test]
-    async fn collection_reads_require_a_collection_stamp() {
+    async fn collection_reads_require_an_engine_search_scope() {
         let cache = SurvivorRangeCache::new(1 << 20);
         crate::observability::io_trace::instrument_with_stable_tenant(
             Some("t".to_string()),
@@ -1697,10 +1710,30 @@ mod tests {
     fn collection_series_cap_folds_new_pairs_into_other() {
         let reg = registry(2, 3_600);
         let c = |s: &str| -> Arc<str> { Arc::from(s) };
-        reg.record(Some(7), &c("a"), CacheReadOutcome::Loaded, 0);
-        reg.record(Some(7), &c("b"), CacheReadOutcome::Loaded, 0);
-        reg.record(Some(7), &c("c"), CacheReadOutcome::Loaded, 10);
-        reg.record(Some(7), &c("c"), CacheReadOutcome::Loaded, 11); // lock-free overflow path
+        reg.record(
+            &CacheScope::stable_tenant(7),
+            &c("a"),
+            CacheReadOutcome::Loaded,
+            0,
+        );
+        reg.record(
+            &CacheScope::stable_tenant(7),
+            &c("b"),
+            CacheReadOutcome::Loaded,
+            0,
+        );
+        reg.record(
+            &CacheScope::stable_tenant(7),
+            &c("c"),
+            CacheReadOutcome::Loaded,
+            10,
+        );
+        reg.record(
+            &CacheScope::stable_tenant(7),
+            &c("c"),
+            CacheReadOutcome::Loaded,
+            11,
+        ); // lock-free overflow path
         assert_eq!(reads(&reg, "other", "other", "cold"), 2);
         assert_eq!(reg.admitted.len(), 2);
         assert!(!present(&reg, "7", "c"));
@@ -1714,10 +1747,25 @@ mod tests {
         let reg = registry(1, 100);
         let old: Arc<str> = Arc::from("old");
         let new: Arc<str> = Arc::from("new");
-        reg.record(Some(4), &old, CacheReadOutcome::MemoryHit, 0);
-        reg.record(Some(4), &new, CacheReadOutcome::MemoryHit, 50); // not idle yet: folded
+        reg.record(
+            &CacheScope::stable_tenant(4),
+            &old,
+            CacheReadOutcome::MemoryHit,
+            0,
+        );
+        reg.record(
+            &CacheScope::stable_tenant(4),
+            &new,
+            CacheReadOutcome::MemoryHit,
+            50,
+        ); // not idle yet: folded
         assert!(!present(&reg, "4", "new"));
-        reg.record(Some(4), &new, CacheReadOutcome::MemoryHit, 150); // old idle 150s: evicted
+        reg.record(
+            &CacheScope::stable_tenant(4),
+            &new,
+            CacheReadOutcome::MemoryHit,
+            150,
+        ); // old idle 150s: evicted
         assert!(!present(&reg, "4", "old"));
         assert_eq!(reads(&reg, "4", "new", "hot"), 1);
         assert_eq!(reg.admitted.len(), 1);
@@ -1728,8 +1776,13 @@ mod tests {
     fn shared_and_stable_tenant_scopes_get_distinct_series() {
         let reg = registry(4, 3_600);
         let c: Arc<str> = Arc::from("c");
-        reg.record(None, &c, CacheReadOutcome::Loaded, 0);
-        reg.record(Some(9), &c, CacheReadOutcome::Loaded, 0);
+        reg.record(&CacheScope::Shared, &c, CacheReadOutcome::Loaded, 0);
+        reg.record(
+            &CacheScope::stable_tenant(9),
+            &c,
+            CacheReadOutcome::Loaded,
+            0,
+        );
         assert_eq!(reads(&reg, "shared", "c", "cold"), 1);
         assert_eq!(reads(&reg, "9", "c", "cold"), 1);
     }

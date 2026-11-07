@@ -4339,6 +4339,53 @@ mod tests {
         );
     }
 
+    /// TD-CACHEC-1: the SST engine's production search entry (the
+    /// `UnifiedStorageFormat` trait impl every search kernel reaches) scopes
+    /// its survivor-cache reads to the catalog collection id.
+    #[tokio::test]
+    async fn trait_search_entry_attributes_survivor_reads_to_its_collection() {
+        let dim = 16usize;
+        let cid = "cachec1_trait_entry";
+        let (engine, collection) = file_backed_test_engine(cid, dim, None).await;
+        let recs = (0..120usize)
+            .map(|idx| {
+                let vector = (0..dim)
+                    .map(|j| ((idx * 7 + j * 3) % 97) as f32 * 0.01)
+                    .collect();
+                half_tagged_record(idx, dim, 1, vector)
+            })
+            .collect();
+        flush_into(&engine, cid, &collection, recs).await;
+        let query: Vec<f32> = (0..dim).map(|j| (j * 5 % 97) as f32 * 0.01).collect();
+        let ctx = approximate_ctx(cid, &collection, &query, 10, None);
+        crate::observability::io_trace::instrument_with_stable_tenant(
+            Some("t".to_string()),
+            Some(910_005),
+            "test",
+            async {
+                for _ in 0..2 {
+                    proximadb_storage_traits::UnifiedStorageFormat::search_vectors_unified(
+                        &engine, &ctx,
+                    )
+                    .await
+                    .expect("search");
+                }
+            },
+        )
+        .await;
+        let family = crate::metrics::operational_metrics::SURVIVOR_CACHE_COLLECTION_READS_TOTAL
+            .as_ref()
+            .expect("family");
+        let total: u64 = ["hot", "l2", "cold"]
+            .iter()
+            .map(|o| family.with_label_values(&["910005", cid, o]).get())
+            .sum();
+        assert!(
+            total > 0,
+            "survivor reads of a trait-entry search must be attributed to its collection"
+        );
+    }
+
     /// O1 parity oracle: rehydrating only the merged winners returns exactly
     /// the per-segment path's results (ids, scores, metadata, persisted
     /// versions), filtered and unfiltered, across several segments; and it

@@ -22,29 +22,41 @@ GETs were unbilled.
 
 == Fix
 
-* `IoTrace` carries an always-compiled `collection_id`. `unified_search_v1_inner`
-  stamps it with the immutable catalog `CollectionObjectId` (never the mutable
-  name) right after the catalog resolves it, through a guard
-  (`stamp_current_collection_id`) that restores the previous value when the
-  search returns. Reads after that search, or of the next collection in the
-  same scope, are never credited to it. Spawned scan tasks rebind the same
-  `Arc<IoTrace>`, so they see the stamp.
+* The SST engine's search entry (`SstEngine::search_vectors_unified`, the
+  trait impl every search kernel reaches, `unified_search_v1` and
+  `unified_search_native` alike) runs the search future inside
+  `survivor_range_cache::with_read_collection(ctx.collection.id, ..)`, a
+  `tokio::task_local!` scope holding the immutable catalog collection id.
+  The scope belongs to that FUTURE, so a concurrent sibling future in the same
+  request (`tokio::join!` in the SQL executor) never sees it, and no read is
+  ever credited to another collection. Reads after the search returns are
+  never credited either. The production search path makes no async cache
+  reads from spawned tasks (its `spawn_blocking` work is synchronous ranking),
+  so nothing needs rebinding. Two rejected designs, for the record:
+  - an ambient collection slot on the shared per-query `IoTrace`: concurrent
+    unstamped sibling reads were credited to the stamped collection;
+  - stamping in one service kernel: `unified_search_native` (pgwire `<->`,
+    the vector UDTF, hybrid, fusion) was missed.
 * `survivor_range_cache::record_lookup` is the single recording point for one
-  logical lookup (it replaced the five inline `record_survivor_l1s` sites; both
-  lookup seams now treat a failed load the same way: an L1 miss, never
-  attributed). The in-parent loader site records the REAL outcome: it
-  hard-coded a miss even when a concurrent fill or the exact-key L2 served the
-  lookup. That fix only matters under a concurrent-fill race, so it is not
-  pinned by a deterministic test.
+  logical lookup that returned bytes; it replaced the five inline
+  `record_survivor_l1s` sites. The in-parent loader site records the REAL
+  outcome: it hard-coded a miss even when a concurrent fill or the exact-key
+  L2 served the lookup. That fix only matters under a concurrent-fill race, so
+  no deterministic test pins it. Failed loads keep each seam's existing io_trace
+  accounting: the in-parent seam counts a miss, `get_or_fetch` records nothing.
+  They are never attributed. Changing L1 semantics is out of scope here.
 * `proximadb_survivor_cache_collection_reads_total{tenant_id, collection_id,
   outcome}` with outcome `hot` (DRAM), `l2` (persistent local store) or `cold`
-  (the loader ran). It holds true counters and only counts inside a stamped
-  scope, so flush seeding, compaction and warm replay are never attributed.
+  (the loader ran). It holds true counters and only counts inside an engine
+  search scope, so flush seeding, compaction and warm replay are never
+  attributed.
   `tenant_id` uses the same label as the per-tenant survivor series (stable id,
   or `shared`). At most 200 (tenant, collection) pairs hold their own series
   (admission is under one lock, so the bound is exact). A new pair arriving at
-  the cap first evicts pairs idle for an hour, removing their series, so
-  dropped collections never pin the cap. If none are idle, the new pair counts
+  the cap first evicts pairs idle for an hour, removing their series (with a
+  re-check at removal, so a concurrently read pair is kept), so dropped
+  collections never pin the cap. While the registry is full and no pair can be
+  idle yet, overflow lookups skip the lock. If none are idle, the new pair counts
   under `other`/`other`. Counter handles are resolved once per pair, so the
   per-lookup path does no label hashing.
 * `hot` means the cache served the bytes from DRAM. Some callers prefetch a
@@ -68,14 +80,24 @@ Hot-hit ratio per collection = `hot / (hot + l2 + cold)`.
   shared-scoped), and a persistent-L2 hit counts as an L1 miss. Prefer the new
   per-collection counter for ratios; aligning the tenant series to logical
   lookups is follow-up work.
-* Attribution needs a request io_trace scope. Today only REST v2 records
-  search, gRPC v2 search / search_stream, Arrow Flight and pgwire open one.
+* The TENANT label needs a request io_trace scope (the collection does not).
+  Today only REST v2 records search, gRPC v2 search / search_stream, Arrow
+  Flight and pgwire open one; elsewhere reads label as `shared`.
   REST v1, AQL, MCP, fusion search, gRPC entity search and `execute_query`
-  open no scope (where they reach `unified_search_v1_inner` the stamp is a
-  no-op), so their reads (and their KRU / object-store meters) are not
-  recorded. Opening scopes there is a billing
+  open no scope, so their reads label as tenant `shared` and their KRU /
+  object-store meters are not recorded. Opening scopes there is a billing
   change per surface and is follow-up work. gRPC still records no egress (KOU)
   inside its scope, unlike REST v2.
+* The gRPC scope also moves gRPC searches' survivor-cache scope from `shared`
+  to the tenant (as REST v2 already is), so tenant fair-share floors and
+  ceilings now apply to them; the first gRPC queries after deploy re-warm
+  under the tenant scope. No test pins that a gRPC search reaches the billing
+  observer, because the service holds a concrete `RecordOpsService`. A tower
+  layer opening the scope for every data-plane RPC is the structural
+  follow-up.
+* Idle eviction removes a pair's series; if the pair returns, its counters
+  restart at 0. Prometheus `rate()` / `increase()` treat that as a counter
+  reset; a consumer of raw cumulative values must do the same.
 * Admission is first-come among non-idle pairs, not ranked by traffic; a
   busy 201st pair counts under `other` until some pair idles for an hour.
 * Rejected alternative: deriving tenant and collection from the DrPath inside
