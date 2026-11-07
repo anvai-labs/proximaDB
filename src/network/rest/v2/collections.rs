@@ -2004,14 +2004,21 @@ pub struct FreshnessHealth {
 pub struct SearchFreshnessModes {
     /// `Strong`: WAL/memtable delta is always merged. Default.
     pub strong: bool,
-    /// `BoundedStale { max_staleness_ms }`: directory state up to the bound
-    /// is accepted without merging the delta.
+    /// `BoundedStale { max_staleness_ms }`: accepted. Since TD-OEDIRWM-1 the
+    /// delta is always scanned (no watermark-based skip), but unlike Strong the
+    /// result may be served from the query cache (up to 300s); the
+    /// `max_staleness_ms` bound is NOT enforced.
     pub bounded_stale: bool,
     /// `StaleOk`: skip the WAL delta entirely.
     pub stale_ok: bool,
     /// Whether `BoundedStale` is wired with a real time-bound check (vs
-    /// silently degrading to Strong). True since commit e34a06225 wired
-    /// `freshness_watermark_ns` through `scan_wal_delta_if_needed`.
+    /// scanning the delta like Strong). FALSE since TD-OEDIRWM-1: the
+    /// directory watermark is stamped after the flush commits and the sidecar
+    /// is shared across pods while memtables are per-pod, so it cannot
+    /// soundly bound staleness. BoundedStale therefore always scans the delta,
+    /// but may still be served from the query cache (only Strong bypasses it),
+    /// so its `max_staleness_ms` bound is not enforced — until a
+    /// snapshot-stamped, pod-scoped watermark exists.
     pub bounded_stale_time_bound_check: bool,
 }
 
@@ -2359,11 +2366,15 @@ fn build_route_health_with_live_state(
             strong: true,
             bounded_stale: true,
             stale_ok: true,
-            bounded_stale_time_bound_check: true,
+            // TD-OEDIRWM-1: BoundedStale scans the delta like Strong — the
+            // directory watermark cannot soundly bound staleness.
+            bounded_stale_time_bound_check: false,
         },
-        notes: "Per-request freshness modes (strong/bounded_stale/stale_ok) \
-                are honored by the search path; collection-default modes are \
-                not yet stored on the catalog.",
+        notes: "Per-request freshness modes are accepted. bounded_stale always \
+                scans the WAL delta (no sound freshness watermark exists yet, \
+                TD-OEDIRWM-1) but may be served from the query cache, which only \
+                strong bypasses, so its max_staleness_ms bound is not enforced. \
+                Collection-default modes are not yet stored on the catalog.",
     };
     let object_economy_eligible = engine == "sst";
     let object_economy_live_status = if object_economy_eligible {
@@ -2383,8 +2394,8 @@ fn build_route_health_with_live_state(
             "VectorObjectEconomyDirectory status was read from the in-process \
              cache without object-storage I/O."
         } else if object_economy_eligible {
-            "VectorObjectEconomyDirectory exists for SST; no cached live status \
-             is currently present in AppState."
+            "VectorObjectEconomyDirectory exists for SST; the query path does not \
+             read it (TD-OEDIRWM-1), so no live status is cached in AppState."
         } else {
             "Vector object-economy directory is currently SST-specific."
         },
@@ -4152,12 +4163,12 @@ mod tests {
 
     #[test]
     fn route_health_freshness_search_request_modes_all_wired() {
-        // All three VectorFreshnessMode variants are honored by
-        // should_scan_delta_with_time. The bounded_stale_time_bound_check
-        // flag specifically requires the watermark_ns threading wired in
-        // commit e34a06225 (Phase 5 slice 5.10). Flipping any of these to
-        // false requires the corresponding mode being removed from the
-        // enum or its branch being disconnected from the search path.
+        // All three VectorFreshnessMode variants are ACCEPTED by the search
+        // path. bounded_stale_time_bound_check is false since TD-OEDIRWM-1:
+        // the directory watermark that fed the time-bound check could not
+        // soundly gate a skip and is no longer read, so the bound is not
+        // enforced (bounded_stale always scans the delta, but may be served
+        // from the query cache).
         let h = build_route_health(
             "c".to_string(),
             "sst".to_string(),
@@ -4170,8 +4181,10 @@ mod tests {
         assert!(h.freshness.search_request_modes.strong);
         assert!(h.freshness.search_request_modes.bounded_stale);
         assert!(h.freshness.search_request_modes.stale_ok);
+        // TD-OEDIRWM-1: honestly reported as NOT wired — the staleness bound
+        // is not enforced until a sound watermark exists.
         assert!(
-            h.freshness
+            !h.freshness
                 .search_request_modes
                 .bounded_stale_time_bound_check
         );

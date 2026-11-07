@@ -1467,17 +1467,10 @@ impl VectorOperationsService {
                 collection_id
             )
         })?;
-        let typed_identity =
-            crate::storage::trait_components::path_resolver::typed_identity_from_storage_assignment(
-                Some(assignment),
-            );
-        let typed_identity =
-            crate::storage::trait_components::path_resolver::typed_path_identity(typed_identity);
         let storage_url =
-            crate::storage::trait_components::path_resolver::collection_data_path_typed(
-                &assignment.base_location,
+            crate::storage::trait_components::path_resolver::collection_data_path_for_assignment(
+                assignment,
                 &collection_id,
-                typed_identity,
             );
         let engine = self.get_engine_for_collection(&collection_id).await?;
         let storage_records = engine
@@ -2246,49 +2239,6 @@ impl VectorOperationsService {
             .map(|entry| entry.status.clone())
     }
 
-    /// Slice 5.10: return both the LSN watermark and the wall-clock
-    /// nanoseconds watermark the directory was emitted at. The `_ns`
-    /// component is needed by [`VectorFreshnessMode::should_scan_delta_with_time`]
-    /// so BoundedStale can apply its time-bound check. `None` when the
-    /// directory cache or its inputs aren't available (same fallback
-    /// path as the LSN-only helper).
-    pub(crate) async fn cached_directory_watermark(
-        &self,
-        collection_id: &str,
-    ) -> Option<(u64, i64)> {
-        let cache = self.directory_cache.as_ref()?;
-
-        // collection_root comes from the collection's storage assignment.
-        // Without it we can't resolve the sidecar URL, so fall back.
-        let collection = self.get_or_load_collection(collection_id).await.ok()?;
-        let collection_root = collection
-            .storage_assignment
-            .as_ref()
-            .map(|a| a.base_location.clone())?;
-
-        // Filesystem reference comes from the SST engine's factory.
-        let fs_factory = self.storage_engine.filesystem().clone();
-        let fs = fs_factory.get_filesystem(&collection_root).ok()?;
-
-        let entry = cache
-            .handle_for(collection_id)
-            .get_or_load(|| async {
-                crate::storage::engines::sst::object_economy_directory::load_directory_for(
-                    &*fs,
-                    collection_id,
-                    &collection_root,
-                    /*storage_epoch*/ 0,
-                    proximadb_catalog::CatalogAuthorityMode::RebuildableProjection,
-                )
-                .await
-            })
-            .await;
-        Some((
-            entry.directory.freshness_watermark_lsn,
-            entry.directory.freshness_watermark_ns,
-        ))
-    }
-
     /// Apply the WAL/memtable delta merge to a set of canonical engine
     /// results and build the structured EXPLAIN payload for the route.
     ///
@@ -2338,17 +2288,16 @@ impl VectorOperationsService {
             return Ok((optimized_results, None));
         }
 
-        // Use the request's effective metric for WAL delta re-score. It is the
-        // collection metric for ordinary calls and the SQL operator metric for
-        // pgvector calls; either way directory and delta scores share a scale.
-        // Slice 5.10: fetch both LSN and ns watermarks so BoundedStale
-        // can apply its time-bound check. When unavailable, fall back
-        // to (0, 0) — the scan helper treats ns=0 as "time unknown"
-        // and conservatively scans (LSN-only behaviour).
-        let (watermark, watermark_ns) = self
-            .cached_directory_watermark(collection_id)
-            .await
-            .unwrap_or((0, 0));
+        // TD-OEDIRWM-1: the query path does NOT read the object-economy
+        // directory. Its watermark cannot soundly gate a delta-scan skip: it
+        // is stamped AFTER the flush commits (not at the flushed snapshot),
+        // and the sidecar is shared across pods while each memtable is
+        // per-pod — a sidecar written by pod A would let pod B skip its own
+        // unflushed rows. Every Strong/BoundedStale query therefore scans the
+        // delta (production already behaved this way: until #2443 the reader
+        // looked in the wrong place and never found a sidecar). (0, 0) means
+        // "always scan"; no sidecar GET is made per query.
+        let (watermark, watermark_ns) = (0u64, 0i64);
         // Read the WAL cursor independently of the scan helper so the
         // EXPLAIN payload carries the value even when no scan ran
         // (watermark already covers the cursor). Two cheap singleton
@@ -2390,7 +2339,9 @@ impl VectorOperationsService {
             route_kind: "vector_object_economy".to_string(),
             authority_mode: "projection_over_canonical_records".to_string(),
             freshness_mode: freshness_mode.explain_label().to_string(),
-            freshness_watermark_lsn: Some(watermark),
+            // Not wired on the query path (TD-OEDIRWM-1) — None, not a
+            // fabricated 0, is the honest encoding.
+            freshness_watermark_lsn: None,
             policy_boundary: "proxima_internal_policy".to_string(),
             cache_status: "unknown".to_string(),
             ..Default::default()
@@ -2407,7 +2358,7 @@ impl VectorOperationsService {
             route_kind = %explain.route_kind,
             freshness_mode = %explain.freshness_mode_used.as_deref().unwrap_or("unknown"),
             current_lsn = explain.current_lsn_at_query.unwrap_or(0),
-            watermark_lsn = explain.freshness_watermark_lsn.unwrap_or(0),
+            watermark_lsn = ?explain.freshness_watermark_lsn, // None = not wired (TD-OEDIRWM-1)
             wal_delta_searched = explain.wal_delta_searched,
             wal_delta_records_scanned = explain.wal_delta_records_scanned.unwrap_or(0),
             merge_input_directory_records = merge_input_directory.unwrap_or(0),

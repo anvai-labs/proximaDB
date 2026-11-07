@@ -267,18 +267,10 @@ impl SstEngine {
                 let collection_id = params.collection_id.as_deref().ok_or_else(|| {
                     SstError::InvalidArgument("Collection ID is required".to_string())
                 })?;
-                let identity =
-                    crate::storage::trait_components::path_resolver::typed_path_identity(
-                     crate::storage::trait_components::path_resolver::typed_identity_from_storage_assignment(
-                         Some(assignment),
-                     ),
-                 );
-                let storage_url =
-                    crate::storage::trait_components::path_resolver::collection_data_path_typed(
-                        &assignment.base_location,
-                        collection_id,
-                        identity,
-                    );
+                let storage_url = crate::storage::trait_components::path_resolver::collection_data_path_for_assignment(
+                    assignment,
+                    collection_id,
+                );
                 debug!(
                     "🔍 SST FLUSH: Using storage URL from params: {}",
                     storage_url
@@ -2291,6 +2283,18 @@ mod tests {
         assert_eq!(
             SstEngine::get_collection_storage_url_from_params(&params).unwrap(),
             expected
+        );
+        // TD-OEDIRWM-1: the shared resolver must produce the explicit
+        // identity + typed-path composition. (A reader once composed its own
+        // root from the raw base_location and never found what the writer
+        // wrote; new readers must call this resolver.)
+        assert_eq!(
+            crate::storage::trait_components::path_resolver::collection_data_path_for_assignment(
+                &assignment,
+                "13",
+            ),
+            expected,
+            "the shared resolver must equal the explicit identity + typed-path composition"
         );
     }
 
