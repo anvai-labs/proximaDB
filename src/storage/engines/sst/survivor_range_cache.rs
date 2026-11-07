@@ -541,10 +541,12 @@ impl SurvivorRangeCache {
     /// of the exact-key residency check — `Some(bytes)` iff a subsequent
     /// `get_or_fetch_in_parent(kind, path, off, len, parent_off, parent_len)`
     /// would be served WITHOUT running its loader. Probes, in the same order
-    /// as the real method and ALL side-effect-free (no `track_hot_key`, no
-    /// hit/miss or `parent_l2_*` counters, no `record_l2s`, no L1 promotion —
-    /// every accounting in `get_or_fetch_in_parent` lives in its body, not in
-    /// the stores):
+    /// as the real method, with none of the cache's own accounting (no
+    /// `track_hot_key`, no hit/miss or `parent_l2_*` counters, no
+    /// `record_l2s`, no L1 promotion — that accounting lives in
+    /// `get_or_fetch_in_parent`'s body). NOT free at the store: an L2 hit
+    /// (steps 3-4) is a full verified disk read that bumps the store's
+    /// recency and protection-group hit stats (TD-SCANDEG-3):
     ///
     /// 1. exact-range L1 (the `{path}:{off}:{len}` scoped key);
     /// 2. parent-region L1 slice (the write-time seed key);

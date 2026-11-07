@@ -6288,20 +6288,26 @@ async fn small_rabitq_segment(
 /// Sets `PROXIMADB_TRACE_GETS=1` for the test and removes it on drop — even
 /// when an assertion panics — so later tests in the same process never see a
 /// leaked trace switch.
-struct TraceGetsGuard;
+struct TraceGetsGuard(Option<String>);
 impl TraceGetsGuard {
     fn on() -> Self {
+        let previous = std::env::var("PROXIMADB_TRACE_GETS").ok();
         // SAFETY: nextest (the supported runner) gives each test its own
         // process. Under `cargo test`, non-#[serial] tests elsewhere share the
         // env and the global GET trace — run these under nextest.
         unsafe { std::env::set_var("PROXIMADB_TRACE_GETS", "1") };
-        Self
+        Self(previous)
     }
 }
 impl Drop for TraceGetsGuard {
     fn drop(&mut self) {
-        // SAFETY: as in `on`.
-        unsafe { std::env::remove_var("PROXIMADB_TRACE_GETS") };
+        // SAFETY: as in `on`. Restores a caller-exported value.
+        unsafe {
+            match &self.0 {
+                Some(v) => std::env::set_var("PROXIMADB_TRACE_GETS", v),
+                None => std::env::remove_var("PROXIMADB_TRACE_GETS"),
+            }
+        }
     }
 }
 
