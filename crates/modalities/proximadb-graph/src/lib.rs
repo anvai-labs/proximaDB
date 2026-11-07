@@ -59,7 +59,13 @@ pub use algorithms::{
 };
 pub use compaction::{CompactionConfig, CompactionManager, CompactionStats};
 pub use cypher_functions::{CypherFunction, CypherFunctionRegistry};
-pub use parser::{FilterExpression, GraphQuery, ParseResult, Pattern, Projection, parse_query};
+// R4 rename: the public GraphQuery/ParseResult here were the STUB types
+// (parse_query returns always-empty) shadowing the functional
+// same-named types in query.rs and cypher_parser.rs. The deprecated
+// aliases remain importable from the parser module.
+pub use parser::{
+    FilterExpression, Pattern, Projection, StubGraphQuery, StubParseResult, parse_query,
+};
 pub use query_ast::{
     CompiledPattern, CreateClause, CreateEdgeSpec, CreateNodeSpec, CypherClause, CypherParser,
     CypherStatement, DeleteClause, EdgeDirection as QueryEdgeDirection, FoundPath, GraphNode,

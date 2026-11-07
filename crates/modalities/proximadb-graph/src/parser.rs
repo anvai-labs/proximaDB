@@ -1,17 +1,23 @@
-//! Graph pattern query parser stubs.
+//! Graph pattern query parser STUBS (renamed 2026-11-07, R4 wave).
 //!
-//! Legacy stub types maintained for root-crate compatibility shims.
-//! The canonical Cypher/GQL parser lives in the query execution layer.
+//! These are legacy compatibility stubs — `parse_query` returns an
+//! ALWAYS-EMPTY query. They were originally named `GraphQuery`/
+//! `ParseResult`, shadowing the two functional same-named types in this
+//! crate (the `query::GraphQuery` traversal IR and the
+//! `cypher_parser::GraphQuery` executable envelope) — and the lib re-export
+//! promoted the STUB as the crate's public face while zero consumers used
+//! it (verified by census). Renamed `Stub*` so the shadowing is visible;
+//! deprecated aliases below keep source compatibility.
 
 /// Parse result
 #[derive(Debug, Clone)]
-pub struct ParseResult {
-    pub query: GraphQuery,
+pub struct StubParseResult {
+    pub query: StubGraphQuery,
 }
 
 /// Graph query (parsed representation)
 #[derive(Debug, Clone)]
-pub struct GraphQuery {
+pub struct StubGraphQuery {
     pub patterns: Vec<Pattern>,
     pub filters: Vec<FilterExpression>,
     pub projections: Vec<Projection>,
@@ -45,12 +51,21 @@ pub struct Projection {
 }
 
 /// Parse a graph query string
-pub fn parse_query(_input: &str) -> Result<ParseResult, String> {
-    Ok(ParseResult {
-        query: GraphQuery {
+pub fn parse_query(_input: &str) -> Result<StubParseResult, String> {
+    Ok(StubParseResult {
+        query: StubGraphQuery {
             patterns: vec![],
             filters: vec![],
             projections: vec![],
         },
     })
 }
+
+#[deprecated(
+    since = "0.5.2",
+    note = "stub type renamed StubGraphQuery; the crate's public GraphQuery re-export pointed at this STUB while nothing consumed it — use the canonical parsers instead"
+)]
+pub type GraphQuery = StubGraphQuery;
+
+#[deprecated(since = "0.5.2", note = "stub type renamed StubParseResult")]
+pub type ParseResult = StubParseResult;

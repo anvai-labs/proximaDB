@@ -1872,9 +1872,12 @@ impl CypherVisitor for QueryValidator {
 // GRAPH QUERY CONVERSION
 // ============================================================================
 
-/// GraphQuery represents an executable graph query
+/// ExecutableGraphQuery represents an executable graph query (renamed
+/// from GraphQuery 2026-11-07: three same-named types in one crate made
+/// the crate's public GraphQuery ambiguous — this one is the executable
+/// envelope built by cypher_query_to_graph_query)
 #[derive(Debug, Clone)]
-pub struct GraphQuery {
+pub struct ExecutableGraphQuery {
     /// Graph ID to execute against
     pub graph_id: String,
     /// Query type
@@ -1942,11 +1945,11 @@ pub enum GraphQueryType {
     },
 }
 
-/// Convert CypherQuery AST to executable GraphQuery
+/// Convert CypherQuery AST to an executable ExecutableGraphQuery
 pub fn cypher_to_graph_query(
     cypher: &CypherQuery,
     graph_id: &str,
-) -> Result<GraphQuery, ProximaDBError> {
+) -> Result<ExecutableGraphQuery, ProximaDBError> {
     // Stub implementation - full conversion not yet implemented
     let patterns = cypher
         .reading_clauses
@@ -1957,7 +1960,7 @@ pub fn cypher_to_graph_query(
         })
         .collect();
 
-    Ok(GraphQuery {
+    Ok(ExecutableGraphQuery {
         graph_id: graph_id.to_string(),
         query_type: GraphQueryType::Match {
             patterns,

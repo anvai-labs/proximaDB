@@ -44,7 +44,8 @@ pub use cypher::{
     CypherParser,
     // Visitor pattern
     CypherVisitor,
-    // GraphQuery conversion
+    // GraphQuery conversion (renamed ExecutableGraphQuery upstream
+    // 2026-11-07; aliased back at the cypher.rs re-export site)
     GraphQuery,
     GraphQueryType,
     LocatedToken,

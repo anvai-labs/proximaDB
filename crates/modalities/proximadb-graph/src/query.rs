@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 /// Graph query expression
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GraphQuery {
+pub struct TraversalQuery {
     /// Query type
     pub query_type: GraphQueryType,
     /// Starting node(s) for traversal
@@ -20,7 +20,7 @@ pub struct GraphQuery {
     pub projection: QueryProjection,
 }
 
-impl GraphQuery {
+impl TraversalQuery {
     pub fn new(query_type: GraphQueryType) -> Self {
         Self {
             query_type,
@@ -47,7 +47,7 @@ impl GraphQuery {
     }
 }
 
-impl Default for GraphQuery {
+impl Default for TraversalQuery {
     fn default() -> Self {
         Self::new(GraphQueryType::Traversal)
     }
@@ -186,7 +186,11 @@ impl QueryExecutor {
         Self
     }
 
-    pub fn execute(&self, _graph: &dyn Graph, _query: &GraphQuery) -> Result<QueryResult, String> {
+    pub fn execute(
+        &self,
+        _graph: &dyn Graph,
+        _query: &TraversalQuery,
+    ) -> Result<QueryResult, String> {
         // Placeholder implementation
         // In production, this would parse and execute the query
         Ok(QueryResult::Count(0))
@@ -205,7 +209,7 @@ mod tests {
 
     #[test]
     fn test_query_construction() {
-        let query = GraphQuery::new(GraphQueryType::Traversal)
+        let query = TraversalQuery::new(GraphQueryType::Traversal)
             .with_start_node(QueryNode::by_label("Person"))
             .with_pattern(TraversalPattern {
                 direction: EdgeDirection::Outgoing,
