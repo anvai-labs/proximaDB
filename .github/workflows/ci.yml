@@ -168,6 +168,7 @@ jobs:
       proto: ${{ steps.filter.outputs.proto }}
       panic_policy: ${{ steps.filter.outputs.panic_policy }}
       capability_facade: ${{ steps.filter.outputs.capability_facade }}
+      type_name_ratchet: ${{ steps.filter.outputs.type_name_ratchet }}
       v1_proto_usage: ${{ steps.filter.outputs.v1_proto_usage }}
       # Granular Rust component detection for targeted testing
       query_changes: ${{ steps.filter.outputs.query_changes }}
@@ -380,6 +381,12 @@ jobs:
               - 'scripts/count_panic_patterns.sh'
               - 'docs/_internal/roadmap/PANIC_POLICY_BASELINE.json'
               - docs/_internal/roadmap/PANIC_POLICY_WORKSPACE_BASELINE.json
+            # TD-NAMING-1: the ratchet must run when ITS OWN inputs change —
+            # a script or baseline-only PR would otherwise skip the job.
+            type_name_ratchet:
+              - 'scripts/count_type_name_collisions.py'
+              - 'docs/_internal/roadmap/TYPE_NAME_COLLISION_BASELINE.json'
+              - 'tests/scripts/test_type_name_collisions.py'
             # TD-FACADE-1: the gate must also run on a PR that edits ONLY the
             # guard or its baseline -- otherwise the PR that weakens MARKER is
             # the one PR the gate never sees.
@@ -813,7 +820,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15  # max 1 min over 14 runs, 2026-10-09..11
     needs: changes
-    if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.python == 'true' || needs.changes.outputs.dup_ratchet == 'true' || needs.changes.outputs.capability_facade == 'true'
+    if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.python == 'true' || needs.changes.outputs.dup_ratchet == 'true' || needs.changes.outputs.capability_facade == 'true' || needs.changes.outputs.type_name_ratchet == 'true'
     steps:
       - uses: actions/checkout@v7
       - name: Check for tracked artifact files
@@ -847,6 +854,10 @@ jobs:
       # same reason the env-gate check above was promoted. Stdlib-only, ~15s.
       - name: Capability-facade ratchet
         run: python3 scripts/count_capability_facades.py --mode no-regression
+      - name: Type-name collision ratchet
+        # TD-NAMING-1: per-name ratchet — fails if any name's count rises, or if
+        # the total falls without the baseline being lowered in the same PR.
+        run: python3 scripts/count_type_name_collisions.py --mode no-regression
 
   deterministic-commit-contract:
     name: Deterministic Commit Contract
@@ -859,6 +870,8 @@ jobs:
         run: python3 scripts/check_deterministic_commit_contract.py
       - name: Test deterministic guard negative controls
         run: python3 -m unittest discover -s tests/scripts -p 'test_deterministic_commit_contract.py'
+      - name: Test type-name collision ratchet
+        run: python3 -m unittest discover -s tests/scripts -p 'test_type_name_collisions.py'
       - name: Test cloud-emulator image contract
         run: python3 -m unittest discover -s tests/scripts -p 'test_cloud_emulator_harness.py'
       - name: Test trusted branch-route workflow contract
