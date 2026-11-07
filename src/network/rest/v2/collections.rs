@@ -2393,7 +2393,8 @@ fn build_route_health_with_live_state(
              sidecar and the query path does not read it (TD-OEDIRWM-1), so \
              there is no live directory status to report."
         } else {
-            "Vector object-economy directory is currently SST-specific."
+            "The vector object-economy route was SST-specific and is not produced \
+             for any engine since TD-OEDIRWM-1."
         },
     };
     let (recall_probe_in_app_state, recall_probe_gate_open) = match recall_probe_state {
