@@ -381,15 +381,15 @@ jobs:
               - 'scripts/count_panic_patterns.sh'
               - 'docs/_internal/roadmap/PANIC_POLICY_BASELINE.json'
               - docs/_internal/roadmap/PANIC_POLICY_WORKSPACE_BASELINE.json
-            # TD-FACADE-1: the gate must also run on a PR that edits ONLY the
-            # guard or its baseline -- otherwise the PR that weakens MARKER is
-            # the one PR the gate never sees.
             # TD-NAMING-1: the ratchet must run when ITS OWN inputs change —
             # a script or baseline-only PR would otherwise skip the job.
             type_name_ratchet:
               - 'scripts/count_type_name_collisions.py'
               - 'docs/_internal/roadmap/TYPE_NAME_COLLISION_BASELINE.json'
               - 'tests/scripts/test_type_name_collisions.py'
+            # TD-FACADE-1: the gate must also run on a PR that edits ONLY the
+            # guard or its baseline -- otherwise the PR that weakens MARKER is
+            # the one PR the gate never sees.
             capability_facade:
               - 'src/**'
               - 'crates/**'

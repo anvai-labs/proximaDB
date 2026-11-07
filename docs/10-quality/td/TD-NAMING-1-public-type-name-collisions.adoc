@@ -1,30 +1,28 @@
-= TD-NAMING-1: Public Rust type names collide across crates — ratchet now, burn down in batches
+= TD-NAMING-1: Public Rust type names are defined many times — ratchet now, burn down in batches
 :status: Open
 :date: 2026-11-06
 :tags: [code-health, naming, solid, duplication]
 
 == Problem
 
-Baseline 2026-11-06 (`scripts/count_type_name_collisions.py`): 798 redundant definitions across 597 names; 987 re-export collisions across 501 names.
+Baseline 2026-11-06 (`scripts/count_type_name_collisions.py`): 797 redundant definitions across 596 names.
 
-Two metrics, two harms:
+The same `pub struct` / `enum` / `union` / `trait` name defined at several
+sites causes two harms:
 
-* **Re-export collisions — the wrong-type footgun.** A `pub use` exporting a
-  name that is defined at more than one site. Once two same-named types are
-  reachable from one module, an obvious-looking signature compiles against
-  the wrong one. Found in #2443: `trait_components::path_resolver`
-  re-exports the storage-ports `StorageAssignment` while call sites need the
-  PROTO `StorageAssignment`; a new helper typed `&StorageAssignment` failed
-  with "expected `StorageAssignment`, found a different `StorageAssignment`".
-  (The ports crate disambiguates internally as `ProtoStorageAssignment`; the
-  re-export loses that.)
-* **Redundant definitions — silent duplication of a primitive.** The same
-  name defined at several sites; a fix lands in one copy while the others
-  keep the bug (mandate #12).
+* **Silent duplication of a primitive** — a fix lands in one copy while the
+  others keep the bug (mandate #12: "silent duplication of an existing
+  primitive").
+* **Wrong-type footgun** — once two same-named types are reachable from one
+  module, an obvious-looking signature compiles against the wrong one. Found
+  in #2443: `trait_components::path_resolver` re-exports the storage-ports
+  `StorageAssignment` while call sites needed the PROTO `StorageAssignment`;
+  a helper typed `&StorageAssignment` failed with "expected
+  `StorageAssignment`, found a different `StorageAssignment`".
 
 [cols="3,1",options="header"]
 |===
-| Redundant definitions (name) | Definition sites
+| Name | Definition sites
 | `OperationType` | 12
 | `ColumnData` | 8
 | `FilterOperator` | 8
@@ -39,56 +37,51 @@ Two metrics, two harms:
 | `QueryType` | 6
 |===
 
-[cols="3,1",options="header"]
-|===
-| Re-export collisions (name) | `pub use` sites
-| `DistanceMetric` | 12
-| `MetadataFilter` | 10
-| `StorageEngineType` | 9
-| `TransactionState` | 9
-| `FilterValue` | 8
-| `CompressionAlgorithm` | 7
-| `QuantizationType` | 7
-| `CompactionConfig` | 6
-| `CompactionResult` | 6
-| `FilterExpression` | 6
-| `FilterOperator` | 6
-| `IndexStats` | 6
-|===
-
 == Counting rules
 
-* Sites, not files: two same-named types in different modules of one file
-  collide. Mutually exclusive `#[cfg(...)]` alternatives of one type in one
-  file are one definition.
-* Not counted: `type` aliases (per-crate `pub type Result<T>` is idiomatic);
-  generated protobuf, for the DEFINITIONS metric only (v1/v2 mirror domain
-  names by design — proto definitions DO count when something re-exports a
-  same-named type); test code (`tests/` / `benches/` / `examples/`,
-  `*_test(s).rs`, `tests.rs`, `#[cfg(test)]` and `#[cfg(all(test, ..))]`
-  modules and items — but not `cfg(any(test, ..))`, which ships); comments.
-* Files come from `git ls-files`, so a local baseline equals CI's.
+* Sites, not files; cfg-gated alternatives of one type (on the items or on
+  enclosing `mod` blocks) are one definition.
+* Not counted: `type` aliases; generated protobuf; test code (`tests/`,
+  `benches/`, `examples/`, `*_test(s).rs`, `tests.rs`, out-of-line
+  `#[cfg(test)] mod x;` files, `#[cfg(test)]` / `#[cfg(all(test, ..))]`
+  modules and items — `cfg(any(test, ..))` ships and is counted); comments and
+  string/char literal contents (masked before matching, using the
+  capability-facade ratchet's lexical rules).
+* `git ls-files` enumeration; deleted-but-indexed files skipped; an
+  unreadable tracked file fails closed.
+
+== Known gaps (deliberate — see Follow-ups)
+
+* **Re-exports are not measured.** The #2443 `StorageAssignment` case is a
+  RE-EXPORT collision (proto definition vs a storage-ports definition
+  surfaced by `pub use`); the guard does not see it. A regex re-export metric
+  was built and dropped in #2445 review: glob re-exports, `as` renames,
+  proto mirrors that are legitimately re-exported, and module-level `cfg`
+  all need real path resolution.
+* Macro-generated definitions are not seen.
 
 == Decision
 
 1. **Ratchet first, per name, both ways.** CI fails if any name's count rises
-   above its baseline (a fix elsewhere cannot pay for a new collision), and
-   if a total falls without the baseline being lowered in the same PR. No
-   big-bang rename — that would conflict with every open PR across
-   concurrent sessions.
+   above its baseline, and if the total falls without the baseline being
+   lowered in the same PR. `--mode baseline` refuses to RAISE any name. No
+   big-bang rename (it would conflict with every open PR).
 2. **Naming rule for new types:** a type that crosses a crate boundary or is
    re-exported carries a qualifying name — `ProtoStorageAssignment`,
    `SstCompactionConfig` — never a bare name already taken elsewhere.
-3. **Burn down in themed batches**, lowering the baseline in each PR:
-   a. re-export collisions first, they actively mislead — start with
-      `StorageAssignment` in `path_resolver`, then the most-re-exported
-      (`DistanceMetric`, `MetadataFilter`, `StorageEngineType`);
-   b. then the redundant-definition clusters (`OperationType`,
-      `FilterOperator`, `TransactionState`, `JoinType`, `BloomFilter`):
-      CONSOLIDATE where the copies are one concept, RENAME where they only
-      share a word.
+3. **Burn down in themed batches**, lowering the baseline in each PR, largest
+   clusters first (`OperationType`, `FilterOperator`, `TransactionState`,
+   `JoinType`, `BloomFilter`): CONSOLIDATE where the copies are one concept,
+   RENAME where they only share a word.
+
+== Follow-ups
+
+* **TD-NAMING-2 (to file with the tool): a resolving re-export check** —
+  `syn` + module-path resolution or a rust-analyzer query that reports two
+  distinct types with one name in scope at a module boundary. First target:
+  `StorageAssignment` in `path_resolver`.
 
 == To close
 
-The re-export metric is zero and every remaining redundant definition is
-documented as intentional.
+Redundant definitions are burned down to documented-intentional cases only,
+and the re-export check (TD-NAMING-2) exists and is green.

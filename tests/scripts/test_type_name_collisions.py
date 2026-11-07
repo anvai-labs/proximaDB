@@ -35,10 +35,7 @@ class TypeNameCollisionTests(unittest.TestCase):
         (path.write_bytes if raw else path.write_text)(text)
 
     def defs(self):
-        return mod.collect(self.root)[0]
-
-    def reexports(self):
-        return mod.collect(self.root)[1]
+        return mod.collect(self.root)
 
     # ---- definitions ----------------------------------------------------
 
@@ -92,20 +89,38 @@ class TypeNameCollisionTests(unittest.TestCase):
         self.write("src/b.rs", "#[cfg(test)]\npub struct Fixture;\npub struct Real;\n")
         self.assertEqual(self.defs(), {"Real": 1})
 
-    # ---- re-exports ----------------------------------------------------
+    # ---- lexical robustness (#2445 review round 2) ---------------------
 
-    def test_reexport_of_a_multiply_defined_name_is_a_collision(self):
-        # The #2443 footgun: proto + ports both define it; a module re-exports one.
-        self.write(PROTO, "pub struct StorageAssignment;\n")
-        self.write("crates/ports/src/lib.rs", "pub struct StorageAssignment;\n")
-        self.write("src/path_resolver.rs", "pub use ports::{CollectionPathResolver, StorageAssignment};\n")
-        self.assertEqual(self.reexports(), {"StorageAssignment": 1})
+    def test_brace_inside_a_string_in_a_test_module_does_not_hide_later_items(self):
+        # catalog/src/lib.rs had exactly this: `"\"Decimal\":{"` in a test.
+        self.write("src/a.rs", "pub struct Catalog;\n")
+        self.write(
+            "src/b.rs",
+            '#[cfg(test)]\nmod tests {\n    fn t() { assert!(s.contains("Decimal:{")); }\n}\npub struct Catalog;\n',
+        )
+        self.assertEqual(self.defs(), {"Catalog": 1})
 
-    def test_reexport_of_a_unique_name_is_fine_and_renames_are_honoured(self):
-        self.write("crates/ports/src/lib.rs", "pub struct Unique;\npub struct Twice;\n")
-        self.write("src/other.rs", "pub struct Twice;\n")
-        self.write("src/a.rs", "pub use ports::Unique;\npub use ports::Twice as PortsTwice;\n")
-        self.assertEqual(self.reexports(), {})
+    def test_comment_markers_inside_strings_are_not_comments(self):
+        self.write("src/a.rs", "pub struct Hidden;\n")
+        self.write(
+            "src/b.rs",
+            'const URL: &str = "s3://bucket/*";\npub struct Hidden;\nconst END: &str = "*/";\n',
+        )
+        self.assertEqual(self.defs(), {"Hidden": 1})
+
+    def test_module_level_cfg_alternatives_are_one_definition(self):
+        self.write(
+            "src/a.rs",
+            '#[cfg(feature = "aws")]\nmod imp { pub struct Factory; }\n'
+            '#[cfg(not(feature = "aws"))]\nmod imp { pub struct Factory; }\n',
+        )
+        self.assertEqual(self.defs(), {})
+
+    def test_out_of_line_cfg_test_module_file_is_excluded(self):
+        self.write("src/storage/common/mod.rs", "#[cfg(test)]\npub mod test_utils;\n")
+        self.write("src/storage/common/test_utils.rs", "pub struct MockEngine;\n")
+        self.write("src/engine.rs", "pub struct MockEngine;\n")
+        self.assertEqual(self.defs(), {})
 
     # ---- ratchet behaviour ---------------------------------------------
 
@@ -144,6 +159,14 @@ class TypeNameCollisionTests(unittest.TestCase):
         self.assertEqual(self._run("--mode", "no-regression", "--baseline", str(base)), 1)
         self._baseline()  # lowered in the same PR
         self.assertEqual(self._run("--mode", "no-regression", "--baseline", str(base)), 0)
+
+    def test_baseline_mode_refuses_to_raise(self):
+        self.write("src/a.rs", "pub struct X;\n")
+        self.write("src/b.rs", "pub struct X;\n")
+        base = self._baseline()
+        self.write("src/c.rs", "pub struct X;\n")
+        self.assertEqual(self._run("--mode", "baseline", "--baseline", str(base)), 1)
+        self.assertEqual(json.loads(base.read_text())["definitions"], {"X": 1})
 
     def test_missing_baseline_and_unreadable_source_fail_closed(self):
         self.write("src/a.rs", "pub struct Dup;\n")
