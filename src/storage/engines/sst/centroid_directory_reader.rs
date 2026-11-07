@@ -34,23 +34,24 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use proximadb_storage_common::centroid_directory::{LiveSegment, PaxCentroidDirectory};
 use proximadb_storage_filesystem_types::{DirEntry, FileSystem};
 
-use crate::storage::engines::sst::block_cluster::env_kill_switch_off;
 use crate::storage::engines::sst::centroid_directory_publisher::directory_objects_newest_first;
 use crate::storage::engines::sst::segment_format::{
     SegmentInvariants, centroid_directory_nprobe_for, pax_rabitq_pool_for_top_k,
     prefix_read_covers_segment,
 };
 
-/// READ gate: plan unfiltered ANN queries on the collection centroid directory.
-pub fn centroid_directory_read_enabled() -> bool {
-    env_kill_switch_off("PROXIMADB_PAX_READ_CENTROID_DIRECTORY")
+// READ gate: plan unfiltered ANN queries on the collection centroid directory.
+proximadb_config::env_kill_switch! {
+    /// Kill-switch gate; default ON (0|false|off|no disables).
+    pub fn centroid_directory_read_enabled() { gate: "PROXIMADB_PAX_READ_CENTROID_DIRECTORY", default: true }
 }
 
-/// TD-PAXDIR-1 D6 READ gate: planned segments with a decode key take their
-/// query-path metadata from the directory instead of reading it. Default ON
-/// since D8; needs directories published with the write-side gate on.
-pub fn directory_decode_keys_read_enabled() -> bool {
-    env_kill_switch_off("PROXIMADB_PAX_READ_DIRECTORY_DECODE_KEYS")
+// TD-PAXDIR-1 D6 READ gate: planned segments with a decode key take their
+// query-path metadata from the directory instead of reading it. Default ON
+// since D8; needs directories published with the write-side gate on.
+proximadb_config::env_kill_switch! {
+    /// Kill-switch gate; default ON (0|false|off|no disables).
+    pub fn directory_decode_keys_read_enabled() { gate: "PROXIMADB_PAX_READ_DIRECTORY_DECODE_KEYS", default: true }
 }
 
 /// One segment's part of a directory-planned query.

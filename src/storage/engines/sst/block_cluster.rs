@@ -690,13 +690,14 @@ pub(crate) fn finish_ivf_probe_classifier(
     })
 }
 
-/// TD-PAXDIR-1 D3: WRITE gate — compaction classifies its output with the
-/// collection's shared coarse model (the directory's dominant model) instead
-/// of training a new one, so every compacted segment speaks one cell space.
-/// Default ON since D8 (the P5b gate run passed); kill-switch like every
-/// PAXDIR gate.
-pub fn shared_model_enabled() -> bool {
-    env_kill_switch_off("PROXIMADB_PAX_WRITE_SHARED_MODEL")
+// TD-PAXDIR-1 D3: WRITE gate — compaction classifies its output with the
+// collection's shared coarse model (the directory's dominant model) instead
+// of training a new one, so every compacted segment speaks one cell space.
+// Default ON since D8 (the P5b gate run passed); kill-switch like every
+// PAXDIR gate.
+proximadb_config::env_kill_switch! {
+    /// Kill-switch gate; default ON (0|false|off|no disables).
+    pub fn shared_model_enabled() { gate: "PROXIMADB_PAX_WRITE_SHARED_MODEL", default: true }
 }
 
 /// Retrain when more than this fraction of an output's rows fall outside
@@ -1089,18 +1090,6 @@ fn gate_value_on(value: Option<&str>) -> bool {
             "1" | "true" | "on" | "yes"
         )
     })
-}
-
-/// Kill-switch read: ON unless set to `0|off|false|no` (unset is ON).
-pub(crate) fn env_kill_switch_off(name: &str) -> bool {
-    std::env::var(name)
-        .map(|v| {
-            !matches!(
-                v.trim().to_ascii_lowercase().as_str(),
-                "0" | "off" | "false" | "no"
-            )
-        })
-        .unwrap_or(true)
 }
 
 pub(crate) fn env_gate_on(name: &str) -> bool {

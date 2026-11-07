@@ -2099,58 +2099,43 @@ pub fn filter_region_write_enabled() -> bool {
     crate::storage::engines::sst::block_cluster::env_gate_on("PROXIMADB_PAX_WRITE_FILTER_REGION")
 }
 
-/// TD-FPRUNE-1 PR-E: answer a filtered query's Stage F from Region E when
-/// the segment carries it. Default ON (a segment without Region E is
-/// unaffected); `PROXIMADB_PAX_READ_FILTER_REGION=0|off|false|no` forces the
-/// full-row path.
-pub fn filter_region_read_enabled() -> bool {
-    crate::storage::engines::sst::block_cluster::env_kill_switch_off(
-        "PROXIMADB_PAX_READ_FILTER_REGION",
-    )
+// TD-FPRUNE-1 PR-E: answer a filtered query's Stage F from Region E when
+// the segment carries it. Default ON (a segment without Region E is
+// unaffected); `PROXIMADB_PAX_READ_FILTER_REGION=0|off|false|no` forces the
+// full-row path.
+proximadb_config::env_kill_switch! {
+    /// Kill-switch gate; default ON (0|false|off|no disables).
+    pub fn filter_region_read_enabled() { gate: "PROXIMADB_PAX_READ_FILTER_REGION", default: true }
 }
 
-/// Whether the coalesced-RaBitQ layout is engaged for new RaBitQ writes
-/// (ADR-062 / TD-RDSTRAT-6). **Default ON** — coalesced scan-then-rerank is the
-/// canonical PAX RaBitQ path (pre-GA: no serialized legacy data, so no back-compat
-/// — per the ADR-061 in-place amendment). The reader handles BOTH layouts via the
-/// `SEG_HEADER_MAGIC` presence-field. `PROXIMADB_PAX_COALESCED_RABITQ=0|off|false`
-/// is an emergency kill-switch back to the legacy in-block RaBitQ layout.
-pub fn coalesced_rabitq_enabled() -> bool {
-    !matches!(
-        std::env::var("PROXIMADB_PAX_COALESCED_RABITQ")
-            .ok()
-            .as_deref()
-            .map(str::trim)
-            .map(str::to_ascii_lowercase)
-            .as_deref(),
-        Some("0" | "off" | "false" | "no")
-    )
+// Whether the coalesced-RaBitQ layout is engaged for new RaBitQ writes
+// (ADR-062 / TD-RDSTRAT-6). **Default ON** — coalesced scan-then-rerank is the
+// canonical PAX RaBitQ path (pre-GA: no serialized legacy data, so no back-compat
+// — per the ADR-061 in-place amendment). The reader handles BOTH layouts via the
+// `SEG_HEADER_MAGIC` presence-field. `PROXIMADB_PAX_COALESCED_RABITQ=0|off|false`
+// is an emergency kill-switch back to the legacy in-block RaBitQ layout.
+proximadb_config::env_kill_switch! {
+    /// Kill-switch gate; default ON (0|false|off|no disables).
+    pub(crate) fn coalesced_rabitq_enabled() { gate: "PROXIMADB_PAX_COALESCED_RABITQ", default: true }
 }
 
-/// TD-PAXRG-1: write the **row-group Region D** layout — Region D granules
-/// are Parquet-style row groups (Olap-framed, RowDirectory + in-block rgdir
-/// suppressed), per-RG stats ride the footer's MinMax payload, the RG target
-/// is floored at 256 KiB, and the OID resolver auto-captures (point-lookup
-/// authority; a format invariant of the layout, not a caller obligation).
-///
-/// DEFAULT ON (FLIPPED 2026-08-28): the TD-PAXRG-1 Phase-G evidence is
-/// complete — SIFT1M 100k recall@10 = 0.9896 identical to the legacy-block
-/// baseline (floor 0.90); at-rest 80.3% of legacy bytes (RowDirectory
-/// removal); micro-granule amplification closed 13.4×; OID-chunk top-k −34%
-/// bytes at GET parity+1; round-trip/twin/gate purity all pinned. Read side
-/// is unconditional. `PROXIMADB_PAX_WRITE_RG_LAYOUT=0|off|false|no` is the
-/// kill-switch back to the legacy block framing; the per-collection
-/// `pax_rg_layout:on|off` tag (flush) outranks the env.
-pub fn rg_layout_enabled() -> bool {
-    !matches!(
-        std::env::var("PROXIMADB_PAX_WRITE_RG_LAYOUT")
-            .ok()
-            .as_deref()
-            .map(str::trim)
-            .map(str::to_ascii_lowercase)
-            .as_deref(),
-        Some("0" | "off" | "false" | "no")
-    )
+// TD-PAXRG-1: write the **row-group Region D** layout — Region D granules
+// are Parquet-style row groups (Olap-framed, RowDirectory + in-block rgdir
+// suppressed), per-RG stats ride the footer's MinMax payload, the RG target
+// is floored at 256 KiB, and the OID resolver auto-captures (point-lookup
+// authority; a format invariant of the layout, not a caller obligation).
+//
+// DEFAULT ON (FLIPPED 2026-08-28): the TD-PAXRG-1 Phase-G evidence is
+// complete — SIFT1M 100k recall@10 = 0.9896 identical to the legacy-block
+// baseline (floor 0.90); at-rest 80.3% of legacy bytes (RowDirectory
+// removal); micro-granule amplification closed 13.4×; OID-chunk top-k −34%
+// bytes at GET parity+1; round-trip/twin/gate purity all pinned. Read side
+// is unconditional. `PROXIMADB_PAX_WRITE_RG_LAYOUT=0|off|false|no` is the
+// kill-switch back to the legacy block framing; the per-collection
+// `pax_rg_layout:on|off` tag (flush) outranks the env.
+proximadb_config::env_kill_switch! {
+    /// Kill-switch gate; default ON (0|false|off|no disables).
+    pub(crate) fn rg_layout_enabled() { gate: "PROXIMADB_PAX_WRITE_RG_LAYOUT", default: true }
 }
 
 /// Parse a `u64` env override, or return `default`. Used for the coalesced
@@ -4305,15 +4290,14 @@ struct CoarseProbeResult {
     prefetched_b: Vec<(u64, Vec<u8>)>,
 }
 
-/// TD-PAXDIR-1 D5 READ gate: fetch the probed cells' SQ8 rerank bytes in the
-/// coarse probe's Region-A wave (A0 records each cell's Region-B extent), so
-/// the rerank needs no dependent wave. Trades bytes (every row of a probed
-/// cell, not only survivors) for one fewer round trip. Default ON since D8
-/// (the passing P5b gate arms ran with it); kill-switch off.
-fn same_wave_rerank_enabled() -> bool {
-    crate::storage::engines::sst::block_cluster::env_kill_switch_off(
-        "PROXIMADB_PAX_READ_SAME_WAVE_RERANK",
-    )
+// TD-PAXDIR-1 D5 READ gate: fetch the probed cells' SQ8 rerank bytes in the
+// coarse probe's Region-A wave (A0 records each cell's Region-B extent), so
+// the rerank needs no dependent wave. Trades bytes (every row of a probed
+// cell, not only survivors) for one fewer round trip. Default ON since D8
+// (the passing P5b gate arms ran with it); kill-switch off.
+proximadb_config::env_kill_switch! {
+    /// Kill-switch gate; default ON (0|false|off|no disables).
+    fn same_wave_rerank_enabled() { gate: "PROXIMADB_PAX_READ_SAME_WAVE_RERANK", default: true }
 }
 
 /// Region-B extents of the probed `cells` (A0 entries) whose Region-A read was
@@ -4455,18 +4439,14 @@ pub(crate) fn coalesced_header_prefetch_floor() -> usize {
     SEG_HEADER_PREFIX_LEN
 }
 
-fn split_probe_metadata_cache_enabled() -> bool {
-    // Metadata population is the shipped behavior: the coarse-probe path
-    // already fetched header/A0/RaBitQ params/footer, and failing to retain
-    // those immutable bytes makes every subsequent query repay four GETs.
-    // Preserve the pre-GA positive gate as an emergency opt-out for operators
-    // that explicitly set a false value; unset must remain ON.
-    std::env::var("PROXIMADB_PAX_SPLIT_PROBE_META_CACHE").map_or(true, |value| {
-        !matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "0" | "false" | "off" | "no"
-        )
-    })
+// Metadata population is the shipped behavior: the coarse-probe path
+// already fetched header/A0/RaBitQ params/footer, and failing to retain
+// those immutable bytes makes every subsequent query repay four GETs.
+// Preserve the pre-GA positive gate as an emergency opt-out for operators
+// that explicitly set a false value; unset must remain ON.
+proximadb_config::env_kill_switch! {
+    /// Split-probe metadata-cache kill-switch; default ON.
+    fn split_probe_metadata_cache_enabled() { gate: "PROXIMADB_PAX_SPLIT_PROBE_META_CACHE", default: true }
 }
 
 /// TD-RDSTRAT-8 PR-B: compute survivors from ONLY the `nprobe` nearest coarse
