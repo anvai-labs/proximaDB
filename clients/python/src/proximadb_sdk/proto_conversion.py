@@ -36,23 +36,33 @@ class ProtoConverter:
 
     _DISTANCE_METRIC_STR_TO_INT: dict[str, int] = {
         "unspecified": 0,
+        "distance_metric_unspecified": 0,
         "cosine": 1,
         "euclidean": 2,
         "dot_product": 3,
         "hamming": 4,
         "manhattan": 5,
         "jaccard": 6,
-        "chebyshev": 7,
-        "canberra": 8,
-        "minkowski": 9,
-        "angular": 10,
+        # ANGULAR/CHEBYSHEV/CANBERRA/MINKOWSKI match
+        # proto/proximadb/v1/vector_types.proto (the former table rotated
+        # these four by one — angular encoded 10 while the proto says 7;
+        # guarded by TestProtoDriftGuard).
+        "angular": 7,
+        "chebyshev": 8,
+        "canberra": 9,
+        "minkowski": 10,
         "bray_curtis": 11,
         "hellinger": 12,
         "custom": 13,
     }
 
     _DISTANCE_METRIC_INT_TO_STR: dict[int, str] = {
-        v: k for k, v in _DISTANCE_METRIC_STR_TO_INT.items()
+        v: k
+        for k, v in _DISTANCE_METRIC_STR_TO_INT.items()
+        # skip alias keys so the fully-qualified form cannot win the
+        # last-key-wins comprehension (review round 1: 0 decoded as
+        # "distance_metric_unspecified" instead of "unspecified")
+        if not (k.endswith("_unspecified") and k != "unspecified")
     }
 
     # =========================================================================

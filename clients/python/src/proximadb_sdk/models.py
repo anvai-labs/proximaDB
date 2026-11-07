@@ -66,7 +66,7 @@ class DistanceMetric(str, Enum):
 class DistanceMetricType(int, Enum):
     """Distance metric types for gRPC API (integer-based, matches v1 proto)
 
-    Maps to proximadb.v1.types_pb2.DistanceMetric enum.
+    Maps to the proximadb.v1 vector_types.proto DistanceMetric enum.
     Use these constants when working with gRPC to avoid magic numbers.
 
     Example:
@@ -80,10 +80,14 @@ class DistanceMetricType(int, Enum):
     HAMMING = 4
     MANHATTAN = 5
     JACCARD = 6
-    CHEBYSHEV = 7
-    CANBERRA = 8
-    MINKOWSKI = 9
-    ANGULAR = 10
+    # Match proto/proximadb/v1/vector_types.proto (the former values were
+    # rotated by one for these four — the docstring claimed proto parity
+    # while the enum disagreed; fixed with a types_pb2 drift guard in
+    # tests/unit/test_proto_conversion_cov.py).
+    ANGULAR = 7
+    CHEBYSHEV = 8
+    CANBERRA = 9
+    MINKOWSKI = 10
     BRAY_CURTIS = 11
     HELLINGER = 12
     CUSTOM = 13

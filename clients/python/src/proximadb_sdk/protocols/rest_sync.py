@@ -984,10 +984,10 @@ class ProximaDBClient:
                 4: "hamming",
                 5: "manhattan",
                 6: "jaccard",
-                7: "chebyshev",
-                8: "canberra",
-                9: "minkowski",
-                10: "angular",
+                7: "angular",
+                8: "chebyshev",
+                9: "canberra",
+                10: "minkowski",
                 11: "bray_curtis",
                 12: "hellinger",
                 13: "custom",
@@ -1154,12 +1154,22 @@ class ProximaDBClient:
         )
         if isinstance(distance_metric_value, int):
             # Map proto enum values to string names
+            # Full proto range — the former 1-5 truncation silently
+            # decoded 6-13 as "cosine" (review round 1, MEDIUM-4).
             distance_metric_map = {
                 1: "cosine",
                 2: "euclidean",
                 3: "dot_product",
-                4: "manhattan",
-                5: "hamming",
+                4: "hamming",
+                5: "manhattan",
+                6: "jaccard",
+                7: "angular",
+                8: "chebyshev",
+                9: "canberra",
+                10: "minkowski",
+                11: "bray_curtis",
+                12: "hellinger",
+                13: "custom",
             }
             distance_metric_value = distance_metric_map.get(
                 distance_metric_value, "cosine"
@@ -1270,13 +1280,13 @@ class ProximaDBClient:
                 1: "cosine",
                 2: "euclidean",
                 3: "dot_product",
-                4: "manhattan",
-                5: "hamming",
+                4: "hamming",
+                5: "manhattan",
                 6: "jaccard",
-                7: "chebyshev",
-                8: "canberra",
-                9: "minkowski",
-                10: "angular",
+                7: "angular",
+                8: "chebyshev",
+                9: "canberra",
+                10: "minkowski",
                 11: "bray_curtis",
                 12: "hellinger",
                 13: "custom",
