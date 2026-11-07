@@ -69,7 +69,7 @@ def test_distance_metric_to_int_all_inputs():
     assert ProtoConverter.distance_metric_to_int("cosine") == 1
     assert ProtoConverter.distance_metric_to_int("COSINE") == 1  # case-insensitive
     assert ProtoConverter.distance_metric_to_int("euclidean") == 2
-    assert ProtoConverter.distance_metric_to_int("minkowski") == 9
+    assert ProtoConverter.distance_metric_to_int("minkowski") == 10
     assert ProtoConverter.distance_metric_to_int("custom") == 13
     # invalid string -> 0
     assert ProtoConverter.distance_metric_to_int("nope") == 0
@@ -305,3 +305,44 @@ def test_convenience_functions_delegate():
 
 if __name__ == "__main__":  # pragma: no cover
     pytest.main([__file__, "-v"])
+
+
+class TestProtoDriftGuard:
+    """The SDK's hand-written enum tables must match the .proto.
+
+    Born from R4 wave-2 PR B: three rest_sync reverse maps, the
+    proto_conversion table, and the models IntEnum had ALL silently rotated
+    ANGULAR/CHEBYSHEV/CANBERRA/MINKOWSKI by one — a create_collection with
+    metric="angular" encoded 7 and the response decoded 7 as "chebyshev".
+    The generated types_pb2 module is the single source of truth; this test
+    makes any future hand-edit that diverges from it fail CI.
+    """
+
+    def test_distance_metric_table_matches_proto(self) -> None:
+        from proximadb_sdk.v1 import vector_types_pb2 as types_pb2
+
+        proto = {
+            proto.name.lower(): proto.number
+            for proto in types_pb2.DistanceMetric.DESCRIPTOR.values
+        }
+        ours = ProtoConverter._DISTANCE_METRIC_STR_TO_INT
+        for name, number in proto.items():
+            assert ours.get(name) == number, (
+                f"SDK table drifted from proto: {name} should be {number}, "
+                f"table says {ours.get(name)}"
+            )
+
+    def test_distance_metric_intenum_matches_proto(self) -> None:
+        from proximadb_sdk.models import DistanceMetricType
+        from proximadb_sdk.v1 import vector_types_pb2 as types_pb2
+
+        for proto in types_pb2.DistanceMetric.DESCRIPTOR.values:
+            ours = getattr(DistanceMetricType, proto.name, None)
+            if proto.name == "DISTANCE_METRIC_UNSPECIFIED":
+                # the IntEnum spells it UNSPECIFIED (documented alias)
+                ours = DistanceMetricType.UNSPECIFIED
+            assert ours is not None, f"IntEnum missing proto member {proto.name}"
+            assert ours.value == proto.number, (
+                f"IntEnum drift: {proto.name} should be {proto.number}, "
+                f"enum says {ours.value}"
+            )
