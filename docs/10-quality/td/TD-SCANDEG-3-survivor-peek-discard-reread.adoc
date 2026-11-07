@@ -1,0 +1,50 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-SCANDEG-3: The survivor planner reads disk-tier peeks twice
+:status: Open
+:date: 2026-11-06
+:tags: [cost, survivor-cache, local-disk, design-decision-needed]
+
+== Verified facts
+
+* The coalesced SQ8 survivor planner (Region B) and the Region-D OID-chunk
+  planner classify each range with `peek_parent_residency` /
+  `peek_exact_residency`. The peek RETURNS bytes; the planner keeps only
+  `.is_some()`; the consume reads the same range again. For a disk-tier (L2)
+  peek hit that is the local-disk read stack paid twice per range.
+* The disk-tier probe itself is DELIBERATE and must stay: without it,
+  L1-evicted but L2-resident ranges are classified Cold and re-fetched from
+  object storage (TD-IOBUDGET-2). The fix is to stop reading twice, never to
+  drop the probe.
+* A related, separate billed-GET defect on the legacy OID tail is
+  TD-IOBUDGET-3.
+
+== Two designs, both tried in #2442 review
+
+[cols="1,2,2",options="header"]
+|===
+| Design | How | Cost found in review
+
+| A. Carry the bytes
+| Planner keeps the peeked bytes in the slot and serves them at consume
+  through a peek-aware seam.
+| Transient memory the old code never held, sized per arm per segment; the
+  serve bypassed per-tenant and L2 counters; a parent-L1 peek returns the
+  WHOLE parent region, which must be sliced (or not carried).
+
+| B. Promote at peek
+| A disk-tier peek hit inserts the range into L1; the consume's ordinary
+  lookup hits L1.
+| Later promotions in one plan can evict ranges already classified resident,
+  turning them into unbatched GETs at consume; the exact-L2 hit bypassed
+  `l2_stats()`; disk-served ranges were recorded as L1 memory hits.
+|===
+
+== To close — measure first
+
+Record per query on a warm-L2 bed: disk-tier peek hits, bytes re-read at
+consume, and L1 occupancy/evictions during the plan. Pick A (with a
+per-query budget) if plans exceed the tenant's L1 share, otherwise B with
+promotion counted through the same path an un-peeked consume uses. Either way
+`l2_stats()`, per-tenant counters and the io_trace L1/L2 split must match an
+un-peeked consume.

@@ -294,7 +294,10 @@ pub fn morsel_degree() -> usize {
 /// Config field `search_parallel_files` (from `[storage.optimization]` in TOML):
 /// - `0` (default) → 50% of CPU cores (wise default — leaves cores for flush/compaction/gRPC)
 /// - `1` → sequential (no parallelism; for debugging)
-/// - `n > 1` → exactly n parallel workers
+/// - `n > 1` → n parallel workers on the test-only ARC entry; on the production
+///   entry (`direct_search_with`) any degree > 1 only enables parallelism, and
+///   every live file is then driven concurrently via `join_all` — the value
+///   does NOT bound the fan-out there (TD-SCANDEG-1)
 ///
 /// Hot-path override: `PROXIMADB_SEARCH_PARALLEL_FILES` env var takes precedence
 /// over the config field — operators can tune without a restart.
@@ -331,8 +334,10 @@ fn resolve_parallel_degree(requested: u16) -> u16 {
     }
 }
 // TD-SEARCH-2 S2b: process-global count of concurrent searches. The auto
-// parallel degree divides by this (cores/2 / in_flight) so concurrent queries
-// don't oversubscribe. Explicit config/env values bypass the adaptive cap.
+// parallel degree divides by this (cores/2 / in_flight). Only the test-only ARC
+// entry increments it; on the production entry it stays 0, so this division
+// never applies to real traffic (TD-SCANDEG-1). Explicit config/env values
+// bypass the adaptive cap.
 static IN_FLIGHT_SEARCHES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// S2b: adaptive degree formula - pure for unit-testing. Divides base by the
@@ -1754,7 +1759,9 @@ impl SstEngine {
         // TD-SEARCH-2: inter-file parallel search. The degree is config/env-driven:
         //   search_parallel_files = 0 → 50% of CPU cores (wise default)
         //   search_parallel_files = 1 → sequential
-        //   search_parallel_files = N → exactly N workers
+        //   search_parallel_files = N → enables parallelism; this entry then
+        //   drives EVERY live file concurrently via join_all (N does not bound
+        //   the fan-out here — TD-SCANDEG-1)
         // Hot-path override: PROXIMADB_SEARCH_PARALLEL_FILES env takes precedence.
         let file_count = u16::try_from(sstable_files.len()).unwrap_or(u16::MAX);
         let parallel_degree = resolve_search_parallelism(self.config().search_parallel_files)
@@ -2699,7 +2706,9 @@ self.try_pax_cascade(
         Ok(all_candidates)
     }
 
-    /// TD-SEARCH-2 S2: Arc-receiver production entry. Same routing as
+    /// TD-SEARCH-2 S2: Arc-receiver entry — NOT the production entry: it is
+    /// reached only through `SearchCoordinator` (test-constructed) and tests;
+    /// production goes through `search_vectors_unified` (TD-SCANDEG-1). Same routing as
     /// `search_vectors_unified` (reuses `want_exact_search` +
     /// `use_orchestrated_search`), but the direct-search branch dispatches to
     /// the multi-core `fallback_to_direct_search_arc`. Exact + orchestrated

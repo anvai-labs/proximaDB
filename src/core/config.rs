@@ -1703,7 +1703,10 @@ pub struct SstConfig {
     /// TD-SEARCH-2: inter-file search parallelism degree.
     /// `0` = 50% of CPU cores (wise default — leaves cores for flush/compaction).
     /// `1` = sequential (debugging).
-    /// `n > 1` = exactly n concurrent segment-file scans.
+    /// `n > 1` = enables parallel segment-file scans. NOTE: on the production
+    /// search entry this does not bound concurrency — every live file is
+    /// scanned concurrently (TD-SCANDEG-1); only the test-only arc entry caps
+    /// in-flight scans at n.
     /// Hot-path override: `PROXIMADB_SEARCH_PARALLEL_FILES` env var.
     #[serde(default)]
     pub search_parallel_files: u16,
