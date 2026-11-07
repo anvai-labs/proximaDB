@@ -188,6 +188,14 @@ impl CollectionSeries {
         now_secs: u64,
     ) {
         use std::sync::atomic::Ordering::Relaxed;
+        // The registry renders scope LABELS, so a Named scope whose name is a
+        // numeric id would alias a StableTenant label: two map slots sharing
+        // one prometheus child, and evicting either detaches the other's
+        // counters silently. Request scopes are only StableTenant | Shared
+        // (TD-CACHEC-1); anything else is refused, never minted.
+        if !matches!(scope, CacheScope::StableTenant(_) | CacheScope::Shared) {
+            return;
+        }
         let idx = outcome_index(outcome);
         let key = (scope.clone(), collection.clone());
         if self.try_fast(&key, idx, now_secs) {
@@ -199,13 +207,14 @@ impl CollectionSeries {
             self.overflow_counters()[idx].inc();
             return;
         }
-        // Admission policy: below the cap, block on the lock — the only time
-        // it is held while the count reads below cap is a mid-flight eviction
-        // (rare: at-cap registries with idle candidates; bounded: one
-        // evict_idle sweep), and a contended lookup must land in ITS series,
-        // never mis-priced into other/other. At the cap, try_lock: a lookup
-        // arriving while the evictor holds the lock counts as overflow
-        // instead of parking an async worker against an O(cap) sweep.
+        // Admission policy: below the cap, block on the lock — its critical
+        // sections are series mints (3 label lookups + one map insert,
+        // microseconds) and mid-flight eviction sweeps (rare: at-cap
+        // registries with idle candidates; bounded: one evict_idle pass), and
+        // a contended lookup must land in ITS series, never mis-priced into
+        // other/other. At the cap, try_lock: a lookup arriving while the
+        // evictor holds the lock counts as overflow instead of parking an
+        // async worker against an O(cap) sweep.
         let _admit = if self.admitted_count.load(Relaxed) >= self.cap {
             match self.admit_lock.try_lock() {
                 Ok(guard) => guard,

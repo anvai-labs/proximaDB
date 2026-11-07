@@ -4464,22 +4464,37 @@ mod tests {
         // SAFETY: nextest runs each test in its own process; no other thread
         // reads these env vars concurrently. Forces the inter-file spawn
         // route regardless of the host core count.
-        unsafe { std::env::set_var("PROXIMADB_SEARCH_PARALLEL_FILES", "4") };
-        unsafe { std::env::set_var("PROXIMADB_PAX_READ_DEFERRED_REHYDRATE", "0") };
         // Restore the process env after the search so a same-process `cargo
         // test` run (the CLAUDE.md fallback; nextest needs none of this) does
         // not leak the forced degree / disabled rehydrate into later tests —
-        // the O1 oracle below pins the rehydration shape these two would break.
-        struct EnvGuard;
+        // the O1 oracle below pins the rehydration shape these two would
+        // break. RESTORES, not removes: an ambient PROXIMADB_SEARCH_PARALLEL_
+        // FILES (a documented query-time override) must survive the test.
+        struct EnvGuard(Option<String>, Option<String>);
+        impl EnvGuard {
+            unsafe fn force(parallel: &str, deferred: &str) -> Self {
+                let prev_parallel = std::env::var("PROXIMADB_SEARCH_PARALLEL_FILES").ok();
+                let prev_deferred = std::env::var("PROXIMADB_PAX_READ_DEFERRED_REHYDRATE").ok();
+                std::env::set_var("PROXIMADB_SEARCH_PARALLEL_FILES", parallel);
+                std::env::set_var("PROXIMADB_PAX_READ_DEFERRED_REHYDRATE", deferred);
+                Self(prev_parallel, prev_deferred)
+            }
+        }
         impl Drop for EnvGuard {
             fn drop(&mut self) {
                 unsafe {
-                    std::env::remove_var("PROXIMADB_SEARCH_PARALLEL_FILES");
-                    std::env::remove_var("PROXIMADB_PAX_READ_DEFERRED_REHYDRATE");
+                    match &self.0 {
+                        Some(v) => std::env::set_var("PROXIMADB_SEARCH_PARALLEL_FILES", v),
+                        None => std::env::remove_var("PROXIMADB_SEARCH_PARALLEL_FILES"),
+                    }
+                    match &self.1 {
+                        Some(v) => std::env::set_var("PROXIMADB_PAX_READ_DEFERRED_REHYDRATE", v),
+                        None => std::env::remove_var("PROXIMADB_PAX_READ_DEFERRED_REHYDRATE"),
+                    }
                 }
             }
         }
-        let _env_guard = EnvGuard;
+        let _env_guard = unsafe { EnvGuard::force("4", "0") };
         let engine_for_spawn = engine.clone();
         crate::observability::io_trace::instrument_with_stable_tenant(
             Some("t".to_string()),
@@ -4511,8 +4526,7 @@ mod tests {
         );
         // degree == 1 on the SAME Arc entry: the sequential branch runs its
         // scans in-parent and must attribute too — pin both shapes of the route.
-        unsafe { std::env::set_var("PROXIMADB_SEARCH_PARALLEL_FILES", "1") };
-        let guard = EnvGuard;
+        let guard = unsafe { EnvGuard::force("1", "0") };
         crate::observability::io_trace::instrument_with_stable_tenant(
             Some("t".to_string()),
             Some(910_006),

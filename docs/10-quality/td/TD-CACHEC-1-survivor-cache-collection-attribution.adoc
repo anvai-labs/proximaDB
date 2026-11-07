@@ -145,6 +145,13 @@ ratio is a follow-up (a second family; it doubles cardinality).
   (review finding). If that fleet shape materializes, the cap becomes a
   config knob (per-TENANT caps or LRU-by-traffic admission) — deliberately
   not built now; the cap is the Prometheus-cardinality guardrail.
+* At a FULL registry, a lookup arriving while an eviction sweep holds the
+  admit lock counts under `other`/`other` even if the sweep just evicted
+  THAT collection's own series (the resumed-collection race). The window
+  is one sweep; the collection re-admits on its next lookup after it, but
+  the in-window reads stay mis-priced in the aggregate (review finding —
+  accepted: a sleep-and-retry on the hot path costs more than the rare
+  mis-priced reads).
 * Rejected alternative: deriving tenant and collection from the DrPath inside
   the cache key. Legacy `{base}/{id}/data/` and typed
   `accounts/{a}/{n}/{c}/data/` layouts coexist and can flip at restart, and

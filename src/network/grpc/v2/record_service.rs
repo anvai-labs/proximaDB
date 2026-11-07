@@ -2466,22 +2466,34 @@ impl ProximaRecordService for ProximaRecordServiceImpl {
         } else {
             Some(q.collection_id.clone())
         };
-        let resp = self
-            .api_handlers
-            .execute_sql(q.query, None, collection, identity.as_borrowed())
-            .await
-            .map_err(|e| {
-                // A DML lock conflict → ABORTED (retryable); other errors → INTERNAL.
-                if let Some((resource, holder)) = crate::errors::extract_dml_lock_conflict(&e) {
-                    let msg = match holder {
-                        Some(h) => format!("DML lock conflict on {resource} held by {h}"),
-                        None => format!("DML lock conflict on {resource}"),
-                    };
-                    Status::aborted(msg)
-                } else {
-                    Status::internal(format!("ExecuteQuery failed: {e}"))
-                }
-            })?;
+        // TD-CACHEC-1 (review round-9): open the io_trace scope here too —
+        // execute_query lowers SQL (including vector search) to the engines,
+        // and without the scope its KRU / object-store meters were dropped
+        // and its survivor-cache reads labeled `shared`, exactly like the
+        // search/search_stream handlers before their fix.
+        let resp = crate::observability::io_trace::instrument_with_stable_tenant(
+            identity.tenant_id.clone(),
+            identity.tenant_stable_id,
+            "grpc.v2.records.execute_query",
+            async {
+                self.api_handlers
+                    .execute_sql(q.query, None, collection, identity.as_borrowed())
+                    .await
+            },
+        )
+        .await
+        .map_err(|e| {
+            // A DML lock conflict → ABORTED (retryable); other errors → INTERNAL.
+            if let Some((resource, holder)) = crate::errors::extract_dml_lock_conflict(&e) {
+                let msg = match holder {
+                    Some(h) => format!("DML lock conflict on {resource} held by {h}"),
+                    None => format!("DML lock conflict on {resource}"),
+                };
+                Status::aborted(msg)
+            } else {
+                Status::internal(format!("ExecuteQuery failed: {e}"))
+            }
+        })?;
         let rows_returned = resp.rows_affected.unwrap_or(resp.rows.len() as u64);
         let rows = resp
             .rows
