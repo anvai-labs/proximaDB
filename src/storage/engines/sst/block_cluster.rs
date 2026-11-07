@@ -35,27 +35,20 @@ pub struct ClusterPlan {
     pub runs: Vec<OrderedClusterRun>,
 }
 
-/// Sort-by-code block clustering at PAX write (TD-RDSTRAT-5 S1, default ON
-/// since TD-WLP-4 / ADR-061 D3 — pre-GA "arm defaults" directive). Records are
-/// reordered by locality key at flush so blocks are spatially coherent and
-/// centroids+radii are emitted for the VOE directory. Reordering is
-/// result-preserving, so the only escape needed is the kill-switch:
-/// `PROXIMADB_PAX_BLOCK_CLUSTER=0|false|off|no` restores insertion-order
-/// writes (no centroids).
-pub fn block_cluster_enabled() -> bool {
-    !env_flag_off("PROXIMADB_PAX_BLOCK_CLUSTER")
-}
-
-/// True when `var` is explicitly set to a falsy value (kill-switch semantics:
-/// unset/unrecognized → not off).
-fn env_flag_off(var: &str) -> bool {
-    match std::env::var(var).ok().as_deref().map(str::trim) {
-        Some(v) => matches!(
-            v.to_ascii_lowercase().as_str(),
-            "0" | "false" | "off" | "no"
-        ),
-        None => false,
-    }
+// Sort-by-code block clustering at PAX write (TD-RDSTRAT-5 S1, default ON
+// since TD-WLP-4 / ADR-061 D3 — pre-GA "arm defaults" directive). Records are
+// reordered by locality key at flush so blocks are spatially coherent and
+// centroids+radii are emitted for the VOE directory. Reordering is
+// result-preserving, so the only escape needed is the kill-switch:
+// `PROXIMADB_PAX_BLOCK_CLUSTER=0|false|off|no` restores insertion-order
+// writes (no centroids).
+// Kill-switch read via the shared env_kill_switch! macro (#2438 follow-up
+// sweep); formerly the local env_flag_off helper — same kill set.
+proximadb_config::env_kill_switch! {
+    /// PAX block-cluster mode kill-switch: ON unless
+    /// PROXIMADB_PAX_BLOCK_CLUSTER=0|false|off|no restores insertion-order
+    /// writes (no centroids).
+    pub fn block_cluster_enabled() { gate: "PROXIMADB_PAX_BLOCK_CLUSTER", default: true }
 }
 
 /// TD-WLP-4/WLP-9 eval opt-in: upgrade the **flush** (L0) ordering from the

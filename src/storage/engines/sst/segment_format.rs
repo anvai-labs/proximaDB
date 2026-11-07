@@ -1163,29 +1163,24 @@ pub(crate) fn pax_field_to_col(field: &str) -> Option<i32> {
     }
 }
 
-/// ADR-089 / TD-FPRUNE-1: the filter-aware cascade gate. **FLIPPED
-/// default-ON 2026-08-31** — evidence (the promotion criterion the
-/// ENV_GATE_REGISTRY row records, discharged NON-vacuously through the real
-/// `search_vectors_unified` dispatch): the NEW filtered SIFT ratchet leg
-/// `sift_pax_filtered_cascade_recall_ratchet` measures filtered recall@10 =
-/// **0.996** vs filtered brute-force ground truth (floor 0.90) over 100
-/// queries at N=10k / 8 partitions, with every hit satisfying the predicate
-/// AND carrying rehydrated metadata (the top-k rehydration keeps the exact
-/// path's response shape). The unfiltered SIFT ratchet holds 0.989 with the
-/// P2 write layout active. Fail-safe on every axis (non-coalesced → exact
-/// fallback; stage-F error → exact fallback; empty allow-set → empty result);
-/// `PROXIMADB_PAX_FILTERED_CASCADE=0|off|false|no` is the emergency
-/// kill-switch back to the whole-object exact scan.
-pub(crate) fn pax_filtered_cascade_enabled() -> bool {
-    !matches!(
-        std::env::var("PROXIMADB_PAX_FILTERED_CASCADE")
-            .ok()
-            .as_deref()
-            .map(str::trim)
-            .map(str::to_ascii_lowercase)
-            .as_deref(),
-        Some("0" | "off" | "false" | "no")
-    )
+// ADR-089 / TD-FPRUNE-1: the filter-aware cascade gate. **FLIPPED
+// default-ON 2026-08-31** — evidence (the promotion criterion the
+// ENV_GATE_REGISTRY row records, discharged NON-vacuously through the real
+// `search_vectors_unified` dispatch): the NEW filtered SIFT ratchet leg
+// `sift_pax_filtered_cascade_recall_ratchet` measures filtered recall@10 =
+// **0.996** vs filtered brute-force ground truth (floor 0.90) over 100
+// queries at N=10k / 8 partitions, with every hit satisfying the predicate
+// AND carrying rehydrated metadata (the top-k rehydration keeps the exact
+// path's response shape). The unfiltered SIFT ratchet holds 0.989 with the
+// P2 write layout active. Fail-safe on every axis (non-coalesced → exact
+// fallback; stage-F error → exact fallback; empty allow-set → empty result);
+// `PROXIMADB_PAX_FILTERED_CASCADE=0|off|false|no` is the emergency
+// kill-switch back to the whole-object exact scan.
+// Kill-switch via the shared env_kill_switch! macro (one read of the
+// 0|false|off|no kill set; formerly an inline match — #2438 follow-up sweep).
+proximadb_config::env_kill_switch! {
+    /// Filter-aware cascade kill-switch (ADR-089 Stage-F); default ON.
+    pub(crate) fn pax_filtered_cascade_enabled() { gate: "PROXIMADB_PAX_FILTERED_CASCADE", default: true }
 }
 
 /// Stage-F observability counters (ADR-089 P1): what the metadata pre-stage

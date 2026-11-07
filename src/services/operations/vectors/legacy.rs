@@ -108,8 +108,6 @@ use crate::services::operations::{BatchOperationResult, BulkWriteRouter, Operati
 use crate::storage::cache::specialized::query_cache::{QueryCache, QueryKey};
 use crate::storage::engines::sst::SstEngine;
 
-const FILTER_FAIL_LOUD_ENV: &str = "PROXIMADB_FILTER_FAIL_LOUD";
-
 /// TD-WLP-5 (ADR-061 D4): the effective read freshness for a collection,
 /// applying the `Churn` Strong-override on top of the request's hint. `Churn`
 /// collections always delta-merge the unflushed WAL (a re-embedded symbol must
@@ -181,11 +179,16 @@ async fn sample_churn_working_set(
     }
 }
 
-fn filter_fail_loud_enabled() -> bool {
-    let value = std::env::var(FILTER_FAIL_LOUD_ENV).ok();
-    filter_fail_loud_for_value(value.as_deref())
+// Env read via the shared env_kill_switch! macro (#2438 follow-up sweep);
+// filter_fail_loud_for_value below remains as the test seam and MUST mirror
+// the macro's kill set (0|false|off|no, trimmed, case-insensitive).
+proximadb_config::env_kill_switch! {
+    /// Legacy-path filter evaluation is fail-loud by default; kill-switch
+    /// restores the legacy silent behavior.
+    fn filter_fail_loud_enabled() { gate: "PROXIMADB_FILTER_FAIL_LOUD", default: true }
 }
 
+#[cfg(test)]
 fn filter_fail_loud_for_value(value: Option<&str>) -> bool {
     !matches!(
         value.map(str::trim).map(str::to_ascii_lowercase).as_deref(),
