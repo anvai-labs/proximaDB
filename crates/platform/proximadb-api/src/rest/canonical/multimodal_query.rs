@@ -31,6 +31,7 @@ use axum::{
     routing::{delete, post},
 };
 use proximadb_data_model::ProximaValue;
+use proximadb_records::conversions::json_to_proxima;
 use proximadb_runtime::{InvalidQueryInput, UnifiedQueryPort};
 use serde::Deserialize;
 use tracing::{error, info};
@@ -92,30 +93,7 @@ struct ExplainQueryRequest {
 // ── Helper ────────────────────────────────────────────────────────────────────
 
 fn json_to_proxima_values(params: Option<Vec<serde_json::Value>>) -> Option<Vec<ProximaValue>> {
-    params.map(|ps| ps.into_iter().map(json_to_proxima_value).collect())
-}
-
-fn json_to_proxima_value(value: serde_json::Value) -> ProximaValue {
-    match value {
-        serde_json::Value::String(s) => ProximaValue::String(s),
-        serde_json::Value::Number(n) => n
-            .as_i64()
-            .map(ProximaValue::Int64)
-            .or_else(|| n.as_u64().map(ProximaValue::UInt64))
-            .or_else(|| n.as_f64().map(ProximaValue::Float64))
-            .unwrap_or(ProximaValue::Null),
-        serde_json::Value::Bool(b) => ProximaValue::Boolean(b),
-        serde_json::Value::Null => ProximaValue::Null,
-        serde_json::Value::Array(values) => {
-            ProximaValue::Array(values.into_iter().map(json_to_proxima_value).collect())
-        }
-        serde_json::Value::Object(fields) => ProximaValue::Map(
-            fields
-                .into_iter()
-                .map(|(key, value)| (key, json_to_proxima_value(value)))
-                .collect(),
-        ),
-    }
+    params.map(|ps| ps.iter().map(json_to_proxima).collect())
 }
 
 fn not_implemented(description: &str) -> impl IntoResponse {

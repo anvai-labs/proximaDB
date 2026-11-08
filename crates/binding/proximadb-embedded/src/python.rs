@@ -44,10 +44,10 @@ use numpy::{PyReadonlyArray1, PyReadonlyArray2};
 
 use super::{
     AccessMode, EmbeddedConfig, EmbeddedProximaDB, EmbeddedSqlQueryResult, StorageLocationConfig,
-    json_to_proxima_value,
 };
 use proximadb::core::config::{AdvancedPruneConfig, PruneModeConfig};
 use proximadb_embedded_common::proxima_value_to_json;
+use proximadb_records::conversions::json_to_proxima;
 
 /// Python wrapper for disk configuration
 #[pyclass(name = "DiskConfig", from_py_object)]
@@ -4126,8 +4126,8 @@ fn python_record_props(record: &Bound<'_, PyAny>) -> PyResult<proximadb_records:
             let key: String = key.extract()?;
             props.insert(
                 key,
-                proximadb_records::ProximaTreeNode::Value(json_to_proxima_value(
-                    python_to_json_record_value(&value)?,
+                proximadb_records::ProximaTreeNode::Value(json_to_proxima(
+                    &python_to_json_record_value(&value)?,
                 )),
             );
         }
@@ -4143,8 +4143,8 @@ fn python_record_props(record: &Bound<'_, PyAny>) -> PyResult<proximadb_records:
         {
             props.insert(
                 prop_name.to_string(),
-                proximadb_records::ProximaTreeNode::Value(json_to_proxima_value(
-                    python_to_json_record_value(&value)?,
+                proximadb_records::ProximaTreeNode::Value(json_to_proxima(
+                    &python_to_json_record_value(&value)?,
                 )),
             );
         }
@@ -4161,8 +4161,8 @@ fn python_dict_to_proxima_tree(
         let key: String = key.extract()?;
         props.insert(
             key,
-            proximadb_records::ProximaTreeNode::Value(json_to_proxima_value(
-                python_to_json_record_value(&value)?,
+            proximadb_records::ProximaTreeNode::Value(json_to_proxima(
+                &python_to_json_record_value(&value)?,
             )),
         );
     }

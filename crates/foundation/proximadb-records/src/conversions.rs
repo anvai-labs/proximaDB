@@ -177,6 +177,11 @@ pub fn proxima_value_to_json_canonical_owned(value: ProximaValue) -> serde_json:
 /// jsonpath/`serde_json` bridge (e.g. document filter path extraction) keeps identical
 /// value semantics. Canonical home for the previously-scattered `json_to_proxima_value`
 /// copies (arrow_ipc, websocket, rest/v2) to converge onto later.
+///
+/// Number handling: integers that fit `i64` become exact `Int64`; u64 > `i64::MAX`
+/// becomes `UInt64`; floats become `Float64`. The `String` fallback is unreachable
+/// for numbers serde_json can parse without `arbitrary_precision`; it exists so
+/// the fn is total and lossless if that feature is ever enabled.
 pub fn json_to_proxima(value: &serde_json::Value) -> ProximaValue {
     match value {
         serde_json::Value::Null => ProximaValue::Null,
@@ -184,8 +189,12 @@ pub fn json_to_proxima(value: &serde_json::Value) -> ProximaValue {
         serde_json::Value::Number(n) => {
             if let Some(i) = n.as_i64() {
                 ProximaValue::Int64(i)
+            } else if let Some(u) = n.as_u64() {
+                ProximaValue::UInt64(u)
+            } else if let Some(f) = n.as_f64() {
+                ProximaValue::Float64(f)
             } else {
-                ProximaValue::Float64(n.as_f64().unwrap_or(0.0))
+                ProximaValue::String(n.to_string())
             }
         }
         serde_json::Value::String(s) => ProximaValue::String(s.clone()),
