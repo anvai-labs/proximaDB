@@ -76,7 +76,6 @@ GETs were unbilled.
   on a warm deployment, and a `cold` burst is the first-touch signal, not
   a steady-state rate. A runnable end-to-end check lives in
   `scripts/smoke/survivor_attribution_smoke.sh`.
-  attributed.
   `tenant_stable_id` is the catalog stable tenant id (or `shared`), the value
   the per-tenant survivor series render. It is deliberately NOT named
   `tenant_id`: the billing families label `tenant_id` with the tenant name, so

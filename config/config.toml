@@ -5,9 +5,10 @@
 node_id = "proximadb-local"
 bind_address = "127.0.0.1"
 # In unified mode (default, see [api].unified_mode) THIS value does NOT bind
-# the public multiplexed port — the multiplexer binds [api].unified_port
-# (default 5678), and the CLI -p/--port flag overrides REST only, never the
-# multiplexer. To move the public port, set [api].unified_port.
+# anything: the public multiplexer binds [api].unified_port (default 5678) and
+# the internal REST listener derives from it (+10000). The CLI -p/--port flag
+# writes this field, which NO bind path consumes — it is a no-op. To move the
+# public port, set [api].unified_port.
 port = 5678
 data_dir = "/tmp/proximadb/data"
 
@@ -306,13 +307,15 @@ max_entries = 10000
 [storage.wal_config]
 # Global manifest location (centralized tracking of all WAL files)
 global_manifest_url = "file:///tmp/proximadb/manifest"
-# ADR-069 auto-flush driver: flush_interval_secs = 0 (the default) leaves the
-# background driver a NO-OP — data stays in WAL+memtable (searched from there)
-# until an explicit flush (e.g. the Arrow Flight `flush_collection` action).
-# Set it (e.g. 10) to drain memtables to L0 PAX segments every tick; the RPO
-# timer overrides the predicted-segment floor, so a trickle collection still
-# drains. A collection recovered from WAL at startup re-enters the driver's
-# unflushed list only at its first post-recovery write.
+# ADR-069 auto-flush driver RPO floor (seconds). DEFAULT 300 — the driver
+# spawns whenever this is > 0 and time-drains memtables to L0 PAX segments on
+# its tick; the RPO timer overrides the predicted-segment floor, so a trickle
+# collection still drains. Lower it to drain sooner (a collection recovered
+# from WAL at startup re-enters the driver's unflushed list only at its first
+# post-recovery write). 0 disables the time trigger (capacity watermarks can
+# still flush); with both 0 and memory_flush_size_bytes unreachable, data
+# stays in WAL+memtable (searched from there) until an explicit flush (e.g.
+# the Arrow Flight `flush_collection` action).
 # flush_interval_secs = 10
 memory_flush_size_bytes = 16777216
 global_flush_threshold = 4294967296
