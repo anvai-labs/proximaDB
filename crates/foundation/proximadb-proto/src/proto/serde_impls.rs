@@ -1310,6 +1310,135 @@ mod sql_value_visitor_differential_tests {
         );
     }
 
+    /// Golden-tree assertions: assert specific expected `SqlValue` variants
+    /// for specific JSON inputs, independent of the visitor. This catches
+    /// mutations that affect both the bytes path and the DOM path equally
+    /// (e.g., `visit_bool→always-true` would fail the `false` assertion).
+    ///
+    /// The differential test (`assert_differential`) only catches asymmetries
+    /// between the two paths. Golden assertions catch bugs in the visitor
+    /// itself by asserting the expected output for each primitive polarity/shape.
+    #[test]
+    fn golden_tree_assertions() {
+        // Primitives: each polarity/shape must produce the exact expected variant.
+        // If visit_bool is mutated to always return true, the false assertion fails.
+        assert_eq!(
+            sql_value_from_slice(b"true").unwrap(),
+            SqlValue {
+                value: Some(SqlValueVariant::BoolValue(true))
+            }
+        );
+        assert_eq!(
+            sql_value_from_slice(b"false").unwrap(),
+            SqlValue {
+                value: Some(SqlValueVariant::BoolValue(false))
+            }
+        );
+        assert_eq!(
+            sql_value_from_slice(b"null").unwrap(),
+            SqlValue {
+                value: Some(SqlValueVariant::NullValue(0))
+            }
+        );
+        assert_eq!(
+            sql_value_from_slice(b"42").unwrap(),
+            SqlValue {
+                value: Some(SqlValueVariant::Int64Value(42))
+            }
+        );
+        assert_eq!(
+            sql_value_from_slice(b"-100").unwrap(),
+            SqlValue {
+                value: Some(SqlValueVariant::Int64Value(-100))
+            }
+        );
+        assert_eq!(
+            sql_value_from_slice(b"1.5").unwrap(),
+            SqlValue {
+                value: Some(SqlValueVariant::NumberValue(1.5))
+            }
+        );
+        assert_eq!(
+            sql_value_from_slice(br#""hello""#).unwrap(),
+            SqlValue {
+                value: Some(SqlValueVariant::StringValue("hello".into()))
+            }
+        );
+
+        // u64 > i64::MAX must approximate as NumberValue, not wrap around.
+        assert_eq!(
+            sql_value_from_slice(format!("{}", u64::MAX).as_bytes()).unwrap(),
+            SqlValue {
+                value: Some(SqlValueVariant::NumberValue(u64::MAX as f64))
+            }
+        );
+
+        // Tagged forms: each tag must unwrap to the exact expected variant.
+        assert_eq!(
+            sql_value_from_slice(br#"{"string_value": "test"}"#).unwrap(),
+            SqlValue {
+                value: Some(SqlValueVariant::StringValue("test".into()))
+            }
+        );
+        assert_eq!(
+            sql_value_from_slice(br#"{"number_value": 1.5}"#).unwrap(),
+            SqlValue {
+                value: Some(SqlValueVariant::NumberValue(1.5))
+            }
+        );
+        assert_eq!(
+            sql_value_from_slice(br#"{"bool_value": true}"#).unwrap(),
+            SqlValue {
+                value: Some(SqlValueVariant::BoolValue(true))
+            }
+        );
+        assert_eq!(
+            sql_value_from_slice(br#"{"bool_value": false}"#).unwrap(),
+            SqlValue {
+                value: Some(SqlValueVariant::BoolValue(false))
+            }
+        );
+        assert_eq!(
+            sql_value_from_slice(br#"{"int64_value": 42}"#).unwrap(),
+            SqlValue {
+                value: Some(SqlValueVariant::Int64Value(42))
+            }
+        );
+        assert_eq!(
+            sql_value_from_slice(br#"{"null_value": null}"#).unwrap(),
+            SqlValue {
+                value: Some(SqlValueVariant::NullValue(0))
+            }
+        );
+
+        // Multi-key objects must become generic ObjectValue (single-key guard).
+        let multi_key = sql_value_from_slice(br#"{"string_value": "test", "other": 42}"#).unwrap();
+        assert!(matches!(
+            multi_key.value,
+            Some(SqlValueVariant::ObjectValue(_))
+        ));
+
+        // Empty containers.
+        assert_eq!(
+            sql_value_from_slice(b"[]").unwrap(),
+            SqlValue {
+                value: Some(SqlValueVariant::ArrayValue(
+                    crate::proto::proximadb_v1::SqlArray { values: vec![] }
+                ))
+            }
+        );
+        assert_eq!(
+            sql_value_from_slice(b"{}").unwrap(),
+            SqlValue {
+                value: Some(SqlValueVariant::ObjectValue(
+                    crate::proto::proximadb_v1::SqlObject {
+                        fields: std::collections::HashMap::new()
+                    }
+                ))
+            }
+        );
+    }
+
     #[test]
     fn simple_forms() {
         assert_differential(r#""hello""#);
