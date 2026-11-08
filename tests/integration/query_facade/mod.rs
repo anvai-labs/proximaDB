@@ -58,5 +58,10 @@ pub mod test_vector_through_facade;
 /// REST/gRPC parity tests - validates consistent results between API protocols
 pub mod test_rest_grpc_parity;
 
+/// Dual-transport RENDERING parity: real REST router vs real gRPC service over
+/// ONE query facade (the file above tests facade idempotence — see its honest
+/// scope note; this one exercises two genuinely different renderer stacks).
+pub mod test_rest_grpc_rendering_parity;
+
 /// Explain plan consistency tests - validates explain plan format across query types
 pub mod test_explain_plan_consistency;
