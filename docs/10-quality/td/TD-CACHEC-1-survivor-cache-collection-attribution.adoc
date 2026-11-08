@@ -69,7 +69,13 @@ GETs were unbilled.
   collection_id, outcome}` with outcome `hot` (DRAM), `l2` (persistent local store) or `cold`
   (the loader ran). It holds true counters and only counts inside an engine
   search scope, so flush seeding, compaction and warm replay are never
-  attributed.
+  counted. Operational shape (post-merge smoke, 2026-11-08): first touches
+  after an L0 flush record `cold` and populate the DRAM ranges; SUBSEQUENT
+  identical queries are served by the wave/prefetch caches upstream of
+  `get_or_fetch` and record NOTHING — the family does not grow per query
+  on a warm deployment, and a `cold` burst is the first-touch signal, not
+  a steady-state rate. A runnable end-to-end check lives in
+  `scripts/smoke/survivor_attribution_smoke.sh`.
   `tenant_stable_id` is the catalog stable tenant id (or `shared`), the value
   the per-tenant survivor series render. It is deliberately NOT named
   `tenant_id`: the billing families label `tenant_id` with the tenant name, so
