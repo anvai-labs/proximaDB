@@ -293,11 +293,13 @@ mod tests {
                     });
                 }
                 _ => {
-                    // Delete collection
-                    let coll_id = format!("ops_collection_{}", i % 10);
-                    tasks.spawn(
-                        async move { eng.delete_collection(&coll_id).await.map(|_| "delete") },
-                    );
+                    // TD-SEAM-16: the old delete arm called
+                    // StorageEngine::delete_collection — a no-op (always
+                    // returned false behind the never-populated registry).
+                    // The concurrent-op shape is preserved with the same
+                    // result count; production DELETE flows through
+                    // CollectionManager, not the engine.
+                    tasks.spawn(async move { Ok("delete") });
                 }
             }
         }

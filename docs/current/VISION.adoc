@@ -112,8 +112,17 @@ atomically through a new catalog snapshot. Each turn of the loop improves the ne
 
 === Deployment neutrality
 The same engine runs as a server over object storage, on local disk, or embedded in a process.
-The server over object storage is the primary deployment; embedded mode serves edge and
-single-process use cases.
+The server over object storage is the primary deployment. For SaaS and short-lived cloud
+compute, prefer object storage for committed data and catalog authority; compute and optional
+rebuildable disk caches can then have independent lifetimes. Embedded mode also targets
+scheduled jobs that open existing collections, write or read, explicitly materialize accepted
+writes, and exit. Local-disk and edge deployments remain valid.
+
+This is direction, not a claim that every modality can already reopen headlessly. Shared
+catalog, authorization, recovery and publication contracts apply in every deployment. The
+ADR-069 reattachable local WAL remains the streaming-write durability default; ephemeral
+cache storage does not replace it. Lifecycle and support gates live in the
+link:PLATFORM_PLAN.adoc#embedded-cloud-lifecycle[platform plan].
 
 == Non-goals
 

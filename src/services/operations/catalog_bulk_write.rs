@@ -23,6 +23,7 @@ use crate::catalog::{CatalogManager, TableIdentifier};
 use crate::network::arrow_ipc::codec::ArrowProtoCodec;
 use crate::services::operations::BulkWriteRouter;
 use proximadb_records::ProximaRecord;
+pub use proximadb_storage_common::IsolationLevel;
 
 /// Configuration for catalog-aware bulk writes
 #[derive(Debug, Clone)]
@@ -55,19 +56,6 @@ impl Default for CatalogBulkWriteConfig {
             max_batch_size: 100_000,
         }
     }
-}
-
-/// Transaction isolation levels for bulk writes
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum IsolationLevel {
-    /// Read uncommitted (fastest, no guarantees)
-    ReadUncommitted,
-    /// Read committed (see only committed data)
-    ReadCommitted,
-    /// Repeatable read (consistent snapshot)
-    RepeatableRead,
-    /// Serializable (full isolation)
-    Serializable,
 }
 
 /// Result of a catalog-aware bulk write operation

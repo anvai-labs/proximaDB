@@ -27,14 +27,22 @@ use prometheus::{
     register_int_counter_vec, register_int_gauge,
 };
 
-fn counter(name: &str, help: &str) -> IntCounter {
+// Canonical scalar policy shared with trace-sink and SST metrics: silently
+// register in the default registry, or return an unregistered renamed handle.
+pub(crate) fn counter(name: &str, help: &str) -> IntCounter {
     register_int_counter!(name, help).unwrap_or_else(|_| {
         IntCounter::new(format!("{name}_fallback"), help)
             .unwrap_or_else(|_| unreachable!("valid counter metric descriptor"))
     })
 }
 
-lazy_static::lazy_static! {
+/// TD-CACHEC-1: registry bound shared with the survivor-cache code (the
+/// metric docs and the LazyLock must not drift).
+pub const SURVIVOR_CACHE_COLLECTION_SERIES_CAP: usize = 200;
+/// TD-CACHEC-1: a pair idle this long gives up its series slot.
+pub const SURVIVOR_CACHE_COLLECTION_SERIES_IDLE_SECS: u64 = 86_400;
+
+lazy_static! {
     /// TD-COMPACT-13: compaction input deletes that failed and are pending
     /// reconciliation. >0 means superseded segments are still serving (cost
     /// defect, results correct) — observable rot, never silent.
@@ -52,7 +60,7 @@ lazy_static::lazy_static! {
     );
 }
 
-fn gauge(name: &str, help: &str) -> IntGauge {
+pub(super) fn gauge(name: &str, help: &str) -> IntGauge {
     register_int_gauge!(name, help).unwrap_or_else(|_| {
         IntGauge::new(format!("{name}_fallback"), help)
             .unwrap_or_else(|_| unreachable!("valid gauge metric descriptor"))
@@ -163,6 +171,20 @@ lazy_static! {
         "Cumulative survivor-cache misses per tenant (top tenants only)",
         &["tenant_id"],
     );
+    /// TD-CACHEC-1: logical survivor-cache lookups per (tenant, collection).
+    /// `tenant_stable_id` is the catalog stable tenant id (or `shared`), NOT
+    /// the tenant name the billing families label `tenant_id`; join through
+    /// the catalog id mapping. Counted
+    /// by outcome: `hot` (DRAM), `l2` (persistent local store), `cold`
+    /// (loader ran). The per-collection hot-hit ratio the warm-rate SKU
+    /// prices. True counters; at most
+    /// `SURVIVOR_CACHE_COLLECTION_SERIES_CAP` (tenant, collection) pairs,
+    /// later pairs fold into `other`/`other`.
+    pub static ref SURVIVOR_CACHE_COLLECTION_READS_TOTAL: Option<IntCounterVec> = counter_vec(
+        "proximadb_survivor_cache_collection_reads_total",
+        "Survivor-cache logical lookups (lookup-weighted, not bytes) per stable tenant id and catalog collection id, by outcome (hot|l2|cold)",
+        &["tenant_stable_id", "collection_id", "outcome"],
+    );
 
     /// Segment-invariants cache (footer/region-A metadata; a hit skips 3
     /// ranged GETs per segment per query).
@@ -237,6 +259,27 @@ lazy_static! {
         "proximadb_compaction_memory_admission_waits_total",
         "Compaction tasks that waited for process-wide weighted memory admission",
     );
+    // proximadb_consolidate_checks_total / proximadb_consolidate_degraded_total
+    // were removed with the background consolidate trigger (TD-COMPACT-16):
+    // nothing can increment them, and a series stuck at 0 reads as "checked,
+    // never degraded" rather than "not running".
+    /// TD-COMPACT-15: outcome of each COMPACT FULL request, by stop reason:
+    /// `completed` (reached target with passes), `at_target` (no-op),
+    /// **`error`** (the FULL loop itself failed — stalled, timed out; this
+    /// bucket is the reason the recording sits off the `?` path; requests
+    /// refused BEFORE the loop starts — missing catalog meta, an unresolvable
+    /// collection, no compaction manager, a target_segments-without-full bail
+    /// — are not counted here, they surface as the API error), else the
+    /// engine's stop reason: `max_passes` / `deadline` / `axis_pending` /
+    /// `contended`. (`no_progress` is NOT emitted: a pass-journal miss is an
+    /// eviction artifact and a flat live count means concurrent ingest is
+    /// offsetting the merges — neither is stagnation, #2418 review rounds
+    /// 20-21.)
+    pub static ref COMPACTION_FULL_STOP: Option<IntCounterVec> = counter_vec(
+        "proximadb_compaction_full_stop_total",
+        "COMPACT FULL request outcomes by stop reason (TD-COMPACT-15)",
+        &["reason"],
+    );
     pub static ref COMPACTION_QUEUE_DEPTH: IntGauge = gauge(
         "proximadb_compaction_queue_depth",
         "Compaction tasks queued across all collections",
@@ -280,6 +323,7 @@ pub fn touch() {
     SURVIVOR_CACHE_HITS.get();
     SURVIVOR_CACHE_MISSES.get();
     SURVIVOR_CACHE_BYTES.get();
+    let _ = SURVIVOR_CACHE_COLLECTION_READS_TOTAL.as_ref();
     SEGMENT_INVARIANTS_CACHE_HITS_TOTAL.get();
     SEGMENT_INVARIANTS_CACHE_MISSES_TOTAL.get();
     SEGMENT_INVARIANTS_CACHE_BYTES.get();
@@ -342,5 +386,88 @@ mod tests {
                 .get(),
             1024
         );
+    }
+}
+
+#[cfg(test)]
+mod scalar_registration_contract {
+    use super::*;
+    use prometheus::core::Collector;
+
+    struct RegistrationCleanup<T: Collector + Clone + 'static>(T);
+
+    impl<T: Collector + Clone + 'static> Drop for RegistrationCleanup<T> {
+        fn drop(&mut self) {
+            let _ = prometheus::unregister(Box::new(self.0.clone()));
+        }
+    }
+
+    fn assert_local_fallback(metric: &impl Collector, name: &str, help: &str) {
+        let descriptors = metric.desc();
+        assert_eq!(descriptors.len(), 1);
+        assert_eq!(descriptors[0].fq_name, format!("{name}_fallback"));
+        assert_eq!(descriptors[0].help, help);
+    }
+
+    fn assert_scrape(name: &str, help: &str, value: &str) -> prometheus::Result<()> {
+        let scrape = prometheus::TextEncoder::new().encode_to_string(&prometheus::gather())?;
+        assert!(
+            scrape
+                .lines()
+                .any(|line| line == format!("# HELP {name} {help}"))
+        );
+        assert!(scrape.lines().any(|line| line == format!("{name} {value}")));
+        assert!(!scrape.contains(&format!("{name}_fallback")));
+        Ok(())
+    }
+
+    #[test]
+    fn scalar_counter_registration_and_collision_contract() -> prometheus::Result<()> {
+        let name = format!("{}_counter_total", module_path!().replace("::", "_"));
+        let help = "Registered counter help";
+        let original = counter(&name, help);
+        let _cleanup = RegistrationCleanup(original.clone());
+        original.inc_by(3);
+        assert_scrape(&name, help, "3")?;
+
+        let duplicate = counter(&name, help);
+        let different_help = "Requested counter help";
+        let collision = counter(&name, different_help);
+        assert_local_fallback(&duplicate, &name, help);
+        assert_local_fallback(&collision, &name, different_help);
+        assert_eq!(duplicate.get(), 0);
+        assert_eq!(collision.get(), 0);
+        duplicate.inc_by(7);
+        collision.inc_by(11);
+        original.inc_by(2);
+        assert_eq!(original.get(), 5);
+        assert_eq!(duplicate.get(), 7);
+        assert_eq!(collision.get(), 11);
+        assert_scrape(&name, help, "5")
+    }
+
+    #[test]
+    fn scalar_gauge_registration_and_collision_contract() -> prometheus::Result<()> {
+        let name = format!("{}_gauge", module_path!().replace("::", "_"));
+        let help = "Registered gauge help";
+        let original = gauge(&name, help);
+        let _cleanup = RegistrationCleanup(original.clone());
+        original.set(-3);
+        assert_scrape(&name, help, "-3")?;
+
+        let duplicate = gauge(&name, help);
+        let different_help = "Requested gauge help";
+        let collision = gauge(&name, different_help);
+        assert_local_fallback(&duplicate, &name, help);
+        assert_local_fallback(&collision, &name, different_help);
+        assert_eq!(duplicate.get(), 0);
+        assert_eq!(collision.get(), 0);
+        duplicate.set(7);
+        collision.set(-11);
+        original.set(5);
+        assert_eq!(original.get(), 5);
+        assert_eq!(duplicate.get(), 7);
+        assert_eq!(collision.get(), -11);
+        assert_scrape(&name, help, "5")
     }
 }

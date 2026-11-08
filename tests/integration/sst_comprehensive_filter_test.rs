@@ -12,7 +12,6 @@ use proximadb::storage::engines::sst::SstEngine;
 use proximadb::storage::persistence::filesystem::FilesystemFactory;
 use proximadb::storage::traits::{FlushParameters, StorageQueryContext, UnifiedStorageEngine};
 use serde_json::json;
-use std::collections::HashMap;
 use std::sync::Arc;
 use tempfile::TempDir;
 

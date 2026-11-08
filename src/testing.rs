@@ -8,7 +8,6 @@
 #![cfg(test)]
 
 use std::collections::HashMap as StdHashMap;
-use std::sync::Arc;
 use tokio::sync::RwLock;
 
 // TD-CAT-10: Minimal in-memory test catalog for precision resolver tests.

@@ -1430,3 +1430,69 @@ hardware = "aiserver1: WSL2 Ubuntu 24.04, 16 vCPU, 125 GB; MinIO single drive + 
 date = "2026-10-28"
 version = "bench/tier1-e1-filter: binary sha256 8f81632d… built with --features aws at the anchor tree over develop ef3f74b79 (harness commit 57d6f7bdc adds --metadata-cols/--search-filters); recall gate relaxed 0.98 -> 0.97 per user direction 2026-10-28"
 notes = "n=1 per cell (exploratory). Bed drift disclosed: build settled 2-seg, first idle arm server auto-merged to terminal 1-seg (dynamic auto budget) — arms measured the 1-seg bed; unfiltered cap4@1seg reference re-running after a mid-chain dirty-worktree refusal. The 3M selectivity-control arm dropped (50k match-all probe establishes independence; ~3h re-runnable). Dropped chain launch (disk exhaustion from 28x10GB run-root caches) is not in any table. Raw results local-only (~/bench-beds/p5b-runs/e1/e1p-*). No production default change; the design (TD-FPRUNE-1 P5-P7) targets bytes, the cap lever already covers requests. Single-machine emulator evidence, not an SLA."
+
+[[claims]]
+id = "stage_f_parallel_decode_3m_sift"
+claim = "TD-FPRUNE-1 PR-D follow-up (#2303, shipped in v0.5.1): decoding Stage-F blocks on bounded parallel workers (morsel_degree spawn_blocking deal per wave, process-wide one-permit-per-core semaphore, small waves serial, cancel-on-drop, exact-by-construction with worker-failure routing to the exact path) cuts filtered object_cold p50 3136 -> 1385 ms (p95 3330 -> 1797) on the 3M SIFT128 category=3 bed, with Stage-F decode mean 2339 -> 632 ms/q; recall@10, GET/q, MB/q and wave counts identical in every phase (0.9751 / 235.3 / 737.0, waves 30). The p50 <= 1.5 s gate is met (5.29 s before #2298). The fetch-wall drop (1078 -> 701 ms/q) is observed, not isolated. Compute-term change only: no format, bytes or request-plan change."
+metric = "latency p50/p95 + Stage-F fetch/decode mean ms/q + recall@10 + GET/q + MB/q + waves p50, object_cold + local_disk_warm + post_write, n=1 per arm"
+status = "measured"
+asserted_in = [
+  "docs/history/evidence/STAGEF_PARALLEL_DECODE_2026_10_31.adoc",
+  "docs/10-quality/td/TD-FPRUNE-1-filter-aware-cascade-arc.adoc",
+]
+bench_source = "scripts/bench/sift1m_get_reduction.py"
+bench_command = "same layout-off 3M SIFT128 category=3 bed and protocol as the #2298 read-waves gate (--skip-ingest, n=1000, MinIO + Toxiproxy 5+5 ms on-host); the comparison arm is the #2298 BINARY (only the binary changed, sha256 prefix 6825514d5); PROXIMADB_SEARCH_MORSEL_DEGREE=1 additionally forces the serial path within the new binary as a self-consistency check, not as the reported baseline"
+artifact = "docs/history/evidence/STAGEF_PARALLEL_DECODE_2026_10_31.adoc"
+hardware = "aiserver1: WSL2 Ubuntu 24.04, 16 vCPU, 125 GB; MinIO single drive + Toxiproxy 2.12.0 on the same host"
+date = "2026-10-31"
+version = "PR #2303 binary sha256 prefix 6825514d5"
+notes = "Numbers transcribed from the PR #2303 bench section; the PR session's raw result.json files were local-only and are not checked in - provenance is the PR body plus this transcription, disclosed in the artifact. n=1 per arm on a single-host emulator: directions, not distributions; not an SLA. The 5.29 s -> 1.39 s narrative in the TD doc spans #2298+#2303 together; this entry carries only the #2303 arm."
+
+[[claims]]
+id = "region_e_filter_columns_3m_sift"
+claim = "TD-FPRUNE-1 PR-E (#2312, shipped in v0.5.1 with the WRITER gate default-OFF): a per-row filter-column region in the PAX segment (footer section 8, additive, future-version-skipping) cuts filtered object_cold read cost to header + footer + one GET per referenced column - GET/q 240.2 -> 74.2 (-69%), MB/q 769 -> 196 (-75%), request $/M 101.1 -> 34.7 (-66%), p50 1379 -> 448 ms, Stage-F fetch/decode 909/786 -> 44.5/11.9 ms/q - with recall@10 identical in every phase (0.9786). Warm phases same shape (local_disk_warm p50 1499 -> 691; post_write 1637 -> 859). Exactness pinned by a 57-filter oracle (allow-set == full-row Stage F) plus fallback for uncovered fields. v0.5.1 default is writer-OFF (mandate #8); these are the armed arms."
+metric = "GET/q + MB/q + $/M requests + recall@10 + latency p50/p95 + Stage-F fetch/decode mean ms/q, object_cold + warm phases, n=1 per arm"
+status = "measured"
+asserted_in = [
+  "docs/history/evidence/REGION_E_FILTER_COLUMNS_2026_10_31.adoc",
+  "docs/10-quality/td/TD-FPRUNE-1-filter-aware-cascade-arc.adoc",
+]
+bench_source = "scripts/bench/sift1m_get_reduction.py"
+bench_command = "a NEW layout-off 3M SIFT128 category=3 bed written for this PR (settled at 3 segments - NOT the #2303 bed), same harness protocol (n=1000, MinIO + Toxiproxy on-host); Region-D arm = same build with PROXIMADB_PAX_READ_FILTER_REGION=0, Region-E arm reads footer section 8 (writer gate armed for the armed-arm fixtures)"
+artifact = "docs/history/evidence/REGION_E_FILTER_COLUMNS_2026_10_31.adoc"
+hardware = "aiserver1: WSL2 Ubuntu 24.04, 16 vCPU, 125 GB; MinIO single drive + Toxiproxy 2.12.0 on the same host"
+date = "2026-10-31"
+version = "PR #2312 build (same bed/binary family as the #2303 gate)"
+notes = "Transcribed from the PR #2312 bench section; raw logs local-only, disclosed in the artifact. n=1 per arm, single-host emulator, not an SLA. Describes the writer-armed arms only; the shipped v0.5.1 default is writer default-OFF and the flip-on is TD-FPRUNE-1's own gate decision - this entry does not claim a default-on effect."
+
+[[claims]]
+id = "p24_sf1_bounded_memory_load"
+claim = "ADR-097 P2.4 exit gate (TD-USUB-22/#2286): the TPC-DS SF1 load + MATERIALIZE runs in bounded memory - 5.84 M rows loaded in 1,655 s and 22/22 tables published, peak RSS 10,401 MiB (load) / 10,773 MiB (MATERIALIZE) inside a 13,677 MiB cgroup, no OOM. 'Bounded' = the run refused to start outside a finite cgroup and the per-phase peaks (VmHWM + the cgroup peak: v2 memory.peak, v1 max_usage_in_bytes - this run was v1) were recorded into ledger.load_stats. The in-harness assertion added with this entry fails a run whose load/MATERIALIZE-phase cgroup peak goes beyond the cgroup bound (memory.high where one exists, else the hard limit, plus a small batched-charge tolerance) or was never captured; the harness remains advisory (#[ignore], manual, cgroup-gated)."
+metric = "peak RSS (VmHWM + cgroup memory.peak) per phase + rows loaded + tables published + wall time, SF1, n=1"
+status = "measured"
+asserted_in = [
+  "docs/history/evidence/P24_SF1_GATE_EVIDENCE_2026_10_23.adoc",
+]
+bench_source = "tests/tpc_perf_ledger_e2e.rs"
+bench_command = "TPC_PERF_SCALE=1 TPC_PERF_BENCHMARK=tpcds TPC_PERF_LOAD_ONLY=1 TPC_PERF_ALLOW_LARGE_SCALE=I_ACCEPT_ISOLATED_OOM TPC_PERF_HOST_HEADROOM_MIB=2048 cargo test --release --test tpc_perf_ledger_e2e -- --ignored <the gate test>; run inside the shell's ambient cgroup (v1 limit 13,677 MiB). scripts/run_tpc_perf_ledger.sh (systemd-run MemoryHigh/MemoryMax) is the wrapper for hosts that have systemd + cgroup v2 - this host had neither, which the artifact records"
+artifact = "docs/history/evidence/P24_SF1_GATE_EVIDENCE_2026_10_23.adoc"
+hardware = "the artifact's SF1 gate host: 4 vCPU, 15.7 GiB RAM, no swap; cgroup v1 memory.limit_in_bytes = 13,677 MiB (ambient, not systemd-run)"
+date = "2026-10-24"
+version = "release build, 2026-10-24; commit/build/host/run provenance in the artifact"
+notes = "Registered here (release-review F3) because the 0.5.0 changelog cites the P2.4 gate while the ledger had no entry for it. Without the datafusion-integration feature the sort path holds the whole table in memory - default features include it. The peak-vs-bound assertion rides the harness itself, so the claim is only as fresh as the last manual run; re-run before citing a new binary."
+
+[[claims]]
+id = "value_codec_phase1_visitor_deserialize"
+claim = "Phase 1 of the value-codec refactor replaced the two-pass Value-first SqlValue Deserialize (materialize serde_json::Value DOM, then walk it) with a one-pass streaming visitor (deserialize_any + Visitor). The kernel bench (benches/bench_value_codec.rs) measures the visitor path (sql_value_from_slice) against the DOM path (serde_json::from_str → serde_json::from_value) across six doc shapes (small object, string-heavy, numeric array, deep nested, tagged string, tagged array). Numbers are indicative — the real win is elimination of the intermediate DOM allocation, visible in throughput and allocation profiles."
+metric = "throughput (bytes/sec) and ns/iter for JSON→SqlValue deserialization, visitor vs DOM path"
+status = "unverified"
+asserted_in = [
+  "benches/bench_value_codec.rs",
+]
+bench_source = "benches/bench_value_codec.rs"
+bench_command = "cargo bench --bench bench_value_codec"
+artifact = ""
+hardware = ""
+date = "2026-11-07"
+version = "refactor/value-codec-phase1 branch"
+notes = "Kernel-level indicative numbers only. E2E ingest throughput (REST document insert) is the citable claim for any perf improvement; run the server binary with the bench harness and update this entry to 'measured' with artifact/hardware provenance before citing in release notes."

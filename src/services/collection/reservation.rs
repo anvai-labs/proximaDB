@@ -108,6 +108,35 @@ pub struct ReservationPoolConfig {
     /// marker (implied default).
     #[serde(default)]
     pub is_default: bool,
+    /// TD-TIER-1 SC6 S2: idle-reclaim TTL for this pool's grants, seconds —
+    /// a grant whose group has seen no read hit for this long (and is older
+    /// than `idle_reclaim_min_lifetime_secs`) is released by the reclaim
+    /// sweep: unregistered, unpinned, accrual stopped. `0` (default) = never
+    /// reclaim (enterprise pools stay persistent).
+    #[serde(default)]
+    pub idle_reclaim_secs: u64,
+    /// Guardrail against reclaim/re-grant flapping and against reaping a
+    /// just-admitted grant whose warm has not finished: a grant younger than
+    /// this is never reclaimed, idle or not.
+    #[serde(default = "default_idle_reclaim_min_lifetime_secs")]
+    pub idle_reclaim_min_lifetime_secs: u64,
+    /// TD-TIER-1 SC6 S3: aggregate warm/backfill bandwidth for this pool's
+    /// grants, MiB/s — the shared-disk fairness knob (one tenant's re-warm
+    /// must not starve another's READY; on ST1 keep it under the volume's
+    /// sustained baseline so the burst bucket survives). `0` (default) =
+    /// uncapped (today's behavior).
+    #[serde(default)]
+    pub warm_bandwidth_mib_per_s: u64,
+    /// TD-TIER-1 SC6 S4: ceiling on this pool's LIVE-grant bytes (the DRAM
+    /// protection share), enforced at admission — fail-closed like pool
+    /// capacity. `None` (default) = uncapped.
+    #[serde(default)]
+    pub dram_budget_bytes: Option<u64>,
+}
+
+/// Default grant age floor before idle reclaim may act (1 h).
+fn default_idle_reclaim_min_lifetime_secs() -> u64 {
+    3600
 }
 
 fn default_overhead_factor() -> f64 {
@@ -184,6 +213,18 @@ pub fn validate_pool_configs(pools: &[ReservationPoolConfig]) -> anyhow::Result<
             );
         }
     }
+    for pool in pools {
+        if pool.dram_budget_bytes == Some(0) {
+            anyhow::bail!(
+                "reservation pool '{}' sets dram_budget_bytes = 0; no grant could \
+                 ever be admitted (use None to uncap)",
+                pool.id
+            );
+        }
+        // NOTE: min_lifetime > idle_reclaim_secs is COHERENT (a grant ages
+        // past the floor and then idles past the TTL — the sweep checks both),
+        // so no cross-check here; an earlier guard wrongly refused those.
+    }
     let defaults = pools.iter().filter(|p| p.is_default).count();
     if defaults > 1 {
         anyhow::bail!("at most one reservation pool may set is_default (found {defaults})");
@@ -256,13 +297,31 @@ impl ReservationRegistry {
         // whenever it registers.
         // Registration is keyed by grant id, so re-registering a grant that is
         // still registered (an in-process reopen) replaces, never doubles.
-        // Known gap (recorded): a group still registered for a grant that the
-        // reopened ledger no longer holds is not pruned here.
+        // SC4 PR-D (reopen pruning): the reopen is also the one place that can
+        // PRUNE — a bridge group still keyed by a grant id the reopened
+        // ledgers no longer hold (an operator rollback of the pool file, a
+        // grant that left the ledger between registrations) would keep its
+        // entries pinned and its bytes charged against the armed budget until
+        // process exit. Unregister every group whose grant id is not in the
+        // live set; the store reconcile that unregistration triggers releases
+        // the stale group's pins (unregistration is idempotent, and groups of
+        // THIS registry's live grants were just re-registered above).
+        let mut live_group_ids = HashSet::new();
         for (_, authority) in registry.pools.values() {
             for grant in authority.grants_snapshot().await {
                 if grant.state.charges_capacity() && !grant.residency_prefixes.is_empty() {
                     proximadb_cache::register_protection_group(protection_group(&grant));
+                    live_group_ids.insert(grant.id.clone());
                 }
+            }
+        }
+        for group_id in proximadb_cache::process_protection_group_ids() {
+            if !live_group_ids.contains(&group_id) {
+                tracing::debug!(
+                    "TD-TIER-1 SC4: pruning protection group '{group_id}' at registry open \
+                     (its grant is not in the reopened ledgers)"
+                );
+                proximadb_cache::unregister_protection_group(&group_id);
             }
         }
         Ok(Some(Arc::new(registry)))
@@ -282,9 +341,15 @@ impl ReservationRegistry {
         collection_id: &str,
         now_unix_secs: i64,
         residency_prefixes: &[String],
+        pool_id: Option<&str>,
     ) -> Result<Grant, ReservationError> {
-        let handle =
-            self.spawn_reserve(tenant_id, collection_id, now_unix_secs, residency_prefixes);
+        let handle = self.spawn_reserve(
+            tenant_id,
+            collection_id,
+            now_unix_secs,
+            residency_prefixes,
+            pool_id,
+        );
         join_reserve(handle).await
     }
 
@@ -297,14 +362,22 @@ impl ReservationRegistry {
         collection_id: &str,
         now_unix_secs: i64,
         residency_prefixes: &[String],
+        pool_id: Option<&str>,
     ) -> tokio::task::JoinHandle<Result<Grant, ReservationError>> {
         let this = Arc::clone(self);
         let tenant = tenant_id.to_string();
         let collection = collection_id.to_string();
         let prefixes = residency_prefixes.to_vec();
+        let pool = pool_id.map(str::to_string);
         tokio::spawn(async move {
-            this.reserve_gated(&tenant, &collection, now_unix_secs, &prefixes)
-                .await
+            this.reserve_gated(
+                &tenant,
+                &collection,
+                now_unix_secs,
+                &prefixes,
+                pool.as_deref(),
+            )
+            .await
         })
     }
 
@@ -314,6 +387,7 @@ impl ReservationRegistry {
         collection_id: &str,
         now_unix_secs: i64,
         residency_prefixes: &[String],
+        pool_id: Option<&str>,
     ) -> Result<Grant, ReservationError> {
         if tenant_id.is_empty() {
             // The metering resolver rejects empty tenant ids, so an
@@ -327,7 +401,7 @@ impl ReservationRegistry {
         // Mutation + budget sync under one gate (SF1): the Σ read cannot
         // interleave with a concurrent mutation's commit.
         let _gate = self.mutation_gate.lock().await;
-        let (config, authority) = self.armed_default_pool()?;
+        let (config, authority) = self.resolve_pool(pool_id)?;
         let previous_bytes = authority
             .live_grant_snapshot(tenant_id, collection_id)
             .await
@@ -362,6 +436,37 @@ impl ReservationRegistry {
     /// The default pool and its config, refusing an unresolvable default
     /// (shared by the admission peek and the reserve — the dup-ratchet
     /// exists for exactly this twin).
+    /// The configured pool ids, for admission-time validation of a
+    /// collection's explicit `pool_id` (TD-TIER-1 SC6).
+    pub fn configured_pool_ids(&self) -> Vec<String> {
+        self.pools.keys().cloned().collect()
+    }
+
+    fn resolve_pool(
+        &self,
+        requested: Option<&str>,
+    ) -> Result<&(ReservationPoolConfig, ReservationAuthority), ReservationError> {
+        match requested.filter(|id| !id.is_empty()) {
+            None => self.armed_default_pool(),
+            Some(id) => {
+                let entry = self.pools.get(id).ok_or_else(|| {
+                    ReservationError::Invalid(format!(
+                        "reservation pool '{id}' is not configured; configured pools: [{}]",
+                        self.pools.keys().cloned().collect::<Vec<_>>().join(", ")
+                    ))
+                })?;
+                if entry.0.default_grant_bytes == 0 {
+                    return Err(ReservationError::Invalid(format!(
+                        "reservation pool '{id}' declares no default_grant_bytes;                          PERFORMANCE admission is not armed (set default_grant_bytes in                          [storage.reservation_pools])"
+                    )));
+                }
+                Ok(entry)
+            }
+        }
+    }
+
+    /// TD-TIER-1 SC6 policy seam routing ends here; the default below is
+    /// the only behavior before `pool_id` existed.
     fn armed_default_pool(
         &self,
     ) -> Result<&(ReservationPoolConfig, ReservationAuthority), ReservationError> {
@@ -394,11 +499,14 @@ impl ReservationRegistry {
     /// persists so a refusal keeps the old policy unchanged; the residual
     /// peek→reserve window (a concurrent reserve taking the headroom) is
     /// the recorded SC4 reconciliation seam.
-    pub async fn peek_performance_admission(&self) -> Result<(), ReservationError> {
+    pub async fn peek_performance_admission(
+        &self,
+        pool_id: Option<&str>,
+    ) -> Result<(), ReservationError> {
         if kill_switch_armed() {
             return Err(ReservationError::KillSwitch);
         }
-        let (config, authority) = self.armed_default_pool()?;
+        let (config, authority) = self.resolve_pool(pool_id)?;
         let needed = config.effective_bytes(config.default_grant_bytes);
         let charged = authority.charged_effective_bytes().await;
         if needed > config.allocatable_bytes.saturating_sub(charged) {
@@ -422,6 +530,75 @@ impl ReservationRegistry {
     /// (a dropped release, then a new reserve) are not ordered — tokio's
     /// mutex is fair only among already-queued waiters — so a late release
     /// can remove the newer grant.
+    /// TD-TIER-1 SC6 S2: reclaim this pool's idle grants — released exactly
+    /// like a drop releases them (group unregistered, pins released, accrual
+    /// closed at now, intervals parked) — then re-sync the budget. Returns
+    /// the reclaimed grants (empty when no pool arms a TTL). Bounded per
+    /// call so a sweep tick stays light; the metering loop rides it hourly.
+    pub async fn reclaim_idle_grants(&self, now_unix_secs: i64) -> Vec<Grant> {
+        const MAX_PER_TICK: usize = 64;
+        let activity: std::collections::HashMap<String, i64> = proximadb_cache::process_store()
+            .map(|store| {
+                store
+                    .group_activity_snapshot()
+                    .into_iter()
+                    .map(|(id, _hits, last_hit)| (id, last_hit))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut reclaimed = Vec::new();
+        let _gate = self.mutation_gate.lock().await;
+        for (config, authority) in self.pools.values() {
+            if config.idle_reclaim_secs == 0 {
+                continue;
+            }
+            for grant in authority.grants_snapshot().await {
+                if reclaimed.len() >= MAX_PER_TICK {
+                    break;
+                }
+                // Released grants stay in the ledger (billing history); only
+                // live ones charge capacity and can be reclaimed.
+                if !grant.state.charges_capacity() {
+                    continue;
+                }
+                let last_use = activity
+                    .get(&grant.id)
+                    .copied()
+                    .filter(|hit| *hit > 0)
+                    .unwrap_or(grant.created_unix_secs);
+                let idle = (now_unix_secs - last_use).max(0) as u64;
+                let age = (now_unix_secs - grant.created_unix_secs).max(0) as u64;
+                if idle <= config.idle_reclaim_secs || age < config.idle_reclaim_min_lifetime_secs {
+                    continue;
+                }
+                match authority
+                    .release(&grant.tenant_id, &grant.collection_id, now_unix_secs)
+                    .await
+                {
+                    Ok(closed) => {
+                        self.park_intervals(closed);
+                        proximadb_cache::unregister_protection_group(&grant.id);
+                        tracing::info!(
+                            pool = %config.id,
+                            grant = %grant.id,
+                            idle_secs = idle,
+                            "TD-TIER-1 SC6 S2: idle grant reclaimed                              (re-admission follows the normal path)"
+                        );
+                        reclaimed.push(grant);
+                    }
+                    Err(error) => tracing::warn!(
+                        "TD-TIER-1 SC6 S2: idle reclaim failed for {}: {error}",
+                        grant.id
+                    ),
+                }
+            }
+        }
+        if !reclaimed.is_empty() {
+            self.sync_residency_budget().await;
+        }
+        reclaimed
+    }
+
     pub async fn release_for_collection(
         self: &Arc<Self>,
         tenant_id: &str,
@@ -517,10 +694,56 @@ impl ReservationRegistry {
     /// order-independent (late store registration pulls the current cell).
     async fn sync_residency_budget(&self) {
         let mut total = 0u64;
-        for (_, authority) in self.pools.values() {
-            total = total.saturating_add(authority.charged_effective_bytes().await);
+        for (config, authority) in self.pools.values() {
+            let charged = authority.charged_effective_bytes().await;
+            // S4: a capped pool contributes at most its DRAM ceiling (the
+            // protection share it may actually claim).
+            let contribution = config
+                .dram_budget_bytes
+                .map_or(charged, |cap| charged.min(cap));
+            total = total.saturating_add(contribution);
         }
         proximadb_cache::set_process_reserved_budget(total);
+        // S3: refresh the warm-path prefix budgets from the live grants.
+        self.sync_warm_budgets().await;
+    }
+
+    /// TD-TIER-1 SC6 S3: map every live grant's prefixes to its pool's warm
+    /// bucket (one bucket per pool: the rate is aggregate, shared by the
+    /// pool's grants). Pools without a budget contribute nothing (uncapped).
+    async fn sync_warm_budgets(&self) {
+        let mut budgets: Vec<(
+            String,
+            std::sync::Arc<crate::storage::engines::sst::segment_io::WarmBudget>,
+        )> = Vec::new();
+        let mut buckets: std::collections::HashMap<
+            String,
+            std::sync::Arc<crate::storage::engines::sst::segment_io::WarmBudget>,
+        > = std::collections::HashMap::new();
+        for (config, authority) in self.pools.values() {
+            if config.warm_bandwidth_mib_per_s == 0 {
+                continue;
+            }
+            for grant in authority.grants_snapshot().await {
+                if !grant.state.charges_capacity() {
+                    continue;
+                }
+                let bucket = buckets
+                    .entry(config.id.clone())
+                    .or_insert_with(|| {
+                        std::sync::Arc::new(
+                            crate::storage::engines::sst::segment_io::WarmBudget::new(
+                                config.warm_bandwidth_mib_per_s as f64 * 1024.0 * 1024.0,
+                            ),
+                        )
+                    })
+                    .clone();
+                for prefix in &grant.residency_prefixes {
+                    budgets.push((prefix.clone(), bucket.clone()));
+                }
+            }
+        }
+        crate::storage::engines::sst::segment_io::set_warm_prefix_budgets(budgets);
     }
 
     fn park_intervals(&self, closed: Vec<ReservationUsageInterval>) {
@@ -1028,6 +1251,32 @@ impl ReservationAuthority {
     /// these twins drifting). `credit` is an effective charge refunded to the
     /// pool before the check — a resize credits the grant's own current
     /// charge, so shrinking always fits.
+    /// TD-TIER-1 SC6 S4: the pool's live-grant sum may not exceed its DRAM
+    /// ceiling — the protection share a tier may claim. Same fail-closed
+    /// shape as pool capacity; `None` = uncapped.
+    fn ensure_dram_budget(
+        &self,
+        ledger: &Ledger,
+        requested: u64,
+        effective: u64,
+        credit: u64,
+    ) -> Result<(), ReservationError> {
+        let Some(cap) = self.config.dram_budget_bytes else {
+            return Ok(());
+        };
+        let charged = self.charged_effective(ledger);
+        let free = cap.saturating_sub(charged.saturating_sub(credit));
+        if effective > free {
+            return Err(ReservationError::Capacity {
+                pool: format!("{} (dram_budget {} B)", self.config.id, cap),
+                requested,
+                effective,
+                free,
+            });
+        }
+        Ok(())
+    }
+
     fn ensure_capacity(
         &self,
         ledger: &Ledger,
@@ -1104,6 +1353,7 @@ impl ReservationAuthority {
         let mut prospective = (*guard).clone();
         let effective = self.config.effective_bytes(bytes);
         self.ensure_capacity(&prospective, bytes, effective, 0)?;
+        self.ensure_dram_budget(&prospective, bytes, effective, 0)?;
         self.ensure_tenant_limit(&prospective, tenant_id, bytes, None)?;
         let now = now_unix_secs;
         let grant = Grant {
@@ -1150,6 +1400,7 @@ impl ReservationAuthority {
         let new_effective = self.config.effective_bytes(bytes);
         // Credit the grant's own current charge first: shrinking always fits.
         self.ensure_capacity(&prospective, bytes, new_effective, old_effective)?;
+        self.ensure_dram_budget(&prospective, bytes, new_effective, old_effective)?;
         self.ensure_tenant_limit(&prospective, tenant_id, bytes, Some(live.id.as_str()))?;
         let grant = grant_by_id_mut(&mut prospective, &live.id)?;
         grant.bytes = bytes;
@@ -1291,9 +1542,15 @@ impl GrantCompensation {
         collection: String,
         now_unix_secs: i64,
         residency_prefixes: &[String],
+        pool_id: Option<&str>,
     ) -> Self {
-        let handle =
-            registry.spawn_reserve(&tenant, &collection, now_unix_secs, residency_prefixes);
+        let handle = registry.spawn_reserve(
+            &tenant,
+            &collection,
+            now_unix_secs,
+            residency_prefixes,
+            pool_id,
+        );
         Self {
             owed: Compensation::Pending(handle),
             target: Some((registry.clone(), tenant, collection)),
@@ -1616,7 +1873,7 @@ fn owner_is_live(held: &OwnerToken) -> bool {
     #[cfg(not(target_os = "linux"))]
     {
         // No portable liveness probe: treat the lock as held (fail-closed).
-        return true;
+        true
     }
 }
 
@@ -1694,6 +1951,7 @@ mod tests {
 
     /// A foreign pid's REAL start ticks (from /proc), for forging live
     /// holders in lock tests. None if /proc is unreadable (non-Linux).
+    #[cfg(target_os = "linux")]
     fn foreign_start_ticks(pid: u32) -> Option<u64> {
         start_ticks_of(&std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?)
     }
@@ -1707,7 +1965,533 @@ mod tests {
             overhead_factor: 0.1,
             default_grant_bytes: 0,
             is_default: false,
+            idle_reclaim_secs: 0,
+            idle_reclaim_min_lifetime_secs: 3600,
+            warm_bandwidth_mib_per_s: 0,
+            dram_budget_bytes: None,
         }
+    }
+
+    fn armed_pool(dir: &tempfile::TempDir, id: &str, default: bool) -> ReservationPoolConfig {
+        ReservationPoolConfig {
+            id: id.to_string(),
+            path: dir.path().join(id).display().to_string(),
+            allocatable_bytes: 60 * 1024 * 1024 * 1024,
+            tenant_limit_bytes: None,
+            overhead_factor: 0.1,
+            default_grant_bytes: 1024 * 1024 * 1024,
+            is_default: default,
+            idle_reclaim_secs: 0,
+            idle_reclaim_min_lifetime_secs: 3600,
+            warm_bandwidth_mib_per_s: 0,
+            dram_budget_bytes: None,
+        }
+    }
+
+    /// TD-TIER-1 SC6: an explicit `pool_id` charges THAT pool's ledger — the
+    /// freemium/team/enterprise routing seam. A defaulted (None) reserve
+    /// keeps charging the armed default.
+    #[tokio::test]
+    async fn named_pool_routes_its_grant() {
+        let dir = tempfile::tempdir().unwrap();
+        let pools = vec![
+            armed_pool(&dir, "default-pool", true),
+            armed_pool(&dir, "enterprise", false),
+        ];
+        let registry = ReservationRegistry::open_from_config(&pools)
+            .await
+            .unwrap()
+            .expect("registry");
+        let now = current_unix_secs();
+
+        registry
+            .reserve_for_performance("t1", "c-named", now, &[], Some("enterprise"))
+            .await
+            .expect("routed reserve");
+        registry
+            .reserve_for_performance("t1", "c-default", now, &[], None)
+            .await
+            .expect("default reserve");
+
+        let enterprise = &registry.pools["enterprise"];
+        let default_pool = &registry.pools["default-pool"];
+        assert!(
+            enterprise
+                .1
+                .live_grant_snapshot("t1", "c-named")
+                .await
+                .is_some(),
+            "the named pool holds the routed grant"
+        );
+        assert!(
+            default_pool
+                .1
+                .live_grant_snapshot("t1", "c-default")
+                .await
+                .is_some(),
+            "the default pool keeps defaulted grants"
+        );
+        assert!(
+            default_pool
+                .1
+                .live_grant_snapshot("t1", "c-named")
+                .await
+                .is_none(),
+            "the routed grant does NOT charge the default pool"
+        );
+
+        // Release is pool-agnostic (it sweeps every pool): the routed grant
+        // releases cleanly from its non-default home.
+        registry.release_for_collection("t1", "c-named", now).await;
+        assert!(
+            enterprise
+                .1
+                .live_grant_snapshot("t1", "c-named")
+                .await
+                .is_none()
+        );
+    }
+
+    /// TD-TIER-1 SC6 S4: a pool's live-grant sum may not exceed its DRAM
+    /// ceiling — refused at admission, fail-closed like pool capacity — and
+    /// the process budget counts the pool at its cap, not its raw sum.
+    #[tokio::test]
+    async fn dram_ceiling_refuses_at_the_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut capped = armed_pool(&dir, "freemium-dram", true);
+        capped.dram_budget_bytes = Some(3 << 30);
+        let registry = ReservationRegistry::open_from_config(&[capped])
+            .await
+            .unwrap()
+            .expect("registry");
+        let now = current_unix_secs();
+
+        // Grants are effective = bytes * (1 + overhead 0.1); two 1 GiB
+        // grants fit under a 3 GiB cap, the third must refuse.
+        registry
+            .reserve_for_performance("t1", "c1", now, &[], None)
+            .await
+            .unwrap();
+        registry
+            .reserve_for_performance("t1", "c2", now, &[], None)
+            .await
+            .unwrap();
+        let error = registry
+            .reserve_for_performance("t1", "c3", now, &[], None)
+            .await
+            .expect_err("the DRAM ceiling refuses");
+        assert!(
+            error.to_string().contains("dram_budget"),
+            "names the ceiling: {error}"
+        );
+    }
+
+    /// TD-TIER-1 SC6 S2: an idle grant past its pool's TTL is reclaimed —
+    /// released like a drop (accrual closed, group unregistered), and the
+    /// sweep is idempotent. A touched grant and a too-young grant survive;
+    /// pools without a TTL never reclaim.
+    #[tokio::test]
+    async fn idle_grants_are_reclaimed_touched_and_young_survive() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut freemium = armed_pool(&dir, "freemium", true);
+        freemium.idle_reclaim_secs = 3600;
+        freemium.idle_reclaim_min_lifetime_secs = 60;
+        let enterprise = armed_pool(&dir, "enterprise", false);
+        let registry = ReservationRegistry::open_from_config(&[freemium, enterprise])
+            .await
+            .unwrap()
+            .expect("registry");
+        let t0 = 1_700_000_000i64;
+        // The liveness signal lives in the process store's protection
+        // groups — arm the test store so a grant's hit can be recorded.
+        let _gate = crate::services::collection::reservation::residency_test_gate();
+        let _store = crate::services::collection::reservation::residency_test_store();
+        let touched_prefixes = vec!["s3://bed/c-touched/data/".to_string()];
+
+        // Idle beyond TTL (created at t0, no hits, "now" = t0 + 2h).
+        registry
+            .reserve_for_performance("t1", "c-idle", t0, &[], Some("freemium"))
+            .await
+            .unwrap();
+        // Same pool, but its group will record a read hit (armed below).
+        registry
+            .reserve_for_performance("t1", "c-touched", t0, &touched_prefixes, Some("freemium"))
+            .await
+            .unwrap();
+        // Younger than min-lifetime.
+        registry
+            .reserve_for_performance("t1", "c-young", t0 + 7_200, &[], Some("freemium"))
+            .await
+            .unwrap();
+        // Idle, but in a pool with no TTL.
+        registry
+            .reserve_for_performance("t2", "c-enterprise", t0, &[], Some("enterprise"))
+            .await
+            .unwrap();
+
+        // Record a hit for c-touched's group: the store's activity snapshot
+        // keys by grant id — take it from the registry.
+        let touched_grant = registry
+            .live_grant_for_collection("c-touched")
+            .await
+            .expect("live");
+        let store = proximadb_cache::process_store().expect("test store armed");
+        store.register_group_hit_for_test(&touched_grant.id, t0 + 6_000);
+
+        let reclaimed = registry.reclaim_idle_grants(t0 + 7_200).await;
+        let ids: Vec<&str> = reclaimed.iter().map(|g| g.collection_id.as_str()).collect();
+        assert_eq!(ids, vec!["c-idle"], "only the idle-beyond-TTL grant");
+        assert!(
+            registry
+                .live_grant_for_collection("c-touched")
+                .await
+                .is_some()
+        );
+        assert!(
+            registry
+                .live_grant_for_collection("c-young")
+                .await
+                .is_some()
+        );
+        assert!(
+            registry
+                .live_grant_for_collection("c-enterprise")
+                .await
+                .is_some(),
+            "no TTL configured: never reclaimed"
+        );
+        // Idempotent.
+        assert!(registry.reclaim_idle_grants(t0 + 7_200).await.is_empty());
+    }
+
+    // ── TD-TIER-1 SC6 (runbook Phase 2): multi-tenant exit gates ─────────────
+    //
+    // Phase 2 = "Pools shared across tenants; mixed balanced/performance" with
+    // the exit gate "no capacity overcommit under concurrency (SC-TE3); idle
+    // reservation accrual matches the ledger; drops/updates release cleanly."
+    // The existing SC-TE3 stress gate races ONE tenant; Phase 2 shares the
+    // pool ACROSS tenants, so these gates race several tenants on one pool
+    // (1), bound one tenant's share under that contention (2), prove idle
+    // reclaim is per-GRANT across tenants — a hot tenant's grant never
+    // subsidizes an idle tenant's (3) — and prove drop releases exactly the
+    // dropped grant with no cross-tenant leak (4).
+
+    /// SC-TE3, multi-tenant: four tenants share one 10 MiB pool. Wave 1 (one
+    /// admission per tenant, 2 MiB each) is guaranteed to fit, so the pool
+    /// serves EVERY tenant deterministically; wave 2 races eight more
+    /// admissions (any tenant) for the last 2 MiB — exactly one more wins.
+    /// Final state regardless of interleaving: 5 grants, pool exactly full,
+    /// all four tenants hold a grant (the contention is genuinely
+    /// cross-tenant, not one tenant sweeping the pool).
+    #[tokio::test]
+    async fn multi_tenant_stress_never_overcommits_shared_pool() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = pool(&dir);
+        cfg.allocatable_bytes = 10 * 1024 * 1024; // 10 effective MiB
+        cfg.overhead_factor = 0.0; // isolate the counter from overhead math
+        let auth = ReservationAuthority::open(cfg).await.unwrap();
+        let tenants = ["t-alpha", "t-beta", "t-gamma", "t-delta"];
+        let reserve_ok = |tenant: String, collection: String| {
+            let a = auth.clone();
+            async move {
+                a.reserve(&tenant, &collection, 2 * 1024 * 1024, current_unix_secs())
+                    .await
+                    .is_ok()
+            }
+        };
+        // Wave 1: 4 × 2 MiB always fits — every tenant is served.
+        let wave1 = futures::future::join_all(
+            tenants
+                .iter()
+                .map(|t| reserve_ok(t.to_string(), format!("w1-{t}"))),
+        )
+        .await;
+        assert!(
+            wave1.iter().all(|&won| won),
+            "every tenant's wave-1 grant fits"
+        );
+
+        // Wave 2: eight racing admissions for the last 2 MiB — exactly one wins.
+        let mut handles = Vec::new();
+        for i in 0..8 {
+            let a = auth.clone();
+            handles.push(tokio::spawn(async move {
+                a.reserve(
+                    "t-alpha",
+                    &format!("w2-{i}"),
+                    2 * 1024 * 1024,
+                    current_unix_secs(),
+                )
+                .await
+                .is_ok()
+            }));
+        }
+        let wave2_wins: usize = futures::future::join_all(handles)
+            .await
+            .into_iter()
+            .map(|r| r.unwrap() as usize)
+            .sum();
+        assert_eq!(
+            wave2_wins, 1,
+            "exactly one of the eight racing admissions fits"
+        );
+
+        let grants = auth.grants_snapshot().await;
+        let live: Vec<&str> = grants
+            .iter()
+            .filter(|g| g.state.charges_capacity())
+            .map(|g| g.tenant_id.as_str())
+            .collect();
+        assert_eq!(live.len(), 5, "exactly floor(10/2) grants hold capacity");
+        assert_eq!(
+            auth.charged_effective_bytes().await,
+            10 * 1024 * 1024,
+            "the shared pool is exactly full"
+        );
+        for tenant in tenants {
+            assert!(
+                live.contains(&tenant),
+                "tenant {tenant} holds a grant — the pool served every tenant"
+            );
+        }
+    }
+
+    /// Phase 2, per-tenant limit under cross-tenant contention. The pool-level
+    /// `tenant_limit_bytes` bounds EVERY tenant's share uniformly (there is no
+    /// per-tenant override), so with a 4 MiB limit inside a 10 MiB shared pool
+    /// and THREE tenants racing 2 MiB admissions: each tenant wins at most its
+    /// 2-grant share, every tenant is still served, and the pool ends exactly
+    /// full (the three shares demand 12 MiB against 10 MiB of capacity —
+    /// capacity binds at 5 regardless of admission order).
+    #[tokio::test]
+    async fn tenant_limit_bounds_one_share_under_cross_tenant_contention() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = pool(&dir);
+        cfg.allocatable_bytes = 10 * 1024 * 1024;
+        cfg.overhead_factor = 0.0;
+        cfg.tenant_limit_bytes = Some(4 * 1024 * 1024);
+        let auth = ReservationAuthority::open(cfg).await.unwrap();
+        let mut handles = Vec::new();
+        for tenant in ["t-alpha", "t-beta", "t-gamma"] {
+            for i in 0..8 {
+                let a = auth.clone();
+                let tenant = tenant.to_string();
+                handles.push(tokio::spawn(async move {
+                    let won = a
+                        .reserve(
+                            &tenant,
+                            &format!("c{i}"),
+                            2 * 1024 * 1024,
+                            current_unix_secs(),
+                        )
+                        .await
+                        .is_ok();
+                    (tenant, won)
+                }));
+            }
+        }
+        let results = futures::future::join_all(handles).await;
+        let wins_for = |tenant: &str| -> usize {
+            results
+                .iter()
+                .filter(|r| {
+                    let (t, won) = r.as_ref().unwrap();
+                    t == tenant && *won
+                })
+                .count()
+        };
+        // Each tenant's first two admissions are limit-legal (2 × 2 MiB = the
+        // 4 MiB share); every later attempt is refused by the limit. Exactly
+        // six limit-legal admissions demand 12 MiB against 10 MiB, so exactly
+        // five win — in ANY interleaving, and dropping one admission from six
+        // still leaves every tenant at least one grant (only two per tenant).
+        for tenant in ["t-alpha", "t-beta", "t-gamma"] {
+            let wins = wins_for(tenant);
+            assert!(
+                (1..=2).contains(&wins),
+                "tenant {tenant} holds {wins} grants — the 4 MiB limit allows at most 2, \
+                 and the served-every-tenant shape guarantees at least 1"
+            );
+        }
+        let total: usize = ["t-alpha", "t-beta", "t-gamma"]
+            .iter()
+            .map(|t| wins_for(t))
+            .sum();
+        assert_eq!(
+            total, 5,
+            "the pool ends exactly full (10 MiB of 2 MiB grants)"
+        );
+        assert_eq!(auth.charged_effective_bytes().await, 10 * 1024 * 1024);
+        // The limit bounded each tenant's CHARGE, not just its wins: the
+        // ledger attributes ≤ 4 MiB raw to every tenant.
+        let grants = auth.grants_snapshot().await;
+        for tenant in ["t-alpha", "t-beta", "t-gamma"] {
+            let charged: u64 = grants
+                .iter()
+                .filter(|g| g.tenant_id == tenant && g.state.charges_capacity())
+                .map(|g| g.bytes)
+                .sum();
+            assert!(
+                charged <= 4 * 1024 * 1024,
+                "tenant {tenant} charge {charged} exceeds its 4 MiB share"
+            );
+        }
+    }
+
+    /// Phase 2, idle accrual is per-GRANT across tenants: two tenants share a
+    /// TTL pool; the idle tenant's grant is reclaimed at the sweep while the
+    /// hot tenant's grant (read hits recorded against its group) survives, and
+    /// the pool's charge drops by exactly one grant.
+    #[tokio::test]
+    async fn idle_reclaim_is_per_grant_across_tenants() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut shared = armed_pool(&dir, "shared", true);
+        shared.idle_reclaim_secs = 100;
+        shared.idle_reclaim_min_lifetime_secs = 60;
+        let registry = ReservationRegistry::open_from_config(&[shared])
+            .await
+            .unwrap()
+            .expect("registry");
+        let t0 = 1_700_000_000i64;
+        let _gate = crate::services::collection::reservation::residency_test_gate();
+        let _store = crate::services::collection::reservation::residency_test_store();
+        let hot_prefixes = vec!["s3://bed/c-hot/data/".to_string()];
+
+        registry
+            .reserve_for_performance("t-hot", "c-hot", t0, &hot_prefixes, Some("shared"))
+            .await
+            .unwrap();
+        registry
+            .reserve_for_performance("t-idle", "c-idle", t0, &[], Some("shared"))
+            .await
+            .unwrap();
+        let hot_grant = registry
+            .live_grant_for_collection("c-hot")
+            .await
+            .expect("live hot grant");
+        let store = proximadb_cache::process_store().expect("test store armed");
+        store.register_group_hit_for_test(&hot_grant.id, t0 + 10_000);
+
+        let authority = &registry.pools["shared"].1;
+        let charged_before = authority.charged_effective_bytes().await;
+        let reclaimed = registry.reclaim_idle_grants(t0 + 10_000).await;
+        let ids: Vec<&str> = reclaimed.iter().map(|g| g.collection_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["c-idle"],
+            "only the idle tenant's grant is reclaimed"
+        );
+        assert!(registry.live_grant_for_collection("c-hot").await.is_some());
+        assert!(registry.live_grant_for_collection("c-idle").await.is_none());
+        let charged_after = authority.charged_effective_bytes().await;
+        assert!(
+            charged_before > charged_after && charged_after > 0,
+            "exactly one grant's charge left the pool ({} → {})",
+            charged_before,
+            charged_after
+        );
+        // Idempotent sweep: the hot grant is never a casualty of a re-run —
+        // the second sweep runs 50s after the recorded hit, well inside the
+        // 100s TTL (the hit clocks the grant's idle time from the hit).
+        assert!(registry.reclaim_idle_grants(t0 + 10_050).await.is_empty());
+        assert!(registry.live_grant_for_collection("c-hot").await.is_some());
+    }
+
+    /// Phase 2, drops release cleanly across tenants: dropping one tenant's
+    /// collection releases exactly its grant (the other tenant's charge is
+    /// untouched), a repeat drop is a no-op, and a reopen of the ledger shows
+    /// only the survivor.
+    #[tokio::test]
+    async fn drop_releases_exactly_one_grant_across_tenants() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut shared = armed_pool(&dir, "shared", true);
+        shared.default_grant_bytes = 1024 * 1024;
+        let config = vec![shared];
+        let registry = ReservationRegistry::open_from_config(&config)
+            .await
+            .unwrap()
+            .expect("registry");
+        let now = current_unix_secs();
+        registry
+            .reserve_for_performance("t-one", "c-one", now, &[], Some("shared"))
+            .await
+            .unwrap();
+        registry
+            .reserve_for_performance("t-two", "c-two", now, &[], Some("shared"))
+            .await
+            .unwrap();
+
+        let authority = &registry.pools["shared"].1;
+        let charged_before = authority.charged_effective_bytes().await;
+        registry
+            .release_for_collection("t-one", "c-one", now + 1)
+            .await;
+        assert!(registry.live_grant_for_collection("c-one").await.is_none());
+        assert!(registry.live_grant_for_collection("c-two").await.is_some());
+        let charged_after = authority.charged_effective_bytes().await;
+        assert!(
+            charged_after > 0 && charged_after < charged_before,
+            "one grant released, the other tenant's charge remains ({} → {})",
+            charged_before,
+            charged_after
+        );
+        // Repeat drop: a no-op that cannot underflow the survivor's charge.
+        registry
+            .release_for_collection("t-one", "c-one", now + 2)
+            .await;
+        assert_eq!(
+            authority.charged_effective_bytes().await,
+            charged_after,
+            "repeat drop changes nothing"
+        );
+        // The ledger on disk agrees: a reopen restores only the survivor.
+        drop(registry);
+        let reopened = ReservationRegistry::open_from_config(&config)
+            .await
+            .unwrap()
+            .expect("registry");
+        assert!(reopened.live_grant_for_collection("c-one").await.is_none());
+        assert!(reopened.live_grant_for_collection("c-two").await.is_some());
+    }
+
+    /// TD-TIER-1 SC6: an unknown pool id is refused fail-closed with the
+    /// configured ids listed; an ungranted (no default_grant_bytes) named
+    /// pool refuses too.
+    #[tokio::test]
+    async fn unknown_or_unarmed_pool_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let pools = vec![armed_pool(&dir, "default-pool", true)];
+        let registry = ReservationRegistry::open_from_config(&pools)
+            .await
+            .unwrap()
+            .expect("registry");
+
+        let error = registry
+            .reserve_for_performance("t1", "c1", current_unix_secs(), &[], Some("nope"))
+            .await
+            .expect_err("unknown id refused");
+        assert!(
+            error.to_string().contains("default-pool"),
+            "the error lists the configured pools: {error}"
+        );
+
+        drop(registry);
+        let dir2 = tempfile::tempdir().unwrap();
+        let mut unarmed = armed_pool(&dir2, "unarmed", false);
+        unarmed.default_grant_bytes = 0;
+        let pools = vec![armed_pool(&dir2, "default-pool", true), unarmed];
+        let registry = ReservationRegistry::open_from_config(&pools)
+            .await
+            .unwrap()
+            .expect("registry");
+        let error = registry
+            .reserve_for_performance("t1", "c2", current_unix_secs(), &[], Some("unarmed"))
+            .await
+            .expect_err("unarmed pool refused");
+        assert!(
+            error.to_string().contains("default_grant_bytes"),
+            "actionable: {error}"
+        );
     }
 
     // SC-TE3: two concurrent 40 GiB requests against 60 GiB (with overhead,
@@ -1887,6 +2671,11 @@ mod tests {
     // must carry pid 1's REAL start ticks — a mismatched-ticks token means
     // "the pid lives but the recorded holder doesn't" (pid reuse), which the
     // authority correctly reclaims.
+    //
+    // Linux-only: the assertions probe `/proc/1/stat` for a foreign pid's
+    // real start ticks. Off Linux there is no liveness probe (owner_is_live is
+    // fail-closed), so both branches below would take the same path.
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn foreign_live_owner_rejected_and_pid_reuse_reclaimed() {
         let dir = tempfile::tempdir().unwrap();
@@ -1913,6 +2702,10 @@ mod tests {
     // Verification round 2 (B1 residual): a LIVE takeover claim slot backs
     // the opener off — bounded attempts, then fail-closed — and never touches
     // the (stale) owner.lock it was judging.
+    //
+    // Linux-only: it needs a provably-LIVE claimer (pid 1's real start ticks
+    // from `/proc/1/stat`). Off Linux every foreign pid already looks live.
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn live_claim_slot_backs_off_without_touching_the_lock() {
         let dir = tempfile::tempdir().unwrap();
@@ -1944,6 +2737,11 @@ mod tests {
     // A stale lock (dead foreign pid) is taken over by exactly one opener —
     // crash recovery. 4194303 is the PID_MAX_LIMIT ceiling: astronomically
     // unlikely to be live; if it somehow is, this test fails closed instead.
+    //
+    // Linux-only: proving a foreign pid dead requires `/proc/{pid}/stat`.
+    // Off Linux `owner_is_live` cannot prove death and is deliberately
+    // fail-closed — that contract is pinned by the cfg(not(linux)) test below.
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn stale_lock_is_taken_over() {
         let dir = tempfile::tempdir().unwrap();
@@ -1952,6 +2750,24 @@ mod tests {
             .await
             .unwrap();
         ReservationAuthority::open(cfg).await.unwrap();
+    }
+
+    // The off-Linux face of the same coin: without a portable liveness probe
+    // a foreign holder can never be PROVEN dead, so the takeover must be
+    // refused (fail-closed, `SecondOwner`) rather than guessed at.
+    #[cfg(not(target_os = "linux"))]
+    #[tokio::test]
+    async fn stale_lock_is_fail_closed_off_linux() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = pool(&dir);
+        tokio::fs::write(owner_lock_path(dir.path()), "4194303:999999")
+            .await
+            .unwrap();
+        let err = ReservationAuthority::open(cfg).await.unwrap_err();
+        assert!(
+            err.to_string().contains("exclusively owned"),
+            "off-Linux a foreign holder must fail closed: {err}"
+        );
     }
 
     // Our own pid with a DIFFERENT start token (pid reuse after our crash) is
@@ -2255,7 +3071,7 @@ mod tests {
         );
 
         registry
-            .reserve_for_performance("t1", "c-budget-1", current_unix_secs(), &[])
+            .reserve_for_performance("t1", "c-budget-1", current_unix_secs(), &[], None)
             .await
             .unwrap();
         assert_eq!(
@@ -2291,7 +3107,7 @@ mod tests {
             .unwrap()
             .unwrap();
         registry
-            .reserve_for_performance("t1", "c-persist-1", current_unix_secs(), &[])
+            .reserve_for_performance("t1", "c-persist-1", current_unix_secs(), &[], None)
             .await
             .unwrap();
         drop(registry); // "crash": the grant is durable in the pool ledger
@@ -2334,6 +3150,7 @@ mod tests {
                 "cancel-1",
                 current_unix_secs(),
                 &[],
+                None,
             ));
             // One poll spawns the task; then the caller goes away.
             let _ = futures::poll!(fut.as_mut());
@@ -2376,6 +3193,7 @@ mod tests {
                 collection.to_string(),
                 current_unix_secs(),
                 &[],
+                None,
             )
         };
         // Dropped before the reserve's outcome was even observed.
@@ -2455,6 +3273,7 @@ mod tests {
                 "77",
                 current_unix_secs(),
                 std::slice::from_ref(&prefix),
+                None,
             )
             .await
             .unwrap();
@@ -2486,6 +3305,77 @@ mod tests {
         assert!(!store.is_protected(&key), "release unpins the entry");
     }
 
+    /// SC4 PR-D (reopen pruning): a reopen PRUNES process-global groups whose
+    /// grants the reopened ledgers no longer hold — a stale group otherwise
+    /// keeps its entries pinned (and its bytes charged against the armed
+    /// budget) until process exit. The bridge is keyed by grant id; the
+    /// durable ledger here is rewritten without the grant, as an operator
+    /// rollback of the pool file would leave it, while the bridge still
+    /// carries the pre-rollback registration.
+    #[tokio::test]
+    async fn reopen_prunes_groups_of_grants_the_ledger_no_longer_holds() {
+        let _guard = budget_cell_gate();
+        let prefix = "s3://b/tenants/t9/42/data/".to_string();
+        let key = proximadb_cache::object_key(&format!("{prefix}L0_x.pax"));
+        let store = super::residency_test_store();
+        store
+            .put(
+                key.clone(),
+                proximadb_cache::L2Class::Invariants,
+                std::sync::Arc::from(vec![1u8; 64]),
+            )
+            .await
+            .unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = pool_config(&dir, "p1", 0);
+        cfg.overhead_factor = 0.0;
+        cfg.default_grant_bytes = 4096;
+        let registry = ReservationRegistry::open_from_config(std::slice::from_ref(&cfg))
+            .await
+            .unwrap()
+            .unwrap();
+        let grant = registry
+            .reserve_for_performance(
+                "t9",
+                "42",
+                current_unix_secs(),
+                std::slice::from_ref(&prefix),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(store.is_protected(&key), "the grant pins its entry");
+
+        // The grant leaves the DURABLE ledger while the process-global bridge
+        // still holds its group.
+        drop(registry);
+        let ledger = Ledger {
+            schema_version: LEDGER_SCHEMA_VERSION,
+            producer_epoch: 9,
+            next_sequence: 0,
+            grants: Vec::new(),
+        };
+        std::fs::write(
+            ledger_path(dir.path()),
+            serde_json::to_vec(&ledger).unwrap(),
+        )
+        .unwrap();
+
+        let _reopened = ReservationRegistry::open_from_config(&[cfg])
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !proximadb_cache::process_protection_group_ids().contains(&grant.id),
+            "the stale group is pruned at reopen"
+        );
+        assert!(
+            !store.is_protected(&key),
+            "its pins are released with the group"
+        );
+    }
+
     // ---- SC3-2: ReservationRegistry ----
 
     fn pool_config(dir: &tempfile::TempDir, id: &str, grant_bytes: u64) -> ReservationPoolConfig {
@@ -2497,6 +3387,10 @@ mod tests {
             overhead_factor: 0.1,
             default_grant_bytes: grant_bytes,
             is_default: false,
+            idle_reclaim_secs: 0,
+            idle_reclaim_min_lifetime_secs: 3600,
+            warm_bandwidth_mib_per_s: 0,
+            dram_budget_bytes: None,
         }
     }
 
@@ -2516,7 +3410,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let grant = registry
-            .reserve_for_performance("t1", "c-uuid-1", 1000, &[])
+            .reserve_for_performance("t1", "c-uuid-1", 1000, &[], None)
             .await
             .unwrap();
         assert_eq!(grant.bytes, 4096, "operator-declared default grant size");
@@ -2535,7 +3429,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let err = registry
-            .reserve_for_performance("t1", "c-uuid-1", 1000, &[])
+            .reserve_for_performance("t1", "c-uuid-1", 1000, &[], None)
             .await
             .unwrap_err()
             .to_string();
@@ -2556,7 +3450,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let err = registry
-            .reserve_for_performance("t1", "c-uuid-1", 1000, &[])
+            .reserve_for_performance("t1", "c-uuid-1", 1000, &[], None)
             .await
             .unwrap_err()
             .to_string();
@@ -2571,7 +3465,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let grant = registry
-            .reserve_for_performance("t1", "c-uuid-1", 1000, &[])
+            .reserve_for_performance("t1", "c-uuid-1", 1000, &[], None)
             .await
             .unwrap();
         assert_eq!(grant.bytes, 4096);
@@ -2590,7 +3484,7 @@ mod tests {
             .unwrap()
             .unwrap();
         registry
-            .reserve_for_performance("t1", "c-uuid-1", 500, &[])
+            .reserve_for_performance("t1", "c-uuid-1", 500, &[], None)
             .await
             .unwrap();
         registry
@@ -2626,7 +3520,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let err = registry
-            .peek_performance_admission()
+            .peek_performance_admission(None)
             .await
             .unwrap_err()
             .to_string();
@@ -2644,7 +3538,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let err = registry
-            .peek_performance_admission()
+            .peek_performance_admission(None)
             .await
             .unwrap_err()
             .to_string();
@@ -2655,7 +3549,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        registry.peek_performance_admission().await.unwrap();
+        registry.peek_performance_admission(None).await.unwrap();
     }
 
     #[tokio::test]
@@ -2671,14 +3565,14 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        registry.peek_performance_admission().await.unwrap();
+        registry.peek_performance_admission(None).await.unwrap();
         registry
-            .reserve_for_performance("t1", "c-uuid-1", current_unix_secs(), &[])
+            .reserve_for_performance("t1", "c-uuid-1", current_unix_secs(), &[], None)
             .await
             .unwrap();
         // 4000 charged of 5000: a second default grant no longer fits.
         let err = registry
-            .peek_performance_admission()
+            .peek_performance_admission(None)
             .await
             .unwrap_err()
             .to_string();
@@ -2696,7 +3590,7 @@ mod tests {
             .unwrap();
         let guard = env_lock::scoped_set(RESERVATIONS_KILL_SWITCH_ENV, "1");
         let err = registry
-            .peek_performance_admission()
+            .peek_performance_admission(None)
             .await
             .unwrap_err()
             .to_string();
@@ -2716,7 +3610,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let err = registry
-            .reserve_for_performance("", "c-uuid-1", 1000, &[])
+            .reserve_for_performance("", "c-uuid-1", 1000, &[], None)
             .await
             .unwrap_err()
             .to_string();

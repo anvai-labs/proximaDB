@@ -300,6 +300,7 @@ pub mod manifest;
 pub mod oid_resolve; // TD-DELVEC-1 WI-3c-1c: resolve_oid_positions + read_resolver lazy-load
 #[cfg(feature = "cold-deletion-vectors")]
 pub use proximadb_storage_common::oid_resolver_cache;
+pub mod cache_policy;
 pub mod pca_manager; // PCA caching for Z-Order spatial encoding
 pub mod search;
 pub mod segment_format; // P3 Phase A: mixed-format (ProximaBlocks/PAX) read primitives
@@ -336,14 +337,16 @@ pub use compactor_impl::{CompactionSortStrategy, SstCompactor, ZeroCopyCompactio
 pub use readers::UnifiedSstableReader;
 
 // Additional exports for unified reader (SstableHeader is already defined below)
-pub use writer::{SstableWriteOutcome, SstableWriter};
+pub use writer::SstableWriter;
 
 // Re-export SstRecord for test compatibility (deprecated - see blocks.rs)
 pub use blocks::SstRecord;
 pub use collections::CollectionSizeInfo;
 pub use core::SstEngine;
 pub use flush::{FlushCoordinator, FlushOperations, FlushOptimizer, SortStats};
-pub use search::{SearchCoordinator, SearchOperations, SearchOptimizer};
+#[cfg(test)]
+pub use search::SearchCoordinator;
+pub use search::{SearchOperations, SearchOptimizer};
 pub use utils::{MemoryEstimate, SortingStats, SstableFileInfo, SstableFileUtils};
 
 // Tiering integration exports (opt-in feature)

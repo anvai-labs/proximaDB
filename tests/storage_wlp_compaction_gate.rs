@@ -17,7 +17,7 @@ use anyhow::Result;
 use proximadb::storage::engines::sst::SstEngine;
 use proximadb::storage::traits::{FlushParameters, FlushResult, UnifiedStorageEngine};
 use proximadb_proto::v1::{Collection, CollectionConfig, StorageAssignment};
-use proximadb_records::{EmbeddingCell, EmbeddingValues, ProximaRecord};
+use proximadb_records::{EmbeddingCell, ProximaRecord};
 
 const GLOBAL_GATE_ENV: &str = "PROXIMADB_L0_COMPACTION_ENABLED";
 

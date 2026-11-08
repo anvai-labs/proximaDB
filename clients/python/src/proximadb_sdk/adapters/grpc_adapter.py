@@ -26,12 +26,13 @@ from ..models import (
 )
 from ..models_v2 import ProximaRecord
 from ..proto_conversion import ProtoConverter
-from .base import BaseProtocolAdapter
+from ._sync_graph_delegations import SyncGraphDelegations
+from .base import BaseProtocolAdapter, RecordOpsMixin
 
 logger = logging.getLogger(__name__)
 
 
-class GrpcProtocolAdapter(BaseProtocolAdapter):
+class GrpcProtocolAdapter(RecordOpsMixin, SyncGraphDelegations, BaseProtocolAdapter):
     """gRPC protocol adapter implementing BaseProtocolAdapter.
 
     Wraps the existing ProximaDBSyncGrpcClient to provide a consistent
@@ -69,8 +70,16 @@ class GrpcProtocolAdapter(BaseProtocolAdapter):
                 config, "base_url", None
             )
             if config_url:
+                # grpcio's insecure_channel expects a bare host:port target.
+                # Strip the http(s):// forms AND the grpc(s):// pseudo-schemes
+                # the SDK accepts as input convenience (v1's _create_adapter
+                # does the same); a scheme-prefixed target is undialable.
                 server_address = (
-                    str(config_url).replace("http://", "").replace("https://", "")
+                    str(config_url)
+                    .replace("https://", "")
+                    .replace("http://", "")
+                    .replace("grpcs://", "")
+                    .replace("grpc://", "")
                 )
 
         metadata = (
@@ -270,29 +279,6 @@ class GrpcProtocolAdapter(BaseProtocolAdapter):
     # ==========================================================================
     # Record Operations
     # ==========================================================================
-
-    @staticmethod
-    def _record_payloads(records: list[ProximaRecord] | list[dict[str, Any]]):
-        payloads = []
-        for record in records:
-            if isinstance(record, dict):
-                payloads.append(record)
-            elif hasattr(record, "model_dump"):
-                payloads.append(record.model_dump(exclude_none=True))
-            else:
-                payloads.append(ProtoConverter.vector_record_to_dict(record))
-        return payloads
-
-    @staticmethod
-    def _batch_to_vector_response(
-        result: BatchResult, operation: str
-    ) -> VectorOperationResponse:
-        return VectorOperationResponse(
-            success=result.success,
-            operation=operation,
-            metrics=result.metrics,
-            error_message="; ".join(result.errors) if result.errors else None,
-        )
 
     def insert_records(
         self,
@@ -635,6 +621,51 @@ class GrpcProtocolAdapter(BaseProtocolAdapter):
                 )
 
         return search_results
+
+    # ==========================================================================
+    # Graph Operations (TD-SDK-3 batch 1)
+    #
+    # The 10 CRUD/traversal delegations shared with REST live once in
+    # SyncGraphDelegations (listed first in the bases so its concrete
+    # methods win over the base-class defaults). gRPC-specific below: the
+    # transport names the analytics call ``shortest_path`` and has no
+    # per-call timeout override. Graph-collection management and the tuned
+    # ``graph_traverse`` stay on the base NotImplementedError defaults —
+    # the transport lacks them (documented, not papered over).
+    # ==========================================================================
+
+    def graph_shortest_path(
+        self,
+        start_node_id: str,
+        target_node_id: str,
+        max_depth: int | None = None,
+        edge_types: list[str] | None = None,
+        algorithm: str = "DIJKSTRA",
+        k: int | None = None,
+        enable_prefetch: bool | None = None,
+        prefetch_budget: int | None = None,
+        timeout: float | None = None,
+        graph_id: str = "default",
+        **kwargs,
+    ) -> dict[str, Any]:
+        """Compute shortest path(s) via gRPC.
+
+        Prefetch overrides are v2-native request fields on the wire. The
+        ``timeout`` parameter is accepted for facade parity but not forwarded
+        (the gRPC transport has no per-call timeout override; v1 behaves the
+        same on this protocol).
+        """
+        return self._client.shortest_path(
+            start_node_id,
+            target_node_id,
+            max_depth,
+            edge_types,
+            algorithm,
+            k,
+            enable_prefetch,
+            prefetch_budget,
+            graph_id=graph_id or "default",
+        )
 
     # ==========================================================================
     # Lifecycle Methods

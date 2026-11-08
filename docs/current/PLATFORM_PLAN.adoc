@@ -30,6 +30,45 @@ SaaS and BYOC share the core binary/request/tenant seams. Edge-collapse is an ad
 not another query/security stack. Cross-region WAL replication and fleet-wide reservations
 require separate ownership/failure contracts; no local feature silently promises them.
 
+[[embedded-cloud-lifecycle]]
+== Embedded cloud bootstrap and lifecycle
+
+Reuse the in-process service/runtime ports; no mandatory socket, IPC daemon or separate
+metastore is required for embedding. RPC remains a deployment adapter for a separately
+running service. The durable SystemCatalog owns collection identities/configuration and
+storage assignments; a local catalog copy is a reconstructible serving view, never a new
+source of truth. Source location, local work/WAL directory and optional cache pools are
+separate configuration inputs. Preserve cloud URIs and resolve local paths only through the
+local path rules. Validate the effective WAL sync mode rather than silently using a default.
+
+[cols="2,3,3",options="header"]
+|===
+| Lifecycle | Foundation acceptance | Remaining dependency
+| Writer bootstrap | Existing authorized assignments and catalog ownership; explicit local WAL/work root with effective durability config | ADR-069 reattachment and TD-OBJSTORE-1 backend-specific crash/reopen proof.
+| End-job materialization | An explicit fallible operation uses the existing admission/materializer, reports every failure and retires only successfully claimed batches | It covers the documented collection/modality set. Durable cross-process receipts and a globally atomic all-collection boundary require separate persisted identity/fencing and recovery proof.
+| Read-only bootstrap | Open the existing catalog follower, refresh its serving view and resolve collection assignments without claiming writer ownership | No owner WAL replay/materialization, DDL, recovery publication or write-producing background tasks. Reopen in a fresh process and verify no remote mutations, then run real queries.
+| Read serving | Shared authorization, visibility and immutable-segment readers; optional rebuildable cache | A catalog snapshot alone does not prove bounded data freshness or all-modality headless recovery. State the writer/follower freshness contract.
+|===
+
+At the reviewed `9d25b5a20` baseline, `SystemCatalog::open_follower` and `reload_if_stale`
+already exist. Embedded startup still calls the general `SharedServices` constructor and
+initializes the global WAL manifest; selecting a follower in isolation does not prove a
+read-only query node. Audit constructor, recovery and background-task side effects before
+closing this gate. The bounded foundation implementation exposes a separate metadata-only
+catalog follower; the normal local constructor rejects remote roots. Completing explicit
+cloud-writer bootstrap and the read-only data-query lifecycle remains required work, with
+separate ownership/recovery gates. Cloud metadata also requires an explicit usable local work root; it must
+not become an accidental local `s3:` directory or be treated as a durable cache.
+
+`flush` success means the selected writes were materialized under the existing publication
+contract; it is not a durable snapshot token. `Drop`, a successful insert into an ephemeral
+buffer, and a warning-only shutdown are not end-job durability receipts. Callers stop or
+coordinate producers before a job-wide boundary. Later appends may remain for another flush.
+Use link:../12-design/adr/ADR-081-admission-first-flush-ownership.adoc[ADR-081 exact claims]
+and TD-WAL-2 for modality convergence; do not create a second embedded-only WAL or scheduler.
+WAL-free bulk publication, persistent idempotency receipts, automatic elastic writer failover
+and cross-modality completion remain explicit dependent gates.
+
 == Workspace and handler boundaries
 
 Continue TD-DECOMP-* against the current dependency graph and compile measurements. Reuse

@@ -1,9 +1,9 @@
-// Disabled: this test was written against a legacy `VectorMatch` type with
-// `{id, score, metadata}` fields that no longer exists; the canonical
-// equivalent `ScoredRecord` has `{record, score, rank}`. Rewriting requires
-// a careful redesign of the mock strategies. Tracked separately from the
-// 2026-05-22 nomenclature refactor.
-#![cfg(any())]
+// Re-enabled 2026-11-08 (compile-disabled since e56a45d90, 2026-05-22): the
+// legacy `VectorMatch {id, score, metadata}` fixture shape maps onto the
+// canonical `ScoredRecord {record, score, rank}` — the "careful redesign"
+// turned out to be mechanical: metadata was fixture-only (never asserted;
+// its canonical carrier is `ProximaRecord::props`), and score/rank map 1:1
+// with rank assigned by fixture position.
 /*
  * Copyright 2025 Vijaykumar Singh
  *
@@ -40,8 +40,9 @@ use std::sync::Arc;
 use proximadb::proto::proximadb_v1::{SearchQuery, VectorSearchRequest};
 use proximadb::query::facade::{
     ExecutionMetrics, FacadeConfig, QueryContext, QueryFacadeAdapter, QueryRequest, QueryResult,
-    QueryResultData, QueryStrategy, QueryType, UnifiedQueryFacade, VectorMatch,
+    QueryResultData, QueryStrategy, QueryType, ScoredRecord, UnifiedQueryFacade,
 };
+use proximadb_records::ProximaRecord;
 
 // ================================================================================
 // MOCK STRATEGIES FOR TESTING
@@ -50,7 +51,7 @@ use proximadb::query::facade::{
 /// Mock vector search strategy that returns predictable results
 struct MockVectorSearchStrategy {
     /// Results to return
-    results: Vec<VectorMatch>,
+    results: Vec<ScoredRecord>,
     /// Whether to simulate an error
     should_error: bool,
 }
@@ -59,27 +60,36 @@ impl MockVectorSearchStrategy {
     fn new() -> Self {
         Self {
             results: vec![
-                VectorMatch {
-                    id: "vec_001".to_string(),
+                ScoredRecord {
+                    record: ProximaRecord {
+                        oid: "vec_001".to_string(),
+                        ..Default::default()
+                    },
                     score: 0.98,
-                    metadata: Some(serde_json::json!({"category": "electronics"})),
+                    rank: 1,
                 },
-                VectorMatch {
-                    id: "vec_002".to_string(),
+                ScoredRecord {
+                    record: ProximaRecord {
+                        oid: "vec_002".to_string(),
+                        ..Default::default()
+                    },
                     score: 0.92,
-                    metadata: Some(serde_json::json!({"category": "clothing"})),
+                    rank: 2,
                 },
-                VectorMatch {
-                    id: "vec_003".to_string(),
+                ScoredRecord {
+                    record: ProximaRecord {
+                        oid: "vec_003".to_string(),
+                        ..Default::default()
+                    },
                     score: 0.85,
-                    metadata: None,
+                    rank: 3,
                 },
             ],
             should_error: false,
         }
     }
 
-    fn with_results(results: Vec<VectorMatch>) -> Self {
+    fn with_results(results: Vec<ScoredRecord>) -> Self {
         Self {
             results,
             should_error: false,
@@ -123,7 +133,7 @@ impl QueryStrategy for MockVectorSearchStrategy {
         };
 
         // Return limited results based on top_k
-        let limited_results: Vec<VectorMatch> = self.results.iter().take(top_k).cloned().collect();
+        let limited_results: Vec<ScoredRecord> = self.results.iter().take(top_k).cloned().collect();
 
         Ok(QueryResult {
             data: QueryResultData::VectorResults(limited_results.clone()),
@@ -161,7 +171,7 @@ fn create_test_adapter() -> QueryFacadeAdapter {
 }
 
 /// Create a facade with custom results
-fn create_facade_with_results(results: Vec<VectorMatch>) -> QueryFacadeAdapter {
+fn create_facade_with_results(results: Vec<ScoredRecord>) -> QueryFacadeAdapter {
     let strategies: Vec<Arc<dyn QueryStrategy>> =
         vec![Arc::new(MockVectorSearchStrategy::with_results(results))];
     let facade = Arc::new(UnifiedQueryFacade::new(strategies, FacadeConfig::default()));

@@ -6,11 +6,14 @@ This script automates the generation of Python protobuf bindings for v2 APIs.
 It handles both protobuf messages (_pb2.py) and gRPC service stubs (_pb2_grpc.py).
 
 Usage:
-    python scripts/generate_v2_protos.py [proximadb/v2/model_registry.proto ...]
+    python scripts/generate_v2_protos.py [proximadb/v2/record.proto ...]
 
 The script will:
 1. Generate protobuf files for v2 proto files
-2. Place generated files in the canonical src/proximadb/v2/ runtime package
+2. Place generated files in the canonical src/proximadb_sdk/v2/ runtime
+   package (the single generated source of truth)
+3. Mirror each generated module as a legacy re-export shim under
+   src/proximadb/v2/ (see generate_protos.write_legacy_shims)
 """
 
 import subprocess
@@ -23,7 +26,8 @@ SCRIPT_DIR = SCRIPT_FILE.parent
 PROJECT_ROOT = SCRIPT_DIR.parent.parent.parent  # Go up to repo root
 PROTO_DIR = PROJECT_ROOT / "proto"
 PYTHON_ROOT = SCRIPT_DIR.parent / "src"
-PYTHON_PACKAGE = PYTHON_ROOT / "proximadb" / "v2"
+PYTHON_PACKAGE = PYTHON_ROOT / "proximadb_sdk" / "v2"
+LEGACY_SHIM_DIR = PYTHON_ROOT / "proximadb" / "v2"
 
 # v2 Proto files to generate (relative to proto directory)
 PROTOS = [
@@ -32,7 +36,6 @@ PROTOS = [
     "proximadb/v2/entity.proto",
     "proximadb/v2/document.proto",
     "proximadb/v2/fusion.proto",
-    "proximadb/v2/model_registry.proto",
 ]
 
 
@@ -115,6 +118,10 @@ def main() -> int:
         "   1. Verify the generated code compiles: python -m py_compile src/proximadb/v2/*"
     )
     print("   2. Run tests to ensure nothing broke: pytest tests/")
+    # Mirror generated modules as legacy re-export shims (proximadb.v2)
+    LEGACY_SHIM_DIR.mkdir(parents=True, exist_ok=True)
+    write_legacy_shims("v2", out_dir=PYTHON_PACKAGE, shim_dir=LEGACY_SHIM_DIR)
+
     return 0
 
 

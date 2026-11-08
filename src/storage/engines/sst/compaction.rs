@@ -78,18 +78,61 @@ static GLOBAL_PRECISION_RESOLVER: std::sync::OnceLock<
     Arc<proximadb_catalog::canonical_precision::CanonicalPrecisionResolver>,
 > = std::sync::OnceLock::new();
 
+/// Test-binary override, consulted BEFORE the set-once global: under
+/// `cargo test --lib` every test shares one process, so whichever test (or
+/// in-process database boot) arms the OnceLock first would otherwise pin its
+/// catalog against every other precision-asserting test. In the test binary
+/// a setter that loses the OnceLock race swaps this slot instead (last
+/// setter wins); the production binary keeps first-wins semantics.
+#[cfg(test)]
+static GLOBAL_PRECISION_RESOLVER_TEST: std::sync::Mutex<
+    Option<Arc<proximadb_catalog::canonical_precision::CanonicalPrecisionResolver>>,
+> = std::sync::Mutex::new(None);
+
 /// Set the process-global precision resolver (first writer wins; idempotent
 /// thereafter — mirrors the OnceLock registry pattern). Called once at boot.
 pub fn set_global_precision_resolver(
     resolver: Arc<proximadb_catalog::canonical_precision::CanonicalPrecisionResolver>,
 ) {
-    let _ = GLOBAL_PRECISION_RESOLVER.set(resolver);
+    if GLOBAL_PRECISION_RESOLVER
+        .set(Arc::clone(&resolver))
+        .is_err()
+    {
+        // Already armed. In the test binary, re-arm the override slot so a
+        // shared-process test can install its own catalog; in production the
+        // original first-wins arm stands.
+        #[cfg(test)]
+        {
+            if let Ok(mut slot) = GLOBAL_PRECISION_RESOLVER_TEST.lock() {
+                *slot = Some(resolver);
+            }
+        }
+        #[cfg(not(test))]
+        {
+            let _ = resolver;
+        }
+    }
 }
 
 /// The process-global precision resolver, if boot armed one.
 pub fn get_global_precision_resolver()
--> Option<&'static Arc<proximadb_catalog::canonical_precision::CanonicalPrecisionResolver>> {
-    GLOBAL_PRECISION_RESOLVER.get()
+-> Option<Arc<proximadb_catalog::canonical_precision::CanonicalPrecisionResolver>> {
+    #[cfg(test)]
+    if let Ok(slot) = GLOBAL_PRECISION_RESOLVER_TEST.lock() {
+        if let Some(resolver) = slot.as_ref() {
+            return Some(Arc::clone(resolver));
+        }
+    }
+    GLOBAL_PRECISION_RESOLVER.get().cloned()
+}
+
+/// Test-only: drop a test-armed override so later shared-process tests fall
+/// back to the boot-armed global again.
+#[cfg(test)]
+pub fn clear_global_precision_resolver_for_tests() {
+    if let Ok(mut slot) = GLOBAL_PRECISION_RESOLVER_TEST.lock() {
+        *slot = None;
+    }
 }
 
 /// Stage-boundary process-RSS checkpoints for the unified compaction pipeline
@@ -223,6 +266,14 @@ pub struct SstCompactionTask {
     /// object, resolved by the task producer from the collection config.
     /// `None` = the account default (also what config-free producers set).
     pub access_tier: Option<proximadb_storage_filesystem_types::ObjectAccessTier>,
+    /// TD-COMPACT-15: the live-segment FLOOR a per-request pinned
+    /// `target_segments > 1` sets for this task and every follow-up it
+    /// spawns. The worker still runs the follow-up chain — including the
+    /// layout/training promotion — but bounds each follow-up's inputs so the
+    /// chain can never merge below the operator's stop point (#2418 review
+    /// round 11: suppressing the chain instead left outputs untrained and
+    /// could drop a concurrent flush's training guard).
+    pub min_live_segments: Option<usize>,
 }
 
 impl SstCompactionTask {
@@ -267,6 +318,21 @@ impl SstCompactionTask {
     /// producer resolved from the catalog meta. `check_compaction_needed` is
     /// config-free and builds tasks with these unset, so without this an sq8
     /// collection's L1->L2 compaction re-encoded as RaBitQ.
+    ///
+    /// TD-TIER-1 SC5 note (review M1 — stated plainly): under a
+    /// `tier_by_level:` policy the follow-up carries the ORIGIN's resolved
+    /// tier, and the follow-up's follow-up carries THAT — the resolved scalar
+    /// propagates down the whole chain, never re-resolved for the deeper
+    /// output's own level. A burst-then-quiesce collection therefore lands
+    /// its entire chain at the ORIGIN's level tier: with
+    /// `tier_by_level:hot,cool`, every chain-produced deep segment (the
+    /// long-lived bytes the policy exists to cool) stays Hot. The
+    /// corrections are probabilistic — a NEW enqueue re-resolves, and dedup
+    /// adoption upgrades a still-queued task — but neither fires once ingest
+    /// stops. This is acceptable ONLY while the tag is default-OFF and
+    /// unmeasured; carrying the parsed policy on the task so the worker
+    /// re-resolves each follow-up by its own output level is the REQUIRED
+    /// fix before any SC6 flip-ON decision.
     pub(crate) fn inherit_collection_intent(&mut self, origin: &SstCompactionTask) {
         self.collection_identity = origin.collection_identity;
         self.rg_layout = origin.rg_layout;
@@ -275,6 +341,9 @@ impl SstCompactionTask {
         self.block_size_kb = origin.block_size_kb;
         self.compression_config = origin.compression_config.clone();
         self.access_tier = origin.access_tier;
+        // The pinned floor is part of the request's intent: a follow-up's own
+        // follow-up must respect it too.
+        self.min_live_segments = origin.min_live_segments;
     }
 }
 
@@ -376,6 +445,56 @@ pub enum CompactionPriority {
     Critical = 3, // When storage is nearly full
 }
 
+/// Terminal outcome of one scheduled compaction morsel, keyed by its output
+/// path; written by the worker, consumed (removed) by the FULL collapse loop
+/// so declines and failures surface typed instead of silent. `Completed`
+/// carries the morsel's measured bytes so the FULL summary reports real
+/// I/O, not estimates.
+#[derive(Debug, Clone)]
+pub enum PassOutcome {
+    Completed { bytes_read: u64, bytes_written: u64 },
+    Declined(&'static str),
+    Failed(String),
+}
+
+/// Outcome of one FULL collapse request (TD-COMPACT-14).
+#[derive(Debug, Clone, Copy)]
+pub struct FullCompactionSummary {
+    pub segments_before: usize,
+    /// ALL live segments after the collapse — compactable PLUS AXIS-pending.
+    /// The loop exits on the compactable count alone, so with pending
+    /// segments present this can exceed `target` (and `reached_target` be
+    /// false) even though the collapse hit the requested count; those
+    /// segments were never candidates. `segments_compactable_after` is the
+    /// population the loop actually drove (#2418 review round 22).
+    pub segments_after: usize,
+    /// The segments the collapse could act on — `segments_after` minus the
+    /// AXIS-pending ones. This is what the loop's target comparison used.
+    pub segments_compactable_after: usize,
+    pub passes_executed: usize,
+    pub reached_target: bool,
+    pub stop_reason: Option<&'static str>,
+    pub pending_files: usize,
+    /// Measured bytes across the passes THIS request's loop executed
+    /// (TD-COMPACT-15 provenance) — a measured LOWER BOUND on the request's
+    /// total I/O, for every target: worker follow-ups (merges, merges
+    /// bounded by a pinned floor, single-input training rewrites) carry
+    /// their own output keys and are not summed here.
+    pub bytes_read: u64,
+    pub bytes_written: u64,
+    /// Wall-clock duration of the whole request, including discovery and
+    /// inter-pass quiescence waits.
+    pub duration_ms: u64,
+    /// Passes that ran but whose journal entry was gone before the loop read
+    /// it, so their bytes are NOT in `bytes_read`/`bytes_written` and they are
+    /// NOT in `passes_executed`. Non-zero means those three figures are a
+    /// lower bound, not a measurement; `segments_before`/`segments_after`/
+    /// `reached_target` are unaffected (they come from a fresh discovery).
+    /// Reachable only with >64 FULL requests in flight at once, since
+    /// eviction skips awaited keys (#2418 review round 22).
+    pub unobserved_passes: usize,
+}
+
 /// Backwards-compat alias for [`SstCompactionStats`].
 pub type CompactionStats = SstCompactionStats;
 
@@ -440,6 +559,17 @@ struct PreparedCompactionRecords {
     tombstones_removed_count: u64,
 }
 
+/// The `L{n}_` level encoded in a compaction output filename (0 when the name
+/// carries no level — adoption treats that as "same level", preserving the
+/// flat-tier semantics).
+fn output_level_of(output_file: &Path) -> u32 {
+    let filename = output_file
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    crate::storage::common::compaction_orchestrator::FilenameCodec::new().parse_level(&filename)
+}
+
 /// Manages background compaction of SST files
 pub struct Compaction {
     config: SstConfig,
@@ -463,6 +593,17 @@ pub struct Compaction {
     /// New compaction orchestrator
     #[allow(dead_code)]
     compaction_orchestrator: Option<Arc<CompactionOrchestrator>>,
+    /// Journal of finished morsels awaiting collection by
+    /// [`Compaction::take_pass_outcome`] (the FULL collapse loop). Bounded;
+    /// entries nobody reads are dropped.
+    pass_outcomes: Arc<tokio::sync::RwLock<HashMap<String, PassOutcome>>>,
+    /// Output keys a FULL loop is currently waiting to read an outcome for.
+    ///
+    /// The journal is a bounded, process-wide map, so without this the
+    /// eviction below could drop the very entry a FULL request was about to
+    /// read — reporting a real multi-segment collapse as `passes: 0,
+    /// bytes_read: 0` (#2418 review round 22). Eviction skips awaited keys.
+    awaited_outcomes: Arc<tokio::sync::RwLock<std::collections::HashSet<String>>>,
     /// Set-once resolver — initialized after bootstrap once the catalog
     /// handle becomes available (the storage engine constructs Compaction
     /// before SharedServices does, so the resolver can't be injected at
@@ -553,6 +694,27 @@ fn atomic_coordinator_staging(task: &SstCompactionTask) -> Result<StagingConfig>
         skip_uuid_subdir: true,
         ..Default::default()
     })
+}
+
+/// How many inputs a follow-up may keep so the chain cannot merge below a
+/// pinned live-segment `floor`: merging `g` inputs removes `g - 1` segments,
+/// so at most `live - floor + 1`. `None` = do not schedule it — a single-input
+/// follow-up is a rewrite, worth running only when it carries the
+/// layout/training promotion (TD-COMPACT-15; #2418 review round 11).
+fn follow_up_input_cap(
+    live: usize,
+    floor: usize,
+    inputs: usize,
+    is_training: bool,
+) -> Option<usize> {
+    let allowed = live.saturating_sub(floor).saturating_add(1);
+    if inputs <= allowed {
+        return Some(inputs);
+    }
+    if allowed < 2 && !is_training {
+        return None;
+    }
+    Some(allowed.max(1))
 }
 
 impl Compaction {
@@ -697,6 +859,8 @@ impl Compaction {
             stats: Arc::new(RwLock::new(SstCompactionStats::default())),
             active_compactions: Arc::new(RwLock::new(HashMap::new())),
             atomic_coordinator,
+            pass_outcomes: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            awaited_outcomes: Arc::new(tokio::sync::RwLock::new(std::collections::HashSet::new())),
             unified_reader,
             sst_compactor,
             filesystem_factory,
@@ -811,7 +975,7 @@ impl Compaction {
             if let Some(resolver) = self.precision_resolver.get() {
                 Arc::clone(resolver)
             } else {
-                Arc::clone(get_global_precision_resolver()?)
+                get_global_precision_resolver()?
             };
         let table_id = Self::collection_to_table_identifier(collection);
         match resolver.resolve(&table_id).await {
@@ -983,6 +1147,11 @@ impl Compaction {
         // inserted — double-enqueue to the same output. Marking active here,
         // atomically with the dedup, closes that TOCTOU. The worker only
         // removes the entry after completion.
+        //
+        // TD-TIER-1 SC5 (WAL-recovery residual): a declined enqueue first
+        // offers its explicit tier to the queued task that owns the work (see
+        // `adopt_incoming_tier_on_queued_owner`) so the collection's current
+        // intent is not stranded on an untiered dedup winner.
         {
             let mut active = self.active_compactions.write().await;
             if active.contains_key(&compaction_key) {
@@ -990,6 +1159,8 @@ impl Compaction {
                     "Skipping compaction - already active for output file {}",
                     compaction_key
                 );
+                drop(active);
+                self.adopt_incoming_tier_on_queued_owner(&task).await;
                 return Ok(false);
             }
             if active.values().any(|active_task| {
@@ -1002,6 +1173,8 @@ impl Compaction {
                     collection_object_id = task.collection_object_id,
                     "Skipping compaction - an input file is already owned by another morsel"
                 );
+                drop(active);
+                self.adopt_incoming_tier_on_queued_owner(&task).await;
                 return Ok(false);
             }
             active.insert(compaction_key, task.clone());
@@ -1027,6 +1200,154 @@ impl Compaction {
         );
 
         Ok(true)
+    }
+
+    /// TD-TIER-1 SC5 (WAL-recovery residual): an enqueue declined by the dedup
+    /// (same output file, or an input file owned by another morsel) must not
+    /// strand the collection's CURRENT tier intent on the task that owns the
+    /// work — the original case is an untiered recovery-enqueued winner whose
+    /// long-lived output would publish at the account default. While the owner
+    /// is still QUEUED it adopts the incoming task's explicit tier: the output
+    /// PUT has not happened, so the latest collection intent wins (this also
+    /// lets an operator tier change reach a queued-but-unstarted compaction).
+    /// A task already popped by a worker is in flight and keeps its tier — a
+    /// change applies from the next enqueue — and an incoming `None` (e.g. a
+    /// recovery flush whose collection record did not resolve) never erases a
+    /// resolved tier.
+    ///
+    /// The queue lock makes the adoption atomic with the worker's pop. No lock
+    /// nesting anywhere on this path (the enqueue's active-map guard is always
+    /// dropped before the queue lock is taken, and the active-map refresh here
+    /// is a best-effort `try_write` that never blocks).
+    async fn adopt_incoming_tier_on_queued_owner(&self, incoming: &SstCompactionTask) {
+        let Some(incoming_tier) = incoming.access_tier else {
+            return;
+        };
+        // TD-TIER-1 SC5 (level-aware tiering review M2): adoption must never
+        // move a tier BETWEEN output levels. A full pass pairs ACROSS levels
+        // while its own output is always L1, so a full-vs-background race can
+        // pair owners of different levels; under a `tier_by_level:` policy
+        // their correct tiers differ, and an unconditional adopt would
+        // publish the wrong one. Gate on the output levels (from the `L{n}_`
+        // filenames; non-level names parse as 0 and adopt as before — the
+        // flat-tier semantics #2404 pinned, where every task of a collection
+        // carried the same value).
+        let incoming_level = output_level_of(&incoming.output_file);
+        let mut adopted_output_keys: Vec<String> = Vec::new();
+        {
+            let mut queue = self.task_queue.lock().await;
+            for queued in queue.iter_mut() {
+                let same_output = queued.output_file == incoming.output_file;
+                let shares_input = queued
+                    .input_files
+                    .iter()
+                    .any(|input| incoming.input_files.contains(input));
+                let same_level = output_level_of(&queued.output_file) == incoming_level;
+                if (same_output || shares_input)
+                    && same_level
+                    && queued.access_tier != Some(incoming_tier)
+                {
+                    queued.access_tier = Some(incoming_tier);
+                    if same_output {
+                        adopted_output_keys.push(queued.output_file.to_string_lossy().to_string());
+                    }
+                }
+            }
+        }
+        // Keep the dedup snapshot consistent with the adopted tier. The
+        // snapshot's tier is never read for the publish (the worker uses the
+        // popped task); this is bookkeeping only.
+        if !adopted_output_keys.is_empty()
+            && let Ok(mut active) = self.active_compactions.try_write()
+        {
+            for key in adopted_output_keys {
+                if let Some(active_task) = active.get_mut(&key) {
+                    active_task.access_tier = Some(incoming_tier);
+                }
+            }
+        }
+    }
+
+    /// TD-TIER-1 SC5 (level-aware tiering, default-OFF): parse the
+    /// `tier_by_level:` collection tag — a comma list of tiers indexed by
+    /// compaction OUTPUT level (`tier_by_level:hot,cool` ⇒ every L1 output
+    /// Hot, L2+ Cool; the list clamps to its last entry). L0/flush output is
+    /// untouched: staging stays at the account default (minimum-duration
+    /// trap, SC5 review S1), and this policy only ever meets compaction
+    /// outputs (always ≥ L1). With the tag absent, the collection's flat
+    /// `default_access_tier` semantics are exactly today's behavior.
+    /// An unparseable or empty entry refuses the WHOLE policy with a warn —
+    /// a misspelt tier must never silently become the account default.
+    fn level_tier_policy(
+        tags: &[String],
+    ) -> Option<Vec<proximadb_storage_filesystem_types::ObjectAccessTier>> {
+        // Last match wins — the same convention as every other multi-valued
+        // collection tag (compaction_override.rs), not first-wins.
+        let raw = tags
+            .iter()
+            .filter_map(|t| t.strip_prefix("tier_by_level:"))
+            .next_back()?;
+        let mut tiers = Vec::new();
+        for entry in raw.split(',') {
+            let parsed =
+                crate::services::collection::storage_class::parse_access_tier(entry.trim());
+            let canonical = parsed.and_then(|proto| {
+                crate::services::collection::storage_class::validate_access_tier_raw(Some(
+                    proto as i32,
+                ))
+            });
+            match canonical {
+                Ok(Some(tier)) => tiers.push(tier),
+                Ok(None) | Err(_) => {
+                    tracing::warn!(
+                        tier_list = %raw,
+                        "TD-TIER-1 SC5: refusing tier_by_level policy — every entry \
+                         must name a tier (hot|cool|cold); falling back to the \
+                         collection's flat default_access_tier"
+                    );
+                    return None;
+                }
+            }
+        }
+        (!tiers.is_empty()).then_some(tiers)
+    }
+
+    /// The tier a compaction OUTPUT carries: the level policy's entry for the
+    /// output level (clamping past the list), else the collection's flat tier.
+    fn effective_output_tier(
+        collection_tier: Option<proximadb_storage_filesystem_types::ObjectAccessTier>,
+        policy: Option<&[proximadb_storage_filesystem_types::ObjectAccessTier]>,
+        output_level: u32,
+    ) -> Option<proximadb_storage_filesystem_types::ObjectAccessTier> {
+        match policy {
+            Some(tiers) => tiers
+                .get(output_level.saturating_sub(1) as usize)
+                .copied()
+                .or_else(|| tiers.last().copied()),
+            None => collection_tier,
+        }
+    }
+
+    /// Resolve the tier for a built task from its output filename's `L{n}_`
+    /// level (the sanctioned `FilenameCodec` inverse — the level lives only
+    /// in the filename; `SstCompactionTask.level` is the SOURCE level).
+    fn resolve_task_output_tier(
+        task: &SstCompactionTask,
+        collection_tier: Option<proximadb_storage_filesystem_types::ObjectAccessTier>,
+        tags: &[String],
+    ) -> Option<proximadb_storage_filesystem_types::ObjectAccessTier> {
+        let filename = task
+            .output_file
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let output_level = crate::storage::common::compaction_orchestrator::FilenameCodec::new()
+            .parse_level(&filename);
+        Self::effective_output_tier(
+            collection_tier,
+            Self::level_tier_policy(tags).as_deref(),
+            output_level,
+        )
     }
 
     /// TD-COMPACT-6 (ADR-076 D1): the production flush-path compaction trigger.
@@ -1058,6 +1379,7 @@ impl Compaction {
         rg_layout: Option<bool>,
         vector_quant: Option<proximadb_block_format::VectorQuant>,
         access_tier: Option<proximadb_storage_filesystem_types::ObjectAccessTier>,
+        collection_tags: &[String],
     ) -> Result<bool> {
         let Some(mut task) = self
             .check_compaction_needed(
@@ -1072,7 +1394,10 @@ impl Compaction {
         };
         task.rg_layout = rg_layout;
         task.vector_quant = vector_quant;
-        task.access_tier = access_tier;
+        // TD-TIER-1 SC5: a `tier_by_level:` tag re-resolves the output tier by
+        // the task's OUTPUT level; without it the collection's flat tier is
+        // exactly today's behavior.
+        task.access_tier = Self::resolve_task_output_tier(&task, access_tier, collection_tags);
         task.collection_identity = collection_identity;
         // TD-COMPACT-6 D1: the worker clears the shared training_in_flight guard
         // for this collection on completion. It derives the collection dir from
@@ -1080,6 +1405,503 @@ impl Compaction {
         // collection dir — see `generate_output_file_path`), so no separate
         // field is needed on the task.
         self.schedule_compaction(task).await
+    }
+
+    /// Take (and remove) the recorded outcome of the morsel that wrote
+    /// `output_key`, if any.
+    pub async fn take_pass_outcome(&self, output_key: &str) -> Option<PassOutcome> {
+        self.pass_outcomes.write().await.remove(output_key)
+    }
+
+    /// Collapse the collection toward `full_target_segments` — the
+    /// per-request target or the config default — with the SMALLEST-FIRST
+    /// greedy grouping (TD-COMPACT-15: ~3.6x less write amplification than
+    /// largest-first; each pass merges the smallest viable group, capped at
+    /// `live - target + 1` inputs so it can never overshoot below the
+    /// target), looping passes until the target is reached or a stop
+    /// condition fires.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn compact_collection_full(
+        &self,
+        collection_object_id: crate::core::stable_id::CollectionObjectId,
+        collection_dir: &Path,
+        precision_hint: Option<proximadb_records::EmbeddingScalarType>,
+        rg_layout: Option<bool>,
+        vector_quant: Option<proximadb_block_format::VectorQuant>,
+        access_tier: Option<proximadb_storage_filesystem_types::ObjectAccessTier>,
+        timeout: std::time::Duration,
+        collection_tags: &[String],
+        target_override: Option<usize>,
+    ) -> Result<FullCompactionSummary> {
+        use crate::storage::common::compaction_memory::current_compaction_input_budget;
+        use crate::storage::common::compaction_utils::CompactionFileDiscovery;
+
+        let started = std::time::Instant::now();
+        let cfg = self.config.compaction_config.clone().unwrap_or_default();
+        // Per-request override (TD-COMPACT-15 Experiment 3). Rejected, not
+        // clamped, at 0: both API surfaces refuse it, and silently turning an
+        // internal caller's Some(0) into a successful collapse to 1 is the
+        // knob-silently-rewritten class those surfaces exist to prevent
+        // (#2418 review round 9).
+        if target_override == Some(0) {
+            return Err(crate::core::StorageError::SstEngine(
+                "target_segments must be >= 1 (got 0)".to_string(),
+            ));
+        }
+        let target = target_override.unwrap_or(cfg.full_target_segments.max(1));
+        // Any resolved target > 1 — per-request OR config-level — bounds the
+        // follow-up chain. Round 9 exempted config targets because the old
+        // SUPPRESSION dropped the training promotion; the floor keeps it (as
+        // a single-input rewrite), so the exemption only let a configured
+        // full_target_segments = 2 be merged down to 1 behind the operator's
+        // back (#2418 review round 13).
+        let min_live_segments = (target > 1).then_some(target);
+        let max_passes = cfg.full_max_passes.max(1);
+        let deadline = started + timeout;
+        let (mut total_bytes_read, mut total_bytes_written) = (0u64, 0u64);
+
+        let collection_path = collection_dir.to_string_lossy().to_string();
+        let collection_id_text = collection_object_id.to_string();
+        let discovery = CompactionFileDiscovery::new(self.filesystem_factory.clone());
+
+        let mut segments_before: Option<usize> = None;
+        // ROUNDS bound the loop; PASSES are the measured provenance (observed
+        // completions only). Round 20 counted a journal MISS as a pass, but
+        // the journal is a shared 64-entry map that evicts an arbitrary key
+        // and the pass's OWN follow-up can evict its entry before quiescence
+        // returns — so `passes` (and the completed/at_target metric label
+        // derived from it) over-reported real merges. A miss is now neither:
+        // it does not inflate the provenance and it does not stall the loop
+        // (#2418 review round 21).
+        let mut rounds = 0usize;
+        let mut passes = 0usize;
+        // Contention only: three consecutive rounds where a background
+        // morsel owned one of our inputs. (Round 21: the journal-miss and
+        // live-count paths no longer feed this, so "no_progress" is not a
+        // reachable stop reason — the metric doc says so.)
+        let mut contended_rounds = 0usize;
+        // Passes that ran but whose journal entry was gone before we read it.
+        let mut unobserved_passes = 0usize;
+        // #2418 review rounds 17+20 on progress detection: a journal miss
+        // after quiescence is an EVICTION artifact (the journal is bounded at
+        // 64 and shared process-wide) — the pass ran, so it counts. Round 17
+        // also broke on a flat LIVE COUNT, but a flat count with passes
+        // completing means concurrent ingest is offsetting the merges — the
+        // collapse is working and should continue to max_passes/deadline, not
+        // stop early with a false no_progress (and that same break shadowed
+        // the schedule-time "contended" reason). So: completions (journal or
+        // eviction-inferred) reset the contention counter, and only the
+        // schedule-false branch produces "contended".
+        let stop_reason = loop {
+            let files = discovery
+                .discover_compactable_files(
+                    &collection_id_text,
+                    &collection_path,
+                    "pax",
+                    CompactionEngineType::SST,
+                )
+                .await
+                .map_err(|e| crate::core::StorageError::SstEngine(e.to_string()))?;
+            let mut pair: Vec<(String, u64, u32)> = files
+                .compactable_files
+                .values()
+                .flatten()
+                .map(|f| (f.path.clone(), f.size_bytes, f.level))
+                .collect();
+            let pending: usize = files.pending_files.values().map(Vec::len).sum();
+            let live = pair.len();
+            if segments_before.is_none() {
+                segments_before = Some(live + pending);
+            }
+            if live <= target {
+                // At target, but AXIS-pending segments would push past it once
+                // their rebuild publishes: report why the count can still move.
+                if pending > 0 && live + pending > target {
+                    break Some("axis_pending");
+                }
+                break None;
+            }
+            if rounds >= max_passes {
+                break Some("max_passes");
+            }
+            if std::time::Instant::now() >= deadline {
+                break Some("deadline");
+            }
+            // TD-COMPACT-15 smallest-first: each pass merges the SMALLEST viable
+            // group (3.6× less write amplification than largest-first; the
+            // admission budget is never the bottleneck because the smallest
+            // always fits; outputs cascade upward naturally).
+            pair.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+            let budget = current_compaction_input_budget(&cfg);
+            // saturating: config validation rejects only 0, so a huge stated
+            // value must not overflow (debug panic, mandate #4; release wrap
+            // to a tiny target).
+            let target_file_size = cfg
+                .consolidate_target_file_size_mb_or_default()
+                .max(1)
+                .saturating_mul(1_048_576);
+            // TD-COMPACT-15 greedy smallest-first: accumulate segments from
+            // the ascending-sorted list until the combined size reaches the
+            // target file size (producing uniform segments) or the
+            // admission budget is hit. At least 2 segments are needed.
+            // The count target CAPS the group: merging g inputs leaves
+            // live - g + 1 segments, so taking more than live - target + 1
+            // inputs would overshoot BELOW the requested count (more write
+            // amplification than the operator asked for). With target=1 the
+            // cap is the whole list — the S=1 collapse behavior.
+            // `pair` was only re-sorted since the loop-top `live`, never
+            // filtered — same count, named once instead of shadowed so the
+            // cap math visibly uses the same figure as the loop-target
+            // check above (#2418 review round 18).
+            let max_group_inputs = live.saturating_sub(target).saturating_add(1);
+            let mut group: Vec<(String, u64, u32)> = Vec::new();
+            let mut group_bytes: u64 = 0;
+            for seg in &pair {
+                if group.len() >= max_group_inputs {
+                    break;
+                }
+                let would_exceed = group_bytes + seg.1 > budget.max_input_bytes
+                    && !group.is_empty()
+                    && !cfg.spill_enabled;
+                if would_exceed {
+                    break;
+                }
+                group.push(seg.clone());
+                group_bytes += seg.1;
+                if group_bytes >= target_file_size {
+                    break;
+                }
+            }
+            let pair: Vec<(String, u64, u32)> = if group.len() >= 2 {
+                group
+            } else if pair.len() >= 2
+                && (pair[0].1 + pair[1].1 <= budget.max_input_bytes || cfg.spill_enabled)
+            {
+                // The greedy group didn't accumulate (the target size is
+                // below one segment); take the two smallest IF they fit.
+                pair[..2].to_vec()
+            } else {
+                return Err(crate::core::StorageError::SstEngine(format!(
+                    "FULL compaction stalled: no segment group fits the \
+                     compaction input budget ({} bytes) and local-spill is \
+                     disabled; raise [storage.compaction_config] memory \
+                     budget/ceiling or set spill_enabled = true",
+                    budget.max_input_bytes
+                )));
+            };
+            let pair_bytes: u64 = pair.iter().map(|(_, size, _)| *size).sum();
+            let source_level = pair.iter().map(|(_, _, level)| *level).min().unwrap_or(1);
+            let input_files: Vec<PathBuf> = pair
+                .iter()
+                .map(|(path, _, _)| PathBuf::from(path))
+                .collect();
+            let output_file = self.generate_output_file_path(
+                collection_object_id,
+                collection_dir,
+                // The level lives only in the `L{n}_` filename; L1 outputs
+                // re-pair on the next pass, and re-min with a fresh L0.
+                1,
+                compaction_output_format(&input_files),
+            );
+            let task = SstCompactionTask {
+                collection_object_id,
+                collection_identity: crate::core::stable_id::CollectionIdentity::default(),
+                // min input level keeps the training follow-up threshold
+                // armed when a pair spans L0.
+                level: source_level as u8,
+                input_files,
+                input_bytes: pair_bytes,
+                output_file: output_file.clone(),
+                priority: CompactionPriority::High,
+                block_size_kb: None,
+                compression_config: None,
+                // The collection intent MUST ride the task (the config-free
+                // task RaBitQ drift bug; see `inherit_collection_intent`).
+                precision_hint,
+                rg_layout,
+                vector_quant,
+                // TD-TIER-1 SC5: full passes publish L1 outputs by design
+                // (re-pairing; see the filename comment above), so a
+                // `tier_by_level:` policy always resolves its first entry
+                // here; without the tag this is exactly the flat tier.
+                access_tier: Self::effective_output_tier(
+                    access_tier,
+                    Self::level_tier_policy(collection_tags).as_deref(),
+                    1,
+                ),
+                // Bounds the follow-up chain to the per-request stop point.
+                min_live_segments,
+            };
+            let output_key = task.output_file.to_string_lossy().to_string();
+            rounds += 1;
+            // Registered AFTER the schedule succeeds: on a declined morsel
+            // (`Ok(false)`) or a schedule error (`?`), nothing is awaited, and
+            // inserting before either path leaked the key into this
+            // process-lifetime set forever — one leaked path string per
+            // contended round on a server running periodic FULL alongside
+            // background compaction (#2418 review round 23). Until the insert,
+            // a >64-in-flight eviction could still drop this outcome — the
+            // `unobserved_passes` figure reports that honestly if it happens.
+            if !self.schedule_compaction(task).await? {
+                // A background morsel owns one of our inputs. It is also
+                // reducing the segment count; let it finish instead of
+                // fighting it.
+                contended_rounds += 1;
+                if contended_rounds >= 3 {
+                    break Some("contended");
+                }
+                continue;
+            }
+            self.awaited_outcomes
+                .write()
+                .await
+                .insert(output_key.clone());
+            // The REQUEST deadline bounds the total; each pass waits at most
+            // what remains of it (full_timeout_ms is not per-pass).
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if !self.await_compaction_quiescence(remaining).await {
+                self.awaited_outcomes.write().await.remove(&output_key);
+                return Err(crate::core::StorageError::SstEngine(format!(
+                    "FULL compaction for {collection_object_id} did not quiesce within the \
+                     request deadline ({}ms remaining); a pass may still be in flight",
+                    remaining.as_millis()
+                )));
+            }
+            let taken = self.take_pass_outcome(&output_key).await;
+            self.awaited_outcomes.write().await.remove(&output_key);
+            match taken {
+                Some(PassOutcome::Completed {
+                    bytes_read,
+                    bytes_written,
+                }) => {
+                    passes += 1;
+                    total_bytes_read += bytes_read;
+                    total_bytes_written += bytes_written;
+                    contended_rounds = 0;
+                    // The worker's follow-up chain may have merged more; the
+                    // next discovery reflects it.
+                }
+                Some(PassOutcome::Declined(label)) => {
+                    return Err(crate::core::StorageError::SstEngine(format!(
+                        "FULL compaction pass declined ({label}); typical causes: \
+                         spill_base_quant_unsupported (an SQ8 base has no spill form) or \
+                         spill_inputs_not_exact (a RawF32 base paired with a lossy input); \
+                         see proximadb_compaction_declined_total"
+                    )));
+                }
+                Some(PassOutcome::Failed(message)) => {
+                    return Err(crate::core::StorageError::SstEngine(format!(
+                        "FULL compaction pass failed: {message}"
+                    )));
+                }
+                None => {
+                    // The journal entry was evicted. Eviction now skips
+                    // awaited keys, so this is reachable only when >64 FULL
+                    // requests are in flight at once. The pass was scheduled
+                    // and the system quiesced, so it is NOT stagnation; it was
+                    // never OBSERVED, so it must not inflate `passes` either
+                    // (`rounds` bounds the loop, the deadline still applies).
+                    // It IS counted here so the summary can say its pass and
+                    // byte figures are incomplete rather than present a
+                    // silent zero as fact (#2418 review round 22).
+                    unobserved_passes += 1;
+                    contended_rounds = 0;
+                }
+            }
+        };
+        let files = discovery
+            .discover_compactable_files(
+                &collection_id_text,
+                &collection_path,
+                "pax",
+                CompactionEngineType::SST,
+            )
+            .await
+            .map_err(|e| crate::core::StorageError::SstEngine(e.to_string()))?;
+        let after: usize = files.total_files;
+        Ok(FullCompactionSummary {
+            segments_before: segments_before.unwrap_or(after),
+            segments_after: after,
+            // The same expression the loop's `live` uses, so the reported
+            // population and the one the target compared against cannot drift.
+            segments_compactable_after: files.compactable_files.values().flatten().count(),
+            passes_executed: passes,
+            reached_target: after <= target,
+            stop_reason,
+            pending_files: files.pending_files.values().map(Vec::len).sum(),
+            bytes_read: total_bytes_read,
+            bytes_written: total_bytes_written,
+            duration_ms: started.elapsed().as_millis() as u64,
+            unobserved_passes,
+        })
+    }
+
+    /// Narrow a follow-up to ONE untrained input worth promoting (the
+    /// TD-COMPACT-5 header check and size floor the flush trigger uses), with
+    /// `input_bytes` set to that file's real size. Returns false when no input
+    /// qualifies — a single-input rewrite of anything else changes nothing.
+    /// Needs only per-file reads, so it also serves the path where the
+    /// directory LIST failed.
+    pub(crate) async fn narrow_to_promotion_candidate(
+        &self,
+        follow_up: &mut SstCompactionTask,
+    ) -> bool {
+        let min_bytes = super::flush::training_compaction_min_bytes();
+        let mut errored = false;
+        // SMALLEST qualifying input, not the first. `input_files` arrives in
+        // task order, which `bound_follow_up_to_floor` establishes is
+        // timestamp order (oldest first) — and in an LSM the oldest segments
+        // have absorbed the most merges, so they are the LARGEST. Taking the
+        // first therefore rewrote the biggest candidate, maximising write
+        // amplification for a rewrite whose only purpose is to attach a
+        // training header; it was the same inversion round 21 fixed for the
+        // multi-input path, left in place on this one (#2418 review round 22).
+        let mut best: Option<(std::path::PathBuf, u64)> = None;
+        for path in &follow_up.input_files {
+            let url = path.to_string_lossy();
+            match super::flush::untrained_segment_size_on(&self.filesystem_factory, &url, min_bytes)
+                .await
+            {
+                Ok(Some(size)) => {
+                    // Tie-break on path so the choice is deterministic.
+                    let better = match &best {
+                        Some((best_path, best_size)) => {
+                            (size, path.as_path()) < (*best_size, best_path.as_path())
+                        }
+                        None => true,
+                    };
+                    if better {
+                        best = Some((path.clone(), size));
+                    }
+                }
+                Ok(None) => {}
+                // Loud: silently skipping left the caller's "skipped: at the
+                // floor" debug! naming the floor as the cause when the real
+                // cause was a transient object-store error — the exact
+                // misdiagnosis the training-regression fights relied on
+                // (#2418 review round 18).
+                Err(error) => {
+                    errored = true;
+                    warn!(
+                        segment = %url,
+                        "promotion-candidate header check failed: {error}"
+                    );
+                }
+            }
+        }
+        if let Some((chosen, size)) = best {
+            follow_up.input_files = vec![chosen];
+            follow_up.input_bytes = size;
+            return true;
+        }
+        if errored {
+            warn!("no promotion candidate readable; not narrowing the follow-up");
+        }
+        false
+    }
+
+    /// Bound a follow-up so the chain can never merge below a pinned
+    /// live-segment `floor` (TD-COMPACT-15; #2418 review round 11).
+    ///
+    /// Merging `g` inputs removes `g - 1` live segments, so with `live`
+    /// segments a follow-up may take at most `live - floor + 1` inputs. Over
+    /// that, the inputs are trimmed (and `input_bytes` recomputed from the
+    /// same discovery the FULL loop uses). A follow-up trimmed to ONE input is
+    /// a rewrite, which is only worth running when it carries the
+    /// layout/training promotion (`is_training`) — that is the case the
+    /// previous suppression wrongly dropped. Returns whether to schedule it.
+    pub(crate) async fn bound_follow_up_to_floor(
+        &self,
+        follow_up: &mut SstCompactionTask,
+        collection_dir: &Path,
+        floor: usize,
+        is_training: bool,
+    ) -> Result<bool> {
+        use crate::storage::common::compaction_utils::CompactionFileDiscovery;
+        let collection_id_text = follow_up.collection_object_id.to_string();
+        let collection_path = collection_dir.to_string_lossy().to_string();
+        let files = CompactionFileDiscovery::new(self.filesystem_factory.clone())
+            .discover_compactable_files(
+                &collection_id_text,
+                &collection_path,
+                "pax",
+                CompactionEngineType::SST,
+            )
+            .await
+            .map_err(|e| crate::core::StorageError::SstEngine(e.to_string()))?;
+        let sizes: std::collections::HashMap<String, u64> = files
+            .compactable_files
+            .values()
+            .flatten()
+            .map(|f| (f.path.clone(), f.size_bytes))
+            .collect();
+        let Some(keep) =
+            follow_up_input_cap(sizes.len(), floor, follow_up.input_files.len(), is_training)
+        else {
+            return Ok(false);
+        };
+        if keep == follow_up.input_files.len() {
+            return Ok(true);
+        }
+        if keep == 1 {
+            // A single-input rewrite is only worth running to PROMOTE an
+            // untrained segment worth training: pick one that is, rather than
+            // `input_files[0]`, and skip when none is (#2418 review rounds
+            // 14-15: same size floor as the flush trigger).
+            return Ok(self.narrow_to_promotion_candidate(follow_up).await);
+        }
+        // Gather the kept sizes BEFORE mutating the task, so an Err leaves
+        // it untouched: round 20's truncation-then-lookup left a torn task
+        // (truncated inputs + the pre-truncation byte sum) for both caller
+        // fallbacks to act on — the retry saw cap == len and scheduled the
+        // morsel with the untrimmed sum (admission over-reserved), and the
+        // promotion fallback narrowed an already-truncated list that may
+        // have lost the untrained input.
+        // SMALLEST-first, not first-N: the task's input list arrives sorted
+        // by timestamp (oldest first), and in an LSM the oldest segments have
+        // absorbed the most merges — i.e. they are the LARGEST. Taking the
+        // first `keep` therefore rewrote the biggest segments, inverting the
+        // smallest-first policy the FULL loop itself applies (and the ~3.6x
+        // write-amp advantage it is built on) — #2418 review round 21.
+        //
+        // An input ABSENT from this fresh discovery was retired by a
+        // concurrent flush/compaction between the task's own discovery and
+        // this one: it is not ours to merge, so it is dropped (round 20
+        // returned Err, and the retry then re-discovered the same missing
+        // path and failed identically — a no-op retry for a deterministic
+        // error). Zero bytes is never substituted: that would under-state
+        // the input and let admission under-reserve.
+        let mut candidates: Vec<(std::path::PathBuf, u64)> = follow_up
+            .input_files
+            .iter()
+            .filter_map(|path| {
+                sizes
+                    .get(&path.to_string_lossy().to_string())
+                    .copied()
+                    .map(|size| (path.clone(), size))
+            })
+            .collect();
+        if candidates.len() < 2 {
+            // `Ok(false)` ("do not schedule"), NOT `Err`: the inputs were
+            // concurrently retired, which a re-discovery reports identically,
+            // so the non-promoting caller's one retry would spend a second
+            // full object-store LIST to fail the same way. Err is reserved
+            // for a genuinely transient LIST error, where the retry can
+            // succeed (#2418 review round 22 — the no-op-retry class round 21
+            // claimed to remove, reintroduced on this path).
+            debug!(
+                live_inputs = candidates.len(),
+                "floor-bounded follow-up has nothing left to merge; not scheduling"
+            );
+            return Ok(false);
+        }
+        candidates.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+        let keep = keep.min(candidates.len());
+        let kept_sizes: Vec<(std::path::PathBuf, u64)> =
+            candidates.into_iter().take(keep).collect();
+        follow_up.input_files = kept_sizes.iter().map(|(p, _)| p.clone()).collect();
+        follow_up.input_bytes = kept_sizes.iter().map(|(_, s)| s).sum();
+        Ok(true)
     }
 
     /// Check if compaction is needed for the given collection and level.
@@ -1195,6 +2017,7 @@ impl Compaction {
                 rg_layout: None,
                 vector_quant: None,
                 access_tier: None,
+                min_live_segments: None,
             }));
         }
 
@@ -1354,7 +2177,7 @@ impl Compaction {
                 // hung on the worker. `perform_compaction` only reads through
                 // the Arc-shared reader/compactor/factory, so concurrent
                 // invocation across workers + flush is safe.
-                let succeeded = match compaction
+                let (succeeded, journal_outcome) = match compaction
                     .perform_compaction_with_plan(&task, resource_plan)
                     .await
                 {
@@ -1369,7 +2192,7 @@ impl Compaction {
                             "Compaction declined for level {}",
                             task.level
                         );
-                        false
+                        (false, Some(PassOutcome::Declined(reason.label())))
                     }
                     Ok(CompactionOutcome::Completed(compaction_stats)) => {
                         info!(
@@ -1398,7 +2221,13 @@ impl Compaction {
                                     (stats_guard.avg_compaction_time_ms + elapsed_ms) / 2;
                             }
                         }
-                        true
+                        (
+                            true,
+                            Some(PassOutcome::Completed {
+                                bytes_read: compaction_stats.bytes_read,
+                                bytes_written: compaction_stats.bytes_written,
+                            }),
+                        )
                     }
                     Err(e) => {
                         error!(
@@ -1407,9 +2236,34 @@ impl Compaction {
                             task.output_file.display(),
                             e
                         );
-                        false
+                        (false, Some(PassOutcome::Failed(e.to_string())))
                     }
                 };
+                if let Some(outcome) = journal_outcome {
+                    let mut journal = compaction.pass_outcomes.write().await;
+                    if journal.len() >= 64 {
+                        // Bounded. Evict an entry NO FULL loop is waiting on:
+                        // dropping an awaited entry would make a real collapse
+                        // report `passes: 0, bytes_read: 0` while
+                        // `reached_target` says it worked (#2418 review round
+                        // 22 — the under-reporting mirror of the over-reporting
+                        // round 21 fixed). The round-17 claim that eviction is
+                        // "benign for the FULL loop" has not held since round
+                        // 21 stopped counting an unobserved pass.
+                        let awaited = compaction.awaited_outcomes.read().await;
+                        let victim = journal.keys().find(|k| !awaited.contains(*k)).cloned();
+                        // `None` = every entry is awaited: keep them all
+                        // rather than corrupt one request's provenance. The
+                        // map exceeds 64 only while that many FULL requests
+                        // are in flight, and each removes its own key when it
+                        // takes its outcome.
+                        drop(awaited);
+                        if let Some(key) = victim {
+                            journal.remove(&key);
+                        }
+                    }
+                    journal.insert(compaction_key.clone(), outcome);
+                }
                 drop(resource_reservation);
                 // TD-COMPACT-13: debounced reconciliation sweep (runs on both
                 // success and failure paths so a failed retirement is re-driven
@@ -1451,30 +2305,114 @@ impl Compaction {
                             // drift between compaction rounds.
                             follow_up.inherit_collection_intent(&task);
                             let follow_up_level = follow_up.level;
-                            match compaction.schedule_compaction(follow_up).await {
-                                Ok(true) => {
-                                    scheduled_follow_up_level = Some(follow_up_level);
-                                    info!(
+                            // A pinned floor bounds the follow-up instead of
+                            // suppressing it: the chain (and its training
+                            // promotion) still runs, but can never merge
+                            // below the operator's stop point.
+                            // Only an L0 follow-up in the training chain is
+                            // a promotion: `training_follow_up_threshold` is
+                            // Some for EVERY follow-up after an L0-sourced
+                            // .pax pass, so on its own it would let the floor
+                            // schedule a single-input rewrite of an already
+                            // trained L1+ segment — pure write amplification
+                            // (#2418 review round 12).
+                            let promotes = follow_up_threshold.is_some() && follow_up.level == 0;
+                            let keep = match follow_up.min_live_segments {
+                                None => true,
+                                Some(floor) => match compaction
+                                    .bound_follow_up_to_floor(
+                                        &mut follow_up,
+                                        collection_dir,
+                                        floor,
+                                        promotes,
+                                    )
+                                    .await
+                                {
+                                    Ok(keep) => keep,
+                                    // A transient LIST failure must not drop the
+                                    // promotion round 11 exists to keep. Without
+                                    // the live count, the only safe follow-up is
+                                    // one that cannot reduce it: a single-input
+                                    // rewrite. `narrow_to_promotion_candidate`
+                                    // sets `input_bytes` to the chosen file's
+                                    // REAL size (the old over-estimate claim is
+                                    // stale, #2418 review round 16).
+                                    Err(error) if promotes => {
+                                        // Same picker as the normal path (an
+                                        // untrained input worth training, with
+                                        // its real size), which needs only
+                                        // per-file reads (#2418 review round 15).
+                                        let keep = compaction
+                                            .narrow_to_promotion_candidate(&mut follow_up)
+                                            .await;
+                                        warn!(
+                                            collection_object_id = task.collection_object_id,
+                                            promoting = keep,
+                                            "Compaction follow-up floor check failed; promotion falls back to a single-input rewrite of an untrained segment when one exists: {error}"
+                                        );
+                                        keep
+                                    }
+                                    Err(first_err) => {
+                                        // One retry: a transient object-store
+                                        // blip on the floor LIST permanently
+                                        // dropped a FLOOR-LEGAL merge on a
+                                        // settled bed, where nothing re-drives
+                                        // it (#2418 review round 17).
+                                        let retried = compaction
+                                            .bound_follow_up_to_floor(
+                                                &mut follow_up,
+                                                collection_dir,
+                                                floor,
+                                                promotes,
+                                            )
+                                            .await;
+                                        match retried {
+                                            Ok(keep) => keep,
+                                            Err(second_err) => {
+                                                warn!(
+                                                    collection_object_id = task.collection_object_id,
+                                                    first = %first_err,
+                                                    second = %second_err,
+                                                    "Compaction follow-up floor check failed twice; not scheduling a plain merge"
+                                                );
+                                                false
+                                            }
+                                        }
+                                    }
+                                },
+                            };
+                            if keep {
+                                match compaction.schedule_compaction(follow_up).await {
+                                    Ok(true) => {
+                                        scheduled_follow_up_level = Some(follow_up_level);
+                                        info!(
+                                            collection_object_id = task.collection_object_id,
+                                            layout_promotion_chain = follow_up_threshold.is_some(),
+                                            "Compaction follow-up morsel enqueued after level {}",
+                                            task.level
+                                        );
+                                    }
+                                    Ok(false) => {
+                                        // Another active task owns this work. Keep
+                                        // the training guard when that owner is an
+                                        // L0 morsel so it inherits threshold one.
+                                        scheduled_follow_up_level = Some(follow_up_level);
+                                        debug!(
+                                            collection_object_id = task.collection_object_id,
+                                            "Compaction follow-up already owned by another morsel"
+                                        );
+                                    }
+                                    Err(error) => warn!(
                                         collection_object_id = task.collection_object_id,
-                                        layout_promotion_chain = follow_up_threshold.is_some(),
-                                        "Compaction follow-up morsel enqueued after level {}",
-                                        task.level
-                                    );
+                                        "Compaction follow-up enqueue failed: {error}"
+                                    ),
                                 }
-                                Ok(false) => {
-                                    // Another active task owns this work. Keep
-                                    // the training guard when that owner is an
-                                    // L0 morsel so it inherits threshold one.
-                                    scheduled_follow_up_level = Some(follow_up_level);
-                                    debug!(
-                                        collection_object_id = task.collection_object_id,
-                                        "Compaction follow-up already owned by another morsel"
-                                    );
-                                }
-                                Err(error) => warn!(
+                            } else {
+                                debug!(
                                     collection_object_id = task.collection_object_id,
-                                    "Compaction follow-up enqueue failed: {error}"
-                                ),
+                                    floor = follow_up.min_live_segments,
+                                    "Compaction follow-up skipped: at the pinned live-segment floor"
+                                );
                             }
                         }
                         Ok(None) => {}
@@ -1601,6 +2539,33 @@ impl Compaction {
     /// TD-COMPACT-13: ONE delete attempt per input (warm-cache purge + DV
     /// removal on success). Returns the inputs that failed this attempt.
     async fn delete_inputs_attempt(&self, inputs: &[PathBuf]) -> Vec<PathBuf> {
+        // A LIST after publication can cache both replacement and inputs.
+        // Cover every exit after deletion, including partial retirement and
+        // cancellation at a later await. The reconciler shares this path and
+        // must invalidate before it removes pending-path suppression.
+        struct InvalidateListingsOnExit<'a> {
+            filesystem: &'a FilesystemFactory,
+            inputs: &'a [PathBuf],
+        }
+        impl Drop for InvalidateListingsOnExit<'_> {
+            fn drop(&mut self) {
+                let directories: std::collections::HashSet<_> = self
+                    .inputs
+                    .iter()
+                    .filter_map(|input| input.parent())
+                    .collect();
+                for directory in directories {
+                    crate::storage::engines::sst::search::invalidate_segment_listing_cache(
+                        self.filesystem,
+                        &directory.to_string_lossy(),
+                    );
+                }
+            }
+        }
+        let _listing_invalidation = InvalidateListingsOnExit {
+            filesystem: self.filesystem_factory.as_ref(),
+            inputs,
+        };
         let warm_caches = crate::storage::engines::sst::core::get_warm_tier_caches();
         #[cfg(feature = "cold-deletion-vectors")]
         let dv_store =
@@ -2220,6 +3185,15 @@ impl Compaction {
                         "update local-spill upload manifest: {error}"
                     ))
                 })?;
+            // Direct uploads publish here; coordinator-managed staging is
+            // covered by the finalization guard below.
+            let _publication_invalidation = if direct_remote_publication
+                || atomic_operation.is_none()
+            {
+                guard_compaction_publication(self.filesystem_factory.as_ref(), &task.output_file)
+            } else {
+                None
+            };
             let bytes = staged
                 .upload_bounded_retaining_local(&self.filesystem_port())
                 .await
@@ -2252,6 +3226,8 @@ impl Compaction {
             "spill_pax_uploaded",
             usize::try_from(mvcc_stats.output_records).unwrap_or(usize::MAX),
         );
+        let publication_invalidation =
+            guard_compaction_publication(self.filesystem_factory.as_ref(), &task.output_file);
         if let (Some(coordinator), Some(operation)) = (&self.atomic_coordinator, &atomic_operation)
             && let Err(error) = coordinator
                 .finalize_atomic_operation(&operation.operation_id)
@@ -2267,6 +3243,9 @@ impl Compaction {
                 "publish local-spill PAX segment: {error}"
             )));
         }
+        drop(publication_invalidation);
+        #[cfg(test)]
+        publication_checkpoint().await;
         if let Err(error) = task_scratch.update_phase("published", None) {
             warn!(%error, "Local-spill publication committed but manifest update failed");
         }
@@ -2918,6 +3897,8 @@ impl Compaction {
                     ))
                 })?;
 
+            let publication_invalidation =
+                guard_compaction_publication(self.filesystem_factory.as_ref(), &task.output_file);
             // Finalize atomic operation - this moves the file from staging to final location
             coordinator
                 .finalize_atomic_operation(&atomic_op.operation_id)
@@ -2928,6 +3909,10 @@ impl Compaction {
                         e
                     ))
                 })?;
+
+            drop(publication_invalidation);
+            #[cfg(test)]
+            publication_checkpoint().await;
 
             info!(
                 "✅ LSM COMPACTION: Atomic operation {} completed successfully",
@@ -3085,6 +4070,13 @@ impl Compaction {
                     );
                 }
             }
+
+            drop(guard_compaction_publication(
+                self.filesystem_factory.as_ref(),
+                &task.output_file,
+            ));
+            #[cfg(test)]
+            publication_checkpoint().await;
 
             // TD-COMPACT-1 S2: size the output through its URL-selected
             // backend, and never fail the already-durable compaction over a
@@ -3540,10 +4532,38 @@ impl Compaction {
     }
 }
 
+fn guard_compaction_publication<'a>(
+    filesystem: &'a FilesystemFactory,
+    output: &Path,
+) -> Option<crate::storage::engines::sst::search::SegmentListingPublicationGuard<'a>> {
+    output.parent().map(|directory| {
+        crate::storage::engines::sst::search::SegmentListingPublicationGuard::new(
+            filesystem,
+            &directory.to_string_lossy(),
+        )
+    })
+}
+
 type WarmTierCachePair = (
     Arc<crate::storage::engines::sst::segment_format::SegmentInvariantsCache>,
     Arc<crate::storage::engines::sst::survivor_range_cache::SurvivorRangeCache>,
 );
+
+#[cfg(test)]
+tokio::task_local! {
+    /// Scoped to one compaction future so unrelated tests cannot block here.
+    static PUBLICATION_CHECKPOINT: (Arc<Notify>, Arc<Notify>);
+}
+
+#[cfg(test)]
+async fn publication_checkpoint() {
+    if let Ok(resume) = PUBLICATION_CHECKPOINT.try_with(|(published, resume)| {
+        published.notify_one();
+        resume.clone()
+    }) {
+        resume.notified().await;
+    }
+}
 
 /// Retire one immutable compaction input through the backend selected by its
 /// URL. A missing input is an idempotent success: another already-running
@@ -3629,6 +4649,7 @@ mod compaction_format_tests {
             rg_layout: None,
             vector_quant,
             access_tier: None,
+            min_live_segments: None,
         }
     }
 

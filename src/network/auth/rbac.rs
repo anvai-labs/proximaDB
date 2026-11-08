@@ -367,23 +367,36 @@ impl RbacService {
             _ => {} // Other resource types handled by basic permission check
         }
 
-        // Tenant isolation check
-        if let Some(resource_tenant) = &context.tenant_id {
-            let _user_roles = self.get_user_roles(user_id)?;
-            // Check if user belongs to the same tenant (simplified check)
-            // In production, this would involve more complex tenant validation
-            if !self.user_belongs_to_tenant(user_id, resource_tenant).await {
-                return Err(AuthError::AuthorizationDenied(permission));
-            }
+        // Tenant isolation check: fail-closed. This layer holds no
+        // tenant-membership data, so it cannot prove the user belongs to the
+        // tenant a context asserts — and an unprovable tenant claim is DENIED,
+        // never silently allowed. Real membership validation would require a
+        // membership store this service does not have (TD-FACADE-1). The
+        // middleware never asserts a resource tenant (it cannot know one from
+        // a request path), so mounted use is unaffected; a caller that asserts
+        // one must bring its own tenancy decision. The system's structural
+        // isolation (TenantContext + DrPathBuilder paths) is unaffected by
+        // this layer either way.
+        if let Some(resource_tenant) = &context.tenant_id
+            && !self.user_belongs_to_tenant(user_id, resource_tenant).await
+        {
+            return Err(AuthError::AuthorizationDenied(permission));
         }
 
         Ok(())
     }
 
-    /// Check if user has access to a specific collection
+    /// Collection-access predicate.
+    ///
+    /// No per-collection ACLs exist in this service: access to ANY collection
+    /// is granted whenever the caller's role permissions already allow the
+    /// operation (checked separately by `check_permission_with_context`) and
+    /// the roles read succeeds (`try_read` contention is the only failure
+    /// mode; unknown users resolve to the default role). Enforcing per-collection ACLs would require
+    /// an ACL store this layer does not have (TD-FACADE-1); until one exists
+    /// this intentionally reduces to role permissions, and the `admin` short
+    /// circuit below is the only collection-independent override.
     async fn user_has_collection_access(&self, user_id: &str, _collection_id: &str) -> bool {
-        // This is a simplified implementation
-        // In production, this would check collection-specific ACLs
         let roles = match self.get_user_roles(user_id) {
             Ok(roles) => roles,
             Err(_) => return false,
@@ -394,16 +407,26 @@ impl RbacService {
             return true;
         }
 
-        // Deferred: Implement collection-specific access control
-        // For now, all authenticated users with appropriate permissions can access all collections
         true
     }
 
-    /// Check if user belongs to tenant
+    /// Fail-closed tenant-membership predicate (TD-FACADE-1).
+    ///
+    /// This service stores roles and permissions only — it has no
+    /// tenant-membership data, so it cannot prove ANY user belongs to ANY
+    /// tenant, and it answers `false` (deny) rather than guessing `true`.
+    /// The previous body returned `true` unconditionally ("for now, assume
+    /// all users can access all tenants"), which made
+    /// [`Self::check_permission_with_context`] approve a context asserting a
+    /// foreign tenant — a cross-tenant bypass for direct callers.
+    ///
+    /// Implementing real validation would require a membership store this
+    /// layer does not have; until one exists, a context that asserts a
+    /// resource tenant is denied. Callers that do not want a tenant decision
+    /// here pass `tenant_id: None` (as the middleware does) and enforce
+    /// tenancy structurally via `TenantContext` / `DrPathBuilder`.
     async fn user_belongs_to_tenant(&self, _user_id: &str, _tenant_id: &str) -> bool {
-        // Deferred: Implement tenant membership validation
-        // For now, assume all users can access all tenants
-        true
+        false
     }
 }
 
@@ -416,6 +439,59 @@ mod tests {
         let rbac = RbacService::new();
         let roles = rbac.list_roles().await;
         assert!(roles.len() >= 3); // admin, user, readonly
+    }
+
+    /// TD-FACADE-1 pin: the tenant predicate must be FAIL-CLOSED. It returned
+    /// `true` unconditionally, which made `check_permission_with_context`
+    /// approve a context asserting a foreign tenant — a cross-tenant bypass
+    /// for direct callers. This layer holds no membership data, so any
+    /// asserted tenant is unprovable and must be denied.
+    #[tokio::test]
+    async fn tenant_asserted_context_is_denied_fail_closed() {
+        let rbac = RbacService::new();
+        let user_id = "test_user"; // default "user" role: has ReadVectors
+
+        let context = PermissionContext {
+            resource_type: ResourceType::Collection,
+            resource_id: Some("some_collection".to_string()),
+            tenant_id: Some("any-tenant-at-all".to_string()), // even one that
+            // might be the caller's own: indistinguishable without data
+            metadata: HashMap::new(),
+        };
+
+        let result = rbac
+            .check_permission_with_context(user_id, Permission::ReadVectors, &context)
+            .await;
+        assert!(
+            result.is_err(),
+            "a context asserting a tenant must be denied while membership cannot be proven"
+        );
+    }
+
+    /// Companion to the pin above: no tenant asserted => the permission check
+    /// itself decides. This is the middleware shape after it stopped echoing
+    /// the caller's own tenant into the context, and it must still ALLOW a
+    /// permitted operation — otherwise the pin would pass merely because
+    /// everything is denied.
+    #[tokio::test]
+    async fn no_tenant_context_allows_permitted_operation() {
+        let rbac = RbacService::new();
+        let user_id = "test_user"; // default "user" role: has ReadVectors
+
+        let context = PermissionContext {
+            resource_type: ResourceType::Collection,
+            resource_id: Some("some_collection".to_string()),
+            tenant_id: None,
+            metadata: HashMap::new(),
+        };
+
+        let result = rbac
+            .check_permission_with_context(user_id, Permission::ReadVectors, &context)
+            .await;
+        assert!(
+            result.is_ok(),
+            "without a tenant assertion the role permission alone decides, and this role has ReadVectors"
+        );
     }
 
     #[tokio::test]

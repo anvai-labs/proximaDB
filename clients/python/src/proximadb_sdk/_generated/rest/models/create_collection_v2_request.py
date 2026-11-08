@@ -14,6 +14,9 @@ from attrs import field as _attrs_field
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
+    from ..models.create_collection_v2_request_properties_type_0 import (
+        CreateCollectionV2RequestPropertiesType0,
+    )
     from ..models.index_config_input import IndexConfigInput
     from ..models.index_policy_input import IndexPolicyInput
     from ..models.quantization_config_input import QuantizationConfigInput
@@ -89,6 +92,16 @@ class CreateCollectionV2Request:
             tags (list[str] | None | Unset): Operator metadata tags, e.g. `"recall_target:0.95"`,
                 `"target_vector_count:1000"`, `"modalities:text,image"`. Consumed by the
                 recall advisor / route-health (`services/collection/recall_target.rs`).
+            properties (CreateCollectionV2RequestPropertiesType0 | None | Unset): Per-collection table properties (Hive
+                TBLPROPERTIES-style).
+
+                NOT persisted by this endpoint yet: a non-empty map is rejected with
+                400. Create the collection, then set properties with `ALTER TABLE
+                <name> SET (...)` over pgwire. Three namespaces are reserved for policy
+                there, with unknown keys rejected: `cache.*` (TD-COMPACT-2b),
+                `compaction.*` (TD-COMPACT-15) and `probe.*` (TD-RDSTRAT-14). Every
+                `probe.*` key, valid or not, is currently refused because nothing
+                consumes it yet.
             quantization (None | QuantizationConfigInput | Unset):
             index_policy (IndexPolicyInput | None | Unset):
             description (None | str | Unset): Free-text description, persisted on the collection config.
@@ -112,6 +125,10 @@ class CreateCollectionV2Request:
                 before a cool/cold tier's minimum storage duration. Existing objects
                 are not rewritten; control objects keep the account default. Once
                 set, a tier can be changed but not cleared back to the default.
+            pool_id (None | str | Unset): TD-TIER-1 SC6 policy seam: the reservation pool this PERFORMANCE
+                collection's grant charges ("pool_id" in [storage.reservation_pools]);
+                omitted ⇒ the configured default pool. Unknown ids are refused at
+                admission with the configured ids listed.
     """
 
     name: str
@@ -124,14 +141,19 @@ class CreateCollectionV2Request:
     canonical_embedding_precision: None | str | Unset = UNSET
     index_configs: list[IndexConfigInput] | None | Unset = UNSET
     tags: list[str] | None | Unset = UNSET
+    properties: CreateCollectionV2RequestPropertiesType0 | None | Unset = UNSET
     quantization: None | QuantizationConfigInput | Unset = UNSET
     index_policy: IndexPolicyInput | None | Unset = UNSET
     description: None | str | Unset = UNSET
     index_type: None | str | Unset = UNSET
     storage_class: None | str | Unset = UNSET
     default_access_tier: None | str | Unset = UNSET
+    pool_id: None | str | Unset = UNSET
 
     def to_dict(self) -> dict[str, Any]:
+        from ..models.create_collection_v2_request_properties_type_0 import (  # noqa: PLC0415
+            CreateCollectionV2RequestPropertiesType0,
+        )
         from ..models.index_config_input import IndexConfigInput  # noqa: PLC0415
         from ..models.index_policy_input import IndexPolicyInput  # noqa: PLC0415
         from ..models.quantization_config_input import (  # noqa: PLC0415
@@ -202,6 +224,14 @@ class CreateCollectionV2Request:
         else:
             tags = self.tags
 
+        properties: dict[str, Any] | None | Unset
+        if isinstance(self.properties, Unset):
+            properties = UNSET
+        elif isinstance(self.properties, CreateCollectionV2RequestPropertiesType0):
+            properties = self.properties.to_dict()
+        else:
+            properties = self.properties
+
         quantization: dict[str, Any] | None | Unset
         if isinstance(self.quantization, Unset):
             quantization = UNSET
@@ -242,6 +272,12 @@ class CreateCollectionV2Request:
         else:
             default_access_tier = self.default_access_tier
 
+        pool_id: None | str | Unset
+        if isinstance(self.pool_id, Unset):
+            pool_id = UNSET
+        else:
+            pool_id = self.pool_id
+
         field_dict: dict[str, Any] = {}
 
         field_dict.update(
@@ -266,6 +302,8 @@ class CreateCollectionV2Request:
             field_dict["index_configs"] = index_configs
         if tags is not UNSET:
             field_dict["tags"] = tags
+        if properties is not UNSET:
+            field_dict["properties"] = properties
         if quantization is not UNSET:
             field_dict["quantization"] = quantization
         if index_policy is not UNSET:
@@ -278,11 +316,16 @@ class CreateCollectionV2Request:
             field_dict["storage_class"] = storage_class
         if default_access_tier is not UNSET:
             field_dict["default_access_tier"] = default_access_tier
+        if pool_id is not UNSET:
+            field_dict["pool_id"] = pool_id
 
         return field_dict
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.create_collection_v2_request_properties_type_0 import (  # noqa: PLC0415
+            CreateCollectionV2RequestPropertiesType0,
+        )
         from ..models.index_config_input import IndexConfigInput  # noqa: PLC0415
         from ..models.index_policy_input import IndexPolicyInput  # noqa: PLC0415
         from ..models.quantization_config_input import (  # noqa: PLC0415
@@ -402,6 +445,27 @@ class CreateCollectionV2Request:
 
         tags = _parse_tags(d.pop("tags", UNSET))
 
+        def _parse_properties(
+            data: object,
+        ) -> CreateCollectionV2RequestPropertiesType0 | None | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                properties_type_0 = CreateCollectionV2RequestPropertiesType0.from_dict(
+                    data
+                )
+
+                return properties_type_0
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            return cast(CreateCollectionV2RequestPropertiesType0 | None | Unset, data)
+
+        properties = _parse_properties(d.pop("properties", UNSET))
+
         def _parse_quantization(data: object) -> None | QuantizationConfigInput | Unset:
             if data is None:
                 return data
@@ -474,6 +538,15 @@ class CreateCollectionV2Request:
             d.pop("default_access_tier", UNSET)
         )
 
+        def _parse_pool_id(data: object) -> None | str | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            return cast(None | str | Unset, data)
+
+        pool_id = _parse_pool_id(d.pop("pool_id", UNSET))
+
         create_collection_v2_request = cls(
             name=name,
             dimension=dimension,
@@ -485,12 +558,14 @@ class CreateCollectionV2Request:
             canonical_embedding_precision=canonical_embedding_precision,
             index_configs=index_configs,
             tags=tags,
+            properties=properties,
             quantization=quantization,
             index_policy=index_policy,
             description=description,
             index_type=index_type,
             storage_class=storage_class,
             default_access_tier=default_access_tier,
+            pool_id=pool_id,
         )
 
         return create_collection_v2_request

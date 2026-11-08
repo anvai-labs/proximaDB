@@ -20,23 +20,10 @@ pub enum EdgeDirection {
 
 // ── WHERE clause types ───────────────────────────────────────────────────────
 
-/// Property constraint for WHERE clauses
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum PropertyConstraint {
-    Equals(serde_json::Value),
-    NotEquals(serde_json::Value),
-    GreaterThan(serde_json::Value),
-    GreaterOrEqual(serde_json::Value),
-    LessThan(serde_json::Value),
-    LessOrEqual(serde_json::Value),
-    In(Vec<serde_json::Value>),
-    Contains(String),
-    StartsWith(String),
-    EndsWith(String),
-    Regex(String),
-    NotExists,
-    Exists,
-}
+/// Property constraint for WHERE clauses — the SEAM's canonical enum
+/// (TD-GRAPH-4 step 2: the twin is gone; the seam's is a superset adding
+/// NotIn and the GreaterThanOrEqual/LessThanOrEqual alias variants).
+pub use proximadb_graph_query::ast::PropertyConstraint;
 
 /// Property projection for RETURN clauses
 #[derive(Debug, Clone, Serialize, Deserialize)]

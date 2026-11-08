@@ -1,5 +1,5 @@
 //! Canonical quantization-level model (Slice D pre-extraction): the UnifiedQuantizationLevel
-//! cluster (the rich QuantizationLevel enum + Product/Scalar/Binary/Uniform/No/Custom/Turbo
+//! cluster (the rich QuantizationScheme enum + Product/Scalar/Binary/Uniform/No/Custom/Turbo
 //! variant payloads + their QuantizationMethod impls). Moved DOWN from the modality vector
 //! crate to foundation so both storage and the modality depend on it (clears the divergent-
 //! types trap + the storage up-edges). Re-exported by proximadb-vector/src/quantization/internal_types.rs.
@@ -16,12 +16,12 @@ use serde::{Deserialize, Serialize};
 /// Unified quantization level configuration
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct UnifiedQuantizationLevel {
-    pub level_type: Option<QuantizationLevel>,
+    pub level_type: Option<QuantizationScheme>,
 }
 
 /// Quantization level types
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
-pub enum QuantizationLevel {
+pub enum QuantizationScheme {
     None(NoQuantization),
     Uniform(UniformQuantization),
     Pq(ProductQuantization),
@@ -172,14 +172,14 @@ impl UnifiedQuantizationLevel {
     /// Common quantization level constants for easy access
     /// Using PascalCase for API consistency with enum variant style
     pub const Binary: Self = Self {
-        level_type: Some(QuantizationLevel::Binary(BinaryQuantization {
+        level_type: Some(QuantizationScheme::Binary(BinaryQuantization {
             threshold: None,
             sign_based: false,
         })),
     };
 
     pub const Int8: Self = Self {
-        level_type: Some(QuantizationLevel::Scalar(ScalarQuantization {
+        level_type: Some(QuantizationScheme::Scalar(ScalarQuantization {
             bits: 8,
             scale: 1.0,
             offset: 0.0,
@@ -189,7 +189,7 @@ impl UnifiedQuantizationLevel {
 
     /// Create a PQ4 constant (requires runtime initialization due to parameter)
     pub const Pq4: Self = Self {
-        level_type: Some(QuantizationLevel::Pq(ProductQuantization {
+        level_type: Some(QuantizationScheme::Pq(ProductQuantization {
             bits_per_code: 4,
             num_subvectors: 8, // Default value
             codebook_id: None,
@@ -199,7 +199,7 @@ impl UnifiedQuantizationLevel {
 
     /// Create a PQ8 constant (requires runtime initialization due to parameter)
     pub const Pq8: Self = Self {
-        level_type: Some(QuantizationLevel::Pq(ProductQuantization {
+        level_type: Some(QuantizationScheme::Pq(ProductQuantization {
             bits_per_code: 8,
             num_subvectors: 8, // Default value
             codebook_id: None,
@@ -210,7 +210,7 @@ impl UnifiedQuantizationLevel {
     /// Create a PQ8 configuration (common case)
     pub fn pq8(num_subvectors: u8) -> Self {
         Self {
-            level_type: Some(QuantizationLevel::Pq(ProductQuantization {
+            level_type: Some(QuantizationScheme::Pq(ProductQuantization {
                 bits_per_code: 8,
                 num_subvectors: num_subvectors as i32,
                 codebook_id: None,
@@ -222,7 +222,7 @@ impl UnifiedQuantizationLevel {
     /// Create a PQ4 configuration (higher compression)
     pub fn pq4(num_subvectors: u8) -> Self {
         Self {
-            level_type: Some(QuantizationLevel::Pq(ProductQuantization {
+            level_type: Some(QuantizationScheme::Pq(ProductQuantization {
                 bits_per_code: 4,
                 num_subvectors: num_subvectors as i32,
                 codebook_id: None,
@@ -234,7 +234,7 @@ impl UnifiedQuantizationLevel {
     /// Create an INT8 scalar quantization
     pub fn int8() -> Self {
         Self {
-            level_type: Some(QuantizationLevel::Scalar(ScalarQuantization {
+            level_type: Some(QuantizationScheme::Scalar(ScalarQuantization {
                 bits: 8,
                 scale: 1.0,
                 offset: 0.0,
@@ -246,7 +246,7 @@ impl UnifiedQuantizationLevel {
     /// Create a binary quantization
     pub fn binary() -> Self {
         Self {
-            level_type: Some(QuantizationLevel::Binary(BinaryQuantization {
+            level_type: Some(QuantizationScheme::Binary(BinaryQuantization {
                 threshold: None,
                 sign_based: false,
             })),
@@ -256,13 +256,13 @@ impl UnifiedQuantizationLevel {
     /// Get the number of bits per element
     pub fn bits_per_element(&self) -> u32 {
         match &self.level_type {
-            Some(QuantizationLevel::Pq(pq)) => pq.bits_per_code as u32,
-            Some(QuantizationLevel::Scalar(sq)) => sq.bits as u32,
-            Some(QuantizationLevel::Binary(_)) => 1,
-            Some(QuantizationLevel::Uniform(uq)) => uq.bits as u32,
-            Some(QuantizationLevel::Custom(cq)) => cq.bits_per_element as u32,
+            Some(QuantizationScheme::Pq(pq)) => pq.bits_per_code as u32,
+            Some(QuantizationScheme::Scalar(sq)) => sq.bits as u32,
+            Some(QuantizationScheme::Binary(_)) => 1,
+            Some(QuantizationScheme::Uniform(uq)) => uq.bits as u32,
+            Some(QuantizationScheme::Custom(cq)) => cq.bits_per_element as u32,
             #[cfg(feature = "experimental-turboquant")]
-            Some(QuantizationLevel::TurboQuant(tq)) => tq.bit_width as u32,
+            Some(QuantizationScheme::TurboQuant(tq)) => tq.bit_width as u32,
             _ => 32, // Full precision
         }
     }
@@ -270,21 +270,21 @@ impl UnifiedQuantizationLevel {
     /// Calculate bytes per vector based on quantization level
     pub fn bytes_per_vector(&self, dimension: usize) -> usize {
         match &self.level_type {
-            Some(QuantizationLevel::Pq(pq)) => {
+            Some(QuantizationScheme::Pq(pq)) => {
                 let codes_per_vector = pq.num_subvectors as usize;
                 let bytes_per_code = ((pq.bits_per_code + 7) / 8) as usize;
                 codes_per_vector * bytes_per_code
             }
-            Some(QuantizationLevel::Scalar(sq)) => dimension * ((sq.bits + 7) / 8) as usize,
-            Some(QuantizationLevel::Binary(_)) => {
+            Some(QuantizationScheme::Scalar(sq)) => dimension * ((sq.bits + 7) / 8) as usize,
+            Some(QuantizationScheme::Binary(_)) => {
                 dimension.div_ceil(8) // 1 bit per dimension
             }
-            Some(QuantizationLevel::Uniform(uq)) => dimension * ((uq.bits + 7) / 8) as usize,
-            Some(QuantizationLevel::Custom(cq)) => {
+            Some(QuantizationScheme::Uniform(uq)) => dimension * ((uq.bits + 7) / 8) as usize,
+            Some(QuantizationScheme::Custom(cq)) => {
                 dimension * ((cq.bits_per_element + 7) / 8) as usize
             }
             #[cfg(feature = "experimental-turboquant")]
-            Some(QuantizationLevel::TurboQuant(tq)) => {
+            Some(QuantizationScheme::TurboQuant(tq)) => {
                 // ceil(dim * bit_width / 8) — matches LLD §3 wire layout.
                 // Plus 4 bytes per vector for the RaBitQ-style length-renorm
                 // scale (stored separately in the .tq file but accounted for
@@ -308,7 +308,7 @@ impl UnifiedQuantizationLevel {
     #[cfg(feature = "experimental-turboquant")]
     pub fn turboquant(bit_width: u8, rotation_seed: u64) -> Self {
         Self {
-            level_type: Some(QuantizationLevel::TurboQuant(TurboQuantization::tq_plus(
+            level_type: Some(QuantizationScheme::TurboQuant(TurboQuantization::tq_plus(
                 bit_width,
                 rotation_seed,
             ))),
@@ -320,7 +320,7 @@ impl UnifiedQuantizationLevel {
     #[cfg(feature = "experimental-turboquant")]
     pub fn turboquant_identity(bit_width: u8, rotation_seed: u64) -> Self {
         Self {
-            level_type: Some(QuantizationLevel::TurboQuant(TurboQuantization::identity(
+            level_type: Some(QuantizationScheme::TurboQuant(TurboQuantization::identity(
                 bit_width,
                 rotation_seed,
             ))),
@@ -338,7 +338,7 @@ impl UnifiedQuantizationLevel {
 // method is `&self`, returns a small `Copy` value, and never touches the
 // codebook cache or vector buffers. Routers, planners, EXPLAIN builders,
 // and Prometheus label emitters call these methods instead of matching on
-// the `QuantizationLevel` enum directly. See the plan document at
+// the `QuantizationScheme` enum directly. See the plan document at
 // `~/.claude/plans/dreamy-finding-clover.md` §"Design rationale" for the
 // load-bearing reasoning, and ADR-021 §"Authority mode" for how lifecycle
 // classification drives the read-time vs write-time routing decision.
@@ -518,7 +518,7 @@ impl QuantizationMethod for TurboQuantization {
 // Blanket impl on the enum + wrapper — what every router call site holds.
 // ----------------------------------------------------------------------------
 
-impl QuantizationMethod for QuantizationLevel {
+impl QuantizationMethod for QuantizationScheme {
     fn quantization_type(&self) -> QuantizationType {
         match self {
             Self::None(v) => v.quantization_type(),

@@ -1,0 +1,135 @@
+= TD-NAMING-1: Public Rust type names are defined many times — ratchet now, burn down in batches
+:status: Open
+:date: 2026-11-06
+:tags: [code-health, naming, solid, duplication]
+
+== Problem
+
+Baseline 2026-11-06 (`scripts/count_type_name_collisions.py`): 797 redundant definitions across 596 names.
+
+The same `pub struct` / `enum` / `union` / `trait` name defined at several
+sites causes two harms:
+
+* **Silent duplication of a primitive** — a fix lands in one copy while the
+  others keep the bug (mandate #12: "silent duplication of an existing
+  primitive").
+* **Wrong-type footgun** — once two same-named types are reachable from one
+  module, an obvious-looking signature compiles against the wrong one. Found
+  in #2443: `trait_components::path_resolver` re-exports the storage-ports
+  `StorageAssignment` while call sites needed the PROTO `StorageAssignment`;
+  a helper typed `&StorageAssignment` failed with "expected
+  `StorageAssignment`, found a different `StorageAssignment`".
+
+[cols="3,1",options="header"]
+|===
+| Name | Definition sites
+| `OperationType` | 12
+| `ColumnData` | 8
+| `FilterOperator` | 8
+| `Index` | 8
+| `JoinType` | 8
+| `TransactionState` | 8
+| `WorkloadType` | 8
+| `BloomFilter` | 7
+| `EdgeDirection` | 6
+| `EvictionPolicy` | 6
+| `FusionStrategy` | 6
+| `QueryType` | 6
+|===
+
+== Counting rules
+
+* Restricted visibility (`pub(crate)`, `pub(super)`) COUNTS. Decision, after
+  two review rounds argued opposite ways: the primary harm — a primitive
+  duplicated so a fix lands in one copy — is visibility-independent, and most
+  code is in the single root crate, where `pub(crate)` duplicates are exactly
+  that harm. (Cross-crate reachability only matters for the re-export class,
+  which this guard does not measure.)
+* Test-only code is decided by EVALUATING the cfg predicate: `test`;
+  `all(..)` with any test-only child; `any(..)` only if every child is
+  test-only; `not(..)` never. Applied to items, inline and out-of-line
+  modules, and file-level `#![cfg(..)]`.
+* Sites are MODULE SCOPES: same-named types in different modules (even of one
+  file) collide; same-named items in ONE scope count once — rustc only allows
+  that for mutually exclusive cfg alternatives, so the collapse is sound and
+  an always-true `#[cfg(all())]` cannot hide a collision across modules.
+  Same-named cfg'd `mod imp { .. }` alternatives share a scope path.
+* Not counted: `type` aliases; generated protobuf; test code (`tests/`,
+  `benches/`, `examples/`, `*_test(s).rs`, `tests.rs`, out-of-line
+  `#[cfg(test)] mod x;` files, `#[cfg(test)]` / `#[cfg(all(test, ..))]`
+  modules and items — `cfg(any(test, ..))` ships and is counted); comments and
+  string/char literal contents (masked before matching, using the
+  capability-facade ratchet's lexical rules).
+* `git ls-files` enumeration; deleted-but-indexed files skipped; an
+  unreadable tracked file fails closed.
+
+== Known gaps (deliberate — see Follow-ups)
+
+* **Re-exports are not measured.** The #2443 `StorageAssignment` case is a
+  RE-EXPORT collision (proto definition vs a storage-ports definition
+  surfaced by `pub use`); the guard does not see it. A regex re-export metric
+  was built and dropped in #2445 review: glob re-exports, `as` renames,
+  proto mirrors that are legitimately re-exported, and module-level `cfg`
+  all need real path resolution.
+* Macro-generated definitions are not seen.
+* Attributes are matched with ONE level of nested brackets (`json!([1])`).
+  Deeper nesting (`json!([[1]])`) breaks the attribute match: on the SAME
+  line as the item it hides the item (a false negative); on its own line
+  after a `#[cfg(test)]` it drops the cfg, so a test-only item is counted (a
+  false positive).
+* Items inside `fn` bodies and `const _: () = { .. }` blocks are scoped to
+  their enclosing module, so two same-named items in two different fn bodies
+  collapse to one (false negative). rustc allows those; the scope rule's
+  soundness argument holds for module scopes only.
+* `cr"..."` C-string literals are lexed as ordinary strings; an escape-like
+  sequence inside one can mis-mask the rest of the file.
+* Out-of-line `#[cfg(test)] mod x;` paths are resolved for `mod.rs` /
+  `lib.rs` / `main.rs` / `<name>.rs` parents only — not `src/bin/*.rs` crate
+  roots or declarations inside an inline `mod outer { .. }`.
+* Platform-alternative modules with different names (`#[cfg(unix)] mod unix`
+  / `#[cfg(windows)] mod windows`, each defining `Imp`) count as a collision.
+* If `git ls-files` fails (e.g. a dubious-ownership checkout), enumeration
+  falls back to walking the tree, which includes untracked files.
+* ~12s per run (a per-character Python masking pass); a token-regex lexer
+  would be faster.
+* The lexer (comment/literal masking) is separate from the capability-facade
+  ratchet's `_match_brace` by decision: masking is a different operation from
+  in-place brace matching, and coupling two ratchets through a private
+  function is its own fragility. A shared module is the right fix if a third
+  ratchet needs a Rust lexer.
+* Out-of-line module handling is one level deep: a `#[cfg(test)] mod x;`
+  file is excluded, but not modules it declares in turn, nor a `#[path]`
+  target; out-of-line cfg alternatives (`#[cfg(unix)] mod unix;` /
+  `#[cfg(windows)] mod windows;`) each count.
+* Concurrent burn-downs of the SAME name in two PRs can leave develop red
+  (both lower the same baseline line identically; the merged tree is lower
+  still) — the same property as the capability-facade ratchet; re-baseline
+  in a follow-up.
+* Local runs see only tracked files (`git ls-files`); a not-yet-added file
+  is checked in CI.
+
+== Decision
+
+1. **Ratchet first, per name, both ways.** CI fails if any name's count rises
+   above its baseline, and if the total falls without the baseline being
+   lowered in the same PR. `--mode baseline` refuses to RAISE any name. No
+   big-bang rename (it would conflict with every open PR).
+2. **Naming rule for new types:** a type that crosses a crate boundary or is
+   re-exported carries a qualifying name — `ProtoStorageAssignment`,
+   `SstCompactionConfig` — never a bare name already taken elsewhere.
+3. **Burn down in themed batches**, lowering the baseline in each PR, largest
+   clusters first (`OperationType`, `FilterOperator`, `TransactionState`,
+   `JoinType`, `BloomFilter`): CONSOLIDATE where the copies are one concept,
+   RENAME where they only share a word.
+
+== Follow-ups
+
+* **TD-NAMING-2 (to file with the tool): a resolving re-export check** —
+  `syn` + module-path resolution or a rust-analyzer query that reports two
+  distinct types with one name in scope at a module boundary. First target:
+  `StorageAssignment` in `path_resolver`.
+
+== To close
+
+Redundant definitions are burned down to documented-intentional cases only,
+and the re-export check (TD-NAMING-2) exists and is green.

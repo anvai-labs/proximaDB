@@ -1,0 +1,212 @@
+{
+  "scope": [
+    "proximadb-kernel",
+    "proximadb-catalog",
+    "proximadb-api",
+    "proximadb-network-middleware"
+  ],
+  "base_commit": "b819abaf90fb17f72790ad4af2bec183d7bb62a1",
+  "compiler": "rustc 1.99.0 aarch64-apple-darwin",
+  "coverage_tool": "cargo-llvm-cov 0.6.22",
+  "inline_test_code_included": true,
+  "transitive_dependency_files_included": false,
+  "branch_coverage_measured": false,
+  "test_counts": {
+    "before": 854,
+    "after": 857,
+    "additional_uninstrumented_middleware_contracts": 5
+  },
+  "coverage": {
+    "before": {
+      "proximadb-kernel": {
+        "covered_lines": 3306,
+        "executable_lines": 3489,
+        "line_percent": 94.7549
+      },
+      "proximadb-catalog": {
+        "covered_lines": 17579,
+        "executable_lines": 21772,
+        "line_percent": 80.7413
+      },
+      "proximadb-api": {
+        "covered_lines": 5366,
+        "executable_lines": 5944,
+        "line_percent": 90.2759
+      },
+      "proximadb-network-middleware": {
+        "covered_lines": 1059,
+        "executable_lines": 1124,
+        "line_percent": 94.2171
+      }
+    },
+    "after": {
+      "proximadb-kernel": {
+        "covered_lines": 3306,
+        "executable_lines": 3489,
+        "line_percent": 94.7549
+      },
+      "proximadb-catalog": {
+        "covered_lines": 17606,
+        "executable_lines": 21797,
+        "line_percent": 80.7726
+      },
+      "proximadb-api": {
+        "covered_lines": 5395,
+        "executable_lines": 5973,
+        "line_percent": 90.3231
+      },
+      "proximadb-network-middleware": {
+        "covered_lines": 1056,
+        "executable_lines": 1121,
+        "line_percent": 94.2016
+      }
+    }
+  },
+  "overlap": {
+    "before": {
+      "function": "is_health_endpoint",
+      "source": "crates/platform/proximadb-network-middleware/src/rate_limit.rs",
+      "tests": {
+        "rate_limit::tests::test_is_health_endpoint": [
+          [
+            354,
+            1,
+            354,
+            46
+          ],
+          [
+            355,
+            5,
+            355,
+            9
+          ],
+          [
+            355,
+            10,
+            355,
+            21
+          ],
+          [
+            356,
+            1,
+            356,
+            2
+          ]
+        ],
+        "rate_limit::tests::test_is_health_endpoint_various_paths": [
+          [
+            354,
+            1,
+            354,
+            46
+          ],
+          [
+            355,
+            5,
+            355,
+            9
+          ],
+          [
+            355,
+            10,
+            355,
+            21
+          ],
+          [
+            356,
+            1,
+            356,
+            2
+          ]
+        ]
+      },
+      "pairs": [
+        {
+          "first": "rate_limit::tests::test_is_health_endpoint",
+          "second": "rate_limit::tests::test_is_health_endpoint_various_paths",
+          "shared_regions": 4,
+          "first_only_regions": 0,
+          "second_only_regions": 0
+        }
+      ]
+    },
+    "after": {
+      "function": "is_health_endpoint",
+      "source": "crates/platform/proximadb-network-middleware/src/rate_limit.rs",
+      "tests": {
+        "rate_limit::tests::test_is_health_endpoint_various_paths": [
+          [
+            354,
+            1,
+            354,
+            46
+          ],
+          [
+            355,
+            5,
+            355,
+            9
+          ],
+          [
+            355,
+            10,
+            355,
+            21
+          ],
+          [
+            356,
+            1,
+            356,
+            2
+          ]
+        ],
+        "rate_limit::tests::health_endpoints_exempt_from_the_limit": [
+          [
+            354,
+            1,
+            354,
+            46
+          ],
+          [
+            355,
+            5,
+            355,
+            9
+          ],
+          [
+            355,
+            10,
+            355,
+            21
+          ],
+          [
+            356,
+            1,
+            356,
+            2
+          ]
+        ]
+      },
+      "pairs": [
+        {
+          "first": "rate_limit::tests::test_is_health_endpoint_various_paths",
+          "second": "rate_limit::tests::health_endpoints_exempt_from_the_limit",
+          "shared_regions": 4,
+          "first_only_regions": 0,
+          "second_only_regions": 0
+        }
+      ]
+    }
+  },
+  "source_sha256": {
+    "crates/control/proximadb-catalog/src/lib.rs": "02044d62a35c85d0460dbd331c9dfb00860885aa860532f9bebd5b6f58713ec6",
+    "crates/control/proximadb-catalog/src/iceberg_rest_service.rs": "5c21fa9650b3faea6511d2c6c002278bbfbcf13811249901ab770848bdfc8e24",
+    "crates/foundation/proximadb-kernel/src/stream_error.rs": "05b72f8ce826070b653d509417be16fa1e5941ed49cb0897b77c9d7a42b96a83",
+    "crates/platform/proximadb-api/src/rest/canonical/document.rs": "f9aebe3d4d7f3b594f825127aae94b00d09c57fbaadda58ad1bf534ee4da4145",
+    "crates/platform/proximadb-api/src/rest/canonical/mod.rs": "46062463b56ce58f467f8882d6f053f943bc87caf023773685756ac31d32947a",
+    "crates/platform/proximadb-network-middleware/src/rate_limit.rs": "75481bc825fa7dfa6e1598a4973bed20b9a074248a0ed1a9c50afefa6bc7a31e",
+    "tests/dedup_utility_contracts.rs": "e06b0640cd9dc29b3879330942ea3cef9bc56d18be0c840ee724c30989b4c4eb"
+  },
+  "isolated_profile_directories": true,
+  "baseline_completed_before_candidate_started": true
+}

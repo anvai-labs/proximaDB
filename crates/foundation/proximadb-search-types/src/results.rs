@@ -10,113 +10,21 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Convert a v1 SqlValue to the canonical ProximaValue.
-/// Magic prefix for JSONB-tagged BytesValue. Two bytes not valid in UTF-8
-/// so they will never appear at the start of raw binary data from users.
-const JSONB_MAGIC: &[u8] = proximadb_data_model::JSONB_LEGACY_MAGIC;
-
-/// Used at WAL/gRPC boundary deserialization so the rest of the system
-/// works entirely with ProximaValue.
+///
+/// Delegates to the canonical `proximadb_records::conversions::sql_value_to_proxima`.
+/// This wrapper exists for backward compatibility at the WAL/gRPC boundary.
+/// New code should use the canonical fn directly.
 pub fn sql_value_to_proxima_value(v: proximadb_proto::proximadb_v1::SqlValue) -> ProximaValue {
-    use proximadb_proto::proximadb_v1::sql_value::Value;
-    match v.value {
-        Some(Value::StringValue(s)) => ProximaValue::String(s),
-        Some(Value::NumberValue(f)) => ProximaValue::Float64(f),
-        Some(Value::Int64Value(i)) => ProximaValue::Int64(i),
-        Some(Value::BoolValue(b)) => ProximaValue::Boolean(b),
-        Some(Value::BytesValue(b)) => {
-            if b.starts_with(JSONB_MAGIC) {
-                // JSONB-tagged bytes — decode the JSON payload after the magic prefix
-                let json_bytes = &b[JSONB_MAGIC.len()..];
-                match serde_json::from_slice(json_bytes) {
-                    Ok(j) => ProximaValue::Jsonb(j),
-                    Err(_) => ProximaValue::Binary(b),
-                }
-            } else {
-                ProximaValue::Binary(b)
-            }
-        }
-        // types.proto tag 9: JSONB by declaration — canonical decode-or-binary
-        // via the shared helper so a value compares equal across read paths.
-        Some(Value::JsonbValue(b)) => ProximaValue::from_jsonb_or_binary(&b),
-        Some(Value::ObjectValue(obj)) => ProximaValue::Map(
-            obj.fields
-                .into_iter()
-                .map(|(k, v)| (k, sql_value_to_proxima_value(v)))
-                .collect(),
-        ),
-        Some(Value::ArrayValue(arr)) => ProximaValue::Array(
-            arr.values
-                .into_iter()
-                .map(sql_value_to_proxima_value)
-                .collect(),
-        ),
-        Some(Value::NullValue(_)) | None => ProximaValue::Null,
-    }
+    proximadb_records::conversions::sql_value_to_proxima(&v)
 }
 
 /// Convert a canonical ProximaValue back to v1 SqlValue for WAL/gRPC writes.
+///
+/// Delegates to the canonical `proximadb_records::conversions::proxima_to_sql_value`.
+/// This wrapper exists for backward compatibility at the WAL/gRPC boundary.
+/// New code should use the canonical fn directly.
 pub fn proxima_value_to_sql_value(v: ProximaValue) -> proximadb_proto::proximadb_v1::SqlValue {
-    use proximadb_proto::proximadb_v1::{SqlArray, SqlObject, SqlValue, sql_value::Value};
-    let inner = match v {
-        ProximaValue::String(s) | ProximaValue::Symbol(s) => Value::StringValue(s),
-        ProximaValue::Float32(f) => Value::NumberValue(f as f64),
-        ProximaValue::Float64(f) => Value::NumberValue(f),
-        ProximaValue::Int8(i) => Value::Int64Value(i as i64),
-        ProximaValue::Int16(i) => Value::Int64Value(i as i64),
-        ProximaValue::Int32(i) => Value::Int64Value(i as i64),
-        ProximaValue::Int64(i) => Value::Int64Value(i),
-        ProximaValue::UInt8(i) => Value::Int64Value(i as i64),
-        ProximaValue::UInt16(i) => Value::Int64Value(i as i64),
-        ProximaValue::UInt32(i) => Value::Int64Value(i as i64),
-        ProximaValue::UInt64(i) => Value::Int64Value(i as i64),
-        ProximaValue::Boolean(b) => Value::BoolValue(b),
-        ProximaValue::Binary(b) => Value::BytesValue(b),
-        ProximaValue::Map(m) => Value::ObjectValue(SqlObject {
-            fields: m
-                .into_iter()
-                .map(|(k, v)| (k, proxima_value_to_sql_value(v)))
-                .collect(),
-        }),
-        ProximaValue::Struct(m) => Value::ObjectValue(SqlObject {
-            fields: m
-                .into_iter()
-                .map(|(k, v)| (k, proxima_value_to_sql_value(v)))
-                .collect(),
-        }),
-        ProximaValue::Array(arr) => Value::ArrayValue(SqlArray {
-            values: arr.into_iter().map(proxima_value_to_sql_value).collect(),
-        }),
-        ProximaValue::Json(json) => {
-            // JSON stored as StringValue — readable and queryable at the gRPC layer
-            Value::StringValue(json.to_string())
-        }
-        ProximaValue::Jsonb(json) => {
-            // TD-PROTO-2 round 4: emit the declared tag-9 variant with the
-            // canonical MessagePack payload — the legacy tag-8 magic+JSON-text
-            // encoding made the canonical decode, structured filters, and every
-            // JsonbValue render arm unreachable for engine search responses.
-            // The tag-8 magic form is still DECODED (below) for results
-            // serialized before this change.
-            match ProximaValue::to_jsonb_vec(&json) {
-                Ok(bytes) => Value::JsonbValue(bytes),
-                Err(_) => {
-                    // Preserve the established fallback encoding under its
-                    // legacy tag. Putting magic+JSON bytes under tag 9 would
-                    // violate tag 9's MessagePack contract and decode as
-                    // opaque binary.
-                    let mut bytes = JSONB_MAGIC.to_vec();
-                    bytes.extend_from_slice(json.to_string().as_bytes());
-                    Value::BytesValue(bytes)
-                }
-            }
-        }
-        ProximaValue::Null => {
-            return SqlValue { value: None };
-        }
-        // Temporal / UUID / vector types: fall back to string representation
-        other => Value::StringValue(format!("{:?}", other)),
-    };
-    SqlValue { value: Some(inner) }
+    proximadb_records::conversions::proxima_to_sql_value(&v)
 }
 
 /// Convert a SqlValue metadata map to a ProximaValue metadata map.

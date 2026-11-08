@@ -26,4 +26,5 @@
   (`CAPS_STATIC` assert) and would bake builder CPU features into the wheel (SIGILL risk); dropped for
   `aarch64-apple-darwin`.
 * **Evidence.** `maturin` dry-run built `proximadb_embedded-0.2.2-cp310-abi3-win_amd64.whl` on
-  `windows-2022`; macOS dry-run imports on `macos-14`.
+  `windows-2022`; macOS dry-run imports (originally on `macos-14`; `macos-15` since the
+  image's 2026-11-02 retirement, PR #2307).

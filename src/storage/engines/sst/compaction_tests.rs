@@ -1,15 +1,220 @@
 use super::{
     MergedVectorTracking, retain_training_guard_for_follow_up, training_follow_up_threshold,
 };
+// Tests below pin process-global gates/env; serialized on the shared lock
+// because the plain `cargo test --lib` runner shares one process.
 use crate::storage::engines::sst::blocks::SstRecord;
 use crate::storage::engines::sst::{
     Compaction, CompactionPriority, CompactionStats, CompactionTask, SstConfig,
 };
+use proximadb_storage_filesystem_types::ObjectAccessTier;
+use serial_test::serial;
 use std::collections::HashMap as StdHashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::testing::InMemoryTestCatalog;
+
+/// Keep expiration from masking a missed invalidation. These tests run in
+/// separate nextest processes, as required for process-global storage state.
+struct ListingCacheTestGuard(Option<std::ffi::OsString>);
+
+impl ListingCacheTestGuard {
+    fn enable() -> Self {
+        let previous = std::env::var_os("PROXIMADB_SEGMENT_LISTING_CACHE_MS");
+        // SAFETY: this test owns its nextest process and restores the value.
+        unsafe { std::env::set_var("PROXIMADB_SEGMENT_LISTING_CACHE_MS", "300000") };
+        Self(previous)
+    }
+}
+
+impl Drop for ListingCacheTestGuard {
+    fn drop(&mut self) {
+        // SAFETY: paired restoration in the same isolated process.
+        unsafe {
+            match self.0.take() {
+                Some(value) => std::env::set_var("PROXIMADB_SEGMENT_LISTING_CACHE_MS", value),
+                None => std::env::remove_var("PROXIMADB_SEGMENT_LISTING_CACHE_MS"),
+            }
+        }
+    }
+}
+
+async fn traced_listing(
+    engine: &crate::storage::engines::sst::SstEngine,
+    directory: &str,
+) -> anyhow::Result<(std::collections::BTreeSet<PathBuf>, u64)> {
+    use crate::observability::io_trace;
+    io_trace::scope(async {
+        let files = engine
+            .discover_sstable_files(directory)
+            .await?
+            .into_iter()
+            .map(|file| PathBuf::from(file.url.strip_prefix("file://").unwrap_or(&file.url)))
+            .collect();
+        let trace = io_trace::snapshot().expect("active listing trace");
+        Ok((files, trace.list_ops))
+    })
+    .await
+}
+
+async fn assert_listing_refreshes_then_hits(
+    engine: &crate::storage::engines::sst::SstEngine,
+    directory: &str,
+    expected: &[PathBuf],
+) -> anyhow::Result<()> {
+    let expected = expected.iter().cloned().collect();
+    let (files, lists) = traced_listing(engine, directory).await?;
+    assert_eq!(
+        files, expected,
+        "discovery must reflect the live files immediately"
+    );
+    assert_eq!(lists, 1, "the first query must refresh the listing");
+    let (files, lists) = traced_listing(engine, directory).await?;
+    assert_eq!(files, expected);
+    assert_eq!(lists, 0, "the next query must reuse the refreshed listing");
+    Ok(())
+}
+
+/// Inspect the actual durable publication before the executor can retire any
+/// input. Filling the listing here independently exercises retirement's later
+/// invalidation; its exit guard cannot mask a missing publication invalidation.
+async fn assert_listing_at_publication<T>(
+    engine: &crate::storage::engines::sst::SstEngine,
+    directory: &str,
+    inputs: &[PathBuf],
+    output: &std::path::Path,
+    compact: impl std::future::Future<Output = anyhow::Result<T>>,
+) -> anyhow::Result<T> {
+    let published = Arc::new(tokio::sync::Notify::new());
+    let resume = Arc::new(tokio::sync::Notify::new());
+    let checkpoint = (published.clone(), resume.clone());
+    let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        tokio::try_join!(
+            super::PUBLICATION_CHECKPOINT.scope(checkpoint, compact),
+            async {
+                published.notified().await;
+                assert!(output.exists(), "the replacement must already be durable");
+                assert!(
+                    inputs.iter().all(|input| input.exists()),
+                    "publication must be observable before input retirement"
+                );
+                let mut expected = inputs.to_vec();
+                expected.push(output.to_path_buf());
+                assert_listing_refreshes_then_hits(engine, directory, &expected).await?;
+                resume.notify_one();
+                Ok::<(), anyhow::Error>(())
+            }
+        )
+    })
+    .await
+    .map_err(|error| anyhow::anyhow!("compaction publication checkpoint timed out: {error}"))??;
+    Ok(result)
+}
+
+/// Cancel while finalization is suspended *inside* the coordinator after the
+/// durable move. Outer success-path invalidation and input retirement have not
+/// run, so only the publication guard can retire the previously warm snapshot.
+async fn assert_listing_after_cancelled_publication(
+    engine: &crate::storage::engines::sst::SstEngine,
+    directory: &str,
+    inputs: &[PathBuf],
+    output: &std::path::Path,
+    publish: impl std::future::Future,
+) -> anyhow::Result<()> {
+    let published = Arc::new(tokio::sync::Notify::new());
+    let resume = Arc::new(tokio::sync::Notify::new());
+    let mut operation = Box::pin(
+        crate::storage::transaction_coordinator::FINALIZE_DURABLE_MOVE_CHECKPOINT
+            .scope((published.clone(), resume), publish),
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        tokio::select! {
+            _ = &mut operation => anyhow::bail!("publication completed before the coordinator checkpoint"),
+            () = published.notified() => Ok::<(), anyhow::Error>(()),
+        }
+    }).await.map_err(|error| anyhow::anyhow!("durable-move checkpoint timed out: {error}"))??;
+    assert!(
+        output.exists(),
+        "output must be durable before cancellation"
+    );
+    assert!(
+        inputs.iter().all(|input| input.exists()),
+        "retirement must not have begun"
+    );
+    drop(operation);
+    let mut expected = inputs.to_vec();
+    expected.push(output.to_path_buf());
+    assert_listing_refreshes_then_hits(engine, directory, &expected).await
+}
+
+async fn listing_test_compaction(config: SstConfig, atomic: bool) -> anyhow::Result<Compaction> {
+    let coordinator = if atomic {
+        let factory = Arc::new(
+            crate::storage::persistence::filesystem::FilesystemFactory::create_default().await?,
+        );
+        Some(Arc::new(
+            crate::storage::transaction_coordinator::TransactionCoordinator::new(factory, None)
+                .await?,
+        ))
+    } else {
+        None
+    };
+    Ok(Compaction::with_atomic_coordinator(config, coordinator).await?)
+}
+
+fn listing_test_path(path: &std::path::Path, file_url: bool) -> PathBuf {
+    if file_url {
+        PathBuf::from(format!("file://{}", path.display()))
+    } else {
+        path.to_path_buf()
+    }
+}
+
+#[tokio::test]
+async fn input_retirement_refreshes_a_listing_filled_after_publication() -> anyhow::Result<()> {
+    check_retirement_listing(false).await
+}
+
+#[tokio::test]
+async fn pending_retirement_drain_cannot_resurrect_cached_inputs() -> anyhow::Result<()> {
+    check_retirement_listing(true).await
+}
+
+async fn check_retirement_listing(pending: bool) -> anyhow::Result<()> {
+    let _listing_cache = ListingCacheTestGuard::enable();
+    let root = tempfile::tempdir()?;
+    let input = root.path().join("old.pax");
+    let output = root.path().join("new.pax");
+    std::fs::write(&input, b"old")?;
+    std::fs::write(&output, b"new")?;
+    let engine = crate::storage::engines::sst::SstEngine::new().await?;
+    let directory = root.path().to_string_lossy();
+    // Deterministically model a LIST after publication but before retirement:
+    // both old and new names are now cached. No sleep or scheduler race.
+    assert_listing_refreshes_then_hits(&engine, &directory, &[input.clone(), output.clone()])
+        .await?;
+    let compaction = Compaction::new(SstConfig::default()).await?;
+    let input_url = format!("file://{}", input.display());
+    if pending {
+        super::retirement_ledger::record_pending(root.path(), &output, &[input_url]).await?;
+        let (files, lists) = traced_listing(&engine, &directory).await?;
+        assert_eq!(files, [output.clone()].into_iter().collect());
+        assert_eq!(lists, 0, "pending inputs are filtered on a cache hit");
+        compaction.drain_pending_for_dir(root.path()).await?;
+    } else {
+        assert!(
+            compaction
+                .delete_inputs_attempt(&[PathBuf::from(input_url)])
+                .await
+                .is_empty()
+        );
+    }
+    assert!(!input.exists());
+    assert!(output.exists());
+    assert_listing_refreshes_then_hits(&engine, &directory, &[output]).await?;
+    Ok(())
+}
 
 #[tokio::test]
 async fn test_compaction_basic() {
@@ -46,6 +251,7 @@ async fn test_compaction_task_scheduling() {
         rg_layout: None,
         vector_quant: None,
         access_tier: None,
+        min_live_segments: None,
     };
 
     assert!(manager.schedule_compaction(task).await.is_ok());
@@ -74,6 +280,7 @@ async fn td_compact6_schedule_dedups_same_output_at_enqueue() {
         rg_layout: None,
         vector_quant: None,
         access_tier: None,
+        min_live_segments: None,
     };
     assert!(manager.schedule_compaction(mk_task()).await.unwrap());
     // Second schedule for the same output file is deduped at enqueue (the
@@ -117,6 +324,7 @@ async fn compaction_morsel_admission_rejects_overlapping_inputs() {
         rg_layout: None,
         vector_quant: None,
         access_tier: None,
+        min_live_segments: None,
     };
 
     assert!(manager.schedule_compaction(task(1)).await.unwrap());
@@ -125,6 +333,389 @@ async fn compaction_morsel_admission_rejects_overlapping_inputs() {
         "a different output name must not admit the same input morsel twice"
     );
     assert_eq!(manager.pending_task_count().await, 1);
+}
+
+// ── TD-TIER-1 SC5: level-aware tiering (`tier_by_level:` tag, default-OFF) ──
+
+/// The policy parse: entries must name tiers (hot|cool|cold), the list
+/// clamps past its end for deeper levels, an unparseable or empty entry
+/// refuses the WHOLE policy (a misspelt tier must never silently become the
+/// account default), and no tag means no policy.
+#[test]
+fn sc5_level_tier_policy_parses_clamps_and_refuses() {
+    use crate::storage::engines::sst::compaction::Compaction;
+    let tag = |s: &str| vec![s.to_string()];
+
+    assert_eq!(
+        Compaction::level_tier_policy(&[]),
+        None,
+        "no tags, no policy"
+    );
+    assert_eq!(
+        Compaction::level_tier_policy(&tag("compaction:on")),
+        None,
+        "unrelated tags are not a policy"
+    );
+    let policy =
+        Compaction::level_tier_policy(&tag("tier_by_level:hot,cool")).expect("valid policy parses");
+    assert_eq!(policy, vec![ObjectAccessTier::Hot, ObjectAccessTier::Cool]);
+    // Clamping: deeper output levels take the LAST entry.
+    assert_eq!(
+        Compaction::effective_output_tier(None, Some(&policy), 3),
+        Some(ObjectAccessTier::Cool),
+        "L3 clamps to the last entry"
+    );
+    assert_eq!(
+        Compaction::effective_output_tier(None, Some(&policy), 1),
+        Some(ObjectAccessTier::Hot),
+        "L1 takes the first entry"
+    );
+    // A misspelt entry refuses the policy entirely.
+    assert_eq!(
+        Compaction::level_tier_policy(&tag("tier_by_level:hot,warm")),
+        None,
+        "an unknown tier refuses the whole policy"
+    );
+    assert_eq!(
+        Compaction::level_tier_policy(&tag("tier_by_level:")),
+        None,
+        "an empty policy is not a policy"
+    );
+}
+
+/// The task-level resolution: the tier follows the OUTPUT filename's `L{n}_`
+/// level (not the task's SOURCE level), a policy overrides the collection's
+/// flat tier for level ≥ 1, and without a policy the flat tier is exactly
+/// today's behavior.
+#[test]
+fn sc5_level_aware_tier_resolves_by_output_level() {
+    use crate::storage::engines::sst::compaction::Compaction;
+    let tags = vec!["tier_by_level:hot,cool".to_string()];
+    let l1 = sc5_tier_task("/nonexistent/proxima_sc5_tier/L1_ab12cd34.pax", None);
+    let l2 = sc5_tier_task("/nonexistent/proxima_sc5_tier/L2_ab12cd34.pax", None);
+    let l0 = sc5_tier_task("/nonexistent/proxima_sc5_tier/L0_ab12cd34.pax", None);
+
+    assert_eq!(
+        Compaction::resolve_task_output_tier(&l1, Some(ObjectAccessTier::Cold), &tags),
+        Some(ObjectAccessTier::Hot),
+        "the policy's first entry wins for an L1 output over the flat tier"
+    );
+    assert_eq!(
+        Compaction::resolve_task_output_tier(&l2, Some(ObjectAccessTier::Cold), &tags),
+        Some(ObjectAccessTier::Cool),
+        "the second entry applies to L2"
+    );
+    assert_eq!(
+        Compaction::resolve_task_output_tier(&l0, Some(ObjectAccessTier::Cold), &tags),
+        Some(ObjectAccessTier::Hot),
+        "a defensively-seen L0 output resolves the first entry (compaction          outputs are always >= L1; the policy never meets flush output)"
+    );
+    // Without the tag: the flat collection tier passes through unchanged.
+    assert_eq!(
+        Compaction::resolve_task_output_tier(&l2, Some(ObjectAccessTier::Cold), &[]),
+        Some(ObjectAccessTier::Cold),
+        "no policy means exactly today's flat-tier behavior"
+    );
+    assert_eq!(
+        Compaction::resolve_task_output_tier(&l2, None, &[]),
+        None,
+        "no policy and no flat tier means the account default"
+    );
+}
+
+/// Review M2: dedup adoption must never move a tier BETWEEN output levels.
+/// A full pass pairs across levels while its output is always L1, so a
+/// full-vs-background race can pair owners of different levels; under a
+/// level policy their correct tiers differ. An incoming L1-resolved tier
+/// must NOT overwrite a queued L2-resolved owner (and vice versa); same-level
+/// owners still adopt.
+#[tokio::test]
+async fn sc5_adoption_never_moves_tiers_between_levels() {
+    let manager = Compaction::new(SstConfig::default()).await.unwrap();
+    // Queued owner: an L2 output carrying its policy tier (Cool).
+    let owner = sc5_tier_task(
+        "/nonexistent/proxima_sc5_tier/L2_owner12.pax",
+        Some(ObjectAccessTier::Cool),
+    );
+    assert!(manager.schedule_compaction(owner).await.unwrap());
+    // Incoming: an L1 output (a full pass pairs across levels) sharing an
+    // input file, resolved Hot by the policy's first entry.
+    let mut incoming = sc5_tier_task(
+        "/nonexistent/proxima_sc5_tier/L1_full12.pax",
+        Some(ObjectAccessTier::Hot),
+    );
+    incoming.input_files = vec![
+        PathBuf::from("/nonexistent/proxima_sc5_tier/input_L2_b.pax"),
+        PathBuf::from("/nonexistent/proxima_sc5_tier/input_L0_a.pax"),
+    ];
+    assert!(
+        !manager.schedule_compaction(incoming).await.unwrap(),
+        "the shared input still declines the enqueue"
+    );
+    let queued_tier = {
+        let queue = manager.task_queue.lock().await;
+        queue.front().expect("owner task").access_tier
+    };
+    assert_eq!(
+        queued_tier,
+        Some(ObjectAccessTier::Cool),
+        "a cross-level decline must not rewrite the owner's tier"
+    );
+
+    // Same output level: adoption still upgrades (the M2 gate opens).
+    let manager2 = Compaction::new(SstConfig::default()).await.unwrap();
+    let owner2 = sc5_tier_task("/nonexistent/proxima_sc5_tier/L1_same12.pax", None);
+    assert!(manager2.schedule_compaction(owner2).await.unwrap());
+    let mut incoming2 = sc5_tier_task(
+        "/nonexistent/proxima_sc5_tier/L1_same12.pax",
+        Some(ObjectAccessTier::Hot),
+    );
+    incoming2.input_files = vec![PathBuf::from(
+        "/nonexistent/proxima_sc5_tier/input_L0_a.pax",
+    )];
+    assert!(!manager2.schedule_compaction(incoming2).await.unwrap());
+    let queued2 = {
+        let queue = manager2.task_queue.lock().await;
+        queue.front().expect("owner task").access_tier
+    };
+    assert_eq!(
+        queued2,
+        Some(ObjectAccessTier::Hot),
+        "same-level adoption still applies"
+    );
+}
+
+/// Review m1: a duplicated `tier_by_level:` tag follows the house
+/// last-match-wins convention for multi-valued tags.
+#[test]
+fn sc5_duplicate_tier_by_level_tag_last_wins() {
+    use crate::storage::engines::sst::compaction::Compaction;
+    let tags = vec![
+        "tier_by_level:hot,cool".to_string(),
+        "tier_by_level:cold".to_string(),
+    ];
+    assert_eq!(
+        Compaction::level_tier_policy(&tags),
+        Some(vec![ObjectAccessTier::Cold]),
+        "the last tier_by_level tag wins, like every other multi-valued tag"
+    );
+}
+
+/// Shared builder for the TD-TIER-1 SC5 tier-adoption tests: a task for one
+/// fixed collection dir whose output file and tier the test overrides.
+fn sc5_tier_task(output: &str, access_tier: Option<ObjectAccessTier>) -> CompactionTask {
+    CompactionTask {
+        collection_object_id: 1,
+        collection_identity: crate::core::stable_id::CollectionIdentity::default(),
+        level: 0,
+        input_files: vec![PathBuf::from(
+            "/nonexistent/proxima_sc5_tier/input_L0_a.pax",
+        )],
+        input_bytes: 0,
+        output_file: PathBuf::from(output),
+        priority: CompactionPriority::Medium,
+        block_size_kb: None,
+        compression_config: None,
+        precision_hint: None,
+        rg_layout: None,
+        vector_quant: None,
+        access_tier,
+        min_live_segments: None,
+    }
+}
+
+/// TD-TIER-1 SC5 (WAL-recovery residual): an enqueue declined by the same-
+/// output dedup must not strand the collection's tier on an UNTIERED task that
+/// owns the work (the recovery-enqueued winner). While the owner is still
+/// queued it adopts the incoming explicit tier, so the output PUT lands with
+/// the collection's current intent.
+#[tokio::test]
+async fn sc5_dedup_decline_adopts_incoming_tier_on_the_queued_owner() {
+    let manager = Compaction::new(SstConfig::default()).await.unwrap();
+    // No start_workers → the owner stays queued, deterministically.
+    assert!(
+        manager
+            .schedule_compaction(sc5_tier_task(
+                "/nonexistent/proxima_sc5_tier/compacted_L1.pax",
+                None
+            ))
+            .await
+            .unwrap()
+    );
+    assert!(
+        !manager
+            .schedule_compaction(sc5_tier_task(
+                "/nonexistent/proxima_sc5_tier/compacted_L1.pax",
+                Some(ObjectAccessTier::Cool)
+            ))
+            .await
+            .unwrap(),
+        "same output file is still deduped"
+    );
+    let queued_tier = {
+        let queue = manager.task_queue.lock().await;
+        assert_eq!(queue.len(), 1, "no second task was enqueued");
+        queue.front().expect("owner task").access_tier
+    };
+    assert_eq!(
+        queued_tier,
+        Some(ObjectAccessTier::Cool),
+        "the queued owner adopted the declined task's tier"
+    );
+    // The dedup snapshot stays consistent with the queued task.
+    let active_tier = {
+        let active = manager.active_compactions.read().await;
+        active
+            .get("/nonexistent/proxima_sc5_tier/compacted_L1.pax")
+            .expect("active marker for the owner")
+            .access_tier
+    };
+    assert_eq!(active_tier, Some(ObjectAccessTier::Cool));
+}
+
+/// The input-overlap dedup rule adopts the tier too: a declined task sharing
+/// an input file upgrades the morsel that owns that input.
+#[tokio::test]
+async fn sc5_dedup_decline_adopts_tier_across_input_overlap() {
+    let manager = Compaction::new(SstConfig::default()).await.unwrap();
+    assert!(
+        manager
+            .schedule_compaction(sc5_tier_task(
+                "/nonexistent/proxima_sc5_tier/out_one.pax",
+                None
+            ))
+            .await
+            .unwrap()
+    );
+    let mut overlapping = sc5_tier_task(
+        "/nonexistent/proxima_sc5_tier/out_two.pax",
+        Some(ObjectAccessTier::Cold),
+    );
+    overlapping.input_files = vec![
+        PathBuf::from("/nonexistent/proxima_sc5_tier/input_L0_a.pax"),
+        PathBuf::from("/nonexistent/proxima_sc5_tier/input_L0_b.pax"),
+    ];
+    assert!(
+        !manager.schedule_compaction(overlapping).await.unwrap(),
+        "shared input file is still rejected"
+    );
+    let queued_tier = {
+        let queue = manager.task_queue.lock().await;
+        assert_eq!(queue.len(), 1);
+        queue.front().expect("owner task").access_tier
+    };
+    assert_eq!(queued_tier, Some(ObjectAccessTier::Cold));
+}
+
+/// An incoming `None` (collection record unresolved — e.g. a recovery flush
+/// that fell back to the minimal config) must never ERASE a resolved tier.
+#[tokio::test]
+async fn sc5_dedup_decline_without_tier_leaves_a_resolved_tier_intact() {
+    let manager = Compaction::new(SstConfig::default()).await.unwrap();
+    assert!(
+        manager
+            .schedule_compaction(sc5_tier_task(
+                "/nonexistent/proxima_sc5_tier/compacted_L1.pax",
+                Some(ObjectAccessTier::Cool)
+            ))
+            .await
+            .unwrap()
+    );
+    assert!(
+        !manager
+            .schedule_compaction(sc5_tier_task(
+                "/nonexistent/proxima_sc5_tier/compacted_L1.pax",
+                None
+            ))
+            .await
+            .unwrap()
+    );
+    let queued_tier = {
+        let queue = manager.task_queue.lock().await;
+        queue.front().expect("owner task").access_tier
+    };
+    assert_eq!(queued_tier, Some(ObjectAccessTier::Cool));
+}
+
+/// A tier CHANGE reaches a queued-but-unstarted owner: the output PUT has not
+/// happened, so the latest collection intent wins. (An in-flight task keeps
+/// its tier — see the popped-owner test below.)
+#[tokio::test]
+async fn sc5_dedup_decline_adopts_a_changed_tier_while_queued() {
+    let manager = Compaction::new(SstConfig::default()).await.unwrap();
+    assert!(
+        manager
+            .schedule_compaction(sc5_tier_task(
+                "/nonexistent/proxima_sc5_tier/compacted_L1.pax",
+                Some(ObjectAccessTier::Cool)
+            ))
+            .await
+            .unwrap()
+    );
+    assert!(
+        !manager
+            .schedule_compaction(sc5_tier_task(
+                "/nonexistent/proxima_sc5_tier/compacted_L1.pax",
+                Some(ObjectAccessTier::Hot)
+            ))
+            .await
+            .unwrap()
+    );
+    let queued_tier = {
+        let queue = manager.task_queue.lock().await;
+        queue.front().expect("owner task").access_tier
+    };
+    assert_eq!(queued_tier, Some(ObjectAccessTier::Hot));
+}
+
+/// A task already popped by a worker is in flight: the decline must be a
+/// no-op (no retrofit, no requeue) — a tier change applies from the next
+/// enqueue for in-flight work.
+#[tokio::test]
+async fn sc5_popped_owner_keeps_its_tier_and_is_not_retrofitted() {
+    let manager = Compaction::new(SstConfig::default()).await.unwrap();
+    assert!(
+        manager
+            .schedule_compaction(sc5_tier_task(
+                "/nonexistent/proxima_sc5_tier/compacted_L1.pax",
+                None
+            ))
+            .await
+            .unwrap()
+    );
+    // Simulate the worker taking the task (the real pop is under this same
+    // lock, so this is the exact interleaving the adoption must survive).
+    {
+        let mut queue = manager.task_queue.lock().await;
+        let popped = queue.pop_front();
+        assert!(popped.is_some());
+    }
+    assert!(
+        !manager
+            .schedule_compaction(sc5_tier_task(
+                "/nonexistent/proxima_sc5_tier/compacted_L1.pax",
+                Some(ObjectAccessTier::Cool)
+            ))
+            .await
+            .unwrap(),
+        "the active marker still dedupes the popped task's output"
+    );
+    assert_eq!(
+        manager.pending_task_count().await,
+        0,
+        "nothing was requeued for the in-flight task"
+    );
+    let active_tier = {
+        let active = manager.active_compactions.read().await;
+        active
+            .get("/nonexistent/proxima_sc5_tier/compacted_L1.pax")
+            .expect("active marker still present until the worker finishes")
+            .access_tier
+    };
+    assert_eq!(
+        active_tier, None,
+        "the in-flight task's tier was not retrofitted"
+    );
 }
 
 /// TD-COMPACT-6 (ADR-076 D1): on the async path the flush caller sets the
@@ -171,6 +762,7 @@ async fn td_compact6_worker_clears_training_in_flight_after_completion() {
         rg_layout: None,
         vector_quant: None,
         access_tier: None,
+        min_live_segments: None,
     };
     manager.schedule_compaction(task).await.unwrap();
 
@@ -314,6 +906,7 @@ async fn test_sst_compaction_expired_deletion_unit() -> anyhow::Result<()> {
         rg_layout: None,
         vector_quant: None,
         access_tier: None,
+        min_live_segments: None,
     };
 
     // Create config and perform compaction
@@ -633,11 +1226,29 @@ fn canonical_compaction_prepare_accounts_expiry_and_old_tombstones() {
 
 #[tokio::test]
 async fn canonical_compaction_round_trips_real_pax_inputs() -> anyhow::Result<()> {
+    check_canonical_compaction_listing(false, false).await
+}
+
+#[tokio::test]
+async fn canonical_atomic_compaction_refreshes_warm_listing() -> anyhow::Result<()> {
+    check_canonical_compaction_listing(true, false).await
+}
+
+#[tokio::test]
+async fn cancelled_atomic_compaction_refreshes_listing_after_durable_move() -> anyhow::Result<()> {
+    check_canonical_compaction_listing(true, true).await
+}
+
+async fn check_canonical_compaction_listing(
+    atomic: bool,
+    cancel_after_move: bool,
+) -> anyhow::Result<()> {
     use crate::storage::engines::sst::segment_format::{read_segment_records, write_pax_segment};
     use proximadb_block_format::VectorQuant;
     use proximadb_records::{EmbeddingCell, ProximaRecord};
     use tempfile::tempdir;
 
+    let _listing_cache = ListingCacheTestGuard::enable();
     let dir = tempdir()?;
     let input_a = dir.path().join("segment_L0_a.pax");
     let input_b = dir.path().join("segment_L0_b.pax");
@@ -676,14 +1287,25 @@ async fn canonical_compaction_round_trips_real_pax_inputs() -> anyhow::Result<()
     )?;
 
     let config = SstConfig::default();
-    let compaction = Compaction::new(config.clone()).await?;
+    let engine = crate::storage::engines::sst::SstEngine::new().await?;
+    let directory = if atomic {
+        format!("file://{}/", dir.path().display())
+    } else {
+        format!("{}/", dir.path().display())
+    };
+    assert_listing_refreshes_then_hits(&engine, &directory, &[input_a.clone(), input_b.clone()])
+        .await?;
+    let compaction = listing_test_compaction(config.clone(), atomic).await?;
     let task = CompactionTask {
         collection_object_id: 7,
         collection_identity: crate::core::stable_id::CollectionIdentity::default(),
         level: 0,
-        input_files: vec![input_a.clone(), input_b.clone()],
+        input_files: vec![
+            listing_test_path(&input_a, atomic),
+            listing_test_path(&input_b, atomic),
+        ],
         input_bytes: 0,
-        output_file: output.clone(),
+        output_file: listing_test_path(&output, atomic),
         priority: CompactionPriority::High,
         block_size_kb: None,
         compression_config: None,
@@ -691,16 +1313,47 @@ async fn canonical_compaction_round_trips_real_pax_inputs() -> anyhow::Result<()
         rg_layout: None,
         vector_quant: None,
         access_tier: None,
+        min_live_segments: None,
     };
-    let stats = compaction
-        .perform_compaction_enhanced(&task, &config, None, None)
-        .await?;
+    if cancel_after_move {
+        return assert_listing_after_cancelled_publication(
+            &engine,
+            &directory,
+            &[input_a.clone(), input_b.clone()],
+            &output,
+            compaction.perform_compaction_enhanced(
+                &task,
+                &config,
+                compaction.atomic_coordinator.clone(),
+                None,
+            ),
+        )
+        .await;
+    }
+    let stats = assert_listing_at_publication(
+        &engine,
+        &directory,
+        &[input_a.clone(), input_b.clone()],
+        &output,
+        async {
+            Ok(compaction
+                .perform_compaction_enhanced(
+                    &task,
+                    &config,
+                    compaction.atomic_coordinator.clone(),
+                    None,
+                )
+                .await?)
+        },
+    )
+    .await?;
 
     assert_eq!(stats.base_stats.files_merged, 2);
     assert_eq!(stats.merged_vectors.len(), 4);
     assert!(output.exists());
     assert!(!input_a.exists());
     assert!(!input_b.exists());
+    assert_listing_refreshes_then_hits(&engine, &directory, std::slice::from_ref(&output)).await?;
 
     let output_bytes = std::fs::read(&output)?;
     let output_records = read_segment_records(&output_bytes, &[], &[], None)?;
@@ -722,6 +1375,23 @@ async fn canonical_compaction_round_trips_real_pax_inputs() -> anyhow::Result<()
 #[tokio::test]
 async fn forced_local_spill_compacts_real_pax_with_mvcc_and_reclaims_scratch() -> anyhow::Result<()>
 {
+    check_local_spill_compaction_listing(false, false).await
+}
+
+#[tokio::test]
+async fn atomic_local_spill_compaction_refreshes_warm_listing() -> anyhow::Result<()> {
+    check_local_spill_compaction_listing(true, false).await
+}
+
+#[tokio::test]
+async fn cancelled_atomic_local_spill_refreshes_listing_after_durable_move() -> anyhow::Result<()> {
+    check_local_spill_compaction_listing(true, true).await
+}
+
+async fn check_local_spill_compaction_listing(
+    atomic: bool,
+    cancel_after_move: bool,
+) -> anyhow::Result<()> {
     use crate::storage::common::compaction_memory::{
         CompactionExecutionMode, CompactionResourceUsage, plan_compaction_resources,
     };
@@ -755,6 +1425,7 @@ async fn forced_local_spill_compacts_real_pax_with_mvcc_and_reclaims_scratch() -
             }
         }
     }
+    let _listing_cache = ListingCacheTestGuard::enable();
     let root = tempdir()?;
     let scratch = root.path().join("spill");
     let input_a = root.path().join("segment_L0_a.pax");
@@ -835,7 +1506,15 @@ async fn forced_local_spill_compacts_real_pax_with_mvcc_and_reclaims_scratch() -
     .ok_or_else(|| anyhow::anyhow!("forced spill plan was not admitted"))?;
     assert_eq!(plan.mode, CompactionExecutionMode::LocalSpill);
 
-    let compaction = Compaction::new(config).await?;
+    let engine = crate::storage::engines::sst::SstEngine::new().await?;
+    let directory = if atomic {
+        format!("file://{}/", root.path().display())
+    } else {
+        format!("{}/", root.path().display())
+    };
+    assert_listing_refreshes_then_hits(&engine, &directory, &[input_a.clone(), input_b.clone()])
+        .await?;
+    let compaction = listing_test_compaction(config, atomic).await?;
     let task = CompactionTask {
         collection_object_id: 7,
         collection_identity: crate::core::stable_id::CollectionIdentity {
@@ -844,9 +1523,12 @@ async fn forced_local_spill_compacts_real_pax_with_mvcc_and_reclaims_scratch() -
             collection_id: 7,
         },
         level: 0,
-        input_files: vec![input_a.clone(), input_b.clone()],
+        input_files: vec![
+            listing_test_path(&input_a, atomic),
+            listing_test_path(&input_b, atomic),
+        ],
         input_bytes,
-        output_file: output.clone(),
+        output_file: listing_test_path(&output, atomic),
         priority: CompactionPriority::High,
         block_size_kb: Some(1),
         compression_config: None,
@@ -854,6 +1536,7 @@ async fn forced_local_spill_compacts_real_pax_with_mvcc_and_reclaims_scratch() -
         rg_layout: None,
         vector_quant: None,
         access_tier: None,
+        min_live_segments: None,
     };
     let assert_no_task_scratch = |root: &std::path::Path| -> anyhow::Result<()> {
         for owner in std::fs::read_dir(root)? {
@@ -894,19 +1577,119 @@ async fn forced_local_spill_compacts_real_pax_with_mvcc_and_reclaims_scratch() -
         input_a.exists() && input_b.exists(),
         "publication failure must leave every source segment authoritative"
     );
+    let (files, lists) = traced_listing(&engine, &directory).await?;
+    assert_eq!(
+        files,
+        [input_a.clone(), input_b.clone()].into_iter().collect()
+    );
+    assert_eq!(
+        lists, 0,
+        "failed publication keeps the cached live input set"
+    );
     assert_no_task_scratch(&scratch)?;
 
-    let stats = compaction
-        .perform_compaction_with_plan(&task, plan)
-        .await?
-        .completed()
-        .ok_or_else(|| anyhow::anyhow!("an untagged (RaBitQ) spill must not be declined"))?;
+    if !atomic {
+        // Force the real staged writer's final rename to fail in the same
+        // collection whose listing is warm. A nonempty directory cannot be
+        // replaced by the completed PAX file, independent of permissions.
+        let blocked = root.path().join("blocked.pax");
+        std::fs::create_dir(&blocked)?;
+        let marker = blocked.join("keep");
+        std::fs::write(&marker, b"blocked publication")?;
+        let mut failed_write = task.clone();
+        failed_write.output_file = blocked.clone();
+        let failure = compaction
+            .perform_compaction_with_plan(&failed_write, plan)
+            .await
+            .expect_err("a PAX file cannot replace the nonempty output directory");
+        assert!(
+            failure
+                .to_string()
+                .contains("upload local-spill PAX segment"),
+            "failure must reach the actual writer's publication step: {failure}"
+        );
+        assert!(input_a.exists() && input_b.exists());
+        assert!(!output.exists());
+        assert_eq!(std::fs::read(&marker)?, b"blocked publication");
+        let (files, lists) = traced_listing(&engine, &directory).await?;
+        assert_eq!(
+            files,
+            [input_a.clone(), input_b.clone()].into_iter().collect()
+        );
+        assert_eq!(
+            lists, 1,
+            "a failed publication attempt must conservatively refresh the collection listing"
+        );
+        assert_no_task_scratch(&scratch)?;
+        std::fs::remove_dir_all(&blocked)?;
+        let (files, lists) = traced_listing(&engine, &directory).await?;
+        assert_eq!(
+            files,
+            [input_a.clone(), input_b.clone()].into_iter().collect()
+        );
+        assert_eq!(
+            lists, 0,
+            "the admission-decline control must start with a warm listing"
+        );
+    }
+
+    // Unlike the unsupported-backend control, this task targets the actual
+    // warmed collection root. Admission decline must not invalidate that root
+    // or retire its inputs. Publication failures may invalidate defensively;
+    // this decline never reaches publication.
+    let mut declined = task.clone();
+    declined.vector_quant = Some(VectorQuant::Sq8);
+    let outcome = compaction
+        .perform_compaction_with_plan(&declined, plan)
+        .await?;
+    assert!(
+        matches!(outcome, super::CompactionOutcome::Declined(_)),
+        "unsupported spill quantization must decline the actual output task"
+    );
+    assert!(input_a.exists() && input_b.exists());
+    assert!(!output.exists());
+    let (files, lists) = traced_listing(&engine, &directory).await?;
+    assert_eq!(
+        files,
+        [input_a.clone(), input_b.clone()].into_iter().collect()
+    );
+    assert_eq!(
+        lists, 0,
+        "decline must preserve the warmed collection listing"
+    );
+    assert_no_task_scratch(&scratch)?;
+
+    if cancel_after_move {
+        return assert_listing_after_cancelled_publication(
+            &engine,
+            &directory,
+            &[input_a.clone(), input_b.clone()],
+            &output,
+            compaction.perform_compaction_with_plan(&task, plan),
+        )
+        .await;
+    }
+    let stats = assert_listing_at_publication(
+        &engine,
+        &directory,
+        &[input_a.clone(), input_b.clone()],
+        &output,
+        async {
+            compaction
+                .perform_compaction_with_plan(&task, plan)
+                .await?
+                .completed()
+                .ok_or_else(|| anyhow::anyhow!("an untagged (RaBitQ) spill must not be declined"))
+        },
+    )
+    .await?;
 
     assert_eq!(stats.files_merged, 2);
     assert!(stats.bytes_written > 0);
     assert!(output.exists());
     assert!(!input_a.exists());
     assert!(!input_b.exists());
+    assert_listing_refreshes_then_hits(&engine, &directory, std::slice::from_ref(&output)).await?;
     let output_records = read_segment_records(&std::fs::read(&output)?, &[], &[], None)?;
     assert_eq!(output_records.len(), 128);
     assert!(
@@ -998,11 +1781,12 @@ async fn check_compaction_needed_stamps_precision_hint_from_resolver() {
 /// fallback reaches unwired instances. (nextest runs each test in its own
 /// process, so the set-once global is fresh here.)
 #[tokio::test]
+#[serial]
 async fn td_global_precision_resolver_stamps_hint_without_per_instance_wiring() {
     use crate::storage::engines::sst::compaction::set_global_precision_resolver;
     use proximadb_catalog::cache::CatalogCache;
     use proximadb_catalog::canonical_precision::CanonicalPrecisionResolver;
-    use proximadb_catalog::{Catalog, CatalogNamespace, CatalogTableSchema, TableIdentifier};
+    use proximadb_catalog::{Catalog, CatalogTableSchema, TableIdentifier};
     use std::sync::Arc;
     let cache = Arc::new(CatalogCache::new(1000, 60));
     let cat: Arc<dyn Catalog> = Arc::new(InMemoryTestCatalog::new(
@@ -1037,6 +1821,9 @@ async fn td_global_precision_resolver_stamps_hint_without_per_instance_wiring() 
         "the global precision resolver must stamp precision_hint on a Compaction \
          that was never per-instance-wired (the per-collection-SstEngine case)"
     );
+    // Drop the override so later shared-process tests see the boot-armed
+    // global again (the plain `cargo test --lib` runner shares one process).
+    crate::storage::engines::sst::compaction::clear_global_precision_resolver_for_tests();
 }
 
 /// INT-3-followup-d wiring: with `CompactionTask.precision_hint =
@@ -1277,6 +2064,7 @@ async fn spill_quant_fixture(
         rg_layout: None,
         vector_quant: Some(collection_quant),
         access_tier: None,
+        min_live_segments: None,
     };
     Ok(SpillQuantFixture {
         _root: root,
@@ -1409,12 +2197,23 @@ async fn spill_declines_a_raw_f32_collection_with_lossy_inputs() -> anyhow::Resu
 /// output and deleted the inputs, the only copies of the exact f32 values.
 /// The probe error must abort the compaction and keep the inputs.
 #[tokio::test]
+#[serial]
 async fn tier_probe_read_error_aborts_and_keeps_exact_inputs() -> anyhow::Result<()> {
     use crate::storage::engines::sst::segment_format::write_pax_segment_full_with_layout;
     use proximadb_block_format::VectorQuant;
-    // SAFETY: isolated nextest process; armed before the factory is built.
+    // Armed before the factory is built, and SCOPED to this test's own temp
+    // dir: under the plain `cargo test --lib` runner every test shares one
+    // process, so an unscoped read-fault would inject failures into every
+    // concurrent test's `.pax` reads.
     unsafe { std::env::set_var("PROXIMADB_TEST_FS_READ_FAIL_AFTER_FIRST", "1") };
     let dir = tempfile::tempdir()?;
+    // The temp dir only exists here — point the fault scope at it now.
+    unsafe {
+        std::env::set_var(
+            "PROXIMADB_TEST_FS_READ_FAIL_SCOPE",
+            dir.path().display().to_string(),
+        )
+    }
     let inputs = [
         dir.path().join("segment_L0_a.pax"),
         dir.path().join("segment_L0_b.pax"),
@@ -1454,6 +2253,7 @@ async fn tier_probe_read_error_aborts_and_keeps_exact_inputs() -> anyhow::Result
         rg_layout: None,
         vector_quant: None,
         access_tier: None,
+        min_live_segments: None,
     };
     let result = compaction
         .perform_compaction_enhanced(&task, &config, None, None)
@@ -1468,6 +2268,10 @@ async fn tier_probe_read_error_aborts_and_keeps_exact_inputs() -> anyhow::Result
         "no lossy output may be published after a probe I/O error"
     );
     assert!(result.is_err(), "the compaction must abort");
+    unsafe {
+        std::env::remove_var("PROXIMADB_TEST_FS_READ_FAIL_SCOPE");
+        std::env::remove_var("PROXIMADB_TEST_FS_READ_FAIL_AFTER_FIRST");
+    }
     Ok(())
 }
 
@@ -1476,6 +2280,7 @@ async fn tier_probe_read_error_aborts_and_keeps_exact_inputs() -> anyhow::Result
 /// (read from the published centroid directory beside the inputs) instead of
 /// training a new model, and republishes the directory for the output.
 #[tokio::test]
+#[serial]
 async fn shared_model_gate_classifies_compaction_output_with_the_collection_model()
 -> anyhow::Result<()> {
     use crate::storage::engines::sst::centroid_directory_publisher::{
@@ -1567,6 +2372,7 @@ async fn shared_model_gate_classifies_compaction_output_with_the_collection_mode
         rg_layout: None,
         vector_quant: None,
         access_tier: None,
+        min_live_segments: None,
     };
     compaction
         .perform_compaction_enhanced(&task, &config, None, None)
@@ -1608,4 +2414,24 @@ async fn shared_model_gate_classifies_compaction_output_with_the_collection_mode
         .collect();
     assert_eq!(covered, ["segment_L1_compacted.pax"]);
     Ok(())
+}
+
+/// #2418 review round 11: a pinned floor BOUNDS the follow-up chain instead
+/// of suppressing it, so the layout/training promotion still runs and the
+/// chain can never merge below the operator's stop point.
+#[test]
+fn follow_up_is_bounded_by_the_pinned_floor() {
+    use super::follow_up_input_cap as cap;
+    // Room to merge: the follow-up keeps its inputs.
+    assert_eq!(cap(6, 2, 3, false), Some(3)); // 6 -> 4 >= 2
+    // Would overshoot: trimmed to exactly what lands on the floor.
+    assert_eq!(cap(4, 2, 4, false), Some(3)); // 4 -> 2
+    // At the floor: a plain merge is skipped...
+    assert_eq!(cap(2, 2, 2, false), None);
+    // ...but the TRAINING promotion still runs, as a single-input rewrite
+    // that cannot change the segment count (what suppression used to drop).
+    assert_eq!(cap(2, 2, 2, true), Some(1));
+    // Below the floor already (a concurrent merge): same rule, never worse.
+    assert_eq!(cap(1, 2, 2, true), Some(1));
+    assert_eq!(cap(1, 2, 2, false), None);
 }

@@ -323,13 +323,32 @@ class TestQuantizationIntegration:
         """Create REST client for testing"""
         return ProximaDBClient(url="http://localhost:5678", protocol=Protocol.REST)
 
+    @staticmethod
+    def _require_server(client):
+        """Skip honestly when no server is reachable.
+
+        ``client.health()`` CANNOT detect this: the REST adapter swallows
+        connection errors and fabricates a ``status="running"`` HealthStatus;
+        ``list_collections()`` is swallowed to ``[]`` the same way. Probe the
+        TCP port directly. (Under v1 these tests also "passed" serverlessly
+        via the client's in-memory local fallback; the v2 client surfaces
+        the connection error, so the skip must be real.)
+        """
+        import socket
+        from urllib.parse import urlparse
+
+        parsed = urlparse(getattr(client.config, "url", "http://localhost:5678"))
+        try:
+            with socket.create_connection(
+                (parsed.hostname or "localhost", parsed.port or 5678), timeout=1
+            ):
+                pass
+        except OSError:
+            pytest.skip("ProximaDB server not running")
+
     def test_create_collection_with_quantization(self, client):
         """Test creating collection with quantization enabled"""
-        # Skip if server is not running
-        try:
-            client.health()
-        except Exception:
-            pytest.skip("ProximaDB server not running")
+        self._require_server(client)
 
         # Create collection with quantization
         collection_name = "test_quant_123456"
@@ -362,11 +381,7 @@ class TestQuantizationIntegration:
 
     def test_search_with_optimization_hints(self, client):
         """Test search with optimization hints"""
-        # Skip if server is not running
-        try:
-            client.health()
-        except Exception:
-            pytest.skip("ProximaDB server not running")
+        self._require_server(client)
 
         collection_name = "test_search_hints_123456"
 

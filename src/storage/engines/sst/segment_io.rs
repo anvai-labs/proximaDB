@@ -29,7 +29,10 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use futures::StreamExt as _;
 use proximadb_cache::{L2Class, PersistentByteStore, object_key};
+use proximadb_storage_filesystem_types::read_ranges_plan;
+use proximadb_storage_filesystem_types::read_ranges_prefetch_inflight;
 use proximadb_storage_filesystem_types::{FileSystem, FilesystemError, FsResult};
 
 /// Whole-object fetches are staged in chunks of this size (bounded RAM).
@@ -42,9 +45,126 @@ const RETIRED_MEMORY: usize = 4096;
 /// budget check.
 const WARMS_IN_FLIGHT: usize = 4;
 
+/// TD-TIER-1 SC6 S3: one pool's aggregate warm bandwidth (bytes/s), shared
+/// by every grant in that pool. A token bucket with one second of burst
+/// capacity; `rate <= 0` paces nothing.
+pub struct WarmBudget {
+    rate_bytes_per_s: f64,
+    state: std::sync::Mutex<WarmBucketState>,
+}
+
+struct WarmBucketState {
+    tokens: f64,
+    last: std::time::Instant,
+}
+
+impl WarmBudget {
+    /// A bucket passing `rate_bytes_per_s` in aggregate.
+    pub fn new(rate_bytes_per_s: f64) -> Self {
+        Self {
+            rate_bytes_per_s,
+            state: std::sync::Mutex::new(WarmBucketState {
+                tokens: rate_bytes_per_s,
+                last: std::time::Instant::now(),
+            }),
+        }
+    }
+
+    /// Account `bytes` of warm transfer and sleep for the deficit. Concurrency
+    /// is bounded by WARMS_IN_FLIGHT, so lock contention is negligible.
+    pub async fn pace(&self, bytes: u64) {
+        if self.rate_bytes_per_s <= 0.0 {
+            return;
+        }
+        let deficit = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let now = std::time::Instant::now();
+            let refill =
+                now.duration_since(state.last).as_secs_f64().min(1.0) * self.rate_bytes_per_s;
+            state.tokens = (state.tokens + refill).min(self.rate_bytes_per_s);
+            state.last = now;
+            state.tokens -= bytes as f64;
+            let deficit_tokens = -state.tokens.min(0.0);
+            deficit_tokens / self.rate_bytes_per_s
+        };
+        if deficit > 0.0 {
+            tokio::time::sleep(std::time::Duration::from_secs_f64(deficit.min(60.0))).await;
+        }
+    }
+}
+
+static WARM_PREFIX_BUDGETS: std::sync::OnceLock<
+    std::sync::RwLock<Vec<(String, std::sync::Arc<WarmBudget>)>>,
+> = std::sync::OnceLock::new();
+
+/// Install the prefix → pool-bucket map (the reservation registry refreshes
+/// it whenever grants change). Longest matching prefix wins; an empty map
+/// paces nothing (today's behavior).
+pub fn set_warm_prefix_budgets(budgets: Vec<(String, std::sync::Arc<WarmBudget>)>) {
+    let registry = WARM_PREFIX_BUDGETS.get_or_init(|| std::sync::RwLock::new(Vec::new()));
+    let mut guard = registry
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *guard = budgets;
+}
+
+fn warm_budget_for(path: &str) -> Option<std::sync::Arc<WarmBudget>> {
+    let registry = WARM_PREFIX_BUDGETS.get_or_init(|| std::sync::RwLock::new(Vec::new()));
+    let guard = registry
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard
+        .iter()
+        .filter(|(prefix, _)| !prefix.is_empty() && path.starts_with(prefix.as_str()))
+        .max_by_key(|(prefix, _)| prefix.len())
+        .map(|(_, budget)| budget.clone())
+}
+
 fn warm_permits() -> &'static tokio::sync::Semaphore {
     static PERMITS: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
     PERMITS.get_or_init(|| tokio::sync::Semaphore::new(WARMS_IN_FLIGHT))
+}
+
+/// TD-TIER-1 SC4 PR-D: whole-object warms in flight, keyed by the CANONICAL
+/// store key ([`object_key`] — the same identity the [`Resident`] copy uses).
+/// The WARMS_IN_FLIGHT semaphore bounds CONCURRENCY; this set bounds
+/// DUPLICATE targets — a post-flush [`spawn_warm_object`] racing a
+/// [`warm_collection`] pass over the same object must not pay the GET twice.
+fn warm_inflight() -> std::sync::MutexGuard<'static, std::collections::HashSet<String>> {
+    static INFLIGHT: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    INFLIGHT
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Claims one canonical key for the guard's lifetime: every exit path —
+/// return, `?` error, panic, task cancellation — runs `Drop`, so a failed or
+/// aborted warm never wedges the target behind a dead claim.
+struct WarmClaim {
+    key: String,
+}
+
+impl WarmClaim {
+    /// `None` when the key is already being warmed elsewhere in the process.
+    fn try_claim(key: String) -> Option<Self> {
+        let mut inflight = warm_inflight();
+        if inflight.contains(&key) {
+            return None;
+        }
+        inflight.insert(key.clone());
+        Some(Self { key })
+    }
+}
+
+impl Drop for WarmClaim {
+    fn drop(&mut self) {
+        warm_inflight().remove(&self.key);
+    }
 }
 
 /// Segment reads that prefer a resident whole-segment copy.
@@ -76,6 +196,7 @@ impl<T: FileSystem + ?Sized> ResidentRangeRead for T {
         if let Some(resident) = Resident::lookup(path)
             && let Some(bytes) = resident.range(offset, length).await
         {
+            crate::storage::engines::sst::metrics::record_resident_hit();
             return Ok(bytes);
         }
         self.read_range(path, offset, length).await
@@ -91,14 +212,50 @@ impl<T: FileSystem + ?Sized> ResidentRangeRead for T {
                 .iter()
                 .all(|range| range.end <= resident.len && range.start <= range.end)
         {
-            let mut out = Vec::with_capacity(ranges.len());
-            for range in &ranges {
-                match resident.range(range.start, range.end - range.start).await {
-                    Some(bytes) => out.push(bytes),
-                    None => return self.read_ranges_prefetch(path, ranges).await,
+            // F1 (SC6 measurement): serve the batch with the SAME plan the
+            // remote path uses — one coalesced physical plan, bounded-
+            // concurrent fetch, identical logical slicing — swapping only the
+            // transport for the resident copy. The previous loop served each
+            // logical range through its own spawn_blocking hop one at a time,
+            // serializing exactly what the cold path issues as parallel waves
+            // (granted warm p50 ~215 ms vs cold ~60 ms at zero GETs).
+            let inflight = read_ranges_prefetch_inflight(path).max(1);
+            let plan = self.plan_read_ranges(&ranges)?;
+            let identity = self.range_coalesce_policy().is_none();
+            let physical: Vec<std::ops::Range<u64>> = plan.physical.clone();
+            let mut fetch = futures::stream::iter(physical.into_iter().map(|range| {
+                let resident = resident.clone();
+                async move { resident.range(range.start, range.end - range.start).await }
+            }))
+            .buffered(inflight);
+            let mut buffers = Vec::with_capacity(plan.physical.len());
+            let mut complete = true;
+            while let Some(item) = fetch.next().await {
+                match item {
+                    Some(bytes) => buffers.push(bytes),
+                    None => {
+                        // A resident miss (eviction/corruption): fall back to
+                        // the remote batch wholesale, dropping in-flight reads.
+                        complete = false;
+                        break;
+                    }
                 }
             }
-            return Ok(out);
+            if complete {
+                crate::storage::engines::sst::metrics::record_resident_hit();
+                if identity {
+                    return Ok(buffers);
+                }
+                return Ok(plan
+                    .mapping
+                    .iter()
+                    .map(|slice| match slice.physical {
+                        Some(idx) => read_ranges_plan::slice_from_physical(&buffers[idx], *slice),
+                        None => Vec::new(),
+                    })
+                    .collect());
+            }
+            return self.read_ranges_prefetch(path, ranges).await;
         }
         self.read_ranges_prefetch(path, ranges).await
     }
@@ -107,6 +264,7 @@ impl<T: FileSystem + ?Sized> ResidentRangeRead for T {
         if let Some(resident) = Resident::lookup(path)
             && let Some(bytes) = resident.range(0, resident.len).await
         {
+            crate::storage::engines::sst::metrics::record_resident_hit();
             return Ok(bytes);
         }
         self.read(path).await
@@ -123,6 +281,7 @@ impl<T: FileSystem + ?Sized> ResidentRangeRead for T {
 }
 
 /// A resident whole-object copy of one segment.
+#[derive(Clone)]
 struct Resident {
     store: Arc<PersistentByteStore>,
     key: String,
@@ -235,12 +394,32 @@ pub async fn warm_object(
         }
     };
     // Process-wide limit, then re-judge the budget: a warm that waited may
-    // find the room taken by the ones ahead of it.
-    let _permit = warm_permits()
-        .acquire()
-        .await
-        .map_err(|error| anyhow::anyhow!("warm permit for {path}: {error}"))?;
+    // find the room taken by the ones ahead of it. The setup permit is
+    // dropped before the chunk loop: each chunk reacquires (the RAM bound is
+    // one chunk per permit), and S3 pacing sleeps BETWEEN permits — a
+    // budgeted pool must never pin the process-wide permits while it sleeps
+    // (review SF1), or a slow pool starves every other pool's warm.
+    {
+        let _setup_permit = warm_permits()
+            .acquire()
+            .await
+            .map_err(|error| anyhow::anyhow!("warm permit for {path}: {error}"))?;
+        if warm_target(path, len).is_none() {
+            return Ok(false);
+        }
+    }
     let Some((store, key)) = warm_target(path, len) else {
+        return Ok(false);
+    };
+    // SC4 PR-D: claim the canonical key for the duration of the fetch — a
+    // concurrent warm of the same object (a post-flush spawn racing a
+    // backfill pass) returns early here instead of paying a second GET for
+    // bytes the claim holder is already fetching. The claim drops on every
+    // exit (return, error, panic, cancellation), and the loser's early
+    // return is the same outcome as losing the budget re-judge above: the
+    // next warm pass retries if the winner does not land the copy.
+    let Some(_claim) = WarmClaim::try_claim(key.clone()) else {
+        tracing::debug!("TD-TIER-1 SC4: warm of {path} already in flight; skipping");
         return Ok(false);
     };
     // Stage on the store's own filesystem (never a possibly RAM-backed
@@ -257,18 +436,38 @@ pub async fn warm_object(
             .map_err(|error| anyhow::anyhow!("warm stage {path}: {error}"))?;
         let mut out = tokio::fs::File::from_std(file);
         let mut offset = 0u64;
+        // TD-TIER-1 SC6 S3: pace this object's chunks against its pool's
+        // aggregate warm budget, when one is installed for the path. Pacing
+        // happens OUTSIDE the warm permit (review SF1): a budgeted pool must
+        // not pin the process-wide permits while it sleeps, or a slow pool
+        // starves every other pool's warm.
+        let budget = warm_budget_for(path);
         while offset < len {
             let chunk = WARM_CHUNK_BYTES.min(len - offset);
-            let bytes = fs
-                .read_range(path, offset, chunk)
-                .await
-                .map_err(|error| anyhow::anyhow!("warm read {path}@{offset}: {error}"))?;
-            if bytes.len() as u64 != chunk {
-                anyhow::bail!("warm read {path}@{offset}: short read");
+            if let Some(budget) = &budget {
+                budget.pace(chunk).await;
             }
-            out.write_all(&bytes)
-                .await
-                .map_err(|error| anyhow::anyhow!("warm stage {path}: {error}"))?;
+            // The chunk buffer lives INSIDE the permit (review SF2): one
+            // WARMS_IN_FLIGHT permit ⇒ at most one 64 MiB buffer held per
+            // warm across the process — the write included. Pacing stays
+            // before the permit, so a budgeted pool still never pins permits
+            // while sleeping.
+            {
+                let _chunk_permit = warm_permits()
+                    .acquire()
+                    .await
+                    .map_err(|error| anyhow::anyhow!("warm permit for {path}: {error}"))?;
+                let bytes = fs
+                    .read_range(path, offset, chunk)
+                    .await
+                    .map_err(|error| anyhow::anyhow!("warm read {path}@{offset}: {error}"))?;
+                if bytes.len() as u64 != chunk {
+                    anyhow::bail!("warm read {path}@{offset}: short read");
+                }
+                out.write_all(&bytes)
+                    .await
+                    .map_err(|error| anyhow::anyhow!("warm stage {path}: {error}"))?;
+            };
             offset += chunk;
         }
         out.flush()
@@ -548,11 +747,16 @@ pub struct WarmReport {
 /// missing from a listing that predates it (review SF1: nothing would
 /// re-warm it).
 ///
-/// Keys are canonical ([`object_key`]: Azure aliases, `file://` vs plain
-/// path, slash runs), so the root is matched ANCHORED at the start of the
-/// location — another base ending in the same path is not this root.
+/// Keys normalize documented scheme aliases and absolute local spellings,
+/// while preserving exact cloud-key bytes. The root is matched ANCHORED at
+/// the start of the location, including every existing trailing delimiter.
 pub(crate) fn orphan_candidates(store: &PersistentByteStore, data_url: &str) -> Vec<String> {
-    let root = object_key(&format!("{}/", data_url.trim_end_matches('/')));
+    let directory = if data_url.ends_with('/') {
+        data_url.to_owned()
+    } else {
+        format!("{data_url}/")
+    };
+    let root = object_key(&directory);
     store.keys_where(|key| {
         key.strip_prefix(root.as_str())
             // Direct children only: the listing is not recursive, so a
@@ -634,6 +838,40 @@ mod tests {
     use crate::storage::persistence::filesystem::local::{LocalConfig, LocalFileSystem};
     use proximadb_storage_filesystem_types::counting::{CountingFileSystem, GetCounters};
 
+    #[tokio::test]
+    async fn orphan_candidates_preserve_exact_cloud_delimiters() {
+        let directory = tempfile::tempdir().expect("cache directory");
+        let store = PersistentByteStore::open(directory.path(), 1 << 20).expect("cache store");
+        let intended = object_key("s3://bucket/x//a.pax");
+        let alternate = object_key("s3://bucket/x/a.pax");
+        let nested = object_key("s3://bucket/x///nested.pax");
+        let sibling = object_key("s3://bucket/x-other/a.pax");
+        for key in [&intended, &alternate, &nested, &sibling] {
+            store
+                .put(key.clone(), L2Class::Invariants, Arc::from(&b"body"[..]))
+                .await
+                .expect("seed entry");
+        }
+        let candidates = orphan_candidates(&store, "s3://bucket/x//");
+        assert_eq!(
+            candidates,
+            vec![intended.clone()],
+            "only direct children of the exact prefix qualify"
+        );
+        assert_eq!(
+            orphan_candidates(&store, "s3://bucket/x"),
+            vec![alternate.clone()]
+        );
+        assert_eq!(sweep_orphan_objects(&store, candidates, &[]).await, 1);
+        assert!(store.entry_len(&intended).is_none());
+        for key in [&alternate, &nested, &sibling] {
+            assert!(
+                store.entry_len(key).is_some(),
+                "other prefixes must survive: {key}"
+            );
+        }
+    }
+
     /// The process store (first registration wins) and a grant group covering
     /// `covered_dir` with `budget` bytes. Holds the crate-wide residency gate,
     /// so shared-process runners cannot interleave tests that touch the
@@ -697,6 +935,133 @@ mod tests {
         std::fs::create_dir_all(&covered).expect("dirs");
         std::fs::create_dir_all(&other).expect("dirs");
         (covered, other)
+    }
+
+    /// A local fs carrying a range-coalesce policy, so the resident batched
+    /// path exercises bridging + logical slicing (the plain local fs is
+    /// identity-mapped and would not).
+    #[derive(Debug)]
+    struct CoalescingLocalFs {
+        inner: Arc<CountingFileSystem>,
+    }
+    proximadb_storage_filesystem_types::forward_filesystem_impl! {
+        impl FileSystem for CoalescingLocalFs => inner;
+        forward [
+            as_any, filesystem_type, supports_mmap, write,
+            supports_bounded_local_file_write, write_local_file, write_if_absent, append,
+            supports_append, supports_conditional_replace, delete, exists, metadata,
+            create_dir, create_dir_all, copy, move_file, sync, sync_file, sync_data, open_file,
+        ];
+        {
+            async fn read(&self, path: &str) -> FsResult<Vec<u8>> {
+                self.inner.read(path).await
+            }
+
+            async fn read_range(&self, path: &str, offset: u64, length: u64) -> FsResult<Vec<u8>> {
+                self.inner.read_range(path, offset, length).await
+            }
+
+            async fn list(
+                &self,
+                path: &str,
+            ) -> FsResult<Vec<proximadb_storage_filesystem_types::DirEntry>> {
+                self.inner.list(path).await
+            }
+
+            fn range_coalesce_policy(
+                &self,
+            ) -> Option<proximadb_storage_filesystem_types::RangeCoalescePolicy> {
+                Some(proximadb_storage_filesystem_types::RangeCoalescePolicy {
+                    max_gap_bytes: 64 * 1024,
+                    max_merged_bytes: 256 * 1024,
+                })
+            }
+        }
+    }
+
+    /// TD-TIER-1 SC6 S3: an installed warm budget paces the aggregate —
+    /// warming a multi-chunk object under a small rate takes at least
+    /// bytes/rate (minus the one-second burst), and no budget paces nothing.
+    #[tokio::test]
+    async fn warm_budget_bounds_the_aggregate() {
+        let root = tempfile::tempdir().expect("root");
+        let (covered, _) = dirs(root.path());
+        let _armed = arm(&covered, "s3-budget", 64 << 20);
+        let (fs, _counters) = counting_local(root.path()).await;
+        // 4 MiB object; a 1 MiB/s budget allows ~1 MiB burst, so >= 3 s.
+        let (path, _) = segment(&covered, "L0_budget.pax", 4 << 20);
+        let rate = 1024.0 * 1024.0;
+        let budget = std::sync::Arc::new(WarmBudget::new(rate));
+        set_warm_prefix_budgets(vec![(covered.to_string_lossy().to_string(), budget)]);
+
+        let started = std::time::Instant::now();
+        assert!(warm_object(fs.as_ref(), &path, None).await.expect("warm"));
+        let elapsed = started.elapsed().as_secs_f64();
+        let minimum = (4.0 - 1.0) / 1.0_f64 - 0.3;
+        assert!(
+            elapsed >= minimum,
+            "budgeted warm took {elapsed:.2}s, expected >= {minimum:.2}s"
+        );
+        set_warm_prefix_budgets(Vec::new());
+    }
+
+    /// F1 regression (SC6 measurement): the resident batched-prefetch path
+    /// serves the SAME coalesced physical plan the remote path uses —
+    /// bridging small gaps, slicing logical ranges back out — byte-exactly
+    /// and with zero object-store GETs. The previous implementation served
+    /// each logical range through one spawn_blocking hop at a time,
+    /// serializing what the cold path issues as parallel waves (granted warm
+    /// p50 ~215 ms vs cold ~60 ms at zero GETs). A range beyond the resident
+    /// copy falls back to the remote batch wholesale.
+    #[tokio::test]
+    async fn resident_prefetch_is_coalesced_concurrent_and_byte_exact() {
+        let root = tempfile::tempdir().expect("root");
+        let (covered, _) = dirs(root.path());
+        let _armed = arm(&covered, "f1", 32 << 20);
+        let (fs, counters) = counting_local(root.path()).await;
+        let coalescing = CoalescingLocalFs { inner: fs.clone() };
+        let (path, bytes) = segment(&covered, "L0_f1.pax", 300_000);
+        assert!(warm_object(fs.as_ref(), &path, None).await.expect("warm"));
+
+        // Small gaps bridge under the policy; a gap beyond max_gap does not.
+        let ranges: Vec<std::ops::Range<u64>> = vec![0..1_000, 2_000..3_000, 150_000..151_000];
+        let plan = coalescing.plan_read_ranges(&ranges).expect("plan");
+        assert!(
+            plan.physical.len() < ranges.len(),
+            "coalescing active: {} physical for {} logical",
+            plan.physical.len(),
+            ranges.len()
+        );
+
+        let before = counters.total_gets();
+        let out = coalescing
+            .read_ranges_prefetch_resident(&path, ranges.clone())
+            .await
+            .expect("resident batch");
+        assert_eq!(counters.total_gets(), before, "zero remote GETs");
+        for (slice, range) in out.iter().zip(&ranges) {
+            let start = range.start as usize;
+            let end = range.end as usize;
+            assert_eq!(slice, &bytes[start..end], "logical slice {range:?}");
+        }
+
+        // A range past the resident copy falls back to the remote batch
+        // wholesale — remote GETs return, results stay byte-exact.
+        let mut beyond = ranges.clone();
+        beyond.push(400_000..401_000);
+        let out = coalescing
+            .read_ranges_prefetch_resident(&path, beyond.clone())
+            .await
+            .expect("fallback batch");
+        assert!(
+            counters.total_gets() > before,
+            "the fallback reads remotely"
+        );
+        for (slice, range) in out.iter().zip(&beyond) {
+            let start = std::cmp::min(range.start as usize, bytes.len());
+            let end = std::cmp::min(range.end as usize, bytes.len());
+            assert_eq!(slice, &bytes[start..end], "fallback slice {range:?}");
+        }
     }
 
     /// The SC4-4 core: a covered segment, once resident, is read — single
@@ -824,6 +1189,61 @@ mod tests {
         );
         assert_eq!(counters.total_gets(), 0, "skipped before the fetch");
         assert_eq!(resident_len(&path), None);
+    }
+
+    /// SC4 PR-D (in-flight warm dedup): two concurrent warms of the SAME
+    /// object pay exactly ONE GET — the loser finds the canonical key already
+    /// in flight and returns without fetching (the WARMS_IN_FLIGHT semaphore
+    /// bounds concurrency; the in-flight set bounds duplicate targets — a
+    /// post-flush `spawn_warm_object` racing a `warm_collection` pass is the
+    /// production shape of this). A different object still warms, and a
+    /// FAILED warm releases its claim so a later warm of the same object is
+    /// not wedged behind it.
+    #[tokio::test]
+    async fn concurrent_warms_of_one_object_fetch_it_once() {
+        let root = tempfile::tempdir().expect("root");
+        let (covered, _) = dirs(root.path());
+        let _armed = arm(&covered, "warm-dedup", 32 << 20);
+        let (fs, counters) = counting_local(root.path()).await;
+        let (path, _) = segment(&covered, "L0_d.pax", 200_000);
+        let (other, _) = segment(&covered, "L0_e.pax", 2_048);
+        let (flaky, _) = segment(&covered, "L0_f.pax", 2_048);
+
+        let (first, second) = tokio::join!(
+            warm_object(fs.as_ref(), &path, None),
+            warm_object(fs.as_ref(), &path, None),
+        );
+        let wrote = first.expect("warm a") as usize + second.expect("warm b") as usize;
+        assert_eq!(wrote, 1, "exactly one of the racing warms writes");
+        assert_eq!(counters.total_gets(), 1, "the duplicate warm paid no GET");
+        assert_eq!(
+            resident_len(&path),
+            Some(200_000),
+            "the winner's copy lands"
+        );
+
+        // A different object is never deduplicated away.
+        assert!(
+            warm_object(fs.as_ref(), &other, None)
+                .await
+                .expect("warm other")
+        );
+
+        // A failed warm (declared length past the file: short read) releases
+        // its in-flight claim — the same object warms cleanly right after
+        // instead of returning early behind a dead claim forever.
+        assert!(
+            warm_object(fs.as_ref(), &flaky, Some(1 << 20))
+                .await
+                .is_err(),
+            "a length past the file fails the fetch"
+        );
+        assert!(
+            warm_object(fs.as_ref(), &flaky, None)
+                .await
+                .expect("warm flaky"),
+            "the claim was released on failure"
+        );
     }
 
     /// Backfill warms every live segment once (non-segment files ignored) and
@@ -1020,38 +1440,413 @@ mod tests {
     /// directly — a direct call would silently bypass residency and cost a
     /// GET on a resident collection (review B1: the first guard matched only
     /// `.read_range(` and missed the batched and whole-object reads).
+    ///
+    /// TD-TIER-1 SC4 (readers outside the vector profile): the pin covers the
+    /// non-vector readers too — the point-lookup/scan PAX path
+    /// (`trait_impl.rs`), the legacy `.sst` reader (`sst_query_engine.rs`),
+    /// and the DataFusion PAX adapter (`pax_adapter.rs`) — plus
+    /// `search/operations.rs`, whose point-lookup was silently uncovered (it
+    /// delegates to the legacy reader, which the pin above now catches, but a
+    /// future direct read there would have bypassed both).
+    ///
+    /// Matching runs on WHITESPACE-STRIPPED source: the point-lookup site was
+    /// originally a line-broken `fs\n    .read(` that a raw-substring guard
+    /// cannot see — exactly the evasion this guard exists to prevent.
+    ///
+    /// Source PREPARATION (review round-1 B1): the previous helper split at
+    /// the first literal `#[cfg(test)]`, which truncates at an attribute
+    /// mentioned inside a `//` comment (segment_format.rs line 33) or at the
+    /// FIRST interleaved test mod — sst_query_engine.rs's routed sites at
+    /// ~2105/~4906/~5220/~5448/~5582 all sat AFTER its first test mod and
+    /// were therefore never actually pinned. Preparation now (a) strips `//`
+    /// line comments first and (b) cuts every real `#[cfg(test)]` ITEM with
+    /// a brace-aware scanner, so production code after interleaved test mods
+    /// stays pinned and files whose tests live at the end are handled by the
+    /// same scanner. Truncation sentinels below fail loudly if a future
+    /// preparation regression re-guts the pin.
+    ///
+    /// Accepted limitations (disclosed on the TD row): the comment strip
+    /// eats the rest of a line containing `//` inside a string literal (none
+    /// in the pinned files' production code); the brace scanner counts
+    /// braces inside string literals (none unbalanced there); and the
+    /// FILESYSTEM-OBJECT forms match on the receiver NAME `fs` — a rename
+    /// evades them (a future `source preparation` could match on type, not
+    /// text).
     #[test]
     fn segment_readers_route_reads_through_residency() {
+        fn strip_line_comments(source: &str) -> String {
+            source
+                .lines()
+                .map(|line| match line.find("//") {
+                    Some(cut) => &line[..cut],
+                    None => line,
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+
+        /// Index just past the `}` matching the `{` at `open_at` (None when
+        /// the braces never balance — cut to end-of-source in that case; the
+        /// sentinels below make that visible instead of silent).
+        fn balanced_brace_end(source: &str, open_at: usize) -> Option<usize> {
+            let mut depth = 0usize;
+            for (i, b) in source.bytes().enumerate().skip(open_at) {
+                match b {
+                    b'{' => depth += 1,
+                    b'}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return Some(i + 1);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            None
+        }
+
+        /// Every `#[cfg(test)]` ITEM cut — the attribute(s), the item head,
+        /// and for braced items the whole balanced body (`mod tests { … }`,
+        /// test-only `fn`s, `#[cfg(test)] use …;`). Chained attributes
+        /// (`#[cfg(test)] #[path = "…"] mod tests;`) are skipped to the item
+        /// head; a `;`-terminated item ends at the semicolon.
+        fn without_test_items(file: &str, source: &str) -> String {
+            const ATTR: &str = "#[cfg(test)]";
+            let mut prepared = String::with_capacity(source.len());
+            let mut cursor = 0usize;
+            while let Some(attr_at) = source[cursor..].find(ATTR).map(|i| i + cursor) {
+                prepared.push_str(&source[cursor..attr_at]);
+                let mut i = attr_at + ATTR.len();
+                loop {
+                    i += source[i..].len() - source[i..].trim_start().len();
+                    if !source[i..].starts_with("#[") {
+                        break;
+                    }
+                    let mut depth = 0isize;
+                    while i < source.len() {
+                        match source.as_bytes()[i] {
+                            b'[' => depth += 1,
+                            b']' => {
+                                depth -= 1;
+                                if depth == 0 {
+                                    i += 1;
+                                    break;
+                                }
+                            }
+                            _ => {}
+                        }
+                        i += 1;
+                    }
+                }
+                let item_end = match source[i..].find(['{', ';']) {
+                    Some(rel) => {
+                        let at = i + rel;
+                        if source.as_bytes()[at] == b';' {
+                            at + 1
+                        } else {
+                            // A brace run that never balances used to cut
+                            // SILENTLY to EOF, unpinning every later line —
+                            // the exact shape of the round-1 B1 defect, and
+                            // invisible in any file without a sentinel. Fail
+                            // loudly instead: the guard's own preparation is
+                            // the thing under test here.
+                            balanced_brace_end(source, at).unwrap_or_else(|| {
+                                // Line of the PREPARED buffer (post comment-strip),
+                                // not the on-disk byte offset — greppable in the
+                                // file even when stripping shifted positions.
+                                let line = source[..at].matches('\n').count() + 1;
+                                panic!(
+                                    "{file}: a #[cfg(test)] item (prepared line {line}) never \
+                                     closes its braces, so the guard would silently stop \
+                                     pinning the rest of the file (string/char literal \
+                                     holding an unmatched brace inside a test body is the \
+                                     known cause)"
+                                )
+                            })
+                        }
+                    }
+                    None => source.len(),
+                };
+                cursor = item_end;
+            }
+            prepared.push_str(&source[cursor..]);
+            prepared
+        }
+
+        fn production_source(file: &str, source: &str) -> String {
+            without_test_items(file, &strip_line_comments(source))
+        }
+
+        fn norm(source: &str) -> String {
+            source.replace(['\n', '\t', ' '], "")
+        }
+
+        // Truncation sentinels (review round-1 B1): each prepared source
+        // must still reach the END of its file's production code — the old
+        // first-`#[cfg(test)]`-split pinned 0.5% of segment_format.rs (first
+        // hit: a comment), 3.5% of search/mod.rs (a mid-file test-only fn)
+        // and only lines 1-1437 of sst_query_engine.rs. Each sentinel names
+        // a production identifier from deep inside the previously-truncated
+        // region.
+        // Self-tests of the PREPARATION itself on synthetic source (review
+        // round-2 NIT-3: the durable replacement for a mutation run — both
+        // prior live mutation attempts were killed by external factors, so
+        // the helpers' behavior is pinned here on inputs whose expected
+        // outcome is known by construction):
+        //   (a) interleaved #[cfg(test)] items are cut and production on
+        //       BOTH sides survives — the round-1 B1 shape;
+        //   (b) a cfg(test) mentioned only in a comment does not arm the
+        //       scanner — the line-33 shape;
+        //   (c) an unbalanced brace inside a test body fails LOUDLY, naming
+        //       the file and a prepared line number — the round-2 root cause.
+        {
+            let synthetic = concat!(
+                "fn before() {}\n",
+                "// see the #[cfg(test)] mod below\n",
+                "fn middle() {}\n",
+                // The test body's braces BALANCE under the scanner's counting
+                // (a brace PAIR inside a string literal nets to zero) — an
+                // unbalanced one belongs to the (c) fixture below.
+                "#[cfg(test)]\nmod tests {\n    fn t() { let s = \"{}\"; }\n}\n",
+                "fn after() {}\n",
+            );
+            let prepared = production_source("synthetic_a.rs", synthetic);
+            let normalized = norm(&prepared);
+            assert!(
+                normalized.contains("fnbefore(){}"),
+                "production before the test mod kept"
+            );
+            assert!(
+                normalized.contains("fnmiddle(){}"),
+                "production between comment and test mod kept"
+            );
+            assert!(
+                normalized.contains("fnafter(){}"),
+                "production after the test mod kept (the B1 cut lost exactly this)"
+            );
+            assert!(!normalized.contains("fnt()"), "test item actually cut");
+
+            let unbalanced = concat!(
+                "fn prod() {}\n",
+                "#[cfg(test)]\nmod tests {\n    fn t() { let s = \"{\"; }\n",
+            );
+            let panicked =
+                std::panic::catch_unwind(|| production_source("synthetic_b.rs", unbalanced));
+            let message = panicked
+                .expect_err("an unbalanced test item must fail loudly")
+                .downcast_ref::<String>()
+                .cloned()
+                .unwrap_or_default();
+            assert!(
+                message.contains("synthetic_b.rs") && message.contains("never closes its braces"),
+                "the panic names the file and the cause: {message}"
+            );
+        }
+
+        let segment_format =
+            production_source("segment_format.rs", include_str!("segment_format.rs"));
+        assert!(
+            segment_format.contains("rabitq_search_segment_coalesced_allowed"),
+            "segment_format.rs preparation truncated: its last production fn \
+             (rabitq_search_segment_coalesced_allowed, ~line 4911) is gone"
+        );
+        let search_mod = production_source("search/mod.rs", include_str!("search/mod.rs"));
+        assert!(
+            search_mod.contains("morsel_degree"),
+            "search/mod.rs preparation truncated: morsel_degree (~line 267, \
+             past the first test-only item) is gone"
+        );
+        let legacy_reader = production_source(
+            "readers/sst_query_engine.rs",
+            include_str!("readers/sst_query_engine.rs"),
+        );
+        assert!(
+            legacy_reader.contains("MemoryPressure"),
+            "sst_query_engine.rs preparation truncated: MemoryPressure \
+             (~line 6829, past the interleaved test mods) is gone"
+        );
+
+        // Round-2 residual: these four pins carried NO sentinel, so a
+        // preparation regression in them unpinned the file SILENTLY (the
+        // brace-scanner over-cut is the known shape). Each sentinel is
+        // TWO-LEGGED (review round-2 on this PR):
+        //   1. an identifier from the file's final production region — but
+        //      identifiers can occur EARLIER too (read_segment_resolver has a
+        //      call site at ~:72 before its fn at ~:82; SearchOperationStats
+        //      a return type at ~:306 before the struct at ~:359), so this
+        //      leg alone pins only up to the FIRST occurrence;
+        //   2. `ends_with` on the normalized production TAIL — the file's
+        //      final production statement, position-asserted, so ANY cut that
+        //      loses tail production fails no matter where the identifier
+        //      occurs. This leg is what makes "the preparation reaches the
+        //      END of production code" literally true.
+        // oid_resolve.rs has NO #[cfg(test)] items — nothing is ever cut from
+        // it — so its sentinel is belt-and-braces for file completeness (the
+        // ends_with leg still guards against a future test mod appearing).
+        let oid_resolve = production_source("oid_resolve.rs", include_str!("oid_resolve.rs"));
+        assert!(
+            oid_resolve.contains("read_segment_resolver"),
+            "oid_resolve.rs preparation truncated: read_segment_resolver (its \
+             last production fn, ~line 82) is gone"
+        );
+        assert!(
+            norm(&oid_resolve).ends_with(&norm("Ok(Some(Arc::new(resolver)))\n}")),
+            "oid_resolve.rs preparation lost the file's production tail"
+        );
+        let centroid_reader = production_source(
+            "centroid_directory_reader.rs",
+            include_str!("centroid_directory_reader.rs"),
+        );
+        assert!(
+            centroid_reader.contains("plan_segments"),
+            "centroid_directory_reader.rs preparation truncated: plan_segments \
+             (~line 222, the last production fn before the tests mod) is gone"
+        );
+        assert!(
+            // plan_segments' final statement: the DirectoryChoice build-up.
+            norm(&centroid_reader).ends_with(&norm(
+                "blocks: Mutex::default(),\n                        }),\n                    )\n                })\n            })\n            .collect(),\n    )\n}",
+            )),
+            "centroid_directory_reader.rs preparation lost the file's production tail"
+        );
+        let trait_impl = production_source("trait_impl.rs", include_str!("trait_impl.rs"));
+        assert!(
+            trait_impl.contains("collect_performance_metrics"),
+            "trait_impl.rs preparation truncated: collect_performance_metrics \
+             (~line 687, the last production fn before the tests mod) is gone"
+        );
+        assert!(
+            norm(&trait_impl).ends_with(&norm("Ok(metrics)\n    }\n}")),
+            "trait_impl.rs preparation lost the file's production tail"
+        );
+        let search_operations =
+            production_source("search/operations.rs", include_str!("search/operations.rs"));
+        assert!(
+            search_operations.contains("SearchOperationStats"),
+            "search/operations.rs preparation truncated: SearchOperationStats \
+             (~line 359, the last production item before the tests mod) is gone"
+        );
+        assert!(
+            norm(&search_operations).ends_with(&norm("pub cache_misses: u64,\n}")),
+            "search/operations.rs preparation lost the file's production tail"
+        );
+
+        // STRICT pins: files whose every production read routes through the
+        // seam — no direct ranged/batched/whole-object read may appear.
         for (name, source) in [
-            ("segment_format.rs", include_str!("segment_format.rs")),
-            ("oid_resolve.rs", include_str!("oid_resolve.rs")),
-            ("search/mod.rs", include_str!("search/mod.rs")),
+            ("segment_format.rs", segment_format.as_str()),
+            ("oid_resolve.rs", oid_resolve.as_str()),
+            ("search/mod.rs", search_mod.as_str()),
             (
-                "centroid_directory_reader.rs (non-test)",
-                include_str!("centroid_directory_reader.rs")
-                    .split("#[cfg(test)]")
-                    .next()
-                    .unwrap_or_default(),
+                "centroid_directory_reader.rs — directory reads",
+                centroid_reader.as_str(),
+            ),
+            (
+                "trait_impl.rs — point-lookup/scan PAX path",
+                trait_impl.as_str(),
             ),
         ] {
-            let heads =
-                source.matches(".metadata(").count() - source.matches(".metadata()").count();
-            assert_eq!(
-                heads, 0,
-                "{name}: {heads} direct `.metadata(` — use `object_size_resident`"
-            );
+            let normalized = norm(source);
             for direct in [
                 ".read_range(",
                 ".read_ranges_prefetch(",
                 ".read_ranges(",
                 "fs.read(",
             ] {
-                let count = source.matches(direct).count();
+                let count = normalized.matches(direct).count();
                 assert_eq!(
                     count, 0,
                     "{name}: {count} direct `{direct}` — use the resident read"
                 );
             }
+            let heads = normalized.matches(".metadata(").count()
+                - normalized.matches(".metadata()").count();
+            assert_eq!(
+                heads, 0,
+                "{name}: {heads} direct `.metadata(` — use `object_size_resident`"
+            );
+        }
+
+        // FILESYSTEM-OBJECT pins: files that read through wrapper handles
+        // (`caching_filesystem`) — banned on the `fs.`-receiver call forms
+        // plus the metadata probes (review round-1 M3: a
+        // `caching_filesystem.metadata` "cache probe" is a real object HEAD
+        // on a metadata-cache miss). The legacy reader cannot carry the
+        // `fs.read_range(` absence ban — see the presence ratchet below.
+        for (name, source, banned) in [
+            (
+                "readers/sst_query_engine.rs — legacy .sst reader",
+                legacy_reader.as_str(),
+                &[
+                    "fs.read(",
+                    "fs.read_ranges(",
+                    "fs.metadata(",
+                    "caching_filesystem.metadata(",
+                ][..],
+            ),
+            (
+                "search/operations.rs — point-lookup coverage hole",
+                search_operations.as_str(),
+                &[
+                    "fs.read(",
+                    "fs.read_range(",
+                    "fs.read_ranges(",
+                    "fs.metadata(",
+                    "caching_filesystem.metadata(",
+                ][..],
+            ),
+        ] {
+            let normalized = norm(source);
+            for direct in banned {
+                let count = normalized.matches(direct).count();
+                assert_eq!(
+                    count, 0,
+                    "{name}: {count} direct `{direct}` — use the resident read"
+                );
+            }
+        }
+
+        // PRESENCE ratchet for the legacy reader: `fs.read_range(` cannot be
+        // an ABSENCE pin — the pre-slice SstDirectReader/UnifiedSstableReader
+        // paths still hold ~25 direct `fs.read_range(` reads that slice 4
+        // deliberately did not route (open item on the TD row). What slice 4
+        // DID route is pinned by PRESENCE: revert any of the routed forms
+        // below and this fails.
+        let legacy_normalized = norm(&legacy_reader);
+        for (routed, at_least, what) in [
+            (
+                "fs.read_range_resident(",
+                1,
+                "the ModularBlockReader read_range choke point",
+            ),
+            ("fs.object_size_resident(", 3, "size probes"),
+            ("fs.read_resident(", 2, "whole-object reads"),
+        ] {
+            let count = legacy_normalized.matches(routed).count();
+            assert!(
+                count >= at_least,
+                "sst_query_engine.rs: only {count} `{routed}` ({what}) — \
+                 slice 4 routed {at_least}; a routed site regressed"
+            );
+        }
+
+        // The DataFusion adapter reads through the FACTORY's convenience
+        // methods, so it is pinned on the factory call forms (the resident
+        // variants end `_resident` and do not match).
+        let adapter = norm(include_str!(
+            "../../../datafusion/engine_adapters/pax_adapter.rs"
+        ));
+        for direct in [
+            "filesystem_factory.read(",
+            "filesystem_factory.read_range(",
+            "filesystem_factory.read_ranges(",
+            "filesystem_factory.metadata(",
+        ] {
+            let count = adapter.matches(direct).count();
+            assert_eq!(
+                count, 0,
+                "pax_adapter.rs: {count} direct `{direct}` — use the `_resident` factory form"
+            );
         }
     }
 }

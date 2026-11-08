@@ -468,6 +468,13 @@ impl MetadataStoreInterface for MetadataStore {
                         m.insert("storage_engine".to_string(), serde_json::json!(se));
                     }
                     super::catalog_config::write_index_and_quant(config, &mut m)?;
+                    // TD-TIER-1 SC5 residual: the direct-WAL path dropped the
+                    // access tier — serialize it so a read round-trips it.
+                    if let Some(tier) = config.default_access_tier
+                        && tier != 0
+                    {
+                        m.insert("default_access_tier".to_string(), serde_json::json!(tier));
+                    }
                     m
                 },
                 description: Some(format!("Collection {}", config.name)),
@@ -490,7 +497,13 @@ impl MetadataStoreInterface for MetadataStore {
                 let config = CollectionConfig {
                     storage_class: None,
                     policy_generation: None,
-                    default_access_tier: None,
+                    default_access_tier: versioned
+                        .config
+                        .get("default_access_tier")
+                        .and_then(|v| v.as_i64())
+                        .filter(|t| *t != 0)
+                        .map(|t| t as i32),
+                    pool_id: None,
                     name: versioned.name.clone(),
                     embedding_config: None,
                     dimension: versioned.dimension as u32,
@@ -578,6 +591,13 @@ impl MetadataStoreInterface for MetadataStore {
                         m.insert("storage_engine".to_string(), serde_json::json!(se));
                     }
                     super::catalog_config::write_index_and_quant(config, &mut m)?;
+                    // TD-TIER-1 SC5 residual: the direct-WAL path dropped the
+                    // access tier — serialize it so a read round-trips it.
+                    if let Some(tier) = config.default_access_tier
+                        && tier != 0
+                    {
+                        m.insert("default_access_tier".to_string(), serde_json::json!(tier));
+                    }
                     m
                 },
                 description: Some(format!("Collection {}", config.name)),
@@ -614,7 +634,13 @@ impl MetadataStoreInterface for MetadataStore {
                     let config = CollectionConfig {
                         storage_class: None,
                         policy_generation: None,
-                        default_access_tier: None,
+                        default_access_tier: versioned
+                            .config
+                            .get("default_access_tier")
+                            .and_then(|v| v.as_i64())
+                            .filter(|t| *t != 0)
+                            .map(|t| t as i32),
+                        pool_id: None,
                         name: versioned.name.clone(),
                         embedding_config: None,
                         dimension: versioned.dimension as u32,

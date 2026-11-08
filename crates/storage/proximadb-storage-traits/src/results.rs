@@ -141,6 +141,92 @@ impl Default for StorageCompactionResult {
     }
 }
 
+/// The FULL-collapse provenance a `COMPACT ... FULL` result carries
+/// (TD-COMPACT-14/15), extracted once so every API surface (REST, Flight,
+/// DDL) reports the same keys and cannot drift. Fields the engine did not
+/// report (a plain, non-FULL pass) stay `None`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FullCompactionMetrics {
+    pub segments_before: Option<usize>,
+    pub segments_after: Option<usize>,
+    pub passes: Option<usize>,
+    pub reached_target: Option<bool>,
+    pub stop_reason: Option<String>,
+    pub pending_files: Option<usize>,
+    pub bytes_read: Option<u64>,
+    pub bytes_written: Option<u64>,
+    pub duration_ms: Option<u64>,
+    /// The SCOPE of the byte counters, so the wire cannot present a partial
+    /// count as the request's total I/O or vice versa:
+    /// [`FULL_BYTES_SCOPE`] for a FULL collapse — the passes this request's
+    /// own loop executed; worker follow-up merges (floor-bounded ones and
+    /// single-input training rewrites) carry their own output keys and are
+    /// NOT summed, so `bytes_*` is a measured LOWER BOUND. For a PLAIN
+    /// (non-FULL) compaction the top-level canonical fields ARE the whole
+    /// request's I/O: [`PLAIN_BYTES_SCOPE`].
+    pub bytes_scope: Option<String>,
+}
+
+/// The value of [`FullCompactionMetrics::bytes_scope`] for a FULL collapse.
+pub const FULL_BYTES_SCOPE: &str = "request_passes_lower_bound";
+/// The value of [`FullCompactionMetrics::bytes_scope`] for a plain
+/// (non-FULL) compaction whose bytes come from the canonical top-level
+/// fields — the complete I/O of that one request.
+pub const PLAIN_BYTES_SCOPE: &str = "request_total";
+
+impl StorageCompactionResult {
+    /// Extract the FULL provenance from `engine_metrics` (keys written by
+    /// the SST FULL branch). The single extraction point for all surfaces.
+    pub fn full_compaction_metrics(&self) -> FullCompactionMetrics {
+        let metric_u64 = |key: &str| {
+            self.engine_metrics
+                .get(key)
+                .and_then(|value| value.as_u64())
+        };
+        FullCompactionMetrics {
+            segments_before: metric_u64("segments_before").map(|v| v as usize),
+            segments_after: metric_u64("segments_after").map(|v| v as usize),
+            passes: metric_u64("passes").map(|v| v as usize),
+            reached_target: self
+                .engine_metrics
+                .get("reached_target")
+                .and_then(|value| value.as_bool()),
+            stop_reason: self
+                .engine_metrics
+                .get("stop_reason")
+                .and_then(|value| value.as_str().map(str::to_string)),
+            pending_files: metric_u64("pending_files").map(|v| v as usize),
+            // Fall back to the canonical top-level fields: a path that sets
+            // the struct fields but not the engine_metrics map still reports
+            // its measured bytes instead of null. (SST's PLAIN do_compact
+            // sets none of them, so a plain SST compact reports nulls — and
+            // no bytes_scope, per the scope match below.)
+            bytes_read: metric_u64("bytes_read").or(self.bytes_read),
+            bytes_written: metric_u64("bytes_written").or(self.bytes_written),
+            duration_ms: metric_u64("duration_ms").or(self.duration_ms),
+            // The scope follows the SOURCE: engine_metrics keys are written
+            // only by the FULL branch (a partial count); the top-level
+            // fallback is a plain compaction's complete accounting (#2418
+            // review round 17 — labelling a plain result "lower bound" told
+            // operators the number excluded work it included).
+            // Scope is stated ONLY when there are bytes to scope: a plain
+            // SST compaction reports null counters (its do_compact branch
+            // sets none), and "request_total" over nulls is a label with
+            // nothing under it (#2418 review round 18).
+            bytes_scope: match (
+                self.engine_metrics.contains_key("segments_after"),
+                metric_u64("bytes_read")
+                    .or(self.bytes_read)
+                    .or(metric_u64("bytes_written").or(self.bytes_written)),
+            ) {
+                (true, Some(_)) => Some(FULL_BYTES_SCOPE.to_string()),
+                (false, Some(_)) => Some(PLAIN_BYTES_SCOPE.to_string()),
+                (_, None) => None,
+            },
+        }
+    }
+}
+
 /// Engine statistics for monitoring and observability.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct EngineStatistics {

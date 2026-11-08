@@ -12,9 +12,7 @@ use common::integration_test_helpers::{UnifiedTestEnvironment, operations};
 use proximadb::compute::distance_computation::UnifiedDistanceCompute;
 use proximadb::proto::proximadb_v1::StorageEngine;
 use proximadb::storage::engines::sst::SstEngine;
-use proximadb::storage::persistence::filesystem::FilesystemFactory;
 use proximadb::storage::traits::UnifiedStorageEngine;
-use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, info};
 
@@ -54,7 +52,7 @@ async fn test_compression_sparse_data() -> anyhow::Result<()> {
 
     info!("Testing compression on SPARSE data (99% zeros)...");
 
-    let distance_compute = Arc::new(UnifiedDistanceCompute::new(
+    let _distance_compute = Arc::new(UnifiedDistanceCompute::new(
         proximadb::compute::distance_computation::DistanceMetric::Cosine,
     ));
 
@@ -185,7 +183,7 @@ async fn test_compression_dense_data() -> anyhow::Result<()> {
 
     info!("Testing compression on DENSE data (random floats)...");
 
-    let distance_compute = Arc::new(UnifiedDistanceCompute::new(
+    let _distance_compute = Arc::new(UnifiedDistanceCompute::new(
         proximadb::compute::distance_computation::DistanceMetric::Cosine,
     ));
 

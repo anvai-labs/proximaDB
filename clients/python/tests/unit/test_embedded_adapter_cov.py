@@ -1425,6 +1425,39 @@ def test_query_timeseries_vector_fallback():
     assert res["total_points"] == 1
 
 
+def test_query_timeseries_fallback_rejects_explicit_aggregation():
+    """TD-EMB-1: the vector fallback drops aggregation/bucket_ms — an
+    explicit ask must raise the honest signal, not return raw points
+    that look aggregated."""
+    db = FakeDB()  # no query_timeseries -> vector fallback
+    db.get_vectors = lambda cid, ids: []
+    a = make_adapter(db)
+    # default (None) still returns the fallback's raw shape
+    res = a.query_timeseries("tscoll001", "t0", "t5")
+    assert res["implementation"] == "vector_fallback"
+    with pytest.raises(NotImplementedError, match="tag_filters are honored"):
+        a.query_timeseries("tscoll001", "t0", "t5", aggregation="avg")
+    with pytest.raises(NotImplementedError, match="TD-EMB-1"):
+        a.query_timeseries("tscoll001", "t0", "t5", bucket_ms=60)
+
+
+def test_query_timeseries_subprocess_async_guard():
+    """TD-EMB-1 direction 3: the subprocess flavor's query_timeseries is
+    `async def` — the sync adapter must NOT call it (an un-awaited
+    coroutine would be returned as a success-shaped object)."""
+
+    class AsyncFlavor:
+        async def query_timeseries(self, **kwargs):  # pragma: no cover
+            raise AssertionError("must never be awaited from the sync adapter")
+
+    db = FakeDB()
+    db.get_vectors = lambda cid, ids: []
+    db.query_timeseries = AsyncFlavor().query_timeseries
+    a = make_adapter(db)
+    res = a.query_timeseries("tscoll001", "t0", "t5")
+    assert res["implementation"] == "vector_fallback"
+
+
 def test_query_timeseries_exception():
     db = FakeDB()
 

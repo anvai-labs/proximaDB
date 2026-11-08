@@ -9,8 +9,9 @@
 //!   with, unique per publication and ordered by time;
 //! * [`gc_older_generations`]: after version `V` commits, delete the data files
 //!   and the incremental MATERIALIZE's `dv-mat-*` deletion-vector Puffins no
-//!   longer referenced by `V` or `V − 1` (a reader that opened `V − 1` keeps its
-//!   files).
+//!   longer referenced by the retained generations —
+//!   `PROXIMADB_MATERIALIZE_GC_RETAINED_GENERATIONS` total, default 3, so a
+//!   reader that opened `V − 1` or `V − 2` keeps its files (F8).
 
 use std::collections::HashSet;
 
@@ -93,6 +94,16 @@ fn generation_of(file_name: &str) -> Option<&str> {
     let generation = file_name.get(..21)?;
     (generation.starts_with('g') && generation[1..].bytes().all(|b| b.is_ascii_digit()))
         .then_some(generation)
+}
+
+/// The embedded mint clock of a self-minted `dv-live-{ns}.puffin`, in
+/// nanoseconds since the epoch (the name IS the lease token).
+fn dv_live_clock_ns(file_name: &str) -> Option<i64> {
+    file_name
+        .strip_prefix("dv-live-")?
+        .strip_suffix(".puffin")?
+        .parse()
+        .ok()
 }
 
 /// The generation of a `dv-mat-{stem}.puffin` minted by the incremental
@@ -297,20 +308,29 @@ fn sort_batches_with_budget(
     .boxed())
 }
 
-/// Delete the data files under `data_prefix` that the just-committed version
-/// (`keep_current`) and its predecessor (`keep_previous`) do not reference and
-/// that are OLDER than this publication (`current_stem`): an older generation,
-/// or a pre-generation name. This generation's other files (a publisher that
-/// lost the race for this version) and newer ones (a publisher that has not
-/// committed yet) are never touched; see [`generation_stem`]. Returns how many files were
-/// deleted. Best-effort per file: the first failure is returned after every
-/// candidate was attempted.
+/// Delete the data files under `data_prefix` that the retained generations do
+/// not reference and that are OLDER than this publication (`current_stem`): an
+/// older generation, or a pre-generation name. Retention is
+/// `PROXIMADB_MATERIALIZE_GC_RETAINED_GENERATIONS` (default 3, floor 2 — F8):
+/// the caller unions the referenced files of the kept versions into
+/// `keep_older`, so a reader pinned a few quick MATERIALIZEs back keeps its
+/// files. This generation's other files (a publisher that lost the race for
+/// this version) and newer ones (a publisher that has not committed yet) are
+/// never touched; see [`generation_stem`]. F15: self-minted `dv-live-*`
+/// Puffins ride this SAME pass under their own rule — kept by exact-key
+/// membership (an adopted dv-live always survives), otherwise collected
+/// once their mint clock ages past `dv_live_grace` (the lease protecting a
+/// publisher that minted but has not committed; a u64::MAX sentinel keeps
+/// them all). Returns how many files were deleted. Best-effort per file:
+/// the first failure is returned after every candidate was attempted.
 pub(super) async fn gc_older_generations(
     bridge: &dyn ObjectStoreBridge,
     data_prefix: &Path,
     keep_current: &HashSet<String>,
-    keep_previous: &HashSet<String>,
+    keep_older: &HashSet<String>,
     current_stem: &str,
+    dv_live_grace: std::time::Duration,
+    dv_live_now_ns: i64,
 ) -> Result<usize> {
     let current_generation =
         generation_of(current_stem).ok_or_else(|| anyhow!("bad stem {current_stem}"))?;
@@ -319,17 +339,33 @@ pub(super) async fn gc_older_generations(
     let mut first_err = None;
     for key in bridge.list_objects(data_prefix).await? {
         let key_str = key.as_ref();
-        if keep_current.contains(key_str) || keep_previous.contains(key_str) {
+        if keep_current.contains(key_str) || keep_older.contains(key_str) {
             continue;
         }
         let name = key.filename().unwrap_or_default();
-        let older = if key_str.ends_with(".parquet") {
-            generation_of(name).is_none_or(|g| g < current_generation)
+        // F15: self-minted dv-live Puffins ride the SAME listing and the same
+        // kept-membership check (an adopted dv-live — re-carried by any
+        // retained version's manifest — is in the keep sets by exact key);
+        // beyond membership their rule is the lease: collect only past the
+        // grace, never by generation (the generation GC has no ordering for
+        // clock names). A disabled sweep (u64::MAX sentinel) keeps them all.
+        if let Some(clock) = dv_live_clock_ns(name) {
+            if dv_live_grace.as_secs() == u64::MAX {
+                continue;
+            }
+            let age_ns = dv_live_now_ns as i128 - clock as i128;
+            if age_ns < dv_live_grace.as_nanos() as i128 {
+                continue;
+            }
         } else {
-            dv_mat_generation(name).is_some_and(|g| g < current_generation)
-        };
-        if !older {
-            continue;
+            let older = if key_str.ends_with(".parquet") {
+                generation_of(name).is_none_or(|g| g < current_generation)
+            } else {
+                dv_mat_generation(name).is_some_and(|g| g < current_generation)
+            };
+            if !older {
+                continue;
+            }
         }
         match object_store::ObjectStoreExt::delete(store.as_ref(), &bridge.object_store_path(&key))
             .await
@@ -600,6 +636,10 @@ mod tests {
         let names = [
             "part-0.parquet".to_string(),
             format!("{old}-00000.parquet"),
+            // F8: a V-2-era part the caller RETAINS (a reader pinned two
+            // quick MATERIALIZEs back) — must survive; its sibling below is
+            // unreferenced and must not.
+            format!("{old}-00001.parquet"),
             format!("{prev}-00000.parquet"),
             format!("{cur}-00000.parquet"),
             format!("{cur}-00001.parquet"),
@@ -608,7 +648,9 @@ mod tests {
             // Puffins: an unreferenced old dv-mat (collected); an old dv-mat
             // the current snapshot still carries BY REFERENCE (kept); the
             // previous snapshot's (kept); a newer publisher's (kept); the live
-            // publisher's clock-named and a foreign Puffin (never touched).
+            // publisher's clock-named dv-live-17 (aged + unreferenced:
+            // collected by the F15 lease rule) and a foreign Puffin (never
+            // touched).
             format!("dv-mat-{old}.puffin"),
             format!("dv-mat-{ancient}.puffin"),
             format!("dv-mat-{prev}.puffin"),
@@ -625,6 +667,19 @@ mod tests {
             .await
             .unwrap();
         }
+        // F15 seeding: the dv-live fates. `now_ns` is fixed so ages are exact.
+        let now_ns: i64 = 1_700_000_000_000_000_000;
+        let adopted_live = format!("t/data/dv-live-{}.puffin", now_ns - 120_000_000_000);
+        let young_live = format!("t/data/dv-live-{}.puffin", now_ns - 1_000_000_000);
+        for k in [&adopted_live, &young_live] {
+            object_store::ObjectStoreExt::put(
+                store.as_ref(),
+                &bridge.object_store_path(&Path::from(k.as_str())),
+                bytes::Bytes::from_static(b"x").into(),
+            )
+            .await
+            .unwrap();
+        }
         let key = |n: &str| format!("t/data/{n}");
         let current: HashSet<String> = [
             key(&format!("{cur}-00000.parquet")),
@@ -632,16 +687,60 @@ mod tests {
             key(&format!("dv-mat-{ancient}.puffin")),
         ]
         .into();
-        let previous: HashSet<String> = [
+        let older: HashSet<String> = [
             key(&format!("{prev}-00000.parquet")),
             key(&format!("dv-mat-{prev}.puffin")),
+            // F8: a V-2-era part the caller RETAINS survives.
+            key(&format!("{old}-00001.parquet")),
+            // F15: an ADOPTED dv-live — re-carried by a retained version's
+            // manifest — survives by exact-key membership despite an aged
+            // clock (120s > the 60s grace).
+            adopted_live.clone(),
         ]
         .into();
-        let deleted =
-            gc_older_generations(&bridge, &Path::from("t/data"), &current, &previous, &cur)
-                .await
-                .unwrap();
-        assert_eq!(deleted, 3);
+
+        let deleted = gc_older_generations(
+            &bridge,
+            &Path::from("t/data"),
+            &current,
+            &older,
+            &cur,
+            std::time::Duration::from_secs(60),
+            now_ns,
+        )
+        .await
+        .unwrap();
+        // 4 = the three generation deletions (the pre-generation part, the
+        // unreferenced old-generation part, the unreferenced old dv-mat) +
+        // dv-live-17.puffin (clock 17ns: aged out and unreferenced).
+        assert_eq!(deleted, 4);
+
+        let dv_live_left: Vec<String> = bridge
+            .list_objects(&Path::from("t/data"))
+            .await
+            .unwrap()
+            .into_iter()
+            .filter_map(|p| {
+                p.filename()
+                    .is_some_and(|n| n.starts_with("dv-live-"))
+                    .then(|| p.filename().unwrap().to_string())
+            })
+            .collect();
+        let adopted_name = adopted_live.rsplit('/').next().unwrap();
+        let young_name = young_live.rsplit('/').next().unwrap();
+        assert!(
+            dv_live_left.iter().any(|f| f == adopted_name),
+            "adopted: kept by membership despite an aged clock"
+        );
+        assert!(
+            dv_live_left.iter().any(|f| f == young_name),
+            "young: inside the lease"
+        );
+        assert!(
+            !dv_live_left.iter().any(|f| f == "dv-live-17.puffin"),
+            "aged out + unreferenced: collected in the same pass"
+        );
+
         let mut left: Vec<String> = bridge
             .list_objects(&Path::from("t/data"))
             .await
@@ -651,6 +750,7 @@ mod tests {
             .collect();
         left.sort();
         let mut expected = vec![
+            format!("{old}-00001.parquet"),
             format!("{prev}-00000.parquet"),
             format!("{cur}-00000.parquet"),
             format!("{cur}-00001.parquet"),
@@ -659,7 +759,8 @@ mod tests {
             format!("dv-mat-{ancient}.puffin"),
             format!("dv-mat-{prev}.puffin"),
             format!("dv-mat-{newer}.puffin"),
-            "dv-live-17.puffin".to_string(),
+            adopted_name.to_string(),
+            young_name.to_string(),
             "foreign.puffin".to_string(),
         ];
         expected.sort();

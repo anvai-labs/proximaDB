@@ -2,7 +2,6 @@
 mod tests {
     use proximadb_records::{EmbeddingCell, ProximaRecord};
     use std::collections::BTreeMap;
-    use std::sync::Arc;
     use tempfile::NamedTempFile;
 
     fn test_record(id: impl Into<String>, vector: Vec<f32>) -> ProximaRecord {
@@ -37,55 +36,5 @@ mod tests {
         }
 
         assert_eq!(records.len(), 10);
-    }
-
-    /// Regression: SstableWriter MUST NOT emit Vector Object Economy
-    /// directory updates by default. Opt-in is via
-    /// `with_directory_emission`. Flipping this default would silently
-    /// touch the read-side cache for every existing call site — a
-    /// behaviour change masquerading as a no-op refactor.
-    #[tokio::test]
-    async fn sstable_writer_default_does_not_emit_directory() {
-        use crate::storage::engines::sst::SstableWriter;
-        use crate::storage::engines::sst::object_economy_directory::{
-            SstableWriterDirectoryHooks, VectorObjectEconomyDirectoryCache,
-        };
-        use crate::storage::persistence::filesystem::{FilesystemConfig, FilesystemFactory};
-        use proximadb_catalog::CatalogAuthorityMode;
-        use tempfile::TempDir;
-
-        let temp = TempDir::new().unwrap();
-        let fs = Arc::new(
-            FilesystemFactory::create(FilesystemConfig::default())
-                .await
-                .unwrap(),
-        );
-
-        // Default construction: no directory emission configured.
-        let writer = SstableWriter::new_with_config(
-            temp.path().join("test.sst"),
-            64 * 1024,
-            fs.clone(),
-            None,
-        );
-        assert!(
-            !writer.directory_emission_configured(),
-            "freshly-constructed writer must NOT emit directory updates"
-        );
-
-        // Opt in via builder — accessor flips.
-        let cache = Arc::new(VectorObjectEconomyDirectoryCache::new());
-        let writer_opted_in =
-            SstableWriter::new_with_config(temp.path().join("test.sst"), 64 * 1024, fs, None)
-                .with_directory_emission(SstableWriterDirectoryHooks {
-                    cache,
-                    collection_id: "coll".to_string(),
-                    collection_root: "file:///tmp/coll".to_string(),
-                    storage_epoch: 1,
-                    authority_mode: CatalogAuthorityMode::RebuildableProjection,
-                    freshness_lsn: 0,
-                    level: 0,
-                });
-        assert!(writer_opted_in.directory_emission_configured());
     }
 }

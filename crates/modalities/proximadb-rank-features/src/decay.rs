@@ -81,20 +81,11 @@ impl FeatureExecutor for DecayExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proximadb_rank_core::test_support::MapAttributeAccess;
     use proximadb_rank_core::{
-        AttributeAccess, FeatureArena, NoopCandidateData, NoopMetricsSink, NoopModelCache,
-        RankProgram,
+        FeatureArena, NoopCandidateData, NoopMetricsSink, NoopModelCache, RankProgram,
     };
     use std::collections::HashMap;
-
-    struct MapAttrs {
-        values: HashMap<(u32, String), f32>,
-    }
-    impl AttributeAccess for MapAttrs {
-        fn read_f32(&self, doc: DocHandle, field: &str) -> Option<f32> {
-            self.values.get(&(doc.0, field.to_string())).copied()
-        }
-    }
 
     fn build(field: &str, half_life: &str) -> RankProgram {
         let bp = DecayBlueprint;
@@ -109,7 +100,7 @@ mod tests {
         b.build().unwrap()
     }
 
-    fn run(prog: &mut RankProgram, attrs: &MapAttrs, doc: u32) -> f32 {
+    fn run(prog: &mut RankProgram, attrs: &MapAttributeAccess, doc: u32) -> f32 {
         let q = QueryContext::default();
         let arena = FeatureArena::new();
         let (c, m, met) = (NoopCandidateData, NoopModelCache, NoopMetricsSink);
@@ -120,7 +111,7 @@ mod tests {
     #[test]
     fn decay_at_zero_value_is_one() {
         let mut prog = build("hops", "5");
-        let attrs = MapAttrs {
+        let attrs = MapAttributeAccess {
             values: HashMap::from([((1, "hops".into()), 0.0)]),
         };
         assert!((run(&mut prog, &attrs, 1) - 1.0).abs() < 1e-6);
@@ -129,7 +120,7 @@ mod tests {
     #[test]
     fn decay_at_half_life_value_is_half() {
         let mut prog = build("hops", "5");
-        let attrs = MapAttrs {
+        let attrs = MapAttributeAccess {
             values: HashMap::from([((1, "hops".into()), 5.0)]),
         };
         assert!((run(&mut prog, &attrs, 1) - 0.5).abs() < 1e-5);
@@ -138,7 +129,7 @@ mod tests {
     #[test]
     fn decay_at_double_half_life_is_quarter() {
         let mut prog = build("hops", "5");
-        let attrs = MapAttrs {
+        let attrs = MapAttributeAccess {
             values: HashMap::from([((1, "hops".into()), 10.0)]),
         };
         assert!((run(&mut prog, &attrs, 1) - 0.25).abs() < 1e-5);
@@ -147,7 +138,7 @@ mod tests {
     #[test]
     fn decay_missing_returns_zero() {
         let mut prog = build("hops", "5");
-        let attrs = MapAttrs {
+        let attrs = MapAttributeAccess {
             values: HashMap::new(),
         };
         assert_eq!(run(&mut prog, &attrs, 1), 0.0);
@@ -158,7 +149,7 @@ mod tests {
         // Negative attribute → treat as zero (best score) rather than
         // returning > 1.0 which would break the [0,1] contract.
         let mut prog = build("hops", "5");
-        let attrs = MapAttrs {
+        let attrs = MapAttributeAccess {
             values: HashMap::from([((1, "hops".into()), -3.0)]),
         };
         assert!((run(&mut prog, &attrs, 1) - 1.0).abs() < 1e-6);

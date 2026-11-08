@@ -777,6 +777,34 @@ pub async fn tenant_middleware(
     mut req: Request,
     next: Next,
 ) -> Response {
+    // TD-PROBE-1: liveness/readiness probes are EXEMPT from tenant assertion.
+    //
+    // The auth layer (`should_skip_auth`) skips credential extraction for
+    // `/health*`, so no authenticated identity is ever attached to a probe.
+    // This layer then saw a bare assertion and rejected it — 400 with no
+    // header, 403 with a bare `X-Tenant-ID`, and 403 EVEN WITH a valid
+    // tenant-bound credential, because the layer that would have consumed
+    // that credential was skipped. Multi-tenant serving requires a security
+    // coordinator (`validate_listener_security`), so that pair IS the
+    // intended production posture and no Kubernetes liveness probe could pass.
+    //
+    // The exemption reuses the SAME predicate the auth layer routes through
+    // (`is_health_endpoint` — review M1 pointed `should_skip_auth` at it in
+    // this PR), so the two layers agree by construction instead of through
+    // two literal lists that can drift.
+    //
+    // No tenant identity is attached BY THIS LAYER: a probe must never assert
+    // or acquire one, and none of the health handlers need one —
+    // `liveness_check` / `readiness_check` take only `State(AppState)`, and
+    // `/health` (`comprehensive_health_check`) adds only a `Query` extractor.
+    // (`default_tenant_if_unresolved`, applied inside `create_router`, still
+    // backfills a default TenantContext for every route — health included —
+    // harmless: no health-path consumer reads it, and it backstops any inner
+    // consumer that ever starts.)
+    if proximadb_network_middleware::rate_limit::is_health_endpoint(req.uri().path()) {
+        return next.run(req).await;
+    }
+
     // Extract tenant ID
     match extractor.extract_tenant_id(&req) {
         Ok(Some((tenant_id, source))) => {
@@ -1307,11 +1335,11 @@ mod tests {
 
     // Unique tenant ids per test: TENANT_TIERS is a process-global insert-only
     // registry with no removal API, so shared ids would couple tests.
-    const T_OPEN: &str = "tier-test-open-tenant";
-    const T_AUTHD: &str = "tier-test-authd-tenant";
+    const _T_OPEN: &str = "tier-test-open-tenant";
+    const _T_AUTHD: &str = "tier-test-authd-tenant";
     const T_BOUND: &str = "tier-test-bound-tenant";
     const T_GW: &str = "tier-test-gateway-tenant";
-    const T_GW_OK: &str = "tier-test-gateway-ok-tenant";
+    const _T_GW_OK: &str = "tier-test-gateway-ok-tenant";
 
     #[test]
     fn tier_claim_open_records_stamp_for_bare_header() {
@@ -1572,6 +1600,113 @@ mod tests {
         assert_eq!(
             TenantExtractorConfig::single_tenant("t").header_trust,
             HeaderTrustPolicy::Open
+        );
+    }
+
+    // ── TD-PROBE-1: probes reach the handler; the data plane still cannot ──
+
+    /// The strictest realistic posture, via the SAME constructor production
+    /// uses for `mode = "multi_tenant"` (`TenantExtractorConfig::multi_tenant`:
+    /// `default_tenant: None`, `require_tenant: true`, `AuthenticatedOnly`) —
+    /// a bare header assertion is refused; a headerless request is NOT
+    /// silently resolved to a default tenant. A hand-rolled config here once
+    /// kept the default-tenant fallback and the negative test passed 200.
+    fn strict_extractor() -> TenantExtractor {
+        TenantExtractor::with_config(TenantExtractorConfig::multi_tenant())
+    }
+
+    fn probe_app() -> axum::Router {
+        use axum::routing::get;
+        axum::Router::new()
+            .route("/health", get(|| async { "ok" }))
+            .route("/health/live", get(|| async { "ok" }))
+            .route("/health/ready", get(|| async { "ok" }))
+            .route("/metrics/health", get(|| async { "ok" }))
+            .route("/api/v2/collections", get(|| async { "data" }))
+            .layer(axum::middleware::from_fn_with_state(
+                strict_extractor(),
+                tenant_middleware,
+            ))
+    }
+
+    async fn status_of(uri: &str, headers: &[(&str, &str)]) -> StatusCode {
+        use tower::ServiceExt;
+        let mut builder = Request::builder().uri(uri);
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        probe_app()
+            .oneshot(builder.body(axum::body::Body::empty()).expect("request"))
+            .await
+            .expect("response")
+            .status()
+    }
+
+    #[tokio::test]
+    async fn liveness_and_readiness_probes_pass_without_any_headers() {
+        // The k8s contract: no credential, no tenant header, 200 while the
+        // process is live. Pre-fix this was 400 "Tenant ID required".
+        for path in ["/health", "/health/live", "/health/ready"] {
+            assert_eq!(
+                status_of(path, &[]).await,
+                StatusCode::OK,
+                "{path} must answer a bare probe"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn probes_pass_with_a_bare_tenant_header_and_with_a_credential() {
+        // Pre-fix: 403 for the bare header, and 403 AGAIN with a valid
+        // credential (the decisive case — the credential cannot help because
+        // the auth layer skipped extraction for this route).
+        assert_eq!(
+            status_of("/health/live", &[("x-tenant-id", "sc6-perf-a")]).await,
+            StatusCode::OK,
+            "a probe carrying a tenant header is still a probe"
+        );
+        assert_eq!(
+            status_of(
+                "/health/live",
+                &[
+                    ("x-tenant-id", "sc6-perf-a"),
+                    ("authorization", "API-Key probe-key"),
+                ],
+            )
+            .await,
+            StatusCode::OK,
+            "a credentialed probe must not be rejected for asserting a tenant"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_exemption_does_not_widen_into_the_data_plane() {
+        // The guard on the fix: a data route with no credential is still
+        // refused under the same strict posture, and a bare assertion there
+        // is still refused.
+        assert_ne!(
+            status_of("/api/v2/collections", &[]).await,
+            StatusCode::OK,
+            "an uncredentialed data request must not pass"
+        );
+        assert_ne!(
+            status_of("/api/v2/collections", &[("x-tenant-id", "sc6-perf-a")]).await,
+            StatusCode::OK,
+            "a bare tenant assertion must not pass on a data route"
+        );
+    }
+
+    #[tokio::test]
+    async fn metrics_health_is_deliberately_not_a_probe_route() {
+        // `/metrics/health` does NOT start with "/health", so it is outside
+        // `is_health_endpoint` and keeps tenant assertion. TD-PROBE-1 makes no
+        // claim about it (it was never exercised); this pins the boundary so
+        // widening it later is a deliberate, evidenced act.
+        assert!(!proximadb_network_middleware::rate_limit::is_health_endpoint("/metrics/health"));
+        assert_ne!(
+            status_of("/metrics/health", &[]).await,
+            StatusCode::OK,
+            "/metrics/health is not exempted by this fix"
         );
     }
 }

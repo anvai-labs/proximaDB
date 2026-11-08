@@ -69,6 +69,7 @@ fn create_test_collection(
         storage_class_status: None,
         id: collection_id.to_string(),
         config: Some(CollectionConfig {
+            pool_id: None,
             storage_class: None,
             policy_generation: None,
             default_access_tier: None,
@@ -195,6 +196,7 @@ async fn test_insert_flush_compact_flow() {
             collection_id,
             temp_dir.path().to_str().unwrap(),
         )),
+        collection_properties: None,
     };
 
     let flush_result = engine
@@ -230,6 +232,8 @@ async fn test_insert_flush_compact_flow() {
     // Step 3: Run compaction
     debug!("\n🔨 Step 3: Running compaction...");
     let compact_params = CompactionParameters {
+        full_target_segments: None,
+        full: false,
         collection_id: Some(collection_id.to_string()),
         force: true,
         synchronous: true,
@@ -491,6 +495,7 @@ async fn test_basic_compaction() {
                 collection_id,
                 temp_dir.path().to_str().unwrap(),
             )),
+            collection_properties: None,
         };
         debug!("🔄 Flushing batch {} with {} vectors", batch, vector_count);
         let flush_result = engine.do_flush(&flush_params).await.unwrap();
@@ -554,6 +559,8 @@ async fn test_basic_compaction() {
 
     // Run compaction
     let compact_params = CompactionParameters {
+        full_target_segments: None,
+        full: false,
         collection_id: Some(collection_id.to_string()),
         force: true,
         synchronous: true,
@@ -901,6 +908,7 @@ async fn test_concurrent_compaction_and_reads() {
             collection_id,
             temp_dir.path().to_str().unwrap(),
         )),
+        collection_properties: None,
     };
     engine.do_flush(&flush_params).await.unwrap();
 
@@ -929,6 +937,7 @@ async fn test_concurrent_compaction_and_reads() {
                 collection_id,
                 temp_dir.path().to_str().unwrap(),
             )),
+            collection_properties: None,
         };
         engine.do_flush(&flush_params).await.unwrap();
     }
@@ -938,6 +947,8 @@ async fn test_concurrent_compaction_and_reads() {
     let temp_dir_path_for_compact = temp_dir.path().to_str().unwrap().to_string();
     let compact_handle = tokio::spawn(async move {
         let compact_params = CompactionParameters {
+            full_target_segments: None,
+            full: false,
             collection_id: Some(collection_id.to_string()),
             force: true,
             synchronous: true,
@@ -1085,6 +1096,7 @@ async fn test_concurrent_compaction_across_collections() {
             trigger_compaction: false,
             estimated_size: 1024 * 1024, // 1MB estimated
             collection_config: Some(collection.clone()),
+            collection_properties: None,
         };
         engine.do_flush(&flush_params).await.unwrap();
 
@@ -1109,6 +1121,7 @@ async fn test_concurrent_compaction_across_collections() {
                 trigger_compaction: false,
                 estimated_size: 1024 * 1024, // 1MB estimated
                 collection_config: Some(collection.clone()),
+                collection_properties: None,
             };
             engine.do_flush(&flush_params).await.unwrap();
         }
@@ -1126,6 +1139,8 @@ async fn test_concurrent_compaction_across_collections() {
             let collection = create_test_collection(&collection_id_owned, &temp_path);
 
             let compact_params = CompactionParameters {
+                full_target_segments: None,
+                full: false,
                 collection_id: Some(collection_id_owned.clone()),
                 force: true,
                 synchronous: true,
@@ -1216,6 +1231,7 @@ async fn test_atomic_coordinator_prevents_concurrent_same_collection_compaction(
         trigger_compaction: false,
         estimated_size: 1024 * 1024, // 1MB estimated
         collection_config: Some(collection.clone()),
+        collection_properties: None,
     };
     debug!(
         "⚡ Starting flush operation with {} vectors",
@@ -1258,6 +1274,8 @@ async fn test_atomic_coordinator_prevents_concurrent_same_collection_compaction(
         tx1.send(()).unwrap(); // Signal that we're starting
 
         let compact_params = CompactionParameters {
+            full_target_segments: None,
+            full: false,
             collection_id: Some(collection_id_clone1.clone()),
             force: true,
             synchronous: true,
@@ -1298,6 +1316,8 @@ async fn test_atomic_coordinator_prevents_concurrent_same_collection_compaction(
         tx2.send(()).unwrap(); // Signal that we're starting
 
         let compact_params = CompactionParameters {
+            full_target_segments: None,
+            full: false,
             collection_id: Some(collection_id_clone2.clone()),
             force: true,
             synchronous: true,
@@ -1404,12 +1424,15 @@ async fn test_size_tiered_compaction_strategy() {
                 collection_id,
                 temp_dir.path().to_str().unwrap(),
             )),
+            collection_properties: None,
         };
         engine.do_flush(&flush_params).await.unwrap();
     }
 
     // Run size-tiered compaction
     let compact_params = CompactionParameters {
+        full_target_segments: None,
+        full: false,
         collection_id: Some(collection_id.to_string()),
         force: true,
         synchronous: true,
@@ -1537,6 +1560,7 @@ async fn test_compaction_with_metadata_filtering() {
             trigger_compaction: false,
             estimated_size: 1024 * 1024, // 1MB estimated
             collection_config: Some(collection),
+            collection_properties: None,
         };
         engine.do_flush(&flush_params).await.unwrap();
     }
@@ -1556,6 +1580,8 @@ async fn test_compaction_with_metadata_filtering() {
     }
 
     let compact_params = CompactionParameters {
+        full_target_segments: None,
+        full: false,
         collection_id: Some(collection_id.to_string()),
         force: true,
         synchronous: true,
@@ -1741,6 +1767,7 @@ async fn test_incremental_compaction() {
             trigger_compaction: false,
             estimated_size: 1024 * 1024, // 1MB estimated
             collection_config: Some(create_test_collection(collection_id, test_dir)),
+            collection_properties: None,
         };
 
         let flush_result = engine.do_flush(&flush_params).await.unwrap();
@@ -1808,6 +1835,8 @@ async fn test_incremental_compaction() {
     // Run incremental compaction multiple times
     for phase in 0..3 {
         let compact_params = CompactionParameters {
+            full_target_segments: None,
+            full: false,
             collection_id: Some(collection_id.to_string()),
             force: true,
             synchronous: true,

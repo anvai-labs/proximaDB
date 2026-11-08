@@ -95,8 +95,8 @@ pub mod col_id {
     pub const RERANK_BASE: i32 = 1000;
     /// First column ID for the OPTIONAL exact-f32 tier (f32_tier_0, …).
     ///
-    /// Opt-in only (`pax_f32_tier:on` tag / `PROXIMADB_PAX_F32_TIER` env, default
-    /// OFF): when enabled on a RaBitQ collection, the writer ALSO emits the raw
+    /// Default ON for the RaBitQ base (`pax_f32_tier:off` tag / `PROXIMADB_PAX_F32_TIER=0`
+    /// opt out): when enabled on a RaBitQ collection, the writer ALSO emits the raw
     /// f32 embedding at `F32_TIER_BASE + i`. The column is read LAZILY — normal
     /// id+score queries never touch it (zero scan/egress cost); it is decoded
     /// only for an exact final rerank (→ recall ≈ 1.0) or `include_vectors`. This

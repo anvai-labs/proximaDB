@@ -20,11 +20,9 @@ const INSTANCE_ID_PATH: &str = "/latest/meta-data/instance-id";
 
 /// Matches a request that carries no IMDSv2 session-token header.
 fn lacks_session_token(req: &HttpMockRequest) -> bool {
-    !req.headers.as_ref().is_some_and(|headers| {
-        headers
-            .iter()
-            .any(|(name, _)| name.eq_ignore_ascii_case("x-aws-ec2-metadata-token"))
-    })
+    // httpmock 0.9: `headers()` is an `http::HeaderMap`, whose name lookup is
+    // case-insensitive by construction (header names are normalized).
+    !req.headers().contains_key("x-aws-ec2-metadata-token")
 }
 
 #[tokio::test]

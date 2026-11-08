@@ -765,6 +765,10 @@ message V2CollectionConfig {
   // "cool" | "cold"; unset ⇒ the account default. Requires an object-store
   // placement; "archive" is refused. Desired, not observed.
   optional string default_access_tier = 11;
+  // TD-TIER-1 SC6 policy seam: reservation pool id for a PERFORMANCE
+  // collection's grant; unset ⇒ the configured default pool. Must name a
+  // pool in `storage.reservation_pools`.
+  optional string pool_id = 12;
 }
 
 // TD-TIER-1 SC1: observed storage-class status (read-side projection of the
@@ -794,7 +798,9 @@ message V2StorageClassStatus {
 message V2Collection {
   string id = 1;
   V2CollectionConfig config = 2;
+  // Unix epoch MILLISECONDS (TD-COLLTIME-1; normalized on the way out).
   int64 created_at = 3;
+  // Unix epoch MILLISECONDS (TD-COLLTIME-1).
   int64 updated_at = 4;
   // TD-TIER-1 SC1: observed status alongside the echoed desired class in
   // `V2CollectionConfig.storage_class` — desired and observed are distinct.

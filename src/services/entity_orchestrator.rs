@@ -109,7 +109,8 @@ impl EntityOrchestrator {
     /// Auxiliary id (embedding vector / provenance document). The entity **node
     /// id** is the recoverable prefix (split on the last `/`), so fusion results
     /// — which carry only the vector `oid` — project back to the entity node with
-    /// no re-fetch.
+    /// no re-fetch. The `/` delimiter
+    /// matches the codebase's canonical-oid convention (`graph/{id}/node/{id}`).
     pub fn auxiliary_id(collection_id: &str, entity_id: &str, model_id: &str) -> String {
         format!(
             "{}/{model_id}",
@@ -124,7 +125,7 @@ impl EntityOrchestrator {
             .unwrap_or(oid)
     }
 
-    fn str_property(s: impl Into<String>) -> PropertyValue {
+    pub(crate) fn str_property(s: impl Into<String>) -> PropertyValue {
         PropertyValue {
             value: Some(GraphValue::StringValue(s.into())),
         }

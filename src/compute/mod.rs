@@ -542,7 +542,7 @@ pub fn get_hardware_info() -> HardwareInfo {
 #[cfg(test)]
 mod unified_quantization_tests {
     use crate::compute::quantization::types::{
-        BinaryQuantization, NoQuantization, ProductQuantization, QuantizationLevel,
+        BinaryQuantization, NoQuantization, ProductQuantization, QuantizationScheme,
         ScalarQuantization, UnifiedQuantizationLevel, UniformQuantization,
     };
     use std::sync::Once;
@@ -561,7 +561,7 @@ mod unified_quantization_tests {
 
         // Test PQ8 creation
         let pq8 = UnifiedQuantizationLevel {
-            level_type: Some(QuantizationLevel::Pq(ProductQuantization {
+            level_type: Some(QuantizationScheme::Pq(ProductQuantization {
                 bits_per_code: 8,
                 num_subvectors: 16,
                 codebook_id: None,
@@ -570,14 +570,14 @@ mod unified_quantization_tests {
         };
 
         assert!(pq8.level_type.is_some());
-        if let Some(QuantizationLevel::Pq(pq)) = &pq8.level_type {
+        if let Some(QuantizationScheme::Pq(pq)) = &pq8.level_type {
             assert_eq!(pq.bits_per_code, 8);
             assert_eq!(pq.num_subvectors, 16);
         }
 
         // Test Uniform quantization
         let uniform4 = UnifiedQuantizationLevel {
-            level_type: Some(QuantizationLevel::Uniform(UniformQuantization {
+            level_type: Some(QuantizationScheme::Uniform(UniformQuantization {
                 bits: 4,
                 scale: None,
                 offset: None,
@@ -585,20 +585,20 @@ mod unified_quantization_tests {
         };
 
         assert!(uniform4.level_type.is_some());
-        if let Some(QuantizationLevel::Uniform(uniform)) = &uniform4.level_type {
+        if let Some(QuantizationScheme::Uniform(uniform)) = &uniform4.level_type {
             assert_eq!(uniform.bits, 4);
         }
 
         // Test Binary quantization
         let binary = UnifiedQuantizationLevel {
-            level_type: Some(QuantizationLevel::Binary(BinaryQuantization {
+            level_type: Some(QuantizationScheme::Binary(BinaryQuantization {
                 threshold: None,
                 sign_based: false,
             })),
         };
 
         assert!(binary.level_type.is_some());
-        if let Some(QuantizationLevel::Binary(bin)) = &binary.level_type {
+        if let Some(QuantizationScheme::Binary(bin)) = &binary.level_type {
             assert!(!bin.sign_based);
         }
     }
@@ -608,13 +608,13 @@ mod unified_quantization_tests {
         setup_hardware_capabilities();
 
         let none_quant = UnifiedQuantizationLevel {
-            level_type: Some(QuantizationLevel::None(NoQuantization {})),
+            level_type: Some(QuantizationScheme::None(NoQuantization {})),
         };
 
         assert!(none_quant.level_type.is_some());
         assert!(matches!(
             none_quant.level_type,
-            Some(QuantizationLevel::None(_))
+            Some(QuantizationScheme::None(_))
         ));
     }
 
@@ -623,7 +623,7 @@ mod unified_quantization_tests {
         setup_hardware_capabilities();
 
         let scalar = UnifiedQuantizationLevel {
-            level_type: Some(QuantizationLevel::Scalar(ScalarQuantization {
+            level_type: Some(QuantizationScheme::Scalar(ScalarQuantization {
                 bits: 8,
                 scale: 1.0,
                 offset: 0.0,
@@ -632,7 +632,7 @@ mod unified_quantization_tests {
         };
 
         assert!(scalar.level_type.is_some());
-        if let Some(QuantizationLevel::Scalar(s)) = &scalar.level_type {
+        if let Some(QuantizationScheme::Scalar(s)) = &scalar.level_type {
             assert_eq!(s.bits, 8);
         }
     }
@@ -642,7 +642,7 @@ mod unified_quantization_tests {
         setup_hardware_capabilities();
 
         let pq_level = UnifiedQuantizationLevel {
-            level_type: Some(QuantizationLevel::Pq(ProductQuantization {
+            level_type: Some(QuantizationScheme::Pq(ProductQuantization {
                 bits_per_code: 8,
                 num_subvectors: 16,
                 codebook_id: None,
@@ -715,16 +715,16 @@ mod unified_quantization_tests {
         // Test that all quantization levels can be created
         let levels = vec![
             UnifiedQuantizationLevel {
-                level_type: Some(QuantizationLevel::None(NoQuantization {})),
+                level_type: Some(QuantizationScheme::None(NoQuantization {})),
             },
             UnifiedQuantizationLevel {
-                level_type: Some(QuantizationLevel::Binary(BinaryQuantization {
+                level_type: Some(QuantizationScheme::Binary(BinaryQuantization {
                     threshold: None,
                     sign_based: false,
                 })),
             },
             UnifiedQuantizationLevel {
-                level_type: Some(QuantizationLevel::Scalar(ScalarQuantization {
+                level_type: Some(QuantizationScheme::Scalar(ScalarQuantization {
                     bits: 8,
                     scale: 1.0,
                     offset: 0.0,

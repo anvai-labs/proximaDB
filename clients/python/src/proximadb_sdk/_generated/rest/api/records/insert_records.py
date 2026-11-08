@@ -121,13 +121,17 @@ def sync_detailed(
                                 "content": "A detailed product description...",
                                 "storage_hint": "adaptive"
                             }
-                        ],
-                        "source": "catalog_import"
+                        ]
                     }
                 ],
                 "validate_schema": true
             }
             ```
+
+            (A record top level accepts exactly `id`, `vector`, `props` — or its
+            advertised alias `metadata` — and `text_fields`; anything else is a 400
+            naming the unknown field. The example used to show a `"source"` key: it
+            was never a contract field and was silently dropped before TD-REC-1.)
             Not supported in v0.2: optimistic versioning, conditional-write predicates,
             update-by-filter, delete-by-filter, and patch / partial-record update. The
             live contract is exposed via `WriteContractHealth` on the route-health
@@ -204,13 +208,17 @@ def sync(
                                 "content": "A detailed product description...",
                                 "storage_hint": "adaptive"
                             }
-                        ],
-                        "source": "catalog_import"
+                        ]
                     }
                 ],
                 "validate_schema": true
             }
             ```
+
+            (A record top level accepts exactly `id`, `vector`, `props` — or its
+            advertised alias `metadata` — and `text_fields`; anything else is a 400
+            naming the unknown field. The example used to show a `"source"` key: it
+            was never a contract field and was silently dropped before TD-REC-1.)
             Not supported in v0.2: optimistic versioning, conditional-write predicates,
             update-by-filter, delete-by-filter, and patch / partial-record update. The
             live contract is exposed via `WriteContractHealth` on the route-health
@@ -282,13 +290,17 @@ async def asyncio_detailed(
                                 "content": "A detailed product description...",
                                 "storage_hint": "adaptive"
                             }
-                        ],
-                        "source": "catalog_import"
+                        ]
                     }
                 ],
                 "validate_schema": true
             }
             ```
+
+            (A record top level accepts exactly `id`, `vector`, `props` — or its
+            advertised alias `metadata` — and `text_fields`; anything else is a 400
+            naming the unknown field. The example used to show a `"source"` key: it
+            was never a contract field and was silently dropped before TD-REC-1.)
             Not supported in v0.2: optimistic versioning, conditional-write predicates,
             update-by-filter, delete-by-filter, and patch / partial-record update. The
             live contract is exposed via `WriteContractHealth` on the route-health
@@ -363,13 +375,17 @@ async def asyncio(
                                 "content": "A detailed product description...",
                                 "storage_hint": "adaptive"
                             }
-                        ],
-                        "source": "catalog_import"
+                        ]
                     }
                 ],
                 "validate_schema": true
             }
             ```
+
+            (A record top level accepts exactly `id`, `vector`, `props` — or its
+            advertised alias `metadata` — and `text_fields`; anything else is a 400
+            naming the unknown field. The example used to show a `"source"` key: it
+            was never a contract field and was silently dropped before TD-REC-1.)
             Not supported in v0.2: optimistic versioning, conditional-write predicates,
             update-by-filter, delete-by-filter, and patch / partial-record update. The
             live contract is exposed via `WriteContractHealth` on the route-health

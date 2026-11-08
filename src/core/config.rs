@@ -884,6 +884,8 @@ impl Default for StorageConfig {
             metadata_url: "file://./metadata".to_string(),
             assignment_config: AssignmentConfig::default(),
             wal_config: WriteBufferUserConfig::default(),
+            write_lease_ttl_ms: default_write_lease_ttl_ms(),
+            cache_policy: Default::default(),
             prune_mode: None,
             mmap_enabled: true,
             sst_config: Some(SstConfig::default()),
@@ -900,6 +902,20 @@ impl Default for StorageConfig {
 
 pub use proximadb_config::ServerConfig;
 
+fn default_write_lease_ttl_ms() -> u64 {
+    10_000
+}
+
+impl CoreStorageConfig {
+    /// The shared lease renew interval derived from
+    /// [`CoreStorageConfig::write_lease_ttl_ms`]: `ttl / 2`, clamped to 1–5 s.
+    /// The upper bound also covers DML locks and graph node/edge leases,
+    /// whose initial TTL is 10 s even when the writer TTL is raised.
+    pub fn write_lease_renew_interval(&self) -> std::time::Duration {
+        let ttl = self.write_lease_ttl_ms.max(2_000);
+        std::time::Duration::from_millis((ttl / 2).clamp(1_000, 5_000))
+    }
+}
 /// Backwards-compat alias for [`CoreStorageConfig`].
 pub type StorageConfig = CoreStorageConfig;
 
@@ -926,6 +942,28 @@ pub struct CoreStorageConfig {
     pub mmap_enabled: bool,
     /// SST (Sorted String Table) engine configuration
     pub sst_config: Option<SstConfig>,
+    /// Per-collection cache-policy server defaults (TD-COMPACT-2b).
+    /// Overrides the built-in defaults; per-collection properties override
+    /// these. Resolution: collection property > server default > advisor >
+    /// built-in. Example TOML:
+    /// ```toml
+    /// [storage.cache_policy]
+    /// advisor = "shadow"
+    /// [storage.cache_policy.modes]
+    /// index = "warm"
+    /// rerank = "on_demand"
+    /// ```
+    #[serde(default)]
+    pub cache_policy: proximadb_cache::policy::ServerCachePolicy,
+
+    /// Writer-incarnation / partition-lease TTL in milliseconds
+    /// (TD-LEASE-2). The shared renew loop interval is derived as `ttl / 2`,
+    /// clamped to 1–5 s so short-lived resource leases also receive a renewal
+    /// opportunity before expiry. Raise it for workloads whose compaction or
+    /// flush stalls can exceed the default 10 s (observed: a 13 s stall
+    /// lapsed the incarnation and fenced an ingest batch).
+    #[serde(default = "default_write_lease_ttl_ms")]
+    pub write_lease_ttl_ms: u64,
     /// VIPER columnar engine configuration
     pub viper_config: Option<ViperConfig>,
     /// Global read cache size in megabytes
@@ -974,9 +1012,16 @@ impl StorageConfig {
     /// from silently falling back to code defaults while another honors TOML.
     pub fn effective_sst_config(&self) -> SstConfig {
         let mut config = self.sst_config.clone().unwrap_or_default();
-        if config.compaction_config.is_none() {
-            config.compaction_config = Some(self.compaction_config.clone());
-        }
+        // Field-level merge for EVERY field via
+        // `CompactionConfig::merge_section_over` — the section states its
+        // knobs, the top level supplies whatever the section leaves
+        // unstated (TD-COMPACT-15 F1, closed for all 23 fields in
+        // #2418 review round 22; the doc on that function carries the
+        // presence rules and the one residual edge).
+        config.compaction_config = Some(CompactionConfig::merge_section_over(
+            &self.compaction_config,
+            config.compaction_config.as_ref(),
+        ));
         config
     }
 
@@ -1658,7 +1703,10 @@ pub struct SstConfig {
     /// TD-SEARCH-2: inter-file search parallelism degree.
     /// `0` = 50% of CPU cores (wise default — leaves cores for flush/compaction).
     /// `1` = sequential (debugging).
-    /// `n > 1` = exactly n concurrent segment-file scans.
+    /// `n > 1` = enables parallel segment-file scans. NOTE: on the production
+    /// search entry this does not bound concurrency — every live file is
+    /// scanned concurrently (TD-SCANDEG-1); only the test-only arc entry caps
+    /// in-flight scans at n.
     /// Hot-path override: `PROXIMADB_SEARCH_PARALLEL_FILES` env var.
     #[serde(default)]
     pub search_parallel_files: u16,
@@ -1679,8 +1727,11 @@ pub struct SstConfig {
 /// `enable_write_train` is on; search probes the nearest `nprobe` cells when
 /// `enable_read_probe` is on. `nprobe` defaults to the geometric
 /// `ceil(sqrt(ncells) × multiplier)` (sub-linear in corpus: V^0.25; ~56× fewer
-/// ranks than full-scan at 1M), clamped to `[nprobe_min, nprobe_max]`. Env vars
-/// override per-field at call time (see `segment_format.rs`).
+/// ranks than full-scan at 1M), clamped to `[nprobe_min, nprobe_max]`. Env vars:
+/// `PROXIMADB_PAX_READ_COARSE_NPROBE` and `_CENTROID_DIRECTORY_NPROBE`
+/// override per call; the `PROXIMADB_PAX_READ_PROBE_*` policy envs are
+/// SNAPSHOTTED once per settings generation (a live-process change needs a
+/// re-seed; see ENV_GATE_REGISTRY).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CoarseProbeConfig {
     /// READ kill-switch: search probes the A0 coarse directory. Default ON.
@@ -1708,9 +1759,10 @@ pub struct CoarseProbeConfig {
     ///   not a post-change evidence run; the full three-phase harness remains
     ///   the release gate.
     ///
-    /// This is process-global: `coarse_probe_nprobe` takes only `k_c`, with no
-    /// collection or query identity, so there is no per-collection retune
-    /// without a signature change (TD-RDSTRAT-9 tracks the missing controller).
+    /// The formula itself is policy-selected (`algorithm` above —
+    /// TD-RDSTRAT-14); this multiplier scales the root/log forms.
+    /// Per-collection retune arrives with the probe.* property carrier
+    /// (TD-RDSTRAT-14 §Deferred); until then this is process-global.
     /// Operators may lower this only with a representative recall gate.
     #[serde(default = "default_nprobe_multiplier")]
     pub nprobe_multiplier: f32,
@@ -1732,6 +1784,39 @@ pub struct CoarseProbeConfig {
     /// and PCA-conditioning bake. Env: `PROXIMADB_IVF_NCOMP_FLOOR`.
     #[serde(default)]
     pub ncomp_floor: usize,
+    /// TD-RDSTRAT-14: the probe-band ALGORITHM (see
+    /// `proximadb-storage-common::probe_policy`). One of sqrt|cbrt|
+    /// fourth_root|log|fixed|byte_budget. Default "sqrt" — byte-for-byte
+    /// the historical `ceil(sqrt(k_c) × nprobe_multiplier)` behavior; a
+    /// different default requires the recall-gated bed experiment + a
+    /// ledger claim. Fail-closed at load: an unknown name aborts boot.
+    #[serde(default = "default_probe_algorithm")]
+    pub algorithm: String,
+    /// Base per-query probe byte budget for the `byte_budget` form (MiB).
+    /// The root and `log` forms are cell-count functions and ignore it
+    /// (pinned by a unit test). Default 4.
+    #[serde(default = "default_probe_base_mb")]
+    pub base_mb: u64,
+    /// Probe byte cap (MiB; 0 = none). Default 32. Read ONLY by the
+    /// `byte_budget` algorithm — the root/log/fixed forms are cell-count
+    /// functions and ignore it — and it sizes ONE probe pool: on the
+    /// per-segment (filtered) path each segment resolves its own cap, and
+    /// the collection-directory path may exceed it to meet the top-k row
+    /// floor (recall floor beats a cost knob).
+    #[serde(default = "default_probe_cap_mb")]
+    pub cap_mb: u64,
+}
+
+fn default_probe_algorithm() -> String {
+    "sqrt".to_string()
+}
+
+fn default_probe_base_mb() -> u64 {
+    4
+}
+
+fn default_probe_cap_mb() -> u64 {
+    32
 }
 
 /// Cache population performed only after a segment is atomically published.
@@ -1782,7 +1867,74 @@ impl Default for CoarseProbeConfig {
             nprobe_min: default_nprobe_min(),
             nprobe_max: 0,
             ncomp_floor: 0, // TD-IVF-3: disabled until the bake clears it
+            algorithm: default_probe_algorithm(),
+            base_mb: default_probe_base_mb(),
+            cap_mb: default_probe_cap_mb(),
         }
+    }
+}
+
+impl CoarseProbeConfig {
+    /// TD-RDSTRAT-14: fail-closed validation — an unknown algorithm name
+    /// aborts boot with the section and the valid names (never a silent
+    /// fallback to sqrt, the dead-config hazard).
+    pub fn validate(&self, section: &str) -> Result<(), String> {
+        use proximadb_storage_common::probe_policy::{
+            MAX_PROBE_BUDGET_MB, MAX_PROBE_MULTIPLIER, ProbeAlgorithm,
+            experimental_algorithms_enabled,
+        };
+        // Parsed ONCE: the rules below all key on it, and separate parses let
+        // two copies of the same condition drift (#2419 review round 14).
+        let Some(algorithm) = ProbeAlgorithm::parse(&self.algorithm) else {
+            return Err(format!(
+                "{section}.algorithm must be one of sqrt|cbrt|fourth_root|log|fixed|byte_budget (got '{}')",
+                self.algorithm
+            ));
+        };
+        if algorithm.is_experimental() && !experimental_algorithms_enabled() {
+            return Err(format!(
+                "{section}.algorithm = \"{}\" is experimental (no recall@k eval gates it yet, mandate #13); set PROXIMADB_PAX_READ_PROBE_EXPERIMENTAL=1 for bench/staging use, or keep \"sqrt\"",
+                self.algorithm
+            ));
+        }
+        let byte_budget = algorithm == ProbeAlgorithm::ByteBudget;
+        // A NEGATIVE multiplier booted before this module and behaved exactly
+        // like 0 (`ceil(sqrt(k) x -m)` is <= 0, clamped up to nprobe_min), so
+        // it keeps booting with that meaning (round 9). What fails boot is a
+        // multiplier that is NON-FINITE or above MAX_PROBE_MULTIPLIER (1e6):
+        // both used to mean "probe every cell" (the f32 sqrt arm narrows a
+        // huge value to inf), a silent full scan nobody should be running
+        // (pre-GA, deliberate). Use an exact search mode for exhaustive
+        // probing.
+        if !self.nprobe_multiplier.is_finite()
+            || f64::from(self.nprobe_multiplier) > MAX_PROBE_MULTIPLIER
+        {
+            return Err(format!(
+                "{section}.nprobe_multiplier must be a finite number of at most {MAX_PROBE_MULTIPLIER} (got {}); use an exact search mode for exhaustive probing",
+                self.nprobe_multiplier
+            ));
+        }
+        // base_mb / cap_mb are read ONLY by byte_budget, so only byte_budget
+        // fails boot on them (rejecting them under sqrt would fail a boot
+        // over knobs that form never reads). Within byte_budget: the 1 TiB
+        // ceiling every other layer enforces, and a positive base. cap < base
+        // is NOT rejected — the resolver applies the cap after the budget
+        // (cap wins), and the env and property layers accept it.
+        if byte_budget {
+            let max_mb = MAX_PROBE_BUDGET_MB as u64;
+            if self.base_mb > max_mb || self.cap_mb > max_mb {
+                return Err(format!(
+                    "{section}.base_mb/cap_mb must be at most {max_mb} MiB (base_mb={}, cap_mb={})",
+                    self.base_mb, self.cap_mb
+                ));
+            }
+            if self.base_mb == 0 {
+                return Err(format!(
+                    "{section}.base_mb must be positive when algorithm = \"byte_budget\" (got 0)"
+                ));
+            }
+        }
+        Ok(())
     }
 }
 

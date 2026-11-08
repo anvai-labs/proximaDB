@@ -468,6 +468,7 @@ impl RecoveryManager {
             crate::storage::persistence::write_ahead_log::list_collections_from_catalog()
                 .await
                 .into_iter()
+                .map(|meta| meta.collection)
                 .find(|collection| collection.id == collection_id)
                 .and_then(|collection| collection.storage_assignment)
                 .map(|assignment| assignment.base_location);
@@ -1050,6 +1051,19 @@ impl RecoveryManager {
         };
 
         // Create flush parameters with REAL collection config
+        //
+        // TD-TIER-1 SC5 (WAL-recovery residual): suppress compaction until the
+        // WAL retires, mirroring `flush_recovered_range`. Without this hint a
+        // per-file recovery flush that falls back to the minimal config (the
+        // catalog record not resolving mid-recovery) can arm the normal
+        // compaction gate and enqueue an UNTIERED task that wins the
+        // per-collection dedup — its long-lived output then publishes at the
+        // account default instead of the collection's configured tier.
+        let mut hints = HashMap::new();
+        hints.insert(
+            "suppress_compaction_until_wal_retired".to_string(),
+            serde_json::Value::Bool(true),
+        );
         let flush_params = crate::storage::traits::FlushParameters {
             collection_id: Some(file_info.collection_id.clone()),
             collection_config,
@@ -1057,6 +1071,7 @@ impl RecoveryManager {
             synchronous: true,
             vector_records: vectors,
             batch_ids: vec![file_info.batch_id],
+            hints,
             ..Default::default()
         };
 
@@ -1376,10 +1391,28 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn test_recovery_manager_direct_to_storage() {
         let (disk_manager, _flush_coordinator, recovery_manager, temp_dir) =
             create_test_managers().await;
         let collection_id = "test_collection";
+
+        // The global WAL manifest is a process-global singleton whose background
+        // worker is spawned on the runtime of whichever test initialized it. In
+        // the shared `cargo test --lib` process that runtime has usually shut
+        // down by now, leaving every append on a closed channel ("Failed to
+        // send append request"). Re-arm the singleton on THIS test's runtime
+        // (the embedded-mode reset), scoped to this test's temp dir.
+        {
+            let mut wal_config =
+                crate::storage::persistence::write_ahead_log::config::WALConfig::default();
+            wal_config.multi_disk.data_directories =
+                vec![temp_dir.path().to_str().unwrap().to_string()];
+            let _ = crate::storage::persistence::write_ahead_log::manifest::reset().await;
+            crate::storage::persistence::write_ahead_log::manifest::init(&wal_config)
+                .await
+                .expect("re-init global manifest on this test's runtime");
+        }
 
         // Create WAL directory structure for collection
         // Use collection_id directly to match the actual directory structure used by disk_manager
@@ -1389,7 +1422,7 @@ mod tests {
             .expect("Failed to create WAL directory");
 
         // Create a mock storage engine
-        let storage_engine = create_mock_storage_engine();
+        let (storage_engine, _flush_hints) = create_mock_storage_engine();
         recovery_manager
             .register_storage_engine(collection_id, storage_engine.clone())
             .await
@@ -1457,6 +1490,10 @@ mod tests {
             .expect("Failed to get stats");
         assert_eq!(stats.total_vectors_recovered, 3);
         assert_eq!(stats.total_files_recovered, 3);
+
+        // Drop the singleton again: this test's runtime dies with it, and a
+        // leftover service would hand later tests the same closed channel.
+        let _ = crate::storage::persistence::write_ahead_log::manifest::reset().await;
     }
 
     /// Issue #1125 regression: candidate bases must union the catalog-assigned
@@ -1613,8 +1650,13 @@ mod tests {
         drop(primary_dir);
     }
 
-    // Mock storage engine for testing
-    fn create_mock_storage_engine() -> Arc<dyn UnifiedStorageFormat> {
+    // Mock storage engine for testing. Returns the engine and a capture of
+    // every `FlushParameters::hints` map it received, so tests can pin the
+    // recovery-flush contract (e.g. the TD-TIER-1 SC5 suppression hint).
+    fn create_mock_storage_engine() -> (
+        Arc<dyn UnifiedStorageFormat>,
+        Arc<tokio::sync::Mutex<Vec<HashMap<String, serde_json::Value>>>>,
+    ) {
         use crate::storage::persistence::filesystem::{FilesystemConfig, FilesystemFactory};
         use crate::storage::traits::{
             CompactionParameters, CompactionResult, FlushParameters, FlushResult,
@@ -1625,6 +1667,7 @@ mod tests {
 
         struct MockStorageEngine {
             vectors_received: Arc<tokio::sync::Mutex<Vec<proximadb_records::ProximaRecord>>>,
+            flush_hints_received: Arc<tokio::sync::Mutex<Vec<HashMap<String, serde_json::Value>>>>,
             filesystem_factory: FilesystemFactory,
         }
 
@@ -1646,6 +1689,9 @@ mod tests {
                 // Store the vectors we receive during recovery
                 let mut vectors = self.vectors_received.lock().await;
                 vectors.extend(params.vector_records.clone());
+                drop(vectors);
+                let mut hints_seen = self.flush_hints_received.lock().await;
+                hints_seen.push(params.hints.clone());
 
                 Ok(FlushResult {
                     success: true,
@@ -1707,11 +1753,86 @@ mod tests {
                 .expect("Failed to create filesystem factory")
         });
 
-        Arc::new(MockStorageEngine {
+        let hints = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let engine = Arc::new(MockStorageEngine {
             vectors_received: Arc::new(tokio::sync::Mutex::new(Vec::<
                 proximadb_records::ProximaRecord,
             >::new())),
+            flush_hints_received: Arc::clone(&hints),
             filesystem_factory,
-        })
+        });
+        (engine, hints)
+    }
+
+    /// TD-TIER-1 SC5 (WAL-recovery residual): the per-file recovery flush must
+    /// carry the same `suppress_compaction_until_wal_retired` hint as the
+    /// deterministic range path. Without it, a mid-recovery flush whose
+    /// collection record does not resolve (minimal-config fallback) can arm the
+    /// normal compaction gate and enqueue an UNTIERED task that wins the
+    /// per-collection dedup — its long-lived output then lands at the account
+    /// default instead of the collection's configured tier.
+    #[tokio::test]
+    async fn per_file_recovery_flush_suppresses_compaction_until_wal_retired() {
+        use crate::storage::persistence::write_ahead_log::disk_manager::WalFileInfo;
+        use std::collections::HashMap;
+
+        let collection_id = "sc5_suppress_hint_col";
+        let (engine, hints) = create_mock_storage_engine();
+        let mut engines = HashMap::new();
+        engines.insert(collection_id.to_string(), engine);
+        let storage_engines: Arc<
+            tokio::sync::RwLock<HashMap<String, Arc<dyn UnifiedStorageFormat>>>,
+        > = Arc::new(tokio::sync::RwLock::new(engines));
+
+        let disk_manager = {
+            let filesystem_factory = Arc::new(
+                FilesystemFactory::create(FilesystemConfig::default())
+                    .await
+                    .expect("filesystem factory for the unused disk-manager param"),
+            );
+            let dir = tempfile::TempDir::new().expect("temp dir for disk manager");
+            let manager = Arc::new(WriteAheadLogDiskManager::new(
+                filesystem_factory,
+                dir.path().to_str().unwrap(),
+            ));
+            std::mem::forget(dir); // keep the temp root alive for the manager's lifetime
+            manager
+        };
+
+        let file_info = WalFileInfo {
+            collection_id: collection_id.to_string(),
+            batch_id: BatchId::new(),
+            file_url: format!("file:///nonexistent/{collection_id}/wal/batch_000001.wal"),
+            size_bytes: 128,
+            format: SerializationFormat::ProtocolBuffers,
+            encryption_metadata: None,
+            recovery_token: None,
+            global_lsn: 0,
+        };
+
+        // The catalog does not resolve this collection in a unit test, so this
+        // drives exactly the minimal-config fallback the residual describes.
+        RecoveryManager::flush_recovered_vectors(
+            &file_info,
+            Vec::new(),
+            &disk_manager,
+            &storage_engines,
+            RecoveryMode::DirectToStorage,
+            "file:///nonexistent",
+        )
+        .await
+        .expect("recovery flush must succeed against the mock engine");
+
+        let captured = hints.lock().await;
+        assert_eq!(
+            captured.len(),
+            1,
+            "exactly one flush reached the mock engine"
+        );
+        assert_eq!(
+            captured[0].get("suppress_compaction_until_wal_retired"),
+            Some(&serde_json::Value::Bool(true)),
+            "the per-file recovery flush must suppress compaction until the WAL retires"
+        );
     }
 }

@@ -77,9 +77,9 @@
 use nom::{
     IResult,
     branch::alt,
-    bytes::complete::{tag, tag_no_case, take_while, take_while1},
-    character::complete::{alpha1, alphanumeric1, char, digit1, multispace0, multispace1, one_of},
-    combinator::{map, map_res, opt, recognize, value},
+    bytes::complete::{tag, tag_no_case},
+    character::complete::{char, digit1, multispace0, multispace1},
+    combinator::{map, map_res, opt, value},
     error::VerboseError,
     multi::{many0, many1, separated_list0, separated_list1},
     sequence::{delimited, pair, preceded, separated_pair, tuple},
@@ -92,6 +92,9 @@ use crate::query_ast::{
     // TODO: Add other AST types
 };
 use std::collections::HashMap;
+
+// Shared TD-GRAPH-4 lexeme (string literals for the string predicates).
+use proximadb_graph_query::parser::lexemes::string_literal;
 
 // Placeholder types for Cypher AST
 pub type EdgeDirection = crate::query_ast::EdgeDirection;
@@ -831,7 +834,14 @@ impl CypherParser {
         input: &str,
     ) -> Result<CompiledPattern, ProximaDBError> {
         match parse_simple_query(input.trim()) {
-            Ok((_, compiled)) => Ok(compiled),
+            // Full-consumption discipline (TD-GRAPH-4 step 2 — same rule
+            // as the seam's live entry): leftover input is an error, not
+            // silently discarded.
+            Ok((remaining, compiled)) if remaining.trim().is_empty() => Ok(compiled),
+            Ok((remaining, _)) => Err(ProximaDBError::InvalidInput(format!(
+                "Unexpected input remaining after parsing: '{}'",
+                remaining.chars().take(50).collect::<String>()
+            ))),
             Err(e) => Err(ProximaDBError::InvalidInput(format!(
                 "Failed to parse query pattern: {:?}",
                 e
@@ -858,151 +868,22 @@ impl super::QueryParser for CypherParser {
 // NOM PARSER COMBINATORS
 // ============================================================================
 
-/// Parse identifier (variable names, labels, property keys)
-fn identifier(input: &str) -> ParseResult<'_, String> {
-    map(
-        recognize(tuple((
-            alt((alpha1, tag("_"))),
-            many0(alt((alphanumeric1, tag("_")))),
-        ))),
-        String::from,
-    )(input)
-}
-
-/// Parse backtick-quoted identifier
-fn quoted_identifier(input: &str) -> ParseResult<'_, String> {
-    map(
-        delimited(char('`'), take_while1(|c| c != '`'), char('`')),
-        String::from,
-    )(input)
-}
-
-/// Parse any identifier (normal or quoted)
+/// Parse any identifier (bare or backtick-quoted) — the shared
+/// TD-GRAPH-4 lexeme, instantiated with this parser's error type.
 fn any_identifier(input: &str) -> ParseResult<'_, String> {
-    alt((quoted_identifier, identifier))(input)
+    proximadb_graph_query::parser::lexemes::any_identifier(input)
 }
 
-/// Parse string literal (single or double quoted)
-fn string_literal(input: &str) -> ParseResult<'_, String> {
-    alt((
-        map(
-            delimited(char('"'), take_while(|c| c != '"'), char('"')),
-            String::from,
-        ),
-        map(
-            delimited(char('\''), take_while(|c| c != '\''), char('\'')),
-            String::from,
-        ),
-    ))(input)
-}
-
-/// Parse integer literal
-fn integer_literal(input: &str) -> ParseResult<'_, i64> {
-    map_res(recognize(tuple((opt(char('-')), digit1))), |s: &str| {
-        s.parse::<i64>()
-    })(input)
-}
-
-/// Parse float literal
-fn float_literal(input: &str) -> ParseResult<'_, f64> {
-    map_res(
-        recognize(tuple((
-            opt(char('-')),
-            digit1,
-            char('.'),
-            digit1,
-            opt(tuple((one_of("eE"), opt(one_of("+-")), digit1))),
-        ))),
-        |s: &str| s.parse::<f64>(),
-    )(input)
-}
-
-/// Parse boolean literal
-fn boolean_literal(input: &str) -> ParseResult<'_, bool> {
-    alt((
-        value(true, tag_no_case("true")),
-        value(false, tag_no_case("false")),
-    ))(input)
-}
-
-/// Parse null literal
-fn null_literal(input: &str) -> ParseResult<'_, serde_json::Value> {
-    value(serde_json::Value::Null, tag_no_case("null"))(input)
-}
-
-/// Parse a property value (string, number, boolean, null)
+/// Parse a property value (string, float, integer, boolean, null, or
+/// array) — the shared TD-GRAPH-4 lexeme.
 fn property_value(input: &str) -> ParseResult<'_, serde_json::Value> {
-    alt((
-        map(string_literal, serde_json::Value::String),
-        map(float_literal, |f| {
-            serde_json::Value::Number(
-                serde_json::Number::from_f64(f).unwrap_or(serde_json::Number::from(0)),
-            )
-        }),
-        map(integer_literal, |i| {
-            serde_json::Value::Number(serde_json::Number::from(i))
-        }),
-        map(boolean_literal, serde_json::Value::Bool),
-        null_literal,
-        // Array value
-        map(
-            delimited(
-                char('['),
-                separated_list0(
-                    delimited(multispace0, char(','), multispace0),
-                    property_value,
-                ),
-                char(']'),
-            ),
-            serde_json::Value::Array,
-        ),
-    ))(input)
+    proximadb_graph_query::parser::lexemes::property_value(input)
 }
 
 /// Parse property assignment: key: value
-fn property_assignment(input: &str) -> ParseResult<'_, (String, PropertyConstraint)> {
-    map(
-        separated_pair(
-            any_identifier,
-            delimited(multispace0, char(':'), multispace0),
-            property_value,
-        ),
-        |(key, value)| (key, PropertyConstraint::Equals(value)),
-    )(input)
-}
-
-/// Parse property map: {key: value, ...}
+/// Parse property map — the shared TD-GRAPH-4 constraint map.
 fn property_map(input: &str) -> ParseResult<'_, HashMap<String, PropertyConstraint>> {
-    map(
-        delimited(
-            pair(char('{'), multispace0),
-            separated_list0(
-                delimited(multispace0, char(','), multispace0),
-                property_assignment,
-            ),
-            pair(multispace0, char('}')),
-        ),
-        |pairs| pairs.into_iter().collect(),
-    )(input)
-}
-
-/// Parse property value map: {key: value, ...} for CREATE
-fn property_value_map(input: &str) -> ParseResult<'_, HashMap<String, serde_json::Value>> {
-    map(
-        delimited(
-            pair(char('{'), multispace0),
-            separated_list0(
-                delimited(multispace0, char(','), multispace0),
-                separated_pair(
-                    any_identifier,
-                    delimited(multispace0, char(':'), multispace0),
-                    property_value,
-                ),
-            ),
-            pair(multispace0, char('}')),
-        ),
-        |pairs| pairs.into_iter().collect(),
-    )(input)
+    proximadb_graph_query::parser::lexemes::constraint_map(input)
 }
 
 /// Parse labels: :Label1:Label2
@@ -1056,9 +937,14 @@ fn property_constraint_to_value(constraint: PropertyConstraint) -> serde_json::V
         PropertyConstraint::NotEquals(v) => v,
         PropertyConstraint::GreaterThan(v) => v,
         PropertyConstraint::GreaterOrEqual(v) => v,
+        PropertyConstraint::GreaterThanOrEqual(v) => v,
         PropertyConstraint::LessThan(v) => v,
         PropertyConstraint::LessOrEqual(v) => v,
+        PropertyConstraint::LessThanOrEqual(v) => v,
         PropertyConstraint::In(vals) => serde_json::Value::Array(vals),
+        // Unreachable today (constraint maps mint only Equals); if a
+        // future step mints NotIn in maps, this needs a real answer.
+        PropertyConstraint::NotIn(_) => serde_json::Value::Bool(false),
         PropertyConstraint::Contains(s) => serde_json::Value::String(s),
         PropertyConstraint::StartsWith(s) => serde_json::Value::String(s),
         PropertyConstraint::EndsWith(s) => serde_json::Value::String(s),
@@ -1841,477 +1727,37 @@ fn parse_match_clause(input: &str) -> ParseResult<'_, (Vec<NodePattern>, Vec<Edg
     )(input)
 }
 
-/// Parse OPTIONAL MATCH clause
-fn parse_optional_match_clause(
-    input: &str,
-) -> ParseResult<'_, (Vec<NodePattern>, Vec<EdgePattern>)> {
-    preceded(
-        tuple((
-            tag_no_case("OPTIONAL"),
-            multispace1,
-            tag_no_case("MATCH"),
-            multispace1,
-        )),
-        map(
-            separated_list1(
-                delimited(multispace0, char(','), multispace0),
-                alt((
-                    map(parse_path_segment, |(from, edge, to)| {
-                        (vec![from, to], vec![edge])
-                    }),
-                    map(parse_node_pattern, |node| (vec![node], vec![])),
-                )),
-            ),
-            |patterns| {
-                let mut nodes = Vec::new();
-                let mut edges = Vec::new();
-                for (mut ns, mut es) in patterns {
-                    for n in &mut ns {
-                        n.optional = true;
-                    }
-                    for e in &mut es {
-                        e.optional = true;
-                    }
-                    nodes.append(&mut ns);
-                    edges.append(&mut es);
-                }
-                (nodes, edges)
-            },
-        ),
-    )(input)
-}
-
-/// Parse CREATE node spec
-fn parse_create_node_spec(input: &str) -> ParseResult<'_, CreateNodeSpec> {
-    map(
-        delimited(
-            char('('),
-            tuple((
-                preceded(multispace0, opt(any_identifier)),
-                parse_optional_labels,
-                preceded(multispace0, opt(property_value_map)),
-                multispace0,
-            )),
-            char(')'),
-        ),
-        |(var, labels, props, _)| CreateNodeSpec {
-            variable: var,
-            labels,
-            properties: props.unwrap_or_default(),
-        },
-    )(input)
-}
-
 /// Parse CREATE edge spec
 #[allow(clippy::type_complexity)] // Labelled tuple documents the parser shape.
-fn parse_create_edge_spec(
-    input: &str,
-) -> ParseResult<
-    '_,
-    (
-        Option<String>,                     // variable
-        Option<String>,                     // edge type
-        HashMap<String, serde_json::Value>, // properties
-        EdgeDirection,
-    ),
-> {
-    map(
-        tuple((
-            parse_edge_left,
-            delimited(
-                char('['),
-                tuple((
-                    preceded(multispace0, opt(any_identifier)),
-                    opt(preceded(char(':'), any_identifier)),
-                    preceded(multispace0, opt(property_value_map)),
-                    multispace0,
-                )),
-                char(']'),
-            ),
-            parse_edge_right,
-        )),
-        |(left, (var, edge_type, props, _), right)| {
-            let direction = match (left, right) {
-                (false, true) => EdgeDirection::Outgoing,
-                (true, false) => EdgeDirection::Incoming,
-                _ => EdgeDirection::Bidirectional,
-            };
-            (var, edge_type, props.unwrap_or_default(), direction)
-        },
-    )(input)
-}
-
-/// Parse CREATE edge pattern: (a)-[r:TYPE]->(b)
-fn parse_create_edge_pattern(
-    input: &str,
-) -> ParseResult<'_, (CreateNodeSpec, CreateEdgeSpec, CreateNodeSpec)> {
-    map(
-        tuple((
-            parse_create_node_spec,
-            preceded(multispace0, parse_create_edge_spec),
-            preceded(multispace0, parse_create_node_spec),
-        )),
-        |(from_node, (edge_var, edge_type, edge_props, direction), to_node)| {
-            let from_var = from_node
-                .variable
-                .clone()
-                .unwrap_or_else(|| "_from".to_string());
-            let to_var = to_node
-                .variable
-                .clone()
-                .unwrap_or_else(|| "_to".to_string());
-
-            let edge = CreateEdgeSpec {
-                variable: edge_var,
-                from_variable: Some(from_var),
-                to_variable: Some(to_var),
-                edge_type: Some(edge_type.unwrap_or_default()),
-                properties: edge_props,
-                direction,
-            };
-
-            (from_node, edge, to_node)
-        },
-    )(input)
-}
-
-/// Parse CREATE clause
-fn parse_create_clause(input: &str) -> ParseResult<'_, CreateClause> {
-    preceded(
-        pair(tag_no_case("CREATE"), multispace1),
-        map(
-            separated_list1(
-                delimited(multispace0, char(','), multispace0),
-                alt((
-                    map(parse_create_edge_pattern, |(from, edge, to)| {
-                        (vec![from, to], vec![edge])
-                    }),
-                    map(parse_create_node_spec, |node| (vec![node], vec![])),
-                )),
-            ),
-            |patterns| {
-                let mut nodes = Vec::new();
-                let mut edges = Vec::new();
-                for (mut ns, mut es) in patterns {
-                    nodes.append(&mut ns);
-                    edges.append(&mut es);
-                }
-                CreateClause { nodes, edges }
-            },
-        ),
-    )(input)
-}
-
-/// Parse DELETE clause
-fn parse_delete_clause(input: &str) -> ParseResult<'_, DeleteClause> {
-    alt((
-        // DETACH DELETE
-        map(
-            preceded(
-                tuple((
-                    tag_no_case("DETACH"),
-                    multispace1,
-                    tag_no_case("DELETE"),
-                    multispace1,
-                )),
-                separated_list1(
-                    delimited(multispace0, char(','), multispace0),
-                    any_identifier,
-                ),
-            ),
-            |vars| DeleteClause {
-                variables: vars,
-                detach: true,
-            },
-        ),
-        // DELETE
-        map(
-            preceded(
-                pair(tag_no_case("DELETE"), multispace1),
-                separated_list1(
-                    delimited(multispace0, char(','), multispace0),
-                    any_identifier,
-                ),
-            ),
-            |vars| DeleteClause {
-                variables: vars,
-                detach: false,
-            },
-        ),
-    ))(input)
-}
-
-/// Parse SET item
-fn parse_set_item(input: &str) -> ParseResult<'_, SetItem> {
-    alt((
-        // n.prop = value
-        map(
-            tuple((
-                any_identifier,
-                char('.'),
-                any_identifier,
-                delimited(multispace0, char('='), multispace0),
-                property_value,
-            )),
-            |(var, _, prop, _, val)| SetItem::Property {
-                variable: var,
-                property: prop,
-                value: val,
-            },
-        ),
-        // n:Label
-        map(
-            tuple((any_identifier, char(':'), any_identifier)),
-            |(var, _, label)| SetItem::AddLabel {
-                variable: var,
-                label,
-            },
-        ),
-        // n += {props}
-        map(
-            tuple((
-                any_identifier,
-                delimited(multispace0, tag("+="), multispace0),
-                property_value_map,
-            )),
-            |(var, _, props)| SetItem::MergeProperties {
-                variable: var,
-                properties: props,
-            },
-        ),
-        // n = {props}
-        map(
-            tuple((
-                any_identifier,
-                delimited(multispace0, char('='), multispace0),
-                property_value_map,
-            )),
-            |(var, _, props)| SetItem::AllProperties {
-                variable: var,
-                properties: props,
-            },
-        ),
-    ))(input)
-}
-
-/// Parse SET clause
-fn parse_set_clause(input: &str) -> ParseResult<'_, SetClause> {
-    preceded(
-        pair(tag_no_case("SET"), multispace1),
-        map(
-            separated_list1(
-                delimited(multispace0, char(','), multispace0),
-                parse_set_item,
-            ),
-            |items| SetClause { items },
-        ),
-    )(input)
-}
-
-/// Parse REMOVE item
-fn parse_remove_item(input: &str) -> ParseResult<'_, RemoveItem> {
-    alt((
-        // n.prop
-        map(
-            tuple((any_identifier, char('.'), any_identifier)),
-            |(var, _, prop)| RemoveItem::Property {
-                variable: var,
-                property: prop,
-            },
-        ),
-        // n:Label
-        map(
-            tuple((any_identifier, char(':'), any_identifier)),
-            |(var, _, label)| RemoveItem::Label {
-                variable: var,
-                label,
-            },
-        ),
-    ))(input)
-}
-
-/// Parse REMOVE clause
-fn parse_remove_clause(input: &str) -> ParseResult<'_, RemoveClause> {
-    preceded(
-        pair(tag_no_case("REMOVE"), multispace1),
-        map(
-            separated_list1(
-                delimited(multispace0, char(','), multispace0),
-                parse_remove_item,
-            ),
-            |items| RemoveClause { items },
-        ),
-    )(input)
-}
-
-/// Parse MERGE clause
-fn parse_merge_clause(input: &str) -> ParseResult<'_, MergeClause> {
-    map(
-        tuple((
-            preceded(
-                pair(tag_no_case("MERGE"), multispace1),
-                map(
-                    separated_list1(
-                        delimited(multispace0, char(','), multispace0),
-                        alt((
-                            map(parse_path_segment, |(from, edge, to)| {
-                                (vec![from, to], vec![edge])
-                            }),
-                            map(parse_node_pattern, |node| (vec![node], vec![])),
-                        )),
-                    ),
-                    |patterns| {
-                        let mut nodes = Vec::new();
-                        let mut edges = Vec::new();
-                        for (mut ns, mut es) in patterns {
-                            nodes.append(&mut ns);
-                            edges.append(&mut es);
-                        }
-                        MatchPattern {
-                            nodes,
-                            edges,
-                            paths: vec![],
-                            where_clause: None,
-                            where_clauses: vec![],
-                            with_clauses: vec![],
-                        }
-                    },
-                ),
-            ),
-            opt(preceded(
-                tuple((
-                    multispace1,
-                    tag_no_case("ON"),
-                    multispace1,
-                    tag_no_case("CREATE"),
-                    multispace1,
-                )),
-                parse_set_clause,
-            )),
-            opt(preceded(
-                tuple((
-                    multispace1,
-                    tag_no_case("ON"),
-                    multispace1,
-                    tag_no_case("MATCH"),
-                    multispace1,
-                )),
-                parse_set_clause,
-            )),
-        )),
-        |(pattern, on_create, on_match)| MergeClause {
-            pattern,
-            on_create,
-            on_match,
-        },
-    )(input)
-}
-
-/// Parse WITH clause
-fn parse_with_clause(input: &str) -> ParseResult<'_, WithClause> {
-    map(
-        tuple((
-            tag_no_case("WITH"),
-            opt(preceded(multispace1, tag_no_case("DISTINCT"))),
-            multispace1,
-            separated_list1(
-                delimited(multispace0, char(','), multispace0),
-                parse_return_item,
-            ),
-            opt(preceded(multispace1, parse_order_by)),
-            opt(preceded(multispace1, parse_skip)),
-            opt(preceded(multispace1, parse_limit)),
-            opt(preceded(multispace1, parse_where_clause)),
-        )),
-        |(_, distinct, _, items, order_by, skip, limit, where_clause)| {
-            let (_, projections): (Vec<_>, Vec<_>) = items.into_iter().unzip();
-            let order_by_strs: Vec<String> = order_by
-                .unwrap_or_default()
-                .into_iter()
-                .map(|(s, asc)| format!("{}{}", s, if asc { " ASC" } else { " DESC" }))
-                .collect();
-            WithClause {
-                projections,
-                distinct: distinct.is_some(),
-                order_by: order_by_strs,
-                limit,
-                skip,
-                where_clause,
-            }
-        },
-    )(input)
-}
-
 /// Parse a complete Cypher query
 fn parse_cypher_query(input: &str) -> ParseResult<'_, CypherQuery> {
-    map(
-        tuple((
-            // Reading clauses
-            many0(preceded(
-                multispace0,
-                alt((
-                    map(
-                        tuple((
-                            parse_optional_match_clause,
-                            opt(preceded(multispace1, parse_where_clause)),
-                        )),
-                        |((nodes, edges), where_opt)| ReadingClause::Match {
-                            pattern: MatchPattern {
-                                nodes,
-                                edges,
-                                paths: vec![],
-                                where_clause: where_opt,
-                                where_clauses: vec![],
-                                with_clauses: vec![],
-                            },
-                            optional: true,
-                        },
-                    ),
-                    map(
-                        tuple((
-                            parse_match_clause,
-                            opt(preceded(multispace1, parse_where_clause)),
-                        )),
-                        |((nodes, edges), where_opt)| ReadingClause::Match {
-                            pattern: MatchPattern {
-                                nodes,
-                                edges,
-                                paths: vec![],
-                                where_clause: where_opt,
-                                where_clauses: vec![],
-                                with_clauses: vec![],
-                            },
-                            optional: false,
-                        },
-                    ),
-                )),
-            )),
-            // WITH clauses
-            many0(preceded(multispace0, parse_with_clause)),
-            // Updating clauses
-            many0(preceded(
-                multispace0,
-                alt((
-                    map(parse_create_clause, UpdatingClause::Create),
-                    map(parse_delete_clause, UpdatingClause::Delete),
-                    map(parse_set_clause, UpdatingClause::Set),
-                    map(parse_remove_clause, UpdatingClause::Remove),
-                    map(parse_merge_clause, UpdatingClause::Merge),
-                )),
-            )),
-            // Optional RETURN
-            opt(preceded(multispace0, parse_return_clause)),
-            multispace0,
-        )),
-        |(reading_clauses, with_clauses, updating_clauses, return_spec, _)| CypherQuery {
-            clauses: vec![],
-            reading_clauses,
-            updating_clauses,
-            with_clauses,
-            union_clauses: vec![],
-            return_spec,
-        },
-    )(input)
+    // TD-GRAPH-4 step 3: the SEAM grammar is the one parser; this crate's
+    // AST is produced by the conversion layer (seam_conversion), which the
+    // 60-entry pinned corpus gates byte-for-byte against the retired
+    // parser's output.
+    match proximadb_graph_query::parser::write_seam::parse_cypher_query(input) {
+        Ok((remaining, seam_query)) => {
+            if remaining.trim().is_empty() {
+                Ok((
+                    remaining,
+                    crate::seam_conversion::seam_query_to_statement(seam_query),
+                ))
+            } else {
+                Err(nom::Err::Error(nom::error::VerboseError {
+                    errors: vec![(
+                        remaining,
+                        nom::error::VerboseErrorKind::Nom(nom::error::ErrorKind::Eof),
+                    )],
+                }))
+            }
+        }
+        Err(_) => Err(nom::Err::Error(nom::error::VerboseError {
+            errors: vec![(
+                input,
+                nom::error::VerboseErrorKind::Nom(nom::error::ErrorKind::Tag),
+            )],
+        })),
+    }
 }
 
 /// Parse simple MATCH query into CompiledPattern
@@ -2426,20 +1872,26 @@ impl CypherVisitor for QueryValidator {
 // GRAPH QUERY CONVERSION
 // ============================================================================
 
-/// GraphQuery represents an executable graph query
+/// ExecutableGraphQuery represents an executable graph query (renamed
+/// from GraphQuery 2026-11-07: three same-named types in one crate made
+/// the crate's public GraphQuery ambiguous — this one is the executable
+/// envelope built by cypher_to_graph_query)
 #[derive(Debug, Clone)]
-pub struct GraphQuery {
+pub struct ExecutableGraphQuery {
     /// Graph ID to execute against
     pub graph_id: String,
     /// Query type
-    pub query_type: GraphQueryType,
+    pub query_type: ExecutableGraphQueryType,
     /// Query parameters
     pub parameters: HashMap<String, serde_json::Value>,
     /// Timeout in milliseconds
     pub timeout_ms: Option<u64>,
 }
 
-/// Types of graph queries.
+/// Types of executable graph queries (the parsed Cypher statement opcode).
+///
+/// Renamed from `GraphQueryType` 2026-11-07 to complete the #2447 disambiguation:
+/// `query::GraphQueryType` (the traversal algorithm selector) shared the name.
 ///
 /// The MATCH variant carries a much heavier payload than the others
 /// (multiple `Pattern`/`Constraint`/`Order` lists). Boxing it would
@@ -2448,7 +1900,7 @@ pub struct GraphQuery {
 /// settled. See `clippy::large_enum_variant`.
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
-pub enum GraphQueryType {
+pub enum ExecutableGraphQueryType {
     /// Read-only pattern match
     Match {
         /// Patterns to match in the graph
@@ -2496,11 +1948,11 @@ pub enum GraphQueryType {
     },
 }
 
-/// Convert CypherQuery AST to executable GraphQuery
+/// Convert CypherQuery AST to an executable ExecutableGraphQuery
 pub fn cypher_to_graph_query(
     cypher: &CypherQuery,
     graph_id: &str,
-) -> Result<GraphQuery, ProximaDBError> {
+) -> Result<ExecutableGraphQuery, ProximaDBError> {
     // Stub implementation - full conversion not yet implemented
     let patterns = cypher
         .reading_clauses
@@ -2511,9 +1963,9 @@ pub fn cypher_to_graph_query(
         })
         .collect();
 
-    Ok(GraphQuery {
+    Ok(ExecutableGraphQuery {
         graph_id: graph_id.to_string(),
-        query_type: GraphQueryType::Match {
+        query_type: ExecutableGraphQueryType::Match {
             patterns,
             return_spec: cypher.return_spec.clone().unwrap_or_else(|| ReturnSpec {
                 items: vec![],
@@ -2533,6 +1985,63 @@ pub fn cypher_to_graph_query(
 // ============================================================================
 // TESTS
 // ============================================================================
+
+#[deprecated(
+    since = "0.5.1",
+    note = "renamed ExecutableGraphQuery 2026-11-07 (three same-named GraphQuery types in one crate); alias kept for source compatibility"
+)]
+pub type GraphQuery = ExecutableGraphQuery;
+
+#[deprecated(
+    since = "0.5.1",
+    note = "renamed ExecutableGraphQueryType 2026-11-07 (shadowed query::GraphQueryType, the traversal selector); alias kept for source compatibility"
+)]
+pub type GraphQueryType = ExecutableGraphQueryType;
+
+#[cfg(test)]
+mod step2_decisions {
+    use super::*;
+
+    #[test]
+    fn null_rejected_in_match_maps_but_not_create() {
+        let p = CypherParser::new();
+        assert!(p.parse("MATCH (n {x: null}) RETURN n").is_err());
+        // CREATE still accepts null (set-to-null).
+        assert!(p.parse("CREATE (n:Person {x: null})").is_ok());
+    }
+
+    #[test]
+    fn oversized_float_fails_not_zero() {
+        let p = CypherParser::new();
+        assert!(p.parse("CREATE (n:Person {v: 1.0e999})").is_err());
+        assert!(p.parse("CREATE (n:Person {v: 1.5e2})").is_ok());
+    }
+
+    #[test]
+    fn null_decision_scope_pinned() {
+        // The null rejection is CONSTRAINT-MAP position only. The other
+        // forms are deliberately left as-is (step-2 scope decision,
+        // recorded in TD-GRAPH-4):
+        let p = CypherParser::new();
+        // (a) WHERE n.x = null: still accepted (a separate code path —
+        // comparison parsing, not the map). Downstream it evaluates as
+        // an accidental IS NULL (matches only nodes missing the
+        // property); deciding its real semantics is clause-by-clause
+        // step work.
+        assert!(p.parse("MATCH (n) WHERE n.x = null RETURN n").is_ok());
+        // (b) MERGE maps REJECT null — they route through the constraint
+        // map even though MERGE is write-shaped (Cypher-correct; Neo4j
+        // rejects null in MERGE patterns too). CREATE/SET (true write
+        // paths) still accept it.
+        assert!(p.parse("MERGE (n:Person {x: null})").is_err());
+        assert!(p.parse("CREATE (n:Person {x: null})").is_ok());
+        // (c) [null] in a constraint map passes the TOP-LEVEL check —
+        // pinned as-is: the effect downstream is an empty result (0
+        // rows), NOT the unconstrained-scan hazard the map rejection
+        // targets; storage cannot hold nulls in arrays.
+        assert!(p.parse("MATCH (n {x: [null]}) RETURN n").is_ok());
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -2562,10 +2071,10 @@ mod tests {
     fn test_lexer_numbers() {
         let mut lexer = CypherLexer::new();
         let tokens = lexer
-            .tokenize("42 3.14 -5")
+            .tokenize("42 2.5 -5")
             .expect("lexer should tokenize numbers");
         assert!(matches!(tokens[0].token, Token::Integer(42)));
-        assert!(matches!(tokens[1].token, Token::Float(f) if (f - 3.14).abs() < 0.001));
+        assert!(matches!(tokens[1].token, Token::Float(f) if (f - 2.5).abs() < 1e-9));
         assert!(matches!(tokens[2].token, Token::Integer(-5)));
     }
 
@@ -2710,7 +2219,7 @@ mod tests {
         assert_eq!(graph_query.graph_id, "test_graph");
         assert!(matches!(
             graph_query.query_type,
-            GraphQueryType::Match { .. }
+            ExecutableGraphQueryType::Match { .. }
         ));
     }
 

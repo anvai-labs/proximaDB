@@ -1008,18 +1008,28 @@ impl ProximaFlightService {
             .read_collection_file(&collection, &file_ticket.file_path)
     }
 
-    async fn trigger_collection_compaction(&self, collection_id: &str) -> Result<()> {
+    /// TD-COMPACT-14/15: run (FULL) compaction and return the engine result
+    /// so the action payload carries provenance — segment counts, passes,
+    /// stop reason and measured bytes — instead of a bare success flag.
+    async fn trigger_collection_compaction(
+        &self,
+        collection_id: &str,
+        full: bool,
+        target_segments: Option<usize>,
+    ) -> Result<proximadb_storage_traits::CompactionResult> {
         let collection = self
             .collection_service
             .collection(collection_id)
             .await?
             .with_context(|| format!("Collection not found: {collection_id}"))?;
         let storage_engine = self.vector_operations_service.unified_engine();
+        // TD-COMPACT-14: `full` collapses across levels toward
+        // `[storage.compaction_config] full_target_segments` unless the
+        // request overrides it (TD-COMPACT-15 Experiment 3).
         storage_engine
-            .compact_collection(&collection.id, Some(&collection))
+            .compact_collection_full(&collection.id, Some(&collection), full, target_segments)
             .await
-            .with_context(|| format!("Failed to compact collection '{}'", collection_id))?;
-        Ok(())
+            .with_context(|| format!("Failed to compact collection '{}'", collection_id))
     }
 
     fn insert_request_conflict_result(
@@ -1839,7 +1849,7 @@ impl FlightService for ProximaFlightService {
                 collection_id = %write_target,
                 "Arrow Flight: triggering compaction after DoPut"
             );
-            self.trigger_collection_compaction(&write_target)
+            self.trigger_collection_compaction(&write_target, false, None)
                 .await
                 .map_err(|e| TonicStatus::internal(format!("Compaction failed: {}", e)))?;
         }
@@ -1954,6 +1964,7 @@ impl FlightService for ProximaFlightService {
                     storage_class: None,
                     policy_generation: None,
                     default_access_tier: None,
+                    pool_id: None,
                     name: name.to_string(),
                     embedding_config: None,
                     dimension,
@@ -2032,13 +2043,25 @@ impl FlightService for ProximaFlightService {
 
                 info!(collection_id = %collection_id, "Arrow Flight: delete_collection");
 
-                // Delete collection via service
-                self.collection_service
+                // Delete collection via service, reporting the real outcome
+                // (the response used to be ignored: every drop said success).
+                let response = self
+                    .collection_service
                     .delete_collection_with_tenant_context(collection_id, Some(&tenant_context))
                     .await
                     .map_err(|e| {
                         TonicStatus::internal(format!("Failed to delete collection: {}", e))
                     })?;
+                match crate::services::collection::manager::delete_outcome(collection_id, &response)
+                {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        return Err(TonicStatus::not_found(format!(
+                            "Collection '{collection_id}' not found"
+                        )));
+                    }
+                    Err(error) => return Err(TonicStatus::unavailable(error.to_string())),
+                }
 
                 let result_bytes = serde_json::to_vec(&serde_json::json!({
                     "success": true,
@@ -2485,7 +2508,7 @@ impl FlightService for ProximaFlightService {
             }
 
             "compact_collection" => {
-                // Body: {"collection_id": "..."}
+                // Body: {"collection_id": "...", "full": bool} (TD-COMPACT-14)
                 let params: serde_json::Value =
                     serde_json::from_slice(&action.body).map_err(|e| {
                         TonicStatus::invalid_argument(format!("Invalid JSON body: {}", e))
@@ -2514,18 +2537,83 @@ impl FlightService for ProximaFlightService {
                     )));
                 }
 
-                self.trigger_collection_compaction(collection_id)
+                // A present `full` must be a boolean: `"true"` or `1` used to
+                // become a silent plain compaction reporting success — the
+                // accepted-then-dropped knob this action refuses for
+                // target_segments (#2418 review round 14). Absent/null = false.
+                let full = match params.get("full") {
+                    None | Some(serde_json::Value::Null) => false,
+                    Some(serde_json::Value::Bool(value)) => *value,
+                    Some(other) => {
+                        return Err(TonicStatus::invalid_argument(format!(
+                            "full must be a boolean, got {other}"
+                        )));
+                    }
+                };
+                // TD-COMPACT-15 Experiment 3: optional per-request override
+                // of the FULL collapse target. Validated fail-closed — an
+                // invalid value (0, non-integer) is rejected, NOT silently
+                // ignored: a swallowed 0 would fall back to the config
+                // default (full collapse) and do the MAXIMUM write
+                // amplification while reporting success.
+                let target_segments = match params.get("target_segments") {
+                    None | Some(serde_json::Value::Null) => None,
+                    Some(value) => {
+                        let parsed = value.as_u64().filter(|t| *t > 0).ok_or_else(|| {
+                            TonicStatus::invalid_argument(format!(
+                                "target_segments must be a positive integer, got {value}"
+                            ))
+                        })?;
+                        Some(parsed as usize)
+                    }
+                };
+                // Same fail-closed reasoning as rejecting 0: a knob accepted
+                // and then discarded by the non-full delegation would report
+                // success for work that never happened. REST rejects this
+                // combination, so Flight must too or the surfaces disagree.
+                if target_segments.is_some() && !full {
+                    return Err(TonicStatus::invalid_argument(
+                        "target_segments requires \"full\": true (it bounds the \
+                         cross-level collapse)",
+                    ));
+                }
+                let compaction = self
+                    .trigger_collection_compaction(collection_id, full, target_segments)
                     .await
                     .map_err(|e| {
                         TonicStatus::internal(format!("Failed to compact collection: {}", e))
                     })?;
 
-                let result_bytes = serde_json::to_vec(&serde_json::json!({
+                // TD-COMPACT-15 provenance: the payload carries what the
+                // engine did (segment counts, passes, measured bytes) and
+                // why it stopped — a FULL that stops at `max_passes` still
+                // reports success, so the reason is the load-bearing field.
+                // Extracted once (`full_compaction_metrics`) so REST, Flight
+                // and DDL cannot drift apart.
+                // The metrics keys come from serializing the STRUCT (not a
+                // hand-enumerated copy) merged flat into the payload — a new
+                // field on FullCompactionMetrics reaches this payload
+                // automatically, and the wire shape stays flat for the
+                // harness + e2e contract.
+                let metrics =
+                    serde_json::to_value(compaction.full_compaction_metrics()).map_err(|e| {
+                        TonicStatus::internal(format!("Failed to serialize result: {}", e))
+                    })?;
+                let mut payload = serde_json::json!({
                     "success": true,
                     "collection_id": collection_id,
-                    "operation": "compact"
-                }))
-                .map_err(|e| TonicStatus::internal(format!("Failed to serialize result: {}", e)))?;
+                    "operation": "compact",
+                    "full": full,
+                });
+                if let (Some(fields), Some(object)) = (metrics.as_object(), payload.as_object_mut())
+                {
+                    for (key, value) in fields {
+                        object.insert(key.clone(), value.clone());
+                    }
+                }
+                let result_bytes = serde_json::to_vec(&payload).map_err(|e| {
+                    TonicStatus::internal(format!("Failed to serialize result: {}", e))
+                })?;
 
                 let result = arrow_flight::Result {
                     body: result_bytes.into(),
@@ -2542,6 +2630,38 @@ impl FlightService for ProximaFlightService {
                     serde_json::from_slice(&action.body).map_err(|e| {
                         TonicStatus::invalid_argument(format!("Invalid JSON body: {}", e))
                     })?;
+
+                // TD-COMPACT-15: this action runs a flush plus ONE plain
+                // policy morsel and has no FULL mode. Reject the FULL knobs
+                // instead of ignoring them — the sibling `compact_collection`
+                // arm fail-closes on the same inputs, and accepting them here
+                // returned `success: true` for a collapse that never ran.
+                // Reject a MEANINGFUL value, not the mere presence of the
+                // key: a client that always serializes the field sends
+                // `"full": false` (semantically "no collapse" — exactly what
+                // this action does) and an explicit `"target_segments": null`
+                // reads as Some(Value::Null) from `Map::get`. The sibling
+                // `compact_collection` arm already treats null as absent, so
+                // a presence check made the two arms disagree on one input.
+                // A present non-boolean `full` ("true", 1) is refused like
+                // the sibling compact_collection arm refuses it, instead of
+                // being read as "no collapse" and reporting success (#2418
+                // review round 15). Absent / null / false = no FULL.
+                let asks_for_full = match params.get("full") {
+                    None | Some(serde_json::Value::Null) => false,
+                    Some(serde_json::Value::Bool(value)) => *value,
+                    Some(other) => {
+                        return Err(TonicStatus::invalid_argument(format!(
+                            "full must be a boolean, got {other}"
+                        )));
+                    }
+                };
+                let asks_for_target = params.get("target_segments").is_some_and(|v| !v.is_null());
+                if asks_for_full || asks_for_target {
+                    return Err(TonicStatus::invalid_argument(
+                        "flush_and_compact does not support full/target_segments: it runs a flush plus one plain policy morsel. Use the compact_collection action for a FULL collapse",
+                    ));
+                }
 
                 let collection_id = params
                     .get("collection_id")
@@ -2574,7 +2694,7 @@ impl FlightService for ProximaFlightService {
                         TonicStatus::internal(format!("Failed to flush collection: {}", e))
                     })?;
 
-                self.trigger_collection_compaction(collection_id)
+                self.trigger_collection_compaction(collection_id, false, None)
                     .await
                     .map_err(|e| {
                         TonicStatus::internal(format!("Failed to compact collection: {}", e))

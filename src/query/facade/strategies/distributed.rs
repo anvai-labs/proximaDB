@@ -819,7 +819,7 @@ mod tests {
     }
 
     struct MockStorageEngine {
-        filesystem_factory: FilesystemFactory,
+        _filesystem_factory: FilesystemFactory,
     }
 
     impl MockStorageEngine {
@@ -827,7 +827,9 @@ mod tests {
             let filesystem_factory = FilesystemFactory::create(FilesystemConfig::default())
                 .await
                 .expect("mock filesystem factory should initialize");
-            Self { filesystem_factory }
+            Self {
+                _filesystem_factory: filesystem_factory,
+            }
         }
     }
 

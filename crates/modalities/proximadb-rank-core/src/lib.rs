@@ -17,6 +17,8 @@ pub mod error;
 pub mod executor;
 pub mod pipeline;
 pub mod program;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
 pub mod types;
 
 pub use arena::FeatureArena;

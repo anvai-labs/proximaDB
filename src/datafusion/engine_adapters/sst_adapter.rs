@@ -247,10 +247,12 @@ impl SstTableProvider {
                     records_per_block,
                 );
 
-                // Add bloom filter indicator
-                if file.has_bloom_filter {
-                    split.statistics.bloom_filter = Some(vec![]); // Placeholder - actual filter read at runtime
-                }
+                // Bloom filter bytes are NOT attached here. This used to set
+                // `Some(vec![])` when `file.has_bloom_filter`, but an empty
+                // `Some` is not `None` to a downstream pruner: a consumer that
+                // checks `.is_some()` before pruning sees a filter that matches
+                // nothing. `None` honestly means "no filter available at plan
+                // time"; see TD-FACADE-1.
 
                 // Copy column statistics if available
                 if !file.column_stats.is_empty() {

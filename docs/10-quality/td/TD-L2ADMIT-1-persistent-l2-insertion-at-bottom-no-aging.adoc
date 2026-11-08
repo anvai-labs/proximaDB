@@ -1,0 +1,37 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-L2ADMIT-1: The persistent L2 store inserts at the bottom with no aging, so it can stop admitting a new working set
+:status: Open
+:date: 2026-11-07
+:tags: [cache, l2, eviction, cost, design-decision-needed]
+
+== Verified facts (develop, `crates/foundation/proximadb-cache/src/persistent_l2.rs`)
+
+* New entries (`put`, `put_file_range`) and entries restored at open are
+  indexed at `touch = 1`. Reads (and, since TD-IOBUDGET-3, residency
+  classification) stamp a clock tick; ticks never decay.
+* `evict_blocking` runs after every put and evicts `min_by_key((class,
+  touch))` among unprotected entries.
+* So once every resident entry has been read at least once, a newly put entry
+  is the unique minimum and is evicted by its own `evict_blocking` — the
+  store keeps entries read once long ago and refuses the new working set.
+  Every later query for the new working set misses L2 and pays billed GETs.
+* This is LRU with insertion at the bottom (LIP) and no aging. Insertion at
+  the bottom is deliberate and valuable (scan resistance: never-read
+  flush/compaction seeds must not evict hot entries — an earlier attempt to
+  insert at the top was rejected in TD-IOBUDGET-3 review for exactly that).
+  The missing piece is aging.
+
+== Options (measure on a churn bed before choosing)
+
+1. Bimodal insertion (BIP): insert at the top with small probability.
+2. Age read ticks: e.g. halve or rebase touches when the clock passes a
+   window, so stale-but-once-read entries eventually fall below new ones.
+3. Two-queue admission (probation + protected segments, as in S3-FIFO /
+   2Q): a new entry must be read once in probation to be promoted.
+
+The gate is a per-query trace on a working-set-shift bed: L2 hit rate and
+billed GETs after the shift, with seeds churning, against develop.
+
+Related: TD-IOBUDGET-3, TD-SCANDEG-3, TD-TIER-1 (protection groups are
+exempt from ordinary pressure and unaffected).

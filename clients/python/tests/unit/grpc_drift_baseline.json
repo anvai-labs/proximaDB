@@ -10,13 +10,15 @@
     "missing-servicer:proto/proximadb/v1/ranking.proto::RankService",
     "missing-servicer:proto/proximadb/v1/security.proto::SecurityService",
     "missing-servicer:proto/proximadb/v1/streaming.proto::StreamingService",
+    "missing-servicer:proto/proximadb/v2/ledger.proto::ProximaLedgerService",
+    "missing-servicer:proto/proximadb/v2/model_registry.proto::ProximaModelRegistryService",
     "missing-stub:proto/proximadb/v1/catalog.proto",
     "missing-stub:proto/proximadb/v1/cluster.proto",
     "missing-stub:proto/proximadb/v1/observability.proto",
     "missing-stub:proto/proximadb/v1/ranking.proto",
     "missing-stub:proto/proximadb/v1/security.proto",
     "missing-stub:proto/proximadb/v1/streaming.proto",
-    "missing-servicer:proto/proximadb/v2/ledger.proto::ProximaLedgerService",
-    "missing-stub:proto/proximadb/v2/ledger.proto"
+    "missing-stub:proto/proximadb/v2/ledger.proto",
+    "missing-stub:proto/proximadb/v2/model_registry.proto"
   ]
 }

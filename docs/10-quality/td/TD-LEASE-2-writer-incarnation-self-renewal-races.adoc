@@ -1,0 +1,113 @@
+= TD-LEASE-2: writer-incarnation self-renewal races
+:status: Accepted
+:date: 2026-11-01
+:tags: [lease, wal, availability]
+
+== Problem
+
+A single-node server under heavy ingest rejected whole write batches:
+`"writer incarnation is fenced; rejecting WAL write"` — observed at
+1.8M/3M rows (9.4k vectors/s) on the f32-evidence bench, 2026-11-01.
+
+The durable manifest log (86 versions, decoded) reconstructs the failure
+exactly: a 13 s compaction stall made the 5 s renew loop miss two ticks →
+the cached writer incarnation expired → the late renew tick
+(`acquire_with_key` = same-generation renewal) and the write path's
+`begin_writer_incarnation` (always bumps) committed to the same lease-log
+key in the same millisecond → the begin lost the `put_if_absent` CAS →
+the Conflict arm mapped the loss to `Fenced{latest}` with
+`latest.holder_pod == self` → the whole 400-row batch was rejected.
+**A pure same-pod race; no foreign pod was ever involved.**
+
+Three stacked defects:
+
+1. *Conflict arms conflated foreign fencing with same-pod races.* Both
+   `acquire_with_key` and `begin_writer_incarnation_with_key` returned
+   `Fenced` for ANY CAS loss — including a loss to a concurrent batch or
+   renew tick on this same pod.
+2. *The renew branch renewed an EXPIRED self-lease at the same
+   generation* (no liveness check) — a same-generation re-commit
+   self-conflicts via `put_if_absent` and adopts a dead lease.
+3. *`ensure_owned`'s registry fast path answered "owned" with NO expiry
+   check* — violating ADR-063 D4's explicit "the registry fast path must
+   not keep answering 'owned' after renewal errors".
+
+== Fix
+
+ONE rule, one resolver, both store paths: *claim-after-death always
+bumps; live-self always renews; only a LIVE FOREIGN holder fences.*
+
+* `ConflictResolution { Adopted, Retry, Fenced }` +
+  `resolve_incarnation_conflict(latest, holder, now_ms, attempted)`:
+  own-pod live → **Adopted** (write under the winner's generation — a
+  same-pod race is a renewal, never a displacement); ANY expired winner
+  (own or foreign — the slow-commit pathology where a racer's read→commit
+  outlives the TTL makes dead-foreign reachable) → **Retry** (one bounded
+  retry of the whole read→decide→commit; the retry takes the takeover
+  branch and bumps; a second dead-writer loss is backpressure — the
+  client's batch retry re-runs the claim); live foreign → **Fenced**;
+  re-read observed nothing → **Fenced{attempted}** (never claim ownership
+  whose bytes were not committed — no phantom lease).
+* Both store paths share one `claim(key, holder, now, lease_ms, mode)`
+  loop (`ClaimMode::RenewOrTakeover` / `AlwaysBump`), so the DML lock
+  service (which calls the store directly) inherits the fix.
+* The renew branch requires `!is_expired`; an expired self-lease takes
+  the takeover-bump branch exactly like a foreign dead owner.
+* `ensure_owned`'s fast path additionally requires a live
+  `writer_incarnations` cache entry (the write gate calls `begin` right
+  after, so steady-state cost is unchanged; after a lapse the fast path
+  falls through to a full acquire — the ADR-063 clause, now satisfied).
+* **Epoch-reset safety (the lapse-bump question, proven):** WAL keys are
+  epoch-first (`{epoch}-{sequence}`), so an unacked `{N,k}` always
+  replays before `{N+1,0}`, no key is ever reused, and all bump racers
+  converge on ONE winning generation via the CAS — one epoch switch,
+  never a fork. Bump-per-lapse is strictly safer than the status quo
+  self-conflict.
+* *TTL configurability + interval coupling:* `[storage]
+  write_lease_ttl_ms` (default 10_000); the renew interval is DERIVED as
+  `clamp(ttl/2, 1s, 5s)` — the floor preserves the minimum cadence,
+  while the ceiling retains a renewal opportunity before DML locks and
+  graph node/edge leases reach their initial 10 s expiry, even when the
+  writer TTL is raised. Smaller writer TTLs retain their half-TTL
+  cadence (the effective writer TTL is at least 2 s). Consumed at the
+  single production `PartitionLeaseManager::new` and its shared renew loop.
+* *Bounded renewals (ADR-095 adoption):* each per-key renewal in
+  `renew_held` is wrapped in `timeout(min(lease/2, 5s))`; this per-call
+  timeout is separate from the shared loop cadence. A hung authority call
+  counts as a renewal failure instead of stalling the serial pass for
+  EVERY collection (the observed amplifier).
+* *Observability:* `proximadb_lease_conflict_resolutions_total{resolution
+  = own_adopted|dead_winner_retry|foreign_fenced}` (the fence CAUSE —
+  would have made the bench failure visible instantly) and
+  `proximadb_write_gate_rejections_total{reason = not_primary|fenced|
+  acquire_error}` (the client-visible rejection).
+
+== Tests
+
+Resolver units (own-live adopt / dead-own retry / dead-foreign retry /
+live-foreign fenced / no-phantom); manager gate-sequence (lapse bumps,
+foreign stays fenced); the D3 negative (registry-self alone must not
+answer owned after lapse); TTL survival; the store-level
+renew-and-begin interleave (every same-pod outcome Acquired); interval
+boundaries (default, small, raised, and maximum writer TTL); shared
+cadence keeps initially 10 s DML/node/edge leases continuously held with
+stable generations through competing-pod probes; plus the
+pre-existing pins (restart-bumps, single-pod-keeps-lease,
+renew-extends-same-generation, steps-down, takeover-fence).
+
+== Considered and deferred
+
+* *Lease process nonce* — a `process_incarnation_id` on the lease would
+  let `begin` adopt its own process's bump and avoid the post-lapse
+  double bump; adds a lease-record field.
+* *Takeover grace* (new owner waits lease+500ms, ADR-095) — applies only
+  to the foreign-takeover branch; adds failover latency.
+* *Clock semantics:* the lease stays wall-clock (cross-pod); NTP skew
+  across pods is the existing model, documented here.
+
+== Relations
+
+ADR-063 D4 (incarnation-unique epoch; fast-path clause — this TD's
+authority), ADR-095 / TD-PGOLTP-2 (bounded authority calls, lease =
+2× interval), TD-OBJSTORE-4 S5 (single-recoverer fencing; recovery
+re-begins before replay — unaffected and still correct).

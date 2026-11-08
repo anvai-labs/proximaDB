@@ -163,6 +163,7 @@ mod performance_comparison_tests {
             trigger_compaction: false,
             batch_ids: vec![],
             collection_config: Some(collection_config.clone()),
+            collection_properties: None,
             estimated_size: 0,
         };
         let flush_result = engine.do_flush(&flush_params).await.unwrap();
@@ -173,6 +174,8 @@ mod performance_comparison_tests {
         let (compaction_time, compaction_throughput) = if engine_name != "viper" {
             let compact_start = Instant::now();
             let compact_params = CompactionParameters {
+                full_target_segments: None,
+                full: false,
                 collection_id: Some(collection_id.to_string()),
                 force: true,
                 synchronous: true,
@@ -220,6 +223,7 @@ mod performance_comparison_tests {
                 storage_class_status: None,
                 id: collection_id.to_string(),
                 config: Some(proximadb::proto::proximadb_v1::CollectionConfig {
+                    pool_id: None,
                     storage_class: None,
                     policy_generation: None,
                     default_access_tier: None,
@@ -668,6 +672,7 @@ mod performance_comparison_tests {
                 trigger_compaction: false,
                 batch_ids: vec![],
                 collection_config: Some(collection_config.clone()),
+                collection_properties: None,
                 estimated_size: 0,
             };
             engine.do_flush(&flush_params).await.unwrap();
@@ -675,6 +680,8 @@ mod performance_comparison_tests {
 
         // Force compaction to organize data
         let compact_params = CompactionParameters {
+            full_target_segments: None,
+            full: false,
             collection_id: Some("test_collection".to_string()),
             force: true,
             synchronous: true,
@@ -719,6 +726,7 @@ mod performance_comparison_tests {
                 storage_class_status: None,
                 id: "test_collection".to_string(),
                 config: Some(proximadb::proto::proximadb_v1::CollectionConfig {
+                    pool_id: None,
                     storage_class: None,
                     policy_generation: None,
                     default_access_tier: None,
@@ -861,6 +869,7 @@ mod performance_comparison_tests {
                 trigger_compaction: false,
                 batch_ids: vec![],
                 collection_config: Some(collection_config),
+                collection_properties: None,
                 estimated_size: 0,
             };
             let flush_result = engine.do_flush(&flush_params).await.unwrap();
@@ -938,6 +947,7 @@ mod performance_comparison_tests {
             batch_ids: vec![],
             collection_config: Some(collection_config),
             estimated_size: 0,
+            collection_properties: None,
         };
         engine.do_flush(&flush_params).await.unwrap();
 
@@ -967,6 +977,7 @@ mod performance_comparison_tests {
                             storage_class_status: None,
                             id: "test_collection".to_string(),
                             config: Some(proximadb::proto::proximadb_v1::CollectionConfig {
+                                pool_id: None,
                                 storage_class: None,
                                 policy_generation: None,
                                 default_access_tier: None,

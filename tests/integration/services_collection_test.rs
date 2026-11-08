@@ -59,6 +59,7 @@ async fn test_create_collection() -> Result<()> {
 
     // Create collection config
     let config = CollectionConfig {
+        pool_id: None,
         storage_class: None,
         policy_generation: None,
         default_access_tier: None,
@@ -102,6 +103,7 @@ async fn test_get_collection() -> Result<()> {
 
     // Create a collection first
     let config = CollectionConfig {
+        pool_id: None,
         storage_class: None,
         policy_generation: None,
         default_access_tier: None,
@@ -153,6 +155,7 @@ async fn test_list_collections() -> Result<()> {
     // Create multiple collections
     for i in 0..3 {
         let config = CollectionConfig {
+            pool_id: None,
             storage_class: None,
             policy_generation: None,
             default_access_tier: None,
@@ -199,6 +202,7 @@ async fn test_delete_collection() -> Result<()> {
 
     // Create a collection
     let config = CollectionConfig {
+        pool_id: None,
         storage_class: None,
         policy_generation: None,
         default_access_tier: None,
@@ -250,6 +254,7 @@ async fn test_tenant_scoped_collection_access_and_delete() -> Result<()> {
         create_test_service_with_tenant_manager(10).await?;
 
     let config = CollectionConfig {
+        pool_id: None,
         storage_class: None,
         policy_generation: None,
         default_access_tier: None,
@@ -335,6 +340,7 @@ async fn test_collection_port_get_collection_is_tenant_scoped() -> Result<()> {
         create_test_service_with_tenant_manager(10).await?;
 
     let config = CollectionConfig {
+        pool_id: None,
         storage_class: None,
         policy_generation: None,
         default_access_tier: None,
@@ -408,6 +414,7 @@ async fn test_tenant_collection_limit_enforced() -> Result<()> {
         create_test_service_with_tenant_manager(1).await?;
 
     let config_one = CollectionConfig {
+        pool_id: None,
         storage_class: None,
         policy_generation: None,
         default_access_tier: None,
@@ -468,6 +475,7 @@ async fn test_tenant_scoped_collection_listing() -> Result<()> {
         create_test_service_with_tenant_manager(10).await?;
 
     let config_a = CollectionConfig {
+        pool_id: None,
         storage_class: None,
         policy_generation: None,
         default_access_tier: None,

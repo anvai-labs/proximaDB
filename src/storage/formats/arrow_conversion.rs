@@ -23,7 +23,7 @@ use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use serde_json::Value as JsonValue;
 
 use super::traits::VectorBatch;
-use crate::proto::proximadb_v1::{SqlArray, SqlObject, VectorRecord};
+use crate::proto::proximadb_v1::VectorRecord;
 
 // Use proto SqlValue type
 use crate::proto::proximadb_v1::SqlValue;
@@ -278,71 +278,10 @@ pub fn vector_records_to_record_batch(records: &[VectorRecord]) -> Result<Record
     vector_batch_to_record_batch(&batch)
 }
 
-/// Convert Arrow RecordBatch to Vec<VectorRecord>
-pub fn record_batch_to_vector_records(batch: &RecordBatch) -> Result<Vec<VectorRecord>> {
-    let vector_batch = record_batch_to_vector_batch(batch)?;
-
-    let mut records = Vec::with_capacity(vector_batch.ids.len());
-    let dimension = vector_batch.dimension;
-
-    for (i, id) in vector_batch.ids.iter().enumerate() {
-        let start = i * dimension;
-        let end = start + dimension;
-        let vector = vector_batch.vectors[start..end].to_vec();
-
-        let metadata = vector_batch
-            .metadata
-            .as_ref()
-            .and_then(|m| m.get(i))
-            .map(|m| {
-                m.iter()
-                    .map(|(k, v)| (k.clone(), json_to_sql_value(v)))
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        records.push(VectorRecord {
-            id: id.clone(),
-            vector,
-            metadata,
-            ..Default::default()
-        });
-    }
-
-    Ok(records)
-}
-
-// ============================================================================
-// SqlValue ↔ JSON Conversions
-// ============================================================================
-
-/// Convert JSON Value to proto SqlValue
-pub fn json_to_sql_value(value: &JsonValue) -> SqlValue {
-    let inner = match value {
-        JsonValue::Null => Some(ProtoSqlValueInner::NullValue(0)),
-        JsonValue::Bool(b) => Some(ProtoSqlValueInner::BoolValue(*b)),
-        JsonValue::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                Some(ProtoSqlValueInner::Int64Value(i))
-            } else if let Some(f) = n.as_f64() {
-                Some(ProtoSqlValueInner::NumberValue(f))
-            } else {
-                Some(ProtoSqlValueInner::NullValue(0))
-            }
-        }
-        JsonValue::String(s) => Some(ProtoSqlValueInner::StringValue(s.clone())),
-        JsonValue::Array(arr) => Some(ProtoSqlValueInner::ArrayValue(SqlArray {
-            values: arr.iter().map(json_to_sql_value).collect(),
-        })),
-        JsonValue::Object(obj) => Some(ProtoSqlValueInner::ObjectValue(SqlObject {
-            fields: obj
-                .iter()
-                .map(|(k, v)| (k.clone(), json_to_sql_value(v)))
-                .collect(),
-        })),
-    };
-    SqlValue { value: inner }
-}
+// NOTE (2026-11-07): `record_batch_to_vector_records` (zero callers —
+// re-export only) and this module's private `json_to_sql_value` copy were
+// deleted here. The canonical JSON → SqlValue conversion lives in
+// proximadb-proto (`serde_impls::json_to_sql_value`).
 
 // ============================================================================
 // Filter Expression to Arrow Predicate
@@ -458,54 +397,6 @@ mod tests {
         for (a, b) in original.vectors.iter().zip(recovered.vectors.iter()) {
             assert!((a - b).abs() < 1e-6);
         }
-    }
-
-    #[test]
-    fn test_sql_value_json_roundtrip() {
-        // Create a proto SqlValue with object value
-        let mut fields = std::collections::HashMap::new();
-        fields.insert(
-            "string".to_string(),
-            SqlValue {
-                value: Some(ProtoSqlValueInner::StringValue("hello".to_string())),
-            },
-        );
-        fields.insert(
-            "number".to_string(),
-            SqlValue {
-                value: Some(ProtoSqlValueInner::Int64Value(42)),
-            },
-        );
-        fields.insert(
-            "float".to_string(),
-            SqlValue {
-                value: Some(ProtoSqlValueInner::NumberValue(3.5)),
-            },
-        );
-        fields.insert(
-            "bool".to_string(),
-            SqlValue {
-                value: Some(ProtoSqlValueInner::BoolValue(true)),
-            },
-        );
-        fields.insert(
-            "null".to_string(),
-            SqlValue {
-                value: Some(ProtoSqlValueInner::NullValue(0)),
-            },
-        );
-
-        let original = SqlValue {
-            value: Some(ProtoSqlValueInner::ObjectValue(SqlObject { fields })),
-        };
-
-        let json = sql_value_to_json(&original);
-        let recovered = json_to_sql_value(&json);
-
-        // Compare as JSON since SqlValue doesn't implement PartialEq for all nested types
-        let original_json = sql_value_to_json(&original);
-        let recovered_json = sql_value_to_json(&recovered);
-        assert_eq!(original_json, recovered_json);
     }
 
     #[test]

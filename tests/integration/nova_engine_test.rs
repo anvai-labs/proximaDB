@@ -7,11 +7,10 @@ use proximadb::proto::proximadb_v1::{
     Collection, DistanceMetric, FilterableDataType, StorageEngine,
 };
 use proximadb::services::collection::manager::CollectionService;
-use proximadb::services::operations::vectors::VectorOperationsService;
 use proximadb::storage::engines::nova::NovaEngine;
 use proximadb::storage::persistence::filesystem::{FilesystemConfig, FilesystemFactory};
 use proximadb::storage::persistence::write_ahead_log::BatchId;
-use proximadb::storage::traits::{FlushParameters, UnifiedStorageEngine, UnifiedStorageFormat};
+use proximadb::storage::traits::{FlushParameters, UnifiedStorageEngine};
 use proximadb_data_model::ProximaValue;
 use proximadb_records::{
     EmbeddingCell, EmbeddingValues, LabelSet, ProximaRecord, ProximaTree, ProximaTreeNode,
@@ -117,6 +116,7 @@ async fn flush_one(
         trigger_compaction: false,
         collection_config: Some(collection.clone()),
         estimated_size: 1024,
+        collection_properties: None,
     };
     let result = nova_engine.flush(flush_params).await.unwrap();
     assert!(result.success, "flush must succeed");
@@ -153,6 +153,7 @@ async fn test_nova_engine_creation_and_insertion() {
         trigger_compaction: false,
         collection_config: Some(collection),
         estimated_size: 1024 * 1024,
+        collection_properties: None,
     };
 
     println!(
@@ -223,6 +224,7 @@ async fn test_nova_flush_basic() {
         trigger_compaction: false,
         collection_config: Some(collection),
         estimated_size: 1024 * 1024,
+        collection_properties: None,
     };
 
     println!(
@@ -306,6 +308,7 @@ async fn test_nova_search_basic() {
         trigger_compaction: false,
         collection_config: Some(collection.clone()),
         estimated_size: 1024 * 1024,
+        collection_properties: None,
     };
 
     println!("🧪 Test: Flushing {} vectors", vectors.len());
@@ -387,7 +390,7 @@ async fn test_nova_compact_basic() {
         .with_distance_metric(DistanceMetric::Cosine)
         .build();
 
-    let base_location = _temp.path().to_str().unwrap().to_string();
+    let _base_location = _temp.path().to_str().unwrap().to_string();
 
     // Flush multiple batches to create multiple files
     for i in 0..3 {
@@ -403,6 +406,7 @@ async fn test_nova_compact_basic() {
             trigger_compaction: false,
             collection_config: Some(collection.clone()),
             estimated_size: 1024 * 1024,
+            collection_properties: None,
         };
 
         println!("🧪 Test: Flushing batch {}", i);
@@ -412,6 +416,8 @@ async fn test_nova_compact_basic() {
 
     // Compact
     let compact_params = CompactionParameters {
+        full_target_segments: None,
+        full: false,
         collection_id: Some(collection_id.to_string()),
         collection_config: Some(collection),
         force: true,

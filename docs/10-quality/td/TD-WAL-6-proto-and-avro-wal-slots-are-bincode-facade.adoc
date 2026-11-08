@@ -1,0 +1,57 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-WAL-6: the "proto" and "avro" WAL serialization slots are a bincode facade — the format enum promises three wire formats, one exists
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Mitigated (2026-11-04).** The shared v1 encoding is now ONE copy (`serialize_bincode_batch` / `deserialize_bincode_batch`) used by both named slots; all doc comments disclose the bincode backing; a byte-identity pin test holds the slots to raw bincode. The facade itself (three enum variants, one wire format) is OPEN — see Decision.
+| Priority | **MEDIUM**: no data loss or corruption (all three slots round-trip through one proven encoding), but the config surface promises semantics it does not deliver — an operator selecting "avro" for schema evolution, or "proto" for proto-first interop, silently gets bincode v1.
+| Component | `src/storage/persistence/write_ahead_log/serialization/{mod,proto,avro}.rs`; `SerializationFormat` enum (config strings `proto`/`bincode`/`avro`); consumers: `SerializerFactory::create`, `write_ahead_log/mod.rs`, `recovery_manager.rs`, `memtable/specialized/wal_behavior.rs`.
+| Relates to | TD-WAL-2 (multimodal WAL convergence — the unified WAL is where a real format split would land), the v2 segment-header precision work (`v2_segment_header.rs`, `wire_v2`), the B-harness finding that surfaced it (duplicate-suspect 1.00 + td-candidate 0.90/0.95, `report/llm_module_analysis/`, 2026-11-04).
+| Found | 2026-11-04, by the per-module LLM analysis harness (wave B) at confidence 1.00 ("ProtocolBuffersSerializer delegates to bincode" / "AvroSerializer delegates to bincode"), then hand-verified against current `develop` (files had moved from `write_ahead_log/*_serialization_strategy.rs` to `write_ahead_log/serialization/*.rs` since the 2026-11-01 index).
+|===
+
+== What the code actually does
+
+`SerializationFormat` exposes three variants with doc comments promising
+protobuf ("default for proto-first architecture"), bincode ("optimized for
+performance"), and Avro ("for schema evolution"). Reality:
+
+* `ProtocolBuffersSerializer::serialize_batch` called `bincode::serialize` directly.
+* `AvroSerializer::serialize_batch` called `bincode::serialize` directly (its module doc claimed "schema evolution support" — bincode has none).
+* Only `BincodeSerializer` matches its name; it is also the only serializer overriding the v2 precision-aware wire path (`serialize_batch_v2` via `wire_v2::ProximaRecordV2`). The two named slots inherit the v1 default, so non-Fp32 records re-trigger the v1 fp32-only refuse-error on those slots.
+
+The two implementations were byte-identical modulo error-string — the exact
+duplicate class the dedup program hunts, but with a lying contract on top.
+
+== Why it matters
+
+. **Config-surface honesty:** `parse_format("avro")` succeeds and selects a slot whose bytes a real Avro reader cannot parse. Same for `proto`. Anyone building cross-system tooling against the advertised format gets an unwelcome surprise.
+. **Schema evolution is unimplemented:** the only reason to prefer Avro — tolerant readers across schema change — does not exist anywhere in this path.
+. **Drift risk:** two hand-maintained copies of the same encoding could diverge silently (one gains a fix, the other doesn't).
+
+== What shipped (this TD's mitigation)
+
+* ONE shared copy of the v1 encoding: `serialize_bincode_batch(records, what)` / `deserialize_bincode_batch(data, what)` in `serialization/mod.rs`, parameterized only by the error-context string (cause INLINED in the message so recovery-side Display keeps the corruption detail). Both named slots delegate.
+* Honest doc comments on both serializers, the module headers, and the `SerializationFormat` variants: named slot, bincode-backed, no protobuf/Avro bytes, no v2 wire override.
+* Pin tests: `test_named_slots_are_bincode_v1_bytes` (both slots byte-identical with raw `bincode::serialize`) and `test_named_slots_v2_default_equals_v1_bytes` (the inherited v2 default delegates to v1 — a precision-conditional divergence in a named slot fails CI, not durability).
+* Shared test fixture (`test_util::create_test_vector`) replacing the copy-pasted proto/avro fixture. The bincode serializer keeps its own richer fixture (carries an `origin` field its tests assert on) — 2-of-3 consolidation, disclosed.
+
+No wire format, enum value, config string, or factory mapping changed.
+
+== Decision (OPEN): collapse or implement
+
+Two coherent end-states; picking one is a product decision, not a refactor:
+
+. **Collapse (recommended default):** keep `Bincode` as the only real v1 format; treat `ProtocolBuffers`/`Avro` as parse-only aliases mapping to the bincode slot (deprecate the variants). Cheap, honest, zero wire change. The v2 precision path then has exactly one name too.
+. **Implement:** give `proto` a real prost encoding via `proximadb_proto` (the crate exists for exactly this) and `avro` a real schema-aware encoding, dispatched behind the v2 segment header so v1 bytes stay mixed-read-safe (format-migration discipline #8). Only worth it if an external consumer actually needs to read WAL slots with a non-Rust reader.
+
+Until decided: the facade is disclosed at every doc site, and the byte pin
+holds the two slots together.
+
+== Residual
+
+* **Same-named memtable twin:** `src/storage/memtable/serialization/avro.rs` is ALSO a bincode facade (its own inline comment says "Placeholder - implement actual Avro"). This TD's fix covers the WAL serialization module only; the memtable twin folds into the same collapse-vs-implement decision.
+* `wal_behavior.rs` (memtable) selects `AvroSerializer` directly — under option 1 that call site should migrate to the canonical alias in the same PR that collapses the variants.
+* The v1-fp32-only refuse-error on non-Fp32 records for the named slots is pre-existing behavior, unchanged here; it folds into whichever end-state is chosen.

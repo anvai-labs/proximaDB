@@ -217,7 +217,7 @@ impl UnifiedCachingFilesystem {
         FilesystemMetrics {
             metadata_cache_size: metadata_stats.memory_usage_bytes,
             metadata_cache_entries: metadata_stats.entries,
-            disk_cache_size: disk_stats.bytes_saved as usize,
+            disk_cache_size: disk_stats.resident_bytes,
             disk_cache_entries: disk_stats.entries,
             total_hits: cache_report.total_hits,
             total_misses: cache_report.total_misses,
@@ -279,10 +279,10 @@ impl FileSystem for UnifiedCachingFilesystem {
         self.record_access(path, AccessOperation::Read).await;
 
         // Check disk cache first
-        if let Some(cached_path) = self.disk_cache.get(path).await {
+        if let Some(cached_data) = self.disk_cache.get_data(path).await {
             debug!("Disk cache hit for {}", path);
             self.metrics.record_cache_hit(CacheType::Disk);
-            return self.underlying_fs.read(&cached_path).await;
+            return Ok(cached_data);
         }
 
         // Check if we can optimize with range reads
@@ -592,15 +592,10 @@ impl FileSystem for UnifiedCachingFilesystem {
     async fn read_range(&self, path: &str, offset: u64, length: u64) -> FsResult<Vec<u8>> {
         self.record_access(path, AccessOperation::RangeRead).await;
 
-        if let Some(cached_data) = self.disk_cache.get_data(path).await
-            && let Ok(start) = usize::try_from(offset)
-            && let Ok(len) = usize::try_from(length)
-            && let Some(end) = start.checked_add(len)
-            && end <= cached_data.len()
-        {
+        if let Some(cached_data) = self.disk_cache.get_range(path, offset, length).await {
             self.metrics
-                .record_cache_hit_with_size(CacheType::Disk, len);
-            return Ok(cached_data[start..end].to_vec());
+                .record_cache_hit_with_size(CacheType::Disk, cached_data.len());
+            return Ok(cached_data);
         }
 
         self.metrics.record_cache_miss(CacheType::Disk);
@@ -759,14 +754,50 @@ mod tests {
         .await
         .expect("local filesystem");
 
+        let mut config = UnifiedCacheConfig::default();
+        config.disk.path = temp_dir.path().join("cache");
         (
-            UnifiedCachingFilesystem::new(
+            UnifiedCachingFilesystem::with_config(
                 Arc::new(local),
+                config,
                 "test_collection".to_string(),
                 "sst".to_string(),
             ),
             temp_dir,
         )
+    }
+
+    #[tokio::test]
+    async fn cached_cloud_body_and_ranges_never_route_local_paths_to_origin() {
+        use proximadb_storage_filesystem_types::testing::SyncRecorder;
+        // This backend rejects every read: a cache hit must be local byte I/O.
+        let directory = tempfile::tempdir().expect("cache directory");
+        let mut config = UnifiedCacheConfig::default();
+        config.disk.path = directory.path().to_owned();
+        let fs = UnifiedCachingFilesystem::with_config(
+            Arc::new(SyncRecorder::default()),
+            config,
+            "c".into(),
+            "sst".into(),
+        );
+        let key = "s3://authoritative-bucket/collection/segment.pax";
+        fs.disk_cache.put(key, b"abcdefghij").await;
+        assert_eq!(
+            fs.read(key).await.expect("local whole-body hit"),
+            b"abcdefghij"
+        );
+        assert_eq!(
+            fs.read_range(key, 2, 3).await.expect("local range hit"),
+            b"cde"
+        );
+        assert_eq!(fs.disk_cache.stats().bytes_saved, 13);
+        assert_eq!(fs.get_metrics().await.disk_cache_size, 10);
+        fs.disk_cache.invalidate(key).await;
+        assert!(
+            fs.read(key).await.is_err(),
+            "cache miss returns the origin failure"
+        );
+        assert_eq!(fs.get_metrics().await.disk_cache_size, 0);
     }
 
     /// TD-OBJSTORE-4 S2/S3: the caching decorator MUST delegate `write_if_absent`

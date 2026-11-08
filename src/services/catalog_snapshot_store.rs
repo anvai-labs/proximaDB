@@ -110,6 +110,31 @@ pub trait CatalogSnapshotStore: Send + Sync {
         Ok(0)
     }
 
+    /// TD-PATH-2 4a: read the durable identity-high-water sidecar, if this
+    /// store keeps one and it has been written. The sidecar is a sibling of
+    /// the snapshot pointer, deliberately OUTSIDE every path a snapshot
+    /// publisher renames or prunes, so an older (pre-high-water) binary
+    /// checkpointing this store cannot destroy the dropped-id floor.
+    /// Default: no sidecar support (`None`).
+    async fn read_identity_high_water(&self) -> Result<Option<Vec<u8>>> {
+        Ok(None)
+    }
+
+    /// TD-PATH-2 4a: durably write the identity-high-water sidecar. Callers
+    /// merge the current image before writing so the sidecar never lowers.
+    /// Default: unsupported — and LOUD about it, so a store implementation
+    /// that forgets to override this is observable in the logs rather than
+    /// silently leaving the snapshot field as the only floor record.
+    async fn write_identity_high_water(&self, _bytes: &[u8]) -> Result<()> {
+        tracing::warn!(
+            store = %self.describe(),
+            "CatalogSnapshotStore implementation does not support the identity \
+             high-water sidecar; dropping the write (the in-snapshot field \
+             remains the only durable floor record)"
+        );
+        Ok(())
+    }
+
     /// Human-readable location, for logs and error context.
     fn describe(&self) -> String;
 }
@@ -119,13 +144,20 @@ pub trait CatalogSnapshotStore: Send + Sync {
 /// pre-5c inline `write_atomic`.
 pub struct LocalSnapshotStore {
     path: PathBuf,
+    /// TD-PATH-2 4a: the identity-high-water sidecar beside the snapshot blob
+    /// (`<stem>.hw` for the conventional `<stem>.snapshot` blob). A
+    /// pre-high-water binary writes only `path` and `path`'s `-tmp` sibling,
+    /// so this file survives its checkpoint.
+    hw_path: PathBuf,
 }
 
 impl LocalSnapshotStore {
     /// Snapshot blob at `path` (conventionally the WAL path with a `.snapshot`
     /// extension).
     pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self { path: path.into() }
+        let path = path.into();
+        let hw_path = path.with_extension("hw");
+        Self { path, hw_path }
     }
 
     /// The blob path.
@@ -183,6 +215,83 @@ impl CatalogSnapshotStore for LocalSnapshotStore {
         Ok(SnapshotWrite::Published { version: 0 })
     }
 
+    async fn read_identity_high_water(&self) -> Result<Option<Vec<u8>>> {
+        match tokio::fs::try_exists(&self.hw_path).await {
+            Ok(true) => {
+                let bytes = tokio::fs::read(&self.hw_path).await.with_context(|| {
+                    format!(
+                        "reading identity high-water sidecar {}",
+                        self.hw_path.display()
+                    )
+                })?;
+                Ok(Some(bytes))
+            }
+            Ok(false) => Ok(None),
+            // Review R2 NIT-2: an FS error is NOT proven absence. Treating it
+            // as absent under-counts the floor (losing DROPPED-id memory until
+            // the next checkpoint rewrite repairs the file), so say so loudly
+            // instead of folding silence into `None`.
+            Err(error) => {
+                tracing::warn!(
+                    path = %self.hw_path.display(),
+                    error = %error,
+                    "probing identity high-water sidecar existence failed; treating \
+                     it as absent (dropped-id memory may under-count until the \
+                     next checkpoint rewrite)"
+                );
+                Ok(None)
+            }
+        }
+    }
+
+    async fn write_identity_high_water(&self, bytes: &[u8]) -> Result<()> {
+        // Same atomic pattern as `write_atomic`: tmp → fsync → rename →
+        // best-effort parent-dir fsync. The tmp name shares no path with the
+        // snapshot's own `-tmp` sibling, so the two writers never collide. A
+        // failure on any arm removes the tmp file (review R2 NIT-3): `.hw-tmp`
+        // orphans are harmless today — extension-filtered out of every list —
+        // but leaving none is tidier than relying on the filter.
+        let tmp = self.hw_path.with_extension("hw-tmp");
+        let written = async {
+            {
+                let mut file = tokio::fs::OpenOptions::new()
+                    .create(true)
+                    .write(true)
+                    .truncate(true)
+                    .open(&tmp)
+                    .await
+                    .with_context(|| format!("opening sidecar temp {}", tmp.display()))?;
+                file.write_all(bytes)
+                    .await
+                    .with_context(|| format!("writing sidecar temp {}", tmp.display()))?;
+                file.flush().await?;
+                file.sync_data()
+                    .await
+                    .with_context(|| format!("fsync sidecar temp {}", tmp.display()))?;
+            }
+            tokio::fs::rename(&tmp, &self.hw_path)
+                .await
+                .with_context(|| {
+                    format!(
+                        "atomically replacing identity high-water sidecar {}",
+                        self.hw_path.display()
+                    )
+                })?;
+            Ok(())
+        }
+        .await;
+        if let Err(error) = written {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return Err(error);
+        }
+        if let Some(dir) = self.hw_path.parent()
+            && let Ok(handle) = std::fs::File::open(dir)
+        {
+            let _ = handle.sync_all();
+        }
+        Ok(())
+    }
+
     fn describe(&self) -> String {
         format!("file:{}", self.path.display())
     }
@@ -203,7 +312,26 @@ impl CatalogSnapshotStore for LocalSnapshotStore {
 /// `proximadb-object-store` crate's cloud features, `s3://`/`gs://`/`az://`.
 pub struct ObjectStoreSnapshotStore {
     committer: ManifestCommitter,
+    /// TD-PATH-2 4a: the same backing store the committer resolves relative
+    /// paths against, used for the sidecar object beside the manifest log.
+    sidecar_store: ProximaObjectStore,
+    sidecar_key: String,
     label: String,
+}
+
+/// TD-PATH-2 4a: the sidecar key is a SIBLING of the manifest-log prefix —
+/// `_operator/catalog/_manifests/` → `_operator/catalog/identity_high_water`.
+/// Sibling, never inside the prefix: the manifest log's retention prune
+/// deletes only its own canonical `{prefix}/_history/` archives, and an older
+/// (pre-high-water) binary's publish/prune never names a key outside its
+/// manifest log — so the sidecar survives every publisher that does not know
+/// it exists.
+fn sibling_sidecar_key(manifests_prefix: &str) -> String {
+    let trimmed = manifests_prefix.trim_end_matches('/');
+    match trimmed.rfind('/') {
+        Some(idx) => format!("{}/identity_high_water", &trimmed[..idx]),
+        None => "identity_high_water".to_string(),
+    }
 }
 
 impl ObjectStoreSnapshotStore {
@@ -226,10 +354,14 @@ impl ObjectStoreSnapshotStore {
     ) -> Self {
         let manifests_prefix = manifests_prefix.into();
         let label = format!("{base_url}::{manifests_prefix}");
+        let sidecar_key = sibling_sidecar_key(&manifests_prefix);
         Self {
-            committer: ManifestCommitter::new(store, manifests_prefix).with_legacy_encoding(
-                proximadb_iceberg_engine::manifest::LegacyEncoding::GenerationPrefixed,
-            ),
+            committer: ManifestCommitter::new(store.clone(), manifests_prefix)
+                .with_legacy_encoding(
+                    proximadb_iceberg_engine::manifest::LegacyEncoding::GenerationPrefixed,
+                ),
+            sidecar_store: store,
+            sidecar_key,
             label,
         }
     }
@@ -310,6 +442,40 @@ impl CatalogSnapshotStore for ObjectStoreSnapshotStore {
             .with_context(|| format!("probing catalog snapshot version {}", self.label))
     }
 
+    async fn read_identity_high_water(&self) -> Result<Option<Vec<u8>>> {
+        let path = object_store::path::Path::from(self.sidecar_key.as_str());
+        match self.sidecar_store.get(&path).await {
+            Ok(bytes) => Ok(Some(bytes.to_vec())),
+            Err(proximadb_kernel::error::StorageError::NotFound(_)) => Ok(None),
+            Err(e) => Err(e).with_context(|| {
+                format!(
+                    "reading identity high-water sidecar {} at {}",
+                    self.sidecar_key, self.label
+                )
+            }),
+        }
+    }
+
+    async fn write_identity_high_water(&self, bytes: &[u8]) -> Result<()> {
+        // TD-PATH-2 review NIT-4: this PUT is deliberately UNFENCED
+        // (last-writer-wins, unlike the generation-fenced snapshot commit).
+        // Fencing it would let a stale owner's rejected write strand a HIGHER
+        // floor; accepting the race is safe because every writer merges the
+        // on-disk image first (fetch-max) and the snapshot field independently
+        // carries the floor — so a stale owner can only transiently lower the
+        // on-DISK sidecar, never the recovered floor.
+        let path = object_store::path::Path::from(self.sidecar_key.as_str());
+        self.sidecar_store
+            .put(&path, bytes::Bytes::copy_from_slice(bytes))
+            .await
+            .with_context(|| {
+                format!(
+                    "writing identity high-water sidecar {} at {}",
+                    self.sidecar_key, self.label
+                )
+            })
+    }
+
     async fn prune_retention(&self, keep_k: usize, min_age: std::time::Duration) -> Result<usize> {
         self.committer
             .prune_retention(keep_k, min_age)
@@ -361,6 +527,82 @@ mod tests {
 
     fn published(w: SnapshotWrite) -> bool {
         matches!(w, SnapshotWrite::Published { .. })
+    }
+
+    /// TD-PATH-2 4a: the sidecar key is a SIBLING of the manifest-log prefix —
+    /// never inside it — so no snapshot publisher or retention prune that only
+    /// names the manifest log can touch the sidecar.
+    #[test]
+    fn sidecar_key_is_a_sibling_of_the_manifests_prefix() {
+        assert_eq!(
+            sibling_sidecar_key("_operator/catalog/_manifests/"),
+            "_operator/catalog/identity_high_water"
+        );
+        assert_eq!(
+            sibling_sidecar_key("_operator/catalog/_manifests"),
+            "_operator/catalog/identity_high_water"
+        );
+        // A single-segment prefix degrades to a root sibling, still outside
+        // the prefix.
+        assert_eq!(sibling_sidecar_key("_manifests/"), "identity_high_water");
+    }
+
+    /// TD-PATH-2 4a: an older binary's snapshot publish must not disturb the
+    /// sidecar — locally, `write_atomic` renames only its own blob + tmp, so
+    /// the `catalog.hw` sibling survives any number of publishes.
+    #[tokio::test]
+    async fn local_sidecar_survives_snapshot_publishes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = LocalSnapshotStore::new(dir.path().join("catalog.snapshot"));
+
+        // New binary: sidecar + snapshot coexist.
+        assert!(store.write_identity_high_water(b"hw-v1").await.is_ok());
+        assert!(published(store.write_atomic(0, b"snap").await.unwrap()));
+        assert_eq!(
+            store.read_identity_high_water().await.unwrap().as_deref(),
+            Some(&b"hw-v1"[..])
+        );
+
+        // Old-binary simulation: snapshot publishes (and its tmp rename)
+        // repeat; the sidecar bytes are untouched.
+        assert!(published(
+            store.write_atomic(0, b"snap-old-1").await.unwrap()
+        ));
+        assert!(published(
+            store.write_atomic(0, b"snap-old-2").await.unwrap()
+        ));
+        assert_eq!(
+            store.read_identity_high_water().await.unwrap().as_deref(),
+            Some(&b"hw-v1"[..])
+        );
+        assert_eq!(
+            body(store.read().await.unwrap()).as_deref(),
+            Some(&b"snap-old-2"[..])
+        );
+    }
+
+    /// TD-PATH-2 4a: the object-store sidecar round-trips at its sibling key
+    /// and is absent before the first write (mixed-read no-op).
+    #[tokio::test]
+    async fn object_store_sidecar_round_trips_beside_the_manifest_log() {
+        let backing =
+            ProximaObjectStore::new(std::sync::Arc::new(object_store::memory::InMemory::new()));
+        let store =
+            ObjectStoreSnapshotStore::new(backing, "memory:///", "_operator/catalog/_manifests/");
+
+        assert!(store.read_identity_high_water().await.unwrap().is_none());
+        assert!(store.write_identity_high_water(b"floor").await.is_ok());
+        assert_eq!(
+            store.read_identity_high_water().await.unwrap().as_deref(),
+            Some(&b"floor"[..])
+        );
+
+        // Snapshot publishing (manifest log commits) does not disturb it.
+        assert!(published(store.write_atomic(1, b"snap").await.unwrap()));
+        assert_eq!(
+            store.read_identity_high_water().await.unwrap().as_deref(),
+            Some(&b"floor"[..])
+        );
     }
 
     #[tokio::test]

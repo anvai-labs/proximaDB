@@ -80,14 +80,6 @@ fn record_vector(record: &ProximaRecord) -> &[f32] {
         .unwrap_or(&[])
 }
 
-/// File type enum for cache key discrimination
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum FileType {
-    SST,
-    Parquet,
-    Index,
-}
-
 /// Wrapper for either memory-mapped data or owned Vec
 /// Enables zero-copy reads on local filesystem while maintaining cloud compatibility
 pub enum MmapOrVec {
@@ -160,44 +152,6 @@ pub struct SharedSstFormatReader {
     /// ✅ Reusable distance compute engine - created once and passed to all search operations
     #[allow(dead_code)]
     distance_compute: Arc<proximadb_distance_kernel::engine::UnifiedDistanceCompute>,
-}
-
-/// Shared SST format writer with compression and Proxima encoding
-/// Complements the reader for full read/write support
-pub struct SharedSstFormatWriter {
-    /// Filesystem port for I/O operations (TD-DECOMP-75 seam)
-    #[allow(dead_code)]
-    filesystem: Arc<dyn FilesystemPort>,
-
-    /// Unified filesystem for write operations
-    #[allow(dead_code)]
-    caching_filesystem: Arc<dyn proximadb_storage_filesystem_types::FileSystem>,
-
-    /// Collection ID for filename-based cache keys
-    #[allow(dead_code)]
-    collection_id: String,
-
-    /// Compression configuration
-    #[allow(dead_code)]
-    compression_config: Option<proximadb_proto::proximadb_v1::CompressionConfig>,
-
-    /// Stats for monitoring writes
-    #[allow(dead_code)]
-    stats: Arc<WriterStats>,
-}
-
-/// Writer statistics for monitoring
-pub struct WriterStats {
-    #[allow(dead_code)]
-    blocks_written: AtomicU64,
-    #[allow(dead_code)]
-    bytes_written: AtomicU64,
-    #[allow(dead_code)]
-    bytes_compressed: AtomicU64,
-    #[allow(dead_code)]
-    compression_time_ms: AtomicU64,
-    #[allow(dead_code)]
-    writes_total: AtomicU64,
 }
 
 #[derive(Clone)]
@@ -670,7 +624,7 @@ impl SharedSstFormatReader {
         let bloom_data = self
             .get_bloom_filter_smart(file_path, collection_id)
             .await?;
-        if !self.check_bloom(&bloom_data, key) {
+        if !self.bloom_might_contain_unfiltered(&bloom_data, key) {
             // Key definitely not in file - saved bandwidth!
             self.stats
                 .bytes_saved
@@ -909,7 +863,7 @@ impl SharedSstFormatReader {
         let mut bloom_filtered = Vec::new();
 
         for (idx, key) in keys.iter().enumerate() {
-            if self.check_bloom(&bloom_data, key) {
+            if self.bloom_might_contain_unfiltered(&bloom_data, key) {
                 possible_keys.push((idx, key));
             } else {
                 bloom_filtered.push(idx);
@@ -1056,26 +1010,43 @@ impl SharedSstFormatReader {
             || path.starts_with("https://")
     }
 
-    /// Check bloom filter
-    fn check_bloom(&self, _bloom_data: &[u8], _key: &[u8]) -> bool {
-        // Bloom filter implementation
-        // Returns false if key definitely not present
-        // Returns true if key might be present
-        true // Placeholder
+    /// Bloom pruning is not implemented here; always answers "might be present".
+    ///
+    /// Deliberately conservative, and deliberately NOT named as if it filtered:
+    /// there is no filter to consult on this path (TD-BLOOM-1). Because it never
+    /// answers `false`, the `bytes_saved` credit on its caller's negative branch
+    /// is unreachable — which is the only reason that counter is not currently
+    /// reporting prunes that never happened. Do not "optimise" this to return
+    /// `false` without a real filter behind it.
+    fn bloom_might_contain_unfiltered(&self, _bloom_data: &[u8], _key: &[u8]) -> bool {
+        true
     }
 
-    /// Find block for key in index
+    /// Index lookup is not implemented; refuses rather than guessing a block.
+    ///
+    /// This used to ignore both arguments and return
+    /// `Some(BlockInfo { offset: 0, size: DATA_BLOCK_SIZE })` for every key, so
+    /// `read_record` downloaded whatever sits at file offset 0 and searched it
+    /// for the key. Both answers it could give were wrong: `Some(block 0)`
+    /// reads the wrong block, and `None` is consumed by the caller as "key not
+    /// in index" — returning `Ok(None)` (absent) *and* crediting
+    /// `stats.bytes_saved` for a prune that never happened. An unimplemented
+    /// index must refuse, not answer (TD-FACADE-1).
+    ///
+    /// `read_record`/`batch_read_with_filtering` have no callers today, so this is
+    /// inert; implementing it means a real binary search over the index block.
     fn find_block_for_key(
         &self,
         _index_data: &[u8],
         _key: &[u8],
     ) -> Result<Option<BlockInfo>, ProximaDBError> {
-        // Binary search in index to find block
-        // Returns None if key not in range
-        Ok(Some(BlockInfo {
-            offset: 0,
-            size: DATA_BLOCK_SIZE as u64,
-        })) // Placeholder
+        Err(ProximaDBError::Storage(StorageError::DiskIO(
+            std::io::Error::other(
+                "SST index block lookup is not implemented: returning a fixed block would \
+                 read the wrong data, and returning None would report an existing key as \
+                 absent. See TD-FACADE-1.",
+            ),
+        )))
     }
 
     /// Search for key in data block

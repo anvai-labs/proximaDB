@@ -131,6 +131,24 @@ The footer remains at the variable tail: moving it to the front would duplicate
 or precompute data before blocks finish, and it is not adjacent to Region B
 because optional resolver and Region-D blocks intervene.
 
+=== Source identity and local backing clarification (2026-11-02)
+
+A persistent cache key identifies a resolved source, not a display URL. Preserve remote
+object-key bytes and backend endpoint/account namespace. Normalize local paths and backend
+aliases only according to the filesystem resolver; globally collapsing repeated slashes can
+alias distinct object keys. Apply the same identity to whole objects, ranges, invalidation
+and protection groups. Collection protection requires a boundary-aware source prefix, never
+an arbitrary substring. A key-encoding change must invalidate/rebuild old entries and
+reconcile grant prefixes together.
+
+The cache backing is local I/O even when its source uses an object-store filesystem. Capacity
+and eviction must remain coherent under concurrent fill, replacement, cancellation and
+failed writes; corrupt/missing cache entries fall back to the authoritative source. Reuse the
+existing byte/range/protection seams and parent-range reuse. No second persistent cache,
+automatic multi-disk migration or new publication authority follows from this clarification.
+Concrete acceptance remains TD-TIER-1 and the
+link:../../current/STORAGE_PLAN.adoc#storage-foundations[storage foundation contract].
+
 == Consequences
 
 * Warm local reads avoid Blob operations while preserving object storage as the

@@ -16,8 +16,7 @@ mod common;
 
 use common::ensure_test_directories;
 use common::integration_test_helpers::{
-    UnifiedTestEnvironment, create_metadata_store_config, create_test_collection_with_storage,
-    create_test_config, operations,
+    UnifiedTestEnvironment, create_metadata_store_config, operations,
 };
 
 // Metadata store configuration now handled by UnifiedTestEnvironment

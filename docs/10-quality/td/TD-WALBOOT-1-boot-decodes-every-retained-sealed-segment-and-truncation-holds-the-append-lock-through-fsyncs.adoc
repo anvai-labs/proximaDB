@@ -1,0 +1,77 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-WALBOOT-1: boot decodes every retained sealed WAL segment, and truncation/rotation hold the append lock through fsyncs
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open — COST 1 MEASURED (2026-11-03, instrumentation + harness landed): boot rebuild is linear, bytes-bound at ~0.32 ms/KB dev-profile, and the worst case coincides with recovery from truncation-pin states (poison/ambiguous-oid), where the retained WAL is largest. Evidence: `docs/history/evidence/WALBOOT1_BOOT_DECODE_2026_11_03.adoc`; live metrics `proximadb_wal_boot_rebuild_seconds` / `_sealed_segments_decoded_total` / `_sealed_decoded_bytes_total`, and `proximadb_wal_append_lock_{truncate,rotate}_hold_seconds` for cost 2. The sidecar-summary candidate is justified; not yet implemented. Cost 2's hold histograms are in place for operational collection.** Filed from the v0.4.x→v0.5.1 release review (finding F9, `RELEASE_REVIEW_v0.4_to_v0.5.1.md`).
+| Priority | **MEDIUM (scalability/perf, not correctness).** Boot time and peak memory are O(retained WAL); every writer sees fsync-scale latency spikes on a 300 s cadence and at each 64 MiB rotation.
+| Component | `src/services/canonical_wal.rs` (`FramedTableWalAppender::open` / `read_sealed_segment` / `truncate_below` / `rotate_active`)
+| Relates to | TD-SEAM-2 (the rotation/truncation design), TD-USUB-19 and TD-WALPOISON-1 (the other WAL-retention costs of failing closed), TD-IOBUDGET-1 (the round-trip cost vocabulary)
+|===
+
+== The two costs
+
+1. **Boot is O(retained WAL), in full decode.** `open()` rebuilds every sealed segment's
+   `SegmentSummary` by reading and decoding each segment whole
+   (`canonical_wal.rs:628-646`; `read_sealed_segment` reads the file into memory). With the
+   change-feed retention default (1M entries) plus everything unflushed, and 64 MiB segments
+   read in full, restart latency and boot memory grow with the retained window. There is no
+   persisted per-segment index sidecar.
+2. **Truncation and rotation serialize against every append.** `truncate_below` holds the
+   same `append_lock` as appends across the floor-marker fsync, N segment unlinks and a
+   directory fsync; `rotate_active` holds it across rename + dir fsync every 64 MiB. On a
+   slow or object-backed directory those are fsync-scale stalls on the write path — a p99
+   tail every 300 s and at each rotation. (The spill `flush_guard` is likewise held across
+   the object PUT per partition — TD-USUB-13's self-acknowledged "not the cheapest possible
+   fix".)
+
+== The rule this TD enforces on itself
+
+**Measure first.** Before any change: (a) instrument boot summary-rebuild time and peak
+bytes (one counter + one histogram at the `open()` site), and append-latency during a
+scheduled truncation on a cold directory (io_trace already carries the query-scoped view).
+The co-design mandate's cost term is round-trips and tail latency, not component
+throughput — a kernel microbenchmark of rename() says nothing about the p99 the writers see.
+
+== Chosen design (corrected 2026-11-03): a sealed-segment summary TRAILER, in-file
+
+The original candidate text below proposed `{name}.idx` sidecars; corrected on
+review: sidecars double the per-segment object count (an extra GET per segment
+on object stores — the co-design mandate's dominant cost term) and add a
+paired-file lifecycle. The house pattern is metadata WITHIN the file (PAX
+footer, Region E). The summary is therefore appended as a self-locating
+trailer at seal time — `[rmp(SummaryData) payload][payload_len u32 LE][magic
+"PXWSTL01"]`, written after the synced final append and before the seal
+rename — and boot reads it with one suffix read per segment. Mixed-read-safe
+by construction: segments without a trailer (all existing ones) full-decode
+exactly as today; corrupt/overlong trailers fall back to the decode (counted
+in `proximadb_wal_boot_summary_section_{hits,misses}_total`); a
+trailer-bearing segment would trip an older binary's strict sealed decoder,
+so arming the gate (`PROXIMADB_WAL_SUMMARY_TRAILER`, default ON) raises the
+data format marker to 4 on first write (the OBJECT_SPILL_FORMAT=3 precedent:
+refuse loudly, never misread). The interrupted-seal window (trailer synced,
+rename not) is closed at boot by completing the rotation — the seal's bytes
+were durable.
+
+== Superseded candidate text (sidecars — kept for the record)
+
+* **Sidecar summaries** (for cost 1): persist each segment's `SegmentSummary` beside the
+  segment (`{name}.idx`), written before the seal's dir-fsync completes; boot trusts a
+  sidecar only when its checksum matches the sealed file's length+hash footer, else falls
+  back to full decode. Bounded, mechanical, no format change to the segments themselves —
+  a missing sidecar is exactly today's behavior.
+* **Off-lock truncation** (for cost 2): do the unlink/fsync work on the segments list
+  snapshot OUTSIDE `append_lock`, holding only a short mutex that pins the sealed-segment
+  set; appends proceed against the active file throughout. The floor marker's
+  temp+fsync+rename already has its own durability protocol and does not need the append
+  lock for exclusion — verify that claim against `BranchFenceRefused` before acting on it.
+* Declined for now: io_uring/batch-unlink style batching (churn; the unlink count per run
+  is bounded by the truncation interval), and mmap decode of sealed segments (memory still
+  O(retained), just faulted differently).
+
+== Non-goals
+
+Sealed-segment format changes (the frozen-frame compat tests own that surface); changing
+the fail-closed refusal discipline of the truncator (TD-WALPOISON-1 depends on it).

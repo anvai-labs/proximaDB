@@ -229,9 +229,14 @@ src/storage/engines/impls/sst/
 
 === Search Coordinator
 
-**Location**: `src/storage/engines/impls/sst/search/coordinator.rs`
+NOTE: `SearchCoordinator` and the `search_vectors_unified_arc` entry are
+test-only (`#[cfg(test)]`, TD-SCANDEG-1). Production SST search enters at
+`SstEngine::search_vectors_unified` -> `fallback_to_direct_search` ->
+`direct_search_with`.
 
-The Search Coordinator provides intelligent strategy selection for optimal query performance:
+**Location**: `src/storage/engines/sst/search/coordinator.rs` (test-only)
+
+In test builds, the Search Coordinator selects among these strategies (historical design; not on the production path):
 
 ```rust
 pub enum SearchStrategy {

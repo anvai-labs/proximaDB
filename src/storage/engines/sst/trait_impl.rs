@@ -22,10 +22,11 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use std::collections::HashMap;
-use tracing::{debug, info};
+use tracing::info;
 
 use crate::core::search::results::OptimizedSearchRecord;
 use crate::storage::engines::sst::core::SstEngine;
+use crate::storage::engines::sst::segment_io::ResidentRangeRead as _;
 use crate::storage::engines::sst::{BACKGROUND_COMPACTION_HINT, COLLECTION_META_COMPLETE_HINT};
 use crate::storage::traits::{
     CompactionParameters, CompactionResult, FlushParameters, FlushResult, StorageFormatStrategy,
@@ -128,7 +129,13 @@ impl UnifiedStorageFormat for SstEngine {
         ))
     }
 
-    /// Delegate compaction to the compaction module
+    /// SST implements the cross-level FULL collapse (`compact_collection_full`),
+    /// so it honours `full` and `full_target_segments`.
+    fn supports_full_compaction(&self) -> bool {
+        true
+    }
+
+    /// Delegate compaction to the compaction module.
     async fn do_compact(&self, params: &CompactionParameters) -> Result<CompactionResult> {
         info!("🔄 SST: Starting compaction operation");
 
@@ -226,6 +233,135 @@ impl UnifiedStorageFormat for SstEngine {
         // TD-PAXRG-1: resolve the row-group switch from the collection's
         // `pax_rg_layout` tag (same precedence the flush seam applies).
         let rg_tags = collection_tags;
+        // TD-READFID-2 review: same base-quant resolution as flush.
+        let rg_layout = Some(super::flush::resolve_pax_rg_layout(rg_tags));
+        let vector_quant = Some(super::flush::resolve_pax_vector_quant(
+            params.collection_config.as_ref(),
+        ));
+        // TD-TIER-1 SC5: the output object carries the collection's tier.
+        let access_tier = params
+            .collection_config
+            .as_ref()
+            .and_then(|collection| collection.config.as_ref())
+            .and_then(crate::services::collection::storage_class::collection_access_tier);
+
+        // TD-COMPACT-14: an operator FULL request collapses the collection
+        // across levels instead of running one policy morsel.
+        if params.full {
+            // Refuse an invalid target BEFORE the metered region: a request
+            // rejected as invalid input is not a FULL that failed, and must
+            // not move the `error` series operators alert on (#2418 review
+            // round 13).
+            if params.full_target_segments == Some(0) {
+                anyhow::bail!("target_segments must be >= 1 (got 0)");
+            }
+            let full_config = self.config().compaction_config.clone().unwrap_or_default();
+            let timeout = std::time::Duration::from_millis(
+                params.timeout_ms.unwrap_or(full_config.full_timeout_ms),
+            );
+            let summary = compaction
+                .compact_collection_full(
+                    collection_object_id,
+                    std::path::Path::new(&collection_dir),
+                    precision_hint,
+                    rg_layout,
+                    vector_quant,
+                    access_tier,
+                    timeout,
+                    rg_tags,
+                    params.full_target_segments,
+                )
+                .await;
+            // TD-COMPACT-15: one observation per FULL request — the first
+            // place pass outcomes are counted, and EVERY outcome counts.
+            // Recording only on the `Ok` path (the call used `?`) meant a
+            // declined, failed, stalled or timed-out FULL emitted no sample
+            // at all, contradicting both the metric's doc and TD-COMPACT-14.
+            // `None` means the engine finished at/below target: distinguish
+            // a real collapse from a no-op so the counter is diagnosable.
+            let stop_label = match summary.as_ref() {
+                Ok(summary) => summary
+                    .stop_reason
+                    .unwrap_or(if summary.passes_executed > 0 {
+                        "completed"
+                    } else {
+                        "at_target"
+                    }),
+                Err(_) => "error",
+            };
+            if let Some(stop_metric) =
+                crate::metrics::operational_metrics::COMPACTION_FULL_STOP.as_ref()
+            {
+                stop_metric.with_label_values(&[stop_label]).inc();
+            }
+            let summary = summary?;
+            return Ok(CompactionResult {
+                success: true,
+                collections_affected: vec![collection_id],
+                bytes_read: Some(summary.bytes_read),
+                bytes_written: Some(summary.bytes_written),
+                duration_ms: Some(summary.duration_ms),
+                completed_at: chrono::Utc::now(),
+                engine_metrics: HashMap::from([
+                    ("full".to_string(), serde_json::json!(true)),
+                    (
+                        "segments_before".to_string(),
+                        serde_json::json!(summary.segments_before),
+                    ),
+                    (
+                        "segments_after".to_string(),
+                        serde_json::json!(summary.segments_after),
+                    ),
+                    (
+                        "passes".to_string(),
+                        serde_json::json!(summary.passes_executed),
+                    ),
+                    (
+                        "reached_target".to_string(),
+                        serde_json::json!(summary.reached_target),
+                    ),
+                    (
+                        "stop_reason".to_string(),
+                        serde_json::json!(summary.stop_reason),
+                    ),
+                    (
+                        "pending_files".to_string(),
+                        serde_json::json!(summary.pending_files),
+                    ),
+                    // Non-zero ⇒ `passes`/`bytes_*` are a lower bound (the
+                    // journal entry for that pass was gone before the loop
+                    // read it). Emitted always, so a consumer can tell
+                    // "complete" from "incomplete" without inferring it
+                    // from a zero (#2418 review round 22).
+                    (
+                        "unobserved_passes".to_string(),
+                        serde_json::json!(summary.unobserved_passes),
+                    ),
+                    // The population the loop's target actually compared
+                    // against; `segments_after` also counts AXIS-pending
+                    // segments the collapse was never able to touch
+                    // (#2418 review round 22).
+                    (
+                        "segments_compactable_after".to_string(),
+                        serde_json::json!(summary.segments_compactable_after),
+                    ),
+                    (
+                        "bytes_read".to_string(),
+                        serde_json::json!(summary.bytes_read),
+                    ),
+                    (
+                        "bytes_written".to_string(),
+                        serde_json::json!(summary.bytes_written),
+                    ),
+                    (
+                        "duration_ms".to_string(),
+                        serde_json::json!(summary.duration_ms),
+                    ),
+                ]),
+                ..Default::default()
+            });
+        }
+
         let enqueued = compaction
             .enqueue_due_compaction(
                 collection_object_id,
@@ -233,17 +369,10 @@ impl UnifiedStorageFormat for SstEngine {
                 std::path::Path::new(&collection_dir),
                 l0_threshold,
                 precision_hint,
-                Some(super::flush::resolve_pax_rg_layout(rg_tags)),
-                // TD-READFID-2 review: same base-quant resolution as flush.
-                Some(super::flush::resolve_pax_vector_quant(
-                    params.collection_config.as_ref(),
-                )),
-                // TD-TIER-1 SC5: the output object carries the collection's tier.
-                params
-                    .collection_config
-                    .as_ref()
-                    .and_then(|collection| collection.config.as_ref())
-                    .and_then(crate::services::collection::storage_class::collection_access_tier),
+                rg_layout,
+                vector_quant,
+                access_tier,
+                rg_tags,
             )
             .await?;
 
@@ -285,21 +414,29 @@ impl UnifiedStorageFormat for SstEngine {
         _base_path: &str,
         vector_id: &str,
     ) -> Result<Option<proximadb_records::ProximaRecord>> {
-        debug!(
-            "🔍 SST: Looking up vector {} in collection {}",
-            vector_id, collection_id
-        );
-
-        // Check if vector exists using bloom filters
-        let exists = self.contains_vector(collection_id, vector_id).await?;
-
-        if !exists {
-            return Ok(None);
-        }
-
-        // In a real implementation, this would read from SST files
-        // For now, return None as a placeholder
-        Ok(None)
+        // Single-record point-lookup refuses honestly (TD-FACADE-1).
+        //
+        // The former body called contains_vector and then returned None
+        // either way — and contains_vector answers "does ANY .sst file
+        // exist in the collection", not "does this id exist", so a `true`
+        // followed by Ok(None) read as "the record vanished".
+        //
+        // A scan-based lookup DOES exist on this engine (the point_lookup
+        // override below backs the live get-by-id path), but a
+        // single-record answer from it would need the MVCC winner rule,
+        // which is deliberately service-side (read.rs freshest_version;
+        // TD-MEMTABLE-MVCC-1 warns against hand-copying it) — a naive
+        // first-match would reintroduce the superseded-version bug. No
+        // conservative single-record answer exists without that rule, so
+        // this refuses. Zero callers reach this method today (census:
+        // every same-name production call targets the memtable's inherent
+        // method; only engine tests call the trait method).
+        let _ = (collection_id, _base_path, vector_id);
+        Err(anyhow::anyhow!(
+            "SST point-lookup is not implemented: contains_vector reports \
+             file-existence, not id-existence, and a fabricated Ok(None) would \
+             read as 'record missing'. See TD-FACADE-1."
+        ))
     }
 
     /// Delegate search to the search module
@@ -457,8 +594,13 @@ impl UnifiedStorageFormat for SstEngine {
                 // compaction reader (`read_batch`) cannot decode `.pax`. This is
                 // the path TD-112 AXIS-rebuild-from-SST uses, so it must read
                 // `.pax` or the index stays empty after a loss.
+                //
+                // TD-TIER-1 SC4: routed through the resident seam — a
+                // PERFORMANCE grant's pinned copy serves this whole-object read
+                // with zero GETs (this is the point-lookup / scan path: every
+                // get-by-id and list funnels through here).
                 let bytes = fs
-                    .read(file)
+                    .read_resident(file)
                     .await
                     .map_err(|e| anyhow::anyhow!("read_all_records: read pax {file}: {e}"))?;
                 all.extend(
@@ -634,6 +776,7 @@ mod tests {
             ..Default::default()
         };
         let params = CompactionParameters {
+            full: false,
             collection_id: Some("7".to_string()),
             synchronous: true,
             collection_config: Some(meta),
@@ -657,6 +800,7 @@ mod tests {
         let engine = create_test_engine().await;
         let directory = tempfile::tempdir().unwrap();
         let params = CompactionParameters {
+            full: false,
             collection_id: Some("7".to_string()),
             synchronous: true,
             hints: HashMap::from([(
@@ -670,6 +814,24 @@ mod tests {
             .await
             .expect_err("a meta-less compaction request must be declined");
         assert!(error.to_string().contains("no catalog collection meta"));
+    }
+
+    /// TD-FACADE-1 pin: the point-lookup must REFUSE, never fabricate
+    /// Ok(None). The former body returned None regardless of
+    /// contains_vector's answer — and contains_vector reports file-existence,
+    /// not id-existence — so a `true` followed by None read as "record
+    /// vanished". Message-asserting deliberately (a bare is_err() would pass
+    /// for many wrong reasons).
+    #[tokio::test]
+    async fn vector_by_id_refuses_instead_of_fabricating_absence() {
+        let engine = create_test_engine().await;
+        let err = engine
+            .vector_by_id("c", "/tmp", "some-id")
+            .await
+            .expect_err("point-lookup must refuse");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("not implemented"), "message: {msg}");
+        assert!(msg.contains("TD-FACADE-1"), "message: {msg}");
     }
 
     async fn create_test_engine() -> SstEngine {

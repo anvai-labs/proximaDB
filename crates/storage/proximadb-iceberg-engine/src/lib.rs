@@ -212,6 +212,14 @@ impl IcebergObjectStoreBridge {
     /// Wrap an existing object-store handle. Published Iceberg metadata then uses
     /// bridge-relative paths; call [`with_root_url`](Self::with_root_url) to make
     /// them absolute.
+    /// HEAD an object at a store path (size + existence). Used by the live
+    /// delete publisher's pre-CAS check (F15 gate 4b) so a swept Puffin
+    /// fails the publish loudly instead of committing a dangling reference.
+    pub async fn object_size(&self, path: &Path) -> Result<u64, StorageError> {
+        self.store.object_size(path).await
+    }
+
+    /// Wrap an existing object-store handle.
     pub fn new(store: ProximaObjectStore) -> Self {
         Self {
             store,

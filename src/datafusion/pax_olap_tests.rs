@@ -9,6 +9,10 @@
 mod tests {
     use std::sync::Arc;
 
+    // These tests pin process-global gates; `cargo test --lib` shares one
+    // process, so they must not interleave with other gate-pinning tests.
+    use serial_test::serial;
+
     use proximadb_catalog::{
         CatalogAuthorityMode, CatalogPhysicalFormat, CatalogStorageLayout, CatalogTableSchema,
     };
@@ -532,11 +536,14 @@ mod tests {
     /// is asserted against values derived from the writer's deterministic
     /// `created_at = (i+1) * 1000` pattern, so a wrong skip cannot hide.
     #[tokio::test]
+    #[serial]
     async fn predicate_pushdown_reduces_iobe() {
         // Ranged reads are what make block pruning visible in I/O terms; the
         // gate is default-off. nextest runs one test per process, so setting it
         // here initializes the OnceLock for THIS test's process only.
-        unsafe { std::env::set_var("PROXIMADB_DF_PAX_RANGED", "1") };
+        // Pin the cached gate directly: the plain `cargo test --lib` runner shares
+        // one process, so the set-once env cache cannot be re-armed mid-run.
+        crate::datafusion::engine_adapters::pax_adapter::set_pax_ranged_gate_for_tests(Some(true));
         // Diagnostic probe: if this fails, the gate never saw the env var (an
         // earlier init or env mutation failed); if it passes while `range_gets`
         // stays 0 below, load_ranged is silently falling back (index locate).
@@ -714,8 +721,11 @@ mod tests {
     /// * Both contexts run the same SQL and we first assert RESULT PARITY
     ///   (row-exactness across engines) before comparing byte totals.
     #[tokio::test]
+    #[serial]
     async fn pax_scan_reads_fewer_bytes_than_parquet_over_identical_data() {
-        unsafe { std::env::set_var("PROXIMADB_DF_PAX_RANGED", "1") };
+        // Pin the cached gate directly: the plain `cargo test --lib` runner shares
+        // one process, so the set-once env cache cannot be re-armed mid-run.
+        crate::datafusion::engine_adapters::pax_adapter::set_pax_ranged_gate_for_tests(Some(true));
         assert!(
             crate::datafusion::engine_adapters::pax_adapter::pax_ranged_read_enabled(),
             "ranged gate must be observable"
@@ -966,8 +976,11 @@ mod tests {
     /// The env var is deliberately still set: the property must hold with the
     /// gate ON, because "gate on" is exactly when the old code lied.
     #[tokio::test]
+    #[serial]
     async fn pax_backed_shape_stamps_the_backend_that_actually_serves() {
-        unsafe { std::env::set_var("PROXIMADB_DF_PAX_READER", "1") };
+        // Pin the cached reader gate directly (same shared-process reason as the
+        // ranged gate above).
+        crate::datafusion::engine_adapters::pax_adapter::set_pax_reader_gate_for_tests(Some(true));
 
         use crate::query::compute_scheduler::{ComputeScheduler, QueryShape};
         use crate::query::table_write_plan::ComputeBackend;
@@ -1000,8 +1013,11 @@ mod tests {
     /// analytical shape on native storage stays on Volcano, which is still worth
     /// holding.
     #[tokio::test]
+    #[serial]
     async fn non_pax_olap_shape_stays_volcano_despite_gate() {
-        unsafe { std::env::set_var("PROXIMADB_DF_PAX_READER", "1") };
+        // Pin the cached reader gate directly (same shared-process reason as the
+        // ranged gate above).
+        crate::datafusion::engine_adapters::pax_adapter::set_pax_reader_gate_for_tests(Some(true));
 
         use crate::query::compute_scheduler::{ComputeScheduler, QueryShape};
         use crate::query::table_write_plan::ComputeBackend;
@@ -1055,7 +1071,7 @@ mod tests {
     /// Writes a v4 row-group segment with `rows` records at
     /// `created_at = (i+1) * 1000` (32-dim embeddings so RGs carry real bulk).
     fn write_v4_segment(dir: &std::path::Path, rows: usize) -> std::path::PathBuf {
-        use proximadb_records::{EmbeddingCell, EmbeddingValues};
+        use proximadb_records::EmbeddingCell;
         use proximadb_storage_common::pax_block::RG_TARGET_MIN_BYTES;
 
         let seg = dir.join("seg.pax");
@@ -1095,8 +1111,11 @@ mod tests {
     /// pruned from the footer's per-RG zone summaries, and only surviving RG
     /// extents come off the wire. Row-exactness guards against wrong skips.
     #[tokio::test]
+    #[serial]
     async fn v4_ranged_scan_prunes_row_groups_off_the_wire() {
-        unsafe { std::env::set_var("PROXIMADB_DF_PAX_RANGED", "1") };
+        // Pin the cached gate directly: the plain `cargo test --lib` runner shares
+        // one process, so the set-once env cache cannot be re-armed mid-run.
+        crate::datafusion::engine_adapters::pax_adapter::set_pax_ranged_gate_for_tests(Some(true));
         assert!(
             crate::datafusion::engine_adapters::pax_adapter::pax_ranged_read_enabled(),
             "ranged gate must be observable"
@@ -1245,7 +1264,7 @@ mod tests {
         use arrow_schema::{DataType, Field, Schema};
         use datafusion::prelude::SessionContext;
         use proximadb_block_format::col_id;
-        use proximadb_records::{EmbeddingCell, EmbeddingValues, ProximaRecord};
+        use proximadb_records::{EmbeddingCell, ProximaRecord};
 
         use crate::datafusion::engine_adapters::register_pax_location;
         use crate::storage::persistence::filesystem::FilesystemFactory;
@@ -1349,8 +1368,11 @@ mod tests {
     /// a small fraction of that. Measured at the reader seam (ambient io_trace
     /// cannot see provider-partitioned reads).
     #[tokio::test]
+    #[serial]
     async fn v4_floor_kills_microgranule_amplification() {
-        unsafe { std::env::set_var("PROXIMADB_DF_PAX_RANGED", "1") };
+        // Pin the cached gate directly: the plain `cargo test --lib` runner shares
+        // one process, so the set-once env cache cannot be re-armed mid-run.
+        crate::datafusion::engine_adapters::pax_adapter::set_pax_ranged_gate_for_tests(Some(true));
 
         use arrow_schema::{DataType, Field, Schema};
         use datafusion::logical_expr::Operator;
@@ -1365,7 +1387,7 @@ mod tests {
         use crate::storage::persistence::filesystem::FilesystemFactory;
 
         const ROWS: usize = 4_000;
-        let build = |path: &std::path::Path, rg: bool| {
+        let _build = |path: &std::path::Path, rg: bool| {
             let records: Vec<ProximaRecord> = (0..ROWS)
                 .map(|i| {
                     let ts = (i + 1) as i64 * 1000;
@@ -1397,7 +1419,7 @@ mod tests {
         let v3_dir = dir.path().join("v3");
         std::fs::create_dir_all(&v3_dir).expect("v3 dir");
         {
-            use proximadb_records::{EmbeddingCell, EmbeddingValues};
+            use proximadb_records::EmbeddingCell;
             let seg = v3_dir.join("seg.pax");
             let mut writer = proximadb_storage_common::pax_block::PaxSegmentWriter::new(
                 &seg,
@@ -1433,8 +1455,7 @@ mod tests {
         let v4_dir = dir.path().join("v4");
         std::fs::create_dir_all(&v4_dir).expect("v4 dir");
         {
-            use proximadb_records::{EmbeddingCell, EmbeddingValues};
-            use proximadb_storage_common::pax_block::RG_TARGET_MIN_BYTES;
+            use proximadb_records::EmbeddingCell;
             let seg = v4_dir.join("seg.pax");
             let mut writer = proximadb_storage_common::pax_block::PaxSegmentWriter::new(
                 &seg,
@@ -1543,8 +1564,11 @@ mod tests {
     /// bytes_read > 0 and range_gets > 0 from a ctx.sql collect (this was
     /// measured 0/0 before the ProximaScanExec scope_with_handle rebind).
     #[tokio::test]
+    #[serial]
     async fn v4_provider_reads_attribute_to_ambient_scope() {
-        unsafe { std::env::set_var("PROXIMADB_DF_PAX_RANGED", "1") };
+        // Pin the cached gate directly: the plain `cargo test --lib` runner shares
+        // one process, so the set-once env cache cannot be re-armed mid-run.
+        crate::datafusion::engine_adapters::pax_adapter::set_pax_ranged_gate_for_tests(Some(true));
 
         use arrow_schema::{DataType, Field, Schema};
         use datafusion::prelude::SessionContext;
@@ -1552,7 +1576,6 @@ mod tests {
 
         use crate::datafusion::engine_adapters::register_pax_location;
         use crate::observability::io_trace;
-        use crate::storage::engines::sst::segment_format::write_pax_segment;
         use crate::storage::persistence::filesystem::FilesystemFactory;
 
         let dir = tempfile::tempdir().expect("tempdir");

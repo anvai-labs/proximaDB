@@ -36,23 +36,33 @@ class ProtoConverter:
 
     _DISTANCE_METRIC_STR_TO_INT: dict[str, int] = {
         "unspecified": 0,
+        "distance_metric_unspecified": 0,
         "cosine": 1,
         "euclidean": 2,
         "dot_product": 3,
         "hamming": 4,
         "manhattan": 5,
         "jaccard": 6,
-        "chebyshev": 7,
-        "canberra": 8,
-        "minkowski": 9,
-        "angular": 10,
+        # ANGULAR/CHEBYSHEV/CANBERRA/MINKOWSKI match
+        # proto/proximadb/v1/vector_types.proto (the former table rotated
+        # these four by one — angular encoded 10 while the proto says 7;
+        # guarded by TestProtoDriftGuard).
+        "angular": 7,
+        "chebyshev": 8,
+        "canberra": 9,
+        "minkowski": 10,
         "bray_curtis": 11,
         "hellinger": 12,
         "custom": 13,
     }
 
     _DISTANCE_METRIC_INT_TO_STR: dict[int, str] = {
-        v: k for k, v in _DISTANCE_METRIC_STR_TO_INT.items()
+        v: k
+        for k, v in _DISTANCE_METRIC_STR_TO_INT.items()
+        # skip alias keys so the fully-qualified form cannot win the
+        # last-key-wins comprehension (review round 1: 0 decoded as
+        # "distance_metric_unspecified" instead of "unspecified")
+        if not (k.endswith("_unspecified") and k != "unspecified")
     }
 
     # =========================================================================
@@ -70,6 +80,14 @@ class ProtoConverter:
         # Legacy fallbacks (map to viper)
         "mmap": 1,
         "hybrid": 1,
+        # Encode parity for the proto engines the SDK does not explicitly
+        # model (#2446 review MEDIUM-6): decode is truthful (reverse table
+        # below), so encode must round-trip the same names rather than
+        # silently coerce read-then-recreate traffic to SST.
+        "tst": 9,
+        "cedar": 10,
+        "titan": 11,
+        "chrono": 12,
     }
 
     _STORAGE_ENGINE_INT_TO_STR: dict[int, str] = {
@@ -80,6 +98,16 @@ class ProtoConverter:
         4: "helix",
         5: "swift",
         6: "raptor",
+        # Decode truthfully what the server sent. The FORWARD aliases
+        # above (mmap/hybrid -> viper) are the deliberate TD-SDKENG-1
+        # deprecation design and stay; but a server response carrying
+        # MMAP=7 must not silently decode as "sst"/"viper".
+        7: "mmap",
+        8: "hybrid",
+        9: "tst",
+        10: "cedar",
+        11: "titan",
+        12: "chrono",
     }
 
     # =========================================================================

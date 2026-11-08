@@ -38,6 +38,45 @@ link:TRACKER.adoc[the tracker] identifies mutation, placement and residency resi
 | SC-TE16 | Remote writer publishes during a listing-cache TTL | TTL bounds staleness, not strong freshness. A local generation is sufficient only for a proven single owner; otherwise validate an authoritative version. | No new zero-LIST strong-consistency claim for multiwriter serving.
 |===
 
+[[storage-foundations]]
+== Foundation contract: source identity, cache I/O and publication
+
+The filesystem resolver owns interpretation of an authoritative location. Preserve object
+keys exactly, including repeated separators and encoded characters; aliases are equivalent
+only when the backend resolver says so. Backend endpoint/account identity is part of the
+namespace: identical bucket/key text on two endpoints must not share cache or listing state.
+Local relative paths follow the configured local resolver; neither `/app` nor a cache root is
+an implicit durable base. Cache directories are explicit local resources, independently of
+any collection's authorized durable target.
+
+Use this identity consistently for listing generations, invalidation, persistent byte keys
+and residency protection. A textual substring match cannot establish collection ownership.
+Match the complete source identity and an object-boundary prefix, including collection
+incarnation where required; dropping/recreating a collection must not inherit old grants.
+Changing a persistent key encoding requires a version/miss-and-rebuild rule and coordinated
+protection-prefix reconciliation. A listing-only fix does not close this full contract.
+
+Repair existing implementations before adding another cache abstraction. A hit in
+`UnifiedCachingFilesystem` reads its local disk entry through local I/O, even when the source
+is S3 or Azure. Capacity accounting and eviction must not reacquire a held size lock; concurrent
+replacement, cancellation, oversize fills and failed writes preserve a coherent bounded cache.
+An evicted or corrupt entry is a miss; cache failure must not corrupt authoritative data.
+Reuse `PersistentByteStore`, existing range ports and protection groups for PAX. Share parent
+object/range coverage rather than storing both a whole-object copy and duplicate range bytes.
+
+A listing is an acceleration of existing discovery, not a new commit authority. Local flush
+and compaction publication invalidate after durable publication, before old visibility is
+retired; a lookup racing invalidation must not reinstall the old generation. Remote-owner
+freshness still needs a proven authoritative version or an explicitly bounded-stale contract.
+ADR-063 recovery authority, ADR-065 immutable segments and ADR-097 PAX/Iceberg publication
+remain unchanged; this work introduces no generic per-flush snapshot manifest.
+
+Acceptance is owned by TD-TIER-1 and TD-PAXDIR-2: distinct-key/endpoint collision tests,
+local resolver aliases, collection-boundary protection, concurrent fill/evict/failure tests,
+and read-after-flush/compaction tests. Multi-disk hot-add, weighted placement, source migration
+and fleet-wide residency are later contracts; a configured disk directory is not proof of
+JBOD or automatic gp3/st1/sc1 tiering.
+
 == Refined interfaces and v1 behavior
 
 === Collection policy and placement
@@ -194,6 +233,32 @@ link:../history/evidence/STORAGE_CLASS_MEDIA_EVIDENCE_2026_10_25.adoc[media evid
 Recheck provider rates/specifications before a purchasing or default decision.
 
 == Economics contracts
+
+=== Optimize over the lifetime of the application
+
+For SaaS/serverless use, prefer cloud-authoritative committed data and metadata. Compare
+remote range reads with cache admission over the actual job or service lifetime, under the
+same latency and recall constraint. Ten or one hundred repeated reads can justify a cache
+when they reuse expensive bytes; ten distinct queries may not. Do not download an entire
+collection merely because the task repeats. Include requests, useful/overread bytes, retrieval
+and transfer fees, cache writes, compute time, provisioned disk time and expected reuse before
+eviction or container exit. A retained disk incurs cost between daily or weekly jobs too.
+
+[cols="2,3,3",options="header"]
+|===
+| Scenario | Preferred starting policy | Proof before changing policy
+| One cold job, sparse reads | Direct object ranges, bounded memory; disk optional | End-to-end latency and cost including cache fill exceed neither budget.
+| Repeated queries in one task | Admit reused immutable ranges into a local pool | Reuse survives long enough to repay download/write cost; distinct queries and disabled result cache are included.
+| Daily/weekly batch write then exit | Explicit fallible materialization of the defined write set | Fresh process opens committed catalog/data; crash before publication retains replayable input or reattachable WAL.
+| On-demand read-only dashboard | Catalog follower plus optional cold cache | No ownership takeover/background writes; freshness and cold-start latency satisfy the declared contract.
+| Streaming writes beside readers | Existing WAL/memtable/flush/compaction lifecycle | Writer ownership, WAL durability and reader visibility are proved independently of cache residency.
+| Multiple local disks or provider tiers | Explicit authorized targets and separate cache pools | Capacity/failure domains, provider capability and measured sustained media behavior; no automatic migration until separately implemented.
+|===
+
+WAL buffering and LSM compaction are distinct: end-job flush may produce a small committed
+segment without waiting for all compaction. Coalescing and later compaction need a live owner
+or a subsequent job; neither a sleeping container nor a disk cache performs them. These
+experiments do not overturn ADR-069's local reattachable WAL default or promise WAL-free writes.
 
 === Three ledgers, not one misleading comparison
 

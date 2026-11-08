@@ -33,7 +33,7 @@
 //!   ADR-052 observe→ingest→act).
 
 use std::collections::HashMap;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, atomic::AtomicU8, atomic::Ordering};
 
 use arrow_array::builder::{Float32Builder, ListBuilder};
 use arrow_array::{
@@ -70,6 +70,60 @@ use crate::datafusion::proxima_table_provider::EngineType;
 use crate::storage::formats::FileSplit;
 use crate::storage::persistence::filesystem::FilesystemFactory;
 
+/// An env-read boolean gate, cached on first read, with a test-only override.
+///
+/// `cargo test --lib` runs every unit test in ONE process, so a test that
+/// flips the gate through the environment cannot win the `OnceLock` race —
+/// whichever caller reads first pins the value process-wide. Tests therefore
+/// pin the gate directly via the `set_for_tests` seam (and serialize on the
+/// `#[serial]` env-gate lock); production callers keep read-once env
+/// semantics. `Ordering::Relaxed` suffices: the gate is advisory routing,
+/// never a synchronization edge.
+struct EnvGate {
+    env_key: &'static str,
+    /// 0 = consult the cached env value, 1 = forced off, 2 = forced on.
+    test_override: AtomicU8,
+    cached: OnceLock<bool>,
+}
+
+impl EnvGate {
+    const fn new(env_key: &'static str) -> Self {
+        Self {
+            env_key,
+            test_override: AtomicU8::new(0),
+            cached: OnceLock::new(),
+        }
+    }
+
+    fn enabled(&self) -> bool {
+        match self.test_override.load(Ordering::Relaxed) {
+            1 => false,
+            2 => true,
+            _ => *self.cached.get_or_init(|| {
+                std::env::var(self.env_key)
+                    .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                    .unwrap_or(false)
+            }),
+        }
+    }
+
+    /// Test-only pin of the gate for the rest of this process. A test that
+    /// pins MUST hold the `#[serial]` env-gate lock for its whole body so it
+    /// cannot interleave with a test pinning or reading a different value.
+    #[cfg(test)]
+    fn set_for_tests(&self, enabled: Option<bool>) {
+        let code = match enabled {
+            Some(false) => 1,
+            Some(true) => 2,
+            None => 0,
+        };
+        self.test_override.store(code, Ordering::Relaxed);
+    }
+}
+
+static PAX_READER_GATE: EnvGate = EnvGate::new("PROXIMADB_DF_PAX_READER");
+static PAX_RANGED_GATE: EnvGate = EnvGate::new("PROXIMADB_DF_PAX_RANGED");
+
 /// `true` when the PAX-native OLAP scan is opted in (TD-OLAP-1 slice 1).
 /// Default OFF — **do not enable in production until slice 2 dispatch is
 /// wired** (see the TD-OLAP-1 slice-2 design record): with the gate ON the
@@ -81,12 +135,7 @@ use crate::storage::persistence::filesystem::FilesystemFactory;
 /// `pax_backed` predicate refinement), not on the storage layout (which
 /// defaulted to row-group Region D on 2026-08-28).
 pub fn pax_reader_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("PROXIMADB_DF_PAX_READER")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false)
-    })
+    PAX_READER_GATE.enabled()
 }
 
 /// `true` when the PAX-native reader should fetch a segment via **ranged reads**
@@ -96,12 +145,20 @@ pub fn pax_reader_enabled() -> bool {
 /// the whole-file path stays the default until the ranged path is baked (ADR-052
 /// observe→flip). Gate: `PROXIMADB_DF_PAX_RANGED`.
 pub fn pax_ranged_read_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("PROXIMADB_DF_PAX_RANGED")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false)
-    })
+    PAX_RANGED_GATE.enabled()
+}
+
+/// Test-only: pin [`pax_ranged_read_enabled`] for this process (see
+/// [`EnvGate`]). Hold the `#[serial]` env-gate lock while pinned.
+#[cfg(test)]
+pub(crate) fn set_pax_ranged_gate_for_tests(enabled: Option<bool>) {
+    PAX_RANGED_GATE.set_for_tests(enabled);
+}
+
+/// Test-only: pin [`pax_reader_enabled`] for this process (see [`EnvGate`]).
+#[cfg(test)]
+pub(crate) fn set_pax_reader_gate_for_tests(enabled: Option<bool>) {
+    PAX_READER_GATE.set_for_tests(enabled);
 }
 
 /// Smallest possible segment tail (`[body_len u32][PAXZ][SEGMENT_MAGIC 8]` at
@@ -174,7 +231,7 @@ impl PaxSplitReader {
     /// engaged by `PROXIMADB_DF_PAX_RANGED` (TD-DOC-PUSHDOWN-1).
     async fn load_bytes(&self, split: &FileSplit) -> DFResult<Vec<u8>> {
         self.filesystem_factory
-            .read(&split.file_path)
+            .read_resident(&split.file_path)
             .await
             .map_err(|e| {
                 DataFusionError::Execution(format!(
@@ -222,8 +279,8 @@ impl PaxSplitReader {
         // hand-built splits that never carried a size).
         let len = match split.object_size {
             Some(size) => size,
-            None => match self.filesystem_factory.metadata(path).await {
-                Ok(m) => m.size,
+            None => match self.filesystem_factory.object_size_resident(path).await {
+                Ok(size) => size,
                 Err(_) => return Ok(None), // no cheap size → fall back
             },
         };
@@ -267,7 +324,7 @@ impl PaxSplitReader {
         let prefix_len = (SEG_HEADER_PREFIX_LEN as u64).min(len);
         let prefix = self
             .filesystem_factory
-            .read_range(path, 0, prefix_len)
+            .read_range_resident(path, 0, prefix_len)
             .await
             .map_err(|e| DataFusionError::Execution(format!("PAX ranged header read: {e}")))?;
         let v4_index: Option<SegmentIndex> = if is_coalesced_segment(&prefix) {
@@ -275,7 +332,7 @@ impl PaxSplitReader {
                 Ok(h) if h.layout_version == SEG_LAYOUT_VERSION && h.footer_len > 0 => {
                     let body = self
                         .filesystem_factory
-                        .read_range(path, h.footer_off, h.footer_len)
+                        .read_range_resident(path, h.footer_off, h.footer_len)
                         .await
                         .map_err(|e| {
                             DataFusionError::Execution(format!("PAX ranged v4 footer read: {e}"))
@@ -331,7 +388,7 @@ impl PaxSplitReader {
             let start = len - probe;
             let suffix = self
                 .filesystem_factory
-                .read_range(path, start, probe)
+                .read_range_resident(path, start, probe)
                 .await
                 .map_err(|e| DataFusionError::Execution(format!("PAX ranged tail read: {e}")))?;
             match SegmentIndex::locate_in_suffix(&suffix) {
@@ -419,7 +476,7 @@ impl PaxSplitReader {
             .collect();
         let bufs = self
             .filesystem_factory
-            .read_ranges(path, ranges)
+            .read_ranges_prefetch_resident(path, ranges)
             .await
             .map_err(|e| DataFusionError::Execution(format!("PAX ranged block read: {e}")))?;
         let mut batches = Vec::with_capacity(bufs.len());
@@ -472,7 +529,7 @@ impl PaxSplitReader {
         let footer_start = block_size - BLOCK_FOOTER_SIZE as u64;
         let tail = self
             .filesystem_factory
-            .read_range(path, block_offset + footer_start, BLOCK_FOOTER_SIZE as u64)
+            .read_range_resident(path, block_offset + footer_start, BLOCK_FOOTER_SIZE as u64)
             .await
             .map_err(|e| DataFusionError::Execution(format!("PAX footer read: {e}")))?;
         let footer = BlockFooter::from_bytes(&tail)
@@ -489,7 +546,7 @@ impl PaxSplitReader {
         }
         let meta_buf = if footer_start > meta_start {
             self.filesystem_factory
-                .read_range(path, block_offset + meta_start, footer_start - meta_start)
+                .read_range_resident(path, block_offset + meta_start, footer_start - meta_start)
                 .await
                 .map_err(|e| DataFusionError::Execution(format!("PAX meta read: {e}")))?
         } else {

@@ -485,6 +485,16 @@ impl PlanExecutor {
                 }
                 _ => false,
             },
+            // Presence tests folded in from the former metadata_query
+            // vocabulary; same semantics as the null tests above.
+            ComparisonOperator::Exists => field_value.is_some_and(|value| !value.is_null()),
+            ComparisonOperator::NotExists => field_value.is_none_or(Value::is_null),
+            ComparisonOperator::Regex => match (field_value, expected) {
+                (Some(Value::String(text)), Value::String(pattern)) => regex::Regex::new(pattern)
+                    .map(|re| re.is_match(text))
+                    .unwrap_or(false),
+                _ => false,
+            },
         }
     }
 

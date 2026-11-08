@@ -64,6 +64,10 @@
 // Multi-process coordination
 pub mod coordination;
 
+/// Read-only published-catalog bootstrap, independent of writer services.
+pub mod catalog_follower;
+pub use catalog_follower::{EmbeddedCatalogFollower, EmbeddedCatalogFollowerConfig};
+
 // Re-export embedded support types for public API compatibility.
 pub use proximadb_embedded_common::{
     EmbeddedMetrics, EmbeddedMetricsCollector, HistogramStats, LatencyStats, LatencyTimer,
@@ -114,6 +118,7 @@ pub use agent_memory::{
 pub use streaming::{EmbeddedSearchIterator, StreamingSearchConfig, StreamingSearchResult};
 
 use proximadb::core::config::{AdvancedPruneConfig, PruneModeConfig};
+use proximadb_records::conversions::json_to_proxima;
 // FA-b: only referenced on the `#[cfg(feature = "abac-policy")]` trailing arg of
 // `unified_search_native`. Embedded mode is abac-OFF by default; this import is
 // gated to match (the `proximadb-abac` dep is optional, behind the same feature).
@@ -133,7 +138,8 @@ pub struct EmbeddedConfig {
     pub default_engine: String,
     /// Enable WAL for durability
     pub enable_wal: bool,
-    /// WAL sync mode: "immediate", "batch", or "async"
+    /// WAL sync mode: "immediate"/"batch" (PerBatch), "async" (Periodic), or
+    /// canonical "PerBatch", "Periodic", "None". Unknown values are rejected.
     pub wal_sync_mode: String,
     /// Block prune mode for approximate search: "sqrt" (default), "ratio", "fixed", or "exact" (disabled)
     pub block_prune_mode: String,
@@ -315,7 +321,8 @@ impl EmbeddedConfig {
 /// Storage location configuration for multi-disk support
 #[derive(Debug, Clone)]
 pub struct StorageLocationConfig {
-    /// Path to storage directory (will be converted to file:// URL)
+    /// Local directory or explicit storage URI. URI conversion does not imply
+    /// that the embedded bootstrap supports opening that backend.
     pub path: String,
     /// Weight for data distribution (higher = more data)
     pub weight: u32,
@@ -345,23 +352,22 @@ impl StorageLocationConfig {
         self
     }
 
-    /// Convert to file:// URL format for internal use
+    /// Preserve explicit storage URIs; convert local paths to file:// URLs.
     pub fn to_url(&self) -> String {
-        if self.path.starts_with("file://") {
-            self.path.clone()
-        } else {
-            let abs_path = if self.path.starts_with('/') {
-                self.path.clone()
-            } else {
-                // Make relative path absolute
-                std::env::current_dir().map_or_else(
-                    |_| self.path.clone(),
-                    |p| p.join(&self.path).to_string_lossy().to_string(),
-                )
-            };
-            format!("file://{}", abs_path)
-        }
+        storage_path_url(&self.path)
     }
+}
+
+/// URI identity belongs to the configured backend, not the process directory.
+fn storage_path_url(path: &str) -> String {
+    if path.contains("://") {
+        return path.to_string();
+    }
+    let absolute = std::env::current_dir().map_or_else(
+        |_| path.to_string(),
+        |cwd| cwd.join(path).to_string_lossy().into_owned(),
+    );
+    format!("file://{absolute}")
 }
 
 /// Backwards-compat alias for [`EmbeddedSearchResult`].
@@ -429,38 +435,6 @@ pub(crate) fn proxima_value_to_string(v: proximadb_data_model::ProximaValue) -> 
             serde_json::Value::String(s) => s,
             json => json.to_string(),
         },
-    }
-}
-
-pub(crate) fn json_to_proxima_value(
-    value: serde_json::Value,
-) -> proximadb_data_model::ProximaValue {
-    use proximadb_data_model::ProximaValue;
-
-    match value {
-        serde_json::Value::Null => ProximaValue::Null,
-        serde_json::Value::Bool(v) => ProximaValue::Boolean(v),
-        serde_json::Value::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                ProximaValue::Int64(i)
-            } else if let Some(u) = n.as_u64() {
-                ProximaValue::UInt64(u)
-            } else if let Some(f) = n.as_f64() {
-                ProximaValue::Float64(f)
-            } else {
-                ProximaValue::String(n.to_string())
-            }
-        }
-        serde_json::Value::String(v) => ProximaValue::String(v),
-        serde_json::Value::Array(values) => {
-            ProximaValue::Array(values.into_iter().map(json_to_proxima_value).collect())
-        }
-        serde_json::Value::Object(fields) => ProximaValue::Map(
-            fields
-                .into_iter()
-                .map(|(key, value)| (key, json_to_proxima_value(value)))
-                .collect(),
-        ),
     }
 }
 
@@ -790,6 +764,20 @@ impl EmbeddedProximaDB {
     /// This initializes the database with the given configuration,
     /// including multi-disk support and WAL settings.
     pub fn new(config: EmbeddedConfig) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        // Validate before acquiring ownership or touching process globals.
+        let storage_config = Self::to_storage_config(&config)?;
+        if storage_config
+            .storage_locations
+            .iter()
+            .map(|location| location.url.as_str())
+            .chain(std::iter::once(storage_config.metadata_url.as_str()))
+            .any(|url| !url.starts_with("file://"))
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "embedded cloud storage requires an explicit catalog role and local work directory; the local constructor cannot open remote roots",
+            ).into());
+        }
         let base_path = config
             .storage_locations
             .first()
@@ -884,9 +872,6 @@ impl EmbeddedProximaDB {
             .thread_stack_size(8 * 1024 * 1024)
             .enable_all()
             .build()?;
-
-        // Convert EmbeddedConfig to StorageConfig
-        let storage_config = Self::to_storage_config(&config);
 
         // Initialize SharedServices using the runtime
         let (shared_services, collection_port) =
@@ -1006,6 +991,11 @@ impl EmbeddedProximaDB {
                 let Ok(plan) =
                     proximadb::storage::flush_materializer::flush_plan_from_collection_meta(
                         &collection,
+                        // Embedded never reads the catalog properties at
+                        // this call site: NOT loaded. (Properties are simply
+                        // not consulted here — the same reason as the sibling
+                        // site below.)
+                        None,
                     )
                 else {
                     continue;
@@ -1056,8 +1046,24 @@ impl EmbeddedProximaDB {
     }
 
     /// Convert EmbeddedConfig to the internal StorageConfig
-    fn to_storage_config(config: &EmbeddedConfig) -> proximadb::core::config::StorageConfig {
+    fn to_storage_config(
+        config: &EmbeddedConfig,
+    ) -> Result<proximadb::core::config::StorageConfig, std::io::Error> {
         use proximadb::core::config::{StorageConfig, StorageLocation};
+
+        // Translate the embedded API's historical spellings into the one
+        // canonical WAL converter used by both server and embedded services.
+        let sync_mode = match config.wal_sync_mode.to_ascii_lowercase().as_str() {
+            "immediate" | "batch" | "perbatch" | "always" => "PerBatch",
+            "async" | "periodic" => "Periodic",
+            "none" => "None",
+            _ => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "invalid wal_sync_mode: expected immediate, batch, async, PerBatch, Periodic, or None",
+                ));
+            }
+        };
 
         // Convert storage locations
         let storage_locations: Vec<StorageLocation> = config
@@ -1072,17 +1078,7 @@ impl EmbeddedProximaDB {
             .collect();
 
         // Convert metadata path to URL
-        let metadata_url = if config.metadata_path.starts_with("file://") {
-            config.metadata_path.clone()
-        } else if config.metadata_path.starts_with('/') {
-            format!("file://{}", config.metadata_path)
-        } else {
-            let abs_path = std::env::current_dir().map_or_else(
-                |_| config.metadata_path.clone(),
-                |p| p.join(&config.metadata_path).to_string_lossy().to_string(),
-            );
-            format!("file://{}", abs_path)
-        };
+        let metadata_url = storage_path_url(&config.metadata_path);
 
         // Create optimized SST config for embedded mode
         // Adaptive bloom filters are automatically used by the SST writer
@@ -1124,7 +1120,7 @@ impl EmbeddedProximaDB {
             other => Some(PruneModeConfig::Simple(other.to_string())),
         };
 
-        StorageConfig {
+        Ok(StorageConfig {
             storage_locations,
             metadata_url,
             cache_size_mb: config.cache_size_mb as u64,
@@ -1140,11 +1136,12 @@ impl EmbeddedProximaDB {
             }),
             wal_config: proximadb::core::config::WriteBufferUserConfig {
                 enable_wal: config.enable_wal,
+                sync_mode: sync_mode.to_string(),
                 ..Default::default()
             },
             prune_mode,
             ..Default::default()
-        }
+        })
     }
 
     /// Initialize the internal services asynchronously
@@ -1692,9 +1689,7 @@ impl EmbeddedProximaDB {
                     for (k, v) in meta_slice {
                         props.insert(
                             k.clone(),
-                            proximadb_records::ProximaTreeNode::Value(json_to_proxima_value(
-                                v.clone(),
-                            )),
+                            proximadb_records::ProximaTreeNode::Value(json_to_proxima(v)),
                         );
                     }
                 }
@@ -2387,10 +2382,11 @@ impl EmbeddedProximaDB {
         }
     }
 
-    /// Flush all pending writes to disk
+    /// Materialize pending vector writes through the shared write pipeline.
     ///
-    /// This forces all in-memory data (memtable/WAL) to be persisted to storage engine files.
-    /// It also triggers compaction to consolidate data into SST files for durability.
+    /// Concurrent writes can remain pending after this call. Success does not
+    /// wait for compaction or provide a cross-process visibility receipt, and
+    /// does not attest to persistence of graph or other modality writes.
     pub fn flush(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // Check write access before flushing
         self.check_write_access()?;
@@ -2469,6 +2465,7 @@ impl EmbeddedProximaDB {
                     // unified SST engine as the create-failure fallback.
                     let plan = match proximadb::storage::flush_materializer::flush_plan_from_collection_meta(
                         &collection_metadata,
+                        None, // not catalog-loaded (see the sibling site)
                     ) {
                         Ok(plan) => plan,
                         Err(error) => {
@@ -3043,22 +3040,6 @@ impl EmbeddedProximaDB {
         None
     }
 
-    /// Close the embedded database gracefully
-    ///
-    /// This method should be called before dropping the database to:
-    /// 1. Persist the RL planner policy to disk
-    /// 2. Log final statistics
-    ///
-    /// Note: Calling `flush()` before `close()` is recommended to ensure
-    /// all vector data is persisted.
-    ///
-    /// # Example
-    /// ```rust,ignore
-    /// let db = EmbeddedProximaDB::new(config)?;
-    /// // ... use the database ...
-    /// db.flush()?;  // Persist vector data
-    /// db.close();   // Persist RL policy and cleanup
-    /// ```
     /// Flush every graph's WAL buffer to disk. Idempotent and best-effort.
     ///
     /// Graph writes land in `UnifiedWALWriter::current_segment_data`, an
@@ -3106,6 +3087,25 @@ impl EmbeddedProximaDB {
         });
     }
 
+    /// Materialize pending vector writes, then release this handle's ownership.
+    ///
+    /// The exclusive borrow prevents concurrent API calls through this handle
+    /// while it flushes. A flush failure leaves the handle open and retains its
+    /// ownership so the caller can retry or choose another recovery action.
+    /// This has the same vector scope as [`Self::flush`]: it is not a cloud
+    /// publication receipt or an all-modality durability barrier. The graph
+    /// flush and policy save performed by [`Self::close`] remain best-effort.
+    pub fn flush_and_close(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.flush()?;
+        self.close();
+        Ok(())
+    }
+
+    /// Release ownership after best-effort graph WAL and policy persistence.
+    ///
+    /// This compatibility API does not materialize pending vector writes.
+    /// Use [`Self::flush_and_close`] to observe a vector flush failure before
+    /// ownership is released. Repeated calls to `close` are harmless.
     pub fn close(&self) {
         if self.closed.swap(true, std::sync::atomic::Ordering::SeqCst) {
             return;
@@ -5020,11 +5020,18 @@ impl EmbeddedProximaDB {
         SqlObject { fields }
     }
 
-    /// Convert serde_json::Value to SqlValue
+    /// Convert serde_json::Value to SqlValue — canonical conversion in
+    /// proximadb-proto (`serde_impls`). This path previously routed through
+    /// `json_to_proxima` + `proxima_to_sql_value`, whose u64
+    /// branch silently wrapped values above i64::MAX to `Int64Value`; the
+    /// canonical fn encodes those as `StringValue` (decimal text) instead
+    /// (pinned by the proto guard test). JSON `null` also changes shape —
+    /// `SqlValue { value: None }` → `Some(NullValue(0))` — which every
+    /// downstream consumer (Serialize, `sql_value_to_json`,
+    /// `sql_value_to_proxima`, tree-node conversion) maps identically;
+    /// only the raw oneof presence on the wire differs.
     fn json_to_sql_value(value: &serde_json::Value) -> proximadb::proto::proximadb_v1::SqlValue {
-        proximadb::core::search::results::proxima_value_to_sql_value(json_to_proxima_value(
-            value.clone(),
-        ))
+        proximadb::proto::serde_impls::json_to_sql_value(value)
     }
 
     /// Convert SqlObject to serde_json::Value

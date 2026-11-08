@@ -18,7 +18,13 @@ T = TypeVar("T", bound="IngestDocumentMetadata")
 
 @_attrs_define
 class IngestDocumentMetadata:
-    """Arbitrary metadata fields. Stored as ProximaRecord props."""
+    """Arbitrary metadata fields. Stored as ProximaRecord props.
+
+    `props` is accepted as an alias (TD-REC-1): the records surface
+    documents `props` as the canonical map and accepts `metadata` as its
+    alias, so this surface accepts both spellings of the same map too.
+
+    """
 
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 

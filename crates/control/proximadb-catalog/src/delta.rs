@@ -1281,16 +1281,7 @@ impl Catalog for DeltaCatalog {
     // ========================
 
     async fn get_statistics(&self, identifier: &TableIdentifier) -> Result<CatalogTableStatistics> {
-        if let Some(stats) = self.cache.get_statistics(&self.name, identifier) {
-            return Ok(stats);
-        }
-
-        // Delta Lake stores statistics in add actions
-        // For now, return default stats
-        let stats = CatalogTableStatistics::default();
-        self.cache
-            .put_statistics(&self.name, identifier, stats.clone());
-        Ok(stats)
+        Ok(self.cache.cached_default_statistics(&self.name, identifier))
     }
 
     async fn update_statistics(

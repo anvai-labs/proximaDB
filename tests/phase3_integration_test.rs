@@ -42,7 +42,7 @@ mod streaming_flush_tests {
     use proximadb::streaming::{
         BackpressureLevel, FlushRetryConfig, SessionConfig, StreamConfig, StreamCoordinator,
     };
-    use proximadb_records::{EmbeddingCell, EmbeddingValues, ProximaRecord};
+    use proximadb_records::{EmbeddingCell, ProximaRecord};
 
     /// Helper to create test vectors
     fn create_test_vectors(count: usize, start_id: usize, dimension: usize) -> Vec<ProximaRecord> {

@@ -13,9 +13,8 @@
 #![cfg(feature = "datafusion-integration")]
 
 use std::collections::HashMap;
-use std::sync::Arc;
 
-use proximadb::datafusion::{CollectionInfo, EngineType, PruningStatistics, SplitReader};
+use proximadb::datafusion::{CollectionInfo, EngineType, PruningStatistics};
 use proximadb::storage::formats::{
     CacheStatus, ColumnBounds, FileSplit, ScalarPredicate, ScalarValue, SpatialBounds,
     SplitStatistics, SplitType, StorageTier,
@@ -616,7 +615,6 @@ mod cross_engine_tests {
 // ============================================================================
 
 mod schema_tests {
-    use super::*;
     use proximadb::datafusion::engine_adapters::common::{
         estimate_record_size, flat_vector_schema, vector_collection_schema,
     };

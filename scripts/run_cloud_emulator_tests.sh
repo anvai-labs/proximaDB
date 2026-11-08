@@ -21,8 +21,9 @@
 #            disk. Compiles the server binary, so it gets its OWN scope/job (kept
 #            off --fast/--all's compile budget).
 #
-# Requires: docker, cargo, aws CLI (S3 bucket), az CLI (Azurite container),
-# curl (fake-gcs bucket). On GitHub ubuntu-latest all are preinstalled.
+# Requires: docker, cargo (plus cargo-nextest for --qa), aws CLI (S3 bucket), az CLI (Azurite container),
+# curl (fake-gcs bucket). QA installs cargo-nextest explicitly; the other
+# command-line tools are available on GitHub ubuntu-latest.
 #
 # Azure + S3 are strict (PUT-with-tier must be accepted + round-trip). GCS is
 # best-effort: the test itself skips on a fake-gcs/object_store incompatibility,
@@ -290,6 +291,14 @@ if [ "$SCOPE" = "qa" ]; then
   # compile efficiency). cloud-full (= aws+azure+gcp) is already built above;
   # this is a near-free incremental build + run. Emulators (Azurite/LocalStack/gcs)
   # are started by the setup trap before this scope runs.
+  # Keep the offline TLS constructor regression in a fresh process so no prior
+  # cloud client can install a provider and mask the embedded-caller failure.
+  # This QA scope reuses the integration binary without building root lib tests.
+  echo "==> QA tier: GCS HTTPS constructor initializes TLS without server startup"
+  CARGO_BUILD_JOBS=1 cargo nextest run -p proximadb --features cloud-full \
+    --test objstore_backend_contract_test \
+    -E 'test(=gcs_https_constructor_initializes_crypto_provider)'
+
   echo "==> TD-OBJSTORE-5 S2: backend contract tests (Azure/S3 strict, GCS best-effort)"
   CARGO_BUILD_JOBS=1 cargo test -p proximadb --features cloud-full \
     --test objstore_backend_contract_test \
@@ -454,3 +463,139 @@ else
 fi
 
 echo "==> Cloud emulator tier validation complete"
+
+# ── TD-TIER-1 SC5: tier round-trip of a FLUSHED+COMPACTED segment (server path) ──
+#
+# The probes above prove a tiered PUT is APPLIED by the object store. This
+# section proves the SERVER's write path (create → admission → flush plan →
+# enqueue_due_compaction → tiered publish) puts the collection's configured
+# tier on the COMPACTION OUTPUT (L1) while the L0 flush output stays at the
+# account default — the tier mix at rest. `object_store` 0.13 cannot surface a
+# tier on read (TD-CI-7), so the Rust test
+# (compaction_output_carries_the_collection_tier_end_to_end) drives the real
+# server against the emulator, asserts the L0/L1 mix structurally, and leaves
+# the inventory in a manifest; the tier VALUES are asserted out-of-band below.
+# One build (--features aws,azure), two arms (Azurite + LocalStack). GCS stays
+# best-effort/nightly like every other tier read-back in this script.
+#
+# SCOPE-GATED away from --fast: this section compiles the full
+# proximadb-server test target (~12.8GB peak rustc, 35-40m serialized — the
+# same class the qa-gate job budgets 120m + sccache + swap for). The --fast PR
+# job (ci.yml object-store-emulator-tests, 15m, read-only rust-cache, no
+# sccache) exists precisely to avoid that compile; running the section there
+# would kill the job mid-build on the very PR that adds it. Default/--all
+# scope (the qa-gate cloud-emulator job + local `make cloud-emulator-test`)
+# has the budget.
+if [ "$SCOPE" = "fast" ]; then
+  echo "==> TD-TIER-1 SC5 tier round-trip: skipped in --fast scope (heavy server-test build; runs in default/--all)"
+else
+TIER_MANIFEST="$(mktemp -t tier_roundtrip.XXXXXX.json)"
+export PROXIMADB_TIER_ROUNDTRIP_MANIFEST="$TIER_MANIFEST"
+
+tier_manifest_keys() { # $1 = "l0" | "l1" — full object keys (bucket stripped), one per line
+  # HARD-FAILS on an extraction error or an empty set: a silent empty list
+  # would make the read-back loops below iterate nothing and exit 0 — a check
+  # that could not fail, looking for a subject it could not find (TD-CI-7).
+  # The Rust test guarantees >=1 object of each class before writing the
+  # manifest, so emptiness here means the harness itself broke.
+  local keys
+  keys="$(python3 -c '
+import json, sys
+manifest = json.load(open(sys.argv[1]))
+field = sys.argv[2]
+for url in manifest[field]:
+    rest = url.split("://", 1)[1]
+    print(rest.split("/", 1)[1])
+' "$TIER_MANIFEST" "$1")" || {
+    echo "::error::manifest key extraction for '$1' failed — the tier read-back cannot run"
+    exit 1
+  }
+  if [ -z "$keys" ]; then
+    echo "::error::manifest lists zero '$1' objects — the tier read-back would be vacuous"
+    exit 1
+  fi
+  printf '%s\n' "$keys"
+}
+
+tier_roundtrip_run() { # $1 = label, $2 = PROXIMADB_OBJECT_STORE_URL
+  echo "==> TD-TIER-1 SC5 tier round-trip ($1): armed-compaction output carries the collection tier"
+  rm -f "$TIER_MANIFEST"
+  # CARGO_BUILD_JOBS=1: same OOM discipline as the restart scope (a single
+  # root-crate rustc peaks at ~12.8GB; the first arm pays the build, the
+  # second reuses it).
+  PROXIMADB_OBJECT_STORE_URL="$2" CARGO_BUILD_JOBS=1 cargo test -p proximadb-server \
+    --features aws,azure --test object_store_restart_recovery \
+    compaction_output_carries_the_collection_tier_end_to_end \
+    -- --ignored --nocapture --test-threads=1 \
+    || { echo "::error::tier round-trip test failed ($1)"; exit 1; }
+  [ -s "$TIER_MANIFEST" ] || { echo "::error::tier round-trip ($1) wrote no manifest"; exit 1; }
+}
+
+tier_readback_azurite() {
+  local failures=0 tier key
+  while IFS= read -r key; do
+    [ -n "$key" ] || continue
+    tier="$(az storage blob show --container-name "$CONTAINER_BUCKET" --name "$key" \
+      --connection-string "$AZURITE_CONN" --query properties.blobTier -o tsv 2>/dev/null || echo "")"
+    echo "  blobTier($key) = '${tier:-<unknown>}'"
+    if [ "$tier" != "Cool" ]; then
+      echo "::error::compacted object '$key' is '${tier:-<unknown>}' — the collection tier never reached the compaction output"
+      failures=$((failures + 1))
+    fi
+  done < <(tier_manifest_keys l1)
+  while IFS= read -r key; do
+    [ -n "$key" ] || continue
+    tier="$(az storage blob show --container-name "$CONTAINER_BUCKET" --name "$key" \
+      --connection-string "$AZURITE_CONN" --query properties.blobTier -o tsv 2>/dev/null || echo "")"
+    echo "  blobTier($key) = '${tier:-<unknown>}' (L0 — must stay at the account default)"
+    if [ "$tier" = "Cool" ]; then
+      echo "::error::L0 object '$key' carries Cool — flush output must keep the account default (minimum-duration trap)"
+      failures=$((failures + 1))
+    fi
+  done < <(tier_manifest_keys l0)
+  [ "$failures" -eq 0 ] || exit 1
+}
+
+tier_readback_s3() {
+  local failures=0 class key
+  while IFS= read -r key; do
+    [ -n "$key" ] || continue
+    class="$(s3_aws s3api head-object --bucket "$CONTAINER_BUCKET" --key "$key" \
+      --query StorageClass --output text 2>/dev/null || echo "")"
+    echo "  StorageClass($key) = '${class:-<unknown>}'"
+    if [ "$class" != "STANDARD_IA" ]; then
+      echo "::error::compacted object '$key' is '${class:-<unknown>}' — the collection tier never reached the compaction output"
+      failures=$((failures + 1))
+    fi
+  done < <(tier_manifest_keys l1)
+  while IFS= read -r key; do
+    [ -n "$key" ] || continue
+    class="$(s3_aws s3api head-object --bucket "$CONTAINER_BUCKET" --key "$key" \
+      --query StorageClass --output text 2>/dev/null || echo "")"
+    echo "  StorageClass($key) = '${class:-<unknown>}' (L0 — must stay at the account default)"
+    if [ "$class" = "STANDARD_IA" ]; then
+      echo "::error::L0 object '$key' carries STANDARD_IA — flush output must keep the account default (minimum-duration trap)"
+      failures=$((failures + 1))
+    fi
+  done < <(tier_manifest_keys l0)
+  [ "$failures" -eq 0 ] || exit 1
+}
+
+# Arm 1 — Azurite (adls://): the production from_url + emulator env.
+export PROXIMADB_AZURE_EMULATOR=1 AZURE_STORAGE_USE_EMULATOR=true AZURE_ALLOW_HTTP=true
+export AZURE_STORAGE_ACCOUNT=devstoreaccount1 AZURE_STORAGE_ACCOUNT_NAME=devstoreaccount1
+tier_roundtrip_run "Azurite adls" "adls://$CONTAINER_BUCKET/tier1-tier-roundtrip"
+if command -v az >/dev/null 2>&1; then
+  tier_readback_azurite
+else
+  echo "::warning::az CLI not installed — Azure tier round-trip not verified out-of-band"
+fi
+
+# Arm 2 — LocalStack (s3://): the factory's endpoint/path-style overrides.
+export PROXIMADB_S3_ENDPOINT="http://127.0.0.1:$S3_EMULATOR_PORT" PROXIMADB_S3_FORCE_PATH_STYLE=true
+export AWS_ACCESS_KEY_ID="$S3_ACCESS_KEY" AWS_SECRET_ACCESS_KEY="$S3_SECRET_KEY" AWS_DEFAULT_REGION=us-east-1
+tier_roundtrip_run "LocalStack s3" "s3://$CONTAINER_BUCKET/tier1-tier-roundtrip"
+tier_readback_s3
+
+echo "==> TD-TIER-1 SC5 tier round-trip validation complete"
+fi

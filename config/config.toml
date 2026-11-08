@@ -4,6 +4,11 @@
 [server]
 node_id = "proximadb-local"
 bind_address = "127.0.0.1"
+# In unified mode (default, see [api].unified_mode) THIS value does NOT bind
+# anything: the public multiplexer binds [api].unified_port (default 5678) and
+# the internal REST listener derives from it (+10000). The CLI -p/--port flag
+# writes this field, which NO bind path consumes — it is a no-op. To move the
+# public port, set [api].unified_port.
 port = 5678
 data_dir = "/tmp/proximadb/data"
 
@@ -156,8 +161,10 @@ vector_first_min_selectivity = 0.5
 [api]
 # Local single-tenant development only. Set false before enabling [security].
 enable_pgwire = true
-# Unified Port Mode - all protocols on single port
+# Unified Port Mode - all protocols on single port. The multiplexer binds
+# unified_port (default 5678 when unset — NOT [server].port).
 unified_mode = true
+# unified_port = 5678
 
 # Multi-Port Mode
 grpc_port = 5679
@@ -214,6 +221,9 @@ dashboard_refresh_interval_seconds = 60
 # on `segment_bytes` OR `flush_interval_s` (whichever first). Object-store dispatch
 # (object_store_uri / access_tier / partition_by / retention_days) arrives in S2.
 # Per-field env overrides: PROXIMADB_IO_TRACE_SINK[_LOCAL_DIR|_SEGMENT_BYTES|...].
+# NOTE: flush_interval_s here is the ETL SINK's segment-sealing timer — it has
+# nothing to do with flushing data to storage. The storage flush driver's keys
+# are [storage.wal_config] flush_interval_secs / memory_flush_size_bytes.
 [observability.io_trace_sink]
 enabled = false
 # local_dir = "./log/io_trace"
@@ -297,6 +307,16 @@ max_entries = 10000
 [storage.wal_config]
 # Global manifest location (centralized tracking of all WAL files)
 global_manifest_url = "file:///tmp/proximadb/manifest"
+# ADR-069 auto-flush driver RPO floor (seconds). DEFAULT 300 — the driver
+# spawns whenever this is > 0 and time-drains memtables to L0 PAX segments on
+# its tick; the RPO timer overrides the predicted-segment floor, so a trickle
+# collection still drains. Lower it to drain sooner (a collection recovered
+# from WAL at startup re-enters the driver's unflushed list only at its first
+# post-recovery write). 0 disables the time trigger (capacity watermarks can
+# still flush); with both 0 and memory_flush_size_bytes unreachable, data
+# stays in WAL+memtable (searched from there) until an explicit flush (e.g.
+# the Arrow Flight `flush_collection` action).
+# flush_interval_secs = 10
 memory_flush_size_bytes = 16777216
 global_flush_threshold = 4294967296
 enable_wal = true

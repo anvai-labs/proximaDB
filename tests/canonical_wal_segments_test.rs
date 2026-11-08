@@ -191,9 +191,16 @@ async fn corrupt_sealed_segment_fails_closed_but_active_torn_tail_is_repaired() 
         .await
         .err()
         .expect("a truncated sealed segment must fail the open");
+    // With summary sections (TD-WALBOOT-1), a 3-byte tail truncation may chop
+    // the section's magic — the structural trim then leaves section bytes the
+    // frame decoder rejects, so the error names the frame decode instead of
+    // the segment scan. Either message satisfies the intent: fail CLOSED on
+    // a corrupt sealed segment, never a silent partial read.
+    let msg = format!("{err:#}");
     assert!(
-        format!("{err:#}").contains("sealed canonical WAL segment"),
-        "{err:#}"
+        msg.contains("sealed canonical WAL segment")
+            || msg.contains("decoding canonical WAL frame"),
+        "{msg}"
     );
     Ok(())
 }

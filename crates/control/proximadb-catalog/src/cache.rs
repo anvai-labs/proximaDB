@@ -284,6 +284,23 @@ impl CatalogCache {
         }
     }
 
+    /// Cache-or-default statistics read for backends without native
+    /// statistics: returns the cached value when present, otherwise caches
+    /// and returns a default. Collapses the five identical per-backend stub
+    /// bodies (glue/delta/iceberg/polaris/unity) onto one implementation.
+    pub fn cached_default_statistics(
+        &self,
+        catalog: &str,
+        id: &TableIdentifier,
+    ) -> CatalogTableStatistics {
+        if let Some(stats) = self.get_statistics(catalog, id) {
+            return stats;
+        }
+        let stats = CatalogTableStatistics::default();
+        self.put_statistics(catalog, id, stats.clone());
+        stats
+    }
+
     pub fn put_statistics(
         &self,
         catalog: &str,

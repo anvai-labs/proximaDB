@@ -1,11 +1,18 @@
-//! Avro serialization for WAL
+//! "Avro" slot serializer for WAL
 //!
-//! Provides schema evolution support for backward compatibility.
+//! TD-WAL-6 disclosure: despite the name, this serializer emits the shared
+//! **v1 bincode encoding** (`serialize_bincode_batch`), not Avro bytes —
+//! there is no schema evolution. The type exists as the named slot for
+//! `SerializationFormat::Avro` so config strings and the memtable WAL
+//! behavior keep selecting it. Like the proto slot it does NOT override the
+//! v2 wire path — non-Fp32 records re-trigger the v1 fp32-only
+//! refuse-error (use `SerializationFormat::Bincode` for precision-aware
+//! ingest).
 
 use anyhow::Result;
 use proximadb_records::ProximaRecord;
 
-/// Avro serializer - for schema evolution support
+/// Serializer for the "avro" WAL slot (bincode-backed, TD-WAL-6)
 #[derive(Debug, Clone, Default)]
 pub struct AvroSerializer;
 
@@ -18,18 +25,11 @@ impl AvroSerializer {
 
 impl super::VectorBatchSerializer for AvroSerializer {
     fn serialize_batch(&self, records: &[ProximaRecord]) -> Result<Vec<u8>> {
-        bincode::serialize(records).map_err(|e| {
-            anyhow::anyhow!("Failed to serialize ProximaRecords to Avro WAL slot: {}", e)
-        })
+        super::serialize_bincode_batch(records, "Avro WAL slot")
     }
 
     fn deserialize_batch(&self, data: &[u8]) -> Result<Vec<ProximaRecord>> {
-        bincode::deserialize(data).map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to deserialize ProximaRecords from Avro WAL slot: {}",
-                e
-            )
-        })
+        super::deserialize_bincode_batch(data, "Avro WAL slot")
     }
 
     fn format(&self) -> super::SerializationFormat {
@@ -41,29 +41,9 @@ impl super::VectorBatchSerializer for AvroSerializer {
 mod tests {
     use super::*;
     use crate::storage::persistence::write_ahead_log::serialization::VectorBatchSerializer;
+    use crate::storage::persistence::write_ahead_log::serialization::test_util::create_test_vector;
     use proximadb_data_model::ProximaValue;
-    use proximadb_records::{EmbeddingCell, ProximaRecord, ProximaTree, ProximaTreeNode};
-
-    fn create_test_vector() -> ProximaRecord {
-        let mut props = ProximaTree::new();
-        props.insert(
-            "category".to_string(),
-            ProximaTreeNode::Value(ProximaValue::String("test".to_string())),
-        );
-
-        ProximaRecord {
-            oid: "test_vector_1".to_string(),
-            embeddings: vec![EmbeddingCell::new_fp32(
-                "default",
-                "vector",
-                4,
-                vec![0.1, 0.2, 0.3, 0.4],
-            )],
-            props,
-            record_version: 1,
-            ..Default::default()
-        }
-    }
+    use proximadb_records::{ProximaTree, ProximaTreeNode};
 
     #[test]
     fn test_avro_round_trip() {

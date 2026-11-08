@@ -197,6 +197,10 @@ const TPCDS_SF1_ROWS: u64 = 5_722_000;
 struct PerfRunPreflight {
     estimated_peak_mib: u64,
     cgroup_limit_mib: Option<u64>,
+    /// cgroup v2 `memory.high` — the thrash threshold the run wrapper sets
+    /// deliberately below `memory.max`. `None` on cgroup v1 (which has no
+    /// high) and where unset.
+    cgroup_high_mib: Option<u64>,
     host_total_mib: Option<u64>,
 }
 
@@ -218,6 +222,7 @@ fn validate_perf_run(
     host_total_mib: Option<u64>,
     required_headroom_mib: u64,
 ) -> Result<PerfRunPreflight, String> {
+    let cgroup_high_mib = current_cgroup_memory_high_mib();
     if !scale.is_finite() || scale <= 0.0 {
         return Err("TPC_PERF_SCALE must be a finite number greater than zero".to_string());
     }
@@ -226,6 +231,7 @@ fn validate_perf_run(
     let preflight = PerfRunPreflight {
         estimated_peak_mib,
         cgroup_limit_mib,
+        cgroup_high_mib,
         host_total_mib,
     };
     if estimated_peak_mib <= SAFE_ESTIMATED_PEAK_MIB {
@@ -256,6 +262,17 @@ fn validate_perf_run(
 fn current_cgroup_memory_limit_mib() -> Option<u64> {
     // An unlimited cgroup reports `max` (v2) or a near-u64::MAX byte count (v1).
     read_bytes_mib(&cgroup_memory_files()?.1).filter(|&mib| mib < (1 << 40))
+}
+
+/// cgroup v2 `memory.high` only: v1 has no soft limit, and a v2 cgroup
+/// without one reports `max` — both read as `None` here.
+fn current_cgroup_memory_high_mib() -> Option<u64> {
+    if !std::path::Path::new("/sys/fs/cgroup/cgroup.controllers").exists() {
+        return None;
+    }
+    let (dir, _) = cgroup_memory_files()?;
+    let path = dir.parent()?.join("memory.high");
+    read_bytes_mib(&path).filter(|&mib| mib < (1 << 40))
 }
 
 fn host_total_memory_mib() -> Option<u64> {
@@ -1504,6 +1521,52 @@ impl PhaseMeter {
     }
 }
 
+/// P2.4 bound enforcement (ledger id `p24_sf1_bounded_memory_load`): the load
+/// phases' recorded cgroup peaks must stay within the finite cgroup the
+/// preflight required. "Bounded" until now meant only "the run refused to
+/// start unisolated and the peaks were recorded" — an unbounded regression
+/// would OOM (or thrash to MemoryHigh) in a manual run and fail nothing
+/// automated. This turns the recorded numbers into the assertion: any phase
+/// peak at or over the limit, or a load phase with NO recorded peak when a
+/// cgroup limit exists, fails the run that produced it. The harness stays
+/// `#[ignore]` (advisory, manual, cgroup-gated) — the ratchet fires wherever
+/// the harness is run, which is wherever its numbers are cited from.
+fn enforce_load_peaks_within_cgroup(
+    load_stats: &[LoadStats],
+    limit_mib: Option<u64>,
+    high_mib: Option<u64>,
+) {
+    let Some(limit) = limit_mib else { return };
+    // `memory.high` (where one exists) is the meaningful bound: it sits below
+    // `memory.max` precisely so a regression throttles there instead of OOMing,
+    // and a peak that merely stays under the HARD limit can still be a runaway.
+    // cgroup v2 charges memory in batches, so `memory.peak` may overshoot a
+    // bound by a little without a real violation — allow that much slack.
+    const BATCHED_CHARGE_SLACK_MIB: u64 = 64;
+    let bound = high_mib.map_or(limit, |high| high.min(limit));
+    for stats in load_stats {
+        // The P2.4 claim is about LOAD + MATERIALIZE; the queries phase is out
+        // of its scope (and its peak is dominated by the query plans, not the
+        // load path this bound protects).
+        for phase in stats.memory.iter().filter(|p| p.phase != "queries") {
+            match phase.cgroup_peak_mib {
+                Some(peak) => assert!(
+                    peak <= bound + BATCHED_CHARGE_SLACK_MIB,
+                    "P2.4 bound violated: phase {} peaked at {peak} MiB beyond the cgroup \
+                     bound {bound} MiB (high {high_mib:?}, max {limit} MiB) — the load is no \
+                     longer bounded; the cited ledger claim is stale",
+                    phase.phase
+                ),
+                None => panic!(
+                    "P2.4 bound unverifiable: phase {} recorded no cgroup peak although a \
+                     {limit} MiB limit exists — fix the capture before citing the claim",
+                    phase.phase
+                ),
+            }
+        }
+    }
+}
+
 /// Run one query: clear the capture, time the client round-trip, drain the
 /// per-query billing snapshot (the observer fires server-side at scope close,
 /// so poll briefly for it).
@@ -2237,6 +2300,13 @@ async fn tpc_perf_ledger_inner() {
         .await;
         load_stats.push(tpch_stats);
         server.shutdown().await;
+        // Enforced per leg as well as at the end: a TPC_PERF_BENCHMARK=tpch
+        // run ends here and must not escape the P2.4 bound (review round 1).
+        enforce_load_peaks_within_cgroup(
+            &load_stats,
+            preflight.cgroup_limit_mib,
+            preflight.cgroup_high_mib,
+        );
         #[cfg(not(feature = "duckdb"))]
         if !load_only() {
             run_duckdb_baseline(
@@ -2268,6 +2338,11 @@ async fn tpc_perf_ledger_inner() {
         .await;
         load_stats.push(tpcds_stats);
         server.shutdown().await;
+        enforce_load_peaks_within_cgroup(
+            &load_stats,
+            preflight.cgroup_limit_mib,
+            preflight.cgroup_high_mib,
+        );
         #[cfg(not(feature = "duckdb"))]
         if !load_only() {
             run_duckdb_baseline(

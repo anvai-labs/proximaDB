@@ -1,11 +1,17 @@
-//! Protocol Buffers serialization for WAL
+//! "Protocol Buffers" slot serializer for WAL
 //!
-//! This is the default and recommended format for ProximaDB's proto-first architecture.
+//! TD-WAL-6 disclosure: despite the name, this serializer emits the shared
+//! **v1 bincode encoding** (`serialize_bincode_batch`), not protobuf bytes.
+//! The type exists as the named slot for `SerializationFormat::ProtocolBuffers`
+//! so config strings and recovery keep selecting it. It also does NOT
+//! override the v2 wire path — non-Fp32 records re-trigger the v1
+//! fp32-only refuse-error (use `SerializationFormat::Bincode` for
+//! precision-aware ingest).
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use proximadb_records::ProximaRecord;
 
-/// Protocol Buffers serializer - the default for proto-first architecture
+/// Serializer for the canonical "proto" WAL slot (bincode-backed, TD-WAL-6)
 #[derive(Debug, Clone, Default)]
 pub struct ProtocolBuffersSerializer;
 
@@ -18,13 +24,11 @@ impl ProtocolBuffersSerializer {
 
 impl super::VectorBatchSerializer for ProtocolBuffersSerializer {
     fn serialize_batch(&self, records: &[ProximaRecord]) -> Result<Vec<u8>> {
-        bincode::serialize(records)
-            .context("Failed to serialize ProximaRecords for canonical WAL proto slot")
+        super::serialize_bincode_batch(records, "canonical WAL proto slot")
     }
 
     fn deserialize_batch(&self, data: &[u8]) -> Result<Vec<ProximaRecord>> {
-        bincode::deserialize(data)
-            .context("Failed to deserialize ProximaRecords from canonical WAL proto slot")
+        super::deserialize_bincode_batch(data, "canonical WAL proto slot")
     }
 
     fn format(&self) -> super::SerializationFormat {
@@ -36,29 +40,7 @@ impl super::VectorBatchSerializer for ProtocolBuffersSerializer {
 mod tests {
     use super::*;
     use crate::storage::persistence::write_ahead_log::serialization::VectorBatchSerializer;
-    use proximadb_data_model::ProximaValue;
-    use proximadb_records::{EmbeddingCell, ProximaRecord, ProximaTree, ProximaTreeNode};
-
-    fn create_test_vector() -> ProximaRecord {
-        let mut props = ProximaTree::new();
-        props.insert(
-            "category".to_string(),
-            ProximaTreeNode::Value(ProximaValue::String("test".to_string())),
-        );
-
-        ProximaRecord {
-            oid: "test_vector_1".to_string(),
-            embeddings: vec![EmbeddingCell::new_fp32(
-                "default",
-                "vector",
-                4,
-                vec![0.1, 0.2, 0.3, 0.4],
-            )],
-            props,
-            record_version: 1,
-            ..Default::default()
-        }
-    }
+    use crate::storage::persistence::write_ahead_log::serialization::test_util::create_test_vector;
 
     #[test]
     fn test_protocol_buffers_round_trip() {

@@ -392,6 +392,16 @@ impl MultiServer {
         // back to opening a local appender when (a) the pgwire path is
         // overridden to a non-default location, or (b) `SharedServices`
         // wasn't constructed with an appender (e.g. opt_config was None).
+        // Release-review F20: the fallback arms below open the WAL directly
+        // (custom `direct_record_wal_path`, or SharedServices without an
+        // appender), bypassing the marker check SharedServices performs on
+        // its own open — record (or check) the data format here too, so a
+        // directory written by a newer binary refuses instead of silently
+        // serving a subset. Idempotent for the shared arm, whose directory
+        // was already checked when SharedServices opened it.
+        if let Some(dir) = wal_path.parent() {
+            crate::services::storage_format::ensure_data_format(dir)?;
+        }
         let wal_appender = if wal_path == default_wal_path {
             if let Some(shared) = self.shared_services.canonical_wal_appender.clone() {
                 info!(
@@ -423,6 +433,17 @@ impl MultiServer {
         // on (idempotent for the shared appender, which SharedServices armed).
         if crate::services::oltp_gate::atomic_commit_enabled() {
             wal_appender.enable_atomic_groups();
+        }
+        // P2.1 (ADR-097 S2), review round 1: the fallback arms above open the
+        // WAL directly, so they must arm segment rotation themselves —
+        // SharedServices' call does not cover a custom `direct_record_wal_path`.
+        // Without it a custom-path WAL never seals a segment, and truncation
+        // (which only removes sealed segments) can never reclaim it: unbounded
+        // growth for the process lifetime. The `ensure_data_format` call above
+        // is what makes sealing this directory downgrade-safe.
+        let segment_bytes = crate::services::canonical_wal::canonical_wal_segment_bytes();
+        if segment_bytes > 0 {
+            wal_appender.enable_segment_rotation(segment_bytes);
         }
         // TD-064: the canonical store is per-(tenant, collection) partitioned and
         // shared across all pgwire connections. Build it once, recover its

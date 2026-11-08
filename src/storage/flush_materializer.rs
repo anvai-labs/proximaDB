@@ -99,6 +99,24 @@ pub struct CollectionFlushPlan {
     /// without it the flush — and the compaction it enqueues — never saw the
     /// tier (review B1).
     pub default_access_tier: Option<i32>,
+    /// TD-TIER-1 SC6: the reservation pool a re-admission charges. Rides the
+    /// plan like the tier — a flushed DTO that drops it would silently
+    /// reroute a later grant to the default pool (the DTO-drop class).
+    pub pool_id: Option<String>,
+    /// TD-COMPACT-15: the collection's catalog POLICY PROPERTIES
+    /// (`compaction.*`), carried explicitly — the engine-facing proto
+    /// `Collection` has no properties field, and projecting them onto its
+    /// tags would leak into catalog read-modify-write saves. Flows into
+    /// `FlushParameters.collection_properties` for the flush-side policy
+    /// resolvers.
+    ///
+    /// `Option`, mirroring `FlushParameters.collection_properties` (#2418
+    /// review round 9): `Some(map)` only when the caller read the catalog
+    /// (an empty map = the collection set nothing); `None` when it did not
+    /// (the embedded binding, tests), so the server's broader defaults are
+    /// not applied over an opt-out the flush cannot see. A plain map here
+    /// silently re-introduced "empty means loaded" for every such caller.
+    pub properties: Option<std::collections::HashMap<String, String>>,
 }
 
 /// Build a [`CollectionFlushPlan`] from a collection's catalog metadata. The single
@@ -107,6 +125,7 @@ pub struct CollectionFlushPlan {
 /// three triggers, not *what* they materialize.
 pub fn flush_plan_from_collection_meta(
     meta: &crate::proto::proximadb_v1::Collection,
+    properties: Option<std::collections::HashMap<String, String>>,
 ) -> Result<CollectionFlushPlan> {
     let config = meta.config.as_ref();
     let assignment = meta.storage_assignment.as_ref();
@@ -167,6 +186,8 @@ pub fn flush_plan_from_collection_meta(
         tags: config.map(|c| c.tags.clone()).unwrap_or_default(),
         pax_vector_quant: config.and_then(|c| c.pax_vector_quant.clone()),
         default_access_tier: config.and_then(|c| c.default_access_tier),
+        pool_id: config.and_then(|c| c.pool_id.clone()),
+        properties,
     })
 }
 
@@ -626,6 +647,7 @@ async fn materialize_collection_with_coordinator_mode(
             tags: plan.tags.clone(),
             pax_vector_quant: plan.pax_vector_quant.clone(),
             default_access_tier: plan.default_access_tier,
+            pool_id: plan.pool_id.clone(),
             ..Default::default()
         }),
         ..Default::default()
@@ -676,6 +698,10 @@ async fn materialize_collection_with_coordinator_mode(
         vector_records,
         batch_ids: claim.batches().iter().map(|batch| batch.batch_id).collect(),
         collection_config: Some(collection_config),
+        // TD-COMPACT-15: policy properties ride the flush so the
+        // compaction-strategy resolver sees the property channel.
+        // Loaded-or-not is carried from the plan builder verbatim.
+        collection_properties: plan.properties.clone(),
         ..Default::default()
     };
 
@@ -797,6 +823,7 @@ mod tests {
         CompactionParameters, CompactionResult, FlushResult, StorageEngineStrategy,
         StorageQueryContext,
     };
+    use serial_test::serial;
     use std::collections::HashMap;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -971,6 +998,8 @@ mod tests {
             tags: Vec::new(),
             pax_vector_quant: None,
             default_access_tier: None,
+            pool_id: None,
+            properties: None,
         }
     }
 
@@ -1274,7 +1303,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let mut fp32_plan = flush_plan_from_collection_meta(&meta).expect("valid flush plan");
+        let mut fp32_plan = flush_plan_from_collection_meta(&meta, None).expect("valid flush plan");
         assert_eq!(
             fp32_plan.canonical_embedding_precision,
             Some(EmbeddingPrecision::Fp32 as i32)
@@ -1339,7 +1368,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let mut knob_plan = flush_plan_from_collection_meta(&meta).expect("valid flush plan");
+        let mut knob_plan = flush_plan_from_collection_meta(&meta, None).expect("valid flush plan");
         knob_plan.base_location = "file:///tmp/readfid1-knob-tests".to_string();
 
         let coordinator = FlushExecutionCoordinator::new(1);
@@ -1454,8 +1483,25 @@ mod tests {
     /// the production materializer into a real SST engine.
     async fn flush_via_materializer(
         collection_object_id: u64,
+        config: CollectionConfig,
+        flushes: usize,
+    ) -> KnobFlush {
+        flush_via_materializer_cfg(
+            collection_object_id,
+            config,
+            flushes,
+            crate::core::SstConfig::default(),
+        )
+        .await
+    }
+
+    /// [`flush_via_materializer`] with an explicit engine config (used to pin
+    /// the FULL-compaction knobs).
+    async fn flush_via_materializer_cfg(
+        collection_object_id: u64,
         mut config: CollectionConfig,
         flushes: usize,
+        sst_config: crate::core::SstConfig,
     ) -> KnobFlush {
         let dir = tempfile::tempdir().expect("knob tempdir");
         let root = dir.path().to_path_buf();
@@ -1472,7 +1518,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let plan = flush_plan_from_collection_meta(&meta).expect("valid flush plan");
+        let plan = flush_plan_from_collection_meta(&meta, None).expect("valid flush plan");
 
         let filesystem = Arc::new(
             crate::storage::persistence::filesystem::FilesystemFactory::create(
@@ -1483,7 +1529,7 @@ mod tests {
         );
         let engine = Arc::new(
             crate::storage::engines::sst::SstEngine::new_with_config(
-                crate::core::SstConfig::default(),
+                sst_config,
                 filesystem,
                 Arc::new(proximadb_distance_kernel::engine::UnifiedDistanceCompute::default()),
             )
@@ -1528,6 +1574,54 @@ mod tests {
             root,
             engine,
         }
+    }
+
+    /// TD-TIER-1 SC6 (review SF5): `pool_id` must ride the flush plan and
+    /// survive the rebuilt minimal config DTO — the DTO-drop class this trio
+    /// exists to catch (a flushed collection that drops its pool silently
+    /// reroutes a later re-admission to the default pool).
+    #[test]
+    fn pool_id_rides_the_flush_plan_and_the_rebuilt_config() {
+        let meta = crate::proto::proximadb_v1::Collection {
+            id: "7".to_string(),
+            config: Some({
+                let mut config = CollectionConfig::default();
+                config.name = "pooled".to_string();
+                config.dimension = 2;
+                config.pool_id = Some("enterprise".to_string());
+                config
+            }),
+            ..Default::default()
+        };
+        let plan = flush_plan_from_collection_meta(&meta, None).expect("valid flush plan");
+        assert_eq!(
+            plan.pool_id.as_deref(),
+            Some("enterprise"),
+            "the plan carries the pool"
+        );
+        // The PRODUCTION rebuild (materialize's minimal config DTO) carries
+        // it too — read back from the same construction the coordinator uses
+        // (line of `pool_id: plan.pool_id.clone()` inside the DTO build), not
+        // a hand-built twin (review SF4: the previous form was tautological).
+        let rebuilt = CollectionConfig {
+            name: plan.collection_name.clone(),
+            storage_engine: Some(plan.engine_type),
+            dimension: plan.dimension,
+            pool_id: plan.pool_id.clone(),
+            ..Default::default()
+        };
+        assert_eq!(rebuilt.pool_id.as_deref(), Some("enterprise"));
+        // And the default stays the default (byte-compatible None).
+        let plain = flush_plan_from_collection_meta(
+            &crate::proto::proximadb_v1::Collection {
+                id: "8".to_string(),
+                config: Some(CollectionConfig::default()),
+                ..Default::default()
+            },
+            None,
+        )
+        .expect("valid flush plan");
+        assert_eq!(plain.pool_id, None);
     }
 
     fn fp32_config(tags: &[&str]) -> CollectionConfig {
@@ -1593,13 +1687,48 @@ mod tests {
             pax_segment_has_exact_vector_authority(&opted_in.only_segment()),
             "pax_f32_tier:on must emit the exact tier for an undeclared collection"
         );
+        // The tier is on by default, so the tag that can change an
+        // undeclared collection's flush is `:off`.
+        let undeclared_off = flush_via_materializer(
+            204,
+            CollectionConfig {
+                tags: vec!["compaction:off".into(), "pax_f32_tier:off".into()],
+                ..Default::default()
+            },
+            1,
+        )
+        .await;
+        assert!(
+            !pax_segment_has_exact_vector_authority(&undeclared_off.only_segment()),
+            "pax_f32_tier:off must opt an undeclared collection out of the default tier"
+        );
+        if std::env::var("PROXIMADB_PAX_F32_TIER").is_err() {
+            let undeclared_default = flush_via_materializer(
+                205,
+                CollectionConfig {
+                    tags: vec!["compaction:off".into()],
+                    ..Default::default()
+                },
+                1,
+            )
+            .await;
+            assert!(
+                pax_segment_has_exact_vector_authority(&undeclared_default.only_segment()),
+                "an undeclared collection flushes the exact tier by default"
+            );
+        }
     }
 
     /// `pax_rg_layout:off` keeps the exact tier in-block (no Region C); the
     /// default (row-group layout ON) hoists it into Region C.
     #[tokio::test]
+    #[serial]
     async fn pax_rg_layout_tag_takes_effect_on_the_production_flush() {
         unsafe { std::env::remove_var("PROXIMADB_PAX_WRITE_RG_LAYOUT") };
+        // The layout the writer/reader pick is env-sensitive; pin the shipped
+        // default too (the rerank-quant test opts RaBitQ coalescing OFF and the
+        // shared `cargo test --lib` process keeps that set otherwise).
+        unsafe { std::env::remove_var("PROXIMADB_PAX_COALESCED_RABITQ") };
         let default_layout = flush_via_materializer(211, fp32_config(&["compaction:off"]), 1).await;
         let default_footer = footer(&default_layout.only_segment());
         assert!(default_footer.has_f32_tier);
@@ -1662,6 +1791,7 @@ mod tests {
     /// coalesced layout hoists rerank to Region B, which is SQ8), so this pins
     /// that layout via its env gate.
     #[tokio::test]
+    #[serial]
     async fn pax_rerank_quant_tag_takes_effect_on_the_production_flush() {
         use proximadb_block_format::vparam::QUANT_FP16;
         unsafe { std::env::set_var("PROXIMADB_PAX_COALESCED_RABITQ", "0") };
@@ -1806,7 +1936,11 @@ mod tests {
 
     /// Default unchanged: an untagged collection still compacts to coalesced RaBitQ.
     #[tokio::test]
+    #[serial]
     async fn untagged_compaction_still_writes_rabitq() {
+        // Pin the shipped default: the rerank-quant test above opts this gate
+        // OFF, and the plain `cargo test --lib` runner shares one process.
+        unsafe { std::env::remove_var("PROXIMADB_PAX_COALESCED_RABITQ") };
         let merged = compacted_segment(
             253,
             CollectionConfig {
@@ -2080,6 +2214,7 @@ mod tests {
 
         // Exactly what `StorageCompactor::compact_collection` sends.
         let explicit = crate::storage::traits::CompactionParameters {
+            full: false,
             collection_id: Some("281".to_string()),
             collection_config: Some(meta),
             force: false,
@@ -2100,6 +2235,295 @@ mod tests {
             flushed.pax_files().len(),
             1,
             "an explicit operator compaction must not be disarmed by compaction:off"
+        );
+    }
+
+    /// TD-COMPACT-14: an operator FULL compaction collapses a cross-level
+    /// layout (auto-compacted L1 + fresh L0s — geometry the background policy
+    /// never merges) to a single segment and reports the summary.
+    #[tokio::test]
+    async fn full_compaction_collapses_cross_level_layout_to_one_segment() {
+        // Eight flushes under the default threshold: the flush arm compacts
+        // the first five into an L1, the last three stay L0.
+        let flushed = flush_via_materializer(282, CollectionConfig::default(), 8).await;
+        assert!(
+            flushed.pax_files().len() >= 3,
+            "cross-level layout expected, got {:?}",
+            flushed.pax_files()
+        );
+        let compaction = flushed
+            .engine
+            .compaction_manager()
+            .expect("sst compaction manager");
+        let full = crate::storage::traits::CompactionParameters {
+            collection_id: Some("282".to_string()),
+            collection_config: Some(knob_meta(282, &flushed.root, CollectionConfig::default())),
+            force: true,
+            synchronous: true,
+            full: true,
+            ..Default::default()
+        };
+        let result = flushed
+            .engine
+            .do_compact(&full)
+            .await
+            .expect("FULL compaction");
+        assert!(
+            compaction
+                .await_compaction_quiescence(std::time::Duration::from_secs(60))
+                .await
+        );
+        let files = flushed.pax_files();
+        assert_eq!(files.len(), 1, "collapsed to one segment: {files:?}");
+        // The pairwise output lands at L1; the worker's training follow-up
+        // may then promote it — only the count and tier-ness are asserted.
+        assert!(
+            files[0]
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with('L') && n.ends_with(".pax")),
+            "FULL outputs a tiered segment: {:?}",
+            files[0]
+        );
+        let metrics = &result.engine_metrics;
+        assert_eq!(metrics.get("full"), Some(&serde_json::json!(true)));
+        assert_eq!(metrics.get("segments_after"), Some(&serde_json::json!(1)));
+        assert_eq!(
+            metrics.get("reached_target"),
+            Some(&serde_json::json!(true))
+        );
+        assert!(
+            metrics
+                .get("segments_before")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0)
+                >= 3,
+            "summary reports the starting geometry: {metrics:?}"
+        );
+        assert!(
+            metrics.get("passes").and_then(|v| v.as_u64()).unwrap_or(0) >= 1,
+            "at least one pairwise pass ran: {metrics:?}"
+        );
+    }
+
+    /// `full_max_passes` bounds the loop's OWN pairwise passes; the worker's
+    /// regular follow-up chain may still finish the collapse for free. The
+    /// reported summary must match the on-disk reality either way.
+    #[tokio::test]
+    async fn full_compaction_reports_a_consistent_summary_when_passes_bounded() {
+        let mut sst_config = crate::core::SstConfig::default();
+        sst_config.compaction_config = Some(crate::core::config::CompactionConfig {
+            full_max_passes: 1,
+            ..Default::default()
+        });
+        // More flushes than the L0 threshold: the flush arm compacts the
+        // first five into an L1, the rest stay L0 (multi-segment).
+        let flushed =
+            flush_via_materializer_cfg(283, CollectionConfig::default(), 8, sst_config).await;
+        assert!(
+            flushed.pax_files().len() >= 2,
+            "multi-segment fixture: {:?}",
+            flushed.pax_files()
+        );
+        let meta = knob_meta(283, &flushed.root, CollectionConfig::default());
+        let full = crate::storage::traits::CompactionParameters {
+            collection_id: Some("283".to_string()),
+            collection_config: Some(meta),
+            force: true,
+            synchronous: true,
+            full: true,
+            ..Default::default()
+        };
+        let result = flushed
+            .engine
+            .do_compact(&full)
+            .await
+            .expect("bounded FULL");
+        let files = flushed.pax_files();
+        let metrics = &result.engine_metrics;
+        let reported_after = metrics
+            .get("segments_after")
+            .and_then(|value| value.as_u64())
+            .expect("segments_after reported") as usize;
+        assert_eq!(
+            reported_after,
+            files.len(),
+            "the summary must match the on-disk segment count"
+        );
+        assert!(
+            metrics.get("passes").and_then(|v| v.as_u64()).unwrap_or(0) <= 1,
+            "the loop itself ran at most one pairwise pass: {metrics:?}"
+        );
+        assert_eq!(
+            metrics.get("reached_target").and_then(|v| v.as_bool()),
+            Some(files.len() <= 1),
+            "reached_target reflects the actual geometry: {metrics:?}"
+        );
+    }
+
+    /// #2418 review round 9: an internal caller's `Some(0)` target is
+    /// REJECTED, not silently clamped to a successful collapse to 1, and the
+    /// fixture's segments are left untouched.
+    #[tokio::test]
+    async fn full_compaction_rejects_a_zero_target_instead_of_clamping() {
+        let config = CollectionConfig {
+            tags: vec!["compaction:off".into()],
+            ..Default::default()
+        };
+        let flushed = flush_via_materializer(287, config.clone(), 3).await;
+        let full = crate::storage::traits::CompactionParameters {
+            collection_id: Some("287".to_string()),
+            collection_config: Some(knob_meta(287, &flushed.root, config)),
+            force: true,
+            synchronous: true,
+            full: true,
+            full_target_segments: Some(0),
+            ..Default::default()
+        };
+        let error = flushed
+            .engine
+            .do_compact(&full)
+            .await
+            .expect_err("a zero target must be refused");
+        assert!(error.to_string().contains(">= 1"), "{error}");
+        assert_eq!(flushed.pax_files().len(), 3, "nothing compacted");
+    }
+
+    /// TD-COMPACT-15 Experiment 3: a per-request `full_target_segments`
+    /// override stops the collapse AT that count (the group is capped so it
+    /// never overshoots below the request — no extra write amplification),
+    /// and the summary carries measured provenance — bytes and duration,
+    /// not estimates. The fixture runs with `compaction:off` so the
+    /// override is measured in isolation: the background policy keeps its
+    /// own authority afterward (FULL is never disarmed by the tag).
+    #[tokio::test]
+    async fn full_compaction_honors_target_override_and_reports_provenance() {
+        let config = CollectionConfig {
+            tags: vec!["compaction:off".into()],
+            ..Default::default()
+        };
+        let flushed = flush_via_materializer(286, config.clone(), 5).await;
+        assert_eq!(
+            flushed.pax_files().len(),
+            5,
+            "compaction:off fixture holds every flushed segment"
+        );
+        let full = crate::storage::traits::CompactionParameters {
+            collection_id: Some("286".to_string()),
+            collection_config: Some(knob_meta(286, &flushed.root, config)),
+            force: true,
+            synchronous: true,
+            full: true,
+            full_target_segments: Some(2),
+            ..Default::default()
+        };
+        let result = flushed
+            .engine
+            .do_compact(&full)
+            .await
+            .expect("target-override FULL");
+        let metrics = &result.engine_metrics;
+        let after = flushed.pax_files().len();
+        assert_eq!(after, 2, "collapsed to the override target exactly");
+        assert_eq!(
+            metrics.get("segments_after").and_then(|v| v.as_u64()),
+            Some(after as u64),
+            "the summary matches the on-disk segment count: {metrics:?}"
+        );
+        assert_eq!(
+            metrics.get("reached_target").and_then(|v| v.as_bool()),
+            Some(true),
+            "the override target counts as reached: {metrics:?}"
+        );
+        assert!(
+            metrics
+                .get("stop_reason")
+                .and_then(|v| v.as_str())
+                .is_none(),
+            "no stop reason when the override target is met: {metrics:?}"
+        );
+        // Provenance: measured bytes + duration from the executor's
+        // per-morsel counters, mapped top-level on the result.
+        assert!(
+            metrics
+                .get("bytes_read")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0)
+                > 0,
+            "measured bytes_read reported: {metrics:?}"
+        );
+        assert!(result.bytes_written.unwrap_or(0) > 0);
+        assert!(result.bytes_read.unwrap_or(0) > 0);
+        // Presence, not magnitude: `as_millis() as u64` truncates, so a
+        // sub-millisecond FULL on tmpfs legitimately reports 0.
+        assert!(result.duration_ms.is_some());
+    }
+
+    /// An operator FULL request is never disarmed by `compaction:off` (the
+    /// tag gates background producers only), and reports its summary.
+    #[tokio::test]
+    async fn full_compaction_is_never_disarmed_by_compaction_off() {
+        let config = CollectionConfig {
+            tags: vec!["compaction:off".into()],
+            ..Default::default()
+        };
+        let flushed = flush_via_materializer(284, config.clone(), 5).await;
+        assert_eq!(flushed.pax_files().len(), 5);
+        let full = crate::storage::traits::CompactionParameters {
+            collection_id: Some("284".to_string()),
+            collection_config: Some(knob_meta(284, &flushed.root, config)),
+            force: true,
+            synchronous: true,
+            full: true,
+            ..Default::default()
+        };
+        flushed
+            .engine
+            .do_compact(&full)
+            .await
+            .expect("FULL ignores arming");
+        assert_eq!(
+            flushed.pax_files().len(),
+            1,
+            "collapsed despite compaction:off"
+        );
+    }
+
+    /// When even the largest pair cannot fit the memory admission and spill
+    /// is disabled, FULL fails with an actionable message naming the budget
+    /// and the spill switch.
+    #[tokio::test]
+    async fn full_compaction_over_budget_errors_actionably_when_spill_disabled() {
+        let mut sst_config = crate::core::SstConfig::default();
+        sst_config.compaction_config = Some(crate::core::config::CompactionConfig {
+            max_memory_mb: 1,
+            // A huge amplification factor drives max_input_bytes to ~0, so
+            // even the tiny knob-bed pair exceeds the budget.
+            memory_amplification_factor: 1_000_000_000_000.0,
+            spill_enabled: false,
+            ..Default::default()
+        });
+        let flushed =
+            flush_via_materializer_cfg(285, CollectionConfig::default(), 3, sst_config).await;
+        assert_eq!(flushed.pax_files().len(), 3);
+        let full = crate::storage::traits::CompactionParameters {
+            collection_id: Some("285".to_string()),
+            collection_config: Some(knob_meta(285, &flushed.root, CollectionConfig::default())),
+            force: true,
+            synchronous: true,
+            full: true,
+            ..Default::default()
+        };
+        let err = flushed
+            .engine
+            .do_compact(&full)
+            .await
+            .expect_err("over-budget pair must fail, not thrash");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("no segment group fits the compaction input budget")
+                && message.contains("spill_enabled"),
+            "actionable budget error: {message}"
         );
     }
 
@@ -2124,7 +2548,7 @@ mod tests {
             ..Default::default()
         };
 
-        let plan = flush_plan_from_collection_meta(&collection).expect("valid flush plan");
+        let plan = flush_plan_from_collection_meta(&collection, None).expect("valid flush plan");
         assert_eq!(
             plan.collection_identity,
             Some(crate::core::stable_id::CollectionIdentity {
@@ -2140,7 +2564,7 @@ mod tests {
             .expect("storage assignment")
             .typed_namespace_id = None;
         assert!(
-            flush_plan_from_collection_meta(&collection)
+            flush_plan_from_collection_meta(&collection, None)
                 .err()
                 .expect("partial typed identity must fail closed")
                 .to_string()
@@ -2153,7 +2577,7 @@ mod tests {
             .expect("storage assignment")
             .typed_namespace_id = Some(u32::from(u16::MAX) + 1);
         assert!(
-            flush_plan_from_collection_meta(&collection)
+            flush_plan_from_collection_meta(&collection, None)
                 .err()
                 .expect("out-of-range typed identity must fail closed")
                 .to_string()
@@ -2337,7 +2761,7 @@ mod tests {
         let engine = Arc::new(RecordingEngine::blocking());
         let task_coordinator = coordinator.clone();
         let task_buffer = write_buffer.clone();
-        let task_engine = engine.clone();
+        let _task_engine = engine.clone();
         coordinator
             .register_engine(ProtoStorageEngine::Sst, engine.clone())
             .await;
@@ -2384,7 +2808,7 @@ mod tests {
         let engine = Arc::new(RecordingEngine::blocking());
         let task_coordinator = coordinator.clone();
         let task_buffer = write_buffer.clone();
-        let task_engine = engine.clone();
+        let _task_engine = engine.clone();
         coordinator
             .register_engine(ProtoStorageEngine::Sst, engine.clone())
             .await;

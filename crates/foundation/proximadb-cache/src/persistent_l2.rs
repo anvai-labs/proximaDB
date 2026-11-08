@@ -11,7 +11,7 @@
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 
 use crc32fast::Hasher as Crc32;
 use dashmap::DashMap;
@@ -115,6 +115,12 @@ struct StoreInner {
     /// the read-path cost of a steadily over-budget grant (review S1); the
     /// per-group `freed` flag decides whether an attempt can succeed.
     heal_attempts: AtomicU32,
+    /// Test-only: cumulative count of entries the reconcile sweeps ran
+    /// per-entry pass work on — the probe for the incremental reconcile's
+    /// scaling claim (read as a delta around one call; a count, never a
+    /// wall-clock benchmark).
+    #[cfg(test)]
+    sweep_examined: AtomicU64,
     /// Test-only hook run between victim selection and its re-check, to
     /// exercise the selection→pin race deterministically.
     #[cfg(test)]
@@ -173,6 +179,8 @@ impl PersistentByteStore {
             policy_active: AtomicBool::new(false),
             heal_pending: AtomicBool::new(false),
             heal_attempts: AtomicU32::new(0),
+            #[cfg(test)]
+            sweep_examined: AtomicU64::new(0),
             #[cfg(test)]
             evict_hook: std::sync::Mutex::new(None),
             clock: AtomicU64::new(1),
@@ -271,6 +279,27 @@ impl PersistentByteStore {
     /// SC4-4 residency probe). `None` when the key is not indexed.
     pub fn entry_len(&self, key: &str) -> Option<u64> {
         self.inner.entries.get(key).map(|meta| meta.value_len)
+    }
+
+    /// [`Self::entry_len`] that also refreshes the entry's LRU recency — the
+    /// residency CLASSIFICATION probe (TD-IOBUDGET-3). A range a planner
+    /// classifies resident is about to be read; without the tick, the same
+    /// query's write-through `put`s for its cold ranges would evict exactly
+    /// those untouched entries first. Index-only: no disk read, no CRC, no
+    /// protection-group hit (the consume read records that once).
+    pub fn touch_entry_len(&self, key: &str) -> Option<u64> {
+        let meta = self.inner.entries.get(key)?;
+        meta.touch.store(self.next_tick(), Ordering::Relaxed);
+        Some(meta.value_len)
+    }
+
+    /// Test support: an entry's LRU recency tick.
+    #[cfg(test)]
+    fn touch_of(&self, key: &str) -> Option<u64> {
+        self.inner
+            .entries
+            .get(key)
+            .map(|meta| meta.touch.load(Ordering::Relaxed))
     }
 
     /// Whether any protection group is registered (lock-free). With none,
@@ -461,70 +490,157 @@ impl PersistentByteStore {
     /// TD-TIER-1 SC4-2: replace the protection policy and reconcile resident
     /// entries against it. Each group is one reservation grant: its
     /// collection's segment-root prefixes and its own byte budget. A key
-    /// belongs to the first group (by id) one of whose prefixes it contains,
-    /// both compared in canonical form (see [`canonical_location`]); cache
-    /// keys embed the published segment path mid-string, and each prefix
-    /// ends in `/`, so containment cannot match a sibling collection.
+    /// belongs to the first group (by id) whose source prefix matches at
+    /// the start of its versioned whole-object location, on a path boundary.
+    /// Both use [`canonical_location`]; object-key bytes remain exact.
+    /// Legacy and non-whole-object keys cannot acquire policy protection.
     ///
-    /// Reconcile: pins owned by a removed group, or whose key no longer
+    /// Reconcile (SC4 PR-D, incremental): the NEW group set is DIFFED against
+    /// the old one, and only entries matching a CHANGED prefix — a removed
+    /// group's, an added group's, or a changed group's old-or-new prefixes —
+    /// can change protection outcome, so the three passes below run their
+    /// per-entry pin/unpin work on that scoped subset only. The scope is
+    /// sound because a policy pin's key always matches its owning group's
+    /// CURRENT prefixes (pins are only taken under a matching group, and
+    /// prefix changes go through this sweep, which releases stranded pins),
+    /// so every pin a removal or prefix change can strand sits under a
+    /// changed prefix; and an unchanged group can never exceed its budget,
+    /// because [`Self::pin_meta`] admits only within it. The pass-3 group
+    /// MATCH still considers the whole policy, so an entry a removed group
+    /// released re-pins under an overlapping surviving group exactly as the
+    /// full sweep did.
+    ///
+    /// Firing cadence unchanged — every grant mutation and every registry
+    /// open still reconciles, now incrementally. Worst case (stated): a
+    /// change whose changed prefixes match every entry (the first arm on a
+    /// populated store, a mass re-register) degrades to the previous full
+    /// O(entries × changed prefixes) pass work, and the key-filter scan of
+    /// the index stays O(total entries) per call (admission cadence only —
+    /// no per-entry work is done out of scope). One deliberate, disclosed
+    /// narrowing: an UNCHANGED group's previously skipped entries are no
+    /// longer retried by an UNRELATED group's reconcile — the read-path
+    /// heal (a hit retries the pin once the group freed room) and the next
+    /// reconcile touching that group cover them, so `heal_pending` stays
+    /// armed for unchanged groups instead of being cleared.
+    ///
+    /// Passes: pins owned by a removed group, or whose key no longer
     /// matches its group, are released; a group whose budget shrank below
     /// its pinned bytes is clamped by releasing its pins; then unpinned
     /// matching entries are pinned against their group's budget —
     /// best-effort, skipped and counted when the budget is exhausted.
-    /// Manual pins are never touched. O(entries × prefixes): admission
-    /// cadence only.
+    /// Manual pins are never touched.
     pub fn set_protection_groups(&self, groups: Vec<ProtectionGroup>) -> ProtectionSweep {
         let mut policy = self.protection_guard();
         let mut previous = std::mem::take(&mut policy.groups);
+        // Diff the incoming set against the outgoing one: the reconcile
+        // below only needs the entries a change can reach.
+        let mut changed_prefixes: Vec<String> = Vec::new();
+        // Groups whose budget changed — the only pass-2 clamp candidates (an
+        // unchanged budget was clamped by the call that set it, and
+        // `pin_meta` never admits past the budget in between).
+        let mut budget_changed: Vec<String> = Vec::new();
+        let mut unchanged_groups = 0usize;
         for group in groups {
-            let counter = previous
-                .remove(&group.id)
-                .map(|old| old.counter)
-                .unwrap_or_else(|| Arc::new(GroupCounter::default()));
-            policy.groups.insert(
-                group.id,
-                PolicyGroup {
-                    prefixes: group
-                        .prefixes
-                        .iter()
-                        .map(|prefix| canonical_location(prefix))
-                        .collect(),
-                    budget: group.budget_bytes,
-                    counter,
-                },
-            );
+            let canonical: Vec<String> = group
+                .prefixes
+                .iter()
+                .map(|prefix| canonical_location(prefix))
+                .collect();
+            match previous.remove(&group.id) {
+                Some(old) => {
+                    if old.prefixes == canonical && old.budget == group.budget_bytes {
+                        unchanged_groups += 1;
+                    } else {
+                        changed_prefixes.extend(old.prefixes.iter().cloned());
+                        changed_prefixes.extend(canonical.iter().cloned());
+                        budget_changed.push(group.id.clone());
+                    }
+                    policy.groups.insert(
+                        group.id,
+                        PolicyGroup {
+                            prefixes: canonical,
+                            budget: group.budget_bytes,
+                            counter: old.counter,
+                        },
+                    );
+                }
+                None => {
+                    changed_prefixes.extend(canonical.iter().cloned());
+                    policy.groups.insert(
+                        group.id,
+                        PolicyGroup {
+                            prefixes: canonical,
+                            budget: group.budget_bytes,
+                            counter: Arc::new(GroupCounter::default()),
+                        },
+                    );
+                }
+            }
         }
+        // Whatever is left in `previous` left the policy — only its prefixes
+        // (and the changed groups' above) reach the entries it protected.
+        for old in previous.values() {
+            changed_prefixes.extend(old.prefixes.iter().cloned());
+        }
+        changed_prefixes.sort_unstable();
+        changed_prefixes.dedup();
         self.inner
             .policy_active
             .store(!policy.groups.is_empty(), Ordering::Release);
 
         let mut sweep = ProtectionSweep::default();
-        let entries: Vec<(String, Arc<EntryMeta>)> = self
+        // Scoped materialization: the index scan stays O(total entries), but
+        // the per-entry pin/unpin work below runs only on entries matching a
+        // changed prefix — the 3-pass sweep under this mutex is what the
+        // admission cadence was paying for.
+        // Review NIT-5: an EMPTY diff (the identical re-registration every
+        // registry open fires) has nothing to reconcile — skip the O(entries)
+        // scan under the protection mutex entirely.
+        if changed_prefixes.is_empty() {
+            return ProtectionSweep {
+                protected: 0,
+                unprotected: 0,
+                skipped_over_budget: 0,
+            };
+        }
+        let scoped: Vec<(String, Arc<EntryMeta>)> = self
             .inner
             .entries
             .iter()
+            .filter(|entry| {
+                changed_prefixes
+                    .iter()
+                    .any(|prefix| protection_prefix_matches(entry.key(), prefix))
+            })
             .map(|entry| (entry.key().clone(), entry.value().clone()))
             .collect();
+        #[cfg(test)]
+        self.inner
+            .sweep_examined
+            .fetch_add(scoped.len() as u64, Ordering::Relaxed);
         // 1. Release policy pins whose group left or whose key left its group.
-        for (key, meta) in &entries {
+        for (key, meta) in &scoped {
             let Some(owner) = Self::pin_owner(meta) else {
                 continue;
             };
-            let canonical = canonical_location(key);
             let keeps = policy.groups.values().any(|group| {
                 Arc::ptr_eq(&group.counter, &owner)
                     && group
                         .prefixes
                         .iter()
-                        .any(|p| canonical.contains(p.as_str()))
+                        .any(|p| protection_prefix_matches(key, p))
             });
             if !keeps && self.release_pin(meta) {
                 sweep.unprotected += 1;
             }
         }
-        // 2. Clamp groups whose budget shrank below their pinned bytes.
-        for group in policy.groups.values() {
-            for (_, meta) in &entries {
+        // 2. Clamp groups whose budget shrank below their pinned bytes —
+        // only budget-changed groups can be over it (see the diff above).
+        for id in &budget_changed {
+            let Some(group) = policy.groups.get(id) else {
+                continue;
+            };
+            for (_, meta) in &scoped {
                 if group.counter.pinned.load(Ordering::Acquire) <= group.budget {
                     break;
                 }
@@ -535,8 +651,11 @@ impl PersistentByteStore {
                 }
             }
         }
-        // 3. Pin unpinned matching entries against their group's budget.
-        for (key, meta) in &entries {
+        // 3. Pin unpinned matching entries against their group's budget. The
+        // match considers the WHOLE policy, not just changed groups, so an
+        // entry a removed group released re-pins under an overlapping
+        // surviving group exactly as the full sweep did.
+        for (key, meta) in &scoped {
             if meta.protected.load(Ordering::Acquire) {
                 continue;
             }
@@ -548,9 +667,17 @@ impl PersistentByteStore {
                 }
             }
         }
-        self.inner
-            .heal_pending
-            .store(sweep.skipped_over_budget > 0, Ordering::Release);
+        // Entries of UNCHANGED groups were not re-examined above, so a skip
+        // recorded earlier may still stand for them — keep the heal flag
+        // armed rather than clearing it (the read-path heal is bounded; a
+        // full rescan per unrelated grant mutation is exactly the cost this
+        // incremental reconcile removed).
+        let stale_skip_possible =
+            unchanged_groups > 0 && self.inner.heal_pending.load(Ordering::Acquire);
+        self.inner.heal_pending.store(
+            sweep.skipped_over_budget > 0 || stale_skip_possible,
+            Ordering::Release,
+        );
         sweep
     }
 
@@ -559,8 +686,67 @@ impl PersistentByteStore {
         self.protection_guard().groups.keys().cloned().collect()
     }
 
+    /// Test-only: cumulative count of entries the reconcile sweeps ran
+    /// per-entry pass work on (read as a delta around one call).
+    #[cfg(test)]
+    pub(crate) fn sweep_examined_for_test(&self) -> u64 {
+        self.inner.sweep_examined.load(Ordering::Relaxed)
+    }
+
     /// Bytes currently pinned under one grant group — the coverage that
     /// grant has actually achieved (status/coverage input).
+    /// Test support (TD-TIER-1 SC6 S2): force a group's liveness clock, so
+    /// the idle-reclaim policy is exercisable without real read traffic.
+    pub fn register_group_hit_for_test(&self, group_id: &str, unix_secs: i64) {
+        let guard = self.protection_guard();
+        if let Some(group) = guard.groups.get(group_id) {
+            group.counter.hits.fetch_add(1, Ordering::Relaxed);
+            group
+                .counter
+                .last_hit_unix_secs
+                .store(unix_secs, Ordering::Relaxed);
+        }
+    }
+
+    /// TD-TIER-1 SC6 S2: record a read hit against the key's group (grant).
+    /// Cheap when no policy is armed; per-read cost is one flag check plus a
+    /// tiny prefix scan (few groups), dominated by the read itself.
+    fn note_group_hit(&self, key: &str) {
+        if !self.inner.policy_active.load(Ordering::Acquire) {
+            return;
+        }
+        let guard = self.protection_guard();
+        let Some(group) = guard.matching_group(key) else {
+            return;
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.as_secs() as i64);
+        group.counter.hits.fetch_add(1, Ordering::Relaxed);
+        group
+            .counter
+            .last_hit_unix_secs
+            .swap(now, Ordering::Relaxed);
+    }
+
+    /// TD-TIER-1 SC6 S2: per-group read liveness for the idle-reclaim sweep —
+    /// `(grant id, hits, last_hit_unix_secs)` (0 = no hit since
+    /// registration). Status/sweep reads only.
+    pub fn group_activity_snapshot(&self) -> Vec<(String, u64, i64)> {
+        let guard = self.protection_guard();
+        guard
+            .groups
+            .iter()
+            .map(|(id, group)| {
+                (
+                    id.clone(),
+                    group.counter.hits.load(Ordering::Relaxed),
+                    group.counter.last_hit_unix_secs.load(Ordering::Relaxed),
+                )
+            })
+            .collect()
+    }
+
     pub fn covered_bytes(&self, group_id: &str) -> u64 {
         self.protection_guard()
             .groups
@@ -587,10 +773,9 @@ impl PersistentByteStore {
                 if !entry.key().starts_with(OBJECT_KEY_PREFIX) {
                     return false;
                 }
-                let canonical = canonical_location(entry.key());
                 prefixes
                     .iter()
-                    .any(|prefix| canonical.contains(prefix.as_str()))
+                    .any(|prefix| protection_prefix_matches(entry.key(), prefix))
             })
             .map(|entry| entry.value().file_len)
             .sum()
@@ -845,6 +1030,7 @@ impl PersistentByteStore {
             return Ok(None);
         };
         let meta_for_read = meta.clone();
+        self.note_group_hit(key);
         let result = tokio::task::spawn_blocking(move || read_full_value(&meta_for_read))
             .await
             .map_err(join_error)?;
@@ -890,6 +1076,7 @@ impl PersistentByteStore {
         match result {
             Ok(bytes) => {
                 meta.touch.store(self.next_tick(), Ordering::Relaxed);
+                self.note_group_hit(key);
                 self.heal_on_hit(key, &meta);
                 Ok(Some(Arc::from(bytes)))
             }
@@ -939,8 +1126,13 @@ impl PersistentByteStore {
         removed
     }
 
+    /// Recency tick for a READ or classification. Always >= 2: new entries
+    /// (and entries restored at open) sit at touch 1, so any entry that has
+    /// been read or classified resident since outranks every never-read one
+    /// in LRU eviction (scan resistance), with no tie against them to fall
+    /// to hash order (TD-IOBUDGET-3).
     fn next_tick(&self) -> u64 {
-        self.inner.clock.fetch_add(1, Ordering::Relaxed)
+        self.inner.clock.fetch_add(1, Ordering::Relaxed) + 1
     }
 
     fn entry_path(&self, key: &str) -> PathBuf {
@@ -1533,10 +1725,14 @@ pub struct ProtectionGroup {
     pub budget_bytes: u64,
 }
 
-/// Bytes pinned under one group (shared by the policy and the entries).
+/// Bytes pinned under one group (shared by the policy and the entries), and
+/// TD-TIER-1 SC6 S2: the group's READ liveness — the idle-reclaim policy's
+/// signal. `last_hit_unix_secs == 0` means no hit since registration.
 #[derive(Debug, Default)]
 struct GroupCounter {
     pinned: AtomicU64,
+    hits: AtomicU64,
+    last_hit_unix_secs: AtomicI64,
     /// Set when one of this group's pins is released (its budget may have
     /// room again). Never cleared by a heal attempt; a group change rebuilds
     /// it.
@@ -1568,15 +1764,16 @@ impl ProtectionPolicy {
         // the object is resident — a region miss is served from the resident
         // object with no GET — and charging both made whole-object coverage
         // unfittable in a grant sized to the collection.
-        if self.groups.is_empty() || !key.starts_with(OBJECT_KEY_PREFIX) {
+        if self.groups.is_empty()
+            || (!key.starts_with(OBJECT_KEY_PREFIX) && !key.starts_with(REGION_KEY_PREFIX))
+        {
             return None;
         }
-        let canonical = canonical_location(key);
         self.groups.values().find(|group| {
             group
                 .prefixes
                 .iter()
-                .any(|prefix| canonical.contains(prefix.as_str()))
+                .any(|prefix| protection_prefix_matches(key, prefix))
         })
     }
 }
@@ -1589,7 +1786,7 @@ impl ProtectionPolicy {
 ///
 /// Canonicalized (review B2): flush seeds under its publish URL while readers
 /// and compaction use the LIST URL, which can spell the same object
-/// differently (`adls://` vs `az://`, slash runs); one canonical key keeps
+/// differently (`adls://` vs `az://`); one canonical key keeps
 /// seed, read and forget on the same entry.
 pub fn object_key(path: &str) -> String {
     format!("{OBJECT_KEY_PREFIX}{}", canonical_location(path))
@@ -1603,38 +1800,78 @@ fn stored_len(key: &str, value_len: u64) -> u64 {
         .saturating_add(value_len)
 }
 
-/// Prefix of every whole-object key ([`object_key`]).
-const OBJECT_KEY_PREFIX: &str = "pax-object/";
+/// TD-COMPACT-2b: the persistent-L2 key prefix for a REGION-GROUP extent
+/// entry. Unlike [`OBJECT_KEY_PREFIX`] (whole objects), these hold only the
+/// byte ranges of one region group (control, Region A, Region B, etc.) of a
+/// specific segment — the granularity the cache-policy pins.
+const REGION_KEY_PREFIX: &str = "pax-region-v1/";
 
-/// TD-TIER-1 SC4-2: canonical form for comparing locations embedded in cache
-/// keys (review S2). Azure scheme aliases (`abfs://`, `abfss://`, `adls://`,
-/// `azure://`) become the `az://` form the Azure listing emits, `gcs://`
-/// becomes `gs://`, and runs of
-/// `/` collapse to one except the `//` that follows a scheme's `:`, so a
-/// base written as `s3://b/x/` and keys listed as `s3://b/x/...` compare
-/// equal. Applied to both prefixes and keys. Known trade-off: two bases that
-/// differ only in a run of slashes (`s3://b/x//y/` vs `s3://b/x/y/`), which
-/// object stores treat as distinct keys, compare equal here.
+/// The persistent-L2 key holding a region-group extent of a segment, keyed
+/// by the group name and the segment path (TD-COMPACT-2b). Example:
+/// `pax-region-v1/index/{canonical_path}`.
+pub fn region_key(group: &str, path: &str) -> String {
+    format!("{REGION_KEY_PREFIX}{group}/{}", canonical_location(path))
+}
+
+/// Prefix of every whole-object key ([`object_key`]).
+// Version the disposable key namespace: old keys collapsed distinct cloud
+// objects. Never reuse those bytes under the corrected identity contract.
+const OBJECT_KEY_PREFIX: &str = "pax-object-v2/";
+
+fn protection_prefix_matches(key: &str, prefix: &str) -> bool {
+    // Strip whichever key form this is, then prefix-match the remaining
+    // canonical location path (TD-COMPACT-2b: region keys carry an extra
+    // `{group}/` segment between the prefix and the location).
+    let location = key
+        .strip_prefix(OBJECT_KEY_PREFIX)
+        .or_else(|| {
+            key.strip_prefix(REGION_KEY_PREFIX).and_then(|rest| {
+                // Skip the {group}/ segment to get to the canonical location.
+                rest.find('/').map(|i| &rest[i + 1..])
+            })
+        })
+        .unwrap_or(key);
+    // Segment-boundary match: a prefix names a directory (or an exact
+    // object), so `…/x//data` must NOT cover the sibling `…/x//data-other`
+    // (a plain string prefix would — `data-other` starts with `data`).
+    let trimmed = prefix.strip_suffix('/').unwrap_or(prefix);
+    let Some(rest) = location.strip_prefix(trimmed) else {
+        return false;
+    };
+    rest.is_empty() || rest.starts_with('/')
+}
+
+/// Normalize only documented backend scheme aliases and absolute local URLs.
+/// Cloud object-key bytes (including slash runs and embedded URI-like text)
+/// remain exact. Relative file URLs and bare relative paths can resolve under
+/// different roots; only the filesystem resolver can establish their identity.
 pub fn canonical_location(raw: &str) -> String {
-    // A local location has two spellings — the writer's plain path and the
-    // listing's `file://` URL — that must name ONE resident copy (SC4
-    // hardening review: two keys for one object charge the grant twice).
-    let mut text = raw.strip_prefix("file://").unwrap_or(raw).to_string();
-    for alias in ["abfss://", "abfs://", "adls://", "azure://"] {
-        text = text.replace(alias, "az://");
-    }
-    text = text.replace("gcs://", "gs://");
-    let mut out = String::with_capacity(text.len());
-    for ch in text.chars() {
-        if ch == '/' && out.ends_with('/') {
-            let before_last = out[..out.len() - 1].chars().last();
-            if before_last != Some(':') {
-                continue;
-            }
+    let local = raw.strip_prefix("file://").unwrap_or(raw);
+    if Path::new(local).is_absolute() {
+        // Local slash runs and `.` components name the same path. Preserve
+        // parent components (symlinks make folding `..` unsafe) and a trailing
+        // separator used by collection-prefix/orphan reconciliation.
+        let mut resolved = Path::new(local)
+            .components()
+            .collect::<PathBuf>()
+            .to_string_lossy()
+            .into_owned();
+        if (local.ends_with('/') || local.ends_with(std::path::MAIN_SEPARATOR))
+            && !resolved.ends_with(std::path::MAIN_SEPARATOR)
+        {
+            resolved.push(std::path::MAIN_SEPARATOR);
         }
-        out.push(ch);
+        return resolved;
     }
-    out
+    if let Some((scheme, key)) = raw.split_once("://") {
+        let canonical = match scheme {
+            "abfss" | "abfs" | "adls" | "azure" => "az",
+            "gcs" => "gs",
+            _ => return raw.to_string(),
+        };
+        return format!("{canonical}://{key}");
+    }
+    raw.to_string()
 }
 
 /// Outcome of a [`PersistentByteStore::set_protection_groups`] reconcile.
@@ -1668,6 +1905,69 @@ mod tests {
     };
     use std::io::{Seek, SeekFrom, Write};
     use std::sync::Arc;
+
+    /// TD-IOBUDGET-3: a never-read entry sits at tick 1; classification
+    /// (`touch_entry_len`) and reads tick strictly above it, even on a fresh
+    /// store whose clock has not advanced.
+    #[tokio::test]
+    async fn classification_ticks_above_every_never_read_entry() {
+        let dir = tempfile::tempdir().expect("test tempdir");
+        let store = PersistentByteStore::open(dir.path(), 1 << 20).expect("open");
+        let value: Arc<[u8]> = Arc::from(vec![1u8; 64].as_slice());
+        for key in ["a", "b"] {
+            store
+                .put(key, L2Class::Survivor, value.clone())
+                .await
+                .expect("put");
+        }
+        assert_eq!(store.touch_of("a"), Some(1), "a new entry is never-read");
+        assert_eq!(store.touch_entry_len("a"), Some(64));
+        let classified = store.touch_of("a").expect("indexed");
+        assert!(
+            classified > store.touch_of("b").expect("indexed"),
+            "classified entry {classified} must outrank the never-read tick"
+        );
+    }
+
+    /// TD-IOBUDGET-3: `touch_entry_len` refreshes recency without a read, so
+    /// a classified-resident entry outlives an older untouched one when the
+    /// next write-through forces an eviction.
+    #[tokio::test]
+    async fn touch_entry_len_protects_a_classified_entry_from_lru_eviction() {
+        let dir = tempfile::tempdir().expect("test tempdir");
+        let value: Arc<[u8]> = Arc::from(vec![1u8; 4096].as_slice());
+        let one = PersistentByteStore::stored_size("a", 4096);
+        // Room for two entries, not three.
+        let store = PersistentByteStore::open(dir.path(), one * 2 + one / 2).expect("open");
+        for key in ["a", "b"] {
+            store
+                .put(key, L2Class::Survivor, value.clone())
+                .await
+                .expect("put");
+        }
+        assert_eq!(
+            store.touch_entry_len("a"),
+            Some(4096),
+            "touch reports the length"
+        );
+        assert_eq!(store.touch_entry_len("missing"), None);
+        store
+            .put("c", L2Class::Survivor, value.clone())
+            .await
+            .expect("put c");
+        assert!(
+            store.entry_len("a").is_some(),
+            "the touched entry must survive"
+        );
+        // `c` and the untouched `b` both sit at the never-read tick, so which
+        // of them goes is unspecified; the classified entry must not.
+        assert_eq!(
+            usize::from(store.entry_len("b").is_some())
+                + usize::from(store.entry_len("c").is_some()),
+            1,
+            "exactly one never-read entry is evicted"
+        );
+    }
 
     #[tokio::test]
     async fn value_survives_store_reopen() {
@@ -2299,6 +2599,69 @@ mod tests {
         );
     }
 
+    /// SC4 PR-D (reconcile scaling): the reconcile is INCREMENTAL — with N
+    /// resident entries under groups the call does not touch, the sweep's
+    /// per-entry work is proportional to the CHANGED group's matches, not to
+    /// N. Asserted as a COUNT across two store sizes (a ratio, not a
+    /// wall-clock benchmark — mandate #6): growing the untouched population
+    /// tenfold must not grow the examined count, which stays at the changed
+    /// group's own match count.
+    #[tokio::test]
+    async fn reconcile_examines_only_the_changed_groups_entries() {
+        const CHANGED_MATCHES: usize = 6;
+        async fn examined_touching_one_group(untouched: usize) -> u64 {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let store = PersistentByteStore::open(dir.path(), 8 << 20).expect("open");
+            store.set_reserved_budget(8 << 20);
+            for i in 0..untouched {
+                store
+                    .put(
+                        key_in(C2, &format!("L0_stable_{i}.pax")),
+                        L2Class::Invariants,
+                        payload(64),
+                    )
+                    .await
+                    .expect("put stable");
+            }
+            for i in 0..CHANGED_MATCHES {
+                store
+                    .put(
+                        key_in(C1, &format!("L0_moving_{i}.pax")),
+                        L2Class::Invariants,
+                        payload(64),
+                    )
+                    .await
+                    .expect("put moving");
+            }
+            // First arm: every group is new, so a full pass is expected (and
+            // pins everything retroactively, as before).
+            store.set_protection_groups(vec![
+                group("stable", C2, 1 << 20),
+                group("moving", C1, 1 << 20),
+            ]);
+            assert!(store.covered_bytes("stable") > 0, "stable group armed");
+            // The measured call: only "moving" changes (its budget); "stable"
+            // is byte-identical.
+            let before = store.sweep_examined_for_test();
+            store.set_protection_groups(vec![
+                group("stable", C2, 1 << 20),
+                group("moving", C1, (1 << 20) + 1024),
+            ]);
+            store.sweep_examined_for_test() - before
+        }
+
+        let small = examined_touching_one_group(50).await;
+        let big = examined_touching_one_group(500).await;
+        assert_eq!(
+            small, big,
+            "examined entries must not grow with the untouched population"
+        );
+        assert!(
+            small <= CHANGED_MATCHES as u64,
+            "proportional to the changed group's matches ({CHANGED_MATCHES}), got {small}"
+        );
+    }
+
     /// SC4-3 self-heal: a pin skipped for budget is retried on the next cache
     /// hit once room frees (here: the pinned entry is invalidated), with no
     /// group change and no re-put.
@@ -2483,7 +2846,7 @@ mod tests {
             object_key("adls://cont/tenants/t/12/data/L0.pax"),
             object_key("az://cont/tenants/t/12/data/L0.pax")
         );
-        assert_eq!(
+        assert_ne!(
             object_key("s3://b/x//12/data/L0.pax"),
             object_key("s3://b/x/12/data/L0.pax")
         );
@@ -2493,9 +2856,9 @@ mod tests {
         );
     }
 
-    /// Review S2: Azure scheme aliases and doubled slashes compare equal.
+    /// Aliases normalize; distinct object-key bytes remain distinct.
     #[test]
-    fn canonical_location_unifies_aliases_and_slashes() {
+    fn canonical_location_preserves_object_key_bytes() {
         assert_eq!(
             canonical_location("adls://c/t/12/data/"),
             "az://c/t/12/data/"
@@ -2503,12 +2866,76 @@ mod tests {
         assert_eq!(canonical_location("abfs://c/x"), "az://c/x");
         assert_eq!(
             canonical_location("s3://b/x//tenants/t/"),
-            "s3://b/x/tenants/t/"
+            "s3://b/x//tenants/t/"
         );
         assert_eq!(
             canonical_location("invariants/region-a/s3://b/k"),
             "invariants/region-a/s3://b/k",
             "the scheme's own // is preserved"
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_cloud_keys_and_protection_survive_reopen() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = PersistentByteStore::open(dir.path(), 1 << 20).expect("open");
+        let a = object_key("s3://bucket/x//data/a.pax");
+        let b = object_key("s3://bucket/x/data/a.pax");
+        store
+            .put(a.clone(), L2Class::Invariants, Arc::from(&b"double"[..]))
+            .await
+            .expect("put");
+        store
+            .put(b.clone(), L2Class::Invariants, Arc::from(&b"single"[..]))
+            .await
+            .expect("put");
+        store
+            .put(
+                "pax-object/s3://bucket/legacy.pax",
+                L2Class::Invariants,
+                payload(8),
+            )
+            .await
+            .expect("legacy");
+        drop(store);
+        let store = PersistentByteStore::open(dir.path(), 1 << 20).expect("reopen");
+        assert_eq!(
+            store.get(&a).await.expect("get").as_deref(),
+            Some(&b"double"[..])
+        );
+        assert_eq!(
+            store.get(&b).await.expect("get").as_deref(),
+            Some(&b"single"[..])
+        );
+        assert!(
+            store
+                .get(&object_key("s3://bucket/legacy.pax"))
+                .await
+                .expect("get")
+                .is_none()
+        );
+        store.set_reserved_budget(1 << 20);
+        store.set_protection_groups(vec![group("g", "s3://bucket/x//data", 1 << 20)]);
+        assert!(store.is_protected(&a));
+        assert!(!store.is_protected(&b));
+        let nested = object_key("s3://foreign/s3://bucket/x//data/a.pax");
+        assert!(!store.policy_covers(&nested));
+        assert!(!store.policy_covers(&object_key("s3://bucket/x//data-other/a.pax")));
+    }
+
+    #[test]
+    fn relative_local_names_and_embedded_schemes_do_not_alias() {
+        assert_ne!(object_key("data/a.pax"), object_key("file://data/a.pax"));
+        assert_eq!(object_key("/data/a.pax"), object_key("file:///data/a.pax"));
+        assert_eq!(
+            object_key("/data//./a.pax"),
+            object_key("file:///data/a.pax")
+        );
+        assert_eq!(canonical_location("/data//./"), "/data/");
+        assert_ne!(object_key("/data/link/../a.pax"), object_key("/data/a.pax"));
+        assert_eq!(
+            canonical_location("s3://bucket/adls://object//a"),
+            "s3://bucket/adls://object//a"
         );
     }
 

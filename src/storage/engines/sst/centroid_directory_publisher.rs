@@ -39,22 +39,23 @@ use proximadb_storage_common::segment_layout::{
 };
 use proximadb_storage_filesystem_types::{DirEntry, FileSystem, FilesystemError};
 
-use crate::storage::engines::sst::block_cluster::env_kill_switch_off;
 use crate::storage::engines::sst::retirement_ledger;
 
 /// Create-only publish attempts before giving up to a concurrent publisher.
 const PUBLISH_ATTEMPTS: usize = 3;
 
-/// WRITE gate: compaction publishes the collection centroid directory.
-pub fn centroid_directory_write_enabled() -> bool {
-    env_kill_switch_off("PROXIMADB_PAX_WRITE_CENTROID_DIRECTORY")
+// WRITE gate: compaction publishes the collection centroid directory.
+proximadb_config::env_kill_switch! {
+    /// Kill-switch gate; default ON (0|false|off|no disables).
+    pub fn centroid_directory_write_enabled() { gate: "PROXIMADB_PAX_WRITE_CENTROID_DIRECTORY", default: true }
 }
 
-/// TD-PAXDIR-1 D6 WRITE gate: publishes add decode keys for the segments they
-/// load (two more ranged reads each) and write the v2 format. Default ON
-/// since D8; off, the directory is the D1 format, byte for byte.
-pub fn directory_decode_keys_write_enabled() -> bool {
-    env_kill_switch_off("PROXIMADB_PAX_WRITE_DIRECTORY_DECODE_KEYS")
+// TD-PAXDIR-1 D6 WRITE gate: publishes add decode keys for the segments they
+// load (two more ranged reads each) and write the v2 format. Default ON
+// since D8; off, the directory is the D1 format, byte for byte.
+proximadb_config::env_kill_switch! {
+    /// Kill-switch gate; default ON (0|false|off|no disables).
+    pub fn directory_decode_keys_write_enabled() { gate: "PROXIMADB_PAX_WRITE_DIRECTORY_DECODE_KEYS", default: true }
 }
 
 /// Directory objects in a listing, newest generation first.
@@ -338,7 +339,13 @@ pub async fn publish_centroid_directory(
         retain_current_decode_keys(&mut dir, decode_keys, &urls);
         let bytes = dir.to_bytes()?;
         let url = format!("{dir_url}/{}", object_name(generation));
-        match fs.write_if_absent(&url, &bytes, None).await {
+        // TD-TIER-1 SC5 residual: control objects (the centroid directory)
+        // keep an EXPLICIT Hot tier so a cold-tier bucket policy never
+        // transitions-lifecycle-moves them — they are read on every query.
+        let options = crate::storage::persistence::filesystem::FileOptions::for_access_tier(Some(
+            proximadb_storage_filesystem_types::ObjectAccessTier::Hot,
+        ));
+        match fs.write_if_absent(&url, &bytes, options).await {
             Ok(()) => {
                 for (old, entry) in &objects {
                     // TD-TIER-1 SC4-5: g-1 is kept remotely for readers but is

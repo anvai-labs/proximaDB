@@ -308,6 +308,7 @@ async fn setup_test_collection(
         trigger_compaction: false,
         collection_config: Some(collection),
         estimated_size: 100 * dimension,
+        collection_properties: None,
     };
 
     engine.do_flush(&flush_params).await?;

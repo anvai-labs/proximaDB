@@ -808,6 +808,24 @@ impl IcebergRestService {
         if catalog.table_exists(&identifier).await? {
             return Err(anyhow::anyhow!("Table '{}' already exists", req.name));
         }
+        // The Iceberg REST createTable door validates policy properties like
+        // every other door (ALTER TABLE SET, CREATE TABLE WITH, REST create /
+        // PATCH): it stored them verbatim, so a typo'd `cache.index.mode` or a
+        // refused `probe.*` key was accepted here and rejected everywhere
+        // else (#2419 review round 14).
+        proximadb_storage_common::validate_policy_properties(&req.properties)
+            // "Bad request:" is the prefix the Iceberg REST layer maps to 400
+            // BadRequestException. Without it the refusal surfaced as 500
+            // ServiceUnavailable, which Iceberg clients RETRY forever and
+            // never show the user (#2419 review round 15).
+            .map_err(|e| anyhow::anyhow!("Bad request: invalid table property: {e}"))?;
+        // System-written keys (`owner`, `tags`, …) are STRIPPED here, not
+        // refused: Spark/Trino/Flink add `owner` to every Iceberg
+        // `CREATE TABLE`, so refusing it would fail standard creates for a
+        // key the client cannot choose not to send (#2419 review round 21 —
+        // round 17 made this a refusal and broke exactly that). The POLICY
+        // namespaces are still validated above, on every door. See
+        // `without_reserved_table_properties` for the full rationale.
         let schema = self.iceberg_schema_to_catalog(&req.schema, &req.name, req.properties.clone());
 
         let created = catalog.create_table(&identifier, schema).await?;
@@ -1086,14 +1104,88 @@ impl IcebergRestService {
             return Err(Self::refuse_collection(&table));
         }
 
+        // Table properties are NOT writable through Iceberg commits, and a
+        // commit containing such a write is refused ATOMICALLY, BEFORE the
+        // update loop: this arm used to `let _ = updates` + success
+        // (Spark/Flink set table properties exactly this way — silently
+        // discarded). Round 19 tried collecting the refusal and bailing
+        // after the loop "so data updates apply first", but the loop's
+        // AddSnapshot arm is itself a debug-log no-op — nothing was applied,
+        // and once snapshot handling IS implemented that ordering would
+        // half-apply a commit and then 400 (client retries → duplicate
+        // append). Refuse the whole commit up front; it contains a write
+        // this surface cannot honour (#2419 review round 20).
+        //
+        // Refuse exactly the POLICY namespaces (`cache.` / `compaction.` /
+        // `probe.`) — the properties this server cannot honour through an
+        // Iceberg commit — and let every other key through.
+        //
+        // Round 22 got this wrong in a way round 23 caught: it stripped
+        // `is_reserved_table_property` keys and refused whatever remained,
+        // on the stated assumption that `write.*` was among them. It is NOT
+        // (`RESERVED_TABLE_PROPERTY_PREFIXES` is asset./collection./vector./
+        // stats. plus exact owner/tags), so `write.parquet.compression-codec`
+        // — which Spark adds unconditionally when rebuilding create
+        // properties — survived the strip and 400'd the commit, discarding
+        // the AddSchema/AddSnapshot updates bundled with it. That is the
+        // staged-create/CTAS regression round 22 set out to fix, reintroduced
+        // by the same patch.
+        //
+        // Scoping to the policy namespaces is also the honest rule: the
+        // Iceberg engine owns `write.*`, `format-version` and `commit.*`, and
+        // this door has no business judging them.
+        for update in &req.updates {
+            // BOTH directions. An unset that silently succeeded while the
+            // property stayed set is the same accepted-but-inert class this
+            // PR exists to close (#2419 review round 23, finding 2).
+            let (keys, verb): (Vec<&String>, &str) = match update {
+                IcebergTableUpdate::SetProperties { updates } => (updates.keys().collect(), "set"),
+                IcebergTableUpdate::RemoveProperties { removals } => {
+                    (removals.iter().collect(), "unset")
+                }
+                _ => continue,
+            };
+            // Sorted, and ALL of them: `HashMap` iteration order is seeded
+            // per process, so naming one arbitrary key made the 400 differ
+            // between attempts on the same request (round 23, finding 5).
+            let mut refused: Vec<&str> = keys
+                .into_iter()
+                .filter(|key| proximadb_storage_common::is_policy_property(key))
+                .map(String::as_str)
+                .collect();
+            if !refused.is_empty() {
+                refused.sort_unstable();
+                refused.dedup();
+                // The advice must lead somewhere that accepts the key: the
+                // pgwire SET door validates cache.*/compaction.* but refuses
+                // probe.* (the knob is server-level until the collection
+                // carrier lands), so a probe.* refusal would dead-end there
+                // (#2419 review round 24).
+                let probe_refused = refused
+                    .iter()
+                    .any(|key| key.trim().to_ascii_lowercase().starts_with("probe."));
+                let where_to = if probe_refused {
+                    "set it on the server ([storage.sst_config.coarse_probe] or PROXIMADB_PAX_READ_PROBE_*)"
+                } else {
+                    "use ALTER TABLE ... SET (...) over pgwire"
+                };
+                anyhow::bail!(
+                    "Bad request: policy table propert{} [{}] cannot be {verb} through an Iceberg commit; {}",
+                    if refused.len() == 1 { "y" } else { "ies" },
+                    refused.join(", "),
+                    where_to
+                );
+            }
+        }
         // Apply updates: handle SetProperties and AddSchema
         for update in &req.updates {
             match update {
-                IcebergTableUpdate::SetProperties { updates } => {
-                    // Update table properties in catalog (best-effort via statistics or properties)
-                    debug!("Commit: SetProperties on {}.{}", namespace.join("."), table);
-                    let _ = updates;
-                }
+                // No POLICY key can reach here (refused before the loop).
+                // Reserved system-written keys are dropped exactly as
+                // `create_table` drops them; Iceberg engine-owned keys
+                // (`write.*`, `format-version`, `commit.*`) are the engine's
+                // own and pass through.
+                IcebergTableUpdate::SetProperties { updates: _ } => {}
                 IcebergTableUpdate::AddSnapshot { snapshot } => {
                     debug!(
                         "Commit: AddSnapshot {} on {}.{}",
@@ -1380,7 +1472,8 @@ impl IcebergRestService {
         properties: HashMap<String, String>,
     ) -> CatalogTableSchema {
         let mut schema = CatalogTableSchema::new(table_name);
-        // System-written properties are never taken from a client request.
+        // System-written keys are dropped (never taken from a client
+        // request); the caller validated the policy namespaces.
         schema.properties = crate::table_properties::without_reserved_table_properties(properties);
 
         for (i, f) in iceberg_schema.fields.iter().enumerate() {
@@ -1767,8 +1860,10 @@ mod tests {
         // One real snapshot through the engine writer, keyed bridge-relatively
         // at facts/metadata (a warehouse-root-scoped bridge, as in production).
         let writer = IcebergObjectStoreBridge::from_url(&root_url).unwrap();
-        let mut record = ProximaRecord::default();
-        record.oid = "r1".to_string();
+        let mut record = ProximaRecord {
+            oid: "r1".to_string(),
+            ..Default::default()
+        };
         record.props.insert(
             "age".to_string(),
             proximadb_records::ProximaTreeNode::Value(ProximaValue::Int64(41)),

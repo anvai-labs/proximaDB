@@ -1,0 +1,56 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-CACHE-11: Restart warm replay reads manifests by tenant NAME, but they are written by cache-scope label, so nothing is replayed
+:status: Fixed (2026-11-08 — boot builds replay targets from catalog names
+resolved through `TenantStableIdResolver` (the write side's label domain),
+plus the shared scope; replay re-binds the recorded request scope via
+`instrument_with_stable_tenant`. Gate:
+`replay_finds_manifest_by_stable_id_label_and_serves_a_dram_hit`
+(mutation-verified: discovery-by-name fails the assert). A name without a
+minted stable id is not a candidate — the write side never keyed manifests
+by name.)
+:date: 2026-11-07
+:tags: [cache, warming, restart, tenant]
+
+== Verified facts
+
+* **Write side.** `warming::emit_warm_manifests` writes one manifest per
+  survivor-cache scope, keyed by `CacheScope::label()` (from
+  `SurvivorRangeCache::warm_set`). Request scopes are only
+  `StableTenant(id)`, which labels as the numeric stable id, and `Shared`,
+  which labels as `shared`. Manifests therefore land under `data/123/_cache/`
+  and `data/shared/_cache/`.
+* **Read side.** Boot (`database.rs`, the cache-warming task) builds its
+  replay list from catalog tenant NAMES (`proximadb_tenant::tenant_id_of`)
+  plus `"default"`, and `warming::replay_tenant` reads
+  `data/{name}/_cache/warm_cache.json`.
+* So no manifest is ever read: neither stable-id manifests (`123` versus
+  `acme`) nor the shared one (`shared` versus `default`). TD-CACHE-1 S2
+  restart warming is inert for every tenant. Replay also runs under
+  `io_trace::instrument` with no stable id, so even a manifest that was found
+  would fill `Shared` keys that tenant-scoped lookups (REST v2, gRPC v2,
+  Flight) never hit.
+
+== Do not
+
+Do not make replay parse a tenant NAME as a stable id. A numerically named
+tenant would be replayed into another tenant's `StableTenant` scope and its
+replay I/O billed to the wrong tenant. This was tried and reverted in the
+TD-CACHEC-1 review.
+
+== Fix direction
+
+Make both sides use one identity. Either:
+
+* key manifests by the catalog tenant name, and replay each under
+  `instrument_with_stable_tenant` with the stable id resolved from the
+  catalog; or
+* have boot enumerate the manifests that exist under the tenant-system
+  prefix, and map each stable-id label back through the catalog before
+  replay. Replay `shared` as shared.
+
+Gate the fix with a restart test: emit, reopen the engine, replay, and assert
+that a tenant-scoped lookup is a DRAM hit.
+
+Related: TD-CACHE-1 (restart warming), TD-CACHE-5 (manifest path),
+TD-CACHEC-1 (found during its review).

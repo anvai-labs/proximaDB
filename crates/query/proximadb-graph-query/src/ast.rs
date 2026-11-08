@@ -45,7 +45,7 @@ pub struct CompiledPattern {
 }
 
 /// Node pattern specification
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct NodePattern {
     /// Variable name (e.g., 'n' in (n:Person))
     pub variable: String,
@@ -58,7 +58,7 @@ pub struct NodePattern {
 }
 
 /// Edge pattern specification
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct EdgePattern {
     /// Variable name (e.g., 'r' in -[r:KNOWS]->)
     pub variable: Option<String>,
@@ -81,7 +81,7 @@ pub struct EdgePattern {
 }
 
 /// Path pattern for variable-length paths
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct PathPattern {
     /// Variable name for the path
     pub variable: String,
@@ -100,7 +100,7 @@ pub struct PathPattern {
 }
 
 /// Property constraint in patterns
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum PropertyConstraint {
     /// Exact value match
     Equals(serde_json::Value),
@@ -148,7 +148,7 @@ pub enum EdgeDirection {
 }
 
 /// Where clause for additional filtering (supports complex conditions)
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub enum WhereClause {
     /// Simple property constraint
     Property {
@@ -163,6 +163,9 @@ pub enum WhereClause {
     And(Box<WhereClause>, Box<WhereClause>),
     /// Logical OR of two conditions
     Or(Box<WhereClause>, Box<WhereClause>),
+    /// Logical XOR of two conditions (the modality grammar's combinator;
+    /// TD-GRAPH-4 step-3 parity)
+    Xor(Box<WhereClause>, Box<WhereClause>),
     /// Logical NOT of a condition
     Not(Box<WhereClause>),
 }
@@ -177,7 +180,7 @@ pub enum LogicalOperator {
 }
 
 /// Return specification
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ReturnSpec {
     /// Variables to return
     pub variables: Vec<String>,
@@ -194,7 +197,7 @@ pub struct ReturnSpec {
 }
 
 /// Property projection in RETURN clause (supports aggregations)
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub enum PropertyProjection {
     /// Simple variable (e.g., RETURN n)
     Variable(String),
@@ -238,7 +241,7 @@ pub enum PropertyProjection {
 }
 
 /// Order by specification
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct OrderBy {
     /// Variable name
     pub variable: String,
@@ -315,7 +318,7 @@ pub struct FoundPath {
 // ==================== Mutation Operation Types ====================
 
 /// A complete Cypher query with all clauses
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct CypherQuery {
     /// Reading clauses (MATCH, OPTIONAL MATCH)
     pub reading_clauses: Vec<ReadingClause>,
@@ -330,7 +333,7 @@ pub struct CypherQuery {
 }
 
 /// Reading clause types
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub enum ReadingClause {
     /// Standard MATCH clause
     Match {
@@ -358,7 +361,7 @@ pub enum ReadingClause {
 }
 
 /// Match pattern (nodes and edges together)
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct MatchPattern {
     /// Node patterns
     pub nodes: Vec<NodePattern>,
@@ -371,7 +374,7 @@ pub struct MatchPattern {
 }
 
 /// Updating clause types
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub enum UpdatingClause {
     /// CREATE clause for creating nodes/edges
     Create(CreateClause),
@@ -388,7 +391,7 @@ pub enum UpdatingClause {
 }
 
 /// CREATE clause for creating nodes and relationships
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct CreateClause {
     /// Nodes to create
     pub nodes: Vec<CreateNodeSpec>,
@@ -397,7 +400,7 @@ pub struct CreateClause {
 }
 
 /// Specification for creating a node
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct CreateNodeSpec {
     /// Variable name for the created node
     pub variable: Option<String>,
@@ -408,7 +411,7 @@ pub struct CreateNodeSpec {
 }
 
 /// Specification for creating an edge
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct CreateEdgeSpec {
     /// Variable name for the created edge
     pub variable: Option<String>,
@@ -420,10 +423,13 @@ pub struct CreateEdgeSpec {
     pub edge_type: String,
     /// Properties for the new edge
     pub properties: HashMap<String, serde_json::Value>,
+    /// Direction (the modality AST's field; previously parsed then
+    /// discarded — TD-GRAPH-4 step 3 keeps it)
+    pub direction: EdgeDirection,
 }
 
 /// DELETE clause for removing nodes and relationships
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct DeleteClause {
     /// Variables to delete
     pub variables: Vec<String>,
@@ -432,14 +438,14 @@ pub struct DeleteClause {
 }
 
 /// SET clause for updating properties
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct SetClause {
     /// Property updates
     pub items: Vec<SetItem>,
 }
 
 /// Individual SET item
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub enum SetItem {
     /// Set a single property: SET n.name = 'Alice'
     Property {
@@ -474,14 +480,14 @@ pub enum SetItem {
 }
 
 /// REMOVE clause for removing properties and labels
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct RemoveClause {
     /// Items to remove
     pub items: Vec<RemoveItem>,
 }
 
 /// Individual REMOVE item
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub enum RemoveItem {
     /// Remove a property: REMOVE n.property
     Property {
@@ -500,7 +506,7 @@ pub enum RemoveItem {
 }
 
 /// MERGE clause for create-if-not-exists pattern
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct MergeClause {
     /// Pattern to match or create
     pub pattern: MatchPattern,
@@ -511,7 +517,7 @@ pub struct MergeClause {
 }
 
 /// FOREACH clause for iteration
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ForEachClause {
     /// Variable name for iteration
     pub variable: String,
@@ -522,7 +528,7 @@ pub struct ForEachClause {
 }
 
 /// WITH clause for intermediate projections
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct WithClause {
     /// Projection specification (same as RETURN)
     pub projections: Vec<(String, PropertyProjection)>,
@@ -540,7 +546,7 @@ pub struct WithClause {
 
 /// UNION clause for combining multiple queries
 /// TD-019: UNION clause implementation
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct UnionClause {
     /// Whether to use DISTINCT (UNION) or ALL (UNION ALL)
     pub distinct: bool,
@@ -816,6 +822,7 @@ mod tests {
                 to_variable: "m".to_string(),
                 edge_type: "KNOWS".to_string(),
                 properties: HashMap::from([("since".to_string(), json!(2024))]),
+                direction: EdgeDirection::Outgoing,
             });
         let delete = DeleteClause::detach(vec!["n".to_string(), "r".to_string()]);
         let set = SetClause::new()

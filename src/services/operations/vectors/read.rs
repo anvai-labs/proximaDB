@@ -17,14 +17,24 @@ use crate::storage::persistence::write_ahead_log::WriteAheadLogManager;
 use super::resolver::CollectionResolver;
 
 /// Freshness order between two physical versions of one id: the later
-/// `updated_at_ns` wins, then the higher `record_version`. Used by get-by-id
-/// (choosing among flushed versions) and by both halves of the
-/// storage-inclusive list merge. The `documents()` merge orders by
-/// `updated_at_ns` alone; unifying all of these, and the memtable's own rule,
-/// is TD-MEMTABLE-MVCC-1.
+/// `updated_at_ns` wins, then the tombstone wins an exact-tie (TD-MEMTABLE-MVCC-1
+/// residual (e): the flushed read must not resurrect a row whose tombstone won
+/// the memtable comparator pre-flush), then the higher `record_version`.
+/// Used by get-by-id (choosing among flushed versions) and by both halves of
+/// the storage-inclusive list merge — matching the memtable's `mvcc_is_newer`
+/// on all three components.
 pub(crate) fn is_fresher(candidate: &ProximaRecord, current: &ProximaRecord) -> bool {
-    (candidate.updated_at_ns, candidate.record_version)
-        > (current.updated_at_ns, current.record_version)
+    if candidate.updated_at_ns != current.updated_at_ns {
+        return candidate.updated_at_ns > current.updated_at_ns;
+    }
+    // Exact-instant tie: tombstone wins BEFORE version (mandate 16d —
+    // matching the memtable's mvcc_is_newer and the search path's
+    // unflushed_supersedes; TD-MEMTABLE-MVCC-1 residual (e)).
+    let tombstone = |r: &ProximaRecord| r.valid_to_ns == Some(0);
+    if tombstone(candidate) != tombstone(current) {
+        return tombstone(candidate);
+    }
+    candidate.record_version > current.record_version
 }
 
 /// The freshest of several physical versions of one id (see [`is_fresher`]).
@@ -193,6 +203,43 @@ mod tests {
             "equal stamps fall back to the version"
         );
         assert!(super::freshest_version(Vec::new()).is_none());
+    }
+
+    /// TD-MEMTABLE-MVCC-1 residual (e): at an exact-timestamp tie, the
+    /// tombstone must win over a higher-version live copy — matching the
+    /// memtable's mvcc_is_newer and the search path's unflushed_supersedes.
+    /// Without this, a delete → flush sequence RESURRECTS the row: the
+    /// memtable correctly picks the tombstone (dead pre-flush), but the
+    /// flushed read picks the live copy (alive post-flush).
+    #[test]
+    fn freshest_version_tombstone_wins_exact_tie_over_higher_version() {
+        let live = super::ProximaRecord {
+            oid: "x".to_string(),
+            updated_at_ns: 100,
+            record_version: 2,
+            valid_to_ns: None,
+            ..Default::default()
+        };
+        let tombstone = super::ProximaRecord {
+            oid: "x".to_string(),
+            updated_at_ns: 100, // EXACT tie
+            record_version: 0,
+            valid_to_ns: Some(0), // dead
+            ..Default::default()
+        };
+        // Both orderings must pick the tombstone
+        for input in [
+            vec![live.clone(), tombstone.clone()],
+            vec![tombstone.clone(), live.clone()],
+        ] {
+            let winner = super::freshest_version(input).unwrap();
+            assert!(
+                winner.valid_to_ns == Some(0),
+                "TD-MEMTABLE-MVCC-1 (e): the tombstone must win an exact-tie over a higher-version live copy; got valid_to_ns={:?} version={}",
+                winner.valid_to_ns,
+                winner.record_version
+            );
+        }
     }
 
     use std::collections::HashMap;

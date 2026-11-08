@@ -1,0 +1,151 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-OEDIRWM-1: The query path read a directory watermark it could never soundly use — removed
+:status: Accepted
+:date: 2026-11-06
+:tags: [cost, gets, voe-directory, freshness, correctness]
+
+== Verified facts
+
+* **Reachability.** Every REST record search reached the read: canonical
+  handler → `RecordOpsService::handle_record_search_for_tenant` →
+  `search_records_with_tenant_context` → `run_unified_search_v1` →
+  `unified_search_v1_inner` → `apply_delta_merge_with_explain` →
+  `cached_directory_watermark`, which loaded the object-economy directory
+  sidecar on every Strong / BoundedStale query.
+* **The reader looked in the wrong place.** It used the raw tenant
+  `base_location`; the flush writer uses the collection DATA path. The reader
+  never found a real sidecar: every strict query paid a 404 (re-issued after
+  each idle gap), and production NEVER skipped a delta scan on the watermark.
+* **The watermark cannot soundly gate a skip.** It is stamped after the flush
+  commits (not at the flushed snapshot), and the sidecar is shared across pods
+  while each memtable is per-pod, so pod A's sidecar would let pod B skip its
+  own unflushed rows. Fixing only the path would have ACTIVATED that.
+
+== Decision (#2443, after four review rounds)
+
+* The query path no longer reads the directory, so every strict query scans
+  the delta — exactly what production already did. Zero sidecar GETs per
+  query. (#2443 passed a constant `(0, 0)` watermark; the follow-up below
+  removed the parameters.)
+* BoundedStale always scans the delta, but — unlike Strong — may still be
+  served from the 300s query cache, so its `max_staleness_ms` bound is NOT
+  enforced (it never effectively was: the skip never fired). Route-health
+  reports `bounded_stale_time_bound_check: false` and says so; EXPLAIN and its
+  trace event report the watermark as `None` (not wired), not a fabricated 0.
+* Route-health's object-economy status stays a NO-I/O read. #2443 left it
+  reporting `not_checked`; the follow-up below makes it `not_applicable`.
+* One root composition, `collection_data_path_for_assignment`, now used by
+  the flush writer and the record read-back. Sites still composing it by
+  hand: the storage-traits `collection_storage_path`,
+  `services/operations/vectors/read.rs`, `engines/nova/operations/search.rs`,
+  `services/collection/manager.rs` (two sites), `storage/engine.rs`, and
+  `engines/sst/trait_impl.rs`.
+
+Rejected along the way, each for a reason a review round found: a negative
+cache, a transient-vs-missing status split, a writer that refuses to
+overwrite an unreadable sidecar, and an on-request diagnostics loader. Once
+the query path stopped reading the directory, each was new machinery serving
+no hot-path reader, and two introduced defects of their own (a non-tenant-
+scoped diagnostics lookup; a refusal that a permanent 403 would turn into
+"never create the sidecar").
+
+== Write side retired (follow-up PR, 2026-11-06)
+
+The first three follow-ups recorded with #2443 are closed:
+
+* **The flush no longer writes the sidecar.** A PAX flush built a directory
+  outcome from the block centroids and ran `upsert_and_persist` (load = GET,
+  store = create-dir + PUT) for a sidecar nothing read — whenever the engine
+  had the directory cache wired (server: `SharedServices::new`; not
+  embedded/bench engines), the flush carried a `collection_id`, and block
+  clustering produced centroids (default ON; `PROXIMADB_PAX_BLOCK_CLUSTER=0`
+  disables it). Removed with its helper (`pax_write_outcome`). Such a flush
+  is one GET + one PUT cheaper; derived from the code path, not
+  benchmarked. The writer still COMPUTES per-block centroids and radii when
+  clustering is on (`.with_block_centroids(cluster)` in `segment_format.rs`):
+  no production path reads them now, but
+  `tests/sst_compaction_reclustering_test.rs` uses the radii as its
+  clustering-quality gate, so the computation stays.
+* **The dead directory-cache wiring is gone:** the `SstEngine`,
+  `VectorOperationsService` and `SharedServices` `directory_cache` fields and
+  builders, `touch_object_economy_directory_for_search`,
+  `cached_object_economy_directory_status`, and the `SstableWriter`
+  `directory_emission` opt-in.
+* **The constant watermark parameters are gone** from
+  `scan_wal_delta_if_needed`: with no watermark the decision is exactly
+  `requires_delta_merge()` (every mode but `StaleOk` scans). The helper
+  returns the WAL cursor it reads, so a strict query reads `current_lsn`
+  once there instead of twice. With no manifest service (embedded/tests
+  without `manifest::init`) the scan is skipped and warned about exactly as
+  before — unflushed rows are not lost there, because Stage 1 of
+  `execute_unified_plan` already scores the WAL with vectors on every query
+  (see TD-DELTASCAN-1). EXPLAIN reports an unread cursor as `None`.
+* `FreshnessLsnSource` stays: the `cold-deletion-vectors` search path uses
+  it as the deletion-vector snapshot LSN. Its engine accessor is gated on
+  that feature.
+
+**Observable route-health change (shape unchanged, values changed):** for
+SST collections `directory_format_present` goes `true → false` (it now means
+"a directory sidecar is produced", not "the engine has the format") and
+`route_hint` goes `"object_economy" → null`, `eligible` goes `true → false`
+and `live_status` goes `"not_checked" → "not_applicable"` — the route is
+not applicable to any engine. EXPLAIN reports `current_lsn_at_query: None` when the WAL
+cursor was not read, instead of 0 — serialized as the field's ABSENCE
+(`skip_serializing_if`), never `null`, so key-presence distinguishes
+"cursor not read" from a truncated payload — and the `proximadb.vector_route.explain`
+trace event's `current_lsn` field is now Debug-formatted (`Some(42)` /
+`None`), not a bare number; structured-log consumers parsing it as an
+integer must adapt. (The object-economy e2e bench is unaffected: its
+engine never wired the directory cache, so it never wrote the sidecar.) Measurement note: harnesses that sum the
+collection directory's bytes (e.g. `persisted_bytes` in
+`sift_pax_recall_ratchet_test`) now exclude the sidecar — that drop is not
+a storage-format gain.
+
+Left in place, deliberately:
+
+* The `object_economy_directory` module (format, store, hooks, cache types)
+  remains for the bench and `FreshnessLsnSource`; with no producer or
+  consumer in the server it is dead production code, and deleting it is a
+  separate cleanup.
+* Sidecars already written by earlier builds (`oedir/v{epoch}.bin` under
+  each SST collection's data root) are not removed: one small object per
+  collection, no reader. Delete them with the module cleanup (or a one-off
+  sweep); never re-read them — they list files compaction has since retired.
+* `OBJECT_ECONOMY_LIVE_STATUS_NOT_REACHABLE` is now emitted only for an
+  eligible route, so it no longer flags every collection (values change; the
+  enum is unchanged). It and `OBJECT_ECONOMY_DIRECTORY_DEGRADED` can no
+  longer fire; retiring the variants is a response-contract change, left to
+  the module cleanup.
+* Other dependents the module cleanup must handle: `query/explain.rs`
+  `record_directory_load` (takes `DirectoryLoadStatus`; test-only callers),
+  the `StaticLsnSource` test double, the `ObjectEconomyCostFactors` /
+  RL-planner object-economy features (no directory input any more), the
+  `merge_delta_with_directory_results` / `merge_input_directory_records`
+  naming (a trace-field rename), and the now-inert
+  `PROXIMADB_DIRECTORY_CACHE_RECHECK_MS` gate.
+* Pre-existing, not introduced here: a strict search scans the unflushed
+  WAL twice, and the second, vector-less scan wins the exact-tie merge, so
+  an unflushed hit can come back without its vector — filed as
+  TD-DELTASCAN-1.
+* `VectorFreshnessMode::should_scan_delta` / `should_scan_delta_with_time`
+  (search-types crate) have no production caller now — only their unit
+  tests (duplicated in `core/search/mod.rs`) and the in-memory
+  object-economy bench. They still encode the watermark-skip semantics this
+  TD calls unsound; reduce them to `requires_delta_merge()` (or delete) with
+  the module cleanup, and never wire a caller back without a sound
+  watermark.
+* `FreshnessLsnSource` is still wired in a default build, where only the
+  feature-gated path reads it; gating the field and wiring too is part of
+  the same cleanup.
+
+== Remaining follow-up
+
+* A sound skip needs a watermark stamped at flush START and scoped per pod
+  (or fenced by memtable epoch), with read-your-writes proven across pods —
+  and a producer/consumer pair for the directory designed around it.
+
+== Not measured
+
+The GET reduction (one sidecar GET per strict query per idle gap → zero) is
+derived from the code path; no `BENCHMARK_EVIDENCE.toml` entry is claimed.

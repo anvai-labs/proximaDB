@@ -154,14 +154,76 @@ pub trait VectorBatchSerializer: Send + Sync {
     }
 }
 
+/// Serialize a batch with the shared v1 bincode encoding (TD-WAL-6).
+///
+/// `ProtocolBuffersSerializer` and `AvroSerializer` both encode WAL slots
+/// with plain `bincode` — neither emits protobuf nor Avro bytes. This helper
+/// is the ONE copy of that v1 encoding so the two named formats cannot drift
+/// apart. `what` names the slot for the error context. The bincode cause is
+/// INLINED in the message (not chained behind `.source()`) so recovery-side
+/// `{}` Display keeps the corruption detail — e.g. flush_coordinator wraps
+/// this with its own context and only the outermost message shows.
+pub(super) fn serialize_bincode_batch(
+    records: &[ProximaRecord],
+    what: &'static str,
+) -> Result<Vec<u8>> {
+    ::bincode::serialize(records)
+        .map_err(|e| anyhow::anyhow!("Failed to serialize ProximaRecords for {what}: {e}"))
+}
+
+/// Deserialize a batch with the shared v1 bincode encoding (TD-WAL-6).
+///
+/// See [`serialize_bincode_batch`]; same one-copy and cause-inlining
+/// rationale.
+pub(super) fn deserialize_bincode_batch(
+    data: &[u8],
+    what: &'static str,
+) -> Result<Vec<ProximaRecord>> {
+    ::bincode::deserialize(data)
+        .map_err(|e| anyhow::anyhow!("Failed to deserialize ProximaRecords from {what}: {e}"))
+}
+
+/// Shared test fixture: a minimal Fp32 `ProximaRecord` used by the proto and
+/// avro slot round-trip tests (was copy-pasted per serializer; the bincode
+/// serializer keeps its own richer fixture with an origin field).
+#[cfg(test)]
+pub(super) mod test_util {
+    use proximadb_data_model::ProximaValue;
+    use proximadb_records::{EmbeddingCell, ProximaRecord, ProximaTree, ProximaTreeNode};
+
+    pub fn create_test_vector() -> ProximaRecord {
+        let mut props = ProximaTree::new();
+        props.insert(
+            "category".to_string(),
+            ProximaTreeNode::Value(ProximaValue::String("test".to_string())),
+        );
+
+        ProximaRecord {
+            oid: "test_vector_1".to_string(),
+            embeddings: vec![EmbeddingCell::new_fp32(
+                "default",
+                "vector",
+                4,
+                vec![0.1, 0.2, 0.3, 0.4],
+            )],
+            props,
+            record_version: 1,
+            ..Default::default()
+        }
+    }
+}
+
 /// Supported serialization formats
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SerializationFormat {
-    /// Protocol Buffers - default for proto-first architecture
+    /// Named "proto" for the canonical WAL slot; the bytes are the shared v1
+    /// bincode encoding (TD-WAL-6) — no protobuf encoding exists.
     ProtocolBuffers,
-    /// Bincode - optimized for performance
+    /// Bincode - optimized for performance (the only format with a v2
+    /// precision-aware wire override)
     Bincode,
-    /// Apache Avro - for schema evolution
+    /// Named "avro" for the WAL slot; the bytes are the shared v1 bincode
+    /// encoding (TD-WAL-6) — no Avro encoding or schema evolution exists.
     Avro,
 }
 
@@ -252,5 +314,54 @@ mod tests {
 
         let bincode_serializer = SerializerFactory::from_string("bincode").unwrap();
         assert_eq!(bincode_serializer.format(), SerializationFormat::Bincode);
+    }
+
+    // TD-WAL-6 pin: the two named-slot serializers must stay byte-identical
+    // with the honest Bincode v1 encoding — they share ONE copy of it.
+    #[test]
+    fn test_named_slots_are_bincode_v1_bytes() {
+        let vectors = vec![test_util::create_test_vector()];
+        let proto_bytes = SerializerFactory::create(SerializationFormat::ProtocolBuffers)
+            .serialize_batch(&vectors)
+            .expect("proto slot serialize");
+        let avro_bytes = SerializerFactory::create(SerializationFormat::Avro)
+            .serialize_batch(&vectors)
+            .expect("avro slot serialize");
+        let bincode_bytes = ::bincode::serialize(&vectors).expect("raw bincode");
+        assert_eq!(proto_bytes, bincode_bytes);
+        assert_eq!(avro_bytes, bincode_bytes);
+    }
+
+    // TD-WAL-6: the named slots inherit the trait's v2 default, which
+    // delegates to the v1 encoding — pin that equality so a future
+    // precision-conditional divergence in either slot is caught here, not
+    // in a durability incident.
+    #[test]
+    fn test_named_slots_v2_default_equals_v1_bytes() {
+        let vectors = vec![test_util::create_test_vector()];
+        for format in [
+            SerializationFormat::ProtocolBuffers,
+            SerializationFormat::Avro,
+        ] {
+            let serializer = SerializerFactory::create(format);
+            let v1 = serializer.serialize_batch(&vectors).expect("v1");
+            let v2 = serializer.serialize_batch_v2(&vectors).expect("v2 default");
+            assert_eq!(v1, v2, "{format:?} v2 default must delegate to v1");
+        }
+    }
+
+    // TD-WAL-6: the shared helper's error path must inline both the slot
+    // context and the bincode cause in the Display message — recovery-side
+    // `{}` shows only the outermost message.
+    #[test]
+    fn test_shared_helper_error_inlines_cause() {
+        let garbage: &[u8] = &[0xFF, 0xFF, 0xFF, 0xFF];
+        let err = deserialize_bincode_batch(garbage, "Avro WAL slot")
+            .expect_err("garbage bytes must not decode");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("Failed to deserialize ProximaRecords from Avro WAL slot"),
+            "message missing slot context: {msg}"
+        );
     }
 }

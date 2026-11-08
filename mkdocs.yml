@@ -5,9 +5,10 @@
 # records written for engineers working in this repo, not for users. Publishing
 # those would make the site a changelog of internal debt. This site covers the
 # user-facing tree only: 01-quick-start, 02-guides, 03-api-reference,
-# 04-operations, 05-concepts, release-notes. (release-notes is in scope but
-# publishes nothing yet: both its files are AsciiDoc, hence excluded, and it has
-# no nav entry — see TD-DOCSITE-1.)
+# 04-operations, 05-concepts, release-notes. (release-notes published nothing
+# until v0.6.0 — its older files are AsciiDoc, hence excluded and baselined;
+# the v0.6.0 notes are the first served page — TD-DOCSITE-1 tracks the
+# AsciiDoc conversion debt.)
 #
 # Deliberately no exact file counts here: they change with almost every PR, so a
 # number in this comment is stale debt. The one count that IS maintained is the
@@ -149,6 +150,8 @@ nav:
   - Operations:
       - Overview: 04-operations/index.md
       - "Release procedure (one tag, every registry)": 04-operations/release/release-procedure.md
+  - Release Notes:
+      - v0.6.0: release-notes/v0.6.0.md
 
 extra_css:
   - stylesheets/tokens.css
