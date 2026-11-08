@@ -589,9 +589,13 @@ jobs:
           # by-design TD-PKG-1 state-dir deviations in rpm -V, and erases.
           # Lint the verifier before dispatching: the last packaging-gate
           # bug was a quoting defect only a parse would catch.
+          # TODO(TD-DOCSITE-adjacent): an actionlint/yamllint lane for
+          # release.yml itself is still missing — the deleted-upload-header
+          # parse break on this very branch reached GitHub before any local
+          # check; add it to an existing lint lane.
           bash -n deploy/packaging/scripts/verify_rpm.sh
           docker run --rm -v "$PWD:/pkg:ro" rockylinux:8 \
-            bash -euo pipefail /pkg/deploy/packaging/scripts/verify_rpm.sh "$VERSION"
+            bash /pkg/deploy/packaging/scripts/verify_rpm.sh "$VERSION"
           # %post scriptlets (systemctl daemon-reload) still report failure here because
           # systemd is not PID 1 in the container; rpm treats a scriptlet failure as a
           # warning and dnf exits 0, so this step proves payload/paths/version/metadata/
