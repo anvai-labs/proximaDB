@@ -14,8 +14,9 @@ cat > /tmp/rehearse-deb/apt-get <<'APT'
 #!/bin/bash
 # "install": create the payload AND the TD-PKG-1 state dirs with the
 # contract's owner/mode (mirrors postinstall.sh's %post behavior).
-dirs="$(grep -E '^CHOWN_DIRS=' deploy/packaging/scripts/postinstall.sh || true)"
-dirs="${dirs#CHOWN_DIRS=}"; dirs="${dirs//\"/}"
+. deploy/packaging/scripts/verify_payload_common.sh
+read_contract_dirs deploy/packaging/scripts/postinstall.sh
+dirs="$CONTRACT_DIRS"
 # the contract owner does not exist on a fresh runner
 id proximadb &>/dev/null || sudo useradd --system --user-group --home-dir /var/lib/proximadb --shell /usr/sbin/nologin proximadb
 mkdir -p /usr/bin /etc/proximadb /lib/systemd/system

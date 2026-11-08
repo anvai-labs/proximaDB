@@ -39,7 +39,7 @@ if [ "$SELFTEST" = "1" ]; then
     # Fixture GENERATED from the contract (CHOWN_DIRS edits cannot break
     # the selftest); VERIFY_RPM_DEV_FIXTURE overrides it for negative
     # paths (empty string = the dead-%post simulation).
-    devs="${VERIFY_RPM_DEV_FIXTURE-$(for dir in $contract_dirs; do printf '.M...UG..    %s\n' "$dir"; done)}"
+    devs="${VERIFY_RPM_DEV_FIXTURE-$(for dir in $contract_dirs; do td_pkg1_stateline_for "$dir"; done)}"
 else
     dnf install -y /pkg/proximadb-*.rpm
     assert_common_payload /usr/lib/systemd/system/proximadb.service
@@ -63,35 +63,35 @@ fi
 # the switch — if the payload ever sets the dirs' attrs itself and
 # postinstall drops the chown loop, CHOWN_DIRS disappears and this gate
 # requires a CLEAN rpm -V instead.)
-n_expected=0
+# REQUIRE: each contract dir has EXACTLY one TD-PKG-1 deviation (counting
+# per dir, not per line — a duplicated line cannot mask an unmatched dir),
+# and every rpm -V line maps to a contract dir (no foreign deviations).
+set -- $contract_dirs
+n_expected=$#
 n_matched=0
 unexpected=""
+for dir in $contract_dirs; do
+    line="$(printf '%s\n' "$devs" | grep -F "    $dir" || true)"
+    count="$(printf '%s\n' "$line" | grep -c . || true)"
+    if [ "$count" -ne 1 ]; then
+        echo "contract dir $dir: expected exactly one TD-PKG-1 deviation, got $count" >&2
+        [ -n "$line" ] && printf '%s\n' "$line" >&2
+        exit 1
+    fi
+    path="$(printf '%s' "$line" | sed -E "s/^\.M\.\.\.UG\.\. +//")"
+    case "$path" in "$dir") ;; *) echo "deviation for $dir has foreign path: $path" >&2; exit 1 ;; esac
+    n_matched=$((n_matched + 1))
+done
 while IFS= read -r line; do
     [ -n "$line" ] || continue
-    # Strip the stateline + whitespace: what remains is the exact path.
-    path="$(printf '%s' "$line" | sed -E 's/^\.M\.\.\.UG\.\. +//')"
-    matched=0
-    for dir in $contract_dirs; do
-        case "$path" in
-            "$dir") matched=1; break ;;
-        esac
-    done
-    if [ "$matched" -eq 1 ]; then
-        n_matched=$((n_matched + 1))
-    else
-        unexpected="$unexpected$line"$'\n'
-    fi
+    path="$(printf '%s' "$line" | sed -E 's/^[.A-Z]+ +//')"
+    known=0
+    for dir in $contract_dirs; do case "$path" in "$dir") known=1; break ;; esac; done
+    [ "$known" -eq 1 ] || { echo "unexpected deviation:" >&2; printf '%s\n' "$line" >&2; unexpected=1; }
 done <<EOF3
 $devs
 EOF3
-set -- $contract_dirs
-n_expected=$#
-
-if [ "$n_matched" -ne "$n_expected" ] || [ -n "$unexpected" ]; then
-    echo "rpm -V deviations wrong: expected=$n_expected matched=$n_matched" >&2
-    [ -n "$unexpected" ] && { echo "unexpected deviations:" >&2; printf '%s' "$unexpected" >&2; }
-    exit 1
-fi
+[ -z "$unexpected" ] || { echo "unexpected deviations present" >&2; exit 1; }
 
 if [ "$SELFTEST" = "1" ]; then
     echo "SELFTEST PASS: fixture tolerated ($n_matched/$n_expected contract dirs), no foreign deviations"

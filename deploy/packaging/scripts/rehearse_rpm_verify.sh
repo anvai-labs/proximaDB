@@ -24,9 +24,12 @@ cat > /tmp/rehearse/rpm <<'RPM'
 #!/bin/bash
 case "$1" in
   -V)
-    dirs="$(grep -E '^CHOWN_DIRS=' deploy/packaging/scripts/postinstall.sh || true)"
-    dirs="${dirs#CHOWN_DIRS=}"; dirs="${dirs//\"/}"
-    for d in $dirs; do printf '.M...UG..    %s\n' "$d"; done
+    # The contract via the SAME strict parser the real gate uses (the repo
+    # checkout is the cwd) — a malformed CHOWN_DIRS fails the rehearsal
+    # exactly as it would fail the container.
+    . deploy/packaging/scripts/verify_payload_common.sh
+    read_contract_dirs deploy/packaging/scripts/postinstall.sh
+    for d in $CONTRACT_DIRS; do printf '.M...UG..    %s\n' "$d"; done
     ;;
   -e) sudo rm -f /usr/bin/proximadb-server ;;
 esac
