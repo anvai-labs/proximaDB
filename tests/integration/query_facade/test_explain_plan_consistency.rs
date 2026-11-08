@@ -1,6 +1,7 @@
-// Disabled: legacy `VectorMatch` type with `{id, score, metadata}` no longer
-// exists; canonical `ScoredRecord` has `{record, score, rank}`. Needs rewrite.
-#![cfg(any())]
+// Re-enabled 2026-11-08 (compile-disabled since e56a45d90, 2026-05-22): the
+// legacy `VectorMatch {id, score, metadata}` fixture shape maps onto the
+// canonical `ScoredRecord {record, score, rank}` (metadata was fixture-only,
+// never asserted; its canonical carrier is `ProximaRecord::props`).
 /*
  * Copyright 2025 Vijaykumar Singh
  *
@@ -41,7 +42,6 @@
 //!                   - query_type hints
 //! ```
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -51,8 +51,9 @@ use serde_json::json;
 
 use proximadb::query::facade::{
     ExecutionMetrics, FacadeConfig, QueryContext, QueryRequest, QueryResult, QueryResultData,
-    QueryStrategy, QueryType, UnifiedQueryFacade, VectorMatch,
+    QueryStrategy, QueryType, ScoredRecord, UnifiedQueryFacade,
 };
+use proximadb_records::ProximaRecord;
 
 // ================================================================================
 // EXPLAIN PLAN RESPONSE SCHEMA
@@ -190,11 +191,14 @@ impl QueryStrategy for MockVectorStrategyWithExplain {
             _ => 10,
         };
 
-        let results: Vec<VectorMatch> = (0..top_k.min(5))
-            .map(|i| VectorMatch {
-                id: format!("vec_{:03}", i + 1),
+        let results: Vec<ScoredRecord> = (0..top_k.min(5))
+            .map(|i| ScoredRecord {
+                record: ProximaRecord {
+                    oid: format!("vec_{:03}", i + 1),
+                    ..Default::default()
+                },
                 score: 0.95 - (i as f32 * 0.05),
-                metadata: Some(json!({"index": i})),
+                rank: (i + 1) as u32,
             })
             .collect();
 
