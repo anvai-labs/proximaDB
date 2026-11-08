@@ -49,7 +49,10 @@ else
     # (the production incident F4 exists to catch) or a hard rpm error.
     # Fail with the precise message instead of a confusing count mismatch.
     if [ -z "$devs" ]; then
-        echo "rpm -V reported NO deviations on a real install — %post dead or rpmdb error; refusing" >&2
+        echo "rpm -V reported NO deviations on a real install — one of:" >&2
+        echo "  - the %post scriptlet died before its chown (dead %post)," >&2
+        echo "  - the payload stopped shipping the contract dirs entirely, or" >&2
+        echo "  - a hard rpm error. Refusing; check the dnf/install output above." >&2
         exit 1
     fi
 fi
@@ -70,15 +73,19 @@ set -- $contract_dirs
 n_expected=$#
 n_matched=0
 unexpected=""
+# The expected line, built from the ONE stateline constant (grep -F with
+# the full expected line + the end anchor below = no substring games).
+stateline_escaped="$(printf '%s' "$TD_PKG1_STATELINE" | sed 's/[.]/[.]/g')"
 for dir in $contract_dirs; do
-    line="$(printf '%s\n' "$devs" | grep -F "    $dir" || true)"
+    expected_line="$(td_pkg1_stateline_for "$dir")"
+    line="$(printf '%s\n' "$devs" | grep -F "$expected_line" | grep -E " $dir\$" || true)"
     count="$(printf '%s\n' "$line" | grep -c . || true)"
     if [ "$count" -ne 1 ]; then
         echo "contract dir $dir: expected exactly one TD-PKG-1 deviation, got $count" >&2
         [ -n "$line" ] && printf '%s\n' "$line" >&2
         exit 1
     fi
-    path="$(printf '%s' "$line" | sed -E "s/^\.M\.\.\.UG\.\. +//")"
+    path="$(printf '%s' "$line" | sed -E "s/^$stateline_escaped +//")"
     case "$path" in "$dir") ;; *) echo "deviation for $dir has foreign path: $path" >&2; exit 1 ;; esac
     n_matched=$((n_matched + 1))
 done

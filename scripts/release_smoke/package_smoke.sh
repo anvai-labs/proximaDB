@@ -36,17 +36,20 @@ grep -q '^Type=simple' "$UNIT" \
   || { echo "::error::${KIND} on ${DISTRO}: unit is not Type=simple: $(grep '^Type=' "$UNIT")"; exit 1; }
 id proximadb >/dev/null 2>&1 \
   || { echo "::error::${KIND} on ${DISTRO}: package creates no proximadb user"; exit 1; }
-# TD-PKG-1: keep this dir list in sync with postinstall.sh's CHOWN_DIRS
-# (the contract's single source of truth). This minimal container has no
-# repo checkout, so the list cannot be derived here — a new state dir
-# needs a one-line edit below AND one in postinstall.sh.
-for d in /var/lib/proximadb /var/log/proximadb; do
+# TD-PKG-1: the dir list arrives via CHOWN_DIRS (derived on the invoking
+# host from postinstall.sh — the contract's single source of truth); this
+# minimal container has no repo checkout. The hardcoded list is a FALLBACK
+# only.
+CONTRACT_DIRS="${CHOWN_DIRS:-/var/lib/proximadb /var/log/proximadb}"
+for d in $CONTRACT_DIRS; do
   [ -d "$d" ] || { echo "::error::${KIND} on ${DISTRO}: $d was not created"; exit 1; }
   owner="$(stat -c '%U:%G' "$d")"
   [ "$owner" = "proximadb:proximadb" ] \
     || { echo "::error::${KIND} on ${DISTRO}: $d is ${owner}, not proximadb:proximadb"; exit 1; }
   mode="$(stat -c '%a' "$d")"
   [ "$mode" = "750" ] || { echo "::error::${KIND} on ${DISTRO}: $d mode is $mode, not 750"; exit 1; }
+  grp="$(stat -c '%G' "$d")"
+  [ "$grp" = "proximadb" ] || { echo "::error::${KIND} on ${DISTRO}: $d group is $grp, not proximadb"; exit 1; }
 done
 echo "${KIND} on ${DISTRO}: unit Type=simple; state dirs owned by proximadb"
 

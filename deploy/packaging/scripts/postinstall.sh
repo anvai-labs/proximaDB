@@ -17,6 +17,10 @@ fi
 # pre-publish verifier derives its expected rpm -V deviations from this
 # variable (the DEB leg instead requires a CLEAN dpkg -V, which ignores
 # dirs entirely). Edits here update the RPM packaging contract.
+# FOLLOW-UP (documented direction): shipping the dirs with the final
+# owner/mode at BUILD time (fpm staging attrs) would make installs
+# natively conforming and retire this mutation contract — the %post chown
+# stays only as the upgrade path for pre-existing root-owned dirs.
 CHOWN_DIRS="/var/lib/proximadb /var/log/proximadb"
 
 for dir in $CHOWN_DIRS; do

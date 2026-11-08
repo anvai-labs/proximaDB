@@ -9,7 +9,8 @@ set -euo pipefail
 VERSION="${1:?usage: rehearse_deb_verify.sh <version>}"
 REPO="$(pwd)"
 
-mkdir -p /tmp/rehearse-deb
+REHEARSE_DIR=$(mktemp -d /tmp/rehearse.XXXXXXX)
+trap 'rm -rf "$REHEARSE_DIR"' EXIT
 cat > /tmp/rehearse-deb/apt-get <<'APT'
 #!/bin/bash
 # "install": create the payload AND the TD-PKG-1 state dirs with the
@@ -19,7 +20,7 @@ read_contract_dirs deploy/packaging/scripts/postinstall.sh
 dirs="$CONTRACT_DIRS"
 # the contract owner does not exist on a fresh runner
 id proximadb &>/dev/null || sudo useradd --system --user-group --home-dir /var/lib/proximadb --shell /usr/sbin/nologin proximadb
-mkdir -p /usr/bin /etc/proximadb /lib/systemd/system
+sudo mkdir -p /usr/bin /etc/proximadb /lib/systemd/system
 printf '#!/bin/sh\necho "proximadb-server $VERIFY_REHEARSE_VERSION"\n' | sudo tee /usr/bin/proximadb-server >/dev/null
 sudo chmod +x /usr/bin/proximadb-server
 sudo touch /etc/proximadb/config.toml /lib/systemd/system/proximadb.service

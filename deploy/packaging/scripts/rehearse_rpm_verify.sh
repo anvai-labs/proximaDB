@@ -12,15 +12,16 @@ VERSION="${1:?usage: rehearse_rpm_verify.sh <version>}"
 REPO="$(pwd)"
 
 # --- stubs -------------------------------------------------------------
-mkdir -p /tmp/rehearse
-cat > /tmp/rehearse/dnf <<'DNF'
+REHEARSE_DIR=$(mktemp -d /tmp/rehearse.XXXXXXX)
+trap 'rm -rf "$REHEARSE_DIR"' EXIT
+cat > $REHEARSE_DIR/dnf <<'DNF'
 #!/bin/bash
 sudo mkdir -p /usr/bin /etc/proximadb /usr/lib/systemd/system
 printf '#!/bin/sh\necho "proximadb-server $VERIFY_REHEARSE_VERSION"\n' | sudo tee /usr/bin/proximadb-server >/dev/null
 sudo chmod +x /usr/bin/proximadb-server
 sudo touch /etc/proximadb/config.toml /usr/lib/systemd/system/proximadb.service
 DNF
-cat > /tmp/rehearse/rpm <<'RPM'
+cat > $REHEARSE_DIR/rpm <<'RPM'
 #!/bin/bash
 case "$1" in
   -V)
@@ -34,7 +35,7 @@ case "$1" in
   -e) sudo rm -f /usr/bin/proximadb-server ;;
 esac
 RPM
-chmod +x /tmp/rehearse/dnf /tmp/rehearse/rpm
+chmod +x $REHEARSE_DIR/dnf $REHEARSE_DIR/rpm
 
 # --- real-branch rehearsal ---------------------------------------------
 VERIFY_REHEARSE_VERSION="$VERSION" PATH="/tmp/rehearse:$PATH" \
