@@ -694,8 +694,15 @@ fn envelope_metadata(record: &ProximaRecord) -> HashMap<String, String> {
                 ProximaValue::String(s) => s.clone(),
                 ProximaValue::Boolean(b) => b.to_string(),
                 ProximaValue::Int64(i) => i.to_string(),
+                ProximaValue::UInt64(u) => u.to_string(),
                 ProximaValue::Float64(f) => f.to_string(),
                 ProximaValue::Json(j) => j.to_string(),
+                // Structured values: serialize to JSON for the string-typed envelope.
+                // The canonical json_to_proxima produces Array/Map (not Json) for
+                // nested structures, so we must handle them here to avoid silent drops.
+                ProximaValue::Array(_) | ProximaValue::Map(_) => {
+                    proximadb_records::conversions::proxima_to_json(value).to_string()
+                }
                 _ => return None,
             };
             Some((k.clone(), s))

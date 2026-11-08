@@ -1378,4 +1378,22 @@ mod tests {
         let pr = ProximaRecord::from(&edge);
         assert!(pr.edge.as_ref().unwrap().weight.is_none());
     }
+
+    /// Pins the u64 > i64::MAX → UInt64 decision. Without this test, a future
+    /// refactor could silently re-remove the as_u64() branch (as happened in
+    /// 5 of the 6 retired copies).
+    #[test]
+    fn json_to_proxima_u64_above_i64_max_becomes_uint64() {
+        let big = serde_json::json!(u64::MAX);
+        assert!(matches!(json_to_proxima(&big), ProximaValue::UInt64(v) if v == u64::MAX));
+        // i64::MAX + 1 is the smallest value that takes the UInt64 branch
+        let boundary = serde_json::json!((i64::MAX as u64) + 1);
+        assert!(matches!(
+            json_to_proxima(&boundary),
+            ProximaValue::UInt64(_)
+        ));
+        // Small u64s still hit the exact i64 path first
+        let small = serde_json::json!(42u64);
+        assert!(matches!(json_to_proxima(&small), ProximaValue::Int64(42)));
+    }
 }
