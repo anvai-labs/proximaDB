@@ -63,9 +63,10 @@ use crate::core::search::FilterExpression;
 use crate::core::search::sql_value_filter::proxima_value_to_filter_literal;
 use crate::proto::proximadb_v1::Collection;
 use crate::query::query_optimizer::{
-    ExecutionStep, OptimizationGoal, QuantizationStrategy, QuantizationType, UnifiedExecutionPlan,
+    ExecutionStep, OptimizationGoal, QuantizationStrategy, UnifiedExecutionPlan,
     UnifiedQueryContext, UnifiedQueryOptimizer,
 };
+use crate::query::rl_planner::action::QuantizationStage as QuantizationType;
 
 // Import from sibling submodules
 use super::config::{SearchPlanHints, UnifiedSearchConfig};
@@ -528,6 +529,9 @@ fn quantization_strategy_to_level(strategy: &QuantizationStrategy) -> UnifiedQua
             codebook_id: None,
             adaptive_subvectors: false,
         })),
+        // Exact-precision stages are not quantization (the historical
+        // as_quantization_type seam mapped FP16/FP32 to None).
+        QuantizationType::FP16 | QuantizationType::FP32 => None,
     };
     UnifiedQuantizationLevel { level_type }
 }

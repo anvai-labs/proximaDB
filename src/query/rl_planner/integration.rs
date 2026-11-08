@@ -465,18 +465,21 @@ fn apply_quantization_floor_to_method(
             if quantization_type.quality_rank() >= floor.quality_rank() {
                 return;
             }
-            if let Some(raised) = floor.as_quantization_type() {
-                trace!(
-                    "Object-economy floor raised QuantizedOnly from {:?} to {:?}",
-                    quantization_type, raised
-                );
-                *quantization_type = raised;
-            } else {
+            if floor.requires_exact_final_stage() {
+                // FP16/FP32 floors demand exact precision — the historical
+                // behavior (the old Option-returning seam mapped these to
+                // None) is preserved: replace rather than raise.
                 trace!(
                     "Object-economy floor ({floor}) requires exact precision; \
                      replacing QuantizedOnly with DirectFP32"
                 );
                 *method = SearchExecutionMethod::DirectFP32;
+            } else {
+                trace!(
+                    "Object-economy floor raised QuantizedOnly from {:?} to {:?}",
+                    quantization_type, floor
+                );
+                *quantization_type = floor;
             }
         }
         SearchExecutionMethod::Progressive { stages } => {
@@ -507,7 +510,6 @@ fn apply_quantization_floor_to_method(
 mod tests {
     use super::*;
     use crate::proto::proximadb_v1::Collection;
-    use crate::query::query_optimizer::QuantizationType;
     use std::sync::Arc;
 
     #[tokio::test]
@@ -605,12 +607,12 @@ mod tests {
     #[test]
     fn floor_raises_quantized_only_from_binary_to_int8() {
         let mut method = SearchExecutionMethod::QuantizedOnly {
-            quantization_type: QuantizationType::Binary,
+            quantization_type: QuantizationStage::Binary,
         };
         apply_quantization_floor_to_method(&mut method, QuantizationStage::INT8);
         match method {
             SearchExecutionMethod::QuantizedOnly { quantization_type } => {
-                assert_eq!(quantization_type, QuantizationType::INT8);
+                assert_eq!(quantization_type, QuantizationStage::INT8);
             }
             other => panic!("expected QuantizedOnly INT8, got {other:?}"),
         }
@@ -619,12 +621,12 @@ mod tests {
     #[test]
     fn floor_keeps_quantized_only_when_current_meets_or_exceeds() {
         let mut method = SearchExecutionMethod::QuantizedOnly {
-            quantization_type: QuantizationType::INT8,
+            quantization_type: QuantizationStage::INT8,
         };
         apply_quantization_floor_to_method(&mut method, QuantizationStage::Binary);
         match method {
             SearchExecutionMethod::QuantizedOnly { quantization_type } => {
-                assert_eq!(quantization_type, QuantizationType::INT8);
+                assert_eq!(quantization_type, QuantizationStage::INT8);
             }
             other => panic!("expected QuantizedOnly INT8, got {other:?}"),
         }
@@ -633,7 +635,7 @@ mod tests {
     #[test]
     fn floor_promotes_quantized_only_to_direct_fp32_when_floor_is_fp16() {
         let mut method = SearchExecutionMethod::QuantizedOnly {
-            quantization_type: QuantizationType::INT8,
+            quantization_type: QuantizationStage::INT8,
         };
         apply_quantization_floor_to_method(&mut method, QuantizationStage::FP16);
         assert!(matches!(method, SearchExecutionMethod::DirectFP32));
@@ -642,7 +644,7 @@ mod tests {
     #[test]
     fn floor_promotes_quantized_only_to_direct_fp32_when_floor_is_fp32() {
         let mut method = SearchExecutionMethod::QuantizedOnly {
-            quantization_type: QuantizationType::PQ4,
+            quantization_type: QuantizationStage::PQ4,
         };
         apply_quantization_floor_to_method(&mut method, QuantizationStage::FP32);
         assert!(matches!(method, SearchExecutionMethod::DirectFP32));
@@ -729,4 +731,49 @@ mod tests {
             }
         ));
     }
+}
+
+#[test]
+fn floor_raises_pq4_to_int8_across_ordering() {
+    // Rank-corruption guard (review 2026-11-08): a probe that set
+    // INT8's rank equal to PQ4's made every existing floor test pass
+    // while silently breaking this exact pairing — floor=INT8 over a
+    // PQ4 plan must RAISE, not silently keep.
+    let mut method = SearchExecutionMethod::QuantizedOnly {
+        quantization_type: QuantizationStage::PQ4,
+    };
+    apply_quantization_floor_to_method(&mut method, QuantizationStage::INT8);
+    match method {
+        SearchExecutionMethod::QuantizedOnly { quantization_type } => {
+            assert_eq!(quantization_type, QuantizationStage::INT8);
+        }
+        other => panic!("expected raise to INT8, got {other:?}"),
+    }
+}
+
+#[test]
+fn floor_keeps_int8_against_pq8_floor() {
+    // The inverse pairing: INT8 (~95%) must NOT be "raised" to PQ8
+    // (~90%) — under the corrupted ranking that was a precision
+    // DOWNGRADE performed as a "raise".
+    let mut method = SearchExecutionMethod::QuantizedOnly {
+        quantization_type: QuantizationStage::INT8,
+    };
+    apply_quantization_floor_to_method(&mut method, QuantizationStage::PQ8);
+    match method {
+        SearchExecutionMethod::QuantizedOnly { quantization_type } => {
+            assert_eq!(quantization_type, QuantizationStage::INT8);
+        }
+        other => panic!("expected INT8 kept, got {other:?}"),
+    }
+}
+
+#[test]
+fn quality_rank_strict_total_order() {
+    // Direct pin: the doc-comment ordering is the recall contract.
+    assert!(QuantizationStage::Binary.quality_rank() < QuantizationStage::PQ4.quality_rank());
+    assert!(QuantizationStage::PQ4.quality_rank() < QuantizationStage::PQ8.quality_rank());
+    assert!(QuantizationStage::PQ8.quality_rank() < QuantizationStage::INT8.quality_rank());
+    assert!(QuantizationStage::INT8.quality_rank() < QuantizationStage::FP16.quality_rank());
+    assert!(QuantizationStage::FP16.quality_rank() < QuantizationStage::FP32.quality_rank());
 }

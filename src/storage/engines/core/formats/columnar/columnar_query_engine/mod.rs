@@ -27,9 +27,9 @@ pub use vectorized_executor::{DataChunk, vectorized_filter_batch};
 
 // Re-export unified reader types for compatibility
 pub use columnar_query_reader::{
-    CollectionContext, FilterValue, PagePruningInfo, PageRange, QuantizationMethod, ReaderConfig,
-    ReadingStrategy, ReadingStrategySelector, RowGroupAccessPattern, SchemaMapping, SearchType,
-    SeekRange, Stage2Strategy, UnifiedParquetReader, VectorPosition,
+    CollectionContext, FilterValue, PagePruningInfo, PageRange, ReaderConfig, ReadingStrategy,
+    ReadingStrategySelector, RowGroupAccessPattern, SchemaMapping, SearchType, SeekRange,
+    Stage2Strategy, UnifiedParquetReader, VectorPosition,
 };
 
 // Common traits used across query implementations
