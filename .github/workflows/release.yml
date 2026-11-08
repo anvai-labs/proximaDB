@@ -609,34 +609,11 @@ jobs:
           VERIFY_RPM_DEV_FIXTURE=$'.M...UG..    /var/lib/proximadb\n.M...UG..    /var/log/proximadb\n..5......    /usr/bin/proximadb-server' \
             bash deploy/packaging/scripts/verify_rpm.sh selftest \
             >/dev/null 2>&1 && { echo "FATAL: foreign-deviation fixture was ACCEPTED"; exit 1; }
-          # REHEARSE the REAL branch on the runner: stubbed dnf/rpm execute
-          # every line the container will run (this branch is otherwise
-          # exercised only AT release time — an unbound variable here once
-          # passed every fixture and would have failed the release).
-          mkdir -p /tmp/rehearse
-          cat > /tmp/rehearse/dnf <<'DNF'
-          #!/bin/bash
-          # sudo: GitHub runners are unprivileged and the payload paths are
-          # root-owned system dirs (the script asserts them at the real paths).
-          sudo mkdir -p /usr/bin /etc/proximadb /usr/lib/systemd/system
-          printf '#!/bin/sh\necho "proximadb-server $VERIFY_REHEARSE_VERSION"\n' | sudo tee /usr/bin/proximadb-server >/dev/null
-          sudo chmod +x /usr/bin/proximadb-server
-          sudo touch /etc/proximadb/config.toml /usr/lib/systemd/system/proximadb.service
-          DNF
-          cat > /tmp/rehearse/rpm <<'RPM'
-          #!/bin/bash
-          case "$1" in
-            -V) # TD-PKG-1 fixture GENERATED from the contract (postinstall.sh
-                # is in the mounted checkout) — CHOWN_DIRS edits auto-adapt.
-                dirs="$(grep -E '^CHOWN_DIRS=' /pkg/deploy/packaging/scripts/postinstall.sh || true)"
-                dirs="${dirs#CHOWN_DIRS=}"; dirs="${dirs//\"/}"
-                for d in $dirs; do printf '.M...UG..    %s\n' "$d"; done ;;
-            -e) sudo rm -f /usr/bin/proximadb-server ;;
-          esac
-          RPM
-          chmod +x /tmp/rehearse/dnf /tmp/rehearse/rpm
-          VERIFY_REHEARSE_VERSION="$VERSION" PATH="/tmp/rehearse:$PATH" \
-            bash deploy/packaging/scripts/verify_rpm.sh "$VERSION"
+          # REHEARSE the REAL branch on the runner (extracted script —
+          # bash -n testable; stubbed dnf/rpm execute every line the
+          # container will run).
+          bash -n deploy/packaging/scripts/rehearse_rpm_verify.sh
+          bash deploy/packaging/scripts/rehearse_rpm_verify.sh "$VERSION"
           test ! -e /usr/bin/proximadb-server
           docker run --rm -v "$PWD:/pkg:ro" rockylinux:8 \
             bash /pkg/deploy/packaging/scripts/verify_rpm.sh "$VERSION"
@@ -726,6 +703,9 @@ jobs:
           VERIFY_DEB_DEV_FIXTURE=$'??5??????    /usr/bin/proximadb-server' \
             bash deploy/packaging/scripts/verify_deb.sh selftest \
             >/dev/null 2>&1 && { echo "FATAL: deviating dpkg -V fixture was ACCEPTED"; exit 1; }
+          # REHEARSE the DEB real branch too (F4 symmetry with the RPM leg).
+          bash -n deploy/packaging/scripts/rehearse_deb_verify.sh
+          bash deploy/packaging/scripts/rehearse_deb_verify.sh "$VERSION"
           docker run --rm -v "$PWD:/pkg:ro" debian:11 \
             bash /pkg/deploy/packaging/scripts/verify_deb.sh "$VERSION"
 

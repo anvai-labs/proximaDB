@@ -31,4 +31,5 @@ read_contract_dirs() {
     esac
     CONTRACT_DIRS="${lines#CHOWN_DIRS=\"}"
     CONTRACT_DIRS="${CONTRACT_DIRS%\"}"
+    [ -n "$CONTRACT_DIRS" ] || { echo "CHOWN_DIRS is empty — the TD-PKG-1 contract is gone; refuse to verify (a dead %post would pass silently)" >&2; return 1; }
 }

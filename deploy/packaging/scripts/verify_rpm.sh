@@ -9,6 +9,8 @@
 #     the container dispatch): replays the exact v0.6.0 failure output as
 #     the fixture; VERIFY_RPM_DEV_FIXTURE overrides it for negative-path
 #     testing (empty = the dead-%post simulation, which must be REJECTED).
+#   rehearse_rpm_verify.sh    (sibling script) rehearses the REAL branch
+#     on the runner with stubbed dnf/rpm.
 #
 # The TD-PKG-1 contract lives in postinstall.sh's CHOWN_DIRS (single
 # source of truth, parsed by the shared read_contract_dirs helper).
@@ -29,23 +31,27 @@ esac
 read_contract_dirs "$POSTINSTALL_SRC"
 contract_dirs="$CONTRACT_DIRS"
 
-# rpm -V exits nonzero on ANY deviation. A nonzero rc with NO verify
-# output is a hard failure (not-installed package, rpmdb error).
-rc=0
+# rpm -V exits nonzero on ANY deviation (rc=1) — captured below. A hard
+# error (not-installed package, rpmdb error) fails via the empty-output
+# branch with its own precise message.
 devs=""
 if [ "$SELFTEST" = "1" ]; then
     # Fixture GENERATED from the contract (CHOWN_DIRS edits cannot break
-    # the selftest); VERIFY_RPM_DEV_FIXTURE overrides for negative paths.
-    rc=1
+    # the selftest); VERIFY_RPM_DEV_FIXTURE overrides it for negative
+    # paths (empty string = the dead-%post simulation).
     devs="${VERIFY_RPM_DEV_FIXTURE-$(for dir in $contract_dirs; do printf '.M...UG..    %s\n' "$dir"; done)}"
 else
     dnf install -y /pkg/proximadb-*.rpm
     assert_common_payload /usr/lib/systemd/system/proximadb.service
     assert_version
     devs="$(rpm -V proximadb)" || true
-    # An EMPTY output on a real install is suspicious (a dead %post, or a
-    # hard rpm error) — the gate below fails it as 0-matched vs n_expected,
-    # and this log line explains why.
+    # An EMPTY output on a real install is a HARD failure — a dead %post
+    # (the production incident F4 exists to catch) or a hard rpm error.
+    # Fail with the precise message instead of a confusing count mismatch.
+    if [ -z "$devs" ]; then
+        echo "rpm -V reported NO deviations on a real install — %post dead or rpmdb error; refusing" >&2
+        exit 1
+    fi
 fi
 
 # Gate: EVERY contract dir must deviate with the TD-PKG-1 stateline
@@ -62,10 +68,12 @@ n_matched=0
 unexpected=""
 while IFS= read -r line; do
     [ -n "$line" ] || continue
+    # Strip the stateline + whitespace: what remains is the exact path.
+    path="$(printf '%s' "$line" | sed -E 's/^\.M\.\.\.UG\.\. +//')"
     matched=0
     for dir in $contract_dirs; do
-        case "$line" in
-            .M...UG..*"$dir") matched=1; break ;;
+        case "$path" in
+            "$dir") matched=1; break ;;
         esac
     done
     if [ "$matched" -eq 1 ]; then

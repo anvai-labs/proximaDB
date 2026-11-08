@@ -1,0 +1,40 @@
+#!/bin/bash
+# Rehearsal of verify_rpm.sh's REAL branch (release-review F4): stubbed
+# dnf/rpm execute every line the container will run — install, payload,
+# version, the TD-PKG-1 gate, erase — on the runner, BEFORE the release
+# dispatch. The stub rpm -V output is GENERATED from postinstall.sh's
+# CHOWN_DIRS (single source of truth; no second copy of the dir list).
+# Expects the repo checkout as cwd. Runs the payload writes via sudo
+# (root-owned system paths, GitHub runners are unprivileged).
+set -euo pipefail
+
+VERSION="${1:?usage: rehearse_rpm_verify.sh <version>}"
+REPO="$(pwd)"
+
+# --- stubs -------------------------------------------------------------
+mkdir -p /tmp/rehearse
+cat > /tmp/rehearse/dnf <<'DNF'
+#!/bin/bash
+sudo mkdir -p /usr/bin /etc/proximadb /usr/lib/systemd/system
+printf '#!/bin/sh\necho "proximadb-server $VERIFY_REHEARSE_VERSION"\n' | sudo tee /usr/bin/proximadb-server >/dev/null
+sudo chmod +x /usr/bin/proximadb-server
+sudo touch /etc/proximadb/config.toml /usr/lib/systemd/system/proximadb.service
+DNF
+cat > /tmp/rehearse/rpm <<'RPM'
+#!/bin/bash
+case "$1" in
+  -V)
+    dirs="$(grep -E '^CHOWN_DIRS=' deploy/packaging/scripts/postinstall.sh || true)"
+    dirs="${dirs#CHOWN_DIRS=}"; dirs="${dirs//\"/}"
+    for d in $dirs; do printf '.M...UG..    %s\n' "$d"; done
+    ;;
+  -e) sudo rm -f /usr/bin/proximadb-server ;;
+esac
+RPM
+chmod +x /tmp/rehearse/dnf /tmp/rehearse/rpm
+
+# --- real-branch rehearsal ---------------------------------------------
+VERIFY_REHEARSE_VERSION="$VERSION" PATH="/tmp/rehearse:$PATH" \
+  bash "$REPO/deploy/packaging/scripts/verify_rpm.sh" "$VERSION"
+test ! -e /usr/bin/proximadb-server
+echo "REHEARSAL PASS: the real verify branch executed end-to-end"
