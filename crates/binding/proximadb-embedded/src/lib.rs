@@ -5024,7 +5024,7 @@ impl EmbeddedProximaDB {
     /// proximadb-proto (`serde_impls`). This path previously routed through
     /// `json_to_proxima` + `proxima_to_sql_value`, whose u64
     /// branch silently wrapped values above i64::MAX to `Int64Value`; the
-    /// canonical fn approximates those as f64 `NumberValue` instead
+    /// canonical fn encodes those as `StringValue` (decimal text) instead
     /// (pinned by the proto guard test). JSON `null` also changes shape —
     /// `SqlValue { value: None }` → `Some(NullValue(0))` — which every
     /// downstream consumer (Serialize, `sql_value_to_json`,

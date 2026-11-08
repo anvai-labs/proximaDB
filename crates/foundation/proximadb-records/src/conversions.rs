@@ -1445,6 +1445,11 @@ mod tests {
             json_to_proxima(&serde_json::json!(1.5)),
             ProximaValue::Float64(f) if (f - 1.5).abs() < f64::EPSILON
         ));
+        // u64 > i64::MAX → UInt64 (the exactness pin)
+        assert!(matches!(
+            json_to_proxima(&serde_json::json!(u64::MAX)),
+            ProximaValue::UInt64(v) if v == u64::MAX
+        ));
 
         // Arrays — empty and non-empty
         let empty_arr = json_to_proxima(&serde_json::json!([]));
