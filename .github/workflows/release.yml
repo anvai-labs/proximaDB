@@ -587,7 +587,10 @@ jobs:
           # (bash -n testable; mounted read-only via the repo checkout). It
           # installs, asserts payload/version, tolerates ONLY the two
           # by-design TD-PKG-1 state-dir deviations in rpm -V, and erases.
-          docker run --rm -e VER="$VERSION" -v "$PWD:/pkg:ro" rockylinux:8 \
+          # Lint the verifier before dispatching: the last packaging-gate
+          # bug was a quoting defect only a parse would catch.
+          bash -n deploy/packaging/scripts/verify_rpm.sh
+          docker run --rm -v "$PWD:/pkg:ro" rockylinux:8 \
             bash -euo pipefail /pkg/deploy/packaging/scripts/verify_rpm.sh "$VERSION"
           # %post scriptlets (systemctl daemon-reload) still report failure here because
           # systemd is not PID 1 in the container; rpm treats a scriptlet failure as a
@@ -595,7 +598,7 @@ jobs:
           # removal - scriptlet health is covered by the post-publish distro smoke, where
           # systemd IS running.
 
-
+      - name: Upload RPM Artifact
         uses: actions/upload-artifact@v7
         with:
           name: rpm-package
@@ -671,9 +674,11 @@ jobs:
             test -x /usr/bin/proximadb-server
             test -f /etc/proximadb/config.toml
             test -f /lib/systemd/system/proximadb.service
-            # F4 symmetry with the RPM leg: dpkg -V checks file md5s/modes and
-            # ignores dirs/ownership, so the TD-PKG-1 chown needs no tolerance
-            # here — a deb payload defect must fail pre-publish, not post-release.
+            # F4 symmetry with the RPM leg: dpkg -V (debian:11 ships 1.20)
+            # verifies md5sums + presence of packaged regular files and
+            # ignores dirs/ownership/modes — so the TD-PKG-1 chown needs no
+            # tolerance here, and content corruption fails pre-publish.
+            # (Mode-only defects are out of dpkg -V's reach.)
             dpkg -V proximadb
             got="$(/usr/bin/proximadb-server --version)"
             test "$got" = "proximadb-server $VER"
