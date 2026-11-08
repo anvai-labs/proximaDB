@@ -988,6 +988,12 @@ impl ProximaDB {
         // cost one negative read each. Gated by PROXIMADB_CACHE_PREFILL.
         {
             let base_url = self._config.storage.storage_urls().into_iter().next();
+            // TD-CACHE-11: catalog manager for stable-id resolution (the write
+            // side keys warm manifests by the stable-id scope label).
+            let catalog_manager_for_warm = self
+                .multi_server
+                .as_ref()
+                .map(|ms| ms.shared_services.catalog_manager.clone());
             if let Some(base_url) = base_url {
                 tokio::spawn(async move {
                     let factory = match crate::storage::persistence::filesystem::FilesystemFactory::create_default().await {
@@ -1000,19 +1006,48 @@ impl ProximaDB {
                     // Small grace so engine arming (which registers the cache
                     // handles) has completed before replay looks them up.
                     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                    // Tenants = catalog-tagged tenant ids ∪ the single-tenant
-                    // default — manifests are keyed by the REQUEST tenant, which
-                    // is "default" for untagged/single-tenant deployments.
-                    let mut tenant_set: std::collections::HashSet<String> =
+                    // TD-CACHE-11: replay targets = catalog tenant NAMES resolved
+                    // to their minted stable ids, plus the shared scope. The
+                    // write side keys manifests by CacheScope::label() (the
+                    // stable id / "shared") — never by tenant name — so a name
+                    // without a minted id has no manifest to find and is not a
+                    // candidate.
+                    use proximadb_tenant::TenantStableIdResolver;
+                    // The shared target needs no stable-id resolution and is
+                    // the only warm data an unstamped single-tenant deployment
+                    // can have — a missing catalog costs the tenant targets,
+                    // never the whole feature.
+                    let mut targets =
+                        vec![crate::storage::engines::sst::warming::ReplayTarget::shared()];
+                    if let Some(catalog_manager) = catalog_manager_for_warm {
+                        let resolver =
+                            crate::security::tenant_stable_id::CatalogTenantStableIdResolver::new(
+                                catalog_manager,
+                            );
+                        let mut names: std::collections::HashSet<String> =
                         crate::storage::persistence::write_ahead_log::list_collections_from_catalog()
                             .await
                             .into_iter()
                             .map(|meta| meta.collection)
                             .filter_map(|collection| proximadb_tenant::tenant_id_of(&collection))
                             .collect();
-                    tenant_set.insert("default".to_string());
-                    let tenants: Vec<String> = tenant_set.into_iter().collect();
-                    crate::storage::engines::sst::warming::boot_warm(factory, base_url, tenants)
+                        names.insert(proximadb_tenant::DEFAULT_TENANT.to_string());
+                        for name in names {
+                            let Some(stable_id) = resolver.stable_id_of(&name) else {
+                                tracing::debug!(
+                                    tenant = %name,
+                                    "warm replay: no stable id minted — write side never keyed manifests by name"
+                                );
+                                continue;
+                            };
+                            targets.push(
+                                crate::storage::engines::sst::warming::ReplayTarget::tenant(
+                                    name, stable_id,
+                                ),
+                            );
+                        }
+                    }
+                    crate::storage::engines::sst::warming::boot_warm(factory, base_url, targets)
                         .await;
                 });
             }
