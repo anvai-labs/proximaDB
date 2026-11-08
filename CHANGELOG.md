@@ -2,6 +2,22 @@
 
 All notable changes to ProximaDB will be documented in this file.
 
+## [0.6.0] - 2026-11-08
+
+Minor release: per-collection survivor-cache attribution — the meter the warm-rate
+tier prices from (`proximadb_survivor_cache_collection_reads_total{tenant_stable_id,
+collection_id, outcome}`, bounded registry, mutation-verified ratchets) — gRPC v2
+billing scopes completed across search AND write handlers (**operator-visible:
+gRPC writes now emit KRU/object-store meters and per-tenant consumption records**),
+restart cache warming fixed (TD-CACHE-11 — manifests are keyed by stable-id scope
+labels and boot now resolves names through the catalog authority), the
+object-economy directory sidecar write retired, and configuration-honesty fixes
+from the post-merge smoke (the public port binds `[api].unified_port`; the
+ADR-069 auto-flush driver keys are `[storage.wal_config] flush_interval_secs`,
+armed by default at 300s). Upgrade notes: per-tenant cost dashboards over gRPC
+traffic will shift as previously-unmetered writes start emitting; SDK `api_version`
+reports 0.6.0.
+
 ## [0.5.1] - 2026-10-31
 
 Patch release, one purpose: the **Windows MSI is now a real x64 package**.
