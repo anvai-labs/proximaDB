@@ -21,8 +21,7 @@ from rich.syntax import Syntax
 from rich.table import Table
 
 # Local imports
-from proximadb_sdk.config import ProximaDBConfig
-from proximadb_sdk.models import SearchFilter
+from proximadb_sdk.config import PortMode
 from proximadb_sdk.unified_client import ProximaDBClient as UnifiedProximaDBClient
 
 console = Console()
@@ -38,6 +37,24 @@ def _record_payload(
     return payload
 
 
+def _jsonable(obj: Any) -> Any:
+    """Convert SDK return values (pydantic models) into JSON-native data.
+
+    The clients return pydantic BaseModels (Collection, SearchResult,
+    BatchResult, VectorOperationResponse, ...) — NOT dicts. Rendering paths
+    that call .get()/.items()/json.dumps on them crash, so every result is
+    normalized here before display (review finding 2026-11-08: every read
+    command exited 1 on a healthy server before this).
+    """
+    if hasattr(obj, "model_dump"):
+        return obj.model_dump(mode="json")
+    if isinstance(obj, dict):
+        return {k: _jsonable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_jsonable(v) for v in obj]
+    return obj
+
+
 def get_client(
     host: str,
     rest_port: int,
@@ -45,25 +62,40 @@ def get_client(
     protocol: str,
     timeout: float,
 ) -> UnifiedProximaDBClient:
-    """Create a ProximaDB client with specified configuration."""
-    config = ProximaDBConfig(
-        host=host,
-        rest_port=rest_port,
-        grpc_port=grpc_port,
+    """Create a ProximaDB client for the CLI's connection options.
+
+    The CLI exposes separate REST/gRPC ports (legacy multi-port layout) plus a
+    protocol selector; the client takes a single base URL plus ``protocol``/
+    ``port_mode`` (unified mode multiplexes all protocols on one port — the
+    server default since the 5678 unification).
+    """
+    mode = PortMode.MULTI if int(grpc_port) != int(rest_port) else PortMode.UNIFIED
+    return UnifiedProximaDBClient(
+        url=f"http://{host}:{rest_port}",
+        protocol=protocol,
+        port_mode=mode,
         timeout=timeout,
     )
-    return UnifiedProximaDBClient(config, preferred_protocol=protocol)
 
 
 @click.group()
 @click.option("--host", default="localhost", help="ProximaDB server host")
 @click.option("--rest-port", default=5678, help="REST API port")
-@click.option("--grpc-port", default=5679, help="gRPC API port")
+@click.option(
+    "--grpc-port",
+    default=5678,
+    help="gRPC API port (defaults to the unified multiplexed port 5678; "
+    "only differs on legacy split-port deployments)",
+)
 @click.option(
     "--protocol",
     type=click.Choice(["auto", "grpc", "rest"]),
-    default="auto",
-    help="Protocol to use (auto selects best available)",
+    # Default REST: against the unified server, `auto` probes gRPC first and
+    # a 404/UNIMPLEMENTED http2 answer (a server ANSWER, not a connection
+    # error) propagates without REST fallback (TD-SDKERR-1 semantics) — the
+    # stock invocation must not depend on that gamble.
+    default="rest",
+    help="Protocol to use (auto probes gRPC first; rest is the safe default)",
 )
 @click.option("--timeout", default=30.0, help="Request timeout in seconds")
 @click.option("--json-output", is_flag=True, help="Output results as JSON")
@@ -114,7 +146,7 @@ def list_collections(ctx: click.Context) -> None:
             ctx.obj["timeout"],
         )
 
-        result = client.list_collections()
+        result = _jsonable(client.list_collections())
 
         if ctx.obj["json_output"]:
             click.echo(json.dumps(result, indent=2))
@@ -130,11 +162,18 @@ def list_collections(ctx: click.Context) -> None:
             table.add_column("Storage Engine", style="blue")
 
             for coll in result:
+                # Collection dumps nest identity/config under "config" and
+                # counts under "stats" (the SDK model shape); fall back to
+                # flat keys for any dict-shaped result.
+                cfg = coll.get("config") or {}
+                stats = coll.get("stats") or {}
                 table.add_row(
-                    coll.get("name", "N/A"),
-                    str(coll.get("dimension", "N/A")),
-                    str(coll.get("vector_count", "N/A")),
-                    coll.get("storage_engine", "default"),
+                    cfg.get("name") or coll.get("name") or coll.get("id") or "N/A",
+                    str(cfg.get("dimension") or coll.get("dimension") or "N/A"),
+                    str(stats.get("vector_count") or coll.get("vector_count") or "N/A"),
+                    cfg.get("storage_engine")
+                    or coll.get("storage_engine")
+                    or "default",
                 )
 
             console.print(table)
@@ -171,11 +210,13 @@ def create_collection(
             ctx.obj["timeout"],
         )
 
-        result = client.create_collection(
-            name=name,
-            dimension=dimension,
-            storage_engine=engine,
-            description=description,
+        result = _jsonable(
+            client.create_collection(
+                name=name,
+                dimension=dimension,
+                storage_engine=engine,
+                description=description,
+            )
         )
 
         if ctx.obj["json_output"]:
@@ -239,7 +280,7 @@ def collection_info(ctx: click.Context, name: str) -> None:
             ctx.obj["timeout"],
         )
 
-        result = client.get_collection(name)
+        result = _jsonable(client.get_collection(name))
 
         if ctx.obj["json_output"]:
             click.echo(json.dumps(result, indent=2))
@@ -318,7 +359,7 @@ def insert_vectors(
             sys.exit(1)
 
         records_data = [_record_payload(record) for record in vectors_data]
-        result = client.insert_records(collection, records_data)
+        result = _jsonable(client.insert_records(collection, records_data))
 
         if ctx.obj["json_output"]:
             click.echo(json.dumps(result, indent=2))
@@ -347,7 +388,7 @@ def get_vector(ctx: click.Context, collection: str, vector_id: str) -> None:
             ctx.obj["timeout"],
         )
 
-        result = client.get_vector(collection, vector_id)
+        result = _jsonable(client.get_vector(collection, vector_id))
 
         if ctx.obj["json_output"]:
             click.echo(json.dumps(result, indent=2))
@@ -395,7 +436,7 @@ def delete_vectors(
             ctx.obj["timeout"],
         )
 
-        result = client.delete_vectors(collection, list(vector_ids))
+        result = _jsonable(client.delete_vectors(collection, list(vector_ids)))
 
         if ctx.obj["json_output"]:
             click.echo(json.dumps(result, indent=2))
@@ -416,12 +457,9 @@ def delete_vectors(
 @click.option("--query", "-q", required=True, help="Query vector as JSON array")
 @click.option("--top-k", "-k", default=10, help="Number of results to return")
 @click.option("--filter", "-f", "filter_expr", help="Filter expression (JSON)")
-@click.option(
-    "--metric",
-    type=click.Choice(["cosine", "euclidean", "dot_product"]),
-    default="cosine",
-    help="Distance metric",
-)
+# NOTE: the historical --metric option was removed (2026-11-08 review): no
+# distance-metric parameter exists anywhere in the client call chain, so it
+# was silently ignored — the collection's configured metric always applied.
 @click.pass_context
 def search(
     ctx: click.Context,
@@ -429,7 +467,6 @@ def search(
     query: str,
     top_k: int,
     filter_expr: str | None,
-    metric: str,
 ) -> None:
     """Perform similarity search.
 
@@ -446,16 +483,17 @@ def search(
         )
 
         query_vector = json.loads(query)
-        search_filter = None
-        if filter_expr:
-            search_filter = SearchFilter(**json.loads(filter_expr))
+        # The client accepts a plain dict (or FilterBuilder) as the metadata
+        # filter — no SDK-side SearchFilter model exists anymore.
+        search_filter = json.loads(filter_expr) if filter_expr else None
 
-        results = client.search(
-            collection_name=collection,
-            query_vector=query_vector,
-            top_k=top_k,
-            filter=search_filter,
-            distance_metric=metric,
+        results = _jsonable(
+            client.search(
+                collection,
+                query_vector,
+                top_k=top_k,
+                metadata_filter=search_filter,
+            )
         )
 
         if ctx.obj["json_output"]:
