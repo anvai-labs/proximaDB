@@ -11,20 +11,32 @@
 # overrides the fixture for negative-path testing.
 set -euo pipefail
 
-VER="${1:?usage: verify_rpm.sh <version>}"
+MODE="${1:?usage: verify_rpm.sh <version>|selftest}"
+case "$MODE" in
+    selftest) SELFTEST=1 ;;
+    *) [ -n "${VERIFY_RPM_SELFTEST:-}" ] && SELFTEST=1 ;;
+esac
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 POSTINSTALL_SRC="${POSTINSTALL_SRC:-$SCRIPT_DIR/postinstall.sh}"
 
-# The TD-PKG-1 contract, read from its single source of truth.
+# The TD-PKG-1 contract, read from its single source of truth. Strict
+# parse: exactly one assignment, optional double quotes, no trailing
+# comment — anything else is a contract edit this verifier refuses to
+# guess at (fail loud at boot, not mid-release).
 rc=0
-contract="$(grep -E '^CHOWN_DIRS=' "$POSTINSTALL_SRC")" || rc=$?
+contract="$(grep -cE '^CHOWN_DIRS=' "$POSTINSTALL_SRC" >/dev/null && grep -E '^CHOWN_DIRS=' "$POSTINSTALL_SRC")" || rc=$?
 if [ "$rc" -ne 0 ] || [ -z "$contract" ]; then
     echo "cannot read CHOWN_DIRS from $POSTINSTALL_SRC (grep rc=$rc)" >&2
     exit 1
 fi
+[ "$(printf '%s\n' "$contract" | wc -l)" -eq 1 ] || { echo "multiple CHOWN_DIRS lines in $POSTINSTALL_SRC" >&2; exit 1; }
+case "$contract" in
+    'CHOWN_DIRS="'*'"'|'CHOWN_DIRS='*) ;;
+    *) echo "CHOWN_DIRS is not a plain quoted/plain assignment: $contract" >&2; exit 1 ;;
+esac
 contract_dirs="${contract#CHOWN_DIRS=}"; contract_dirs="${contract_dirs//\"/}"
 
-if [ "${VERIFY_RPM_SELFTEST:-0}" = "1" ]; then
+if [ "${SELFTEST:-0}" = "1" ]; then
     # Fixture = the exact v0.6.0 failure output (run 42496624451).
     rc=1
     # `-` (not `:-`): an explicitly EMPTY fixture is honored — it is the
@@ -72,7 +84,8 @@ while IFS= read -r line; do
 done <<EOF3
 $devs
 EOF3
-n_expected="$(echo $contract_dirs | wc -w)"
+set -- $contract_dirs
+n_expected=$#
 
 if [ "$n_matched" -ne "$n_expected" ] || [ -n "$unexpected" ]; then
     echo "rpm -V deviations wrong: expected=$n_expected matched=$n_matched" >&2
@@ -80,7 +93,7 @@ if [ "$n_matched" -ne "$n_expected" ] || [ -n "$unexpected" ]; then
     exit 1
 fi
 
-if [ "${VERIFY_RPM_SELFTEST:-0}" = "1" ]; then
+if [ "${SELFTEST:-0}" = "1" ]; then
     echo "SELFTEST PASS: fixture tolerated ($n_matched/$n_expected contract dirs), no foreign deviations"
     exit 0
 fi

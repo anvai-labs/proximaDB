@@ -12,7 +12,8 @@ apt-get install -y -qq /pkg/proximadb_*_amd64.deb
 test -x /usr/bin/proximadb-server
 test -f /etc/proximadb/config.toml
 test -f /lib/systemd/system/proximadb.service
-# F4 symmetry with the RPM leg. Two dpkg -V semantics matter (1.20/1.22
+# F4 symmetry with the RPM leg. Two dpkg -V semantics matter (empirically
+# verified on debian:11 / dpkg 1.20; re-pin at each debian bump —
 # src/verify.c): it verifies md5sums + presence of packaged regular files
 # only (no dirs/ownership/modes — the TD-PKG-1 chown needs no tolerance),
 # and it exits 0 while PRINTING deviations (rc=1 only for a
