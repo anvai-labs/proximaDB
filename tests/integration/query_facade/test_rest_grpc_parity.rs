@@ -1,6 +1,9 @@
-// Disabled: legacy `VectorMatch` type with `{id, score, metadata}` no longer
-// exists; canonical `ScoredRecord` has `{record, score, rank}`. Needs rewrite.
-#![cfg(any())]
+// Re-enabled 2026-11-08: this suite was compile-disabled (`#![cfg(any())]`)
+// since the 2026-05-22 nomenclature migration (e56a45d90). The rewrite maps
+// the legacy `VectorMatch {id, score, metadata}` fixture shape onto the
+// canonical `ScoredRecord {record, score, rank}` (metadata was fixture-only,
+// never asserted; its canonical carrier is `ProximaRecord::props`), and
+// `ExecuteSqlResponse` onto its WS7 rename `ExecuteQueryResponse`.
 /*
  * Copyright 2025 Vijaykumar Singh
  *
@@ -17,27 +20,31 @@
  * limitations under the License.
  */
 
-//! REST/gRPC Parity Tests
+//! REST/gRPC Facade Consistency Tests
 //!
-//! This module verifies that REST and gRPC APIs produce consistent results
-//! when routed through the unified facade (`unified-facade-routing` feature).
+//! **Honest scope (2026-11-08 re-enable review):** these tests call the SAME
+//! in-process `QueryFacadeAdapter` method twice and assert identical results —
+//! they verify facade determinism/idempotence and response-schema shape, NOT
+//! REST-vs-gRPC wire behavior (no HTTP, no gRPC, no protocol label is
+//! exercised). This was true before the 2026-05-22 disable as well. A mutation
+//! probe corrupting mock fixtures leaves the comparisons green — their teeth
+//! are the schema/error assertions, not the comparison. Real wire parity lives
+//! in `tests/rest_grpc_parity_test.rs` (live-server, manual-only); an
+//! automated dual-transport parity test is a recorded follow-up.
 //!
 //! ## Test Coverage
 //!
-//! 1. **Vector Search Parity**: Verify vector search via REST produces same results as gRPC
-//! 2. **SQL Query Parity**: Verify SQL queries via REST produce same results as gRPC
-//! 3. **Graph Query Parity**: Verify graph queries via REST produce same results as gRPC
-//! 4. **Response Schema Consistency**: Verify response structures match between protocols
+//! 1. **Facade consistency**: the same request through the adapter produces
+//!    identical results on repeated invocation
+//! 2. **Response schema shape**: result structures match the expected envelopes
+//! 3. **Error paths**: invalid requests are rejected by the adapter
 //!
 //! ## Architecture
 //!
-//! When `unified-facade-routing` is enabled:
 //! ```text
-//! REST Handler --> QueryFacadeAdapter --> UnifiedQueryFacade --> Result
-//! gRPC Handler --> QueryFacadeAdapter --> UnifiedQueryFacade --> Result
+//! request --> QueryFacadeAdapter --> UnifiedQueryFacade (mock strategies) --> Result
+//! (twice; assert equal)
 //! ```
-//!
-//! Both protocols should route through the same facade, producing identical results.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -47,14 +54,15 @@ use serde_json::json;
 
 // Proto types for request/response structures
 use proximadb::proto::proximadb_v1::{
-    self, ExecuteSqlResponse, SearchQuery, SqlValue, VectorOperationResponse, VectorSearchRequest,
+    self, ExecuteQueryResponse, SearchQuery, SqlValue, VectorOperationResponse, VectorSearchRequest,
 };
 
 // Query facade types
 use proximadb::query::{
     FacadeConfig, GraphQueryResult, QueryContext, QueryFacadeAdapter, QueryRequest, QueryResult,
-    QueryResultData, QueryStrategy, UnifiedQueryFacade, VectorMatch,
+    QueryResultData, QueryStrategy, UnifiedQueryFacade,
 };
+use proximadb_records::ProximaRecord;
 
 // =============================================================================
 // Test Helpers
@@ -90,8 +98,9 @@ fn normalize_vector_response(response: &VectorOperationResponse) -> Vec<Normaliz
         .unwrap_or_default()
 }
 
-/// Extract normalized results from ExecuteSqlResponse (gRPC)
-fn normalize_grpc_sql_response(response: &ExecuteSqlResponse) -> Vec<NormalizedSqlRow> {
+/// Extract normalized results from ExecuteQueryResponse (gRPC; renamed from
+/// ExecuteSqlResponse in WS7 — 279b1e5c3)
+fn normalize_grpc_sql_response(response: &ExecuteQueryResponse) -> Vec<NormalizedSqlRow> {
     response
         .rows
         .iter()
@@ -112,31 +121,13 @@ fn normalize_grpc_sql_response(response: &ExecuteSqlResponse) -> Vec<NormalizedS
         .collect()
 }
 
-/// Convert SqlValue proto to JSON value
-fn sql_value_to_json(v: &SqlValue) -> serde_json::Value {
-    use proximadb_v1::sql_value::Value as V;
-    match v.value.as_ref() {
-        Some(V::StringValue(s)) => serde_json::Value::String(s.clone()),
-        Some(V::NumberValue(n)) => serde_json::Value::Number(
-            serde_json::Number::from_f64(*n).unwrap_or(serde_json::Number::from(0)),
-        ),
-        Some(V::BoolValue(b)) => serde_json::Value::Bool(*b),
-        Some(V::Int64Value(i)) => serde_json::Value::Number((*i).into()),
-        Some(V::NullValue(_)) => serde_json::Value::Null,
-        Some(V::ArrayValue(arr)) => {
-            serde_json::Value::Array(arr.values.iter().map(sql_value_to_json).collect())
-        }
-        Some(V::ObjectValue(obj)) => {
-            let mut map = serde_json::Map::new();
-            for (k, sv) in &obj.fields {
-                map.insert(k.clone(), sql_value_to_json(sv));
-            }
-            serde_json::Value::Object(map)
-        }
-        Some(V::BytesValue(b)) => serde_json::Value::Array(b.iter().map(|x| json!(*x)).collect()),
-        None => serde_json::Value::Null,
-    }
-}
+// SqlValue → JSON via the canonical records conversion. This file's private
+// copy (which predated the JsonbValue variant and drifted on BytesValue /
+// non-finite-float rendering) was deleted at the 2026-11-08 re-enable.
+// Note: the only current consumer is the retained `normalize_grpc_sql_response`
+// helper (kept for future live-server parity tests — see the module doc);
+// no executed test path renders SqlValue today.
+use proximadb_records::conversions::sql_value_to_json;
 
 /// Compare two sets of normalized results with tolerance for floating point scores
 fn compare_search_results(
@@ -261,13 +252,17 @@ impl QueryStrategy for MockVectorStrategy {
     }
 
     async fn execute(&self, _request: QueryRequest, _ctx: &QueryContext) -> Result<QueryResult> {
-        let matches: Vec<VectorMatch> = self
+        let matches: Vec<proximadb::query::ScoredRecord> = self
             .results
             .iter()
-            .map(|(id, score)| VectorMatch {
-                id: id.clone(),
+            .enumerate()
+            .map(|(rank, (id, score))| proximadb::query::ScoredRecord {
+                record: ProximaRecord {
+                    oid: id.clone(),
+                    ..Default::default()
+                },
                 score: *score as f32,
-                metadata: None,
+                rank: (rank + 1) as u32,
             })
             .collect();
 
