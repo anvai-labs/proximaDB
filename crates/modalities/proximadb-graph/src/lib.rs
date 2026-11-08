@@ -31,7 +31,6 @@ pub mod cypher_parser;
 pub mod graphwalk;
 pub mod parser;
 pub mod projection;
-pub mod query;
 pub mod query_ast;
 pub mod record;
 pub mod storage;

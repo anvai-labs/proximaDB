@@ -2299,27 +2299,42 @@ fn parquet_stats_trust(schema: &proximadb_catalog::CatalogTableSchema) -> StatsT
     }
 }
 
-/// Master switch for the ADR-025 OLAP read-merge. **Default-ON** (ADR-025 PR3):
-/// once a table is materialized, OLAP `SELECT`s reconcile its cold Parquet base
-/// with the authoritative post-snapshot WAL delta so `DELETE`/`UPDATE`/`INSERT`
-/// written after `MATERIALIZE` are reflected. Read-mostly tables (nothing changed
-/// since the snapshot) take the empty-delta fast path — a bare Parquet read — so
-/// default-ON is correctness- and cost-neutral for them.
-///
-/// Kill-switch: set `PROXIMADB_OLAP_DELTA_MERGE` to a falsy token
-/// (`0`/`false`/`off`/`no`, case-insensitive) to force the legacy bare-Parquet
-/// read engine-wide; individual tables can still opt back in via the
-/// `olap_delta_merge` storage-layout property. Any other value — or leaving it
-/// unset — keeps the merge on.
+// Master switch for the ADR-025 OLAP read-merge. **Default-ON** (ADR-025 PR3):
+// once a table is materialized, OLAP `SELECT`s reconcile its cold Parquet base
+// with the authoritative post-snapshot WAL delta so `DELETE`/`UPDATE`/`INSERT`
+// written after `MATERIALIZE` are reflected. Read-mostly tables (nothing changed
+// since the snapshot) take the empty-delta fast path — a bare Parquet read — so
+// default-ON is correctness- and cost-neutral for them.
+//
+// Kill-switch: set `PROXIMADB_OLAP_DELTA_MERGE` to a falsy token
+// (`0`/`false`/`off`/`no`, case-insensitive) to force the legacy bare-Parquet
+// read engine-wide; individual tables can still opt back in via the
+// `olap_delta_merge` storage-layout property. Any other value — or leaving it
+// unset — keeps the merge on.
+//
+// Env read via the shared env_kill_switch! macro (#2450 follow-up, exact-shape
+// migration: identical falsy set, default-ON, non-memoized so the pgwire-accuracy
+// e2e lane can toggle it mid-process); olap_delta_merge_on below remains as the
+// test seam and MUST mirror the macro's kill set (0|false|off|no, trimmed,
+// case-insensitive).
+//
+// (Doc comments must stay OUTSIDE as `//`: `///` above a macro invocation is
+// dropped by rustdoc and fires `unused_doc_comment` — the repo-wide convention
+// at every env_kill_switch! site; the fn's rustdoc lives inside the braces.)
 #[cfg(feature = "datafusion-integration")]
-fn olap_delta_merge_enabled() -> bool {
-    olap_delta_merge_on(std::env::var("PROXIMADB_OLAP_DELTA_MERGE").ok().as_deref())
+proximadb_config::env_kill_switch! {
+    /// Master switch for the ADR-025 OLAP read-merge: reconciles a materialized
+    /// table's cold Parquet base with the authoritative post-snapshot WAL delta.
+    /// Engine-wide kill-switch; default ON. Per-table re-opt-in via the
+    /// `olap_delta_merge` storage-layout property.
+    fn olap_delta_merge_enabled() { gate: "PROXIMADB_OLAP_DELTA_MERGE", default: true }
 }
 
-/// Pure kill-switch policy for [`olap_delta_merge_enabled`], split out so it is
-/// unit-testable without mutating the process environment: `None` (unset) or any
-/// non-falsy value ⇒ merge ON; only an explicit falsy token turns it OFF.
-#[cfg(feature = "datafusion-integration")]
+/// Pure kill-switch policy mirroring the `env_kill_switch!` read in
+/// [`olap_delta_merge_enabled`] — the test seam (unit-testable without mutating
+/// the process environment): `None` (unset) or any non-falsy value ⇒ merge ON;
+/// only an explicit falsy token turns it OFF.
+#[cfg(all(test, feature = "datafusion-integration"))]
 fn olap_delta_merge_on(var: Option<&str>) -> bool {
     match var {
         Some(v) => !matches!(
