@@ -41,8 +41,15 @@ use serde_json::json;
 /// This middleware is attached ONLY in the misconfigured case, so its presence
 /// is the signal. An allowlist also covers API aliases and future mounted routes.
 pub async fn auth_misconfigured_deny_data_plane(req: Request, next: Next) -> Response {
+    // The probe allowlist mirrors `is_health_endpoint`'s route set (the three
+    // REAL routes; TD-PROBE-1 review N3: it previously OMITTED /health/ready —
+    // a readiness probe 503'd under this misconfigured posture — and listed
+    // /healthz, for which no route exists anywhere; kept as a harmless alias).
     let liveness = matches!(*req.method(), Method::GET | Method::HEAD)
-        && matches!(req.uri().path(), "/health" | "/health/live" | "/healthz");
+        && matches!(
+            req.uri().path(),
+            "/health" | "/health/live" | "/health/ready" | "/healthz"
+        );
     if !liveness {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -68,6 +75,7 @@ mod tests {
         Router::new()
             .route("/api/v1/search", get(|| async { "data" }))
             .route("/health", get(|| async { "ok" }))
+            .route("/health/ready", get(|| async { "ok" }))
             .layer(axum::middleware::from_fn(
                 auth_misconfigured_deny_data_plane,
             ))
@@ -93,6 +101,22 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn readiness_also_passes_under_misconfigured_auth() {
+        // TD-PROBE-1 review N3: /health/ready was missing from the allowlist,
+        // so a READINESS probe 503'd under this posture while liveness passed.
+        let resp = app()
+            .oneshot(
+                Request::builder()
+                    .uri("/health/ready")
                     .body(Body::empty())
                     .unwrap(),
             )

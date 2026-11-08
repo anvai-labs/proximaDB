@@ -108,8 +108,6 @@ use crate::services::operations::{BatchOperationResult, BulkWriteRouter, Operati
 use crate::storage::cache::specialized::query_cache::{QueryCache, QueryKey};
 use crate::storage::engines::sst::SstEngine;
 
-const FILTER_FAIL_LOUD_ENV: &str = "PROXIMADB_FILTER_FAIL_LOUD";
-
 /// TD-WLP-5 (ADR-061 D4): the effective read freshness for a collection,
 /// applying the `Churn` Strong-override on top of the request's hint. `Churn`
 /// collections always delta-merge the unflushed WAL (a re-embedded symbol must
@@ -181,11 +179,16 @@ async fn sample_churn_working_set(
     }
 }
 
-fn filter_fail_loud_enabled() -> bool {
-    let value = std::env::var(FILTER_FAIL_LOUD_ENV).ok();
-    filter_fail_loud_for_value(value.as_deref())
+// Env read via the shared env_kill_switch! macro (#2438 follow-up sweep);
+// filter_fail_loud_for_value below remains as the test seam and MUST mirror
+// the macro's kill set (0|false|off|no, trimmed, case-insensitive).
+proximadb_config::env_kill_switch! {
+    /// Legacy-path filter evaluation is fail-loud by default; kill-switch
+    /// restores the legacy silent behavior.
+    fn filter_fail_loud_enabled() { gate: "PROXIMADB_FILTER_FAIL_LOUD", default: true }
 }
 
+#[cfg(test)]
 fn filter_fail_loud_for_value(value: Option<&str>) -> bool {
     !matches!(
         value.map(str::trim).map(str::to_ascii_lowercase).as_deref(),
@@ -494,28 +497,32 @@ fn vector_record_to_rich_result(record: ProximaRecord) -> RichSearchResult {
 /// Convert a query optimizer quantization strategy to a unified quantization level.
 #[allow(dead_code)]
 fn quantization_strategy_to_level(strategy: &QuantizationStrategy) -> UnifiedQuantizationLevel {
+    // Aliased: this file already binds the query optimizer's
+    // QuantizationStrategy at module scope, so the model crate's renamed
+    // enum (QuantizationScheme, TD-QUANT-1) needs a distinct local name.
     use crate::compute::quantization::types::{
-        BinaryQuantization, ProductQuantization, QuantizationLevel, ScalarQuantization,
+        BinaryQuantization, ProductQuantization, QuantizationScheme as ModelLevel,
+        ScalarQuantization,
     };
 
     let level_type = match strategy.quantization_type {
-        QuantizationType::Binary => Some(QuantizationLevel::Binary(BinaryQuantization {
+        QuantizationType::Binary => Some(ModelLevel::Binary(BinaryQuantization {
             threshold: None,
             sign_based: false,
         })),
-        QuantizationType::INT8 => Some(QuantizationLevel::Scalar(ScalarQuantization {
+        QuantizationType::INT8 => Some(ModelLevel::Scalar(ScalarQuantization {
             bits: 8,
             scale: 1.0,
             offset: 0.0,
             clamp_values: false,
         })),
-        QuantizationType::PQ4 => Some(QuantizationLevel::Pq(ProductQuantization {
+        QuantizationType::PQ4 => Some(ModelLevel::Pq(ProductQuantization {
             num_subvectors: 8, // default
             bits_per_code: 4,
             codebook_id: None,
             adaptive_subvectors: false,
         })),
-        QuantizationType::PQ8 => Some(QuantizationLevel::Pq(ProductQuantization {
+        QuantizationType::PQ8 => Some(ModelLevel::Pq(ProductQuantization {
             num_subvectors: 8, // default
             bits_per_code: 8,
             codebook_id: None,
@@ -526,6 +533,31 @@ fn quantization_strategy_to_level(strategy: &QuantizationStrategy) -> UnifiedQua
 }
 
 /// Updated Vector Operations Service using consolidated optimizer
+/// `CollectionCompactor` capability for `DdlService` (`COMPACT TABLE`):
+/// resolves the table tenant-scoped via the collection port, then runs the
+/// operator compaction on the unified engine.
+pub struct VectorOpsCollectionCompactor {
+    pub vector_ops: std::sync::Arc<VectorOperationsService>,
+}
+
+#[async_trait::async_trait]
+impl crate::services::ddl::CollectionCompactor for VectorOpsCollectionCompactor {
+    async fn compact(
+        &self,
+        tenant: Option<&str>,
+        table: &str,
+        full: bool,
+    ) -> anyhow::Result<crate::services::ddl::CompactSummary> {
+        let result = self
+            .vector_ops
+            .compact_collection_named(tenant, table, full)
+            .await?;
+        Ok(crate::services::ddl::CompactSummary::from_result(
+            table, full, &result,
+        ))
+    }
+}
+
 pub struct VectorOperationsService {
     /// Default storage engine (SST) - used for fallback and WAL coordination
     storage_engine: Arc<SstEngine>,
@@ -533,10 +565,7 @@ pub struct VectorOperationsService {
     /// Dynamic engine cache keyed by the catalog's globally unique object id.
     /// This enables each collection to use its configured engine (SST, HELIX, VIPER, etc.)
     engine_cache: Arc<
-        dashmap::DashMap<
-            crate::core::stable_id::CollectionObjectId,
-            Arc<dyn UnifiedStorageFormat>,
-        >,
+        dashmap::DashMap<crate::core::stable_id::CollectionObjectId, Arc<dyn UnifiedStorageFormat>>,
     >,
 
     /// WAL/Memtable for unflushed vectors (required for two-stage search)
@@ -547,9 +576,8 @@ pub struct VectorOperationsService {
 
     /// Collection metadata cache keyed by catalog object id. Names/aliases are
     /// resolved before this cache boundary.
-    collection_cache: Arc<
-        dashmap::DashMap<crate::core::stable_id::CollectionObjectId, Arc<Collection>>,
-    >,
+    collection_cache:
+        Arc<dashmap::DashMap<crate::core::stable_id::CollectionObjectId, Arc<Collection>>>,
 
     /// Query result cache - unified for all query sources (SQL, REST API, gRPC)
     query_cache: Arc<QueryCache>,
@@ -598,19 +626,6 @@ pub struct VectorOperationsService {
     /// Per tenant+collection guard for insert-only check-and-append operations.
     insert_only_locks: Arc<dashmap::DashMap<String, Arc<Mutex<()>>>>,
 
-    /// Vector Object Economy per-collection directory cache. `None` until
-    /// wired by `SharedServices::new` via `with_directory_cache`. The cache
-    /// is the search-side counterpart to the writer/compactor's
-    /// `upsert_and_persist` — first reader per collection loads the
-    /// sidecar; subsequent readers reuse the cached entry.
-    ///
-    /// Used by [`Self::touch_object_economy_directory_for_search`] today as
-    /// a smoke-test seam. Future EXPLAIN/route work will consume the cached
-    /// entry in the search planner.
-    directory_cache: Option<
-        Arc<crate::storage::engines::sst::object_economy_directory::VectorObjectEconomyDirectoryCache>,
-    >,
-
     /// Phase 7.2 cache-affinity registry. `None` until wired by
     /// `SharedServices::new` via `with_affinity_registry`. When set,
     /// every successful unified search invocation calls
@@ -619,8 +634,7 @@ pub struct VectorOperationsService {
     /// single-node deploys (the only node the registry will ever
     /// see); a future cluster path will plumb the actual node id
     /// through.
-    affinity_registry:
-        Option<Arc<crate::cluster::cache_affinity::CacheAffinityRegistry>>,
+    affinity_registry: Option<Arc<crate::cluster::cache_affinity::CacheAffinityRegistry>>,
 }
 
 /// FA-2 (abac-policy): a `FilterExpression` is AXIS push-down-compatible iff it
@@ -1174,20 +1188,25 @@ impl VectorOperationsService {
                 record.tenant_id.is_empty() || record.tenant_id == tenant_context.tenant_id
             });
         }
-        // TD-DML-3: one CURRENT version per oid. The raw WAL view holds every
-        // write of a key, and an UPDATE of a relational row on this store
-        // appends a new version — so a SELECT returned the old and the new row
-        // side by side. Latest wins (highest record_version, then
-        // updated_at_ns, then the later write), and it is chosen BEFORE the
-        // dead filter so a newer tombstone / expired version hides its older
-        // live copy (mandate #16d).
+        // TD-DML-3: one CURRENT version per oid. The memtable's
+        // get_collection_vectors already applies MVCC winner selection (one
+        // record per oid), so this dedup is defense-in-depth — but if the
+        // input ever becomes the raw delta, the comparator must match the
+        // unified rule (TD-MEMTABLE-MVCC-1 residual (f)): timestamp-first
+        // (is_fresher semantics), NOT the old version-first ordering that
+        // was here before.
         let mut latest: std::collections::HashMap<String, usize> =
             std::collections::HashMap::with_capacity(records.len());
         for (index, record) in records.iter().enumerate() {
             let newer = match latest.get(&record.oid).and_then(|&kept| records.get(kept)) {
                 Some(kept) => {
-                    (record.record_version, record.updated_at_ns)
-                        >= (kept.record_version, kept.updated_at_ns)
+                    // Same rule as read.rs::is_fresher (timestamp-first).
+                    // NOTE: does NOT include mvcc_is_newer's tombstone-first
+                    // exact-tie rule — this input is pre-deduped so ties
+                    // cannot occur here (verified: get_collection_vectors
+                    // returns one winner per oid via the memtable).
+                    (record.updated_at_ns, record.record_version)
+                        > (kept.updated_at_ns, kept.record_version)
                 }
                 None => true,
             };
@@ -1433,17 +1452,10 @@ impl VectorOperationsService {
                 collection_id
             )
         })?;
-        let typed_identity =
-            crate::storage::trait_components::path_resolver::typed_identity_from_storage_assignment(
-                Some(assignment),
-            );
-        let typed_identity =
-            crate::storage::trait_components::path_resolver::typed_path_identity(typed_identity);
         let storage_url =
-            crate::storage::trait_components::path_resolver::collection_data_path_typed(
-                &assignment.base_location,
+            crate::storage::trait_components::path_resolver::collection_data_path_for_assignment(
+                assignment,
                 &collection_id,
-                typed_identity,
             );
         let engine = self.get_engine_for_collection(&collection_id).await?;
         let storage_records = engine
@@ -2059,7 +2071,6 @@ impl VectorOperationsService {
             metadata_validator: MetadataValidator::default(),
             pseudo_query_generator: Arc::new(DefaultPseudoQueryGenerator),
             insert_only_locks: Arc::new(dashmap::DashMap::new()),
-            directory_cache: None,
             affinity_registry: None,
         }
     }
@@ -2111,20 +2122,6 @@ impl VectorOperationsService {
         self
     }
 
-    /// Attach the Vector Object Economy per-collection directory cache.
-    /// Called once by `SharedServices::new` after both the service and
-    /// the cache have been constructed. Subsequent calls overwrite the
-    /// previous cache reference.
-    pub fn with_directory_cache(
-        mut self,
-        cache: Arc<
-            crate::storage::engines::sst::object_economy_directory::VectorObjectEconomyDirectoryCache,
-        >,
-    ) -> Self {
-        self.directory_cache = Some(cache);
-        self
-    }
-
     /// Wire the process-wide cache-affinity registry (Phase 7.2).
     /// When wired, the unified search path calls `record_query`
     /// after each successful read so the registry reflects which
@@ -2156,103 +2153,6 @@ impl VectorOperationsService {
         if let Some(reg) = &self.affinity_registry {
             reg.record_query(collection_id, self.local_node_id_for_affinity());
         }
-    }
-
-    /// Smoke-test seam for the object-economy directory cache.
-    ///
-    /// Calls `directory_cache.handle_for(collection_id).get_or_load(...)`
-    /// using `load_directory_for` with safe defaults (`storage_epoch = 0`,
-    /// `authority_mode = RebuildableProjection`) so the cache surface is
-    /// exercised end-to-end without depending on writer-wiring source
-    /// values. Returns `None` when the cache has not been wired (test
-    /// scenarios that bypass `SharedServices`).
-    ///
-    /// Today this is only meant to verify the integration is sound. Once
-    /// the writer call-site lands and the directory has real content,
-    /// production routing/EXPLAIN code will consume the cached entry
-    /// directly via `directory_cache.handle_for(...)`. Then this helper
-    /// should be removed or repurposed.
-    pub async fn touch_object_economy_directory_for_search(
-        &self,
-        collection_id: &str,
-        fs: &dyn crate::storage::persistence::filesystem::FileSystem,
-        collection_root: &str,
-    ) -> Option<crate::storage::engines::sst::object_economy_directory::DirectoryLoadStatus> {
-        use proximadb_catalog::CatalogAuthorityMode;
-        let cache = self.directory_cache.as_ref()?;
-        let entry = cache
-            .handle_for(collection_id)
-            .get_or_load(|| async {
-                crate::storage::engines::sst::object_economy_directory::load_directory_for(
-                    fs,
-                    collection_id,
-                    collection_root,
-                    0,
-                    CatalogAuthorityMode::RebuildableProjection,
-                )
-                .await
-            })
-            .await;
-        Some(entry.status.clone())
-    }
-
-    /// Return the cached object-economy directory status for a collection
-    /// without creating a handle or loading from object storage.
-    ///
-    /// Diagnostics endpoints use this to report live in-process cache state
-    /// while preserving the "no surprise I/O" contract.
-    pub(crate) fn cached_object_economy_directory_status(
-        &self,
-        collection_id: &str,
-    ) -> Option<crate::storage::engines::sst::object_economy_directory::DirectoryLoadStatus> {
-        self.directory_cache
-            .as_ref()?
-            .get_handle(collection_id)?
-            .get_cached()
-            .map(|entry| entry.status.clone())
-    }
-
-    /// Slice 5.10: return both the LSN watermark and the wall-clock
-    /// nanoseconds watermark the directory was emitted at. The `_ns`
-    /// component is needed by [`VectorFreshnessMode::should_scan_delta_with_time`]
-    /// so BoundedStale can apply its time-bound check. `None` when the
-    /// directory cache or its inputs aren't available (same fallback
-    /// path as the LSN-only helper).
-    pub(crate) async fn cached_directory_watermark(
-        &self,
-        collection_id: &str,
-    ) -> Option<(u64, i64)> {
-        let cache = self.directory_cache.as_ref()?;
-
-        // collection_root comes from the collection's storage assignment.
-        // Without it we can't resolve the sidecar URL, so fall back.
-        let collection = self.get_or_load_collection(collection_id).await.ok()?;
-        let collection_root = collection
-            .storage_assignment
-            .as_ref()
-            .map(|a| a.base_location.clone())?;
-
-        // Filesystem reference comes from the SST engine's factory.
-        let fs_factory = self.storage_engine.filesystem().clone();
-        let fs = fs_factory.get_filesystem(&collection_root).ok()?;
-
-        let entry = cache
-            .handle_for(collection_id)
-            .get_or_load(|| async {
-                crate::storage::engines::sst::object_economy_directory::load_directory_for(
-                    &*fs,
-                    collection_id,
-                    &collection_root,
-                    /*storage_epoch*/ 0,
-                    proximadb_catalog::CatalogAuthorityMode::RebuildableProjection,
-                )
-                .await
-            })
-            .await;
-        Some((
-            entry.directory.freshness_watermark_lsn,
-            entry.directory.freshness_watermark_ns,
-        ))
     }
 
     /// Apply the WAL/memtable delta merge to a set of canonical engine
@@ -2304,27 +2204,17 @@ impl VectorOperationsService {
             return Ok((optimized_results, None));
         }
 
-        // Use the request's effective metric for WAL delta re-score. It is the
-        // collection metric for ordinary calls and the SQL operator metric for
-        // pgvector calls; either way directory and delta scores share a scale.
-        // Slice 5.10: fetch both LSN and ns watermarks so BoundedStale
-        // can apply its time-bound check. When unavailable, fall back
-        // to (0, 0) — the scan helper treats ns=0 as "time unknown"
-        // and conservatively scans (LSN-only behaviour).
-        let (watermark, watermark_ns) = self
-            .cached_directory_watermark(collection_id)
-            .await
-            .unwrap_or((0, 0));
-        // Read the WAL cursor independently of the scan helper so the
-        // EXPLAIN payload carries the value even when no scan ran
-        // (watermark already covers the cursor). Two cheap singleton
-        // calls in exchange for operator visibility.
-        let current_lsn =
-            match crate::storage::persistence::write_ahead_log::manifest::get_service() {
-                Some(svc) => svc.current_lsn().await,
-                None => 0,
-            };
-        let delta_outcome = self
+        // TD-OEDIRWM-1: the query path does NOT read the object-economy
+        // directory. Its watermark cannot soundly gate a delta-scan skip: it
+        // is stamped AFTER the flush commits (not at the flushed snapshot),
+        // and the sidecar is shared across pods while each memtable is
+        // per-pod — a sidecar written by pod A would let pod B skip its own
+        // unflushed rows. Every Strong/BoundedStale query therefore scans the
+        // delta (production already behaved this way: until #2443 the reader
+        // looked in the wrong place and never found a sidecar). No sidecar
+        // GET is made per query. The helper returns the WAL cursor it read,
+        // so EXPLAIN reuses that one read.
+        let (current_lsn, delta_outcome) = self
             .scan_wal_delta_if_needed(
                 collection_id,
                 query_vector,
@@ -2332,8 +2222,6 @@ impl VectorOperationsService {
                 distance_metric,
                 filter,
                 freshness_mode,
-                watermark,
-                watermark_ns,
             )
             .await?;
         let scanned_records = delta_outcome.as_ref().map(|d| d.len() as u64);
@@ -2356,7 +2244,9 @@ impl VectorOperationsService {
             route_kind: "vector_object_economy".to_string(),
             authority_mode: "projection_over_canonical_records".to_string(),
             freshness_mode: freshness_mode.explain_label().to_string(),
-            freshness_watermark_lsn: Some(watermark),
+            // Not wired on the query path (TD-OEDIRWM-1) — None, not a
+            // fabricated 0, is the honest encoding.
+            freshness_watermark_lsn: None,
             policy_boundary: "proxima_internal_policy".to_string(),
             cache_status: "unknown".to_string(),
             ..Default::default()
@@ -2372,8 +2262,8 @@ impl VectorOperationsService {
             collection_id = %collection_id,
             route_kind = %explain.route_kind,
             freshness_mode = %explain.freshness_mode_used.as_deref().unwrap_or("unknown"),
-            current_lsn = explain.current_lsn_at_query.unwrap_or(0),
-            watermark_lsn = explain.freshness_watermark_lsn.unwrap_or(0),
+            current_lsn = ?explain.current_lsn_at_query, // None = cursor not read
+            watermark_lsn = ?explain.freshness_watermark_lsn, // None = not wired (TD-OEDIRWM-1)
             wal_delta_searched = explain.wal_delta_searched,
             wal_delta_records_scanned = explain.wal_delta_records_scanned.unwrap_or(0),
             merge_input_directory_records = merge_input_directory.unwrap_or(0),
@@ -2384,26 +2274,26 @@ impl VectorOperationsService {
         Ok((final_results, Some(explain)))
     }
 
-    /// Scan the WAL/memtable delta for records committed after the
-    /// directory's freshness watermark, when the request's freshness
-    /// mode requires it.
+    /// Scan the WAL/memtable delta when the request's freshness mode
+    /// requires it (every mode except `StaleOk`).
     ///
-    /// Phase 5 Slice 5.3: this method delegates the decision to
-    /// [`VectorFreshnessMode::should_scan_delta`] (pure logic, fully
-    /// unit-tested in `core/search`) and the actual scan to the
-    /// existing `WriteAheadLogManager::search_unflushed_vectors`. It is
-    /// deliberately separate from the merge step that lands in Slice
-    /// 5.4 — this slice just returns the delta candidate set; the
-    /// caller decides how to combine it with directory-routed results.
+    /// There is no watermark-based skip: no sound freshness watermark
+    /// exists (TD-OEDIRWM-1), so Strong and BoundedStale always scan. The
+    /// scan itself is `WriteAheadLogManager::search_unflushed_vectors`; the
+    /// caller merges the delta with the engine results.
     ///
-    /// Returns:
-    /// * `Ok(None)` — no scan was needed (mode is `StaleOk`, watermark
-    ///   already covers the WAL, or no WAL cursor available).
-    /// * `Ok(Some(records))` — delta records, possibly empty. Tombstone
+    /// Returns `(current_lsn, delta)`, where `current_lsn` is the WAL cursor
+    /// read once here for EXPLAIN (`None` when it was not read), and `delta`
+    /// is:
+    /// * `None` — no scan ran: mode is `StaleOk`, or no manifest service is
+    ///   registered (Stage 1 of `execute_unified_plan` already covers the
+    ///   unflushed WAL then — TD-DELTASCAN-1).
+    /// * `Some(records)` — delta records, possibly empty. Tombstone
     ///   markers are preserved so the merge step can suppress older
-    ///   directory results.
-    /// * `Err(_)` — WAL scan failed; caller decides whether to fail the
-    ///   query or fall back to directory-only results.
+    ///   engine results.
+    ///
+    /// `Err(_)` means the WAL scan failed; the caller decides whether to
+    /// fail the query or fall back to engine-only results.
     pub async fn scan_wal_delta_if_needed(
         &self,
         collection_id: &str,
@@ -2412,29 +2302,24 @@ impl VectorOperationsService {
         distance_metric: crate::compute::distance_computation::DistanceMetric,
         metadata_filters: Option<&crate::core::search::FilterExpression>,
         freshness_mode: &crate::core::search::VectorFreshnessMode,
-        directory_watermark_lsn: u64,
-        directory_watermark_ns: i64,
-    ) -> Result<Option<Vec<crate::core::search::results::OptimizedSearchRecord>>> {
+    ) -> Result<(
+        Option<u64>,
+        Option<Vec<crate::core::search::results::OptimizedSearchRecord>>,
+    )> {
         // StaleOk short-circuits before we even ask the WAL — saves the
         // singleton lookup on the cheap-read path.
-        if matches!(
-            freshness_mode,
-            crate::core::search::VectorFreshnessMode::StaleOk
-        ) {
-            return Ok(None);
+        if !freshness_mode.requires_delta_merge() {
+            return Ok((None, None));
         }
 
-        // Without a global manifest service we can't decide whether the
-        // WAL has newer data, so the safe default is to skip and let
-        // the directory-routed result stand. Strong-route correctness
-        // is then advertised only when the manifest is wired (which is
-        // the common production case via `SharedServices::new`).
-        //
-        // Log loud on miss: a missing manifest in a server-mode process is a
-        // bug (the v2 INSERT→SEARCH gap reconciled 2026-05-28 traced to this
-        // arm silently dropping delta-merge candidates). Emit a warn so the
-        // path is visible in route-health logs, but keep the Ok(None) so
-        // embedded callers that haven't called manifest::init can still read.
+        // Without a global manifest service (embedded/test processes that
+        // never call `manifest::init`) this second scan is skipped, as on
+        // develop. Unflushed rows are NOT lost: execution Stage 1
+        // (`execute_unified_plan`) already scores the same WAL snapshot WITH
+        // vectors and reconciles it against tombstones (mandate 16d) on every
+        // query. Running this vector-less scan there would let its copy win
+        // the exact-tie merge and strip the vector from an unflushed hit
+        // (TD-DELTASCAN-1, which also covers the double scan on servers).
         let current_lsn =
             match crate::storage::persistence::write_ahead_log::manifest::get_service() {
                 Some(svc) => svc.current_lsn().await,
@@ -2443,26 +2328,11 @@ impl VectorOperationsService {
                         target: "proximadb::services::vectors::delta_merge",
                         collection_id = %collection_id,
                         "WAL delta merge skipped: global manifest service is not registered. \
-                         In server mode this means freshly-written WAL records may not be \
-                         visible to search. Call `manifest::init(&wal_config)` once at startup."
+                         In server mode call `manifest::init(&wal_config)` once at startup."
                     );
-                    return Ok(None);
+                    return Ok((None, None));
                 }
             };
-
-        let now_ns = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as i64)
-            .unwrap_or(0);
-
-        if !freshness_mode.should_scan_delta_with_time(
-            current_lsn,
-            directory_watermark_lsn,
-            directory_watermark_ns,
-            now_ns,
-        ) {
-            return Ok(None);
-        }
 
         // Delta scan: oversample (top_k * 2) so the eventual merge step
         // still has enough candidates after dedupe + tombstone
@@ -2480,7 +2350,7 @@ impl VectorOperationsService {
                 /* include_metadata */ true,
             )
             .await?;
-        Ok(Some(records))
+        Ok((Some(current_lsn), Some(records)))
     }
 
     /// Attach orchestrator (builder-style)
@@ -4890,6 +4760,30 @@ impl VectorOperationsService {
                             value,
                         }
                     }
+                    // Presence tests and Regex evaluate as their real
+                    // predicates (the FilterExpression evaluators all support
+                    // them) instead of the catch-all dummy below.
+                    FilterCondition::IsNull { column } => {
+                        crate::core::search::FilterExpression::Comparison {
+                            field: column,
+                            operator: crate::core::search::ComparisonOperator::IsNull,
+                            value: serde_json::Value::Null,
+                        }
+                    }
+                    FilterCondition::IsNotNull { column } => {
+                        crate::core::search::FilterExpression::Comparison {
+                            field: column,
+                            operator: crate::core::search::ComparisonOperator::IsNotNull,
+                            value: serde_json::Value::Null,
+                        }
+                    }
+                    FilterCondition::Regex { column, pattern } => {
+                        crate::core::search::FilterExpression::Comparison {
+                            field: column,
+                            operator: crate::core::search::ComparisonOperator::Regex,
+                            value: serde_json::Value::String(pattern),
+                        }
+                    }
                     // Default case for other variants - map them to Equals for simplicity
                     _ => crate::core::search::FilterExpression::Comparison {
                         field: "unknown".to_string(),
@@ -5251,6 +5145,27 @@ impl VectorOperationsService {
     /// delegates to `super::flush::FlushCompactionCoordinator`.
     pub async fn force_flush_all(&self) -> Result<()> {
         self.flush_coordinator().force_flush_all().await
+    }
+
+    /// TD-COMPACT-14: resolve `identifier` (name or id) within `tenant` and
+    /// run an operator compaction; `full` collapses across levels toward
+    /// `[storage.compaction_config] full_target_segments`.
+    pub async fn compact_collection_named(
+        &self,
+        tenant: Option<&str>,
+        identifier: &str,
+        full: bool,
+    ) -> Result<crate::storage::traits::CompactionResult> {
+        let collection = self
+            .collection_port
+            .get_collection(identifier, tenant)
+            .await?
+            .ok_or_else(|| {
+                anyhow::anyhow!("collection '{identifier}' does not exist for this tenant")
+            })?;
+        self.unified_engine()
+            .compact_collection_full(&collection.id, Some(&collection), full, None)
+            .await
     }
 
     /// Flush all pending WAL entries for a specific collection to durable storage.
@@ -6096,7 +6011,7 @@ mod index_first_search_tests {
             io_budget: None,
         }];
 
-        let filesystem = Arc::new(
+        let _filesystem = Arc::new(
             crate::storage::persistence::filesystem::FilesystemFactory::create(Default::default())
                 .await?,
         );
@@ -6701,22 +6616,22 @@ mod index_first_search_tests {
     #[test]
     fn test_quantization_levels() {
         use crate::compute::quantization::types::{
-            BinaryQuantization, ProductQuantization, QuantizationLevel, ScalarQuantization,
+            BinaryQuantization, ProductQuantization, QuantizationScheme, ScalarQuantization,
         };
 
         // Test that quantization levels are properly defined
         let levels = [
-            QuantizationLevel::Binary(BinaryQuantization {
+            QuantizationScheme::Binary(BinaryQuantization {
                 threshold: None,
                 sign_based: false,
             }),
-            QuantizationLevel::Scalar(ScalarQuantization {
+            QuantizationScheme::Scalar(ScalarQuantization {
                 scale: 1.0,
                 offset: 0.0,
                 bits: 8, // INT8 quantization
                 clamp_values: true,
             }),
-            QuantizationLevel::Pq(ProductQuantization {
+            QuantizationScheme::Pq(ProductQuantization {
                 bits_per_code: 8,
                 num_subvectors: 8,
                 codebook_id: None,
@@ -6726,13 +6641,13 @@ mod index_first_search_tests {
 
         for level in &levels {
             match level {
-                QuantizationLevel::Binary(_) => {
+                QuantizationScheme::Binary(_) => {
                     assert!(true, "Binary quantization available");
                 }
-                QuantizationLevel::Scalar(_) => {
+                QuantizationScheme::Scalar(_) => {
                     assert!(true, "Scalar quantization available");
                 }
-                QuantizationLevel::Pq(_) => {
+                QuantizationScheme::Pq(_) => {
                     assert!(true, "Product quantization available");
                 }
                 _ => {}

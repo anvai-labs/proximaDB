@@ -1,6 +1,6 @@
 # ProximaDB Build and Test Makefile
 
-.PHONY: env-gate-check all clean build test test-python test-rust test-fast check-fast install-fast-tools benchmark release install help capability-matrix-check mvp-contract-check mvp-smoke-test context-benchmark-check workspace-boundaries-check tenant-path-check tenant-ingress-check catalog-seal-check deterministic-commit-contract-check branch-promotion-policy-check work-commit-check validated-commit-check workspace-rebuild-baseline panic-policy-report panic-policy-no-regression panic-policy-module-guard panic-policy-baseline silent-failure-report silent-failure-no-regression silent-failure-baseline v1-proto-usage-report v1-proto-usage-no-regression v1-proto-usage-baseline hygiene-check proto-check verify-openapi-spec gen-go-sdk gen-ts-sdk gen-rust-sdk gen-python-sdk release-check query-conformance-check docs-claim-check design-status-check status-asof-check release-smoke release-evidence-contract-check cloud-emulator-test
+.PHONY: env-gate-check ci-lane-coverage-check all clean build test test-python test-rust test-fast check-fast install-fast-tools benchmark release install help capability-matrix-check mvp-contract-check mvp-smoke-test context-benchmark-check workspace-boundaries-check tenant-path-check tenant-ingress-check catalog-seal-check deterministic-commit-contract-check branch-promotion-policy-check work-commit-check validated-commit-check workspace-rebuild-baseline panic-policy-report panic-policy-no-regression panic-policy-module-guard panic-policy-baseline silent-failure-report silent-failure-no-regression silent-failure-baseline capability-facade-report capability-facade-no-regression capability-facade-baseline type-name-ratchet-report type-name-ratchet-no-regression v1-proto-usage-report v1-proto-usage-no-regression v1-proto-usage-baseline hygiene-check proto-check verify-openapi-spec gen-go-sdk gen-ts-sdk gen-rust-sdk gen-python-sdk release-check query-conformance-check docs-claim-check design-status-check status-asof-check release-smoke release-evidence-contract-check cloud-emulator-test
 
 # Default target
 all: build test
@@ -98,6 +98,10 @@ clippy:
 env-gate-check:
 	@echo "🚪 Validating env-gate registry..."
 	python3 scripts/check_env_gates.py
+
+ci-lane-coverage-check:
+	@echo "🛬 Validating integration-test CI lane coverage..."
+	python3 scripts/check_ci_lane_coverage.py
 
 release-build-features-check:
 	@echo "📦 Validating what the release artifacts are compiled with..."
@@ -254,7 +258,7 @@ tenant-ingress-check:
 	@echo "Validating deployment-aware tenant ingress..."
 	python3 scripts/check_tenant_ingress_contract.py
 
-work-commit-check: fmt-check deterministic-commit-contract-check branch-promotion-policy-check docs-claim-check design-status-check status-asof-check capability-matrix-check mvp-contract-check mvp-smoke-test context-benchmark-check workspace-boundaries-check tenant-path-check tenant-ingress-check catalog-seal-check panic-policy-module-guard panic-policy-workspace-no-regression silent-failure-no-regression hygiene-check env-gate-check dup-ratchet-check release-build-features-check release-evidence-contract-check orphan-rust-files-check
+work-commit-check: fmt-check deterministic-commit-contract-check branch-promotion-policy-check docs-claim-check design-status-check status-asof-check capability-matrix-check mvp-contract-check mvp-smoke-test context-benchmark-check workspace-boundaries-check tenant-path-check tenant-ingress-check catalog-seal-check panic-policy-module-guard panic-policy-workspace-no-regression silent-failure-no-regression capability-facade-no-regression type-name-ratchet-no-regression hygiene-check env-gate-check ci-lane-coverage-check dup-ratchet-check release-build-features-check release-evidence-contract-check orphan-rust-files-check
 	@echo "✅ work-commit-check: deterministic architecture and commit guardrails passed"
 
 validated-commit-check: work-commit-check
@@ -274,6 +278,24 @@ silent-failure-no-regression:
 
 silent-failure-baseline:
 	python3 scripts/count_silent_failures.py --mode baseline
+
+capability-facade-report:
+	@echo "🎭 Counting Rust capability-facade sites (TD-FACADE-1)..."
+	python3 scripts/count_capability_facades.py --mode report
+
+capability-facade-no-regression:
+	@echo "🎭 Enforcing the Rust capability-facade ratchet (TD-FACADE-1)..."
+	python3 scripts/count_capability_facades.py --mode no-regression
+
+capability-facade-baseline:
+	python3 scripts/count_capability_facades.py --mode baseline
+
+type-name-ratchet-report:
+	python3 scripts/count_type_name_collisions.py --mode report
+
+type-name-ratchet-no-regression:
+	@echo "Enforcing the public type-name collision ratchet (TD-NAMING-1)..."
+	python3 scripts/count_type_name_collisions.py --mode no-regression
 
 panic-policy-report:
 	@echo "🧯 WS-2 panic policy report (non-blocking)..."

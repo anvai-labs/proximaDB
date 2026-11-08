@@ -268,24 +268,6 @@ pub struct SharedServices {
     /// gives both paths a shared backing.
     pub fulltext_indexes: crate::network::hybrid_search::HybridFullTextIndexMap,
 
-    /// Process-wide cache of per-collection Vector Object Economy
-    /// directories. Search paths fetch a [`CachedDirectoryHandle`] via
-    /// `directory_cache.handle_for(collection_id)` and then `get_or_load`
-    /// against a loader closure (typically wrapping
-    /// [`load_directory_for`](crate::storage::engines::sst::object_economy_directory::load_directory_for)).
-    /// First reader per collection pays the cost of loading the sidecar;
-    /// subsequent readers reuse the cached `Arc<CachedDirectoryEntry>`.
-    ///
-    /// Writer/compactor will call
-    /// [`VectorObjectEconomyDirectoryCache::invalidate`](crate::storage::engines::sst::object_economy_directory::VectorObjectEconomyDirectoryCache::invalidate)
-    /// after `upsert_and_persist` lands a new directory version so the
-    /// next reader picks up the change. That wiring is the next step
-    /// after this slot exists — see the VECTOR_OBJECT_ECONOMY_ROUTE
-    /// design doc.
-    pub directory_cache: Arc<
-        crate::storage::engines::sst::object_economy_directory::VectorObjectEconomyDirectoryCache,
-    >,
-
     /// Process-wide per-collection pinning registry (Phase 6 control
     /// surface). Operators PATCH `/api/v1/collections/:id/pin` to
     /// record an explicit tier override; the `AxisTieringManager`
@@ -1240,16 +1222,6 @@ impl SharedServices {
         );
         debug!("✅ SharedServices::new - VIPER engine created successfully");
 
-        // Vector Object Economy Phase 4 (1-B + 2-B): construct the
-        // process-wide per-collection directory cache up front so both
-        // the SST engine (producer side — emits directory updates after
-        // atomic commit) and the vector operations service (consumer
-        // side — loads cached directories during search) hold the same
-        // `Arc`.
-        let directory_cache = Arc::new(
-            crate::storage::engines::sst::object_economy_directory::VectorObjectEconomyDirectoryCache::new(),
-        );
-
         // Phase 6: per-collection pinning registry constructed up
         // front so REST handlers (control plane) and the SST
         // tier-migration integration (data plane) share the same
@@ -1389,12 +1361,11 @@ impl SharedServices {
         };
         debug!("✅ SharedServices::new - WAL manager created successfully");
 
-        // Phase 5 (Slice 5.2): try to resolve the global manifest
-        // singleton and wrap it as a `FreshnessLsnSource`. When the
-        // singleton hasn't been initialised yet (some embedded/test
-        // paths), the engine falls back to emitting `freshness_lsn = 0`
-        // — strong-route readers will simply always re-scan the WAL
-        // delta, which is correct but more expensive.
+        // Resolve the global manifest singleton as the engine's committed-LSN
+        // source. Only the `cold-deletion-vectors` search path reads it (as
+        // the deletion-vector snapshot LSN); without a source that path sees
+        // every delete (`u64::MAX`). It no longer feeds any directory
+        // watermark (TD-OEDIRWM-1).
         let freshness_lsn_source: Option<
             Arc<dyn crate::storage::engines::sst::object_economy_directory::FreshnessLsnSource>,
         > = crate::storage::persistence::write_ahead_log::manifest::get_service().map(|svc| {
@@ -1419,8 +1390,7 @@ impl SharedServices {
                 filesystem_factory.clone(),
                 distance_compute,
             )
-            .await?
-            .with_directory_cache(directory_cache.clone());
+            .await?;
             if let Some(src) = freshness_lsn_source.clone() {
                 engine = engine.with_freshness_lsn_source(src);
             }
@@ -1721,9 +1691,6 @@ impl SharedServices {
         #[cfg(feature = "abac-policy")]
         let abac_enforcer = abac_stores.as_ref().map(Self::build_enforcer_from_stores);
 
-        // `directory_cache` constructed earlier (before SstEngine) so the
-        // engine, the vector ops service, and the SharedServices public
-        // field all share the same `Arc`.
         let vector_operations_service = {
             let svc = {
                 #[cfg(feature = "axis")]
@@ -1745,7 +1712,6 @@ impl SharedServices {
                 }
             }
             .with_orchestrator(Some(orchestrator.clone()))
-            .with_directory_cache(directory_cache.clone())
             // Phase 7.2: thread the same affinity registry held by
             // the SharedServices field so search-path recordings and
             // operator inspection share state.
@@ -1813,6 +1779,7 @@ impl SharedServices {
                     storage_class: None,
                     policy_generation: None,
                     default_access_tier: None,
+                    pool_id: None,
                     name: metadata.name.clone(),
                     embedding_config: None,
                     dimension: metadata.dimension as u32,
@@ -2129,6 +2096,15 @@ impl SharedServices {
                      replayed tables stay resident until each table's first write"
                 ),
             }
+            // Release-review F7: once the WAL has been truncated below its
+            // head (`retained_from() > 1` — the same condition the spill-off
+            // boot refusal treats as "rows may be in no retained WAL entry"),
+            // a failed replay is not self-healing: the retained tail is the
+            // only copy of the unflushed rows, so serving whatever replayed
+            // is a silent subset, exactly the failure the DATA_FORMAT marker
+            // exists to refuse. Fatal there; a never-truncated WAL keeps the
+            // legacy warn-and-recover-on-restart posture.
+            let truncated_history = appender.retained_from() > 1;
             match appender.read_entries().await {
                 Ok(entries) => match store.replay_wal_entries(entries).await {
                     Ok(_) => record_store_recovered = true,
@@ -2138,12 +2114,29 @@ impl SharedServices {
                                 "canonical record-store WAL replay failed with [oltp] atomic_commit on; refusing to serve partial state: {e:#}"
                             );
                         }
+                        if truncated_history {
+                            anyhow::bail!(
+                                "canonical record-store WAL replay failed on a truncated WAL \
+                                 (retained from LSN {}); the retained tail is the only copy of \
+                                 unflushed rows, so serving the partial replay would silently \
+                                 drop data. Restore or investigate the WAL, then restart: {e:#}",
+                                appender.retained_from()
+                            );
+                        }
                         warn!("SharedServices: canonical record-store WAL replay failed: {e}");
                     }
                 },
                 Err(e) if atomic_commit => {
                     anyhow::bail!(
                         "reading the canonical WAL failed with [oltp] atomic_commit on; refusing to serve: {e:#}"
+                    );
+                }
+                Err(e) if truncated_history => {
+                    anyhow::bail!(
+                        "reading the canonical WAL failed on a truncated WAL (retained from \
+                         LSN {}); the retained tail is the only copy of unflushed rows, so \
+                         serving without it would silently drop data: {e:#}",
+                        appender.retained_from()
                     );
                 }
                 Err(e) => {
@@ -2804,29 +2797,31 @@ impl SharedServices {
             match PartitionLeaseStore::from_url(&storage_config.metadata_url, "_operator/leases") {
                 Ok(store) => {
                     let pod_id = crate::cluster::primary_pod_registry::resolve_self_pod_id(None);
+                    let lease_ttl_ms = storage_config.write_lease_ttl_ms.max(2_000) as i64;
                     let manager = Arc::new(PartitionLeaseManager::new(
                         Arc::new(store),
                         primary_pod_registry.clone(),
                         pod_id.clone(),
-                        10_000,
+                        lease_ttl_ms,
                     ));
                     crate::cluster::partition_lease::install_global_partition_lease_manager(
                         manager.clone(),
                     );
                     // P1a: keep held leases warm. Without this the renew loop
                     // never runs in production (it was only spawned in tests),
-                    // so held leases lapse after the 10s TTL and the
+                    // so held leases lapse after their TTL and the
                     // leaseholder model the write-gate (421) + DML locks rely
                     // on silently degrades. Fire-and-forget for the process
                     // lifetime (matches SharedServices' existing background-task
-                    // pattern); interval ≤ lease_ms/2 so a lease never lapses
-                    // between renewals.
+                    // pattern). The config-derived interval is at most half
+                    // the writer TTL and capped at 5s for initially 10s DML
+                    // locks and graph node/edge resource leases.
                     // `spawn_renew_loop` tokio::spawns the loop and returns its
                     // JoinHandle; drop it as a temporary so the task runs detached
                     // (fire-and-forget) without tripping clippy::let_underscore_future.
                     manager
                         .clone()
-                        .spawn_renew_loop(std::time::Duration::from_millis(5_000));
+                        .spawn_renew_loop(storage_config.write_lease_renew_interval());
 
                     // TD-MANIFEST-1: cap the lease manifest log. Manifests are
                     // append-only and were never pruned, so a long-lived lease grew
@@ -2954,6 +2949,12 @@ impl SharedServices {
         // so DDL and DML share one ownership view.
         let mut ddl = crate::services::DdlService::new(catalog_manager.clone())
             .with_record_store(dml_service_for_grpc.record_store())
+            // TD-COMPACT-14: COMPACT TABLE over the REST/gRPC SQL facade.
+            .with_collection_compactor(std::sync::Arc::new(
+                crate::services::operations::vectors::VectorOpsCollectionCompactor {
+                    vector_ops: vector_operations_service.clone(),
+                },
+            ))
             .with_primary_pod_registry(primary_pod_registry.clone())
             .with_self_pod_id(crate::cluster::primary_pod_registry::resolve_self_pod_id(
                 None,
@@ -3284,12 +3285,6 @@ impl SharedServices {
                 // retrieval. Same in-process map serves REST, gRPC, and the
                 // R-7c rank-pipeline BM25 leg (`ProductionHybridBackend`).
                 fulltext_indexes,
-                // Vector Object Economy Phase 4 (2-B): process-wide
-                // per-collection directory cache. The same Arc is also
-                // attached to `vector_operations_service` via
-                // `with_directory_cache` above so the search service can
-                // touch the cache without re-resolving SharedServices.
-                directory_cache,
                 // Phase 6: per-collection pinning registry.
                 // Constructed up front (line ~322) so REST handlers
                 // (control plane) and the SST tier-migration

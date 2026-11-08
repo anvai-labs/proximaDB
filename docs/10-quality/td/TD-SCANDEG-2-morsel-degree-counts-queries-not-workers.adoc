@@ -1,0 +1,30 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-SCANDEG-2: The morsel-degree invariant's wording does not hold within one query
+:status: Open
+:date: 2026-11-06
+:tags: [search, concurrency, cpu, documentation]
+
+== Verified facts
+
+* `morsel_degree()` returns `cores` when `INFLIGHT_SCANS == 1`, else 1. Its doc
+  says total CPU workers ≈ cores regardless of load.
+* `INFLIGHT_SCANS` counts in-flight QUERIES. On the production entry one
+  query drives every live file concurrently (`join_all`), and each file's rank
+  can start up to `cores` `spawn_blocking` workers. So one query can run up to
+  N_files x cores rank workers.
+* The only measurement on record (2026-07-25 cold A/B sweep) found the
+  lone-query win (c=1 cold 5.8 → 10.4 QPS on 3 segments) WITH this fan-out,
+  and found dividing ACROSS queries within noise.
+
+So this is a gap in the invariant's wording, not an established defect.
+
+== To close
+
+Either correct the doc to say "≈ cores per in-flight query", or bound total
+rank workers. If bounding: reuse the existing process-wide
+`stage_f_decode_permits()` semaphore pattern (which already bounds this same
+fan-out for Stage F decode), do not reintroduce a cores/inflight-style
+division (the rejected posture), and measure c=1 and c>=4 before and after.
+
+Related: TD-SCANDEG-1, TD-SEARCH-2.

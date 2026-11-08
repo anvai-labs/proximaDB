@@ -268,7 +268,7 @@ pub async fn auth_middleware(
     // Check basic permissions for the endpoint
     let required_permission = determine_required_permission(method.as_str(), path);
     if let Some(permission) = required_permission {
-        let context = build_permission_context(path, &auth_result);
+        let context = build_permission_context(path);
 
         auth_state
             .auth_service
@@ -433,8 +433,13 @@ fn authz_response(
 
 /// Determine if authentication should be skipped for this path
 fn should_skip_auth(path: &str) -> bool {
-    // Health endpoints
-    if path.starts_with("/health") {
+    // Health endpoints — via the ONE shared predicate (TD-PROBE-1 review M1:
+    // this was a private literal `starts_with("/health")`, so the auth skip
+    // and the tenant-layer probe exemption were two independent literals
+    // whose match sets merely happened to be identical — exactly the drift
+    // shape the tenant exemption's comment claims to preclude. Route both
+    // through `is_health_endpoint` and they agree by construction).
+    if proximadb_network_middleware::rate_limit::is_health_endpoint(path) {
         return true;
     }
 
@@ -534,7 +539,7 @@ fn determine_required_permission(method: &str, path: &str) -> Option<Permission>
 }
 
 /// Build permission context from request path and auth result
-fn build_permission_context(path: &str, auth_result: &AuthResult) -> PermissionContext {
+fn build_permission_context(path: &str) -> PermissionContext {
     let resource_type = if path.starts_with("/collections") {
         ResourceType::Collection
     } else if path.contains("/vectors") {
@@ -557,7 +562,14 @@ fn build_permission_context(path: &str, auth_result: &AuthResult) -> PermissionC
     PermissionContext {
         resource_type,
         resource_id,
-        tenant_id: auth_result.tenant_id.clone(),
+        // No resource tenant is asserted here. The only tenant a middleware
+        // knows is the caller's OWN (from AuthResult) — asserting it as the
+        // resource's tenant was circular and enforced nothing, and now that
+        // the RBAC tenant predicate is fail-closed it would deny every
+        // request. A path does not identify the resource's tenant; tenancy
+        // is enforced structurally (TenantContext + DrPathBuilder), not by
+        // this layer (TD-FACADE-1).
+        tenant_id: None,
         metadata: std::collections::HashMap::new(),
     }
 }
@@ -679,7 +691,11 @@ pub async fn check_permission(
     let context = PermissionContext {
         resource_type,
         resource_id,
-        tenant_id: auth_result.tenant_id.clone(),
+        // See build_permission_context: the caller's own tenant is not the
+        // resource's tenant. Leave the tenant unset — asserting it is
+        // circular and, with the fail-closed RBAC predicate, would deny
+        // every check (TD-FACADE-1).
+        tenant_id: None,
         metadata: std::collections::HashMap::new(),
     };
 
@@ -1009,6 +1025,24 @@ mod tests {
         assert!(should_skip_auth("/docs"));
         assert!(!should_skip_auth("/collections"));
         assert!(!should_skip_auth("/api/collections"));
+    }
+
+    /// TD-FACADE-1 pin: the permission context built for a request must NOT
+    /// assert a tenant. It used to echo the caller's OWN tenant in, which (a)
+    /// enforced nothing circular and (b) with the now fail-closed RBAC tenant
+    /// predicate would deny every tenant-carrying request outright. The
+    /// function takes no auth result at all anymore — the signature itself is
+    /// the invariant; this pin guards against a future re-addition.
+    #[test]
+    fn test_build_permission_context_never_asserts_a_tenant() {
+        let ctx = build_permission_context("/collections/abc");
+        assert!(
+            ctx.tenant_id.is_none(),
+            "middleware must not assert the caller's own tenant as the resource tenant"
+        );
+        // resource_type/resource_id extraction still works
+        assert_eq!(ctx.resource_type, ResourceType::Collection);
+        assert_eq!(ctx.resource_id.as_deref(), Some("abc"));
     }
 
     #[test]

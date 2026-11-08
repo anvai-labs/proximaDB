@@ -49,32 +49,48 @@ pub const DEFAULT_SPILL_FLUSH_LAG_ENTRIES: u64 = 1_000_000;
 /// Anything else keeps the default and warns — a typo must neither disable
 /// durability features silently nor pick an absurd value.
 pub fn default_on_gate(env: &str, default: u64) -> Option<u64> {
-    let Ok(raw) = std::env::var(env) else {
+    let raw = std::env::var(env).ok();
+    let value = default_on_gate_value(raw.as_deref(), default);
+    if let (Some(r), Some(v)) = (&raw, value) {
+        let t = r.trim();
+        if v == default && !t.is_empty() && t.parse::<u64>().is_err() && !is_off_like(t) {
+            tracing::warn!(
+                env,
+                value = %r,
+                default,
+                "unrecognised value; using the default (set 0 or off to disable)"
+            );
+        }
+    }
+    value
+}
+
+/// [`default_on_gate`]'s pure core over the raw value (testable without env
+/// injection; the typo branch keeps the default instead of logging — only
+/// the env-reading wrapper warns).
+pub fn default_on_gate_value(raw: Option<&str>, default: u64) -> Option<u64> {
+    let Some(raw) = raw else {
         return Some(default);
     };
     let value = raw.trim();
     if value.is_empty() {
         return Some(default);
     }
-    if matches!(
-        value.to_ascii_lowercase().as_str(),
-        "off" | "false" | "no" | "none" | "disabled"
-    ) {
+    if is_off_like(value) {
         return None;
     }
     match value.parse::<u64>() {
         Ok(0) => None,
         Ok(n) => Some(n),
-        _ => {
-            tracing::warn!(
-                env,
-                value,
-                default,
-                "unrecognised value; using the default (set 0 or off to disable)"
-            );
-            Some(default)
-        }
+        _ => Some(default),
     }
+}
+
+fn is_off_like(value: &str) -> bool {
+    matches!(
+        value.to_ascii_lowercase().as_str(),
+        "off" | "false" | "no" | "none" | "disabled" | "0"
+    )
 }
 
 /// The format this binary writes by default.
@@ -84,8 +100,16 @@ pub const CURRENT_FORMAT: u32 = 2;
 /// (`PROXIMADB_RELATIONAL_SPILL_URL`), not only beside the WAL. Recorded
 /// ([`raise_data_format`]) before a directory's first object placement, so a
 /// binary that only knows local segments refuses the directory instead of
-/// serving it without them. The newest format this binary can read.
+/// serving it without them.
 pub const OBJECT_SPILL_FORMAT: u32 = 3;
+
+/// **Format 4**: sealed canonical-WAL segments may carry an in-file summary
+/// section (TD-WALBOOT-1 cost-1). Recorded by the appender before the FIRST
+/// section a WAL directory sees; a format-3 binary reading this marker
+/// refuses the directory (its strict sealed-segment decoder would fail on
+/// the section bytes), while this binary reads both shapes. The newest
+/// format this binary can read.
+pub const WAL_SECTION_FORMAT: u32 = 4;
 
 /// Marker file, beside the canonical WAL.
 pub const FORMAT_MARKER: &str = "DATA_FORMAT";
@@ -99,7 +123,7 @@ struct Marker {
 /// Check `dir`'s format marker and record at least [`CURRENT_FORMAT`] in it. Call before
 /// opening anything in `dir`.
 ///
-/// Refuses a marker newer than [`OBJECT_SPILL_FORMAT`] (written by a newer
+/// Refuses a marker newer than [`WAL_SECTION_FORMAT`] (written by a newer
 /// binary) or one that cannot be read — guessing would risk serving a subset of the
 /// data. A missing marker is a format-1 directory, or a new one; either way it
 /// is upgraded, durably (temp file, fsync, rename, fsync of the directory),
@@ -122,7 +146,7 @@ pub fn ensure_data_format(dir: &Path) -> Result<u32> {
         }
     };
     if let Some(format) = found {
-        if format > OBJECT_SPILL_FORMAT {
+        if format > WAL_SECTION_FORMAT {
             anyhow::bail!(
                 "{} was written in data format {format}, newer than this binary's {OBJECT_SPILL_FORMAT} \
                  (ProximaDB {}); serving it could silently drop data. Run a newer binary.",
@@ -283,10 +307,12 @@ mod tests {
         assert_eq!(ensure_data_format(dir.path())?, 3);
         assert_eq!(raise_data_format(dir.path(), CURRENT_FORMAT)?, 3);
 
-        // A newer one refuses, and is left as it was.
+        // A newer one refuses, and is left as it was. (WAL_SECTION_FORMAT + 1,
+        // not OBJECT_SPILL_FORMAT + 1: format 4 is this binary's readable
+        // ceiling now — the "future" format must exceed it.)
         let newer = format!(
             r#"{{"format":{},"written_by":"future"}}"#,
-            OBJECT_SPILL_FORMAT + 1
+            WAL_SECTION_FORMAT + 1
         );
         std::fs::write(dir.path().join(FORMAT_MARKER), &newer)?;
         let err = ensure_data_format(dir.path()).expect_err("newer format");

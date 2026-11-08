@@ -61,3 +61,22 @@ pub mod kernels;
 pub use batching::{BatchPerformanceEstimator, BatchingStrategy, GpuBatchIterator, GpuBatchSizer};
 pub use decoder::GpuDecoder;
 pub use encoder::GpuEncoder;
+
+// Encoder and decoder advertise the same scheme-level capability.
+fn supports_scheme(scheme: &crate::types::ProximaScheme) -> bool {
+    use crate::types::ProximaScheme;
+
+    let backend = crate::simd::get_simd_backend();
+    if !backend.is_gpu() {
+        return false;
+    }
+
+    matches!(
+        scheme,
+        ProximaScheme::Delta { .. }
+            | ProximaScheme::BitPacked { .. }
+            | ProximaScheme::FrameOfReference { .. }
+            | ProximaScheme::Zigzag { .. }
+            | ProximaScheme::PForDelta { .. }
+    )
+}

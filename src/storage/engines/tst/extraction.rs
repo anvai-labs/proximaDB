@@ -12,7 +12,7 @@ use crate::core::types::StorageEngineType;
 use crate::storage::persistence::filesystem::caching_filesystem::UnifiedCachingFilesystem;
 use crate::storage::trait_components::extractor::{
     ExtractedVector, ExtractionCapabilities, ExtractionCost, ExtractionError, ExtractionMode,
-    ExtractionRequest, ExtractionResult, ExtractionStats, VectorExtractor,
+    ExtractionRequest, ExtractionResult, ExtractionStats, VectorExtractor, linear_file_cost,
 };
 
 /// TST Vector Extractor
@@ -218,17 +218,14 @@ impl VectorExtractor for TstExtractor {
     }
 
     fn estimate_extraction_cost(&self, request: &ExtractionRequest) -> ExtractionCost {
-        // Estimate based on file count
-        let estimated_vectors = request.file_paths.len() * 1000; // Assume 1K vectors per file
-        let estimated_bytes = estimated_vectors * 512; // 512 bytes per vector estimate
-        let estimated_duration_ms = (request.file_paths.len() * 100) as u64; // 100ms per file
-
-        ExtractionCost {
-            estimated_vectors,
-            estimated_bytes,
-            estimated_duration_ms,
-            io_cost: 0.8, // TST is columnar, good I/O efficiency
-        }
+        // Estimate based on file count (TST rows are narrow: ~512 B/vector)
+        linear_file_cost(
+            request.file_paths.len(),
+            1000,
+            512,
+            100,
+            0.8, // TST is columnar, good I/O efficiency
+        )
     }
 
     fn engine_type(&self) -> StorageEngineType {

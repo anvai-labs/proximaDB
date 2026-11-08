@@ -54,6 +54,8 @@ class CollectionV2Response:
         default_access_tier (None | str | Unset): Desired access tier for future segment writes (TD-TIER-1 SC5):
             "hot" | "cool" | "cold"; omitted when unset (the account default).
             Desired, not observed: an account lifecycle rule may move objects.
+        pool_id (None | str | Unset): Reservation pool the PERFORMANCE grant charges (TD-TIER-1 SC6);
+            omitted when the default pool applies.
         schema (None | SchemaDefinition | Unset):
         quantization (None | QuantizationConfigOutput | Unset):
         updated_at (None | str | Unset): Last update timestamp
@@ -74,6 +76,7 @@ class CollectionV2Response:
     created_at: str
     canonical_embedding_precision: None | str | Unset = UNSET
     default_access_tier: None | str | Unset = UNSET
+    pool_id: None | str | Unset = UNSET
     schema: None | SchemaDefinition | Unset = UNSET
     quantization: None | QuantizationConfigOutput | Unset = UNSET
     updated_at: None | str | Unset = UNSET
@@ -131,6 +134,12 @@ class CollectionV2Response:
         else:
             default_access_tier = self.default_access_tier
 
+        pool_id: None | str | Unset
+        if isinstance(self.pool_id, Unset):
+            pool_id = UNSET
+        else:
+            pool_id = self.pool_id
+
         schema: dict[str, Any] | None | Unset
         if isinstance(self.schema, Unset):
             schema = UNSET
@@ -176,6 +185,8 @@ class CollectionV2Response:
             field_dict["canonical_embedding_precision"] = canonical_embedding_precision
         if default_access_tier is not UNSET:
             field_dict["default_access_tier"] = default_access_tier
+        if pool_id is not UNSET:
+            field_dict["pool_id"] = pool_id
         if schema is not UNSET:
             field_dict["schema"] = schema
         if quantization is not UNSET:
@@ -253,6 +264,15 @@ class CollectionV2Response:
             d.pop("default_access_tier", UNSET)
         )
 
+        def _parse_pool_id(data: object) -> None | str | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            return cast(None | str | Unset, data)
+
+        pool_id = _parse_pool_id(d.pop("pool_id", UNSET))
+
         def _parse_schema(data: object) -> None | SchemaDefinition | Unset:
             if data is None:
                 return data
@@ -314,6 +334,7 @@ class CollectionV2Response:
             created_at=created_at,
             canonical_embedding_precision=canonical_embedding_precision,
             default_access_tier=default_access_tier,
+            pool_id=pool_id,
             schema=schema,
             quantization=quantization,
             updated_at=updated_at,

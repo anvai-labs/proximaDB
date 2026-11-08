@@ -134,6 +134,38 @@ impl std::fmt::Display for CollectionNotFound {
 
 impl std::error::Error for CollectionNotFound {}
 
+/// A collection drop the server refused or could not complete (catalog or
+/// metadata delete failed). Distinct from [`CollectionNotFound`]: the
+/// collection still exists, so a surface must report a failure — never
+/// success, and never "does not exist" (which an idempotent client would
+/// treat as done).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CollectionDropFailed {
+    /// The collection as the request named it.
+    pub identifier: String,
+    /// The service's machine-readable failure code (e.g.
+    /// `CATALOG_DELETE_FAILED`).
+    pub code: String,
+}
+
+impl std::fmt::Display for CollectionDropFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Collection '{}' could not be dropped ({}); it still exists, retry the drop",
+            self.identifier, self.code
+        )
+    }
+}
+
+impl std::error::Error for CollectionDropFailed {}
+
+/// The [`CollectionDropFailed`] anywhere in `err`'s chain, if any.
+pub fn collection_drop_failed(err: &anyhow::Error) -> Option<&CollectionDropFailed> {
+    err.chain()
+        .find_map(|cause| cause.downcast_ref::<CollectionDropFailed>())
+}
+
 /// The [`CollectionNotFound`] anywhere in `err`'s chain, if any.
 pub fn collection_not_found(err: &anyhow::Error) -> Option<&CollectionNotFound> {
     err.chain()

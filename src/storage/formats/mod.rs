@@ -119,9 +119,7 @@ pub use arrow_conversion::{
     filter_to_string,
     graph_edge_schema,
     graph_node_schema,
-    json_to_sql_value,
     record_batch_to_vector_batch,
-    record_batch_to_vector_records,
     sql_value_to_arrow_type,
     // Conversions
     vector_batch_to_record_batch,

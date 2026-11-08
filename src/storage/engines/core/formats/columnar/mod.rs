@@ -106,7 +106,6 @@ pub use proximadb_engine_core::proximablocks::columnar_footer_cache as footer_ca
 pub mod hybrid_writer;
 pub mod metadata_collector;
 pub mod native_metadata;
-pub use proximadb_engine_core::proximablocks::nova_metadata; // extracted TD-DECOMP-76
 pub mod parquet_io_layer; // Low-level I/O operations (formerly shared_parquet_reader)
 pub use metadata_collector::MetadataCollector;
 pub use proximadb_engine_core::proximablocks::columnar_utilities as utilities; // extracted TD-DECOMP-76

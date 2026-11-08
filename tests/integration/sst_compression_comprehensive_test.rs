@@ -93,7 +93,7 @@ async fn test_compression_for_data(
     let env_uncompressed = UnifiedTestEnvironment::new().await?;
     let env_compressed = UnifiedTestEnvironment::new().await?;
 
-    let distance_compute = Arc::new(UnifiedDistanceCompute::new(
+    let _distance_compute = Arc::new(UnifiedDistanceCompute::new(
         proximadb::compute::distance_computation::DistanceMetric::Cosine,
     ));
 

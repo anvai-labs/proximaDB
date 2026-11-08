@@ -534,7 +534,9 @@ class CodeKnowledgeBuilder:
                     "id": record_symbol_id(metadata, self.config.graph_name),
                     "vector": embedding,
                     "props": metadata,
-                    "source": chunk.text,
+                    # TD-REC-1: the code text rides in text_fields; a
+                    # top-level `source` was never a contract field (silently
+                    # dropped before, a 400 now).
                     "text_fields": [{"name": "source_code", "content": chunk.text}],
                 }
             )

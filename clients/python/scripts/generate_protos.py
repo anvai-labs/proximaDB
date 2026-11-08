@@ -18,13 +18,46 @@ The script will:
 import subprocess
 import sys
 from pathlib import Path
-from typing import List
 
 # Root directories
 SCRIPT_DIR = Path(__file__).parent
 PROJECT_ROOT = SCRIPT_DIR.parent.parent
 PROTO_DIR = PROJECT_ROOT / "proto"
 PYTHON_OUT = SCRIPT_DIR.parent / "src" / "proximadb_sdk" / "v1"
+# Compatibility shims: legacy import path kept alive against the single
+# generated source of truth (see src/proximadb/v1/).
+LEGACY_SHIM_DIR = SCRIPT_DIR.parent / "src" / "proximadb" / "v1"
+
+
+def write_legacy_shims(version: str = "v1", out_dir=None, shim_dir=None) -> None:
+    """Mirror every generated module as a re-export shim under proximadb.<version>.
+
+    The emitted file form is the one ``tests/unit/test_proto_schema_drift.py``'s
+    ``_resolve_shim`` recognizes (docstring marker + exact import lines); keep
+    the two in sync when editing either.
+    """
+    out_dir = out_dir if out_dir is not None else PYTHON_OUT
+    shim_dir = shim_dir if shim_dir is not None else LEGACY_SHIM_DIR
+    for mod in sorted(out_dir.glob("*_pb2*.py")):
+        name = mod.stem
+        import_line = f"from proximadb_sdk.{version}.{name}"
+        if name.endswith("_grpc"):
+            body = f"{import_line} import *  # noqa: F401,F403\n"
+        else:
+            body = (
+                f"{import_line} import *  # noqa: F401,F403\n"
+                f"{import_line} import DESCRIPTOR as DESCRIPTOR  # noqa: F401\n"
+            )
+        header = (
+            '"""Compatibility shim: the canonical generated module lives in\n'
+            f"``proximadb_sdk.{version}.{name}`` (single source of truth, emitted by\n"
+            "``scripts/generate_protos.py``). This path is kept so legacy\n"
+            f"``import proximadb.{version}.{name}`` keeps working against fresh generated code.\n"
+            '"""\n\n'
+        )
+        (shim_dir / mod.name).write_text(header + body)
+    print(f"Wrote legacy shims to {shim_dir}")
+
 
 # Proto files to generate (relative to proto directory)
 PROTOS = [
@@ -159,10 +192,12 @@ def verify_generation(python_out: Path) -> bool:
     try:
         sys.path.insert(0, str(python_out.parent))
 
-        from proximadb_sdk.v1 import document_pb2
-        from proximadb_sdk.v1 import document_pb2_grpc
-        from proximadb_sdk.v1 import hybrid_pb2
-        from proximadb_sdk.v1 import hybrid_pb2_grpc
+        from proximadb_sdk.v1 import (
+            document_pb2,
+            document_pb2_grpc,
+            hybrid_pb2,
+            hybrid_pb2_grpc,
+        )
 
         print("  All proto files imported successfully!")
 
@@ -211,6 +246,10 @@ def main() -> int:
 
     # Fix import paths
     fix_imports(PYTHON_OUT)
+
+    # Mirror the generated modules as legacy re-export shims (proximadb.v1)
+    LEGACY_SHIM_DIR.mkdir(parents=True, exist_ok=True)
+    write_legacy_shims()
 
     # Verify generation
     print()

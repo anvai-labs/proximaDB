@@ -43,20 +43,36 @@ fn fault_mode() -> Option<FaultMode> {
 /// compaction read its records, then a later probe read of the same input hit
 /// a transient I/O error" (TD-READFID-2 review). Keyed with `file://`
 /// stripped so URL and resolved-path forms of one file share a count.
+///
+/// Read live (no OnceLock): under `cargo test --lib` every test shares one
+/// process, so a cached first read would pin the gate before the arming test
+/// runs — and would stay armed after it clears the env.
 fn read_fault_armed() -> bool {
-    static ARMED: OnceLock<bool> = OnceLock::new();
-    *ARMED.get_or_init(|| {
-        std::env::var("PROXIMADB_TEST_FS_READ_FAIL_AFTER_FIRST")
-            .map(|v| v.trim() == "1")
-            .unwrap_or(false)
-    })
+    std::env::var("PROXIMADB_TEST_FS_READ_FAIL_AFTER_FIRST")
+        .map(|v| v.trim() == "1")
+        .unwrap_or(false)
 }
 
 /// True when the read-fault env gate is set, so the factory installs this
 /// wrapper.
 pub fn read_fault_requested() -> bool {
-    static REQUESTED: OnceLock<bool> = OnceLock::new();
-    *REQUESTED.get_or_init(|| std::env::var_os("PROXIMADB_TEST_FS_READ_FAIL_AFTER_FIRST").is_some())
+    std::env::var_os("PROXIMADB_TEST_FS_READ_FAIL_AFTER_FIRST").is_some()
+}
+
+/// `PROXIMADB_TEST_FS_READ_FAIL_SCOPE`: optional directory prefix. When set,
+/// only `.pax` paths under it can be faulted (and only they are tracked) —
+/// the arming test points this at its own temp dir so that, in the
+/// shared-process `cargo test --lib` world, the wrapper the factory installs
+/// everywhere stays inert for every concurrent test's files. Unset (the
+/// default): any `.pax` path can be faulted, exactly as under nextest.
+fn read_fault_scope_covers(key: &str) -> bool {
+    let Some(scope) = std::env::var_os("PROXIMADB_TEST_FS_READ_FAIL_SCOPE") else {
+        return true;
+    };
+    let scope = scope.to_string_lossy();
+    let scope = scope.strip_prefix("file://").unwrap_or(&scope);
+    let scope = scope.trim_end_matches('/');
+    key == scope || key.starts_with(&format!("{scope}/"))
 }
 
 fn already_read() -> &'static Mutex<HashSet<String>> {
@@ -67,18 +83,6 @@ fn already_read() -> &'static Mutex<HashSet<String>> {
 fn already_failed() -> &'static Mutex<HashSet<String>> {
     static FAILED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
     FAILED.get_or_init(|| Mutex::new(HashSet::new()))
-}
-
-/// Reset the injection state (test isolation helper — nextest runs each test
-/// in its own process, so this is only needed for in-process multi-phase
-/// tests).
-pub fn reset_for_tests() {
-    if let Ok(mut failed) = already_failed().lock() {
-        failed.clear();
-    }
-    if let Ok(mut read) = already_read().lock() {
-        read.clear();
-    }
 }
 
 #[derive(Debug)]
@@ -100,6 +104,9 @@ impl FaultInjectingFileSystem {
             return None;
         }
         let key = path.strip_prefix("file://").unwrap_or(path).to_string();
+        if !read_fault_scope_covers(&key) {
+            return None;
+        }
         let mut seen = already_read().lock().ok()?;
         if seen.insert(key) {
             None

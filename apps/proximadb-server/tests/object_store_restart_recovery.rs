@@ -697,9 +697,11 @@ async fn graceful_flush_persists_segment_to_object_store() -> anyhow::Result<()>
 /// per-collection compaction (WLP-2 tags) on an object-store base must merge
 /// flushed segments through the staged write — a false-success compaction here
 /// is the data-loss shape that deletes the INPUT segments (the only copies).
-/// Three boots: seed+flush ×2 (the second flush trips l0_threshold:2 and runs
-/// compaction inline, #1012), then a fresh-disk boot proving every record from
-/// BOTH batches is still readable. Also asserts no URL-as-local-path artifact.
+/// Three boots: seed+flush ×2 (the second shutdown flush trips l0_threshold:2
+/// and ENQUEUES the armed compaction — whether it completes before process
+/// exit is a race this test does not depend on), then a fresh-disk boot
+/// proving every record from BOTH batches is still readable whether or not the
+/// compaction ran. Also asserts no URL-as-local-path artifact.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires PROXIMADB_OBJECT_STORE_URL (adls://Azurite, s3://MinIO, gs://fake-gcs, or real cloud)"]
 async fn armed_compaction_on_object_store_preserves_all_records() -> anyhow::Result<()> {
@@ -763,7 +765,8 @@ async fn armed_compaction_on_object_store_preserves_all_records() -> anyhow::Res
     b1.graceful()?;
 
     // Boot 2: seed batch B, graceful stop (flush #2 → l0_threshold:2 trips →
-    // armed compaction runs inline on the flush path).
+    // the armed compaction is ENQUEUED on the flush path; completion before
+    // process exit is not guaranteed — the assertions below hold either way).
     let b2 = ServerProcess::start(&root, &dirs[1], &tmp.path().join("vm1.toml")).await?;
     let batch_b: Vec<Value> = (0..8)
         .map(|i| json!({ "id": format!("b-{i}"), "vector": vec![0.05_f32 * (i as f32 + 1.0); 8] }))
@@ -805,6 +808,222 @@ async fn armed_compaction_on_object_store_preserves_all_records() -> anyhow::Res
     anyhow::ensure!(
         artifact_preexisted || !scheme_dir.exists(),
         "compaction created a literal local '{}' directory (URL-as-local-path)",
+        scheme_dir.display()
+    );
+    Ok(())
+}
+
+/// TD-TIER-1 SC5: tier-mix at rest — the SERVER write path, not a probe PUT.
+///
+/// Creates a collection with `default_access_tier: "cool"`, drives two
+/// flush-at-shutdown cycles, then a third boot runs the operator COMPACT
+/// (synchronous — it awaits quiescence, so the L1 publish is deterministic
+/// rather than riding the shutdown enqueue race) and seeds one more L0 that
+/// stays un-compacted. The final at-rest set is at least one tiered L1 (the
+/// collection's tier — tiered objects are COMPACTION output only) beside at
+/// least one untiered L0 (the account default: L0s are compacted away within
+/// minutes, so tiering them would only pay the cold tier's minimum duration).
+///
+/// What is proven in-process: the plumbing end-to-end (create → admission →
+/// flush plan → `enqueue_due_compaction` → tiered publish) produced an L1
+/// object and kept an L0 beside it, and every record survives restarts.
+/// What is NOT provable in-process: the tier VALUE on the objects —
+/// `object_store` 0.13 cannot surface a tier on read and our `FileMetadata`
+/// `storage_class` is write-side only. When
+/// `$PROXIMADB_TIER_ROUNDTRIP_MANIFEST` is set (set by
+/// `scripts/run_cloud_emulator_tests.sh`), the test writes the L0/L1 object
+/// inventories there for the out-of-band az/aws read-backs (blobTier=Cool /
+/// StorageClass=STANDARD_IA on every L1, account default on every L0).
+/// Segment names carry their level (`L0_…`, `L1_…` — `FilenameCodec`), so the
+/// CLI read-back classifies without another surface.
+#[ignore = "requires PROXIMADB_OBJECT_STORE_URL (adls://Azurite, s3://MinIO/LocalStack, gs://fake-gcs, or real cloud)"]
+#[tokio::test]
+async fn compaction_output_carries_the_collection_tier_end_to_end() -> anyhow::Result<()> {
+    let base = std::env::var("PROXIMADB_OBJECT_STORE_URL")?;
+    anyhow::ensure!(
+        base.starts_with("s3://")
+            || base.starts_with("adls://")
+            || base.starts_with("az://")
+            || base.starts_with("gs://"),
+        "test URL must use s3://, adls://, az:// or gs:// (got {base})"
+    );
+    let root = format!(
+        "{}/td-tier1-tier-roundtrip/{}",
+        base.trim_end_matches('/'),
+        uuid::Uuid::new_v4().simple()
+    );
+    let tmp = tempfile::tempdir()?;
+    let collection = format!("tiermix_{}", uuid::Uuid::new_v4().simple());
+    let dirs: Vec<_> = (0..3).map(|i| tmp.path().join(format!("vm{i}"))).collect();
+    for d in &dirs {
+        std::fs::create_dir_all(d)?;
+    }
+    let scheme_dir =
+        std::path::PathBuf::from(format!("{}:", base.split("://").next().unwrap_or("adls")));
+    let artifact_preexisted = scheme_dir.exists();
+
+    let http = Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(30))
+        .build()?;
+
+    async fn seed_batch(
+        http: &Client,
+        base_url: &str,
+        collection: &str,
+        prefix: &str,
+    ) -> anyhow::Result<()> {
+        let records: Vec<Value> = (0..8)
+            .map(|i| {
+                json!({ "id": format!("{prefix}-{i}"), "vector": vec![0.1_f32 * (i as f32 + 1.0); 8] })
+            })
+            .collect();
+        let response = http
+            .post(format!(
+                "{base_url}/api/v2/collections/{collection}/records/batch"
+            ))
+            .json(&json!({ "records": records }))
+            .send()
+            .await?;
+        anyhow::ensure!(
+            response.status().is_success(),
+            "batch {prefix} insert failed ({})",
+            response.status()
+        );
+        Ok(())
+    }
+    async fn read_all(http: &Client, base_url: &str, collection: &str) -> anyhow::Result<()> {
+        for prefix in ["a", "b", "c"] {
+            for i in 0..8 {
+                let id = format!("{prefix}-{i}");
+                let response = http
+                    .get(format!(
+                        "{base_url}/api/v2/collections/{collection}/records/{id}"
+                    ))
+                    .send()
+                    .await?;
+                anyhow::ensure!(
+                    response.status().is_success(),
+                    "record {id} unreadable ({})",
+                    response.status()
+                );
+            }
+        }
+        Ok(())
+    }
+
+    // Boot 1: create with an explicit tier + ARMED compaction; flush #1.
+    let b1 = ServerProcess::start(&root, &dirs[0], &tmp.path().join("vm0.toml")).await?;
+    let response = http
+        .post(format!("{}/api/v2/collections", b1.base_url))
+        .json(&json!({
+            "name": collection,
+            "dimension": 8,
+            "engine": "sst",
+            "distance_metric": "cosine",
+            "canonical_embedding_precision": "fp32",
+            "enable_proxima_record": false,
+            "default_access_tier": "cool",
+            "tags": ["compaction:on", "l0_threshold:2"]
+        }))
+        .send()
+        .await?;
+    anyhow::ensure!(
+        response.status().is_success(),
+        "tiered create failed ({}) — admission must accept cool on a tiered object store",
+        response.status()
+    );
+    seed_batch(&http, &b1.base_url, &collection, "a").await?;
+    b1.graceful()?;
+
+    // Boot 2: flush #2 (shutdown) trips l0_threshold:2 and enqueues the armed
+    // compaction. Shutdown does NOT drain the compaction queue (Compaction::stop
+    // drops still-queued tasks), so whether this pass completes before exit is a
+    // race this test must not depend on — the next boot compacts explicitly.
+    let b2 = ServerProcess::start(&root, &dirs[1], &tmp.path().join("vm1.toml")).await?;
+    seed_batch(&http, &b2.base_url, &collection, "b").await?;
+    b2.graceful()?;
+
+    // Boot 3: the operator COMPACT (TD-COMPACT-14, synchronous — it awaits
+    // quiescence) deterministically publishes the L1 from whatever L0s exist
+    // (two if boot-2's raced shutdown task was dropped; none due if it ran —
+    // either way at least one L1 exists afterward). Then one more flush leaves
+    // a single L0 below the threshold at the account default, and all records
+    // must survive compaction and restarts.
+    let b3 = ServerProcess::start(&root, &dirs[2], &tmp.path().join("vm2.toml")).await?;
+    let response = http
+        .post(format!(
+            "{}/api/v2/collections/{collection}/compact",
+            b3.base_url
+        ))
+        .json(&json!({ "full": false }))
+        .send()
+        .await?;
+    anyhow::ensure!(
+        response.status().is_success(),
+        "operator compact failed ({})",
+        response.status()
+    );
+    seed_batch(&http, &b3.base_url, &collection, "c").await?;
+    read_all(&http, &b3.base_url, &collection).await?;
+    b3.graceful()?;
+
+    // Structural tier-mix proof: at rest there is at least one compacted (L1+)
+    // object AND at least one un-compacted L0 — the mix the out-of-band
+    // read-backs assert per class.
+    let blobs = list_segment_blobs(&root).await?;
+    let classify = |url: &str| -> Option<bool> {
+        // Some(true) = compacted (L1+), Some(false) = L0, None = unrecognized.
+        let name = url.rsplit('/').next().unwrap_or(url);
+        if name.starts_with("L0_") {
+            Some(false)
+        } else if name
+            .strip_prefix('L')
+            .and_then(|rest| rest.split_once('_'))
+            .is_some_and(|(digits, _)| {
+                !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit())
+            })
+        {
+            Some(true)
+        } else {
+            None
+        }
+    };
+    let mut l0_objects = Vec::new();
+    let mut l1_objects = Vec::new();
+    for url in &blobs {
+        match classify(url) {
+            Some(false) => l0_objects.push(url.clone()),
+            Some(true) => l1_objects.push(url.clone()),
+            None => anyhow::bail!("unclassifiable segment object under the test root: {url}"),
+        }
+    }
+    anyhow::ensure!(
+        !l1_objects.is_empty(),
+        "no compacted (L1+) object exists under {root} — the synchronous operator compact did not publish"
+    );
+    anyhow::ensure!(
+        !l0_objects.is_empty(),
+        "no un-compacted L0 object exists under {root} — the untiered half of the tier mix is missing"
+    );
+
+    // Hand the inventory to the out-of-band tier read-back (az/aws CLI).
+    if let Ok(manifest_path) = std::env::var("PROXIMADB_TIER_ROUNDTRIP_MANIFEST") {
+        std::fs::write(
+            &manifest_path,
+            serde_json::json!({
+                "root": root,
+                "collection": collection,
+                "l0": l0_objects,
+                "l1": l1_objects,
+            })
+            .to_string(),
+        )?;
+    }
+
+    anyhow::ensure!(
+        artifact_preexisted || !scheme_dir.exists(),
+        "test created a literal local '{}' directory (URL-as-local-path)",
         scheme_dir.display()
     );
     Ok(())

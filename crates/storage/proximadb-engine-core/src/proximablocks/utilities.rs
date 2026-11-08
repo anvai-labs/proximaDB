@@ -2,12 +2,55 @@
 // Common utility functions and helpers
 
 use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
 use crate::proximablocks::block_structures::ProximaDataBlock;
 use crate::proximablocks::row_config::RowBasedConfig;
 use proximadb_hardware_caps::HardwareCapabilities;
 use proximadb_records::ProximaRecord;
+
+/// Stable id hash for range comparisons (nova/swift/parquet id-hash ranges).
+///
+/// The per-format `hash_*` helpers this replaces (nova/swift `hash_id`,
+/// parquet `hash_string`, sst `hash_bytes`, and the footer-cache schema
+/// fingerprint) were byte-identical `DefaultHasher` wrappers. IMPORTANT: the str-Hash and bytes-Hash digests
+/// DIFFER (std length-prefix handling), and each format's persisted
+/// min/max id-hash ranges were written with one specific form — nova, swift
+/// and parquet hash the `&str`, SST hashes the raw bytes. Both forms are
+/// preserved exactly by the two helpers below; do not unify them.
+pub fn stable_id_hash(s: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    s.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Stable bytes hash (SST id/bloom hashing form) — see [`stable_id_hash`].
+pub fn stable_bytes_hash(bytes: &[u8]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// IdLookup skip predicate shared by the formats whose metadata keeps
+/// per-group id-hash ranges (nova: `column_groups`, swift: `segments`).
+///
+/// Returns true when no queried id's hash falls inside any `[min, max]`
+/// range, i.e. the file provably cannot match and can be skipped.
+pub fn ids_outside_all_ranges(
+    ids: &[String],
+    ranges: &[(u64, u64)],
+    id_hash: impl Fn(&str) -> u64,
+) -> bool {
+    for id in ids {
+        let h = id_hash(id);
+        if ranges.iter().any(|&(lo, hi)| h >= lo && h <= hi) {
+            return false; // Potential match — cannot skip
+        }
+    }
+    true
+}
 
 /// Row-based utilities collection
 pub struct RowBasedUtilities;

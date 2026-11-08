@@ -12,6 +12,8 @@ import logging
 import time
 from typing import Any
 
+import httpx
+
 from ..models import (
     BatchResult,
     Collection,
@@ -26,13 +28,13 @@ from ..models import (
     VectorRecord,
 )
 from ..models_v2 import ProximaRecord
-from ..proto_conversion import ProtoConverter
-from .base import BaseProtocolAdapter
+from ._sync_graph_delegations import SyncGraphDelegations
+from .base import BaseProtocolAdapter, RecordOpsMixin
 
 logger = logging.getLogger(__name__)
 
 
-class RestProtocolAdapter(BaseProtocolAdapter):
+class RestProtocolAdapter(RecordOpsMixin, SyncGraphDelegations, BaseProtocolAdapter):
     """REST protocol adapter implementing BaseProtocolAdapter.
 
     Wraps the existing ProximaDBClient (REST) to provide a consistent
@@ -67,6 +69,7 @@ class RestProtocolAdapter(BaseProtocolAdapter):
         self._client = ProximaDBClient(config=config)
         self._url = url
         self._connected = True
+        self._generated_document_client = None
 
     @property
     def protocol_name(self) -> str:
@@ -201,18 +204,6 @@ class RestProtocolAdapter(BaseProtocolAdapter):
     # ==========================================================================
 
     @staticmethod
-    def _record_payloads(records: list[ProximaRecord] | list[dict[str, Any]]):
-        payloads = []
-        for record in records:
-            if isinstance(record, dict):
-                payloads.append(record)
-            elif hasattr(record, "model_dump"):
-                payloads.append(record.model_dump(exclude_none=True))
-            else:
-                payloads.append(ProtoConverter.vector_record_to_dict(record))
-        return payloads
-
-    @staticmethod
     def _to_batch_result(result: Any, total_count: int) -> BatchResult:
         if isinstance(result, BatchResult):
             return result
@@ -257,17 +248,6 @@ class RestProtocolAdapter(BaseProtocolAdapter):
                 successful_count=successful,
                 failed_count=failed,
             ),
-        )
-
-    @staticmethod
-    def _batch_to_vector_response(
-        result: BatchResult, operation: str
-    ) -> VectorOperationResponse:
-        return VectorOperationResponse(
-            success=result.success,
-            operation=operation,
-            metrics=result.metrics,
-            error_message="; ".join(result.errors) if result.errors else None,
         )
 
     def insert_records(
@@ -644,24 +624,128 @@ class RestProtocolAdapter(BaseProtocolAdapter):
 
     # ==========================================================================
     # Document Operations
+    #
+    # The whole family runs the SPEC-DRIVEN generated openapi ops
+    # (``_generated/rest/api/documents/*``) through the adapter's shared
+    # generated client — one URL/auth/TLS/timeout source (the resolved
+    # config) and one outcome vocabulary (``_document_ingest``). The
+    # previous hand-rolled ``self._client._session.*`` calls could never
+    # execute: the protocol client has no ``_session`` attribute, so every
+    # call raised AttributeError before any I/O — masked upstream by v1's
+    # broad-except local fallback (and by these methods' own try/except
+    # returning None/False/[]).
     # ==========================================================================
+
+    def _generated_document_client_kwargs(self) -> dict[str, Any]:
+        """Construction kwargs for a generated document client, from ONE
+        source of truth: the resolved ``config`` the protocol session uses
+        — its URL, auth headers (``get_base_headers``), TLS material, and
+        timeouts — never the constructor ``url`` kwarg, which can diverge
+        when the caller passes ``config=`` explicitly or the URL comes from
+        the environment (auth for one host must not be sent to another).
+        Mirrors the protocol session's httpx construction (timeouts, pool
+        limits, client cert, UDS transport, HTTP/2).
+        """
+        from .._generated.rest.client import Client as GeneratedClient  # noqa: F401
+
+        cfg = self._client.config
+        timeout = httpx.Timeout(
+            connect=cfg.connection.connect_timeout,
+            read=cfg.connection.read_timeout,
+            write=cfg.timeout,
+            pool=cfg.connection.total_timeout,
+        )
+        limits = httpx.Limits(
+            max_keepalive_connections=cfg.connection.pool_size,
+            max_connections=cfg.connection.pool_maxsize,
+            keepalive_expiry=cfg.connection.keepalive_timeout,
+        )
+        uds_path = getattr(cfg, "uds_path", None)
+        if uds_path:
+            # Portless embedded mode (same rationale as the protocol
+            # session): connect through the Unix-domain socket; TLS and
+            # HTTP/2 do not apply once a transport is supplied.
+            httpx_args: dict[str, Any] = {
+                "transport": httpx.HTTPTransport(uds=uds_path, limits=limits),
+            }
+        else:
+            httpx_args = {
+                "limits": limits,
+                "http2": cfg.enable_http2,
+            }
+            if cfg.tls.cert_file:
+                httpx_args["cert"] = (cfg.tls.cert_file, cfg.tls.key_file)
+
+        return {
+            "base_url": cfg.url,
+            "headers": cfg.get_base_headers(),
+            "timeout": timeout,
+            "verify_ssl": cfg.tls.verify,
+            "httpx_args": httpx_args,
+            "raise_on_unexpected_status": True,
+            "follow_redirects": False,
+        }
+
+    def _get_generated_document_client(self):
+        """The adapter's shared generated openapi client (the document CRUD
+        ops — which carry no per-call headers). Built lazily from
+        :meth:`_generated_document_client_kwargs`; ``close()`` releases and
+        resets it. Never call ``with_headers`` on it: the generated
+        ``with_headers`` mutates a materialized httpx pool's headers IN
+        PLACE, which would permanently bleed per-call headers (e.g.
+        ``X-Tenant-ID``) onto every later request — a tenancy-isolation
+        defect. Per-call headers use
+        :meth:`_fresh_generated_document_client` instead.
+        """
+        if self._generated_document_client is None:
+            from .._generated.rest.client import Client as GeneratedClient
+
+            self._generated_document_client = GeneratedClient(
+                **self._generated_document_client_kwargs()
+            )
+        return self._generated_document_client
+
+    def _fresh_generated_document_client(self, extra_headers: dict[str, str]):
+        """A FRESH generated client for a single call carrying per-call
+        headers (``X-Tenant-ID`` / ``X-Ingest-Mode`` / ``X-Embed-Source``).
+
+        Built from the same config snapshot, with the per-call headers
+        merged into the base headers at construction — the shared client
+        is never touched, so headers cannot bleed between calls (same
+        per-call-pool shape as v1's canonical ingest path).
+        """
+        from .._generated.rest.client import Client as GeneratedClient
+
+        kwargs = self._generated_document_client_kwargs()
+        kwargs["headers"] = {**kwargs["headers"], **extra_headers}
+        return GeneratedClient(**kwargs)
 
     def create_document_collection(
         self, name: str, config: dict[str, Any] | None = None, **kwargs
     ) -> dict[str, Any]:
-        """Create a document collection via REST."""
-        try:
+        """Create a document collection (spec-driven op)."""
+        from .._generated.rest.api.documents.create_document_collection import (
+            sync_detailed,
+        )
+        from .._generated.rest.models.create_document_collection_request import (
+            CreateDocumentCollectionRequest,
+        )
+        from .._generated_op_exec import execute_generated_op
 
-            response = self._client._session.post(
-                f"{self._url}/api/v2/document-collections",
-                json={"name": name, **(config or {})},
-                timeout=self._client._timeout,
-            )
-            response.raise_for_status()
-            return response.json()
-        except Exception as e:
-            logger.error(f"Failed to create document collection: {e}")
-            raise
+        # The positional ``name`` is authoritative — a config dict keyed
+        # "name" must not silently override it.
+        body = CreateDocumentCollectionRequest.from_dict(
+            {
+                "name": name,
+                **{k: v for k, v in (config or {}).items() if k != "name"},
+            }
+        )
+        return execute_generated_op(
+            "create_document_collection",
+            lambda: sync_detailed(
+                client=self._get_generated_document_client(), body=body
+            ),
+        )
 
     def ingest_documents(
         self,
@@ -675,17 +759,26 @@ class RestProtocolAdapter(BaseProtocolAdapter):
     ) -> dict[str, Any]:
         """Ingest documents via the canonical generated client (ADR-041).
 
-        Targets the **collections** vector-store document surface with server-side
-        embedding. For the separate JSON **document-collections** surface (no
-        embedding) see :meth:`insert_document`.
+        Targets the **collections** vector-store document surface with
+        server-side embedding. For the separate JSON **document-collections**
+        surface (no embedding) see :meth:`insert_document`.
+
+        The wire protocol — record validation, per-call header shaping, and
+        outcome mapping — is the shared ``_document_ingest`` module (the same
+        one the v1 client's canonical path uses), so the adapter path and the
+        client path cannot drift.
         """
-        return self._client.ingest_documents(
-            collection_id,
-            records,
-            tenant_id=tenant_id,
-            ingest_mode=ingest_mode,
-            embed_source=embed_source,
-            **kwargs,
+        from .._document_ingest import (
+            build_ingest_request_body,
+            execute_ingest_documents,
+            ingest_per_call_headers,
+        )
+
+        client = self._fresh_generated_document_client(
+            ingest_per_call_headers(tenant_id, ingest_mode, embed_source)
+        )
+        return execute_ingest_documents(
+            client, collection_id, build_ingest_request_body(records)
         )
 
     def insert_document(
@@ -698,24 +791,27 @@ class RestProtocolAdapter(BaseProtocolAdapter):
         """Insert a JSON document into a document-collection (spec-driven, ADR-041).
 
         Targets the **document-collections** surface
-        (`POST /api/v2/document-collections/{c}/documents`) via the GENERATED client
-        op — pure JSON storage, no server-side embedding. For semantic content with
-        embedding use :meth:`ingest_documents` (the collections vector store).
+        (`POST /api/v2/document-collections/{c}/documents`) via the GENERATED
+        client op — pure JSON storage, no server-side embedding. For semantic
+        content with embedding use :meth:`ingest_documents` (the collections
+        vector store). One outcome vocabulary with the rest of the family:
+        transport → ``NetworkError``, documented errors and undocumented
+        statuses → ``ServerError`` (the op documents 200/400/500).
         """
         from .._generated.rest.api.documents.insert_document import sync_detailed
-        from .._generated.rest.client import Client as GeneratedClient
         from .._generated.rest.models.doc_insert_request import DocInsertRequest
+        from .._generated_op_exec import execute_generated_op
 
         # Wave-9 typed the previously free-form request body
         # (InsertDocumentBody) into DocInsertRequest {id?, document}.
         body = DocInsertRequest.from_dict({"id": id, "document": document})
-        client = GeneratedClient(base_url=self._url, raise_on_unexpected_status=False)
-        response = sync_detailed(collection=collection_name, client=client, body=body)
-        if response.status_code in (200, 201, 202):
-            return response.parsed.to_dict() if response.parsed is not None else {}
-        raise RuntimeError(
-            f"insert_document (document-collections) failed {response.status_code}: "
-            f"{response.content!r}"
+        return execute_generated_op(
+            "insert_document",
+            lambda: sync_detailed(
+                collection=collection_name,
+                client=self._get_generated_document_client(),
+                body=body,
+            ),
         )
 
     def get_document(
@@ -725,24 +821,22 @@ class RestProtocolAdapter(BaseProtocolAdapter):
         projection: list[str] | None = None,
         **kwargs,
     ) -> dict[str, Any] | None:
-        """Get a document by ID via REST."""
-        try:
+        """Get a document by ID (spec-driven op; 404 → ``None``)."""
+        from .._generated.rest.api.documents.get_document import sync_detailed
+        from .._generated.rest.types import UNSET
+        from .._generated_op_exec import execute_generated_op
 
-            params = {}
-            if projection:
-                params["projection"] = ",".join(projection)
-            response = self._client._session.get(
-                f"{self._url}/api/v2/document-collections/{collection_name}/documents/{doc_id}",
-                params=params,
-                timeout=self._client._timeout,
-            )
-            if response.status_code == 404:
-                return None
-            response.raise_for_status()
-            return response.json()
-        except Exception as e:
-            logger.debug(f"Document not found: {doc_id} - {e}")
-            return None
+        projection_csv = ",".join(projection) if projection else UNSET
+        return execute_generated_op(
+            "get_document",
+            lambda: sync_detailed(
+                collection=collection_name,
+                id=doc_id,
+                client=self._get_generated_document_client(),
+                projection=projection_csv,
+            ),
+            not_found=None,
+        )
 
     def query_documents(
         self,
@@ -752,86 +846,93 @@ class RestProtocolAdapter(BaseProtocolAdapter):
         limit: int = 100,
         **kwargs,
     ) -> dict[str, Any]:
-        """Query documents with filter via REST."""
-        try:
+        """Query documents with filter (spec-driven op; filter → JSON param)."""
+        import json as _json
 
-            body = {}
-            if filter:
-                body["filter"] = filter
-            if projection:
-                body["projection"] = projection
-            body["limit"] = limit
-            response = self._client._session.post(
-                f"{self._url}/api/v2/document-collections/{collection_name}/documents",
-                json=body,
-                timeout=self._client._timeout,
-            )
-            response.raise_for_status()
-            return response.json()
-        except Exception as e:
-            logger.error(f"Failed to query documents: {e}")
-            raise
+        from .._generated.rest.api.documents.query_documents import sync_detailed
+        from .._generated.rest.types import UNSET
+        from .._generated_op_exec import execute_generated_op
+
+        return execute_generated_op(
+            "query_documents",
+            lambda: sync_detailed(
+                collection=collection_name,
+                client=self._get_generated_document_client(),
+                filter_=_json.dumps(filter) if filter is not None else UNSET,
+                projection=",".join(projection) if projection else UNSET,
+                limit=limit if limit is not None else UNSET,
+            ),
+        )
 
     def update_document(
         self, collection_name: str, doc_id: str, updates: list[dict[str, Any]], **kwargs
     ) -> dict[str, Any]:
-        """Update a document via REST."""
-        try:
+        """Update a document (spec-driven op)."""
+        from .._generated.rest.api.documents.update_document import sync_detailed
+        from .._generated.rest.models.doc_update_request import DocUpdateRequest
+        from .._generated_op_exec import execute_generated_op
 
-            response = self._client._session.put(
-                f"{self._url}/api/v2/document-collections/{collection_name}/documents/{doc_id}",
-                json={"updates": updates},
-                timeout=self._client._timeout,
-            )
-            response.raise_for_status()
-            return response.json()
-        except Exception as e:
-            logger.error(f"Failed to update document: {e}")
-            raise
+        body = DocUpdateRequest.from_dict({"updates": updates})
+        return execute_generated_op(
+            "update_document",
+            lambda: sync_detailed(
+                collection=collection_name,
+                id=doc_id,
+                client=self._get_generated_document_client(),
+                body=body,
+            ),
+        )
 
     def delete_document(self, collection_name: str, doc_id: str, **kwargs) -> bool:
-        """Delete a document via REST."""
-        try:
+        """Delete a document (spec-driven op; 404 → ``False``)."""
+        from .._generated.rest.api.documents.delete_document import sync_detailed
+        from .._generated_op_exec import execute_generated_op
 
-            response = self._client._session.delete(
-                f"{self._url}/api/v2/document-collections/{collection_name}/documents/{doc_id}",
-                timeout=self._client._timeout,
-            )
-            response.raise_for_status()
-            result = response.json()
-            return result.get("deleted", False)
-        except Exception as e:
-            logger.error(f"Failed to delete document: {e}")
-            return False
+        result = execute_generated_op(
+            "delete_document",
+            lambda: sync_detailed(
+                collection=collection_name,
+                id=doc_id,
+                client=self._get_generated_document_client(),
+            ),
+            # Ack-shaped so the uniform ``result["success"]`` flow works on
+            # both the parsed and the 404 paths.
+            not_found={"success": False},
+        )
+        return bool(result.get("success", False))
 
     def list_document_collections(self, **kwargs) -> list[dict[str, Any]]:
-        """List all document collections via REST."""
-        try:
+        """List all document collections (spec-driven op)."""
+        from .._generated.rest.api.documents.list_document_collections import (
+            sync_detailed,
+        )
+        from .._generated_op_exec import execute_generated_op
 
-            response = self._client._session.get(
-                f"{self._url}/api/v2/document-collections",
-                timeout=self._client._timeout,
-            )
-            response.raise_for_status()
-            return response.json().get("collections", [])
-        except Exception as e:
-            logger.error(f"Failed to list document collections: {e}")
-            return []
+        result = execute_generated_op(
+            "list_document_collections",
+            lambda: sync_detailed(client=self._get_generated_document_client()),
+        )
+        collections = result.get("collections", [])
+        return collections if isinstance(collections, list) else []
 
     def delete_document_collection(self, collection_name: str, **kwargs) -> bool:
-        """Delete a document collection via REST."""
-        try:
+        """Delete a document collection (spec-driven op; 404 → ``False``)."""
+        from .._generated.rest.api.documents.delete_document_collection import (
+            sync_detailed,
+        )
+        from .._generated_op_exec import execute_generated_op
 
-            response = self._client._session.delete(
-                f"{self._url}/api/v2/document-collections/{collection_name}",
-                timeout=self._client._timeout,
-            )
-            response.raise_for_status()
-            result = response.json()
-            return result.get("success", False)
-        except Exception as e:
-            logger.error(f"Failed to delete document collection: {e}")
-            return False
+        result = execute_generated_op(
+            "delete_document_collection",
+            lambda: sync_detailed(
+                collection=collection_name,
+                client=self._get_generated_document_client(),
+            ),
+            # Ack-shaped so the uniform ``result["success"]`` flow works on
+            # both the parsed and the 404 paths.
+            not_found={"success": False},
+        )
+        return bool(result.get("success", False))
 
     # ==========================================================================
     # Hybrid Search Operations
@@ -844,127 +945,523 @@ class RestProtocolAdapter(BaseProtocolAdapter):
         query_vector: list[float],
         fusion_strategy: str = "rrf",
         top_k: int = 10,
+        fusion_params: dict[str, Any] | None = None,
         **kwargs,
     ) -> dict[str, Any]:
-        """Execute hybrid search via REST."""
-        try:
+        """Execute hybrid search (spec-driven op).
 
-            response = self._client._session.post(
-                f"{self._url}/api/v2/hybrid/search",
-                json={
-                    "collection": collection,
-                    "text_query": text_query,
-                    "query_vector": query_vector,
-                    "fusion_strategy": fusion_strategy,
-                    "top_k": top_k,
-                },
-                timeout=self._client._timeout,
+        Replaces hand-rolled ``_client._session`` calls that could never
+        execute (the protocol client has no ``_session`` attribute) — the
+        same dead-code disease as the document/timeseries families.
+        ``fusion_params`` is NOT a server field (the REST surface reads
+        ``rrf_k``/``vector_weight`` and serde drops unknown keys) — raising
+        the honest capability signal instead of silently shipping a no-op.
+        """
+        from .._generated.rest.api.hybrid.hybrid_search import sync_detailed
+        from .._generated.rest.models.hybrid_search_body import HybridSearchBody
+        from .._generated_op_exec import execute_generated_op
+
+        if fusion_params is not None:
+            raise NotImplementedError(
+                "hybrid_search(fusion_params) is not supported by the REST "
+                "op (the server's body has no fusion_params field; tune "
+                "rrf_k/vector_weight at the server or use the embedded path)"
             )
-            response.raise_for_status()
-            return response.json()
-        except Exception as e:
-            logger.error(f"Hybrid search failed: {e}")
-            raise
+        payload: dict[str, Any] = {
+            "collection": collection,
+            "text_query": text_query,
+            "vector": query_vector,
+            "fusion_strategy": fusion_strategy,
+            "top_k": top_k,
+        }
+        return execute_generated_op(
+            "hybrid_search",
+            lambda: sync_detailed(
+                client=self._get_generated_document_client(),
+                body=HybridSearchBody.from_dict(payload),
+            ),
+        )
 
-    # ==========================================================================
-    # Time-Series Operations
-    # ==========================================================================
+    def scan_page(
+        self,
+        collection_id: str,
+        *,
+        filter=None,
+        limit: int | None = None,
+        cursor: str | None = None,
+        include_vectors: bool = False,
+        include_text: bool = False,
+    ):
+        """Scan one page via the protocol client's REST-only scan endpoint
+        (note the protocol surface's SINGULAR ``include_vector``)."""
+        return self._client.scan_records(
+            collection_id,
+            filter=filter,
+            limit=limit,
+            cursor=cursor,
+            include_vector=include_vectors,
+            include_text=include_text,
+        )
+
+    def search_envelope(
+        self,
+        collection_id: str,
+        vector,
+        top_k: int = 10,
+        include_vectors: bool = False,
+        include_metadata: bool = True,
+        **kwargs,
+    ) -> Any:
+        """Run the first-page search envelope via the protocol client
+        (returns ``models.SearchEnvelope``; cursored continuation is
+        :meth:`search_next_page`)."""
+        return self._client.search_envelope(
+            collection_id=collection_id,
+            vector=vector,
+            top_k=top_k,
+            include_vectors=include_vectors,
+            include_metadata=include_metadata,
+            **kwargs,
+        )
+
+    def search_next_page(
+        self,
+        collection_id: str,
+        cursor: str,
+        include_vectors: bool = False,
+        include_metadata: bool = True,
+        **kwargs,
+    ) -> Any:
+        """Fetch the next SKS search page by cursor (the protocol
+        surface's continuation primitive; ``search_envelope`` takes no
+        cursor parameter)."""
+        return self._client.search_next_page(
+            collection_id,
+            cursor,
+            include_vectors=include_vectors,
+            include_metadata=include_metadata,
+            **kwargs,
+        )
+
+    def execute_sql(
+        self,
+        query: str,
+        parameters: list[Any] | None = None,
+        collection: str | None = None,
+        **kwargs,
+    ) -> dict[str, Any]:
+        """Execute SQL (spec-driven op; replaces v1's dead ``_session`` path).
+
+        ``parameters`` is rejected on REST: the server's SQL contract
+        deliberately does not advertise parameter binding yet ("callers
+        must not be offered a field that an adapter would silently
+        ignore"); the embedded adapter honors it.
+        """
+        from .._generated.rest.api.sql.execute_sql import sync_detailed
+        from .._generated.rest.models.sql_request import SqlRequest
+        from .._generated_op_exec import execute_generated_op
+
+        if parameters is not None:
+            raise NotImplementedError(
+                "execute_sql(parameters) is not supported by the REST op "
+                "(the server's SQL contract does not advertise parameter "
+                "binding); the embedded adapter honors parameters"
+            )
+        payload: dict[str, Any] = {"query": query}
+        if collection is not None:
+            payload["collection"] = collection
+        return execute_generated_op(
+            "execute_sql",
+            lambda: sync_detailed(
+                client=self._get_generated_document_client(),
+                body=SqlRequest.from_dict(payload),
+            ),
+        )
 
     def create_timeseries_collection(
         self, name: str, config: dict[str, Any] | None = None, **kwargs
     ) -> dict[str, Any]:
-        """Create a time-series collection via REST."""
-        try:
+        """Create a time-series collection (spec-driven op)."""
+        from .._generated.rest.api.timeseries.create_timeseries_collection import (
+            sync_detailed,
+        )
+        from .._generated.rest.models.ts_collection_config import TsCollectionConfig
+        from .._generated_op_exec import execute_generated_op
 
-            response = self._client._session.post(
-                f"{self._url}/api/v2/timeseries/collections",
-                json={"name": name, **(config or {})},
-                timeout=self._client._timeout,
-            )
-            response.raise_for_status()
-            return response.json()
-        except Exception as e:
-            logger.error(f"Failed to create time-series collection: {e}")
-            raise
+        # The positional ``name`` is authoritative; config keys (known or
+        # additional) ride the model's additional_properties. The body
+        # builds INSIDE the executed callable so a malformed config (a
+        # TsValueColumn missing its required `name`, say) maps to
+        # ProximaDBError, not a raw KeyError.
+        return execute_generated_op(
+            "create_timeseries_collection",
+            lambda: sync_detailed(
+                client=self._get_generated_document_client(),
+                body=TsCollectionConfig.from_dict(
+                    {
+                        "name": name,
+                        **{k: v for k, v in (config or {}).items() if k != "name"},
+                    }
+                ),
+            ),
+        )
 
     def ingest_timeseries(
         self, collection_name: str, points: list[dict[str, Any]], **kwargs
     ) -> dict[str, Any]:
-        """Ingest time-series data points via REST."""
-        try:
+        """Ingest time-series data points (spec-driven op)."""
+        from .._generated.rest.api.timeseries.ingest_timeseries import sync_detailed
+        from .._generated.rest.models.ts_ingest_request import TsIngestRequest
+        from .._generated_op_exec import execute_generated_op
 
-            response = self._client._session.post(
-                f"{self._url}/api/v2/timeseries/collections/{collection_name}/ingest",
-                json={"points": points},
-                timeout=self._client._timeout,
-            )
-            response.raise_for_status()
-            return response.json()
-        except Exception as e:
-            logger.error(f"Failed to ingest time-series data: {e}")
-            raise
+        return execute_generated_op(
+            "ingest_timeseries",
+            lambda: sync_detailed(
+                collection_id=collection_name,
+                client=self._get_generated_document_client(),
+                body=TsIngestRequest.from_dict({"points": points}),
+            ),
+        )
 
     def query_timeseries(
         self,
         collection_name: str,
         start_time: str,
         end_time: str,
-        aggregation: str = "avg",
+        aggregation: str | None = None,
         bucket_ms: int | None = None,
         tag_filters: dict[str, str] | None = None,
         **kwargs,
     ) -> dict[str, Any]:
-        """Query time-series data with optional aggregation via REST."""
-        try:
+        """Query time-series data (spec-driven op).
 
-            body = {
-                "start_time": start_time,
-                "end_time": end_time,
-                "aggregation": aggregation,
-            }
-            if bucket_ms:
-                body["bucket_ms"] = bucket_ms
-            if tag_filters:
-                body["tag_filters"] = tag_filters
-            response = self._client._session.post(
-                f"{self._url}/api/v2/timeseries/collections/{collection_name}/query",
-                json=body,
-                timeout=self._client._timeout,
+        The spec's query window (``start_time``/``end_time``) is integer
+        epoch time; the v1-era ``str`` signature is preserved for
+        compatibility — pass what the server expects. REST does NOT
+        support ``aggregation``/``bucket_ms``/``tag_filters`` (the
+        server's query body declares only the window and limit, and
+        drops unknown fields) — passing any of them raises
+        NotImplementedError here rather than silently shipping ignored
+        keys. The EMBEDDED adapter honors all three.
+        """
+        from .._generated.rest.api.timeseries.query_timeseries import sync_detailed
+        from .._generated.rest.models.ts_query_request import TsQueryRequest
+        from .._generated_op_exec import execute_generated_op
+
+        if aggregation is not None or bucket_ms is not None or tag_filters is not None:
+            # The server's QueryRequest declares ONLY start_time/end_time/
+            # limit and serde DROPS unknown fields — shipping these would
+            # be a silent no-op (raw points, aggregation ignored). Raise
+            # the honest capability signal instead: v2 surfaces the typed
+            # ProximaDBNotSupportedError; v1's dispatch falls back to the
+            # in-memory repository, which honors them (its users' actual
+            # pre-batch behavior).
+            raise NotImplementedError(
+                "query_timeseries(aggregation/bucket_ms/tag_filters) is not "
+                "supported by the REST query op (the server drops unknown "
+                "fields); use the aggregate_timeseries op or the embedded/"
+                "local path"
             )
-            response.raise_for_status()
-            return response.json()
-        except Exception as e:
-            logger.error(f"Failed to query time-series data: {e}")
-            raise
+        payload: dict[str, Any] = {
+            "start_time": start_time,
+            "end_time": end_time,
+        }
+        if "limit" in kwargs:
+            payload["limit"] = kwargs["limit"]
+        return execute_generated_op(
+            "query_timeseries",
+            lambda: sync_detailed(
+                collection_id=collection_name,
+                client=self._get_generated_document_client(),
+                body=TsQueryRequest.from_dict(payload),
+            ),
+        )
 
     def list_timeseries_collections(self, **kwargs) -> list[dict[str, Any]]:
-        """List all time-series collections via REST."""
-        try:
+        """List all time-series collections (spec-driven op)."""
+        from .._generated.rest.api.timeseries.list_timeseries_collections import (
+            sync_detailed,
+        )
+        from .._generated_op_exec import execute_generated_op
 
-            response = self._client._session.get(
-                f"{self._url}/api/v2/timeseries/collections",
-                timeout=self._client._timeout,
-            )
-            response.raise_for_status()
-            return response.json().get("collections", [])
-        except Exception as e:
-            logger.error(f"Failed to list time-series collections: {e}")
-            return []
+        result = execute_generated_op(
+            "list_timeseries_collections",
+            lambda: sync_detailed(client=self._get_generated_document_client()),
+        )
+        collections = result.get("collections", [])
+        return collections if isinstance(collections, list) else []
 
     def delete_timeseries_collection(self, collection_name: str, **kwargs) -> bool:
-        """Delete a time-series collection via REST."""
-        try:
+        """Delete a time-series collection (spec-driven op; 404 → ``False``)."""
+        from .._generated.rest.api.timeseries.delete_timeseries_collection import (
+            sync_detailed,
+        )
+        from .._generated_op_exec import execute_generated_op
 
-            response = self._client._session.delete(
-                f"{self._url}/api/v2/timeseries/collections/{collection_name}",
-                timeout=self._client._timeout,
-            )
-            response.raise_for_status()
-            result = response.json()
-            return result.get("success", False)
-        except Exception as e:
-            logger.error(f"Failed to delete time-series collection: {e}")
-            return False
+        result = execute_generated_op(
+            "delete_timeseries_collection",
+            lambda: sync_detailed(
+                collection_id=collection_name,
+                client=self._get_generated_document_client(),
+            ),
+            not_found={"success": False},
+        )
+        return bool(result.get("success", False))
+
+    # ==========================================================================
+    # Observability Operations (TD-SDK-3 batch 3) — namespace/logs/metrics
+    # over the SPEC-DRIVEN generated ops; the TRACES family has no spec
+    # endpoints and deliberately stays on the base NotImplementedError
+    # defaults (embedded-only, exactly as v1 discloses).
+    # ==========================================================================
+
+    def create_observability_namespace(
+        self,
+        name: str,
+        retention_days: int | None = None,
+        **kwargs,
+    ) -> dict[str, Any]:
+        """Create an observability namespace (spec-driven op).
+
+        ``retention_days`` maps to the spec's ``hot_retention_days`` (the
+        closest single-knob semantic; warm/cold keep their spec defaults).
+        """
+        from .._generated.rest.api.observability.create_observability_namespace import (
+            sync_detailed,
+        )
+        from .._generated.rest.models.create_observability_namespace_request import (
+            CreateObservabilityNamespaceRequest,
+        )
+        from .._generated_op_exec import execute_generated_op
+
+        payload: dict[str, Any] = {"name": name}
+        if retention_days is not None:
+            payload["hot_retention_days"] = retention_days
+        return execute_generated_op(
+            "create_observability_namespace",
+            lambda: sync_detailed(
+                client=self._get_generated_document_client(),
+                body=CreateObservabilityNamespaceRequest.from_dict(payload),
+            ),
+        )
+
+    def ingest_logs(self, namespace: str, logs: list[dict[str, Any]], **kwargs) -> int:
+        """Ingest structured log events (spec-driven op; returns the count)."""
+        from .._generated.rest.api.observability.ingest_logs import sync_detailed
+        from .._generated.rest.models.bulk_log_ingest_request import (
+            BulkLogIngestRequest,
+        )
+        from .._generated_op_exec import execute_generated_op
+
+        result = execute_generated_op(
+            "ingest_logs",
+            lambda: sync_detailed(
+                namespace=namespace,
+                client=self._get_generated_document_client(),
+                body=BulkLogIngestRequest.from_dict({"logs": logs}),
+            ),
+        )
+        return int(result.get("ingested", 0))
+
+    def query_logs(
+        self,
+        namespace: str,
+        start_time_ns: int,
+        end_time_ns: int,
+        query: str | None = None,
+        limit: int = 100,
+        **kwargs,
+    ) -> list[dict[str, Any]]:
+        """Query log events (spec-driven op; the body model is open, all
+        filter fields ride its additional_properties)."""
+        from .._generated.rest.api.observability.query_logs import sync_detailed
+        from .._generated.rest.models.query_logs_body import QueryLogsBody
+        from .._generated_op_exec import execute_generated_op
+
+        payload: dict[str, Any] = {
+            "start_time_ns": start_time_ns,
+            "end_time_ns": end_time_ns,
+            "limit": limit,
+        }
+        if query is not None:
+            payload["query"] = query
+        result = execute_generated_op(
+            "query_logs",
+            lambda: sync_detailed(
+                namespace=namespace,
+                client=self._get_generated_document_client(),
+                body=QueryLogsBody.from_dict(payload),
+            ),
+        )
+        logs = result.get("logs", [])
+        return logs if isinstance(logs, list) else []
+
+    def ingest_metrics(
+        self, namespace: str, samples: list[dict[str, Any]], **kwargs
+    ) -> int:
+        """Ingest metric samples (spec-driven op; returns the count)."""
+        from .._generated.rest.api.observability.ingest_metrics import sync_detailed
+        from .._generated.rest.models.bulk_metric_ingest_request import (
+            BulkMetricIngestRequest,
+        )
+        from .._generated_op_exec import execute_generated_op
+
+        result = execute_generated_op(
+            "ingest_metrics",
+            lambda: sync_detailed(
+                namespace=namespace,
+                client=self._get_generated_document_client(),
+                body=BulkMetricIngestRequest.from_dict({"metrics": samples}),
+            ),
+        )
+        return int(result.get("ingested", 0))
+
+    def aggregate_metrics(
+        self,
+        namespace: str,
+        metric_name: str,
+        aggregation: str = "avg",
+        start_time: str | None = None,
+        end_time: str | None = None,
+        step_seconds: int = 60,
+        **kwargs,
+    ) -> list[dict[str, Any]]:
+        """Aggregate metrics (spec-driven op).
+
+        The spec's window is ``start_time_ns``/``end_time_ns`` (integer);
+        the v1-era ``str`` signature is preserved for compatibility — pass
+        epoch-ns integers for a real server.
+        """
+        from .._generated.rest.api.observability.aggregate_metrics import sync_detailed
+        from .._generated.rest.models.metric_aggregation_input import (
+            MetricAggregationInput,
+        )
+        from .._generated_op_exec import execute_generated_op
+
+        payload: dict[str, Any] = {
+            "metric_name": metric_name,
+            "aggregation": aggregation,
+            "step_seconds": step_seconds,
+        }
+        if start_time is not None:
+            payload["start_time_ns"] = start_time
+        if end_time is not None:
+            payload["end_time_ns"] = end_time
+        result = execute_generated_op(
+            "aggregate_metrics",
+            lambda: sync_detailed(
+                namespace=namespace,
+                client=self._get_generated_document_client(),
+                body=MetricAggregationInput.from_dict(payload),
+            ),
+        )
+        series = result.get("series", [])
+        return series if isinstance(series, list) else []
+
+    # ==========================================================================
+    # Graph Operations (TD-SDK-3 batch 1)
+    #
+    # The 10 CRUD/traversal delegations shared with gRPC live once in
+    # SyncGraphDelegations (listed first in the bases so its concrete
+    # methods win over the base-class defaults). REST-specific below:
+    # graph-collection management and the analytics pair (prefetch overrides
+    # travel as headers to keep the body stable).
+    # ==========================================================================
+
+    def create_graph(
+        self,
+        graph_id: str,
+        name: str | None = None,
+        description: str | None = None,
+        schema: dict[str, Any] | None = None,
+        **kwargs,
+    ) -> dict[str, Any]:
+        """Create a graph collection via REST."""
+        return self._client.create_graph(
+            graph_id=graph_id,
+            name=name,
+            description=description,
+            schema=schema,
+        )
+
+    def delete_graph(self, graph_id: str, **kwargs) -> dict[str, Any]:
+        """Delete a graph collection via REST."""
+        return self._client.delete_graph(graph_id=graph_id)
+
+    def get_graph(self, graph_id: str, **kwargs) -> dict[str, Any]:
+        """Get graph-collection metadata via REST."""
+        return self._client.get_graph(graph_id=graph_id)
+
+    def list_graphs(self, **kwargs) -> dict[str, Any]:
+        """List all graph collections via REST."""
+        return self._client.list_graphs()
+
+    def get_graph_stats(self, graph_id: str, **kwargs) -> dict[str, Any]:
+        """Get statistics for a graph collection via REST."""
+        return self._client.get_graph_stats(graph_id=graph_id)
+
+    def graph_shortest_path(
+        self,
+        start_node_id: str,
+        target_node_id: str,
+        max_depth: int | None = None,
+        edge_types: list[str] | None = None,
+        algorithm: str = "DIJKSTRA",
+        k: int | None = None,
+        enable_prefetch: bool | None = None,
+        prefetch_budget: int | None = None,
+        timeout: float | None = None,
+        graph_id: str = "default",
+        **kwargs,
+    ) -> dict[str, Any]:
+        """Compute shortest path(s) via REST (prefetch overrides as headers)."""
+        return self._client.graph_shortest_path(
+            start_node_id,
+            target_node_id,
+            max_depth,
+            edge_types,
+            algorithm,
+            k,
+            enable_prefetch,
+            prefetch_budget,
+            timeout=timeout,
+            graph_id=graph_id or "default",
+        )
+
+    def graph_traverse(
+        self,
+        start_node_id: str,
+        max_depth: int = 3,
+        edge_types: list[str] | None = None,
+        algorithm: str = "BFS",
+        limit: int | None = None,
+        timeout_ms: int | None = None,
+        max_frontier: int | None = None,
+        enable_prefetch: bool | None = None,
+        prefetch_budget: int | None = None,
+        timeout: float | None = None,
+        graph_id: str = "default",
+        **kwargs,
+    ) -> dict[str, Any]:
+        """Tuned traversal via REST (overrides as headers).
+
+        Unlike the v1 wrapper, ``graph_id`` is honored (the transport has
+        accepted it since TD-SDKDOC-1; v1 dropped it, running every tuned
+        traversal on ``default``).
+        """
+        return self._client.graph_traverse(
+            start_node_id,
+            max_depth,
+            edge_types,
+            algorithm,
+            limit,
+            timeout_ms,
+            max_frontier,
+            enable_prefetch,
+            prefetch_budget,
+            timeout=timeout,
+            graph_id=graph_id or "default",
+        )
 
     # ==========================================================================
     # Lifecycle Methods
@@ -974,4 +1471,15 @@ class RestProtocolAdapter(BaseProtocolAdapter):
         """Close the REST client connection."""
         if hasattr(self._client, "close"):
             self._client.close()
+        # The shared generated document client's httpx pool is only
+        # materialized once an op ran; close it so adapters don't leak a
+        # connection pool until GC.
+        if self._generated_document_client is not None:
+            try:
+                self._generated_document_client.get_httpx_client().close()
+            except Exception as e:  # closing is best-effort
+                logger.debug(f"Could not close generated document client: {e}")
+            # Reset so a later op builds a fresh client instead of hitting
+            # httpx's raw use-after-close RuntimeError.
+            self._generated_document_client = None
         self._connected = False

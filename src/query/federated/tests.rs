@@ -28,7 +28,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 struct MockVectorEngine {
-    filesystem_factory: FilesystemFactory,
+    _filesystem_factory: FilesystemFactory,
     results: Vec<OptimizedSearchRecord>,
     query_vectors: Mutex<Vec<Vec<f32>>>,
     storage_urls: Mutex<Vec<String>>,
@@ -40,7 +40,7 @@ impl MockVectorEngine {
             .await
             .expect("mock vector engine should create filesystem factory");
         Self {
-            filesystem_factory,
+            _filesystem_factory: filesystem_factory,
             results,
             query_vectors: Mutex::new(Vec::new()),
             storage_urls: Mutex::new(Vec::new()),

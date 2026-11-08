@@ -1,0 +1,60 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-SCANDEG-1: The S2b in-flight back-off is not acquired on the production search entry
+:status: Open
+:date: 2026-11-06
+:tags: [search, concurrency, investigate-first]
+
+== Verified facts
+
+* `resolve_search_parallelism` consults `IN_FLIGHT_SEARCHES`, incremented only
+  by `InFlightSearchGuard`, acquired only in `search_vectors_unified_arc_inner`.
+* No production request reaches that arc entry. Its callers are
+  `SearchCoordinator` (constructed only in `coordinator.rs`'s own tests) and
+  tests that call `search_vectors_unified_arc` / `fallback_to_direct_search_arc`
+  directly. Production enters `SstEngine` → `search_vectors_unified` →
+  `direct_search_with`, which never acquires the guard.
+* On the production entry the computed degree does NOT bound the scan: it
+  only selects `enable_parallel = degree > 1`, after which every discovered
+  file is driven with `join_all` on one task. So the S2b division, even if
+  wired, would change behaviour only by flipping that boolean.
+* The arc entry's doc comment called it the "Arc-receiver production entry";
+  corrected (2026-11-06, with the S2b and `search_parallel_files` comments
+  and config docs, which also described arc-only behaviour as production).
+  That mislabel made an attempted fix target the wrong entry (#2442).
+
+== Why there is no fix here
+
+The production fan-out semantics differ from what S2b assumed. Whether any
+in-flight back-off helps that path is an open question; changing it is a
+posture decision that needs measurement first.
+
+== To close — investigate, then decide
+
+1. Characterise the production fan-out under load: how many per-file
+   futures are polled concurrently, and what concurrency the object store
+   and CPU actually see, at client concurrency 1/4/8, cold and warm.
+2. Decide from that data whether the production entry needs any bound.
+3. Consolidate the duplicated entries (`search_vectors_unified` / `_arc`,
+   `direct_search_with` / `direct_search_arc_with`). Port every test that
+   calls the arc entry directly to the survivor first, because those tests are
+   the only coverage of their behaviour: the S2 degree-1-vs-parallel
+   equivalence test, `ttl_expired_pax_rows_never_return_live` (a Mandate-16a
+   regression test that today exercises ONLY the test-only entry),
+   `cascade_rehydrate_reuses_the_top_k_block_fetch`, the arc half of
+   `deferred_rehydrate_matches_per_segment`, and
+   `centroid_directory_search_test.rs`.
+4. DONE 2026-11-06 — Enforce, don't describe: make the arc entry and the re-exported
+   `SearchCoordinator` `pub(crate)` / `#[cfg(test)]` so nothing new wires
+   into the drifted copy of the direct-search loop.
+5. DONE 2026-11-06 — Give the PRODUCTION entry its own Mandate-16a regression test:
+   `ttl_expired_pax_rows_never_return_live` runs only the arc entry; loop it
+   over both entries, as `deferred_rehydrate_matches_per_segment` already does.
+
+Related: TD-SEARCH-2 (whose S2/S2b status this corrects), TD-SCANDEG-2, TD-SCANDEG-3.
+
+Follow-ups 4 and 5 landed together: the arc entry, its helpers
+(`scan_single_file`, `InFlightSearchGuard`) and `SearchCoordinator` are now
+`#[cfg(test)]` (they had no non-test caller; `pub(crate)` alone would have
+failed clippy as dead code), and `ttl_expired_pax_rows_never_return_live`
+runs both entries. Steps 1-3 remain open.

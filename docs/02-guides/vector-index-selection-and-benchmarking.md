@@ -378,9 +378,11 @@ table's own `Source` column.
   `PROXIMADB_OBJECT_STORE_URL`, so that arm has never run in CI.
   Treat it as indicative and re-measure on your own account. (That gap is part of
   what TD-VECEVAL-1 covers.)
-* The harness forces `PROXIMADB_PAX_F32_TIER=1`, which is **default-OFF**
-  (`ENV_GATE_REGISTRY.adoc`) and changes which stripes a segment emits — so no
-  row here is stock defaults, and that gate moves the very bytes/query and
+* The harness forces `PROXIMADB_PAX_F32_TIER=1`. The tier itself has been on
+  by default since 2026-10-30 (`ENV_GATE_REGISTRY.adoc`), but an *explicit*
+  setting also lets small collections take the Adaptive exact-scan route,
+  which stock defaults do not (the default tier is storage-only). So no row
+  here is stock defaults, and that setting moves the very bytes/query and
   bytes/GET columns. Note also that **`[baseline]` additionally sets
   `PROXIMADB_PAX_WRITE_RG_LAYOUT=0`**, disabling a shipped default; that is the
   point of the row, and its label says so.

@@ -1,6 +1,6 @@
 [package]
 name = "proximadb"
-version = "0.5.1"
+version = "0.6.0"
 edition = "2024"
 autobenches = false
 authors = ["Vijaykumar Singh <vijay@anvaiops.com>"]
@@ -174,7 +174,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.5.1"
+version = "0.6.0"
 edition = "2024"
 rust-version = "1.95"
 license = "Apache-2.0"
@@ -396,6 +396,10 @@ faer = { version = "0.24", default-features = false, features = ["std"] }
 statrs = "0.19"
 
 # Python embedded library (cdylib for PyO3)
+# Dev-only HTTP mocking (root integration tests + the Rust SDK contract gate,
+# clients/rust/tests/openapi_contract.rs). Declared HERE so both crates
+# inherit one version (#2430 review).
+httpmock = "0.9"
 [lib]
 name = "proximadb"
 # Default: rlib only (for testing and normal Rust usage)
@@ -574,7 +578,7 @@ proximadb-query-filter = { path = "crates/query/proximadb-query-filter" }
 proximadb-uql = { path = "crates/query/proximadb-uql" }
 proximadb-vector-query = { path = "crates/query/proximadb-vector-query" }
 # Extracted from src/services/catalog_introspection.rs (re-export shim keeps callers stable).
-proximadb-catalog-introspection = { version = "0.5.1", path = "crates/binding/proximadb-catalog-introspection" }
+proximadb-catalog-introspection = { version = "0.6.0", path = "crates/binding/proximadb-catalog-introspection" }
 
 # SQL Parsing
 sqlparser = { version = "0.62", features = ["visitor"] }
@@ -798,10 +802,10 @@ moka = { version = "0.12", features = ["future"] }
 # Provides direct buffer access to numpy arrays without Python .tolist() conversion
 # Java bindings via JNI
 # Node.js bindings via NAPI-RS
-proximadb-raptor-common = { version = "0.5.1", path = "crates/storage/proximadb-raptor-common" }
-proximadb-raptor-engine = { version = "0.5.1", path = "crates/storage/proximadb-raptor-engine" }
-proximadb-engine-core = { version = "0.5.1", path = "crates/storage/proximadb-engine-core" }
-proximadb-mongodb-parser = { version = "0.5.1", path = "crates/binding/proximadb-mongodb-parser" }
+proximadb-raptor-common = { version = "0.6.0", path = "crates/storage/proximadb-raptor-common" }
+proximadb-raptor-engine = { version = "0.6.0", path = "crates/storage/proximadb-raptor-engine" }
+proximadb-engine-core = { version = "0.6.0", path = "crates/storage/proximadb-engine-core" }
+proximadb-mongodb-parser = { version = "0.6.0", path = "crates/binding/proximadb-mongodb-parser" }
 
 # GPU acceleration dependencies (platform-specific)
 [target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
@@ -819,6 +823,7 @@ tracing-subscriber = "0.3"
 
 # Development dependencies
 [dev-dependencies]
+proximadb-records = { path = "crates/foundation/proximadb-records", features = ["test-support"] }
 criterion = { version = "0.5", features = ["async_tokio"] }
 proptest = "1.0"
 # In-process gather of the default prometheus registry where the per-tenant
@@ -841,11 +846,16 @@ proximadb-sdk = { path = "clients/rust", default-features = false, features = ["
 # and tests/connectors_flight_contract.rs). httpmock is the same crate the SDK
 # gate uses at clients/rust/tests/openapi_contract.rs; serde_yaml lets the
 # gates load docs/openapi/proximadb-openapi.yaml directly.
-httpmock = "0.7"
+httpmock.workspace = true
 serde_yaml = "0.9"
 # Test-only: integration tests use EmbeddedProximaDB from the embedded crate.
 # Dev-deps don't create build cycles (test-mode only).
 proximadb-embedded = { path = "crates/binding/proximadb-embedded" }
+# `cargo test --lib` runs every unit test in ONE process, so tests that mutate
+# process-global state (env gates, global counters, fault injection) must be
+# mutually serialized; nextest isolates them per process but the plain
+# libtest runner does not. `#[serial]` gives those tests one shared lock.
+serial_test = "3"
 
 [features]
 # Default feature set as of 2026-05-26 (ADR-020 Tier 2.2 / TD-065 default-enable).
@@ -940,7 +950,13 @@ onnx = [
 # Cloud storage features (optional to avoid linking issues during testing)
 aws = ["object_store/aws", "proximadb-catalog/aws"]
 azure = ["object_store/azure"]
-gcp = ["dep:google-cloud-storage", "dep:google-cloud-auth", "dep:http", "dep:crc32c"]
+gcp = [
+  "dep:google-cloud-storage",
+  "dep:google-cloud-auth",
+  "dep:http",
+  "dep:crc32c",
+  "proximadb-object-store/gcp",
+]
 
 # TD-161 external OTLP metering push (default-OFF). Compiles the OTLP exporter that
 # ships the per-tenant metering snapshot to a collector; runtime-gated additionally by
@@ -1407,6 +1423,12 @@ path = "benches/bench_24_recall_at_k_engine.rs"
 name = "bench_25_search_get_count"
 harness = false
 path = "benches/bench_25_search_get_count.rs"
+
+# Value codec: one-pass visitor vs old Value-first DOM path (indicative).
+[[bench]]
+name = "bench_value_codec"
+harness = false
+path = "benches/bench_value_codec.rs"
 
 # ============================================================================
 # BUILD OPTIMIZATION STRATEGY

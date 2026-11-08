@@ -72,15 +72,10 @@ fn cache() -> &'static RwLock<HashMap<Key, Arc<TableOpenDiscovery>>> {
     CACHE.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
-/// Whether the table-OPEN cache is enabled (`PROXIMADB_OLAP_TABLE_CACHE=1`).
-/// Default-OFF; evaluated once.
-pub fn enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("PROXIMADB_OLAP_TABLE_CACHE")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false)
-    })
+proximadb_config::env_gate! {
+    /// Whether the table-OPEN cache is enabled (`PROXIMADB_OLAP_TABLE_CACHE=1`).
+    /// Default-OFF; evaluated once.
+    pub fn enabled() { gate: "PROXIMADB_OLAP_TABLE_CACHE", default: false }
 }
 
 fn key(tenant: Option<&str>, location: &str) -> Key {

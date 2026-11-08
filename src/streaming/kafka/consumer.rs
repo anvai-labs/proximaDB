@@ -23,6 +23,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use proximadb_records::conversions::json_to_proxima;
+
 use tokio::sync::{RwLock, mpsc};
 use tracing::{debug, info};
 
@@ -326,7 +328,7 @@ impl KafkaVectorConsumer {
                 let dim = v.vector.len() as u32;
                 let mut props = proximadb_records::ProximaTree::new();
                 for (k, jv) in v.metadata {
-                    let pv = json_to_proxima_value(&jv);
+                    let pv = json_to_proxima(&jv);
                     props.insert(k, proximadb_records::ProximaTreeNode::Value(pv));
                 }
                 let ts_ns = v
@@ -381,22 +383,6 @@ impl KafkaVectorConsumer {
     /// Check if consumer is running
     pub fn is_running(&self) -> bool {
         self.running.load(Ordering::Relaxed)
-    }
-}
-
-/// Convert serde_json Value to ProximaValue at the protocol boundary
-fn json_to_proxima_value(v: &serde_json::Value) -> proximadb_data_model::ProximaValue {
-    match v {
-        serde_json::Value::String(s) => proximadb_data_model::ProximaValue::String(s.clone()),
-        serde_json::Value::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                proximadb_data_model::ProximaValue::Int64(i)
-            } else {
-                proximadb_data_model::ProximaValue::Float64(n.as_f64().unwrap_or(0.0))
-            }
-        }
-        serde_json::Value::Bool(b) => proximadb_data_model::ProximaValue::Boolean(*b),
-        _ => proximadb_data_model::ProximaValue::String(v.to_string()),
     }
 }
 

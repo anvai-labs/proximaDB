@@ -4,15 +4,14 @@
 //! The strong-consistency read path produces two candidate sets per
 //! query:
 //!
-//! 1. `directory_results` — records selected by the
-//!    [`VectorObjectEconomyDirectory`](crate::storage::engines::sst::object_economy_directory::VectorObjectEconomyDirectory)-routed
-//!    search over committed-and-flushed SST blocks. These are visible
-//!    up to the directory's `freshness_watermark_lsn`.
+//! 1. `directory_results` — the engine's results over committed-and-flushed
+//!    segments. (The name predates TD-OEDIRWM-1: no object-economy
+//!    directory routes this search any more.)
 //! 2. `delta_results` — records returned by
 //!    [`scan_wal_delta_if_needed`](crate::services::operations::vectors::VectorOperationsService::scan_wal_delta_if_needed)
-//!    for the WAL/memtable region committed after the watermark.
-//!    Tombstones in this set are marked with an empty `vector` plus a
-//!    set `expires_at`.
+//!    for the unflushed WAL/memtable region.
+//!    Tombstones in this set carry `valid_to_ns == Some(0)` (see
+//!    `is_wal_tombstone`; never infer them from `expires_at`).
 //!
 //! [`merge_delta_with_directory_results`] combines the two with these
 //! rules:

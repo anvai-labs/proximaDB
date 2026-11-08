@@ -27,7 +27,11 @@ logging.basicConfig(
 # Test configuration
 TEST_CONFIG = {
     "rest_endpoint": "http://localhost:5678",
-    "grpc_endpoint": "grpc://localhost:5679",
+    # gRPC is multiplexed on the unified 5678 port (not port+1). The old 5679
+    # endpoint only "worked" because the v1 client silently failed over when
+    # the gRPC dial was refused; the v2 client surfaces the misconfiguration
+    # honestly (TD-SDK-3 swap).
+    "grpc_endpoint": "grpc://localhost:5678",
     "default_timeout": 30.0,
     "max_retry_attempts": 3,
     "test_collection_prefix": "pytest_",

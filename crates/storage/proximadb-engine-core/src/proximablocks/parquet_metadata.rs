@@ -12,6 +12,8 @@ use proximadb_storage_common::zero_copy_traits::{
 use proximadb_kernel::error::ProximaDBError;
 use proximadb_storage_ports::FilesystemPort;
 
+use super::utilities::stable_id_hash;
+
 /// Parquet Footer metadata (fixed size, bytemuck-compatible)
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
@@ -930,12 +932,7 @@ impl MetadataSerializer for ParquetMetadataSerializer {
 
     // Helper methods
     fn hash_string(&self, s: &str) -> u64 {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-
-        let mut hasher = DefaultHasher::new();
-        s.hash(&mut hasher);
-        hasher.finish()
+        stable_id_hash(s)
     }
 }
 

@@ -65,7 +65,7 @@ use proximadb::storage::traits::{
     FlushParameters, StorageQueryContext, StorageQueryMetadata, UnifiedStorageEngine,
 };
 use proximadb_block_format::{RankMetric, VectorQuant};
-use proximadb_records::{EmbeddingCell, EmbeddingValues, ProximaRecord};
+use proximadb_records::{EmbeddingCell, ProximaRecord};
 use rayon::prelude::*;
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -372,6 +372,7 @@ async fn flush_batch(engine: &SstEngine, collection: &Collection, batch: Vec<Vec
         batch_ids: vec![],
         collection_config: Some(collection.clone()),
         estimated_size: 0,
+        collection_properties: None,
     };
     let result = engine.do_flush(&params).await.expect("flush succeeds");
     assert!(result.success, "flush should succeed");
@@ -1168,10 +1169,7 @@ async fn sift_coalesced_rabitq_scan_rerank_eval() {
         "sift_coalesced_eval",
         temp_dir.path().to_string_lossy().into_owned(),
     );
-    let engine = SstEngine::new().await.unwrap()
-        .with_directory_cache(Arc::new(
-            proximadb::storage::engines::sst::object_economy_directory::VectorObjectEconomyDirectoryCache::new(),
-        ));
+    let engine = SstEngine::new().await.unwrap();
     // ADR-065 Q3: opt-in ranged survivor/OID cache. Set
     // PROXIMADB_SURVIVOR_CACHE_BUDGET_MB (default unset → uncached baseline) to
     // measure the GET/bytes win on the repeated-query working set.

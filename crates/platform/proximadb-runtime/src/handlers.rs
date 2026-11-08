@@ -14,10 +14,8 @@
 //! TD-104 S3-f — every REST/gRPC/Arrow/pgwire/embedded surface now routes
 //! through this handler, which delegates to injected service ports.
 
-use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::Instant;
 
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
@@ -37,94 +35,6 @@ use crate::port::{
 use crate::service_ports::{
     CollectionPort, PortIdentity, QueryAdapterPort, SqlExecutionResult, VectorOpsPort,
 };
-
-/// Global request counter for generating unique request IDs.
-static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-/// Generate a 16-char hex request ID (8 chars timestamp + 8 chars counter).
-pub fn generate_request_id() -> String {
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u32)
-        .unwrap_or(0);
-    let counter = REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed) as u32;
-    format!("{:08x}{:08x}", timestamp, counter)
-}
-
-// ── Collection ID cache ───────────────────────────────────────────────────────
-
-const COLLECTION_ID_CACHE_TTL_SECS: u64 = 300;
-const COLLECTION_ID_CACHE_MAX_SIZE: usize = 1000;
-
-#[derive(Clone)]
-struct CollectionIdCacheEntry {
-    collection_id: String,
-    cached_at: Instant,
-}
-
-/// Thread-safe TTL-based cache for collection ID resolution.
-///
-/// Reduces metadata backend lookups from ~5 ms/request to ~0.1 ms on cache hits.
-pub struct CollectionIdCache {
-    cache: std::sync::RwLock<HashMap<String, CollectionIdCacheEntry>>,
-    ttl: Duration,
-    max_size: usize,
-}
-
-impl CollectionIdCache {
-    pub fn new() -> Self {
-        Self {
-            cache: std::sync::RwLock::new(HashMap::new()),
-            ttl: Duration::from_secs(COLLECTION_ID_CACHE_TTL_SECS),
-            max_size: COLLECTION_ID_CACHE_MAX_SIZE,
-        }
-    }
-
-    pub fn get(&self, collection_name: &str) -> Option<String> {
-        let cache = self.cache.read().ok()?;
-        let entry = cache.get(collection_name)?;
-        if entry.cached_at.elapsed() > self.ttl {
-            return None;
-        }
-        Some(entry.collection_id.clone())
-    }
-
-    pub fn put(&self, collection_name: String, collection_id: String) {
-        if let Ok(mut cache) = self.cache.write() {
-            let now = Instant::now();
-            cache.retain(|_, entry| now.duration_since(entry.cached_at) < self.ttl);
-            while cache.len() >= self.max_size {
-                let oldest_key = cache
-                    .iter()
-                    .min_by_key(|(_, entry)| entry.cached_at)
-                    .map(|(key, _)| key.clone());
-                if let Some(key) = oldest_key {
-                    cache.remove(&key);
-                } else {
-                    break;
-                }
-            }
-            cache.insert(
-                collection_name,
-                CollectionIdCacheEntry {
-                    collection_id,
-                    cached_at: now,
-                },
-            );
-        }
-    }
-}
-
-impl Default for CollectionIdCache {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-// ── Placeholder for hybrid runtime config ─────────────────────────────────────
-
-/// Placeholder for hybrid runtime configuration (weights, seeding).
-pub struct HybridRuntimeConfig;
 
 // ── UnifiedHandlers ───────────────────────────────────────────────────────────
 
@@ -157,10 +67,6 @@ pub struct UnifiedHandlers {
     pub vector_ops: Arc<dyn VectorOpsPort>,
     /// Optional unified query facade for SQL / hybrid routing.
     pub query_adapter: Option<Arc<dyn QueryAdapterPort>>,
-    /// Optional hybrid runtime configuration.
-    pub hybrid_runtime: Arc<std::sync::RwLock<Option<HybridRuntimeConfig>>>,
-    /// Cache for collection ID resolution.
-    pub collection_id_cache: CollectionIdCache,
 }
 
 impl UnifiedHandlers {
@@ -174,9 +80,22 @@ impl UnifiedHandlers {
             collection,
             vector_ops,
             query_adapter,
-            hybrid_runtime: Arc::new(std::sync::RwLock::new(None)),
-            collection_id_cache: CollectionIdCache::new(),
         }
+    }
+}
+
+/// TD-COLLTIME-1: `Collection.created_at`/`updated_at` are Unix epoch
+/// MILLISECONDS, but collections created before the unit fix carry
+/// MICROseconds (the manager and engine paths wrote `timestamp_micros()`).
+/// A millisecond epoch is ~1.7-2.0e12 today; a microsecond epoch is ~1000x
+/// that — anything above 1e14 is unambiguously microseconds, and normalizing
+/// on read makes stored pre-fix collections render correctly without a
+/// migration (pre-GA: no back-compat gate, per the 2026-07-14 directive).
+pub fn normalize_epoch_ms(value: i64) -> i64 {
+    if value > 100_000_000_000_000 {
+        value / 1000
+    } else {
+        value
     }
 }
 
@@ -184,8 +103,8 @@ fn schema_metadata_from_collection(collection: &Collection) -> CollectionSchemaM
     let Some(config) = collection.config.as_ref() else {
         return CollectionSchemaMetadata {
             collection_id: collection.id.clone(),
-            created_at_ms: collection.created_at,
-            updated_at_ms: collection.updated_at,
+            created_at_ms: normalize_epoch_ms(collection.created_at),
+            updated_at_ms: normalize_epoch_ms(collection.updated_at),
             ..CollectionSchemaMetadata::default()
         };
     };
@@ -246,8 +165,8 @@ fn schema_metadata_from_collection(collection: &Collection) -> CollectionSchemaM
     let record_schema = config.record_schema.as_ref();
     CollectionSchemaMetadata {
         collection_id: collection.id.clone(),
-        created_at_ms: collection.created_at,
-        updated_at_ms: collection.updated_at,
+        created_at_ms: normalize_epoch_ms(collection.created_at),
+        updated_at_ms: normalize_epoch_ms(collection.updated_at),
         schema_id: record_schema.map(|schema| schema.schema_id.clone()),
         schema_version: record_schema.map(|schema| schema.schema_version.clone()),
         enforcement: record_schema.map(|schema| enforcement_from_i32(schema.enforcement)),
@@ -704,6 +623,19 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
+    #[test]
+    fn normalize_epoch_ms_converts_stored_microsecond_values() {
+        // TD-COLLTIME-1: pre-fix writers stored microseconds; anything above
+        // 1e14 is unambiguously µs and is divided to milliseconds, while
+        // correct millisecond values (and 0/negative sentinels) pass through.
+        let ms_now = 1_735_000_000_123_i64; // ~2024-11, epoch ms
+        assert_eq!(normalize_epoch_ms(ms_now), ms_now);
+        assert_eq!(normalize_epoch_ms(0), 0);
+        assert_eq!(normalize_epoch_ms(-1), -1);
+        let us_now = ms_now * 1000; // the same instant, stored in µs
+        assert_eq!(normalize_epoch_ms(us_now), ms_now);
+    }
+
     use proximadb_proto::v1::{Collection, CollectionConfig, VectorRecord, sql_value};
     use serde_json::json;
 
@@ -931,38 +863,6 @@ mod tests {
             }),
             ..CollectionRequest::default()
         }
-    }
-
-    #[test]
-    fn request_ids_are_hex_length_stable_and_collection_id_cache_handles_ttl_and_eviction() {
-        let first = generate_request_id();
-        let second = generate_request_id();
-        assert_eq!(first.len(), 16);
-        assert!(first.chars().all(|c| c.is_ascii_hexdigit()));
-        assert_ne!(first, second);
-
-        let cache = CollectionIdCache::new();
-        cache.put("docs".to_string(), "docs-id".to_string());
-        assert_eq!(cache.get("docs").as_deref(), Some("docs-id"));
-        assert_eq!(CollectionIdCache::default().get("missing"), None);
-
-        let expiring = CollectionIdCache {
-            cache: std::sync::RwLock::new(HashMap::new()),
-            ttl: Duration::from_nanos(0),
-            max_size: 1,
-        };
-        expiring.put("old".to_string(), "old-id".to_string());
-        assert_eq!(expiring.get("old"), None);
-
-        let bounded = CollectionIdCache {
-            cache: std::sync::RwLock::new(HashMap::new()),
-            ttl: Duration::from_secs(60),
-            max_size: 1,
-        };
-        bounded.put("a".to_string(), "a-id".to_string());
-        bounded.put("b".to_string(), "b-id".to_string());
-        assert_eq!(bounded.get("a"), None);
-        assert_eq!(bounded.get("b").as_deref(), Some("b-id"));
     }
 
     #[tokio::test]

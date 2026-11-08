@@ -56,3 +56,61 @@ pub use updater::{
 
 pub use proximadb_config::MetricsConfig;
 pub use proximadb_metrics::exporters::MetricsExportSnapshot;
+
+/// TD-LEASE-2: outcomes of a lost version CAS in the partition-lease store's
+/// claim loop. `own_adopted` = a same-pod race settled as renewal (the
+/// 2026-11-01 mid-ingest failure class); `dead_winner_retry` = the winner was
+/// expired and the claim retried; `foreign_fenced` = a live foreign lease
+/// (or an uncommittable claim) fenced this pod.
+pub fn record_lease_conflict_resolution(resolution: &str) {
+    if let Some(family) = LEASE_CONFLICT_RESOLUTIONS.as_ref() {
+        family.with_label_values(&[resolution]).inc();
+    }
+}
+
+lazy_static::lazy_static! {
+    static ref LEASE_CONFLICT_RESOLUTIONS: Option<prometheus::IntCounterVec> = {
+        use prometheus::{IntCounterVec, Opts};
+        match IntCounterVec::new(
+            Opts::new(
+                "proximadb_lease_conflict_resolutions_total",
+                "Lost version CAS outcomes in the partition-lease claim loop (TD-LEASE-2)",
+            ),
+            &["resolution"],
+        ) {
+            Ok(metric) => {
+                let _ = prometheus::register(Box::new(metric.clone()));
+                Some(metric)
+            }
+            Err(_) => None,
+        }
+    };
+}
+
+/// TD-LEASE-2: write-gate rejections at the lease-on-write boundary
+/// (`record_ops_service`), by reason — the client-visible failure the
+/// conflict-resolution counter explains.
+pub fn record_write_gate_rejection(reason: &str) {
+    if let Some(family) = WRITE_GATE_REJECTIONS.as_ref() {
+        family.with_label_values(&[reason]).inc();
+    }
+}
+
+lazy_static::lazy_static! {
+    static ref WRITE_GATE_REJECTIONS: Option<prometheus::IntCounterVec> = {
+        use prometheus::{IntCounterVec, Opts};
+        match IntCounterVec::new(
+            Opts::new(
+                "proximadb_write_gate_rejections_total",
+                "Write batches rejected by the lease-on-write gate (TD-LEASE-2)",
+            ),
+            &["reason"],
+        ) {
+            Ok(metric) => {
+                let _ = prometheus::register(Box::new(metric.clone()));
+                Some(metric)
+            }
+            Err(_) => None,
+        }
+    };
+}

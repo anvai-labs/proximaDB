@@ -31,7 +31,7 @@ use proximadb::graph::rag::engine_impls::{KHopSubgraphBuilder, VectorNodeRetriev
 use proximadb::graph::rag::{IdentityFilter, RagBudget, RagPipeline, RagQuery};
 use proximadb::graph::{Edge, Node};
 use proximadb::services::vector_operations_service::VectorOperationsService;
-use proximadb_records::{EmbeddingCell, EmbeddingValues, ProximaRecord};
+use proximadb_records::{EmbeddingCell, ProximaRecord};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 

@@ -55,13 +55,26 @@ impl Server {
     /// Start with the test-only commit fault armed BEFORE any server thread
     /// exists, so no env mutation races the server's env reads (review S4a F10).
     async fn start_with_fault(fault: &str) -> anyhow::Result<Self> {
-        // SAFETY: called before the server (or any other thread) starts;
-        // nextest runs each test in its own process.
-        unsafe { std::env::set_var(FAULT, fault) };
-        Self::start().await
+        Self::start_inner(Some(fault)).await
     }
 
     async fn start() -> anyhow::Result<Self> {
+        Self::start_inner(None).await
+    }
+
+    /// One boot path for both. `None` REMOVES the fault variable: a previous
+    /// test in this process may have armed one and nothing else clears it.
+    /// Nextest isolates tests per process, but a lane that runs
+    /// `cargo test --test-threads=1` does not — the leaked
+    /// `fail_before_append` then fails every later test's commit (found by
+    /// wiring this file into the pgwire-accuracy lane: three tests failed
+    /// under faults they never armed, 25P02 included).
+    async fn start_inner(fault: Option<&str>) -> anyhow::Result<Self> {
+        // SAFETY: called before the server (or any other thread) starts.
+        match fault {
+            Some(f) => unsafe { std::env::set_var(FAULT, f) },
+            None => unsafe { std::env::remove_var(FAULT) },
+        }
         // Arm the gate unless the runner pinned it (to demonstrate the legacy RED).
         if std::env::var(GATE).is_err() {
             // SAFETY: set before the server (and any other thread) starts;

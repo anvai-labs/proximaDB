@@ -5,7 +5,7 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | **Open.** Design: link:../../12-design/P5B_PAX_CENTROID_DIRECTORY_DESIGN.adoc[P5B_PAX_CENTROID_DIRECTORY_DESIGN] (2026-10-22, #2120). D1 done (#2127); D2 done (#2152); D3 done (#2183); D5 done (#2196); D6 done (#2232); D7 done (#2240); D8 in review; D4 deferred.
+| Status | **Partial (release-review F13 status repair, 2026-11-01).** Design: link:../../12-design/P5B_PAX_CENTROID_DIRECTORY_DESIGN.adoc[P5B_PAX_CENTROID_DIRECTORY_DESIGN] (2026-10-22, #2120). D1 done (#2127); D2 done (#2152); D3 done (#2183); D5 done (#2196); D6 done (#2232); D7 done (#2240); D8 done (#2241, merged 2026-10-25 — defaults flipped ON with the confirmation artifact P5B_D8_DEFAULTS_CONFIRMATION_2026_10_25.adoc; the header had said "in review" past the merge); D4 deferred (owner decision); open: TD-PAXDIR-2 LIST cache, k_G per-tier bytes, G5 BIGANN re-measure.
 | Priority | MED. Vector cost and latency on object storage. It is the precondition for any P6 pricing claim.
 | Component | `crates/storage/proximadb-storage-common/src/coarse_directory.rs` (Region A0), new `centroid_directory.rs`; `src/storage/engines/sst/{block_cluster,segment_format,compaction}.rs`; `src/storage/engines/sst/search/mod.rs`
 | Relates to | TD-SEAM-10 (parent row; this file holds the implementation slices), TD-RDSTRAT-8 (per-segment A0), TD-FPRUNE-1, TD-PAXMETA-1, TD-SEAM-13, ADR-097 D2, ADR-094 D4, ADR-026

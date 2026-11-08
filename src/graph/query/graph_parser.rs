@@ -3,9 +3,6 @@
 //! The canonical parser implementation is being migrated to the `proximadb-graph`
 //! workspace crate. This module preserves the historical root import surface.
 
-// TODO: Move implementation from src/graph/query to proximadb-graph crate
-// pub use proximadb_graph::query::unified_parser::*;
-
 use super::ast::QueryResult;
 use super::cypher_parser::{CypherParser, CypherStatement};
 

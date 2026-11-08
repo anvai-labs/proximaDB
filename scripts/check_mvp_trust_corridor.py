@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import re
 import sys
+from datetime import date, datetime
 from pathlib import Path
 
 import tomllib
@@ -18,6 +19,12 @@ ROOT = Path(__file__).resolve().parents[1]
 CONTRACT = ROOT / "docs/00-product/MVP_TRUST_CORRIDOR.toml"
 ALLOWED_SURFACE_TIERS = {"supported", "diagnostic"}
 ALLOWED_EXCLUSION_TIERS = {"beta", "experimental", "planned"}
+# Parity with scripts/check_status_as_of.py's DEFAULT_MAX_AGE_DAYS: the
+# corridor claims to be the machine-checked customer promise, so an un-dated
+# one is the same drift class as a stale status-of-record doc (TD-DOCS-2).
+# Release-review F19: the field previously had no check at all and sat at
+# 2026-08-03 through two minor releases.
+MAX_AGE_DAYS = 60
 
 
 def _text(relative: str) -> str:
@@ -46,6 +53,21 @@ def validate_contract(data: dict) -> list[str]:
 
     if data.get("schema_version") != 1:
         errors.append("schema_version must be 1")
+    as_of = str(data.get("as_of_date", ""))
+    try:
+        as_of_day = datetime.strptime(as_of, "%Y-%m-%d").date()
+    except ValueError:
+        errors.append(f"as_of_date must be YYYY-MM-DD, got {as_of!r}")
+    else:
+        today = date.today()
+        if as_of_day > today:
+            errors.append(f"as_of_date is in the future: {as_of}")
+        elif (today - as_of_day).days > MAX_AGE_DAYS:
+            errors.append(
+                f"as_of_date is {(today - as_of_day).days} days old (max {MAX_AGE_DAYS}): "
+                "re-verify the corridor against HEAD and bump the date — a stale "
+                "corridor misroutes every surface decision that cites it"
+            )
     if data.get("canonical_api") != "REST /api/v2":
         errors.append("the MVP canonical_api must remain REST /api/v2")
     if data.get("default_engine") != "sst":

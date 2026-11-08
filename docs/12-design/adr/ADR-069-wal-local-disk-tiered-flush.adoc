@@ -173,6 +173,25 @@ New `[storage.wal_config]` keys: `flush_interval_secs`, `wal_max_bytes`, `high_w
 behavior (a sane time interval + a budget derived from the volume). No runtime mutation — the config is the
 version-controlled source of truth (repo convention).
 
+=== Embedded and short-lived compute clarification (2026-11-02)
+
+The local reattachable WAL default also governs embedded streaming writers. A local cache
+volume and a durability volume are different roles even when they share hardware. An
+unreattachable container filesystem does not satisfy D1 merely because it supports fsync.
+The application must retain replayable input or a reattachable WAL until the intended writes
+have been successfully materialized into authoritative storage. A process-local flush return
+is not an exactly-once, cross-process receipt.
+
+For a scheduled batch job, an explicit fallible end-job flush may publish a small segment
+before exit; it need not wait for all LSM compaction. Continued compaction needs a running
+owner or subsequent job. Periodic, pressure and explicit materialization reuse the shared
+scheduler/materializer and preserve concurrent writes outside the selected claims. Unknown
+or silently ignored sync modes are configuration errors, not permission to weaken durability.
+
+WAL-free direct bulk publication and a durable job-completion token remain separate future
+contracts with bounded input, immutable publication, idempotency and crash-recovery proofs.
+This clarification does not introduce per-write object-store WAL PUTs or change D1/D5.
+
 == 3. Co-design dimensional analysis (ADR-052 spine)
 
 Per ADR-052, design against the **dominant cost term** and *measure* every dimension:

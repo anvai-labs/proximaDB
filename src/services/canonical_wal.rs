@@ -195,6 +195,9 @@ pub struct FramedTableWalAppender {
     /// reaches this many bytes. `0` = never rotate (the default; only the shared
     /// pgwire canonical WAL opts in via [`Self::enable_segment_rotation`]).
     segment_bytes: AtomicU64,
+    /// True once this process has raised the directory's data format to 4
+    /// for summary sections (checked once, not per rotation).
+    trailer_format_raised: AtomicBool,
     /// Sealed segments (`{path}.{first_seq:020}.seg`), oldest first, with the
     /// LSN ranges a range read uses to skip them.
     sealed: parking_lot::RwLock<Vec<SegmentSummary>>,
@@ -231,7 +234,9 @@ struct BranchFence {
 
 /// A `(tenant, collection)` pair. The tenant is resolved as a request's is:
 /// an entry without one belongs to the default tenant.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub struct TenantCollection {
     pub tenant: String,
     pub collection: String,
@@ -553,14 +558,387 @@ async fn discover_sealed_segments(active: &Path) -> Result<Vec<(u64, PathBuf)>> 
     Ok(out)
 }
 
+/// TD-WALBOOT-1 cost-1 remedy: the summary SECTION of a sealed segment —
+/// the Region-E/PAX-footer pattern applied to the canonical WAL (metadata
+/// lives INSIDE the single file it describes; never a sidecar, which would
+/// double the per-segment object count). The section is a self-locating
+/// trailer appended at seal time; `path` is deliberately absent because boot
+/// re-derives it from the directory listing.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SummaryData {
+    first_seq: Option<u64>,
+    last_seq: u64,
+    collection_max: std::collections::HashMap<String, u64>,
+    has_uncollected: bool,
+    first_branch_seq: Option<u64>,
+    branched: BTreeSet<TenantCollection>,
+    tenants: std::collections::HashMap<String, BTreeSet<String>>,
+}
+
+impl From<&SegmentSummary> for SummaryData {
+    fn from(s: &SegmentSummary) -> Self {
+        Self {
+            first_seq: s.first_seq,
+            last_seq: s.last_seq,
+            collection_max: s.collection_max.clone(),
+            has_uncollected: s.has_uncollected,
+            first_branch_seq: s.first_branch_seq,
+            branched: s.branched.clone(),
+            tenants: s.tenants.clone(),
+        }
+    }
+}
+
+impl SummaryData {
+    fn into_summary(self, path: PathBuf) -> SegmentSummary {
+        SegmentSummary {
+            path,
+            first_seq: self.first_seq,
+            last_seq: self.last_seq,
+            collection_max: self.collection_max,
+            has_uncollected: self.has_uncollected,
+            first_branch_seq: self.first_branch_seq,
+            branched: self.branched,
+            tenants: self.tenants,
+        }
+    }
+}
+
+/// Section wire form, little-endian: `payload | crc32(payload) u32 |
+/// payload_len u32 | magic`, magic at EOF so one small suffix read locates
+/// the whole section — a segment's summary costs ONE range read, not a full
+/// decode and not a second object.
+const SUMMARY_TRAILER_MAGIC: &[u8; 8] = b"PXWSTL01";
+/// A section larger than this is treated as absent (fall back to the decode):
+/// the bound exists so a corrupt length can never make boot seek backwards
+/// through the whole file.
+const SUMMARY_TRAILER_MAX_PAYLOAD: usize = 4 * 1024 * 1024;
+
+/// Gate for the whole feature (default ON per the pre-GA evidence-armed
+/// directive; `0` writes no sections and boots by full decode — the
+/// pre-feature behavior, byte-identical).
+fn summary_trailer_enabled() -> bool {
+    crate::services::storage_format::default_on_gate("PROXIMADB_WAL_SUMMARY_TRAILER", 1).is_some()
+}
+
+fn encode_summary_trailer(summary: &SegmentSummary) -> Result<Vec<u8>> {
+    let payload = rmp_serde::to_vec_named(&SummaryData::from(summary))
+        .context("serializing the sealed-segment summary section")?;
+    let mut crc = Crc32Hasher::new();
+    crc.update(&payload);
+    let mut bytes = Vec::with_capacity(payload.len() + 16);
+    bytes.extend_from_slice(&payload);
+    bytes.extend_from_slice(&crc.finalize().to_le_bytes());
+    bytes.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    bytes.extend_from_slice(SUMMARY_TRAILER_MAGIC);
+    Ok(bytes)
+}
+
+/// Split the summary section off the END of a sealed segment's bytes.
+/// Returns `Some((frames, summary))` when a section is present AND its
+/// payload is trustworthy; `Some((frames, None))` when a section is
+/// structurally present (magic + sane length) but the payload fails CRC or
+/// decode — the FRAMES boundary is still derivable and must be honored, or
+/// the decode fallback would try to parse section bytes as frames; `None`
+/// when the file has no section at all (every pre-feature segment), so the
+/// caller treats the whole file as frames exactly as before.
+fn split_summary_trailer(bytes: &[u8]) -> Option<(&[u8], Option<SummaryData>)> {
+    if bytes.len() < 8 + 4 + 4 {
+        return None;
+    }
+    let tail = &bytes[bytes.len() - 12..];
+    if &tail[4..] != SUMMARY_TRAILER_MAGIC {
+        return None;
+    }
+    let payload_len = u32::from_le_bytes(tail[..4].try_into().ok()?) as usize;
+    // After the payload sit crc(4) + len(4) + magic(8) = 16 bytes.
+    if payload_len > SUMMARY_TRAILER_MAX_PAYLOAD || bytes.len() < 16 + payload_len {
+        return None;
+    }
+    let payload_end = bytes.len() - 16;
+    let payload_start = payload_end - payload_len;
+    let payload = &bytes[payload_start..payload_end];
+    let crc = u32::from_le_bytes(bytes[payload_end..payload_end + 4].try_into().ok()?);
+    let mut hasher = Crc32Hasher::new();
+    hasher.update(payload);
+    if hasher.finalize() != crc {
+        return Some((&bytes[..payload_start], None));
+    }
+    match rmp_serde::from_slice::<SummaryData>(payload) {
+        Ok(data) => Some((&bytes[..payload_start], Some(data))),
+        // CRC passed but the decode failed (a format revision we don't know):
+        // the boundary still stands; trust nothing.
+        Err(_) => Some((&bytes[..payload_start], None)),
+    }
+}
+
+/// If the ACTIVE file ends with a summary section, the rotation that wrote it
+/// crashed before renaming; complete it (the bytes were synced). Returns the
+/// segment's first_seq when a seal was completed.
+async fn recover_interrupted_seal(active_path: &Path) -> Option<u64> {
+    let bytes = tokio::fs::read(active_path).await.ok()?;
+    // A nonempty active file WITHOUT a trailing section is the normal case
+    // (crash before the section, or rotation never armed) — nothing to do;
+    // the active reader's torn-tail repair owns that file.
+    let (frames, data) = split_summary_trailer(&bytes)?;
+    // The segment name needs the first seq: trust the section's summary when
+    // present, else derive it from the frames themselves.
+    let first_seq = match data {
+        Some(data) if data.first_seq.is_some() => data.first_seq,
+        _ => frames
+            .first()
+            .map(|_| scan_wal_bytes(frames, active_path).ok())
+            .and_then(|scan| scan.map(|s| s.entries.first().map(|e| e.sequence_number)))
+            .flatten(),
+    }?;
+    let sealed = sealed_segment_path(active_path, first_seq);
+    // A sealed segment already occupying this name means the section's
+    // first_seq is wrong (stale or corrupt) — renaming would SILENTLY CLOBBER
+    // a real segment. Refuse: boot continues with the section un-recovered,
+    // which surfaces loudly rather than losing acknowledged entries.
+    if tokio::fs::try_exists(&sealed).await.unwrap_or(true) {
+        tracing::warn!(
+            active = %active_path.display(),
+            target = %sealed.display(),
+            "canonical WAL: interrupted-seal recovery refused — target segment already exists"
+        );
+        return None;
+    }
+    tokio::fs::rename(active_path, &sealed).await.ok()?;
+    if let Some(dir) = sealed.parent()
+        && let Ok(handle) = std::fs::File::open(dir)
+    {
+        let _ = handle.sync_all();
+    }
+    // The frames now live in the sealed segment; the active file must start
+    // EMPTY (writing the frames back would duplicate every entry at replay).
+    if let Ok(handle) = tokio::fs::File::create(active_path).await {
+        drop(handle);
+        if let Some(dir) = active_path.parent()
+            && let Ok(handle) = std::fs::File::open(dir)
+        {
+            let _ = handle.sync_all();
+        }
+    }
+    Some(first_seq)
+}
+
+/// Read a sealed segment's summary section with ONE suffix read — never the
+/// whole file. `None` on absence or any distrust (fall back to decode).
+async fn read_summary_section(segment: &Path) -> Option<SegmentSummary> {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+    let mut file = tokio::fs::File::open(segment).await.ok()?;
+    let len = file.metadata().await.ok()?.len() as usize;
+    if len < 12 {
+        return None;
+    }
+    let mut tail = vec![0u8; 12];
+    file.seek(std::io::SeekFrom::End(-12)).await.ok()?;
+    file.read_exact(&mut tail).await.ok()?;
+    if &tail[4..] != SUMMARY_TRAILER_MAGIC {
+        return None;
+    }
+    let payload_len = u32::from_le_bytes(tail[..4].try_into().ok()?) as usize;
+    if payload_len > SUMMARY_TRAILER_MAX_PAYLOAD || len < 16 + payload_len {
+        return None;
+    }
+    let section_len = 16 + payload_len;
+    let mut section = vec![0u8; section_len];
+    file.seek(std::io::SeekFrom::End(-(section_len as i64)))
+        .await
+        .ok()?;
+    file.read_exact(&mut section).await.ok()?;
+    let (_, data) = split_summary_trailer(&section)?;
+    // Structurally present but untrusted: not good enough for the fast path
+    // (the caller falls back to the decode, which trims by structure).
+    let data = data?;
+    Some(data.into_summary(segment.to_path_buf()))
+}
+
+/// Trim a trailing summary section from file bytes (sealed OR active —
+/// during a rotation the active file legitimately ends with one). The trim
+/// is STRUCTURAL: the section's magic+length delimit the frames even when
+/// its payload is untrusted; trust is the CALLER's concern.
+fn trim_summary_section(bytes: &[u8]) -> &[u8] {
+    match split_summary_trailer(bytes) {
+        Some((frames, _)) => frames,
+        None => bytes,
+    }
+}
+
+/// Append the summary section to the ACTIVE file and sync it, just before
+/// the seal rename — the rotation seqlock is odd and the append lock is
+/// held, so no append can interleave. Best-effort: on failure the segment
+/// seals without a section and every boot simply decodes it.
+async fn append_summary_trailer(active_path: &Path, summary: &SegmentSummary) {
+    let bytes = match encode_summary_trailer(summary) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            tracing::warn!(
+                segment = %active_path.display(),
+                error = %err,
+                "canonical WAL: summary section not written; boot will decode this segment"
+            );
+            return;
+        }
+    };
+    use tokio::io::AsyncWriteExt;
+    // Rollback-safe (review round 1): a partial section write or a failed
+    // sync leaves bytes in the active file that the frame decoder would
+    // hard-fail on — the pre-feature format tore gracefully (an incomplete
+    // FRAME header is quarantined). On ANY error the file is rolled back to
+    // its pre-section length so the next seal simply tries again on a clean
+    // frame boundary.
+    let result: Result<u64, (std::io::Error, u64)> = async {
+        let file = tokio::fs::OpenOptions::new()
+            .append(true)
+            .open(active_path)
+            .await
+            .map_err(|err| (err, 0))?;
+        let pre_len = file.metadata().await.map_err(|err| (err, 0))?.len();
+        let mut file = file;
+        let write_result = file.write_all(&bytes).await;
+        match write_result {
+            Ok(()) => file
+                .sync_data()
+                .await
+                .map(|_| pre_len)
+                .map_err(|err| (err, pre_len)),
+            Err(err) => Err((err, pre_len)),
+        }
+    }
+    .await;
+    match result {
+        Ok(_) => {}
+        Err((err, pre_len)) => {
+            // Roll the file back: the section bytes must not survive.
+            if let Ok(f) = std::fs::OpenOptions::new().write(true).open(active_path) {
+                let _ = f.set_len(pre_len);
+            }
+            tracing::warn!(
+                segment = %active_path.display(),
+                error = %err,
+                "canonical WAL: summary section write FAILED and was rolled back;                  boot will decode this segment"
+            );
+        }
+    }
+}
+
+/// TD-WALBOOT-1 instrumentation (measurement-first): the two costs the TD
+/// names, made observable before any change to them —
+/// * boot is O(retained WAL) in full decode (`open`'s summary rebuild): wall
+///   time, segments decoded, bytes decoded;
+/// * truncation and rotation hold the same `append_lock` as every append
+///   across fsync-scale work: hold-duration histograms per operation.
+///
+/// Histogram buckets span 1ms..60s (+Inf above), coarse by design (order-of-magnitude
+/// drift is the signal, not microseconds).
+struct WalCostMetrics {
+    boot_rebuild: prometheus::Histogram,
+    boot_segments: prometheus::IntCounter,
+    boot_bytes: prometheus::IntCounter,
+    truncate_hold: prometheus::Histogram,
+    rotate_hold: prometheus::Histogram,
+    section_hits: prometheus::IntCounter,
+    section_misses: prometheus::IntCounter,
+}
+
+fn wal_cost_metrics() -> &'static WalCostMetrics {
+    static METRICS: std::sync::OnceLock<WalCostMetrics> = std::sync::OnceLock::new();
+    METRICS.get_or_init(|| {
+        let histogram = |name: &str, help: &str| {
+            prometheus::register_histogram!(
+                name,
+                help,
+                vec![
+                    0.001, 0.005, 0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0
+                ]
+            )
+            .unwrap_or_else(|_| {
+                let opts = prometheus::HistogramOpts::new(
+                    format!("{name}_fallback"),
+                    "fallback",
+                )
+                .buckets(vec![
+                    0.001, 0.005, 0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0,
+                ]);
+                prometheus::Histogram::with_opts(opts)
+                    .unwrap_or_else(|_| unreachable!("valid histogram metric descriptor"))
+            })
+        };
+        let counter = |name: &str, help: &str| {
+            prometheus::register_int_counter!(name, help).unwrap_or_else(|_| {
+                prometheus::IntCounter::new(format!("{name}_fallback"), "fallback")
+                    .unwrap_or_else(|_| unreachable!("valid counter metric descriptor"))
+            })
+        };
+        WalCostMetrics {
+            boot_rebuild: histogram(
+                "proximadb_wal_boot_rebuild_seconds",
+                "Wall time of canonical-WAL open()'s sealed-segment summary rebuild (TD-WALBOOT-1: boot is O(retained WAL) in full decode)",
+            ),
+            boot_segments: counter(
+                "proximadb_wal_boot_sealed_segments_decoded_total",
+                "Sealed canonical-WAL segments fully decoded at boot to rebuild summaries (TD-WALBOOT-1)",
+            ),
+            boot_bytes: counter(
+                "proximadb_wal_boot_sealed_decoded_bytes_total",
+                "Bytes of sealed canonical-WAL segments fully decoded at boot (TD-WALBOOT-1)",
+            ),
+            truncate_hold: histogram(
+                "proximadb_wal_append_lock_truncate_hold_seconds",
+                "Duration truncate_below holds the append lock (floor-marker fsync + unlinks + dir fsync; TD-WALBOOT-1)",
+            ),
+            section_hits: counter(
+                "proximadb_wal_boot_summary_section_hits_total",
+                "Sealed segments whose summary section was trusted at boot (no decode; TD-WALBOOT-1)",
+            ),
+            section_misses: counter(
+                "proximadb_wal_boot_summary_section_misses_total",
+                "Sealed segments decoded at boot because the summary section was absent or untrusted (TD-WALBOOT-1)",
+            ),
+            rotate_hold: histogram(
+                "proximadb_wal_append_lock_rotate_hold_seconds",
+                "Duration rotate_active holds the append lock (seal rename + dir fsync; TD-WALBOOT-1)",
+            ),
+        }
+    })
+}
+
+/// Observes a duration into `histogram` when dropped — measures a lock hold
+/// across every exit path without threading timers through early returns.
+struct HoldTimer<'a> {
+    started: std::time::Instant,
+    histogram: &'a prometheus::Histogram,
+}
+
+impl<'a> HoldTimer<'a> {
+    fn start(histogram: &'a prometheus::Histogram) -> Self {
+        Self {
+            started: std::time::Instant::now(),
+            histogram,
+        }
+    }
+}
+
+impl Drop for HoldTimer<'_> {
+    fn drop(&mut self) {
+        self.histogram.observe(self.started.elapsed().as_secs_f64());
+    }
+}
+
 /// Read every complete entry of a sealed segment. A sealed segment was synced
 /// before it was sealed, so anything short of a clean parse is corruption and
 /// fails closed (unlike the active file, whose torn tail is repaired on open).
 async fn read_sealed_segment(path: &Path) -> Result<Vec<CanonicalWalEntry>> {
+    // The summary section (if present) is not a frame; trim it from the tail
+    // so the frame decoder sees exactly the frames. A file with no section
+    // decodes exactly as before.
     let bytes = tokio::fs::read(path)
         .await
         .with_context(|| format!("reading canonical WAL segment {}", path.display()))?;
-    let scan = scan_wal_bytes(&bytes, path)?;
+    let bytes: &[u8] = trim_summary_section(&bytes);
+    let scan = scan_wal_bytes(bytes, path)?;
     if scan.valid_len != bytes.len() {
         bail!(
             "sealed canonical WAL segment {} is truncated or corrupt at byte {} of {}",
@@ -623,6 +1001,20 @@ impl FramedTableWalAppender {
             })?;
         }
 
+        // TD-WALBOOT-1 crash window: a summary section was synced to the
+        // ACTIVE file but the seal rename never ran (crash between them).
+        // The section's bytes were durable, so the seal is complete in
+        // substance — finish it here rather than let later appends land
+        // after the section mid-file. The renamed segment then flows through
+        // normal discovery below (and its own section is trusted).
+        if let Some(first_seq) = recover_interrupted_seal(&path).await {
+            tracing::info!(
+                wal = %path.display(),
+                first_seq,
+                "canonical WAL: completed an interrupted segment rotation at open"
+            );
+        }
+
         // Sealed segments are discovered whether or not this appender rotates:
         // a WAL rotated by an earlier run must read back in full.
         let mut sealed = Vec::new();
@@ -633,11 +1025,32 @@ impl FramedTableWalAppender {
         let mut sealed_last = truncated_through;
         let mut sealed_collection_max: std::collections::HashMap<String, u64> =
             std::collections::HashMap::new();
+        // TD-WALBOOT-1: the boot cost the TD names — measure it where it
+        // happens, so the sidecar-vs-status-quo decision is made on data.
+        let boot_started = std::time::Instant::now();
+        let mut boot_segments: u64 = 0;
+        let mut boot_bytes: u64 = 0;
         for (_, segment_path) in discover_sealed_segments(&path).await? {
-            let mut summary = SegmentSummary::new(segment_path.clone());
-            for entry in read_sealed_segment(&segment_path).await? {
-                summary.observe(&entry);
+            boot_segments += 1;
+            if let Ok(meta) = tokio::fs::metadata(&segment_path).await {
+                boot_bytes += meta.len();
             }
+            // Summary section first (one suffix read); full decode only when
+            // it is absent or untrusted — the pre-feature behavior.
+            let summary = match read_summary_section(&segment_path).await {
+                Some(summary) => {
+                    wal_cost_metrics().section_hits.inc();
+                    summary
+                }
+                None => {
+                    wal_cost_metrics().section_misses.inc();
+                    let mut summary = SegmentSummary::new(segment_path.clone());
+                    for entry in read_sealed_segment(&segment_path).await? {
+                        summary.observe(&entry);
+                    }
+                    summary
+                }
+            };
             if truncated_through > 0 && summary.last_seq <= truncated_through {
                 if let Err(err) = tokio::fs::remove_file(&segment_path).await
                     && err.kind() != std::io::ErrorKind::NotFound
@@ -657,6 +1070,11 @@ impl FramedTableWalAppender {
             }
             sealed.push(summary);
         }
+        wal_cost_metrics()
+            .boot_rebuild
+            .observe(boot_started.elapsed().as_secs_f64());
+        wal_cost_metrics().boot_segments.inc_by(boot_segments);
+        wal_cost_metrics().boot_bytes.inc_by(boot_bytes);
 
         let mut recovery = recover_wal_state(&path).await?;
         recovery.last_sequence = recovery.last_sequence.max(sealed_last);
@@ -703,6 +1121,7 @@ impl FramedTableWalAppender {
             poisoned: AtomicBool::new(false),
             collection_max: parking_lot::Mutex::new(recovery.collection_max),
             segment_bytes: AtomicU64::new(0),
+            trailer_format_raised: AtomicBool::new(false),
             sealed: parking_lot::RwLock::new(sealed),
             active: parking_lot::Mutex::new(active),
             rotations: AtomicU64::new(0),
@@ -856,6 +1275,7 @@ impl FramedTableWalAppender {
     /// list stable while victims are chosen.
     pub async fn truncate_below(&self, floor: u64) -> Result<WalTruncation> {
         let _guard = self.append_lock.lock().await;
+        let _hold = HoldTimer::start(&wal_cost_metrics().truncate_hold);
         let floor = self
             .pins
             .lock()
@@ -953,6 +1373,7 @@ impl FramedTableWalAppender {
     /// only acknowledged, complete frames. A failed rename leaves everything in
     /// the active file (nothing is lost; rotation is retried on the next append).
     async fn rotate_active(&self) {
+        let _hold = HoldTimer::start(&wal_cost_metrics().rotate_hold);
         let summary = {
             let active = self.active.lock();
             if active.first_seq.is_none() {
@@ -964,8 +1385,31 @@ impl FramedTableWalAppender {
             return;
         };
         let sealed_path = sealed_segment_path(&self.path, first_seq);
-        // Odd generation: readers that overlap the rename re-read.
+        // Odd generation FIRST — the seqlock exists for READERS: an even
+        // generation while the section bytes are visible in the active file
+        // lets a concurrent change-feed poll hard-fail on them (the same
+        // discipline truncate_below follows: odd before touching disk).
         self.rotations.fetch_add(1, Ordering::SeqCst);
+        // TD-WALBOOT-1: the summary section rides inside the segment (one
+        // object, one suffix read at boot). The format marker rises to 4
+        // (WAL_SECTION_FORMAT) before the FIRST section a directory sees.
+        if summary_trailer_enabled() {
+            if !self.trailer_format_raised.swap(true, Ordering::SeqCst)
+                && let Some(dir) = self.path.parent()
+                && crate::services::storage_format::raise_data_format(
+                    dir,
+                    crate::services::storage_format::WAL_SECTION_FORMAT,
+                )
+                .is_err()
+            {
+                tracing::warn!(
+                    "canonical WAL: could not raise the data format for summary sections;                      skipping them for this process"
+                );
+                self.trailer_format_raised.store(false, Ordering::SeqCst);
+            } else {
+                append_summary_trailer(&self.path, &summary).await;
+            }
+        }
         if let Err(err) = tokio::fs::rename(&self.path, &sealed_path).await {
             self.rotations.fetch_add(1, Ordering::SeqCst);
             tracing::warn!(
@@ -1623,7 +2067,8 @@ async fn read_active_file(path: &Path) -> Result<Vec<CanonicalWalEntry>> {
             return Err(err).with_context(|| format!("opening canonical WAL {}", path.display()));
         }
     };
-    Ok(scan_wal_bytes(&bytes, path)?.entries)
+    let bytes: &[u8] = trim_summary_section(&bytes);
+    Ok(scan_wal_bytes(bytes, path)?.entries)
 }
 
 /// Write `bytes` to a new file and fsync it.
@@ -2053,6 +2498,239 @@ mod tests {
             _ if new == old => Ok(()),
             _ => Err(format!("{path}: format 2 wrote {old}, now {new}")),
         }
+    }
+
+    /// TD-WALBOOT-1 measurement harness (advisory, run explicitly):
+    /// `cargo test --lib wal_boot_summary_rebuild_cost -- --ignored --nocapture`.
+    /// Boot's summary rebuild is claimed O(retained WAL) in full decode; this
+    /// times `open()` across sealed-segment counts (3 opens each — the first
+    /// includes cold-ish disk reads, the later ones the page-cache floor) so
+    /// the sidecar-summary decision rests on data. Dev-profile provenance
+    /// unless run with --release; record whichever in the evidence artifact.
+    #[tokio::test]
+    #[ignore = "TD-WALBOOT-1 measurement harness: advisory, run explicitly"]
+    async fn wal_boot_summary_rebuild_cost_measurement() -> Result<()> {
+        for segments in [8u32, 32, 128, 512] {
+            let dir = tempfile::tempdir()?;
+            let wal_path = dir.path().join("boot-cost.wal");
+            {
+                let wal = FramedTableWalAppender::open(&wal_path).await?;
+                // Rotation at 1 byte: every append seals its own segment
+                // (the same trick the truncation tests use), so the segment
+                // count is exact without payload-size tuning.
+                wal.enable_segment_rotation(1);
+                for i in 0..segments {
+                    wal.append_operations(
+                        vec![upsert_operation("boot_cost", &format!("r{i}"))],
+                        Some("t".to_string()),
+                    )
+                    .await?;
+                }
+            }
+            let bytes: u64 = std::fs::read_dir(dir.path())?
+                .flatten()
+                .filter_map(|e| e.metadata().ok())
+                .map(|m| m.len())
+                .sum();
+            let mut samples_ms = Vec::new();
+            for _ in 0..3 {
+                let started = std::time::Instant::now();
+                let wal = FramedTableWalAppender::open(&wal_path).await?;
+                samples_ms.push(started.elapsed().as_millis());
+                drop(wal);
+            }
+            println!(
+                "TD-WALBOOT-1 boot rebuild: segments={segments} bytes={bytes} open_ms={samples_ms:?}"
+            );
+        }
+        Ok(())
+    }
+
+    /// Seal `segments` one-append segments into a tempdir WAL and return its
+    /// path; shared by the summary-section tests.
+    async fn seal_segments(dir: &tempfile::TempDir, segments: u32) -> PathBuf {
+        let wal_path = dir.path().join("sections.wal");
+        let wal = FramedTableWalAppender::open(&wal_path).await.unwrap();
+        wal.enable_segment_rotation(1);
+        for i in 0..segments {
+            wal.append_operations(
+                vec![upsert_operation("sec_test", &format!("r{i}"))],
+                Some("t1".to_string()),
+            )
+            .await
+            .unwrap();
+        }
+        wal_path
+    }
+
+    /// Every sealed `.seg`'s summary as boot recovered it, for comparisons.
+    async fn recovered_summaries(wal_path: &Path) -> Vec<SegmentSummary> {
+        let wal = FramedTableWalAppender::open(wal_path).await.unwrap();
+        wal.sealed.read().clone()
+    }
+
+    #[tokio::test]
+    async fn summary_section_round_trips_and_boot_trusts_it() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let wal_path = seal_segments(&dir, 5).await;
+        // Every sealed segment ends with the section magic.
+        for entry in std::fs::read_dir(dir.path())? {
+            let path = entry?.path();
+            if path.extension().is_none_or(|e| e != "seg") {
+                continue;
+            }
+            let bytes = std::fs::read(&path)?;
+            assert!(
+                bytes.len() >= 12 && &bytes[bytes.len() - 8..] == SUMMARY_TRAILER_MAGIC,
+                "{} lacks a summary section",
+                path.display()
+            );
+        }
+        let with_sections = recovered_summaries(&wal_path).await;
+        // Force the decode HONESTLY (review round 1: gating only the write
+        // path left the read path trusting the same sections — a vacuous
+        // X==X comparison): delete every .idx-less section by truncating
+        // each segment to its frames boundary. A fresh re-open then recovers
+        // the same facts by full decode, proving the section payload agrees
+        // with the frames.
+        for entry in std::fs::read_dir(dir.path())? {
+            let path = entry?.path();
+            if path.extension().is_some_and(|e| e == "seg") {
+                let bytes = std::fs::read(&path)?;
+                if let Some((frames, _)) = split_summary_trailer(&bytes) {
+                    std::fs::write(&path, frames)?;
+                }
+            }
+        }
+        let decoded = recovered_summaries(&wal_path).await;
+        assert_eq!(with_sections.len(), decoded.len());
+        for (section, decode) in with_sections.iter().zip(decoded.iter()) {
+            assert_eq!(section.first_seq, decode.first_seq);
+            assert_eq!(section.last_seq, decode.last_seq);
+            assert_eq!(section.collection_max, decode.collection_max);
+            assert_eq!(section.tenants, decode.tenants);
+            assert_eq!(section.has_uncollected, decode.has_uncollected);
+            assert_eq!(section.first_branch_seq, decode.first_branch_seq);
+            assert_eq!(section.branched, decode.branched);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn corrupt_summary_section_falls_back_to_decode() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let wal_path = seal_segments(&dir, 3).await;
+        // Corrupt one segment's section payload (a byte inside it).
+        let mut segs: Vec<_> = std::fs::read_dir(dir.path())?
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|e| e == "seg"))
+            .collect();
+        segs.sort();
+        let victim = segs[1].clone();
+        let mut bytes = std::fs::read(&victim)?;
+        let idx = bytes.len() - 20;
+        bytes[idx] ^= 0xff; // inside the payload region
+        std::fs::write(&victim, &bytes)?;
+        // Boot still recovers the correct facts via the decode fallback.
+        let summaries = recovered_summaries(&wal_path).await;
+        assert_eq!(summaries.len(), 3);
+        assert_eq!(summaries[1].collection_max.get("sec_test"), Some(&2));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn gate_off_writes_no_sections_and_boots_by_decode() -> Result<()> {
+        // SAFETY: set before any appender exists; RESTORED before return so
+        // a shared-process libtest run (parallel by default — see review
+        // round 1) cannot leak the gate-off state into sibling tests.
+        unsafe { std::env::set_var("PROXIMADB_WAL_SUMMARY_TRAILER", "0") };
+        let result = async {
+            let dir = tempfile::tempdir()?;
+            let wal_path = seal_segments(&dir, 2).await;
+            for entry in std::fs::read_dir(dir.path())? {
+                let path = entry?.path();
+                if path.extension().is_some_and(|e| e == "seg") {
+                    let bytes = std::fs::read(&path)?;
+                    assert!(
+                        &bytes[bytes.len().saturating_sub(8)..] != SUMMARY_TRAILER_MAGIC,
+                        "gate off must write no sections"
+                    );
+                }
+            }
+            let summaries = recovered_summaries(&wal_path).await;
+            assert_eq!(summaries.len(), 2);
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+        unsafe { std::env::remove_var("PROXIMADB_WAL_SUMMARY_TRAILER") };
+        result.map_err(|e| anyhow::anyhow!("{e:#}"))
+    }
+
+    #[tokio::test]
+    async fn interrupted_seal_completes_at_boot() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let wal_path = seal_segments(&dir, 2).await;
+        // Simulate the crash window: append entries to the active file, then
+        // write ITS summary section, and never rotate.
+        {
+            let wal = FramedTableWalAppender::open(&wal_path).await?;
+            for i in 0..2 {
+                wal.append_operations(
+                    vec![upsert_operation("sec_test", &format!("late{i}"))],
+                    Some("t1".to_string()),
+                )
+                .await?;
+            }
+        }
+        // Build the section exactly as rotate_active would: summarize the
+        // active entries by decoding them, append, sync, NO rename.
+        let entries = read_sealed_segment(wal_path.as_path()).await?;
+        let mut summary = SegmentSummary::new(wal_path.clone());
+        for entry in &entries {
+            summary.observe(entry);
+        }
+        summary.first_seq = Some(3); // entries 1,2 are sealed; the active file holds 3,4
+        append_summary_trailer(&wal_path, &summary).await;
+        // Boot: the interrupted rotation completes; three sealed segments now
+        // exist and every entry is recoverable.
+        let summaries = recovered_summaries(&wal_path).await;
+        assert_eq!(summaries.len(), 3, "interrupted seal completed at boot");
+        assert!(summaries.iter().any(|s| s.last_seq >= 3));
+        let wal = FramedTableWalAppender::open(&wal_path).await?;
+        let all = wal.read_entries().await?;
+        assert_eq!(all.len(), 4, "every entry survives the interrupted seal");
+        Ok(())
+    }
+
+    #[test]
+    fn summary_section_codec_round_trips() {
+        let mut summary = SegmentSummary::new(PathBuf::from("/tmp/x.seg"));
+        summary.first_seq = Some(7);
+        summary.last_seq = 42;
+        summary.collection_max.insert("c".into(), 42);
+        summary
+            .tenants
+            .insert("c".into(), ["t1".to_string()].into_iter().collect());
+        summary.has_uncollected = true;
+        let assert_facts = |d: &SummaryData| {
+            assert_eq!(d.first_seq, Some(7));
+            assert_eq!(d.last_seq, 42);
+            assert_eq!(d.collection_max.get("c"), Some(&42));
+        };
+        let trailer = encode_summary_trailer(&summary).unwrap();
+        // Bare trailer: split returns zero frames and the exact facts.
+        let (frames, data) = split_summary_trailer(&trailer)
+            .unwrap_or_else(|| panic!("split failed; trailer len {}", trailer.len()));
+        assert!(frames.is_empty());
+        assert_facts(&data.expect("freshly-encoded section must be trusted"));
+        // Frame-prefixed file: exactly the prefix comes back as frames.
+        let mut with_prefix = vec![0xABu8; 100];
+        with_prefix.extend_from_slice(&trailer);
+        let (frames2, data2) =
+            split_summary_trailer(&with_prefix).expect("split with prefix failed");
+        assert_eq!(frames2.len(), 100);
+        assert_facts(&data2.expect("trusted"));
     }
 
     fn upsert_operation(collection_id: &str, oid: &str) -> CanonicalOperation {

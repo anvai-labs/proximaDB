@@ -177,6 +177,11 @@ pub fn proxima_value_to_json_canonical_owned(value: ProximaValue) -> serde_json:
 /// jsonpath/`serde_json` bridge (e.g. document filter path extraction) keeps identical
 /// value semantics. Canonical home for the previously-scattered `json_to_proxima_value`
 /// copies (arrow_ipc, websocket, rest/v2) to converge onto later.
+///
+/// Number handling: integers that fit `i64` become exact `Int64`; u64 > `i64::MAX`
+/// becomes `UInt64`; floats become `Float64`. The `String` fallback is unreachable
+/// for numbers serde_json can parse without `arbitrary_precision`; it exists so
+/// the fn is total and lossless if that feature is ever enabled.
 pub fn json_to_proxima(value: &serde_json::Value) -> ProximaValue {
     match value {
         serde_json::Value::Null => ProximaValue::Null,
@@ -184,8 +189,12 @@ pub fn json_to_proxima(value: &serde_json::Value) -> ProximaValue {
         serde_json::Value::Number(n) => {
             if let Some(i) = n.as_i64() {
                 ProximaValue::Int64(i)
+            } else if let Some(u) = n.as_u64() {
+                ProximaValue::UInt64(u)
+            } else if let Some(f) = n.as_f64() {
+                ProximaValue::Float64(f)
             } else {
-                ProximaValue::Float64(n.as_f64().unwrap_or(0.0))
+                ProximaValue::String(n.to_string())
             }
         }
         serde_json::Value::String(s) => ProximaValue::String(s.clone()),
@@ -1368,5 +1377,121 @@ mod tests {
 
         let pr = ProximaRecord::from(&edge);
         assert!(pr.edge.as_ref().unwrap().weight.is_none());
+    }
+
+    /// Pins the u64 > i64::MAX → UInt64 decision. Without this test, a future
+    /// refactor could silently re-remove the as_u64() branch (as happened in
+    /// 5 of the 6 retired copies).
+    #[test]
+    fn json_to_proxima_u64_above_i64_max_becomes_uint64() {
+        let big = serde_json::json!(u64::MAX);
+        assert!(matches!(json_to_proxima(&big), ProximaValue::UInt64(v) if v == u64::MAX));
+        // i64::MAX + 1 is the smallest value that takes the UInt64 branch
+        let boundary = serde_json::json!((i64::MAX as u64) + 1);
+        assert!(matches!(
+            json_to_proxima(&boundary),
+            ProximaValue::UInt64(_)
+        ));
+        // Small u64s still hit the exact i64 path first
+        let small = serde_json::json!(42u64);
+        assert!(matches!(json_to_proxima(&small), ProximaValue::Int64(42)));
+    }
+
+    /// Golden-tree assertions for json_to_proxima: assert specific expected
+    /// ProximaValue variants for specific JSON inputs, independent of the
+    /// conversion implementation. Catches single-branch mutations.
+    #[test]
+    fn json_to_proxima_golden_tree_assertions() {
+        // Null
+        assert!(matches!(
+            json_to_proxima(&serde_json::json!(null)),
+            ProximaValue::Null
+        ));
+
+        // Booleans — both polarities
+        assert!(matches!(
+            json_to_proxima(&serde_json::json!(true)),
+            ProximaValue::Boolean(true)
+        ));
+        assert!(matches!(
+            json_to_proxima(&serde_json::json!(false)),
+            ProximaValue::Boolean(false)
+        ));
+
+        // Strings
+        assert!(matches!(
+            json_to_proxima(&serde_json::json!("hello")),
+            ProximaValue::String(ref s) if s == "hello"
+        ));
+        assert!(matches!(
+            json_to_proxima(&serde_json::json!("")),
+            ProximaValue::String(ref s) if s.is_empty()
+        ));
+
+        // Numbers — positive, negative, zero, float
+        assert!(matches!(
+            json_to_proxima(&serde_json::json!(42)),
+            ProximaValue::Int64(42)
+        ));
+        assert!(matches!(
+            json_to_proxima(&serde_json::json!(-100)),
+            ProximaValue::Int64(-100)
+        ));
+        assert!(matches!(
+            json_to_proxima(&serde_json::json!(0)),
+            ProximaValue::Int64(0)
+        ));
+        assert!(matches!(
+            json_to_proxima(&serde_json::json!(1.5)),
+            ProximaValue::Float64(f) if (f - 1.5).abs() < f64::EPSILON
+        ));
+        // u64 > i64::MAX → UInt64 (the exactness pin)
+        assert!(matches!(
+            json_to_proxima(&serde_json::json!(u64::MAX)),
+            ProximaValue::UInt64(v) if v == u64::MAX
+        ));
+
+        // Arrays — empty and non-empty
+        let empty_arr = json_to_proxima(&serde_json::json!([]));
+        assert!(matches!(empty_arr, ProximaValue::Array(ref v) if v.is_empty()));
+        let arr = json_to_proxima(&serde_json::json!([1, "two", true]));
+        if let ProximaValue::Array(items) = arr {
+            assert_eq!(items.len(), 3);
+            assert!(matches!(items[0], ProximaValue::Int64(1)));
+            assert!(matches!(items[1], ProximaValue::String(ref s) if s == "two"));
+            assert!(matches!(items[2], ProximaValue::Boolean(true)));
+        } else {
+            panic!("expected Array");
+        }
+
+        // Objects — empty and non-empty
+        let empty_obj = json_to_proxima(&serde_json::json!({}));
+        assert!(matches!(empty_obj, ProximaValue::Map(ref m) if m.is_empty()));
+        let obj = json_to_proxima(&serde_json::json!({"key": "value", "num": 42}));
+        if let ProximaValue::Map(fields) = obj {
+            assert_eq!(fields.len(), 2);
+            assert!(matches!(fields.get("key"), Some(ProximaValue::String(s)) if s == "value"));
+            assert!(matches!(fields.get("num"), Some(ProximaValue::Int64(42))));
+        } else {
+            panic!("expected Map");
+        }
+
+        // Nested structures
+        let nested = json_to_proxima(&serde_json::json!({"a": [1, {"b": true}]}));
+        if let ProximaValue::Map(fields) = nested {
+            if let Some(ProximaValue::Array(items)) = fields.get("a") {
+                assert_eq!(items.len(), 2);
+                assert!(matches!(items[0], ProximaValue::Int64(1)));
+                if let ProximaValue::Map(inner) = &items[1] {
+                    assert!(matches!(inner.get("b"), Some(ProximaValue::Boolean(true))));
+                } else {
+                    panic!("expected inner Map");
+                }
+            } else {
+                panic!("expected Array in field 'a'");
+            }
+        } else {
+            panic!("expected Map");
+        }
     }
 }

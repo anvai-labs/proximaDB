@@ -175,7 +175,8 @@ pub fn write_pax_segment(
 /// D). When `f32_tier` is true, each embedding also gets a co-located raw-f32
 /// stripe at `col_id::F32_TIER_BASE + i` for an exact
 /// final rerank / `include_vectors`. The flush path calls this with the resolved
-/// `pax_f32_tier` opt-in; compaction/tests use [`write_pax_segment`] (no tier).
+/// `pax_f32_tier` decision (default ON for lossy bases); tests use
+/// [`write_pax_segment`] (no tier).
 pub fn write_pax_segment_with_f32_tier(
     path: &Path,
     records: &[ProximaRecord],
@@ -1162,29 +1163,24 @@ pub(crate) fn pax_field_to_col(field: &str) -> Option<i32> {
     }
 }
 
-/// ADR-089 / TD-FPRUNE-1: the filter-aware cascade gate. **FLIPPED
-/// default-ON 2026-08-31** — evidence (the promotion criterion the
-/// ENV_GATE_REGISTRY row records, discharged NON-vacuously through the real
-/// `search_vectors_unified` dispatch): the NEW filtered SIFT ratchet leg
-/// `sift_pax_filtered_cascade_recall_ratchet` measures filtered recall@10 =
-/// **0.996** vs filtered brute-force ground truth (floor 0.90) over 100
-/// queries at N=10k / 8 partitions, with every hit satisfying the predicate
-/// AND carrying rehydrated metadata (the top-k rehydration keeps the exact
-/// path's response shape). The unfiltered SIFT ratchet holds 0.989 with the
-/// P2 write layout active. Fail-safe on every axis (non-coalesced → exact
-/// fallback; stage-F error → exact fallback; empty allow-set → empty result);
-/// `PROXIMADB_PAX_FILTERED_CASCADE=0|off|false|no` is the emergency
-/// kill-switch back to the whole-object exact scan.
-pub(crate) fn pax_filtered_cascade_enabled() -> bool {
-    !matches!(
-        std::env::var("PROXIMADB_PAX_FILTERED_CASCADE")
-            .ok()
-            .as_deref()
-            .map(str::trim)
-            .map(str::to_ascii_lowercase)
-            .as_deref(),
-        Some("0" | "off" | "false" | "no")
-    )
+// ADR-089 / TD-FPRUNE-1: the filter-aware cascade gate. **FLIPPED
+// default-ON 2026-08-31** — evidence (the promotion criterion the
+// ENV_GATE_REGISTRY row records, discharged NON-vacuously through the real
+// `search_vectors_unified` dispatch): the NEW filtered SIFT ratchet leg
+// `sift_pax_filtered_cascade_recall_ratchet` measures filtered recall@10 =
+// **0.996** vs filtered brute-force ground truth (floor 0.90) over 100
+// queries at N=10k / 8 partitions, with every hit satisfying the predicate
+// AND carrying rehydrated metadata (the top-k rehydration keeps the exact
+// path's response shape). The unfiltered SIFT ratchet holds 0.989 with the
+// P2 write layout active. Fail-safe on every axis (non-coalesced → exact
+// fallback; stage-F error → exact fallback; empty allow-set → empty result);
+// `PROXIMADB_PAX_FILTERED_CASCADE=0|off|false|no` is the emergency
+// kill-switch back to the whole-object exact scan.
+// Kill-switch via the shared env_kill_switch! macro (one read of the
+// 0|false|off|no kill set; formerly an inline match — #2438 follow-up sweep).
+proximadb_config::env_kill_switch! {
+    /// Filter-aware cascade kill-switch (ADR-089 Stage-F); default ON.
+    pub(crate) fn pax_filtered_cascade_enabled() { gate: "PROXIMADB_PAX_FILTERED_CASCADE", default: true }
 }
 
 /// Stage-F observability counters (ADR-089 P1): what the metadata pre-stage
@@ -2103,58 +2099,43 @@ pub fn filter_region_write_enabled() -> bool {
     crate::storage::engines::sst::block_cluster::env_gate_on("PROXIMADB_PAX_WRITE_FILTER_REGION")
 }
 
-/// TD-FPRUNE-1 PR-E: answer a filtered query's Stage F from Region E when
-/// the segment carries it. Default ON (a segment without Region E is
-/// unaffected); `PROXIMADB_PAX_READ_FILTER_REGION=0|off|false|no` forces the
-/// full-row path.
-pub fn filter_region_read_enabled() -> bool {
-    crate::storage::engines::sst::block_cluster::env_kill_switch_off(
-        "PROXIMADB_PAX_READ_FILTER_REGION",
-    )
+// TD-FPRUNE-1 PR-E: answer a filtered query's Stage F from Region E when
+// the segment carries it. Default ON (a segment without Region E is
+// unaffected); `PROXIMADB_PAX_READ_FILTER_REGION=0|off|false|no` forces the
+// full-row path.
+proximadb_config::env_kill_switch! {
+    /// Kill-switch gate; default ON (0|false|off|no disables).
+    pub fn filter_region_read_enabled() { gate: "PROXIMADB_PAX_READ_FILTER_REGION", default: true }
 }
 
-/// Whether the coalesced-RaBitQ layout is engaged for new RaBitQ writes
-/// (ADR-062 / TD-RDSTRAT-6). **Default ON** — coalesced scan-then-rerank is the
-/// canonical PAX RaBitQ path (pre-GA: no serialized legacy data, so no back-compat
-/// — per the ADR-061 in-place amendment). The reader handles BOTH layouts via the
-/// `SEG_HEADER_MAGIC` presence-field. `PROXIMADB_PAX_COALESCED_RABITQ=0|off|false`
-/// is an emergency kill-switch back to the legacy in-block RaBitQ layout.
-pub fn coalesced_rabitq_enabled() -> bool {
-    !matches!(
-        std::env::var("PROXIMADB_PAX_COALESCED_RABITQ")
-            .ok()
-            .as_deref()
-            .map(str::trim)
-            .map(str::to_ascii_lowercase)
-            .as_deref(),
-        Some("0" | "off" | "false" | "no")
-    )
+// Whether the coalesced-RaBitQ layout is engaged for new RaBitQ writes
+// (ADR-062 / TD-RDSTRAT-6). **Default ON** — coalesced scan-then-rerank is the
+// canonical PAX RaBitQ path (pre-GA: no serialized legacy data, so no back-compat
+// — per the ADR-061 in-place amendment). The reader handles BOTH layouts via the
+// `SEG_HEADER_MAGIC` presence-field. `PROXIMADB_PAX_COALESCED_RABITQ=0|off|false`
+// is an emergency kill-switch back to the legacy in-block RaBitQ layout.
+proximadb_config::env_kill_switch! {
+    /// Kill-switch gate; default ON (0|false|off|no disables).
+    pub(crate) fn coalesced_rabitq_enabled() { gate: "PROXIMADB_PAX_COALESCED_RABITQ", default: true }
 }
 
-/// TD-PAXRG-1: write the **row-group Region D** layout — Region D granules
-/// are Parquet-style row groups (Olap-framed, RowDirectory + in-block rgdir
-/// suppressed), per-RG stats ride the footer's MinMax payload, the RG target
-/// is floored at 256 KiB, and the OID resolver auto-captures (point-lookup
-/// authority; a format invariant of the layout, not a caller obligation).
-///
-/// DEFAULT ON (FLIPPED 2026-08-28): the TD-PAXRG-1 Phase-G evidence is
-/// complete — SIFT1M 100k recall@10 = 0.9896 identical to the legacy-block
-/// baseline (floor 0.90); at-rest 80.3% of legacy bytes (RowDirectory
-/// removal); micro-granule amplification closed 13.4×; OID-chunk top-k −34%
-/// bytes at GET parity+1; round-trip/twin/gate purity all pinned. Read side
-/// is unconditional. `PROXIMADB_PAX_WRITE_RG_LAYOUT=0|off|false|no` is the
-/// kill-switch back to the legacy block framing; the per-collection
-/// `pax_rg_layout:on|off` tag (flush) outranks the env.
-pub fn rg_layout_enabled() -> bool {
-    !matches!(
-        std::env::var("PROXIMADB_PAX_WRITE_RG_LAYOUT")
-            .ok()
-            .as_deref()
-            .map(str::trim)
-            .map(str::to_ascii_lowercase)
-            .as_deref(),
-        Some("0" | "off" | "false" | "no")
-    )
+// TD-PAXRG-1: write the **row-group Region D** layout — Region D granules
+// are Parquet-style row groups (Olap-framed, RowDirectory + in-block rgdir
+// suppressed), per-RG stats ride the footer's MinMax payload, the RG target
+// is floored at 256 KiB, and the OID resolver auto-captures (point-lookup
+// authority; a format invariant of the layout, not a caller obligation).
+//
+// DEFAULT ON (FLIPPED 2026-08-28): the TD-PAXRG-1 Phase-G evidence is
+// complete — SIFT1M 100k recall@10 = 0.9896 identical to the legacy-block
+// baseline (floor 0.90); at-rest 80.3% of legacy bytes (RowDirectory
+// removal); micro-granule amplification closed 13.4×; OID-chunk top-k −34%
+// bytes at GET parity+1; round-trip/twin/gate purity all pinned. Read side
+// is unconditional. `PROXIMADB_PAX_WRITE_RG_LAYOUT=0|off|false|no` is the
+// kill-switch back to the legacy block framing; the per-collection
+// `pax_rg_layout:on|off` tag (flush) outranks the env.
+proximadb_config::env_kill_switch! {
+    /// Kill-switch gate; default ON (0|false|off|no disables).
+    pub(crate) fn rg_layout_enabled() { gate: "PROXIMADB_PAX_WRITE_RG_LAYOUT", default: true }
 }
 
 /// Parse a `u64` env override, or return `default`. Used for the coalesced
@@ -3005,10 +2986,23 @@ impl SegmentInvariantsCache {
                 Some(bytes)
             }
             Ok(None) | Err(_) => {
-                self.l2_misses
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                crate::observability::io_trace::record_l2s(0, 1);
-                None
+                // TD-COMPACT-2b step 3: the legacy key missed. Fall back to
+                // the policy's region key (pinned, survives eviction).
+                let policy_key = proximadb_cache::region_key("index", path);
+                match store.get_range(&policy_key, relative_off, len).await {
+                    Ok(Some(bytes)) => {
+                        self.l2_hits
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        crate::observability::io_trace::record_l2s(1, 0);
+                        Some(bytes)
+                    }
+                    _ => {
+                        self.l2_misses
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        crate::observability::io_trace::record_l2s(0, 1);
+                        None
+                    }
+                }
             }
         }
     }
@@ -3632,7 +3626,7 @@ pub fn drain_probe_trace() -> Vec<(u64, u64, u64, u64)> {
 
 /// Resolved coarse-probe settings (TOML-derived; env overrides applied at call
 /// sites, not here). Defaults replicate `CoarseProbeConfig::default()`.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CoarseProbeSettings {
     pub enable_read_probe: bool,
     pub enable_write_train: bool,
@@ -3642,6 +3636,12 @@ pub struct CoarseProbeSettings {
     /// TD-IVF-3 write-side floor on the coarse-PCA projection width; 0 = legacy
     /// formula. Read by `block_cluster::ivf_ncomp_floor()`.
     pub ncomp_floor: usize,
+    /// TD-RDSTRAT-14: the resolved probe policy (algorithm + budgets). The
+    /// numeric fields above are the policy's root-form params — kept flat
+    /// because they predate it; `settings_policy` folds them.
+    pub probe_algorithm: proximadb_storage_common::probe_policy::ProbeAlgorithm,
+    pub probe_base_bytes: u64,
+    pub probe_cap_bytes: u64,
 }
 
 // TD-COMPACT-9: overwritable, NOT first-wins. Every production `SstEngine::new()`
@@ -3659,13 +3659,42 @@ static SHARED_COARSE_PROBE: std::sync::RwLock<Option<CoarseProbeSettings>> =
 /// `SstEngine::new()`) only fills the default if nothing real was set yet.
 /// Poison-safe (no-panic mandate #4).
 pub fn init_coarse_probe_settings(cfg: Option<&crate::core::config::CoarseProbeConfig>) {
+    // Install the settings FIRST, then drop the derived policy cache.
+    // Clearing first opened a window where a query resolved and cached a
+    // policy from the OLD settings; because the repopulate used
+    // `get_or_insert` (first writer wins), that stale entry then survived
+    // the authoritative `Some(cfg)` write for the whole process — exactly
+    // the TD-COMPACT-9 "TOML silently dead" failure this RwLock replaced an
+    // OnceLock to fix.
+    // Bump the generation (invalidating the resolved-policy memo) only when
+    // the stored settings actually CHANGE. Every `SstEngine::new()` calls
+    // this with `None` to fill the default if unset, so an unconditional bump
+    // meant a server building one engine per collection re-ran the env scan —
+    // and re-emitted any WARN for a junk PROXIMADB_PAX_READ_PROBE_* value —
+    // on the next probe query after every construction, defeating the memo
+    // the cache exists for (#2419 review round 23).
+    let mut changed = false;
     if let Ok(mut g) = SHARED_COARSE_PROBE.write() {
         match cfg {
-            Some(c) => *g = Some(c.clone().into()),
+            Some(c) => {
+                let next: CoarseProbeSettings = c.clone().into();
+                changed = g.as_ref() != Some(&next);
+                *g = Some(next);
+            }
             None => {
-                g.get_or_insert_with(CoarseProbeSettings::default);
+                if g.is_none() {
+                    *g = Some(CoarseProbeSettings::default());
+                    changed = true;
+                }
             }
         }
+    }
+    if !changed {
+        return;
+    }
+    COARSE_PROBE_GENERATION.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    if let Ok(mut cached) = RESOLVED_PROBE_POLICY.write() {
+        *cached = None;
     }
 }
 
@@ -3675,8 +3704,34 @@ impl Default for CoarseProbeSettings {
     }
 }
 
+/// Clamp a probe MiB knob to the budget bound, LOUDLY: the loader aborts
+/// boot on an over-bound value, so silently clamping here gave a non-loader
+/// (embedded/programmatic) config a third behaviour — and a mislabelled
+/// experiment arm (#2419 review round 18).
+fn bounded_probe_mb(name: &str, mb: u64, max_mb: u64, reads_budget: bool) -> u64 {
+    if mb > max_mb && reads_budget {
+        // Only warned when the chosen algorithm actually READS the knob:
+        // `CoarseProbeConfig::validate` bounds base/cap inside its
+        // `byte_budget` branch (rejecting them under sqrt would fail a boot
+        // over a knob that form never reads), so warning unconditionally
+        // told operators the loader refuses a value it had just accepted
+        // (#2419 review round 22).
+        tracing::warn!(
+            knob = name,
+            value_mb = mb,
+            max_mb,
+            "coarse_probe.{name} exceeds the probe budget bound; clamping — the loader refuses this at boot under byte_budget, so fix the construction site"
+        );
+    }
+    mb.min(max_mb)
+}
+
 impl From<crate::core::config::CoarseProbeConfig> for CoarseProbeSettings {
     fn from(c: crate::core::config::CoarseProbeConfig) -> Self {
+        let max_mb = proximadb_storage_common::probe_policy::MAX_PROBE_BUDGET_MB as u64;
+        let reads_budget =
+            proximadb_storage_common::probe_policy::ProbeAlgorithm::parse(&c.algorithm)
+                == Some(proximadb_storage_common::probe_policy::ProbeAlgorithm::ByteBudget);
         Self {
             enable_read_probe: c.enable_read_probe,
             enable_write_train: c.enable_write_train,
@@ -3684,6 +3739,34 @@ impl From<crate::core::config::CoarseProbeConfig> for CoarseProbeSettings {
             nprobe_min: c.nprobe_min,
             nprobe_max: c.nprobe_max,
             ncomp_floor: c.ncomp_floor,
+            probe_algorithm: proximadb_storage_common::probe_policy::ProbeAlgorithm::parse(
+                &c.algorithm,
+            )
+            .unwrap_or_else(|| {
+                // The loader aborts on an unknown name; this is the
+                // non-loader path (programmatic/embedded/test
+                // construction). Loud, never silent: a silently
+                // ignored algorithm would invalidate the ladder
+                // experiment this dial exists for.
+                tracing::warn!(
+                    algorithm = %c.algorithm,
+                    "coarse_probe.algorithm is not a known probe \
+                     algorithm (sqrt/cbrt/fourth_root/log/fixed/\
+                     byte_budget); falling back to sqrt — fix the \
+                     construction site"
+                );
+                Default::default()
+            }),
+            // Bounded like the property path: an unbounded MiB->bytes
+            // multiply overflows (mandate #4 forbids the debug panic). A
+            // value OVER the bound is LOUD here: the loader aborts boot on
+            // it, so silently clamping gave a non-loader (embedded/
+            // programmatic) config a third behavior — and a mislabelled
+            // experiment arm (#2419 review round 18).
+            probe_base_bytes: bounded_probe_mb("base_mb", c.base_mb, max_mb, reads_budget)
+                .saturating_mul(1024 * 1024),
+            probe_cap_bytes: bounded_probe_mb("cap_mb", c.cap_mb, max_mb, reads_budget)
+                .saturating_mul(1024 * 1024),
         }
     }
 }
@@ -3696,21 +3779,258 @@ pub(crate) fn coarse_probe_settings() -> CoarseProbeSettings {
         .unwrap_or_default()
 }
 
-/// Geometric nprobe: `ceil(sqrt(k_c) × multiplier)`, clamped to `[min, max]`
-/// then to `k_c`. Sub-linear in corpus (V^0.25): ~56× fewer ranks than full-scan
-/// at 1M. The default multiplier 2.0 is recall-ratcheted by the settled
-/// one-segment SIFT1M geometry (11/30 cells, recall@10 >= 0.98); operators may
-/// trade quality for fewer bytes via TOML. The max-then-min ordering avoids the
-/// `clamp(min, k_c)` panic when `k_c < min` (no-panic mandate #4).
-fn geometric_nprobe(k_c: usize, s: CoarseProbeSettings) -> usize {
-    let raw = ((k_c as f32).sqrt() * s.nprobe_multiplier).ceil() as usize;
-    let floored = raw.max(s.nprobe_min);
-    let bounded = if s.nprobe_max > 0 {
-        floored.min(s.nprobe_max)
+/// TD-RDSTRAT-14: the RESOLVED policy, cached beside the settings — env
+/// scans are not free and this sits on the per-query probe path. Cleared
+/// when settings re-seed so a test/authority rewrite re-resolves.
+static RESOLVED_PROBE_POLICY: std::sync::RwLock<
+    Option<(u64, proximadb_storage_common::probe_policy::ProbePolicy)>,
+> = std::sync::RwLock::new(None);
+
+/// Bumped every time the coarse-probe settings are installed. The resolved
+/// policy is cached WITH the generation it was derived from, so a resolver
+/// that was in flight across a re-seed cannot store its stale value back
+/// (last-write-wins alone allowed exactly that).
+static COARSE_PROBE_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn warn_junk_env(name: &str, value: &str, expected: &str) {
+    tracing::warn!(
+        env = name,
+        value,
+        expected,
+        "PROXIMADB_PAX_READ_PROBE_* override is unparseable and is being IGNORED — \
+         a typo here silently runs the wrong experiment arm"
+    );
+}
+
+/// Bounded like the property and TOML paths: dev/test build with
+/// overflow-checks, so an unbounded MiB->bytes multiply would abort the
+/// query path (mandate #4); in release it wraps, and `mb = 2^44` would
+/// yield `cap_bytes = 0`, which resolution honours as the "no cap"
+/// sentinel — silently removing the cap a typo meant to set.
+const MAX_PROBE_MB: u64 = proximadb_storage_common::probe_policy::MAX_PROBE_BUDGET_MB as u64;
+
+/// The env layer of the chain (env > TOML > code — the same precedence
+/// every other probe knob has), expressed as a [`ServerProbePolicy`] so
+/// resolution goes through the ONE exported path
+/// (`resolve_probe_policy`): no parallel hand-rolled resolver can drift.
+/// NOTE on timing: unlike the other probe env knobs (which are read per
+/// call), `PROXIMADB_PAX_READ_PROBE_*` is folded into the resolved policy
+/// and memoized per settings generation — so an in-process change after the
+/// first probe query is not picked up until the settings are re-seeded.
+/// That matches how the bench harness uses them (set once, per spawned
+/// server) and keeps the env scan off the per-query path.
+fn env_probe_layer() -> proximadb_storage_common::probe_policy::ServerProbePolicy {
+    let mut server = proximadb_storage_common::probe_policy::ServerProbePolicy::default();
+    if let Ok(name) = std::env::var("PROXIMADB_PAX_READ_PROBE_ALGORITHM") {
+        match proximadb_storage_common::probe_policy::ProbeAlgorithm::parse(&name) {
+            // Experimental algorithms need the explicit gate; without it the
+            // override is ignored (warned), like any other refused env value.
+            Some(algorithm) if algorithm.is_experimental() && !probe_experimental_enabled() => {
+                warn_junk_env(
+                    "PROXIMADB_PAX_READ_PROBE_ALGORITHM",
+                    &name,
+                    "sqrt (other algorithms are experimental: set PROXIMADB_PAX_READ_PROBE_EXPERIMENTAL=1)",
+                )
+            }
+            Some(algorithm) => server.algorithm = Some(algorithm.as_str().to_string()),
+            None => warn_junk_env(
+                "PROXIMADB_PAX_READ_PROBE_ALGORITHM",
+                &name,
+                "sqrt|cbrt|fourth_root|log|fixed|byte_budget",
+            ),
+        }
+    }
+    if let Ok(base) = std::env::var("PROXIMADB_PAX_READ_PROBE_BASE_MB") {
+        match base.trim().parse::<u64>() {
+            Ok(mb) if mb > 0 && mb <= MAX_PROBE_MB => {
+                server.base_bytes = Some(mb.saturating_mul(1024 * 1024))
+            }
+            _ => warn_junk_env(
+                "PROXIMADB_PAX_READ_PROBE_BASE_MB",
+                &base,
+                "a positive integer of at most 1048576 (MiB)",
+            ),
+        }
+    }
+    if let Ok(cap) = std::env::var("PROXIMADB_PAX_READ_PROBE_CAP_MB") {
+        match cap.trim().parse::<u64>() {
+            // 0 is the documented "no cap" sentinel on the TOML field this
+            // mirrors; warning-and-ignoring it meant the env could not
+            // express it and the arm silently ran capped at the default.
+            Ok(0) => server.cap_bytes = Some(0),
+            Ok(mb) if mb <= MAX_PROBE_MB => server.cap_bytes = Some(mb.saturating_mul(1024 * 1024)),
+            _ => warn_junk_env(
+                "PROXIMADB_PAX_READ_PROBE_CAP_MB",
+                &cap,
+                "an integer of at most 1048576 (MiB); 0 = no cap",
+            ),
+        }
+    }
+    server
+}
+
+/// Whether the experimental probe algorithms are admitted
+/// (`PROXIMADB_PAX_READ_PROBE_EXPERIMENTAL=1`; see
+/// `proximadb_storage_common::probe_policy::PROBE_EXPERIMENTAL_ENV`).
+pub(crate) fn probe_experimental_enabled() -> bool {
+    proximadb_storage_common::probe_policy::experimental_algorithms_enabled()
+}
+
+/// Fold the flat settings (the historical root-form params) into the
+/// TD-RDSTRAT-14 probe policy. All probe-band formulas live in
+/// `proximadb-storage-common::probe_policy` — tuned in ONE place.
+fn settings_policy(s: &CoarseProbeSettings) -> proximadb_storage_common::probe_policy::ProbePolicy {
+    // The TOML settings become the server layer's BASE; the env layer sits
+    // above it; the code default below. Properties/tags are empty until
+    // the collection-level carrier lands (TD-RDSTRAT-14 §Deferred).
+    // The experimental gate is enforced HERE, where the policy is built, not
+    // only at ConfigLoader: an embedded binding, a programmatic
+    // `ProximaDB::start` or a test builds its Config without the loader, so
+    // a boot-time-only check let an ungated algorithm through (#2419 review
+    // round 11). Same treatment as the env layer: warn and keep sqrt.
+    let algorithm = if s.probe_algorithm.is_experimental() && !probe_experimental_enabled() {
+        tracing::warn!(
+            algorithm = s.probe_algorithm.as_str(),
+            "TD-RDSTRAT-14: experimental probe algorithm configured without PROXIMADB_PAX_READ_PROBE_EXPERIMENTAL=1; using sqrt"
+        );
+        proximadb_storage_common::probe_policy::ProbeAlgorithm::Sqrt
     } else {
-        floored
+        s.probe_algorithm
     };
-    bounded.min(k_c.max(1))
+    let mut server = proximadb_storage_common::probe_policy::ServerProbePolicy {
+        algorithm: Some(algorithm.as_str().to_string()),
+        // Negative = 0 ("floor only"), its historical behaviour; the server
+        // layer drops negatives, which would otherwise silently swap in the
+        // 2.0 default instead (#2419 review round 9). A NON-FINITE multiplier
+        // is refused at boot; a Config built without the loader reaches here,
+        // and the server layer drops it to the 2.0 default — so say so
+        // instead of silently probing approximately where `inf` used to mean
+        // every cell (#2419 review round 12).
+        // NaN and inf took different paths here (NaN.max(0.0) is 0 = floor
+        // only; inf survived to be dropped downstream = 2.0). Both now take
+        // ONE: unusable -> warn -> the default (#2419 review round 13).
+        multiplier: {
+            // Finiteness is judged BEFORE the negative clamp: `.max(0.0)`
+            // turned -inf into 0 ("floor only") without a warning while +inf
+            // warned and used the default (#2419 review round 15). Only a
+            // FINITE negative keeps its historical floor-only meaning.
+            let raw = s.nprobe_multiplier as f64;
+            let m = raw.max(0.0);
+            if raw.is_finite() && proximadb_storage_common::probe_policy::is_valid_multiplier(m) {
+                Some(m)
+            } else {
+                tracing::warn!(
+                    nprobe_multiplier = s.nprobe_multiplier,
+                    "TD-RDSTRAT-14: unusable nprobe_multiplier (non-finite or above the bound); using the default. Use an exact search mode for exhaustive probing"
+                );
+                None
+            }
+        },
+        min_cells: Some(s.nprobe_min),
+        max_cells: Some(s.nprobe_max),
+        base_bytes: Some(s.probe_base_bytes),
+        cap_bytes: Some(s.probe_cap_bytes),
+    };
+    let env = env_probe_layer();
+    if env.algorithm.is_some() {
+        server.algorithm = env.algorithm;
+    }
+    if env.base_bytes.is_some() {
+        server.base_bytes = env.base_bytes;
+    }
+    if env.cap_bytes.is_some() {
+        server.cap_bytes = env.cap_bytes;
+    }
+    proximadb_storage_common::probe_policy::resolve_probe_policy(
+        &std::collections::HashMap::new(),
+        &[],
+        &server,
+    )
+}
+
+fn cached_probe_policy() -> proximadb_storage_common::probe_policy::ProbePolicy {
+    let generation = COARSE_PROBE_GENERATION.load(std::sync::atomic::Ordering::Acquire);
+    // Poison-safe (mandate #4): a panic elsewhere while the lock was held
+    // must not disable the cache forever — that re-ran settings_policy (env
+    // reads + WARNs) on EVERY probe query. Recover the guard; the cached
+    // value is still a valid (generation, policy) pair.
+    if let g = RESOLVED_PROBE_POLICY
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        && let Some((cached_generation, policy)) = g.as_ref()
+        && *cached_generation == generation
+    {
+        return policy.clone();
+    }
+    let resolved = settings_policy(&coarse_probe_settings());
+    {
+        // Poison-safe (see the read above); `into_inner` always yields a
+        // guard, so no `if let`.
+        let mut g = RESOLVED_PROBE_POLICY
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Store ONLY if the settings have not been re-seeded since we read
+        // them. Without this check a resolver that started before a re-seed
+        // could write back a policy derived from the old settings and pin
+        // it for the rest of the process — the TD-COMPACT-9 failure mode
+        // through a narrower window.
+        if COARSE_PROBE_GENERATION.load(std::sync::atomic::Ordering::Acquire) == generation {
+            *g = Some((generation, resolved.clone()));
+        }
+    }
+    resolved
+}
+
+/// Policy nprobe (TD-RDSTRAT-14): the resolved plan's cell count for a pool of
+/// `cells` candidates. The default (`sqrt`) is byte-for-byte the historical
+/// `ceil(sqrt(k_c) × multiplier)` clamped `[min, max]` then to the pool (the
+/// module's regression test pins equality across k_c 1..4096). Callers with
+/// corpus/rowgroup/cell-byte context at hand pass them so non-root forms
+/// (`byte_budget`) scale correctly; root forms ignore them.
+/// Test-only since round 20: every production caller reads the policy once
+/// and calls [`geometric_nprobe_with`] (a second cached read could straddle
+/// a settings re-seed). The wrapper remains for the `#[cfg(test)]` shim.
+#[cfg(test)]
+fn geometric_nprobe(
+    k_c: usize,
+    corpus_rows: u64,
+    rowgroup_bytes: u64,
+    avg_cell_bytes: u64,
+) -> usize {
+    geometric_nprobe_with(
+        &cached_probe_policy(),
+        k_c,
+        corpus_rows,
+        rowgroup_bytes,
+        avg_cell_bytes,
+    )
+}
+
+/// [`geometric_nprobe`] with the policy as an INPUT, so a caller that has
+/// already read it (and branched on the algorithm) cannot be split across a
+/// re-seed.
+fn geometric_nprobe_with(
+    policy: &proximadb_storage_common::probe_policy::ProbePolicy,
+    k_c: usize,
+    corpus_rows: u64,
+    rowgroup_bytes: u64,
+    avg_cell_bytes: u64,
+) -> usize {
+    let plan = proximadb_storage_common::probe_policy::resolve_probe_plan(
+        policy,
+        k_c,
+        corpus_rows,
+        rowgroup_bytes,
+        avg_cell_bytes,
+    );
+    plan.cells
+}
+
+/// Root-form compatibility shim: the historical two-argument call. Root forms
+/// are corpus/geometry-invariant, so the extra inputs are neutral defaults.
+#[cfg(test)]
+fn geometric_nprobe_root(k_c: usize) -> usize {
+    geometric_nprobe(k_c, 0, 4 * 1024 * 1024, 0)
 }
 
 /// TD-RDSTRAT-8 PR-B gate: engage the Region-A0 coarse probe on v3 segments.
@@ -3739,12 +4059,58 @@ pub fn coarse_probe_enabled() -> bool {
 /// `ceil(sqrt(k_c) × multiplier)` from the TOML config
 /// (`[storage.sst_config.coarse_probe] nprobe_multiplier/min/max`), clamped to
 /// `k_c`. `>= k_c` is exact mode (every cell).
-fn coarse_probe_nprobe(k_c: usize) -> usize {
+/// TD-RDSTRAT-14: per-segment nprobe with the probe context the policy
+/// needs (`path` → the rowgroup/IOPS geometry; the parsed directory →
+/// corpus rows and mean cell bytes). Env override precedence unchanged.
+fn coarse_probe_nprobe(
+    k_c: usize,
+    path: &str,
+    dir: &proximadb_storage_common::coarse_directory::CoarseDirectory,
+) -> usize {
     std::env::var("PROXIMADB_PAX_READ_COARSE_NPROBE")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|n| *n > 0)
-        .unwrap_or_else(|| geometric_nprobe(k_c, coarse_probe_settings()))
+        .unwrap_or_else(|| {
+            // The corpus/geometry inputs cost an O(k_c) scan, an O(k_c) mean
+            // and an IopsBudget registry+env lookup per segment — and are
+            // read ONLY by byte_budget (sqrt/cbrt/log/fixed are cell-count
+            // functions; the parity is pinned by test). Gather them lazily,
+            // inside the closure, and only for byte_budget, so the DEFAULT
+            // sqrt path pays none of it (#2419 review round 17; was F2).
+            //
+            // The policy is read ONCE and threaded through: reading it again
+            // inside geometric_nprobe let a settings re-seed between the two
+            // reads plan byte_budget with the zeroed fallback geometry — a
+            // full-pool probe for one query (#2419 review round 18).
+            let policy = cached_probe_policy();
+            if policy.algorithm
+                != proximadb_storage_common::probe_policy::ProbeAlgorithm::ByteBudget
+            {
+                return geometric_nprobe_with(&policy, k_c, 0, 0, 0);
+            }
+            let corpus_rows = dir.cells.iter().map(|c| c.row_end).max().unwrap_or(0);
+            // Average over NON-EMPTY cells only: the probe never reads a
+            // zero-length cell, so including them biased the mean low and
+            // made a band under-read its budget (10 empty of 30 cells turned
+            // an 8 MiB band into ~11 MiB of actual reads).
+            let avg_cell_bytes = {
+                let mut bytes = 0u64;
+                let mut count = 0u64;
+                for cell in &dir.cells {
+                    if cell.a_len > 0 {
+                        // saturating (mandate #4): file-derived a_len
+                        // (#2419 review round 19).
+                        bytes = bytes.saturating_add(cell.a_len);
+                        count += 1;
+                    }
+                }
+                bytes.checked_div(count).unwrap_or(0)
+            };
+            let rowgroup_bytes = proximadb_storage_common::iops_budget::IopsBudget::for_path(path)
+                .target_block_bytes();
+            geometric_nprobe_with(&policy, k_c, corpus_rows, rowgroup_bytes, avg_cell_bytes)
+        })
         .min(k_c.max(1))
 }
 
@@ -3754,12 +4120,38 @@ fn coarse_probe_nprobe(k_c: usize) -> usize {
 /// default as the per-segment probe, applied to the **total** usable cells
 /// (`ceil(sqrt(cells) × multiplier)`), so S segments of k cells probe about
 /// `2·sqrt(S·k)` cells instead of `S · 2·sqrt(k)`.
-pub(crate) fn centroid_directory_nprobe(total_cells: usize) -> usize {
+pub(crate) fn centroid_directory_nprobe_for(
+    first_url: &str,
+    total_cells: usize,
+    corpus_rows: u64,
+    avg_cell_bytes: u64,
+) -> usize {
     std::env::var("PROXIMADB_PAX_READ_CENTROID_DIRECTORY_NPROBE")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|n| *n > 0)
-        .unwrap_or_else(|| geometric_nprobe(total_cells, coarse_probe_settings()))
+        .unwrap_or_else(|| {
+            // Policy read ONCE; the rowgroup budget (registry + env scan) is
+            // resolved ONLY for byte_budget — every other algorithm ignores
+            // it, and this runs per directory-planned query (#2419 review
+            // round 19; same rule as the per-segment path).
+            let policy = cached_probe_policy();
+            let rowgroup_bytes = if policy.algorithm
+                == proximadb_storage_common::probe_policy::ProbeAlgorithm::ByteBudget
+            {
+                proximadb_storage_common::iops_budget::IopsBudget::for_path(first_url)
+                    .target_block_bytes()
+            } else {
+                0
+            };
+            geometric_nprobe_with(
+                &policy,
+                total_cells,
+                corpus_rows,
+                rowgroup_bytes,
+                avg_cell_bytes,
+            )
+        })
         .min(total_cells.max(1))
 }
 
@@ -3783,6 +4175,25 @@ pub(crate) async fn scope_directory_cells<F: std::future::Future>(
         Some(choice) => DIRECTORY_CHOICE.scope(choice, scan).await,
         None => scan.await,
     }
+}
+
+tokio::task_local! {
+    /// O1: set by a caller that resolves OIDs itself, after merging every
+    /// segment's candidates (see [`scope_deferred_topk_oids`]).
+    static DEFER_TOPK_OIDS: ();
+}
+
+/// O1: run a segment cascade that stops after the Region-B rerank. Its
+/// [`CascadeHit`]s carry the position and distance of each top-k row and an
+/// EMPTY `oid`; the caller merges candidates across segments first and then
+/// rehydrates only the global winners, whose records carry the OID. Region D
+/// is not read at all here.
+pub(crate) async fn scope_deferred_topk_oids<F: std::future::Future>(scan: F) -> F::Output {
+    DEFER_TOPK_OIDS.scope((), scan).await
+}
+
+fn deferring_topk_oids() -> bool {
+    DEFER_TOPK_OIDS.try_with(|_| ()).is_ok()
 }
 
 /// PR-D L4: per-cascade stash of the top-k blocks the Region-D OID resolve
@@ -3879,15 +4290,14 @@ struct CoarseProbeResult {
     prefetched_b: Vec<(u64, Vec<u8>)>,
 }
 
-/// TD-PAXDIR-1 D5 READ gate: fetch the probed cells' SQ8 rerank bytes in the
-/// coarse probe's Region-A wave (A0 records each cell's Region-B extent), so
-/// the rerank needs no dependent wave. Trades bytes (every row of a probed
-/// cell, not only survivors) for one fewer round trip. Default ON since D8
-/// (the passing P5b gate arms ran with it); kill-switch off.
-fn same_wave_rerank_enabled() -> bool {
-    crate::storage::engines::sst::block_cluster::env_kill_switch_off(
-        "PROXIMADB_PAX_READ_SAME_WAVE_RERANK",
-    )
+// TD-PAXDIR-1 D5 READ gate: fetch the probed cells' SQ8 rerank bytes in the
+// coarse probe's Region-A wave (A0 records each cell's Region-B extent), so
+// the rerank needs no dependent wave. Trades bytes (every row of a probed
+// cell, not only survivors) for one fewer round trip. Default ON since D8
+// (the passing P5b gate arms ran with it); kill-switch off.
+proximadb_config::env_kill_switch! {
+    /// Kill-switch gate; default ON (0|false|off|no disables).
+    fn same_wave_rerank_enabled() { gate: "PROXIMADB_PAX_READ_SAME_WAVE_RERANK", default: true }
 }
 
 /// Region-B extents of the probed `cells` (A0 entries) whose Region-A read was
@@ -4029,18 +4439,14 @@ pub(crate) fn coalesced_header_prefetch_floor() -> usize {
     SEG_HEADER_PREFIX_LEN
 }
 
-fn split_probe_metadata_cache_enabled() -> bool {
-    // Metadata population is the shipped behavior: the coarse-probe path
-    // already fetched header/A0/RaBitQ params/footer, and failing to retain
-    // those immutable bytes makes every subsequent query repay four GETs.
-    // Preserve the pre-GA positive gate as an emergency opt-out for operators
-    // that explicitly set a false value; unset must remain ON.
-    std::env::var("PROXIMADB_PAX_SPLIT_PROBE_META_CACHE").map_or(true, |value| {
-        !matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "0" | "false" | "off" | "no"
-        )
-    })
+// Metadata population is the shipped behavior: the coarse-probe path
+// already fetched header/A0/RaBitQ params/footer, and failing to retain
+// those immutable bytes makes every subsequent query repay four GETs.
+// Preserve the pre-GA positive gate as an emergency opt-out for operators
+// that explicitly set a false value; unset must remain ON.
+proximadb_config::env_kill_switch! {
+    /// Split-probe metadata-cache kill-switch; default ON.
+    fn split_probe_metadata_cache_enabled() { gate: "PROXIMADB_PAX_SPLIT_PROBE_META_CACHE", default: true }
 }
 
 /// TD-RDSTRAT-8 PR-B: compute survivors from ONLY the `nprobe` nearest coarse
@@ -4117,7 +4523,7 @@ async fn coarse_probe_survivors(
         })
         .collect();
     cell_dist.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-    let nprobe = coarse_probe_nprobe(k_c);
+    let nprobe = coarse_probe_nprobe(k_c, path, &dir);
     // TD-PAXDIR-1 D2: the collection directory already ranked this segment's
     // cells against every other segment's; probe exactly its choice (valid,
     // non-empty, distinct cells only). Filtered queries never carry a
@@ -4307,9 +4713,12 @@ async fn coarse_probe_survivors(
         match survivor_cache {
             Some(sc)
                 if sc
-                    .peek_memory_exact(CacheKind::Other, path, fetch.start, len)
-                    .await
-                    .is_some() =>
+                    // TD-IOBUDGET-3: L2-aware — a range evicted from L1 but
+                    // resident in the exact-key L2 store must not join the
+                    // billed cold wave (get_or_fetch would serve it from L2 and
+                    // drop the wave bytes).
+                    .is_exact_resident(CacheKind::Other, path, fetch.start, len)
+                    .await =>
             {
                 slots.push(Slot::SurvivorCached);
             }
@@ -4474,7 +4883,7 @@ async fn coarse_probe_survivors(
             }
             Slot::Ready(b) => std::sync::Arc::from(b.clone()),
             Slot::SurvivorCached => {
-                // peek_memory_exact said resident, but an LRU race could have
+                // is_exact_resident said resident, but an LRU race could have
                 // evicted before we reach the consume call; fail safe to a real
                 // ranged read (the baseline shape), never panic.
                 let sc = match survivor_cache {
@@ -5604,6 +6013,22 @@ pub async fn rabitq_search_segment_coalesced_allowed(
     let top_k_rows: Vec<usize> = scored.iter().take(k).map(|(g, _)| *g).collect();
 
     drop(prefetched_b); // D5: the same-wave extents are spent
+    if deferring_topk_oids() {
+        // O1: positions + distances only (nearest-first, as step 7 below
+        // orders them); the caller resolves OIDs after the global merge.
+        return Ok(Some(
+            scored
+                .iter()
+                .take(k)
+                .map(|(g, dist)| CascadeHit {
+                    oid: String::new(),
+                    distance: canonical_score_from_rank_score(metric, *dist),
+                    vector: None,
+                    position: *g as u32,
+                })
+                .collect(),
+        ));
+    }
     // 5. ADR-065 Region D: fetch ONLY the top-k OIDs from the row blocks (≤k
     //    coalesced GETs — vs PR2's M-survivor block fetches). Map top-k rows →
     //    blocks via cumulative row counts.
@@ -5760,9 +6185,8 @@ pub async fn rabitq_search_segment_coalesced_allowed(
                 // serve into a billed wave GET whose bytes were then dropped.
                 Some(sc)
                     if sc
-                        .peek_exact_residency(CacheKind::Other, path, desc.start, desc.range_len)
-                        .await
-                        .is_some() =>
+                        .is_exact_resident(CacheKind::Other, path, desc.start, desc.range_len)
+                        .await =>
                 {
                     chunk_slots.push(ChunkSlot::SiteServed);
                 }
@@ -5931,7 +6355,8 @@ pub async fn rabitq_search_segment_coalesced_allowed(
         let oid_fetches = plan_coalesced_block_ranges(&footer, &topk_blocks, &oid_policy);
         // TD-RDSTRAT-12 §3 round 4: peek·batch·feed for the OID tail (mirror of
         // W1; plain exact-key seam — no parent tier here). Classification via the
-        // existing side-effect-free `peek_memory_exact`; one bounded-concurrent
+        // L2-aware `is_exact_resident` (TD-IOBUDGET-3: a DRAM-only peek sent
+        // L2-resident ranges into the billed wave); one bounded-concurrent
         // wave for the true-cold block ranges (D4 bound: min(INFLIGHT,N) ×
         // max_range_bytes ≤ 128 MiB transient).
         enum OidSlot {
@@ -5944,14 +6369,13 @@ pub async fn rabitq_search_segment_coalesced_allowed(
             match survivor_cache {
                 Some(sc)
                     if sc
-                        .peek_memory_exact(
+                        .is_exact_resident(
                             CacheKind::Other,
                             path,
                             fetch.start,
                             fetch.end - fetch.start,
                         )
-                        .await
-                        .is_some() =>
+                        .await =>
                 {
                     oid_slots.push(OidSlot::SiteServed);
                 }

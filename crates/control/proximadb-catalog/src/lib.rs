@@ -20,10 +20,90 @@ pub mod proto {
     pub use proximadb_proto::proximadb_v1;
 }
 
+// ── TD-PATH-2 4c: identity writer-version ladder ─────────────────────────────
+// Shared by BOTH catalog implementations (SystemCatalog snapshot + sidecar,
+// NativeCatalog `_syscat/identity_high_water.json`) so a high-water-aware
+// binary can tell whether a durable artifact it is adopting was published by
+// an older binary that did not maintain the identity high-water.
+
+/// The catalog's identity artifacts were written by a binary that predates
+/// the TD-PATH-2 identity high-water (or the artifact carries no stamp at
+/// all — additive `serde(default)` decodes as `None`).
+pub const IDENTITY_WRITER_VERSION_LEGACY: u32 = 1;
+
+/// The current writer: maintains the identity high-water in its snapshots and
+/// sidecars, and stamps every such artifact so a later reader can detect (and
+/// WARN about) a lagging publisher.
+pub const IDENTITY_WRITER_VERSION_HIGH_WATER: u32 = 2;
+
+/// Whether an adopted artifact's writer-version stamp was produced by a
+/// pre-high-water binary (`None` stamp = written before the stamp existed).
+/// The caller logs a WARN and leans on the independent sidecar / WAL floor.
+pub fn identity_writer_version_lags(stamp: Option<u32>) -> bool {
+    stamp.unwrap_or(IDENTITY_WRITER_VERSION_LEGACY) < IDENTITY_WRITER_VERSION_HIGH_WATER
+}
+
 pub mod cache;
 // Runtime/wiring modules extracted from the root `src/catalog` (decomposition
 // Slice 1 — foundation-pure leaves). The root `crate::catalog` re-exports these
 // so existing `crate::catalog::*` import paths are unchanged.
+
+/// Poison-tolerant `RwLock` helpers shared across catalog modules.
+#[cfg(feature = "fc-metamodel")]
+pub(crate) mod lock_util {
+    use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+
+    /// Acquire a read lock, recovering from poison instead of panicking.
+    pub(crate) fn read_lock<T>(lock: &RwLock<T>) -> RwLockReadGuard<'_, T> {
+        match lock.read() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    /// Acquire a write lock, recovering from poison instead of panicking.
+    pub(crate) fn write_lock<T>(lock: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
+        match lock.write() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::sync::Arc;
+
+        #[test]
+        fn healthy_lock_reads_and_commits_mutations() {
+            let lock = RwLock::new(vec![1]);
+            assert_eq!(*read_lock(&lock), [1]);
+            write_lock(&lock).push(2);
+            assert_eq!(*read_lock(&lock), [1, 2]);
+            assert!(!lock.is_poisoned());
+        }
+
+        #[test]
+        fn poisoned_writer_preserves_data_and_allows_later_reads_and_writes() {
+            let lock = Arc::new(RwLock::new(vec![1]));
+            let writer = Arc::clone(&lock);
+            let result = std::thread::spawn(move || {
+                let mut guard = writer.write().unwrap();
+                guard.push(2);
+                panic!("deliberate writer failure while holding the lock");
+            })
+            .join();
+            assert!(result.is_err());
+            assert!(lock.is_poisoned());
+            assert_eq!(*read_lock(&lock), [1, 2]);
+            write_lock(&lock).push(3);
+            assert_eq!(*read_lock(&lock), [1, 2, 3]);
+            // Recovery must keep working even though poisoning is not cleared.
+            assert!(lock.is_poisoned());
+        }
+    }
+}
+
 pub mod canonical_precision;
 pub mod corpus_version_fs_store;
 #[cfg(feature = "fc-metamodel")]
@@ -2659,8 +2739,16 @@ pub trait Catalog: Send + Sync {
         identifier: &TableIdentifier,
         index_name: &str,
     ) -> anyhow::Result<bool>;
-    async fn list_indexes(&self, identifier: &TableIdentifier)
-    -> anyhow::Result<Vec<CatalogIndex>>;
+    /// List a table's indexes. Default: the table's schema-declared indexes
+    /// (the former identical glue/iceberg/polaris/unity bodies). Backends
+    /// storing indexes elsewhere (e.g. delta's table properties) override.
+    async fn list_indexes(
+        &self,
+        identifier: &TableIdentifier,
+    ) -> anyhow::Result<Vec<CatalogIndex>> {
+        let schema = self.get_table(identifier).await?;
+        Ok(schema.indexes)
+    }
 
     // Statistics
     async fn get_statistics(

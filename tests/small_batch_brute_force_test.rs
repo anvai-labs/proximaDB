@@ -165,6 +165,7 @@ mod small_batch_tests {
             batch_ids: vec![],
             collection_config: Some(collection.clone()),
             estimated_size: 0,
+            collection_properties: None,
         };
 
         let flush_result = engine.do_flush(&flush_params).await.unwrap();
@@ -214,6 +215,7 @@ mod small_batch_tests {
                 batch_ids: vec![],
                 collection_config: Some(collection.clone()),
                 estimated_size: 0,
+                collection_properties: None,
             };
             engine.do_flush(&flush_params).await.unwrap();
         }
@@ -263,6 +265,7 @@ mod small_batch_tests {
             batch_ids: vec![],
             collection_config: Some(collection.clone()),
             estimated_size: 0,
+            collection_properties: None,
         };
 
         let flush_result = engine.do_flush(&flush_params).await.unwrap();
@@ -311,6 +314,7 @@ mod small_batch_tests {
                 batch_ids: vec![],
                 collection_config: Some(collection.clone()),
                 estimated_size: 0,
+                collection_properties: None,
             };
             engine.do_flush(&flush_params).await.unwrap();
         }
@@ -362,6 +366,7 @@ mod small_batch_tests {
                 batch_ids: vec![],
                 collection_config: Some(collection_50.clone()),
                 estimated_size: 0,
+                collection_properties: None,
             })
             .await
             .unwrap();
@@ -385,6 +390,7 @@ mod small_batch_tests {
                 batch_ids: vec![],
                 collection_config: Some(collection_1000.clone()),
                 estimated_size: 0,
+                collection_properties: None,
             })
             .await
             .unwrap();
@@ -466,6 +472,7 @@ mod small_batch_tests {
                 batch_ids: vec![],
                 collection_config: Some(collection.clone()),
                 estimated_size: 0,
+                collection_properties: None,
             };
             let flush_result = engine.do_flush(&flush_params).await.unwrap();
             eprintln!(
@@ -598,6 +605,7 @@ mod small_batch_tests {
                 batch_ids: vec![],
                 collection_config: Some(collection.clone()),
                 estimated_size: 0,
+                collection_properties: None,
             };
             let flush_result = engine.do_flush(&flush_params).await.unwrap();
             eprintln!(
@@ -803,6 +811,7 @@ mod small_batch_tests {
                 batch_ids: vec![],
                 collection_config: Some(collection.clone()),
                 estimated_size: 0,
+                collection_properties: None,
             };
             let flush_result = engine.do_flush(&flush_params).await.unwrap();
             eprintln!(
@@ -878,6 +887,7 @@ mod small_batch_tests {
                 batch_ids: vec![],
                 collection_config: Some(collection.clone()),
                 estimated_size: 0,
+                collection_properties: None,
             };
             engine.do_flush(&flush_params).await.unwrap();
         }
@@ -929,6 +939,7 @@ mod small_batch_tests {
                 batch_ids: vec![],
                 collection_config: Some(collection.clone()),
                 estimated_size: 0,
+                collection_properties: None,
             };
             engine.do_flush(&flush_params).await.unwrap();
         }
@@ -988,6 +999,7 @@ mod small_batch_tests {
                     batch_ids: vec![],
                     collection_config: Some(collection_helix.clone()),
                     estimated_size: 0,
+                    collection_properties: None,
                 })
                 .await
                 .unwrap();
@@ -1016,6 +1028,7 @@ mod small_batch_tests {
                     batch_ids: vec![],
                     collection_config: Some(collection_sst.clone()),
                     estimated_size: 0,
+                    collection_properties: None,
                 })
                 .await
                 .unwrap();
@@ -1090,6 +1103,7 @@ mod small_batch_tests {
                 batch_ids: vec![],
                 collection_config: Some(collection.clone()),
                 estimated_size: 0,
+                collection_properties: None,
             };
             engine.do_flush(&flush_params).await.unwrap();
         }

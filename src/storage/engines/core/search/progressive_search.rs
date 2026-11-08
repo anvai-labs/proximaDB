@@ -298,7 +298,7 @@ impl ProgressiveSearchExecutor {
                                         primary: Some(QuantizedVector {
                                             data: pq_result,
                                             quantization_level: proximadb_quantization_model::UnifiedQuantizationLevel {
-                                                level_type: Some(proximadb_quantization_model::QuantizationLevel::Pq(
+                                                level_type: Some(proximadb_quantization_model::QuantizationScheme::Pq(
                                                     proximadb_quantization_model::ProductQuantization {
                                                         bits_per_code: 8,
                                                         num_subvectors: num_subvectors as i32,

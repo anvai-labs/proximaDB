@@ -114,7 +114,7 @@ mod tests {
              ownership rule on its result",
         ),
         ("src/services/ddl/mod.rs", 5, "unit tests"),
-        ("src/services/dml/tests.rs", 21, "unit tests"),
+        ("src/services/dml/tests.rs", 24, "unit tests"),
         (
             "src/services/external_collection/service.rs",
             1,
@@ -506,6 +506,11 @@ mod tests {
         ),
         (
             "src/network/rest/v2/mod.rs",
+            "/collections/{collection_id}/compact",
+            "tenant: collection resolved within the request tenant via get_collection_with_tenant_context, 404 on miss; maintain-gated (TD-COMPACT-14)",
+        ),
+        (
+            "src/network/rest/v2/mod.rs",
             "/collections/{collection_id}/suspend",
             "tenant: ensure_collection_exists within the request tenant",
         ),
@@ -775,51 +780,6 @@ mod tests {
             "gated off by default (MLflow env gate); MLflow run store scopes by request tenant",
         ),
         (
-            "src/network/rest/canonical/multimodal_query.rs",
-            "/execute",
-            "not mounted (root multimodal router has no caller; api-crate router serves /api/v2/unified)",
-        ),
-        (
-            "src/network/rest/canonical/multimodal_query.rs",
-            "/multi-model",
-            "not mounted (root multimodal router has no caller; api-crate router serves /api/v2/unified)",
-        ),
-        (
-            "src/network/rest/canonical/multimodal_query.rs",
-            "/federated",
-            "not mounted (root multimodal router has no caller; api-crate router serves /api/v2/unified)",
-        ),
-        (
-            "src/network/rest/canonical/multimodal_query.rs",
-            "/distributed",
-            "not mounted (root multimodal router has no caller; api-crate router serves /api/v2/unified)",
-        ),
-        (
-            "src/network/rest/canonical/multimodal_query.rs",
-            "/explain",
-            "not mounted (root multimodal router has no caller; api-crate router serves /api/v2/unified)",
-        ),
-        (
-            "src/network/rest/canonical/multimodal_query.rs",
-            "/prepare",
-            "not mounted (root multimodal router has no caller; api-crate router serves /api/v2/unified)",
-        ),
-        (
-            "src/network/rest/canonical/multimodal_query.rs",
-            "/execute/{statement_id}",
-            "not mounted (root multimodal router has no caller; api-crate router serves /api/v2/unified)",
-        ),
-        (
-            "src/network/rest/canonical/multimodal_query.rs",
-            "/prepared/{statement_id}",
-            "not mounted (root multimodal router has no caller; api-crate router serves /api/v2/unified)",
-        ),
-        (
-            "src/network/rest/canonical/multimodal_query.rs",
-            "/prepared/stats",
-            "not mounted (root multimodal router has no caller; api-crate router serves /api/v2/unified)",
-        ),
-        (
             "src/network/rest/canonical/memory.rs",
             "/ingest",
             "tenant: scope keyed by the authenticated request tenant",
@@ -828,41 +788,6 @@ mod tests {
             "src/network/rest/canonical/memory.rs",
             "/consolidation/{session_id}",
             "tenant: scope keyed by the authenticated request tenant",
-        ),
-        (
-            "src/network/rest/canonical/document.rs",
-            "/collections",
-            "not mounted (root document router has no caller; api-crate router serves /api/v2/document-collections)",
-        ),
-        (
-            "src/network/rest/canonical/document.rs",
-            "/collections/{collection}",
-            "not mounted (root document router has no caller; api-crate router serves /api/v2/document-collections)",
-        ),
-        (
-            "src/network/rest/canonical/document.rs",
-            "/collections/{collection}/documents",
-            "not mounted (root document router has no caller; api-crate router serves /api/v2/document-collections)",
-        ),
-        (
-            "src/network/rest/canonical/document.rs",
-            "/collections/{collection}/documents/{id}",
-            "not mounted (root document router has no caller; api-crate router serves /api/v2/document-collections)",
-        ),
-        (
-            "src/network/rest/canonical/document.rs",
-            "/collections/{collection}/documents/_batch",
-            "not mounted (root document router has no caller; api-crate router serves /api/v2/document-collections)",
-        ),
-        (
-            "src/network/rest/canonical/document.rs",
-            "/collections/{collection}/documents/_aggregate",
-            "not mounted (root document router has no caller; api-crate router serves /api/v2/document-collections)",
-        ),
-        (
-            "src/network/rest/canonical/document.rs",
-            "/collections/{collection}/indexes",
-            "not mounted (root document router has no caller; api-crate router serves /api/v2/document-collections)",
         ),
         (
             "src/network/rest/canonical/iceberg_rest_catalog.rs",
@@ -923,16 +848,6 @@ mod tests {
             "src/network/rest/canonical/aql.rs",
             "/audit/{query_id}",
             "tenant: AQL scope = request tenant (sources resolve within it)",
-        ),
-        (
-            "src/network/rest/canonical/hybrid.rs",
-            "/search",
-            "tenant: hybrid search resolves the collection within the request tenant",
-        ),
-        (
-            "src/network/rest/canonical/hybrid.rs",
-            "/strategies",
-            "tenant: hybrid search resolves the collection within the request tenant",
         ),
         (
             "src/network/rest/canonical/nl.rs",
@@ -1145,6 +1060,11 @@ mod tests {
             "test router (inside a test module)",
         ),
         (
+            "src/network/middleware/auth_failclosed.rs",
+            "/health/ready",
+            "test router (inside a test module)",
+        ),
+        (
             "src/network/middleware/tls.rs",
             "/api/v1/secure",
             "test router (inside a test module)",
@@ -1152,6 +1072,31 @@ mod tests {
         (
             "src/network/middleware/tenant.rs",
             "/api/v1/collections",
+            "test router (inside a test module)",
+        ),
+        (
+            "src/network/middleware/tenant.rs",
+            "/api/v2/collections",
+            "test router (inside a test module)",
+        ),
+        (
+            "src/network/middleware/tenant.rs",
+            "/health",
+            "test router (inside a test module)",
+        ),
+        (
+            "src/network/middleware/tenant.rs",
+            "/health/live",
+            "test router (inside a test module)",
+        ),
+        (
+            "src/network/middleware/tenant.rs",
+            "/health/ready",
+            "test router (inside a test module)",
+        ),
+        (
+            "src/network/middleware/tenant.rs",
+            "/metrics/health",
             "test router (inside a test module)",
         ),
         (
@@ -1503,16 +1448,6 @@ mod tests {
             "crates/platform/proximadb-api/src/rest/canonical/graph.rs",
             "/stats",
             "e2e tenant_owned_resources_are_reachable_only_by_their_owner",
-        ),
-        (
-            "crates/platform/proximadb-api/src/rest/canonical/analytics.rs",
-            "/entanglement",
-            "tenant: collection resolved within the request tenant (absent = default)",
-        ),
-        (
-            "crates/platform/proximadb-api/src/rest/canonical/analytics.rs",
-            "/collections/{collection_id}/entanglement",
-            "tenant: collection resolved within the request tenant (absent = default)",
         ),
         (
             "crates/platform/proximadb-network-middleware/src/rate_limit.rs",

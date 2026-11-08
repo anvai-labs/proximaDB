@@ -1554,13 +1554,7 @@ fn dml_lock_outcome_label(outcome: &LockOutcome) -> &'static str {
 // Lease Types
 ////////////////////////////////////////////////////////////////////////////////
 
-/// Current wall-clock milliseconds since the Unix epoch.
-fn now_millis() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as i64
-}
+use proximadb_kernel::time::now_unix_ms;
 
 /// Error returned by [`validate_fencing`] when a write carries a fencing
 /// generation older than the current durable lease generation.
@@ -1805,6 +1799,60 @@ impl PartitionLease {
     }
 }
 
+/// How a lost version CAS should be settled. ONE rule for both store claim
+/// paths ([`PartitionLeaseStore::acquire_with_key`] and
+/// [`PartitionLeaseStore::begin_writer_incarnation_with_key`]):
+/// *claim-after-death always bumps; live-self always renews; only a LIVE
+/// FOREIGN holder fences* (TD-LEASE-2).
+#[derive(Debug, Clone, PartialEq)]
+enum ConflictResolution {
+    /// Our own pod's live generation won the race: write under it. Losing a
+    /// race against a concurrent batch on THIS pod is a renewal, never a
+    /// displacement — the fence exists to stop a *foreign* pod (the
+    /// 2026-11-01 mid-ingest failure: a whole 400-row batch rejected at
+    /// 1.8M/3M rows for losing a CAS to its own renew loop).
+    Adopted(PartitionLease),
+    /// The winner is dead (expired, ANY pod — reachable via the slow-commit
+    /// pathology where a racer's read→commit outlives the lease TTL): re-run
+    /// the claim; the retry takes the takeover branch and bumps.
+    Retry,
+    /// A live foreign lease owns the resource, or nothing was committed on
+    /// the re-read (never claim ownership whose bytes were not committed).
+    Fenced(PartitionLease),
+}
+
+fn resolve_incarnation_conflict(
+    latest: Option<PartitionLease>,
+    holder_pod: &str,
+    now_ms: i64,
+    attempted: PartitionLease,
+) -> ConflictResolution {
+    match latest {
+        // Never adopt a RELEASED tombstone (even our own): a concurrent
+        // release_with_key commits {released: true, gen+1} and the claim's
+        // stale start-time clock can read it as live — adopting it would
+        // resurrect an explicitly relinquished lock. Route to Fenced.
+        Some(lease) if lease.released => ConflictResolution::Fenced(lease),
+        Some(lease) if lease.holder_pod == holder_pod && !lease.is_expired(now_ms) => {
+            ConflictResolution::Adopted(lease)
+        }
+        Some(lease) if lease.is_expired(now_ms) => ConflictResolution::Retry,
+        Some(lease) => ConflictResolution::Fenced(lease),
+        None => ConflictResolution::Fenced(attempted),
+    }
+}
+
+/// How [`PartitionLeaseStore::claim`] decides the generation to write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ClaimMode {
+    /// `acquire` semantics: renew a LIVE self-lease at the same generation;
+    /// bump on tombstone or death (takeover).
+    RenewOrTakeover,
+    /// `begin_writer_incarnation` semantics: ALWAYS bump (incarnation
+    /// uniqueness across process restarts, ADR-063 D4).
+    AlwaysBump,
+}
+
 /// Outcome of an acquire/renew attempt against the durable lease log.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LeaseOutcome {
@@ -1999,62 +2047,14 @@ impl PartitionLeaseStore {
         now_ms: i64,
         lease_ms: i64,
     ) -> Result<LeaseOutcome> {
-        let committer = self.committer_for_key(key)?;
-        let key_desc = format!("{}:{}", key.tenant_id, key.resource_type.name());
-
-        // Decide the parent version + the generation to claim, from the current
-        // durable state.
-        let (parent, generation) = match self.read_key(key).await? {
-            // Fresh resource — generation 1 (manifest versions start at 0).
-            None => (None, 1),
-            Some((version, lease)) => {
-                // A released tombstone (F7) means the prior holder explicitly
-                // relinquished: the resource is free. Claim a strictly-higher
-                // generation so the monotonic fence stays intact (the tombstone
-                // occupies `lease.generation`; an object-store delete would have
-                // reset it to 1 and collapsed the fence).
-                if lease.released {
-                    // `saturating_add` rather than `+` to honor the no-panic
-                    // policy (matches the manifest version counter's `checked_add`);
-                    // u64 generation overflow is unreachable in practice.
-                    (Some(version), lease.generation.saturating_add(1))
-                } else if lease.holder_pod.as_str() == holder_pod {
-                    // We already own it → renew at the SAME generation
-                    (Some(version), lease.generation)
-                } else if lease.is_expired(now_ms) {
-                    // Take over a dead owner → strictly-higher generation
-                    (Some(version), lease.generation.saturating_add(1))
-                } else {
-                    // A live lease belongs to someone else — we are not the owner.
-                    return Ok(LeaseOutcome::Held { by: lease });
-                }
-            }
-        };
-
-        let lease = PartitionLease::with_key(
-            key.clone(),
+        self.claim(
+            key,
             holder_pod,
-            generation,
             now_ms,
-            now_ms.saturating_add(lease_ms),
-        );
-        let payload = serde_json::to_vec(&lease).context("encoding partition lease")?;
-
-        match committer
-            .commit_fenced(parent, generation, bytes::Bytes::from(payload))
-            .await
-            .with_context(|| format!("committing lease {key_desc}"))?
-        {
-            CommitOutcome::Committed(_) => Ok(LeaseOutcome::Acquired(lease)),
-            // Lost the version CAS or was fenced by a higher generation — re-read
-            // to report who actually owns the resource now.
-            CommitOutcome::Conflict { .. } => match self.read_key(key).await? {
-                Some((_, latest)) => Ok(LeaseOutcome::Fenced { latest }),
-                // Extremely unlikely (the conflicting object vanished) — surface
-                // our own attempt as the latest so the caller does not own it.
-                None => Ok(LeaseOutcome::Fenced { latest: lease }),
-            },
-        }
+            lease_ms,
+            ClaimMode::RenewOrTakeover,
+        )
+        .await
     }
 
     /// Begin a new writer process incarnation. Unlike lease renewal, this always
@@ -2068,34 +2068,118 @@ impl PartitionLeaseStore {
         now_ms: i64,
         lease_ms: i64,
     ) -> Result<LeaseOutcome> {
+        self.claim(key, holder_pod, now_ms, lease_ms, ClaimMode::AlwaysBump)
+            .await
+    }
+
+    /// The one read→decide→commit claim loop shared by both store paths.
+    /// A lost version CAS is settled by [`resolve_incarnation_conflict`] with
+    /// ONE bounded retry (a second dead-writer loss is backpressure: the
+    /// caller's batch retry re-runs the claim). No livelock — the CAS
+    /// serializes contenders; no ABA — versions and generations only advance.
+    async fn claim(
+        &self,
+        key: &ResourceKey,
+        holder_pod: &str,
+        now_ms: i64,
+        lease_ms: i64,
+        mode: ClaimMode,
+    ) -> Result<LeaseOutcome> {
         let committer = self.committer_for_key(key)?;
-        let (parent, generation) = match self.read_key(key).await? {
-            None => (None, 1),
-            Some((version, lease)) => {
-                if !lease.released && !lease.is_expired(now_ms) && lease.holder_pod != holder_pod {
-                    return Ok(LeaseOutcome::Held { by: lease });
+        let key_desc = format!("{}:{}", key.tenant_id, key.resource_type.name());
+
+        for attempt in 0..=1 {
+            // Decide the parent version + generation from the durable state.
+            let (parent, generation) = match self.read_key(key).await? {
+                // Fresh resource — generation 1 (manifest versions start at 0).
+                None => (None, 1),
+                Some((version, lease)) => {
+                    // A released tombstone (F7) means the prior holder
+                    // explicitly relinquished: the resource is free. Claim a
+                    // strictly-higher generation so the monotonic fence stays
+                    // intact (the tombstone occupies `lease.generation`; an
+                    // object-store delete would reset it to 1 and collapse
+                    // the fence). `saturating_add` honors the no-panic policy.
+                    if lease.released {
+                        (Some(version), lease.generation.saturating_add(1))
+                    } else if mode == ClaimMode::RenewOrTakeover
+                        && lease.holder_pod.as_str() == holder_pod
+                        && !lease.is_expired(now_ms)
+                    {
+                        // Live self-lease → renew at the SAME generation. An
+                        // EXPIRED self-lease must NOT renew (a same-generation
+                        // re-commit self-conflicts and would adopt a dead
+                        // lease); it falls through to the takeover bump below
+                        // exactly like a foreign dead owner.
+                        (Some(version), lease.generation)
+                    } else if lease.is_expired(now_ms) {
+                        // Dead owner (self or foreign) → takeover bump.
+                        (Some(version), lease.generation.saturating_add(1))
+                    } else if lease.holder_pod.as_str() != holder_pod {
+                        // A live lease belongs to someone else — not the owner.
+                        return Ok(LeaseOutcome::Held { by: lease });
+                    } else {
+                        // AlwaysBump on a live self-lease (process-incarnation
+                        // semantics: the epoch advances even for this pod).
+                        (Some(version), lease.generation.saturating_add(1))
+                    }
                 }
-                (Some(version), lease.generation.saturating_add(1))
+            };
+
+            let lease = PartitionLease::with_key(
+                key.clone(),
+                holder_pod,
+                generation,
+                now_ms,
+                now_ms.saturating_add(lease_ms),
+            );
+            let payload = serde_json::to_vec(&lease).context("encoding partition lease")?;
+
+            match committer
+                .commit_fenced(parent, generation, bytes::Bytes::from(payload))
+                .await
+                .with_context(|| format!("committing lease {key_desc}"))?
+            {
+                CommitOutcome::Committed(_) => return Ok(LeaseOutcome::Acquired(lease)),
+                CommitOutcome::Conflict { .. } => {
+                    let latest = self.read_key(key).await?.map(|(_, latest)| latest);
+                    match resolve_incarnation_conflict(latest.clone(), holder_pod, now_ms, lease) {
+                        ConflictResolution::Adopted(latest) => {
+                            crate::metrics::record_lease_conflict_resolution("own_adopted");
+                            return Ok(LeaseOutcome::Acquired(latest));
+                        }
+                        ConflictResolution::Retry if attempt == 0 => {
+                            crate::metrics::record_lease_conflict_resolution("dead_winner_retry");
+                            continue;
+                        }
+                        ConflictResolution::Retry => {
+                            crate::metrics::record_lease_conflict_resolution("dead_winner_fenced");
+                            let fallback = latest.unwrap_or_else(|| {
+                                PartitionLease::with_key(
+                                    key.clone(),
+                                    holder_pod,
+                                    generation,
+                                    now_ms,
+                                    now_ms,
+                                )
+                            });
+                            return Ok(LeaseOutcome::Fenced { latest: fallback });
+                        }
+                        ConflictResolution::Fenced(latest) => {
+                            crate::metrics::record_lease_conflict_resolution("foreign_fenced");
+                            return Ok(LeaseOutcome::Fenced { latest });
+                        }
+                    }
+                }
             }
-        };
-        let lease = PartitionLease::with_key(
-            key.clone(),
-            holder_pod,
-            generation,
-            now_ms,
-            now_ms.saturating_add(lease_ms),
-        );
-        let payload = serde_json::to_vec(&lease).context("encoding writer incarnation lease")?;
-        match committer
-            .commit_fenced(parent, generation, bytes::Bytes::from(payload))
-            .await?
-        {
-            CommitOutcome::Committed(_) => Ok(LeaseOutcome::Acquired(lease)),
-            CommitOutcome::Conflict { .. } => match self.read_key(key).await? {
-                Some((_, latest)) => Ok(LeaseOutcome::Fenced { latest }),
-                None => Ok(LeaseOutcome::Fenced { latest: lease }),
-            },
         }
+        // Provably unreachable (the second iteration always returns in one
+        // of the match arms), but the no-panic policy prefers an error
+        // return over unreachable!.
+        Err(anyhow::anyhow!(
+            "partition-lease claim loop exhausted its retry budget without a \
+             terminal outcome (key={key_desc})"
+        ))
     }
 
     /// Legacy compatibility: convert (tenant_id, collection_id) to ResourceKey
@@ -2320,12 +2404,23 @@ impl PartitionLeaseManager {
         collection_id: &str,
         now_ms: i64,
     ) -> Result<bool> {
-        if self
+        // ADR-063 D4: "the registry fast path must not keep answering 'owned'
+        // after renewal errors". The registry binding alone is therefore NOT
+        // enough — the writer incarnation this process last observed must
+        // still be LIVE (the write gate calls `begin_writer_incarnation`
+        // right after, which refreshes it, so steady-state cost is one map
+        // read; after a lapse the fast path falls through to a full acquire,
+        // which takes the takeover-bump branch).
+        let registry_binds_self = self
             .registry
             .lookup(tenant_id, collection_id)
             .map(|binding| binding.pod == self.self_pod_id)
-            .unwrap_or(false)
-        {
+            .unwrap_or(false);
+        let incarnation_live = self
+            .writer_incarnations
+            .get(&format!("{tenant_id}/{collection_id}"))
+            .is_some_and(|state| now_ms < state.1);
+        if registry_binds_self && incarnation_live {
             return Ok(true);
         }
         self.acquire(tenant_id, collection_id, now_ms).await
@@ -2483,30 +2578,52 @@ impl PartitionLeaseManager {
     /// are renewed from the full `ResourceKey` registry.
     pub async fn renew_held(&self, now_ms: i64) -> Result<usize> {
         let mut still_owned = 0;
+        // TD-LEASE-2 (ADR-095 adoption): each authority call is bounded by
+        // half the lease — a hung call counts as a renewal failure instead of
+        // stalling the serial pass for EVERY collection (observed: a 13 s
+        // compaction stall lapsed all incarnations because one slow path
+        // blocked the single renew tick).
+        // Cap each call's timeout at 5 s. This bounds authority-call latency;
+        // the shared loop's cadence is capped separately by
+        // CoreStorageConfig::write_lease_renew_interval for 10 s DML and graph
+        // resource leases.
+        let renew_budget_ms = (self.lease_ms.max(2) / 2).min(5_000);
+        let renew_budget = std::time::Duration::from_millis(renew_budget_ms as u64);
         for (tenant_id, collection_id, binding) in self.registry.list() {
             if binding.pod != self.self_pod_id {
                 continue; // not ours to renew
             }
-            match self
-                .store
-                .acquire(
-                    &tenant_id,
-                    &collection_id,
-                    &self.self_pod_id,
-                    now_ms,
-                    self.lease_ms,
-                )
-                .await
-            {
-                Ok(outcome) => {
+            let renewal = self.store.acquire(
+                &tenant_id,
+                &collection_id,
+                &self.self_pod_id,
+                now_ms,
+                self.lease_ms,
+            );
+            match tokio::time::timeout(renew_budget, renewal).await {
+                Ok(Ok(outcome)) => {
                     if self.reconcile(&tenant_id, &collection_id, outcome) {
                         still_owned += 1;
                     }
                 }
+                // Bounded call elapsed (hung authority call): count it as a
+                // renewal failure and retry next tick — same policy as an
+                // object-store error.
+                // The bounded call elapsed (hung authority call): keep the
+                // binding and retry next tick.
+                Err(_elapsed) => {
+                    tracing::warn!(
+                        tenant = %tenant_id,
+                        collection = %collection_id,
+                        "partition-lease renewal timed out; retrying next interval"
+                    );
+                    crate::metrics::dml_lock_metrics::record_renewal_failure("collection");
+                    still_owned += 1;
+                }
                 // A transient object-store error: keep the binding and retry next
                 // tick rather than spuriously step down (the lease has not lapsed
                 // from our side yet).
-                Err(e) => {
+                Ok(Err(e)) => {
                     tracing::warn!(
                         tenant = %tenant_id,
                         collection = %collection_id,
@@ -2529,12 +2646,11 @@ impl PartitionLeaseManager {
                 continue;
             };
             let key = ResourceKey::legacy_collection(tenant_id, collection_id);
-            match self
-                .store
-                .acquire_with_key(&key, &self.self_pod_id, now_ms, self.lease_ms)
-                .await
-            {
-                Ok(LeaseOutcome::Acquired(lease)) => {
+            let renewal =
+                self.store
+                    .acquire_with_key(&key, &self.self_pod_id, now_ms, self.lease_ms);
+            match tokio::time::timeout(renew_budget, renewal).await {
+                Ok(Ok(LeaseOutcome::Acquired(lease))) => {
                     self.writer_incarnations
                         .insert(identity.clone(), (lease.generation, lease.expires_at_ms));
                     crate::storage::persistence::write_ahead_log::RecoveryTokenProvider::global()
@@ -2546,15 +2662,20 @@ impl PartitionLeaseManager {
                         );
                     still_owned += 1;
                 }
-                Ok(LeaseOutcome::Held { .. } | LeaseOutcome::Fenced { .. }) => {
+                Ok(Ok(LeaseOutcome::Held { .. } | LeaseOutcome::Fenced { .. })) => {
                     self.writer_incarnations.remove(&identity);
                     let _ = crate::storage::persistence::write_ahead_log::RecoveryTokenProvider::global()
                         .expire(collection_id);
                 }
-                Err(error) => {
+                Ok(Err(error)) => {
                     // Keep the last durable expiry. Allocation fails closed once
                     // it passes, even if renewal keeps returning transient errors.
                     tracing::warn!(resource = %identity, %error, "writer incarnation renewal failed");
+                }
+                // Bounded call elapsed (hung authority call): same policy —
+                // keep the last durable expiry, allocation fails closed on it.
+                Err(_elapsed) => {
+                    tracing::warn!(resource = %identity, "writer incarnation renewal timed out");
                 }
             }
         }
@@ -2566,22 +2687,31 @@ impl PartitionLeaseManager {
             .collect::<Vec<_>>();
         for (identity, key) in held_keys {
             let ttl_ms = self.get_ttl_for_resource(&key.resource_type);
-            match self
+            let renewal = self
                 .store
-                .acquire_with_key(&key, &self.self_pod_id, now_ms, ttl_ms)
-                .await
-            {
-                Ok(LeaseOutcome::Acquired(_)) => {
+                .acquire_with_key(&key, &self.self_pod_id, now_ms, ttl_ms);
+            match tokio::time::timeout(renew_budget, renewal).await {
+                Ok(Ok(LeaseOutcome::Acquired(_))) => {
                     still_owned += 1;
                 }
-                Ok(LeaseOutcome::Held { .. } | LeaseOutcome::Fenced { .. }) => {
+                Ok(Ok(LeaseOutcome::Held { .. } | LeaseOutcome::Fenced { .. })) => {
                     self.held_resource_keys.remove(&identity);
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     tracing::warn!(
                         resource = %identity,
                         error = %e,
                         "resource lease renewal failed; retrying next interval"
+                    );
+                    crate::metrics::dml_lock_metrics::record_renewal_failure(
+                        key.resource_type.name(),
+                    );
+                    still_owned += 1;
+                }
+                Err(_elapsed) => {
+                    tracing::warn!(
+                        resource = %identity,
+                        "resource lease renewal timed out; retrying next interval"
                     );
                     crate::metrics::dml_lock_metrics::record_renewal_failure(
                         key.resource_type.name(),
@@ -2645,7 +2775,7 @@ impl PartitionLeaseManager {
             ticker.tick().await; // consume the immediate first tick
             loop {
                 ticker.tick().await;
-                if let Err(e) = self.renew_held(now_millis()).await {
+                if let Err(e) = self.renew_held(now_unix_ms()).await {
                     tracing::warn!(error = %e, "partition-lease renew loop pass failed");
                 }
             }
@@ -2943,7 +3073,7 @@ impl DmlLockService {
     /// This is called periodically by the background reconciliation loop.
     /// It scans all locks and removes those that have expired.
     async fn reconcile_expired_locks(active_locks: &Arc<RwLock<HashMap<String, ActiveLock>>>) {
-        let now_ms = now_millis();
+        let now_ms = now_unix_ms();
         let mut locks = active_locks.write().await;
         let initial_count = locks.len();
 
@@ -3166,7 +3296,7 @@ impl DmlLockService {
         // Best-effort; `release_with_key` is fail-open to TTL internally.
         let _ = self
             .lease_manager
-            .release_with_key(&key, now_millis())
+            .release_with_key(&key, now_unix_ms())
             .await;
     }
 
@@ -3618,7 +3748,7 @@ mod tests {
             100,
         ));
         let key = ResourceKey::legacy_collection("t1", "c1");
-        assert!(mgr.acquire_with_key(&key, now_millis()).await?);
+        assert!(mgr.acquire_with_key(&key, now_unix_ms()).await?);
 
         // Renew every 40ms (≤ TTL/2), fire-and-forget like production.
         let renew_handle = mgr.clone().spawn_renew_loop(Duration::from_millis(40));
@@ -3633,7 +3763,7 @@ mod tests {
             .expect("lease still present");
         assert_eq!(lease.holder_pod, "pod-A");
         assert!(
-            !lease.is_expired(now_millis()),
+            !lease.is_expired(now_unix_ms()),
             "renewal must push expiry forward past now"
         );
         assert_eq!(
@@ -3873,6 +4003,206 @@ mod tests {
         Ok(())
     }
 
+    /// A pod that loses the incarnation CAS to a CONCURRENT BATCH ON ITS OWN
+    /// POD is renewed, not fenced: the fence exists to displace a *foreign*
+    /// pod. This is the mid-ingest failure observed on 2026-11-01 (a whole
+    /// 400-row batch rejected at 1.8M/3M rows under load).
+    #[test]
+    fn incarnation_conflict_resolves_renewal_for_own_pod() {
+        let key = ResourceKey::legacy_collection("t", "c");
+        let ours = PartitionLease::with_key(key.clone(), "A", 2, 0, 10_000);
+        let theirs = PartitionLease::with_key(key.clone(), "B", 2, 0, 10_000);
+
+        // Lost the CAS to our own pod's LIVE newer generation → adopt it.
+        assert!(matches!(
+            resolve_incarnation_conflict(Some(ours.clone()), "A", 5, ours.clone()),
+            ConflictResolution::Adopted(lease) if lease.holder_pod == "A"
+        ));
+        // Our own EXPIRED lease is not a renewal: RETRY (the next claim takes
+        // the takeover branch and bumps).
+        let dead_own = PartitionLease::with_key(key.clone(), "A", 2, 0, 1);
+        assert!(matches!(
+            resolve_incarnation_conflict(Some(dead_own), "A", 10_000, ours.clone()),
+            ConflictResolution::Retry
+        ));
+        // A dead FOREIGN winner is equally a retry — the slow-commit
+        // pathology makes it reachable, and the retry bumps past it.
+        let dead_foreign = PartitionLease::with_key(key.clone(), "B", 2, 0, 1);
+        assert!(matches!(
+            resolve_incarnation_conflict(Some(dead_foreign), "A", 10_000, ours.clone()),
+            ConflictResolution::Retry
+        ));
+        // Lost it to a LIVE foreign pod → fenced, latest surfaced for step-down.
+        assert!(matches!(
+            resolve_incarnation_conflict(Some(theirs.clone()), "A", 5, ours.clone()),
+            ConflictResolution::Fenced(latest) if latest.holder_pod == "B"
+        ));
+        // The re-read observed nothing: never claim ownership whose bytes were
+        // not committed (no phantom lease).
+        let attempted = PartitionLease::with_key(key, "A", 3, 0, 10_000);
+        assert!(matches!(
+            resolve_incarnation_conflict(None, "A", 5, attempted),
+            ConflictResolution::Fenced(_)
+        ));
+    }
+
+    /// End-to-end at the manager: the lease-on-write gate survives same-pod
+    /// renewal races after TTL expiry (the mid-ingest failure mode), while a
+    /// foreign pod still fences.
+    #[tokio::test]
+    async fn ensure_owned_survives_ttl_expiry_and_same_pod_races() -> Result<()> {
+        let backing = shared_backing();
+        let reg_a = Arc::new(PrimaryPodRegistry::new());
+        let reg_b = Arc::new(PrimaryPodRegistry::new());
+        let mgr_a = PartitionLeaseManager::new(Arc::new(store(&backing)), reg_a, "A", LEASE_MS);
+        let mgr_b = PartitionLeaseManager::new(Arc::new(store(&backing)), reg_b, "B", LEASE_MS);
+
+        // The gate sequence: ensure_owned then begin_writer_incarnation (the
+        // latter primes the incarnation cache the D3 fast path requires).
+        assert!(mgr_a.ensure_owned("t", "c", 0).await?);
+        assert!(mgr_a.begin_writer_incarnation("t", "c", 0).await?);
+        let (_, first) = store(&backing).read("t", "c").await?.expect("first lease");
+
+        // In-window ensure: registry-self AND live incarnation → fast path.
+        assert!(mgr_a.ensure_owned("t", "c", 5).await?);
+
+        // After the TTL the fast path must NOT answer owned (ADR-063 D4):
+        // the claim falls through to a full acquire — takeover-bumped, and
+        // the foreign pod remains fenced by the renewed live lease.
+        assert!(mgr_a.ensure_owned("t", "c", 2 * LEASE_MS + 5).await?);
+        let (_, renewed) = store(&backing)
+            .read("t", "c")
+            .await?
+            .expect("renewed lease");
+        assert!(
+            renewed.generation > first.generation,
+            "a lapse bumps, never same-gen renews"
+        );
+        assert!(
+            !mgr_b.ensure_owned("t", "c", 2 * LEASE_MS + 6).await?,
+            "a foreign pod stays fenced by the live renewed lease"
+        );
+        Ok(())
+    }
+
+    /// D3 negative: registry binding alone must NOT short-circuit `owned`
+    /// once the observed incarnation has lapsed — this is precisely the
+    /// ADR-063 clause the old fast path violated.
+    #[tokio::test]
+    async fn ensure_owned_fast_path_requires_a_live_incarnation() -> Result<()> {
+        let backing = shared_backing();
+        let reg = Arc::new(PrimaryPodRegistry::new());
+        let mgr = PartitionLeaseManager::new(Arc::new(store(&backing)), reg.clone(), "A", LEASE_MS);
+
+        assert!(mgr.ensure_owned("t", "c", 0).await?);
+        assert!(mgr.begin_writer_incarnation("t", "c", 0).await?);
+        // Registry still binds self far beyond the TTL…
+        assert_eq!(
+            reg.lookup("t", "c").map(|binding| binding.pod.clone()),
+            Some("A".to_string())
+        );
+        // …but the fast path must decline: the outcome must come from the
+        // durable claim (a fresh, live, bumped lease — true, via the store).
+        assert!(mgr.ensure_owned("t", "c", 5 * LEASE_MS).await?);
+        let (_, lease) = store(&backing)
+            .read("t", "c")
+            .await?
+            .expect("durable lease");
+        assert!(!lease.is_expired(5 * LEASE_MS), "the claim actually ran");
+        Ok(())
+    }
+
+    /// M1 regression: the resolver must NEVER adopt a RELEASED tombstone,
+    /// even of its own pod — adopting it would resurrect an explicitly
+    /// relinquished lock.
+    #[test]
+    fn incarnation_conflict_never_adopts_a_released_tombstone() {
+        let key = ResourceKey::legacy_collection("t", "c");
+        let attempted = PartitionLease::with_key(key.clone(), "A", 3, 0, 10_000);
+        // A released tombstone of our own pod, whose expiry reads as "live"
+        // against the claim's stale start-time clock (release sets
+        // expires_at_ms = release-time now > claim start).
+        let released_own = PartitionLease {
+            released: true,
+            ..PartitionLease::with_key(key.clone(), "A", 4, 5_000, 10_000)
+        };
+        assert!(matches!(
+            resolve_incarnation_conflict(Some(released_own), "A", 0, attempted.clone()),
+            ConflictResolution::Fenced(_)
+        ));
+        // A released tombstone of a foreign pod: equally fenced.
+        let released_foreign = PartitionLease {
+            released: true,
+            ..PartitionLease::with_key(key, "B", 4, 5_000, 10_000)
+        };
+        assert!(matches!(
+            resolve_incarnation_conflict(Some(released_foreign), "A", 0, attempted),
+            ConflictResolution::Fenced(_)
+        ));
+    }
+
+    /// The exact 2026-11-01 manifest-log race shape at the STORE level: the
+    /// renew loop's same-generation renewal and the write path's
+    /// always-bump begin interleave on ONE lease log. Post-fix, both
+    /// sequences commit and every outcome for the same pod is Acquired — a
+    /// pod never fences itself. (The CAS-loss arm of that interleave is
+    /// covered by the resolver unit test above; the loss is forced
+    /// deterministically there.)
+    #[tokio::test]
+    async fn renew_and_begin_interleave_never_self_fences() -> Result<()> {
+        let backing = shared_backing();
+        let key = ResourceKey::legacy_collection("default", "1");
+
+        // Write path begins the incarnation (gen 1).
+        assert!(matches!(
+            store(&backing)
+                .begin_writer_incarnation_with_key(&key, "self", 0, LEASE_MS)
+                .await?,
+            LeaseOutcome::Acquired(_)
+        ));
+        // The renew loop's tick lands (same-generation renewal, same pod).
+        assert!(matches!(
+            store(&backing)
+                .acquire_with_key(&key, "self", 1_000, LEASE_MS)
+                .await?,
+            LeaseOutcome::Acquired(_)
+        ));
+        // A later write-path begin bumps past the renewal — still Acquired.
+        assert!(matches!(
+            store(&backing)
+                .begin_writer_incarnation_with_key(&key, "self", 2_000, LEASE_MS)
+                .await?,
+            LeaseOutcome::Acquired(lease) if lease.generation >= 2
+        ));
+        // And the gate's outcome for the same pod is never Fenced at any
+        // point of that sequence.
+        let (_, final_lease) = store(&backing).read_key(&key).await?.expect("lease");
+        assert_eq!(final_lease.holder_pod, "self");
+        Ok(())
+    }
+
+    /// End-to-end at the manager: a batch outliving the incarnation TTL still
+    /// writes — the same pod re-begins the (bumped) incarnation and both
+    /// generations belong to it.
+    #[tokio::test]
+    async fn writer_incarnation_survives_ttl_expiry_on_the_same_pod() -> Result<()> {
+        let backing = shared_backing();
+        let reg = Arc::new(PrimaryPodRegistry::new());
+        let mgr = PartitionLeaseManager::new(Arc::new(store(&backing)), reg, "A", LEASE_MS);
+
+        // First batch begins the incarnation at t=0.
+        assert!(mgr.begin_writer_incarnation("t", "c", 0).await?);
+        // Long after the TTL a second batch from the SAME pod begins again:
+        // a bump (not a reuse — a restart must bump), and never a fence.
+        for now_ms in [LEASE_MS + 1, 2 * LEASE_MS + 5] {
+            assert!(
+                mgr.begin_writer_incarnation("t", "c", now_ms).await?,
+                "a same-pod re-begin after TTL expiry must write (now={now_ms})"
+            );
+        }
+        Ok(())
+    }
+
     /// A6 fence primitive: `is_fenced_out` (via `current_holder`) detects that a
     /// live lease held by another pod fences this pod out of writing to shared
     /// storage, and fails open when there is no live lease.
@@ -4067,6 +4397,92 @@ mod tests {
             0,
             "released DML lease must no longer be renewed"
         );
+        Ok(())
+    }
+
+    /// Raising the writer TTL must still renew DML, node, and edge leases
+    /// before their initial 10s expiry, using the production config cadence.
+    #[tokio::test]
+    async fn raised_writer_ttl_keeps_short_resource_leases_live() -> Result<()> {
+        let config = crate::core::config::StorageConfig {
+            write_lease_ttl_ms: 30_000,
+            ..Default::default()
+        };
+        let backing = shared_backing();
+        let manager = Arc::new(PartitionLeaseManager::new(
+            Arc::new(store(&backing)),
+            Arc::new(PrimaryPodRegistry::new()),
+            "owner",
+            config.write_lease_ttl_ms as i64,
+        ));
+        manager.register_strategy(Arc::new(GraphNodeStrategy));
+        manager.register_strategy(Arc::new(GraphEdgeStrategy));
+
+        let lock_service = DmlLockService::new(manager.clone(), "owner".to_string());
+        let scope = DmlLockScope::Table {
+            schema_name: "public".to_string(),
+            table_name: "users".to_string(),
+        };
+        assert!(matches!(
+            lock_service
+                .acquire_dml_lock("tenant", None, &scope, LockIntent::Write, 0)
+                .await?,
+            LockOutcome::Acquired { .. }
+        ));
+        let mut keys = vec![ResourceKey::table("tenant", "public", "users")];
+        for strategy in [
+            &GraphNodeStrategy as &dyn ResourceStrategy,
+            &GraphEdgeStrategy as &dyn ResourceStrategy,
+        ] {
+            let key = strategy.make_key("tenant", None, &["graph".into(), "element".into()])?;
+            assert!(manager.acquire_with_key(&key, 0).await?);
+            keys.push(key);
+        }
+        let mut generations = Vec::new();
+        for key in &keys {
+            let (_, lease) = manager
+                .store
+                .read_key(key)
+                .await?
+                .context("initial lease")?;
+            assert_eq!(lease.expires_at_ms, 10_000);
+            generations.push(lease.generation);
+        }
+
+        let interval_ms = config.write_lease_renew_interval().as_millis() as i64;
+        // Probe just before each scheduled renewal, including beyond both the
+        // initial resource lifetime and the configured writer TTL. An expired
+        // lease would let this peer acquire it and advance the generation.
+        for tick in 1..=7 {
+            let now_ms = tick * interval_ms;
+            for key in &keys {
+                assert!(
+                    matches!(
+                        manager
+                            .store
+                            .acquire_with_key(key, "peer", now_ms - 1, 10_000)
+                            .await?,
+                        LeaseOutcome::Held { .. }
+                    ),
+                    "{} became takeover-eligible before renewal at {now_ms}ms",
+                    key.resource_type.name()
+                );
+            }
+            assert_eq!(manager.renew_held(now_ms).await?, keys.len());
+            for (key, generation) in keys.iter().zip(&generations) {
+                let (_, lease) = manager
+                    .store
+                    .read_key(key)
+                    .await?
+                    .context("renewed lease")?;
+                assert_eq!(lease.holder_pod, "owner");
+                assert_eq!(
+                    lease.generation, *generation,
+                    "live renewal must preserve the fence"
+                );
+                assert!(!lease.is_expired(now_ms));
+            }
+        }
         Ok(())
     }
 
@@ -4453,7 +4869,7 @@ mod tests {
         };
 
         // Manually insert locks with different expiry times
-        let now_ms = now_millis();
+        let now_ms = now_unix_ms();
         let mut locks = lock_service.active_locks.write().await;
         locks.insert(
             DmlLockService::scoped_lock_key("tenant1", None, &scope1),

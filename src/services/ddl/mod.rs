@@ -90,6 +90,10 @@ pub enum DdlStatement {
         /// Name of the table to materialize.
         name: String,
     },
+    /// `COMPACT TABLE <name> [FULL]` — operator compaction (TD-COMPACT-14).
+    /// FULL collapses toward
+    /// `[storage.compaction_config] full_target_segments`. Mutates no schema.
+    CompactTable { name: String, full: bool },
     /// CREATE INDEX [IF NOT EXISTS] index_name ON table_name (columns)
     CreateIndex {
         /// Name of the index to create.
@@ -492,6 +496,53 @@ pub trait TableMaterializer: Send + Sync {
     ) -> Result<String>;
 }
 
+/// Summary of one operator compaction (`COMPACT TABLE ... [FULL]`), as
+/// reported by the engine's `CompactionResult.engine_metrics`. Fields the
+/// engine did not report stay `None`.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CompactSummary {
+    pub collection_id: String,
+    pub full: bool,
+    /// The provenance fields, EMBEDDED rather than hand-copied (#2418 review
+    /// round 16).
+    pub metrics: crate::storage::traits::FullCompactionMetrics,
+}
+
+impl CompactSummary {
+    /// Map the engine metrics keys written by the SST FULL branch; a plain
+    /// (non-full) pass reports none of them.
+    pub fn from_result(
+        collection_id: &str,
+        full: bool,
+        result: &crate::storage::traits::CompactionResult,
+    ) -> Self {
+        // The single extraction point shared with REST and Flight.
+        let metrics = result.full_compaction_metrics();
+        Self {
+            collection_id: collection_id.to_string(),
+            full,
+            metrics,
+        }
+    }
+}
+
+/// Operator compaction capability for `COMPACT TABLE ... [FULL]`
+/// (TD-COMPACT-14). Injected into [`DdlService`] so the DDL path can trigger
+/// compaction without depending on the vector engine directly — the same
+/// pattern as [`TableMaterializer`].
+#[async_trait::async_trait]
+pub trait CollectionCompactor: Send + Sync {
+    /// Compact `table` (name or id), scoped to `tenant`. `full` requests the
+    /// cross-level collapse. Fails when the table does not exist for the
+    /// tenant.
+    async fn compact(
+        &self,
+        tenant: Option<&str>,
+        table: &str,
+        full: bool,
+    ) -> Result<CompactSummary>;
+}
+
 /// The authority a publisher re-checks immediately before it commits a new
 /// snapshot (P2.4 fenced advance). `Err` means this process may no longer
 /// publish the table — typically its write lease moved to another pod.
@@ -534,6 +585,9 @@ pub struct DdlService {
     /// absent for paths without a configured warehouse object store (those get a
     /// clean error when the statement is issued).
     materializer: Option<Arc<dyn TableMaterializer>>,
+    /// Optional collection compactor. Required for `COMPACT TABLE`; absent
+    /// for paths without the vector engine wired (clean error on use).
+    collection_compactor: Option<Arc<dyn CollectionCompactor>>,
     /// Optional rank-profile catalog. Required for `CREATE RANK PROFILE` /
     /// `DROP RANK PROFILE`; absent for embedded paths that never see those
     /// statements.
@@ -569,6 +623,7 @@ impl DdlService {
         Self {
             catalog_manager,
             materializer: None,
+            collection_compactor: None,
             rank_profile_store: None,
             rank_services: None,
             function_store: None,
@@ -581,6 +636,12 @@ impl DdlService {
 
     /// Attach the table materializer. Required by `ALTER TABLE … MATERIALIZE`;
     /// callers that don't wire it get a clean error when that statement is issued.
+    /// Attach the operator compaction capability (`COMPACT TABLE ...`).
+    pub fn with_collection_compactor(mut self, compactor: Arc<dyn CollectionCompactor>) -> Self {
+        self.collection_compactor = Some(compactor);
+        self
+    }
+
     pub fn with_materializer(mut self, materializer: Arc<dyn TableMaterializer>) -> Self {
         self.materializer = Some(materializer);
         self
@@ -746,6 +807,52 @@ impl DdlService {
             } => {
                 self.check_lease_for_write(tenant, &table_name).await?;
                 self.alter_table(&table_name, changes, tenant).await
+            }
+            DdlStatement::CompactTable { name, full } => {
+                self.check_lease_for_write(tenant, &name).await?;
+                let compactor = self.collection_compactor.as_ref().ok_or_else(|| {
+                    anyhow!(
+                        "COMPACT TABLE requires the vector compaction capability \
+                         (no collection compactor is wired)"
+                    )
+                })?;
+                let summary = compactor.compact(tenant, &name, full).await?;
+                self.check_lease_for_write(tenant, &name).await?;
+                let before = summary
+                    .metrics
+                    .segments_before
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "?".to_string());
+                let after = summary
+                    .metrics
+                    .segments_after
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "?".to_string());
+                // TD-COMPACT-15: measured I/O + why the loop stopped — the
+                // provenance an operator needs to trust the message.
+                let io_note = match (summary.metrics.bytes_read, summary.metrics.bytes_written) {
+                    // Only state a duration that was MEASURED: unwrap_or(0)
+                    // printed a fabricated "in 0ms" as provenance whenever a
+                    // path set the byte counters but not the clock (now
+                    // reachable, since the metrics extractor falls back to the
+                    // canonical top-level byte fields).
+                    (Some(read), Some(written)) => match summary.metrics.duration_ms {
+                        Some(ms) => format!(", {read} read / {written} written in {ms}ms"),
+                        None => format!(", {read} read / {written} written"),
+                    },
+                    _ => String::new(),
+                };
+                let stop_note = match (&summary.metrics.stop_reason, summary.metrics.reached_target)
+                {
+                    (Some(reason), _) => format!(" (stopped: {reason})"),
+                    (None, Some(false)) => " (stopped before target)".to_string(),
+                    _ => String::new(),
+                };
+                Ok(DdlResult::success(format!(
+                    "Compacted table '{name}' (full={full}): {before} -> {after} segments \
+                     in {} passes{stop_note}{io_note}",
+                    summary.metrics.passes.unwrap_or(0),
+                )))
             }
             DdlStatement::MaterializeTable { name } => {
                 self.check_lease_for_write(tenant, &name).await?;
@@ -1665,6 +1772,14 @@ impl DdlService {
         // System-written properties (a collection's record, its owner) are
         // never client-settable.
         proximadb_catalog::table_properties::ensure_no_reserved_table_properties(&properties)?;
+        // The FOURTH door: `CREATE TABLE … WITH (…)` and `create_collection`
+        // land here. Without this, a policy typo was stored verbatim and
+        // inert at create while the identical key through
+        // `ALTER TABLE … SET` was rejected — the accepted-but-inert split
+        // the single boundary exists to close.
+        if let Err(error) = proximadb_storage_common::validate_policy_properties(&properties) {
+            anyhow::bail!("invalid table property: {error}");
+        }
         let mut schema = CatalogTableSchema::new(table_name);
         schema.properties = properties;
 
@@ -2047,6 +2162,20 @@ impl DdlService {
                     }
                 }
                 AlterTableChange::SetTableOption { key, value } => {
+                    // Validate EVERY policy family at SET time through the
+                    // one boundary (`validate_policy_properties`): cache.*
+                    // (TD-COMPACT-2b), compaction.* (TD-COMPACT-15) and
+                    // probe.* (TD-RDSTRAT-14). A typo fails here instead of
+                    // being stored and silently doing nothing, and a fourth
+                    // family cannot be half-wired — it is one line in that
+                    // function, not a new arm in every door.
+                    let mut candidate = std::collections::HashMap::new();
+                    candidate.insert(key.clone(), value.clone());
+                    if let Err(error) =
+                        proximadb_storage_common::validate_policy_properties(&candidate)
+                    {
+                        anyhow::bail!("invalid table property: {error}");
+                    }
                     SchemaChange::SetTableOption { key, value }
                 }
             };
@@ -2620,6 +2749,100 @@ mod tests {
         DdlService::new(std::sync::Arc::new(CatalogManager::new()))
     }
 
+    /// A `CollectionCompactor` that records the call and returns a canned
+    /// summary (the engine loop is covered by the `full_compaction_*` tests
+    /// in `src/storage/flush_materializer.rs`).
+    struct RecordingCompactor {
+        calls: std::sync::Mutex<Vec<(Option<String>, String, bool)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl CollectionCompactor for RecordingCompactor {
+        async fn compact(
+            &self,
+            tenant: Option<&str>,
+            table: &str,
+            full: bool,
+        ) -> anyhow::Result<CompactSummary> {
+            self.calls
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push((tenant.map(str::to_string), table.to_string(), full));
+            Ok(CompactSummary {
+                collection_id: table.to_string(),
+                full,
+                metrics: crate::storage::traits::FullCompactionMetrics {
+                    segments_before: Some(3),
+                    segments_after: Some(1),
+                    passes: Some(2),
+                    reached_target: Some(true),
+                    ..Default::default()
+                },
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn compact_table_without_capability_errors_cleanly() {
+        let ddl = lease_ddl();
+        let error = ddl
+            .execute_scoped(
+                DdlStatement::CompactTable {
+                    name: "inv".to_string(),
+                    full: true,
+                },
+                None,
+            )
+            .await
+            .expect_err("no compactor wired");
+        assert!(
+            error.to_string().contains("vector compaction capability"),
+            "actionable error: {error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_table_runs_the_capability_and_reports_the_summary() {
+        let compactor = std::sync::Arc::new(RecordingCompactor {
+            calls: std::sync::Mutex::new(Vec::new()),
+        });
+        let ddl = lease_ddl().with_collection_compactor(compactor.clone());
+        for (full, expected_fragment) in [
+            (true, "3 -> 1 segments in 2 passes"),
+            (false, "3 -> 1 segments in 2 passes"),
+        ] {
+            let result = ddl
+                .execute_scoped(
+                    DdlStatement::CompactTable {
+                        name: "inv".to_string(),
+                        full,
+                    },
+                    Some("tenant-a"),
+                )
+                .await
+                .expect("compact executes");
+            assert!(result.success);
+            assert!(
+                result.message.contains(expected_fragment),
+                "summary rides the message: {}",
+                result.message
+            );
+        }
+        let calls = compactor
+            .calls
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        assert_eq!(
+            calls,
+            vec![
+                (Some("tenant-a".to_string()), "inv".to_string(), true),
+                (Some("tenant-a".to_string()), "inv".to_string(), false),
+            ],
+            "the tenant and mode flow to the capability"
+        );
+    }
+
     #[tokio::test]
     async fn check_lease_for_write_is_noop_when_not_wired() {
         // No registry / pod id attached ⇒ inert; every DDL is allowed.
@@ -2797,10 +3020,11 @@ mod tests {
             .expect("manager acquires the lease (no contention) => Allow");
     }
 
-    // External-location allowlist (Path Isolation, fail-closed). Serialized by
-    // the shared env var; nextest's process-per-test isolation keeps these from
-    // racing other tests.
+    // External-location allowlist (Path Isolation, fail-closed). Serialized on
+    // the shared env-gate lock: this test sets AND clears the process env var,
+    // which the plain `cargo test --lib` runner shares across all tests.
     #[test]
+    #[serial_test::serial]
     fn external_location_allowlist_is_fail_closed_and_boundary_aware() {
         // Unset ⇒ everything rejected (feature off by default).
         unsafe { std::env::remove_var("PROXIMADB_EXTERNAL_TABLE_ROOTS") };

@@ -5,7 +5,7 @@ mod common;
 use anyhow::Result;
 use proximadb::compute::distance_computation::engine::{DistanceMetric, UnifiedDistanceCompute};
 use proximadb::compute::quantization::{
-    BinaryQuantization, InMemoryCodebookStore, ProductQuantization as PqConfig, QuantizationLevel,
+    BinaryQuantization, InMemoryCodebookStore, ProductQuantization as PqConfig, QuantizationScheme,
     StorageQuantizationConfig, StorageQuantizationEngine, UnifiedQuantizationEngine,
     UnifiedQuantizationLevel,
 };
@@ -62,7 +62,7 @@ async fn test_quantization_statistics_comprehensive() -> Result<()> {
             (
                 "Binary Quantization",
                 Some(UnifiedQuantizationLevel {
-                    level_type: Some(QuantizationLevel::Binary(BinaryQuantization {
+                    level_type: Some(QuantizationScheme::Binary(BinaryQuantization {
                         threshold: None,
                         sign_based: false,
                     })),
@@ -77,7 +77,7 @@ async fn test_quantization_statistics_comprehensive() -> Result<()> {
             (
                 "PQ8 Quantization",
                 Some(UnifiedQuantizationLevel {
-                    level_type: Some(QuantizationLevel::Pq(PqConfig {
+                    level_type: Some(QuantizationScheme::Pq(PqConfig {
                         num_subvectors: 8,
                         bits_per_code: 8,
                         codebook_id: None,
@@ -89,7 +89,7 @@ async fn test_quantization_statistics_comprehensive() -> Result<()> {
             (
                 "PQ4 Quantization",
                 Some(UnifiedQuantizationLevel {
-                    level_type: Some(QuantizationLevel::Pq(PqConfig {
+                    level_type: Some(QuantizationScheme::Pq(PqConfig {
                         num_subvectors: 16,
                         bits_per_code: 4,
                         codebook_id: None,
@@ -105,7 +105,7 @@ async fn test_quantization_statistics_comprehensive() -> Result<()> {
             (
                 "PQ8 Quantization",
                 Some(UnifiedQuantizationLevel {
-                    level_type: Some(QuantizationLevel::Pq(PqConfig {
+                    level_type: Some(QuantizationScheme::Pq(PqConfig {
                         num_subvectors: 8,
                         bits_per_code: 8,
                         codebook_id: None,
@@ -164,14 +164,14 @@ async fn run_quantization_test(
     primary_level: Option<UnifiedQuantizationLevel>,
     fast_level: Option<UnifiedQuantizationLevel>,
 ) -> Result<TestResult> {
-    let start_time = Instant::now();
+    let _start_time = Instant::now();
 
     // Create temporary directory
     let temp_dir = TempDir::new()?;
     let base_path = temp_dir.path().to_str().unwrap();
 
     // Setup SST engine with test configuration
-    let sst_config = SstConfig::test_config_256kb(); // Use 256KB blocks for clustering
+    let _sst_config = SstConfig::test_config_256kb(); // Use 256KB blocks for clustering
     let fs_config = FilesystemConfig {
         default_fs: Some(format!("file://{}", base_path)),
         local: Some(LocalConfig::default()),
@@ -180,10 +180,10 @@ async fn run_quantization_test(
         performance_config: FilesystemPerformanceConfig::default(),
         scheme_mapping: HashMap::new(),
     };
-    let filesystem = Arc::new(FilesystemFactory::create(fs_config).await?);
+    let _filesystem = Arc::new(FilesystemFactory::create(fs_config).await?);
 
-    let distance_compute = Arc::new(UnifiedDistanceCompute::default());
-    let mut sst_storage = SstEngine::new().await?;
+    let _distance_compute = Arc::new(UnifiedDistanceCompute::default());
+    let sst_storage = SstEngine::new().await?;
 
     // Calculate baseline (uncompressed) size
     let baseline_size = vectors.len() * dimension * 4; // FP32 = 4 bytes per float
@@ -257,6 +257,7 @@ async fn run_quantization_test(
         batch_ids: vec![],
         collection_config: Some(collection.clone()),
         estimated_size: 0,
+        collection_properties: None,
     };
 
     // Vectors are already in flush_params, no need for insert_batch

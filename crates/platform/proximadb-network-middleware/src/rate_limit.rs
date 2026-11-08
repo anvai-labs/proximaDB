@@ -347,8 +347,11 @@ fn trusted_proxies() -> &'static crate::client_addr::TrustedProxies {
     TRUSTED.get_or_init(crate::client_addr::TrustedProxies::from_env)
 }
 
-/// Check if the path is a health endpoint
-fn is_health_endpoint(path: &str) -> bool {
+/// Check if the path is a health endpoint.
+///
+/// Shared across rate-limit, auth, and TLS middleware so the definition
+/// of "health endpoint" stays in one place.
+pub fn is_health_endpoint(path: &str) -> bool {
     path.starts_with("/health")
 }
 
@@ -402,14 +405,6 @@ mod tests {
         bucket.increment(window);
         assert_eq!(bucket.count, 1);
         assert!(bucket.is_within_limit(10, window));
-    }
-
-    #[test]
-    fn test_is_health_endpoint() {
-        assert!(is_health_endpoint("/health"));
-        assert!(is_health_endpoint("/health/ready"));
-        assert!(is_health_endpoint("/health/live"));
-        assert!(!is_health_endpoint("/collections"));
     }
 
     #[test]
@@ -671,6 +666,9 @@ mod tests {
         assert!(is_health_endpoint("/health/ready"));
         assert!(is_health_endpoint("/health/live"));
         assert!(is_health_endpoint("/health/startup"));
+        assert!(!is_health_endpoint("/collections"));
+        assert!(!is_health_endpoint("/api/health"));
+        assert!(!is_health_endpoint("/Health"));
         assert!(!is_health_endpoint("/api/v1/collections"));
         assert!(!is_health_endpoint("/metrics"));
         assert!(!is_health_endpoint("/"));

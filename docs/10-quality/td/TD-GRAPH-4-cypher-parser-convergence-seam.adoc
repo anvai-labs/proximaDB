@@ -1,0 +1,178 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-GRAPH-4: Cypher parser convergence — one grammar behind the graph-query seam, not two drifting forks
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Convergence LANDED 2026-11-02: seam extracted → corpus pinned → steps 1-2 (shared lexemes/patterns, type unification) → step-3 prerequisite (four review passes, corpus 41→61) → step 3 (the modality parser IS the conversion layer; write grammar is ONE behind the seam). Remaining: the SQL-lowering read entry (a TD non-goal — and see its correction below). The mixed-operator precedence decision is MADE: FLAT LEFT-ASSOC (the retired live grammar's semantics), implemented in the seam's where-chain and pinned by two corpus entries.**
+| Priority | P2 — two live nom-based Cypher grammars with 34 shared function names and drifted bodies is the standard fork disease; every parser fix must currently land twice or silently miss one path.
+| Relates to | link:TD-GRAPH-3-cypher-variable-length-multihop.adoc[TD-GRAPH-3] (variable-length parsing), the 2026-10-31 victor clone-scan dedup program (wave 3)
+| Component | `crates/query/proximadb-graph-query/src/parser/` (read path + `write_seam.rs`), `crates/modalities/proximadb-graph/src/cypher_parser.rs` (the graph-API grammar), `src/query/parsers/cypher.rs` + `src/graph/query/graph_parser.rs` (its consumers).
+| Evidence | 2026-10-31 scan: two parsers, 54 vs 43 top-level fns, 34 shared names, drifted bodies (`ParseResult` vs `IResult`, combinator reorg); graph-consumer analysis: the graph-query crate's ONLY runtime consumer is `proximadb-query/src/graph_lowering.rs` (`QueryParser`, the read path), while its full-Cypher write grammar (CREATE/MERGE/DELETE/SET/REMOVE/WITH/OPTIONAL MATCH over `CypherQuery`) is unwired — exercised solely by its own 19 tests in the parser test module. The modality crate's parser is the live full-Cypher implementation (graph API path).
+|===
+
+== The finding
+
+The repository carries two independently evolved Cypher grammars. The graph-query crate's
+full-query grammar sat inside `parser.rs` behind a single scattered `#[allow(dead_code)]`,
+reading as accidental residue rather than what the owner has declared it: **an intentional seam
+to build upon** (owner decision 2026-11-01) and the convergence target for the modality crate's
+drifted twin.
+
+== Direction
+
+1. **Seam made explicit** (landed; amended 2026-11-01): the write grammar lives in
+   `parser/write_seam.rs` with its rationale and its 19 tests intact (parser module: 19 seam
+   + 17 read-path = 36; crate total 47/47 green; pure code motion). The original module-level
+   `dead_code` allowance was removed when the module became `pub` (its full-query entry is
+   the declared convergence surface) — every private combinator is reachable from that entry,
+   so no allowance is needed.
+2. **Convergence design** (step 1 LANDED 2026-11-02 — shared lexemes): the token-level
+   parsers now live ONCE in `parser/lexemes.rs` (generic over the nom error type), with the
+   MODALITY's behavior as the superset (quoted/backtick identifiers, negative integers,
+   floats with exponents, case-insensitive booleans, `null`, arrays, empty strings,
+   permissive map spacing). Both grammars in this crate AND the modality's graph-API parser
+   delegate to them — previously the seam accepted strictly less, so adopting the superset
+   only makes previously-REJECTED inputs parse; the 41-entry pinned corpus stayed
+   byte-identical through the switch (the differential check this pin exists for). Remaining
+   steps (step 2 LANDED 2026-11-02 — shared constraint patterns + type
+   unification): the modality's `PropertyConstraint` twin is GONE —
+   `query_ast` re-exports the seam's superset enum (adds `NotIn` + the
+   `GreaterThanOrEqual`/`LessThanOrEqual` aliases; CLAUDE.md #19), so the
+   two grammars now share ONE constraint type and ONE constraint-map
+   pattern (`lexemes::constraint_map`, both sides delegating). The step-1
+   ledger's three items are executed: inf→0 → parse error (both paths);
+   null rejected in constraint position (write path still allows
+   set-to-null); the live read entry errors on unconsumed remainder.
+   Step-3 prerequisite LANDED 2026-11-02, in TWO passes (the second after
+   round-1 review proved the first pass's completeness claim premature —
+   the blind-spot list itself was incomplete): the seam GAINED the
+   modality's constructs — pass 1: `IN` predicates, multi-label `:A:B`
+   (MATCH), bare-variable `AS` aliasing, `COUNT(DISTINCT n)` → Count
+   (DISTINCT takes exactly one bare identifier, the modality's shape —
+   review F2 tightened a garbage-accepting take_while form); pass 2 (the
+   review's full counterexample list): CONTAINS / STARTS WITH / ENDS
+   WITH, IS NULL / IS NOT NULL, `<>` and `=~` (→ Regex), the XOR
+   combinator (a new `WhereClause::Xor` variant — the seam AST's one
+   superset gain, with boolean-equivalent lowering `(l∨r)∧¬(l∧r)` in
+   graph_adapter, `^` in graph_runtime, accepted in lowering validation),
+   backtick-quoted identifiers everywhere (variables, labels, WHERE
+   operands), case-insensitive `as`/AND/OR/NOT, permissive node-pattern
+   spacing, and write-path multi-label CREATE (which had left the seam
+   internally inconsistent: MERGE multi-label parsed, CREATE did not).
+   ROUND 3 then falsified pass 2's keyword list (`on` never landed; the
+   ORDER/BY/ASC/DESC/OPTIONAL keywords were also still case-sensitive) and
+   corrected one false-parity claim (CREATE-edge alternation was a seam
+   SUPERSET silently dropping the extra types — now single-type, matching
+   the modality). Landed: case- and spacing-permissive ON CREATE / ON
+   MATCH, lowercase order/by/asc/desc/optional; corpus 58→60.
+   **REMAINING MODALITY-ONLY LEDGER (probed 2026-11-02, round 3 battery —
+   the list the pin cannot hold, maintained HERE):** none found by the
+   round-3 battery (23 R2 shapes + 22 fresh shapes; the only MODALITY-only
+   results were the ON/order/optional items fixed in this pass). Shared
+   gaps (BOTH reject): permissive spacing around label colons
+   (`( n : A : B )`), ASCENDING/DESCENDING long forms, SKIP-after-LIMIT,
+   COUNT(DISTINCT n.name). The ledger is scoped to the probed battery —
+   four review rounds have each falsified the previous claim; the port
+   must keep probing.
+   ROUND 2's landed list (historical): backtick identifiers EVERYWHERE (RETURN/ORDER BY
+   projection paths, all write-clause operands), edge-type ALTERNATION
+   (`-[r:KNOWS|LIKES]->`, full list kept on the read path, first-type on
+   CREATE), clause-keyword case-insensitivity (match/return/where/
+   create/set/remove/merge/on/with/distinct/limit), permissive spacing in
+   the CREATE node spec, and `=~` with a NON-STRING RHS falls back to
+   Equals (the modality's behavior — round 2 caught the new arm silently
+   producing Regex("30") where the modality produces Equals(30); now
+   pinned by a corpus entry). The corpus was DELIBERATELY EXTENDED
+   41 → 58 (reviewed pin updates across three passes) so every
+   newly-shared shape is differentially pinned. KNOWN BOTH-reject shapes
+   (kept out of the corpus by construction): ORDER BY over properties,
+   UNION, UNWIND, FOREACH, CALL, COUNT(n), COUNT(DISTINCT n.name).
+   KNOWN UNPINNED divergence (disclosed, must be decided at the port):
+   mixed-operator chains nest differently (seam tiered precedence vs
+   modality flat left-assoc). The completeness claim is scoped to the
+   PROBED battery — three review rounds have each falsified the
+   previous one, so the port itself must keep probing.
+
+   STEP 3 LANDED 2026-11-02 (the clause port, done as ONE conversion
+   layer rather than clause-by-clause — the seam grammar was already the
+   full probed superset, so the retired assembly had no clause left to
+   keep): the modality's CypherParser::parse delegates to the seam's
+   parse_cypher_query and converts the seam AST into query_ast via the
+   new seam_conversion module (minted var_uuid ids, anon-variable
+   mapping, OPTIONAL propagation onto every node and edge, Xor
+   decomposed to the retired parser's And(Or,Not(And)) shape,
+   projection/return reshaping). The 61-entry corpus is BYTE-IDENTICAL
+   on the modality side through the switch — the retired parser's
+   canonical ASTs reproduced exactly. The seam's CreateEdgeSpec gained
+   the `direction` field its parser computed then discarded. 13 dead
+   clause parsers deleted (cypher_parser.rs 2675 → 2230 ln). The
+   read-path entry (parse_to_compiled_pattern) still parses with the
+   retired read helpers and stays per the non-goal — though review
+   found it has ZERO in-repo callers today (the SQL lowering uses the
+   seam's own QueryParser directly), so it is retained public API
+   awaiting removal at a later cleanup, not a live pipeline.
+
+   _Widened-behavior ledger (recorded per the step-1 review — tracked
+   decisions, not accidents of superset adoption):_
+   * **inf→0 coercion** — RESOLVED in step 2: `from_f64` failure now fails
+     the parse on BOTH paths (`map_opt`; an oversized exponent in map
+     context is a parse error, not `Equals(0)`). Pinned by tests on both
+     grammars.
+   * **`null` filter drop** — DECIDED in step 2, with its actual SCOPE:
+     `null` is rejected in CONSTRAINT-MAP position on both grammars (the
+     form that silently produced an unconstrained scan). Deliberately
+     unchanged: `WHERE n.x = null` is still ACCEPTED (a separate code
+     path — comparison parsing; downstream it evaluates as an accidental
+     IS NULL, matching only nodes MISSING the property — its real
+     semantics are clause-by-clause step work). MERGE maps REJECT null
+     (they route through the constraint map even though MERGE is
+     write-shaped — Cypher-correct; Neo4j rejects it too); CREATE/SET
+     (the true write paths) still accept null (set-to-null). `[null]`
+     in a constraint map passes the top-level check and pins to an empty
+     result (0 rows — storage cannot hold nulls in arrays; not the
+     scan hazard). All shapes pinned by tests on both grammars.
+   * **Read-path convergence is VALUES-only so far** — IMPROVED in step 2:
+     the read path's constraint map now shares the full pattern (quoted
+     keys, permissive spacing). (Pre-existing remainder-discarding on the
+     read entries — RESOLVED in step 2: `QueryParser::parse` AND the
+     modality's `parse_to_compiled_pattern` now error on unconsumed
+     input, matching the write entry's discipline. Note: trailing
+     comments and a stray `;` at the direct entries now hard-error where
+     they previously silently truncated — intended tightening; comment
+     support is grammar work, not convergence.)
+3. **Contract pinning** (landed 2026-11-01): a 41-entry shared corpus (reads incl. var-length
+   `*`/`*1..3`, OPTIONAL MATCH, WHERE and/or, incoming/bidirectional edges, property maps with
+   string/bool/int values, DISTINCT, SKIP/LIMIT, ORDER BY over a bare variable (incl. DESC), and the
+   aggregation family SUM/AVG/MIN/MAX/COUNT(*) (incl. `COUNT(*) AS c`); CREATE node+edge incl. property maps keyed
+   `id`/`from`/`to`; MERGE with ON CREATE / ON MATCH / both; SET `=`/`+=`/label; REMOVE
+   prop+label; DELETE node/edge/DETACH; WITH + post-WITH WHERE — every entry parses cleanly on
+   BOTH grammars) is pinned in
+   `crates/modalities/proximadb-graph/src/cypher_corpus_pin.rs`: per entry, the modality AST
+   JSON and the seam AST JSON side by side, so each ported clause is differential-checked
+   against the behavior the graph API path shipped — a port that changes parse semantics fails
+   the pin, and pin updates are deliberate reviewed edits. The seam's full-query entry
+   (`parser::write_seam::parse_cypher_query`) is now `pub` as the crate's declared convergence
+   surface; the write-AST types derive `Serialize` so both sides snapshot under one canonical
+   rule (keys sorted; the modality side's runtime-minted node/edge UUIDs elided — its
+   `Serialize` impls buffer through maps with process-varying iteration order, so raw
+   `to_string` is NOT a stable pin).
++
+   _Pin blind spots (deliberate, disclosed):_ the corpus is the BOTH-grammar intersection and
+   CANNOT protect modality-only shapes (they cannot enter it). The modality-only ledger is
+   maintained in §2 by PROBING, not guessing — the reviews falsified three earlier
+   completeness claims (rounds 1–3), and its final state is recorded there. Constructs BOTH grammars
+   reject (ORDER BY over a property, UNION, UNWIND, aggregations other than SUM, FOREACH,
+   CALL, `COUNT(n)`) are absent from both ASTs' parsed output today despite AST fields
+   existing for several — a shared gap, not a divergence. KNOWN UNPINNED divergence:
+   mixed-operator chains (`a XOR b AND c`) nest differently on the two grammars (seam
+   tiered precedence vs modality flat left-assoc) — the clause port must pick a
+   precedence deliberately and pin it. Probe discipline
+   for these lists: the seam parser does NOT require eof, so acceptance means
+   full consumption (`rest` empty), never a bare `Ok`.
+
+== Non-goals
+
+Deleting the seam grammar (rejected — owner decision), and merging the READ path into the
+modality parser (the `CompiledPattern` contract serves the SQL-lowering pipeline and stays).

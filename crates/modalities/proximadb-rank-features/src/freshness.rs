@@ -94,20 +94,11 @@ impl FeatureExecutor for FreshnessExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proximadb_rank_core::test_support::MapAttributeAccess;
     use proximadb_rank_core::{
-        AttributeAccess, FeatureArena, NoopCandidateData, NoopMetricsSink, NoopModelCache,
-        RankProgram,
+        FeatureArena, NoopCandidateData, NoopMetricsSink, NoopModelCache, RankProgram,
     };
     use std::collections::HashMap;
-
-    struct MapAttrs {
-        values: HashMap<(u32, String), f32>,
-    }
-    impl AttributeAccess for MapAttrs {
-        fn read_f32(&self, doc: DocHandle, field: &str) -> Option<f32> {
-            self.values.get(&(doc.0, field.to_string())).copied()
-        }
-    }
 
     fn build(field: &str, half_life_ms: Option<&str>) -> RankProgram {
         let mut literal_args = vec![field.into()];
@@ -124,7 +115,7 @@ mod tests {
         b.build().unwrap()
     }
 
-    fn run(prog: &mut RankProgram, attrs: &MapAttrs, now_ms: i64, doc: u32) -> f32 {
+    fn run(prog: &mut RankProgram, attrs: &MapAttributeAccess, now_ms: i64, doc: u32) -> f32 {
         let q = QueryContext {
             now_ms_unix: Some(now_ms),
             ..Default::default()
@@ -138,7 +129,7 @@ mod tests {
     #[test]
     fn freshness_at_now_is_one() {
         let mut prog = build("ts", Some("1000"));
-        let attrs = MapAttrs {
+        let attrs = MapAttributeAccess {
             values: HashMap::from([((1, "ts".into()), 1_000_000.0)]),
         };
         let v = run(&mut prog, &attrs, 1_000_000, 1);
@@ -148,7 +139,7 @@ mod tests {
     #[test]
     fn freshness_at_half_life_is_half() {
         let mut prog = build("ts", Some("1000")); // 1s half-life
-        let attrs = MapAttrs {
+        let attrs = MapAttributeAccess {
             values: HashMap::from([((1, "ts".into()), 1_000_000.0)]),
         };
         // 1s = 1000ms later
@@ -159,7 +150,7 @@ mod tests {
     #[test]
     fn freshness_at_two_half_lives_is_quarter() {
         let mut prog = build("ts", Some("1000"));
-        let attrs = MapAttrs {
+        let attrs = MapAttributeAccess {
             values: HashMap::from([((1, "ts".into()), 1_000_000.0)]),
         };
         let v = run(&mut prog, &attrs, 1_002_000, 1);
@@ -172,7 +163,7 @@ mod tests {
     #[test]
     fn freshness_missing_attribute_returns_zero() {
         let mut prog = build("ts", Some("1000"));
-        let attrs = MapAttrs {
+        let attrs = MapAttributeAccess {
             values: HashMap::new(),
         };
         assert_eq!(run(&mut prog, &attrs, 1_000_000, 1), 0.0);
@@ -181,7 +172,7 @@ mod tests {
     #[test]
     fn freshness_future_dated_doc_returns_one() {
         let mut prog = build("ts", Some("1000"));
-        let attrs = MapAttrs {
+        let attrs = MapAttributeAccess {
             values: HashMap::from([((1, "ts".into()), 2_000_000.0)]),
         };
         let v = run(&mut prog, &attrs, 1_000_000, 1);

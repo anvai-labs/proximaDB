@@ -201,20 +201,25 @@ impl CatalogLookup for InMemoryCatalog {
     }
 }
 
-/// TD-OLAP-18: ANSI/PostgreSQL identifier case-folding. Unquoted identifiers
-/// resolve case-insensitively (an exact/declared-case match always wins first);
-/// quoted identifiers stay case-exact. The fold only turns previously-failing
-/// lookups into successes, so it defaults ON; `PROXIMADB_IDENT_CASE_FOLD=0`
-/// restores the legacy case-exact resolution. Consulted only on the exact-miss
-/// cold path, so it costs nothing on today's working queries.
-pub fn ident_case_fold_enabled() -> bool {
-    match std::env::var("PROXIMADB_IDENT_CASE_FOLD") {
-        Ok(v) => !matches!(
-            v.trim().to_ascii_lowercase().as_str(),
-            "0" | "false" | "off" | "no"
-        ),
-        Err(_) => true,
-    }
+// TD-OLAP-18: ANSI/PostgreSQL identifier case-folding. Unquoted identifiers
+// resolve case-insensitively (an exact/declared-case match always wins first);
+// quoted identifiers stay case-exact. The fold only turns previously-failing
+// lookups into successes, so it defaults ON; `PROXIMADB_IDENT_CASE_FOLD=0`
+// restores the legacy case-exact resolution. Consulted only on the exact-miss
+// cold path, so it costs nothing on today's working queries.
+proximadb_config::env_kill_switch! {
+    /// TD-OLAP-18: ANSI/PostgreSQL identifier case-folding. Unquoted
+    /// identifiers resolve case-insensitively (an exact/declared-case
+    /// match always wins first); quoted identifiers stay case-exact.
+    /// The fold only turns previously-failing resolutions into successes.
+    /// Default ON; `PROXIMADB_IDENT_CASE_FOLD=0|false|off|no` restores
+    /// case-exact resolution (see ENV_GATE_REGISTRY).
+    ///
+    /// Deliberately NOT memoized (`env_kill_switch!`, not `env_gate!`):
+    /// cold-path reads where the env cost is irrelevant, and
+    /// `gate_reads_live_between_toggles` (below) asserts the second read
+    /// observes a mid-process change.
+    pub fn ident_case_fold_enabled() { gate: "PROXIMADB_IDENT_CASE_FOLD", default: true }
 }
 
 // =========================================================================
@@ -3034,6 +3039,33 @@ pub fn lower_function_body(
 // =========================================================================
 // Tests
 // =========================================================================
+
+#[cfg(test)]
+mod kill_switch_liveness {
+    // nextest runs each test in its own process, so env mutation here
+    // cannot leak into other tests.
+    use super::*;
+
+    /// TD-OLAP-18 / the env_kill_switch! design decision: the gate reads
+    /// LIVE on every call. The e2e suite cannot guard this (it sets the
+    /// var before server start, so a memoized gate would still pass it);
+    /// this test is the negative control with teeth — a OnceLock-based
+    /// implementation fails the second assert.
+    #[test]
+    fn gate_reads_live_between_toggles() {
+        unsafe { std::env::remove_var("PROXIMADB_IDENT_CASE_FOLD") };
+        assert!(ident_case_fold_enabled(), "default ON when unset");
+
+        unsafe { std::env::set_var("PROXIMADB_IDENT_CASE_FOLD", "0") };
+        assert!(
+            !ident_case_fold_enabled(),
+            "second read must observe the mid-process toggle — a memoized gate would still return true"
+        );
+
+        unsafe { std::env::remove_var("PROXIMADB_IDENT_CASE_FOLD") };
+        assert!(ident_case_fold_enabled(), "removal restores the default");
+    }
+}
 
 #[cfg(test)]
 mod tests {

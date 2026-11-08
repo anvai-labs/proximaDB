@@ -866,10 +866,13 @@ async fn v2_fp32_point_read_is_byte_exact_after_flush() {
 /// "no input has the tier", so the merged segment was written lossy and an
 /// `fp32` collection re-lossified at its first compaction.
 ///
-/// Drives the real trigger: five forced flushes reach the default L0 threshold
-/// (`L0_COMPACTION_THRESHOLD = 5`), the flush enqueues compaction, and the
-/// background worker merges the five tier'd segments into one. No test-only
-/// compaction entry point is used.
+/// Drives the production operator trigger: five forced flushes reach the
+/// default L0 threshold (`L0_COMPACTION_THRESHOLD = 5`), then an explicit
+/// operator compaction (the same entry point as `COMPACT TABLE`) merges the
+/// five tier'd segments into one and AWAITS the result. The background
+/// worker's admission gate never reliably opens on memory-tight CI runners,
+/// so the wall-clock poll this test used first could pass only on an idle
+/// dev box.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn v2_fp32_point_read_is_byte_exact_after_compaction() {
     let server = TestServer::start().await.expect("server start");
@@ -926,9 +929,30 @@ async fn v2_fp32_point_read_is_byte_exact_after_compaction() {
         server.force_flush(&name).await.expect("force flush");
     }
 
-    // Every flushed segment carries the exact tier (TD-READFID-1). Then wait
-    // for the background compaction the fifth flush enqueued to retire them.
-    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    // Every flushed segment carries the exact tier (TD-READFID-1). The
+    // explicit operator compaction awaits the merge, so the result is
+    // deterministic on any runner; the short settle only covers the file
+    // listing's visibility of retired L0s.
+    // The PRODUCTION operator surface: POST /api/v2/collections/{id}/compact
+    // (TD-COMPACT-14) — same entry as `COMPACT TABLE`, awaits, and reports
+    // segments_before/after so the merge is asserted, not polled.
+    let compact = http
+        .post(format!(
+            "{}/api/v2/collections/{}/compact",
+            server.base_url(),
+            name
+        ))
+        .json(&json!({"full": false}))
+        .send()
+        .await
+        .expect("compact request");
+    assert!(
+        compact.status().is_success(),
+        "compact: {} {}",
+        compact.status(),
+        compact.text().await.unwrap_or_default()
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
     let merged = loop {
         let pax = server.persisted_pax_files();
         if pax.len() == 1 {
@@ -976,6 +1000,126 @@ async fn v2_fp32_point_read_is_byte_exact_after_compaction() {
          has_exact_authority={merged_is_exact}; {} of {} records differ: {mismatches:#?}",
         mismatches.len(),
         written.len()
+    );
+}
+
+/// TD-COMPACT-15: the compact response carries full provenance — segment
+/// counts, passes, stop reason, and MEASURED bytes/duration — and accepts
+/// the per-request `target_segments` override (validated > 0). The first
+/// test to pin the REST response shape (the endpoint is deliberately
+/// off-spec, so nothing else guards it).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn v2_compact_full_response_reports_provenance_and_target_override() {
+    let server = TestServer::start().await.expect("server start");
+    let http = http_client();
+    let base = server.base_url();
+    let name = unique_name("v2_cmp_prov");
+    let dim: usize = 8;
+
+    let create = http
+        .post(format!("{base}/api/v2/collections"))
+        .json(&json!({
+            "name": name,
+            "dimension": dim,
+            "engine": "sst",
+            "distance_metric": "euclidean",
+        }))
+        .send()
+        .await
+        .expect("create");
+    assert!(
+        create.status().is_success(),
+        "create: {} {}",
+        create.status(),
+        create.text().await.unwrap_or_default()
+    );
+
+    // Four flush rounds stay UNDER the L0 count threshold (5): the
+    // background policy never fires, so the fixture deterministically
+    // holds 4 segments when FULL runs.
+    let flushes: usize = 4;
+    for flush in 0..flushes {
+        let records: Vec<serde_json::Value> = (0..3)
+            .map(|i| {
+                let i = flush * 3 + i;
+                json!({
+                    "id": format!("rec-{i}"),
+                    "vector": (0..dim).map(|j| (i * dim + j) as f32 * 0.017).collect::<Vec<f32>>(),
+                })
+            })
+            .collect();
+        let insert = http
+            .post(format!("{base}/api/v2/collections/{name}/records/batch"))
+            .json(&json!({ "records": records }))
+            .send()
+            .await
+            .expect("insert");
+        assert!(insert.status().is_success());
+        server.force_flush(&name).await.expect("force flush");
+    }
+
+    // Zero is rejected with an actionable error, not silently clamped.
+    let bad = http
+        .post(format!("{base}/api/v2/collections/{name}/compact"))
+        .json(&json!({"full": true, "target_segments": 0}))
+        .send()
+        .await
+        .expect("reject zero target");
+    assert!(
+        !bad.status().is_success(),
+        "target_segments=0 must be rejected: {}",
+        bad.text().await.unwrap_or_default()
+    );
+
+    let compact = http
+        .post(format!("{base}/api/v2/collections/{name}/compact"))
+        .json(&json!({"full": true, "target_segments": 2}))
+        .send()
+        .await
+        .expect("compact request");
+    let status = compact.status();
+    let body: serde_json::Value = compact.json().await.expect("compact json");
+    assert!(status.is_success(), "compact: {status} {body}");
+
+    // The provenance contract: every key present, counts consistent with
+    // the on-disk geometry, bytes measured (not zero) once a pass ran.
+    assert_eq!(body["full"], json!(true), "echoes the request mode");
+    let before = body["segments_before"].as_u64().expect("segments_before");
+    let after = body["segments_after"].as_u64().expect("segments_after");
+    assert!(before >= 3, "multi-segment fixture, got {before}");
+    // 2, not 1: the config default is 1, so only a NON-default target
+    // proves the per-request override reaches the engine, and only a stop
+    // above 1 exercises the follow-up floor end to end (#2418 review round
+    // 14). The 4-segment fixture must land on exactly 2, not 1.
+    assert_eq!(
+        after, 2,
+        "target_segments=2 must stop at exactly two: {body}"
+    );
+    assert!(
+        body["passes"].as_u64().unwrap_or(0) >= 1,
+        "at least one pass"
+    );
+    assert_eq!(body["reached_target"], json!(true));
+    assert!(
+        body["stop_reason"].is_null(),
+        "no stop reason when the target is met: {body}"
+    );
+    assert!(body["pending_files"].is_u64(), "pending_files reported");
+    assert!(
+        body["bytes_read"].as_u64().unwrap_or(0) > 0,
+        "measured bytes_read: {body}"
+    );
+    assert!(
+        body["bytes_written"].as_u64().unwrap_or(0) > 0,
+        "measured bytes_written: {body}"
+    );
+    // Presence, not magnitude: the duration truncates to whole
+    // milliseconds, so a sub-ms compaction legitimately reports 0.
+    assert!(body["duration_ms"].is_u64(), "duration_ms reported: {body}");
+    assert_eq!(
+        server.persisted_pax_files().len(),
+        after as usize,
+        "the summary matches the on-disk segment count"
     );
 }
 

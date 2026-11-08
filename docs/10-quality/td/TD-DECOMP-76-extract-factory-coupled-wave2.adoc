@@ -17,3 +17,9 @@
 * Test-stub caveat (same as link:TD-DECOMP-75-extract-sst-swift-metadata-via-filesystem-port.adoc[TD-DECOMP-75]): nova/utilities/footer_cache tests inject no-op ports because their
   filesystem reads are placeholder or unused by those tests; `parquet_metadata` is the only serializer with a
   real read path and keeps it through the port. Swap stubs for real filesystems when placeholders gain reads.
+* Resolved for nova (2026-11-07): `nova_metadata.rs` is DELETED. After `ZeroCopyIOSystem::with_all_engines`
+  (its only non-test consumer, itself zero-caller) was removed, the module was fully dead — zero references
+  and no tests of its own survived — and its serializer fabricated placeholder metadata
+  (`create_placeholder_metadata` built the same fabricated payload as the already-dead `extract_metadata`;
+  the two differ in signature — async vs sync — and one `debug!` log). `parquet_metadata`,
+  `columnar_footer_cache` and `columnar_utilities` keep their real read paths and stay.

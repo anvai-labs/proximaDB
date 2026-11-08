@@ -1,0 +1,118 @@
+= Dedup Utility Contracts and Coverage — 2026-11-01
+:toc:
+
+== Scope and provenance
+
+This is a measured baseline for four utility crates, based on develop
+`b819abaf9`: `proximadb-kernel`, `proximadb-catalog` with `fc-metamodel`,
+`proximadb-api`, and `proximadb-network-middleware`.
+It is not a full-workspace baseline and does not replace the QA coverage ratchet.
+The compiler was Rust 1.99.0 on aarch64-apple-darwin, using
+`cargo-llvm-cov 0.6.22` and its matching LLVM tools.
+
+The cohort passed 854 tests before the changes and 857 afterward: four new
+contract tests and one overlapping test removed. Five additional middleware
+integration tests passed outside the instrumented cohort.
+Raw reports include dependencies; the table below selects only source files in
+the four named crates. Inline test code is included. Branch coverage was not
+measured.
+
+The compact measurements, source hashes, and per-test code-region reports are
+in link:evidence/DEDUP_UTILITY_COVERAGE_2026_11_01.json[the evidence snapshot].
+
+[cols="2,1,1",options="header"]
+|===
+| Crate | Before: covered/executable lines | After: covered/executable lines
+| kernel | 3306/3489 (94.7549%) | 3306/3489 (94.7549%)
+| catalog | 17579/21772 (80.7413%) | 17606/21797 (80.7726%)
+| API | 5366/5944 (90.2759%) | 5395/5973 (90.3231%)
+| network middleware | 1059/1124 (94.2171%) | 1056/1121 (94.2016%)
+|===
+
+The middleware percentage changes because three covered inline-test lines were
+removed. The health predicate retains all four executed production code regions.
+Every original predicate input case remains, with additional controls for
+`/api/health` and case-sensitive matching. No QA baseline was lowered.
+
+== Contracts closed
+
+* Catalog locks preserve data and support subsequent reads and writes after a
+  writer panics while holding the lock; a healthy-lock control remains separate.
+* Document query-string extraction and log JSON-body deserialization default an
+  omitted limit to 100 and preserve explicit zero/custom/maximum limits.
+  Invalid numeric values are rejected instead of defaulted or truncated.
+  Numeric query-string text is valid for documents; JSON strings and JSON null
+  remain invalid for the log request's integer limit.
+* Auth exemptions honor `require_auth_for_health`; invalid or missing credentials
+  do not admit protected paths. Valid credentials stamp the configured identity.
+* Required TLS certificate validation is bypassed only for the existing
+  case-sensitive `/health` prefix contract.
+* Exhausted per-peer/global rate limits exempt health only when configured.
+
+The accessor itself had 100% line coverage before these changes. That did not
+prove the omitted-field serde contract. Similarly, line coverage alone did not
+prove lock-poison recovery or that middleware callers apply the shared predicate
+under the right configuration.
+
+== Reproduce the measured cohort
+
+Pin a clean checkout to `b819abaf90fb17f72790ad4af2bec183d7bb62a1`
+and rebase the candidate onto that same revision. Measure the baseline first,
+then the candidate, with distinct fresh target directories and output files.
+Never overlap coverage runs against one profile directory.
+In each isolated checkout, use this command with its own target/output path:
+
+[source,shell]
+----
+CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=/tmp/proximadb-utility-cov \
+  RUSTC_WRAPPER=sccache cargo llvm-cov nextest --locked --lib -j 3 \
+  -p proximadb-kernel -p proximadb-catalog -p proximadb-api \
+  -p proximadb-network-middleware --features proximadb-catalog/fc-metamodel \
+  --json --summary-only --output-path /tmp/utility-coverage.json
+----
+
+Aggregate `summary.lines.covered` and `summary.lines.count` only for files under
+each selected crate's `src/` directory. Exclude transitive dependency files and
+other workspace crates; do not label the raw report total as workspace coverage.
+
+== Test overlap and pruning
+
+`scripts/measure_test_coverage_overlap.py` runs exact tests from an instrumented
+libtest binary, saves a separate profile for each, and reports executed LLVM code
+regions for one selected Rust function. It rejects zero matching tests, missing
+functions, uncovered functions, and subprocess failures.
+
+Before pruning, `rate_limit::tests::test_is_health_endpoint` and
+`rate_limit::tests::test_is_health_endpoint_various_paths` covered the same four
+`is_health_endpoint` code regions, with zero regions unique to either test.
+Their assertions were inspected separately and their input cases merged into
+the retained test. The post-pruning profile still covers those four regions.
+
+[source,shell]
+----
+python3 scripts/measure_test_coverage_overlap.py \
+  --binary /path/to/instrumented/proximadb_network_middleware-TEST_HASH \
+  --source crates/platform/proximadb-network-middleware/src/rate_limit.rs \
+  --function is_health_endpoint \
+  --test rate_limit::tests::test_is_health_endpoint_various_paths \
+  --test rate_limit::tests::health_endpoints_exempt_from_the_limit \
+  --output /tmp/health-overlap.json
+----
+
+Matching region coverage is necessary evidence for this pruning, not proof of
+equivalent assertions or inputs. The tool does not delete tests. The measured
+cohort does not justify pruning unrelated tests across the workspace.
+
+== Semantic audit qualification
+
+The saved Victor audit reports 82 Rust families, but its largest family groups
+8,134 symbols across 1,554 files. Its codec family spans different encodings,
+and its cost-estimation family includes LLM cost, shuffle cost, I/O cost,
+projection benefit, and query-plan estimates. Similarity scores do not establish
+an interchangeable implementation or a common test contract.
+
+Existing seams must be reviewed before adding traits: codecs already expose
+`RawEncoder`, `RawDecoder`, `ToWireFormat`, and `WirePrim`; upserts already use
+`RecordStore`; ranking reads already use `AttributeAccess`; metric registration
+already has shared helpers with distinct collision policies. Further extraction
+must preserve each site's format, failure handling, ordering, and side effects.

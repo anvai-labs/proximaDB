@@ -2190,6 +2190,7 @@ def write_config(
     compaction_spill_scratch_amplification_factor: float = 10.0,
     compaction_spill_available_disk_fraction: float = 0.5,
     compaction_spill_max_disk_mb: int = 0,
+    reservation_pool: tuple[str, int, int] | None = None,
 ) -> None:
     data = root / "data"
     if compaction_spill_enabled and compaction_spill_directory is None:
@@ -2199,6 +2200,17 @@ def write_config(
         if compaction_spill_directory is not None
         else ""
     )
+    pool_section = ""
+    if reservation_pool is not None:
+        pool_id, allocatable_gb, default_grant_gb = reservation_pool
+        pool_section = (
+            "# TD-TIER-1 SC6: admitted-residency pool (opt-in; SC2/SC3/SC4).\n"
+            "[[storage.reservation_pools]]\n"
+            f'id = "{pool_id}"\n'
+            f'path = "{root / "pool"}"\n'
+            f"allocatable_bytes = {allocatable_gb << 30}\n"
+            f"default_grant_bytes = {default_grant_gb << 30}\n\n"
+        )
     config = f"""[server]
 node_id = "sift1m-get-reduction"
 bind_address = "127.0.0.1"
@@ -2252,7 +2264,14 @@ segment_invariants_cache_mb = 256
 survivor_cache_mb = 1024
 cache_on_write = "all"
 
-[api]
+{pool_section}[api]
+# TD-TIER-1 SC6: a query that stacks many object-store round
+# trips behind an added-RTT proxy can exceed the 60 s default API timeout —
+# the server then closes the connection mid-sweep (RemoteDisconnected). 300 s
+# keeps the sweep alive; the API timeout is not a measured dimension.
+# UNCONDITIONAL from the latency-arm commit onward: every arm of every run
+# carries it (a disclosed protocol delta vs the 60 s banked baseline).
+timeout_seconds = 300
 unified_mode = true
 unified_port = {port}
 rest_port = {port}
@@ -2279,6 +2298,29 @@ def effective_flush_interval(
     return 3600 if explicit_flush_every_rows is not None else 12
 
 
+# TD-RDSTRAT-14 probe-policy env gates; scrubbed per spawn with the other
+# inherited gates (see OwnedServer).
+PROBE_POLICY_GATES = (
+    "PROXIMADB_PAX_READ_PROBE_ALGORITHM",
+    "PROXIMADB_PAX_READ_PROBE_BASE_MB",
+    "PROXIMADB_PAX_READ_PROBE_CAP_MB",
+    "PROXIMADB_PAX_READ_PROBE_EXPERIMENTAL",
+)
+
+def probe_experimental_gate(probe_algorithm, probe_base_mb, probe_cap_mb) -> bool:
+    """Whether a run sets PROXIMADB_PAX_READ_PROBE_EXPERIMENTAL=1.
+
+    ONE decision used both to spawn the server and to record the arm in
+    result.json, so the label cannot drift from what the server got (#2419
+    review round 13). Non-sqrt algorithms need the gate; so do base/cap with
+    no --probe-algorithm, which only matter against a TOML byte_budget
+    server (round 11).
+    """
+    if probe_algorithm is not None:
+        return probe_algorithm != "sqrt"
+    return probe_base_mb is not None or probe_cap_mb is not None
+
+
 # TD-PAXDIR-1 D7: the gates the --centroid-directory arm turns on — publish the
 # collection directory with decode keys (D1, D6), plan queries on it (D2), ride
 # the rerank on the probe wave (D5), and use the keys on the query path (D6).
@@ -2302,6 +2344,9 @@ class OwnedServer:
         ivf_k: int | None = None,
         n_comp: int | None = None,
         nprobe: int | None = None,
+        probe_algorithm: str | None = None,
+        probe_base_mb: int | None = None,
+        probe_cap_mb: int | None = None,
         training_compaction_min_mb: int | None = None,
         azure_emulator: bool = False,
         s3_endpoint: str | None = None,
@@ -2322,6 +2367,9 @@ class OwnedServer:
         self.ivf_k = ivf_k
         self.n_comp = n_comp
         self.nprobe = nprobe
+        self.probe_algorithm = probe_algorithm
+        self.probe_base_mb = probe_base_mb
+        self.probe_cap_mb = probe_cap_mb
         self.training_compaction_min_mb = training_compaction_min_mb
         self.azure_emulator = azure_emulator
         self.s3_endpoint = s3_endpoint
@@ -2374,6 +2422,7 @@ class OwnedServer:
             # "default"/"on" arms, so an operator export must not leak (the
             # TD-IOBUDGET-2 hole class).
             *CENTROID_DIRECTORY_GATES,
+            *PROBE_POLICY_GATES,
             "PROXIMADB_PAX_WRITE_SHARED_MODEL",
             "PROXIMADB_PAX_READ_CENTROID_DIRECTORY_NPROBE",
             # S3 endpoint identity comes from --s3-endpoint/--s3-region only;
@@ -2474,6 +2523,15 @@ class OwnedServer:
                 if self.centroid_directory in ("on", "default")
                 else "PROXIMADB_PAX_READ_COARSE_NPROBE"
             ] = str(self.nprobe)
+        if self.probe_algorithm is not None:
+            environment["PROXIMADB_PAX_READ_PROBE_ALGORITHM"] = self.probe_algorithm
+        # The same decision result.json records (see probe_experimental_gate).
+        if probe_experimental_gate(self.probe_algorithm, self.probe_base_mb, self.probe_cap_mb):
+            environment["PROXIMADB_PAX_READ_PROBE_EXPERIMENTAL"] = "1"
+        if self.probe_base_mb is not None:
+            environment["PROXIMADB_PAX_READ_PROBE_BASE_MB"] = str(self.probe_base_mb)
+        if self.probe_cap_mb is not None:
+            environment["PROXIMADB_PAX_READ_PROBE_CAP_MB"] = str(self.probe_cap_mb)
         if self.training_compaction_min_mb is not None:
             environment["PROXIMADB_TRAINING_COMPACTION_MIN_MB"] = str(
                 self.training_compaction_min_mb
@@ -2610,6 +2668,7 @@ def storage_action_via_flight(
     action_type: str,
     expected_operation: str,
     flight_module=None,
+    extra_body: dict | None = None,
 ) -> dict:
     if flight_module is None:
         try:
@@ -2625,7 +2684,7 @@ def storage_action_via_flight(
     try:
         action = flight_module.Action(
             action_type,
-            json.dumps({"collection_id": collection_id}).encode(),
+            json.dumps({"collection_id": collection_id, **(extra_body or {})}).encode(),
         )
         responses = list(client.do_action(action))
     finally:
@@ -2660,8 +2719,21 @@ def force_flush_via_flight(
 
 
 def compact_via_flight(
-    host: str, port: int, collection_id: str, flight_module=None
+    host: str,
+    port: int,
+    collection_id: str,
+    flight_module=None,
+    full: bool = False,
+    target_segments: int | None = None,
 ) -> dict:
+    """Trigger a compaction. ``full=True`` asks for the cross-level collapse
+    (TD-COMPACT-14); ``target_segments`` overrides the FULL collapse target
+    (TD-COMPACT-15 Experiment 3) — both ride the action body."""
+    # Send `full` only when asked: a plain compaction keeps the exact body it
+    # always had ({"collection_id": ...}), which the harness test pins.
+    body: dict[str, object] = {"full": True} if full else {}
+    if target_segments is not None:
+        body["target_segments"] = target_segments
     return storage_action_via_flight(
         host,
         port,
@@ -2669,6 +2741,7 @@ def compact_via_flight(
         "compact_collection",
         "compact",
         flight_module,
+        extra_body=body,
     )
 
 
@@ -2723,22 +2796,32 @@ def post_flush_compaction_observation(
     }
 
 
-def create_collection(server: str, base_path: Path, base_format: str) -> str:
+def create_collection(
+    server: str,
+    base_path: Path,
+    base_format: str,
+    storage_class: str | None = None,
+) -> str:
     """Create the (empty) benchmark collection and return its id — the same
     call ingest() makes, without inserting vectors. TD-TIER-1 E1 --skip-ingest
     uses it to register the collection in a fresh server's catalog so the
-    object prefix a prior run built (which contains <id>/data/...) resolves."""
+    object prefix a prior run built (which contains <id>/data/...) resolves.
+    TD-TIER-1 SC6: `storage_class` (e.g. "performance") requests admitted
+    residency at create (SC2 admission against the configured pool)."""
     _, dimension, _ = vector_source_geometry(base_path, base_format)
-    response = request_json(
-        server + "/api/v2/collections",
-        method="POST",
-        body={
+    body = {
             "name": "sift1m_get_reduction",
             "dimension": dimension,
             "engine": "sst",
             "enable_proxima_record": True,
             "distance_metric": "euclidean",
-        },
+    }
+    if storage_class is not None:
+        body["storage_class"] = storage_class
+    response = request_json(
+        server + "/api/v2/collections",
+        method="POST",
+        body=body,
     )
     collection_id = str(response.get("collection_id") or response.get("id") or "")
     if not collection_id:
@@ -2758,18 +2841,22 @@ def ingest(
     explicit_flush_every_rows: int | None,
     explicit_geometry: AzureCliPaxGeometry | None,
     metadata_cols: dict[str, str] | None = None,
+    storage_class: str | None = None,
 ) -> tuple[str, float, dict[int, int], list[dict], dict | None]:
     _, dimension, _ = vector_source_geometry(base_path, base_format)
+    create_body = {
+        "name": "sift1m_get_reduction",
+        "dimension": dimension,
+        "engine": "sst",
+        "enable_proxima_record": True,
+        "distance_metric": "euclidean",
+    }
+    if storage_class is not None:
+        create_body["storage_class"] = storage_class
     response = request_json(
         server + "/api/v2/collections",
         method="POST",
-        body={
-            "name": "sift1m_get_reduction",
-            "dimension": dimension,
-            "engine": "sst",
-            "enable_proxima_record": True,
-            "distance_metric": "euclidean",
-        },
+        body=create_body,
     )
     collection_id = str(response.get("collection_id") or response.get("id") or "")
     if not collection_id:
@@ -3155,6 +3242,31 @@ def main() -> int:
     )
     parser.add_argument("--queries", type=int, default=1_000)
     parser.add_argument(
+        "--storage-class",
+        default=None,
+        help="TD-TIER-1 SC6: storage_class on collection create (e.g. performance; "
+        "requires --reservation-pool-allocatable-gb for admission)",
+    )
+    parser.add_argument(
+        "--reservation-pool-allocatable-gb",
+        type=int,
+        default=0,
+        help="TD-TIER-1 SC6: [[storage.reservation_pools]] allocatable_bytes (GiB); 0 = no pool",
+    )
+    parser.add_argument(
+        "--reservation-pool-grant-gb",
+        type=int,
+        default=0,
+        help="TD-TIER-1 SC6: pool default_grant_bytes (GiB)",
+    )
+    parser.add_argument(
+        "--residency-ready-timeout-secs",
+        type=int,
+        default=600,
+        help="TD-TIER-1 SC6: wait for storage_class_status READY before the warm "
+        "sweep when a storage_class was requested (0 = skip the wait)",
+    )
+    parser.add_argument(
         "--skip-ingest",
         action="store_true",
         help=(
@@ -3168,6 +3280,29 @@ def main() -> int:
     parser.add_argument(
         "--collection-id",
         help="collection id for --skip-ingest runs (the build run records it in result.json)",
+    )
+    parser.add_argument(
+        "--compact-full-before-measure",
+        action="store_true",
+        help=(
+            "TD-COMPACT-15 S=1: after the bed settles, issue COMPACT FULL "
+            "(cross-level collapse, #2339) via Arrow Flight and re-settle "
+            "before any query arm. The pre/post geometries are pinned into "
+            "result.json so the segment-count-vs-GET-cost delta is measured "
+            "on byte-identical rows/model/queries — no external server or "
+            "second bed. Combines with --skip-ingest to measure a prior "
+            "bed collapsed in place"
+        ),
+    )
+    parser.add_argument(
+        "--compact-full-target-segments",
+        type=int,
+        help=(
+            "TD-COMPACT-15 Experiment 3: per-request override of the FULL "
+            "collapse target (server [storage.compaction_config] "
+            "full_target_segments, default 1). Requires "
+            "--compact-full-before-measure; --max-segments must match"
+        ),
     )
     parser.add_argument("--top-k", type=int, default=10)
     parser.add_argument("--settle-timeout-secs", type=int, default=1_200)
@@ -3328,6 +3463,28 @@ def main() -> int:
         help="force query-time coarse cells (scale experiments only)",
     )
     parser.add_argument(
+        "--probe-algorithm",
+        # `fixed` is deliberately NOT offered: it probes exactly
+        # `min_cells`, and the harness has no flag for that, so the arm
+        # would silently always run at the default 3 cells. Set it via
+        # TOML/collection property if you want a pinned-count arm.
+        choices=["sqrt", "cbrt", "fourth_root", "log", "byte_budget"],
+        help=(
+            "TD-RDSTRAT-14 probe-band algorithm (PROXIMADB_PAX_READ_PROBE_ALGORITHM); "
+            "default sqrt. The recall-vs-GETs dial for the ladder experiment"
+        ),
+    )
+    parser.add_argument(
+        "--probe-base-mb",
+        type=int,
+        help="byte_budget base probe budget in MiB; the root and log forms ignore it (PROXIMADB_PAX_READ_PROBE_BASE_MB)",
+    )
+    parser.add_argument(
+        "--probe-cap-mb",
+        type=int,
+        help="byte_budget per-probe-POOL byte cap in MiB, 0 = none (PROXIMADB_PAX_READ_PROBE_CAP_MB); not per query: with the directory off each segment is its own pool",
+    )
+    parser.add_argument(
         "--adaptive-read-strategy",
         action="store_true",
         help=(
@@ -3348,6 +3505,49 @@ def main() -> int:
     args = parser.parse_args()
     if args.skip_ingest and not args.collection_id:
         raise SystemExit("--skip-ingest requires --collection-id")
+    # An ABSENT override DEFAULTS to --max-segments rather than erroring:
+    # requiring it killed every previously valid invocation, including the
+    # reproduce command TD-COMPACT-15 documents for this PR's own evidence
+    # (#2418 review round 21). An override that DISAGREES with --max-segments
+    # is still refused — that is the mismatch the gate exists for.
+    # NOT defaulted to --max-segments (#2418 review round 22). --max-segments
+    # defaults to 2 while the server's full_target_segments defaults to 1, so
+    # defaulting here would silently change what an existing
+    # --compact-full-before-measure invocation measures: the bed would settle
+    # at two segments where it previously settled at one. Segment count is the
+    # dominant variable in this harness's GET-reduction result, so runs
+    # recorded before and after would both pass the gate while being
+    # incomparable in BENCHMARK_EVIDENCE.toml. Unset keeps the server-resolved
+    # behaviour; a STATED value must still agree with --max-segments below.
+    if (
+        # The override is ONLY read inside the --compact-full-before-measure
+        # block, so stating it alone let the arm silently collapse to the
+        # server default while result.json implied the geometry was pinned —
+        # the accepted-then-dropped-knob class (#2418 review round 23).
+        args.compact_full_target_segments is not None
+        and not args.compact_full_before_measure
+    ):
+        raise SystemExit(
+            "--compact-full-target-segments requires --compact-full-before-measure: "
+            "without it the override is never sent and the bed collapses to the "
+            "server default",
+        )
+    if (
+        args.compact_full_before_measure
+        # Only a STATED override is checked: unset means "let the server
+        # resolve it", which is the pre-PR behaviour F8 preserves.
+        and args.compact_full_target_segments is not None
+        and args.compact_full_target_segments != args.max_segments
+    ):
+        # The post-compact settle gate uses the override, so a mismatch let an
+        # arm settle at one geometry while result.json reported another. The
+        # --help text only ADVISED consistency; enforce it.
+        raise SystemExit(
+            f"--compact-full-target-segments ({args.compact_full_target_segments}) "
+            f"must equal --max-segments ({args.max_segments}): the post-compact "
+            "settle gate asserts the override, so a mismatch records a geometry "
+            "the run did not measure",
+        )
     if not (
         args.coalesce_gap_mb >= 0
         and args.coalesce_range_mb > 0
@@ -3397,6 +3597,46 @@ def main() -> int:
         raise RuntimeError("--n-comp must be positive")
     if args.nprobe is not None and args.nprobe <= 0:
         raise RuntimeError("--nprobe must be positive")
+    # #2419 review round 8: --nprobe sets a probe-count env override that
+    # takes precedence over the probe policy, so combining it with a policy
+    # flag ran a fixed-count probe while result.json recorded the algorithm.
+    probe_policy_flags = [
+        name
+        for name, value in (
+            ("--probe-algorithm", args.probe_algorithm),
+            ("--probe-base-mb", args.probe_base_mb),
+            ("--probe-cap-mb", args.probe_cap_mb),
+        )
+        if value is not None
+    ]
+    if args.nprobe is not None and probe_policy_flags:
+        raise RuntimeError(
+            f"--nprobe overrides the probe policy, so it cannot be combined with "
+            f"{', '.join(probe_policy_flags)}: the arm would be labelled with an "
+            "algorithm it never ran"
+        )
+    # Mirror the server's env bounds EXACTLY so result.json cannot record a
+    # value the server warns about and ignores (it would run the default).
+    # MAX_PROBE_MB mirrors segment_format.rs / MAX_PROBE_BUDGET_MB (1 TiB).
+    max_probe_mb = 1024 * 1024
+    if args.probe_base_mb is not None and not 0 < args.probe_base_mb <= max_probe_mb:
+        raise RuntimeError(f"--probe-base-mb must be in 1..={max_probe_mb}")
+    if args.probe_cap_mb is not None and not 0 <= args.probe_cap_mb <= max_probe_mb:
+        raise RuntimeError(f"--probe-cap-mb must be in 0..={max_probe_mb} (0 = no cap)")
+    # base/cap are read ONLY by byte_budget; recording them on another arm
+    # labels it with knobs the server never consulted (#2419 review round 8).
+    # Refused only when the arm EXPLICITLY picks another algorithm: with no
+    # --probe-algorithm the server's TOML may already be byte_budget, which
+    # does read them.
+    if (
+        args.probe_algorithm is not None
+        and args.probe_algorithm != "byte_budget"
+        and (args.probe_base_mb is not None or args.probe_cap_mb is not None)
+    ):
+        raise RuntimeError(
+            "--probe-base-mb/--probe-cap-mb are read only by byte_budget; with "
+            f"--probe-algorithm {args.probe_algorithm} they would be recorded but ignored"
+        )
     if (
         args.training_compaction_min_mb is not None
         and args.training_compaction_min_mb <= 0
@@ -3616,6 +3856,11 @@ def main() -> int:
         args.compaction_spill_scratch_amplification_factor,
         args.compaction_spill_available_disk_fraction,
         args.compaction_spill_max_disk_mb,
+        reservation_pool=(
+            ("sc6", args.reservation_pool_allocatable_gb, args.reservation_pool_grant_gb)
+            if args.reservation_pool_allocatable_gb > 0
+            else None
+        ),
     )
     server_url = f"http://127.0.0.1:{args.port}"
     local_disk = root / "local-disk-cache"
@@ -3725,6 +3970,19 @@ def main() -> int:
             "ivf_k_override": args.ivf_k,
             "n_comp_override": args.n_comp,
             "nprobe_override": args.nprobe,
+            # The PROXIMADB_PAX_READ_PROBE_* env OVERRIDES this run set
+            # (None = not set). NOT the resolved policy: a server TOML
+            # [storage.sst_config.coarse_probe] still applies beneath them,
+            # so a None row is the control only against the default config
+            # (#2419 review round 9).
+            "probe_policy_env_overrides": {
+                "experimental_gate": probe_experimental_gate(
+                    args.probe_algorithm, args.probe_base_mb, args.probe_cap_mb
+                ),
+                "algorithm": args.probe_algorithm,
+                "base_mb": args.probe_base_mb,
+                "cap_mb": args.probe_cap_mb,
+            },
             "training_compaction_min_mb_override": (
                 args.training_compaction_min_mb
             ),
@@ -3811,6 +4069,9 @@ def main() -> int:
                 ivf_k=args.ivf_k,
                 n_comp=args.n_comp,
                 nprobe=args.nprobe,
+                probe_algorithm=args.probe_algorithm,
+                probe_base_mb=args.probe_base_mb,
+                probe_cap_mb=args.probe_cap_mb,
                 training_compaction_min_mb=args.training_compaction_min_mb,
                 azure_emulator=args.azurite,
                 s3_endpoint=args.s3_endpoint,
@@ -3835,6 +4096,31 @@ def main() -> int:
                 spill_directory,
             )
             resource_sampler.start()
+        # TD-COMPACT-15 S=1: with --compact-full-before-measure the bed must
+        # first settle at its CURRENT segment count; --max-segments asserts
+        # the POST-compact geometry, so the pre-compact waits get a
+        # permissive bound. FULL is bounded by full_max_passes (default 16
+        # passes), so a bed beyond ~17 segments can never reach S=1 — fail
+        # the PRE gate fast rather than burning the settle timeout after.
+        pre_compact_max_segments = (
+            17 if args.compact_full_before_measure else args.max_segments
+        )
+        # The three settle waits (skip-ingest, post-ingest, post-compact)
+        # share every argument but the segment bound — one closure keeps
+        # them from drifting apart (the file's phase_sweep pattern).
+        def settle(max_segments: int) -> dict:
+            return wait_for_materialization(
+                root / "data" / "sst",
+                server_url,
+                collection_id,
+                args.rows,
+                max_segments,
+                args.settle_timeout_secs,
+                args.stable_secs,
+                remote_geometry,
+                required_layout_version=args.require_layout_version,
+            )
+
         if args.skip_ingest:
             # TD-TIER-1 E1: reuse the settled OBJECT PREFIX a prior run built —
             # identical objects, model and query IDs across cap arms. The
@@ -3842,7 +4128,9 @@ def main() -> int:
             # server too; its id must reproduce the fixture's (objects live
             # under <id>/data/) — a fresh catalog assigns the same first id;
             # anything else fails closed rather than querying a wrong prefix.
-            collection_id = create_collection(server_url, base_path, args.base_format)
+            collection_id = create_collection(
+                server_url, base_path, args.base_format, storage_class=args.storage_class
+            )
             if collection_id != args.collection_id:
                 raise RuntimeError(
                     "skip-ingest id mismatch: fixture collection "
@@ -3850,17 +4138,7 @@ def main() -> int:
                 )
             result["collection_id"] = collection_id
             result["ingest"] = {"skipped": True, "source_collection_id": collection_id}
-            geometry = wait_for_materialization(
-                root / "data" / "sst",
-                server_url,
-                collection_id,
-                args.rows,
-                args.max_segments,
-                args.settle_timeout_secs,
-                args.stable_secs,
-                remote_geometry,
-                required_layout_version=args.require_layout_version,
-            )
+            geometry = settle(pre_compact_max_segments)
             result["settled_geometry"] = geometry
         else:
             (
@@ -3889,6 +4167,7 @@ def main() -> int:
                     if args.metadata_cols
                     else None
                 ),
+                storage_class=args.storage_class,
             )
             result["collection_id"] = collection_id
             result["ingest"] = {
@@ -3898,17 +4177,41 @@ def main() -> int:
                 "explicit_flushes": explicit_flushes,
                 "explicit_compaction": explicit_compaction,
             }
-        geometry = wait_for_materialization(
-            root / "data" / "sst",
-            server_url,
-            collection_id,
-            args.rows,
-            args.max_segments,
-            args.settle_timeout_secs,
-            args.stable_secs,
-            remote_geometry,
-            required_layout_version=args.require_layout_version,
-        )
+        geometry = settle(pre_compact_max_segments)
+        if args.compact_full_before_measure:
+            # TD-COMPACT-15 S=1: collapse the settled bed with COMPACT FULL
+            # (#2339) and re-settle so every arm below measures the SAME
+            # rows/model/queries against a smaller segment count. The
+            # validations that follow (layout, trained, ivf_k, n_comp) then
+            # gate the final measured geometry, and --max-segments turns
+            # into the collapse assertion (S=1 arms pass --max-segments 1),
+            # and --compact-full-target-segments must match it (enforced at
+            # parse time) so the gate and the recorded config agree.
+            before = {
+                "segment_count": geometry["segment_count"],
+                "bytes": geometry["bytes"],
+                "segments": [
+                    {"path": s["path"], "bytes": s.get("bytes")}
+                    for s in geometry["segments"]
+                ],
+            }
+            action = compact_via_flight(
+                "127.0.0.1",
+                args.port,
+                collection_id,
+                full=True,
+                target_segments=args.compact_full_target_segments,
+            )
+            # The two are equal (enforced at parse time), so settle on the one.
+            geometry = settle(args.max_segments)
+            result["compact_full_before_measure"] = {
+                "before": before,
+                "action": action,
+                "after": {
+                    "segment_count": geometry["segment_count"],
+                    "bytes": geometry["bytes"],
+                },
+            }
         wrong_layouts = [
             segment
             for segment in geometry["segments"]
@@ -4023,6 +4326,36 @@ def main() -> int:
         active = spawn_server("server-local-disk-warm.log", local_disk)
         active.start()
         active_pid = active.process.pid if active.process is not None else None
+        if args.storage_class and args.residency_ready_timeout_secs > 0:
+            # TD-TIER-1 SC6: the granted arm serves from residency only once
+            # the grant is READY(g) — poll storage_class_status, then pin the
+            # status (state, coverage, generation) into the result.
+
+            deadline = time.monotonic() + args.residency_ready_timeout_secs
+            status = None
+            while time.monotonic() < deadline:
+                try:
+                    detail = request_json(
+                        f"{server_url}/api/v2/collections/{collection_id}",
+                        method="GET",
+                    )
+                except Exception:
+                    detail = None
+                status = (
+                    detail.get("storage_class_status") if isinstance(detail, dict) else None
+                )
+                if isinstance(status, dict) and str(status.get("state", "")).upper() == "READY":
+                    break
+                time.sleep(2.0)
+            if not (isinstance(status, dict) and str(status.get("state", "")).upper() == "READY"):
+                raise RuntimeError(
+                    f"TD-TIER-1 SC6: residency never reached READY within "
+                    f"{args.residency_ready_timeout_secs}s: {status!r}"
+                )
+            result["residency"] = {
+                "ready_status": status,
+                "waited_for": "storage_class_status.state == READY",
+            }
         local_warm = phase_sweep("local_disk_warm", args.queries)
         result["phases"]["local_disk_warm"] = local_warm
         failures.extend(

@@ -1437,7 +1437,7 @@ mod tests {
                 // onto it and carry its file.
                 if let Some(part) = self.competitor_part.lock().unwrap().take() {
                     let mut commits = self.iceberg_commits.lock().unwrap();
-                    let version = commits.iter().filter(|c| c.0 == metadata_prefix).count() as u64;
+                    let _version = commits.iter().filter(|c| c.0 == metadata_prefix).count() as u64;
                     commits.push((metadata_prefix.to_string(), parent, vec![part]));
                 }
                 return Err(StorageError::AlreadyExists(

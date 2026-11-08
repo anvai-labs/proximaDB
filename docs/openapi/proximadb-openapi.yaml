@@ -8,7 +8,7 @@ info:
   license:
     name: Apache-2.0
     identifier: Apache-2.0
-  version: 0.2.0
+  version: 0.6.0
 servers:
 - url: http://localhost:5678
   description: Local ProximaDB server
@@ -5209,6 +5209,13 @@ components:
             Desired access tier for future segment writes (TD-TIER-1 SC5):
             "hot" | "cool" | "cold"; omitted when unset (the account default).
             Desired, not observed: an account lifecycle rule may move objects.
+        pool_id:
+          type:
+          - string
+          - 'null'
+          description: |-
+            Reservation pool the PERFORMANCE grant charges (TD-TIER-1 SC6);
+            omitted when the default pool applies.
         schema:
           oneOf:
           - type: 'null'
@@ -5398,6 +5405,24 @@ components:
             Operator metadata tags, e.g. `"recall_target:0.95"`,
             `"target_vector_count:1000"`, `"modalities:text,image"`. Consumed by the
             recall advisor / route-health (`services/collection/recall_target.rs`).
+        properties:
+          type:
+          - object
+          - 'null'
+          description: |-
+            Per-collection table properties (Hive TBLPROPERTIES-style).
+
+            NOT persisted by this endpoint yet: a non-empty map is rejected with
+            400. Create the collection, then set properties with `ALTER TABLE
+            <name> SET (...)` over pgwire. Three namespaces are reserved for policy
+            there, with unknown keys rejected: `cache.*` (TD-COMPACT-2b),
+            `compaction.*` (TD-COMPACT-15) and `probe.*` (TD-RDSTRAT-14). Every
+            `probe.*` key, valid or not, is currently refused because nothing
+            consumes it yet.
+          additionalProperties:
+            type: string
+          propertyNames:
+            type: string
         quantization:
           oneOf:
           - type: 'null'
@@ -5455,6 +5480,15 @@ components:
             before a cool/cold tier's minimum storage duration. Existing objects
             are not rewritten; control objects keep the account default. Once
             set, a tier can be changed but not cleared back to the default.
+        pool_id:
+          type:
+          - string
+          - 'null'
+          description: |-
+            TD-TIER-1 SC6 policy seam: the reservation pool this PERFORMANCE
+            collection's grant charges ("pool_id" in [storage.reservation_pools]);
+            omitted ⇒ the configured default pool. Unknown ids are refused at
+            admission with the configured ids listed.
       additionalProperties: false
     CreateCollectionV2Response:
       type: object
@@ -6011,7 +6045,13 @@ components:
           description: Whether this is the collection's primary ANN index.
     IngestDocument:
       type: object
-      description: A single record submitted for native embedding + indexing.
+      description: |-
+        A single record submitted for native embedding + indexing.
+
+        Unknown fields are REJECTED (`deny_unknown_fields`, TD-REC-1 policy — the
+        same rule as the records surface): the declared fields plus the
+        `props`/`metadata` alias pair are the contract; anything else is a 400
+        naming the unknown field instead of a silently dropped write.
       required:
       - id
       properties:
@@ -6037,10 +6077,16 @@ components:
             locally (legacy path).
         metadata:
           type: object
-          description: Arbitrary metadata fields. Stored as ProximaRecord props.
+          description: |-
+            Arbitrary metadata fields. Stored as ProximaRecord props.
+
+            `props` is accepted as an alias (TD-REC-1): the records surface
+            documents `props` as the canonical map and accepts `metadata` as its
+            alias, so this surface accepts both spellings of the same map too.
           additionalProperties: {}
           propertyNames:
             type: string
+      additionalProperties: false
     IngestDocumentsRequest:
       type: object
       required:
@@ -6123,13 +6169,17 @@ components:
                             "content": "A detailed product description...",
                             "storage_hint": "adaptive"
                         }
-                    ],
-                    "source": "catalog_import"
+                    ]
                 }
             ],
             "validate_schema": true
         }
         ```
+
+        (A record top level accepts exactly `id`, `vector`, `props` — or its
+        advertised alias `metadata` — and `text_fields`; anything else is a 400
+        naming the unknown field. The example used to show a `"source"` key: it
+        was never a contract field and was silently dropped before TD-REC-1.)
         Not supported in v0.2: optimistic versioning, conditional-write predicates,
         update-by-filter, delete-by-filter, and patch / partial-record update. The
         live contract is exposed via `WriteContractHealth` on the route-health
@@ -6319,6 +6369,15 @@ components:
         This is the JSON-serializable input format for ProximaRecord.
         It uses serde_json::Value for typed fields to support dynamic typing
         at the API boundary, with validation happening during conversion.
+
+        Unknown fields are REJECTED (`deny_unknown_fields`, TD-REC-1 policy): a
+        write that carries a field this contract does not know must fail loud at
+        the boundary, not report success while silently discarding data — which
+        is exactly how the `metadata` drop shipped. The grandfathered spellings
+        are the ones the contract itself advertises: `props` and its `metadata`
+        alias. Generated SDKs (regenerated in #2337) send only declared fields,
+        so the deny cannot break them; a hand-rolled client sending something
+        else gets a 400 naming the problem instead of a silent no-op filter.
       required:
       - vector
       properties:
@@ -6337,7 +6396,18 @@ components:
           type:
           - object
           - 'null'
-          description: Canonical rich property map.
+          description: |-
+            Canonical rich property map.
+
+            `metadata` is accepted as an alias: the documents API advertises that
+            spelling ("Arbitrary metadata fields. Stored as ProximaRecord props")
+            and maps it here, so the records API must accept it too — before the
+            alias it was silently dropped and filters over it matched nothing
+            (TD-REC-1). The OpenAPI contract stays `props`; the alias is
+            lenience for the already-advertised spelling, not a second field.
+            It composes with `deny_unknown_fields`: an alias is a KNOWN field
+            name, so `metadata` passes the deny while any other unknown key is
+            rejected.
           additionalProperties: {}
           propertyNames:
             type: string
@@ -6348,6 +6418,7 @@ components:
           items:
             $ref: '#/components/schemas/TextFieldInput'
           description: Dedicated TEXT fields with storage hints
+      additionalProperties: false
     QuantizationConfigInput:
       type: object
       description: |-
@@ -8460,6 +8531,14 @@ components:
       - IsNull
       - IsNotNull
       - Like
+      - Exists
+      - NotExists
+      - Regex
+      description: |
+        The server additionally accepts the legacy wire names `Equal` and
+        `NotEqual` as aliases of `Equals`/`NotEquals` when deserializing
+        (mixed-read compatibility); serialization always emits the names
+        above.
     AbacFilterExpression:
       type: object
       additionalProperties: true
@@ -8476,7 +8555,8 @@ components:
         * `{"Comparison": {"field": <string>, "operator": <one of
           "Equals","NotEquals","GreaterThan","GreaterThanOrEqual",
           "LessThan","LessThanOrEqual","In","NotIn","Contains",
-          "StartsWith","EndsWith","Between","IsNull","IsNotNull","Like">,
+          "StartsWith","EndsWith","Between","IsNull","IsNotNull","Like",
+          "Exists","NotExists","Regex">,
           "value": <any JSON value>}}`
         * `{"And": [<AbacFilterExpression>, ...]}`
         * `{"Or": [<AbacFilterExpression>, ...]}`

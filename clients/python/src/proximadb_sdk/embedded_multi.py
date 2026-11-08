@@ -50,6 +50,14 @@ from typing import Any
 from proximadb_sdk.adapters.embedded_adapter import EmbeddedProtocolAdapter
 from proximadb_sdk.integrations._records import insert_records, record_payload
 
+from ._code_analysis import (
+    chunk_code,
+    extract_code_metrics,
+    filter_hybrid_results,
+    find_code_files,
+    matches_filter,
+)
+
 
 class EmbeddedMultiModelProvider:
     """High-level multi-model code provider for embedded ProximaDB.
@@ -425,97 +433,16 @@ class EmbeddedMultiModelProvider:
     # ========================================================================
 
     def _chunk_code(self, content: str, chunk_size: int = 512) -> list[dict[str, Any]]:
-        """Chunk code content for better semantic retrieval.
-
-        Splits code into logical chunks (functions, classes, blocks)
-        while preserving metadata about line numbers.
-        """
-        chunks: list[dict[str, Any]] = []
-
-        lines = content.split("\n")
-        current_chunk: list[str] = []
-        current_start = 0
-
-        for i, line in enumerate(lines):
-            current_chunk.append(line)
-
-            # Start new chunk on:
-            # - Empty lines (between functions)
-            # - Class/function definitions
-            # - Chunk size limit
-            if line.strip() == "" or i - current_start >= chunk_size:
-                if current_chunk:
-                    chunks.append(
-                        {
-                            "content": "\n".join(current_chunk),
-                            "start_line": current_start + 1,
-                            "end_line": i + 1,
-                            "line_count": len(current_chunk),
-                        }
-                    )
-                    current_chunk = []
-                    current_start = i + 1
-
-        # Add remaining content
-        if current_chunk:
-            chunks.append(
-                {
-                    "content": "\n".join(current_chunk),
-                    "start_line": current_start + 1,
-                    "end_line": len(lines),
-                    "line_count": len(current_chunk),
-                }
-            )
-
-        return chunks
+        """Chunk code content for better semantic retrieval (shared helper)."""
+        return chunk_code(content, chunk_size)
 
     def _extract_code_metrics(
         self,
         content: str,
         language: str,
     ) -> list[dict[str, Any]]:
-        """Extract code metrics for time-series tracking.
-
-        Metrics:
-        - lines_of_code: Total non-empty, non-comment lines
-        - function_count: Number of functions
-        - class_count: Number of classes
-        - cyclomatic_complexity: Approximate complexity
-        - max_nesting_depth: Maximum nesting level
-        """
-        lines = content.split("\n")
-        metrics: list[dict[str, Any]] = []
-
-        # Lines of code
-        loc = sum(
-            1 for line in lines if line.strip() and not line.strip().startswith("#")
-        )
-        metrics.append({"name": "lines_of_code", "value": loc, "language": language})
-
-        # Function count (heuristic)
-        func_count = sum(1 for line in lines if line.strip().startswith("def "))
-        metrics.append(
-            {"name": "function_count", "value": func_count, "language": language}
-        )
-
-        # Class count (heuristic)
-        class_count = sum(1 for line in lines if line.strip().startswith("class "))
-        metrics.append(
-            {"name": "class_count", "value": class_count, "language": language}
-        )
-
-        # Max nesting depth
-        max_depth = 0
-        current_depth = 0
-        for line in lines:
-            stripped = line.strip()
-            current_depth += stripped.count("{") - stripped.count("}")
-            max_depth = max(max_depth, current_depth)
-        metrics.append(
-            {"name": "max_nesting_depth", "value": max_depth, "language": language}
-        )
-
-        return metrics
+        """Extract code metrics for time-series tracking (shared helper)."""
+        return extract_code_metrics(content, language)
 
     # ========================================================================
     # Advanced Queries
@@ -689,28 +616,8 @@ class EmbeddedMultiModelProvider:
         repo_path: Path,
         language_map: dict[str, str] | None = None,
     ) -> list[Path]:
-        """Find all code files in the repository."""
-        language_map = language_map or {
-            ".py": "python",
-            ".js": "javascript",
-            ".ts": "typescript",
-            ".java": "java",
-            ".go": "go",
-            ".rs": "rust",
-            ".cpp": "cpp",
-            ".c": "c",
-            ".h": "c",
-            ".cc": "cpp",
-        }
-
-        code_files = []
-        for file_path in repo_path.rglob("*"):
-            if file_path.is_file():
-                ext = file_path.suffix
-                if ext in language_map:
-                    code_files.append(file_path)
-
-        return code_files
+        """Find code files in a repository (shared helper)."""
+        return find_code_files(repo_path, language_map)
 
     def _detect_language(
         self,
@@ -807,27 +714,14 @@ class EmbeddedMultiModelProvider:
         results: list[dict[str, Any]],
         filter_dict: dict[str, Any] | None,
     ) -> list[dict[str, Any]]:
-        """Filter hybrid search results."""
-        if not filter_dict:
-            return results
-
-        filtered = []
-        for result in results:
-            metadata = result.get("metadata", {})
-            if self._matches_filter(metadata, filter_dict):
-                filtered.append(result)
-        return filtered
+        """Filter hybrid search results (shared helper)."""
+        return filter_hybrid_results(results, filter_dict)
 
     def _matches_filter(
         self, metadata: dict[str, Any], filter_dict: dict[str, Any]
     ) -> bool:
-        """Check if metadata matches filter criteria."""
-        for key, value in filter_dict.items():
-            if key not in metadata:
-                return False
-            if metadata[key] != value:
-                return False
-        return True
+        """Check if metadata matches filter criteria (shared helper)."""
+        return matches_filter(metadata, filter_dict)
 
     def _rank_hybrid_results(
         self,

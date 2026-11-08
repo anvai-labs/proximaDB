@@ -15,8 +15,12 @@
 //!   topic. Publish failure is logged and counted — it must never fail the
 //!   write (TD-CACHE-10's original constraint).
 //! * **Subscribe** (every other pod): consumer group keyed by pod id; each
-//!   admitted event drives `CacheInvalidationCoordinator::invalidate_
-//! collection` plus the object-economy directory cache drop.
+//!   admitted event drives
+//!   `CacheInvalidationCoordinator::invalidate_collection`. (The bus has no
+//!   production subscriber — the only production caller that ever dropped
+//!   the object-economy directory cache was the writer-side
+//!   `SstableWriterDirectoryHooks::emit_after_flush`, whose call site this
+//!   retirement removes; see TD-OEDIRWM-1.)
 //!
 //! Ordering/dedup: `GlobalLsnAllocator` LSNs are PER-POD monotonic atomics,
 //! so events carry `(pod_id, lsn)` and admission is "lsn strictly greater

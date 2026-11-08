@@ -190,19 +190,7 @@ impl FileSystemTenantPostureStore {
     }
 }
 
-fn read_lock<T>(lock: &RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
-    match lock.read() {
-        Ok(g) => g,
-        Err(poisoned) => poisoned.into_inner(),
-    }
-}
-
-fn write_lock<T>(lock: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
-    match lock.write() {
-        Ok(g) => g,
-        Err(poisoned) => poisoned.into_inner(),
-    }
-}
+use crate::lock_util::{read_lock, write_lock};
 
 // ---------------------------------------------------------------------------
 // Specification (TD-SEC-2 Slice C). Written before the seam wiring.

@@ -57,7 +57,6 @@ use std::sync::Arc;
 
 use crate::storage::persistence::filesystem::FilesystemFactory;
 
-use super::IndexEntry;
 use crate::core::bloom::{BloomFilterConfig, HashAlgorithm};
 use crate::storage::engines::core::formats::proximablocks::ProximaBlockMetadata;
 
@@ -142,30 +141,6 @@ struct BlockIndexEntry {
 }
 
 /// SSTable writer with atomic write optimization and quantization support
-/// Metadata returned by [`SstableWriter::write_sorted_vector_records`] and
-/// its delegators so callers (the flush coordinator, compaction, tests)
-/// can use the writer's internal index state without re-reading the
-/// freshly-written SST. Carries the inputs `SstableWriterDirectoryHooks`
-/// needs to populate an object-economy directory entry — that's the
-/// motivating consumer, but the struct is generally useful.
-///
-/// Pre-existing callers that ignore the return value via `?` are
-/// unaffected.
-#[derive(Debug, Clone)]
-pub struct SstableWriteOutcome {
-    /// Sorted index entries for every block written, in key order. Used
-    /// by the directory emitter to build the per-block metadata layer.
-    pub index_entries: Vec<IndexEntry>,
-    /// Offset where the block index section begins in the SST file.
-    pub block_index_offset: u64,
-    /// Length of the block index section in bytes.
-    pub block_index_size: u32,
-    /// Total serialized SST file size in bytes.
-    pub file_size_bytes: u64,
-    /// Number of records written.
-    pub record_count: u64,
-}
-
 /// MIGRATED: Now uses universal adapters to eliminate code duplication
 pub struct SstableWriter {
     /// Output file path
@@ -182,14 +157,6 @@ pub struct SstableWriter {
     /// Compression configuration from flush parameters
     compression_config: Option<CompressionConfig>,
     // SIMD encoding now handled internally by ProximaDataBlock
-    /// Optional Vector Object Economy directory emission hooks. When set
-    /// by [`Self::with_directory_emission`], `finalize_sstable` (and the
-    /// write path it shares with compaction) appends a directory file
-    /// entry after the atomic SST write succeeds and invalidates the
-    /// read-side cache. When `None`, directory emission is skipped
-    /// entirely — pre-existing callers are unaffected until they opt in.
-    directory_emission:
-        Option<crate::storage::engines::sst::object_economy_directory::SstableWriterDirectoryHooks>,
 }
 
 impl SstableWriter {
@@ -220,7 +187,6 @@ impl SstableWriter {
             filesystem,
             compression_provider,
             compression_config: None,
-            directory_emission: None,
         }
     }
 
@@ -252,7 +218,6 @@ impl SstableWriter {
             filesystem,
             compression_provider,
             compression_config,
-            directory_emission: None,
         }
     }
 
@@ -271,28 +236,6 @@ impl SstableWriter {
         // Update compression configuration (stored in compression_config field)
         self.compression_config = config;
         self
-    }
-
-    /// Opt in to Vector Object Economy directory emission after each
-    /// successful SST write. Constructor-injected: when the caller
-    /// (flush coordinator) supplies hooks, the writer appends a file
-    /// entry to the per-collection sidecar and invalidates the read-side
-    /// cache. When `None` (default), directory emission is skipped — no
-    /// path derivation, no fallback inference.
-    pub fn with_directory_emission(
-        mut self,
-        hooks: crate::storage::engines::sst::object_economy_directory::SstableWriterDirectoryHooks,
-    ) -> Self {
-        self.directory_emission = Some(hooks);
-        self
-    }
-
-    /// True when [`Self::with_directory_emission`] has supplied hooks for
-    /// this writer. Used by operators (and the regression test) to verify
-    /// that opt-in is explicit — newly-constructed writers MUST NOT emit
-    /// directory updates by default.
-    pub fn directory_emission_configured(&self) -> bool {
-        self.directory_emission.is_some()
     }
 
     /// Write `records` as a native PAX segment (ADR-049 M1-2). ProximaRecord-native:

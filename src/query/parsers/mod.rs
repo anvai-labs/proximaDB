@@ -44,7 +44,11 @@ pub use cypher::{
     CypherParser,
     // Visitor pattern
     CypherVisitor,
-    // GraphQuery conversion
+    // Statement opcode (renamed ExecutableGraphQueryType 2026-11-07; the
+    // GraphQueryType alias re-exports the deprecated upstream alias)
+    ExecutableGraphQueryType,
+    // GraphQuery conversion (renamed ExecutableGraphQuery upstream
+    // 2026-11-07; aliased back at the cypher.rs re-export site)
     GraphQuery,
     GraphQueryType,
     LocatedToken,

@@ -2621,3 +2621,101 @@ async fn diagnostics_observability_and_prepared_statements_are_tenant_scoped() {
         failures.join("\n  ")
     );
 }
+
+/// TD-COMPACT-15: the Flight `compact_collection` payload carries full
+/// provenance (segment counts, stop reason, measured bytes/duration) and
+/// accepts the per-request `target_segments` override — the contract the
+/// bench harness records verbatim into result.json.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn flight_compact_collection_payload_carries_provenance() {
+    let server = Server::start().await.expect("server start");
+    let rest = Rest {
+        http: reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .no_proxy()
+            .build()
+            .expect("http client"),
+        base: format!("http://127.0.0.1:{}", server.rest_port),
+    };
+    let name = "acme_compact_provenance";
+    rest.create(Some(ACME), &name).await;
+
+    let channel =
+        tonic::transport::Endpoint::from_shared(format!("http://127.0.0.1:{}", server.flight_port))
+            .expect("flight endpoint")
+            .connect()
+            .await
+            .expect("flight channel");
+    let mut flight = FlightServiceClient::new(channel);
+
+    // Four insert+flush rounds stay UNDER the L0 count threshold (5): the
+    // fixture deterministically holds 4 segments when FULL runs.
+    for round in 0..4 {
+        rest.insert(Some(ACME), &name, &format!("r{round}")).await;
+        let flush = arrow_flight::Action {
+            r#type: "flush_collection".to_string(),
+            body: serde_json::to_vec(&json!({ "collection_id": name }))
+                .expect("flush body")
+                .into(),
+        };
+        let outcome = flight.do_action(with_tenant(flush, ACME)).await;
+        assert!(outcome.is_ok(), "flush round {round}: {outcome:?}");
+    }
+
+    let compact = arrow_flight::Action {
+        r#type: "compact_collection".to_string(),
+        body: serde_json::to_vec(&json!({
+            "collection_id": name, "full": true, "target_segments": 2
+        }))
+        .expect("compact body")
+        .into(),
+    };
+    let stream = flight
+        .do_action(with_tenant(compact, ACME))
+        .await
+        .expect("compact action");
+    let results: Vec<_> = stream
+        .into_inner()
+        .try_collect()
+        .await
+        .expect("compact result stream");
+    assert_eq!(results.len(), 1, "one result body");
+    let payload: Value = serde_json::from_slice(&results[0].body).expect("compact payload json");
+    assert_eq!(payload["success"], json!(true), "payload: {payload}");
+    assert_eq!(payload["operation"], json!("compact"));
+    assert_eq!(payload["full"], json!(true));
+    let before = payload["segments_before"]
+        .as_u64()
+        .expect("segments_before");
+    let after = payload["segments_after"].as_u64().expect("segments_after");
+    assert!(
+        before >= 3,
+        "multi-segment fixture, got {before}: {payload}"
+    );
+    // 2, not 1: the config default is 1, so only a NON-default target
+    // proves the per-request override reaches the engine, and only a stop
+    // above 1 exercises the follow-up floor end to end (#2418 review round
+    // 14). The 4-segment fixture must land on exactly 2, not 1.
+    assert_eq!(
+        after, 2,
+        "target_segments=2 must stop at exactly two: {payload}"
+    );
+    assert_eq!(payload["reached_target"], json!(true));
+    assert!(
+        payload["stop_reason"].is_null(),
+        "no stop reason when the target is met: {payload}"
+    );
+    assert!(
+        payload["bytes_read"].as_u64().unwrap_or(0) > 0,
+        "measured bytes_read: {payload}"
+    );
+    assert!(
+        payload["bytes_written"].as_u64().unwrap_or(0) > 0,
+        "measured bytes_written: {payload}"
+    );
+    // Presence, not magnitude (whole-millisecond truncation).
+    assert!(
+        payload["duration_ms"].is_u64(),
+        "duration_ms reported: {payload}"
+    );
+}

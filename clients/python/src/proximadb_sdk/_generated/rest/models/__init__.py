@@ -109,6 +109,9 @@ from .collection_stats_v2 import CollectionStatsV2
 from .collection_v2_response import CollectionV2Response
 from .collection_v2_summary import CollectionV2Summary
 from .create_collection_v2_request import CreateCollectionV2Request
+from .create_collection_v2_request_properties_type_0 import (
+    CreateCollectionV2RequestPropertiesType0,
+)
 from .create_collection_v2_response import CreateCollectionV2Response
 from .create_document_collection_request import CreateDocumentCollectionRequest
 from .create_edge_request import CreateEdgeRequest
@@ -449,6 +452,7 @@ __all__ = (
     "CollectionV2Response",
     "CollectionV2Summary",
     "CreateCollectionV2Request",
+    "CreateCollectionV2RequestPropertiesType0",
     "CreateCollectionV2Response",
     "CreateDocumentCollectionRequest",
     "CreateEdgeRequest",

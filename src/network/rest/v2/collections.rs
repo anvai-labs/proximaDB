@@ -92,8 +92,15 @@ fn record_count_for_wire(
 /// (errors surface as anyhow text, not typed variants); consolidating it in
 /// this one choke point means the eventual typed-error fix is a single-site
 /// change instead of an edit per handler.
-fn collection_op_error(op: &str, collection_id: &str, e: impl std::fmt::Display) -> ApiError {
-    if e.to_string().contains("not found") {
+fn collection_op_error(op: &str, collection_id: &str, e: anyhow::Error) -> ApiError {
+    // Typed first: a failed drop leaves the collection in place, so it is a
+    // server failure (retry), never a 404 an idempotent client reads as done.
+    if let Some(failed) = proximadb_search_types::client_argument::collection_drop_failed(&e) {
+        return ApiError::Internal(failed.to_string());
+    }
+    if proximadb_search_types::client_argument::collection_not_found(&e).is_some()
+        || e.to_string().contains("not found")
+    {
         ApiError::CollectionNotFound(collection_id.to_string())
     } else {
         ApiError::Internal(format!("Failed to {op} collection: {e}"))
@@ -257,6 +264,16 @@ pub struct CreateCollectionV2Request {
     /// `"target_vector_count:1000"`, `"modalities:text,image"`. Consumed by the
     /// recall advisor / route-health (`services/collection/recall_target.rs`).
     pub tags: Option<Vec<String>>,
+    /// Per-collection table properties (Hive TBLPROPERTIES-style).
+    ///
+    /// NOT persisted by this endpoint yet: a non-empty map is rejected with
+    /// 400. Create the collection, then set properties with `ALTER TABLE
+    /// <name> SET (...)` over pgwire. Three namespaces are reserved for policy
+    /// there, with unknown keys rejected: `cache.*` (TD-COMPACT-2b),
+    /// `compaction.*` (TD-COMPACT-15) and `probe.*` (TD-RDSTRAT-14). Every
+    /// `probe.*` key, valid or not, is currently refused because nothing
+    /// consumes it yet.
+    pub properties: Option<std::collections::HashMap<String, String>>,
     /// Quantization config (gRPC-v2 parity). When omitted, quantization is
     /// left unset (engine default).
     pub quantization: Option<QuantizationConfigInput>,
@@ -292,6 +309,12 @@ pub struct CreateCollectionV2Request {
     /// set, a tier can be changed but not cleared back to the default.
     #[serde(default)]
     pub default_access_tier: Option<String>,
+    /// TD-TIER-1 SC6 policy seam: the reservation pool this PERFORMANCE
+    /// collection's grant charges ("pool_id" in [storage.reservation_pools]);
+    /// omitted ⇒ the configured default pool. Unknown ids are refused at
+    /// admission with the configured ids listed.
+    #[serde(default)]
+    pub pool_id: Option<String>,
 }
 
 /// REST input for the per-collection index routing policy (mirrors proto
@@ -705,6 +728,23 @@ async fn create_collection_v2_checked(
         ));
     }
 
+    // FAIL CLOSED on create-time properties (#2419 review round 7). This
+    // handler builds a `CollectionConfig`, which has no properties field, so
+    // `request.properties` was never persisted: a valid
+    // `{"cache.index.mode": "pin"}` returned 200 and pinned nothing — the
+    // accepted-but-inert class the policy door exists to close, and
+    // validating the keys first only made the 200 look more trustworthy.
+    // Until create persists them, refuse and name the path that works.
+    if request
+        .properties
+        .as_ref()
+        .is_some_and(|properties| !properties.is_empty())
+    {
+        return Err(ApiError::InvalidArgument(
+            "properties are not persisted by POST /collections yet; create the collection, then set them with ALTER TABLE <name> SET ('key' = 'value', ...) over pgwire".to_string(),
+        ));
+    }
+
     if request.dimension == 0 {
         return Err(ApiError::InvalidArgument(
             "Vector dimension must be greater than 0".to_string(),
@@ -930,12 +970,23 @@ async fn create_collection_v2_checked(
     // a misspelt tier must never silently become the account default).
     let default_access_tier = match request.default_access_tier.take() {
         None => None,
+        // TD-TIER-1 SC5 residual: "default" is an EXPLICIT clear — it maps to
+        // Some(0) so the update path clears the recorded tier back to the
+        // account default (omitted preserves it, which is None).
+        Some(raw) if raw.trim().eq_ignore_ascii_case("default") => {
+            Some(crate::proto::proximadb_v1::AccessTier::Unspecified as i32)
+        }
         Some(raw) => {
             let tier = crate::services::collection::storage_class::parse_access_tier(&raw)
                 .map_err(|e| ApiError::InvalidArgument(e.to_string()))?;
             (tier != crate::proto::proximadb_v1::AccessTier::Unspecified).then_some(tier as i32)
         }
     };
+
+    // TD-TIER-1 SC6: carry the requested reservation pool verbatim —
+    // admission validates it against the configured pools (unknown ids are
+    // refused there with the list; empty normalizes to the default pool).
+    let pool_id = request.pool_id.take().filter(|raw| !raw.trim().is_empty());
 
     // ADR-028: validate + map the optional index routing policy. Fail-closed on
     // nonsensical combinations (the mode×rehydrate/nprobe validity matrix) so a
@@ -959,6 +1010,7 @@ async fn create_collection_v2_checked(
         description: request.description.take(),
         storage_class,
         default_access_tier,
+        pool_id,
         ..Default::default()
     };
 
@@ -1067,6 +1119,10 @@ pub struct CollectionV2Response {
     /// Desired, not observed: an account lifecycle rule may move objects.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_access_tier: Option<String>,
+    /// Reservation pool the PERFORMANCE grant charges (TD-TIER-1 SC6);
+    /// omitted when the default pool applies.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pool_id: Option<String>,
     /// Schema definition (if defined)
     pub schema: Option<SchemaDefinition>,
     /// Collection statistics
@@ -1381,6 +1437,7 @@ pub async fn get_collection_v2(
                     config.default_access_tier,
                 )
                 .map(str::to_string),
+                pool_id: config.pool_id.clone(),
                 storage_class_status: collection
                     .storage_class_status
                     .clone()
@@ -1928,7 +1985,8 @@ pub struct WriteContractHealth {
 ///
 /// * `search_request_modes` — what each individual search request can ask for
 ///   today. All three `VectorFreshnessMode` variants (Strong, BoundedStale,
-///   StaleOk) are wired in the search path via `should_scan_delta_with_time`.
+///   StaleOk) are accepted; the search path scans the delta for every mode
+///   but StaleOk (`requires_delta_merge`, TD-OEDIRWM-1).
 /// * `collection_level_modes_wired` — whether a *default* freshness mode is
 ///   stored on the collection / projection (so callers don't have to set it
 ///   per request). Still `false`: only per-projection `ProjectionFreshness`
@@ -1941,20 +1999,28 @@ pub struct FreshnessHealth {
     pub notes: &'static str,
 }
 
-/// Per-request freshness modes the search path actually honors. Each flag
-/// corresponds to a verifiable arm of `VectorFreshnessMode::should_scan_delta_with_time`.
+/// Per-request freshness modes the search path accepts. Strong and
+/// BoundedStale both scan the delta; StaleOk skips it
+/// (`VectorFreshnessMode::requires_delta_merge`).
 #[derive(Debug, Serialize, PartialEq)]
 pub struct SearchFreshnessModes {
     /// `Strong`: WAL/memtable delta is always merged. Default.
     pub strong: bool,
-    /// `BoundedStale { max_staleness_ms }`: directory state up to the bound
-    /// is accepted without merging the delta.
+    /// `BoundedStale { max_staleness_ms }`: accepted. Since TD-OEDIRWM-1 the
+    /// delta is always scanned (no watermark-based skip), but unlike Strong the
+    /// result may be served from the query cache (up to 300s); the
+    /// `max_staleness_ms` bound is NOT enforced.
     pub bounded_stale: bool,
     /// `StaleOk`: skip the WAL delta entirely.
     pub stale_ok: bool,
     /// Whether `BoundedStale` is wired with a real time-bound check (vs
-    /// silently degrading to Strong). True since commit e34a06225 wired
-    /// `freshness_watermark_ns` through `scan_wal_delta_if_needed`.
+    /// scanning the delta like Strong). FALSE since TD-OEDIRWM-1: the
+    /// directory watermark is stamped after the flush commits and the sidecar
+    /// is shared across pods while memtables are per-pod, so it cannot
+    /// soundly bound staleness. BoundedStale therefore always scans the delta,
+    /// but may still be served from the query cache (only Strong bypasses it),
+    /// so its `max_staleness_ms` bound is not enforced — until a
+    /// snapshot-stamped, pod-scoped watermark exists.
     pub bounded_stale_time_bound_check: bool,
 }
 
@@ -2087,9 +2153,10 @@ impl ColdServingHealth {
     }
 }
 
-/// Object-economy directory state. The directory format and sidecar live in
-/// the SST engine; route-health reports cached in-process status when present
-/// without forcing an object-storage read.
+/// Object-economy directory state. Since TD-OEDIRWM-1 no engine produces or
+/// reads the directory, so every engine reports `eligible: false`,
+/// `directory_format_present: false` and `live_status: "not_applicable"`. The
+/// shape is kept unchanged for the response contract.
 #[derive(Debug, Serialize, PartialEq)]
 pub struct ObjectEconomyHealth {
     pub eligible: bool,
@@ -2191,7 +2258,9 @@ fn compute_degraded_reasons(
     if !filtered_ann.post_filter_shortfall_disclosure {
         reasons.push(DegradedReason::PostFilterShortfallNotDisclosed);
     }
-    if !object_economy.live_status_in_app_state {
+    // Only an eligible route can be "not reachable"; since TD-OEDIRWM-1 no
+    // engine is eligible, so this no longer flags every collection.
+    if object_economy.eligible && !object_economy.live_status_in_app_state {
         reasons.push(DegradedReason::ObjectEconomyLiveStatusNotReachable);
     }
     if object_economy.eligible
@@ -2238,7 +2307,6 @@ fn build_route_health(
         record_count,
         storage_size_bytes,
         index_size_bytes,
-        None,
         RecallProbeLiveState::Unwired,
         None,
     )
@@ -2263,7 +2331,6 @@ fn build_route_health_with_live_state(
     record_count: u64,
     storage_size_bytes: u64,
     index_size_bytes: u64,
-    cached_object_economy_status: Option<&'static str>,
     recall_probe_state: RecallProbeLiveState,
     pin_state: Option<crate::storage::collection_pinning::PinState>,
 ) -> CollectionRouteHealthV2 {
@@ -2302,35 +2369,27 @@ fn build_route_health_with_live_state(
             strong: true,
             bounded_stale: true,
             stale_ok: true,
-            bounded_stale_time_bound_check: true,
+            // TD-OEDIRWM-1: BoundedStale scans the delta like Strong — the
+            // directory watermark cannot soundly bound staleness.
+            bounded_stale_time_bound_check: false,
         },
-        notes: "Per-request freshness modes (strong/bounded_stale/stale_ok) \
-                are honored by the search path; collection-default modes are \
-                not yet stored on the catalog.",
+        notes: "Per-request freshness modes are accepted. bounded_stale always \
+                scans the WAL delta (no sound freshness watermark exists yet, \
+                TD-OEDIRWM-1) but may be served from the query cache, which only \
+                strong bypasses, so its max_staleness_ms bound is not enforced. \
+                Collection-default modes are not yet stored on the catalog.",
     };
-    let object_economy_eligible = engine == "sst";
-    let object_economy_live_status = if object_economy_eligible {
-        cached_object_economy_status.unwrap_or("not_checked")
-    } else {
-        "not_applicable"
-    };
-    let object_economy_live_status_in_app_state =
-        object_economy_eligible && cached_object_economy_status.is_some();
+    // TD-OEDIRWM-1: no engine produces or reads an object-economy
+    // directory any more, so the route is not applicable anywhere.
     let object_economy = ObjectEconomyHealth {
-        eligible: object_economy_eligible,
-        directory_format_present: object_economy_eligible,
-        live_status_in_app_state: object_economy_live_status_in_app_state,
-        live_status: object_economy_live_status,
-        route_hint: object_economy_eligible.then_some("object_economy"),
-        notes: if object_economy_eligible && cached_object_economy_status.is_some() {
-            "VectorObjectEconomyDirectory status was read from the in-process \
-             cache without object-storage I/O."
-        } else if object_economy_eligible {
-            "VectorObjectEconomyDirectory exists for SST; no cached live status \
-             is currently present in AppState."
-        } else {
-            "Vector object-economy directory is currently SST-specific."
-        },
+        eligible: false,
+        directory_format_present: false,
+        live_status_in_app_state: false,
+        live_status: "not_applicable",
+        route_hint: None,
+        notes: "The vector object-economy directory route is retired: the SST \
+                flush no longer writes the directory sidecar and no query path \
+                reads it (TD-OEDIRWM-1).",
     };
     let (recall_probe_in_app_state, recall_probe_gate_open) = match recall_probe_state {
         RecallProbeLiveState::Unwired => (false, None),
@@ -2403,19 +2462,6 @@ fn build_route_health_with_live_state(
         // cold→warm serving state from the AXIS manager (ADR-023 R3 (c)).
         cold_serving: ColdServingHealth::unobservable(),
         degraded_reasons,
-    }
-}
-
-fn object_economy_status_label(
-    status: &crate::storage::engines::sst::object_economy_directory::DirectoryLoadStatus,
-) -> &'static str {
-    use crate::storage::engines::sst::object_economy_directory::DirectoryLoadStatus;
-
-    match status {
-        DirectoryLoadStatus::Loaded => "loaded",
-        DirectoryLoadStatus::Missing => "missing",
-        DirectoryLoadStatus::Corrupt(_) => "corrupt",
-        DirectoryLoadStatus::Mismatch { .. } => "mismatch",
     }
 }
 
@@ -2616,16 +2662,6 @@ pub async fn get_collection_route_health_v2(
 
     let engine_str = collection_storage_engine_label(config.storage_engine).to_string();
     let distance_metric_str = collection_distance_metric_label(config.distance_metric).to_string();
-    let cached_object_economy_status = if engine_str == "sst" {
-        state
-            .vector_operations_service
-            .cached_object_economy_directory_status(&collection_id)
-            .as_ref()
-            .map(object_economy_status_label)
-    } else {
-        None
-    };
-
     let recall_probe_state = match &state.recall_probe_gate {
         Some(gate) => {
             let scope =
@@ -2648,7 +2684,6 @@ pub async fn get_collection_route_health_v2(
         non_negative_stat(stats.vector_count),
         non_negative_stat(stats.data_size_bytes),
         non_negative_stat(stats.index_size_bytes),
-        cached_object_economy_status,
         recall_probe_state,
         pin_state,
     );
@@ -2838,6 +2873,39 @@ pub async fn get_collection_route_health_v2(
 /// `endpoint` is the operator-facing label used in the error
 /// message + audit log so the caller can tell which mutation was
 /// rejected.
+/// Gate for operator maintenance endpoints (`COMPACT` / `POST .../compact`):
+/// accepts `SystemAdmin | ConfigureSystem | MaintainCollections` — the PG17
+/// `MAINTAIN` analog (TD-COMPACT-14). Same envelope as
+/// [`require_recall_admin`]: no auth context (unified-port dev mode) passes
+/// with the documented dev marker; an attached context without one of the
+/// three permissions is a 403.
+fn require_maintain(
+    user_context: Option<&crate::security::rbac_service::UnifiedUserContext>,
+    endpoint: &'static str,
+) -> ApiResult<String> {
+    use crate::security::rbac_service::UnifiedPermission;
+
+    let Some(ctx) = user_context else {
+        return Ok("dev:unified-port-no-auth".to_string());
+    };
+    let allowed = ctx
+        .effective_permissions
+        .contains(&UnifiedPermission::SystemAdmin)
+        || ctx
+            .effective_permissions
+            .contains(&UnifiedPermission::ConfigureSystem)
+        || ctx
+            .effective_permissions
+            .contains(&UnifiedPermission::MaintainCollections);
+    if allowed {
+        Ok(ctx.user_id.clone())
+    } else {
+        Err(ApiError::Forbidden(format!(
+            "{endpoint}: requires SystemAdmin, ConfigureSystem or MaintainCollections permission"
+        )))
+    }
+}
+
 fn require_recall_admin(
     user_context: Option<&crate::security::rbac_service::UnifiedUserContext>,
     endpoint: &'static str,
@@ -3273,9 +3341,105 @@ async fn ensure_collection_exists(
     Ok(())
 }
 
-/// `POST /api/v2/collections/:id/suspend` — Phase 8 F4a. Evicts the collection's
-/// in-memory IVF index to free memory (the persisted `ivf.bin` + catalog
-/// metadata stay); the next query (or `/resume`) warm-loads it. Admin-gated.
+// `PATCH /api/v2/collections/{id}/properties` was REMOVED (#2419 review
+// round 16). It shipped in #2405 as a stub that never persisted anything —
+// first echoing its input as if applied, then (rounds 7-14) refusing with
+// 501. A route that can only ever refuse is a capability that does not exist,
+// so it is deleted rather than kept as an advertised facade. Set table
+// properties with `ALTER TABLE <name> SET (...)` over pgwire; restore a PATCH
+// door together with the merge + catalog write it needs.
+
+#[derive(Debug, serde::Deserialize)]
+pub struct CompactRequest {
+    #[serde(default)]
+    pub full: bool,
+    /// TD-COMPACT-15 Experiment 3: per-request override of the FULL
+    /// collapse target (`[storage.compaction_config] full_target_segments`).
+    /// Must be > 0, and requires `full: true` — sending it with
+    /// `full: false` is a 400 rather than a silently dropped knob.
+    #[serde(default)]
+    pub target_segments: Option<usize>,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct CompactResponse {
+    pub collection_id: String,
+    pub full: bool,
+    /// The provenance fields, EMBEDDED rather than hand-copied: a field added
+    /// to `FullCompactionMetrics` reaches this wire automatically (#2418
+    /// review round 16; the hand-copy drift was TD-COMPACT-15 F4).
+    #[serde(flatten)]
+    pub metrics: crate::storage::traits::FullCompactionMetrics,
+}
+
+/// `POST /api/v2/collections/{id}/compact` body `{"full": bool}` (an omitted
+/// body — no Content-Type — compacts plainly). Operator endpoint
+/// (TD-COMPACT-14): NOT utoipa-annotated, so it is not part of the published
+/// OpenAPI spec — same convention as suspend/resume and the `_diagnostics`
+/// actions.
+pub async fn post_collection_compact_v2(
+    Path(collection_id): Path<String>,
+    Extension(tenant): Extension<TenantContext>,
+    user_context: Option<Extension<crate::security::rbac_service::UnifiedUserContext>>,
+    State(state): State<AppState>,
+    body: Option<axum::Json<CompactRequest>>,
+) -> ApiResult<Json<CompactResponse>> {
+    if collection_id.is_empty() {
+        return Err(ApiError::InvalidArgument(
+            "Collection ID is required".to_string(),
+        ));
+    }
+    require_maintain(user_context.as_ref().map(|e| &e.0), "compact")?;
+    // The engine needs the full Collection proto (storage_assignment + tags
+    // resolve the output encoding), so resolve via the tenant-scoped
+    // collection service rather than the metadata-only existence check.
+    let storage_tenant = crate::storage::tenant::context::StorageTenantContext::from(&tenant);
+    let Some(collection) = state
+        .collection_service
+        .get_collection_with_tenant_context(&collection_id, Some(&storage_tenant))
+        .await
+        .map_err(|e| ApiError::Internal(format!("collection lookup: {e}")))?
+    else {
+        return Err(ApiError::CollectionNotFound(collection_id.clone()));
+    };
+    let (full, target_segments) = body
+        .map(|Json(request)| (request.full, request.target_segments))
+        .unwrap_or((false, None));
+    if target_segments.is_some_and(|t| t == 0) {
+        return Err(ApiError::InvalidArgument(
+            "target_segments must be greater than zero".to_string(),
+        ));
+    }
+    // Fail closed on the same reasoning the Flight side rejects 0: a knob
+    // that is accepted and then silently dropped reports success for work
+    // that never happened. `target_segments` only means anything to the
+    // cross-level collapse.
+    if target_segments.is_some() && !full {
+        return Err(ApiError::InvalidArgument(
+            "target_segments requires \"full\": true (it bounds the cross-level collapse)"
+                .to_string(),
+        ));
+    }
+    let result = state
+        .vector_operations_service
+        .unified_engine()
+        .compact_collection_full(&collection.id, Some(&collection), full, target_segments)
+        .await
+        .map_err(|e| ApiError::Internal(format!("compaction: {e}")))?;
+    // Extracted once so REST, Flight and DDL report the same keys and
+    // cannot drift (TD-COMPACT-15 review).
+    let metrics = result.full_compaction_metrics();
+    Ok(Json(CompactResponse {
+        collection_id,
+        full,
+        metrics,
+    }))
+}
+
+/// `POST /api/v2/collections/:id/suspend` — Phase 8 F4a. Evicts the
+/// collection's in-memory IVF index to free memory (the persisted `ivf.bin` +
+/// catalog metadata stay); the next query (or `/resume`) warm-loads it.
+/// Admin-gated.
 pub async fn post_collection_suspend_v2(
     Path(collection_id): Path<String>,
     Extension(tenant): Extension<TenantContext>,
@@ -3966,12 +4130,12 @@ mod tests {
 
     #[test]
     fn route_health_freshness_search_request_modes_all_wired() {
-        // All three VectorFreshnessMode variants are honored by
-        // should_scan_delta_with_time. The bounded_stale_time_bound_check
-        // flag specifically requires the watermark_ns threading wired in
-        // commit e34a06225 (Phase 5 slice 5.10). Flipping any of these to
-        // false requires the corresponding mode being removed from the
-        // enum or its branch being disconnected from the search path.
+        // All three VectorFreshnessMode variants are ACCEPTED by the search
+        // path. bounded_stale_time_bound_check is false since TD-OEDIRWM-1:
+        // the directory watermark that fed the time-bound check could not
+        // soundly gate a skip and is no longer read, so the bound is not
+        // enforced (bounded_stale always scans the delta, but may be served
+        // from the query cache).
         let h = build_route_health(
             "c".to_string(),
             "sst".to_string(),
@@ -3984,8 +4148,10 @@ mod tests {
         assert!(h.freshness.search_request_modes.strong);
         assert!(h.freshness.search_request_modes.bounded_stale);
         assert!(h.freshness.search_request_modes.stale_ok);
+        // TD-OEDIRWM-1: honestly reported as NOT wired — the staleness bound
+        // is not enforced until a sound watermark exists.
         assert!(
-            h.freshness
+            !h.freshness
                 .search_request_modes
                 .bounded_stale_time_bound_check
         );
@@ -4000,34 +4166,25 @@ mod tests {
     }
 
     #[test]
-    fn route_health_object_economy_is_explicitly_sst_only() {
-        let sst = build_route_health(
-            "c".to_string(),
-            "sst".to_string(),
-            8,
-            "cosine".to_string(),
-            0,
-            0,
-            0,
-        );
-        assert!(sst.object_economy.eligible);
-        assert!(sst.object_economy.directory_format_present);
-        assert_eq!(sst.object_economy.live_status, "not_checked");
-        assert_eq!(sst.object_economy.route_hint, Some("object_economy"));
-
-        let viper = build_route_health(
-            "c".to_string(),
-            "viper".to_string(),
-            8,
-            "cosine".to_string(),
-            0,
-            0,
-            0,
-        );
-        assert!(!viper.object_economy.eligible);
-        assert!(!viper.object_economy.directory_format_present);
-        assert_eq!(viper.object_economy.live_status, "not_applicable");
-        assert_eq!(viper.object_economy.route_hint, None);
+    fn route_health_object_economy_is_retired_for_every_engine() {
+        // TD-OEDIRWM-1: no engine produces or reads the directory, so the
+        // route is not applicable anywhere — including SST.
+        for engine in ["sst", "viper"] {
+            let h = build_route_health(
+                "c".to_string(),
+                engine.to_string(),
+                8,
+                "cosine".to_string(),
+                0,
+                0,
+                0,
+            );
+            assert!(!h.object_economy.eligible, "{engine}");
+            assert!(!h.object_economy.directory_format_present, "{engine}");
+            assert!(!h.object_economy.live_status_in_app_state, "{engine}");
+            assert_eq!(h.object_economy.live_status, "not_applicable", "{engine}");
+            assert_eq!(h.object_economy.route_hint, None, "{engine}");
+        }
     }
 
     #[test]
@@ -4113,7 +4270,6 @@ mod tests {
             0,
         );
         let expected = vec![
-            DegradedReason::ObjectEconomyLiveStatusNotReachable,
             DegradedReason::FreshnessModesNotCollectionLevel,
             DegradedReason::ConditionalWritesUnsupported,
             DegradedReason::FilterWritesUnsupported,
@@ -4229,6 +4385,51 @@ mod tests {
             expires_at: None,
             created_at: Utc::now(),
             metadata: std::collections::HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn require_maintain_allows_when_no_context_in_unified_port_mode() {
+        assert_eq!(
+            require_maintain(None, "compact").expect("dev fallback"),
+            "dev:unified-port-no-auth"
+        );
+    }
+
+    #[test]
+    fn require_maintain_accepts_its_three_permissions() {
+        use crate::security::rbac_service::UnifiedPermission;
+        for permission in [
+            UnifiedPermission::SystemAdmin,
+            UnifiedPermission::ConfigureSystem,
+            UnifiedPermission::MaintainCollections,
+        ] {
+            let ctx = ctx_with_permissions(vec![permission]);
+            let user = require_maintain(Some(&ctx), "compact")
+                .unwrap_or_else(|e| panic!("accepted permission rejected: {e}"));
+            assert_eq!(user, ctx.user_id);
+        }
+    }
+
+    #[test]
+    fn require_maintain_rejects_other_permissions() {
+        use crate::security::rbac_service::UnifiedPermission;
+        for permissions in [
+            vec![UnifiedPermission::TenantRead],
+            vec![
+                UnifiedPermission::CollectionCreate,
+                UnifiedPermission::ListCollections,
+            ],
+            vec![UnifiedPermission::AuditRead],
+        ] {
+            let ctx = ctx_with_permissions(permissions);
+            let error = require_maintain(Some(&ctx), "compact")
+                .expect_err("insufficient permission must be a 403");
+            assert!(
+                matches!(&error, ApiError::Forbidden(message) if message.contains("MaintainCollections")),
+                "{:?}: {error:?}",
+                ctx.effective_permissions
+            );
         }
     }
 
@@ -4592,60 +4793,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn route_health_object_economy_reports_cached_loaded_status() {
-        let h = build_route_health_with_live_state(
-            "c".to_string(),
-            "sst".to_string(),
-            8,
-            "cosine".to_string(),
-            0,
-            0,
-            0,
-            Some("loaded"),
-            RecallProbeLiveState::Unwired,
-            None,
-        );
-
-        assert!(h.object_economy.live_status_in_app_state);
-        assert_eq!(h.object_economy.live_status, "loaded");
-        assert!(
-            !h.degraded_reasons
-                .contains(&DegradedReason::ObjectEconomyLiveStatusNotReachable)
-        );
-        assert!(
-            !h.degraded_reasons
-                .contains(&DegradedReason::ObjectEconomyDirectoryDegraded)
-        );
-    }
-
-    #[test]
-    fn route_health_object_economy_reports_cached_degraded_status() {
-        let h = build_route_health_with_live_state(
-            "c".to_string(),
-            "sst".to_string(),
-            8,
-            "cosine".to_string(),
-            0,
-            0,
-            0,
-            Some("missing"),
-            RecallProbeLiveState::Unwired,
-            None,
-        );
-
-        assert!(h.object_economy.live_status_in_app_state);
-        assert_eq!(h.object_economy.live_status, "missing");
-        assert!(
-            !h.degraded_reasons
-                .contains(&DegradedReason::ObjectEconomyLiveStatusNotReachable)
-        );
-        assert!(
-            h.degraded_reasons
-                .contains(&DegradedReason::ObjectEconomyDirectoryDegraded)
-        );
-    }
-
     // ------------------------------------------------------------------
     // RecallProbeLiveState branch coverage — exercises both the Unwired
     // path (default, no AppState slot) and the Wired path (gate reachable
@@ -4689,7 +4836,6 @@ mod tests {
             0,
             0,
             0,
-            None,
             RecallProbeLiveState::Wired { gate_open: true },
             None,
         );
@@ -4710,33 +4856,6 @@ mod tests {
     // AppState::new); the per-collection pin is Some only when an
     // operator has explicitly pinned the collection.
     // ------------------------------------------------------------------
-
-    #[test]
-    fn object_economy_status_label_covers_all_directory_load_status_variants() {
-        // Closed-enum mapping canary: if a future DirectoryLoadStatus variant
-        // lands without an arm here, the route-health response would silently
-        // misrender the status. Pin each variant → label pair.
-        use crate::storage::engines::sst::object_economy_directory::DirectoryLoadStatus;
-        assert_eq!(
-            object_economy_status_label(&DirectoryLoadStatus::Loaded),
-            "loaded"
-        );
-        assert_eq!(
-            object_economy_status_label(&DirectoryLoadStatus::Missing),
-            "missing"
-        );
-        assert_eq!(
-            object_economy_status_label(&DirectoryLoadStatus::Corrupt("bad header".to_string())),
-            "corrupt"
-        );
-        assert_eq!(
-            object_economy_status_label(&DirectoryLoadStatus::Mismatch {
-                expected_collection: "products".to_string(),
-                found_collection: "orders".to_string(),
-            }),
-            "mismatch"
-        );
-    }
 
     #[test]
     fn route_health_pinning_reports_no_pin_by_default() {
@@ -4769,7 +4888,6 @@ mod tests {
             0,
             0,
             0,
-            None,
             RecallProbeLiveState::Unwired,
             Some(pin),
         );
@@ -4792,7 +4910,6 @@ mod tests {
             0,
             0,
             0,
-            None,
             RecallProbeLiveState::Wired { gate_open: false },
             None,
         );
@@ -5059,7 +5176,8 @@ mod tests {
             vec![
                 DegradedReason::FilteredAnnRecordPredicateBridgePartial,
                 DegradedReason::PostFilterShortfallNotDisclosed,
-                DegradedReason::ObjectEconomyLiveStatusNotReachable,
+                // Not ObjectEconomyLiveStatusNotReachable: the route is
+                // ineligible, so it cannot be "not reachable".
                 DegradedReason::RecallProbeNotWired,
                 DegradedReason::FreshnessModesNotCollectionLevel,
                 DegradedReason::ConditionalWritesUnsupported,
@@ -5257,6 +5375,7 @@ mod tests {
     #[test]
     fn get_response_serializes_index_specs_and_quantization() {
         let resp = CollectionV2Response {
+            pool_id: None,
             storage_class: "balanced".into(),
             default_access_tier: None,
             storage_class_status: StorageClassStatusOutput::from_proto(

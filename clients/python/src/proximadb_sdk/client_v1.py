@@ -139,13 +139,13 @@ class ProximaDBClientV1:
                 1: "cosine",
                 2: "euclidean",
                 3: "dot_product",
-                4: "manhattan",
-                5: "hamming",
+                4: "hamming",
+                5: "manhattan",
                 6: "jaccard",
-                7: "chebyshev",
-                8: "canberra",
-                9: "minkowski",
-                10: "angular",
+                7: "angular",
+                8: "chebyshev",
+                9: "canberra",
+                10: "minkowski",
                 11: "bray_curtis",
                 12: "hellinger",
                 13: "custom",
@@ -160,6 +160,12 @@ class ProximaDBClientV1:
                 6: "raptor",
                 7: "mmap",
                 8: "hybrid",
+                # proto engines — decode truthfully (the former truncation
+                # silently decoded 9-12 as "sst")
+                9: "tst",
+                10: "cedar",
+                11: "titan",
+                12: "chrono",
             }
 
             dm_val = response.config.distance_metric if response.config else 0
@@ -353,6 +359,14 @@ class ProximaDBClientV1:
             if "props" not in payload and "metadata" in payload:
                 payload["props"] = payload.pop("metadata")
             payload.setdefault("id", payload.get("oid") or f"record_{index}")
+            # `oid` is a client-side seeding value, not a contract field —
+            # drop it once it has seeded `id`. Other unknown keys are left
+            # IN deliberately: the server's deny_unknown_fields (TD-REC-1)
+            # returns a 400 naming the field, which is the fail-loud contract
+            # this SDK wants its users to see — silently stripping them here
+            # would recreate the silent-drop bug client-side.
+            if "id" in payload:
+                payload.pop("oid", None)
             return payload
 
         payload = {
@@ -360,9 +374,12 @@ class ProximaDBClientV1:
             "vector": record.vector,
             "props": record.metadata or {},
         }
+        # TD-REC-1: a record's top level is exactly {id, vector, props,
+        # text_fields} (plus the advertised `metadata` alias). `source` rides
+        # in text_fields, where it actually persists — emitting it at the top
+        # level was always silently dropped by the server and is now a 400.
         source = getattr(record, "source", None)
         if source:
-            payload["source"] = source
             payload["text_fields"] = [{"name": "text", "content": source}]
         return payload
 

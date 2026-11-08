@@ -62,7 +62,7 @@ That collection writes legacy `.sst` regardless of the global default. Use this
 for collections that can't tolerate quantization or need exact-vector return
 without the f32 tier.
 
-=== Exact-vector fidelity (opt-in f32 tier)
+=== Exact-vector fidelity (f32 tier; on by default for RaBitQ since 2026-10-30)
 For collections that need exact `include_vectors` returns alongside PAX:
 [source,json]
 ----
@@ -100,7 +100,7 @@ or exact final rerank). Storage cost: +260 bytes/vector.
 | `PROXIMADB_PAX_VECTOR_SEGMENTS` | OFF | Explicit opt-in (pre-Phase-F mechanism; `PROXIMADB_PAX_DEFAULT_ON=1` supersedes).
 | `PROXIMADB_PAX_VECTOR_SEGMENTS_DISABLE` | unset | **Kill-switch.** Forces legacy `.sst` for ALL collections.
 | `PROXIMADB_PAX_VECTOR_QUANT` | rabitq | Quantization strategy (`rabitq` / `sq8` / `auto`).
-| `PROXIMADB_PAX_F32_TIER` | OFF | Global f32-tier opt-in (per-collection: `pax_f32_tier:on` tag).
+| `PROXIMADB_PAX_F32_TIER` | ON for RaBitQ (since 2026-10-30) | Global f32-tier override; `=0` opts out, `=1` also unlocks the small-collection exact route (per-collection: `pax_f32_tier:on|off` tag).
 | `PROXIMADB_PAX_RABITQ_POOL_MULT` | 100 | Stage-1 candidate pool multiplier (pool = max(k × mult, min)).
 | `PROXIMADB_PAX_RABITQ_POOL_MIN` | 1000 | Stage-1 pool minimum.
 |===

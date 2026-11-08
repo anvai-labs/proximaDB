@@ -239,12 +239,16 @@ pub mod types {
             Default::default()
         }
     }
-    ///`AbacComparisonOperator`
+    /// The server additionally accepts the legacy wire names `Equal` and
+    /// `NotEqual` as aliases of `Equals`/`NotEquals` when deserializing
+    /// (mixed-read compatibility); serialization always emits the names
+    /// above.
     ///
     /// <details><summary>JSON schema</summary>
     ///
     /// ```json
     ///{
+    ///  "description": "The server additionally accepts the legacy wire names `Equal` and\n`NotEqual` as aliases of `Equals`/`NotEquals` when deserializing\n(mixed-read compatibility); serialization always emits the names\nabove.\n",
     ///  "type": "string",
     ///  "enum": [
     ///    "Equals",
@@ -261,7 +265,10 @@ pub mod types {
     ///    "Between",
     ///    "IsNull",
     ///    "IsNotNull",
-    ///    "Like"
+    ///    "Like",
+    ///    "Exists",
+    ///    "NotExists",
+    ///    "Regex"
     ///  ]
     ///}
     /// ```
@@ -294,6 +301,9 @@ pub mod types {
         IsNull,
         IsNotNull,
         Like,
+        Exists,
+        NotExists,
+        Regex,
     }
     impl ::std::fmt::Display for AbacComparisonOperator {
         fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
@@ -313,6 +323,9 @@ pub mod types {
                 Self::IsNull => f.write_str("IsNull"),
                 Self::IsNotNull => f.write_str("IsNotNull"),
                 Self::Like => f.write_str("Like"),
+                Self::Exists => f.write_str("Exists"),
+                Self::NotExists => f.write_str("NotExists"),
+                Self::Regex => f.write_str("Regex"),
             }
         }
     }
@@ -335,6 +348,9 @@ pub mod types {
                 "IsNull" => Ok(Self::IsNull),
                 "IsNotNull" => Ok(Self::IsNotNull),
                 "Like" => Ok(Self::Like),
+                "Exists" => Ok(Self::Exists),
+                "NotExists" => Ok(Self::NotExists),
+                "Regex" => Ok(Self::Regex),
                 _ => Err("invalid value".into()),
             }
         }
@@ -520,7 +536,8 @@ pub mod types {
     /// * `{"Comparison": {"field": <string>, "operator": <one of
     ///   "Equals","NotEquals","GreaterThan","GreaterThanOrEqual",
     ///   "LessThan","LessThanOrEqual","In","NotIn","Contains",
-    ///   "StartsWith","EndsWith","Between","IsNull","IsNotNull","Like">,
+    ///   "StartsWith","EndsWith","Between","IsNull","IsNotNull","Like",
+    ///   "Exists","NotExists","Regex">,
     ///   "value": <any JSON value>}}`
     /// * `{"And": [<AbacFilterExpression>, ...]}`
     /// * `{"Or": [<AbacFilterExpression>, ...]}`
@@ -534,7 +551,7 @@ pub mod types {
     ///
     /// ```json
     ///{
-    ///  "description": "A predicate-object row filter — a RECURSIVE, externally-tagged Rust\nenum (`proximadb_filter_expression::FilterExpression`). Modeled\nhere as free-form JSON (rather than a typed `oneOf`) because the\nself-referential union is not representable in a form the SDK\ncodegen tooling can process (openapi-python-client cannot resolve\na `oneOf` branch whose `items` `$ref`s the union being defined);\nthis is the one schema in the ABAC surface where the generated\nclient falls back to an untyped object. Construct exactly one of:\n\n* `{\"Comparison\": {\"field\": <string>, \"operator\": <one of\n  \"Equals\",\"NotEquals\",\"GreaterThan\",\"GreaterThanOrEqual\",\n  \"LessThan\",\"LessThanOrEqual\",\"In\",\"NotIn\",\"Contains\",\n  \"StartsWith\",\"EndsWith\",\"Between\",\"IsNull\",\"IsNotNull\",\"Like\">,\n  \"value\": <any JSON value>}}`\n* `{\"And\": [<AbacFilterExpression>, ...]}`\n* `{\"Or\": [<AbacFilterExpression>, ...]}`\n* `{\"Not\": <AbacFilterExpression>}`\n\nSee [AbacComparisonOperator](#/components/schemas/AbacComparisonOperator)\nfor the authoritative operator enum (referenced here for docs only;\nnot structurally, for the same recursion reason).\n",
+    ///  "description": "A predicate-object row filter — a RECURSIVE, externally-tagged Rust\nenum (`proximadb_filter_expression::FilterExpression`). Modeled\nhere as free-form JSON (rather than a typed `oneOf`) because the\nself-referential union is not representable in a form the SDK\ncodegen tooling can process (openapi-python-client cannot resolve\na `oneOf` branch whose `items` `$ref`s the union being defined);\nthis is the one schema in the ABAC surface where the generated\nclient falls back to an untyped object. Construct exactly one of:\n\n* `{\"Comparison\": {\"field\": <string>, \"operator\": <one of\n  \"Equals\",\"NotEquals\",\"GreaterThan\",\"GreaterThanOrEqual\",\n  \"LessThan\",\"LessThanOrEqual\",\"In\",\"NotIn\",\"Contains\",\n  \"StartsWith\",\"EndsWith\",\"Between\",\"IsNull\",\"IsNotNull\",\"Like\",\n  \"Exists\",\"NotExists\",\"Regex\">,\n  \"value\": <any JSON value>}}`\n* `{\"And\": [<AbacFilterExpression>, ...]}`\n* `{\"Or\": [<AbacFilterExpression>, ...]}`\n* `{\"Not\": <AbacFilterExpression>}`\n\nSee [AbacComparisonOperator](#/components/schemas/AbacComparisonOperator)\nfor the authoritative operator enum (referenced here for docs only;\nnot structurally, for the same recursion reason).\n",
     ///  "type": "object",
     ///  "additionalProperties": true
     ///}
@@ -3979,6 +3996,13 @@ pub mod types {
     ///      "description": "Collection name",
     ///      "type": "string"
     ///    },
+    ///    "pool_id": {
+    ///      "description": "Reservation pool the PERFORMANCE grant charges (TD-TIER-1 SC6);\nomitted when the default pool applies.",
+    ///      "type": [
+    ///        "string",
+    ///        "null"
+    ///      ]
+    ///    },
     ///    "proxima_record_enabled": {
     ///      "description": "Whether ProximaRecord is enabled",
     ///      "type": "boolean"
@@ -4043,6 +4067,10 @@ pub mod types {
         pub index_specs: ::std::vec::Vec<IndexSpecOutput>,
         ///Collection name
         pub name: ::std::string::String,
+        /// Reservation pool the PERFORMANCE grant charges (TD-TIER-1 SC6);
+        /// omitted when the default pool applies.
+        #[serde(default, skip_serializing_if = "::std::option::Option::is_none")]
+        pub pool_id: ::std::option::Option<::std::string::String>,
         ///Whether ProximaRecord is enabled
         pub proxima_record_enabled: bool,
         #[serde(default, skip_serializing_if = "::std::option::Option::is_none")]
@@ -4253,6 +4281,23 @@ pub mod types {
     ///      "type": "string",
     ///      "minLength": 1
     ///    },
+    ///    "pool_id": {
+    ///      "description": "TD-TIER-1 SC6 policy seam: the reservation pool this PERFORMANCE\ncollection's grant charges (\"pool_id\" in [storage.reservation_pools]);\nomitted ⇒ the configured default pool. Unknown ids are refused at\nadmission with the configured ids listed.",
+    ///      "type": [
+    ///        "string",
+    ///        "null"
+    ///      ]
+    ///    },
+    ///    "properties": {
+    ///      "description": "Per-collection table properties (Hive TBLPROPERTIES-style).\n\nNOT persisted by this endpoint yet: a non-empty map is rejected with\n400. Create the collection, then set properties with `ALTER TABLE\n<name> SET (...)` over pgwire. Three namespaces are reserved for policy\nthere, with unknown keys rejected: `cache.*` (TD-COMPACT-2b),\n`compaction.*` (TD-COMPACT-15) and `probe.*` (TD-RDSTRAT-14). Every\n`probe.*` key, valid or not, is currently refused because nothing\nconsumes it yet.",
+    ///      "type": [
+    ///        "object",
+    ///        "null"
+    ///      ],
+    ///      "additionalProperties": {
+    ///        "type": "string"
+    ///      }
+    ///    },
     ///    "quantization": {
     ///      "$ref": "#/components/schemas/QuantizationConfigInput"
     ///    },
@@ -4353,6 +4398,25 @@ pub mod types {
         pub initial_capacity: ::std::option::Option<i64>,
         ///Collection name (required)
         pub name: CreateCollectionV2RequestName,
+        /// TD-TIER-1 SC6 policy seam: the reservation pool this PERFORMANCE
+        /// collection's grant charges ("pool_id" in [storage.reservation_pools]);
+        /// omitted ⇒ the configured default pool. Unknown ids are refused at
+        /// admission with the configured ids listed.
+        #[serde(default, skip_serializing_if = "::std::option::Option::is_none")]
+        pub pool_id: ::std::option::Option<::std::string::String>,
+        /// Per-collection table properties (Hive TBLPROPERTIES-style).
+        ///
+        /// NOT persisted by this endpoint yet: a non-empty map is rejected with
+        /// 400. Create the collection, then set properties with `ALTER TABLE
+        /// <name> SET (...)` over pgwire. Three namespaces are reserved for policy
+        /// there, with unknown keys rejected: `cache.*` (TD-COMPACT-2b),
+        /// `compaction.*` (TD-COMPACT-15) and `probe.*` (TD-RDSTRAT-14). Every
+        /// `probe.*` key, valid or not, is currently refused because nothing
+        /// consumes it yet.
+        #[serde(default, skip_serializing_if = "::std::option::Option::is_none")]
+        pub properties: ::std::option::Option<
+            ::std::collections::HashMap<::std::string::String, ::std::string::String>,
+        >,
         #[serde(default, skip_serializing_if = "::std::option::Option::is_none")]
         pub quantization: ::std::option::Option<QuantizationConfigInput>,
         #[serde(default, skip_serializing_if = "::std::option::Option::is_none")]
@@ -9715,13 +9779,18 @@ pub mod types {
             Default::default()
         }
     }
-    ///A single record submitted for native embedding + indexing.
+    /// A single record submitted for native embedding + indexing.
+    ///
+    /// Unknown fields are REJECTED (`deny_unknown_fields`, TD-REC-1 policy — the
+    /// same rule as the records surface): the declared fields plus the
+    /// `props`/`metadata` alias pair are the contract; anything else is a 400
+    /// naming the unknown field instead of a silently dropped write.
     ///
     /// <details><summary>JSON schema</summary>
     ///
     /// ```json
     ///{
-    ///  "description": "A single record submitted for native embedding + indexing.",
+    ///  "description": "A single record submitted for native embedding + indexing.\n\nUnknown fields are REJECTED (`deny_unknown_fields`, TD-REC-1 policy — the\nsame rule as the records surface): the declared fields plus the\n`props`/`metadata` alias pair are the contract; anything else is a 400\nnaming the unknown field instead of a silently dropped write.",
     ///  "type": "object",
     ///  "required": [
     ///    "id"
@@ -9731,7 +9800,7 @@ pub mod types {
     ///      "type": "string"
     ///    },
     ///    "metadata": {
-    ///      "description": "Arbitrary metadata fields. Stored as ProximaRecord props.",
+    ///      "description": "Arbitrary metadata fields. Stored as ProximaRecord props.\n\n`props` is accepted as an alias (TD-REC-1): the records surface\ndocuments `props` as the canonical map and accepts `metadata` as its\nalias, so this surface accepts both spellings of the same map too.",
     ///      "type": "object",
     ///      "additionalProperties": {}
     ///    },
@@ -9753,14 +9822,20 @@ pub mod types {
     ///        "format": "float"
     ///      }
     ///    }
-    ///  }
+    ///  },
+    ///  "additionalProperties": false
     ///}
     /// ```
     /// </details>
     #[derive(::serde::Deserialize, ::serde::Serialize, Clone, Debug)]
+    #[serde(deny_unknown_fields)]
     pub struct IngestDocument {
         pub id: ::std::string::String,
-        ///Arbitrary metadata fields. Stored as ProximaRecord props.
+        /// Arbitrary metadata fields. Stored as ProximaRecord props.
+        ///
+        /// `props` is accepted as an alias (TD-REC-1): the records surface
+        /// documents `props` as the canonical map and accepts `metadata` as its
+        /// alias, so this surface accepts both spellings of the same map too.
         #[serde(default, skip_serializing_if = "::serde_json::Map::is_empty")]
         pub metadata: ::serde_json::Map<::std::string::String, ::serde_json::Value>,
         /// Raw text content. Required when `X-Embed-Source: native` (default);
@@ -9956,13 +10031,17 @@ pub mod types {
     ///                 "content": "A detailed product description...",
     ///                 "storage_hint": "adaptive"
     ///             }
-    ///         ],
-    ///         "source": "catalog_import"
+    ///         ]
     ///     }
     /// ],
     /// "validate_schema": true
     /// }
     /// ```
+    ///
+    /// (A record top level accepts exactly `id`, `vector`, `props` — or its
+    /// advertised alias `metadata` — and `text_fields`; anything else is a 400
+    /// naming the unknown field. The example used to show a `"source"` key: it
+    /// was never a contract field and was silently dropped before TD-REC-1.)
     /// Not supported in v0.2: optimistic versioning, conditional-write predicates,
     /// update-by-filter, delete-by-filter, and patch / partial-record update. The
     /// live contract is exposed via `WriteContractHealth` on the route-health
@@ -9973,7 +10052,7 @@ pub mod types {
     ///
     /// ```json
     ///{
-    ///  "description": "Request to insert ProximaRecords\n\n## Example JSON\n\n```json\n{\n    \"records\": [\n        {\n            \"id\": \"doc_1\",\n            \"vector\": [0.1, 0.2, 0.3],\n            \"props\": {\n                \"category\": \"electronics\",\n                \"price\": 299.99,\n                \"in_stock\": true\n            },\n            \"text_fields\": [\n                {\n                    \"name\": \"description\",\n                    \"content\": \"A detailed product description...\",\n                    \"storage_hint\": \"adaptive\"\n                }\n            ],\n            \"source\": \"catalog_import\"\n        }\n    ],\n    \"validate_schema\": true\n}\n```\nNot supported in v0.2: optimistic versioning, conditional-write predicates,\nupdate-by-filter, delete-by-filter, and patch / partial-record update. The\nlive contract is exposed via `WriteContractHealth` on the route-health\ndiagnostic endpoint (`GET /api/v2/_diagnostics/collections/{id}/route-health`);\nsee also `docs/SUPPORTED_SURFACE.adoc` \"Not Supported in v0.2\".",
+    ///  "description": "Request to insert ProximaRecords\n\n## Example JSON\n\n```json\n{\n    \"records\": [\n        {\n            \"id\": \"doc_1\",\n            \"vector\": [0.1, 0.2, 0.3],\n            \"props\": {\n                \"category\": \"electronics\",\n                \"price\": 299.99,\n                \"in_stock\": true\n            },\n            \"text_fields\": [\n                {\n                    \"name\": \"description\",\n                    \"content\": \"A detailed product description...\",\n                    \"storage_hint\": \"adaptive\"\n                }\n            ]\n        }\n    ],\n    \"validate_schema\": true\n}\n```\n\n(A record top level accepts exactly `id`, `vector`, `props` — or its\nadvertised alias `metadata` — and `text_fields`; anything else is a 400\nnaming the unknown field. The example used to show a `\"source\"` key: it\nwas never a contract field and was silently dropped before TD-REC-1.)\nNot supported in v0.2: optimistic versioning, conditional-write predicates,\nupdate-by-filter, delete-by-filter, and patch / partial-record update. The\nlive contract is exposed via `WriteContractHealth` on the route-health\ndiagnostic endpoint (`GET /api/v2/_diagnostics/collections/{id}/route-health`);\nsee also `docs/SUPPORTED_SURFACE.adoc` \"Not Supported in v0.2\".",
     ///  "type": "object",
     ///  "required": [
     ///    "records"
@@ -12011,11 +12090,20 @@ pub mod types {
     /// It uses serde_json::Value for typed fields to support dynamic typing
     /// at the API boundary, with validation happening during conversion.
     ///
+    /// Unknown fields are REJECTED (`deny_unknown_fields`, TD-REC-1 policy): a
+    /// write that carries a field this contract does not know must fail loud at
+    /// the boundary, not report success while silently discarding data — which
+    /// is exactly how the `metadata` drop shipped. The grandfathered spellings
+    /// are the ones the contract itself advertises: `props` and its `metadata`
+    /// alias. Generated SDKs (regenerated in #2337) send only declared fields,
+    /// so the deny cannot break them; a hand-rolled client sending something
+    /// else gets a 400 naming the problem instead of a silent no-op filter.
+    ///
     /// <details><summary>JSON schema</summary>
     ///
     /// ```json
     ///{
-    ///  "description": "Input format for ProximaRecord (JSON-friendly)\n\nThis is the JSON-serializable input format for ProximaRecord.\nIt uses serde_json::Value for typed fields to support dynamic typing\nat the API boundary, with validation happening during conversion.",
+    ///  "description": "Input format for ProximaRecord (JSON-friendly)\n\nThis is the JSON-serializable input format for ProximaRecord.\nIt uses serde_json::Value for typed fields to support dynamic typing\nat the API boundary, with validation happening during conversion.\n\nUnknown fields are REJECTED (`deny_unknown_fields`, TD-REC-1 policy): a\nwrite that carries a field this contract does not know must fail loud at\nthe boundary, not report success while silently discarding data — which\nis exactly how the `metadata` drop shipped. The grandfathered spellings\nare the ones the contract itself advertises: `props` and its `metadata`\nalias. Generated SDKs (regenerated in #2337) send only declared fields,\nso the deny cannot break them; a hand-rolled client sending something\nelse gets a 400 naming the problem instead of a silent no-op filter.",
     ///  "type": "object",
     ///  "required": [
     ///    "vector"
@@ -12029,7 +12117,7 @@ pub mod types {
     ///      ]
     ///    },
     ///    "props": {
-    ///      "description": "Canonical rich property map.",
+    ///      "description": "Canonical rich property map.\n\n`metadata` is accepted as an alias: the documents API advertises that\nspelling (\"Arbitrary metadata fields. Stored as ProximaRecord props\")\nand maps it here, so the records API must accept it too — before the\nalias it was silently dropped and filters over it matched nothing\n(TD-REC-1). The OpenAPI contract stays `props`; the alias is\nlenience for the already-advertised spelling, not a second field.\nIt composes with `deny_unknown_fields`: an alias is a KNOWN field\nname, so `metadata` passes the deny while any other unknown key is\nrejected.",
     ///      "type": [
     ///        "object",
     ///        "null"
@@ -12054,16 +12142,28 @@ pub mod types {
     ///        "format": "float"
     ///      }
     ///    }
-    ///  }
+    ///  },
+    ///  "additionalProperties": false
     ///}
     /// ```
     /// </details>
     #[derive(::serde::Deserialize, ::serde::Serialize, Clone, Debug)]
+    #[serde(deny_unknown_fields)]
     pub struct ProximaRecordInput {
         ///Record ID (optional, will be auto-generated if not provided)
         #[serde(default, skip_serializing_if = "::std::option::Option::is_none")]
         pub id: ::std::option::Option<::std::string::String>,
-        ///Canonical rich property map.
+        /// Canonical rich property map.
+        ///
+        /// `metadata` is accepted as an alias: the documents API advertises that
+        /// spelling ("Arbitrary metadata fields. Stored as ProximaRecord props")
+        /// and maps it here, so the records API must accept it too — before the
+        /// alias it was silently dropped and filters over it matched nothing
+        /// (TD-REC-1). The OpenAPI contract stays `props`; the alias is
+        /// lenience for the already-advertised spelling, not a second field.
+        /// It composes with `deny_unknown_fields`: an alias is a KNOWN field
+        /// name, so `metadata` passes the deny while any other unknown key is
+        /// rejected.
         #[serde(default, skip_serializing_if = "::std::option::Option::is_none")]
         pub props:
             ::std::option::Option<::serde_json::Map<::std::string::String, ::serde_json::Value>>,
@@ -21141,6 +21241,10 @@ pub mod types {
                 ::std::string::String,
             >,
             name: ::std::result::Result<::std::string::String, ::std::string::String>,
+            pool_id: ::std::result::Result<
+                ::std::option::Option<::std::string::String>,
+                ::std::string::String,
+            >,
             proxima_record_enabled: ::std::result::Result<bool, ::std::string::String>,
             quantization: ::std::result::Result<
                 ::std::option::Option<super::QuantizationConfigOutput>,
@@ -21175,6 +21279,7 @@ pub mod types {
                     engine: Err("no value supplied for engine".to_string()),
                     index_specs: Err("no value supplied for index_specs".to_string()),
                     name: Err("no value supplied for name".to_string()),
+                    pool_id: Ok(Default::default()),
                     proxima_record_enabled: Err(
                         "no value supplied for proxima_record_enabled".to_string()
                     ),
@@ -21302,6 +21407,16 @@ pub mod types {
                     .map_err(|e| format!("error converting supplied value for name: {e}"));
                 self
             }
+            pub fn pool_id<T>(mut self, value: T) -> Self
+            where
+                T: ::std::convert::TryInto<::std::option::Option<::std::string::String>>,
+                T::Error: ::std::fmt::Display,
+            {
+                self.pool_id = value
+                    .try_into()
+                    .map_err(|e| format!("error converting supplied value for pool_id: {e}"));
+                self
+            }
             pub fn proxima_record_enabled<T>(mut self, value: T) -> Self
             where
                 T: ::std::convert::TryInto<bool>,
@@ -21390,6 +21505,7 @@ pub mod types {
                     engine: value.engine?,
                     index_specs: value.index_specs?,
                     name: value.name?,
+                    pool_id: value.pool_id?,
                     proxima_record_enabled: value.proxima_record_enabled?,
                     quantization: value.quantization?,
                     schema: value.schema?,
@@ -21414,6 +21530,7 @@ pub mod types {
                     engine: Ok(value.engine),
                     index_specs: Ok(value.index_specs),
                     name: Ok(value.name),
+                    pool_id: Ok(value.pool_id),
                     proxima_record_enabled: Ok(value.proxima_record_enabled),
                     quantization: Ok(value.quantization),
                     schema: Ok(value.schema),
@@ -21577,6 +21694,16 @@ pub mod types {
                 ::std::result::Result<::std::option::Option<i64>, ::std::string::String>,
             name:
                 ::std::result::Result<super::CreateCollectionV2RequestName, ::std::string::String>,
+            pool_id: ::std::result::Result<
+                ::std::option::Option<::std::string::String>,
+                ::std::string::String,
+            >,
+            properties: ::std::result::Result<
+                ::std::option::Option<
+                    ::std::collections::HashMap<::std::string::String, ::std::string::String>,
+                >,
+                ::std::string::String,
+            >,
             quantization: ::std::result::Result<
                 ::std::option::Option<super::QuantizationConfigInput>,
                 ::std::string::String,
@@ -21609,6 +21736,8 @@ pub mod types {
                     index_type: Ok(Default::default()),
                     initial_capacity: Ok(Default::default()),
                     name: Err("no value supplied for name".to_string()),
+                    pool_id: Ok(Default::default()),
+                    properties: Ok(Default::default()),
                     quantization: Ok(Default::default()),
                     schema: Ok(Default::default()),
                     storage_class: Ok(Default::default()),
@@ -21741,6 +21870,33 @@ pub mod types {
                     .map_err(|e| format!("error converting supplied value for name: {e}"));
                 self
             }
+            pub fn pool_id<T>(mut self, value: T) -> Self
+            where
+                T: ::std::convert::TryInto<::std::option::Option<::std::string::String>>,
+                T::Error: ::std::fmt::Display,
+            {
+                self.pool_id = value
+                    .try_into()
+                    .map_err(|e| format!("error converting supplied value for pool_id: {e}"));
+                self
+            }
+            pub fn properties<T>(mut self, value: T) -> Self
+            where
+                T: ::std::convert::TryInto<
+                        ::std::option::Option<
+                            ::std::collections::HashMap<
+                                ::std::string::String,
+                                ::std::string::String,
+                            >,
+                        >,
+                    >,
+                T::Error: ::std::fmt::Display,
+            {
+                self.properties = value
+                    .try_into()
+                    .map_err(|e| format!("error converting supplied value for properties: {e}"));
+                self
+            }
             pub fn quantization<T>(mut self, value: T) -> Self
             where
                 T: ::std::convert::TryInto<::std::option::Option<super::QuantizationConfigInput>>,
@@ -21802,6 +21958,8 @@ pub mod types {
                     index_type: value.index_type?,
                     initial_capacity: value.initial_capacity?,
                     name: value.name?,
+                    pool_id: value.pool_id?,
+                    properties: value.properties?,
                     quantization: value.quantization?,
                     schema: value.schema?,
                     storage_class: value.storage_class?,
@@ -21824,6 +21982,8 @@ pub mod types {
                     index_type: Ok(value.index_type),
                     initial_capacity: Ok(value.initial_capacity),
                     name: Ok(value.name),
+                    pool_id: Ok(value.pool_id),
+                    properties: Ok(value.properties),
                     quantization: Ok(value.quantization),
                     schema: Ok(value.schema),
                     storage_class: Ok(value.storage_class),
@@ -38123,7 +38283,7 @@ pub mod types {
 ///
 /// SDK-facing ProximaDB REST contract. This specification is v2-first and centers on ProximaRecord, typed schemas, record search, and collection lifecycle operations. Legacy v1 compatibility routes are intentionally not part of this publishable SDK surface.
 ///
-/// Version: 0.2.0
+/// Version: 0.6.0
 pub struct Client {
     pub(crate) baseurl: String,
     pub(crate) client: reqwest::Client,
@@ -38161,7 +38321,7 @@ impl Client {
 }
 impl ClientInfo<()> for Client {
     fn api_version() -> &'static str {
-        "0.2.0"
+        "0.6.0"
     }
     fn baseurl(&self) -> &str {
         self.baseurl.as_str()

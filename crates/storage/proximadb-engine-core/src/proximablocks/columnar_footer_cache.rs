@@ -11,6 +11,7 @@
 //! - Cache persistence for restart resilience
 //! - Metrics and monitoring integration
 
+use super::utilities::stable_bytes_hash;
 use anyhow::Result;
 use moka::future::Cache;
 use proximadb_runtime_common::cache::CacheStats;
@@ -439,14 +440,7 @@ impl ParquetFooterCache {
     /// Compute schema fingerprint for compatibility
     fn compute_schema_fingerprint(&self, footer_data: &[u8]) -> Result<String> {
         // In production, would hash schema definition
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-
-        let mut hasher = DefaultHasher::new();
-        footer_data.hash(&mut hasher);
-        let hash = hasher.finish();
-
-        Ok(format!("{:x}", hash))
+        Ok(format!("{:x}", stable_bytes_hash(footer_data)))
     }
 
     /// Consider file for prefetch queue

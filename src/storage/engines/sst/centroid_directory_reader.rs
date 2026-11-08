@@ -34,23 +34,24 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use proximadb_storage_common::centroid_directory::{LiveSegment, PaxCentroidDirectory};
 use proximadb_storage_filesystem_types::{DirEntry, FileSystem};
 
-use crate::storage::engines::sst::block_cluster::env_kill_switch_off;
 use crate::storage::engines::sst::centroid_directory_publisher::directory_objects_newest_first;
 use crate::storage::engines::sst::segment_format::{
-    SegmentInvariants, centroid_directory_nprobe, pax_rabitq_pool_for_top_k,
+    SegmentInvariants, centroid_directory_nprobe_for, pax_rabitq_pool_for_top_k,
     prefix_read_covers_segment,
 };
 
-/// READ gate: plan unfiltered ANN queries on the collection centroid directory.
-pub fn centroid_directory_read_enabled() -> bool {
-    env_kill_switch_off("PROXIMADB_PAX_READ_CENTROID_DIRECTORY")
+// READ gate: plan unfiltered ANN queries on the collection centroid directory.
+proximadb_config::env_kill_switch! {
+    /// Kill-switch gate; default ON (0|false|off|no disables).
+    pub fn centroid_directory_read_enabled() { gate: "PROXIMADB_PAX_READ_CENTROID_DIRECTORY", default: true }
 }
 
-/// TD-PAXDIR-1 D6 READ gate: planned segments with a decode key take their
-/// query-path metadata from the directory instead of reading it. Default ON
-/// since D8; needs directories published with the write-side gate on.
-pub fn directory_decode_keys_read_enabled() -> bool {
-    env_kill_switch_off("PROXIMADB_PAX_READ_DIRECTORY_DECODE_KEYS")
+// TD-PAXDIR-1 D6 READ gate: planned segments with a decode key take their
+// query-path metadata from the directory instead of reading it. Default ON
+// since D8; needs directories published with the write-side gate on.
+proximadb_config::env_kill_switch! {
+    /// Kill-switch gate; default ON (0|false|off|no disables).
+    pub fn directory_decode_keys_read_enabled() { gate: "PROXIMADB_PAX_READ_DIRECTORY_DECODE_KEYS", default: true }
 }
 
 /// One segment's part of a directory-planned query.
@@ -238,10 +239,32 @@ pub(crate) fn plan_segments<'a>(
             size_bytes,
         });
     }
-    let plan = dir.plan_probe(query, &live, centroid_directory_nprobe, |rows| {
-        let rows = usize::try_from(rows).unwrap_or(usize::MAX);
-        pax_rabitq_pool_for_top_k(k, rows) as u64
-    })?;
+    // TD-RDSTRAT-14: the probe policy needs corpus/geometry context. The
+    // corpus size comes from plan_probe itself (`usable_rows` — the
+    // live AND stamp-matched set it actually plans over), handed to the
+    // closure below. Deriving it here from the directory's segment list
+    // counted entries whose size no longer matches the live object, which
+    // inflated a byte_budget plan by (counted/usable)^0.25 mid-compaction.
+    // The rowgroup geometry comes from the lexicographically-smallest live
+    // URL (deterministic across restarts even when a collection spans URL
+    // schemes mid-migration; its residual nondeterminism is filed as
+    // RDSTRAT-14-F14) — resolved LAZILY, inside the closure and only for
+    // byte_budget, so the default path pays no registry/env scan per query
+    // (#2419 review round 19).
+    let first_url = url_by_name.values().min().map(String::as_str).unwrap_or("");
+    let plan = dir.plan_probe(
+        query,
+        &live,
+        // `avg_group_bytes` comes from `plan_probe`, which alone knows the
+        // usable, stamp-matched set and the real grouping — see its doc.
+        |total_cells: usize, usable_rows: u64, avg_group_bytes: u64| {
+            centroid_directory_nprobe_for(first_url, total_cells, usable_rows, avg_group_bytes)
+        },
+        |rows| {
+            let rows = usize::try_from(rows).unwrap_or(usize::MAX);
+            pax_rabitq_pool_for_top_k(k, rows) as u64
+        },
+    )?;
     let decode_keys = directory_decode_keys_read_enabled();
     let keyed: HashMap<&str, usize> = dir
         .segments
@@ -287,11 +310,13 @@ mod tests {
     use super::*;
     use crate::storage::engines::sst::centroid_directory_publisher::publish_centroid_directory;
     use crate::storage::persistence::filesystem::local::{LocalConfig, LocalFileSystem};
+    use serial_test::serial;
 
     /// A key is used only for the object whose listed ETag it recorded: a
     /// rewritten object (another ETag) or a listing without one keeps the
     /// segment on its own metadata reads, while its cells are still planned.
     #[tokio::test]
+    #[serial]
     async fn a_decode_key_is_used_only_for_the_listed_object_it_recorded() {
         // SAFETY: nextest runs each test in its own process.
         unsafe {

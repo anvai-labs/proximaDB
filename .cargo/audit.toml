@@ -29,7 +29,10 @@ ignore = [
     # brings is dev-only, but that is not the only copy). No lock-only fix
     # exists — the whole 0.3 line is unpatched (fixed in >= 0.4.16). The real
     # fix is the reqwest 0.11 -> 0.12 major bump (own PR); do not deprioritize
-    # it on the strength of this entry.
+    # it on the strength of this entry. (Earlier this note also blamed a
+    # dev-only h2 0.3 copy via httpmock 0.7 -> hyper 0.14; httpmock is 0.9
+    # now and rides hyper 1.x, so the 0.3.27 in the lock is the production
+    # reqwest chain ALONE.)
     "RUSTSEC-2026-0258",
 
     # quick-xml quadratic run time / unbounded namespace allocation
@@ -44,9 +47,6 @@ ignore = [
 
     # --- unmaintained (transitive; no patched line exists) ---
 
-    # async-std discontinued (RUSTSEC-2025-0052) — pulled by a transitive
-    # runtime dep; no runtime code of ours executes on it.
-    "RUSTSEC-2025-0052",
     # bincode 1.x unmaintained (RUSTSEC-2025-0141) — 2.x is a different API.
     # bincode is a DIRECT production dependency of the root crate (and ~17
     # workspace crates); the ignore stands only because the 1.x -> 2.x migration

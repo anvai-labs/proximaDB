@@ -154,6 +154,8 @@ async fn test_dsst_compaction() -> Result<()> {
     let fixture = DualModeTestFixture::new(100, 128).await?;
     
     let params = CompactionParameters {
+        full_target_segments: None,
+        full: false,
         collection_id: "test_collection".to_string(),
         compaction_level: 1,
         estimated_input_size: 2 * 1024 * 1024,

@@ -146,12 +146,12 @@ impl GlueCatalog {
         let mut properties = HashMap::new();
 
         // Parse vector dimension from comment or parameters
-        if let Some(comment) = col.comment() {
-            if comment.starts_with("vector:") {
-                if let Some(dim) = comment.strip_prefix("vector:").and_then(|s| s.parse().ok()) {
-                    properties.insert("dimension".to_string(), dim);
-                }
-            }
+        if let Some(dim) = col
+            .comment()
+            .and_then(|comment| comment.strip_prefix("vector:"))
+            .and_then(|dimension| dimension.parse().ok())
+        {
+            properties.insert("dimension".to_string(), dim);
         }
 
         CatalogColumn {
@@ -890,28 +890,12 @@ impl Catalog for GlueCatalog {
         Ok(schema.indexes.len() < initial_len)
     }
 
-    async fn list_indexes(&self, identifier: &TableIdentifier) -> Result<Vec<CatalogIndex>> {
-        let schema = self.get_table(identifier).await?;
-        Ok(schema.indexes)
-    }
-
     // ========================
     // Statistics
     // ========================
 
     async fn get_statistics(&self, identifier: &TableIdentifier) -> Result<CatalogTableStatistics> {
-        // Check cache first
-        if let Some(stats) = self.cache.get_statistics(&self.name, identifier) {
-            return Ok(stats);
-        }
-
-        // Glue has its own statistics in the table metadata
-        // For now, return empty stats
-        let stats = CatalogTableStatistics::default();
-
-        self.cache
-            .put_statistics(&self.name, identifier, stats.clone());
-        Ok(stats)
+        Ok(self.cache.cached_default_statistics(&self.name, identifier))
     }
 
     async fn update_statistics(

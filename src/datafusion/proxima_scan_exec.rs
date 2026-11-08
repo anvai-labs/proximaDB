@@ -222,24 +222,19 @@ fn resolved_runtime_predicates(
     out
 }
 
-/// Gate for absorbing DataFusion's join runtime filters into the scan.
-///
-/// **Promoted to default-ON** (2026-07-06, TD-OLAP-3 evidence v6, executing the
-/// promotion v5/#696 found evidence-supported). On the four TPC-DS star-join
-/// queries (q3/q42/q52/q55) the runtime filter cuts the same query's `bytes_read`
-/// 30–57% (fact scan collapses to the row groups the `date_dim` build side
-/// selects) — measured stable across scale 0.01/0.05; the other conformance
-/// queries are byte-identical and all 38 return identical result sets on both
-/// gates. Correctness-neutral: the hash join still applies exact semantics, so
-/// absorbing the dynamic filter is a scan-pruning hint. Opt out with
-/// `PROXIMADB_DF_RUNTIME_FILTER_PRUNE=0`.
-pub fn runtime_filter_prune_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("PROXIMADB_DF_RUNTIME_FILTER_PRUNE")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(true)
-    })
+proximadb_config::env_gate! {
+    /// Gate for absorbing DataFusion's join runtime filters into the scan.
+    ///
+    /// **Promoted to default-ON** (2026-07-06, TD-OLAP-3 evidence v6, executing the
+    /// promotion v5/#696 found evidence-supported). On the four TPC-DS star-join
+    /// queries (q3/q42/q52/q55) the runtime filter cuts the same query's `bytes_read`
+    /// 30–57% (fact scan collapses to the row groups the `date_dim` build side
+    /// selects) — measured stable across scale 0.01/0.05; the other conformance
+    /// queries are byte-identical and all 38 return identical result sets on both
+    /// gates. Correctness-neutral: the hash join still applies exact semantics, so
+    /// absorbing the dynamic filter is a scan-pruning hint. Opt out with
+    /// `PROXIMADB_DF_RUNTIME_FILTER_PRUNE=0`.
+    pub fn runtime_filter_prune_enabled() { gate: "PROXIMADB_DF_RUNTIME_FILTER_PRUNE", default: true }
 }
 
 /// The probe scan's wait budget for the build-side runtime filter's

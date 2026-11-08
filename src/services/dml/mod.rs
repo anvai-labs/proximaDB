@@ -3529,45 +3529,71 @@ impl DmlService {
             ndv.publish();
         }
 
-        // 7. Garbage-collect generations older than the previous version. Best
+        // 7. Garbage-collect generations older than the retained window
+        //    (PROXIMADB_MATERIALIZE_GC_RETAINED_GENERATIONS, default 3
+        //    generations INCLUDING this one). Best
         //    effort: a leftover file is unreferenced (readers select from the
         //    manifest), so a failure here only costs storage until the next run.
         //    Puffins are kept by the same rule as data files: anything the
         //    committed or the previous snapshot's vectors name survives. Every
         //    vector is carried only from the parent, so a Puffin the committed
-        //    snapshot names by reference is also in `keep_previous`; keeping
+        //    snapshot names by reference is also in `keep_older`; keeping
         //    the committed set too is defence in depth, not the only guard.
         let keep_current: std::collections::HashSet<String> = snapshot_keys
             .iter()
             .chain(carried_deletes.iter().map(|v| &v.puffin_file))
             .map(|p| p.to_string())
             .collect();
-        let keep_previous: std::collections::HashSet<String> = match parent {
-            Some(previous) => {
+        // F8: keep files for N generations (default 3, floor 2), not just V
+        // and V−1 — a reader pinned two quick MATERIALIZEs back was losing
+        // files mid-scan. Walk the metadata versions downward from the parent;
+        // if any retained version cannot be read, skip GC this round. A read
+        // failure cannot prove its files are unreferenced, even if its metadata
+        // may have been pruned externally.
+        let retained = materialize_append::gc_retained_generations();
+        let mut keep_older: std::collections::HashSet<String> = Default::default();
+        if let Some(previous) = parent {
+            // `retained` counts TOTAL generations including the committed V;
+            // retained_versions enumerates the OLDER ones, newest-first, and
+            // includes version 0 (the first commit) — pinned by its own test.
+            for v in materialize_append::retained_versions(previous, retained) {
                 match bridge
-                    .read_iceberg_snapshot_files(&metadata_prefix, previous)
+                    .read_iceberg_snapshot_files(&metadata_prefix, v)
                     .await
                 {
-                    Ok(snapshot) => snapshot
-                        .data_files
-                        .iter()
-                        .chain(snapshot.deletion_vectors.iter().map(|v| &v.puffin_file))
-                        .map(|p| p.to_string())
-                        .collect(),
+                    Ok(snapshot) => keep_older.extend(
+                        snapshot
+                            .data_files
+                            .iter()
+                            .chain(snapshot.deletion_vectors.iter().map(|x| &x.puffin_file))
+                            .map(|p| p.to_string()),
+                    ),
                     Err(e) => {
-                        warn!(table = %table_name, "MATERIALIZE GC skipped: {e}");
+                        // An incomplete keep-set could delete data or Puffins
+                        // still in use by a reader pinned within the window.
+                        warn!(table = %table_name, version = v, "MATERIALIZE GC skipped: retained generation unreadable: {e}");
                         return Ok(location);
                     }
                 }
             }
-            None => Default::default(),
-        };
+        }
+        // F15 (TD-LIVEDEL-1) rides the SAME GC pass: self-minted dv-live
+        // Puffins are collected by lease (grace) once unreferenced, in the
+        // single listing above — an adopted dv-live is in the keep sets by
+        // exact key. See gc_older_generations.
+        let dv_live_grace = materialize_append::dv_live_gc_grace();
+        let dv_live_now_ns: i64 = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as i64)
+            .unwrap_or_default();
         match materialize_stream::gc_older_generations(
             bridge,
             &object_store::path::Path::from(data_dir.as_str()),
             &keep_current,
-            &keep_previous,
+            &keep_older,
             &stem,
+            dv_live_grace,
+            dv_live_now_ns,
         )
         .await
         {
@@ -3746,11 +3772,8 @@ impl DmlService {
             ));
         }
         let files = snapshot.data_files;
-        if files.len() >= materialize_append::APPEND_MAX_FILES {
-            return Ok((
-                AppendPlan::Rewrite("the snapshot has many parts; a rewrite compacts them"),
-                Vec::new(),
-            ));
+        if let Some(reason) = materialize_append::parts_fallback_reason(files.len()) {
+            return Ok((AppendPlan::Rewrite(reason), Vec::new()));
         }
         let Some(published) =
             materialize_append::PublishedOids::read(bridge, &files, expected).await?
@@ -6118,6 +6141,21 @@ impl DmlService {
                 .await
                 .map_err(|e| anyhow!("live delete: writing the vectors: {e}"))?;
 
+            // Gate 4b (F15 review, finding 1c): HEAD the minted Puffin
+            // before the CAS. The dv-live GC's grace lease protects a
+            // publisher between mint and commit, but a publisher stalled
+            // LONGER than the grace would otherwise commit a dangling
+            // reference — every later DV read would fail stickily. One stat
+            // converts that into the contract's accepted fence-gap failure:
+            // this publish refuses loudly, the fence stays unrecorded, and
+            // the swept Puffin is a harmless orphan.
+            bridge
+                .object_size(&puffin_key)
+                .await
+                .map_err(|e| {
+                    anyhow!("live delete: the minted Puffin vanished before commit (GC lease expired or external deletion): {e}")
+                })?;
+
             // Gate 4, second check — IMMEDIATELY before the CAS. The check is
             // point-in-time (no token reaches the CAS), so its protection is
             // the window between it and the commit; the first check alone
@@ -7998,9 +8036,13 @@ impl DmlService {
                 projection.version.map(|version| version as u64 + 1)
             }
         };
-        let mut updated_at_ns = chrono::Utc::now()
-            .timestamp_millis()
-            .saturating_mul(1_000_000);
+        // TD-MEMTABLE-MVCC-1 residual (a): stamp FULL nanoseconds, matching
+        // the INSERT path (which inherits full ns from ProximaRecord::default
+        // via to_proxima_record). The old millisecond truncation made an
+        // INSERT followed by an UPDATE within the same millisecond order the
+        // UPDATE as OLDER under every ns-first comparator — the update was
+        // invisible until another write.
+        let mut updated_at_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
         if let Some(timestamp_ns) = assigned_timestamp_ns {
             created_at_ns = Some(timestamp_ns);
             updated_at_ns = timestamp_ns;

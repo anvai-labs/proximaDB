@@ -12,7 +12,7 @@ use proximadb::storage::engines::sst::segment_format::{
     write_pax_segment_compacted, write_pax_segment_full,
 };
 use proximadb_block_format::VectorQuant;
-use proximadb_records::{EmbeddingCell, EmbeddingValues, ProximaRecord};
+use proximadb_records::{EmbeddingCell, ProximaRecord};
 
 const DIM: usize = 8;
 const CLUSTERS: usize = 4;

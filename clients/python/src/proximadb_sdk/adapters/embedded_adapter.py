@@ -36,12 +36,20 @@ from ..models import (
 )
 from ..models_v2 import ProximaRecord
 from ..proto_conversion import ProtoConverter
-from .base import BaseProtocolAdapter
+from .base import BaseProtocolAdapter, RecordOpsMixin
 
 logger = logging.getLogger(__name__)
 
 
-class EmbeddedProtocolAdapter(BaseProtocolAdapter):
+def _is_coroutine_fn(fn) -> bool:
+    """True when ``fn`` is a coroutine function (the subprocess flavor's
+    async timeseries surface — TD-EMB-1 direction 3)."""
+    import asyncio
+
+    return asyncio.iscoroutinefunction(fn)
+
+
+class EmbeddedProtocolAdapter(RecordOpsMixin, BaseProtocolAdapter):
     """Embedded adapter implementing BaseProtocolAdapter.
 
     Wraps the PyO3 EmbeddedProximaDB bindings to provide a consistent
@@ -522,17 +530,6 @@ class EmbeddedProtocolAdapter(BaseProtocolAdapter):
             failed=response.metrics.failed_count,
             errors=[response.error_message] if response.error_message else [],
             metrics=response.metrics,
-        )
-
-    @staticmethod
-    def _batch_to_vector_response(
-        result: BatchResult, operation: str
-    ) -> VectorOperationResponse:
-        return VectorOperationResponse(
-            success=result.success,
-            operation=operation,
-            metrics=result.metrics,
-            error_message="; ".join(result.errors) if result.errors else None,
         )
 
     def insert_records(
@@ -1196,6 +1193,33 @@ class EmbeddedProtocolAdapter(BaseProtocolAdapter):
             logger.error(f"Failed to get node: {e}")
             raise
 
+    def _directional_edges(
+        self,
+        direction: str,
+        node_id: str,
+        graph: str | None,
+        edge_types: list[str] | None,
+        kwargs: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        """Shared body for the outgoing/incoming edge readers (same shape,
+        one engine method name — a twin pair is how the adapters drifted)."""
+        try:
+            graph_id = self._graph_id_from_args(graph, kwargs)
+            engine_method = f"get_{direction}_edges"
+            if hasattr(self._db, engine_method):
+                edges = getattr(self._db, engine_method)(
+                    graph_id=graph_id,
+                    node_id=node_id,
+                    edge_types=edge_types,
+                )
+                return [self._normalize_graph_edge(edge) for edge in (edges or [])]
+            raise NotImplementedError(
+                f"{engine_method} not implemented in embedded API"
+            )
+        except Exception as e:
+            logger.error(f"Failed to get {direction} edges: {e}")
+            raise
+
     def get_outgoing_edges(
         self,
         node_id: str,
@@ -1204,21 +1228,7 @@ class EmbeddedProtocolAdapter(BaseProtocolAdapter):
         **kwargs,
     ) -> list[dict[str, Any]]:
         """Get outgoing graph edges via embedded API."""
-        try:
-            graph_id = self._graph_id_from_args(graph, kwargs)
-            if hasattr(self._db, "get_outgoing_edges"):
-                edges = self._db.get_outgoing_edges(
-                    graph_id=graph_id,
-                    node_id=node_id,
-                    edge_types=edge_types,
-                )
-                return [self._normalize_graph_edge(edge) for edge in (edges or [])]
-            raise NotImplementedError(
-                "get_outgoing_edges not implemented in embedded API"
-            )
-        except Exception as e:
-            logger.error(f"Failed to get outgoing edges: {e}")
-            raise
+        return self._directional_edges("outgoing", node_id, graph, edge_types, kwargs)
 
     def get_incoming_edges(
         self,
@@ -1228,21 +1238,7 @@ class EmbeddedProtocolAdapter(BaseProtocolAdapter):
         **kwargs,
     ) -> list[dict[str, Any]]:
         """Get incoming graph edges via embedded API."""
-        try:
-            graph_id = self._graph_id_from_args(graph, kwargs)
-            if hasattr(self._db, "get_incoming_edges"):
-                edges = self._db.get_incoming_edges(
-                    graph_id=graph_id,
-                    node_id=node_id,
-                    edge_types=edge_types,
-                )
-                return [self._normalize_graph_edge(edge) for edge in (edges or [])]
-            raise NotImplementedError(
-                "get_incoming_edges not implemented in embedded API"
-            )
-        except Exception as e:
-            logger.error(f"Failed to get incoming edges: {e}")
-            raise
+        return self._directional_edges("incoming", node_id, graph, edge_types, kwargs)
 
     def delete_node(
         self,
@@ -1272,6 +1268,130 @@ class EmbeddedProtocolAdapter(BaseProtocolAdapter):
             raise NotImplementedError("graph_stats not implemented in embedded API")
         except Exception as e:
             logger.error(f"Failed to get graph stats: {e}")
+            raise
+
+    # NOTE (canonical-contract divergences, TD-SDK-3 batch 1 review): the
+    # pre-existing graph methods below predate the base-class canonical
+    # signatures and are kept kwargs-compatible rather than reordered — live
+    # callers pass the legacy spellings positionally/kwarg-wise
+    # (agentic_io.py ``from_node=``, embedded cov tests pass ``edge_type``
+    # as the 2nd positional). Call them with KEYWORDS per the canonical
+    # names (``from_node_id``/``to_node_id`` are popped from kwargs). Known
+    # engine limitations, documented rather than faked: the engine's
+    # ``traverse_graph`` has no ``algorithm``/``node_labels`` params (a DFS
+    # request runs BFS), ``create_graph`` ignores ``name``/``description``/
+    # ``schema``, and ``create_node`` ignores ``embedding``. Canonicalizing
+    # these belongs to the v1→v2 swap batch (TD-SDK-3 step 3) together with
+    # the agentic_io migration.
+    def _engine_graph_classes(self) -> tuple[type, type] | None:
+        """Resolve ``(GraphNode, GraphEdge)`` from the engine package.
+
+        Resolution order mirrors the adapter's own engine import:
+
+        1. ``proximadb_embedded`` — the CANONICAL wheel module (the adapter
+           imports it first at connect time) and the one that re-exports
+           GraphNode/GraphEdge in its ``__init__``.
+        2. ``proximadb`` — the legacy top-level engine module (also shipped
+           as a compat shim by the wheel, but WITHOUT the graph classes; it
+           resolves here only for the raw legacy layout).
+        3. The db object's own module — for pure-Python engines that co-locate
+           the classes with the db class. This is the ONLY path that could
+           work for PyO3 classes derived from ``type(db).__module__``, and it
+           never fires there: a ``#[pyclass]`` without ``module = "..."``
+           reports ``__module__ == "builtins"``, which is skipped.
+
+        ``None`` → the batch methods degrade to the base class's
+        NotImplementedError (graph.py then falls back to per-item creates).
+        """
+        import importlib
+        import sys
+
+        candidates = ["proximadb_embedded", "proximadb"]
+        db_module = type(self._db).__module__
+        if db_module and db_module != "builtins" and db_module not in candidates:
+            candidates.append(db_module)
+        for name in candidates:
+            try:
+                module = sys.modules.get(name) or importlib.import_module(name)
+            except Exception:
+                continue
+            node_cls = getattr(module, "GraphNode", None)
+            edge_cls = getattr(module, "GraphEdge", None)
+            if node_cls is not None and edge_cls is not None:
+                return node_cls, edge_cls
+        return None
+
+    def batch_create_nodes(
+        self, nodes: list[dict[str, Any]], graph_id: str | None = None, **kwargs
+    ) -> dict[str, Any]:
+        """Batch-create nodes via the embedded engine's ``create_nodes``.
+
+        Returns the same ``{success, created_count, nodes}`` shape as the
+        REST/gRPC batch endpoints (a bare count would break facade parity).
+        """
+        try:
+            gid = graph_id or kwargs.pop("graph_id", None) or "default"
+            if hasattr(self._db, "create_nodes"):
+                classes = self._engine_graph_classes()
+                if classes is not None:
+                    node_cls, _ = classes
+                    items = [
+                        node_cls(
+                            n.get("id") or n.get("node_id"),
+                            n.get("labels"),
+                            n.get("properties"),
+                        )
+                        for n in nodes
+                    ]
+                    created = self._db.create_nodes(gid, items)
+                    return {
+                        "success": True,
+                        "created_count": int(created),
+                        "nodes": nodes,
+                    }
+            raise NotImplementedError(
+                "batch_create_nodes not implemented in embedded API"
+            )
+        except Exception as e:
+            logger.error(f"Failed to batch create nodes: {e}")
+            raise
+
+    def batch_create_edges(
+        self, edges: list[dict[str, Any]], graph_id: str | None = None, **kwargs
+    ) -> dict[str, Any]:
+        """Batch-create edges via the embedded engine's ``create_edges``.
+
+        Returns the same ``{success, created_count, edges}`` shape as the
+        REST/gRPC batch endpoints.
+        """
+        try:
+            gid = graph_id or kwargs.pop("graph_id", None) or "default"
+            if hasattr(self._db, "create_edges"):
+                classes = self._engine_graph_classes()
+                if classes is not None:
+                    _, edge_cls = classes
+                    items = [
+                        edge_cls(
+                            e.get("from_node_id") or e.get("source"),
+                            e.get("to_node_id") or e.get("target"),
+                            e.get("edge_type") or e.get("type") or "RELATED",
+                            e.get("id") or e.get("edge_id"),
+                            e.get("weight"),
+                            e.get("properties"),
+                        )
+                        for e in edges
+                    ]
+                    created = self._db.create_edges(gid, items)
+                    return {
+                        "success": True,
+                        "created_count": int(created),
+                        "edges": edges,
+                    }
+            raise NotImplementedError(
+                "batch_create_edges not implemented in embedded API"
+            )
+        except Exception as e:
+            logger.error(f"Failed to batch create edges: {e}")
             raise
 
     def execute_graph_query(self, graph: str, query: str, **kwargs) -> dict[str, Any]:
@@ -1668,7 +1788,9 @@ class EmbeddedProtocolAdapter(BaseProtocolAdapter):
     ) -> dict[str, Any]:
         """Create a time-series collection via embedded API."""
         try:
-            if hasattr(self._db, "create_timeseries_collection"):
+            if hasattr(
+                self._db, "create_timeseries_collection"
+            ) and not _is_coroutine_fn(self._db.create_timeseries_collection):
                 result = self._db.create_timeseries_collection(
                     name=name, config=config or {}
                 )
@@ -1702,7 +1824,9 @@ class EmbeddedProtocolAdapter(BaseProtocolAdapter):
     ) -> dict[str, Any]:
         """Ingest time-series data points via embedded API."""
         try:
-            if hasattr(self._db, "ingest_timeseries"):
+            if hasattr(self._db, "ingest_timeseries") and not _is_coroutine_fn(
+                self._db.ingest_timeseries
+            ):
                 result = self._db.ingest_timeseries(
                     collection=collection_name,
                     points=points,
@@ -1757,14 +1881,31 @@ class EmbeddedProtocolAdapter(BaseProtocolAdapter):
         collection_name: str,
         start_time: str,
         end_time: str,
-        aggregation: str = "avg",
+        aggregation: str | None = None,
         bucket_ms: int | None = None,
         tag_filters: dict[str, str] | None = None,
         **kwargs,
     ) -> dict[str, Any]:
-        """Query time-series data with optional aggregation via embedded API."""
+        """Query time-series data with optional aggregation via embedded API.
+
+        TD-EMB-1 disclosure: the embedded ENGINE has no timeseries
+        surface (the multimodel facade maps ``ModelType::TimeSeries`` to
+        ``None`` — not yet implemented), so ``hasattr`` below is False on
+        every current build and the VECTOR FALLBACK always runs. The
+        fallback honors ``tag_filters`` ONLY — ``aggregation``/``bucket_ms``
+        are silently dropped there, so on the fallback they raise the
+        typed capability error (TD-SDK-3's honest-signal convention)
+        instead of returning raw points that look aggregated.
+        """
         try:
-            if hasattr(self._db, "query_timeseries"):
+            if hasattr(self._db, "query_timeseries") and not _is_coroutine_fn(
+                self._db.query_timeseries
+            ):
+                # The SUBPROCESS flavor's query_timeseries is `async def`
+                # (TD-EMB-1 direction 3): a sync call would silently
+                # return an un-awaited coroutine — raise the honest
+                # capability error instead (use the async client or the
+                # vector fallback).
                 result = self._db.query_timeseries(
                     collection=collection_name,
                     start_time=start_time,
@@ -1775,7 +1916,15 @@ class EmbeddedProtocolAdapter(BaseProtocolAdapter):
                 )
                 return result
             else:
-                # Fall back to vector storage
+                # Vector fallback: tags-only. Reject the parameters it
+                # would silently drop (TD-EMB-1 direction 2).
+                if aggregation is not None or bucket_ms is not None:
+                    raise NotImplementedError(
+                        "query_timeseries(aggregation/bucket_ms) is not "
+                        "supported on the embedded vector fallback (the "
+                        "engine has no timeseries surface; TD-EMB-1) — "
+                        "only tag_filters are honored"
+                    )
                 return self._query_timeseries_as_vector(
                     collection_name, start_time, end_time, tag_filters
                 )
@@ -1843,7 +1992,9 @@ class EmbeddedProtocolAdapter(BaseProtocolAdapter):
     def list_timeseries_collections(self, **kwargs) -> list[dict[str, Any]]:
         """List all time-series collections via embedded API."""
         try:
-            if hasattr(self._db, "list_timeseries_collections"):
+            if hasattr(
+                self._db, "list_timeseries_collections"
+            ) and not _is_coroutine_fn(self._db.list_timeseries_collections):
                 result = self._db.list_timeseries_collections()
                 return result if isinstance(result, list) else []
             else:
@@ -1864,7 +2015,9 @@ class EmbeddedProtocolAdapter(BaseProtocolAdapter):
     def delete_timeseries_collection(self, collection_name: str, **kwargs) -> bool:
         """Delete a time-series collection via embedded API."""
         try:
-            if hasattr(self._db, "delete_timeseries_collection"):
+            if hasattr(
+                self._db, "delete_timeseries_collection"
+            ) and not _is_coroutine_fn(self._db.delete_timeseries_collection):
                 result = self._db.delete_timeseries_collection(
                     collection=collection_name
                 )

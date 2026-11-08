@@ -248,7 +248,6 @@ pub mod spatial_pruning; // SpatialPruner for unified block selection
 pub mod spatial_traits; // SpatialCurveEncoder trait for unified block clustering
 pub use proximadb_engine_core::proximablocks::sst_io_layer; // extracted TD-DECOMP-79
 pub use proximadb_engine_core::proximablocks::sst_metadata; // extracted TD-DECOMP-75
-pub use proximadb_engine_core::proximablocks::swift_metadata; // extracted TD-DECOMP-75
 pub use proximadb_engine_core::proximablocks::utilities; // extracted TD-DECOMP-72
 
 // Re-exports for common use

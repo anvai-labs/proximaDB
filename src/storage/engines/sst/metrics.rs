@@ -14,14 +14,9 @@
 //! per-collection demand — keeping cardinality intentional, not eager.
 
 use lazy_static::lazy_static;
-use prometheus::{IntCounter, IntCounterVec, register_int_counter, register_int_counter_vec};
+use prometheus::{IntCounter, IntCounterVec, register_int_counter_vec};
 
-fn counter(name: &str, help: &str) -> IntCounter {
-    register_int_counter!(name, help).unwrap_or_else(|_| {
-        IntCounter::new(format!("{name}_fallback"), help)
-            .unwrap_or_else(|_| unreachable!("valid counter metric descriptor"))
-    })
-}
+use crate::metrics::operational_metrics::counter;
 
 // NOTE: unlabeled AGGREGATE operator surface. The per-tenant billing versions
 // in metrics/consumption_metrics.rs own the canonical
@@ -74,6 +69,12 @@ lazy_static! {
         "proximadb_pax_metadata_ops_agg_total",
         "Object-storage HEAD/metadata ops on the SST search path (TD-RDSTRAT-13 C3 removes the per-segment HEAD)",
     );
+    /// TD-TIER-1 SC4 residual: a read served from the resident (granted)
+    /// local-disk copy — zero object-store cost. Per-query trace visibility.
+    pub static ref PAX_RESIDENT_HITS: IntCounter = counter(
+        "proximadb_pax_resident_hits_total",
+        "Reads served from the resident whole-object copy (admitted residency)",
+    );
     pub static ref IVF_PROBE_RANK_US: IntCounter = counter(
         "proximadb_ivf_probe_rank_us_agg_total",
         "Cumulative coarse-probe rank wall microseconds incl. morsel join (TD-RDSTRAT-13 C2 compute term)",
@@ -93,6 +94,22 @@ lazy_static! {
     pub static ref REHYDRATE_US: IntCounter = counter(
         "proximadb_rehydrate_us_agg_total",
         "Cumulative top-k rehydration wall microseconds (TD-RDSTRAT-13 PR-B)",
+    );
+    pub static ref PAX_DEFERRED_SEARCHES: IntCounter = counter(
+        "proximadb_pax_deferred_searches_agg_total",
+        "Vector searches that resolved OIDs and rehydrated after the cross-segment merge (O1)",
+    );
+    pub static ref PAX_DEFERRED_CANDIDATES: IntCounter = counter(
+        "proximadb_pax_deferred_candidates_agg_total",
+        "Cascade candidates whose OID resolve and rehydrate were deferred to the merge (O1); minus the winners counter = rows never rehydrated",
+    );
+    pub static ref PAX_DEFERRED_WINNERS: IntCounter = counter(
+        "proximadb_pax_deferred_winners_agg_total",
+        "Merged winners rehydrated on the deferred path (O1)",
+    );
+    pub static ref PAX_DEFERRED_REHYDRATE_RETRIES: IntCounter = counter(
+        "proximadb_pax_deferred_rehydrate_retries_agg_total",
+        "Vector searches re-run on the per-segment path because a merged winner could not be rehydrated (O1)",
     );
     pub static ref STAGE_F_REGION_E: IntCounter = counter(
         "proximadb_stage_f_region_e_agg_total",
@@ -179,6 +196,11 @@ pub fn record_tier_get(tier_idx: usize, bytes: u64) {
 /// Record one object-storage metadata op (HEAD) on the search path (C3).
 pub fn record_metadata_op() {
     PAX_METADATA_OPS.inc();
+}
+
+/// TD-TIER-1 SC4 residual: record a read served from the resident copy.
+pub fn record_resident_hit() {
+    PAX_RESIDENT_HITS.inc();
 }
 
 /// Record one coarse-probe rank wall duration in microseconds (C2).

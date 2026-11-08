@@ -96,7 +96,7 @@ pub struct SmartRowGroupSizer {
 }
 
 // Use unified quantization types instead of deprecated proto imports
-use proximadb_quantization_model::{QuantizationLevel, UnifiedQuantizationLevel};
+use proximadb_quantization_model::{QuantizationScheme, UnifiedQuantizationLevel};
 
 /// Internal quantization config for sizing calculations
 #[derive(Debug, Clone)]
@@ -188,10 +188,10 @@ impl SmartRowGroupSizer {
             }
             Some(config) => {
                 let quantized_bytes = match &config.primary_level.level_type {
-                    Some(QuantizationLevel::Binary(_)) => dimension / 8,
-                    Some(QuantizationLevel::Scalar(scalar)) if scalar.bits == 8 => dimension,
-                    Some(QuantizationLevel::Pq(pq)) if pq.bits_per_code == 4 => dimension / 2,
-                    Some(QuantizationLevel::Pq(pq)) if pq.bits_per_code == 8 => dimension,
+                    Some(QuantizationScheme::Binary(_)) => dimension / 8,
+                    Some(QuantizationScheme::Scalar(scalar)) if scalar.bits == 8 => dimension,
+                    Some(QuantizationScheme::Pq(pq)) if pq.bits_per_code == 4 => dimension / 2,
+                    Some(QuantizationScheme::Pq(pq)) if pq.bits_per_code == 8 => dimension,
                     _ => dimension * 4, // Default to FP32
                 };
 

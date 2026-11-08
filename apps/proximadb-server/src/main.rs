@@ -114,7 +114,7 @@ fn main() -> anyhow::Result<()> {
     // check caught as a boot-time server death. Install aws-lc-rs explicitly
     // (rustls's own default preference, and what the Glue/aws path already
     // compiles) before anything can construct a TLS endpoint.
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    proximadb::network::tls::ensure_crypto_provider();
 
     let cli = cli::Cli::parse();
     cli.validate()?;

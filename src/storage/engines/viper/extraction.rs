@@ -16,6 +16,7 @@ use crate::storage::trait_components::extractor::{
     ExtractedVector, ExtractionCapabilities, ExtractionCost, ExtractionError, ExtractionMode,
     ExtractionRequest, ExtractionResult, VectorExtractor, filter_existing_files,
     finalize_extraction, id_filter_allows, mode_wants_fp32,
+    linear_file_cost,
 };
 
 /// VIPER Vector Extractor
@@ -193,16 +194,7 @@ impl VectorExtractor for ViperExtractor {
 
     fn estimate_extraction_cost(&self, request: &ExtractionRequest) -> ExtractionCost {
         // VIPER uses columnar Parquet - efficient for full scans
-        let files = request.file_paths.len();
-        let vectors_per_file = 100_000;
-        let bytes_per_vector = 768 * 4;
-
-        ExtractionCost {
-            estimated_vectors: files * vectors_per_file,
-            estimated_bytes: files * vectors_per_file * bytes_per_vector,
-            estimated_duration_ms: (files * 200) as u64, // ~200ms per large file
-            io_cost: 0.7,                                // Columnar is efficient for full scans
-        }
+        linear_file_cost(request.file_paths.len(), 100000, 768 * 4, 200, 0.7)
     }
 
     fn engine_type(&self) -> StorageEngineType {

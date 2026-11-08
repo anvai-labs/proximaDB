@@ -34,43 +34,7 @@ use super::subscription::{ResultChange, ScoredResult};
 
 /// A wrapper around f32 that provides total ordering
 /// Used for BTreeMap keys where f32 ordering is needed
-#[derive(Debug, Clone, Copy)]
-struct OrderedFloat(f32);
-
-impl PartialEq for OrderedFloat {
-    fn eq(&self, other: &Self) -> bool {
-        self.0.to_bits() == other.0.to_bits()
-    }
-}
-
-impl Eq for OrderedFloat {}
-
-impl PartialOrd for OrderedFloat {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for OrderedFloat {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        // Handle NaN: NaN is considered greater than all other values
-        match (self.0.is_nan(), other.0.is_nan()) {
-            (true, true) => std::cmp::Ordering::Equal,
-            (true, false) => std::cmp::Ordering::Greater,
-            (false, true) => std::cmp::Ordering::Less,
-            (false, false) => self
-                .0
-                .partial_cmp(&other.0)
-                .unwrap_or(std::cmp::Ordering::Equal),
-        }
-    }
-}
-
-impl std::hash::Hash for OrderedFloat {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.0.to_bits().hash(state);
-    }
-}
+use proximadb_records::BitKeyF32 as OrderedFloat;
 
 /// Result set for maintaining top-k results with change tracking
 #[derive(Debug)]

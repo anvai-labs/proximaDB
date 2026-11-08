@@ -7,7 +7,7 @@
 
 use crate::compute::quantization::quantization_engine::UnifiedQuantizationLevel;
 use crate::compute::quantization::storage_engine::StorageQuantizationEngine;
-use crate::compute::quantization::types::QuantizationLevel;
+use crate::compute::quantization::types::QuantizationScheme;
 use crate::proto::proximadb_v1::DistanceMetric;
 use crate::proto::proximadb_v1::QuantizationConfig;
 use parking_lot::RwLock;
@@ -482,7 +482,7 @@ impl QueryPreprocessor {
         // Quantize based on configuration
         if levels
             .iter()
-            .any(|l| matches!(l.level_type, Some(QuantizationLevel::Binary(_))))
+            .any(|l| matches!(l.level_type, Some(QuantizationScheme::Binary(_))))
             && let Some(engine) = &self.quantization_engine
             && let Ok(quantized) = engine
                 .quantize_batch_with_level(&[vector.to_vec()], UnifiedQuantizationLevel::Binary)
@@ -495,7 +495,7 @@ impl QueryPreprocessor {
 
         if levels
             .iter()
-            .any(|l| matches!(l.level_type, Some(QuantizationLevel::Scalar(_))))
+            .any(|l| matches!(l.level_type, Some(QuantizationScheme::Scalar(_))))
             && let Some(engine) = &self.quantization_engine
             && let Ok(quantized) = engine
                 .quantize_batch_with_level(&[vector.to_vec()], UnifiedQuantizationLevel::Int8)
@@ -508,7 +508,7 @@ impl QueryPreprocessor {
             ));
         }
 
-        if levels.iter().any(|l| matches!(l.level_type, Some(QuantizationLevel::Pq(ref pq)) if pq.bits_per_code == 4))
+        if levels.iter().any(|l| matches!(l.level_type, Some(QuantizationScheme::Pq(ref pq)) if pq.bits_per_code == 4))
             && let Some(engine) = &self.quantization_engine
                 && let Ok(quantized) = engine
                     .quantize_batch_with_level(&[vector.to_vec()], UnifiedQuantizationLevel::Pq4)
@@ -518,7 +518,7 @@ impl QueryPreprocessor {
                         pq4 = Some(Arc::new(primary.data));
                     }
 
-        if levels.iter().any(|l| matches!(l.level_type, Some(QuantizationLevel::Pq(ref pq)) if pq.bits_per_code == 8))
+        if levels.iter().any(|l| matches!(l.level_type, Some(QuantizationScheme::Pq(ref pq)) if pq.bits_per_code == 8))
             && let Some(engine) = &self.quantization_engine
                 && let Ok(quantized) = engine
                     .quantize_batch_with_level(&[vector.to_vec()], UnifiedQuantizationLevel::Pq8)

@@ -51,6 +51,25 @@ pub struct FlushParameters {
     /// Collection configuration to avoid redundant lookups
     pub collection_config: Option<Collection>,
 
+    /// TD-COMPACT-15: the collection's catalog POLICY PROPERTIES
+    /// (`compaction.*`, `cache.*`) carried alongside the flush so policy
+    /// resolvers see the property channel without mutating the
+    /// engine-facing Collection proto (which has no properties field —
+    /// derived tags would leak into read-modify-write catalog saves).
+    /// Populated by the catalog walk at flush-plan build time.
+    ///
+    /// `Option` so "loaded" is distinguishable from "not loaded" (#2418
+    /// review round 8): `Some(map)` — the catalog was consulted, and an EMPTY
+    /// map means the collection set nothing, so server defaults apply as
+    /// normal; `None` — this flush path never consulted the catalog
+    /// (bulk-ingest, the WAL flush coordinator, recovery, VIPER), so a
+    /// per-collection opt-out would be invisible and the server's broader
+    /// defaults must not be applied on its behalf. A bare `HashMap` forced
+    /// an emptiness heuristic that either left the server default inert for
+    /// every property-less collection or applied it over invisible opt-outs.
+    #[serde(default)]
+    pub collection_properties: Option<HashMap<String, String>>,
+
     /// Estimated size in bytes for metrics tracking
     pub estimated_size: usize,
 }
@@ -159,6 +178,20 @@ pub struct CompactionParameters {
 
     /// Estimated input size in bytes for metrics tracking
     pub estimated_input_size: usize,
+
+    /// Operator-requested cross-level collapse (`COMPACT ... FULL`): merge
+    /// toward `CompactionConfig::full_target_segments`, pairing the largest
+    /// segments across levels. Engines without a cross-level mode treat it
+    /// as an explicit single pass.
+    #[serde(default)]
+    pub full: bool,
+
+    /// Per-request override of `CompactionConfig::full_target_segments`
+    /// (TD-COMPACT-15 Experiment 3): stop the collapse at this many
+    /// segments instead of the config default. Validated > 0 at the API
+    /// boundary; `None` keeps the configured target.
+    #[serde(default)]
+    pub full_target_segments: Option<usize>,
 }
 
 impl CompactionParameters {

@@ -332,6 +332,7 @@ impl RecordOpsService {
                 collection_id = %collection_name,
                 "lease-on-write: this pod is not the primary for the collection; rejecting write"
             );
+            crate::metrics::record_write_gate_rejection("not_primary");
             return Err(anyhow!(
                 "this pod is not the primary for collection '{}'",
                 collection_name
@@ -349,6 +350,7 @@ impl RecordOpsService {
                     collection_id = %canonical_collection_id,
                     "writer incarnation is fenced; rejecting WAL write"
                 );
+                crate::metrics::record_write_gate_rejection("fenced");
                 Err(anyhow!(
                     "this pod is not the primary for collection '{}'",
                     canonical_collection_id
@@ -362,6 +364,7 @@ impl RecordOpsService {
                     collection_id = %collection_name,
                     "lease-on-write acquire failed; rejecting write"
                 );
+                crate::metrics::record_write_gate_rejection("acquire_error");
                 Err(anyhow!("lease-on-write acquire failed: {}", e))
             }
         }

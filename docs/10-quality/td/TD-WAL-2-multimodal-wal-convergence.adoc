@@ -35,6 +35,23 @@ Concept proliferation found: at least two batch size estimators
 two WAL user-config structs (`WalStorageConfig` test-only vs `WriteBufferUserConfig` live);
 a dead per-strategy `MemtableManager` stack beside the live global write buffer.
 
+== Embedded lifecycle scope clarification (2026-11-02)
+
+The same convergence gates apply when compute exits after a batch or restarts for a weekly
+query. An embedded vector flush does not prove graph/document/timeseries materialization or
+recovery. Explicit job completion must declare its modality set and return failure; it must
+not create a second scheduler or claim a durable cross-modality token. TD-OBJSTORE-1 owns
+URI/bootstrap and fresh-process cloud-open proof; this TD retains shared replay dispatch and
+per-modality materialization. Reuse ADR-069's local reattachable WAL profile and
+link:../../12-design/adr/ADR-081-admission-first-flush-ownership.adoc[ADR-081 exact batch claims].
+
+For the read-only cloud profile, expose a published-only read view through the existing query
+ports rather than constructing a writer WAL manager. Preserve the streaming writer's WAL-tail
+view as a separate injected capability. The existing engine lifecycle must suppress recovery,
+compaction and training writes in read-only mode; the writer continues to use shared admission
+and exact-claim materialization. TD-OBJSTORE-1 owns the concrete catalog/collection projection
+and bootstrap dependencies; this is a required seam, not another modality storage stack.
+
 == Boundary defenses (what stays modality-specific — do NOT converge)
 
 * **Flushed segment formats**: SST/ProximaBlocks for ANN, Parquet/columnar for document/OLAP,

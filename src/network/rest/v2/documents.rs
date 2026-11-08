@@ -21,6 +21,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use proximadb_data_model::ProximaValue;
+use proximadb_records::conversions::json_to_proxima;
 use proximadb_records::{EmbeddingCell, ProximaRecord, ProximaTreeNode};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -39,7 +40,13 @@ use crate::services::{
 // ── Request / response DTOs ────────────────────────────────────────────────
 
 /// A single record submitted for native embedding + indexing.
+///
+/// Unknown fields are REJECTED (`deny_unknown_fields`, TD-REC-1 policy — the
+/// same rule as the records surface): the declared fields plus the
+/// `props`/`metadata` alias pair are the contract; anything else is a 400
+/// naming the unknown field instead of a silently dropped write.
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct IngestDocument {
     pub id: String,
     /// Raw text content. Required when `X-Embed-Source: native` (default);
@@ -52,7 +59,11 @@ pub struct IngestDocument {
     #[serde(default)]
     pub vector: Option<Vec<f32>>,
     /// Arbitrary metadata fields. Stored as ProximaRecord props.
-    #[serde(default)]
+    ///
+    /// `props` is accepted as an alias (TD-REC-1): the records surface
+    /// documents `props` as the canonical map and accepts `metadata` as its
+    /// alias, so this surface accepts both spellings of the same map too.
+    #[serde(default, alias = "props")]
     pub metadata: HashMap<String, serde_json::Value>,
 }
 
@@ -108,8 +119,15 @@ pub async fn ingest_documents(
     Extension(tenant): Extension<TenantContext>,
     capability: Option<Extension<DataPlaneCapability>>,
     headers: HeaderMap,
-    Json(request): Json<IngestDocumentsRequest>,
+    payload: Result<Json<IngestDocumentsRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
+    // TD-REC-1: `deny_unknown_fields` on IngestDocument means a rejected
+    // body must be the documented 400 ApiError envelope naming the unknown
+    // field, not axum's plain-text 422 (same as `insert_records`).
+    let request = match super::json_body(payload) {
+        Ok(request) => request,
+        Err(response) => return response,
+    };
     match ingest_documents_inner(
         collection,
         state,
@@ -214,7 +232,7 @@ async fn ingest_documents_inner(
             );
         }
         for (k, v) in doc.metadata.into_iter() {
-            props.insert(k, ProximaTreeNode::Value(json_to_proxima_value(v)));
+            props.insert(k, ProximaTreeNode::Value(json_to_proxima(&v)));
         }
         // #950: make the tenant queryable. `record.tenant_id` (the isolation
         // field, stamped below) is invisible to metadata filters and record
@@ -676,8 +694,15 @@ fn envelope_metadata(record: &ProximaRecord) -> HashMap<String, String> {
                 ProximaValue::String(s) => s.clone(),
                 ProximaValue::Boolean(b) => b.to_string(),
                 ProximaValue::Int64(i) => i.to_string(),
+                ProximaValue::UInt64(u) => u.to_string(),
                 ProximaValue::Float64(f) => f.to_string(),
                 ProximaValue::Json(j) => j.to_string(),
+                // Structured values: serialize to JSON for the string-typed envelope.
+                // The canonical json_to_proxima produces Array/Map (not Json) for
+                // nested structures, so we must handle them here to avoid silent drops.
+                ProximaValue::Array(_) | ProximaValue::Map(_) => {
+                    proximadb_records::conversions::proxima_to_json(value).to_string()
+                }
                 _ => return None,
             };
             Some((k.clone(), s))
@@ -697,32 +722,26 @@ fn extract_text(record: &ProximaRecord) -> Option<String> {
     }
 }
 
-fn json_to_proxima_value(value: serde_json::Value) -> ProximaValue {
-    match value {
-        // ProximaValue has no Null variant — represent JSON null as empty
-        // string so the metadata key survives without crashing the type
-        // system. Callers can skip null fields earlier if they prefer.
-        serde_json::Value::Null => ProximaValue::String(String::new()),
-        serde_json::Value::Bool(b) => ProximaValue::Boolean(b),
-        serde_json::Value::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                ProximaValue::Int64(i)
-            } else if let Some(f) = n.as_f64() {
-                ProximaValue::Float64(f)
-            } else {
-                ProximaValue::String(n.to_string())
-            }
-        }
-        serde_json::Value::String(s) => ProximaValue::String(s),
-        // Arrays and objects get preserved as full JSON so downstream
-        // query/filter layers retain structural fidelity.
-        v @ (serde_json::Value::Array(_) | serde_json::Value::Object(_)) => ProximaValue::Json(v),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ingest_document_accepts_the_records_api_props_spelling() {
+        // TD-REC-1 mirror: the records API canonical spelling is `props`;
+        // the documents surface must accept it too, not drop it silently.
+        for field in ["metadata", "props"] {
+            let json = format!(r#"{{"id":"d1","text":"hi","{field}":{{"k":"v"}}}}"#);
+            let doc: IngestDocument = serde_json::from_str(&json)
+                .unwrap_or_else(|e| panic!("{field} must deserialize: {e}"));
+            assert!(
+                doc.metadata.contains_key("k"),
+                "{field}: {:?}",
+                doc.metadata
+            );
+        }
+    }
+
     use crate::services::operations::BatchOperationResult;
     use proximadb_embedding::config::{EmbedRoute, EmbeddingConfig};
     use proximadb_embedding::scheduler::EmbedSchedulerConfig;

@@ -328,10 +328,10 @@ mod tests {
     use super::super::GraphOperationsService;
     use crate::graph::{Edge, Node};
     use crate::proto::proximadb_v1::CreateGraphRequest;
-    use async_trait::async_trait;
-    use proximadb_records::{ProximaRecord, RecordKey, RecordStore, RecordStoreResult};
+    use proximadb_records::test_support::MemoryRecordStore;
+    use proximadb_records::{RecordKey, RecordStore};
     use std::collections::HashMap;
-    use std::sync::{Arc, RwLock};
+    use std::sync::Arc;
 
     /// Node fixture: single `label`, no properties, no embedding. Only the id,
     /// label, and timestamps vary across these tests — pass each test's exact
@@ -386,40 +386,6 @@ mod tests {
             .await
             .expect("create graph");
         graph_id
-    }
-
-    #[derive(Default)]
-    struct MemoryRecordStore {
-        records: RwLock<HashMap<String, ProximaRecord>>,
-    }
-
-    #[async_trait]
-    impl RecordStore for MemoryRecordStore {
-        async fn upsert_record(&self, record: ProximaRecord) -> RecordStoreResult<ProximaRecord> {
-            self.records
-                .write()
-                .expect("record store write lock")
-                .insert(record.oid.clone(), record.clone());
-            Ok(record)
-        }
-
-        async fn get_record(&self, key: &RecordKey) -> RecordStoreResult<Option<ProximaRecord>> {
-            Ok(self
-                .records
-                .read()
-                .expect("record store read lock")
-                .get(&key.oid)
-                .cloned())
-        }
-
-        async fn delete_record(&self, key: &RecordKey) -> RecordStoreResult<bool> {
-            Ok(self
-                .records
-                .write()
-                .expect("record store write lock")
-                .remove(&key.oid)
-                .is_some())
-        }
     }
 
     #[tokio::test]
@@ -797,9 +763,9 @@ mod tests {
 
         // Simulate a crash that lost the buffered cold store while the engine —
         // rebuilt from its own WAL on restart — retains the authoritative state.
-        record_store.records.write().expect("clear store").clear();
+        record_store.clear().expect("clear store");
         assert!(
-            record_store.records.read().expect("read store").is_empty(),
+            record_store.is_empty().expect("read store"),
             "cold store emptied (buffer lost on crash)"
         );
 
