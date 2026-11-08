@@ -1396,4 +1396,102 @@ mod tests {
         let small = serde_json::json!(42u64);
         assert!(matches!(json_to_proxima(&small), ProximaValue::Int64(42)));
     }
+
+    /// Golden-tree assertions for json_to_proxima: assert specific expected
+    /// ProximaValue variants for specific JSON inputs, independent of the
+    /// conversion implementation. Catches single-branch mutations.
+    #[test]
+    fn json_to_proxima_golden_tree_assertions() {
+        // Null
+        assert!(matches!(
+            json_to_proxima(&serde_json::json!(null)),
+            ProximaValue::Null
+        ));
+
+        // Booleans — both polarities
+        assert!(matches!(
+            json_to_proxima(&serde_json::json!(true)),
+            ProximaValue::Boolean(true)
+        ));
+        assert!(matches!(
+            json_to_proxima(&serde_json::json!(false)),
+            ProximaValue::Boolean(false)
+        ));
+
+        // Strings
+        assert!(matches!(
+            json_to_proxima(&serde_json::json!("hello")),
+            ProximaValue::String(ref s) if s == "hello"
+        ));
+        assert!(matches!(
+            json_to_proxima(&serde_json::json!("")),
+            ProximaValue::String(ref s) if s.is_empty()
+        ));
+
+        // Numbers — positive, negative, zero, float
+        assert!(matches!(
+            json_to_proxima(&serde_json::json!(42)),
+            ProximaValue::Int64(42)
+        ));
+        assert!(matches!(
+            json_to_proxima(&serde_json::json!(-100)),
+            ProximaValue::Int64(-100)
+        ));
+        assert!(matches!(
+            json_to_proxima(&serde_json::json!(0)),
+            ProximaValue::Int64(0)
+        ));
+        assert!(matches!(
+            json_to_proxima(&serde_json::json!(1.5)),
+            ProximaValue::Float64(f) if (f - 1.5).abs() < f64::EPSILON
+        ));
+        // u64 > i64::MAX → UInt64 (the exactness pin)
+        assert!(matches!(
+            json_to_proxima(&serde_json::json!(u64::MAX)),
+            ProximaValue::UInt64(v) if v == u64::MAX
+        ));
+
+        // Arrays — empty and non-empty
+        let empty_arr = json_to_proxima(&serde_json::json!([]));
+        assert!(matches!(empty_arr, ProximaValue::Array(ref v) if v.is_empty()));
+        let arr = json_to_proxima(&serde_json::json!([1, "two", true]));
+        if let ProximaValue::Array(items) = arr {
+            assert_eq!(items.len(), 3);
+            assert!(matches!(items[0], ProximaValue::Int64(1)));
+            assert!(matches!(items[1], ProximaValue::String(ref s) if s == "two"));
+            assert!(matches!(items[2], ProximaValue::Boolean(true)));
+        } else {
+            panic!("expected Array");
+        }
+
+        // Objects — empty and non-empty
+        let empty_obj = json_to_proxima(&serde_json::json!({}));
+        assert!(matches!(empty_obj, ProximaValue::Map(ref m) if m.is_empty()));
+        let obj = json_to_proxima(&serde_json::json!({"key": "value", "num": 42}));
+        if let ProximaValue::Map(fields) = obj {
+            assert_eq!(fields.len(), 2);
+            assert!(matches!(fields.get("key"), Some(ProximaValue::String(s)) if s == "value"));
+            assert!(matches!(fields.get("num"), Some(ProximaValue::Int64(42))));
+        } else {
+            panic!("expected Map");
+        }
+
+        // Nested structures
+        let nested = json_to_proxima(&serde_json::json!({"a": [1, {"b": true}]}));
+        if let ProximaValue::Map(fields) = nested {
+            if let Some(ProximaValue::Array(items)) = fields.get("a") {
+                assert_eq!(items.len(), 2);
+                assert!(matches!(items[0], ProximaValue::Int64(1)));
+                if let ProximaValue::Map(inner) = &items[1] {
+                    assert!(matches!(inner.get("b"), Some(ProximaValue::Boolean(true))));
+                } else {
+                    panic!("expected inner Map");
+                }
+            } else {
+                panic!("expected Array in field 'a'");
+            }
+        } else {
+            panic!("expected Map");
+        }
+    }
 }
