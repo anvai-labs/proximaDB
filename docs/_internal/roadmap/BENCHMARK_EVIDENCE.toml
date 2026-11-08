@@ -1480,3 +1480,19 @@ hardware = "the artifact's SF1 gate host: 4 vCPU, 15.7 GiB RAM, no swap; cgroup 
 date = "2026-10-24"
 version = "release build, 2026-10-24; commit/build/host/run provenance in the artifact"
 notes = "Registered here (release-review F3) because the 0.5.0 changelog cites the P2.4 gate while the ledger had no entry for it. Without the datafusion-integration feature the sort path holds the whole table in memory - default features include it. The peak-vs-bound assertion rides the harness itself, so the claim is only as fresh as the last manual run; re-run before citing a new binary."
+
+[[claims]]
+id = "value_codec_phase1_visitor_deserialize"
+claim = "Phase 1 of the value-codec refactor replaced the two-pass Value-first SqlValue Deserialize (materialize serde_json::Value DOM, then walk it) with a one-pass streaming visitor (deserialize_any + Visitor). The kernel bench (benches/bench_value_codec.rs) measures the visitor path (sql_value_from_slice) against the DOM path (serde_json::from_str → serde_json::from_value) across six doc shapes (small object, string-heavy, numeric array, deep nested, tagged string, tagged array). Numbers are indicative — the real win is elimination of the intermediate DOM allocation, visible in throughput and allocation profiles."
+metric = "throughput (bytes/sec) and ns/iter for JSON→SqlValue deserialization, visitor vs DOM path"
+status = "unverified"
+asserted_in = [
+  "benches/bench_value_codec.rs",
+]
+bench_source = "benches/bench_value_codec.rs"
+bench_command = "cargo bench --bench bench_value_codec"
+artifact = ""
+hardware = ""
+date = "2026-11-07"
+version = "refactor/value-codec-phase1 branch"
+notes = "Kernel-level indicative numbers only. E2E ingest throughput (REST document insert) is the citable claim for any perf improvement; run the server binary with the bench harness and update this entry to 'measured' with artifact/hardware provenance before citing in release notes."

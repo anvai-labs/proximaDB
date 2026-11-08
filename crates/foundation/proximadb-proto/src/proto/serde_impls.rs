@@ -229,106 +229,281 @@ impl<'de> Deserialize<'de> for SqlValue {
     where
         D: Deserializer<'de>,
     {
-        // First, deserialize as a raw JSON value to handle both formats
-        let json_value = serde_json::Value::deserialize(deserializer)?;
+        deserializer.deserialize_any(SqlValueVisitor)
+    }
+}
 
-        // Convert JSON value to SqlValue
-        // Supports BOTH:
-        // 1. Proto format: {"string_value": "test"}, {"number_value": 42}
-        // 2. Simple format: "test", 42, true, null (MVP-friendly)
-        let value = match &json_value {
-            // Non-object kinds are exactly the shared simple-format
-            // conversion (see json_to_sql_value below).
-            serde_json::Value::Object(obj) => {
-                // Check for proto-style wrapped values first
-                if let Some(v) = obj.get("string_value")
-                    && let Some(s) = v.as_str()
-                {
-                    return Ok(SqlValue {
-                        value: Some(SqlValueVariant::StringValue(s.to_string())),
-                    });
+struct SqlValueVisitor;
+
+impl<'de> serde::de::Visitor<'de> for SqlValueVisitor {
+    type Value = SqlValue;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+        formatter.write_str("a JSON value (string, number, bool, null, array, or object)")
+    }
+
+    fn visit_bool<E: serde::de::Error>(self, v: bool) -> Result<SqlValue, E> {
+        Ok(SqlValue {
+            value: Some(SqlValueVariant::BoolValue(v)),
+        })
+    }
+
+    fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<SqlValue, E> {
+        Ok(SqlValue {
+            value: Some(SqlValueVariant::Int64Value(v)),
+        })
+    }
+
+    fn visit_i128<E: serde::de::Error>(self, v: i128) -> Result<SqlValue, E> {
+        if let Ok(i) = i64::try_from(v) {
+            Ok(SqlValue {
+                value: Some(SqlValueVariant::Int64Value(i)),
+            })
+        } else {
+            Ok(SqlValue {
+                value: Some(SqlValueVariant::NumberValue(v as f64)),
+            })
+        }
+    }
+
+    fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<SqlValue, E> {
+        if let Ok(i) = i64::try_from(v) {
+            Ok(SqlValue {
+                value: Some(SqlValueVariant::Int64Value(i)),
+            })
+        } else {
+            Ok(SqlValue {
+                value: Some(SqlValueVariant::NumberValue(v as f64)),
+            })
+        }
+    }
+
+    fn visit_u128<E: serde::de::Error>(self, v: u128) -> Result<SqlValue, E> {
+        if let Ok(i) = i64::try_from(v) {
+            Ok(SqlValue {
+                value: Some(SqlValueVariant::Int64Value(i)),
+            })
+        } else {
+            Ok(SqlValue {
+                value: Some(SqlValueVariant::NumberValue(v as f64)),
+            })
+        }
+    }
+
+    fn visit_f64<E: serde::de::Error>(self, v: f64) -> Result<SqlValue, E> {
+        Ok(SqlValue {
+            value: Some(SqlValueVariant::NumberValue(v)),
+        })
+    }
+
+    fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<SqlValue, E> {
+        Ok(SqlValue {
+            value: Some(SqlValueVariant::StringValue(v.to_owned())),
+        })
+    }
+
+    fn visit_string<E: serde::de::Error>(self, v: String) -> Result<SqlValue, E> {
+        Ok(SqlValue {
+            value: Some(SqlValueVariant::StringValue(v)),
+        })
+    }
+
+    fn visit_unit<E: serde::de::Error>(self) -> Result<SqlValue, E> {
+        Ok(SqlValue {
+            value: Some(SqlValueVariant::NullValue(0)),
+        })
+    }
+
+    fn visit_none<E: serde::de::Error>(self) -> Result<SqlValue, E> {
+        Ok(SqlValue {
+            value: Some(SqlValueVariant::NullValue(0)),
+        })
+    }
+
+    fn visit_seq<A>(self, mut seq: A) -> Result<SqlValue, A::Error>
+    where
+        A: serde::de::SeqAccess<'de>,
+    {
+        let cap = seq.size_hint().unwrap_or(0);
+        let mut values = Vec::with_capacity(cap);
+        while let Some(elem) = seq.next_element()? {
+            values.push(elem);
+        }
+        Ok(SqlValue {
+            value: Some(SqlValueVariant::ArrayValue(
+                crate::proto::proximadb_v1::SqlArray { values },
+            )),
+        })
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<SqlValue, A::Error>
+    where
+        A: serde::de::MapAccess<'de>,
+    {
+        let cap = map.size_hint().unwrap_or(0);
+        let mut entries: Vec<(String, SqlValue)> = Vec::with_capacity(cap);
+        while let Some((key, value)) = map.next_entry()? {
+            entries.push((key, value));
+        }
+
+        // Single-key tagged-object detection: only a single-entry map with a
+        // known tag key AND a matching value shape unwraps to the tagged
+        // variant. Multi-key objects always become generic ObjectValue —
+        // sibling keys must never be silently dropped.
+        if entries.len() == 1 {
+            let (ref key, ref inner) = entries[0];
+            match key.as_str() {
+                "string_value" => {
+                    if let SqlValue {
+                        value: Some(SqlValueVariant::StringValue(s)),
+                    } = inner
+                    {
+                        return Ok(SqlValue {
+                            value: Some(SqlValueVariant::StringValue(s.clone())),
+                        });
+                    }
                 }
-                if let Some(v) = obj.get("number_value")
-                    && let Some(f) = v.as_f64()
-                {
-                    return Ok(SqlValue {
-                        value: Some(SqlValueVariant::NumberValue(f)),
-                    });
+                "number_value" => {
+                    // Accept both NumberValue and Int64Value (mirrors the old
+                    // `as_f64()` which accepted any JSON number).
+                    match &inner.value {
+                        Some(SqlValueVariant::NumberValue(f)) => {
+                            return Ok(SqlValue {
+                                value: Some(SqlValueVariant::NumberValue(*f)),
+                            });
+                        }
+                        Some(SqlValueVariant::Int64Value(i)) => {
+                            return Ok(SqlValue {
+                                value: Some(SqlValueVariant::NumberValue(*i as f64)),
+                            });
+                        }
+                        _ => {}
+                    }
                 }
-                if let Some(v) = obj.get("bool_value")
-                    && let Some(b) = v.as_bool()
-                {
-                    return Ok(SqlValue {
+                "bool_value" => {
+                    if let SqlValue {
                         value: Some(SqlValueVariant::BoolValue(b)),
-                    });
+                    } = inner
+                    {
+                        return Ok(SqlValue {
+                            value: Some(SqlValueVariant::BoolValue(*b)),
+                        });
+                    }
                 }
-                if let Some(v) = obj.get("int64_value")
-                    && let Some(i) = v.as_i64()
-                {
-                    return Ok(SqlValue {
+                "int64_value" => {
+                    if let SqlValue {
                         value: Some(SqlValueVariant::Int64Value(i)),
-                    });
+                    } = inner
+                    {
+                        return Ok(SqlValue {
+                            value: Some(SqlValueVariant::Int64Value(*i)),
+                        });
+                    }
                 }
-                if let Some(v) = obj.get("bytes_value")
-                    && let Some(s) = v.as_str()
-                {
-                    let bytes = base64_decode(s).map_err(serde::de::Error::custom)?;
-                    return Ok(SqlValue {
-                        value: Some(SqlValueVariant::BytesValue(bytes)),
-                    });
+                "bytes_value" => {
+                    if let SqlValue {
+                        value: Some(SqlValueVariant::StringValue(s)),
+                    } = inner
+                    {
+                        let bytes = base64_decode(s).map_err(serde::de::Error::custom)?;
+                        return Ok(SqlValue {
+                            value: Some(SqlValueVariant::BytesValue(bytes)),
+                        });
+                    }
                 }
-                if obj.len() == 1
-                    && let Some(v) = obj.get("jsonb_value")
-                    && let Some(s) = v.as_str()
-                    && let Ok(bytes) = base64_decode(s)
-                    // Round-trip gate: a genuine JSONB payload is valid
-                    // MessagePack by construction. A generic object whose
-                    // literal key happens to be "jsonb_value" with an
-                    // arbitrary base64-ish string usually is not, and falls
-                    // through to ObjectValue instead of being reshaped.
-                    && valid_jsonb_bytes(&bytes)
-                {
-                    // The tagged form commits only for a SINGLE-KEY object
-                    // whose value decodes to valid JSONB bytes: sibling keys
-                    // must never be silently dropped, and a generic object
-                    // that merely contains a "jsonb_value" key falls through
-                    // to the generic-object handling below instead of 422-ing
-                    // or being reshaped. (Residual ambiguity mirrors the
-                    // pre-existing bytes_value tagged form.)
-                    return Ok(SqlValue {
-                        value: Some(SqlValueVariant::JsonbValue(bytes)),
-                    });
+                "jsonb_value" => {
+                    if let SqlValue {
+                        value: Some(SqlValueVariant::StringValue(s)),
+                    } = inner
+                        && let Ok(bytes) = base64_decode(s)
+                    {
+                        // Round-trip gate: a genuine JSONB payload is valid
+                        // MessagePack by construction. A generic object whose
+                        // literal key happens to be "jsonb_value" with an
+                        // arbitrary base64-ish string usually is not, and falls
+                        // through to ObjectValue instead of being reshaped.
+                        if valid_jsonb_bytes(&bytes) {
+                            return Ok(SqlValue {
+                                value: Some(SqlValueVariant::JsonbValue(bytes)),
+                            });
+                        }
+                    }
                 }
-                if obj.contains_key("null_value") {
+                "null_value" => {
                     return Ok(SqlValue {
                         value: Some(SqlValueVariant::NullValue(0)),
                     });
                 }
-                if let Some(v) = obj.get("array_value") {
-                    let arr: crate::proto::proximadb_v1::SqlArray =
-                        serde_json::from_value(v.clone()).map_err(serde::de::Error::custom)?;
-                    return Ok(SqlValue {
-                        value: Some(SqlValueVariant::ArrayValue(arr)),
-                    });
+                "array_value" => {
+                    // SqlArray serializes as {"values": [...]}. The visitor
+                    // deserializes that wrapper as a generic ObjectValue with a
+                    // single "values" key holding the ArrayValue. Extract it.
+                    // Also accept a bare ArrayValue (the visitor may have seen
+                    // a bare JSON array as the map value).
+                    match &inner.value {
+                        Some(SqlValueVariant::ArrayValue(arr)) => {
+                            return Ok(SqlValue {
+                                value: Some(SqlValueVariant::ArrayValue(arr.clone())),
+                            });
+                        }
+                        Some(SqlValueVariant::ObjectValue(wrapper))
+                            if wrapper.fields.len() == 1 =>
+                        {
+                            if let Some(SqlValue {
+                                value: Some(SqlValueVariant::ArrayValue(arr)),
+                            }) = wrapper.fields.get("values")
+                            {
+                                return Ok(SqlValue {
+                                    value: Some(SqlValueVariant::ArrayValue(arr.clone())),
+                                });
+                            }
+                        }
+                        _ => {}
+                    }
                 }
-                if let Some(v) = obj.get("object_value") {
-                    let object: crate::proto::proximadb_v1::SqlObject =
-                        serde_json::from_value(v.clone()).map_err(serde::de::Error::custom)?;
-                    return Ok(SqlValue {
-                        value: Some(SqlValueVariant::ObjectValue(object)),
-                    });
+                "object_value" => {
+                    // SqlObject serializes as {"fields": {...}}. The visitor
+                    // deserializes that wrapper as a generic ObjectValue with a
+                    // single "fields" key holding the inner ObjectValue. Extract it.
+                    // Also accept a bare ObjectValue (a plain JSON object as the
+                    // map value).
+                    if let Some(SqlValueVariant::ObjectValue(wrapper)) = &inner.value {
+                        if wrapper.fields.len() == 1
+                            && let Some(SqlValue {
+                                value: Some(SqlValueVariant::ObjectValue(obj)),
+                            }) = wrapper.fields.get("fields")
+                        {
+                            return Ok(SqlValue {
+                                value: Some(SqlValueVariant::ObjectValue(obj.clone())),
+                            });
+                        }
+                        // Bare object: the inner ObjectValue IS the object.
+                        return Ok(SqlValue {
+                            value: Some(SqlValueVariant::ObjectValue(wrapper.clone())),
+                        });
+                    }
                 }
-
-                // Treat as a generic object (MVP-friendly nested object):
-                // the shared conversion's Object branch does exactly this.
-                return Ok(json_to_sql_value(&json_value));
+                _ => {}
             }
-            // Every non-object kind is the shared simple-format conversion.
-            _ => json_to_sql_value(&json_value).value,
-        };
+        }
 
-        Ok(SqlValue { value })
+        // Generic object: build SqlObject from the buffered pairs.
+        let fields: std::collections::HashMap<String, SqlValue> = entries.into_iter().collect();
+        Ok(SqlValue {
+            value: Some(SqlValueVariant::ObjectValue(
+                crate::proto::proximadb_v1::SqlObject { fields },
+            )),
+        })
     }
+}
+
+/// One-pass entry point: deserialize a JSON byte slice directly into a
+/// [`SqlValue`] with zero intermediate `serde_json::Value` allocation.
+///
+/// This is the preferred ingest path for JSON bytes. For an already-materialized
+/// `serde_json::Value`, use [`json_to_sql_value`] instead.
+pub fn sql_value_from_slice(bytes: &[u8]) -> Result<SqlValue, serde_json::Error> {
+    serde_json::from_slice(bytes)
 }
 
 /// Simple-format conversion from `serde_json::Value` to [`SqlValue`].
@@ -346,6 +521,10 @@ impl<'de> Deserialize<'de> for SqlValue {
 /// The `StringValue` fallback is unreachable for numbers serde_json can
 /// parse without `arbitrary_precision`; it exists so the fn is total and
 /// lossless if that feature is ever enabled (pinned by the test below).
+///
+/// Key order: `SqlObject::fields` is a `HashMap`, so JSON object key order
+/// is NOT preserved. This is a deliberate keep+document decision — callers
+/// must not depend on field iteration order.
 pub fn json_to_sql_value(json: &serde_json::Value) -> SqlValue {
     let value = match json {
         serde_json::Value::String(s) => SqlValueVariant::StringValue(s.clone()),
@@ -1091,5 +1270,204 @@ mod json_to_sql_value_tests {
             inner.fields.get("c").and_then(|v| v.value.clone()),
             Some(SqlValueVariant::NumberValue(2.5))
         );
+    }
+}
+
+/// Differential corpus: the one-pass visitor (`sql_value_from_slice`) must
+/// produce the same `SqlValue` as the DOM path (`serde_json::from_str` →
+/// `serde_json::from_value::<SqlValue>`) for every JSON shape we care about,
+/// and round-tripping through `to_string` must preserve the tree.
+///
+/// This is the negative-control-bearing guard: if a visitor branch regresses,
+/// the bytes path and the Value path will diverge, or the round-trip will fail.
+#[cfg(test)]
+mod sql_value_visitor_differential_tests {
+    use super::*;
+
+    /// Helper: assert that `sql_value_from_slice` and the DOM path agree,
+    /// and that round-tripping through `to_string` preserves the tree.
+    fn assert_differential(doc: &str) {
+        let from_slice: SqlValue =
+            sql_value_from_slice(doc.as_bytes()).expect("sql_value_from_slice must succeed");
+        let json_value: serde_json::Value =
+            serde_json::from_str(doc).expect("serde_json::from_str must succeed");
+        let from_value: SqlValue =
+            serde_json::from_value(json_value).expect("serde_json::from_value must succeed");
+
+        assert_eq!(
+            from_slice, from_value,
+            "visitor and DOM paths must agree for: {}",
+            doc
+        );
+
+        let serialized = serde_json::to_string(&from_slice).expect("to_string must succeed");
+        let reparsed: SqlValue =
+            sql_value_from_slice(serialized.as_bytes()).expect("reparsed must succeed");
+        assert_eq!(
+            from_slice, reparsed,
+            "round-trip must preserve tree for: {}",
+            doc
+        );
+    }
+
+    #[test]
+    fn simple_forms() {
+        assert_differential(r#""hello""#);
+        assert_differential(r#""unicode: 你好世界 🌍""#);
+        assert_differential(r#""escaped: \"\\n\\t""#);
+        assert_differential("true");
+        assert_differential("false");
+        assert_differential("null");
+        assert_differential("42");
+        assert_differential("-100");
+        assert_differential("3.14");
+        assert_differential("-2.5e10");
+        assert_differential(&format!("{}", u64::MAX));
+    }
+
+    #[test]
+    fn tagged_string_value() {
+        assert_differential(r#"{"string_value": "test"}"#);
+        assert_differential(r#"{"string_value": ""}"#);
+        assert_differential(r#"{"string_value": "unicode: 你好"}"#);
+    }
+
+    #[test]
+    fn tagged_number_value() {
+        assert_differential(r#"{"number_value": 3.14}"#);
+        assert_differential(r#"{"number_value": -2.5e10}"#);
+        assert_differential(r#"{"number_value": 42}"#);
+        assert_differential(r#"{"number_value": 0}"#);
+    }
+
+    #[test]
+    fn tagged_bool_value() {
+        assert_differential(r#"{"bool_value": true}"#);
+        assert_differential(r#"{"bool_value": false}"#);
+    }
+
+    #[test]
+    fn tagged_int64_value() {
+        assert_differential(r#"{"int64_value": 42}"#);
+        assert_differential(r#"{"int64_value": -100}"#);
+        assert_differential(r#"{"int64_value": 0}"#);
+    }
+
+    #[test]
+    fn tagged_bytes_value() {
+        let base64 = base64_encode(b"hello world");
+        let doc = format!(r#"{{"bytes_value": "{}"}}"#, base64);
+        assert_differential(&doc);
+
+        let empty = base64_encode(b"");
+        let doc = format!(r#"{{"bytes_value": "{}"}}"#, empty);
+        assert_differential(&doc);
+    }
+
+    #[test]
+    fn tagged_jsonb_value_valid() {
+        let jsonb_bytes = rmp_serde::to_vec(&serde_json::json!({"key": "value"})).unwrap();
+        let base64 = base64_encode(&jsonb_bytes);
+        let doc = format!(r#"{{"jsonb_value": "{}"}}"#, base64);
+        assert_differential(&doc);
+    }
+
+    #[test]
+    fn tagged_jsonb_value_invalid_falls_through() {
+        // 0xC1 is a reserved/invalid messagepack byte that cannot start any
+        // valid messagepack value.
+        let invalid_jsonb: &[u8] = &[0xC1, 0xC1, 0xC1];
+        let base64 = base64_encode(invalid_jsonb);
+        let doc = format!(r#"{{"jsonb_value": "{}"}}"#, base64);
+        let from_slice: SqlValue = sql_value_from_slice(doc.as_bytes()).unwrap();
+        let json_value: serde_json::Value = serde_json::from_str(&doc).unwrap();
+        let from_value: SqlValue = serde_json::from_value(json_value).unwrap();
+        assert_eq!(from_slice, from_value);
+        // Invalid JSONB falls through to generic ObjectValue wrapping the
+        // original key/value pair (not JsonbValue, not StringValue).
+        assert!(
+            matches!(from_slice.value, Some(SqlValueVariant::ObjectValue(_))),
+            "expected ObjectValue, got {:?}",
+            from_slice.value
+        );
+    }
+
+    #[test]
+    fn tagged_null_value() {
+        assert_differential(r#"{"null_value": null}"#);
+        assert_differential(r#"{"null_value": "anything"}"#);
+        assert_differential(r#"{"null_value": 42}"#);
+    }
+
+    #[test]
+    fn tagged_array_value() {
+        assert_differential(r#"{"array_value": {"values": []}}"#);
+        assert_differential(r#"{"array_value": {"values": [1, 2, 3]}}"#);
+        assert_differential(r#"{"array_value": {"values": ["a", "b"]}}"#);
+        assert_differential(r#"{"array_value": {"values": [1, "two", true, null, 3.14]}}"#);
+    }
+
+    #[test]
+    fn tagged_object_value() {
+        assert_differential(r#"{"object_value": {"fields": {}}}"#);
+        assert_differential(r#"{"object_value": {"fields": {"key": "value"}}}"#);
+        assert_differential(r#"{"object_value": {"fields": {"a": 1, "b": 2.5, "c": true}}}"#);
+    }
+
+    #[test]
+    fn multi_key_objects_are_generic() {
+        let doc = r#"{"string_value": "test", "other": 42}"#;
+        let from_slice: SqlValue = sql_value_from_slice(doc.as_bytes()).unwrap();
+        assert!(matches!(
+            from_slice.value,
+            Some(SqlValueVariant::ObjectValue(_))
+        ));
+
+        let doc = r#"{"number_value": 3.14, "extra": true}"#;
+        let from_slice: SqlValue = sql_value_from_slice(doc.as_bytes()).unwrap();
+        assert!(matches!(
+            from_slice.value,
+            Some(SqlValueVariant::ObjectValue(_))
+        ));
+    }
+
+    #[test]
+    fn nested_structures() {
+        assert_differential(r#"{"a": [1, [2, [3]]]}"#);
+        assert_differential(r#"{"x": {"y": {"z": "deep"}}}"#);
+        assert_differential(r#"[1, [2, [3, [4]]]]"#);
+        assert_differential(r#"{"arr": [{"nested": true}, {"nested": false}]}"#);
+    }
+
+    #[test]
+    fn empty_containers() {
+        assert_differential(r#"[]"#);
+        assert_differential(r#"{}"#);
+        assert_differential(r#"{"empty_arr": []}"#);
+        assert_differential(r#"{"empty_obj": {}}"#);
+    }
+
+    #[test]
+    fn large_array() {
+        let arr: Vec<i32> = (0..10_000).collect();
+        let doc = serde_json::to_string(&arr).unwrap();
+        assert_differential(&doc);
+    }
+
+    #[test]
+    fn unicode_and_escaped_strings() {
+        assert_differential(r#""Hello, 世界! 🌍""#);
+        assert_differential(r#""\u0048\u0065\u006c\u006c\u006f""#);
+        assert_differential(r#""line1\nline2\ttab""#);
+        assert_differential(r#""quote: \" backslash: \\""#);
+    }
+
+    #[test]
+    fn mixed_nested_tagged_and_generic() {
+        let doc = r#"{"outer": {"string_value": "inner"}}"#;
+        let from_slice: SqlValue = sql_value_from_slice(doc.as_bytes()).unwrap();
+        let from_value: SqlValue =
+            serde_json::from_value(serde_json::from_str(doc).unwrap()).unwrap();
+        assert_eq!(from_slice, from_value);
     }
 }

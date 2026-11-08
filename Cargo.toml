@@ -1424,6 +1424,12 @@ name = "bench_25_search_get_count"
 harness = false
 path = "benches/bench_25_search_get_count.rs"
 
+# Value codec: one-pass visitor vs old Value-first DOM path (indicative).
+[[bench]]
+name = "bench_value_codec"
+harness = false
+path = "benches/bench_value_codec.rs"
+
 # ============================================================================
 # BUILD OPTIMIZATION STRATEGY
 # ============================================================================
