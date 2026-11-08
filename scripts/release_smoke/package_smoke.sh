@@ -48,8 +48,6 @@ for d in $CONTRACT_DIRS; do
     || { echo "::error::${KIND} on ${DISTRO}: $d is ${owner}, not proximadb:proximadb"; exit 1; }
   mode="$(stat -c '%a' "$d")"
   [ "$mode" = "750" ] || { echo "::error::${KIND} on ${DISTRO}: $d mode is $mode, not 750"; exit 1; }
-  grp="$(stat -c '%G' "$d")"
-  [ "$grp" = "proximadb" ] || { echo "::error::${KIND} on ${DISTRO}: $d group is $grp, not proximadb"; exit 1; }
 done
 echo "${KIND} on ${DISTRO}: unit Type=simple; state dirs owned by proximadb"
 

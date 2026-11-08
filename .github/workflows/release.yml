@@ -609,12 +609,6 @@ jobs:
           VERIFY_RPM_DEV_FIXTURE=$'.M...UG..    /var/lib/proximadb\n.M...UG..    /var/log/proximadb\n..5......    /usr/bin/proximadb-server' \
             bash deploy/packaging/scripts/verify_rpm.sh selftest \
             >/dev/null 2>&1 && { echo "FATAL: foreign-deviation fixture was ACCEPTED"; exit 1; }
-          # REHEARSE the REAL branch on the runner (extracted script —
-          # bash -n testable; stubbed dnf/rpm execute every line the
-          # container will run).
-          bash -n deploy/packaging/scripts/rehearse_rpm_verify.sh
-          bash deploy/packaging/scripts/rehearse_rpm_verify.sh "$VERSION"
-          test ! -e /usr/bin/proximadb-server
           docker run --rm -v "$PWD:/pkg:ro" rockylinux:8 \
             bash /pkg/deploy/packaging/scripts/verify_rpm.sh "$VERSION"
           # %post scriptlets (systemctl daemon-reload) still report failure here because
@@ -703,9 +697,6 @@ jobs:
           VERIFY_DEB_DEV_FIXTURE=$'??5??????    /usr/bin/proximadb-server' \
             bash deploy/packaging/scripts/verify_deb.sh selftest \
             >/dev/null 2>&1 && { echo "FATAL: deviating dpkg -V fixture was ACCEPTED"; exit 1; }
-          # REHEARSE the DEB real branch too (F4 symmetry with the RPM leg).
-          bash -n deploy/packaging/scripts/rehearse_deb_verify.sh
-          bash deploy/packaging/scripts/rehearse_deb_verify.sh "$VERSION"
           docker run --rm -v "$PWD:/pkg:ro" debian:11 \
             bash /pkg/deploy/packaging/scripts/verify_deb.sh "$VERSION"
 

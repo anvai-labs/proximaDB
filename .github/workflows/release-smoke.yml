@@ -581,6 +581,11 @@ jobs:
           # the minimal smoke container has no repo, so the dir list rides
           # in as env (package_smoke.sh falls back only if this is unset).
           CHOWN_DIRS="$(grep -E '^CHOWN_DIRS=' "$GITHUB_WORKSPACE/deploy/packaging/scripts/postinstall.sh" | sed -E 's/^CHOWN_DIRS="?([^"]*)"?$/\1/')"
+          # Fail LOUD on a malformed contract (a hand-rolled sed silently
+          # passes decoration through — the strict parser's message instead).
+          case "$CHOWN_DIRS" in
+            ""|*'"'*|*#*) echo "::error::CHOWN_DIRS in postinstall.sh is malformed: $CHOWN_DIRS"; exit 1 ;;
+          esac
           for img in ubuntu:20.04 ubuntu:22.04 ubuntu:24.04 debian:11 debian:12; do
             docker run --rm -e CHOWN_DIRS="$CHOWN_DIRS" -v "$RUNNER_TEMP/rel:/rel:ro" -v "$GITHUB_WORKSPACE/scripts/release_smoke:/smoke:ro" \
               "$img" bash /smoke/package_smoke.sh deb "/rel/proximadb_${VERSION}_amd64.deb" "$VERSION"
@@ -588,7 +593,9 @@ jobs:
       - name: .rpm install + start + /health (rockylinux 8 and 9, fedora 41)
         run: |
           set -euo pipefail
-          CHOWN_DIRS="$(grep -E '^CHOWN_DIRS=' "$GITHUB_WORKSPACE/deploy/packaging/scripts/postinstall.sh" | sed -E 's/^CHOWN_DIRS="?([^"]*)"?$/\1/')"
+          case "$CHOWN_DIRS" in
+            ""|*'"'*|*#*) echo "::error::CHOWN_DIRS in postinstall.sh is malformed: $CHOWN_DIRS"; exit 1 ;;
+          esac
           for img in rockylinux:8 rockylinux:9 fedora:41; do
             docker run --rm -e CHOWN_DIRS="$CHOWN_DIRS" -v "$RUNNER_TEMP/rel:/rel:ro" -v "$GITHUB_WORKSPACE/scripts/release_smoke:/smoke:ro" \
               "$img" bash /smoke/package_smoke.sh rpm "/rel/proximadb-${VERSION}-1.el8.x86_64.rpm" "$VERSION"

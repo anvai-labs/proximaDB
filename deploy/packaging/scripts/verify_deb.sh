@@ -29,16 +29,10 @@ else
     apt-get update -qq
     apt-get install -y -qq /pkg/proximadb_*_amd64.deb
     assert_common_payload /lib/systemd/system/proximadb.service
-    # TD-PKG-1 asserted at the SAME depth as the RPM leg: dpkg -V is blind
-    # to dirs/ownership/modes, so the contract dirs are stat-ed directly.
-    read_contract_dirs "$POSTINSTALL_SRC"
-    contract_dirs="$CONTRACT_DIRS"
-    for dir in $contract_dirs; do
-        owner="$(stat -c %U "$dir")"
-        mode="$(stat -c %a "$dir")"
-        [ "$owner" = "proximadb" ] || { echo "TD-PKG-1: $dir owner is $owner, not proximadb" >&2; exit 1; }
-        [ "$mode" = "750" ] || { echo "TD-PKG-1: $dir mode is $mode, not 750" >&2; exit 1; }
-    done
+    # TD-PKG-1 asserted at the SAME depth as the RPM leg via the SHARED
+    # helper (dpkg -V is blind to dirs/ownership/modes, so the contract
+    # dirs are stat-ed directly — owner, group, and mode).
+    assert_td_pkg1_dirs "$POSTINSTALL_SRC"
     assert_version
     # Two dpkg -V semantics (verified on debian:11 / dpkg 1.20; re-pin at
     # each debian bump): deviations print to stdout with rc=0, and

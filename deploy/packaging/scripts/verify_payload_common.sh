@@ -45,3 +45,19 @@ td_pkg1_stateline_for() {
     # $1 = contract dir → the exact expected rpm -V line.
     printf '%s    %s\n' "$TD_PKG1_STATELINE" "$1"
 }
+
+# Assert the TD-PKG-1 contract on INSTALLED dirs: owner+group proximadb,
+# mode 750. $1 = postinstall.sh path (the CHOWN_DIRS source). Used by the
+# DEB verifier (dpkg -V is blind to dirs); the RPM leg's rpm -V gate
+# covers the same contract for rpm.
+assert_td_pkg1_dirs() {
+    local src="${1:?usage: assert_td_pkg1_dirs <postinstall.sh>}"
+    read_contract_dirs "$src"
+    local dir owner grp mode
+    for dir in $CONTRACT_DIRS; do
+        owner="$(stat -c %U "$dir")"; grp="$(stat -c %G "$dir")"; mode="$(stat -c %a "$dir")"
+        [ "$owner" = "proximadb" ] && [ "$grp" = "proximadb" ] \
+            || { echo "TD-PKG-1: $dir is ${owner}:${grp}, not proximadb:proximadb" >&2; return 1; }
+        [ "$mode" = "750" ] || { echo "TD-PKG-1: $dir mode is $mode, not 750" >&2; return 1; }
+    done
+}
