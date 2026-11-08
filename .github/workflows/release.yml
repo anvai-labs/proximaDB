@@ -590,7 +590,17 @@ jobs:
             test -f /usr/lib/systemd/system/proximadb.service
             got="$(/usr/bin/proximadb-server --version)"
             test "$got" = "proximadb-server $VER"
-            rpm -V proximadb
+            # rpm -V exits nonzero on ANY deviation. The %post scriptlet
+            # DELIBERATELY chowns/chmods the state/log dirs (TD-PKG-1 — the
+            # service user must own its own data), so exactly those two
+            # deviations are expected; anything else fails the verify.
+            devs="$(rpm -V proximadb || true)"
+            unexpected="$(printf '%s\n' "$devs" | grep -vE '^\.M\.\.\.UG\.[[:space:]]+/var/(lib|log)/proximadb$' || true)"
+            if [ -n "$unexpected" ]; then
+              echo "unexpected rpm -V deviations:"
+              echo "$unexpected"
+              exit 1
+            fi
             rpm -e proximadb
             test ! -e /usr/bin/proximadb-server'
           # %post scriptlets (systemctl daemon-reload) still report failure here because
