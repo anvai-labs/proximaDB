@@ -36,6 +36,7 @@ use async_trait::async_trait;
 use tracing::{debug, info, instrument};
 
 use crate::proto::proximadb_v1::{IncludeFields, SearchQuery, VectorSearchRequest};
+use proximadb_records::conversions::sql_value_to_proxima;
 use proximadb_records::{ProximaRecord, ProximaTreeNode, ScoredRecord};
 
 use crate::query::facade::{
@@ -136,9 +137,8 @@ impl VectorSearchStrategy {
                 };
                 // Convert SqlValue metadata to ProximaTree props
                 for (key, sql_val) in r.metadata {
-                    if let Some(pv) = sql_value_to_proxima_value(sql_val) {
-                        record.props.insert(key, ProximaTreeNode::Value(pv));
-                    }
+                    let pv = sql_value_to_proxima(&sql_val);
+                    record.props.insert(key, ProximaTreeNode::Value(pv));
                 }
                 ScoredRecord {
                     record,
@@ -167,42 +167,6 @@ impl VectorSearchStrategy {
             }),
         }
     }
-}
-
-/// Convert proto SqlValue to canonical ProximaValue.
-fn sql_value_to_proxima_value(
-    value: crate::proto::proximadb_v1::SqlValue,
-) -> Option<proximadb_data_model::ProximaValue> {
-    use crate::proto::proximadb_v1::sql_value::Value;
-    use proximadb_data_model::ProximaValue;
-
-    value.value.map(|v| match v {
-        Value::StringValue(s) => ProximaValue::String(s),
-        Value::Int64Value(i) => ProximaValue::Int64(i),
-        Value::NumberValue(f) => ProximaValue::Float64(f),
-        Value::BoolValue(b) => ProximaValue::Boolean(b),
-        Value::NullValue(_) => ProximaValue::Null,
-        Value::BytesValue(bytes) => ProximaValue::Binary(bytes),
-        // Canonical MessagePack JSONB decode (the shared helper) so a tag-9
-        // value compares equal across read paths.
-        Value::JsonbValue(bytes) => ProximaValue::from_jsonb_or_binary(&bytes),
-        Value::ArrayValue(list) => {
-            let items: Vec<ProximaValue> = list
-                .values
-                .into_iter()
-                .filter_map(sql_value_to_proxima_value)
-                .collect();
-            ProximaValue::Array(items)
-        }
-        Value::ObjectValue(map) => {
-            let obj: std::collections::HashMap<String, ProximaValue> = map
-                .fields
-                .into_iter()
-                .filter_map(|(k, v)| sql_value_to_proxima_value(v).map(|pv| (k, pv)))
-                .collect();
-            ProximaValue::Map(obj)
-        }
-    })
 }
 
 #[async_trait]

@@ -36,6 +36,7 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use proximadb_data_model::ProximaValue;
+use proximadb_records::conversions::json_to_proxima;
 use proximadb_records::{
     EmbeddingCell, EmbeddingScalarType, EmbeddingValues, ProximaRecord, ProximaTree,
     ProximaTreeNode,
@@ -586,36 +587,7 @@ impl DefaultProximaRecordBridge {
                     .map(|(key, value)| (key, Self::json_to_tree_node(value)))
                     .collect(),
             ),
-            other => ProximaTreeNode::Value(Self::json_to_proxima_value(other)),
-        }
-    }
-
-    fn json_to_proxima_value(value: JsonValue) -> ProximaValue {
-        match value {
-            JsonValue::Null => ProximaValue::Null,
-            JsonValue::Bool(value) => ProximaValue::Boolean(value),
-            JsonValue::Number(value) => {
-                if let Some(int_value) = value.as_i64() {
-                    ProximaValue::Int64(int_value)
-                } else if let Some(float_value) = value.as_f64() {
-                    ProximaValue::Float64(float_value)
-                } else {
-                    ProximaValue::Null
-                }
-            }
-            JsonValue::String(value) => ProximaValue::String(value),
-            JsonValue::Array(values) => ProximaValue::Array(
-                values
-                    .into_iter()
-                    .map(Self::json_to_proxima_value)
-                    .collect(),
-            ),
-            JsonValue::Object(values) => ProximaValue::Map(
-                values
-                    .into_iter()
-                    .map(|(key, value)| (key, Self::json_to_proxima_value(value)))
-                    .collect(),
-            ),
+            other => ProximaTreeNode::Value(json_to_proxima(&other)),
         }
     }
 

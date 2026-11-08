@@ -21,6 +21,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use proximadb_data_model::ProximaValue;
+use proximadb_records::conversions::json_to_proxima;
 use proximadb_records::{EmbeddingCell, ProximaRecord, ProximaTreeNode};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -231,7 +232,7 @@ async fn ingest_documents_inner(
             );
         }
         for (k, v) in doc.metadata.into_iter() {
-            props.insert(k, ProximaTreeNode::Value(json_to_proxima_value(v)));
+            props.insert(k, ProximaTreeNode::Value(json_to_proxima(&v)));
         }
         // #950: make the tenant queryable. `record.tenant_id` (the isolation
         // field, stamped below) is invisible to metadata filters and record
@@ -693,8 +694,15 @@ fn envelope_metadata(record: &ProximaRecord) -> HashMap<String, String> {
                 ProximaValue::String(s) => s.clone(),
                 ProximaValue::Boolean(b) => b.to_string(),
                 ProximaValue::Int64(i) => i.to_string(),
+                ProximaValue::UInt64(u) => u.to_string(),
                 ProximaValue::Float64(f) => f.to_string(),
                 ProximaValue::Json(j) => j.to_string(),
+                // Structured values: serialize to JSON for the string-typed envelope.
+                // The canonical json_to_proxima produces Array/Map (not Json) for
+                // nested structures, so we must handle them here to avoid silent drops.
+                ProximaValue::Array(_) | ProximaValue::Map(_) => {
+                    proximadb_records::conversions::proxima_to_json(value).to_string()
+                }
                 _ => return None,
             };
             Some((k.clone(), s))
@@ -711,29 +719,6 @@ fn extract_text(record: &ProximaRecord) -> Option<String> {
         Some(s.clone())
     } else {
         None
-    }
-}
-
-fn json_to_proxima_value(value: serde_json::Value) -> ProximaValue {
-    match value {
-        // ProximaValue has no Null variant — represent JSON null as empty
-        // string so the metadata key survives without crashing the type
-        // system. Callers can skip null fields earlier if they prefer.
-        serde_json::Value::Null => ProximaValue::String(String::new()),
-        serde_json::Value::Bool(b) => ProximaValue::Boolean(b),
-        serde_json::Value::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                ProximaValue::Int64(i)
-            } else if let Some(f) = n.as_f64() {
-                ProximaValue::Float64(f)
-            } else {
-                ProximaValue::String(n.to_string())
-            }
-        }
-        serde_json::Value::String(s) => ProximaValue::String(s),
-        // Arrays and objects get preserved as full JSON so downstream
-        // query/filter layers retain structural fidelity.
-        v @ (serde_json::Value::Array(_) | serde_json::Value::Object(_)) => ProximaValue::Json(v),
     }
 }
 

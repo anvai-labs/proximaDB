@@ -118,6 +118,7 @@ pub use agent_memory::{
 pub use streaming::{EmbeddedSearchIterator, StreamingSearchConfig, StreamingSearchResult};
 
 use proximadb::core::config::{AdvancedPruneConfig, PruneModeConfig};
+use proximadb_records::conversions::json_to_proxima;
 // FA-b: only referenced on the `#[cfg(feature = "abac-policy")]` trailing arg of
 // `unified_search_native`. Embedded mode is abac-OFF by default; this import is
 // gated to match (the `proximadb-abac` dep is optional, behind the same feature).
@@ -434,38 +435,6 @@ pub(crate) fn proxima_value_to_string(v: proximadb_data_model::ProximaValue) -> 
             serde_json::Value::String(s) => s,
             json => json.to_string(),
         },
-    }
-}
-
-pub(crate) fn json_to_proxima_value(
-    value: serde_json::Value,
-) -> proximadb_data_model::ProximaValue {
-    use proximadb_data_model::ProximaValue;
-
-    match value {
-        serde_json::Value::Null => ProximaValue::Null,
-        serde_json::Value::Bool(v) => ProximaValue::Boolean(v),
-        serde_json::Value::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                ProximaValue::Int64(i)
-            } else if let Some(u) = n.as_u64() {
-                ProximaValue::UInt64(u)
-            } else if let Some(f) = n.as_f64() {
-                ProximaValue::Float64(f)
-            } else {
-                ProximaValue::String(n.to_string())
-            }
-        }
-        serde_json::Value::String(v) => ProximaValue::String(v),
-        serde_json::Value::Array(values) => {
-            ProximaValue::Array(values.into_iter().map(json_to_proxima_value).collect())
-        }
-        serde_json::Value::Object(fields) => ProximaValue::Map(
-            fields
-                .into_iter()
-                .map(|(key, value)| (key, json_to_proxima_value(value)))
-                .collect(),
-        ),
     }
 }
 
@@ -1720,9 +1689,7 @@ impl EmbeddedProximaDB {
                     for (k, v) in meta_slice {
                         props.insert(
                             k.clone(),
-                            proximadb_records::ProximaTreeNode::Value(json_to_proxima_value(
-                                v.clone(),
-                            )),
+                            proximadb_records::ProximaTreeNode::Value(json_to_proxima(v)),
                         );
                     }
                 }
@@ -5055,7 +5022,7 @@ impl EmbeddedProximaDB {
 
     /// Convert serde_json::Value to SqlValue — canonical conversion in
     /// proximadb-proto (`serde_impls`). This path previously routed through
-    /// `json_to_proxima_value` + `proxima_value_to_sql_value`, whose u64
+    /// `json_to_proxima` + `proxima_value_to_sql_value`, whose u64
     /// branch silently wrapped values above i64::MAX to `Int64Value`; the
     /// canonical fn approximates those as f64 `NumberValue` instead
     /// (pinned by the proto guard test). JSON `null` also changes shape —
