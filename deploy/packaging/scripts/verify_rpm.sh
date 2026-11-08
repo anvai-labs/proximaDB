@@ -29,17 +29,63 @@ if [ "$rc" -ne 0 ] && [ -z "$devs" ]; then
     echo "rpm -V failed with rc=$rc and no verify output" >&2
     exit 1
 fi
-expected="$(printf '%s\n' "$devs" \
-    | grep -cE '^\.M\.\.\.UG\.\.[[:space:]]+/var/(lib|log)/proximadb$' || true)"
-unexpected="$(printf '%s\n' "$devs" \
-    | grep -vE '^\.M\.\.\.UG\.\.[[:space:]]+/var/(lib|log)/proximadb$' || true)"
-# Tolerating the two TD-PKG-1 deviations is not enough: REQUIRE them. A
-# %post that died before its chown (useradd failure, etc.) reports no
-# deviations at all — rpm -V clean — and the old forbid-only gate would
-# pass a package whose service user cannot write its own state dir.
-if [ "$expected" -ne 2 ] || [ -n "$unexpected" ]; then
-    echo "rpm -V deviations wrong: expected exactly the 2 TD-PKG-1 state-dir" >&2
-    echo "deviations, got expected=$expected; unexpected:" >&2
+# Derive the expected deviations FROM postinstall.sh (the source of truth
+# for the TD-PKG-1 contract) instead of hard-coding the dir list: every
+# `chown proximadb... DIR` line means rpm -V will show mode+user+group
+# deviation (chmod 750 vs the payload's 0755) for that dir on a 9-column
+# rpm-4.14 stateline: `.M...UG..`.
+expected_dirs="$(grep -E '^chown proximadb(:proximadb)? ' \
+    /pkg/deploy/packaging/scripts/postinstall.sh | awk '{print $NF}' || true)"
+if [ -z "$expected_dirs" ]; then
+    echo "no chown targets found in postinstall.sh — verifier contract broken" >&2
+    exit 1
+fi
+n_expected=0
+n_matched=0
+while IFS= read -r dir; do
+    [ -n "$dir" ] || continue
+    n_expected=$((n_expected + 1))
+    line="$(printf '%s\n' "$devs" | grep "[[:space:]]${dir}\$" || true)"
+    if [ -n "$line" ] && printf '%s' "$line" | grep -qE '^\.M\.\.\.UG\.\.'; then
+        n_matched=$((n_matched + 1))
+    else
+        echo "expected TD-PKG-1 deviation MISSING for $dir" >&2
+    fi
+done <<EOF2
+$expected_dirs
+EOF2
+# Anything in rpm -V output that is NOT one of the expected dirs fails.
+filter=""
+while IFS= read -r dir; do
+    [ -n "$dir" ] || continue
+    filter="$filter -e ${dir}\$"
+done <<EOF2
+$expected_dirs
+EOF2
+unexpected="$(printf '%s\n' "$devs" | grep -v $filter || true)"
+if [ "$n_matched" -ne "$n_expected" ] || [ -n "$unexpected" ]; then
+    echo "rpm -V deviations wrong: expected=$n_expected matched=$n_matched; unexpected:" >&2
+    printf '%s\n' "$unexpected" >&2
+    [ -z "$devs" ] || printf '%s\n' "$devs" >&2
+    exit 1
+fi
+n_expected=0
+n_matched=0
+while IFS= read -r dir; do
+    n_expected=$((n_expected + 1))
+    line="$(printf '%s\n' "$devs" | grep -E "[[:space:]]${dir}\$" || true)"
+    if [ -n "$line" ] && printf '%s' "$line" | grep -qE '^\.M\.\.\.UG\.\.'; then
+        n_matched=$((n_matched + 1))
+    else
+        echo "expected TD-PKG-1 deviation MISSING for $dir" >&2
+    fi
+done <<EOF2
+$expected_dirs
+EOF2
+unexpected="$(printf '%s\n' "$devs" | grep -vE "$(printf '%s\\n' "$expected_dirs" \
+    | sed 's|/|\\/|g; s|^|^[[:space:]]|; s|$|\$|' | paste -sd'|' -)" || true)"
+if [ "$n_matched" -ne "$n_expected" ] || [ -n "$unexpected" ]; then
+    echo "rpm -V deviations wrong: expected=$n_expected matched=$n_matched; unexpected:" >&2
     printf '%s\n' "$unexpected" >&2
     [ -z "$devs" ] || printf '%s\n' "$devs" >&2
     exit 1

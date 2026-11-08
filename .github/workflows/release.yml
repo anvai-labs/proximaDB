@@ -587,13 +587,14 @@ jobs:
           # (bash -n testable; mounted read-only via the repo checkout). It
           # installs, asserts payload/version, tolerates ONLY the two
           # by-design TD-PKG-1 state-dir deviations in rpm -V, and erases.
-          # Lint the verifier before dispatching: the last packaging-gate
-          # bug was a quoting defect only a parse would catch.
-          # TODO(TD-DOCSITE-adjacent): an actionlint/yamllint lane for
-          # release.yml itself is still missing — the deleted-upload-header
-          # parse break on this very branch reached GitHub before any local
-          # check; add it to an existing lint lane.
+          # bash -n catches PARSE errors only, not quoting/word-splitting
+          # defects (shellcheck would; no lane runs it yet).
+          # TODO(lint lane): an actionlint/yamllint+shellcheck lane for
+          # release.yml and deploy/packaging/scripts is still missing — the
+          # deleted-upload-header parse break on this very branch reached
+          # GitHub before any local check; add it to an existing lint lane.
           bash -n deploy/packaging/scripts/verify_rpm.sh
+          bash -n deploy/packaging/scripts/verify_deb.sh
           docker run --rm -v "$PWD:/pkg:ro" rockylinux:8 \
             bash /pkg/deploy/packaging/scripts/verify_rpm.sh "$VERSION"
           # %post scriptlets (systemctl daemon-reload) still report failure here because
@@ -672,22 +673,10 @@ jobs:
       - name: Verify DEB installs and runs (debian:11)
         run: |
           VERSION="${{ needs.prepare.outputs.version }}"
-          docker run --rm -e VER="$VERSION" -v "$PWD:/pkg:ro" debian:11 bash -euo pipefail -c '
-            apt-get update -qq
-            apt-get install -y -qq /pkg/proximadb_*_amd64.deb
-            test -x /usr/bin/proximadb-server
-            test -f /etc/proximadb/config.toml
-            test -f /lib/systemd/system/proximadb.service
-            # F4 symmetry with the RPM leg: dpkg -V (debian:11 ships 1.20)
-            # verifies md5sums + presence of packaged regular files and
-            # ignores dirs/ownership/modes — so the TD-PKG-1 chown needs no
-            # tolerance here, and content corruption fails pre-publish.
-            # (Mode-only defects are out of dpkg -V's reach.)
-            dpkg -V proximadb
-            got="$(/usr/bin/proximadb-server --version)"
-            test "$got" = "proximadb-server $VER"
-            dpkg -r proximadb
-            test ! -e /usr/bin/proximadb-server'
+          # Lint before dispatching (parse errors only — shellcheck for quoting).
+          bash -n deploy/packaging/scripts/verify_deb.sh
+          docker run --rm -v "$PWD:/pkg:ro" debian:11 \
+            bash /pkg/deploy/packaging/scripts/verify_deb.sh "$VERSION"
 
       - name: Upload DEB Artifact
         uses: actions/upload-artifact@v7
