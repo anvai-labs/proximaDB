@@ -583,33 +583,19 @@ jobs:
       - name: Verify RPM installs and runs (rockylinux:8)
         run: |
           VERSION="${{ needs.prepare.outputs.version }}"
-          docker run --rm -e VER="$VERSION" -v "$PWD:/pkg:ro" rockylinux:8 bash -euo pipefail -c '
-            dnf install -y /pkg/proximadb-*.rpm
-            test -x /usr/bin/proximadb-server
-            test -f /etc/proximadb/config.toml
-            test -f /usr/lib/systemd/system/proximadb.service
-            got="$(/usr/bin/proximadb-server --version)"
-            test "$got" = "proximadb-server $VER"
-            # rpm -V exits nonzero on ANY deviation. The %post scriptlet
-            # DELIBERATELY chowns/chmods the state/log dirs (TD-PKG-1 — the
-            # service user must own its own data), so exactly those two
-            # deviations are expected; anything else fails the verify.
-            devs="$(rpm -V proximadb || true)"
-            unexpected="$(printf '%s\n' "$devs" | grep -vE '^\.M\.\.\.UG\.[[:space:]]+/var/(lib|log)/proximadb$' || true)"
-            if [ -n "$unexpected" ]; then
-              echo "unexpected rpm -V deviations:"
-              echo "$unexpected"
-              exit 1
-            fi
-            rpm -e proximadb
-            test ! -e /usr/bin/proximadb-server'
+          # Verifier body lives in deploy/packaging/scripts/verify_rpm.sh
+          # (bash -n testable; mounted read-only via the repo checkout). It
+          # installs, asserts payload/version, tolerates ONLY the two
+          # by-design TD-PKG-1 state-dir deviations in rpm -V, and erases.
+          docker run --rm -e VER="$VERSION" -v "$PWD:/pkg:ro" rockylinux:8 \
+            bash -euo pipefail /pkg/deploy/packaging/scripts/verify_rpm.sh "$VERSION"
           # %post scriptlets (systemctl daemon-reload) still report failure here because
           # systemd is not PID 1 in the container; rpm treats a scriptlet failure as a
           # warning and dnf exits 0, so this step proves payload/paths/version/metadata/
           # removal - scriptlet health is covered by the post-publish distro smoke, where
           # systemd IS running.
 
-      - name: Upload RPM Artifact
+
         uses: actions/upload-artifact@v7
         with:
           name: rpm-package
@@ -685,6 +671,10 @@ jobs:
             test -x /usr/bin/proximadb-server
             test -f /etc/proximadb/config.toml
             test -f /lib/systemd/system/proximadb.service
+            # F4 symmetry with the RPM leg: dpkg -V checks file md5s/modes and
+            # ignores dirs/ownership, so the TD-PKG-1 chown needs no tolerance
+            # here — a deb payload defect must fail pre-publish, not post-release.
+            dpkg -V proximadb
             got="$(/usr/bin/proximadb-server --version)"
             test "$got" = "proximadb-server $VER"
             dpkg -r proximadb
