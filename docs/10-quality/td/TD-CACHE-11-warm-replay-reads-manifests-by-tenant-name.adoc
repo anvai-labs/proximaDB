@@ -1,7 +1,14 @@
 // Copyright (C) 2026 ProximaDB
 // SPDX-License-Identifier: Apache-2.0
 = TD-CACHE-11: Restart warm replay reads manifests by tenant NAME, but they are written by cache-scope label, so nothing is replayed
-:status: Open
+:status: Fixed (2026-11-08 — boot builds replay targets from catalog names
+resolved through `TenantStableIdResolver` (the write side's label domain),
+plus the shared scope; replay re-binds the recorded request scope via
+`instrument_with_stable_tenant`. Gate:
+`replay_finds_manifest_by_stable_id_label_and_serves_a_dram_hit`
+(mutation-verified: discovery-by-name fails the assert). A name without a
+minted stable id is not a candidate — the write side never keyed manifests
+by name.)
 :date: 2026-11-07
 :tags: [cache, warming, restart, tenant]
 

@@ -38,6 +38,24 @@ struct WarmManifest {
     entries: Vec<WarmKey>,
 }
 
+/// TD-CACHE-11: one replay candidate. The manifest LIVES at the write side's
+/// key — the recording scope's `CacheScope::label()` (the numeric stable id,
+/// or `shared`) — while the replay must RUN as the tenant it benefits (io_trace
+/// tenant name + stable id), so replayed entries key under the same request
+/// scope the recorded lookups used and the replay I/O is metered to that
+/// tenant. A catalog tenant with no minted stable id has no manifest to find
+/// (the write side never keyed manifests by tenant NAME) and is simply not a
+/// candidate.
+#[derive(Debug, Clone)]
+pub struct ReplayTarget {
+    /// Directory label the manifest was written under (`CacheScope::label()`).
+    pub manifest_label: String,
+    /// io_trace tenant NAME for metering/attribution; `None` = shared scope.
+    pub io_trace_tenant: Option<String>,
+    /// Stable id the replay scope re-binds (must match the recorded scope).
+    pub stable_id: Option<u64>,
+}
+
 /// Per-tenant manifest object URL under the DrPath manifests subprefix —
 /// fail-closed on an invalid tenant id (same recipe as
 /// `metrics::metering_writer::ksu_snapshot_object_url`).
@@ -107,20 +125,32 @@ pub async fn emit_warm_manifests(factory: &Arc<FilesystemFactory>, base_url: &st
 pub async fn replay_tenant(
     factory: &Arc<FilesystemFactory>,
     base_url: &str,
-    tenant_id: &str,
+    target: &ReplayTarget,
 ) -> (usize, usize) {
     let Some((invariants, survivor)) = crate::storage::engines::sst::core::get_warm_tier_caches()
     else {
         return (0, 0);
     };
-    let Ok(url) = manifest_url(base_url, tenant_id) else {
+    replay_target_with(factory, base_url, target, &invariants, &survivor).await
+}
+
+/// Testable core: same as [`replay_tenant`] with the caches passed in (the
+/// boot path fetches the engine-armed globals; tests install their own).
+pub(crate) async fn replay_target_with(
+    factory: &Arc<FilesystemFactory>,
+    base_url: &str,
+    target: &ReplayTarget,
+    invariants: &Arc<crate::storage::engines::sst::segment_format::SegmentInvariantsCache>,
+    survivor: &Arc<crate::storage::engines::sst::survivor_range_cache::SurvivorRangeCache>,
+) -> (usize, usize) {
+    let Ok(url) = manifest_url(base_url, &target.manifest_label) else {
         return (0, 0);
     };
     let Ok(bytes) = factory.read(&url).await else {
         return (0, 0); // no manifest = tenant wasn't hot = nothing to warm
     };
     let Ok(manifest) = serde_json::from_slice::<WarmManifest>(&bytes) else {
-        tracing::warn!(tenant_id, "warm manifest unreadable — cold start");
+        tracing::warn!(manifest_label = %target.manifest_label, "warm manifest unreadable — cold start");
         return (0, 0);
     };
     if manifest.version != WARM_MANIFEST_VERSION
@@ -129,8 +159,12 @@ pub async fn replay_tenant(
         return (0, 0); // stale/unknown — the working set has moved on
     }
 
-    let tenant_owned = tenant_id.to_string();
-    crate::observability::io_trace::instrument(Some(tenant_owned), "warm.replay", async {
+    // TD-CACHE-11: re-bind the RECORDED request scope so replayed entries land
+    // where the tenant-scoped lookups will find them. Shared manifests replay
+    // scope-less (Shared is the no-stable-id fallback), tenant manifests under
+    // instrument_with_stable_tenant — NEVER by parsing a tenant name as an id
+    // (that mis-billing was tried and reverted; see the TD).
+    let replay_scope = async {
         let mut loaded = 0usize;
         let mut prefilled = 0usize;
         let mut seen_segments = std::collections::HashSet::new();
@@ -145,7 +179,7 @@ pub async fn replay_tenant(
                 match crate::storage::engines::sst::segment_format::prefetch_segment_invariants(
                     fs.as_ref(),
                     &entry.p,
-                    &invariants,
+                    invariants,
                 )
                 .await
                 {
@@ -171,8 +205,19 @@ pub async fn replay_tenant(
             }
         }
         (loaded, prefilled)
-    })
-    .await
+    };
+    let (loaded, prefilled) = if target.stable_id.is_some() {
+        crate::observability::io_trace::instrument_with_stable_tenant(
+            target.io_trace_tenant.clone(),
+            target.stable_id,
+            "warm.replay",
+            replay_scope,
+        )
+        .await
+    } else {
+        crate::observability::io_trace::instrument(None, "warm.replay", replay_scope).await
+    };
+    (loaded, prefilled)
 }
 
 /// TD-CACHE-1 S3: order tenants for replay by cache-tier entitlement —
@@ -210,7 +255,11 @@ pub fn tier_ordered(
 /// first (S3). Tenants are derived from the catalog's collections; tenants
 /// without manifests cost one cheap negative read each. Gated by
 /// `PROXIMADB_CACHE_PREFILL` (unset/1 = on).
-pub async fn boot_warm(factory: Arc<FilesystemFactory>, base_url: String, tenants: Vec<String>) {
+pub async fn boot_warm(
+    factory: Arc<FilesystemFactory>,
+    base_url: String,
+    targets: Vec<ReplayTarget>,
+) {
     if std::env::var("PROXIMADB_CACHE_PREFILL").ok().as_deref() == Some("0") {
         tracing::info!("cache warming disabled (PROXIMADB_CACHE_PREFILL=0)");
         return;
@@ -221,32 +270,170 @@ pub async fn boot_warm(factory: Arc<FilesystemFactory>, base_url: String, tenant
         .and_then(|path| std::fs::read_to_string(&path).ok())
         .and_then(|json| proximadb_cache::TierPolicy::from_json(&json).ok());
     // TD-TENANT-3 S3: canonical-then-raw probe, so boot-warm ordering agrees
-    // with the admission floors the survivor cache resolves for the same tenant.
-    let tenants = tier_ordered(tenants, policy.as_ref(), &|t| {
-        let Some(policy) = policy.as_ref() else {
-            return crate::services::record_store::tenant_tier(t);
+    // with the admission floors the survivor cache resolves for the same
+    // tenant. Order by the replay's tenant NAME; shared targets sort last
+    // (entitled tenants must not queue behind the shared warmup).
+    let mut targets = targets;
+    targets.sort_by(|a, b| {
+        let name_of = |t: &ReplayTarget| {
+            t.io_trace_tenant
+                .clone()
+                .unwrap_or_else(|| "\u{7f}shared".to_string())
         };
-        crate::services::record_store::tenant_tier_policy_key(t, |key| policy.has_tier(key))
+        let (na, nb) = (name_of(a), name_of(b));
+        let rank = |name: &str| -> (u32, f64) {
+            let Some(policy) = policy.as_ref() else {
+                return (0, 0.0);
+            };
+            let tier = tier_key_for(name, policy);
+            policy
+                .tiers
+                .get(&tier)
+                .or_else(|| policy.tiers.get(&policy.default_tier))
+                .map(|spec| (spec.weight, spec.floor_frac))
+                .unwrap_or((0, 0.0))
+        };
+        let (wa, fa) = rank(&na);
+        let (wb, fb) = rank(&nb);
+        wb.cmp(&wa)
+            .then_with(|| fb.total_cmp(&fa))
+            .then_with(|| nb.cmp(&na))
     });
     let mut total_ranges = 0usize;
     let mut total_segments = 0usize;
-    for tenant in &tenants {
-        let (r, s) = replay_tenant(&factory, &base_url, tenant).await;
+    for target in &targets {
+        let (r, s) = replay_tenant(&factory, &base_url, target).await;
         total_ranges += r;
         total_segments += s;
     }
     if total_ranges > 0 || total_segments > 0 {
         tracing::info!(
-            tenants = tenants.len(),
+            targets = targets.len(),
             ranges = total_ranges,
             segments = total_segments,
-            "🔥 restart cache warming complete"
+            "\u{1f525} restart cache warming complete"
         );
+    }
+}
+
+/// Tier key for a replay target's tenant name (the same probe the admission
+/// floors use).
+fn tier_key_for(name: &str, policy: &proximadb_cache::TierPolicy) -> String {
+    if policy.has_tier(name) {
+        name.to_string()
+    } else {
+        crate::services::record_store::tenant_tier(name)
+            .unwrap_or_else(|| policy.default_tier.clone())
     }
 }
 
 #[cfg(test)]
 mod tests {
+    /// TD-CACHE-11 gate: a manifest written under the stable-id scope label is
+    /// FOUND by a replay target built from (name, stable id), replayed under
+    /// the SAME scope, and the replayed range is a DRAM hit for a tenant-scoped
+    /// lookup afterwards. This is the restart-warm loop end-to-end minus the
+    /// engine: emit-side keying + replay-side discovery + scope re-binding.
+    #[tokio::test]
+    async fn replay_finds_manifest_by_stable_id_label_and_serves_a_dram_hit() {
+        use crate::storage::engines::sst::core::set_warm_tier_caches;
+        use crate::storage::engines::sst::survivor_range_cache::SurvivorRangeCache;
+        use crate::storage::persistence::filesystem::FilesystemFactory;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = tmp.path().to_str().expect("utf8 tmpdir").to_string();
+        let factory = std::sync::Arc::new(FilesystemFactory::create_default().await.unwrap());
+        let base = format!("file://{tmp}");
+
+        let survivor = std::sync::Arc::new(SurvivorRangeCache::new(4 * 1024 * 1024));
+        let invariants = std::sync::Arc::new(
+            crate::storage::engines::sst::segment_format::SegmentInvariantsCache::new(
+                4 * 1024 * 1024,
+            ),
+        );
+        set_warm_tier_caches(invariants.clone(), survivor.clone());
+
+        // A real referenced range: the "segment" bytes replay will load.
+        let seg_url = format!("{base}/data/42/collections/c/segments/seg0.pax");
+        let range = vec![7_u8; 4096];
+        factory
+            .write(
+                &seg_url,
+                &range,
+                Some(proximadb_storage_filesystem_types::FileOptions {
+                    create_dirs: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("segment write");
+
+        // Emit-side shape: manifest under the STABLE-ID scope label (what
+        // `warm_set` + `manifest_url` produce), never under the tenant name.
+        let manifest = WarmManifest {
+            version: WARM_MANIFEST_VERSION,
+            created_unix: chrono::Utc::now().timestamp(),
+            entries: vec![WarmKey {
+                k: 1,
+                p: seg_url.clone(),
+                o: 0,
+                l: range.len() as u64,
+            }],
+        };
+        let url = manifest_url(&base, "42").expect("manifest url");
+        factory
+            .write(
+                &url,
+                &serde_json::to_vec(&manifest).unwrap(),
+                Some(proximadb_storage_filesystem_types::FileOptions {
+                    create_dirs: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("manifest write");
+
+        // Replay-side: the boot target built from (name, stable id) via the
+        // catalog resolver finds it under the label and replays as acme(42).
+        let target = ReplayTarget {
+            manifest_label: "42".to_string(),
+            io_trace_tenant: Some("acme".to_string()),
+            stable_id: Some(42),
+        };
+        let (loaded, _prefilled) = replay_tenant(&factory, &base, &target).await;
+        assert_eq!(loaded, 1, "the manifest's range must replay");
+
+        // THE GATE: a tenant-scoped lookup afterwards is a DRAM hit — the
+        // loader would fail if it were invoked, so an Ok proves the bytes came
+        // from the replayed cache, under the right scope.
+        crate::observability::io_trace::instrument_with_stable_tenant(
+            Some("acme".to_string()),
+            Some(42),
+            "test",
+            async {
+                let got = survivor
+                    .get_or_fetch(
+                        proximadb_cache::CacheKind::Other,
+                        &seg_url,
+                        0,
+                        range.len() as u64,
+                        || async {
+                            Err::<Vec<u8>, _>(
+                                proximadb_storage_filesystem_types::FilesystemError::NotFound(
+                                    "loader must not run: the replayed range must be a DRAM hit"
+                                        .to_string(),
+                                ),
+                            )
+                        },
+                    )
+                    .await
+                    .expect("lookup ok");
+                assert_eq!(&got[..], &range[..], "DRAM hit serves the replayed bytes");
+            },
+        )
+        .await;
+    }
+
     use super::*;
 
     /// TD-CACHE-7: the warm-manifest URL for a CLOUD base must be well-formed —
