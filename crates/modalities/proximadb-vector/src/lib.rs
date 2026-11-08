@@ -51,7 +51,7 @@ pub mod transform_index;
 pub use distance::DistanceMetric;
 
 pub use quantization::{
-    QuantizationConfig, QuantizationLevel, QuantizationType, QuantizedVectorData,
+    ProtoQuantizationType, QuantizationConfig, QuantizationLevel, QuantizedVectorData,
 };
 
 pub use index::{
