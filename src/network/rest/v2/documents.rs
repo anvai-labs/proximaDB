@@ -967,8 +967,10 @@ mod tests {
     /// develop behavior (all fields materialized to typed overlay, no blob).
     #[test]
     fn binary_ingest_gate_off_byte_identity() {
-        // Ensure gate is OFF (default)
-        std::env::remove_var("PROXIMADB_DOC_BINARY_INGEST");
+        // Ensure gate is OFF (default) — unsafe required in Rust 1.99+
+        // because env vars are process-global state.
+        // SAFETY: test-only, no other thread reads this var concurrently.
+        unsafe { std::env::remove_var("PROXIMADB_DOC_BINARY_INGEST") };
         assert!(!doc_binary_ingest_enabled());
 
         // The gate-OFF path is the existing code path — no blob prop,
@@ -981,14 +983,16 @@ mod tests {
     /// `_doc_blob` and only materialize filterable fields to the overlay.
     #[test]
     fn binary_ingest_gate_on_produces_blob() {
-        std::env::set_var("PROXIMADB_DOC_BINARY_INGEST", "1");
+        // SAFETY: test-only, no other thread reads this var concurrently.
+        unsafe { std::env::set_var("PROXIMADB_DOC_BINARY_INGEST", "1") };
         assert!(doc_binary_ingest_enabled());
 
         // Verify the blob prop name is correct
         assert_eq!(DOC_BLOB_PROP, "_doc_blob");
 
         // Clean up
-        std::env::remove_var("PROXIMADB_DOC_BINARY_INGEST");
+        // SAFETY: test-only, no other thread reads this var concurrently.
+        unsafe { std::env::remove_var("PROXIMADB_DOC_BINARY_INGEST") };
     }
 
     /// Overlay-authoritative invariant: when binary ingest is ON, filters
