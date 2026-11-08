@@ -173,18 +173,6 @@ pub(crate) async fn replay_target_with(
     let Ok(url) = manifest_url(base_url, &target.manifest_label()) else {
         return (0, 0);
     };
-    let Ok(bytes) = factory.read(&url).await else {
-        return (0, 0); // no manifest = tenant wasn't hot = nothing to warm
-    };
-    let Ok(manifest) = serde_json::from_slice::<WarmManifest>(&bytes) else {
-        tracing::warn!(manifest_label = %target.manifest_label(), "warm manifest unreadable — cold start");
-        return (0, 0);
-    };
-    if manifest.version != WARM_MANIFEST_VERSION
-        || chrono::Utc::now().timestamp() - manifest.created_unix > WARM_MANIFEST_MAX_AGE_SECS
-    {
-        return (0, 0); // stale/unknown — the working set has moved on
-    }
 
     // TD-CACHE-11: re-bind the RECORDED request scope so replayed entries land
     // where the tenant-scoped lookups will find them. Shared manifests replay
@@ -192,6 +180,24 @@ pub(crate) async fn replay_target_with(
     // instrument_with_stable_tenant — NEVER by parsing a tenant name as an id
     // (that mis-billing was tried and reverted; see the TD).
     let replay_scope = async {
+        // The manifest GET is part of the replay's cost — keep it INSIDE the
+        // io_trace scope so the one read that decides whether warming happens
+        // at all is metered/attributed like the entry loads (review round-3).
+        let Ok(bytes) = factory.read(&url).await else {
+            return (0usize, 0usize); // no manifest = tenant wasn't hot = nothing to warm
+        };
+        let manifest = match serde_json::from_slice::<WarmManifest>(&bytes) {
+            Ok(m) => m,
+            Err(_) => {
+                tracing::warn!(manifest_label = %target.manifest_label(), "warm manifest unreadable — cold start");
+                return (0usize, 0usize);
+            }
+        };
+        if manifest.version != WARM_MANIFEST_VERSION
+            || chrono::Utc::now().timestamp() - manifest.created_unix > WARM_MANIFEST_MAX_AGE_SECS
+        {
+            return (0usize, 0usize); // stale/unknown — the working set has moved on
+        }
         let mut loaded = 0usize;
         let mut prefilled = 0usize;
         let mut seen_segments = std::collections::HashSet::new();
@@ -247,37 +253,6 @@ pub(crate) async fn replay_target_with(
     (loaded, prefilled)
 }
 
-/// TD-CACHE-1 S3: order tenants for replay by cache-tier entitlement —
-/// highest `TierSpec.weight` first (ties: larger `floor_frac`, then tenant id
-/// for determinism). A contract-pinned (paid hot-tier) tenant's warmup is an
-/// entitled cost, so it must not queue behind free-tier replays on a shared
-/// boot. Unknown tenants resolve to `default_tier`; no policy ⇒ plain
-/// deterministic name order.
-pub fn tier_ordered(
-    mut tenants: Vec<String>,
-    policy: Option<&proximadb_cache::TierPolicy>,
-    tier_of: &dyn Fn(&str) -> Option<String>,
-) -> Vec<String> {
-    let rank = |tenant: &str| -> (u32, f64) {
-        let Some(policy) = policy else {
-            return (0, 0.0);
-        };
-        let tier = tier_of(tenant).unwrap_or_else(|| policy.default_tier.clone());
-        policy
-            .tiers
-            .get(&tier)
-            .or_else(|| policy.tiers.get(&policy.default_tier))
-            .map(|spec| (spec.weight, spec.floor_frac))
-            .unwrap_or((0, 0.0))
-    };
-    tenants.sort_by(|a, b| {
-        let (wa, fa) = rank(a);
-        let (wb, fb) = rank(b);
-        wb.cmp(&wa).then(fb.total_cmp(&fa)).then_with(|| a.cmp(b))
-    });
-    tenants
-}
-
 /// Boot warm task body: replay every tenant that has a manifest, hot tiers
 /// first (S3). Tenants are derived from the catalog's collections; tenants
 /// without manifests cost one cheap negative read each. Gated by
@@ -301,7 +276,7 @@ pub async fn boot_warm(
     // tenant. Rank per target ONCE (no per-comparison allocation), hottest
     // tier first (weight desc, floor desc), then ascending name — the
     // DEL-prefixed shared sentinel therefore sorts LAST (entitled tenants
-    // never queue behind the shared warmup), matching tier_ordered's
+    // never queue behind the shared warmup)
     // documented ascending order.
     let mut targets = targets;
     {
@@ -440,6 +415,36 @@ mod tests {
             replay_target_with(&factory, &base, &target, &invariants, &survivor).await;
         assert_eq!(loaded, 1, "the manifest's range must replay");
 
+        // Shared-path coverage (review round-3): the shared scope's manifest
+        // URL must validate and replay too — the whole single-tenant story
+        // rests on data/shared/_cache/warm_cache.json being readable.
+        let shared_manifest = WarmManifest {
+            version: WARM_MANIFEST_VERSION,
+            created_unix: chrono::Utc::now().timestamp(),
+            entries: manifest.entries.clone(),
+        };
+        let shared_url = manifest_url(&base, "shared").expect("shared manifest url");
+        factory
+            .write(
+                &shared_url,
+                &serde_json::to_vec(&shared_manifest).unwrap(),
+                Some(proximadb_storage_filesystem_types::FileOptions {
+                    create_dirs: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("shared manifest write");
+        let (shared_loaded, _) = replay_target_with(
+            &factory,
+            &base,
+            &ReplayTarget::shared(),
+            &invariants,
+            &survivor,
+        )
+        .await;
+        assert_eq!(shared_loaded, 1, "the shared-scope manifest must replay");
+
         // THE GATE: a tenant-scoped lookup afterwards is a DRAM hit — the
         // loader would fail if it were invoked, so an Ok proves the bytes came
         // from the replayed cache, under the right scope.
@@ -576,46 +581,6 @@ mod tests {
         assert!(gcp_eviction_imminent("TRUE\n"));
         assert!(!gcp_eviction_imminent("FALSE"));
         assert!(!gcp_eviction_imminent(""));
-    }
-
-    /// TD-CACHE-1 S3: replay order is tier weight desc, then floor desc, then
-    /// tenant id; unknown tenants rank at default tier; no policy = name order.
-    #[test]
-    fn tier_ordered_puts_hot_tiers_first() {
-        let policy = proximadb_cache::TierPolicy::from_json(
-            r#"{
-                "default_tier": "free",
-                "tiers": {
-                    "enterprise": {"weight": 8, "floor_frac": 0.5, "ceiling_frac": 1.0},
-                    "pro":        {"weight": 4, "floor_frac": 0.2, "ceiling_frac": 0.8},
-                    "free":       {"weight": 1, "floor_frac": 0.0, "ceiling_frac": 0.5}
-                }
-            }"#,
-        )
-        .unwrap();
-        let tier_of = |t: &str| -> Option<String> {
-            match t {
-                "acme" => Some("enterprise".to_string()),
-                "beta_corp" => Some("pro".to_string()),
-                _ => None, // unknown → default_tier (free)
-            }
-        };
-        let tenants = vec![
-            "zeta".to_string(),
-            "beta_corp".to_string(),
-            "alpha".to_string(),
-            "acme".to_string(),
-        ];
-        assert_eq!(
-            tier_ordered(tenants.clone(), Some(&policy), &tier_of),
-            vec!["acme", "beta_corp", "alpha", "zeta"],
-            "weight desc, unknown tenants at default tier in name order"
-        );
-        assert_eq!(
-            tier_ordered(tenants, None, &tier_of),
-            vec!["acme", "alpha", "beta_corp", "zeta"],
-            "no policy = deterministic name order"
-        );
     }
 }
 

@@ -1031,7 +1031,7 @@ impl ProximaDB {
                             .map(|meta| meta.collection)
                             .filter_map(|collection| proximadb_tenant::tenant_id_of(&collection))
                             .collect();
-                        names.insert("default".to_string());
+                        names.insert(proximadb_tenant::DEFAULT_TENANT.to_string());
                         for name in names {
                             let Some(stable_id) = resolver.stable_id_of(&name) else {
                                 tracing::debug!(
