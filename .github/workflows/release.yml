@@ -593,6 +593,7 @@ jobs:
           # missing — the deleted-upload-header parse break on this very
           # branch reached GitHub before any local check).
           bash -n deploy/packaging/scripts/verify_rpm.sh
+          bash -n deploy/packaging/scripts/verify_payload_common.sh
           # The gate's OWN selftest replays the exact v0.6.0 failure output
           # (positive fixture, no container needed) — and the NEGATIVE
           # fixtures are exercised too: the gate must REJECT a dead-%post
@@ -607,6 +608,31 @@ jobs:
           VERIFY_RPM_DEV_FIXTURE=$'.M...UG..    /var/lib/proximadb\n.M...UG..    /var/log/proximadb\n..5......    /usr/bin/proximadb-server' \
             bash deploy/packaging/scripts/verify_rpm.sh selftest \
             >/dev/null 2>&1 && { echo "FATAL: foreign-deviation fixture was ACCEPTED"; exit 1; }
+          # REHEARSE the REAL branch on the runner: stubbed dnf/rpm execute
+          # every line the container will run (this branch is otherwise
+          # exercised only AT release time — an unbound variable here once
+          # passed every fixture and would have failed the release).
+          mkdir -p /tmp/rehearse
+          cat > /tmp/rehearse/dnf <<'DNF'
+          #!/bin/bash
+          # sudo: GitHub runners are unprivileged and the payload paths are
+          # root-owned system dirs (the script asserts them at the real paths).
+          sudo mkdir -p /usr/bin /etc/proximadb /usr/lib/systemd/system
+          printf '#!/bin/sh\necho "proximadb-server $VERIFY_REHEARSE_VERSION"\n' | sudo tee /usr/bin/proximadb-server >/dev/null
+          sudo chmod +x /usr/bin/proximadb-server
+          sudo touch /etc/proximadb/config.toml /usr/lib/systemd/system/proximadb.service
+          DNF
+          cat > /tmp/rehearse/rpm <<'RPM'
+          #!/bin/bash
+          case "$1" in
+            -V) printf '.M...UG..    /var/lib/proximadb\n.M...UG..    /var/log/proximadb\n' ;;
+            -e) sudo rm -f /usr/bin/proximadb-server ;;
+          esac
+          RPM
+          chmod +x /tmp/rehearse/dnf /tmp/rehearse/rpm
+          VERIFY_REHEARSE_VERSION="$VERSION" PATH="/tmp/rehearse:$PATH" \
+            bash deploy/packaging/scripts/verify_rpm.sh "$VERSION"
+          test ! -e /usr/bin/proximadb-server
           docker run --rm -v "$PWD:/pkg:ro" rockylinux:8 \
             bash /pkg/deploy/packaging/scripts/verify_rpm.sh "$VERSION"
           # %post scriptlets (systemctl daemon-reload) still report failure here because
@@ -687,6 +713,14 @@ jobs:
           VERSION="${{ needs.prepare.outputs.version }}"
           # Lint before dispatching (parse errors only — shellcheck for quoting).
           bash -n deploy/packaging/scripts/verify_deb.sh
+          bash -n deploy/packaging/scripts/verify_payload_common.sh
+          # Selftest + negative fixture: clean dpkg -V must be ACCEPTED and
+          # printed deviations must be REJECTED (dpkg -V exits 0 even when
+          # printing — its rc is nonzero only for a not-installed package).
+          bash deploy/packaging/scripts/verify_deb.sh selftest
+          VERIFY_DEB_DEV_FIXTURE=$'??5??????    /usr/bin/proximadb-server' \
+            bash deploy/packaging/scripts/verify_deb.sh selftest \
+            >/dev/null 2>&1 && { echo "FATAL: deviating dpkg -V fixture was ACCEPTED"; exit 1; }
           docker run --rm -v "$PWD:/pkg:ro" debian:11 \
             bash /pkg/deploy/packaging/scripts/verify_deb.sh "$VERSION"
 
