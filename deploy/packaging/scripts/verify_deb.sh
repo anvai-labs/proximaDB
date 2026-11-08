@@ -18,7 +18,10 @@ test -f /lib/systemd/system/proximadb.service
 # AND it exits 0 even when deviations are printed (its rc is 1 only for a
 # not-installed package, dpkg 1.20 src/verify.c). So the gate REQUIRES
 # empty output: any printed deviation fails.
-out="$(dpkg -V proximadb)"
+# dpkg -V exits 0 while PRINTING deviations (rc=1 only for a
+# not-installed package, dpkg 1.20/1.22 src/verify.c) — capture with
+# || true so set -e never kills the diagnostics before they print.
+out="$(dpkg -V proximadb)" || true
 if [ -n "$out" ]; then
     echo "dpkg -V reported deviations:" >&2
     printf '%s\n' "$out" >&2

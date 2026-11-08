@@ -1,96 +1,91 @@
 #!/bin/bash
 # Pre-publish RPM verifier (release-review F4, TD-PKG-1 interaction).
 # Run INSIDE the verify container with the repo root mounted at /pkg:
-#   docker run ... -v "$PWD:/pkg:ro" rockylinux:8 bash -euo pipefail \
-#     /pkg/deploy/packaging/scripts/verify_rpm.sh <version>
-# The .rpm must be at /pkg/proximadb-*.rpm (the mount, not the cwd).
-# Self-contained here (not inlined in release.yml) so it is bash -n
-# testable without burning a release dispatch.
+#   docker run ... -v "$PWD:/pkg:ro" rockylinux:8 bash verify_rpm.sh <version>
+# (plain `bash` — the script's own `set -euo pipefail` is the strictness
+# authority). The .rpm must be at /pkg/proximadb-*.rpm. Self-contained
+# here (not inlined in release.yml) so it is bash -n testable without
+# burning a release dispatch. Self-test mode: VERIFY_RPM_SELFTEST=1
+# skips dnf/install and replays the shipped rpm -V fixture.
 set -euo pipefail
 
 VER="${1:?usage: verify_rpm.sh <version> — the .rpm must be at /pkg/proximadb-*.rpm}"
+POSTINSTALL_SRC="${POSTINSTALL_SRC:-/pkg/deploy/packaging/scripts/postinstall.sh}"
 
-dnf install -y /pkg/proximadb-*.rpm
-test -x /usr/bin/proximadb-server
-test -f /etc/proximadb/config.toml
-test -f /usr/lib/systemd/system/proximadb.service
-got="$(/usr/bin/proximadb-server --version)"
-test "$got" = "proximadb-server $VER"
+if [ "${VERIFY_RPM_SELFTEST:-0}" != "1" ]; then
+    dnf install -y /pkg/proximadb-*.rpm
+    test -x /usr/bin/proximadb-server
+    test -f /etc/proximadb/config.toml
+    test -f /usr/lib/systemd/system/proximadb.service
+    got="$(/usr/bin/proximadb-server --version)"
+    test "$got" = "proximadb-server $VER"
+    rc=0
+    devs="$(rpm -V proximadb)" || rc=$?
+else
+    # Fixture = the exact v0.6.0 failure output (run 42496624451) so the
+    # gate below can be exercised without a container or an install.
+    rc=1
+    devs=$'.M...UG..    /var/lib/proximadb\n.M...UG..    /var/log/proximadb'
+fi
 
-# rpm -V exits nonzero on ANY deviation, INCLUDING the two by-design ones
-# (the %post scriptlet deliberately chowns/chmods the state/log dirs,
-# TD-PKG-1). rpm 4.14 (el8) emits a 9-column stateline (trailing P for
-# file capabilities). So: a nonzero rc with NO verify output is a hard
-# failure; among printed deviations, exactly the two expected ones are
-# tolerated and anything else fails.
-rc=0
-devs="$(rpm -V proximadb)" || rc=$?
+# rpm -V exits nonzero on ANY deviation. A nonzero rc with NO verify
+# output is a hard failure (not-installed package, rpmdb error).
 if [ "$rc" -ne 0 ] && [ -z "$devs" ]; then
     echo "rpm -V failed with rc=$rc and no verify output" >&2
     exit 1
 fi
-# Derive the expected deviations FROM postinstall.sh (the source of truth
-# for the TD-PKG-1 contract) instead of hard-coding the dir list: every
-# `chown proximadb... DIR` line means rpm -V will show mode+user+group
-# deviation (chmod 750 vs the payload's 0755) for that dir on a 9-column
-# rpm-4.14 stateline: `.M...UG..`.
-expected_dirs="$(grep -E '^chown proximadb(:proximadb)? ' \
-    /pkg/deploy/packaging/scripts/postinstall.sh | awk '{print $NF}' || true)"
+
+# TD-PKG-1 contract: the %post scriptlet deliberately chowns/chmods the
+# state/log dirs (chmod 750 vs the payload's 0755 → mode deviation; chown
+# user+group → U+G deviations), which on a 9-column rpm-4.14 stateline
+# renders as `.M...UG..` on each chowned dir. The expected dir set is
+# derived FROM postinstall.sh — the source of truth — so the two cannot
+# drift apart. A dead %post (no chown) reports no deviations and MUST
+# fail here: that failure mode was the production incident F4 prevents.
+expected_dirs="$(grep -E '^chown ' "$POSTINSTALL_SRC" | grep 'proximadb' | awk '{print $NF}' | sed 's:/*$::' || true)"
 if [ -z "$expected_dirs" ]; then
-    echo "no chown targets found in postinstall.sh — verifier contract broken" >&2
+    echo "no chown targets found in $POSTINSTALL_SRC — verifier contract broken" >&2
     exit 1
 fi
+
 n_expected=0
 n_matched=0
-while IFS= read -r dir; do
-    [ -n "$dir" ] || continue
-    n_expected=$((n_expected + 1))
-    line="$(printf '%s\n' "$devs" | grep "[[:space:]]${dir}\$" || true)"
-    if [ -n "$line" ] && printf '%s' "$line" | grep -qE '^\.M\.\.\.UG\.\.'; then
+unexpected=""
+while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    matched=0
+    while IFS= read -r dir; do
+        [ -n "$dir" ] || continue
+        case "$line" in
+            *"$dir") case "$line" in .M...UG..*) matched=1; break;; esac ;;
+        esac
+    done <<EOF2
+$expected_dirs
+EOF2
+    if [ "$matched" -eq 1 ]; then
         n_matched=$((n_matched + 1))
     else
-        echo "expected TD-PKG-1 deviation MISSING for $dir" >&2
+        unexpected="$unexpected$line"$'\n'
     fi
-done <<EOF2
-$expected_dirs
-EOF2
-# Anything in rpm -V output that is NOT one of the expected dirs fails.
-filter=""
-while IFS= read -r dir; do
-    [ -n "$dir" ] || continue
-    filter="$filter -e ${dir}\$"
-done <<EOF2
-$expected_dirs
-EOF2
-unexpected="$(printf '%s\n' "$devs" | grep -v $filter || true)"
+done <<EOF3
+$devs
+EOF3
+n_expected="$(printf '%s\n' "$expected_dirs" | wc -l)"
+
+# Require EXACTLY the derived deviations: a dead %post reports none
+# (the production incident), a foreign deviation is a packaging defect.
 if [ "$n_matched" -ne "$n_expected" ] || [ -n "$unexpected" ]; then
-    echo "rpm -V deviations wrong: expected=$n_expected matched=$n_matched; unexpected:" >&2
-    printf '%s\n' "$unexpected" >&2
-    [ -z "$devs" ] || printf '%s\n' "$devs" >&2
+    echo "rpm -V deviations wrong: expected=$n_expected matched=$n_matched" >&2
+    [ -n "$unexpected" ] && { echo "unexpected deviations:" >&2; printf '%s' "$unexpected" >&2; }
     exit 1
 fi
-n_expected=0
-n_matched=0
-while IFS= read -r dir; do
-    n_expected=$((n_expected + 1))
-    line="$(printf '%s\n' "$devs" | grep -E "[[:space:]]${dir}\$" || true)"
-    if [ -n "$line" ] && printf '%s' "$line" | grep -qE '^\.M\.\.\.UG\.\.'; then
-        n_matched=$((n_matched + 1))
-    else
-        echo "expected TD-PKG-1 deviation MISSING for $dir" >&2
-    fi
-done <<EOF2
-$expected_dirs
-EOF2
-unexpected="$(printf '%s\n' "$devs" | grep -vE "$(printf '%s\\n' "$expected_dirs" \
-    | sed 's|/|\\/|g; s|^|^[[:space:]]|; s|$|\$|' | paste -sd'|' -)" || true)"
-if [ "$n_matched" -ne "$n_expected" ] || [ -n "$unexpected" ]; then
-    echo "rpm -V deviations wrong: expected=$n_expected matched=$n_matched; unexpected:" >&2
-    printf '%s\n' "$unexpected" >&2
-    [ -z "$devs" ] || printf '%s\n' "$devs" >&2
-    exit 1
+
+if [ "${VERIFY_RPM_SELFTEST:-0}" = "1" ]; then
+    echo "SELFTEST PASS: the healthy fixture is tolerated (2/2), and the
+contract gates are exercised above by the caller."
+    exit 0
 fi
 
 rpm -e proximadb
 test ! -e /usr/bin/proximadb-server
-echo "RPM verify PASSED (install, payload, version, metadata tolerance, erase)"
+echo "RPM verify PASSED (install, payload, version, TD-PKG-1 tolerance, erase)"

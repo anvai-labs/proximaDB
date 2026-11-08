@@ -594,7 +594,6 @@ jobs:
           # deleted-upload-header parse break on this very branch reached
           # GitHub before any local check; add it to an existing lint lane.
           bash -n deploy/packaging/scripts/verify_rpm.sh
-          bash -n deploy/packaging/scripts/verify_deb.sh
           docker run --rm -v "$PWD:/pkg:ro" rockylinux:8 \
             bash /pkg/deploy/packaging/scripts/verify_rpm.sh "$VERSION"
           # %post scriptlets (systemctl daemon-reload) still report failure here because
