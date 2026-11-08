@@ -588,12 +588,15 @@ jobs:
           # installs, asserts payload/version, tolerates ONLY the two
           # by-design TD-PKG-1 state-dir deviations in rpm -V, and erases.
           # bash -n catches PARSE errors only, not quoting/word-splitting
-          # defects (shellcheck would; no lane runs it yet).
-          # TODO(lint lane): an actionlint/yamllint+shellcheck lane for
-          # release.yml and deploy/packaging/scripts is still missing — the
-          # deleted-upload-header parse break on this very branch reached
-          # GitHub before any local check; add it to an existing lint lane.
+          # defects (shellcheck would; TODO: an actionlint/yamllint+shellcheck
+          # lane for release.yml and deploy/packaging/scripts is still
+          # missing — the deleted-upload-header parse break on this very
+          # branch reached GitHub before any local check).
           bash -n deploy/packaging/scripts/verify_rpm.sh
+          # The gate's OWN selftest replays the exact v0.6.0 failure output
+          # and rejects dead-%post / contract-subset / foreign-deviation
+          # fixtures — exercised on every release run, no container needed.
+          VERIFY_RPM_SELFTEST=1 bash deploy/packaging/scripts/verify_rpm.sh selftest
           docker run --rm -v "$PWD:/pkg:ro" rockylinux:8 \
             bash /pkg/deploy/packaging/scripts/verify_rpm.sh "$VERSION"
           # %post scriptlets (systemctl daemon-reload) still report failure here because

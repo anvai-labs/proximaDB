@@ -9,19 +9,22 @@ if ! id proximadb &>/dev/null; then
     echo "Created system user 'proximadb'"
 fi
 
-# TD-PKG-1: chown UNCONDITIONALLY. dpkg/rpm create the payload's
-# /var/lib/proximadb and /var/log/proximadb as root before postinst runs, so
-# the old "only when absent" guard left them root-owned and the service user
-# could not write to its own state directories.
-mkdir -p /var/lib/proximadb
-chown proximadb:proximadb /var/lib/proximadb
-chmod 750 /var/lib/proximadb
-echo "Data directory /var/lib/proximadb ready"
+# TD-PKG-1: chown UNCONDITIONALLY. dpkg/rpm create the payload's state/log
+# dirs as root before postinst runs, so the old "only when absent" guard
+# left them root-owned and the service user could not write to its own
+# state directories.
+# CHOWN_DIRS is the single source of truth for this contract: the
+# pre-publish verifiers (verify_rpm.sh / verify_deb.sh) derive the expected
+# rpm -V / dpkg -V deviations from this variable, so edits here update the
+# whole packaging contract.
+CHOWN_DIRS="/var/lib/proximadb /var/log/proximadb"
 
-mkdir -p /var/log/proximadb
-chown proximadb:proximadb /var/log/proximadb
-chmod 750 /var/log/proximadb
-echo "Log directory /var/log/proximadb ready"
+for dir in $CHOWN_DIRS; do
+    mkdir -p "$dir"
+    chown proximadb:proximadb "$dir"
+    chmod 750 "$dir"
+    echo "State dir $dir ready (owned by proximadb)"
+done
 
 # Reload systemd and enable service
 if command -v systemctl >/dev/null 2>&1; then

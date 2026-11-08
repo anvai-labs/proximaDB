@@ -12,16 +12,19 @@ apt-get install -y -qq /pkg/proximadb_*_amd64.deb
 test -x /usr/bin/proximadb-server
 test -f /etc/proximadb/config.toml
 test -f /lib/systemd/system/proximadb.service
-# F4 symmetry with the RPM leg. CAUTION: dpkg -V (debian:11 ships 1.20.x)
-# verifies md5sums + presence of packaged regular files only — no
-# dirs/ownership/modes, so the TD-PKG-1 chown needs no tolerance here —
-# AND it exits 0 even when deviations are printed (its rc is 1 only for a
-# not-installed package, dpkg 1.20 src/verify.c). So the gate REQUIRES
-# empty output: any printed deviation fails.
-# dpkg -V exits 0 while PRINTING deviations (rc=1 only for a
-# not-installed package, dpkg 1.20/1.22 src/verify.c) — capture with
-# || true so set -e never kills the diagnostics before they print.
-out="$(dpkg -V proximadb)" || true
+# F4 symmetry with the RPM leg. Two dpkg -V semantics matter (1.20/1.22
+# src/verify.c): it verifies md5sums + presence of packaged regular files
+# only (no dirs/ownership/modes — the TD-PKG-1 chown needs no tolerance),
+# and it exits 0 while PRINTING deviations (rc=1 only for a
+# not-installed package). So the gate REQUIRES empty output — but capture
+# with `|| true` AND guard the rc: a nonzero rc with NO output is a hard
+# failure (db error / not installed), exactly like the RPM leg's rc guard.
+rc=0
+out="$(dpkg -V proximadb)" || rc=$?
+if [ "$rc" -ne 0 ] && [ -z "$out" ]; then
+    echo "dpkg -V failed with rc=$rc and no verify output" >&2
+    exit 1
+fi
 if [ -n "$out" ]; then
     echo "dpkg -V reported deviations:" >&2
     printf '%s\n' "$out" >&2

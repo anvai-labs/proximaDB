@@ -3,16 +3,34 @@
 # Run INSIDE the verify container with the repo root mounted at /pkg:
 #   docker run ... -v "$PWD:/pkg:ro" rockylinux:8 bash verify_rpm.sh <version>
 # (plain `bash` — the script's own `set -euo pipefail` is the strictness
-# authority). The .rpm must be at /pkg/proximadb-*.rpm. Self-contained
-# here (not inlined in release.yml) so it is bash -n testable without
-# burning a release dispatch. Self-test mode: VERIFY_RPM_SELFTEST=1
-# skips dnf/install and replays the shipped rpm -V fixture.
+# authority). The .rpm must be at /pkg/proximadb-*.rpm. Self-test mode:
+#   VERIFY_RPM_SELFTEST=1 bash verify_rpm.sh <version>
+# runs on the HOST (no container): POSTINSTALL_SRC defaults to the
+# postinstall.sh next to this script, and the rpm -V fixture replays the
+# exact v0.6.0 failure output (run 42496624451). VERIFY_RPM_DEV_FIXTURE
+# overrides the fixture for negative-path testing.
 set -euo pipefail
 
-VER="${1:?usage: verify_rpm.sh <version> — the .rpm must be at /pkg/proximadb-*.rpm}"
-POSTINSTALL_SRC="${POSTINSTALL_SRC:-/pkg/deploy/packaging/scripts/postinstall.sh}"
+VER="${1:?usage: verify_rpm.sh <version>}"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+POSTINSTALL_SRC="${POSTINSTALL_SRC:-$SCRIPT_DIR/postinstall.sh}"
 
-if [ "${VERIFY_RPM_SELFTEST:-0}" != "1" ]; then
+# The TD-PKG-1 contract, read from its single source of truth.
+rc=0
+contract="$(grep -E '^CHOWN_DIRS=' "$POSTINSTALL_SRC")" || rc=$?
+if [ "$rc" -ne 0 ] || [ -z "$contract" ]; then
+    echo "cannot read CHOWN_DIRS from $POSTINSTALL_SRC (grep rc=$rc)" >&2
+    exit 1
+fi
+contract_dirs="${contract#CHOWN_DIRS=}"; contract_dirs="${contract_dirs//\"/}"
+
+if [ "${VERIFY_RPM_SELFTEST:-0}" = "1" ]; then
+    # Fixture = the exact v0.6.0 failure output (run 42496624451).
+    rc=1
+    # `-` (not `:-`): an explicitly EMPTY fixture is honored — it is the
+    # dead-%post simulation (rc≠0 + no output = hard failure branch).
+    devs="${VERIFY_RPM_DEV_FIXTURE-$(printf '.M...UG..    /var/lib/proximadb\n.M...UG..    /var/log/proximadb')}"
+else
     dnf install -y /pkg/proximadb-*.rpm
     test -x /usr/bin/proximadb-server
     test -f /etc/proximadb/config.toml
@@ -21,11 +39,6 @@ if [ "${VERIFY_RPM_SELFTEST:-0}" != "1" ]; then
     test "$got" = "proximadb-server $VER"
     rc=0
     devs="$(rpm -V proximadb)" || rc=$?
-else
-    # Fixture = the exact v0.6.0 failure output (run 42496624451) so the
-    # gate below can be exercised without a container or an install.
-    rc=1
-    devs=$'.M...UG..    /var/lib/proximadb\n.M...UG..    /var/log/proximadb'
 fi
 
 # rpm -V exits nonzero on ANY deviation. A nonzero rc with NO verify
@@ -35,33 +48,22 @@ if [ "$rc" -ne 0 ] && [ -z "$devs" ]; then
     exit 1
 fi
 
-# TD-PKG-1 contract: the %post scriptlet deliberately chowns/chmods the
-# state/log dirs (chmod 750 vs the payload's 0755 → mode deviation; chown
-# user+group → U+G deviations), which on a 9-column rpm-4.14 stateline
-# renders as `.M...UG..` on each chowned dir. The expected dir set is
-# derived FROM postinstall.sh — the source of truth — so the two cannot
-# drift apart. A dead %post (no chown) reports no deviations and MUST
-# fail here: that failure mode was the production incident F4 prevents.
-expected_dirs="$(grep -E '^chown ' "$POSTINSTALL_SRC" | grep 'proximadb' | awk '{print $NF}' | sed 's:/*$::' || true)"
-if [ -z "$expected_dirs" ]; then
-    echo "no chown targets found in $POSTINSTALL_SRC — verifier contract broken" >&2
-    exit 1
-fi
-
+# Gate: EVERY contract dir must appear among the deviations with the
+# TD-PKG-1 stateline (chmod 750 vs payload 0755 → M; chown user+group →
+# U+G; 9-column rpm-4.14 stateline → trailing '.'), and NOTHING else may
+# deviate. A dead %post reports no deviations and fails here — that
+# failure mode was the production incident F4 exists to prevent.
 n_expected=0
 n_matched=0
 unexpected=""
 while IFS= read -r line; do
     [ -n "$line" ] || continue
     matched=0
-    while IFS= read -r dir; do
-        [ -n "$dir" ] || continue
+    for dir in $contract_dirs; do
         case "$line" in
-            *"$dir") case "$line" in .M...UG..*) matched=1; break;; esac ;;
+            .M...UG..*"$dir") matched=1; break ;;
         esac
-    done <<EOF2
-$expected_dirs
-EOF2
+    done
     if [ "$matched" -eq 1 ]; then
         n_matched=$((n_matched + 1))
     else
@@ -70,10 +72,8 @@ EOF2
 done <<EOF3
 $devs
 EOF3
-n_expected="$(printf '%s\n' "$expected_dirs" | wc -l)"
+n_expected="$(echo $contract_dirs | wc -w)"
 
-# Require EXACTLY the derived deviations: a dead %post reports none
-# (the production incident), a foreign deviation is a packaging defect.
 if [ "$n_matched" -ne "$n_expected" ] || [ -n "$unexpected" ]; then
     echo "rpm -V deviations wrong: expected=$n_expected matched=$n_matched" >&2
     [ -n "$unexpected" ] && { echo "unexpected deviations:" >&2; printf '%s' "$unexpected" >&2; }
@@ -81,8 +81,7 @@ if [ "$n_matched" -ne "$n_expected" ] || [ -n "$unexpected" ]; then
 fi
 
 if [ "${VERIFY_RPM_SELFTEST:-0}" = "1" ]; then
-    echo "SELFTEST PASS: the healthy fixture is tolerated (2/2), and the
-contract gates are exercised above by the caller."
+    echo "SELFTEST PASS: fixture tolerated ($n_matched/$n_expected contract dirs), no foreign deviations"
     exit 0
 fi
 
