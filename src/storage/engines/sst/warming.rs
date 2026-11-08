@@ -48,12 +48,39 @@ struct WarmManifest {
 /// candidate.
 #[derive(Debug, Clone)]
 pub struct ReplayTarget {
-    /// Directory label the manifest was written under (`CacheScope::label()`).
-    pub manifest_label: String,
     /// io_trace tenant NAME for metering/attribution; `None` = shared scope.
     pub io_trace_tenant: Option<String>,
     /// Stable id the replay scope re-binds (must match the recorded scope).
+    /// `None` = the shared scope.
     pub stable_id: Option<u64>,
+}
+
+impl ReplayTarget {
+    /// A named tenant replay: the manifest label IS the stable id's rendering
+    /// (`CacheScope::label()` derives from the same id), so the invalid state
+    /// of a label disagreeing with the scope is unrepresentable.
+    pub fn tenant(name: impl Into<String>, stable_id: u64) -> Self {
+        Self {
+            io_trace_tenant: Some(name.into()),
+            stable_id: Some(stable_id),
+        }
+    }
+
+    /// The shared scope replay (scope-less io_trace).
+    pub fn shared() -> Self {
+        Self {
+            io_trace_tenant: None,
+            stable_id: None,
+        }
+    }
+
+    /// The directory label the manifest was written under
+    /// (`CacheScope::label()` of the recording scope).
+    pub fn manifest_label(&self) -> String {
+        self.stable_id
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| "shared".to_string())
+    }
 }
 
 /// Per-tenant manifest object URL under the DrPath manifests subprefix —
@@ -143,14 +170,14 @@ pub(crate) async fn replay_target_with(
     invariants: &Arc<crate::storage::engines::sst::segment_format::SegmentInvariantsCache>,
     survivor: &Arc<crate::storage::engines::sst::survivor_range_cache::SurvivorRangeCache>,
 ) -> (usize, usize) {
-    let Ok(url) = manifest_url(base_url, &target.manifest_label) else {
+    let Ok(url) = manifest_url(base_url, &target.manifest_label()) else {
         return (0, 0);
     };
     let Ok(bytes) = factory.read(&url).await else {
         return (0, 0); // no manifest = tenant wasn't hot = nothing to warm
     };
     let Ok(manifest) = serde_json::from_slice::<WarmManifest>(&bytes) else {
-        tracing::warn!(manifest_label = %target.manifest_label, "warm manifest unreadable — cold start");
+        tracing::warn!(manifest_label = %target.manifest_label(), "warm manifest unreadable — cold start");
         return (0, 0);
     };
     if manifest.version != WARM_MANIFEST_VERSION
@@ -271,18 +298,18 @@ pub async fn boot_warm(
         .and_then(|json| proximadb_cache::TierPolicy::from_json(&json).ok());
     // TD-TENANT-3 S3: canonical-then-raw probe, so boot-warm ordering agrees
     // with the admission floors the survivor cache resolves for the same
-    // tenant. Order by the replay's tenant NAME; shared targets sort last
-    // (entitled tenants must not queue behind the shared warmup).
+    // tenant. Rank per target ONCE (no per-comparison allocation), hottest
+    // tier first (weight desc, floor desc), then ascending name — the
+    // DEL-prefixed shared sentinel therefore sorts LAST (entitled tenants
+    // never queue behind the shared warmup), matching tier_ordered's
+    // documented ascending order.
     let mut targets = targets;
-    targets.sort_by(|a, b| {
-        let name_of = |t: &ReplayTarget| {
-            t.io_trace_tenant
-                .clone()
-                .unwrap_or_else(|| "\u{7f}shared".to_string())
-        };
-        let (na, nb) = (name_of(a), name_of(b));
-        let rank = |name: &str| -> (u32, f64) {
+    {
+        let rank = |t: &ReplayTarget| -> (u32, f64) {
             let Some(policy) = policy.as_ref() else {
+                return (0, 0.0);
+            };
+            let Some(name) = t.io_trace_tenant.as_deref() else {
                 return (0, 0.0);
             };
             let tier = tier_key_for(name, policy);
@@ -293,12 +320,24 @@ pub async fn boot_warm(
                 .map(|spec| (spec.weight, spec.floor_frac))
                 .unwrap_or((0, 0.0))
         };
-        let (wa, fa) = rank(&na);
-        let (wb, fb) = rank(&nb);
-        wb.cmp(&wa)
-            .then_with(|| fb.total_cmp(&fa))
-            .then_with(|| nb.cmp(&na))
-    });
+        let mut keyed: Vec<_> = targets
+            .iter()
+            .map(|t| {
+                let (w, f) = rank(t);
+                let name = t
+                    .io_trace_tenant
+                    .clone()
+                    .unwrap_or_else(|| "\u{7f}shared".to_string());
+                (w, f, name, t.clone())
+            })
+            .collect();
+        keyed.sort_by(|a, b| {
+            b.0.cmp(&a.0)
+                .then_with(|| b.1.total_cmp(&a.1))
+                .then_with(|| a.2.cmp(&b.2))
+        });
+        targets = keyed.into_iter().map(|(_, _, _, t)| t).collect();
+    }
     let mut total_ranges = 0usize;
     let mut total_segments = 0usize;
     for target in &targets {
@@ -316,15 +355,13 @@ pub async fn boot_warm(
     }
 }
 
-/// Tier key for a replay target's tenant name (the same probe the admission
-/// floors use).
+/// Tier key for a replay target's tenant name: the canonical-then-raw
+/// stamped-tier probe (`tenant_tier_policy_key`) the admission floors use —
+/// a raw commercial alias resolves to its canonical tier, a name that IS a
+/// policy tier binds directly.
 fn tier_key_for(name: &str, policy: &proximadb_cache::TierPolicy) -> String {
-    if policy.has_tier(name) {
-        name.to_string()
-    } else {
-        crate::services::record_store::tenant_tier(name)
-            .unwrap_or_else(|| policy.default_tier.clone())
-    }
+    crate::services::record_store::tenant_tier_policy_key(name, |key| policy.has_tier(key))
+        .unwrap_or_else(|| policy.default_tier.clone())
 }
 
 #[cfg(test)]
@@ -336,7 +373,6 @@ mod tests {
     /// engine: emit-side keying + replay-side discovery + scope re-binding.
     #[tokio::test]
     async fn replay_finds_manifest_by_stable_id_label_and_serves_a_dram_hit() {
-        use crate::storage::engines::sst::core::set_warm_tier_caches;
         use crate::storage::engines::sst::survivor_range_cache::SurvivorRangeCache;
         use crate::storage::persistence::filesystem::FilesystemFactory;
 
@@ -351,7 +387,11 @@ mod tests {
                 4 * 1024 * 1024,
             ),
         );
-        set_warm_tier_caches(invariants.clone(), survivor.clone());
+        // Explicit caches via replay_target_with, NOT set_warm_tier_caches:
+        // the global is a first-writer-wins OnceLock (no reset), so under an
+        // in-process runner an engine-arming test running first would silently
+        // win and this gate would exercise foreign caches. Deterministic here
+        // means passing the state in — the seam the fix added.
 
         // A real referenced range: the "segment" bytes replay will load.
         let seg_url = format!("{base}/data/42/collections/c/segments/seg0.pax");
@@ -395,12 +435,9 @@ mod tests {
 
         // Replay-side: the boot target built from (name, stable id) via the
         // catalog resolver finds it under the label and replays as acme(42).
-        let target = ReplayTarget {
-            manifest_label: "42".to_string(),
-            io_trace_tenant: Some("acme".to_string()),
-            stable_id: Some(42),
-        };
-        let (loaded, _prefilled) = replay_tenant(&factory, &base, &target).await;
+        let target = ReplayTarget::tenant("acme", 42);
+        let (loaded, _prefilled) =
+            replay_target_with(&factory, &base, &target, &invariants, &survivor).await;
         assert_eq!(loaded, 1, "the manifest's range must replay");
 
         // THE GATE: a tenant-scoped lookup afterwards is a DRAM hit — the

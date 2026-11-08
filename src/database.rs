@@ -1013,44 +1013,40 @@ impl ProximaDB {
                     // without a minted id has no manifest to find and is not a
                     // candidate.
                     use proximadb_tenant::TenantStableIdResolver;
-                    let Some(catalog_manager) = catalog_manager_for_warm.clone() else {
-                        tracing::warn!(
-                            "cache warming skipped (no catalog for stable-id resolution)"
-                        );
-                        return;
-                    };
-                    let resolver =
-                        crate::security::tenant_stable_id::CatalogTenantStableIdResolver::new(
-                            catalog_manager,
-                        );
-                    let mut names: std::collections::HashSet<String> =
+                    // The shared target needs no stable-id resolution and is
+                    // the only warm data an unstamped single-tenant deployment
+                    // can have — a missing catalog costs the tenant targets,
+                    // never the whole feature.
+                    let mut targets =
+                        vec![crate::storage::engines::sst::warming::ReplayTarget::shared()];
+                    if let Some(catalog_manager) = catalog_manager_for_warm {
+                        let resolver =
+                            crate::security::tenant_stable_id::CatalogTenantStableIdResolver::new(
+                                catalog_manager,
+                            );
+                        let mut names: std::collections::HashSet<String> =
                         crate::storage::persistence::write_ahead_log::list_collections_from_catalog()
                             .await
                             .into_iter()
                             .map(|meta| meta.collection)
                             .filter_map(|collection| proximadb_tenant::tenant_id_of(&collection))
                             .collect();
-                    names.insert("default".to_string());
-                    let mut targets = Vec::new();
-                    for name in names {
-                        let Some(stable_id) = resolver.stable_id_of(&name) else {
-                            tracing::debug!(
-                                tenant = %name,
-                                "warm replay: no stable id minted — write side never keyed manifests by name"
+                        names.insert("default".to_string());
+                        for name in names {
+                            let Some(stable_id) = resolver.stable_id_of(&name) else {
+                                tracing::debug!(
+                                    tenant = %name,
+                                    "warm replay: no stable id minted — write side never keyed manifests by name"
+                                );
+                                continue;
+                            };
+                            targets.push(
+                                crate::storage::engines::sst::warming::ReplayTarget::tenant(
+                                    name, stable_id,
+                                ),
                             );
-                            continue;
-                        };
-                        targets.push(crate::storage::engines::sst::warming::ReplayTarget {
-                            manifest_label: stable_id.to_string(),
-                            io_trace_tenant: Some(name),
-                            stable_id: Some(stable_id),
-                        });
+                        }
                     }
-                    targets.push(crate::storage::engines::sst::warming::ReplayTarget {
-                        manifest_label: "shared".to_string(),
-                        io_trace_tenant: None,
-                        stable_id: None,
-                    });
                     crate::storage::engines::sst::warming::boot_warm(factory, base_url, targets)
                         .await;
                 });
