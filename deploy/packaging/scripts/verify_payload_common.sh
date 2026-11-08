@@ -15,3 +15,20 @@ assert_version() {
     got="$(/usr/bin/proximadb-server --version)"
     test "$got" = "proximadb-server $VER"
 }
+
+# The TD-PKG-1 contract dirs, read from postinstall.sh's CHOWN_DIRS with
+# the strict parse both legs share (exactly one assignment, double-quoted
+# value). Sets CONTRACT_DIRS. $1 = the postinstall.sh path.
+read_contract_dirs() {
+    local src="${1:?usage: read_contract_dirs <postinstall.sh>}"
+    local lines
+    lines="$(grep -E '^CHOWN_DIRS=' "$src" || true)"
+    [ -n "$lines" ] || { echo "cannot read CHOWN_DIRS from $src" >&2; return 1; }
+    [ "$(printf '%s\n' "$lines" | wc -l)" -eq 1 ] || { echo "multiple CHOWN_DIRS lines in $src" >&2; return 1; }
+    case "$lines" in
+        'CHOWN_DIRS="'*'"') ;;
+        *) echo "CHOWN_DIRS must be a double-quoted assignment: $lines" >&2; return 1 ;;
+    esac
+    CONTRACT_DIRS="${lines#CHOWN_DIRS=\"}"
+    CONTRACT_DIRS="${CONTRACT_DIRS%\"}"
+}

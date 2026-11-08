@@ -21,7 +21,7 @@ POSTINSTALL_SRC="${POSTINSTALL_SRC:-$SCRIPT_DIR/postinstall.sh}"
 if [ "${1:-}" = "selftest" ]; then
     SELFTEST=1
     VER="selftest"
-    rc=0
+    rc="${VERIFY_DEB_RC_FIXTURE:-0}"
     out="${VERIFY_DEB_DEV_FIXTURE-}"
 else
     SELFTEST=0
@@ -31,9 +31,8 @@ else
     assert_common_payload /lib/systemd/system/proximadb.service
     # TD-PKG-1 asserted at the SAME depth as the RPM leg: dpkg -V is blind
     # to dirs/ownership/modes, so the contract dirs are stat-ed directly.
-    contract="$(grep -E '^CHOWN_DIRS=' "$POSTINSTALL_SRC" || true)"
-    [ -n "$contract" ] || { echo "cannot read CHOWN_DIRS from $POSTINSTALL_SRC" >&2; exit 1; }
-    contract_dirs="${contract#CHOWN_DIRS=\"}"; contract_dirs="${contract_dirs%\"}"
+    read_contract_dirs "$POSTINSTALL_SRC"
+    contract_dirs="$CONTRACT_DIRS"
     for dir in $contract_dirs; do
         owner="$(stat -c %U "$dir")"
         mode="$(stat -c %a "$dir")"

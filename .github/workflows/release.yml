@@ -598,11 +598,12 @@ jobs:
           # (positive fixture, no container needed) — and the NEGATIVE
           # fixtures are exercised too: the gate must REJECT a dead-%post
           # (clean rpm -V), a contract subset, and a foreign deviation.
-          VERIFY_RPM_SELFTEST=1 bash deploy/packaging/scripts/verify_rpm.sh selftest
+          bash deploy/packaging/scripts/verify_rpm.sh selftest
           VERIFY_RPM_DEV_FIXTURE="" bash deploy/packaging/scripts/verify_rpm.sh selftest \
             >/dev/null 2>&1 && { echo "FATAL: dead-%post fixture was ACCEPTED"; exit 1; }
-          printf 'CHOWN_DIRS="/var/lib/proximadb"\n' > /tmp/postinstall-subset.sh
-          POSTINSTALL_SRC=/tmp/postinstall-subset.sh VERIFY_RPM_SELFTEST=1 \
+          # contract-subset: default contract (2 dirs) but only ONE deviation
+          # in the fixture → n_matched(1) != n_expected(2) → gate rejects.
+          VERIFY_RPM_DEV_FIXTURE=$'.M...UG..    /var/lib/proximadb' \
             bash deploy/packaging/scripts/verify_rpm.sh selftest \
             >/dev/null 2>&1 && { echo "FATAL: contract-subset fixture was ACCEPTED"; exit 1; }
           VERIFY_RPM_DEV_FIXTURE=$'.M...UG..    /var/lib/proximadb\n.M...UG..    /var/log/proximadb\n..5......    /usr/bin/proximadb-server' \
@@ -625,7 +626,11 @@ jobs:
           cat > /tmp/rehearse/rpm <<'RPM'
           #!/bin/bash
           case "$1" in
-            -V) printf '.M...UG..    /var/lib/proximadb\n.M...UG..    /var/log/proximadb\n' ;;
+            -V) # TD-PKG-1 fixture GENERATED from the contract (postinstall.sh
+                # is in the mounted checkout) — CHOWN_DIRS edits auto-adapt.
+                dirs="$(grep -E '^CHOWN_DIRS=' /pkg/deploy/packaging/scripts/postinstall.sh || true)"
+                dirs="${dirs#CHOWN_DIRS=}"; dirs="${dirs//\"/}"
+                for d in $dirs; do printf '.M...UG..    %s\n' "$d"; done ;;
             -e) sudo rm -f /usr/bin/proximadb-server ;;
           esac
           RPM
