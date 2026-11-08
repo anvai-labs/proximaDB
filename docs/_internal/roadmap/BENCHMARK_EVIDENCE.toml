@@ -1506,8 +1506,8 @@ status = "unverified"
 asserted_in = [
   "src/network/rest/v2/documents.rs",
 ]
-bench_source = "Python bake-off script (format_bakeoff.py, not checked in — run inline)"
-bench_command = "python3 -c '... bake-off script ...'"
+bench_source = "src/network/rest/v2/documents.rs"
+bench_command = "N/A — bake-off was run inline via Python script (not checked in)"
 artifact = ""
 hardware = "Apple Silicon 10-core, 64GB RAM (aarch64-apple-darwin)"
 date = "2026-11-08"
