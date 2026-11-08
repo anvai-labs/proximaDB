@@ -1,5 +1,5 @@
 {
-  "total": 1028,
+  "total": 1027,
   "by_file": {
     "apps/proximadb-migrate/src/main.rs": 2,
     "crates/binding/proximadb-embedded/src/lib.rs": 9,
@@ -60,7 +60,6 @@
     "crates/integrations/proximadb-cdc/src/transform/schema.rs": 3,
     "crates/modalities/proximadb-graph/src/compaction.rs": 3,
     "crates/modalities/proximadb-graph/src/cypher_parser.rs": 8,
-    "crates/modalities/proximadb-graph/src/query.rs": 1,
     "crates/modalities/proximadb-observability-engine/src/alerting/engine.rs": 1,
     "crates/modalities/proximadb-observability-engine/src/query/logs.rs": 1,
     "crates/modalities/proximadb-observability-engine/src/query/mod.rs": 1,
