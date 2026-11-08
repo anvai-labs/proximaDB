@@ -1502,7 +1502,7 @@ notes = "E2E result is negative-but-true: the codec optimization is real at the 
 id = "binary_json_at_rest_savings"
 claim = "Binary document ingest (PROXIMADB_DOC_BINARY_INGEST=1) stores document metadata as a single Jsonb blob (MessagePack at rest) instead of per-field materialization. Format bake-off (2026-11-08) measured MessagePack at 69.5% of JSON text on heterogeneous mixed docs (30.5% savings) and 71.4% on homogeneous small docs (28.6% savings). Avro was measured but fails the decision threshold: 14.42x decode overhead on homogeneous docs (must be ±20% parity) and cannot encode heterogeneous/nested docs without a per-collection schema registry. MessagePack chosen as default — already the JsonbValue encoding (proto tag 8), schema-free, mixed-read-safe by construction."
 metric = "at-rest bytes/doc (MessagePack vs JSON text)"
-status = "measured"
+status = "unverified"
 asserted_in = [
   "src/network/rest/v2/documents.rs",
 ]

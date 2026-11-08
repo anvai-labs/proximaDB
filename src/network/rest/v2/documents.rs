@@ -255,7 +255,7 @@ async fn ingest_documents_inner(
         .map_err(|e| ApiError::Internal(format!("collection lookup failed: {e}")))?;
     let existing_dimension: Option<u32> = collection_config
         .as_ref()
-        .and_then(|col| col.config.as_ref().map(|c| c.dimension));
+        .map(|col| col.config.as_ref().map(|c| c.dimension).unwrap_or(0));
     let filterable_field_names: std::collections::HashSet<String> = collection_config
         .as_ref()
         .and_then(|col| col.config.as_ref())
@@ -286,6 +286,17 @@ async fn ingest_documents_inner(
             // only materialize filterable fields to the typed overlay.
             // The storage layer encodes Jsonb as MessagePack at rest (~28% savings
             // vs per-field JSON text, measured bake-off 2026-11-08).
+
+            // Reject user-supplied `_doc_blob` keys to prevent collision with
+            // the system blob prop. This is a reserved internal key.
+            if doc.metadata.contains_key(DOC_BLOB_PROP) {
+                return Err(ApiError::InvalidArgument(format!(
+                    "metadata key '{}' is reserved for binary document storage; \
+                     rename or remove it",
+                    DOC_BLOB_PROP
+                )));
+            }
+
             let blob_value = serde_json::Value::Object(
                 doc.metadata
                     .iter()
@@ -756,6 +767,11 @@ fn envelope_metadata(record: &ProximaRecord) -> HashMap<String, String> {
                 ProximaValue::UInt64(u) => u.to_string(),
                 ProximaValue::Float64(f) => f.to_string(),
                 ProximaValue::Json(j) => j.to_string(),
+                // Binary ingest blob: serialize the Jsonb value to JSON string
+                // for the string-typed envelope. Without this arm, the _doc_blob
+                // prop falls through to `_ => return None` and all non-filterable
+                // metadata is silently lost on the async queue path.
+                ProximaValue::Jsonb(j) => j.to_string(),
                 // Structured values: serialize to JSON for the string-typed envelope.
                 // The canonical json_to_proxima produces Array/Map (not Json) for
                 // nested structures, so we must handle them here to avoid silent drops.
@@ -923,8 +939,8 @@ mod tests {
         let docs = vec![
             // u64 > i64::MAX — the exactness pin
             json!({"big_num": 18446744073709551615u64, "name": "max_u64"}),
-            // f64 extremes
-            json!({"inf": f64::INFINITY, "neg_inf": f64::NEG_INFINITY, "nan_check": 1e308}),
+            // f64 extremes (large finite values — JSON spec doesn't support infinity/NaN)
+            json!({"big": 1e308, "small": -1e308, "tiny": 5e-324}),
             // Unicode
             json!({"text": "Hello 世界 🌍", "emoji": "🎉🎊"}),
             // Nested structures
