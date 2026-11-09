@@ -36,12 +36,14 @@ grep -q '^Type=simple' "$UNIT" \
   || { echo "::error::${KIND} on ${DISTRO}: unit is not Type=simple: $(grep '^Type=' "$UNIT")"; exit 1; }
 id proximadb >/dev/null 2>&1 \
   || { echo "::error::${KIND} on ${DISTRO}: package creates no proximadb user"; exit 1; }
-# TD-PKG-1: the dir list arrives via CHOWN_DIRS (derived on the invoking
-# host from postinstall.sh — the contract's single source of truth); this
-# minimal container has no repo checkout. The hardcoded list is a FALLBACK
-# only.
-CONTRACT_DIRS="${CHOWN_DIRS:-/var/lib/proximadb /var/log/proximadb}"
-for d in $CONTRACT_DIRS; do
+# TD-PKG-1: the contract ships IN the package (deploy/packaging/
+# chown_dirs.env → /etc/proximadb/chown_dirs.env) — source it here so a
+# contract edit updates this check without touching the smoke script.
+CONTRACT_FILE=/etc/proximadb/chown_dirs.env
+[ -f "$CONTRACT_FILE" ] || { echo "::error::${KIND} on ${DISTRO}: $CONTRACT_FILE missing from the package"; exit 1; }
+# shellcheck disable=SC1090  # shipped contract data
+. "$CONTRACT_FILE"
+for d in $CHOWN_DIRS; do
   [ -d "$d" ] || { echo "::error::${KIND} on ${DISTRO}: $d was not created"; exit 1; }
   owner="$(stat -c '%U:%G' "$d")"
   [ "$owner" = "proximadb:proximadb" ] \

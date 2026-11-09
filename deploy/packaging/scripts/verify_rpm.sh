@@ -9,17 +9,16 @@
 #     the container dispatch): replays the exact v0.6.0 failure output as
 #     the fixture; VERIFY_RPM_DEV_FIXTURE overrides it for negative-path
 #     testing (empty = the dead-%post simulation, which must be REJECTED).
-#   rehearse_rpm_verify.sh    (sibling script) rehearses the REAL branch
-#     on the runner with stubbed dnf/rpm.
 #
-# The TD-PKG-1 contract lives in postinstall.sh's CHOWN_DIRS (single
-# source of truth, parsed by the shared read_contract_dirs helper).
+# The TD-PKG-1 contract lives in deploy/packaging/chown_dirs.env (single
+# source of truth, parsed by the shared read_contract_dirs helper; it
+# SHIPS as /etc/proximadb/chown_dirs.env — postinstall.sh sources it and
+# verify_deb.sh stat-asserts the installed copy).
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=verify_payload_common.sh
 . "$SCRIPT_DIR/verify_payload_common.sh"
-POSTINSTALL_SRC="${POSTINSTALL_SRC:-$SCRIPT_DIR/postinstall.sh}"
 
 MODE="${1:?usage: verify_rpm.sh <version>|selftest}"
 SELFTEST=0
@@ -28,12 +27,19 @@ case "$MODE" in
     selftest) SELFTEST=1 ;;
 esac
 
-read_contract_dirs "$POSTINSTALL_SRC"
+if [ "$SELFTEST" = "1" ]; then
+    # host: read the repo contract file
+    read_contract_dirs "$SCRIPT_DIR/../chown_dirs.env"
+else
+    # container: read the SHIPPED contract file
+    read_contract_dirs /pkg/deploy/packaging/chown_dirs.env
+fi
 contract_dirs="$CONTRACT_DIRS"
 
-# rpm -V exits nonzero on ANY deviation (rc=1) — captured below. A hard
-# error (not-installed package, rpmdb error) fails via the empty-output
-# branch with its own precise message.
+# rpm -V prints deviations with rc=1 (discarded — the gate below keys on
+# the OUTPUT). A hard error (not-installed package, rpmdb error) produces
+# empty output and fails via the empty-output branch with its own
+# precise message.
 devs=""
 if [ "$SELFTEST" = "1" ]; then
     # Fixture GENERATED from the contract (CHOWN_DIRS edits cannot break
@@ -65,10 +71,10 @@ fi
 # (DESIGN NOTE: the gate mandates the deviations because CHOWN_DIRS is
 # the switch — if the payload ever sets the dirs' attrs itself and
 # postinstall drops the chown loop, CHOWN_DIRS disappears and this gate
-# requires a CLEAN rpm -V instead.)
-# REQUIRE: each contract dir has EXACTLY one TD-PKG-1 deviation (counting
-# per dir, not per line — a duplicated line cannot mask an unmatched dir),
-# and every rpm -V line maps to a contract dir (no foreign deviations).
+# requires a CLEAN rpm -V instead. Each contract dir must have EXACTLY
+# one TD-PKG-1 deviation (counted per dir, not per line — a duplicated
+# line cannot mask an unmatched dir), and the total line count must equal
+# the contract count (no foreign deviations).
 set -- $contract_dirs
 n_expected=$#
 n_matched=0
@@ -89,16 +95,16 @@ for dir in $contract_dirs; do
     case "$path" in "$dir") ;; *) echo "deviation for $dir has foreign path: $path" >&2; exit 1 ;; esac
     n_matched=$((n_matched + 1))
 done
-while IFS= read -r line; do
-    [ -n "$line" ] || continue
-    path="$(printf '%s' "$line" | sed -E 's/^[.A-Z]+ +//')"
-    known=0
-    for dir in $contract_dirs; do case "$path" in "$dir") known=1; break ;; esac; done
-    [ "$known" -eq 1 ] || { echo "unexpected deviation:" >&2; printf '%s\n' "$line" >&2; unexpected=1; }
-done <<EOF3
-$devs
-EOF3
-[ -z "$unexpected" ] || { echo "unexpected deviations present" >&2; exit 1; }
+# No foreign deviations: each contract dir was validated above to own
+# exactly one deviation line, so the TOTAL line count must equal the
+# contract count (avoids strip-and-inspect over arbitrary deviation
+# shapes — a digest '5' or 'missing' line cannot be mis-parsed here).
+total_lines="$(printf '%s\n' "$devs" | grep -c . || true)"
+[ "$total_lines" -eq "$n_expected" ] || {
+    echo "foreign/unexpected rpm -V deviations present (total=$total_lines, contract=$n_expected):" >&2
+    printf '%s\n' "$devs" >&2
+    exit 1
+}
 
 if [ "$SELFTEST" = "1" ]; then
     echo "SELFTEST PASS: fixture tolerated ($n_matched/$n_expected contract dirs), no foreign deviations"

@@ -548,6 +548,9 @@ jobs:
           mkdir -p rpm_build/var/lib/proximadb
           mkdir -p rpm_build/var/log/proximadb
           mkdir -p rpm_build/tmp
+          # TD-PKG-1 contract data file — postinstall sources it at %post
+          # time and the release smoke asserts the same dirs.
+          cp deploy/packaging/chown_dirs.env rpm_build/etc/proximadb/chown_dirs.env
 
           # Only the three binaries go to /usr/bin (the archive's README,
           # LICENSE and config/ used to land there too); config ships as
@@ -654,6 +657,8 @@ jobs:
           mkdir -p deb_build/var/log/proximadb
           mkdir -p deb_build/tmp
           mkdir -p deb_build/lib/systemd/system
+          # TD-PKG-1 contract data file (postinst sources it; smoke asserts it).
+          cp deploy/packaging/chown_dirs.env deb_build/etc/proximadb/chown_dirs.env
 
           # Only the three binaries go to /usr/bin (the archive's README,
           # LICENSE and config/ used to land there too); config ships as
@@ -697,6 +702,10 @@ jobs:
           VERIFY_DEB_DEV_FIXTURE=$'??5??????    /usr/bin/proximadb-server' \
             bash deploy/packaging/scripts/verify_deb.sh selftest \
             >/dev/null 2>&1 && { echo "FATAL: deviating dpkg -V fixture was ACCEPTED"; exit 1; }
+          # rc fixture: nonzero rc with NO output (db error / not installed)
+          # must be a HARD failure, not a silent clean verify.
+          VERIFY_DEB_RC_FIXTURE=1 bash deploy/packaging/scripts/verify_deb.sh selftest \
+            >/dev/null 2>&1 && { echo "FATAL: rc-with-no-output fixture was ACCEPTED"; exit 1; }
           docker run --rm -v "$PWD:/pkg:ro" debian:11 \
             bash /pkg/deploy/packaging/scripts/verify_deb.sh "$VERSION"
 

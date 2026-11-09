@@ -16,13 +16,15 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=verify_payload_common.sh
 . "$SCRIPT_DIR/verify_payload_common.sh"
-POSTINSTALL_SRC="${POSTINSTALL_SRC:-$SCRIPT_DIR/postinstall.sh}"
 
 if [ "${1:-}" = "selftest" ]; then
     SELFTEST=1
     VER="selftest"
     rc="${VERIFY_DEB_RC_FIXTURE:-0}"
     out="${VERIFY_DEB_DEV_FIXTURE-}"
+    # parse-exercise the repo contract file on the host (the stat gate
+    # itself needs an installed package and runs in the container only)
+    read_contract_dirs "$SCRIPT_DIR/../chown_dirs.env"
 else
     SELFTEST=0
     VER="${1:?real-branch usage: verify_deb.sh <version>}"
@@ -32,7 +34,7 @@ else
     # TD-PKG-1 asserted at the SAME depth as the RPM leg via the SHARED
     # helper (dpkg -V is blind to dirs/ownership/modes, so the contract
     # dirs are stat-ed directly — owner, group, and mode).
-    assert_td_pkg1_dirs "$POSTINSTALL_SRC"
+    assert_td_pkg1_dirs /etc/proximadb/chown_dirs.env
     assert_version
     # Two dpkg -V semantics (verified on debian:11 / dpkg 1.20; re-pin at
     # each debian bump): deviations print to stdout with rc=0, and
