@@ -3284,12 +3284,42 @@ export interface components {
             enabled?: boolean | null;
             /** @description Strategy: "smart_defaults" (default) | "minimal" | "aggressive" | "custom_levels". */
             strategy?: string | null;
+            /**
+             * @description Concrete level configuration (sent when strategy is "custom_levels"):
+             *     the quantization method + its parameters. Without this, a
+             *     custom_levels strategy carries no actual levels and the server
+             *     applies smart defaults — the SDK's concrete type (scalar/pq/binary)
+             *     and params silently never reached the engine (the #2473-review
+             *     silent-drop).
+             */
+            custom_levels?: components["schemas"]["QuantizationLevelInput"][] | null;
         };
         /** @description REST output for quantization config (mirrors gRPC `V2QuantizationConfig`). */
         QuantizationConfigOutput: {
             enabled: boolean;
             /** @description Strategy label, e.g. "smart_defaults" | "minimal" | "aggressive". */
             strategy: string;
+        };
+        /**
+         * @description REST input for one quantization level (mirrors proto `QuantizationLevel`'s
+         *     core fields; the advanced calibration fields stay server-defaulted).
+         */
+        QuantizationLevelInput: {
+            /**
+             * @description Quantization method: "scalar" | "product" | "binary" | "uniform" | "none"
+             *     (proto `quantization_level::QuantizationType` names, lowercase).
+             */
+            quantization_type: string;
+            /**
+             * Format: int32
+             * @description Bits per vector element (8 for INT8, 4/8 for PQ sub-quantizers).
+             */
+            bits?: number | null;
+            /**
+             * Format: int32
+             * @description Number of sub-vectors for product quantization.
+             */
+            num_subvectors?: number | null;
         };
         /** @enum {string} */
         QueryLanguage: "uql" | "aql" | "federated";

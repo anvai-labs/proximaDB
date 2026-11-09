@@ -428,6 +428,29 @@ pub struct QuantizationConfigInput {
     pub enabled: Option<bool>,
     /// Strategy: "smart_defaults" (default) | "minimal" | "aggressive" | "custom_levels".
     pub strategy: Option<String>,
+    /// Concrete level configuration (sent when strategy is "custom_levels"):
+    /// the quantization method + its parameters. Without this, a
+    /// custom_levels strategy carries no actual levels and the server
+    /// applies smart defaults — the SDK's concrete type (scalar/pq/binary)
+    /// and params silently never reached the engine (the #2473-review
+    /// silent-drop).
+    pub custom_levels: Option<Vec<QuantizationLevelInput>>,
+}
+
+/// REST input for one quantization level (mirrors proto `QuantizationLevel`'s
+/// core fields; the advanced calibration fields stay server-defaulted).
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct QuantizationLevelInput {
+    /// Quantization method: "scalar" | "product" | "binary" | "uniform" | "none"
+    /// (proto `quantization_level::QuantizationType` names, lowercase).
+    pub quantization_type: String,
+    /// Bits per vector element (8 for INT8, 4/8 for PQ sub-quantizers).
+    #[serde(default)]
+    pub bits: Option<u32>,
+    /// Number of sub-vectors for product quantization.
+    #[serde(default)]
+    pub num_subvectors: Option<u32>,
 }
 
 /// REST input for HNSW index params (mirrors proto `HnswConfig`).
@@ -932,28 +955,76 @@ async fn create_collection_v2_checked(
     // gRPC-v2 parity: map the optional quantization config onto the proto.
     // TD-RESTGET-1: an unknown strategy is a 400 naming the valid ones; it used
     // to be silently replaced by SMART_DEFAULTS.
-    let quantization = match request.quantization.take() {
-        None => None,
-        Some(q) => {
-            use crate::proto::proximadb_v1::{QuantizationConfig, quantization_config::Strategy};
-            let strategy = match q.strategy {
-                None => None,
-                Some(s) => Some(Strategy::from_str_name(&s.to_ascii_uppercase()).ok_or_else(
-                    || {
-                        ApiError::InvalidArgument(format!(
-                            "quantization.strategy '{s}' is not one of smart_defaults, \
+    let quantization =
+        match request.quantization.take() {
+            None => None,
+            Some(q) => {
+                use crate::proto::proximadb_v1::{
+                    QuantizationConfig, quantization_config::Strategy,
+                };
+                let strategy = match q.strategy {
+                    None => None,
+                    Some(s) => Some(Strategy::from_str_name(&s.to_ascii_uppercase()).ok_or_else(
+                        || {
+                            ApiError::InvalidArgument(format!(
+                                "quantization.strategy '{s}' is not one of smart_defaults, \
                              custom_levels, minimal, aggressive"
-                        ))
-                    },
-                )? as i32),
-            };
-            Some(QuantizationConfig {
+                            ))
+                        },
+                    )? as i32),
+                };
+                Some(QuantizationConfig {
                 enabled: q.enabled,
                 strategy,
+                custom_levels: q
+                    .custom_levels
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(
+                        |level| -> Result<crate::proto::proximadb_v1::QuantizationLevel, ApiError> {
+                            use crate::proto::proximadb_v1::quantization_level::QuantizationType;
+                            let qt = QuantizationType::from_str_name(
+                                &level.quantization_type.to_ascii_uppercase(),
+                            )
+                            .filter(|t| {
+                                // uniform/none are proto-valid but engine-
+                                // unexecutable (smart_defaults' validate_level
+                                // rejects them; the write-time quantizer maps
+                                // them to empty data) — reject at the API
+                                // boundary rather than silent no-op (LOW-8).
+                                !matches!(t, QuantizationType::Uniform | QuantizationType::None)
+                            })
+                            .ok_or_else(|| {
+                                ApiError::InvalidArgument(format!(
+                                    "quantization.custom_levels[].quantization_type '{}' is not \
+                                     one of scalar, product, binary",
+                                    level.quantization_type
+                                ))
+                            })? as i32;
+                            Ok(crate::proto::proximadb_v1::QuantizationLevel {
+                                // The query path filters levels by exact
+                                // level_id strings (query_preprocessing
+                                // matches "binary"/"int8"/"pq4"/"pq8") — an
+                                // empty id silently drops the level there
+                                // (review MEDIUM-4). Generate from the name.
+                                level_id: QuantizationType::try_from(qt)
+                                    .map(|t| t.as_str_name().to_lowercase())
+                                    .unwrap_or_default(),
+                                r#type: qt,
+                                // Binary is 1 bit/element; others 8 (LOW-7).
+                                bits: level.bits.unwrap_or(
+                                    if qt == QuantizationType::Binary as i32 { 1 } else { 8 },
+                                ),
+                                num_subvectors: level.num_subvectors.unwrap_or(8),
+                                ..Default::default()
+                            })
+                        },
+                    )
+                    .collect::<Result<Vec<_>, _>>()?,
                 ..Default::default()
             })
-        }
-    };
+            }
+        };
 
     // TD-TIER-1 SC1: parse + validate the desired storage class (fail-closed
     // on unknown strings — the TD-RESTGET-1 failure mode is a silent default).

@@ -266,6 +266,7 @@ from .proxima_record_input import ProximaRecordInput
 from .proxima_record_input_props_type_0 import ProximaRecordInputPropsType0
 from .quantization_config_input import QuantizationConfigInput
 from .quantization_config_output import QuantizationConfigOutput
+from .quantization_level_input import QuantizationLevelInput
 from .query_language import QueryLanguage
 from .query_logs_body import QueryLogsBody
 from .query_logs_response_200 import QueryLogsResponse200
@@ -603,6 +604,7 @@ __all__ = (
     "ProximaRecordInputPropsType0",
     "QuantizationConfigInput",
     "QuantizationConfigOutput",
+    "QuantizationLevelInput",
     "QueryLanguage",
     "QueryLogsBody",
     "QueryLogsResponse200",
