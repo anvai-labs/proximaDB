@@ -1,5 +1,5 @@
 {
-  "total": 1027,
+  "total": 1026,
   "by_file": {
     "apps/proximadb-migrate/src/main.rs": 2,
     "crates/binding/proximadb-embedded/src/lib.rs": 9,
@@ -92,7 +92,6 @@
     "crates/query/proximadb-uql/src/decomposition.rs": 2,
     "crates/query/proximadb-uql/src/uql.rs": 2,
     "crates/storage/proximadb-engine-core/src/ops_compression/compression_adapter.rs": 1,
-    "crates/storage/proximadb-engine-core/src/ops_compression/proxima_tensor_encoding.rs": 1,
     "crates/storage/proximadb-engine-core/src/parquet_write_engine/bloom_filter_builder.rs": 1,
     "crates/storage/proximadb-engine-core/src/parquet_write_engine/streaming_writer.rs": 3,
     "crates/storage/proximadb-engine-core/src/proximablocks/arrow_reader.rs": 1,

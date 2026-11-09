@@ -30,7 +30,6 @@ use crate::index::axis::{AxisVectorIndex, IndexAlgorithm as AxisIndexAlgorithm, 
 use crate::services::operations::vectors::VectorOperationsService;
 
 // Type aliases for compatibility
-pub type VectorSearchQuery = SearchQuery;
 pub type VectorSearchResult = crate::core::service_types::VectorSearchResult;
 pub type SearchParameters = VectorSearchConfig;
 

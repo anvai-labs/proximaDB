@@ -33,3 +33,10 @@ dependency in the compression path.
   deferred (filesystem-factory refs) — phase-7 candidates as planned.
   `ops/` is reduced to `mod.rs` + `performance_optimization.rs` + `zero_copy_reader_integration.rs`
   (both phase-7 port-swap candidates).
+
+* Resolved for proxima_tensor_encoding (2026-11-08): the module is DELETED — every
+  pub item (sparse/quantized tensor codecs, transposes, the format chooser) had zero
+  non-test consumers since extraction; its QuantizationType was one of the duplicated
+  method-axis vocabularies retired by the quantization rationalization. The other
+  ops_compression modules (compression_adapter, compression_common, simd_config) keep
+  their consumers and stay.

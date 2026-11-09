@@ -149,9 +149,6 @@ impl ExternalTableScanner {
     }
 }
 
-/// Backwards-compat alias for [`ExternalTableStatistics`].
-pub type TableStatistics = ExternalTableStatistics;
-
 #[derive(Debug, Clone, Default)]
 pub struct ExternalTableStatistics {
     pub row_count: u64,

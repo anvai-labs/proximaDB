@@ -5,5 +5,4 @@
 
 pub mod compression_adapter;
 pub mod compression_common;
-pub mod proxima_tensor_encoding;
 pub mod simd_config;
