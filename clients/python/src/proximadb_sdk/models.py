@@ -1515,6 +1515,24 @@ class BatchResult(BaseModel):
     inserted_ids: list[str] = Field(default_factory=list)
 
 
+def format_insert_errors(errors: list) -> list[str]:
+    """Flatten the server's InsertError entries into human-readable strings.
+
+    The v2 REST/gRPC insert responses serialize per-record failures as
+    structured InsertError objects ({index, id, error}); BatchResult.errors
+    is list[str]. Null-safe on the error message (the only message channel;
+    index/id are already nullable). Shared by the sync/async/gRPC paths so
+    one server shape renders identically everywhere (TD-SDK-3 lesson).
+    """
+    out: list[str] = []
+    for e in errors or []:
+        if isinstance(e, dict):
+            out.append(str(e.get("error") or e))
+        else:
+            out.append(str(e))
+    return out
+
+
 def resolve_vector_ids(
     result: "BatchResult",
     records: list,

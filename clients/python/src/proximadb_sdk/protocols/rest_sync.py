@@ -1505,10 +1505,8 @@ class ProximaDBClient:
         # InsertError objects ({index, id, error}); BatchResult.errors is
         # list[str], so coerce (a raw dict would crash pydantic validation
         # on any partial-failure response).
-        errors = [
-            e.get("error", str(e)) if isinstance(e, dict) else str(e)
-            for e in (response_data.get("errors", []) or [])
-        ]
+        from proximadb_sdk.models import format_insert_errors
+        errors = format_insert_errors(response_data.get("errors", []))
         return BatchResult(
             total=total_count,
             success=inserted_count,
