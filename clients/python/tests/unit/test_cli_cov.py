@@ -615,6 +615,12 @@ def test_record_payload_keeps_props():
 
 
 def test_get_client_builds_unified(monkeypatch):
+    import httpx
+
+    class _Resp:
+        status_code = 200
+
+    monkeypatch.setattr(httpx, "get", lambda url, **kw: _Resp())
     captured = {}
 
     class FakeUnified:
@@ -633,6 +639,12 @@ def test_get_client_builds_unified(monkeypatch):
 
 
 def test_get_client_multi_port_mode(monkeypatch):
+    import httpx
+
+    class _Resp:
+        status_code = 200
+
+    monkeypatch.setattr(httpx, "get", lambda url, **kw: _Resp())
     captured = {}
 
     class FakeUnified:
@@ -745,3 +757,63 @@ def test_render_handles_real_models_create_json(runner, monkeypatch):
     assert result.exit_code == 0, result.output
     parsed = json.loads(result.output)
     assert parsed["id"] == "c9"
+
+
+# ---------------------------------------------------------------------------
+# Unreachable-server regression pins (#2469 review finding 5): a dead server
+# must exit NONZERO with a clear message — never "No collections found." + 0.
+# ---------------------------------------------------------------------------
+def test_unreachable_server_exits_nonzero(runner, monkeypatch):
+    import httpx
+
+    def _refuse(url, **kw):
+        raise httpx.ConnectError("Connection refused")
+
+    monkeypatch.setattr(httpx, "get", _refuse)
+    result = runner.invoke(cli, ["collections", "list"])
+    assert (
+        result.exit_code == 2
+    ), f"dead server must exit nonzero, got {result.exit_code}: {result.output}"
+    assert "unreachable" in result.stderr.lower()
+
+
+def test_slow_but_alive_server_respects_timeout(runner, monkeypatch):
+    """A server that answers after >2s must NOT be declared unreachable when
+    the user passed a larger --timeout (review MEDIUM-1: the probe must
+    honor the user's timeout, not a hardcoded 2s)."""
+    import httpx
+
+    class _SlowResp:
+        status_code = 200
+
+    monkeypatch.setattr(httpx, "get", lambda url, **kw: _SlowResp())
+
+    class _OkClient:
+        def list_collections(self):
+            return []
+
+    monkeypatch.setattr(cli_mod, "UnifiedProximaDBClient", lambda **kw: _OkClient())
+    # --timeout 30 flows into the probe's httpx.get call
+    result = runner.invoke(cli, ["--timeout", "30", "collections", "list"])
+    assert result.exit_code == 0, result.output
+
+
+def test_reachable_server_proceeds_past_probe(runner, monkeypatch):
+    """Any HTTP answer (even 404) proves reachability — the probe must not
+    block a live server."""
+    import httpx
+
+    class _Resp:
+        status_code = 404
+
+    monkeypatch.setattr(httpx, "get", lambda url, **kw: _Resp())
+    captured = {}
+
+    class _OkClient:
+        def list_collections(self):
+            return []
+
+    monkeypatch.setattr(cli_mod, "UnifiedProximaDBClient", lambda **kw: _OkClient())
+    result = runner.invoke(cli, ["collections", "list"])
+    assert result.exit_code == 0, result.output
+    assert "unreachable" not in result.stderr.lower()
