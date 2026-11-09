@@ -295,9 +295,13 @@ async fn ingest_documents_inner(
                 )));
             }
 
+            // Lazy materialization: store only NON-indexed fields in the blob.
+            // Indexed fields live only in the typed overlay — no duplication.
+            // This saves storage proportional to indexed/total field ratio.
             let blob_value = serde_json::Value::Object(
                 doc.metadata
                     .iter()
+                    .filter(|(k, _)| !filterable_field_names.contains(*k))
                     .map(|(k, v)| (k.clone(), v.clone()))
                     .collect(),
             );
@@ -305,8 +309,8 @@ async fn ingest_documents_inner(
                 DOC_BLOB_PROP.to_string(),
                 ProximaTreeNode::Value(ProximaValue::Jsonb(blob_value)),
             );
-            // Only materialize filterable fields to the typed overlay.
-            // Non-indexed fields live only in the blob — O(indexed) write cost.
+            // Materialize filterable fields to the typed overlay.
+            // These are the ONLY indexed fields — filters hit the overlay directly.
             for (k, v) in doc.metadata.iter() {
                 if filterable_field_names.contains(k) {
                     props.insert(k.clone(), ProximaTreeNode::Value(json_to_proxima(v)));

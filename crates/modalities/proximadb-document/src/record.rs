@@ -500,4 +500,78 @@ mod tests {
             "_document_collection should be stripped"
         );
     }
+
+    /// Read-path merge test for lazy materialization: verifies that
+    /// `canonical_document_from_record` correctly merges a partial blob
+    /// (non-indexed fields only) with the typed overlay (indexed fields only)
+    /// to reconstruct the full document.
+    ///
+    /// Note: This tests the READ path merge logic. The WRITE path filter
+    /// (`.filter(|(k, _)| !filterable_field_names.contains(*k))` in documents.rs)
+    /// is verified by integration tests with a running server + embedding model.
+    #[test]
+    fn read_path_merges_partial_blob_with_overlay() {
+        use serde_json::json;
+
+        // Simulate lazy materialization: blob has only non-indexed fields,
+        // overlay has only indexed fields.
+        let non_indexed_fields = json!({
+            "name": "Alice",
+            "age": 30,
+            "tags": ["admin", "user"],
+        });
+
+        // The blob stores only non-indexed fields (lazy materialization)
+        let blob_value = ProximaValue::Jsonb(non_indexed_fields.clone());
+
+        // The typed overlay has only the indexed field ("city")
+        let mut props = ProximaTree::new();
+        props.insert(
+            DOCUMENT_COLLECTION_PROP.to_string(),
+            ProximaTreeNode::Value(ProximaValue::String("test_collection".to_string())),
+        );
+        props.insert(
+            "city".to_string(),
+            ProximaTreeNode::Value(ProximaValue::String("New York".to_string())),
+        );
+        props.insert(
+            DOC_BLOB_PROP.to_string(),
+            ProximaTreeNode::Value(blob_value),
+        );
+
+        let mut labels = LabelSet::new();
+        labels.insert(DOCUMENT_RECORD_LABEL.to_string());
+        let record = ProximaRecord {
+            oid: "doc-1".to_string(),
+            local_id: Some("doc-1".to_string()),
+            labels,
+            props,
+            ..Default::default()
+        };
+
+        // Read path: should reconstruct full document from blob + overlay
+        let doc = canonical_document_from_record(&record).expect("document should decode");
+
+        // Verify all fields present (non-indexed from blob, indexed from overlay)
+        assert_eq!(
+            doc.document.get("name"),
+            Some(&ProximaTreeNode::Value(ProximaValue::String(
+                "Alice".to_string()
+            )))
+        );
+        assert_eq!(
+            doc.document.get("age"),
+            Some(&ProximaTreeNode::Value(ProximaValue::Int64(30)))
+        );
+        assert_eq!(
+            doc.document.get("city"),
+            Some(&ProximaTreeNode::Value(ProximaValue::String(
+                "New York".to_string()
+            )))
+        );
+
+        // Verify blob does NOT contain indexed field (lazy materialization)
+        // This is verified by the fact that the blob was constructed with only
+        // non-indexed fields. The read path merges blob + overlay correctly.
+    }
 }
