@@ -386,7 +386,8 @@ def test_insert_vectors_autogenerates_ids(monkeypatch):
     res = c.insert_vectors("cid", [[1.0, 2.0], [3.0, 4.0]])
     assert res.success == 2
     rec_ids = [r["id"] for r in _last(c)[2]["json"]["records"]]
-    assert rec_ids == ["record_0", "record_1"]
+    assert len(rec_ids) == 2 and all(_is_uuid(r) for r in rec_ids)
+    assert rec_ids[0] != rec_ids[1]
 
 
 def test_insert_vectors_dict_records(monkeypatch):
@@ -955,3 +956,13 @@ def test_update_vector_empty_vector_list_when_none_metadata(monkeypatch):
     # vector provided but metadata None -> props {} path
     res = c.update_vector("cid", "v1", vector=[1.0, 2.0])
     assert res.success == 1
+
+
+def _is_uuid(value):
+    """Default record ids are UUID4s (an index-based default overwrote)."""
+    import uuid
+
+    try:
+        return str(uuid.UUID(str(value))) == str(value)
+    except ValueError:
+        return False

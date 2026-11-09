@@ -11,6 +11,7 @@ from urllib.parse import urljoin, urlparse
 import grpc
 import requests
 
+from ._record_ids import new_record_id
 from .exceptions import NetworkError, ProximaDBError
 from .models import (
     Collection,
@@ -358,7 +359,7 @@ class ProximaDBClientV1:
             payload = dict(record)
             if "props" not in payload and "metadata" in payload:
                 payload["props"] = payload.pop("metadata")
-            payload.setdefault("id", payload.get("oid") or f"record_{index}")
+            payload.setdefault("id", payload.get("oid") or new_record_id())
             # `oid` is a client-side seeding value, not a contract field —
             # drop it once it has seeded `id`. Other unknown keys are left
             # IN deliberately: the server's deny_unknown_fields (TD-REC-1)
@@ -370,7 +371,7 @@ class ProximaDBClientV1:
             return payload
 
         payload = {
-            "id": record.id or f"record_{index}",
+            "id": record.id or new_record_id(),
             "vector": record.vector,
             "props": record.metadata or {},
         }

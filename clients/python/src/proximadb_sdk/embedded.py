@@ -71,6 +71,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional, Protocol, runtime_checkable
 
+from ._record_ids import new_record_id
+
 # Socket file names MUST match the Rust constants in
 # crates/platform/proximadb-runtime/src/bootstrap_config.rs.
 UDS_REST_SOCKET_NAME = "rest.sock"
@@ -1590,7 +1592,7 @@ prefetch_budget = 4
                     props[str(key)] = self._to_proxima_value(typed_value)
 
         payload = {
-            "id": record.get("id") or record.get("oid") or f"record_{index}",
+            "id": record.get("id") or record.get("oid") or new_record_id(),
             "vector": [float(v) for v in vector],
             "props": props,
         }

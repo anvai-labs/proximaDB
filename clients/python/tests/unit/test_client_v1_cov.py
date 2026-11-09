@@ -321,7 +321,7 @@ def test_insert_records_rest_no_id_fallback(rest_client, monkeypatch):
     )
     rec = VectorRecord(vector=[1.0])
     rest_client.insert_records("col", [rec])
-    assert captured["json"]["records"][0]["id"] == "record_0"
+    assert _is_uuid(captured["json"]["records"][0]["id"])
 
 
 def test_insert_records_rest_network_error(rest_client, monkeypatch):
@@ -960,3 +960,13 @@ def test_convert_search_result_from_proto(rest_client):
     assert out["id"] == "r1"
     assert out["score"] == pytest.approx(0.7)
     assert out["vector"] == [pytest.approx(0.1)]
+
+
+def _is_uuid(value):
+    """Default record ids are UUID4s (an index-based default overwrote)."""
+    import uuid
+
+    try:
+        return str(uuid.UUID(str(value))) == str(value)
+    except ValueError:
+        return False

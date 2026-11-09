@@ -1531,7 +1531,7 @@ def test_record_payload_from_legacy_input_dict_and_record():
     c = make_client()
     payload = c._record_payload_from_legacy_input({"metadata": {"a": 1}}, 0)
     assert payload["props"] == {"a": 1}
-    assert payload["id"] == "record_0"
+    assert _is_uuid(payload["id"])
     rec = VectorRecord(id="r1", vector=[1.0, 2.0], metadata={"k": "v"}, source="src")
     payload2 = c._record_payload_from_legacy_input(rec, 1)
     assert payload2["id"] == "r1"
@@ -3169,3 +3169,26 @@ def test_logout_with_auth():
     assert c.logout() is True
     auth.logout.side_effect = RuntimeError("x")
     assert c.logout() is False
+
+
+def _is_uuid(value):
+    """Default record ids are UUID4s (an index-based default overwrote)."""
+    import uuid
+
+    try:
+        return str(uuid.UUID(str(value))) == str(value)
+    except ValueError:
+        return False
+
+
+def test_idless_inserts_get_distinct_ids_across_calls():
+    """The overwrite bug: two separate ID-less writes both defaulted to
+    `record_0` (batch index), so the second replaced the first. Each call
+    must now mint its own id; an explicit id is kept as given."""
+    client = make_client()
+    first = client._record_payload_from_legacy_input({"vector": [1.0]}, 0)
+    second = client._record_payload_from_legacy_input({"vector": [2.0]}, 0)
+    assert _is_uuid(first["id"]) and _is_uuid(second["id"])
+    assert first["id"] != second["id"]
+    kept = client._record_payload_from_legacy_input({"id": "mine", "vector": [1.0]}, 0)
+    assert kept["id"] == "mine"

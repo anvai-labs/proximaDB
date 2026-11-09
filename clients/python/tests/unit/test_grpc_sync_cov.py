@@ -367,7 +367,7 @@ def test_normalize_vector_alias_records_variants(client):
     assert out[1]["id"] == "b"
     assert out[2]["id"] == "md"
     assert out[3]["id"] == "dd"
-    assert out[4]["id"] == "record_4"
+    assert _is_uuid(out[4]["id"])
     assert out[4]["vector"] == [0.5, 0.6]
 
 
@@ -1108,3 +1108,13 @@ def test_convert_path_from_proto(client):
 
     assert client._convert_path_from_proto(FakePath()) == ["n1", "n2"]
     assert client._convert_path_from_proto(object()) == []
+
+
+def _is_uuid(value):
+    """Default record ids are UUID4s (an index-based default overwrote)."""
+    import uuid
+
+    try:
+        return str(uuid.UUID(str(value))) == str(value)
+    except ValueError:
+        return False
