@@ -869,10 +869,13 @@ pub async fn write_back_merge(
     // Tag every merged record with origin = "branch_merge:<a>:<b>" so the
     // canonical WAL identifies the write as a branch-merge resolution (per
     // ADR-012 §3 step 6 / T3.1 Slice 6 plan spec).
+    // TD-SEAM-12 follow-up: also clear branch_id so the source branch can close.
+    // Without this, the truncator's branch floor never advances past merged entries.
     let merge_origin = format!("branch_merge:{}:{}", branch_a, branch_b);
     let stamp_origin = |record: &proximadb_records::ProximaRecord| {
         let mut cloned = record.clone();
         cloned.origin = Some(merge_origin.clone());
+        cloned.branch_id = None; // Clear branch_id so the source branch can close
         Box::new(cloned)
     };
 
@@ -925,6 +928,7 @@ pub async fn write_back_merge(
                         &right_labels,
                     ));
                     merged_rec.origin = Some(merge_origin.clone());
+                    merged_rec.branch_id = None; // TD-SEAM-12: clear so source branch can close
                     operations.push(CanonicalOperation::RecordUpsert {
                         collection_id: collection_id.to_string(),
                         record: Box::new(merged_rec),
@@ -1674,6 +1678,12 @@ mod tests {
                         record.origin.as_deref(),
                         Some("branch_merge:a:b"),
                         "every merged record must carry the branch-merge origin"
+                    );
+                    // TD-SEAM-12: branch_id must be cleared so the source branch can close
+                    assert!(
+                        record.branch_id.is_none(),
+                        "merged records must have branch_id = None (was {:?})",
+                        record.branch_id
                     );
                 }
                 other => panic!("expected RecordUpsert, got {:?}", other),
