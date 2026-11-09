@@ -19,7 +19,6 @@ pub mod parquet_reconstructor;
 pub use crate::storage::engines::core::formats::columnar::{
     CollectionContext,
     FilterValue,
-    QuantizationMethod,
     // All VIPER types now consolidated in columnar module
     ReaderConfig,
     ReadingStrategy,

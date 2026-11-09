@@ -286,8 +286,7 @@ pub use parquet_strategy_reader::{CachedVIPERReader, DirectVIPERReader, UnifiedV
 
 // Clean Release 1 API - Pure data access layer with search optimization
 pub use readers::{
-    CollectionContext, FilterValue, QuantizationMethod, ReaderConfig, ReadingStrategy,
-    UnifiedParquetReader,
+    CollectionContext, FilterValue, ReaderConfig, ReadingStrategy, UnifiedParquetReader,
 };
 // MetadataFilter is directly from columnar module
 pub use crate::storage::engines::core::formats::columnar::MetadataFilter;
