@@ -2393,7 +2393,12 @@ class ProximaDBClient:
                 successful_count=result.success,
                 failed_count=result.failed,
             ),
-            vector_ids=[record["id"] for record in records if record.get("id")],
+            # prefer server-assigned IDs when the batch result carries them
+            # (client-supplied ids are only a fallback for request-echo paths)
+            vector_ids=(
+                result.inserted_ids
+                or [record["id"] for record in records if record.get("id")]
+            ),
             error_message="; ".join(result.errors) if result.errors else None,
         )
 

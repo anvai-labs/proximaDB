@@ -228,6 +228,9 @@ def v2_record_batch_result(response) -> BatchResult:
         success=int(response.success_count),
         failed=int(response.failed_count),
         errors=errors,
+        # the client requests return_ids=True; the proto's inserted_ids
+        # (field 5) carries the server-assigned per-record IDs.
+        inserted_ids=list(getattr(response, "inserted_ids", []) or []),
         metrics=OperationMetrics(
             total_processed=int(response.total_processed),
             successful_count=int(response.success_count),

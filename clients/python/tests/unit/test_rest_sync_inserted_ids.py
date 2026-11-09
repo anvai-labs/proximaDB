@@ -62,6 +62,32 @@ def test_insert_accumulates_ids_across_batches(monkeypatch):
     assert len(result.inserted_ids) == 6
 
 
+def test_partial_failure_coerces_structured_errors(monkeypatch):
+    # the server serializes per-record failures as InsertError objects
+    # ({index, id, error}); BatchResult.errors is list[str] — a raw dict
+    # used to crash pydantic validation instead of reporting failed=1.
+    body = {
+        "inserted_count": 2,
+        "failed_count": 1,
+        "inserted_ids": ["a", "c"],
+        "errors": [{"index": 1, "id": None, "error": "Vector cannot be empty"}],
+        "duration_ms": 1.0,
+    }
+    c = _client_with_response(monkeypatch, body)
+    result = c.insert_records(
+        "col",
+        [
+            # the mocked SERVER response reports the middle record failed
+            # (the client cannot fabricate a server-side rejection locally)
+            {"id": "bad", "vector": [0.5, 0.5, 0.5, 0.5]},
+            {"id": "c", "vector": [0.0, 0.0, 1.0, 0.0]},
+        ],
+    )
+    assert result.inserted_ids == ["a", "c"]
+    assert result.failed == 1
+    assert result.errors == ["Vector cannot be empty"]
+
+
 def test_mixin_maps_inserted_ids_to_vector_ids(monkeypatch):
     c = _client_with_response(monkeypatch, _V2_RESPONSE)
     result = c.insert_records(

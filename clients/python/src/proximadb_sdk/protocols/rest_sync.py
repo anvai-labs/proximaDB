@@ -1501,11 +1501,19 @@ class ProximaDBClient:
         # as BatchResult.inserted_ids so the vector compatibility aliases can
         # report vector_ids (previously dropped, leaving vector_ids always
         # empty on this path).
+        # The server serializes per-record failures as structured
+        # InsertError objects ({index, id, error}); BatchResult.errors is
+        # list[str], so coerce (a raw dict would crash pydantic validation
+        # on any partial-failure response).
+        errors = [
+            e.get("error", str(e)) if isinstance(e, dict) else str(e)
+            for e in (response_data.get("errors", []) or [])
+        ]
         return BatchResult(
             total=total_count,
             success=inserted_count,
             failed=failed_count,
-            errors=response_data.get("errors", []),
+            errors=errors,
             duration_ms=response_data.get("duration_ms", 0.0),
             inserted_ids=list(response_data.get("inserted_ids", []) or []),
             metrics=OperationMetrics(

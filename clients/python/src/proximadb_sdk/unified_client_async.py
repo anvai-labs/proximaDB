@@ -459,6 +459,10 @@ class ProximaDBAsyncUnified:
             failed=failed,
             errors=data.get("errors", []) or [],
             duration_ms=0.0,
+            # the generated model's to_dict() already carries the
+            # server-assigned per-record IDs — keep them (same channel as
+            # the sync path's BatchResult.inserted_ids).
+            inserted_ids=list(data.get("inserted_ids", []) or []),
             metrics=OperationMetrics(
                 total_processed=total,
                 successful_count=inserted,
