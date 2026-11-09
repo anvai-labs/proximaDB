@@ -1,10 +1,10 @@
 = Central execution tracker
-// status-as-of: 2026-11-02
-// Scope: storage foundations refreshed; other tracks retain dated observations.
+// status-as-of: 2026-11-09
+// Scope: storage foundations refreshed; value-codec and binary-JSON complete; other tracks retain dated observations.
 :toc:
 :toclevels: 2
 
-Evidence baseline: fetched origin/develop `74f7f0a83`, 2026-10-28; merged slices and limits
+Evidence baseline: fetched origin/develop `e9c706588`, 2026-11-09; merged slices and limits
 are recorded in link:../history/evidence/INTEGRATION_RECONCILIATION_2026_10_28.adoc[the integration record].
 Planning source: https://github.com/anvai-labs/proximaDB/pull/2250[#2250]. Local WIP and
 owner-reported tests/pauses are explicitly separate from merged delivery.
@@ -45,6 +45,55 @@ claims about remote state. Existing foreign WIP is preserved.
 | Platform release gates | Open/needs per-TD pickup | Published-image install/restart and driver proof, surface parity, workspace residuals and security/CI lanes: platform plan. No inference of completion from old plans.
 | Governance residuals | Partial implementation; per-TD GLM pickup | TD-SC-1/2/4 have existing implementations; track their actual tenant/coherence/signup/write-guard residuals, not new implementations from zero. Per-TD acceptance still governs completion.
 |===
+
+== Recently completed (2026-11-07 to 2026-11-09)
+
+These items were completed via handoff-driven initiatives, not tracker-assigned work.
+They are recorded here to prevent duplication and provide context for future sessions.
+
+[cols="1,3,2",options="header"]
+|===
+| PRs | Work | Outcome
+
+| #2458, #2460, #2463, #2466
+| **Value-codec refactor**: Phase 1 one-pass streaming visitor for SqlValue Deserialize; golden-tree assertions for mutation testing; Phase 2 consolidation of 6 drifted json_to_proxima_value copies; Phase 2b fold of search-types into canonical spine.
+| All SqlValue⇄ProximaValue paths now route through canonical fns in proximadb-records. Lossy squeeze in exactly one place. 221 tests pass.
+
+| #2471, #2480
+| **E2E benchmark evidence**: Value-codec ingest benchmark (10k docs) showing +0.48% within noise; binary-JSON at-rest + throughput benchmark showing 0% savings (storage layer uses ProximaValue variants, not JSON text).
+| BENCHMARK_EVIDENCE.toml entries updated from "unverified" to "measured" with honest negative results.
+
+| #2474, #2478, #2483
+| **Binary-JSON document path**: Phase A ingest seam (PROXIMADB_DOC_BINARY_INGEST gate, MessagePack blob + indexed overlay); Phase B read path (blob decode + overlay merge); lazy materialization (blob stores only non-indexed fields, no duplication).
+| Full binary document storage cycle complete. Format bake-off chose MessagePack over Avro (Avro fails decode-cost parity). Overlay-authoritative invariant enforced.
+
+| #2473, #2475
+| **Quantization type rationalization**: Phase 1 closed QuantizationType bare-name trap + retired drifted dead Python map; Phase 2 absorbed optimizer QuantizationType into QuantizationStage, deleted dead columnar enum.
+| Quantization type landscape rationalized per TD-QUANT-1.
+
+| #2481
+| **Dead-code wave 3**: Retired proxima_tensor_encoding module, selection.rs dead half, three zero-consumer aliases. −975 lines, 12 files.
+| Survey-driven dead-code removal with complete reference enumerations.
+
+| #2470, #2485
+| **SQL transport parity**: Dual-transport rendering parity test over one query facade; same-SQL transport rendering parity with real v2 router + real gRPC service over one stack.
+| REST and gRPC transports verified to produce identical SQL rendering.
+
+| #2469
+| **SDK CLI fix**: Repaired CLI against real SDK surface (imports, ctor, search kwargs). CLI was crashing at import.
+| Published console script (proximadb-cli / pdb-cli) now functional.
+
+| #2462
+| **Parity suite re-enable**: Re-enabled query_facade parity suite (3 files compile-disabled since May).
+| Parity tests restored to CI.
+
+| #2461
+| **Cache warm replay fix**: Restart warm replay finds manifests by their real key (TD-CACHE-11). Restart cache warming was inert for every tenant.
+| TD-CACHE-11 resolved; warm cache now functional across tenants.
+
+|===
+
+Local worktrees cleaned. All value-codec and binary-JSON branches deleted. Memory updated with outcomes.
 
 == Foundation acceptance and outstanding actions
 
