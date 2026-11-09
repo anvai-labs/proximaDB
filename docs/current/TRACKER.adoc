@@ -101,7 +101,11 @@ They are recorded here to prevent duplication and provide context for future ses
 
 | #2495
 | **TD-SEAM-12 branch-after-truncate auto-registration**: In `checkpoint()`, when `base_for` returns `Err` but the collection has branch-tagged entries in the retained WAL, auto-create a fresh merge-base image. Safety guard: only auto-register when collection has NO entries in truncated segments (`!truncated.contains_key`), fail closed otherwise. Design doc for follow-up 5 (pre-tracking truncation) at `TD-SEAM-12-F5`.
-| Four of five TD-SEAM-12 open follow-ups resolved. Remaining: pre-tracking truncation handling (documented in TD-SEAM-12-F5, not yet implemented). TD-SEAM-14 (object-store recovery) remains open.
+| Four of five TD-SEAM-12 open follow-ups resolved.
+
+| #2496
+| **TD-SEAM-12-F5 bootstrap on checkpoint**: When `generation == 0 && retained_from > 0` (first checkpoint after pre-tracking truncation), bootstrap merge-base images for collections with retained branch entries. Collections without retained entries get truncation marks (fail closed 410). Adversarial review caught unreachable condition bug (`state.tracked_from` → `retained_from`).
+| **All 5 TD-SEAM-12 follow-ups resolved.** TD-SEAM-12 complete.
 
 |===
 
