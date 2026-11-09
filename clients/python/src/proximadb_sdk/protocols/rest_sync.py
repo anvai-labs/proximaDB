@@ -969,8 +969,29 @@ class ProximaDBClient:
             # SMART_DEFAULTS|CUSTOM_LEVELS|MINIMAL|AGGRESSIVE — the SDK's
             # type (scalar/pq/...) is a METHOD, not a strategy. A concrete
             # method means custom levels; the default needs no key.
-            if getattr(quant.type, "value", quant.type) not in (None, "none"):
+            quant_method = getattr(quant.type, "value", quant.type)
+            if quant_method not in (None, "none"):
                 v2_quant["strategy"] = "custom_levels"
+                # The CONCRETE level (ranked cleanup 3/11): without
+                # custom_levels, a custom_levels strategy carried no actual
+                # levels and the server applied smart defaults - the
+                # configured method never reached the engine.
+                # Map SDK spellings to proto QuantizationType names
+                # (review HIGH-2: "pq" hard-400s at the server's
+                # from_str_name which accepts only proto names).
+                proto_method = {"pq": "product"}.get(quant_method, quant_method)
+                # Bits: the SDK model has bits_per_subvector/_vector, NOT
+                # "bits" (review HIGH-3: getattr(quant, "bits") was always
+                # None - the value silently never sent).
+                quant_bits = getattr(quant, "bits_per_subvector", None) or getattr(
+                    quant, "bits_per_vector", None
+                )
+                level: dict[str, Any] = {"quantization_type": proto_method}
+                if quant_bits:
+                    level["bits"] = quant_bits
+                if getattr(quant, "num_subvectors", None):
+                    level["num_subvectors"] = quant.num_subvectors
+                v2_quant["custom_levels"] = [level]
             v2_request_data["quantization"] = v2_quant
         # Spec-driven request shape/path via the generated REST transport
         # (TD-126 Phase 4); the HTTP call still goes through _make_request.
