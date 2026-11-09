@@ -43,6 +43,7 @@ CONTRACT_FILE=/etc/proximadb/chown_dirs.env
 [ -f "$CONTRACT_FILE" ] || { echo "::error::${KIND} on ${DISTRO}: $CONTRACT_FILE missing from the package"; exit 1; }
 # shellcheck disable=SC1090  # shipped contract data
 . "$CONTRACT_FILE"
+[ -n "${CHOWN_DIRS:-}" ] || { echo "::error::${KIND} on ${DISTRO}: $CONTRACT_FILE defines an EMPTY CHOWN_DIRS (dead %post would ship silently)"; exit 1; }
 for d in $CHOWN_DIRS; do
   [ -d "$d" ] || { echo "::error::${KIND} on ${DISTRO}: $d was not created"; exit 1; }
   owner="$(stat -c '%U:%G' "$d")"

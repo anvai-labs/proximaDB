@@ -22,7 +22,8 @@ assert_version() {
 # generator, and the rehearsal stub all derive from this value.
 TD_PKG1_STATELINE='.M...UG..'
 
-# The TD-PKG-1 contract dirs, read from postinstall.sh's CHOWN_DIRS with
+# The TD-PKG-1 contract dirs, read from the contract data file
+# (deploy/packaging/chown_dirs.env) with
 # the strict parse both legs share (exactly one assignment, double-quoted
 # value). Sets CONTRACT_DIRS. $1 = the postinstall.sh path.
 read_contract_dirs() {
@@ -47,9 +48,9 @@ td_pkg1_stateline_for() {
 }
 
 # Assert the TD-PKG-1 contract on INSTALLED dirs: owner+group proximadb,
-# mode 750. $1 = postinstall.sh path (the CHOWN_DIRS source). Used by the
-# DEB verifier (dpkg -V is blind to dirs); the RPM leg's rpm -V gate
-# covers the same contract for rpm.
+# mode 750. $1 = the SHIPPED contract file (/etc/proximadb/chown_dirs.env
+# on the deb leg). Used by the DEB verifier (dpkg -V is blind to dirs);
+# the RPM leg's rpm -V gate covers the same contract for rpm.
 assert_td_pkg1_dirs() {
     local src="${1:?usage: assert_td_pkg1_dirs <postinstall.sh>}"
     read_contract_dirs "$src"
