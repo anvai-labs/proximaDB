@@ -2,6 +2,18 @@
 
 All notable changes to ProximaDB will be documented in this file.
 
+## [0.6.1] - 2026-11-09
+
+Packaging-integrity release: v0.6.0's release run was blocked by the new
+pre-publish RPM/DEB verifiers (they found real defects — that is what they
+are for). v0.6.1 carries the fixed verifiers (el8 9-column rpm -V stateline,
+per-dir exact-path matching, a real dpkg -V gate, the TD-PKG-1 contract as
+a shipped data file, selftest + negative fixtures wired into the release
+jobs) and the smoketest ownership/mode assertion. **Note:** PyPI's
+`proximadb` 0.6.0 packages were published before the block and are
+functional; every other registry publishes 0.6.1 fresh. No server-code
+changes in this release beyond what 0.6.0 carried.
+
 ## [0.6.0] - 2026-11-08
 
 Minor release: per-collection survivor-cache attribution — the meter the warm-rate
