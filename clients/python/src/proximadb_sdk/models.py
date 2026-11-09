@@ -1294,9 +1294,9 @@ class SearchQuery(BaseModel):
     """Search query"""
 
     vector: list[float]
-    filters: dict[str, Any] = (
-        {}
-    )  # Simple equality filters (proto map field - always include)
+    filters: dict[
+        str, Any
+    ] = {}  # Simple equality filters (proto map field - always include)
     id: str | None = None
     metadata_filter: MetadataFilter | None = None
 
