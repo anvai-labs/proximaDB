@@ -38,6 +38,7 @@ from .models import (
     DeleteResult,
     OperationMetrics,
     SearchResult,
+    format_insert_errors,
     normalize_collection_config_kwargs,
 )
 
