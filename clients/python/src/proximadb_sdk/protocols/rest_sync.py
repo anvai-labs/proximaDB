@@ -72,6 +72,7 @@ from ..models import (
     ServerCapabilities,
     UpdateSchemaResponse,
     VectorArray,
+    format_insert_errors,
     normalize_collection_config_kwargs,
 )
 from ..models_v2 import ProximaRecord
@@ -1544,12 +1545,24 @@ class ProximaDBClient:
         inserted_count = int(response_data.get("inserted_count", 0) or 0)
         failed_count = int(response_data.get("failed_count", 0) or 0)
         total_count = inserted_count + failed_count
+        # Server-assigned IDs of the successfully inserted records — surfaced
+        # as BatchResult.inserted_ids so the vector compatibility aliases can
+        # report vector_ids (previously dropped, leaving vector_ids always
+        # empty on this path).
+        # The server serializes per-record failures as structured
+        # InsertError objects ({index, id, error}); BatchResult.errors is
+        # list[str], so coerce (a raw dict would crash pydantic validation
+        # on any partial-failure response).
+        from proximadb_sdk.models import format_insert_errors
+
+        errors = format_insert_errors(response_data.get("errors", []))
         return BatchResult(
             total=total_count,
             success=inserted_count,
             failed=failed_count,
-            errors=response_data.get("errors", []),
+            errors=errors,
             duration_ms=response_data.get("duration_ms", 0.0),
+            inserted_ids=list(response_data.get("inserted_ids", []) or []),
             metrics=OperationMetrics(
                 total_processed=total_count,
                 successful_count=inserted_count,
@@ -1673,6 +1686,7 @@ class ProximaDBClient:
         total_successful = 0
         total_failed = 0
         all_errors = []
+        all_inserted_ids = []
         for start in range(0, len(record_data), effective_batch_size):
             batch_data = record_data[start : start + effective_batch_size]
             call = _gen.insert_records(
@@ -1688,6 +1702,7 @@ class ProximaDBClient:
             total_successful += result.success
             total_failed += result.failed
             all_errors.extend(result.errors or [])
+            all_inserted_ids.extend(result.inserted_ids or [])
 
         if total_successful > 0:
             self._invalidate_collection_cache(collection_id)
@@ -1698,6 +1713,7 @@ class ProximaDBClient:
             failed=total_failed,
             errors=all_errors,
             duration_ms=0.0,
+            inserted_ids=all_inserted_ids,
             metrics=OperationMetrics(
                 total_processed=total_successful + total_failed,
                 successful_count=total_successful,

@@ -1509,6 +1509,61 @@ class BatchResult(BaseModel):
     errors: list[str] = Field(default_factory=list)
     duration_ms: float = 0.0
     metrics: OperationMetrics = Field(default_factory=OperationMetrics)
+    # Server-assigned IDs of successfully inserted records (the REST
+    # insert response's inserted_ids). Empty for operations whose server
+    # response does not carry per-record IDs.
+    inserted_ids: list[str] = Field(default_factory=list)
+
+
+def format_insert_errors(errors: list) -> list[str]:
+    """Flatten the REST server's InsertError entries into readable strings.
+
+    The v2 REST insert response serializes per-record failures as
+    structured InsertError objects ({index, id, error}); BatchResult.errors
+    is list[str]. Null/empty message falls back to the index/id context.
+    (The gRPC v2 codec renders its proto shape with a record_id prefix —
+    intentionally different; a cross-transport normalizer is follow-up.)
+    """
+    out: list[str] = []
+    for e in errors or []:
+        if isinstance(e, dict):
+            msg = e.get("error")
+            if msg:
+                out.append(str(msg))
+            else:
+                ctx = {k: v for k, v in e.items() if v is not None}
+                out.append(f"record failed: {ctx}" if ctx else "record failed")
+        else:
+            out.append(str(e))
+    return out
+
+
+def resolve_vector_ids(
+    result: "BatchResult",
+    records: list,
+) -> list:
+    """The ONE vector_ids policy for the legacy insert/upsert aliases.
+
+    Prefer server-assigned IDs (BatchResult.inserted_ids); fall back to
+    the client-supplied id echo ONLY when the operation fully succeeded
+    (on failures the echo lists records the server rejected, including
+    fabricated placeholders). All alias sites (REST unified client,
+    grpc_sync, grpc_async) MUST route through this — divergent hand-rolled
+    copies of this policy are exactly how the v1 silent drift happened
+    (TD-SDK-3)."""
+    if result.inserted_ids:
+        return list(result.inserted_ids)
+    if result.failed == 0:
+        ids = []
+        for record in records:
+            if isinstance(record, dict):
+                rid = record.get("id")
+            else:
+                rid = getattr(record, "id", None)
+            if rid:
+                ids.append(rid)
+        return ids
+    return []
 
 
 class VectorOperationResponse(BaseModel):
