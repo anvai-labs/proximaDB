@@ -61,6 +61,7 @@ class RecordOpsMixin:
             error_message="; ".join(result.errors) if result.errors else None,
         )
 
+
 class BaseProtocolAdapter(ABC):
     """Abstract base class for SDK adapters.
 
