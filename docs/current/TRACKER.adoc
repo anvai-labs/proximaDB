@@ -91,6 +91,10 @@ They are recorded here to prevent duplication and provide context for future ses
 | **Cache warm replay fix**: Restart warm replay finds manifests by their real key (TD-CACHE-11). Restart cache warming was inert for every tenant.
 | TD-CACHE-11 resolved; warm cache now functional across tenants.
 
+| #2489
+| **TD-SEAM-12 branch-closure fixes**: (1) `write_back_merge` clears `branch_id` on merged records so the truncator's branch floor can advance and branches can close; (2) `filter_wal_by_branch_lsn` includes untagged records (`branch_id=None`) when filtering for "main" since they are implicitly on main.
+| Two of five TD-SEAM-12 open follow-ups resolved. Remaining: branch registration after truncation, pre-tracking truncation handling, truncation mark cleanup. TD-SEAM-14 (object-store recovery) remains open.
+
 |===
 
 Local worktrees cleaned. All value-codec and binary-JSON branches deleted. Memory updated with outcomes.
