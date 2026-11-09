@@ -1506,6 +1506,7 @@ class ProximaDBClient:
         # list[str], so coerce (a raw dict would crash pydantic validation
         # on any partial-failure response).
         from proximadb_sdk.models import format_insert_errors
+
         errors = format_insert_errors(response_data.get("errors", []))
         return BatchResult(
             total=total_count,

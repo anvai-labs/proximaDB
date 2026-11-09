@@ -455,6 +455,7 @@ class ProximaDBAsyncUnified:
         total = inserted + failed
         # same shape as the sync path — shared formatter (TD-SDK-3)
         from proximadb_sdk.models import format_insert_errors
+
         errors = format_insert_errors(data.get("errors", []))
         return BatchResult(
             total=total,
