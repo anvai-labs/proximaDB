@@ -47,8 +47,9 @@ pub use projection::{
 };
 pub use query::{DocumentQueryExpr, DocumentSort, PathFilter};
 pub use record::{
-    CanonicalDocument, CanonicalDocumentStore, DOCUMENT_COLLECTION_PROP, DOCUMENT_RECORD_LABEL,
-    DOCUMENT_TYPE_PROP, DocumentRecordKey, DocumentRecordMetadata, canonical_document_from_record,
+    CanonicalDocument, CanonicalDocumentStore, DOC_BLOB_PROP, DOCUMENT_COLLECTION_PROP,
+    DOCUMENT_RECORD_LABEL, DOCUMENT_TYPE_PROP, DocumentRecordKey, DocumentRecordMetadata,
+    canonical_document_from_record,
 };
 pub use structural_projection::{
     JsonLeafKind, JsonPathStats, JsonPresenceSummary, JsonShapeId, JsonShapeStats,

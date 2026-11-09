@@ -30,9 +30,7 @@ use tracing::{debug, info, warn};
 use crate::api_handlers::RichRecordBatchRequest;
 use crate::errors::{ApiError, ApiResult};
 
-/// Name of the prop that holds the MessagePack blob when binary ingest is ON.
-/// Prefixed with `_` to avoid collision with user metadata keys.
-const DOC_BLOB_PROP: &str = "_doc_blob";
+use proximadb_document::DOC_BLOB_PROP;
 
 /// Check if the binary document ingest path is enabled.
 /// Default-OFF per storage-format directive #8.
