@@ -1631,6 +1631,7 @@ class ProximaDBClient:
         total_successful = 0
         total_failed = 0
         all_errors = []
+        all_inserted_ids = []
         for start in range(0, len(record_data), effective_batch_size):
             batch_data = record_data[start : start + effective_batch_size]
             call = _gen.insert_records(
@@ -1646,6 +1647,7 @@ class ProximaDBClient:
             total_successful += result.success
             total_failed += result.failed
             all_errors.extend(result.errors or [])
+            all_inserted_ids.extend(result.inserted_ids or [])
 
         if total_successful > 0:
             self._invalidate_collection_cache(collection_id)
@@ -1656,6 +1658,7 @@ class ProximaDBClient:
             failed=total_failed,
             errors=all_errors,
             duration_ms=0.0,
+            inserted_ids=all_inserted_ids,
             metrics=OperationMetrics(
                 total_processed=total_successful + total_failed,
                 successful_count=total_successful,
