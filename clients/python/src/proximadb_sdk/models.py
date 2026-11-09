@@ -1509,6 +1509,10 @@ class BatchResult(BaseModel):
     errors: list[str] = Field(default_factory=list)
     duration_ms: float = 0.0
     metrics: OperationMetrics = Field(default_factory=OperationMetrics)
+    # Server-assigned IDs of successfully inserted records (the REST
+    # insert response's inserted_ids). Empty for operations whose server
+    # response does not carry per-record IDs.
+    inserted_ids: list[str] = Field(default_factory=list)
 
 
 class VectorOperationResponse(BaseModel):

@@ -57,6 +57,7 @@ class RecordOpsMixin:
             success=result.success,
             operation=operation,
             metrics=result.metrics,
+            vector_ids=result.inserted_ids,
             error_message="; ".join(result.errors) if result.errors else None,
         )
 
