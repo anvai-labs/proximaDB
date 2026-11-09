@@ -1516,18 +1516,23 @@ class BatchResult(BaseModel):
 
 
 def format_insert_errors(errors: list) -> list[str]:
-    """Flatten the server's InsertError entries into human-readable strings.
+    """Flatten the REST server's InsertError entries into readable strings.
 
-    The v2 REST/gRPC insert responses serialize per-record failures as
+    The v2 REST insert response serializes per-record failures as
     structured InsertError objects ({index, id, error}); BatchResult.errors
-    is list[str]. Null-safe on the error message (the only message channel;
-    index/id are already nullable). Shared by the sync/async/gRPC paths so
-    one server shape renders identically everywhere (TD-SDK-3 lesson).
+    is list[str]. Null/empty message falls back to the index/id context.
+    (The gRPC v2 codec renders its proto shape with a record_id prefix —
+    intentionally different; a cross-transport normalizer is follow-up.)
     """
     out: list[str] = []
     for e in errors or []:
         if isinstance(e, dict):
-            out.append(str(e.get("error") or e))
+            msg = e.get("error")
+            if msg:
+                out.append(str(msg))
+            else:
+                ctx = {k: v for k, v in e.items() if v is not None}
+                out.append(f"record failed: {ctx}" if ctx else "record failed")
         else:
             out.append(str(e))
     return out

@@ -72,6 +72,7 @@ from ..models import (
     ServerCapabilities,
     UpdateSchemaResponse,
     VectorArray,
+    format_insert_errors,
     normalize_collection_config_kwargs,
 )
 from ..models_v2 import ProximaRecord
