@@ -117,6 +117,9 @@ desktop.ini
 .env.*.local
 *.env
 !example.env
+# TD-PKG-1: the packaging contract is a real (non-secret) data file —
+# postinstall sources it, the verifiers and the smoke assert it.
+!deploy/packaging/chown_dirs.env
 
 # Logs and databases
 *.log
