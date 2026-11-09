@@ -486,6 +486,12 @@ impl SegmentSummary {
     fn has_partition_drop_for(&self, collection: &TenantCollection) -> bool {
         self.dropped.contains(collection)
     }
+
+    /// TD-SEAM-12 follow-up: whether this segment has branch-tagged entries
+    /// for the given collection.
+    fn has_branch_for(&self, collection: &TenantCollection) -> bool {
+        self.branched.contains(collection)
+    }
 }
 
 /// Every `(tenant, collection)` in `segments` (oldest first) → the first
@@ -1218,6 +1224,21 @@ impl FramedTableWalAppender {
             if segment.first_seq.is_some_and(|f| f >= after)
                 && segment.has_partition_drop_for(collection)
             {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// TD-SEAM-12 follow-up: check if `collection` has any branch-tagged entries
+    /// at or after sequence `after` in the retained WAL. Used to detect collections
+    /// that were branched after truncation — these can get auto-registered by
+    /// creating a fresh merge-base image from the retained history.
+    pub fn has_branch_entries_after(&self, collection: &TenantCollection, after: u64) -> bool {
+        let active = self.active.lock().clone();
+        let sealed = self.sealed.read();
+        for segment in sealed.iter().chain(std::iter::once(&active)) {
+            if segment.first_seq.is_some_and(|f| f >= after) && segment.has_branch_for(collection) {
                 return true;
             }
         }
