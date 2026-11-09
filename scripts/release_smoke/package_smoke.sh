@@ -36,11 +36,21 @@ grep -q '^Type=simple' "$UNIT" \
   || { echo "::error::${KIND} on ${DISTRO}: unit is not Type=simple: $(grep '^Type=' "$UNIT")"; exit 1; }
 id proximadb >/dev/null 2>&1 \
   || { echo "::error::${KIND} on ${DISTRO}: package creates no proximadb user"; exit 1; }
-for d in /var/lib/proximadb /var/log/proximadb; do
+# TD-PKG-1: the contract ships IN the package (deploy/packaging/
+# chown_dirs.env → /etc/proximadb/chown_dirs.env) — source it here so a
+# contract edit updates this check without touching the smoke script.
+CONTRACT_FILE=/etc/proximadb/chown_dirs.env
+[ -f "$CONTRACT_FILE" ] || { echo "::error::${KIND} on ${DISTRO}: $CONTRACT_FILE missing from the package"; exit 1; }
+# shellcheck disable=SC1090  # shipped contract data
+. "$CONTRACT_FILE"
+[ -n "${CHOWN_DIRS:-}" ] || { echo "::error::${KIND} on ${DISTRO}: $CONTRACT_FILE defines an EMPTY CHOWN_DIRS (dead %post would ship silently)"; exit 1; }
+for d in $CHOWN_DIRS; do
   [ -d "$d" ] || { echo "::error::${KIND} on ${DISTRO}: $d was not created"; exit 1; }
   owner="$(stat -c '%U:%G' "$d")"
   [ "$owner" = "proximadb:proximadb" ] \
     || { echo "::error::${KIND} on ${DISTRO}: $d is ${owner}, not proximadb:proximadb"; exit 1; }
+  mode="$(stat -c '%a' "$d")"
+  [ "$mode" = "750" ] || { echo "::error::${KIND} on ${DISTRO}: $d mode is $mode, not 750"; exit 1; }
 done
 echo "${KIND} on ${DISTRO}: unit Type=simple; state dirs owned by proximadb"
 

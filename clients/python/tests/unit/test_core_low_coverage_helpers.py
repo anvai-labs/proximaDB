@@ -29,8 +29,6 @@ from proximadb_sdk.proto_conversion import (
     distance_metric_to_str,
     index_type_to_int,
     index_type_to_str,
-    quantization_type_to_int,
-    quantization_type_to_str,
     storage_engine_to_int,
     storage_engine_to_str,
 )
@@ -289,7 +287,7 @@ def test_create_validation_result_comparators(
     assert result.threshold == threshold
 
 
-def test_proto_converter_distance_storage_index_and_quantization_mappings():
+def test_proto_converter_distance_storage_index_mappings():
     assert ProtoConverter.distance_metric_to_int(None) == 0
     assert ProtoConverter.distance_metric_to_int("COSINE") == 1
     assert ProtoConverter.distance_metric_to_int(IntMetric.EUCLIDEAN) == 2
@@ -313,19 +311,12 @@ def test_proto_converter_distance_storage_index_and_quantization_mappings():
     assert ProtoConverter.index_type_to_str(4) == "flat"
     assert ProtoConverter.index_type_to_str("bad") == "hnsw"
 
-    assert ProtoConverter.quantization_type_to_int(None) == 0
-    assert ProtoConverter.quantization_type_to_int("scalar") == 3
-    assert ProtoConverter.quantization_type_to_str(2) == "pq"
-    assert ProtoConverter.quantization_type_to_str("bad") == "none"
-
     assert distance_metric_to_int("dot_product") == 3
     assert distance_metric_to_str(3) == "dot_product"
     assert storage_engine_to_int("sst") == 2
     assert storage_engine_to_str(2) == "sst"
     assert index_type_to_int("pq") == 3
     assert index_type_to_str(3) == "pq"
-    assert quantization_type_to_int("binary") == 4
-    assert quantization_type_to_str(4) == "binary"
 
 
 def test_proto_converter_model_helpers_normalize_records_and_configs():

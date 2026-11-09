@@ -1,0 +1,24 @@
+# Benchmark config - use different port to avoid Docker conflict
+[server]
+node_id = "bench"
+bind_address = "127.0.0.1"
+port = 15680
+data_dir = "/tmp/proximadb-bench"
+
+[api]
+unified_port = 15680
+unified_mode = true
+
+[server.tenant]
+mode = "single_tenant"
+default_tenant = "default"
+
+[server.admin_ui]
+enabled = false
+
+[storage]
+root = "/tmp/proximadb-bench/storage"
+
+[storage.write_ahead_log]
+enabled = true
+sync_mode = "batch"
