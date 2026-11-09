@@ -194,6 +194,27 @@ def _convert_quantization_config_to_proto(quant_config) -> dict[str, Any]:
     return proto_dict
 
 
+def _success_false_is_partial(body: dict) -> bool:
+    """True for response shapes where `success: false` is a legitimate
+    partial-batch signal the CALLER handles, not a whole-request failure
+    (e.g. batch inserts carrying per-record results / counts)."""
+    # Batch-result shapes: they carry per-item result lists or counts.
+    return any(
+        k in body
+        for k in (
+            "results",
+            "successful_count",
+            "failed_count",
+            "vectors",
+            "records",
+            "inserted_count",
+            # Observability partial-ingest shape (server-verified:
+            # observability.rs /298,/330,/414,/442): {ingested, failed}
+            "ingested",
+        )
+    )
+
+
 class ProximaDBClient:
     """Synchronous ProximaDB client"""
 
@@ -449,6 +470,11 @@ class ProximaDBClient:
                 # Data too small to benefit from compression
                 kwargs["json"] = json_data
 
+        # Escape hatch must be consumed BEFORE the closure forwards kwargs
+        # into httpx.request (which rejects unknown kwargs with TypeError —
+        # review round-1 HIGH-1).
+        allow_success_false = kwargs.pop("_allow_success_false", False)
+
         @retry(
             stop=stop_after_attempt(self.config.retry.max_retries + 1),
             wait=wait_exponential(
@@ -464,6 +490,36 @@ class ProximaDBClient:
 
                 if response.status_code >= 400:
                     self._handle_error_response(response)
+
+                # Swallow-disease fix (ranked cleanup item 2/11): HTTP 200
+                # with {"success": false} is a SERVER-REPORTED FAILURE, not a
+                # success — historically every REST protocol method silently
+                # returned the failure body as if it were data. Raise here,
+                # centrally, unless the caller explicitly opted out (the
+                # rare partial-batch surfaces where success=false means
+                # "some rows failed", which the callers handle themselves).
+                if allow_success_false:
+                    return response
+                content_type = response.headers.get("content-type", "").lower()
+                if "application/json" in content_type:
+                    try:
+                        body = response.json()
+                    except Exception:
+                        body = None
+                    if (
+                        isinstance(body, dict)
+                        and body.get("success") is False
+                        and not _success_false_is_partial(body)
+                    ):
+                        err = body.get("error_message") or body.get("message")
+                        if not err and isinstance(body.get("error"), dict):
+                            err = body["error"].get("message") or body["error"].get(
+                                "code"
+                            )
+                        raise ProximaDBError(
+                            f"Server reported failure (HTTP {response.status_code}): "
+                            f"{err or body}",
+                        )
 
                 return response
 
@@ -1149,15 +1205,6 @@ class ProximaDBClient:
                     "not found" in error_msg.lower()
                     or "does not exist" in error_msg.lower()
                 ):
-                    raise CollectionNotFoundError(
-                        f"Collection '{collection_id}' not found"
-                    )
-                raise ProximaDBError(f"Failed to get collection: {error_msg}")
-
-            # If success is explicitly false, treat as error
-            if "success" in response_data and response_data["success"] is False:
-                error_msg = response_data.get("error_message", "Unknown error")
-                if "not found" in str(error_msg).lower():
                     raise CollectionNotFoundError(
                         f"Collection '{collection_id}' not found"
                     )
