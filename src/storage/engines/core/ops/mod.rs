@@ -141,10 +141,6 @@ pub fn estimate_vector_storage_size(
     num_vectors * bytes_per_vector
 }
 
-/// Tensor-specific encoding operations (sparse tensors, quantization, transpose)
-/// Re-exported through proximaencoder for consolidated access
-pub use proximadb_engine_core::ops_compression::proxima_tensor_encoding; // extracted TD-DECOMP-81
-
 // Zero-copy I/O system moved to core/io/zero_copy
 // Import from there: use crate::storage::engines::core::io::zero_copy::*;
 // Deferred: Create these modules when needed:

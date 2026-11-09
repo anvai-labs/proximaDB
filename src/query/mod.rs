@@ -162,7 +162,7 @@ pub use query_optimizer::{
     UnifiedCostWeights, UnifiedExecutionPlan as QueryPlan, UnifiedMetadataFilter as MetadataFilter,
     UnifiedOptimizerConfig, UnifiedQueryOptimizer as QueryOptimizer,
 };
-pub use vector_search::{SearchParameters, VectorSearchQuery, VectorSearchResult};
+pub use vector_search::{SearchParameters, VectorSearchResult};
 
 // Re-export AQL types - TD-050 RUBICON
 pub use aql::{

@@ -3,7 +3,7 @@
 //! The pure kernel was extracted to the `proximadb-quantization-kernel` crate
 //! (step **Q3** of the quantization-kernel split,
 //! `docs/12-design/QUANTIZATION_KERNEL_SPLIT_2026_06_22.adoc`). The storage↔compute
-//! glue (codebook cache, level selection) lives in `crate::storage::compute_bridge`
+//! glue (codebook cache, engine selection) lives in `crate::storage::compute_bridge`
 //! (step **Q2**). This module re-exports both so existing
 //! `crate::compute::quantization::*` consumers are unchanged.
 
@@ -17,6 +17,4 @@ pub use proximadb_quantization_kernel::*;
 // import `crate::compute::quantization::{global_cache, selection}`).
 pub use crate::storage::compute_bridge::{global_cache, selection};
 pub use global_cache::{GlobalQuantizationCache, QuantizationCacheKey};
-pub use selection::{
-    QuantizationSelectionReason, QuantizationSelector, RecommendedQuantizationLevel,
-};
+pub use selection::QuantizationSelector;
