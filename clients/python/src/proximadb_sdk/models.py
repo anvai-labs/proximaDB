@@ -1294,9 +1294,9 @@ class SearchQuery(BaseModel):
     """Search query"""
 
     vector: list[float]
-    filters: dict[str, Any] = (
-        {}
-    )  # Simple equality filters (proto map field - always include)
+    filters: dict[
+        str, Any
+    ] = {}  # Simple equality filters (proto map field - always include)
     id: str | None = None
     metadata_filter: MetadataFilter | None = None
 
@@ -1514,6 +1514,7 @@ class BatchResult(BaseModel):
     # response does not carry per-record IDs.
     inserted_ids: list[str] = Field(default_factory=list)
 
+
 def resolve_vector_ids(
     result: "BatchResult",
     records: list,
@@ -1540,7 +1541,6 @@ def resolve_vector_ids(
                 ids.append(rid)
         return ids
     return []
-
 
 
 class VectorOperationResponse(BaseModel):

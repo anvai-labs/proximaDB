@@ -558,9 +558,7 @@ class EmbeddedProtocolAdapter(RecordOpsMixin, BaseProtocolAdapter):
                     # the client-supplied ids are all we can surface (a
                     # server-assigned-id channel needs wire support in the
                     # embedded binding — documented limitation)
-                    inserted_ids=[
-                        r.get("id") for r in self._record_payloads(records)
-                    ],
+                    inserted_ids=[r.get("id") for r in self._record_payloads(records)],
                     metrics=OperationMetrics(
                         total_processed=len(records),
                         successful_count=successful,

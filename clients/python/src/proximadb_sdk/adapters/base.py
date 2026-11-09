@@ -73,6 +73,7 @@ class RecordOpsMixin:
         # copies of this policy is exactly how the v1 silent drift happened
         # (TD-SDK-3).
         from proximadb_sdk.models import resolve_vector_ids as _resolve
+
         return _resolve(result, records)
 
 
