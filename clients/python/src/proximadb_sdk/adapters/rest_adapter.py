@@ -26,6 +26,7 @@ from ..models import (
     VectorArray,
     VectorOperationResponse,
     VectorRecord,
+    format_insert_errors,
 )
 from ..models_v2 import ProximaRecord
 from ._sync_graph_delegations import SyncGraphDelegations
@@ -214,6 +215,7 @@ class RestProtocolAdapter(RecordOpsMixin, SyncGraphDelegations, BaseProtocolAdap
                 success=metrics.successful_count,
                 failed=metrics.failed_count,
                 errors=[result.error_message] if result.error_message else [],
+                inserted_ids=list(result.vector_ids or []),
                 metrics=metrics,
             )
         if isinstance(result, dict):
@@ -228,7 +230,8 @@ class RestProtocolAdapter(RecordOpsMixin, SyncGraphDelegations, BaseProtocolAdap
                 total=result.get("total", success + failed),
                 success=success,
                 failed=failed,
-                errors=result.get("errors", []),
+                errors=format_insert_errors(result.get("errors", [])),
+                inserted_ids=list(result.get("inserted_ids", []) or []),
                 metrics=OperationMetrics(
                     total_processed=result.get("total", success + failed),
                     successful_count=success,
@@ -243,6 +246,7 @@ class RestProtocolAdapter(RecordOpsMixin, SyncGraphDelegations, BaseProtocolAdap
             total=successful + failed,
             success=successful,
             failed=failed,
+            inserted_ids=list(getattr(result, "vector_ids", None) or []),
             metrics=OperationMetrics(
                 total_processed=successful + failed,
                 successful_count=successful,

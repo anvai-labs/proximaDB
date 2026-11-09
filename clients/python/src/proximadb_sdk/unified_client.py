@@ -50,6 +50,7 @@ from .models import (
     VectorOperationResponse,
     VectorRecord,
     normalize_collection_config_kwargs,
+    resolve_vector_ids,
 )
 from .operation_router import OperationRouter, RoutingConfig, RoutingStrategy
 from .proto_conversion import ProtoConverter
@@ -2393,7 +2394,9 @@ class ProximaDBClient:
                 successful_count=result.success,
                 failed_count=result.failed,
             ),
-            vector_ids=[record["id"] for record in records if record.get("id")],
+            # the ONE policy (models.resolve_vector_ids — shared with the
+            # grpc aliases)
+            vector_ids=resolve_vector_ids(result, records),
             error_message="; ".join(result.errors) if result.errors else None,
         )
 

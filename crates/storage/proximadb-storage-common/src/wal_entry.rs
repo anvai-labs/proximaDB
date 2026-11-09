@@ -449,10 +449,10 @@ pub fn latest_checkpoint(entries: &[CanonicalWalEntry]) -> Option<&SnapshotManif
 /// **Scope (T3.1 Slice 3):**
 ///
 /// * Only `CanonicalOperation::RecordUpsert` entries are considered.
-/// * The record's `branch_id` MUST equal `Some(branch_id)` — entries with
-///   `branch_id: None` are EXCLUDED. (A record with no branch tag has not
-///   been tagged for any branch; the orchestrator treats those as "main"
-///   via a separate code path, not via this filter.)
+/// * For `branch_id == "main"`: entries with `branch_id: Some("main")` OR
+///   `branch_id: None` are included (untagged records are implicitly on main).
+/// * For all other branches: the record's `branch_id` MUST equal
+///   `Some(branch_id)` — entries with `branch_id: None` are EXCLUDED.
 /// * `RecordDelete` entries are ALWAYS excluded. They lack a full record
 ///   and therefore have no branch metadata; the orchestrator tracks
 ///   deletes via separate context.
@@ -486,7 +486,13 @@ where
         .filter(|entry| lsn_range.contains(&entry.sequence_number))
         .filter(|entry| match &entry.operation {
             CanonicalOperation::RecordUpsert { record, .. } => {
-                record.branch_id.as_deref() == Some(branch_id)
+                // TD-SEAM-12 follow-up: untagged records (branch_id = None) are
+                // implicitly on "main". When filtering for "main", include them.
+                if branch_id == "main" {
+                    record.branch_id.as_deref() == Some("main") || record.branch_id.is_none()
+                } else {
+                    record.branch_id.as_deref() == Some(branch_id)
+                }
             }
             _ => false,
         })
@@ -1095,6 +1101,23 @@ mod tests {
         let out = filter_wal_by_branch_lsn(&entries, "dev", 0..u64::MAX);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].sequence_number, 2);
+    }
+
+    #[test]
+    fn filter_main_includes_untagged_records() {
+        // TD-SEAM-12: filtering for "main" includes untagged records
+        // (branch_id = None) since they are implicitly on main.
+        let entries = vec![
+            branch_upsert(1, "a", None),         // untagged → included for "main"
+            branch_upsert(2, "b", Some("main")), // explicit main → included
+            branch_upsert(3, "c", Some("dev")),  // other branch → excluded
+            branch_upsert(4, "d", None),         // untagged → included for "main"
+        ];
+        let out = filter_wal_by_branch_lsn(&entries, "main", 0..u64::MAX);
+        assert_eq!(out.len(), 3, "untagged + explicit main, not dev");
+        assert_eq!(out[0].sequence_number, 1);
+        assert_eq!(out[1].sequence_number, 2);
+        assert_eq!(out[2].sequence_number, 4);
     }
 
     #[test]

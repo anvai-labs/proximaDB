@@ -389,7 +389,7 @@
     "QuantizationMethod": 1,
     "QuantizationParams": 1,
     "QuantizationStrategy": 1,
-    "QuantizationType": 2,
+    "QuantizationType": 1,
     "QuantizedVector": 1,
     "QuantizedVectorData": 2,
     "QueryCache": 1,

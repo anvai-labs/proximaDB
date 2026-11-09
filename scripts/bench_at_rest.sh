@@ -25,25 +25,25 @@ fi
 echo "📝 Generating $DOC_COUNT documents..."
 DOCS_FILE=$(mktemp)
 python3 - "$DOC_COUNT" > "$DOCS_FILE" <<'PYTHON'
-import json, random, sys, math
+import json, random, sys
 
 count = int(sys.argv[1])
 random.seed(42)
 
 for i in range(count):
-    vec = [math.sin(i * 0.01 + j * 0.1) * 0.5 for j in range(128)]
     shape = i % 4
     if shape == 0:
         meta = {"name": f"user_{i}", "email": f"user{i}@test.com", "city": "Chicago", "tags": ["a", "b", "c"]}
     elif shape == 1:
-        meta = {"user": {"id": i, "profile": {"name": f"user_{i}", "age": 25 + (i % 50)}}, "active": True}
+        meta = {"user": {"id": i, "profile": {"name": f"user_{i}", "age": 25 + (i % 50)}}, "active": True, "city": "NYC"}
     elif shape == 2:
-        meta = {"scores": [random.random() for _ in range(10)], "counts": [i, i*2, i*3]}
+        meta = {"id": i, "scores": [random.random() for _ in range(10)], "counts": [i, i*2, i*3], "name": f"item_{i}"}
     else:
-        meta = {"name": f"doc_{i}", "source": "bench", "version": 1, "values": [1.5, 2.5, 3.5]}
-    
-    record = {"id": f"rec_{i}", "vector": vec, "props": meta}
-    print(json.dumps(record))
+        meta = {"name": f"doc_{i}", "source": "bench", "version": 1, "values": [1.5, 2.5, 3.5], "city": "LA"}
+
+    # Documents API format: {id, text, metadata}
+    doc = {"id": f"rec_{i}", "text": f"Document {i} content", "metadata": meta}
+    print(json.dumps(doc))
 PYTHON
 
 # Function to run benchmark with a given gate setting
@@ -74,10 +74,12 @@ run_bench() {
         sleep 1
     done
     
-    # Create collection
+    # Create collection with schema defining filterable columns for lazy materialization
+    # Schema marks city/name/source as filterable → they go to typed overlay only
+    # Other fields (email, tags, user, scores, etc.) go to blob only → no duplication
     curl -sf -X POST "http://localhost:$PORT/api/v2/collections" \
         -H "Content-Type: application/json" \
-        -d "{\"name\": \"$COLLECTION\", \"dimension\": 128, \"enable_proxima_record\": true}" > /dev/null
+        -d '{"name": "'"$COLLECTION"'", "dimension": 128, "enable_proxima_record": true, "schema": {"columns": [{"name": "city", "data_type": "text", "filterable": true}, {"name": "name", "data_type": "text", "filterable": true}, {"name": "source", "data_type": "text", "filterable": true}], "enforcement": "flexible"}}' > /dev/null
     
     # Ingest documents
     echo "  Ingesting $DOC_COUNT documents..."
@@ -94,7 +96,7 @@ run_bench() {
         local batch_docs=$(sed -n "${start_line},${end_line}p" "$DOCS_FILE" | jq -s '{records: .}')
         
         local http_code=$(curl -sf -o /dev/null -w "%{http_code}" -X POST \
-            "http://localhost:$PORT/api/v2/collections/$COLLECTION/records/batch" \
+            "http://localhost:$PORT/api/v2/collections/$COLLECTION/documents" \
             -H "Content-Type: application/json" \
             -d "$batch_docs" 2>/dev/null || echo "000")
         

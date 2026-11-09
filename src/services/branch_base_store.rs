@@ -398,6 +398,16 @@ impl BranchBaseStore {
             *mark = (*mark).min(*first);
         }
 
+        // TD-SEAM-12 follow-up: clear truncation marks for collections that
+        // have been dropped (RecordPartitionDrop) in the retained WAL. Without
+        // this, a collection dropped and re-created under the same name keeps
+        // returning 410 even when its post-recreate history is complete.
+        truncated.retain(|collection, mark| {
+            // Check if there's a RecordPartitionDrop for this collection
+            // after the mark's first sequence in the retained WAL.
+            !self.wal.has_partition_drop_after(collection, *mark)
+        });
+
         let mut images = BTreeMap::new();
         for collection in &summary.collections {
             let (mut image, fresh) = match state.base_for(collection, retained_from) {
@@ -409,9 +419,28 @@ impl BranchBaseStore {
                 ),
                 Ok(MergeBase::Image(image)) => (image.clone(), false),
                 Ok(MergeBase::Retained) => (MergeBaseImage::default(), true),
-                // Its base is already gone: it stays unimaged and its merges
-                // refuse (410).
-                Err(_) => continue,
+                // TD-SEAM-12 follow-up: if the collection has a truncation mark
+                // but also has branch-tagged entries in the retained WAL (branched
+                // after truncation), create a fresh image from retained history.
+                // This auto-registers the branch and clears the need for explicit
+                // BranchRef registration.
+                //
+                // SAFETY: Only auto-register if the collection has NO entries in
+                // truncated segments (i.e., not in the local `truncated` map).
+                // If it had pre-truncation history, the image would be incomplete
+                // and merges would produce silently incorrect results. In that
+                // case, we must refuse (410) — fail closed.
+                Err(_) => {
+                    if !truncated.contains_key(collection)
+                        && self.wal.has_branch_entries_after(collection, retained_from)
+                    {
+                        (MergeBaseImage::default(), true)
+                    } else {
+                        // Its base is truly gone or incomplete: stays unimaged and
+                        // its merges refuse (410). Fail closed.
+                        continue;
+                    }
+                }
             };
             if fresh || image.through < through {
                 let entries: Vec<CanonicalWalEntry> = self
@@ -430,6 +459,10 @@ impl BranchBaseStore {
                 image.advance(&entries, through);
             }
             images.insert(collection.clone(), image);
+            // TD-SEAM-12 follow-up: if we created an image for a collection
+            // that had a truncation mark (branched after truncation), clear
+            // the mark — the image now covers the retained history.
+            truncated.remove(collection);
         }
 
         let changed = state.generation == 0

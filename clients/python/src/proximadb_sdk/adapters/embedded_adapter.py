@@ -554,6 +554,11 @@ class EmbeddedProtocolAdapter(RecordOpsMixin, BaseProtocolAdapter):
                     total=len(records),
                     success=successful,
                     failed=failed,
+                    # no inserted_ids: the PyO3 result carries counts only
+                    # (per-record ids need wire support in the embedded
+                    # binding — documented limitation), and echoing the
+                    # client-supplied ids would misreport partial failures
+                    # as inserted and crash pydantic on id-less records.
                     metrics=OperationMetrics(
                         total_processed=len(records),
                         successful_count=successful,

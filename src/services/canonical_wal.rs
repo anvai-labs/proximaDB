@@ -410,6 +410,9 @@ struct SegmentSummary {
     first_branch_seq: Option<u64>,
     /// Every `(tenant, collection)` with a branch-tagged record here.
     branched: BTreeSet<TenantCollection>,
+    /// Every `(tenant, collection)` with a `RecordPartitionDrop` here.
+    /// TD-SEAM-12 follow-up: used to clear truncation marks for dropped collections.
+    dropped: BTreeSet<TenantCollection>,
     /// collection id → every tenant with an entry of it here.
     tenants: std::collections::HashMap<String, BTreeSet<String>>,
 }
@@ -418,6 +421,7 @@ impl SegmentSummary {
     fn new(path: PathBuf) -> Self {
         Self {
             path,
+            dropped: BTreeSet::new(),
             ..Default::default()
         }
     }
@@ -451,6 +455,14 @@ impl SegmentSummary {
                 collection_id,
             ));
         }
+        // TD-SEAM-12 follow-up: track partition drops so truncation marks
+        // can be cleared for dropped-and-recreated collections.
+        if let CanonicalOperation::RecordPartitionDrop { collection_id } = &entry.operation {
+            self.dropped.insert(TenantCollection::new(
+                entry.tenant_id.as_deref(),
+                collection_id,
+            ));
+        }
     }
 
     /// Whether [`FramedTableWalAppender::truncate_below`] at `floor` removes
@@ -467,6 +479,18 @@ impl SegmentSummary {
                 .collection_max
                 .get(collection_id)
                 .is_some_and(|max| *max > since)
+    }
+
+    /// TD-SEAM-12 follow-up: whether this segment has a `RecordPartitionDrop`
+    /// for the given collection.
+    fn has_partition_drop_for(&self, collection: &TenantCollection) -> bool {
+        self.dropped.contains(collection)
+    }
+
+    /// TD-SEAM-12 follow-up: whether this segment has branch-tagged entries
+    /// for the given collection.
+    fn has_branch_for(&self, collection: &TenantCollection) -> bool {
+        self.branched.contains(collection)
     }
 }
 
@@ -572,6 +596,10 @@ struct SummaryData {
     has_uncollected: bool,
     first_branch_seq: Option<u64>,
     branched: BTreeSet<TenantCollection>,
+    /// TD-SEAM-12 follow-up: collections dropped in this segment.
+    /// `#[serde(default)]` for backward compat — old summaries lack this field.
+    #[serde(default)]
+    dropped: BTreeSet<TenantCollection>,
     tenants: std::collections::HashMap<String, BTreeSet<String>>,
 }
 
@@ -584,6 +612,7 @@ impl From<&SegmentSummary> for SummaryData {
             has_uncollected: s.has_uncollected,
             first_branch_seq: s.first_branch_seq,
             branched: s.branched.clone(),
+            dropped: s.dropped.clone(),
             tenants: s.tenants.clone(),
         }
     }
@@ -599,6 +628,7 @@ impl SummaryData {
             has_uncollected: self.has_uncollected,
             first_branch_seq: self.first_branch_seq,
             branched: self.branched,
+            dropped: self.dropped,
             tenants: self.tenants,
         }
     }
@@ -1181,6 +1211,38 @@ impl FramedTableWalAppender {
                 .chain(std::iter::once(&active))
                 .take_while(|s| s.wholly_below(floor)),
         )
+    }
+
+    /// TD-SEAM-12 follow-up: check if there's a `RecordPartitionDrop` for
+    /// `collection` at or after sequence `after` in the retained WAL. Used to
+    /// clear truncation marks for collections that have been dropped and re-created.
+    /// Uses `>=` (not `>`) so drops co-located with the mark's segment are found.
+    pub fn has_partition_drop_after(&self, collection: &TenantCollection, after: u64) -> bool {
+        let active = self.active.lock().clone();
+        let sealed = self.sealed.read();
+        for segment in sealed.iter().chain(std::iter::once(&active)) {
+            if segment.first_seq.is_some_and(|f| f >= after)
+                && segment.has_partition_drop_for(collection)
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// TD-SEAM-12 follow-up: check if `collection` has any branch-tagged entries
+    /// at or after sequence `after` in the retained WAL. Used to detect collections
+    /// that were branched after truncation — these can get auto-registered by
+    /// creating a fresh merge-base image from the retained history.
+    pub fn has_branch_entries_after(&self, collection: &TenantCollection, after: u64) -> bool {
+        let active = self.active.lock().clone();
+        let sealed = self.sealed.read();
+        for segment in sealed.iter().chain(std::iter::once(&active)) {
+            if segment.first_seq.is_some_and(|f| f >= after) && segment.has_branch_for(collection) {
+                return true;
+            }
+        }
+        false
     }
 
     /// Arm the next [`Self::truncate_below`] (which consumes it) to refuse —
