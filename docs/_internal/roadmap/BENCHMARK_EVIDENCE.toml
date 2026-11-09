@@ -1500,32 +1500,32 @@ notes = "E2E result is negative-but-true: the codec optimization is real at the 
 
 [[claims]]
 id = "binary_json_at_rest_savings"
-claim = "Binary document ingest (PROXIMADB_DOC_BINARY_INGEST=1) stores document metadata as a single Jsonb blob (MessagePack at rest) instead of per-field materialization. Format bake-off (2026-11-08) measured MessagePack at 69.5% of JSON text on heterogeneous mixed docs (30.5% savings) and 71.4% on homogeneous small docs (28.6% savings). Avro was measured but fails the decision threshold: 14.42x decode overhead on homogeneous docs (must be ±20% parity) and cannot encode heterogeneous/nested docs without a per-collection schema registry. MessagePack chosen as default — already the JsonbValue encoding (proto tag 8), schema-free, mixed-read-safe by construction."
-metric = "at-rest bytes/doc (MessagePack vs JSON text)"
-status = "unverified"
+claim = "Binary document ingest (PROXIMADB_DOC_BINARY_INGEST=1) stores document metadata as a single Jsonb blob + typed overlay. E2E at-rest benchmark (10k docs, 128-dim vectors, mixed metadata, 2026-11-08) measured ZERO at-rest savings: gate OFF = 9.2 MB (969.5 bytes/doc), gate ON = 9.2 MB (969.5 bytes/doc). The format bake-off showed MessagePack is 28-30% smaller than JSON text at the encoding level, but the storage layer stores ProximaValue variants (already binary-encoded), not JSON text. The blob + typed overlay stores the same total data volume as the all-fields overlay. At-rest savings would require true late materialization (not storing non-indexed fields at all), which is not yet implemented."
+metric = "at-rest bytes/doc (gate ON vs gate OFF)"
+status = "measured"
 asserted_in = [
-  "src/network/rest/v2/documents.rs",
+  "scripts/bench_at_rest.sh",
 ]
-bench_source = "src/network/rest/v2/documents.rs"
-bench_command = "N/A — bake-off was run inline via Python script (not checked in)"
-artifact = ""
+bench_source = "scripts/bench_at_rest.sh"
+bench_command = "./scripts/bench_at_rest.sh 10000"
+artifact = "bench_results/binary_json_at_rest_20261108.json"
 hardware = "Apple Silicon 10-core, 64GB RAM (aarch64-apple-darwin)"
 date = "2026-11-08"
-version = "develop (post Phase A bake-off)"
-notes = "At-rest savings are the primary claim carrier for the binary-JSON refactor. E2E throughput impact is below noise (Phase 0 profile: doc-shape handling <5% of ingest wall time). Avro dismissed: fails decode-cost parity (14.42x vs ±20% threshold) and cannot handle heterogeneous docs without schema registry machinery."
+version = "develop (post Phase A+B merge)"
+notes = "Honest negative result: at-rest savings do NOT materialize at the storage level. The format bake-off (MessagePack vs JSON text) measures encoding-level savings, but the storage layer uses ProximaValue variants which are already binary. The blob + typed overlay path stores the same total data as the all-fields overlay path. To achieve actual at-rest savings, would need true late materialization: store only indexed fields + blob, don't duplicate non-indexed fields in the overlay. This is a follow-up optimization, not yet implemented."
 
 [[claims]]
 id = "binary_json_e2e_ingest_throughput"
 claim = "E2E ingest throughput with binary document path (PROXIMADB_DOC_BINARY_INGEST=1) vs current develop path. Phase 0 profile (2026-11-08) determined doc-shape handling is <5% of ingest wall time (codec e2e result: +0.48% within noise at 1663 docs/s). Binary ingest expected to show similar — the optimization targets at-rest bytes, not throughput. Late materialization (O(indexed) write cost instead of O(document)) may show improvement on collections with many non-indexed fields, but this is not yet measured."
 metric = "docs/sec (e2e REST ingest throughput)"
-status = "unverified"
+status = "measured"
 asserted_in = [
-  "src/network/rest/v2/documents.rs",
+  "scripts/bench_at_rest.sh",
 ]
-bench_source = "scripts/bench_e2e_ingest.sh"
-bench_command = "./scripts/bench_e2e_ingest.sh 10000"
-artifact = ""
-hardware = ""
+bench_source = "scripts/bench_at_rest.sh"
+bench_command = "./scripts/bench_at_rest.sh 10000"
+artifact = "bench_results/binary_json_at_rest_20261108.json"
+hardware = "Apple Silicon 10-core, 64GB RAM (aarch64-apple-darwin)"
 date = "2026-11-08"
-version = "develop"
-notes = "E2E throughput is NOT the claim carrier for binary-JSON — at-rest bytes is. Phase 0 profile showed doc-shape handling <5% of wall time, so throughput improvement is expected to be within noise. The real win is ~28-30% at-rest savings (MessagePack vs JSON text). This entry will be updated to 'measured' after running the e2e bench with gate ON vs OFF."
+version = "develop (post Phase A+B merge)"
+notes = "E2E throughput measured: gate OFF = 1726 docs/sec, gate ON = 1683 docs/sec. Delta is within noise (-2.5%), confirming Phase 0 profile that doc-shape handling is <5% of wall time. Throughput is NOT the claim carrier for binary-JSON — the project proceeds on exactness merits (u64/i64/f64 preserved exactly in MessagePack) and the architectural foundation for future late-materialization optimizations."

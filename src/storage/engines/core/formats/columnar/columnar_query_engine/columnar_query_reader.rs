@@ -146,15 +146,6 @@ pub enum FilterValue {
     FloatList(Vec<f64>),
 }
 
-/// Quantization method for vectors
-#[derive(Debug, Clone, Copy)]
-pub enum QuantizationMethod {
-    None,
-    Binary,
-    Int8,
-    PQ,
-}
-
 /// Seek range for targeted reads
 #[derive(Debug, Clone)]
 pub struct SeekRange {

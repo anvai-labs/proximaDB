@@ -1,0 +1,26 @@
+{
+  "benchmark": "binary_json_at_rest",
+  "date": "2026-11-08",
+  "doc_count": 10000,
+  "vector_dim": 128,
+  "gate_off": {
+    "storage_mb": 9.2,
+    "bytes_per_doc": 969.5,
+    "throughput_docs_per_sec": 1726.0,
+    "duration_sec": 5.79
+  },
+  "gate_on": {
+    "storage_mb": 9.2,
+    "bytes_per_doc": 969.5,
+    "throughput_docs_per_sec": 1683.0,
+    "duration_sec": 5.94
+  },
+  "delta": {
+    "at_rest_savings_pct": 0.0,
+    "throughput_delta_pct": -2.5
+  },
+  "conclusion": "ZERO at-rest savings. Storage layer uses ProximaValue variants (already binary), not JSON text. Format bake-off savings (28-30% MessagePack vs JSON) don't materialize at storage level.",
+  "hardware": "Apple Silicon 10-core, 64GB RAM (aarch64-apple-darwin)",
+  "server_binary": "target/release/proximadb-server",
+  "bench_script": "scripts/bench_at_rest.sh"
+}

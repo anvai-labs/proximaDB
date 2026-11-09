@@ -19,6 +19,7 @@ use tracing::{debug, info, trace};
 use crate::compute::quantization::storage_engine::StorageQuantizationEngine;
 pub use crate::core::search::{FilterExpression, SearchParams};
 use crate::proto::proximadb_v1::{Collection, CompressionAlgorithm};
+use crate::query::rl_planner::action::QuantizationStage;
 use crate::query::rl_planner::{ExecutionAction, get_rl_planner};
 use crate::storage::engines::core::formats::columnar::common::EarlyTerminationConfig;
 // Note: SearchStageContext from search_modes is for search stages, not query context - using StorageQueryContext instead
@@ -1538,8 +1539,10 @@ pub enum SearchExecutionMethod {
     },
     /// Search using only quantized representations
     QuantizedOnly {
-        /// Type of quantization to use
-        quantization_type: QuantizationType,
+        /// Type of quantization to use (the shared progressive-pipeline
+        /// stage vocabulary — consolidated 2026-11-08; FP16/FP32 members are
+        /// exact-precision stages and are never constructed by the optimizer)
+        quantization_type: QuantizationStage,
     },
     /// Search using a pre-built index
     IndexBased {
@@ -1587,35 +1590,6 @@ pub enum SearchAlgorithm {
     QuantizedSearch,
     /// Exact brute-force distance computation
     ExactSearch,
-}
-
-/// Quantization types
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum QuantizationType {
-    /// 1-bit binary quantization
-    Binary,
-    /// 8-bit integer quantization
-    INT8,
-    /// Product quantization with 4-bit sub-quantizers
-    PQ4,
-    /// Product quantization with 8-bit sub-quantizers
-    PQ8,
-}
-
-impl QuantizationType {
-    /// Quality rank where higher = higher precision/recall. Aligned with
-    /// [`QuantizationStage::quality_rank`] so RL-side floor comparisons can
-    /// be done uniformly across both enums.
-    ///
-    /// [`QuantizationStage::quality_rank`]: crate::query::rl_planner::action::QuantizationStage::quality_rank
-    pub fn quality_rank(self) -> u8 {
-        match self {
-            Self::Binary => 0,
-            Self::PQ4 => 1,
-            Self::PQ8 => 2,
-            Self::INT8 => 3,
-        }
-    }
 }
 
 /// Index types
@@ -1981,8 +1955,8 @@ pub struct SearchOptimizerConfig {
 /// Quantization strategy
 #[derive(Debug, Clone)]
 pub struct QuantizationStrategy {
-    /// Type of quantization to apply
-    pub quantization_type: QuantizationType,
+    /// Type of quantization to apply (shared stage vocabulary)
+    pub quantization_type: QuantizationStage,
     /// Whether to use two-stage search (quantized then exact)
     pub use_two_stage: bool,
     /// Multiplier for candidate count in quantized search
@@ -2319,7 +2293,7 @@ impl UnifiedQueryOptimizer {
         } else {
             // Large dataset without indexes - quantized only
             SearchExecutionMethod::QuantizedOnly {
-                quantization_type: QuantizationType::PQ8,
+                quantization_type: QuantizationStage::PQ8,
             }
         };
 
@@ -2336,7 +2310,7 @@ impl UnifiedQueryOptimizer {
 
         if estimated_dataset_size > 100000 {
             Some(QuantizationStrategy {
-                quantization_type: QuantizationType::PQ8,
+                quantization_type: QuantizationStage::PQ8,
                 use_two_stage: true,
                 candidate_multiplier: 10,
             })
@@ -2913,10 +2887,10 @@ impl UnifiedQueryOptimizer {
                 offset: None,
                 execution_steps: vec![ExecutionStep::VectorSearch {
                     execution_method: SearchExecutionMethod::QuantizedOnly {
-                        quantization_type: QuantizationType::Binary,
+                        quantization_type: QuantizationStage::Binary,
                     },
                     quantization_strategy: Some(QuantizationStrategy {
-                        quantization_type: QuantizationType::Binary,
+                        quantization_type: QuantizationStage::Binary,
                         use_two_stage: false,
                         candidate_multiplier: 5,
                     }),
