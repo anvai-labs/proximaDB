@@ -15,7 +15,12 @@ from datetime import UTC
 from typing import Any
 
 from ..exceptions import ProximaDBError
-from ..models import BatchResult, SearchResult, VectorOperationResponse, resolve_vector_ids
+from ..models import (
+    BatchResult,
+    SearchResult,
+    VectorOperationResponse,
+    resolve_vector_ids,
+)
 from ..models_v2 import ProximaRecord
 from . import _grpc_v2_codec as _codec
 from .connection_pools import GrpcChannelContext, GrpcConnectionPool
