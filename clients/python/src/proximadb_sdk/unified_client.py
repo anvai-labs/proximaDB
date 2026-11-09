@@ -43,7 +43,6 @@ from .models import (
     HealthStatus,
     IndexingAlgorithm,
     OperationMetrics,
-    resolve_vector_ids,
     QuantizationConfig,
     QuantizationType,
     SearchResult,
@@ -51,6 +50,7 @@ from .models import (
     VectorOperationResponse,
     VectorRecord,
     normalize_collection_config_kwargs,
+    resolve_vector_ids,
 )
 from .operation_router import OperationRouter, RoutingConfig, RoutingStrategy
 from .proto_conversion import ProtoConverter
