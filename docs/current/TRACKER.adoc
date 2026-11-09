@@ -93,7 +93,11 @@ They are recorded here to prevent duplication and provide context for future ses
 
 | #2489
 | **TD-SEAM-12 branch-closure fixes**: (1) `write_back_merge` clears `branch_id` on merged records so the truncator's branch floor can advance and branches can close; (2) `filter_wal_by_branch_lsn` includes untagged records (`branch_id=None`) when filtering for "main" since they are implicitly on main.
-| Two of five TD-SEAM-12 open follow-ups resolved. Remaining: branch registration after truncation, pre-tracking truncation handling, truncation mark cleanup. TD-SEAM-14 (object-store recovery) remains open.
+| Two of five TD-SEAM-12 open follow-ups resolved.
+
+| #2492
+| **TD-SEAM-12 truncation mark clearing**: Track `RecordPartitionDrop` in `SegmentSummary` (new `dropped` field with serde backward compat). Clear truncation marks during checkpoint for collections that have been dropped in the retained WAL, so dropped-and-recreated collections no longer return 410.
+| Three of five TD-SEAM-12 open follow-ups resolved. Remaining: branch registration after truncation, pre-tracking truncation handling. TD-SEAM-14 (object-store recovery) remains open.
 
 |===
 
