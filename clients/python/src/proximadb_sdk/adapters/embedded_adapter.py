@@ -554,6 +554,13 @@ class EmbeddedProtocolAdapter(RecordOpsMixin, BaseProtocolAdapter):
                     total=len(records),
                     success=successful,
                     failed=failed,
+                    # embedded echo: the PyO3 result carries counts only, so
+                    # the client-supplied ids are all we can surface (a
+                    # server-assigned-id channel needs wire support in the
+                    # embedded binding — documented limitation)
+                    inserted_ids=[
+                        r.get("id") for r in self._record_payloads(records)
+                    ],
                     metrics=OperationMetrics(
                         total_processed=len(records),
                         successful_count=successful,

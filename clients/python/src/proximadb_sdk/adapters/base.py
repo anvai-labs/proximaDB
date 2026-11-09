@@ -61,6 +61,20 @@ class RecordOpsMixin:
             error_message="; ".join(result.errors) if result.errors else None,
         )
 
+    @staticmethod
+    def resolve_vector_ids(
+        result: BatchResult,
+        records: list[dict[str, Any]] | list[object],
+    ) -> list[str]:
+        # The ONE vector_ids policy for the legacy aliases — defined once in
+        # models.resolve_vector_ids (importable by protocols without a
+        # cycle). All alias sites (REST unified client, grpc_sync,
+        # grpc_async) MUST route through this — three divergent hand-rolled
+        # copies of this policy is exactly how the v1 silent drift happened
+        # (TD-SDK-3).
+        from proximadb_sdk.models import resolve_vector_ids as _resolve
+        return _resolve(result, records)
+
 
 class BaseProtocolAdapter(ABC):
     """Abstract base class for SDK adapters.

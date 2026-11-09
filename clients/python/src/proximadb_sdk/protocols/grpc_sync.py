@@ -15,7 +15,7 @@ from datetime import UTC
 from typing import Any
 
 from ..exceptions import ProximaDBError
-from ..models import BatchResult, SearchResult, VectorOperationResponse
+from ..models import BatchResult, SearchResult, VectorOperationResponse, resolve_vector_ids
 from ..models_v2 import ProximaRecord
 from . import _grpc_v2_codec as _codec
 from .connection_pools import GrpcChannelContext, GrpcConnectionPool
@@ -1164,10 +1164,9 @@ class ProximaDBSyncGrpcClient:
             success=batch_result.failed == 0,
             operation="UPSERT" if upsert else "INSERT",
             metrics=batch_result.metrics,
-            # prefer server-assigned IDs; fall back to the client-supplied
-            # echo only when the transport result carries none
-            vector_ids=batch_result.inserted_ids
-            or [record["id"] for record in records],
+            # the ONE policy (models.resolve_vector_ids — shared with the
+            # REST unified client and the async grpc client)
+            vector_ids=resolve_vector_ids(batch_result, records),
             error_message=(
                 "; ".join(batch_result.errors) if batch_result.errors else None
             ),

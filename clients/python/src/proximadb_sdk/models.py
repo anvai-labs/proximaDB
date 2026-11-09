@@ -1514,6 +1514,34 @@ class BatchResult(BaseModel):
     # response does not carry per-record IDs.
     inserted_ids: list[str] = Field(default_factory=list)
 
+def resolve_vector_ids(
+    result: "BatchResult",
+    records: list,
+) -> list:
+    """The ONE vector_ids policy for the legacy insert/upsert aliases.
+
+    Prefer server-assigned IDs (BatchResult.inserted_ids); fall back to
+    the client-supplied id echo ONLY when the operation fully succeeded
+    (on failures the echo lists records the server rejected, including
+    fabricated placeholders). All alias sites (REST unified client,
+    grpc_sync, grpc_async) MUST route through this — divergent hand-rolled
+    copies of this policy are exactly how the v1 silent drift happened
+    (TD-SDK-3)."""
+    if result.inserted_ids:
+        return list(result.inserted_ids)
+    if result.failed == 0:
+        ids = []
+        for record in records:
+            if isinstance(record, dict):
+                rid = record.get("id")
+            else:
+                rid = getattr(record, "id", None)
+            if rid:
+                ids.append(rid)
+        return ids
+    return []
+
+
 
 class VectorOperationResponse(BaseModel):
     """Vector operation response"""

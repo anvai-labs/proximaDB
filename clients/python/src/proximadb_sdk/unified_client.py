@@ -43,6 +43,7 @@ from .models import (
     HealthStatus,
     IndexingAlgorithm,
     OperationMetrics,
+    resolve_vector_ids,
     QuantizationConfig,
     QuantizationType,
     SearchResult,
@@ -2393,18 +2394,9 @@ class ProximaDBClient:
                 successful_count=result.success,
                 failed_count=result.failed,
             ),
-            # prefer server-assigned IDs when the batch result carries them;
-            # the client-echo fallback applies ONLY to fully-successful
-            # operations (on failures the echo would list records the
-            # server rejected, including fabricated placeholders)
-            vector_ids=(
-                result.inserted_ids
-                or (
-                    [record["id"] for record in records if record.get("id")]
-                    if result.failed == 0
-                    else []
-                )
-            ),
+            # the ONE policy (models.resolve_vector_ids — shared with the
+            # grpc aliases)
+            vector_ids=resolve_vector_ids(result, records),
             error_message="; ".join(result.errors) if result.errors else None,
         )
 

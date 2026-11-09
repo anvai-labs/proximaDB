@@ -493,6 +493,7 @@ class GrpcProtocolAdapter(RecordOpsMixin, SyncGraphDelegations, BaseProtocolAdap
                     duration_ms=getattr(metrics, "duration_ms", 0),
                     total_count=total_count,
                 ),
+                vector_ids=list(getattr(result, "inserted_ids", None) or []),
                 error_message=error_message,
             )
 

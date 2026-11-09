@@ -25,7 +25,7 @@ import logging
 from typing import TYPE_CHECKING, Any
 
 from ..exceptions import ProximaDBError
-from ..models import SearchResult, VectorOperationResponse
+from ..models import SearchResult, VectorOperationResponse, resolve_vector_ids
 from . import _grpc_v2_codec as _codec
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -346,9 +346,9 @@ class ProximaDBAsyncGrpcClient:
             success=batch.failed == 0,
             operation="UPSERT" if upsert else "INSERT",
             metrics=batch.metrics,
-            # prefer server-assigned IDs; fall back to the client-supplied
-            # echo only when the transport result carries none
-            vector_ids=batch.inserted_ids or [r["id"] for r in records],
+            # the ONE policy (models.resolve_vector_ids — shared with the
+            # sync grpc client and the REST unified client)
+            vector_ids=resolve_vector_ids(batch, records),
             error_message="; ".join(batch.errors) if batch.errors else None,
         )
 
