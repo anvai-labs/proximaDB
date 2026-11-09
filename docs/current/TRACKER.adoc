@@ -97,7 +97,11 @@ They are recorded here to prevent duplication and provide context for future ses
 
 | #2492
 | **TD-SEAM-12 truncation mark clearing**: Track `RecordPartitionDrop` in `SegmentSummary` (new `dropped` field with serde backward compat). Clear truncation marks during checkpoint for collections that have been dropped in the retained WAL, so dropped-and-recreated collections no longer return 410.
-| Three of five TD-SEAM-12 open follow-ups resolved. Remaining: branch registration after truncation, pre-tracking truncation handling. TD-SEAM-14 (object-store recovery) remains open.
+| Three of five TD-SEAM-12 open follow-ups resolved.
+
+| #2495
+| **TD-SEAM-12 branch-after-truncate auto-registration**: In `checkpoint()`, when `base_for` returns `Err` but the collection has branch-tagged entries in the retained WAL, auto-create a fresh merge-base image. Safety guard: only auto-register when collection has NO entries in truncated segments (`!truncated.contains_key`), fail closed otherwise. Design doc for follow-up 5 (pre-tracking truncation) at `TD-SEAM-12-F5`.
+| Four of five TD-SEAM-12 open follow-ups resolved. Remaining: pre-tracking truncation handling (documented in TD-SEAM-12-F5, not yet implemented). TD-SEAM-14 (object-store recovery) remains open.
 
 |===
 
