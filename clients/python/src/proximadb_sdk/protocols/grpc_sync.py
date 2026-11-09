@@ -1164,7 +1164,10 @@ class ProximaDBSyncGrpcClient:
             success=batch_result.failed == 0,
             operation="UPSERT" if upsert else "INSERT",
             metrics=batch_result.metrics,
-            vector_ids=[record["id"] for record in records],
+            # prefer server-assigned IDs; fall back to the client-supplied
+            # echo only when the transport result carries none
+            vector_ids=batch_result.inserted_ids
+            or [record["id"] for record in records],
             error_message=(
                 "; ".join(batch_result.errors) if batch_result.errors else None
             ),

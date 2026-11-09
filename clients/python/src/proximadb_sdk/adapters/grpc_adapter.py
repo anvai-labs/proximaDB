@@ -302,6 +302,7 @@ class GrpcProtocolAdapter(RecordOpsMixin, SyncGraphDelegations, BaseProtocolAdap
             success=response.metrics.successful_count,
             failed=response.metrics.failed_count,
             errors=[response.error_message] if response.error_message else [],
+            inserted_ids=list(response.vector_ids or []),
             metrics=response.metrics,
         )
 
@@ -330,6 +331,7 @@ class GrpcProtocolAdapter(RecordOpsMixin, SyncGraphDelegations, BaseProtocolAdap
             success=response.metrics.successful_count,
             failed=response.metrics.failed_count,
             errors=[response.error_message] if response.error_message else [],
+            inserted_ids=list(response.vector_ids or []),
             metrics=response.metrics,
         )
 

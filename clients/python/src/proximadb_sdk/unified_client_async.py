@@ -453,11 +453,18 @@ class ProximaDBAsyncUnified:
         inserted = int(data.get("inserted_count", 0) or 0)
         failed = int(data.get("failed_count", 0) or 0)
         total = inserted + failed
+        # the server serializes per-record failures as structured
+        # InsertError objects; BatchResult.errors is list[str] — coerce
+        # (same as the sync path's _record_write_result).
+        errors = [
+            e.get("error", str(e)) if isinstance(e, dict) else str(e)
+            for e in (data.get("errors", []) or [])
+        ]
         return BatchResult(
             total=total,
             success=inserted,
             failed=failed,
-            errors=data.get("errors", []) or [],
+            errors=errors,
             duration_ms=0.0,
             # the generated model's to_dict() already carries the
             # server-assigned per-record IDs — keep them (same channel as
