@@ -548,6 +548,9 @@ jobs:
           mkdir -p rpm_build/var/lib/proximadb
           mkdir -p rpm_build/var/log/proximadb
           mkdir -p rpm_build/tmp
+          # TD-PKG-1 contract data file — postinstall sources it at %post
+          # time and the release smoke asserts the same dirs.
+          cp deploy/packaging/chown_dirs.env rpm_build/etc/proximadb/chown_dirs.env
 
           # Only the three binaries go to /usr/bin (the archive's README,
           # LICENSE and config/ used to land there too); config ships as
@@ -583,16 +586,34 @@ jobs:
       - name: Verify RPM installs and runs (rockylinux:8)
         run: |
           VERSION="${{ needs.prepare.outputs.version }}"
-          docker run --rm -e VER="$VERSION" -v "$PWD:/pkg:ro" rockylinux:8 bash -euo pipefail -c '
-            dnf install -y /pkg/proximadb-*.rpm
-            test -x /usr/bin/proximadb-server
-            test -f /etc/proximadb/config.toml
-            test -f /usr/lib/systemd/system/proximadb.service
-            got="$(/usr/bin/proximadb-server --version)"
-            test "$got" = "proximadb-server $VER"
-            rpm -V proximadb
-            rpm -e proximadb
-            test ! -e /usr/bin/proximadb-server'
+          # Verifier body lives in deploy/packaging/scripts/verify_rpm.sh
+          # (bash -n testable; mounted read-only via the repo checkout). It
+          # installs, asserts payload/version, tolerates ONLY the two
+          # by-design TD-PKG-1 state-dir deviations in rpm -V, and erases.
+          # bash -n catches PARSE errors only, not quoting/word-splitting
+          # defects (shellcheck would; TODO: an actionlint/yamllint+shellcheck
+          # lane for release.yml and deploy/packaging/scripts is still
+          # missing — the deleted-upload-header parse break on this very
+          # branch reached GitHub before any local check).
+          bash -n deploy/packaging/scripts/verify_rpm.sh
+          bash -n deploy/packaging/scripts/verify_payload_common.sh
+          # The gate's OWN selftest replays the exact v0.6.0 failure output
+          # (positive fixture, no container needed) — and the NEGATIVE
+          # fixtures are exercised too: the gate must REJECT a dead-%post
+          # (clean rpm -V), a contract subset, and a foreign deviation.
+          bash deploy/packaging/scripts/verify_rpm.sh selftest
+          VERIFY_RPM_DEV_FIXTURE="" bash deploy/packaging/scripts/verify_rpm.sh selftest \
+            >/dev/null 2>&1 && { echo "FATAL: dead-%post fixture was ACCEPTED"; exit 1; }
+          # contract-subset: default contract (2 dirs) but only ONE deviation
+          # in the fixture → n_matched(1) != n_expected(2) → gate rejects.
+          VERIFY_RPM_DEV_FIXTURE=$'.M...UG..    /var/lib/proximadb' \
+            bash deploy/packaging/scripts/verify_rpm.sh selftest \
+            >/dev/null 2>&1 && { echo "FATAL: contract-subset fixture was ACCEPTED"; exit 1; }
+          VERIFY_RPM_DEV_FIXTURE=$'.M...UG..    /var/lib/proximadb\n.M...UG..    /var/log/proximadb\n..5......    /usr/bin/proximadb-server' \
+            bash deploy/packaging/scripts/verify_rpm.sh selftest \
+            >/dev/null 2>&1 && { echo "FATAL: foreign-deviation fixture was ACCEPTED"; exit 1; }
+          docker run --rm -v "$PWD:/pkg:ro" rockylinux:8 \
+            bash /pkg/deploy/packaging/scripts/verify_rpm.sh "$VERSION"
           # %post scriptlets (systemctl daemon-reload) still report failure here because
           # systemd is not PID 1 in the container; rpm treats a scriptlet failure as a
           # warning and dnf exits 0, so this step proves payload/paths/version/metadata/
@@ -636,6 +657,8 @@ jobs:
           mkdir -p deb_build/var/log/proximadb
           mkdir -p deb_build/tmp
           mkdir -p deb_build/lib/systemd/system
+          # TD-PKG-1 contract data file (postinst sources it; smoke asserts it).
+          cp deploy/packaging/chown_dirs.env deb_build/etc/proximadb/chown_dirs.env
 
           # Only the three binaries go to /usr/bin (the archive's README,
           # LICENSE and config/ used to land there too); config ships as
@@ -669,16 +692,22 @@ jobs:
       - name: Verify DEB installs and runs (debian:11)
         run: |
           VERSION="${{ needs.prepare.outputs.version }}"
-          docker run --rm -e VER="$VERSION" -v "$PWD:/pkg:ro" debian:11 bash -euo pipefail -c '
-            apt-get update -qq
-            apt-get install -y -qq /pkg/proximadb_*_amd64.deb
-            test -x /usr/bin/proximadb-server
-            test -f /etc/proximadb/config.toml
-            test -f /lib/systemd/system/proximadb.service
-            got="$(/usr/bin/proximadb-server --version)"
-            test "$got" = "proximadb-server $VER"
-            dpkg -r proximadb
-            test ! -e /usr/bin/proximadb-server'
+          # Lint before dispatching (parse errors only — shellcheck for quoting).
+          bash -n deploy/packaging/scripts/verify_deb.sh
+          bash -n deploy/packaging/scripts/verify_payload_common.sh
+          # Selftest + negative fixture: clean dpkg -V must be ACCEPTED and
+          # printed deviations must be REJECTED (dpkg -V exits 0 even when
+          # printing — its rc is nonzero only for a not-installed package).
+          bash deploy/packaging/scripts/verify_deb.sh selftest
+          VERIFY_DEB_DEV_FIXTURE=$'??5??????    /usr/bin/proximadb-server' \
+            bash deploy/packaging/scripts/verify_deb.sh selftest \
+            >/dev/null 2>&1 && { echo "FATAL: deviating dpkg -V fixture was ACCEPTED"; exit 1; }
+          # rc fixture: nonzero rc with NO output (db error / not installed)
+          # must be a HARD failure, not a silent clean verify.
+          VERIFY_DEB_RC_FIXTURE=1 bash deploy/packaging/scripts/verify_deb.sh selftest \
+            >/dev/null 2>&1 && { echo "FATAL: rc-with-no-output fixture was ACCEPTED"; exit 1; }
+          docker run --rm -v "$PWD:/pkg:ro" debian:11 \
+            bash /pkg/deploy/packaging/scripts/verify_deb.sh "$VERSION"
 
       - name: Upload DEB Artifact
         uses: actions/upload-artifact@v7

@@ -1483,16 +1483,49 @@ notes = "Registered here (release-review F3) because the 0.5.0 changelog cites t
 
 [[claims]]
 id = "value_codec_phase1_visitor_deserialize"
-claim = "Phase 1 of the value-codec refactor replaced the two-pass Value-first SqlValue Deserialize (materialize serde_json::Value DOM, then walk it) with a one-pass streaming visitor (deserialize_any + Visitor). The kernel bench (benches/bench_value_codec.rs) measures the visitor path (sql_value_from_slice) against the DOM path (serde_json::from_str → serde_json::from_value) across six doc shapes (small object, string-heavy, numeric array, deep nested, tagged string, tagged array). Numbers are indicative — the real win is elimination of the intermediate DOM allocation, visible in throughput and allocation profiles."
-metric = "throughput (bytes/sec) and ns/iter for JSON→SqlValue deserialization, visitor vs DOM path"
-status = "unverified"
+claim = "Phase 1 of the value-codec refactor replaced the two-pass Value-first SqlValue Deserialize (materialize serde_json::Value DOM, then walk it) with a one-pass streaming visitor (deserialize_any + Visitor). The kernel bench (benches/bench_value_codec.rs) measures the visitor path (sql_value_from_slice) against the DOM path (serde_json::from_str → serde_json::from_value) across six doc shapes. E2E ingest benchmark (10k docs, 128-dim vectors, mixed metadata shapes via REST POST /api/v2/collections/{id}/records/batch) shows the codec optimization is below e2e noise: before=1663 docs/sec (commit 8c5e7765b), after=1671 docs/sec (commit 23a08ccfc), delta=+0.48%. The conversion cost is real and allocation-relevant at the kernel level, but represents a small fraction of total ingest wall time."
+metric = "throughput (docs/sec) for e2e REST document ingest; ns/iter for kernel JSON→SqlValue conversion"
+status = "measured"
 asserted_in = [
   "benches/bench_value_codec.rs",
+  "scripts/bench_e2e_ingest.sh",
 ]
-bench_source = "benches/bench_value_codec.rs"
-bench_command = "cargo bench --bench bench_value_codec"
+bench_source = "scripts/bench_e2e_ingest.sh"
+bench_command = "./scripts/bench_e2e_ingest.sh 10000"
+artifact = "bench_results_20261108_085751/summary_before.json"
+hardware = "Apple Silicon 10-core, 64GB RAM (aarch64-apple-darwin)"
+date = "2026-11-08"
+version = "develop (post Phase 1+2 merge)"
+notes = "E2E result is negative-but-true: the codec optimization is real at the kernel level (visitor eliminates intermediate serde_json::Value DOM allocation) but below e2e noise because JSON→SqlValue conversion is a small fraction of total ingest wall time (WAL, storage, indexing dominate). This is the honest ledger entry per mandate #6 — no qualified 'X% faster ingest' claim backed only by kernel numbers."
+
+[[claims]]
+id = "binary_json_at_rest_savings"
+claim = "Binary document ingest (PROXIMADB_DOC_BINARY_INGEST=1) stores document metadata as a single Jsonb blob (MessagePack at rest) instead of per-field materialization. Format bake-off (2026-11-08) measured MessagePack at 69.5% of JSON text on heterogeneous mixed docs (30.5% savings) and 71.4% on homogeneous small docs (28.6% savings). Avro was measured but fails the decision threshold: 14.42x decode overhead on homogeneous docs (must be ±20% parity) and cannot encode heterogeneous/nested docs without a per-collection schema registry. MessagePack chosen as default — already the JsonbValue encoding (proto tag 8), schema-free, mixed-read-safe by construction."
+metric = "at-rest bytes/doc (MessagePack vs JSON text)"
+status = "unverified"
+asserted_in = [
+  "src/network/rest/v2/documents.rs",
+]
+bench_source = "src/network/rest/v2/documents.rs"
+bench_command = "N/A — bake-off was run inline via Python script (not checked in)"
+artifact = ""
+hardware = "Apple Silicon 10-core, 64GB RAM (aarch64-apple-darwin)"
+date = "2026-11-08"
+version = "develop (post Phase A bake-off)"
+notes = "At-rest savings are the primary claim carrier for the binary-JSON refactor. E2E throughput impact is below noise (Phase 0 profile: doc-shape handling <5% of ingest wall time). Avro dismissed: fails decode-cost parity (14.42x vs ±20% threshold) and cannot handle heterogeneous docs without schema registry machinery."
+
+[[claims]]
+id = "binary_json_e2e_ingest_throughput"
+claim = "E2E ingest throughput with binary document path (PROXIMADB_DOC_BINARY_INGEST=1) vs current develop path. Phase 0 profile (2026-11-08) determined doc-shape handling is <5% of ingest wall time (codec e2e result: +0.48% within noise at 1663 docs/s). Binary ingest expected to show similar — the optimization targets at-rest bytes, not throughput. Late materialization (O(indexed) write cost instead of O(document)) may show improvement on collections with many non-indexed fields, but this is not yet measured."
+metric = "docs/sec (e2e REST ingest throughput)"
+status = "unverified"
+asserted_in = [
+  "src/network/rest/v2/documents.rs",
+]
+bench_source = "scripts/bench_e2e_ingest.sh"
+bench_command = "./scripts/bench_e2e_ingest.sh 10000"
 artifact = ""
 hardware = ""
-date = "2026-11-07"
-version = "refactor/value-codec-phase1 branch"
-notes = "Kernel-level indicative numbers only. E2E ingest throughput (REST document insert) is the citable claim for any perf improvement; run the server binary with the bench harness and update this entry to 'measured' with artifact/hardware provenance before citing in release notes."
+date = "2026-11-08"
+version = "develop"
+notes = "E2E throughput is NOT the claim carrier for binary-JSON — at-rest bytes is. Phase 0 profile showed doc-shape handling <5% of wall time, so throughput improvement is expected to be within noise. The real win is ~28-30% at-rest savings (MessagePack vs JSON text). This entry will be updated to 'measured' after running the e2e bench with gate ON vs OFF."

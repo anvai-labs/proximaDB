@@ -1,10 +1,12 @@
 """Offline unit tests for proximadb_sdk.cli.
 
-The cli module imports two symbols that no longer exist in their source
-modules (`ProximaDBConfig` from config, `SearchFilter` from models). To exercise
-the CLI fully offline we inject lightweight stand-ins into those modules BEFORE
-importing cli, so the top-level `from ... import` lines succeed. We then drive
-each command via click's CliRunner with the network-facing client mocked out.
+The CLI is driven via click's CliRunner with the network-facing client mocked
+out. (The historical import-time shims — stand-in ProximaDBConfig/SearchFilter
+classes — were removed 2026-11-08 when cli.py was repaired against the real
+SDK surface; a bare `import proximadb_sdk.cli` is now pinned by the regression
+tests at the bottom of this file.) Render-path contract tests near the bottom
+drive the CLI with REAL SDK model instances, pinning that the renderers handle
+the pydantic types the clients actually return.
 
 ABSOLUTELY no network / no server / no real client construction happens.
 
@@ -70,41 +72,14 @@ import types
 import pytest
 from click.testing import CliRunner
 
-
 # ---------------------------------------------------------------------------
-# Import-time shims: make cli importable without the missing symbols.
+# Direct import — the shims that used to inject ProximaDBConfig/SearchFilter
+# stand-ins were removed when cli.py was repaired against the real SDK surface
+# (2026-11-08): a published console script (`proximadb-cli`) must import
+# WITHOUT test-side rescue, and the regression tests below pin exactly that.
 # ---------------------------------------------------------------------------
-def _ensure_cli_module():
-    import proximadb_sdk.config as config_mod
-    import proximadb_sdk.models as models_mod
+import proximadb_sdk.cli as cli_mod
 
-    if not hasattr(config_mod, "ProximaDBConfig"):
-
-        class ProximaDBConfig:  # minimal stand-in for the stale symbol
-            def __init__(self, host=None, rest_port=None, grpc_port=None, timeout=None):
-                self.host = host
-                self.rest_port = rest_port
-                self.grpc_port = grpc_port
-                self.timeout = timeout
-
-        config_mod.ProximaDBConfig = ProximaDBConfig
-
-    if not hasattr(models_mod, "SearchFilter"):
-
-        class SearchFilter:  # minimal stand-in for the stale symbol
-            def __init__(self, **kwargs):
-                self.__dict__.update(kwargs)
-
-        models_mod.SearchFilter = SearchFilter
-
-    # Remove any half-imported cli module then import fresh.
-    sys.modules.pop("proximadb_sdk.cli", None)
-    import proximadb_sdk.cli as cli_mod
-
-    return cli_mod
-
-
-cli_mod = _ensure_cli_module()
 cli = cli_mod.cli
 
 
@@ -491,14 +466,15 @@ def test_search_with_filter(runner, fake_client):
             "[1.0]",
             "-f",
             '{"field": "x"}',
-            "--metric",
-            "euclidean",
         ],
     )
     assert result.exit_code == 0
     name, args, kw = next(c for c in fake_client.calls if c[0] == "search")
-    assert kw["distance_metric"] == "euclidean"
-    assert kw["filter"] is not None
+    # The repaired call matches the client's real signature: positional
+    # (collection, vector) + metadata_filter dict.
+    assert args[0] == "coll"
+    assert args[1] == [1.0]
+    assert kw["metadata_filter"] == {"field": "x"}
 
 
 def test_search_json(runner, fake_client):
@@ -642,12 +618,130 @@ def test_get_client_builds_unified(monkeypatch):
     captured = {}
 
     class FakeUnified:
-        def __init__(self, config, preferred_protocol=None):
-            captured["config"] = config
-            captured["proto"] = preferred_protocol
+        def __init__(self, url=None, protocol=None, port_mode=None, **kw):
+            captured["url"] = url
+            captured["proto"] = protocol
+            captured["mode"] = port_mode
+            captured["rest"] = kw
 
     monkeypatch.setattr(cli_mod, "UnifiedProximaDBClient", FakeUnified)
-    client = cli_mod.get_client("h", 1, 2, "rest", 5.0)
+    client = cli_mod.get_client("h", 5678, 5678, "rest", 5.0)
     assert isinstance(client, FakeUnified)
     assert captured["proto"] == "rest"
-    assert captured["config"].host == "h"
+    assert captured["url"] == "http://h:5678"
+    assert captured["rest"]["timeout"] == 5.0
+
+
+def test_get_client_multi_port_mode(monkeypatch):
+    captured = {}
+
+    class FakeUnified:
+        def __init__(self, url=None, protocol=None, port_mode=None, **kw):
+            captured["mode"] = port_mode
+
+    monkeypatch.setattr(cli_mod, "UnifiedProximaDBClient", FakeUnified)
+    cli_mod.get_client("h", 5678, 5679, "grpc", 5.0)
+    assert captured["mode"] is not None
+    assert "MULTI" in str(captured["mode"])
+
+
+# ---------------------------------------------------------------------------
+# Regression: the CLI is a published console script (proximadb-cli / pdb-cli in
+# pyproject) — it must import and render --help with NO test-side shims.
+# These tests fail at import-collection time if cli.py drifts from the SDK
+# surface again (the previous failure mode: ImportError, invisible to CI
+# because this file's old shims masked it).
+# ---------------------------------------------------------------------------
+def test_cli_imports_without_shims():
+    import subprocess
+    import sys as _sys
+    from pathlib import Path
+
+    # Point the child interpreter at THIS source tree (not any installed
+    # wheel — the previously published wheel carries the same breakage).
+    src = Path(__file__).resolve().parents[2] / "src"
+    assert (src / "proximadb_sdk" / "cli.py").is_file()
+
+    proc = subprocess.run(
+        [_sys.executable, "-c", "import proximadb_sdk.cli"],
+        capture_output=True,
+        text=True,
+        env={
+            k: v
+            for k, v in os.environ.items()
+            if k.startswith(("OTEL_", "ANONYMIZED_", "PROXIMADB_"))
+        }
+        | {
+            "OTEL_SDK_DISABLED": "true",
+            "PATH": os.environ.get("PATH", ""),
+            "PYTHONPATH": str(src),
+        },
+        timeout=60,
+    )
+    assert proc.returncode == 0, f"bare import failed:\n{proc.stderr}"
+
+
+def test_cli_help_smoke(runner):
+    result = runner.invoke(cli, ["--help"])
+    assert result.exit_code == 0
+    assert "Usage" in result.output
+
+
+# ---------------------------------------------------------------------------
+# Render-path CONTRACT tests: the real clients return pydantic models, not
+# dicts — these pin that the CLI's renderers handle the real types (the
+# 2026-11-08 review proved every read command crashed on .get()/json.dumps
+# against healthy servers before the _jsonable normalization).
+# ---------------------------------------------------------------------------
+class _ModelClient:
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def list_collections(self):
+        from proximadb_sdk.models import Collection, CollectionConfig
+
+        return [Collection(id="c1", config=CollectionConfig(name="c1", dimension=4))]
+
+    def search(self, collection_id, vector, top_k=10, metadata_filter=None, **kw):
+        from proximadb_sdk.models import SearchResult
+
+        return [SearchResult(id="v1", score=0.9, rank=1)]
+
+
+def test_render_handles_real_models_table(runner, monkeypatch):
+    monkeypatch.setattr(cli_mod, "get_client", lambda *a, **k: _ModelClient())
+    result = runner.invoke(cli, ["collections", "list"])
+    assert result.exit_code == 0, result.output
+    assert "c1" in result.output
+
+
+def test_render_handles_real_models_json(runner, monkeypatch):
+    monkeypatch.setattr(cli_mod, "get_client", lambda *a, **k: _ModelClient())
+    result = runner.invoke(
+        cli, ["--json-output", "search", "-c", "coll", "-q", "[1.0]"]
+    )
+    assert result.exit_code == 0, result.output
+    parsed = json.loads(result.output)
+    assert parsed[0]["id"] == "v1"
+    assert parsed[0]["score"] == 0.9
+
+
+def test_render_handles_real_models_create_json(runner, monkeypatch):
+    """Round-2 pin: create_collection returns a Collection model — the JSON
+    path must render it (previously exit-1 AFTER a successful create)."""
+    from proximadb_sdk.models import Collection, CollectionConfig
+
+    class _CreateClient:
+        def create_collection(self, **kwargs):
+            return Collection(
+                id=kwargs["name"],
+                config=CollectionConfig(name=kwargs["name"], dimension=4),
+            )
+
+    monkeypatch.setattr(cli_mod, "get_client", lambda *a, **k: _CreateClient())
+    result = runner.invoke(
+        cli, ["--json-output", "collections", "create", "-d", "4", "c9"]
+    )
+    assert result.exit_code == 0, result.output
+    parsed = json.loads(result.output)
+    assert parsed["id"] == "c9"

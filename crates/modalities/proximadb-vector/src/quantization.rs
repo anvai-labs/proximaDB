@@ -36,8 +36,13 @@ use serde::{Deserialize, Serialize};
 // Re-export proto types for compatibility
 pub use proximadb_proto::v1::{QuantizationConfig, QuantizationLevel};
 
-// Import QuantizationType from nested module
-pub use proximadb_proto::v1::quantization_level::QuantizationType;
+// The proto wire enum is re-exported under a QUALIFIED name (2026-11-08):
+// `internal_types.rs` glob-brings the types-crate `QuantizationType` (the
+// internal SSOT) into the sibling module, and both enums share the
+// Binary/Scalar/Product variant names — a bare-name export of BOTH meant a
+// wrong-import compiled silently and only mis-decoded on the divergent
+// variants (proto Uniform vs types TurboQuant).
+pub use proximadb_proto::v1::quantization_level::QuantizationType as ProtoQuantizationType;
 
 // Re-export implementations
 pub use binary::{BinaryQuantizer, BinaryVector};
@@ -58,11 +63,11 @@ pub enum QuantizedVectorData {
 }
 
 impl QuantizedVectorData {
-    pub fn quantization_type(&self) -> QuantizationType {
+    pub fn quantization_type(&self) -> ProtoQuantizationType {
         match self {
-            QuantizedVectorData::Binary(_) => QuantizationType::Binary,
-            QuantizedVectorData::Int8(_) => QuantizationType::Scalar,
-            QuantizedVectorData::PQ(_) => QuantizationType::Product,
+            QuantizedVectorData::Binary(_) => ProtoQuantizationType::Binary,
+            QuantizedVectorData::Int8(_) => ProtoQuantizationType::Scalar,
+            QuantizedVectorData::PQ(_) => ProtoQuantizationType::Product,
         }
     }
 
@@ -91,14 +96,14 @@ mod tests {
         let binary = QuantizedVectorData::Binary(BinaryVector {
             data: vec![0b10101010],
         });
-        assert_eq!(binary.quantization_type(), QuantizationType::Binary);
+        assert_eq!(binary.quantization_type(), ProtoQuantizationType::Binary);
 
         let int8 = QuantizedVectorData::Int8(Int8Vector {
             data: vec![1i8, 2, 3],
             scale: 0.01,
             min: vec![-1.0, -1.0, -1.0],
         });
-        assert_eq!(int8.quantization_type(), QuantizationType::Scalar);
+        assert_eq!(int8.quantization_type(), ProtoQuantizationType::Scalar);
     }
 
     #[test]

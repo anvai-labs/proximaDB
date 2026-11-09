@@ -15,8 +15,6 @@ from proximadb_sdk.proto_conversion import (
     distance_metric_to_str,
     index_type_to_int,
     index_type_to_str,
-    quantization_type_to_int,
-    quantization_type_to_str,
     storage_engine_to_int,
     storage_engine_to_str,
 )
@@ -48,14 +46,6 @@ class StrIndex(Enum):
 
 class IntIndex(Enum):
     IVF = 2
-
-
-class StrQuant(Enum):
-    SCALAR = "scalar"
-
-
-class IntQuant(Enum):
-    PQ = 2
 
 
 # ============================================================================
@@ -170,29 +160,6 @@ def test_index_type_to_str_all_inputs():
 # ============================================================================
 
 
-def test_quantization_type_to_int_all_inputs():
-    assert ProtoConverter.quantization_type_to_int(None) == 0
-    assert ProtoConverter.quantization_type_to_int(4) == 4
-    assert ProtoConverter.quantization_type_to_int("scalar") == 3
-    assert ProtoConverter.quantization_type_to_int("BINARY") == 4
-    assert ProtoConverter.quantization_type_to_int("unknown") == 0  # default
-    assert ProtoConverter.quantization_type_to_int(IntQuant.PQ) == 2
-    assert ProtoConverter.quantization_type_to_int(StrQuant.SCALAR) == 3
-    assert ProtoConverter.quantization_type_to_int(3.14) == 0  # unsupported type
-
-
-def test_quantization_type_to_str_all_inputs():
-    assert ProtoConverter.quantization_type_to_str(None) == "none"
-    assert ProtoConverter.quantization_type_to_str("scalar") == "scalar"
-    assert ProtoConverter.quantization_type_to_str("SCALAR") == "scalar"
-    assert ProtoConverter.quantization_type_to_str("unknown") == "none"  # default
-    assert ProtoConverter.quantization_type_to_str(2) == "pq"
-    assert ProtoConverter.quantization_type_to_str(999) == "none"  # unknown int default
-    assert ProtoConverter.quantization_type_to_str(IntQuant.PQ) == "pq"
-    assert ProtoConverter.quantization_type_to_str(StrQuant.SCALAR) == "scalar"
-    assert ProtoConverter.quantization_type_to_str(3.14) == "none"  # unsupported type
-
-
 # ============================================================================
 # Model conversion helpers
 # ============================================================================
@@ -299,8 +266,6 @@ def test_convenience_functions_delegate():
     assert storage_engine_to_str(2) == "sst"
     assert index_type_to_int("ivf") == 2
     assert index_type_to_str(3) == "pq"
-    assert quantization_type_to_int("scalar") == 3
-    assert quantization_type_to_str(2) == "pq"
 
 
 if __name__ == "__main__":  # pragma: no cover
@@ -511,4 +476,102 @@ class TestProtoDriftGuard:
             assert ours.value == proto.number, (
                 f"IntEnum drift: {proto.name} should be {proto.number}, "
                 f"enum says {ours.value}"
+            )
+
+
+class TestQuantizationMapDriftGuard:
+    """Guard the LIVE quantization encode map against the proto.
+
+    Born from the 2026-11-08 rationalization: the DEAD proto_conversion
+    map (`_QUANTIZATION_TYPE_STR_TO_INT`, 5/6 values wrong + phantom
+    'custom', disclosed as #2444 LOW-7) was deleted along with its
+    wrong-value assertions. What ships is rest_sync's production map —
+    this guard pins THAT to the generated proto descriptor so the next
+    hand-edit that diverges fails CI instead of silently mis-encoding.
+    """
+
+    def test_rest_sync_quantization_map_matches_proto(self) -> None:
+        import re as _re
+
+        from proximadb_sdk.protocols import rest_sync
+        from proximadb_sdk.v1 import vector_types_pb2 as types_pb2
+
+        proto = {
+            v.name.upper(): v.number
+            for v in types_pb2.QuantizationLevel.QuantizationType.DESCRIPTOR.values
+        }
+        assert proto, "proto descriptor must enumerate QuantizationType"
+
+        # The map lives inline in _convert_quantization_config_to_proto.
+        # Resolve from the REPO tree (sibling-guard convention): an editable
+        # or stale site-packages install must not be the validated copy.
+        from pathlib import Path
+
+        repo_src = Path(__file__).resolve().parents[2] / "src" / "proximadb_sdk"
+        assert (repo_src / "protocols" / "rest_sync.py").is_file()
+        src = open(repo_src / "protocols" / "rest_sync.py", encoding="utf-8").read()
+        m = _re.search(r"QUANT_TYPE_MAP\s*=\s*\{(.*?)\}", src, _re.DOTALL)
+        assert m, "rest_sync QUANT_TYPE_MAP not found — was it renamed?"
+        entries = dict(_re.findall(r'"([A-Z_0-9]+)"\s*:\s*(\d+)', m.group(1)))
+        ours = {k: int(v) for k, v in entries.items()}
+
+        # Completeness (a truncation is as bad as a rotation — the #2446
+        # lesson) AND value correctness. Map keys may additionally carry
+        # DOCUMENTED SDK-spelling aliases (value-identical to their proto
+        # entry); anything else is drift.
+        documented_aliases = {"PQ": "PRODUCT"}
+        unknown = set(ours) - set(proto) - set(documented_aliases)
+        assert not unknown, f"undocumented map keys: {unknown}"
+        missing = set(proto) - set(ours)
+        assert not missing, f"map missing proto variants: {missing}"
+        for alias, canonical in documented_aliases.items():
+            assert ours[alias] == proto[canonical], (
+                f"alias {alias} must equal {canonical}={proto[canonical]}, "
+                f"got {ours[alias]}"
+            )
+        for name, number in proto.items():
+            assert ours[name] == number, (
+                f"rest_sync QUANT_TYPE_MAP drifted: {name} should be "
+                f"{number}, map says {ours[name]}"
+            )
+
+    def test_sdk_enum_values_resolve_in_live_map(self) -> None:
+        """Every PUBLIC models.QuantizationType value must resolve through the
+        live rest_sync map (upper-cased lookup) — the review-found drift class:
+        PRODUCT ("pq") previously fell through to the NONE default and silently
+        mis-encoded. CUSTOM has no proto representation; its pinned behavior
+        is the NONE default (documented exception, asserted).
+        """
+        import re as _re2
+        from pathlib import Path
+
+        from proximadb_sdk.models import QuantizationType as SdkQuantType
+        from proximadb_sdk.v1 import vector_types_pb2 as types_pb2
+
+        repo_src = Path(__file__).resolve().parents[2] / "src" / "proximadb_sdk"
+        src = open(repo_src / "protocols" / "rest_sync.py", encoding="utf-8").read()
+        m = _re2.search(r"QUANT_TYPE_MAP\s*=\s*\{(.*?)\}", src, _re2.DOTALL)
+        assert m, "QUANT_TYPE_MAP not found"
+        ours = {
+            k: int(v)
+            for k, v in _re2.findall(r'"([A-Z_0-9]+)"\s*:\s*(\d+)', m.group(1))
+        }
+
+        proto_none = next(
+            v.number
+            for v in types_pb2.QuantizationLevel.QuantizationType.DESCRIPTOR.values
+            if v.name == "NONE"
+        )
+        for member in SdkQuantType:
+            key = member.value.upper()
+            if key == "CUSTOM":
+                # No proto representation: pinned default is NONE.
+                assert ours.get(key, proto_none) == proto_none, (
+                    "CUSTOM must resolve to the NONE default (or gain a proto "
+                    "representation — then update this pin)"
+                )
+                continue
+            assert key in ours, (
+                f"SDK enum value {member.value!r} (.upper()={key!r}) does not "
+                f"resolve in the live map — it would silently mis-encode"
             )

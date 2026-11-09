@@ -1,0 +1,10 @@
+{
+    "doc_count": 10000,
+    "duration_sec": 5.983119964599609,
+    "inserted": 10000,
+    "failed": 0,
+    "throughput_docs_per_sec": 1671.3687940684974,
+    "timestamp": "2026-11-08T14:57:59Z",
+    "server_binary": "./target/release/proximadb-server",
+    "git_commit": "23a08ccfc2bb630a0bfe09a0d07a21c59f8495f1"
+}

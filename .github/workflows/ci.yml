@@ -170,8 +170,11 @@ jobs:
       capability_facade: ${{ steps.filter.outputs.capability_facade }}
       type_name_ratchet: ${{ steps.filter.outputs.type_name_ratchet }}
       v1_proto_usage: ${{ steps.filter.outputs.v1_proto_usage }}
-      # Granular Rust component detection for targeted testing
-      query_changes: ${{ steps.filter.outputs.query_changes }}
+      # Granular Rust component detection for targeted testing. query_changes
+      # also ORs the selfdef verdict (below) so edits to the query lane's own
+      # CI definition run the lane — same pattern as the four selfdef outputs
+      # under it.
+      query_changes: ${{ steps.filter.outputs.query_changes == 'true' || steps.selfdef.outputs.query_changes == 'true' }}
       storage_changes: ${{ steps.filter.outputs.storage_changes }}
       graph_changes: ${{ steps.filter.outputs.graph_changes }}
       core_changes: ${{ steps.filter.outputs.core_changes }}
@@ -414,6 +417,10 @@ jobs:
             query_changes:
               - 'src/query/**'
               - 'tests/*query*'
+              # The re-enabled query_facade suite (#2462) lives in the merged
+              # `integration` [[test]] target — this filter + the run step
+              # below are what make its tests gate CI.
+              - 'tests/integration/query_facade/**'
               # TD-SPECRAT-1: the AV-SQL translate eval gates the /api/v2/nl
               # surface (engine: src/query/nl) — explicit so eval edits run it.
               - 'tests/nl_translate_eval.rs'
@@ -745,7 +752,8 @@ jobs:
               --job object-store-restart-recovery=object_store_restart_changes \
               --job mlflow-conformance=mlflow_changes \
               --job openapi-spec-drift=openapi_code_changes \
-              --job feature-matrix-enterprise-catalogs=enterprise_catalogs_changes)"; then
+              --job feature-matrix-enterprise-catalogs=enterprise_catalogs_changes \
+              --job rust-integration-test-query=query_changes)"; then
             echo "::warning::ci_job_definition_changed.py failed; running every path-scoped suite"
             verdicts="$(printf '%s=true\n' object_store_restart_changes mlflow_changes openapi_code_changes enterprise_catalogs_changes)"
           fi
@@ -3030,7 +3038,9 @@ jobs:
     name: Rust Integration Tests (query)
     runs-on: ubuntu-24.04
     timeout-minutes: 60
-    # was 45; green spans reach 30-34 min across the integration legs
+    # was 45; green spans reach 30-34 min across the integration legs, plus a
+    # few minutes of per-run link for the merged `integration` target (its
+    # test binary is never in the rust-cache; watch first runs for OOM)
     needs: [changes, rust-build]
     if: |
       !inputs.skip_tests &&
@@ -3067,6 +3077,23 @@ jobs:
               cargo test --test "$test_name" -- --test-threads=1
             fi
           done
+          # The query_facade suite (#2462 re-enable) lives in the merged
+          # `integration` [[test]] target — run its subset by name filter.
+          # Without this step the target was compile-checked in every feature
+          # lane but never executed anywhere in CI. Zero-test guard per the
+          # authz lane pattern: `cargo test` exits 0 on an empty match, so a
+          # future #![cfg(any())]-style re-disable or rename would otherwise
+          # keep this lane green while gating nothing.
+          set +e
+          facade_output=$(cargo test --test integration -- query_facade --test-threads=1 2>&1)
+          facade_status=$?
+          set -e
+          echo "$facade_output"
+          if echo "$facade_output" | grep -qE "running 0 tests"; then
+            echo "::error::the query_facade suite matched ZERO tests — the suite is disabled, renamed, or the filter drifted; this lane verified nothing."
+            exit 1
+          fi
+          exit "$facade_status"
 
   rust-integration-test-pgwire-accuracy:
     name: Rust Integration Tests (pgwire accuracy)

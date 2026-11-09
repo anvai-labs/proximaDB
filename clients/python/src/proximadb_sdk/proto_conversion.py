@@ -129,23 +129,6 @@ class ProtoConverter:
     }
 
     # =========================================================================
-    # Quantization Type Mappings
-    # =========================================================================
-
-    _QUANTIZATION_TYPE_STR_TO_INT: dict[str, int] = {
-        "none": 0,
-        "uniform": 1,
-        "pq": 2,
-        "scalar": 3,
-        "binary": 4,
-        "custom": 5,
-    }
-
-    _QUANTIZATION_TYPE_INT_TO_STR: dict[int, str] = {
-        v: k for k, v in _QUANTIZATION_TYPE_STR_TO_INT.items()
-    }
-
-    # =========================================================================
     # Distance Metric Conversion Methods
     # =========================================================================
 
@@ -313,45 +296,6 @@ class ProtoConverter:
         return "hnsw"
 
     # =========================================================================
-    # Quantization Type Conversion Methods
-    # =========================================================================
-
-    @classmethod
-    def quantization_type_to_int(cls, value: str | int | Enum | None) -> int:
-        """Convert quantization type to gRPC integer representation."""
-        if value is None:
-            return 0
-        if isinstance(value, int):
-            return value
-        if isinstance(value, Enum):
-            val = value.value
-            if isinstance(val, int):
-                return val
-            return cls._QUANTIZATION_TYPE_STR_TO_INT.get(str(val).lower(), 0)
-        if isinstance(value, str):
-            return cls._QUANTIZATION_TYPE_STR_TO_INT.get(value.lower(), 0)
-        return 0
-
-    @classmethod
-    def quantization_type_to_str(cls, value: str | int | Enum | None) -> str:
-        """Convert quantization type to REST string representation."""
-        if value is None:
-            return "none"
-        if isinstance(value, str):
-            lower_val = value.lower()
-            if lower_val in cls._QUANTIZATION_TYPE_STR_TO_INT:
-                return lower_val
-            return "none"
-        if isinstance(value, int):
-            return cls._QUANTIZATION_TYPE_INT_TO_STR.get(value, "none")
-        if isinstance(value, Enum):
-            val = value.value
-            if isinstance(val, int):
-                return cls._QUANTIZATION_TYPE_INT_TO_STR.get(val, "none")
-            return str(val).lower()
-        return "none"
-
-    # =========================================================================
     # Model Conversion Helpers
     # =========================================================================
 
@@ -435,13 +379,3 @@ def index_type_to_int(value: str | int | Enum | None) -> int:
 def index_type_to_str(value: str | int | Enum | None) -> str:
     """Convert index type to string."""
     return ProtoConverter.index_type_to_str(value)
-
-
-def quantization_type_to_int(value: str | int | Enum | None) -> int:
-    """Convert quantization type to integer."""
-    return ProtoConverter.quantization_type_to_int(value)
-
-
-def quantization_type_to_str(value: str | int | Enum | None) -> str:
-    """Convert quantization type to string."""
-    return ProtoConverter.quantization_type_to_str(value)

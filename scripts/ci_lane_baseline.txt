@@ -16,11 +16,11 @@ cdc_rest_changefeed_e2e.rs
 clickbench_ledger_e2e.rs
 corpus_version_restart_safety_test.rs
 cost_trace_pgwire_multimodal_e2e.rs
-counting_filesystem.rs  # FakeFs unit test misplaced under tests/ — permanent resident
+counting_filesystem.rs
 cpg_fragment_pax_contract.rs
 cross_model_transaction_e2e.rs
 cross_surface_unification_e2e.rs
-dedup_utility_contracts.rs  # arrived on develop via #2360 mid-flight; lane wiring is the dedup-wave owner's call
+dedup_utility_contracts.rs
 discovery_drift_watcher_e2e.rs
 discovery_job_republish_test.rs
 distance_metric_consistency_test.rs
@@ -61,10 +61,9 @@ helix_prune_debug_test.rs
 hmgi_integration_test.rs
 ident_case_fold_e2e.rs
 infrastructure_integration_test.rs
-integration.rs  # helper module, not a test target — permanent
 ivf_ingest_asymptotic_test.rs
 jsonb_integration_test.rs
-lib.rs  # helper module root, not a test target — permanent
+lib.rs
 logical_operators_tests.rs
 mtls_integration_test.rs
 multimodal_integration_test.rs
@@ -72,7 +71,7 @@ nova_ingest_sorted_segment.rs
 objstore_segment_path_guard_test.rs
 objstore_url_construction_test.rs
 objstore_zero_vector_recovery_test.rs
-openapi_helpers.rs  # #[path]-included helper, not a test target — permanent
+openapi_helpers.rs
 orion_canonical_checkpoint_read_test.rs
 pax_cascade_prod_search_test.rs
 pax_kill_switch_rawf32_exact_read_test.rs

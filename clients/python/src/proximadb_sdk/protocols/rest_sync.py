@@ -139,7 +139,20 @@ def _convert_quantization_config_to_proto(quant_config) -> dict[str, Any]:
     proto_dict["strategy"] = 1  # CUSTOM_LEVELS
 
     # Map quantization type to proto enum
-    QUANT_TYPE_MAP = {"BINARY": 0, "SCALAR": 1, "PRODUCT": 2, "UNIFORM": 3, "NONE": 4}
+    QUANT_TYPE_MAP = {
+        "BINARY": 0,
+        "SCALAR": 1,
+        "PRODUCT": 2,
+        # SDK spelling alias (models.QuantizationType.PRODUCT.value == "pq"):
+        # without it the .upper() lookup fell through to the NONE default
+        # and silently mis-encoded PRODUCT as no-quantization (review 2026-11-08).
+        "PQ": 2,
+        # SDK spelling alias (models.QuantizationType.PRODUCT.value == "pq"):
+        # without it the .upper() lookup fell through to the NONE default
+        # and silently mis-encoded PRODUCT as no-quantization (review 2026-11-08).
+        "UNIFORM": 3,
+        "NONE": 4,
+    }
 
     # Build custom_levels array from flat SDK fields
     # QuantizationLevel has many fields - provide sensible defaults for all

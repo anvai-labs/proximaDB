@@ -29,8 +29,9 @@
 //! exercised). This was true before the 2026-05-22 disable as well. A mutation
 //! probe corrupting mock fixtures leaves the comparisons green — their teeth
 //! are the schema/error assertions, not the comparison. Real wire parity lives
-//! in `tests/rest_grpc_parity_test.rs` (live-server, manual-only); an
-//! automated dual-transport parity test is a recorded follow-up.
+//! in `tests/rest_grpc_parity_test.rs` (live-server, manual-only); the
+//! automated dual-transport RENDERING parity test now exists next door
+//! (`test_rest_grpc_rendering_parity.rs`).
 //!
 //! ## Test Coverage
 //!
