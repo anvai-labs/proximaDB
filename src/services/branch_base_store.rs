@@ -398,6 +398,16 @@ impl BranchBaseStore {
             *mark = (*mark).min(*first);
         }
 
+        // TD-SEAM-12 follow-up: clear truncation marks for collections that
+        // have been dropped (RecordPartitionDrop) in the retained WAL. Without
+        // this, a collection dropped and re-created under the same name keeps
+        // returning 410 even when its post-recreate history is complete.
+        truncated.retain(|collection, mark| {
+            // Check if there's a RecordPartitionDrop for this collection
+            // after the mark's first sequence in the retained WAL.
+            !self.wal.has_partition_drop_after(collection, *mark)
+        });
+
         let mut images = BTreeMap::new();
         for collection in &summary.collections {
             let (mut image, fresh) = match state.base_for(collection, retained_from) {
