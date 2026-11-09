@@ -1497,12 +1497,17 @@ class ProximaDBClient:
         inserted_count = int(response_data.get("inserted_count", 0) or 0)
         failed_count = int(response_data.get("failed_count", 0) or 0)
         total_count = inserted_count + failed_count
+        # Server-assigned IDs of the successfully inserted records — surfaced
+        # as BatchResult.inserted_ids so the vector compatibility aliases can
+        # report vector_ids (previously dropped, leaving vector_ids always
+        # empty on this path).
         return BatchResult(
             total=total_count,
             success=inserted_count,
             failed=failed_count,
             errors=response_data.get("errors", []),
             duration_ms=response_data.get("duration_ms", 0.0),
+            inserted_ids=list(response_data.get("inserted_ids", []) or []),
             metrics=OperationMetrics(
                 total_processed=total_count,
                 successful_count=inserted_count,

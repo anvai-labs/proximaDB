@@ -239,23 +239,6 @@ class RestProtocolAdapter(RecordOpsMixin, SyncGraphDelegations, BaseProtocolAdap
         if isinstance(successful, bool):
             successful = total_count if successful else 0
         failed = getattr(result, "failed", 0)
-        # Generated REST responses (InsertRecordsResponse et al) carry the
-        # server-assigned per-record IDs; keep them so the vector
-        # compatibility aliases can surface vector_ids (they were dropped
-        # here, leaving VectorOperationResponse.vector_ids always empty).
-        inserted_ids = getattr(result, "inserted_ids", None) or []
-        if inserted_ids:
-            return BatchResult(
-                total=total_count,
-                success=len(inserted_ids),
-                failed=max(total_count - len(inserted_ids), 0),
-                metrics=OperationMetrics(
-                    total_processed=total_count,
-                    successful_count=len(inserted_ids),
-                    failed_count=max(total_count - len(inserted_ids), 0),
-                ),
-                inserted_ids=inserted_ids,
-            )
         return BatchResult(
             total=successful + failed,
             success=successful,
