@@ -144,25 +144,8 @@ impl QuantizationStage {
         }
     }
 
-    /// Map to the query optimizer's [`QuantizationType`] enum when a direct
-    /// equivalent exists. `FP16` and `FP32` return `None` because they are
-    /// not quantization — they are full/half precision and require an exact
-    /// search path.
-    ///
-    /// [`QuantizationType`]: crate::query::query_optimizer::QuantizationType
-    pub fn as_quantization_type(self) -> Option<crate::query::query_optimizer::QuantizationType> {
-        use crate::query::query_optimizer::QuantizationType;
-        match self {
-            Self::Binary => Some(QuantizationType::Binary),
-            Self::PQ4 => Some(QuantizationType::PQ4),
-            Self::PQ8 => Some(QuantizationType::PQ8),
-            Self::INT8 => Some(QuantizationType::INT8),
-            Self::FP16 | Self::FP32 => None,
-        }
-    }
-
-    /// True when this floor requires an exact (FP32) final stage. Floors at
-    /// FP16/FP32 cannot be satisfied by quantized-only paths.
+    /// Whether this stage demands exact precision (FP16/FP32) — used by the
+    /// object-economy floor enforcement.
     pub fn requires_exact_final_stage(self) -> bool {
         self.quality_rank() >= Self::FP16.quality_rank()
     }

@@ -170,7 +170,6 @@ pub use columnar_query_engine::{
     // Core query types with semantic names
     ParquetQueryEngine,
     ParquetReader,
-    QuantizationMethod,
     QueryConfig,
     QueryStatistics,
     ReaderConfig,

@@ -12,8 +12,8 @@
 
 // Re-export from columnar module to maintain API compatibility
 pub use crate::storage::engines::core::formats::columnar::{
-    CollectionContext, FilterValue, MetadataFilter, QuantizationMethod, ReaderConfig,
-    ReadingStrategy, RowGroupAccessPattern, SchemaMapping, SearchType, SeekRange, Stage2Strategy,
+    CollectionContext, FilterValue, MetadataFilter, ReaderConfig, ReadingStrategy,
+    RowGroupAccessPattern, SchemaMapping, SearchType, SeekRange, Stage2Strategy,
     UnifiedParquetReader, VectorPosition,
 };
 

@@ -177,7 +177,6 @@ use crate::index::axis::{
 use crate::index::{DenseVectorIndex, GlobalIdIndex, JoinEngine, MetadataIndex, SparseVectorIndex};
 use proximadb_records::{ProximaRecord, ProximaTreeNode};
 // Temporarily disabled due to arrow-arith compilation conflicts - DEFERRED: Re-enable when resolved
-// use crate::storage::engines::viper::QuantizationMethod;
 
 /// Central manager for AXIS with adaptive capabilities
 ///
