@@ -63,5 +63,10 @@ pub mod test_rest_grpc_parity;
 /// scope note; this one exercises two genuinely different renderer stacks).
 pub mod test_rest_grpc_rendering_parity;
 
+/// Same-SQL transport parity: the REAL v2 router and the REAL v2 record
+/// service over ONE SharedServices stack (the strongest pairing — both legs
+/// converge on the same api_handlers.execute_sql).
+pub mod test_sql_transport_rendering_parity;
+
 /// Explain plan consistency tests - validates explain plan format across query types
 pub mod test_explain_plan_consistency;
