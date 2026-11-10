@@ -304,6 +304,135 @@ async fn write_owner(
     Ok(())
 }
 
+// ── TD-SEAM-14 S2: Manifest head read/write/CAS ─────────────────────────────
+
+/// Read the manifest head from the object store. Returns `None` if absent.
+/// The manifest is at `{url}/{MANIFEST_HEAD}`.
+pub async fn read_manifest(url: &str, filesystem: &dyn FileSystem) -> Result<Option<ManifestHead>> {
+    let path = format!("{}/{}", url.trim_end_matches('/'), MANIFEST_HEAD);
+    let bytes = match path.strip_prefix("file://").map(Path::new) {
+        Some(local) => match std::fs::read(local) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error).with_context(|| format!("reading {path}")),
+        },
+        None => match filesystem.read(&path).await {
+            Ok(bytes) => bytes,
+            Err(error) if is_absent(&error) => return Ok(None),
+            Err(error) => return Err(fs_error(&format!("reading {path}"), error)),
+        },
+    };
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .with_context(|| format!("parsing manifest head at {path}"))
+}
+
+/// Write the manifest head with CAS (compare-and-swap) on the revision.
+/// Returns `Ok(true)` if the write succeeded, `Ok(false)` if the revision
+/// changed (CAS conflict). The caller must retry with the updated manifest.
+///
+/// The `expected_revision` is the revision the caller read. If the current
+/// manifest has a different revision, the write fails.
+pub async fn write_manifest_cas(
+    url: &str,
+    filesystem: &dyn FileSystem,
+    manifest: &ManifestHead,
+    expected_revision: u64,
+) -> Result<bool> {
+    let path = format!("{}/{}", url.trim_end_matches('/'), MANIFEST_HEAD);
+
+    // TD-SEAM-14 S2: Enforce owner conditioning.
+    // Read the current owner marker and verify that the manifest's owner fields match.
+    let owner_path = format!("{}/{}", url.trim_end_matches('/'), OWNER_MARKER);
+    let current_owner = match read_owner(&owner_path, filesystem).await? {
+        Some(bytes) => parse_owner(&owner_path, &bytes)?
+            .ok_or_else(|| anyhow!("owner marker at {owner_path} is present but unparseable"))?,
+        None => bail!("no owner marker at {owner_path}; cannot write manifest without ownership"),
+    };
+
+    // Verify owner identity matches.
+    if manifest.owner_instance != current_owner.instance
+        || manifest.owner_epoch != current_owner.epoch
+        || manifest.owner_nonce != current_owner.nonce
+    {
+        return Ok(false); // Owner mismatch — CAS conflict
+    }
+
+    let bytes = serde_json::to_vec_pretty(manifest)?;
+
+    // Compute the expected bytes for CAS.
+    let expected_bytes = match read_manifest_raw(&path, filesystem).await? {
+        Some(existing) => {
+            // Parse to verify the revision matches.
+            let existing_manifest: ManifestHead = serde_json::from_slice(&existing)
+                .with_context(|| format!("parsing existing manifest at {path}"))?;
+            if existing_manifest.revision != expected_revision {
+                return Ok(false); // CAS conflict
+            }
+            Some(existing)
+        }
+        None => {
+            if expected_revision != 0 {
+                return Ok(false); // Expected absent but revision is non-zero
+            }
+            None
+        }
+    };
+
+    // Perform the CAS write using compare_exchange for atomicity (both local and object-store paths).
+    let success = filesystem
+        .compare_exchange(
+            &path,
+            expected_bytes.as_deref(),
+            &bytes,
+            &[], // No guards for now
+        )
+        .await
+        .map_err(|e| fs_error(&format!("CAS write {path}"), e))?;
+
+    Ok(success)
+}
+
+/// Read the raw manifest bytes (for CAS expected value).
+async fn read_manifest_raw(path: &str, filesystem: &dyn FileSystem) -> Result<Option<Vec<u8>>> {
+    match path.strip_prefix("file://").map(Path::new) {
+        Some(local) => match std::fs::read(local) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error).with_context(|| format!("reading {path}")),
+        },
+        None => match filesystem.read(path).await {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(error) if is_absent(&error) => Ok(None),
+            Err(error) => Err(fs_error(&format!("reading {path}"), error)),
+        },
+    }
+}
+
+// ── TD-SEAM-14 S2: Durable witness read/write ───────────────────────────────
+
+/// Read the durable witness from the local WAL directory. Returns `None` if absent.
+pub fn read_witness(wal_dir: &Path) -> Result<Option<DurableWitness>> {
+    let path = wal_dir.join(DURABLE_WITNESS);
+    match std::fs::read(&path) {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .map(Some)
+            .with_context(|| format!("parsing durable witness at {}", path.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("reading {}", path.display())),
+    }
+}
+
+/// Write the durable witness with fsync. This is the local record of the last
+/// verified manifest head, used at boot to detect rollback.
+pub fn write_witness(wal_dir: &Path, witness: &DurableWitness) -> Result<()> {
+    crate::services::storage_format::write_marker(
+        wal_dir,
+        DURABLE_WITNESS,
+        &serde_json::to_vec_pretty(witness)?,
+    )
+}
+
 /// `bucket/key` of a URL: listings may spell the scheme differently.
 fn after_scheme(url: &str) -> &str {
     url.split_once("://").map_or(url, |(_, rest)| rest)
