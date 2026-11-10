@@ -20,7 +20,7 @@ impl super::GraphOperationsService {
                 "Graph operations disabled in current mode".to_string(),
             ));
         }
-        let engine = self.get_or_create_graph_engine(graph_id).await?;
+        let engine = self.get_existing_graph_engine(graph_id).await?;
         engine.get_neighbors(node_id, None)
     }
 
@@ -91,7 +91,7 @@ impl super::GraphOperationsService {
             ));
         }
 
-        let engine = self.get_or_create_graph_engine(graph_id).await?;
+        let engine = self.get_existing_graph_engine(graph_id).await?;
 
         // Initial candidate set from labels or all nodes
         let mut candidates: HashSet<NodeId> = if !query.labels.is_empty() {
@@ -349,7 +349,7 @@ impl super::GraphOperationsService {
                 "Graph operations disabled in current mode".to_string(),
             ));
         }
-        let engine = self.get_or_create_graph_engine(graph_id).await?;
+        let engine = self.get_existing_graph_engine(graph_id).await?;
         if let Some(node) = engine.get_node(id)? {
             return Ok(Some(node));
         }
@@ -368,7 +368,7 @@ impl super::GraphOperationsService {
                 "Graph operations disabled in current mode".to_string(),
             ));
         }
-        let engine = self.get_or_create_graph_engine(graph_id).await?;
+        let engine = self.get_existing_graph_engine(graph_id).await?;
 
         // ADR-012 Add-Wins label union: preserve labels from the existing node.
         if let Ok(Some(existing)) = engine.get_node(&node.id) {
@@ -392,7 +392,7 @@ impl super::GraphOperationsService {
                 "Graph operations disabled in current mode".to_string(),
             ));
         }
-        let engine = self.get_or_create_graph_engine(graph_id).await?;
+        let engine = self.get_existing_graph_engine(graph_id).await?;
         if let Some(node) = engine.get_node(id)? {
             self.unregister_node_from_unique_constraints(graph_id, &node);
             self.unregister_node_from_multi_unique_constraints(graph_id, &node);
@@ -415,7 +415,7 @@ impl super::GraphOperationsService {
                 "Graph operations disabled in current mode".to_string(),
             ));
         }
-        let engine = self.get_or_create_graph_engine(graph_id).await?;
+        let engine = self.get_existing_graph_engine(graph_id).await?;
         let mut edge_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
         for e in engine.get_outgoing_edges(id, None)? {
             edge_ids.insert(e.id.clone());

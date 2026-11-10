@@ -49,7 +49,7 @@ impl super::GraphOperationsService {
                 crate::graph::engines::orion::traversal::AStarHeuristic::EuclideanEmbedding,
         };
 
-        let engine = self.get_or_create_graph_engine(graph_id).await?;
+        let engine = self.get_existing_graph_engine(graph_id).await?;
         let traversal_result = match &*engine {
             crate::graph::engines::GraphEngineImpl::Orion(e) => {
                 crate::graph::engines::orion::traversal::breadth_first_search(
@@ -169,7 +169,7 @@ impl super::GraphOperationsService {
                 "Graph operations disabled in current mode".to_string(),
             ));
         }
-        let engine = self.get_or_create_graph_engine(graph_id).await?;
+        let engine = self.get_existing_graph_engine(graph_id).await?;
         let crate::graph::engines::GraphEngineImpl::Orion(e) = &*engine;
         crate::graph::engines::orion::traversal::connected_components(e).await
     }
@@ -181,7 +181,7 @@ impl super::GraphOperationsService {
                 "Graph operations disabled in current mode".to_string(),
             ));
         }
-        let engine = self.get_or_create_graph_engine(graph_id).await?;
+        let engine = self.get_existing_graph_engine(graph_id).await?;
         let crate::graph::engines::GraphEngineImpl::Orion(e) = &*engine;
         crate::graph::engines::orion::traversal::has_cycle(e).await
     }
@@ -219,7 +219,7 @@ impl super::GraphOperationsService {
             astar_heuristic:
                 crate::graph::engines::orion::traversal::AStarHeuristic::EuclideanEmbedding,
         };
-        let engine = self.get_or_create_graph_engine(graph_id).await?;
+        let engine = self.get_existing_graph_engine(graph_id).await?;
         let crate::graph::engines::GraphEngineImpl::Orion(orion_engine) = &*engine;
 
         if let Some(kk) = k
@@ -289,7 +289,7 @@ impl super::GraphOperationsService {
             ));
         }
 
-        let engine = self.get_or_create_graph_engine(graph_id).await?;
+        let engine = self.get_existing_graph_engine(graph_id).await?;
         let node_id_owned = node_id.to_string();
 
         // Current node, then neighbors -- include the start so the agent has
@@ -346,7 +346,7 @@ impl super::GraphOperationsService {
             ));
         }
 
-        let engine = self.get_or_create_graph_engine(graph_id).await?;
+        let engine = self.get_existing_graph_engine(graph_id).await?;
 
         let start_node_id_string = start_node_id.to_string();
 

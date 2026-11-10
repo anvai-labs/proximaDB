@@ -264,7 +264,25 @@ impl FactoryQueueFs {
             // Compare path components, not raw URL spelling, without relaxing
             // traversal or root confinement.
             let entry = Self::without_current_dir(entry);
-            let root = Self::without_current_dir(root);
+            // The local backend reports every LIST entry as an absolute
+            // `file:///…` URL (relative file URLs resolve against the CWD, so
+            // that is the only spelling that names the exact entry). An
+            // explicit relative root therefore has to be compared in the same
+            // absolute coordinates, resolved lexically against the CWD exactly
+            // as the backend resolved it. Caller-facing paths stay in caller
+            // coordinates: `listed_path` rebuilds them from `requested_dir`.
+            let root = if root.is_relative() && entry.is_absolute() {
+                std::path::absolute(root).map_err(|error| {
+                    QueueError::Persistence(format!(
+                        "cannot resolve relative queue filesystem root {} for LIST containment: {error}",
+                        self.root_url
+                    ))
+                })?
+            } else {
+                root.clone()
+            };
+            let root = Self::without_current_dir(&root);
+            Self::reject_parent_components(&root, "queue filesystem root")?;
             entry
                 .strip_prefix(&root)
                 .map_err(|_| outside_root())?
@@ -565,6 +583,88 @@ mod tests {
                 .expect("absolute list"),
             vec![root.join("relative/child")]
         );
+    }
+
+    /// The local backend returns absolute LIST URLs; a relative `file://` root
+    /// must still admit its own children and reject everything else.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn relative_root_list_containment_uses_absolute_backend_coordinates() {
+        let factory = Arc::new(
+            FilesystemFactory::create_default()
+                .await
+                .expect("filesystem factory"),
+        );
+        // Pure mapping checks: nothing is created under this relative root.
+        let root = Path::new("queue-relative-list-containment/queue");
+        let adapter = FactoryQueueFs::build(factory, format!("file://{}", root.display()))
+            .expect("relative-root adapter");
+        let cwd = std::env::current_dir().expect("cwd");
+        let absolute_root = cwd.join(root);
+
+        // Positive: absolute backend spelling maps back to caller coordinates.
+        assert_eq!(
+            adapter
+                .listed_path(
+                    Path::new("events"),
+                    &format!("file://{}", absolute_root.join("events/0").display()),
+                )
+                .expect("absolute child of relative root"),
+            PathBuf::from("events/0")
+        );
+        assert_eq!(
+            adapter
+                .listed_path(
+                    Path::new("./events"),
+                    &format!("file://{}", absolute_root.join("events/0").display()),
+                )
+                .expect("dotted caller coordinates preserved"),
+            PathBuf::from("./events/0")
+        );
+        // Legacy relative spelling is still accepted.
+        assert_eq!(
+            adapter
+                .listed_path(
+                    Path::new("events"),
+                    &format!("file://{}", root.join("events/0").display()),
+                )
+                .expect("relative child of relative root"),
+            PathBuf::from("events/0")
+        );
+
+        // Negative controls: entries outside the root fail closed.
+        for foreign in [
+            format!("file://{}", cwd.join("other/events/0").display()),
+            format!(
+                "file://{}",
+                cwd.join("queue-relative-list-containment/queue-sibling/events/0")
+                    .display()
+            ),
+            "file:///foreign/events/0".to_string(),
+        ] {
+            let error = adapter
+                .listed_path(Path::new("events"), &foreign)
+                .expect_err("foreign LIST entry must fail closed");
+            assert!(
+                error.to_string().contains("outside configured root"),
+                "{foreign}: {error}"
+            );
+        }
+        let traversal = adapter
+            .listed_path(
+                Path::new("events"),
+                &format!("file://{}/events/../../escape", absolute_root.display()),
+            )
+            .expect_err("parent traversal must fail closed");
+        assert!(traversal.to_string().contains("parent traversal"));
+        // The root itself (empty suffix) is not a child of `events`.
+        let not_child = adapter
+            .listed_path(
+                Path::new("events"),
+                &format!("file://{}", absolute_root.display()),
+            )
+            .expect_err("root entry is not a child of the requested directory");
+        assert!(not_child.to_string().contains("non-child entry"));
     }
 
     #[test]

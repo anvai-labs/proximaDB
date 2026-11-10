@@ -23,12 +23,12 @@ deliberate change; **investigate** = deterministic failure, cause not yet proven
 
 | `objstore_segment_path_guard_test`
 | `src/storage/engines/sst/compaction.rs` contains `strip_prefix("file://")`
-| real
+| **fixed**
 | Source guard from #1082 (TD-OBJSTORE-4 defect-6 class). Reintroduced at `compaction.rs:3262` and `:3298` by later PRs (#1325, #1417, TD-TIER-1 SC4 `cd46e4473`) because no lane ran the guard. Both sites are the post-publication cache-promotion **fallback** path: for a cloud URL the strip is a no-op, the fallback "path" is `az://...`, and promotion fails with a warning (a silently cold cache), not data loss. Fix: derive the fallback through `sst::staged_write` like the write path.
 
 | `queue_adapter_upgrade_integration_test` (2 tests)
 | A relative `file://` queue root makes LIST return entries "outside configured root": `.tmpX/queue/.tmpX/queue/events`
-| real (likely)
+| **fixed** (real)
 | The path is doubled when the root is relative (`file://.tmp1tZS1z/queue`, `file://./.tmpUVDUgf/queue`); absolute roots pass (3/5 tests green). Likely a relative-root join applied twice in the queue filesystem's LIST.
 
 | `discovery_drift_watcher_e2e`
@@ -38,8 +38,8 @@ deliberate change; **investigate** = deterministic failure, cause not yet proven
 
 | `documents_convergence_e2e`
 | Consumption metric family not live on `/metrics/prometheus` after a metered write
-| investigate
-| A metering (billing) regression or a renamed metric family. 4 of 5 tests pass.
+| stale (likely)
+| Not an export bug: `/metrics/prometheus` does append `prometheus::gather()` (`src/network/metrics_service.rs`). The asserted substring `proximadb_storage_bytes` matches the current family `proximadb_storage_bytes_seconds`, but that is a labelled `GaugeVec` set by the **periodic** storage snapshot (`src/database.rs:355`), and a vec with no observed label set exports nothing. Per-write billing is `proximadb_object_store_write_bytes_by_tier_total`, recorded **at flush** (#718); the test's `CreateDocument` lands in the memtable without flushing, so no consumption sample exists yet. The test asserts a family the write cannot produce. Confirm the intended "metered path" with the metering owner, then assert the right family (after a flush) or the snapshot. 4 of 5 tests pass.
 
 | `route_cost_offline_eval`
 | Controller should cut >= 75% of the static heuristic's regret; got ctrl=198,900 vs static=200,000
@@ -48,17 +48,17 @@ deliberate change; **investigate** = deterministic failure, cause not yet proven
 
 | `grpc_methods_test`
 | `GraphOperationsService::get_node` on a non-existent graph does not error
-| contract
+| **fixed** (real; contract decided)
 | The test expects `Err`; the service presumably returns `Ok(None)`. Decide the contract (not-found as `Err` vs `None`) with the graph owner, then fix the code or the test.
 
 | `counting_filesystem`
 | `batched_range_reads` is 2, test expects 1
-| stale
+| **fixed** (stale)
 | `CountingFileSystem::read_ranges` deliberately counts *physical* GETs after the inner filesystem's coalescing plan ("count what the wire will see", `crates/storage/proximadb-storage-filesystem-types/src/counting.rs:220-224`). The test's fake filesystem does not coalesce, so its two adjacent ranges are correctly 2 GETs. Update the test to the physical-GET contract (or give the fake a coalescing plan).
 
 | `tdd_infrastructure_test`
 | Asserts `.git/hooks/pre-commit.tdd` exists
-| stale
+| **fixed** (stale)
 | Depends on a developer-local git hook that no checkout or CI runner has. Delete the assertion (or the target, if it pins nothing else).
 
 | `helix_prune_debug_test`
@@ -78,6 +78,15 @@ deliberate change; **investigate** = deterministic failure, cause not yet proven
 * `abac_vector_pushdown_integration_test`, `abac_rest_record_search_integration_test`: their tests compile out without `abac-policy`; they belong in the feature-matrix lane.
 * `cdc_rest_changefeed_e2e`: requires `cdc-kafka`.
 * 43 targets that need external services, are cfg-gated or `#[ignore]`d.
+
+== Progress
+
+* **Fixed and wired into the burn-down lane** (#TBD):
+** `objstore_segment_path_guard_test`: compaction's two cache-promotion fallbacks now use the new sanctioned `StagedSegmentWrite::local_path_of` (in `proximadb-sst-engine`'s `staged_write`), which returns `None` for an object-store output, and skip explicitly instead of building an `az://...` "path".
+** `counting_filesystem`: the fake now has a coalescing plan, so the batched read is one physical GET and the test proves the physical-GET contract (it fails if the wrapper counts logical ranges).
+** `tdd_infrastructure_test`: the developer-local hook assertion is removed; the repo-tracked checks remain.
+** `queue_adapter_upgrade_integration_test`: regression from #2386 (`55141f6b3`), which made `LocalFileSystem::list` always return absolute `file:///...` entries; `FactoryQueueFs::relative_from_listed_url` still compared them with the relative root, so every LIST under a relative root failed. Fixed at that boundary only: a relative root is resolved against the working directory for the comparison (lexical, like the backend), confinement and `..` rejection unchanged, caller-facing paths still in caller coordinates. The doubled path in the dotted case is the documented existing mapping, not a bug. New unit test covers in-root, `./` callers, and out-of-root/traversal rejections.
+** `grpc_methods_test`: a READ of a never-created graph went through `get_or_create_graph_engine`, so looking up a node in a mistyped graph silently **created and registered** that graph, then answered "no such node". Decided contract: reads and mutations of existing data (27 call sites) use a new non-provisioning `get_existing_graph_engine` and fail with "Graph collection '...' not found" (NOT_FOUND on the wire, same wording as `update_graph_schema`); only creating writes (create/batch-create, transactions, adding a constraint: 9 sites) still provision, preserving the TD-GRAPH-TENANT-1 first-write flow. A missing node in an existing graph stays `Ok(None)`. Visible change: reading a named tenant's graph before its first write is NOT_FOUND, not empty.
 
 == Exit criteria
 
