@@ -48,6 +48,11 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
   CARGO_INCREMENTAL: 0
+  # Network retry for rustup/cargo downloads (same values as release.yml /
+  # prerelease-ci.yml). Toolchain-setup timeouts and 504s were the most
+  # common infra-only red on PRs; rustup defaults to 3 retries, cargo to 2.
+  CARGO_NET_RETRY: 10
+  RUSTUP_MAX_RETRIES: 10
   # Lean CI compile profiles — cut DWARF line-tables (~1.5–3 GiB off the
   # root-crate test-compile RSS). CI doesn't need backtraces (panics still
   # print file:line via the panic message); local dev keeps line-tables-only

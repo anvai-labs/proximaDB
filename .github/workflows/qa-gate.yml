@@ -33,6 +33,11 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # Network retry for rustup/cargo downloads (same values as release.yml /
+  # prerelease-ci.yml). Toolchain-setup timeouts and 504s were the most
+  # common infra-only red on PRs; rustup defaults to 3 retries, cargo to 2.
+  CARGO_NET_RETRY: 10
+  RUSTUP_MAX_RETRIES: 10
 
 # Least-privilege default GITHUB_TOKEN scope (CodeQL actions/missing-workflow-permissions).
 # Read-only is sufficient: every job only checks out and runs tests/ratchets — none
