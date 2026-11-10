@@ -1,0 +1,59 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-PKG-4: macOS Apple-Silicon DMG packaging — shipped leg, open distribution questions
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Partially resolved (2026-11-10).** The DMG build leg ships; Developer ID signing + notarization does not (needs Apple credentials).
+| Priority | MEDIUM — macOS was the only advertised platform without a native artifact; distribution trust (notarization) remains open.
+| Component | `.github/workflows/release.yml` (`build-binaries` matrix, macOS DMG step, `validate-artifacts`); the GitHub Release notes table
+| Relates to | TD-PKG-2 (Windows MSI, the same "OS package" family); release procedure (`docs/04-operations/release/release-procedure.md`)
+|===
+
+== Background
+
+macOS was disabled at v0.2.0 with the note "ring 0.17.14 has CPU feature
+detection issues on CI macOS runners". At re-enable time (0.6.2) `ring` is
+**still 0.17.14** — the dependency did not move. What changed is the build
+shape: the leg now runs NATIVELY on a `macos-14` (arm64) runner instead of
+whatever `macos-latest` was in 2024, so the first dry_run proves the build
+end to end. If ring still fails there, the recorded fallbacks are: (a) pin
+`ring`/`rustls` to a version pair known good on macOS CI (verify against the
+ring issue tracker first — do not guess), or (b) swap the JSON-webtoken/pgwire
+crypto stack off ring.
+
+== What ships now
+
+* `build-binaries` gains an `aarch64-apple-darwin` leg: `macos-14` runner,
+  features `cloud-full,vendored-openssl` (vendored OpenSSL so the binaries do
+  not depend on Homebrew's OpenSSL), own rust-cache prefix.
+* The DMG bundle carries the three binaries (`proximadb-server`, `-bench`,
+  `-migrate`), `README.adoc`, `LICENSE`, and `config/config.toml` under
+  `config/` — the same layout as the Linux archive. The shipped config's
+  `/tmp` roots are rebased by the documented `PROXIMADB_DATA_DIR` knob
+  (TD-PKG-3's loader behaviour), so a drag-install user's data lands under
+  the data dir they point at.
+* Binaries are **ad-hoc** codesigned (`codesign --sign -`). On arm64, a fully
+  unsigned downloaded binary can be reported by Gatekeeper as *damaged*
+  rather than merely unverified; ad-hoc avoids that. It does NOT make the
+  DMG notarized: first launch still needs right-click → Open.
+* `validate-artifacts` requires the DMG (missing = release blocked, same
+  fail-closed shape as every other leg); `release-assets` collection and the
+  SHA256SUMS glob already handled `*.dmg`; the release-notes table advertises
+  it with the Gatekeeper note.
+
+== Open (needs Apple credentials + a decision)
+
+* **Developer ID signing + notarization**: needs an Apple Developer account,
+  a `Developer ID Application` certificate, and notarization (stapling).
+  Wire as secrets-gated steps (`MACOS_CERTIFICATE` / `APPLE_ID` /
+  `APPLE_PASSWORD` / `APPLE_TEAM_ID`): sign with the identity when the
+  secret exists, keep ad-hoc otherwise. Until then the release notes carry
+  the right-click note.
+* **Embedded wheel**: `proximadb_embedded` (PyO3) has no macOS arm64 wheel —
+  `release-python.yml` owns that matrix and was not touched here. If macOS
+  SDK users want the embedded engine natively, that matrix needs the same
+  leg (abi3 aarch64-apple-darwin), plus the same ring question.
+* **Homebrew**: the formula builds from source against the tarball; once the
+  DMG exists, a cask route (drag-install) is a candidate — undecided.

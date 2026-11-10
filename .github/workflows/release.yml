@@ -57,9 +57,10 @@
 #   └─────────────────────────────────────────────────────────────────────────┘
 #
 # EXPECTED ARTIFACTS:
-#   Binaries (2 targets for the v0.2 MVP trust corridor):
+#   Binaries (3 targets; macOS aarch64 DMG re-enabled 0.6.2, TD-PKG-4):
 #     - proximadb-{version}-x86_64-unknown-linux-gnu.tar.gz
 #     - proximadb-{version}-x86_64-pc-windows-msvc.zip
+#     - proximadb-{version}-aarch64-apple-darwin.dmg
 #
 #   Python Wheels are NOT built here. The pure-Python SDK (`proximadb`) and the
 #   native embedded engine (`proximadb_embedded`, one abi3 wheel per platform,
@@ -75,8 +76,8 @@
 #
 # v0.2.0 SCOPE:
 #   - Only x86_64-linux-gnu and x86_64-windows are built
-#   - musl, aarch64 targets disabled due to cross-compilation issues
-#   - macOS DMG disabled (no macOS binaries)
+#   - musl, aarch64-linux targets disabled due to cross-compilation issues
+#   - macOS DMG re-enabled in 0.6.2 (native macos-14 arm64 leg; TD-PKG-4)
 #   - Python packages are pure Python (no Rust wheels)
 #
 # MANUAL RELEASE PROCESS:
@@ -286,14 +287,19 @@ jobs:
           #   features: ""
           #   cross: true
 
-          # macOS aarch64 (Apple Silicon) - DISABLED for v0.2.0
-          # Ring 0.17.14 has CPU feature detection issues on CI macOS runners
-          # Multiple dependencies pull in ring (jsonwebtoken, pgwire, rustls, rcgen)
-          # Re-enable in v0.2.1 with alternative crypto stack or rustls upgrade
-          # - target: aarch64-apple-darwin
-          #   os: macos-latest
-          #   archive: tar.gz
-          #   features: ""
+          # macOS aarch64 (Apple Silicon) - RE-ENABLED (user-directed, 0.6.2).
+          # The v0.2.0 disable blamed ring 0.17.14 CPU-feature detection on
+          # CI macOS runners; ring is still 0.17.14, but this leg now builds
+          # NATIVELY on a macos-14 (arm64) runner — the first dry_run proves
+          # it end to end. If ring still fails there, TD-PKG-4 records the
+          # fallback options (ring/rustls upgrade pin). Distribution is
+          # ad-hoc codesigned; Developer ID + notarization is TD-PKG-4's open
+          # question (needs Apple credentials).
+          - target: aarch64-apple-darwin
+            os: macos-14
+            archive: dmg
+            features: "cloud-full,vendored-openssl"
+            cache_prefix: "v1-rust-aarch64-apple-darwin"
 
           # Windows x86_64
           - target: x86_64-pc-windows-msvc
@@ -409,7 +415,7 @@ jobs:
         shell: bash
 
       - name: Create Archive (Unix)
-        if: steps.fetch.outcome != 'success' && runner.os != 'Windows'
+        if: steps.fetch.outcome != 'success' && runner.os != 'Windows' && matrix.archive == 'tar.gz'
         run: |
           VERSION="${{ needs.prepare.outputs.version }}"
           TARGET="${{ matrix.target }}"
@@ -428,6 +434,37 @@ jobs:
           shasum -a 256 "${ARCHIVE_NAME}.tar.gz" > "${ARCHIVE_NAME}.tar.gz.sha256"
 
           echo "ARCHIVE_NAME=${ARCHIVE_NAME}.tar.gz" >> "$GITHUB_ENV"
+
+      # macOS ships a .dmg (user-directed): server + bench + migrate binaries,
+      # README/LICENSE, and the config template in one drag-install volume.
+      - name: Create DMG (macOS)
+        if: steps.fetch.outcome != 'success' && runner.os == 'macOS' && matrix.archive == 'dmg'
+        run: |
+          VERSION="${{ needs.prepare.outputs.version }}"
+          TARGET="${{ matrix.target }}"
+          VOLDIR="proximadb-${VERSION}-${TARGET}"
+
+          mkdir -p "${VOLDIR}/config"
+          cp "target/${TARGET}/release/proximadb-server" "${VOLDIR}/"
+          cp "target/${TARGET}/release/proximadb-bench" "${VOLDIR}/"
+          cp "target/${TARGET}/release/proximadb-migrate" "${VOLDIR}/"
+          cp README.adoc LICENSE "${VOLDIR}/" 2>/dev/null || true
+          cp config/config.toml "${VOLDIR}/config/"
+
+          # Ad-hoc codesign (no Apple credentials in the pipeline): on arm64,
+          # a fully unsigned binary downloaded from the internet can be
+          # reported by Gatekeeper as damaged rather than merely unverified.
+          # Ad-hoc does NOT make the DMG notarized — double-click still needs
+          # right-click → Open. Developer ID + notarization: TD-PKG-4.
+          for macos_bin in proximadb-server proximadb-bench proximadb-migrate; do
+            codesign --sign - --force "${VOLDIR}/${macos_bin}"
+          done
+
+          hdiutil create -volname "proximadb ${VERSION}" -srcfolder "${VOLDIR}" \
+            -ov -format UDZO "proximadb-${VERSION}-${TARGET}.dmg"
+          shasum -a 256 "proximadb-${VERSION}-${TARGET}.dmg" \
+            > "proximadb-${VERSION}-${TARGET}.dmg.sha256"
+          echo "ARCHIVE_NAME=proximadb-${VERSION}-${TARGET}.dmg" >> "$GITHUB_ENV"
 
       - name: Create Archive (Windows)
         if: steps.fetch.outcome != 'success' && runner.os == 'Windows'
@@ -880,8 +917,7 @@ jobs:
           echo ""
 
           # ----------------------------------------
-          # Expected Binary Targets (2 platforms for v0.2.0)
-          # macOS disabled due to ring crate CI compatibility issues
+          # Expected Binary Targets (3 platforms since macOS 0.6.2)
           # ----------------------------------------
           echo "## Binary Artifacts"
           echo ""
@@ -889,6 +925,7 @@ jobs:
           EXPECTED_BINARIES=(
             "proximadb-${VERSION}-x86_64-unknown-linux-gnu.tar.gz"
             "proximadb-${VERSION}-x86_64-pc-windows-msvc.zip"
+            "proximadb-${VERSION}-aarch64-apple-darwin.dmg"
           )
 
           BINARY_COUNT=0
@@ -1122,9 +1159,12 @@ jobs:
           |----------|--------------|---------|
           | Linux | x86_64 (glibc) | `proximadb-${{ needs.prepare.outputs.version }}-x86_64-unknown-linux-gnu.tar.gz` |
           | Windows | x86_64 | `proximadb-${{ needs.prepare.outputs.version }}-x86_64-pc-windows-msvc.zip` |
+          | macOS (Apple Silicon) | aarch64 | `proximadb-${{ needs.prepare.outputs.version }}-aarch64-apple-darwin.dmg` |
 
-          Linux musl, Linux aarch64, and macOS archives are not built by this
-          workflow and are therefore not advertised in this release.
+          The macOS DMG is ad-hoc codesigned but NOT notarized: on first
+          launch, right-click → Open (Gatekeeper). Linux musl and Linux
+          aarch64 archives are not built by this workflow and are therefore
+          not advertised in this release.
 
           #### Packages (every registry at the identical version ${{ needs.prepare.outputs.version }})
 
