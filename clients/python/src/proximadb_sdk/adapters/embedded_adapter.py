@@ -394,6 +394,7 @@ class EmbeddedProtocolAdapter(RecordOpsMixin, BaseProtocolAdapter):
         start_time: float,
         result: Any,
         error: Exception | None = None,
+        vector_ids: list[str] | None = None,
     ) -> VectorOperationResponse:
         duration_ms = (time.time() - start_time) * 1000
         if error is not None:
@@ -414,6 +415,9 @@ class EmbeddedProtocolAdapter(RecordOpsMixin, BaseProtocolAdapter):
         return VectorOperationResponse(
             success=True,
             operation=operation,
+            # echo ONLY on full success (models.resolve_vector_ids policy —
+            # a partial echo would list records the server rejected)
+            vector_ids=list(vector_ids or []) if failed_count == 0 else [],
             metrics=OperationMetrics(
                 successful_count=successful_count,
                 failed_count=failed_count,
@@ -475,6 +479,10 @@ class EmbeddedProtocolAdapter(RecordOpsMixin, BaseProtocolAdapter):
                 len(ids),
                 start_time,
                 result,
+                # Echo the client-supplied ids ONLY on full success (the
+                # models.resolve_vector_ids policy — on partial failure the
+                # echo would list records the server rejected).
+                vector_ids=ids if result == len(ids) else [],
             )
         except Exception as e:
             return self._build_vector_operation_response(
@@ -530,6 +538,7 @@ class EmbeddedProtocolAdapter(RecordOpsMixin, BaseProtocolAdapter):
             success=response.metrics.successful_count,
             failed=response.metrics.failed_count,
             errors=[response.error_message] if response.error_message else [],
+            inserted_ids=list(response.vector_ids or []),
             metrics=response.metrics,
         )
 
