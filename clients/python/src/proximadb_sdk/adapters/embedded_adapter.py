@@ -50,6 +50,25 @@ def _is_coroutine_fn(fn) -> bool:
     return asyncio.iscoroutinefunction(fn)
 
 
+def _successful_write_count(result: Any, total_count: int) -> int:
+    """Interpret an embedded write result as a successful-write count.
+
+    The PyO3 binding's contract: insert/insert_numpy return a processed
+    count (int); upsert/upsert_numpy return an (inserted, updated) tuple
+    where both elements are successful-write categories. Defensive on
+    malformed shapes: a tuple with non-int parts sums its int parts (a
+    binding upgrade adding a category must not convert a committed write
+    into a reported failure); anything non-int/non-tuple counts as full
+    success.
+    """
+    if isinstance(result, tuple):
+        parts = [p for p in result if isinstance(p, int)]
+        return sum(parts) if parts else total_count
+    if isinstance(result, int):
+        return result
+    return total_count
+
+
 class EmbeddedProtocolAdapter(RecordOpsMixin, BaseProtocolAdapter):
     """Embedded adapter implementing BaseProtocolAdapter.
 
@@ -426,7 +445,7 @@ class EmbeddedProtocolAdapter(RecordOpsMixin, BaseProtocolAdapter):
             # upsert/upsert_numpy contract: every tuple element is a
             # successful-write category (inserted, updated, …) — sum them
             # all, matching upsert_records' counting
-            successful_count = sum(int(part) for part in result)
+            successful_count = _successful_write_count(result, total_count)
         elif isinstance(result, int):
             successful_count = result
         else:
@@ -456,11 +475,12 @@ class EmbeddedProtocolAdapter(RecordOpsMixin, BaseProtocolAdapter):
         upsert: bool,
     ) -> VectorOperationResponse:
         start_time = time.time()
-        # empty batch: REST insert_records([]) answers BatchResult(success=0)
-        # without a request — match that falsy shape (a caller checking
-        # `if resp.success:` must see the same thing on every transport).
-        # ids-without-vectors is a caller bug: it fails at the binding's own
-        # length check, surfaced as a failed response — not masked here.
+        # empty batch: a legal no-op. CROSS-TRANSPORT DIVERGENCE (documented):
+        # the direct embedded path answers success=True, while the same empty
+        # input via insert_records/insert_vectors converts to
+        # BatchResult(success=0) — falsy. ids-without-vectors is a caller
+        # bug: it raises at the np.asarray shape check below, escaping as a
+        # raw ValueError rather than a failed response.
         if len(vectors) == 0 and len(ids) == 0:
             return self._build_vector_operation_response(
                 operation,
@@ -637,11 +657,7 @@ class EmbeddedProtocolAdapter(RecordOpsMixin, BaseProtocolAdapter):
                 # the upsert contract is (inserted, updated) — BOTH are
                 # successful writes (an all-updated batch must not report
                 # total failure)
-                successful = (
-                    sum(int(part) for part in result)
-                    if isinstance(result, tuple)
-                    else (result if isinstance(result, int) else len(records))
-                )
+                successful = _successful_write_count(result, len(records))
                 failed = max(len(records) - successful, 0)
                 return BatchResult(
                     total=len(records),

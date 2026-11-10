@@ -72,6 +72,18 @@ def test_partial_success_suppresses_the_echo():
     assert resp.vector_ids == []
 
 
+def test_successful_count_helper_is_defensive_on_malformed_tuples():
+    # a binding upgrade adding a non-int category must not convert a
+    # committed write into a reported failure: non-int parts are ignored,
+    # and a tuple with no int parts counts as full success (the total
+    # fallback) rather than crashing the echo gate.
+    from proximadb_sdk.adapters.embedded_adapter import _successful_write_count
+
+    assert _successful_write_count((2, None), 3) == 2
+    assert _successful_write_count((2, "err"), 3) == 3
+    assert _successful_write_count(3, 3) == 3
+
+
 def test_empty_batch_is_a_clean_noop():
     adapter = _adapter(insert_result=0)
     resp = adapter.insert_numpy("col", [], [], None)

@@ -1511,10 +1511,11 @@ class BatchResult(BaseModel):
     metrics: OperationMetrics = Field(default_factory=OperationMetrics)
     # Per-record IDs of successfully written records. Server-assigned when
     # the wire response carries them (REST v2 inserted_ids, gRPC inserted_ids
-    # with return_ids=True); the embedded transport echoes the
-    # client-supplied ids (its PyO3 result carries counts only). Empty for
-    # operations whose transport provides no per-record IDs, and for partial
-    # failures (the echo must not list records the server rejected).
+    # with return_ids=True); on the embedded transport these may be
+    # client-supplied OR client-minted (new_record_id for id-less records —
+    # the PyO3 result carries counts only). Empty for operations whose
+    # transport provides no per-record IDs, and for partial failures (the
+    # echo must not list records the server rejected).
     inserted_ids: list[str] = Field(default_factory=list)
 
 
