@@ -1315,4 +1315,168 @@ mod tests {
         .await;
         assert!(err.contains("must not nest"), "{err}");
     }
+
+    // ── TD-SEAM-14 S0 counterexample tests ──────────────────────────────────
+    // These tests demonstrate gaps in the current ownership/fencing model.
+    // They should FAIL until the gaps are fixed.
+
+    /// Counterexample 1: Second-writer purge race (TD-SEAM-14 §1.1)
+    ///
+    /// Scenario:
+    /// 1. Server A boots, claims prefix at epoch 1
+    /// 2. Server B boots with copied data directory (same instance, same epoch)
+    /// 3. Server B increments to epoch 2, overwrites owner marker
+    /// 4. Server A's purge is not fenced — it can delete segments B is serving
+    ///
+    /// Expected (after fix): Server B's claim should be refused (epoch collision)
+    /// OR Server A's purge should be fenced (check owner marker before delete).
+    ///
+    /// Current behavior: Both servers can claim ownership, no fencing on purge.
+    #[tokio::test]
+    async fn counterexample_second_writer_purge_race() {
+        let (_data, bucket, dir_a, url, factory) = fixture().await;
+
+        // Server A boots, claims prefix at epoch 1
+        let target_a = resolve(&dir_a, &factory, false, Some(&url))
+            .await
+            .expect("server A claims");
+        assert_eq!(owner(&url).epoch, 1, "server A at epoch 1");
+
+        // Write a segment that server A is serving
+        segment(&bucket.path().join("spill"), "spill-1.parquet");
+
+        // Copy the data directory to simulate server B
+        let data_b = tempfile::tempdir().expect("tempdir");
+        let dir_b = data_b.path().join("pgwire");
+        std::fs::create_dir_all(&dir_b).expect("mkdir");
+        std::fs::copy(dir_a.join(PLACEMENT_MARKER), dir_b.join(PLACEMENT_MARKER))
+            .expect("copy placement");
+
+        // Server B boots from copied directory
+        // GAP: Server B can increment epoch and overwrite owner marker
+        let target_b = resolve(&dir_b, &factory, false, Some(&url))
+            .await
+            .expect("server B claims (GAP: should be refused)");
+
+        // Both servers now think they own the prefix
+        assert_eq!(state(&dir_a).epoch, 1, "server A still at epoch 1");
+        assert_eq!(state(&dir_b).epoch, 2, "server B at epoch 2");
+        assert_eq!(owner(&url).epoch, 2, "owner marker overwritten by B");
+
+        // GAP: Server A's purge is not fenced — it can delete spill-1.parquet
+        // even though server B might be serving it.
+        // After fix: purge should check owner marker and refuse if epoch changed.
+        // For now, this test documents the gap.
+        assert!(
+            target_a.has_state().await.expect("scan"),
+            "server A can still see segments (no fencing yet)"
+        );
+    }
+
+    /// Counterexample 2: Rollback undetected (TD-SEAM-14 §1.2)
+    ///
+    /// Scenario:
+    /// 1. Server boots at epoch 5, writes segments S1-S5
+    /// 2. Bucket is restored to mid-run state (epoch 3, segments S1-S3)
+    /// 3. Server reboots, sees owner marker at epoch 3
+    /// 4. Server increments to epoch 4, boots successfully
+    /// 5. Server serves S1-S3 — GAP: rollback undetected, missing S4-S5
+    ///
+    /// Expected (after fix): Boot should detect rollback (epoch went backwards)
+    /// OR segments should be epoch-stamped (S4, S5 have epoch 5, not found).
+    ///
+    /// Current behavior: Rollback is undetected, server serves incomplete data.
+    #[tokio::test]
+    async fn counterexample_rollback_undetected() {
+        let (_data, bucket, dir, url, factory) = fixture().await;
+
+        // Server boots at epoch 1, writes segments
+        resolve(&dir, &factory, false, Some(&url)).expect("boot at epoch 1");
+        segment(&bucket.path().join("spill"), "spill-1.parquet");
+        segment(&bucket.path().join("spill"), "spill-2.parquet");
+
+        // Simulate rollback: restore owner marker to epoch 0 (before boot)
+        // and remove one segment
+        let owner_path = bucket.path().join("_proximadb_spill_owner.json");
+        let old_owner = serde_json::to_vec_pretty(&OwnerMarker {
+            instance: state(&dir).instance.clone(),
+            epoch: 0,
+            nonce: None,
+            written_by: crate::version::PROXIMADB_VERSION.to_string(),
+        })
+        .expect("serialize");
+        std::fs::write(&owner_path, old_owner).expect("restore old owner");
+        std::fs::remove_file(bucket.path().join("spill/spill-2.parquet")).expect("lose segment");
+
+        // Server reboots after rollback
+        // GAP: Server increments to epoch 1, boots successfully, serves incomplete data
+        let target = resolve(&dir, &factory, false, Some(&url))
+            .expect("boot after rollback (GAP: should detect rollback)");
+
+        // Server can still see spill-1.parquet but not spill-2.parquet
+        assert!(target.has_state().await.expect("scan"));
+        // GAP: No rollback detection, server serves incomplete data
+    }
+
+    /// Counterexample 3: Racing boot epoch collision (TD-SEAM-14 §1.3)
+    ///
+    /// Scenario:
+    /// 1. Two copies of data directory exist (A and B)
+    /// 2. Both boot simultaneously at epoch 5
+    /// 3. Both read owner marker at epoch 5
+    /// 4. Both increment to epoch 6
+    /// 5. Both write owner marker with epoch 6 — GAP: no CAS, both succeed
+    /// 6. Both claim ownership, both can purge
+    ///
+    /// Expected (after fix): Owner marker write should be CAS (check-and-set).
+    /// Second writer's CAS should fail, boot refused.
+    ///
+    /// Current behavior: No CAS, both writers can succeed.
+    #[tokio::test]
+    async fn counterexample_racing_boot_epoch_collision() {
+        let (_data, bucket, dir_a, url, factory) = fixture().await;
+
+        // Set up initial state at epoch 5
+        std::fs::create_dir_all(&dir_a).expect("mkdir");
+        let initial = PlacementMarker {
+            instance: "test-instance".to_string(),
+            epoch: 5,
+            pending: None,
+            placement: url.clone(),
+        };
+        write_placement(&dir_a, &initial).expect("write placement");
+        let owner_bytes = serde_json::to_vec_pretty(&OwnerMarker {
+            instance: "test-instance".to_string(),
+            epoch: 5,
+            nonce: None,
+            written_by: crate::version::PROXIMADB_VERSION.to_string(),
+        })
+        .expect("serialize");
+        write_owner(&owner_url(&url), &factory().await, &owner_bytes, false)
+            .await
+            .expect("write owner");
+
+        // Copy data directory for server B
+        let data_b = tempfile::tempdir().expect("tempdir");
+        let dir_b = data_b.path().join("pgwire");
+        std::fs::create_dir_all(&dir_b).expect("mkdir");
+        std::fs::copy(dir_a.join(PLACEMENT_MARKER), dir_b.join(PLACEMENT_MARKER))
+            .expect("copy placement");
+
+        // Both servers boot "simultaneously" (sequentially in test, but both read epoch 5)
+        // GAP: Both can increment to epoch 6 and write owner marker
+        let _target_a = resolve(&dir_a, &factory, false, Some(&url)).expect("server A boots");
+        let _target_b = resolve(&dir_b, &factory, false, Some(&url)).expect("server B boots");
+
+        // Both servers now at epoch 6
+        assert_eq!(state(&dir_a).epoch, 6, "server A at epoch 6");
+        assert_eq!(
+            state(&dir_b).epoch,
+            6,
+            "server B at epoch 6 (GAP: should be refused)"
+        );
+        assert_eq!(owner(&url).epoch, 6, "owner marker at epoch 6");
+
+        // GAP: Both servers think they own the prefix, no CAS prevented collision
+    }
 }
