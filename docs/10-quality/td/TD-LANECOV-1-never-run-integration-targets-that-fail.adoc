@@ -1,0 +1,80 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-LANECOV-1: integration targets that ran in no CI lane, and fail on develop
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open (filed 2026-11-10).** Found by the item-7 lane burn-down (#2502). Each target here is still on `scripts/ci_lane_baseline.txt` and must stay off a lane until it passes.
+| Evidence | All 75 default-feature, hermetic-looking baseline targets were run on develop `4f256e8b9` (`cargo nextest run -p proximadb --profile integration --retries 0 --test ...`). 64 passed and are wired into the new burn-down lane. The 9 below failed; each was then **re-run twice in isolation** to separate deterministic failures from load.
+| Why it matters | These tests were compiled by CI but executed by none, which is the release-review F2 shape. Several guard a property that has since regressed, and nothing noticed.
+|===
+
+== Triage
+
+Classification key: **real** = the product violates the property the test pins
+(verified by reading the code); **stale** = the test's expectation predates a
+deliberate change; **investigate** = deterministic failure, cause not yet proven;
+**contract** = the expected behaviour is a product decision.
+
+[cols="2,3,1,4", options="header"]
+|===
+| Target | Failure (deterministic 2/2 unless noted) | Class | Notes
+
+| `objstore_segment_path_guard_test`
+| `src/storage/engines/sst/compaction.rs` contains `strip_prefix("file://")`
+| real
+| Source guard from #1082 (TD-OBJSTORE-4 defect-6 class). Reintroduced at `compaction.rs:3262` and `:3298` by later PRs (#1325, #1417, TD-TIER-1 SC4 `cd46e4473`) because no lane ran the guard. Both sites are the post-publication cache-promotion **fallback** path: for a cloud URL the strip is a no-op, the fallback "path" is `az://...`, and promotion fails with a warning (a silently cold cache), not data loss. Fix: derive the fallback through `sst::staged_write` like the write path.
+
+| `queue_adapter_upgrade_integration_test` (2 tests)
+| A relative `file://` queue root makes LIST return entries "outside configured root": `.tmpX/queue/.tmpX/queue/events`
+| real (likely)
+| The path is doubled when the root is relative (`file://.tmp1tZS1z/queue`, `file://./.tmpUVDUgf/queue`); absolute roots pass (3/5 tests green). Likely a relative-root join applied twice in the queue filesystem's LIST.
+
+| `discovery_drift_watcher_e2e`
+| Drift watcher did not auto-trigger a second recluster in 40 s
+| investigate
+| The test sets `PROXIMADB_DRIFT_THRESHOLD_WRITES=1` and `PROXIMADB_DRIFT_INTERVAL_SECS=1` itself (lines 100-101), so defaults (60 s / 10,000) are not the cause. Check whether the knobs are read into a static before `set_var`, or whether the watcher stopped re-arming.
+
+| `documents_convergence_e2e`
+| Consumption metric family not live on `/metrics/prometheus` after a metered write
+| investigate
+| A metering (billing) regression or a renamed metric family. 4 of 5 tests pass.
+
+| `route_cost_offline_eval`
+| Controller should cut >= 75% of the static heuristic's regret; got ctrl=198,900 vs static=200,000
+| investigate
+| An offline eval of the cost router (directive 13): the gated controller now barely beats the static heuristic. Either the router regressed or the eval's fixture drifted.
+
+| `grpc_methods_test`
+| `GraphOperationsService::get_node` on a non-existent graph does not error
+| contract
+| The test expects `Err`; the service presumably returns `Ok(None)`. Decide the contract (not-found as `Err` vs `None`) with the graph owner, then fix the code or the test.
+
+| `counting_filesystem`
+| `batched_range_reads` is 2, test expects 1
+| stale
+| `CountingFileSystem::read_ranges` deliberately counts *physical* GETs after the inner filesystem's coalescing plan ("count what the wire will see", `crates/storage/proximadb-storage-filesystem-types/src/counting.rs:220-224`). The test's fake filesystem does not coalesce, so its two adjacent ranges are correctly 2 GETs. Update the test to the physical-GET contract (or give the fake a coalescing plan).
+
+| `tdd_infrastructure_test`
+| Asserts `.git/hooks/pre-commit.tdd` exists
+| stale
+| Depends on a developer-local git hook that no checkout or CI runner has. Delete the assertion (or the target, if it pins nothing else).
+
+| `helix_prune_debug_test`
+| Failed once in the 75-target batch; **passed 2/2 in isolation**
+| flaky
+| Load/timing-sensitive. Not wired; make it deterministic before adding it to a lane.
+|===
+
+== Also not wired (not failures)
+
+* `abac_vector_pushdown_integration_test`, `abac_rest_record_search_integration_test`: their tests compile out without `abac-policy`; they belong in the feature-matrix lane.
+* `cdc_rest_changefeed_e2e`: requires `cdc-kafka`.
+* 43 targets that need external services, are cfg-gated or `#[ignore]`d.
+
+== Exit criteria
+
+Each row is closed by a PR that fixes the code (real), the test (stale), or the
+contract (contract), **and** moves the target from the baseline into a lane in
+the same PR, so it cannot silently rot again.
