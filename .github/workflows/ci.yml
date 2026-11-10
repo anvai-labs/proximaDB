@@ -169,6 +169,13 @@ jobs:
       proto: ${{ steps.filter.outputs.proto }}
       panic_policy: ${{ steps.filter.outputs.panic_policy }}
       capability_facade: ${{ steps.filter.outputs.capability_facade }}
+      # The lint lane's first real catch (actionlint): this output was never
+      # declared while the dup_ratchet filter group and the hygiene job's
+      # `if` both reference it — so a PR touching ONLY dup_ratchet.py or its
+      # baseline never ran Hygiene Guardrails (the undeclared output reads as
+      # empty). Same failure class capability_facade guards against: the PR
+      # that weakens the gate is the one PR the gate never sees.
+      dup_ratchet: ${{ steps.filter.outputs.dup_ratchet }}
       type_name_ratchet: ${{ steps.filter.outputs.type_name_ratchet }}
       v1_proto_usage: ${{ steps.filter.outputs.v1_proto_usage }}
       # Granular Rust component detection for targeted testing. query_changes
@@ -1785,7 +1792,19 @@ jobs:
       - name: Run actionlint on the release workflows
         run: |
           bash <(curl https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash)
-          ./actionlint -color .github/workflows/release.yml .github/workflows/release-smoke.yml .github/workflows/ci.yml
+          # -shellcheck= : disable actionlint's EMBEDDED shellcheck on inline
+          # `run:` blocks — 60 pre-existing info/style findings (40x SC2086)
+          # in release.yml's publish scripts are real debt but the wrong size
+          # to churn a publish workflow in one PR; the packaging .sh scripts
+          # (the layer this lane exists for) are checked standalone above at
+          # --severity=warning. Follow-up: quote them incrementally.
+          # -ignore 'property "cross"' : matrix.cross only exists on the
+          # DISABLED aarch64 matrix leg (commented out next to the musl leg);
+          # the Install Cross / cross-build steps are its re-enablement
+          # scaffolding, so the "undefined property" finding is intentional.
+          ./actionlint -color -shellcheck= \
+            -ignore 'property "cross" is not defined' \
+            .github/workflows/release.yml .github/workflows/release-smoke.yml .github/workflows/ci.yml
 
   go-lint:
     name: Go SDK Lint
