@@ -22,12 +22,12 @@ def _adapter(insert_result=None, upsert_result=None):
         "Db",
         (),
         {
-            "insert_numpy": lambda self, *a, **k: insert_result
-            if insert_result is not None
-            else len(a[1]),
-            "upsert_numpy": lambda self, *a, **k: upsert_result
-            if upsert_result is not None
-            else (len(a[1]), 0),
+            "insert_numpy": lambda self, *a, **k: (
+                insert_result if insert_result is not None else len(a[1])
+            ),
+            "upsert_numpy": lambda self, *a, **k: (
+                upsert_result if upsert_result is not None else (len(a[1]), 0)
+            ),
         },
     )()
     adapter._connected = True
@@ -58,7 +58,9 @@ def test_upsert_numpy_echoes_ids_on_full_success():
     adapter = _adapter(upsert_result=(2, 0))
     ids = ["a", "b"]
     records = _records(2)
-    resp = adapter.upsert_numpy("col", [r["id"] for r in records], [r["vector"] for r in records], None)
+    resp = adapter.upsert_numpy(
+        "col", [r["id"] for r in records], [r["vector"] for r in records], None
+    )
     assert resp.vector_ids == [r["id"] for r in records]
 
 
