@@ -101,6 +101,20 @@ class ClientConfig(BaseModel):
     port_mode: PortMode = Field(
         default=PortMode.UNIFIED, description="Server port mode (unified or multi)"
     )
+    grpc_port: int | None = Field(
+        default=None,
+        description=(
+            "gRPC port in multi-port mode (default 5679). Ignored in unified "
+            "mode, where every protocol shares the URL's port."
+        ),
+    )
+    flight_port: int | None = Field(
+        default=None,
+        description=(
+            "Arrow Flight port in multi-port mode (default 5680). Ignored in "
+            "unified mode."
+        ),
+    )
     uds_path: str | None = Field(
         default=None,
         description=(
@@ -355,14 +369,18 @@ class ClientConfig(BaseModel):
             else:
                 return f"{scheme}://{host}:{port}"
 
-        # Multi-port mode (legacy): different ports for each protocol
-        # Note: In unified mode (default), all protocols share port 5678
+        # Multi-port mode (legacy): a separate port per protocol. Each honours
+        # the caller's setting and falls back to the legacy default; these
+        # were hardcoded, so a URL on :15678 still sent REST to :5678 and a
+        # configured gRPC port was ignored (gRPC always dialled :5679).
         if target_protocol == Protocol.REST:
-            port = 5678  # REST API port
+            # The URL is the REST URL only when it is http(s); a grpc:// URL's
+            # port is the gRPC port and must not leak into REST.
+            port = (parsed.port if scheme in ("http", "https") else None) or 5678
         elif target_protocol == Protocol.GRPC:
-            port = 5679  # Legacy gRPC API port (use unified mode for single port)
+            port = self.grpc_port or 5679
         elif target_protocol == Protocol.ARROW_FLIGHT:
-            port = 5680  # Legacy Arrow Flight port (use unified mode for single port)
+            port = self.flight_port or 5680
         else:
             # Keep original port for AUTO or unknown protocols
             port = parsed.port or (443 if scheme == "https" else 80)

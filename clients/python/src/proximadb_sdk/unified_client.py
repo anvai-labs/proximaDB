@@ -1179,7 +1179,15 @@ class ProximaDBClient:
         # Pass compression settings from config
         client = ProximaDBSyncGrpcClient(
             server_address=grpc_url,
-            timeout=60.0,
+            # An explicitly configured timeout now reaches gRPC (it was
+            # hardcoded to 60 s, so the CLI's --timeout never applied). Unset
+            # keeps 60 s: ClientConfig.timeout defaults to 30 s, and silently
+            # halving every gRPC deadline would be a behaviour change.
+            timeout=(
+                self.config.timeout
+                if "timeout" in getattr(self.config, "model_fields_set", set())
+                else 60.0
+            ),
             enable_compression=(
                 self.config.compression.enabled
                 if hasattr(self.config, "compression")

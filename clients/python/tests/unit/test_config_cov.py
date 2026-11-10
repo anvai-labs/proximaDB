@@ -321,8 +321,10 @@ def test_protocol_url_unified_default_port():
 
 
 def test_protocol_url_multi_rest():
+    # In multi-port mode an http(s) URL is the REST URL, so its port is used
+    # (it was hardcoded to 5678, which broke split-port servers on 15678).
     cfg = ClientConfig(url="http://localhost:9999", port_mode=PortMode.MULTI)
-    assert cfg.get_protocol_url(Protocol.REST) == "http://localhost:5678"
+    assert cfg.get_protocol_url(Protocol.REST) == "http://localhost:9999"
 
 
 def test_protocol_url_multi_grpc():
