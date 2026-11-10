@@ -51,7 +51,10 @@ def test_insert_numpy_echoes_ids_on_full_success():
 def test_upsert_numpy_echoes_ids_on_full_success():
     # REAL binding contract: upsert_numpy returns an (inserted, updated)
     # TUPLE — an int stub masks the echo path (the round-8 review's finding).
-    adapter = _adapter(upsert_result=(2, 0))
+    # (0, 2) is the discriminating all-UPDATED case: the pre-PR counting
+    # (inserted component only) would report total failure and suppress the
+    # echo — this test goes red under that regression.
+    adapter = _adapter(upsert_result=(0, 2))
     records = _records(2)
     resp = adapter.upsert_numpy(
         "col", [r["id"] for r in records], [r["vector"] for r in records], None
@@ -60,10 +63,12 @@ def test_upsert_numpy_echoes_ids_on_full_success():
 
 
 def test_partial_success_suppresses_the_echo():
-    # binding processed only 2 of 3 → the echo MUST be suppressed
+    # REACHABLE partial shape: 3 ids paired with 3 vectors, the binding
+    # reports 2 processed (one record rejected server-side) → failed=1 →
+    # the echo MUST be suppressed
     adapter = _adapter(insert_result=2)
     ids = ["a", "b", "c"]
-    resp = adapter.insert_numpy("col", ids, [[1.0] * 4] * 2, None)
+    resp = adapter.insert_numpy("col", ids, [[1.0] * 4] * 3, None)
     assert resp.vector_ids == []
 
 

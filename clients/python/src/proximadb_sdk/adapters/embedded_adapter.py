@@ -400,11 +400,13 @@ class EmbeddedProtocolAdapter(RecordOpsMixin, BaseProtocolAdapter):
 
         The embedded binding's write contract: insert/insert_numpy return a
         processed count (int); upsert/upsert_numpy return an (inserted,
-        updated) tuple. THE ECHO POLICY LIVES HERE AND ONLY HERE: the
-        client-supplied id echo is emitted ONLY on full success — a partial
-        echo would list records the server rejected. Consumers read it as
-        BatchResult.inserted_ids (via _batch_result_from_vector_response)
-        and as VectorOperationResponse.vector_ids on the alias paths.
+        updated) tuple. THE ECHO GATE LIVES HERE: the client-supplied id
+        echo is emitted ONLY on full success — a partial echo would list
+        records the server rejected. models.resolve_vector_ids applies the
+        same failed==0 rule to its echo fallback, and consumers read the
+        result as BatchResult.inserted_ids (via
+        _batch_result_from_vector_response) and as
+        VectorOperationResponse.vector_ids on the alias paths.
         """
         duration_ms = (time.time() - start_time) * 1000
         if error is not None:
@@ -421,9 +423,10 @@ class EmbeddedProtocolAdapter(RecordOpsMixin, BaseProtocolAdapter):
             )
 
         if isinstance(result, tuple):
-            # upsert/upsert_numpy contract: (inserted, updated) — both count
-            # as successful writes
-            successful_count = int(result[0]) + int(result[1])
+            # upsert/upsert_numpy contract: every tuple element is a
+            # successful-write category (inserted, updated, …) — sum them
+            # all, matching upsert_records' counting
+            successful_count = sum(int(part) for part in result)
         elif isinstance(result, int):
             successful_count = result
         else:
