@@ -121,6 +121,10 @@ def baseline_names() -> set[str]:
     }
 
 
+# `for <var> in <words...>; do` on a single line; group 1 = the word list.
+INLINE_FOR_RE = re.compile(r"\bfor\s+\w+\s+in\s+([^;\n]*);\s*do\b")
+
+
 def is_covered(stem: str, file_name: str, text: str, patterns: list[str]) -> bool:
     """Covered = any reference anywhere in any workflow.
 
@@ -135,6 +139,13 @@ def is_covered(stem: str, file_name: str, text: str, patterns: list[str]) -> boo
         rf"^\s*{re.escape(stem)}\s*(?:\\\s*|;\s*do\s*|,\s*)?$", text, re.M
     ):
         return True
+    # Inline for-loop list: `for t in a b c; do` on one line. The bare-word
+    # form above only sees a stem ALONE on its line, so an inline list was
+    # invisible and its targets were baselined as never-run while a lane ran
+    # them (#2502 review: the api-surface lane's two targets).
+    for words in INLINE_FOR_RE.findall(text):
+        if stem in words.split():
+            return True
     if f"tests/{file_name}" in text:
         return True
     return any(fnmatch(f"tests/{file_name}", pat) for pat in patterns)

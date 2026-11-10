@@ -69,6 +69,12 @@ deliberate change; **investigate** = deterministic failure, cause not yet proven
 
 == Also not wired (not failures)
 
+* **Vacuous (pass, but assert nothing):** `gap_implementation_tests` puts every
+  real test under `#[cfg(feature = "gap-tests")]`, a feature that does not exist
+  in `Cargo.toml`, and its 4 remaining tests have comment-only bodies;
+  `test_record_store_route` is one empty placeholder. Wiring them would let the
+  ratchet certify coverage that checks nothing, so they stay on the baseline.
+  Owner decision: implement, or delete with sign-off.
 * `abac_vector_pushdown_integration_test`, `abac_rest_record_search_integration_test`: their tests compile out without `abac-policy`; they belong in the feature-matrix lane.
 * `cdc_rest_changefeed_e2e`: requires `cdc-kafka`.
 * 43 targets that need external services, are cfg-gated or `#[ignore]`d.

@@ -26,6 +26,7 @@ fp16_flight_e2e.rs
 fp16_network_e2e.rs
 fp16_rust_sdk_e2e.rs
 fp16_v2_insert_search_e2e.rs
+gap_implementation_tests.rs
 grpc_created_collection_e2e.rs
 grpc_methods_test.rs
 grpc_td121_relational_tenant_isolation_e2e.rs
@@ -48,6 +49,7 @@ search_top_k_cap_e2e.rs
 sql_ast_golden.rs
 streaming_integration_test.rs
 tdd_infrastructure_test.rs
+test_record_store_route.rs
 turboquant_e2e_propagation_test.rs
 turboquant_e2e_test.rs
 v2_metadata_filter_enforcement_test.rs
