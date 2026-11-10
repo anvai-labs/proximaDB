@@ -16,16 +16,10 @@ assert_version() {
     test "$got" = "proximadb-server $VER"
 }
 
-# The TD-PKG-1 rpm -V stateline for a contract dir (9-column rpm-4.14:
-# chmod 750 vs payload 0755 → M; chown user+group → U+G; trailing '.').
-# The ONE definition — verify_rpm.sh's sed, the selftest fixture
-# generator, and the rehearsal stub all derive from this value.
-TD_PKG1_STATELINE='.M...UG..'
-
 # The TD-PKG-1 contract dirs, read from the contract data file
 # (deploy/packaging/chown_dirs.env) with
 # the strict parse both legs share (exactly one assignment, double-quoted
-# value). Sets CONTRACT_DIRS. $1 = the postinstall.sh path.
+# value). Sets CONTRACT_DIRS. $1 = the contract file path.
 read_contract_dirs() {
     local src="${1:?usage: read_contract_dirs <postinstall.sh>}"
     local lines
@@ -41,16 +35,11 @@ read_contract_dirs() {
     [ -n "$CONTRACT_DIRS" ] || { echo "CHOWN_DIRS is empty — the TD-PKG-1 contract is gone; refuse to verify (a dead %post would pass silently)" >&2; return 1; }
 }
 
-# Print the expected rpm -V deviation line for one contract dir.
-td_pkg1_stateline_for() {
-    # $1 = contract dir → the exact expected rpm -V line.
-    printf '%s    %s\n' "$TD_PKG1_STATELINE" "$1"
-}
-
 # Assert the TD-PKG-1 contract on INSTALLED dirs: owner+group proximadb,
 # mode 750. $1 = the SHIPPED contract file (/etc/proximadb/chown_dirs.env
-# on the deb leg). Used by the DEB verifier (dpkg -V is blind to dirs);
-# the RPM leg's rpm -V gate covers the same contract for rpm.
+# on both legs). Used by the DEB verifier (dpkg -V is blind to dirs) AND,
+# since the build-time-attrs flip, by the RPM verifier as the attr-depth
+# gate on top of the clean rpm -V requirement.
 assert_td_pkg1_dirs() {
     local src="${1:?usage: assert_td_pkg1_dirs <postinstall.sh>}"
     read_contract_dirs "$src"
