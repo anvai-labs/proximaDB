@@ -3513,7 +3513,7 @@ jobs:
             fi
           done
 
-  # Lane-coverage burn-down (ranked cleanup item 7). These 60 integration
+  # Lane-coverage burn-down (ranked cleanup item 7). These integration
   # targets were compiled by CI but executed by NO lane (the release-review F2
   # shape scripts/check_ci_lane_coverage.py ratchets). Each was run locally and
   # passed in full on develop 4f256e8b9 before being listed here (~6 min of
@@ -3592,6 +3592,7 @@ jobs:
               --test backup_restore_test \
               --test catalog_integration_test \
               --test corpus_version_restart_safety_test \
+              --test counting_filesystem \
               --test cpg_fragment_pax_contract \
               --test cross_model_transaction_e2e \
               --test cross_surface_unification_e2e \
@@ -3614,6 +3615,7 @@ jobs:
               --test logical_operators_tests \
               --test mtls_integration_test \
               --test nova_ingest_sorted_segment \
+              --test objstore_segment_path_guard_test \
               --test objstore_url_construction_test \
               --test objstore_zero_vector_recovery_test \
               --test orion_canonical_checkpoint_read_test \
@@ -3636,6 +3638,7 @@ jobs:
               --test sks_integration_test \
               --test small_batch_brute_force_test \
               --test td134_keu_rbac_e2e \
+              --test tdd_infrastructure_test \
               --test test_zero_copy_verification \
               --test text_column_integration_test \
               --test tier_transition_invalidation_test \

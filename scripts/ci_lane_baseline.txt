@@ -8,7 +8,6 @@ cdc_integration_test.rs
 cdc_rest_changefeed_e2e.rs
 clickbench_ledger_e2e.rs
 cost_trace_pgwire_multimodal_e2e.rs
-counting_filesystem.rs
 discovery_drift_watcher_e2e.rs
 document_observability_integration_test.rs
 documents_convergence_bake.rs
@@ -37,7 +36,6 @@ ident_case_fold_e2e.rs
 infrastructure_integration_test.rs
 lib.rs
 multimodal_integration_test.rs
-objstore_segment_path_guard_test.rs
 openapi_helpers.rs
 pgwire_upsert_constraints_e2e.rs
 queue_adapter_upgrade_integration_test.rs
@@ -48,7 +46,6 @@ search_collection_tenant_scope_e2e.rs
 search_top_k_cap_e2e.rs
 sql_ast_golden.rs
 streaming_integration_test.rs
-tdd_infrastructure_test.rs
 test_record_store_route.rs
 turboquant_e2e_propagation_test.rs
 turboquant_e2e_test.rs

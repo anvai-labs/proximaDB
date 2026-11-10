@@ -3258,36 +3258,45 @@ impl Compaction {
             && let Some((invariants, survivor)) =
                 crate::storage::engines::sst::core::get_warm_tier_caches()
         {
+            // The retained scratch file if it survives (cloud outputs keep
+            // it); otherwise the published file, but only when the output is
+            // local. An object-store output has no local path to fall back to
+            // (string-stripping its URL yields an `az://...` "path"), so skip.
             let retained_path = Path::new(staged.local_path());
-            let final_local = output_path.strip_prefix("file://").unwrap_or(&output_path);
             let cache_source = if retained_path.exists() {
-                retained_path
+                Some(retained_path)
             } else {
-                Path::new(final_local)
+                crate::storage::engines::sst::staged_write::StagedSegmentWrite::local_path_of(&output_path).map(Path::new)
             };
-            match
-                crate::storage::engines::sst::segment_format::install_pax_cache_seed_from_local_file(
-                    &output_path,
-                    cache_source,
-                    cache_on_write.includes_survivors(),
-                    Some(&invariants),
-                    Some(&survivor),
-                )
-                .await
-            {
-                Ok(seeded_to_disk) => info!(
+            match cache_source {
+                None => debug!(
                     output = %output_path,
-                    source = %cache_source.display(),
-                    seeded_to_disk,
-                    include_survivors = cache_on_write.includes_survivors(),
-                    "post-publication local-spill cache promotion completed"
+                    "post-publication cache promotion skipped: no local copy of a remote output"
                 ),
-                Err(error) => warn!(
-                    output = %output_path,
-                    source = %cache_source.display(),
-                    %error,
-                    "post-publication local-spill cache promotion failed"
-                ),
+                Some(cache_source) => match
+                    crate::storage::engines::sst::segment_format::install_pax_cache_seed_from_local_file(
+                        &output_path,
+                        cache_source,
+                        cache_on_write.includes_survivors(),
+                        Some(&invariants),
+                        Some(&survivor),
+                    )
+                    .await
+                {
+                    Ok(seeded_to_disk) => info!(
+                        output = %output_path,
+                        source = %cache_source.display(),
+                        seeded_to_disk,
+                        include_survivors = cache_on_write.includes_survivors(),
+                        "post-publication local-spill cache promotion completed"
+                    ),
+                    Err(error) => warn!(
+                        output = %output_path,
+                        source = %cache_source.display(),
+                        %error,
+                        "post-publication local-spill cache promotion failed"
+                    ),
+                },
             }
         }
         // TD-TIER-1 SC4-4: a grant covering this collection makes the output
@@ -3295,20 +3304,27 @@ impl Compaction {
         // independent of the cache-on-write policy. Inert without a grant.
         {
             let retained_path = Path::new(staged.local_path());
-            let final_local = output_path.strip_prefix("file://").unwrap_or(&output_path);
             let source = if retained_path.exists() {
-                retained_path
+                Some(retained_path)
             } else {
-                Path::new(final_local)
+                crate::storage::engines::sst::staged_write::StagedSegmentWrite::local_path_of(&output_path).map(Path::new)
             };
-            if let Err(error) =
-                crate::storage::engines::sst::segment_io::seed_object_from_local_file(
-                    &output_path,
-                    source,
-                )
-                .await
-            {
-                warn!(output = %output_path, %error, "TD-TIER-1 SC4: output residency seed failed");
+            match source {
+                None => debug!(
+                    output = %output_path,
+                    "TD-TIER-1 SC4: residency seed skipped: no local copy of a remote output"
+                ),
+                Some(source) => {
+                    if let Err(error) =
+                        crate::storage::engines::sst::segment_io::seed_object_from_local_file(
+                            &output_path,
+                            source,
+                        )
+                        .await
+                    {
+                        warn!(output = %output_path, %error, "TD-TIER-1 SC4: output residency seed failed");
+                    }
+                }
             }
         }
         drop(staged);

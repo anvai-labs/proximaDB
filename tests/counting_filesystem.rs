@@ -12,6 +12,7 @@ use async_trait::async_trait;
 use proximadb_storage_filesystem_types::counting::{CountingFileSystem, GetCounters};
 use proximadb_storage_filesystem_types::{
     DirEntry, FileOptions, FileSystem, FilesystemError, FilesystemFile, FsFileMetadata, FsResult,
+    RangeCoalescePolicy,
 };
 
 /// Minimal fake filesystem: `read` returns a fixed buffer; everything else
@@ -26,6 +27,16 @@ impl FileSystem for FakeFs {
     }
     fn filesystem_type(&self) -> &'static str {
         "fake"
+    }
+    // Coalesce adjacent ranges, like the object-store backends. The wrapper
+    // counts PHYSICAL GETs after the inner plan ("count what the wire will
+    // see"), so the batched read below is one GET, not one per range. A
+    // wrapper counting logical ranges would report 2 and fail this test.
+    fn range_coalesce_policy(&self) -> Option<RangeCoalescePolicy> {
+        Some(RangeCoalescePolicy {
+            max_gap_bytes: 0,
+            max_merged_bytes: 1 << 20,
+        })
     }
     async fn read(&self, _path: &str) -> FsResult<Vec<u8>> {
         Ok(b"hello world".to_vec())
@@ -78,7 +89,8 @@ async fn counting_filesystem_counts_reads_without_double_counting() {
     let counters = Arc::new(GetCounters::default());
     let fs = CountingFileSystem::new(Arc::new(FakeFs) as Arc<dyn FileSystem>, counters.clone());
 
-    // One full read, one ranged read, one batched read.
+    // One full read, one ranged read, one batched read of two adjacent
+    // ranges (coalesced by the fake's plan into one physical GET).
     let buf = fs.read("a").await.expect("read");
     let _ = fs.read_range("a", 0, 5).await.expect("read_range");
     let _ = fs

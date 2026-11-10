@@ -15,8 +15,10 @@ mod infrastructure_tests {
         assert!(std::path::Path::new("tests/tdd").exists());
         assert!(std::path::Path::new("tests/tdd/test_utils").exists());
 
-        // Verify pre-commit hook exists
-        assert!(std::path::Path::new(".git/hooks/pre-commit.tdd").exists());
+        // The `.git/hooks/pre-commit.tdd` hook is developer-local state that
+        // `make install-tdd-hooks` creates; it is never present in CI or in a
+        // git worktree (`.git` is a file there), so it is not asserted here.
+        // The Makefile target that installs it is checked below.
 
         println!("✓ TDD infrastructure is properly set up!");
     }

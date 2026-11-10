@@ -40,6 +40,19 @@ impl StagedSegmentWrite {
         target_url.contains("://") && !target_url.starts_with("file://")
     }
 
+    /// Local filesystem path of a published segment URL, or `None` for an
+    /// object-store target, which has no local path (read it through the
+    /// FileSystem). The single sanctioned URL-to-path conversion for callers
+    /// outside this module; string-stripping a URL elsewhere is the
+    /// TD-OBJSTORE-4 defect-6 class (`tests/objstore_segment_path_guard_test.rs`).
+    pub fn local_path_of(target_url: &str) -> Option<&str> {
+        if Self::is_remote_target(target_url) {
+            None
+        } else {
+            Some(target_url.strip_prefix("file://").unwrap_or(target_url))
+        }
+    }
+
     /// Prepare a staged write for `target_url` (the full staging FILE url,
     /// e.g. `az://c/…/__flush/L0_x.pax` or `file:///…/__flush/L0_x.pax`).
     pub async fn begin(target_url: &str) -> Result<Self> {
