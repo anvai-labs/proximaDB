@@ -22,6 +22,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 MODE="${1:?usage: verify_rpm.sh <version>|selftest}"
 SELFTEST=0
+# shellcheck disable=SC2034  # VER is consumed by assert_version() in verify_payload_common.sh (sourced below)
 VER="$MODE"
 case "$MODE" in
     selftest) SELFTEST=1 ;;
@@ -79,7 +80,6 @@ fi
 set -- $contract_dirs
 n_expected=$#
 n_matched=0
-unexpected=""
 # The expected line, built from the ONE stateline constant: grep -Fx
 # (fixed-string, WHOLE line) proves the stateline, the spacing, and the
 # exact path in a single check — no regex, no strip, no substring games.
