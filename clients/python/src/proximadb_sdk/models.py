@@ -1553,7 +1553,9 @@ def resolve_vector_ids(
     fabricated placeholders). All alias sites (REST unified client,
     grpc_sync, grpc_async) MUST route through this — divergent hand-rolled
     copies of this policy are exactly how the v1 silent drift happened
-    (TD-SDK-3)."""
+    (TD-SDK-3). NOTE: on the embedded transport BatchResult.inserted_ids
+    may be the client echo (the PyO3 write result carries counts only) —
+    the adapter gates that echo on full success."""
     if result.inserted_ids:
         return list(result.inserted_ids)
     if result.failed == 0:

@@ -453,19 +453,17 @@ class EmbeddedProtocolAdapter(RecordOpsMixin, BaseProtocolAdapter):
         upsert: bool,
     ) -> VectorOperationResponse:
         start_time = time.time()
-        if len(vectors) == 0:
+        if len(vectors) == 0 and len(ids) == 0:
             # empty batch: a legal no-op on REST/gRPC (total=0, success=0) —
-            # match them instead of raising on the np.asarray shape check
-            return VectorOperationResponse(
-                success=True,
-                operation=operation,
+            # match them instead of raising on the np.asarray shape check.
+            # MISMATCHED ids/vectors lengths still fall through to the
+            # binding's own rejection (a caller bug must not be masked).
+            return self._build_vector_operation_response(
+                operation,
+                0,
+                start_time,
+                0,
                 vector_ids=[],
-                metrics=OperationMetrics(
-                    successful_count=0,
-                    failed_count=0,
-                    duration_ms=(time.time() - start_time) * 1000,
-                    total_count=0,
-                ),
             )
         vector_array = np.asarray(vectors, dtype=np.float32)
         if vector_array.ndim != 2:
@@ -632,7 +630,14 @@ class EmbeddedProtocolAdapter(RecordOpsMixin, BaseProtocolAdapter):
             start_time = time.time()
             try:
                 result = self._db.upsert_records(collection_id, records, **kwargs)
-                successful = result[0] if isinstance(result, tuple) else len(records)
+                # the upsert contract is (inserted, updated) — BOTH are
+                # successful writes (an all-updated batch must not report
+                # total failure)
+                successful = (
+                    sum(int(part) for part in result)
+                    if isinstance(result, tuple)
+                    else len(records)
+                )
                 failed = max(len(records) - successful, 0)
                 return BatchResult(
                     total=len(records),
