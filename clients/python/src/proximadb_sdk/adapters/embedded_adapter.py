@@ -50,6 +50,29 @@ def _is_coroutine_fn(fn) -> bool:
     return asyncio.iscoroutinefunction(fn)
 
 
+def _successful_write_count(result: Any, total_count: int) -> int:
+    """Interpret an embedded write result as a successful-write count.
+
+    The PyO3 binding's contract: insert/insert_numpy return a processed
+    count (int); upsert/upsert_numpy return an (inserted, updated) tuple
+    where both elements are successful-write categories. Defensive on
+    malformed shapes: a tuple with non-int parts sums its int parts (a
+    binding upgrade adding a category must not convert a committed write
+    into a reported failure); anything non-int/non-tuple counts as full
+    success.
+    """
+    # bool is an int subclass in Python — a success FLAG (True/False) must
+    # not count as 1/0 processed records
+    if isinstance(result, bool):
+        return total_count if result else 0
+    if isinstance(result, tuple):
+        parts = [p for p in result if isinstance(p, int) and not isinstance(p, bool)]
+        return sum(parts) if parts else total_count
+    if isinstance(result, int) and not isinstance(result, bool):
+        return result
+    return total_count
+
+
 class EmbeddedProtocolAdapter(RecordOpsMixin, BaseProtocolAdapter):
     """Embedded adapter implementing BaseProtocolAdapter.
 
@@ -394,7 +417,20 @@ class EmbeddedProtocolAdapter(RecordOpsMixin, BaseProtocolAdapter):
         start_time: float,
         result: Any,
         error: Exception | None = None,
+        vector_ids: list[str] | None = None,
     ) -> VectorOperationResponse:
+        """Build the response for a fully-successful embedded write.
+
+        The embedded binding's write contract: insert/insert_numpy return a
+        processed count (int); upsert/upsert_numpy return an (inserted,
+        updated) tuple. THE ECHO GATE LIVES HERE: the client-supplied id
+        echo is emitted ONLY on full success — a partial echo would list
+        records the server rejected. models.resolve_vector_ids applies the
+        same failed==0 rule to its echo fallback, and consumers read the
+        result as BatchResult.inserted_ids (via
+        _batch_result_from_vector_response) and as
+        VectorOperationResponse.vector_ids on the alias paths.
+        """
         duration_ms = (time.time() - start_time) * 1000
         if error is not None:
             return VectorOperationResponse(
@@ -409,11 +445,13 @@ class EmbeddedProtocolAdapter(RecordOpsMixin, BaseProtocolAdapter):
                 ),
             )
 
-        successful_count = result if isinstance(result, int) else total_count
+        successful_count = _successful_write_count(result, total_count)
         failed_count = max(total_count - successful_count, 0)
         return VectorOperationResponse(
             success=True,
             operation=operation,
+            # echo ONLY on full success — the ONE gate for the policy
+            vector_ids=list(vector_ids or []) if failed_count == 0 else [],
             metrics=OperationMetrics(
                 successful_count=successful_count,
                 failed_count=failed_count,
@@ -433,6 +471,20 @@ class EmbeddedProtocolAdapter(RecordOpsMixin, BaseProtocolAdapter):
         upsert: bool,
     ) -> VectorOperationResponse:
         start_time = time.time()
+        # empty batch: a legal no-op. CROSS-TRANSPORT DIVERGENCE (documented):
+        # the direct embedded path answers success=True, while the same empty
+        # input via insert_records/insert_vectors converts to
+        # BatchResult(success=0) — falsy. ids-without-vectors is a caller
+        # bug: it raises at the np.asarray shape check below, escaping as a
+        # raw ValueError rather than a failed response.
+        if len(vectors) == 0 and len(ids) == 0:
+            return self._build_vector_operation_response(
+                operation,
+                0,
+                start_time,
+                0,
+                vector_ids=list(ids),
+            )
         vector_array = np.asarray(vectors, dtype=np.float32)
         if vector_array.ndim != 2:
             raise ValueError(
@@ -475,6 +527,7 @@ class EmbeddedProtocolAdapter(RecordOpsMixin, BaseProtocolAdapter):
                 len(ids),
                 start_time,
                 result,
+                vector_ids=ids,
             )
         except Exception as e:
             return self._build_vector_operation_response(
@@ -530,6 +583,7 @@ class EmbeddedProtocolAdapter(RecordOpsMixin, BaseProtocolAdapter):
             success=response.metrics.successful_count,
             failed=response.metrics.failed_count,
             errors=[response.error_message] if response.error_message else [],
+            inserted_ids=list(response.vector_ids or []),
             metrics=response.metrics,
         )
 
@@ -596,7 +650,10 @@ class EmbeddedProtocolAdapter(RecordOpsMixin, BaseProtocolAdapter):
             start_time = time.time()
             try:
                 result = self._db.upsert_records(collection_id, records, **kwargs)
-                successful = result[0] if isinstance(result, tuple) else len(records)
+                # the upsert contract is (inserted, updated) — BOTH are
+                # successful writes (an all-updated batch must not report
+                # total failure)
+                successful = _successful_write_count(result, len(records))
                 failed = max(len(records) - successful, 0)
                 return BatchResult(
                     total=len(records),
