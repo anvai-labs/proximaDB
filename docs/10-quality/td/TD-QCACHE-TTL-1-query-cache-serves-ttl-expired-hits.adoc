@@ -1,0 +1,68 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-QCACHE-TTL-1: the query cache can serve TTL-expired records for up to 300 s
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open (filed 2026-11-09).** Found by the #2499 adversarial review. Pre-existing on gRPC; #2499 makes it reachable from REST, since REST can now set a record TTL.
+| Invariant | CLAUDE.md directive 16a (every read boundary filters dead records) and 16c (Strong reads must not return pre-write cached state).
+| Window | Bounded by the cache max-age: every hit path passes `300` s to `get_if_fresh*` (`src/services/operations/vectors/legacy.rs`).
+|===
+
+== The hazard
+
+TTL expiry is time-based: a record whose `valid_to_ns` passes becomes dead without
+any write. So expiry neither advances the canonical-WAL LSN nor triggers
+`CacheInvalidationCoordinator`.
+
+The query cache's freshness checks are age (`max_age_secs`) and, for the Strong
+variant, LSN equality (`QueryCache::get_if_fresh_v1_at_lsn`,
+`src/storage/cache/specialized/query_cache.rs:141`). Neither notices that a cached
+hit has since expired. Scenario: insert with `expires_at_ms = now + 5 s`, search
+(the result is cached), wait 10 s, search again. The expired record is returned,
+and on the LSN-gated path that includes Strong reads.
+
+Hit paths: `legacy.rs` ~2784 (non-Strong, unified search), ~3140-3162 (Strong via
+`get_if_fresh_v1_at_lsn`), ~3822 and ~3942 (non-Strong).
+
+== Premise correction (why this is not a one-line filter)
+
+The review suggested re-applying `is_record_dead` on cache hits because "the hits
+already carry `valid_to_ns`". They do not. The cache stores
+`proximadb_v1::SearchResult`, whose per-hit `SearchVectorRecord` has no expiry
+field (`crates/foundation/proximadb-proto/src/proto/proximadb.v1.rs`, struct
+`SearchVectorRecord`: id, score, vector, metadata, version, similarity, timestamp,
+source, ...). Some engines put a display-only `expires_at` into `metadata`, but
+in mixed units (seconds in SST, milliseconds in NOVA), so it cannot be the filter.
+The expiry is known only before the engine result is converted to the v1 proto.
+
+== Fix
+
+Record the earliest expiry of a result set when it is cached, and treat the entry
+as stale once that instant passes:
+
+1. Add `min_valid_to_ns: Option<i64>` to `CachedQueryResult`: the minimum positive
+   `valid_to_ns` among the returned records. `None` means nothing in the result
+   expires.
+2. Set it at every writer, before the engine-to-v1 conversion drops the field:
+   `cache_with_dependencies*` callers in `legacy.rs` (3),
+   `core/search/integrated_search_optimization.rs` (2) and
+   `query/distributed/coordinator.rs` (1). A writer that cannot compute it must
+   pass "unknown", and an unknown value must disable caching for that entry rather
+   than default to "never expires" (fail closed).
+3. In all three getters, return `None` (miss) when
+   `min_valid_to_ns <= now_ns`. Because the predicate is idempotent, this composes
+   with the read-path filter that already ran when the result was computed.
+
+== Test (the gate)
+
+The ratchet test: insert with a near-future `expires_at_ms`, search, assert the
+hit is present, wait past expiry, then search again under each freshness mode
+(StaleOk, BoundedStale, Strong). It must not return the record, and the second
+search must be a cache miss. Make the test fail on develop first (negative
+control), then fix.
+
+Cheaper interim mitigation if this waits: skip caching any result set that
+contains a record with a non-`None` `valid_to_ns`. That trades cache hit-rate on
+TTL'd collections for correctness.

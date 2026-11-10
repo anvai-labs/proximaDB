@@ -47,3 +47,19 @@ def test_generated_rest_model_carries_expires_at_ms():
         {"vector": [1.0], "expires_at_ms": 1_700_000_000_000}
     ).to_dict()
     assert body["expires_at_ms"] == 1_700_000_000_000
+
+
+def test_async_normalizer_forwards_expires_at_ms():
+    """Async twin of the sync normalizer (review M1: it dropped the TTL)."""
+    from proximadb_sdk.unified_client_async import ProximaDBAsyncUnified
+
+    client = ProximaDBAsyncUnified.__new__(ProximaDBAsyncUnified)
+    out = client._normalize_record(
+        {"id": "r1", "vector": [1.0], "expires_at_ms": 1_700_000_000_000}, 0
+    )
+    assert out["expires_at_ms"] == 1_700_000_000_000
+    rec = ProximaRecord(id="r1", vector=[1.0], expires_at_ms=1_700_000_000_000)
+    assert client._normalize_record(rec, 0)["expires_at_ms"] == 1_700_000_000_000
+    assert "expires_at_ms" not in client._normalize_record(
+        {"id": "r1", "vector": [1.0]}, 0
+    )

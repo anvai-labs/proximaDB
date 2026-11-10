@@ -3104,6 +3104,124 @@ mod tests {
         assert_eq!(deprecation, Some("true"));
     }
 
+    /// Record TTL through the REAL REST v2 insert handler (review M3: the
+    /// helper tests alone would pass if the handler stopped calling it or
+    /// dropped the mapped value).
+    ///
+    /// * a future expiry is accepted and the record is readable;
+    /// * a plausible PAST expiry (2020) is accepted, and the record is dead
+    ///   on read: proves `valid_to_ns` actually reaches the stored record;
+    /// * 0 (tombstone encoding) and epoch seconds are rejected per record.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_v2_insert_records_maps_expires_at_ms_end_to_end() {
+        use axum::body::to_bytes;
+
+        async fn send(
+            router: &axum::Router,
+            method: &str,
+            uri: &str,
+            body: Option<serde_json::Value>,
+        ) -> (StatusCode, serde_json::Value) {
+            let request = Request::builder()
+                .method(method)
+                .uri(uri)
+                .header("content-type", "application/json")
+                .body(match body {
+                    Some(b) => Body::from(b.to_string()),
+                    None => Body::empty(),
+                })
+                .expect("failed to build request");
+            let response = router
+                .clone()
+                .oneshot(request)
+                .await
+                .expect("router failed");
+            let status = response.status();
+            let bytes = to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body");
+            let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+            (status, json)
+        }
+
+        let (state, _temp_dir) = build_test_app_state().await;
+        // Mount v2 exactly as the server does (create_router alone has no
+        // /api/v2 record routes), with the default tenant the middleware
+        // would stamp.
+        let default_tenant = crate::network::middleware::tenant::TenantContext::new(
+            "default",
+            crate::network::middleware::tenant::TenantIdSource::Default,
+        );
+        let default_api_tenant = proximadb_api::rest::TenantContext {
+            tenant_id: "default".to_string(),
+        };
+        let v2_router = crate::network::rest::v2::create_v2_router().with_state(state.clone());
+        let router = create_router(state)
+            .nest("/api/v2", v2_router)
+            .layer(axum::Extension(default_tenant))
+            .layer(axum::Extension(default_api_tenant));
+
+        let (status, body) = send(
+            &router,
+            "POST",
+            "/api/v2/collections",
+            Some(serde_json::json!({ "name": "ttl_wire_coll", "dimension": 2 })),
+        )
+        .await;
+        assert!(status.is_success(), "create collection: {status} {body}");
+
+        let future_ms = chrono::Utc::now().timestamp_millis() + 3_600_000;
+        let (status, body) = send(
+            &router,
+            "POST",
+            "/api/v2/collections/ttl_wire_coll/records/batch",
+            Some(serde_json::json!({ "records": [
+                { "id": "live",    "vector": [1.0, 0.0], "expires_at_ms": future_ms },
+                { "id": "expired", "vector": [0.0, 1.0], "expires_at_ms": 1_600_000_000_000_i64 },
+                { "id": "zero",    "vector": [1.0, 1.0], "expires_at_ms": 0 },
+                { "id": "secs",    "vector": [1.0, 1.0], "expires_at_ms": 1_700_000_000_i64 }
+            ]})),
+        )
+        .await;
+        assert!(status.is_success(), "insert: {status} {body}");
+        assert_eq!(body["inserted_count"], 2, "{body}");
+        assert_eq!(body["failed_count"], 2, "{body}");
+        let errors = body["errors"].as_array().expect("errors array");
+        let mut failed: Vec<&str> = errors.iter().filter_map(|e| e["id"].as_str()).collect();
+        failed.sort_unstable();
+        assert_eq!(failed, vec!["secs", "zero"], "{body}");
+        assert!(
+            errors.iter().all(|e| e["error"]
+                .as_str()
+                .is_some_and(|m| m.contains("expires_at_ms"))),
+            "{body}"
+        );
+
+        let (status, body) = send(
+            &router,
+            "GET",
+            "/api/v2/collections/ttl_wire_coll/records/live",
+            None,
+        )
+        .await;
+        assert!(
+            status.is_success(),
+            "live record must be readable: {status} {body}"
+        );
+        let (status, body) = send(
+            &router,
+            "GET",
+            "/api/v2/collections/ttl_wire_coll/records/expired",
+            None,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "expired record must be dead on read: {body}"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_graph_legacy_edges_endpoint_redirects_to_canonical_multi_graph_route() {
         let (state, _temp_dir) = build_test_app_state().await;

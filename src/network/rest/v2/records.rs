@@ -361,10 +361,12 @@ pub struct ProximaRecordInput {
     pub props: Option<HashMap<String, RestProximaValue>>,
     /// Dedicated TEXT fields with storage hints
     pub text_fields: Option<Vec<TextFieldInput>>,
-    /// Absolute expiry time in epoch milliseconds (record TTL). After this
+    /// Absolute expiry time in epoch MILLISECONDS (record TTL). After this
     /// instant the record is dead to every read. Same field and semantics as
-    /// the gRPC v2 `ProximaRecord.expires_at_ms`. Must be > 0: an expiry of 0
-    /// is the internal tombstone encoding and is rejected per record.
+    /// the gRPC v2 `ProximaRecord.expires_at_ms`. Rejected for that record
+    /// (it lands in `errors`): 0 or negative (0 is the internal tombstone
+    /// encoding) and anything before 1973 (1e11), which is almost always epoch
+    /// seconds passed by mistake. Upsert without this field clears any TTL.
     #[serde(default)]
     pub expires_at_ms: Option<i64>,
 }
@@ -1017,21 +1019,6 @@ pub struct InsertRecordsResponse {
     pub inserted_ids: Vec<String>,
 }
 
-/// Map a REST `expires_at_ms` (epoch ms) onto the record's `valid_to_ns`,
-/// matching the gRPC v2 conversion (`proto_record_to_envelope`).
-///
-/// A non-positive expiry is rejected: `valid_to_ns = Some(0)` is the
-/// canonical tombstone, so an expiry of 0 would make the insert succeed
-/// while the record is instantly invisible to every read.
-pub(crate) fn record_valid_to_ns(expires_at_ms: Option<i64>) -> Result<Option<i64>, String> {
-    match expires_at_ms {
-        Some(ms) if ms <= 0 => Err(format!(
-            "expires_at_ms must be a positive epoch-millisecond timestamp, got {ms}"
-        )),
-        other => Ok(other.map(|ms| ms.saturating_mul(1_000_000))),
-    }
-}
-
 /// Error details for a failed record insertion
 #[derive(Debug, Serialize, ToSchema)]
 pub struct InsertError {
@@ -1205,17 +1192,18 @@ async fn insert_records_inner(
             continue;
         }
 
-        let valid_to_ns = match record_valid_to_ns(record.expires_at_ms) {
-            Ok(v) => v,
-            Err(error) => {
-                errors.push(InsertError {
-                    index,
-                    id: record.id,
-                    error,
-                });
-                continue;
-            }
-        };
+        let valid_to_ns =
+            match proximadb_records::proto_v2::expires_at_ms_to_valid_to_ns(record.expires_at_ms) {
+                Ok(v) => v,
+                Err(error) => {
+                    errors.push(InsertError {
+                        index,
+                        id: record.id,
+                        error,
+                    });
+                    continue;
+                }
+            };
 
         // Generate ID if not provided
         let record_id = record.id.unwrap_or_else(|| {
@@ -3024,21 +3012,6 @@ mod tests {
         assert_eq!(input.expires_at_ms, Some(1_700_000_000_000));
         let absent: ProximaRecordInput = serde_json::from_str(r#"{"vector":[1.0]}"#).unwrap();
         assert_eq!(absent.expires_at_ms, None);
-    }
-
-    #[test]
-    fn record_valid_to_ns_maps_ms_and_rejects_non_positive() {
-        assert_eq!(record_valid_to_ns(None), Ok(None));
-        assert_eq!(
-            record_valid_to_ns(Some(1_700_000_000_000)),
-            Ok(Some(1_700_000_000_000_000_000))
-        );
-        for bad in [0, -1, i64::MIN] {
-            let err = record_valid_to_ns(Some(bad)).unwrap_err();
-            assert!(err.contains("expires_at_ms"), "{err}");
-        }
-        // The mapped value must never be the tombstone encoding.
-        assert_ne!(record_valid_to_ns(Some(1)), Ok(Some(0)));
     }
 
     #[test]

@@ -276,6 +276,42 @@ fn proxima_map_to_typed_map(
 }
 
 /// Convert a v2 protobuf record into the canonical Rust `ProximaRecord`.
+/// Smallest accepted `expires_at_ms`: 1e11 ms = 1973-03-03T09:46:40Z.
+///
+/// Below this is not a plausible expiry for a record written today, and the
+/// common way to produce one is passing epoch SECONDS where the field is
+/// MILLISECONDS (1_700_000_000 s read as ms is January 1970). Either way the
+/// write would succeed while the record is already dead.
+pub const MIN_PLAUSIBLE_EXPIRES_AT_MS: i64 = 100_000_000_000;
+
+/// Map a client-supplied record expiry (epoch ms) onto `valid_to_ns`.
+///
+/// The single rule for every inbound surface (REST v2 and gRPC v2).
+/// Rejected, so the write fails instead of silently producing a dead record:
+/// * `<= 0`: `valid_to_ns = Some(0)` is the canonical tombstone
+///   (`is_record_dead`), so 0 would delete-on-insert;
+/// * `< MIN_PLAUSIBLE_EXPIRES_AT_MS`: almost certainly seconds, not ms.
+///
+/// A plausible expiry that is merely in the past is accepted (clock skew);
+/// the read path then treats the record as expired. Values past year 2262
+/// saturate to `i64::MAX` ns, which reads as "never expires".
+pub fn expires_at_ms_to_valid_to_ns(
+    expires_at_ms: Option<i64>,
+) -> std::result::Result<Option<i64>, String> {
+    match expires_at_ms {
+        None => Ok(None),
+        Some(ms) if ms <= 0 => Err(format!(
+            "expires_at_ms must be a positive epoch-millisecond timestamp, got {ms} \
+             (0 is the internal tombstone encoding; use the delete API)"
+        )),
+        Some(ms) if ms < MIN_PLAUSIBLE_EXPIRES_AT_MS => Err(format!(
+            "expires_at_ms {ms} is before 1973; it looks like epoch seconds, but the \
+             field is epoch milliseconds"
+        )),
+        Some(ms) => Ok(Some(ms.saturating_mul(1_000_000))),
+    }
+}
+
 pub fn proto_record_to_envelope(proto: &v2::ProximaRecord) -> Result<ProximaRecord> {
     let mut record = ProximaRecord::default();
     record.oid = proto.id.clone();
@@ -285,15 +321,8 @@ pub fn proto_record_to_envelope(proto: &v2::ProximaRecord) -> Result<ProximaReco
         .updated_at_ms
         .map(|v| v.saturating_mul(1_000_000))
         .unwrap_or(record.created_at_ns);
-    // expires_at_ms = 0 would become valid_to_ns = Some(0), the canonical
-    // tombstone: the insert would succeed and the record be instantly
-    // invisible. No internal producer emits 0; reject it at the wire.
-    if let Some(ms) = proto.expires_at_ms
-        && ms <= 0
-    {
-        bail!("expires_at_ms must be a positive epoch-millisecond timestamp, got {ms}");
-    }
-    record.valid_to_ns = proto.expires_at_ms.map(|v| v.saturating_mul(1_000_000));
+    record.valid_to_ns =
+        expires_at_ms_to_valid_to_ns(proto.expires_at_ms).map_err(|e| anyhow!(e))?;
     record.origin = proto.source.clone();
     record.actor = proto.created_by.clone();
     record.variation_id = proto.schema_id.clone();
@@ -676,7 +705,9 @@ mod tests {
             }),
             timestamp_ms: 100,
             updated_at_ms: Some(200),
-            expires_at_ms: Some(300),
+            // A plausible epoch-ms expiry (the old fixture, 300 ms, is now
+            // rejected as below MIN_PLAUSIBLE_EXPIRES_AT_MS).
+            expires_at_ms: Some(1_700_000_000_300),
             version: Some(4),
             source: Some("cdc".to_string()),
             schema_id: Some("shape-a".to_string()),
@@ -701,7 +732,7 @@ mod tests {
         assert_eq!(envelope.record_version, 4);
         assert_eq!(envelope.created_at_ns, 100_000_000);
         assert_eq!(envelope.updated_at_ns, 200_000_000);
-        assert_eq!(envelope.valid_to_ns, Some(300_000_000));
+        assert_eq!(envelope.valid_to_ns, Some(1_700_000_000_300_000_000));
         assert_eq!(envelope.origin.as_deref(), Some("cdc"));
         assert_eq!(envelope.actor.as_deref(), Some("alice"));
         assert_eq!(envelope.variation_id.as_deref(), Some("shape-a"));
@@ -738,12 +769,29 @@ mod tests {
         let ok = v2::ProximaRecord {
             id: "r".to_string(),
             vector: vec![1.0],
-            expires_at_ms: Some(1),
+            expires_at_ms: Some(1_700_000_000_000),
             ..Default::default()
         };
         assert_eq!(
             proto_record_to_envelope(&ok).unwrap().valid_to_ns,
-            Some(1_000_000)
+            Some(1_700_000_000_000_000_000)
+        );
+        // Epoch SECONDS in the ms field: rejected, not written as a 1970 expiry.
+        let secs = v2::ProximaRecord {
+            id: "r".to_string(),
+            vector: vec![1.0],
+            expires_at_ms: Some(1_700_000_000),
+            ..Default::default()
+        };
+        let err = proto_record_to_envelope(&secs).unwrap_err().to_string();
+        assert!(err.contains("epoch seconds"), "{err}");
+        // The floor itself is accepted; one below it is not.
+        assert!(expires_at_ms_to_valid_to_ns(Some(MIN_PLAUSIBLE_EXPIRES_AT_MS)).is_ok());
+        assert!(expires_at_ms_to_valid_to_ns(Some(MIN_PLAUSIBLE_EXPIRES_AT_MS - 1)).is_err());
+        // Far future saturates to "never expires", never to the tombstone.
+        assert_eq!(
+            expires_at_ms_to_valid_to_ns(Some(i64::MAX)),
+            Ok(Some(i64::MAX))
         );
         let none = v2::ProximaRecord {
             id: "r".to_string(),

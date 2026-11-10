@@ -3276,10 +3276,12 @@ export interface components {
             text_fields?: components["schemas"]["TextFieldInput"][] | null;
             /**
              * Format: int64
-             * @description Absolute expiry time in epoch milliseconds (record TTL). After this
+             * @description Absolute expiry time in epoch MILLISECONDS (record TTL). After this
              *     instant the record is dead to every read. Same field and semantics as
-             *     the gRPC v2 `ProximaRecord.expires_at_ms`. Must be > 0: an expiry of 0
-             *     is the internal tombstone encoding and is rejected per record.
+             *     the gRPC v2 `ProximaRecord.expires_at_ms`. Rejected for that record
+             *     (it lands in `errors`): 0 or negative (0 is the internal tombstone
+             *     encoding) and anything before 1973 (1e11), which is almost always epoch
+             *     seconds passed by mistake. Upsert without this field clears any TTL.
              */
             expires_at_ms?: number | null;
         };
