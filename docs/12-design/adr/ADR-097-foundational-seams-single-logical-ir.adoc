@@ -45,6 +45,14 @@ Something has to be the one.
 
 == Decision
 
+Object-store spill's S2/S3 durability and ownership refinement is specified in
+link:../../10-quality/td/TD-SEAM-14-object-store-recovery-and-ownership-boundary.adoc[TD-SEAM-14]
+(revised proposal 2026-11-09). The seam does not imply that a pre-operation owner read fences
+another writer, that boot-epoch names prove rollback absence, or that remote spill alone
+recovers an acknowledged local WAL tail after disk loss. The proposal reuses ADR-095 and
+TD-LEASE-INFRA-1 ownership/publication mechanisms; implementation and backend qualification
+remain open. No change to the accepted single-IR or modality-format decisions is implied.
+
 === D0 — The seams S1–S9 are the contracts every modality plugs into
 
 [cols="1,5", options="header"]
