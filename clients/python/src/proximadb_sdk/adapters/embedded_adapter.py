@@ -396,6 +396,15 @@ class EmbeddedProtocolAdapter(RecordOpsMixin, BaseProtocolAdapter):
         error: Exception | None = None,
         vector_ids: list[str] | None = None,
     ) -> VectorOperationResponse:
+        """Build the response for a fully-successful embedded write.
+
+        The embedded binding's write contract: insert/insert_numpy return a
+        processed count (int); upsert/upsert_numpy return an (inserted,
+        updated) tuple. THE ECHO POLICY LIVES HERE (models.resolve_vector_ids
+        is the alias-side consumer of this gate): the client-supplied id echo
+        is emitted ONLY on full success — a partial echo would list records
+        the server rejected.
+        """
         duration_ms = (time.time() - start_time) * 1000
         if error is not None:
             return VectorOperationResponse(
@@ -410,13 +419,19 @@ class EmbeddedProtocolAdapter(RecordOpsMixin, BaseProtocolAdapter):
                 ),
             )
 
-        successful_count = result if isinstance(result, int) else total_count
+        if isinstance(result, tuple):
+            # upsert/upsert_numpy contract: (inserted, updated) — both count
+            # as successful writes
+            successful_count = int(result[0]) + int(result[1])
+        elif isinstance(result, int):
+            successful_count = result
+        else:
+            successful_count = total_count
         failed_count = max(total_count - successful_count, 0)
         return VectorOperationResponse(
             success=True,
             operation=operation,
-            # echo ONLY on full success (models.resolve_vector_ids policy —
-            # a partial echo would list records the server rejected)
+            # echo ONLY on full success — the ONE gate for the policy
             vector_ids=list(vector_ids or []) if failed_count == 0 else [],
             metrics=OperationMetrics(
                 successful_count=successful_count,
@@ -437,6 +452,20 @@ class EmbeddedProtocolAdapter(RecordOpsMixin, BaseProtocolAdapter):
         upsert: bool,
     ) -> VectorOperationResponse:
         start_time = time.time()
+        if len(vectors) == 0:
+            # empty batch: a legal no-op on REST/gRPC (total=0, success=0) —
+            # match them instead of raising on the np.asarray shape check
+            return VectorOperationResponse(
+                success=True,
+                operation=operation,
+                vector_ids=[],
+                metrics=OperationMetrics(
+                    successful_count=0,
+                    failed_count=0,
+                    duration_ms=(time.time() - start_time) * 1000,
+                    total_count=0,
+                ),
+            )
         vector_array = np.asarray(vectors, dtype=np.float32)
         if vector_array.ndim != 2:
             raise ValueError(
@@ -479,10 +508,7 @@ class EmbeddedProtocolAdapter(RecordOpsMixin, BaseProtocolAdapter):
                 len(ids),
                 start_time,
                 result,
-                # Echo the client-supplied ids ONLY on full success (the
-                # models.resolve_vector_ids policy — on partial failure the
-                # echo would list records the server rejected).
-                vector_ids=ids if result == len(ids) else [],
+                vector_ids=ids,
             )
         except Exception as e:
             return self._build_vector_operation_response(
