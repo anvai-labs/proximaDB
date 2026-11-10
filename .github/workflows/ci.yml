@@ -162,12 +162,20 @@ jobs:
       sdk_docs: ${{ steps.filter.outputs.sdk_docs }}
       ui: ${{ steps.filter.outputs.ui }}
       docker: ${{ steps.filter.outputs.docker }}
+      packaging_scripts: ${{ steps.filter.outputs.packaging_scripts }}
       docs: ${{ steps.filter.outputs.docs }}
       docs_site: ${{ steps.filter.outputs.docs_site }}
       td_citations: ${{ steps.filter.outputs.td_citations }}
       proto: ${{ steps.filter.outputs.proto }}
       panic_policy: ${{ steps.filter.outputs.panic_policy }}
       capability_facade: ${{ steps.filter.outputs.capability_facade }}
+      # The lint lane's first real catch (actionlint): this output was never
+      # declared while the dup_ratchet filter group and the hygiene job's
+      # `if` both reference it — so a PR touching ONLY dup_ratchet.py or its
+      # baseline never ran Hygiene Guardrails (the undeclared output reads as
+      # empty). Same failure class capability_facade guards against: the PR
+      # that weakens the gate is the one PR the gate never sees.
+      dup_ratchet: ${{ steps.filter.outputs.dup_ratchet }}
       type_name_ratchet: ${{ steps.filter.outputs.type_name_ratchet }}
       v1_proto_usage: ${{ steps.filter.outputs.v1_proto_usage }}
       # Granular Rust component detection for targeted testing. query_changes
@@ -351,6 +359,15 @@ jobs:
             docker:
               - 'deploy/docker/**'
               - '.dockerignore'
+              - '.github/workflows/ci.yml'
+            packaging_scripts:
+              - 'deploy/packaging/**'
+              - '.github/workflows/release.yml'
+              - '.github/workflows/release-smoke.yml'
+              # A gate must see a change to itself (TD-CITIER-1): editing the
+              # lane's own severity, ignore-lists, or tools must re-run it.
+              # Cheap (~1-2 min), unlike the heavy suites that deliberately
+              # route ci.yml through `sweep` instead.
               - '.github/workflows/ci.yml'
             docs:
               - 'docs/**'
@@ -1759,6 +1776,45 @@ jobs:
             src/proximadb_sdk/proto_conversion.py \
             src/proximadb_sdk/integrations/ \
             || echo "::warning::mypy type checking found issues"
+
+  # ShellCheck + actionlint on the packaging gate scripts and the release
+  # workflows, wired into ci-success.needs so a red lane BLOCKS (review F1:
+  # a job outside needs gates nothing — the mlflow-conformance shape). The
+  # v0.6.0/v0.6.1 release cycles burned two dispatches on a quoting defect
+  # and a parse break in release.yml that local checks could not see (the
+  # lane TODO in release.yml). Runs when the packaging gate scripts, the
+  # release workflows, or this CI definition change.
+  packaging-lint:
+    name: Packaging Scripts Lint
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    needs: changes
+    if: needs.changes.outputs.sweep == 'true' || needs.changes.outputs.packaging_scripts == 'true'
+    steps:
+      - uses: actions/checkout@v7
+      - name: Run shellcheck on packaging scripts
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          find deploy/packaging/scripts -name '*.sh' -print0 | xargs -0 shellcheck --severity=warning
+      - name: Run actionlint on the release workflows
+        run: |
+          # Pinned version: the download script fetches from the upstream
+          # `main` branch, so without $1 the lane's toolchain could change
+          # mid-flight (review F3; house convention pins tooling).
+          bash <(curl https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash) 1.7.12
+          # -shellcheck= : disable actionlint's EMBEDDED shellcheck on inline
+          # `run:` blocks — 60 pre-existing info/style findings (40x SC2086)
+          # in release.yml's publish scripts are real debt but the wrong size
+          # to churn a publish workflow in one PR; the packaging .sh scripts
+          # (the layer this lane exists for) are checked standalone above at
+          # --severity=warning. Follow-up: quote them incrementally.
+          # -ignore 'property "cross"' : matrix.cross only exists on the
+          # DISABLED aarch64 matrix leg (commented out next to the musl leg);
+          # the Install Cross / cross-build steps are its re-enablement
+          # scaffolding, so the "undefined property" finding is intentional.
+          ./actionlint -color -shellcheck= \
+            -ignore 'property "cross" is not defined' \
+            .github/workflows/release.yml .github/workflows/release-smoke.yml .github/workflows/ci.yml
 
   go-lint:
     name: Go SDK Lint
@@ -4138,6 +4194,12 @@ jobs:
       - openapi-spec-drift
       - feature-matrix-enterprise-catalogs
       - mlflow-conformance
+      # packaging-lint MUST gate (round-3 review F1): a job outside needs
+      # contributes nothing to CI Success — the exact mlflow-conformance /
+      # hygiene-check shape that burned before. A red shellcheck/actionlint
+      # on the packaging scripts or release workflows has to block the merge
+      # (path-scoped, so a skipped result passes and only a real run gates).
+      - packaging-lint
       # gates that encode load-bearing decisions as checks
       - docs-authority
       - risk-coverage
