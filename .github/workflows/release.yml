@@ -200,9 +200,11 @@ jobs:
           fi
           case "$PRERELEASE" in true|false) ;; *) echo "::error::prerelease must be true/false"; exit 1 ;; esac
           case "$DRY_RUN" in true|false) ;; *) echo "::error::dry_run must be true/false"; exit 1 ;; esac
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-          echo "prerelease=$PRERELEASE" >> $GITHUB_OUTPUT
-          echo "dry_run=$DRY_RUN" >> $GITHUB_OUTPUT
+          {
+            echo "version=$VERSION"
+            echo "prerelease=$PRERELEASE"
+            echo "dry_run=$DRY_RUN"
+          } >> "$GITHUB_OUTPUT"
           echo "Release version: $VERSION (prerelease: $PRERELEASE, dry_run: $DRY_RUN)"
 
       # TD-RELTAG-1 version gate. This was a ::warning:: that compared only
@@ -384,19 +386,22 @@ jobs:
             bash scripts/build_portable_linux.sh "$FEATURES"
             exit 0
           fi
+          # Empty-array-safe expansion: an empty $FEATURES must pass NO
+          # argument (a quoted "" would hand cargo an empty feature flag).
+          FEATURES_ARGS=()
           if [ -n "$FEATURES" ]; then
-            FEATURES_FLAG="--features $FEATURES"
-          else
-            FEATURES_FLAG=""
+            FEATURES_ARGS=(--features "$FEATURES")
           fi
 
           if [ "${{ matrix.cross }}" = "true" ]; then
-            cross build --release --target ${{ matrix.target }} $FEATURES_FLAG \
+            cross build --release --target "${{ matrix.target }}" \
+              ${FEATURES_ARGS[@]+"${FEATURES_ARGS[@]}"} \
               -p proximadb-server \
               -p proximadb-bench \
               -p proximadb-migrate
           else
-            cargo build --release --target ${{ matrix.target }} $FEATURES_FLAG \
+            cargo build --release --target "${{ matrix.target }}" \
+              ${FEATURES_ARGS[@]+"${FEATURES_ARGS[@]}"} \
               -p proximadb-server \
               -p proximadb-bench \
               -p proximadb-migrate
@@ -411,9 +416,9 @@ jobs:
           ARCHIVE_NAME="proximadb-${VERSION}-${TARGET}"
 
           mkdir -p "${ARCHIVE_NAME}"
-          cp target/${TARGET}/release/proximadb-server "${ARCHIVE_NAME}/"
-          cp target/${TARGET}/release/proximadb-bench "${ARCHIVE_NAME}/"
-          cp target/${TARGET}/release/proximadb-migrate "${ARCHIVE_NAME}/"
+          cp "target/${TARGET}/release/proximadb-server" "${ARCHIVE_NAME}/"
+          cp "target/${TARGET}/release/proximadb-bench" "${ARCHIVE_NAME}/"
+          cp "target/${TARGET}/release/proximadb-migrate" "${ARCHIVE_NAME}/"
           cp README.adoc LICENSE "${ARCHIVE_NAME}/" 2>/dev/null || true
           cp -r config "${ARCHIVE_NAME}/" 2>/dev/null || true
 
@@ -422,7 +427,7 @@ jobs:
           # Generate checksums
           shasum -a 256 "${ARCHIVE_NAME}.tar.gz" > "${ARCHIVE_NAME}.tar.gz.sha256"
 
-          echo "ARCHIVE_NAME=${ARCHIVE_NAME}.tar.gz" >> $GITHUB_ENV
+          echo "ARCHIVE_NAME=${ARCHIVE_NAME}.tar.gz" >> "$GITHUB_ENV"
 
       - name: Create Archive (Windows)
         if: steps.fetch.outcome != 'success' && runner.os == 'Windows'
@@ -990,7 +995,7 @@ jobs:
             echo "  All expected artifacts are present."
             echo "  Release can proceed safely."
             echo ""
-            echo "passed=true" >> $GITHUB_OUTPUT
+            echo "passed=true" >> "$GITHUB_OUTPUT"
           else
             echo ""
             echo "  STATUS: FAILED"
@@ -1003,7 +1008,7 @@ jobs:
               echo -e "$MISSING_ARTIFACTS"
             fi
             echo ""
-            echo "passed=false" >> $GITHUB_OUTPUT
+            echo "passed=false" >> "$GITHUB_OUTPUT"
           fi
 
           # Generate artifact report for downstream jobs
@@ -1020,32 +1025,35 @@ jobs:
           echo "  Total artifact files: $ARTIFACT_COUNT"
 
           # Save report
-          echo "report<<EOF" >> $GITHUB_OUTPUT
-          echo "Version: $VERSION" >> $GITHUB_OUTPUT
-          echo "Binaries: $BINARY_COUNT/${#EXPECTED_BINARIES[@]}" >> $GITHUB_OUTPUT
-          echo "SDists: $SDIST_COUNT" >> $GITHUB_OUTPUT
-          echo "Status: $VALIDATION_PASSED" >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
+          {
+            echo "report<<EOF"
+            echo "Version: $VERSION"
+            echo "Binaries: $BINARY_COUNT/${#EXPECTED_BINARIES[@]}"
+            echo "SDists: $SDIST_COUNT"
+            echo "Status: $VALIDATION_PASSED"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Generate Validation Summary
         run: |
-          echo "## Release Artifact Validation Report" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Version:** ${{ needs.prepare.outputs.version }}" >> $GITHUB_STEP_SUMMARY
-          echo "**Dry Run:** ${{ needs.prepare.outputs.dry_run }}" >> $GITHUB_STEP_SUMMARY
-          echo "**Pre-release:** ${{ needs.prepare.outputs.prerelease }}" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-
-          if [ "${{ steps.validate.outputs.passed }}" = "true" ]; then
-            echo ":white_check_mark: **All artifact validations passed**" >> $GITHUB_STEP_SUMMARY
-          else
-            echo ":x: **Artifact validation failed - release blocked**" >> $GITHUB_STEP_SUMMARY
-          fi
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Artifact Summary" >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-          echo "${{ steps.validate.outputs.report }}" >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
+          {
+            echo "## Release Artifact Validation Report"
+            echo ""
+            echo "**Version:** ${{ needs.prepare.outputs.version }}"
+            echo "**Dry Run:** ${{ needs.prepare.outputs.dry_run }}"
+            echo "**Pre-release:** ${{ needs.prepare.outputs.prerelease }}"
+            echo ""
+            if [ "${{ steps.validate.outputs.passed }}" = "true" ]; then
+              echo ":white_check_mark: **All artifact validations passed**"
+            else
+              echo ":x: **Artifact validation failed - release blocked**"
+            fi
+            echo ""
+            echo "### Artifact Summary"
+            echo '```'
+            echo "${{ steps.validate.outputs.report }}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
   # ============================================================================
   # CREATE GITHUB RELEASE - Consolidate all artifacts
@@ -1086,16 +1094,21 @@ jobs:
           find artifacts -name "*.dmg" -exec cp {} release-assets/ \;
           find artifacts -name "*.msi" -exec cp {} release-assets/ \;
 
-          # Create combined checksums file
+          # Create combined checksums file (nullglob: a platform with no
+          # artifacts of one kind must not pass a literal '*.zip' to shasum)
           cd release-assets
-          shasum -a 256 *.tar.gz *.zip *.whl *.rpm *.deb *.dmg *.msi 2>/dev/null | sort > SHA256SUMS.txt || true
+          shopt -s nullglob
+          checksums=( *.tar.gz *.zip *.whl *.rpm *.deb *.dmg *.msi )
+          shopt -u nullglob
+          if [ "${#checksums[@]}" -gt 0 ]; then
+            shasum -a 256 "${checksums[@]}" | sort > SHA256SUMS.txt
+          fi
 
           ls -la
 
       - name: Generate Release Notes
         id: release-notes
         run: |
-          VERSION="${{ needs.prepare.outputs.version }}"
           cat << 'EOF' > release-notes.md
           ## ProximaDB ${{ needs.prepare.outputs.version }}
 
@@ -1588,7 +1601,7 @@ jobs:
           echo ""
 
           # Count artifacts
-          BINARY_COUNT=$(find artifacts -name "proximadb-*.tar.gz" -o -name "proximadb-*.zip" | grep -v sha256 | wc -l)
+          BINARY_COUNT=$(find artifacts -name "proximadb-*.tar.gz" -o -name "proximadb-*.zip" | grep -vc sha256)
           CHECKSUM_COUNT=$(find artifacts -name "*.sha256" | wc -l)
           WHEEL_COUNT=$(find artifacts -name "*.whl" | wc -l)
           SDIST_COUNT=$(find artifacts -path "*/sdist/*.tar.gz" | wc -l)
@@ -1658,17 +1671,19 @@ jobs:
 
       - name: Generate Summary
         run: |
-          echo "## Dry Run Complete" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Version:** ${{ needs.prepare.outputs.version }}" >> $GITHUB_STEP_SUMMARY
-          echo "**Pre-release:** ${{ needs.prepare.outputs.prerelease }}" >> $GITHUB_STEP_SUMMARY
-          echo "**Validation:** ${{ needs.validate-artifacts.outputs.validation_passed }}" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### No Publishing Occurred" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "This was a **dry run**. All artifacts were built and validated, but nothing was published." >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "To perform an actual release, re-run this workflow with \`dry_run: false\` or push a version tag." >> $GITHUB_STEP_SUMMARY
+          {
+            echo "## Dry Run Complete"
+            echo ""
+            echo "**Version:** ${{ needs.prepare.outputs.version }}"
+            echo "**Pre-release:** ${{ needs.prepare.outputs.prerelease }}"
+            echo "**Validation:** ${{ needs.validate-artifacts.outputs.validation_passed }}"
+            echo ""
+            echo "### No Publishing Occurred"
+            echo ""
+            echo "This was a **dry run**. All artifacts were built and validated, but nothing was published."
+            echo ""
+            echo "To perform an actual release, re-run this workflow with \`dry_run: false\` or push a version tag."
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Fail if Validation Failed
         if: needs.validate-artifacts.outputs.validation_passed != 'true'

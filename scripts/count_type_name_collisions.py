@@ -383,9 +383,13 @@ def main(argv: list[str] | None = None) -> int:
         print("type-name ratchet FAILED (TD-NAMING-1):", file=sys.stderr)
         for f in failures:
             print(f"  {f}", file=sys.stderr)
-        print("A new pub struct/enum/union/trait reuses a name already defined elsewhere. Give it a\n"
-              "qualifying name (e.g. ProtoStorageAssignment) or reuse the existing type.",
-              file=sys.stderr)
+        # The qualifying-name hint only applies to actual RISES — a pure
+        # burn-down (total fell, baseline not lowered) has no new definition,
+        # and its remedy is the "lower the baseline" line appended above.
+        if rises:
+            print("A new pub struct/enum/union/trait reuses a name already defined elsewhere. Give it a\n"
+                  "qualifying name (e.g. ProtoStorageAssignment) or reuse the existing type.",
+                  file=sys.stderr)
         return 1
     print(f"type-name ratchet OK: {total(counts)} redundant definitions (= baseline)")
     return 0
