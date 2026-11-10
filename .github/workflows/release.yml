@@ -242,6 +242,11 @@ jobs:
   # artifact expired (prerelease-ci.yml keeps it 14 days) or is missing. A
   # checksum or name MISMATCH fails the job rather than rebuilding: that is a
   # corrupt or unexpected artifact, not an absent one.
+  # EXCEPTION (TD-PKG-4): the macOS DMG leg has NO prerelease counterpart yet
+  # (prerelease-ci's matrix still omits aarch64-apple-darwin), so on real
+  # releases the DMG always builds HERE -- a broken macOS build surfaces at
+  # release time, not in prerelease CI. Add the leg to prerelease-ci.yml to
+  # restore the reuse shape.
   build-binaries:
     timeout-minutes: 150
     name: Fetch or build ${{ matrix.target }}
@@ -454,8 +459,10 @@ jobs:
           # Ad-hoc codesign (no Apple credentials in the pipeline): on arm64,
           # a fully unsigned binary downloaded from the internet can be
           # reported by Gatekeeper as damaged rather than merely unverified.
-          # Ad-hoc does NOT make the DMG notarized — double-click still needs
-          # right-click → Open. Developer ID + notarization: TD-PKG-4.
+          # Ad-hoc does NOT make the DMG notarized — these are bare Mach-O
+          # executables (no .app bundle), so first launch needs
+          # `xattr -d com.apple.quarantine` or the System Settings override.
+          # Developer ID + notarization: TD-PKG-4.
           for macos_bin in proximadb-server proximadb-bench proximadb-migrate; do
             codesign --sign - --force "${VOLDIR}/${macos_bin}"
           done
@@ -1003,18 +1010,19 @@ jobs:
 
           echo "  RPM packages: $RPM_COUNT (expected >= 1)"
           echo "  DEB packages: $DEB_COUNT (expected >= 1)"
-          echo "  DMG installers: $DMG_COUNT (disabled for v0.2.0)"
+          echo "  DMG installers: $DMG_COUNT (expected >= 1 -- macOS aarch64, TD-PKG-4)"
           echo "  MSI installers: $MSI_COUNT (expected >= 1)"
           echo ""
 
-          # Only validate RPM, DEB, MSI for v0.2.0
+          # All four platform packages are required (DMG since macOS 0.6.2;
+          # the EXPECTED_BINARIES loop above enforces it too).
           if [ "$RPM_COUNT" -lt 1 ] || [ "$DEB_COUNT" -lt 1 ] || [ "$MSI_COUNT" -lt 1 ]; then
             echo "  [WARNING] Missing required platform packages (RPM, DEB, or MSI)"
             VALIDATION_PASSED=false
           fi
 
           if [ "$DMG_COUNT" -gt 0 ]; then
-            echo "  [INFO] DMG found (not required for v0.2.0)"
+            echo "  [OK] DMG found (macOS aarch64)"
           fi
           echo ""
 
@@ -1161,10 +1169,12 @@ jobs:
           | Windows | x86_64 | `proximadb-${{ needs.prepare.outputs.version }}-x86_64-pc-windows-msvc.zip` |
           | macOS (Apple Silicon) | aarch64 | `proximadb-${{ needs.prepare.outputs.version }}-aarch64-apple-darwin.dmg` |
 
-          The macOS DMG is ad-hoc codesigned but NOT notarized: on first
-          launch, right-click → Open (Gatekeeper). Linux musl and Linux
-          aarch64 archives are not built by this workflow and are therefore
-          not advertised in this release.
+          The macOS DMG is ad-hoc codesigned but NOT notarized: the binaries
+          inside carry the quarantine attribute on first download, so the
+          first run needs one of — `xattr -d com.apple.quarantine
+          proximadb-server` (or System Settings → Privacy & Security → "Allow
+          Anyway"). Linux musl and Linux aarch64 archives are not built by
+          this workflow and are therefore not advertised in this release.
 
           #### Packages (every registry at the identical version ${{ needs.prepare.outputs.version }})
 

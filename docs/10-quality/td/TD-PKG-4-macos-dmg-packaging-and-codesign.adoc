@@ -41,7 +41,7 @@ crypto stack off ring.
 * `validate-artifacts` requires the DMG (missing = release blocked, same
   fail-closed shape as every other leg); `release-assets` collection and the
   SHA256SUMS glob already handled `*.dmg`; the release-notes table advertises
-  it with the Gatekeeper note.
+  it with the quarantine note.
 
 == Open (needs Apple credentials + a decision)
 
@@ -50,7 +50,17 @@ crypto stack off ring.
   Wire as secrets-gated steps (`MACOS_CERTIFICATE` / `APPLE_ID` /
   `APPLE_PASSWORD` / `APPLE_TEAM_ID`): sign with the identity when the
   secret exists, keep ad-hoc otherwise. Until then the release notes carry
-  the right-click note.
+  the quarantine note (`xattr -d com.apple.quarantine` / System Settings —
+  these are bare Mach-O executables, not an .app bundle, so the
+  right-click-Open flow does not apply).
+* **Prerelease-CI reuse gap (review round 1)**: prerelease-ci.yml's matrix
+  has NO macOS leg, so on real releases the DMG always builds INSIDE the
+  release run (~60-90 min on macos-14) — a macOS-only break (e.g. the ring
+  question above) surfaces at release time, after prerelease CI passed.
+  Fail-closed still holds (validate-artifacts requires the dmg), but the
+  reuse shape the other legs enjoy is lost. Fix: add the leg to
+  prerelease-ci.yml so the release fetches it like linux/windows, and the
+  ring question gets answered by prerelease CI instead of a release run.
 * **Embedded wheel**: `proximadb_embedded` (PyO3) has no macOS arm64 wheel —
   `release-python.yml` owns that matrix and was not touched here. If macOS
   SDK users want the embedded engine natively, that matrix needs the same
