@@ -797,7 +797,7 @@ jobs:
           MEDIUM_TIER: ${{ github.base_ref == 'qa' || github.base_ref == 'main' || github.ref == 'refs/heads/qa' || github.ref == 'refs/heads/main' }}
           FULL_TIER: ${{ github.base_ref == 'main' || github.ref == 'refs/heads/main' }}
         run: |
-          tree="$(git rev-parse HEAD^{tree})"
+          tree="$(git rev-parse 'HEAD^{tree}')"
           echo "tree=$tree" >> "$GITHUB_OUTPUT"
           python3 scripts/ci_tree_reuse.py --tree "$tree" || echo "reused=" >> "$GITHUB_OUTPUT"
 
@@ -1338,7 +1338,7 @@ jobs:
         run: |
           ./target/release/proximadb-server -c config/config.toml -d /tmp/proxima-rt -p 5678 > /tmp/server.log 2>&1 &
           echo $! > /tmp/server.pid
-          for i in $(seq 1 90); do
+          for _ in $(seq 1 90); do
             if curl -sf http://127.0.0.1:5678/health >/dev/null 2>&1; then echo "server ready"; exit 0; fi
             sleep 1
           done
@@ -1360,7 +1360,7 @@ jobs:
           PROXIMADB_DOC_SMOKE_URL: http://127.0.0.1:5678
       - name: Stop server
         if: always()
-        run: kill $(cat /tmp/server.pid) 2>/dev/null || true
+        run: kill "$(cat /tmp/server.pid)" 2>/dev/null || true
 
   panic-policy-report:
     name: Panic Policy Report (WS-2 Stage 1)
@@ -1847,17 +1847,15 @@ jobs:
           # `main` branch, so without $1 the lane's toolchain could change
           # mid-flight (review F3; house convention pins tooling).
           bash <(curl https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash) 1.7.12
-          # -shellcheck= : disable actionlint's EMBEDDED shellcheck on inline
-          # `run:` blocks — 60 pre-existing info/style findings (40x SC2086)
-          # in release.yml's publish scripts are real debt but the wrong size
-          # to churn a publish workflow in one PR; the packaging .sh scripts
-          # (the layer this lane exists for) are checked standalone above at
-          # --severity=warning. Follow-up: quote them incrementally.
+          # EMBEDDED shellcheck is ON: every inline `run:` block in the three
+          # release/CI workflows was quoted clean (the 60-finding debt the
+          # lane surfaced on day one was paid off in the same window). Any
+          # new unquoted variable in a workflow script now fails this lane.
           # -ignore 'property "cross"' : matrix.cross only exists on the
           # DISABLED aarch64 matrix leg (commented out next to the musl leg);
           # the Install Cross / cross-build steps are its re-enablement
           # scaffolding, so the "undefined property" finding is intentional.
-          ./actionlint -color -shellcheck= \
+          ./actionlint -color \
             -ignore 'property "cross" is not defined' \
             .github/workflows/release.yml .github/workflows/release-smoke.yml .github/workflows/ci.yml
 
@@ -2744,12 +2742,13 @@ jobs:
             exit 0
           fi
           # Bare positionals to cargo/nextest are TEST-NAME FILTERS, not package
-          # selectors — turn the space-separated list into -p args.
-          pkg_args=""
+          # selectors — turn the space-separated list into -p args (array, so
+          # each -p/$p is one properly quoted word downstream).
+          pkg_args=()
           for p in $pkgs; do
-            pkg_args="$pkg_args -p $p"
+            pkg_args+=(-p "$p")
           done
-          echo "Affected leaf crates:$pkg_args"
+          echo "Affected leaf crates: ${pkg_args[*]}"
           # This production-scale synthetic recall ratchet takes minutes by
           # design. The required 90-minute rust-test/unit lane still runs it;
           # only this explicitly advisory fast-feedback lane excludes it.
@@ -2760,7 +2759,7 @@ jobs:
           # a lane that cries wolf is one people stop reading.
           cargo nextest run --lib --profile unit --no-tests=pass \
             -E 'not test(rabitq_cold_recall_harness_n100000_recall_at_10)' \
-            $pkg_args
+            ${pkg_args[@]+"${pkg_args[@]}"}
 
   # TD-168 develop early-detection: run the CHEAP object-store Cool-tier tests
   # (scripts/run_cloud_emulator_tests.sh --fast — compiles only the small
@@ -3880,6 +3879,9 @@ jobs:
           # `xargs -n1 bash -c 'test_one "$0"'` passes each file as $0 (no -I
           # substitution, so no BSD/GNU command-length quirk). xargs exits non-zero
           # (123) if any invocation failed -> the step fails.
+          # $0 in the bash -c string is expanded by the INNER bash (the test
+          # path), not this shell — SC2016 does not apply here.
+          # shellcheck disable=SC2016
           find tests/unit -name 'test_*.py' | sort | grep -vE "$SKIP_RE" | \
             xargs -P 4 -n 1 bash -c 'test_one "$0"'
 
@@ -4088,13 +4090,13 @@ jobs:
               exit 0
             fi
           fi
-          exit ${exit_code}
+          exit "$exit_code"
 
       - name: Collect Server Logs on Failure
         if: failure()
         run: |
           echo "=== Server process status ==="
-          ps aux | grep proximadb || true
+          pgrep -af proximadb || true
           echo "=== Server logs (if available) ==="
           cat /tmp/proximadb*.log 2>/dev/null || echo "No log files found"
 

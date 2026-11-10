@@ -57,9 +57,10 @@
 #   └─────────────────────────────────────────────────────────────────────────┘
 #
 # EXPECTED ARTIFACTS:
-#   Binaries (2 targets for the v0.2 MVP trust corridor):
+#   Binaries (3 targets; macOS aarch64 DMG re-enabled 0.6.2, TD-PKG-4):
 #     - proximadb-{version}-x86_64-unknown-linux-gnu.tar.gz
 #     - proximadb-{version}-x86_64-pc-windows-msvc.zip
+#     - proximadb-{version}-aarch64-apple-darwin.dmg
 #
 #   Python Wheels are NOT built here. The pure-Python SDK (`proximadb`) and the
 #   native embedded engine (`proximadb_embedded`, one abi3 wheel per platform,
@@ -75,8 +76,8 @@
 #
 # v0.2.0 SCOPE:
 #   - Only x86_64-linux-gnu and x86_64-windows are built
-#   - musl, aarch64 targets disabled due to cross-compilation issues
-#   - macOS DMG disabled (no macOS binaries)
+#   - musl, aarch64-linux targets disabled due to cross-compilation issues
+#   - macOS DMG re-enabled in 0.6.2 (native macos-14 arm64 leg; TD-PKG-4)
 #   - Python packages are pure Python (no Rust wheels)
 #
 # MANUAL RELEASE PROCESS:
@@ -200,9 +201,11 @@ jobs:
           fi
           case "$PRERELEASE" in true|false) ;; *) echo "::error::prerelease must be true/false"; exit 1 ;; esac
           case "$DRY_RUN" in true|false) ;; *) echo "::error::dry_run must be true/false"; exit 1 ;; esac
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-          echo "prerelease=$PRERELEASE" >> $GITHUB_OUTPUT
-          echo "dry_run=$DRY_RUN" >> $GITHUB_OUTPUT
+          {
+            echo "version=$VERSION"
+            echo "prerelease=$PRERELEASE"
+            echo "dry_run=$DRY_RUN"
+          } >> "$GITHUB_OUTPUT"
           echo "Release version: $VERSION (prerelease: $PRERELEASE, dry_run: $DRY_RUN)"
 
       # TD-RELTAG-1 version gate. This was a ::warning:: that compared only
@@ -239,6 +242,11 @@ jobs:
   # artifact expired (prerelease-ci.yml keeps it 14 days) or is missing. A
   # checksum or name MISMATCH fails the job rather than rebuilding: that is a
   # corrupt or unexpected artifact, not an absent one.
+  # EXCEPTION (TD-PKG-4): the macOS DMG leg has NO prerelease counterpart yet
+  # (prerelease-ci's matrix still omits aarch64-apple-darwin), so on real
+  # releases the DMG always builds HERE -- a broken macOS build surfaces at
+  # release time, not in prerelease CI. Add the leg to prerelease-ci.yml to
+  # restore the reuse shape.
   build-binaries:
     timeout-minutes: 150
     name: Fetch or build ${{ matrix.target }}
@@ -284,14 +292,19 @@ jobs:
           #   features: ""
           #   cross: true
 
-          # macOS aarch64 (Apple Silicon) - DISABLED for v0.2.0
-          # Ring 0.17.14 has CPU feature detection issues on CI macOS runners
-          # Multiple dependencies pull in ring (jsonwebtoken, pgwire, rustls, rcgen)
-          # Re-enable in v0.2.1 with alternative crypto stack or rustls upgrade
-          # - target: aarch64-apple-darwin
-          #   os: macos-latest
-          #   archive: tar.gz
-          #   features: ""
+          # macOS aarch64 (Apple Silicon) - RE-ENABLED (user-directed, 0.6.2).
+          # The v0.2.0 disable blamed ring 0.17.14 CPU-feature detection on
+          # CI macOS runners; ring is still 0.17.14, but this leg now builds
+          # NATIVELY on a macos-14 (arm64) runner — the first dry_run proves
+          # it end to end. If ring still fails there, TD-PKG-4 records the
+          # fallback options (ring/rustls upgrade pin). Distribution is
+          # ad-hoc codesigned; Developer ID + notarization is TD-PKG-4's open
+          # question (needs Apple credentials).
+          - target: aarch64-apple-darwin
+            os: macos-14
+            archive: dmg
+            features: "cloud-full,vendored-openssl"
+            cache_prefix: "v1-rust-aarch64-apple-darwin"
 
           # Windows x86_64
           - target: x86_64-pc-windows-msvc
@@ -384,19 +397,22 @@ jobs:
             bash scripts/build_portable_linux.sh "$FEATURES"
             exit 0
           fi
+          # Empty-array-safe expansion: an empty $FEATURES must pass NO
+          # argument (a quoted "" would hand cargo an empty feature flag).
+          FEATURES_ARGS=()
           if [ -n "$FEATURES" ]; then
-            FEATURES_FLAG="--features $FEATURES"
-          else
-            FEATURES_FLAG=""
+            FEATURES_ARGS=(--features "$FEATURES")
           fi
 
           if [ "${{ matrix.cross }}" = "true" ]; then
-            cross build --release --target ${{ matrix.target }} $FEATURES_FLAG \
+            cross build --release --target "${{ matrix.target }}" \
+              ${FEATURES_ARGS[@]+"${FEATURES_ARGS[@]}"} \
               -p proximadb-server \
               -p proximadb-bench \
               -p proximadb-migrate
           else
-            cargo build --release --target ${{ matrix.target }} $FEATURES_FLAG \
+            cargo build --release --target "${{ matrix.target }}" \
+              ${FEATURES_ARGS[@]+"${FEATURES_ARGS[@]}"} \
               -p proximadb-server \
               -p proximadb-bench \
               -p proximadb-migrate
@@ -404,16 +420,16 @@ jobs:
         shell: bash
 
       - name: Create Archive (Unix)
-        if: steps.fetch.outcome != 'success' && runner.os != 'Windows'
+        if: steps.fetch.outcome != 'success' && runner.os != 'Windows' && matrix.archive == 'tar.gz'
         run: |
           VERSION="${{ needs.prepare.outputs.version }}"
           TARGET="${{ matrix.target }}"
           ARCHIVE_NAME="proximadb-${VERSION}-${TARGET}"
 
           mkdir -p "${ARCHIVE_NAME}"
-          cp target/${TARGET}/release/proximadb-server "${ARCHIVE_NAME}/"
-          cp target/${TARGET}/release/proximadb-bench "${ARCHIVE_NAME}/"
-          cp target/${TARGET}/release/proximadb-migrate "${ARCHIVE_NAME}/"
+          cp "target/${TARGET}/release/proximadb-server" "${ARCHIVE_NAME}/"
+          cp "target/${TARGET}/release/proximadb-bench" "${ARCHIVE_NAME}/"
+          cp "target/${TARGET}/release/proximadb-migrate" "${ARCHIVE_NAME}/"
           cp README.adoc LICENSE "${ARCHIVE_NAME}/" 2>/dev/null || true
           cp -r config "${ARCHIVE_NAME}/" 2>/dev/null || true
 
@@ -422,7 +438,40 @@ jobs:
           # Generate checksums
           shasum -a 256 "${ARCHIVE_NAME}.tar.gz" > "${ARCHIVE_NAME}.tar.gz.sha256"
 
-          echo "ARCHIVE_NAME=${ARCHIVE_NAME}.tar.gz" >> $GITHUB_ENV
+          echo "ARCHIVE_NAME=${ARCHIVE_NAME}.tar.gz" >> "$GITHUB_ENV"
+
+      # macOS ships a .dmg (user-directed): server + bench + migrate binaries,
+      # README/LICENSE, and the config template in one drag-install volume.
+      - name: Create DMG (macOS)
+        if: steps.fetch.outcome != 'success' && runner.os == 'macOS' && matrix.archive == 'dmg'
+        run: |
+          VERSION="${{ needs.prepare.outputs.version }}"
+          TARGET="${{ matrix.target }}"
+          VOLDIR="proximadb-${VERSION}-${TARGET}"
+
+          mkdir -p "${VOLDIR}/config"
+          cp "target/${TARGET}/release/proximadb-server" "${VOLDIR}/"
+          cp "target/${TARGET}/release/proximadb-bench" "${VOLDIR}/"
+          cp "target/${TARGET}/release/proximadb-migrate" "${VOLDIR}/"
+          cp README.adoc LICENSE "${VOLDIR}/" 2>/dev/null || true
+          cp config/config.toml "${VOLDIR}/config/"
+
+          # Ad-hoc codesign (no Apple credentials in the pipeline): on arm64,
+          # a fully unsigned binary downloaded from the internet can be
+          # reported by Gatekeeper as damaged rather than merely unverified.
+          # Ad-hoc does NOT make the DMG notarized — these are bare Mach-O
+          # executables (no .app bundle), so first launch needs
+          # `xattr -d com.apple.quarantine` or the System Settings override.
+          # Developer ID + notarization: TD-PKG-4.
+          for macos_bin in proximadb-server proximadb-bench proximadb-migrate; do
+            codesign --sign - --force "${VOLDIR}/${macos_bin}"
+          done
+
+          hdiutil create -volname "proximadb ${VERSION}" -srcfolder "${VOLDIR}" \
+            -ov -format UDZO "proximadb-${VERSION}-${TARGET}.dmg"
+          shasum -a 256 "proximadb-${VERSION}-${TARGET}.dmg" \
+            > "proximadb-${VERSION}-${TARGET}.dmg.sha256"
+          echo "ARCHIVE_NAME=proximadb-${VERSION}-${TARGET}.dmg" >> "$GITHUB_ENV"
 
       - name: Create Archive (Windows)
         if: steps.fetch.outcome != 'success' && runner.os == 'Windows'
@@ -875,8 +924,7 @@ jobs:
           echo ""
 
           # ----------------------------------------
-          # Expected Binary Targets (2 platforms for v0.2.0)
-          # macOS disabled due to ring crate CI compatibility issues
+          # Expected Binary Targets (3 platforms since macOS 0.6.2)
           # ----------------------------------------
           echo "## Binary Artifacts"
           echo ""
@@ -884,6 +932,7 @@ jobs:
           EXPECTED_BINARIES=(
             "proximadb-${VERSION}-x86_64-unknown-linux-gnu.tar.gz"
             "proximadb-${VERSION}-x86_64-pc-windows-msvc.zip"
+            "proximadb-${VERSION}-aarch64-apple-darwin.dmg"
           )
 
           BINARY_COUNT=0
@@ -961,18 +1010,19 @@ jobs:
 
           echo "  RPM packages: $RPM_COUNT (expected >= 1)"
           echo "  DEB packages: $DEB_COUNT (expected >= 1)"
-          echo "  DMG installers: $DMG_COUNT (disabled for v0.2.0)"
+          echo "  DMG installers: $DMG_COUNT (expected >= 1 -- macOS aarch64, TD-PKG-4)"
           echo "  MSI installers: $MSI_COUNT (expected >= 1)"
           echo ""
 
-          # Only validate RPM, DEB, MSI for v0.2.0
+          # All four platform packages are required (DMG since macOS 0.6.2;
+          # the EXPECTED_BINARIES loop above enforces it too).
           if [ "$RPM_COUNT" -lt 1 ] || [ "$DEB_COUNT" -lt 1 ] || [ "$MSI_COUNT" -lt 1 ]; then
             echo "  [WARNING] Missing required platform packages (RPM, DEB, or MSI)"
             VALIDATION_PASSED=false
           fi
 
           if [ "$DMG_COUNT" -gt 0 ]; then
-            echo "  [INFO] DMG found (not required for v0.2.0)"
+            echo "  [OK] DMG found (macOS aarch64)"
           fi
           echo ""
 
@@ -990,7 +1040,7 @@ jobs:
             echo "  All expected artifacts are present."
             echo "  Release can proceed safely."
             echo ""
-            echo "passed=true" >> $GITHUB_OUTPUT
+            echo "passed=true" >> "$GITHUB_OUTPUT"
           else
             echo ""
             echo "  STATUS: FAILED"
@@ -1003,7 +1053,7 @@ jobs:
               echo -e "$MISSING_ARTIFACTS"
             fi
             echo ""
-            echo "passed=false" >> $GITHUB_OUTPUT
+            echo "passed=false" >> "$GITHUB_OUTPUT"
           fi
 
           # Generate artifact report for downstream jobs
@@ -1020,32 +1070,35 @@ jobs:
           echo "  Total artifact files: $ARTIFACT_COUNT"
 
           # Save report
-          echo "report<<EOF" >> $GITHUB_OUTPUT
-          echo "Version: $VERSION" >> $GITHUB_OUTPUT
-          echo "Binaries: $BINARY_COUNT/${#EXPECTED_BINARIES[@]}" >> $GITHUB_OUTPUT
-          echo "SDists: $SDIST_COUNT" >> $GITHUB_OUTPUT
-          echo "Status: $VALIDATION_PASSED" >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
+          {
+            echo "report<<EOF"
+            echo "Version: $VERSION"
+            echo "Binaries: $BINARY_COUNT/${#EXPECTED_BINARIES[@]}"
+            echo "SDists: $SDIST_COUNT"
+            echo "Status: $VALIDATION_PASSED"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Generate Validation Summary
         run: |
-          echo "## Release Artifact Validation Report" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Version:** ${{ needs.prepare.outputs.version }}" >> $GITHUB_STEP_SUMMARY
-          echo "**Dry Run:** ${{ needs.prepare.outputs.dry_run }}" >> $GITHUB_STEP_SUMMARY
-          echo "**Pre-release:** ${{ needs.prepare.outputs.prerelease }}" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-
-          if [ "${{ steps.validate.outputs.passed }}" = "true" ]; then
-            echo ":white_check_mark: **All artifact validations passed**" >> $GITHUB_STEP_SUMMARY
-          else
-            echo ":x: **Artifact validation failed - release blocked**" >> $GITHUB_STEP_SUMMARY
-          fi
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Artifact Summary" >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-          echo "${{ steps.validate.outputs.report }}" >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
+          {
+            echo "## Release Artifact Validation Report"
+            echo ""
+            echo "**Version:** ${{ needs.prepare.outputs.version }}"
+            echo "**Dry Run:** ${{ needs.prepare.outputs.dry_run }}"
+            echo "**Pre-release:** ${{ needs.prepare.outputs.prerelease }}"
+            echo ""
+            if [ "${{ steps.validate.outputs.passed }}" = "true" ]; then
+              echo ":white_check_mark: **All artifact validations passed**"
+            else
+              echo ":x: **Artifact validation failed - release blocked**"
+            fi
+            echo ""
+            echo "### Artifact Summary"
+            echo '```'
+            echo "${{ steps.validate.outputs.report }}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
   # ============================================================================
   # CREATE GITHUB RELEASE - Consolidate all artifacts
@@ -1086,16 +1139,21 @@ jobs:
           find artifacts -name "*.dmg" -exec cp {} release-assets/ \;
           find artifacts -name "*.msi" -exec cp {} release-assets/ \;
 
-          # Create combined checksums file
+          # Create combined checksums file (nullglob: a platform with no
+          # artifacts of one kind must not pass a literal '*.zip' to shasum)
           cd release-assets
-          shasum -a 256 *.tar.gz *.zip *.whl *.rpm *.deb *.dmg *.msi 2>/dev/null | sort > SHA256SUMS.txt || true
+          shopt -s nullglob
+          checksums=( *.tar.gz *.zip *.whl *.rpm *.deb *.dmg *.msi )
+          shopt -u nullglob
+          if [ "${#checksums[@]}" -gt 0 ]; then
+            shasum -a 256 "${checksums[@]}" | sort > SHA256SUMS.txt
+          fi
 
           ls -la
 
       - name: Generate Release Notes
         id: release-notes
         run: |
-          VERSION="${{ needs.prepare.outputs.version }}"
           cat << 'EOF' > release-notes.md
           ## ProximaDB ${{ needs.prepare.outputs.version }}
 
@@ -1109,9 +1167,14 @@ jobs:
           |----------|--------------|---------|
           | Linux | x86_64 (glibc) | `proximadb-${{ needs.prepare.outputs.version }}-x86_64-unknown-linux-gnu.tar.gz` |
           | Windows | x86_64 | `proximadb-${{ needs.prepare.outputs.version }}-x86_64-pc-windows-msvc.zip` |
+          | macOS (Apple Silicon) | aarch64 | `proximadb-${{ needs.prepare.outputs.version }}-aarch64-apple-darwin.dmg` |
 
-          Linux musl, Linux aarch64, and macOS archives are not built by this
-          workflow and are therefore not advertised in this release.
+          The macOS DMG is ad-hoc codesigned but NOT notarized: the binaries
+          inside carry the quarantine attribute on first download, so the
+          first run needs one of — `xattr -d com.apple.quarantine
+          proximadb-server` (or System Settings → Privacy & Security → "Allow
+          Anyway"). Linux musl and Linux aarch64 archives are not built by
+          this workflow and are therefore not advertised in this release.
 
           #### Packages (every registry at the identical version ${{ needs.prepare.outputs.version }})
 
@@ -1588,7 +1651,7 @@ jobs:
           echo ""
 
           # Count artifacts
-          BINARY_COUNT=$(find artifacts -name "proximadb-*.tar.gz" -o -name "proximadb-*.zip" | grep -v sha256 | wc -l)
+          BINARY_COUNT=$(find artifacts -name "proximadb-*.tar.gz" -o -name "proximadb-*.zip" | grep -vc sha256)
           CHECKSUM_COUNT=$(find artifacts -name "*.sha256" | wc -l)
           WHEEL_COUNT=$(find artifacts -name "*.whl" | wc -l)
           SDIST_COUNT=$(find artifacts -path "*/sdist/*.tar.gz" | wc -l)
@@ -1658,17 +1721,19 @@ jobs:
 
       - name: Generate Summary
         run: |
-          echo "## Dry Run Complete" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Version:** ${{ needs.prepare.outputs.version }}" >> $GITHUB_STEP_SUMMARY
-          echo "**Pre-release:** ${{ needs.prepare.outputs.prerelease }}" >> $GITHUB_STEP_SUMMARY
-          echo "**Validation:** ${{ needs.validate-artifacts.outputs.validation_passed }}" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### No Publishing Occurred" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "This was a **dry run**. All artifacts were built and validated, but nothing was published." >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "To perform an actual release, re-run this workflow with \`dry_run: false\` or push a version tag." >> $GITHUB_STEP_SUMMARY
+          {
+            echo "## Dry Run Complete"
+            echo ""
+            echo "**Version:** ${{ needs.prepare.outputs.version }}"
+            echo "**Pre-release:** ${{ needs.prepare.outputs.prerelease }}"
+            echo "**Validation:** ${{ needs.validate-artifacts.outputs.validation_passed }}"
+            echo ""
+            echo "### No Publishing Occurred"
+            echo ""
+            echo "This was a **dry run**. All artifacts were built and validated, but nothing was published."
+            echo ""
+            echo "To perform an actual release, re-run this workflow with \`dry_run: false\` or push a version tag."
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Fail if Validation Failed
         if: needs.validate-artifacts.outputs.validation_passed != 'true'
