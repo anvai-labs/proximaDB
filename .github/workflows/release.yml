@@ -565,16 +565,23 @@ jobs:
           cp deploy/packaging/scripts/preremove.sh rpm_build/tmp/preremove.sh
 
           # Build-time attrs (TD-PKG-1, 2026-11-10): the contract dirs ship
-          # with their FINAL owner/mode in the payload (mode,user,group,path
-          # per dir, driven FROM the contract file — it stays the switch),
-          # and preinstall.sh creates the user in %pre BEFORE extraction so
-          # rpm can resolve the recorded names. postinstall's chown loop
-          # becomes a no-op on fresh installs (kept for deb-upgrade
-          # semantics — dpkg does not reset existing dir ownership).
+          # with their FINAL owner/mode in the payload, driven FROM the
+          # contract file (it stays the switch). fpm --rpm-attr format is
+          # MODE,USER,GROUP:PATH — COLON before the path (a comma would make
+          # the whole string the attrs-hash key, match NO payload path, and
+          # silently drop the attr — the review-round 1 blocker), and
+          # preinstall.sh creates the user in %pre BEFORE extraction so rpm
+          # can resolve the recorded names. postinstall's chown loop becomes
+          # a no-op on fresh installs (kept for deb-upgrade semantics — dpkg
+          # does not reset existing dir ownership).
           source deploy/packaging/chown_dirs.env
+          # Split the space-separated contract into a properly quoted array —
+          # an unquoted `$CHOWN_DIRS` loop would be SC2086 under the lane's
+          # (re-enabled) embedded shellcheck.
+          read -ra CONTRACT_DIR_LIST <<< "$CHOWN_DIRS"
           RPM_ATTRS=()
-          for contract_dir in $CHOWN_DIRS; do
-            RPM_ATTRS+=(--rpm-attr "750,proximadb,proximadb,$contract_dir")
+          for contract_dir in "${CONTRACT_DIR_LIST[@]}"; do
+            RPM_ATTRS+=(--rpm-attr "750,proximadb,proximadb:$contract_dir")
           done
 
           fpm -s dir -t rpm \
@@ -592,6 +599,29 @@ jobs:
             --before-remove rpm_build/tmp/preremove.sh \
             "${RPM_ATTRS[@]}" \
             rpm_build/=/
+
+          # Build-time attr assertion (review round 1, cheap insurance): a
+          # future fpm format change or a typo must fail THIS step, not the
+          # release-night container verify. rpm -qp --dump columns are
+          # path size mtime md5 mode user group symlink — the two contract
+          # dirs must be present with owner proximadb:proximadb and mode 750
+          # (dump prints octal like 040750, hence the *750 suffix match).
+          rpm -qp --dump proximadb-*.rpm > /tmp/rpm_dump.txt
+          for contract_dir in "${CONTRACT_DIR_LIST[@]}"; do
+            entry="$(awk -v d="$contract_dir" '$1 == d' /tmp/rpm_dump.txt)"
+            if [ -z "$entry" ]; then
+              echo "::error::payload lost contract dir $contract_dir (fpm --rpm-attr no-op?)"
+              exit 1
+            fi
+            mode="$(printf '%s\n' "$entry" | awk '{print $5}')"
+            owner="$(printf '%s\n' "$entry" | awk '{print $6}')"
+            grp="$(printf '%s\n' "$entry" | awk '{print $7}')"
+            if [ "$owner:$grp" != "proximadb:proximadb" ] || ! printf '%s' "$mode" | grep -q '750$'; then
+              echo "::error::$contract_dir attrs are $owner:$grp $mode — expected proximadb:proximadb *750"
+              exit 1
+            fi
+          done
+          echo "build-time attrs verified in payload: $CHOWN_DIRS"
 
       # Release-review F4: same class as the v0.5.0 MSI bug — install the
       # package on a representative distro BEFORE it can be published. The
@@ -614,10 +644,12 @@ jobs:
           bash -n deploy/packaging/scripts/verify_rpm.sh
           bash -n deploy/packaging/scripts/verify_payload_common.sh
           bash -n deploy/packaging/scripts/preinstall.sh
-          # The gate's OWN selftest proves the flip: the positive fixture is
-          # a CLEAN rpm -V (accepted), and the NEGATIVE fixtures — the
-          # lost-attrs statelines, a contract subset, a foreign deviation —
-          # must ALL be REJECTED (the gate keys on emptiness).
+          # The gate's OWN selftest proves Gate 1 (the clean-rpm -V rule):
+          # the positive fixture is CLEAN (accepted), and the NEGATIVE
+          # fixtures — the lost-attrs statelines, a contract subset, a
+          # foreign deviation — must ALL be REJECTED. Gate 2 (the dir
+          # stat-asserts) needs an installed package and is exercised for
+          # real by the container run below.
           bash deploy/packaging/scripts/verify_rpm.sh selftest
           VERIFY_RPM_DEV_FIXTURE=$'.M...UG..    /var/lib/proximadb\n.M...UG..    /var/log/proximadb' \
             bash deploy/packaging/scripts/verify_rpm.sh selftest \
