@@ -103,16 +103,12 @@ class ClientConfig(BaseModel):
     )
     grpc_port: int | None = Field(
         default=None,
+        ge=1,
+        le=65535,
         description=(
-            "gRPC port in multi-port mode (default 5679). Ignored in unified "
-            "mode, where every protocol shares the URL's port."
-        ),
-    )
-    flight_port: int | None = Field(
-        default=None,
-        description=(
-            "Arrow Flight port in multi-port mode (default 5680). Ignored in "
-            "unified mode."
+            "gRPC port in multi-port mode (default: a grpc:// URL's port, else "
+            "5679). Ignored in unified mode, where every protocol shares the "
+            "URL's port."
         ),
     )
     uds_path: str | None = Field(
@@ -369,18 +365,21 @@ class ClientConfig(BaseModel):
             else:
                 return f"{scheme}://{host}:{port}"
 
-        # Multi-port mode (legacy): a separate port per protocol. Each honours
-        # the caller's setting and falls back to the legacy default; these
-        # were hardcoded, so a URL on :15678 still sent REST to :5678 and a
-        # configured gRPC port was ignored (gRPC always dialled :5679).
+        # Multi-port mode (legacy): a separate port per protocol.
         if target_protocol == Protocol.REST:
-            # The URL is the REST URL only when it is http(s); a grpc:// URL's
-            # port is the gRPC port and must not leak into REST.
-            port = (parsed.port if scheme in ("http", "https") else None) or 5678
+            port = 5678  # REST API port
         elif target_protocol == Protocol.GRPC:
-            port = self.grpc_port or 5679
+            # The configured gRPC port wins; else a grpc:// URL's own port
+            # (that URL names the gRPC endpoint); else the legacy 5679. This
+            # was hardcoded to 5679, so --grpc-port never took effect.
+            if self.grpc_port is not None:
+                port = self.grpc_port
+            elif scheme in ("grpc", "grpcs") and parsed.port:
+                port = parsed.port
+            else:
+                port = 5679
         elif target_protocol == Protocol.ARROW_FLIGHT:
-            port = self.flight_port or 5680
+            port = 5680  # Legacy Arrow Flight port (use unified mode for single port)
         else:
             # Keep original port for AUTO or unknown protocols
             port = parsed.port or (443 if scheme == "https" else 80)

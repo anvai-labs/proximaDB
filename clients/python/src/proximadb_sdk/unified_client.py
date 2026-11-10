@@ -475,7 +475,15 @@ class ProximaDBClient:
                 .replace("grpc://", "")
                 .replace("grpcs://", "")
             )
+            # Split-port: dial the gRPC port, not the REST URL's port. Most
+            # operations go through this adapter, so without this the
+            # configured gRPC port reached only _create_grpc_client (#2504
+            # review). Unified mode keeps the stripped URL, which preserves
+            # the host of a bare "host:port" URL.
+            if self.config.port_mode in (PortMode.MULTI, PortMode.MULTI.value):
+                grpc_target = self.config.get_protocol_url(Protocol.GRPC)
             adapter_kwargs["server_address"] = grpc_target
+            adapter_kwargs["timeout"] = self._grpc_timeout()
         elif protocol == "embedded":
             adapter_kwargs.update(self._embedded_options)
         else:
@@ -1163,6 +1171,18 @@ class ProximaDBClient:
             self.enable_operation_routing = False
             self._operation_router = None
 
+    def _grpc_timeout(self) -> float:
+        """Deadline for both gRPC paths (the adapter and the direct client).
+
+        An explicitly configured timeout applies (the CLI always passes
+        --timeout, default 30 s). Unset keeps the historical 60 s, since
+        ClientConfig.timeout defaults to 30 s and silently halving every
+        programmatic gRPC deadline would be a behaviour change.
+        """
+        if "timeout" in getattr(self.config, "model_fields_set", set()):
+            return self.config.timeout
+        return 60.0
+
     def _create_grpc_client(self):
         """Create gRPC client with authentication support"""
         from .config import Protocol
@@ -1183,11 +1203,7 @@ class ProximaDBClient:
             # hardcoded to 60 s, so the CLI's --timeout never applied). Unset
             # keeps 60 s: ClientConfig.timeout defaults to 30 s, and silently
             # halving every gRPC deadline would be a behaviour change.
-            timeout=(
-                self.config.timeout
-                if "timeout" in getattr(self.config, "model_fields_set", set())
-                else 60.0
-            ),
+            timeout=self._grpc_timeout(),
             enable_compression=(
                 self.config.compression.enabled
                 if hasattr(self.config, "compression")
