@@ -107,6 +107,10 @@ They are recorded here to prevent duplication and provide context for future ses
 | **TD-SEAM-12-F5 bootstrap on checkpoint**: When `generation == 0 && retained_from > 0` (first checkpoint after pre-tracking truncation), bootstrap merge-base images for collections with retained branch entries. Collections without retained entries get truncation marks (fail closed 410). Adversarial review caught unreachable condition bug (`state.tracked_from` → `retained_from`).
 | **All 5 TD-SEAM-12 follow-ups resolved.** TD-SEAM-12 complete.
 
+| #2501
+| **TD-SEAM-14 S1 compare_exchange for cloud backends**: Implement `compare_exchange` (CAS) for S3, Azure, GCS filesystem backends. Enables owner marker CAS for exclusive claim, preventing racing boot epoch collisions. Adversarial review caught critical GCS bug (was fetching JSON metadata instead of object data) — fixed to use data plane (`read_all`) for content and metadata plane (`get_object`) for generation.
+| TD-SEAM-14 S1 complete. Foundation for exclusive claim mechanism. S2-S5 (manifest publication, logical DROP, format migration, server integration) remain open.
+
 |===
 
 Local worktrees cleaned. All value-codec and binary-JSON branches deleted. Memory updated with outcomes.
