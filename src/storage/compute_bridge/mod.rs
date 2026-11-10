@@ -17,7 +17,8 @@
 //!
 //! - [`global_cache`] — process-wide quantization codebook cache built over the
 //!   storage [`CrossCacheOrchestrator`](crate::storage::cache::orchestrator::CrossCacheOrchestrator).
-//! - [`selection`] — quantization-level selection driven by the storage
+//! - [`selection`] — persistent-vs-stateless quantization ENGINE selection
+//!   driven by the storage
 //!   [`FlushParameters`](crate::storage::traits::FlushParameters).
 
 pub mod global_cache;

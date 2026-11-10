@@ -72,6 +72,7 @@ from ..models import (
     ServerCapabilities,
     UpdateSchemaResponse,
     VectorArray,
+    format_insert_errors,
     normalize_collection_config_kwargs,
 )
 from ..models_v2 import ProximaRecord
@@ -192,6 +193,27 @@ def _convert_quantization_config_to_proto(quant_config) -> dict[str, Any]:
     )
 
     return proto_dict
+
+
+def _success_false_is_partial(body: dict) -> bool:
+    """True for response shapes where `success: false` is a legitimate
+    partial-batch signal the CALLER handles, not a whole-request failure
+    (e.g. batch inserts carrying per-record results / counts)."""
+    # Batch-result shapes: they carry per-item result lists or counts.
+    return any(
+        k in body
+        for k in (
+            "results",
+            "successful_count",
+            "failed_count",
+            "vectors",
+            "records",
+            "inserted_count",
+            # Observability partial-ingest shape (server-verified:
+            # observability.rs /298,/330,/414,/442): {ingested, failed}
+            "ingested",
+        )
+    )
 
 
 class ProximaDBClient:
@@ -449,6 +471,11 @@ class ProximaDBClient:
                 # Data too small to benefit from compression
                 kwargs["json"] = json_data
 
+        # Escape hatch must be consumed BEFORE the closure forwards kwargs
+        # into httpx.request (which rejects unknown kwargs with TypeError —
+        # review round-1 HIGH-1).
+        allow_success_false = kwargs.pop("_allow_success_false", False)
+
         @retry(
             stop=stop_after_attempt(self.config.retry.max_retries + 1),
             wait=wait_exponential(
@@ -464,6 +491,36 @@ class ProximaDBClient:
 
                 if response.status_code >= 400:
                     self._handle_error_response(response)
+
+                # Swallow-disease fix (ranked cleanup item 2/11): HTTP 200
+                # with {"success": false} is a SERVER-REPORTED FAILURE, not a
+                # success — historically every REST protocol method silently
+                # returned the failure body as if it were data. Raise here,
+                # centrally, unless the caller explicitly opted out (the
+                # rare partial-batch surfaces where success=false means
+                # "some rows failed", which the callers handle themselves).
+                if allow_success_false:
+                    return response
+                content_type = response.headers.get("content-type", "").lower()
+                if "application/json" in content_type:
+                    try:
+                        body = response.json()
+                    except Exception:
+                        body = None
+                    if (
+                        isinstance(body, dict)
+                        and body.get("success") is False
+                        and not _success_false_is_partial(body)
+                    ):
+                        err = body.get("error_message") or body.get("message")
+                        if not err and isinstance(body.get("error"), dict):
+                            err = body["error"].get("message") or body["error"].get(
+                                "code"
+                            )
+                        raise ProximaDBError(
+                            f"Server reported failure (HTTP {response.status_code}): "
+                            f"{err or body}",
+                        )
 
                 return response
 
@@ -969,8 +1026,29 @@ class ProximaDBClient:
             # SMART_DEFAULTS|CUSTOM_LEVELS|MINIMAL|AGGRESSIVE — the SDK's
             # type (scalar/pq/...) is a METHOD, not a strategy. A concrete
             # method means custom levels; the default needs no key.
-            if getattr(quant.type, "value", quant.type) not in (None, "none"):
+            quant_method = getattr(quant.type, "value", quant.type)
+            if quant_method not in (None, "none"):
                 v2_quant["strategy"] = "custom_levels"
+                # The CONCRETE level (ranked cleanup 3/11): without
+                # custom_levels, a custom_levels strategy carried no actual
+                # levels and the server applied smart defaults - the
+                # configured method never reached the engine.
+                # Map SDK spellings to proto QuantizationType names
+                # (review HIGH-2: "pq" hard-400s at the server's
+                # from_str_name which accepts only proto names).
+                proto_method = {"pq": "product"}.get(quant_method, quant_method)
+                # Bits: the SDK model has bits_per_subvector/_vector, NOT
+                # "bits" (review HIGH-3: getattr(quant, "bits") was always
+                # None - the value silently never sent).
+                quant_bits = getattr(quant, "bits_per_subvector", None) or getattr(
+                    quant, "bits_per_vector", None
+                )
+                level: dict[str, Any] = {"quantization_type": proto_method}
+                if quant_bits:
+                    level["bits"] = quant_bits
+                if getattr(quant, "num_subvectors", None):
+                    level["num_subvectors"] = quant.num_subvectors
+                v2_quant["custom_levels"] = [level]
             v2_request_data["quantization"] = v2_quant
         # Spec-driven request shape/path via the generated REST transport
         # (TD-126 Phase 4); the HTTP call still goes through _make_request.
@@ -1149,15 +1227,6 @@ class ProximaDBClient:
                     "not found" in error_msg.lower()
                     or "does not exist" in error_msg.lower()
                 ):
-                    raise CollectionNotFoundError(
-                        f"Collection '{collection_id}' not found"
-                    )
-                raise ProximaDBError(f"Failed to get collection: {error_msg}")
-
-            # If success is explicitly false, treat as error
-            if "success" in response_data and response_data["success"] is False:
-                error_msg = response_data.get("error_message", "Unknown error")
-                if "not found" in str(error_msg).lower():
                     raise CollectionNotFoundError(
                         f"Collection '{collection_id}' not found"
                     )
@@ -1497,12 +1566,24 @@ class ProximaDBClient:
         inserted_count = int(response_data.get("inserted_count", 0) or 0)
         failed_count = int(response_data.get("failed_count", 0) or 0)
         total_count = inserted_count + failed_count
+        # Server-assigned IDs of the successfully inserted records — surfaced
+        # as BatchResult.inserted_ids so the vector compatibility aliases can
+        # report vector_ids (previously dropped, leaving vector_ids always
+        # empty on this path).
+        # The server serializes per-record failures as structured
+        # InsertError objects ({index, id, error}); BatchResult.errors is
+        # list[str], so coerce (a raw dict would crash pydantic validation
+        # on any partial-failure response).
+        from proximadb_sdk.models import format_insert_errors
+
+        errors = format_insert_errors(response_data.get("errors", []))
         return BatchResult(
             total=total_count,
             success=inserted_count,
             failed=failed_count,
-            errors=response_data.get("errors", []),
+            errors=errors,
             duration_ms=response_data.get("duration_ms", 0.0),
+            inserted_ids=list(response_data.get("inserted_ids", []) or []),
             metrics=OperationMetrics(
                 total_processed=total_count,
                 successful_count=inserted_count,
@@ -1626,6 +1707,7 @@ class ProximaDBClient:
         total_successful = 0
         total_failed = 0
         all_errors = []
+        all_inserted_ids = []
         for start in range(0, len(record_data), effective_batch_size):
             batch_data = record_data[start : start + effective_batch_size]
             call = _gen.insert_records(
@@ -1641,6 +1723,7 @@ class ProximaDBClient:
             total_successful += result.success
             total_failed += result.failed
             all_errors.extend(result.errors or [])
+            all_inserted_ids.extend(result.inserted_ids or [])
 
         if total_successful > 0:
             self._invalidate_collection_cache(collection_id)
@@ -1651,6 +1734,7 @@ class ProximaDBClient:
             failed=total_failed,
             errors=all_errors,
             duration_ms=0.0,
+            inserted_ids=all_inserted_ids,
             metrics=OperationMetrics(
                 total_processed=total_successful + total_failed,
                 successful_count=total_successful,

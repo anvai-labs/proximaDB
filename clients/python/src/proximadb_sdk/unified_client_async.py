@@ -38,6 +38,7 @@ from .models import (
     DeleteResult,
     OperationMetrics,
     SearchResult,
+    format_insert_errors,
     normalize_collection_config_kwargs,
 )
 
@@ -453,12 +454,18 @@ class ProximaDBAsyncUnified:
         inserted = int(data.get("inserted_count", 0) or 0)
         failed = int(data.get("failed_count", 0) or 0)
         total = inserted + failed
+        # same shape as the sync path — shared formatter (TD-SDK-3)
+        errors = format_insert_errors(data.get("errors", []))
         return BatchResult(
             total=total,
             success=inserted,
             failed=failed,
-            errors=data.get("errors", []) or [],
+            errors=errors,
             duration_ms=0.0,
+            # the generated model's to_dict() already carries the
+            # server-assigned per-record IDs — keep them (same channel as
+            # the sync path's BatchResult.inserted_ids).
+            inserted_ids=list(data.get("inserted_ids", []) or []),
             metrics=OperationMetrics(
                 total_processed=total,
                 successful_count=inserted,

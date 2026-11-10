@@ -32,8 +32,6 @@ pub mod strategies;
 pub use adapter::{ExplainComponent, ExplainResult, QueryFacadeAdapter};
 use proximadb_data_model::ProximaValue;
 pub use proximadb_records::ScoredRecord;
-/// Backwards-compat alias for legacy `VectorMatch` users.
-pub type VectorMatch = ScoredRecord;
 pub use strategies::{
     ColumnarStrategy, ColumnarStrategyConfig, DocumentStrategy, GraphStrategy,
     ObservabilityStrategy, SqlStrategy, VectorSearchStrategy,

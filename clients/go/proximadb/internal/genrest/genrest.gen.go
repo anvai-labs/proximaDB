@@ -2630,6 +2630,14 @@ type ProximaRecordInput struct {
 // QuantizationConfigInput REST input for quantization config (mirrors proto `QuantizationConfig`;
 // gRPC-v2 parity with `V2QuantizationConfig`).
 type QuantizationConfigInput struct {
+	// CustomLevels Concrete level configuration (sent when strategy is "custom_levels"):
+	// the quantization method + its parameters. Without this, a
+	// custom_levels strategy carries no actual levels and the server
+	// applies smart defaults — the SDK's concrete type (scalar/pq/binary)
+	// and params silently never reached the engine (the #2473-review
+	// silent-drop).
+	CustomLevels *[]QuantizationLevelInput `json:"custom_levels,omitempty"`
+
 	// Enabled Enable quantization for this collection.
 	Enabled *bool `json:"enabled,omitempty"`
 
@@ -2643,6 +2651,20 @@ type QuantizationConfigOutput struct {
 
 	// Strategy Strategy label, e.g. "smart_defaults" | "minimal" | "aggressive".
 	Strategy string `json:"strategy"`
+}
+
+// QuantizationLevelInput REST input for one quantization level (mirrors proto `QuantizationLevel`'s
+// core fields; the advanced calibration fields stay server-defaulted).
+type QuantizationLevelInput struct {
+	// Bits Bits per vector element (8 for INT8, 4/8 for PQ sub-quantizers).
+	Bits *int32 `json:"bits,omitempty"`
+
+	// NumSubvectors Number of sub-vectors for product quantization.
+	NumSubvectors *int32 `json:"num_subvectors,omitempty"`
+
+	// QuantizationType Quantization method: "scalar" | "product" | "binary" | "uniform" | "none"
+	// (proto `quantization_level::QuantizationType` names, lowercase).
+	QuantizationType string `json:"quantization_type"`
 }
 
 // QueryLanguage defines model for QueryLanguage.

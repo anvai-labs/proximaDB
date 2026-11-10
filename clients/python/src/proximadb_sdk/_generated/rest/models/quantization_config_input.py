@@ -13,6 +13,10 @@ from attrs import field as _attrs_field
 
 from ..types import UNSET, Unset
 
+if TYPE_CHECKING:
+    from ..models.quantization_level_input import QuantizationLevelInput
+
+
 T = TypeVar("T", bound="QuantizationConfigInput")
 
 
@@ -25,12 +29,24 @@ class QuantizationConfigInput:
             enabled (bool | None | Unset): Enable quantization for this collection.
             strategy (None | str | Unset): Strategy: "smart_defaults" (default) | "minimal" | "aggressive" |
                 "custom_levels".
+            custom_levels (list[QuantizationLevelInput] | None | Unset): Concrete level configuration (sent when strategy is
+                "custom_levels"):
+                the quantization method + its parameters. Without this, a
+                custom_levels strategy carries no actual levels and the server
+                applies smart defaults — the SDK's concrete type (scalar/pq/binary)
+                and params silently never reached the engine (the #2473-review
+                silent-drop).
     """
 
     enabled: bool | None | Unset = UNSET
     strategy: None | str | Unset = UNSET
+    custom_levels: list[QuantizationLevelInput] | None | Unset = UNSET
 
     def to_dict(self) -> dict[str, Any]:
+        from ..models.quantization_level_input import (  # noqa: PLC0415
+            QuantizationLevelInput,
+        )
+
         enabled: bool | None | Unset
         if isinstance(self.enabled, Unset):
             enabled = UNSET
@@ -43,6 +59,18 @@ class QuantizationConfigInput:
         else:
             strategy = self.strategy
 
+        custom_levels: list[dict[str, Any]] | None | Unset
+        if isinstance(self.custom_levels, Unset):
+            custom_levels = UNSET
+        elif isinstance(self.custom_levels, list):
+            custom_levels = []
+            for custom_levels_type_0_item_data in self.custom_levels:
+                custom_levels_type_0_item = custom_levels_type_0_item_data.to_dict()
+                custom_levels.append(custom_levels_type_0_item)
+
+        else:
+            custom_levels = self.custom_levels
+
         field_dict: dict[str, Any] = {}
 
         field_dict.update({})
@@ -50,11 +78,17 @@ class QuantizationConfigInput:
             field_dict["enabled"] = enabled
         if strategy is not UNSET:
             field_dict["strategy"] = strategy
+        if custom_levels is not UNSET:
+            field_dict["custom_levels"] = custom_levels
 
         return field_dict
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.quantization_level_input import (  # noqa: PLC0415
+            QuantizationLevelInput,
+        )
+
         d = dict(src_dict)
 
         def _parse_enabled(data: object) -> bool | None | Unset:
@@ -75,9 +109,36 @@ class QuantizationConfigInput:
 
         strategy = _parse_strategy(d.pop("strategy", UNSET))
 
+        def _parse_custom_levels(
+            data: object,
+        ) -> list[QuantizationLevelInput] | None | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            try:
+                if not isinstance(data, list):
+                    raise TypeError()
+                custom_levels_type_0 = []
+                _custom_levels_type_0 = data
+                for custom_levels_type_0_item_data in _custom_levels_type_0:
+                    custom_levels_type_0_item = QuantizationLevelInput.from_dict(
+                        custom_levels_type_0_item_data
+                    )
+
+                    custom_levels_type_0.append(custom_levels_type_0_item)
+
+                return custom_levels_type_0
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            return cast(list[QuantizationLevelInput] | None | Unset, data)
+
+        custom_levels = _parse_custom_levels(d.pop("custom_levels", UNSET))
+
         quantization_config_input = cls(
             enabled=enabled,
             strategy=strategy,
+            custom_levels=custom_levels,
         )
 
         return quantization_config_input

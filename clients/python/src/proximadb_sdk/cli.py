@@ -41,7 +41,7 @@ def _jsonable(obj: Any) -> Any:
     """Convert SDK return values (pydantic models) into JSON-native data.
 
     The clients return pydantic BaseModels (Collection, SearchResult,
-    BatchResult, VectorOperationResponse, ...) — NOT dicts. Rendering paths
+    BatchResult, VectorOperationResponse, ...) - NOT dicts. Rendering paths
     that call .get()/.items()/json.dumps on them crash, so every result is
     normalized here before display (review finding 2026-11-08: every read
     command exited 1 on a healthy server before this).
@@ -55,6 +55,39 @@ def _jsonable(obj: Any) -> Any:
     return obj
 
 
+def _fail_if_unreachable(host: str, rest_port: int, timeout: float = 30.0) -> None:
+    """Fail LOUDLY when the server is unreachable.
+
+    The v1 client treats connection failures as a signal to activate its
+    local (in-memory) fallback - silently. For a CLI that means a dead
+    server renders as 'No collections found.' with exit 0 (#2469 review
+    finding 5: scripts cannot distinguish empty-from-down). Probe the
+    health endpoint once; if the transport is down, say so and exit
+    nonzero BEFORE any command output looks like an answer. ANY HTTP
+    response (even 404/405) proves reachability - only transport-level
+    failures (connect refused, timeout, DNS) trigger the exit.
+
+    Scope: the probe validates the REST/unified port (the CLI default and
+    the client's URL base). Split-port gRPC-only deployments where REST is
+    down but gRPC lives will see exit 2; conversely the SDK's MULTI-mode
+    gRPC dial hardcodes 5679 regardless of --grpc-port (pre-existing SDK
+    behavior, queued as the split-port client param follow-up) - the
+    never-fake-success guarantee holds for the default invocation.
+    """
+    import httpx
+
+    try:
+        httpx.get(f"http://{host}:{rest_port}/health", timeout=timeout)
+    except httpx.HTTPError as e:
+        click.echo(
+            f"Error: ProximaDB server unreachable at {host}:{rest_port} "
+            f"({type(e).__name__}). Check that the server is running and "
+            "the ports are correct.",
+            err=True,
+        )
+        sys.exit(2)
+
+
 def get_client(
     host: str,
     rest_port: int,
@@ -66,9 +99,13 @@ def get_client(
 
     The CLI exposes separate REST/gRPC ports (legacy multi-port layout) plus a
     protocol selector; the client takes a single base URL plus ``protocol``/
-    ``port_mode`` (unified mode multiplexes all protocols on one port — the
+    ``port_mode`` (unified mode multiplexes all protocols on one port - the
     server default since the 5678 unification).
+
+    Reachability is probed before returning: a dead server must exit
+    nonzero, never fall through to the client's silent local fallback.
     """
+    _fail_if_unreachable(host, rest_port, timeout)
     mode = PortMode.MULTI if int(grpc_port) != int(rest_port) else PortMode.UNIFIED
     return UnifiedProximaDBClient(
         url=f"http://{host}:{rest_port}",
@@ -92,7 +129,7 @@ def get_client(
     type=click.Choice(["auto", "grpc", "rest"]),
     # Default REST: against the unified server, `auto` probes gRPC first and
     # a 404/UNIMPLEMENTED http2 answer (a server ANSWER, not a connection
-    # error) propagates without REST fallback (TD-SDKERR-1 semantics) — the
+    # error) propagates without REST fallback (TD-SDKERR-1 semantics) - the
     # stock invocation must not depend on that gamble.
     default="rest",
     help="Protocol to use (auto probes gRPC first; rest is the safe default)",
@@ -459,7 +496,7 @@ def delete_vectors(
 @click.option("--filter", "-f", "filter_expr", help="Filter expression (JSON)")
 # NOTE: the historical --metric option was removed (2026-11-08 review): no
 # distance-metric parameter exists anywhere in the client call chain, so it
-# was silently ignored — the collection's configured metric always applied.
+# was silently ignored - the collection's configured metric always applied.
 @click.pass_context
 def search(
     ctx: click.Context,
@@ -484,7 +521,7 @@ def search(
 
         query_vector = json.loads(query)
         # The client accepts a plain dict (or FilterBuilder) as the metadata
-        # filter — no SDK-side SearchFilter model exists anymore.
+        # filter - no SDK-side SearchFilter model exists anymore.
         search_filter = json.loads(filter_expr) if filter_expr else None
 
         results = _jsonable(

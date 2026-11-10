@@ -1,0 +1,138 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-SEAM-12-F5: Pre-tracking truncation handling (bootstrap on upgrade)
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Design spec — not yet implemented.** Documents the seam, spec, and design rationale for handling deployments whose WAL was truncated before merge-base tracking started.
+| Priority | LOW. Fails closed (410) which is safe. Only affects upgrades from pre-tracking versions.
+| Component | `src/services/branch_base_store.rs`, `src/services/canonical_wal.rs`
+| Relates to | TD-SEAM-12, ADR-012 (branch merge)
+|===
+
+== Problem statement
+
+A deployment whose WAL was truncated before merge-base tracking started (`tracked_from > 0`) can never create merge-base images for collections that existed before tracking began. Every merge attempt for those collections returns 410 (Gone).
+
+This is a migration/upgrade concern: deployments upgrading from versions before the branch-base store was introduced will have `tracked_from > 0` and no images for existing branched collections.
+
+== Current behavior
+
+The `BranchBases::base_for` method returns `MergeBaseTruncated` when:
+1. `tracked_from > 0` — the WAL was truncated before tracking started
+2. No image exists for the collection
+3. The collection has branch-tagged entries in the retained WAL
+
+The error message: "canonical WAL history before {retained_from} was truncated before merge bases were tracked"
+
+This fails closed (410), which is safe but blocks merges for upgraded deployments.
+
+== Design options
+
+=== Option A: Bootstrap on first checkpoint (recommended)
+
+When `tracked_from > 0` and a collection has branch-tagged entries in the retained WAL, the checkpoint logic should:
+1. Create a fresh merge-base image from the retained history
+2. Set `tracked_from` to the current `retained_from` (marking the bootstrap point)
+3. Clear any truncation marks for the collection
+
+This is similar to follow-up 4 (branch-after-truncate) but applies to the deployment-level tracking state rather than per-collection marks.
+
+**Pros:**
+- Automatic — no manual intervention required
+- Safe — only creates images from retained history (no data loss)
+- Consistent with follow-up 4 logic
+
+**Cons:**
+- First checkpoint after upgrade does extra work (creates images for all branched collections)
+- Need to handle the case where retained history is incomplete (some collections may have lost history before `tracked_from`)
+
+=== Option B: Migration script
+
+Provide a CLI tool that pre-bootstraps merge-base images for existing collections before upgrading:
+1. Scan the WAL for collections with branch-tagged entries
+2. Create merge-base images for each
+3. Write the images to the branch-base store
+4. Set `tracked_from` to the current WAL head
+
+**Pros:**
+- Explicit — operator controls the migration
+- Can be run during maintenance window
+
+**Cons:**
+- Requires operator intervention
+- Tool needs to be maintained and documented
+- Risk of operator error
+
+=== Option C: Accept the limitation
+
+Document that upgrades from pre-tracking versions require manual intervention:
+1. Before upgrading, ensure no collections have branches
+2. Or accept that merges will return 410 until images are created
+3. Provide a recovery procedure (delete branch-base store, let it rebuild)
+
+**Pros:**
+- No code changes
+- Safe (fails closed)
+
+**Cons:**
+- Poor upgrade experience
+- Requires documentation and support
+
+== Recommended approach
+
+**Option A (bootstrap on first checkpoint)** with the following refinements:
+
+1. **Detect bootstrap scenario**: When `tracked_from > 0` and `generation == 0` (no checkpoints have run yet), the deployment is in bootstrap mode.
+
+2. **Create images for branched collections**: For each collection in `summary.collections` (collections with branch-tagged entries), create a fresh merge-base image from the retained WAL history.
+
+3. **Handle incomplete history**: If a collection's branch-tagged entries start before `retained_from`, the image will be incomplete. Mark the collection with a truncation mark so merges refuse (410) until the history is complete.
+
+4. **Set tracked_from**: After bootstrap, set `tracked_from` to `retained_from` to mark the bootstrap point.
+
+5. **Log the bootstrap**: Emit a clear log message indicating that bootstrap occurred, including the number of collections imaged and any collections with incomplete history.
+
+== Implementation sketch
+
+```rust
+// In BranchBaseStore::checkpoint():
+if state.generation == 0 && state.tracked_from > 0 {
+    // Bootstrap scenario: create images for all branched collections
+    info!("bootstrapping merge-base images for {} collections", summary.collections.len());
+    for collection in &summary.collections {
+        if self.wal.has_branch_entries_after(collection, retained_from) {
+            // Create image from retained history
+            let entries = self.wal.read_entries_since(&collection.collection, 0).await?;
+            let mut image = MergeBaseImage::default();
+            image.advance(&entries, through);
+            images.insert(collection.clone(), image);
+        } else {
+            // Collection has branch entries before retained_from — incomplete history
+            truncated.insert(collection.clone(), retained_from);
+        }
+    }
+    tracked_from = retained_from;
+}
+```
+
+== Acceptance criteria
+
+1. Deployment with `tracked_from > 0` and branched collections can merge after first checkpoint
+2. Collections with incomplete history (branch entries before `retained_from`) still return 410
+3. Bootstrap is logged with clear message
+4. Existing tests pass
+5. New test: bootstrap scenario with mixed complete/incomplete collections
+
+== Open questions
+
+1. Should bootstrap be opt-in (env gate) or automatic?
+2. Should there be a maximum number of collections to bootstrap in one checkpoint (to avoid long pauses)?
+3. How should the bootstrap interact with the existing `PROXIMADB_CANONICAL_WAL_TRUNCATE_INTERVAL_SECS` gate?
+
+== Relation to other follow-ups
+
+- Follow-up 4 (branch-after-truncate) uses similar logic (create image from retained history)
+- Both follow-ups share the `has_branch_entries_after` helper
+- Both are about improving the merge experience after truncation events
