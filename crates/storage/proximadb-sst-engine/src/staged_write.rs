@@ -465,4 +465,21 @@ mod tests {
             "/var/lib/proximadb/L3.pax"
         ));
     }
+
+    #[test]
+    fn local_path_of_maps_only_local_urls() {
+        // file:// -> its path; a bare local path -> itself.
+        assert_eq!(
+            StagedSegmentWrite::local_path_of("file:///var/lib/proximadb/L3.pax"),
+            Some("/var/lib/proximadb/L3.pax")
+        );
+        assert_eq!(
+            StagedSegmentWrite::local_path_of("/var/lib/proximadb/L3.pax"),
+            Some("/var/lib/proximadb/L3.pax")
+        );
+        // An object-store target has NO local path: never `az://...` as a path.
+        for remote in ["az://c/t/L3.pax", "s3://b/t/L3.pax", "gs://b/t/L3.pax"] {
+            assert_eq!(StagedSegmentWrite::local_path_of(remote), None, "{remote}");
+        }
+    }
 }

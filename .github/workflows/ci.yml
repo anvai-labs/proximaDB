@@ -3608,6 +3608,7 @@ jobs:
               --test external_collection_bm25_e2e_test \
               --test filesystem_compat \
               --test fp16_centroid_test \
+              --test grpc_methods_test \
               --test helix_integration_test \
               --test hmgi_integration_test \
               --test ivf_ingest_asymptotic_test \
@@ -3625,6 +3626,7 @@ jobs:
               --test prepared_statement_test \
               --test proximacodec_cross_compatibility_test \
               --test proximacodec_integration_test \
+              --test queue_adapter_upgrade_integration_test \
               --test rank_services_e2e_test \
               --test repair_chain_integration_test \
               --test rerank_pgwire_contract_e2e \

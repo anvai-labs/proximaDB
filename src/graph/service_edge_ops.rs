@@ -77,7 +77,7 @@ impl super::GraphOperationsService {
             ));
         }
 
-        let engine = self.get_or_create_graph_engine(graph_id).await?;
+        let engine = self.get_existing_graph_engine(graph_id).await?;
         // If we can load endpoints, enforce schema
         if let (Some(from), Some(to)) = (
             engine.get_node(&edge.from_node_id)?,
@@ -105,7 +105,7 @@ impl super::GraphOperationsService {
                 "Graph operations disabled in current mode".to_string(),
             ));
         }
-        let engine = self.get_or_create_graph_engine(graph_id).await?;
+        let engine = self.get_existing_graph_engine(graph_id).await?;
         let deleted = crate::graph::engines::GraphEngine::delete_edge(&*engine, id).await?;
         if let Some(ref edge) = deleted {
             let edge_record = edge_to_canonical_record(graph_id, edge);
@@ -130,7 +130,7 @@ impl super::GraphOperationsService {
                 "Graph operations disabled in current mode".to_string(),
             ));
         }
-        let engine = self.get_or_create_graph_engine(graph_id).await?;
+        let engine = self.get_existing_graph_engine(graph_id).await?;
         if let Some(edge) = engine.get_edge(id)? {
             return Ok(Some(edge));
         }
@@ -153,7 +153,7 @@ impl super::GraphOperationsService {
                 "Graph operations disabled in current mode".to_string(),
             ));
         }
-        let engine = self.get_or_create_graph_engine(graph_id).await?;
+        let engine = self.get_existing_graph_engine(graph_id).await?;
         let edge_prefix = format!("graph/{graph_id}/edge/");
 
         let mut seen = std::collections::HashSet::new();
@@ -276,7 +276,7 @@ impl super::GraphOperationsService {
                 "Graph operations disabled in current mode".to_string(),
             ));
         }
-        let engine = self.get_or_create_graph_engine(graph_id).await?;
+        let engine = self.get_existing_graph_engine(graph_id).await?;
         let nodes = engine.get_all_nodes()?;
         let mut edges = Vec::new();
         for node in nodes {

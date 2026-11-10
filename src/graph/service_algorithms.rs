@@ -164,7 +164,7 @@ impl GraphOperationsService {
         let start_time = std::time::Instant::now();
         let config = config.unwrap_or_default();
 
-        let engine = self.get_or_create_graph_engine(graph_id).await?;
+        let engine = self.get_existing_graph_engine(graph_id).await?;
 
         let crate::graph::engines::GraphEngineImpl::Orion(orion_engine) = engine.as_ref();
 
@@ -254,7 +254,7 @@ impl GraphOperationsService {
         let start_time = std::time::Instant::now();
         let config = config.unwrap_or_default();
 
-        let engine = self.get_or_create_graph_engine(graph_id).await?;
+        let engine = self.get_existing_graph_engine(graph_id).await?;
 
         let crate::graph::engines::GraphEngineImpl::Orion(orion_engine) = engine.as_ref();
 

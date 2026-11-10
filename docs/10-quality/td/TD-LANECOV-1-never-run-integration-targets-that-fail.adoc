@@ -28,7 +28,7 @@ deliberate change; **investigate** = deterministic failure, cause not yet proven
 
 | `queue_adapter_upgrade_integration_test` (2 tests)
 | A relative `file://` queue root makes LIST return entries "outside configured root": `.tmpX/queue/.tmpX/queue/events`
-| real (likely)
+| **fixed** (real)
 | The path is doubled when the root is relative (`file://.tmp1tZS1z/queue`, `file://./.tmpUVDUgf/queue`); absolute roots pass (3/5 tests green). Likely a relative-root join applied twice in the queue filesystem's LIST.
 
 | `discovery_drift_watcher_e2e`
@@ -48,7 +48,7 @@ deliberate change; **investigate** = deterministic failure, cause not yet proven
 
 | `grpc_methods_test`
 | `GraphOperationsService::get_node` on a non-existent graph does not error
-| contract
+| **fixed** (real; contract decided)
 | The test expects `Err`; the service presumably returns `Ok(None)`. Decide the contract (not-found as `Err` vs `None`) with the graph owner, then fix the code or the test.
 
 | `counting_filesystem`
@@ -85,6 +85,8 @@ deliberate change; **investigate** = deterministic failure, cause not yet proven
 ** `objstore_segment_path_guard_test`: compaction's two cache-promotion fallbacks now use the new sanctioned `StagedSegmentWrite::local_path_of` (in `proximadb-sst-engine`'s `staged_write`), which returns `None` for an object-store output, and skip explicitly instead of building an `az://...` "path".
 ** `counting_filesystem`: the fake now has a coalescing plan, so the batched read is one physical GET and the test proves the physical-GET contract (it fails if the wrapper counts logical ranges).
 ** `tdd_infrastructure_test`: the developer-local hook assertion is removed; the repo-tracked checks remain.
+** `queue_adapter_upgrade_integration_test`: regression from #2386 (`55141f6b3`), which made `LocalFileSystem::list` always return absolute `file:///...` entries; `FactoryQueueFs::relative_from_listed_url` still compared them with the relative root, so every LIST under a relative root failed. Fixed at that boundary only: a relative root is resolved against the working directory for the comparison (lexical, like the backend), confinement and `..` rejection unchanged, caller-facing paths still in caller coordinates. The doubled path in the dotted case is the documented existing mapping, not a bug. New unit test covers in-root, `./` callers, and out-of-root/traversal rejections.
+** `grpc_methods_test`: a READ of a never-created graph went through `get_or_create_graph_engine`, so looking up a node in a mistyped graph silently **created and registered** that graph, then answered "no such node". Decided contract: reads and mutations of existing data (27 call sites) use a new non-provisioning `get_existing_graph_engine` and fail with "Graph collection '...' not found" (NOT_FOUND on the wire, same wording as `update_graph_schema`); only creating writes (create/batch-create, transactions, adding a constraint: 9 sites) still provision, preserving the TD-GRAPH-TENANT-1 first-write flow. A missing node in an existing graph stays `Ok(None)`. Visible change: reading a named tenant's graph before its first write is NOT_FOUND, not empty.
 
 == Exit criteria
 

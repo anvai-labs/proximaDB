@@ -3266,7 +3266,10 @@ impl Compaction {
             let cache_source = if retained_path.exists() {
                 Some(retained_path)
             } else {
-                crate::storage::engines::sst::staged_write::StagedSegmentWrite::local_path_of(&output_path).map(Path::new)
+                crate::storage::engines::sst::staged_write::StagedSegmentWrite::local_path_of(
+                    &output_path,
+                )
+                .map(Path::new)
             };
             match cache_source {
                 None => debug!(
@@ -3307,7 +3310,10 @@ impl Compaction {
             let source = if retained_path.exists() {
                 Some(retained_path)
             } else {
-                crate::storage::engines::sst::staged_write::StagedSegmentWrite::local_path_of(&output_path).map(Path::new)
+                crate::storage::engines::sst::staged_write::StagedSegmentWrite::local_path_of(
+                    &output_path,
+                )
+                .map(Path::new)
             };
             match source {
                 None => debug!(

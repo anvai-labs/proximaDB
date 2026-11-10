@@ -555,7 +555,7 @@ impl GraphOperationsService {
         graph_id: &str,
         ids: &[String],
     ) -> Result<Vec<Option<Arc<Node>>>> {
-        let engine = self.get_or_create_graph_engine(graph_id).await?;
+        let engine = self.get_existing_graph_engine(graph_id).await?;
         let mut out: Vec<Option<Arc<Node>>> = Vec::with_capacity(ids.len());
         let mut miss_slots: Vec<usize> = Vec::new();
         for (i, id) in ids.iter().enumerate() {
@@ -622,7 +622,7 @@ impl GraphOperationsService {
         graph_id: &str,
         ids: &[String],
     ) -> Result<Vec<Option<Arc<Edge>>>> {
-        let engine = self.get_or_create_graph_engine(graph_id).await?;
+        let engine = self.get_existing_graph_engine(graph_id).await?;
         let mut out: Vec<Option<Arc<Edge>>> = Vec::with_capacity(ids.len());
         let mut miss_slots: Vec<usize> = Vec::new();
         for (i, id) in ids.iter().enumerate() {
@@ -1200,7 +1200,7 @@ impl GraphOperationsService {
             prefetch_budget: override_prefetch_budget
                 .unwrap_or(self.graph_settings.prefetch_budget),
         };
-        let engine = self.get_or_create_graph_engine(graph_id).await?;
+        let engine = self.get_existing_graph_engine(graph_id).await?;
 
         let orion_engine = match &*engine {
             crate::graph::engines::GraphEngineImpl::Orion(e) => Some(e),
@@ -1823,7 +1823,7 @@ impl GraphOperationsService {
         }
 
         // Validate schema
-        let engine = self.get_or_create_graph_engine(graph_id).await?;
+        let engine = self.get_existing_graph_engine(graph_id).await?;
         if let (Some(from), Some(to)) = (
             engine.get_node(&edge.from_node_id)?,
             engine.get_node(&edge.to_node_id)?,
@@ -1927,7 +1927,7 @@ impl GraphOperationsService {
         property: &str,
     ) -> Result<()> {
         // Get the graph engine to ensure it exists
-        let _engine = self.get_or_create_graph_engine(graph_id).await?;
+        let _engine = self.get_existing_graph_engine(graph_id).await?;
 
         // Remove constraint using graph-specific key
         let key = (
@@ -2104,7 +2104,7 @@ impl GraphOperationsService {
             ));
         }
 
-        let engine = self.get_or_create_graph_engine(graph_id).await?;
+        let engine = self.get_existing_graph_engine(graph_id).await?;
 
         // Initial candidate set from labels or all nodes
         let mut candidates: HashSet<NodeId> = if !query.labels.is_empty() {
@@ -2350,7 +2350,7 @@ impl GraphOperationsService {
             ));
         }
 
-        let engine = self.get_or_create_graph_engine(graph_id).await?;
+        let engine = self.get_existing_graph_engine(graph_id).await?;
 
         // Edge querying: from/to node ID filtering. Edge type and property
         // filtering applied post-retrieval via the query.filters field.
@@ -2594,7 +2594,7 @@ impl GraphOperationsService {
             ));
         }
 
-        let engine = self.get_or_create_graph_engine(graph_id).await?;
+        let engine = self.get_existing_graph_engine(graph_id).await?;
 
         // Collect label statistics by iterating through all nodes
         let mut label_counts: std::collections::HashMap<String, u64> =

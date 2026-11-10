@@ -307,6 +307,57 @@ mod grpc_methods_tests {
         // For this test, we verify the removal operation doesn't panic
     }
 
+    /// A READ of a graph that was never created must not create it. Reads used
+    /// to go through `get_or_create_graph_engine`, so looking up a node in a
+    /// mistyped graph silently registered a new graph collection and then
+    /// answered "no such node". Mutations of existing data (update/delete)
+    /// must not create it either; only creating writes provision.
+    #[tokio::test]
+    async fn test_read_or_mutation_of_missing_graph_does_not_create_it() {
+        let service = Arc::new(GraphOperationsService::new());
+        let before = service.list_graphs().await.expect("list graphs");
+
+        assert!(
+            service
+                .get_node("typo_graph", &"n1".to_string())
+                .await
+                .is_err()
+        );
+        assert!(
+            service
+                .get_edge("typo_graph", &"e1".to_string())
+                .await
+                .is_err()
+        );
+        assert!(
+            service
+                .delete_node("typo_graph", &"n1".to_string())
+                .await
+                .is_err()
+        );
+        let err = service
+            .get_node("typo_graph", &"n1".to_string())
+            .await
+            .expect_err("missing graph")
+            .to_string();
+        assert!(err.contains("not found"), "maps to NOT_FOUND: {err}");
+
+        let after = service.list_graphs().await.expect("list graphs");
+        assert_eq!(before, after, "a read/mutation must not provision a graph");
+        assert!(!after.iter().any(|g| g.contains("typo_graph")), "{after:?}");
+
+        // The other half of the contract: an EXISTING graph with a missing
+        // node is Ok(None) (a plain "not there"), not an error.
+        let existing = create_test_graph_with_engine("lookup_contract_graph", "ORION").await;
+        assert!(
+            existing
+                .get_node("lookup_contract_graph", &"absent".to_string())
+                .await
+                .expect("existing graph: lookup succeeds")
+                .is_none()
+        );
+    }
+
     /// Test error handling for non-existent graphs
     #[tokio::test]
     async fn test_graph_error_handling() {
