@@ -420,6 +420,11 @@ class ProximaDBAsyncUnified:
         text_fields = record.get("text_fields")
         if text_fields:
             normalized["text_fields"] = text_fields
+        # Record TTL: async twin of the sync REST normalizer (rest_sync
+        # _normalize_record_payload). Only the explicit *_ms key.
+        expires_at_ms = record.get("expires_at_ms")
+        if expires_at_ms is not None:
+            normalized["expires_at_ms"] = int(expires_at_ms)
         return normalized
 
     async def insert_records(

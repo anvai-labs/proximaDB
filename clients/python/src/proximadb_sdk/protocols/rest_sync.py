@@ -1686,6 +1686,12 @@ class ProximaDBClient:
         }
         if text_fields:
             normalized["text_fields"] = text_fields
+        # Record TTL (absolute epoch ms), same field as gRPC v2. Only the
+        # explicit *_ms key is forwarded: bare `expires_at` has mixed units
+        # across the codebase (ms on the wire, s in the model property).
+        expires_at_ms = record.get("expires_at_ms")
+        if expires_at_ms is not None:
+            normalized["expires_at_ms"] = int(expires_at_ms)
         return normalized
 
     def insert_records(
