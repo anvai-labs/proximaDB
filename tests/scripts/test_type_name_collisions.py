@@ -202,6 +202,36 @@ class TypeNameCollisionTests(unittest.TestCase):
         self.assertEqual(self._run("--mode", "baseline", "--baseline", str(base)), 0)
         self.assertEqual(self._run("--mode", "no-regression", "--baseline", str(base)), 0)
 
+    def test_burn_down_failure_prints_the_baseline_hint_not_the_new_collision_hint(self):
+        # The count FALLS: nothing new was defined, so the generic "give it a
+        # qualifying name" hint names an action that does not apply — the only
+        # remedy is lowering the baseline in the same PR.
+        import io
+        from contextlib import redirect_stderr
+        self.write("src/a.rs", "pub struct X;\n")
+        self.write("src/b.rs", "pub struct X;\n")
+        base = self._baseline()
+        (self.root / "src/b.rs").unlink()
+        err = io.StringIO()
+        with redirect_stderr(err):
+            self.assertEqual(self._run("--mode", "no-regression", "--baseline", str(base)), 1)
+        out = err.getvalue()
+        self.assertIn("lower the baseline", out)
+        self.assertNotIn("Give it a", out)
+
+    def test_new_collision_failure_still_prints_the_qualifying_hint(self):
+        import io
+        from contextlib import redirect_stderr
+        self.write("src/a.rs", "pub struct Dup;\n")
+        self.write("src/b.rs", "pub struct Dup;\n")
+        base = self._baseline()
+        self.write("src/c.rs", "pub struct Other;\n")
+        self.write("src/d.rs", "pub struct Other;\n")
+        err = io.StringIO()
+        with redirect_stderr(err):
+            self.assertEqual(self._run("--mode", "no-regression", "--baseline", str(base)), 1)
+        self.assertIn("Give it a", err.getvalue())
+
     def test_baseline_mode_refuses_to_raise(self):
         self.write("src/a.rs", "pub struct X;\n")
         self.write("src/b.rs", "pub struct X;\n")
