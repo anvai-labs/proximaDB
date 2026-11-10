@@ -285,6 +285,14 @@ pub fn proto_record_to_envelope(proto: &v2::ProximaRecord) -> Result<ProximaReco
         .updated_at_ms
         .map(|v| v.saturating_mul(1_000_000))
         .unwrap_or(record.created_at_ns);
+    // expires_at_ms = 0 would become valid_to_ns = Some(0), the canonical
+    // tombstone: the insert would succeed and the record be instantly
+    // invisible. No internal producer emits 0; reject it at the wire.
+    if let Some(ms) = proto.expires_at_ms
+        && ms <= 0
+    {
+        bail!("expires_at_ms must be a positive epoch-millisecond timestamp, got {ms}");
+    }
     record.valid_to_ns = proto.expires_at_ms.map(|v| v.saturating_mul(1_000_000));
     record.origin = proto.source.clone();
     record.actor = proto.created_by.clone();
@@ -711,6 +719,38 @@ mod tests {
                 values: vec![0.5, 0.9],
             }))
         );
+    }
+
+    #[test]
+    fn proto_record_to_envelope_rejects_non_positive_expiry() {
+        // expires_at_ms = 0 used to become valid_to_ns = Some(0): the
+        // tombstone. The insert "succeeded" and the record was invisible.
+        for bad in [0_i64, -5] {
+            let proto = v2::ProximaRecord {
+                id: "r".to_string(),
+                vector: vec![1.0],
+                expires_at_ms: Some(bad),
+                ..Default::default()
+            };
+            let err = proto_record_to_envelope(&proto).unwrap_err().to_string();
+            assert!(err.contains("expires_at_ms"), "{err}");
+        }
+        let ok = v2::ProximaRecord {
+            id: "r".to_string(),
+            vector: vec![1.0],
+            expires_at_ms: Some(1),
+            ..Default::default()
+        };
+        assert_eq!(
+            proto_record_to_envelope(&ok).unwrap().valid_to_ns,
+            Some(1_000_000)
+        );
+        let none = v2::ProximaRecord {
+            id: "r".to_string(),
+            vector: vec![1.0],
+            ..Default::default()
+        };
+        assert_eq!(proto_record_to_envelope(&none).unwrap().valid_to_ns, None);
     }
 
     #[test]

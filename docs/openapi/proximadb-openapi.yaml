@@ -6418,6 +6418,16 @@ components:
           items:
             $ref: '#/components/schemas/TextFieldInput'
           description: Dedicated TEXT fields with storage hints
+        expires_at_ms:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          description: |-
+            Absolute expiry time in epoch milliseconds (record TTL). After this
+            instant the record is dead to every read. Same field and semantics as
+            the gRPC v2 `ProximaRecord.expires_at_ms`. Must be > 0: an expiry of 0
+            is the internal tombstone encoding and is rejected per record.
       additionalProperties: false
     QuantizationConfigInput:
       type: object

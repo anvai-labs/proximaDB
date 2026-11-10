@@ -2770,7 +2770,9 @@ class ProximaDBClient:
                         vector_dict["updated_at"] = record.updated_at
 
                     if hasattr(record, "expires_at_ms") and record.expires_at_ms:
-                        vector_dict["expires_at"] = record.expires_at_ms
+                        # Explicit *_ms key: the REST normalizer forwards
+                        # only expires_at_ms (bare "expires_at" was dropped).
+                        vector_dict["expires_at_ms"] = record.expires_at_ms
                     elif hasattr(record, "expires_at") and record.expires_at:
                         vector_dict["expires_at"] = record.expires_at
 

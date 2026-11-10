@@ -2604,6 +2604,12 @@ type ProjectionRouteMetadataExplanation struct {
 // so the deny cannot break them; a hand-rolled client sending something
 // else gets a 400 naming the problem instead of a silent no-op filter.
 type ProximaRecordInput struct {
+	// ExpiresAtMs Absolute expiry time in epoch milliseconds (record TTL). After this
+	// instant the record is dead to every read. Same field and semantics as
+	// the gRPC v2 `ProximaRecord.expires_at_ms`. Must be > 0: an expiry of 0
+	// is the internal tombstone encoding and is rejected per record.
+	ExpiresAtMs *int64 `json:"expires_at_ms,omitempty"`
+
 	// Id Record ID (optional, will be auto-generated if not provided)
 	Id *string `json:"id,omitempty"`
 

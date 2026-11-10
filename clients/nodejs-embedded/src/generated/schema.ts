@@ -3274,6 +3274,14 @@ export interface components {
             } | null;
             /** @description Dedicated TEXT fields with storage hints */
             text_fields?: components["schemas"]["TextFieldInput"][] | null;
+            /**
+             * Format: int64
+             * @description Absolute expiry time in epoch milliseconds (record TTL). After this
+             *     instant the record is dead to every read. Same field and semantics as
+             *     the gRPC v2 `ProximaRecord.expires_at_ms`. Must be > 0: an expiry of 0
+             *     is the internal tombstone encoding and is rejected per record.
+             */
+            expires_at_ms?: number | null;
         };
         /**
          * @description REST input for quantization config (mirrors proto `QuantizationConfig`;
