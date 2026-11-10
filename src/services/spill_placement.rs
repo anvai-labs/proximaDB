@@ -73,6 +73,14 @@ pub const PLACEMENT_MARKER: &str = "SPILL_PLACEMENT";
 /// sees it.
 pub const OWNER_MARKER: &str = "_proximadb_spill_owner.json";
 
+/// TD-SEAM-14 S2: Manifest head, at the root of an object-store placement.
+/// Lists all segments by partition, updated with CAS on the revision field.
+pub const MANIFEST_HEAD: &str = "_proximadb_spill_manifest.json";
+
+/// TD-SEAM-14 S2: Durable witness, beside the canonical WAL.
+/// Records the last verified manifest head revision and digest.
+pub const DURABLE_WITNESS: &str = "SPILL_WITNESS";
+
 /// The placement value recorded for local segments.
 const LOCAL: &str = "local";
 
@@ -373,6 +381,66 @@ struct OwnerMarker {
     #[serde(default)]
     nonce: Option<String>,
     written_by: String,
+}
+
+/// TD-SEAM-14 S2: Manifest head — the authoritative list of segments by partition.
+/// Updated with CAS on the `revision` field. The manifest is owner-conditioned:
+/// only the current owner (matching instance+epoch+nonce) can update it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManifestHead {
+    /// Owner identity — must match the current owner marker.
+    pub owner_instance: String,
+    pub owner_epoch: u64,
+    #[serde(default)]
+    pub owner_nonce: Option<String>,
+    /// Monotonically increasing revision. CAS uses this as the expected value.
+    pub revision: u64,
+    /// SHA-256 digest of this manifest (excluding this field), hex-encoded.
+    /// Used by the durable witness to verify integrity.
+    #[serde(default)]
+    pub digest: String,
+    /// Partitions keyed by "{tenant}/{collection}".
+    #[serde(default)]
+    pub partitions: std::collections::HashMap<String, PartitionManifest>,
+}
+
+/// TD-SEAM-14 S2: Manifest for a single partition (tenant/collection).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PartitionManifest {
+    /// Partition incarnation — incremented on DROP/recreate.
+    pub incarnation: u64,
+    /// Immutable segments in LSN order.
+    pub segments: Vec<SegmentEntry>,
+}
+
+/// TD-SEAM-14 S2: An immutable segment entry in the manifest.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SegmentEntry {
+    /// Segment key (relative to partition prefix).
+    pub key: String,
+    /// SHA-256 digest, hex-encoded.
+    pub digest: String,
+    /// Byte length.
+    pub byte_length: u64,
+    /// Format (e.g., "parquet").
+    pub format: String,
+    /// LSN range [start, end] covered by this segment.
+    pub lsn_range: [u64; 2],
+}
+
+/// TD-SEAM-14 S2: Durable witness — local record of the last verified manifest head.
+/// Written with fsync before acknowledging publication. Used at boot to detect rollback.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DurableWitness {
+    /// Owner identity at the time of the witness.
+    pub owner_instance: String,
+    pub owner_epoch: u64,
+    /// Manifest revision at the time of the witness.
+    pub manifest_revision: u64,
+    /// Manifest digest at the time of the witness.
+    pub manifest_digest: String,
+    /// Timestamp (Unix seconds) when the witness was written.
+    pub timestamp: u64,
 }
 
 /// A decisive refusal: retrying cannot change it.
