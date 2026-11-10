@@ -596,6 +596,115 @@ impl FileSystem for GcsFileSystem {
         }
     }
 
+    /// TD-SEAM-14 S1: conditional replacement for owner marker CAS.
+    ///
+    /// Reads the current value and generation, compares with `expected`, and if
+    /// it matches, writes `replacement` with a conditional PUT using the generation.
+    /// Also checks `guards` (other files that must match expected values).
+    ///
+    /// Returns `Ok(true)` if the replacement was written, `Ok(false)` if the
+    /// current value didn't match or a guard failed.
+    async fn compare_exchange(
+        &self,
+        path: &str,
+        expected: Option<&[u8]>,
+        replacement: &[u8],
+        guards: &[(&str, Option<&[u8]>)],
+    ) -> FsResult<bool> {
+        let (bucket, object) = Self::parse(path)?;
+
+        // Check guards first (fail fast if any guard doesn't match).
+        // Use data plane (read_all) to read actual object content.
+        for (guard_path, guard_expected) in guards {
+            let (guard_bucket, guard_object) = Self::parse(guard_path)?;
+            let guard_current = match self
+                .read_all("GCS guard read", &guard_bucket, &guard_object, None)
+                .await
+            {
+                Ok(bytes) => Some(bytes),
+                Err(FilesystemError::NotFound(_)) => None,
+                Err(e) => return Err(e),
+            };
+            let guard_matches = match (guard_expected, guard_current.as_deref()) {
+                (None, None) => true,
+                (Some(exp), Some(cur)) => *exp == cur,
+                _ => false,
+            };
+            if !guard_matches {
+                return Ok(false);
+            }
+        }
+
+        // Read current value (data plane) and generation (metadata plane).
+        let current_data = match self.read_all("GCS get", &bucket, &object, None).await {
+            Ok(bytes) => Some(bytes),
+            Err(FilesystemError::NotFound(_)) => None,
+            Err(e) => return Err(e),
+        };
+
+        let current_generation =
+            match self.json.get_object(&bucket, &object).await {
+                Ok(Some(obj)) => {
+                    // Extract generation from metadata JSON.
+                    let gen_str =
+                        obj.get("generation")
+                            .and_then(|v| v.as_str())
+                            .ok_or_else(|| {
+                                FilesystemError::Network("GCS metadata missing generation".into())
+                            })?;
+                    Some(gen_str.parse::<i64>().map_err(|e| {
+                        FilesystemError::Network(format!("GCS generation parse: {e}"))
+                    })?)
+                }
+                Ok(None) => None,
+                Err(e) => return Err(FilesystemError::Network(format!("GCS metadata: {e}"))),
+            };
+
+        let current = current_data.map(|data| (data, current_generation));
+
+        // Compare with expected.
+        let matches = match (expected, current.as_ref()) {
+            (None, None) => true,
+            (Some(exp), Some((cur, _))) => exp == cur.as_slice(),
+            _ => false,
+        };
+        if !matches {
+            return Ok(false);
+        }
+
+        // Write replacement with conditional PUT using generation.
+        let generation = current.as_ref().and_then(|(_, g)| *g);
+        let mut builder = self
+            .data
+            .write_object(
+                Self::bucket_param(&bucket),
+                &object,
+                bytes::Bytes::copy_from_slice(replacement),
+            )
+            .with_known_crc32c(crc32c::crc32c(replacement));
+
+        if let Some(g) = generation {
+            builder = builder.set_if_generation_match(g);
+        } else {
+            // Expected was None (absent), so use generation 0 (create-only).
+            builder = builder.set_if_generation_match(0i64);
+        }
+
+        match builder.send_unbuffered().await {
+            Ok(_) => Ok(true),
+            Err(e) if Self::is_precondition_conflict(&e) => Ok(false),
+            Err(e) => Err(status_error(
+                "GCS conditional upload",
+                e.http_status_code(),
+                e,
+            )),
+        }
+    }
+
+    fn supports_conditional_replace(&self) -> bool {
+        true
+    }
+
     async fn append(&self, _path: &str, _data: &[u8]) -> FsResult<()> {
         Err(FilesystemError::InvalidOperation(
             "GCS objects are immutable; append is unsupported".to_string(),
