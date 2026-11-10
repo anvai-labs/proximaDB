@@ -400,9 +400,10 @@ class EmbeddedProtocolAdapter(RecordOpsMixin, BaseProtocolAdapter):
 
         The embedded binding's write contract: insert/insert_numpy return a
         processed count (int); upsert/upsert_numpy return an (inserted,
-        updated) tuple. THE ECHO POLICY LIVES HERE (models.resolve_vector_ids
-        is the alias-side consumer of this gate): the client-supplied id echo
-        is emitted ONLY on full success — a partial echo would list records
+        updated) tuple. THE ECHO POLICY LIVES HERE (the alias sites consume
+        the gate's output via BatchResult.inserted_ids through
+        _batch_result_from_vector_response): the client-supplied id echo is
+        emitted ONLY on full success — a partial echo would list records
         the server rejected.
         """
         duration_ms = (time.time() - start_time) * 1000

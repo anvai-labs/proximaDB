@@ -6,11 +6,7 @@ return an (inserted, updated) TUPLE. These tests stub that real shape —
 earlier test doubles stubbed ints for upserts, masking a dead echo.
 """
 
-import numpy as np
-import pytest
-
 from proximadb_sdk.adapters.embedded_adapter import EmbeddedProtocolAdapter
-from proximadb_sdk.models import BatchResult, VectorRecord
 
 
 def _adapter(insert_result=None, upsert_result=None):
@@ -56,7 +52,6 @@ def test_upsert_numpy_echoes_ids_on_full_success():
     # REAL binding contract: upsert_numpy returns an (inserted, updated)
     # TUPLE — an int stub masks the echo path (the round-8 review's finding).
     adapter = _adapter(upsert_result=(2, 0))
-    ids = ["a", "b"]
     records = _records(2)
     resp = adapter.upsert_numpy(
         "col", [r["id"] for r in records], [r["vector"] for r in records], None
