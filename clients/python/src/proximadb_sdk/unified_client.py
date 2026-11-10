@@ -26,6 +26,7 @@ from ._graph_validation import (
     validate_create_node_args,
     validate_traverse_graph_args,
 )
+from ._record_ids import new_record_id
 from .adapters import BaseProtocolAdapter, create_adapter
 from .auth import AuthConfig, AuthMethod, ProximaDBAuth
 from .config import ClientConfig, PortMode, Protocol, load_config
@@ -616,7 +617,9 @@ class ProximaDBClient:
             return None
 
         ids_list = (
-            list(ids) if ids is not None else [f"vec_{i}" for i in range(len(vectors))]
+            list(ids)
+            if ids is not None
+            else [new_record_id() for _ in range(len(vectors))]
         )
         metadata_list = (
             metadata if metadata and any(item for item in metadata) else None
@@ -2359,7 +2362,10 @@ class ProximaDBClient:
             payload = dict(record)
             if "props" not in payload and "metadata" in payload:
                 payload["props"] = payload.pop("metadata")
-            payload.setdefault("id", payload.get("oid") or f"record_{index}")
+            # Falsy check, not setdefault: {"id": None} / {"id": ""} must
+            # also get a fresh id (setdefault kept them).
+            if not payload.get("id"):
+                payload["id"] = payload.get("oid") or new_record_id()
             # TD-REC-1: `oid` is a client-side seeding value, not a contract
             # field — drop it once it has seeded `id`. Other unknown keys stay
             # IN so the server's deny returns a 400 naming the field.
@@ -2368,7 +2374,7 @@ class ProximaDBClient:
             return payload
 
         payload: dict[str, Any] = {
-            "id": record.id or f"record_{index}",
+            "id": record.id or new_record_id(),
             "vector": (
                 record.vector.tolist()
                 if hasattr(record.vector, "tolist")
@@ -2853,11 +2859,11 @@ class ProximaDBClient:
                 else:
                     # REST fallback
                     vectors = [r.vector for r in records]
-                    ids = [r.id for r in records if r.id]
+                    # Per-record default: filtering out ID-less records
+                    # (the old `if r.id`) left ids shorter than vectors in a
+                    # mixed batch.
+                    ids = [r.id or new_record_id() for r in records]
                     metadata = [r.metadata for r in records]
-
-                    if not ids:
-                        ids = [f"vec_{i}" for i in range(len(vectors))]
 
                     result = client.insert_vectors(
                         collection_id, vectors, ids, metadata

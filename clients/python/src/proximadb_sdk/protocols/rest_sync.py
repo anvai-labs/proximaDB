@@ -45,6 +45,7 @@ from tenacity import (
     wait_exponential,
 )
 
+from .._record_ids import new_record_id
 from ..batching_unified import BatchConfig, ThreadedBatchProcessor
 from ..cache import ResponseCache
 from ..config import ClientConfig, load_config
@@ -1679,7 +1680,7 @@ class ProximaDBClient:
 
         text_fields = record.get("text_fields") or []
         normalized = {
-            "id": record.get("id") or record.get("oid") or f"record_{index}",
+            "id": record.get("id") or record.get("oid") or new_record_id(),
             "vector": vector,
             "props": props,
         }
@@ -1847,7 +1848,7 @@ class ProximaDBClient:
         else:
             vectors_list = self._normalize_vectors(vectors)
             if ids is None:
-                ids = [f"record_{i}" for i in range(len(vectors_list))]
+                ids = [new_record_id() for _ in range(len(vectors_list))]
             if len(vectors_list) != len(ids):
                 raise ValueError("Number of vectors must match number of IDs")
             if metadata and len(metadata) != len(vectors_list):

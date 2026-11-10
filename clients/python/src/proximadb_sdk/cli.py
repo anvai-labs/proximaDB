@@ -350,7 +350,11 @@ def vectors() -> None:
     "--file", "-f", type=click.Path(exists=True), help="JSON file with vectors"
 )
 @click.option("--vector", "-v", help="Single vector as JSON array")
-@click.option("--id", "vector_id", help="Vector ID (for single vector)")
+@click.option(
+    "--id",
+    "vector_id",
+    help="Vector ID (single vector; a UUID is generated if omitted)",
+)
 @click.option("--metadata", "-m", help="Metadata as JSON object")
 @click.pass_context
 def insert_vectors(
@@ -388,9 +392,12 @@ def insert_vectors(
         elif vector:
             vec = json.loads(vector)
             meta = json.loads(metadata) if metadata else {}
-            vectors_data = [
-                {"id": vector_id or "auto", "vector": vec, "metadata": meta}
-            ]
+            record: dict[str, Any] = {"vector": vec, "metadata": meta}
+            # No --id: leave the key out so the SDK mints a UUID. The old
+            # literal "auto" made every ID-less insert overwrite the last.
+            if vector_id:
+                record["id"] = vector_id
+            vectors_data = [record]
         else:
             console.print("[red]Either --file or --vector is required.[/red]")
             sys.exit(1)

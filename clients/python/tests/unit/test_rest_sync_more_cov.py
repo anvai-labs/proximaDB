@@ -20,6 +20,7 @@ import pytest
 
 from proximadb_sdk.models import CollectionConfig
 from proximadb_sdk.protocols.rest_sync import ProximaDBClient
+from tests.unit._id_helpers import is_uuid as _is_uuid
 
 
 class FakeResp:
@@ -386,7 +387,8 @@ def test_insert_vectors_autogenerates_ids(monkeypatch):
     res = c.insert_vectors("cid", [[1.0, 2.0], [3.0, 4.0]])
     assert res.success == 2
     rec_ids = [r["id"] for r in _last(c)[2]["json"]["records"]]
-    assert rec_ids == ["record_0", "record_1"]
+    assert len(rec_ids) == 2 and all(_is_uuid(r) for r in rec_ids)
+    assert rec_ids[0] != rec_ids[1]
 
 
 def test_insert_vectors_dict_records(monkeypatch):

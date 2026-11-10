@@ -12,6 +12,8 @@ import base64
 import httpx
 import pytest
 
+from tests.unit._id_helpers import is_uuid as _is_uuid
+
 
 @pytest.fixture(autouse=True)
 def _fresh_event_loop():
@@ -665,7 +667,7 @@ def test_normalize_record_payload_typed_model_dump():
     )
     # model_dump result has a "value" key but no value_type/type -> type is None
     assert out["props"]["x"] == {"type": None, "value": 7}
-    assert out["id"] == "record_3"
+    assert _is_uuid(out["id"])
 
 
 def test_normalize_record_payload_missing_vector():

@@ -24,6 +24,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any
 
+from .._record_ids import new_record_id
 from ..exceptions import ProximaDBError
 from ..models import SearchResult, VectorOperationResponse, resolve_vector_ids
 from . import _grpc_v2_codec as _codec
@@ -331,7 +332,7 @@ class ProximaDBAsyncGrpcClient:
         """Vector-alias insert/upsert over the v2 record surface (aio)."""
         records = [
             {
-                "id": v.get("id") or v.get("oid") or f"record_{i}",
+                "id": v.get("id") or v.get("oid") or new_record_id(),
                 "vector": v.get("vector"),
                 "props": v.get("props") or v.get("metadata") or {},
             }

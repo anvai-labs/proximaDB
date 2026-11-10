@@ -43,6 +43,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from ._record_ids import new_record_id
 from .exceptions import ProximaDBNotSupportedError
 
 
@@ -564,7 +565,7 @@ class ProximaDBGraph:
                                 "Edge batch items must include from/to node IDs and edge type"
                             )
                         item = {
-                            "id": edge_dict.get("id", f"edge_{i + edge_offset}"),
+                            "id": edge_dict.get("id") or new_record_id(),
                             "from_node_id": from_node_id,
                             "to_node_id": to_node_id,
                             "edge_type": edge_type,
@@ -609,7 +610,7 @@ class ProximaDBGraph:
                         )
                     self._client.create_edge(
                         graph_id=self._graph_id,
-                        edge_id=edge_dict.get("id", f"edge_{i + edge_offset}"),
+                        edge_id=edge_dict.get("id") or new_record_id(),
                         from_node_id=from_node_id,
                         to_node_id=to_node_id,
                         edge_type=edge_type,

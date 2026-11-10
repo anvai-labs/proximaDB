@@ -19,6 +19,7 @@ from typing import Any
 
 import numpy as np
 
+from .._record_ids import new_record_id
 from ..models import (
     BatchResult,
     Collection,
@@ -376,7 +377,7 @@ class EmbeddedProtocolAdapter(RecordOpsMixin, BaseProtocolAdapter):
             else:
                 payload = ProtoConverter.vector_record_to_dict(vector)
 
-            ids.append(str(payload.get("id") or f"vec_{index}"))
+            ids.append(str(payload.get("id") or new_record_id()))
             vector_values.append(list(payload.get("vector") or []))
 
             metadata = dict(payload.get("metadata") or {})
