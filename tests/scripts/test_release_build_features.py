@@ -714,18 +714,21 @@ class ReleaseBuildFeaturesGuard(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
 
     def _mutate_one_features_entry(self, replacement: str) -> None:
-        """Rewrite ONE of the two live targets, leaving the other intact.
+        """Rewrite ONE of the live targets, leaving the others intact.
 
-        Mutating both would trip the `found == 0` safety net instead of the
-        value check, which is how an earlier revision looked guarded while
-        letting a single reverted target through.
+        Mutating all of them would trip the `found == 0` safety net instead of
+        the value check, which is how an earlier revision looked guarded while
+        letting a single reverted target through. Three live entries since the
+        macOS aarch64 DMG leg (TD-PKG-4); bumped BY HAND when a platform is
+        added — this count is a ratchet against silently feature-less targets.
         """
         p = self.tree / ".github/workflows/release.yml"
         text = p.read_text(encoding="utf-8")
-        # The Linux target also carries `vendored-openssl` (portable build), so
-        # match each live entry by its `cloud-full` prefix, not the exact value.
+        # The Linux + macOS targets also carry `vendored-openssl` (portable
+        # build), so match each live entry by its `cloud-full` prefix, not the
+        # exact value.
         entries = re.findall(r'^            features: "cloud-full[^"]*"\n', text, flags=re.M)
-        self.assertEqual(len(entries), 2)
+        self.assertEqual(len(entries), 3)
         p.write_text(text.replace(entries[-1], replacement + "\n", 1), encoding="utf-8")
 
     def test_rejects_every_empty_features_spelling(self) -> None:
@@ -1157,10 +1160,13 @@ class ReleaseBinaryReuseGuard(unittest.TestCase):
         self._fails_with("lost its fallback `cargo build --release`")
 
     def test_catches_an_archive_step_that_runs_after_a_fetch(self) -> None:
+        # The Unix archive step is additionally gated on matrix.archive ==
+        # 'tar.gz' since the DMG leg arrived; the mutation drops ONLY the
+        # fetch gate — the guard must still catch it.
         self._edit(
             self.REL,
-            "        if: steps.fetch.outcome != 'success' && runner.os != 'Windows'\n",
-            "        if: runner.os != 'Windows'\n",
+            "        if: steps.fetch.outcome != 'success' && runner.os != 'Windows' && matrix.archive == 'tar.gz'\n",
+            "        if: runner.os != 'Windows' && matrix.archive == 'tar.gz'\n",
         )
         self._fails_with("`Create Archive (Unix)` must be gated")
 
