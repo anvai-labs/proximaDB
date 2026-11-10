@@ -120,7 +120,7 @@ class Group:
         return name in self.exact or any(name.startswith(p) for p in self.prefix)
 
 
-_LANES = ("storage", "query", "graph", "cluster", "api")
+_LANES = ("storage", "query", "graph", "cluster", "api", "burndown")
 
 GROUPS: tuple[Group, ...] = (
     Group("rust-test", prefix=("Rust Tests (",)),
@@ -150,6 +150,7 @@ GROUPS: tuple[Group, ...] = (
     Group("rust-integration-test-graph", exact=("Rust Integration Tests (graph)",)),
     Group("rust-integration-test-cluster", exact=("Rust Integration Tests (cluster)",)),
     Group("rust-integration-test-api", exact=("Rust Integration Tests (api surface)",)),
+    Group("rust-integration-test-burndown", exact=("Rust Integration Tests (burn-down)",)),
     Group("object-store-emulator-tests", exact=("Object-store Cool tier (emulators)",)),
     Group(
         "object-store-restart-recovery",
