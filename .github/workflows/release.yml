@@ -560,8 +560,22 @@ jobs:
           bash scripts/check_linux_portability.sh rpm_build/usr/bin
           cp config/config.toml rpm_build/etc/proximadb/
           cp deploy/packaging/systemd/proximadb.service rpm_build/usr/lib/systemd/system/
+          cp deploy/packaging/scripts/preinstall.sh rpm_build/tmp/preinstall.sh
           cp deploy/packaging/scripts/postinstall.sh rpm_build/tmp/postinstall.sh
           cp deploy/packaging/scripts/preremove.sh rpm_build/tmp/preremove.sh
+
+          # Build-time attrs (TD-PKG-1, 2026-11-10): the contract dirs ship
+          # with their FINAL owner/mode in the payload (mode,user,group,path
+          # per dir, driven FROM the contract file — it stays the switch),
+          # and preinstall.sh creates the user in %pre BEFORE extraction so
+          # rpm can resolve the recorded names. postinstall's chown loop
+          # becomes a no-op on fresh installs (kept for deb-upgrade
+          # semantics — dpkg does not reset existing dir ownership).
+          source deploy/packaging/chown_dirs.env
+          RPM_ATTRS=()
+          for contract_dir in $CHOWN_DIRS; do
+            RPM_ATTRS+=(--rpm-attr "750,proximadb,proximadb,$contract_dir")
+          done
 
           fpm -s dir -t rpm \
             -n proximadb \
@@ -573,8 +587,10 @@ jobs:
             --vendor "ProximaDB" \
             --rpm-dist "el8" \
             --depends xz-libs \
+            --before-install rpm_build/tmp/preinstall.sh \
             --after-install rpm_build/tmp/postinstall.sh \
             --before-remove rpm_build/tmp/preremove.sh \
+            "${RPM_ATTRS[@]}" \
             rpm_build/=/
 
       # Release-review F4: same class as the v0.5.0 MSI bug — install the
@@ -588,27 +604,28 @@ jobs:
           VERSION="${{ needs.prepare.outputs.version }}"
           # Verifier body lives in deploy/packaging/scripts/verify_rpm.sh
           # (bash -n testable; mounted read-only via the repo checkout). It
-          # installs, asserts payload/version, tolerates ONLY the two
-          # by-design TD-PKG-1 state-dir deviations in rpm -V, and erases.
-          # bash -n catches PARSE errors only, not quoting/word-splitting
-          # defects (shellcheck covers those; the Packaging Scripts Lint
-          # lane in ci.yml runs it + actionlint when packaging scripts or
-          # the release workflows change).
+          # installs, asserts payload/version, REQUIRES a CLEAN rpm -V (the
+          # payload carries the state dirs' final attrs — build-time attrs,
+          # TD-PKG-1 2026-11-10), stat-asserts the installed dir attrs, and
+          # erases. bash -n catches PARSE errors only, not
+          # quoting/word-splitting defects (shellcheck covers those; the
+          # Packaging Scripts Lint lane in ci.yml runs it + actionlint when
+          # packaging scripts or the release workflows change).
           bash -n deploy/packaging/scripts/verify_rpm.sh
           bash -n deploy/packaging/scripts/verify_payload_common.sh
-          # The gate's OWN selftest replays the exact v0.6.0 failure output
-          # (positive fixture, no container needed) — and the NEGATIVE
-          # fixtures are exercised too: the gate must REJECT a dead-%post
-          # (clean rpm -V), a contract subset, and a foreign deviation.
+          bash -n deploy/packaging/scripts/preinstall.sh
+          # The gate's OWN selftest proves the flip: the positive fixture is
+          # a CLEAN rpm -V (accepted), and the NEGATIVE fixtures — the
+          # lost-attrs statelines, a contract subset, a foreign deviation —
+          # must ALL be REJECTED (the gate keys on emptiness).
           bash deploy/packaging/scripts/verify_rpm.sh selftest
-          VERIFY_RPM_DEV_FIXTURE="" bash deploy/packaging/scripts/verify_rpm.sh selftest \
-            >/dev/null 2>&1 && { echo "FATAL: dead-%post fixture was ACCEPTED"; exit 1; }
-          # contract-subset: default contract (2 dirs) but only ONE deviation
-          # in the fixture → n_matched(1) != n_expected(2) → gate rejects.
+          VERIFY_RPM_DEV_FIXTURE=$'.M...UG..    /var/lib/proximadb\n.M...UG..    /var/log/proximadb' \
+            bash deploy/packaging/scripts/verify_rpm.sh selftest \
+            >/dev/null 2>&1 && { echo "FATAL: lost-attrs fixture was ACCEPTED"; exit 1; }
           VERIFY_RPM_DEV_FIXTURE=$'.M...UG..    /var/lib/proximadb' \
             bash deploy/packaging/scripts/verify_rpm.sh selftest \
             >/dev/null 2>&1 && { echo "FATAL: contract-subset fixture was ACCEPTED"; exit 1; }
-          VERIFY_RPM_DEV_FIXTURE=$'.M...UG..    /var/lib/proximadb\n.M...UG..    /var/log/proximadb\n..5......    /usr/bin/proximadb-server' \
+          VERIFY_RPM_DEV_FIXTURE=$'..5......    /usr/bin/proximadb-server' \
             bash deploy/packaging/scripts/verify_rpm.sh selftest \
             >/dev/null 2>&1 && { echo "FATAL: foreign-deviation fixture was ACCEPTED"; exit 1; }
           docker run --rm -v "$PWD:/pkg:ro" rockylinux:8 \
@@ -667,6 +684,7 @@ jobs:
           bash scripts/check_linux_portability.sh deb_build/usr/bin
           cp config/config.toml deb_build/etc/proximadb/
           cp deploy/packaging/systemd/proximadb.service deb_build/lib/systemd/system/
+          cp deploy/packaging/scripts/preinstall.sh deb_build/tmp/preinstall.sh
           cp deploy/packaging/scripts/postinstall.sh deb_build/tmp/postinstall.sh
           cp deploy/packaging/scripts/preremove.sh deb_build/tmp/preremove.sh
 
@@ -681,6 +699,7 @@ jobs:
             --vendor "ProximaDB" \
             --deb-priority "optional" \
             --depends liblzma5 \
+            --before-install deb_build/tmp/preinstall.sh \
             --after-install deb_build/tmp/postinstall.sh \
             --before-remove deb_build/tmp/preremove.sh \
             deb_build/=/
