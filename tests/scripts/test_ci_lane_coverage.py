@@ -125,6 +125,25 @@ class RunBlockExtraction(unittest.TestCase):
                 )
 
 
+class InlineForLoop(unittest.TestCase):
+    """`for t in a b; do` on one line must certify every listed stem (it was
+    invisible: the api-surface lane's targets were baselined as never-run)."""
+
+    def test_inline_for_list_certifies_each_word(self):
+        text = (
+            "for test_name in tst_integration_test external_collection_index_in_place_test; do\n"
+            '  cargo test --test "$test_name"\n'
+            "done\n"
+        )
+        for stem in ("tst_integration_test", "external_collection_index_in_place_test"):
+            self.assertTrue(guard.is_covered(stem, f"{stem}.rs", text, []), stem)
+
+    def test_word_outside_a_for_header_does_not_certify(self):
+        text = 'echo "skipping tst_integration_test for now"\nfor t in other_test; do\n'
+        self.assertFalse(guard.is_covered("tst_integration_test", "tst_integration_test.rs", text, []))
+        self.assertFalse(guard.is_covered("other", "other.rs", text, []))
+
+
 class BaselineRatchet(unittest.TestCase):
     def test_new_uncovered_fails(self):
         tree = GuardTree(

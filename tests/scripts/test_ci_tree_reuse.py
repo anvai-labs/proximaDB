@@ -73,6 +73,7 @@ JOB_NAMES = [
     "Rust Integration Tests (graph)",
     "Rust Integration Tests (cluster)",
     "Rust Integration Tests (api surface)",
+    "Rust Integration Tests (burn-down)",
     "Object-store Cool tier (emulators)",
     "Object-store restart recovery (Azurite)",
     "MLflow conformance (real client)",
