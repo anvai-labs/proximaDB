@@ -61,10 +61,14 @@ def _successful_write_count(result: Any, total_count: int) -> int:
     into a reported failure); anything non-int/non-tuple counts as full
     success.
     """
+    # bool is an int subclass in Python — a success FLAG (True/False) must
+    # not count as 1/0 processed records
+    if isinstance(result, bool):
+        return total_count if result else 0
     if isinstance(result, tuple):
-        parts = [p for p in result if isinstance(p, int)]
+        parts = [p for p in result if isinstance(p, int) and not isinstance(p, bool)]
         return sum(parts) if parts else total_count
-    if isinstance(result, int):
+    if isinstance(result, int) and not isinstance(result, bool):
         return result
     return total_count
 
@@ -441,15 +445,7 @@ class EmbeddedProtocolAdapter(RecordOpsMixin, BaseProtocolAdapter):
                 ),
             )
 
-        if isinstance(result, tuple):
-            # upsert/upsert_numpy contract: every tuple element is a
-            # successful-write category (inserted, updated, …) — sum them
-            # all, matching upsert_records' counting
-            successful_count = _successful_write_count(result, total_count)
-        elif isinstance(result, int):
-            successful_count = result
-        else:
-            successful_count = total_count
+        successful_count = _successful_write_count(result, total_count)
         failed_count = max(total_count - successful_count, 0)
         return VectorOperationResponse(
             success=True,
