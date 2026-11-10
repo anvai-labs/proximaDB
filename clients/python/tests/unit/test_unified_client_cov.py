@@ -23,6 +23,7 @@ from proximadb_sdk.models import (
     VectorOperationResponse,
     VectorRecord,
 )
+from tests.unit._id_helpers import is_uuid as _is_uuid
 
 
 def _delete_resp():
@@ -3169,16 +3170,6 @@ def test_logout_with_auth():
     assert c.logout() is True
     auth.logout.side_effect = RuntimeError("x")
     assert c.logout() is False
-
-
-def _is_uuid(value):
-    """Default record ids are UUID4s (an index-based default overwrote)."""
-    import uuid
-
-    try:
-        return str(uuid.UUID(str(value))) == str(value)
-    except ValueError:
-        return False
 
 
 def test_idless_inserts_get_distinct_ids_across_calls():

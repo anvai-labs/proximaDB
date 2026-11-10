@@ -22,6 +22,7 @@ from proximadb_sdk.v1 import (
     vector_types_pb2,
 )
 from proximadb_sdk.v2 import record_pb2
+from tests.unit._id_helpers import is_uuid as _is_uuid
 
 
 # --------------------------------------------------------------------------
@@ -960,13 +961,3 @@ def test_convert_search_result_from_proto(rest_client):
     assert out["id"] == "r1"
     assert out["score"] == pytest.approx(0.7)
     assert out["vector"] == [pytest.approx(0.1)]
-
-
-def _is_uuid(value):
-    """Default record ids are UUID4s (an index-based default overwrote)."""
-    import uuid
-
-    try:
-        return str(uuid.UUID(str(value))) == str(value)
-    except ValueError:
-        return False

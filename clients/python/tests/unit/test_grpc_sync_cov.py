@@ -16,6 +16,7 @@ from proximadb.v2 import record_pb2 as r
 from proximadb_sdk.exceptions import ProximaDBError
 from proximadb_sdk.v1 import collection_types_pb2 as c
 from proximadb_sdk.v1 import types_pb2 as v1_types
+from tests.unit._id_helpers import is_uuid as _is_uuid
 
 
 # --------------------------------------------------------------------------- #
@@ -1108,13 +1109,3 @@ def test_convert_path_from_proto(client):
 
     assert client._convert_path_from_proto(FakePath()) == ["n1", "n2"]
     assert client._convert_path_from_proto(object()) == []
-
-
-def _is_uuid(value):
-    """Default record ids are UUID4s (an index-based default overwrote)."""
-    import uuid
-
-    try:
-        return str(uuid.UUID(str(value))) == str(value)
-    except ValueError:
-        return False

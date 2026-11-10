@@ -20,6 +20,7 @@ import pytest
 
 from proximadb_sdk.models import CollectionConfig
 from proximadb_sdk.protocols.rest_sync import ProximaDBClient
+from tests.unit._id_helpers import is_uuid as _is_uuid
 
 
 class FakeResp:
@@ -956,13 +957,3 @@ def test_update_vector_empty_vector_list_when_none_metadata(monkeypatch):
     # vector provided but metadata None -> props {} path
     res = c.update_vector("cid", "v1", vector=[1.0, 2.0])
     assert res.success == 1
-
-
-def _is_uuid(value):
-    """Default record ids are UUID4s (an index-based default overwrote)."""
-    import uuid
-
-    try:
-        return str(uuid.UUID(str(value))) == str(value)
-    except ValueError:
-        return False

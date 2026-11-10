@@ -12,6 +12,8 @@ import base64
 import httpx
 import pytest
 
+from tests.unit._id_helpers import is_uuid as _is_uuid
+
 
 @pytest.fixture(autouse=True)
 def _fresh_event_loop():
@@ -1439,13 +1441,3 @@ def test_async_context_manager(monkeypatch):
         return started["v"]
 
     assert run(go()) == 11
-
-
-def _is_uuid(value):
-    """Default record ids are UUID4s (an index-based default overwrote)."""
-    import uuid
-
-    try:
-        return str(uuid.UUID(str(value))) == str(value)
-    except ValueError:
-        return False

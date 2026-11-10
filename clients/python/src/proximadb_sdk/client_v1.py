@@ -359,7 +359,10 @@ class ProximaDBClientV1:
             payload = dict(record)
             if "props" not in payload and "metadata" in payload:
                 payload["props"] = payload.pop("metadata")
-            payload.setdefault("id", payload.get("oid") or new_record_id())
+            # Falsy check, not setdefault: {"id": None} / {"id": ""} must
+            # also get a fresh id (setdefault kept them).
+            if not payload.get("id"):
+                payload["id"] = payload.get("oid") or new_record_id()
             # `oid` is a client-side seeding value, not a contract field —
             # drop it once it has seeded `id`. Other unknown keys are left
             # IN deliberately: the server's deny_unknown_fields (TD-REC-1)
