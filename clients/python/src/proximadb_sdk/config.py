@@ -101,6 +101,16 @@ class ClientConfig(BaseModel):
     port_mode: PortMode = Field(
         default=PortMode.UNIFIED, description="Server port mode (unified or multi)"
     )
+    grpc_port: int | None = Field(
+        default=None,
+        ge=1,
+        le=65535,
+        description=(
+            "gRPC port in multi-port mode (default: a grpc:// URL's port, else "
+            "5679). Ignored in unified mode, where every protocol shares the "
+            "URL's port."
+        ),
+    )
     uds_path: str | None = Field(
         default=None,
         description=(
@@ -355,12 +365,19 @@ class ClientConfig(BaseModel):
             else:
                 return f"{scheme}://{host}:{port}"
 
-        # Multi-port mode (legacy): different ports for each protocol
-        # Note: In unified mode (default), all protocols share port 5678
+        # Multi-port mode (legacy): a separate port per protocol.
         if target_protocol == Protocol.REST:
             port = 5678  # REST API port
         elif target_protocol == Protocol.GRPC:
-            port = 5679  # Legacy gRPC API port (use unified mode for single port)
+            # The configured gRPC port wins; else a grpc:// URL's own port
+            # (that URL names the gRPC endpoint); else the legacy 5679. This
+            # was hardcoded to 5679, so --grpc-port never took effect.
+            if self.grpc_port is not None:
+                port = self.grpc_port
+            elif scheme in ("grpc", "grpcs") and parsed.port:
+                port = parsed.port
+            else:
+                port = 5679
         elif target_protocol == Protocol.ARROW_FLIGHT:
             port = 5680  # Legacy Arrow Flight port (use unified mode for single port)
         else:

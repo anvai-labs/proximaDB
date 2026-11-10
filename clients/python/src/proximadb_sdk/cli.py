@@ -68,11 +68,9 @@ def _fail_if_unreachable(host: str, rest_port: int, timeout: float = 30.0) -> No
     failures (connect refused, timeout, DNS) trigger the exit.
 
     Scope: the probe validates the REST/unified port (the CLI default and
-    the client's URL base). Split-port gRPC-only deployments where REST is
-    down but gRPC lives will see exit 2; conversely the SDK's MULTI-mode
-    gRPC dial hardcodes 5679 regardless of --grpc-port (pre-existing SDK
-    behavior, queued as the split-port client param follow-up) - the
-    never-fake-success guarantee holds for the default invocation.
+    the client's URL base). In split-port mode the client dials --grpc-port
+    for gRPC (ClientConfig.grpc_port), but the probe still checks only REST:
+    a deployment with REST down and gRPC up exits 2.
     """
     import httpx
 
@@ -107,11 +105,15 @@ def get_client(
     """
     _fail_if_unreachable(host, rest_port, timeout)
     mode = PortMode.MULTI if int(grpc_port) != int(rest_port) else PortMode.UNIFIED
+    # In split-port mode the gRPC client must dial --grpc-port; before
+    # ClientConfig.grpc_port existed it always dialled :5679 (#2487 review).
+    extra = {"grpc_port": int(grpc_port)} if mode == PortMode.MULTI else {}
     return UnifiedProximaDBClient(
         url=f"http://{host}:{rest_port}",
         protocol=protocol,
         port_mode=mode,
         timeout=timeout,
+        **extra,
     )
 
 
