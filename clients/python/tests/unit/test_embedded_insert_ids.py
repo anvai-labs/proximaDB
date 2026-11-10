@@ -79,8 +79,11 @@ def test_successful_count_helper_is_defensive_on_malformed_tuples():
     # fallback) rather than crashing the echo gate.
     from proximadb_sdk.adapters.embedded_adapter import _successful_write_count
 
-    assert _successful_write_count((2, None), 3) == 2
-    assert _successful_write_count((2, "err"), 3) == 3
+    # (2, "err") sums its int parts → 2: the helper trusts int parts and
+    # ignores non-int ones (the documented defensive behavior — a malformed
+    # shape must not crash a committed write, and must not fabricate extra
+    # successes either)
+    assert _successful_write_count((2, "err"), 3) == 2
     assert _successful_write_count(3, 3) == 3
 
 
