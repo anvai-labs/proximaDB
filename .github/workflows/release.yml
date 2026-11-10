@@ -591,10 +591,9 @@ jobs:
           # installs, asserts payload/version, tolerates ONLY the two
           # by-design TD-PKG-1 state-dir deviations in rpm -V, and erases.
           # bash -n catches PARSE errors only, not quoting/word-splitting
-          # defects (shellcheck would; TODO: an actionlint/yamllint+shellcheck
-          # lane for release.yml and deploy/packaging/scripts is still
-          # missing — the deleted-upload-header parse break on this very
-          # branch reached GitHub before any local check).
+          # defects (shellcheck covers those; the Packaging Scripts Lint
+          # lane in ci.yml runs it + actionlint when packaging scripts or
+          # the release workflows change).
           bash -n deploy/packaging/scripts/verify_rpm.sh
           bash -n deploy/packaging/scripts/verify_payload_common.sh
           # The gate's OWN selftest replays the exact v0.6.0 failure output

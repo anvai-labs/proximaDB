@@ -162,6 +162,7 @@ jobs:
       sdk_docs: ${{ steps.filter.outputs.sdk_docs }}
       ui: ${{ steps.filter.outputs.ui }}
       docker: ${{ steps.filter.outputs.docker }}
+      packaging_scripts: ${{ steps.filter.outputs.packaging_scripts }}
       docs: ${{ steps.filter.outputs.docs }}
       docs_site: ${{ steps.filter.outputs.docs_site }}
       td_citations: ${{ steps.filter.outputs.td_citations }}
@@ -352,6 +353,10 @@ jobs:
               - 'deploy/docker/**'
               - '.dockerignore'
               - '.github/workflows/ci.yml'
+            packaging_scripts:
+              - 'deploy/packaging/**'
+              - '.github/workflows/release.yml'
+              - '.github/workflows/release-smoke.yml'
             docs:
               - 'docs/**'
               - '*.adoc'
@@ -1759,6 +1764,28 @@ jobs:
             src/proximadb_sdk/proto_conversion.py \
             src/proximadb_sdk/integrations/ \
             || echo "::warning::mypy type checking found issues"
+
+  # ShellCheck + actionlint on the packaging gate scripts and the release
+  # workflows. The v0.6.0/v0.6.1 release cycles burned two dispatches on a
+  # quoting defect and a parse break in release.yml that local checks could
+  # not see (the lane TODO in release.yml). Runs when the packaging gate
+  # scripts, the release workflows, or this CI definition change.
+  packaging-lint:
+    name: Packaging Scripts Lint
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    needs: changes
+    if: needs.changes.outputs.sweep == 'true' || needs.changes.outputs.packaging_scripts == 'true'
+    steps:
+      - uses: actions/checkout@v7
+      - name: Run shellcheck on packaging scripts
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          find deploy/packaging/scripts -name '*.sh' -print0 | xargs -0 shellcheck --severity=warning
+      - name: Run actionlint on the release workflows
+        run: |
+          bash <(curl https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash)
+          ./actionlint -color .github/workflows/release.yml .github/workflows/release-smoke.yml .github/workflows/ci.yml
 
   go-lint:
     name: Go SDK Lint
