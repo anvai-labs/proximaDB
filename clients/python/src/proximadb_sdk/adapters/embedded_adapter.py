@@ -400,11 +400,11 @@ class EmbeddedProtocolAdapter(RecordOpsMixin, BaseProtocolAdapter):
 
         The embedded binding's write contract: insert/insert_numpy return a
         processed count (int); upsert/upsert_numpy return an (inserted,
-        updated) tuple. THE ECHO POLICY LIVES HERE (the alias sites consume
-        the gate's output via BatchResult.inserted_ids through
-        _batch_result_from_vector_response): the client-supplied id echo is
-        emitted ONLY on full success — a partial echo would list records
-        the server rejected.
+        updated) tuple. THE ECHO POLICY LIVES HERE AND ONLY HERE: the
+        client-supplied id echo is emitted ONLY on full success — a partial
+        echo would list records the server rejected. Consumers read it as
+        BatchResult.inserted_ids (via _batch_result_from_vector_response)
+        and as VectorOperationResponse.vector_ids on the alias paths.
         """
         duration_ms = (time.time() - start_time) * 1000
         if error is not None:
@@ -453,17 +453,18 @@ class EmbeddedProtocolAdapter(RecordOpsMixin, BaseProtocolAdapter):
         upsert: bool,
     ) -> VectorOperationResponse:
         start_time = time.time()
+        # empty batch: REST insert_records([]) answers BatchResult(success=0)
+        # without a request — match that falsy shape (a caller checking
+        # `if resp.success:` must see the same thing on every transport).
+        # ids-without-vectors is a caller bug: it fails at the binding's own
+        # length check, surfaced as a failed response — not masked here.
         if len(vectors) == 0 and len(ids) == 0:
-            # empty batch: a legal no-op on REST/gRPC (total=0, success=0) —
-            # match them instead of raising on the np.asarray shape check.
-            # MISMATCHED ids/vectors lengths still fall through to the
-            # binding's own rejection (a caller bug must not be masked).
             return self._build_vector_operation_response(
                 operation,
                 0,
                 start_time,
                 0,
-                vector_ids=[],
+                vector_ids=list(ids),
             )
         vector_array = np.asarray(vectors, dtype=np.float32)
         if vector_array.ndim != 2:
@@ -636,7 +637,7 @@ class EmbeddedProtocolAdapter(RecordOpsMixin, BaseProtocolAdapter):
                 successful = (
                     sum(int(part) for part in result)
                     if isinstance(result, tuple)
-                    else len(records)
+                    else (result if isinstance(result, int) else len(records))
                 )
                 failed = max(len(records) - successful, 0)
                 return BatchResult(
