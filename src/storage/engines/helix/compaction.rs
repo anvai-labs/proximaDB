@@ -711,10 +711,14 @@ impl LeveledCompactor {
 
             // Filter out expired records (physical delete during compaction)
             for record in block.records {
-                // Canonical predicate (ns). This compared `valid_to_ns` (ns)
+                // Canonical 16a predicate (ns). This compared `valid_to_ns` (ns)
                 // against a SECONDS clock, so TTL-expired records were never
-                // physically removed (only Some(0) tombstones were).
-                if record.is_dead(now_ns) {
+                // physically removed (only Some(0) tombstones were). A physical
+                // delete uses exactly `is_record_dead`, not the broader
+                // `ProximaRecord::is_dead` (which is also true for a not-yet-valid
+                // `valid_from_ns`), so compaction never drops a row that is
+                // merely not visible yet.
+                if proximadb_records::is_record_dead(record.valid_to_ns, now_ns) {
                     debug!(
                         "Filtering dead record: {} (valid_to_ns {:?})",
                         record.oid, record.valid_to_ns
