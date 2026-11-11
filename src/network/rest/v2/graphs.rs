@@ -330,8 +330,12 @@ pub async fn impact_analysis_v2(
         "v2 graph impact-analysis"
     );
 
+    // Structural tenant isolation: scope through `for_tenant` like every other
+    // graph read (the handler used to pass the bare id, so a named tenant read
+    // the default tenant's same-named graph).
     let response = state
         .graph_operations_service
+        .for_tenant(&tenant.tenant_id)
         .impact_analysis(
             &graph_id,
             &request.node_id,
@@ -341,7 +345,14 @@ pub async fn impact_analysis_v2(
             request.limit,
         )
         .await
-        .map_err(|error| ApiError::Internal(format!("impact analysis failed: {error}")))?;
+        .map_err(|error| {
+            // A never-created graph is a 404, not a 500.
+            if error.is_not_found() {
+                ApiError::NotFound(format!("impact analysis: {error}"))
+            } else {
+                ApiError::Internal(format!("impact analysis failed: {error}"))
+            }
+        })?;
 
     Ok(Json(ImpactAnalysisResponse {
         node_ids: response.nodes.into_iter().map(|n| n.id).collect(),

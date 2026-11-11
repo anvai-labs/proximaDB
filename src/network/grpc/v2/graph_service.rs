@@ -1617,7 +1617,10 @@ mod tests {
         );
         // Typed, not just worded: callers match the variant, so a wrapping
         // `.context()` cannot hide it (TD-LANECOV-1 review).
-        assert!(err.is_not_found(), "expected the typed not-found, got: {err}");
+        assert!(
+            err.is_not_found(),
+            "expected the typed not-found, got: {err}"
+        );
         // ...and the failed read provisioned nothing for globex.
         let graphs = graph.list_graphs().await?;
         assert!(
