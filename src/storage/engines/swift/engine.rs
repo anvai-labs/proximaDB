@@ -1586,6 +1586,9 @@ impl UnifiedStorageFormat for SwiftEngine {
                                 score: scored.similarity,
                                 similarity: Some(scored.similarity),
                                 vector: None, // AXIS doesn't return vectors by default
+                                // Carry the TTL so the service dead filter and the query
+                                // cache's earliest-expiry see it (TD-QCACHE-TTL-1).
+                                valid_to_ns: scored.valid_to_ns(),
                                 ..Default::default()
                             })
                             .collect();
