@@ -57,10 +57,11 @@
 #   └─────────────────────────────────────────────────────────────────────────┘
 #
 # EXPECTED ARTIFACTS:
-#   Binaries (3 targets; macOS aarch64 DMG re-enabled 0.6.2, TD-PKG-4):
+#   Binaries (2 hosted targets + the macOS DMG via local-build/manual-attach,
+#   TD-PKG-4 — hosted macOS jobs are auto-cancelled by org policy):
 #     - proximadb-{version}-x86_64-unknown-linux-gnu.tar.gz
 #     - proximadb-{version}-x86_64-pc-windows-msvc.zip
-#     - proximadb-{version}-aarch64-apple-darwin.dmg
+#     - proximadb-{version}-aarch64-apple-darwin.dmg  (attached post-publish)
 #
 #   Python Wheels are NOT built here. The pure-Python SDK (`proximadb`) and the
 #   native embedded engine (`proximadb_embedded`, one abi3 wheel per platform,
@@ -77,7 +78,8 @@
 # v0.2.0 SCOPE:
 #   - Only x86_64-linux-gnu and x86_64-windows are built
 #   - musl, aarch64-linux targets disabled due to cross-compilation issues
-#   - macOS DMG re-enabled in 0.6.2 (native macos-14 arm64 leg; TD-PKG-4)
+#   - macOS DMG: local-build + manual-attach (TD-PKG-4) — hosted macOS
+#     legs are auto-cancelled by org policy
 #   - Python packages are pure Python (no Rust wheels)
 #
 # MANUAL RELEASE PROCESS:
@@ -292,19 +294,21 @@ jobs:
           #   features: ""
           #   cross: true
 
-          # macOS aarch64 (Apple Silicon) - RE-ENABLED (user-directed, 0.6.2).
-          # The v0.2.0 disable blamed ring 0.17.14 CPU-feature detection on
-          # CI macOS runners; ring is still 0.17.14, but this leg now builds
-          # NATIVELY on a macos-14 (arm64) runner — the first dry_run proves
-          # it end to end. If ring still fails there, TD-PKG-4 records the
-          # fallback options (ring/rustls upgrade pin). Distribution is
-          # ad-hoc codesigned; Developer ID + notarization is TD-PKG-4's open
-          # question (needs Apple credentials).
-          - target: aarch64-apple-darwin
-            os: macos-14
-            archive: dmg
-            features: "cloud-full,vendored-openssl"
-            cache_prefix: "v1-rust-aarch64-apple-darwin"
+          # macOS aarch64 (Apple Silicon) - REMOVED from the hosted matrix
+          # (2026-11-11): the org auto-cancels hosted macOS jobs ~1s after
+          # they start (three consecutive attempts on the v0.7.0 run, each
+          # before a runner was ever claimed), so the leg can never complete
+          # here. The DMG ships via the LOCAL-build + manual-attach path
+          # instead — the exact recipe (binaries + README/LICENSE + config,
+          # ad-hoc codesign, hdiutil UDZO, sha256) is documented and
+          # machine-proven in TD-PKG-4; the built DMG is attached to the
+          # GitHub Release with `gh release upload` after this run publishes.
+          # Re-add this entry if hosted macOS runners are ever allowed.
+          # - target: aarch64-apple-darwin
+          #   os: macos-14
+          #   archive: dmg
+          #   features: "cloud-full,vendored-openssl"
+          #   cache_prefix: "v1-rust-aarch64-apple-darwin"
 
           # Windows x86_64
           - target: x86_64-pc-windows-msvc
@@ -440,38 +444,13 @@ jobs:
 
           echo "ARCHIVE_NAME=${ARCHIVE_NAME}.tar.gz" >> "$GITHUB_ENV"
 
-      # macOS ships a .dmg (user-directed): server + bench + migrate binaries,
-      # README/LICENSE, and the config template in one drag-install volume.
-      - name: Create DMG (macOS)
-        if: steps.fetch.outcome != 'success' && runner.os == 'macOS' && matrix.archive == 'dmg'
-        run: |
-          VERSION="${{ needs.prepare.outputs.version }}"
-          TARGET="${{ matrix.target }}"
-          VOLDIR="proximadb-${VERSION}-${TARGET}"
-
-          mkdir -p "${VOLDIR}/config"
-          cp "target/${TARGET}/release/proximadb-server" "${VOLDIR}/"
-          cp "target/${TARGET}/release/proximadb-bench" "${VOLDIR}/"
-          cp "target/${TARGET}/release/proximadb-migrate" "${VOLDIR}/"
-          cp README.adoc LICENSE "${VOLDIR}/" 2>/dev/null || true
-          cp config/config.toml "${VOLDIR}/config/"
-
-          # Ad-hoc codesign (no Apple credentials in the pipeline): on arm64,
-          # a fully unsigned binary downloaded from the internet can be
-          # reported by Gatekeeper as damaged rather than merely unverified.
-          # Ad-hoc does NOT make the DMG notarized — these are bare Mach-O
-          # executables (no .app bundle), so first launch needs
-          # `xattr -d com.apple.quarantine` or the System Settings override.
-          # Developer ID + notarization: TD-PKG-4.
-          for macos_bin in proximadb-server proximadb-bench proximadb-migrate; do
-            codesign --sign - --force "${VOLDIR}/${macos_bin}"
-          done
-
-          hdiutil create -volname "proximadb ${VERSION}" -srcfolder "${VOLDIR}" \
-            -ov -format UDZO "proximadb-${VERSION}-${TARGET}.dmg"
-          shasum -a 256 "proximadb-${VERSION}-${TARGET}.dmg" \
-            > "proximadb-${VERSION}-${TARGET}.dmg.sha256"
-          echo "ARCHIVE_NAME=proximadb-${VERSION}-${TARGET}.dmg" >> "$GITHUB_ENV"
+      # The macOS DMG is NOT built here (hosted macOS jobs are auto-cancelled
+      # by org policy — see the commented matrix entry above). It is built on
+      # an Apple-Silicon Mac by the exact recipe in TD-PKG-4 (proven end to
+      # end on the v0.7.0 release) and attached to the GitHub Release with
+      # `gh release upload` after this run publishes. Keep the Create
+      # Archive (Unix) step gated on matrix.archive == 'tar.gz' so the gate
+      # survives the leg's return.
 
       - name: Create Archive (Windows)
         if: steps.fetch.outcome != 'success' && runner.os == 'Windows'
@@ -932,8 +911,10 @@ jobs:
           EXPECTED_BINARIES=(
             "proximadb-${VERSION}-x86_64-unknown-linux-gnu.tar.gz"
             "proximadb-${VERSION}-x86_64-pc-windows-msvc.zip"
-            "proximadb-${VERSION}-aarch64-apple-darwin.dmg"
           )
+          # The macOS DMG is NOT built by this run (hosted macOS jobs are
+          # auto-cancelled by org policy) — it ships via the local-build +
+          # manual-attach path (TD-PKG-4) and must NOT be required here.
 
           BINARY_COUNT=0
           BINARY_MISSING=0
@@ -1010,12 +991,14 @@ jobs:
 
           echo "  RPM packages: $RPM_COUNT (expected >= 1)"
           echo "  DEB packages: $DEB_COUNT (expected >= 1)"
-          echo "  DMG installers: $DMG_COUNT (expected >= 1 -- macOS aarch64, TD-PKG-4)"
+          echo "  DMG installers: $DMG_COUNT (attached separately after publish — local build, TD-PKG-4)"
           echo "  MSI installers: $MSI_COUNT (expected >= 1)"
           echo ""
 
-          # All four platform packages are required (DMG since macOS 0.6.2;
-          # the EXPECTED_BINARIES loop above enforces it too).
+          # RPM, DEB and MSI are required. The DMG is NOT required from this
+          # run: hosted macOS jobs are auto-cancelled by org policy, so the
+          # DMG ships via the local-build + `gh release upload` path
+          # (TD-PKG-4) and lands on the release after this run publishes.
           if [ "$RPM_COUNT" -lt 1 ] || [ "$DEB_COUNT" -lt 1 ] || [ "$MSI_COUNT" -lt 1 ]; then
             echo "  [WARNING] Missing required platform packages (RPM, DEB, or MSI)"
             VALIDATION_PASSED=false
