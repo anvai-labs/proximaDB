@@ -27,6 +27,7 @@ if [ "${1:-}" = "selftest" ]; then
     read_contract_dirs "$SCRIPT_DIR/../chown_dirs.env"
 else
     SELFTEST=0
+    # shellcheck disable=SC2034  # VER is consumed by assert_version() in verify_payload_common.sh (sourced below)
     VER="${1:?real-branch usage: verify_deb.sh <version>}"
     apt-get update -qq
     apt-get install -y -qq /pkg/proximadb_*_amd64.deb

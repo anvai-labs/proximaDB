@@ -27,11 +27,25 @@
 
 use super::Result;
 use crate::graph::engines::GraphEngine;
+use crate::proto::proximadb_v1::GraphCollection;
 use proximadb_kernel::error::ProximaDBError;
 use std::sync::Arc;
 
 impl super::GraphOperationsService {
     /// Get or create a graph engine for the specified graph ID
+    /// Engine for a CREATING write (create/batch-create, transactions, adding
+    /// a schema constraint): provisions the graph collection on first use.
+    ///
+    /// Lazily provisioning under this (possibly tenant-scoped) key means a
+    /// tenant-scoped first write (`for_tenant` composes `{tenant}/{graph_id}`)
+    /// auto-registers its collection instead of failing "does not exist",
+    /// making named-tenant graph create->use work without an out-of-band bare
+    /// create (TD-GRAPH-TENANT-1). The default tenant stays bare, so its
+    /// explicitly-created collections are found, not recreated.
+    ///
+    /// Reads and mutations of existing data must use
+    /// [`Self::get_existing_graph_engine`] instead: provisioning on a read
+    /// made a lookup in a mistyped graph silently create and register it.
     pub async fn get_or_create_graph_engine(
         &self,
         graph_id: &str,
@@ -39,17 +53,41 @@ impl super::GraphOperationsService {
         if let Some(engine) = self.graphs.get(graph_id) {
             return Ok(Arc::clone(&engine));
         }
-
-        // Get — or lazily provision — the graph collection under this (possibly tenant-scoped)
-        // key. A tenant-scoped first write (`for_tenant` composes `{tenant}/{graph_id}`) thus
-        // auto-registers its collection instead of failing "does not exist", making named-tenant
-        // graph create→use functional without an out-of-band bare create (TD-GRAPH-TENANT-1). The
-        // default tenant stays bare, so its explicitly-created collections are found, not recreated.
         let collection = self
             .collection_service
             .ensure_or_create_graph(graph_id)
             .await?;
+        self.open_graph_engine(graph_id, &collection).await
+    }
 
+    /// Engine for a READ or a mutation of existing data. Never provisions:
+    /// a graph that was never created is an error ("Graph collection '...'
+    /// not found", surfaced as NOT_FOUND), not an empty graph created as a
+    /// side effect of the lookup.
+    pub async fn get_existing_graph_engine(
+        &self,
+        graph_id: &str,
+    ) -> Result<Arc<crate::graph::engines::GraphEngineImpl>> {
+        if let Some(engine) = self.graphs.get(graph_id) {
+            return Ok(Arc::clone(&engine));
+        }
+        let Some(collection) = self.collection_service.get_graph(graph_id).await? else {
+            // Same wording as `update_graph_schema` (service.rs): the message-based
+            // gRPC / entity mappers check "not found" before "invalid", so this
+            // surfaces as NOT_FOUND on the wire.
+            return Err(ProximaDBError::InvalidInput(format!(
+                "Graph collection '{graph_id}' not found"
+            )));
+        };
+        self.open_graph_engine(graph_id, &collection).await
+    }
+
+    /// Open (and cache) the engine for an existing graph collection.
+    async fn open_graph_engine(
+        &self,
+        graph_id: &str,
+        collection: &GraphCollection,
+    ) -> Result<Arc<crate::graph::engines::GraphEngineImpl>> {
         // Determine engine type and storage ROOT URL
         let engine_type_str = collection
             .engine_config

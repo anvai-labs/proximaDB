@@ -408,6 +408,21 @@ impl BranchBaseStore {
             !self.wal.has_partition_drop_after(collection, *mark)
         });
 
+        // TD-SEAM-12-F5: Bootstrap detection. When generation == 0 and
+        // retained_from > 0, this deployment's WAL was truncated before
+        // merge-base tracking started. We're bootstrapping for the first time.
+        // Note: we check retained_from (not state.tracked_from) because when
+        // generation == 0, tracked_from is always 0 (set together during replay).
+        let is_bootstrap = state.generation == 0 && retained_from > 0;
+        if is_bootstrap {
+            tracing::info!(
+                tracked_from = state.tracked_from,
+                retained_from,
+                collections = summary.collections.len(),
+                "TD-SEAM-12-F5: bootstrapping merge-base images for deployment with pre-tracking truncation"
+            );
+        }
+
         let mut images = BTreeMap::new();
         for collection in &summary.collections {
             let (mut image, fresh) = match state.base_for(collection, retained_from) {
@@ -436,6 +451,19 @@ impl BranchBaseStore {
                     {
                         (MergeBaseImage::default(), true)
                     } else {
+                        // TD-SEAM-12-F5: During bootstrap, collections without
+                        // retained branch entries get truncation marks so their
+                        // merges refuse (410) — fail closed. This handles the
+                        // case where a collection had history before tracking
+                        // started but no branch entries in the retained WAL.
+                        if is_bootstrap && !truncated.contains_key(collection) {
+                            truncated.insert(collection.clone(), retained_from);
+                            tracing::debug!(
+                                collection = %collection.collection,
+                                tenant = ?collection.tenant,
+                                "TD-SEAM-12-F5: marking collection with incomplete history during bootstrap"
+                            );
+                        }
                         // Its base is truly gone or incomplete: stays unimaged and
                         // its merges refuse (410). Fail closed.
                         continue;
@@ -463,6 +491,20 @@ impl BranchBaseStore {
             // that had a truncation mark (branched after truncation), clear
             // the mark — the image now covers the retained history.
             truncated.remove(collection);
+        }
+
+        // TD-SEAM-12-F5: Log bootstrap summary.
+        if is_bootstrap {
+            let marked_count = truncated.len();
+            let imaged_count = images.len();
+            tracing::info!(
+                imaged = imaged_count,
+                marked_incomplete = marked_count,
+                tracked_from = retained_from,
+                "TD-SEAM-12-F5: bootstrap complete — {} collections imaged, {} marked incomplete (410)",
+                imaged_count,
+                marked_count
+            );
         }
 
         let changed = state.generation == 0

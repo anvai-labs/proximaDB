@@ -361,6 +361,14 @@ pub struct ProximaRecordInput {
     pub props: Option<HashMap<String, RestProximaValue>>,
     /// Dedicated TEXT fields with storage hints
     pub text_fields: Option<Vec<TextFieldInput>>,
+    /// Absolute expiry time in epoch MILLISECONDS (record TTL). After this
+    /// instant the record is dead to every read. Same field and semantics as
+    /// the gRPC v2 `ProximaRecord.expires_at_ms`. Rejected for that record
+    /// (it lands in `errors`): 0 or negative (0 is the internal tombstone
+    /// encoding) and anything before 1973 (1e11), which is almost always epoch
+    /// seconds passed by mistake. Upsert without this field clears any TTL.
+    #[serde(default)]
+    pub expires_at_ms: Option<i64>,
 }
 
 /// REST value shape for the canonical `ProximaValue` type system.
@@ -1184,6 +1192,19 @@ async fn insert_records_inner(
             continue;
         }
 
+        let valid_to_ns =
+            match proximadb_records::proto_v2::expires_at_ms_to_valid_to_ns(record.expires_at_ms) {
+                Ok(v) => v,
+                Err(error) => {
+                    errors.push(InsertError {
+                        index,
+                        id: record.id,
+                        error,
+                    });
+                    continue;
+                }
+            };
+
         // Generate ID if not provided
         let record_id = record.id.unwrap_or_else(|| {
             let new_id = uuid::Uuid::new_v4().to_string();
@@ -1219,6 +1240,7 @@ async fn insert_records_inner(
             created_at_ns: now_ns,
             updated_at_ns: now_ns,
             origin: Some("v2_api".to_string()),
+            valid_to_ns,
             props,
             embeddings: vec![EmbeddingCell::new_fp32(
                 "default",
@@ -2978,6 +3000,18 @@ mod tests {
             validate_scan_content_revision(Some(&cursor), 42, "epoch-a:42"),
             Err(ApiError::Conflict(_))
         ));
+    }
+
+    #[test]
+    fn record_input_accepts_expires_at_ms() {
+        // Before this change deny_unknown_fields rejected the key outright,
+        // so REST could not express a TTL at all (gRPC could).
+        let input: ProximaRecordInput =
+            serde_json::from_str(r#"{"vector":[1.0],"expires_at_ms":1700000000000}"#)
+                .expect("expires_at_ms is a declared field");
+        assert_eq!(input.expires_at_ms, Some(1_700_000_000_000));
+        let absent: ProximaRecordInput = serde_json::from_str(r#"{"vector":[1.0]}"#).unwrap();
+        assert_eq!(absent.expires_at_ms, None);
     }
 
     #[test]

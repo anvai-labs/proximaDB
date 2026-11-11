@@ -2,6 +2,20 @@
 
 All notable changes to ProximaDB will be documented in this file.
 
+## [0.7.0] - 2026-11-10
+
+Platform and packaging release: macOS Apple Silicon joins the supported
+platforms (native arm64 DMG, ad-hoc codesigned — notarization open in
+TD-PKG-4), the Linux packages ship their state-directory ownership at build
+time (the install-time chown mutation contract is retired; the pre-publish
+`rpm -V` gate now requires a clean verify plus direct dir stat-asserts), the
+TD-SEAM-14 S2 spill-manifest CAS/witness primitives land (storage-only,
+unwired), and graph reads of never-created collections return `NOT_FOUND`
+instead of silently provisioning an empty graph (TD-LANECOV-1 — the 5 failing
+lane targets are closed and wired into the CI burn-down lane). The Python
+SDK's `inserted_ids`/`vector_ids` channel is complete on every transport.
+Full notes: `docs/release-notes/v0.7.0.md`.
+
 ## [0.6.1] - 2026-11-09
 
 Packaging-integrity release: v0.6.0's release run was blocked by the new

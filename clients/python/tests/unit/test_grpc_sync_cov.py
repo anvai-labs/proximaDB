@@ -16,6 +16,7 @@ from proximadb.v2 import record_pb2 as r
 from proximadb_sdk.exceptions import ProximaDBError
 from proximadb_sdk.v1 import collection_types_pb2 as c
 from proximadb_sdk.v1 import types_pb2 as v1_types
+from tests.unit._id_helpers import is_uuid as _is_uuid
 
 
 # --------------------------------------------------------------------------- #
@@ -367,7 +368,7 @@ def test_normalize_vector_alias_records_variants(client):
     assert out[1]["id"] == "b"
     assert out[2]["id"] == "md"
     assert out[3]["id"] == "dd"
-    assert out[4]["id"] == "record_4"
+    assert _is_uuid(out[4]["id"])
     assert out[4]["vector"] == [0.5, 0.6]
 
 

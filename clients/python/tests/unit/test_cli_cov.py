@@ -817,3 +817,22 @@ def test_reachable_server_proceeds_past_probe(runner, monkeypatch):
     result = runner.invoke(cli, ["collections", "list"])
     assert result.exit_code == 0, result.output
     assert "unreachable" not in result.stderr.lower()
+
+
+def test_vectors_insert_without_id_sends_no_literal_auto(runner, fake_client):
+    """No --id: the CLI must leave `id` out so the SDK mints a UUID. It used
+    to send the literal "auto", so every ID-less insert overwrote the last."""
+    result = runner.invoke(cli, ["vectors", "insert", "-c", "coll", "-v", "[1.0]"])
+    assert result.exit_code == 0, result.output
+    _, (_, records), _ = next(c for c in fake_client.calls if c[0] == "insert_records")
+    assert "id" not in records[0]
+    assert "auto" not in json.dumps(records)
+
+
+def test_vectors_insert_with_id_keeps_it(runner, fake_client):
+    result = runner.invoke(
+        cli, ["vectors", "insert", "-c", "coll", "-v", "[1.0]", "--id", "v1"]
+    )
+    assert result.exit_code == 0, result.output
+    _, (_, records), _ = next(c for c in fake_client.calls if c[0] == "insert_records")
+    assert records[0]["id"] == "v1"

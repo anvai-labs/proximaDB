@@ -162,12 +162,20 @@ jobs:
       sdk_docs: ${{ steps.filter.outputs.sdk_docs }}
       ui: ${{ steps.filter.outputs.ui }}
       docker: ${{ steps.filter.outputs.docker }}
+      packaging_scripts: ${{ steps.filter.outputs.packaging_scripts }}
       docs: ${{ steps.filter.outputs.docs }}
       docs_site: ${{ steps.filter.outputs.docs_site }}
       td_citations: ${{ steps.filter.outputs.td_citations }}
       proto: ${{ steps.filter.outputs.proto }}
       panic_policy: ${{ steps.filter.outputs.panic_policy }}
       capability_facade: ${{ steps.filter.outputs.capability_facade }}
+      # The lint lane's first real catch (actionlint): this output was never
+      # declared while the dup_ratchet filter group and the hygiene job's
+      # `if` both reference it — so a PR touching ONLY dup_ratchet.py or its
+      # baseline never ran Hygiene Guardrails (the undeclared output reads as
+      # empty). Same failure class capability_facade guards against: the PR
+      # that weakens the gate is the one PR the gate never sees.
+      dup_ratchet: ${{ steps.filter.outputs.dup_ratchet }}
       type_name_ratchet: ${{ steps.filter.outputs.type_name_ratchet }}
       v1_proto_usage: ${{ steps.filter.outputs.v1_proto_usage }}
       # Granular Rust component detection for targeted testing. query_changes
@@ -351,6 +359,15 @@ jobs:
             docker:
               - 'deploy/docker/**'
               - '.dockerignore'
+              - '.github/workflows/ci.yml'
+            packaging_scripts:
+              - 'deploy/packaging/**'
+              - '.github/workflows/release.yml'
+              - '.github/workflows/release-smoke.yml'
+              # A gate must see a change to itself (TD-CITIER-1): editing the
+              # lane's own severity, ignore-lists, or tools must re-run it.
+              # Cheap (~1-2 min), unlike the heavy suites that deliberately
+              # route ci.yml through `sweep` instead.
               - '.github/workflows/ci.yml'
             docs:
               - 'docs/**'
@@ -780,7 +797,7 @@ jobs:
           MEDIUM_TIER: ${{ github.base_ref == 'qa' || github.base_ref == 'main' || github.ref == 'refs/heads/qa' || github.ref == 'refs/heads/main' }}
           FULL_TIER: ${{ github.base_ref == 'main' || github.ref == 'refs/heads/main' }}
         run: |
-          tree="$(git rev-parse HEAD^{tree})"
+          tree="$(git rev-parse 'HEAD^{tree}')"
           echo "tree=$tree" >> "$GITHUB_OUTPUT"
           python3 scripts/ci_tree_reuse.py --tree "$tree" || echo "reused=" >> "$GITHUB_OUTPUT"
 
@@ -967,6 +984,11 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.99.0
+        # Step-level, NOT workflow env: rust-cache hashes every CARGO*/RUST*
+        # env var into its cache key, so a workflow-level var would cold-start
+        # every cache (#2502 review). rustup's default is 3 retries.
+        env:
+          RUSTUP_MAX_RETRIES: "10"
         with:
           components: rustfmt
       - name: Install System Dependencies
@@ -1030,6 +1052,11 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.99.0
+        # Step-level, NOT workflow env: rust-cache hashes every CARGO*/RUST*
+        # env var into its cache key, so a workflow-level var would cold-start
+        # every cache (#2502 review). rustup's default is 3 retries.
+        env:
+          RUSTUP_MAX_RETRIES: "10"
         with:
           # Match rust-toolchain.toml's declared components + target so `cargo
           # check` doesn't trigger a rustup re-sync that collides installing
@@ -1091,6 +1118,11 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.99.0
+        # Step-level, NOT workflow env: rust-cache hashes every CARGO*/RUST*
+        # env var into its cache key, so a workflow-level var would cold-start
+        # every cache (#2502 review). rustup's default is 3 retries.
+        env:
+          RUSTUP_MAX_RETRIES: "10"
       - name: Install System Dependencies
         run: |
           sudo apt-get update
@@ -1184,6 +1216,11 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.99.0
+        # Step-level, NOT workflow env: rust-cache hashes every CARGO*/RUST*
+        # env var into its cache key, so a workflow-level var would cold-start
+        # every cache (#2502 review). rustup's default is 3 retries.
+        env:
+          RUSTUP_MAX_RETRIES: "10"
         with:
           components: rustfmt
       - name: Install System Dependencies
@@ -1272,6 +1309,11 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.99.0
+        # Step-level, NOT workflow env: rust-cache hashes every CARGO*/RUST*
+        # env var into its cache key, so a workflow-level var would cold-start
+        # every cache (#2502 review). rustup's default is 3 retries.
+        env:
+          RUSTUP_MAX_RETRIES: "10"
       - name: Install System Dependencies
         run: |
           sudo apt-get update
@@ -1296,7 +1338,7 @@ jobs:
         run: |
           ./target/release/proximadb-server -c config/config.toml -d /tmp/proxima-rt -p 5678 > /tmp/server.log 2>&1 &
           echo $! > /tmp/server.pid
-          for i in $(seq 1 90); do
+          for _ in $(seq 1 90); do
             if curl -sf http://127.0.0.1:5678/health >/dev/null 2>&1; then echo "server ready"; exit 0; fi
             sleep 1
           done
@@ -1318,7 +1360,7 @@ jobs:
           PROXIMADB_DOC_SMOKE_URL: http://127.0.0.1:5678
       - name: Stop server
         if: always()
-        run: kill $(cat /tmp/server.pid) 2>/dev/null || true
+        run: kill "$(cat /tmp/server.pid)" 2>/dev/null || true
 
   panic-policy-report:
     name: Panic Policy Report (WS-2 Stage 1)
@@ -1438,6 +1480,11 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.99.0
+        # Step-level, NOT workflow env: rust-cache hashes every CARGO*/RUST*
+        # env var into its cache key, so a workflow-level var would cold-start
+        # every cache (#2502 review). rustup's default is 3 retries.
+        env:
+          RUSTUP_MAX_RETRIES: "10"
         with:
           components: clippy
       - name: Install System Dependencies
@@ -1572,6 +1619,11 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.99.0
+        # Step-level, NOT workflow env: rust-cache hashes every CARGO*/RUST*
+        # env var into its cache key, so a workflow-level var would cold-start
+        # every cache (#2502 review). rustup's default is 3 retries.
+        env:
+          RUSTUP_MAX_RETRIES: "10"
       - name: Install System Dependencies
         # g++ provides libstdc++ for the onnxruntime (ort) build script.
         run: |
@@ -1646,6 +1698,11 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.99.0
+        # Step-level, NOT workflow env: rust-cache hashes every CARGO*/RUST*
+        # env var into its cache key, so a workflow-level var would cold-start
+        # every cache (#2502 review). rustup's default is 3 retries.
+        env:
+          RUSTUP_MAX_RETRIES: "10"
       - name: Install System Dependencies
         run: |
           sudo apt-get update
@@ -1710,6 +1767,11 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.99.0
+        # Step-level, NOT workflow env: rust-cache hashes every CARGO*/RUST*
+        # env var into its cache key, so a workflow-level var would cold-start
+        # every cache (#2502 review). rustup's default is 3 retries.
+        env:
+          RUSTUP_MAX_RETRIES: "10"
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
       # TD-AUDITGATE-1: this job used to be doubly unfailable (`|| echo` under
@@ -1759,6 +1821,43 @@ jobs:
             src/proximadb_sdk/proto_conversion.py \
             src/proximadb_sdk/integrations/ \
             || echo "::warning::mypy type checking found issues"
+
+  # ShellCheck + actionlint on the packaging gate scripts and the release
+  # workflows, wired into ci-success.needs so a red lane BLOCKS (review F1:
+  # a job outside needs gates nothing — the mlflow-conformance shape). The
+  # v0.6.0/v0.6.1 release cycles burned two dispatches on a quoting defect
+  # and a parse break in release.yml that local checks could not see (the
+  # lane TODO in release.yml). Runs when the packaging gate scripts, the
+  # release workflows, or this CI definition change.
+  packaging-lint:
+    name: Packaging Scripts Lint
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    needs: changes
+    if: needs.changes.outputs.sweep == 'true' || needs.changes.outputs.packaging_scripts == 'true'
+    steps:
+      - uses: actions/checkout@v7
+      - name: Run shellcheck on packaging scripts
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          find deploy/packaging/scripts -name '*.sh' -print0 | xargs -0 shellcheck --severity=warning
+      - name: Run actionlint on the release workflows
+        run: |
+          # Pinned version: the download script fetches from the upstream
+          # `main` branch, so without $1 the lane's toolchain could change
+          # mid-flight (review F3; house convention pins tooling).
+          bash <(curl https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash) 1.7.12
+          # EMBEDDED shellcheck is ON: every inline `run:` block in the three
+          # release/CI workflows was quoted clean (the 60-finding debt the
+          # lane surfaced on day one was paid off in the same window). Any
+          # new unquoted variable in a workflow script now fails this lane.
+          # -ignore 'property "cross"' : matrix.cross only exists on the
+          # DISABLED aarch64 matrix leg (commented out next to the musl leg);
+          # the Install Cross / cross-build steps are its re-enablement
+          # scaffolding, so the "undefined property" finding is intentional.
+          ./actionlint -color \
+            -ignore 'property "cross" is not defined' \
+            .github/workflows/release.yml .github/workflows/release-smoke.yml .github/workflows/ci.yml
 
   go-lint:
     name: Go SDK Lint
@@ -1832,6 +1931,11 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.99.0
+        # Step-level, NOT workflow env: rust-cache hashes every CARGO*/RUST*
+        # env var into its cache key, so a workflow-level var would cold-start
+        # every cache (#2502 review). rustup's default is 3 retries.
+        env:
+          RUSTUP_MAX_RETRIES: "10"
         with:
           components: rustfmt, clippy
       - name: Check formatting
@@ -1887,6 +1991,10 @@ jobs:
       # Toolchain setup — one branch per matrix cell
       - if: matrix.setup == 'rust'
         uses: dtolnay/rust-toolchain@1.99.0
+        # Step-level, NOT workflow env: rust-cache hashes every CARGO*/RUST*
+        # env var into its cache key (#2502 review). rustup's default is 3.
+        env:
+          RUSTUP_MAX_RETRIES: "10"
       - if: matrix.setup == 'rust'
         uses: Swatinem/rust-cache@v2
         with:
@@ -1961,6 +2069,11 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.99.0
+        # Step-level, NOT workflow env: rust-cache hashes every CARGO*/RUST*
+        # env var into its cache key, so a workflow-level var would cold-start
+        # every cache (#2502 review). rustup's default is 3 retries.
+        env:
+          RUSTUP_MAX_RETRIES: "10"
       - name: Install System Dependencies
         run: |
           sudo apt-get update
@@ -2014,6 +2127,11 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.99.0
+        # Step-level, NOT workflow env: rust-cache hashes every CARGO*/RUST*
+        # env var into its cache key, so a workflow-level var would cold-start
+        # every cache (#2502 review). rustup's default is 3 retries.
+        env:
+          RUSTUP_MAX_RETRIES: "10"
       - uses: actions/setup-java@v6
         with:
           distribution: temurin
@@ -2219,6 +2337,11 @@ jobs:
       - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@1.99.0
+        # Step-level, NOT workflow env: rust-cache hashes every CARGO*/RUST*
+        # env var into its cache key, so a workflow-level var would cold-start
+        # every cache (#2502 review). rustup's default is 3 retries.
+        env:
+          RUSTUP_MAX_RETRIES: "10"
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -2269,6 +2392,11 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.99.0
+        # Step-level, NOT workflow env: rust-cache hashes every CARGO*/RUST*
+        # env var into its cache key, so a workflow-level var would cold-start
+        # every cache (#2502 review). rustup's default is 3 retries.
+        env:
+          RUSTUP_MAX_RETRIES: "10"
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: "v2-rust"
@@ -2345,6 +2473,11 @@ jobs:
       - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@1.99.0
+        # Step-level, NOT workflow env: rust-cache hashes every CARGO*/RUST*
+        # env var into its cache key, so a workflow-level var would cold-start
+        # every cache (#2502 review). rustup's default is 3 retries.
+        env:
+          RUSTUP_MAX_RETRIES: "10"
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -2460,6 +2593,11 @@ jobs:
       - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@1.99.0
+        # Step-level, NOT workflow env: rust-cache hashes every CARGO*/RUST*
+        # env var into its cache key, so a workflow-level var would cold-start
+        # every cache (#2502 review). rustup's default is 3 retries.
+        env:
+          RUSTUP_MAX_RETRIES: "10"
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -2569,6 +2707,11 @@ jobs:
           fetch-depth: 0
 
       - uses: dtolnay/rust-toolchain@1.99.0
+        # Step-level, NOT workflow env: rust-cache hashes every CARGO*/RUST*
+        # env var into its cache key, so a workflow-level var would cold-start
+        # every cache (#2502 review). rustup's default is 3 retries.
+        env:
+          RUSTUP_MAX_RETRIES: "10"
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -2599,12 +2742,13 @@ jobs:
             exit 0
           fi
           # Bare positionals to cargo/nextest are TEST-NAME FILTERS, not package
-          # selectors — turn the space-separated list into -p args.
-          pkg_args=""
+          # selectors — turn the space-separated list into -p args (array, so
+          # each -p/$p is one properly quoted word downstream).
+          pkg_args=()
           for p in $pkgs; do
-            pkg_args="$pkg_args -p $p"
+            pkg_args+=(-p "$p")
           done
-          echo "Affected leaf crates:$pkg_args"
+          echo "Affected leaf crates: ${pkg_args[*]}"
           # This production-scale synthetic recall ratchet takes minutes by
           # design. The required 90-minute rust-test/unit lane still runs it;
           # only this explicitly advisory fast-feedback lane excludes it.
@@ -2615,7 +2759,7 @@ jobs:
           # a lane that cries wolf is one people stop reading.
           cargo nextest run --lib --profile unit --no-tests=pass \
             -E 'not test(rabitq_cold_recall_harness_n100000_recall_at_10)' \
-            $pkg_args
+            ${pkg_args[@]+"${pkg_args[@]}"}
 
   # TD-168 develop early-detection: run the CHEAP object-store Cool-tier tests
   # (scripts/run_cloud_emulator_tests.sh --fast — compiles only the small
@@ -2638,6 +2782,11 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.99.0
+        # Step-level, NOT workflow env: rust-cache hashes every CARGO*/RUST*
+        # env var into its cache key, so a workflow-level var would cold-start
+        # every cache (#2502 review). rustup's default is 3 retries.
+        env:
+          RUSTUP_MAX_RETRIES: "10"
       - name: Install system deps
         run: |
           sudo apt-get update
@@ -2742,6 +2891,11 @@ jobs:
           free -h
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.99.0
+        # Step-level, NOT workflow env: rust-cache hashes every CARGO*/RUST*
+        # env var into its cache key, so a workflow-level var would cold-start
+        # every cache (#2502 review). rustup's default is 3 retries.
+        env:
+          RUSTUP_MAX_RETRIES: "10"
       - name: Install system deps
         run: |
           sudo apt-get update
@@ -2800,6 +2954,11 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.99.0
+        # Step-level, NOT workflow env: rust-cache hashes every CARGO*/RUST*
+        # env var into its cache key, so a workflow-level var would cold-start
+        # every cache (#2502 review). rustup's default is 3 retries.
+        env:
+          RUSTUP_MAX_RETRIES: "10"
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: "v2-rust"
@@ -2883,6 +3042,11 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.99.0
+        # Step-level, NOT workflow env: rust-cache hashes every CARGO*/RUST*
+        # env var into its cache key, so a workflow-level var would cold-start
+        # every cache (#2502 review). rustup's default is 3 retries.
+        env:
+          RUSTUP_MAX_RETRIES: "10"
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: "v2-rust"
@@ -3006,6 +3170,11 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.99.0
+        # Step-level, NOT workflow env: rust-cache hashes every CARGO*/RUST*
+        # env var into its cache key, so a workflow-level var would cold-start
+        # every cache (#2502 review). rustup's default is 3 retries.
+        env:
+          RUSTUP_MAX_RETRIES: "10"
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: "v2-rust"
@@ -3052,6 +3221,11 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.99.0
+        # Step-level, NOT workflow env: rust-cache hashes every CARGO*/RUST*
+        # env var into its cache key, so a workflow-level var would cold-start
+        # every cache (#2502 review). rustup's default is 3 retries.
+        env:
+          RUSTUP_MAX_RETRIES: "10"
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: "v2-rust"
@@ -3112,6 +3286,11 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.99.0
+        # Step-level, NOT workflow env: rust-cache hashes every CARGO*/RUST*
+        # env var into its cache key, so a workflow-level var would cold-start
+        # every cache (#2502 review). rustup's default is 3 retries.
+        env:
+          RUSTUP_MAX_RETRIES: "10"
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: "v2-rust"
@@ -3214,6 +3393,11 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.99.0
+        # Step-level, NOT workflow env: rust-cache hashes every CARGO*/RUST*
+        # env var into its cache key, so a workflow-level var would cold-start
+        # every cache (#2502 review). rustup's default is 3 retries.
+        env:
+          RUSTUP_MAX_RETRIES: "10"
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: "v2-rust"
@@ -3250,6 +3434,11 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.99.0
+        # Step-level, NOT workflow env: rust-cache hashes every CARGO*/RUST*
+        # env var into its cache key, so a workflow-level var would cold-start
+        # every cache (#2502 review). rustup's default is 3 retries.
+        env:
+          RUSTUP_MAX_RETRIES: "10"
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: "v2-rust"
@@ -3296,6 +3485,11 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.99.0
+        # Step-level, NOT workflow env: rust-cache hashes every CARGO*/RUST*
+        # env var into its cache key, so a workflow-level var would cold-start
+        # every cache (#2502 review). rustup's default is 3 retries.
+        env:
+          RUSTUP_MAX_RETRIES: "10"
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: "v2-rust"
@@ -3317,6 +3511,155 @@ jobs:
               cargo test --test "$test_name" -- --test-threads=1
             fi
           done
+
+  # Lane-coverage burn-down (ranked cleanup item 7). These integration
+  # targets were compiled by CI but executed by NO lane (the release-review F2
+  # shape scripts/check_ci_lane_coverage.py ratchets). Each was run locally and
+  # passed in full on develop 4f256e8b9 before being listed here (~6 min of
+  # test time; the cost is mostly the build). One nextest invocation = one
+  # build, in its own job so it runs alongside the other lanes rather than
+  # lengthening them. Do not add a target without running it green first;
+  # the failing and vacuous never-run targets are tracked in TD-LANECOV-1.
+  rust-integration-test-burndown:
+    name: Rust Integration Tests (burn-down)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    needs: [changes, rust-build]
+    if: |
+      !inputs.skip_tests &&
+      needs.changes.outputs.test_tier == 'true' &&
+      needs.changes.outputs.rust == 'true' &&
+      !contains(needs.changes.outputs.reused, ',rust-integration-test-burndown,')
+    steps:
+      # This is the first lane that builds many root-crate test binaries in
+      # ONE cargo invocation (64; ~6 GB of binaries locally). Same disk and
+      # memory mitigations as the other large-build jobs (#2502 review).
+      - name: Reclaim disk space
+        run: |
+          echo "Disk before reclaim:"; df -h /
+          sudo rm -rf \
+            /usr/local/lib/android \
+            /usr/share/dotnet \
+            /opt/ghc \
+            /usr/local/.ghcup \
+            /usr/local/share/boost || true
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+          echo "Disk after reclaim:"; df -h /
+      - name: Add swap headroom
+        run: |
+          sudo fallocate -l 12G /mnt/swapfile-ci
+          sudo chmod 600 /mnt/swapfile-ci
+          sudo mkswap /mnt/swapfile-ci
+          sudo swapon /mnt/swapfile-ci
+          free -h
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.99.0
+        # Step-level, NOT workflow env: rust-cache hashes every CARGO*/RUST*
+        # env var into its cache key, so a workflow-level var would cold-start
+        # every cache (#2502 review). rustup's default is 3 retries.
+        env:
+          RUSTUP_MAX_RETRIES: "10"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v2-rust"
+          shared-key: "dev-test"
+          add-job-id-key: false
+          save-if: false
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libssl-dev pkg-config protobuf-compiler
+      - name: Install nextest
+        uses: taiki-e/install-action@nextest
+      - name: Run burn-down integration targets
+        env:
+          # Several targets boot a full server in a dev-profile build; same
+          # stack remedy as the storage and query lanes.
+          RUST_MIN_STACK: "8388608"
+          # Cap concurrent compile/link units: .cargo/config.toml allows 5,
+          # and up to 5 root-crate test binaries linking at once exceeds the
+          # runner's 16 GB even with swap. Step-level, so the rust-cache key
+          # (computed in its own step) is unchanged.
+          CARGO_BUILD_JOBS: "2"
+        run: |
+          # -E excludes test_multiple_flush_cycles_all_engines (TD-LANECOV-1,
+          # investigate row): a LOAD-DEPENDENT HELIX post-flush hang — passes in
+          # isolation 5/5 locally (unrestricted, 4-CPU-constrained, under gdb)
+          # but hung the lane 3/5 CI runs across three different trees
+          # (including pure develop), always after the sst leg printed PASSED,
+          # always at exactly 360s. Same load-dependent HELIX flakiness the
+          # original triage saw on helix_prune_debug_test ("failed once in the
+          # batch; passed 2/2 in isolation"); TD-HELIX-2 (post-flush, open on
+          # pristine develop) is the likely family. The binary's other tests
+          # (all-engine search matrix) keep gating. Rabitq -E precedent: the
+          # unit lane's slow synthetic recall ratchet.
+          cargo nextest run -p proximadb --profile integration --retries 0 \
+              -E 'not test(test_multiple_flush_cycles_all_engines)' \
+              --test agent_memory_ingest_e2e \
+              --test arrow_native_format_integration_test \
+              --test automl_integration_test \
+              --test aws_imds_v2_test \
+              --test axis_edge_cases_test \
+              --test backup_restore_test \
+              --test catalog_integration_test \
+              --test corpus_version_restart_safety_test \
+              --test counting_filesystem \
+              --test cpg_fragment_pax_contract \
+              --test cross_model_transaction_e2e \
+              --test cross_surface_unification_e2e \
+              --test dedup_utility_contracts \
+              --test discovery_job_republish_test \
+              --test distance_metric_consistency_test \
+              --test dual_mode_integration_test \
+              --test embedded_engine_parity_test \
+              --test embedded_service_profile \
+              --test engine_safety_test \
+              --test eventlog_integration_test \
+              --test example_using_new_utilities \
+              --test external_collection_bm25_e2e_test \
+              --test filesystem_compat \
+              --test fp16_centroid_test \
+              --test grpc_methods_test \
+              --test helix_integration_test \
+              --test hmgi_integration_test \
+              --test ivf_ingest_asymptotic_test \
+              --test jsonb_integration_test \
+              --test logical_operators_tests \
+              --test mtls_integration_test \
+              --test nova_ingest_sorted_segment \
+              --test objstore_segment_path_guard_test \
+              --test objstore_url_construction_test \
+              --test objstore_zero_vector_recovery_test \
+              --test orion_canonical_checkpoint_read_test \
+              --test pax_cascade_prod_search_test \
+              --test pax_kill_switch_rawf32_exact_read_test \
+              --test phase3_integration_test \
+              --test prepared_statement_test \
+              --test proximacodec_cross_compatibility_test \
+              --test proximacodec_integration_test \
+              --test queue_adapter_upgrade_integration_test \
+              --test rank_services_e2e_test \
+              --test repair_chain_integration_test \
+              --test rerank_pgwire_contract_e2e \
+              --test rest_api_handlers_test \
+              --test rest_api_load_test \
+              --test rest_api_v1_test \
+              --test rl_planner_integration_test \
+              --test route_cost_override_pgwire_eval \
+              --test route_geometry_calibration_e2e \
+              --test sks_fixtures_test \
+              --test sks_integration_test \
+              --test small_batch_brute_force_test \
+              --test td134_keu_rbac_e2e \
+              --test tdd_infrastructure_test \
+              --test test_zero_copy_verification \
+              --test text_column_integration_test \
+              --test tier_transition_invalidation_test \
+              --test trace_lifecycle_integration_test \
+              --test trace_pipeline_integration_test \
+              --test transaction_integration_test \
+              --test typed_memory_test \
+              --test v2_evaluation_chain_integration_test
 
   rust-coverage:
     name: Code Coverage
@@ -3367,6 +3710,11 @@ jobs:
           free -h
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.99.0
+        # Step-level, NOT workflow env: rust-cache hashes every CARGO*/RUST*
+        # env var into its cache key, so a workflow-level var would cold-start
+        # every cache (#2502 review). rustup's default is 3 retries.
+        env:
+          RUSTUP_MAX_RETRIES: "10"
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: "v2-rust"
@@ -3543,6 +3891,9 @@ jobs:
           # `xargs -n1 bash -c 'test_one "$0"'` passes each file as $0 (no -I
           # substitution, so no BSD/GNU command-length quirk). xargs exits non-zero
           # (123) if any invocation failed -> the step fails.
+          # $0 in the bash -c string is expanded by the INNER bash (the test
+          # path), not this shell — SC2016 does not apply here.
+          # shellcheck disable=SC2016
           find tests/unit -name 'test_*.py' | sort | grep -vE "$SKIP_RE" | \
             xargs -P 4 -n 1 bash -c 'test_one "$0"'
 
@@ -3751,13 +4102,13 @@ jobs:
               exit 0
             fi
           fi
-          exit ${exit_code}
+          exit "$exit_code"
 
       - name: Collect Server Logs on Failure
         if: failure()
         run: |
           echo "=== Server process status ==="
-          ps aux | grep proximadb || true
+          pgrep -af proximadb || true
           echo "=== Server logs (if available) ==="
           cat /tmp/proximadb*.log 2>/dev/null || echo "No log files found"
 
@@ -3868,6 +4219,11 @@ jobs:
       - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@1.99.0
+        # Step-level, NOT workflow env: rust-cache hashes every CARGO*/RUST*
+        # env var into its cache key, so a workflow-level var would cold-start
+        # every cache (#2502 review). rustup's default is 3 retries.
+        env:
+          RUSTUP_MAX_RETRIES: "10"
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -3912,6 +4268,11 @@ jobs:
       - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@1.99.0
+        # Step-level, NOT workflow env: rust-cache hashes every CARGO*/RUST*
+        # env var into its cache key, so a workflow-level var would cold-start
+        # every cache (#2502 review). rustup's default is 3 retries.
+        env:
+          RUSTUP_MAX_RETRIES: "10"
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -4021,6 +4382,11 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.99.0
+        # Step-level, NOT workflow env: rust-cache hashes every CARGO*/RUST*
+        # env var into its cache key, so a workflow-level var would cold-start
+        # every cache (#2502 review). rustup's default is 3 retries.
+        env:
+          RUSTUP_MAX_RETRIES: "10"
       - name: Install system deps
         run: |
           sudo apt-get update
@@ -4111,6 +4477,7 @@ jobs:
       - rust-integration-test-graph
       - rust-integration-test-cluster
       - rust-integration-test-api
+      - rust-integration-test-burndown
       - object-store-emulator-tests
       - object-store-restart-recovery
       - python-lint
@@ -4138,6 +4505,12 @@ jobs:
       - openapi-spec-drift
       - feature-matrix-enterprise-catalogs
       - mlflow-conformance
+      # packaging-lint MUST gate (round-3 review F1): a job outside needs
+      # contributes nothing to CI Success — the exact mlflow-conformance /
+      # hygiene-check shape that burned before. A red shellcheck/actionlint
+      # on the packaging scripts or release workflows has to block the merge
+      # (path-scoped, so a skipped result passes and only a real run gates).
+      - packaging-lint
       # gates that encode load-bearing decisions as checks
       - docs-authority
       - risk-coverage

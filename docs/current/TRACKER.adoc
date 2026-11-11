@@ -27,7 +27,7 @@ claims about remote state. Existing foreign WIP is preserved.
 | Track / IDs | State / owner | Next work and closure gate
 | P1 / TD-SEAM-1 | In progress; pickup unassigned | Resolve tenant-scoped REST metadata key, wire the production bulk route (currently PlannedOnlyTableWriteExecutor), preserve nested/list schema; external value read-back through real facade after two snapshots. Writer-unit proof alone is insufficient.
 | P2 delete / TD-SEAM-4, TD-USUB-10 | Writer + fence gates landed (#2266, #2273); default-OFF | Readers #2256, v3 policy #2260, lineage #2261, oid mapping #2262, fence contract #2264, live delete publisher #2266, and the six acceptance gates #2273 (deterministic CAS-race injection, shared WriteLeaseAuthority at the publisher's CAS, crash-gap adoption recovery, reader-guard standing). All default-OFF (`PROXIMADB_LIVE_DELETE_PUBLISHER`). Remaining: soak evidence and the activation flip. Update/upsert publication and rollout remain separate gates.
-| Recovery / TD-SEAM-12/14 | Open residual; unassigned | All consumer floors and branch-merge residuals; object-store owner/reattach boundary before placement becomes default. Refusal is safer than silent history loss.
+| Recovery / TD-SEAM-14 | Revised design proposed; implementation unassigned | TD-SEAM-12 floors and all five residuals are complete (#2496). link:../10-quality/td/TD-SEAM-14-object-store-recovery-and-ownership-boundary.adoc[TD-SEAM-14 specification] now owns S0–S5: exclusive claim, conditional manifest publication, local rollback witness, logical DROP, migration and durability drills. Design branch: `docs/td-seam-14-design-handback`, baseline `6e34f2a0a`; source review only, no runtime proof. Next: deterministic counterexamples and shared-primitive qualification before production wiring. Placement stays opt-in; automatic takeover, online physical GC and remote-only zero-loss recovery are not claimed.
 | P3 provider / TD-SEAM-5, USUB-2/3 | In progress; unassigned | Default-on soak, stats and EXPLAIN parity, ABAC and bounded delta memory. Admit PAX only after visibility/WAL/ABAC proof; ungoverned UDTF routing is not governed parity.
 | Native differentiation / S6/S8, TD-SEAM-6, TD-OLAP-10/11/12 | Design/source review merged (#2252/#2254); implementation unassigned | NE-0..7 and per-engine strength/crossover tests are specified in the lakehouse plan; benchmarks remain PLANNED. First audit actual routes and build exact eligible-set oracle; prototype one fused native region only after defining semantics. No new generic engine rewrite or performance claims from desk research.
 | P3 operator / TD-SEAM-6 | Planned; unassigned | FilteredAnnExec through pgwire: canonical oid, ABAC before candidates, pushed filters/limit/runtime filters, recall >=0.95 across selectivity bands.
@@ -101,7 +101,15 @@ They are recorded here to prevent duplication and provide context for future ses
 
 | #2495
 | **TD-SEAM-12 branch-after-truncate auto-registration**: In `checkpoint()`, when `base_for` returns `Err` but the collection has branch-tagged entries in the retained WAL, auto-create a fresh merge-base image. Safety guard: only auto-register when collection has NO entries in truncated segments (`!truncated.contains_key`), fail closed otherwise. Design doc for follow-up 5 (pre-tracking truncation) at `TD-SEAM-12-F5`.
-| Four of five TD-SEAM-12 open follow-ups resolved. Remaining: pre-tracking truncation handling (documented in TD-SEAM-12-F5, not yet implemented). TD-SEAM-14 (object-store recovery) remains open.
+| Four of five TD-SEAM-12 open follow-ups resolved.
+
+| #2496
+| **TD-SEAM-12-F5 bootstrap on checkpoint**: When `generation == 0 && retained_from > 0` (first checkpoint after pre-tracking truncation), bootstrap merge-base images for collections with retained branch entries. Collections without retained entries get truncation marks (fail closed 410). Adversarial review caught unreachable condition bug (`state.tracked_from` → `retained_from`).
+| **All 5 TD-SEAM-12 follow-ups resolved.** TD-SEAM-12 complete.
+
+| #2501
+| **TD-SEAM-14 S1 compare_exchange for cloud backends**: Implement `compare_exchange` (CAS) for S3, Azure, GCS filesystem backends. Enables owner marker CAS for exclusive claim, preventing racing boot epoch collisions. Adversarial review caught critical GCS bug (was fetching JSON metadata instead of object data) — fixed to use data plane (`read_all`) for content and metadata plane (`get_object`) for generation.
+| TD-SEAM-14 S1 complete. Foundation for exclusive claim mechanism. S2-S5 (manifest publication, logical DROP, format migration, server integration) remain open.
 
 |===
 

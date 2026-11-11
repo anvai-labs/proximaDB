@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from .._record_ids import new_record_id
 from ..exceptions import ProximaDBError
 from ..models import BatchResult, OperationMetrics, SearchResult
 
@@ -156,7 +157,7 @@ def record_proto_for_grpc(pb2: Any, record: Any, index: int = 0):
         raise ValueError("record is missing vector")
 
     proto = pb2.ProximaRecord()
-    proto.id = str(record.get("id") or record.get("oid") or f"record_{index}")
+    proto.id = str(record.get("id") or record.get("oid") or new_record_id())
     proto.vector.extend(float(v) for v in vector)
     if record.get("vector_dimension") is not None:
         proto.vector_dimension = int(record["vector_dimension"])

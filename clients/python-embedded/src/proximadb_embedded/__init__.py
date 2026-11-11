@@ -36,6 +36,7 @@ Example:
     >>> results = db.search("embeddings", query=vectors[0], top_k=10)
 """
 
+import uuid
 from ._proximadb_embedded import (
     CollectionInfo,
     DiskConfig,
@@ -80,7 +81,7 @@ from .notebook import (
 )
 import time
 
-__version__ = "0.6.1"
+__version__ = "0.7.0"
 __all__ = [
     "ProximaDB",
     "DiskConfig",
@@ -297,7 +298,9 @@ def _record_batch_parts(
         return fast_parts
 
     normalized = normalize_records(records, **normalize_kwargs)
-    ids = [record.get("id") or f"record_{index}" for index, record in enumerate(normalized)]
+    # A missing/empty id gets a fresh UUID; a position-derived default
+    # (record_0, record_1, ...) repeated across calls and overwrote.
+    ids = [record.get("id") or str(uuid.uuid4()) for record in normalized]
     vectors = [record["vector"] for record in normalized]
     props = []
     for record in normalized:
@@ -373,7 +376,7 @@ def _proxima_record_numpy_batch_parts(records, normalize_kwargs):
     if not matrix.flags.c_contiguous:
         matrix = np.ascontiguousarray(matrix, dtype=np.float32)
 
-    ids = [record.id for record in records]
+    ids = [record.id or str(uuid.uuid4()) for record in records]
     props = []
     for record in records:
         record_props = dict(record.props)
@@ -404,7 +407,7 @@ def _proxima_record_batch_parts(records, normalize_kwargs):
     if not records or not all(isinstance(record, ProximaRecord) for record in records):
         return None
 
-    ids = [record.id for record in records]
+    ids = [record.id or str(uuid.uuid4()) for record in records]
     vectors = [_vector_values(record.vector) for record in records]
     props = []
     for record in records:
@@ -458,7 +461,9 @@ def profile_record_batch_parts(records, **normalize_kwargs):
     normalized_elapsed = time.perf_counter() - normalized_started
 
     parts_started = time.perf_counter()
-    ids = [record.get("id") or f"record_{index}" for index, record in enumerate(normalized)]
+    # A missing/empty id gets a fresh UUID; a position-derived default
+    # (record_0, record_1, ...) repeated across calls and overwrote.
+    ids = [record.get("id") or str(uuid.uuid4()) for record in normalized]
     vectors = [record["vector"] for record in normalized]
     props = []
     for record in normalized:

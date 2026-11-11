@@ -28,6 +28,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any
 
+from ._record_ids import new_record_id
 from .config import ClientConfig, Protocol, load_config
 from .exceptions import CollectionNotFoundError, ProximaDBError
 from .models import (
@@ -412,13 +413,18 @@ class ProximaDBAsyncUnified:
                 props.update({str(k): v for k, v in values.items()})
 
         normalized: dict[str, Any] = {
-            "id": record.get("id") or record.get("oid") or f"record_{index}",
+            "id": record.get("id") or record.get("oid") or new_record_id(),
             "vector": vector,
             "props": props,
         }
         text_fields = record.get("text_fields")
         if text_fields:
             normalized["text_fields"] = text_fields
+        # Record TTL: async twin of the sync REST normalizer (rest_sync
+        # _normalize_record_payload). Only the explicit *_ms key.
+        expires_at_ms = record.get("expires_at_ms")
+        if expires_at_ms is not None:
+            normalized["expires_at_ms"] = int(expires_at_ms)
         return normalized
 
     async def insert_records(

@@ -1509,9 +1509,13 @@ class BatchResult(BaseModel):
     errors: list[str] = Field(default_factory=list)
     duration_ms: float = 0.0
     metrics: OperationMetrics = Field(default_factory=OperationMetrics)
-    # Server-assigned IDs of successfully inserted records (the REST
-    # insert response's inserted_ids). Empty for operations whose server
-    # response does not carry per-record IDs.
+    # Per-record IDs of successfully written records. Server-assigned when
+    # the wire response carries them (REST v2 inserted_ids, gRPC inserted_ids
+    # with return_ids=True); on the embedded transport these may be
+    # client-supplied OR client-minted (new_record_id for id-less records —
+    # the PyO3 result carries counts only). Empty for operations whose
+    # transport provides no per-record IDs, and for partial failures (the
+    # echo must not list records the server rejected).
     inserted_ids: list[str] = Field(default_factory=list)
 
 
@@ -1550,7 +1554,9 @@ def resolve_vector_ids(
     fabricated placeholders). All alias sites (REST unified client,
     grpc_sync, grpc_async) MUST route through this — divergent hand-rolled
     copies of this policy are exactly how the v1 silent drift happened
-    (TD-SDK-3)."""
+    (TD-SDK-3). NOTE: on the embedded transport BatchResult.inserted_ids
+    may be the client echo (the PyO3 write result carries counts only) —
+    the adapter gates that echo on full success."""
     if result.inserted_ids:
         return list(result.inserted_ids)
     if result.failed == 0:

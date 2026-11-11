@@ -11,6 +11,7 @@ functions while they are being retired.
 """
 
 from __future__ import annotations
+import uuid
 
 from dataclasses import dataclass, field
 from datetime import date, datetime, time
@@ -306,7 +307,7 @@ def normalize_records(
         rows = np.asarray(source, dtype=np.float32)
         if rows.ndim == 1:
             rows = rows.reshape(1, -1)
-        ids = ids or [f"record_{i}" for i in range(rows.shape[0])]
+        ids = ids or [str(uuid.uuid4()) for _ in range(rows.shape[0])]
         props = props or [{} for _ in range(rows.shape[0])]
         if len(ids) != rows.shape[0] or len(props) != rows.shape[0]:
             raise ValueError("ids and props must match the number of records")

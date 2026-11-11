@@ -1573,10 +1573,12 @@ mod tests {
 
     /// End-to-end functional isolation with NO explicit provisioning (TD-GRAPH-TENANT-1): a named
     /// tenant's first scoped write auto-provisions its `{tenant}/{graph_id}` collection, so
-    /// create→use works without an out-of-band bare create — and a second tenant using the SAME
-    /// clean logical id is isolated (it auto-provisions its own empty scoped graph). This is the
-    /// flow that was broken before the lazy-provision fix (create scoped nowhere ⇒ "collection
-    /// does not exist").
+    /// create→use works without an out-of-band bare create. A second tenant using the SAME clean
+    /// logical id hits the read-never-provisions rule on its first READ (NOT_FOUND, the semantic
+    /// this PR fixed — the old expectation, an auto-provisioned empty graph returned as Ok(None),
+    /// was the leak being closed); its own first WRITE then provisions ITS graph, and acme's node
+    /// does not leak into it. This is the flow that was broken before the lazy-provision fix
+    /// (create scoped nowhere ⇒ "collection does not exist").
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn named_tenant_graph_auto_provisions_on_first_write_and_isolates() -> anyhow::Result<()>
     {
@@ -1598,14 +1600,40 @@ mod tests {
                 .is_some(),
             "owner reads its own node after auto-provision"
         );
-        // globex, same clean "shared", sees nothing (its own auto-provisioned empty scoped graph).
+        // globex, same clean "shared": its graph was NEVER created, so a READ
+        // must be NOT_FOUND — reads never provision a graph (the semantic this
+        // PR fixed; the old expectation here, an auto-provisioned empty scoped
+        // graph returned as Ok(None), was the leak this PR closes).
+        let err = graph
+            .for_tenant("globex")
+            .get_node("shared", &"secret".to_string())
+            .await
+            .expect_err(
+                "reading a never-created tenant graph must fail, not return an empty graph",
+            );
+        assert!(
+            err.to_string().contains("not found"),
+            "expected the missing-graph error, got: {err}"
+        );
+
+        // globex's own first WRITE provisions ITS graph; acme's node does not
+        // leak into it (isolation).
+        let globex_node = crate::graph::Node {
+            id: "globex_doc".to_string(),
+            labels: vec!["Doc".to_string()],
+            ..Default::default()
+        };
+        graph
+            .for_tenant("globex")
+            .create_node("shared", globex_node)
+            .await?;
         assert!(
             graph
                 .for_tenant("globex")
                 .get_node("shared", &"secret".to_string())
                 .await?
                 .is_none(),
-            "cross-tenant read is isolated"
+            "cross-tenant read is isolated after globex's own provisioning"
         );
         Ok(())
     }

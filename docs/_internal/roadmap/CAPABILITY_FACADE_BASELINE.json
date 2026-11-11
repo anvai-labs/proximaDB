@@ -1,5 +1,5 @@
 {
-  "total": 1026,
+  "total": 1025,
   "by_file": {
     "apps/proximadb-migrate/src/main.rs": 2,
     "crates/binding/proximadb-embedded/src/lib.rs": 9,
@@ -233,7 +233,7 @@
     "src/network/grpc/v2/record_service.rs": 2,
     "src/network/multi_server.rs": 1,
     "src/network/postgres/pgvector_params.rs": 1,
-    "src/network/postgres/protocol.rs": 8,
+    "src/network/postgres/protocol.rs": 7,
     "src/network/postgres/relational_pipeline.rs": 3,
     "src/network/rest/canonical/analytics.rs": 1,
     "src/network/rest/canonical/catalog.rs": 1,

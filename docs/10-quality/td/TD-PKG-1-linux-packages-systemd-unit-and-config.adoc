@@ -5,7 +5,7 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | **Resolved (2026-10-25).**
+| Status | **Resolved (2026-10-25); build-time attrs (2026-11-10).**
 
 * **Service readiness:** the unit is `Type=simple` (the server never calls `sd_notify`, so `Type=notify` could never report ready) with `WorkingDirectory=/var/lib/proximadb`, so the `./log` rolling appender no longer resolves to `/` under `ProtectSystem=strict`.
 * **Data survives restarts:** the unit sets `PROXIMADB_DATA_DIR=/var/lib/proximadb`. The loader (TD-PKG-3 fix) rebases every config root still at the shipped `/tmp/proximadb` default under it, so the `PrivateTmp` wipe is harmless.
@@ -43,6 +43,30 @@ Not done here (minor, from the filed list): the archive clutter (`/usr/bin/confi
   release copies the whole `config/` directory into the archive (`release.yml`, `cp -r config`),
   and the Homebrew formula installs it under `$(brew --prefix)/share/proximadb/config`; most of
   those example configs keep their roots under `/tmp`. The fix must cover them too.
+
+== Follow-up: build-time attrs (2026-11-10)
+
+The install-time chown design above carried a cost the RPM verifier had to pay
+forever: the payload created the state dirs root-owned, `%post` chowned them,
+and the pre-publish gate therefore had to REQUIRE those by-design deviations
+in `rpm -V` (any clean output was a dead `%post`). That mutation contract is
+now retired — the payload carries the dirs' FINAL attrs:
+
+* `release.yml` builds the RPM with `fpm --rpm-attr 750,proximadb,proximadb,<dir>`
+  per contract dir, driven FROM `deploy/packaging/chown_dirs.env` (the file
+  stays the single source of truth for the dir list).
+* NEW `deploy/packaging/scripts/preinstall.sh` creates the system user in
+  `%pre` (wired `--before-install` on BOTH legs) — rpm resolves the recorded
+  owner names at extract time, so without it the dirs would fall back to root
+  and a clean `rpm -V` could never pass.
+* `postinstall.sh` keeps its (now no-op on fresh RPM installs) chown loop:
+  dpkg does NOT reset existing directory ownership on upgrade, so the DEB leg
+  still needs it for root-owned upgrades from pre-build-time-attrs packages.
+* The RPM verifier gate flipped per the original design note: `rpm -V` must be
+  CLEAN (any deviation = foreign modification or lost `--rpm-attr`), and the
+  installed dirs are stat-asserted directly (`assert_td_pkg1_dirs`, the same
+  depth as the DEB leg) — dir coverage no longer depends on rpm's `rpm -V`
+  directory reporting at all.
 
 == Fix
 
