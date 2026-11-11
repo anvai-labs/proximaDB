@@ -427,7 +427,9 @@ proximadb_quantization_compression_ratio{type="pq"} 32.0
 
 ## Next Steps
 
-- [Storage Engines](./storage-engines.adoc) - How quantization fits with engines
+- Storage Engines (source: docs/05-concepts/storage-engines.adoc, unpublished
+  pending the AsciiDoc conversion tracked by TD-DOCSITE-1) - How
+  quantization fits with engines
 - [API Surface and Performance](../02-guides/api-surface-performance-guide.md) - Optimization guide
 - [Vector Search](../02-guides/vector-search.md) - Search with quantization
 
