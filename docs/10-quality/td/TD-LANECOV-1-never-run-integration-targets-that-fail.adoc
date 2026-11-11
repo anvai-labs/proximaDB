@@ -93,3 +93,38 @@ deliberate change; **investigate** = deterministic failure, cause not yet proven
 Each row is closed by a PR that fixes the code (real), the test (stale), or the
 contract (contract), **and** moves the target from the baseline into a lane in
 the same PR, so it cannot silently rot again.
+
+== New row (2026-11-11, found blocking the v0.7.0 promotion)
+
+[cols="2,3,1,4", options="header"]
+|===
+| Target | `axis_edge_cases_test` :: `test_multiple_flush_cycles_all_engines` — LOAD-DEPENDENT HELIX post-flush hang | Class | **investigate** (TD-HELIX-2 family, likely)
+|===
+
+Evidence (all in the burn-down lane, slot ~51 of 620 sequential):
+
+* Hung the lane **3 of 5 CI runs across three different trees** — #2506's
+  original head (pre-#2505 Rust), #2509's head (current develop + graph
+  changes), and the develop → qa promotion PR on **pure develop**
+  (`c0610df0a`, no feature changes at all). Same signature every time: the
+  `[sst]` leg prints PASSED, then silence to the full 360s (120s × 3
+  terminate-after), while sibling all-engine tests in the same binary pass in
+  ~3s concurrently.
+* Passes in isolation **5/5 locally** — unrestricted (6-16s), 4-CPU-constrained
+  via taskset, and under gdb with the same `--exact` invocation. A constrained
+  run showed 5.1% CPU at 86s once (blocked, not slow), and per-thread wchans
+  were futex_do_wait + an idle epoll reactor — lock/wait-shaped, but the
+  user-space stacks were never captured (ptrace_scope=1; the CI-side stack is
+  unavailable too — nextest kills the process).
+* The distinguishing property vs the passing siblings: it is the only
+  flush-heavy multi-engine test (3 insert+flush cycles per engine, WAL
+  enabled) — the same post-flush territory as TD-HELIX-2, which is **open on
+  pristine develop** with deterministic wrongness after a flush. The original
+  triage already recorded the pattern: `helix_prune_debug_test` "failed once
+  in the batch; passed 2/2 in isolation".
+
+Disposition: excluded from the burn-down lane via `-E 'not
+test(test_multiple_flush_cycles_all_engines)'` (the unit lane's rabitq
+precedent) — the binary's all-engine search matrix keeps gating. Exit
+criterion unchanged: root-cause the HELIX post-flush hang (with TD-HELIX-2's
+fix), then remove the `-E` and re-wire the test in the same PR.
