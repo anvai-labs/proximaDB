@@ -1,0 +1,57 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-DISCOVERY-TENANT-1: the discovery pipeline is keyed by collection name, not tenant
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open (filed 2026-11-10).** Guarded, not fixed. Surfaced by the #2511 review when the drift-watcher fix made the pipeline fire again.
+| Invariant | CLAUDE.md co-design mandate #3 and directive 18b: isolation is structural, and `TenantContext` reaches every I/O boundary.
+| Exposure | AXIS deployments only: the drift watcher is spawned only with `enable_axis_indexes` on (default off, ADR-070; gated since #1384).
+|===
+
+== The problem
+
+`DriftWatcher` (`src/services/discovery/drift.rs`) is a background system caller.
+Since #2511 it sweeps collections through `list_collections_internal()`, which lists
+**every tenant's** collections, because the tenant-scoped listing is empty without a
+tenant (`076592ba1`). The rest of the pipeline is keyed by the collection **name** and
+carries no tenant:
+
+* the recluster baseline: `DiscoveryService::last_reclustered_lsn(name)`;
+* the signal and job: `on_signal(name, ...)`, `DiscoveryJob.collection_id`;
+* the executor's pin and object-id resolution: `coordinator.pin(&job.collection_id)`,
+  `resolve_collection_object_id(name)` via `get_collection_internal(name)`
+  (`src/services/discovery/executor.rs` ~66-82), with no tenant;
+* the recluster I/O itself, which receives no `TenantContext`.
+
+When two tenants own collections with the same name, one tenant's write volume could
+trigger a recluster pinned to the other tenant's collection. The baseline recorded by
+the executor could also come from a different object id than the one the watcher reads,
+so the two never line up.
+
+== The guard in place (#2511)
+
+`DriftWatcher::sweep_targets` **skips** any name owned by more than one collection and
+logs a warning, so drift is never attributed to the wrong tenant's collection. Pinned by
+`sweep_targets_skip_names_shared_across_tenants`. The cost: those collections get no
+automatic drift reclusters until this TD is fixed.
+
+== Fix
+
+Make discovery tenant-aware end to end:
+
+1. Key the watcher's targets, the registry, baselines, signals and jobs by
+   `(tenant_id, collection)` (or by internal object id, which is already unique).
+2. Carry the tenant into the executor: resolve the collection with that tenant
+   (`get_collection(name, Some(tenant))`), pin by object id, and pass `TenantContext`
+   to the recluster I/O so it is isolated and billed.
+3. Persist the tenant with each job.
+4. Remove the ambiguity guard once (1)-(3) land, and replace its test with a two-tenant
+   same-name test asserting that each tenant's drift reclusters only its own collection.
+
+== Also noted
+
+Each tick lists the whole catalog and does one manifest lookup per collection. That is
+fine at today's scale; at large collection counts, drive the sweep from the WAL
+manifest's per-object write counters instead.

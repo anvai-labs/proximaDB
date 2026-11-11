@@ -50,6 +50,14 @@ pub enum VectorDBError {
     #[error("Not implemented: {0}")]
     NotImplemented(String),
 
+    /// A named resource that does not exist (e.g. a graph collection that was
+    /// never created). Typed so callers match on the variant, not on message
+    /// text that a wrapping `.context()` can hide; the display keeps the
+    /// "not found" wording the message-based status mappers rely on, and it
+    /// converts to the core `ProximaDBError::NotFound` (gRPC NOT_FOUND).
+    #[error("Resource not found: {resource_type} '{id}'")]
+    NotFound { resource_type: String, id: String },
+
     /// Transaction with the given ID was not found.
     #[error("Transaction not found: {id}")]
     TransactionNotFound { id: String },
@@ -92,6 +100,14 @@ pub enum VectorDBError {
 
 /// Backward-compatible alias used broadly across the current tree.
 pub type ProximaDBError = VectorDBError;
+
+impl VectorDBError {
+    /// True for the typed "does not exist" variant. Prefer this over matching
+    /// on message text.
+    pub fn is_not_found(&self) -> bool {
+        matches!(self, Self::NotFound { .. })
+    }
+}
 
 /// Errors originating from storage engines and I/O operations.
 #[derive(Error, Debug)]

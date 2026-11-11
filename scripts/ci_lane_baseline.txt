@@ -8,7 +8,6 @@ cdc_integration_test.rs
 cdc_rest_changefeed_e2e.rs
 clickbench_ledger_e2e.rs
 cost_trace_pgwire_multimodal_e2e.rs
-discovery_drift_watcher_e2e.rs
 document_observability_integration_test.rs
 documents_convergence_bake.rs
 documents_convergence_e2e.rs
@@ -39,7 +38,6 @@ openapi_helpers.rs
 pgwire_upsert_constraints_e2e.rs
 release_smoke_v2.rs
 rest_grpc_parity_test.rs
-route_cost_offline_eval.rs
 search_collection_tenant_scope_e2e.rs
 search_top_k_cap_e2e.rs
 sql_ast_golden.rs

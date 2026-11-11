@@ -82,6 +82,12 @@ fn snapshot_for(mean_gets: u64, round: u64) -> IoTraceSnapshot {
     let mut compute_ms = BTreeMap::new();
     compute_ms.insert("sim".to_string(), jitter);
     IoTraceSnapshot {
+        // The model scores the PHYSICAL GET count, `get_ops` (#1709: scoring
+        // `range_gets` double-counts). Real traces fill both (`range_gets` is
+        // the ranged subset), so the simulated per-arm cost must ride `get_ops`;
+        // with `range_gets` alone both arms scored 0 GETs and the controller
+        // could never see an advantage (it never flipped, ctrl ~= static).
+        get_ops: mean_gets,
         range_gets: mean_gets,
         compute_ms,
         ..Default::default()

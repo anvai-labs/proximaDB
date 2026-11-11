@@ -251,3 +251,59 @@ async fn graph_nodes_exchange_and_get_over_socket() {
         );
     }
 }
+
+/// A DoGet on a graph that was never created is the caller's NOT_FOUND, on
+/// both the node and the edge export paths, over a real socket (#2511 review:
+/// the node path's FIRST page used to map every error, including a missing
+/// graph, to INTERNAL). It must also not provision the graph as a side effect.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn graph_doget_on_missing_graph_is_not_found() {
+    let server = FlightTestServer::start().await.expect("server start");
+    let channel = tonic::transport::Endpoint::from_shared(server.flight_url())
+        .expect("endpoint")
+        .connect()
+        .await
+        .expect("flight channel");
+    let mut flight = FlightServiceClient::new(channel);
+
+    for model in ["graph_nodes", "graph_edges"] {
+        let ticket = Ticket {
+            ticket: serde_json::to_vec(&serde_json::json!({
+                "model": model,
+                "graph_id": "never_created_graph",
+            }))
+            .unwrap()
+            .into(),
+        };
+        let status = match flight.do_get(ticket).await {
+            Err(status) => status,
+            // A server may accept the call and fail on the first message.
+            Ok(response) => match response.into_inner().next().await {
+                Some(Err(status)) => status,
+                other => panic!("{model}: DoGet on a missing graph must fail, got {other:?}"),
+            },
+        };
+        assert_eq!(
+            status.code(),
+            tonic::Code::NotFound,
+            "{model}: expected NOT_FOUND, got {:?}: {}",
+            status.code(),
+            status.message()
+        );
+    }
+
+    // The failed reads must not have provisioned the graph.
+    let http = reqwest::Client::builder().no_proxy().build().unwrap();
+    let listed = http
+        .get(format!("{}/api/v2/graphs", server.rest_base()))
+        .send()
+        .await
+        .expect("list graphs")
+        .text()
+        .await
+        .expect("list body");
+    assert!(
+        !listed.contains("never_created_graph"),
+        "a DoGet must not provision the graph: {listed}"
+    );
+}

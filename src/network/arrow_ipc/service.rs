@@ -176,8 +176,24 @@ enum NodePage {
 }
 
 /// Map a graph/codec error into a Flight stream error.
+/// True when any cause in the chain is the kernel's typed not-found (e.g. a
+/// never-created graph), however many `.context()` layers wrap it.
+fn is_typed_not_found(e: &anyhow::Error) -> bool {
+    e.chain().any(|cause| {
+        cause
+            .downcast_ref::<proximadb_kernel::error::ProximaDBError>()
+            .is_some_and(proximadb_kernel::error::ProximaDBError::is_not_found)
+    })
+}
+
 fn graph_flight_err(e: anyhow::Error) -> FlightError {
-    FlightError::ProtocolError(e.to_string())
+    // A never-created graph is the caller's NOT_FOUND, not an opaque protocol
+    // error.
+    if is_typed_not_found(&e) {
+        FlightError::Tonic(Box::new(TonicStatus::not_found(format!("{e:#}"))))
+    } else {
+        FlightError::ProtocolError(e.to_string())
+    }
 }
 
 /// ProximaDB Flight service implementation
@@ -3340,9 +3356,18 @@ impl ProximaFlightService {
         ) = if ticket.model == "graph_nodes" {
             let labels: Vec<String> = ticket.label.clone().into_iter().collect();
             // Peek the first page to fix the schema dimension for the whole stream.
+            // The FIRST page is where a never-created graph fails (later pages
+            // only run once it succeeded), so map the typed not-found here:
+            // NOT_FOUND, not INTERNAL (#2511 review).
             let first = Self::query_node_page(&graph, &gid, &labels, page, 0)
                 .await
-                .map_err(|e| TonicStatus::internal(format!("query nodes: {e}")))?;
+                .map_err(|e| {
+                    if is_typed_not_found(&e) {
+                        TonicStatus::not_found(format!("query nodes: {e:#}"))
+                    } else {
+                        TonicStatus::internal(format!("query nodes: {e}"))
+                    }
+                })?;
             let dim = super::graph_codec::embedding_dim_of(&first)
                 .map_err(|e| TonicStatus::invalid_argument(format!("embedding dim: {e}")))?;
             let schema = super::graph_codec::graph_node_schema(dim);
@@ -3393,10 +3418,14 @@ impl ProximaFlightService {
             // adjacency-scoped query; without one, do a full graph edge scan
             // (export/ETL — dump every edge), filtering by type if requested.
             let edges = if ticket.from_node_id.is_none() && ticket.to_node_id.is_none() {
-                let mut all = graph
-                    .all_edges(&gid)
-                    .await
-                    .map_err(|e| TonicStatus::internal(format!("scan edges: {e}")))?;
+                let mut all = graph.all_edges(&gid).await.map_err(|e| {
+                    // A never-created graph is the caller's NOT_FOUND, not a server fault.
+                    if e.is_not_found() {
+                        TonicStatus::not_found(format!("scan edges: {e}"))
+                    } else {
+                        TonicStatus::internal(format!("scan edges: {e}"))
+                    }
+                })?;
                 if let Some(et) = &ticket.edge_type {
                     all.retain(|e| e.edge_type == *et);
                 }
@@ -3412,10 +3441,14 @@ impl ProximaFlightService {
                     offset: None,
                     continuation_token: None,
                 };
-                graph
-                    .query_edges(&gid, query)
-                    .await
-                    .map_err(|e| TonicStatus::internal(format!("query edges: {e}")))?
+                graph.query_edges(&gid, query).await.map_err(|e| {
+                    // A never-created graph is the caller's NOT_FOUND, not a server fault.
+                    if e.is_not_found() {
+                        TonicStatus::not_found(format!("query edges: {e}"))
+                    } else {
+                        TonicStatus::internal(format!("query edges: {e}"))
+                    }
+                })?
             };
             let edges: Vec<crate::graph::Edge> = edges.iter().map(|e| (**e).clone()).collect();
             let batches: Vec<GraphBatchResult> = edges

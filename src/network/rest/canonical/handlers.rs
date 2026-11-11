@@ -3104,6 +3104,73 @@ mod tests {
         assert_eq!(deprecation, Some("true"));
     }
 
+    /// Tenant isolation for REST v2 impact analysis, through the REAL route
+    /// (TD-LANECOV-1 review): the handler passed the BARE graph id to the
+    /// service, so a named tenant analysed the DEFAULT tenant's same-named
+    /// graph. With structural scoping (`for_tenant`), tenant `globex` asking
+    /// about `shared` sees no such graph (404), while the default tenant's own
+    /// request still succeeds.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_v2_impact_analysis_is_tenant_scoped() {
+        use axum::body::to_bytes;
+
+        let (state, _temp_dir) = build_test_app_state().await;
+        // The default tenant (bare id) owns graph `shared` with node `a`.
+        state
+            .graph_operations_service
+            .create_node(
+                "shared",
+                crate::graph::Node {
+                    id: "a".to_string(),
+                    labels: vec!["Doc".to_string()],
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("default tenant creates its graph");
+
+        async fn impact(state: &AppState, tenant: &str) -> (StatusCode, String) {
+            let ctx = crate::network::middleware::tenant::TenantContext::new(
+                tenant,
+                crate::network::middleware::tenant::TenantIdSource::Default,
+            );
+            let api_ctx = proximadb_api::rest::TenantContext {
+                tenant_id: tenant.to_string(),
+            };
+            let router = create_router(state.clone())
+                .nest(
+                    "/api/v2",
+                    crate::network::rest::v2::create_v2_router().with_state(state.clone()),
+                )
+                .layer(axum::Extension(ctx))
+                .layer(axum::Extension(api_ctx));
+            let request = Request::builder()
+                .method("POST")
+                .uri("/api/v2/graphs/shared/impact-analysis")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"node_id":"a"}"#))
+                .expect("request");
+            let response = router.oneshot(request).await.expect("router");
+            let status = response.status();
+            let body = to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body");
+            (status, String::from_utf8_lossy(&body).into_owned())
+        }
+
+        let (status, body) = impact(&state, "default").await;
+        assert!(
+            status.is_success(),
+            "owner analyses its own graph: {status} {body}"
+        );
+        let (status, body) = impact(&state, "globex").await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "another tenant must not read the default tenant's graph: {body}"
+        );
+    }
+
     /// Record TTL through the REAL REST v2 insert handler (review M3: the
     /// helper tests alone would pass if the handler stopped calling it or
     /// dropped the mapped value).

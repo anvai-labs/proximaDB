@@ -426,10 +426,10 @@ impl GraphCollectionService {
                 info!("Deleted graph collection: {}", graph_id);
                 Ok(())
             }
-            None => Err(ProximaDBError::InvalidInput(format!(
-                "Graph collection '{}' not found",
-                graph_id
-            ))),
+            None => Err(ProximaDBError::NotFound {
+                resource_type: "graph collection".to_string(),
+                id: graph_id.to_string(),
+            }),
         }
     }
 
@@ -466,18 +466,21 @@ impl GraphCollectionService {
             info!("Updated schema for graph: {}", graph_id);
             Ok(())
         } else {
-            Err(ProximaDBError::InvalidInput(format!(
-                "Graph collection '{}' not found",
-                graph_id
-            )))
+            Err(ProximaDBError::NotFound {
+                resource_type: "graph collection".to_string(),
+                id: graph_id.to_string(),
+            })
         }
     }
 
     /// Validate that a graph exists before operations
     pub async fn ensure_graph_exists(&self, graph_id: &str) -> Result<Arc<GraphCollection>> {
-        self.get_graph(graph_id).await?.ok_or_else(|| {
-            ProximaDBError::InvalidInput(format!("Graph collection '{}' does not exist", graph_id))
-        })
+        self.get_graph(graph_id)
+            .await?
+            .ok_or_else(|| ProximaDBError::NotFound {
+                resource_type: "graph collection".to_string(),
+                id: graph_id.to_string(),
+            })
     }
 
     /// Get the graph collection for `graph_id`, lazily provisioning it with defaults (ORION
@@ -515,10 +518,10 @@ impl GraphCollectionService {
         if let Some(collection) = self.get_graph(graph_id).await? {
             Ok(collection.stats.clone())
         } else {
-            Err(ProximaDBError::InvalidInput(format!(
-                "Graph collection '{}' not found",
-                graph_id
-            )))
+            Err(ProximaDBError::NotFound {
+                resource_type: "graph collection".to_string(),
+                id: graph_id.to_string(),
+            })
         }
     }
 }

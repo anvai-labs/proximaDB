@@ -220,6 +220,29 @@ impl TenantGraphOps<'_> {
     pub async fn delete_node(&self, graph_id: &str, id: &NodeId) -> Result<Option<Arc<Node>>> {
         self.inner.delete_node(&self.scope(graph_id)?, id).await
     }
+    /// Tenant-scoped impact analysis. Without this delegation the REST v2
+    /// handler called the service with the BARE graph id, so a named tenant's
+    /// impact analysis read the default tenant's same-named graph.
+    pub async fn impact_analysis(
+        &self,
+        graph_id: &str,
+        start_node_id: &str,
+        direction: crate::graph::model::ImpactDirection,
+        edge_types: Vec<String>,
+        max_depth: u32,
+        limit: usize,
+    ) -> Result<crate::graph::TraversalResponse> {
+        self.inner
+            .impact_analysis(
+                &self.scope(graph_id)?,
+                start_node_id,
+                direction,
+                edge_types,
+                max_depth,
+                limit,
+            )
+            .await
+    }
     pub async fn get_neighbors(&self, graph_id: &str, node_id: &NodeId) -> Result<Vec<Arc<Node>>> {
         self.inner
             .get_neighbors(&self.scope(graph_id)?, node_id)
