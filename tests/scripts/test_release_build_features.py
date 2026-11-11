@@ -718,17 +718,19 @@ class ReleaseBuildFeaturesGuard(unittest.TestCase):
 
         Mutating all of them would trip the `found == 0` safety net instead of
         the value check, which is how an earlier revision looked guarded while
-        letting a single reverted target through. Three live entries since the
-        macOS aarch64 DMG leg (TD-PKG-4); bumped BY HAND when a platform is
-        added — this count is a ratchet against silently feature-less targets.
+        letting a single reverted target through. Two live entries — the
+        macOS aarch64 leg moved to the local-build DMG path (TD-PKG-4), so
+        its features line is commented out. Bumped BY HAND when a platform
+        is added — this count is a ratchet against silently feature-less
+        targets.
         """
         p = self.tree / ".github/workflows/release.yml"
         text = p.read_text(encoding="utf-8")
-        # The Linux + macOS targets also carry `vendored-openssl` (portable
-        # build), so match each live entry by its `cloud-full` prefix, not the
-        # exact value.
+        # The Linux target also carries `vendored-openssl` (portable build),
+        # so match each live entry by its `cloud-full` prefix, not the exact
+        # value. Commented-out entries never match.
         entries = re.findall(r'^            features: "cloud-full[^"]*"\n', text, flags=re.M)
-        self.assertEqual(len(entries), 3)
+        self.assertEqual(len(entries), 2)
         p.write_text(text.replace(entries[-1], replacement + "\n", 1), encoding="utf-8")
 
     def test_rejects_every_empty_features_spelling(self) -> None:
