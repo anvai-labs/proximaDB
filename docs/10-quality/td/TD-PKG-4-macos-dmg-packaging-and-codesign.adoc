@@ -67,3 +67,41 @@ crypto stack off ring.
   leg (abi3 aarch64-apple-darwin), plus the same ring question.
 * **Homebrew**: the formula builds from source against the tarball; once the
   DMG exists, a cask route (drag-install) is a candidate — undecided.
+
+== Update (2026-11-11): hosted macOS jobs are auto-cancelled — DMG ships via the local-build path
+
+The first release dispatch (v0.7.0, tag run `43018447743`) hit the wall the
+ring note above only hinted at: the org **auto-cancels hosted macOS jobs ~1
+second after they start** — three consecutive attempts (`12:13:29→12:13:30`,
+`13:16:45→13:16:46`, `15:32:26`, each cancelled before a runner was ever
+claimed; `runner_name` empty, `runner_group_id: 0`). The cancel actor is
+owner-level; the org audit log holds the final word. Meanwhile
+`release-python.yml`'s `macos-15 aarch64` wheel job sat unclaimed for over an
+hour on the same tag — and the SAME leg had succeeded on 2026-11-09 for
+v0.6.1 — so the policy is new (or newly enforced) as of ~2026-11-11.
+
+Consequence: `release.yml` no longer carries a hosted macOS leg (the matrix
+entry is commented out with the rationale inline, so re-enabling is one
+uncomment if policy ever allows it). The DMG ships via the **local-build +
+manual-attach path**, proven end to end on the v0.7.0 release on an M1 Max
+(64 GB, macOS 26.2, rustc 1.99.0 — build finished in 16m21s):
+
+1. `git worktree add ~/code/proximaDB.worktrees/release-v070 <main-tip-sha>`
+   and `git fetch origin tag vX.Y.Z` (resync from origin first).
+2. `cargo build --release --target aarch64-apple-darwin \
+   --features cloud-full,vendored-openssl \
+   -p proximadb-server -p proximadb-bench -p proximadb-migrate`
+3. Assemble `proximadb-{version}-aarch64-apple-darwin/`: the three binaries,
+   `README.adoc`, `LICENSE`, `config/config.toml` under `config/`.
+4. `codesign --sign - --force` each binary (ad-hoc — same Gatekeeper notes as
+   above).
+5. `hdiutil create -volname "proximadb {version}" -srcfolder <VOLDIR> -ov
+   -format UDZO proximadb-{version}-aarch64-apple-darwin.dmg` + `shasum -a 256`.
+6. Smoke: `hdiutil attach -mountpoint /tmp/x -nobrowse`, run `--version`,
+   `codesign -dv`, detach.
+7. `gh release upload vX.Y.Z proximadb-*.dmg proximadb-*.dmg.sha256` (the run
+   publishes everything else; `validate-artifacts` no longer requires the DMG
+   — it is attached after publish, so it never gates).
+
+`validate-artifacts` accordingly lists only the two hosted binaries as
+required and prints the DMG as "attached separately after publish".

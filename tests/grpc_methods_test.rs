@@ -317,30 +317,64 @@ mod grpc_methods_tests {
         let service = Arc::new(GraphOperationsService::new());
         let before = service.list_graphs().await.expect("list graphs");
 
-        assert!(
-            service
-                .get_node("typo_graph", &"n1".to_string())
-                .await
-                .is_err()
+        // Every read and every mutation of existing data on a never-created
+        // graph is the TYPED not-found (not just "some error"). Covers the
+        // switched call sites broadly so reverting any one to the creating
+        // path is caught (the list_graphs check below also sees it).
+        macro_rules! not_found {
+            ($label:expr, $call:expr) => {{
+                match $call.await {
+                    Err(e) => assert!(
+                        e.is_not_found(),
+                        "{}: expected typed not-found, got {e}",
+                        $label
+                    ),
+                    Ok(_) => panic!("{}: read of a missing graph must fail", $label),
+                }
+            }};
+        }
+        let g = "typo_graph";
+        let n = "n1".to_string();
+        let ids = vec!["n1".to_string()];
+        not_found!("get_node", service.get_node(g, &n));
+        not_found!("get_nodes", service.get_nodes(g, &ids));
+        not_found!("get_edge", service.get_edge(g, &n));
+        not_found!("get_edges", service.get_edges(g, &ids));
+        not_found!("get_neighbors", service.get_neighbors(g, &n));
+        not_found!("all_edges", service.all_edges(g));
+        not_found!("query_nodes", service.query_nodes(g, Default::default()));
+        not_found!("query_edges", service.query_edges(g, Default::default()));
+        not_found!("get_stats", service.get_stats(g));
+        not_found!("has_cycle", service.has_cycle(g));
+        not_found!("connected_components", service.connected_components(g));
+        not_found!("traverse", service.traverse(g, Default::default()));
+        not_found!(
+            "update_node",
+            service.update_node(
+                g,
+                Node {
+                    id: n.clone(),
+                    ..Default::default()
+                }
+            )
         );
-        assert!(
-            service
-                .get_edge("typo_graph", &"e1".to_string())
-                .await
-                .is_err()
-        );
-        assert!(
-            service
-                .delete_node("typo_graph", &"n1".to_string())
-                .await
-                .is_err()
+        not_found!("update_edge", service.update_edge(g, Default::default()));
+        not_found!("delete_node", service.delete_node(g, &n));
+        not_found!("delete_node_detach", service.delete_node_detach(g, &n));
+        not_found!("delete_edge", service.delete_edge(g, &n));
+        not_found!(
+            "remove_unique_constraint",
+            service.remove_unique_constraint(g, "L", "p")
         );
         let err = service
-            .get_node("typo_graph", &"n1".to_string())
+            .get_node(g, &n)
             .await
             .expect_err("missing graph")
             .to_string();
-        assert!(err.contains("not found"), "maps to NOT_FOUND: {err}");
+        assert!(
+            err.contains("not found"),
+            "message maps to NOT_FOUND: {err}"
+        );
 
         let after = service.list_graphs().await.expect("list graphs");
         assert_eq!(before, after, "a read/mutation must not provision a graph");

@@ -18,7 +18,10 @@ use proximadb_storage_filesystem_types::{
 /// Minimal fake filesystem: `read` returns a fixed buffer; everything else
 /// no-ops or errors (the wrapper only needs the read surface to count).
 #[derive(Debug)]
-struct FakeFs;
+struct FakeFs {
+    /// Coalesce adjacent ranges into one physical GET (object-store-like).
+    coalesce: bool,
+}
 
 #[async_trait]
 impl FileSystem for FakeFs {
@@ -33,7 +36,7 @@ impl FileSystem for FakeFs {
     // see"), so the batched read below is one GET, not one per range. A
     // wrapper counting logical ranges would report 2 and fail this test.
     fn range_coalesce_policy(&self) -> Option<RangeCoalescePolicy> {
-        Some(RangeCoalescePolicy {
+        self.coalesce.then_some(RangeCoalescePolicy {
             max_gap_bytes: 0,
             max_merged_bytes: 1 << 20,
         })
@@ -87,7 +90,10 @@ impl FileSystem for FakeFs {
 #[tokio::test]
 async fn counting_filesystem_counts_reads_without_double_counting() {
     let counters = Arc::new(GetCounters::default());
-    let fs = CountingFileSystem::new(Arc::new(FakeFs) as Arc<dyn FileSystem>, counters.clone());
+    let fs = CountingFileSystem::new(
+        Arc::new(FakeFs { coalesce: true }) as Arc<dyn FileSystem>,
+        counters.clone(),
+    );
 
     // One full read, one ranged read, one batched read of two adjacent
     // ranges (coalesced by the fake's plan into one physical GET).
@@ -110,9 +116,30 @@ async fn counting_filesystem_counts_reads_without_double_counting() {
     let range_buf = fs.read_range("a", 0, 4).await.expect("read_range again");
     assert_eq!(range_buf.len(), 4);
     assert!(counters.bytes_read.load(Ordering::Relaxed) >= buf.len() as u64);
+    // Exact: 11 (full) + 5 (range) + 6 (batched) + 4 (range again). A wrapper
+    // that double-counted any read would exceed this.
+    assert_eq!(counters.bytes_read.load(Ordering::Relaxed), 11 + 5 + 6 + 4);
 
     // reset clears everything.
     counters.reset();
     assert_eq!(counters.total_gets(), 0);
     assert_eq!(counters.bytes_read.load(Ordering::Relaxed), 0);
+}
+
+/// Without coalescing (the default plan), two ranges are two physical GETs:
+/// the wrapper counts what the wire sees, in both directions.
+#[tokio::test]
+async fn counting_filesystem_counts_each_physical_get_without_coalescing() {
+    let counters = Arc::new(GetCounters::default());
+    let fs = CountingFileSystem::new(
+        Arc::new(FakeFs { coalesce: false }) as Arc<dyn FileSystem>,
+        counters.clone(),
+    );
+    let _ = fs
+        .read_ranges("a", vec![0..3, 3..6])
+        .await
+        .expect("read_ranges");
+    assert_eq!(counters.batched_range_reads.load(Ordering::Relaxed), 2);
+    assert_eq!(counters.total_gets(), 2);
+    assert_eq!(counters.bytes_read.load(Ordering::Relaxed), 6);
 }

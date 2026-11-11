@@ -4,7 +4,8 @@
 //!
 //! Boots a full DB with the drift knob driven tiny via env
 //! (`PROXIMADB_DRIFT_THRESHOLD_WRITES=1`, `PROXIMADB_DRIFT_INTERVAL_SECS=1`) so the
-//! background watcher fires fast, then:
+//! background watcher fires fast, and the AXIS runtime switch on (the watcher
+//! is an AXIS maintenance loop and is not spawned without it), then:
 //!   1. inserts records and runs ONE recluster (seeds discovery history + the
 //!      LSN baseline — the watcher only sweeps collections that have history),
 //!   2. inserts MORE records (advancing the manifest LSN past the baseline),
@@ -101,7 +102,17 @@ async fn drift_watcher_auto_reclusters_after_writes() {
         std::env::set_var("PROXIMADB_DRIFT_INTERVAL_SECS", "1");
     }
 
-    let server = TestPgServer::start().await.expect("server start");
+    // The DriftWatcher is spawned only when AXIS is compiled in AND the AXIS
+    // runtime switch is on (`src/network/shared_services.rs`, gated by #1384):
+    // recluster is AXIS maintenance. The runtime switch defaults OFF (ADR-070,
+    // `default_enable_axis_indexes`), so a default-config boot never starts the
+    // watcher and no auto-recluster can ever appear. Opt in, as the server
+    // would in an AXIS deployment.
+    let server = TestPgServer::start_with(|config| {
+        config.storage.optimization.enable_axis_indexes = true;
+    })
+    .await
+    .expect("server start");
     let (http, base) = server.rest_client().expect("rest client");
     let name = server.unique_name("disc_drift");
     let dim: usize = 8;

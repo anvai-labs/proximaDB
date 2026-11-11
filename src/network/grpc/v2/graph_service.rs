@@ -1615,6 +1615,18 @@ mod tests {
             err.to_string().contains("not found"),
             "expected the missing-graph error, got: {err}"
         );
+        // Typed, not just worded: callers match the variant, so a wrapping
+        // `.context()` cannot hide it (TD-LANECOV-1 review).
+        assert!(
+            err.is_not_found(),
+            "expected the typed not-found, got: {err}"
+        );
+        // ...and the failed read provisioned nothing for globex.
+        let graphs = graph.list_graphs().await?;
+        assert!(
+            !graphs.iter().any(|g| g.contains("globex")),
+            "a read must not provision the other tenant's graph: {graphs:?}"
+        );
 
         // globex's own first WRITE provisions ITS graph; acme's node does not
         // leak into it (isolation).

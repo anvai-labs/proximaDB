@@ -109,6 +109,9 @@ impl From<VectorDBError> for crate::core::errors::ProximaDBError {
             VectorDBError::SavepointNotFound { name } => {
                 crate::core::errors::ProximaDBError::SavepointNotFound { name }
             }
+            VectorDBError::NotFound { resource_type, id } => {
+                crate::core::errors::ProximaDBError::NotFound { resource_type, id }
+            }
         }
     }
 }

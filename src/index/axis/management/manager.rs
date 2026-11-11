@@ -4424,6 +4424,17 @@ pub struct ScoredResult {
     pub expires_at: Option<DateTime<Utc>>,
 }
 
+impl ScoredResult {
+    /// The record's TTL as `valid_to_ns` (ns since epoch), the unit every
+    /// read path and cache uses (CLAUDE.md 16a). Converters to
+    /// `OptimizedSearchRecord` must carry it: dropping it (`..Default`) made
+    /// the result look like it never expires, so a cached AXIS result outlived
+    /// its records' TTL (TD-QCACHE-TTL-1).
+    pub fn valid_to_ns(&self) -> Option<i64> {
+        self.expires_at.and_then(|at| at.timestamp_nanos_opt())
+    }
+}
+
 impl AxisManager {
     /// ADR-011 PreFilter: evaluate scalar predicates first, then score the
     /// surviving candidates EXACTLY. `query.search_effort` is intentionally not
@@ -6928,5 +6939,30 @@ mod hmgi_lifecycle_tests {
                 .is_empty()
         );
         assert!(registry.is_empty().await);
+    }
+}
+
+#[cfg(test)]
+mod scored_result_ttl_tests {
+    use super::*;
+
+    /// The AXIS manager's hit TTL reaches `valid_to_ns` in ns (TD-QCACHE-TTL-1).
+    #[test]
+    fn valid_to_ns_is_the_expiry_in_nanoseconds() {
+        let at = DateTime::<Utc>::from_timestamp(1_700_000_000, 5).expect("ts");
+        let hit = ScoredResult {
+            vector_id: "v".to_string(),
+            similarity: 0.9,
+            expires_at: Some(at),
+        };
+        assert_eq!(hit.valid_to_ns(), Some(1_700_000_000_000_000_005));
+        assert_eq!(
+            ScoredResult {
+                expires_at: None,
+                ..hit
+            }
+            .valid_to_ns(),
+            None
+        );
     }
 }

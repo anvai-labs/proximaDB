@@ -438,7 +438,8 @@ mod tests {
         assert_eq!(record.created_at_ns, 100);
         assert_eq!(record.updated_at_ns, 100);
         assert_eq!(record.valid_from_ns, Some(100));
-        assert_eq!(record.valid_to_ns, Some(250));
+        // End time is data (props.end_time_ns), not a TTL (valid_to_ns).
+        assert_eq!(record.valid_to_ns, None);
         assert!(record.props.contains_key("attributes"));
     }
 

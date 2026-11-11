@@ -199,7 +199,11 @@ pub fn trace_data_to_proxima_record(namespace: &str, span: &TraceData) -> Proxim
 
     let mut record = base_observability_record(namespace, key.canonical_oid(), span.start_time_ns);
     record.local_id = Some(key.local_id);
-    record.valid_to_ns = Some(span.end_time_ns);
+    // NOT `valid_to_ns = end_time_ns`: `valid_to_ns` is the record's
+    // liveness/TTL (CLAUDE.md 16a), and a completed span's end time is in the
+    // past, so that encoding made every span dead on arrival: invisible to
+    // any read path applying the canonical dead-record predicate. The end
+    // time lives in `props.end_time_ns`; a span record never expires by TTL.
     record.props = props;
     record.labels.insert(SPAN_LABEL);
     record
@@ -487,7 +491,13 @@ mod tests {
 
         assert_eq!(record.oid, "obs://tenant-a/span/trace-1:span-1");
         assert_eq!(record.valid_from_ns, Some(1_000));
-        assert_eq!(record.valid_to_ns, Some(1_250));
+        // The end time is data, not a TTL: the span stays live to reads.
+        assert_eq!(record.valid_to_ns, None);
+        assert!(
+            !record.is_dead(i64::MAX),
+            "a completed span must not read as dead"
+        );
+        assert!(record.props.contains_key("end_time_ns"));
         assert!(record.labels.contains(SPAN_LABEL));
     }
 }

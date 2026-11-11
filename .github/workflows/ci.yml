@@ -3608,6 +3608,7 @@ jobs:
               --test cross_model_transaction_e2e \
               --test cross_surface_unification_e2e \
               --test dedup_utility_contracts \
+              --test discovery_drift_watcher_e2e \
               --test discovery_job_republish_test \
               --test distance_metric_consistency_test \
               --test dual_mode_integration_test \
@@ -3645,6 +3646,7 @@ jobs:
               --test rest_api_load_test \
               --test rest_api_v1_test \
               --test rl_planner_integration_test \
+              --test route_cost_offline_eval \
               --test route_cost_override_pgwire_eval \
               --test route_geometry_calibration_e2e \
               --test sks_fixtures_test \

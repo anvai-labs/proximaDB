@@ -55,6 +55,27 @@ pub struct CachedQueryResult {
     /// read-after-write still holds. `0` = "unversioned" (written by a
     /// non-LSN-aware path; never served to a Strong read via the LSN gate).
     pub computed_at_lsn: u64,
+    /// Earliest TTL expiry (`valid_to_ns`, ns) among the cached records, or
+    /// `None` when none of them expires. TTL expiry is time-based: it advances
+    /// no LSN and triggers no invalidation, so the age and LSN checks cannot
+    /// see it. Past this instant the entry is treated as a miss, otherwise a
+    /// hit would serve a record every read path must hide (CLAUDE.md 16a/16c;
+    /// TD-QCACHE-TTL-1). Writers compute it with
+    /// `OptimizedSearchRecord::earliest_expiry_ns` before the v1 conversion,
+    /// which drops the per-record expiry.
+    pub min_valid_to_ns: Option<i64>,
+}
+
+impl CachedQueryResult {
+    /// True once the earliest-expiring cached record has passed its TTL.
+    pub fn has_expired_record(&self, now_ns: i64) -> bool {
+        self.min_valid_to_ns.is_some_and(|ns| ns <= now_ns)
+    }
+}
+
+/// Wall-clock now in ns (the same clock the read-path dead predicate uses).
+fn now_ns() -> i64 {
+    chrono::Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX)
 }
 
 impl CacheValue for CachedQueryResult {
@@ -99,11 +120,32 @@ impl QueryCache {
                 .unwrap_or_default()
                 .as_secs();
 
-            if age <= max_age_secs {
+            // TTL is time-based (no LSN / invalidation), so check it here.
+            if age <= max_age_secs && !cached.has_expired_record(now_ns()) {
                 return Some(cached.results);
             }
         }
         None
+    }
+
+    /// Like [`Self::get_if_fresh`], also returning the entry's earliest record
+    /// expiry so a caller that re-caches the results (a second cache layer)
+    /// can carry it forward instead of losing it.
+    pub async fn get_if_fresh_with_expiry(
+        &self,
+        key: &QueryKey,
+        max_age_secs: u64,
+    ) -> Option<(Vec<SearchResult>, Option<i64>)> {
+        let cached = BaseCache::get_with_hooks(&self.base, key).await?;
+        let age = SystemTime::now()
+            .duration_since(cached.cached_at)
+            .unwrap_or_default()
+            .as_secs();
+        if age <= max_age_secs && !cached.has_expired_record(now_ns()) {
+            Some((cached.results, cached.min_valid_to_ns))
+        } else {
+            None
+        }
     }
 
     /// Get cached results as v1 if fresh (converts legacy to v1 on read)
@@ -118,7 +160,8 @@ impl QueryCache {
                 .unwrap_or_default()
                 .as_secs();
 
-            if age <= max_age_secs {
+            // TTL is time-based (no LSN / invalidation), so check it here.
+            if age <= max_age_secs && !cached.has_expired_record(now_ns()) {
                 return Some(
                     cached
                         .results
@@ -155,7 +198,8 @@ impl QueryCache {
                 .duration_since(cached.cached_at)
                 .unwrap_or_default()
                 .as_secs();
-            if age <= max_age_secs {
+            // TTL is time-based (no LSN / invalidation), so check it here.
+            if age <= max_age_secs && !cached.has_expired_record(now_ns()) {
                 return Some(cached.results.into_iter().collect());
             }
         }
@@ -168,12 +212,14 @@ impl QueryCache {
         key: QueryKey,
         results: Vec<SearchResult>,
         dependencies: Vec<String>,
+        min_valid_to_ns: Option<i64>,
     ) {
         let cached = CachedQueryResult {
             results,
             cached_at: SystemTime::now(),
             file_dependencies: dependencies,
             computed_at_lsn: 0,
+            min_valid_to_ns,
         };
 
         BaseCache::put_with_hooks(&self.base, key, cached).await;
@@ -185,6 +231,7 @@ impl QueryCache {
         key: QueryKey,
         results: Vec<crate::proto::proximadb_v1::SearchResult>,
         dependencies: Vec<String>,
+        min_valid_to_ns: Option<i64>,
     ) {
         let legacy: Vec<SearchResult> = results
             .into_iter()
@@ -195,6 +242,7 @@ impl QueryCache {
             cached_at: SystemTime::now(),
             file_dependencies: dependencies,
             computed_at_lsn: 0,
+            min_valid_to_ns,
         };
         BaseCache::put_with_hooks(&self.base, key, cached).await;
     }
@@ -208,6 +256,7 @@ impl QueryCache {
         results: Vec<SearchResult>,
         dependencies: Vec<String>,
         computed_at_lsn: u64,
+        min_valid_to_ns: Option<i64>,
     ) {
         let legacy: Vec<SearchResult> = results.into_iter().collect();
         let cached = CachedQueryResult {
@@ -215,6 +264,7 @@ impl QueryCache {
             cached_at: SystemTime::now(),
             file_dependencies: dependencies,
             computed_at_lsn,
+            min_valid_to_ns,
         };
         BaseCache::put_with_hooks(&self.base, key, cached).await;
     }
@@ -324,7 +374,7 @@ mod lsn_gate_tests {
         let cache = QueryCache::new(16);
         let k = key("c1");
         cache
-            .cache_with_dependencies_v1_at_lsn(k.clone(), Vec::new(), Vec::new(), 42)
+            .cache_with_dependencies_v1_at_lsn(k.clone(), Vec::new(), Vec::new(), 42, None)
             .await;
 
         assert!(cache.get_if_fresh_v1_at_lsn(&k, 300, 42).await.is_some());
@@ -339,7 +389,7 @@ mod lsn_gate_tests {
         let cache = QueryCache::new(16);
         let k = key("c2");
         cache
-            .cache_with_dependencies_v1(k.clone(), Vec::new(), Vec::new())
+            .cache_with_dependencies_v1(k.clone(), Vec::new(), Vec::new(), None)
             .await;
 
         assert!(cache.get_if_fresh_v1_at_lsn(&k, 300, 7).await.is_none());
@@ -356,7 +406,7 @@ mod lsn_gate_tests {
         let cache = QueryCache::new(16);
         let k = key("c3");
         cache
-            .cache_with_dependencies_v1_at_lsn(k.clone(), Vec::new(), Vec::new(), 99)
+            .cache_with_dependencies_v1_at_lsn(k.clone(), Vec::new(), Vec::new(), 99, None)
             .await;
         // Present at its LSN before the write.
         assert!(cache.get_if_fresh_v1_at_lsn(&k, 300, 99).await.is_some());
@@ -366,5 +416,83 @@ mod lsn_gate_tests {
 
         // The LSN-pinned entry is gone → the next Strong read recomputes.
         assert!(cache.get_if_fresh_v1_at_lsn(&k, 300, 99).await.is_none());
+    }
+}
+
+#[cfg(test)]
+mod ttl_expiry_tests {
+    //! TD-QCACHE-TTL-1: TTL expiry is time-based (no LSN advance, no
+    //! invalidation), so every getter must refuse an entry once its
+    //! earliest-expiring record has passed its TTL, including the LSN-gated
+    //! Strong path at a MATCHING LSN.
+    use super::*;
+
+    fn key() -> QueryKey {
+        QueryKey::new("ttl_c".to_string(), &[0.1f32, 0.2, 0.3], 5, None)
+    }
+    fn past() -> Option<i64> {
+        Some(now_ns() - 1_000_000_000)
+    }
+    fn future() -> Option<i64> {
+        Some(now_ns() + 3_600_000_000_000)
+    }
+
+    #[tokio::test]
+    async fn expired_entry_is_a_miss_on_every_getter() {
+        let cache = QueryCache::new(16);
+        cache
+            .cache_with_dependencies_v1_at_lsn(key(), Vec::new(), Vec::new(), 42, past())
+            .await;
+        assert!(
+            cache.get_if_fresh(&key(), 300).await.is_none(),
+            "get_if_fresh"
+        );
+        assert!(
+            cache.get_if_fresh_v1(&key(), 300).await.is_none(),
+            "get_if_fresh_v1"
+        );
+        assert!(
+            cache
+                .get_if_fresh_v1_at_lsn(&key(), 300, 42)
+                .await
+                .is_none(),
+            "Strong read at the matching LSN must still miss an expired entry"
+        );
+        assert!(
+            cache.get_if_fresh_with_expiry(&key(), 300).await.is_none(),
+            "with_expiry"
+        );
+    }
+
+    #[tokio::test]
+    async fn unexpired_or_ttl_less_entry_still_hits() {
+        let cache = QueryCache::new(16);
+        cache
+            .cache_with_dependencies_v1_at_lsn(key(), Vec::new(), Vec::new(), 42, future())
+            .await;
+        assert!(
+            cache
+                .get_if_fresh_v1_at_lsn(&key(), 300, 42)
+                .await
+                .is_some()
+        );
+        let (_, expiry) = cache
+            .get_if_fresh_with_expiry(&key(), 300)
+            .await
+            .expect("future expiry is a hit");
+        // The stored expiry travels with the hit (for a re-caching caller).
+        assert!(
+            expiry.is_some_and(|ns| ns > now_ns()),
+            "expiry travels: {expiry:?}"
+        );
+
+        let cache = QueryCache::new(16);
+        cache
+            .cache_with_dependencies_v1(key(), Vec::new(), Vec::new(), None)
+            .await;
+        assert!(
+            cache.get_if_fresh(&key(), 300).await.is_some(),
+            "no TTL never expires"
+        );
     }
 }
