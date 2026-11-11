@@ -830,8 +830,9 @@ impl GraphOperationsService {
         self.collection_service
             .get_graph(graph_id)
             .await?
-            .ok_or_else(|| {
-                ProximaDBError::InvalidInput(format!("Graph collection '{}' not found", graph_id))
+            .ok_or_else(|| ProximaDBError::NotFound {
+                resource_type: "graph collection".to_string(),
+                id: graph_id.to_string(),
             })
     }
 

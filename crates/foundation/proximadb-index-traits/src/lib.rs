@@ -167,6 +167,17 @@ pub struct IndexScoredResult {
     pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
+impl IndexScoredResult {
+    /// The record's TTL as `valid_to_ns` (ns since epoch), the unit every read
+    /// path and cache uses. Engine converters to `OptimizedSearchRecord` must
+    /// carry it; dropping it makes the result look like it never expires
+    /// (TD-QCACHE-TTL-1). Same rule as the AXIS manager's
+    /// `ScoredResult::valid_to_ns`.
+    pub fn valid_to_ns(&self) -> Option<i64> {
+        self.expires_at.and_then(|at| at.timestamp_nanos_opt())
+    }
+}
+
 /// A slim, read-only snapshot of one index for a collection — the foundation-only
 /// stand-in for a live `Arc<dyn AxisVectorIndex>` reader handle.
 ///
@@ -312,4 +323,27 @@ pub trait IndexEngine:
     /// Downcast to `Any` for concrete-type access (e.g., AXIS-specific recall-target advisor methods).
     /// Callers can use `.downcast_ref::<AxisManager>()` to recover the concrete type.
     fn as_any(&self) -> &dyn std::any::Any;
+}
+
+#[cfg(test)]
+mod scored_result_ttl_tests {
+    use super::*;
+
+    /// An AXIS hit's TTL must reach `valid_to_ns` in ns; dropping it made a
+    /// cached AXIS result look like it never expires (TD-QCACHE-TTL-1, #2516).
+    #[test]
+    fn valid_to_ns_is_the_expiry_in_nanoseconds() {
+        let at = chrono::DateTime::<chrono::Utc>::from_timestamp(1_700_000_000, 5).expect("ts");
+        let hit = IndexScoredResult {
+            vector_id: "v".to_string(),
+            similarity: 0.9,
+            expires_at: Some(at),
+        };
+        assert_eq!(hit.valid_to_ns(), Some(1_700_000_000_000_000_005));
+        let no_ttl = IndexScoredResult {
+            expires_at: None,
+            ..hit
+        };
+        assert_eq!(no_ttl.valid_to_ns(), None);
+    }
 }

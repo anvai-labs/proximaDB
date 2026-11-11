@@ -337,11 +337,18 @@ impl EntityOrchestrator {
         entity_id: &str,
     ) -> Result<Option<Arc<Node>>> {
         let node_id = Self::entity_node_id(collection, entity_id);
-        self.graph
+        // An entity collection's backing graph is provisioned lazily on the
+        // first upsert, so "no graph yet" means "no entities yet": not found,
+        // not a server error. Matched on the typed variant, before `.context()`.
+        match self
+            .graph
             .for_tenant(tenant)
             .get_node(collection, &node_id)
             .await
-            .context("get entity node")
+        {
+            Err(e) if e.is_not_found() => Ok(None),
+            other => other.context("get entity node"),
+        }
     }
 
     /// Delete the entity graph node. Returns whether it existed. (Associated
@@ -349,13 +356,16 @@ impl EntityOrchestrator {
     /// auxiliary-id convention.) `tenant` scopes the graph delete structurally.
     pub async fn delete(&self, collection: &str, tenant: &str, entity_id: &str) -> Result<bool> {
         let node_id = Self::entity_node_id(collection, entity_id);
-        Ok(self
+        // No backing graph yet => the entity did not exist (see `get`).
+        match self
             .graph
             .for_tenant(tenant)
             .delete_node(collection, &node_id)
             .await
-            .context("delete entity node")?
-            .is_some())
+        {
+            Err(e) if e.is_not_found() => Ok(false),
+            other => Ok(other.context("delete entity node")?.is_some()),
+        }
     }
 
     /// Search entities. With a `query_vector`: graph-augmented vector fusion via the
@@ -430,12 +440,16 @@ impl EntityOrchestrator {
             offset: None,
             continuation_token: None,
         };
-        let nodes = self
+        // No backing graph yet => no entities to scan (see `get`).
+        let nodes = match self
             .graph
             .for_tenant(tenant)
             .query_nodes(collection, query)
             .await
-            .context("entity node scan")?;
+        {
+            Err(e) if e.is_not_found() => Vec::new(),
+            other => other.context("entity node scan")?,
+        };
         let prefix = format!("entity:{collection}:");
         Ok(nodes
             .into_iter()

@@ -186,7 +186,10 @@ fn node_to_dto(node: &crate::graph::Node, collection: &str) -> EntityDto {
 }
 
 fn err_internal(operation: &str, e: impl std::fmt::Display) -> ApiError {
-    let msg = e.to_string();
+    // `{:#}` renders an anyhow error's FULL cause chain ("ctx: cause"); plain
+    // `to_string()` is only the outermost `.context()`, so a wrapped
+    // not-found used to classify as a 500. Same output for other Display types.
+    let msg = format!("{e:#}");
     let lower = msg.to_lowercase();
     if lower.contains("not found") {
         ApiError::NotFound(msg)
