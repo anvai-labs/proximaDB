@@ -39,7 +39,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::watch;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use super::job::DiscoveryJob;
 use super::service::DiscoveryService;
@@ -164,22 +164,52 @@ impl DriftWatcher {
     async fn sweep_targets(&self) -> std::collections::HashMap<String, String> {
         let mut by_name: std::collections::HashMap<String, String> =
             std::collections::HashMap::new();
+        // The internal listing spans ALL tenants, but the discovery pipeline
+        // (baseline, signal, job, executor pin) is keyed by collection NAME and
+        // is not tenant-aware. A name owned by more than one collection (two
+        // tenants' `orders`) cannot be attributed safely: one tenant's writes
+        // would trigger a recluster pinned to the other's collection. Such names
+        // are skipped (warned), never guessed (TD-DISCOVERY-TENANT-1).
+        let mut ambiguous: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         if let Some(source) = &self.collection_source {
             match source.list_collections_internal().await {
                 Ok(cols) => {
                     for c in cols {
-                        if let Some(name) = c.config.as_ref().map(|cfg| cfg.name.clone()) {
-                            by_name.entry(name).or_insert(c.id);
+                        let Some(name) = c.config.as_ref().map(|cfg| cfg.name.clone()) else {
+                            continue;
+                        };
+                        match by_name.get(&name) {
+                            Some(existing) if *existing != c.id => {
+                                ambiguous.insert(name);
+                            }
+                            Some(_) => {}
+                            None => {
+                                by_name.insert(name, c.id);
+                            }
                         }
                     }
                 }
                 Err(err) => debug!("DriftWatcher: collection listing failed: {err:#}"),
             }
         }
+        for name in &ambiguous {
+            by_name.remove(name);
+        }
+        if !ambiguous.is_empty() {
+            warn!(
+                "DriftWatcher: skipping {} collection name(s) owned by more than one tenant \
+                 (discovery is name-keyed; TD-DISCOVERY-TENANT-1): {:?}",
+                ambiguous.len(),
+                ambiguous
+            );
+        }
         // History-only collections may not be in the catalog list; fall back to
         // name-as-id (the manifest lookup then returns 0 — no spurious signal).
+        // An ambiguous name is never re-added under a guessed id.
         for c in self.service.registry().collections() {
-            by_name.entry(c.clone()).or_insert_with(|| c.clone());
+            if !ambiguous.contains(&c) {
+                by_name.entry(c.clone()).or_insert_with(|| c.clone());
+            }
         }
         by_name
     }
@@ -370,7 +400,18 @@ mod tests {
 
     /// A port that scopes like `CollectionService`: the request listing denies
     /// a missing tenant (empty), only the internal listing sees everything.
-    struct TenantScopedPort;
+    struct TenantScopedPort {
+        /// (internal id, collection name) across ALL tenants.
+        collections: Vec<(&'static str, &'static str)>,
+    }
+
+    impl TenantScopedPort {
+        fn orders() -> Self {
+            Self {
+                collections: vec![("7", "orders")],
+            }
+        }
+    }
 
     #[async_trait::async_trait]
     impl proximadb_runtime::CollectionPort for TenantScopedPort {
@@ -416,14 +457,18 @@ mod tests {
         async fn list_collections_internal(
             &self,
         ) -> anyhow::Result<Vec<proximadb_proto::v1::Collection>> {
-            Ok(vec![proximadb_proto::v1::Collection {
-                id: "7".to_string(),
-                config: Some(proximadb_proto::v1::CollectionConfig {
-                    name: "orders".to_string(),
+            Ok(self
+                .collections
+                .iter()
+                .map(|(id, name)| proximadb_proto::v1::Collection {
+                    id: id.to_string(),
+                    config: Some(proximadb_proto::v1::CollectionConfig {
+                        name: name.to_string(),
+                        ..Default::default()
+                    }),
                     ..Default::default()
-                }),
-                ..Default::default()
-            }])
+                })
+                .collect())
         }
         async fn resolve_collection_id(&self, identifier: &str) -> anyhow::Result<Option<String>> {
             Ok(Some(identifier.to_string()))
@@ -445,7 +490,7 @@ mod tests {
             coordinator.clone(),
         ));
         let w = DriftWatcher::new(service, coordinator, 10)
-            .with_collection_source(Arc::new(TenantScopedPort));
+            .with_collection_source(Arc::new(TenantScopedPort::orders()));
         let targets = w.sweep_targets().await;
         assert_eq!(
             targets.get("orders").map(String::as_str),
@@ -457,5 +502,30 @@ mod tests {
         // collections (name-as-id) are swept — `orders` is absent.
         let (bare, _r) = watcher().await;
         assert!(bare.sweep_targets().await.is_empty());
+    }
+
+    /// Two tenants own a collection named `orders` (internal ids 7 and 9). The
+    /// name-keyed discovery pipeline cannot attribute drift to either safely,
+    /// so the name is skipped, never resolved to whichever id listed first; a
+    /// uniquely named collection is still swept (#2511 review).
+    #[tokio::test]
+    async fn sweep_targets_skip_names_shared_across_tenants() {
+        let coordinator = Arc::new(SnapshotPublishCoordinator::new(Arc::new(
+            CatalogManager::new(),
+        )));
+        let service = Arc::new(DiscoveryService::new(
+            Arc::new(DiscoveryRegistry::new()),
+            coordinator.clone(),
+        ));
+        let port = TenantScopedPort {
+            collections: vec![("7", "orders"), ("9", "orders"), ("11", "invoices")],
+        };
+        let w = DriftWatcher::new(service, coordinator, 10).with_collection_source(Arc::new(port));
+        let targets = w.sweep_targets().await;
+        assert!(
+            !targets.contains_key("orders"),
+            "an ambiguous cross-tenant name must not be swept: {targets:?}"
+        );
+        assert_eq!(targets.get("invoices").map(String::as_str), Some("11"));
     }
 }

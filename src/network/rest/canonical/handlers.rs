@@ -3104,14 +3104,6 @@ mod tests {
         assert_eq!(deprecation, Some("true"));
     }
 
-    /// Record TTL through the REAL REST v2 insert handler (review M3: the
-    /// helper tests alone would pass if the handler stopped calling it or
-    /// dropped the mapped value).
-    ///
-    /// * a future expiry is accepted and the record is readable;
-    /// * a plausible PAST expiry (2020) is accepted, and the record is dead
-    ///   on read: proves `valid_to_ns` actually reaches the stored record;
-    /// * 0 (tombstone encoding) and epoch seconds are rejected per record.
     /// Tenant isolation for REST v2 impact analysis, through the REAL route
     /// (TD-LANECOV-1 review): the handler passed the BARE graph id to the
     /// service, so a named tenant analysed the DEFAULT tenant's same-named
@@ -3179,6 +3171,14 @@ mod tests {
         );
     }
 
+    /// Record TTL through the REAL REST v2 insert handler (review M3: the
+    /// helper tests alone would pass if the handler stopped calling it or
+    /// dropped the mapped value).
+    ///
+    /// * a future expiry is accepted and the record is readable;
+    /// * a plausible PAST expiry (2020) is accepted, and the record is dead
+    ///   on read: proves `valid_to_ns` actually reaches the stored record;
+    /// * 0 (tombstone encoding) and epoch seconds are rejected per record.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_v2_insert_records_maps_expires_at_ms_end_to_end() {
         use axum::body::to_bytes;

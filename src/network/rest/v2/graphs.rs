@@ -349,6 +349,13 @@ pub async fn impact_analysis_v2(
             // A never-created graph is a 404, not a 500.
             if error.is_not_found() {
                 ApiError::NotFound(format!("impact analysis: {error}"))
+            } else if matches!(
+                error,
+                proximadb_kernel::error::ProximaDBError::InvalidInput(_)
+            ) {
+                // An invalid graph id or tenant (e.g. a `/` in the id, which
+                // structural scoping rejects) is the caller's 400, not a 500.
+                ApiError::InvalidArgument(format!("impact analysis: {error}"))
             } else {
                 ApiError::Internal(format!("impact analysis failed: {error}"))
             }
