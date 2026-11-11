@@ -1627,10 +1627,16 @@ impl UnifiedStorageFormat for SwiftEngine {
             let swift_filter: Option<super::MetadataFilter> = None;
 
             let mut all_results = Vec::new();
+            let mut newest = proximadb_records::NewestVersionIndex::new();
             for swift_file in &files {
                 let file_results = swift_file
                     .search_without_index(query_vector, top_k, swift_filter.clone(), &prune_config)
                     .await?;
+                // Observe every row BEFORE the filter: a newer copy that no longer
+                // matches must still shadow an older matching one (TD-ENGINE-MVCC-1).
+                for record in &file_results {
+                    newest.observe(&swift_record_id(record), record.version_key());
+                }
                 // Apply filter expression after progressive search if provided
                 let filtered_results = if let Some(filter_expr) = filter_expression {
                     file_results
@@ -1650,8 +1656,11 @@ impl UnifiedStorageFormat for SwiftEngine {
 
             // Dead records (tombstoned or TTL-expired) never reach a read and
             // must not take a top-k slot (CLAUDE.md 16a; engine TTL conformance).
+            // Pick each id's newest copy FIRST, then dead-filter it.
             let now_ns = proximadb_kernel::time::now_unix_ns();
-            all_results.retain(|r| !r.is_dead(now_ns));
+            all_results.retain(|r| {
+                newest.is_newest(&swift_record_id(r), &r.version_key()) && !r.is_dead(now_ns)
+            });
 
             // Sort and take top_k from all results
             all_results.sort_by(|a, b| {
@@ -1721,11 +1730,17 @@ impl UnifiedStorageFormat for SwiftEngine {
         let swift_filter: Option<super::MetadataFilter> = None;
 
         let mut all_results = Vec::new();
+        let mut newest = proximadb_records::NewestVersionIndex::new();
         for swift_file in &files {
             // Use search_without_index which applies block pruning
             let file_results = swift_file
                 .search_without_index(query_vector, top_k, swift_filter.clone(), &prune_config)
                 .await?;
+            // Observe every row BEFORE the filter: a newer copy that no longer
+            // matches must still shadow an older matching one (TD-ENGINE-MVCC-1).
+            for record in &file_results {
+                newest.observe(&swift_record_id(record), record.version_key());
+            }
 
             // Apply filter expression after block-pruned search if provided
             let filtered_results = if let Some(filter_expr) = filter_expression {
@@ -1747,8 +1762,11 @@ impl UnifiedStorageFormat for SwiftEngine {
 
         // Dead records (tombstoned or TTL-expired) never reach a read and
         // must not take a top-k slot (CLAUDE.md 16a; engine TTL conformance).
+        // Pick each id's newest copy FIRST, then dead-filter it.
         let now_ns = proximadb_kernel::time::now_unix_ns();
-        all_results.retain(|r| !r.is_dead(now_ns));
+        all_results.retain(|r| {
+            newest.is_newest(&swift_record_id(r), &r.version_key()) && !r.is_dead(now_ns)
+        });
 
         // Sort and take top_k from all results
         all_results.sort_by(|a, b| {
@@ -1955,14 +1973,29 @@ impl SwiftEngine {
         let mut priority_queue = BoundedPriorityQueue::new(top_k);
 
         // Search each SWIFT file by iterating through superblocks and blocks
-        // Dead records are skipped before scoring (CLAUDE.md 16a).
+        // Dead records are skipped before scoring (CLAUDE.md 16a), but only
+        // after each id's newest copy across every file is known: a pre-pass
+        // over the (already loaded) records, so an older live copy cannot
+        // resurface when the newest copy is dead (TD-ENGINE-MVCC-1).
         let now_ns = proximadb_kernel::time::now_unix_ns();
+        let mut newest = proximadb_records::NewestVersionIndex::new();
+        for swift_file in &files {
+            for superblock in &swift_file.superblocks {
+                for block in &superblock.blocks {
+                    for record in &block.records {
+                        newest.observe(&swift_record_id(record), record.version_key());
+                    }
+                }
+            }
+        }
         for swift_file in &files {
             // Iterate through all superblocks -> blocks -> records
             for superblock in &swift_file.superblocks {
                 for block in &superblock.blocks {
                     for record in &block.records {
-                        if record.is_dead(now_ns) {
+                        if !newest.is_newest(&swift_record_id(record), &record.version_key())
+                            || record.is_dead(now_ns)
+                        {
                             continue;
                         }
                         // Apply metadata filter if present

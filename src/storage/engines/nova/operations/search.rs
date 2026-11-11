@@ -210,10 +210,23 @@ impl NovaSearchOperations {
         // reads each file in full (today's behavior). Recall-preserving — a row
         // group is skipped only when its bounding box provably cannot hold a
         // top-k candidate (Euclidean clamp-gap lower bound > current k-th best).
+        //
+        // Multi-version correctness (TD-ENGINE-MVCC-1): with more than one file
+        // an id can have copies in several files, and the newest copy can sit in
+        // a row group the bounds prune would skip. Resolving the newest copy
+        // per id needs every row of every file, so the prune engages only for a
+        // single file (one flushed or compacted file holds one copy per id).
+        // Compaction restores pruning by reducing the file count; deletion
+        // vectors (ADR-025, supersede-on-upsert) are the structural fix that
+        // lets pruning stay on for multiple files.
         let prune_enabled = matches!(ctx.distance_metric(), DistanceMetric::Euclidean)
             && !ctx.search_params.block_prune.force_exact
             && filter_expression.is_none()
-            && !vector_bounds_prune_disabled();
+            && !vector_bounds_prune_disabled()
+            && files.len() == 1;
+        // Rows from the full-read path, held until every file has been read so
+        // the newest-copy index covers all of them before anything is scored.
+        let mut full_read: Vec<Vec<ProximaRecord>> = Vec::new();
         let mut bounds_pruned_total: u64 = 0;
 
         for file_path in files {
@@ -258,8 +271,26 @@ impl NovaSearchOperations {
                 collection_id.to_string(),
                 "nova".to_string(),
             )?;
-            let records = reader.read_all_records(10000, None).await?;
-            self.score_records_into_queue(records, query_vector, ctx, &mut priority_queue);
+            // `0` is the START OFFSET, not a batch size: this passed 10000, which
+            // silently skipped the first 10,000 rows of any larger file.
+            let records = reader.read_all_records(0, None).await?;
+            full_read.push(records);
+        }
+
+        if !full_read.is_empty() {
+            let mut newest = proximadb_records::NewestVersionIndex::new();
+            for record in full_read.iter().flatten() {
+                newest.observe(nova_hit_id(record), record.version_key());
+            }
+            for records in full_read {
+                self.score_records_into_queue(
+                    records,
+                    query_vector,
+                    ctx,
+                    &mut priority_queue,
+                    Some(&newest),
+                );
+            }
         }
 
         // TD-040 observability: surface the pruned-row-group count to the
@@ -294,12 +325,20 @@ impl NovaSearchOperations {
         query_vector: &[f32],
         ctx: &crate::storage::traits::StorageQueryContext,
         priority_queue: &mut BoundedPriorityQueue,
+        newest: Option<&proximadb_records::NewestVersionIndex>,
     ) {
-        // One clock reading per batch. Dead records (tombstoned or TTL-expired)
-        // are skipped BEFORE scoring so they never take a top-k slot
-        // (CLAUDE.md 16a; flushed TTL'd records used to be returned).
+        // Pick the winner FIRST, then dead-filter it (the shared rule,
+        // `proximadb_records::VersionKey`; TD-ENGINE-MVCC-1). A row that is not
+        // its id's newest copy across every file scanned is never scored, so an
+        // older live copy cannot resurface when the newest copy is a tombstone
+        // or TTL-expired, and neither kind can take a top-k slot (16a).
         let now_ns = proximadb_kernel::time::now_unix_ns();
         for record in records {
+            if let Some(index) = newest
+                && !index.is_newest(nova_hit_id(&record), &record.version_key())
+            {
+                continue;
+            }
             if record.is_dead(now_ns) {
                 continue;
             }
@@ -312,11 +351,7 @@ impl NovaSearchOperations {
                 &vector,
                 &ctx.distance_metric(),
             );
-            let record_id = record
-                .local_id
-                .clone()
-                .filter(|id| !id.is_empty())
-                .unwrap_or_else(|| record.oid.clone());
+            let record_id = nova_hit_id(&record).to_string();
 
             let search_record = OptimizedSearchRecord {
                 id: record_id.clone(),
@@ -392,7 +427,7 @@ impl NovaSearchOperations {
             Some(recs) => recs,
             None => return Ok(None),
         };
-        self.score_records_into_queue(seed, query_vector, ctx, priority_queue);
+        self.score_records_into_queue(seed, query_vector, ctx, priority_queue, None);
 
         // Recover the provisional top-k threshold. Euclidean normalized score is
         // s = 1/(1+d) ⇒ d = 1/s − 1. Under-full queue (s_k == -inf) ⇒ no prune.
@@ -436,7 +471,7 @@ impl NovaSearchOperations {
                 .ok_or_else(|| {
                     anyhow::anyhow!("NOVA ranged reader became unavailable mid-file: {file_path}")
                 })?;
-            self.score_records_into_queue(recs, query_vector, ctx, priority_queue);
+            self.score_records_into_queue(recs, query_vector, ctx, priority_queue, None);
         }
 
         Ok(Some(pruned))
@@ -474,4 +509,14 @@ impl NovaSearchOperations {
         // For now, return a placeholder
         Ok(None)
     }
+}
+
+/// The id a NOVA hit is reported (and versions are resolved) under: the
+/// record's `local_id` when set, else its `oid`.
+fn nova_hit_id(record: &ProximaRecord) -> &str {
+    record
+        .local_id
+        .as_deref()
+        .filter(|id| !id.is_empty())
+        .unwrap_or(record.oid.as_str())
 }

@@ -826,17 +826,12 @@ pub async fn search_helix_sstable(
     collection: Option<&crate::proto::proximadb_v1::Collection>,
     filter_expression: Option<&proximadb_filter_expression::FilterExpression>,
     prune: &crate::core::search::BlockPruneConfig,
-) -> Result<
-    Vec<(
-        String,
-        f32,
-        std::collections::HashMap<String, crate::proto::proximadb_v1::SqlValue>,
-        // The record's TTL (`valid_to_ns`), so the hit can carry it.
-        Option<i64>,
-    )>,
-> {
-    // One clock reading per search: dead records are skipped before scoring.
+) -> Result<HelixSegmentScan> {
+    // One clock reading per search.
     let now_ns = proximadb_kernel::time::now_unix_ns();
+    // Every row read in this segment (live, dead, filtered out), by id: the
+    // input to cross-segment newest-copy resolution (TD-ENGINE-MVCC-1).
+    let mut versions = proximadb_records::NewestVersionIndex::new();
     // CLOUD-OPTIMIZED: Read unified file header in 2 API calls (metadata + header)
     // UnifiedCachingFilesystem will cache this, so subsequent queries = 0 API calls!
     let header = read_helix_header_optimized(filesystem, path).await?;
@@ -934,10 +929,13 @@ pub async fn search_helix_sstable(
 
         // Search within block
         for record in &block.records {
-            // Dead records (tombstoned or TTL-expired) never reach a read
-            // (CLAUDE.md 16a). Skipped BEFORE scoring so they cannot take a
-            // top-k slot: this path previously returned expired records
-            // after flush (engine TTL conformance).
+            // Observe EVERY row before any filter: a newer copy that is dead, or
+            // whose metadata no longer matches the filter, must still shadow an
+            // older matching copy (pick the winner first, then filter).
+            let key = record.version_key();
+            versions.observe(&record.oid, key);
+            // Dead records (tombstoned or TTL-expired) are never results (16a)
+            // and never take a top-k slot.
             if record.is_dead(now_ns) {
                 continue;
             }
@@ -957,20 +955,47 @@ pub async fn search_helix_sstable(
             let distance = distance_compute.distance(query_vector, &wire_record.vector);
 
             // Return SqlValue metadata (type-safe)
-            results.push((
-                wire_record.id,
+            results.push(HelixSegmentHit {
+                id: wire_record.id,
                 distance,
-                wire_record.metadata,
-                record.valid_to_ns,
-            ));
+                metadata: wire_record.metadata,
+                valid_to_ns: record.valid_to_ns,
+                key,
+            });
         }
     }
 
-    // Sort by distance and return top-k
-    results.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+    // Within-segment resolution first (a superseded copy never takes a slot),
+    // then top-k by distance. Cross-segment resolution happens in the caller
+    // with the returned `versions`.
+    results.retain(|hit| versions.is_newest(&hit.id, &hit.key));
+    results.sort_by(|a, b| {
+        a.distance
+            .partial_cmp(&b.distance)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     results.truncate(k);
 
-    Ok(results)
+    Ok(HelixSegmentScan {
+        hits: results,
+        versions,
+    })
+}
+
+/// One live, filter-matching, segment-newest candidate from a HELIX segment.
+pub struct HelixSegmentHit {
+    pub id: String,
+    pub distance: f32,
+    pub metadata: std::collections::HashMap<String, crate::proto::proximadb_v1::SqlValue>,
+    pub valid_to_ns: Option<i64>,
+    /// This copy's position in the shared newest-copy order.
+    pub key: proximadb_records::VersionKey,
+}
+
+/// A segment's candidates plus the newest-copy index over EVERY row it read.
+pub struct HelixSegmentScan {
+    pub hits: Vec<HelixSegmentHit>,
+    pub versions: proximadb_records::NewestVersionIndex,
 }
 
 fn select_blocks_by_centroid(

@@ -5,7 +5,7 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | **Open (filed 2026-11-11).** Found by the #2518 adversarial review. Reproduced on develop and on #2518.
+| Status | **Stage 1 resolved (2026-11-11); stage 2 is TD-DELVEC-2.** Found by the #2518 adversarial review and reproduced on develop. Stage 1 (read-time newest-copy resolution, exact over the rows a scan reads) landed together with the NOVA reader/compaction fixes below. Stage 2 (deletion vectors on supersede, per-engine) makes it structural, so it also holds for rows a pruned scan never reads.
 | Invariant | CLAUDE.md 16a/16d, and `resolve_freshest` in `src/core/search/merge.rs`: pick the newest copy of an id FIRST, then drop it if dead (PR #2063).
 | Owner | HELIX / NOVA / SWIFT engines. Related: TD-MVCCRES-1, TD-MEMTABLE-MVCC-1.
 |===
@@ -45,3 +45,33 @@ until that is read correctly.
   dead or alive.
 . Add an overwrite-across-flushes case and a flushed-delete case per engine to
   `tests/engine_ttl_conformance_test.rs`; those are the acceptance gates.
+
+== Resolution (stage 1)
+
+* **One order, defined once:** `proximadb_records::VersionKey`
+  (`updated_at` ms, then a tombstone wins the tie, then `version`) plus
+  `NewestVersionIndex`. `merge.rs::supersedes` (the service `resolve_freshest`)
+  now delegates to it, so the engines and the service cannot disagree.
+* **HELIX:** each segment scan observes EVERY row it reads, before the dead and
+  metadata filters. `readers::resolve_across_sstables` merges the per-segment
+  indexes and keeps only globally newest hits (parallel, sequential and
+  progressive callers). Hits now carry `updated_at`/`version`.
+* **NOVA:** both columnar record builders decode `version` (UInt32, the writer's
+  type; Int64 accepted), `updated_at` and `expires_at` through one helper
+  (`columnar_query_engine/version_columns.rs`). Search indexes every file's rows
+  before scoring. **Bounds pruning (TD-040) now engages only for single-file
+  collections**, because exactness needs every row; TD-DELVEC-2 restores it.
+* **NOVA, found along the way (data correctness):** search passed `10000` and
+  compaction `100000` as `read_all_records`' **start offset**, silently skipping
+  that many leading rows of any larger file. Compaction then deleted its inputs
+  (data loss). Its "keep latest" dedup kept the FIRST occurrence (file order),
+  not the newest. All three are fixed; compaction dedups by `VersionKey` and keeps
+  tombstones.
+* **SWIFT:** the per-file scan resolves within the file and passes newest-dead
+  copies up as markers, so the cross-file layer can shadow older live copies
+  before it dead-filters.
+* **Acceptance:** the `MV_CONFORMANCE` overwrite-then-expire and
+  delete-after-flush cases pass for SST/HELIX/NOVA/SWIFT.
+* **Remaining bound:** exact over the rows a scan reads. A newer copy in a pruned
+  HELIX block or outside a SWIFT file's top-k cannot shadow an older one. That is
+  TD-DELVEC-2.

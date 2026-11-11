@@ -305,7 +305,7 @@ impl ProgressiveSearchCoordinator {
             crate::storage::persistence::filesystem::caching_filesystem::UnifiedCachingFilesystem,
         >,
     ) -> Result<Vec<OptimizedSearchRecord>> {
-        let mut priority_queue = BoundedPriorityQueue::new(k);
+        let mut scans = Vec::with_capacity(sstables.len());
 
         for sstable in sstables {
             let results = super::readers::search_sstable(
@@ -323,14 +323,12 @@ impl ProgressiveSearchCoordinator {
             )
             .await?;
 
-            // Insert results into bounded queue
-            for result in results {
-                priority_queue.try_insert(result);
-            }
+            scans.push(results);
         }
 
-        // Return sorted results
-        Ok(priority_queue.into_sorted_vec())
+        // Top-k over each id's newest copy across every SSTable
+        // (TD-ENGINE-MVCC-1).
+        Ok(super::readers::resolve_across_sstables(scans, k))
     }
 
     /// Search a single SSTable with quantization

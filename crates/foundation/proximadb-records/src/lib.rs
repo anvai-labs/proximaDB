@@ -932,6 +932,210 @@ pub fn is_record_dead(valid_to_ns: Option<i64>, now_ns: i64) -> bool {
     }
 }
 
+/// The "which copy of an id is the newest" order: the single rule shared by
+/// the service merge (`resolve_freshest`, src/core/search/merge.rs) and every
+/// engine's flushed-segment scan, so the two can never disagree about which
+/// version wins (TD-ENGINE-MVCC-1, TD-MVCCRES-1).
+///
+/// Order: `updated_at_ms` first; on a tie a tombstone wins BEFORE versions
+/// are compared (mandate 16d: tombstones carry `record_version` 0 while live
+/// versions can carry >= 1, so version-first let a same-instant live copy
+/// beat its own delete); then `version`. Pick the winner FIRST, then apply
+/// the dead filter to it (the PR #2063 rule). Filtering dead copies before
+/// resolution lets an older live copy resurface.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VersionKey {
+    /// Last-write time in milliseconds (the search-hit wire unit).
+    pub updated_at_ms: i64,
+    /// `valid_to_ns == Some(0)`.
+    pub tombstone: bool,
+    pub version: u64,
+}
+
+impl VersionKey {
+    /// Strictly newer than `other` under the shared order. Equal keys are not
+    /// newer (the caller keeps whichever it saw first).
+    pub fn supersedes(&self, other: &Self) -> bool {
+        if self.updated_at_ms != other.updated_at_ms {
+            return self.updated_at_ms > other.updated_at_ms;
+        }
+        if self.tombstone != other.tombstone {
+            return self.tombstone;
+        }
+        self.version > other.version
+    }
+}
+
+/// Keeps, per id, the key of its newest copy among everything a scan has seen.
+/// Engines feed EVERY row they read (live, tombstoned or expired) through
+/// [`NewestVersionIndex::observe`] before scoring, then score a row only if
+/// [`NewestVersionIndex::is_newest`] holds and it is not dead.
+#[derive(Debug, Default)]
+pub struct NewestVersionIndex {
+    newest: std::collections::HashMap<String, VersionKey>,
+}
+
+impl NewestVersionIndex {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn observe(&mut self, id: &str, key: VersionKey) {
+        match self.newest.get_mut(id) {
+            Some(current) => {
+                if key.supersedes(current) {
+                    *current = key;
+                }
+            }
+            None => {
+                self.newest.insert(id.to_string(), key);
+            }
+        }
+    }
+
+    /// `key` is the newest copy of `id` seen (ties count as newest, so two
+    /// byte-identical copies of one version both pass; the top-k layer
+    /// already de-duplicates by id).
+    pub fn is_newest(&self, id: &str, key: &VersionKey) -> bool {
+        self.newest
+            .get(id)
+            .is_none_or(|newest| !newest.supersedes(key))
+    }
+
+    /// Fold another scan's index in (e.g. one per segment, merged at the end).
+    pub fn merge(&mut self, other: NewestVersionIndex) {
+        for (id, key) in other.newest {
+            match self.newest.get_mut(&id) {
+                Some(current) => {
+                    if key.supersedes(current) {
+                        *current = key;
+                    }
+                }
+                None => {
+                    self.newest.insert(id, key);
+                }
+            }
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.newest.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.newest.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod version_key_tests {
+    use super::*;
+
+    fn k(updated_at_ms: i64, tombstone: bool, version: u64) -> VersionKey {
+        VersionKey {
+            updated_at_ms,
+            tombstone,
+            version,
+        }
+    }
+
+    #[test]
+    fn order_is_time_then_tombstone_then_version() {
+        assert!(
+            k(2, false, 1).supersedes(&k(1, true, 9)),
+            "later write wins outright"
+        );
+        assert!(
+            k(1, true, 0).supersedes(&k(1, false, 9)),
+            "same-instant tombstone beats any version (16d)"
+        );
+        assert!(k(1, false, 3).supersedes(&k(1, false, 2)), "then version");
+        assert!(
+            !k(1, false, 2).supersedes(&k(1, false, 2)),
+            "equal is not newer"
+        );
+    }
+
+    #[test]
+    fn order_is_antisymmetric_over_a_grid() {
+        let keys: Vec<VersionKey> = [0_i64, 1, 2]
+            .iter()
+            .flat_map(|&t| {
+                [false, true]
+                    .into_iter()
+                    .flat_map(move |d| [0_u64, 1, 2].into_iter().map(move |v| k(t, d, v)))
+            })
+            .collect();
+        for a in &keys {
+            for b in &keys {
+                assert!(
+                    !(a.supersedes(b) && b.supersedes(a)),
+                    "{a:?} and {b:?} each supersede the other"
+                );
+                if a != b {
+                    assert!(
+                        a.supersedes(b) || b.supersedes(a),
+                        "{a:?} vs {b:?} unordered"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn index_tracks_newest_regardless_of_observation_order() {
+        let (old, new) = (k(1, false, 1), k(2, true, 0));
+        for order in [[old, new], [new, old]] {
+            let mut idx = NewestVersionIndex::new();
+            for key in order {
+                idx.observe("a", key);
+            }
+            assert!(idx.is_newest("a", &new));
+            assert!(!idx.is_newest("a", &old), "older copy must be shadowed");
+        }
+        assert!(
+            NewestVersionIndex::new().is_newest("unseen", &old),
+            "unseen ids pass"
+        );
+    }
+
+    #[test]
+    fn merge_keeps_the_newest_across_indexes() {
+        let mut a = NewestVersionIndex::new();
+        a.observe("x", k(1, false, 1));
+        let mut b = NewestVersionIndex::new();
+        b.observe("x", k(3, false, 1));
+        b.observe("y", k(1, false, 1));
+        a.merge(b);
+        assert!(!a.is_newest("x", &k(1, false, 1)));
+        assert!(a.is_newest("x", &k(3, false, 1)));
+        assert_eq!(a.len(), 2);
+    }
+
+    #[test]
+    fn record_key_uses_updated_else_created_in_ms() {
+        let r = ProximaRecord {
+            created_at_ns: 5_000_000,
+            updated_at_ns: 0,
+            record_version: 4,
+            valid_to_ns: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(r.version_key(), k(5, true, 4));
+    }
+}
+
+impl ProximaRecord {
+    /// This copy's position in the shared newest-copy order.
+    pub fn version_key(&self) -> VersionKey {
+        VersionKey {
+            updated_at_ms: self.updated_at_ns.max(self.created_at_ns) / 1_000_000,
+            tombstone: self.valid_to_ns == Some(0),
+            version: self.record_version,
+        }
+    }
+}
+
 impl ProximaRecord {
     /// Returns true when this record is a tombstone marker at `snapshot_time_ns`.
     ///

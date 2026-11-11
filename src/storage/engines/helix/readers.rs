@@ -68,7 +68,7 @@ pub async fn search_sstable(
     candidate_ids: Option<&[String]>, // Optional IDs to check via bloom filter
     collection: Option<&crate::proto::proximadb_v1::Collection>,
     prune: &crate::core::search::BlockPruneConfig,
-) -> Result<Vec<OptimizedSearchRecord>> {
+) -> Result<HelixSstableResults> {
     // Check bloom filter if candidate IDs provided
     if let Some(ids) = candidate_ids
         && !ids.is_empty()
@@ -79,7 +79,7 @@ pub async fn search_sstable(
         // Skip this SSTable if none of the candidate IDs might be present
         if !bloom_results.iter().any(|&present| present) {
             debug!("Skipping SSTable due to bloom filter pruning");
-            return Ok(Vec::new());
+            return Ok(HelixSstableResults::default());
         }
     }
 
@@ -104,8 +104,19 @@ pub async fn search_sstable(
     .await?;
 
     // Convert the search results to OptimizedSearchRecord format
-    let mut results = Vec::new();
-    for (id, distance, sql_metadata, valid_to_ns) in search_results {
+    let super::proxima::HelixSegmentScan {
+        hits: segment_hits,
+        versions,
+    } = search_results;
+    let mut results = Vec::with_capacity(segment_hits.len());
+    for super::proxima::HelixSegmentHit {
+        id,
+        distance,
+        metadata: sql_metadata,
+        valid_to_ns,
+        key,
+    } in segment_hits
+    {
         // Filter is now applied inside search_helix_sstable using type-safe SqlValue evaluation
 
         // Use standardized distance-to-similarity conversion for consistency across all engines
@@ -122,13 +133,56 @@ pub async fn search_sstable(
             .with_similarity(similarity)
             .with_metadata(sql_metadata);
         // Carry the TTL so the service dead filter and the query cache's
-        // earliest-expiry see it (TD-QCACHE-TTL-1).
+        // earliest-expiry see it (TD-QCACHE-TTL-1), and the version facts so
+        // the service merge resolves this copy against the WAL delta by the
+        // same rule (`resolve_freshest`).
         record.valid_to_ns = valid_to_ns;
+        record.updated_at = Some(key.updated_at_ms);
+        record.version = u32::try_from(key.version).ok();
 
-        results.push(record);
+        results.push((record, key));
     }
 
-    Ok(results)
+    Ok(HelixSstableResults {
+        hits: results,
+        versions,
+    })
+}
+
+/// One SSTable's candidates (each with its newest-copy key) plus the
+/// newest-copy index over every row that SSTable's scan read.
+#[derive(Default)]
+pub struct HelixSstableResults {
+    pub hits: Vec<(OptimizedSearchRecord, proximadb_records::VersionKey)>,
+    pub versions: proximadb_records::NewestVersionIndex,
+}
+
+/// Merge per-SSTable results into the global top-k, keeping only each id's
+/// NEWEST copy across every SSTable scanned (TD-ENGINE-MVCC-1). Without this
+/// an older live copy in one SSTable resurfaced when the id's newest copy, in
+/// another SSTable, was a tombstone or had expired: each SSTable filtered its
+/// own dead rows, so no layer ever saw both copies.
+///
+/// Exact over the rows the scans READ. A newer copy in a block that centroid
+/// pruning never read cannot shadow an older one; deletion vectors with
+/// supersede-on-upsert (ADR-025) close that structurally.
+pub fn resolve_across_sstables(
+    scans: Vec<HelixSstableResults>,
+    k: usize,
+) -> Vec<OptimizedSearchRecord> {
+    let mut global = proximadb_records::NewestVersionIndex::new();
+    let mut hits = Vec::new();
+    for scan in scans {
+        global.merge(scan.versions);
+        hits.extend(scan.hits);
+    }
+    let mut queue = BoundedPriorityQueue::new(k);
+    for (hit, key) in hits {
+        if global.is_newest(&hit.id, &key) {
+            queue.try_insert(hit);
+        }
+    }
+    queue.into_sorted_vec()
 }
 
 /// Find a specific vector by ID
@@ -263,18 +317,19 @@ pub async fn parallel_search(
     // Wait for all search tasks to complete
     let results = join_all(search_tasks).await;
 
-    // Merge results from all SSTables using bounded queue
-    let mut priority_queue = BoundedPriorityQueue::new(k);
     let mut successful_searches = 0;
     let mut failed_searches = 0;
 
+    let mut scans = Vec::new();
     for (idx, result) in results.into_iter().enumerate() {
         match result {
             Ok(Ok(sstable_results)) => {
-                trace!("Thread {} returned {} results", idx, sstable_results.len());
-                for result in sstable_results {
-                    priority_queue.try_insert(result);
-                }
+                trace!(
+                    "Thread {} returned {} results",
+                    idx,
+                    sstable_results.hits.len()
+                );
+                scans.push(sstable_results);
                 successful_searches += 1;
             }
             Ok(Err(e)) => {
@@ -288,8 +343,8 @@ pub async fn parallel_search(
         }
     }
 
-    // Get top-k results
-    let all_results = priority_queue.into_sorted_vec();
+    // Top-k over each id's newest copy across every SSTable.
+    let all_results = resolve_across_sstables(scans, k);
 
     info!(
         "Parallel search completed in {:?}: {} successful, {} failed, {} results",

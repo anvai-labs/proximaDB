@@ -118,7 +118,6 @@ pub mod unified_metadata_serializer {
 pub mod proximablocks_strategy_reader;
 
 use crate::core::search::SearchMode;
-use crate::core::search::bounded_queue::BoundedPriorityQueue;
 use crate::proto::proximadb_v1::VectorRecord;
 use crate::services::EventLog;
 use crate::storage::common::compaction_orchestrator::FilenameCodec;
@@ -1951,9 +1950,8 @@ impl UnifiedStorageFormat for HelixEngine {
                 sstables_to_search.len()
             );
 
-            // Sequential search for small number of files
-            // Use bounded priority queue to maintain only top-k results
-            let mut priority_queue = BoundedPriorityQueue::new(k);
+            // Sequential search for small number of files.
+            let mut scans = Vec::new();
             let mut accessed_files = Vec::new();
 
             for sstable in sstables_to_search {
@@ -1974,14 +1972,12 @@ impl UnifiedStorageFormat for HelixEngine {
                 )
                 .await?;
 
-                // Insert results into bounded queue
-                for result in sstable_results {
-                    priority_queue.try_insert(result);
-                }
+                scans.push(sstable_results);
             }
 
-            // Get sorted results from bounded queue
-            let results = priority_queue.into_sorted_vec();
+            // Top-k over each id's newest copy across every SSTable
+            // (TD-ENGINE-MVCC-1).
+            let results = readers::resolve_across_sstables(scans, k);
 
             (results, accessed_files)
         };

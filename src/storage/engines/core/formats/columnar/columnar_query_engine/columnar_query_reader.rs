@@ -1869,23 +1869,14 @@ impl UnifiedParquetReader {
             None
         };
 
-        // Get version and timestamp
-        let version_array = batch
-            .column_by_name("version")
-            .and_then(|c| c.as_any().downcast_ref::<Int64Array>());
-
         let timestamp_array = batch
             .column_by_name("timestamp")
             .and_then(|c| c.as_any().downcast_ref::<Int64Array>());
 
-        // The record's TTL. The flush writer stores `valid_to_ns / 1_000_000`
-        // in this column (milliseconds; parquet_write_engine/streaming_writer),
-        // and this reader used to skip it, so every record read back from a
-        // flushed segment looked immortal: TTL-expired records were returned
-        // by NOVA search after flush (CLAUDE.md 16a; engine TTL conformance).
-        let expires_at_array = batch
-            .column_by_name(proximadb_storage_common::FIELD_EXPIRES_AT)
-            .and_then(|c| c.as_any().downcast_ref::<Int64Array>());
+        // Per-row version facts (version, updated_at, TTL), decoded in ONE
+        // place (TD-ENGINE-MVCC-1). This builder used to downcast `version` to
+        // Int64 while the writer stores UInt32, so every row read as version 0.
+        let version_columns = super::version_columns::VersionColumns::from_batch(batch);
 
         // Process each row
         for row_idx in 0..num_rows {
@@ -2081,8 +2072,6 @@ impl UnifiedParquetReader {
                 ProximaTree::new()
             };
 
-            let version = version_array.map(|arr| arr.value(row_idx)).unwrap_or(0);
-
             let timestamp = timestamp_array.map(|arr| arr.value(row_idx)).unwrap_or(0);
 
             let dim = vector.len() as u32;
@@ -2091,12 +2080,8 @@ impl UnifiedParquetReader {
                 ..Default::default()
             };
             record.props = props;
-            record.record_version = version as u64;
             record.created_at_ns = timestamp * 1_000_000;
-            // ms -> ns. A tombstone (0) stays 0; null means no TTL.
-            record.valid_to_ns = expires_at_array
-                .filter(|arr| arrow_array::Array::is_valid(*arr, row_idx))
-                .map(|arr| arr.value(row_idx).saturating_mul(1_000_000));
+            version_columns.stamp(&mut record, row_idx);
             if !vector.is_empty() {
                 record
                     .embeddings

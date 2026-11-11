@@ -343,3 +343,172 @@ ttl_case!(
     cfg = feature = "experimental-engines",
     known = "TTL LEAK, TD-RAPTOR-TTL-1: the RAPTOR segment format has no TTL column, so the expiry is lost at flush (format change needed)"
 );
+
+// ---------------------------------------------------------------------------
+// Multi-version cases (TD-ENGINE-MVCC-1). The newest version of an id must win
+// BEFORE the dead filter (`resolve_freshest`, src/core/search/merge.rs): an
+// older live copy in an earlier segment must never resurface when the newest
+// version is dead.
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum MultiVersion {
+    /// v1 (no TTL) flushed; v2 (short TTL) flushed; v2 expires.
+    OverwriteThenExpire,
+    /// v1 flushed; delete; flushed.
+    DeleteAfterFlush,
+}
+
+impl MultiVersion {
+    fn label(self) -> &'static str {
+        match self {
+            MultiVersion::OverwriteThenExpire => "overwrite_then_expire",
+            MultiVersion::DeleteAfterFlush => "delete_after_flush",
+        }
+    }
+}
+
+fn run_multi_version(engine: &str, case: MultiVersion) {
+    let (_tmp, db) = create_test_db(engine);
+    let collection = format!("mv_conf_{engine}_{}", case.label());
+    if let Err(e) = db.create_collection(&collection, DIM as u32, Some(engine)) {
+        println!(
+            "MV_CONFORMANCE engine={engine} case={} verdict=n/a reason=\"create_collection failed: {e}\"",
+            case.label()
+        );
+        return;
+    }
+
+    // v1: live, no TTL, plus fillers. Flushed into segment 1.
+    let mut records: Vec<_> = (0..FILLERS)
+        .map(|i| record(&format!("live_{i:03}"), filler_vector(i), None))
+        .collect();
+    records.push(record(VICTIM, victim_vector(), None));
+    db.insert_proxima_records(&collection, records)
+        .unwrap_or_else(|e| panic!("[{engine}] insert v1 failed: {e}"));
+    db.flush()
+        .unwrap_or_else(|e| panic!("[{engine}] flush 1 failed: {e}"));
+
+    // Positive control: v1 is found.
+    let before = search(&db, &collection, 1)
+        .unwrap_or_else(|e| panic!("[{engine}] search before failed: {e}"));
+    assert!(
+        before.iter().any(|r| r.id == VICTIM),
+        "[{engine}/{}] positive control failed: v1 not found",
+        case.label()
+    );
+
+    let mut expiry_ns = None;
+    match case {
+        MultiVersion::OverwriteThenExpire => {
+            let valid_to = now_ns() + Duration::from_secs(3).as_nanos() as i64;
+            let mut v2 = record(VICTIM, victim_vector(), Some(valid_to));
+            v2.record_version = 2;
+            v2.created_at_ns = now_ns();
+            v2.updated_at_ns = v2.created_at_ns;
+            db.insert_proxima_records(&collection, vec![v2])
+                .unwrap_or_else(|e| panic!("[{engine}] upsert v2 failed: {e}"));
+            expiry_ns = Some(valid_to);
+        }
+        MultiVersion::DeleteAfterFlush => {
+            db.delete_vector(&collection, VICTIM)
+                .unwrap_or_else(|e| panic!("[{engine}] delete failed: {e}"));
+        }
+    }
+    db.flush()
+        .unwrap_or_else(|e| panic!("[{engine}] flush 2 failed: {e}"));
+
+    if let Some(valid_to) = expiry_ns {
+        let wait_ns = (valid_to - now_ns()).max(0) as u64 + 750_000_000;
+        std::thread::sleep(Duration::from_nanos(wait_ns));
+        assert!(now_ns() > valid_to);
+    }
+
+    let after = search(&db, &collection, 2)
+        .unwrap_or_else(|e| panic!("[{engine}] search after failed: {e}"));
+    let resurfaced = after.iter().find(|r| r.id == VICTIM);
+    let live_after = after.iter().filter(|r| r.id.starts_with("live_")).count();
+    println!(
+        "MV_CONFORMANCE engine={engine} case={} verdict={} post_hits={} post_live_hits={} victim={:?}",
+        case.label(),
+        if resurfaced.is_some() {
+            "RESURFACES"
+        } else {
+            "hidden"
+        },
+        after.len(),
+        live_after,
+        resurfaced.map(|r| (r.valid_to_ns, r.version))
+    );
+    assert!(
+        live_after > 0,
+        "[{engine}/{}] no live fillers returned",
+        case.label()
+    );
+    assert!(
+        resurfaced.is_none(),
+        "[{engine}/{}] an older live copy of '{VICTIM}' resurfaced after its newest \
+         version became dead: {:?}",
+        case.label(),
+        resurfaced.map(|r| (r.score, r.valid_to_ns, r.version))
+    );
+}
+
+macro_rules! mv_case {
+    ($name:ident, $engine:literal, $case:expr) => {
+        #[test]
+        fn $name() {
+            run_multi_version($engine, $case);
+        }
+    };
+    ($name:ident, $engine:literal, $case:expr, cfg = $cfg:meta) => {
+        #[cfg($cfg)]
+        #[test]
+        fn $name() {
+            run_multi_version($engine, $case);
+        }
+    };
+}
+
+mv_case!(
+    sst_overwrite_then_expire,
+    "sst",
+    MultiVersion::OverwriteThenExpire
+);
+mv_case!(
+    sst_delete_after_flush,
+    "sst",
+    MultiVersion::DeleteAfterFlush
+);
+mv_case!(
+    helix_overwrite_then_expire,
+    "helix",
+    MultiVersion::OverwriteThenExpire
+);
+mv_case!(
+    helix_delete_after_flush,
+    "helix",
+    MultiVersion::DeleteAfterFlush
+);
+mv_case!(
+    nova_overwrite_then_expire,
+    "nova",
+    MultiVersion::OverwriteThenExpire
+);
+mv_case!(
+    nova_delete_after_flush,
+    "nova",
+    MultiVersion::DeleteAfterFlush
+);
+mv_case!(
+    swift_overwrite_then_expire,
+    "swift",
+    MultiVersion::OverwriteThenExpire,
+    cfg = feature = "experimental-engines"
+);
+mv_case!(
+    swift_delete_after_flush,
+    "swift",
+    MultiVersion::DeleteAfterFlush,
+    cfg = feature = "experimental-engines"
+);
