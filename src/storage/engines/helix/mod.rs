@@ -1571,6 +1571,7 @@ impl UnifiedStorageFormat for HelixEngine {
                                     score: scored.similarity,
                                     similarity: Some(scored.similarity),
                                     vector: None, // AXIS doesn't return vectors by default
+                                    valid_to_ns: scored.valid_to_ns(), // TTL (TD-QCACHE-TTL-1)
                                     ..Default::default()
                                 },
                             )
