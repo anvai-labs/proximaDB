@@ -24,7 +24,8 @@ use object_store::ObjectStoreExt;
 use object_store::aws::AmazonS3Builder;
 use object_store::path::Path as ObjPath;
 use object_store::{
-    Attribute, Attributes, PutMode, PutMultipartOptions, PutOptions, PutPayload, WriteMultipart,
+    Attribute, Attributes, PutMode, PutMultipartOptions, PutOptions, PutPayload, UpdateVersion,
+    WriteMultipart,
 };
 use std::sync::Arc;
 use tokio::io::AsyncReadExt;
@@ -294,6 +295,125 @@ impl FileSystem for AwsS3FileSystem {
                 error,
             )),
         }
+    }
+
+    /// TD-SEAM-14 S1: conditional replacement for owner marker CAS.
+    ///
+    /// Reads the current value, compares with `expected`, and if it matches,
+    /// writes `replacement` with a conditional PUT using the ETag. Also checks
+    /// `guards` (other files that must match expected values).
+    ///
+    /// Returns `Ok(true)` if the replacement was written, `Ok(false)` if the
+    /// current value didn't match or a guard failed.
+    ///
+    /// Note: This is not atomic — there's a race window between read and write.
+    /// The conditional PUT (ETag check) closes the window for the target file,
+    /// but guards are checked separately. For the owner marker use case, this
+    /// is acceptable because the owner marker is small and writes are infrequent.
+    async fn compare_exchange(
+        &self,
+        path: &str,
+        expected: Option<&[u8]>,
+        replacement: &[u8],
+        guards: &[(&str, Option<&[u8]>)],
+    ) -> FsResult<bool> {
+        let (bucket, key) = Self::parse(path)?;
+        let store = self.store_for(&bucket)?;
+        let dst = ObjPath::from(key);
+
+        // Check guards first (fail fast if any guard doesn't match).
+        for (guard_path, guard_expected) in guards {
+            let (guard_bucket, guard_key) = Self::parse(guard_path)?;
+            let guard_store = self.store_for(&guard_bucket)?;
+            let guard_dst = ObjPath::from(guard_key);
+            let guard_current = match guard_store.get(&guard_dst).await {
+                Ok(result) => Some(result.bytes().await.map_err(|e| {
+                    super::object_store_errors::object_error("S3 guard read body", guard_path, e)
+                })?),
+                Err(object_store::Error::NotFound { .. }) => None,
+                Err(e) => {
+                    return Err(super::object_store_errors::denied("S3 guard read", e));
+                }
+            };
+            let guard_matches = match (guard_expected, guard_current.as_deref()) {
+                (None, None) => true,
+                (Some(exp), Some(cur)) => *exp == &cur[..],
+                _ => false,
+            };
+            if !guard_matches {
+                return Ok(false);
+            }
+        }
+
+        // Read current value and ETag.
+        let current = match store.get(&dst).await {
+            Ok(result) => {
+                let meta = result.meta.clone();
+                let bytes = result.bytes().await.map_err(|e| {
+                    super::object_store_errors::object_error("S3 get body", path, e)
+                })?;
+                Some((bytes.to_vec(), meta.e_tag))
+            }
+            Err(object_store::Error::NotFound { .. }) => None,
+            Err(e) => {
+                return Err(super::object_store_errors::denied("S3 get", e));
+            }
+        };
+
+        // Compare with expected.
+        let matches = match (expected, current.as_ref()) {
+            (None, None) => true,
+            (Some(exp), Some((cur, _))) => exp == cur.as_slice(),
+            _ => false,
+        };
+        if !matches {
+            return Ok(false);
+        }
+
+        // Write replacement with conditional PUT using ETag.
+        let etag = current.as_ref().and_then(|(_, etag)| etag.clone());
+        let mode = match (&current, &etag) {
+            (Some(_), Some(etag)) => PutMode::Update(UpdateVersion {
+                e_tag: Some(etag.clone()),
+                version: None,
+            }),
+            (Some(_), None) => {
+                // Object exists but has no ETag — backend didn't return one.
+                // This is an error condition, not a CAS conflict.
+                return Err(FilesystemError::Network(
+                    "S3 get returned object without ETag".into(),
+                ));
+            }
+            (None, _) => PutMode::Create,
+        };
+
+        let result = store
+            .put_opts(
+                &dst,
+                PutPayload::from(replacement.to_vec()),
+                PutOptions {
+                    mode,
+                    ..Default::default()
+                },
+            )
+            .await;
+
+        match result {
+            Ok(_) => Ok(true),
+            Err(object_store::Error::Precondition { .. }) => {
+                // ETag mismatch — someone else wrote between our read and write.
+                Ok(false)
+            }
+            Err(object_store::Error::AlreadyExists { .. }) => {
+                // Create mode failed because file exists — someone else wrote.
+                Ok(false)
+            }
+            Err(e) => Err(super::object_store_errors::denied("S3 conditional put", e)),
+        }
+    }
+
+    fn supports_conditional_replace(&self) -> bool {
+        true
     }
 
     async fn append(&self, _path: &str, _data: &[u8]) -> FsResult<()> {

@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from datetime import UTC
 from typing import Any
 
+from .._record_ids import new_record_id
 from ..exceptions import ProximaDBError
 from ..models import (
     BatchResult,
@@ -1038,7 +1039,7 @@ class ProximaDBSyncGrpcClient:
                 vector_dict = vector_data
 
             if not isinstance(vector_dict, dict):
-                vector_dict = {"id": f"record_{index}", "vector": vector_dict}
+                vector_dict = {"id": new_record_id(), "vector": vector_dict}
 
             props = (
                 vector_dict.get("props")
@@ -1049,7 +1050,7 @@ class ProximaDBSyncGrpcClient:
             record = {
                 "id": vector_dict.get("id")
                 or vector_dict.get("oid")
-                or f"record_{index}",
+                or new_record_id(),
                 "vector": vector_dict.get("vector"),
                 "props": props,
             }

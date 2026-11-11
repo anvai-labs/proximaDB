@@ -1,0 +1,89 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-RECID-1: UUID-shaped record ids are stored as 36-char text in every at-rest format
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open (filed 2026-11-09).** Not started. Measure first (see "Gate"): the saving is real for one id shape on some formats, and smaller than the headline everywhere else.
+| Surface | Record id (`ProximaRecord.oid`) in the WAL, PAX blocks, warehouse Parquet, and the in-memory id→position maps.
+| Dimensional cost term | Storage GB-month (KSU) and cold-read bytes for id stripes; resident memory for id maps. Not CPU.
+| Origin | Raised during #2497 (client-minted UUID defaults). Premise checked against `origin/develop` @ `b6cbf4879`, file:line below.
+|===
+
+== The claim, and what is actually true
+
+Proposal as raised: store record ids as 16-byte binary instead of 36-char strings.
+
+What the code says (verified):
+
+* **Ids are arbitrary strings by contract, so binary cannot be mandatory.**
+  `ProximaRecord.oid: String` (`crates/foundation/proximadb-records/src/lib.rs:799`);
+  proto `string id = 1` (`proto/proximadb/v2/record.proto:391`). ADR-024 (:74, :77) and
+  ADR-031 (:305-309) define the oid as "a user-provided natural key, or an engine-minted
+  ULID". SQL rows use the primary-key text as the oid (`wal_entry.rs:93`,
+  `record_store.rs:761`). Documented examples use ids like `v1`, `acct_1`, `doc:main.py`.
+  OpenAPI declares the id as an unformatted string (`docs/openapi/proximadb-openapi.yaml:6384-6388`).
+  No server path validates id format beyond non-empty (`src/network/rest/v2/records.rs:2048`,
+  `src/network/grpc/v2/record_service.rs:1404`).
+* **So the only candidate is a fast path for UUID/ULID-shaped ids**, with strings still
+  supported for every other id. This is the shape the SDK (since #2497) and REST
+  (`records.rs:1188-1192`, `Uuid::new_v4`) now mint by default.
+
+What a UUID costs today, per format:
+
+[cols="2,3,2", options="header"]
+|===
+| Format | Encoding of the id | Bytes per UUID id
+| Unified WAL | bincode 1.x default config, `String` = u64 length + UTF-8 (`wal_operations.rs:567`); no frame compression | 44
+| Canonical WAL | MessagePack `to_vec_named` (`src/services/canonical_wal.rs:2200`); field name written per frame; no compression | ~38 + field name
+| PAX block, `col_id::OID` | Raw = u32 length + UTF-8 (`record.rs:661-679`); per-block Dictionary when chosen (`writer.rs:2143-2181`), which does not help unique ids; LZ4 only behind `PROXIMADB_PAX_LOSSLESS_SCALAR`, off by default (`segment_format.rs:821-829`); the header's `Zstd` label is not applied to stripes | 40 (Raw)
+| Warehouse Parquet `__proxima_oid` | `Utf8` (`proxima_arrow.rs:214-218`); writer policy sets no codec (`parquet_write_policy.rs:244-279`), so UNCOMPRESSED with arrow-rs default dictionary; Bloom filter on the column | ~36-40 + Bloom
+| In-memory id maps | `String` keys: `OidPositionResolver` (`oid_position_resolver.rs:26-31`, unwired), SWIFT `IdIndex` (`swift_id_index.rs:16`), AXIS HNSW `DashMap<String, usize>` (`src/index/axis/utils.rs:138`, persisted at `storage/serialization.rs:1142`), RAPTOR `id_to_node` (`raptor-engine/src/writer.rs:283`) | 36 heap + 24 `String` header + map overhead
+|===
+
+A random UUIDv4 carries 122 bits of entropy (~15.3 bytes), so a 16-byte encoding is
+near-optimal; a general-purpose compressor on hex text typically recovers only part of
+the 36→16 gap. The PAX row directory already stores a 64-bit hash of the oid, not the
+string (`row_dir.rs:30`), so lookups there do not pay the text cost.
+
+== Options (cheapest first)
+
+1. **Turn on the compression the formats already have.** Set a Parquet codec (zstd) in
+   `warehouse_write_policy`, and evaluate default-on LZ4 for PAX id stripes. No format
+   change, no new scheme; recovers part of the gap on cold tiers. Measure before
+   choosing option 2.
+2. **Typed 16-byte fast path.** When an oid parses as a canonical UUID (or ULID), store it
+   as 16 bytes under a new stripe/column scheme tag; every other id stays text. Readers
+   format back to the canonical text, so the API contract is unchanged. Formats:
+   a new PAX string-stripe scheme for `OID`, Parquet `FixedSizeBinary(16)` alongside or in
+   place of `Utf8`, and a tagged WAL encoding. This is a storage-format change: it must be
+   mixed-read-safe (scheme tag; absent tag = legacy text), default-OFF per collection
+   until baked, and round-trip tested (directive #8). The map keys can switch to an
+   `enum OidKey { Uuid([u8; 16]), Text(Box<str>) }` independently of the on-disk work.
+3. **Time-ordered minting (UUIDv7 or ULID)** for new ids, client and server together.
+   Orthogonal to size: it improves index/compaction locality and PAX block min/max
+   pruning on id. It also resolves an inconsistency found here: ADR-024 says engine-minted
+   ids are ULIDs, but REST mints UUIDv4 (`records.rs:1189`). TD-USUB-21 (:75) already
+   suggests UUIDv7 for generated oids.
+
+== Gate (measure before building)
+
+Per the co-design mandate, justify with a measured trace, not this table:
+
+* On a representative corpus (SIFT-scale vector collection with default ids, plus one
+  natural-key collection), record bytes-per-record for the id stripe/column in each format,
+  and the resident size of the id maps, before and after option 1.
+* Build option 2 only if the id is a material share of at-rest bytes after option 1
+  (for vector collections the embedding usually dominates; for small-payload document or
+  SQL collections the id share is larger).
+* Option 2 must hold the existing round-trip and recall ratchets unchanged; the id is an
+  identity column, so any lossy behaviour is a correctness failure, not a tolerance.
+
+== Not in scope
+
+* Changing the API contract: ids stay arbitrary strings on every surface.
+* The catalog `object_id` (already a compact u64 per ADR-031).
+* A dead validator that would reject most UUIDs if wired (`src/core/utils/validation.rs:42`,
+  `validate_vector_id` rejects a leading digit; zero callers). Delete it under directive 19
+  rather than let it be wired in by accident.

@@ -73,6 +73,14 @@ pub const PLACEMENT_MARKER: &str = "SPILL_PLACEMENT";
 /// sees it.
 pub const OWNER_MARKER: &str = "_proximadb_spill_owner.json";
 
+/// TD-SEAM-14 S2: Manifest head, at the root of an object-store placement.
+/// Lists all segments by partition, updated with CAS on the revision field.
+pub const MANIFEST_HEAD: &str = "_proximadb_spill_manifest.json";
+
+/// TD-SEAM-14 S2: Durable witness, beside the canonical WAL.
+/// Records the last verified manifest head revision and digest.
+pub const DURABLE_WITNESS: &str = "SPILL_WITNESS";
+
 /// The placement value recorded for local segments.
 const LOCAL: &str = "local";
 
@@ -121,8 +129,12 @@ impl SpillTarget {
     }
 
     /// Whether this target holds any file from an earlier run (a segment or a
-    /// purge obligation). The owner marker is not state. An error means the
-    /// answer is unknown: callers must not treat it as "empty".
+    /// purge obligation). The owner marker and the manifest head are not
+    /// state: a prefix holding only control metadata (owner claim + manifest
+    /// head) holds zero SEGMENTS, and treating the manifest head as state
+    /// would permanently refuse adoption/migration of a prefix whose segments
+    /// were purged. An error means the answer is unknown: callers must not
+    /// treat it as "empty".
     pub async fn has_state(&self) -> Result<bool> {
         Ok(self.scan().await?.has_state)
     }
@@ -161,6 +173,9 @@ async fn scan_object(url: &str, filesystem: &dyn FileSystem) -> Result<Scan> {
         }
         if entry.name == OWNER_MARKER {
             scan.nested_owners.push(entry.url.clone());
+        } else if entry.name == MANIFEST_HEAD {
+            // Control metadata, not state (see [`Scan`]: a manifest head with
+            // zero segments must stay adoptable/migratable).
         } else {
             scan.has_state = true;
         }
@@ -191,6 +206,9 @@ fn scan_local(dir: &Path, own_marker: &Path, scan: &mut Scan) {
                 scan.nested_owners
                     .push(format!("file://{}", path.display()));
             }
+            // Control metadata, not state: a manifest head with zero segments
+            // must stay adoptable/migratable (mirrors scan_object).
+            Ok(_) if entry.file_name() == MANIFEST_HEAD => {}
             // A marker install cut off before its rename.
             Ok(_) if is_marker_temp(&entry.file_name().to_string_lossy()) => {}
             _ => scan.has_state = true,
@@ -296,6 +314,151 @@ async fn write_owner(
     Ok(())
 }
 
+// ── TD-SEAM-14 S2: Manifest head read/write/CAS ─────────────────────────────
+
+/// Read the manifest head from the object store. Returns `None` if absent.
+/// The manifest is at `{url}/{MANIFEST_HEAD}`.
+pub async fn read_manifest(url: &str, filesystem: &dyn FileSystem) -> Result<Option<ManifestHead>> {
+    let path = format!("{}/{}", url.trim_end_matches('/'), MANIFEST_HEAD);
+    let bytes = match path.strip_prefix("file://").map(Path::new) {
+        Some(local) => match std::fs::read(local) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error).with_context(|| format!("reading {path}")),
+        },
+        None => match filesystem.read(&path).await {
+            Ok(bytes) => bytes,
+            Err(error) if is_absent(&error) => return Ok(None),
+            Err(error) => return Err(fs_error(&format!("reading {path}"), error)),
+        },
+    };
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .with_context(|| format!("parsing manifest head at {path}"))
+}
+
+/// Write the manifest head with CAS (compare-and-swap) on the revision, ATOMICALLY
+/// conditioned on ownership: the owner marker's exact bytes at read time are
+/// passed as a compare_exchange guard, so ownership lost between the check and
+/// the write fails the write (TD-SEAM-14: token+revision validated by the SAME
+/// conditional replacement).
+///
+/// Returns `Ok(true)` if the write succeeded, `Ok(false)` if the revision
+/// changed (CAS conflict) — the caller may retry with the updated manifest.
+/// A LOST-OWNERSHIP mismatch is decisive, not retryable, and errors instead
+/// (the instance was fenced; a caller retrying `Ok(false)` forever would spin
+/// against a manifest it no longer owns).
+pub async fn write_manifest_cas(
+    url: &str,
+    filesystem: &dyn FileSystem,
+    manifest: &ManifestHead,
+    expected_revision: u64,
+) -> Result<bool> {
+    let path = format!("{}/{}", url.trim_end_matches('/'), MANIFEST_HEAD);
+
+    // Owner conditioning, part 1 (read): the marker must exist, be parseable,
+    // and match the manifest's owner identity.
+    let owner_path = format!("{}/{}", url.trim_end_matches('/'), OWNER_MARKER);
+    let owner_bytes = match read_owner(&owner_path, filesystem).await? {
+        Some(bytes) => bytes,
+        None => bail!("no owner marker at {owner_path}; cannot write manifest without ownership"),
+    };
+    let current_owner = parse_owner(&owner_path, &owner_bytes)?
+        .ok_or_else(|| anyhow!("owner marker at {owner_path} is present but unparseable"))?;
+
+    // Verify owner identity matches. Decisive: ownership lost ⇒ error.
+    if manifest.owner_instance != current_owner.instance
+        || manifest.owner_epoch != current_owner.epoch
+        || manifest.owner_nonce != current_owner.nonce
+    {
+        bail!(
+            "owner mismatch at {owner_path}: manifest claims instance={} epoch={}, \
+             marker holds instance={} epoch={} — this instance is FENCED; \
+             do not retry the manifest write",
+            manifest.owner_instance,
+            manifest.owner_epoch,
+            current_owner.instance,
+            current_owner.epoch
+        );
+    }
+
+    let bytes = serde_json::to_vec_pretty(manifest)?;
+
+    // Compute the expected bytes for CAS.
+    let expected_bytes = match read_manifest_raw(&path, filesystem).await? {
+        Some(existing) => {
+            // Parse to verify the revision matches.
+            let existing_manifest: ManifestHead = serde_json::from_slice(&existing)
+                .with_context(|| format!("parsing existing manifest at {path}"))?;
+            if existing_manifest.revision != expected_revision {
+                return Ok(false); // CAS conflict — retryable
+            }
+            Some(existing)
+        }
+        None => {
+            if expected_revision != 0 {
+                return Ok(false); // Expected absent but revision is non-zero
+            }
+            None
+        }
+    };
+
+    // Owner conditioning, part 2 (atomic): the owner marker's read-time bytes
+    // guard the write, so ownership lost between part 1 and here fails the
+    // write instead of landing a manifest from a fenced instance.
+    let success = filesystem
+        .compare_exchange(
+            &path,
+            expected_bytes.as_deref(),
+            &bytes,
+            &[(owner_path.as_str(), Some(owner_bytes.as_slice()))],
+        )
+        .await
+        .map_err(|e| fs_error(&format!("CAS write {path}"), e))?;
+
+    Ok(success)
+}
+
+/// Read the raw manifest bytes (for CAS expected value).
+async fn read_manifest_raw(path: &str, filesystem: &dyn FileSystem) -> Result<Option<Vec<u8>>> {
+    match path.strip_prefix("file://").map(Path::new) {
+        Some(local) => match std::fs::read(local) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error).with_context(|| format!("reading {path}")),
+        },
+        None => match filesystem.read(path).await {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(error) if is_absent(&error) => Ok(None),
+            Err(error) => Err(fs_error(&format!("reading {path}"), error)),
+        },
+    }
+}
+
+// ── TD-SEAM-14 S2: Durable witness read/write ───────────────────────────────
+
+/// Read the durable witness from the local WAL directory. Returns `None` if absent.
+pub fn read_witness(wal_dir: &Path) -> Result<Option<DurableWitness>> {
+    let path = wal_dir.join(DURABLE_WITNESS);
+    match std::fs::read(&path) {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .map(Some)
+            .with_context(|| format!("parsing durable witness at {}", path.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("reading {}", path.display())),
+    }
+}
+
+/// Write the durable witness with fsync. This is the local record of the last
+/// verified manifest head, used at boot to detect rollback.
+pub fn write_witness(wal_dir: &Path, witness: &DurableWitness) -> Result<()> {
+    crate::services::storage_format::write_marker(
+        wal_dir,
+        DURABLE_WITNESS,
+        &serde_json::to_vec_pretty(witness)?,
+    )
+}
+
 /// `bucket/key` of a URL: listings may spell the scheme differently.
 fn after_scheme(url: &str) -> &str {
     url.split_once("://").map_or(url, |(_, rest)| rest)
@@ -373,6 +536,66 @@ struct OwnerMarker {
     #[serde(default)]
     nonce: Option<String>,
     written_by: String,
+}
+
+/// TD-SEAM-14 S2: Manifest head — the authoritative list of segments by partition.
+/// Updated with CAS on the `revision` field. The manifest is owner-conditioned:
+/// only the current owner (matching instance+epoch+nonce) can update it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManifestHead {
+    /// Owner identity — must match the current owner marker.
+    pub owner_instance: String,
+    pub owner_epoch: u64,
+    #[serde(default)]
+    pub owner_nonce: Option<String>,
+    /// Monotonically increasing revision. CAS uses this as the expected value.
+    pub revision: u64,
+    /// SHA-256 digest of this manifest (excluding this field), hex-encoded.
+    /// Used by the durable witness to verify integrity.
+    #[serde(default)]
+    pub digest: String,
+    /// Partitions keyed by "{tenant}/{collection}".
+    #[serde(default)]
+    pub partitions: std::collections::HashMap<String, PartitionManifest>,
+}
+
+/// TD-SEAM-14 S2: Manifest for a single partition (tenant/collection).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PartitionManifest {
+    /// Partition incarnation — incremented on DROP/recreate.
+    pub incarnation: u64,
+    /// Immutable segments in LSN order.
+    pub segments: Vec<SegmentEntry>,
+}
+
+/// TD-SEAM-14 S2: An immutable segment entry in the manifest.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SegmentEntry {
+    /// Segment key (relative to partition prefix).
+    pub key: String,
+    /// SHA-256 digest, hex-encoded.
+    pub digest: String,
+    /// Byte length.
+    pub byte_length: u64,
+    /// Format (e.g., "parquet").
+    pub format: String,
+    /// LSN range [start, end] covered by this segment.
+    pub lsn_range: [u64; 2],
+}
+
+/// TD-SEAM-14 S2: Durable witness — local record of the last verified manifest head.
+/// Written with fsync before acknowledging publication. Used at boot to detect rollback.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DurableWitness {
+    /// Owner identity at the time of the witness.
+    pub owner_instance: String,
+    pub owner_epoch: u64,
+    /// Manifest revision at the time of the witness.
+    pub manifest_revision: u64,
+    /// Manifest digest at the time of the witness.
+    pub manifest_digest: String,
+    /// Timestamp (Unix seconds) when the witness was written.
+    pub timestamp: u64,
 }
 
 /// A decisive refusal: retrying cannot change it.
@@ -1314,5 +1537,82 @@ mod tests {
         )
         .await;
         assert!(err.contains("must not nest"), "{err}");
+    }
+
+    #[test]
+    fn manifest_head_alone_is_not_state() {
+        // Regression (review round): the manifest head is CONTROL metadata —
+        // a prefix holding only it (owner claim + manifest, zero segments)
+        // must stay adoptable/migratable. Counting it as state permanently
+        // refused purged prefixes.
+        let root = tempfile::tempdir().expect("root");
+        std::fs::write(root.path().join(MANIFEST_HEAD), b"{}").expect("manifest");
+        let mut scan = Scan::default();
+        scan_local(root.path(), &root.path().join(OWNER_MARKER), &mut scan);
+        assert!(!scan.has_state, "control metadata alone is not state");
+        segment(root.path(), "L0_1.pax");
+        let mut scan = Scan::default();
+        scan_local(root.path(), &root.path().join(OWNER_MARKER), &mut scan);
+        assert!(scan.has_state, "a segment IS state");
+    }
+
+    #[tokio::test]
+    async fn manifest_cas_roundtrip_conflict_and_fence() {
+        // `file://` exercises the same URL-addressed CAS + owner conditioning
+        // the object-store legs use. Round-trip: rev 0 installs on an absent
+        // head, rev 1 replaces it. Revision conflict → Ok(false) (retryable).
+        // A manifest claiming a DIFFERENT owner is decisive: an Err, not
+        // Ok(false) — the instance is fenced and must not retry forever.
+        let (_data, bucket, _dir, url, factory) = fixture().await;
+        let fs = factory.get_filesystem(&url).expect("fs");
+        let prefix = bucket.path().join("spill");
+        std::fs::create_dir_all(&prefix).expect("prefix");
+
+        let owner = OwnerMarker {
+            instance: "inst-1".to_string(),
+            epoch: 1,
+            nonce: Some("n1".to_string()),
+            written_by: "test".to_string(),
+        };
+        std::fs::write(
+            prefix.join(OWNER_MARKER),
+            serde_json::to_vec(&owner).expect("owner json"),
+        )
+        .expect("owner marker");
+
+        let manifest = |revision: u64| ManifestHead {
+            owner_instance: owner.instance.clone(),
+            owner_epoch: owner.epoch,
+            owner_nonce: owner.nonce.clone(),
+            revision,
+            digest: String::new(),
+            partitions: Default::default(),
+        };
+
+        assert!(
+            write_manifest_cas(&url, fs.as_ref(), &manifest(0), 0)
+                .await
+                .expect("cas"),
+            "revision 0 installs on an absent head"
+        );
+        assert!(
+            write_manifest_cas(&url, fs.as_ref(), &manifest(1), 0)
+                .await
+                .expect("cas"),
+            "revision 1 replaces it"
+        );
+        assert!(
+            !write_manifest_cas(&url, fs.as_ref(), &manifest(2), 0)
+                .await
+                .expect("cas"),
+            "expected 0 against head revision 1 → retryable conflict"
+        );
+
+        let mut foreign = manifest(2);
+        foreign.owner_instance = "inst-2".to_string();
+        let err = write_manifest_cas(&url, fs.as_ref(), &foreign, 1)
+            .await
+            .expect_err("a fenced instance must error, not return Ok(false)");
+        assert!(err.to_string().contains("FENCED"), "{err:#}");
     }
 }

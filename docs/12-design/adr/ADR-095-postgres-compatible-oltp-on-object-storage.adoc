@@ -320,6 +320,23 @@ ReadWriteOnce PVC, which the CSI driver reattaches on reschedule. Otherwise it i
 operator (ADR-084 D2). The engine's contract is narrow: **win the epoch, replay, serve; never serve
 without the epoch.** No consensus code is added to the OSS engine.
 
+=== D2 clarification — spill publication and recovery boundary (2026-11-09)
+
+The implementation contract for object-store relational spill is
+link:../../10-quality/td/TD-SEAM-14-object-store-recovery-and-ownership-boundary.adoc[TD-SEAM-14].
+Its revised design is *proposed*, not a declaration that the S3 gaps above are closed.
+An owner GET followed by a destructive operation is not a storage fence, and a create-only
+epoch slot alone does not fence later publication or prevent stale local-WAL acknowledgements.
+Use the qualified conditional-head/ownership work tracked by TD-LEASE-INFRA-1; the historical
+slot description above is not permission to bypass its current protocol or backend qualification.
+
+The bounded spill proposal refuses a second active claim, uses owner-conditioned manifest
+publication, preserves a durable local rollback witness and defers physical deletion to
+exclusive maintenance. A supported takeover must exclude the previous local WAL writer before
+new acknowledgements. Boot epochs alone do not detect a same-run rollback; permanent loss of
+an unarchived local WAL tail has no zero-loss recovery guarantee. These limits refine the spill
+consumer of D1/D2; they do not change unrelated OLTP surfaces or certify automatic failover.
+
 === D3 — A transaction is one WAL commit record; acknowledge after a group-commit fsync
 
 * At COMMIT, the transaction's write set (record puts, tombstones, unique/PK/FK key claims,

@@ -53,12 +53,19 @@ class ProximaRecordInput:
                 name, so `metadata` passes the deny while any other unknown key is
                 rejected.
             text_fields (list[TextFieldInput] | None | Unset): Dedicated TEXT fields with storage hints
+            expires_at_ms (int | None | Unset): Absolute expiry time in epoch MILLISECONDS (record TTL). After this
+                instant the record is dead to every read. Same field and semantics as
+                the gRPC v2 `ProximaRecord.expires_at_ms`. Rejected for that record
+                (it lands in `errors`): 0 or negative (0 is the internal tombstone
+                encoding) and anything before 1973 (1e11), which is almost always epoch
+                seconds passed by mistake. Upsert without this field clears any TTL.
     """
 
     vector: list[float]
     id: None | str | Unset = UNSET
     props: None | ProximaRecordInputPropsType0 | Unset = UNSET
     text_fields: list[TextFieldInput] | None | Unset = UNSET
+    expires_at_ms: int | None | Unset = UNSET
 
     def to_dict(self) -> dict[str, Any]:
         from ..models.proxima_record_input_props_type_0 import (  # noqa: PLC0415
@@ -94,6 +101,12 @@ class ProximaRecordInput:
         else:
             text_fields = self.text_fields
 
+        expires_at_ms: int | None | Unset
+        if isinstance(self.expires_at_ms, Unset):
+            expires_at_ms = UNSET
+        else:
+            expires_at_ms = self.expires_at_ms
+
         field_dict: dict[str, Any] = {}
 
         field_dict.update(
@@ -107,6 +120,8 @@ class ProximaRecordInput:
             field_dict["props"] = props
         if text_fields is not UNSET:
             field_dict["text_fields"] = text_fields
+        if expires_at_ms is not UNSET:
+            field_dict["expires_at_ms"] = expires_at_ms
 
         return field_dict
 
@@ -170,11 +185,21 @@ class ProximaRecordInput:
 
         text_fields = _parse_text_fields(d.pop("text_fields", UNSET))
 
+        def _parse_expires_at_ms(data: object) -> int | None | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            return cast(int | None | Unset, data)
+
+        expires_at_ms = _parse_expires_at_ms(d.pop("expires_at_ms", UNSET))
+
         proxima_record_input = cls(
             vector=vector,
             id=id,
             props=props,
             text_fields=text_fields,
+            expires_at_ms=expires_at_ms,
         )
 
         return proxima_record_input

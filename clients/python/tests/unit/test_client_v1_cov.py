@@ -22,6 +22,7 @@ from proximadb_sdk.v1 import (
     vector_types_pb2,
 )
 from proximadb_sdk.v2 import record_pb2
+from tests.unit._id_helpers import is_uuid as _is_uuid
 
 
 # --------------------------------------------------------------------------
@@ -321,7 +322,7 @@ def test_insert_records_rest_no_id_fallback(rest_client, monkeypatch):
     )
     rec = VectorRecord(vector=[1.0])
     rest_client.insert_records("col", [rec])
-    assert captured["json"]["records"][0]["id"] == "record_0"
+    assert _is_uuid(captured["json"]["records"][0]["id"])
 
 
 def test_insert_records_rest_network_error(rest_client, monkeypatch):

@@ -1,49 +1,383 @@
 // Copyright (C) 2026 ProximaDB
 // SPDX-License-Identifier: Apache-2.0
 = TD-SEAM-14: object-store spill recovery and ownership boundary (S2/S3)
+:toc:
 
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | **Open.** Filed 2026-10-25 from the M1 rebase review (contract refinement: object-store recovery and ownership guarantees).
-| Priority | HIGH. Gates object-store spill placement leaving opt-in, and any second-writer / restored-bucket deployment.
-| Component | `src/services/spill_placement.rs` (#2231), `src/services/record_spill.rs`, `src/services/wal_truncator.rs`, the canonical WAL appender; recorded as the two open follow-ups on the TD-SEAM-3 row.
-| Relates to | TD-SEAM-3 (object-store placement landed #2231), TD-SEAM-2 (truncation floors), ADR-020 (canonical WAL authority), ADR-094 (one substrate)
+| Status | *Open; revised design proposed 2026-11-09. No implementation or safety graduation claimed.*
+| Priority | HIGH. Gates object-store spill placement leaving opt-in and copied-writer / restored-bucket guarantees.
+| Component | Spill placement/store, partition factory, canonical WAL/truncator, storage format, shared ownership/publication adapters.
+| Authority | ADR-020, ADR-094, ADR-095 D1/D2, ADR-097. This existing TD owns the detailed defect, implementation specification and acceptance tests.
+| Dependencies | TD-LEASE-INFRA-1 conditional publication/ownership; TD-PGOLTP-2 volume fencing; TD-SEAM-12 truncation floors. Reuse dependencies, not assumed completed capabilities.
+| Inspection baseline | `origin/develop` at `6e34f2a0a`, 2026-11-09. Revalidate symbols and feature lanes before implementation.
 |===
 
-== Problem
+== 1. Review handback: rejected premises
 
-An acknowledged write today is a local canonical-WAL append (fsync) plus, after a flush,
-remote spill segments under `PROXIMADB_RELATIONAL_SPILL_URL`. Two boundaries are undefined:
+This specification replaces the original local handoff's algorithm. Source inspection, not
+executed fault injection, established these counterexamples:
 
-. **Durability boundary.** The WAL is local; the segments are remote. What an acknowledged
-  write survives — process crash, node loss, total loss of the writer's local disk — is not
-  written down, and neither is the recovery procedure (replay order, what a node that lost
-  its WAL may serve, when it must refuse).
-. **Ownership boundary.** Placement is fenced only at boot: a local placement marker plus a
-  prefix owner marker whose epoch advances every boot (#2231). (a) A copy of a data
-  directory booted while the original runs presents a fresh epoch and can purge segments the
-  original still serves. (b) A bucket restored to a point *inside* the current run passes the
-  boot check, so in-run rollback is undetected.
+[cols="2,3,3",options="header"]
+|===
+| Original premise | Actual behavior / counterexample | Correction
+| GET owner under the operation lock fences DELETE
+| A validates; B claims; A deletes. `flush_guard` is process-local. B's own check succeeds after its claim and B can delete A's rows.
+| Ownership and authoritative publication need one atomic boundary. Initial strict mode has no online physical deletion.
+| Instance + epoch identifies a run
+| Copies share instance and racing boots choose the same next epoch. Existing owner replacement is unconditional.
+| Exact scope, authority incarnation, owner incarnation, generation and storage revision; no blind overwrite.
+| Boot epoch names detect rollback
+| Normal restart leaves valid older segments. Same-epoch restore loses later objects without changing remaining epochs.
+| Exact committed inventory and durable witness outside the restored bucket. Never ignore an old epoch merely because it is old.
+| Flush overwrites segments
+| `flush` already uses `write_if_absent`; names are `spill-{seq:016x}.parquet`.
+| Preserve conditional creation; fence publication of new rows and tombstones too.
+| Epoch stamping is a small naming migration
+| Discovery strictly parses names, reconstructs paths, resumes counters and orders versions; purge obligations record exact paths.
+| Versioned inventory, explicit ordering and migration/downgrade fences.
+| Remote segments recover all acknowledged writes after disk loss
+| Acknowledged unflushed canonical WAL tail, catalog and identity may be local only.
+| State exact failure domain/checkpoint; refuse incomplete normal recovery.
+|===
 
-== Plan
+Source anchors: `src/services/spill_placement.rs::{write_owner,PlacementAttempt::claim}`;
+`src/services/record_spill.rs::{flush,ensure_discovered,drain_purge_obligation,
+record_purge_obligation,purge_durable_objects,parse_spill_seq}`;
+`src/services/record_store.rs` partition factory and `RecordPartitionDrop` replay;
+`src/services/wal_truncator.rs::run_once`.
 
-. Write the acknowledged-write durability boundary down (which fsync/PUT acknowledgments
-  imply survival of which failure classes), and the recovery procedure for a writer that
-  lost its local disk; drill it as a test, not prose.
-. Runtime owner fence: re-read the owner epoch/nonce before every destructive operation
-  (purge, truncation-driven delete, flush overwrite), and treat a mismatch as a hard refusal
-  to delete — the running owner wins, the late boot refuses.
-. In-run rollback high-water: epoch-stamped segment names (or an equivalent forward-only
-  marker) so a restored bucket reads as "older than this run" and is refused.
-. Placement stays opt-in (`PROXIMADB_RELATIONAL_SPILL_URL`, default off) until the fence and
-  the high-water land; multi-writer object storage stays unsupported until then.
+== 2. Bounded delivery and invariants
 
-== Acceptance
+Initial delivery supports *one active writer*, an intact durable local WAL/metadata volume,
+and qualified conditional object-store publication. Automatic live failover, concurrent writers,
+online physical GC and zero-loss recovery of an unarchived WAL tail after total local-volume
+loss are outside this delivery. Placement stays opt-in; restrictions must be documented.
 
-* Boot a second writer on a copied data directory while the first serves: it must not delete
-  or purge anything the first is serving (test, not review).
-* Restore the bucket to a mid-run point: the writer detects rollback and refuses rather than
-  serving mixed generations.
-* The documented durability boundary matches tested behavior (a recovery drill that loses the
-  local WAL and replays from remote segments + whatever the boundary promises).
+. A copied second boot cannot acquire an active prefix, publish into it, or delete its objects.
+  Refusal occurs before replay or serving.
+. One authoritative head serializes ownership and inventory changes. Stale expected revisions
+  cannot commit, even if candidate PUTs complete after takeover.
+. Only manifest-referenced objects are data. LIST is never serving authority after migration.
+. Acknowledged local mutations remain recoverable from retained canonical WAL or validated,
+  durably witnessed inventory within the specified failure domain.
+. Missing/changed required objects and a remote head behind/divergent from the local witness
+  cause refusal. Missing tombstones cannot resurrect rows; no silent skipping of segments.
+. Generations/revisions/operation IDs are never reused; overflow errors. Confirmed ownership
+  loss is sticky for a process even if an old marker reappears.
+
+Use a non-expiring claim for the initial delivery. A partitioned/paused owner keeps ownership,
+sacrificing availability. Crash takeover requires externally established exclusion of the
+predecessor. A timeout, matching instance, copied nonce, PID check or expired lease is not proof.
+A remote publication fence cannot prevent a stale process acknowledging its own local WAL copy.
+Automated takeover depends on a qualified TD-PGOLTP-2 admission/volume fence and its proof.
+
+Data-prefix rollback and authority rollback are different failure classes. Strict deployments
+place the control authority outside the data-prefix restore operation and restrict restore
+credentials accordingly. Restoring authority and data together requires external exclusion of
+all writers first. Rolling back every copy of the evidence cannot be detected without an
+independent witness. Do not claim arbitrary live control-authority restore safety.
+
+== 3. Reuse and authority placement
+
+Read link:../../12-design/LEASE_INFRASTRUCTURE_CONSOLIDATION_HLD.md[lease/publication consolidation]
+and link:TD-LEASE-INFRA-1-ownership-publication-consolidation.adoc[TD-LEASE-INFRA-1]. Reuse/harden
+`ProximaObjectStore::{get_with_meta,put_opts}`, the conditional-head implementation behind
+`ManifestCommitter`, existing `ResourceKey`/ownership-token types, and write-fence/admission
+seams. Extract/re-export shared internals where needed; no duplicate public lease API,
+private row WAL, generic transaction coordinator or per-provider ownership algorithm.
+
+`write_atomic`, `overwrite: false`, and GET followed by PUT are not CAS. Qualify native expected-
+revision replacement and read-with-validator on each supported backend. Local replacement
+requires cross-process/crash proof; a process mutex is insufficient. Unsupported backends
+refuse strict mode, never fall back to unconditional replacement. Existing method names are
+not certification; inspect live callers and actual guarantees before reuse.
+
+Use one serialized control head per configured storage scope containing both owner state
+and manifest-root reference, outside the restorable data prefix. Prefix reservations must
+serialize equal/ancestor/descendant claims, including copies of the same instance. Reuse a
+qualified hierarchical allocator or a single CAS reservation map for that control scope.
+Independent owner keys with LIST-based overlap checks are unsafe. Keep reservation tombstones
+across releases; never delete/recycle the authority identity.
+
+Every deployment addressing the same bucket/namespace must agree on its canonical control
+scope, bound in trusted configuration and credentials. An alternate URL must not create a
+second authority over the same data. Qualify normalized paths, aliases and scope binding.
+Where reservation and head are distinct: reserve first, then create the head; failure leaves
+a conservative reservation for reconciliation, never a reusable prefix. Reservation alone
+cannot start a writer. Independent per-partition publication is a later measured optimization.
+
+== 4. Persistent records and lifecycle
+
+Logical fields below reuse canonical types rather than creating synonymous structs:
+
+* Control head: format, canonical scope, authority incarnation, non-reused logical revision,
+  owner state (`Released`/`Owned`), owner incarnation/generation, manifest-root key+digest,
+  operation ID+payload digest, predecessor revision/digest and native CAS validator.
+* Immutable manifest root: partition map keyed by tenant, collection identity and partition
+  incarnation; each partition has an explicitly ordered immutable segment inventory and
+  durable DROP/incarnation state. Entries carry exact key, digest, byte length, format and
+  order identity. WAL coverage metadata must have proved semantics.
+* Local witness: authority identity, last verified head revision/digest, manifest-root identity,
+  pending transition descriptor and persisted checkpoint/truncation basis. Atomic durable
+  replacement includes file and parent-directory fsync through existing metadata primitives.
+* Segment: immutable unique key containing partition incarnation and unique write identity.
+  Optional writer epoch is diagnostic; filenames do not determine freshness or visibility.
+
+Retain immutable manifests and parents in the initial delivery. Ancestry/operation receipts
+resolve committed-but-response-lost operations. Reusing an operation ID with different payload
+is an error. History/receipt pruning requires a separate retention proof and stays disabled.
+
+[cols="2,4",options="header"]
+|===
+| Transition | Rule
+| Unclaimed -> Owned | Reserve scope atomically, create head once, fresh run identity. Persist local intent before publication. No replay until claim/witness are settled.
+| Released -> Owned | CAS exact head revision; increment generation; preserve inventory; new run identity. Never upgrade an active owner automatically.
+| Owned -> publication | Exact token and expected revision validated by the *same conditional replacement* that changes the manifest reference.
+| Owned -> Released | Stop admission/producers, finish or resolve in-flight operations, persist witness, then exact-token release. Unresolved operations block release; no mutation afterward.
+| Owned -> Fenced | Terminal after ownership mismatch, incompatible authority or rollback. Stop admission/flush/truncation/mutable recovery and affected serving paths.
+| Unavailable | Bounded retries, readiness failure and backpressure. Unchanged authoritative ownership may resume after transient outage; Fenced cannot.
+| Crash takeover | Explicit recovery only after externally excluding predecessor and reconciling pending operations; CAS predecessor head to fresh generation, preserving inventory/evidence.
+|===
+
+A restart seeing `Owned` takes crash recovery even when all local bytes/nonces match. A copied
+pending nonce is not permission to resume another live run. Graceful restart uses `Released`.
+Cancellation or request timeout alone does not prove a remote operation stopped executing.
+
+== 5. Publication, uncertainty and WAL truncation
+
+A local coordinator serializes head transitions to reduce self-contention. The backend head
+CAS, not this lock, is the cross-process linearization point.
+
+. Admit under the acquired run with existing tenant/write-intent/WAL checks. Canonical WAL
+  append+fsync remains the acknowledged-write boundary; do not add a row durability log.
+. Snapshot rows/tombstones using existing generation-safe flush rules. Create a unique immutable
+  candidate with `write_if_absent`. Candidate existence is not publication. Failure/cancellation
+  retains resident state and WAL.
+. Upload immutable next inventory/root preserving version/tombstone order. Fsync local pending
+  descriptor with expected head, operation ID and proposed root digest before attempting CAS.
+. CAS the head under exact owner+revision. Reconcile conflicts using authoritative state and
+  receipts. Changed owner fences the process; same-owner revision conflict is not permission
+  for blind retry of the stale payload.
+. Resolve receipt, durably advance local witness, then expose the new inventory and evict only
+  covered resident generations/tombstones. Only then can spill release required WAL history.
+. Compose with *all* existing WAL consumer floors and branch protections via the current
+  truncator/appender. No second truncator or bypass path.
+
+PUT acknowledgement alone cannot release the floor. Pending/unknown publication pins it.
+Remote commit plus local-witness failure is uncertain state, not truncation permission.
+Restart settles the pending operation from its identity and immutable ancestry; if evidence
+cannot establish outcome, refuse and retain WAL. A prepared descriptor may conservatively
+require repair rather than treating an old head as proof that CAS never happened.
+
+A segment maximum LSN does not prove coverage of every lower LSN, catalog mutation or other
+modality. Preserve per-record unflushed-floor semantics. The durable witness records a recovery
+certificate derived from all consumer floors, not an independently invented checkpoint number.
+Crash-inject local fsyncs, CAS and lost responses as well as object writes.
+
+== 6. DROP, replay and physical deletion
+
+Strict DROP performs an owner-conditioned logical manifest retirement with a new partition
+incarnation, retaining old immutable objects. Stale handles cannot publish into the successor.
+Coordinate with existing catalog/WAL ordering: a catalog-committed DROP is not suddenly an
+abortable statement. Replay is idempotent by operation identity and must not retire post-DROP
+rows or allocate another incarnation on each replay.
+
+`purge_durable_objects` dispatches by explicit format/mode. Strict mode performs logical
+retirement and issues no physical DELETE. Name/document the internal contract so callers do
+not claim completed erasure. Physical-erasure requests remain pending/unsupported until
+exclusive maintenance completes; logical DROP is not compliance deletion.
+
+Cover live DROP, `RecordPartitionDrop` replay, first-touch `drain_purge_obligation`, orphan
+cleanup, shutdown cleanup and future compaction. Ordinary reads/discovery never drain legacy
+delete obligations after strict migration begins.
+
+Physical GC is offline exclusive maintenance initially: externally stop/fence all readers and
+writers, resolve pending operations, freeze authority head, compute reachability from retained
+manifests/backups, delete only proven unreferenced keys, record completion, release maintenance
+ownership. Retained history intentionally delays reclamation. Deleting history requires a
+separate explicit retention decision. Delayed candidate PUTs are invisible to readers but must
+be resolved before reporting erasure completion. Never clean against a changing head.
+Online GC requires reader/candidate pins and a storage-enforced protocol; object age, a grace
+period, or conditional DELETE of one object does not establish cross-object ownership.
+
+== 7. Rollback and read semantics
+
+Compare durable local witness with authoritative control history at boot before replay effects,
+before publication/truncation and at read admission. Pin one immutable manifest per query.
+Never re-list the bucket to discover serving truth or substitute older data after an error.
+
+Behind/divergent head, changed authority, missing ancestry, or missing/changed required object
+means refusal. A remote revision ahead of the witness requires operation/ancestry reconciliation;
+a greater integer is not proof. Advance witness per publication, not just per boot/truncation.
+
+Validate object identity on actual reads and cache hits. Cache keys bind to manifest reference
+and digest, not mutable path alone. Point reads, scans, chunked scans, delete probes and indexes
+used for pruning must account for later versions/tombstones. Validate pruning metadata under
+the same snapshot; a missing file never means an empty range.
+
+Detection occurs at the next relevant validated boundary, not instant notification of restore.
+A query can finish from a fully validated pinned snapshot whose bytes remain available. If a
+required object disappears mid-stream, return a terminal error, not successful partial results;
+already transmitted rows cannot be retracted. Background integrity probes may bound detection
+latency operationally, but are not correctness proof against arbitrary restores between probes.
+
+Data-only rollback leaves the control inventory to expose missing/changed objects. Rollback of
+control+data with an intact local witness exposes revision/ancestry regression. Restoring control
+while another writer may acquire is unsupported: exclude all processes first. Loss/rollback of
+all witnesses requires explicit verified-backup restore and a new authority incarnation.
+
+== 8. Durability boundary and operator recovery
+
+[cols="2,3,3",options="header"]
+|===
+| Failure | Guarantee after implementation | Recovery / refusal
+| Process crash, durable volume intact | Fsynced canonical WAL plus verified inventory includes acknowledged unflushed tail | Exclude predecessor, reconcile claim/pending publication/witness, validate inventory, replay canonical WAL before serving.
+| Node loss, same volume reattached | Same only within documented volume durability domain | Qualified volume exclusion/reattach; copied metadata alone is insufficient.
+| Permanent local volume loss | No guarantee for acknowledged unarchived tail; remote spill is not complete backup | Refuse normal startup. Explicit consistent backup/checkpoint + available WAL archive/catalog/identity/keys recovery; disclose recovery point and lost tail.
+| Segment prefix rollback, local witness intact | No successful silent subset/mixed generation | Validate inventory, refuse missing/changed required objects, retain available WAL for repair.
+| Control + data rollback, witness intact | Detect regression at validation; no live control restore promise | Exclude writers before restore; reconcile witness and repair before serving.
+| All authority evidence lost | Cannot establish freshness automatically | Explicit backup restore/new authority incarnation; no maximum-filename heuristic.
+| Store outage | Preserve WAL/residents; no unsafe publication/truncation | Bounded retries/backpressure, fail closed.
+|===
+
+Normal crash-recovery sequence: stop/exclude predecessor; verify volume and authority scope;
+reconcile pending operations; validate manifest/witness; establish fresh claim via explicit
+recovery; replay retained WAL and catalog in canonical order; verify consumer floors; only
+then open listeners/admission. No destructive replay before ownership is established. If
+inspection requires a claim, acquire a recovery-only capability that cannot serve or purge.
+An unresolved conflict stays in recovery refusal, with evidence preserved.
+
+Drills include flushed records AND acknowledged unflushed tail, updates, tombstones,
+DROP/recreate and catalog mutations. Intact-volume recovery preserves all acknowledged state.
+Total-volume-loss normal boot refuses. Explicit backup recovery is a separate drill and may
+restore only its advertised consistent checkpoint. Listing Parquet cannot reconstruct a
+complete database catalog, constraints or authority identity by itself.
+
+== 9. Migration and software rollback
+
+. Mixed readers recognize legacy and manifest formats explicitly. Strict writes stay default-
+  OFF until baked. Consult the env registry before adding/using gates; register any new gate
+  with implementation. Prefer typed configuration and existing switches where appropriate.
+. Initial migration is offline exclusive: stop/fence old binaries, retain WAL/markers. No
+  zero-downtime claim. Pre-protocol binaries may ignore new remote markers; credential and
+  operational exclusion are prerequisites.
+. Reconcile legacy purge obligations under exclusion before inventory construction. Verify
+  all adopted segments and preserve current sequence ordering; unknown/mangled names refuse.
+  Reference existing immutable keys without copying/renaming data.
+. Write immutable manifests and durable crash-resumable local migration intent. Raise local
+  format fence BEFORE strict-head publication. Publish remote format/authority/inventory as
+  one conditional head transition; persist witness/completion before service opens.
+. Interrupted steps resume from verified intent or refuse. Never fall back to legacy LIST
+  authority after cutover. Unreferenced staged files are not rows. Explicitly order mixed
+  legacy/new entries; prior ownership epochs remain valid data.
+. Disabling write gate never downgrades an existing strict directory or restores destructive
+  legacy behavior. Old binaries refuse before mutation. Reversion requires explicit offline
+  export/restore, never deletion of format markers. Remote format fence also protects clients
+  with missing local markers; old clients require external exclusion as above.
+
+== 10. Implementation inventory and TDD slices
+
+[cols="1,3,3",options="header"]
+|===
+| Slice | Work | Progress gate
+| S0 | Fresh baseline, caller/capability audit; deterministic counterexample tests | Failing tests demonstrate actual races; qualify backend semantics and existing production wiring.
+| S1 | Exclusive claim, prefix reservation, exact tokens, release/fenced states, explicit crash exclusion | Copied/concurrent/nested claims refuse. Supported transfer prevents stale WAL acknowledgements; unsupported transfer refuses.
+| S2 | Immutable candidates, owner-conditioned manifest head, durable witness, conservative floor | Crash/cancel/lost-response schedules pass; stale PUT invisible; uncertain state retains sufficient WAL.
+| S3 | Manifest reads, logical DROP/incarnation, replay idempotence, suppress online DELETE | Missing segments/tombstones cannot yield wrong success; stale handles cannot resurrect tables.
+| S4 | Format migration, recovery/maintenance operations and operator documentation | Mixed format, interruption, downgrade refusal, complete durability drills.
+| S5 | Server integration, provider qualification, measured traces, independent adversarial review | Required checks green; no unsupported claim; TD remains open while any required slice is missing.
+|===
+
+Files/callers to inventory: `spill_placement.rs` bootstrap/claim result; `record_store.rs` factory,
+admission and DROP replay; `record_spill.rs` plus `record_spill/chunked_scan.rs` reads/publication/
+purge; `wal_truncator.rs` and canonical appender floor; `storage_format.rs`; server composition
+roots; existing object-store/publication/lease adapters; provider and server integration tests.
+`SpillTarget::Object` must carry validated ownership/publication capability through the factory
+into every lazy partition. URL+filesystem alone cannot construct a strict production writer.
+Local legacy mode remains explicit; capability defaults cannot silently bypass safety.
+
+Required deterministic tests use barriers/fault schedules, never sleeps as ordering proof:
+
+* A validates; B attempts live claim; A resumes purge. B refuses and no A objects are deleted.
+* Same-instance/same-next-epoch distinct-nonce claims: exactly one acquisition. Prefix equal,
+  ancestor/descendant and alias races get no same-instance exemption.
+* Pause candidate PUT/head CAS across supported fenced recovery; stale candidate cannot become
+  authoritative, and old local WAL cannot acknowledge after the supported exclusion boundary.
+* Stale release, duplicate receipt, reused ID/different payload, overflow, ABA and unsupported
+  CAS backend all fail safely.
+* Missing/malformed/unreadable authority; cached success cannot authorize mutation. Confirmed
+  loss stays terminal if an old marker reappears.
+* Crash/cancel before/after candidate PUT, inventory upload, local intent fsync, head CAS,
+  witness fsync, eviction and WAL deletion, including commit with response lost.
+* Transfer amid multi-partition operations preserves declared atomic scope. No online partial
+  physical purge. Replay DROP/first-touch purge obligations under ownership loss never DELETE.
+* DROP/recreate and stale handles preserve new rows; repeated WAL replay is idempotent.
+* Same-run restore loses latest segment, only tombstone, or inventory. Ordinary restart accepts
+  valid older epochs; an empty newest generation is not rollback evidence.
+* Restore during point read, scan/chunked scan, delete probe, cache hit and index pruning gives
+  exact snapshot or terminal error, never silent subset/resurrection.
+* Mixed-format ordering, duplicate/malformed entries, digest mismatch, interrupted conversion,
+  and old binary refusal before mutation.
+* Actual server/pgwire durability drills with catalog and unflushed tail, as section 8 specifies.
+
+Assert object bytes, authoritative head, visible rows/tombstones, retained WAL, acknowledgement
+history and mutation logs, not only returned errors. Add negative controls showing removal of
+key conditions breaks the tests. Emulator tests do not certify production provider semantics;
+qualify conditional operations and ambiguous retry outcomes on supported providers.
+
+== 11. Performance, evidence and completion
+
+Never cache successful GET as permission. Cached head is only an optimistic expected revision
+for CAS; storage validates at commit. Queries pin immutable inventory. One head transition per
+flush batch amortizes coordination; do not add per-row object-store RTT to WAL acknowledgement.
+
+Measure actual pgwire p50/p95/p99 write/flush/read latency, GET/PUT/LIST counts/bytes, CAS conflicts,
+lock wait/hold, resident backlog, retained WAL, refusal latency, restart cost and manifest growth.
+Separate additional publication PUT, local witness fsync and validation GET costs. Metadata
+paging must preserve exact inventory semantics. Record reproducible evidence in existing ledger;
+no invented acceptable latency budget or component-only performance claim. Preserve TenantContext,
+canonical paths, billing and query-scoped I/O trace. Metrics distinguish ownership loss, outage,
+rollback, unknown commit, unsupported backend and pending reclamation without credential leakage.
+
+Run focused nextest suites, actual server build, touched provider/feature lanes, factory/replay
+integration, formatting, layering, env registry, TD/ADR uniqueness and commit guards. Require
+fresh-context adversarial review on exact proposed head, resolve findings, rebase stale work
+and repeat affected checks. Keep implementation, production wiring, tests and documentation in
+coherent changes; update tracker with evidence and residual gates.
+
+Completion requires S0-S5 and explicit operational recovery/maintenance procedures. This design
+alone authorizes no multi-writer deployment, automatic crash takeover, online GC or remote-only
+zero-loss recovery. File separate debt only for independent newly discovered gaps; never create
+a second TD-SEAM-14 or competing ownership architecture.
+
+== 12. Implementation-session overlay
+
+[source,text]
+----
+Implement TD-SEAM-14 from its revised specification in
+  docs/10-quality/td/TD-SEAM-14-object-store-recovery-and-ownership-boundary.adoc
+Read ADR-095 D2 clarification, ADR-097's S2/S3 refinement, the current tracker row,
+and LEASE_INFRASTRUCTURE_CONSOLIDATION_HLD.md. Use these tracked documents instead
+of the original HANDOFF-TD-SEAM-14-DESIGN.md algorithm.
+
+Start in an isolated worktree from current origin/develop. Bring the design changes
+from docs/td-seam-14-design-handback into your task branch (they may be uncommitted;
+copy only the four specified documentation files, preserving foreign WIP). Verify
+current callers and shared CAS/ownership capabilities first. Execute S0-S5 using
+TDD: deterministic failing races/crash cases, smallest integrated fix, focused
+nextest/server/provider-feature checks, then required guards and fresh-context
+adversarial review. Wire each slice into the real factory/replay/pgwire path in the
+same change. Reuse shared primitives; no parallel lease service or WAL. Preserve
+all existing ratchets, tenant/path/metering rules and default-OFF format rollout.
+
+Treat the non-expiring claim, explicit fenced crash recovery, logical DROP/offline
+GC and refusal on missing recovery evidence as the initial support boundary. If
+an existing primitive cannot meet a specified invariant, document the concrete
+counterexample and implement its narrow shared fix; do not substitute owner-GET
+caching, filename-epoch freshness, or unconditional writes. Record tests, measured
+I/O, migration/recovery evidence and remaining gates in the TD/tracker. Do not
+claim completion or enable placement by default until S0-S5 are proved. Do not
+merge or bypass required review without the repository's required authorization.
+----

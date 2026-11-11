@@ -5601,12 +5601,11 @@ impl PostgresProtocol {
     /// port (`/api/v2/query`) or the graph service — they are not replaceable
     /// by pgwire"). This used to fabricate a `(table_name, 0, 0)` row
     /// regardless of whether the collection existed or had data — a silent
-    /// wrong answer, not a real query. Decline honestly instead: calling
-    /// `GraphService::get_stats` here would be unsafe, not just
-    /// unimplemented — it resolves via `get_or_create_graph_engine`, so a
-    /// bare stats lookup on a nonexistent/misspelled name would silently
-    /// provision a new empty graph collection as a side effect of a stray
-    /// SELECT, which is worse than today's placeholder.
+    /// wrong answer, not a real query. Decline honestly instead: pgwire has
+    /// no graph query lowering, and since reads stopped provisioning graphs
+    /// (TD-LANECOV-1) even a bare stats lookup on a nonexistent/misspelled
+    /// name returns NOT_FOUND — still not a query answer, so the decline
+    /// stands on the no-lowering rationale.
     async fn execute_graph_query(&mut self, table_name: &str, _query: &str) -> Result<()> {
         debug!("Declining unsupported graph query on table: {}", table_name);
         self.send_error(

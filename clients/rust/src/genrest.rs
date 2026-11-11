@@ -12109,6 +12109,14 @@ pub mod types {
     ///    "vector"
     ///  ],
     ///  "properties": {
+    ///    "expires_at_ms": {
+    ///      "description": "Absolute expiry time in epoch MILLISECONDS (record TTL). After this\ninstant the record is dead to every read. Same field and semantics as\nthe gRPC v2 `ProximaRecord.expires_at_ms`. Rejected for that record\n(it lands in `errors`): 0 or negative (0 is the internal tombstone\nencoding) and anything before 1973 (1e11), which is almost always epoch\nseconds passed by mistake. Upsert without this field clears any TTL.",
+    ///      "type": [
+    ///        "integer",
+    ///        "null"
+    ///      ],
+    ///      "format": "int64"
+    ///    },
     ///    "id": {
     ///      "description": "Record ID (optional, will be auto-generated if not provided)",
     ///      "type": [
@@ -12150,6 +12158,14 @@ pub mod types {
     #[derive(::serde::Deserialize, ::serde::Serialize, Clone, Debug)]
     #[serde(deny_unknown_fields)]
     pub struct ProximaRecordInput {
+        /// Absolute expiry time in epoch MILLISECONDS (record TTL). After this
+        /// instant the record is dead to every read. Same field and semantics as
+        /// the gRPC v2 `ProximaRecord.expires_at_ms`. Rejected for that record
+        /// (it lands in `errors`): 0 or negative (0 is the internal tombstone
+        /// encoding) and anything before 1973 (1e11), which is almost always epoch
+        /// seconds passed by mistake. Upsert without this field clears any TTL.
+        #[serde(default, skip_serializing_if = "::std::option::Option::is_none")]
+        pub expires_at_ms: ::std::option::Option<i64>,
         ///Record ID (optional, will be auto-generated if not provided)
         #[serde(default, skip_serializing_if = "::std::option::Option::is_none")]
         pub id: ::std::option::Option<::std::string::String>,
@@ -12188,6 +12204,16 @@ pub mod types {
     ///  "description": "REST input for quantization config (mirrors proto `QuantizationConfig`;\ngRPC-v2 parity with `V2QuantizationConfig`).",
     ///  "type": "object",
     ///  "properties": {
+    ///    "custom_levels": {
+    ///      "description": "Concrete level configuration (sent when strategy is \"custom_levels\"):\nthe quantization method + its parameters. Without this, a\ncustom_levels strategy carries no actual levels and the server\napplies smart defaults — the SDK's concrete type (scalar/pq/binary)\nand params silently never reached the engine (the #2473-review\nsilent-drop).",
+    ///      "type": [
+    ///        "array",
+    ///        "null"
+    ///      ],
+    ///      "items": {
+    ///        "$ref": "#/components/schemas/QuantizationLevelInput"
+    ///      }
+    ///    },
     ///    "enabled": {
     ///      "description": "Enable quantization for this collection.",
     ///      "type": [
@@ -12210,6 +12236,14 @@ pub mod types {
     #[derive(::serde::Deserialize, ::serde::Serialize, Clone, Debug)]
     #[serde(deny_unknown_fields)]
     pub struct QuantizationConfigInput {
+        /// Concrete level configuration (sent when strategy is "custom_levels"):
+        /// the quantization method + its parameters. Without this, a
+        /// custom_levels strategy carries no actual levels and the server
+        /// applies smart defaults — the SDK's concrete type (scalar/pq/binary)
+        /// and params silently never reached the engine (the #2473-review
+        /// silent-drop).
+        #[serde(default, skip_serializing_if = "::std::option::Option::is_none")]
+        pub custom_levels: ::std::option::Option<::std::vec::Vec<QuantizationLevelInput>>,
         ///Enable quantization for this collection.
         #[serde(default, skip_serializing_if = "::std::option::Option::is_none")]
         pub enabled: ::std::option::Option<bool>,
@@ -12220,6 +12254,7 @@ pub mod types {
     impl ::std::default::Default for QuantizationConfigInput {
         fn default() -> Self {
             Self {
+                custom_levels: Default::default(),
                 enabled: Default::default(),
                 strategy: Default::default(),
             }
@@ -12262,6 +12297,64 @@ pub mod types {
     }
     impl QuantizationConfigOutput {
         pub fn builder() -> builder::QuantizationConfigOutput {
+            Default::default()
+        }
+    }
+    /// REST input for one quantization level (mirrors proto `QuantizationLevel`'s
+    /// core fields; the advanced calibration fields stay server-defaulted).
+    ///
+    /// <details><summary>JSON schema</summary>
+    ///
+    /// ```json
+    ///{
+    ///  "description": "REST input for one quantization level (mirrors proto `QuantizationLevel`'s\ncore fields; the advanced calibration fields stay server-defaulted).",
+    ///  "type": "object",
+    ///  "required": [
+    ///    "quantization_type"
+    ///  ],
+    ///  "properties": {
+    ///    "bits": {
+    ///      "description": "Bits per vector element (8 for INT8, 4/8 for PQ sub-quantizers).",
+    ///      "type": [
+    ///        "integer",
+    ///        "null"
+    ///      ],
+    ///      "format": "int32",
+    ///      "minimum": 0.0
+    ///    },
+    ///    "num_subvectors": {
+    ///      "description": "Number of sub-vectors for product quantization.",
+    ///      "type": [
+    ///        "integer",
+    ///        "null"
+    ///      ],
+    ///      "format": "int32",
+    ///      "minimum": 0.0
+    ///    },
+    ///    "quantization_type": {
+    ///      "description": "Quantization method: \"scalar\" | \"product\" | \"binary\" | \"uniform\" | \"none\"\n(proto `quantization_level::QuantizationType` names, lowercase).",
+    ///      "type": "string"
+    ///    }
+    ///  },
+    ///  "additionalProperties": false
+    ///}
+    /// ```
+    /// </details>
+    #[derive(::serde::Deserialize, ::serde::Serialize, Clone, Debug)]
+    #[serde(deny_unknown_fields)]
+    pub struct QuantizationLevelInput {
+        ///Bits per vector element (8 for INT8, 4/8 for PQ sub-quantizers).
+        #[serde(default, skip_serializing_if = "::std::option::Option::is_none")]
+        pub bits: ::std::option::Option<i32>,
+        ///Number of sub-vectors for product quantization.
+        #[serde(default, skip_serializing_if = "::std::option::Option::is_none")]
+        pub num_subvectors: ::std::option::Option<i32>,
+        /// Quantization method: "scalar" | "product" | "binary" | "uniform" | "none"
+        /// (proto `quantization_level::QuantizationType` names, lowercase).
+        pub quantization_type: ::std::string::String,
+    }
+    impl QuantizationLevelInput {
+        pub fn builder() -> builder::QuantizationLevelInput {
             Default::default()
         }
     }
@@ -31539,6 +31632,7 @@ pub mod types {
         }
         #[derive(Clone, Debug)]
         pub struct ProximaRecordInput {
+            expires_at_ms: ::std::result::Result<::std::option::Option<i64>, ::std::string::String>,
             id: ::std::result::Result<
                 ::std::option::Option<::std::string::String>,
                 ::std::string::String,
@@ -31558,6 +31652,7 @@ pub mod types {
         impl ::std::default::Default for ProximaRecordInput {
             fn default() -> Self {
                 Self {
+                    expires_at_ms: Ok(Default::default()),
                     id: Ok(Default::default()),
                     props: Ok(Default::default()),
                     text_fields: Ok(Default::default()),
@@ -31566,6 +31661,16 @@ pub mod types {
             }
         }
         impl ProximaRecordInput {
+            pub fn expires_at_ms<T>(mut self, value: T) -> Self
+            where
+                T: ::std::convert::TryInto<::std::option::Option<i64>>,
+                T::Error: ::std::fmt::Display,
+            {
+                self.expires_at_ms = value
+                    .try_into()
+                    .map_err(|e| format!("error converting supplied value for expires_at_ms: {e}"));
+                self
+            }
             pub fn id<T>(mut self, value: T) -> Self
             where
                 T: ::std::convert::TryInto<::std::option::Option<::std::string::String>>,
@@ -31619,6 +31724,7 @@ pub mod types {
                 value: ProximaRecordInput,
             ) -> ::std::result::Result<Self, super::error::ConversionError> {
                 Ok(Self {
+                    expires_at_ms: value.expires_at_ms?,
                     id: value.id?,
                     props: value.props?,
                     text_fields: value.text_fields?,
@@ -31629,6 +31735,7 @@ pub mod types {
         impl ::std::convert::From<super::ProximaRecordInput> for ProximaRecordInput {
             fn from(value: super::ProximaRecordInput) -> Self {
                 Self {
+                    expires_at_ms: Ok(value.expires_at_ms),
                     id: Ok(value.id),
                     props: Ok(value.props),
                     text_fields: Ok(value.text_fields),
@@ -31638,6 +31745,10 @@ pub mod types {
         }
         #[derive(Clone, Debug)]
         pub struct QuantizationConfigInput {
+            custom_levels: ::std::result::Result<
+                ::std::option::Option<::std::vec::Vec<super::QuantizationLevelInput>>,
+                ::std::string::String,
+            >,
             enabled: ::std::result::Result<::std::option::Option<bool>, ::std::string::String>,
             strategy: ::std::result::Result<
                 ::std::option::Option<::std::string::String>,
@@ -31647,12 +31758,25 @@ pub mod types {
         impl ::std::default::Default for QuantizationConfigInput {
             fn default() -> Self {
                 Self {
+                    custom_levels: Ok(Default::default()),
                     enabled: Ok(Default::default()),
                     strategy: Ok(Default::default()),
                 }
             }
         }
         impl QuantizationConfigInput {
+            pub fn custom_levels<T>(mut self, value: T) -> Self
+            where
+                T: ::std::convert::TryInto<
+                        ::std::option::Option<::std::vec::Vec<super::QuantizationLevelInput>>,
+                    >,
+                T::Error: ::std::fmt::Display,
+            {
+                self.custom_levels = value
+                    .try_into()
+                    .map_err(|e| format!("error converting supplied value for custom_levels: {e}"));
+                self
+            }
             pub fn enabled<T>(mut self, value: T) -> Self
             where
                 T: ::std::convert::TryInto<::std::option::Option<bool>>,
@@ -31680,6 +31804,7 @@ pub mod types {
                 value: QuantizationConfigInput,
             ) -> ::std::result::Result<Self, super::error::ConversionError> {
                 Ok(Self {
+                    custom_levels: value.custom_levels?,
                     enabled: value.enabled?,
                     strategy: value.strategy?,
                 })
@@ -31688,6 +31813,7 @@ pub mod types {
         impl ::std::convert::From<super::QuantizationConfigInput> for QuantizationConfigInput {
             fn from(value: super::QuantizationConfigInput) -> Self {
                 Self {
+                    custom_levels: Ok(value.custom_levels),
                     enabled: Ok(value.enabled),
                     strategy: Ok(value.strategy),
                 }
@@ -31744,6 +31870,75 @@ pub mod types {
                 Self {
                     enabled: Ok(value.enabled),
                     strategy: Ok(value.strategy),
+                }
+            }
+        }
+        #[derive(Clone, Debug)]
+        pub struct QuantizationLevelInput {
+            bits: ::std::result::Result<::std::option::Option<i32>, ::std::string::String>,
+            num_subvectors:
+                ::std::result::Result<::std::option::Option<i32>, ::std::string::String>,
+            quantization_type: ::std::result::Result<::std::string::String, ::std::string::String>,
+        }
+        impl ::std::default::Default for QuantizationLevelInput {
+            fn default() -> Self {
+                Self {
+                    bits: Ok(Default::default()),
+                    num_subvectors: Ok(Default::default()),
+                    quantization_type: Err("no value supplied for quantization_type".to_string()),
+                }
+            }
+        }
+        impl QuantizationLevelInput {
+            pub fn bits<T>(mut self, value: T) -> Self
+            where
+                T: ::std::convert::TryInto<::std::option::Option<i32>>,
+                T::Error: ::std::fmt::Display,
+            {
+                self.bits = value
+                    .try_into()
+                    .map_err(|e| format!("error converting supplied value for bits: {e}"));
+                self
+            }
+            pub fn num_subvectors<T>(mut self, value: T) -> Self
+            where
+                T: ::std::convert::TryInto<::std::option::Option<i32>>,
+                T::Error: ::std::fmt::Display,
+            {
+                self.num_subvectors = value.try_into().map_err(|e| {
+                    format!("error converting supplied value for num_subvectors: {e}")
+                });
+                self
+            }
+            pub fn quantization_type<T>(mut self, value: T) -> Self
+            where
+                T: ::std::convert::TryInto<::std::string::String>,
+                T::Error: ::std::fmt::Display,
+            {
+                self.quantization_type = value.try_into().map_err(|e| {
+                    format!("error converting supplied value for quantization_type: {e}")
+                });
+                self
+            }
+        }
+        impl ::std::convert::TryFrom<QuantizationLevelInput> for super::QuantizationLevelInput {
+            type Error = super::error::ConversionError;
+            fn try_from(
+                value: QuantizationLevelInput,
+            ) -> ::std::result::Result<Self, super::error::ConversionError> {
+                Ok(Self {
+                    bits: value.bits?,
+                    num_subvectors: value.num_subvectors?,
+                    quantization_type: value.quantization_type?,
+                })
+            }
+        }
+        impl ::std::convert::From<super::QuantizationLevelInput> for QuantizationLevelInput {
+            fn from(value: super::QuantizationLevelInput) -> Self {
+                Self {
+                    bits: Ok(value.bits),
+                    num_subvectors: Ok(value.num_subvectors),
+                    quantization_type: Ok(value.quantization_type),
                 }
             }
         }
@@ -38283,7 +38478,7 @@ pub mod types {
 ///
 /// SDK-facing ProximaDB REST contract. This specification is v2-first and centers on ProximaRecord, typed schemas, record search, and collection lifecycle operations. Legacy v1 compatibility routes are intentionally not part of this publishable SDK surface.
 ///
-/// Version: 0.6.0
+/// Version: 0.6.1
 pub struct Client {
     pub(crate) baseurl: String,
     pub(crate) client: reqwest::Client,
@@ -38321,7 +38516,7 @@ impl Client {
 }
 impl ClientInfo<()> for Client {
     fn api_version() -> &'static str {
-        "0.6.0"
+        "0.6.1"
     }
     fn baseurl(&self) -> &str {
         self.baseurl.as_str()
