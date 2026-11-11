@@ -153,16 +153,16 @@ pub fn scoped_graph_id(tenant: &str, graph_id: &str) -> anyhow::Result<String> {
     // A `/` in the graph id would address another tenant's `{tenant}/{graph_id}` key.
     proximadb_tenant::validate_scoped_resource_name(graph_id)
         .map_err(|e| anyhow::anyhow!("invalid graph id: {e}"))?;
-    // The default tenant stays UNSCOPED (bare `graph_id`). Graph node/edge ops resolve the
-    // backing engine through `get_or_create_graph_engine`, which requires the collection to
-    // already exist in `collection_service` — and graph collection CREATION is not yet
-    // tenant-scoped (created bare via the REST/pgwire/internal create paths). Prefixing the
-    // default tenant would key reads at `default/{graph_id}` while creation stays bare, so every
-    // default-tenant create→use would fail "collection does not exist". Named tenants DO scope
-    // (`{tenant}/{graph_id}`) as the structural foundation — but that path is only end-to-end
-    // functional once collection creation is scoped in lockstep (TD-GRAPH-TENANT-1, the same
-    // collection-lifecycle work that gates the document/entity slices). Until then a named-tenant
-    // graph must be provisioned under the scoped key explicitly (as the isolation tests do).
+    // The default tenant stays UNSCOPED (bare `graph_id`). Named tenants scope to
+    // `{tenant}/{graph_id}` and are end-to-end functional since TD-GRAPH-TENANT-1:
+    // the first creating write auto-provisions the scoped collection (exactly 9
+    // provisioning call sites, all writes), reads/mutations-of-existing use the
+    // never-provisioning lookup (TD-LANECOV-1 — a read of a never-created graph is
+    // NOT_FOUND, not a silent empty graph). The default tenant keeps the bare key
+    // for the same lifecycle reason as before: prefixing it would key
+    // default-tenant graphs at `default/{graph_id}` while the bare REST/pgwire/
+    // internal create paths still create bare, so every default-tenant
+    // create→use would fail "collection does not exist".
     if tenant == proximadb_tenant::DEFAULT_TENANT {
         return Ok(graph_id.to_string());
     }
