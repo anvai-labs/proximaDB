@@ -1,0 +1,47 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-RAPTOR-TTL-1: the RAPTOR segment format drops the record TTL, so expired records are returned after flush
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open (filed 2026-11-11).** Found by the engine TTL conformance matrix (`tests/engine_ttl_conformance_test.rs`, case `raptor_flushed_hides_expired`, kept `#[ignore]` with a pointer here).
+| Invariant | CLAUDE.md directive 16a: every read boundary filters dead records (`valid_to_ns == Some(0)` or `0 < valid_to_ns < now`).
+| Exposure | RAPTOR is behind `experimental-engines` (not in the default build).
+| Owner | RAPTOR engine.
+|===
+
+== The hazard
+
+A record inserted with a TTL is hidden by search while it is unflushed: the WAL
+delta carries `valid_to_ns` and `reconcile_against_wal_state`
+(`src/core/search/merge.rs`) drops it once expired. After flush it is returned
+again, indefinitely, because RAPTOR's segment format has no expiry column at all.
+`proximadb_raptor_common::ColumnType` is `VectorsFp32 | VectorsQuantized | Ids |
+Metadata | SourceContent | P2Matrix | PxKMatrix | BloomFilter`, and the disk scan in
+`src/storage/engines/raptor/engine.rs` reads only `VectorsFp32` and `Ids`. Nothing
+downstream can recover a TTL that was never written.
+
+The other engines fixed in the same PR could be fixed in the reader, because
+their formats already stored the TTL (HELIX blocks carry `ProximaRecord`, the NOVA
+Parquet files carry `expires_at` in ms, SWIFT blocks carry `ProximaRecord`).
+RAPTOR cannot be.
+
+== Why it is not fixed in place
+
+Adding the column is a storage-format change, so CLAUDE.md #8 applies. It must be
+mixed-read-safe: old segments without the column read as "no TTL", and the column
+is detected rather than assumed. It also ships behind a version marker, with a
+round-trip test. That is a RAPTOR format PR, not a reader patch.
+
+== Fix shape
+
+. Writer: persist `valid_to_ns` per row (an `i64` column, null = no TTL), plus a
+  format version bump or a column-presence marker.
+. Reader: load the column alongside `Ids` in every scan path (the disk scan, plus
+  the hit builders around `engine.rs` ~1447 and ~2011), skip `is_record_dead(…)`
+  rows before scoring, and set `OptimizedSearchRecord.valid_to_ns` on each hit so
+  the query cache's earliest-expiry also sees it (TD-QCACHE-TTL-1).
+. The RAPTOR AXIS branch (`engine.rs` ~2835) must carry `scored.valid_to_ns()` too.
+. Remove the `#[ignore]` on `raptor_flushed_hides_expired`; that test is the
+  acceptance gate.

@@ -224,7 +224,11 @@ fn run_ttl_conformance(engine: &str, path: PathKind) {
         path.label(),
         before.iter().map(|r| r.id.as_str()).collect::<Vec<_>>()
     );
-    let valid_to_populated = matches!(pre_valid_to, Some(Some(v)) if v == valid_to_ns);
+    // Flushed formats store the TTL at millisecond precision (Parquet
+    // `expires_at`, ms), so compare at ms: the hit carries the record's TTL,
+    // truncated to the storage unit.
+    let valid_to_populated =
+        matches!(pre_valid_to, Some(Some(v)) if v / 1_000_000 == valid_to_ns / 1_000_000);
 
     // ---- After expiry: victim must be hidden. ----
     let wait_ns = (valid_to_ns - now_ns()).max(0) as u64 + 750_000_000;
@@ -302,21 +306,9 @@ macro_rules! ttl_case {
 ttl_case!(sst_unflushed_hides_expired, "sst", PathKind::Unflushed);
 ttl_case!(sst_flushed_hides_expired, "sst", PathKind::Flushed);
 ttl_case!(helix_unflushed_hides_expired, "helix", PathKind::Unflushed);
-ttl_case!(
-    helix_flushed_hides_expired,
-    "helix",
-    PathKind::Flushed,
-    known = "TTL LEAK: HELIX segment search (readers::search_sstable -> proxima::search_helix_sstable) \
-             drops valid_to_ns and never checks expiry"
-);
+ttl_case!(helix_flushed_hides_expired, "helix", PathKind::Flushed);
 ttl_case!(nova_unflushed_hides_expired, "nova", PathKind::Unflushed);
-ttl_case!(
-    nova_flushed_hides_expired,
-    "nova",
-    PathKind::Flushed,
-    known = "TTL LEAK: NOVA search_standard reads via UnifiedParquetReader, which skips the \
-             expires_at column, so valid_to_ns is lost and nothing filters expiry"
-);
+ttl_case!(nova_flushed_hides_expired, "nova", PathKind::Flushed);
 ttl_case!(viper_unflushed_hides_expired, "viper", PathKind::Unflushed);
 ttl_case!(viper_flushed_hides_expired, "viper", PathKind::Flushed);
 ttl_case!(tst_unflushed_hides_expired, "tst", PathKind::Unflushed);
@@ -324,8 +316,7 @@ ttl_case!(
     tst_flushed_hides_expired,
     "tst",
     PathKind::Flushed,
-    known = "BLOCKED: TST do_flush ignores FlushParameters.vector_records and returns \
-             FlushResult::default() (success=false), so the WAL flush never materializes"
+    known = "BLOCKED by TD-TST-FLUSH-1: TST do_flush ignores the flush batch and reports failure, so nothing is flushed"
 );
 ttl_case!(
     swift_unflushed_hides_expired,
@@ -337,8 +328,7 @@ ttl_case!(
     swift_flushed_hides_expired,
     "swift",
     PathKind::Flushed,
-    cfg = feature = "experimental-engines",
-    known = "TTL LEAK: SWIFT segment search builds hits without valid_to_ns (engine.rs / optimized_operations.rs) and does not filter expiry"
+    cfg = feature = "experimental-engines"
 );
 ttl_case!(
     raptor_unflushed_hides_expired,
@@ -351,5 +341,5 @@ ttl_case!(
     "raptor",
     PathKind::Flushed,
     cfg = feature = "experimental-engines",
-    known = "TTL LEAK: RAPTOR segment search builds hits without valid_to_ns (engine.rs / proximadb-raptor-engine lib.rs) and does not filter expiry"
+    known = "TTL LEAK, TD-RAPTOR-TTL-1: the RAPTOR segment format has no TTL column, so the expiry is lost at flush (format change needed)"
 );

@@ -244,6 +244,16 @@ impl ParquetReader {
             .downcast_ref::<arrow::array::Int64Array>()
             .ok_or_else(|| anyhow::anyhow!("Timestamp column is not i64 type"))?;
 
+        // The record's TTL: the flush writer stores `valid_to_ns / 1_000_000`
+        // (milliseconds) here. This reader listed it as a "standard column" and
+        // never read it, so every record read back from a flushed segment looked
+        // immortal and NOVA search returned TTL-expired records after flush
+        // (CLAUDE.md 16a; engine TTL conformance). Optional: older files may
+        // lack the column (= no TTL).
+        let expires_at_array = batch
+            .column_by_name(FIELD_EXPIRES_AT)
+            .and_then(|c| c.as_any().downcast_ref::<arrow::array::Int64Array>());
+
         // Extract vector column - handle both List and FixedSizeList for compatibility
         let vector_column = batch
             .column_by_name(FIELD_VECTOR_FP32)
@@ -480,6 +490,10 @@ impl ParquetReader {
                 oid: id_array.value(row).to_string(),
                 created_at_ns: timestamp_array.value(row) * 1_000_000,
                 props: metadata,
+                // ms -> ns. A tombstone (0) stays 0; null means no TTL.
+                valid_to_ns: expires_at_array
+                    .filter(|arr| arrow::array::Array::is_valid(*arr, row))
+                    .map(|arr| arr.value(row).saturating_mul(1_000_000)),
                 ..Default::default()
             };
             if !values.is_empty() {

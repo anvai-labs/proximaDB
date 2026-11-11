@@ -831,8 +831,12 @@ pub async fn search_helix_sstable(
         String,
         f32,
         std::collections::HashMap<String, crate::proto::proximadb_v1::SqlValue>,
+        // The record's TTL (`valid_to_ns`), so the hit can carry it.
+        Option<i64>,
     )>,
 > {
+    // One clock reading per search: dead records are skipped before scoring.
+    let now_ns = proximadb_kernel::time::now_unix_ns();
     // CLOUD-OPTIMIZED: Read unified file header in 2 API calls (metadata + header)
     // UnifiedCachingFilesystem will cache this, so subsequent queries = 0 API calls!
     let header = read_helix_header_optimized(filesystem, path).await?;
@@ -930,6 +934,13 @@ pub async fn search_helix_sstable(
 
         // Search within block
         for record in &block.records {
+            // Dead records (tombstoned or TTL-expired) never reach a read
+            // (CLAUDE.md 16a). Skipped BEFORE scoring so they cannot take a
+            // top-k slot: this path previously returned expired records
+            // after flush (engine TTL conformance).
+            if record.is_dead(now_ns) {
+                continue;
+            }
             let wire_record = crate::proto::proximadb_v1::VectorRecord::from(record);
             // Apply type-safe filter if present
             if let Some(filter_expr) = filter_expression {
@@ -946,7 +957,12 @@ pub async fn search_helix_sstable(
             let distance = distance_compute.distance(query_vector, &wire_record.vector);
 
             // Return SqlValue metadata (type-safe)
-            results.push((wire_record.id, distance, wire_record.metadata));
+            results.push((
+                wire_record.id,
+                distance,
+                wire_record.metadata,
+                record.valid_to_ns,
+            ));
         }
     }
 

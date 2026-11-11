@@ -719,6 +719,11 @@ async fn phase4_full_precision(
         }
     }
 
+    // Dead records (tombstoned or TTL-expired) never reach a read and must
+    // not take a top-k slot (CLAUDE.md 16a; engine TTL conformance).
+    let now_ns = proximadb_kernel::time::now_unix_ns();
+    all_results.retain(|(record, _)| !record.is_dead(now_ns));
+
     // Apply final metadata filter if needed
     if let Some(f) = filter {
         all_results.retain(|(record, _)| record_matches_filter(record, &f));
@@ -739,6 +744,7 @@ async fn phase4_full_precision(
             metadata: crate::core::search::sql_value_filter::proxima_tree_to_value_map(
                 &record.props,
             ),
+            valid_to_ns: record.valid_to_ns,
             ..Default::default()
         };
 
