@@ -32,7 +32,6 @@ use proximadb_kernel::error::ProximaDBError;
 use std::sync::Arc;
 
 impl super::GraphOperationsService {
-    /// Get or create a graph engine for the specified graph ID
     /// Engine for a CREATING write (create/batch-create, transactions, adding
     /// a schema constraint): provisions the graph collection on first use.
     ///
@@ -61,9 +60,9 @@ impl super::GraphOperationsService {
     }
 
     /// Engine for a READ or a mutation of existing data. Never provisions:
-    /// a graph that was never created is an error ("Graph collection '...'
-    /// not found", surfaced as NOT_FOUND), not an empty graph created as a
-    /// side effect of the lookup.
+    /// a graph that was never created is `ProximaDBError::NotFound`
+    /// (`is_not_found()`; NOT_FOUND on the wire), not an empty graph created
+    /// as a side effect of the lookup.
     pub async fn get_existing_graph_engine(
         &self,
         graph_id: &str,
@@ -72,12 +71,13 @@ impl super::GraphOperationsService {
             return Ok(Arc::clone(&engine));
         }
         let Some(collection) = self.collection_service.get_graph(graph_id).await? else {
-            // Same wording as `update_graph_schema` (service.rs): the message-based
-            // gRPC / entity mappers check "not found" before "invalid", so this
-            // surfaces as NOT_FOUND on the wire.
-            return Err(ProximaDBError::InvalidInput(format!(
-                "Graph collection '{graph_id}' not found"
-            )));
+            // Typed: callers match `is_not_found()`; the display ("Resource not
+            // found: graph collection '...'") also satisfies the message-based
+            // gRPC / entity mappers, which check "not found" first.
+            return Err(ProximaDBError::NotFound {
+                resource_type: "graph collection".to_string(),
+                id: graph_id.to_string(),
+            });
         };
         self.open_graph_engine(graph_id, &collection).await
     }

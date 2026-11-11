@@ -33,7 +33,7 @@ deliberate change; **investigate** = deterministic failure, cause not yet proven
 
 | `discovery_drift_watcher_e2e`
 | Drift watcher did not auto-trigger a second recluster in 40 s
-| investigate
+| **fixed** (real + stale)
 | The test sets `PROXIMADB_DRIFT_THRESHOLD_WRITES=1` and `PROXIMADB_DRIFT_INTERVAL_SECS=1` itself (lines 100-101), so defaults (60 s / 10,000) are not the cause. Check whether the knobs are read into a static before `set_var`, or whether the watcher stopped re-arming.
 
 | `documents_convergence_e2e`
@@ -43,7 +43,7 @@ deliberate change; **investigate** = deterministic failure, cause not yet proven
 
 | `route_cost_offline_eval`
 | Controller should cut >= 75% of the static heuristic's regret; got ctrl=198,900 vs static=200,000
-| investigate
+| **fixed** (stale; the eval measured nothing)
 | An offline eval of the cost router (directive 13): the gated controller now barely beats the static heuristic. Either the router regressed or the eval's fixture drifted.
 
 | `grpc_methods_test`
@@ -87,6 +87,9 @@ deliberate change; **investigate** = deterministic failure, cause not yet proven
 ** `tdd_infrastructure_test`: the developer-local hook assertion is removed; the repo-tracked checks remain.
 ** `queue_adapter_upgrade_integration_test`: regression from #2386 (`55141f6b3`), which made `LocalFileSystem::list` always return absolute `file:///...` entries; `FactoryQueueFs::relative_from_listed_url` still compared them with the relative root, so every LIST under a relative root failed. Fixed at that boundary only: a relative root is resolved against the working directory for the comparison (lexical, like the backend), confinement and `..` rejection unchanged, caller-facing paths still in caller coordinates. The doubled path in the dotted case is the documented existing mapping, not a bug. New unit test covers in-root, `./` callers, and out-of-root/traversal rejections.
 ** `grpc_methods_test`: a READ of a never-created graph went through `get_or_create_graph_engine`, so looking up a node in a mistyped graph silently **created and registered** that graph, then answered "no such node". Decided contract: reads and mutations of existing data (27 call sites) use a new non-provisioning `get_existing_graph_engine` and fail with "Graph collection '...' not found" (NOT_FOUND on the wire, same wording as `update_graph_schema`); only creating writes (create/batch-create, transactions, adding a constraint: 9 sites) still provision, preserving the TD-GRAPH-TENANT-1 first-write flow. A missing node in an existing graph stays `Ok(None)`. Visible change: reading a named tenant's graph before its first write is NOT_FOUND, not empty.
+
+** `discovery_drift_watcher_e2e` (**real product bug** + stale test): since `076592ba1` (2026-10-17) the tenant-scoped `list_collections(None)` returns empty without a tenant, and `DriftWatcher::tick` (a background system caller) was never moved to the `list_collections_internal()` added for that case. Its name-to-id map therefore held only name-as-id, while the WAL manifest is keyed by internal object id, so `writes_since` was always 0: **the drift watcher never fired, for any collection, in any deployment**. Fixed in `drift.rs` (`sweep_targets()` uses the internal listing; listing errors logged, not dropped). Separately the test was stale: since #1384 the watcher is spawned only with the AXIS runtime on (`enable_axis_indexes`, default off per ADR-070); the test now enables it. Unit tests: name-to-internal-id pairing with a tenant-scoping mock (fails if the old call is restored) and re-arm after a completed recluster (with a coalescing negative control).
+** `route_cost_offline_eval` (stale, high impact): the offline gate for flipping `PROXIMADB_ROUTE_COST_OVERRIDE` fed its simulated cost through `range_gets`, but since #1709 (`5d772a895`) the model scores the physical `get_ops`. Both arms scored 0 GETs, so the controller could never see an advantage and the eval measured nothing. The router itself is unaffected (real traces fill `get_ops`); the fixture now sets it.
 
 == Exit criteria
 

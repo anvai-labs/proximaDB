@@ -133,30 +133,11 @@ impl DriftWatcher {
     /// and (b) every collection in the catalog (so a never-reclustered
     /// collection is picked up automatically). Each is considered by **name**
     /// (the discovery pipeline keys jobs/pins by name) but its write volume is
-    /// read by **internal id** (the WAL manifest keys entries by uuid) — hence
+    /// read by **internal id** (the WAL manifest keys entries by object id) — hence
     /// the (name, id) pairing. Returns the number of signals emitted (coalesced
     /// considerations don't count).
     pub async fn tick(&self) -> usize {
-        // name -> internal id. The id is used solely for the per-collection
-        // write-volume lookup; the catalog list is the authoritative source of
-        // the name->id mapping (proto `Collection` carries both).
-        let mut by_name: std::collections::HashMap<String, String> =
-            std::collections::HashMap::new();
-        if let Some(source) = &self.collection_source
-            && let Ok(cols) = source.list_collections(None).await
-        {
-            for c in cols {
-                if let Some(name) = c.config.as_ref().map(|cfg| cfg.name.clone()) {
-                    by_name.entry(name).or_insert(c.id);
-                }
-            }
-        }
-        // History-only collections may not be in the catalog list; fall back to
-        // name-as-id (the manifest lookup then returns 0 — no spurious signal).
-        for c in self.service.registry().collections() {
-            by_name.entry(c.clone()).or_insert_with(|| c.clone());
-        }
-
+        let by_name = self.sweep_targets().await;
         let mut emitted = 0;
         for (name, internal_id) in by_name {
             if self.consider(&name, &internal_id).await.is_some() {
@@ -167,6 +148,40 @@ impl DriftWatcher {
             debug!("DriftWatcher: emitted {emitted} recluster signal(s)");
         }
         emitted
+    }
+
+    /// The `name -> internal id` pairs one sweep considers. The id is used
+    /// solely for the per-collection write-volume lookup; the catalog list is
+    /// the authoritative source of the name->id mapping (proto `Collection`
+    /// carries both).
+    ///
+    /// The watcher is a background *system* caller sweeping every tenant's
+    /// collections, so it must use the explicit internal listing. The
+    /// request-scoped `list_collections(None)` is tenant-denied (no tenant =>
+    /// empty listing, since 076592ba1); calling it here left only the
+    /// history-only fallback below (name-as-id), whose manifest lookup is
+    /// always 0 — so the watcher never signalled.
+    async fn sweep_targets(&self) -> std::collections::HashMap<String, String> {
+        let mut by_name: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        if let Some(source) = &self.collection_source {
+            match source.list_collections_internal().await {
+                Ok(cols) => {
+                    for c in cols {
+                        if let Some(name) = c.config.as_ref().map(|cfg| cfg.name.clone()) {
+                            by_name.entry(name).or_insert(c.id);
+                        }
+                    }
+                }
+                Err(err) => debug!("DriftWatcher: collection listing failed: {err:#}"),
+            }
+        }
+        // History-only collections may not be in the catalog list; fall back to
+        // name-as-id (the manifest lookup then returns 0 — no spurious signal).
+        for c in self.service.registry().collections() {
+            by_name.entry(c.clone()).or_insert_with(|| c.clone());
+        }
+        by_name
     }
 
     /// Consider one collection: sum the records written to *this* collection
@@ -313,5 +328,134 @@ mod tests {
             w.consider_with_writes("c1", 60).is_none(),
             "still drifted but a recluster is in flight -> coalesced"
         );
+    }
+
+    /// The re-arm half of the loop the e2e (`discovery_drift_watcher_e2e`)
+    /// pins: once the in-flight recluster completes (baseline advances), new
+    /// drift must enqueue a SECOND recluster — and the completed job's
+    /// `collection_write_lsn` must become the baseline the next sweep reads.
+    /// Negative control: while it is still Running, the same drift coalesces.
+    #[tokio::test]
+    async fn drift_rearms_after_recluster_completes() {
+        let (w, r) = watcher().await;
+        let mut first = w
+            .consider_with_writes("c1", 50)
+            .expect("first drift enqueues");
+        assert_eq!(w.service.last_reclustered_lsn("c1"), None);
+
+        first.status = super::super::job::DiscoveryJobStatus::Running;
+        r.upsert(first.clone());
+        assert!(
+            w.consider_with_writes("c1", 50).is_none(),
+            "Running recluster -> coalesced (negative control)"
+        );
+
+        first.status = super::super::job::DiscoveryJobStatus::Complete;
+        first.collection_write_lsn = 42;
+        r.upsert(first);
+        assert_eq!(
+            w.service.last_reclustered_lsn("c1"),
+            Some(42),
+            "completed recluster's HWM becomes the drift baseline"
+        );
+        assert!(
+            w.consider_with_writes("c1", 0).is_none(),
+            "no writes past the new baseline -> no signal"
+        );
+        assert!(
+            w.consider_with_writes("c1", 10).is_some(),
+            "threshold-many writes past the baseline after completion -> a second recluster"
+        );
+    }
+
+    /// A port that scopes like `CollectionService`: the request listing denies
+    /// a missing tenant (empty), only the internal listing sees everything.
+    struct TenantScopedPort;
+
+    #[async_trait::async_trait]
+    impl proximadb_runtime::CollectionPort for TenantScopedPort {
+        async fn get_collection(
+            &self,
+            _identifier: &str,
+            _tenant_id: Option<&str>,
+        ) -> anyhow::Result<Option<proximadb_proto::v1::Collection>> {
+            Ok(None)
+        }
+        async fn create_collection(
+            &self,
+            _config: proximadb_proto::v1::CollectionConfig,
+            _tenant_id: Option<&str>,
+        ) -> anyhow::Result<proximadb_proto::v1::Collection> {
+            anyhow::bail!("unused")
+        }
+        async fn update_collection(
+            &self,
+            _id: &str,
+            _config: proximadb_proto::v1::CollectionConfig,
+            _tenant_id: Option<&str>,
+        ) -> anyhow::Result<proximadb_proto::v1::Collection> {
+            anyhow::bail!("unused")
+        }
+        async fn delete_collection(
+            &self,
+            _id: &str,
+            _tenant_id: Option<&str>,
+        ) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+        async fn list_collections(
+            &self,
+            tenant_id: Option<&str>,
+        ) -> anyhow::Result<Vec<proximadb_proto::v1::Collection>> {
+            // No tenant => denied (empty), as in CollectionService.
+            match tenant_id {
+                None => Ok(Vec::new()),
+                Some(_) => self.list_collections_internal().await,
+            }
+        }
+        async fn list_collections_internal(
+            &self,
+        ) -> anyhow::Result<Vec<proximadb_proto::v1::Collection>> {
+            Ok(vec![proximadb_proto::v1::Collection {
+                id: "7".to_string(),
+                config: Some(proximadb_proto::v1::CollectionConfig {
+                    name: "orders".to_string(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }])
+        }
+        async fn resolve_collection_id(&self, identifier: &str) -> anyhow::Result<Option<String>> {
+            Ok(Some(identifier.to_string()))
+        }
+    }
+
+    /// The watcher is a system caller: it must pair each catalog collection's
+    /// name with its internal id via the INTERNAL listing. Regression for the
+    /// tenant-denied `list_collections(None)` call, which yielded no catalog
+    /// collections, so the manifest was looked up by name and drift was
+    /// always 0 (the `discovery_drift_watcher_e2e` failure).
+    #[tokio::test]
+    async fn sweep_targets_pair_catalog_names_with_internal_ids() {
+        let coordinator = Arc::new(SnapshotPublishCoordinator::new(Arc::new(
+            CatalogManager::new(),
+        )));
+        let service = Arc::new(DiscoveryService::new(
+            Arc::new(DiscoveryRegistry::new()),
+            coordinator.clone(),
+        ));
+        let w = DriftWatcher::new(service, coordinator, 10)
+            .with_collection_source(Arc::new(TenantScopedPort));
+        let targets = w.sweep_targets().await;
+        assert_eq!(
+            targets.get("orders").map(String::as_str),
+            Some("7"),
+            "catalog name must map to the internal id the WAL manifest keys by"
+        );
+
+        // Negative control: without a collection source, only history-only
+        // collections (name-as-id) are swept — `orders` is absent.
+        let (bare, _r) = watcher().await;
+        assert!(bare.sweep_targets().await.is_empty());
     }
 }
