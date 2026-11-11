@@ -151,6 +151,7 @@ nav:
       - Overview: 04-operations/index.md
       - "Release procedure (one tag, every registry)": 04-operations/release/release-procedure.md
   - Release Notes:
+      - v0.7.0: release-notes/v0.7.0.md
       - v0.6.0: release-notes/v0.6.0.md
 
 extra_css:
