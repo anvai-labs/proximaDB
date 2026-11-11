@@ -4479,10 +4479,16 @@ impl VectorOperationsService {
                                 .results
                                 .into_iter()
                                 .map(|r| {
-                                    crate::core::search::results::OptimizedSearchRecord::new(
-                                        r.vector_id,
-                                        r.similarity,
-                                    )
+                                    // Carry the TTL (TD-QCACHE-TTL-1): `new`
+                                    // leaves valid_to_ns None ("never expires").
+                                    let valid_to_ns = r.valid_to_ns();
+                                    let mut rec =
+                                        crate::core::search::results::OptimizedSearchRecord::new(
+                                            r.vector_id,
+                                            r.similarity,
+                                        );
+                                    rec.valid_to_ns = valid_to_ns;
+                                    rec
                                 })
                                 .collect();
                         debug!("Stage 2 complete: {} AXIS HNSW results", records.len());
