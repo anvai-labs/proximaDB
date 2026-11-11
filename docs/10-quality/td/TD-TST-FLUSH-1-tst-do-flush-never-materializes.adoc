@@ -1,0 +1,38 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-TST-FLUSH-1: TST `do_flush` ignores the flush batch and reports failure, so the WAL never materializes
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open (filed 2026-11-11).** Found by the engine TTL conformance matrix (`tests/engine_ttl_conformance_test.rs`, case `tst_flushed_hides_expired`, kept `#[ignore]` with a pointer here).
+| Invariant | CLAUDE.md #18a: every modality flushes through the shared `ModalityMaterializer::do_flush` seam.
+| Owner | TST (time-series) engine. Related: TD-WAL-2 (the TST isolated WAL being retired).
+|===
+
+== The defect
+
+Both `StorageWriter::do_flush` impls in `src/storage/engines/tst/mod.rs` (~1185 and
+~1391) ignore `FlushParameters` and start from `FlushResult::default()`. The batch
+the flush driver hands over (`FlushParameters.vector_records`) is never written.
+The first impl only reports the size of the engine's own in-memory
+`active_partition`, and the result's success flag stays at its default (`false`).
+
+Consequences:
+
+* Records written through the unified WAL into a TST collection are never
+  materialized by the shared flush driver, so they live only in the WAL delta.
+* The flush driver sees a failed flush on every attempt. Whether that retries,
+  backs off or wedges depends on the driver's failure policy, so the effect on WAL
+  growth and backpressure needs measuring.
+* No flushed-path behaviour of TST (TTL, tombstones, recovery) can be tested,
+  because there is no flushed path. The TTL conformance case is BLOCKED, not
+  failing.
+
+== Fix shape
+
+Implement `do_flush` over `FlushParameters.vector_records` into the TST
+time-partitioned segment format (the legitimately modality-specific part per #18a).
+Return an honest `FlushResult` (`success`, `entries_flushed`, `bytes_written`). Then
+un-ignore `tst_flushed_hides_expired`, which also gates that the flushed reader
+applies the dead-record predicate.

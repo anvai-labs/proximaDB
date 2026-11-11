@@ -1,0 +1,47 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-ENGINE-MVCC-1: flushed vector search does not resolve the newest version per id before the dead filter (HELIX/NOVA/SWIFT)
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open (filed 2026-11-11).** Found by the #2518 adversarial review. Reproduced on develop and on #2518.
+| Invariant | CLAUDE.md 16a/16d, and `resolve_freshest` in `src/core/search/merge.rs`: pick the newest copy of an id FIRST, then drop it if dead (PR #2063).
+| Owner | HELIX / NOVA / SWIFT engines. Related: TD-MVCCRES-1, TD-MEMTABLE-MVCC-1.
+|===
+
+== The defect
+
+The flushed segment search paths in HELIX (`helix/proxima.rs::search_helix_sstable`),
+NOVA (`nova/operations/search.rs::score_records_into_queue`) and SWIFT score each row
+independently into a top-k queue (`BoundedPriorityQueue` does no per-id dedup), and
+since #2518 skip dead rows before scoring. No step resolves the newest version per id
+across segments. So an older live copy can win over a newer dead one:
+
+* **Overwrite, then expire:** insert v1 (no TTL), flush; upsert v2 with a 3 s TTL,
+  flush; wait. HELIX and NOVA return the victim (v1, `valid_to_ns = None`). SST hides
+  it. Before #2518 they returned the expired v2 instead, so the visible outcome (the
+  record is still returned) is unchanged.
+* **NOVA flushed delete:** insert, flush, delete, flush, search. NOVA returns the
+  deleted record (v1). HELIX and SST hide it.
+* **HELIX get-by-id** (`helix/readers.rs::find_vector_by_id`, caller `helix/mod.rs`
+  ~2051): returns `None` for a dead match and moves on to the next SSTable in listing
+  order, not newest-first. So the same shape shows up on point reads.
+
+Contributing: NOVA hit `version` is always `0`, because the reader downcasts the
+`version` column to `Int64Array` but NOVA writes it as `UInt32`
+(`columnar_query_reader.rs` ~1873). Version-based resolution cannot work for NOVA
+until that is read correctly.
+
+== Fix shape
+
+. Resolve the newest version per id inside each engine's flushed search (version,
+  then the canonical tiebreak), THEN apply `is_record_dead`. Over-fetch, or resolve
+  before the top-k queue, so that dropping a resolved-dead id does not shrink the
+  result below k.
+. Fix the NOVA `version` column read (UInt32), keeping Int64 as a fallback for
+  mixed-read safety.
+. Make HELIX get-by-id search segments newest-first and stop at the first match,
+  dead or alive.
+. Add an overwrite-across-flushes case and a flushed-delete case per engine to
+  `tests/engine_ttl_conformance_test.rs`; those are the acceptance gates.

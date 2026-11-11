@@ -105,7 +105,7 @@ pub async fn search_sstable(
 
     // Convert the search results to OptimizedSearchRecord format
     let mut results = Vec::new();
-    for (id, distance, sql_metadata) in search_results {
+    for (id, distance, sql_metadata, valid_to_ns) in search_results {
         // Filter is now applied inside search_helix_sstable using type-safe SqlValue evaluation
 
         // Use standardized distance-to-similarity conversion for consistency across all engines
@@ -118,9 +118,12 @@ pub async fn search_sstable(
         // Metadata is already SqlValue format from search_helix_sstable
         // IMPORTANT: score field contains normalized similarity (0-1, higher = better)
         // This is used for sorting in VOS and display to users
-        let record = OptimizedSearchRecord::new(id, similarity)
+        let mut record = OptimizedSearchRecord::new(id, similarity)
             .with_similarity(similarity)
             .with_metadata(sql_metadata);
+        // Carry the TTL so the service dead filter and the query cache's
+        // earliest-expiry see it (TD-QCACHE-TTL-1).
+        record.valid_to_ns = valid_to_ns;
 
         results.push(record);
     }
@@ -170,14 +173,14 @@ pub async fn find_vector_by_id(
         use crate::storage::engines::core::formats::proximablocks::ProximaDataBlock;
         let block = ProximaDataBlock::deserialize(&block_data, None)?;
 
-        let current_time = chrono::Utc::now().timestamp() as u64;
+        // `valid_to_ns` is nanoseconds; this compared it against a SECONDS
+        // clock, so a real TTL was never seen as expired (only the Some(0)
+        // tombstone worked). Use the canonical predicate (CLAUDE.md 16a).
+        let now_ns = proximadb_kernel::time::now_unix_ns();
         for record in block.records {
             if record.oid == vector_id {
-                // Check if record is expired (tombstone support)
-                if let Some(expires_at) = record.valid_to_ns
-                    && expires_at as u64 <= current_time
-                {
-                    // Record is expired, treat as deleted
+                // Tombstoned or TTL-expired: treat as deleted.
+                if record.is_dead(now_ns) {
                     return Ok(None);
                 }
                 return Ok(Some(crate::proto::proximadb_v1::VectorRecord::from(

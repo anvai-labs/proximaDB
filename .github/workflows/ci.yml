@@ -3615,6 +3615,7 @@ jobs:
               --test embedded_engine_parity_test \
               --test embedded_service_profile \
               --test engine_safety_test \
+              --test engine_ttl_conformance_test \
               --test eventlog_integration_test \
               --test example_using_new_utilities \
               --test external_collection_bm25_e2e_test \

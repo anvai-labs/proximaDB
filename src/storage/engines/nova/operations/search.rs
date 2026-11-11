@@ -295,7 +295,14 @@ impl NovaSearchOperations {
         ctx: &crate::storage::traits::StorageQueryContext,
         priority_queue: &mut BoundedPriorityQueue,
     ) {
+        // One clock reading per batch. Dead records (tombstoned or TTL-expired)
+        // are skipped BEFORE scoring so they never take a top-k slot
+        // (CLAUDE.md 16a; flushed TTL'd records used to be returned).
+        let now_ns = proximadb_kernel::time::now_unix_ns();
         for record in records {
+            if record.is_dead(now_ns) {
+                continue;
+            }
             let vector = record
                 .embeddings
                 .first()
@@ -322,6 +329,9 @@ impl NovaSearchOperations {
                 timestamp: Some(record.created_at_ns / 1_000_000),
                 updated_at: Some(record.updated_at_ns / 1_000_000),
                 expires_at: record.valid_to_ns.map(|ts| ts / 1_000_000),
+                // The canonical TTL (ns): the service dead filter and the query
+                // cache's earliest-expiry read this, never `expires_at`.
+                valid_to_ns: record.valid_to_ns,
                 ..Default::default()
             };
             priority_queue.try_insert(search_record);

@@ -1586,6 +1586,9 @@ impl UnifiedStorageFormat for SwiftEngine {
                                 score: scored.similarity,
                                 similarity: Some(scored.similarity),
                                 vector: None, // AXIS doesn't return vectors by default
+                                // Carry the TTL so the service dead filter and the query
+                                // cache's earliest-expiry see it (TD-QCACHE-TTL-1).
+                                valid_to_ns: scored.valid_to_ns(),
                                 ..Default::default()
                             })
                             .collect();
@@ -1645,6 +1648,11 @@ impl UnifiedStorageFormat for SwiftEngine {
                 all_results.extend(filtered_results);
             }
 
+            // Dead records (tombstoned or TTL-expired) never reach a read and
+            // must not take a top-k slot (CLAUDE.md 16a; engine TTL conformance).
+            let now_ns = proximadb_kernel::time::now_unix_ns();
+            all_results.retain(|r| !r.is_dead(now_ns));
+
             // Sort and take top_k from all results
             all_results.sort_by(|a, b| {
                 let dist_a: f32 = self
@@ -1670,7 +1678,7 @@ impl UnifiedStorageFormat for SwiftEngine {
                         swift_record_vector(&record),
                         &distance_metric,
                     );
-                    OptimizedSearchRecord::new(
+                    let mut hit = OptimizedSearchRecord::new(
                         swift_record_id(&record),
                         distance_result.normalized_score,
                     )
@@ -1680,7 +1688,9 @@ impl UnifiedStorageFormat for SwiftEngine {
                         crate::core::search::sql_value_filter::proxima_tree_to_value_map(
                             &record.props,
                         ),
-                    )
+                    );
+                    hit.valid_to_ns = record.valid_to_ns;
+                    hit
                 })
                 .collect();
 
@@ -1735,6 +1745,11 @@ impl UnifiedStorageFormat for SwiftEngine {
             all_results.extend(filtered_results);
         }
 
+        // Dead records (tombstoned or TTL-expired) never reach a read and
+        // must not take a top-k slot (CLAUDE.md 16a; engine TTL conformance).
+        let now_ns = proximadb_kernel::time::now_unix_ns();
+        all_results.retain(|r| !r.is_dead(now_ns));
+
         // Sort and take top_k from all results
         all_results.sort_by(|a, b| {
             let dist_a: f32 = self
@@ -1760,7 +1775,7 @@ impl UnifiedStorageFormat for SwiftEngine {
                     swift_record_vector(&record),
                     &distance_metric,
                 );
-                OptimizedSearchRecord::new(
+                let mut hit = OptimizedSearchRecord::new(
                     swift_record_id(&record),
                     distance_result.normalized_score,
                 )
@@ -1768,7 +1783,9 @@ impl UnifiedStorageFormat for SwiftEngine {
                 .add_vector(swift_record_vector(&record).to_vec())
                 .with_proxima_metadata(
                     crate::core::search::sql_value_filter::proxima_tree_to_value_map(&record.props),
-                )
+                );
+                hit.valid_to_ns = record.valid_to_ns;
+                hit
             })
             .collect();
 
@@ -1938,11 +1955,16 @@ impl SwiftEngine {
         let mut priority_queue = BoundedPriorityQueue::new(top_k);
 
         // Search each SWIFT file by iterating through superblocks and blocks
+        // Dead records are skipped before scoring (CLAUDE.md 16a).
+        let now_ns = proximadb_kernel::time::now_unix_ns();
         for swift_file in &files {
             // Iterate through all superblocks -> blocks -> records
             for superblock in &swift_file.superblocks {
                 for block in &superblock.blocks {
                     for record in &block.records {
+                        if record.is_dead(now_ns) {
+                            continue;
+                        }
                         // Apply metadata filter if present
                         if let Some(filter_expr) = _filter_expression {
                             let matches =
@@ -1989,6 +2011,8 @@ impl SwiftEngine {
                             search_record = search_record
                                 .with_version_info(version, record.created_at_ns / 1_000_000);
                         }
+
+                        search_record.valid_to_ns = record.valid_to_ns;
 
                         // Try to insert into bounded queue - only keeps top-k
                         priority_queue.try_insert(search_record);

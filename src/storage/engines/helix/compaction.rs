@@ -692,7 +692,7 @@ impl LeveledCompactor {
         let num_blocks = u32::from_le_bytes(num_blocks_bytes);
 
         let mut records = Vec::new();
-        let current_time = chrono::Utc::now().timestamp() as u64;
+        let now_ns = proximadb_kernel::time::now_unix_ns();
 
         // Read blocks
         for _ in 0..num_blocks {
@@ -711,13 +711,17 @@ impl LeveledCompactor {
 
             // Filter out expired records (physical delete during compaction)
             for record in block.records {
-                if let Some(expires_at) = record.valid_to_ns
-                    && expires_at as u64 <= current_time
-                {
-                    // Record is expired, skip it (physical delete)
+                // Canonical 16a predicate (ns). This compared `valid_to_ns` (ns)
+                // against a SECONDS clock, so TTL-expired records were never
+                // physically removed (only Some(0) tombstones were). A physical
+                // delete uses exactly `is_record_dead`, not the broader
+                // `ProximaRecord::is_dead` (which is also true for a not-yet-valid
+                // `valid_from_ns`), so compaction never drops a row that is
+                // merely not visible yet.
+                if proximadb_records::is_record_dead(record.valid_to_ns, now_ns) {
                     debug!(
-                        "Filtering expired record: {} (expired at {})",
-                        record.oid, expires_at
+                        "Filtering dead record: {} (valid_to_ns {:?})",
+                        record.oid, record.valid_to_ns
                     );
                     continue;
                 }

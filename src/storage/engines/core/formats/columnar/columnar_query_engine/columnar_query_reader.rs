@@ -1878,6 +1878,15 @@ impl UnifiedParquetReader {
             .column_by_name("timestamp")
             .and_then(|c| c.as_any().downcast_ref::<Int64Array>());
 
+        // The record's TTL. The flush writer stores `valid_to_ns / 1_000_000`
+        // in this column (milliseconds; parquet_write_engine/streaming_writer),
+        // and this reader used to skip it, so every record read back from a
+        // flushed segment looked immortal: TTL-expired records were returned
+        // by NOVA search after flush (CLAUDE.md 16a; engine TTL conformance).
+        let expires_at_array = batch
+            .column_by_name(proximadb_storage_common::FIELD_EXPIRES_AT)
+            .and_then(|c| c.as_any().downcast_ref::<Int64Array>());
+
         // Process each row
         for row_idx in 0..num_rows {
             let id = id_array.value(row_idx).to_string();
@@ -2084,6 +2093,10 @@ impl UnifiedParquetReader {
             record.props = props;
             record.record_version = version as u64;
             record.created_at_ns = timestamp * 1_000_000;
+            // ms -> ns. A tombstone (0) stays 0; null means no TTL.
+            record.valid_to_ns = expires_at_array
+                .filter(|arr| arrow_array::Array::is_valid(*arr, row_idx))
+                .map(|arr| arr.value(row_idx).saturating_mul(1_000_000));
             if !vector.is_empty() {
                 record
                     .embeddings
