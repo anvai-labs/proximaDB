@@ -256,6 +256,20 @@ impl OptimizedSearchRecord {
         is_record_dead(self.valid_to_ns, now_ns)
     }
 
+    /// The earliest instant at which any record in `records` becomes dead by
+    /// TTL (`valid_to_ns`, ns), or `None` when none of them expires.
+    ///
+    /// For caches: a cached result set stays correct only until its earliest
+    /// expiry; past it, a cached hit would serve a record every read path must
+    /// hide (CLAUDE.md 16a). Tombstones (`Some(0)`) never reach a result set
+    /// (read paths filter them), so only positive expiries count.
+    pub fn earliest_expiry_ns(records: &[Self]) -> Option<i64> {
+        records
+            .iter()
+            .filter_map(|r| r.valid_to_ns.filter(|&ns| ns > 0))
+            .min()
+    }
+
     /// Standardized distance-to-similarity conversion for consistent ranking across all metrics
     /// This is a static method that can be used without an instance
     pub fn standardized_distance_to_similarity(
@@ -529,6 +543,7 @@ impl From<&OptimizedSearchRecord> for SearchVectorRecord {
 
 #[cfg(test)]
 mod score_vector_tests {
+
     //! R-0 tests for the ScoreVector promotion into OptimizedSearchRecord.
     //! See roadmap/RANKING_FRAMEWORK_SPEC_2026_05_23.md §6.1.
     use super::*;
@@ -686,5 +701,28 @@ mod score_vector_tests {
                 prev = s;
             }
         }
+    }
+
+    #[test]
+    fn earliest_expiry_is_the_min_positive_valid_to_ns() {
+        let rec = |v: Option<i64>| OptimizedSearchRecord {
+            valid_to_ns: v,
+            ..Default::default()
+        };
+        assert_eq!(OptimizedSearchRecord::earliest_expiry_ns(&[]), None);
+        assert_eq!(
+            OptimizedSearchRecord::earliest_expiry_ns(&[rec(None), rec(None)]),
+            None,
+            "no TTL anywhere: nothing expires"
+        );
+        assert_eq!(
+            OptimizedSearchRecord::earliest_expiry_ns(&[rec(Some(300)), rec(None), rec(Some(200))]),
+            Some(200)
+        );
+        // A tombstone (0) is not an expiry instant and never in a result set.
+        assert_eq!(
+            OptimizedSearchRecord::earliest_expiry_ns(&[rec(Some(0)), rec(Some(500))]),
+            Some(500)
+        );
     }
 }

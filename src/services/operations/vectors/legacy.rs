@@ -2798,10 +2798,12 @@ impl VectorOperationsService {
             collection_id, progressive_enabled
         );
 
-        // Execute search based on configuration
-        let results = if progressive_enabled {
+        // Execute search based on configuration. The `_with_expiry` variants
+        // carry the results' earliest record TTL so this second cache layer
+        // stops serving the entry once a record in it expires.
+        let (results, min_valid_to_ns) = if progressive_enabled {
             // Progressive search with configured recall levels
-            self.execute_progressive_search(
+            self.execute_progressive_search_with_expiry(
                 collection_id,
                 query_vector,
                 k,
@@ -2813,7 +2815,7 @@ impl VectorOperationsService {
             // Direct search without progressive stages. Reuse the
             // profile-resolved freshness (TD-WLP-5) so Churn's Strong override
             // reaches the delta-merge decision, not just the cache gate.
-            self.execute_search_internal(
+            self.execute_search_internal_with_expiry(
                 collection_id,
                 query_vector,
                 k,
@@ -2833,6 +2835,7 @@ impl VectorOperationsService {
             cached_at: std::time::SystemTime::now(),
             file_dependencies: Vec::new(), // No specific file dependencies for this query
             computed_at_lsn: 0, // non-LSN-aware path (unified_search_with_tenant_context)
+            min_valid_to_ns,
         };
         self.query_cache
             .put_with_hooks(cache_key, cached_result)
@@ -3248,6 +3251,12 @@ impl VectorOperationsService {
             None => merged_results,
         };
 
+        // Earliest record TTL, captured before the v1 conversion drops it, so
+        // the cached entry stops being served once a record in it expires.
+        let min_valid_to_ns =
+            crate::core::search::results::OptimizedSearchRecord::earliest_expiry_ns(
+                &merged_results,
+            );
         // Build v1 results from the merged records
         let v1_results = vec![self.optimized_results_to_proto_v1(
             merged_results,
@@ -3272,6 +3281,7 @@ impl VectorOperationsService {
                     v1_results.clone(),
                     Vec::new(),
                     query_lsn,
+                    min_valid_to_ns,
                 )
                 .await;
         }
@@ -3743,15 +3753,17 @@ impl VectorOperationsService {
         Ok((results, hints))
     }
 
-    /// Execute progressive search with multiple stages
-    async fn execute_progressive_search(
+    /// Execute progressive search with multiple stages. Returns the results
+    /// plus their earliest record TTL (see
+    /// [`Self::execute_search_internal_with_expiry`]).
+    async fn execute_progressive_search_with_expiry(
         &self,
         collection_id: &str,
         query_vector: Vec<f32>,
         k: usize,
         filter: Option<FilterExpression>,
         config: UnifiedSearchConfig,
-    ) -> Result<Vec<crate::proto::proximadb_v1::SearchResult>> {
+    ) -> Result<(Vec<crate::proto::proximadb_v1::SearchResult>, Option<i64>)> {
         debug!(
             "🔍 Executing progressive search for collection {}",
             collection_id
@@ -3771,7 +3783,7 @@ impl VectorOperationsService {
         // Progressive path inherits the request's freshness_mode from
         // the same config; defaults to Strong when unset.
         let freshness_mode = config.freshness_mode.clone().unwrap_or_default();
-        self.execute_search_internal(
+        self.execute_search_internal_with_expiry(
             collection_id,
             query_vector,
             k,
@@ -3790,7 +3802,11 @@ impl VectorOperationsService {
     /// skips the merge and returns engine results unchanged.
     /// `BoundedStale` is currently treated as `Strong` until the
     /// time-bound check is wired (Phase 5 follow-up).
-    async fn execute_search_internal(
+    ///
+    /// Also returns the results' earliest record TTL (`valid_to_ns`), for a
+    /// caller that caches them again: the v1 results carry no per-record
+    /// expiry, so it must travel alongside them (TD-QCACHE-TTL-1).
+    async fn execute_search_internal_with_expiry(
         &self,
         collection_id: &str,
         query_vector: Vec<f32>,
@@ -3798,7 +3814,7 @@ impl VectorOperationsService {
         filter: Option<FilterExpression>,
         optimization_goal: OptimizationGoal,
         freshness_mode: crate::core::search::VectorFreshnessMode,
-    ) -> Result<Vec<crate::proto::proximadb_v1::SearchResult>> {
+    ) -> Result<(Vec<crate::proto::proximadb_v1::SearchResult>, Option<i64>)> {
         debug!(
             "🔍 Executing unified search+filter query for collection {}",
             collection_id
@@ -3819,10 +3835,13 @@ impl VectorOperationsService {
         if !matches!(
             freshness_mode,
             crate::core::search::VectorFreshnessMode::Strong
-        ) && let Some(cached_results) = self.query_cache.get_if_fresh(&cache_key, 300).await
+        ) && let Some((cached_results, cached_expiry)) = self
+            .query_cache
+            .get_if_fresh_with_expiry(&cache_key, 300)
+            .await
         {
             debug!("✅ Cache hit for query in collection {}", collection_id);
-            return Ok(cached_results);
+            return Ok((cached_results, cached_expiry));
         }
 
         // Get collection
@@ -3898,6 +3917,11 @@ impl VectorOperationsService {
             )
             .await?;
 
+        // Earliest record TTL, captured before the v1 conversion drops it.
+        let min_valid_to_ns =
+            crate::core::search::results::OptimizedSearchRecord::earliest_expiry_ns(
+                &merged_results,
+            );
         // Prefer v1 build/cache even though this method returns legacy
         let v1_results = vec![self.optimized_results_to_proto_v1(
             merged_results,
@@ -3907,7 +3931,7 @@ impl VectorOperationsService {
 
         // Cache v1 results directly
         self.query_cache
-            .cache_with_dependencies_v1(cache_key, v1_results.clone(), Vec::new())
+            .cache_with_dependencies_v1(cache_key, v1_results.clone(), Vec::new(), min_valid_to_ns)
             .await;
         debug!(
             "💾 Cached v1 query results for collection {}",
@@ -3915,7 +3939,7 @@ impl VectorOperationsService {
         );
 
         // Return v1 results directly - no conversion needed
-        Ok(v1_results)
+        Ok((v1_results, min_valid_to_ns))
     }
 
     /// Like `unified_search_with_hints`, but returns v1 SearchResult.
@@ -6235,6 +6259,77 @@ mod index_first_search_tests {
     // read is served it (proving the cache is consulted), a Strong read bypasses
     // it (read-after-write). Same gate now applies to unified_search_with_hints
     // and execute_search_internal.
+    // TD-QCACHE-TTL-1 through the real read path: a cached result containing a
+    // record that has since passed its TTL must not be served, even to a
+    // StaleOk read (TTL expiry advances no LSN and triggers no invalidation, so
+    // only the entry's recorded earliest expiry can catch it). The FUTURE
+    // expiry half is the positive control: it proves the cache is consulted,
+    // so the expired half cannot pass vacuously.
+    #[tokio::test]
+    async fn cached_result_with_expired_record_is_not_served() {
+        let (service, _temp_dir) = create_test_service().await.unwrap();
+        cache_test_collection(&service, 1003, 3);
+        let qv = vec![1.0f32, 2.0, 3.0];
+        let k = 5usize;
+        let key = || {
+            crate::storage::cache::specialized::query_cache::QueryKey::new(
+                "1003".to_string(),
+                &qv,
+                k as u32,
+                None,
+            )
+        };
+        let sentinel = || crate::proto::proximadb_v1::SearchResult {
+            results: Vec::new(),
+            total_found: 0,
+            collection_id: Some("TTL-SENTINEL".to_string()),
+        };
+        let stale_ok = || {
+            let mut c =
+                crate::services::operations::vectors::config::UnifiedSearchConfig::default();
+            c.freshness_mode = Some(crate::core::search::VectorFreshnessMode::StaleOk);
+            c
+        };
+        let served_sentinel = |r: &Result<Vec<crate::proto::proximadb_v1::SearchResult>>| matches!(r, Ok(v) if v.iter().any(|x| x.collection_id.as_deref() == Some("TTL-SENTINEL")));
+        let now_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX);
+
+        // Positive control: earliest expiry in the FUTURE -> served from cache.
+        service
+            .query_cache
+            .cache_with_dependencies(
+                key(),
+                vec![sentinel()],
+                Vec::new(),
+                Some(now_ns + 3_600_000_000_000),
+            )
+            .await;
+        let r = service
+            .unified_search_with_tenant_context("1003", qv.clone(), k, None, Some(stale_ok()), None)
+            .await;
+        assert!(
+            served_sentinel(&r),
+            "unexpired cached entry must be served (cache consulted)"
+        );
+
+        // Earliest expiry in the PAST -> the entry must not be served.
+        service
+            .query_cache
+            .cache_with_dependencies(
+                key(),
+                vec![sentinel()],
+                Vec::new(),
+                Some(now_ns - 1_000_000_000),
+            )
+            .await;
+        let r = service
+            .unified_search_with_tenant_context("1003", qv.clone(), k, None, Some(stale_ok()), None)
+            .await;
+        assert!(
+            !served_sentinel(&r),
+            "a cached result containing a TTL-expired record must not be served"
+        );
+    }
+
     #[tokio::test]
     async fn strong_read_bypasses_query_cache_on_tenant_context_path() {
         let (service, _temp_dir) = create_test_service().await.unwrap();
@@ -6266,7 +6361,7 @@ mod index_first_search_tests {
         };
         service
             .query_cache
-            .cache_with_dependencies(cache_key, vec![stale], Vec::new())
+            .cache_with_dependencies(cache_key, vec![stale], Vec::new(), None)
             .await;
 
         let mut stale_ok =
