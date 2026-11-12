@@ -77,18 +77,17 @@ until that is read correctly.
      needs a measured per-query I/O trace (co-design #2), and the pass-1 round-trip
      cost (HEAD + footer + key GET per file, outside the caching filesystem) must
      be priced into that decision.
-* **HELIX compaction (review H1, round 2 M-b/M-d):** every L0/level path resolves
-  the newest copy across its whole input and KEEPS dead winners, because they
-  shadow older copies outside the input. A vectorless dead winner takes the vector
-  of the copy it shadows, so Hilbert/centroid pruning keeps the two together. The
-  **max-level recluster purges dead winners**: nothing older lies below, and every
-  max-level file is in its input. So physical GC of dead data now happens there;
-  on develop it happened at every compaction, but by dropping dead rows before
-  resolving, which resurrected older copies. It used to drop every dead row before
-  resolving, which rewrote v1 with nothing left to shadow it. Dead winners
-  without a vector get an all-zero vector: the block encoder requires one
-  dimension per block, and a mixed block fails the whole compaction. They are
-  never scored. PCA trains on live records only.
+* **HELIX compaction (reviews H1, round 2 M-d, round 3 M1/M2):** production runs
+  only L0 -> L1. Every path resolves the newest copy across its input. When the
+  L0 input holds a dead winner, all of L1 joins the input. With no level >= 2
+  holding files, the input covers every older copy, so dead winners are dropped
+  together with what they shadow: real GC, and no kept tombstone for file-level
+  Hilbert pruning to separate from its shadowed copy. With a deeper level present,
+  dead winners are kept: a vectorless one takes its shadowed copy's vector when
+  that copy is in the input, else a zero vector. In that case file-level pruning
+  can still separate them (bound below). Consumed files are removed from the
+  level map by path; `remove(&0)` used to drop L0 files flushed after the
+  compaction snapshot. PCA trains on live records only.
 * **HELIX Approximate (quantized) path (review M2):** resolves and dead-filters
   like the fp32 path, and its hits carry their TTL.
 * **HELIX get-by-id (review round 2):** resolves the newest copy across every
@@ -111,9 +110,17 @@ until that is read correctly.
   before it dead-filters.
 * **Acceptance:** the `MV_CONFORMANCE` overwrite-then-expire and
   delete-after-flush cases pass for SST/HELIX/NOVA/SWIFT.
-* **Remaining bound:** NOVA is exact over every row (pass 1 reads all keys).
+* **Remaining bound:** NOVA is exact over every row it reads (with pruning off,
+  which is every service query, that is every row).
   HELIX and SWIFT are exact over the rows a scan reads: a newer copy in a pruned
   HELIX block, or outside a SWIFT file's top-k, cannot shadow an older one.
-  TD-DELVEC-2 closes that. Per-segment truncation before cross-segment
-  resolution can under-fill k (review L3; same family as
-  TD-SEARCH-DEAD-OVERFETCH-1).
+  TD-DELVEC-2 closes that. Per-segment truncation to k BEFORE the cross-segment
+  check can return fewer than k, and can also pick the WRONG top-k members: a
+  segment whose top-k are all superseded elsewhere contributes nothing, even if
+  its next-ranked rows belong in the global top-k (round 3 L3). A probe did not
+  reproduce it at the service level (upstream over-fetch masked it), but it is
+  real at the engine level. Same family as TD-SEARCH-DEAD-OVERFETCH-1.
+* **Kept tombstones with a deeper level present:** file-level Hilbert-range
+  pruning runs even in Exact mode, so a kept tombstone (zero vector) can sit in
+  a pruned SSTable while the copy it shadows is searched. This needs a level >= 2,
+  which production does not create today.

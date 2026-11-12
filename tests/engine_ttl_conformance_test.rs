@@ -614,9 +614,11 @@ mv_case_with!(
         ..MvOpts::default()
     }
 );
-// Review L1/M4 + round 2 M-a: NOVA TD-040 bounds pruning engages only in
-// Approximate mode with the Euclidean metric (Exact sets force_exact), over two
-// files. A reachability probe confirmed these cases reach the prune seed.
+// NOVA, Approximate + Euclidean over two files. NOTE (reviews round 2/3): this
+// does NOT reach TD-040 bounds pruning. The service path forces `force_exact` for
+// NOVA (`StorageQueryContext`), so pruning is unreachable there; a reachability
+// probe confirmed the prune seed is never hit. These cases pin the service-path
+// behaviour under these settings, not the prune path.
 mv_case_with!(
     nova_overwrite_then_expire_approx_l2,
     "nova",
