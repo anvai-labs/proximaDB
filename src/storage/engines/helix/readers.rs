@@ -137,7 +137,8 @@ pub async fn search_sstable(
         // the service merge resolves this copy against the WAL delta by the
         // same rule (`resolve_freshest`).
         record.valid_to_ns = valid_to_ns;
-        record.updated_at = Some(key.updated_at_ms);
+        // The hit wire unit is ms.
+        record.updated_at = Some(key.updated_at_ns / 1_000_000);
         record.version = u32::try_from(key.version).ok();
 
         results.push((record, key));
@@ -385,7 +386,7 @@ pub async fn search_sstable_quantized(
     _query_hilbert_key: Option<u64>,
     k: usize,
     use_binary: bool, // true for binary (Stage 2), false for INT8 (Stage 3)
-) -> Result<Vec<OptimizedSearchRecord>> {
+) -> Result<HelixSstableResults> {
     debug!(
         "Quantized search ({}) on SSTable at level {} with {} vectors",
         if use_binary { "binary" } else { "INT8" },
@@ -406,6 +407,8 @@ pub async fn search_sstable_quantized(
     let num_blocks = u32::from_le_bytes(num_blocks_bytes);
 
     let mut results = Vec::new();
+    let mut versions = proximadb_records::NewestVersionIndex::new();
+    let now_ns = proximadb_kernel::time::now_unix_ns();
 
     // Compute query binary sketch for Hamming distance
     let query_binary: Vec<u8> = if use_binary {
@@ -435,6 +438,11 @@ pub async fn search_sstable_quantized(
         // Deserialize block
         use crate::storage::engines::core::formats::proximablocks::ProximaDataBlock;
         let block = ProximaDataBlock::deserialize(&block_data, None)?;
+        // Observe EVERY row first (TD-ENGINE-MVCC-1): a dead or newer copy
+        // must shadow older copies here and in other SSTables.
+        for record in &block.records {
+            versions.observe(&record.oid, record.version_key());
+        }
 
         // Check if block has quantized section
         if let Some(ref quant_section) = block.quantized_section {
@@ -454,16 +462,12 @@ pub async fn search_sstable_quantized(
                         let similarity = 1.0 - (hamming_dist as f32 / max_bits as f32);
 
                         // Get record ID and vector from block
-                        if let Some(record) = block.records.get(vec_idx) {
-                            let wire_record =
-                                crate::proto::proximadb_v1::VectorRecord::from(record);
-                            // Use with_vector constructor which takes id, score, and vector
-                            let result = OptimizedSearchRecord::with_vector(
-                                wire_record.id,
-                                similarity,
-                                wire_record.vector,
-                            );
-                            results.push(result);
+                        if let Some(hit) = block
+                            .records
+                            .get(vec_idx)
+                            .and_then(|record| quantized_hit(record, similarity, now_ns))
+                        {
+                            results.push(hit);
                         }
                     }
                 }
@@ -508,15 +512,12 @@ pub async fn search_sstable_quantized(
                             1.0 - ((int8_dist as f64) / (max_dist as f64)).sqrt() as f32;
 
                         // Get record ID and vector from block
-                        if let Some(record) = block.records.get(vec_idx) {
-                            let wire_record =
-                                crate::proto::proximadb_v1::VectorRecord::from(record);
-                            let result = OptimizedSearchRecord::with_vector(
-                                wire_record.id,
-                                similarity,
-                                wire_record.vector,
-                            );
-                            results.push(result);
+                        if let Some(hit) = block
+                            .records
+                            .get(vec_idx)
+                            .and_then(|record| quantized_hit(record, similarity, now_ns))
+                        {
+                            results.push(hit);
                         }
                     }
                 }
@@ -525,29 +526,33 @@ pub async fn search_sstable_quantized(
             // Fallback: No quantized section, use FP32 vectors directly
             // This ensures backwards compatibility with non-quantized data
             for record in &block.records {
-                let wire_record = crate::proto::proximadb_v1::VectorRecord::from(record);
+                let vector = record
+                    .embeddings
+                    .first()
+                    .map_or(Vec::new(), |e| e.values.to_fp32_owned());
                 // Simple cosine-like similarity approximation
                 let dot: f32 = query_vector
                     .iter()
-                    .zip(wire_record.vector.iter())
+                    .zip(vector.iter())
                     .map(|(&a, &b)| a * b)
                     .sum();
                 let similarity = (dot + 1.0) / 2.0; // Normalize to [0, 1]
 
-                let result = OptimizedSearchRecord::with_vector(
-                    wire_record.id,
-                    similarity,
-                    wire_record.vector,
-                );
-                results.push(result);
+                if let Some(hit) = quantized_hit(record, similarity, now_ns) {
+                    results.push(hit);
+                }
             }
         }
     }
 
     // Sort by similarity (descending) and return top-k
+    // Within-SSTable newest copy first (a superseded copy never takes a
+    // slot), then top-k by similarity; cross-SSTable resolution is the
+    // caller's `resolve_across_sstables`.
+    results.retain(|(hit, key)| versions.is_newest(&hit.id, key));
     results.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
+        b.0.score
+            .partial_cmp(&a.0.score)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     results.truncate(k);
@@ -558,7 +563,30 @@ pub async fn search_sstable_quantized(
         num_blocks
     );
 
-    Ok(results)
+    Ok(HelixSstableResults {
+        hits: results,
+        versions,
+    })
+}
+
+/// A quantized-path hit: `None` for a dead copy (tombstoned or TTL-expired,
+/// 16a), else the hit with its TTL and version facts, plus its key.
+fn quantized_hit(
+    record: &proximadb_records::ProximaRecord,
+    similarity: f32,
+    now_ns: i64,
+) -> Option<(OptimizedSearchRecord, proximadb_records::VersionKey)> {
+    if record.is_dead(now_ns) {
+        return None;
+    }
+    let key = record.version_key();
+    let wire_record = crate::proto::proximadb_v1::VectorRecord::from(record);
+    let mut hit =
+        OptimizedSearchRecord::with_vector(wire_record.id, similarity, wire_record.vector);
+    hit.valid_to_ns = record.valid_to_ns;
+    hit.updated_at = Some(key.updated_at_ns / 1_000_000);
+    hit.version = u32::try_from(key.version).ok();
+    Some((hit, key))
 }
 
 #[cfg(test)]

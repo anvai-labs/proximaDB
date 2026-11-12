@@ -116,9 +116,6 @@ impl NovaSearchOperations {
         ctx: &crate::storage::traits::StorageQueryContext,
         _collection_id: &str,
     ) -> Result<Vec<OptimizedSearchRecord>> {
-        use crate::storage::engines::core::formats::columnar::UnifiedParquetReader;
-        use crate::storage::persistence::filesystem::caching_filesystem::UnifiedCachingFilesystem;
-
         // Get search parameters from context
         let query_vector = ctx
             .query_vector()
@@ -210,25 +207,25 @@ impl NovaSearchOperations {
         // reads each file in full (today's behavior). Recall-preserving — a row
         // group is skipped only when its bounding box provably cannot hold a
         // top-k candidate (Euclidean clamp-gap lower bound > current k-th best).
-        //
-        // Multi-version correctness (TD-ENGINE-MVCC-1): with more than one file
-        // an id can have copies in several files, and the newest copy can sit in
-        // a row group the bounds prune would skip. Resolving the newest copy
-        // per id needs every row of every file, so the prune engages only for a
-        // single file (one flushed or compacted file holds one copy per id).
-        // Compaction restores pruning by reducing the file count; deletion
-        // vectors (ADR-025, supersede-on-upsert) are the structural fix that
-        // lets pruning stay on for multiple files.
         let prune_enabled = matches!(ctx.distance_metric(), DistanceMetric::Euclidean)
             && !ctx.search_params.block_prune.force_exact
             && filter_expression.is_none()
-            && !vector_bounds_prune_disabled()
-            && files.len() == 1;
-        // Rows from the full-read path, held until every file has been read so
-        // the newest-copy index covers all of them before anything is scored.
-        let mut full_read: Vec<Vec<ProximaRecord>> = Vec::new();
+            && !vector_bounds_prune_disabled();
         let mut bounds_pruned_total: u64 = 0;
 
+        // Pass 1 (TD-ENGINE-MVCC-1): each id's newest copy across EVERY row of
+        // EVERY file, before anything is scored, so a row is scored only if it is
+        // its id's newest copy (then dead-filtered). Built from a key-only column
+        // projection (ranged GETs of id/timestamp/updated_at/version/expires_at,
+        // never the vectors), so memory is O(ids) and pass 2 keeps TD-040 bounds
+        // pruning even for multi-file collections. Exact on every scoring path,
+        // including rows a pruned pass 2 skips, and including a single flushed
+        // file holding several copies of an id (flush does not dedup).
+        let newest = self
+            .build_newest_version_index(&files, collection_id, dimension)
+            .await?;
+
+        // Pass 2: score.
         for file_path in files {
             files_scanned += 1;
 
@@ -242,6 +239,7 @@ impl NovaSearchOperations {
                         query_vector,
                         ctx,
                         &mut priority_queue,
+                        &newest,
                     )
                     .await?
                 {
@@ -257,40 +255,16 @@ impl NovaSearchOperations {
             }
 
             // Full-read fallback (today's behavior): read the whole file.
-            let fs = self.filesystem.get_filesystem(&file_path)?;
-            let unified_fs = Arc::new(UnifiedCachingFilesystem::new(
-                fs,
-                collection_id.to_string(),
-                "nova".to_string(),
-            ));
-            let reader = UnifiedParquetReader::new(
-                vec![file_path],
-                dimension,
-                self.filesystem.clone(),
-                unified_fs,
-                collection_id.to_string(),
-                "nova".to_string(),
-            )?;
-            // `0` is the START OFFSET, not a batch size: this passed 10000, which
-            // silently skipped the first 10,000 rows of any larger file.
-            let records = reader.read_all_records(0, None).await?;
-            full_read.push(records);
-        }
-
-        if !full_read.is_empty() {
-            let mut newest = proximadb_records::NewestVersionIndex::new();
-            for record in full_read.iter().flatten() {
-                newest.observe(nova_hit_id(record), record.version_key());
-            }
-            for records in full_read {
-                self.score_records_into_queue(
-                    records,
-                    query_vector,
-                    ctx,
-                    &mut priority_queue,
-                    Some(&newest),
-                );
-            }
+            let records = self
+                .read_file_records(&file_path, collection_id, dimension)
+                .await?;
+            self.score_records_into_queue(
+                records,
+                query_vector,
+                ctx,
+                &mut priority_queue,
+                Some(&newest),
+            );
         }
 
         // TD-040 observability: surface the pruned-row-group count to the
@@ -396,6 +370,7 @@ impl NovaSearchOperations {
         query_vector: &[f32],
         ctx: &crate::storage::traits::StorageQueryContext,
         priority_queue: &mut BoundedPriorityQueue,
+        newest: &proximadb_records::NewestVersionIndex,
     ) -> Result<Option<u64>> {
         use crate::storage::engines::nova::nova_ranged_reader::read_selected_row_groups;
 
@@ -427,7 +402,7 @@ impl NovaSearchOperations {
             Some(recs) => recs,
             None => return Ok(None),
         };
-        self.score_records_into_queue(seed, query_vector, ctx, priority_queue, None);
+        self.score_records_into_queue(seed, query_vector, ctx, priority_queue, Some(newest));
 
         // Recover the provisional top-k threshold. Euclidean normalized score is
         // s = 1/(1+d) ⇒ d = 1/s − 1. Under-full queue (s_k == -inf) ⇒ no prune.
@@ -471,7 +446,7 @@ impl NovaSearchOperations {
                 .ok_or_else(|| {
                     anyhow::anyhow!("NOVA ranged reader became unavailable mid-file: {file_path}")
                 })?;
-            self.score_records_into_queue(recs, query_vector, ctx, priority_queue, None);
+            self.score_records_into_queue(recs, query_vector, ctx, priority_queue, Some(newest));
         }
 
         Ok(Some(pruned))
@@ -508,6 +483,66 @@ impl NovaSearchOperations {
         // This would use the hierarchical index and bloom filters for fast ID lookup
         // For now, return a placeholder
         Ok(None)
+    }
+
+    /// Read one NOVA file in full (records with vectors).
+    async fn read_file_records(
+        &self,
+        file_path: &str,
+        collection_id: &str,
+        dimension: usize,
+    ) -> Result<Vec<ProximaRecord>> {
+        use crate::storage::engines::core::formats::columnar::UnifiedParquetReader;
+        use crate::storage::persistence::filesystem::caching_filesystem::UnifiedCachingFilesystem;
+        let fs = self.filesystem.get_filesystem(file_path)?;
+        let unified_fs = Arc::new(UnifiedCachingFilesystem::new(
+            fs,
+            collection_id.to_string(),
+            "nova".to_string(),
+        ));
+        let reader = UnifiedParquetReader::new(
+            vec![file_path.to_string()],
+            dimension,
+            self.filesystem.clone(),
+            unified_fs,
+            collection_id.to_string(),
+            "nova".to_string(),
+        )?;
+        // `0` is the START OFFSET, not a batch size: this passed 10000, which
+        // silently skipped the first 10,000 rows of any larger file.
+        reader.read_all_records(0, None).await
+    }
+
+    /// Pass 1 of a NOVA search: the newest-copy index over every row of every
+    /// file. Key-only projected ranged read per file; a full read only where no
+    /// ranged reader is available (that file's records are dropped right after
+    /// observing, so memory stays one file plus the index).
+    async fn build_newest_version_index(
+        &self,
+        files: &[String],
+        collection_id: &str,
+        dimension: usize,
+    ) -> Result<proximadb_records::NewestVersionIndex> {
+        use crate::storage::engines::nova::nova_ranged_reader::read_version_keys;
+        let mut newest = proximadb_records::NewestVersionIndex::new();
+        for file_path in files {
+            match read_version_keys(file_path).await? {
+                Some(keys) => {
+                    for (id, key) in keys {
+                        newest.observe(&id, key);
+                    }
+                }
+                None => {
+                    for record in self
+                        .read_file_records(file_path, collection_id, dimension)
+                        .await?
+                    {
+                        newest.observe(nova_hit_id(&record), record.version_key());
+                    }
+                }
+            }
+        }
+        Ok(newest)
     }
 }
 

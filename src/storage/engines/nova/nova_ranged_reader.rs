@@ -149,3 +149,83 @@ pub(crate) async fn read_row_group_row_counts(file_path: &str) -> Result<Option<
         .collect();
     Ok(Some(counts))
 }
+
+/// Read ONLY the version-fact columns (`id`, `timestamp`, `updated_at`,
+/// `version`, `expires_at`) of every row of `file_path`, through a parquet
+/// column projection: ranged GETs of those small column chunks, never the
+/// vectors. Returns `(id, VersionKey)` per row, the input to NOVA's
+/// cross-file newest-copy index (TD-ENGINE-MVCC-1). `Ok(None)` means no ranged
+/// reader is available for this scheme and the caller falls back to a full read.
+pub(crate) async fn read_version_keys(
+    file_path: &str,
+) -> Result<Option<Vec<(String, proximadb_records::VersionKey)>>> {
+    use crate::storage::engines::core::formats::columnar::columnar_query_engine::version_columns::VersionColumns;
+    use proximadb_storage_common::{
+        FIELD_EXPIRES_AT, FIELD_ID, FIELD_TIMESTAMP, FIELD_UPDATED_AT, FIELD_VERSION,
+    };
+
+    let Some(url) = to_object_url(file_path) else {
+        return Ok(None);
+    };
+    let (store, path) = match object_store::parse_url(&url) {
+        Ok(pair) => pair,
+        Err(_) => return Ok(None),
+    };
+    let store: Arc<dyn ObjectStore> = Arc::from(store);
+    let file_size = match store.head(&path).await {
+        Ok(meta) => meta.size,
+        Err(_) => return Ok(None),
+    };
+    // arrow-rs 59.2 deprecated ParquetObjectReader (apache/arrow-rs#10308);
+    // contained here like the other readers in this module.
+    #[allow(deprecated)]
+    let reader = ParquetObjectReader::new(store, path).with_file_size(file_size);
+    let builder = match ParquetRecordBatchStreamBuilder::new(reader).await {
+        Ok(b) => b,
+        Err(_) => return Ok(None),
+    };
+    let wanted = [
+        FIELD_ID,
+        FIELD_TIMESTAMP,
+        FIELD_UPDATED_AT,
+        FIELD_VERSION,
+        FIELD_EXPIRES_AT,
+    ];
+    let arrow_schema = builder.schema().clone();
+    let indices: Vec<usize> = wanted
+        .iter()
+        .filter_map(|name| arrow_schema.index_of(name).ok())
+        .collect();
+    if arrow_schema.index_of(FIELD_ID).is_err() {
+        // No id column: nothing to resolve against; let the caller full-read.
+        return Ok(None);
+    }
+    let mask = parquet::arrow::ProjectionMask::roots(builder.parquet_schema(), indices);
+    let mut stream = builder
+        .with_projection(mask)
+        .with_batch_size(RANGED_BATCH_SIZE)
+        .build()?;
+
+    let mut keys = Vec::new();
+    while let Some(batch) = stream.next().await {
+        let batch = batch?;
+        let Some(ids) = batch
+            .column_by_name(FIELD_ID)
+            .and_then(|c| c.as_any().downcast_ref::<arrow_array::StringArray>())
+        else {
+            return Ok(None);
+        };
+        let created = batch
+            .column_by_name(FIELD_TIMESTAMP)
+            .and_then(|c| c.as_any().downcast_ref::<arrow_array::Int64Array>());
+        let cols = VersionColumns::from_batch(&batch);
+        for row in 0..batch.num_rows() {
+            // Same unit as the full-read builders: `timestamp` is ms.
+            let created_at_ns = created
+                .filter(|a| arrow_array::Array::is_valid(*a, row))
+                .map_or(0, |a| a.value(row).saturating_mul(1_000_000));
+            keys.push((ids.value(row).to_string(), cols.key(row, created_at_ns)));
+        }
+    }
+    Ok(Some(keys))
+}

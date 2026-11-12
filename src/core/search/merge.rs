@@ -122,7 +122,12 @@ pub enum CandidateSource {
 
 fn hit_version_key(record: &OptimizedSearchRecord) -> proximadb_records::VersionKey {
     proximadb_records::VersionKey {
-        updated_at_ms: record.updated_at.unwrap_or(i64::MIN),
+        // Hits carry ms; scaling to ns keeps the hit-vs-hit order identical
+        // (MIN stays MIN: `saturating_mul`).
+        updated_at_ns: record
+            .updated_at
+            .unwrap_or(i64::MIN)
+            .saturating_mul(1_000_000),
         tombstone: is_wal_tombstone(record),
         version: u64::from(record.version.unwrap_or(0)),
     }

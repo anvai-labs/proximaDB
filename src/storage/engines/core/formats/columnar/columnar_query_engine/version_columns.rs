@@ -70,16 +70,42 @@ impl<'a> VersionColumns<'a> {
         }
     }
 
-    /// Stamp the row's version facts onto `record`. Absent/null facts leave
-    /// the record's existing value (mixed-read safe).
+    /// The row's position in the shared newest-copy order, computed directly
+    /// (no record materialized): the same result as `stamp` followed by
+    /// `ProximaRecord::version_key`, given the row's `created_at_ns`.
+    pub(crate) fn key(&self, row: usize, created_at_ns: i64) -> proximadb_records::VersionKey {
+        let updated_at_ns = match self.updated_at_ms {
+            Some(a) if a.is_valid(row) => a.value(row).saturating_mul(1_000_000),
+            _ => created_at_ns,
+        };
+        let tombstone =
+            matches!(self.expires_at_ms, Some(a) if a.is_valid(row) && a.value(row) == 0);
+        proximadb_records::VersionKey {
+            updated_at_ns: if updated_at_ns != 0 {
+                updated_at_ns
+            } else {
+                created_at_ns
+            },
+            tombstone,
+            version: self.version(row).unwrap_or(0),
+        }
+    }
+
+    /// Stamp the row's version facts onto `record`. Call AFTER `created_at_ns`
+    /// is set. Absent/null `version`/`expires_at` leave the existing value;
+    /// absent/null `updated_at` becomes `created_at_ns` (mixed-read safe).
     pub(crate) fn stamp(&self, record: &mut ProximaRecord, row: usize) {
         if let Some(v) = self.version(row) {
             record.record_version = v;
         }
-        if let Some(a) = self.updated_at_ms
-            && a.is_valid(row)
-        {
-            record.updated_at_ns = a.value(row).saturating_mul(1_000_000);
+        match self.updated_at_ms {
+            Some(a) if a.is_valid(row) => {
+                record.updated_at_ns = a.value(row).saturating_mul(1_000_000);
+            }
+            // No last-write time recorded (legacy file or null cell): fall back
+            // to the creation time, never to `Default`'s read-time `now()`,
+            // which would make every such row look newest (mixed-read safe, #8).
+            _ => record.updated_at_ns = record.created_at_ns,
         }
         if let Some(a) = self.expires_at_ms
             && a.is_valid(row)
@@ -134,16 +160,18 @@ mod tests {
         assert_eq!(r0.updated_at_ns, 1_700_000_000_123_000_000);
         assert_eq!(r0.valid_to_ns, Some(1_800_000_000_000_000_000));
 
-        let mut r1 = ProximaRecord::default();
-        // `Default` stamps `updated_at_ns` with the current time, so compare
-        // against the pre-stamp value, not 0.
-        let r1_updated_before = r1.updated_at_ns;
+        // `Default` stamps `updated_at_ns` with the read-time `now()`; a null
+        // updated_at must fall back to created_at instead (review L4).
+        let mut r1 = ProximaRecord {
+            created_at_ns: 42_000_000,
+            ..Default::default()
+        };
         cols.stamp(&mut r1, 1);
         assert_eq!(r1.record_version, 2);
         assert_eq!(r1.valid_to_ns, Some(0), "tombstone stays 0");
         assert_eq!(
-            r1.updated_at_ns, r1_updated_before,
-            "null updated_at leaves the existing value"
+            r1.updated_at_ns, 42_000_000,
+            "null updated_at falls back to created_at, not now()"
         );
 
         let mut r2 = ProximaRecord {
@@ -156,6 +184,26 @@ mod tests {
             "null version leaves the existing value"
         );
         assert_eq!(r2.valid_to_ns, None, "null expires_at = no TTL");
+    }
+
+    #[test]
+    fn key_agrees_with_stamp_then_version_key() {
+        let b = batch(
+            Arc::new(UInt32Array::from(vec![Some(7), Some(2), None])),
+            DataType::UInt32,
+        );
+        let cols = VersionColumns::from_batch(&b);
+        for row in 0..3 {
+            let created = 1_000_000_000 + row as i64;
+            let mut r = ProximaRecord {
+                created_at_ns: created,
+                record_version: 0,
+                valid_to_ns: None,
+                ..Default::default()
+            };
+            cols.stamp(&mut r, row);
+            assert_eq!(cols.key(row, created), r.version_key(), "row {row}");
+        }
     }
 
     #[test]

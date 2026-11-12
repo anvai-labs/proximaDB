@@ -1600,7 +1600,8 @@ impl UnifiedStorageFormat for NovaEngine {
         // Resolve MVCC winner across ALL candidate rows in ALL files before
         // any liveness check — a delete is itself a newer version and must
         // be able to shadow an older live one (CLAUDE.md invariant 16d).
-        let mut best_match: Option<(VectorRecord, i64, i64)> = None; // (record, version, timestamp)
+        // (record, its position in the shared newest-copy order)
+        let mut best_match: Option<(VectorRecord, proximadb_records::VersionKey)> = None;
 
         for file_path in &files {
             let file_fs = self.filesystem.get_filesystem(file_path)?;
@@ -1802,15 +1803,26 @@ impl UnifiedStorageFormat for NovaEngine {
                         source,
                     };
 
+                    // The shared newest-copy order (TD-ENGINE-MVCC-1 /
+                    // TD-MVCC-ORDER-1), the same one search uses. This was
+                    // version-first, so a version-2 live copy beat a later
+                    // version-0 tombstone, and get-by-id returned a record that
+                    // search hides.
+                    let key = proximadb_records::VersionKey {
+                        updated_at_ns: if updated_at != 0 {
+                            updated_at.saturating_mul(1_000_000)
+                        } else {
+                            timestamp.saturating_mul(1_000_000)
+                        },
+                        tombstone: expires_at == Some(0),
+                        version: u64::try_from(version).unwrap_or(0),
+                    };
                     let is_better = match &best_match {
-                        Some((_, best_version, best_timestamp)) => {
-                            version > *best_version
-                                || (version == *best_version && timestamp > *best_timestamp)
-                        }
+                        Some((_, best_key)) => key.supersedes(best_key),
                         None => true,
                     };
                     if is_better {
-                        best_match = Some((record, version, timestamp));
+                        best_match = Some((record, key));
                     }
                 }
             }

@@ -15,6 +15,7 @@ use crate::storage::common::compaction_orchestrator::FilenameCodec;
 use crate::storage::persistence::filesystem::{
     FileSystem, caching_filesystem::UnifiedCachingFilesystem,
 };
+use proximadb_records::ProximaRecord;
 
 use super::clustering::{
     HilbertKey, LiquidClusteringConfig, PCAModel, QueryPatternTracker, sort_by_hilbert,
@@ -82,11 +83,9 @@ impl LeveledCompactor {
         info!("Mixed sorted/unsorted L0 files - using full re-clustering");
 
         // Fallback path: read all records and re-cluster
-        let mut all_records = Vec::new();
-        for sstable in &l0_files {
-            let records = self.read_sstable(&sstable.path).await?;
-            all_records.extend(records);
-        }
+        // Newest copy per id across the whole input (TD-ENGINE-MVCC-1).
+        let input_paths: Vec<&PathBuf> = l0_files.iter().map(|s| &s.path).collect();
+        let (mut all_records, dead_ids) = self.read_sstables_resolved(&input_paths).await?;
 
         info!(
             "Read {} vectors from {} L0 files",
@@ -95,8 +94,9 @@ impl LeveledCompactor {
         );
 
         // Train PCA model if we have enough data
-        let pca_model = if all_records.len() > 100 {
-            Some(PCAModel::train(&all_records, self.config.pca_dimensions)?)
+        let trainable = pca_training_records(&all_records, &dead_ids);
+        let pca_model = if trainable.len() > 100 {
+            Some(PCAModel::train(&trainable, self.config.pca_dimensions)?)
         } else {
             None
         };
@@ -265,8 +265,8 @@ impl LeveledCompactor {
         // Since files are already sorted by Hilbert key, we can do a k-way merge
         // This is much more efficient than reading all records and re-sorting
 
-        let mut all_records = Vec::new();
-        let mut all_keys = Vec::new();
+        // (record, hilbert key) pairs, so resolution keeps the pairing.
+        let mut pairs: Vec<(ProximaRecord, u64)> = Vec::new();
 
         // For simplicity, read all records but preserve sorting
         // In production, implement proper k-way merge with iterators
@@ -285,17 +285,21 @@ impl LeveledCompactor {
                     };
 
                     for (i, record) in records.into_iter().enumerate() {
-                        let key = min_key + (i as u64 * step);
-                        all_keys.push(key);
-                        all_records.push(record);
+                        pairs.push((record, min_key + (i as u64 * step)));
                     }
                 }
             } else {
                 // Shouldn't happen with sorted flush
-                all_records.extend(records);
-                all_keys.extend(vec![0; all_records.len() - all_keys.len()]);
+                pairs.extend(records.into_iter().map(|r| (r, 0)));
             }
         }
+
+        // Newest copy per id across the whole input, dead winners kept
+        // (TD-ENGINE-MVCC-1; see `read_sstables_resolved`).
+        let pairs =
+            proximadb_records::keep_newest_by(pairs, |p| p.0.oid.as_str(), |p| p.0.version_key());
+        let (records, all_keys): (Vec<ProximaRecord>, Vec<u64>) = pairs.into_iter().unzip();
+        let (all_records, _dead_ids) = materialize_for_write(records);
 
         info!(
             "Merged {} records from pre-sorted L0 files",
@@ -454,11 +458,9 @@ impl LeveledCompactor {
         let files_to_compact = self.select_files_for_compaction(&curr_files, &next_files)?;
 
         // Read all vectors
-        let mut all_records = Vec::new();
-        for sstable in &files_to_compact {
-            let records = self.read_sstable(&sstable.path).await?;
-            all_records.extend(records);
-        }
+        // Newest copy per id across the whole input (TD-ENGINE-MVCC-1).
+        let input_paths: Vec<&PathBuf> = files_to_compact.iter().map(|s| &s.path).collect();
+        let (mut all_records, _dead_ids) = self.read_sstables_resolved(&input_paths).await?;
 
         // Apply liquid clustering if enabled (after computing Hilbert keys)
         // This will be done after Hilbert key computation below
@@ -676,9 +678,33 @@ impl LeveledCompactor {
         Ok((reorganized_records, reorganized_keys))
     }
 
-    /// Read an SSTable and filter out expired records (tombstone support)
-    #[expect(clippy::ptr_arg)] // Accepting &PathBuf for API compatibility
-    async fn read_sstable(&self, path: &PathBuf) -> Result<Vec<VectorRecord>> {
+    /// Read every input SSTable and keep only each id's NEWEST copy across the
+    /// whole compaction input (the shared order, `proximadb_records::VersionKey`;
+    /// TD-ENGINE-MVCC-1), preserving input order.
+    ///
+    /// Dead winners (tombstones and TTL-expired copies) are KEPT. A compaction
+    /// input is a subset of the collection's SSTables, so a dropped dead winner
+    /// would stop shadowing an older live copy in a level outside the input,
+    /// and search would resurface it. This used to drop every dead row before
+    /// any resolution, which did exactly that. Purging dead winners needs a
+    /// full-coverage watermark (TD-DELVEC-2).
+    async fn read_sstables_resolved(
+        &self,
+        paths: &[&PathBuf],
+    ) -> Result<(Vec<VectorRecord>, std::collections::HashSet<String>)> {
+        let mut all = Vec::new();
+        for path in paths {
+            all.extend(self.read_sstable(path).await?);
+        }
+        Ok(materialize_for_write(proximadb_records::keep_newest_by(
+            all,
+            |r| r.oid.as_str(),
+            ProximaRecord::version_key,
+        )))
+    }
+
+    /// Every row of one SSTable, dead or alive, unresolved.
+    async fn read_sstable(&self, path: &std::path::Path) -> Result<Vec<ProximaRecord>> {
         // Read file data
         let file_data = self.filesystem.read(path.to_str().unwrap_or("")).await?;
         let mut cursor = std::io::Cursor::new(file_data);
@@ -692,7 +718,6 @@ impl LeveledCompactor {
         let num_blocks = u32::from_le_bytes(num_blocks_bytes);
 
         let mut records = Vec::new();
-        let now_ns = proximadb_kernel::time::now_unix_ns();
 
         // Read blocks
         for _ in 0..num_blocks {
@@ -709,25 +734,7 @@ impl LeveledCompactor {
             use crate::storage::engines::core::formats::proximablocks::ProximaDataBlock;
             let block = ProximaDataBlock::deserialize(&block_data, None)?;
 
-            // Filter out expired records (physical delete during compaction)
-            for record in block.records {
-                // Canonical 16a predicate (ns). This compared `valid_to_ns` (ns)
-                // against a SECONDS clock, so TTL-expired records were never
-                // physically removed (only Some(0) tombstones were). A physical
-                // delete uses exactly `is_record_dead`, not the broader
-                // `ProximaRecord::is_dead` (which is also true for a not-yet-valid
-                // `valid_from_ns`), so compaction never drops a row that is
-                // merely not visible yet.
-                if proximadb_records::is_record_dead(record.valid_to_ns, now_ns) {
-                    debug!(
-                        "Filtering dead record: {} (valid_to_ns {:?})",
-                        record.oid, record.valid_to_ns
-                    );
-                    continue;
-                }
-                // Record is not expired or has no expiration, keep it
-                records.push(crate::proto::proximadb_v1::VectorRecord::from(&record));
-            }
+            records.extend(block.records);
         }
 
         Ok(records)
@@ -754,15 +761,14 @@ impl LeveledCompactor {
         }
 
         // Read all vectors
-        let mut all_records = Vec::new();
-        for sstable in &max_level_files {
-            let records = self.read_sstable(&sstable.path).await?;
-            all_records.extend(records);
-        }
+        // Newest copy per id across the whole input (TD-ENGINE-MVCC-1).
+        let input_paths: Vec<&PathBuf> = max_level_files.iter().map(|s| &s.path).collect();
+        let (all_records, dead_ids) = self.read_sstables_resolved(&input_paths).await?;
 
         // Update PCA model with current data
-        if !all_records.is_empty() {
-            let new_model = PCAModel::train(&all_records, self.config.pca_dimensions)?;
+        let trainable = pca_training_records(&all_records, &dead_ids);
+        if !trainable.is_empty() {
+            let new_model = PCAModel::train(&trainable, self.config.pca_dimensions)?;
             *pca_model.write().await = Some(new_model);
         }
 
@@ -771,6 +777,59 @@ impl LeveledCompactor {
             .await?;
 
         Ok(())
+    }
+}
+
+/// Convert resolved compaction survivors for the HELIX writer.
+///
+/// Compaction keeps dead winners (TD-ENGINE-MVCC-1), and a tombstone carries no
+/// vector. The HELIX block encoder requires one dimension per block, so an
+/// empty vector next to live rows fails the WHOLE compaction. A dead winner
+/// without a vector therefore gets an all-zero vector of the input's
+/// dimension. It is never scored: every HELIX read path skips dead records
+/// before scoring, and get-by-id returns `None` for them. It only shadows
+/// older copies, which is what it is kept for.
+fn materialize_for_write(
+    records: Vec<ProximaRecord>,
+) -> (Vec<VectorRecord>, std::collections::HashSet<String>) {
+    // Deadness on the canonical `valid_to_ns` (16a), before conversion.
+    let now_ns = proximadb_kernel::time::now_unix_ns();
+    let dead_ids: std::collections::HashSet<String> = records
+        .iter()
+        .filter(|r| proximadb_records::is_record_dead(r.valid_to_ns, now_ns))
+        .map(|r| r.oid.clone())
+        .collect();
+    let mut out: Vec<VectorRecord> = records.iter().map(VectorRecord::from).collect();
+    let dimension = out
+        .iter()
+        .map(|r| r.vector.len())
+        .find(|&d| d > 0)
+        .unwrap_or(0);
+    if dimension > 0 {
+        for r in out.iter_mut().filter(|r| r.vector.is_empty()) {
+            r.vector = vec![0.0; dimension];
+        }
+    }
+    (out, dead_ids)
+}
+
+/// The records PCA may train on: live ones. Dead winners kept by compaction
+/// (TD-ENGINE-MVCC-1) carry an all-zero vector or a vector nobody will
+/// read again; they must not shape the model. Borrows when nothing is dead.
+fn pca_training_records<'a>(
+    records: &'a [VectorRecord],
+    dead_ids: &std::collections::HashSet<String>,
+) -> std::borrow::Cow<'a, [VectorRecord]> {
+    if dead_ids.is_empty() {
+        std::borrow::Cow::Borrowed(records)
+    } else {
+        std::borrow::Cow::Owned(
+            records
+                .iter()
+                .filter(|r| !dead_ids.contains(&r.id))
+                .cloned()
+                .collect(),
+        )
     }
 }
 
@@ -802,5 +861,203 @@ mod tests {
 
         let compactor = LeveledCompactor::new(config, filesystem, data_dir);
         assert!(compactor.liquid_config.enabled);
+    }
+
+    // ---- TD-ENGINE-MVCC-1 / #2521 review H1 ----
+    // Compaction must resolve each id's newest copy across its whole input and
+    // KEEP a dead winner. Dropping dead rows first rewrote the older live copy
+    // with nothing left to shadow it, so search resurfaced it.
+
+    const DIM: usize = 8;
+
+    fn vrec(id: &str, ms: i64, version: u32, expires_at: Option<i64>, live: bool) -> VectorRecord {
+        let mut vector = vec![0.0_f32; DIM];
+        vector[0] = 1.0;
+        VectorRecord {
+            id: id.to_string(),
+            // A tombstone carries no vector (as flush writes it).
+            vector: if live { vector } else { Vec::new() },
+            metadata: HashMap::new(),
+            timestamp: Some(ms),
+            updated_at: Some(ms),
+            expires_at,
+            version: Some(version),
+            source: None,
+        }
+    }
+
+    fn pad(name: &str, i: usize) -> VectorRecord {
+        let mut v = vrec(&format!("{name}_{i}"), 500, 1, None, true);
+        v.vector[DIM - 1] = 1.0 + i as f32;
+        v
+    }
+
+    async fn compactor_in(
+        dir: &std::path::Path,
+    ) -> (LeveledCompactor, Arc<UnifiedCachingFilesystem>) {
+        let url = format!("file://{}", dir.display());
+        let mut fs_config = crate::storage::persistence::filesystem::FilesystemConfig::default();
+        fs_config.default_fs = Some(url.clone());
+        let factory = Arc::new(
+            crate::storage::persistence::filesystem::FilesystemFactory::create(fs_config)
+                .await
+                .unwrap_or_else(|e| panic!("fs factory: {e}")),
+        );
+        let base = factory
+            .get_filesystem(&url)
+            .unwrap_or_else(|e| panic!("fs: {e}"));
+        let filesystem = Arc::new(UnifiedCachingFilesystem::new(
+            base,
+            "mvcc_compaction_test".to_string(),
+            "helix".to_string(),
+        ));
+        let compactor = LeveledCompactor::new(
+            HelixConfig::default(),
+            filesystem.clone(),
+            dir.to_path_buf(),
+        );
+        (compactor, filesystem)
+    }
+
+    async fn l0_file(
+        filesystem: &Arc<UnifiedCachingFilesystem>,
+        dir: &std::path::Path,
+        name: &str,
+        records: &[VectorRecord],
+        sorted: bool,
+    ) -> SStableMetadata {
+        let path = dir.join(name);
+        let keys: Vec<u64> = (0..records.len() as u64).collect();
+        let size_bytes = write_helix_sstable(
+            filesystem,
+            &path,
+            records,
+            HelixConfig::default().proxima_block_size,
+            crate::storage::engines::constants::HELIX_MAGIC,
+            if sorted { Some(&keys) } else { None },
+            Some(256),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("write {name}: {e}"));
+        SStableMetadata {
+            path,
+            level: 0,
+            hilbert_range: sorted.then(|| (0, records.len().saturating_sub(1) as u64)),
+            num_vectors: records.len(),
+            size_bytes,
+            created_at: chrono::Utc::now(),
+            blocks: Vec::new(),
+            bloom_filter: None,
+        }
+    }
+
+    /// Run one L0->L1 compaction over [v1 live] + [newest dead copy] + 2 pad
+    /// files; return every copy of `victim` found in the L1 output.
+    async fn compact_and_find_victim(
+        sorted: bool,
+        dead_newest: VectorRecord,
+    ) -> Vec<proximadb_records::ProximaRecord> {
+        let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("tempdir: {e}"));
+        let dir = tmp.path().to_path_buf();
+        let (compactor, fs) = compactor_in(&dir).await;
+        let v1 = vrec("victim", 1_000, 1, None, true);
+        let mut f0 = vec![v1];
+        f0.extend((0..3).map(|i| pad("a", i)));
+        // A tombstone carries no vector, so (as a flush writes it) it sits in a
+        // file of its own; an expired copy still has its vector and shares one.
+        let tombstone = dead_newest.vector.is_empty();
+        let mut f1 = vec![dead_newest];
+        if !tombstone {
+            f1.extend((0..3).map(|i| pad("b", i)));
+        }
+        let files = vec![
+            l0_file(&fs, &dir, "l0_0.helix", &f0, sorted).await,
+            l0_file(&fs, &dir, "l0_1.helix", &f1, sorted).await,
+            l0_file(
+                &fs,
+                &dir,
+                "l0_2.helix",
+                &(0..4).map(|i| pad("c", i)).collect::<Vec<_>>(),
+                sorted,
+            )
+            .await,
+            l0_file(
+                &fs,
+                &dir,
+                "l0_3.helix",
+                &(0..4).map(|i| pad("d", i)).collect::<Vec<_>>(),
+                sorted,
+            )
+            .await,
+        ];
+        let levels = Arc::new(RwLock::new(HashMap::from([(0_usize, files)])));
+        let (compacted, _) = compactor
+            .compact_l0_to_l1(levels.clone())
+            .await
+            .unwrap_or_else(|e| panic!("compact: {e}"));
+        assert!(
+            compacted > 0,
+            "positive control: compaction must run (sorted={sorted})"
+        );
+        let l1 = levels.read().await.get(&1).cloned().unwrap_or_default();
+        assert!(
+            !l1.is_empty(),
+            "positive control: L1 output written (sorted={sorted})"
+        );
+        let mut copies = Vec::new();
+        for file in &l1 {
+            for r in compactor
+                .read_sstable(&file.path)
+                .await
+                .unwrap_or_else(|e| panic!("read L1: {e}"))
+            {
+                if r.oid == "victim" {
+                    copies.push(r);
+                }
+            }
+        }
+        std::mem::forget(tmp);
+        copies
+    }
+
+    async fn assert_only_dead_winner(sorted: bool, dead_newest: VectorRecord, what: &str) {
+        let copies = compact_and_find_victim(sorted, dead_newest).await;
+        let now = proximadb_kernel::time::now_unix_ns();
+        assert_eq!(
+            copies.len(),
+            1,
+            "[{what}, sorted={sorted}] exactly the newest copy survives; got {:?}",
+            copies
+                .iter()
+                .map(|c| (c.record_version, c.valid_to_ns))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            proximadb_records::is_record_dead(copies[0].valid_to_ns, now),
+            "[{what}, sorted={sorted}] the survivor must be the DEAD newest copy, not the \
+             older live v1 (which search would resurface): {:?}",
+            (copies[0].record_version, copies[0].valid_to_ns)
+        );
+    }
+
+    #[tokio::test]
+    async fn compaction_keeps_expired_winner_and_drops_older_live_copy() {
+        for sorted in [true, false] {
+            // v2: newer, TTL already expired (1 ms after the epoch).
+            assert_only_dead_winner(sorted, vrec("victim", 2_000, 2, Some(1), true), "expired")
+                .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn compaction_keeps_tombstone_winner_and_drops_older_live_copy() {
+        for sorted in [true, false] {
+            assert_only_dead_winner(
+                sorted,
+                vrec("victim", 2_000, 0, Some(0), false),
+                "tombstone",
+            )
+            .await;
+        }
     }
 }

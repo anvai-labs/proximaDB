@@ -1,0 +1,24 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-REINSERT-CONFLICT-1: inserting an id deleted in the same unflushed delta fails with INSERT_CONFLICT
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open (filed 2026-11-11).** Found by the #2521 adversarial review (INFO-2).
+| Invariant | CLAUDE.md 16d (a tombstone in the delta suppresses the live copy): a deleted id is free to be inserted again.
+|===
+
+== The defect
+
+`insert` of an id whose only unflushed state is a tombstone fails with
+`INSERT_CONFLICT: record '<id>' already exists`. The existence check treats the
+deleted copy as present and does not apply the canonical dead predicate
+(`is_record_dead`) to the id's newest unflushed copy.
+
+== Fix shape
+
+The existence check resolves the id's newest copy (WAL delta first, then flushed)
+with `proximadb_records::VersionKey`, and treats it as absent when that copy is dead.
+Pin it with delete-then-insert unflushed, delete-then-insert across a flush, and a
+plain duplicate insert, which must still conflict.

@@ -336,16 +336,8 @@ impl NovaCompactionOperations {
 /// kept: a newest-copy tombstone must keep shadowing copies in files outside the
 /// compaction set.
 fn keep_newest_per_id(records: Vec<ProximaRecord>) -> Vec<ProximaRecord> {
-    let mut newest: HashMap<String, ProximaRecord> = HashMap::with_capacity(records.len());
-    for record in records {
-        match newest.get(&record.oid) {
-            Some(current) if !record.version_key().supersedes(&current.version_key()) => {}
-            _ => {
-                newest.insert(record.oid.clone(), record);
-            }
-        }
-    }
-    let mut out: Vec<ProximaRecord> = newest.into_values().collect();
+    let mut out =
+        proximadb_records::keep_newest_by(records, |r| r.oid.as_str(), ProximaRecord::version_key);
     out.sort_by(|a, b| a.oid.cmp(&b.oid));
     out
 }

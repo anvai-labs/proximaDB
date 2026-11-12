@@ -57,10 +57,27 @@ until that is read correctly.
   indexes and keeps only globally newest hits (parallel, sequential and
   progressive callers). Hits now carry `updated_at`/`version`.
 * **NOVA:** both columnar record builders decode `version` (UInt32, the writer's
-  type; Int64 accepted), `updated_at` and `expires_at` through one helper
-  (`columnar_query_engine/version_columns.rs`). Search indexes every file's rows
-  before scoring. **Bounds pruning (TD-040) now engages only for single-file
-  collections**, because exactness needs every row; TD-DELVEC-2 restores it.
+  type; Int64 accepted), `updated_at` (falling back to `created_at`, never the
+  read-time `now()`) and `expires_at` through one helper
+  (`columnar_query_engine/version_columns.rs`). Search runs in **two passes**:
+  pass 1 builds the index from a **key-only column projection** (ranged GETs of
+  id/timestamp/updated_at/version/expires_at, never the vectors;
+  `nova_ranged_reader::read_version_keys`). Pass 2 scores with the index on
+  **every** path, including TD-040 bounds pruning, which stays ON for multi-file
+  collections. Memory is one file plus O(ids). Get-by-id uses the same order (it
+  was version-first, and returned a record that search hides).
+* **HELIX compaction (review H1):** every L0/level/recluster path resolves the
+  newest copy across its whole input and KEEPS dead winners, because they shadow
+  older copies outside the input. It used to drop every dead row before
+  resolving, which rewrote v1 with nothing left to shadow it. Dead winners
+  without a vector get an all-zero vector: the block encoder requires one
+  dimension per block, and a mixed block fails the whole compaction. They are
+  never scored. PCA trains on live records only.
+* **HELIX Approximate (quantized) path (review M2):** resolves and dead-filters
+  like the fp32 path, and its hits carry their TTL.
+* **Order precision (review M1):** `VersionKey` compares ns, so a re-insert written
+  within the same millisecond as its delete is not hidden. Remaining twins:
+  TD-MVCC-ORDER-1.
 * **NOVA, found along the way (data correctness):** search passed `10000` and
   compaction `100000` as `read_all_records`' **start offset**, silently skipping
   that many leading rows of any larger file. Compaction then deleted its inputs
@@ -72,6 +89,9 @@ until that is read correctly.
   before it dead-filters.
 * **Acceptance:** the `MV_CONFORMANCE` overwrite-then-expire and
   delete-after-flush cases pass for SST/HELIX/NOVA/SWIFT.
-* **Remaining bound:** exact over the rows a scan reads. A newer copy in a pruned
-  HELIX block or outside a SWIFT file's top-k cannot shadow an older one. That is
-  TD-DELVEC-2.
+* **Remaining bound:** NOVA is exact over every row (pass 1 reads all keys).
+  HELIX and SWIFT are exact over the rows a scan reads: a newer copy in a pruned
+  HELIX block, or outside a SWIFT file's top-k, cannot shadow an older one.
+  TD-DELVEC-2 closes that. Per-segment truncation before cross-segment
+  resolution can under-fill k (review L3; same family as
+  TD-SEARCH-DEAD-OVERFETCH-1).

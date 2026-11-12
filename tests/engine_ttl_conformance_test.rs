@@ -115,6 +115,16 @@ fn search(
     collection: &str,
     salt: usize,
 ) -> Result<Vec<proximadb::core::search::results::OptimizedSearchRecord>, String> {
+    search_with(db, collection, salt, None)
+}
+
+/// `search` with an explicit search config (mode / metric override).
+fn search_with(
+    db: &EmbeddedProximaDB,
+    collection: &str,
+    salt: usize,
+    config: Option<proximadb::services::operations::vectors::UnifiedSearchConfig>,
+) -> Result<Vec<proximadb::core::search::results::OptimizedSearchRecord>, String> {
     db.runtime().block_on(async {
         db.shared_services()
             .vector_operations_service
@@ -123,7 +133,7 @@ fn search(
                 query(salt),
                 10,
                 None,
-                None,
+                config,
                 #[cfg(feature = "abac-policy")]
                 &proximadb_abac::ReadContext::system(
                     proximadb_abac::SystemReadReason::Statistics,
@@ -368,9 +378,49 @@ impl MultiVersion {
     }
 }
 
+/// How a multi-version case runs beyond the basic two-flush shape.
+#[derive(Clone, Copy, Default)]
+struct MvOpts {
+    /// Search in Approximate mode (HELIX: the progressive / quantized path).
+    approximate: bool,
+    /// Search with the Euclidean metric (NOVA: engages TD-040 bounds pruning).
+    euclidean: bool,
+}
+
+impl MvOpts {
+    fn label(self) -> String {
+        let mut l = String::new();
+        if self.approximate {
+            l.push_str("_approx");
+        }
+        if self.euclidean {
+            l.push_str("_l2");
+        }
+        l
+    }
+
+    fn config(self) -> Option<proximadb::services::operations::vectors::UnifiedSearchConfig> {
+        if !self.approximate && !self.euclidean {
+            return None;
+        }
+        let mut cfg = proximadb::services::operations::vectors::UnifiedSearchConfig::default();
+        if self.approximate {
+            cfg.search_mode = proximadb::core::search::SearchMode::Approximate { nprobe: None };
+        }
+        if self.euclidean {
+            cfg.distance_metric = Some(proximadb_distance_types::DistanceMetric::L2);
+        }
+        Some(cfg)
+    }
+}
+
 fn run_multi_version(engine: &str, case: MultiVersion) {
+    run_multi_version_with(engine, case, MvOpts::default());
+}
+
+fn run_multi_version_with(engine: &str, case: MultiVersion, opts: MvOpts) {
     let (_tmp, db) = create_test_db(engine);
-    let collection = format!("mv_conf_{engine}_{}", case.label());
+    let collection = format!("mv_conf_{engine}_{}{}", case.label(), opts.label());
     if let Err(e) = db.create_collection(&collection, DIM as u32, Some(engine)) {
         println!(
             "MV_CONFORMANCE engine={engine} case={} verdict=n/a reason=\"create_collection failed: {e}\"",
@@ -390,7 +440,7 @@ fn run_multi_version(engine: &str, case: MultiVersion) {
         .unwrap_or_else(|e| panic!("[{engine}] flush 1 failed: {e}"));
 
     // Positive control: v1 is found.
-    let before = search(&db, &collection, 1)
+    let before = search_with(&db, &collection, 1, opts.config())
         .unwrap_or_else(|e| panic!("[{engine}] search before failed: {e}"));
     assert!(
         before.iter().any(|r| r.id == VICTIM),
@@ -424,13 +474,14 @@ fn run_multi_version(engine: &str, case: MultiVersion) {
         assert!(now_ns() > valid_to);
     }
 
-    let after = search(&db, &collection, 2)
+    let after = search_with(&db, &collection, 2, opts.config())
         .unwrap_or_else(|e| panic!("[{engine}] search after failed: {e}"));
     let resurfaced = after.iter().find(|r| r.id == VICTIM);
     let live_after = after.iter().filter(|r| r.id.starts_with("live_")).count();
     println!(
-        "MV_CONFORMANCE engine={engine} case={} verdict={} post_hits={} post_live_hits={} victim={:?}",
+        "MV_CONFORMANCE engine={engine} case={}{} verdict={} post_hits={} post_live_hits={} victim={:?}",
         case.label(),
+        opts.label(),
         if resurfaced.is_some() {
             "RESURFACES"
         } else {
@@ -512,3 +563,84 @@ mv_case!(
     MultiVersion::DeleteAfterFlush,
     cfg = feature = "experimental-engines"
 );
+
+macro_rules! mv_case_with {
+    ($name:ident, $engine:literal, $case:expr, $opts:expr) => {
+        #[test]
+        fn $name() {
+            run_multi_version_with($engine, $case, $opts);
+        }
+    };
+}
+
+// Review H1 (compaction must keep a dead newest copy and drop the older live
+// one) is pinned at the compaction seam, not here: no public API drives
+// HELIX/NOVA engine compaction deterministically (`compact_collection_named`
+// runs the generic segment compactor; HELIX auto-compacts in a detached task).
+// See `helix::compaction::tests::compaction_keeps_*` and
+// `nova::operations::compaction::keep_newest_tests`.
+// Review M2: HELIX Approximate mode (progressive / quantized path).
+mv_case_with!(
+    helix_overwrite_then_expire_approx,
+    "helix",
+    MultiVersion::OverwriteThenExpire,
+    MvOpts {
+        approximate: true,
+        ..MvOpts::default()
+    }
+);
+mv_case_with!(
+    helix_delete_after_flush_approx,
+    "helix",
+    MultiVersion::DeleteAfterFlush,
+    MvOpts {
+        approximate: true,
+        ..MvOpts::default()
+    }
+);
+// Review L1/M4: NOVA Euclidean (TD-040 bounds pruning engages) over two files.
+mv_case_with!(
+    nova_overwrite_then_expire_l2,
+    "nova",
+    MultiVersion::OverwriteThenExpire,
+    MvOpts {
+        euclidean: true,
+        ..MvOpts::default()
+    }
+);
+mv_case_with!(
+    nova_delete_after_flush_l2,
+    "nova",
+    MultiVersion::DeleteAfterFlush,
+    MvOpts {
+        euclidean: true,
+        ..MvOpts::default()
+    }
+);
+
+/// Review L2: NOVA search read files from start offset 10000 (a batch size
+/// passed as the offset), silently skipping the first 10,000 rows of any larger
+/// file. The victim is row 0 of a 10,050-row flushed file.
+#[test]
+fn nova_large_file_first_rows_are_searchable() {
+    let (_tmp, db) = create_test_db("nova");
+    let collection = "nova_large_file_offset";
+    db.create_collection(collection, DIM as u32, Some("nova"))
+        .unwrap_or_else(|e| panic!("create: {e}"));
+    let mut records = vec![record(VICTIM, victim_vector(), None)];
+    records.extend((0..10_050).map(|i| record(&format!("live_{i:05}"), filler_vector(i), None)));
+    db.insert_proxima_records(collection, records)
+        .unwrap_or_else(|e| panic!("insert: {e}"));
+    db.flush().unwrap_or_else(|e| panic!("flush: {e}"));
+    let hits = search(&db, collection, 1).unwrap_or_else(|e| panic!("search: {e}"));
+    println!(
+        "LARGE_FILE engine=nova victim_found={} hits={}",
+        hits.iter().any(|r| r.id == VICTIM),
+        hits.len()
+    );
+    assert!(
+        hits.iter().any(|r| r.id == VICTIM),
+        "row 0 of a >10,000-row NOVA file is not searchable (start-offset bug); ids={:?}",
+        hits.iter().map(|r| r.id.as_str()).collect::<Vec<_>>()
+    );
+}
