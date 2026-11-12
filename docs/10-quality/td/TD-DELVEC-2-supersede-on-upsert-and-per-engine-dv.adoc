@@ -22,9 +22,20 @@ scan skips:
   copy in a block or rank the scan never reads cannot shadow an older one. Suppose
   an upsert moves a vector far from the query, then the new copy expires or is
   deleted. The old copy can still resurface.
-* **NOVA** TD-040 vector-bounds pruning is disabled when a collection has more than
-  one file, so that stage 1 stays exact. That costs the pruning win until compaction
-  reduces the file count.
+* **NOVA** TD-040 vector-bounds pruning is **unreachable on the service path**:
+  `StorageQueryContext` forces `force_exact` for NOVA (found in the #2521 review).
+  Where pruning does run (direct-engine callers), stage 1 pays a key-only pass 1
+  (HEAD + footer + key-column GET per file). Deletion vectors make that pass
+  unnecessary.
+* **GC of dead data.** Stage 1 keeps dead winners through every HELIX compaction
+  except the max-level recluster (and NOVA compaction keeps them always), because
+  the copies they shadow may be outside the input. Until DVs land, tombstones and
+  expired rows of a TTL workload cost GB-month until they reach the max level
+  (HELIX) or forever (NOVA). A DV bit on the shadowed copy lets compaction drop
+  both.
+* **Superseded copies in extraction/export:** the HELIX extractor now skips dead
+  rows but does not resolve versions, so an older live copy can still be
+  extracted. A DV on the superseded copy closes that too.
 
 The structural fix is the one ADR-025 already chose for deletes: decide visibility
 **at the older copy's segment**, not by finding the newer copy at read time.

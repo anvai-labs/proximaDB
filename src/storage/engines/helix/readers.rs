@@ -10,7 +10,6 @@ use tracing::{debug, error, info, trace, warn};
 
 use crate::core::search::bounded_queue::BoundedPriorityQueue;
 use crate::core::search::results::OptimizedSearchRecord;
-use crate::proto::proximadb_v1::VectorRecord;
 use crate::storage::persistence::filesystem::FileSystem;
 use proximadb_distance_kernel::DistanceMetric;
 
@@ -186,6 +185,24 @@ pub fn resolve_across_sstables(
     queue.into_sorted_vec()
 }
 
+/// Get-by-id resolution across SSTables: the NEWEST copy of the id wins
+/// (shared `VersionKey` order), and only then is it dead-filtered
+/// (TD-ENGINE-MVCC-1). Independent of the order SSTables are listed in, so an
+/// older live copy can never beat a newer dead one.
+pub fn newest_live_copy(
+    copies: impl IntoIterator<Item = proximadb_records::ProximaRecord>,
+    now_ns: i64,
+) -> Option<proximadb_records::ProximaRecord> {
+    let newest = copies.into_iter().reduce(|best, copy| {
+        if copy.version_key().supersedes(&best.version_key()) {
+            copy
+        } else {
+            best
+        }
+    })?;
+    (!newest.is_dead(now_ns)).then_some(newest)
+}
+
 /// Find a specific vector by ID
 pub async fn find_vector_by_id(
     filesystem: &Arc<
@@ -193,7 +210,7 @@ pub async fn find_vector_by_id(
     >,
     sstable: &SStableMetadata,
     vector_id: &str,
-) -> Result<Option<VectorRecord>> {
+) -> Result<Option<proximadb_records::ProximaRecord>> {
     // Check bloom filter if available
     if let Some(ref _bloom_data) = sstable.bloom_filter {
         // Deserialize and check bloom filter
@@ -213,6 +230,7 @@ pub async fn find_vector_by_id(
     std::io::Read::read_exact(&mut cursor, &mut num_blocks_bytes)?;
     let num_blocks = u32::from_le_bytes(num_blocks_bytes);
 
+    let mut newest: Option<proximadb_records::ProximaRecord> = None;
     // Read blocks
     for _ in 0..num_blocks {
         // Read block size
@@ -228,24 +246,24 @@ pub async fn find_vector_by_id(
         use crate::storage::engines::core::formats::proximablocks::ProximaDataBlock;
         let block = ProximaDataBlock::deserialize(&block_data, None)?;
 
-        // `valid_to_ns` is nanoseconds; this compared it against a SECONDS
-        // clock, so a real TTL was never seen as expired (only the Some(0)
-        // tombstone worked). Use the canonical predicate (CLAUDE.md 16a).
-        let now_ns = proximadb_kernel::time::now_unix_ns();
+        // Keep this file's NEWEST copy of the id, dead or alive: the caller
+        // resolves across every SSTable and only then applies the dead filter
+        // (TD-ENGINE-MVCC-1). Returning `None` for a dead copy here let the
+        // caller fall through to an older live copy in another file.
         for record in block.records {
-            if record.oid == vector_id {
-                // Tombstoned or TTL-expired: treat as deleted.
-                if record.is_dead(now_ns) {
-                    return Ok(None);
-                }
-                return Ok(Some(crate::proto::proximadb_v1::VectorRecord::from(
-                    &record,
-                )));
+            if record.oid == vector_id
+                && newest
+                    .as_ref()
+                    .is_none_or(|n: &proximadb_records::ProximaRecord| {
+                        record.version_key().supersedes(&n.version_key())
+                    })
+            {
+                newest = Some(record);
             }
         }
     }
 
-    Ok(None)
+    Ok(newest)
 }
 
 /// Parallel search across multiple SSTables with type-safe FilterExpression
@@ -605,5 +623,46 @@ mod tests {
 
         assert_eq!(stats.sstables_scanned - stats.sstables_pruned, 3);
         assert_eq!(stats.pruning_ratio, 0.7);
+    }
+}
+
+#[cfg(test)]
+mod newest_live_copy_tests {
+    use super::newest_live_copy;
+    use proximadb_records::ProximaRecord;
+
+    fn copy(updated_ns: i64, version: u64, valid_to_ns: Option<i64>) -> ProximaRecord {
+        ProximaRecord {
+            oid: "victim".to_string(),
+            created_at_ns: updated_ns,
+            updated_at_ns: updated_ns,
+            record_version: version,
+            valid_to_ns,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_newer_dead_copy_hides_an_older_live_one_in_any_listing_order() {
+        let now = 1_000_000;
+        let v1_live = copy(100, 1, None);
+        let v2_expired = copy(200, 2, Some(500));
+        let tomb = copy(200, 0, Some(0));
+        for dead in [v2_expired, tomb] {
+            assert!(newest_live_copy([v1_live.clone(), dead.clone()], now).is_none());
+            assert!(newest_live_copy([dead.clone(), v1_live.clone()], now).is_none());
+        }
+    }
+
+    #[test]
+    fn the_newest_live_copy_is_returned() {
+        let now = 1_000_000;
+        let got = newest_live_copy(
+            [copy(100, 1, None), copy(300, 3, None), copy(200, 2, None)],
+            now,
+        )
+        .map(|r| r.record_version);
+        assert_eq!(got, Some(3));
+        assert!(newest_live_copy(Vec::new(), now).is_none());
     }
 }

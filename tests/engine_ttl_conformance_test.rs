@@ -496,6 +496,22 @@ fn run_multi_version_with(engine: &str, case: MultiVersion, opts: MvOpts) {
         "[{engine}/{}] no live fillers returned",
         case.label()
     );
+    // Get-by-id must agree with search: the newest copy is dead, so nothing is
+    // returned (round-2 review: HELIX get-by-id returned the older live v1).
+    let got = db
+        .get_vector(&collection, VICTIM)
+        .unwrap_or_else(|e| panic!("[{engine}] get_vector failed: {e}"));
+    println!(
+        "MV_GET engine={engine} case={}{} found={}",
+        case.label(),
+        opts.label(),
+        got.is_some()
+    );
+    assert!(
+        got.is_none(),
+        "[{engine}/{}] get-by-id returned '{VICTIM}' although its newest copy is dead",
+        case.label()
+    );
     assert!(
         resurfaced.is_none(),
         "[{engine}/{}] an older live copy of '{VICTIM}' resurfaced after its newest \
@@ -598,23 +614,25 @@ mv_case_with!(
         ..MvOpts::default()
     }
 );
-// Review L1/M4: NOVA Euclidean (TD-040 bounds pruning engages) over two files.
+// Review L1/M4 + round 2 M-a: NOVA TD-040 bounds pruning engages only in
+// Approximate mode with the Euclidean metric (Exact sets force_exact), over two
+// files. A reachability probe confirmed these cases reach the prune seed.
 mv_case_with!(
-    nova_overwrite_then_expire_l2,
+    nova_overwrite_then_expire_approx_l2,
     "nova",
     MultiVersion::OverwriteThenExpire,
     MvOpts {
         euclidean: true,
-        ..MvOpts::default()
+        approximate: true,
     }
 );
 mv_case_with!(
-    nova_delete_after_flush_l2,
+    nova_delete_after_flush_approx_l2,
     "nova",
     MultiVersion::DeleteAfterFlush,
     MvOpts {
         euclidean: true,
-        ..MvOpts::default()
+        approximate: true,
     }
 );
 

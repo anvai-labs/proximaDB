@@ -59,22 +59,44 @@ until that is read correctly.
 * **NOVA:** both columnar record builders decode `version` (UInt32, the writer's
   type; Int64 accepted), `updated_at` (falling back to `created_at`, never the
   read-time `now()`) and `expires_at` through one helper
-  (`columnar_query_engine/version_columns.rs`). Search runs in **two passes**:
-  pass 1 builds the index from a **key-only column projection** (ranged GETs of
-  id/timestamp/updated_at/version/expires_at, never the vectors;
-  `nova_ranged_reader::read_version_keys`). Pass 2 scores with the index on
-  **every** path, including TD-040 bounds pruning, which stays ON for multi-file
-  collections. Memory is one file plus O(ids). Get-by-id uses the same order (it
-  was version-first, and returned a record that search hides).
-* **HELIX compaction (review H1):** every L0/level/recluster path resolves the
-  newest copy across its whole input and KEEPS dead winners, because they shadow
-  older copies outside the input. It used to drop every dead row before
+  (`columnar_query_engine/version_columns.rs`).
+  ** **Search, pruning off (every service query):** one pass with no extra I/O.
+     Each file's rows feed the cross-file index, and each file keeps its top-k
+     newest-in-file live candidates. Candidates pass the global newest-copy check
+     only after every file has been seen.
+  ** **Search, TD-040 bounds pruning on (direct-engine callers only):** two passes.
+     Pass 1 is a key-only column projection (ranged GETs of id/timestamp/
+     updated_at/version/expires_at, never vectors), because pruned row groups must
+     still be indexed.
+  ** **Get-by-id** uses the same order. It was version-first, so it returned a
+     record that search hides.
+  ** **Found during review round 2:** NOVA bounds pruning is UNREACHABLE on the
+     service path. `StorageQueryContext` forces `force_exact` for NOVA/VIPER/RAPTOR
+     (`proximadb-storage-traits/src/query.rs`), so TD-040's win never applies to
+     service queries. That is recorded in TD-DELVEC-2. Re-enabling pruning there
+     needs a measured per-query I/O trace (co-design #2), and the pass-1 round-trip
+     cost (HEAD + footer + key GET per file, outside the caching filesystem) must
+     be priced into that decision.
+* **HELIX compaction (review H1, round 2 M-b/M-d):** every L0/level path resolves
+  the newest copy across its whole input and KEEPS dead winners, because they
+  shadow older copies outside the input. A vectorless dead winner takes the vector
+  of the copy it shadows, so Hilbert/centroid pruning keeps the two together. The
+  **max-level recluster purges dead winners**: nothing older lies below, and every
+  max-level file is in its input. So physical GC of dead data now happens there;
+  on develop it happened at every compaction, but by dropping dead rows before
+  resolving, which resurrected older copies. It used to drop every dead row before
   resolving, which rewrote v1 with nothing left to shadow it. Dead winners
   without a vector get an all-zero vector: the block encoder requires one
   dimension per block, and a mixed block fails the whole compaction. They are
   never scored. PCA trains on live records only.
 * **HELIX Approximate (quantized) path (review M2):** resolves and dead-filters
   like the fp32 path, and its hits carry their TTL.
+* **HELIX get-by-id (review round 2):** resolves the newest copy across every
+  SSTable, then dead-filters. It returned the first file holding the id, so a
+  dead newer copy in a later file let the older live copy win.
+* **HELIX extractor:** skips dead rows on `valid_to_ns`. Its "no vector =
+  tombstone" test no longer holds now that compaction keeps dead winners with a
+  vector.
 * **Order precision (review M1):** `VersionKey` compares ns, so a re-insert written
   within the same millisecond as its delete is not hidden. Remaining twins:
   TD-MVCC-ORDER-1.

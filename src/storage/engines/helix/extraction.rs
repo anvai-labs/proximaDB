@@ -83,10 +83,17 @@ impl HelixExtractor {
             // Deserialize block
             match ProximaDataBlock::deserialize(&block_data, None) {
                 Ok(block) => {
+                    // Dead records (tombstoned or TTL-expired) are never
+                    // extracted (16a), decided on the canonical `valid_to_ns`.
+                    // The caller's "no vector = tombstone" test is not enough:
+                    // compaction now keeps dead winners WITH a vector
+                    // (TD-ENGINE-MVCC-1, #2521 review round 2 L-b).
+                    let now_ns = proximadb_kernel::time::now_unix_ns();
                     records.extend(
                         block
                             .records
                             .iter()
+                            .filter(|r| !proximadb_records::is_record_dead(r.valid_to_ns, now_ns))
                             .map(crate::proto::proximadb_v1::VectorRecord::from),
                     );
                 }

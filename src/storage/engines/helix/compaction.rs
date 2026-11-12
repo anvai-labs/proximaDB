@@ -296,10 +296,11 @@ impl LeveledCompactor {
 
         // Newest copy per id across the whole input, dead winners kept
         // (TD-ENGINE-MVCC-1; see `read_sstables_resolved`).
+        let shadowed = shadowed_vectors(pairs.iter().map(|p| &p.0));
         let pairs =
             proximadb_records::keep_newest_by(pairs, |p| p.0.oid.as_str(), |p| p.0.version_key());
         let (records, all_keys): (Vec<ProximaRecord>, Vec<u64>) = pairs.into_iter().unzip();
-        let (all_records, _dead_ids) = materialize_for_write(records);
+        let (all_records, _dead_ids) = materialize_for_write(records, &shadowed);
 
         info!(
             "Merged {} records from pre-sorted L0 files",
@@ -696,11 +697,11 @@ impl LeveledCompactor {
         for path in paths {
             all.extend(self.read_sstable(path).await?);
         }
-        Ok(materialize_for_write(proximadb_records::keep_newest_by(
-            all,
-            |r| r.oid.as_str(),
-            ProximaRecord::version_key,
-        )))
+        let shadowed = shadowed_vectors(all.iter());
+        Ok(materialize_for_write(
+            proximadb_records::keep_newest_by(all, |r| r.oid.as_str(), ProximaRecord::version_key),
+            &shadowed,
+        ))
     }
 
     /// Every row of one SSTable, dead or alive, unresolved.
@@ -764,6 +765,17 @@ impl LeveledCompactor {
         // Newest copy per id across the whole input (TD-ENGINE-MVCC-1).
         let input_paths: Vec<&PathBuf> = max_level_files.iter().map(|s| &s.path).collect();
         let (all_records, dead_ids) = self.read_sstables_resolved(&input_paths).await?;
+        // Physical GC of dead data (review round 2, M-b). The max level is the
+        // oldest; every max-level file is in this input, and levels above can
+        // only hold NEWER copies (which supersede anything here anyway). So a
+        // dead winner here shadows nothing and is dropped. Elsewhere dead
+        // winners are kept, because the copies they shadow may lie outside the
+        // input.
+        let all_records: Vec<VectorRecord> = all_records
+            .into_iter()
+            .filter(|r| !dead_ids.contains(&r.id))
+            .collect();
+        let dead_ids = std::collections::HashSet::new();
 
         // Update PCA model with current data
         let trainable = pca_training_records(&all_records, &dead_ids);
@@ -791,6 +803,7 @@ impl LeveledCompactor {
 /// older copies, which is what it is kept for.
 fn materialize_for_write(
     records: Vec<ProximaRecord>,
+    shadowed: &HashMap<String, Vec<f32>>,
 ) -> (Vec<VectorRecord>, std::collections::HashSet<String>) {
     // Deadness on the canonical `valid_to_ns` (16a), before conversion.
     let now_ns = proximadb_kernel::time::now_unix_ns();
@@ -805,12 +818,41 @@ fn materialize_for_write(
         .map(|r| r.vector.len())
         .find(|&d| d > 0)
         .unwrap_or(0);
-    if dimension > 0 {
-        for r in out.iter_mut().filter(|r| r.vector.is_empty()) {
+    for r in out.iter_mut().filter(|r| r.vector.is_empty()) {
+        // Prefer the vector of the copy this dead winner shadows (review round
+        // 2, M-d): Hilbert keys, block centroids and SSTable ranges are computed
+        // from it, so the tombstone lands where the shadowed copy lives and
+        // pruning cannot read one without the other. Zero only when no copy of
+        // the id is in this input.
+        if let Some(v) = shadowed.get(&r.id) {
+            r.vector = v.clone();
+        } else if dimension > 0 {
             r.vector = vec![0.0; dimension];
         }
     }
     (out, dead_ids)
+}
+
+/// The newest LIVE vector of every id in a compaction input: what a dead winner
+/// without a vector borrows so it stays co-located with the copy it shadows.
+fn shadowed_vectors<'a>(
+    records: impl Iterator<Item = &'a ProximaRecord>,
+) -> HashMap<String, Vec<f32>> {
+    let mut best: HashMap<String, (proximadb_records::VersionKey, Vec<f32>)> = HashMap::new();
+    let now_ns = proximadb_kernel::time::now_unix_ns();
+    for r in records {
+        if proximadb_records::is_record_dead(r.valid_to_ns, now_ns) {
+            continue;
+        }
+        let Some(cell) = r.embeddings.first() else {
+            continue;
+        };
+        let key = r.version_key();
+        if best.get(&r.oid).is_none_or(|(k, _)| key.supersedes(k)) {
+            best.insert(r.oid.clone(), (key, cell.values.to_fp32_owned()));
+        }
+    }
+    best.into_iter().map(|(id, (_, v))| (id, v)).collect()
 }
 
 /// The records PCA may train on: live ones. Dead winners kept by compaction
@@ -1038,6 +1080,67 @@ mod tests {
              older live v1 (which search would resurface): {:?}",
             (copies[0].record_version, copies[0].valid_to_ns)
         );
+    }
+
+    #[test]
+    fn pca_trains_on_live_records_only() {
+        // Review round 2, L-c (mutation B5 survived): dead winners must not
+        // shape the PCA model.
+        let live = vrec("live", 1, 1, None, true);
+        let dead = vrec("dead", 1, 1, Some(0), true);
+        let records = vec![live.clone(), dead];
+        let dead_ids: std::collections::HashSet<String> = ["dead".to_string()].into();
+        let trainable = pca_training_records(&records, &dead_ids);
+        assert_eq!(
+            trainable.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            ["live"]
+        );
+        assert!(matches!(
+            pca_training_records(&records, &std::collections::HashSet::new()),
+            std::borrow::Cow::Borrowed(_)
+        ));
+    }
+
+    #[test]
+    fn tombstone_winner_takes_the_shadowed_copys_vector() {
+        // Review round 2, M-d: a vectorless dead winner borrows the vector of
+        // the copy it shadows, so Hilbert/centroid pruning keeps them together.
+        let mut v1 = proximadb_records::ProximaRecord::from(vrec("victim", 1_000, 1, None, true));
+        v1.embeddings[0] = proximadb_records::EmbeddingCell::new_fp32(
+            "default",
+            "vector",
+            DIM as u32,
+            vec![0.5; DIM],
+        );
+        let tomb = proximadb_records::ProximaRecord::from(vrec("victim", 2_000, 0, Some(0), false));
+        let other = proximadb_records::ProximaRecord::from(vrec("other", 1_000, 1, None, true));
+        let input = vec![v1, tomb, other];
+        let shadowed = shadowed_vectors(input.iter());
+        let resolved = proximadb_records::keep_newest_by(
+            input,
+            |r| r.oid.as_str(),
+            ProximaRecord::version_key,
+        );
+        let (out, dead) = materialize_for_write(resolved, &shadowed);
+        let victim = out
+            .iter()
+            .find(|r| r.id == "victim")
+            .unwrap_or_else(|| panic!("victim"));
+        assert_eq!(
+            victim.vector,
+            vec![0.5; DIM],
+            "tombstone takes the shadowed copy's vector"
+        );
+        assert!(dead.contains("victim") && !dead.contains("other"));
+        // With no shadowed copy in the input, a dimension-matched zero vector.
+        let lone = proximadb_records::ProximaRecord::from(vrec("lone", 2_000, 0, Some(0), false));
+        let live = proximadb_records::ProximaRecord::from(vrec("x", 1, 1, None, true));
+        let (out, _) = materialize_for_write(vec![lone, live], &HashMap::new());
+        let lone = out
+            .iter()
+            .find(|r| r.id == "lone")
+            .unwrap_or_else(|| panic!("lone"));
+        assert_eq!(lone.vector, vec![0.0; DIM]);
     }
 
     #[tokio::test]

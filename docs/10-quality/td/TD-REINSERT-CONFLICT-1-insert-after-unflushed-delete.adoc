@@ -22,3 +22,15 @@ The existence check resolves the id's newest copy (WAL delta first, then flushed
 with `proximadb_records::VersionKey`, and treats it as absent when that copy is dead.
 Pin it with delete-then-insert unflushed, delete-then-insert across a flush, and a
 plain duplicate insert, which must still conflict.
+
+== Hazard this fix ARMS (round-2 review L-a)
+
+`VersionKey` compares ns, but HELIX segments (via `VectorRecord`) and NOVA
+Parquet store `updated_at` in **ms**. Once delete-then-reinsert is allowed, a
+delete and a re-insert written within the same millisecond and flushed together
+tie on `updated_at`, and the same-instant rule makes the tombstone win. The
+re-insert then vanishes after flush, and compaction's `keep_newest_by` discards it
+physically. Fixing this TD therefore requires either ns `updated_at` in segment
+formats (a #8 format change) or a write-path guarantee that a re-insert's
+`updated_at` is strictly greater, at ms granularity, than the tombstone it
+supersedes.

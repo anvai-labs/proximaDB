@@ -2045,7 +2045,11 @@ impl UnifiedStorageFormat for HelixEngine {
         // List all SSTable files in the data directory
         let entries = fs.list(&data_dir).await?;
 
-        // Search through all HELIX SSTable files
+        // Each SSTable's newest copy of the id, then the newest across all of
+        // them, and only then the dead filter (TD-ENGINE-MVCC-1). Returning the
+        // first file that had the id let an older live copy win over a newer
+        // dead one listed later (review round 2).
+        let mut copies: Vec<proximadb_records::ProximaRecord> = Vec::new();
         for entry in entries {
             if entry.name.ends_with(".helix") || entry.name.ends_with(".sstable") {
                 let file_path = format!("{}/{}", data_dir, entry.name);
@@ -2062,27 +2066,26 @@ impl UnifiedStorageFormat for HelixEngine {
                     bloom_filter: None,
                 };
 
-                if let Some(vector) = readers::find_vector_by_id(&fs, &metadata, vector_id).await? {
-                    // Update global cache with found vector
-                    if let Some(orchestrator) =
-                        crate::storage::cache::orchestrator::CrossCacheOrchestrator::global()
-                    {
-                        let cache_key = format!("vector:{}:{}", collection_id, vector_id);
-                        if let Some(vector_cache) = orchestrator.get_vector_cache() {
-                            let _ = vector_cache
-                                .put(
-                                    cache_key,
-                                    proximadb_records::ProximaRecord::from(vector.clone()),
-                                )
-                                .await;
-                        }
-                    }
-                    return Ok(Some(proximadb_records::ProximaRecord::from(vector)));
+                if let Some(copy) = readers::find_vector_by_id(&fs, &metadata, vector_id).await? {
+                    copies.push(copy);
                 }
             }
         }
 
-        Ok(None)
+        let Some(record) = readers::newest_live_copy(copies, proximadb_kernel::time::now_unix_ns())
+        else {
+            return Ok(None);
+        };
+        // Update global cache with the resolved live copy.
+        if let Some(orchestrator) =
+            crate::storage::cache::orchestrator::CrossCacheOrchestrator::global()
+        {
+            let cache_key = format!("vector:{}:{}", collection_id, vector_id);
+            if let Some(vector_cache) = orchestrator.get_vector_cache() {
+                let _ = vector_cache.put(cache_key, record.clone()).await;
+            }
+        }
+        Ok(Some(record))
     }
 
     async fn collection_stats(

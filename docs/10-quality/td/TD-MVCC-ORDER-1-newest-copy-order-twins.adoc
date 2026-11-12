@@ -21,6 +21,8 @@
 | ~`src/storage/engines/nova/engine.rs` NOVA get-by-id~ | **Fixed in #2521.** It was version-first, so a version-2 live copy beat a later version-0 tombstone and get-by-id returned a record that search hides. It now uses `VersionKey`.
 | `src/core/search/mvcc_resolution.rs` `MvccResolver` | effective_version, then created_at_ns (TD-MVCCRES-1)
 | `src/storage/engines/core/formats/columnar/columnar_compaction.rs` (VIPER) | also reads `version` as Int64 (the writer stores UInt32) and compares the ms `expires_at` against a seconds clock
+| `src/storage/engines/nova/engine.rs` NOVA get-by-id column decode (~1636) | third hand-written decoder of version/updated_at/expires_at (UInt32-only `version`); should use `version_columns::VersionColumns` (#19)
+| `src/storage/engines/swift/progressive_search.rs` per-file resolution | resolves by `oid` while the engine resolves by `local_id`-else-`oid`; agrees today only because SWIFT never sets `local_id`
 |===
 
 == Fix shape
