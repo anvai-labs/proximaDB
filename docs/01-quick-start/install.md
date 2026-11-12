@@ -12,7 +12,7 @@ flowchart LR
 
   B --> B1["RPM / DEB / tar.gz / Homebrew"]
   C --> C1["MSI / zip"]
-  D --> D1["Docker or build from source"]
+  D --> D1["DMG (Apple Silicon) / Docker / build from source"]
   E --> E1[Docker Hub]
 
   style B1 fill:#4a90e2,color:#fff
@@ -23,9 +23,10 @@ flowchart LR
 
 Every release is published on
 [GitHub Releases](https://github.com/anvai-labs/proximaDB/releases) with RPM, DEB and MSI
-packages, Linux x86_64 and Windows x86_64 archives, and checksums; the server image is
-`vjsingh1984/proximadb` on Docker Hub, and the `anvai-labs/tap` Homebrew tap installs the Linux
-x86_64 archive. There is no native macOS package yet: on macOS use Docker or build from source.
+packages, Linux x86_64 and Windows x86_64 archives, an Apple Silicon DMG, and checksums; the
+server image is `vjsingh1984/proximadb` on Docker Hub, and the `anvai-labs/tap` Homebrew tap
+installs the Linux x86_64 archive. On macOS, use the Apple Silicon DMG (below), Docker, or
+build from source.
 
 The snippets below resolve the latest release instead of hard-coding a version:
 
@@ -143,6 +144,26 @@ cd $env:LOCALAPPDATA
 - Binaries and config: `C:\Program Files\ProximaDB\` (`config.toml` sits next to the binaries)
 - An empty `C:\ProgramData\ProximaDBData\`, which the shipped config does not use until you point
   its roots there (TD-PKG-2)
+
+### macOS (Apple Silicon - DMG)
+
+```bash
+# Download proximadb-<version>-aarch64-apple-darwin.dmg from GitHub Releases, then:
+hdiutil attach proximadb-<version>-aarch64-apple-darwin.dmg
+cp -r /Volumes/proximadb\ <version> ~/proximadb   # binaries + config template
+hdiutil detach "/Volumes/proximadb <version>"
+
+# The DMG is ad-hoc codesigned but NOT notarized: the first run of a
+# quarantined bare executable needs the quarantine attribute removed or an
+# explicit allow:
+xattr -d com.apple.quarantine ~/proximadb/proximadb-server
+~/proximadb/proximadb-server --version
+```
+
+**What ships:** `proximadb-server`, `proximadb-bench`, `proximadb-migrate`, `README.adoc`,
+`LICENSE`, and `config/config.toml` (the shipped config keeps its roots under `/tmp`; point
+them at a durable folder before running with real data). Requires macOS 11+ on Apple Silicon.
+Linux x86_64 remains the Homebrew tap's target.
 
 ### Linux x86_64 (Homebrew)
 
