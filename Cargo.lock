@@ -6859,7 +6859,7 @@ dependencies = [
  "arrow-data 59.3.2",
  "arrow-flight",
  "arrow-ipc",
- "arrow-ord 59.3.2",
+ "arrow-ord 60.1.0",
  "arrow-schema 59.3.2",
  "arrow-select 59.3.2",
  "async-recursion",
