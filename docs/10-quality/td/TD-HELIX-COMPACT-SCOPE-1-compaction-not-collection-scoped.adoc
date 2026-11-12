@@ -1,0 +1,56 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-HELIX-COMPACT-SCOPE-1: HELIX compaction is not collection-scoped: it merges every collection's and tenant's L0 into one collection's directory
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open, HIGH (filed 2026-11-12).** Found by the #2521 adversarial review round 4 and demonstrated there. Pre-existing on develop. Next PR after #2521.
+| Invariant | CLAUDE.md co-design mandate #3 / path isolation: every object-storage write lands under `DrPathBuilder` (`data/{tenant}/{namespace}/...`), and isolation is structural, never a per-query predicate.
+| Severity | Cross-tenant data movement on every HELIX L0 compaction. The data is not destroyed today, but it is moved out of its own collection's directory.
+|===
+
+== The defect
+
+`FlushExecutionCoordinator::engine_for` (`src/storage/flush_materializer.rs`) caches
+**one engine instance per engine type for the whole process**. So one `HelixEngine`,
+and its single `levels: HashMap<usize, Vec<SStableMetadata>>` (`helix/mod.rs`), holds
+the SSTables of every HELIX collection of every tenant. Search separates them only
+afterwards, with a `collection_data_dir` prefix filter.
+
+Any collection's flush that reaches the L0 trigger spawns
+`compact_l0_to_l1(self.levels)` with `data_dir` set to **that** collection's directory.
+It reads every collection's L0 files and writes the merged output under the
+triggering collection's directory:
+
+* the other collections' records become invisible to their own searches (the prefix
+  filter no longer matches);
+* they become visible to the triggering collection's search;
+* their source files are deleted.
+
+== Why #2521 does not fix it, and what it guards
+
+#2521 makes version resolution **per (collection directory, id)**
+(`collection_scope` / `scoped_id`), so one collection's tombstone can never
+supersede another collection's record with the same id. Round 4 demonstrated that
+permanent cross-collection data loss with a bare-id resolver. #2521 also removed its
+own L1 fold and GC, which made this bug destructive. It does not change which files
+a compaction reads or where it writes.
+
+== Fix shape
+
+. Scope compaction inputs to the triggering collection: filter `l0_files` (and any
+  L1 input) to SSTables under the compactor's `data_dir`, or give each collection its
+  own level map.
+. Serialize compactions per collection (a mutex or in-flight guard); today every
+  flush past the trigger spawns another one, unsynchronized.
+. Delete inputs only after outputs are durable and registered. Delete in an order
+  that can never strand an older copy without its tombstone (folded L1 before L0),
+  or use a manifest edit. Search must fail closed on resolution read errors.
+. Only then re-enable physical GC of dead winners. The design is the round-3 fold
+  (all of the collection's L1 joins an L0 input that holds dead winners; drop them
+  when no deeper level exists), with seam tests for two collections, concurrent
+  compaction and crash ordering.
+
+Acceptance: a two-collection, two-tenant seam test where compacting A never reads,
+moves or deletes B's files, plus the GC tests from the #2521 round-3 design.

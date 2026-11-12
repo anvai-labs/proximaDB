@@ -27,14 +27,12 @@ scan skips:
   Where pruning does run (direct-engine callers), stage 1 pays a key-only pass 1
   (HEAD + footer + key-column GET per file). Deletion vectors make that pass
   unnecessary.
-* **GC of dead data (HELIX).** Production runs only L0 -> L1 compaction
-  (`compact_level_to_next` and `recluster_max_level` have no production callers).
-  When the L0 input holds a dead winner, all of L1 is folded into the input. With
-  no level >= 2 holding files, dead winners are then dropped together with the
-  copies they shadow (real GC). The cost is that L1 is rewritten whenever
-  deletes/TTL expiry are present: write amplification of O(L1) per such
-  compaction. DVs remove it, since a DV bit lets compaction drop a copy without
-  meeting it. With a level >= 2 present (legacy data), dead winners are kept.
+* **GC of dead data (HELIX).** HELIX compaction keeps dead winners: older copies
+  may live outside its input. Physical GC (fold the collection's L1 into an L0 input
+  that holds dead winners, then drop them when no deeper level exists) is designed
+  but **deliberately not enabled**. It is unsafe until compaction is
+  collection-scoped and serialized (TD-HELIX-COMPACT-SCOPE-1). Until then,
+  tombstones and expired rows cost GB-month for TTL workloads.
 * **GC of dead data (NOVA).** NOVA compaction keeps tombstones and expired rows
   (it cannot know whether older copies exist outside its input). That is a
   GB-month cost for TTL workloads until DVs land.
