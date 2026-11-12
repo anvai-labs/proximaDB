@@ -14,7 +14,7 @@ name = "proximadb_storage_encryption"
 path = "src/lib.rs"
 
 [dependencies]
-aes-gcm = "0.10"
+aes-gcm = "0.11"
 anyhow.workspace = true
 async-trait.workspace = true
 bincode.workspace = true
