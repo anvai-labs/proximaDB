@@ -17,7 +17,7 @@ path = "src/lib.rs"
 anyhow.workspace = true
 async-trait.workspace = true
 chrono.workspace = true
-nom = "7"
+nom = "8"
 proximadb-data-model = { path = "../../foundation/proximadb-data-model" }
 proximadb-kernel = { path = "../../foundation/proximadb-kernel" }
 proximadb-records = { path = "../../foundation/proximadb-records" }

@@ -15,7 +15,7 @@ path = "src/lib.rs"
 
 [dependencies]
 async-trait.workspace = true
-nom = "7"
+nom = "8"
 proximadb-kernel = { path = "../../foundation/proximadb-kernel" }
 proximadb-proto = { path = "../../foundation/proximadb-proto" }
 proximadb-query-filter = { path = "../proximadb-query-filter" }
