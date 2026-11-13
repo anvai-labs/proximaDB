@@ -1,0 +1,76 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-DELVEC-2: deletion vectors must also mark SUPERSEDED copies, and cover HELIX/NOVA/SWIFT, so newest-copy correctness is structural
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open (filed 2026-11-11).** Stage 2 of the staged plan agreed for TD-ENGINE-MVCC-1. Stage 1 (read-time newest-copy resolution) landed in the same PR as this TD.
+| Design | ADR-025 (deletion vectors layered over MVCC). This TD extends its DV-set events and engine coverage. It does not replace MVCC.
+| Relates to | TD-DELVEC-1 (SST/PAX cold-tier DV, default-OFF), TD-ENGINE-MVCC-1, TD-RAPTOR-TTL-1.
+| Owner | Storage engines + the vector delete/upsert service path.
+|===
+
+== Why stage 1 is not the end state
+
+Stage 1 (TD-ENGINE-MVCC-1) makes each engine's flushed scan resolve the newest copy
+of an id, using the shared `proximadb_records::VersionKey` order, before applying
+the dead filter. That is exact over the rows a scan **reads**. It cannot see what a
+scan skips:
+
+* **HELIX** centroid/Hilbert block pruning and **SWIFT** per-file top-k: a newer
+  copy in a block or rank the scan never reads cannot shadow an older one. Suppose
+  an upsert moves a vector far from the query, then the new copy expires or is
+  deleted. The old copy can still resurface.
+* **NOVA** TD-040 vector-bounds pruning is **unreachable on the service path**:
+  `StorageQueryContext` forces `force_exact` for NOVA (found in the #2521 review).
+  Where pruning does run (direct-engine callers), stage 1 pays a key-only pass 1
+  (HEAD + footer + key-column GET per file). Deletion vectors make that pass
+  unnecessary.
+* **GC of dead data (HELIX).** HELIX compaction keeps dead winners: older copies
+  may live outside its input. Physical GC (fold the collection's L1 into an L0 input
+  that holds dead winners, then drop them when no deeper level exists) is designed
+  but **deliberately not enabled**. It is unsafe until compaction is
+  collection-scoped and serialized (TD-HELIX-COMPACT-SCOPE-1). Until then,
+  tombstones and expired rows cost GB-month for TTL workloads.
+* **GC of dead data (NOVA).** NOVA compaction keeps tombstones and expired rows
+  (it cannot know whether older copies exist outside its input). That is a
+  GB-month cost for TTL workloads until DVs land.
+* **Superseded copies in extraction/export:** the HELIX extractor now skips dead
+  rows but does not resolve versions, so an older live copy can still be
+  extracted. A DV on the superseded copy closes that too.
+
+The structural fix is the one ADR-025 already chose for deletes: decide visibility
+**at the older copy's segment**, not by finding the newer copy at read time.
+
+== The gaps against ADR-025
+
+. **Deletes only.** Today a DV bit is set only by a delete
+  (`legacy.rs` delete path → `dv_store.mark_deleted`). An upsert that supersedes a
+  flushed v1 does not mark v1. Superseding is a delete of the old copy, so it must
+  set the same bit, keyed by the upsert's WAL LSN, exactly as deletes are.
+. **SST/PAX only.** DVs need an OID→position resolver inside the segment format
+  (the PAX footer region, WI-2c). HELIX blocks, NOVA Parquet and SWIFT
+  superblocks have none.
+. **Default-OFF.** `cold-deletion-vectors` is off even for SST.
+
+== Plan
+
+Each step ships default-OFF, mixed-read-safe and detected by a marker (#8).
+
+. **Supersede-on-upsert (SST first).** When an upsert's id has a flushed copy, set
+  that copy's DV bit at the upsert's durable LSN, then gate it with the
+  multi-version cases of `tests/engine_ttl_conformance_test.rs` running with the
+  feature ON.
+. **Per-engine resolver.** Add the OID→position map to the NOVA Parquet footer
+  (key-value metadata or a sidecar alongside `.nova_meta`), to HELIX segments and to
+  SWIFT superblocks. Readers apply the DV at segment scan.
+. **Re-enable pruning.** With a DV covering an engine, the NOVA multi-file
+  bounds-prune restriction can lift. Keep stage 1's read-time resolution as
+  defence-in-depth (it is idempotent with the DV, like the 16a predicate).
+. **Default-ON decision** per engine, once recall@k and the conformance matrix hold.
+
+== Acceptance
+
+The multi-version conformance cases pass with block pruning forced ON, including a
+variant where v2's vector is moved far from the query (the case stage 1 cannot see).

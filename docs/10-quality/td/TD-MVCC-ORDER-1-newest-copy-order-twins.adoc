@@ -1,0 +1,33 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-MVCC-ORDER-1: "which copy is newest" is still re-derived in several places; route them through `VersionKey`
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open (filed 2026-11-11).** Found by the #2521 adversarial review (M1). #2521 defines the shared order (`proximadb_records::VersionKey`: `updated_at_ns`, then a same-instant tombstone wins, then `version`). The service merge (`resolve_freshest`) and every engine's flushed scan and compaction now use it. The sites below still carry their own copy.
+| Invariant | CLAUDE.md #12/#19 (no silent duplicates) and 16a/16d: every read boundary must agree on which copy of an id wins, or one surface shows a record another hides.
+| Relates to | TD-MVCCRES-1 (MvccResolver's third ordering), TD-MEMTABLE-MVCC-1, TD-ENGINE-MVCC-1.
+|===
+
+== Twins still live
+
+[cols="2,3", options="header"]
+|===
+| Site | Order it uses
+| `src/services/operations/vectors/read.rs` `is_fresher` (get-by-id + list merge, 7 call sites) | ns `updated_at`
+| `src/storage/memtable/implementations/global_partitioned.rs` `mvcc_is_newer` | ns
+| `src/storage/persistence/write_ahead_log/mod.rs` `unflushed_supersedes` | ns
+| ~`src/storage/engines/nova/engine.rs` NOVA get-by-id~ | **Fixed in #2521.** It was version-first, so a version-2 live copy beat a later version-0 tombstone and get-by-id returned a record that search hides. It now uses `VersionKey`.
+| `src/core/search/mvcc_resolution.rs` `MvccResolver` | effective_version, then created_at_ns (TD-MVCCRES-1)
+| `src/storage/engines/core/formats/columnar/columnar_compaction.rs` (VIPER) | also reads `version` as Int64 (the writer stores UInt32) and compares the ms `expires_at` against a seconds clock
+| `src/storage/engines/nova/engine.rs` NOVA get-by-id column decode (~1636) | third hand-written decoder of version/updated_at/expires_at (UInt32-only `version`); should use `version_columns::VersionColumns` (#19)
+| `src/storage/engines/swift/progressive_search.rs` per-file resolution | resolves by `oid` while the engine resolves by `local_id`-else-`oid`; agrees today only because SWIFT never sets `local_id`
+|===
+
+== Fix shape
+
+Replace each body with `VersionKey::supersedes` (building the key from the site's
+fields at ns precision). Pin each site with the cross-ordering case: a same-instant
+tombstone vs a live copy with a higher version, in both input orders, plus a
+sub-millisecond re-insert after a delete.

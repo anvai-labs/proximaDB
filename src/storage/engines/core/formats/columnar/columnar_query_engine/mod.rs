@@ -12,6 +12,7 @@ pub mod pipeline;
 pub mod query_metrics;
 pub mod result_cache;
 pub mod vectorized_executor;
+pub(crate) mod version_columns;
 
 // Re-export main types for convenience with semantic names
 pub use adaptive_filter_executor::{BranchedFilterExecutor, FilterPath};

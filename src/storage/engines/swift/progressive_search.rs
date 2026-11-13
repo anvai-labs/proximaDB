@@ -719,10 +719,21 @@ async fn phase4_full_precision(
         }
     }
 
-    // Dead records (tombstoned or TTL-expired) never reach a read and must
-    // not take a top-k slot (CLAUDE.md 16a; engine TTL conformance).
+    // Within-file newest-copy resolution (TD-ENGINE-MVCC-1): keep only each
+    // id's newest copy in this file. The DEAD filter is NOT applied here: a
+    // newest copy that is dead must reach the caller as a marker so it can
+    // shadow an older live copy in ANOTHER file (the caller resolves across
+    // files, then dead-filters). Dead markers never take a top-k slot below.
     let now_ns = proximadb_kernel::time::now_unix_ns();
-    all_results.retain(|(record, _)| !record.is_dead(now_ns));
+    let mut newest = proximadb_records::NewestVersionIndex::new();
+    for (record, _) in &all_results {
+        newest.observe(&record.oid, record.version_key());
+    }
+    all_results.retain(|(record, _)| newest.is_newest(&record.oid, &record.version_key()));
+    let (dead_markers, live): (Vec<_>, Vec<_>) = all_results
+        .into_iter()
+        .partition(|(record, _)| record.is_dead(now_ns));
+    let mut all_results = live;
 
     // Apply final metadata filter if needed
     if let Some(f) = filter {
@@ -757,10 +768,12 @@ async fn phase4_full_precision(
         .into_iter()
         .map(|(record, _)| (record.oid.clone(), record))
         .collect();
-    let final_records: Vec<ProximaRecord> = top_results
+    let mut final_records: Vec<ProximaRecord> = top_results
         .into_iter()
         .filter_map(|search_record| by_id.remove(&search_record.id))
         .collect();
+    // Newest-but-dead copies ride along as markers, after the top-k.
+    final_records.extend(dead_markers.into_iter().map(|(record, _)| record));
 
     Ok(final_records)
 }

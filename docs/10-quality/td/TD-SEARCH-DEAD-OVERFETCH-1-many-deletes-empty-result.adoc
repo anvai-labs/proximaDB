@@ -1,0 +1,45 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-SEARCH-DEAD-OVERFETCH-1: deleting many near neighbours makes vector search return ZERO results (all engines, even unflushed)
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open (filed 2026-11-11).** Found by the #2521 adversarial review (INFO-1). Reproduced on SST, HELIX and NOVA, **before flush**, so it is independent of the engine scans #2521 changes.
+| Invariant | A top-k search over a collection with at least k live matching records returns k results. Dead records may cost recall work; they must never empty the result.
+| Severity | HIGH for affected workloads: a "delete the 100 records nearest a query" pattern (e.g. retracting a document's chunks) makes that query return nothing.
+|===
+
+== Reproduction
+
+Insert 120 records near a query vector plus fillers. Delete the 100 nearest. Then
+`unified_search_native(k = 10)` returns **0** results, although 20+ live records
+remain.
+
+== Likely cause
+
+Tombstone markers (and, after flush, superseded copies) are scored and occupy the
+service's over-fetch window, typically a fixed multiple of k. After the dead
+filter runs, nothing is left, and nothing re-fetches. Engine-level per-segment
+truncation before resolution (#2521 review L3) is the same shape one layer down.
+
+== Fix shape
+
+Dead and superseded copies must not consume the candidate budget:
+
+* engines exclude them before their top-k (#2521 does this for flushed
+  HELIX/NOVA/SWIFT scans);
+* the WAL leg does the same;
+* the service over-fetch becomes adaptive: re-fetch with a larger window while the
+  post-filter result is short of k and the scan is not exhausted.
+
+Add the 100-of-120 case to `tests/engine_ttl_conformance_test.rs` as the acceptance
+gate, per engine, unflushed and flushed.
+
+== Related, same review
+
+* **INFO-2 / TD-REINSERT-CONFLICT-1:** re-inserting an id after deleting it within
+  one unflushed delta fails with `INSERT_CONFLICT ... already exists`, because the
+  conflict check ignores the unflushed tombstone.
+* **INFO-3:** SST hits report `version = Some(0)` for records written with
+  `record_version` 1 (HELIX/NOVA report 1).

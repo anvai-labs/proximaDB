@@ -209,7 +209,7 @@ impl ProgressiveSearchCoordinator {
         >,
         quantization_level: UnifiedQuantizationLevel,
     ) -> Result<Vec<OptimizedSearchRecord>> {
-        let mut priority_queue = BoundedPriorityQueue::new(k);
+        let mut scans = Vec::with_capacity(sstables.len());
 
         for sstable in sstables {
             // Read SSTable blocks with quantized vectors
@@ -225,14 +225,12 @@ impl ProgressiveSearchCoordinator {
                 )
                 .await?;
 
-            // Insert results into bounded queue
-            for result in results {
-                priority_queue.try_insert(result);
-            }
+            scans.push(results);
         }
 
-        // Return sorted results
-        Ok(priority_queue.into_sorted_vec())
+        // Top-k over each id's newest copy across every SSTable
+        // (TD-ENGINE-MVCC-1), the same resolution as the fp32 path.
+        Ok(super::readers::resolve_across_sstables(scans, k))
     }
 
     /// Refine candidates with higher precision quantization
@@ -305,7 +303,7 @@ impl ProgressiveSearchCoordinator {
             crate::storage::persistence::filesystem::caching_filesystem::UnifiedCachingFilesystem,
         >,
     ) -> Result<Vec<OptimizedSearchRecord>> {
-        let mut priority_queue = BoundedPriorityQueue::new(k);
+        let mut scans = Vec::with_capacity(sstables.len());
 
         for sstable in sstables {
             let results = super::readers::search_sstable(
@@ -323,14 +321,12 @@ impl ProgressiveSearchCoordinator {
             )
             .await?;
 
-            // Insert results into bounded queue
-            for result in results {
-                priority_queue.try_insert(result);
-            }
+            scans.push(results);
         }
 
-        // Return sorted results
-        Ok(priority_queue.into_sorted_vec())
+        // Top-k over each id's newest copy across every SSTable
+        // (TD-ENGINE-MVCC-1).
+        Ok(super::readers::resolve_across_sstables(scans, k))
     }
 
     /// Search a single SSTable with quantization
@@ -349,7 +345,7 @@ impl ProgressiveSearchCoordinator {
             crate::storage::persistence::filesystem::caching_filesystem::UnifiedCachingFilesystem,
         >,
         quantization_level: &UnifiedQuantizationLevel,
-    ) -> Result<Vec<OptimizedSearchRecord>> {
+    ) -> Result<super::readers::HelixSstableResults> {
         let _ = (distance_metric, quantization_level); // Currently unused, will be used for future optimizations
         // Determine if we should use binary or INT8 based on quantization level
         use proximadb_quantization_model::QuantizationScheme;

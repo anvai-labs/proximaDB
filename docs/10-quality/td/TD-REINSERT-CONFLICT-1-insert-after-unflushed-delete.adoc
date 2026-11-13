@@ -1,0 +1,36 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-REINSERT-CONFLICT-1: inserting an id deleted in the same unflushed delta fails with INSERT_CONFLICT
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open (filed 2026-11-11).** Found by the #2521 adversarial review (INFO-2).
+| Invariant | CLAUDE.md 16d (a tombstone in the delta suppresses the live copy): a deleted id is free to be inserted again.
+|===
+
+== The defect
+
+`insert` of an id whose only unflushed state is a tombstone fails with
+`INSERT_CONFLICT: record '<id>' already exists`. The existence check treats the
+deleted copy as present and does not apply the canonical dead predicate
+(`is_record_dead`) to the id's newest unflushed copy.
+
+== Fix shape
+
+The existence check resolves the id's newest copy (WAL delta first, then flushed)
+with `proximadb_records::VersionKey`, and treats it as absent when that copy is dead.
+Pin it with delete-then-insert unflushed, delete-then-insert across a flush, and a
+plain duplicate insert, which must still conflict.
+
+== Hazard this fix ARMS (round-2 review L-a)
+
+`VersionKey` compares ns, but HELIX segments (via `VectorRecord`) and NOVA
+Parquet store `updated_at` in **ms**. Once delete-then-reinsert is allowed, a
+delete and a re-insert written within the same millisecond and flushed together
+tie on `updated_at`, and the same-instant rule makes the tombstone win. The
+re-insert then vanishes after flush, and compaction's `keep_newest_by` discards it
+physically. Fixing this TD therefore requires either ns `updated_at` in segment
+formats (a #8 format change) or a write-path guarantee that a re-insert's
+`updated_at` is strictly greater, at ms granularity, than the tombstone it
+supersedes.

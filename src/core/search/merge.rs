@@ -120,31 +120,28 @@ pub enum CandidateSource {
     Storage = 2,
 }
 
+fn hit_version_key(record: &OptimizedSearchRecord) -> proximadb_records::VersionKey {
+    proximadb_records::VersionKey {
+        // Hits carry ms; scaling to ns keeps the hit-vs-hit order identical
+        // (MIN stays MIN: `saturating_mul`).
+        updated_at_ns: record
+            .updated_at
+            .unwrap_or(i64::MIN)
+            .saturating_mul(1_000_000),
+        tombstone: is_wal_tombstone(record),
+        version: u64::from(record.version.unwrap_or(0)),
+    }
+}
+
+/// The shared newest-copy order (`proximadb_records::VersionKey`, also used by
+/// every engine's flushed scan), then the source priority as the final tiebreak.
 fn supersedes(
     candidate: &(CandidateSource, OptimizedSearchRecord),
     current: &(CandidateSource, OptimizedSearchRecord),
 ) -> bool {
-    let (cu, ru) = (
-        candidate.1.updated_at.unwrap_or(i64::MIN),
-        current.1.updated_at.unwrap_or(i64::MIN),
-    );
-    if cu != ru {
-        return cu > ru;
-    }
-    // Same timestamp: a tombstone wins BEFORE versions are compared (mandate
-    // 16d). Tombstones carry record_version 0 while live versions can carry
-    // >= 1 (SQL UPDATE, gRPC client versions), so a version-first tie-break
-    // let a same-instant live copy beat its own delete.
-    let (ct, rt) = (is_wal_tombstone(&candidate.1), is_wal_tombstone(&current.1));
-    if ct != rt {
-        return ct;
-    }
-    let (cv, rv) = (
-        candidate.1.version.unwrap_or(0),
-        current.1.version.unwrap_or(0),
-    );
-    if cv != rv {
-        return cv > rv;
+    let (ck, rk) = (hit_version_key(&candidate.1), hit_version_key(&current.1));
+    if ck != rk {
+        return ck.supersedes(&rk);
     }
     candidate.0 < current.0
 }

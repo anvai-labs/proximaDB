@@ -932,6 +932,287 @@ pub fn is_record_dead(valid_to_ns: Option<i64>, now_ns: i64) -> bool {
     }
 }
 
+/// The "which copy of an id is the newest" order: the single rule shared by
+/// the service merge (`resolve_freshest`, src/core/search/merge.rs) and every
+/// engine's flushed-segment scan, so the two can never disagree about which
+/// version wins (TD-ENGINE-MVCC-1, TD-MVCCRES-1).
+///
+/// Order: `updated_at_ns` first; on a tie a tombstone wins BEFORE versions
+/// are compared (mandate 16d: tombstones carry `record_version` 0 while live
+/// versions can carry >= 1, so version-first let a same-instant live copy
+/// beat its own delete); then `version`. Pick the winner FIRST, then apply
+/// the dead filter to it (the PR #2063 rule). Filtering dead copies before
+/// resolution lets an older live copy resurface.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VersionKey {
+    /// Last-write time in NANOSECONDS. Full precision on purpose: the WAL
+    /// (`unflushed_supersedes`), memtable and get-by-id orders compare ns, and a
+    /// ms-truncated key would turn a re-insert written within the same
+    /// millisecond as its delete into a "same-instant tombstone wins" and hide
+    /// it. Search hits carry ms on the wire; their keys are ms * 1e6, which keeps
+    /// the hit-vs-hit order exactly as before.
+    pub updated_at_ns: i64,
+    /// `valid_to_ns == Some(0)`.
+    pub tombstone: bool,
+    pub version: u64,
+}
+
+impl VersionKey {
+    /// Strictly newer than `other` under the shared order. Equal keys are not
+    /// newer (the caller keeps whichever it saw first).
+    pub fn supersedes(&self, other: &Self) -> bool {
+        if self.updated_at_ns != other.updated_at_ns {
+            return self.updated_at_ns > other.updated_at_ns;
+        }
+        if self.tombstone != other.tombstone {
+            return self.tombstone;
+        }
+        self.version > other.version
+    }
+}
+
+/// Keeps, per id, the key of its newest copy among everything a scan has seen.
+/// Engines feed EVERY row they read (live, tombstoned or expired) through
+/// [`NewestVersionIndex::observe`] before scoring, then score a row only if
+/// [`NewestVersionIndex::is_newest`] holds and it is not dead.
+#[derive(Debug, Default)]
+pub struct NewestVersionIndex {
+    newest: std::collections::HashMap<String, VersionKey>,
+}
+
+impl NewestVersionIndex {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn observe(&mut self, id: &str, key: VersionKey) {
+        match self.newest.get_mut(id) {
+            Some(current) => {
+                if key.supersedes(current) {
+                    *current = key;
+                }
+            }
+            None => {
+                self.newest.insert(id.to_string(), key);
+            }
+        }
+    }
+
+    /// `key` is the newest copy of `id` seen (ties count as newest, so two
+    /// byte-identical copies of one version both pass; the top-k layer
+    /// already de-duplicates by id).
+    pub fn is_newest(&self, id: &str, key: &VersionKey) -> bool {
+        self.newest
+            .get(id)
+            .is_none_or(|newest| !newest.supersedes(key))
+    }
+
+    /// Fold another scan's index in (e.g. one per segment, merged at the end).
+    pub fn merge(&mut self, other: NewestVersionIndex) {
+        for (id, key) in other.newest {
+            match self.newest.get_mut(&id) {
+                Some(current) => {
+                    if key.supersedes(current) {
+                        *current = key;
+                    }
+                }
+                None => {
+                    self.newest.insert(id, key);
+                }
+            }
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.newest.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.newest.is_empty()
+    }
+}
+
+/// Keep only each id's newest copy (the shared [`VersionKey`] order),
+/// preserving the input order of the survivors. Dead winners (tombstones,
+/// expired) are KEPT: a compaction rewriting its input must keep them so they
+/// go on shadowing older copies outside that input. Used by every engine's
+/// compaction so they cannot drift apart (TD-ENGINE-MVCC-1).
+pub fn keep_newest_by<T>(
+    items: Vec<T>,
+    id: impl Fn(&T) -> &str,
+    key: impl Fn(&T) -> VersionKey,
+) -> Vec<T> {
+    let mut index = NewestVersionIndex::new();
+    for item in &items {
+        index.observe(id(item), key(item));
+    }
+    // Ties (byte-identical keys) keep only the first occurrence.
+    let mut taken: std::collections::HashSet<String> = std::collections::HashSet::new();
+    items
+        .into_iter()
+        .filter(|item| {
+            let item_id = id(item);
+            index.is_newest(item_id, &key(item)) && taken.insert(item_id.to_string())
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod version_key_tests {
+    use super::*;
+
+    fn k(updated_at_ns: i64, tombstone: bool, version: u64) -> VersionKey {
+        VersionKey {
+            updated_at_ns,
+            tombstone,
+            version,
+        }
+    }
+
+    #[test]
+    fn order_is_time_then_tombstone_then_version() {
+        assert!(
+            k(2, false, 1).supersedes(&k(1, true, 9)),
+            "later write wins outright"
+        );
+        assert!(
+            k(1, true, 0).supersedes(&k(1, false, 9)),
+            "same-instant tombstone beats any version (16d)"
+        );
+        assert!(k(1, false, 3).supersedes(&k(1, false, 2)), "then version");
+        assert!(
+            !k(1, false, 2).supersedes(&k(1, false, 2)),
+            "equal is not newer"
+        );
+    }
+
+    #[test]
+    fn order_is_antisymmetric_over_a_grid() {
+        let keys: Vec<VersionKey> = [0_i64, 1, 2]
+            .iter()
+            .flat_map(|&t| {
+                [false, true]
+                    .into_iter()
+                    .flat_map(move |d| [0_u64, 1, 2].into_iter().map(move |v| k(t, d, v)))
+            })
+            .collect();
+        for a in &keys {
+            for b in &keys {
+                assert!(
+                    !(a.supersedes(b) && b.supersedes(a)),
+                    "{a:?} and {b:?} each supersede the other"
+                );
+                if a != b {
+                    assert!(
+                        a.supersedes(b) || b.supersedes(a),
+                        "{a:?} vs {b:?} unordered"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn index_tracks_newest_regardless_of_observation_order() {
+        let (old, new) = (k(1, false, 1), k(2, true, 0));
+        for order in [[old, new], [new, old]] {
+            let mut idx = NewestVersionIndex::new();
+            for key in order {
+                idx.observe("a", key);
+            }
+            assert!(idx.is_newest("a", &new));
+            assert!(!idx.is_newest("a", &old), "older copy must be shadowed");
+        }
+        assert!(
+            NewestVersionIndex::new().is_newest("unseen", &old),
+            "unseen ids pass"
+        );
+    }
+
+    #[test]
+    fn merge_keeps_the_newest_across_indexes() {
+        let mut a = NewestVersionIndex::new();
+        a.observe("x", k(1, false, 1));
+        let mut b = NewestVersionIndex::new();
+        b.observe("x", k(3, false, 1));
+        b.observe("y", k(1, false, 1));
+        a.merge(b);
+        assert!(!a.is_newest("x", &k(1, false, 1)));
+        assert!(a.is_newest("x", &k(3, false, 1)));
+        assert_eq!(a.len(), 2);
+    }
+
+    #[test]
+    fn record_key_uses_updated_ns_else_created() {
+        let absent = ProximaRecord {
+            created_at_ns: 5_000_000,
+            updated_at_ns: 0,
+            record_version: 4,
+            valid_to_ns: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(absent.version_key(), k(5_000_000, true, 4));
+        // updated_at wins even when created_at is later (client timestamps):
+        // the same rule the WAL hit and SST use.
+        let both = ProximaRecord {
+            created_at_ns: 9_000,
+            updated_at_ns: 7_000,
+            ..Default::default()
+        };
+        assert_eq!(both.version_key().updated_at_ns, 7_000);
+    }
+
+    #[test]
+    fn sub_millisecond_reinsert_beats_its_delete() {
+        // Review M1: tombstone at ...100_000 ns, live re-insert at ...900_000 ns
+        // (same millisecond). ms truncation made the tombstone win; ns must not.
+        let tomb = k(1_700_000_000_000_100_000, true, 0);
+        let live = k(1_700_000_000_000_900_000, false, 1);
+        assert!(live.supersedes(&tomb));
+        assert!(!tomb.supersedes(&live));
+    }
+
+    #[test]
+    fn keep_newest_by_is_order_independent_and_order_preserving() {
+        let items = vec![
+            ("a", k(1, false, 1)),
+            ("b", k(1, false, 1)),
+            ("a", k(2, false, 2)),
+        ];
+        let out = keep_newest_by(items.clone(), |i| i.0, |i| i.1);
+        assert_eq!(out, vec![("b", k(1, false, 1)), ("a", k(2, false, 2))]);
+        let mut rev = items;
+        rev.reverse();
+        let out = keep_newest_by(rev, |i| i.0, |i| i.1);
+        assert_eq!(out, vec![("a", k(2, false, 2)), ("b", k(1, false, 1))]);
+        // A same-instant tombstone survives (it must keep shadowing copies
+        // outside the input).
+        let out = keep_newest_by(
+            vec![("a", k(5, false, 3)), ("a", k(5, true, 0))],
+            |i| i.0,
+            |i| i.1,
+        );
+        assert_eq!(out, vec![("a", k(5, true, 0))]);
+    }
+}
+
+impl ProximaRecord {
+    /// This copy's position in the shared newest-copy order. Uses
+    /// `updated_at_ns` (as the WAL hit and SST do); `created_at_ns` only when no
+    /// last-write time was recorded (0).
+    pub fn version_key(&self) -> VersionKey {
+        VersionKey {
+            updated_at_ns: if self.updated_at_ns != 0 {
+                self.updated_at_ns
+            } else {
+                self.created_at_ns
+            },
+            tombstone: self.valid_to_ns == Some(0),
+            version: self.record_version,
+        }
+    }
+}
+
 impl ProximaRecord {
     /// Returns true when this record is a tombstone marker at `snapshot_time_ns`.
     ///

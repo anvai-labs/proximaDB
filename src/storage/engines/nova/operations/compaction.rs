@@ -12,6 +12,7 @@ use crate::storage::engines::core::formats::columnar::{
 };
 use crate::storage::persistence::filesystem::FilesystemFactory;
 use crate::storage::traits::{CompactionParameters, CompactionResult};
+use proximadb_records::ProximaRecord;
 
 /// Handles all compaction operations for NOVA engine
 pub struct NovaCompactionOperations {
@@ -135,25 +136,18 @@ impl NovaCompactionOperations {
             input_files.len()
         );
 
-        // Sort by ID for better locality
-        all_records.sort_by(|a, b| a.id.cmp(&b.id));
-
-        // Remove duplicates keeping latest version (by timestamp)
-        let mut unique_records = Vec::new();
-        let mut prev_id: Option<String> = None;
-
-        for record in all_records {
-            if let Some(ref pid) = prev_id {
-                if &record.id != pid {
-                    unique_records.push(record.clone());
-                    prev_id = Some(record.id);
-                }
-                // Skip duplicates (keep first occurrence after sort)
-            } else {
-                unique_records.push(record.clone());
-                prev_id = Some(record.id);
-            }
-        }
+        // Keep exactly the NEWEST copy of each id, under the same order the
+        // read path uses (`proximadb_records::VersionKey`; TD-ENGINE-MVCC-1).
+        // This used to sort by id and keep the FIRST occurrence, which is
+        // file-listing order, not newest: compaction could keep v1 and discard
+        // v2 or its tombstone, permanently resurrecting the old copy.
+        // Tombstones are kept (a newest-copy tombstone must keep shadowing
+        // copies in files outside this compaction set); TTL rows are kept with
+        // their expiry and are hidden by the read path.
+        let unique_records: Vec<VectorRecord> = keep_newest_per_id(all_records)
+            .iter()
+            .map(VectorRecord::from)
+            .collect();
 
         let entries_removed = (original_count - unique_records.len()) as u64;
         info!(
@@ -220,7 +214,7 @@ impl NovaCompactionOperations {
         &self,
         file_path: &str,
         collection_id: &str,
-    ) -> Result<Vec<VectorRecord>> {
+    ) -> Result<Vec<ProximaRecord>> {
         // Get filesystem
         let fs = self.filesystem.get_filesystem(file_path)?;
 
@@ -243,9 +237,10 @@ impl NovaCompactionOperations {
             "nova".to_string(),
         )?;
 
-        // Read all records
-        let records = reader.read_all_records(100000, None).await?;
-        Ok(records.iter().map(VectorRecord::from).collect())
+        // `0` is the START OFFSET, not a batch size. This passed 100000, which
+        // skipped the first 100,000 rows of any larger file; compaction then
+        // wrote the output without them and deleted the inputs (data loss).
+        reader.read_all_records(0, None).await
     }
 
     /// Write compacted file using HybridParquetWriter
@@ -333,5 +328,66 @@ impl NovaCompactionOperations {
             "{}/nova_{}_compacted_{}_{}.parquet",
             data_path, collection_id, timestamp, uuid
         )
+    }
+}
+
+/// Keep exactly the newest copy of each id under the shared order
+/// (`proximadb_records::VersionKey`), sorted by id for locality. Tombstones are
+/// kept: a newest-copy tombstone must keep shadowing copies in files outside the
+/// compaction set.
+fn keep_newest_per_id(records: Vec<ProximaRecord>) -> Vec<ProximaRecord> {
+    let mut out =
+        proximadb_records::keep_newest_by(records, |r| r.oid.as_str(), ProximaRecord::version_key);
+    out.sort_by(|a, b| a.oid.cmp(&b.oid));
+    out
+}
+
+#[cfg(test)]
+mod keep_newest_tests {
+    use super::*;
+
+    fn rec(oid: &str, updated_ms: i64, version: u64, valid_to_ns: Option<i64>) -> ProximaRecord {
+        ProximaRecord {
+            oid: oid.to_string(),
+            created_at_ns: updated_ms * 1_000_000,
+            updated_at_ns: updated_ms * 1_000_000,
+            record_version: version,
+            valid_to_ns,
+            ..Default::default()
+        }
+    }
+
+    fn pick(input: Vec<ProximaRecord>) -> ProximaRecord {
+        let out = keep_newest_per_id(input);
+        assert_eq!(out.len(), 1, "one copy per id");
+        out.into_iter().next().unwrap_or_default()
+    }
+
+    #[test]
+    fn newest_wins_in_either_input_order() {
+        // The old dedup kept the FIRST occurrence: order-dependent. Pin both orders.
+        let old = rec("a", 1_000, 1, None);
+        let new = rec("a", 2_000, 2, Some(9_000_000_000_000));
+        assert_eq!(pick(vec![old.clone(), new.clone()]).record_version, 2);
+        assert_eq!(pick(vec![new, old]).record_version, 2);
+    }
+
+    #[test]
+    fn same_instant_tombstone_beats_live_copy_and_is_kept() {
+        let live = rec("a", 5_000, 3, None);
+        let tomb = rec("a", 5_000, 0, Some(0));
+        assert_eq!(pick(vec![live.clone(), tomb.clone()]).valid_to_ns, Some(0));
+        assert_eq!(pick(vec![tomb, live]).valid_to_ns, Some(0));
+    }
+
+    #[test]
+    fn distinct_ids_all_survive_sorted() {
+        let out = keep_newest_per_id(vec![
+            rec("c", 1, 1, None),
+            rec("a", 1, 1, None),
+            rec("b", 1, 1, None),
+        ]);
+        let ids: Vec<_> = out.iter().map(|r| r.oid.as_str()).collect();
+        assert_eq!(ids, ["a", "b", "c"]);
     }
 }

@@ -5,7 +5,7 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | **Open (filed 2026-11-11).** Found by the #2518 adversarial review. Reproduced on develop and on #2518.
+| Status | **Stage 1 resolved (2026-11-11); stage 2 is TD-DELVEC-2.** Found by the #2518 adversarial review and reproduced on develop. Stage 1 (read-time newest-copy resolution, exact over the rows a scan reads) landed together with the NOVA reader/compaction fixes below. Stage 2 (deletion vectors on supersede, per-engine) makes it structural, so it also holds for rows a pruned scan never reads.
 | Invariant | CLAUDE.md 16a/16d, and `resolve_freshest` in `src/core/search/merge.rs`: pick the newest copy of an id FIRST, then drop it if dead (PR #2063).
 | Owner | HELIX / NOVA / SWIFT engines. Related: TD-MVCCRES-1, TD-MEMTABLE-MVCC-1.
 |===
@@ -45,3 +45,80 @@ until that is read correctly.
   dead or alive.
 . Add an overwrite-across-flushes case and a flushed-delete case per engine to
   `tests/engine_ttl_conformance_test.rs`; those are the acceptance gates.
+
+== Resolution (stage 1)
+
+* **One order, defined once:** `proximadb_records::VersionKey`
+  (`updated_at` ms, then a tombstone wins the tie, then `version`) plus
+  `NewestVersionIndex`. `merge.rs::supersedes` (the service `resolve_freshest`)
+  now delegates to it, so the engines and the service cannot disagree.
+* **HELIX:** each segment scan observes EVERY row it reads, before the dead and
+  metadata filters. `readers::resolve_across_sstables` merges the per-segment
+  indexes and keeps only globally newest hits (parallel, sequential and
+  progressive callers). Hits now carry `updated_at`/`version`.
+* **NOVA:** both columnar record builders decode `version` (UInt32, the writer's
+  type; Int64 accepted), `updated_at` (falling back to `created_at`, never the
+  read-time `now()`) and `expires_at` through one helper
+  (`columnar_query_engine/version_columns.rs`).
+  ** **Search, pruning off (every service query):** one pass with no extra I/O.
+     Each file's rows feed the cross-file index, and each file keeps its top-k
+     newest-in-file live candidates. Candidates pass the global newest-copy check
+     only after every file has been seen.
+  ** **Search, TD-040 bounds pruning on (direct-engine callers only):** two passes.
+     Pass 1 is a key-only column projection (ranged GETs of id/timestamp/
+     updated_at/version/expires_at, never vectors), because pruned row groups must
+     still be indexed.
+  ** **Get-by-id** uses the same order. It was version-first, so it returned a
+     record that search hides.
+  ** **Found during review round 2:** NOVA bounds pruning is UNREACHABLE on the
+     service path. `StorageQueryContext` forces `force_exact` for NOVA/VIPER/RAPTOR
+     (`proximadb-storage-traits/src/query.rs`), so TD-040's win never applies to
+     service queries. That is recorded in TD-DELVEC-2. Re-enabling pruning there
+     needs a measured per-query I/O trace (co-design #2), and the pass-1 round-trip
+     cost (HEAD + footer + key GET per file, outside the caching filesystem) must
+     be priced into that decision.
+* **HELIX compaction (reviews H1, rounds 2-4):** production runs only L0 -> L1.
+  It resolves the newest copy per **(collection directory, id)** across its input:
+  one level map holds every collection's SSTables (TD-HELIX-COMPACT-SCOPE-1), so a
+  bare-id resolver let one collection's tombstone delete another collection's
+  record. Dead winners are KEPT; a vectorless one takes its shadowed copy's vector
+  when that copy is in the input. Physical GC is deferred to
+  TD-HELIX-COMPACT-SCOPE-1. Consumed files are removed from the level map by path
+  (`retain_unconsumed`, both paths). PCA trains on live records only.
+* **HELIX Approximate (quantized) path (review M2):** resolves and dead-filters
+  like the fp32 path, and its hits carry their TTL.
+* **HELIX get-by-id (review round 2):** resolves the newest copy across every
+  SSTable, then dead-filters. It returned the first file holding the id, so a
+  dead newer copy in a later file let the older live copy win.
+* **HELIX extractor:** skips dead rows on `valid_to_ns`. Its "no vector =
+  tombstone" test no longer holds now that compaction keeps dead winners with a
+  vector.
+* **Order precision (review M1):** `VersionKey` compares ns, so a re-insert written
+  within the same millisecond as its delete is not hidden. Remaining twins:
+  TD-MVCC-ORDER-1.
+* **NOVA, found along the way (data correctness):** search passed `10000` and
+  compaction `100000` as `read_all_records`' **start offset**, silently skipping
+  that many leading rows of any larger file. Compaction then deleted its inputs
+  (data loss). Its "keep latest" dedup kept the FIRST occurrence (file order),
+  not the newest. All three are fixed; compaction dedups by `VersionKey` and keeps
+  tombstones.
+* **SWIFT:** the per-file scan resolves within the file and passes newest-dead
+  copies up as markers, so the cross-file layer can shadow older live copies
+  before it dead-filters.
+* **Acceptance:** the `MV_CONFORMANCE` overwrite-then-expire and
+  delete-after-flush cases pass for SST/HELIX/NOVA/SWIFT.
+* **Remaining bound:** NOVA is exact over every row it reads (with pruning off,
+  which is every service query, that is every row).
+  HELIX and SWIFT are exact over the rows a scan reads: a newer copy in a pruned
+  HELIX block, or outside a SWIFT file's top-k, cannot shadow an older one.
+  TD-DELVEC-2 closes that. Per-segment truncation to k BEFORE the cross-segment
+  check can return fewer than k, and can also pick the WRONG top-k members: a
+  segment whose top-k are all superseded elsewhere contributes nothing, even if
+  its next-ranked rows belong in the global top-k (round 3 L3). A probe did not
+  reproduce it at the service level (upstream over-fetch masked it), but it is
+  real at the engine level. Same family as TD-SEARCH-DEAD-OVERFETCH-1.
+* **Kept tombstones vs file-level pruning:** file-level Hilbert-range pruning runs
+  even in Exact mode. A kept tombstone whose shadowed copy was not in its
+  compaction input (zero vector) can sit in a pruned SSTable while that copy is
+  searched. The GC design in TD-HELIX-COMPACT-SCOPE-1 removes the case; until it
+  lands, this is a known bound.
