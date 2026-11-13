@@ -307,13 +307,7 @@ impl LeveledCompactor {
 
         // Newest copy per id across the whole input, dead winners kept
         // (TD-ENGINE-MVCC-1; see `read_sstables_resolved`).
-        let shadowed = shadowed_vectors(
-            pairs
-                .iter()
-                .map(|p| (p.0.clone(), p.1.clone()))
-                .collect::<Vec<_>>()
-                .iter(),
-        );
+        let shadowed = shadowed_vectors(pairs.iter().map(|p| (p.0.as_str(), &p.1)));
         let pairs =
             proximadb_records::keep_newest_by(pairs, |p| p.0.as_str(), |p| p.1.version_key());
         let mut all_keys = Vec::with_capacity(pairs.len());
@@ -716,7 +710,7 @@ impl LeveledCompactor {
     async fn read_sstables_resolved(
         &self,
         paths: &[&PathBuf],
-    ) -> Result<(Vec<VectorRecord>, std::collections::HashSet<String>)> {
+    ) -> Result<(Vec<VectorRecord>, Vec<bool>)> {
         let mut all = Vec::new();
         for path in paths {
             let scope = collection_scope(path);
@@ -727,7 +721,7 @@ impl LeveledCompactor {
                     .map(|r| (scoped_id(&scope, &r.oid), r)),
             );
         }
-        let shadowed = shadowed_vectors(all.iter());
+        let shadowed = shadowed_vectors(all.iter().map(|p| (p.0.as_str(), &p.1)));
         Ok(materialize_for_write(
             proximadb_records::keep_newest_by(all, |p| p.0.as_str(), |p| p.1.version_key()),
             &shadowed,
@@ -795,17 +789,6 @@ impl LeveledCompactor {
         // Newest copy per id across the whole input (TD-ENGINE-MVCC-1).
         let input_paths: Vec<&PathBuf> = max_level_files.iter().map(|s| &s.path).collect();
         let (all_records, dead_ids) = self.read_sstables_resolved(&input_paths).await?;
-        // Physical GC of dead data (review round 2, M-b). The max level is the
-        // oldest; every max-level file is in this input, and levels above can
-        // only hold NEWER copies (which supersede anything here anyway). So a
-        // dead winner here shadows nothing and is dropped. Elsewhere dead
-        // winners are kept, because the copies they shadow may lie outside the
-        // input.
-        let all_records: Vec<VectorRecord> = all_records
-            .into_iter()
-            .filter(|r| !dead_ids.contains(&r.id))
-            .collect();
-        let dead_ids = std::collections::HashSet::new();
 
         // Update PCA model with current data
         let trainable = pca_training_records(&all_records, &dead_ids);
@@ -834,15 +817,17 @@ impl LeveledCompactor {
 fn materialize_for_write(
     scoped: Vec<(String, ProximaRecord)>,
     shadowed: &HashMap<String, Vec<f32>>,
-) -> (Vec<VectorRecord>, std::collections::HashSet<String>) {
+) -> (Vec<VectorRecord>, Vec<bool>) {
     let scoped_ids: Vec<String> = scoped.iter().map(|(id, _)| id.clone()).collect();
     let records: Vec<ProximaRecord> = scoped.into_iter().map(|(_, r)| r).collect();
     // Deadness on the canonical `valid_to_ns` (16a), before conversion.
     let now_ns = proximadb_kernel::time::now_unix_ns();
-    let dead_ids: std::collections::HashSet<String> = records
+    // Positional (one flag per output row), never keyed on the bare id: one
+    // compaction input can hold several collections' records with the same id
+    // (review round 5, LOW-3).
+    let dead: Vec<bool> = records
         .iter()
-        .filter(|r| proximadb_records::is_record_dead(r.valid_to_ns, now_ns))
-        .map(|r| r.oid.clone())
+        .map(|r| proximadb_records::is_record_dead(r.valid_to_ns, now_ns))
         .collect();
     let mut out: Vec<VectorRecord> = records.iter().map(VectorRecord::from).collect();
     let dimension = out
@@ -866,19 +851,36 @@ fn materialize_for_write(
             r.vector = vec![0.0; dimension];
         }
     }
-    (out, dead_ids)
+    (out, dead)
 }
 
-/// The newest LIVE vector of every (collection, id) in a compaction input:
-/// what a dead winner without a vector borrows so it stays co-located with the
-/// copy it shadows.
-fn shadowed_vectors<'a>(
-    records: impl Iterator<Item = &'a (String, ProximaRecord)>,
-) -> HashMap<String, Vec<f32>> {
-    let mut best: HashMap<String, (proximadb_records::VersionKey, Vec<f32>)> = HashMap::new();
+/// For each (collection, id) whose NEWEST copy in a compaction input is dead
+/// and carries no vector, the newest LIVE vector of that id: what the dead
+/// winner borrows so it stays co-located with the copy it shadows. Copies only
+/// the vectors actually needed (review round 5, LOW-4).
+fn shadowed_vectors<'a, I>(records: I) -> HashMap<String, Vec<f32>>
+where
+    I: IntoIterator<Item = (&'a str, &'a ProximaRecord)>,
+    I::IntoIter: Clone,
+{
+    let records = records.into_iter();
     let now_ns = proximadb_kernel::time::now_unix_ns();
+    let mut newest = proximadb_records::NewestVersionIndex::new();
+    for (id, r) in records.clone() {
+        newest.observe(id, r.version_key());
+    }
+    let needed: std::collections::HashSet<&str> = records
+        .clone()
+        .filter(|(id, r)| {
+            r.embeddings.is_empty()
+                && proximadb_records::is_record_dead(r.valid_to_ns, now_ns)
+                && newest.is_newest(id, &r.version_key())
+        })
+        .map(|(id, _)| id)
+        .collect();
+    let mut best: HashMap<String, (proximadb_records::VersionKey, Vec<f32>)> = HashMap::new();
     for (id, r) in records {
-        if proximadb_records::is_record_dead(r.valid_to_ns, now_ns) {
+        if !needed.contains(id) || proximadb_records::is_record_dead(r.valid_to_ns, now_ns) {
             continue;
         }
         let Some(cell) = r.embeddings.first() else {
@@ -886,7 +888,7 @@ fn shadowed_vectors<'a>(
         };
         let key = r.version_key();
         if best.get(id).is_none_or(|(k, _)| key.supersedes(k)) {
-            best.insert(id.clone(), (key, cell.values.to_fp32_owned()));
+            best.insert(id.to_string(), (key, cell.values.to_fp32_owned()));
         }
     }
     best.into_iter().map(|(id, (_, v))| (id, v)).collect()
@@ -928,16 +930,17 @@ fn scoped_id(scope: &str, oid: &str) -> String {
 /// read again; they must not shape the model. Borrows when nothing is dead.
 fn pca_training_records<'a>(
     records: &'a [VectorRecord],
-    dead_ids: &std::collections::HashSet<String>,
+    dead: &[bool],
 ) -> std::borrow::Cow<'a, [VectorRecord]> {
-    if dead_ids.is_empty() {
+    if !dead.iter().any(|&d| d) {
         std::borrow::Cow::Borrowed(records)
     } else {
         std::borrow::Cow::Owned(
             records
                 .iter()
-                .filter(|r| !dead_ids.contains(&r.id))
-                .cloned()
+                .zip(dead.iter())
+                .filter(|(_, d)| !**d)
+                .map(|(r, _)| r.clone())
                 .collect(),
         )
     }
@@ -1233,15 +1236,16 @@ mod tests {
     fn pca_trains_on_live_records_only() {
         let live = vrec("live", 1, 1, None, true);
         let dead = vrec("dead", 1, 1, Some(0), true);
-        let records = vec![live, dead];
-        let dead_ids: std::collections::HashSet<String> = ["dead".to_string()].into();
-        let trainable = pca_training_records(&records, &dead_ids);
-        assert_eq!(
-            trainable.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
-            ["live"]
-        );
+        // A live record sharing an id with a dead one (another collection)
+        // must still train: the mask is positional, not keyed on the id.
+        let mut same_id = vrec("dead", 1, 1, None, true);
+        same_id.vector[1] = 0.5;
+        let records = vec![live, dead, same_id];
+        let trainable = pca_training_records(&records, &[false, true, false]);
+        assert_eq!(trainable.len(), 2);
+        assert!(trainable.iter().all(|r| r.expires_at != Some(0)));
         assert!(matches!(
-            pca_training_records(&records, &std::collections::HashSet::new()),
+            pca_training_records(&records, &[false, false, false]),
             std::borrow::Cow::Borrowed(_)
         ));
     }
@@ -1261,7 +1265,7 @@ mod tests {
             scoped("A", vrec("victim", 2_000, 0, Some(0), false)),
             scoped("B", other_coll),
         ];
-        let shadowed = super::shadowed_vectors(input.iter());
+        let shadowed = super::shadowed_vectors(input.iter().map(|p| (p.0.as_str(), &p.1)));
         let resolved =
             proximadb_records::keep_newest_by(input, |p| p.0.as_str(), |p| p.1.version_key());
         let (out, _) = materialize_for_write(resolved, &shadowed);
@@ -1278,6 +1282,27 @@ mod tests {
             out.iter().filter(|r| r.id == "victim").count(),
             2,
             "B's live copy untouched"
+        );
+    }
+
+    #[test]
+    fn no_production_path_clears_a_whole_level() {
+        // Round 5 LOW-1: the call sites of `retain_unconsumed` cannot be driven
+        // deterministically mid-compaction, and `levels_write.remove(&0)` came
+        // back once already (rounds 3-4, HIGH-2). Guard the source structurally:
+        // no production code may drop a whole level from the map.
+        let source = include_str!("compaction.rs");
+        let production = source.split("#[cfg(test)]").next().unwrap_or(source);
+        assert!(
+            !production.contains("levels_write.remove(&"),
+            "a production path removes a whole level; use retain_unconsumed"
+        );
+        assert!(
+            production
+                .matches("retain_unconsumed(&mut levels_write")
+                .count()
+                >= 2,
+            "both L0 paths must update the level map through retain_unconsumed"
         );
     }
 }
