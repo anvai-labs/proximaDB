@@ -57,8 +57,12 @@ moves or deletes B's files, plus the GC tests from the #2521 round-3 design.
 
 == Resolution (steps 1-2)
 
-* `compaction::owns_sstable(data_dir, path)` (`path.parent() == data_dir`,
-  component-wise). Every compaction path (L0->L1, level->next, max-level recluster)
+* `compaction::owns_sstable(data_dir, path)` compares the **canonical** parent
+  directory (`canonical_location`: strip `file://`, absolutize relative paths, fold
+  the `adls`/`abfs`/`azure` aliases to `az`, drop `.` components). Rediscovered
+  SSTables come back as absolute `file://` URLs, while the default storage URL is
+  the relative `file://./data`. A raw comparison made every rediscovered file "not
+  owned", so that collection never compacted again (#2530 review HIGH-1). Every compaction path (L0->L1, level->next, max-level recluster)
   selects only its own collection's files.
 * `should_compact` counts only the triggering collection's L0 files.
 * A per-collection compaction guard (`HelixEngine::compaction_guards`): the
@@ -69,3 +73,20 @@ moves or deletes B's files, plus the GC tests from the #2521 round-3 design.
 * Seam test `compaction_never_reads_moves_or_deletes_another_collections_files`
   (both L0 paths). Negative control: selecting the whole level compacts 8 files
   instead of A's 4 and fails it.
+
+== Still shared across collections (same root cause; found by the #2530 review; not fixed here)
+
+* **`pca_model` is one engine-wide model.** Collection B reuses A's in-memory PCA
+  model: wrong pruning, `transform` errors when dimensions differ, and B's model is
+  never persisted.
+* **The query-optimizer result cache is keyed only by the query vector's bits and
+  `k`**, with no collection or tenant. If one engine instance serves several
+  collections' searches, that is a cross-tenant result-leak risk. It is also not
+  invalidated on writes (16b). It needs confirming which instance the search path
+  uses, then a key that includes (tenant, collection) plus write invalidation.
+  **Highest priority of these.**
+* **Search's per-collection filter is a string `starts_with`**, not a component
+  match. Cache-miss discovery appends without dedupe.
+* `compaction_guards` gains one entry per collection and never shrinks (small;
+  bounded by the number of collections ever seen).
+* A skipped flush trigger leaves >= 4 L0 files until that collection's next flush.
