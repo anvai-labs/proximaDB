@@ -899,13 +899,11 @@ impl HelixEngine {
 
         // Check L0 trigger: THIS collection's L0 files only (the level map is
         // shared by every collection; TD-HELIX-COMPACT-SCOPE-1).
-        if let Some(l0_files) = levels.get(&0)
-            && l0_files
-                .iter()
-                .filter(|f| compaction::owns_sstable(data_dir, &f.path))
-                .count()
-                >= self.config.level0_file_num_compaction_trigger
-        {
+        if compaction::l0_trigger_reached(
+            &levels,
+            data_dir,
+            self.config.level0_file_num_compaction_trigger,
+        ) {
             return true;
         }
 
@@ -914,8 +912,16 @@ impl HelixEngine {
             if let (Some(curr_level), Some(next_level)) =
                 (levels.get(&level), levels.get(&(level + 1)))
             {
-                let curr_size: u64 = curr_level.iter().map(|f| f.size_bytes).sum();
-                let next_size: u64 = next_level.iter().map(|f| f.size_bytes).sum();
+                // This collection's files only (#2530 review LOW-3).
+                let own = |files: &Vec<SStableMetadata>| -> u64 {
+                    files
+                        .iter()
+                        .filter(|f| compaction::owns_sstable(data_dir, &f.path))
+                        .map(|f| f.size_bytes)
+                        .sum()
+                };
+                let curr_size: u64 = own(curr_level);
+                let next_size: u64 = own(next_level);
 
                 if next_size > 0 && (curr_size as f64 / next_size as f64) > self.config.size_ratio {
                     return true;
@@ -1403,7 +1409,7 @@ impl UnifiedStorageFormat for HelixEngine {
             tokio::spawn(async move {
                 // One compaction per collection at a time: if one is already
                 // running it will see these files on its next trigger.
-                let Ok(_running) = guard.try_lock_owned() else {
+                let Some(_running) = compaction::acquire_compaction(guard, false).await else {
                     debug!("HELIX: compaction already running for this collection; skipped");
                     return;
                 };
@@ -1439,7 +1445,7 @@ impl UnifiedStorageFormat for HelixEngine {
             LeveledCompactor::new(self.config.clone(), filesystem, collection_dir.clone());
         // Serialized with any flush-triggered compaction of this collection.
         let guard = self.compaction_guard(&collection_dir);
-        let _running = guard.lock_owned().await;
+        let _running = compaction::acquire_compaction(guard, true).await;
 
         let start = std::time::Instant::now();
 

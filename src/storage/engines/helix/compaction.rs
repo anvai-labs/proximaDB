@@ -905,7 +905,78 @@ where
 /// directory: cross-tenant data movement, a path-isolation violation
 /// (TD-HELIX-COMPACT-SCOPE-1).
 pub(super) fn owns_sstable(data_dir: &std::path::Path, path: &std::path::Path) -> bool {
-    path.parent() == Some(data_dir)
+    path.parent()
+        .is_some_and(|parent| canonical_location(parent) == canonical_location(data_dir))
+}
+
+/// One canonical form for a storage location, so the SAME directory compares
+/// equal however it was spelled (#2530 review HIGH-1). Flushed SSTable paths are
+/// built from the raw `data_dir` string (e.g. the default `file://./data`), but
+/// SSTables rediscovered from a directory listing come back as absolute
+/// `file:///abs/...` URLs. Comparing raw forms made every rediscovered file
+/// "not owned", and that collection never compacted again.
+///
+/// `file://` is stripped and relative paths are absolutized (as the local
+/// filesystem's listing does). The Azure scheme aliases (`adls`/`abfs`/`azure`)
+/// fold to `az`, the one flat Blob backend they all resolve to (ADR-036). `.`
+/// components and trailing separators are dropped.
+pub(super) fn canonical_location(location: &std::path::Path) -> std::path::PathBuf {
+    let raw = location.to_string_lossy();
+    let mut s: String = raw.into_owned();
+    for alias in ["adls://", "abfs://", "azure://"] {
+        if let Some(rest) = s.strip_prefix(alias) {
+            s = format!("az://{rest}");
+            break;
+        }
+    }
+    let local = match s.strip_prefix("file://") {
+        Some(rest) => Some(rest.to_string()),
+        None if !s.contains("://") => Some(s.clone()),
+        None => None,
+    };
+    let path = match local {
+        Some(p) => {
+            let p = std::path::PathBuf::from(p);
+            if p.is_absolute() {
+                p
+            } else {
+                std::path::absolute(&p).unwrap_or(p)
+            }
+        }
+        None => std::path::PathBuf::from(s),
+    };
+    path.components()
+        .filter(|c| !matches!(c, std::path::Component::CurDir))
+        .collect()
+}
+
+/// The L0 compaction trigger for ONE collection: its own L0 files only. The
+/// level map is shared by every collection (TD-HELIX-COMPACT-SCOPE-1).
+pub(super) fn l0_trigger_reached(
+    levels: &HashMap<usize, Vec<SStableMetadata>>,
+    data_dir: &std::path::Path,
+    trigger: usize,
+) -> bool {
+    levels.get(&0).is_some_and(|l0| {
+        l0.iter()
+            .filter(|f| owns_sstable(data_dir, &f.path))
+            .count()
+            >= trigger
+    })
+}
+
+/// Acquire a collection's compaction guard. `wait = false` (flush-triggered):
+/// skip when a compaction is already running. `wait = true` (explicit
+/// `do_compact`): wait for it. Returns `None` only when skipping.
+pub(super) async fn acquire_compaction(
+    guard: Arc<tokio::sync::Mutex<()>>,
+    wait: bool,
+) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+    if wait {
+        Some(guard.lock_owned().await)
+    } else {
+        guard.try_lock_owned().ok()
+    }
 }
 
 /// The files of one level that belong to the collection at `data_dir`.
@@ -1463,5 +1534,123 @@ mod tests {
             drop(map);
             std::mem::forget(tmp);
         }
+    }
+
+    #[test]
+    fn owns_sstable_matches_rediscovered_files_in_every_data_dir_form() {
+        // #2530 review HIGH-1: rediscovered SSTables come back as absolute
+        // `file://` URLs, whatever form the collection's data_dir was written
+        // in. The default storage URL is the RELATIVE `file://./data`.
+        use std::path::{Path, PathBuf};
+        let cwd = std::env::current_dir().unwrap_or_else(|e| panic!("cwd: {e}"));
+        let abs = cwd.join("rel_data").join("c1");
+        let discovered = PathBuf::from(format!("file://{}/L0_x.helix", abs.display()));
+        for data_dir in [
+            "file://./rel_data/c1".to_string(),
+            "./rel_data/c1".to_string(),
+            "rel_data/c1".to_string(),
+            format!("file://{}", abs.display()),
+            format!("file://{}/", abs.display()),
+            abs.display().to_string(),
+        ] {
+            assert!(
+                super::owns_sstable(Path::new(&data_dir), &discovered),
+                "data_dir {data_dir} must own {}",
+                discovered.display()
+            );
+        }
+        // Flushed form (built from the raw data_dir) still matches.
+        let raw = Path::new("file://./rel_data/c1");
+        assert!(super::owns_sstable(raw, &raw.join("L0_y.helix")));
+        // Still exact: another collection is never owned.
+        assert!(!super::owns_sstable(
+            Path::new("file://./rel_data/c1"),
+            &PathBuf::from(format!(
+                "file://{}/L0_x.helix",
+                cwd.join("rel_data").join("c10").display()
+            ))
+        ));
+        // Azure aliases resolve to the one flat Blob backend.
+        assert!(super::owns_sstable(
+            Path::new("adls://cont/t/ns/c1/data"),
+            Path::new("az://cont/t/ns/c1/data/L0_z.helix")
+        ));
+    }
+
+    #[test]
+    fn l0_trigger_counts_only_the_collections_own_files_in_any_form() {
+        // Round review MEDIUM-1 (M3): the trigger must count only this
+        // collection, including its rediscovered (URL-form) files.
+        let meta = |p: &str| SStableMetadata {
+            path: PathBuf::from(p),
+            level: 0,
+            hilbert_range: None,
+            num_vectors: 0,
+            size_bytes: 0,
+            created_at: chrono::Utc::now(),
+            blocks: Vec::new(),
+            bloom_filter: None,
+        };
+        let dir = std::path::Path::new("/d/t1/c1");
+        let mut l0 = vec![
+            meta("/d/t1/c1/a.helix"),
+            meta("file:///d/t1/c1/b.helix"),
+            meta("/d/t1/c1/c.helix"),
+        ];
+        l0.extend((0..5).map(|i| meta(&format!("/d/t2/c9/{i}.helix"))));
+        let levels = HashMap::from([(0_usize, l0)]);
+        assert!(
+            !super::l0_trigger_reached(&levels, dir, 4),
+            "3 own files < 4 (others ignored)"
+        );
+        assert!(
+            super::l0_trigger_reached(&levels, dir, 3),
+            "rediscovered URL form counts"
+        );
+    }
+
+    #[tokio::test]
+    async fn acquire_compaction_skips_or_waits_while_one_runs() {
+        // MEDIUM-1 (M4/M6): one compaction per collection at a time.
+        let guard = Arc::new(tokio::sync::Mutex::new(()));
+        let held = super::acquire_compaction(guard.clone(), true)
+            .await
+            .unwrap_or_else(|| panic!("first acquire"));
+        assert!(
+            super::acquire_compaction(guard.clone(), false)
+                .await
+                .is_none(),
+            "flush-triggered compaction must skip while one runs"
+        );
+        let waiter = tokio::spawn(super::acquire_compaction(guard.clone(), true));
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished(), "explicit compaction must wait");
+        drop(held);
+        assert!(
+            waiter
+                .await
+                .unwrap_or_else(|e| panic!("join: {e}"))
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn engine_sites_use_the_scoped_trigger_and_the_guard() {
+        // Structural: both compaction entry points in helix/mod.rs go through
+        // the guard (skip for flush, wait for do_compact) and the scoped trigger.
+        let engine = include_str!("mod.rs");
+        let engine = engine.split("#[cfg(test)]").next().unwrap_or(engine);
+        assert!(
+            engine.contains("compaction::acquire_compaction(guard, false)"),
+            "flush must skip"
+        );
+        assert!(
+            engine.contains("compaction::acquire_compaction(guard, true)"),
+            "do_compact must wait"
+        );
+        assert!(
+            engine.contains("compaction::l0_trigger_reached("),
+            "per-collection trigger"
+        );
     }
 }
