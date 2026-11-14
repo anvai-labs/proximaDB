@@ -923,9 +923,17 @@ pub(super) fn owns_sstable(data_dir: &std::path::Path, path: &std::path::Path) -
 pub(super) fn canonical_location(location: &std::path::Path) -> std::path::PathBuf {
     let raw = location.to_string_lossy();
     let mut s: String = raw.into_owned();
-    for alias in ["adls://", "abfs://", "azure://"] {
+    // Scheme aliases that resolve to ONE backend fold to the scheme its
+    // listing returns: Azure (`adls`/`abfs`/`azure` -> `az`, ADR-036) and GCS
+    // (`gcs` -> `gs`: `GcsFileSystem::list` returns `gs://`; #2530 review r2).
+    for (alias, canonical) in [
+        ("adls://", "az://"),
+        ("abfs://", "az://"),
+        ("azure://", "az://"),
+        ("gcs://", "gs://"),
+    ] {
         if let Some(rest) = s.strip_prefix(alias) {
-            s = format!("az://{rest}");
+            s = format!("{canonical}{rest}");
             break;
         }
     }
@@ -958,9 +966,13 @@ pub(super) fn l0_trigger_reached(
     trigger: usize,
 ) -> bool {
     levels.get(&0).is_some_and(|l0| {
+        // Distinct physical files: the same SSTable may be registered under
+        // two spellings (see `owned`).
         l0.iter()
             .filter(|f| owns_sstable(data_dir, &f.path))
-            .count()
+            .map(|f| canonical_location(&f.path))
+            .collect::<std::collections::HashSet<_>>()
+            .len()
             >= trigger
     })
 }
@@ -981,10 +993,16 @@ pub(super) async fn acquire_compaction(
 
 /// The files of one level that belong to the collection at `data_dir`.
 fn owned(files: Option<&Vec<SStableMetadata>>, data_dir: &std::path::Path) -> Vec<SStableMetadata> {
+    // One entry per physical file: the level map can hold the same SSTable
+    // under two spellings (flushed raw `file://./..` vs rediscovered
+    // `file:///abs/..`). Compacting both copies duplicated their records and
+    // failed on the second delete (#2530 review r2, M-2).
+    let mut seen = std::collections::HashSet::new();
     files
         .map(|v| {
             v.iter()
                 .filter(|f| owns_sstable(data_dir, &f.path))
+                .filter(|f| seen.insert(canonical_location(&f.path)))
                 .cloned()
                 .collect()
         })
@@ -1000,9 +1018,14 @@ fn retain_unconsumed(
     level: usize,
     consumed: &[SStableMetadata],
 ) {
-    let consumed: std::collections::HashSet<&PathBuf> = consumed.iter().map(|s| &s.path).collect();
+    // Canonical match: every spelling of a consumed file goes (otherwise the
+    // other spelling would stay registered, pointing at a deleted file).
+    let consumed: std::collections::HashSet<PathBuf> = consumed
+        .iter()
+        .map(|s| canonical_location(&s.path))
+        .collect();
     if let Some(files) = levels.get_mut(&level) {
-        files.retain(|f| !consumed.contains(&f.path));
+        files.retain(|f| !consumed.contains(&canonical_location(&f.path)));
     }
 }
 
@@ -1012,8 +1035,10 @@ fn retain_unconsumed(
 /// Version resolution must never let one collection's copy supersede another
 /// collection's record with the same id (#2521 review round 4).
 fn collection_scope(path: &std::path::Path) -> String {
+    // Canonical, so two spellings of one collection directory are ONE scope
+    // (#2530 review r2, M-2 probe A).
     path.parent()
-        .map(|p| p.to_string_lossy().into_owned())
+        .map(|p| canonical_location(p).to_string_lossy().into_owned())
         .unwrap_or_default()
 }
 
@@ -1575,6 +1600,11 @@ mod tests {
             Path::new("adls://cont/t/ns/c1/data"),
             Path::new("az://cont/t/ns/c1/data/L0_z.helix")
         ));
+        // GCS: `gcs://` is registered alongside `gs://`, and listing returns `gs://`.
+        assert!(super::owns_sstable(
+            Path::new("gcs://bucket/t/ns/c1/data"),
+            Path::new("gs://bucket/t/ns/c1/data/L0_z.helix")
+        ));
     }
 
     #[test]
@@ -1652,5 +1682,127 @@ mod tests {
             engine.contains("compaction::l0_trigger_reached("),
             "per-collection trigger"
         );
+        // do_compact's level-map invalidation and optimizer-cache invalidation
+        // are scoped to the collection; so is the size-ratio trigger (#2530 r2
+        // L-2: m7/m8/m9 survived without these).
+        assert!(
+            engine
+                .contains("files.retain(|f| !compaction::owns_sstable(&collection_dir, &f.path))"),
+            "do_compact must invalidate only its own collection's entries"
+        );
+        assert!(
+            engine.contains(".filter(|f| compaction::owns_sstable(&collection_dir, &f.path))"),
+            "do_compact must invalidate only its own collection's optimizer entries"
+        );
+        assert!(
+            engine.contains(".filter(|f| compaction::owns_sstable(data_dir, &f.path))"),
+            "the size-ratio trigger must count only this collection's files"
+        );
+    }
+
+    #[tokio::test]
+    async fn one_file_registered_under_two_spellings_compacts_once() {
+        // #2530 review r2, M-2 probe B: the level map can hold one SSTable as
+        // both its raw path and its rediscovered `file://` URL. Compaction must
+        // use it once, write its records once, and drop every spelling.
+        for sorted in [true, false] {
+            let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("tempdir: {e}"));
+            let dir = tmp.path().join("coll");
+            std::fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("mkdir: {e}"));
+            let (compactor, fs) = compactor_in(&dir).await;
+            let g0 = l0_file(&fs, &dir, "g0.helix", &pads("g0", 4), sorted).await;
+            let mut g0_url = g0.clone();
+            g0_url.path = PathBuf::from(format!("file://{}", g0.path.display()));
+            let mut l0 = vec![g0, g0_url];
+            for i in 1..4 {
+                l0.push(
+                    l0_file(
+                        &fs,
+                        &dir,
+                        &format!("g{i}.helix"),
+                        &pads(&format!("g{i}"), 4),
+                        sorted,
+                    )
+                    .await,
+                );
+            }
+            let levels = Arc::new(RwLock::new(HashMap::from([(0_usize, l0)])));
+            compactor
+                .compact_l0_to_l1(levels.clone())
+                .await
+                .unwrap_or_else(|e| panic!("[sorted={sorted}] compaction must not fail: {e}"));
+            let map = levels.read().await;
+            assert!(
+                map.get(&0).is_none_or(|v| v.is_empty()),
+                "[sorted={sorted}] every spelling of every consumed L0 file must leave the map"
+            );
+            let mut ids = Vec::new();
+            for f in map.get(&1).cloned().unwrap_or_default() {
+                for r in compactor
+                    .read_sstable(&f.path)
+                    .await
+                    .unwrap_or_else(|e| panic!("read: {e}"))
+                {
+                    ids.push(r.oid);
+                }
+            }
+            let unique: std::collections::HashSet<_> = ids.iter().cloned().collect();
+            assert_eq!(
+                ids.len(),
+                unique.len(),
+                "[sorted={sorted}] a record was written twice"
+            );
+            assert_eq!(
+                ids.len(),
+                16,
+                "[sorted={sorted}] all 4 files x 4 records, once each"
+            );
+            drop(map);
+            std::mem::forget(tmp);
+        }
+    }
+
+    #[tokio::test]
+    async fn mixed_spellings_of_one_collection_resolve_as_one_scope() {
+        // #2530 review r2, M-2 probe A: v1 (live) under the raw path and a newer
+        // expired v2 under the URL spelling are the SAME collection: only the
+        // dead winner may survive.
+        let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("tempdir: {e}"));
+        let dir = tmp.path().join("coll");
+        std::fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("mkdir: {e}"));
+        let (compactor, fs) = compactor_in(&dir).await;
+        let f0 = l0_file(
+            &fs,
+            &dir,
+            "f0.helix",
+            &[vrec("victim", 1_000, 1, None, true)],
+            false,
+        )
+        .await;
+        let f1 = l0_file(
+            &fs,
+            &dir,
+            "f1.helix",
+            &[vrec("victim", 2_000, 2, Some(1), true)],
+            false,
+        )
+        .await;
+        let f1_url = PathBuf::from(format!("file://{}", f1.path.display()));
+        let (out, dead) = compactor
+            .read_sstables_resolved(&[&f0.path, &f1_url])
+            .await
+            .unwrap_or_else(|e| panic!("resolve: {e}"));
+        let victims: Vec<usize> = out
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.id == "victim")
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(victims.len(), 1, "one collection, one newest copy");
+        assert!(
+            dead[victims[0]],
+            "the survivor is the dead newest copy, not v1"
+        );
+        std::mem::forget(tmp);
     }
 }
