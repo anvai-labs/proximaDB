@@ -61,7 +61,7 @@ impl LeveledCompactor {
         // Get L0 files
         let l0_files = {
             let levels_read = levels.read().await;
-            levels_read.get(&0).cloned().unwrap_or_default()
+            owned(levels_read.get(&0), &self.data_dir)
         };
 
         if l0_files.len() < self.config.level0_file_num_compaction_trigger {
@@ -464,8 +464,8 @@ impl LeveledCompactor {
         let (curr_files, next_files) = {
             let levels_read = levels.read().await;
             (
-                levels_read.get(&level).cloned().unwrap_or_default(),
-                levels_read.get(&(level + 1)).cloned().unwrap_or_default(),
+                owned(levels_read.get(&level), &self.data_dir),
+                owned(levels_read.get(&(level + 1)), &self.data_dir),
             )
         };
 
@@ -778,7 +778,7 @@ impl LeveledCompactor {
         // Get files at max level
         let max_level_files = {
             let levels_read = levels.read().await;
-            levels_read.get(&max_level).cloned().unwrap_or_default()
+            owned(levels_read.get(&max_level), &self.data_dir)
         };
 
         if max_level_files.is_empty() {
@@ -894,6 +894,121 @@ where
     best.into_iter().map(|(id, (_, v))| (id, v)).collect()
 }
 
+/// True when `path` is an SSTable of the collection whose data directory is
+/// `data_dir` (its direct parent; component-wise, so `coll_1` never matches
+/// `coll_10`).
+///
+/// One HELIX engine and one level map serve every collection of every tenant
+/// (the flush coordinator caches one engine per engine type). A compaction
+/// must therefore select ONLY its own collection's files. Selecting the whole
+/// map merged every collection's L0 into the triggering collection's
+/// directory: cross-tenant data movement, a path-isolation violation
+/// (TD-HELIX-COMPACT-SCOPE-1).
+pub(super) fn owns_sstable(data_dir: &std::path::Path, path: &std::path::Path) -> bool {
+    path.parent()
+        .is_some_and(|parent| canonical_location(parent) == canonical_location(data_dir))
+}
+
+/// One canonical form for a storage location, so the SAME directory compares
+/// equal however it was spelled (#2530 review HIGH-1). Flushed SSTable paths are
+/// built from the raw `data_dir` string (e.g. the default `file://./data`), but
+/// SSTables rediscovered from a directory listing come back as absolute
+/// `file:///abs/...` URLs. Comparing raw forms made every rediscovered file
+/// "not owned", and that collection never compacted again.
+///
+/// `file://` is stripped and relative paths are absolutized (as the local
+/// filesystem's listing does). The Azure scheme aliases (`adls`/`abfs`/`azure`)
+/// fold to `az`, the one flat Blob backend they all resolve to (ADR-036). `.`
+/// components and trailing separators are dropped.
+pub(super) fn canonical_location(location: &std::path::Path) -> std::path::PathBuf {
+    let raw = location.to_string_lossy();
+    let mut s: String = raw.into_owned();
+    // Scheme aliases that resolve to ONE backend fold to the scheme its
+    // listing returns: Azure (`adls`/`abfs`/`azure` -> `az`, ADR-036) and GCS
+    // (`gcs` -> `gs`: `GcsFileSystem::list` returns `gs://`; #2530 review r2).
+    for (alias, canonical) in [
+        ("adls://", "az://"),
+        ("abfs://", "az://"),
+        ("azure://", "az://"),
+        ("gcs://", "gs://"),
+    ] {
+        if let Some(rest) = s.strip_prefix(alias) {
+            s = format!("{canonical}{rest}");
+            break;
+        }
+    }
+    let local = match s.strip_prefix("file://") {
+        Some(rest) => Some(rest.to_string()),
+        None if !s.contains("://") => Some(s.clone()),
+        None => None,
+    };
+    let path = match local {
+        Some(p) => {
+            let p = std::path::PathBuf::from(p);
+            if p.is_absolute() {
+                p
+            } else {
+                std::path::absolute(&p).unwrap_or(p)
+            }
+        }
+        None => std::path::PathBuf::from(s),
+    };
+    path.components()
+        .filter(|c| !matches!(c, std::path::Component::CurDir))
+        .collect()
+}
+
+/// The L0 compaction trigger for ONE collection: its own L0 files only. The
+/// level map is shared by every collection (TD-HELIX-COMPACT-SCOPE-1).
+pub(super) fn l0_trigger_reached(
+    levels: &HashMap<usize, Vec<SStableMetadata>>,
+    data_dir: &std::path::Path,
+    trigger: usize,
+) -> bool {
+    levels.get(&0).is_some_and(|l0| {
+        // Distinct physical files: the same SSTable may be registered under
+        // two spellings (see `owned`).
+        l0.iter()
+            .filter(|f| owns_sstable(data_dir, &f.path))
+            .map(|f| canonical_location(&f.path))
+            .collect::<std::collections::HashSet<_>>()
+            .len()
+            >= trigger
+    })
+}
+
+/// Acquire a collection's compaction guard. `wait = false` (flush-triggered):
+/// skip when a compaction is already running. `wait = true` (explicit
+/// `do_compact`): wait for it. Returns `None` only when skipping.
+pub(super) async fn acquire_compaction(
+    guard: Arc<tokio::sync::Mutex<()>>,
+    wait: bool,
+) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+    if wait {
+        Some(guard.lock_owned().await)
+    } else {
+        guard.try_lock_owned().ok()
+    }
+}
+
+/// The files of one level that belong to the collection at `data_dir`.
+fn owned(files: Option<&Vec<SStableMetadata>>, data_dir: &std::path::Path) -> Vec<SStableMetadata> {
+    // One entry per physical file: the level map can hold the same SSTable
+    // under two spellings (flushed raw `file://./..` vs rediscovered
+    // `file:///abs/..`). Compacting both copies duplicated their records and
+    // failed on the second delete (#2530 review r2, M-2).
+    let mut seen = std::collections::HashSet::new();
+    files
+        .map(|v| {
+            v.iter()
+                .filter(|f| owns_sstable(data_dir, &f.path))
+                .filter(|f| seen.insert(canonical_location(&f.path)))
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Drop exactly the `consumed` files from `level` of the level map, keeping
 /// any file registered after the compaction's snapshot (e.g. an L0 file flushed
 /// mid-compaction, possibly a tombstone file). `remove(&level)` dropped those
@@ -903,9 +1018,14 @@ fn retain_unconsumed(
     level: usize,
     consumed: &[SStableMetadata],
 ) {
-    let consumed: std::collections::HashSet<&PathBuf> = consumed.iter().map(|s| &s.path).collect();
+    // Canonical match: every spelling of a consumed file goes (otherwise the
+    // other spelling would stay registered, pointing at a deleted file).
+    let consumed: std::collections::HashSet<PathBuf> = consumed
+        .iter()
+        .map(|s| canonical_location(&s.path))
+        .collect();
     if let Some(files) = levels.get_mut(&level) {
-        files.retain(|f| !consumed.contains(&f.path));
+        files.retain(|f| !consumed.contains(&canonical_location(&f.path)));
     }
 }
 
@@ -915,8 +1035,10 @@ fn retain_unconsumed(
 /// Version resolution must never let one collection's copy supersede another
 /// collection's record with the same id (#2521 review round 4).
 fn collection_scope(path: &std::path::Path) -> String {
+    // Canonical, so two spellings of one collection directory are ONE scope
+    // (#2530 review r2, M-2 probe A).
     path.parent()
-        .map(|p| p.to_string_lossy().into_owned())
+        .map(|p| canonical_location(p).to_string_lossy().into_owned())
         .unwrap_or_default()
 }
 
@@ -1179,36 +1301,47 @@ mod tests {
 
     #[tokio::test]
     async fn resolution_never_lets_one_collection_supersede_another() {
-        // Round 4 HIGH-1: one level map holds every collection's SSTables, so
-        // an L0 input can mix collections. A tombstone in collection A must
-        // never remove collection B's live record with the same id.
+        // Round 4 HIGH-1 (defence in depth): compaction no longer mixes
+        // collections (TD-HELIX-COMPACT-SCOPE-1), but the resolver itself must
+        // never let one collection's tombstone supersede another collection's
+        // record with the same id, whatever input it is handed.
         for sorted in [true, false] {
-            let mut a = vec![vrec("shared", 2_000, 0, Some(0), false)];
-            let _ = &mut a;
-            let mut b = vec![vrec("shared", 1_000, 1, None, true)];
-            b.extend(pads("b", 3));
-            let out = compact_l0(
+            let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("tempdir: {e}"));
+            let base = tmp.path().to_path_buf();
+            let (dir_a, dir_b) = (base.join("coll_a"), base.join("coll_b"));
+            std::fs::create_dir_all(&dir_a).unwrap_or_else(|e| panic!("mkdir: {e}"));
+            std::fs::create_dir_all(&dir_b).unwrap_or_else(|e| panic!("mkdir: {e}"));
+            let (compactor, fs) = compactor_in(&dir_a).await;
+            let a = l0_file(
+                &fs,
+                &dir_a,
+                "l0_a.helix",
+                &[vrec("shared", 2_000, 0, Some(0), false)],
                 sorted,
-                "coll_a",
-                vec![
-                    ("coll_a", "l0_0.helix", a),
-                    ("coll_b", "l0_1.helix", b),
-                    ("coll_a", "l0_2.helix", pads("c", 4)),
-                    ("coll_b", "l0_3.helix", pads("d", 4)),
-                ],
             )
             .await;
+            let mut b_records = vec![vrec("shared", 1_000, 1, None, true)];
+            b_records.extend(pads("b", 3));
+            let b = l0_file(&fs, &dir_b, "l0_b.helix", &b_records, sorted).await;
+            let (out, _) = compactor
+                .read_sstables_resolved(&[&a.path, &b.path])
+                .await
+                .unwrap_or_else(|e| panic!("resolve: {e}"));
             let now = proximadb_kernel::time::now_unix_ns();
-            let live: Vec<_> = out
-                .copies("shared")
-                .into_iter()
-                .filter(|r| !proximadb_records::is_record_dead(r.valid_to_ns, now))
-                .collect();
+            let shared: Vec<_> = out.iter().filter(|r| r.id == "shared").collect();
             assert_eq!(
-                live.len(),
-                1,
-                "[sorted={sorted}] collection B's live 'shared' must survive A's tombstone"
+                shared.len(),
+                2,
+                "[sorted={sorted}] both collections' 'shared' survive resolution"
             );
+            assert!(
+                shared
+                    .iter()
+                    .any(|r| r.expires_at.is_none() && !r.vector.iter().all(|v| *v == 0.0)),
+                "[sorted={sorted}] collection B's LIVE 'shared' must survive A's tombstone"
+            );
+            let _ = now;
+            std::mem::forget(tmp);
         }
     }
 
@@ -1297,6 +1430,13 @@ mod tests {
             !production.contains("levels_write.remove(&"),
             "a production path removes a whole level; use retain_unconsumed"
         );
+        // The engine (`do_compact`) shares the same level map (round 6 LOW-1).
+        let engine = include_str!("mod.rs");
+        let engine = engine.split("#[cfg(test)]").next().unwrap_or(engine);
+        assert!(
+            !engine.contains("levels_write.remove(&"),
+            "helix/mod.rs removes a whole level of the shared map"
+        );
         assert!(
             production
                 .matches("retain_unconsumed(&mut levels_write")
@@ -1304,5 +1444,365 @@ mod tests {
                 >= 2,
             "both L0 paths must update the level map through retain_unconsumed"
         );
+    }
+
+    #[test]
+    fn owns_sstable_is_exact_per_collection_directory() {
+        use std::path::Path;
+        let dir = Path::new("/data/t1/ns/coll_1");
+        assert!(super::owns_sstable(
+            dir,
+            Path::new("/data/t1/ns/coll_1/L0_a.helix")
+        ));
+        assert!(!super::owns_sstable(
+            dir,
+            Path::new("/data/t1/ns/coll_10/L0_a.helix")
+        ));
+        assert!(!super::owns_sstable(
+            dir,
+            Path::new("/data/t2/ns/coll_1/L0_a.helix")
+        ));
+        assert!(!super::owns_sstable(
+            dir,
+            Path::new("/data/t1/ns/coll_1/__model/x.helix")
+        ));
+    }
+
+    #[tokio::test]
+    async fn compaction_never_reads_moves_or_deletes_another_collections_files() {
+        // TD-HELIX-COMPACT-SCOPE-1: one level map holds every collection's
+        // SSTables. Compacting A must leave B's L0 files in the map and on
+        // disk, and write only A's records, only under A's directory.
+        for sorted in [true, false] {
+            let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("tempdir: {e}"));
+            let base = tmp.path().to_path_buf();
+            let dir_a = base.join("tenant_a").join("coll");
+            let dir_b = base.join("tenant_b").join("coll");
+            std::fs::create_dir_all(&dir_a).unwrap_or_else(|e| panic!("mkdir: {e}"));
+            std::fs::create_dir_all(&dir_b).unwrap_or_else(|e| panic!("mkdir: {e}"));
+            let (compactor, fs) = compactor_in(&dir_a).await;
+            let mut l0 = Vec::new();
+            for i in 0..4 {
+                l0.push(
+                    l0_file(
+                        &fs,
+                        &dir_a,
+                        &format!("a_{i}.helix"),
+                        &pads(&format!("a{i}"), 4),
+                        sorted,
+                    )
+                    .await,
+                );
+            }
+            let mut b_files = Vec::new();
+            for i in 0..4 {
+                let f = l0_file(
+                    &fs,
+                    &dir_b,
+                    &format!("b_{i}.helix"),
+                    &pads(&format!("b{i}"), 4),
+                    sorted,
+                )
+                .await;
+                b_files.push(f.path.clone());
+                l0.push(f);
+            }
+            let levels = Arc::new(RwLock::new(HashMap::from([(0_usize, l0)])));
+            let (compacted, _) = compactor
+                .compact_l0_to_l1(levels.clone())
+                .await
+                .unwrap_or_else(|e| panic!("compact: {e}"));
+            assert_eq!(
+                compacted, 4,
+                "[sorted={sorted}] only A's 4 L0 files are compacted"
+            );
+            let map = levels.read().await;
+            let l0_left: Vec<_> = map
+                .get(&0)
+                .map(|v| v.iter().map(|f| f.path.clone()).collect())
+                .unwrap_or_default();
+            for b in &b_files {
+                assert!(
+                    l0_left.contains(b),
+                    "[sorted={sorted}] B's L0 file left the map: {}",
+                    b.display()
+                );
+                assert!(
+                    b.exists(),
+                    "[sorted={sorted}] B's L0 file was deleted: {}",
+                    b.display()
+                );
+            }
+            let l1 = map.get(&1).cloned().unwrap_or_default();
+            assert!(
+                !l1.is_empty(),
+                "[sorted={sorted}] positive control: A's L1 written"
+            );
+            for f in &l1 {
+                assert!(
+                    super::owns_sstable(&dir_a, &f.path),
+                    "[sorted={sorted}] an output landed outside A's directory: {}",
+                    f.path.display()
+                );
+                for r in compactor
+                    .read_sstable(&f.path)
+                    .await
+                    .unwrap_or_else(|e| panic!("read: {e}"))
+                {
+                    assert!(
+                        r.oid.starts_with('a'),
+                        "[sorted={sorted}] B's record '{}' was moved into A's L1",
+                        r.oid
+                    );
+                }
+            }
+            drop(map);
+            std::mem::forget(tmp);
+        }
+    }
+
+    #[test]
+    fn owns_sstable_matches_rediscovered_files_in_every_data_dir_form() {
+        // #2530 review HIGH-1: rediscovered SSTables come back as absolute
+        // `file://` URLs, whatever form the collection's data_dir was written
+        // in. The default storage URL is the RELATIVE `file://./data`.
+        use std::path::{Path, PathBuf};
+        let cwd = std::env::current_dir().unwrap_or_else(|e| panic!("cwd: {e}"));
+        let abs = cwd.join("rel_data").join("c1");
+        let discovered = PathBuf::from(format!("file://{}/L0_x.helix", abs.display()));
+        for data_dir in [
+            "file://./rel_data/c1".to_string(),
+            "./rel_data/c1".to_string(),
+            "rel_data/c1".to_string(),
+            format!("file://{}", abs.display()),
+            format!("file://{}/", abs.display()),
+            abs.display().to_string(),
+        ] {
+            assert!(
+                super::owns_sstable(Path::new(&data_dir), &discovered),
+                "data_dir {data_dir} must own {}",
+                discovered.display()
+            );
+        }
+        // Flushed form (built from the raw data_dir) still matches.
+        let raw = Path::new("file://./rel_data/c1");
+        assert!(super::owns_sstable(raw, &raw.join("L0_y.helix")));
+        // Still exact: another collection is never owned.
+        assert!(!super::owns_sstable(
+            Path::new("file://./rel_data/c1"),
+            &PathBuf::from(format!(
+                "file://{}/L0_x.helix",
+                cwd.join("rel_data").join("c10").display()
+            ))
+        ));
+        // Azure aliases resolve to the one flat Blob backend.
+        assert!(super::owns_sstable(
+            Path::new("adls://cont/t/ns/c1/data"),
+            Path::new("az://cont/t/ns/c1/data/L0_z.helix")
+        ));
+        // GCS: `gcs://` is registered alongside `gs://`, and listing returns `gs://`.
+        assert!(super::owns_sstable(
+            Path::new("gcs://bucket/t/ns/c1/data"),
+            Path::new("gs://bucket/t/ns/c1/data/L0_z.helix")
+        ));
+    }
+
+    #[test]
+    fn l0_trigger_counts_only_the_collections_own_files_in_any_form() {
+        // Round review MEDIUM-1 (M3): the trigger must count only this
+        // collection, including its rediscovered (URL-form) files.
+        let meta = |p: &str| SStableMetadata {
+            path: PathBuf::from(p),
+            level: 0,
+            hilbert_range: None,
+            num_vectors: 0,
+            size_bytes: 0,
+            created_at: chrono::Utc::now(),
+            blocks: Vec::new(),
+            bloom_filter: None,
+        };
+        let dir = std::path::Path::new("/d/t1/c1");
+        let mut l0 = vec![
+            meta("/d/t1/c1/a.helix"),
+            meta("file:///d/t1/c1/b.helix"),
+            meta("/d/t1/c1/c.helix"),
+        ];
+        l0.extend((0..5).map(|i| meta(&format!("/d/t2/c9/{i}.helix"))));
+        let levels = HashMap::from([(0_usize, l0)]);
+        assert!(
+            !super::l0_trigger_reached(&levels, dir, 4),
+            "3 own files < 4 (others ignored)"
+        );
+        assert!(
+            super::l0_trigger_reached(&levels, dir, 3),
+            "rediscovered URL form counts"
+        );
+    }
+
+    #[tokio::test]
+    async fn acquire_compaction_skips_or_waits_while_one_runs() {
+        // MEDIUM-1 (M4/M6): one compaction per collection at a time.
+        let guard = Arc::new(tokio::sync::Mutex::new(()));
+        let held = super::acquire_compaction(guard.clone(), true)
+            .await
+            .unwrap_or_else(|| panic!("first acquire"));
+        assert!(
+            super::acquire_compaction(guard.clone(), false)
+                .await
+                .is_none(),
+            "flush-triggered compaction must skip while one runs"
+        );
+        let waiter = tokio::spawn(super::acquire_compaction(guard.clone(), true));
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished(), "explicit compaction must wait");
+        drop(held);
+        assert!(
+            waiter
+                .await
+                .unwrap_or_else(|e| panic!("join: {e}"))
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn engine_sites_use_the_scoped_trigger_and_the_guard() {
+        // Structural: both compaction entry points in helix/mod.rs go through
+        // the guard (skip for flush, wait for do_compact) and the scoped trigger.
+        let engine = include_str!("mod.rs");
+        let engine = engine.split("#[cfg(test)]").next().unwrap_or(engine);
+        assert!(
+            engine.contains("compaction::acquire_compaction(guard, false)"),
+            "flush must skip"
+        );
+        assert!(
+            engine.contains("compaction::acquire_compaction(guard, true)"),
+            "do_compact must wait"
+        );
+        assert!(
+            engine.contains("compaction::l0_trigger_reached("),
+            "per-collection trigger"
+        );
+        // do_compact's level-map invalidation and optimizer-cache invalidation
+        // are scoped to the collection; so is the size-ratio trigger (#2530 r2
+        // L-2: m7/m8/m9 survived without these).
+        assert!(
+            engine
+                .contains("files.retain(|f| !compaction::owns_sstable(&collection_dir, &f.path))"),
+            "do_compact must invalidate only its own collection's entries"
+        );
+        assert!(
+            engine.contains(".filter(|f| compaction::owns_sstable(&collection_dir, &f.path))"),
+            "do_compact must invalidate only its own collection's optimizer entries"
+        );
+        assert!(
+            engine.contains(".filter(|f| compaction::owns_sstable(data_dir, &f.path))"),
+            "the size-ratio trigger must count only this collection's files"
+        );
+    }
+
+    #[tokio::test]
+    async fn one_file_registered_under_two_spellings_compacts_once() {
+        // #2530 review r2, M-2 probe B: the level map can hold one SSTable as
+        // both its raw path and its rediscovered `file://` URL. Compaction must
+        // use it once, write its records once, and drop every spelling.
+        for sorted in [true, false] {
+            let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("tempdir: {e}"));
+            let dir = tmp.path().join("coll");
+            std::fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("mkdir: {e}"));
+            let (compactor, fs) = compactor_in(&dir).await;
+            let g0 = l0_file(&fs, &dir, "g0.helix", &pads("g0", 4), sorted).await;
+            let mut g0_url = g0.clone();
+            g0_url.path = PathBuf::from(format!("file://{}", g0.path.display()));
+            let mut l0 = vec![g0, g0_url];
+            for i in 1..4 {
+                l0.push(
+                    l0_file(
+                        &fs,
+                        &dir,
+                        &format!("g{i}.helix"),
+                        &pads(&format!("g{i}"), 4),
+                        sorted,
+                    )
+                    .await,
+                );
+            }
+            let levels = Arc::new(RwLock::new(HashMap::from([(0_usize, l0)])));
+            compactor
+                .compact_l0_to_l1(levels.clone())
+                .await
+                .unwrap_or_else(|e| panic!("[sorted={sorted}] compaction must not fail: {e}"));
+            let map = levels.read().await;
+            assert!(
+                map.get(&0).is_none_or(|v| v.is_empty()),
+                "[sorted={sorted}] every spelling of every consumed L0 file must leave the map"
+            );
+            let mut ids = Vec::new();
+            for f in map.get(&1).cloned().unwrap_or_default() {
+                for r in compactor
+                    .read_sstable(&f.path)
+                    .await
+                    .unwrap_or_else(|e| panic!("read: {e}"))
+                {
+                    ids.push(r.oid);
+                }
+            }
+            let unique: std::collections::HashSet<_> = ids.iter().cloned().collect();
+            assert_eq!(
+                ids.len(),
+                unique.len(),
+                "[sorted={sorted}] a record was written twice"
+            );
+            assert_eq!(
+                ids.len(),
+                16,
+                "[sorted={sorted}] all 4 files x 4 records, once each"
+            );
+            drop(map);
+            std::mem::forget(tmp);
+        }
+    }
+
+    #[tokio::test]
+    async fn mixed_spellings_of_one_collection_resolve_as_one_scope() {
+        // #2530 review r2, M-2 probe A: v1 (live) under the raw path and a newer
+        // expired v2 under the URL spelling are the SAME collection: only the
+        // dead winner may survive.
+        let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("tempdir: {e}"));
+        let dir = tmp.path().join("coll");
+        std::fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("mkdir: {e}"));
+        let (compactor, fs) = compactor_in(&dir).await;
+        let f0 = l0_file(
+            &fs,
+            &dir,
+            "f0.helix",
+            &[vrec("victim", 1_000, 1, None, true)],
+            false,
+        )
+        .await;
+        let f1 = l0_file(
+            &fs,
+            &dir,
+            "f1.helix",
+            &[vrec("victim", 2_000, 2, Some(1), true)],
+            false,
+        )
+        .await;
+        let f1_url = PathBuf::from(format!("file://{}", f1.path.display()));
+        let (out, dead) = compactor
+            .read_sstables_resolved(&[&f0.path, &f1_url])
+            .await
+            .unwrap_or_else(|e| panic!("resolve: {e}"));
+        let victims: Vec<usize> = out
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.id == "victim")
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(victims.len(), 1, "one collection, one newest copy");
+        assert!(
+            dead[victims[0]],
+            "the survivor is the dead newest copy, not v1"
+        );
+        std::mem::forget(tmp);
     }
 }
