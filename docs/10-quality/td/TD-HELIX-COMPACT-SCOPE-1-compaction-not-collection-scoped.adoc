@@ -59,7 +59,10 @@ moves or deletes B's files, plus the GC tests from the #2521 round-3 design.
 
 * `compaction::owns_sstable(data_dir, path)` compares the **canonical** parent
   directory (`canonical_location`: strip `file://`, absolutize relative paths, fold
-  the `adls`/`abfs`/`azure` aliases to `az`, drop `.` components). Rediscovered
+  the `adls`/`abfs`/`azure` aliases to `az` and `gcs` to `gs`, drop `.` components).
+  `owned()` dedupes by canonical path, `retain_unconsumed` and the L0 trigger match
+  canonically, version-resolution scope is canonical, and the compaction guard is
+  keyed canonically. Rediscovered
   SSTables come back as absolute `file://` URLs, while the default storage URL is
   the relative `file://./data`. A raw comparison made every rediscovered file "not
   owned", so that collection never compacted again (#2530 review HIGH-1). Every compaction path (L0->L1, level->next, max-level recluster)
@@ -79,14 +82,26 @@ moves or deletes B's files, plus the GC tests from the #2521 round-3 design.
 * **`pca_model` is one engine-wide model.** Collection B reuses A's in-memory PCA
   model: wrong pruning, `transform` errors when dimensions differ, and B's model is
   never persisted.
-* **The query-optimizer result cache is keyed only by the query vector's bits and
-  `k`**, with no collection or tenant. If one engine instance serves several
-  collections' searches, that is a cross-tenant result-leak risk. It is also not
-  invalidated on writes (16b). It needs confirming which instance the search path
-  uses, then a key that includes (tenant, collection) plus write invalidation.
-  **Highest priority of these.**
-* **Search's per-collection filter is a string `starts_with`**, not a component
-  match. Cache-miss discovery appends without dedupe.
+* **Query-optimizer result cache: no cross-tenant leak (refuted 2026-11-13).** The
+  search path builds a fresh `HelixEngine` per `CollectionObjectId`
+  (`VectorOperationsService::engine_cache` -> `StorageFormatFactory::create_from_proto_async`
+  -> `HelixEngine::new()`), so each instance's cache serves exactly one collection.
+  It is still not invalidated by writes, because flushes run on a different
+  instance. An empirical probe (flush a new exact match after warming the query)
+  found the new record, so staleness did not reproduce end to end.
+* **Search's level cache is never refreshed by flushes (load-bearing workaround).**
+  Flushes register SSTables in the FLUSH path's shared engine instance, not in the
+  per-collection search instance. For `file://` data dirs, search's string
+  `starts_with` cache check never matches, so every search rediscovers from the
+  directory listing. That accident is what keeps search fresh: a #2530 attempt to
+  "fix" the match made HELIX overwrite-then-expire resurface (the conformance
+  matrix caught it), and it was reverted. Plain-path data dirs DO hit that cache
+  and can serve a stale file list (pre-existing). The real fix is for search to
+  refresh its level map from flushes (shared registry, or invalidate on flush),
+  after which the match can become `owns_sstable`.
+* **Search's per-collection filter is a string `starts_with`** (see above). Discovery
+  now dedupes by canonical path (#2530), so the level map no longer grows by one copy
+  per search.
 * `compaction_guards` gains one entry per collection and never shrinks (small;
   bounded by the number of collections ever seen).
 * A skipped flush trigger leaves >= 4 L0 files until that collection's next flush.

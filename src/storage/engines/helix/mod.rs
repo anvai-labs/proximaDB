@@ -887,8 +887,9 @@ impl HelixEngine {
 
     /// The compaction guard of one collection data directory.
     fn compaction_guard(&self, data_dir: &std::path::Path) -> Arc<tokio::sync::Mutex<()>> {
+        // Canonical key: two spellings of one directory share ONE guard.
         self.compaction_guards
-            .entry(data_dir.to_path_buf())
+            .entry(compaction::canonical_location(data_dir))
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone()
     }
@@ -1735,6 +1736,7 @@ impl UnifiedStorageFormat for HelixEngine {
         let discovered_sstables = {
             let levels_read = self.levels.read().await;
             let mut cached_sstables: Vec<SStableMetadata> = Vec::new();
+            let mut seen_canonical = std::collections::HashSet::new();
 
             // Collect all SSTables from all levels for this collection
             for sstables in levels_read.values() {
@@ -1746,12 +1748,23 @@ impl UnifiedStorageFormat for HelixEngine {
                     );
                     // Filter by collection directory to ensure collection isolation
                     // Handle both file:// URLs and plain paths
+                    //
+                    // NOTE (TD-HELIX-COMPACT-SCOPE-1): for `file://` data dirs this
+                    // string match never hits, so every search rediscovers from the
+                    // directory listing. That is load-bearing today: flushes
+                    // register new SSTables in the FLUSH path's engine instance, not
+                    // in this search instance, so a working cache hit would serve a
+                    // stale file list (#2530 review r2 follow-up; the conformance
+                    // matrix caught it). Do not "fix" the match until search
+                    // refreshes its level map from flushes.
                     let sstable_path_str = sstable.path.to_string_lossy();
                     let normalized_path = sstable_path_str
                         .strip_prefix("file://")
                         .unwrap_or(&sstable_path_str);
 
-                    if normalized_path.starts_with(&collection_data_dir) {
+                    if normalized_path.starts_with(&collection_data_dir)
+                        && seen_canonical.insert(compaction::canonical_location(&sstable.path))
+                    {
                         tracing::trace!("[HELIX] Matched! Adding to cached_sstables");
                         cached_sstables.push(sstable.clone());
                     } else {
@@ -1797,10 +1810,15 @@ impl UnifiedStorageFormat for HelixEngine {
                         level,
                         sstable.path
                     );
-                    levels_write
-                        .entry(level)
-                        .or_insert_with(Vec::new)
-                        .push(sstable.clone());
+                    // Never register a second spelling of a file already cached.
+                    let canonical = compaction::canonical_location(&sstable.path);
+                    let files = levels_write.entry(level).or_insert_with(Vec::new);
+                    if !files
+                        .iter()
+                        .any(|f| compaction::canonical_location(&f.path) == canonical)
+                    {
+                        files.push(sstable.clone());
+                    }
                 }
                 tracing::debug!("[HELIX] Cache populated with {} SSTables", discovered.len());
 
