@@ -1,0 +1,260 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= ADR-098: Metadata spine — catalog-rooted L0, LIST-validated L1 directory, declared durability mode, one planner
+:toc: left
+:toclevels: 2
+:last-updated: 2026-11-19
+
+[cols="1,3"]
+|===
+| Status | **Accepted (owner decision 2026-11-19).** Implementation Open; tracked by TD-SPINE-1 … TD-SPINE-6 and TD-PAXMETA-1.
+| Date | 2026-11-19
+| Deciders | Vijaykumar Singh
+| Amends | link:ADR-097-foundational-seams-single-logical-ir.adoc[ADR-097] D0 (adds seam **S10 Catalog**; specifies S2/S4/S6/S7 metadata obligations); link:ADR-063-objstore-native-catalog-driven-restartability.adoc[ADR-063] D3 and the WAL-object parts of D4 (scoped to one declared mode; D4's LIST-discovery rule stays mode-independent); link:ADR-069-wal-local-disk-tiered-flush.adoc[ADR-069] D1 (scoped to the other); link:ADR-094-unified-storage-substrate-and-compute-seam.adoc[ADR-094] D4 (Layer B carrier); link:ADR-010-pax-block-format.adoc[ADR-010] (truncation wording); link:ADR-032-durable-tenant-prefixed-object-store-catalog.adoc[ADR-032]; link:ADR-037-statistics-substrate-and-reference-mcp.adoc[ADR-037]; link:ADR-042-canonical-segment-statistics-contract.adoc[ADR-042]; link:ADR-045-pax-durable-core-vs-serving-metadata.adoc[ADR-045]; link:ADR-050-statistics-fed-datafusion-route-selection.adoc[ADR-050]; link:ADR-053-cross-modal-query-fabric.adoc[ADR-053]; link:ADR-064-query-engine-pipeline-decision-dispatch-lowering-trace.adoc[ADR-064]; link:ADR-073-disk-cache-tier-and-backend-aware-coalescing.adoc[ADR-073]; link:ADR-0083-consolidated-catalog-identity-model.adoc[ADR-0083]; link:ADR-007-iceberg-rest-catalog-server.adoc[ADR-007]
+| Supersedes (in part) | link:ADR-035-per-tenant-system-catalog-cache.adoc[ADR-035] D1 + D3 write branch; link:ADR-048-unified-system-catalog-native-authority.adoc[ADR-048] D6 / P4; TD-USUB-8 slice 3; TD-SC-3; TD-SC-5 — see <<_d6_supersessions>>
+| Relates to | ADR-033 (cost spine DEPTH ≫ WIDTH ≫ BYTES ≫ CPU), ADR-062 (self-describing footer), ADR-095 (local-volume OLTP contract), ADR-096 (product direction), TD-PAXDIR-1 / TD-SEAM-10 (centroid directory), TD-SEAM-1 / TD-SEAM-4 (Iceberg publication), TD-SEAM-14 (spill durability boundary), TD-MANIFEST-1, TD-LEASE-INFRA-1, TD-CAT-7, TD-NS-1, TD-WAL-6
+| Tracked under | TD-SPINE-1 … TD-SPINE-6, TD-PAXMETA-1
+|===
+
+== Context
+
+A pre-GA checkpoint (2026-11-19) compared ProximaDB's metadata against PostgreSQL
+(`pg_class` / `pg_attribute`), Iceberg v2 (`metadata.json` → manifest list → Avro manifests),
+Delta (JSON log + Parquet checkpoints) and catalog-rooted designs (Snowflake/FoundationDB,
+DuckLake). Every one of them answers four questions before reading data, and they form the
+layers this ADR names:
+
+[cols="1,2,3", options="header"]
+|===
+| Layer | Question | ProximaDB today (develop @ `23bced026`)
+| **L0** | What is this table/collection; what is its schema? | `SystemCatalog` — the `pg_class` equivalent. Field-named MessagePack deltas, snapshot and identity sidecar with **no magic or version byte** (`src/services/system_catalog_state.rs:112,527,620`). **One global snapshot**; in object-store mode **every DDL publishes the full image** (`src/services/catalog_snapshot_store.rs:372`); cross-pod reload swaps the whole image (`src/services/system_catalog.rs:791`); the namespace stable-id floor is global although documented per-account (`system_catalog.rs:304`).
+| **L1** | Which files/segments make up the current state, and what is in them? | Warehouse: hand-rolled Iceberg v2 (Avro manifests). PAX: **nothing** — segments are LISTed and per-segment facts live only in each footer, so collection-level questions cost 2 GETs per segment (TD-PAXMETA-1; 20–80 GET/q cold at 1M). The TD-PAXDIR-1 centroid directory (`centroids-<gen>.pxcd`) already carries per-segment decode keys, but only after compaction and only for trained segments.
+| **L2** | Where inside the file are my rows? | PAX footer + footer-index (custom LE binary, versioned); Parquet footer. Sound.
+| **Data** | — | PAX (vector), Parquet (warehouse). Sound (ADR-033 / ADR-094 D1).
+|===
+
+The checkpoint's conclusion is that **no storage-format pivot is warranted**: the leaf formats are
+right and encoding CPU is second-order (a 10k-file manifest decodes in roughly one object-store RTT
+and is immutable, so it is paid once). The cost and robustness problems are in the *layers between*
+the leaves and the catalog, and in a set of ADRs that contradict each other about them:
+
+* Three ADRs claim catalog authority (ADR-032, ADR-048, ADR-063); ADR-035 D1 specifies a
+  u64-oid-keyed layout that ADR-0083 retired and the default catalog never used.
+* ADR-094 D4 and ADR-048 D6 put collection serving metadata *into* the catalog; ADR-063 D4 says LIST
+  is the discovery authority and manifests are caches.
+* ADR-063 D3 says an ack means "durable **and LISTable on the object store**"; ADR-069 D1 says the
+  WAL is "never on object storage". Both are live code paths (`object_store_restart_recovery.rs`
+  depends on the former; `wal_local_dir` implements the latter), selected implicitly by a legacy
+  default, with a boot guard that only warns (`src/network/shared_services.rs:3523`).
+* Two query front doors share no tenant or freshness contract: `ComputeScheduler` (pgwire,
+  `api_handlers.execute_sql`) and `UnifiedQueryPort` (canonical REST `/sql`, REST v2 query, MCP),
+  which refuses plain SQL and has no freshness handling.
+* Iceberg metadata (`metadata.json`, manifests, manifest lists) is never garbage-collected and
+  `metadata-log` grows by one entry per commit (`crates/storage/proximadb-iceberg-engine/src/iceberg.rs:824-833`);
+  manifests are re-read on every query, and per-file `column_stats` are written but unused for
+  file pruning (`src/datafusion/engine_adapters/object_store_parquet_reader.rs:929,2162`).
+
+ADR-097 D0 defines the contracts every modality plugs into (S1–S9) but has **no catalog seam**.
+This ADR adds it and settles the metadata obligations of the seams that touch metadata.
+
+== Decision
+
+=== D0 — Seam S10 Catalog, and the metadata obligations of S2/S4/S6/S7
+
+ADR-097's seam table gains:
+
+[cols="1,5", options="header"]
+|===
+| Seam | Contract
+| **S10 Catalog** | One catalog authority (ADR-063 D1, unchanged). Every persisted catalog record is framed by a versioned envelope (D1). The catalog holds identity, schema, layouts, statistics summaries and pointers — **never per-file or per-segment lists**; it grows with tables, not with data.
+|===
+
+and the existing seams are specified as follows: S2 Durable resolves exactly one declared
+durability mode (D3); S4 Publish includes metadata retention and a bounded metadata log (D4.2);
+S6 Plan has one decision path for every surface (D5); S7 Index includes the L1 collection segment
+directory (D2).
+
+=== D1 — L0 catalog records: an envelope now, per-account shards next
+
+. **Envelope.** Every persisted SystemCatalog record — WAL delta payload, snapshot, identity
+  sidecar — is written as `{magic, format_version, body_codec, body}`. The pattern reuses the
+  existing binary framings (PMHEAD `b"PMHEAD\0\x01"` in `manifest/head.rs`; ADR-063 D4 r3.1's
+  plaintext authenticated envelope), not ADR-066's JSONL header. **Absent magic ⇒ legacy
+  field-named MessagePack**, readable forever (mixed-read-safe per CLAUDE.md #8). Readers sniff
+  unconditionally; the envelope **writer** ships behind an opt-in write gate (default OFF until
+  baked, with an `ENV_GATE_REGISTRY.adoc` row).
+. **Body codec stays MessagePack for now.** Choosing protobuf (field numbers) for the 41-field
+  `CatalogTableSchema` is a separate, later decision; the envelope makes it a non-flag-day change.
+  The existing `catalog.proto` messages are a smaller wire API and are not the persisted schema.
+. **Per-account shards (next).** The single global snapshot is replaced by a small root
+  (global registries, id high-waters, `account → shard generation`) plus one shard per account,
+  each committed through `ManifestCommitter` and stored **under the account's tenant prefix via
+  `DrPathBuilder`** (structural isolation, carrying TD-CAT-2). A DDL publishes its account's shard and the root;
+  followers adopt only changed shards. Bytes written per DDL become O(account), not O(fleet).
+. **Per-account namespace floor** for new allocations; existing stable ids are never renumbered
+  (TD-SPINE-2; TD-NS-1 S4 separately fences the `CatalogIdService` minting path).
+
+=== D2 — L1: the collection segment directory is the single collection-level fact cache
+
+. The PXCD centroid directory (`crates/storage/proximadb-storage-common/src/centroid_directory.rs`)
+  is generalized into the **collection segment directory**. PXCD already lists every live segment
+  (uncovered ones as `model_idx = u32::MAX` with no facts) and v2 already carries decode keys for
+  trained ones (`PROXIMADB_PAX_WRITE_DIRECTORY_DECODE_KEYS`); generalization means **every** entry
+  carries the decode key (header-prefix extents, footer offset/length, rows, quant tag,
+  `has_f32_tier`, block stats, etag) and the per-segment statistics of ADR-042.
+. It is **published at flush and at compaction**, create-only at generation g+1 (the existing
+  `publish_centroid_directory` protocol), behind a default-OFF write gate (`PROXIMADB_PAX_WRITE_DIRECTORY_AT_FLUSH`) until baked.
+. It is **never authoritative.** LIST remains the discovery authority (ADR-063 D4); an entry is
+  used only when its etag matches the LISTed object, otherwise the reader falls back to the footer.
+  The object itself stays self-describing and wins on divergence (ADR-062, TD-USUB-8 rules).
+. The catalog **does not grow** with segment count: no per-segment rows in xCatalog. This replaces
+  the "catalog-resident Layer B" direction of ADR-094 D4, ADR-048 D6 and TD-USUB-8 slice 3. Their
+  goals (cold start, cross-node sharing, planner pruning) are met by the directory object for
+  **both** PAX read lanes: the SST search route and the DataFusion PAX lane
+  (`PaxSplitReader::load_ranged`), which takes footer and SegmentIndex extents from the entry's
+  decode key instead of probing the tail. Blooms, deletion vectors and stripe data stay in the
+  object and are fetched by reference.
+. Target: a cold vector query costs LIST + directory + one data wave; collection-level questions
+  (vector counts, exact-authority checks, coarse probing) read no segment bodies or footers.
+. A new metadata format is **not** introduced for this (an Arrow-IPC manifest was considered and
+  rejected in favour of reusing PXCD; see Alternatives).
+
+=== D3 — S2: exactly one declared durability mode
+
+[cols="1,3,3", options="header"]
+|===
+| Mode | Ack means | Contract
+| `local_volume` | The WAL frame is fsync'd on a local, reattachable volume | ADR-069 D1, ADR-095 D1; object store is the coalesced durable tier for flushed data
+| `object_store_serverless` | The WAL object is durable and LISTable on the object store | ADR-063 D3 + the WAL-object parts of D4 (pre-PUT ordering token, put-if-absent WAL objects, LIST replay under `{collection}/wal/`)
+|===
+
+* The server resolves the mode at boot: a declared `durability_mode` wins; when unset it is
+  **inferred at boot from one deterministic input**: the global `wal_local_dir` if set
+  (⇒ `local_volume`), otherwise the scheme of the server's primary WAL location
+  (`write_buffer_directory`, else `data_directories[0]`): a local path ⇒ `local_volume`, with the
+  WAL root defaulting to `{data_dir}/wal` for every collection; an object URL ⇒
+  `object_store_serverless`, with per-collection WAL under the catalog-derived base location.
+  The resolved mode and the reason are **logged at INFO** and recorded in `durable_locations`. There is no silent legacy path and no boot break for existing configs.
+* Each mode carries a ratchet test that the resolved WAL root has that mode's scheme.
+* The object-store spill placement durability/ownership boundary is TD-SEAM-14's and is not
+  restated here; it must resolve to one of these two modes.
+
+=== D4 — Encodings by layer, and S4 metadata hygiene
+
+. **Encodings.**
++
+[cols="1,2,3", options="header"]
+|===
+| Layer | Encoding | Why
+| L0 catalog records | Envelope (D1) + MessagePack body | Format agility without a flag day
+| L1 segment directory | PXCD (custom, versioned) | Reuse; hot path; already in the search route
+| L2 file internals | PAX footer / Parquet footer | Unchanged
+| Iceberg export seam | Avro manifests + JSON `metadata.json` | Spec-mandated; **only here**
+| REST / external | JSON, Arrow (Flight), protobuf (gRPC) | Existing transports; no new RPC protocol
+|===
++
+The WAL's `proto`/`avro` serialization slots are a bincode facade (TD-WAL-6); they collapse to one
+real encoding. Avro appears nowhere outside the Iceberg seam.
+. **Iceberg metadata hygiene (S4).** Metadata retention **follows the data-generation window**
+  that TD-GCRETAIN-1 already decided (`PROXIMADB_MATERIALIZE_GC_RETAINED_GENERATIONS`, default 3,
+  floor 2): the retained `metadata.json` versions, their manifest lists and manifests are exactly
+  those of the retained generations, and `metadata-log` is bounded to the same window (a log entry
+  older than the data window would point at a snapshot whose files are already deleted). The rule
+  is **clock-free** — TD-GCRETAIN-1 declined time-based grace and this ADR adopts that decision; it
+  does not use TD-MANIFEST-1's min-age. Unreachable metadata is deleted best-effort beside the
+  existing data-file GC at MATERIALIZE; no new job framework.
+. **Manifests are planning data.** Per-file `column_stats` already written to manifests prune
+  files before splits are generated (the bounds TD-OLAPFMT-2 writes under Iceberg's `truncate(16)`
+  metrics mode: a string longer than 16 characters keeps a truncated lower bound and **no** upper
+  bound, so a missing bound always means unbounded), and parsed manifests are cached by their immutable path in
+  `TenantCache` (the latest-version LIST still runs per query, so freshness is unchanged).
+
+=== D5 — S6: one decision path for every surface
+
+The single-logical-IR rule is ADR-097 D1, with decision/dispatch separation in ADR-064 D1 and the
+cross-modal fabric in ADR-053 D2 (ADR-096 D4's "one planning frame" is the roadmap, not the
+planner). `UnifiedQueryPort` therefore delegates plain SQL to the `ComputeScheduler` decision path
+(`QueryFacadeAdapter::execute_sql`, `src/query/facade/adapter.rs`, which already reaches
+`relational_pipeline::try_run_select` and the `ComputeScheduler`), carries `PortIdentity` explicitly rather than through a
+task-local, and honours freshness. The transport-parity suite extends to canonical `/sql` and
+pgwire. Owner-versus-reader *placement* (writes and Strong reads on the partition-lease holder;
+scans on cache-affine stateless readers) is the follow-on direction and is not decided here.
+
+[[_d6_supersessions]]
+=== D6 — Supersessions and amendments
+
+[cols="1,3", options="header"]
+|===
+| Section | Disposition
+| ADR-035 D1, D3 write branch, WRITE/INVALIDATION decision-tree rows | Superseded by D1 (that layout is the NativeCatalog fallback's). D2/D4 stay, keyed on account shard + generation.
+| ADR-048 D6 / P4 (segments and leases as cataloged entries) | Superseded by D2.
+| ADR-094 D4 ("Layer B into xCatalog") | Amended by D2: the carrier is the L1 directory.
+| ADR-045 Layer B carrier; ADR-050 D2 stats source; ADR-042 D3 aggregation source | Amended by D2.
+| ADR-063 D3 + WAL-object parts of D4 | Scoped to `object_store_serverless` (D3). D4's "LIST is the discovery authority; manifests are caches" stays **mode-independent** and is what D2 relies on. D1 remains the single authority statement.
+| ADR-069 D1 | Scoped to `local_volume` (D3).
+| ADR-032 D1/D2/D4 | D1 realized by SystemCatalog; D4 marker replaced by the D1 envelope.
+| ADR-010 truncation amendment ("catalog-referenced segment") | Read as LIST-discoverable under the catalog-derived prefix.
+| ADR-053 D2, ADR-064 scope | Two cores exist today; convergence is D5.
+| ADR-073 D3 | Refresh per account shard.
+| ADR-007 synthetic snapshot section | Superseded by ADR-097 D3; residual in TD-SEAM-1.
+| TD-USUB-8 slice 3; TD-SC-3; TD-SC-5; TD-CAT-1; TD-OLAPFMT-3 | Superseded or closed (see each entry).
+| TD-CAT-2 (tenant-prefixed catalog paths) | Re-scoped into TD-SPINE-2: the default catalog is one `_operator/` image, so the isolation goal is still open.
+| TD-MANIFEST-1 "no mutable tip pointer" | Reworded: no *unconditional or payload-less* tip pointer; the etag-CAS head is legitimate.
+|===
+
+== Alternatives considered
+
+=== Iceberg everywhere (file-tree spine for every modality)
+Five to six dependent round trips before data (LIST version → `metadata.json` → manifest list →
+manifests → footers), commits serialized on a metadata CAS, and a snapshot per commit that needs
+maintenance which does not exist here. Kept as the **interop projection** for warehouse tables, not
+as the spine.
+
+=== Delta-style JSON log + checkpoints
+Fewer waves than Iceberg but log replay, the same small-file problem, and no existing code
+(`src/storage/formats/open/delta.rs` compaction is a placeholder). Rejected.
+
+=== Pure catalog-resident metadata (per-file lists in the catalog, DuckLake/Snowflake style)
+Fastest planning, but the catalog's RAM and snapshot size grow with data volume across all tenants
+— the opposite of D1's sharding goal — and ADR-063 D1 forbids a side RDBMS. Rejected; the catalog
+holds pointers and summaries only.
+
+=== A new Arrow-IPC collection manifest
+Columnar and vectorizable, but a second collection-level format beside PXCD, which already sits in
+the search route with zero-GET resident queries. Rejected under reuse-first (CLAUDE.md #12/#19).
+Revisit only if directory size makes row-wise decode measurable on a per-query trace.
+
+=== Protobuf body for catalog records now
+Gives field-number evolution, but requires new persisted messages for a 41-field struct and a
+hand-maintained v1 proto mirror. Deferred behind the envelope (D1.2).
+
+=== Fail-closed boot when the durability mode is undeclared
+Safest, but a breaking config change for every existing deployment. Inference plus a loud boot log
+gives the same observability without a flag day (owner decision).
+
+== Consequences
+
+* One coherent spine: each metadata fact has one layer, one format, one owner document.
+* Cold-path round trips become an explicit, ratcheted target per layer (D2, D4.3) measured on
+  per-query traces, not kernel benchmarks.
+* Catalog cost scales with tenants' own activity, not the fleet (D1.3).
+* Interop stays standard (Iceberg REST, Parquet, Avro only at the seam) while the internals stay
+  vertical (CODESIGN mandate 4).
+* Risks: the directory and its LIST validation add a publish step to flush (gated, default OFF until
+  baked); metadata GC deletes files (grace window + reachability check + interop read-back gate);
+  shard migration touches the catalog's recovery root (mixed-read-safe envelope first, then shards).
+
+== Sequencing and gates
+
+[cols="1,3,3", options="header"]
+|===
+| Item | Work | Gate
+| TD-PAXMETA-1 | D2 directory generalization + flush publish + consumers + delete `SstManifest` | Counting-filesystem pins (0 per-segment GETs with a valid directory; stale-etag negative control); mixed-version round trip; SIFT recall ratchet unchanged; MinIO SIFT1M cold requests/waves on vs off in `BENCHMARK_EVIDENCE.toml`
+| TD-SPINE-3 | D4.2 metadata GC + bounded log | Generation-window retention tests (clock-free, per TD-GCRETAIN-1); `iceberg_interop_e2e` read-back green after GC
+| TD-SPINE-4 | D4.3 manifest-stats file pruning + manifest cache | Pruning negative controls (boundaries, nulls, strings); TPC-H/DS ratchets unchanged; io-trace GETs/query before/after
+| TD-SPINE-1 | D1.1 envelope | Legacy-read and round-trip tests
+| TD-SPINE-2 | D1.3–D1.4 shards + per-account floor | Bytes/DDL O(account); all cross-pod catalog tests green
+| TD-SPINE-5 | D3 durability mode | Per-mode WAL-root ratchet; crash-recovery and object-store restart suites green
+| TD-SPINE-6 | D5 one decision path | Transport parity extended to canonical `/sql` and pgwire
+| Runbook | Real S3/Azure traces | `cloud_latency` / `object_store_latency_floor` move from unverified to measured
+|===

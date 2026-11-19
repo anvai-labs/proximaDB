@@ -1,0 +1,39 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-SPINE-4: manifest per-file statistics are written but never used, and manifests are re-read on every query
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open** (filed 2026-11-19).
+| Priority | **HIGH** for warehouse read latency. Every cold OLAP query pays `metadata.json` + manifest list + manifests before any footer, and then opens every file's footer because files are not pruned from manifest bounds (ADR-033: DEPTH ≫ WIDTH).
+| Component | `src/datafusion/engine_adapters/object_store_parquet_reader.rs` (`manifest_selected_files` :929, `prune_splits` :1446, manifest-managed cache bypass :2162-2165); `crates/storage/proximadb-iceberg-engine/src/iceberg.rs` (`ColumnFileStats` :260, `stats_from_avro` :416); `src/datafusion/engine_adapters/table_open_cache.rs` (default off, `PROXIMADB_OLAP_TABLE_CACHE`); `crates/foundation/proximadb-cache` (`TenantCache`).
+| Authority | link:../../12-design/adr/ADR-098-metadata-spine.adoc[ADR-098] D4.3 (seam S4/S5)
+| Relates to | TD-OLAPFMT-2 (writes the manifest bounds; `truncate(16)` drops string upper bounds, `crates/storage/proximadb-iceberg-engine/src/stats.rs`), TD-SPINE-3, TD-OLAP-9 (partition spec: partition bounds in manifests build on this), ADR-050 (stats-fed routing), ADR-052 (scan avoidance is the dominant cost)
+|===
+
+== Problem
+
+* `manifest_selected_files` reads the latest `metadata.json` (LIST), the manifest list and manifests
+  on every query; the table-open cache is bypassed for every manifest-managed base.
+* Row-group pruning uses footer stats, zone maps and Blooms, but the per-file bounds already in the
+  manifests are not consulted, so every surviving file's footer is fetched.
+
+== Fix
+
+. Cache parsed snapshot file lists and per-file stats keyed by the **immutable** metadata path in
+  `TenantCache` (byte-weighted, tenant-fair). The latest-version LIST still runs per query, so
+  freshness and read-after-write are unchanged (mandate #16).
+. Before generating splits, evaluate pushed-down filters against per-file `ColumnFileStats`, reusing
+  the predicate evaluation in `prune_splits`. Conservative by construction: missing/null bound ⇒ keep;
+  a string longer than 16 characters has a truncated lower bound and no upper bound (`truncate(16)`), so it is pruned only on the lower bound; type mismatch ⇒ keep.
+. Emit files-pruned and manifest-cache hit counters in the query-scoped I/O trace.
+
+== Acceptance
+
+* Negative controls: a file holding a matching row is never pruned at boundary values, with nulls,
+  and with string bounds.
+* TPC-H 22/22 and TPC-DS pgwire ratchets unchanged.
+* io-trace evidence (pgwire query on a MATERIALIZEd table): GETs/query and files pruned before vs
+  after, recorded in `BENCHMARK_EVIDENCE.toml`.
+* Write → read with a cached manifest returns the new rows (cache keyed on immutable path, not table).

@@ -34,12 +34,16 @@ Stratify the segment per ADR-045:
 
 * **Layer A — durable open core:** stripes (incl. co-located RaBitQ/SQ8 rerank) + MVCC columns.
   Immutable; ships 1:1 to Iceberg.
++
+*Amended 2026-11-19 (link:../../12-design/adr/ADR-098-metadata-spine.adoc[ADR-098] reconciliation):* "ships 1:1 to Iceberg" is stale; it holds per modality (ADR-045 amendment, ADR-094 D1). Relational-only Layer A is Parquet-encoded and ships 1:1; vector/multimodal Layer A stays PAX and is converted on export.
 * **Layer B — rebuildable serving metadata:** `RowDirectory`, `ColumnMeta`, bloom, `BlockFooter`,
   `SegmentIndex`, zone summaries, `PDV1` deletion vector. Regenerable from (Layer A + WAL).
 
 New segment magic/version (mixed-read-safe). On cold-start, regenerate Layer B from Layer A + WAL
 *without* re-reading vector data. **Co-location is inviolable:** filter + vector stripes stay
 together in Layer A (the cascade must keep working with no extra GET).
+
+*Amended 2026-11-19:* the cold-start Layer B goal is partly met already: PXCD v2 directory entries carry per-segment decode keys (link:TD-PAXDIR-1-collection-global-centroid-directory.adoc[TD-PAXDIR-1] D6), so a directory-planned segment's header prefix, Region A0, Region-A header and ANN footer fields come from the directory and its first read is its probed cells. The collection-level carrier is the L1 directory (ADR-098 D2, link:TD-PAXMETA-1-collection-level-segment-facts.adoc[TD-PAXMETA-1]).
 
 == Dependencies
 

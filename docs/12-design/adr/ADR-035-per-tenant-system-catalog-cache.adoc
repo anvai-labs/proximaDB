@@ -4,7 +4,7 @@
 
 [cols="1,3"]
 |===
-|Status|Proposed (reconciled 2026-10-15). The tracking TDs were never filed at reconciliation time; **filed 2026-10-26** as TD-SC-1…5 in `docs/10-quality/td/` (Open, gated on this ADR's acceptance; TD-SC-3 carries the composite-key conflict below). Keying on ADR-031's `u64 object_id` (TD-SC-3) conflicts with ADR-0083, which retires the u64 as identity in favour of the composite; re-key on the composite before implementing.
+|Status|Proposed (reconciled 2026-10-15). The tracking TDs were never filed at reconciliation time; **filed 2026-10-26** as TD-SC-1…5 in `docs/10-quality/td/` (Open, gated on this ADR's acceptance; TD-SC-3 carries the composite-key conflict below). Keying on ADR-031's `u64 object_id` (TD-SC-3) conflicts with ADR-0083, which retires the u64 as identity in favour of the composite; re-key on the composite before implementing. *Amended 2026-11-19 (link:ADR-098-metadata-spine.adoc[ADR-098]):* D1 (u64-oid-keyed `_syscat/objects/{oid}.json`), D3's write branch, and the WRITE/INVALIDATION decision-tree rows are superseded by ADR-098 D1 — that layout belongs to the `NativeCatalog` fallback; the canonical layout is per-account SystemCatalog snapshot shards (TD-SPINE-2). D2 (3-tier read cache) and D4 (hydration) stay, re-keyed on account shard + shard generation instead of oid + corpus version.
 |Date|2026-06-27
 |Deciders|Vijaykumar Singh
 |Relates to|ADR-032 (Durable, tenant-prefixed object-store catalog — the storage substrate this caches; D3 system-only writes), ADR-031 (Stable `u64` object_id physical key — the per-type globally-unique id the metadata group is keyed by), ADR-027 (Unified storage + metering substrate — the OPERATIONAL group: coalesced `_metering`/`_trace` writers, TD-161 landed), ADR-030 (hot-path trace+meter seam — the query-scoped I/O trace this is measured against), `CODESIGN_DIMENSIONAL_ARCHITECTURE_2026_06_19.adoc` (dominant cost term = I/O round-trips, isolation structural, treat the boundary as the contract)
@@ -23,6 +23,8 @@ Already on `develop` (this ADR composes, it does not invent): `TenantCache` (byt
 This changes on-disk metadata addressing (object_id-keyed) and adds a warm-cache tier, so per the storage-format-migration mandate it needs this ADR, must be **mixed-read-safe**, and ships **default-OFF/additive** per slice.
 
 == Decision
+
+*Amended 2026-11-19 (link:ADR-098-metadata-spine.adoc[ADR-098]):* D1, the write branch of D3, and the WRITE and INVALIDATION rows of the decision tree below are superseded by ADR-098 D1. The oid-keyed `_syscat/objects/{oid}.json` layout describes the `NativeCatalog` fallback only; the canonical layout is per-account SystemCatalog snapshot shards (TD-SPINE-2). D2 and D4 stand, re-keyed on account shard + shard generation.
 
 === D1 — Two object-store groups (canonical authority, grouped by access pattern)
 Under each tenant prefix (`data/{tenant}/…`, ADR-032/TD-CAT-2), split the system catalog by access pattern:

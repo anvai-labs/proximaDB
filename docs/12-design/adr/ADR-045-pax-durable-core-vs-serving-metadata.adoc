@@ -83,6 +83,11 @@ the open format):
 * `BlockFooter` + `SegmentIndex`.
 * Deletion vector (`PDV1`) per ADR-025.
 
+*Amended 2026-11-19 (link:ADR-098-metadata-spine.adoc[ADR-098]):* Layer B's collection-level
+carrier is the L1 collection segment directory object (ADR-098 D2), not xCatalog (ADR-094 D4).
+The directory is LIST-validated by etag and never authoritative, so it stays consistent with
+the "Layer B is rebuildable" contract below.
+
 Contracts:
 
 * **Layer B is derivable from (Layer A + WAL replay).** On cold-start, Layer B can be regenerated

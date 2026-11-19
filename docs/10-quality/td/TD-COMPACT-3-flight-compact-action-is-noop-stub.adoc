@@ -49,5 +49,7 @@ asynchronous, return a job id and expose completion via the diagnostics
 route-health endpoint (or a `compaction_status` action) instead of
 `success: true` with zero work done.
 
+*Amended 2026-11-19 (link:../../12-design/adr/ADR-098-metadata-spine.adoc[ADR-098]):* the job outcome should also report the L1 collection segment directory generation the compaction published (ADR-098 D2), or that none was published, so a caller can tell when readers can plan on the compacted segment set.
+
 S3 — Promote flush-path compaction errors from `debug!` to `warn!` with the
 collection id — silent failure hid both the stub and the OOM during testing.

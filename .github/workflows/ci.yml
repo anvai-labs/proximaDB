@@ -166,6 +166,7 @@ jobs:
       docs: ${{ steps.filter.outputs.docs }}
       docs_site: ${{ steps.filter.outputs.docs_site }}
       td_citations: ${{ steps.filter.outputs.td_citations }}
+      doc_guards: ${{ steps.filter.outputs.doc_guards }}
       proto: ${{ steps.filter.outputs.proto }}
       panic_policy: ${{ steps.filter.outputs.panic_policy }}
       capability_facade: ${{ steps.filter.outputs.capability_facade }}
@@ -390,6 +391,15 @@ jobs:
             td_citations:
               - 'docs/10-quality/td/**'
               - 'scripts/check_td_cited_tests.py'
+            # A guard edited without any doc change must still run itself
+            # (else a broken guard lands green and fires on the next docs PR).
+            doc_guards:
+              - 'scripts/check_doc_references.py'
+              - 'scripts/check_td_adr_unique.py'
+              - 'scripts/check_design_status_index.py'
+              - 'scripts/__init__.py'
+              - 'tests/scripts/test_check_doc_references.py'
+              - 'docs/_internal/roadmap/DOC_REFERENCES_BASELINE.json'
               - 'src/**'
               - 'crates/**'
               - 'apps/**'
@@ -2241,7 +2251,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15  # max 1 min over 14 runs, 2026-10-09..11
     needs: changes
-    if: needs.changes.outputs.docs == 'true' || needs.changes.outputs.td_citations == 'true' || needs.changes.outputs.docs_site == 'true'
+    if: needs.changes.outputs.docs == 'true' || needs.changes.outputs.td_citations == 'true' || needs.changes.outputs.docs_site == 'true' || needs.changes.outputs.doc_guards == 'true'
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
@@ -2279,11 +2289,20 @@ jobs:
       # costs no toolchain here. TD-DOCSITE-1.
       - name: Check no user-facing page is silently unpublished
         run: python3 scripts/check_docs_site_coverage.py
-      - name: Check documentation links
-        run: |
-          echo "Checking for broken links in documentation..."
-          find docs -name "*.md" -o -name "*.adoc" | head -20 || true
-          echo "Documentation validation complete"
+      # Replaces a step that only ran `find docs | head -20` and could never
+      # fail. Per-file bidirectional ratchet over dead link:/xref:/include::
+      # targets and TD/ADR ids that resolve to no live or archived entry
+      # (ADR-098 reconciliation, 2026-11-19). Stdlib only.
+      - name: Check documentation references (dead links, orphan TD/ADR ids)
+        run: python3 scripts/check_doc_references.py
+      - name: Doc-reference guard unit tests
+        run: python3 -m unittest discover -s tests/scripts -p 'test_check_doc_references.py'
+      # Advisory: status-of-record docs whose status-as-of tag is older than the
+      # window. Time-driven, so it must never redden develop by itself; it
+      # surfaces drift on every PR instead of only on a local make run.
+      - name: Status-as-of staleness report (advisory)
+        continue-on-error: true
+        run: python3 scripts/check_status_as_of.py
 
   # ============================================================================
   # COMPILE GATE - lib + test shapes, both REQUIRED, in parallel

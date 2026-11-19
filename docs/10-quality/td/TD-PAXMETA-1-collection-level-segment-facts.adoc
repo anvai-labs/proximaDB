@@ -5,10 +5,10 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | **Open** (filed 2026-10-19).
+| Status | **Open — design settled by link:../../12-design/adr/ADR-098-metadata-spine.adoc[ADR-098] D2 (2026-11-19).** Formerly: Open (filed 2026-10-19).
 | Priority | **MEDIUM**. Correctness is unaffected; the cost lands on cold queries and on the GET-depth budget the PAX cascade is measured against (ADR-033: DEPTH ≫ WIDTH ≫ BYTES ≫ CPU).
 | Component | PAX segment footer (`crates/storage/proximadb-storage-common/src/segment_layout.rs`, `SegmentFooterIndex`), SST search routing (`src/storage/engines/sst/search/mod.rs`: `segment_vector_count`, `pax_footer_facts`, `all_segments_coarse_rabitq_pax_without_f32_tier`, `durable_vector_count_for_rebuild`), catalog / Iceberg manifests
-| Relates to | TD-SEAM-10 (collection-global centroid directory), TD-SEAM-11 (P5a: `.pax` row count), TD-CACHE-9 (persistent PAX warm tier), TD-PAXRG-1 (row-group Region D), ADR-062 (self-describing tail footer), ADR-097 S7 (indexes as catalog projections), `docs/current/LAKEHOUSE_PLAN.adoc` Part C
+| Relates to | TD-SEAM-10 (collection-global centroid directory), TD-SEAM-11 (P5a: `.pax` row count), TD-CACHE-9 (persistent PAX warm tier), TD-PAXRG-1 (row-group Region D), ADR-062 (self-describing tail footer), ADR-097 S7 (indexes as catalog projections), `docs/current/LAKEHOUSE_PLAN.adoc` Part C, link:../../12-design/adr/ADR-098-metadata-spine.adoc[ADR-098] D2 (L1 collection segment directory), link:TD-USUB-8-catalog-resident-serving-metadata-collapses-cold-read-depth.adoc[TD-USUB-8] (slice 3 superseded by this TD)
 |===
 
 == Problem
@@ -39,7 +39,47 @@ Parquet and Iceberg solve the same problem with a *manifest*: per-file record co
 statistics live one level up, so a planner prunes and routes without opening data files. PAX has
 no equivalent level.
 
-== Fix direction (to be validated by the PAX spec thought experiments)
+== Fix approach (amended 2026-11-19, link:../../12-design/adr/ADR-098-metadata-spine.adoc[ADR-098] D2)
+
+The collection-level carrier is the **L1 collection segment directory**, a generalization of the
+existing PXCD centroid directory rather than a new manifest. It is an S7 projection: LIST-validated,
+never authoritative (ADR-063 D4 stands), and it does not grow the catalog with segment count.
+
+. **Generalize PXCD.** Extend the centroid directory
+  (`crates/storage/proximadb-storage-common/src/centroid_directory.rs`) so its entries carry facts
+  for ALL live segments, not only segments covered by a trained coarse model: URL, size, row count,
+  LSN range, quantization tier, `has_f32_tier`, and the A0 summary where one exists. A new PXCD
+  version byte keeps it mixed-read-safe; readers fall back to the per-segment footer path when the
+  version is unknown.
+. **Publish at flush and at compaction**, create-only at generation g+1 (as PXCD already is at
+  compaction). Each entry records the segment's ETag, and a reader trusts an entry only when the
+  LIST it already issues reports that same ETag. A publish failure never fails the flush or the
+  compaction.
+. **Per-entry statistics per ADR-042** (`SegmentStatistics`), so planning and the ADR-037 envelope
+  aggregate from directory entries, with footers as the fallback.
+. **Delete the dead `src/storage/engines/sst/manifest.rs`** (`SstManifest` and friends). Its types
+  have no users outside the module (only comments elsewhere name `SstManifest`; the `SstableFileInfo`
+  in use is a separate struct in `sst/utils.rs`).
+. **Both PAX read lanes consume the directory** (ADR-098 D2.4; carries TD-USUB-8 slice 3): the SST
+  search route (the consumers listed under Problem) and the DataFusion PAX lane
+  (`PaxSplitReader::load_ranged`, `crates/storage/proximadb-block-format/src/ranged.rs`), which takes
+  footer and SegmentIndex extents from the entry's decode key instead of probing the tail. Blooms,
+  deletion vectors and stripe data stay in the object and are fetched by reference.
+. **Write gate `PROXIMADB_PAX_WRITE_DIRECTORY_AT_FLUSH`**, default OFF until baked, registered in
+  `ENV_GATE_REGISTRY.adoc` with the code. Compaction-time publication stays on its existing
+  `PROXIMADB_PAX_WRITE_CENTROID_DIRECTORY` gate.
+
+The per-object footer-facts cache from TD-SEAM-11 stays as the fallback for segments with no valid
+entry.
+
+== Superseded proposal (2026-10-19)
+
+_Kept for history. Superseded by the amended fix approach above. The "written atomically with the
+segment set, through the same create-only CAS committer" wording conflicts with ADR-063 D3, under
+which segments are made durable and LIST-discoverable on their own; the directory is a cache that
+follows them, not a commit that gates them._
+
+=== Fix direction (to be validated by the PAX spec thought experiments)
 
 * Publish a **collection-level segment manifest** with each segment set (flush or compaction
   commit). It holds, per segment: URL, size, row count, LSN range, quantization tier,
@@ -58,3 +98,7 @@ no equivalent level.
 * The AXIS rebuild coverage and coarse-RaBitQ checks read no segment bodies.
 * The SIFT1M MinIO RTT-ladder bench (`RDSTRAT13`) shows the manifest removes the per-segment
   footer wave from the cold critical path.
+* DataFusion PAX lane: a cold `PaxSplitReader` read of a directory-covered segment pays no
+  index-acquisition round trip (extend the TD-USUB-8 ratchet `cold - warm == 3` in
+  `docs/_internal/status/PAX_DATAFUSION_READ_DEPTH_2026_09_27.adoc` to `cold - warm == 0` when the
+  entry's etag matches; a stale etag falls back to the tail probe — negative control).

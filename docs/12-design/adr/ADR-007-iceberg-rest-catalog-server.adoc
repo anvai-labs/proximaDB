@@ -93,6 +93,11 @@ For existing ProximaDB collections, `load table` returns a synthetic snapshot:
 * One manifest entry per VIPER/NOVA/HELIX storage shard: row count, size bytes, column stats
 * Arrow Flight ticket embedded in `write-credentials` → workers exchange at port 5680
 
+*Amended 2026-11-19 (link:ADR-098-metadata-spine.adoc[ADR-098]):* superseded by ADR-097 D3 —
+the REST service serves the Iceberg engine's own `metadata.json` verbatim. The synthetic path
+remains only for tables the engine has not published, which is the residual tracked in
+TD-SEAM-1.
+
 === Hadoop Split Mapping
 
 [source]

@@ -4,7 +4,7 @@
 
 [cols="1,3"]
 |===
-|Status|Proposed
+|Status|Proposed. *Amended 2026-11-19 (link:ADR-098-metadata-spine.adoc[ADR-098]):* partially superseded/realized; see the dated notes in Context, D3 and D4.
 |Date|2026-06-28
 |Deciders|Vijaykumar Singh
 |Relates to|ADR-037 (Statistics Substrate — this ADR fulfills its Decision 1 "measured once at the write boundary, read many" by *aggregating* per-segment stats instead of re-observing records), ADR-038 (envelope freshness coherence — per-segment watermarks fold into the conservative-floor envelope freshness), ADR-027 (PAX zone maps + coalesced writer + small→large compaction), ADR-030 ("one seam, N readers" co-design), the `SegmentFormat::detect` mixed-read seam (`src/storage/engines/sst/segment_format.rs`)
@@ -38,6 +38,8 @@ storage-format layer), but it has two gaps against the ADR-037 intent:
 The two formats already coexist mixed-read-safe, disambiguated by magic bytes via
 `SegmentFormat::detect`. What is missing is a **single per-segment statistics view
 both formats produce**, so the aggregation reads one shape regardless of format.
+
+*Amended 2026-11-19 (link:ADR-098-metadata-spine.adoc[ADR-098]):* the restatement of ADR-037 Decision 1 above is informative only; ADR-037 owns the principle. Naming note: the identifier `SegmentStatistics` already exists as a private helper struct in `src/query/execution/layer_a/prune.rs` (line 256); the contract type must not be confused with it (rename one when the contract type lands).
 
 == Decision 1 — The boundary object is a per-segment `SegmentStatistics`, conforming to the envelope vocabulary
 
@@ -104,6 +106,8 @@ This **replaces the TD-174 per-record re-observe shortcut**: the envelope is
 assembled by folding the tiny per-segment summaries, never by re-scanning or
 re-tokenizing records. Re-observation remains only as the *legacy-segment fallback*.
 
+*Amended 2026-11-19 (link:ADR-098-metadata-spine.adoc[ADR-098]):* the aggregation source is the metadata spine. PAX: L1 collection segment directory entries (ADR-098 D2), which carry per-entry `SegmentStatistics`; Parquet/Iceberg: manifest per-file `ColumnFileStats` (ADR-098 D4.3, link:../../10-quality/td/TD-SPINE-4-manifest-stats-pruning-and-cache.adoc[TD-SPINE-4]); footers are the fallback for both (for PAX, when an entry is missing or fails LIST/etag validation).
+
 == Decision 4 — Relocate the mergeable sketches to a foundation crate (the load-bearing structural change)
 
 Today the sketches (`HyperLogLog`/`TDigest`/`Reservoir`/`FrequentItems`) live in the
@@ -119,6 +123,8 @@ crate) to share *one* sketch implementation, the sketches MUST move down.
 * The **envelope DTO types** stay in the root crate — they are the consumer-facing
   wire contract, not a storage primitive. `SegmentStatistics` itself lives **with the
   sketches** (foundation), since both formats' writers must construct it.
+
+*Amended 2026-11-19 (link:ADR-098-metadata-spine.adoc[ADR-098]):* done. The mergeable sketches (`HyperLogLog`, `TDigest`, `Reservoir`, `FrequentItems`) live in `crates/foundation/proximadb-kernel/src/sketches/` (not a new `proximadb-statistics-sketches` crate), and the root crate re-exports them (`src/core/statistics/mod.rs`: `pub use proximadb_kernel::sketches;`). `src/core/statistics/sketches/` no longer exists.
 
 == Mixed-read-safety and phasing (mandate #8 — never a flag-day)
 

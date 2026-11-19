@@ -1,0 +1,51 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-SPINE-2: one global catalog snapshot is rewritten on every object-store DDL
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open** (filed 2026-11-19). Blocked on TD-SPINE-1.
+| Priority | **HIGH** for multi-tenant SaaS scale. Cost and recovery time grow with the whole fleet's catalog, and one tenant's DDL rewrites every tenant's metadata.
+| Component | `src/services/system_catalog_state.rs` (`CatalogSnapshot` :279, whole-image `load_from_snapshot_bytes` :562); `src/services/system_catalog.rs` (checkpoint :558/:691, `reload_if_stale` :767, `reload_from_store_locked` :791, namespace floor `allocate_bounded(&self.namespace_floor…)` :304); `src/services/catalog_snapshot_store.rs` (`requires_snapshot_on_commit` :372, `ObjectStoreSnapshotStore` :313).
+| Authority | link:../../12-design/adr/ADR-098-metadata-spine.adoc[ADR-098] D1.3–D1.4
+| Supersedes | link:TD-SC-3-object_id-keyed-metadata-layout.adoc[TD-SC-3] (oid-keyed layout, conflicts with ADR-0083), link:TD-SC-5-multi-pod-shared-corpus-version-store.adoc[TD-SC-5] (shard generation becomes the shared version) — see each entry
+| Relates to | TD-NS-1 S4 (fences the separate `CatalogIdService::mint_namespace_id` path; this TD owns SystemCatalog's floor), TD-CAT-7 item 4, TD-CAT-11, ADR-035 D2/D4 (cache re-keyed on shard), ADR-073 D3
+|===
+
+== Problem
+
+* `CatalogSnapshot` holds every account, namespace, table and statistics row. In object-store mode
+  `requires_snapshot_on_commit()` is true, so **every DDL publishes the full image**; in local mode it
+  is rewritten every 1,000 mutations.
+* Followers and superseded owners adopt a newer snapshot by swapping the whole image.
+* Illustration (a model, not a measurement): 2,000 tenants × 50 tables × ~4 KB per table is
+  ~400 MB per snapshot, written and redistributed for a single `CREATE TABLE`, and decoded in full
+  at boot.
+* The namespace stable-id floor is one global counter although the schema documents
+  `stable_namespace_id` as per-account, so the 65,536-namespace bound is fleet-wide.
+
+== Fix
+
+. Snapshot = a small **root** (account registry, id high-waters, `account → shard generation`) plus
+  one **shard per account**, each committed through `ManifestCommitter` (fenced, retention per
+  TD-MANIFEST-1). Shard objects live **under the account's tenant prefix via `DrPathBuilder`**, so
+  catalog isolation is structural (CLAUDE.md co-design mandate 3); this carries TD-CAT-2's goal.
+. A DDL publishes its account's shard, then the root. Followers compare shard generations and fetch
+  only changed shards.
+. The namespace floor becomes per-account **for new allocations only**; existing ids are never
+  renumbered.
+. Migration: on first boot with the new code, an unsharded snapshot is read as legacy and re-published
+  as root + shards (mixed-read-safe; the legacy chain stays readable).
+. Read paths that iterate every account (`list_namespaces(None)` callers, `get_namespace_by_object_id`
+  linear scan) are inventoried in the PR and either scoped to an account or explicitly marked as
+  system-scope.
+
+== Acceptance
+
+* Bytes written per DDL scale with the account's catalog, not the fleet's (test with N accounts).
+* All cross-pod catalog tests in `src/services/system_catalog.rs` and the embedded follower tests
+  (`crates/binding/proximadb-embedded/src/catalog_follower.rs`) pass.
+* Legacy unsharded snapshot → sharded migration round-trips and survives a crash between shard and
+  root publish (idempotent).
+* Per-account namespace floor: two accounts can each allocate namespace id 1; existing ids unchanged.

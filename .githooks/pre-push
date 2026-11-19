@@ -34,4 +34,24 @@ if command -v cargo >/dev/null 2>&1; then
   fi
 fi
 
-echo "pre-push: OK (worktree + fmt)"
+# 3) Doc-hygiene guards, only when the push touches docs or the guards themselves.
+#    Stdlib-only and ~1 s: TD/ADR id uniqueness (incl. archived-id reuse and
+#    slug-polluted headings), status vocabulary, and the dead-link / orphan-id
+#    ratchet — the classes the ADR-098 reconciliation found piled up unguarded.
+base="$(git merge-base HEAD origin/develop 2>/dev/null || true)"
+if [ -n "$base" ] && git diff --name-only "$base" HEAD | grep -qE '^(docs/|scripts/check_(td_adr_unique|design_status_index|doc_references)\.py)|\.(adoc|md)$'; then
+  for guard in check_td_adr_unique.py check_design_status_index.py check_doc_references.py; do
+    if ! python3 "$root/scripts/$guard" >/dev/null 2>&1; then
+      echo "pre-push: BLOCKED — docs guard failed: python3 scripts/$guard   (bypass: git push --no-verify)" >&2
+      exit 1
+    fi
+  done
+fi
+
+# 4) Advisory: merged worktrees still holding disk (their target/ dirs are tens of GB).
+reclaim="$("$root/scripts/worktree.sh" clean --dry-run 2>/dev/null | tail -1 || true)"
+case "$reclaim" in
+  *"would clean "[1-9]*) echo "pre-push: note — $reclaim  (run: scripts/worktree.sh clean)" >&2 ;;
+esac
+
+echo "pre-push: OK (worktree + fmt + docs guards)"

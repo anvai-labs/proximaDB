@@ -49,6 +49,8 @@ that escapes the per-test `data_dir` boundary.
 3. Then decide whether the nanos-suffix discipline can be relaxed in the
    e2e suites (it currently papers over this).
 
+*Amended 2026-11-19:* this TD now owns link:TD-OLAP-16-catalog-location-model-first-principles.adoc[TD-OLAP-16] follow-on 2 (change the `metadata_url` default from `file://./metadata` to `{data_dir}/metadata`, with a mixed-read-safe migration story).
+
 Deps: none. Discovered by the pgwire-transactions adversarial review
 round 3 (2026-09-14); related isolation context in TD-CONV-1's e2e
 tempdir anchoring (which this TD complements — TD-CONV-1 anchors the

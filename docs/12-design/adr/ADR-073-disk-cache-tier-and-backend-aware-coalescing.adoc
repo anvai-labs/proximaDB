@@ -70,6 +70,13 @@ resources; PVC reattach on AKS).
    dedicated metadata VM at this stage. PREREQUISITE: eliminate
    cwd-relative `./data` state (violates path discipline; observed
    cross-instance contamination 2026-07-25).
++
+*Amended 2026-11-19 (link:ADR-098-metadata-spine.adoc[ADR-098]):* the RAM read-copy refresh
+becomes per account shard: a node refreshes one account's catalog snapshot shard by
+conditional read, keyed on that shard's generation (ADR-098 D1 /
+link:../../10-quality/td/TD-SPINE-2-per-account-catalog-shards.adoc[TD-SPINE-2]). The
+fresh-data-dir prerequisite above is tracked in
+link:../../10-quality/td/TD-CAT-11-catalog-survives-fresh-data-dir.adoc[TD-CAT-11].
 
 == Cost model (growth stage)
 

@@ -73,6 +73,8 @@ A new modality, operator or format is admitted by naming which seam it implement
 that it honours that seam's contract. Code that writes around a seam (its own WAL, its own
 metadata tree, its own identity) is a defect against this ADR.
 
+*Amended 2026-11-19 (link:ADR-098-metadata-spine.adoc[ADR-098]):* ADR-098 adds seam **S10 Catalog** (L0 SystemCatalog record envelope + per-account snapshot shards) and specifies the S2 declared durability mode, the S4 metadata hygiene (Iceberg metadata GC, bounded metadata log, manifest-stats pruning and cache) and the S7 L1 collection segment directory.
+
 === D1 — Single logical IR: DataFusion `LogicalPlan`, with native physical operators via adapters
 
 * DataFusion `LogicalPlan` (`Expr`, `TableScan`, `Join`, `Aggregate`, `Window`,
@@ -120,6 +122,8 @@ metadata tree, its own identity) is a defect against this ADR.
   gates activation, not another cycle of v2 development.
 * CI reads published tables back with an external reader and compares values with pgwire
   (TD-SEAM-1).
+
+*Status note 2026-11-19:* the verbatim path holds only for engine-published tables. For other tables, REST `load_table` still falls through to `catalog_schema_to_iceberg_metadata`, which synthesizes a snapshot whose `manifest-list` URL (`…/manifests/snap-{id}.avro`) is not served by any route; and `commit_table` applies no data — its `AddSnapshot` arm only logs (`crates/control/proximadb-catalog/src/iceberg_rest_service.rs`). The residual is tracked in TD-SEAM-1.
 
 === D4 — Positioning
 

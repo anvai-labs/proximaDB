@@ -168,6 +168,12 @@ LSN holder; and segment durability must be established (object durably written *
 catalog-referenced) before the corresponding WAL range is eligible for truncation. ADR-045's
 Layer A/B stratification is what makes Layer A sufficient for this — Layer B is rebuildable
 and therefore never load-bearing for recovery.
+
+*Amended 2026-11-19 (link:ADR-098-metadata-spine.adoc[ADR-098]):* segments are never catalog
+rows. Read "catalog-referenced" as *durably written and LIST-discoverable under the
+catalog-derived prefix* (ADR-063 D4's discovery rule, which is mode-independent and holds in
+both `durability_mode` values). The L1 collection segment directory is a cache only
+(ADR-098 D2) and never makes a segment truncation-eligible on its own.
 ====
 
 == Iceberg / Arrow Flight Integration

@@ -55,6 +55,18 @@ cross-modal JOIN is a **query executed data-local in the engine**, not client gl
    (OLTP) behind the `ComputeBackend` seam (ADR-052). The engine ships the **answer**, not the
    intermediate sets — one round-trip, one metered plan, isolation enforced structurally at one
    boundary.
++
+*Amended 2026-11-19 (link:ADR-098-metadata-spine.adoc[ADR-098]):* two dispatch cores exist
+today. `ComputeScheduler` serves pgwire and `api_handlers.execute_sql` (REST `/api/v2/sql`,
+gRPC); `UnifiedQueryPort` serves canonical REST `/sql`, REST v2 `/api/v2/query` and MCP, has
+no freshness handling, and refuses plain relational SQL (`FederatedQueryContext`). That holds
+for external tables too in the live wiring: `ExternalTableStrategy`
+(`src/query/facade/strategies/external_table.rs`) only detects external-table SQL and returns
+a "not wired" error, and `SharedServices` does not register it; the registered
+`ColumnarStrategy` accepts plain SQL only for collections with a registered columnar provider,
+and the live wiring registers none.
+Convergence onto one planner is ADR-098 D5 /
+link:../../10-quality/td/TD-SPINE-6-one-planner-unified-query-port.adoc[TD-SPINE-6].
 3. **The agentic copilot brain stays in the client/agent (MCP) layer.** The database does NOT
    embed a vertical's workflow — no hard-coded "fraud copilot". The reference MCP surface projects
    Layer-1 primitives + Layer-2 relations as tools; the agent composes them; **AnvaiOps** governs

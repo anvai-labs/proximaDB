@@ -1,0 +1,40 @@
+{
+  "ids": {
+    "docs/06-internals/CATALOG_OBJECT_ID_LAYOUT.adoc": 3,
+    "docs/10-quality/TECHNICAL_DEBT.adoc": 2,
+    "docs/10-quality/TECHNICAL_DEBT_CLOSED_2026_06_24.adoc": 2,
+    "docs/10-quality/td/TD-COMPACT-15-consolidate-strategy.adoc": 1,
+    "docs/10-quality/td/TD-COMPACT-5-training-compaction-trigger.adoc": 1,
+    "docs/10-quality/td/TD-DECOMP-64-rename-document-geo-index.adoc": 3,
+    "docs/10-quality/td/TD-FPRUNE-2-record-scan-materializes-before-filtering.adoc": 1,
+    "docs/10-quality/td/TD-IOTRACE-4-persistent-l2-cache-counters-not-in-trace.adoc": 1,
+    "docs/10-quality/td/TD-IVF-3-coarse-pca-projection-width-miscalibrated.adoc": 5,
+    "docs/10-quality/td/TD-LEDGER-1-transactional-ledger-modality.adoc": 2,
+    "docs/10-quality/td/TD-NAMING-1-public-type-name-collisions.adoc": 2,
+    "docs/10-quality/td/TD-RDSTRAT-14-probe-policy-controller.adoc": 1,
+    "docs/10-quality/td/TD-RDSTRAT-8-two-level-ivf-coarse-probe.adoc": 1,
+    "docs/10-quality/td/TD-USUB-3-abac-silently-removes-sql-capability.adoc": 2,
+    "docs/10-quality/td/TD-WLP-10-churn-evidence-gated-flush-threshold.adoc": 2,
+    "docs/10-quality/td/TD-WLP-4-appendbulk-clustering-at-compaction.adoc": 1,
+    "docs/12-design/CODE_GRAPH_CORRELATED_SUBSTRATE_2026_06_22.adoc": 2,
+    "docs/12-design/ENV_GATE_REGISTRY.adoc": 8,
+    "docs/12-design/HOW_TO_FILE_TD_AND_ADR.adoc": 1,
+    "docs/12-design/PAX_SPEC_THOUGHT_EXPERIMENTS_2026_10.adoc": 22,
+    "docs/12-design/ROOT_CRATE_DECOMPOSITION_CI_BUILD_OPTIMIZATION_2026_07_11.adoc": 1,
+    "docs/12-design/TD-SELECTOR-1_selector-benchmark-framework.adoc": 1,
+    "docs/12-design/adr/ADR-029-shared-codegraph-chunker-package.adoc": 5,
+    "docs/12-design/adr/ADR-061-per-collection-workload-profiles.adoc": 2,
+    "docs/12-design/adr/ADR-071-transactional-ledger-modality.adoc": 4,
+    "docs/12-design/adr/README.adoc": 2,
+    "docs/_internal/HANDOFF_ANVAIOPS_S3_HOME_DEPLOYMENT_2026-10-23.md": 3,
+    "docs/agent-rules/skills/td-adr-convention/SKILL.md": 1,
+    "docs/history/planning/CONNECTIVITY_AND_MODALITY_COMPLETION_TRACKER_2026_07_21.adoc": 1,
+    "docs/history/planning/STRATEGIC_ROADMAP.adoc": 2,
+    "docs/release-notes/v0.2.0.adoc": 1,
+    "docs/rfcs/0001-transactional-ledger-modality.adoc": 6,
+    "roadmap/MULTIMODAL_OVERHAUL_SPEC_2026_05_08.adoc": 10
+  },
+  "links": {
+    "docs/architecture-diagrams/RENDERING_STRATEGY.md": 1
+  }
+}

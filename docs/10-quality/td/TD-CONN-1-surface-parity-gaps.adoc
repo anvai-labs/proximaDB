@@ -36,6 +36,8 @@ are shared (the `HeaderTrustPolicy` + `UnifiedQueryPort`/`ComputeScheduler` core
 handler is a thin codec over that core, never a new stack — enforced by the Unified Connectivity
 Envelope rule (rule seed).
 
+*Amended 2026-11-19 (link:../../12-design/adr/ADR-098-metadata-spine.adoc[ADR-098]):* the "`UnifiedQueryPort`/`ComputeScheduler` core" above is two cores today, not one. `ComputeScheduler` routes pgwire and `api_handlers.execute_sql` (REST `/api/v2/sql`, gRPC); `UnifiedQueryPort` serves canonical REST `/sql`, REST v2 `/api/v2/query` and MCP without a route decision or freshness handling. Convergence is link:TD-SPINE-6-one-planner-unified-query-port.adoc[TD-SPINE-6] (ADR-098 D5).
+
 == Slices (each begins with anchor re-verification)
 
 C1 — **REST graph-write parity.** _Anchor re-verification note (2026-10-15 consolidation): the
