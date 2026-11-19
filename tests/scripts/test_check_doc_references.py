@@ -61,6 +61,19 @@ class ProseOnly(unittest.TestCase):
         md = ROOT / "docs" / "12-design" / "adr" / "NOTE.md"
         self.assertEqual(cdr.broken_links(md, '[x](missing.adoc "Title")', set()), ["missing.adoc"])
 
+    def test_tagged_fence_and_post_block_prose(self) -> None:
+        # Round-3 finding 1: the tagged opener must toggle the fence (content
+        # hidden) AND the bare closer must restore scanning (prose after the
+        # block stays visible).
+        text = "TD-ZZ-1\n```rust\nTD-ZZ-2\n```\nTD-ZZ-3\n"
+        body = cdr.prose(text)
+        self.assertIn("TD-ZZ-1", body)
+        self.assertIn("TD-ZZ-3", body)
+        self.assertNotIn("TD-ZZ-2", body)
+
+    def test_double_backtick_inline_code_is_hidden(self) -> None:
+        self.assertNotIn("TD-ZZ-9", cdr.prose("``TD-ZZ-9``"))
+
     def test_code_blocks_and_inline_code_are_not_references(self) -> None:
         text = "real TD-ZZ-1\n----\nlink:ghost.adoc[x] TD-ZZ-2\n----\n`TD-ZZ-3` inline\n```\nTD-ZZ-4\n```\n"
         body = cdr.prose(text)

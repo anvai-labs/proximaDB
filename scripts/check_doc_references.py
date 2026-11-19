@@ -37,7 +37,7 @@ ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_BASELINE = ROOT / "docs" / "_internal" / "roadmap" / "DOC_REFERENCES_BASELINE.json"
 
 ADOC_LINK_RE = re.compile(r"(?:link|xref):([^\s\[\]]+)\[|include::([^\s\[\]]+)\[")
-MD_LINK_RE = re.compile(r"\]\(<?([^)\s>]+)>?(?:\s+\"[^\"]*\")?\)")
+MD_LINK_RE = re.compile(r'''\]\(<?([^)\s>]+)>?(?:\s+["'][^"']*["'])?\)''')
 ADR_MENTION_RE = re.compile(r"\bADR-(\d{3,4}[a-z]?)\b")
 
 
@@ -85,8 +85,8 @@ def _looks_like_file(target: str) -> bool:
     return "/" in target or "." in name
 
 
-FENCE_RE = re.compile(r"^(```|~~~|----|\.\.\.\.)\s*$")
-INLINE_CODE_RE = re.compile(r"`[^`\n]*`")
+FENCE_RE = re.compile(r"^(?:`{3,}|~{3,}|-{4,}|\.{4,}).*$")
+INLINE_CODE_RE = re.compile(r"`+[^`\n]*`+")
 
 
 def prose(text: str) -> str:
