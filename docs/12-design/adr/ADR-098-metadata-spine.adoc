@@ -241,7 +241,7 @@ gives the same observability without a flag day (owner decision).
 * Interop stays standard (Iceberg REST, Parquet, Avro only at the seam) while the internals stay
   vertical (CODESIGN mandate 4).
 * Risks: the directory and its LIST validation add a publish step to flush (gated, default OFF until
-  baked); metadata GC deletes files (grace window + reachability check + interop read-back gate);
+  baked); metadata GC deletes files (retention follows the clock-free generation window (TD-GCRETAIN-1) + reachability check + interop read-back gate);
   shard migration touches the catalog's recovery root (mixed-read-safe envelope first, then shards).
 
 == Sequencing and gates

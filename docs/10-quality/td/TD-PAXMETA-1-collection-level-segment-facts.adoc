@@ -62,7 +62,7 @@ never authoritative (ADR-063 D4 stands), and it does not grow the catalog with s
   in use is a separate struct in `sst/utils.rs`).
 . **Both PAX read lanes consume the directory** (ADR-098 D2.4; carries TD-USUB-8 slice 3): the SST
   search route (the consumers listed under Problem) and the DataFusion PAX lane
-  (`PaxSplitReader::load_ranged`, `crates/storage/proximadb-block-format/src/ranged.rs`), which takes
+  (`PaxSplitReader::load_ranged`, `src/datafusion/engine_adapters/pax_adapter.rs`; read-order planning in `crates/storage/proximadb-block-format/src/ranged.rs`), which takes
   footer and SegmentIndex extents from the entry's decode key instead of probing the tail. Blooms,
   deletion vectors and stripe data stay in the object and are fetched by reference.
 . **Write gate `PROXIMADB_PAX_WRITE_DIRECTORY_AT_FLUSH`**, default OFF until baked, registered in
@@ -75,8 +75,9 @@ entry.
 == Superseded proposal (2026-10-19)
 
 _Kept for history. Superseded by the amended fix approach above. The "written atomically with the
-segment set, through the same create-only CAS committer" wording conflicts with ADR-063 D3, under
-which segments are made durable and LIST-discoverable on their own; the directory is a cache that
+segment set, through the same create-only CAS committer" wording conflicts with ADR-063 D4's
+mode-independent discovery rule (LIST is the authority; manifests are caches): segments are made
+durable and LIST-discoverable on their own; the directory is a cache that
 follows them, not a commit that gates them._
 
 === Fix direction (to be validated by the PAX spec thought experiments)

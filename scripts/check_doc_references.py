@@ -37,7 +37,7 @@ ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_BASELINE = ROOT / "docs" / "_internal" / "roadmap" / "DOC_REFERENCES_BASELINE.json"
 
 ADOC_LINK_RE = re.compile(r"(?:link|xref):([^\s\[\]]+)\[|include::([^\s\[\]]+)\[")
-MD_LINK_RE = re.compile(r"\]\(([^)\s]+)\)")
+MD_LINK_RE = re.compile(r"\]\(<?([^)\s>]+)>?(?:\s+\"[^\"]*\")?\)")
 ADR_MENTION_RE = re.compile(r"\bADR-(\d{3,4}[a-z]?)\b")
 
 
@@ -85,6 +85,23 @@ def _looks_like_file(target: str) -> bool:
     return "/" in target or "." in name
 
 
+FENCE_RE = re.compile(r"^(```|~~~|----|\.\.\.\.)\s*$")
+INLINE_CODE_RE = re.compile(r"`[^`\n]*`")
+
+
+def prose(text: str) -> str:
+    """Text with code blocks and inline code removed: examples there are not references."""
+    out: list[str] = []
+    fenced = False
+    for line in text.splitlines():
+        if FENCE_RE.match(line.strip()):
+            fenced = not fenced
+            continue
+        if not fenced:
+            out.append(INLINE_CODE_RE.sub("", line))
+    return "\n".join(out)
+
+
 def link_targets(path: Path, text: str) -> list[str]:
     targets: list[str] = []
     if path.suffix == ".adoc":
@@ -128,8 +145,18 @@ def unresolved_ids(text: str, td_known: set[str], adr_known: set[str], td_re) ->
             continue
         # File slugs (TD-PAXDIR-1-collection-…) and suffixes: trim trailing
         # segments until a known id matches.
+        # Only lowercase slug words are trimmed; an uppercase/digit tail
+        # (`TD-SEAM-12-F99`) is a sub-id and must exist in its own right.
+        # A tail with a lowercase word is a filename slug and may be trimmed
+        # (`TD-DEPS-1-bincode-2x-…`); a tail of only uppercase/digit segments is
+        # a sub-id (`TD-SEAM-12-F99`, `TD-162a-3`) and must exist in its own right.
         parts = mention.split("-")
-        if not any("-".join(parts[:k]) in td_known for k in range(len(parts), 1, -1)):
+        resolved = any(
+            "-".join(parts[:k]) in td_known
+            and (k == len(parts) or any(seg[:1].islower() for seg in parts[k:]))
+            for k in range(len(parts), 1, -1)
+        )
+        if not resolved:
             bad.append(mention)
     for m in ADR_MENTION_RE.finditer(text):
         if _adr_key(m.group(1)) not in adr_known:
@@ -149,10 +176,11 @@ def scan() -> tuple[dict[str, list[str]], dict[str, list[str]]]:
     for path in tracked_docs():
         text = path.read_text(encoding="utf-8", errors="replace")
         rel = path.relative_to(ROOT).as_posix()
-        bl = broken_links(path, text, files)
+        body = prose(text)
+        bl = broken_links(path, body, files)
         if bl:
             links[rel] = bl
-        ui = unresolved_ids(text, td_known, adr_known, uniq.TD_ID_RE)
+        ui = unresolved_ids(body, td_known, adr_known, uniq.TD_ID_RE)
         if ui:
             ids[rel] = ui
     return links, ids

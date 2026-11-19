@@ -391,6 +391,10 @@ jobs:
             td_citations:
               - 'docs/10-quality/td/**'
               - 'scripts/check_td_cited_tests.py'
+              - 'src/**'
+              - 'crates/**'
+              - 'apps/**'
+              - 'tests/**'
             # A guard edited without any doc change must still run itself
             # (else a broken guard lands green and fires on the next docs PR).
             doc_guards:
@@ -399,11 +403,8 @@ jobs:
               - 'scripts/check_design_status_index.py'
               - 'scripts/__init__.py'
               - 'tests/scripts/test_check_doc_references.py'
+              - 'tests/scripts/test_check_td_adr_unique.py'
               - 'docs/_internal/roadmap/DOC_REFERENCES_BASELINE.json'
-              - 'src/**'
-              - 'crates/**'
-              - 'apps/**'
-              - 'tests/**'
             proto:
               - 'proto/**'
             panic_policy:
@@ -2297,6 +2298,8 @@ jobs:
         run: python3 scripts/check_doc_references.py
       - name: Doc-reference guard unit tests
         run: python3 -m unittest discover -s tests/scripts -p 'test_check_doc_references.py'
+      - name: TD/ADR uniqueness guard unit tests
+        run: python3 -m unittest discover -s tests/scripts -p 'test_check_td_adr_unique.py'
       # Advisory: status-of-record docs whose status-as-of tag is older than the
       # window. Time-driven, so it must never redden develop by itself; it
       # surfaces drift on every PR instead of only on a local make run.

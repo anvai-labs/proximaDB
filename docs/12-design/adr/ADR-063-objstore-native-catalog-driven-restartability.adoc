@@ -247,7 +247,7 @@ by id. It caught batch 3; it stays red until D3-D5 land, and the CI wiring must 
 
 == Deployment-profile clarification (2026-11-02)
 
-*Amended 2026-11-19 (link:ADR-098-metadata-spine.adoc[ADR-098]):* the two profiles described here are now a declared `durability_mode` (`local_volume` or `object_store_serverless`), resolved at boot per ADR-098 D3 — declared, or inferred from the storage scheme and logged loudly; there is no silent legacy path. D3 and the WAL-object parts of D4 apply to `object_store_serverless` only; D4's "LIST is the discovery authority; manifests are caches" rule applies in both modes.
+*Amended 2026-11-19 (link:ADR-098-metadata-spine.adoc[ADR-098]):* the two profiles described here are now a declared `durability_mode` (`local_volume` or `object_store_serverless`), resolved at boot per ADR-098 D3 — declared, or inferred (the global `wal_local_dir` if set, else the primary WAL location's scheme) and logged at INFO; there is no silent legacy path. D3 and the WAL-object parts of D4 apply to `object_store_serverless` only; D4's "LIST is the discovery authority; manifests are caches" rule applies in both modes.
 
 Cloud authority means committed bulk data and catalog metadata outlive compute. It does not
 require each insert to issue an object-store WAL PUT. The later

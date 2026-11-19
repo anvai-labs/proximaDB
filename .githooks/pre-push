@@ -39,7 +39,10 @@ fi
 #    slug-polluted headings), status vocabulary, and the dead-link / orphan-id
 #    ratchet — the classes the ADR-098 reconciliation found piled up unguarded.
 base="$(git merge-base HEAD origin/develop 2>/dev/null || true)"
-if [ -n "$base" ] && git diff --name-only "$base" HEAD | grep -qE '^(docs/|scripts/check_(td_adr_unique|design_status_index|doc_references)\.py)|\.(adoc|md)$'; then
+# Capture first: `git diff | grep -q` under pipefail turns grep's early exit into
+# SIGPIPE (141) on a large diff and silently skips the guards.
+changed="$( [ -n "$base" ] && git diff --name-only "$base" HEAD || true )"
+if printf '%s\n' "$changed" | grep -E '^(docs/|scripts/check_(td_adr_unique|design_status_index|doc_references)\.py)|\.(adoc|md)$' >/dev/null; then
   for guard in check_td_adr_unique.py check_design_status_index.py check_doc_references.py; do
     if ! python3 "$root/scripts/$guard" >/dev/null 2>&1; then
       echo "pre-push: BLOCKED — docs guard failed: python3 scripts/$guard   (bypass: git push --no-verify)" >&2

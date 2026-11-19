@@ -56,6 +56,19 @@ class BrokenLinks(unittest.TestCase):
         self.assertEqual(cdr.broken_links(md, "[x](missing.adoc)", self.files), ["missing.adoc"])
 
 
+class ProseOnly(unittest.TestCase):
+    def test_markdown_link_with_title_is_checked(self) -> None:
+        md = ROOT / "docs" / "12-design" / "adr" / "NOTE.md"
+        self.assertEqual(cdr.broken_links(md, '[x](missing.adoc "Title")', set()), ["missing.adoc"])
+
+    def test_code_blocks_and_inline_code_are_not_references(self) -> None:
+        text = "real TD-ZZ-1\n----\nlink:ghost.adoc[x] TD-ZZ-2\n----\n`TD-ZZ-3` inline\n```\nTD-ZZ-4\n```\n"
+        body = cdr.prose(text)
+        self.assertIn("TD-ZZ-1", body)
+        for hidden in ("ghost.adoc", "TD-ZZ-2", "TD-ZZ-3", "TD-ZZ-4"):
+            self.assertNotIn(hidden, body)
+
+
 class UnresolvedIds(unittest.TestCase):
     td_known = {"TD-SPINE-1", "TD-PAXDIR-1", "TD-007"}
     adr_known = {"98", "83"}
@@ -65,6 +78,13 @@ class UnresolvedIds(unittest.TestCase):
 
     def test_known_ids_and_file_slugs_resolve(self) -> None:
         self.assertEqual(self.bad("TD-SPINE-1 and TD-PAXDIR-1-collection-global-centroid-directory"), [])
+
+    def test_sub_id_must_exist_but_numeric_slug_words_trim(self) -> None:
+        known = {"TD-SEAM-12", "TD-DEPS-1"}
+        bad = cdr.unresolved_ids(
+            "TD-SEAM-12-F99 TD-DEPS-1-bincode-2x-upgrade TD-SEAM-12", known, set(), TD_ID_RE
+        )
+        self.assertEqual(bad, ["TD-SEAM-12-F99"])
 
     def test_hallucinated_id_is_reported(self) -> None:
         self.assertEqual(self.bad("see TD-SPINE-9"), ["TD-SPINE-9"])

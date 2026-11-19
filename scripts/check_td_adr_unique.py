@@ -84,14 +84,15 @@ def td_ids() -> dict[str, list[str]]:
         for p in sorted([*TD_DIR.glob("TD-*.adoc"), *TD_DIR.glob("TD-*.md")]):
             if p.name.lower() == "readme.adoc":
                 continue
-            heading = next(
-                (
-                    line
-                    for line in p.read_text(encoding="utf-8").splitlines()
-                    if line.startswith("= ")
-                ),
-                "",
-            )
+            lines = p.read_text(encoding="utf-8").splitlines()
+            heading = next((line for line in lines if line.startswith("= ")), "")
+            if p.suffix == ".md" and not heading:
+                # Markdown TDs may use `# TD-<ID>: title`. A `#` heading WITHOUT the
+                # `:` after the id (`# TD-SEAM-14 S0 Audit`) names its parent TD and
+                # is a companion document, not a declaration.
+                md = next((line for line in lines if line.startswith("# ")), "")
+                if re.match(r"^#\s+TD-[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*:", md):
+                    heading = md
             m = TD_ID_RE.search(heading)
             if m:
                 by_id[m.group(0)].append(p.name)
