@@ -64,6 +64,17 @@ proximadb_config::env_kill_switch! {
     pub fn directory_decode_keys_write_enabled() { gate: "PROXIMADB_PAX_WRITE_DIRECTORY_DECODE_KEYS", default: true }
 }
 
+// TD-PAXMETA-1 (ADR-098 D2) WRITE gate: a flush that published new segments
+// also refreshes the collection directory — the same create-only reconcile
+// the compaction publish runs — so flush-written (uncovered) segments appear
+// with their untrained decode keys instead of waiting for the next
+// compaction. Default OFF until baked (a flush is the hot ingest path; the
+// publish adds one LIST plus per-changed-segment reads off the query path).
+// Read on every call (not memoized) so tests can flip it mid-process.
+pub fn directory_at_flush_write_enabled() -> bool {
+    proximadb_config::env_flag_now("PROXIMADB_PAX_WRITE_DIRECTORY_AT_FLUSH")
+}
+
 /// Directory objects in a listing, newest generation first.
 pub(crate) fn directory_objects_newest_first(entries: &[DirEntry]) -> Vec<(u64, &DirEntry)> {
     let mut objects: Vec<(u64, &DirEntry)> = entries
@@ -883,6 +894,25 @@ pub(crate) mod tests {
         assert!(centroid_directory_write_enabled());
         unsafe { std::env::set_var("PROXIMADB_PAX_WRITE_CENTROID_DIRECTORY", "0") };
         assert!(!centroid_directory_write_enabled());
+    }
+
+    /// TD-PAXMETA-1: the flush-publish gate is default-OFF opt-in — the
+    /// registry's truthy set enables it, anything else (including unset and
+    /// unrecognized values) keeps the flush path unchanged.
+    #[test]
+    fn at_flush_gate_defaults_off_opt_in() {
+        // SAFETY: nextest runs each test in its own process.
+        unsafe { std::env::remove_var("PROXIMADB_PAX_WRITE_DIRECTORY_AT_FLUSH") };
+        assert!(!directory_at_flush_write_enabled(), "default OFF");
+        for on in ["1", "true", "on", "yes"] {
+            unsafe { std::env::set_var("PROXIMADB_PAX_WRITE_DIRECTORY_AT_FLUSH", on) };
+            assert!(directory_at_flush_write_enabled(), "{on} opts in");
+        }
+        for off in ["0", "false", "off", "no", "bogus"] {
+            unsafe { std::env::set_var("PROXIMADB_PAX_WRITE_DIRECTORY_AT_FLUSH", off) };
+            assert!(!directory_at_flush_write_enabled(), "{off} stays off");
+        }
+        unsafe { std::env::remove_var("PROXIMADB_PAX_WRITE_DIRECTORY_AT_FLUSH") };
     }
 
     /// TD-PAXMETA-1 (ADR-098 D2): an untrained (flush-layout) coalesced
