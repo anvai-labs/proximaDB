@@ -14,6 +14,7 @@ documents_convergence_e2e.rs
 duckdb_route_pgwire_e2e.rs
 embedded_port_free.rs
 external_table_pgwire_e2e.rs
+external_table_s3_pgwire_e2e.rs
 filesystem_integration_test.rs
 financial_option_pricing_test.rs
 flight_bulk_search_e2e.rs

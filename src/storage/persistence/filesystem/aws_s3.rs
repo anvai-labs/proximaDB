@@ -337,7 +337,7 @@ impl FileSystem for AwsS3FileSystem {
             };
             let guard_matches = match (guard_expected, guard_current.as_deref()) {
                 (None, None) => true,
-                (Some(exp), Some(cur)) => *exp == &cur[..],
+                (Some(exp), Some(cur)) => *exp == cur,
                 _ => false,
             };
             if !guard_matches {
