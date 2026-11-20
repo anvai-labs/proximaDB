@@ -202,40 +202,14 @@ pub(crate) fn dv_live_gc_grace_from(raw: Option<&str>) -> std::time::Duration {
     )
 }
 
-/// F8 (release review 0.4→0.5.1): how many committed Iceberg metadata
-/// generations MATERIALIZE's GC must keep files for, TOTAL including the
-/// committed one. The structural floor is 2 (the committed version and its
-/// parent); the default 3 keeps V−2 alive so a reader pinned two quick
-/// MATERIALIZEs back does not lose files mid-scan. Values below 2 (including
-/// OFF spellings) clamp to the floor: retention cannot go under the two
-/// generations the reader contract names.
-pub(crate) fn gc_retained_generations() -> u64 {
-    retained_generations_from(
-        std::env::var("PROXIMADB_MATERIALIZE_GC_RETAINED_GENERATIONS")
-            .ok()
-            .as_deref(),
-    )
-}
-
-/// Pure core of the gate (testable without env injection): unset/typo keeps
-/// the default 3; OFF/0/1 clamp to the structural floor 2 (V and V−1) — the
-/// pre-fix behavior, so OFF is a faithful kill-switch.
-pub(crate) fn retained_generations_from(raw: Option<&str>) -> u64 {
-    crate::services::storage_format::default_on_gate_value(raw, 3)
-        .unwrap_or(2)
-        .max(2)
-}
-
-/// The metadata versions whose referenced files GC must keep, newest-first:
-/// `previous` down to and including `previous - (retained - 2)`, saturating at
-/// 0. `retained` counts TOTAL generations including the committed V, so
-/// retained=2 ⇒ [previous] exactly (the pre-fix window), retained=3 ⇒
-/// [previous, previous−1] (V−1 and V−2 — the F8 fix; version 0 INCLUDED: the
-/// first commit lands at v0, so `previous - x` must be allowed to reach 0).
-pub(crate) fn retained_versions(previous: u64, retained: u64) -> Vec<u64> {
-    let floor = previous.saturating_sub(retained - 2);
-    (floor..=previous).rev().collect()
-}
+/// F8 (release review 0.4→0.5.1): the MATERIALIZE generation window —
+/// `PROXIMADB_MATERIALIZE_GC_RETAINED_GENERATIONS` TOTAL generations including
+/// the committed one, default 3, floor 2 — and the older versions it retains.
+/// Owned by the Iceberg engine (TD-SPINE-3) so the data-file GC here, the
+/// metadata GC and the bounded `metadata-log` share ONE window definition.
+#[cfg(test)]
+pub(crate) use proximadb_iceberg_engine::retention::retained_generations_from;
+pub(crate) use proximadb_iceberg_engine::retention::{gc_retained_generations, retained_versions};
 
 /// F15 (TD-LIVEDEL-1): how old an UNREFERENCED self-minted `dv-live-*`
 /// Puffin must be before the post-MATERIALIZE sweep may collect it — the

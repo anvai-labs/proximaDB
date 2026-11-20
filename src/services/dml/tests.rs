@@ -4429,6 +4429,116 @@ fn materialize_gc_collects_with_healthy_retained_metadata() {
     check_gc_with_retained_metadata_unavailable(false);
 }
 
+/// ADR-098 D4.2 / TD-SPINE-3 through the real MATERIALIZE path: after six
+/// publications only the retained window's metadata survives (default 3
+/// generations), the tip's `metadata-log` names exactly the two older
+/// retained versions, and a reader pinned to the OLDEST retained version
+/// still resolves every file. With the kill-switch set (the negative
+/// control) every version stays.
+#[cfg(feature = "datafusion-integration")]
+fn check_materialize_metadata_gc(disabled: bool) {
+    let _retained = EnvGuard::set("PROXIMADB_MATERIALIZE_GC_RETAINED_GENERATIONS", "3");
+    let _gc = EnvGuard::set(
+        "PROXIMADB_ICEBERG_METADATA_GC_DISABLE",
+        if disabled { "1" } else { "0" },
+    );
+    crate::query::execution::test_runtime::run_with_timeout(60, async {
+        let inv = InvFixture::new("metadata-gc.wal", 6).await;
+        let location = inv.materialize().await;
+        let (_, metadata_prefix) = inv.prefixes(&location);
+        for round in 0..5 {
+            inv.exec(&format!(
+                "UPDATE inv SET qty = {} WHERE id = 'i{round}';",
+                100 + round
+            ))
+            .await;
+            inv.materialize().await;
+        }
+        let tip = inv
+            .bridge
+            .latest_metadata_version(&metadata_prefix)
+            .await
+            .expect("metadata log")
+            .expect("a committed snapshot");
+        assert_eq!(tip, 5, "six publications");
+        let names: Vec<String> = inv
+            .bridge
+            .list_objects(&object_store::path::Path::from(metadata_prefix.as_str()))
+            .await
+            .expect("list metadata")
+            .into_iter()
+            .filter_map(|k| k.filename().map(String::from))
+            .collect();
+        let versions: std::collections::BTreeSet<u64> = names
+            .iter()
+            .filter_map(|n| {
+                n.strip_prefix('v')?
+                    .strip_suffix(".metadata.json")?
+                    .parse()
+                    .ok()
+            })
+            .collect();
+        if disabled {
+            assert_eq!(
+                versions,
+                (0..=5).collect(),
+                "kill-switch keeps every version"
+            );
+            return;
+        }
+        assert_eq!(
+            versions,
+            (3..=5).collect(),
+            "only the window survives: {names:?}"
+        );
+        // Every surviving Avro object belongs to a retained version.
+        for name in names.iter().filter(|n| n.ends_with(".avro")) {
+            let retained = (3..=5u64).any(|v| name.contains(&format!("v{v:020}")));
+            assert!(retained, "{name} is outside the window");
+        }
+        // The tip's log is bounded to the window and every entry resolves.
+        let doc: serde_json::Value = serde_json::from_slice(
+            &inv.bridge
+                .read_table_metadata(&metadata_prefix, tip)
+                .await
+                .expect("tip metadata"),
+        )
+        .expect("json");
+        let log = doc["metadata-log"].as_array().expect("metadata-log");
+        assert_eq!(log.len(), 2, "{log:?}");
+        // A reader pinned to the oldest retained version still reads.
+        let pinned = inv
+            .bridge
+            .read_iceberg_snapshot_files(&metadata_prefix, 3)
+            .await
+            .expect("pinned v3 resolves");
+        assert!(!pinned.data_files.is_empty());
+        for file in pinned
+            .data_files
+            .iter()
+            .chain(pinned.deletion_vectors.iter().map(|d| &d.puffin_file))
+        {
+            inv.bridge
+                .object_size(file)
+                .await
+                .unwrap_or_else(|e| panic!("pinned v3 file {file} must survive GC: {e}"));
+        }
+        assert_eq!(inv_qty_sum(location).await.0, 6, "the current view reads");
+    });
+}
+
+#[cfg(feature = "datafusion-integration")]
+#[test]
+fn materialize_metadata_gc_keeps_only_the_window() {
+    check_materialize_metadata_gc(false);
+}
+
+#[cfg(feature = "datafusion-integration")]
+#[test]
+fn materialize_metadata_gc_kill_switch_keeps_every_version() {
+    check_materialize_metadata_gc(true);
+}
+
 /// v0.5.0 upgrade (release blocker): v0.4.1 published Iceberg format-version
 /// 3 WITHOUT row lineage (no `next-row-id`, no snapshot `first-row-id` or
 /// `added-rows`). The lineage check from #2261 refused such a parent, so every

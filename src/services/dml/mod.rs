@@ -3600,6 +3600,32 @@ impl DmlService {
             Ok(deleted) => debug!(table = %table_name, version, deleted, "MATERIALIZE GC"),
             Err(e) => warn!(table = %table_name, "MATERIALIZE GC incomplete: {e}"),
         }
+        // 7b. ADR-098 D4.2 / TD-SPINE-3: the same window for Iceberg metadata.
+        //     Older `metadata.json` documents (never the tip) and the manifests
+        //     and manifest lists no retained version reaches go too — under
+        //     `metadata_prefix` only (DrPathBuilder-derived), clock-free, and
+        //     best effort: a failure here never fails the publication.
+        if !proximadb_iceberg_engine::retention::metadata_gc_disabled() {
+            match bridge
+                .gc_iceberg_metadata(&metadata_prefix, version, retained)
+                .await
+            {
+                Ok(report) => {
+                    if let Some(reason) = &report.skipped {
+                        debug!(table = %table_name, version, "MATERIALIZE metadata GC skipped: {reason}");
+                    } else {
+                        debug!(
+                            table = %table_name,
+                            version,
+                            deleted = report.deleted,
+                            failed = report.failed,
+                            "MATERIALIZE metadata GC"
+                        );
+                    }
+                }
+                Err(e) => warn!(table = %table_name, "MATERIALIZE metadata GC incomplete: {e}"),
+            }
+        }
 
         Ok(location)
     }

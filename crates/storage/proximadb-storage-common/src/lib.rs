@@ -24,6 +24,7 @@ pub mod format_conversion;
 pub mod format_splits;
 pub mod format_traits;
 pub mod fused_quantization;
+pub mod gate_value;
 pub mod glob;
 pub mod hierarchical_stats;
 pub mod hilbert_curve;
