@@ -17,6 +17,12 @@
 //!    and footer: two more ranged reads, and its listed ETag), kept only when
 //!    the A0 the directory rebuilds from it is byte-identical to the
 //!    segment's. Entries carried from the base keep their key, if any.
+//!    TD-PAXMETA-1 (ADR-098 D2): an UNCOVERED segment that is coalesced PAX
+//!    (the untrained flush layout, or a trained segment whose dimension
+//!    mismatches the directory) also gets a key — the zero-encoded untrained
+//!    form, built from its header prefix and footer — so collection-level
+//!    questions (row counts, exact-authority) read no footers. Legacy
+//!    non-coalesced objects stay keyless.
 //! 4. Write generation `g + 1` **create-only**. Losing the race to another
 //!    publisher reloads and retries; repeated losses give up, since the next
 //!    compaction repairs the directory.
@@ -35,7 +41,7 @@ use proximadb_storage_common::centroid_directory::{
 };
 use proximadb_storage_common::coarse_directory::CoarseDirectory;
 use proximadb_storage_common::segment_layout::{
-    SEG_HEADER_PREFIX_LEN, SegmentFooterIndex, SegmentHeaderPrefix,
+    SEG_HEADER_PREFIX_LEN, SegmentFooterIndex, SegmentHeaderPrefix, is_coalesced_segment,
 };
 use proximadb_storage_filesystem_types::{DirEntry, FileSystem, FilesystemError};
 
@@ -56,6 +62,17 @@ proximadb_config::env_kill_switch! {
 proximadb_config::env_kill_switch! {
     /// Kill-switch gate; default ON (0|false|off|no disables).
     pub fn directory_decode_keys_write_enabled() { gate: "PROXIMADB_PAX_WRITE_DIRECTORY_DECODE_KEYS", default: true }
+}
+
+// TD-PAXMETA-1 (ADR-098 D2) WRITE gate: a flush that published new segments
+// also refreshes the collection directory — the same create-only reconcile
+// the compaction publish runs — so flush-written (uncovered) segments appear
+// with their untrained decode keys instead of waiting for the next
+// compaction. Default OFF until baked (a flush is the hot ingest path; the
+// publish adds one LIST plus per-changed-segment reads off the query path).
+// Read on every call (not memoized) so tests can flip it mid-process.
+pub fn directory_at_flush_write_enabled() -> bool {
+    proximadb_config::env_flag_now("PROXIMADB_PAX_WRITE_DIRECTORY_AT_FLUSH")
 }
 
 /// Directory objects in a listing, newest generation first.
@@ -172,6 +189,76 @@ fn retain_current_decode_keys(
         if !(decode_keys && key_matches_listing(segment, listed)) {
             segment.decode_key = None;
         }
+    }
+}
+
+/// TD-PAXMETA-1 (ADR-098 D2): read an UNCOVERED segment's footer and build its
+/// zero-encoded decode key — the coalesced-but-untrained segments a flush
+/// writes, and trained segments whose dimension mismatches the directory. Two
+/// ranged reads (header prefix, footer). `None` when the object is not
+/// coalesced PAX or any part disagrees: the segment stays uncovered and
+/// keyless, and its readers keep the per-segment footer path.
+async fn read_uncovered_decode_key(
+    fs: &dyn FileSystem,
+    url: &str,
+    size_bytes: u64,
+    etag: Option<&str>,
+) -> Option<SegmentDecodeKey> {
+    let prefix_len = (SEG_HEADER_PREFIX_LEN as u64).min(size_bytes);
+    if prefix_len < SEG_HEADER_PREFIX_LEN as u64 {
+        return None;
+    }
+    let prefix = match fs.read_range(url, 0, prefix_len).await {
+        Ok(prefix) => prefix,
+        Err(error) => {
+            tracing::debug!(%url, %error, "segment header unreadable; no untrained key");
+            return None;
+        }
+    };
+    if !is_coalesced_segment(&prefix) {
+        return None; // legacy block layout: never keyable
+    }
+    let Ok(header) = SegmentHeaderPrefix::parse(&prefix) else {
+        return None;
+    };
+    if header.footer_len == 0 || !within(size_bytes, header.footer_off, header.footer_len) {
+        return None;
+    }
+    let footer = match fs
+        .read_range(url, header.footer_off, header.footer_len)
+        .await
+    {
+        Ok(footer) => footer,
+        Err(error) => {
+            tracing::debug!(%url, %error, "segment footer unreadable; no untrained key");
+            return None;
+        }
+    };
+    let footer = SegmentFooterIndex::parse(&footer).ok()?;
+    SegmentDecodeKey::from_untrained_segment(&prefix, &footer, etag)
+        .map_err(|error| tracing::debug!(%url, %error, "segment has no untrained decode key"))
+        .ok()
+}
+
+/// Best-effort untrained-key attach for a segment just recorded as uncovered:
+/// a failure leaves it keyless (readers use the footer path), never errors
+/// the publish.
+async fn attach_untrained_key(
+    builder: &mut proximadb_storage_common::centroid_directory::DirectoryBuilder,
+    fs: &dyn FileSystem,
+    name: &str,
+    url: &str,
+    size_bytes: u64,
+    etag: Option<&str>,
+    decode_keys: bool,
+) {
+    if !decode_keys {
+        return;
+    }
+    if let Some(key) = read_uncovered_decode_key(fs, url, size_bytes, etag).await
+        && let Err(error) = builder.set_decode_key(name, key)
+    {
+        tracing::debug!(%url, %error, "untrained decode key refused; publishing keyless");
     }
 }
 
@@ -315,6 +402,19 @@ pub async fn publish_centroid_directory(
                         tracing::debug!(%url, %error, "segment not addressable by the directory");
                         plan.builder
                             .add_uncovered(&segment.name, segment.size_bytes);
+                        // TD-PAXMETA-1: a trained segment the directory cannot
+                        // address (dimension mismatch) still gets its
+                        // collection-level facts published.
+                        attach_untrained_key(
+                            &mut plan.builder,
+                            fs,
+                            &segment.name,
+                            url,
+                            segment.size_bytes,
+                            etag.as_deref(),
+                            decode_keys,
+                        )
+                        .await;
                     } else if decode_keys
                         && let Some(key) =
                             read_decode_key(fs, url, segment.size_bytes, etag.as_deref(), &read)
@@ -324,9 +424,22 @@ pub async fn publish_centroid_directory(
                         a0_by_name.insert(segment.name.clone(), read.a0_bytes);
                     }
                 }
-                Ok(None) => plan
-                    .builder
-                    .add_uncovered(&segment.name, segment.size_bytes),
+                Ok(None) => {
+                    plan.builder
+                        .add_uncovered(&segment.name, segment.size_bytes);
+                    // TD-PAXMETA-1: a coalesced-but-untrained segment (the
+                    // flush layout) carries its footer facts in the directory.
+                    attach_untrained_key(
+                        &mut plan.builder,
+                        fs,
+                        &segment.name,
+                        url,
+                        segment.size_bytes,
+                        etag.as_deref(),
+                        decode_keys,
+                    )
+                    .await;
+                }
                 // Transient read failure: leave the segment out of the stamp
                 // entirely, so readers scan it per segment and the next
                 // publish retries it.
@@ -781,5 +894,94 @@ pub(crate) mod tests {
         assert!(centroid_directory_write_enabled());
         unsafe { std::env::set_var("PROXIMADB_PAX_WRITE_CENTROID_DIRECTORY", "0") };
         assert!(!centroid_directory_write_enabled());
+        // Restore for the shared-process `cargo test --lib` runner.
+        unsafe { std::env::remove_var("PROXIMADB_PAX_WRITE_CENTROID_DIRECTORY") };
+    }
+
+    /// TD-PAXMETA-1: the flush-publish gate is default-OFF opt-in — the
+    /// registry's truthy set enables it, anything else (including unset and
+    /// unrecognized values) keeps the flush path unchanged.
+    #[test]
+    fn at_flush_gate_defaults_off_opt_in() {
+        // SAFETY: nextest runs each test in its own process.
+        unsafe { std::env::remove_var("PROXIMADB_PAX_WRITE_DIRECTORY_AT_FLUSH") };
+        assert!(!directory_at_flush_write_enabled(), "default OFF");
+        for on in ["1", "true", "on", "yes"] {
+            unsafe { std::env::set_var("PROXIMADB_PAX_WRITE_DIRECTORY_AT_FLUSH", on) };
+            assert!(directory_at_flush_write_enabled(), "{on} opts in");
+        }
+        for off in ["0", "false", "off", "no", "bogus"] {
+            unsafe { std::env::set_var("PROXIMADB_PAX_WRITE_DIRECTORY_AT_FLUSH", off) };
+            assert!(!directory_at_flush_write_enabled(), "{off} stays off");
+        }
+        unsafe { std::env::remove_var("PROXIMADB_PAX_WRITE_DIRECTORY_AT_FLUSH") };
+    }
+
+    /// TD-PAXMETA-1 (ADR-098 D2): an untrained (flush-layout) coalesced
+    /// segment is published UNCOVERED but WITH its zero-encoded decode key,
+    /// whose footer facts equal the segment's own; a non-coalesced object
+    /// stays keyless. A second publish finds nothing changed.
+    #[tokio::test]
+    async fn untrained_coalesced_segments_carry_zero_encoded_keys() {
+        enable_trained_layout();
+        // SAFETY: nextest runs each test in its own process.
+        unsafe { std::env::set_var("PROXIMADB_PAX_WRITE_DIRECTORY_DECODE_KEYS", "1") };
+        let tmp = tempfile::tempdir().unwrap();
+        // Flush-style L0: coalesced RaBitQ (the default write layout), no A0
+        // trained — the exact shape the flush path publishes.
+        crate::storage::engines::sst::segment_format::write_pax_segment(
+            &tmp.path().join("l0.pax"),
+            &records(0, 300),
+            "col",
+            1,
+            VectorQuant::RaBitQ,
+            None,
+            None,
+        )
+        .expect("write untrained segment");
+        std::fs::write(tmp.path().join("garbage.pax"), b"not a segment").unwrap();
+        let fs = local_fs().await;
+        let dir_url = tmp.path().to_string_lossy().to_string();
+
+        assert_eq!(
+            publish_centroid_directory(&fs, &dir_url).await.unwrap(),
+            Some(1)
+        );
+        let dir = &newest(&fs, &dir_url).await[0].1;
+        let l0 = dir
+            .segments
+            .iter()
+            .find(|s| s.name == "l0.pax")
+            .expect("untrained segment stamped");
+        assert!(!l0.is_covered(), "no A0 ⇒ not addressable");
+        let key = l0.decode_key.as_ref().expect("untrained decode key");
+        assert!(
+            key.rabitq_header.is_empty() && key.a0_seed == 0 && key.a0_trained_on == 0,
+            "zero-encoded A0 fields"
+        );
+        // The key's facts equal the segment's own footer.
+        let bytes = fs.read(&format!("{dir_url}/l0.pax")).await.unwrap();
+        let real = SegmentFooterIndex::locate_in_segment(&bytes)
+            .expect("footer locates")
+            .expect("coalesced footer present");
+        assert_eq!(key.row_count, real.row_count);
+        assert_eq!(key.row_count, 300);
+        assert_eq!(key.has_f32_tier, real.has_f32_tier);
+        assert_eq!(key.embed_quant_tag, real.embed_quant_tag);
+        assert_eq!(key.blocks, real.blocks);
+        assert_eq!(key.block_stats, real.block_stats);
+        // A legacy/garbage object stays uncovered AND keyless.
+        let garbage = dir
+            .segments
+            .iter()
+            .find(|s| s.name == "garbage.pax")
+            .expect("garbage stamped");
+        assert!(!garbage.is_covered() && garbage.decode_key.is_none());
+
+        // Nothing changed: no new generation.
+        assert_eq!(
+            publish_centroid_directory(&fs, &dir_url).await.unwrap(),
+            None
+        );
     }
 }

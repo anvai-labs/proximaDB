@@ -786,6 +786,15 @@ impl SstEngine {
             });
         }
 
+        // TD-PAXMETA-1 (ADR-098 D2): keep the collection segment directory
+        // current with the segment this flush just published (default OFF:
+        // PROXIMADB_PAX_WRITE_DIRECTORY_AT_FLUSH). The publish never fails
+        // the flush — the directory is a projection, and without one readers
+        // use the per-segment footer path.
+        if block_format == BlockFormat::PaxBlock {
+            self.refresh_directory_after_flush(&final_file_path).await;
+        }
+
         // Check if compaction should be triggered (per-collection tag cascade,
         // TD-WLP-2 — the global env stays the master kill-switch).
         let collection_tags: &[String] = params
@@ -1012,6 +1021,59 @@ impl SstEngine {
             compaction_error,
             flushed_batch_ids: params.batch_ids.clone(),
         })
+    }
+
+    /// TD-PAXMETA-1 (ADR-098 D2): bring the collection segment directory up to
+    /// date after this flush published `final_file_path`, behind the
+    /// default-OFF `PROXIMADB_PAX_WRITE_DIRECTORY_AT_FLUSH` gate (the
+    /// compaction publish path stays on
+    /// `PROXIMADB_PAX_WRITE_CENTROID_DIRECTORY`). A publish failure is logged
+    /// and never fails the flush — the same discipline as the compaction
+    /// publish: the directory is a projection, so without one queries use the
+    /// per-segment footer path.
+    async fn refresh_directory_after_flush(&self, final_file_path: &str) {
+        use crate::storage::engines::sst::centroid_directory_publisher::{
+            centroid_directory_write_enabled, directory_at_flush_write_enabled,
+            publish_centroid_directory,
+        };
+        // The flush hook obeys the same master write kill-switch as the
+        // compaction publish (`refresh_centroid_directory`).
+        if !(centroid_directory_write_enabled() && directory_at_flush_write_enabled()) {
+            return;
+        }
+        let Some((dir_url, _)) = final_file_path.rsplit_once('/') else {
+            return;
+        };
+        let Ok(fs) = self.filesystem().get_filesystem(dir_url) else {
+            tracing::warn!(
+                dir = dir_url,
+                "PAX segment directory not published after flush"
+            );
+            return;
+        };
+        match publish_centroid_directory(fs.as_ref(), dir_url).await {
+            Ok(Some(generation)) => {
+                tracing::debug!(
+                    dir = dir_url,
+                    generation,
+                    "published PAX segment directory after flush"
+                );
+                // TD-TIER-1 SC4-5: queries read the newest directory on every
+                // cold query; a granted collection makes it resident at once
+                // (detached; inert without a grant).
+                crate::storage::engines::sst::segment_io::spawn_warm_object(
+                    fs,
+                    format!(
+                        "{dir_url}/{}",
+                        proximadb_storage_common::centroid_directory::object_name(generation)
+                    ),
+                );
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(dir = dir_url, %error, "PAX segment directory not published after flush")
+            }
+        }
     }
 
     /// Whether L0→base compaction should be triggered after this flush (TD-114,
@@ -2971,5 +3033,162 @@ mod tests {
         assert!(resolve_pax_rg_layout(&tags_on));
         assert!(resolve_pax_rg_layout(&[]));
         assert!(rg_layout_enabled());
+    }
+
+    /// TD-PAXMETA-1 (ADR-098 D2): `PROXIMADB_PAX_WRITE_DIRECTORY_AT_FLUSH`
+    /// (default OFF). With the gate unset a PAX flush publishes NO directory
+    /// object (the flush path is byte-for-byte today's behavior); opted in,
+    /// the flush's untrained segments appear in the directory as `NO_MODEL`
+    /// entries carrying their zero-encoded decode keys.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn flush_publishes_the_segment_directory_only_when_gated_on() {
+        use crate::core::search::SearchParams;
+        use crate::proto::proximadb_v1::{Collection, CollectionConfig, StorageAssignment};
+        use crate::storage::traits::{FlushParameters, StorageQueryContext, UnifiedStorageFormat};
+        use proximadb_records::{EmbeddingCell, ProximaRecord};
+
+        // SAFETY: pinned before the engine is constructed; #[serial] keeps
+        // the gate world private to this test in the shared `cargo test --lib`
+        // process, and the vars are restored at the end.
+        unsafe {
+            std::env::remove_var("PROXIMADB_PAX_WRITE_DIRECTORY_AT_FLUSH");
+            std::env::set_var("PROXIMADB_PAX_WRITE_CENTROID_DIRECTORY", "1");
+            std::env::set_var("PROXIMADB_PAX_COALESCED_RABITQ", "1");
+            std::env::set_var("PROXIMADB_PAX_WRITE_DIRECTORY_DECODE_KEYS", "1");
+        }
+        let dim = 8usize;
+        let records = |seed: usize| -> Vec<ProximaRecord> {
+            (0..64usize)
+                .map(|i| ProximaRecord {
+                    oid: format!("s{seed}-{i}"),
+                    record_version: 1,
+                    embeddings: vec![EmbeddingCell::new_fp32(
+                        "test",
+                        "dense_vector",
+                        dim as u32,
+                        (0..dim)
+                            .map(|j| (((i + seed) * 13 + j * 7) % 31) as f32 * 0.01)
+                            .collect(),
+                    )],
+                    ..ProximaRecord::default()
+                })
+                .collect()
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        // `compaction:off` keeps the compaction publisher out of the arm —
+        // this test isolates the FLUSH publish gate.
+        let collection = Collection {
+            id: "paxmeta-flush-gate".into(),
+            config: Some(CollectionConfig {
+                name: "paxmeta-flush-gate".into(),
+                dimension: dim as u32,
+                tags: vec!["compaction:off".into()],
+                ..Default::default()
+            }),
+            storage_assignment: Some(StorageAssignment {
+                base_location: tmp.path().to_str().unwrap().to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let engine = SstEngine::new_with_config(
+            SstConfig::default(),
+            Arc::new(
+                crate::storage::persistence::filesystem::FilesystemFactory::create({
+                    let mut fs_config =
+                        crate::storage::persistence::filesystem::FilesystemConfig::default();
+                    fs_config.default_fs = Some(format!("file://{}", tmp.path().display()));
+                    fs_config
+                })
+                .await
+                .unwrap(),
+            ),
+            Arc::new(UnifiedDistanceCompute::default()),
+        )
+        .await
+        .unwrap();
+        let ctx = StorageQueryContext::new(
+            Arc::new(SearchParams::default()),
+            Arc::new(collection.clone()),
+        );
+        let storage_url = ctx.collection_storage_path().unwrap();
+        tokio::fs::create_dir_all(&storage_url).await.unwrap();
+        let flush = |seed: usize| {
+            let engine = &engine;
+            let collection = collection.clone();
+            let storage_url = storage_url.clone();
+            async move {
+                engine
+                    .do_flush(&FlushParameters {
+                        collection_id: Some("paxmeta-flush-gate".into()),
+                        vector_records: records(seed),
+                        force: true,
+                        synchronous: true,
+                        collection_config: Some(collection),
+                        ..Default::default()
+                    })
+                    .await
+                    .unwrap()
+            }
+        };
+        let directories = || {
+            std::fs::read_dir(&storage_url)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .filter(|e| e.file_name().to_string_lossy().ends_with(".pxcd"))
+                .map(|e| e.path())
+                .collect::<Vec<_>>()
+        };
+
+        // Gate OFF (the default): the flush succeeds and writes NO directory.
+        assert!(flush(0).await.success);
+        assert!(
+            directories().is_empty(),
+            "default OFF: no directory object after a PAX flush"
+        );
+
+        // Opted in: the next flush publishes generation 1, covering both
+        // untrained flush segments with zero-encoded decode keys.
+        // SAFETY: see above.
+        unsafe { std::env::set_var("PROXIMADB_PAX_WRITE_DIRECTORY_AT_FLUSH", "1") };
+        assert!(flush(1).await.success);
+        let published = directories();
+        assert_eq!(published.len(), 1, "exactly the newest generation is kept");
+        let bytes = std::fs::read(&published[0]).unwrap();
+        let dir = proximadb_storage_common::centroid_directory::PaxCentroidDirectory::parse(&bytes)
+            .unwrap();
+        assert_eq!(dir.generation, 1);
+        assert_eq!(dir.segments.len(), 2, "both flush segments are stamped");
+        for segment in &dir.segments {
+            assert!(!segment.is_covered(), "flush segments are untrained");
+            let key = segment.decode_key.as_ref().expect("untrained decode key");
+            assert_eq!(key.row_count, 64);
+            assert!(
+                key.rabitq_header.is_empty() && key.a0_seed == 0 && key.a0_trained_on == 0,
+                "zero-encoded A0 fields"
+            );
+        }
+
+        // Negative control for the master WRITE kill-switch: AT_FLUSH still
+        // on, but PROXIMADB_PAX_WRITE_CENTROID_DIRECTORY off ⇒ the flush
+        // succeeds and publishes no new generation.
+        // SAFETY: see above.
+        unsafe { std::env::set_var("PROXIMADB_PAX_WRITE_CENTROID_DIRECTORY", "0") };
+        assert!(flush(2).await.success);
+        let after_off = directories();
+        assert_eq!(
+            after_off, published,
+            "master write kill-switch off: no new generation"
+        );
+
+        // Restore the gate world for the shared-process runner.
+        // SAFETY: see above.
+        unsafe {
+            std::env::remove_var("PROXIMADB_PAX_WRITE_CENTROID_DIRECTORY");
+            std::env::remove_var("PROXIMADB_PAX_WRITE_DIRECTORY_AT_FLUSH");
+            std::env::remove_var("PROXIMADB_PAX_COALESCED_RABITQ");
+            std::env::remove_var("PROXIMADB_PAX_WRITE_DIRECTORY_DECODE_KEYS");
+        }
     }
 }

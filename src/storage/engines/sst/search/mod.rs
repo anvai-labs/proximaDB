@@ -505,6 +505,18 @@ const PAX_FOOTER_FACTS_CACHE_MAX: usize = 100_000;
 /// Bound on concurrent footer/header reads in `segment_vector_count`.
 const FOOTER_FACTS_CONCURRENCY: usize = 32;
 
+/// TD-PAXMETA-1 (ADR-098 D2): the collection-level facts the segment
+/// directory serves for one segment — the same fields [`PaxFooterFacts`]
+/// reads a footer for, plus the row total the rebuild-coverage scan counts
+/// block by block. Served only for entries whose `(size, ETag)` binding
+/// matches the listing the caller already holds; every other segment keeps
+/// the per-segment footer path unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DirectorySegmentFacts {
+    row_count: usize,
+    has_f32_tier: bool,
+}
+
 /// ADR-028: resolve the collection's `index_policy` into the exact-scan decision
 /// inputs for the SST adaptive route. Returns `(byte_budget, pin_exact)`:
 ///
@@ -556,13 +568,28 @@ impl SstEngine {
             Ok(files) => files,
             Err(_) => return 0,
         };
+        // TD-PAXMETA-1 (ADR-098 D2): collection-level facts come from the
+        // segment directory first — zero per-segment GETs for the segments it
+        // covers with a matching (size, ETag) binding. A segment without a
+        // matching entry keeps its footer read below (exactly today's path).
+        let directory = self.directory_segment_facts(storage_url, &files).await;
         // Concurrent waves: footer facts / legacy headers for every segment are
         // independent reads, so a cold first query pays ~one round trip of
         // latency per `FOOTER_FACTS_CONCURRENCY` segments, not one per segment
         // (PAX spec study TE-P2, change #6; TD-PAXMETA-1 removes the reads).
         let mut total = 0usize;
         for chunk in files.chunks(FOOTER_FACTS_CONCURRENCY) {
-            let counts = join_all(chunk.iter().map(|f| self.segment_count_fact(&f.url))).await;
+            let counts = join_all(chunk.iter().map(|f| async {
+                match directory.as_ref().and_then(|d| d.get(&f.url)) {
+                    // Same semantics as the footer path: an exact scan needs
+                    // authoritative f32 values in EVERY segment, so one lossy
+                    // segment keeps the whole collection on the cascade.
+                    Some(facts) if !facts.has_f32_tier => SegmentCountFact::Lossy,
+                    Some(facts) => SegmentCountFact::Rows(facts.row_count),
+                    None => self.segment_count_fact(&f.url).await,
+                }
+            }))
+            .await;
             for count in counts {
                 match count {
                     // An exact scan needs authoritative f32 values in EVERY
@@ -622,6 +649,54 @@ impl SstEngine {
             PAX_FOOTER_FACTS.clear();
         }
         PAX_FOOTER_FACTS.insert(url.to_string(), facts);
+        Some(facts)
+    }
+
+    /// TD-PAXMETA-1 (ADR-098 D2): per-segment collection facts served from
+    /// the collection segment directory — everything [`PaxFooterFacts`]
+    /// reads a footer for — for every discovered file whose directory entry
+    /// matches the listing's `(size, ETag)` binding. `None` when the
+    /// decode-key read gate is off or there is no usable directory; a file
+    /// simply absent from the returned map keeps today's per-segment path.
+    /// The directory is a projection (ADR-098 D2.3): never authoritative,
+    /// only a cache validated against the listing here.
+    async fn directory_segment_facts(
+        &self,
+        storage_url: &str,
+        files: &[DiscoveredSstFile],
+    ) -> Option<HashMap<String, DirectorySegmentFacts>> {
+        use crate::storage::engines::sst::centroid_directory_reader as reader;
+        if !(reader::centroid_directory_read_enabled()
+            && reader::directory_decode_keys_read_enabled())
+        {
+            return None;
+        }
+        let fs = self.filesystem().get_filesystem(storage_url).ok()?;
+        let dir = reader::load_directory(fs.as_ref(), storage_url).await?;
+        let mut facts = HashMap::with_capacity(files.len());
+        for file in files {
+            let Some(name) = file.url.rsplit('/').next() else {
+                continue;
+            };
+            let Some(entry) = dir.segments.iter().find(|s| s.name == name) else {
+                continue;
+            };
+            if !entry.key_matches_listing(file.size_bytes, file.etag.as_deref()) {
+                continue;
+            }
+            let Some(key) = entry.decode_key.as_ref() else {
+                continue;
+            };
+            if let Ok(row_count) = usize::try_from(key.row_count) {
+                facts.insert(
+                    file.url.clone(),
+                    DirectorySegmentFacts {
+                        row_count,
+                        has_f32_tier: key.has_f32_tier,
+                    },
+                );
+            }
+        }
         Some(facts)
     }
 
@@ -1187,9 +1262,7 @@ impl SstEngine {
             let covered = match self.discover_sstable_files(storage_url).await {
                 Ok(files) if !files.is_empty() => {
                     match self
-                        .durable_vector_count_for_rebuild(
-                            &files.iter().map(|f| f.url.clone()).collect::<Vec<_>>(),
-                        )
+                        .durable_vector_count_for_rebuild(storage_url, &files)
                         .await
                     {
                         Some(durable) => registered as u64 >= durable,
@@ -1227,9 +1300,7 @@ impl SstEngine {
         // `all()` check and rebuilds normally (exact AXIS). See
         // `pax_segment_is_coarse_rabitq_without_f32_tier`.
         if self
-            .all_segments_coarse_rabitq_pax_without_f32_tier(
-                &files.iter().map(|f| f.url.clone()).collect::<Vec<_>>(),
-            )
+            .all_segments_coarse_rabitq_pax_without_f32_tier(storage_url, &files)
             .await
         {
             tracing::info!(
@@ -1298,12 +1369,27 @@ impl SstEngine {
     /// errs toward rebuilding. Kept separate from the TD-165
     /// `segment_vector_count` gate, whose 0-on-unknown semantics ("fall through
     /// to the approximate path") must not change.
-    async fn durable_vector_count_for_rebuild(&self, files: &[String]) -> Option<u64> {
+    ///
+    /// TD-PAXMETA-1 (ADR-098 D2): a `.pax` segment whose directory entry
+    /// matches the listing's `(size, ETag)` binding contributes its recorded
+    /// row count with no read (the key's block table sums to it, enforced at
+    /// publish); every other segment keeps today's whole-object scan.
+    async fn durable_vector_count_for_rebuild(
+        &self,
+        storage_url: &str,
+        files: &[DiscoveredSstFile],
+    ) -> Option<u64> {
         use crate::storage::engines::sst::SstableHeader;
+        let directory = self.directory_segment_facts(storage_url, files).await;
         let mut total: u64 = 0;
-        for file_path in files {
+        for file in files {
+            let file_path = file.url.as_str();
             let fs = self.filesystem().get_filesystem(file_path).ok()?;
             if file_path.ends_with(".pax") {
+                if let Some(facts) = directory.as_ref().and_then(|d| d.get(file_path)) {
+                    total = total.saturating_add(facts.row_count as u64);
+                    continue;
+                }
                 // Segments are the flush unit and small relative to query cost;
                 // a full read + index parse is the same cost class as the
                 // coarse-RaBitQ probe below.
@@ -1332,16 +1418,36 @@ impl SstEngine {
         Some(total)
     }
 
-    async fn all_segments_coarse_rabitq_pax_without_f32_tier(&self, files: &[String]) -> bool {
+    /// TD-PAXMETA-1 (ADR-098 D2): a directory-covered segment whose entry
+    /// records the exact f32 tier answers this with no read — a segment WITH
+    /// the tier rebuilds exact, which is the `false` this guard returns for
+    /// "RaBitQ with an f32 tier". An entry WITHOUT the tier keeps today's
+    /// whole-object byte probe (the directory does not record the block-level
+    /// embed quant the predicate keys on), so the directory never changes the
+    /// guard's answer, it only removes reads it can prove unnecessary. Pinned
+    /// by `directory_facts_answer_collection_questions_with_zero_gets`.
+    async fn all_segments_coarse_rabitq_pax_without_f32_tier(
+        &self,
+        storage_url: &str,
+        files: &[DiscoveredSstFile],
+    ) -> bool {
         use crate::storage::engines::sst::segment_format::pax_segment_is_coarse_rabitq_without_f32_tier;
+        let directory = self.directory_segment_facts(storage_url, files).await;
         for file in files {
-            if !file.ends_with(".pax") {
+            if !file.url.ends_with(".pax") {
                 return false; // legacy `.sst` / `.arrow` → exact-readable → rebuild
             }
-            let Ok(fs) = self.filesystem().get_filesystem(file) else {
+            if directory
+                .as_ref()
+                .and_then(|d| d.get(file.url.as_str()))
+                .is_some_and(|facts| facts.has_f32_tier)
+            {
+                return false; // exact tier recorded → rebuild exact, no read
+            }
+            let Ok(fs) = self.filesystem().get_filesystem(&file.url) else {
                 return false; // can't open → don't skip; let the rebuild try
             };
-            let Ok(bytes) = fs.read_resident(file).await else {
+            let Ok(bytes) = fs.read_resident(&file.url).await else {
                 return false;
             };
             if !pax_segment_is_coarse_rabitq_without_f32_tier(&bytes) {
@@ -4760,6 +4866,329 @@ mod tests {
             // Served from the cache once read (the object is immutable).
             assert_eq!(PAX_FOOTER_FACTS.get(&url).map(|f| *f), Some(facts));
         }
+    }
+
+    // ---- TD-PAXMETA-1 (ADR-098 D2): collection-level facts from the segment
+    // directory ----
+
+    /// One test collection: an engine over a counting factory, `n_segments`
+    /// segments — one trained (covered entry) plus untrained flush-layout
+    /// segments (uncovered entries with zero-encoded keys), all carrying the
+    /// exact-f32 tier so the Adaptive count arm sees `Rows` — and a published
+    /// directory. Returns the engine, GET counters, the storage URL and the
+    /// discovered files.
+    async fn directory_facts_arm(
+        id: &str,
+        n_segments: usize,
+    ) -> (
+        SstEngine,
+        std::sync::Arc<proximadb_storage_filesystem_types::counting::GetCounters>,
+        String,
+        Vec<DiscoveredSstFile>,
+    ) {
+        use crate::storage::engines::sst::centroid_directory_publisher::publish_centroid_directory;
+        use crate::storage::engines::sst::segment_format::write_pax_segment_compacted;
+        use crate::storage::persistence::filesystem::FilesystemConfig;
+        use proximadb_records::{EmbeddingCell, ProximaRecord};
+
+        const DIM: usize = 16;
+        const ROWS: usize = 300;
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().to_str().unwrap().to_string();
+        // Keep the directory for the engine's lifetime (the engine and the
+        // discovered URLs outlive this function).
+        std::mem::forget(temp);
+        let mut fs_config = FilesystemConfig::default();
+        fs_config.default_fs = Some(format!("file://{base}"));
+        let counters = std::sync::Arc::new(
+            proximadb_storage_filesystem_types::counting::GetCounters::default(),
+        );
+        let mut factory = FilesystemFactory::create(fs_config).await.unwrap();
+        factory.set_test_get_counters(std::sync::Arc::clone(&counters));
+        let engine = SstEngine::new_with_config(
+            SstConfig::default(),
+            std::sync::Arc::new(factory),
+            std::sync::Arc::new(UnifiedDistanceCompute::default()),
+        )
+        .await
+        .unwrap();
+        let collection = crate::proto::proximadb_v1::Collection {
+            id: id.into(),
+            config: Some(crate::proto::proximadb_v1::CollectionConfig {
+                name: id.into(),
+                dimension: DIM as u32,
+                tags: vec!["compaction:off".into()],
+                ..Default::default()
+            }),
+            storage_assignment: Some(crate::proto::proximadb_v1::StorageAssignment {
+                base_location: base,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let ctx = StorageQueryContext::new(
+            std::sync::Arc::new(crate::core::search::SearchParams::default()),
+            std::sync::Arc::new(collection),
+        );
+        let storage_url = ctx.collection_storage_path().unwrap();
+        tokio::fs::create_dir_all(&storage_url).await.unwrap();
+        let records = |seed: usize| -> Vec<ProximaRecord> {
+            (0..ROWS)
+                .map(|i| {
+                    let mut r = ProximaRecord {
+                        oid: format!("s{seed}-{i}"),
+                        record_version: 1,
+                        ..Default::default()
+                    };
+                    r.embeddings.push(EmbeddingCell::new_fp32(
+                        "",
+                        "dense",
+                        DIM as u32,
+                        (0..DIM)
+                            .map(|d| ((((i + seed) * 131 + d * 17) % 251) as f32) * 0.01)
+                            .collect(),
+                    ));
+                    r
+                })
+                .collect()
+        };
+        for s in 0..n_segments {
+            let path_buf = std::path::PathBuf::from(format!("{storage_url}/seg-{s}.pax"));
+            let path = path_buf.as_path();
+            if s == 0 {
+                // Trained + exact tier: a COVERED directory entry with a key.
+                write_pax_segment_compacted(
+                    path,
+                    &records(s),
+                    id,
+                    1,
+                    proximadb_block_format::VectorQuant::RaBitQ,
+                    proximadb_block_format::VectorQuant::Sq8,
+                    true,
+                    Some(16 * 1024),
+                    None,
+                )
+                .unwrap();
+            } else {
+                // Untrained flush layout + exact tier: an UNCOVERED entry
+                // carrying a zero-encoded key.
+                crate::storage::engines::sst::segment_format::write_pax_segment_with_f32_tier(
+                    path,
+                    &records(s),
+                    id,
+                    1,
+                    proximadb_block_format::VectorQuant::RaBitQ,
+                    true,
+                    None,
+                    None,
+                )
+                .unwrap();
+            }
+        }
+        let fs = engine.filesystem().get_filesystem(&storage_url).unwrap();
+        assert_eq!(
+            publish_centroid_directory(fs.as_ref(), &storage_url)
+                .await
+                .unwrap(),
+            Some(1)
+        );
+        let files = engine.discover_sstable_files(&storage_url).await.unwrap();
+        assert_eq!(files.len(), n_segments);
+        // Steady state: the directory generation is loaded once per
+        // collection, not per question — pre-warm it outside the measurement.
+        crate::storage::engines::sst::centroid_directory_reader::load_directory(
+            fs.as_ref(),
+            &storage_url,
+        )
+        .await
+        .expect("published directory loads");
+        (engine, counters, storage_url, files)
+    }
+
+    /// TD-PAXMETA-1 (ADR-098 D2): with a valid directory, the collection-level
+    /// questions (`segment_vector_count`, the AXIS rebuild coverage count, the
+    /// coarse-RaBitQ guard) are answered with ZERO per-segment GETs, and the
+    /// answers equal the footer path's. The coarse-RaBitQ parity is pinned
+    /// directly against the byte predicate on the same segments' bytes.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn directory_facts_answer_collection_questions_with_zero_gets() {
+        // SAFETY: nextest runs each test in its own process; #[serial] keeps
+        // the gate world private in the shared `cargo test --lib` process.
+        unsafe {
+            std::env::set_var("PROXIMADB_PAX_COALESCED_RABITQ", "1");
+            std::env::set_var("PROXIMADB_PAX_WRITE_A0_TRAIN", "1");
+            std::env::set_var("PROXIMADB_IVF_K", "4");
+            std::env::set_var("PROXIMADB_PAX_WRITE_DIRECTORY_DECODE_KEYS", "1");
+            std::env::set_var("PROXIMADB_PAX_READ_DIRECTORY_DECODE_KEYS", "1");
+            std::env::set_var("PROXIMADB_PAX_READ_CENTROID_DIRECTORY", "1");
+        }
+        let (engine, counters, storage_url, files) = directory_facts_arm("dir-facts", 3).await;
+        let before = counters.total_gets();
+
+        // The coarse-RaBitQ guard's byte predicate, pinned on the same
+        // segments the directory answers for: every segment here records the
+        // exact f32 tier, and the byte path returns false for each — exactly
+        // what the directory path returns without the read.
+        for file in &files {
+            let fs = engine.filesystem().get_filesystem(&file.url).unwrap();
+            let bytes = fs.read_resident(&file.url).await.unwrap();
+            assert!(
+                !crate::storage::engines::sst::segment_format::pax_segment_is_coarse_rabitq_without_f32_tier(&bytes),
+                "parity premise: the byte predicate is false for exact-tier {}",
+                file.url
+            );
+        }
+        let parity_reads = counters.total_gets() - before;
+
+        let count = engine.segment_vector_count(&storage_url).await;
+        let durable = engine
+            .durable_vector_count_for_rebuild(&storage_url, &files)
+            .await;
+        let coarse = engine
+            .all_segments_coarse_rabitq_pax_without_f32_tier(&storage_url, &files)
+            .await;
+        let measured_gets = counters.total_gets() - before - parity_reads;
+        println!("PAXMETA directory_valid collection_question_gets={measured_gets}");
+
+        assert_eq!(
+            count, 900,
+            "3 segments × 300 rows, every one exact-authority"
+        );
+        assert_eq!(durable, Some(900));
+        assert!(!coarse, "same answer as the byte predicate");
+        assert_eq!(
+            measured_gets, 0,
+            "a valid directory answers collection-level questions with zero GETs"
+        );
+
+        // Negative control for the master READ kill-switch: with
+        // PROXIMADB_PAX_READ_CENTROID_DIRECTORY off the same valid directory
+        // is ignored, the rebuild count goes back to per-segment reads, and
+        // the answer is unchanged. SAFETY: nextest runs each test in its own
+        // process; restored below.
+        unsafe { std::env::set_var("PROXIMADB_PAX_READ_CENTROID_DIRECTORY", "0") };
+        let before_off = counters.total_gets();
+        let durable_off = engine
+            .durable_vector_count_for_rebuild(&storage_url, &files)
+            .await;
+        let off_gets = counters.total_gets() - before_off;
+        unsafe { std::env::remove_var("PROXIMADB_PAX_READ_CENTROID_DIRECTORY") };
+        assert_eq!(durable_off, Some(900), "same answer without the directory");
+        assert!(
+            off_gets > 0,
+            "master read kill-switch off: the directory must not serve ({off_gets} GETs)"
+        );
+    }
+
+    /// Negative control: an entry whose key records an ETag the listing does
+    /// not report (the object was rewritten) is NOT trusted — the consumers
+    /// fall back to today's footer/whole-object reads, and the answers are
+    /// unchanged.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn stale_directory_entries_fall_back_to_footer_reads() {
+        // SAFETY: see the test above.
+        unsafe {
+            std::env::set_var("PROXIMADB_PAX_COALESCED_RABITQ", "1");
+            std::env::set_var("PROXIMADB_PAX_WRITE_A0_TRAIN", "1");
+            std::env::set_var("PROXIMADB_IVF_K", "4");
+            std::env::set_var("PROXIMADB_PAX_WRITE_DIRECTORY_DECODE_KEYS", "1");
+            std::env::set_var("PROXIMADB_PAX_READ_DIRECTORY_DECODE_KEYS", "1");
+            std::env::set_var("PROXIMADB_PAX_READ_CENTROID_DIRECTORY", "1");
+        }
+        let (engine, counters, storage_url, _arm_files) = directory_facts_arm("dir-stale", 2).await;
+        // Plant generation 2 whose keys record an ETag ("rewritten") the local
+        // listing never reports.
+        let fs = engine.filesystem().get_filesystem(&storage_url).unwrap();
+        let gen1 =
+            crate::storage::engines::sst::centroid_directory_publisher::load_newest_directory(
+                fs.as_ref(),
+                &storage_url,
+            )
+            .await
+            .unwrap();
+        let mut planted = gen1.clone();
+        planted.generation = 2;
+        for segment in &mut planted.segments {
+            if let Some(key) = segment.decode_key.as_mut() {
+                key.object_etag = Some("rewritten".into());
+            }
+        }
+        let url = format!(
+            "{storage_url}/{}",
+            proximadb_storage_common::centroid_directory::object_name(2)
+        );
+        fs.write_if_absent(&url, &planted.to_bytes().unwrap(), None)
+            .await
+            .unwrap();
+        // A fresh discovery (the flush/compaction publish paths retire the
+        // cached listing the same way) notices generation 2; the readers load it.
+        invalidate_segment_listing_cache(engine.filesystem(), &storage_url);
+        let files = engine.discover_sstable_files(&storage_url).await.unwrap();
+        crate::storage::engines::sst::centroid_directory_reader::load_directory(
+            fs.as_ref(),
+            &storage_url,
+        )
+        .await
+        .expect("planted generation loads");
+
+        let before = counters.total_gets();
+        let count = engine.segment_vector_count(&storage_url).await;
+        let durable = engine
+            .durable_vector_count_for_rebuild(&storage_url, &files)
+            .await;
+        let gets = counters.total_gets() - before;
+        println!("PAXMETA directory_stale fallback_gets={gets}");
+        assert_eq!(count, 600, "the fallback still counts every row");
+        assert_eq!(durable, Some(600));
+        assert!(
+            gets > 0,
+            "stale entries are not trusted: the footer path runs ({gets} GETs)"
+        );
+    }
+
+    /// No directory at all: today's behavior, byte for byte — the footer
+    /// reads happen and the answers are the same.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn no_directory_keeps_the_footer_path() {
+        // SAFETY: see the tests above.
+        unsafe {
+            std::env::set_var("PROXIMADB_PAX_COALESCED_RABITQ", "1");
+            std::env::set_var("PROXIMADB_PAX_WRITE_A0_TRAIN", "1");
+            std::env::set_var("PROXIMADB_IVF_K", "4");
+            std::env::remove_var("PROXIMADB_PAX_WRITE_DIRECTORY_DECODE_KEYS");
+            std::env::set_var("PROXIMADB_PAX_READ_DIRECTORY_DECODE_KEYS", "1");
+            std::env::set_var("PROXIMADB_PAX_READ_CENTROID_DIRECTORY", "1");
+        }
+        // Build the arm, then delete the directory object before measuring.
+        let (engine, counters, storage_url, _arm_files) = directory_facts_arm("dir-none", 2).await;
+        let fs = engine.filesystem().get_filesystem(&storage_url).unwrap();
+        fs.delete(&format!(
+            "{storage_url}/{}",
+            proximadb_storage_common::centroid_directory::object_name(1)
+        ))
+        .await
+        .unwrap();
+        // A fresh discovery sees no directory and forgets the loaded one.
+        invalidate_segment_listing_cache(engine.filesystem(), &storage_url);
+        let files = engine.discover_sstable_files(&storage_url).await.unwrap();
+
+        let before = counters.total_gets();
+        let count = engine.segment_vector_count(&storage_url).await;
+        let gets = counters.total_gets() - before;
+        println!("PAXMETA no_directory segment_vector_count_gets={gets}");
+        assert_eq!(count, 600);
+        assert_eq!(gets, 4, "two footer reads (prefix + footer) per segment");
+        let before = counters.total_gets();
+        let durable = engine
+            .durable_vector_count_for_rebuild(&storage_url, &files)
+            .await;
+        let gets = counters.total_gets() - before;
+        println!("PAXMETA no_directory durable_count_gets={gets}");
+        assert_eq!(durable, Some(600));
+        assert!(gets >= 2, "one whole-object read per segment ({gets} GETs)");
     }
 
     #[tokio::test]

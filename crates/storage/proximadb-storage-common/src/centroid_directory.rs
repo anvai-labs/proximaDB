@@ -45,6 +45,21 @@
 //!   [n_blocks u32] n_blocks × footer block entry (the footer's own wire form,
 //!                              row-group OID-chunk stats included)
 //!   [etag_len u32 (u32::MAX = none)][object ETag utf-8]
+//!
+//! TD-PAXMETA-1 (2026-11-19, ADR-098 D2): a decode key may also ride an
+//! UNCOVERED entry (`model_idx == u32::MAX`) when the segment is coalesced
+//! PAX — an untrained flush, a non-coalesced layout it must not describe, or a
+//! dimension mismatch. The wire stays v2: for such an entry the A0-specific
+//! fields are **zero-encoded** (`a0_seed == 0`, `a0_trained_on == 0`,
+//! `rabitq_header_len == 0`), which is unambiguous because `model_idx ==
+//! NO_MODEL` already says the directory holds no model for the segment, and
+//! `parse`/`validate` reject any uncovered key whose A0 fields are not exactly
+//! zero. The key then carries only the collection-level facts (rows, tier,
+//! quant tag, block table, etag) that [`SegmentDecodeKey`] exists to project.
+//! A reader from before this change rejects a directory containing such an
+//! entry wholesale and falls back to the per-segment path — the same
+//! degradation a D1-only reader already suffers on any keyed (v2) directory,
+//! so no flag day is introduced.
 //! ```
 //!
 //! Segments are sorted by name and cells by `(segment, a0_cell)`, so identical
@@ -61,6 +76,12 @@
 //! segment keeps its self-describing copy; the key is a projection like the
 //! rest of the directory. A directory with no key is written as v1, byte for
 //! byte the D1 format, and `parse` accepts both versions.
+//!
+//! TD-PAXMETA-1: an **uncovered** segment (no model the directory can address)
+//! that is coalesced PAX may also carry a key, with its A0-specific fields
+//! zero-encoded (see the layout above). Such a key serves the collection-level
+//! consumers (row counts, tier authority) — never `segment_decode`, which
+//! needs a model.
 //!
 //! Because a key replaces the segment's own metadata reads, it is bound to
 //! the exact object it was built from: beyond the `(name, size)` stamp, it
@@ -182,8 +203,10 @@ pub struct DirectorySegment {
     /// Index into the model table, or [`NO_MODEL`].
     pub model_idx: u32,
     /// TD-PAXDIR-1 D6: the segment's query-path metadata, so a covered
-    /// segment needs no header, A0 or footer read. Only covered segments
-    /// carry one; `None` keeps the per-segment metadata reads.
+    /// segment needs no header, A0 or footer read. TD-PAXMETA-1: an uncovered
+    /// (`NO_MODEL`) coalesced segment may also carry one, with zero-encoded A0
+    /// fields, so collection-level questions (row count, tier authority) need
+    /// no footer read either. `None` keeps the per-segment metadata reads.
     pub decode_key: Option<SegmentDecodeKey>,
 }
 
@@ -248,6 +271,41 @@ impl SegmentDecodeKey {
         Ok(key)
     }
 
+    /// TD-PAXMETA-1 (ADR-098 D2): build the key of an UNCOVERED segment —
+    /// coalesced PAX the directory examined but holds no model for (untrained,
+    /// or a dimension mismatch). The A0-specific fields are zero-encoded
+    /// (there is no model and no Region-A header to carry), so the key holds
+    /// only the collection-level facts: rows, tier authority, quant tag, block
+    /// table and ETag. Fails when the header/footer disagree, exactly as
+    /// [`Self::from_segment`] does for a covered one.
+    pub fn from_untrained_segment(
+        header_prefix: &[u8],
+        footer: &SegmentFooterIndex,
+        object_etag: Option<&str>,
+    ) -> Result<Self> {
+        let key = Self {
+            header_prefix: header_prefix
+                .get(..SEG_HEADER_PREFIX_LEN)
+                .ok_or_else(|| anyhow::anyhow!("decode key: header prefix truncated"))?
+                .to_vec(),
+            a0_seed: 0,
+            a0_trained_on: 0,
+            rabitq_header: Vec::new(),
+            row_count: footer.row_count,
+            sq8_min: footer.sq8_min,
+            sq8_scale: footer.sq8_scale,
+            embed_dim: footer.embed_dim,
+            embed_count: footer.embed_count,
+            embed_quant_tag: footer.embed_quant_tag,
+            has_f32_tier: footer.has_f32_tier,
+            blocks: footer.blocks.clone(),
+            block_stats: footer.block_stats.clone(),
+            object_etag: object_etag.map(str::to_owned),
+        };
+        key.check_untrained()?;
+        Ok(key)
+    }
+
     /// Whether this key describes the object a listing now reports: the
     /// ETags must agree, and a key built with one never matches a listing
     /// without one. (`None` on both sides — a backend that lists no ETag —
@@ -256,8 +314,9 @@ impl SegmentDecodeKey {
         self.object_etag.as_deref() == listed_etag
     }
 
-    /// Internal consistency against the segment's directory entry. Any
-    /// disagreement means the key cannot describe the segment: fail closed.
+    /// Internal consistency against the segment's directory entry — the
+    /// TRAINED (covered) form. Any disagreement means the key cannot describe
+    /// the segment: fail closed.
     fn check(&self, dim: u32, rows_covered: u64) -> Result<()> {
         let header = SegmentHeaderPrefix::parse(&self.header_prefix)?;
         if header.a0_len == 0 {
@@ -276,18 +335,51 @@ impl SegmentDecodeKey {
         if !self.sq8_min.is_finite() || !self.sq8_scale.is_finite() {
             bail!("decode key: non-finite SQ8 dequant key");
         }
-        let block_rows: u64 = self.blocks.iter().map(|b| u64::from(b.row_count)).sum();
-        if self.row_count != rows_covered || block_rows != self.row_count {
+        if self.row_count != rows_covered {
             bail!(
-                "decode key: rows disagree (footer {}, blocks {block_rows}, A0 {rows_covered})",
+                "decode key: rows disagree (footer {}, A0 {rows_covered})",
+                self.row_count
+            );
+        }
+        self.check_block_table()?;
+        Ok(())
+    }
+
+    /// TD-PAXMETA-1: consistency of a key on an UNCOVERED (`NO_MODEL`) entry.
+    /// The header prefix must parse (which requires the coalesced magic and
+    /// layout version — a legacy `PBLK` segment is never keyable) and declare
+    /// a footer; the A0-specific fields must be exactly zero-encoded; and the
+    /// block table obeys the shared invariants. Fail closed on anything else.
+    fn check_untrained(&self) -> Result<()> {
+        let header = SegmentHeaderPrefix::parse(&self.header_prefix)?;
+        if !self.rabitq_header.is_empty() || self.a0_seed != 0 || self.a0_trained_on != 0 {
+            bail!("decode key: an untrained segment's A0 fields must be zero-encoded");
+        }
+        if header.footer_len == 0 {
+            bail!("decode key: coalesced segment declares no footer");
+        }
+        if !self.sq8_min.is_finite() || !self.sq8_scale.is_finite() {
+            bail!("decode key: non-finite SQ8 dequant key");
+        }
+        self.check_block_table()?;
+        Ok(())
+    }
+
+    /// Block-table invariants shared by trained and untrained keys: the block
+    /// rows sum to the footer's row count, stats stay index-aligned, and
+    /// readers plan coalesced block fetches by block index and slice each
+    /// block out of its fetch, so offsets must ascend without overlap.
+    fn check_block_table(&self) -> Result<()> {
+        let block_rows: u64 = self.blocks.iter().map(|b| u64::from(b.row_count)).sum();
+        if block_rows != self.row_count {
+            bail!(
+                "decode key: rows disagree (footer {}, blocks {block_rows})",
                 self.row_count
             );
         }
         if self.block_stats.len() != self.blocks.len() {
             bail!("decode key: block stats misaligned with blocks");
         }
-        // Readers plan coalesced block fetches by block index and slice each
-        // block out of its fetch: offsets must ascend without overlap.
         let mut end = 0u64;
         for block in &self.blocks {
             if block.offset < end {
@@ -408,6 +500,19 @@ impl DirectorySegment {
     /// Whether the directory addresses this segment's cells.
     pub fn is_covered(&self) -> bool {
         self.model_idx != NO_MODEL
+    }
+
+    /// TD-PAXMETA-1 (ADR-098 D2): whether this entry's decode key may serve
+    /// facts for an object a listing just reported. The entry is bound to the
+    /// exact object it examined: the listed size must equal the recorded
+    /// `size_bytes` stamp, and the key's ETag the listed one (`None` on both
+    /// sides — a backend that lists no ETag — leaves the stamp as the only
+    /// binding, exactly as [`SegmentDecodeKey::matches_object`]). A segment of
+    /// unknown size can never be validated, so it never matches.
+    pub fn key_matches_listing(&self, size_bytes: Option<u64>, etag: Option<&str>) -> bool {
+        self.decode_key
+            .as_ref()
+            .is_some_and(|key| size_bytes == Some(self.size_bytes) && key.matches_object(etag))
     }
 }
 
@@ -702,13 +807,14 @@ impl PaxCentroidDirectory {
                 bail!("centroid directory segment {} has no model", segment.name);
             }
             if let Some(key) = &segment.decode_key {
-                if !segment.is_covered() {
-                    bail!(
-                        "centroid directory uncovered segment {} has a decode key",
-                        segment.name
-                    );
-                }
-                key.check(self.dim, segment.rows_covered).map_err(|e| {
+                // TD-PAXMETA-1: an uncovered entry may carry a key too, but
+                // only the zero-encoded untrained form.
+                let checked = if segment.is_covered() {
+                    key.check(self.dim, segment.rows_covered)
+                } else {
+                    key.check_untrained()
+                };
+                checked.map_err(|e| {
                     anyhow::anyhow!("centroid directory segment {}: {e}", segment.name)
                 })?;
             }
@@ -1252,17 +1358,24 @@ impl DirectoryBuilder {
     }
 
     /// TD-PAXDIR-1 D6: attach a decode key to a segment added with
-    /// [`Self::add_covered`]. Fails (leaving the segment keyless) when the
-    /// segment is not covered or the key disagrees with its A0.
+    /// [`Self::add_covered`] — or, since TD-PAXMETA-1, with
+    /// [`Self::add_uncovered`] when the segment is coalesced PAX the directory
+    /// holds no model for. Fails (leaving the segment keyless) when the key
+    /// disagrees with the segment: a covered one's key must reproduce its A0,
+    /// an uncovered one's must be the zero-encoded untrained form.
     pub fn set_decode_key(&mut self, name: &str, key: SegmentDecodeKey) -> Result<()> {
         let dim = self.dim.unwrap_or(0);
         let pending = self
             .pending
             .get_mut(name)
-            .filter(|p| p.model.is_some())
-            .ok_or_else(|| anyhow::anyhow!("segment {name} is not covered"))?;
-        let rows: u64 = pending.cells.iter().map(DirectoryCell::rows).sum();
-        key.check(dim, rows)?;
+            .ok_or_else(|| anyhow::anyhow!("segment {name} is not in the directory"))?;
+        match pending.model.is_some() {
+            true => {
+                let rows: u64 = pending.cells.iter().map(DirectoryCell::rows).sum();
+                key.check(dim, rows)?;
+            }
+            false => key.check_untrained()?,
+        }
         pending.decode_key = Some(key);
         Ok(())
     }
@@ -2135,6 +2248,175 @@ mod tests {
             .unwrap();
         b.add_uncovered("l0.pax", 50);
         (b.build(9).unwrap(), seg)
+    }
+
+    /// The header prefix of a coalesced-but-untrained segment: no A0, no
+    /// Region A, a footer where the key's facts live.
+    fn untrained_header(footer_len: u64) -> SegmentHeaderPrefix {
+        SegmentHeaderPrefix {
+            layout_version: crate::segment_layout::SEG_LAYOUT_VERSION,
+            rabitq_off: 0,
+            rabitq_len: 0,
+            sq8_off: 0,
+            sq8_len: 0,
+            footer_off: 88,
+            footer_len,
+            a0_off: 0,
+            a0_len: 0,
+            c_off: 0,
+            c_len: 0,
+        }
+    }
+
+    /// An untrained (TD-PAXMETA-1) key for a 17-row segment of two blocks.
+    fn untrained_key(etag: Option<&str>) -> SegmentDecodeKey {
+        let blocks = vec![
+            FooterBlockEntry {
+                offset: 3000,
+                size: 100,
+                row_count: 10,
+                stats_kind: crate::segment_layout::StatsKind::None,
+            },
+            FooterBlockEntry {
+                offset: 3100,
+                size: 100,
+                row_count: 7,
+                stats_kind: crate::segment_layout::StatsKind::None,
+            },
+        ];
+        let footer = SegmentFooterIndex {
+            row_count: 17,
+            rabitq_off: 0,
+            rabitq_len: 0,
+            sq8_off: 0,
+            sq8_len: 0,
+            sq8_min: 0.0,
+            sq8_scale: 0.0,
+            embed_dim: 4,
+            embed_count: 1,
+            embed_quant_tag: 1,
+            has_f32_tier: true,
+            blocks,
+            block_stats: vec![None, None],
+            encoding_map: Vec::new(),
+            block_tier_assignments: Vec::new(),
+            a0_off: 0,
+            a0_len: 0,
+            opr_off: 0,
+            opr_len: 0,
+            c_off: 0,
+            c_len: 0,
+            block_filterable_stats: Vec::new(),
+            shred_field_map: Vec::new(),
+            filter_region: None,
+        };
+        SegmentDecodeKey::from_untrained_segment(&untrained_header(300).to_bytes(), &footer, etag)
+            .unwrap()
+    }
+
+    /// TD-PAXMETA-1 (ADR-098 D2): an uncovered (`NO_MODEL`) coalesced segment
+    /// carries a decode key with zero-encoded A0 fields; the wire stays v2, a
+    /// keyless uncovered entry keeps the exact v2 shape it always had, and a
+    /// pre-existing v2 directory (covered keys only) still parses.
+    #[test]
+    fn uncovered_segments_carry_zero_encoded_decode_keys() {
+        let (mut base, _) = keyed_directory();
+        // Pre-existing v2 bytes (covered key, keyless uncovered) still parse.
+        let v2 = base.to_bytes().unwrap();
+        assert_eq!(v2[4], DIRECTORY_VERSION);
+        assert_eq!(PaxCentroidDirectory::parse(&v2).unwrap(), base);
+
+        // Attach an untrained key to the uncovered entry (`l0.pax`, index 1).
+        base.segments[1].decode_key = Some(untrained_key(Some("\"etag-u\"")));
+        let keyed = base.to_bytes().unwrap();
+        assert_eq!(keyed[4], DIRECTORY_VERSION, "still v2 — no flag day");
+        let parsed = PaxCentroidDirectory::parse(&keyed).unwrap();
+        assert_eq!(parsed, base);
+        assert_eq!(parsed.to_bytes().unwrap(), keyed, "deterministic");
+
+        let key = parsed.segments[1].decode_key.as_ref().unwrap();
+        assert!(key.rabitq_header.is_empty() && key.a0_seed == 0 && key.a0_trained_on == 0);
+        assert_eq!(key.row_count, 17);
+        assert!(key.has_f32_tier);
+        // The facts the collection-level consumers want are all present.
+        assert_eq!(key.blocks.len(), 2);
+        // An untrained key never serves the ANN decode path.
+        assert!(parsed.segment_decode(1).is_err());
+
+        // Entry validity against a listing (TD-PAXMETA-1 binding rule).
+        let entry = &parsed.segments[1];
+        assert!(entry.key_matches_listing(Some(50), Some("\"etag-u\"")));
+        assert!(
+            !entry.key_matches_listing(Some(51), Some("\"etag-u\"")),
+            "size"
+        );
+        assert!(
+            !entry.key_matches_listing(Some(50), Some("\"other\"")),
+            "etag"
+        );
+        assert!(!entry.key_matches_listing(Some(50), None), "rewritten");
+        assert!(
+            !entry.key_matches_listing(None, Some("\"etag-u\"")),
+            "unknown size"
+        );
+        // A keyless entry never matches, whatever the listing says.
+        assert!(!parsed.segments[0].key_matches_listing(Some(300), None));
+    }
+
+    /// An untrained key survives an incremental rebuild with its segment, and
+    /// a key that disagrees with an uncovered segment is refused at attach and
+    /// at serialize (fail closed).
+    #[test]
+    fn untrained_keys_round_trip_through_reconcile_and_fail_closed() {
+        let mut b = DirectoryBuilder::default();
+        b.add_covered(
+            "k.pax",
+            300,
+            &a0(4, 2, 0.5, &[&[0.0, 0.0], &[5.0, 5.0]], &[10, 7]),
+        )
+        .unwrap();
+        b.add_uncovered("u.pax", 50);
+        assert!(b.set_decode_key("u.pax", untrained_key(None)).is_ok());
+        let dir = b.clone().build(5).unwrap();
+        let bytes = dir.to_bytes().unwrap();
+        assert_eq!(PaxCentroidDirectory::parse(&bytes).unwrap(), dir);
+
+        // Carried by a rebuild that keeps the segment.
+        let live = vec![
+            LiveSegment {
+                name: "k.pax".into(),
+                size_bytes: 300,
+            },
+            LiveSegment {
+                name: "u.pax".into(),
+                size_bytes: 50,
+            },
+        ];
+        let plan = plan_reconcile(Some(&dir), &live);
+        let rebuilt = plan.builder.build(6).unwrap();
+        assert!(rebuilt.segments[1].decode_key.is_some());
+
+        // A trained key on an uncovered segment is refused (non-zero A0
+        // fields), and so is every inconsistent untrained form.
+        let mut bad = untrained_key(None);
+        bad.rabitq_header = vec![1, 2, 3];
+        let mut b2 = DirectoryBuilder::default();
+        b2.add_uncovered("u.pax", 50);
+        assert!(b2.set_decode_key("u.pax", bad).is_err());
+        let mut wrong_rows = untrained_key(None);
+        wrong_rows.blocks[0].row_count += 1;
+        assert!(b2.set_decode_key("u.pax", wrong_rows).is_err());
+        let mut overlapping = untrained_key(None);
+        overlapping.blocks[1].offset = overlapping.blocks[0].offset + 1;
+        assert!(b2.set_decode_key("u.pax", overlapping).is_err());
+        let mut no_footer = untrained_key(None);
+        no_footer.header_prefix = untrained_header(0).to_bytes();
+        assert!(b2.set_decode_key("u.pax", no_footer).is_err());
+        // Serialize validates what a hand-mutated directory would smuggle in.
+        let mut smuggled = b2.build(1).unwrap();
+        smuggled.segments[0].decode_key = Some(untrained_key(None));
+        smuggled.segments[0].decode_key.as_mut().unwrap().a0_seed = 7;
+        assert!(smuggled.to_bytes().is_err());
     }
 
     /// TD-PAXDIR-1 D6: a decode key round-trips, and rebuilds the segment's

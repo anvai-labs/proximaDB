@@ -317,6 +317,19 @@ impl PaxSplitReader {
                 .await;
         }
 
+        // TD-PAXMETA-1 (ADR-098 D2.4): a segment whose collection-directory
+        // entry carries a decode key bound to THIS object (the split's listed
+        // size + ETag) takes its block table and per-RG zone stats from the
+        // key — the same values the v4 footer holds, copied at publish — so a
+        // cold read pays no prefix/footer round trip. Any miss (gate off, no
+        // listed directory, no entry, stale binding) falls through to the
+        // object's own metadata below, unchanged. The key-derived index is not
+        // admitted to the SegmentIndexCache: the directory is itself the
+        // cache, and only object-derived metadata is cached as the object's.
+        if let Some(index) = self.directory_index(split, len).await {
+            return self.load_ranged_with_index(path, index, out_schema).await;
+        }
+
         // TD-PAXRG-1: a v4 row-group segment DECLARES its index (the coalesced
         // footer + per-RG MinMax stats) in the header-prefix — no PAXZ tail
         // probe. One small GET decides; the footer renders as the layout-neutral
@@ -415,6 +428,52 @@ impl PaxSplitReader {
                 .await;
         }
         self.load_ranged_with_index(path, index, out_schema).await
+    }
+
+    /// TD-PAXMETA-1 (ADR-098 D2.4): the segment's [`SegmentIndex`] rebuilt from
+    /// its collection-directory decode key, or `None` to keep today's path.
+    ///
+    /// Follows the `PROXIMADB_PAX_READ_DIRECTORY_DECODE_KEYS` discipline: the
+    /// gate must be on, the collection directory must be the one the latest
+    /// listing reported (`note_listing`, called by the segment locators), and
+    /// the entry must match the split's listed `(size, ETag)` — an object
+    /// rewritten since the directory was published never matches. Only a
+    /// v4 (coalesced) header prefix is accepted, the same condition the
+    /// footer branch below requires.
+    async fn directory_index(&self, split: &FileSplit, len: u64) -> Option<SegmentIndex> {
+        use crate::storage::engines::sst::centroid_directory_reader as reader;
+        if !(reader::centroid_directory_read_enabled()
+            && reader::directory_decode_keys_read_enabled())
+        {
+            return None;
+        }
+        let (dir_url, name) = split.file_path.rsplit_once('/')?;
+        let fs = self.filesystem_factory.get_filesystem(dir_url).ok()?;
+        let dir = reader::load_directory(fs.as_ref(), dir_url).await?;
+        let entry = dir.segments.iter().find(|s| s.name == name)?;
+        if !entry.key_matches_listing(Some(len), split.etag.as_deref()) {
+            return None;
+        }
+        let key = entry.decode_key.as_ref()?;
+        match SegmentHeaderPrefix::parse(&key.header_prefix) {
+            Ok(h) if h.layout_version == SEG_LAYOUT_VERSION && h.footer_len > 0 => {}
+            _ => return None,
+        }
+        if key.block_stats.len() != key.blocks.len() {
+            return None;
+        }
+        let blocks = key
+            .blocks
+            .iter()
+            .zip(&key.block_stats)
+            .map(|(entry, stats)| BlockIndexEntry {
+                offset: entry.offset,
+                size: entry.size,
+                zone: stats.as_ref().map(|s| s.zone.clone()),
+                footer_stats: None,
+            })
+            .collect();
+        Some(SegmentIndex { blocks })
     }
 
     /// Shared ranged stages (TD-PAXRG-1): prune + fetch, layout-agnostic —
@@ -1113,6 +1172,153 @@ mod tests {
              changed — re-derive it rather than adjusting the number: this is the \
              DEPTH term ADR-033 ranks dominant. cold={cold} warm={warm}"
         );
+    }
+
+    /// TD-PAXMETA-1 (ADR-098 D2.4) — DEPTH pin modeled on
+    /// `warm_read_skips_the_index_fetch`: a COLD read of a segment whose
+    /// collection-directory decode key is bound to the listed object pays no
+    /// index-acquisition round trip — it costs exactly what a SegmentIndexCache
+    /// warm read costs (`cold - warm == 0`). Negative control: the same split
+    /// with an ETag the key did not record (the object was rewritten) is not
+    /// trusted; it falls back to the v4 header-prefix + footer reads (2
+    /// dependent GETs on top of the warm cost). Rows are identical on every arm.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial]
+    async fn directory_key_cold_read_skips_the_index_fetch() {
+        use crate::storage::engines::sst::centroid_directory_publisher::publish_centroid_directory;
+        use crate::storage::engines::sst::centroid_directory_reader::load_directory;
+        use crate::storage::engines::sst::segment_format::write_pax_segment_compacted;
+        use proximadb_records::EmbeddingCell;
+
+        const GATES: [(&str, &str); 5] = [
+            ("PROXIMADB_PAX_COALESCED_RABITQ", "1"),
+            ("PROXIMADB_PAX_WRITE_A0_TRAIN", "1"),
+            ("PROXIMADB_IVF_K", "4"),
+            ("PROXIMADB_PAX_WRITE_DIRECTORY_DECODE_KEYS", "1"),
+            ("PROXIMADB_PAX_READ_DIRECTORY_DECODE_KEYS", "1"),
+        ];
+        // SAFETY: nextest runs each test in its own process; #[serial] keeps
+        // the gate world private in the shared `cargo test --lib` process.
+        unsafe {
+            for (gate, value) in GATES {
+                std::env::set_var(gate, value);
+            }
+        }
+        crate::services::record_store::init_segment_caches(
+            proximadb_cache::CacheBudget::new(8 << 20, 4 << 20),
+            None,
+        );
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let records: Vec<_> = (0..300i64)
+            .map(|i| {
+                let mut r = record(&format!("r{i:04}"), "t", (i + 1) * 1000);
+                r.embeddings.push(EmbeddingCell::new_fp32(
+                    "",
+                    "dense",
+                    16,
+                    (0..16usize)
+                        .map(|d| (((i as usize * 131 + d * 17) % 251) as f32) * 0.01)
+                        .collect(),
+                ));
+                r
+            })
+            .collect();
+        write_pax_segment_compacted(
+            &tmp.path().join("seg.pax"),
+            &records,
+            "col",
+            1,
+            VectorQuant::RaBitQ,
+            VectorQuant::Sq8,
+            true,
+            Some(16 * 1024),
+            None,
+        )
+        .expect("write coalesced segment");
+        let fs = Arc::new(FilesystemFactory::create_default().await.unwrap());
+        let base = format!("{}", tmp.path().display());
+        let dir_fs = fs.get_filesystem(&base).unwrap();
+        assert_eq!(
+            publish_centroid_directory(dir_fs.as_ref(), &base)
+                .await
+                .unwrap(),
+            Some(1),
+            "the directory publishes generation 1"
+        );
+        // The locator's LIST records the directory generation and the split's
+        // (size, ETag) binding.
+        let split = crate::datafusion::engine_adapters::pax_segment_locator::discover_pax_segments(
+            &base, &fs,
+        )
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|s| s.file_path.ends_with("seg.pax"))
+        .expect("discovered seg.pax split");
+        // Steady state: the directory is loaded once per collection
+        // generation, not per read — pre-warm it outside the measurement.
+        load_directory(dir_fs.as_ref(), &base)
+            .await
+            .expect("published directory loads");
+
+        let (schema, map) = created_at_schema();
+        let reader = PaxSplitReader::new(schema.clone(), fs.clone(), map, vec![], None, None);
+        let measure = |split: crate::storage::formats::FileSplit| {
+            let reader = &reader;
+            let schema = schema.clone();
+            async move {
+                io_trace::scope(async move {
+                    let batches = reader
+                        .load_ranged(&split, &schema)
+                        .await
+                        .unwrap()
+                        .expect("ranged path");
+                    let gets = io_trace::snapshot().expect("scope active").range_gets;
+                    (gets, collect_created_at(&batches))
+                })
+                .await
+            }
+        };
+
+        // 1. Directory-covered cold read (the SegmentIndexCache is empty for
+        //    this path: the directory path does not populate it).
+        let (dir_cold, dir_rows) = measure(split.clone()).await;
+        // 2. Negative control: a stale binding falls back to the object's own
+        //    v4 metadata (prefix + footer), which then populates the cache.
+        let stale = split.clone().with_etag(Some("rewritten".into()));
+        let (stale_cold, stale_rows) = measure(stale.clone()).await;
+        // 3. Cache-warm read: no index acquisition at all.
+        let (warm, warm_rows) = measure(stale).await;
+
+        unsafe {
+            for (gate, _) in GATES {
+                std::env::remove_var(gate);
+            }
+        }
+        println!(
+            "DEPTH directory_cold_range_gets={dir_cold} stale_cold_range_gets={stale_cold} \
+             warm_range_gets={warm}"
+        );
+        assert_eq!(dir_rows.len(), 300, "every row decodes");
+        assert_eq!(
+            dir_rows, stale_rows,
+            "the directory index changes no result"
+        );
+        assert_eq!(dir_rows, warm_rows);
+        assert_eq!(
+            stale_cold.saturating_sub(warm),
+            2,
+            "negative control: a stale ETag is not trusted — the v4 fallback pays \
+             the header prefix + footer reads. stale_cold={stale_cold} warm={warm}"
+        );
+        assert_eq!(
+            dir_cold.saturating_sub(warm),
+            0,
+            "a directory-covered cold read pays no index acquisition (cold - warm == 0). \
+             dir_cold={dir_cold} warm={warm}"
+        );
+        assert_eq!(dir_cold, warm);
     }
 
     /// Caching must not change what is returned. Same segment, same predicate,
