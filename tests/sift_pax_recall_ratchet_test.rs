@@ -2842,8 +2842,19 @@ async fn run_sift_get_counts(at_flush: bool) {
     let adaptive = run_cold_arm(&spec("adaptive"));
     let approx_first = &approx["first_query"];
     let adaptive_first = &adaptive["first_query"];
-    let diff =
-        |key: &str| count_field(adaptive_first, key).saturating_sub(count_field(approx_first, key));
+    // The Adaptive arm runs the same first query plus the collection-level
+    // question, so it can never cost LESS than the Approximate arm; a negative
+    // delta means the arms diverged, and must fail rather than clamp to 0.
+    for key in ["get_ops", "range_gets", "list_ops", "head_ops", "requests"] {
+        assert!(
+            count_field(adaptive_first, key) >= count_field(approx_first, key),
+            "[{mode}] cold Adaptive first query {key}={} < Approximate {key}={} — the arms \
+             no longer differ only by the collection-level question",
+            count_field(adaptive_first, key),
+            count_field(approx_first, key)
+        );
+    }
+    let diff = |key: &str| count_field(adaptive_first, key) - count_field(approx_first, key);
     let cold_metadata = serde_json::json!({
         "get_ops": diff("get_ops"),
         "range_gets": diff("range_gets"),
@@ -2885,12 +2896,40 @@ async fn run_sift_get_counts(at_flush: bool) {
              (>= 1 GET per segment); measured {} over {segments} segments",
             diff("get_ops")
         );
+    } else {
+        // The directory must actually SERVE the collection-level question
+        // (ADR-098 D2): zero marginal GETs, and the cold first query carries
+        // exactly one whole-object (non-ranged) GET — the directory load.
+        // Without these, ON with the directory read path disabled
+        // (PROXIMADB_PAX_READ_CENTROID_DIRECTORY=0 or
+        // PROXIMADB_PAX_READ_DIRECTORY_DECODE_KEYS=0) passed with the
+        // footer-path counts, and the flip evidence would be unprotected.
+        assert_eq!(
+            diff("get_ops"),
+            0,
+            "AT_FLUSH=1: the directory must answer the cold collection-level question \
+             with zero per-segment GETs (measured {})",
+            diff("get_ops")
+        );
+        for (arm, first) in [("approx", approx_first), ("adaptive", adaptive_first)] {
+            assert_eq!(
+                count_field(first, "get_ops"),
+                count_field(first, "range_gets") + 1,
+                "AT_FLUSH=1: the cold {arm} first query must carry exactly one non-ranged \
+                 GET (the directory load): {first}"
+            );
+        }
     }
     assert!(
         recall >= floor,
         "SIFT recall@{TOP_K} [{mode}] = {recall:.4} < floor {floor} (N={n}, segments={segments})"
     );
-    if let Ok(raw) = std::env::var("PROXIMADB_SIFT_MAX_COLD_METADATA_GETS") {
+    // The ceiling is a budget for the directory-backed (AT_FLUSH=1) mode
+    // only; the OFF mode pays 2 GETs per segment by design.
+    if let Some(raw) = std::env::var("PROXIMADB_SIFT_MAX_COLD_METADATA_GETS")
+        .ok()
+        .filter(|_| at_flush)
+    {
         let ceiling: u64 = raw.trim().parse().unwrap_or_else(|_| {
             panic!("PROXIMADB_SIFT_MAX_COLD_METADATA_GETS must be an unsigned integer, got {raw:?}")
         });
@@ -2978,6 +3017,10 @@ async fn sift_get_counts_cold_child() {
         let mut waves_total = 0u64;
         let mut waves_unrecorded = 0u64;
         let mut recall_sum = 0.0f64;
+        // The steady loop starts at query 0, which the cold first query above
+        // already ran (so its first iteration is a warm repeat). Kept so the
+        // recall denominator is exactly `queries` and the recorded Azurite
+        // figures stay comparable with this harness version.
         for (qi, query) in query_vectors.iter().enumerate() {
             let (ids, snap) =
                 traced_query(&engine, &collection, query.clone(), adaptive.clone()).await;
