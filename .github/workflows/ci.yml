@@ -619,6 +619,7 @@ jobs:
               - 'scripts/run_cloud_emulator_tests.sh'
               - 'rust-toolchain*'
               - '.cargo/**'
+              - '.config/nextest.toml'
             # MLflow real-client conformance (mlflow-conformance). Path-scoped on
             # feat->develop, unconditional at develop->qa (TD-CITIER-1). Derived
             # from what the job builds and drives: the MLflow REST surface + the
@@ -2941,17 +2942,10 @@ jobs:
   object-store-restart-recovery:
     name: Object-store restart recovery (Azurite)
     runs-on: ubuntu-24.04
-    # The `--restart` scope (scripts/run_cloud_emulator_tests.sh) builds 3 test
-    # targets across distinct cloud feature sets (azure; aws,azure,gcp) at
-    # CARGO_BUILD_JOBS=1 (OOM-safe on the 16GB runner). No other CI job builds
-    # these feature sets, so they are always a COLD compile. Measured step span
-    # 129.8 min, not the ~85-90 an earlier note claimed, which is why 150 was
-    # only 1.16x. Bumped again to 200 for
-    # headroom. (Efficiency follow-up: warm these feature sets in a shared
-    # earlier job, or split the contract test out of --restart.)
+    # TD-CI-8: the server integration target and root lib-test both build with
+    # Azure, but the lib-test compiles the root again with cfg(test). Separate
+    # the compiles from fixture setup and execution so a stalled phase is visible.
     timeout-minutes: 200
-    # was 150 against a measured 129-min step span (1.16x) -- a TIGHTER ratio
-    # than the 45-vs-43 docker-build case this PR exists to fix.
     needs: [changes]
     # TD-CITIER-1: path-scoped on feat->develop (widened filter), and
     # UNCONDITIONAL at develop->qa / qa->main (`medium_tier`) so no promotion
@@ -2979,17 +2973,8 @@ jobs:
             /usr/local/.ghcup \
             /usr/local/share/boost || true
           echo "Disk after reclaim:"; df -h /
-      # The `--restart` scope compiles the full root `proximadb` crate as
-      # `proximadb-server` under a single rustc invocation (CARGO_BUILD_JOBS=1).
-      # Its peak (type-check + monomorphization + codegen of the 940-file crate
-      # with the azure object_store generics) exceeds the runner's 16GB RAM, and
-      # ubuntu-latest ships with NO swap — so the peak OOM-kills mid-compile
-      # (observed: dies ~64 min in, still compiling dev-deps, test never runs).
-      # Root cause is the monolithic root crate (tracked for decomposition); the
-      # immediate mitigation mirrors the unit-matrix job (the "Add swap headroom"
-      # step below this): 12G of swap on the big ephemeral /mnt disk turns the
-      # residual spike into a slowdown instead of a dead runner. jobs stays 1
-      # (the established OOM-safe setting; jobs=2 would re-risk the kill).
+      # The full root crate's peak memory can exceed the runner's 16 GiB.
+      # Retain the serial compile and 12 GiB of swap on the ephemeral disk.
       - name: Add swap headroom
         run: |
           sudo fallocate -l 12G /mnt/swapfile-ci
@@ -3020,31 +3005,35 @@ jobs:
           path: /home/runner/.cache/sccache
           key: sccache-restart-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: sccache-restart-${{ runner.os }}-
-      # Authenticated pulls. The emulator images (Azurite, LocalStack, fake-gcs)
-      # come from Docker Hub, and an ANONYMOUS pull is rate-limited per IP across
-      # every job on the runner fleet -- so these jobs fail with
-      # "toomanyrequests: You have reached your unauthenticated pull rate limit"
-      # and exit 125 within ~90 seconds, before any compilation, for reasons
-      # entirely unrelated to the change under test. `publish-image.yml` already
-      # authenticates with these same secrets; these jobs simply never did.
-      # TD-CI-6 records the merge-blocking shape of this class: these jobs are in
-      # `ci-success`'s needs, so a rate-limited pull blocks the required check.
-      #
-      # continue-on-error so a fork PR, which cannot read secrets, still falls
-      # back to an anonymous pull rather than failing on the login itself.
-      - name: Log in to Docker Hub (raises the pull rate limit)
-        continue-on-error: true
-        uses: docker/login-action@v4
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-      - name: Prove full-server restart recovery over Azurite (adls://)
-        # docker + aws/az CLIs preinstalled on ubuntu-latest; the script starts
-        # Azurite and runs catalog_wal_and_sst_survive_fresh_local_disks.
+      - name: Install nextest
+        uses: taiki-e/install-action@nextest
+      # Run 44742091797, attempt 3, spent about 16 min on the server build and
+      # 19 min on the library build. Allow headroom for cold-cache runners.
+      - name: Build the Azure server integration tests
+        timeout-minutes: 60
         env:
           RUSTC_WRAPPER: sccache
           SCCACHE_DIR: /home/runner/.cache/sccache
-        run: bash scripts/run_cloud_emulator_tests.sh --restart
+        run: /usr/bin/time -v bash scripts/run_cloud_emulator_tests.sh --restart build-server
+      - name: Build the Azure library tests
+        timeout-minutes: 60
+        env:
+          RUSTC_WRAPPER: sccache
+          SCCACHE_DIR: /home/runner/.cache/sccache
+        run: /usr/bin/time -v bash scripts/run_cloud_emulator_tests.sh --restart build-library
+      - name: Start Azurite and create the test container
+        timeout-minutes: 5
+        run: bash scripts/run_cloud_emulator_tests.sh --restart setup "$RUNNER_TEMP/proximadb-azurite.cid"
+      - name: Run restart recovery and object-store contracts over Azurite (adls://)
+        timeout-minutes: 15
+        env:
+          RUSTC_WRAPPER: sccache
+          SCCACHE_DIR: /home/runner/.cache/sccache
+        run: bash scripts/run_cloud_emulator_tests.sh --restart test "$RUNNER_TEMP/proximadb-azurite.cid"
+      - name: Stop Azurite
+        if: always()
+        timeout-minutes: 2
+        run: bash scripts/run_cloud_emulator_tests.sh --restart cleanup "$RUNNER_TEMP/proximadb-azurite.cid"
 
       - name: Job timing (report)
         if: always()

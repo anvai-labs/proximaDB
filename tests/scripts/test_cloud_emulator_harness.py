@@ -78,7 +78,7 @@ _DOCKER_ARG_FLAGS = frozenset(
         "-p", "--publish", "--name", "-e", "--env", "-v", "--volume",
         "--network", "--net", "--entrypoint", "-u", "--user", "-w",
         "--workdir", "--label", "-l", "--add-host", "--health-cmd",
-        "--memory", "-m", "--cpus", "--restart", "--platform",
+        "--memory", "-m", "--cpus", "--restart", "--platform", "--cidfile",
     }
 )
 
@@ -95,8 +95,10 @@ def _tier_gate_features(source: str) -> set[str]:
     return set(m.group(1).split(",")) if m else set()
 
 
-def _docker_run_port_bindings(source: str) -> tuple[list[str], int, list[str], list[str]]:
-    """Port bindings, container count, and off-host escape hatches.
+def _docker_run_port_bindings(
+    source: str,
+) -> tuple[list[str], list[str], list[str], list[str | None]]:
+    """Port bindings, off-host escape hatches, and one image per run.
 
     Scoped to `docker run` blocks because `-p` is also cargo's package flag: a
     naive scan picks up `cargo test -p proximadb-server` and reports it as an
@@ -104,14 +106,12 @@ def _docker_run_port_bindings(source: str) -> tuple[list[str], int, list[str], l
     script's stated purpose includes recording the emulator migration history —
     a commented-out old `docker run` would otherwise fail the guard on dead prose.
 
-    Returns the bindings and the number of `--name`d containers, so the count
-    assertion can be derived rather than hard-coded.
+    The image list also counts invocations that identify a container by ID.
     """
     bindings: list[str] = []
     publish_all: list[str] = []
     host_network: list[str] = []
     images: list[str | None] = []
-    names = 0
     lines = [ln for ln in source.splitlines() if not ln.lstrip().startswith("#")]
     i = 0
     while i < len(lines):
@@ -186,11 +186,6 @@ def _docker_run_port_bindings(source: str) -> tuple[list[str], int, list[str], l
                         break
                     bindings.append(candidate)
                     break
-                # Both forms: `--name x` and `--name=x`. Counting only the
-                # first let a `--name=rogue` container with no binding keep
-                # bindings == names, hiding it from the count assertion.
-                if tok == "--name" or tok.startswith("--name="):
-                    names += 1
                 # The IMAGE is the first token that is neither a flag nor a
                 # flag's argument. Identified POSITIONALLY rather than by
                 # pattern-matching tokens, because the pattern approach missed a
@@ -207,7 +202,7 @@ def _docker_run_port_bindings(source: str) -> tuple[list[str], int, list[str], l
                 k += 1
             images.append(image)
         i += 1
-    return bindings, names, publish_all, host_network, images
+    return bindings, publish_all, host_network, images
 
 
 _OVERRIDE_RE = re.compile(r"^\$\{(?P<var>[A-Za-z_][A-Za-z0-9_]*):-(?P<default>.+)\}$")
@@ -318,16 +313,7 @@ class CloudEmulatorHarnessTest(unittest.TestCase):
         `:latest` there would reproduce the exact failure TD-CI-6 is about.
         """
         declared = re.findall(r'^([A-Z0-9_]*IMAGE)="([^"]+)"$', self.source, re.MULTILINE)
-        # Derived, not hard-coded at 3 — the same criticism that was already
-        # applied to the binding count. A legitimate fourth emulator should be
-        # CHECKED, not rejected.
-        _, _, _, _, used = _docker_run_port_bindings(self.source)
-        self.assertGreaterEqual(
-            len(declared),
-            len(used),
-            f"every `docker run` image must come from a declared *_IMAGE variable; "
-            f"declared={[n for n, _ in declared]} used={used}",
-        )
+        declared_images = {f"${name}" for name, _ in declared}
         for name, declaration in declared:
             reference, override = _image_default(declaration)
             if override is not None:
@@ -351,7 +337,7 @@ class CloudEmulatorHarnessTest(unittest.TestCase):
         # `/` and a `:`, so `redis:7` (official image, no slash) and bare
         # `alpine` (implicit `:latest`) both slipped through — verified before
         # this change.
-        _, _, _, _, images = _docker_run_port_bindings(self.source)
+        _, _, _, images = _docker_run_port_bindings(self.source)
         self.assertTrue(images, "no `docker run` image arguments found")
         for image in images:
             self.assertIsNotNone(
@@ -359,10 +345,10 @@ class CloudEmulatorHarnessTest(unittest.TestCase):
                 "a `docker run` block has no identifiable image argument — if a "
                 "flag that consumes a token was added, extend _DOCKER_ARG_FLAGS",
             )
-            self.assertTrue(
-                (image or "").startswith("$") or (image or "").startswith('"$'),
-                f"`docker run` uses the literal image '{image}' — declare it as a "
-                "digest-pinned *_IMAGE variable so it cannot float",
+            self.assertIn(
+                (image or "").strip("\"'"),
+                declared_images,
+                f"`docker run` uses '{image}'; reference a declared digest-pinned *_IMAGE variable",
             )
 
     def test_s3_emulator_image_is_pinned_by_digest(self) -> None:
@@ -389,7 +375,7 @@ class CloudEmulatorHarnessTest(unittest.TestCase):
         # assertion fails on a correct script (it did) and would have to be
         # edited for any port change — which is how a security check turns into
         # a maintenance tax and then gets relaxed.
-        bindings, containers, publish_all, host_network, _ = _docker_run_port_bindings(
+        bindings, publish_all, host_network, images = _docker_run_port_bindings(
             self.source
         )
         self.assertEqual(
@@ -411,16 +397,12 @@ class CloudEmulatorHarnessTest(unittest.TestCase):
                 f"binding '{binding}' is not loopback-qualified; emulators run "
                 "with development credentials and must not be reachable off-host",
             )
-        # Derived from the number of `--name`d containers, not hard-coded at 3.
-        # A hard-coded count passes when a FOURTH emulator is added with no
-        # binding at all (or one the parser misses), because the loop then has
-        # nothing bad to inspect — and it hard-fails on a legitimate fourth
-        # emulator instead of checking it.
+        # Count every invocation, including containers tracked by ID file.
         self.assertEqual(
             len(bindings),
-            containers,
-            f"every `docker run` must publish its port: {containers} container(s) "
-            f"named but {len(bindings)} binding(s) found ({bindings})",
+            len(images),
+            f"every `docker run` must publish its port: {len(images)} invocation(s) "
+            f"but {len(bindings)} binding(s) found ({bindings})",
         )
 
     def test_readiness_is_gated_on_a_real_s3_call(self) -> None:

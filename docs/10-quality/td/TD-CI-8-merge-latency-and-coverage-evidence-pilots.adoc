@@ -53,12 +53,19 @@ review report (`report/CI_BUILD_FEEDBACK_2026-11-20.md`, local-only).
 
 == Pilot 1: split and time the Azurite restart build (HIGH)
 
-The `object-store-restart-recovery` job spent 71 of 74 minutes in ONE combined
-build-and-test step; its `--restart` scope builds three feature shapes at
-`CARGO_BUILD_JOBS=1` that NO other job builds, so every run is a cold compile.
+The `object-store-restart-recovery` job spent 71 of 74 minutes in one combined
+build-and-test step in the review sample. Its current `--restart` scope builds
+two Azure targets at `CARGO_BUILD_JOBS=1`: the server integration test and the
+root lib-test. Run 44742091797 attempts 1 and 2 lost communication with their
+hosted runners during the combined step. Attempt 3 on the same commit passed:
+fixture setup took 54 s, the two builds took about 35 min in total, and all
+13 tests passed in about 58 s. The interrupted attempts have no phase logs, so
+their last active phase and the cause of the lost communication are unknown.
 
-1. Separate compile, fixture bootstrap (Azurite container), and test execution into
-   distinct, timed steps; publish the step spans per run.
+1. Separate the two compiles, Azurite fixture bootstrap, and test execution into
+   distinct GitHub Actions steps with per-phase timeouts. Build logs record peak
+   RSS and wall time. The fixture uses the pinned MCR image on a dynamically
+   assigned loopback port and needs only the Azure CLI.
 2. Pilot a higher-memory runner (pinned setup, more build jobs) for the two Azure build
    shapes, cold and warm trees; record peak RSS, swap, disk and cost. The prior sccache
    experiment on the root unit job hit the 16 GiB ceiling — measure before enabling.
