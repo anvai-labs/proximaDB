@@ -19,6 +19,7 @@ skipped by accident when that job is reused.
 from __future__ import annotations
 
 import datetime as dt
+import dataclasses
 import io
 import re
 import sys
@@ -250,8 +251,10 @@ class Reuses(unittest.TestCase):
         self.assertTrue(all(v == 100 for v in d.reused.values()))
 
     def test_full_tier_reuses_all_but_rust_build(self):
+        # Both build jobs stay unreused at the FULL tier: `integration-test`
+        # requires their real results (it downloads the release binary).
         d = decide(green_api())
-        self.assertEqual(set(d.reused), ALL_KEYS - {"rust-build"})
+        self.assertEqual(set(d.reused), ALL_KEYS - {"rust-build", "rust-build-release"})
 
     def test_output_value_is_comma_delimited_for_exact_contains(self):
         d = decide(green_api(), ctx(**PUSH_QA))
@@ -484,18 +487,23 @@ class RunsEverything(unittest.TestCase):
         self.assertIn("reused=\n", buf.getvalue())
 
     # -- dependency safety --------------------------------------------------
-    def test_rust_build_needs_every_dependent_reused(self):
+    def test_rust_build_reuses_free_at_medium_tier_no_dependents(self):
+        # The integration lanes no longer `needs:` rust-build (artifact-free
+        # edge removed), so a skipped lane no longer blocks reusing the dev
+        # build proof at the MEDIUM tier.
         r = run(100)
         d = decide(
             FakeApi([r], {100: jobs({"Rust Integration Tests (graph)": "skipped"})}),
             ctx(**PUSH_QA),
         )
-        self.assertNotIn("rust-build", d.reused)
+        self.assertIn("rust-build", d.reused)
         self.assertNotIn("rust-integration-test-graph", d.reused)
         self.assertIn("rust-integration-test-storage", d.reused)
 
-    def test_rust_build_never_reused_at_full_tier(self):
-        self.assertNotIn("rust-build", decide(green_api()).reused)
+    def test_build_jobs_never_reused_at_full_tier(self):
+        d = decide(green_api()).reused
+        self.assertNotIn("rust-build", d)
+        self.assertNotIn("rust-build-release", d)
 
 
 class PrProofTrust(unittest.TestCase):
@@ -814,6 +822,46 @@ class Pagination(unittest.TestCase):
             api.jobs(9)
 
 
+def _dependents_not_reused_scenario():
+    """Scenario for the 'dependents must be reused' mutation guard.
+
+    No REAL group declares dependents any more (the integration lanes dropped
+    their artifact-free rust-build edge), so the guard is exercised with a
+    SYNTHETIC dependent: rust-test is made to depend on the graph lane, which
+    is skipped in this scenario and therefore not reused — the guard must then
+    refuse to reuse rust-test. The patched GROUPS live inside a scoped wrapper
+    around `reuse.decide`, so the mutant module (a separately-loaded copy with
+    its own GROUPS and its own decide) is untouched and no state leaks across
+    subtests.
+    """
+    api = FakeApi(
+        [run(100)], {100: jobs({"Rust Integration Tests (graph)": "skipped"})}
+    )
+    real_decide = reuse.decide
+
+    def decide_with_dependents(c, api_arg, **kw):
+        patched = tuple(
+            dataclasses.replace(g, dependents=("rust-integration-test-graph",))
+            if g.key == "rust-test"
+            else g
+            for g in reuse.GROUPS
+        )
+        try:
+            with mock.patch.object(reuse, "GROUPS", patched):
+                return real_decide(c, api_arg, **kw)
+        finally:
+            # Fully unwind so later mutation scenarios baseline against the
+            # real decide, not one still carrying this synthetic dependent.
+            patcher.stop()
+
+    patcher = mock.patch.object(reuse, "decide", decide_with_dependents)
+    patcher.start()
+    # Baseline runs `reuse.decide` — the patched wrapper. The mutant module
+    # loads its own decide, so only the baseline sees the synthetic dependent.
+    return api, dict(PUSH_QA), None
+
+
+
 # ---------------------------------------------------------------------------
 # Mutation tests: delete each guard; its scenario must flip to "reuse".
 # ---------------------------------------------------------------------------
@@ -1084,13 +1132,7 @@ MUTANTS = [
         "dependency: dependents must be reused",
         "        if missing:\n",
         "        if False:\n",
-        lambda: (
-            FakeApi(
-                [run(100)], {100: jobs({"Rust Integration Tests (graph)": "skipped"})}
-            ),
-            dict(PUSH_QA),
-            None,
-        ),
+        _dependents_not_reused_scenario,
     ),
 ]
 
@@ -1320,16 +1362,14 @@ class Wiring(unittest.TestCase):
         `needs.<dep>.result` + the reuse marker, or (c) only run in contexts
         where its dependency is never reused (rust-build at the FULL tier)."""
         by_key = {g.key: g for g in reuse.GROUPS}
-        # job -> (dependency, a clause in its `if:` proving it only runs where
+        # job -> {dependency: a clause in its `if:` proving it only runs where
         # that dependency is never reused: the FULL tier, a develop push, or
-        # workflow_dispatch -- none of which reuse rust-build).
+        # workflow_dispatch -- none of which reuse the build jobs}.
         only_where_dep_never_reused = {
-            "integration-test": (
-                "rust-build",
-                "needs.changes.outputs.extensive == 'true'",
-            ),
-            "benchmarks": ("rust-build", "github.ref == 'refs/heads/main'"),
-            "tpc-perf-ledger": ("rust-build", "github.ref == 'refs/heads/develop'"),
+            "integration-test": {
+                "rust-build": "needs.changes.outputs.extensive == 'true'",
+                "rust-build-release": "needs.changes.outputs.extensive == 'true'",
+            },
         }
         for key, block in BLOCKS.items():
             for dep in job_needs(block):
@@ -1342,13 +1382,10 @@ class Wiring(unittest.TestCase):
                         # always(): treats skipped as pass by design (asserted below).
                         self.assertEqual(job_if(block), "always()")
                         continue
-                    if (
-                        key in only_where_dep_never_reused
-                        and only_where_dep_never_reused[key][0] == dep
-                    ):
+                    if dep in only_where_dep_never_reused.get(key, {}):
                         self.assertTrue(by_key[dep].not_at_full_tier)
                         self.assertIn(
-                            only_where_dep_never_reused[key][1], job_if(block)
+                            only_where_dep_never_reused[key][dep], job_if(block)
                         )
                         continue
                     cond = job_if(block)

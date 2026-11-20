@@ -1,6 +1,6 @@
 # ProximaDB Build and Test Makefile
 
-.PHONY: env-gate-check ci-lane-coverage-check all clean build test test-python test-rust test-fast check-fast install-fast-tools benchmark release install help capability-matrix-check mvp-contract-check mvp-smoke-test context-benchmark-check workspace-boundaries-check tenant-path-check tenant-ingress-check catalog-seal-check deterministic-commit-contract-check branch-promotion-policy-check work-commit-check validated-commit-check workspace-rebuild-baseline panic-policy-report panic-policy-no-regression panic-policy-module-guard panic-policy-baseline silent-failure-report silent-failure-no-regression silent-failure-baseline capability-facade-report capability-facade-no-regression capability-facade-baseline type-name-ratchet-report type-name-ratchet-no-regression v1-proto-usage-report v1-proto-usage-no-regression v1-proto-usage-baseline hygiene-check proto-check verify-openapi-spec gen-go-sdk gen-ts-sdk gen-rust-sdk gen-python-sdk release-check query-conformance-check docs-claim-check design-status-check status-asof-check release-smoke release-evidence-contract-check cloud-emulator-test
+.PHONY: env-gate-check ci-lane-coverage-check all clean build test test-python test-rust test-fast check-fast check-pkg test-pkg server-dev install-fast-tools benchmark release install help capability-matrix-check mvp-contract-check mvp-smoke-test context-benchmark-check workspace-boundaries-check tenant-path-check tenant-ingress-check catalog-seal-check deterministic-commit-contract-check branch-promotion-policy-check work-commit-check validated-commit-check workspace-rebuild-baseline panic-policy-report panic-policy-no-regression panic-policy-module-guard panic-policy-baseline silent-failure-report silent-failure-no-regression silent-failure-baseline capability-facade-report capability-facade-no-regression capability-facade-baseline type-name-ratchet-report type-name-ratchet-no-regression v1-proto-usage-report v1-proto-usage-no-regression v1-proto-usage-baseline hygiene-check proto-check verify-openapi-spec gen-go-sdk gen-ts-sdk gen-rust-sdk gen-python-sdk release-check query-conformance-check docs-claim-check design-status-check status-asof-check release-smoke release-evidence-contract-check cloud-emulator-test
 
 # Default target
 all: build test
@@ -21,9 +21,13 @@ build-release:
 	@echo "🚀 Building ProximaDB (Release)..."
 	cargo build --release
 
+# The workspace's default-members select ONLY the root `proximadb` package,
+# whose bins do NOT include `proximadb-server` (it lives in apps/). Every
+# server target must therefore select the package explicitly, or cargo fails
+# with "no bin target named `proximadb-server` in default-run packages".
 build-server:
 	@echo "🚀 Building ProximaDB Server (Optimized)..."
-	cargo build --profile release-server
+	cargo build --profile release-server -p proximadb-server --bin proximadb-server
 
 # Test targets
 test: test-rust test-python
@@ -40,19 +44,50 @@ test-integration:
 # Fast iteration loop. Uses nextest (parallel, process-isolated) if installed;
 # falls back to libtest with parallel --test-threads. Bypasses the
 # RUST_TEST_THREADS=1 env in .cargo/config.toml (which is for integration tests).
+# Fast iteration loop. Uses nextest (parallel, process-isolated) if installed;
+# falls back to libtest SERIAL: the suite has tests that touch process-global
+# statics (WAL registry, metadata provider, request-id counter) — the reason
+# CI runs unit tests under nextest (mandate #11). A parallel in-process
+# fallback reproduced exactly the cross-test deadlock nextest exists to
+# prevent, so the fallback is serial by default; override with TEST_THREADS.
 test-fast:
 	@if command -v cargo-nextest >/dev/null 2>&1; then \
 		echo "Running unit tests via nextest (profile=unit)..."; \
 		cargo nextest run --lib --profile unit; \
 	else \
-		echo "nextest not installed; falling back to: cargo test --lib --test-threads=6"; \
-		echo "  install with: make install-fast-tools"; \
-		cargo test --lib -- --test-threads=6; \
+		echo "nextest not installed; falling back to: cargo test --lib -- --test-threads=$${TEST_THREADS:-1}"; \
+		echo "  install with: make install-fast-tools (recommended)"; \
+		cargo test --lib -- --test-threads=$${TEST_THREADS:-1}; \
 	fi
 
 # Type-check only (no codegen, no link) for the tightest inner edit loop.
 check-fast:
 	@cargo check-fast
+
+# ── Package-scoped inner loop (CI/build feedback 2026-11-20) ─────────────────
+# The workspace's default-members select ONLY the root `proximadb` package, so
+# the tight edit loop for workspace-member work is package-scoped. PKG=<crate>
+# overrides the target. For a full pre-PR sweep use `make check` (fmt+clippy+
+# tests) or `cargo check --locked --workspace --lib --bins --tests`.
+#
+#   make check-pkg                 # type-check root crate lib only
+#   make check-pkg PKG=proximadb-storage
+#   make test-pkg                  # nextest unit tests, isolated processes
+#   make server-dev                # build + --help the real server binary
+#
+# (check-pkg checks the LIB target; bin-only crates — e.g. the apps/ packages
+# — have no lib, use `cargo check -p <crate>` directly for those.)
+PKG ?= proximadb
+
+check-pkg:
+	cargo check --locked -p $(PKG) --lib
+
+test-pkg:
+	cargo nextest run --locked -p $(PKG) --lib --profile unit --retries 0
+
+server-dev:
+	cargo build --locked -p proximadb-server --bin proximadb-server
+	cargo run --locked -p proximadb-server --bin proximadb-server -- --help
 
 # Install optional build-speed tools. Idempotent.
 install-fast-tools:
@@ -391,8 +426,11 @@ v1-proto-usage-baseline:
 	@echo "Updated baseline: $(V1_PROTO_USAGE_BASELINE)"
 	@$(MAKE) --no-print-directory baseline-merge-skew-warning ARTIFACT="$(V1_PROTO_USAGE_BASELINE)" REVERIFY="make v1-proto-usage-no-regression"
 
-# Release targets
-release: clean build-server test benchmark
+# Release targets. `release` deliberately does NOT start with `clean`: wiping
+# target/ discards every prior build artifact and makes repeated release
+# experiments pay the full cold build. Run `make clean` explicitly when you
+# want a from-scratch build.
+release: build-server test benchmark
 	@echo "🎯 Release build completed successfully"
 	@echo "📊 Release artifacts:"
 	@ls -la target/release-server/proximadb-server 2>/dev/null || echo "Server binary not found"
@@ -489,13 +527,15 @@ install: build-release
 dev: build test-rust
 	@echo "🔧 Development build completed"
 
+# `-p proximadb-server` is required: default-members select only the root
+# package, which has no `proximadb-server` bin (see build-server).
 server-start:
 	@echo "🚀 Starting ProximaDB server..."
-	cargo run --bin proximadb-server
+	cargo run -p proximadb-server --bin proximadb-server
 
 server-start-release:
 	@echo "🚀 Starting ProximaDB server (Release)..."
-	cargo run --release --bin proximadb-server
+	cargo run --release -p proximadb-server --bin proximadb-server
 
 # Clean targets
 clean:
@@ -557,12 +597,15 @@ help:
 	@echo "Building:"
 	@echo "  build              - Debug build"
 	@echo "  build-release      - Release build"
-	@echo "  build-server       - Optimized server build"
+	@echo "  build-server       - Optimized server build (release-server profile)"
+	@echo "  server-dev         - Build + --help the real server binary (dev profile)"
 	@echo ""
 	@echo "Testing:"
 	@echo "  test               - Run all tests"
 	@echo "  test-rust          - Run Rust tests only"
 	@echo "  test-python        - Run Python tests only"
+	@echo "  check-pkg [PKG=]   - Type-check one package's lib (tight edit loop)"
+	@echo "  test-pkg  [PKG=]   - nextest unit tests for one package"
 	@echo "  test-integration   - Run integration tests"
 	@echo "  perf-test          - Run performance tests with server"
 	@echo "  integration-full   - Full integration test with real server"

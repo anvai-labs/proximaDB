@@ -59,11 +59,12 @@ def integration_targets() -> list[Path]:
     )
 
 
-def run_block_text() -> str:
+def run_block_text() -> tuple[str, int]:
     """Concatenate `run:` block contents across workflows, comment-stripped,
-    plus the bodies of repo scripts those blocks invoke.
+    plus the bodies of repo scripts those blocks invoke. Returns the text and
+    the number of COMPILE-ONLY invocation lines excluded from it.
 
-    Coverage must mean EXECUTION. Three consequences:
+    Coverage must mean EXECUTION. Four consequences:
 
     * Path filters (`changes:`/`filters:` lists) and compile-step globs
       (`tests/**`) reference files without running them, so they are never
@@ -77,9 +78,15 @@ def run_block_text() -> str:
       appended to the search text (adversarial-review round 1 found
       `objstore_backend_contract_test.rs` certified exactly that way while
       the guard called it unexecuted).
+    * COMPILE-ONLY invocations do not certify (2026-11-20 CI review): a
+      `cargo test --test example_e2e --no-run` (or a `--list`/`nextest list`
+      enumeration) builds or lists a target without executing it — the exact
+      shape that let a target sit on the burn-down baseline "covered". Such
+      lines are dropped and counted; the caller reports the count.
     """
     chunks: list[str] = []
     invoked: set[Path] = set()
+    compile_only_lines = 0
 
     def harvest_script_invocations(text: str) -> None:
         for match in re.finditer(r"(?:bash |sh |python3 )([^\s;|&]+\.sh\b)", text):
@@ -104,11 +111,22 @@ def run_block_text() -> str:
                 block = [stripped[len("run:"):]]
             # Cut shell comments: nothing after '#' may certify coverage.
             block = [piece.split("#", 1)[0] for piece in block]
-            harvest_script_invocations("\n".join(block))
-            chunks.extend(block)
+            # Drop compile-only invocations: building or listing a target
+            # proves wiring, never execution.
+            executable = [
+                piece for piece in block if not COMPILE_ONLY_RE.search(piece)
+            ]
+            compile_only_lines += len(block) - len(executable)
+            harvest_script_invocations("\n".join(executable))
+            chunks.extend(executable)
     for script in sorted(invoked):
-        chunks.append(script.read_text(encoding="utf-8"))
-    return "\n".join(chunks)
+        # Same compile-only rule inside invoked script bodies: a script line
+        # building or listing a target executes nothing.
+        all_lines = script.read_text(encoding="utf-8").splitlines()
+        kept = [piece for piece in all_lines if not COMPILE_ONLY_RE.search(piece)]
+        compile_only_lines += len(all_lines) - len(kept)
+        chunks.extend(kept)
+    return "\n".join(chunks), compile_only_lines
 
 
 def baseline_names() -> set[str]:
@@ -123,6 +141,12 @@ def baseline_names() -> set[str]:
 
 # `for <var> in <words...>; do` on a single line; group 1 = the word list.
 INLINE_FOR_RE = re.compile(r"\bfor\s+\w+\s+in\s+([^;\n]*);\s*do\b")
+
+# A line that builds or enumerates a target WITHOUT executing it:
+#   --no-run            libtest/rustc compile-only (`cargo test --test X --no-run`)
+#   nextest list        nextest's discovery mode
+#   --list              libtest's list mode (`cargo test -- --list`)
+COMPILE_ONLY_RE = re.compile(r"--no-run\b|\bnextest\s+list\b|--list\b")
 
 
 def is_covered(stem: str, file_name: str, text: str, patterns: list[str]) -> bool:
@@ -160,7 +184,7 @@ def main() -> int:
     if not targets:
         print("check_ci_lane_coverage: no integration targets found under tests/", file=sys.stderr)
         return 2
-    text = run_block_text()
+    text, compile_only_lines = run_block_text()
     # Execution globs inside run blocks, e.g. tests/*wal*.rs in a for-loop.
     patterns = sorted(set(re.findall(r"(tests/[^\s'\";)]+)", text)))
     baseline = baseline_names()
@@ -195,9 +219,12 @@ def main() -> int:
         print(f"\nRegenerate with: python3 scripts/check_ci_lane_coverage.py --update-baseline", file=sys.stderr)
         return 1
     covered = len(targets) - len(uncovered)
+    compile_note = (
+        f" ({compile_only_lines} compile-only invocation line(s) excluded)" if compile_only_lines else ""
+    )
     print(
         f"CI lane coverage check passed: {covered}/{len(targets)} integration targets "
-        f"executed by a lane; {len(uncovered)} on the burn-down baseline."
+        f"executed by a lane; {len(uncovered)} on the burn-down baseline{compile_note}."
     )
     return 0
 

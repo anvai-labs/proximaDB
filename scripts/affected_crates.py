@@ -68,6 +68,10 @@ def main():
     # Committed changes vs base + any uncommitted working-tree changes.
     diff = git(["diff", "--name-only", f"{base}...HEAD"], root)
     diff += git(["diff", "--name-only", "HEAD"], root)
+    # `git diff` never lists UNTRACKED files — a brand-new src file (the common
+    # shape for a fresh module) was invisible to the selector, so the affected
+    # package check silently skipped the crate it belongs to.
+    diff += git(["ls-files", "--others", "--exclude-standard"], root)
     changed = sorted({ln.strip() for ln in diff.splitlines() if ln.strip()})
     if not changed:
         return
