@@ -45,12 +45,20 @@ Answers (`SUM(v), COUNT(*)`) are identical in every mode and temperature (assert
   Bloom or key-set read re-opens a footer outside it). With the levers on, a filter keeping S of
   the four files reads `|S ∪ {first file}|` footers: the first file in path order is the
   planning-schema source and is read at open (`id > 750` therefore reads 2, not 1).
-* `get_ops` / `range_gets` / `bytes_read` count the **data-plane** store only (the
-  `TracingObjectStore` the table wraps). The Iceberg `metadata.json` / manifest-list / manifest
-  reads and the latest-version LIST run on the bridge's own store, which the trace does not wrap
-  (`list_ops` reads 0 in both modes). So the manifest cache's saving shows here only as the
-  hit/miss counter; it is not in `get_ops`. Wrapping the bridge store is a follow-up.
-* The `after` first-run of `id <= 250` pays the manifest miss (decoded deletion vectors and stats
-  inserted); the repeat is a hit. HEADs are deferred with the footers (a pruned file is never HEADed).
-* The negative control reads 16 `get_ops` after vs 19 before with the same 4 footers and 0
-  pruned files; the cause of the 3-request difference was not isolated and is not claimed.
+* `get_ops` counts BOTH stores. The data-plane reads go through the `TracingObjectStore` the
+  table wraps (HEADs and ranged footer/row-group GETs; ranged ones also count in `range_gets`).
+  The Iceberg reads go through the bridge's `ProximaObjectStore`, whose full-object GETs are
+  recorded by the process `IoRecorder` the server installs at boot (`src/database.rs`,
+  `IoTraceObjectStoreRecorder`): one `get_ops` + bytes each, no `range_gets`. Only the
+  latest-version LIST is unrecorded (`list_ops` reads 0 in both modes).
+* Attribution verified by a per-path instrumented run (a temporary `eprintln!` in
+  `ProximaObjectStore::get_with_meta`, reverted): every manifest-cache MISS issues exactly three
+  full GETs — `vN.metadata.json`, `snap-…-list.avro`, `vN-…-m0.avro` — and a HIT issues none.
+  So `id <= 250` reads 7 `get_ops` on the miss and 4 on the hit with `range_gets` unchanged at 4
+  and ~7 KB fewer bytes: the 3 saved requests are those three metadata GETs. The negative
+  control's 19 → 16 is the same three (the "after" run is a cache hit), with the same 4 footers.
+* With the kill-switches set, each query pays the three metadata GETs (no cache) plus a HEAD and
+  a footer for every file; the per-request split of the remaining data-plane GETs was not
+  itemized.
+* The `after` first-run of `id <= 250` pays the manifest miss; later queries hit. HEADs are
+  deferred with the footers (a pruned file is never HEADed).

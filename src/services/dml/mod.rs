@@ -3497,10 +3497,11 @@ impl DmlService {
         // catalog to it — must not move the layout (and its `snapshot_lsn`) back.
         //
         // TD-SPINE-3 (deferred LOW): a failed read is NOT "no existing layouts" —
-        // that would defeat the forward-only check for a stale below-tip commit
-        // whose tip evidence was `Unknown`. Without the layouts, only a commit
-        // proven to be the tip flips; anything else leaves the catalog alone and
-        // skips this run's GC (fail safe; the next MATERIALIZE reconciles).
+        // that would defeat the forward-only check for a stale below-tip commit,
+        // and writing this layout alone would drop other representations'. The
+        // flip, the NDV publish and this run's GC are skipped (fail safe): the
+        // previous layout keeps serving, and the next MATERIALIZE whose catalog
+        // read succeeds flips it.
         let existing_layouts = match catalog.get_table(&table_id).await {
             Ok(schema) => Some(schema.storage_layouts),
             Err(e) => {
@@ -3508,13 +3509,7 @@ impl DmlService {
                 None
             }
         };
-        let flip = materialize_stream::plan_catalog_flip(
-            existing_layouts,
-            layout,
-            proximadb_iceberg_engine::below_tip_evidence(bridge, &metadata_prefix, version, None),
-        )
-        .await;
-        let overtaken = match flip {
+        let overtaken = match materialize_stream::plan_catalog_flip(existing_layouts, layout) {
             materialize_stream::CatalogFlip::Flip(layouts) => {
                 catalog.set_storage_layouts(&table_id, layouts).await?;
                 false
@@ -3527,13 +3522,12 @@ impl DmlService {
                 );
                 true
             }
-            materialize_stream::CatalogFlip::Unproven(evidence) => {
+            materialize_stream::CatalogFlip::LayoutsUnreadable => {
                 warn!(
                     table = %table_name,
                     version,
-                    ?evidence,
-                    "MATERIALIZE: catalog unreadable and the commit is not proven to be the \
-                     tip; the catalog flip and GC are skipped until the next MATERIALIZE"
+                    "MATERIALIZE: the catalog was unreadable after the commit; the catalog \
+                     flip and GC are skipped until a later MATERIALIZE reads it"
                 );
                 return Ok(location);
             }
