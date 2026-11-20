@@ -2940,12 +2940,21 @@ jobs:
   # CARGO_BUILD_JOBS=1 (in the script) for the 16GB-runner OOM cliff. Path-gated
   # (skipped otherwise) and in ci-success.needs so it gates when it runs.
   object-store-restart-recovery:
-    name: Object-store restart recovery (Azurite)
+    name: ${{ matrix.name }}
     runs-on: ubuntu-24.04
     # TD-CI-8: the server integration target and root lib-test both build with
     # Azure, but the lib-test compiles the root again with cfg(test). Separate
-    # the compiles from fixture setup and execution so a stalled phase is visible.
-    timeout-minutes: 200
+    # them onto fresh runners. Each runner also reports independent compile,
+    # fixture setup, and test execution steps.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - suite: server
+            name: Object-store restart recovery (Azurite)
+          - suite: library
+            name: Object-store library contracts (Azurite)
+    timeout-minutes: 100
     needs: [changes]
     # TD-CITIER-1: path-scoped on feat->develop (widened filter), and
     # UNCONDITIONAL at develop->qa / qa->main (`medium_tier`) so no promotion
@@ -3003,30 +3012,29 @@ jobs:
       - uses: actions/cache@v6
         with:
           path: /home/runner/.cache/sccache
-          key: sccache-restart-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: sccache-restart-${{ runner.os }}-
+          key: sccache-restart-${{ matrix.suite }}-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            sccache-restart-${{ matrix.suite }}-${{ runner.os }}-
+            sccache-restart-${{ runner.os }}-
       - name: Install nextest
         uses: taiki-e/install-action@nextest
       # Run 44742091797, attempt 3, spent about 16 min on the server build and
       # 19 min on the library build. Allow headroom for cold-cache runners.
-      - name: Build the Azure server integration tests
+      - name: Build the Azure ${{ matrix.suite }} tests
         timeout-minutes: 60
         env:
+          AZURITE_SUITE: ${{ matrix.suite }}
           RUSTC_WRAPPER: sccache
           SCCACHE_DIR: /home/runner/.cache/sccache
-        run: /usr/bin/time -v bash scripts/run_cloud_emulator_tests.sh --restart build-server "$RUNNER_TEMP/proximadb-restart"
-      - name: Build the Azure library tests
-        timeout-minutes: 60
-        env:
-          RUSTC_WRAPPER: sccache
-          SCCACHE_DIR: /home/runner/.cache/sccache
-        run: /usr/bin/time -v bash scripts/run_cloud_emulator_tests.sh --restart build-library "$RUNNER_TEMP/proximadb-restart"
+        run: /usr/bin/time -v bash scripts/run_cloud_emulator_tests.sh --restart "build-$AZURITE_SUITE" "$RUNNER_TEMP/proximadb-restart"
       - name: Start Azurite and create the test container
         timeout-minutes: 5
         run: bash scripts/run_cloud_emulator_tests.sh --restart setup "$RUNNER_TEMP/proximadb-restart"
-      - name: Run restart recovery and object-store contracts over Azurite (adls://)
+      - name: Run the ${{ matrix.suite }} tests over Azurite (adls://)
         timeout-minutes: 15
-        run: bash scripts/run_cloud_emulator_tests.sh --restart test "$RUNNER_TEMP/proximadb-restart"
+        env:
+          AZURITE_SUITE: ${{ matrix.suite }}
+        run: bash scripts/run_cloud_emulator_tests.sh --restart "test-$AZURITE_SUITE" "$RUNNER_TEMP/proximadb-restart"
       - name: Stop Azurite
         if: always()
         timeout-minutes: 2

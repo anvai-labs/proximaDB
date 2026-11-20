@@ -165,7 +165,10 @@ GROUPS: tuple[Group, ...] = (
     Group("object-store-emulator-tests", exact=("Object-store Cool tier (emulators)",)),
     Group(
         "object-store-restart-recovery",
-        exact=("Object-store restart recovery (Azurite)",),
+        exact=(
+            "Object-store restart recovery (Azurite)",
+            "Object-store library contracts (Azurite)",
+        ),
     ),
     Group("mlflow-conformance", exact=("MLflow conformance (real client)",)),
     Group("sift-recall-ratchet", exact=("SIFT PAX recall ratchet (N=10k)",)),
@@ -412,6 +415,8 @@ def group_verdicts(jobs: Sequence[dict]) -> tuple[set[str], set[str], set[str]]:
         ]
         if any(c in _RED for c in conclusions):
             red.add(group.key)
+        elif not set(group.exact).issubset(j["name"] for j in mine):
+            other.add(group.key)
         elif all(c == "success" for c in conclusions):
             green.add(group.key)
         elif any(c not in ("success", "skipped") for c in conclusions):

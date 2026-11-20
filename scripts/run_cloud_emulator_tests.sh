@@ -20,7 +20,7 @@
 #            it, and recovers catalog + WAL-replays collections on a fresh local
 #            disk. Compiles the server binary, so it gets its OWN scope/job (kept
 #            off --fast/--all's compile budget).
-#   --restart [build-server|build-library|setup|test|cleanup STATE_DIR]
+#   --restart [build-server|build-library|setup|test-server|test-library|cleanup STATE_DIR]
 #            Split the restart proof into CI steps. With no phase, run all steps.
 #
 # Requires: Docker, Cargo, and the Azure CLI. --qa and --restart also use
@@ -44,7 +44,7 @@ if [ "${1:-}" = "--restart" ]; then
   RESTART_PHASE="${2:-all}"
   case "$RESTART_PHASE:$#" in
     all:1) ;;
-    build-server:3|build-library:3|setup:3|test:3|cleanup:3)
+    build-server:3|build-library:3|setup:3|test-server:3|test-library:3|cleanup:3)
       [ -n "$3" ] || { echo "::error::missing restart state directory"; exit 2; }
       RESTART_STATE="$3"
       ;;
@@ -146,17 +146,20 @@ wait_port() { # $1=port $2=name $3=attempts (default 30)
   echo "::error::$2 (:$1) did not come up"; diagnose "$2"; return 1
 }
 
-restart_build_server() {
+restart_build() {
+  local suite="$1"
+  shift
   mkdir -p -- "$RESTART_STATE"
   cargo metadata --locked --format-version 1 > "$RESTART_STATE/cargo.json"
-  cargo nextest list -p proximadb-server --features azure --test object_store_restart_recovery \
-    --list-type binaries-only --message-format json > "$RESTART_STATE/server.json"
+  cargo nextest list "$@" --list-type binaries-only --message-format json > "$RESTART_STATE/$suite.json"
+}
+
+restart_build_server() {
+  restart_build server -p proximadb-server --features azure --test object_store_restart_recovery
 }
 
 restart_build_library() {
-  mkdir -p -- "$RESTART_STATE"
-  cargo nextest list -p proximadb --features azure --lib \
-    --list-type binaries-only --message-format json > "$RESTART_STATE/library.json"
+  restart_build library -p proximadb --features azure --lib
 }
 
 restart_azurite_endpoint() {
@@ -179,7 +182,7 @@ restart_setup() {
 }
 
 restart_test() {
-  local cid
+  local suite="$1" cid
   # Reuse the exact outputs of the preceding builds. Running Cargo again here
   # can rebuild both package graphs as their feature unification changes.
   local -a run_args=(--cargo-metadata "$RESTART_STATE/cargo.json"
@@ -191,14 +194,20 @@ restart_test() {
   export PROXIMADB_AZURE_EMULATOR=1 AZURE_STORAGE_USE_EMULATOR=true AZURE_ALLOW_HTTP=true
   export AZURE_STORAGE_ACCOUNT=devstoreaccount1 AZURE_STORAGE_ACCOUNT_NAME=devstoreaccount1
   export PROXIMADB_OBJECT_STORE_URL="adls://$CONTAINER_BUCKET/objstore-restart-recovery"
-  echo "==> TD-OBJSTORE-5 S1: full-server restart recovery over Azurite (adls://)"
-  cargo nextest run "${run_args[@]}" --binaries-metadata "$RESTART_STATE/server.json"
-  echo "==> TD-CACHE-7 and spill: object-store contracts over Azurite (adls://)"
-  cargo nextest run "${run_args[@]}" --binaries-metadata "$RESTART_STATE/library.json" \
-    -E 'test(/::warm_manifest_round_trips_on_object_store$/)
-      | test(/::a_missing_object_is_not_found_on_object_store$/)
-      | test(/::spill_segments_round_trip_on_object_store$/)
-      | test(/::placement_is_claimed_and_fenced_on_object_store$/)'
+  case "$suite" in
+    server)
+      echo "==> TD-OBJSTORE-5 S1: full-server restart recovery over Azurite (adls://)"
+      cargo nextest run "${run_args[@]}" --binaries-metadata "$RESTART_STATE/server.json"
+      ;;
+    library)
+      echo "==> TD-CACHE-7 and spill: object-store contracts over Azurite (adls://)"
+      cargo nextest run "${run_args[@]}" --binaries-metadata "$RESTART_STATE/library.json" \
+        -E 'test(/::warm_manifest_round_trips_on_object_store$/)
+          | test(/::a_missing_object_is_not_found_on_object_store$/)
+          | test(/::spill_segments_round_trip_on_object_store$/)
+          | test(/::placement_is_claimed_and_fenced_on_object_store$/)'
+      ;;
+  esac
 }
 
 restart_cleanup() {
@@ -217,7 +226,8 @@ if [ "$SCOPE" = "restart" ]; then
     build-server) restart_build_server ;;
     build-library) restart_build_library ;;
     setup) restart_setup ;;
-    test) restart_test ;;
+    test-server) restart_test server ;;
+    test-library) restart_test library ;;
     cleanup) restart_cleanup ;;
     all)
       RESTART_STATE="$(mktemp -d)"
@@ -225,7 +235,8 @@ if [ "$SCOPE" = "restart" ]; then
       restart_build_server
       restart_build_library
       restart_setup
-      restart_test
+      restart_test server
+      restart_test library
       ;;
   esac
   exit 0

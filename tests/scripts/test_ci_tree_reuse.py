@@ -77,6 +77,7 @@ JOB_NAMES = [
     "Rust Integration Tests (burn-down)",
     "Object-store Cool tier (emulators)",
     "Object-store restart recovery (Azurite)",
+    "Object-store library contracts (Azurite)",
     "MLflow conformance (real client)",
     "SIFT PAX recall ratchet (N=10k)",
     "Python SDK Tests (3.11)",
@@ -255,6 +256,13 @@ class Reuses(unittest.TestCase):
         # requires their real results (it downloads the release binary).
         d = decide(green_api())
         self.assertEqual(set(d.reused), ALL_KEYS - {"rust-build", "rust-build-release"})
+
+    def test_azurite_reuse_requires_both_jobs(self):
+        visible_jobs = [
+            job for job in jobs() if job["name"] != "Object-store library contracts (Azurite)"
+        ]
+        d = decide(FakeApi([run()], {100: visible_jobs}), ctx(**PUSH_QA))
+        self.assertNotIn("object-store-restart-recovery", d.reused)
 
     def test_output_value_is_comma_delimited_for_exact_contains(self):
         d = decide(green_api(), ctx(**PUSH_QA))
@@ -1330,7 +1338,10 @@ class Wiring(unittest.TestCase):
         for g in reuse.GROUPS:
             with self.subTest(group=g.key):
                 name = job_name(BLOCKS[g.key])
-                if g.exact:
+                if name == "${{ matrix.name }}":
+                    matrix_names = re.findall(r"^\s{12}name: (.+)$", BLOCKS[g.key], re.MULTILINE)
+                    self.assertEqual(set(matrix_names), set(g.exact))
+                elif g.exact:
                     self.assertIn(name, g.exact)
                 else:
                     self.assertTrue(any(name.startswith(p) for p in g.prefix), name)
