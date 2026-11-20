@@ -9969,20 +9969,6 @@ mod flip_fault {
         ) -> anyhow::Result<CatalogTableSchema> {
             self.inner.create_table_inner(identifier, schema).await
         }
-        async fn create_table(
-            &self,
-            identifier: &TableIdentifier,
-            schema: CatalogTableSchema,
-        ) -> anyhow::Result<CatalogTableSchema> {
-            self.inner.create_table(identifier, schema).await
-        }
-        async fn replace_table(
-            &self,
-            identifier: &TableIdentifier,
-            schema: CatalogTableSchema,
-        ) -> anyhow::Result<CatalogTableSchema> {
-            self.inner.replace_table(identifier, schema).await
-        }
         fn require_object_id(
             &self,
             verb: &str,
