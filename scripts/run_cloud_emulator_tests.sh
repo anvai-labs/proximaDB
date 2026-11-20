@@ -14,12 +14,14 @@
 #            on the introducing feat→develop PR.
 #   --all  : (default) also run cold_graph_record_store_round_trips_on_real_azure,
 #            which compiles the full main crate and runs under CARGO_BUILD_JOBS=2.
-#   --restart : ONLY the full-server object-store RESTARTABILITY recovery proof
-#            (TD-OBJSTORE-5 S1, ADR-063 D8 PR tier) — spawns the real
+#   --restart : Azurite restart recovery and library contracts
+#            (TD-OBJSTORE-5 S1, ADR-063 D8 PR tier). Spawns the real
 #            `proximadb-server` binary against an Azurite (adls://) prefix, SIGKILLs
 #            it, and recovers catalog + WAL-replays collections on a fresh local
 #            disk. Compiles the server binary, so it gets its OWN scope/job (kept
 #            off --fast/--all's compile budget).
+#   --restart [build-server|build-library|setup|test-server|test-library|cleanup STATE_DIR]
+#            Split the restart proof into CI steps. With no phase, run all steps.
 #   --sift-get-counts : ONLY Azurite, then the TD-PAXMETA-1 SIFT request-count
 #            harness (tests/sift_pax_recall_ratchet_test.rs, `sift_get_counts_*`)
 #            over adls:// with the flush-time directory publish OFF and ON.
@@ -28,9 +30,8 @@
 #            PROXIMADB_SIFT_DATASET_DIR. Summary lines are appended (JSON lines)
 #            to $SIFT_GET_COUNTS_OUT (default target/sift-get-counts.jsonl).
 #
-# Requires: docker, cargo (plus cargo-nextest for --qa), aws CLI (S3 bucket), az CLI (Azurite container),
-# curl (fake-gcs bucket). QA installs cargo-nextest explicitly; the other
-# command-line tools are available on GitHub ubuntu-latest.
+# Requires: Docker, Cargo, and the Azure CLI. --qa and --restart also use
+# cargo-nextest. The scopes that start S3 and GCS also use the AWS CLI and curl.
 #
 # Azure + S3 are strict (PUT-with-tier must be accepted + round-trip). GCS is
 # best-effort: the test itself skips on a fake-gcs/object_store incompatibility,
@@ -43,11 +44,25 @@ cd "$ROOT_DIR"
 # Scope selection (see header). --fast = object-store tier tests only; --all (default)
 # adds the cold-payload azure round-trip, which compiles the full main crate.
 SCOPE="all"
+RESTART_PHASE=""
+RESTART_STATE=""
+if [ "${1:-}" = "--restart" ]; then
+  SCOPE="restart"
+  RESTART_PHASE="${2:-all}"
+  case "$RESTART_PHASE:$#" in
+    all:1) ;;
+    build-server:3|build-library:3|setup:3|test-server:3|test-library:3|cleanup:3)
+      [ -n "$3" ] || { echo "::error::missing restart state directory"; exit 2; }
+      RESTART_STATE="$3"
+      ;;
+    *) echo "::error::invalid --restart phase or missing state directory"; exit 2 ;;
+  esac
+  set --
+fi
 for arg in "$@"; do
   case "$arg" in
     --fast) SCOPE="fast" ;;
     --all)  SCOPE="all" ;;
-    --restart) SCOPE="restart" ;;
     --qa) SCOPE="qa" ;;
     --mlflow-s3) SCOPE="mlflow-s3" ;;
     --nightly) SCOPE="nightly" ;;
@@ -120,9 +135,6 @@ S3_SECRET_KEY=test
 AZURITE_IMAGE="${PROXIMADB_CI_AZURITE_IMAGE:-mcr.microsoft.com/azure-storage/azurite@sha256:830430c1da1a2d537e08f3e6764dd1f5ae00cf0346bcaf625b968ec3f0971fd5}"
 FAKE_GCS_IMAGE="${PROXIMADB_CI_FAKE_GCS_IMAGE:-fsouza/fake-gcs-server@sha256:797ce226d62f947c009dc40246b30cfb456b8473d8241407f9d6f2c04e4d69ef}"
 
-cleanup() { docker rm -f azurite s3-emulator fake-gcs >/dev/null 2>&1 || true; }
-trap cleanup EXIT
-
 # $3 = attempts (2s apart), default 30. On timeout, dump the container's own log:
 # without it a startup failure reports only "did not come up", which is the
 # emulator equivalent of a silent failure — the first LocalStack attempt timed
@@ -141,6 +153,105 @@ wait_port() { # $1=port $2=name $3=attempts (default 30)
   done
   echo "::error::$2 (:$1) did not come up"; diagnose "$2"; return 1
 }
+
+restart_build() {
+  local suite="$1"
+  shift
+  mkdir -p -- "$RESTART_STATE"
+  cargo metadata --locked --format-version 1 > "$RESTART_STATE/cargo.json"
+  cargo nextest list "$@" --list-type binaries-only --message-format json > "$RESTART_STATE/$suite.json"
+}
+
+restart_build_server() {
+  restart_build server -p proximadb-server --features azure --test object_store_restart_recovery
+}
+
+restart_build_library() {
+  restart_build library -p proximadb --features azure --lib
+}
+
+restart_azurite_endpoint() {
+  local host
+  host="$(docker port "$1" 10000/tcp)" || return
+  printf 'http://%s\n' "$host"
+}
+
+restart_setup() {
+  local cid endpoint conn
+  echo "==> Starting pinned Azurite (Docker)"
+  docker run -d --rm --cidfile "$RESTART_STATE/azurite.cid" -p 127.0.0.1::10000 \
+    "$AZURITE_IMAGE" azurite-blob --blobHost 0.0.0.0 --skipApiVersionCheck >/dev/null
+  cid="$(cat "$RESTART_STATE/azurite.cid")"
+  endpoint="$(restart_azurite_endpoint "$cid")"
+  wait_port "${endpoint##*:}" "$cid"
+  conn="${AZURITE_CONN/127.0.0.1:10000/${endpoint#http://}}"
+  az storage container create --name "$CONTAINER_BUCKET" --connection-string "$conn" \
+    --only-show-errors >/dev/null || { diagnose "$cid"; return 1; }
+}
+
+restart_test() {
+  local suite="$1" cid
+  # Reuse the exact outputs of the preceding builds. Running Cargo again here
+  # can rebuild both package graphs as their feature unification changes.
+  local -a run_args=(--cargo-metadata "$RESTART_STATE/cargo.json"
+    --profile integration --run-ignored only --retries 0 --no-tests fail
+    --success-output never)
+  cid="$(cat "$RESTART_STATE/azurite.cid")"
+  AZURITE_BLOB_STORAGE_URL="$(restart_azurite_endpoint "$cid")"
+  export AZURITE_BLOB_STORAGE_URL
+  export PROXIMADB_AZURE_EMULATOR=1 AZURE_STORAGE_USE_EMULATOR=true AZURE_ALLOW_HTTP=true
+  export AZURE_STORAGE_ACCOUNT=devstoreaccount1 AZURE_STORAGE_ACCOUNT_NAME=devstoreaccount1
+  export PROXIMADB_OBJECT_STORE_URL="adls://$CONTAINER_BUCKET/objstore-restart-recovery"
+  case "$suite" in
+    server)
+      echo "==> TD-OBJSTORE-5 S1: full-server restart recovery over Azurite (adls://)"
+      cargo nextest run "${run_args[@]}" --binaries-metadata "$RESTART_STATE/server.json"
+      ;;
+    library)
+      echo "==> TD-CACHE-7 and spill: object-store contracts over Azurite (adls://)"
+      cargo nextest run "${run_args[@]}" --binaries-metadata "$RESTART_STATE/library.json" \
+        -E 'test(/::warm_manifest_round_trips_on_object_store$/)
+          | test(/::a_missing_object_is_not_found_on_object_store$/)
+          | test(/::spill_segments_round_trip_on_object_store$/)
+          | test(/::placement_is_claimed_and_fenced_on_object_store$/)'
+      ;;
+  esac
+}
+
+restart_cleanup() {
+  if [ -s "$RESTART_STATE/azurite.cid" ]; then
+    docker rm -f "$(cat "$RESTART_STATE/azurite.cid")" >/dev/null || true
+  fi
+  rm -f -- "$RESTART_STATE/azurite.cid" "$RESTART_STATE/cargo.json" \
+    "$RESTART_STATE/server.json" "$RESTART_STATE/library.json"
+}
+
+if [ "$SCOPE" = "restart" ]; then
+  # The server integration test and root lib-test are separate codegen targets.
+  # Serialize by default for the hosted runner's memory budget.
+  export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-1}"
+  case "$RESTART_PHASE" in
+    build-server) restart_build_server ;;
+    build-library) restart_build_library ;;
+    setup) restart_setup ;;
+    test-server) restart_test server ;;
+    test-library) restart_test library ;;
+    cleanup) restart_cleanup ;;
+    all)
+      RESTART_STATE="$(mktemp -d)"
+      trap 'restart_cleanup; rmdir "$RESTART_STATE"' EXIT
+      restart_build_server
+      restart_build_library
+      restart_setup
+      restart_test server
+      restart_test library
+      ;;
+  esac
+  exit 0
+fi
+
+cleanup() { docker rm -f azurite s3-emulator fake-gcs >/dev/null 2>&1 || true; }
+trap cleanup EXIT
 
 s3_aws() {
   AWS_ACCESS_KEY_ID="$S3_ACCESS_KEY" \
@@ -297,47 +408,6 @@ export AWS_ACCESS_KEY_ID="$S3_ACCESS_KEY" AWS_SECRET_ACCESS_KEY="$S3_SECRET_KEY"
 export PROXIMADB_GCS_TEST_ENDPOINT=http://localhost:80
 # The production root FileSystem GCS backend (contract tests) reads these:
 export PROXIMADB_GCS_ENDPOINT=http://localhost:80 PROXIMADB_GCS_ANONYMOUS=1 GCP_PROJECT=proximadb
-
-if [ "$SCOPE" = "restart" ]; then
-  # TD-OBJSTORE-5 S1 (ADR-063 D8 PR tier = Azurite-strict): prove full-server
-  # object-store RESTARTABILITY recovery in the runner. Spawns the real
-  # `proximadb-server` three times against ONE Azurite (adls://) prefix with a
-  # fresh local `server.data_dir` each time: CREATE+INSERT → SIGKILL → recover
-  # catalog from metadata_url + WAL-replay reattaches SST/HELIX collections →
-  # SIGINT (flush SST) → cold read on another empty disk. All durable state lives
-  # only in the object store (ADR-048 stateless catalog). Isolated scope: it
-  # compiles the proximadb-server binary (heavy, CARGO_BUILD_JOBS=1 for OOM
-  # safety), so it runs in its own path-gated CI job, not on --fast/--all's budget.
-  # The zero-vector-KV restart arm (the TD-OBJSTORE-1 batch-3 gate) is IN the
-  # gate: TD-OBJSTORE-4 S1 (#1061 + the reconciled S1 PR) greened it end-to-end.
-  echo "==> TD-OBJSTORE-5 S1: full-server restart recovery over Azurite (adls://)"
-  # Azurite = ADLS Blob emulator; the production adls:// from_url + emulator env.
-  export PROXIMADB_AZURE_EMULATOR=1 AZURE_STORAGE_USE_EMULATOR=true AZURE_ALLOW_HTTP=true
-  export AZURE_STORAGE_ACCOUNT=devstoreaccount1 AZURE_STORAGE_ACCOUNT_NAME=devstoreaccount1
-  export PROXIMADB_OBJECT_STORE_URL="adls://$CONTAINER_BUCKET/objstore-restart-recovery"
-  CARGO_BUILD_JOBS=1 cargo test -p proximadb-server --features azure \
-    --test object_store_restart_recovery \
-    -- --ignored --nocapture --test-threads=1
-  # TD-CACHE-7: restart-warming manifest write/read round-trip on object storage
-  # — the boundary that repeatedly regressed with zero coverage (container-strip
-  # / malformed prefix). Reuses the exported PROXIMADB_OBJECT_STORE_URL.
-  echo "==> TD-CACHE-7: warm-manifest round-trip over Azurite (adls://)"
-  # Same build: a missing object must read as `NotFound`, not `Network`
-  # (the record spill's discovery depends on it).
-  CARGO_BUILD_JOBS=1 cargo test -p proximadb --features azure --lib -- \
-    warm_manifest_round_trips_on_object_store \
-    a_missing_object_is_not_found_on_object_store \
-    spill_segments_round_trip_on_object_store \
-    placement_is_claimed_and_fenced_on_object_store \
-    --ignored --nocapture --test-threads=1
-  # TD-OBJSTORE-5 S2 (backend contract tests) moved to --qa — see below.
-  # Keeping it here forced a 3rd cold feature-set compile (aws,azure,gcp)
-  # that, combined with the two azure builds above, exceeded the job's timeout
-  # budget. In --qa it's a near-free incremental build on the existing
-  # cloud-full artifact (cloud-full = aws+azure+gcp — identical feature set).
-  echo "==> Restart-recovery validation complete (cleanup trap tears emulators down)"
-  exit 0
-fi
 
 if [ "$SCOPE" = "qa" ]; then
   # TD-OBJSTORE-5 S3 (ADR-063 D8 QA tier): one cloud-full server build, then the
