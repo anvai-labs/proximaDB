@@ -221,8 +221,13 @@ async fn s3_external_tables_full_q1() {
         })
         .collect();
     assert_eq!(
-        ids,
-        vec![
+        ids.len(),
+        100,
+        "official q1 must return exactly its LIMIT 100 rows"
+    );
+    assert_eq!(
+        ids[..3],
+        [
             "AAAAAAAAAAAAEAAA".to_string(),
             "AAAAAAAAAAABBAAA".to_string(),
             "AAAAAAAAAAABHAAA".to_string(),
