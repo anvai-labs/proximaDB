@@ -5,7 +5,7 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | **Open — design settled by link:../../12-design/adr/ADR-098-metadata-spine.adoc[ADR-098] D2 (2026-11-19).** Formerly: Open (filed 2026-10-19).
+| Status | **In progress — PR-A (`feat/paxmeta-1-segment-directory`): slice 1 (PXCD v2 generalization — zero-encoded untrained decode keys on `NO_MODEL` entries, wire stays v2) landed; slices 2–6 in flight. Design settled by link:../../12-design/adr/ADR-098-metadata-spine.adoc[ADR-098] D2 (2026-11-19).** Formerly: Open (filed 2026-10-19).
 | Priority | **MEDIUM**. Correctness is unaffected; the cost lands on cold queries and on the GET-depth budget the PAX cascade is measured against (ADR-033: DEPTH ≫ WIDTH ≫ BYTES ≫ CPU).
 | Component | PAX segment footer (`crates/storage/proximadb-storage-common/src/segment_layout.rs`, `SegmentFooterIndex`), SST search routing (`src/storage/engines/sst/search/mod.rs`: `segment_vector_count`, `pax_footer_facts`, `all_segments_coarse_rabitq_pax_without_f32_tier`, `durable_vector_count_for_rebuild`), catalog / Iceberg manifests
 | Relates to | TD-SEAM-10 (collection-global centroid directory), TD-SEAM-11 (P5a: `.pax` row count), TD-CACHE-9 (persistent PAX warm tier), TD-PAXRG-1 (row-group Region D), ADR-062 (self-describing tail footer), ADR-097 S7 (indexes as catalog projections), `docs/current/LAKEHOUSE_PLAN.adoc` Part C, link:../../12-design/adr/ADR-098-metadata-spine.adoc[ADR-098] D2 (L1 collection segment directory), link:TD-USUB-8-catalog-resident-serving-metadata-collapses-cold-read-depth.adoc[TD-USUB-8] (slice 3 superseded by this TD)
