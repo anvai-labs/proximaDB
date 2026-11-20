@@ -352,6 +352,12 @@ pub struct IoTrace {
     /// discovery and reuses cached schema/splits/file-sizes.
     table_open_hits: AtomicU64,
     table_open_misses: AtomicU64,
+    /// TD-SPINE-4: Iceberg manifest-cache outcomes (a hit skips the
+    /// metadata.json + manifest-list + manifest + deletion-vector reads; the
+    /// latest-version LIST still runs) and data files pruned by manifest bounds.
+    manifest_cache_hits: AtomicU64,
+    manifest_cache_misses: AtomicU64,
+    manifest_files_pruned: AtomicU64,
     /// Plan-geometry vector (TD-EXEC-2 Slice 1, observe-only): the pre-execution
     /// geometric summary of the served physical plan — depth, node/leaf counts,
     /// fan-out, blocking-operator count — recorded at the plan→execute seam as
@@ -1125,6 +1131,22 @@ impl IoTrace {
         counter.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Record an Iceberg manifest-cache outcome (TD-SPINE-4).
+    pub fn record_manifest_cache(&self, hit: bool) {
+        let counter = if hit {
+            &self.manifest_cache_hits
+        } else {
+            &self.manifest_cache_misses
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record data files pruned by manifest bounds before split pruning.
+    pub fn record_manifest_files_pruned(&self, files: u64) {
+        self.manifest_files_pruned
+            .fetch_add(files, Ordering::Relaxed);
+    }
+
     /// Record an embedding API call (KEU — Kilo-Embedding-Units metering).
     pub fn record_embedding_calls(&self, calls: u64) {
         self.embedding_calls.fetch_add(calls, Ordering::Relaxed);
@@ -1217,6 +1239,9 @@ impl IoTrace {
             plan_ms: self.plan_ms.load(Ordering::Relaxed),
             table_open_hits: self.table_open_hits.load(Ordering::Relaxed),
             table_open_misses: self.table_open_misses.load(Ordering::Relaxed),
+            manifest_cache_hits: self.manifest_cache_hits.load(Ordering::Relaxed),
+            manifest_cache_misses: self.manifest_cache_misses.load(Ordering::Relaxed),
+            manifest_files_pruned: self.manifest_files_pruned.load(Ordering::Relaxed),
             plan_depth: self.plan_depth.load(Ordering::Relaxed),
             plan_nodes: self.plan_nodes.load(Ordering::Relaxed),
             plan_leaves: self.plan_leaves.load(Ordering::Relaxed),
@@ -1431,6 +1456,15 @@ pub struct IoTraceSnapshot {
     /// Table-OPEN cache misses (cold open).
     #[serde(default)]
     pub table_open_misses: u64,
+    /// Iceberg manifest-cache hits (TD-SPINE-4).
+    #[serde(default)]
+    pub manifest_cache_hits: u64,
+    /// Iceberg manifest-cache misses (TD-SPINE-4).
+    #[serde(default)]
+    pub manifest_cache_misses: u64,
+    /// Data files pruned by manifest bounds (TD-SPINE-4).
+    #[serde(default)]
+    pub manifest_files_pruned: u64,
     /// Served plan's longest root→leaf path (TD-EXEC-2 geometry; 0 = not recorded).
     #[serde(default)]
     pub plan_depth: u64,
@@ -1893,6 +1927,16 @@ pub fn record_plan_ms(ms: u64) {
 /// Record a table-OPEN cache outcome on the active query trace.
 pub fn record_table_open(hit: bool) {
     let _ = IO_TRACE.try_with(|t| t.record_table_open(hit));
+}
+
+/// Record an Iceberg manifest-cache outcome on the active query trace.
+pub fn record_manifest_cache(hit: bool) {
+    let _ = IO_TRACE.try_with(|t| t.record_manifest_cache(hit));
+}
+
+/// Record data files pruned by manifest bounds on the active query trace.
+pub fn record_manifest_files_pruned(files: u64) {
+    let _ = IO_TRACE.try_with(|t| t.record_manifest_files_pruned(files));
 }
 
 /// Stamp the route (`shape_class`, `backend_label`) onto the active query trace.

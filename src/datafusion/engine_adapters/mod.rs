@@ -48,6 +48,7 @@
 
 pub mod filesystem_parquet_reader;
 pub mod helix_adapter;
+pub(crate) mod manifest_plan_cache;
 pub mod object_store_parquet_reader;
 pub mod pax_adapter;
 pub mod pax_segment_locator;
