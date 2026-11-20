@@ -674,7 +674,67 @@ impl IcebergObjectStoreBridge {
             },
             &lineage,
         )?;
-        committer.commit(parent, Bytes::from(json)).await
+        match committer.commit(parent, Bytes::from(json)).await? {
+            CommitOutcome::Committed(target) => {
+                self.verify_commit_is_the_tip(&committer, target, snapshot_id)
+                    .await
+            }
+            conflict => Ok(conflict),
+        }
+    }
+
+    /// TD-SPINE-3 review M1: metadata GC frees old create-only slots, so a
+    /// publisher whose parent read predates a GC can win `put_if_absent` on a
+    /// slot BELOW the tip. That is not a commit: it is a conflict. After the
+    /// CAS, a version above `target` must be a successor built ON this commit
+    /// (its `parent-snapshot-id` is `snapshot_id`); anything else means the
+    /// slot was collected and reused, so the orphaned document is deleted
+    /// (best effort) and the caller sees `Conflict` — it never flips a
+    /// catalog layout to a version below the tip. A failed LIST keeps the
+    /// commit (it cannot prove a conflict); the check costs one LIST, plus
+    /// one GET when a newer version exists.
+    async fn verify_commit_is_the_tip(
+        &self,
+        committer: &metadata::MetadataCommitter,
+        target: u64,
+        snapshot_id: i64,
+    ) -> Result<CommitOutcome, StorageError> {
+        let Ok(Some(latest)) = committer.latest_version().await else {
+            return Ok(CommitOutcome::Committed(target));
+        };
+        if latest <= target {
+            return Ok(CommitOutcome::Committed(target));
+        }
+        let built_on_us = match target.checked_add(1) {
+            Some(next) => committer
+                .read_metadata(next)
+                .await
+                .ok()
+                .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+                .and_then(|doc| {
+                    let current = doc.get("current-snapshot-id")?.as_i64()?;
+                    doc.get("snapshots")?
+                        .as_array()?
+                        .iter()
+                        .find(|snap| {
+                            snap.get("snapshot-id").and_then(|x| x.as_i64()) == Some(current)
+                        })?
+                        .get("parent-snapshot-id")?
+                        .as_i64()
+                })
+                .is_some_and(|parent| parent == snapshot_id),
+            None => false,
+        };
+        if built_on_us {
+            return Ok(CommitOutcome::Committed(target));
+        }
+        let orphan = Path::from(committer.metadata_location(target));
+        if let Err(e) = self.store.delete(&orphan).await {
+            tracing::warn!(%orphan, "iceberg-engine: orphaned below-tip commit not deleted: {e}");
+        }
+        Ok(CommitOutcome::Conflict {
+            latest: Some(latest),
+        })
     }
 
     /// Create-only write of one generation-named metadata object. `Some(Conflict)` when

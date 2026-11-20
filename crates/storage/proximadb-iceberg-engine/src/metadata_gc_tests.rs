@@ -317,3 +317,83 @@ async fn previous_versions_max_only_lowers_the_log_bound() {
         );
     }
 }
+
+/// Review M1: a publisher whose parent read predates a GC can win the
+/// create-only CAS on a COLLECTED slot below the tip. That must surface as a
+/// conflict (the caller never flips its catalog layout to it), the tip must
+/// not move, and the orphaned document must be removed.
+#[tokio::test]
+async fn a_stale_publisher_winning_a_collected_slot_is_a_conflict() {
+    let b = bridge();
+    publish_generations(&b, 6).await;
+    // GC collected v1's slot while the stale publisher still holds parent v0
+    // (its parent read happened before the GC).
+    b.store
+        .delete(&Path::from(format!("{META}/v{:020}.metadata.json", 1)))
+        .await
+        .expect("collect v1");
+    let own = part(&b, "t/data/stale.parquet", &[9]).await;
+    let err = b
+        .publish_iceberg_files(
+            &[own],
+            Some(0),
+            META,
+            "uuid-gc",
+            "memory:///t",
+            &fields(),
+            5000,
+            1_900_000_000_000,
+            iceberg::FormatVersion::V3,
+        )
+        .await
+        .expect_err("a below-tip slot win is a conflict");
+    assert!(matches!(err, StorageError::AlreadyExists(_)), "{err:?}");
+    assert_eq!(
+        b.latest_metadata_version(META).await.expect("tip"),
+        Some(5),
+        "the tip does not move"
+    );
+    assert!(
+        !metadata_names(&b)
+            .await
+            .contains(&format!("v{:020}.metadata.json", 1)),
+        "the orphaned below-tip document is removed"
+    );
+    // Control: an ordinary successor of the tip still commits.
+    let next = part(&b, "t/data/next.parquet", &[10]).await;
+    let v = b
+        .publish_iceberg_files(
+            &[next],
+            Some(5),
+            META,
+            "uuid-gc",
+            "memory:///t",
+            &fields(),
+            6000,
+            1_900_000_000_001,
+            iceberg::FormatVersion::V3,
+        )
+        .await
+        .expect("successor of the tip commits");
+    assert_eq!(v, 6);
+}
+
+/// Review M2: a LIST that omits a version inside the window (here the
+/// committed one) cannot prove what that version reaches, so nothing is
+/// collected.
+#[tokio::test]
+async fn a_listing_missing_a_window_version_skips_gc() {
+    for missing in [5u64, 4] {
+        let b = bridge();
+        publish_generations(&b, 6).await;
+        b.store
+            .delete(&Path::from(format!("{META}/v{missing:020}.metadata.json")))
+            .await
+            .expect("hide a window version");
+        let before = metadata_names(&b).await;
+        let report = b.gc_metadata(META, 5, 3).await.expect("gc");
+        assert!(report.skipped.is_some(), "missing v{missing}: {report:?}");
+        assert_eq!(report.deleted, 0);
+        assert_eq!(metadata_names(&b).await, before);
+    }
+}

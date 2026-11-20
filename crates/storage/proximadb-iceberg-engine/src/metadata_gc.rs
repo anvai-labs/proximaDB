@@ -20,10 +20,17 @@
 //!   unreadable retained version cannot prove anything unreferenced.
 //! * **The version in the name orders against in-flight publishers.** A
 //!   publisher writes its manifests before its metadata CAS, so they are
-//!   unreachable until it commits; but it commits the successor of a version
-//!   it read as the latest, which is at least V, so its manifests are named
-//!   with a version above the floor and are never candidates. Names that do
-//!   not parse (legacy layouts, foreign writers) are kept.
+//!   unreachable until it commits. A publisher that read its parent at or
+//!   above V names them above the floor, so they are never candidates. A
+//!   STALE publisher (parent read before this GC, possibly far below V) may
+//!   lose its manifests, or even win the CAS on a collected slot below the
+//!   tip; the bridge treats such a below-tip win as a conflict
+//!   (`verify_commit_is_the_tip`, review M1), so it never becomes the table's
+//!   current version. Names that do not parse (legacy layouts, foreign
+//!   writers) are kept.
+//! * **The listing must show the whole window.** A LIST that omits any version
+//!   in `[floor, committed]` (eventual consistency, lag) would under-count
+//!   reachability, so the pass is skipped (review M2).
 //! * **Best effort.** Deletes that fail are counted, never surfaced as a
 //!   commit error; the next pass retries them (they stay below the floor and
 //!   unreachable).
@@ -138,6 +145,18 @@ impl IcebergObjectStoreBridge {
             })
             .collect();
         let floor = retention::window_floor(committed, retained_generations);
+        let listed_versions: HashSet<u64> = listing
+            .iter()
+            .filter_map(|p| p.filename().and_then(metadata_version_of))
+            .collect();
+        if let Some(missing) = (floor..=committed).find(|v| !listed_versions.contains(v)) {
+            return Ok(IcebergMetadataGcReport {
+                skipped: Some(format!(
+                    "listing omits retained version v{missing}; reachability unproven"
+                )),
+                ..Default::default()
+            });
+        }
         let retained_docs: Vec<&Path> = listing
             .iter()
             .filter(|p| {
