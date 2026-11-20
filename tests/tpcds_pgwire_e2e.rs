@@ -440,7 +440,7 @@ fn tpcds_expected() -> Vec<(&'static str, Vec<Vec<&'static str>>)> {
                 vec!["5", "20"],
             ],
         ),
-        // win_groups: GROUPS 1 PRECEDING = one peer-group back: qty1 14 (x2), qty2 14+12=26, qty3 12+10=22, qty5 10+20=30 (vs RANGE: no qty2 in the qty5 frame).
+        // win_groups: GROUPS 1 PRECEDING = one peer-group back: qty1 14 (x2), qty2 14+12=26, qty3 12+10=22, qty5 10+20=30 (vs RANGE at qty5: the RANGE frame [4,5] excludes BOTH qty2 and qty3; GROUPS includes qty3).
         (
             "win_groups",
             vec![
