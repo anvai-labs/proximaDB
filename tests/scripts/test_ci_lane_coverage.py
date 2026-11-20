@@ -91,6 +91,7 @@ class GuardTree:
     def patch(self):
         return mock.patch.multiple(
             guard,
+            ROOT=self.root,
             TESTS_DIR=self.root / "tests",
             WORKFLOWS_DIR=self.root / ".github" / "workflows",
             BASELINE=self.baseline,
@@ -101,7 +102,7 @@ class RunBlockExtraction(unittest.TestCase):
     def test_filter_mention_does_not_certify(self):
         tree = GuardTree(["alpha_e2e.rs", "beta_e2e.rs"], [WORKFLOW_WITH_FILTER_ONLY])
         with tree.patch():
-            text = guard.run_block_text()
+            text, _ = guard.run_block_text()
             self.assertNotIn("tests/**", text)
             self.assertFalse(guard.is_covered("alpha_e2e", "alpha_e2e.rs", text, []))
 
@@ -111,7 +112,7 @@ class RunBlockExtraction(unittest.TestCase):
             [WORKFLOW_WITH_RUN_LIST],
         )
         with tree.patch():
-            text = guard.run_block_text()
+            text, _ = guard.run_block_text()
             patterns = sorted(set(__import__("re").findall(r"(tests/[^\s'\";)]+)", text)))
             for stem, name in [
                 ("alpha_e2e", "alpha_e2e.rs"),  # bare for-loop name
@@ -205,11 +206,83 @@ jobs:
     def test_comment_mentions_do_not_certify(self):
         tree = GuardTree(["alpha_e2e.rs", "conv_e2e.rs"], [self.COMMENT_ONLY_WORKFLOW])
         with tree.patch():
-            text = guard.run_block_text()
+            text, _ = guard.run_block_text()
             patterns = sorted(set(re.findall(guard.TESTS_TOKEN_RE, text))) if hasattr(
                 guard, "TESTS_TOKEN_RE") else sorted(set(re.findall(r"(tests/[^\s'\";)]+)", text)))
             self.assertFalse(guard.is_covered("alpha_e2e", "alpha_e2e.rs", text, patterns))
             self.assertFalse(guard.is_covered("conv_e2e", "conv_e2e.rs", text, patterns))
+
+
+class CompileOnlyDoesNotCertify(unittest.TestCase):
+    """2026-11-20 CI review: a COMPILE-ONLY invocation certified a target as
+    executed. `cargo test --test example_e2e --no-run` (and `--list` /
+    `nextest list` enumeration) proves the target is wired, never that it
+    RAN — the exact shape that let a target sit on the burn-down baseline
+    while the guard called it covered. The lines are dropped and counted."""
+
+    WORKFLOW = """
+jobs:
+  lane:
+    runs-on: ubuntu-latest
+    steps:
+      - name: compile check
+        run: |
+          cargo test --test compile_only_e2e --no-run
+          cargo test --test list_only_e2e -- --list
+          cargo nextest list --test nextest_list_only_e2e
+      - name: actually run one
+        run: cargo test --test real_run_e2e -- --test-threads=1
+"""
+
+    def test_compile_only_invocations_do_not_certify(self):
+        tree = GuardTree(
+            [
+                "compile_only_e2e.rs",
+                "list_only_e2e.rs",
+                "nextest_list_only_e2e.rs",
+                "real_run_e2e.rs",
+            ],
+            [self.WORKFLOW],
+        )
+        with tree.patch():
+            text, excluded = guard.run_block_text()
+            self.assertEqual(
+                excluded, 3, "all three compile-only lines must be counted"
+            )
+            for stem, name in [
+                ("compile_only_e2e", "compile_only_e2e.rs"),
+                ("list_only_e2e", "list_only_e2e.rs"),
+                ("nextest_list_only_e2e", "nextest_list_only_e2e.rs"),
+            ]:
+                self.assertFalse(
+                    guard.is_covered(stem, name, text, []), name
+                )
+            # A real invocation on a nearby line still certifies its target.
+            self.assertTrue(guard.is_covered("real_run_e2e", "real_run_e2e.rs", text, []))
+
+    def test_script_bodies_are_scan_for_compile_only_too(self):
+        # Coverage routed through a repo script counts, but a compile-only
+        # invocation inside that script must equally not certify.
+        workflow = """
+jobs:
+  lane:
+    runs-on: ubuntu-latest
+    steps:
+      - name: drive the script
+        run: |
+          bash scripts/run_emulator.sh
+"""
+        tree = GuardTree(["scripted_compile_only_e2e.rs"], [workflow])
+        with tree.patch():
+            (tree.root / "scripts" / "run_emulator.sh").write_text(
+                "cargo test --test scripted_compile_only_e2e --no-run\n",
+                encoding="utf-8",
+            )
+            text, excluded = guard.run_block_text()
+            self.assertEqual(excluded, 1)
+            self.assertFalse(
+                guard.is_covered("scripted_compile_only_e2e", "scripted_compile_only_e2e.rs", text, [])
+            )
 
 
 if __name__ == "__main__":

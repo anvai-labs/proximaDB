@@ -177,6 +177,7 @@ jobs:
       # empty). Same failure class capability_facade guards against: the PR
       # that weakens the gate is the one PR the gate never sees.
       dup_ratchet: ${{ steps.filter.outputs.dup_ratchet }}
+      coverage_gate: ${{ steps.filter.outputs.coverage_gate }}
       type_name_ratchet: ${{ steps.filter.outputs.type_name_ratchet }}
       v1_proto_usage: ${{ steps.filter.outputs.v1_proto_usage }}
       # Granular Rust component detection for targeted testing. query_changes
@@ -286,6 +287,10 @@ jobs:
               # workspace-wide, so a bump must re-run the Rust suite.
               - 'rust-toolchain*'
               - '.cargo/**'
+              # TD-CITIER-1: nextest profiles/groups (retries, serial/resource
+              # groups, slow timeouts) change test OUTCOMES — a config-only PR
+              # must re-run the Rust lanes, not slip through as skipped-pass.
+              - '.config/nextest.toml'
               # This file DEFINES the Rust jobs (clippy args, feature matrix
               # combos, test shapes), so a change to it changes their outcome —
               # but it was not listed, which meant **CI could not validate a
@@ -317,6 +322,7 @@ jobs:
               - 'Cargo.lock'
               - 'rust-toolchain*'
               - '.cargo/**'
+              - '.config/nextest.toml'
               - 'proto/**'
             python:
               - 'clients/python/**'
@@ -434,6 +440,16 @@ jobs:
               - 'docs/**'
               - '*.md'
               - '*.adoc'
+            # The coverage ratchet must run when ITS OWN inputs change — the
+            # gate script, the committed baseline, or this gate's tests. The
+            # `python:` filter deliberately stays narrow (it gates several
+            # unrelated Python jobs); this one exists for the same reason
+            # `type_name_ratchet` does: the PR that weakens the gate is the
+            # one PR the gate must not miss.
+            coverage_gate:
+              - 'scripts/coverage_ratchet.py'
+              - 'docs/_internal/roadmap/COVERAGE_BASELINE.json'
+              - 'tests/scripts/test_coverage_ratchet.py'
             v1_proto_usage:
               - 'src/**'
               - 'crates/**'
@@ -2459,23 +2475,24 @@ jobs:
   # ============================================================================
   # BUILD - Compile Rust binaries
   # ============================================================================
+  # The dev/release matrix legs are SPLIT into two jobs: on a feat->develop PR
+  # the release leg ran only its setup steps (disk reclaim + checkout + cache
+  # restore + apt install — minutes of runner time, every sampled run) because
+  # its build step was gated off at that tier, and the dev-only consumer steps
+  # sat behind it. The release job now exists only where its artifact has a
+  # consumer (integration-test at the FULL tier), which keeps the required
+  # merge edge there while removing the light-tier no-op entirely.
   rust-build:
-    name: Rust Build (${{ matrix.profile }})
+    name: Rust Build (dev)
     runs-on: ubuntu-24.04
     timeout-minutes: 75
     # max 37 min over 14 runs, 2026-10-09..11, 2 legs (dev/release)
     needs: [changes]
     if: (needs.changes.outputs.rust == 'true' && !inputs.skip_tests) && !contains(needs.changes.outputs.reused, ',rust-build,')
-    strategy:
-      matrix:
-        include:
-          - profile: dev
-            args: ""
-            cache: dev-test
-          - profile: release
-            args: "--release"
-            cache: release
     steps:
+      - name: Job timing (start)
+        run: echo "JOB_START_EPOCH=$(date -u +%s)" >> "$GITHUB_ENV"
+
       - name: Reclaim disk space
         # ubuntu-latest ships ~25 GB of preinstalled toolchains this build never
         # uses (Android SDK, .NET, GHC/Haskell, boost). Removing them frees the
@@ -2504,7 +2521,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: "v2-rust"
-          shared-key: ${{ matrix.cache }}
+          shared-key: "dev-test"
           add-job-id-key: false
           save-if: false
 
@@ -2514,23 +2531,17 @@ jobs:
           sudo apt-get install -y libssl-dev pkg-config protobuf-compiler
 
       - name: Build All Binaries
-        # feat->develop (medium_tier=false): skip the release leg's ~30m compile —
-        # the dev build + clippy + test-compile already cover correctness, and the
-        # release binary artifact is only consumed at qa->main (integration-test,
-        # extensive). dev always runs; release runs at develop->qa+ (medium_tier).
-        if: matrix.profile == 'dev' || needs.changes.outputs.medium_tier == 'true'
         # TD-079 retired the root-crate lint debt 2026-05-28 — no
         # `-A warnings` override needed. Cargo build doesn't fail on
         # warnings by default; the rust-clippy job is the authoritative
         # lint gate.
         run: |
-          cargo build ${{ matrix.args }} \
+          cargo build \
             -p proximadb-server \
             -p proximadb-bench \
             -p proximadb-migrate
 
       - name: Verify critical drainer lifecycle (real server)
-        if: matrix.profile == 'dev'
         env:
           RUST_MIN_STACK: "8388608"
         # Subprocess isolation is owned by this suite. Reuse the dev server
@@ -2538,20 +2549,82 @@ jobs:
         run: cargo test -p proximadb-server --test drainer_lifecycle_integration_test -- --test-threads=1
 
       - name: Verify cold backup/restore round trip (real server)
-        if: matrix.profile == 'dev'
         env:
           RUST_MIN_STACK: "8388608"
         # Backup refuses under a live server (ownership lease), then a stopped
         # server's roots round-trip byte-identical through wipe + restore.
         run: cargo test -p proximadb-server --test cold_backup_restore -- --test-threads=1
 
+      - name: Job timing (report)
+        if: always()
+        run: |
+          if [ -n "${JOB_START_EPOCH:-}" ]; then
+            echo "⏱️ job=$GITHUB_JOB wall=$(( $(date -u +%s) - JOB_START_EPOCH ))s (excludes queue time)" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  rust-build-release:
+    name: Rust Build (release)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    needs: [changes]
+    if: (needs.changes.outputs.rust == 'true' && needs.changes.outputs.medium_tier == 'true' && !inputs.skip_tests) && !contains(needs.changes.outputs.reused, ',rust-build-release,')
+    steps:
+      - name: Job timing (start)
+        run: echo "JOB_START_EPOCH=$(date -u +%s)" >> "$GITHUB_ENV"
+
+      - name: Reclaim disk space
+        run: |
+          echo "Disk before reclaim:"; df -h /
+          sudo rm -rf \
+            /usr/local/lib/android \
+            /usr/share/dotnet \
+            /opt/ghc \
+            /usr/local/.ghcup \
+            /usr/local/share/boost || true
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+          echo "Disk after reclaim:"; df -h /
+
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@1.99.0
+        env:
+          RUSTUP_MAX_RETRIES: "10"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v2-rust"
+          # Reader of the release shape (writer: python-sdk-round-trip, develop
+          # push); this job never runs on develop, so it never saves.
+          shared-key: "release"
+          add-job-id-key: false
+          save-if: false
+
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libssl-dev pkg-config protobuf-compiler
+
+      - name: Build Release Binaries
+        run: |
+          cargo build --release \
+            -p proximadb-server \
+            -p proximadb-bench \
+            -p proximadb-migrate
+
       - name: Upload Server Binary
-        if: matrix.profile == 'release' && needs.changes.outputs.medium_tier == 'true'
+        # Consumed by `integration-test` (FULL tier, SDK/server integration).
         uses: actions/upload-artifact@v7
         with:
           name: proximadb-server-linux-x64
           path: target/release/proximadb-server
           retention-days: 1
+
+      - name: Job timing (report)
+        if: always()
+        run: |
+          if [ -n "${JOB_START_EPOCH:-}" ]; then
+            echo "⏱️ job=$GITHUB_JOB wall=$(( $(date -u +%s) - JOB_START_EPOCH ))s (excludes queue time)" >> "$GITHUB_STEP_SUMMARY"
+          fi
 
   rust-test:
     name: Rust Tests (${{ matrix.test-type }})
@@ -2596,6 +2669,9 @@ jobs:
       # instead of disarming to green.
       REQUIRE_PROTOC: "1"
     steps:
+      - name: Job timing (start)
+        run: echo "JOB_START_EPOCH=$(date -u +%s)" >> "$GITHUB_ENV"
+
       - name: Reclaim disk space
         # ubuntu-latest ships ~25 GB of preinstalled toolchains this build never
         # uses (Android SDK, .NET, GHC/Haskell, boost). Removing them frees the
@@ -2669,6 +2745,13 @@ jobs:
             CARGO_BUILD_JOBS=1 cargo nextest run --lib --profile unit --test-threads=2
           else
             cargo test --doc -- --test-threads=4
+          fi
+
+      - name: Job timing (report)
+        if: always()
+        run: |
+          if [ -n "${JOB_START_EPOCH:-}" ]; then
+            echo "⏱️ job=$GITHUB_JOB wall=$(( $(date -u +%s) - JOB_START_EPOCH ))s (excludes queue time)" >> "$GITHUB_STEP_SUMMARY"
           fi
 
   # ============================================================================
@@ -2883,6 +2966,9 @@ jobs:
     # on the build steps instead: a job-level value would give this job a
     # different key from the shape's writer and it would never restore.
     steps:
+      - name: Job timing (start)
+        run: echo "JOB_START_EPOCH=$(date -u +%s)" >> "$GITHUB_ENV"
+
       - name: Reclaim disk space
         run: |
           echo "Disk before reclaim:"; df -h /
@@ -2960,12 +3046,24 @@ jobs:
           SCCACHE_DIR: /home/runner/.cache/sccache
         run: bash scripts/run_cloud_emulator_tests.sh --restart
 
+      - name: Job timing (report)
+        if: always()
+        run: |
+          if [ -n "${JOB_START_EPOCH:-}" ]; then
+            echo "⏱️ job=$GITHUB_JOB wall=$(( $(date -u +%s) - JOB_START_EPOCH ))s (excludes queue time)" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
   # Targeted integration tests based on changed components
   rust-integration-test-storage:
     name: Rust Integration Tests (storage)
     runs-on: ubuntu-24.04
     timeout-minutes: 45
-    needs: [changes, rust-build]
+    # TD-CITIER-1 precedent (rust-test, authz): NO `rust-build` in needs —
+    # nothing here downloads its artifact; the lane compiles its own tests
+    # from the shared dev-test rust-cache shape. The edge only serialized
+    # this lane (the run's last-to-finish job) behind Rust Build (dev) for
+    # no artifact; start it as soon as change detection finishes.
+    needs: [changes]
     if: |
       !inputs.skip_tests &&
       needs.changes.outputs.test_tier == 'true' &&
@@ -3232,7 +3330,12 @@ jobs:
     # was 45; green spans reach 30-34 min across the integration legs, plus a
     # few minutes of per-run link for the merged `integration` target (its
     # test binary is never in the rust-cache; watch first runs for OOM)
-    needs: [changes, rust-build]
+    # TD-CITIER-1 precedent (rust-test, authz): NO `rust-build` in needs —
+    # nothing here downloads its artifact; the lane compiles its own tests
+    # from the shared dev-test rust-cache shape. The edge only serialized
+    # this lane (the run's last-to-finish job) behind Rust Build (dev) for
+    # no artifact; start it as soon as change detection finishes.
+    needs: [changes]
     if: |
       !inputs.skip_tests &&
       needs.changes.outputs.test_tier == 'true' &&
@@ -3404,7 +3507,12 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     # was 45; green spans reach 30-34 min across the integration legs
-    needs: [changes, rust-build]
+    # TD-CITIER-1 precedent (rust-test, authz): NO `rust-build` in needs —
+    # nothing here downloads its artifact; the lane compiles its own tests
+    # from the shared dev-test rust-cache shape. The edge only serialized
+    # this lane (the run's last-to-finish job) behind Rust Build (dev) for
+    # no artifact; start it as soon as change detection finishes.
+    needs: [changes]
     if: |
       !inputs.skip_tests &&
       needs.changes.outputs.test_tier == 'true' &&
@@ -3445,7 +3553,12 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     # was 45; green spans reach 30-34 min across the integration legs
-    needs: [changes, rust-build]
+    # TD-CITIER-1 precedent (rust-test, authz): NO `rust-build` in needs —
+    # nothing here downloads its artifact; the lane compiles its own tests
+    # from the shared dev-test rust-cache shape. The edge only serialized
+    # this lane (the run's last-to-finish job) behind Rust Build (dev) for
+    # no artifact; start it as soon as change detection finishes.
+    needs: [changes]
     if: |
       !inputs.skip_tests &&
       needs.changes.outputs.test_tier == 'true' &&
@@ -3496,7 +3609,12 @@ jobs:
     name: Rust Integration Tests (api surface)
     runs-on: ubuntu-24.04
     timeout-minutes: 45
-    needs: [changes, rust-build]
+    # TD-CITIER-1 precedent (rust-test, authz): NO `rust-build` in needs —
+    # nothing here downloads its artifact; the lane compiles its own tests
+    # from the shared dev-test rust-cache shape. The edge only serialized
+    # this lane (the run's last-to-finish job) behind Rust Build (dev) for
+    # no artifact; start it as soon as change detection finishes.
+    needs: [changes]
     if: |
       !inputs.skip_tests &&
       needs.changes.outputs.test_tier == 'true' &&
@@ -3546,7 +3664,12 @@ jobs:
     name: Rust Integration Tests (burn-down)
     runs-on: ubuntu-24.04
     timeout-minutes: 75
-    needs: [changes, rust-build]
+    # TD-CITIER-1 precedent (rust-test, authz): NO `rust-build` in needs —
+    # nothing here downloads its artifact; the lane compiles its own tests
+    # from the shared dev-test rust-cache shape. The edge only serialized
+    # this lane (the run's last-to-finish job) behind Rust Build (dev) for
+    # no artifact; start it as soon as change detection finishes.
+    needs: [changes]
     if: |
       !inputs.skip_tests &&
       needs.changes.outputs.test_tier == 'true' &&
@@ -3556,6 +3679,9 @@ jobs:
       # This is the first lane that builds many root-crate test binaries in
       # ONE cargo invocation (64; ~6 GB of binaries locally). Same disk and
       # memory mitigations as the other large-build jobs (#2502 review).
+      - name: Job timing (start)
+        run: echo "JOB_START_EPOCH=$(date -u +%s)" >> "$GITHUB_ENV"
+
       - name: Reclaim disk space
         run: |
           echo "Disk before reclaim:"; df -h /
@@ -3686,6 +3812,13 @@ jobs:
               --test typed_memory_test \
               --test v2_evaluation_chain_integration_test
 
+      - name: Job timing (report)
+        if: always()
+        run: |
+          if [ -n "${JOB_START_EPOCH:-}" ]; then
+            echo "⏱️ job=$GITHUB_JOB wall=$(( $(date -u +%s) - JOB_START_EPOCH ))s (excludes queue time)" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
   rust-coverage:
     name: Code Coverage
     runs-on: ubuntu-24.04
@@ -3777,13 +3910,20 @@ jobs:
           # -memory issue mitigated in the unit-test job.
           CARGO_BUILD_JOBS: 1
         run: |
-          # Use --lib only and limit parallelism to avoid OOM on CI runners
+          # Use --lib only and limit parallelism to avoid OOM on CI runners.
+          # The `--fail-under 60` result is NOT swallowed: a sub-floor or failed
+          # run fails the STEP (visible in the job result and run history). The
+          # job-level `continue-on-error` keeps it advisory at the workflow
+          # level until the llvm-cov pipeline (qa-gate rust-coverage-ratchet)
+          # seeds the Rust baseline — but an advisory check still has to RECORD
+          # its failure; `|| echo continuing` turned every below-floor run into
+          # a green step nobody could distinguish from a pass.
           cargo tarpaulin --lib --timeout 600 \
             --out xml --out html \
             --output-dir coverage \
             --skip-clean \
             --jobs 2 \
-            --fail-under 60 || echo "Coverage generation failed (may be OOM), continuing"
+            --fail-under 60
       - name: Upload Coverage Report
         if: always()
         uses: actions/upload-artifact@v7
@@ -3933,7 +4073,9 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     needs: changes
-    if: ${{ !inputs.skip_tests && needs.changes.outputs.python == 'true' }}
+    # `coverage_gate` covers this gate's own inputs (ratchet script, committed
+    # baseline, its tests) so a gate-only PR still runs the gate it edits.
+    if: ${{ !inputs.skip_tests && (needs.changes.outputs.python == 'true' || needs.changes.outputs.coverage_gate == 'true') }}
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
@@ -3955,18 +4097,37 @@ jobs:
           # _cov sys.modules-leak failures (the ratchet measures coverage, not
           # pass/fail). OFFLINE unit tests only: filter out `integration` (needs
           # a running server) and `live` (needs an external dependency / network).
+          #
+          # `|| true` no longer buys a free pass: the Ratchet check step below
+          # rejects a MISSING report, and normalize (script-side) rejects a
+          # zero-denominator one. This step additionally rejects a run that
+          # collected/ran NO tests — a coverage JSON from an empty suite is
+          # not evidence of coverage (the empty-report false-green the
+          # 2026-11-20 CI review reproduced).
+          set +e
           pytest tests/unit/ -q -p no:cacheprovider --timeout=120 \
             --cov=proximadb_sdk --cov-report=json:/tmp/sdk-cov.json \
             -m "not integration and not live" \
             --ignore=tests/unit/test_chunking_code_cov.py \
-            --continue-on-collection-errors || true
-          test -f /tmp/sdk-cov.json
+            --continue-on-collection-errors 2>&1 | tee /tmp/sdk-pytest.log
+          pytest_status=${PIPESTATUS[0]}
+          set -e
+          test -f /tmp/sdk-cov.json || { echo "::error::SDK coverage report missing — pytest produced no report"; exit 1; }
+          if grep -qE "no tests ran|collected 0 items" /tmp/sdk-pytest.log; then
+            echo "::error::SDK coverage run selected ZERO tests — this is not coverage evidence"
+            exit 1
+          fi
+          echo "pytest exit $pytest_status (coverage measured, pass/fail owned by python-test)"
       - name: Ratchet check
         run: |
+          # normalize exits 2 on a malformed/zero-denominator report; check
+          # fails if the sdk component is absent (--require-components), so a
+          # Rust-only or empty report can never pass the Python gate.
           python3 scripts/coverage_ratchet.py normalize --sdk /tmp/sdk-cov.json -o /tmp/sdk-current.json
           python3 scripts/coverage_ratchet.py check \
             --baseline docs/_internal/roadmap/COVERAGE_BASELINE.json \
-            --current /tmp/sdk-current.json
+            --current /tmp/sdk-current.json \
+            --require-components sdk:proximadb-python
 
   # TD-CHUNK-1 / ADR-091: the chunking conformance ratchet.
   #
@@ -4028,14 +4189,16 @@ jobs:
     name: Integration Tests
     runs-on: ubuntu-24.04
     timeout-minutes: 30
-    needs: [changes, rust-build, python-test]
+    needs: [changes, rust-build, rust-build-release, python-test]
     # TD-CITIER-2: `python-test` may be SKIPPED because it was proven green on
-    # this exact tree; that must not skip this main-only extra. `rust-build` is
-    # never reused at the FULL tier (this job downloads its release binary),
-    # so it must still have succeeded.
+    # this exact tree; that must not skip this main-only extra. `rust-build` /
+    # `rust-build-release` are never reused at the FULL tier (this job
+    # downloads the release binary), so they must still have succeeded.
     if: >-
       ${{ !cancelled() && !inputs.skip_tests && needs.changes.result == 'success' &&
-      needs.changes.outputs.extensive == 'true' && needs.rust-build.result == 'success' &&
+      needs.changes.outputs.extensive == 'true' &&
+      needs.rust-build.result == 'success' &&
+      needs.rust-build-release.result == 'success' &&
       (needs.python-test.result == 'success' ||
        (needs.python-test.result == 'skipped' && contains(needs.changes.outputs.reused, ',python-test,'))) }}
     steps:
@@ -4236,10 +4399,18 @@ jobs:
     name: Benchmarks
     runs-on: ubuntu-24.04
     timeout-minutes: 120  # extensive-only (main); not in the develop/qa sample
-    needs: [rust-build]
+    # NO `rust-build` in needs: nothing here downloads its artifact — `cargo
+    # bench` compiles its own binaries from the restored cache shape. The edge
+    # only delayed these scheduled/dispatch jobs behind the dev build. The
+    # push arm DOES keep the old path gate (`rust == 'true'`, which the old
+    # needs edge provided transitively): a docs-only push must not burn a
+    # ~2-hour runner compiling benches. Dispatch stays unconditional.
+    needs: [changes]
     if: |
       inputs.run_benchmarks ||
-      (github.event_name == 'push' && github.ref == 'refs/heads/main')
+      (github.event_name == 'push' &&
+       github.ref == 'refs/heads/main' &&
+       needs.changes.outputs.rust == 'true')
     steps:
       - uses: actions/checkout@v7
 
@@ -4283,12 +4454,20 @@ jobs:
   tpc-perf-ledger:
     name: TPC Perf Evidence Ledger (advisory)
     runs-on: ubuntu-24.04
-    needs: [rust-build]
+    # NO `rust-build` in needs: nothing here downloads its artifact — `cargo
+    # bench` compiles its own binaries from the restored cache shape. The edge
+    # only delayed these scheduled/dispatch jobs behind the dev build. The
+    # push arm keeps the old path gate (`rust == 'true'`, provided
+    # transitively by the old needs edge): a docs-only develop push must not
+    # burn a ~60-min advisory runner. Dispatch stays unconditional.
+    needs: [changes]
     continue-on-error: true
     timeout-minutes: 60
     if: |
       inputs.run_benchmarks ||
-      (github.event_name == 'push' && github.ref == 'refs/heads/develop')
+      (github.event_name == 'push' &&
+       github.ref == 'refs/heads/develop' &&
+       needs.changes.outputs.rust == 'true')
     steps:
       - uses: actions/checkout@v7
 
@@ -4493,6 +4672,7 @@ jobs:
       - feature-matrix
       - rust-security
       - rust-build
+      - rust-build-release
       - rust-test
       - rust-coverage
       - rust-integration-test-storage

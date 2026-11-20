@@ -1,0 +1,112 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-CI-8: Merge-latency and coverage-evidence pilots (Azurite build split, nextest archives, Rust coverage seed, post-merge dedup)
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Partial.** Phase 1 (artifact-free dependency edges, no-op release leg, local entry points) and Phase 2 (coverage-ratchet + lane-census evidence hardening, trigger gaps) shipped in the PR that filed this TD. The measurement-gated pilots below remain OPEN.
+| Priority | **HIGH.** Ten sampled Rust PRs took a median 40.8 min to `CI Success` (p90 62.4, max 80.1); the integration burn-down lane was last-to-finish in 6/10 runs and the Azurite restart job in 4/10. The coverage gates had two reproduced false-greens (empty report passed the ratchet; a compile-only test counted as executed).
+| Component | `.github/workflows/ci.yml`, `.github/workflows/qa-gate.yml`, `scripts/run_cloud_emulator_tests.sh`, `scripts/coverage_ratchet.py`, `scripts/check_ci_lane_coverage.py`, `scripts/ci_tree_reuse.py`
+| Relates to | link:TD-CITIER-2-promotion-reruns-identical-trees.adoc[TD-CITIER-2] (tree-reuse + the nextest-archive proposal §), link:TD-CI-1-rust-test-compile-bottleneck.adoc[TD-CI-1] (root-compile experiments + OOM ceiling), link:TD-LANECOV-1-never-run-integration-targets-that-fail.adoc[TD-LANECOV-1] (the never-run baseline this TD's census builds on), mandate #9 (CI tiers), mandate #10 (quality ratchets)
+|===
+
+== Evidence baseline (2026-11-20 review, `origin/develop` @ 4cd469982)
+
+Ten successful first-attempt PR runs, 2026-11-12..20 (run IDs 44675584157, 44673928844,
+43574708531, 43520001590, 43463106533, 43338817154, 43307859216, 43276839052,
+43168402312, 43150257467): median 40.8 min to `CI Success`, 380 runner-minutes per run,
+51 jobs-with-steps. The full measured table and the coverage findings live in the
+review report (`report/CI_BUILD_FEEDBACK_2026-11-20.md`, local-only).
+
+== Shipped in the filing PR (Phases 1–2)
+
+* **Artifact-free edges removed.** The six integration lanes (`storage`, `query`,
+  `graph`, `cluster`, `api`, `burndown`) no longer `needs: rust-build` — none downloads
+  its artifact; each compiles its own tests from the shared `dev-test` rust-cache shape
+  (same precedent as `rust-test`/`authz`, TD-CITIER-1). `benchmarks` and
+  `tpc-perf-ledger` lost the same edge. `ci_tree_reuse.py` groups updated: the two
+  build legs are separate EXACT groups with no declared dependents.
+* **No-op release leg eliminated.** `rust-build`'s dev/release matrix split into
+  `rust-build` (dev, always) + `rust-build-release` (medium-tier only, uploads the
+  server binary). A feat→develop PR no longer pays the release leg's setup steps.
+  `integration-test` requires BOTH results at the FULL tier; `rust-build-release`
+  joined `ci-success.needs`; neither build job is reused at the FULL tier.
+* **Evidence hardening.** `coverage_ratchet.py` rejects empty/malformed/zero-denominator
+  reports (exit 2), `check` gained `--require-components` (absent ⇒ FAIL, not warn),
+  crate attribution is repo-relative via `--workspace-root` (apps/clients no longer
+  collapse into the root bucket). `check_ci_lane_coverage.py` excludes and counts
+  compile-only invocations (`--no-run`, `--list`, `nextest list`) in run blocks AND
+  harvested script bodies. Tarpaulin's `|| echo continuing` swallow removed (failure is
+  now a visible red step under the job-level advisory). `sdk-coverage-ratchet` rejects a
+  missing report and a zero-test run.
+* **Trigger gaps closed.** `.config/nextest.toml` added to the `rust:`/`compile:`
+  filters; a `coverage_gate:` filter (ratchet script + committed baseline + its tests)
+  wired into `sdk-coverage-ratchet`'s `if:`.
+* **Local entry points fixed.** `build-server`/`server-start(-release)` select
+  `-p proximadb-server --bin proximadb-server` (they failed: default-members select
+  only the root package); `make release` no longer starts with `clean`;
+  `test-fast`'s fallback is serial (`TEST_THREADS` override) instead of in-process
+  parallel; new package-scoped `check-pkg`/`test-pkg`/`server-dev` targets;
+  `affected_crates.py` now includes untracked files. Timing labels added to the four
+  critical-path jobs.
+
+== Pilot 1: split and time the Azurite restart build (HIGH)
+
+The `object-store-restart-recovery` job spent 71 of 74 minutes in ONE combined
+build-and-test step; its `--restart` scope builds three feature shapes at
+`CARGO_BUILD_JOBS=1` that NO other job builds, so every run is a cold compile.
+
+1. Separate compile, fixture bootstrap (Azurite container), and test execution into
+   distinct, timed steps; publish the step spans per run.
+2. Pilot a higher-memory runner (pinned setup, more build jobs) for the two Azure build
+   shapes, cold and warm trees; record peak RSS, swap, disk and cost. The prior sccache
+   experiment on the root unit job hit the 16 GiB ceiling — measure before enabling.
+3. Reuse an Azure-enabled test archive only after proving fixture AND feature parity.
+4. Keep the process-boundary recovery proof (fresh local disks, catalog recovery, WAL
+   replay, cold read-back, warm manifests, spill/fencing) on affected PRs.
+
+== Pilot 2: build test binaries once (nextest archives, MEDIUM)
+
+Per link:TD-CITIER-2-promotion-reruns-identical-trees.adoc[TD-CITIER-2] §existing
+proposal: pilot archives on a bounded subset of burn-down targets. Time compile, pack,
+transfer, unpack, execute separately; compare discovered vs executed test IDs against
+the current lane; preserve serial/resource groups and fixtures. A local one-binary pilot
+passed 11/11 from an archive; hosted large-archive net savings are UNMEASURED. Expand
+only across groups sharing package set, features, profile, target, toolchain, native
+libraries and flags. Doctests stay separate. Reject missing/mismatched archives (tie to
+producing run, exact tree, configuration, checksum).
+
+== Pilot 3: seed the Rust coverage baseline, then flip the ratchet (MEDIUM)
+
+QA's `rust-coverage-ratchet` emits a seed artifact under `continue-on-error`; the
+baseline has no `rust:*` entries and Main's Tarpaulin job is advisory.
+
+1. Get one clean QA run to produce `rust-coverage-seed.json`; review per-crate numbers,
+   denominators and the build configuration; commit a scoped baseline via
+   `coverage_ratchet.py write`.
+2. Gate `check --require-components rust:proximadb,...` in qa-gate; only then remove
+   `continue-on-error`.
+3. Retire the duplicate Tarpaulin instrumented build after proving llvm-cov parity.
+
+== Pilot 4: post-merge dedup, consolidation, merge queue (LOW; after ≥30 comparable PR runs)
+
+* Compare equivalent code paths over ≥30 PR runs (Rust, storage/recovery, lockfile,
+  SDK, docs) before any lane-removal: time to `CI Success`, queue/setup, runner
+  minutes; include cancelled/superseded runs and reruns.
+* Reduce protected-branch push duplication (one writer per cache shape; coalesce
+  scheduled warming) only after there is trusted exact-tree evidence per lane —
+  the TD-CITIER-2 machinery, not a new one.
+* Shadow-compare the workspace `--lib --bins --tests` compile against the separate
+  lib/bin legs before consolidation.
+* Merge queue only after CI handles `merge_group` with explicit base/head and measured
+  latency under representative churn.
+
+== Rollout targets and rollback
+
+Pilot goal: 30-min median / 50-min p90 to `CI Success` on comparable Rust PRs, ≥20%
+lower median runner minutes, no reduction in required executed regression scenarios.
+Track docs-only, SDK-docs, ordinary Rust, restart-sensitive Rust, lockfile and
+promotions separately. **Roll back to the original lanes** if executed test IDs fall
+out or the new path loses on latency or reliability. A failing dev build or integration
+test must still fail the gate in every variant.

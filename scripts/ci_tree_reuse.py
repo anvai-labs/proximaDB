@@ -120,8 +120,6 @@ class Group:
         return name in self.exact or any(name.startswith(p) for p in self.prefix)
 
 
-_LANES = ("storage", "query", "graph", "cluster", "api", "burndown")
-
 GROUPS: tuple[Group, ...] = (
     Group("rust-test", prefix=("Rust Tests (",)),
     Group(
@@ -134,10 +132,23 @@ GROUPS: tuple[Group, ...] = (
         exact=("Feature Matrix (enterprise-catalogs)",),
     ),
     Group("rust-compile-benches", exact=("Rust Compile (benches)",)),
+    # The dev/release matrix legs are separate ci.yml jobs now (the light-tier
+    # no-op release leg was split out), so each gets its own EXACT group — the
+    # old prefix ("Rust Build (") would funnel both legs into one group and
+    # reuse decisions could not tell them apart. The integration lanes no
+    # longer `needs:` rust-build (artifact-free edge removed), so it has no
+    # declared dependents; both stay not_at_full_tier because
+    # `integration-test` requires their real (non-skipped) results at the
+    # FULL tier — it downloads the release binary and a dev-build proof does
+    # not substitute for it.
     Group(
         "rust-build",
-        prefix=("Rust Build (",),
-        dependents=tuple(f"rust-integration-test-{lane}" for lane in _LANES),
+        exact=("Rust Build (dev)",),
+        not_at_full_tier=True,
+    ),
+    Group(
+        "rust-build-release",
+        exact=("Rust Build (release)",),
         not_at_full_tier=True,
     ),
     Group("rust-integration-test-storage", exact=("Rust Integration Tests (storage)",)),
