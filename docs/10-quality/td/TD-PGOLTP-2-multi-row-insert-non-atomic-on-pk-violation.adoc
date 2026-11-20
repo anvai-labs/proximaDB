@@ -1,0 +1,77 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-PGOLTP-2: Multi-row INSERT is non-atomic on a PK violation — all rows land, then the error is raised
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open.** Reproduced on release build `origin/develop` `651cd2529` (2026-11-20), pgwire autocommit path. Not yet root-caused in `dml_service`; fix not designed.
+| Severity | **High (correctness).** A statement that reports failure has durably applied ALL of its rows. Postgres semantics: a failed statement inserts nothing.
+| Component | `src/services/dml/mod.rs` (multi-row INSERT apply loop over pgwire autocommit), `src/network/postgres/relational_pipeline.rs` (statement execution), PK-constraint validation point (insert path)
+| Realizes | ADR-018 (pgwire SQL parity — statement atomicity), the "atomicity" clause of ADR-095's problem statement; complements TD-PGOLTP-1 (which makes a *transaction* one commit record but does not by itself fix within-statement row-then-error ordering on the legacy autocommit path)
+| Relates to | TD-PGOLTP-1 (transaction-level atomicity, default-OFF), ADR-095 (Postgres-compatible OLTP)
+|===
+
+== Reproduction (2026-11-20, release-server, pgwire autocommit)
+
+Fresh server, empty catalog:
+
+----
+CREATE TABLE date_dim (d_date_sk INT PRIMARY KEY, d_date DATE, d_year INT,
+                        d_moy INT, d_qoy INT, d_dom INT, d_dow INT);
+INSERT INTO date_dim (d_date_sk, d_date, d_year, d_moy, d_qoy, d_dom, d_dow)
+VALUES (24001, DATE '2000-11-01', 2000, 11, 4, 1, 3),
+       (24002, DATE '2000-11-15', 2000, 11, 4, 15, 3),
+       (24003, DATE '2000-12-10', 2000, 12, 4, 10, 0),
+       (23001, DATE '1999-11-05', 1999, 11, 4, 5, 5);
+-- → ERROR: Insert failed: duplicate key value violates primary key
+--          'd_date_sk' on table 'date_dim': '24001' already exists
+SELECT count(*) FROM date_dim;   -- → 4   (all rows durable)
+----
+
+Observed on the seed-insert path while loading the TPC-H/TPC-DS pgwire conformance
+seed (the harness's `reseed_for_accuracy_phase` never hits this because its seed
+contains no duplicate keys). Two engines cross-checked on the identical seed:
+duckdb 1.4.4 returns no rows for the failed statement (rollback); proximaDB
+returns all 4.
+
+== What is wrong
+
+The multi-row INSERT apply loop writes rows to the record store row-by-row and
+validates the PRIMARY KEY constraint against the store **after** (or interleaved
+with) the writes, on the autocommit path where each statement is its own implicit
+commit. There is no per-statement staging: once the constraint error is raised,
+the already-written rows are durable and the client is told the statement failed.
+This is statement-level non-atomicity — a strictly narrower defect than
+TD-PGOLTP-1's torn-COMMIT, but the same user-visible contract violation
+("a failed statement changed nothing").
+
+== Why the existing mitigations do not cover it
+
+* `[oltp] atomic_commit` / TD-PGOLTP-1 stages *transactions*; on the default
+  (legacy, autocommit) path each statement commits as it goes, so per-row writes
+  land before the PK check completes.
+* The uniqueness validation appears to consult the store (or an index) that the
+  earlier rows of the SAME statement already updated, so the violation is
+  detected against the statement's own writes.
+
+== Fix direction (to be confirmed by the root-cause pass)
+
+1. **Constraint-first staging (preferred):** validate the whole statement's key
+   set (including self-duplicates within the VALUES list) before applying any
+   row; apply only after validation passes. Cheap for the common sizes; no new
+   machinery.
+2. **Statement staging via the TD-PGOLTP-1 decorator:** route autocommit
+   statements through `txn_staging` even when `atomic_commit` is OFF, so the
+   constraint error discards the staged writes. Larger blast radius; makes the
+   legacy path safe by construction.
+3. Either way: add a pgwire e2e regression — multi-row INSERT with a duplicate
+   key must return the error AND leave `count(*)` unchanged.
+
+== Evidence files
+
+* Repro session: server log `/tmp/tpcconf/server.log` (ephemeral; reproduce with
+  the two statements above against any fresh server).
+* Discovered while building two-engine TPC goldens: proximaDB actuals ==
+  duckdb goldens on all 40 TPC queries once the non-atomic insert is worked
+  around (PR #2547 adds the TPC-DS accuracy ratchet 10 → 18).
