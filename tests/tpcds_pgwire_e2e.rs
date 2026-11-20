@@ -17,7 +17,7 @@ const TPCDS_RATCHET: usize = 18;
 /// ADR-040 accuracy ratchet (TD-182 P1): TPC-DS queries with full-row anchors
 /// over the seed (the shapes not already anchored in the conformance test's
 /// ROLLUP/CUBE/rank/RANGE-GROUPS/INTERSECT section). Only goes up.
-const TPCDS_ACCURATE_RATCHET: usize = 10;
+const TPCDS_ACCURATE_RATCHET: usize = 18;
 
 #[path = "common/pg_server.rs"]
 mod pg_server;
@@ -419,6 +419,78 @@ fn tpcds_expected() -> Vec<(&'static str, Vec<Vec<&'static str>>)> {
         ),
         // EXCEPT: Electronics buyers {1,2} minus Books buyers {1,3} → {2}.
         ("except", vec![vec!["2"]]),
+        // win_rank: brand revenue per category — Books brandC 49.95 rank1 / brandD 42 rank2; Electronics brandA 59.97 (39.98+19.99) rank1 / brandB 29.5 rank2 (canon-sorted).
+        (
+            "win_rank",
+            vec![
+                vec!["Books", "brandC", "49.95", "1"],
+                vec!["Books", "brandD", "42", "2"],
+                vec!["Electronics", "brandA", "59.97", "1"],
+                vec!["Electronics", "brandB", "29.5", "2"],
+            ],
+        ),
+        // win_range: RANGE 1 PRECEDING = window qty in [qty-1, qty]: qty1 8+6=14 (x2 peer rows), qty2 14+12=26, qty3 12+10=22, qty5 20.
+        (
+            "win_range",
+            vec![
+                vec!["1", "14"],
+                vec!["1", "14"],
+                vec!["2", "26"],
+                vec!["3", "22"],
+                vec!["5", "20"],
+            ],
+        ),
+        // win_groups: GROUPS 1 PRECEDING = one peer-group back: qty1 14 (x2), qty2 14+12=26, qty3 12+10=22, qty5 10+20=30 (vs RANGE: no qty2 in the qty5 frame).
+        (
+            "win_groups",
+            vec![
+                vec!["1", "14"],
+                vec!["1", "14"],
+                vec!["2", "26"],
+                vec!["3", "22"],
+                vec!["5", "30"],
+            ],
+        ),
+        // rollup: (cat,class) rows + (cat) subtotals + () grand total 30, NULL-marked (canon-sorted).
+        (
+            "rollup",
+            vec![
+                vec!["Books", "NULL", "30"],
+                vec!["Books", "classY", "30"],
+                vec!["Electronics", "NULL", "26"],
+                vec!["Electronics", "classX", "26"],
+                vec!["NULL", "NULL", "56"],
+            ],
+        ),
+        // grouping sets ((cat),(brand),()): category sums + brand sums + grand total qty 8.
+        (
+            "grouping_sets",
+            vec![
+                vec!["Books", "NULL", "8"],
+                vec!["Electronics", "NULL", "4"],
+                vec!["NULL", "NULL", "12"],
+                vec!["NULL", "brandA", "3"],
+                vec!["NULL", "brandB", "1"],
+                vec!["NULL", "brandC", "5"],
+                vec!["NULL", "brandD", "3"],
+            ],
+        ),
+        // cube(year,cat): all combos + NULL subtotals, canon-sorted.
+        (
+            "cube",
+            vec![
+                vec!["1999", "Electronics", "19.99"],
+                vec!["1999", "NULL", "19.99"],
+                vec!["2000", "Books", "91.95"],
+                vec!["2000", "Electronics", "69.48"],
+                vec!["2000", "NULL", "161.43"],
+                vec!["NULL", "Books", "91.95"],
+                vec!["NULL", "Electronics", "89.47"],
+                vec!["NULL", "NULL", "181.42"],
+            ],
+        ),
+        // intersect: customers buying BOTH Electronics and Books -> {1} (cust1 in both; cust2 Electronics-only, cust3 Books-only).
+        ("intersect", vec![vec!["1"]]),
     ]
 }
 
