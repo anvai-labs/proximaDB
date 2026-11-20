@@ -486,6 +486,221 @@ impl ProximaObjectStore {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Parquet-object detection (external-table open path)
+// ---------------------------------------------------------------------------
+//
+// Dual-duty classification used wherever a location string or listed object
+// must be recognized as "a parquet object" before an open:
+//
+// 1. The FREE extension check — the single source of truth for the
+//    `.parquet` suffix test (dispatch sites previously each hand-rolled
+//    `ends_with(".parquet")`).
+// 2. OPTIONAL content verification — a 4-byte ranged GET confirming the
+//    parquet magic. A parquet file carries `PAR1` at BOTH ends (leading
+//    header magic at offset 0, trailing footer magic as the last 4 bytes);
+//    the trailing probe is preferred whenever the object size is already
+//    known (an open path that does a `head` anyway pays nothing extra),
+//    the leading probe serving size-less callers. Verification is OPT-IN
+//    (one probe per object per open; a table-open cache hit re-pays it,
+//    since the store is re-created per query for io-trace attribution):
+//    the default is extension-only, flipped with
+//    `PROXIMADB_PARQUET_MAGIC_VERIFY=1` for fail-closed behavior — a
+//    mis-suffixed or wrong-content object is rejected at open with a clear
+//    message instead of surfacing as a parquet decode error later.
+
+/// How strictly an open path should classify a candidate parquet object.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ParquetDetect {
+    /// Extension evidence only — zero extra I/O (the default).
+    #[default]
+    Extension,
+    /// Extension AND the parquet magic (one extra 4-byte ranged GET per
+    /// object; fail-closed on mismatch).
+    ExtensionAndMagicBytes,
+}
+
+impl ParquetDetect {
+    /// Process-wide default, from `PROXIMADB_PARQUET_MAGIC_VERIFY`
+    /// (`1`/`true` ⇒ [`ParquetDetect::ExtensionAndMagicBytes`]; anything
+    /// else, including unset, ⇒ extension-only).
+    pub fn from_env() -> Self {
+        match std::env::var("PROXIMADB_PARQUET_MAGIC_VERIFY") {
+            Ok(v) if matches!(v.trim(), "1" | "true" | "True" | "TRUE") => {
+                Self::ExtensionAndMagicBytes
+            }
+            _ => Self::Extension,
+        }
+    }
+
+    /// Whether this mode performs the (extra-GET) magic-byte probe.
+    pub fn verifies_magic_bytes(self) -> bool {
+        matches!(self, Self::ExtensionAndMagicBytes)
+    }
+}
+
+/// Single source of truth for the `.parquet` extension test on a URI or
+/// object-path string. Case-insensitive; a query/fragment suffix (`?…`/`#…`)
+/// is ignored. Anything without the extension (e.g. a directory location)
+/// classifies as false.
+pub fn has_parquet_extension(path_or_uri: &str) -> bool {
+    let bare = path_or_uri.split(['?', '#']).next().unwrap_or(path_or_uri);
+    bare.trim_end_matches('/')
+        .to_ascii_lowercase()
+        .ends_with(".parquet")
+}
+
+/// Verify an object LEADS with the parquet magic (`PAR1`). One 4-byte ranged
+/// GET. Prefer [`verify_parquet_footer_magic_bytes`] when the object size is
+/// already known — the parquet file ends with the same 4-byte magic, so the
+/// trailing probe is equally definitive and, on an open path that performs a
+/// `head`/footer read anyway, costs no extra GET.
+pub async fn verify_parquet_magic_bytes(
+    store: &dyn ObjectStore,
+    path: &Path,
+) -> Result<bool, StorageError> {
+    let bytes = store
+        .get_range(path, 0..4)
+        .await
+        .map_err(|e| os_err("parquet magic probe", e))?;
+    Ok(bytes.as_ref() == b"PAR1")
+}
+
+/// Verify an object ENDS with the parquet footer magic (`PAR1`). One 4-byte
+/// ranged GET at `size - 4` — free when the caller already has the size
+/// (e.g. from the `head` every open path performs) or is about to fetch the
+/// footer itself.
+pub async fn verify_parquet_footer_magic_bytes(
+    store: &dyn ObjectStore,
+    path: &Path,
+    size: u64,
+) -> Result<bool, StorageError> {
+    if size < 8 {
+        // Smaller than header magic (4) + footer len (4): not a parquet file.
+        return Ok(false);
+    }
+    let start = size - 4;
+    let bytes = store
+        .get_range(path, start..size)
+        .await
+        .map_err(|e| os_err("parquet footer magic probe", e))?;
+    Ok(bytes.as_ref() == b"PAR1")
+}
+
+/// Dual-duty classification of a candidate object: the free extension test
+/// always runs, plus (when `mode` asks) the magic-byte probe. `Ok(false)`
+/// means the object is not acceptable under `mode`.
+pub async fn detect_parquet_object(
+    store: &dyn ObjectStore,
+    path: &Path,
+    mode: ParquetDetect,
+) -> Result<bool, StorageError> {
+    if !has_parquet_extension(path.as_ref()) {
+        return Ok(false);
+    }
+    if !mode.verifies_magic_bytes() {
+        return Ok(true);
+    }
+    verify_parquet_magic_bytes(store, path).await
+}
+
+#[cfg(test)]
+mod parquet_detect_tests {
+    use super::*;
+    use object_store::PutPayload;
+    use object_store::memory::InMemory;
+
+    #[test]
+    fn extension_check_is_case_insensitive_and_ignores_query() {
+        assert!(has_parquet_extension("s3://bucket/data/part-0.parquet"));
+        assert!(has_parquet_extension("file:///x/y/Data_0.PARQUET"));
+        assert!(has_parquet_extension("s3://bucket/x.parquet?versionId=abc"));
+        assert!(has_parquet_extension("file:///x/y/z.parquet/"));
+        assert!(!has_parquet_extension("s3://bucket/data"));
+        assert!(!has_parquet_extension("s3://bucket/data/"));
+        assert!(!has_parquet_extension("s3://bucket/x.parquet.bak"));
+        // Extension look-alikes in the QUERY string must not classify.
+        assert!(!has_parquet_extension("s3://bucket/dir?file=a.parquet"));
+    }
+
+    #[tokio::test]
+    async fn magic_probe_accepts_parquet_and_rejects_other_content() {
+        let store = InMemory::new();
+        let good = Path::from("data/real.parquet");
+        let bad = Path::from("data/fake.parquet");
+        // A real parquet layout: PAR1 header … footer … footer-len … PAR1.
+        let mut good_bytes = b"PAR1rowgroups...".to_vec();
+        good_bytes.extend_from_slice(b"\x08\x00\x00\x00PAR1");
+        store
+            .put(&good, PutPayload::from(good_bytes))
+            .await
+            .unwrap();
+        store
+            .put(&bad, PutPayload::from_static(b"NOPE...."))
+            .await
+            .unwrap();
+
+        let mode = ParquetDetect::ExtensionAndMagicBytes;
+        assert!(detect_parquet_object(&store, &good, mode).await.unwrap());
+        assert!(!detect_parquet_object(&store, &bad, mode).await.unwrap());
+        // Extension-only mode accepts both with no content probe.
+        let cheap = ParquetDetect::Extension;
+        assert!(detect_parquet_object(&store, &bad, cheap).await.unwrap());
+
+        // Trailing (footer) probe: same verdicts, using the size a `head`
+        // would have returned.
+        assert!(
+            verify_parquet_footer_magic_bytes(&store, &good, 24)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !verify_parquet_footer_magic_bytes(&store, &bad, 8)
+                .await
+                .unwrap()
+        );
+        // Smaller than header + footer-len: never a parquet file.
+        assert!(
+            !verify_parquet_footer_magic_bytes(&store, &bad, 4)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn magic_probe_surfaces_store_errors() {
+        let store = InMemory::new();
+        let missing = Path::from("data/absent.parquet");
+        let err = verify_parquet_magic_bytes(&store, &missing)
+            .await
+            .expect_err("missing object must error, not classify");
+        assert!(
+            err.to_string()
+                .to_lowercase()
+                .contains("parquet magic probe")
+        );
+    }
+
+    #[test]
+    fn from_env_defaults_to_extension_only() {
+        // SAFETY: single-threaded test (this binary's tests do not read
+        // PROXIMADB_PARQUET_MAGIC_VERIFY concurrently); edition-2024 unsafe
+        // env mutation, same pattern as the pgwire e2e harnesses.
+        unsafe {
+            std::env::remove_var("PROXIMADB_PARQUET_MAGIC_VERIFY");
+            assert_eq!(ParquetDetect::from_env(), ParquetDetect::Extension);
+            std::env::set_var("PROXIMADB_PARQUET_MAGIC_VERIFY", "off");
+            assert_eq!(ParquetDetect::from_env(), ParquetDetect::Extension);
+            std::env::set_var("PROXIMADB_PARQUET_MAGIC_VERIFY", "1");
+            assert_eq!(
+                ParquetDetect::from_env(),
+                ParquetDetect::ExtensionAndMagicBytes
+            );
+            std::env::remove_var("PROXIMADB_PARQUET_MAGIC_VERIFY");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     /// TD-OBJSTORE-1 (#960): the documented `adls://`/`gcs://` aliases must

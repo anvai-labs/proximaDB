@@ -41,12 +41,14 @@ use parquet::file::statistics::Statistics as ParquetStatistics;
 use proximadb_bloom::{BloomFilterBuilder, BloomFilterStrategy, CoreBloomFilterConfig};
 use proximadb_iceberg_engine::IcebergObjectStoreBridge;
 use proximadb_iceberg_engine::deletion_vector::PositionDeletes;
+use proximadb_object_store::{
+    ParquetDetect, has_parquet_extension, verify_parquet_footer_magic_bytes,
+};
 use proximadb_storage_common::format_splits::{
     ColumnBounds, FileSplit, ScalarPredicate, ScalarValue, SplitStatistics, SplitType,
 };
 use proximadb_storage_common::object_store_bridge::ObjectStoreBridge;
 use proximadb_storage_common::parquet_page_prune::page_row_selection;
-use url::Url;
 
 use super::super::physical_filter_translate::df_scalar_value;
 use super::super::proxima_scan_exec::{ProximaScanExec, SplitReader};
@@ -110,6 +112,33 @@ fn df_err(context: &str, err: impl std::fmt::Display) -> DataFusionError {
     DataFusionError::Execution(format!("{context}: {err}"))
 }
 
+/// Optional fail-closed magic-byte gate (`PROXIMADB_PARQUET_MAGIC_VERIFY=1`,
+/// default OFF). Uses the FOOTER magic (last 4 bytes) — a parquet file ends
+/// with the same `PAR1` it opens with, and this gate runs right after the
+/// `head` the open performs anyway, so when enabled the probe is the only
+/// extra GET. Default behavior is unchanged: extension evidence alone
+/// dispatches the open.
+async fn verify_parquet_magic_if_enabled(
+    store: &dyn ObjectStore,
+    path: &Path,
+    size: u64,
+    location: &str,
+) -> DFResult<()> {
+    if !ParquetDetect::from_env().verifies_magic_bytes() {
+        return Ok(());
+    }
+    if !verify_parquet_footer_magic_bytes(store, path, size)
+        .await
+        .map_err(|e| df_err(&format!("parquet footer magic probe {path}"), e))?
+    {
+        return Err(df_err(
+            "parquet magic verify",
+            format!("{location} lacks the trailing PAR1 footer magic — not a parquet object"),
+        ));
+    }
+    Ok(())
+}
+
 /// Build the per-query traced object store for `location` WITHOUT any discovery
 /// I/O (no LIST/HEAD/footer). Used on a table-OPEN cache hit: the store must be
 /// re-created per query because [`TracingObjectStore::wrap`] captures the
@@ -117,11 +146,16 @@ fn df_err(context: &str, err: impl std::fmt::Display) -> DataFusionError {
 /// later queries' `bytes_read`. Mirrors the store creation inside
 /// `open_direct_object` / `open_bridge_base`.
 fn build_traced_store(location: &str) -> DFResult<Arc<dyn ObjectStore>> {
-    if location.ends_with(".parquet") {
-        let parsed = Url::parse(location).map_err(|e| df_err("parse object-store url", e))?;
-        let (store, _path) =
-            object_store::parse_url(&parsed).map_err(|e| df_err("object_store parse_url", e))?;
-        Ok(TracingObjectStore::wrap(Arc::from(store)))
+    if has_parquet_extension(location) {
+        // Same resolution contract as `open_direct_object` (shared factory,
+        // env-forwarded) so a cache hit builds the SAME store the miss built.
+        // NOTE: deliberately NO magic-byte probe here — this path is
+        // contractually zero-discovery-I/O (see doc above); verification
+        // happens once, on the open (`open_direct_object`) path.
+        let (store, _path) = proximadb_object_store::store_for_url(location)
+            .map_err(|e| df_err(&format!("object-store url {location}"), e))?;
+        let store: Arc<dyn ObjectStore> = TracingObjectStore::wrap(store);
+        Ok(store)
     } else {
         let bridge = IcebergObjectStoreBridge::from_url(location)
             .map_err(|e| df_err(&format!("object-store bridge({location})"), e))?;
@@ -883,7 +917,7 @@ impl ObjectStoreParquetTable {
     /// Open either a ProximaDB base-prefix location (`data/*.parquet`) or a
     /// direct external `.parquet` object.
     pub async fn open(location: &str) -> DFResult<Self> {
-        if location.ends_with(".parquet") {
+        if has_parquet_extension(location) {
             return Self::open_direct_object(location).await;
         }
         Self::open_bridge_base(location).await
@@ -948,7 +982,7 @@ impl ObjectStoreParquetTable {
         let mut paths: Vec<Path> = snapshot
             .data_files
             .into_iter()
-            .filter(|p| p.as_ref().ends_with(".parquet"))
+            .filter(|p| has_parquet_extension(p.as_ref()))
             .collect();
         if paths.is_empty() {
             return Err(df_err(
@@ -1043,7 +1077,7 @@ impl ObjectStoreParquetTable {
             .await
             .unwrap_or_default()
             .into_iter()
-            .filter(|path| path.as_ref().ends_with(".parquet"))
+            .filter(|path| has_parquet_extension(path.as_ref()))
             .collect::<Vec<_>>();
         if parquet_paths.is_empty() {
             parquet_paths = bridge
@@ -1051,7 +1085,7 @@ impl ObjectStoreParquetTable {
                 .await
                 .map_err(|e| df_err(&format!("list parquet data/ fallback {location}"), e))?
                 .into_iter()
-                .filter(|path| path.as_ref().ends_with(".parquet"))
+                .filter(|path| has_parquet_extension(path.as_ref()))
                 .collect::<Vec<_>>();
         }
         parquet_paths.sort_by(|a, b| a.as_ref().cmp(b.as_ref()));
@@ -1097,15 +1131,20 @@ impl ObjectStoreParquetTable {
     }
 
     async fn open_direct_object(location: &str) -> DFResult<Self> {
-        let parsed = Url::parse(location).map_err(|e| df_err("parse object-store url", e))?;
-        let (store, path) =
-            object_store::parse_url(&parsed).map_err(|e| df_err("object_store parse_url", e))?;
-        let store: Arc<dyn ObjectStore> = TracingObjectStore::wrap(Arc::from(store));
+        // Resolve through the shared factory rather than a bare `object_store::parse_url`:
+        // the factory forwards the process environment (`AWS_*`/`AZURE_*`/`GOOGLE_*`
+        // endpoint/credential keys) and normalizes the ProximaDB scheme aliases, which a
+        // bare parse silently drops — a single-object `s3://` location against an
+        // S3-compatible endpoint would otherwise ignore its endpoint/credentials.
+        let (store, path) = proximadb_object_store::store_for_url(location)
+            .map_err(|e| df_err(&format!("object-store url {location}"), e))?;
+        let store: Arc<dyn ObjectStore> = TracingObjectStore::wrap(store);
         let size = store
             .head(&path)
             .await
             .map_err(|e| df_err(&format!("head {path}"), e))?
             .size;
+        verify_parquet_magic_if_enabled(store.as_ref(), &path, size, location).await?;
         Self::open_files(
             store,
             vec![(path, Some(size))],

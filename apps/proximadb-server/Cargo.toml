@@ -63,6 +63,10 @@ coreml = ["onnx", "proximadb-embedding/coreml"]
 # "Unsupported filesystem scheme: adls" (resp. s3/gcs) when storage points at
 # a cloud URL — the default build only has the local `file://` backend.
 aws = ["proximadb/aws"]
+# DuckDB compat route engine (PROXIMADB_DUCKDB_ROUTE, runtime-gated OFF by
+# default); this feature only links the engine so operators can run the
+# wrapper binary.
+duckdb = ["proximadb/duckdb"]
 azure = ["proximadb/azure"]
 gcp = ["proximadb/gcp"]
 # Convenience: all three cloud backends (mirrors the root crate's cloud-full).
