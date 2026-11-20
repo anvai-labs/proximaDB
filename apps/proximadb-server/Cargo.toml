@@ -65,7 +65,7 @@ coreml = ["onnx", "proximadb-embedding/coreml"]
 aws = ["proximadb/aws"]
 # DuckDB compat route engine (PROXIMADB_DUCKDB_ROUTE, runtime-gated OFF by
 # default); this feature only links the engine so operators can run the
-# wrapper binary.
+# wrapper binary. Pair with `aws` (etc.) to scan external S3 (etc.) locations.
 duckdb = ["proximadb/duckdb"]
 azure = ["proximadb/azure"]
 gcp = ["proximadb/gcp"]
