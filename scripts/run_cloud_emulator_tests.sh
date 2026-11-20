@@ -20,7 +20,7 @@
 #            it, and recovers catalog + WAL-replays collections on a fresh local
 #            disk. Compiles the server binary, so it gets its OWN scope/job (kept
 #            off --fast/--all's compile budget).
-#   --restart [build-server|build-library|setup CIDFILE|test CIDFILE|cleanup CIDFILE]
+#   --restart [build-server|build-library|setup|test|cleanup STATE_DIR]
 #            Split the restart proof into CI steps. With no phase, run all steps.
 #
 # Requires: Docker, Cargo, and the Azure CLI. --qa and --restart also use
@@ -38,14 +38,17 @@ cd "$ROOT_DIR"
 # adds the cold-payload azure round-trip, which compiles the full main crate.
 SCOPE="all"
 RESTART_PHASE=""
-RESTART_CIDFILE=""
+RESTART_STATE=""
 if [ "${1:-}" = "--restart" ]; then
   SCOPE="restart"
   RESTART_PHASE="${2:-all}"
   case "$RESTART_PHASE:$#" in
-    all:1|build-server:2|build-library:2) ;;
-    setup:3|test:3|cleanup:3) RESTART_CIDFILE="$3" ;;
-    *) echo "::error::invalid --restart phase or missing container ID file"; exit 2 ;;
+    all:1) ;;
+    build-server:3|build-library:3|setup:3|test:3|cleanup:3)
+      [ -n "$3" ] || { echo "::error::missing restart state directory"; exit 2; }
+      RESTART_STATE="$3"
+      ;;
+    *) echo "::error::invalid --restart phase or missing state directory"; exit 2 ;;
   esac
   set --
 fi
@@ -143,12 +146,17 @@ wait_port() { # $1=port $2=name $3=attempts (default 30)
   echo "::error::$2 (:$1) did not come up"; diagnose "$2"; return 1
 }
 
-restart_server_tests() {
-  cargo nextest run -p proximadb-server --features azure --test object_store_restart_recovery "$@"
+restart_build_server() {
+  mkdir -p -- "$RESTART_STATE"
+  cargo metadata --locked --format-version 1 > "$RESTART_STATE/cargo.json"
+  cargo nextest list -p proximadb-server --features azure --test object_store_restart_recovery \
+    --list-type binaries-only --message-format json > "$RESTART_STATE/server.json"
 }
 
-restart_library_tests() {
-  cargo nextest run -p proximadb --features azure --lib "$@"
+restart_build_library() {
+  mkdir -p -- "$RESTART_STATE"
+  cargo nextest list -p proximadb --features azure --lib \
+    --list-type binaries-only --message-format json > "$RESTART_STATE/library.json"
 }
 
 restart_azurite_endpoint() {
@@ -160,9 +168,9 @@ restart_azurite_endpoint() {
 restart_setup() {
   local cid endpoint conn
   echo "==> Starting pinned Azurite (Docker)"
-  docker run -d --rm --cidfile "$RESTART_CIDFILE" -p 127.0.0.1::10000 \
+  docker run -d --rm --cidfile "$RESTART_STATE/azurite.cid" -p 127.0.0.1::10000 \
     "$AZURITE_IMAGE" azurite-blob --blobHost 0.0.0.0 --skipApiVersionCheck >/dev/null
-  cid="$(cat "$RESTART_CIDFILE")"
+  cid="$(cat "$RESTART_STATE/azurite.cid")"
   endpoint="$(restart_azurite_endpoint "$cid")"
   wait_port "${endpoint##*:}" "$cid"
   conn="${AZURITE_CONN/127.0.0.1:10000/${endpoint#http://}}"
@@ -172,17 +180,21 @@ restart_setup() {
 
 restart_test() {
   local cid
-  local -a run_args=(--profile integration --run-ignored only --retries 0 --no-tests fail)
-  cid="$(cat "$RESTART_CIDFILE")"
+  # Reuse the exact outputs of the preceding builds. Running Cargo again here
+  # can rebuild both package graphs as their feature unification changes.
+  local -a run_args=(--cargo-metadata "$RESTART_STATE/cargo.json"
+    --profile integration --run-ignored only --retries 0 --no-tests fail
+    --success-output never)
+  cid="$(cat "$RESTART_STATE/azurite.cid")"
   AZURITE_BLOB_STORAGE_URL="$(restart_azurite_endpoint "$cid")"
   export AZURITE_BLOB_STORAGE_URL
   export PROXIMADB_AZURE_EMULATOR=1 AZURE_STORAGE_USE_EMULATOR=true AZURE_ALLOW_HTTP=true
   export AZURE_STORAGE_ACCOUNT=devstoreaccount1 AZURE_STORAGE_ACCOUNT_NAME=devstoreaccount1
   export PROXIMADB_OBJECT_STORE_URL="adls://$CONTAINER_BUCKET/objstore-restart-recovery"
   echo "==> TD-OBJSTORE-5 S1: full-server restart recovery over Azurite (adls://)"
-  restart_server_tests "${run_args[@]}"
+  cargo nextest run "${run_args[@]}" --binaries-metadata "$RESTART_STATE/server.json"
   echo "==> TD-CACHE-7 and spill: object-store contracts over Azurite (adls://)"
-  restart_library_tests "${run_args[@]}" \
+  cargo nextest run "${run_args[@]}" --binaries-metadata "$RESTART_STATE/library.json" \
     -E 'test(/::warm_manifest_round_trips_on_object_store$/)
       | test(/::a_missing_object_is_not_found_on_object_store$/)
       | test(/::spill_segments_round_trip_on_object_store$/)
@@ -190,10 +202,11 @@ restart_test() {
 }
 
 restart_cleanup() {
-  if [ -s "$RESTART_CIDFILE" ]; then
-    docker rm -f "$(cat "$RESTART_CIDFILE")" >/dev/null || true
+  if [ -s "$RESTART_STATE/azurite.cid" ]; then
+    docker rm -f "$(cat "$RESTART_STATE/azurite.cid")" >/dev/null || true
   fi
-  rm -f -- "$RESTART_CIDFILE"
+  rm -f -- "$RESTART_STATE/azurite.cid" "$RESTART_STATE/cargo.json" \
+    "$RESTART_STATE/server.json" "$RESTART_STATE/library.json"
 }
 
 if [ "$SCOPE" = "restart" ]; then
@@ -201,17 +214,16 @@ if [ "$SCOPE" = "restart" ]; then
   # Serialize by default for the hosted runner's memory budget.
   export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-1}"
   case "$RESTART_PHASE" in
-    build-server) restart_server_tests --no-run ;;
-    build-library) restart_library_tests --no-run ;;
+    build-server) restart_build_server ;;
+    build-library) restart_build_library ;;
     setup) restart_setup ;;
     test) restart_test ;;
     cleanup) restart_cleanup ;;
     all)
-      RESTART_TEMP="$(mktemp -d)"
-      RESTART_CIDFILE="$RESTART_TEMP/azurite.cid"
-      trap 'restart_cleanup; rmdir "$RESTART_TEMP"' EXIT
-      restart_server_tests --no-run
-      restart_library_tests --no-run
+      RESTART_STATE="$(mktemp -d)"
+      trap 'restart_cleanup; rmdir "$RESTART_STATE"' EXIT
+      restart_build_server
+      restart_build_library
       restart_setup
       restart_test
       ;;

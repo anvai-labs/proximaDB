@@ -64,7 +64,8 @@ their last active phase and the cause of the lost communication are unknown.
 
 1. Separate the two compiles, Azurite fixture bootstrap, and test execution into
    distinct GitHub Actions steps with per-phase timeouts. Build logs record peak
-   RSS and wall time. The fixture uses the pinned MCR image on a dynamically
+   RSS and wall time. Nextest runs the binaries named by the saved build metadata
+   on the same runner. The fixture uses the pinned MCR image on a dynamically
    assigned loopback port and needs only the Azure CLI.
 2. Pilot a higher-memory runner (pinned setup, more build jobs) for the two Azure build
    shapes, cold and warm trees; record peak RSS, swap, disk and cost. The prior sccache

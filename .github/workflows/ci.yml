@@ -3014,26 +3014,23 @@ jobs:
         env:
           RUSTC_WRAPPER: sccache
           SCCACHE_DIR: /home/runner/.cache/sccache
-        run: /usr/bin/time -v bash scripts/run_cloud_emulator_tests.sh --restart build-server
+        run: /usr/bin/time -v bash scripts/run_cloud_emulator_tests.sh --restart build-server "$RUNNER_TEMP/proximadb-restart"
       - name: Build the Azure library tests
         timeout-minutes: 60
         env:
           RUSTC_WRAPPER: sccache
           SCCACHE_DIR: /home/runner/.cache/sccache
-        run: /usr/bin/time -v bash scripts/run_cloud_emulator_tests.sh --restart build-library
+        run: /usr/bin/time -v bash scripts/run_cloud_emulator_tests.sh --restart build-library "$RUNNER_TEMP/proximadb-restart"
       - name: Start Azurite and create the test container
         timeout-minutes: 5
-        run: bash scripts/run_cloud_emulator_tests.sh --restart setup "$RUNNER_TEMP/proximadb-azurite.cid"
+        run: bash scripts/run_cloud_emulator_tests.sh --restart setup "$RUNNER_TEMP/proximadb-restart"
       - name: Run restart recovery and object-store contracts over Azurite (adls://)
         timeout-minutes: 15
-        env:
-          RUSTC_WRAPPER: sccache
-          SCCACHE_DIR: /home/runner/.cache/sccache
-        run: bash scripts/run_cloud_emulator_tests.sh --restart test "$RUNNER_TEMP/proximadb-azurite.cid"
+        run: bash scripts/run_cloud_emulator_tests.sh --restart test "$RUNNER_TEMP/proximadb-restart"
       - name: Stop Azurite
         if: always()
         timeout-minutes: 2
-        run: bash scripts/run_cloud_emulator_tests.sh --restart cleanup "$RUNNER_TEMP/proximadb-azurite.cid"
+        run: bash scripts/run_cloud_emulator_tests.sh --restart cleanup "$RUNNER_TEMP/proximadb-restart"
 
       - name: Job timing (report)
         if: always()
