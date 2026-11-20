@@ -95,7 +95,7 @@ pub mod iceberg;
 pub mod manifest;
 pub mod metadata;
 mod metadata_gc;
-pub use metadata_gc::{MetadataGcPlan, plan_metadata_gc};
+pub use metadata_gc::{MetadataGcPlan, TipEvidence, below_tip_evidence, plan_metadata_gc};
 pub mod retention;
 mod snapshot_deletes;
 pub use snapshot_deletes::{IcebergSnapshotFiles, IcebergSnapshotPlan, SnapshotDeletionVector};
@@ -676,7 +676,7 @@ impl IcebergObjectStoreBridge {
         )?;
         match committer.commit(parent, Bytes::from(json)).await? {
             CommitOutcome::Committed(target) => {
-                self.verify_commit_is_the_tip(&committer, target, snapshot_id)
+                self.verify_commit_is_the_tip(&committer, metadata_prefix, target, snapshot_id)
                     .await
             }
             conflict => Ok(conflict),
@@ -685,56 +685,41 @@ impl IcebergObjectStoreBridge {
 
     /// TD-SPINE-3 review M1: metadata GC frees old create-only slots, so a
     /// publisher whose parent read predates a GC can win `put_if_absent` on a
-    /// slot BELOW the tip. That is not a commit: it is a conflict. After the
-    /// CAS, a version above `target` must be a successor built ON this commit
-    /// (its `parent-snapshot-id` is `snapshot_id`); anything else means the
-    /// slot was collected and reused, so the orphaned document is deleted
-    /// (best effort) and the caller sees `Conflict` — it never flips a
-    /// catalog layout to a version below the tip. A failed LIST keeps the
-    /// commit (it cannot prove a conflict); the check costs one LIST, plus
-    /// one GET when a newer version exists.
+    /// slot BELOW the tip. That is not a commit: it is a conflict. The
+    /// evidence rule is [`metadata_gc::below_tip_evidence`] (shared with
+    /// MATERIALIZE's `check_commit`): only a POSITIVE non-successor — the next
+    /// version is missing, or was read and names another parent — makes this
+    /// a conflict; the orphaned document is then deleted (best effort) and the
+    /// caller never flips a layout to it. Any read failure keeps the commit
+    /// (it proves nothing). Cost: one LIST, plus one GET when a newer version
+    /// exists.
     async fn verify_commit_is_the_tip(
         &self,
         committer: &metadata::MetadataCommitter,
+        metadata_prefix: &str,
         target: u64,
         snapshot_id: i64,
     ) -> Result<CommitOutcome, StorageError> {
-        let Ok(Some(latest)) = committer.latest_version().await else {
-            return Ok(CommitOutcome::Committed(target));
-        };
-        if latest <= target {
-            return Ok(CommitOutcome::Committed(target));
-        }
-        let built_on_us = match target.checked_add(1) {
-            Some(next) => committer
-                .read_metadata(next)
-                .await
-                .ok()
-                .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
-                .and_then(|doc| {
-                    let current = doc.get("current-snapshot-id")?.as_i64()?;
-                    doc.get("snapshots")?
-                        .as_array()?
-                        .iter()
-                        .find(|snap| {
-                            snap.get("snapshot-id").and_then(|x| x.as_i64()) == Some(current)
-                        })?
-                        .get("parent-snapshot-id")?
-                        .as_i64()
+        use metadata_gc::TipEvidence;
+        match metadata_gc::below_tip_evidence(self, metadata_prefix, target, Some(snapshot_id))
+            .await
+        {
+            TipEvidence::NotBuiltOn { latest } => {
+                let orphan = Path::from(committer.metadata_location(target));
+                if let Err(e) = self.store.delete(&orphan).await {
+                    tracing::warn!(
+                        %orphan,
+                        "iceberg-engine: orphaned below-tip commit not deleted: {e}"
+                    );
+                }
+                Ok(CommitOutcome::Conflict {
+                    latest: Some(latest),
                 })
-                .is_some_and(|parent| parent == snapshot_id),
-            None => false,
-        };
-        if built_on_us {
-            return Ok(CommitOutcome::Committed(target));
+            }
+            TipEvidence::AtTip | TipEvidence::BuiltOn | TipEvidence::Unknown => {
+                Ok(CommitOutcome::Committed(target))
+            }
         }
-        let orphan = Path::from(committer.metadata_location(target));
-        if let Err(e) = self.store.delete(&orphan).await {
-            tracing::warn!(%orphan, "iceberg-engine: orphaned below-tip commit not deleted: {e}");
-        }
-        Ok(CommitOutcome::Conflict {
-            latest: Some(latest),
-        })
     }
 
     /// Create-only write of one generation-named metadata object. `Some(Conflict)` when

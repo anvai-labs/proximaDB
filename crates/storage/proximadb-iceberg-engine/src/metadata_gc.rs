@@ -40,7 +40,7 @@ use std::collections::HashSet;
 use object_store::ObjectStoreExt;
 use object_store::path::Path;
 use proximadb_kernel::error::StorageError;
-use proximadb_storage_common::object_store_bridge::IcebergMetadataGcReport;
+use proximadb_storage_common::object_store_bridge::{IcebergMetadataGcReport, ObjectStoreBridge};
 
 use crate::{IcebergObjectStoreBridge, iceberg, read_err, retention};
 
@@ -118,6 +118,83 @@ pub fn plan_metadata_gc(
         .cloned()
         .collect();
     MetadataGcPlan { floor, tip, delete }
+}
+
+/// Whether committed metadata `version` is (still) on the table's line of
+/// history, from positive evidence only (TD-SPINE-3 review M1/M1b/M1c).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TipEvidence {
+    /// No version above it: it is the tip.
+    AtTip,
+    /// The next version's current snapshot names it as parent.
+    BuiltOn,
+    /// A newer version exists and the next version is missing, or was read
+    /// and names another parent: `version` won a GC-freed slot below the tip.
+    NotBuiltOn { latest: u64 },
+    /// A read failed or a document did not parse: nothing is proven.
+    Unknown,
+}
+
+fn current_snapshot(doc: &serde_json::Value) -> Option<&serde_json::Value> {
+    let current = doc.get("current-snapshot-id")?.as_i64()?;
+    doc.get("snapshots")?
+        .as_array()?
+        .iter()
+        .find(|snap| snap.get("snapshot-id").and_then(|x| x.as_i64()) == Some(current))
+}
+
+/// Classify `version` under `metadata_prefix` (see [`TipEvidence`]).
+/// `snapshot_id` is `version`'s current snapshot id when the caller knows it;
+/// otherwise it is read from the document. One LIST, plus GETs only when a
+/// newer version exists.
+pub async fn below_tip_evidence(
+    bridge: &dyn ObjectStoreBridge,
+    metadata_prefix: &str,
+    version: u64,
+    snapshot_id: Option<i64>,
+) -> TipEvidence {
+    let latest = match bridge.latest_metadata_version(metadata_prefix).await {
+        Ok(Some(latest)) => latest,
+        Ok(None) => return TipEvidence::AtTip,
+        Err(_) => return TipEvidence::Unknown,
+    };
+    if latest <= version {
+        return TipEvidence::AtTip;
+    }
+    let ours = match snapshot_id {
+        Some(id) => id,
+        None => {
+            let Some(id) = bridge
+                .read_table_metadata(metadata_prefix, version)
+                .await
+                .ok()
+                .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+                .and_then(|doc| doc.get("current-snapshot-id").and_then(|x| x.as_i64()))
+            else {
+                return TipEvidence::Unknown;
+            };
+            id
+        }
+    };
+    let Some(next) = version.checked_add(1) else {
+        return TipEvidence::Unknown;
+    };
+    match bridge.read_table_metadata(metadata_prefix, next).await {
+        Err(StorageError::NotFound(_)) => TipEvidence::NotBuiltOn { latest },
+        Err(_) => TipEvidence::Unknown,
+        Ok(bytes) => {
+            let Ok(doc) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+                return TipEvidence::Unknown;
+            };
+            let Some(snapshot) = current_snapshot(&doc) else {
+                return TipEvidence::Unknown;
+            };
+            match snapshot.get("parent-snapshot-id").and_then(|p| p.as_i64()) {
+                Some(parent) if parent == ours => TipEvidence::BuiltOn,
+                _ => TipEvidence::NotBuiltOn { latest },
+            }
+        }
+    }
 }
 
 impl IcebergObjectStoreBridge {

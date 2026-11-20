@@ -4527,6 +4527,64 @@ fn check_materialize_metadata_gc(disabled: bool) {
     });
 }
 
+/// TD-SPINE-3 review MED (c): when a stale publisher's below-tip win could
+/// not be cleaned up (its orphan delete failed), `check_commit` must NOT
+/// report it `Landed` — MATERIALIZE would flip the catalog and run GC from a
+/// version below the tip. Simulated by rewriting the NEXT version's parent so
+/// v1 is no longer on the line of history; the untouched state is the
+/// positive control.
+#[cfg(feature = "datafusion-integration")]
+#[test]
+fn check_commit_never_lands_a_version_below_the_tip_that_nothing_builds_on() {
+    crate::query::execution::test_runtime::run_with_timeout(60, async {
+        use super::materialize_stream::{CommitCheck, check_commit};
+        let inv = InvFixture::new("below-tip.wal", 4).await;
+        let location = inv.materialize().await;
+        let (prefix, metadata_prefix) = inv.prefixes(&location);
+        inv.exec("UPDATE inv SET qty = 50 WHERE id = 'i0';").await;
+        inv.materialize().await;
+        let v1_files = published_data_files(&inv.bridge, &prefix).await;
+        for round in 1..3 {
+            inv.exec(&format!(
+                "UPDATE inv SET qty = {} WHERE id = 'i{round}';",
+                60 + round
+            ))
+            .await;
+            inv.materialize().await;
+        }
+        let first = std::slice::from_ref(&v1_files[0]);
+        assert_eq!(
+            check_commit(&*inv.bridge, &metadata_prefix, 1, first, None).await,
+            CommitCheck::Landed(1),
+            "control: v1 is on the line of history (v2 builds on it)"
+        );
+        let mut v2: serde_json::Value = serde_json::from_slice(
+            &inv.bridge
+                .read_table_metadata(&metadata_prefix, 2)
+                .await
+                .expect("v2"),
+        )
+        .expect("json");
+        v2["snapshots"][0]["parent-snapshot-id"] = serde_json::json!(999_999);
+        inv.bridge
+            .object_store()
+            .put(
+                &object_store::path::Path::from(format!(
+                    "{metadata_prefix}/v{:020}.metadata.json",
+                    2
+                )),
+                bytes::Bytes::from(v2.to_string()),
+            )
+            .await
+            .expect("rewrite v2");
+        assert_eq!(
+            check_commit(&*inv.bridge, &metadata_prefix, 1, first, None).await,
+            CommitCheck::Unknown,
+            "a below-tip version nothing builds on is never Landed"
+        );
+    });
+}
+
 #[cfg(feature = "datafusion-integration")]
 #[test]
 fn materialize_metadata_gc_keeps_only_the_window() {

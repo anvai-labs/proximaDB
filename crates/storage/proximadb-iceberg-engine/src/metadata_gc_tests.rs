@@ -397,3 +397,210 @@ async fn a_listing_missing_a_window_version_skips_gc() {
         assert_eq!(metadata_names(&b).await, before);
     }
 }
+
+/// An in-memory store that fails GETs and/or deletes of one exact path.
+#[derive(Debug)]
+struct FaultStore {
+    inner: Arc<InMemory>,
+    fail_get: std::sync::Mutex<Option<Path>>,
+    fail_delete: std::sync::Mutex<Option<Path>>,
+}
+
+impl std::fmt::Display for FaultStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("FaultStore")
+    }
+}
+
+fn injected(what: &str) -> object_store::Error {
+    object_store::Error::Generic {
+        store: "FaultStore",
+        source: Box::new(std::io::Error::other(format!("injected {what} failure"))),
+    }
+}
+
+#[async_trait::async_trait]
+impl object_store::ObjectStore for FaultStore {
+    async fn put_opts(
+        &self,
+        path: &Path,
+        payload: object_store::PutPayload,
+        options: object_store::PutOptions,
+    ) -> object_store::Result<object_store::PutResult> {
+        self.inner.put_opts(path, payload, options).await
+    }
+    async fn put_multipart_opts(
+        &self,
+        p: &Path,
+        o: object_store::PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        self.inner.put_multipart_opts(p, o).await
+    }
+    async fn get_opts(
+        &self,
+        p: &Path,
+        o: object_store::GetOptions,
+    ) -> object_store::Result<object_store::GetResult> {
+        if self
+            .fail_get
+            .lock()
+            .map(|g| g.as_ref() == Some(p))
+            .unwrap_or(false)
+        {
+            return Err(injected("GET"));
+        }
+        self.inner.get_opts(p, o).await
+    }
+    fn delete_stream(
+        &self,
+        paths: futures::stream::BoxStream<'static, object_store::Result<Path>>,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<Path>> {
+        let fail = self.fail_delete.lock().ok().and_then(|g| g.clone());
+        let inner = self.inner.clone();
+        Box::pin(paths.then(move |p| {
+            let fail = fail.clone();
+            let inner = inner.clone();
+            async move {
+                let p = p?;
+                if fail.as_ref() == Some(&p) {
+                    return Err(injected("DELETE"));
+                }
+                object_store::ObjectStoreExt::delete(inner.as_ref(), &p).await?;
+                Ok(p)
+            }
+        }))
+    }
+    fn list(
+        &self,
+        p: Option<&Path>,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+        self.inner.list(p)
+    }
+    async fn list_with_delimiter(
+        &self,
+        p: Option<&Path>,
+    ) -> object_store::Result<object_store::ListResult> {
+        self.inner.list_with_delimiter(p).await
+    }
+    async fn copy_opts(
+        &self,
+        a: &Path,
+        b: &Path,
+        o: object_store::CopyOptions,
+    ) -> object_store::Result<()> {
+        self.inner.copy_opts(a, b, o).await
+    }
+}
+
+fn fault_bridge() -> (IcebergObjectStoreBridge, Arc<FaultStore>) {
+    let store = Arc::new(FaultStore {
+        inner: Arc::new(InMemory::new()),
+        fail_get: std::sync::Mutex::new(None),
+        fail_delete: std::sync::Mutex::new(None),
+    });
+    let b = IcebergObjectStoreBridge::new(ProximaObjectStore::new(store.clone()))
+        .with_root_url("memory:///");
+    (b, store)
+}
+
+fn meta_path(v: u64) -> Path {
+    Path::from(format!("{META}/v{v:020}.metadata.json"))
+}
+
+async fn stale_publish(b: &IcebergObjectStoreBridge, parent: u64) -> Result<u64, StorageError> {
+    let own = part(b, &format!("t/data/stale-{parent}.parquet"), &[9]).await;
+    b.publish_iceberg_files(
+        &[own],
+        Some(parent),
+        META,
+        "uuid-gc",
+        "memory:///t",
+        &fields(),
+        5000,
+        1_900_000_000_000,
+        iceberg::FormatVersion::V3,
+    )
+    .await
+}
+
+/// Review LOW (a): the stale publisher lands in a freed slot AND the next
+/// version is also collected (missing) — still a conflict, never a commit.
+#[tokio::test]
+async fn a_below_tip_win_whose_successor_is_also_collected_is_a_conflict() {
+    let b = bridge();
+    publish_generations(&b, 6).await;
+    for v in [1, 2] {
+        b.store.delete(&meta_path(v)).await.expect("collect");
+    }
+    let err = stale_publish(&b, 0).await.expect_err("conflict");
+    assert!(matches!(err, StorageError::AlreadyExists(_)), "{err:?}");
+    assert_eq!(b.latest_metadata_version(META).await.expect("tip"), Some(5));
+    assert!(
+        !metadata_names(&b)
+            .await
+            .contains(&format!("v{:020}.metadata.json", 1))
+    );
+}
+
+/// Review LOW (b): a transient GET error on the next version proves nothing,
+/// so the commit is kept (never deleted as an orphan) — same rule as a
+/// failed LIST.
+#[tokio::test]
+async fn a_transient_successor_read_error_keeps_the_commit() {
+    let (b, store) = fault_bridge();
+    publish_generations(&b, 6).await;
+    b.store.delete(&meta_path(1)).await.expect("collect v1");
+    *store.fail_get.lock().expect("lock") = Some(meta_path(2));
+    let v = stale_publish(&b, 0)
+        .await
+        .expect("kept on an unproven read");
+    assert_eq!(v, 1);
+    assert!(
+        metadata_names(&b)
+            .await
+            .contains(&format!("v{:020}.metadata.json", 1))
+    );
+    assert_eq!(
+        below_tip_evidence(&b, META, 1, None).await,
+        TipEvidence::Unknown
+    );
+    // Once the read succeeds, the same state is positively a below-tip win.
+    *store.fail_get.lock().expect("lock") = None;
+    assert_eq!(
+        below_tip_evidence(&b, META, 1, None).await,
+        TipEvidence::NotBuiltOn { latest: 5 }
+    );
+}
+
+/// Review MED (c): the orphan delete fails, so the below-tip document stays.
+/// The publisher still sees a conflict, and the shared evidence rule that
+/// MATERIALIZE's `check_commit` uses classifies the leftover as NOT on the
+/// line of history (so it is never `Landed`, never flipped).
+#[tokio::test]
+async fn a_failed_orphan_delete_still_never_reads_as_landed() {
+    let (b, store) = fault_bridge();
+    publish_generations(&b, 6).await;
+    b.store.delete(&meta_path(1)).await.expect("collect v1");
+    *store.fail_delete.lock().expect("lock") = Some(meta_path(1));
+    let err = stale_publish(&b, 0).await.expect_err("conflict");
+    assert!(matches!(err, StorageError::AlreadyExists(_)), "{err:?}");
+    assert!(
+        metadata_names(&b)
+            .await
+            .contains(&format!("v{:020}.metadata.json", 1)),
+        "the injected failure left the orphan in place"
+    );
+    assert_eq!(
+        below_tip_evidence(&b, META, 1, None).await,
+        TipEvidence::NotBuiltOn { latest: 5 }
+    );
+    // Controls: a version on the line of history is BuiltOn, the tip AtTip.
+    assert_eq!(
+        below_tip_evidence(&b, META, 4, None).await,
+        TipEvidence::BuiltOn
+    );
+    assert_eq!(
+        below_tip_evidence(&b, META, 5, None).await,
+        TipEvidence::AtTip
+    );
+}
