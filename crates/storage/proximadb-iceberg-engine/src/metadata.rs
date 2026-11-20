@@ -65,6 +65,37 @@ impl MetadataCommitter {
             .max())
     }
 
+    /// The highest committed metadata version with a revision token of its
+    /// object, from the SAME LIST [`latest_version`](Self::latest_version)
+    /// issues (no extra request). The token (path, e-tag, last-modified, size)
+    /// changes if the slot is ever re-created — a dropped and re-created table
+    /// restarts at v0 — so a cache keyed on it can never serve the old table.
+    pub async fn latest_version_revision(&self) -> Result<Option<(u64, String)>, StorageError> {
+        let prefix = Path::from(self.prefix.as_str());
+        let metas = self.store.list(Some(&prefix)).await?;
+        Ok(metas
+            .iter()
+            .filter_map(|m| {
+                m.location
+                    .filename()
+                    .and_then(Self::parse_version)
+                    .map(|v| (v, m))
+            })
+            .max_by_key(|(v, _)| *v)
+            .map(|(v, m)| {
+                (
+                    v,
+                    format!(
+                        "{}|{}|{}|{}",
+                        m.location,
+                        m.e_tag.as_deref().unwrap_or(""),
+                        m.last_modified.timestamp_nanos_opt().unwrap_or_default(),
+                        m.size
+                    ),
+                )
+            }))
+    }
+
     /// Read the raw metadata-document bytes for a specific `version`.
     pub async fn read_metadata(&self, version: u64) -> Result<Bytes, StorageError> {
         self.store.get(&self.metadata_path(version)).await

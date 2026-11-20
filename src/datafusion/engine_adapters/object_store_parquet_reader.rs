@@ -54,6 +54,10 @@ use super::super::proxima_table_provider::EngineType;
 use super::super::schema_inference::{
     df_stats_value_bounds_enabled, project_statistics, statistics_from_splits,
 };
+use super::manifest_plan_cache::{
+    CachedSnapshot, FileManifestStats, ManifestPlanCache, manifest_cache_enabled,
+    manifest_prune_enabled,
+};
 use crate::observability::object_store_trace::TracingObjectStore;
 
 /// True iff `proj` selects every column in ascending order — a no-op projection
@@ -853,6 +857,11 @@ pub struct ObjectStoreParquetTable {
     /// layout's recorded version: only a base that IS the recorded publication
     /// may serve deletion vectors alongside a non-empty WAL delta.
     snapshot_version: Option<u64>,
+    /// TD-SPINE-4: each manifest-selected data file's manifest bounds, keyed
+    /// by full data-file path (empty for listed / cached / direct opens).
+    /// Consulted before row-group pruning to drop whole files a pushed-down
+    /// filter provably cannot match.
+    manifest_file_stats: Arc<HashMap<String, Arc<FileManifestStats>>>,
 }
 
 /// Metadata subdirectory beneath the table base, matching the writer's
@@ -867,6 +876,8 @@ struct ManifestSelection {
     bridge: Arc<IcebergObjectStoreBridge>,
     paths: Vec<Path>,
     deletions: HashMap<String, Arc<PositionDeletes>>,
+    /// Per-file manifest bounds (TD-SPINE-4), keyed by full data-file path.
+    file_stats: HashMap<String, Arc<FileManifestStats>>,
 }
 
 /// The same selection as absolute URIs plus each file's deleted positions, for
@@ -883,10 +894,16 @@ impl ObjectStoreParquetTable {
     /// Open either a ProximaDB base-prefix location (`data/*.parquet`) or a
     /// direct external `.parquet` object.
     pub async fn open(location: &str) -> DFResult<Self> {
+        Self::open_for_tenant(location, None).await
+    }
+
+    /// [`open`](Self::open) on behalf of `tenant`: the manifest cache
+    /// (TD-SPINE-4) accounts the parsed snapshot to that tenant's fair share.
+    pub async fn open_for_tenant(location: &str, tenant: Option<&str>) -> DFResult<Self> {
         if location.ends_with(".parquet") {
             return Self::open_direct_object(location).await;
         }
-        Self::open_bridge_base(location).await
+        Self::open_bridge_base(location, tenant).await
     }
 
     /// Derive the table base from a published data location.
@@ -926,7 +943,16 @@ impl ObjectStoreParquetTable {
     /// vectors, and each vector is decoded here (one small ranged read per
     /// vector) into the table's `deletions` map. A snapshot whose vectors
     /// cannot be decoded is an `Err` — never a silent read of deleted rows.
-    async fn manifest_selected_files(location: &str) -> DFResult<Option<ManifestSelection>> {
+    ///
+    /// TD-SPINE-4: the LIST for the latest version runs on every call (so a
+    /// new commit is seen by the next query); the parsed snapshot of that
+    /// IMMUTABLE version — files, decoded vectors, manifest bounds — is served
+    /// from the [`ManifestPlanCache`] keyed by the store base and the LISTed
+    /// object revision.
+    async fn manifest_selected_files(
+        location: &str,
+        tenant: Option<&str>,
+    ) -> DFResult<Option<ManifestSelection>> {
         let Some(base) = Self::table_base_of(location) else {
             return Ok(None);
         };
@@ -934,17 +960,33 @@ impl ObjectStoreParquetTable {
             df_err(&format!("read snapshot manifest under {base}"), e)
         };
         let bridge = Arc::new(IcebergObjectStoreBridge::from_url(&base).map_err(manifest_err)?);
-        let Some(version) = bridge
-            .latest_metadata_version(METADATA_SUBPREFIX)
+        let Some((version, revision)) = bridge
+            .latest_metadata_revision(METADATA_SUBPREFIX)
             .await
             .map_err(manifest_err)?
         else {
             return Ok(None);
         };
-        let snapshot = bridge
-            .read_iceberg_snapshot_with_deletes(METADATA_SUBPREFIX, version)
+        let cache = manifest_cache_enabled().then(ManifestPlanCache::global);
+        let key = ManifestPlanCache::key(tenant, &base, &revision);
+        if let Some(cache) = cache
+            && let Some(hit) = cache.get(&key).await
+            && hit.version == version
+        {
+            crate::observability::io_trace::record_manifest_cache(true);
+            return Ok(Some(ManifestSelection {
+                version,
+                bridge,
+                paths: hit.paths.clone(),
+                deletions: hit.deletions.clone(),
+                file_stats: hit.file_stats.clone(),
+            }));
+        }
+        let plan = bridge
+            .read_iceberg_snapshot_plan(METADATA_SUBPREFIX, version)
             .await
             .map_err(manifest_err)?;
+        let snapshot = plan.files;
         let mut paths: Vec<Path> = snapshot
             .data_files
             .into_iter()
@@ -966,11 +1008,36 @@ impl ObjectStoreParquetTable {
             let full = bridge.full_object_path(&vector.data_file);
             deletions.insert(full.as_ref().to_string(), Arc::new(decoded));
         }
+        let file_stats: HashMap<String, Arc<FileManifestStats>> = plan
+            .file_stats
+            .iter()
+            .map(|(path, stats)| {
+                (
+                    bridge.full_object_path(path).as_ref().to_string(),
+                    Arc::new(FileManifestStats::from_manifest(&plan.fields, stats)),
+                )
+            })
+            .collect();
+        if let Some(cache) = cache {
+            crate::observability::io_trace::record_manifest_cache(false);
+            cache
+                .insert(
+                    key,
+                    Arc::new(CachedSnapshot {
+                        version,
+                        paths: paths.clone(),
+                        deletions: deletions.clone(),
+                        file_stats: file_stats.clone(),
+                    }),
+                )
+                .await;
+        }
         Ok(Some(ManifestSelection {
             version,
             bridge,
             paths,
             deletions,
+            file_stats,
         }))
     }
 
@@ -981,7 +1048,7 @@ impl ObjectStoreParquetTable {
     pub async fn manifest_selected_snapshot(
         location: &str,
     ) -> DFResult<Option<ManifestReadSource>> {
-        let Some(selected) = Self::manifest_selected_files(location).await? else {
+        let Some(selected) = Self::manifest_selected_files(location, None).await? else {
             return Ok(None);
         };
         // Bound expansion before allocating row IDs for DuckDB's SQL predicate.
@@ -1014,18 +1081,20 @@ impl ObjectStoreParquetTable {
         }))
     }
 
-    async fn open_bridge_base(location: &str) -> DFResult<Self> {
+    async fn open_bridge_base(location: &str, tenant: Option<&str>) -> DFResult<Self> {
         // Manifest first; listing only when the table has no metadata log
         // (see `manifest_selected_files`).
-        if let Some(selected) = Self::manifest_selected_files(location).await? {
-            return Self::open_relative(
+        if let Some(selected) = Self::manifest_selected_files(location, tenant).await? {
+            let mut table = Self::open_relative(
                 selected.bridge,
                 selected.paths,
                 selected.deletions,
                 location,
                 Some(selected.version),
             )
-            .await;
+            .await?;
+            table.manifest_file_stats = Arc::new(selected.file_stats);
+            return Ok(table);
         }
 
         let bridge = Arc::new(
@@ -1160,6 +1229,7 @@ impl ObjectStoreParquetTable {
             stats_trust: proximadb_data_model::StatsTrust::Trusted,
             // Only the manifest path proves a version; `open_relative` stamps it.
             snapshot_version: None,
+            manifest_file_stats: Arc::default(),
         })
     }
 
@@ -1232,6 +1302,7 @@ impl ObjectStoreParquetTable {
             // A cached discovery cannot prove which metadata version it read:
             // never eligible for the ordered-DV merge (fail-closed).
             snapshot_version: None,
+            manifest_file_stats: Arc::default(),
         })
     }
 
@@ -1450,12 +1521,28 @@ impl ObjectStoreParquetTable {
 
     /// Prune splits; also returns how many of the skips needed a Bloom filter
     /// (min/max alone would have kept them).
+    /// TD-SPINE-4: the data files whose manifest bounds prove that the AND of
+    /// `filters` matches none of their rows (full paths). Empty when the
+    /// table was not opened through the manifest, there are no filters, or
+    /// `PROXIMADB_OLAP_MANIFEST_PRUNE_DISABLE` is set.
+    fn manifest_pruned_files(&self, filters: &[Expr]) -> HashSet<String> {
+        if filters.is_empty() || self.manifest_file_stats.is_empty() || !manifest_prune_enabled() {
+            return HashSet::new();
+        }
+        self.manifest_file_stats
+            .iter()
+            .filter(|(_, stats)| stats.prunes(filters))
+            .map(|(file, _)| file.clone())
+            .collect()
+    }
+
     fn prune_splits_with(
         &self,
         filters: &[Expr],
         cfg: SemijoinConfig,
         spec: SpecPruneConfig,
     ) -> (Vec<FileSplit>, usize) {
+        let manifest_pruned = self.manifest_pruned_files(filters);
         // Build this query's per-column in-list blooms once (cheap; reused across
         // every split), then hold the split-key cache for the whole pass.
         let inlist_blooms = if cfg.enabled {
@@ -1491,6 +1578,9 @@ impl ObjectStoreParquetTable {
             .splits
             .iter()
             .filter(|split| {
+                if manifest_pruned.contains(&split.file_path) {
+                    return false;
+                }
                 let pruned = filters
                     .iter()
                     .any(|filter| filter_prunes_split(split, filter, view.as_ref()));
@@ -1571,8 +1661,13 @@ impl ObjectStoreParquetTable {
             return;
         }
 
+        // Files the manifest bounds already exclude need no Bloom/key reads.
+        let manifest_pruned = self.manifest_pruned_files(filters);
         let mut missing_native: HashMap<(String, String), Vec<usize>> = HashMap::new();
         for split in &self.splits {
+            if manifest_pruned.contains(&split.file_path) {
+                continue;
+            }
             let Some(rg) = row_group_index(split) else {
                 continue;
             };
@@ -1854,6 +1949,9 @@ impl TableProvider for ObjectStoreParquetTable {
             .await;
         let (pruned, bloom_pruned) = self.prune_splits_with(filters, semijoin_cfg, spec_cfg);
         crate::observability::io_trace::record_bloom_splits_pruned(bloom_pruned as u64);
+        crate::observability::io_trace::record_manifest_files_pruned(
+            self.manifest_pruned_files(filters).len() as u64,
+        );
         // Skip-ratio evidence for the runtime-filter promotion gate
         // (TD-OLAP-3/TD-OLAP-4): candidate vs pruned splits, per query.
         crate::observability::io_trace::record_splits(
@@ -2177,7 +2275,7 @@ pub async fn open_object_store_parquet_location(
     }
 
     let table = Arc::new(
-        ObjectStoreParquetTable::open(location)
+        ObjectStoreParquetTable::open_for_tenant(location, tenant)
             .await?
             .with_table_name(stats_key)
             .with_stats_trust(stats_trust),
@@ -2221,6 +2319,167 @@ pub(crate) mod tests {
         writer.write(&batch).unwrap();
         writer.close().unwrap();
         schema
+    }
+
+    fn write_kx_parquet(path: &std::path::Path, ks: &[&str], xs: &[i64]) {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Utf8, false),
+            Field::new("x", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(ks.to_vec())),
+                Arc::new(Int64Array::from(xs.to_vec())),
+            ],
+        )
+        .unwrap();
+        let file = std::fs::File::create(path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+    }
+
+    /// Publish every parquet under `{root}/data` as the next metadata version.
+    async fn publish_listed(root: &std::path::Path, snapshot_id: i64) -> String {
+        use proximadb_storage_common::object_store_bridge::{
+            IcebergSnapshotField, ObjectStoreBridge,
+        };
+        let base_url = format!("file://{}", root.display());
+        let bridge = IcebergObjectStoreBridge::from_url(&base_url).unwrap();
+        let field = |id, name: &str, ty: &str| IcebergSnapshotField {
+            id,
+            name: name.into(),
+            type_name: ty.into(),
+            required: true,
+        };
+        bridge
+            .publish_iceberg_table(
+                &Path::from("data"),
+                METADATA_SUBPREFIX,
+                "00000000-0000-0000-0000-000000000002",
+                &format!("{base_url}/data"),
+                &[field(1, "k", "string"), field(2, "x", "long")],
+                snapshot_id,
+                snapshot_id,
+                true,
+            )
+            .await
+            .expect("publish snapshot");
+        base_url
+    }
+
+    async fn count_where(table: ObjectStoreParquetTable, predicate: &str) -> i64 {
+        let ctx = SessionContext::new();
+        ctx.register_table("t", Arc::new(table)).unwrap();
+        let batches = ctx
+            .sql(&format!("SELECT COUNT(*) FROM t WHERE {predicate}"))
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0)
+    }
+
+    /// TD-SPINE-4: manifest bounds drop whole files before row-group pruning,
+    /// and never a file holding a matching row (boundary values included).
+    #[tokio::test]
+    async fn manifest_bounds_prune_files_but_never_a_matching_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        std::fs::create_dir(&data).unwrap();
+        write_kx_parquet(&data.join("a.parquet"), &["apple", "berry"], &[1, 2]);
+        write_kx_parquet(&data.join("b.parquet"), &["melon", "peach"], &[100, 101]);
+        let base = publish_listed(tmp.path(), 1).await;
+        let location = format!("{base}/data");
+        let table = ObjectStoreParquetTable::open(&location).await.unwrap();
+        assert_eq!(table.manifest_file_stats.len(), 2, "bounds for both files");
+        let file_of = |name: &str| {
+            table
+                .manifest_file_stats
+                .keys()
+                .find(|k| k.ends_with(name))
+                .cloned()
+                .unwrap()
+        };
+        let (a, b) = (file_of("a.parquet"), file_of("b.parquet"));
+        // Boundary values keep exactly the file that holds them.
+        assert_eq!(
+            table.manifest_pruned_files(&[eq_i64("x", 2)]),
+            HashSet::from([b.clone()])
+        );
+        assert_eq!(
+            table.manifest_pruned_files(&[eq_i64("x", 100)]),
+            HashSet::from([a.clone()])
+        );
+        assert_eq!(table.manifest_pruned_files(&[gt_filter("x", 101)]).len(), 2);
+        assert!(table.manifest_pruned_files(&[gt_filter("x", 1)]).len() <= 1);
+        // End to end the counts are unchanged by pruning.
+        for (predicate, expected) in [
+            ("x = 2", 1),
+            ("x = 100", 1),
+            ("x >= 101", 1),
+            ("x <= 1", 1),
+            ("x > 101", 0),
+            ("k = 'peach'", 1),
+            ("k >= 'berry'", 3),
+            ("k IS NULL", 0),
+        ] {
+            let table = ObjectStoreParquetTable::open(&location).await.unwrap();
+            assert_eq!(count_where(table, predicate).await, expected, "{predicate}");
+        }
+    }
+
+    /// TD-SPINE-4: the second open of an unchanged version is served from the
+    /// manifest cache (proved by deleting the manifest list it would read),
+    /// and a NEW commit is seen by the next open (the LIST still runs).
+    #[tokio::test]
+    async fn manifest_cache_hit_is_identical_and_a_new_commit_is_seen() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        std::fs::create_dir(&data).unwrap();
+        write_kx_parquet(&data.join("a.parquet"), &["apple", "berry"], &[1, 2]);
+        let base = publish_listed(tmp.path(), 1).await;
+        let location = format!("{base}/data");
+        let first = ObjectStoreParquetTable::open_for_tenant(&location, Some("t1"))
+            .await
+            .unwrap();
+        let first_splits: Vec<String> = first.splits.iter().map(|s| s.split_id.clone()).collect();
+        // Remove v0's manifest list: only a cache hit can still open v0.
+        let metadata_dir = tmp.path().join(METADATA_SUBPREFIX);
+        let mut removed = 0;
+        for entry in std::fs::read_dir(&metadata_dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.to_string_lossy().ends_with("-list.avro") {
+                std::fs::remove_file(&path).unwrap();
+                removed += 1;
+            }
+        }
+        assert_eq!(removed, 1);
+        let second = ObjectStoreParquetTable::open_for_tenant(&location, Some("t1"))
+            .await
+            .expect("served from the manifest cache");
+        let second_splits: Vec<String> = second.splits.iter().map(|s| s.split_id.clone()).collect();
+        assert_eq!(
+            first_splits, second_splits,
+            "a hit returns the same selection"
+        );
+        assert_eq!(second.manifest_file_stats.len(), 1);
+        assert_eq!(count_where(second, "x > 0").await, 2);
+        // A new commit (v1 adds b.parquet) is visible on the very next open.
+        write_kx_parquet(&data.join("b.parquet"), &["melon"], &[100]);
+        publish_listed(tmp.path(), 2).await;
+        let third = ObjectStoreParquetTable::open_for_tenant(&location, Some("t1"))
+            .await
+            .unwrap();
+        assert_eq!(third.snapshot_version(), Some(1));
+        assert_eq!(count_where(third, "x > 0").await, 3);
     }
 
     fn gt_filter(column: &str, value: i64) -> Expr {

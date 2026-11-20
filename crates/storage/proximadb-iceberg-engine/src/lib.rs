@@ -94,8 +94,11 @@ pub mod iceberg;
 /// Iceberg-style atomic manifest commits (optimistic concurrency via `put_if_absent`).
 pub mod manifest;
 pub mod metadata;
+mod metadata_gc;
+pub use metadata_gc::{MetadataGcPlan, TipEvidence, below_tip_evidence, plan_metadata_gc};
+pub mod retention;
 mod snapshot_deletes;
-pub use snapshot_deletes::{IcebergSnapshotFiles, SnapshotDeletionVector};
+pub use snapshot_deletes::{IcebergSnapshotFiles, IcebergSnapshotPlan, SnapshotDeletionVector};
 /// Puffin files: the container of a v3 table's deletion vectors.
 pub mod puffin;
 /// Parquet footer → Iceberg manifest column metrics.
@@ -542,8 +545,15 @@ impl IcebergObjectStoreBridge {
             None => None,
         };
         let parent_location = parent.map(|v| self.object_uri(&committer.metadata_location(v)));
-        let lineage =
+        let mut lineage =
             iceberg::Lineage::from_parent(parent_json.as_deref(), parent_location.as_deref())?;
+        // ADR-098 D4.2 / TD-SPINE-3: the metadata-log follows the generation
+        // window (an older entry would name a snapshot whose data files the
+        // generation GC already collected); the table property only lowers it.
+        lineage.bound_metadata_log(retention::metadata_log_max_entries(
+            retention::gc_retained_generations(),
+            lineage.previous_versions_max,
+        ));
         // Snapshot ids must advance past the parent's current snapshot: an equal id
         // would make the snapshot its own ancestor and a lower one rewinds history.
         // Same-millisecond publishers (ids derived from a clock) hit this; a real
@@ -664,7 +674,52 @@ impl IcebergObjectStoreBridge {
             },
             &lineage,
         )?;
-        committer.commit(parent, Bytes::from(json)).await
+        match committer.commit(parent, Bytes::from(json)).await? {
+            CommitOutcome::Committed(target) => {
+                self.verify_commit_is_the_tip(&committer, metadata_prefix, target, snapshot_id)
+                    .await
+            }
+            conflict => Ok(conflict),
+        }
+    }
+
+    /// TD-SPINE-3 review M1: metadata GC frees old create-only slots, so a
+    /// publisher whose parent read predates a GC can win `put_if_absent` on a
+    /// slot BELOW the tip. That is not a commit: it is a conflict. The
+    /// evidence rule is [`metadata_gc::below_tip_evidence`] (shared with
+    /// MATERIALIZE's `check_commit`): only a POSITIVE non-successor — the next
+    /// version is missing, or was read and names another parent — makes this
+    /// a conflict; the orphaned document is then deleted (best effort) and the
+    /// caller never flips a layout to it. Any read failure keeps the commit
+    /// (it proves nothing). Cost: one LIST, plus one GET when a newer version
+    /// exists.
+    async fn verify_commit_is_the_tip(
+        &self,
+        committer: &metadata::MetadataCommitter,
+        metadata_prefix: &str,
+        target: u64,
+        snapshot_id: i64,
+    ) -> Result<CommitOutcome, StorageError> {
+        use metadata_gc::TipEvidence;
+        match metadata_gc::below_tip_evidence(self, metadata_prefix, target, Some(snapshot_id))
+            .await
+        {
+            TipEvidence::NotBuiltOn { latest } => {
+                let orphan = Path::from(committer.metadata_location(target));
+                if let Err(e) = self.store.delete(&orphan).await {
+                    tracing::warn!(
+                        %orphan,
+                        "iceberg-engine: orphaned below-tip commit not deleted: {e}"
+                    );
+                }
+                Ok(CommitOutcome::Conflict {
+                    latest: Some(latest),
+                })
+            }
+            TipEvidence::AtTip | TipEvidence::BuiltOn | TipEvidence::Unknown => {
+                Ok(CommitOutcome::Committed(target))
+            }
+        }
     }
 
     /// Create-only write of one generation-named metadata object. `Some(Conflict)` when
@@ -682,6 +737,18 @@ impl IcebergObjectStoreBridge {
             })),
             Err(e) => Err(e),
         }
+    }
+
+    /// The latest committed metadata version under `metadata_prefix` and a
+    /// revision token of its object, from one LIST (see
+    /// [`MetadataCommitter::latest_version_revision`](metadata::MetadataCommitter::latest_version_revision)).
+    pub async fn latest_metadata_revision(
+        &self,
+        metadata_prefix: &str,
+    ) -> Result<Option<(u64, String)>, StorageError> {
+        metadata::MetadataCommitter::new(self.store.clone(), metadata_prefix)
+            .latest_version_revision()
+            .await
     }
 
     /// Absolute location of metadata `version` under `metadata_prefix` — what an
@@ -968,6 +1035,17 @@ impl ObjectStoreBridge for IcebergObjectStoreBridge {
     ) -> Result<Vec<u8>, StorageError> {
         let committer = metadata::MetadataCommitter::new(self.store.clone(), metadata_prefix);
         Ok(committer.read_metadata(version).await?.to_vec())
+    }
+
+    async fn gc_iceberg_metadata(
+        &self,
+        metadata_prefix: &str,
+        committed_version: u64,
+        retained_generations: u64,
+    ) -> Result<proximadb_storage_common::object_store_bridge::IcebergMetadataGcReport, StorageError>
+    {
+        self.gc_metadata(metadata_prefix, committed_version, retained_generations)
+            .await
     }
 
     async fn commit_table_metadata(
