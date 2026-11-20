@@ -151,6 +151,15 @@ second system; it is retired.
   a sequence separate from identity (not a key).
 * **Namespace `u16` wrap (ADR-074 D4):** 65,536 namespaces/account is a hard
   cap, not a silent wrap — fence it. Tracked separately.
++
+*Amended 2026-11-19 (link:ADR-098-metadata-spine.adoc[ADR-098]):* the cap is fenced
+(`allocate_bounded` against `u16::MAX`), but the namespace stable-id floor is *global* today —
+one `namespace_floor: AtomicU64` per `SystemCatalog` (`src/services/system_catalog.rs`,
+`allocate_bounded(&self.namespace_floor, …)` near line 304), not one per account. So the
+"65,536 namespaces per account" bound is fleet-wide until
+link:../../10-quality/td/TD-SPINE-2-per-account-catalog-shards.adoc[TD-SPINE-2] makes the floor
+per-account. (TD-NS-1 S4 is the related fence on the separate per-account
+`CatalogIdService::mint_namespace_id` allocator; it does not by itself localize this floor.)
 
 == Addendum: ABAC `tenant_stable_id` (TD-TENANT-1 item 3)
 

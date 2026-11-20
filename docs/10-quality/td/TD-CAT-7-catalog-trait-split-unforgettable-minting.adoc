@@ -49,6 +49,8 @@ done. It is a persistence-strategy refactor with a different risk profile from
 the trait contract, and bundling it here would have put a storage change in an
 identity PR, which is the mistake this TD's sequencing note exists to prevent.
 
+*Amended 2026-11-19 (link:../../12-design/adr/ADR-098-metadata-spine.adoc[ADR-098]):* item 4 (retire `NativeCatalog` as an authority path and the `PROXIMADB_DISABLE_SYSTEM_CATALOG` kill switch) is **spine-blocking** for ADR-098: until it lands, ADR-032/ADR-035 text written against `NativeCatalog` still describes a live fallback. The `NativeCatalog` residual of TD-CAT-1 / TD-CAT-2 retires with item 4, but TD-CAT-2's tenant-isolation goal does not: it continues as link:TD-SPINE-2-per-account-catalog-shards.adoc[TD-SPINE-2] (per-account shards under the tenant prefix via `DrPathBuilder`).
+
 The `unwrap_or_default()` rendering at
 `crates/binding/proximadb-catalog-introspection/src/lib.rs:424` also remains: it
 turns a missing `object_id` into an empty string. The post-condition now makes

@@ -62,27 +62,37 @@ def td_ids() -> dict[str, list[str]]:
     """Map TD id -> list of sources declaring it (legacy table rows + per-file)."""
     by_id: dict[str, list[str]] = defaultdict(list)
     # Legacy monolithic table: one declaration per id-column row.
+    # A row that links to its own per-file entry (`td/TD-181-….adoc`) is a
+    # migration POINTER, not a second declaration (HOW_TO_FILE_TD_AND_ADR: the
+    # legacy table migrates to per-file in batches; the row stays as a pointer).
     if TD_TABLE.is_file():
-        for line in TD_TABLE.read_text(encoding="utf-8").splitlines():
+        lines = TD_TABLE.read_text(encoding="utf-8").splitlines()
+        for i, line in enumerate(lines):
             m = TD_ROW_RE.match(line)
             if m:
+                row_text = line + (lines[i + 1] if i + 1 < len(lines) else "")
+                if re.search(rf"td/{re.escape(m.group(1))}-[^\s`\[\]]+\.adoc", row_text):
+                    continue
                 by_id[m.group(1)].append(f"{TD_TABLE.name} (table row)")
     # Per-file TDs: the id is read from the file's first `= TD-<id>: ...` heading
     # (NOT the filename — a slug uses hyphens too, so `TD-167-foo` is ambiguous;
     # in the heading the id is delimited by `:`/space, matching how the legacy
     # table row and ADR titles declare their id). Filename is cosmetic.
     if TD_DIR.is_dir():
-        for p in sorted(TD_DIR.glob("TD-*.adoc")):
+        # `.md` per-file TDs exist too (TD-SSO-2/3, TD-SPECRAT-1/2); before 2026-11-19
+        # they escaped the uniqueness check entirely.
+        for p in sorted([*TD_DIR.glob("TD-*.adoc"), *TD_DIR.glob("TD-*.md")]):
             if p.name.lower() == "readme.adoc":
                 continue
-            heading = next(
-                (
-                    line
-                    for line in p.read_text(encoding="utf-8").splitlines()
-                    if line.startswith("= ")
-                ),
-                "",
-            )
+            lines = p.read_text(encoding="utf-8").splitlines()
+            heading = next((line for line in lines if line.startswith("= ")), "")
+            if p.suffix == ".md" and not heading:
+                # Markdown TDs may use `# TD-<ID>: title`. A `#` heading WITHOUT the
+                # `:` after the id (`# TD-SEAM-14 S0 Audit`) names its parent TD and
+                # is a companion document, not a declaration.
+                md = next((line for line in lines if line.startswith("# ")), "")
+                if re.match(r"^#\s+TD-[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*:", md):
+                    heading = md
             m = TD_ID_RE.search(heading)
             if m:
                 by_id[m.group(0)].append(p.name)
@@ -90,6 +100,21 @@ def td_ids() -> dict[str, list[str]]:
                 # A per-file TD with no `= TD-…:` heading can't be uniqueness-checked.
                 by_id[f"<no-id-heading:{p.name}>"].append(p.name)
     return by_id
+
+
+def archived_td_ids() -> dict[str, str]:
+    """TD ids closed into an archive register (`TECHNICAL_DEBT_CLOSED_*.adoc`).
+
+    Archived ids are history, not live declarations: a reference to one is
+    valid, but a NEW entry must never reuse one (rule 4: never reuse a number).
+    """
+    out: dict[str, str] = {}
+    for p in sorted(TD_TABLE.parent.glob("TECHNICAL_DEBT_CLOSED_*.adoc")):
+        for line in p.read_text(encoding="utf-8").splitlines():
+            m = TD_ROW_RE.match(line)
+            if m:
+                out.setdefault(m.group(1), p.name)
+    return out
 
 
 def indexed_adrs() -> set[str]:
@@ -124,6 +149,28 @@ def main() -> int:
             errors.append(
                 f"TD id {tid} is declared {len(sources)}×: {', '.join(sources)} "
                 f"— a TD id must be unique across the legacy table and the per-file dir."
+            )
+
+    archived = archived_td_ids()
+    for tid, sources in sorted(td_ids().items()):
+        if tid in archived:
+            errors.append(
+                f"TD id {tid} ({', '.join(sources)}) reuses an id closed into {archived[tid]} "
+                f"— pick a new id; archived ids are reserved forever."
+            )
+
+    # A heading id that swallowed the filename slug (`= TD-SC-5-multi-pod-…:`)
+    # registers as a different id than the one everyone cites, so a second
+    # `TD-SC-5` would never collide. Ten entries carried this until 2026-11-19,
+    # hiding a real duplicate (TD-181). Ids are uppercase/digit segments
+    # (`TD-162a-3`, `TD-SEAM-12-F5`); a lowercase-word segment is a slug.
+    for tid, sources in sorted(td_ids().items()):
+        if tid.startswith("<"):
+            continue  # companion doc without an id heading (e.g. an audit appendix)
+        if any(re.match(r"^[a-z][a-z_]", seg) for seg in tid.split("-")[1:]):
+            errors.append(
+                f"TD heading id {tid!r} in {', '.join(sources)} contains a filename slug — "
+                f"write the heading as `= TD-<ID>: <title>`."
             )
 
     indexed = indexed_adrs()

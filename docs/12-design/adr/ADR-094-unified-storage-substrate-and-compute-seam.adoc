@@ -273,6 +273,12 @@ disaster recovery, external tools, and BYOB buckets (ADR-090), where the custome
 storage and ProximaDB's catalog may be unavailable. Catalog is the fast path; the object
 remains the truthful one.
 
+*Amended 2026-11-19 (link:ADR-098-metadata-spine.adoc[ADR-098]):* Layer B collection facts
+publish to the L1 collection segment directory object (ADR-098 D2), not into xCatalog, so
+xCatalog does not grow with segment count. The directory is LIST-validated by etag and never
+authoritative. TD-USUB-8 slice 3 (catalog-resident Layer B) is superseded by
+link:../../10-quality/td/TD-PAXMETA-1-collection-level-segment-facts.adoc[TD-PAXMETA-1].
+
 == Consequences
 
 * ADR-027 becomes `Accepted (as narrowed by ADR-094)`; **TD-162's governance gate lifts.**
@@ -316,6 +322,9 @@ Ordered so the system is never left in a worse state than today.
   `RecordReader` + `PAR1` arm.
 * **Phase 3 (format evolution, evidence-gated)** — TD-USUB-6 typed columns authoritative;
   TD-USUB-7 adaptive structural encoding; TD-USUB-8 catalog-resident Layer B.
+  *Amended 2026-11-19 (link:ADR-098-metadata-spine.adoc[ADR-098] D2):* the catalog-resident Layer B item is superseded — Layer B
+  collection facts publish to the LIST-validated L1 collection segment directory object, never
+  in xCatalog (TD-PAXMETA-1).
 * **Phase 4 (integrity)** — TD-USUB-9 route-stamp integrity + dead-code removal;
   TD-USUB-10 incremental publication.
 
@@ -340,6 +349,8 @@ Reconciled 2026-10-15 against `origin/develop` (per-slice detail lives in the TD
   Resolved #1921; TD-USUB-11 faithful Parquet round-trip (kept `valid_to_ns`) Resolved #1922.
 * Phase 3 — TD-USUB-6 typed shred columns In progress (#1925, #1926, #1929, #1930, #1931, #1934);
   TD-USUB-7 Open; TD-USUB-8 slices 0–2 (cold-read depth 3→0, ratcheted) #1936, #1941, #1943.
+  *Amended 2026-11-19 (link:ADR-098-metadata-spine.adoc[ADR-098] D2):* TD-USUB-8 slice 3 (catalog-resident Layer B) is superseded
+  by TD-PAXMETA-1 (L1 collection segment directory).
 * Phase 4 — TD-USUB-9 route-stamp integrity + dead code Resolved #1924; TD-USUB-10 slice 0
   manifest-driven file selection #1927 (In progress).
 

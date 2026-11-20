@@ -5,7 +5,7 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | Open — reference implementation exists off-tree (`handoff/reference/p2-publisher.patch`); needs rework before merge
+| Status | **Resolved (2026-11-19).** Per the link:../../12-design/adr/ADR-098-metadata-spine.adoc[ADR-098] reconciliation: incremental MATERIALIZE append and deletion vectors are in-tree: hidden oid column (#2222), insert-only append via `plan_append` in `src/services/dml/mod.rs` (#2234), Iceberg deletion-vector codec (#2238), and incremental update/delete publication behind `PROXIMADB_MATERIALIZE_INCREMENTAL_DV` in `src/services/dml/materialize_append.rs` (#2283, default ON since 2026-10-29). The residual — a background publication driver and a live update/delete writer — moves to TD-SEAM-4 / link:TD-USUB-10-incremental-publication-before-any-automation.adoc[TD-USUB-10]. Formerly: Open — reference implementation exists off-tree (`handoff/reference/p2-publisher.patch`); needs rework before merge.
 | Priority | P2
 | Relates to | ADR-094 D1 ("a second representation is optional, catalog-expressed and cost-justified") and D2 (multi-layout catalog, additive MATERIALIZE); TD-USUB-1/4
 | Tracked under | TD-SEAM-4 (streaming MATERIALIZE / incremental publisher, phase P2 of link:../../current/LAKEHOUSE_PLAN.adoc[LAKEHOUSE_MULTIMODAL_SEAMS_2026_10]; ADR-097)

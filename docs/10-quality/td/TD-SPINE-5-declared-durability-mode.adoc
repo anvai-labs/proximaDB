@@ -1,0 +1,45 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-SPINE-5: the WAL durability mode is implicit — two contracts selected by a legacy default
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open** (filed 2026-11-19).
+| Priority | **HIGH**. Operators cannot tell from config or logs whether an ack means "fsync'd on a local volume" (ADR-069) or "durable and LISTable on object storage" (ADR-063 D3). The guard only warns, and only checks `write_buffer_directory`.
+| Component | `src/storage/persistence/write_ahead_log/config.rs` (`wal_local_dir` :335-347, default `None` :392); `write_ahead_log/mod.rs` (`local_wal_dir` :133, effective base location :1704-1711); `recovery_manager.rs` (:48, :104); `src/network/shared_services.rs` (warning guard :3523-3551); `apps/proximadb-server/src/main.rs` (`rebase_default_relative_paths` :569-638); `durable_locations.rs`; `config/config.toml` `[storage.wal_config]`.
+| Authority | link:../../12-design/adr/ADR-098-metadata-spine.adoc[ADR-098] D3 (seam S2)
+| Relates to | TD-WAL-1 (implements `local_volume`), TD-WAL-5 (resolved replay-root fix), TD-SEAM-14 (spill durability/ownership boundary — owns that detail), ADR-063 D3/D4, ADR-069 D1, ADR-095 D1; registry row `PROXIMADB_WAL_LOCAL_DIR`
+|===
+
+== Problem
+
+* `wal_local_dir` is opt-in. When unset, the WAL follows the catalog `base_location` or
+  `data_directories[0]`, either of which may be object storage — the ADR-063 serverless posture,
+  which `apps/proximadb-server/tests/object_store_restart_recovery.rs` depends on.
+* Which contract applies is therefore decided by a default, is not logged, and is not recorded in
+  `durable_locations`.
+
+== Fix (owner decision: infer and log, no boot break)
+
+. Add `durability_mode = "local_volume" | "object_store_serverless"` to `[storage.wal_config]`, with
+  a mirror env gate registered in `ENV_GATE_REGISTRY.adoc` (naming per the registry rules).
+. Resolution at boot (ADR-098 D3): declared wins; otherwise infer from one deterministic input,
+  the global `wal_local_dir` if set (⇒ `local_volume`), else the scheme of `write_buffer_directory`
+  (else `data_directories[0]`). Local path ⇒ `local_volume`, with `wal_local_dir` defaulting to
+  `{data_dir}/wal` for every collection. Object URL ⇒ `object_store_serverless`, with per-collection
+  WAL under the catalog-derived base location (`resolve_collection_base_location`,
+  `write_ahead_log/mod.rs:1704`). Log the resolved mode and reason at INFO; record it in
+  `durable_locations`.
+. `local_volume` default root move: recovery also scans the legacy co-located WAL root so an upgrade
+  never strands unflushed WAL objects.
+. Replace the `write_buffer_directory`-only warning with the resolution above.
+. `object_store_restart_recovery.rs` declares `object_store_serverless` explicitly.
+
+== Acceptance
+
+* Per-mode ratchet: the resolved WAL root's scheme matches the mode.
+* Upgrade test: a WAL written at the legacy co-located root replays after the default moves.
+* `wal_fsync_crash_recovery.rs`, `cold_backup_restore.rs` and `object_store_restart_recovery.rs`
+  green; boot log names the mode in each.
+* Coordinated with the TD-SEAM-14 owner so spill placement resolves to one of the two modes.

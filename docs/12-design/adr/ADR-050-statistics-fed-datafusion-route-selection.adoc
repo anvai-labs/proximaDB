@@ -95,6 +95,13 @@ canonical `SegmentStatistics` type / `SegmentFormat::detect` seam is not yet in
 code — the ADR-042 generalization (PAX segments feeding the same projection)
 continues under TD-OLAP-2.
 
+*Amended 2026-11-19 (link:ADR-098-metadata-spine.adoc[ADR-098]):* plan-time statistics
+come from the metadata spine rather than from per-file footers. PAX: L1 collection segment
+directory entries (ADR-098 D2); Parquet/Iceberg: manifest per-file `ColumnFileStats`
+(ADR-098 D4.3, link:../../10-quality/td/TD-SPINE-4-manifest-stats-pruning-and-cache.adoc[TD-SPINE-4]);
+footers are the fallback for both. The shipped slice above (`ObjectStoreParquetTable`) is
+Parquet, so it uses the manifest.
+
 === D3 — Treat statistics as freshness-bounded hints (ADR-038)
 
 Each `SegmentStatistics` block carries its own freshness watermark; the envelope floor is

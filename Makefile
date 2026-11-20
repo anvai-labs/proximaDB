@@ -258,7 +258,7 @@ tenant-ingress-check:
 	@echo "Validating deployment-aware tenant ingress..."
 	python3 scripts/check_tenant_ingress_contract.py
 
-work-commit-check: fmt-check deterministic-commit-contract-check branch-promotion-policy-check docs-claim-check design-status-check status-asof-check capability-matrix-check mvp-contract-check mvp-smoke-test context-benchmark-check workspace-boundaries-check tenant-path-check tenant-ingress-check catalog-seal-check panic-policy-module-guard panic-policy-workspace-no-regression silent-failure-no-regression capability-facade-no-regression type-name-ratchet-no-regression hygiene-check env-gate-check ci-lane-coverage-check dup-ratchet-check release-build-features-check release-evidence-contract-check orphan-rust-files-check
+work-commit-check: fmt-check deterministic-commit-contract-check branch-promotion-policy-check docs-claim-check design-status-check doc-references-check status-asof-check capability-matrix-check mvp-contract-check mvp-smoke-test context-benchmark-check workspace-boundaries-check tenant-path-check tenant-ingress-check catalog-seal-check panic-policy-module-guard panic-policy-workspace-no-regression silent-failure-no-regression capability-facade-no-regression type-name-ratchet-no-regression hygiene-check env-gate-check ci-lane-coverage-check dup-ratchet-check release-build-features-check release-evidence-contract-check orphan-rust-files-check
 	@echo "✅ work-commit-check: deterministic architecture and commit guardrails passed"
 
 validated-commit-check: work-commit-check
@@ -451,6 +451,10 @@ docs-claim-check:
 # has a parseable status, legacy TD rows use the controlled vocabulary, every ADR
 # is indexed once, and the index/file lifecycle classes agree. Claim truth is
 # covered by the freshness check below.
+doc-references-check: ## Ratchet dead doc links + orphan TD/ADR ids (archived ids resolve)
+	@echo "🔗 Checking documentation references (dead links, orphan TD/ADR ids)..."
+	@python3 scripts/check_doc_references.py
+
 design-status-check:
 	@echo "📚 Checking ADR/TD status coverage and index agreement..."
 	@python3 scripts/check_design_status_index.py

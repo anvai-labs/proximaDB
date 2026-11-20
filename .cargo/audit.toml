@@ -120,6 +120,17 @@ ignore = [
     "RUSTSEC-2026-0405",
     "RUSTSEC-2026-0406",
 
+    # --- unmaintained (2026-11-19 batch; no patched version EXISTS — the
+    # advisory is the crate's maintenance status, not a fixable bug). All three
+    # are pulled by the DataFusion 55 / Arrow 59 stack we cannot move without a
+    # major bump; re-review each when datafusion or arrow migrates.
+    # chrono: direct use + chrono-tz + datafusion 55 (RUSTSEC-2026-0543).
+    # chrono-tz: arrow-array 59 -> arrow/datafusion (RUSTSEC-2026-0555).
+    # humantime: object_store 0.13 -> datafusion (RUSTSEC-2026-0542).
+    "RUSTSEC-2026-0542",
+    "RUSTSEC-2026-0543",
+    "RUSTSEC-2026-0555",
+
     # --- yanked ---
     # Excluded as a class via --no-yanked (see header): spin 0.9.8 (flume
     # 0.12) and wide 1.6.0 (simba 0.10) are yanked with no parent bump that

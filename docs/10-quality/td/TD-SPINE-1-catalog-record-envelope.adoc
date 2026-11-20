@@ -1,0 +1,43 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-SPINE-1: persisted SystemCatalog records carry no magic or version byte
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open** (filed 2026-11-19).
+| Priority | **HIGH**. No defect today, but every future change to the catalog's persisted shape (body codec, sharding in TD-SPINE-2) is a flag day without it. The catalog is the recovery root (ADR-063 D2).
+| Component | `src/services/system_catalog_state.rs`: `CatalogDelta::to_operation` (:112) / decode (:121), `to_snapshot_bytes` (:527) / `inner_from_snapshot_bytes` (:571), `IdentityHighWaterSidecar` encode (:620) / decode (:631). Generation-prefixed payload in `crates/storage/proximadb-iceberg-engine/src/manifest.rs` (`encode_fenced`, :309).
+| Authority | link:../../12-design/adr/ADR-098-metadata-spine.adoc[ADR-098] D1.1–D1.2
+| Relates to | TD-SPINE-2 (shards build on the envelope), TD-MANIFEST-1, ADR-063 D4 r3.1 (binary envelope pattern), PMHEAD (`manifest/head.rs`)
+|===
+
+== Problem
+
+Catalog deltas, snapshots and the identity sidecar are bare field-named MessagePack
+(`rmp_serde::to_vec_named`). The only version-like field, `writer_version`, sits inside the body.
+The outer canonical WAL frame (`PXWAL001`) is versioned, but its catalog payload is not. A reader
+cannot distinguish a future body codec or layout from today's, so any change needs every reader
+upgraded first. Schema evolution relies only on `#[serde(default)]`; a rename silently breaks old
+snapshots.
+
+== Fix
+
+. Frame every persisted catalog record as `{magic (4–8 B), format_version: u8, body_codec: u8, body}`,
+  following PMHEAD's binary framing. Body codec 0 = field-named MessagePack.
+. Decoders sniff the magic: present ⇒ dispatch on `format_version`/`body_codec`; **absent ⇒ legacy
+  MessagePack** (forever). Unknown version ⇒ a typed error naming the version, never a panic.
+. Readers sniff unconditionally and land first. The **writer** emits the envelope only behind an
+  opt-in write gate (default OFF until baked, per CLAUDE.md #8), with an `ENV_GATE_REGISTRY.adoc`
+  row named per the registry rules (e.g. `PROXIMADB_CATALOG_WRITE_RECORD_ENVELOPE`). Flipping the
+  default is a separate, evidence-gated change.
+. Do not change the body codec here (ADR-098 D1.2).
+
+== Acceptance
+
+* Round-trip tests for delta, snapshot and sidecar in both framings.
+* A legacy (unframed) snapshot and WAL tail written by the current code open and replay unchanged
+  (extend `identity_high_water_is_mixed_read_safe`-style tests).
+* Cross-pod tests in `src/services/system_catalog.rs` (follower tail, superseded owner, fenced
+  checkpoint) pass with a mixed legacy/enveloped chain.
+* Truncated or corrupt envelope ⇒ fail closed with the existing torn-tail semantics.

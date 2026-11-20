@@ -5,7 +5,7 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | **Mitigated (2026-11-04).** The shared v1 encoding is now ONE copy (`serialize_bincode_batch` / `deserialize_bincode_batch`) used by both named slots; all doc comments disclose the bincode backing; a byte-identity pin test holds the slots to raw bincode. The facade itself (three enum variants, one wire format) is OPEN — see Decision.
+| Status | **Mitigated (2026-11-04).** The shared v1 encoding is now ONE copy (`serialize_bincode_batch` / `deserialize_bincode_batch`) used by both named slots; all doc comments disclose the bincode backing; a byte-identity pin test holds the slots to raw bincode. The facade itself (three enum variants, one wire format) is OPEN — see Decision. *Decision recorded 2026-11-19 (link:../../12-design/adr/ADR-098-metadata-spine.adoc[ADR-098] D4): Collapse;* the collapse itself is not yet implemented.
 | Priority | **MEDIUM**: no data loss or corruption (all three slots round-trip through one proven encoding), but the config surface promises semantics it does not deliver — an operator selecting "avro" for schema evolution, or "proto" for proto-first interop, silently gets bincode v1.
 | Component | `src/storage/persistence/write_ahead_log/serialization/{mod,proto,avro}.rs`; `SerializationFormat` enum (config strings `proto`/`bincode`/`avro`); consumers: `SerializerFactory::create`, `write_ahead_log/mod.rs`, `recovery_manager.rs`, `memtable/specialized/wal_behavior.rs`.
 | Relates to | TD-WAL-2 (multimodal WAL convergence — the unified WAL is where a real format split would land), the v2 segment-header precision work (`v2_segment_header.rs`, `wire_v2`), the B-harness finding that surfaced it (duplicate-suspect 1.00 + td-candidate 0.90/0.95, `report/llm_module_analysis/`, 2026-11-04).
@@ -49,6 +49,8 @@ Two coherent end-states; picking one is a product decision, not a refactor:
 
 Until decided: the facade is disclosed at every doc site, and the byte pin
 holds the two slots together.
+
+*Decision 2026-11-19 (link:../../12-design/adr/ADR-098-metadata-spine.adoc[ADR-098] D4): Collapse (option 1).* The WAL has one real encoding; Avro exists only at the Iceberg export seam, never as a WAL or memtable format. The same collapse covers the memtable twin (`src/storage/memtable/serialization/avro.rs`, also a bincode placeholder) and its `wal_behavior.rs` call site.
 
 == Residual
 

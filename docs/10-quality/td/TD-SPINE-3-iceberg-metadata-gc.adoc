@@ -1,0 +1,50 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-SPINE-3: Iceberg metadata files are never garbage-collected and the metadata log is unbounded
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open** (filed 2026-11-19).
+| Priority | **HIGH** under heavy writes. Every MATERIALIZE / bulk-append commit leaves a `metadata.json`, a manifest list and manifests forever; storage, LIST cost (version discovery is by LIST) and `metadata.json` size grow without bound.
+| Component | `crates/storage/proximadb-iceberg-engine/src/iceberg.rs` (`build_table_metadata` :870, metadata-log :824-833); `metadata.rs` (`MetadataCommitter`, `latest_version` by LIST :59-66); `lib.rs` (`commit_iceberg_snapshot` :493-668); data-file GC beside which this runs: `src/services/dml/materialize_stream.rs` (`gc_older_generations` :326), `src/services/dml/mod.rs` (:3540-3606).
+| Authority | link:../../12-design/adr/ADR-098-metadata-spine.adoc[ADR-098] D4.2 (seam S4)
+| Relates to | **TD-GCRETAIN-1** (the generation-window, clock-free data-file GC this must match), TD-SEAM-1 (single writer), TD-SEAM-4 (incremental publisher), TD-SEAM-7 (observability retention = snapshot expiry), TD-MANIFEST-1 (retention semantics), TD-SPINE-4
+|===
+
+== Problem
+
+* Data-file GC exists (`gc_older_generations`, keep N generations; DV Puffin grace), but nothing
+  deletes `v*.metadata.json`, `snap-*-list.avro` or `*-m*.avro` under `metadata/`.
+* `metadata-log` is the parent's log plus one entry per commit; `write.metadata.previous-versions-max`
+  is not enforced.
+* Expiry was discussed before (`PROXIMADB_AS_LAKEHOUSE_NATIVE_PG_ENGINE_2026_06_17.md`; TD-GCRETAIN-1
+  considered and declined Iceberg-style snapshot leases), but no entry owns metadata-file deletion
+  or the log bound.
+
+== Fix
+
+. **Retention follows the data-generation window** (TD-GCRETAIN-1:
+  `PROXIMADB_MATERIALIZE_GC_RETAINED_GENERATIONS`, default 3, floor 2). The retained
+  `metadata.json` versions are those of the retained generations; `metadata-log` is bounded to the
+  same window, because an older entry would name a snapshot whose data files `gc_older_generations`
+  has already deleted. A `write.metadata.previous-versions-max` table property may only *lower*
+  the bound.
+. **Clock-free**, adopting TD-GCRETAIN-1's decision: no minimum-age grace. A reader pinned to a
+  retained generation is protected by the window, exactly as for data files.
+. After a successful commit at MATERIALIZE (beside `gc_older_generations`; no new job framework),
+  delete manifests and manifest lists **not reachable from any retained metadata version**, and
+  metadata files outside the window. Never the tip; best-effort deletes (a failed delete is retried
+  on the next pass, never an error to the writer).
+. All keys through `DrPathBuilder`; any new env gate gets an `ENV_GATE_REGISTRY.adoc` row.
+. Rewrite-manifests (compacting many small manifests) is out of scope until a trace shows manifest
+  count on the planning path; record the measurement in TD-SPINE-4's evidence.
+
+== Acceptance
+
+* GC keeps the tip and the retained generations; never deletes a file reachable from a retained
+  version (negative control: a reader pinned to the oldest retained generation still reads after GC).
+* After N+k commits, `metadata-log` holds exactly the retained window, and every entry it lists is
+  readable (no entry names a snapshot whose data files were collected).
+* No wall-clock input: the same commit sequence yields the same deletions regardless of timing.
+* `tests/iceberg_interop_e2e.rs` (PyIceberg + DuckDB read-back, DVs, v3) green after GC.

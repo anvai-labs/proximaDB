@@ -1,6 +1,6 @@
 // Copyright (C) 2026 ProximaDB
 // SPDX-License-Identifier: Apache-2.0
-= TD-SC-2-warm-on-disk-tier--hydration: warm on-disk tier + hydration
+= TD-SC-2: warm on-disk tier + hydration
 
 [cols="1,3", options="header"]
 |===
@@ -22,4 +22,4 @@ On-disk warm cache for the per-tenant system catalog, inserted between the hot c
 `PROXIMADB_SYSCAT_WARM_DIR` is configured. Tests cover warm integration/hydration. This is
 not proof of the complete per-tenant or multi-pod contract: verify durable version identity,
 restart invalidation and tenant isolation before broad rollout. Coordinate TD-SC-5 instead
-of treating process-local corpus stamps as a shared durable authority.
+of treating process-local corpus stamps as a shared durable authority (TD-SC-5 superseded by link:TD-SPINE-2-per-account-catalog-shards.adoc[TD-SPINE-2], 2026-11-19; coordinate with TD-SPINE-2's shard generation instead).

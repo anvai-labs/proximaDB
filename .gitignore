@@ -327,6 +327,7 @@ docs/log/
 !docs/10-quality/DUP_RATCHET_BASELINE.json
 !docs/_internal/roadmap/V1_PROTO_USAGE_BASELINE.json
 !docs/_internal/roadmap/SILENT_FAILURE_BASELINE.json
+!docs/_internal/roadmap/DOC_REFERENCES_BASELINE.json
 # TD-PROTO-2 known-drift ledger: the v1-mirror conformance ratchet reads this
 # at test time — it is a baseline like the ones above, not generated runtime
 # data. Untracked => the guard panics on every fresh checkout.

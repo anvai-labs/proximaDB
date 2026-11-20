@@ -20,7 +20,7 @@ default-OFF. Per-clause state:
 | §1.3 additive layouts | link:../10-quality/td/TD-USUB-4-storage-layouts-clobber-so-multi-representation-is-inexpressible.adoc[TD-USUB-4] | **Shipped** (#1920). Publication upserts by layout `name`. The `MATERIALIZE`-destroys-native-layout defect was fixed with it.
 | §2.1 typed columns authoritative | link:../10-quality/td/TD-USUB-6-typed-user-columns-authoritative-not-duplicated.adoc[TD-USUB-6] | **Partial.** Version dispatch, shred directory, declared types and the residual tail landed default-OFF (#1925, #1926, #1929, #1930). Write amplification was measured (#1931, #1934). Open: the default flip, and convergence with the segment-level `shred_field_map`.
 | §2.2 adaptive structural encoding | link:../10-quality/td/TD-USUB-7-adaptive-per-column-structural-encoding.adoc[TD-USUB-7] | **Open.**
-| §3 catalog-resident Layer B | link:../10-quality/td/TD-USUB-8-catalog-resident-serving-metadata-collapses-cold-read-depth.adoc[TD-USUB-8] | **Partial.** Slices 0–2 (#1936, #1941, #1943) took warm-read depth 3 → 0 via the segment-index cache, ratcheted. Open: slice 3, which must be argued on cold start, cross-node sharing or planner-time pruning, not on depth.
+| §3 catalog-resident Layer B | link:../10-quality/td/TD-USUB-8-catalog-resident-serving-metadata-collapses-cold-read-depth.adoc[TD-USUB-8] | **Partial.** Slices 0–2 (#1936, #1941, #1943) took warm-read depth 3 → 0 via the segment-index cache, ratcheted. Open: slice 3, which must be argued on cold start, cross-node sharing or planner-time pruning, not on depth. *Amended 2026-11-19 (link:adr/ADR-098-metadata-spine.adoc[ADR-098] D2):* the catalog-resident direction is superseded; slice 3 is carried by TD-PAXMETA-1 (see the §3 note).
 | §4.1 `RecordReader` + `PAR1` detect | link:../10-quality/td/TD-USUB-5-record-reader-trait-and-parquet-detect-arm.adoc[TD-USUB-5] | **Shipped** (#1921).
 | §4.3 capability storage-independent | link:../10-quality/td/TD-USUB-2-sql-capability-must-not-depend-on-storage-format.adoc[TD-USUB-2] / link:../10-quality/td/TD-USUB-3-abac-silently-removes-sql-capability.adoc[TD-USUB-3] | **Partial.** ABAC in-plan enforcement shipped (TD-USUB-3, #1919). The native table provider landed default-OFF behind `PROXIMADB_NATIVE_TABLE_PROVIDER` (TD-USUB-2, #1917). Open: making provider registration, not `parquet_backed`, the gate by default.
 | §5 route-stamp integrity | link:../10-quality/td/TD-USUB-9-route-stamp-integrity-and-dead-interop-code.adoc[TD-USUB-9] | **Shipped** (#1924). Open: cost-only routing over enumerated layouts.
@@ -147,6 +147,8 @@ Two properties must be documented rather than silently relied upon:
   count. Cost models may use it; correctness paths may not.
 
 == §3 Catalog-resident serving metadata
+
+*Amended 2026-11-19 (link:adr/ADR-098-metadata-spine.adoc[ADR-098] D2):* Layer B collection facts publish to the L1 collection segment directory object (generalized PXCD), LIST-validated, never in xCatalog; this section's catalog-resident direction is superseded.
 
 === 3.1 The depth problem
 
@@ -281,7 +283,7 @@ Two live defects were fixed as part of this work (TD-USUB-9, #1924):
 | Change | Gate before default-ON
 | §2.1 typed columns authoritative | Round-trip losslessness ratchet (declared + residual reconstruct the original record exactly); write-amplification delta recorded.
 | §2.2 adaptive structural encoding | Random-access IOPs per vector fetch measured (target: 1 for full-zip fixed-width); scan throughput not regressed; recall ratchet green.
-| §3 catalog-resident Layer B | Cold-read dependent-GET depth measured 3 → 1 via `io_trace` `range_gets`; catalog-unavailable recovery path exercised.
+| §3 catalog-resident Layer B | Cold-read dependent-GET depth measured 3 → 1 via `io_trace` `range_gets`; catalog-unavailable recovery path exercised. *Amended 2026-11-19 (link:adr/ADR-098-metadata-spine.adoc[ADR-098] D2):* superseded with §3; the gate moves to the L1 directory (TD-PAXMETA-1).
 | §5 cost-based routing | Route stamp matches executing engine (TD-USUB-9) before any cost cell is trusted.
 | ADR-033 "< 2× scans" premise | Measured on our shapes with the #1914 scale harness before any format-strategy conclusion is drawn from it.
 |===

@@ -11,6 +11,8 @@
 | Relates to | TD-SEAM-10 (parent row; this file holds the implementation slices), TD-RDSTRAT-8 (per-segment A0), TD-FPRUNE-1, TD-PAXMETA-1, TD-SEAM-13, ADR-097 D2, ADR-094 D4, ADR-026
 |===
 
+*Amended 2026-11-19 (link:../../12-design/adr/ADR-098-metadata-spine.adoc[ADR-098]):* the PXCD directory is the format base for the L1 collection segment directory (ADR-098 D2); its generalization to all segments, flush-time publication and per-entry stats is tracked in link:TD-PAXMETA-1-collection-level-segment-facts.adoc[TD-PAXMETA-1].
+
 == Problem
 
 The coarse IVF level of the PAX cascade is per segment. A cold query pays every segment's

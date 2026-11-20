@@ -1,11 +1,11 @@
 // Copyright (C) 2026 ProximaDB
 // SPDX-License-Identifier: Apache-2.0
-= TD-SC-5-multi-pod-shared-corpus-version-store: multi-pod shared corpus-version store
+= TD-SC-5: multi-pod shared corpus-version store
 
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | **Open, not started** (filed 2026-10-26 from ADR-035 citations; ADR-035 is Proposed — the design and its reconciliation live there, and this lane is gated on its acceptance).
+| Status | **Superseded by link:TD-SPINE-2-per-account-catalog-shards.adoc[TD-SPINE-2] (2026-11-19).** Per link:../../12-design/adr/ADR-098-metadata-spine.adoc[ADR-098] D1: the per-account catalog shard generation becomes the shared version, so no separate corpus-version store is needed. Formerly: **Open, not started** (filed 2026-10-26 from ADR-035 citations; ADR-035 is Proposed — the design and its reconciliation live there, and this lane is gated on its acceptance).
 | Priority | TBD when picked up
 | Component | (see scope)
 | Relates to | ADR-035

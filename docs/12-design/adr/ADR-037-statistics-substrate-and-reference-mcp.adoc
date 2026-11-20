@@ -53,6 +53,8 @@ The sketches are **mergeable**, so compaction merges segment-level sketches into
 
 This is the ADR-030 co-design pattern applied to the **write** boundary: instrument the flush/compaction pass once; **zone-map pruning, KSU storage accrual, and the statistics envelope all read the same written segment.** One pass, three readers.
 
+*Amended 2026-11-19 (link:ADR-098-metadata-spine.adoc[ADR-098]):* Mechanism: ADR-042 (per-segment `SegmentStatistics`, aggregated from L1 directory entries per ADR-098 D2). This ADR owns the principle and the D2 wire envelope.
+
 == Decision 2 — The statistics envelope is the boundary object: versioned, modality-neutral, units-only
 
 The engine emits one **versioned, modality-neutral statistics envelope** per collection, exposed on the existing introspection surface (`xcatalog`, the collection-stats endpoint, the `_diagnostics` route-health surface) — not a new transport. Its shape:

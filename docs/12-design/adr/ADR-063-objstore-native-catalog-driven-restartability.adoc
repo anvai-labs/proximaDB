@@ -1,5 +1,5 @@
 = ADR-063: Object-store-native catalog & catalog-driven restartability (serverless posture)
-:status: Accepted (2026-07-16; r2 = pre-PUT fenced ordering + crash-idempotent materialization; r3 = incarnation-unique epoch, write_if_absent + digest-named commit-record segment, recovery compaction suppression, semantic legacy policy, GCS pagination, TST row; r3.1 = outer authenticated encryption envelope, acceptance-wording fix, production-backend contract-test row)
+:status: Accepted (2026-07-16; r2 = pre-PUT fenced ordering + crash-idempotent materialization; r3 = incarnation-unique epoch, write_if_absent + digest-named commit-record segment, recovery compaction suppression, semantic legacy policy, GCS pagination, TST row; r3.1 = outer authenticated encryption envelope, acceptance-wording fix, production-backend contract-test row). Amended 2026-11-19 (ADR-098-metadata-spine.adoc): D3 (ack ⇒ durable and LISTable on object store) and the WAL-object parts of D4 (pre-PUT ordering token, put-if-absent WAL objects, LIST-under-{collection}/wal/ replay) are scoped to durability_mode = object_store_serverless (ADR-098 D3); in local_volume, ADR-069 D1 governs ack durability. D4's rule "LIST is the discovery authority; manifests are caches" is mode-independent and governs segment discovery in both modes (ADR-098 D2 relies on it). D1 remains the single catalog-authority statement; ADR-032 and ADR-048 defer to it.
 :date: 2026-07-15
 :deciders: architecture
 :relates-to: ADR-020 (WAL authority), ADR-028 (anvaiops object-store deployment), ADR-031 (catalog object identity), ADR-036 (flat keys / access tier), ADR-045 (durable core vs rebuildable metadata), ADR-048 (SystemCatalog authority), TD-OBJSTORE-1..5, TD-CAT-4/5, CATALOG_OBJECT_STORE_DESIGN_REVIEW_2026_07_14
@@ -58,6 +58,14 @@ First principles for object storage:
   (bounded, parallel, once) achieves the same guarantee.
 
 == Decision
+
+*Amended 2026-11-19 (link:ADR-098-metadata-spine.adoc[ADR-098]):* D1 remains the single
+catalog-authority statement; ADR-032 and ADR-048 defer to it. D3 and the WAL-object parts
+of D4 (the pre-PUT ordering token, put-if-absent WAL objects, and LIST-under-`{collection}/wal/`
+replay) are scoped to `durability_mode = object_store_serverless` (ADR-098 D3); in
+`local_volume`, ADR-069 D1 governs ack durability. D4's rule "LIST is the discovery
+authority; manifests are caches" is *mode-independent*: it governs segment discovery in
+both modes, and ADR-098 D2 relies on it.
 
 **D1 — The catalog is object-store-native. No side RDBMS, ever.** `SystemCatalog`'s
 generation-fenced put-if-absent snapshot chain under `_operator/catalog/_manifests/`
@@ -238,6 +246,8 @@ by id. It caught batch 3; it stays red until D3-D5 land, and the CI wiring must 
 **red-first** on develop to prove the gate bites.
 
 == Deployment-profile clarification (2026-11-02)
+
+*Amended 2026-11-19 (link:ADR-098-metadata-spine.adoc[ADR-098]):* the two profiles described here are now a declared `durability_mode` (`local_volume` or `object_store_serverless`), resolved at boot per ADR-098 D3 — declared, or inferred (the global `wal_local_dir` if set, else the primary WAL location's scheme) and logged at INFO; there is no silent legacy path. D3 and the WAL-object parts of D4 apply to `object_store_serverless` only; D4's "LIST is the discovery authority; manifests are caches" rule applies in both modes.
 
 Cloud authority means committed bulk data and catalog metadata outlive compute. It does not
 require each insert to issue an object-store WAL PUT. The later

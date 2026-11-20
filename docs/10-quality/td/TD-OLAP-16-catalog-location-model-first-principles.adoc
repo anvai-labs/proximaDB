@@ -38,7 +38,7 @@ Parquet files are immediate children (DuckDB `read_parquet('{location}')`; DF li
 == Follow-ons (not blocking)
 
 1. **Default-location resolution** — blank `location` → `{warehouse_root}/{database}/{table}/` (like Hive's `hive.metastore.warehouse.dir`).
-2. **`metadata_url` default fix** — change the default from `file://./metadata` to `{data_dir}/metadata` (affects production, not just tests). Same residual as TD-CONV-1 (still the default, 2026-10-15); needs a mixed-read-safe migration story.
+2. **`metadata_url` default fix** — change the default from `file://./metadata` to `{data_dir}/metadata` (affects production, not just tests). Same residual as TD-CONV-1 (still the default, 2026-10-15); needs a mixed-read-safe migration story. *Moved 2026-11-19:* this follow-on is now owned by link:TD-CAT-11-catalog-survives-fresh-data-dir.adoc[TD-CAT-11] (same root cause); track it there.
 3. **Partitioned layouts** — `colname=value/` subdirs (`CatalogPartitionSpec` exists, impl stubbed).
 4. **Explicit commit-file skipping** — the `.parquet` extension filter works, but explicit `_`/`.` skip is more robust.
 5. **ClickBench harness `metadata_url`** — same stale `./metadata` issue (the ClickBench test also uses `Config::default()`).
