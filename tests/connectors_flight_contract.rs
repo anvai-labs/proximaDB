@@ -509,6 +509,7 @@ mod trino_flight_pilot {
             statistics: SplitStatistics::default(),
             locality: SplitLocality::default(),
             object_size: None,
+            etag: None,
         }
     }
 

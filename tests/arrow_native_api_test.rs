@@ -490,6 +490,7 @@ mod trino_tests {
                 ..Default::default()
             },
             object_size: None,
+            etag: None,
         };
 
         let trino_split = TrinoSplit::from_file_split(
@@ -626,6 +627,7 @@ mod duckdb_tests {
             statistics: SplitStatistics::default(),
             locality: SplitLocality::default(),
             object_size: None,
+            etag: None,
         }];
 
         let init_data = DuckDBInitData::new(splits);
@@ -649,6 +651,7 @@ mod duckdb_tests {
                 statistics: SplitStatistics::default(),
                 locality: SplitLocality::default(),
                 object_size: None,
+                etag: None,
             },
             FileSplit {
                 split_id: "s1".to_string(),
@@ -661,6 +664,7 @@ mod duckdb_tests {
                 statistics: SplitStatistics::default(),
                 locality: SplitLocality::default(),
                 object_size: None,
+                etag: None,
             },
         ];
 
@@ -722,6 +726,7 @@ mod hadoop_tests {
                 ..Default::default()
             },
             object_size: None,
+            etag: None,
         };
 
         let hadoop_split = HadoopInputSplit::from_file_split(file_split);
