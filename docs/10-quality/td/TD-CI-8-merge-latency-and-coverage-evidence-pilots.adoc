@@ -110,3 +110,48 @@ Track docs-only, SDK-docs, ordinary Rust, restart-sensitive Rust, lockfile and
 promotions separately. **Roll back to the original lanes** if executed test IDs fall
 out or the new path loses on latency or reliability. A failing dev build or integration
 test must still fail the gate in every variant.
+
+== Redundancy census (2026-11-20, post-#2540 pass)
+
+Two read-only censuses (jobs, step-blocks) over ci.yml / qa-gate.yml / prerelease-ci.yml
+classified every overlap candidate as STRICTLY-SUBSUMED, PARTIAL-OVERLAP, or DISTINCT.
+
+**Eliminated in the filing PR (pure dedup, gate semantics unchanged):**
+
+* `rust-compile` lib leg — `--workspace --lib --bins --tests` is a strict target
+  superset of `--workspace --lib --bins` (same toolchain/sccache/`check` shape; the
+  test shape is the only cache writer). ~12 runner-min on every PR. Sole cost:
+  lib-only compile failures surface at ~21 min instead of ~12 (feedback latency,
+  not coverage).
+* `python-sdk-codegen-drift` folded into `python-lint` — identical
+  checkout/setup-python/`pip install -e ".[dev]"`, and the drift check's black/isort
+  are installed there anyway. ~5–7 min per Python PR; `python-lint` gate widened with
+  `openapi_spec` (the drift check's input; mandate #15).
+
+**Owner decisions pending (each moves a gate or a metric — file the decision, then a PR):**
+
+|===
+| # | Candidate | Saving | Semantics change |
+| 1 | ci.yml `rust-coverage` (tarpaulin) vs qa-gate `rust-coverage-ratchet` (llvm-cov) both instrument the same lib at qa→main | 80–150 min/promotion | tarpaulin vs llvm-cov measure different percentages; floor + future rust baseline must be re-seeded against one metric (= Pilot 3) |
+| 2 | qa-gate `--qa` restart scope ⊇ ci.yml restart job except 4 TD-CACHE-7 lib tests | ~130 min/promotion | promotion proof moves from `CI Success` to qa-gate required check; verify branch protection lists qa-gate jobs |
+| 4 | SIFT ratchet runs at two scales at promotion | ~32 min/promotion | floors differ (10k/0.85 vs 100k/dataset) — pick the governing assertion |
+| 5ii | coverage rides `python-test` via per-file COVERAGE_FILE + `coverage combine` | ~6 min/python PR | ratchet exclusions would also stop gating pass/fail unless only cov flags are conditioned |
+| 8 | `rust-build-release` at develop→qa builds an artifact nobody downloads | 30–60 min/promotion | option (ii) drops the qa-tier release-compile proof |
+| 10 | `rust-affected-fast` duplicates `rust-test` unit signal (advisory) | ≤10 min/rust PR | loses early leaf-crate feedback |
+|===
+
+**Verified DISTINCT — do not re-litigate:** clippy vs check artifacts (different
+drivers), mlflow REST-conformance vs mlflow-s3-seam, feature-matrix legs
+(TD-CAT-8), benchmarks/tpc-ledger/sift (different targets/tiers/shapes),
+chunking vs unit dirs, Trivy vs cargo-audit, connectors vs lanes. No dead jobs.
+
+**Step-block fold (separate PR):** 38 copies of the checkout+toolchain+rust-cache
+triple, 40 apt blocks, 7 reclaim + 8 swap blocks → 4 composite actions
+(`rust-setup`, `runner-prep`, `python-setup`, `dockerhub-login`). ~0 wall-clock delta;
+the payoff is single-point maintenance (40+ sites → 1). HARD PREREQUISITE: retarget
+`check_deterministic_commit_contract.py` to match the composite call sites, assert the
+action file keeps prefix-key/add-job-id-key/env-step-level invariants (else the gate
+fails vacuously or goes silently blind), add contract fixtures for the composite form,
+and add `.github/actions/**` to the selfdef filter groups. Timing pairs stay inline;
+reclaim/swap ordering (pre-checkout) means a local composite only works placed after
+checkout — functionally safe, preserve if deemed semantic.

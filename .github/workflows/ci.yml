@@ -216,7 +216,7 @@ jobs:
       # LIGHT/fast; this catches drift/flakes the instant a merge lands them on the
       # branch, so they can't accumulate invisibly and block the next triggering PR.
       # The drift jobs (rust-format, rust-clippy, proto-compat, openapi-spec-drift,
-      # python-lint, the 4 sdk-codegen-drifts, go/nodejs/rust-sdk-lint) OR this `sweep`
+      # python-lint, the 3 sdk-codegen-drifts, go/nodejs/rust-sdk-lint) OR this `sweep`
       # into their `if:`.
       sweep: ${{ github.event_name == 'push' }}
       # CI redesign PR1: the develop-push CACHE WRITER. rust-cache saves ONLY on
@@ -1293,33 +1293,6 @@ jobs:
   # if the committed copy has drifted from the spec — the same generated-artifact
   # pattern as go-sdk-codegen-drift / ts-sdk-codegen-drift / rust-sdk-codegen-drift
   # / openapi-spec-drift. Regenerate locally with: make gen-python-sdk
-  python-sdk-codegen-drift:
-    name: Python SDK Codegen Drift (TD-126)
-    runs-on: ubuntu-24.04
-    timeout-minutes: 20
-    # max 7 min over 14 runs, 2026-10-09..11 (run 37870748694)
-    needs: changes
-    if: needs.changes.outputs.sweep == 'true' || needs.changes.outputs.python == 'true' || needs.changes.outputs.openapi_spec == 'true'
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
-        with:
-          python-version: "3.11"
-      # The SDK's own black + isort run the deterministic formatting pass inside
-      # gen.sh, so install them (the generator itself runs in its own pinned
-      # venv that gen.sh provisions from codegen/requirements.txt).
-      - name: Install the SDK's formatters (black + isort)
-        working-directory: clients/python
-        run: pip install -e ".[dev]"
-      - name: Regenerate the Python REST transport from the OpenAPI spec
-        env:
-          PYTHON: python
-        run: make gen-python-sdk
-      - name: Fail on uncommitted drift in the generated Python client
-        run: |
-          git diff --exit-code -- clients/python/src/proximadb_sdk/_generated/ \
-            || (echo "::error::clients/python/src/proximadb_sdk/_generated has drifted from the OpenAPI spec. Run 'make gen-python-sdk' and commit the result." && exit 1)
-
   # ADR-068 D5 — the BLOCKING behavioral SDK gate: drive the shipped Python
   # facade through the real REST transport against a live server (create→insert→
   # search→get→delete). The codegen-drift gates cannot see facade bugs (S2a/S2b
@@ -1816,7 +1789,13 @@ jobs:
     timeout-minutes: 25
     # was 15 against a 12.8-min green span (SDK dependency install)
     needs: changes
-    if: needs.changes.outputs.sweep == 'true' || needs.changes.outputs.python == 'true' || needs.changes.outputs.proto == 'true'
+    # TD-CI-8 job census: absorbs python-sdk-codegen-drift (deleted). Same
+    # checkout + setup-python + `pip install -e ".[dev]"` the drift job paid
+    # for separately, and black/isort it needs are installed here anyway.
+    # Gate widened with `openapi_spec`: the drift check's INPUT is the spec,
+    # so a spec-only PR must still re-run it (mandate #15: spec change ⇒
+    # regenerate every SDK in the same PR).
+    if: needs.changes.outputs.sweep == 'true' || needs.changes.outputs.python == 'true' || needs.changes.outputs.proto == 'true' || needs.changes.outputs.openapi_spec == 'true'
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
@@ -1848,6 +1827,19 @@ jobs:
             src/proximadb_sdk/proto_conversion.py \
             src/proximadb_sdk/integrations/ \
             || echo "::warning::mypy type checking found issues"
+
+      # TD-CI-8 job census: the former python-sdk-codegen-drift job, folded in.
+      # The SDK's own black + isort run the deterministic formatting pass inside
+      # gen.sh, so install them (the generator itself runs in its own pinned
+      # venv that gen.sh provisions from codegen/requirements.txt).
+      - name: Regenerate the Python REST transport from the OpenAPI spec (TD-126 drift)
+        env:
+          PYTHON: python
+        run: make gen-python-sdk
+      - name: Fail on uncommitted drift in the generated Python client
+        run: |
+          git diff --exit-code -- clients/python/src/proximadb_sdk/_generated/ \
+            || (echo "::error::clients/python/src/proximadb_sdk/_generated has drifted from the OpenAPI spec. Run 'make gen-python-sdk' and commit the result." && exit 1)
 
   # ShellCheck + actionlint on the packaging gate scripts and the release
   # workflows, wired into ci-success.needs so a red lane BLOCKS (review F1:
@@ -2324,7 +2316,7 @@ jobs:
         run: python3 scripts/check_status_as_of.py
 
   # ============================================================================
-  # COMPILE GATE - lib + test shapes, both REQUIRED, in parallel
+  # COMPILE GATE - workspace lib+bins+tests, REQUIRED
   # ============================================================================
   # Gated ONLY by the comprehensive `compile` path filter (a deliberate SUPERSET
   # of everything `cargo check --workspace` reads: src/**, crates/**, apps/**,
@@ -2347,30 +2339,25 @@ jobs:
   # benches are disabled in Cargo.toml; the rest compile). Examples are still
   # excluded (separate rot).
   rust-compile:
-    name: Rust Compile (${{ matrix.shape }})
+    name: Rust Compile (test)
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     # max 32 min over 14 runs, 2026-10-09..11 (run 37926571641, `Rust Compile
-    # (test)`), 2 legs (lib/test). An earlier comment said 28 min / 4 legs: 28
-    # understated the window, and the 4 counted the SEPARATE rust-compile-benches
-    # job, whose literal name `Rust Compile (benches)` the prefix also matches.
+    # (test)`). Was a lib/test matrix; the lib leg was REMOVED (TD-CI-8 job
+    # census, strictly-subsumed): `--workspace --lib --bins --tests` compiles
+    # a strict SUPERSET of `--workspace --lib --bins` with the same toolchain,
+    # sccache and cache shape, so the smaller leg bought a faster-grained
+    # failure signal, never extra gate coverage (~12 runner-min per PR back).
+    # Keep the `(test)` display suffix: test fixtures key on the job name.
     needs: changes
     if: needs.changes.outputs.compile == 'true'
     # CARGO_BUILD_JOBS=1: serial compilation keeps peak memory bounded. The
-    # `test` shape compiles every crate's test targets at once and OOM-killed the
-    # runner (exit 143) under default parallelism; serial is the repo's standard
-    # fix for the root-crate test compile (mirrors the rust-test job).
+    # test-target compile OOM-killed the runner (exit 143) under default
+    # parallelism; serial is the repo's standard fix for the root-crate test
+    # compile (mirrors the rust-test job).
     # Job-level CARGO_*/RUST* env is folded into the rust-cache key, so it lives
     # on the build steps instead: a job-level value would give this job a
     # different key from the shape's writer and it would never restore.
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - shape: lib
-            args: "--workspace --lib --bins"
-          - shape: test
-            args: "--workspace --lib --bins --tests"
     steps:
       - uses: actions/checkout@v7
 
@@ -2386,7 +2373,7 @@ jobs:
           prefix-key: "v2-rust"
           shared-key: "check"
           add-job-id-key: false
-          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/develop' && matrix.shape == 'test' }}
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/develop' }}
 
       # sccache complements rust-cache: caches individual rustc invocations
       # (content-addressed), so it hits even when the target/ artifact cache misses.
@@ -2402,12 +2389,12 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libssl-dev pkg-config protobuf-compiler
 
-      - name: cargo check ${{ matrix.args }}
+      - name: cargo check --workspace --lib --bins --tests
         env:
           CARGO_BUILD_JOBS: 1
           RUSTC_WRAPPER: sccache
           SCCACHE_DIR: /home/runner/.cache/sccache
-        run: cargo check ${{ matrix.args }}
+        run: cargo check --workspace --lib --bins --tests
 
       - name: sccache stats
         env:
@@ -4700,7 +4687,6 @@ jobs:
       - nodejs-lint
       - ui-build
       - ts-sdk-codegen-drift
-      - python-sdk-codegen-drift
       - python-sdk-round-trip
       - rust-sdk-lint
       - sdk-security-scan
@@ -4735,7 +4721,7 @@ jobs:
           echo "::error::Promotion PR is stale — refresh from the source branch before merging (else commits are dropped). See the 'Promotion Freshness' job for the missing commits."
           exit 1
 
-      # HARD GATE — Rust lib + test compile (the `rust-compile` matrix) must pass
+      # HARD GATE — workspace lib+bins+tests compile (rust-compile) must pass
       # whenever it runs. `rust-compile` is gated on the comprehensive `compile`
       # path filter (a SUPERSET of all code paths), so it is `skipped` ONLY for a
       # docs/non-code-only diff — safe to let through (nothing to compile).
@@ -4747,14 +4733,14 @@ jobs:
       # array with unescaped `"` into `results="..."`, which broke bash quoting so
       # it NEVER matched — `CI Success` silently passed through every failure (it
       # let the non-compiling develop of #226 merge). Do NOT restore that grep.
-      - name: Require Rust compile (lib + test)
+      - name: Require Rust compile
         if: ${{ needs.rust-compile.result == 'failure' || needs.rust-compile.result == 'cancelled' }}
         run: |
-          echo "::error::Rust Compile (lib and/or test shape) did not pass — blocking merge."
+          echo "::error::Rust Compile (workspace lib + bins + tests) did not pass — blocking merge."
           {
             echo "## CI Results Summary"
             echo ""
-            echo "❌ Rust Compile (lib + test) is a required merge gate and did not pass."
+            echo "❌ Rust Compile is a required merge gate and did not pass."
           } >> "$GITHUB_STEP_SUMMARY"
           exit 1
 
@@ -4781,5 +4767,5 @@ jobs:
           {
             echo "## CI Results Summary"
             echo ""
-            echo "✅ Rust Compile (lib + test) passed."
+            echo "✅ Rust Compile passed."
           } >> "$GITHUB_STEP_SUMMARY"
