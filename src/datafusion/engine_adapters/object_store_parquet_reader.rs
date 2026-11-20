@@ -896,6 +896,98 @@ pub struct ObjectStoreParquetTable {
     /// Consulted before row-group pruning to drop whole files a pushed-down
     /// filter provably cannot match.
     manifest_file_stats: Arc<HashMap<String, Arc<FileManifestStats>>>,
+    /// TD-SPINE-4 lazy footer discovery: for a manifest-selected open through
+    /// [`open_object_store_parquet_location`], only the first file's footer
+    /// (the schema source) is read at open; every other file's HEAD + footer
+    /// is read by `scan()` once the pushed-down filters are known, and never
+    /// for a file the manifest bounds prune. `None` = eager discovery
+    /// (`splits` / `file_sizes` hold every file).
+    lazy_footers: Option<Arc<LazyFooters>>,
+}
+
+/// Kill-switch for lazy footer discovery (unset = lazy on).
+pub(crate) const LAZY_FOOTER_DISABLE_ENV: &str = "PROXIMADB_OLAP_LAZY_FOOTER_DISABLE";
+
+fn lazy_footers_enabled() -> bool {
+    !proximadb_iceberg_engine::retention::disable_flag(
+        std::env::var(LAZY_FOOTER_DISABLE_ENV).ok().as_deref(),
+    )
+}
+
+/// How many footers a scan resolves concurrently (bounded fan-out).
+const LAZY_FOOTER_CONCURRENCY: usize = 8;
+
+/// One data file's footer discovery: its object size and row-group splits.
+#[derive(Debug)]
+struct ResolvedFooter {
+    size: u64,
+    splits: Vec<FileSplit>,
+}
+
+/// Per-table lazy footer state (see `ObjectStoreParquetTable::lazy_footers`).
+#[derive(Debug)]
+struct LazyFooters {
+    /// Every selected data file (full path), in the eager open's order.
+    files: Vec<Path>,
+    /// Footers resolved so far, keyed by full path.
+    resolved: Mutex<HashMap<String, Arc<ResolvedFooter>>>,
+    /// Serializes resolution so concurrent scans never fetch one footer twice.
+    resolving: tokio::sync::Mutex<()>,
+}
+
+impl LazyFooters {
+    fn resolved(&self) -> HashMap<String, Arc<ResolvedFooter>> {
+        self.resolved
+            .lock()
+            .map(|m| m.clone())
+            .unwrap_or_else(|p| p.into_inner().clone())
+    }
+
+    /// The resolved files' splits and sizes, in file order, skipping `skip`.
+    fn assemble(&self, skip: &HashSet<String>) -> (Vec<FileSplit>, HashMap<String, u64>) {
+        let resolved = self.resolved();
+        let mut splits = Vec::new();
+        let mut sizes = HashMap::new();
+        for file in &self.files {
+            if skip.contains(file.as_ref()) {
+                continue;
+            }
+            if let Some(footer) = resolved.get(file.as_ref()) {
+                splits.extend(footer.splits.iter().cloned());
+                sizes.insert(file.as_ref().to_string(), footer.size);
+            }
+        }
+        (splits, sizes)
+    }
+
+    fn complete(&self) -> bool {
+        let resolved = self.resolved();
+        self.files.iter().all(|f| resolved.contains_key(f.as_ref()))
+    }
+}
+
+/// Read one data file's footer: its planning schema and row-group splits.
+/// Validates that every deleted position lies inside the file.
+async fn read_footer(
+    store: &Arc<dyn ObjectStore>,
+    path: &Path,
+    size: Option<u64>,
+    deletions: &HashMap<String, Arc<PositionDeletes>>,
+) -> DFResult<(SchemaRef, Vec<FileSplit>)> {
+    let reader = parquet_reader(store.clone(), path.clone(), size);
+    let builder = ParquetRecordBatchStreamBuilder::new(reader)
+        .await
+        .map_err(|e| df_err(&format!("parquet metadata {path}"), e))?;
+    crate::observability::io_trace::record_parquet_footer_reads(1);
+    if let Some(deleted) = deletions.get(path.as_ref()) {
+        let rows = u64::try_from(builder.metadata().file_metadata().num_rows())
+            .map_err(|e| df_err("negative parquet row count", e))?;
+        if deleted.count_range(0, rows) != deleted.cardinality() {
+            return Err(df_err("open deletion vector", "position outside data file"));
+        }
+    }
+    let schema = builder.schema().clone();
+    Ok((schema, row_group_splits(path.clone(), builder.metadata())))
 }
 
 /// Metadata subdirectory beneath the table base, matching the writer's
@@ -934,10 +1026,18 @@ impl ObjectStoreParquetTable {
     /// [`open`](Self::open) on behalf of `tenant`: the manifest cache
     /// (TD-SPINE-4) accounts the parsed snapshot to that tenant's fair share.
     pub async fn open_for_tenant(location: &str, tenant: Option<&str>) -> DFResult<Self> {
+        Self::open_with(location, tenant, false).await
+    }
+
+    /// `lazy` = defer manifest-selected files' footers to `scan()` (TD-SPINE-4);
+    /// only the registration path asks for it, because the sync accessors
+    /// (`estimated_rows`, `aggregate_numeric_bounds`, …) answer only once
+    /// every footer is known.
+    async fn open_with(location: &str, tenant: Option<&str>, lazy: bool) -> DFResult<Self> {
         if has_parquet_extension(location) {
             return Self::open_direct_object(location).await;
         }
-        Self::open_bridge_base(location, tenant).await
+        Self::open_bridge_base(location, tenant, lazy).await
     }
 
     /// Derive the table base from a published data location.
@@ -1115,10 +1215,13 @@ impl ObjectStoreParquetTable {
         }))
     }
 
-    async fn open_bridge_base(location: &str, tenant: Option<&str>) -> DFResult<Self> {
+    async fn open_bridge_base(location: &str, tenant: Option<&str>, lazy: bool) -> DFResult<Self> {
         // Manifest first; listing only when the table has no metadata log
         // (see `manifest_selected_files`).
         if let Some(selected) = Self::manifest_selected_files(location, tenant).await? {
+            if lazy && lazy_footers_enabled() {
+                return Self::open_manifest_lazy(selected, location).await;
+            }
             let mut table = Self::open_relative(
                 selected.bridge,
                 selected.paths,
@@ -1199,6 +1302,146 @@ impl ObjectStoreParquetTable {
         Ok(table)
     }
 
+    /// TD-SPINE-4 lazy open of a manifest selection: HEAD + footer of the
+    /// FIRST file only — the schema source, the same file the eager open takes
+    /// it from, so the planning schema is identical — and every other file
+    /// recorded for `scan()` to resolve once the filters are known.
+    async fn open_manifest_lazy(selected: ManifestSelection, location: &str) -> DFResult<Self> {
+        let store = TracingObjectStore::wrap(selected.bridge.inner_store());
+        let files: Vec<Path> = selected
+            .paths
+            .iter()
+            .map(|relative| selected.bridge.full_object_path(relative))
+            .collect();
+        let first = files
+            .first()
+            .ok_or_else(|| df_err("open object-store parquet", "no parquet files"))?;
+        let size = store
+            .head(first)
+            .await
+            .map_err(|e| df_err(&format!("head {first}"), e))?
+            .size;
+        let (schema, splits) = read_footer(&store, first, Some(size), &selected.deletions).await?;
+        let lazy = LazyFooters {
+            resolved: Mutex::new(HashMap::from([(
+                first.as_ref().to_string(),
+                Arc::new(ResolvedFooter { size, splits }),
+            )])),
+            files,
+            resolving: tokio::sync::Mutex::new(()),
+        };
+        Ok(Self {
+            schema: Self::normalize_schema_for_planning(schema),
+            store,
+            splits: Vec::new(),
+            file_sizes: HashMap::new(),
+            deletions: selected.deletions,
+            location: location.to_string(),
+            table_name: None,
+            split_key_cache: Arc::new(Mutex::new(HashMap::new())),
+            row_group_bloom_cache: Arc::new(Mutex::new(HashMap::new())),
+            stats_trust: proximadb_data_model::StatsTrust::Trusted,
+            snapshot_version: Some(selected.version),
+            manifest_file_stats: Arc::new(selected.file_stats),
+            lazy_footers: Some(Arc::new(lazy)),
+        })
+    }
+
+    /// The splits and file sizes a scan with `filters` reads from: every split
+    /// for an eager table; for a lazy one, the footers of every file the
+    /// manifest bounds do not prune are resolved first (bounded concurrency,
+    /// each footer at most once per table), and only those files' splits are
+    /// returned.
+    async fn scan_inputs(
+        &self,
+        filters: &[Expr],
+    ) -> DFResult<(
+        std::borrow::Cow<'_, [FileSplit]>,
+        std::borrow::Cow<'_, HashMap<String, u64>>,
+    )> {
+        use std::borrow::Cow;
+        let Some(lazy) = &self.lazy_footers else {
+            return Ok((Cow::Borrowed(&self.splits), Cow::Borrowed(&self.file_sizes)));
+        };
+        let pruned = self.manifest_pruned_files(filters);
+        {
+            let _serial = lazy.resolving.lock().await;
+            let resolved = lazy.resolved();
+            let missing: Vec<Path> = lazy
+                .files
+                .iter()
+                .filter(|f| !pruned.contains(f.as_ref()) && !resolved.contains_key(f.as_ref()))
+                .cloned()
+                .collect();
+            let store = self.store.clone();
+            let deletions = &self.deletions;
+            let mut footers = futures::stream::iter(missing.into_iter().map(|path| {
+                let store = store.clone();
+                async move {
+                    let size = store
+                        .head(&path)
+                        .await
+                        .map_err(|e| df_err(&format!("head {path}"), e))?
+                        .size;
+                    let (_, splits) = read_footer(&store, &path, Some(size), deletions).await?;
+                    Ok::<_, DataFusionError>((path, ResolvedFooter { size, splits }))
+                }
+            }))
+            .buffered(LAZY_FOOTER_CONCURRENCY);
+            while let Some(footer) = footers.next().await {
+                let (path, footer) = footer?;
+                // Never drop a resolved footer (a missing one would silently
+                // drop its file's rows): recover a poisoned map instead.
+                lazy.resolved
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .insert(path.as_ref().to_string(), Arc::new(footer));
+            }
+        }
+        if lazy.complete() {
+            // The shape stat the registration path records for eager tables
+            // (zero extra I/O: every footer is now known).
+            let (all, _) = lazy.assemble(&HashSet::new());
+            crate::query::route_cost_model::record_table_shape_stat(
+                &self.location,
+                u32::try_from(all.len()).unwrap_or(u32::MAX),
+                rows_of(&all),
+            );
+        }
+        let resolved = lazy.resolved();
+        if let Some(unresolved) = lazy
+            .files
+            .iter()
+            .find(|f| !pruned.contains(f.as_ref()) && !resolved.contains_key(f.as_ref()))
+        {
+            // Fail closed: a kept file without splits would drop its rows.
+            return Err(df_err(
+                "lazy parquet footers",
+                format!("{unresolved} unresolved"),
+            ));
+        }
+        let (splits, sizes) = lazy.assemble(&pruned);
+        Ok((Cow::Owned(splits), Cow::Owned(sizes)))
+    }
+
+    /// Whether every file's footer is known (always for an eager table). The
+    /// sync statistics accessors answer only then: a partial view would
+    /// understate rows and bounds.
+    pub fn footers_complete(&self) -> bool {
+        self.lazy_footers
+            .as_ref()
+            .is_none_or(|lazy| lazy.complete())
+    }
+
+    /// Every known split: all of them for an eager table, the resolved files'
+    /// (in file order) for a lazy one.
+    fn known_splits(&self) -> std::borrow::Cow<'_, [FileSplit]> {
+        match &self.lazy_footers {
+            None => std::borrow::Cow::Borrowed(&self.splits),
+            Some(lazy) => std::borrow::Cow::Owned(lazy.assemble(&HashSet::new()).0),
+        }
+    }
+
     async fn open_direct_object(location: &str) -> DFResult<Self> {
         // Resolve through the shared factory rather than a bare `object_store::parse_url`:
         // the factory forwards the process environment (`AWS_*`/`AZURE_*`/`GOOGLE_*`
@@ -1233,25 +1476,14 @@ impl ObjectStoreParquetTable {
         let mut splits = Vec::new();
         let mut file_sizes = HashMap::new();
         for (path, size) in files {
-            let reader = parquet_reader(store.clone(), path.clone(), size);
-            let builder = ParquetRecordBatchStreamBuilder::new(reader)
-                .await
-                .map_err(|e| df_err(&format!("parquet metadata {path}"), e))?;
-            if let Some(deleted) = deletions.get(path.as_ref()) {
-                let rows = u64::try_from(builder.metadata().file_metadata().num_rows())
-                    .map_err(|e| df_err("negative parquet row count", e))?;
-                if deleted.count_range(0, rows) != deleted.cardinality() {
-                    return Err(df_err("open deletion vector", "position outside data file"));
-                }
-            }
-            let file_schema = builder.schema().clone();
+            let (file_schema, file_splits) = read_footer(&store, &path, size, &deletions).await?;
             if schema.is_none() {
                 schema = Some(Self::normalize_schema_for_planning(file_schema));
             }
             if let Some(size) = size {
                 file_sizes.insert(path.as_ref().to_string(), size);
             }
-            splits.extend(row_group_splits(path, builder.metadata()));
+            splits.extend(file_splits);
         }
 
         Ok(Self {
@@ -1269,6 +1501,7 @@ impl ObjectStoreParquetTable {
             // Only the manifest path proves a version; `open_relative` stamps it.
             snapshot_version: None,
             manifest_file_stats: Arc::default(),
+            lazy_footers: None,
         })
     }
 
@@ -1342,6 +1575,7 @@ impl ObjectStoreParquetTable {
             // never eligible for the ordered-DV merge (fail-closed).
             snapshot_version: None,
             manifest_file_stats: Arc::default(),
+            lazy_footers: None,
         })
     }
 
@@ -1372,6 +1606,16 @@ impl ObjectStoreParquetTable {
         if !self.deletions.is_empty() {
             return None;
         }
+        if let Some(lazy) = &self.lazy_footers {
+            // Every selected file, sized where its footer is already known.
+            let resolved = lazy.resolved();
+            let files = lazy
+                .files
+                .iter()
+                .map(|f| (f.clone(), resolved.get(f.as_ref()).map(|r| r.size)))
+                .collect();
+            return Some((self.store.clone(), files, self.schema.clone()));
+        }
         let mut seen = std::collections::BTreeSet::new();
         let mut files: Vec<(Path, Option<u64>)> = Vec::new();
         for split in &self.splits {
@@ -1400,32 +1644,34 @@ impl ObjectStoreParquetTable {
         self
     }
 
-    /// Number of row-group splits before runtime filter pruning.
+    /// Number of row-group splits before runtime filter pruning — of the
+    /// files whose footers are known (all of them unless lazy; see
+    /// [`footers_complete`](Self::footers_complete)).
     pub fn split_count(&self) -> usize {
-        self.splits.len()
+        self.known_splits().len()
     }
 
     /// Total rows across all row-group splits (from Parquet footer statistics),
     /// or `None` when no split carries a row count. Footer-`fresh` — used by the
     /// read-route EXPLAIN to disclose the table's estimated scan cardinality.
+    /// `None` while lazy footers are unresolved (a partial sum understates).
     pub fn estimated_rows(&self) -> Option<u64> {
-        let mut total = 0u64;
-        let mut any = false;
-        for split in &self.splits {
-            if let Some(rows) = split.statistics.row_count {
-                total = total.saturating_add(rows);
-                any = true;
-            }
+        if !self.footers_complete() {
+            return None;
         }
-        any.then_some(total)
+        rows_of(&self.known_splits())
     }
 
     /// Total on-disk bytes across all row-group splits (from Parquet footer
     /// statistics), or `None` when no split carries a byte size.
+    /// `None` while lazy footers are unresolved.
     pub fn estimated_bytes(&self) -> Option<u64> {
+        if !self.footers_complete() {
+            return None;
+        }
         let mut total = 0u64;
         let mut any = false;
-        for split in &self.splits {
+        for split in self.known_splits().iter() {
             if let Some(bytes) = split.statistics.byte_size {
                 total = total.saturating_add(bytes);
                 any = true;
@@ -1441,14 +1687,20 @@ impl ObjectStoreParquetTable {
     /// carries numeric bounds for the column (a partially-covered column would
     /// understate the range), or the bounds are non-numeric (truncated string
     /// stats → the caller scans, matching DataFusion's `Inexact` guard).
+    /// `None` while lazy footers are unresolved (an unread file could hold
+    /// the extreme).
     pub fn aggregate_numeric_bounds(&self, col: &str) -> Option<(f64, f64, u64)> {
-        if self.splits.is_empty() {
+        if !self.footers_complete() {
+            return None;
+        }
+        let splits = self.known_splits();
+        if splits.is_empty() {
             return None;
         }
         let mut lo = f64::INFINITY;
         let mut hi = f64::NEG_INFINITY;
         let mut nulls: u64 = 0;
-        for split in &self.splits {
+        for split in splits.iter() {
             let cb = split.statistics.column_stats.get(col)?;
             nulls = nulls.saturating_add(cb.null_count);
             let mn = cb.min.as_ref()?.as_f64()?;
@@ -1534,15 +1786,25 @@ impl ObjectStoreParquetTable {
         }
     }
 
+    #[cfg(test)]
     fn reader(
         &self,
         filters: &[Expr],
         spec: SpecPruneConfig,
     ) -> Arc<ObjectStoreParquetSplitReader> {
+        self.reader_over(filters, spec, &self.file_sizes)
+    }
+
+    fn reader_over(
+        &self,
+        filters: &[Expr],
+        spec: SpecPruneConfig,
+        file_sizes: &HashMap<String, u64>,
+    ) -> Arc<ObjectStoreParquetSplitReader> {
         Arc::new(ObjectStoreParquetSplitReader {
             schema: self.schema.clone(),
             store: self.store.clone(),
-            file_sizes: self.file_sizes.clone(),
+            file_sizes: file_sizes.clone(),
             deletions: self.deletions.clone(),
             static_predicates: if spec.page_prune {
                 conjunctive_predicates(filters)
@@ -1581,6 +1843,17 @@ impl ObjectStoreParquetTable {
         cfg: SemijoinConfig,
         spec: SpecPruneConfig,
     ) -> (Vec<FileSplit>, usize) {
+        self.prune_splits_over(&self.known_splits(), filters, cfg, spec)
+    }
+
+    /// [`prune_splits_with`](Self::prune_splits_with) over `splits`.
+    fn prune_splits_over(
+        &self,
+        splits: &[FileSplit],
+        filters: &[Expr],
+        cfg: SemijoinConfig,
+        spec: SpecPruneConfig,
+    ) -> (Vec<FileSplit>, usize) {
         let manifest_pruned = self.manifest_pruned_files(filters);
         // Build this query's per-column in-list blooms once (cheap; reused across
         // every split), then hold the split-key cache for the whole pass.
@@ -1613,8 +1886,7 @@ impl ObjectStoreParquetTable {
                 split_keys,
             });
         let mut bloom_pruned = 0usize;
-        let kept = self
-            .splits
+        let kept = splits
             .iter()
             .filter(|split| {
                 if manifest_pruned.contains(&split.file_path) {
@@ -1680,14 +1952,29 @@ impl ObjectStoreParquetTable {
     /// split's distinct join-key set via a projected read of just that column.
     /// Splits the zone-map already prunes are skipped, so extra metadata/key
     /// reads are paid only where the bloom can actually help.
+    #[cfg(test)]
     async fn prepare_split_keys(
         &self,
         filters: &[Expr],
         cfg: SemijoinConfig,
         spec: SpecPruneConfig,
     ) {
+        self.prepare_split_keys_over(&self.known_splits(), &self.file_sizes, filters, cfg, spec)
+            .await;
+    }
+
+    /// [`prepare_split_keys`](Self::prepare_split_keys) over `splits`.
+    async fn prepare_split_keys_over(
+        &self,
+        splits: &[FileSplit],
+        file_sizes: &HashMap<String, u64>,
+        filters: &[Expr],
+        cfg: SemijoinConfig,
+        spec: SpecPruneConfig,
+    ) {
         if spec.bloom_read {
-            self.prefetch_point_probe_blooms(filters).await;
+            self.prefetch_point_probe_blooms(splits, file_sizes, filters)
+                .await;
         }
         if !cfg.enabled {
             return;
@@ -1703,7 +1990,7 @@ impl ObjectStoreParquetTable {
         // Files the manifest bounds already exclude need no Bloom/key reads.
         let manifest_pruned = self.manifest_pruned_files(filters);
         let mut missing_native: HashMap<(String, String), Vec<usize>> = HashMap::new();
-        for split in &self.splits {
+        for split in splits {
             if manifest_pruned.contains(&split.file_path) {
                 continue;
             }
@@ -1735,7 +2022,7 @@ impl ObjectStoreParquetTable {
             row_groups.sort_unstable();
             row_groups.dedup();
             let blooms = self
-                .read_row_group_blooms(&file_path, &column, &row_groups)
+                .read_row_group_blooms(file_sizes, &file_path, &column, &row_groups)
                 .await;
             if let Ok(mut cache) = self.row_group_bloom_cache.lock() {
                 for (rg, bloom) in blooms {
@@ -1744,7 +2031,7 @@ impl ObjectStoreParquetTable {
             }
         }
 
-        for split in &self.splits {
+        for split in splits {
             let Some(rg) = row_group_index(split) else {
                 continue;
             };
@@ -1771,7 +2058,9 @@ impl ObjectStoreParquetTable {
                 if already {
                     continue;
                 }
-                let keys = self.build_split_keys(&split.file_path, rg, column).await;
+                let keys = self
+                    .build_split_keys(file_sizes, &split.file_path, rg, column)
+                    .await;
                 if let Ok(mut cache) = self.split_key_cache.lock() {
                     cache.insert(key, keys.map(Arc::new));
                 }
@@ -1784,7 +2073,12 @@ impl ObjectStoreParquetTable {
     /// column's persisted row-group Bloom filter into the cache so the
     /// synchronous pruning pass can test the probe values. Only columns whose
     /// chunk metadata advertises a Bloom filter are fetched.
-    async fn prefetch_point_probe_blooms(&self, filters: &[Expr]) {
+    async fn prefetch_point_probe_blooms(
+        &self,
+        splits: &[FileSplit],
+        file_sizes: &HashMap<String, u64>,
+        filters: &[Expr],
+    ) {
         let mut probes: Vec<(String, Vec<ScalarValue>)> = Vec::new();
         for filter in filters {
             collect_point_probes(filter, &mut probes);
@@ -1793,7 +2087,7 @@ impl ObjectStoreParquetTable {
             return;
         }
         let mut wanted: HashMap<(String, String), Vec<usize>> = HashMap::new();
-        for split in &self.splits {
+        for split in splits {
             let Some(rg) = row_group_index(split) else {
                 continue;
             };
@@ -1824,7 +2118,7 @@ impl ObjectStoreParquetTable {
             row_groups.sort_unstable();
             row_groups.dedup();
             let blooms = self
-                .read_row_group_blooms(&file_path, &column, &row_groups)
+                .read_row_group_blooms(file_sizes, &file_path, &column, &row_groups)
                 .await;
             if let Ok(mut cache) = self.row_group_bloom_cache.lock() {
                 for (rg, bloom) in blooms {
@@ -1840,6 +2134,7 @@ impl ObjectStoreParquetTable {
     /// materializing its key column.
     async fn read_row_group_blooms(
         &self,
+        file_sizes: &HashMap<String, u64>,
         file_path: &str,
         column: &str,
         row_groups: &[usize],
@@ -1849,7 +2144,7 @@ impl ObjectStoreParquetTable {
         };
         let data_type = self.schema.field(field_index).data_type().clone();
         let path = Path::from(file_path);
-        let file_size = self.file_sizes.get(file_path).copied();
+        let file_size = file_sizes.get(file_path).copied();
         let reader = parquet_reader(self.store.clone(), path, file_size);
         let Ok(mut stream_builder) = ParquetRecordBatchStreamBuilder::new(reader).await else {
             return row_groups.iter().map(|&rg| (rg, None)).collect();
@@ -1890,6 +2185,7 @@ impl ObjectStoreParquetTable {
     /// and falls back to min/max (never a false negative).
     async fn build_split_keys(
         &self,
+        file_sizes: &HashMap<String, u64>,
         file_path: &str,
         rg_index: usize,
         column: &str,
@@ -1897,7 +2193,7 @@ impl ObjectStoreParquetTable {
         let field_index = self.schema.index_of(column).ok()?;
         let family = column_key_family(self.schema.field(field_index).data_type())?;
         let path = Path::from(file_path);
-        let file_size = self.file_sizes.get(file_path).copied();
+        let file_size = file_sizes.get(file_path).copied();
         let reader = parquet_reader(self.store.clone(), path, file_size);
         let stream_builder = ParquetRecordBatchStreamBuilder::new(reader).await.ok()?;
         let mask = ProjectionMask::roots(stream_builder.parquet_schema(), [field_index]);
@@ -1960,14 +2256,21 @@ impl TableProvider for ObjectStoreParquetTable {
         // ADR-050 D2 / TD-DFR-1: footer-derived, zero-new-scan column
         // statistics so the planner stops planning blind. Typed min/max value
         // bounds are opt-in (default OFF) — see `df_stats_value_bounds_enabled`.
+        // TD-SPINE-4 lazy footers: whole-table statistics only once every
+        // footer is known — a partial view would understate rows and bounds.
+        // The scan's own (post-prune) statistics are always exact.
+        if !self.footers_complete() {
+            return None;
+        }
+        let splits = self.known_splits();
         let mut stats = statistics_from_splits(
-            &self.splits,
+            &splits,
             &self.schema,
             self.table_name.as_deref(),
             df_stats_value_bounds_enabled(),
             self.stats_trust,
         );
-        Self::apply_deletion_statistics(&self.deletions, &self.splits, &self.splits, &mut stats);
+        Self::apply_deletion_statistics(&self.deletions, &splits, &splits, &mut stats);
         Some(stats)
     }
 
@@ -1981,12 +2284,17 @@ impl TableProvider for ObjectStoreParquetTable {
         let target_partitions = state.config().target_partitions();
         let semijoin_cfg = SemijoinConfig::from_env();
         let spec_cfg = SpecPruneConfig::from_env();
+        // TD-SPINE-4: a lazy table resolves the footers of the files the
+        // manifest bounds keep, now that the filters are known; `splits` is
+        // every candidate split (all of them for an eager table).
+        let (splits, file_sizes) = self.scan_inputs(filters).await?;
         // TD-OLAP-3 bloom semi-join + spec SBBF point probes: prefetch per-split
         // Bloom filters (persisted) or join-key sets (fallback) so `prune_splits`
         // can skip splits whose min/max window cannot. No-op when absent.
-        self.prepare_split_keys(filters, semijoin_cfg, spec_cfg)
+        self.prepare_split_keys_over(&splits, &file_sizes, filters, semijoin_cfg, spec_cfg)
             .await;
-        let (pruned, bloom_pruned) = self.prune_splits_with(filters, semijoin_cfg, spec_cfg);
+        let (pruned, bloom_pruned) =
+            self.prune_splits_over(&splits, filters, semijoin_cfg, spec_cfg);
         crate::observability::io_trace::record_bloom_splits_pruned(bloom_pruned as u64);
         crate::observability::io_trace::record_manifest_files_pruned(
             self.manifest_pruned_files(filters).len() as u64,
@@ -1994,8 +2302,8 @@ impl TableProvider for ObjectStoreParquetTable {
         // Skip-ratio evidence for the runtime-filter promotion gate
         // (TD-OLAP-3/TD-OLAP-4): candidate vs pruned splits, per query.
         crate::observability::io_trace::record_splits(
-            self.splits.len() as u64,
-            (self.splits.len() - pruned.len()) as u64,
+            splits.len() as u64,
+            (splits.len() - pruned.len()) as u64,
         );
         // Post-prune stats, narrowed to the projection: `partition_statistics`
         // requires the vector to match the exec's PROJECTED schema width.
@@ -2009,11 +2317,11 @@ impl TableProvider for ObjectStoreParquetTable {
             ),
             projection.map(|p| p.as_slice()),
         );
-        Self::apply_deletion_statistics(&self.deletions, &self.splits, &pruned, &mut scan_stats);
+        Self::apply_deletion_statistics(&self.deletions, &splits, &pruned, &mut scan_stats);
         let exec = ProximaScanExec::builder()
             .schema(self.schema.clone())
             .splits(pruned)
-            .reader(self.reader(filters, spec_cfg))
+            .reader(self.reader_over(filters, spec_cfg, &file_sizes))
             .projection(projection.cloned())
             .filters(filters.to_vec())
             .limit(limit)
@@ -2024,6 +2332,19 @@ impl TableProvider for ObjectStoreParquetTable {
             .build()?;
         Ok(Arc::new(exec))
     }
+}
+
+/// Σ footer row counts, or `None` when no split carries one.
+fn rows_of(splits: &[FileSplit]) -> Option<u64> {
+    let mut total = 0u64;
+    let mut any = false;
+    for split in splits {
+        if let Some(rows) = split.statistics.row_count {
+            total = total.saturating_add(rows);
+            any = true;
+        }
+    }
+    any.then_some(total)
 }
 
 fn row_group_splits(path: Path, metadata: &ParquetMetaData) -> Vec<FileSplit> {
@@ -2313,8 +2634,10 @@ pub async fn open_object_store_parquet_location(
         return Ok(table);
     }
 
+    // TD-SPINE-4: the registration path defers manifest-selected footers to
+    // `scan()` (kill-switch `PROXIMADB_OLAP_LAZY_FOOTER_DISABLE`).
     let table = Arc::new(
-        ObjectStoreParquetTable::open_for_tenant(location, tenant)
+        ObjectStoreParquetTable::open_with(location, tenant, true)
             .await?
             .with_table_name(stats_key)
             .with_stats_trust(stats_trust),
@@ -2519,6 +2842,121 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(third.snapshot_version(), Some(1));
         assert_eq!(count_where(third, "x > 0").await, 3);
+    }
+
+    /// TD-SPINE-4 lazy footers: through the registration path, a filter
+    /// whose manifest bounds prune K of N files reads N−K footers (the first
+    /// file, the schema source, is read at open and counts once); a filter
+    /// matching every file reads N (negative control); the kill-switch
+    /// restores the eager N. Answers are identical in every mode, and the
+    /// whole-table statistics wait for every footer.
+    #[tokio::test]
+    async fn lazy_footers_skip_files_the_manifest_prunes() {
+        use crate::observability::io_trace;
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        std::fs::create_dir(&data).unwrap();
+        write_kx_parquet(&data.join("a.parquet"), &["apple", "berry"], &[1, 2]);
+        write_kx_parquet(&data.join("b.parquet"), &["melon", "peach"], &[100, 101]);
+        write_kx_parquet(&data.join("c.parquet"), &["plum", "quince"], &[200, 201]);
+        write_kx_parquet(&data.join("d.parquet"), &["sloe", "ugli"], &[300, 301]);
+        let base = publish_listed(tmp.path(), 1).await;
+        let location = format!("{base}/data");
+
+        async fn measure(location: &str, lazy: bool, predicate: &str) -> (i64, u64, u64) {
+            // SAFETY: nextest runs each test in its own process; the switch is
+            // read per open, single-threaded here.
+            unsafe {
+                if lazy {
+                    std::env::remove_var(LAZY_FOOTER_DISABLE_ENV);
+                } else {
+                    std::env::set_var(LAZY_FOOTER_DISABLE_ENV, "1");
+                }
+            }
+            let predicate = predicate.to_string();
+            let location = location.to_string();
+            io_trace::scope(async move {
+                let ctx = SessionContext::new();
+                register_object_store_parquet_location(
+                    &ctx,
+                    "t",
+                    &location,
+                    None,
+                    proximadb_data_model::StatsTrust::Trusted,
+                )
+                .await
+                .unwrap();
+                let batches = ctx
+                    .sql(&format!("SELECT COUNT(*) FROM t WHERE {predicate}"))
+                    .await
+                    .unwrap()
+                    .collect()
+                    .await
+                    .unwrap();
+                let count = batches[0]
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .value(0);
+                let snap = io_trace::snapshot().expect("snapshot inside scope");
+                (count, snap.parquet_footer_reads, snap.manifest_files_pruned)
+            })
+            .await
+        }
+
+        // (predicate, rows, footers read lazily, files pruned)
+        for (predicate, rows, lazy_footers, pruned) in [
+            // Keeps only the first file: K = 3 pruned, N − K = 1 footer.
+            ("x <= 2", 2, 1, 3),
+            // Keeps only the last: its footer plus the schema source.
+            ("x >= 300", 2, 2, 3),
+            ("x > 150", 4, 3, 2),
+            // Negative control: every file matches.
+            ("x > 0", 8, 4, 0),
+        ] {
+            let (lazy_rows, lazy_reads, lazy_pruned) = measure(&location, true, predicate).await;
+            let (eager_rows, eager_reads, eager_pruned) =
+                measure(&location, false, predicate).await;
+            assert_eq!(lazy_rows, rows, "{predicate}: lazy answer");
+            assert_eq!(eager_rows, rows, "{predicate}: eager answer");
+            assert_eq!(lazy_reads, lazy_footers, "{predicate}: lazy footer reads");
+            assert_eq!(
+                eager_reads, 4,
+                "{predicate}: the kill-switch reads every footer"
+            );
+            assert_eq!(lazy_pruned, pruned, "{predicate}");
+            assert_eq!(eager_pruned, pruned, "{predicate}");
+        }
+
+        // Whole-table statistics wait for every footer, then equal the eager ones.
+        unsafe { std::env::remove_var(LAZY_FOOTER_DISABLE_ENV) };
+        let lazy = ObjectStoreParquetTable::open_with(&location, None, true)
+            .await
+            .unwrap();
+        let eager = ObjectStoreParquetTable::open(&location).await.unwrap();
+        assert!(!lazy.footers_complete());
+        assert_eq!(lazy.estimated_rows(), None);
+        assert_eq!(lazy.aggregate_numeric_bounds("x"), None);
+        assert!(lazy.statistics().is_none());
+        assert_eq!(lazy.schema(), eager.schema(), "same planning schema");
+        let lazy = Arc::new(lazy);
+        let ctx = SessionContext::new();
+        ctx.register_table("t", lazy.clone()).unwrap();
+        ctx.sql("SELECT COUNT(*) FROM t")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert!(lazy.footers_complete());
+        assert_eq!(lazy.estimated_rows(), eager.estimated_rows());
+        assert_eq!(lazy.split_count(), eager.split_count());
+        assert_eq!(
+            lazy.aggregate_numeric_bounds("x"),
+            eager.aggregate_numeric_bounds("x")
+        );
+        assert_eq!(lazy.statistics(), eager.statistics());
     }
 
     fn gt_filter(column: &str, value: i64) -> Expr {
@@ -3319,7 +3757,7 @@ pub(crate) mod tests {
         let location = format!("file://{}", tmp.path().display());
         let table = ObjectStoreParquetTable::open(&location).await.unwrap();
         let sk = table
-            .build_split_keys(&table.splits[0].file_path, 0, "k")
+            .build_split_keys(&table.file_sizes, &table.splits[0].file_path, 0, "k")
             .await
             .expect("keys read for the Int64 column");
         assert_eq!(sk.family, KeyFamily::Int);

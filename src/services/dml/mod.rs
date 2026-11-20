@@ -3490,29 +3490,54 @@ impl DmlService {
         // cost-based routing across representations inexpressible (ADR-094 Decision 2).
         //
         // Read fresh from the catalog rather than reusing the pre-write `schema`, so a
-        // layout added between the snapshot scan and here is not lost. A failed read
-        // degrades to "no existing layouts" — the pre-TD-USUB-4 behaviour — rather than
-        // failing the materialize.
-        let existing_layouts = catalog
-            .get_table(&table_id)
-            .await
-            .map(|s| s.storage_layouts)
-            .unwrap_or_default();
+        // layout added between the snapshot scan and here is not lost.
         //
         // Forward-only (P2.4): a publication whose commit was overtaken — another
         // publisher committed a later metadata version and already flipped the
         // catalog to it — must not move the layout (and its `snapshot_lsn`) back.
-        let overtaken = materialize_stream::layout_is_newer(&existing_layouts, &layout);
-        if overtaken {
-            info!(
-                table = %table_name,
-                version,
-                "MATERIALIZE: a newer publication already flipped the catalog; keeping it"
-            );
-        } else {
-            let layouts = upsert_storage_layout(existing_layouts, layout);
-            catalog.set_storage_layouts(&table_id, layouts).await?;
-        }
+        //
+        // TD-SPINE-3 (deferred LOW): a failed read is NOT "no existing layouts" —
+        // that would defeat the forward-only check for a stale below-tip commit
+        // whose tip evidence was `Unknown`. Without the layouts, only a commit
+        // proven to be the tip flips; anything else leaves the catalog alone and
+        // skips this run's GC (fail safe; the next MATERIALIZE reconciles).
+        let existing_layouts = match catalog.get_table(&table_id).await {
+            Ok(schema) => Some(schema.storage_layouts),
+            Err(e) => {
+                warn!(table = %table_name, version, "MATERIALIZE: catalog read before the flip failed: {e:#}");
+                None
+            }
+        };
+        let flip = materialize_stream::plan_catalog_flip(
+            existing_layouts,
+            layout,
+            proximadb_iceberg_engine::below_tip_evidence(bridge, &metadata_prefix, version, None),
+        )
+        .await;
+        let overtaken = match flip {
+            materialize_stream::CatalogFlip::Flip(layouts) => {
+                catalog.set_storage_layouts(&table_id, layouts).await?;
+                false
+            }
+            materialize_stream::CatalogFlip::Overtaken => {
+                info!(
+                    table = %table_name,
+                    version,
+                    "MATERIALIZE: a newer publication already flipped the catalog; keeping it"
+                );
+                true
+            }
+            materialize_stream::CatalogFlip::Unproven(evidence) => {
+                warn!(
+                    table = %table_name,
+                    version,
+                    ?evidence,
+                    "MATERIALIZE: catalog unreadable and the commit is not proven to be the \
+                     tip; the catalog flip and GC are skipped until the next MATERIALIZE"
+                );
+                return Ok(location);
+            }
+        };
         // The catalog now records `snapshot_lsn`; published snapshots hold the WAL
         // truncation floor from here on.
         drop(snapshot);

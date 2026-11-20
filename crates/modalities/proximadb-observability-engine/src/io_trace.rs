@@ -358,6 +358,9 @@ pub struct IoTrace {
     manifest_cache_hits: AtomicU64,
     manifest_cache_misses: AtomicU64,
     manifest_files_pruned: AtomicU64,
+    /// TD-SPINE-4: Parquet footers read by table discovery (open, or the
+    /// lazy per-scan resolution of manifest-selected files).
+    parquet_footer_reads: AtomicU64,
     /// Plan-geometry vector (TD-EXEC-2 Slice 1, observe-only): the pre-execution
     /// geometric summary of the served physical plan — depth, node/leaf counts,
     /// fan-out, blocking-operator count — recorded at the plan→execute seam as
@@ -1147,6 +1150,12 @@ impl IoTrace {
             .fetch_add(files, Ordering::Relaxed);
     }
 
+    /// Record Parquet footers read by table discovery (TD-SPINE-4).
+    pub fn record_parquet_footer_reads(&self, footers: u64) {
+        self.parquet_footer_reads
+            .fetch_add(footers, Ordering::Relaxed);
+    }
+
     /// Record an embedding API call (KEU — Kilo-Embedding-Units metering).
     pub fn record_embedding_calls(&self, calls: u64) {
         self.embedding_calls.fetch_add(calls, Ordering::Relaxed);
@@ -1242,6 +1251,7 @@ impl IoTrace {
             manifest_cache_hits: self.manifest_cache_hits.load(Ordering::Relaxed),
             manifest_cache_misses: self.manifest_cache_misses.load(Ordering::Relaxed),
             manifest_files_pruned: self.manifest_files_pruned.load(Ordering::Relaxed),
+            parquet_footer_reads: self.parquet_footer_reads.load(Ordering::Relaxed),
             plan_depth: self.plan_depth.load(Ordering::Relaxed),
             plan_nodes: self.plan_nodes.load(Ordering::Relaxed),
             plan_leaves: self.plan_leaves.load(Ordering::Relaxed),
@@ -1465,6 +1475,9 @@ pub struct IoTraceSnapshot {
     /// Data files pruned by manifest bounds (TD-SPINE-4).
     #[serde(default)]
     pub manifest_files_pruned: u64,
+    /// Parquet footers read by table discovery (TD-SPINE-4 lazy footers).
+    #[serde(default)]
+    pub parquet_footer_reads: u64,
     /// Served plan's longest root→leaf path (TD-EXEC-2 geometry; 0 = not recorded).
     #[serde(default)]
     pub plan_depth: u64,
@@ -1937,6 +1950,11 @@ pub fn record_manifest_cache(hit: bool) {
 /// Record data files pruned by manifest bounds on the active query trace.
 pub fn record_manifest_files_pruned(files: u64) {
     let _ = IO_TRACE.try_with(|t| t.record_manifest_files_pruned(files));
+}
+
+/// Record Parquet footers read by table discovery on the active query trace.
+pub fn record_parquet_footer_reads(footers: u64) {
+    let _ = IO_TRACE.try_with(|t| t.record_parquet_footer_reads(footers));
 }
 
 /// Stamp the route (`shape_class`, `backend_label`) onto the active query trace.

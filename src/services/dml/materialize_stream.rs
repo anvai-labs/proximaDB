@@ -466,6 +466,46 @@ pub(super) fn layout_is_newer(
         .any(|theirs| theirs > ours)
 }
 
+/// What MATERIALIZE does to the catalog after its Iceberg commit (see
+/// [`plan_catalog_flip`]).
+#[derive(Debug)]
+pub(super) enum CatalogFlip {
+    /// Write these layouts (the incoming one upserted by name).
+    Flip(Vec<proximadb_catalog::CatalogStorageLayout>),
+    /// A newer publication already flipped the catalog: keep it.
+    Overtaken,
+    /// The current layouts could not be read and the commit is not proven to
+    /// be the tip: leave the catalog alone (fail safe; the next MATERIALIZE
+    /// reconciles it).
+    Unproven(proximadb_iceberg_engine::TipEvidence),
+}
+
+/// TD-SPINE-3 (deferred LOW): decide the catalog flip. `existing` is the
+/// table's current layouts, or `None` when the catalog read failed. With the
+/// layouts in hand the forward-only rule ([`layout_is_newer`]) decides. Without
+/// them, "no layouts" must never stand in for "not overtaken": a stale
+/// below-tip commit whose evidence is `Unknown` would then move the catalog
+/// backwards. So only a commit proven to be the tip (`tip_evidence` — awaited
+/// only on that path) flips; it is upserted into an empty list, as before
+/// TD-USUB-4 (co-layouts written by another representation may be dropped —
+/// the tip's own layout is never moved back).
+pub(super) async fn plan_catalog_flip(
+    existing: Option<Vec<proximadb_catalog::CatalogStorageLayout>>,
+    incoming: proximadb_catalog::CatalogStorageLayout,
+    tip_evidence: impl std::future::Future<Output = proximadb_iceberg_engine::TipEvidence>,
+) -> CatalogFlip {
+    match existing {
+        Some(existing) if layout_is_newer(&existing, &incoming) => CatalogFlip::Overtaken,
+        Some(existing) => CatalogFlip::Flip(super::upsert_storage_layout(existing, incoming)),
+        None => match tip_evidence.await {
+            proximadb_iceberg_engine::TipEvidence::AtTip => {
+                CatalogFlip::Flip(super::upsert_storage_layout(Vec::new(), incoming))
+            }
+            evidence => CatalogFlip::Unproven(evidence),
+        },
+    }
+}
+
 /// Held for a whole publication of one table in this process.
 pub(super) type PublishGuard = tokio::sync::OwnedMutexGuard<()>;
 
@@ -533,6 +573,54 @@ mod tests {
             "other layouts"
         );
         assert!(!layout_is_newer(&[], &layout(Some(0))));
+    }
+
+    /// TD-SPINE-3 deferred LOW: a failed catalog read must not be taken for
+    /// "no existing layouts". Only a commit proven to be the tip flips; a
+    /// below-tip commit whose evidence is `Unknown` (a transient GET error on
+    /// the next version), `BuiltOn` or `NotBuiltOn` leaves the catalog alone.
+    #[tokio::test]
+    async fn an_unreadable_catalog_never_flips_a_commit_not_proven_the_tip() {
+        use proximadb_iceberg_engine::TipEvidence;
+        let evidence = |e: TipEvidence| async move { e };
+        async fn never() -> TipEvidence {
+            panic!("evidence must not be read when the layouts are known")
+        }
+        // The flipped layouts' recorded versions, or None for no flip.
+        let flipped = |flip: CatalogFlip| match flip {
+            CatalogFlip::Flip(layouts) => Some(
+                layouts
+                    .iter()
+                    .map(metadata_version_of)
+                    .collect::<Vec<Option<u64>>>(),
+            ),
+            CatalogFlip::Overtaken | CatalogFlip::Unproven(_) => None,
+        };
+        for e in [
+            TipEvidence::Unknown,
+            TipEvidence::BuiltOn,
+            TipEvidence::NotBuiltOn { latest: 7 },
+        ] {
+            let flip = plan_catalog_flip(None, layout(Some(3)), evidence(e)).await;
+            assert!(
+                matches!(flip, CatalogFlip::Unproven(got) if got == e),
+                "{e:?}: unreadable layouts + an unproven commit must not flip, got {flip:?}"
+            );
+        }
+        // Positive control: the tip flips even when the layouts are unreadable.
+        assert_eq!(
+            flipped(plan_catalog_flip(None, layout(Some(3)), evidence(TipEvidence::AtTip)).await),
+            Some(vec![Some(3)])
+        );
+        // With the layouts in hand, the evidence is never consulted.
+        assert!(matches!(
+            plan_catalog_flip(Some(vec![layout(Some(5))]), layout(Some(3)), never()).await,
+            CatalogFlip::Overtaken
+        ));
+        assert_eq!(
+            flipped(plan_catalog_flip(Some(vec![layout(Some(2))]), layout(Some(3)), never()).await),
+            Some(vec![Some(3)])
+        );
     }
 
     #[tokio::test]
