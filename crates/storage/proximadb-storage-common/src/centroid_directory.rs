@@ -510,9 +510,9 @@ impl DirectorySegment {
     /// binding, exactly as [`SegmentDecodeKey::matches_object`]). A segment of
     /// unknown size can never be validated, so it never matches.
     pub fn key_matches_listing(&self, size_bytes: Option<u64>, etag: Option<&str>) -> bool {
-        self.decode_key.as_ref().is_some_and(|key| {
-            size_bytes == Some(self.size_bytes) && key.matches_object(etag)
-        })
+        self.decode_key
+            .as_ref()
+            .is_some_and(|key| size_bytes == Some(self.size_bytes) && key.matches_object(etag))
     }
 }
 
@@ -2310,12 +2310,8 @@ mod tests {
             shred_field_map: Vec::new(),
             filter_region: None,
         };
-        SegmentDecodeKey::from_untrained_segment(
-            &untrained_header(300).to_bytes(),
-            &footer,
-            etag,
-        )
-        .unwrap()
+        SegmentDecodeKey::from_untrained_segment(&untrained_header(300).to_bytes(), &footer, etag)
+            .unwrap()
     }
 
     /// TD-PAXMETA-1 (ADR-098 D2): an uncovered (`NO_MODEL`) coalesced segment
@@ -2350,10 +2346,19 @@ mod tests {
         // Entry validity against a listing (TD-PAXMETA-1 binding rule).
         let entry = &parsed.segments[1];
         assert!(entry.key_matches_listing(Some(50), Some("\"etag-u\"")));
-        assert!(!entry.key_matches_listing(Some(51), Some("\"etag-u\"")), "size");
-        assert!(!entry.key_matches_listing(Some(50), Some("\"other\"")), "etag");
+        assert!(
+            !entry.key_matches_listing(Some(51), Some("\"etag-u\"")),
+            "size"
+        );
+        assert!(
+            !entry.key_matches_listing(Some(50), Some("\"other\"")),
+            "etag"
+        );
         assert!(!entry.key_matches_listing(Some(50), None), "rewritten");
-        assert!(!entry.key_matches_listing(None, Some("\"etag-u\"")), "unknown size");
+        assert!(
+            !entry.key_matches_listing(None, Some("\"etag-u\"")),
+            "unknown size"
+        );
         // A keyless entry never matches, whatever the listing says.
         assert!(!parsed.segments[0].key_matches_listing(Some(300), None));
     }

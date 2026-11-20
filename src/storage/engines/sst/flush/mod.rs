@@ -1042,7 +1042,10 @@ impl SstEngine {
             return;
         };
         let Ok(fs) = self.filesystem().get_filesystem(dir_url) else {
-            tracing::warn!(dir = dir_url, "PAX segment directory not published after flush");
+            tracing::warn!(
+                dir = dir_url,
+                "PAX segment directory not published after flush"
+            );
             return;
         };
         match publish_centroid_directory(fs.as_ref(), dir_url).await {
@@ -3091,8 +3094,7 @@ mod tests {
                 crate::storage::persistence::filesystem::FilesystemFactory::create({
                     let mut fs_config =
                         crate::storage::persistence::filesystem::FilesystemConfig::default();
-                    fs_config.default_fs =
-                        Some(format!("file://{}", tmp.path().display()));
+                    fs_config.default_fs = Some(format!("file://{}", tmp.path().display()));
                     fs_config
                 })
                 .await
