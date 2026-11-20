@@ -2859,6 +2859,13 @@ async fn manifest_levers_cut_footer_gets_over_pgwire_inner() {
             "{name}: the levers must not change the answer"
         );
     }
-    let sum: i64 = (1..=1000_i64).map(|id| id % 7).sum();
-    assert_eq!(results[&("all_files", false)], vec![format!("{sum},1000")]);
+    // Absolute answers for every query (SUM(v), COUNT(*)), v = id % 7.
+    let expect = |ids: std::ops::RangeInclusive<i64>| {
+        let count = ids.clone().count();
+        let sum: i64 = ids.map(|id| id % 7).sum();
+        vec![format!("{sum},{count}")]
+    };
+    assert_eq!(results[&("first_file", false)], expect(1..=250));
+    assert_eq!(results[&("last_file", false)], expect(751..=1000));
+    assert_eq!(results[&("all_files", false)], expect(1..=1000));
 }

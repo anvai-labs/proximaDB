@@ -9879,6 +9879,8 @@ mod flip_fault {
         pub(super) metadata_prefix: String,
         /// `u64::MAX` = disarmed.
         pub(super) fail_after_version: AtomicU64,
+        /// Failures still to inject once armed (`usize::MAX` = persistent).
+        pub(super) budget: AtomicUsize,
         pub(super) injected: AtomicUsize,
     }
 
@@ -10021,7 +10023,17 @@ mod flip_fault {
                     .await
                     .ok()
                     .flatten();
-                if latest.is_some_and(|v| v > armed) {
+                let spend = |left: usize| match left {
+                    0 => None,
+                    usize::MAX => Some(usize::MAX),
+                    n => Some(n - 1),
+                };
+                if latest.is_some_and(|v| v > armed)
+                    && self
+                        .budget
+                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, spend)
+                        .is_ok()
+                {
                     self.injected.fetch_add(1, Ordering::SeqCst);
                     return Err(anyhow::anyhow!("injected get_table fault after v{armed}"));
                 }
@@ -10171,16 +10183,18 @@ mod flip_fault {
     }
 }
 
-/// TD-SPINE-3 review M1: MATERIALIZE through the real path with a catalog that
-/// fails the flip-time read after the commit lands. The layout must stay on
-/// the previous version and this run's GC must be skipped (v0's metadata
-/// survives); the next MATERIALIZE that reads the catalog flips it. The
-/// unfaulted run is the positive control (flip to v3, v0 collected).
+/// TD-SPINE-3 review M1/round 2: MATERIALIZE through the real path with a
+/// catalog whose flip-time read (after the commit lands) fails `failures`
+/// times. The read is retried (3 attempts): one transient failure is absorbed
+/// and the flip lands; a persistent one leaves the layout on the previous
+/// version, skips this run's NDV publish and GC (v0's metadata survives), and
+/// the next MATERIALIZE that reads the catalog flips. `failures == 0` is the
+/// positive control (flip to v3, v0 collected).
 #[cfg(feature = "datafusion-integration")]
-fn check_materialize_flip_under_catalog_fault(fault: bool) {
+fn check_materialize_flip_under_catalog_fault(failures: usize) {
     crate::query::execution::test_runtime::run_with_timeout(60, async {
         use std::sync::atomic::Ordering;
-        let inv = InvFixture::new(&format!("flip-fault-{fault}.wal"), 4).await;
+        let inv = InvFixture::new(&format!("flip-fault-{failures}.wal"), 4).await;
         let location = inv.materialize().await;
         let (_prefix, metadata_prefix) = inv.prefixes(&location);
         for round in 1..3 {
@@ -10222,12 +10236,21 @@ fn check_materialize_flip_under_catalog_fault(fault: bool) {
                     })
             }
         };
+        // The NDV summary the first (full) MATERIALIZE published.
+        let ndv_records = || {
+            crate::core::statistics::statistics_registry()
+                .envelope(&crate::core::statistics::table_statistics_key(None, "inv"))
+                .map(|e| e.record_count)
+        };
+        let ndv_before = ndv_records();
+        assert!(ndv_before.is_some(), "the full MATERIALIZE published NDV");
         assert_eq!(recorded(inner.clone()).await, Some(2));
         let faulty = Arc::new(flip_fault::FlipReadFaultCatalog {
             inner: inner.clone(),
             bridge: inv.bridge.clone(),
             metadata_prefix: metadata_prefix.clone(),
-            fail_after_version: std::sync::atomic::AtomicU64::new(if fault { 2 } else { u64::MAX }),
+            fail_after_version: std::sync::atomic::AtomicU64::new(2),
+            budget: std::sync::atomic::AtomicUsize::new(failures),
             injected: std::sync::atomic::AtomicUsize::new(0),
         });
         // Same name: replaces the native catalog the DML service resolves.
@@ -10236,7 +10259,10 @@ fn check_materialize_flip_under_catalog_fault(fault: bool) {
             .await
             .expect("register");
 
-        inv.exec("UPDATE inv SET qty = 99 WHERE id = 'i3';").await;
+        // An INSERT: any NDV publish from this run would change the summary's
+        // record count (an UPDATE can republish the same count).
+        inv.exec("INSERT INTO inv (id, qty) VALUES ('i9', 99);")
+            .await;
         assert_eq!(
             inv.materialize().await,
             location,
@@ -10248,30 +10274,32 @@ fn check_materialize_flip_under_catalog_fault(fault: bool) {
             .read_table_metadata(&metadata_prefix, 0)
             .await
             .is_ok();
-        if fault {
-            assert!(
-                faulty.injected.load(Ordering::SeqCst) >= 1,
-                "the flip-time read must have been faulted"
-            );
+        let injected = faulty.injected.load(Ordering::SeqCst);
+        if failures == usize::MAX {
+            assert_eq!(injected, 3, "every one of the 3 flip-read attempts failed");
             assert_eq!(
                 recorded(inner.clone()).await,
                 Some(2),
                 "an unreadable catalog leaves the previous layout in place"
             );
             assert!(v0_survives, "GC is skipped when the flip is skipped");
+            assert_eq!(ndv_records(), ndv_before, "no NDV publish without the flip");
             // Liveness: the next MATERIALIZE that reads the catalog flips it.
             faulty.fail_after_version.store(u64::MAX, Ordering::SeqCst);
             inv.exec("UPDATE inv SET qty = 98 WHERE id = 'i0';").await;
             inv.materialize().await;
             assert_eq!(recorded(inner.clone()).await, Some(4));
         } else {
-            assert_eq!(faulty.injected.load(Ordering::SeqCst), 0);
+            assert_eq!(
+                injected, failures,
+                "{failures} transient failure(s) injected"
+            );
             assert_eq!(
                 recorded(inner.clone()).await,
                 Some(3),
-                "control: the flip lands"
+                "the flip lands (a transient failure is retried)"
             );
-            assert!(!v0_survives, "control: GC collects v0 below the window");
+            assert!(!v0_survives, "GC collects v0 below the window");
         }
     });
 }
@@ -10279,11 +10307,17 @@ fn check_materialize_flip_under_catalog_fault(fault: bool) {
 #[cfg(feature = "datafusion-integration")]
 #[test]
 fn materialize_skips_the_flip_and_gc_when_the_catalog_read_fails() {
-    check_materialize_flip_under_catalog_fault(true);
+    check_materialize_flip_under_catalog_fault(usize::MAX);
+}
+
+#[cfg(feature = "datafusion-integration")]
+#[test]
+fn materialize_retries_a_transient_catalog_read_failure_and_flips() {
+    check_materialize_flip_under_catalog_fault(1);
 }
 
 #[cfg(feature = "datafusion-integration")]
 #[test]
 fn materialize_flips_and_collects_when_the_catalog_reads() {
-    check_materialize_flip_under_catalog_fault(false);
+    check_materialize_flip_under_catalog_fault(0);
 }

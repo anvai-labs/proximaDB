@@ -3499,13 +3499,32 @@ impl DmlService {
         // TD-SPINE-3 (deferred LOW): a failed read is NOT "no existing layouts" —
         // that would defeat the forward-only check for a stale below-tip commit,
         // and writing this layout alone would drop other representations'. The
-        // flip, the NDV publish and this run's GC are skipped (fail safe): the
-        // previous layout keeps serving, and the next MATERIALIZE whose catalog
-        // read succeeds flips it.
-        let existing_layouts = match catalog.get_table(&table_id).await {
+        // read is retried (3 attempts, short exponential backoff) so a transient
+        // error does not cost the flip. If every attempt fails, the flip, the NDV
+        // publish and this run's GC are skipped — the same state a failed layout
+        // write or a crash between commit and flip leaves: readers open the
+        // Iceberg tip V (they LIST the latest metadata) while the layout records
+        // V-1 and its snapshot_lsn. Without deletion vectors the OLAP merge stays
+        // exact; a table whose base carries deletion vectors fails closed — merged
+        // OLAP reads refuse ("nonempty WAL delta cannot be ordered against a
+        // deletion-vector snapshot") — until a later MATERIALIZE flips. That
+        // MATERIALIZE is a full rewrite (the layout is not the latest snapshot).
+        let flip_read = proximadb_resilience::RetryPolicy::exponential_backoff(
+            2,
+            std::time::Duration::from_millis(50),
+        );
+        let existing_layouts = match flip_read.execute(|| catalog.get_table(&table_id)).await {
             Ok(schema) => Some(schema.storage_layouts),
-            Err(e) => {
-                warn!(table = %table_name, version, "MATERIALIZE: catalog read before the flip failed: {e:#}");
+            Err(proximadb_resilience::RetryError::RetriesExhausted {
+                attempts,
+                last_error,
+            }) => {
+                warn!(
+                    table = %table_name,
+                    version,
+                    attempts,
+                    "MATERIALIZE: catalog read before the flip failed: {last_error:#}"
+                );
                 None
             }
         };
