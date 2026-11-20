@@ -4,13 +4,13 @@
 :icons: font
 :source-highlighter: rouge
 :sectnums:
-:last-updated: 2026-09-11
-// status-as-of: 2026-09-11
+:last-updated: 2026-11-19
+// status-as-of: 2026-11-19
 // The status-as-of tag above is checked by scripts/check_status_as_of.py (wired into
 // `make work-commit-check`): re-verify the "Current state" sections against HEAD, then bump it.
 
 Status: Apex reference index (active baseline) +
-Date: 2026-09-11 (filename `SYSTEM_MAP_2026_05_30` is the original; content tracks current HEAD) +
+Date: 2026-11-19 (filename `SYSTEM_MAP_2026_05_30` is the original; content tracks current HEAD) +
 Cost spine: the multi-engine routing + cache policy shown here is co-optimized against the *measured
 per-query I/O trace* across the five physical dimensions — see
 `CODESIGN_DIMENSIONAL_ARCHITECTURE_2026_06_19.adoc` (the unified cost objective the `ComputeScheduler`
@@ -28,8 +28,8 @@ feeders (see <<feeders>>).
 
 [.lead]
 This is the **single pane of glass** for ProximaDB. It exists to answer one question fast — "where does
-a thing live, and what does it converge on?" Current checkout reality: 152 workspace members across
-the root package, `crates/`, `apps/`, bindings, integrations, and clients, plus 42 real top-level
+a thing live, and what does it converge on?" Current checkout reality: 153 workspace members across
+the root package, `crates/`, `apps/`, bindings, integrations, and clients, plus 41 real top-level
 `src/` module directories. It is navigation-first: it does not
 duplicate the per-module detail in the feeder docs, it indexes and ties them together so they stop
 diverging.
@@ -281,7 +281,7 @@ operator visibility.
 |===
 
 [#workspace]
-== Layer 1 — Workspace (152 members, layered)
+== Layer 1 — Workspace (153 members, layered)
 
 The workspace follows the stable map from `CLAUDE.md`:
 `Foundation -> Contracts -> Control -> Horizontal -> Modality -> Storage -> Query/Cross-Model -> Platform -> Apps/Bindings`.
@@ -321,7 +321,7 @@ link:MODULE_COMPONENT_LLD_2026_05_22.adoc[MODULE_COMPONENT_LLD_2026_05_22]; the 
 link:ARCHITECTURE_ATLAS_2026_05_22.adoc[ARCHITECTURE_ATLAS_2026_05_22]. This map does not restate them.
 
 [#srcmap]
-== Layer 2 — `src/` module map (42 top-level module directories)
+== Layer 2 — `src/` module map (41 top-level module directories)
 
 The root crate composes the workspace crates and still hosts many load-bearing services. Handler
 composition is split deliberately: `proximadb-runtime` owns the sole production `ApiHandlersPort`
@@ -603,7 +603,10 @@ identity, stable IDs, and cross-modality isolation close.
 | Object-store and Iceberg engine crates are in the workspace; Parquet/Arrow/Iceberg are the
 interop/publication seam and current local OLAP bridge. ADR-027 proposes PAX as the single internal
 format and ADR-033/052 keep open formats at the boundary unless xCatalog explicitly marks an
-external-authority mode.
+external-authority mode. Federated external-location reads exist
+(`external_location` on collection/DDL properties plus the catalog `authority`/`authority_mode`
+vocabulary, e.g. `federated_read`) but are fail-closed: every location is rejected unless the
+operator allowlists URI-prefix roots via `PROXIMADB_EXTERNAL_TABLE_ROOTS`.
 | Beta/Experimental depending on path. Safe claim is interoperability direction and one-way publish
 where tested, not default external-table durable authority or warehouse-scale object economy.
 
