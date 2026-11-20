@@ -93,6 +93,35 @@ follows them, not a commit that gates them._
 * The per-object footer-facts cache from TD-SEAM-11 stays as the fallback for segments written
   before the manifest exists (mixed-read-safe).
 
+== Request-count evidence harness (counts only)
+
+`tests/sift_pax_recall_ratchet_test.rs` — `sift_get_counts_directory_at_flush_{off,on}` (`#[ignore]`d;
+CI job `sift-object-store-request-counts`, `scripts/run_cloud_emulator_tests.sh --sift-get-counts`,
+Azurite `adls://`, dispatch + develop→qa tier). Scenario per mode: SIFT N vectors ingested through
+`SstEngine::do_flush` in fixed batches of `PROXIMADB_SIFT_FLUSH_BATCH` (one `.pax` per flush, so
+segments = ceil(N / batch), asserted against the listing); then each cold arm runs in a **fresh
+re-exec'd process** (every process-global cache empty): the first query with an explicit
+`Approximate` intent vs the same first query with the production `Adaptive` intent (threshold 0, so it
+asks `segment_vector_count` and still takes the ANN arm). `cold_metadata` = the difference — the
+marginal cost of the collection-level question on a cold open; `steady` = 100 further Adaptive queries
+in the same process; recall@10 vs SIFT ground truth. Latency is not measured: emulator latency is not
+evidence, and real-cloud latency is a separate follow-up.
+
+*Scope of what this measures.* The collection uses `compaction:off`, and the harness disables the
+ADR-081 L0 admission ceiling (`PROXIMADB_L0_STOP_TRIGGER=0` / `_SLOWDOWN_TRIGGER=0`) because nothing
+drains L0 without compaction. So in this scenario the directory exists **only** because of
+`PROXIMADB_PAX_WRITE_DIRECTORY_AT_FLUSH` — positive control: `AT_FLUSH=0` leaves no
+`centroids-*.pxcd` at rest, `AT_FLUSH=1` leaves the newest two generations. In production the
+directory is otherwise published after a compaction (`PROXIMADB_PAX_WRITE_CENTROID_DIRECTORY`); a
+compacted, A0-trained collection (directory-planned search) is not what this harness measures. Only
+the SST `segment_vector_count` consumer is reachable from this public search path: the AXIS rebuild
+coverage / coarse-RaBitQ checks run only for AXIS-orchestrated collections, and PUTs are not recorded
+by the per-query trace (ingest reports GET/LIST/HEAD only).
+
+Determinism: every GET / range-GET / LIST / HEAD count is identical across repeated runs on the same
+inputs (file://, two runs × four configurations). `waves` is reported but is scheduling-derived and
+can differ by one when the segment fan-out exceeds the scan concurrency (seen at 20 segments).
+
 == Acceptance
 
 * Cold Adaptive routing on an N-segment collection: at most 1 metadata GET, not 2N.

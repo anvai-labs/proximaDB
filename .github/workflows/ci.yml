@@ -4619,6 +4619,133 @@ jobs:
         run: cargo test --release --features io-trace --test sift_pax_recall_ratchet_test -- --nocapture
 
   # ============================================================================
+  # SIFT OBJECT-STORE REQUEST COUNTS over Azurite (develop→qa tier, TD-PAXMETA-1)
+  # Deterministic per-query GET / range-GET / LIST / HEAD counts for SIFT
+  # N=10k (100 queries) through the SST engine on adls:// (Azurite), with the
+  # flush-time segment-directory publish (PROXIMADB_PAX_WRITE_DIRECTORY_AT_FLUSH)
+  # OFF vs ON, at two flush batches (1000 → 10 segments, 500 → 20) so the
+  # per-segment slope is visible. Cold phases run in fresh processes. COUNTS
+  # ONLY: emulator latency is not evidence and is not reported. Report-only for
+  # counts (recall floor asserted in every mode); set
+  # PROXIMADB_SIFT_MAX_COLD_METADATA_GETS to turn the cold metadata count into
+  # a ceiling. Same trigger as sift-recall-ratchet: dispatch + medium tier,
+  # never on feat→develop.
+  # ============================================================================
+  sift-object-store-request-counts:
+    name: SIFT object-store request counts (Azurite)
+    needs: changes
+    runs-on: ubuntu-24.04
+    # Cold release compile of the root crate with azure+io-trace at
+    # CARGO_BUILD_JOBS=1 (no other job builds this feature set) plus four
+    # small N=10k runs.
+    timeout-minutes: 150
+    if: >
+      (github.event_name == 'workflow_dispatch' ||
+      needs.changes.outputs.medium_tier == 'true') &&
+      !contains(needs.changes.outputs.reused, ',sift-object-store-request-counts,')
+    steps:
+      - name: Reclaim disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+            /usr/local/.ghcup /usr/local/share/boost || true
+          df -h /
+      # 16 GB runners and no default swap: the root-crate rustc peak is close
+      # to the ceiling (same mitigation as object-store-restart-recovery).
+      - name: Add swap headroom
+        run: |
+          sudo fallocate -l 12G /mnt/swapfile-ci
+          sudo chmod 600 /mnt/swapfile-ci
+          sudo mkswap /mnt/swapfile-ci
+          sudo swapon /mnt/swapfile-ci
+          free -h
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.99.0
+        # Step-level, NOT workflow env: rust-cache hashes every CARGO*/RUST*
+        # env var into its cache key.
+        env:
+          RUSTUP_MAX_RETRIES: "10"
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libssl-dev pkg-config protobuf-compiler
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v2-rust"
+          shared-key: "release"
+          add-job-id-key: false
+          save-if: false
+      - uses: mozilla-actions/sccache-action@v0.0.11
+      - uses: actions/cache@v6
+        with:
+          path: /home/runner/.cache/sccache
+          key: sccache-sift-counts-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: sccache-sift-counts-${{ runner.os }}-
+      - name: Cache SIFT corpus
+        uses: actions/cache@v6
+        with:
+          path: ~/sift1m
+          key: sift1m-texmem-fvecs-v1
+      - name: Download SIFT corpus (first-time only, cached after)
+        run: |
+          mkdir -p "$HOME/sift1m"
+          cd "$HOME/sift1m"
+          base=https://huggingface.co/datasets/qbo-odp/sift1m/resolve/main
+          for f in sift_base.fvecs sift_query.fvecs sift_groundtruth.ivecs; do
+            if [ ! -s "$f" ]; then
+              curl -L --fail --retry 3 -o "$f" "$base/$f"
+            fi
+          done
+      # Azurite comes from mcr.microsoft.com (no Docker Hub rate limit), so no
+      # registry login is needed for this Azurite-only scope.
+      - name: Measure SIFT request counts over Azurite (adls://)
+        env:
+          RUSTC_WRAPPER: sccache
+          SCCACHE_DIR: /home/runner/.cache/sccache
+          CARGO_BUILD_JOBS: "1"
+          PROXIMADB_SIFT_DATASET_DIR: /home/runner/sift1m
+          PROXIMADB_SIFT_N: "10000"
+          PROXIMADB_SIFT_QUERIES: "100"
+          PROXIMADB_SIFT_RECALL_FLOOR: "0.85"
+          SIFT_GET_COUNTS_OUT: ${{ github.workspace }}/target/sift-get-counts.jsonl
+        run: bash scripts/run_cloud_emulator_tests.sh --sift-get-counts
+      - name: Job summary
+        if: always()
+        run: |
+          out="${{ github.workspace }}/target/sift-get-counts.jsonl"
+          {
+            echo "## SIFT object-store request counts (Azurite, counts only — latency not measured)"
+            echo ""
+            if [ -s "$out" ]; then
+              python3 - "$out" <<'PY'
+          import json, sys
+          print("| mode | batch | segments | recall@10 | cold metadata GETs | cold first query (approx) GET/range/LIST/HEAD | steady per-query GET/range/LIST/HEAD/waves |")
+          print("|---|---|---|---|---|---|---|")
+          for line in open(sys.argv[1]):
+              r = json.loads(line)
+              a = r["cold_first_query_approx"]
+              s = r["steady"]["per_query"]
+              print(f"| {r['mode']} | {r['flush_batch']} | {r['segments']} | {r['recall_at_10']:.4f} "
+                    f"| {r['cold_metadata']['get_ops']} "
+                    f"| {a['get_ops']}/{a['range_gets']}/{a['list_ops']}/{a['head_ops']} "
+                    f"| {s['get_ops']:.2f}/{s['range_gets']:.2f}/{s['list_ops']:.2f}/{s['head_ops']:.2f}/{s['waves']:.2f} |")
+          PY
+              echo ""
+              echo '```json'
+              cat "$out"
+              echo '```'
+            else
+              echo "No summary lines were produced."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload request-count summary
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: sift-object-store-request-counts
+          path: target/sift-get-counts.jsonl
+          if-no-files-found: warn
+
+  # ============================================================================
   # SUMMARY - Final status check
   # ============================================================================
   ci-success:
@@ -4707,6 +4834,8 @@ jobs:
       - risk-coverage
       # SIFT PAX cascade recall ratchet (develop->qa+ only — TD-CITIER-1)
       - sift-recall-ratchet
+      # SIFT object-store request counts over Azurite (develop->qa+ only, TD-PAXMETA-1)
+      - sift-object-store-request-counts
       # promotion correctness — a promotion PR must not be a stale snapshot
       - promotion-freshness
     if: always()

@@ -169,6 +169,10 @@ GROUPS: tuple[Group, ...] = (
     ),
     Group("mlflow-conformance", exact=("MLflow conformance (real client)",)),
     Group("sift-recall-ratchet", exact=("SIFT PAX recall ratchet (N=10k)",)),
+    Group(
+        "sift-object-store-request-counts",
+        exact=("SIFT object-store request counts (Azurite)",),
+    ),
     Group("python-test", prefix=("Python SDK Tests (",)),
     Group("python-sdk-round-trip", exact=("Python SDK round-trip (ADR-068 D5)",)),
     Group("openapi-spec-drift", exact=("OpenAPI Spec From Code (TD-126)",)),

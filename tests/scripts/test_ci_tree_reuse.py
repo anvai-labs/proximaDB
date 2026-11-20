@@ -78,6 +78,7 @@ JOB_NAMES = [
     "Object-store restart recovery (Azurite)",
     "MLflow conformance (real client)",
     "SIFT PAX recall ratchet (N=10k)",
+    "SIFT object-store request counts (Azurite)",
     "Python SDK Tests (3.11)",
     "Python SDK Tests (3.12)",
     "Python SDK round-trip (ADR-068 D5)",

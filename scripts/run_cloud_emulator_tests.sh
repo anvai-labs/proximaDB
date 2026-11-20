@@ -7,7 +7,7 @@
 # `make cloud-emulator-test` (local). Single source of truth so every CI path is
 # exactly the locally-runnable path.
 #
-# Usage: run_cloud_emulator_tests.sh [--fast|--all|--restart|--qa|--mlflow-s3|--nightly]
+# Usage: run_cloud_emulator_tests.sh [--fast|--all|--restart|--qa|--mlflow-s3|--nightly|--sift-get-counts]
 #   --fast : run ONLY the cheap object-store tier tests (~3-5 min — compiles just
 #            the small object-store crate, no main-crate compile, no OOM risk).
 #            Used by the develop early-detection job so a tier regression is caught
@@ -20,6 +20,13 @@
 #            it, and recovers catalog + WAL-replays collections on a fresh local
 #            disk. Compiles the server binary, so it gets its OWN scope/job (kept
 #            off --fast/--all's compile budget).
+#   --sift-get-counts : ONLY Azurite, then the TD-PAXMETA-1 SIFT request-count
+#            harness (tests/sift_pax_recall_ratchet_test.rs, `sift_get_counts_*`)
+#            over adls:// with the flush-time directory publish OFF and ON.
+#            Deterministic per-query GET / range-GET / LIST / HEAD counts only —
+#            emulator latency is not evidence and is not reported. Needs
+#            PROXIMADB_SIFT_DATASET_DIR. Summary lines are appended (JSON lines)
+#            to $SIFT_GET_COUNTS_OUT (default target/sift-get-counts.jsonl).
 #
 # Requires: docker, cargo (plus cargo-nextest for --qa), aws CLI (S3 bucket), az CLI (Azurite container),
 # curl (fake-gcs bucket). QA installs cargo-nextest explicitly; the other
@@ -44,7 +51,8 @@ for arg in "$@"; do
     --qa) SCOPE="qa" ;;
     --mlflow-s3) SCOPE="mlflow-s3" ;;
     --nightly) SCOPE="nightly" ;;
-    *) echo "::error::unknown argument: $arg"; echo "usage: $0 [--fast|--all|--restart|--qa|--mlflow-s3|--nightly]"; exit 2 ;;
+    --sift-get-counts) SCOPE="sift-get-counts" ;;
+    *) echo "::error::unknown argument: $arg"; echo "usage: $0 [--fast|--all|--restart|--qa|--mlflow-s3|--nightly|--sift-get-counts]"; exit 2 ;;
   esac
 done
 echo "==> Scope: $SCOPE"
@@ -157,11 +165,72 @@ create_s3_bucket() {
   return 1
 }
 
+# The ONE Azurite launch, shared by the full emulator set and the Azurite-only
+# --sift-get-counts scope.
+start_azurite() {
+  docker run -d --name azurite -p 127.0.0.1:10000:10000 \
+    "$AZURITE_IMAGE" \
+    azurite-blob --blobHost 0.0.0.0 --skipApiVersionCheck >/dev/null
+}
+
+if [ "$SCOPE" = "sift-get-counts" ]; then
+  # TD-PAXMETA-1: Azurite only (no LocalStack / fake-gcs pulls). Build FIRST,
+  # before any container exists, so the compile peak (CARGO_BUILD_JOBS=1 —
+  # 16 GB runners OOM on a parallel root-crate build) never shares memory
+  # with the emulator.
+  : "${PROXIMADB_SIFT_DATASET_DIR:?--sift-get-counts needs PROXIMADB_SIFT_DATASET_DIR}"
+  SIFT_FEATURES="io-trace,azure"
+  echo "==> TD-PAXMETA-1: build the SIFT request-count harness (--features $SIFT_FEATURES)"
+  CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-1}" cargo test --release -p proximadb \
+    --features "$SIFT_FEATURES" --test sift_pax_recall_ratchet_test --no-run
+
+  echo "==> Starting Azurite (Docker)"
+  cleanup
+  start_azurite
+  wait_port 10000 azurite
+  # Hard failure here: without the container every write fails later with a
+  # far less legible error.
+  az storage container create --name "$CONTAINER_BUCKET" --connection-string "$AZURITE_CONN" >/dev/null \
+    || { echo "::error::could not create Azurite container '$CONTAINER_BUCKET' (az CLI)"; exit 1; }
+  export PROXIMADB_AZURE_EMULATOR=1 AZURE_STORAGE_USE_EMULATOR=true AZURE_ALLOW_HTTP=true
+  export AZURE_STORAGE_ACCOUNT=devstoreaccount1 AZURE_STORAGE_ACCOUNT_NAME=devstoreaccount1
+  export PROXIMADB_OBJECT_STORE_URL="adls://$CONTAINER_BUCKET/sift-get-counts"
+  export PROXIMADB_RECALL_DATASET_REQUIRED=1
+  OUT="${SIFT_GET_COUNTS_OUT:-$ROOT_DIR/target/sift-get-counts.jsonl}"
+  mkdir -p "$(dirname "$OUT")"
+  : > "$OUT"
+  # Flush batches to measure: each gives exactly ceil(N / batch) segments, so
+  # two points show the per-segment slope.
+  for batch in ${SIFT_GET_COUNTS_BATCHES:-1000 500}; do
+    for mode in off on; do
+      echo "==> SIFT request counts: N=${PROXIMADB_SIFT_N:-10000} batch=$batch AT_FLUSH=$mode (Azurite adls://)"
+      LOG="$(mktemp -t sift_get_counts.XXXXXX.log)"
+      if PROXIMADB_SIFT_FLUSH_BATCH="$batch" CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-1}" \
+        cargo test --release -p proximadb --features "$SIFT_FEATURES" \
+        --test sift_pax_recall_ratchet_test -- --ignored --exact \
+        "sift_get_counts_directory_at_flush_$mode" --nocapture --test-threads=1 > "$LOG" 2>&1; then
+        status=0
+      else
+        status=$?
+      fi
+      cat "$LOG"
+      # The summary line is the proof the test ran (a filter matching nothing
+      # passes with zero tests).
+      if ! grep -o 'SIFT_GET_COUNTS {.*}' "$LOG" | sed 's/^SIFT_GET_COUNTS //' >> "$OUT"; then
+        echo "::error::no SIFT_GET_COUNTS summary for batch=$batch AT_FLUSH=$mode"
+        exit 1
+      fi
+      [ "$status" -eq 0 ] || { echo "::error::SIFT request-count run failed (batch=$batch AT_FLUSH=$mode)"; exit "$status"; }
+    done
+  done
+  echo "==> SIFT request counts written to $OUT"
+  cat "$OUT"
+  exit 0
+fi
+
 echo "==> Starting emulators (Docker)"
 cleanup
-docker run -d --name azurite -p 127.0.0.1:10000:10000 \
-  "$AZURITE_IMAGE" \
-  azurite-blob --blobHost 0.0.0.0 --skipApiVersionCheck >/dev/null
+start_azurite
 # SERVICES=s3 is an ALLOW-LIST, not a startup-cost tweak: a service left out is
 # REFUSED, not lazily started. Verified — with this set, `sts get-caller-identity`
 # fails with "Service 'sts' is not enabled. Please check your 'SERVICES'
