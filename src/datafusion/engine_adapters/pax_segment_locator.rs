@@ -37,6 +37,11 @@ pub async fn discover_pax_segments(
         }
         Err(e) => return Err(e),
     };
+    // TD-PAXMETA-1 (ADR-098 D2.4): this LIST is the authority for which
+    // collection directory generation is current, exactly as SST discovery's
+    // listing is — record it so `PaxSplitReader` can take a segment's index
+    // from a directory decode key bound to the listed object.
+    crate::storage::engines::sst::centroid_directory_reader::note_listing(base_path, &entries);
     let mut splits = Vec::new();
     for entry in entries {
         if !entry.name.ends_with(".pax") {
@@ -53,7 +58,14 @@ pub async fn discover_pax_segments(
         // number before it can locate the trailing footer — one of the four
         // dependent round trips in the cold-read chain, for information we are
         // holding right here.
-        splits.push(FileSplit::new_block(file_path, 0, 0, size, 0).with_object_size(size));
+        //
+        // TD-PAXMETA-1: the listed ETag binds any directory decode key to
+        // this exact object.
+        splits.push(
+            FileSplit::new_block(file_path, 0, 0, size, 0)
+                .with_object_size(size)
+                .with_etag(entry.metadata.etag.clone()),
+        );
     }
     Ok(splits)
 }

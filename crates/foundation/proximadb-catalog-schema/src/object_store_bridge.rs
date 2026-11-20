@@ -437,6 +437,37 @@ pub trait ObjectStoreBridge: Send + Sync {
             "write_deletion_vector_positions not supported".into(),
         ))
     }
+
+    /// ADR-098 D4.2 / TD-SPINE-3: delete Iceberg metadata under
+    /// `metadata_prefix` outside the generation window ending at
+    /// `committed_version` (`retained_generations` TOTAL, the TD-GCRETAIN-1
+    /// window): older `metadata.json` documents (never the tip) and the
+    /// manifests / manifest lists no retained document reaches. Best effort —
+    /// failed deletes are counted, never errors. Default: skipped (a bridge
+    /// that does not publish Iceberg metadata has none to collect).
+    async fn gc_iceberg_metadata(
+        &self,
+        _metadata_prefix: &str,
+        _committed_version: u64,
+        _retained_generations: u64,
+    ) -> Result<IcebergMetadataGcReport, StorageError> {
+        Ok(IcebergMetadataGcReport {
+            skipped: Some("this bridge does not collect Iceberg metadata".into()),
+            ..Default::default()
+        })
+    }
+}
+
+/// The outcome of one [`ObjectStoreBridge::gc_iceberg_metadata`] pass.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct IcebergMetadataGcReport {
+    /// Objects deleted.
+    pub deleted: usize,
+    /// Deletes that failed (retried by the next pass).
+    pub failed: usize,
+    /// Why nothing was collected, when the pass was skipped (e.g. a retained
+    /// version was unreadable, so reachability could not be proven).
+    pub skipped: Option<String>,
 }
 
 /// The exact row positions some oids occupy in one published data file

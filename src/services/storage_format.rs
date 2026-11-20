@@ -67,31 +67,10 @@ pub fn default_on_gate(env: &str, default: u64) -> Option<u64> {
 
 /// [`default_on_gate`]'s pure core over the raw value (testable without env
 /// injection; the typo branch keeps the default instead of logging — only
-/// the env-reading wrapper warns).
-pub fn default_on_gate_value(raw: Option<&str>, default: u64) -> Option<u64> {
-    let Some(raw) = raw else {
-        return Some(default);
-    };
-    let value = raw.trim();
-    if value.is_empty() {
-        return Some(default);
-    }
-    if is_off_like(value) {
-        return None;
-    }
-    match value.parse::<u64>() {
-        Ok(0) => None,
-        Ok(n) => Some(n),
-        _ => Some(default),
-    }
-}
-
-fn is_off_like(value: &str) -> bool {
-    matches!(
-        value.to_ascii_lowercase().as_str(),
-        "off" | "false" | "no" | "none" | "disabled" | "0"
-    )
-}
+/// the env-reading wrapper warns). One definition, in storage-common, so the
+/// storage crates parse shared gates identically (TD-SPINE-3).
+pub use proximadb_storage_common::gate_value::default_on_gate_value;
+use proximadb_storage_common::gate_value::is_off_like;
 
 /// The format this binary writes by default.
 pub const CURRENT_FORMAT: u32 = 2;

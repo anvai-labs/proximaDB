@@ -350,6 +350,7 @@ async fn discover_native_pax_segments(
                 0,
             )
             .with_object_size(e.metadata.size)
+            .with_etag(e.metadata.etag.clone())
         })
         .collect()
 }

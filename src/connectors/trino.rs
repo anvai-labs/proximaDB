@@ -374,6 +374,7 @@ impl TrinoSplitManager {
             statistics: SplitStatistics::default(),
             locality: crate::storage::formats::SplitLocality::default(),
             object_size: None,
+            etag: None,
         };
 
         vec![TrinoSplit::from_file_split(
@@ -1177,6 +1178,7 @@ mod tests {
             statistics: SplitStatistics::default(),
             locality: crate::storage::formats::SplitLocality::default(),
             object_size: None,
+            etag: None,
         };
 
         let trino_split = TrinoSplit::from_file_split(
@@ -1204,6 +1206,7 @@ mod tests {
             statistics: SplitStatistics::default(),
             locality: crate::storage::formats::SplitLocality::default(),
             object_size: None,
+            etag: None,
         };
 
         let split = TrinoSplit::from_file_split(

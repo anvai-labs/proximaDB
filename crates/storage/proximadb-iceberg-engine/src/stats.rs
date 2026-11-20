@@ -188,7 +188,21 @@ pub fn iceberg_column_stats(
                 schema.column(leaf).logical_type_ref(),
                 Some(parquet::basic::LogicalType::Decimal { .. })
             );
-        let (lower_bound, upper_bound) = if bounds_valid && decimal_ok {
+        // Bounds are folded from the PHYSICAL statistics, so they are only
+        // meaningful when the physical value is the Iceberg value: an unsigned
+        // integer (a u32 above 2^31 / u64 above 2^63 reads as negative) or a
+        // `date` stored as anything but a DATE-annotated INT32 (Arrow Date64
+        // is INT64 milliseconds, not days) gets no bounds — the file is kept.
+        let column = schema.column(leaf);
+        let logical = column.logical_type_ref();
+        let unsigned = matches!(
+            logical,
+            Some(parquet::basic::LogicalType::Integer(int)) if !int.is_signed
+        );
+        let date_ok = field.type_name != "date"
+            || (matches!(logical, Some(parquet::basic::LogicalType::Date))
+                && column.physical_type() == parquet::basic::Type::INT32);
+        let (lower_bound, upper_bound) = if bounds_valid && decimal_ok && !unsigned && date_ok {
             (
                 lower
                     .as_ref()
@@ -312,6 +326,79 @@ mod tests {
         assert_eq!(s.lower_bound.as_deref(), Some(&b"aardvark-long-st"[..]));
         assert_eq!(s.upper_bound, None);
         assert_eq!(s.null_value_count, Some(1));
+    }
+
+    fn single_column_footer(field: Field, column: arrow_array::ArrayRef) -> Arc<ParquetMetaData> {
+        let schema = Arc::new(Schema::new(vec![field]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![column]).unwrap();
+        let mut buf = Vec::new();
+        let mut w = ArrowWriter::try_new(&mut buf, schema, None).unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+        ParquetRecordBatchReaderBuilder::try_new(Bytes::from(buf))
+            .unwrap()
+            .metadata()
+            .clone()
+    }
+
+    /// Review L1: a u32 above 2^31 / u64 above 2^63 reads back from the
+    /// physical INT32/INT64 statistics as NEGATIVE, so an unsigned column
+    /// publishes no bounds (a reader then keeps the file).
+    #[test]
+    fn unsigned_columns_get_no_bounds() {
+        let u32_meta = single_column_footer(
+            Field::new("u", DataType::UInt32, false),
+            Arc::new(arrow_array::UInt32Array::from(vec![1u32, 3_000_000_000])),
+        );
+        let u64_meta = single_column_footer(
+            Field::new("u", DataType::UInt64, false),
+            Arc::new(arrow_array::UInt64Array::from(vec![1u64, u64::MAX - 1])),
+        );
+        for meta in [u32_meta, u64_meta] {
+            let stats = iceberg_column_stats(&meta, &[field(1, "u", "long")]);
+            assert_eq!(stats[0].lower_bound, None);
+            assert_eq!(stats[0].upper_bound, None);
+            assert_eq!(stats[0].value_count, Some(2), "counts are still exact");
+        }
+    }
+
+    /// Review L2: Arrow Date64 is INT64 milliseconds, not Iceberg days, so it
+    /// publishes no `date` bounds; a DATE-annotated INT32 (Date32) still does.
+    #[test]
+    fn only_day_dates_get_date_bounds() {
+        let date64 = single_column_footer(
+            Field::new("d", DataType::Date64, false),
+            Arc::new(arrow_array::Date64Array::from(vec![
+                86_400_000i64,
+                864_000_000,
+            ])),
+        );
+        let stats = iceberg_column_stats(&date64, &[field(1, "d", "date")]);
+        if stats[0].lower_bound.is_some() {
+            // A writer that coerced Date64 to DATE INT32 days must have
+            // written days, never milliseconds.
+            assert_eq!(
+                stats[0].lower_bound.as_deref(),
+                Some(&1i32.to_le_bytes()[..])
+            );
+        }
+        let date32 = single_column_footer(
+            Field::new("d", DataType::Date32, false),
+            Arc::new(arrow_array::Date32Array::from(vec![1i32, 10])),
+        );
+        let stats = iceberg_column_stats(&date32, &[field(1, "d", "date")]);
+        assert_eq!(
+            stats[0].lower_bound.as_deref(),
+            Some(&1i32.to_le_bytes()[..])
+        );
+        assert_eq!(
+            stats[0].upper_bound.as_deref(),
+            Some(&10i32.to_le_bytes()[..])
+        );
+        // A plain (non-DATE) INT32 column declared `date` gets no bounds.
+        let plain = footer();
+        let stats = iceberg_column_stats(&plain, &[field(1, "d", "date")]);
+        assert_eq!(stats[0].lower_bound, None);
     }
 
     #[test]

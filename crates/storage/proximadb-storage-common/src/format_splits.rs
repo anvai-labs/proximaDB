@@ -68,6 +68,15 @@ pub struct FileSplit {
     /// ADR-033 ranks dominant. `None` ⇒ the reader falls back to the `HEAD`.
     #[serde(default)]
     pub object_size: Option<u64>,
+    /// The object's ETag as the listing that produced this split reported it
+    /// (TD-PAXMETA-1 / ADR-098 D2). Binds a collection-directory decode key to
+    /// the exact object it was built from: a reader may take the segment's
+    /// footer/index extents from the directory only while this ETag equals the
+    /// one the key recorded. `None` (a backend that lists no ETag, or a split
+    /// built without one) keeps the reader on the object's own metadata path
+    /// unless the key is also ETag-less.
+    #[serde(default)]
+    pub etag: Option<String>,
 }
 
 /// Type of split - varies by storage engine
@@ -212,6 +221,7 @@ impl FileSplit {
             statistics: SplitStatistics::default(),
             locality: SplitLocality::default(),
             object_size: None,
+            etag: None,
         }
     }
 
@@ -220,6 +230,13 @@ impl FileSplit {
     /// object-storage reader can locate the trailing footer without a `HEAD`.
     pub fn with_object_size(mut self, object_size: u64) -> Self {
         self.object_size = Some(object_size);
+        self
+    }
+
+    /// Record the object's listed ETag (TD-PAXMETA-1), binding any
+    /// directory-provided metadata to the exact object.
+    pub fn with_etag(mut self, etag: Option<String>) -> Self {
+        self.etag = etag;
         self
     }
 
@@ -246,6 +263,7 @@ impl FileSplit {
             },
             locality: SplitLocality::default(),
             object_size: None,
+            etag: None,
         }
     }
 
@@ -273,6 +291,7 @@ impl FileSplit {
             },
             locality: SplitLocality::default(),
             object_size: None,
+            etag: None,
         }
     }
 
@@ -306,6 +325,7 @@ impl FileSplit {
             },
             locality: SplitLocality::default(),
             object_size: None,
+            etag: None,
         }
     }
 
@@ -334,6 +354,7 @@ impl FileSplit {
             },
             locality: SplitLocality::default(),
             object_size: None,
+            etag: None,
         }
     }
 
@@ -825,6 +846,7 @@ mod tests {
             statistics: SplitStatistics::default(),
             locality: SplitLocality::default(),
             object_size: None,
+            etag: None,
         };
         assert!((zorder.split_cost().decode_complexity - 1.3).abs() < 0.01);
 
@@ -843,6 +865,7 @@ mod tests {
                 cache_status: CacheStatus::Unknown,
             },
             object_size: None,
+            etag: None,
         };
         let cost = byte_range.split_cost();
         assert_eq!(cost.io_bytes, 20);

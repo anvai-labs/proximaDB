@@ -167,10 +167,26 @@ pub(super) async fn check_commit(
                         .any(|v| &v.puffin_file == ours)
                 }),
             };
-            if landed {
-                CommitCheck::Landed(successor)
-            } else {
-                CommitCheck::NotLanded
+            if !landed {
+                return CommitCheck::NotLanded;
+            }
+            // TD-SPINE-3 review M1c: metadata GC frees old slots, so a stale
+            // publisher can land BELOW the tip (and the bridge's orphan delete
+            // may have failed). Only a version on the table's line of history
+            // counts as landed; anything unproven keeps the parts and never
+            // flips the catalog.
+            match proximadb_iceberg_engine::below_tip_evidence(
+                bridge,
+                metadata_prefix,
+                successor,
+                None,
+            )
+            .await
+            {
+                proximadb_iceberg_engine::TipEvidence::AtTip
+                | proximadb_iceberg_engine::TipEvidence::BuiltOn => CommitCheck::Landed(successor),
+                proximadb_iceberg_engine::TipEvidence::NotBuiltOn { .. }
+                | proximadb_iceberg_engine::TipEvidence::Unknown => CommitCheck::Unknown,
             }
         }
         Err(_) => CommitCheck::Unknown,

@@ -743,6 +743,10 @@ pub struct Lineage {
     pub parent_format_version: Option<i32>,
     /// The previous metadata log, extended with the previous metadata file.
     metadata_log: Vec<serde_json::Value>,
+    /// The parent's `write.metadata.previous-versions-max` table property, when
+    /// it carries a valid one: carried forward, and it may only LOWER the
+    /// generation-window bound on the log (TD-SPINE-3).
+    pub previous_versions_max: Option<u64>,
 }
 
 impl Lineage {
@@ -832,13 +836,40 @@ impl Lineage {
                 "metadata-file": loc,
             }));
         }
+        let previous_versions_max = v
+            .get("properties")
+            .and_then(|p| p.get(crate::retention::PREVIOUS_VERSIONS_MAX_PROPERTY))
+            .and_then(|x| match x {
+                serde_json::Value::String(s) => s.trim().parse::<u64>().ok(),
+                other => other.as_u64(),
+            });
         Ok(Self {
             sequence_number: last_seq + 1,
             parent_snapshot_id,
             first_row_id,
             parent_format_version,
             metadata_log,
+            previous_versions_max,
         })
+    }
+
+    /// Bound the `metadata-log` to its newest `max_entries` entries (ADR-098
+    /// D4.2 / TD-SPINE-3): the log follows the generation window, so an entry
+    /// older than it — naming a snapshot whose files the generation GC has
+    /// collected — is dropped. The log is oldest-first, so the tail is kept.
+    pub fn bound_metadata_log(&mut self, max_entries: usize) {
+        let excess = self.metadata_log.len().saturating_sub(max_entries);
+        if excess > 0 {
+            self.metadata_log.drain(..excess);
+        }
+    }
+
+    /// The `metadata-file` locations the log names, oldest-first.
+    pub fn metadata_log_files(&self) -> Vec<&str> {
+        self.metadata_log
+            .iter()
+            .filter_map(|e| e.get("metadata-file").and_then(|f| f.as_str()))
+            .collect()
     }
 }
 
@@ -924,8 +955,47 @@ pub fn build_table_metadata(
         snapshot["added-rows"] = serde_json::json!(commit.added_records);
         metadata["next-row-id"] = serde_json::json!(lineage.first_row_id + commit.added_records);
     }
+    if let Some(max) = lineage.previous_versions_max {
+        metadata["properties"][crate::retention::PREVIOUS_VERSIONS_MAX_PROPERTY] =
+            serde_json::json!(max.to_string());
+    }
     metadata["snapshots"] = serde_json::json!([snapshot]);
     serde_json::to_string_pretty(&metadata).map_err(|e| ser_err("serialize table metadata", e))
+}
+
+/// The current schema's primitive fields of a `TableMetadata` JSON (the
+/// schema whose `schema-id` is `current-schema-id`, or the only one). Nested
+/// fields and fields without an id/name are skipped; unparseable metadata
+/// yields none, which only disables manifest pruning (never wrong).
+pub fn current_schema_fields(metadata_json: &str) -> Vec<IcebergField> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(metadata_json) else {
+        return Vec::new();
+    };
+    let current = v.get("current-schema-id").and_then(|x| x.as_i64());
+    let Some(schemas) = v.get("schemas").and_then(|x| x.as_array()) else {
+        return Vec::new();
+    };
+    let schema = schemas
+        .iter()
+        .find(|s| s.get("schema-id").and_then(|x| x.as_i64()) == current)
+        .or_else(|| (schemas.len() == 1).then(|| &schemas[0]));
+    let Some(fields) = schema
+        .and_then(|s| s.get("fields"))
+        .and_then(|f| f.as_array())
+    else {
+        return Vec::new();
+    };
+    fields
+        .iter()
+        .filter_map(|f| {
+            Some(IcebergField {
+                id: i32::try_from(f.get("id")?.as_i64()?).ok()?,
+                name: f.get("name")?.as_str()?.to_string(),
+                type_name: f.get("type")?.as_str()?.to_string(),
+                required: f.get("required").and_then(|r| r.as_bool()).unwrap_or(false),
+            })
+        })
+        .collect()
 }
 
 /// Extract the current snapshot's manifest-list location from a `TableMetadata` JSON.

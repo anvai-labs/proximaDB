@@ -49,6 +49,20 @@ fn to_u64(v: i64, what: &str) -> Result<u64, StorageError> {
     u64::try_from(v).map_err(|_| invalid(format!("negative {what} {v}")))
 }
 
+/// A snapshot as a planner reads it (TD-SPINE-4): the data files and deletion
+/// vectors of [`IcebergSnapshotFiles`], plus each data file's manifest column
+/// metrics and the schema those metrics' field ids refer to. Every part is a
+/// pure function of the (immutable) metadata version it was read from.
+#[derive(Debug, Clone, Default)]
+pub struct IcebergSnapshotPlan {
+    pub files: IcebergSnapshotFiles,
+    /// `(data file, its manifest column metrics)`, one per data file, in
+    /// manifest order. Metrics are keyed by Iceberg field id.
+    pub file_stats: Vec<(Path, Vec<iceberg::ColumnFileStats>)>,
+    /// The metadata document's current schema (primitive fields only).
+    pub fields: Vec<iceberg::IcebergField>,
+}
+
 impl IcebergObjectStoreBridge {
     /// The current snapshot of metadata `version` under `metadata_prefix`: its data
     /// files and its deletion vectors, both as bridge-relative keys.
@@ -57,12 +71,30 @@ impl IcebergObjectStoreBridge {
         metadata_prefix: &str,
         version: u64,
     ) -> Result<IcebergSnapshotFiles, StorageError> {
+        Ok(self
+            .read_iceberg_snapshot_plan(metadata_prefix, version)
+            .await?
+            .files)
+    }
+
+    /// [`read_iceberg_snapshot_with_deletes`](Self::read_iceberg_snapshot_with_deletes)
+    /// plus the per-file manifest metrics and the schema they refer to — the
+    /// same I/O (metadata document, manifest list, manifests), nothing more.
+    pub async fn read_iceberg_snapshot_plan(
+        &self,
+        metadata_prefix: &str,
+        version: u64,
+    ) -> Result<IcebergSnapshotPlan, StorageError> {
         let committer = metadata::MetadataCommitter::new(self.store.clone(), metadata_prefix);
         let meta_bytes = committer.read_metadata(version).await?;
         let meta_json =
             std::str::from_utf8(&meta_bytes).map_err(|e| read_err("metadata utf8", e))?;
+        let fields = iceberg::current_schema_fields(meta_json);
         let Some(list_loc) = iceberg::current_manifest_list(meta_json)? else {
-            return Ok(IcebergSnapshotFiles::default());
+            return Ok(IcebergSnapshotPlan {
+                fields,
+                ..Default::default()
+            });
         };
         // Recorded paths are absolute URIs (or legacy bridge-relative keys). The
         // table prefix re-roots URIs under the table `location` when this bridge is
@@ -79,13 +111,16 @@ impl IcebergObjectStoreBridge {
             |p: &str| self.resolve_recorded_path(p, table_location.as_deref(), table_prefix);
         let list_bytes = self.store.get(&resolve(&list_loc)).await?;
         let mut out = IcebergSnapshotFiles::default();
+        let mut file_stats = Vec::new();
         let mut vectors = Vec::new();
         for m in iceberg::read_manifest_list(&list_bytes)? {
             let bytes = self.store.get(&resolve(&m.manifest_path)).await?;
             match m.content {
                 iceberg::ManifestContent::Data => {
                     for df in iceberg::read_manifest(&bytes)? {
-                        out.data_files.push(resolve(&df.file_path));
+                        let path = resolve(&df.file_path);
+                        file_stats.push((path.clone(), df.column_stats));
+                        out.data_files.push(path);
                     }
                 }
                 iceberg::ManifestContent::Deletes => {
@@ -117,7 +152,11 @@ impl IcebergObjectStoreBridge {
                 cardinality: to_u64(v.record_count, "record_count")?,
             });
         }
-        Ok(out)
+        Ok(IcebergSnapshotPlan {
+            files: out,
+            file_stats,
+            fields,
+        })
     }
 
     /// Fetch and decode one deletion vector (a ranged read of its blob only).
