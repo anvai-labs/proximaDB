@@ -1529,3 +1529,19 @@ hardware = "Apple Silicon 10-core, 64GB RAM (aarch64-apple-darwin)"
 date = "2026-11-08"
 version = "develop (post Phase A+B merge)"
 notes = "E2E throughput measured: gate OFF = 1726 docs/sec, gate ON = 1683 docs/sec. Delta is within noise (-2.5%), confirming Phase 0 profile that doc-shape handling is <5% of wall time. Throughput is NOT the claim carrier for binary-JSON — the project proceeds on exactness merits (u64/i64/f64 preserved exactly in MessagePack) and the architectural foundation for future late-materialization optimizations."
+
+[[claims]]
+id = "paxmeta1_directory_at_flush_request_counts_azurite"
+claim = "Publishing the PXCD segment directory at flush (PROXIMADB_PAX_WRITE_DIRECTORY_AT_FLUSH=1) removes the per-segment metadata GETs of the cold collection-level question: on Azurite (adls://), SIFT N=10000 ingested in fixed flush batches, the cold metadata cost is 20 GETs at 10 segments and 40 at 20 segments with the gate OFF (2 per segment) versus 0 with it ON (one directory GET paid by the cold first query instead); cold first Adaptive query 65 -> 46 GETs (10 segments) and 128 -> 89 (20 segments); steady 5.25 / 6.71 GETs per query and recall@10 0.987 / 0.992 are identical in both modes. Cost of the gate: about 4 GETs and 1 LIST per flush to refresh the directory. Request counts only; latency not measured."
+metric = "object-store requests per phase (cold metadata, cold first query, steady per query, ingest), gate ON vs OFF"
+status = "measured"
+asserted_in = [
+  "tests/sift_pax_recall_ratchet_test.rs",
+]
+bench_source = "tests/sift_pax_recall_ratchet_test.rs"
+bench_command = "scripts/run_cloud_emulator_tests.sh --sift-get-counts (CI job sift-object-store-request-counts)"
+artifact = "docs/_internal/status/PAXMETA1_SIFT_AZURITE_REQUEST_COUNTS_2026_11_20.jsonl"
+hardware = "GitHub-hosted ubuntu runner, Azurite emulator (counts are hardware-independent)"
+date = "2026-11-20"
+version = "ci/sift-azurite-get-counts (PR #2545)"
+notes = "CI run https://github.com/anvai-labs/proximaDB/actions/runs/44788449721 (job 136469877008); artifact = the four SIFT_GET_COUNTS lines from its log. Store = Azurite emulator. Counts are deterministic (GET/range-GET/LIST/HEAD identical across repeat runs; waves are scheduling-derived and reported only). Query-side counts match file:// exactly. PUTs are not traced. Latency is deliberately not measured (emulator latency is not evidence); real-cloud latency is a later follow-up. Scenario uses compaction:off, so the directory exists only via the flush-time publish."
