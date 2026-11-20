@@ -3053,6 +3053,7 @@ mod tests {
         // process, and the vars are restored at the end.
         unsafe {
             std::env::remove_var("PROXIMADB_PAX_WRITE_DIRECTORY_AT_FLUSH");
+            std::env::set_var("PROXIMADB_PAX_WRITE_CENTROID_DIRECTORY", "1");
             std::env::set_var("PROXIMADB_PAX_COALESCED_RABITQ", "1");
             std::env::set_var("PROXIMADB_PAX_WRITE_DIRECTORY_DECODE_KEYS", "1");
         }
@@ -3169,9 +3170,22 @@ mod tests {
             );
         }
 
+        // Negative control for the master WRITE kill-switch: AT_FLUSH still
+        // on, but PROXIMADB_PAX_WRITE_CENTROID_DIRECTORY off ⇒ the flush
+        // succeeds and publishes no new generation.
+        // SAFETY: see above.
+        unsafe { std::env::set_var("PROXIMADB_PAX_WRITE_CENTROID_DIRECTORY", "0") };
+        assert!(flush(2).await.success);
+        let after_off = directories();
+        assert_eq!(
+            after_off, published,
+            "master write kill-switch off: no new generation"
+        );
+
         // Restore the gate world for the shared-process runner.
         // SAFETY: see above.
         unsafe {
+            std::env::remove_var("PROXIMADB_PAX_WRITE_CENTROID_DIRECTORY");
             std::env::remove_var("PROXIMADB_PAX_WRITE_DIRECTORY_AT_FLUSH");
             std::env::remove_var("PROXIMADB_PAX_COALESCED_RABITQ");
             std::env::remove_var("PROXIMADB_PAX_WRITE_DIRECTORY_DECODE_KEYS");

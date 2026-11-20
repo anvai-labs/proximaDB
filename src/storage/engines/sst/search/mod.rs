@@ -5061,6 +5061,24 @@ mod tests {
             measured_gets, 0,
             "a valid directory answers collection-level questions with zero GETs"
         );
+
+        // Negative control for the master READ kill-switch: with
+        // PROXIMADB_PAX_READ_CENTROID_DIRECTORY off the same valid directory
+        // is ignored, the rebuild count goes back to per-segment reads, and
+        // the answer is unchanged. SAFETY: nextest runs each test in its own
+        // process; restored below.
+        unsafe { std::env::set_var("PROXIMADB_PAX_READ_CENTROID_DIRECTORY", "0") };
+        let before_off = counters.total_gets();
+        let durable_off = engine
+            .durable_vector_count_for_rebuild(&storage_url, &files)
+            .await;
+        let off_gets = counters.total_gets() - before_off;
+        unsafe { std::env::remove_var("PROXIMADB_PAX_READ_CENTROID_DIRECTORY") };
+        assert_eq!(durable_off, Some(900), "same answer without the directory");
+        assert!(
+            off_gets > 0,
+            "master read kill-switch off: the directory must not serve ({off_gets} GETs)"
+        );
     }
 
     /// Negative control: an entry whose key records an ETag the listing does

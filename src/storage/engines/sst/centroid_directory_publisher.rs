@@ -894,6 +894,8 @@ pub(crate) mod tests {
         assert!(centroid_directory_write_enabled());
         unsafe { std::env::set_var("PROXIMADB_PAX_WRITE_CENTROID_DIRECTORY", "0") };
         assert!(!centroid_directory_write_enabled());
+        // Restore for the shared-process `cargo test --lib` runner.
+        unsafe { std::env::remove_var("PROXIMADB_PAX_WRITE_CENTROID_DIRECTORY") };
     }
 
     /// TD-PAXMETA-1: the flush-publish gate is default-OFF opt-in — the
