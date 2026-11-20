@@ -57,7 +57,6 @@ FRESH = "2026-10-15T05:04:50Z"
 JOB_NAMES = [
     "Detect Changes",
     "Rust Clippy",
-    "Rust Compile (lib)",
     "Rust Compile (test)",
     "Rust Tests (unit)",
     "Rust Tests (doc)",
@@ -80,6 +79,7 @@ JOB_NAMES = [
     "Object-store library contracts (Azurite)",
     "MLflow conformance (real client)",
     "SIFT PAX recall ratchet (N=10k)",
+    "SIFT object-store request counts (Azurite)",
     "Python SDK Tests (3.11)",
     "Python SDK Tests (3.12)",
     "Python SDK round-trip (ADR-068 D5)",

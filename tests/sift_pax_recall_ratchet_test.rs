@@ -2510,3 +2510,556 @@ async fn sift_pax_filtered_cascade_recall_ratchet_shipped_defaults() {
     // set here are the same geometry the sibling pins, so no cleanup is needed.
     run_sift_filtered_cascade_ratchet().await;
 }
+
+// ---------------------------------------------------------------------------
+// TD-PAXMETA-1: deterministic per-query object-store REQUEST COUNTS for SIFT
+// over the SST engine, with the flush-time segment-directory publish
+// (`PROXIMADB_PAX_WRITE_DIRECTORY_AT_FLUSH`) OFF vs ON.
+//
+// Scenario (per mode): ingest N SIFT vectors through `SstEngine::do_flush` in
+// fixed batches of `PROXIMADB_SIFT_FLUSH_BATCH` (one segment per flush, so the
+// segment count is exactly ceil(N / batch); compaction is off via the
+// `compaction:off` tag and the ADR-081 L0 admission ceiling is disabled, so in
+// OFF mode no directory exists at all) → re-exec
+// this test binary for each COLD arm (a fresh process: every process-global
+// cache — segment listing, centroid directory, PAX footer facts, footer/
+// invariants caches — starts empty) and record the io_trace request counts:
+//
+//   * `cold_first_query_approx`  — the first query of a cold process with an
+//     explicit `Approximate` intent: segment search only, no collection-level
+//     question;
+//   * `cold_first_query_adaptive` — the same first query with the production
+//     `Adaptive` intent (threshold 0 forces the ANN arm), which first asks the
+//     collection-level question (`segment_vector_count`: directory facts, or
+//     2 footer GETs per segment without a directory);
+//   * `cold_metadata` = adaptive − approx: the marginal cost of the
+//     collection-level question on a cold open;
+//   * `steady` — Q more Adaptive{threshold 0} queries in the adaptive arm's
+//     process (per-query totals and means), plus recall@10 against SIFT GT.
+//
+// Counts only. Latency is deliberately NOT measured or reported: emulator
+// latency is meaningless, and a wall-clock number here would be evidence of
+// nothing (real-cloud latency is a separate follow-up).
+//
+// Determinism: same inputs → same counts. The cold arms pin the cross-query
+// segment-listing TTL far above any run time (`PROXIMADB_SEGMENT_LISTING_CACHE_MS`)
+// so a slow backend cannot turn a cached listing into an extra LIST. `waves`
+// is derived from request intervals and is reported, but it is the one field
+// that can legitimately depend on scheduling.
+// ---------------------------------------------------------------------------
+
+/// Child-arm spec env (internal plumbing of the re-exec; test-only).
+const GET_COUNTS_CHILD_ENV: &str = "PROXIMADB_SIFT_GET_COUNTS_CHILD_SPEC";
+const GET_COUNTS_CHILD_TEST: &str = "sift_get_counts_cold_child";
+const GET_COUNTS_DEFAULT_QUERIES: usize = 100;
+const GET_COUNTS_COLLECTION: &str = "sift_get_counts";
+/// Far above any run time: the cross-query listing is cached for the whole
+/// cold arm, so LIST counts cannot depend on how slow the backend is.
+const GET_COUNTS_LISTING_TTL_MS: &str = "3600000";
+
+fn sift_flush_batch() -> usize {
+    match std::env::var("PROXIMADB_SIFT_FLUSH_BATCH") {
+        Ok(raw) => raw
+            .trim()
+            .parse::<usize>()
+            .ok()
+            .filter(|n| *n > 0)
+            .unwrap_or_else(|| {
+                panic!("PROXIMADB_SIFT_FLUSH_BATCH must be a positive integer, got {raw:?}")
+            }),
+        Err(_) => BATCH_SIZE,
+    }
+}
+
+fn get_counts_storage_base(local_base: &Path, configured: Option<&str>, run_id: &str) -> String {
+    match configured {
+        Some(base) => {
+            let base = base.trim();
+            assert!(
+                !base.is_empty(),
+                "PROXIMADB_OBJECT_STORE_URL must be unset or a non-empty storage URL"
+            );
+            format!("{}/sift-get-counts/{run_id}", base.trim_end_matches('/'))
+        }
+        None => local_base.to_string_lossy().into_owned(),
+    }
+}
+
+/// The PAX write/read geometry both the ingest process and the cold arms
+/// run under (they must agree: the cold arm reads what the ingest wrote).
+unsafe fn set_get_counts_env(at_flush: bool) {
+    unsafe {
+        std::env::set_var("PROXIMADB_PAX_VECTOR_QUANT", "rabitq");
+        // An explicit f32 tier makes the Adaptive route ask the
+        // collection-level question (`f32_tier_exact_route_eligible`).
+        std::env::set_var("PROXIMADB_PAX_F32_TIER", "1");
+        std::env::set_var(
+            "PROXIMADB_PAX_WRITE_DIRECTORY_AT_FLUSH",
+            if at_flush { "1" } else { "0" },
+        );
+        // Compaction is off (`compaction:off`), so nothing drains L0: the
+        // ADR-081 admission ceiling (default 10 L0 files) would reject the
+        // 11th flush. Disable admission so the segment count is exactly
+        // ceil(N / batch) at any batch size.
+        std::env::set_var("PROXIMADB_L0_STOP_TRIGGER", "0");
+        std::env::set_var("PROXIMADB_L0_SLOWDOWN_TRIGGER", "0");
+    }
+}
+
+/// Request counts of one traced unit (one query, or the whole ingest).
+fn request_counts(s: &proximadb::observability::io_trace::IoTraceSnapshot) -> serde_json::Value {
+    serde_json::json!({
+        "get_ops": s.get_ops,
+        "range_gets": s.range_gets,
+        "list_ops": s.list_ops,
+        "head_ops": s.head_ops,
+        "put_ops": s.put_ops,
+        "requests": s.get_ops + s.list_ops + s.head_ops,
+        "bytes_read": s.bytes_read,
+        "waves": s.waves,
+    })
+}
+
+fn count_field(v: &serde_json::Value, key: &str) -> u64 {
+    v.get(key)
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_else(|| panic!("missing u64 field {key:?} in {v}"))
+}
+
+fn get_counts_query_ctx(
+    collection: &Collection,
+    query: Vec<f32>,
+    mode: SearchMode,
+) -> StorageQueryContext {
+    StorageQueryContext {
+        search_params: Arc::new(SearchParams {
+            query_vectors: Some(vec![query]),
+            top_k: Some(TOP_K as u16),
+            distance_metric: Some(DistanceMetric::Euclidean),
+            search_mode: mode,
+            ..Default::default()
+        }),
+        collection: Arc::new(collection.clone()),
+        metadata: StorageQueryMetadata {
+            collection_id: collection.id.clone(),
+            ..Default::default()
+        },
+        user_context: None,
+        tenant_context: None,
+    }
+}
+
+async fn traced_query(
+    engine: &SstEngine,
+    collection: &Collection,
+    query: Vec<f32>,
+    mode: SearchMode,
+) -> (
+    Vec<String>,
+    proximadb::observability::io_trace::IoTraceSnapshot,
+) {
+    let ctx = get_counts_query_ctx(collection, query, mode);
+    proximadb::observability::io_trace::scope(async {
+        let ids: Vec<String> = engine
+            .search_vectors_unified(&ctx)
+            .await
+            .expect("search succeeds")
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        let snapshot = proximadb::observability::io_trace::snapshot()
+            .expect("io_trace scope active during traced query");
+        (ids, snapshot)
+    })
+    .await
+}
+
+fn assert_ann_path(snapshot: &proximadb::observability::io_trace::IoTraceSnapshot, what: &str) {
+    assert_eq!(
+        snapshot.vector_accesses.len(),
+        1,
+        "{what}: one physical vector access expected"
+    );
+    assert_eq!(
+        snapshot.vector_accesses[0].actual_path,
+        VectorAccessPath::Ann,
+        "{what}: the measured query must take the ANN cascade"
+    );
+}
+
+/// Re-exec this binary for one cold arm and return its summary.
+fn run_cold_arm(spec: &serde_json::Value) -> serde_json::Value {
+    let exe = std::env::current_exe().expect("current test executable");
+    let output = std::process::Command::new(exe)
+        .args([
+            GET_COUNTS_CHILD_TEST,
+            "--exact",
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(GET_COUNTS_CHILD_ENV, spec.to_string())
+        .output()
+        .expect("spawn cold arm");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "cold arm {spec} failed ({}):\n--- stdout\n{stdout}\n--- stderr\n{stderr}",
+        output.status
+    );
+    let marker = "SIFT_GET_COUNTS_CHILD ";
+    let line = stdout
+        .lines()
+        .chain(stderr.lines())
+        .find_map(|l| l.find(marker).map(|at| &l[at + marker.len()..]))
+        .unwrap_or_else(|| panic!("cold arm {spec} printed no summary:\n{stdout}\n{stderr}"));
+    let summary: serde_json::Value = serde_json::from_str(line).expect("cold arm summary is JSON");
+    // `--exact` + a filter that matches nothing would "pass" with 0 tests;
+    // the summary line above is the proof the arm actually ran.
+    summary
+}
+
+async fn run_sift_get_counts(at_flush: bool) {
+    let mode = if at_flush {
+        "at_flush_on"
+    } else {
+        "at_flush_off"
+    };
+    let Some(base_path) = dataset_path("sift_base.fvecs").filter(|p| p.exists()) else {
+        assert!(
+            !dataset_required(),
+            "PROXIMADB_SIFT_DATASET_DIR (with sift_base.fvecs) is required by this gate"
+        );
+        eprintln!("skip: SIFT corpus unavailable — request-count harness needs the TEXMEX corpus");
+        return;
+    };
+    // SAFETY: the request-count tests are #[ignore]d and run one at a time
+    // (`--test-threads=1` in CI; nextest isolates them by process).
+    unsafe { set_get_counts_env(at_flush) };
+    let _ = proximadb::core::hardware_capabilities::initialize_hardware_capabilities_default();
+    let n: usize = std::env::var("PROXIMADB_SIFT_N")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(10_000);
+    let queries: usize = std::env::var("PROXIMADB_SIFT_QUERIES")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(GET_COUNTS_DEFAULT_QUERIES);
+    let floor: f64 = std::env::var("PROXIMADB_SIFT_RECALL_FLOOR")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|f| (0.0..=1.0).contains(f))
+        .unwrap_or(0.90);
+    let batch_size = sift_flush_batch();
+
+    let temp_dir = TempDir::new().expect("tempdir");
+    let object_store_url = std::env::var("PROXIMADB_OBJECT_STORE_URL").ok();
+    let storage_base = get_counts_storage_base(
+        temp_dir.path(),
+        object_store_url.as_deref(),
+        &uuid::Uuid::new_v4().simple().to_string(),
+    );
+    let store = if object_store_url.is_some() {
+        storage_base
+            .split("://")
+            .next()
+            .unwrap_or("unknown")
+            .to_string()
+    } else {
+        "file".to_string()
+    };
+    let collection = collection(GET_COUNTS_COLLECTION, storage_base.clone());
+    let engine = SstEngine::new().await.expect("SST engine");
+
+    // --- Ingest: one flush per batch ⇒ exactly ceil(N / batch) segments ----------
+    let base = read_vec_records_f32(&base_path, Some(n)).expect("read sift_base.fvecs");
+    let n = base.len();
+    assert!(n >= TOP_K, "need at least {TOP_K} base vectors, got {n}");
+    let expected_segments = n.div_ceil(batch_size);
+    let ingest = proximadb::observability::io_trace::scope(async {
+        for (chunk_index, chunk) in base.chunks(batch_size).enumerate() {
+            let batch = chunk
+                .iter()
+                .enumerate()
+                .map(|(j, v)| vector_record((chunk_index * batch_size + j) as u32, v.clone()))
+                .collect();
+            flush_batch(&engine, &collection, batch).await;
+        }
+        proximadb::observability::io_trace::snapshot().expect("io_trace scope active during ingest")
+    })
+    .await;
+    drop(base);
+
+    // --- Positive controls on what is at rest (outside any trace scope) ------------
+    let storage_url = get_counts_query_ctx(&collection, vec![0.0; DIMENSION], SearchMode::Exact)
+        .collection_storage_path()
+        .expect("collection storage path");
+    let fs = engine
+        .filesystem()
+        .get_filesystem(&storage_url)
+        .expect("filesystem for the collection");
+    let listing =
+        proximadb::storage::persistence::filesystem::FileSystem::list(fs.as_ref(), &storage_url)
+            .await
+            .expect("list collection directory");
+    let segments = listing.iter().filter(|e| e.name.ends_with(".pax")).count();
+    let directories = listing
+        .iter()
+        .filter(|e| e.name.starts_with("centroids-") && e.name.ends_with(".pxcd"))
+        .count();
+    assert_eq!(
+        segments,
+        expected_segments,
+        "one .pax segment per flush expected (N={n}, batch={batch_size}) in {storage_url}: {:?}",
+        listing.iter().map(|e| &e.name).collect::<Vec<_>>()
+    );
+    if at_flush {
+        assert!(
+            directories >= 1,
+            "AT_FLUSH=1 must leave a centroids-<gen>.pxcd at rest (the gate took no effect)"
+        );
+    } else {
+        assert_eq!(
+            directories, 0,
+            "AT_FLUSH=0 with compaction off must leave no directory (something else published one)"
+        );
+    }
+
+    // --- Cold arms (fresh processes) -------------------------------------------------
+    let spec = |arm: &str| {
+        serde_json::json!({
+            "arm": arm,
+            "at_flush": at_flush,
+            "storage_base": storage_base,
+            "n": n,
+            "queries": queries,
+        })
+    };
+    let approx = run_cold_arm(&spec("approx"));
+    let adaptive = run_cold_arm(&spec("adaptive"));
+    let approx_first = &approx["first_query"];
+    let adaptive_first = &adaptive["first_query"];
+    // The Adaptive arm runs the same first query plus the collection-level
+    // question, so it can never cost LESS than the Approximate arm; a negative
+    // delta means the arms diverged, and must fail rather than clamp to 0.
+    for key in ["get_ops", "range_gets", "list_ops", "head_ops", "requests"] {
+        assert!(
+            count_field(adaptive_first, key) >= count_field(approx_first, key),
+            "[{mode}] cold Adaptive first query {key}={} < Approximate {key}={} — the arms \
+             no longer differ only by the collection-level question",
+            count_field(adaptive_first, key),
+            count_field(approx_first, key)
+        );
+    }
+    let diff = |key: &str| count_field(adaptive_first, key) - count_field(approx_first, key);
+    let cold_metadata = serde_json::json!({
+        "get_ops": diff("get_ops"),
+        "range_gets": diff("range_gets"),
+        "list_ops": diff("list_ops"),
+        "head_ops": diff("head_ops"),
+        "requests": diff("requests"),
+    });
+    let recall = adaptive["recall_at_10"]
+        .as_f64()
+        .expect("recall in adaptive arm");
+    let summary = serde_json::json!({
+        "mode": mode,
+        "pax_write_directory_at_flush": at_flush,
+        "store": store,
+        "n": n,
+        "flush_batch": batch_size,
+        "segments": segments,
+        "directory_objects_at_rest": directories,
+        "queries": queries,
+        "top_k": TOP_K,
+        "recall_at_10": recall,
+        "ingest": request_counts(&ingest),
+        "cold_first_query_approx": approx_first,
+        "cold_first_query_adaptive": adaptive_first,
+        "cold_metadata": cold_metadata,
+        "steady": adaptive["steady"],
+        "latency": "not measured (emulator latency is not evidence)",
+    });
+    // Leading newline: libtest prints "test <name> ... " without one.
+    println!("\nSIFT_GET_COUNTS {summary}");
+
+    // Non-vacuity: without a directory the collection-level question must
+    // pay per-segment footer reads; if it pays nothing the scenario is not
+    // measuring what it claims (e.g. the Adaptive route stopped asking).
+    if !at_flush {
+        assert!(
+            diff("get_ops") >= segments as u64,
+            "AT_FLUSH=0: the cold collection-level question should read footers \
+             (>= 1 GET per segment); measured {} over {segments} segments",
+            diff("get_ops")
+        );
+    } else {
+        // The directory must actually SERVE the collection-level question
+        // (ADR-098 D2): zero marginal GETs, and the cold first query carries
+        // exactly one whole-object (non-ranged) GET — the directory load.
+        // Without these, ON with the directory read path disabled
+        // (PROXIMADB_PAX_READ_CENTROID_DIRECTORY=0 or
+        // PROXIMADB_PAX_READ_DIRECTORY_DECODE_KEYS=0) passed with the
+        // footer-path counts, and the flip evidence would be unprotected.
+        assert_eq!(
+            diff("get_ops"),
+            0,
+            "AT_FLUSH=1: the directory must answer the cold collection-level question \
+             with zero per-segment GETs (measured {})",
+            diff("get_ops")
+        );
+        for (arm, first) in [("approx", approx_first), ("adaptive", adaptive_first)] {
+            assert_eq!(
+                count_field(first, "get_ops"),
+                count_field(first, "range_gets") + 1,
+                "AT_FLUSH=1: the cold {arm} first query must carry exactly one non-ranged \
+                 GET (the directory load): {first}"
+            );
+        }
+    }
+    assert!(
+        recall >= floor,
+        "SIFT recall@{TOP_K} [{mode}] = {recall:.4} < floor {floor} (N={n}, segments={segments})"
+    );
+    // The ceiling is a budget for the directory-backed (AT_FLUSH=1) mode
+    // only; the OFF mode pays 2 GETs per segment by design.
+    if let Some(raw) = std::env::var("PROXIMADB_SIFT_MAX_COLD_METADATA_GETS")
+        .ok()
+        .filter(|_| at_flush)
+    {
+        let ceiling: u64 = raw.trim().parse().unwrap_or_else(|_| {
+            panic!("PROXIMADB_SIFT_MAX_COLD_METADATA_GETS must be an unsigned integer, got {raw:?}")
+        });
+        assert!(
+            diff("get_ops") <= ceiling,
+            "[{mode}] cold collection-level metadata GETs {} exceed the ceiling {ceiling} \
+             (PROXIMADB_SIFT_MAX_COLD_METADATA_GETS)",
+            diff("get_ops")
+        );
+    }
+}
+
+/// TD-PAXMETA-1 request counts, flush-time directory publish OFF (shipped default).
+#[tokio::test]
+#[ignore = "SIFT request-count harness — set PROXIMADB_SIFT_DATASET_DIR + run with --ignored"]
+async fn sift_get_counts_directory_at_flush_off() {
+    run_sift_get_counts(false).await;
+}
+
+/// TD-PAXMETA-1 request counts, flush-time directory publish ON.
+#[tokio::test]
+#[ignore = "SIFT request-count harness — set PROXIMADB_SIFT_DATASET_DIR + run with --ignored"]
+async fn sift_get_counts_directory_at_flush_on() {
+    run_sift_get_counts(true).await;
+}
+
+/// One cold arm of the request-count harness, run ONLY as a re-exec'd child
+/// of the two tests above (inert without the spec env).
+#[tokio::test]
+#[ignore = "internal child of sift_get_counts_directory_at_flush_{off,on}"]
+async fn sift_get_counts_cold_child() {
+    let Ok(raw) = std::env::var(GET_COUNTS_CHILD_ENV) else {
+        eprintln!("skip: {GET_COUNTS_CHILD_ENV} unset — this is a re-exec child");
+        return;
+    };
+    let spec: serde_json::Value = serde_json::from_str(&raw).expect("child spec is JSON");
+    let arm = spec["arm"].as_str().expect("arm").to_string();
+    let at_flush = spec["at_flush"].as_bool().expect("at_flush");
+    let storage_base = spec["storage_base"]
+        .as_str()
+        .expect("storage_base")
+        .to_string();
+    let n = spec["n"].as_u64().expect("n") as usize;
+    let queries = spec["queries"].as_u64().expect("queries") as usize;
+    // SAFETY: a dedicated child process running exactly this test.
+    unsafe {
+        set_get_counts_env(at_flush);
+        std::env::set_var(
+            "PROXIMADB_SEGMENT_LISTING_CACHE_MS",
+            GET_COUNTS_LISTING_TTL_MS,
+        );
+    }
+    let _ = proximadb::core::hardware_capabilities::initialize_hardware_capabilities_default();
+    let collection = collection(GET_COUNTS_COLLECTION, storage_base);
+    let engine = SstEngine::new().await.expect("SST engine");
+
+    let query_path = dataset_path("sift_query.fvecs").filter(|p| p.exists());
+    let query_vectors = read_vec_records_f32(
+        query_path
+            .as_deref()
+            .expect("sift_query.fvecs required by the request-count harness"),
+        Some(queries),
+    )
+    .expect("read sift_query.fvecs");
+    let adaptive = SearchMode::Adaptive { threshold: 0 };
+    let first_mode = match arm.as_str() {
+        "approx" => SearchMode::Approximate { nprobe: None },
+        "adaptive" => adaptive.clone(),
+        other => panic!("unknown cold arm {other:?}"),
+    };
+    let (_, first) = traced_query(&engine, &collection, query_vectors[0].clone(), first_mode).await;
+    assert_ann_path(&first, "cold first query");
+    let mut summary = serde_json::json!({
+        "arm": arm,
+        "first_query": request_counts(&first),
+    });
+
+    if arm == "adaptive" {
+        let base_path = dataset_path("sift_base.fvecs").expect("dataset dir");
+        let base = read_vec_records_f32(&base_path, Some(n)).expect("read sift_base.fvecs");
+        let gt_path = dataset_path("sift_groundtruth.ivecs");
+        let (ground_truth, _) = exact_ground_truth(&base, &query_vectors, gt_path.as_deref());
+        drop(base);
+        let mut totals = proximadb::observability::io_trace::IoTraceSnapshot::default();
+        let mut waves_total = 0u64;
+        let mut waves_unrecorded = 0u64;
+        let mut recall_sum = 0.0f64;
+        // The steady loop starts at query 0, which the cold first query above
+        // already ran (so its first iteration is a warm repeat). Kept so the
+        // recall denominator is exactly `queries` and the recorded Azurite
+        // figures stay comparable with this harness version.
+        for (qi, query) in query_vectors.iter().enumerate() {
+            let (ids, snap) =
+                traced_query(&engine, &collection, query.clone(), adaptive.clone()).await;
+            assert_ann_path(&snap, "steady query");
+            totals.get_ops += snap.get_ops;
+            totals.range_gets += snap.range_gets;
+            totals.list_ops += snap.list_ops;
+            totals.head_ops += snap.head_ops;
+            totals.put_ops += snap.put_ops;
+            totals.bytes_read += snap.bytes_read;
+            match snap.waves {
+                Some(w) => waves_total += w,
+                None => waves_unrecorded += 1,
+            }
+            let got: std::collections::HashSet<String> = ids.into_iter().take(TOP_K).collect();
+            recall_sum += got.intersection(&ground_truth[qi]).count() as f64 / TOP_K as f64;
+        }
+        let q = query_vectors.len() as f64;
+        summary["recall_at_10"] = serde_json::json!(recall_sum / q);
+        summary["steady"] = serde_json::json!({
+            "queries": query_vectors.len(),
+            "total": {
+                "get_ops": totals.get_ops,
+                "range_gets": totals.range_gets,
+                "list_ops": totals.list_ops,
+                "head_ops": totals.head_ops,
+                "requests": totals.get_ops + totals.list_ops + totals.head_ops,
+                "bytes_read": totals.bytes_read,
+                "waves": waves_total,
+                "queries_without_waves": waves_unrecorded,
+            },
+            "per_query": {
+                "get_ops": totals.get_ops as f64 / q,
+                "range_gets": totals.range_gets as f64 / q,
+                "list_ops": totals.list_ops as f64 / q,
+                "head_ops": totals.head_ops as f64 / q,
+                "waves": waves_total as f64 / q,
+            },
+        });
+    }
+    println!("\nSIFT_GET_COUNTS_CHILD {summary}");
+}
