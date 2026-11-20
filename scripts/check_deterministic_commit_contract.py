@@ -55,7 +55,16 @@ TEXT_EXTENSIONS = {
 }
 
 CONFLICT_RE = re.compile(r"^(<<<<<<<|=======|>>>>>>>)($| )", re.MULTILINE)
-RUST_CACHE_RE = re.compile(r"^(?P<indent>\s*)-\s+uses:\s*Swatinem/rust-cache@")
+# A rust-cache user is either an inline Swatinem/rust-cache step (legacy
+# form; still used by qa-gate.yml / prerelease-ci.yml) or a call to the
+# rust-setup composite action (TD-CI-8 step-block fold). The policy checks
+# below treat both identically: the `with:` inputs carry the same
+# shared-key / save-if / add-job-id-key values at the call site.
+RUST_CACHE_RE = re.compile(
+    r"^(?P<indent>\s*)-\s+uses:\s*("
+    r"Swatinem/rust-cache@|"
+    r"\./\.github/actions/rust-setup\s*$)"
+)
 CACHE_INPUT_RE = re.compile(
     r"^\s+(?P<name>prefix-key|shared-key):\s*(?P<value>.*?)\s*$"
 )
@@ -526,17 +535,25 @@ CACHE_POLICY_INPUT_RE = re.compile(
 
 
 def _rust_cache_steps(lines: list[str]):
-    """Yield (line_no, job_lines, inputs) for every rust-cache step."""
+    """Yield (line_no, job_lines, inputs, is_composite) for every rust-cache
+    step (inline Swatinem/rust-cache or the rust-setup composite call)."""
     for index, line in enumerate(lines):
         action = RUST_CACHE_RE.match(line)
         if action is None:
             # `- if: ...` then `uses:` on the next line is the same step.
-            bare = re.match(r"^(?P<indent>\s*)uses:\s*Swatinem/rust-cache@", line)
+            bare = re.match(
+                r"^(?P<indent>\s*)uses:\s*("
+                r"Swatinem/rust-cache@|"
+                r"\./\.github/actions/rust-setup\s*$)",
+                line,
+            )
             if bare is None or line.lstrip().startswith("#"):
                 continue
             step_indent = len(bare.group("indent")) - 2
+            is_composite = "rust-setup" in line
         else:
             step_indent = len(action.group("indent"))
+            is_composite = "rust-setup" in action.group(0)
         job_start = index
         while job_start >= 0 and not re.match(r"^  [A-Za-z0-9_-]+:\s*$", lines[job_start]):
             job_start -= 1
@@ -556,7 +573,7 @@ def _rust_cache_steps(lines: list[str]):
                 if found:
                     inputs[found.group("name")] = found.group("value").strip("\"'")
             cursor += 1
-        yield index + 1, lines[max(job_start, 0) : job_end], inputs
+        yield index + 1, lines[max(job_start, 0) : job_end], inputs, is_composite
 
 
 WRITER_BLOCKING_GATES = (
@@ -635,7 +652,11 @@ def check_rust_cache_policy(findings: list[Finding]) -> None:
     writers: dict[str, list[int]] = {}
     users: dict[str, list[tuple[int, list[str]]]] = {}
     seen = 0
-    for line_no, job, inputs in _rust_cache_steps(lines):
+    for line_no, job, inputs, is_composite in _rust_cache_steps(lines):
+        if is_composite and not inputs.get("shared-key"):
+            # rust-setup composite call without a shared-key input: a
+            # cache-less toolchain setup (lint/audit), not a cache user.
+            continue
         seen += 1
         if inputs.get("shared-key"):
             users.setdefault(inputs["shared-key"], []).append((line_no, job))
@@ -742,6 +763,78 @@ def check_rust_cache_policy(findings: list[Finding]) -> None:
                 f"check would pass vacuously",
             )
         )
+
+
+RUST_SETUP_ACTION = ".github/actions/rust-setup/action.yml"
+
+
+def check_rust_setup_action(findings: list[Finding]) -> None:
+    """The composite the cache policy now leans on must not silently change it.
+
+    After the TD-CI-8 step-block fold, ci.yml call sites carry only the
+    per-site inputs (shared-key / save-if / add-job-id-key); the CONSTANTS
+    (prefix-key "v2-rust", step-level RUSTUP_MAX_RETRIES, no composite-level
+    env) live in the action file -- which this check pins, because a drive-by
+    edit there is invisible to every per-site check above.
+    """
+    path = ROOT / RUST_SETUP_ACTION
+    if not path.exists():
+        findings.append(
+            Finding(
+                "rust-setup-action",
+                f"{RUST_SETUP_ACTION} is missing -- ci.yml call sites depend on it",
+            )
+        )
+        return
+    text = path.read_text(encoding="utf-8")
+    if "uses: Swatinem/rust-cache@v2" not in text:
+        findings.append(
+            Finding("rust-setup-action", f"{RUST_SETUP_ACTION} no longer uses Swatinem/rust-cache@v2")
+        )
+    if 'prefix-key: \'v2-rust\'' not in text and 'prefix-key: "v2-rust"' not in text:
+        findings.append(
+            Finding(
+                "rust-setup-action",
+                f"{RUST_SETUP_ACTION} must hardcode `prefix-key: 'v2-rust'` -- "
+                f"a different prefix strands every shared shape key",
+            )
+        )
+    if "uses: dtolnay/rust-toolchain@1.99.0" not in text:
+        findings.append(
+            Finding(
+                "rust-setup-action",
+                f"{RUST_SETUP_ACTION} no longer pins dtolnay/rust-toolchain@1.99.0 "
+                f"-- a toolchain bump is a whole-fleet event, land it deliberately",
+            )
+        )
+    if "default: '1.99.0'" not in text:
+        findings.append(
+            Finding(
+                "rust-setup-action",
+                f"{RUST_SETUP_ACTION} toolchain input default drifted from '1.99.0' "
+                f"-- keep the uses ref and the default in lockstep",
+            )
+        )
+    if "RUSTUP_MAX_RETRIES" not in text:
+        findings.append(
+            Finding(
+                "rust-setup-action",
+                f"{RUST_SETUP_ACTION} lost the step-level RUSTUP_MAX_RETRIES env",
+            )
+        )
+    # A composite-level `env:` would be hashed into every consumer's
+    # rust-cache key exactly like a job-level one would.
+    for line in text.splitlines():
+        # sibling of `  steps:` (composite-level); step-level env lives deeper
+        if re.match(r"^ {2}env:\s*$", line):
+            findings.append(
+                Finding(
+                    "rust-setup-action",
+                    f"{RUST_SETUP_ACTION} has a composite-level `env:` block -- "
+                    f"move any env onto the individual steps",
+                )
+            )
+            break
 
 
 def tracked_files() -> list[Path]:
@@ -1338,6 +1431,7 @@ def main() -> int:
     check_object_store_proof_authority(findings)
     check_rust_cache_keys(findings)
     check_rust_cache_policy(findings)
+    check_rust_setup_action(findings)
     check_conflict_markers(findings)
     check_promotion_concurrency(findings)
     check_ci_concurrency_per_event(findings)

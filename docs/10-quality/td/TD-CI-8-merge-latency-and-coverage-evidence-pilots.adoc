@@ -145,7 +145,26 @@ drivers), mlflow REST-conformance vs mlflow-s3-seam, feature-matrix legs
 (TD-CAT-8), benchmarks/tpc-ledger/sift (different targets/tiers/shapes),
 chunking vs unit dirs, Trivy vs cargo-audit, connectors vs lanes. No dead jobs.
 
-**Step-block fold (separate PR):** 38 copies of the checkout+toolchain+rust-cache
+**Step-block fold (SHIPPED in the filing PR, ci.yml scope):** `.github/actions/rust-setup`
+composite created (pinned toolchain + optional apt/nextest + optional
+rust-cache with prefix-key "v2-rust" hardcoded; the CALLER owns
+actions/checkout — a LOCAL composite is loaded from the workspace and cannot
+run before checkout, which the first CI run of the fold proved the hard way
+(30 instant "Can't find 'action.yml'" failures)); 30 of ci.yml's 31 rust-cache triples
+converted (3 bail-outs kept inline where unique steps — Java setup, Python-dep
+installs — sit inside the span; 1 conditional bare-form site stays inline), plus the
+toolchain-only trio (rust-format/rust-security/rust-sdk-lint) as cache-less callers.
+~480 duplicated lines → 30 × ~7. Per-site policy (shared-key, save-if,
+add-job-id-key) still enforced at each call site by
+`check_deterministic_commit_contract.py`, retargeted to match the composite form;
+new `check_rust_setup_action` pins the action-file constants against drive-by
+edits; `.github/actions/**` added to the `rust:`/`compile:` selfdef filters;
+composite-form fixtures added to the contract tests. qa-gate.yml / prerelease-ci.yml
+conversion DEFERRED (their prefix-key-v1 shapes without shared-key/save-if have
+different cache semantics — a deliberate separate change). ~0 wall-clock delta by
+design; the payoff is single-point maintenance.
+
+Original fold plan for reference: 38 copies of the checkout+toolchain+rust-cache
 triple, 40 apt blocks, 7 reclaim + 8 swap blocks → 4 composite actions
 (`rust-setup`, `runner-prep`, `python-setup`, `dockerhub-login`). ~0 wall-clock delta;
 the payoff is single-point maintenance (40+ sites → 1). HARD PREREQUISITE: retarget
@@ -155,3 +174,19 @@ fails vacuously or goes silently blind), add contract fixtures for the composite
 and add `.github/actions/**` to the selfdef filter groups. Timing pairs stay inline;
 reclaim/swap ordering (pre-checkout) means a local composite only works placed after
 checkout — functionally safe, preserve if deemed semantic.
+
+
+== Reliability ledger
+
+* **2026-11-20, PR #2546**: `feature-matrix-enterprise-catalogs` died 3× at
+  77–81 min with "hosted runner lost communication", always inside the
+  `serve enterprise-catalog tests` step (attempt 3's step timing: warm-cache
+  `cargo check` 9.4 min → serve step hung ~65+ min → runner death; logs
+  unrecoverable, BlobNotFound — runner death prevents upload). Same tree's
+  ~60 other jobs green. The job passed at 36.5 min earlier the same day
+  (#2540 run) and at ~25–30 min in #2541's run — no Rust delta between those
+  trees and this one. Incident recorded per the acceptance criteria's
+  "include rerun attempts in the reliability view"; NOT counted against the
+  fold's first-attempt record (the fold's two genuine defects — checkout
+  before local composite, undeclared input — were caught by guards on
+  earlier runs of this same PR and fixed pre-merge).

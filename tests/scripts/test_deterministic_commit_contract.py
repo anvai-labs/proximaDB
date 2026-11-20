@@ -359,6 +359,68 @@ class NodeVersionPinContractTest(unittest.TestCase):
         self.assertIn(f"node-version: '{contract.NODE_MAJOR}'", text)
 
 
+
+class RustSetupActionContractTest(unittest.TestCase):
+    """TD-CI-8 step-block fold: the constants the cache policy leans on moved
+    into the composite action file — pin them there."""
+
+    def findings_for(self, action_text: str | None) -> list[contract.Finding]:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            action_dir = root / ".github" / "actions" / "rust-setup"
+            if action_text is not None:
+                action_dir.mkdir(parents=True)
+                (action_dir / "action.yml").write_text(action_text, encoding="utf-8")
+            with patch.object(contract, "ROOT", root):
+                findings: list[contract.Finding] = []
+                contract.check_rust_setup_action(findings)
+                return findings
+
+    GOOD = (
+        "runs:\n"
+        "  using: composite\n"
+        "  steps:\n"
+        "    - uses: actions/checkout@v7\n"
+        "    - uses: dtolnay/rust-toolchain@1.99.0\n"
+        "      with:\n"
+        "        toolchain: ${{ inputs.toolchain }}\n"
+        "      env:\n"
+        "        RUSTUP_MAX_RETRIES: '10'\n"
+        "    - uses: Swatinem/rust-cache@v2\n"
+        "      with:\n"
+        "        prefix-key: 'v2-rust'\n"
+        "inputs:\n"
+        "  toolchain:\n"
+        "    default: '1.99.0'\n"
+    )
+
+    def test_good_action_passes(self) -> None:
+        self.assertEqual(self.findings_for(self.GOOD), [])
+
+    def test_missing_action_fails(self) -> None:
+        findings = self.findings_for(None)
+        self.assertTrue(any("is missing" in f.message for f in findings), findings)
+
+    def test_missing_rust_cache_step_fails(self) -> None:
+        findings = self.findings_for("runs:\n  using: composite\n")
+        self.assertTrue(any("Swatinem/rust-cache" in f.message for f in findings), findings)
+
+    def test_changed_prefix_key_fails(self) -> None:
+        findings = self.findings_for(self.GOOD.replace("'v2-rust'", "'v3-other'"))
+        self.assertTrue(any("prefix-key" in f.message for f in findings), findings)
+
+    def test_toolchain_bump_in_action_fails(self) -> None:
+        bad = self.GOOD.replace("dtolnay/rust-toolchain@1.99.0", "dtolnay/rust-toolchain@2.0.0")
+        findings = self.findings_for(bad)
+        self.assertTrue(any("toolchain bump" in f.message for f in findings), findings)
+
+    def test_composite_level_env_fails(self) -> None:
+        bad = self.GOOD.replace("  steps:\n", "  env:\n    CARGO_INCREMENTAL: '0'\n  steps:\n", 1)
+        findings = self.findings_for(bad)
+        self.assertTrue(any("composite-level `env:`" in f.message for f in findings), findings)
+
+
+
 if __name__ == "__main__":
     unittest.main()
 
@@ -878,6 +940,46 @@ class RustCachePolicyContractTest(unittest.TestCase):
             "&& matrix.shape == 'test' }}"
         )
         self.assertEqual(self.findings_for(self.wf(self._job("j", self._cache(save=narrowed)))), [])
+
+    # -- composite call-site form (TD-CI-8 step-block fold) -----------------
+
+    def _composite(self, key: str, save: str | None = "false", extra: str = "") -> str:
+        body = f'          shared-key: "{key}"\n' if key else ""
+        if save is not None:
+            body += f"          save-if: {save}\n"
+        body += "          add-job-id-key: false\n" + extra
+        return (
+            "  j:\n"
+            "    runs-on: ubuntu-24.04\n"
+            "    steps:\n"
+            "      - uses: ./.github/actions/rust-setup\n"
+            "        with:\n"
+            + body
+            + "      - run: cargo check\n"
+        )
+
+    def test_composite_writer_plus_reader_accepted(self) -> None:
+        findings = self.findings_for(
+            self.wf(self._composite("dev-test", save=self.DEVELOP), self._composite("dev-test"))
+        )
+        self.assertEqual(findings, [], [f.message for f in findings])
+
+    def test_composite_missing_save_if_rejected(self) -> None:
+        findings = self.findings_for(self.wf(self._composite("dev-test", save=None)))
+        self.assertTrue(any("save-if" in f.message for f in findings), findings)
+
+    def test_composite_toolchain_only_site_skipped(self) -> None:
+        # shared-key '' = cache-less lint/audit setup: not a rust-cache user,
+        # so the site itself must draw no shared-key/save-if finding. (A file
+        # with NO cache users at all still trips the vacuity guard — correct.)
+        findings = self.findings_for(self.wf(self._composite("", save=None)))
+        per_site = [f for f in findings if "vacuously" not in f.message]
+        self.assertEqual(per_site, [], per_site)
+
+    def test_composite_site_counts_toward_vacuity_guard(self) -> None:
+        findings = self.findings_for(self.wf(self._composite("dev-test")))
+        # only the missing save-if, NOT the vacuity finding
+        self.assertFalse(any("vacuously" in f.message for f in findings), findings)
 
     def test_job_id_key_is_rejected(self) -> None:
         findings = self.findings_for(

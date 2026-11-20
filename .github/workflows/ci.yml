@@ -79,6 +79,11 @@ env:
 #   restores the shape: the dependencies are shared, and it never writes.
 # * Job-level CARGO_*/RUST* env is hashed into the key, so such env lives on
 #   build steps, never on a job that reads a shared shape.
+# * TD-CI-8 step-block fold: most jobs restore their shape via the
+#   ./.github/actions/rust-setup composite (constants — prefix-key v2-rust,
+#   step-level RUSTUP_MAX_RETRIES — live in .github/actions/rust-setup/action.yml
+#   and are pinned by check_rust_setup_action in
+#   scripts/check_deterministic_commit_contract.py).
 # * `cache-workspace-crates` is deliberately NOT set: cargo decides freshness of
 #   workspace (path) crates by source mtime, and a fresh checkout makes every
 #   source newer than any restored artifact, so cached workspace-crate
@@ -291,6 +296,10 @@ jobs:
               # groups, slow timeouts) change test OUTCOMES — a config-only PR
               # must re-run the Rust lanes, not slip through as skipped-pass.
               - '.config/nextest.toml'
+              # The rust-setup composite carries the toolchain pin, apt deps and
+              # rust-cache constants every Rust job leans on — an edit to it is
+              # an edit to every lane's setup.
+              - '.github/actions/**'
               # This file DEFINES the Rust jobs (clippy args, feature matrix
               # combos, test shapes), so a change to it changes their outcome —
               # but it was not listed, which meant **CI could not validate a
@@ -323,6 +332,7 @@ jobs:
               - 'rust-toolchain*'
               - '.cargo/**'
               - '.config/nextest.toml'
+              - '.github/actions/**'
               - 'proto/**'
             python:
               - 'clients/python/**'
@@ -1010,18 +1020,11 @@ jobs:
     if: needs.changes.outputs.sweep == 'true' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.compile == 'true'
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.99.0
-        # Step-level, NOT workflow env: rust-cache hashes every CARGO*/RUST*
-        # env var into its cache key, so a workflow-level var would cold-start
-        # every cache (#2502 review). rustup's default is 3 retries.
-        env:
-          RUSTUP_MAX_RETRIES: "10"
+      - uses: ./.github/actions/rust-setup
         with:
+          shared-key: ''  # cache-less toolchain-only setup
           components: rustfmt
-      - name: Install System Dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libssl-dev pkg-config
+          apt-packages: 'libssl-dev pkg-config'
       - run: cargo fmt --all -- --check
 
   capability-matrix:
@@ -1144,22 +1147,12 @@ jobs:
     if: (needs.changes.outputs.sweep == 'true' || needs.changes.outputs.medium_tier == 'true' || needs.changes.outputs.openapi_code_changes == 'true' || needs.changes.outputs.openapi_spec == 'true') && !contains(needs.changes.outputs.reused, ',openapi-spec-drift,')
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.99.0
-        # Step-level, NOT workflow env: rust-cache hashes every CARGO*/RUST*
-        # env var into its cache key, so a workflow-level var would cold-start
-        # every cache (#2502 review). rustup's default is 3 retries.
-        env:
-          RUSTUP_MAX_RETRIES: "10"
-      - name: Install System Dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libssl-dev pkg-config protobuf-compiler
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/rust-setup
         with:
-          prefix-key: "v2-rust"
           shared-key: "dev-test"
-          add-job-id-key: false
           save-if: false
+          add-job-id-key: false
+          apt-packages: 'libssl-dev pkg-config protobuf-compiler'
       - name: Regenerate OpenAPI spec from handlers (drift gate)
         run: cargo test -p proximadb --test openapi_spec_gen -- --nocapture
       - name: Fail on uncommitted drift in generated OpenAPI spec
@@ -1308,22 +1301,12 @@ jobs:
     if: (needs.changes.outputs.sweep == 'true' || needs.changes.outputs.python == 'true' || needs.changes.outputs.openapi_spec == 'true' || needs.changes.outputs.sdk_docs == 'true') && !contains(needs.changes.outputs.reused, ',python-sdk-round-trip,')
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.99.0
-        # Step-level, NOT workflow env: rust-cache hashes every CARGO*/RUST*
-        # env var into its cache key, so a workflow-level var would cold-start
-        # every cache (#2502 review). rustup's default is 3 retries.
-        env:
-          RUSTUP_MAX_RETRIES: "10"
-      - name: Install System Dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libssl-dev pkg-config curl
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/rust-setup
         with:
-          prefix-key: "v2-rust"
           shared-key: "release"
-          add-job-id-key: false
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/develop' }}
+          add-job-id-key: false
+          apt-packages: 'curl libssl-dev pkg-config'
       - name: Build server binary
         run: cargo build --release --package proximadb-server --bin proximadb-server
       - uses: actions/setup-python@v7
@@ -1479,31 +1462,13 @@ jobs:
     if: needs.changes.outputs.sweep == 'true' || needs.changes.outputs.rust == 'true'
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.99.0
-        # Step-level, NOT workflow env: rust-cache hashes every CARGO*/RUST*
-        # env var into its cache key, so a workflow-level var would cold-start
-        # every cache (#2502 review). rustup's default is 3 retries.
-        env:
-          RUSTUP_MAX_RETRIES: "10"
+      - uses: ./.github/actions/rust-setup
         with:
           components: clippy
-      - name: Install System Dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libssl-dev pkg-config protobuf-compiler
-      - uses: Swatinem/rust-cache@v2
-        with:
-          prefix-key: "v2-rust"
           shared-key: "check"
-          add-job-id-key: false
           save-if: false
-      # Clippy is authoritative. TD-079 retired the accumulated root-crate
-      # lint debt (2026-05-28); any new warning fails CI. If a new lint
-      # surfaces from a dependency or toolchain update, prefer fixing it
-      # over re-adding `-A warnings`. Targeted `#[allow(...)]` with an
-      # inline rationale is acceptable for genuinely infallible / large
-      # blast-radius edge cases.
-      # Only lint lib+bins to stay within CI memory limits (--all-targets OOMs).
+          add-job-id-key: false
+          apt-packages: 'libssl-dev pkg-config protobuf-compiler'
       - name: Run clippy (-D warnings)
         env:
           CARGO_PROFILE_DEV_DEBUG: 0
@@ -1618,23 +1583,12 @@ jobs:
           - { label: "small-crates",         pkg: "proximadb-mongodb-parser proximadb-catalog-introspection", args: "" }
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.99.0
-        # Step-level, NOT workflow env: rust-cache hashes every CARGO*/RUST*
-        # env var into its cache key, so a workflow-level var would cold-start
-        # every cache (#2502 review). rustup's default is 3 retries.
-        env:
-          RUSTUP_MAX_RETRIES: "10"
-      - name: Install System Dependencies
-        # g++ provides libstdc++ for the onnxruntime (ort) build script.
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libssl-dev pkg-config protobuf-compiler g++
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/rust-setup
         with:
-          prefix-key: "v2-rust"
           shared-key: "check"
-          add-job-id-key: false
           save-if: false
+          add-job-id-key: false
+          apt-packages: 'g++ libssl-dev pkg-config protobuf-compiler'
       - name: cargo check -p ${{ matrix.pkg }} --tests ${{ matrix.args }}
         env:
           CARGO_PROFILE_DEV_DEBUG: 0
@@ -1697,32 +1651,13 @@ jobs:
       !contains(needs.changes.outputs.reused, ',feature-matrix-enterprise-catalogs,')
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.99.0
-        # Step-level, NOT workflow env: rust-cache hashes every CARGO*/RUST*
-        # env var into its cache key, so a workflow-level var would cold-start
-        # every cache (#2502 review). rustup's default is 3 retries.
-        env:
-          RUSTUP_MAX_RETRIES: "10"
-      - name: Install System Dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libssl-dev pkg-config protobuf-compiler g++
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/rust-setup
         with:
-          prefix-key: "v2-rust"
+          components: clippy
           shared-key: "check"
-          add-job-id-key: false
           save-if: false
-      # OOM insurance, same as the unit matrix row's "Add swap headroom", and
-      # for the same peak. The "serve enterprise-catalog tests" step builds the
-      # root crate's lib-test binary (`--lib`), whose single-rustc codegen+link
-      # sits near the 16GB hosted-runner ceiling. The runner was OOM-killed
-      # there ("shutdown signal", exit 143) on all three v0.4.1 promotion
-      # attempts (#2052 x2, #2053); `cargo check` had already passed in ~15 min.
-      # The kill is marginal, not deterministic: the same tree passed this job
-      # on #2050, and a cold-cache run has passed without swap. Swap turns
-      # the peak into a slowdown instead of a dead runner. It must stay ahead
-      # of the serve step.
+          add-job-id-key: false
+          apt-packages: 'g++ libssl-dev pkg-config protobuf-compiler'
       - name: Add swap headroom
         run: |
           sudo fallocate -l 12G /mnt/swapfile-ci
@@ -1766,12 +1701,9 @@ jobs:
     if: needs.changes.outputs.rust == 'true'
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.99.0
-        # Step-level, NOT workflow env: rust-cache hashes every CARGO*/RUST*
-        # env var into its cache key, so a workflow-level var would cold-start
-        # every cache (#2502 review). rustup's default is 3 retries.
-        env:
-          RUSTUP_MAX_RETRIES: "10"
+      - uses: ./.github/actions/rust-setup
+        with:
+          shared-key: ''  # cache-less toolchain-only setup
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
       # TD-AUDITGATE-1: this job used to be doubly unfailable (`|| echo` under
@@ -1949,13 +1881,9 @@ jobs:
     if: needs.changes.outputs.sweep == 'true' || needs.changes.outputs.rust_sdk == 'true'
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.99.0
-        # Step-level, NOT workflow env: rust-cache hashes every CARGO*/RUST*
-        # env var into its cache key, so a workflow-level var would cold-start
-        # every cache (#2502 review). rustup's default is 3 retries.
-        env:
-          RUSTUP_MAX_RETRIES: "10"
+      - uses: ./.github/actions/rust-setup
         with:
+          shared-key: ''  # cache-less toolchain-only setup
           components: rustfmt, clippy
       - name: Check formatting
         working-directory: clients/rust
@@ -2087,23 +2015,12 @@ jobs:
         kind: [rest, flight]
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.99.0
-        # Step-level, NOT workflow env: rust-cache hashes every CARGO*/RUST*
-        # env var into its cache key, so a workflow-level var would cold-start
-        # every cache (#2502 review). rustup's default is 3 retries.
-        env:
-          RUSTUP_MAX_RETRIES: "10"
-      - name: Install System Dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libssl-dev pkg-config protobuf-compiler
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/rust-setup
         with:
-          prefix-key: "v2-rust"
           shared-key: "dev-test"
-          add-job-id-key: false
           save-if: false
-
+          add-job-id-key: false
+          apt-packages: 'libssl-dev pkg-config protobuf-compiler'
       - name: REST contract gate
         if: matrix.kind == 'rest'
         run: |
@@ -2360,23 +2277,11 @@ jobs:
     # different key from the shape's writer and it would never restore.
     steps:
       - uses: actions/checkout@v7
-
-      - uses: dtolnay/rust-toolchain@1.99.0
-        # Step-level, NOT workflow env: rust-cache hashes every CARGO*/RUST*
-        # env var into its cache key, so a workflow-level var would cold-start
-        # every cache (#2502 review). rustup's default is 3 retries.
-        env:
-          RUSTUP_MAX_RETRIES: "10"
-
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/rust-setup
         with:
-          prefix-key: "v2-rust"
           shared-key: "check"
-          add-job-id-key: false
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/develop' }}
-
-      # sccache complements rust-cache: caches individual rustc invocations
-      # (content-addressed), so it hits even when the target/ artifact cache misses.
+          add-job-id-key: false
       - uses: mozilla-actions/sccache-action@v0.0.11
       - uses: actions/cache@v6
         with:
@@ -2416,23 +2321,11 @@ jobs:
     # different key from the shape's writer and it would never restore.
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.99.0
-        # Step-level, NOT workflow env: rust-cache hashes every CARGO*/RUST*
-        # env var into its cache key, so a workflow-level var would cold-start
-        # every cache (#2502 review). rustup's default is 3 retries.
-        env:
-          RUSTUP_MAX_RETRIES: "10"
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/rust-setup
         with:
-          prefix-key: "v2-rust"
           shared-key: "check"
-          add-job-id-key: false
           save-if: false
-      # sccache MUST be installed: the check step sets RUSTC_WRAPPER=sccache, so without
-      # the action cargo dies instantly ("could not execute process `sccache`").
-      # The step was missing while the env + stats step were present — the job is
-      # gated on medium_tier, so it only runs on develop→qa promotions and the gap
-      # went unexercised until it hard-failed #1378 across every rerun.
+          add-job-id-key: false
       - uses: mozilla-actions/sccache-action@v0.0.11
       - uses: actions/cache@v6
         with:
@@ -2497,26 +2390,12 @@ jobs:
           echo "Disk after reclaim:"; df -h /
 
       - uses: actions/checkout@v7
-
-      - uses: dtolnay/rust-toolchain@1.99.0
-        # Step-level, NOT workflow env: rust-cache hashes every CARGO*/RUST*
-        # env var into its cache key, so a workflow-level var would cold-start
-        # every cache (#2502 review). rustup's default is 3 retries.
-        env:
-          RUSTUP_MAX_RETRIES: "10"
-
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/rust-setup
         with:
-          prefix-key: "v2-rust"
           shared-key: "dev-test"
-          add-job-id-key: false
           save-if: false
-
-      - name: Install Dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libssl-dev pkg-config protobuf-compiler
-
+          add-job-id-key: false
+          apt-packages: 'libssl-dev pkg-config protobuf-compiler'
       - name: Build All Binaries
         # TD-079 retired the root-crate lint debt 2026-05-28 — no
         # `-A warnings` override needed. Cargo build doesn't fail on
@@ -2572,25 +2451,12 @@ jobs:
           echo "Disk after reclaim:"; df -h /
 
       - uses: actions/checkout@v7
-
-      - uses: dtolnay/rust-toolchain@1.99.0
-        env:
-          RUSTUP_MAX_RETRIES: "10"
-
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/rust-setup
         with:
-          prefix-key: "v2-rust"
-          # Reader of the release shape (writer: python-sdk-round-trip, develop
-          # push); this job never runs on develop, so it never saves.
           shared-key: "release"
-          add-job-id-key: false
           save-if: false
-
-      - name: Install Dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libssl-dev pkg-config protobuf-compiler
-
+          add-job-id-key: false
+          apt-packages: 'libssl-dev pkg-config protobuf-compiler'
       - name: Build Release Binaries
         run: |
           cargo build --release \
@@ -2676,31 +2542,12 @@ jobs:
           echo "Disk after reclaim:"; df -h /
 
       - uses: actions/checkout@v7
-
-      - uses: dtolnay/rust-toolchain@1.99.0
-        # Step-level, NOT workflow env: rust-cache hashes every CARGO*/RUST*
-        # env var into its cache key, so a workflow-level var would cold-start
-        # every cache (#2502 review). rustup's default is 3 retries.
-        env:
-          RUSTUP_MAX_RETRIES: "10"
-
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/rust-setup
         with:
-          prefix-key: "v2-rust"
           shared-key: "dev-test"
-          add-job-id-key: false
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/develop' && matrix.test-type == 'unit' }}
-
-      - name: Install Dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libssl-dev pkg-config protobuf-compiler
-
-      # Unit tests run under nextest for process-per-test isolation: the suite
-      # has tests that touch process-global statics (WAL registry, metadata
-      # provider, request-id counter) and race under libtest's shared-process
-      # parallelism. nextest gives each test its own process. Doc tests stay on
-      # `cargo test` (nextest does not run doc tests).
+          add-job-id-key: false
+          apt-packages: 'libssl-dev pkg-config protobuf-compiler'
       - name: Install nextest
         if: matrix.test-type == 'unit'
         uses: taiki-e/install-action@nextest
@@ -2794,32 +2641,14 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          # Full history so affected_crates.py's `git diff origin/develop...HEAD`
-          # (three-dot, merge-base) resolves across a large develop→main gap.
           fetch-depth: 0
-
-      - uses: dtolnay/rust-toolchain@1.99.0
-        # Step-level, NOT workflow env: rust-cache hashes every CARGO*/RUST*
-        # env var into its cache key, so a workflow-level var would cold-start
-        # every cache (#2502 review). rustup's default is 3 retries.
-        env:
-          RUSTUP_MAX_RETRIES: "10"
-
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/rust-setup
         with:
-          prefix-key: "v2-rust"
           shared-key: "dev-test"
-          add-job-id-key: false
           save-if: false
-
-      - name: Install Dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libssl-dev pkg-config protobuf-compiler
-
-      - name: Install nextest
-        uses: taiki-e/install-action@nextest
-
+          add-job-id-key: false
+          apt-packages: 'libssl-dev pkg-config protobuf-compiler'
+          install-nextest: 'true'
       - name: Affected-only fast unit check
         run: |
           set -euo pipefail
@@ -2873,38 +2702,12 @@ jobs:
       !contains(needs.changes.outputs.reused, ',object-store-emulator-tests,')
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.99.0
-        # Step-level, NOT workflow env: rust-cache hashes every CARGO*/RUST*
-        # env var into its cache key, so a workflow-level var would cold-start
-        # every cache (#2502 review). rustup's default is 3 retries.
-        env:
-          RUSTUP_MAX_RETRIES: "10"
-      - name: Install system deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libssl-dev pkg-config protobuf-compiler
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/rust-setup
         with:
-          prefix-key: "v2-rust"
-          # Restores dev-test read-only (same dev profile; the object-store
-          # crate's cloud features rebuild only what they change). This job
-          # never runs on a develop push, so a key of its own would never be
-          # written.
           shared-key: "dev-test"
-          add-job-id-key: false
           save-if: false
-      # Authenticated pulls. The emulator images (Azurite, LocalStack, fake-gcs)
-      # come from Docker Hub, and an ANONYMOUS pull is rate-limited per IP across
-      # every job on the runner fleet -- so these jobs fail with
-      # "toomanyrequests: You have reached your unauthenticated pull rate limit"
-      # and exit 125 within ~90 seconds, before any compilation, for reasons
-      # entirely unrelated to the change under test. `publish-image.yml` already
-      # authenticates with these same secrets; these jobs simply never did.
-      # TD-CI-6 records the merge-blocking shape of this class: these jobs are in
-      # `ci-success`'s needs, so a rate-limited pull blocks the required check.
-      #
-      # continue-on-error so a fork PR, which cannot read secrets, still falls
-      # back to an anonymous pull rather than failing on the login itself.
+          add-job-id-key: false
+          apt-packages: 'libssl-dev pkg-config protobuf-compiler'
       - name: Log in to Docker Hub (raises the pull rate limit)
         continue-on-error: true
         uses: docker/login-action@v4
@@ -2985,22 +2788,12 @@ jobs:
           sudo swapon /mnt/swapfile-ci
           free -h
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.99.0
-        # Step-level, NOT workflow env: rust-cache hashes every CARGO*/RUST*
-        # env var into its cache key, so a workflow-level var would cold-start
-        # every cache (#2502 review). rustup's default is 3 retries.
-        env:
-          RUSTUP_MAX_RETRIES: "10"
-      - name: Install system deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libssl-dev pkg-config protobuf-compiler
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/rust-setup
         with:
-          prefix-key: "v2-rust"
           shared-key: "dev-test"
-          add-job-id-key: false
           save-if: false
+          add-job-id-key: false
+          apt-packages: 'libssl-dev pkg-config protobuf-compiler'
       - uses: mozilla-actions/sccache-action@v0.0.11
       - uses: actions/cache@v6
         with:
@@ -3060,25 +2853,12 @@ jobs:
       !contains(needs.changes.outputs.reused, ',rust-integration-test-storage,')
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.99.0
-        # Step-level, NOT workflow env: rust-cache hashes every CARGO*/RUST*
-        # env var into its cache key, so a workflow-level var would cold-start
-        # every cache (#2502 review). rustup's default is 3 retries.
-        env:
-          RUSTUP_MAX_RETRIES: "10"
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/rust-setup
         with:
-          prefix-key: "v2-rust"
           shared-key: "dev-test"
-          add-job-id-key: false
           save-if: false
-      - name: Install Dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libssl-dev pkg-config protobuf-compiler
-      # ADR-097 D3 / TD-SEAM-1: external Iceberg read-back gate. Pinned readers
-      # that are NOT ProximaDB read a pgwire-materialized table back value-for-
-      # value (tests/iceberg_interop_e2e.rs -> scripts/iceberg_readback.py).
+          add-job-id-key: false
+          apt-packages: 'libssl-dev pkg-config protobuf-compiler'
       - name: Set up Python (Iceberg read-back readers)
         uses: actions/setup-python@v7
         with:
@@ -3148,20 +2928,12 @@ jobs:
       PROXIMADB_MLFLOW_COMPAT_ENABLE: "1"
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.99.0
-        # Step-level, NOT workflow env: rust-cache hashes every CARGO*/RUST*
-        # env var into its cache key, so a workflow-level var would cold-start
-        # every cache (#2502 review). rustup's default is 3 retries.
-        env:
-          RUSTUP_MAX_RETRIES: "10"
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/rust-setup
         with:
-          prefix-key: "v2-rust"
           shared-key: "dev-test"
-          add-job-id-key: false
           save-if: false
-      - name: Install protobuf compiler
-        run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config protobuf-compiler
+          add-job-id-key: false
+          apt-packages: 'libssl-dev pkg-config protobuf-compiler'
       - name: Build server binary (with MLflow UI feature)
         run: cargo build -p proximadb-server --features mlflow-ui
       - name: Set up Python
@@ -3276,22 +3048,12 @@ jobs:
       !contains(needs.changes.outputs.reused, ',rust-integration-test-authz,')
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.99.0
-        # Step-level, NOT workflow env: rust-cache hashes every CARGO*/RUST*
-        # env var into its cache key, so a workflow-level var would cold-start
-        # every cache (#2502 review). rustup's default is 3 retries.
-        env:
-          RUSTUP_MAX_RETRIES: "10"
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/rust-setup
         with:
-          prefix-key: "v2-rust"
           shared-key: "dev-test"
-          add-job-id-key: false
           save-if: false
-      - name: Install Dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libssl-dev pkg-config protobuf-compiler
+          add-job-id-key: false
+          apt-packages: 'libssl-dev pkg-config protobuf-compiler'
       - name: Run Authorization E2E (live transports)
         env:
           RUST_MIN_STACK: "8388608"
@@ -3332,22 +3094,12 @@ jobs:
       !contains(needs.changes.outputs.reused, ',rust-integration-test-query,')
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.99.0
-        # Step-level, NOT workflow env: rust-cache hashes every CARGO*/RUST*
-        # env var into its cache key, so a workflow-level var would cold-start
-        # every cache (#2502 review). rustup's default is 3 retries.
-        env:
-          RUSTUP_MAX_RETRIES: "10"
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/rust-setup
         with:
-          prefix-key: "v2-rust"
           shared-key: "dev-test"
-          add-job-id-key: false
           save-if: false
-      - name: Install Dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libssl-dev pkg-config protobuf-compiler
+          add-job-id-key: false
+          apt-packages: 'libssl-dev pkg-config protobuf-compiler'
       - name: Run Query Integration Tests
         env:
           # Match the QA recall lane and the hardened server runtime: the
@@ -3397,28 +3149,12 @@ jobs:
     # RUST* env changes the rust-cache key (see the rust-compile job).
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.99.0
-        # Step-level, NOT workflow env: rust-cache hashes every CARGO*/RUST*
-        # env var into its cache key, so a workflow-level var would cold-start
-        # every cache (#2502 review). rustup's default is 3 retries.
-        env:
-          RUSTUP_MAX_RETRIES: "10"
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/rust-setup
         with:
-          prefix-key: "v2-rust"
           shared-key: "dev-test"
-          add-job-id-key: false
           save-if: false
-      - name: Install Dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libssl-dev pkg-config protobuf-compiler
-      # TD-182 P0: the multi-modal pgwire VALUE-ACCURACY suite — these e2e tests
-      # assert exact result values (and the merged cold-path aggregates), not just
-      # clean execution, so they catch silent wrong-answer regressions the
-      # conformance ratchets miss. Run with --test-threads=1: they toggle the
-      # PROXIMADB_OLAP_DELTA_MERGE process env between awaited queries, so they
-      # must not run concurrently within one process.
+          add-job-id-key: false
+          apt-packages: 'libssl-dev pkg-config protobuf-compiler'
       - name: Run pgwire accuracy e2e
         env:
           # TD-STACK-1 mitigation: the document/JSON pgwire path carries a latent
@@ -3509,22 +3245,12 @@ jobs:
       !contains(needs.changes.outputs.reused, ',rust-integration-test-graph,')
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.99.0
-        # Step-level, NOT workflow env: rust-cache hashes every CARGO*/RUST*
-        # env var into its cache key, so a workflow-level var would cold-start
-        # every cache (#2502 review). rustup's default is 3 retries.
-        env:
-          RUSTUP_MAX_RETRIES: "10"
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/rust-setup
         with:
-          prefix-key: "v2-rust"
           shared-key: "dev-test"
-          add-job-id-key: false
           save-if: false
-      - name: Install Dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libssl-dev pkg-config protobuf-compiler
+          add-job-id-key: false
+          apt-packages: 'libssl-dev pkg-config protobuf-compiler'
       - name: Run Graph Integration Tests
         run: |
           for test_file in tests/*graph*.rs; do
@@ -3555,22 +3281,12 @@ jobs:
       !contains(needs.changes.outputs.reused, ',rust-integration-test-cluster,')
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.99.0
-        # Step-level, NOT workflow env: rust-cache hashes every CARGO*/RUST*
-        # env var into its cache key, so a workflow-level var would cold-start
-        # every cache (#2502 review). rustup's default is 3 retries.
-        env:
-          RUSTUP_MAX_RETRIES: "10"
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/rust-setup
         with:
-          prefix-key: "v2-rust"
           shared-key: "dev-test"
-          add-job-id-key: false
           save-if: false
-      - name: Install Dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libssl-dev pkg-config protobuf-compiler
+          add-job-id-key: false
+          apt-packages: 'libssl-dev pkg-config protobuf-compiler'
       - name: Run Cluster Integration Tests
         run: |
           for test_file in tests/*cluster*.rs tests/*distributed*.rs; do
@@ -3611,22 +3327,12 @@ jobs:
       !contains(needs.changes.outputs.reused, ',rust-integration-test-api,')
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.99.0
-        # Step-level, NOT workflow env: rust-cache hashes every CARGO*/RUST*
-        # env var into its cache key, so a workflow-level var would cold-start
-        # every cache (#2502 review). rustup's default is 3 retries.
-        env:
-          RUSTUP_MAX_RETRIES: "10"
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/rust-setup
         with:
-          prefix-key: "v2-rust"
           shared-key: "dev-test"
-          add-job-id-key: false
           save-if: false
-      - name: Install Dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libssl-dev pkg-config protobuf-compiler
+          add-job-id-key: false
+          apt-packages: 'libssl-dev pkg-config protobuf-compiler'
       - name: Run API Surface Integration Tests
         run: |
           # Explicitly named only — verify each passes before adding (these were
@@ -3688,24 +3394,13 @@ jobs:
           sudo swapon /mnt/swapfile-ci
           free -h
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.99.0
-        # Step-level, NOT workflow env: rust-cache hashes every CARGO*/RUST*
-        # env var into its cache key, so a workflow-level var would cold-start
-        # every cache (#2502 review). rustup's default is 3 retries.
-        env:
-          RUSTUP_MAX_RETRIES: "10"
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/rust-setup
         with:
-          prefix-key: "v2-rust"
           shared-key: "dev-test"
-          add-job-id-key: false
           save-if: false
-      - name: Install Dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libssl-dev pkg-config protobuf-compiler
-      - name: Install nextest
-        uses: taiki-e/install-action@nextest
+          add-job-id-key: false
+          apt-packages: 'libssl-dev pkg-config protobuf-compiler'
+          install-nextest: 'true'
       - name: Run burn-down integration targets
         env:
           # Several targets boot a full server in a dev-profile build; same
@@ -3854,24 +3549,11 @@ jobs:
           sudo swapon /mnt/swapfile-ci
           free -h
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.99.0
-        # Step-level, NOT workflow env: rust-cache hashes every CARGO*/RUST*
-        # env var into its cache key, so a workflow-level var would cold-start
-        # every cache (#2502 review). rustup's default is 3 retries.
-        env:
-          RUSTUP_MAX_RETRIES: "10"
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/rust-setup
         with:
-          prefix-key: "v2-rust"
-          # Restores dev-test read-only: tarpaulin's instrumented build cannot
-          # reuse dev-test's compiled artifacts, but it gets the registry and
-          # build-script outputs, and nothing on a develop push builds an
-          # instrumented shape to write a key of its own.
           shared-key: "dev-test"
-          add-job-id-key: false
           save-if: false
-      # sccache complements rust-cache: caches individual rustc invocations
-      # (content-addressed), so it hits even when the target/ artifact cache misses.
+          add-job-id-key: false
       - uses: mozilla-actions/sccache-action@v0.0.11
       - uses: actions/cache@v6
         with:
@@ -4400,26 +4082,12 @@ jobs:
        needs.changes.outputs.rust == 'true')
     steps:
       - uses: actions/checkout@v7
-
-      - uses: dtolnay/rust-toolchain@1.99.0
-        # Step-level, NOT workflow env: rust-cache hashes every CARGO*/RUST*
-        # env var into its cache key, so a workflow-level var would cold-start
-        # every cache (#2502 review). rustup's default is 3 retries.
-        env:
-          RUSTUP_MAX_RETRIES: "10"
-
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/rust-setup
         with:
-          prefix-key: "v2-rust"
           shared-key: "release"
-          add-job-id-key: false
           save-if: false
-
-      - name: Install Dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libssl-dev pkg-config protobuf-compiler
-
+          add-job-id-key: false
+          apt-packages: 'libssl-dev pkg-config protobuf-compiler'
       - name: Run Benchmarks
         run: |
           cargo bench --bench bench_21_query_cache -- --noplot 2>&1 | tee bench-results.txt
@@ -4457,26 +4125,12 @@ jobs:
        needs.changes.outputs.rust == 'true')
     steps:
       - uses: actions/checkout@v7
-
-      - uses: dtolnay/rust-toolchain@1.99.0
-        # Step-level, NOT workflow env: rust-cache hashes every CARGO*/RUST*
-        # env var into its cache key, so a workflow-level var would cold-start
-        # every cache (#2502 review). rustup's default is 3 retries.
-        env:
-          RUSTUP_MAX_RETRIES: "10"
-
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/rust-setup
         with:
-          prefix-key: "v2-rust"
           shared-key: "dev-test"
-          add-job-id-key: false
           save-if: false
-
-      - name: Install Dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libssl-dev pkg-config protobuf-compiler
-
+          add-job-id-key: false
+          apt-packages: 'libssl-dev pkg-config protobuf-compiler'
       - name: Run TPC perf ledger harness (small scale, advisory)
         env:
           TPC_PERF_SCALE: "0.001"
@@ -4572,22 +4226,12 @@ jobs:
       !contains(needs.changes.outputs.reused, ',sift-recall-ratchet,')
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.99.0
-        # Step-level, NOT workflow env: rust-cache hashes every CARGO*/RUST*
-        # env var into its cache key, so a workflow-level var would cold-start
-        # every cache (#2502 review). rustup's default is 3 retries.
-        env:
-          RUSTUP_MAX_RETRIES: "10"
-      - name: Install system deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libssl-dev pkg-config protobuf-compiler
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/rust-setup
         with:
-          prefix-key: "v2-rust"
           shared-key: "release"
-          add-job-id-key: false
           save-if: false
+          add-job-id-key: false
+          apt-packages: 'libssl-dev pkg-config protobuf-compiler'
       - name: Cache SIFT corpus
         uses: actions/cache@v6
         with:
