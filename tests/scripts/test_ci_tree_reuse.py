@@ -57,7 +57,6 @@ FRESH = "2026-10-15T05:04:50Z"
 JOB_NAMES = [
     "Detect Changes",
     "Rust Clippy",
-    "Rust Compile (lib)",
     "Rust Compile (test)",
     "Rust Tests (unit)",
     "Rust Tests (doc)",
