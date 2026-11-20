@@ -258,11 +258,11 @@ mod tests {
         assert_eq!(metadata_version_of("v7.metadata.json"), Some(7));
         assert_eq!(metadata_version_of("vx.metadata.json"), None);
         assert_eq!(
-            avro_version_of(&manifest(4).filename().unwrap_or_default().to_string()),
+            avro_version_of(manifest(4).filename().unwrap_or_default()),
             Some(4)
         );
         assert_eq!(
-            avro_version_of(&list(4).filename().unwrap_or_default().to_string()),
+            avro_version_of(list(4).filename().unwrap_or_default()),
             Some(4)
         );
         // Legacy / foreign names never parse, so they are never collected.
