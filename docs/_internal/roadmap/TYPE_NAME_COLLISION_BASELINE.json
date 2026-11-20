@@ -496,7 +496,6 @@
     "SqlExecutionResult": 1,
     "SqlQueryRequest": 1,
     "SslMode": 1,
-    "SstableFileInfo": 1,
     "SstableIndex": 1,
     "StageMetrics": 1,
     "StagingConfig": 1,

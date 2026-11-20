@@ -1033,9 +1033,12 @@ impl SstEngine {
     /// per-segment footer path.
     async fn refresh_directory_after_flush(&self, final_file_path: &str) {
         use crate::storage::engines::sst::centroid_directory_publisher::{
-            directory_at_flush_write_enabled, publish_centroid_directory,
+            centroid_directory_write_enabled, directory_at_flush_write_enabled,
+            publish_centroid_directory,
         };
-        if !directory_at_flush_write_enabled() {
+        // The flush hook obeys the same master write kill-switch as the
+        // compaction publish (`refresh_centroid_directory`).
+        if !(centroid_directory_write_enabled() && directory_at_flush_write_enabled()) {
             return;
         }
         let Some((dir_url, _)) = final_file_path.rsplit_once('/') else {

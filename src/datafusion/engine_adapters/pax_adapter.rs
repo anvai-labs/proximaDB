@@ -442,7 +442,9 @@ impl PaxSplitReader {
     /// footer branch below requires.
     async fn directory_index(&self, split: &FileSplit, len: u64) -> Option<SegmentIndex> {
         use crate::storage::engines::sst::centroid_directory_reader as reader;
-        if !reader::directory_decode_keys_read_enabled() {
+        if !(reader::centroid_directory_read_enabled()
+            && reader::directory_decode_keys_read_enabled())
+        {
             return None;
         }
         let (dir_url, name) = split.file_path.rsplit_once('/')?;

@@ -666,7 +666,9 @@ impl SstEngine {
         files: &[DiscoveredSstFile],
     ) -> Option<HashMap<String, DirectorySegmentFacts>> {
         use crate::storage::engines::sst::centroid_directory_reader as reader;
-        if !reader::directory_decode_keys_read_enabled() {
+        if !(reader::centroid_directory_read_enabled()
+            && reader::directory_decode_keys_read_enabled())
+        {
             return None;
         }
         let fs = self.filesystem().get_filesystem(storage_url).ok()?;
