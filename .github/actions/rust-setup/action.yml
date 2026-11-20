@@ -1,0 +1,94 @@
+# One point for the setup block every Rust CI job repeats: pinned toolchain,
+# apt dependencies, optional nextest, optional rust-cache restore. The caller
+# owns actions/checkout (a local composite cannot run before it).
+# TD-CI-8 step-block census: this replaces ~31 copies of the same ~14 lines in
+# ci.yml; a toolchain bump or cache-policy tweak now edits ONE file instead of
+# 31 sites across the workflow.
+#
+# INVARIANTS the deterministic-commit-contract parser asserts on THIS file
+# (scripts/check_deterministic_commit_contract.py) — do not weaken here:
+#   * `uses: Swatinem/rust-cache@v2` with `prefix-key: "v2-rust"` hardcoded;
+#   * RUSTUP_MAX_RETRIES stays STEP-level (never a composite `env:` block —
+#     there is no job level inside a composite, and a caller's job-level
+#     CARGO*/RUST* env would be hashed into the rust-cache key);
+#   * no top-level `env:` at all.
+# Per-call-site policy (shared-key shape, one develop-push writer per key,
+# save-if rule) is still enforced at each ci.yml call site by the same parser.
+name: 'Rust job setup'
+description: 'Pinned Rust toolchain + apt deps + optional nextest/rust-cache (caller checks out)'
+# NOTE: a LOCAL composite (./.github/actions/...) can only run AFTER the
+# caller has checked out the repo — the runner loads the action file from
+# the workspace. Callers own actions/checkout; this action starts at the
+# toolchain step.
+inputs:
+  # Toolchain (dtolnay/rust-toolchain's `toolchain:` input overrides its ref tag)
+  toolchain:
+    description: 'Rust toolchain pin'
+    required: false
+    default: '1.99.0'
+  components:
+    description: 'rustup components, comma/space separated (e.g. llvm-tools-preview)'
+    required: false
+    default: ''
+  # apt-get update + install; '' skips the block entirely
+  apt-packages:
+    description: 'space-separated apt packages to install (empty = skip apt)'
+    required: false
+    default: ''
+  # nextest (taiki-e/install-action)
+  install-nextest:
+    description: "'true' installs cargo-nextest via taiki-e/install-action"
+    required: false
+    default: 'false'
+  # rust-cache. Skipped when shared-key is '' (cache-less toolchain-only
+  # setups). save-if semantics per the ci.yml rust-cache policy header:
+  # 'false' = reader, or the develop-push expression = the shape's ONE writer.
+  use-cache:
+    description: "'false' skips the rust-cache step entirely"
+    required: false
+    default: 'true'
+  shared-key:
+    description: 'build-shape key (check / dev-test / release / ...)'
+    required: false
+    default: ''
+  add-job-id-key:
+    description: "must be 'false' in ci.yml (one cache per shape, not per job)"
+    required: false
+    default: 'false'
+  save-if:
+    description: "'false' or the develop-push expression; '' lets rust-cache default"
+    required: false
+    default: ''
+
+runs:
+  using: composite
+  steps:
+    - uses: dtolnay/rust-toolchain@1.99.0
+      with:
+        toolchain: ${{ inputs.toolchain }}
+        components: ${{ inputs.components }}
+      # Step-level ON PURPOSE: rust-cache hashes every CARGO*/RUST* env var
+      # into its key; a composite-level env would leak into every consumer's
+      # key exactly like a job-level one would (#2502 review).
+      env:
+        RUSTUP_MAX_RETRIES: '10'
+
+    - name: Install apt dependencies
+      if: inputs.apt-packages != ''
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y ${{ inputs.apt-packages }}
+
+    - name: Install nextest
+      if: inputs.install-nextest == 'true'
+      uses: taiki-e/install-action@nextest
+
+    - uses: Swatinem/rust-cache@v2
+      # cache-less callers (lint/audit jobs) set shared-key: '' or use-cache: 'false'
+      if: inputs.use-cache == 'true' && inputs.shared-key != ''
+      with:
+        prefix-key: 'v2-rust'
+        shared-key: ${{ inputs.shared-key }}
+        add-job-id-key: ${{ inputs.add-job-id-key }}
+        save-if: ${{ inputs.save-if }}
