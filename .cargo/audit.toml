@@ -72,8 +72,6 @@ ignore = [
     # long-known, upstream replaced by libyaml-safer in newer serde_yaml.
     "RUSTSEC-2024-0449",
 
-    # --- unsound (reported unfixed upstream) ---
-
     # --- unmaintained (2026-11-19 batch; no patched version EXISTS — the
     # advisory is the crate's maintenance status, not a fixable bug). All three
     # are pulled by the DataFusion 55 / Arrow 59 stack we cannot move without a
