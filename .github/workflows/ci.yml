@@ -383,6 +383,7 @@ jobs:
               - 'deploy/packaging/**'
               - '.github/workflows/release.yml'
               - '.github/workflows/release-smoke.yml'
+              - '.github/workflows/qa-gate.yml'
               # A gate must see a change to itself (TD-CITIER-1): editing the
               # lane's own severity, ignore-lists, or tools must re-run it.
               # Cheap (~1-2 min), unlike the heavy suites that deliberately

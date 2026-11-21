@@ -464,6 +464,10 @@ COPILOT.md
 test_summary*.py
 test_*_summary.py
 *_summary_report.py
+# EXCEPTION: the qa-gate aggregate wiring guard is a TRACKED test, not a
+# session summary — without this line `git add -A` is blind to it and
+# `make qa-gate-summary-check` breaks for every developer (2026-11-21).
+!tests/scripts/test_qa_gate_summary.py
 
 # Session work archives (development session notes and summaries)
 docs/archive/sessions/
