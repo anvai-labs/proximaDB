@@ -33,7 +33,10 @@ WORKFLOW = ROOT / ".github" / "workflows" / "qa-gate.yml"
 REQUIRED_CONTEXT = "QA Gate Success"
 
 # Advisory jobs: recorded in the summary, non-blocking on failure.
-ADVISORY_JOBS = {"rust-coverage-ratchet"}
+# EMPTY since TD-CI-8 Pilot 3 (2026-11-21): the coverage ratchet flipped
+# required once the rust baseline was seeded. If a job goes advisory again,
+# add it here AND keep the aggregate's hard gate from naming its 'failure'.
+ADVISORY_JOBS: set[str] = set()
 
 
 def _load_workflow():
@@ -81,22 +84,23 @@ class QaGateSummaryWiring(unittest.TestCase):
                     f"the hard gate must fail on {job} {outcome}",
                 )
 
+    @unittest.skipIf(not ADVISORY_JOBS, "no advisory jobs configured")
     def test_advisory_job_fails_gate_only_when_cancelled(self):
         cond = self._hard_gate_condition()
-        advisory = next(iter(ADVISORY_JOBS))
-        self.assertNotIn(
-            f"needs.{advisory}.result == 'failure'",
-            cond,
-            "the advisory coverage ratchet must NOT gate on failure "
-            "(TD-CI-8 Pilot 3 decides when it flips required)",
-        )
-        self.assertIn(
-            f"needs.{advisory}.result == 'cancelled'",
-            cond,
-            "a cancelled advisory run still gates — a cancelled promotion "
-            "proves nothing",
-        )
+        for advisory in ADVISORY_JOBS:
+            self.assertNotIn(
+                f"needs.{advisory}.result == 'failure'",
+                cond,
+                f"advisory {advisory} must NOT gate on failure",
+            )
+            self.assertIn(
+                f"needs.{advisory}.result == 'cancelled'",
+                cond,
+                "a cancelled advisory run still gates — a cancelled promotion "
+                "proves nothing",
+            )
 
+    @unittest.skipIf(not ADVISORY_JOBS, "no advisory jobs configured")
     def test_advisory_job_is_job_level_continue_on_error(self):
         for job in ADVISORY_JOBS:
             self.assertTrue(
@@ -105,6 +109,21 @@ class QaGateSummaryWiring(unittest.TestCase):
                 "flipped required, update ADVISORY_JOBS here AND the "
                 "aggregate's hard gate in the same PR",
             )
+
+    def test_formerly_advisory_jobs_are_now_required(self):
+        # TD-CI-8 Pilot 3: the coverage ratchet flipped required when the rust
+        # baseline was seeded — pin it so it can't silently go advisory again.
+        cond = self._hard_gate_condition()
+        for outcome in ("failure", "cancelled"):
+            self.assertIn(
+                f"needs.rust-coverage-ratchet.result == '{outcome}'",
+                cond,
+                f"the coverage ratchet is REQUIRED and must gate on {outcome}",
+            )
+        self.assertTrue(
+            self.jobs["rust-coverage-ratchet"].get("continue-on-error") is not True,
+            "rust-coverage-ratchet must not carry job-level continue-on-error",
+        )
 
 
 if __name__ == "__main__":

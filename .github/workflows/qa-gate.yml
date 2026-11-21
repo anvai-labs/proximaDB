@@ -582,14 +582,14 @@ jobs:
     name: Rust Coverage Ratchet
     runs-on: ubuntu-latest
     timeout-minutes: 130  # 80.2-min green step span => 1.6x; 90 was 1.12x and 120 only 1.50x
-    # FIRST CUT: cargo-llvm-cov over the full workspace is heavy. 60m was too
-    # tight — it timed out mid-lib-test-run (deep into the graph/index tests),
-    # so the seed artifact was never produced. 90m lets it complete + emit the
-    # seed (rust-coverage-seed.json), the prerequisite to baseline rust:* in
-    # COVERAGE_BASELINE.json. Still non-blocking (continue-on-error); flip to
-    # required (remove continue-on-error) only AFTER a clean run seeds the
-    # baseline AND it stays green.
-    continue-on-error: true
+    # TD-CI-8 Pilot 3 COMPLETE (2026-11-21): a clean dispatch
+    # (run 44876346830, 95 min, all jobs green) seeded rust:proximadb = 65.7
+    # into COVERAGE_BASELINE.json, and this run stayed green — both
+    # prerequisites of the original flip rule. continue-on-error removed:
+    # the ratchet is REQUIRED via the 'QA Gate Success' aggregate. 65.7 is
+    # below the 80% target, which the ratchet treats as a WARNING for an
+    # existing component (only regressions past the 0.5 tolerance and new
+    # below-target components fail) — the floor ratchets up over time.
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.99.0
@@ -653,10 +653,8 @@ jobs:
   # Semantics (mirrors ci-success):
   #   * every REQUIRED job: failure or cancelled -> RED; skipped (event-gated,
   #     e.g. push-to-qa skips the pull_request-only guards) -> pass;
-  #   * rust-coverage-ratchet stays ADVISORY (continue-on-error until Pilot 3
-  #     seeds the rust baseline): its failure is reported in the summary but
-  #     does not gate; a CANCELLED coverage run still gates (a cancelled
-  #     promotion proves nothing).
+  #   * rust-coverage-ratchet is REQUIRED since Pilot 3 seeded the baseline
+  #     (2026-11-21, rust:proximadb = 65.7).
   qa-gate-summary:
     name: QA Gate Success
     runs-on: ubuntu-latest
@@ -688,13 +686,14 @@ jobs:
           needs.mlflow-s3-artifact-seam.result == 'cancelled' ||
           needs.cloud-emulator-object-store.result == 'failure' ||
           needs.cloud-emulator-object-store.result == 'cancelled' ||
+          needs.rust-coverage-ratchet.result == 'failure' ||
           needs.rust-coverage-ratchet.result == 'cancelled'
         run: |
           echo "::error::A required QA Gate job failed or was cancelled — blocking promotion."
           {
             echo "## QA Gate Summary"
             echo ""
-            echo "❌ A required QA Gate job failed or was cancelled (coverage ratchet is advisory; a cancelled one still gates)."
+            echo "❌ A required QA Gate job failed or was cancelled (incl. the coverage ratchet — required since the rust baseline was seeded, TD-CI-8 Pilot 3)."
           } >> "$GITHUB_STEP_SUMMARY"
           exit 1
 
@@ -704,5 +703,5 @@ jobs:
             echo "## QA Gate Summary"
             echo ""
             echo "✅ All required QA Gate jobs green."
-            echo "coverage-ratchet: ${{ needs.rust-coverage-ratchet.result }} (advisory — non-blocking until the rust baseline is seeded; TD-CI-8 Pilot 3)"
+            echo "coverage-ratchet: ${{ needs.rust-coverage-ratchet.result }} (required — rust:proximadb seeded at 65.7% in COVERAGE_BASELINE.json; TD-CI-8 Pilot 3)"
           } >> "$GITHUB_STEP_SUMMARY"
