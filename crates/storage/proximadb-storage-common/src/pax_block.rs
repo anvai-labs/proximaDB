@@ -926,6 +926,12 @@ pub struct PaxSegmentWriter {
     filter_region_on: bool,
     /// Region-E rows accumulated in `add_record` order (= on-disk ordinals).
     filter_region: Option<crate::filter_region::FilterRegionBuilder>,
+    /// ADR-042 / TD-PAXMETA-1: per-block prune statistics of the shred-spec
+    /// columns (coalesced layout), accumulated in `add_record` order and cut
+    /// at every block boundary; emitted as footer section 9.
+    prune_stats: Option<crate::block_prune_stats::BlockPruneStatsBuilder>,
+    /// Whether `prune_stats` was already initialized for this segment.
+    prune_stats_started: bool,
 
     current_writer: PaxBlockWriter,
     index: SegmentIndex,
@@ -1054,6 +1060,8 @@ impl PaxSegmentWriter {
             shred_spec: Vec::new(),
             filter_region_on: false,
             filter_region: None,
+            prune_stats: None,
+            prune_stats_started: false,
             current_writer: writer,
             index: SegmentIndex { blocks: Vec::new() },
             block_stats: Vec::new(),
@@ -1390,6 +1398,26 @@ impl PaxSegmentWriter {
                 })
                 .push_row(&record.props);
         }
+        // ADR-042 / TD-PAXMETA-1: the per-block prune stats follow the same
+        // rows, in the same order, for every coalesced segment with shred
+        // columns (no gate: a few hundred bytes per block in the footer).
+        if self.coalesced_rabitq && !self.shred_spec.is_empty() {
+            if !self.prune_stats_started {
+                self.prune_stats_started = true;
+                self.prune_stats = crate::block_prune_stats::BlockPruneStatsBuilder::new(
+                    self.shred_spec
+                        .iter()
+                        .map(|c| crate::block_prune_stats::PruneColumn {
+                            name: c.key.clone(),
+                            column_id: c.column_id,
+                        })
+                        .collect(),
+                );
+            }
+            if let Some(builder) = self.prune_stats.as_mut() {
+                builder.push_row(&record.props);
+            }
+        }
         if let Some(t) = t {
             d_raw = t.elapsed();
         }
@@ -1655,6 +1683,11 @@ impl PaxSegmentWriter {
             zone,
             footer_stats,
         });
+        // ADR-042: cut the prune stats at the same boundary (a row-count
+        // disagreement poisons the builder, so no misaligned stats are written).
+        if let Some(builder) = self.prune_stats.as_mut() {
+            builder.cut_block(row_count);
+        }
         if self.local_spill.is_none() {
             self.file_buf.extend_from_slice(&block_bytes);
         }
@@ -2020,6 +2053,7 @@ impl PaxSegmentWriter {
                     .collect()
             },
             filter_region,
+            block_prune_stats: self.prune_stats.take().and_then(|b| b.finish()),
         };
         let footer_body = footer.to_bytes()?;
         let footer_off = e_off + filter_region_bytes.len() as u64;
@@ -2567,6 +2601,7 @@ impl PaxSegmentWriter {
                     .collect()
             },
             filter_region,
+            block_prune_stats: self.prune_stats.take().and_then(|b| b.finish()),
         };
         let footer_body = footer.to_bytes()?;
         let footer_off = e_off + filter_region_bytes.len() as u64;

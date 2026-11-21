@@ -32,7 +32,7 @@
 //!                       [pca_mean dim × f32][pca_components n_comp × dim × f32]
 //! segments: n_segments × [name_len u32][name utf-8][size_bytes u64]
 //!                         [rows_covered u64][model_idx u32 (u32::MAX = uncovered)]
-//!                         [has_key u8][decode key, when has_key = 1]   (v2 only)
+//!                         [has_key u8][decode key, when has_key = 1]   (v2, v3)
 //! cells:    n_cells × [segment_idx u32][a0_cell u32]
 //!                      [centroid n_comp × f32][radius f32][CoarseCellEntry 72 B]
 //! [checksum u64]   (FNV-1a over all preceding bytes, as Region A0)
@@ -45,6 +45,15 @@
 //!   [n_blocks u32] n_blocks × footer block entry (the footer's own wire form,
 //!                              row-group OID-chunk stats included)
 //!   [etag_len u32 (u32::MAX = none)][object ETag utf-8]
+//!   v3 only (ADR-042 / TD-PAXMETA-1, 2026-11-21):
+//!   [has_facts u8] when 1: [has_region_e u8]
+//!     [n_shred u16] n_shred × [name_len u16][name utf-8][column_id i32]
+//!     [stats_len u32 (u32::MAX = none)][BlockPruneStatsTable bytes]
+//!
+//! Breaking change (accepted pre-GA, 2026-11-21): keyed directories are now
+//! written as v3. A binary from before v3 rejects them wholesale and falls
+//! back to its per-segment path (correct results, its pre-directory cost);
+//! this reader still accepts v1 and v2.
 //!
 //! TD-PAXMETA-1 (2026-11-19, ADR-098 D2): a decode key may also ride an
 //! UNCOVERED entry (`model_idx == u32::MAX`) when the segment is coalesced
@@ -116,8 +125,21 @@ use crate::segment_layout::{
 /// Directory magic — first 4 bytes of the serialized object.
 pub const DIRECTORY_MAGIC: &[u8; 4] = b"PXCD";
 
-/// Directory serde version of a directory that carries decode keys (D6).
-pub const DIRECTORY_VERSION: u8 = 2;
+/// Directory serde version of a directory that carries decode keys. v3
+/// (ADR-042 / TD-PAXMETA-1, 2026-11-21) appends each key's
+/// [`SegmentFilterFacts`] (per-block prune statistics, shred field map,
+/// Region-E presence); v2 keys (D6) carry none.
+pub const DIRECTORY_VERSION: u8 = 3;
+
+/// The D6 keyed format without filter facts. Still parsed (its keys simply
+/// carry no [`SegmentFilterFacts`], so filtered queries keep the footer path
+/// for them); never written.
+const DIRECTORY_VERSION_V2: u8 = 2;
+
+/// Largest serialized prune-stats table one key carries; a larger table is
+/// left out of the directory (the segment's footer still has it), bounding
+/// what every reader re-reads per directory generation.
+pub const MAX_KEY_PRUNE_STATS_BYTES: usize = 64 * 1024;
 
 /// The D1 format (no decode keys), still written for a keyless directory so
 /// a reader that predates D6 keeps using it.
@@ -236,7 +258,124 @@ pub struct SegmentDecodeKey {
     /// The segment object's ETag as listed when the key was built (`None`
     /// when the backend lists none). See [`Self::matches_object`].
     pub object_etag: Option<String>,
+    /// ADR-042 / TD-PAXMETA-1 (v3): the footer facts a filtered query needs.
+    /// `None` for a key parsed from a v2 directory (unknown ⇒ filtered
+    /// queries read the footer as before).
+    pub filter_facts: Option<SegmentFilterFacts>,
 }
+
+/// ADR-042 (amended 2026-11-20) / TD-PAXMETA-1: what a filtered query reads
+/// a segment's footer for, beyond the decode key's block table — so a
+/// directory-covered segment prunes blocks (and the whole segment) and builds
+/// its Stage-F allow-set without a footer read.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SegmentFilterFacts {
+    /// The segment carries PAX Region E (filter columns); its Stage F may
+    /// answer from Region E, which the directory does not describe.
+    pub has_filter_region: bool,
+    /// The footer's shred field map `(prop name, column id)` — the body
+    /// prune's field resolver.
+    pub shred_columns: Vec<(String, i32)>,
+    /// The footer's per-block prune statistics (`None`: none, or larger than
+    /// [`MAX_KEY_PRUNE_STATS_BYTES`]).
+    pub prune_stats: Option<crate::block_prune_stats::BlockPruneStatsTable>,
+}
+
+impl SegmentFilterFacts {
+    /// Copy the facts out of a parsed footer.
+    pub fn from_footer(footer: &SegmentFooterIndex) -> Self {
+        Self {
+            has_filter_region: footer.filter_region.is_some(),
+            shred_columns: footer
+                .shred_field_map
+                .iter()
+                .map(|c| (c.key.clone(), c.column_id))
+                .collect(),
+            prune_stats: footer.block_prune_stats.clone().filter(|table| {
+                table
+                    .to_bytes()
+                    .is_ok_and(|bytes| bytes.len() <= MAX_KEY_PRUNE_STATS_BYTES)
+            }),
+        }
+    }
+
+    fn write_to(&self, buf: &mut Vec<u8>) -> Result<()> {
+        buf.push(u8::from(self.has_filter_region));
+        let n = u16::try_from(self.shred_columns.len())
+            .map_err(|_| anyhow::anyhow!("decode key shred map exceeds u16"))?;
+        buf.extend_from_slice(&n.to_le_bytes());
+        for (name, column_id) in &self.shred_columns {
+            let len = u16::try_from(name.len())
+                .map_err(|_| anyhow::anyhow!("decode key shred name exceeds u16"))?;
+            buf.extend_from_slice(&len.to_le_bytes());
+            buf.extend_from_slice(name.as_bytes());
+            buf.extend_from_slice(&column_id.to_le_bytes());
+        }
+        match &self.prune_stats {
+            Some(table) => {
+                let bytes = table.to_bytes()?;
+                if bytes.len() > MAX_KEY_PRUNE_STATS_BYTES {
+                    bail!("decode key prune stats exceed {MAX_KEY_PRUNE_STATS_BYTES} bytes");
+                }
+                buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+                buf.extend_from_slice(&bytes);
+            }
+            None => buf.extend_from_slice(&NO_PRUNE_STATS.to_le_bytes()),
+        }
+        Ok(())
+    }
+
+    fn read_from(body: &[u8], p: &mut usize) -> Result<Self> {
+        let flag = *body
+            .get(*p)
+            .ok_or_else(|| anyhow::anyhow!("centroid directory truncated (filter facts)"))?;
+        *p += 1;
+        let has_filter_region = match flag {
+            0 => false,
+            1 => true,
+            other => bail!("decode key Region-E flag {other}"),
+        };
+        let n = read_u16(body, p)? as usize;
+        let mut shred_columns = Vec::with_capacity(n.min(body.len() / 6));
+        for _ in 0..n {
+            let len = read_u16(body, p)? as usize;
+            let end = p
+                .checked_add(len)
+                .filter(|end| *end <= body.len())
+                .ok_or_else(|| anyhow::anyhow!("centroid directory truncated (shred name)"))?;
+            let name = std::str::from_utf8(&body[*p..end])
+                .map_err(|_| anyhow::anyhow!("decode key shred name is not UTF-8"))?
+                .to_owned();
+            *p = end;
+            let column_id = read_u32(body, p)? as i32;
+            shred_columns.push((name, column_id));
+        }
+        let prune_stats = match read_u32(body, p)? {
+            NO_PRUNE_STATS => None,
+            len => {
+                let len = len as usize;
+                if len > MAX_KEY_PRUNE_STATS_BYTES {
+                    bail!("decode key prune stats exceed {MAX_KEY_PRUNE_STATS_BYTES} bytes");
+                }
+                let end = p
+                    .checked_add(len)
+                    .filter(|end| *end <= body.len())
+                    .ok_or_else(|| anyhow::anyhow!("centroid directory truncated (prune stats)"))?;
+                let table = crate::block_prune_stats::BlockPruneStatsTable::parse(&body[*p..end])?;
+                *p = end;
+                Some(table)
+            }
+        };
+        Ok(Self {
+            has_filter_region,
+            shred_columns,
+            prune_stats,
+        })
+    }
+}
+
+/// `stats_len` of a key whose segment carries no prune statistics.
+const NO_PRUNE_STATS: u32 = u32::MAX;
 
 impl SegmentDecodeKey {
     /// Build from a segment's header prefix, Region-A header bytes, parsed A0
@@ -266,6 +405,7 @@ impl SegmentDecodeKey {
             blocks: footer.blocks.clone(),
             block_stats: footer.block_stats.clone(),
             object_etag: object_etag.map(str::to_owned),
+            filter_facts: Some(SegmentFilterFacts::from_footer(footer)),
         };
         key.check(a0.model.dim, a0.model.rows_covered())?;
         Ok(key)
@@ -301,6 +441,7 @@ impl SegmentDecodeKey {
             blocks: footer.blocks.clone(),
             block_stats: footer.block_stats.clone(),
             object_etag: object_etag.map(str::to_owned),
+            filter_facts: Some(SegmentFilterFacts::from_footer(footer)),
         };
         key.check_untrained()?;
         Ok(key)
@@ -380,6 +521,14 @@ impl SegmentDecodeKey {
         if self.block_stats.len() != self.blocks.len() {
             bail!("decode key: block stats misaligned with blocks");
         }
+        if let Some(table) = self
+            .filter_facts
+            .as_ref()
+            .and_then(|facts| facts.prune_stats.as_ref())
+        {
+            let rows: Vec<u32> = self.blocks.iter().map(|b| b.row_count).collect();
+            table.check_block_rows(&rows)?;
+        }
         let mut end = 0u64;
         for block in &self.blocks {
             if block.offset < end {
@@ -393,7 +542,7 @@ impl SegmentDecodeKey {
         Ok(())
     }
 
-    fn write_to(&self, buf: &mut Vec<u8>) -> Result<()> {
+    fn write_to(&self, buf: &mut Vec<u8>, version: u8) -> Result<()> {
         buf.extend_from_slice(&self.header_prefix);
         buf.extend_from_slice(&self.a0_seed.to_le_bytes());
         buf.extend_from_slice(&self.a0_trained_on.to_le_bytes());
@@ -425,10 +574,21 @@ impl SegmentDecodeKey {
             }
             None => buf.extend_from_slice(&NO_ETAG.to_le_bytes()),
         }
+        // v3: filter facts, behind a presence byte (a key carried over from
+        // a v2 base has none).
+        if version >= DIRECTORY_VERSION {
+            match &self.filter_facts {
+                Some(facts) => {
+                    buf.push(1);
+                    facts.write_to(buf)?;
+                }
+                None => buf.push(0),
+            }
+        }
         Ok(())
     }
 
-    fn read_from(body: &[u8], p: &mut usize) -> Result<Self> {
+    fn read_from(body: &[u8], p: &mut usize, version: u8) -> Result<Self> {
         let take = |p: &mut usize, len: usize| -> Result<Vec<u8>> {
             let end = p
                 .checked_add(len)
@@ -462,6 +622,15 @@ impl SegmentDecodeKey {
                     .map_err(|_| anyhow::anyhow!("decode key ETag is not UTF-8"))?,
             ),
         };
+        let filter_facts = if version >= DIRECTORY_VERSION {
+            match take(p, 1)?[0] {
+                0 => None,
+                1 => Some(SegmentFilterFacts::read_from(body, p)?),
+                other => bail!("decode key filter-facts flag {other}"),
+            }
+        } else {
+            None
+        };
         Ok(Self {
             header_prefix,
             a0_seed,
@@ -477,7 +646,60 @@ impl SegmentDecodeKey {
             blocks,
             block_stats,
             object_etag,
+            filter_facts,
         })
+    }
+
+    /// The footer a filtered Stage F needs, rebuilt from this key: the block
+    /// table, the shred field map and the per-block prune statistics (and the
+    /// ANN fields, as in [`PaxCentroidDirectory::segment_decode`]). `None`
+    /// for a key without filter facts (a v2 key). Like the ANN footer it is
+    /// not the segment's footer (no encoding map, no Region-E directory), so
+    /// it must never be cached as the segment's metadata.
+    pub fn filtered_footer(&self) -> Result<Option<SegmentFooterIndex>> {
+        let Some(facts) = &self.filter_facts else {
+            return Ok(None);
+        };
+        let header = SegmentHeaderPrefix::parse(&self.header_prefix)?;
+        let mut footer = self.ann_footer(&header);
+        footer.shred_field_map = facts
+            .shred_columns
+            .iter()
+            .map(|(name, id)| proximadb_block_format::ShredColumn::untyped(name.clone(), *id))
+            .collect();
+        footer.block_prune_stats = facts.prune_stats.clone();
+        Ok(Some(footer))
+    }
+
+    /// The ANN cascade's footer fields, rebuilt from this key and its header.
+    fn ann_footer(&self, header: &SegmentHeaderPrefix) -> SegmentFooterIndex {
+        SegmentFooterIndex {
+            row_count: self.row_count,
+            rabitq_off: header.rabitq_off,
+            rabitq_len: header.rabitq_len,
+            sq8_off: header.sq8_off,
+            sq8_len: header.sq8_len,
+            sq8_min: self.sq8_min,
+            sq8_scale: self.sq8_scale,
+            embed_dim: self.embed_dim,
+            embed_count: self.embed_count,
+            embed_quant_tag: self.embed_quant_tag,
+            has_f32_tier: self.has_f32_tier,
+            blocks: self.blocks.clone(),
+            block_stats: self.block_stats.clone(),
+            encoding_map: Vec::new(),
+            block_tier_assignments: Vec::new(),
+            a0_off: header.a0_off,
+            a0_len: header.a0_len,
+            opr_off: 0,
+            opr_len: 0,
+            c_off: header.c_off,
+            c_len: header.c_len,
+            block_filterable_stats: Vec::new(),
+            shred_field_map: Vec::new(),
+            filter_region: None,
+            block_prune_stats: None,
+        }
     }
 }
 
@@ -592,18 +814,31 @@ impl PartialEq for SpaceIds {
 }
 
 impl PaxCentroidDirectory {
-    /// Serialize (deterministic).
+    /// Serialize (deterministic). A keyed directory is written as v3, a
+    /// keyless one as v1.
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
+        self.to_bytes_keyed_as(DIRECTORY_VERSION)
+    }
+
+    /// The pre-ADR-042 v2 bytes of this directory (keys without filter
+    /// facts) — test-only: the reader keeps accepting v2, nothing writes it.
+    #[cfg(test)]
+    pub(crate) fn to_bytes_v2(&self) -> Result<Vec<u8>> {
+        self.to_bytes_keyed_as(DIRECTORY_VERSION_V2)
+    }
+
+    fn to_bytes_keyed_as(&self, keyed_version: u8) -> Result<Vec<u8>> {
         self.validate()?;
         let dim = self.dim as usize;
         let mut buf = Vec::new();
         buf.extend_from_slice(DIRECTORY_MAGIC);
         let keyed = self.segments.iter().any(|s| s.decode_key.is_some());
-        buf.push(if keyed {
-            DIRECTORY_VERSION
+        let version = if keyed {
+            keyed_version
         } else {
             DIRECTORY_VERSION_V1
-        });
+        };
+        buf.push(version);
         buf.push(0); // flags (reserved; TD-PAXMETA-1 snapshot id)
         buf.extend_from_slice(&0u16.to_le_bytes());
         buf.extend_from_slice(&self.generation.to_le_bytes());
@@ -632,7 +867,7 @@ impl PaxCentroidDirectory {
                 match &segment.decode_key {
                     Some(key) => {
                         buf.push(1);
-                        key.write_to(&mut buf)?;
+                        key.write_to(&mut buf, version)?;
                     }
                     None => buf.push(0),
                 }
@@ -661,7 +896,10 @@ impl PaxCentroidDirectory {
             bail!("not a centroid directory (bad magic)");
         }
         let version = bytes[4];
-        if version != DIRECTORY_VERSION && version != DIRECTORY_VERSION_V1 {
+        if version != DIRECTORY_VERSION
+            && version != DIRECTORY_VERSION_V2
+            && version != DIRECTORY_VERSION_V1
+        {
             bail!("unsupported centroid directory version {version}");
         }
         // v1 and v2 assign no meaning to flags or reserved: reject non-zero
@@ -728,7 +966,7 @@ impl PaxCentroidDirectory {
                 p += 1;
                 match has_key {
                     0 => None,
-                    1 => Some(SegmentDecodeKey::read_from(body, &mut p)?),
+                    1 => Some(SegmentDecodeKey::read_from(body, &mut p, version)?),
                     other => bail!("centroid directory decode-key flag {other}"),
                 }
             };
@@ -873,38 +1111,44 @@ impl PaxCentroidDirectory {
                 header.a0_len
             );
         }
-        let ann_footer = SegmentFooterIndex {
-            row_count: key.row_count,
-            rabitq_off: header.rabitq_off,
-            rabitq_len: header.rabitq_len,
-            sq8_off: header.sq8_off,
-            sq8_len: header.sq8_len,
-            sq8_min: key.sq8_min,
-            sq8_scale: key.sq8_scale,
-            embed_dim: key.embed_dim,
-            embed_count: key.embed_count,
-            embed_quant_tag: key.embed_quant_tag,
-            has_f32_tier: key.has_f32_tier,
-            blocks: key.blocks.clone(),
-            block_stats: key.block_stats.clone(),
-            encoding_map: Vec::new(),
-            block_tier_assignments: Vec::new(),
-            a0_off: header.a0_off,
-            a0_len: header.a0_len,
-            opr_off: 0,
-            opr_len: 0,
-            c_off: header.c_off,
-            c_len: header.c_len,
-            block_filterable_stats: Vec::new(),
-            shred_field_map: Vec::new(),
-            filter_region: None,
-        }
-        .to_bytes()?;
+        let ann_footer = key.ann_footer(&header).to_bytes()?;
         Ok(SegmentDecodeBytes {
             header_prefix: key.header_prefix.clone(),
             a0,
             rabitq_header: key.rabitq_header.clone(),
             ann_footer,
+        })
+    }
+
+    /// TD-PAXMETA-1 / ADR-042: [`Self::segment_decode`] for any keyed entry.
+    /// A covered entry decodes exactly as there; an UNCOVERED keyed entry (an
+    /// untrained coalesced segment, which has no Region A0) yields its header
+    /// prefix and ANN footer with an empty A0 and Region-A header — the scan
+    /// then reads Region A as it would without the key, but no footer.
+    pub fn segment_metadata_decode(&self, segment_idx: usize) -> Result<SegmentDecodeBytes> {
+        let segment = self
+            .segments
+            .get(segment_idx)
+            .ok_or_else(|| anyhow::anyhow!("segment {segment_idx} is out of range"))?;
+        if segment.is_covered() {
+            return self.segment_decode(segment_idx);
+        }
+        let key = segment
+            .decode_key
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("segment {} has no decode key", segment.name))?;
+        let header = SegmentHeaderPrefix::parse(&key.header_prefix)?;
+        if header.a0_len != 0 {
+            bail!(
+                "segment {}: uncovered entry of a segment with Region A0",
+                segment.name
+            );
+        }
+        Ok(SegmentDecodeBytes {
+            header_prefix: key.header_prefix.clone(),
+            a0: Vec::new(),
+            rabitq_header: Vec::new(),
+            ann_footer: key.ann_footer(&header).to_bytes()?,
         })
     }
 
@@ -2227,10 +2471,42 @@ mod tests {
             embed_count: 1,
             embed_quant_tag: 1,
             has_f32_tier: false,
+            filter_facts: Some(SegmentFilterFacts {
+                has_filter_region: false,
+                shred_columns: vec![("tag".to_owned(), 100)],
+                prune_stats: Some(prune_table(
+                    &blocks.iter().map(|b| b.row_count).collect::<Vec<_>>(),
+                )),
+            }),
             blocks,
             block_stats,
             object_etag: Some("\"etag-1\"".to_owned()),
         }
+    }
+
+    /// A prune-stats table for blocks of `rows` rows: block `b` holds the
+    /// tag values `b*10 .. b*10 + rows`.
+    pub(super) fn prune_table(rows: &[u32]) -> crate::block_prune_stats::BlockPruneStatsTable {
+        use crate::block_prune_stats::{BlockPruneStatsBuilder, PruneColumn};
+        let mut builder = BlockPruneStatsBuilder::new(vec![PruneColumn {
+            name: "tag".to_owned(),
+            column_id: 100,
+        }])
+        .unwrap();
+        for (b, &n) in rows.iter().enumerate() {
+            for r in 0..n {
+                let mut props = proximadb_records::ProximaTree::new();
+                props.insert(
+                    "tag".to_owned(),
+                    proximadb_records::ProximaTreeNode::Value(
+                        proximadb_data_model::ProximaValue::Int64((b * 10) as i64 + i64::from(r)),
+                    ),
+                );
+                builder.push_row(&props);
+            }
+            builder.cut_block(n);
+        }
+        builder.finish().unwrap()
     }
 
     fn keyed_directory() -> (PaxCentroidDirectory, CoarseDirectory) {
@@ -2309,6 +2585,7 @@ mod tests {
             block_filterable_stats: Vec::new(),
             shred_field_map: Vec::new(),
             filter_region: None,
+            block_prune_stats: Some(prune_table(&[10, 7])),
         };
         SegmentDecodeKey::from_untrained_segment(&untrained_header(300).to_bytes(), &footer, etag)
             .unwrap()
@@ -2455,6 +2732,106 @@ mod tests {
         assert!(parsed.segment_decode(1).is_err());
         assert!(parsed.segment_decode(2).is_err());
         assert!(parsed.segment_decode(99).is_err());
+    }
+
+    /// ADR-042 / TD-PAXMETA-1 (v3): each key's filter facts — prune stats,
+    /// shred map, Region-E presence — round-trip byte-for-byte, rebuild the
+    /// filtered footer, and the reader keeps accepting v2 (keys without facts).
+    #[test]
+    fn v3_filter_facts_round_trip_and_v2_still_parses() {
+        let (mut dir, _) = keyed_directory();
+        dir.segments[1].decode_key = Some(untrained_key(Some("\"etag-u\"")));
+        let bytes = dir.to_bytes().unwrap();
+        assert_eq!(bytes[4], 3, "a keyed directory is written as v3");
+        let parsed = PaxCentroidDirectory::parse(&bytes).unwrap();
+        assert_eq!(parsed, dir);
+        assert_eq!(parsed.to_bytes().unwrap(), bytes, "deterministic");
+        let key = parsed.segments[0].decode_key.as_ref().unwrap();
+        let facts = key.filter_facts.as_ref().expect("v3 keys carry facts");
+        assert_eq!(facts.shred_columns, vec![("tag".to_owned(), 100)]);
+        let table = facts.prune_stats.as_ref().expect("prune stats carried");
+        assert_eq!(table.block_count(), key.blocks.len());
+
+        // The filtered footer: the key's block table plus the facts.
+        let footer = key.filtered_footer().unwrap().expect("facts present");
+        assert_eq!(footer.blocks, key.blocks);
+        assert_eq!(footer.block_prune_stats.as_ref(), Some(table));
+        assert_eq!(footer.shred_field_map.len(), 1);
+        assert_eq!(footer.shred_field_map[0].key, "tag");
+        assert_eq!(footer.shred_field_map[0].column_id, 100);
+        assert!(footer.filter_region.is_none());
+
+        // An uncovered keyed entry decodes its metadata without an A0.
+        let untrained = parsed.segment_metadata_decode(1).unwrap();
+        assert!(untrained.a0.is_empty() && untrained.rabitq_header.is_empty());
+        let ann = SegmentFooterIndex::parse(&untrained.ann_footer).unwrap();
+        assert_eq!(ann.row_count, 17);
+        // A covered one decodes exactly as segment_decode; a keyless one fails.
+        assert_eq!(
+            parsed.segment_metadata_decode(0).unwrap(),
+            parsed.segment_decode(0).unwrap()
+        );
+        assert!(parsed.segment_metadata_decode(2).is_err(), "keyless");
+
+        // v2 bytes (what a pre-ADR-042 binary wrote) still parse; their keys
+        // carry no facts, so a filtered query keeps the footer path for them.
+        let v2 = dir.to_bytes_v2().unwrap();
+        assert_eq!(v2[4], 2);
+        let from_v2 = PaxCentroidDirectory::parse(&v2).unwrap();
+        for (a, b) in from_v2.segments.iter().zip(&dir.segments) {
+            let (Some(ka), Some(kb)) = (&a.decode_key, &b.decode_key) else {
+                assert_eq!(a.decode_key.is_some(), b.decode_key.is_some());
+                continue;
+            };
+            assert!(ka.filter_facts.is_none());
+            assert!(ka.filtered_footer().unwrap().is_none());
+            assert_eq!(ka.blocks, kb.blocks);
+        }
+        // Re-serializing a v2-parsed directory writes v3 with fact-less keys.
+        let rewritten = from_v2.to_bytes().unwrap();
+        assert_eq!(rewritten[4], 3);
+        assert_eq!(PaxCentroidDirectory::parse(&rewritten).unwrap(), from_v2);
+    }
+
+    /// v3 parsing is fail-closed: every truncation and every single-bit flip
+    /// of a keyed v3 directory (prune stats included) is rejected, and so is
+    /// a key whose prune stats disagree with its block table.
+    #[test]
+    fn v3_parse_fails_closed_on_truncation_bit_flips_and_misaligned_stats() {
+        let (mut dir, _) = keyed_directory();
+        dir.segments[1].decode_key = Some(untrained_key(None));
+        let bytes = dir.to_bytes().unwrap();
+        for len in 0..bytes.len() {
+            assert!(
+                PaxCentroidDirectory::parse(&bytes[..len]).is_err(),
+                "truncated to {len}"
+            );
+        }
+        for byte in 0..bytes.len() {
+            for bit in 0..8 {
+                let mut flipped = bytes.clone();
+                flipped[byte] ^= 1 << bit;
+                assert!(
+                    PaxCentroidDirectory::parse(&flipped).is_err(),
+                    "bit {bit} of byte {byte} flipped must fail closed"
+                );
+            }
+        }
+        // Stats for a different block table: refused at attach and at parse.
+        let mut key = key_for(&a0(
+            4,
+            2,
+            0.5,
+            &[&[0.0, 0.0], &[5.0, 5.0], &[1.0, 2.0]],
+            &[10, 0, 7],
+        ));
+        if let Some(facts) = key.filter_facts.as_mut() {
+            facts.prune_stats = Some(prune_table(&[1, 2, 3, 4]));
+        }
+        assert!(key.check_block_table().is_err());
+        let mut bad = dir.clone();
+        bad.segments[0].decode_key = Some(key);
+        assert!(bad.to_bytes().is_err(), "serialize validates keys");
     }
 
     /// Keys survive an incremental rebuild that keeps the segment, and

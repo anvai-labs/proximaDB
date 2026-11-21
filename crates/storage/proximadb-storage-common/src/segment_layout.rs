@@ -540,6 +540,17 @@ const SECTION_SHRED_FIELD_MAP: u8 = 5;
 /// it (treated as absent) so a later revision never fails a footer parse.
 /// Absent ⇒ filtered reads use the full-row Stage F.
 const SECTION_FILTER_REGION: u8 = 8;
+/// Optional footer section carrying the ADR-042 per-block prune statistics
+/// of the filterable (P-Shred) columns
+/// ([`crate::block_prune_stats::BlockPruneStatsTable`]): per block and
+/// column, row/absent/null counts, typed bounds, a capped distinct-value set
+/// and an optional string bloom, computed from each row's resolved filter
+/// literal. Written whenever the segment has shred columns (coalesced layout);
+/// copied verbatim into the collection segment directory (PXCD v3) so a
+/// filtered query prunes blocks without a footer read. Additive: predating
+/// parsers skip the unknown tag, and this parser treats a malformed or
+/// misaligned table as absent (an optimization, never a footer failure).
+const SECTION_BLOCK_PRUNE_STATS: u8 = 9;
 
 /// The self-describing footer-index (Parquet-style metadata hub): block table +
 /// schema snapshot + per-stripe encoding map + RaBitQ mirror + row count. Located
@@ -630,6 +641,11 @@ pub struct SegmentFooterIndex {
     /// chunk extents. `None` (legacy segments, or the write gate off) ⇒
     /// filtered reads decode Region D. Serialized as optional section 8.
     pub filter_region: Option<crate::filter_region::FilterRegionDirectory>,
+    /// ADR-042 / TD-PAXMETA-1: per-block prune statistics of the filterable
+    /// columns, index-aligned with [`Self::blocks`] (validated at parse).
+    /// `None` = no stats (no shred columns, a legacy segment, or a malformed
+    /// section) ⇒ every block is kept. Serialized as optional section 9.
+    pub block_prune_stats: Option<crate::block_prune_stats::BlockPruneStatsTable>,
 }
 
 /// `[footer_len u64][SEGMENT_MAGIC 8B]` — the 16 B tail that locates the footer.
@@ -1059,6 +1075,9 @@ impl SegmentFooterIndex {
         if let Some(region) = &self.filter_region {
             sections.push((SECTION_FILTER_REGION, region.to_section_payload()?));
         }
+        if let Some(table) = &self.block_prune_stats {
+            sections.push((SECTION_BLOCK_PRUNE_STATS, table.to_bytes()?));
+        }
         if !sections.is_empty() {
             let section_count = u16::try_from(sections.len())
                 .map_err(|_| anyhow::anyhow!("footer section count exceeds u16"))?;
@@ -1289,6 +1308,7 @@ impl SegmentFooterIndex {
         let mut block_filterable_stats: Vec<(u32, Vec<u8>)> = Vec::new();
         let mut shred_field_map = Vec::new();
         let mut filter_region = None;
+        let mut block_prune_stats = None;
         if p != body.len() {
             let section_count = read_u16(body, &mut p)? as usize;
             if section_count > body.len().saturating_sub(p) / 6 {
@@ -1360,6 +1380,18 @@ impl SegmentFooterIndex {
                     } else {
                         bail!("unsupported shred field-map section version {version}");
                     }
+                } else if tag == SECTION_BLOCK_PRUNE_STATS && version == SECTION_VERSION_V1 {
+                    // Pruning stats are an optimization: a malformed table is
+                    // absent (every block kept), never a footer failure.
+                    block_prune_stats = match crate::block_prune_stats::BlockPruneStatsTable::parse(
+                        section,
+                    ) {
+                        Ok(table) => Some(table),
+                        Err(error) => {
+                            tracing::warn!(%error, "ignoring malformed prune-stats footer section");
+                            None
+                        }
+                    };
                 } else if tag == SECTION_FILTER_REGION && version == SECTION_VERSION_V1 {
                     // Region E is an optimization: a malformed directory makes
                     // it absent (Stage F decodes Region D), never a footer
@@ -1379,6 +1411,17 @@ impl SegmentFooterIndex {
                 bail!("footer-index has trailing bytes");
             }
         }
+        let block_prune_stats =
+            block_prune_stats.filter(|table: &crate::block_prune_stats::BlockPruneStatsTable| {
+                let rows: Vec<u32> = blocks.iter().map(|b| b.row_count).collect();
+                match table.check_block_rows(&rows) {
+                    Ok(()) => true,
+                    Err(error) => {
+                        tracing::warn!(%error, "ignoring misaligned prune-stats footer section");
+                        false
+                    }
+                }
+            });
         Ok(Self {
             row_count,
             rabitq_off,
@@ -1404,6 +1447,7 @@ impl SegmentFooterIndex {
             block_filterable_stats,
             shred_field_map,
             filter_region,
+            block_prune_stats,
         })
     }
 
@@ -1601,6 +1645,7 @@ mod tests {
                 proximadb_block_format::ShredColumn::untyped("lang", 101),
             ],
             filter_region: None,
+            block_prune_stats: None,
         }
     }
 
@@ -1807,6 +1852,7 @@ mod tests {
             block_filterable_stats: Vec::new(),
             shred_field_map: Vec::new(),
             filter_region: None,
+            block_prune_stats: None,
         };
         let parsed = SegmentFooterIndex::parse(&base.to_bytes().expect("serialize"))
             .expect("parse footer with exact-region section");
@@ -1856,6 +1902,7 @@ mod tests {
             block_filterable_stats: Vec::new(),
             shred_field_map: Vec::new(),
             filter_region: None,
+            block_prune_stats: None,
             blocks: vec![
                 FooterBlockEntry {
                     offset: 1_000,

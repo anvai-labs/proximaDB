@@ -815,7 +815,7 @@ fn read_column_stats(bytes: &[u8], p: &mut usize) -> Result<ColumnBlockStats> {
     } else {
         None
     };
-    let mut read_str = |p: &mut usize| -> Result<String> {
+    let read_str = |p: &mut usize| -> Result<String> {
         let len = usize::from(take_u8(bytes, p)?);
         if len > STRING_BOUND_PREFIX_BYTES {
             bail!("prune stats: string bound too long");
