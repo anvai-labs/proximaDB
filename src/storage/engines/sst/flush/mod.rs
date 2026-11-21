@@ -1030,11 +1030,12 @@ impl SstEngine {
     /// `PROXIMADB_PAX_WRITE_CENTROID_DIRECTORY`). A publish failure is logged
     /// and never fails the flush — the same discipline as the compaction
     /// publish: the directory is a projection, so without one queries use the
-    /// per-segment footer path.
+    /// per-segment footer path. The publish is awaited inline but bounded by
+    /// `PROXIMADB_PAX_WRITE_DIRECTORY_AT_FLUSH_TIMEOUT_MS` (default 5 s).
     async fn refresh_directory_after_flush(&self, final_file_path: &str) {
         use crate::storage::engines::sst::centroid_directory_publisher::{
-            centroid_directory_write_enabled, directory_at_flush_write_enabled,
-            publish_centroid_directory,
+            centroid_directory_write_enabled, directory_at_flush_timeout,
+            directory_at_flush_write_enabled, publish_centroid_directory_bounded,
         };
         // The flush hook obeys the same master write kill-switch as the
         // compaction publish (`refresh_centroid_directory`).
@@ -1051,7 +1052,21 @@ impl SstEngine {
             );
             return;
         };
-        match publish_centroid_directory(fs.as_ref(), dir_url).await {
+        // Inline (so a reader right after the flush sees the directory) but
+        // BOUNDED: a slow or hung object-store call must not stall the flush
+        // (TD-PAXMETA-1 review M1). On timeout the publish is dropped; the
+        // next flush or compaction publish reconciles.
+        let bound = directory_at_flush_timeout();
+        let Some(outcome) = publish_centroid_directory_bounded(fs.as_ref(), dir_url, bound).await
+        else {
+            tracing::warn!(
+                dir = dir_url,
+                bound_ms = bound.as_millis() as u64,
+                "PAX segment directory publish after flush timed out; flush continues"
+            );
+            return;
+        };
+        match outcome {
             Ok(Some(generation)) => {
                 tracing::debug!(
                     dir = dir_url,
