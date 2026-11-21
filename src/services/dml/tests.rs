@@ -2643,6 +2643,7 @@ async fn select_where_supports_or_nested_and_pk_or_safety() {
 /// `point_lookup_batch_relational` (TD-128), which reuse this same index +
 /// `get_by_key` path.
 #[tokio::test]
+#[serial_test::serial]
 async fn select_where_uses_secondary_index_for_nonpk_name_and_file() {
     use crate::services::record_store::DirectWalTableRecordStore;
     use crate::services::{FramedTableWalAppender, MemtableRecordStorage};
@@ -3433,6 +3434,7 @@ async fn materialize_drpath_layout_uses_opaque_namespace_id() {
 /// (`data/{tenant}/{namespace}/{table}`) — not the flat `tables/{name}`
 /// fallback — and yields `None` (legacy fallback) when there is no tenant scope.
 #[tokio::test]
+#[serial_test::serial]
 async fn resolve_warehouse_object_prefix_is_namespace_aware_and_tenant_scoped() {
     use crate::services::record_store::DirectWalTableRecordStore;
     use crate::services::{FramedTableWalAppender, MemtableRecordStorage};
@@ -3664,6 +3666,7 @@ fn materialized_table_is_readable_through_datafusion_reader() {
 /// columns only.
 #[cfg(feature = "datafusion-integration")]
 #[test]
+#[serial_test::serial]
 fn published_files_carry_a_hidden_oid_column() {
     crate::query::execution::test_runtime::run_with_timeout(30, async {
         use crate::datafusion::create_session_context;
@@ -3857,6 +3860,7 @@ async fn inv_qty_sum(location: String) -> (i64, i64) {
 /// `an_incremental_republication_hides_old_versions_with_deletion_vectors`).
 #[cfg(feature = "datafusion-integration")]
 #[test]
+#[serial_test::serial]
 fn an_insert_only_republication_appends_and_an_update_rewrites() {
     let _bloom = EnvGuard::set("PROXIMADB_PARQUET_WRITE_BLOOM_MIN_ROWS", "1");
     let _gate = EnvGuard::set("PROXIMADB_MATERIALIZE_INCREMENTAL_DV", "0");
@@ -4117,6 +4121,7 @@ impl InvFixture {
 /// the deletion-vector-applying reader see the right rows throughout.
 #[cfg(feature = "datafusion-integration")]
 #[test]
+#[serial_test::serial]
 fn an_incremental_republication_hides_old_versions_with_deletion_vectors() {
     let _bloom = EnvGuard::set("PROXIMADB_PARQUET_WRITE_BLOOM_MIN_ROWS", "1");
     let _gate = EnvGuard::set("PROXIMADB_MATERIALIZE_INCREMENTAL_DV", "1");
@@ -4437,12 +4442,14 @@ fn check_gc_with_retained_metadata_unavailable(unavailable: bool) {
 
 #[cfg(feature = "datafusion-integration")]
 #[test]
+#[serial_test::serial]
 fn materialize_gc_skips_when_older_retained_metadata_is_unavailable() {
     check_gc_with_retained_metadata_unavailable(true);
 }
 
 #[cfg(feature = "datafusion-integration")]
 #[test]
+#[serial_test::serial]
 fn materialize_gc_collects_with_healthy_retained_metadata() {
     check_gc_with_retained_metadata_unavailable(false);
 }
@@ -4605,12 +4612,14 @@ fn check_commit_never_lands_a_version_below_the_tip_that_nothing_builds_on() {
 
 #[cfg(feature = "datafusion-integration")]
 #[test]
+#[serial_test::serial]
 fn materialize_metadata_gc_keeps_only_the_window() {
     check_materialize_metadata_gc(false);
 }
 
 #[cfg(feature = "datafusion-integration")]
 #[test]
+#[serial_test::serial]
 fn materialize_metadata_gc_kill_switch_keeps_every_version() {
     check_materialize_metadata_gc(true);
 }
@@ -4625,6 +4634,7 @@ fn materialize_metadata_gc_kill_switch_keeps_every_version() {
 /// v0.4.1 bytes); the next UPDATE + MATERIALIZE must succeed and read back.
 #[cfg(feature = "datafusion-integration")]
 #[test]
+#[serial_test::serial]
 fn a_table_published_by_v041_without_row_lineage_republishes() {
     let _bloom = EnvGuard::set("PROXIMADB_PARQUET_WRITE_BLOOM_MIN_ROWS", "1");
     // v0.4.1 published v3 from the first MATERIALIZE.
@@ -4702,6 +4712,7 @@ fn a_table_published_by_v041_without_row_lineage_republishes() {
 /// plan falls back to a full rewrite: no deletion vectors, nothing carried.
 #[cfg(feature = "datafusion-integration")]
 #[test]
+#[serial_test::serial]
 fn an_incremental_republication_over_the_bound_compacts_instead() {
     let _bloom = EnvGuard::set("PROXIMADB_PARQUET_WRITE_BLOOM_MIN_ROWS", "1");
     let _gate = EnvGuard::set("PROXIMADB_MATERIALIZE_INCREMENTAL_DV", "1");
@@ -4730,6 +4741,7 @@ fn an_incremental_republication_over_the_bound_compacts_instead() {
 /// from the table's own schema, not a re-resolution of its bare name), so the
 /// republication rewrites instead of keeping the stale row as "unchanged".
 #[tokio::test]
+#[serial_test::serial]
 async fn an_update_under_object_id_keying_outside_default_rewrites() {
     // Pins the full-rewrite path (the default publishes an update
     // incrementally; 1 of 3 rows would also trip the 20% compaction bound).
@@ -4800,6 +4812,7 @@ async fn an_update_under_object_id_keying_outside_default_rewrites() {
 /// evidence): unset or empty arms it, and only an explicit off value disarms
 /// it — a typo keeps the default rather than silently reverting to rewrites.
 #[test]
+#[serial_test::serial]
 fn incremental_materialize_is_on_by_default_and_opts_out_explicitly() {
     use super::materialize_append::incremental_dv_enabled;
     const GATE: &str = "PROXIMADB_MATERIALIZE_INCREMENTAL_DV";
@@ -4823,8 +4836,10 @@ fn incremental_materialize_is_on_by_default_and_opts_out_explicitly() {
     }
 }
 
-/// Restores an environment variable when dropped (lib tests run one per process
-/// under nextest; locally they run serialized).
+/// Restores an environment variable when dropped. It does not serialize:
+/// every test that uses it (directly or through a helper) is
+/// `#[serial_test::serial]`, because plain `cargo test` (e.g. the
+/// `feature-matrix-enterprise-catalogs` CI job) runs them in one process.
 struct EnvGuard(&'static str, Option<String>);
 impl EnvGuard {
     fn set(key: &'static str, value: &str) -> Self {
@@ -4897,6 +4912,7 @@ async fn dml_over_wal_table(
 
 #[cfg(feature = "datafusion-integration")]
 #[test]
+#[serial_test::serial]
 fn materialize_publishes_multi_part_generations_and_collects_old_ones() {
     // Full rewrites only: this pins generations and GC, which an insert-only
     // republication would otherwise append to (P2.4 slice 2).
@@ -5072,6 +5088,7 @@ impl crate::services::ddl::PublishFence for RefusingFence {
 /// table in one process both succeed — serialized by the publish lock — instead
 /// of the second losing the metadata CAS.
 #[tokio::test]
+#[serial_test::serial]
 async fn materialize_is_fenced_and_serialized_per_table() {
     // Every run must rewrite so each one exercises the fenced publish.
     let _append = EnvGuard::set("PROXIMADB_MATERIALIZE_APPEND_MAX_ROWS", "0");
@@ -10197,7 +10214,11 @@ mod flip_fault {
 /// v3, v0 collected). Every MATERIALIZE here is a full rewrite (append and
 /// incremental-DV planning off), so the faulted run is one whose success
 /// WOULD publish NDV; the table name is per test, so the process-global NDV
-/// registry entry is too.
+/// registry entry is too. Its three callers are `#[serial]` (like every
+/// `EnvGuard` user here): they pin env gates through the unserialized
+/// `EnvGuard`, and the
+/// `feature-matrix-enterprise-catalogs` CI job runs them under plain
+/// `cargo test` (one shared process), not nextest.
 #[cfg(feature = "datafusion-integration")]
 fn check_materialize_flip_under_catalog_fault(failures: usize, table: &str) {
     let _append = EnvGuard::set("PROXIMADB_MATERIALIZE_APPEND_MAX_ROWS", "0");
@@ -10329,18 +10350,21 @@ fn check_materialize_flip_under_catalog_fault(failures: usize, table: &str) {
 
 #[cfg(feature = "datafusion-integration")]
 #[test]
+#[serial_test::serial]
 fn materialize_skips_the_flip_and_gc_when_the_catalog_read_fails() {
     check_materialize_flip_under_catalog_fault(usize::MAX, "flip_fault_persistent");
 }
 
 #[cfg(feature = "datafusion-integration")]
 #[test]
+#[serial_test::serial]
 fn materialize_retries_a_transient_catalog_read_failure_and_flips() {
     check_materialize_flip_under_catalog_fault(1, "flip_fault_transient");
 }
 
 #[cfg(feature = "datafusion-integration")]
 #[test]
+#[serial_test::serial]
 fn materialize_flips_and_collects_when_the_catalog_reads() {
     check_materialize_flip_under_catalog_fault(0, "flip_fault_control");
 }

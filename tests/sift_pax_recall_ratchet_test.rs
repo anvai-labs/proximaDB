@@ -2535,7 +2535,16 @@ async fn sift_pax_filtered_cascade_recall_ratchet_shipped_defaults() {
 //   * `cold_metadata` = adaptive − approx: the marginal cost of the
 //     collection-level question on a cold open;
 //   * `steady` — Q more Adaptive{threshold 0} queries in the adaptive arm's
-//     process (per-query totals and means), plus recall@10 against SIFT GT.
+//     process (per-query totals and means), plus recall@10 against SIFT GT;
+//   * ON mode only: an approx/adaptive PROBE pair over the same at-rest data
+//     with the directory's collection-level facts disabled
+//     (`PROXIMADB_PAX_READ_DIRECTORY_DECODE_KEYS=0`, first query only), whose
+//     footer-GET delta proves the Adaptive arm still asks the collection-level
+//     question — so ON's zero-GET assertions cannot pass vacuously.
+//
+// Both modes pin `PROXIMADB_PAX_WRITE_DIRECTORY_AT_FLUSH` explicitly (`0` /
+// `1`): since the flip the shipped default is ON, and an unpinned OFF run
+// would silently measure ON.
 //
 // Counts only. Latency is deliberately NOT measured or reported: emulator
 // latency is meaningless, and a wall-clock number here would be evidence of
@@ -2829,17 +2838,18 @@ async fn run_sift_get_counts(at_flush: bool) {
     }
 
     // --- Cold arms (fresh processes) -------------------------------------------------
-    let spec = |arm: &str| {
+    let spec = |arm: &str, directory_facts: bool| {
         serde_json::json!({
             "arm": arm,
             "at_flush": at_flush,
             "storage_base": storage_base,
             "n": n,
             "queries": queries,
+            "directory_facts": directory_facts,
         })
     };
-    let approx = run_cold_arm(&spec("approx"));
-    let adaptive = run_cold_arm(&spec("adaptive"));
+    let approx = run_cold_arm(&spec("approx", true));
+    let adaptive = run_cold_arm(&spec("adaptive", true));
     let approx_first = &approx["first_query"];
     let adaptive_first = &adaptive["first_query"];
     // The Adaptive arm runs the same first query plus the collection-level
@@ -2865,6 +2875,16 @@ async fn run_sift_get_counts(at_flush: bool) {
     let recall = adaptive["recall_at_10"]
         .as_f64()
         .expect("recall in adaptive arm");
+    // ON mode only: the non-vacuity probe pair (asserted below), run before
+    // the summary so its counts are reported with it.
+    let probe_gets = at_flush.then(|| {
+        let approx_probe = run_cold_arm(&spec("approx", false));
+        let adaptive_probe = run_cold_arm(&spec("adaptive", false));
+        (
+            count_field(&approx_probe["first_query"], "get_ops"),
+            count_field(&adaptive_probe["first_query"], "get_ops"),
+        )
+    });
     let summary = serde_json::json!({
         "mode": mode,
         "pax_write_directory_at_flush": at_flush,
@@ -2882,6 +2902,9 @@ async fn run_sift_get_counts(at_flush: bool) {
         "cold_metadata": cold_metadata,
         "steady": adaptive["steady"],
         "latency": "not measured (emulator latency is not evidence)",
+        "probe_directory_facts_off_first_query_gets": probe_gets.map(|(approx, adaptive)| {
+            serde_json::json!({ "approx": approx, "adaptive": adaptive })
+        }),
     });
     // Leading newline: libtest prints "test <name> ... " without one.
     println!("\nSIFT_GET_COUNTS {summary}");
@@ -2897,6 +2920,24 @@ async fn run_sift_get_counts(at_flush: bool) {
             diff("get_ops")
         );
     } else {
+        // ON-mode non-vacuity (the zero-GET assertions below are only
+        // meaningful if the Adaptive arm still ASKS the collection-level
+        // question — a mutation forcing Adaptive→Approximate would otherwise
+        // pass the ON run alone). Two extra cold probes over THIS run's
+        // at-rest data with the directory's collection-level facts disabled
+        // (`PROXIMADB_PAX_READ_DIRECTORY_DECODE_KEYS=0`, first query only):
+        // the Adaptive probe must then pay the per-segment footer reads the
+        // Approximate probe does not.
+        let (probe_approx, probe_adaptive) = probe_gets.expect("ON mode runs the probe pair");
+        assert!(
+            probe_adaptive >= probe_approx + segments as u64,
+            "AT_FLUSH=1: with directory facts disabled the cold Adaptive first query \
+             must read footers (>= 1 GET per segment beyond Approximate) — the Adaptive \
+             route no longer asks the collection-level question; measured adaptive={} \
+             approx={} over {segments} segments",
+            probe_adaptive,
+            probe_approx
+        );
         // The directory must actually SERVE the collection-level question
         // (ADR-098 D2): zero marginal GETs, and the cold first query carries
         // exactly one whole-object (non-ranged) GET — the directory load.
@@ -2942,14 +2983,18 @@ async fn run_sift_get_counts(at_flush: bool) {
     }
 }
 
-/// TD-PAXMETA-1 request counts, flush-time directory publish OFF (shipped default).
+/// TD-PAXMETA-1 request counts, flush-time directory publish OFF (the
+/// `PROXIMADB_PAX_WRITE_DIRECTORY_AT_FLUSH=0` kill switch, pinned explicitly
+/// by `set_get_counts_env` in the ingest process and every cold arm — the
+/// shipped default is ON since the flip).
 #[tokio::test]
 #[ignore = "SIFT request-count harness — set PROXIMADB_SIFT_DATASET_DIR + run with --ignored"]
 async fn sift_get_counts_directory_at_flush_off() {
     run_sift_get_counts(false).await;
 }
 
-/// TD-PAXMETA-1 request counts, flush-time directory publish ON.
+/// TD-PAXMETA-1 request counts, flush-time directory publish ON (the shipped
+/// default; pinned to `1` explicitly so the mode never depends on the default).
 #[tokio::test]
 #[ignore = "SIFT request-count harness — set PROXIMADB_SIFT_DATASET_DIR + run with --ignored"]
 async fn sift_get_counts_directory_at_flush_on() {
@@ -2974,9 +3019,15 @@ async fn sift_get_counts_cold_child() {
         .to_string();
     let n = spec["n"].as_u64().expect("n") as usize;
     let queries = spec["queries"].as_u64().expect("queries") as usize;
+    // Probe arms (ON-mode non-vacuity) disable the directory's
+    // collection-level facts and run the first query only.
+    let directory_facts = spec["directory_facts"].as_bool().unwrap_or(true);
     // SAFETY: a dedicated child process running exactly this test.
     unsafe {
         set_get_counts_env(at_flush);
+        if !directory_facts {
+            std::env::set_var("PROXIMADB_PAX_READ_DIRECTORY_DECODE_KEYS", "0");
+        }
         std::env::set_var(
             "PROXIMADB_SEGMENT_LISTING_CACHE_MS",
             GET_COUNTS_LISTING_TTL_MS,
@@ -3007,7 +3058,7 @@ async fn sift_get_counts_cold_child() {
         "first_query": request_counts(&first),
     });
 
-    if arm == "adaptive" {
+    if arm == "adaptive" && directory_facts {
         let base_path = dataset_path("sift_base.fvecs").expect("dataset dir");
         let base = read_vec_records_f32(&base_path, Some(n)).expect("read sift_base.fvecs");
         let gt_path = dataset_path("sift_groundtruth.ivecs");

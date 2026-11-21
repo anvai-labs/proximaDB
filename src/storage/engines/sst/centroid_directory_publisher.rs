@@ -29,7 +29,8 @@
 //! 5. Delete generations older than the previous one (readers holding an older
 //!    generation stay correct: every entry is validated against the live set).
 //!
-//! Gate: `PROXIMADB_PAX_WRITE_CENTROID_DIRECTORY` (default OFF). A publish
+//! Gate: `PROXIMADB_PAX_WRITE_CENTROID_DIRECTORY` (default ON since D8;
+//! `0/false/off/no` disables). A publish
 //! failure is logged and never fails the compaction: the directory is a
 //! projection, and without one queries use the per-segment cascade.
 
@@ -68,11 +69,54 @@ proximadb_config::env_kill_switch! {
 // also refreshes the collection directory — the same create-only reconcile
 // the compaction publish runs — so flush-written (uncovered) segments appear
 // with their untrained decode keys instead of waiting for the next
-// compaction. Default OFF until baked (a flush is the hot ingest path; the
-// publish adds one LIST plus per-changed-segment reads off the query path).
-// Read on every call (not memoized) so tests can flip it mid-process.
-pub fn directory_at_flush_write_enabled() -> bool {
-    proximadb_config::env_flag_now("PROXIMADB_PAX_WRITE_DIRECTORY_AT_FLUSH")
+// compaction. Default ON since the request-count flip evidence
+// (`paxmeta1_directory_at_flush_request_counts_azurite`: cold collection-level
+// metadata GETs 20→0 / 40→0 on Azurite, same recall). Each flush pays ~3 GETs
+// (2 ranged + the directory) + 1 LIST (+1 PUT, +1 DELETE once two generations
+// exist) off the query path, inline but bounded by
+// [`directory_at_flush_timeout`]; `0/false/off/no` is the kill switch. Not memoized (`env_kill_switch!`) so
+// tests can flip it mid-process.
+proximadb_config::env_kill_switch! {
+    /// Kill-switch gate; default ON (0|false|off|no disables).
+    pub fn directory_at_flush_write_enabled() { gate: "PROXIMADB_PAX_WRITE_DIRECTORY_AT_FLUSH", default: true }
+}
+
+/// Default bound on the flush-time publish (ms). The publish runs inline on
+/// the flush path (LIST + directory GET + per-changed-segment ranged GETs +
+/// PUT + DELETE, up to [`PUBLISH_ATTEMPTS`] create-only attempts), so a slow
+/// or hung object-store call must not stall the flush; a few seconds is far
+/// above a healthy publish's handful of round trips. Latency unmeasured.
+pub const DEFAULT_DIRECTORY_AT_FLUSH_TIMEOUT_MS: u64 = 5_000;
+
+/// The flush-time publish bound: `PROXIMADB_PAX_WRITE_DIRECTORY_AT_FLUSH_TIMEOUT_MS`
+/// as a positive integer of milliseconds; unset, `0`, an off spelling or a
+/// typo keep [`DEFAULT_DIRECTORY_AT_FLUSH_TIMEOUT_MS`] (the bound itself can
+/// never be switched off — `PROXIMADB_PAX_WRITE_DIRECTORY_AT_FLUSH=0` is the
+/// way to take the publish off the flush path). Read on every call.
+pub fn directory_at_flush_timeout() -> std::time::Duration {
+    let raw = std::env::var("PROXIMADB_PAX_WRITE_DIRECTORY_AT_FLUSH_TIMEOUT_MS").ok();
+    let ms = crate::services::storage_format::default_on_gate_value(
+        raw.as_deref(),
+        DEFAULT_DIRECTORY_AT_FLUSH_TIMEOUT_MS,
+    )
+    .unwrap_or(DEFAULT_DIRECTORY_AT_FLUSH_TIMEOUT_MS);
+    std::time::Duration::from_millis(ms)
+}
+
+/// [`publish_centroid_directory`] bounded by `bound`. `None` when the bound
+/// elapsed: the in-flight publish is dropped. Every step is create-only or a
+/// delete of a superseded generation, so an interrupted publish leaves at
+/// most a stale or extra generation — or, on a backend without atomic PUT
+/// (local fs), a truncated newest object, which readers treat as no
+/// directory (footer path) and the next publish supersedes.
+pub(crate) async fn publish_centroid_directory_bounded(
+    fs: &dyn FileSystem,
+    dir_url: &str,
+    bound: std::time::Duration,
+) -> Option<anyhow::Result<Option<u64>>> {
+    tokio::time::timeout(bound, publish_centroid_directory(fs, dir_url))
+        .await
+        .ok()
 }
 
 /// Directory objects in a listing, newest generation first.
@@ -84,6 +128,15 @@ pub(crate) fn directory_objects_newest_first(entries: &[DirEntry]) -> Vec<(u64, 
         .collect();
     objects.sort_by_key(|o| std::cmp::Reverse(o.0));
     objects
+}
+
+/// What [`read_segment_a0_with_header`] found: a trained segment's A0, or no
+/// usable A0 — carrying the header prefix it already read (when it read a
+/// full one) so the untrained-key attach does not GET it again (TD-PAXMETA-1
+/// review L1: an untrained flush segment costs 2 ranged GETs, not 3).
+enum SegmentA0Read {
+    Trained(Box<SegmentA0>),
+    Untrained { prefix: Option<Vec<u8>> },
 }
 
 /// A segment's Region A0 as the publisher reads it.
@@ -103,34 +156,46 @@ pub(crate) async fn read_segment_a0(
     url: &str,
     size_bytes: u64,
 ) -> Result<Option<CoarseDirectory>, FilesystemError> {
-    Ok(read_segment_a0_with_header(fs, url, size_bytes)
-        .await?
-        .map(|s| s.a0))
+    Ok(
+        match read_segment_a0_with_header(fs, url, size_bytes).await? {
+            SegmentA0Read::Trained(segment) => Some(segment.a0),
+            SegmentA0Read::Untrained { .. } => None,
+        },
+    )
 }
 
 async fn read_segment_a0_with_header(
     fs: &dyn FileSystem,
     url: &str,
     size_bytes: u64,
-) -> Result<Option<SegmentA0>, FilesystemError> {
+) -> Result<SegmentA0Read, FilesystemError> {
     let prefix_len = (SEG_HEADER_PREFIX_LEN as u64).min(size_bytes);
     if prefix_len < SEG_HEADER_PREFIX_LEN as u64 {
-        return Ok(None);
+        return Ok(SegmentA0Read::Untrained { prefix: None });
     }
     let prefix = fs.read_range(url, 0, prefix_len).await?;
     let Ok(header) = SegmentHeaderPrefix::parse(&prefix) else {
-        return Ok(None);
+        return Ok(SegmentA0Read::Untrained {
+            prefix: Some(prefix),
+        });
     };
     if header.a0_len == 0 || !within(size_bytes, header.a0_off, header.a0_len) {
-        return Ok(None);
+        return Ok(SegmentA0Read::Untrained {
+            prefix: Some(prefix),
+        });
     }
     let a0_bytes = fs.read_range(url, header.a0_off, header.a0_len).await?;
-    Ok(CoarseDirectory::parse(&a0_bytes).ok().map(|a0| SegmentA0 {
-        a0,
-        a0_bytes,
-        header,
-        prefix,
-    }))
+    Ok(match CoarseDirectory::parse(&a0_bytes) {
+        Ok(a0) => SegmentA0Read::Trained(Box::new(SegmentA0 {
+            a0,
+            a0_bytes,
+            header,
+            prefix,
+        })),
+        Err(_) => SegmentA0Read::Untrained {
+            prefix: Some(prefix),
+        },
+    })
 }
 
 fn within(size_bytes: u64, off: u64, len: u64) -> bool {
@@ -195,7 +260,8 @@ fn retain_current_decode_keys(
 /// TD-PAXMETA-1 (ADR-098 D2): read an UNCOVERED segment's footer and build its
 /// zero-encoded decode key — the coalesced-but-untrained segments a flush
 /// writes, and trained segments whose dimension mismatches the directory. Two
-/// ranged reads (header prefix, footer). `None` when the object is not
+/// ranged reads (header prefix, footer) — one when the caller passes the
+/// `prefix` it already read. `None` when the object is not
 /// coalesced PAX or any part disagrees: the segment stays uncovered and
 /// keyless, and its readers keep the per-segment footer path.
 async fn read_uncovered_decode_key(
@@ -203,17 +269,21 @@ async fn read_uncovered_decode_key(
     url: &str,
     size_bytes: u64,
     etag: Option<&str>,
+    prefix: Option<Vec<u8>>,
 ) -> Option<SegmentDecodeKey> {
     let prefix_len = (SEG_HEADER_PREFIX_LEN as u64).min(size_bytes);
     if prefix_len < SEG_HEADER_PREFIX_LEN as u64 {
         return None;
     }
-    let prefix = match fs.read_range(url, 0, prefix_len).await {
-        Ok(prefix) => prefix,
-        Err(error) => {
-            tracing::debug!(%url, %error, "segment header unreadable; no untrained key");
-            return None;
-        }
+    let prefix = match prefix {
+        Some(prefix) => prefix,
+        None => match fs.read_range(url, 0, prefix_len).await {
+            Ok(prefix) => prefix,
+            Err(error) => {
+                tracing::debug!(%url, %error, "segment header unreadable; no untrained key");
+                return None;
+            }
+        },
     };
     if !is_coalesced_segment(&prefix) {
         return None; // legacy block layout: never keyable
@@ -251,11 +321,12 @@ async fn attach_untrained_key(
     size_bytes: u64,
     etag: Option<&str>,
     decode_keys: bool,
+    prefix: Option<Vec<u8>>,
 ) {
     if !decode_keys {
         return;
     }
-    if let Some(key) = read_uncovered_decode_key(fs, url, size_bytes, etag).await
+    if let Some(key) = read_uncovered_decode_key(fs, url, size_bytes, etag, prefix).await
         && let Err(error) = builder.set_decode_key(name, key)
     {
         tracing::debug!(%url, %error, "untrained decode key refused; publishing keyless");
@@ -394,7 +465,7 @@ pub async fn publish_centroid_directory(
         for segment in &plan.to_load {
             let (url, etag) = &urls[&segment.name];
             match read_segment_a0_with_header(fs, url, segment.size_bytes).await {
-                Ok(Some(read)) => {
+                Ok(SegmentA0Read::Trained(read)) => {
                     if let Err(error) =
                         plan.builder
                             .add_covered(&segment.name, segment.size_bytes, &read.a0)
@@ -413,6 +484,7 @@ pub async fn publish_centroid_directory(
                             segment.size_bytes,
                             etag.as_deref(),
                             decode_keys,
+                            Some(read.prefix.clone()),
                         )
                         .await;
                     } else if decode_keys
@@ -424,7 +496,7 @@ pub async fn publish_centroid_directory(
                         a0_by_name.insert(segment.name.clone(), read.a0_bytes);
                     }
                 }
-                Ok(None) => {
+                Ok(SegmentA0Read::Untrained { prefix }) => {
                     plan.builder
                         .add_uncovered(&segment.name, segment.size_bytes);
                     // TD-PAXMETA-1: a coalesced-but-untrained segment (the
@@ -437,6 +509,7 @@ pub async fn publish_centroid_directory(
                         segment.size_bytes,
                         etag.as_deref(),
                         decode_keys,
+                        prefix,
                     )
                     .await;
                 }
@@ -502,6 +575,7 @@ pub(crate) mod tests {
     use crate::storage::persistence::filesystem::local::{LocalConfig, LocalFileSystem};
     use proximadb_block_format::VectorQuant;
     use proximadb_records::{EmbeddingCell, ProximaRecord};
+    use std::sync::Arc;
 
     const DIM: usize = 16;
 
@@ -898,23 +972,125 @@ pub(crate) mod tests {
         unsafe { std::env::remove_var("PROXIMADB_PAX_WRITE_CENTROID_DIRECTORY") };
     }
 
-    /// TD-PAXMETA-1: the flush-publish gate is default-OFF opt-in — the
-    /// registry's truthy set enables it, anything else (including unset and
-    /// unrecognized values) keeps the flush path unchanged.
+    /// TD-PAXMETA-1: the flush-publish gate is a default-ON kill switch —
+    /// unset (and unrecognized values) publish at flush; the kill-switch set
+    /// `0|false|off|no` (case-insensitive, whitespace-tolerant) disables it.
     #[test]
-    fn at_flush_gate_defaults_off_opt_in() {
-        // SAFETY: nextest runs each test in its own process.
+    #[serial_test::serial]
+    fn at_flush_gate_defaults_on_with_kill_switch() {
+        // SAFETY: #[serial] keeps the gate private to this test in the
+        // shared `cargo test --lib` process; restored at the end.
         unsafe { std::env::remove_var("PROXIMADB_PAX_WRITE_DIRECTORY_AT_FLUSH") };
-        assert!(!directory_at_flush_write_enabled(), "default OFF");
-        for on in ["1", "true", "on", "yes"] {
+        assert!(directory_at_flush_write_enabled(), "default ON");
+        for on in ["1", "true", "on", "yes", "bogus"] {
             unsafe { std::env::set_var("PROXIMADB_PAX_WRITE_DIRECTORY_AT_FLUSH", on) };
-            assert!(directory_at_flush_write_enabled(), "{on} opts in");
+            assert!(directory_at_flush_write_enabled(), "{on} keeps it on");
         }
-        for off in ["0", "false", "off", "no", "bogus"] {
+        for off in ["0", "false", "off", "no", " OFF "] {
             unsafe { std::env::set_var("PROXIMADB_PAX_WRITE_DIRECTORY_AT_FLUSH", off) };
-            assert!(!directory_at_flush_write_enabled(), "{off} stays off");
+            assert!(!directory_at_flush_write_enabled(), "{off} kills it");
         }
         unsafe { std::env::remove_var("PROXIMADB_PAX_WRITE_DIRECTORY_AT_FLUSH") };
+    }
+
+    /// A filesystem whose LIST never completes (a hung object-store call).
+    #[derive(Debug)]
+    struct StallingListFs {
+        inner: Arc<LocalFileSystem>,
+    }
+
+    proximadb_storage_filesystem_types::forward_filesystem_impl! {
+        impl FileSystem for StallingListFs => inner;
+        forward [
+            as_any, filesystem_type, supports_mmap, write,
+            supports_bounded_local_file_write, write_local_file, write_if_absent, append,
+            supports_append, supports_conditional_replace, delete, exists, metadata,
+            create_dir, create_dir_all, copy, move_file, sync, sync_file, sync_data, open_file,
+        ];
+        {
+            async fn read(&self, path: &str) -> proximadb_storage_filesystem_types::FsResult<Vec<u8>> {
+                self.inner.read(path).await
+            }
+
+            async fn read_range(
+                &self,
+                path: &str,
+                offset: u64,
+                length: u64,
+            ) -> proximadb_storage_filesystem_types::FsResult<Vec<u8>> {
+                self.inner.read_range(path, offset, length).await
+            }
+
+            async fn list(
+                &self,
+                _path: &str,
+            ) -> proximadb_storage_filesystem_types::FsResult<Vec<DirEntry>> {
+                std::future::pending().await
+            }
+        }
+    }
+
+    /// TD-PAXMETA-1 review M1: the flush-time publish is bounded — a publish
+    /// whose object-store call hangs returns `None` at the bound instead of
+    /// stalling the flush. Mutation check: replacing the `timeout` in
+    /// `publish_centroid_directory_bounded` with a plain await makes the
+    /// outer guard below fire (the test fails instead of hanging forever).
+    #[tokio::test]
+    async fn a_hung_flush_publish_returns_at_the_bound() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fs = StallingListFs {
+            inner: Arc::new(local_fs().await),
+        };
+        let dir = tmp.path().to_str().unwrap().to_string();
+        let bound = std::time::Duration::from_millis(50);
+        let started = std::time::Instant::now();
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            publish_centroid_directory_bounded(&fs, &dir, bound),
+        )
+        .await
+        .expect("the bounded publish must return well before the 10 s guard");
+        assert!(outcome.is_none(), "a hung publish reports the timeout");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "returned at the bound, not after the hang: {:?}",
+            started.elapsed()
+        );
+        // Positive control: the same (non-stalling) backend under the default
+        // bound completes — the `None` above is the stall, not the wrapper.
+        let healthy = local_fs().await;
+        let outcome = publish_centroid_directory_bounded(
+            &healthy,
+            &dir,
+            std::time::Duration::from_millis(DEFAULT_DIRECTORY_AT_FLUSH_TIMEOUT_MS),
+        )
+        .await;
+        assert!(
+            outcome.is_some(),
+            "a healthy publish finishes inside the bound"
+        );
+    }
+
+    /// The bound's env knob: positive milliseconds; everything else keeps the
+    /// default (the bound itself cannot be switched off).
+    #[test]
+    #[serial_test::serial]
+    fn at_flush_timeout_knob_parses_positive_millis() {
+        const KNOB: &str = "PROXIMADB_PAX_WRITE_DIRECTORY_AT_FLUSH_TIMEOUT_MS";
+        let default = std::time::Duration::from_millis(DEFAULT_DIRECTORY_AT_FLUSH_TIMEOUT_MS);
+        // SAFETY: #[serial]; restored at the end.
+        unsafe { std::env::remove_var(KNOB) };
+        assert_eq!(directory_at_flush_timeout(), default);
+        unsafe { std::env::set_var(KNOB, "250") };
+        assert_eq!(
+            directory_at_flush_timeout(),
+            std::time::Duration::from_millis(250)
+        );
+        for keep in ["0", "off", "typo", ""] {
+            unsafe { std::env::set_var(KNOB, keep) };
+            assert_eq!(directory_at_flush_timeout(), default, "{keep:?}");
+        }
+        unsafe { std::env::remove_var(KNOB) };
     }
 
     /// TD-PAXMETA-1 (ADR-098 D2): an untrained (flush-layout) coalesced
@@ -943,9 +1119,28 @@ pub(crate) mod tests {
         let fs = local_fs().await;
         let dir_url = tmp.path().to_string_lossy().to_string();
 
+        // Review L1: the untrained segment costs exactly 2 ranged reads (header
+        // prefix once, footer) — the prefix the A0 probe read is reused, not
+        // fetched again (was 3). The garbage object is shorter than a prefix
+        // and costs none.
+        let counters =
+            Arc::new(proximadb_storage_filesystem_types::counting::GetCounters::default());
+        let counting = proximadb_storage_filesystem_types::counting::CountingFileSystem::new(
+            Arc::new(local_fs().await),
+            counters.clone(),
+        );
         assert_eq!(
-            publish_centroid_directory(&fs, &dir_url).await.unwrap(),
+            publish_centroid_directory(&counting, &dir_url)
+                .await
+                .unwrap(),
             Some(1)
+        );
+        assert_eq!(
+            counters
+                .range_reads
+                .load(std::sync::atomic::Ordering::Relaxed),
+            2,
+            "untrained segment: prefix + footer, the prefix read once"
         );
         let dir = &newest(&fs, &dir_url).await[0].1;
         let l0 = dir

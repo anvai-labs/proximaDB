@@ -4174,11 +4174,19 @@ jobs:
   # flush-time segment-directory publish (PROXIMADB_PAX_WRITE_DIRECTORY_AT_FLUSH)
   # OFF vs ON, at two flush batches (1000 → 10 segments, 500 → 20) so the
   # per-segment slope is visible. Cold phases run in fresh processes. COUNTS
-  # ONLY: emulator latency is not evidence and is not reported. Report-only for
-  # counts (recall floor asserted in every mode); set
-  # PROXIMADB_SIFT_MAX_COLD_METADATA_GETS to turn the cold metadata count into
-  # a ceiling. Same trigger as sift-recall-ratchet: dispatch + medium tier,
-  # never on feat→develop.
+  # ONLY: emulator latency is not evidence and is not reported. Asserted in
+  # every mode: the recall floor and the at-rest shape (one .pax per flush;
+  # OFF leaves no directory, ON at least one). OFF hard-asserts the cold
+  # collection-level question reads footers (>= 1 GET per segment); ON
+  # hard-asserts 0 cold collection-level metadata GETs, exactly one directory
+  # (non-ranged) GET per cold first query, and — via a probe pair with the
+  # directory facts disabled — that the Adaptive arm still asks the question.
+  # PROXIMADB_SIFT_MAX_COLD_METADATA_GETS remains an optional extra ceiling
+  # (ON mode). The directory publish at flush is default ON since the
+  # TD-PAXMETA-1 flip; the harness pins AT_FLUSH=0/1 explicitly per mode, so
+  # the OFF baseline never silently measures ON. Trigger: dispatch + medium
+  # tier, never on feat→develop (sift-recall-ratchet is dispatch-only since
+  # TD-CI-8 #3; this job keeps the medium tier).
   # ============================================================================
   sift-object-store-request-counts:
     name: SIFT object-store request counts (Azurite)
