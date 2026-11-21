@@ -4008,15 +4008,23 @@ struct InvFixture {
     dml: DmlService,
     root_url: String,
     bridge: Arc<proximadb_iceberg_engine::IcebergObjectStoreBridge>,
+    /// The table's name (`inv` unless a test needs process-unique state).
+    table: String,
 }
 
 #[cfg(feature = "datafusion-integration")]
 impl InvFixture {
     async fn new(wal: &str, rows: usize) -> Self {
+        Self::named(wal, rows, "inv").await
+    }
+
+    /// The same fixture under table `table`: process-global state keyed by
+    /// the table name (the NDV statistics registry) stays per test.
+    async fn named(wal: &str, rows: usize, table: &str) -> Self {
         let wal_dir = tempfile::tempdir().expect("tempdir");
         let (manager, dml) = dml_over_wal_table(
             wal_dir.path(),
-            "CREATE TABLE inv (id TEXT NOT NULL, qty INT, PRIMARY KEY (id));",
+            &format!("CREATE TABLE {table} (id TEXT NOT NULL, qty INT, PRIMARY KEY (id));"),
             wal,
         )
         .await;
@@ -4032,10 +4040,13 @@ impl InvFixture {
             dml,
             root_url,
             bridge,
+            table: table.to_string(),
         };
         for i in 0..rows {
             fixture
-                .exec(&format!("INSERT INTO inv (id, qty) VALUES ('i{i}', {i});"))
+                .exec(&format!(
+                    "INSERT INTO {table} (id, qty) VALUES ('i{i}', {i});"
+                ))
                 .await;
         }
         fixture
@@ -4054,9 +4065,16 @@ impl InvFixture {
 
     async fn materialize(&self) -> String {
         self.dml
-            .materialize_table_to_parquet(&*self.bridge, &self.root_url, "inv", None)
+            .materialize_table_to_parquet(&*self.bridge, &self.root_url, &self.table, None)
             .await
             .expect("materialize")
+    }
+
+    /// One MATERIALIZE, returning its result rather than expecting success.
+    async fn try_materialize(&self) -> anyhow::Result<String> {
+        self.dml
+            .materialize_table_to_parquet(&*self.bridge, &self.root_url, &self.table, None)
+            .await
     }
 
     /// The published data prefix of a location, and its metadata prefix.
@@ -10169,23 +10187,30 @@ mod flip_fault {
     }
 }
 
-/// TD-SPINE-3 review M1/round 2: MATERIALIZE through the real path with a
+/// TD-SPINE-3 review rounds 1-3: MATERIALIZE through the real path with a
 /// catalog whose flip-time read (after the commit lands) fails `failures`
 /// times. The read is retried (3 attempts): one transient failure is absorbed
-/// and the flip lands; a persistent one leaves the layout on the previous
-/// version, skips this run's NDV publish and GC (v0's metadata survives), and
-/// the next MATERIALIZE that reads the catalog flips. `failures == 0` is the
-/// positive control (flip to v3, v0 collected).
+/// and the flip lands; a persistent one returns an error naming the committed
+/// version, leaves the layout on the previous version, skips this run's NDV
+/// publish and GC (v0's metadata survives), and the next MATERIALIZE that
+/// reads the catalog flips. `failures == 0` is the positive control (flip to
+/// v3, v0 collected). Every MATERIALIZE here is a full rewrite (append and
+/// incremental-DV planning off), so the faulted run is one whose success
+/// WOULD publish NDV; the table name is per test, so the process-global NDV
+/// registry entry is too.
 #[cfg(feature = "datafusion-integration")]
-fn check_materialize_flip_under_catalog_fault(failures: usize) {
-    crate::query::execution::test_runtime::run_with_timeout(60, async {
+fn check_materialize_flip_under_catalog_fault(failures: usize, table: &str) {
+    let _append = EnvGuard::set("PROXIMADB_MATERIALIZE_APPEND_MAX_ROWS", "0");
+    let _dv = EnvGuard::set("PROXIMADB_MATERIALIZE_INCREMENTAL_DV", "0");
+    let table = table.to_string();
+    crate::query::execution::test_runtime::run_with_timeout(60, async move {
         use std::sync::atomic::Ordering;
-        let inv = InvFixture::new(&format!("flip-fault-{failures}.wal"), 4).await;
+        let inv = InvFixture::named(&format!("{table}.wal"), 4, &table).await;
         let location = inv.materialize().await;
-        let (_prefix, metadata_prefix) = inv.prefixes(&location);
+        let (prefix, metadata_prefix) = inv.prefixes(&location);
         for round in 1..3 {
             inv.exec(&format!(
-                "UPDATE inv SET qty = {} WHERE id = 'i{round}';",
+                "UPDATE {table} SET qty = {} WHERE id = 'i{round}';",
                 70 + round
             ))
             .await;
@@ -10201,7 +10226,7 @@ fn check_materialize_flip_under_catalog_fault(failures: usize) {
         assert_eq!(tip().await, 2, "v0..v2 published");
         let (_, table_id) = inv
             ._manager
-            .resolve_table_scoped("inv", None)
+            .resolve_table_scoped(&table, None)
             .await
             .expect("resolve");
         let inner = inv._manager.get_catalog("native").await.expect("native");
@@ -10222,15 +10247,16 @@ fn check_materialize_flip_under_catalog_fault(failures: usize) {
                     })
             }
         };
-        // The NDV summary the first (full) MATERIALIZE published.
+        // The NDV summary the last (full) MATERIALIZE published: 4 rows.
         let ndv_records = || {
             crate::core::statistics::statistics_registry()
-                .envelope(&crate::core::statistics::table_statistics_key(None, "inv"))
+                .envelope(&crate::core::statistics::table_statistics_key(None, &table))
                 .map(|e| e.record_count)
         };
         let ndv_before = ndv_records();
-        assert!(ndv_before.is_some(), "the full MATERIALIZE published NDV");
+        assert_eq!(ndv_before, Some(4), "the full MATERIALIZE published NDV");
         assert_eq!(recorded(inner.clone()).await, Some(2));
+        let files_before = published_data_files(&inv.bridge, &prefix).await;
         let faulty = Arc::new(flip_fault::FlipReadFaultCatalog {
             inner: inner.clone(),
             bridge: inv.bridge.clone(),
@@ -10245,16 +10271,17 @@ fn check_materialize_flip_under_catalog_fault(failures: usize) {
             .await
             .expect("register");
 
-        // An INSERT: any NDV publish from this run would change the summary's
-        // record count (an UPDATE can republish the same count).
-        inv.exec("INSERT INTO inv (id, qty) VALUES ('i9', 99);")
+        // A fifth row: a publish from this run would record 5, not 4.
+        inv.exec(&format!("INSERT INTO {table} (id, qty) VALUES ('i9', 99);"))
             .await;
-        assert_eq!(
-            inv.materialize().await,
-            location,
-            "the commit itself succeeds"
-        );
+        let outcome = inv.try_materialize().await;
         assert_eq!(tip().await, 3, "v3 committed");
+        let files_after = published_data_files(&inv.bridge, &prefix).await;
+        assert!(
+            files_after.iter().all(|f| !files_before.contains(f)),
+            "the faulted run is a full rewrite (no file carried): \
+             {files_before:?} -> {files_after:?}"
+        );
         let v0_survives = inv
             .bridge
             .read_table_metadata(&metadata_prefix, 0)
@@ -10262,6 +10289,14 @@ fn check_materialize_flip_under_catalog_fault(failures: usize) {
             .is_ok();
         let injected = faulty.injected.load(Ordering::SeqCst);
         if failures == usize::MAX {
+            let err = outcome.expect_err("a skipped flip is not reported as success");
+            let message = err.to_string();
+            assert!(
+                message.contains("committed Iceberg metadata v3")
+                    && message.contains("after 3 attempts")
+                    && message.contains("re-run MATERIALIZE"),
+                "the error names the committed version and the remedy: {message}"
+            );
             assert_eq!(injected, 3, "every one of the 3 flip-read attempts failed");
             assert_eq!(
                 recorded(inner.clone()).await,
@@ -10270,12 +10305,13 @@ fn check_materialize_flip_under_catalog_fault(failures: usize) {
             );
             assert!(v0_survives, "GC is skipped when the flip is skipped");
             assert_eq!(ndv_records(), ndv_before, "no NDV publish without the flip");
-            // Liveness: the next MATERIALIZE that reads the catalog flips it.
+            // Liveness: re-running MATERIALIZE once the catalog reads flips it.
             faulty.fail_after_version.store(u64::MAX, Ordering::SeqCst);
-            inv.exec("UPDATE inv SET qty = 98 WHERE id = 'i0';").await;
-            inv.materialize().await;
+            assert_eq!(inv.try_materialize().await.expect("re-run"), location);
             assert_eq!(recorded(inner.clone()).await, Some(4));
+            assert_eq!(ndv_records(), Some(5), "the re-run publishes NDV");
         } else {
+            assert_eq!(outcome.expect("the flip lands"), location);
             assert_eq!(
                 injected, failures,
                 "{failures} transient failure(s) injected"
@@ -10286,6 +10322,7 @@ fn check_materialize_flip_under_catalog_fault(failures: usize) {
                 "the flip lands (a transient failure is retried)"
             );
             assert!(!v0_survives, "GC collects v0 below the window");
+            assert_eq!(ndv_records(), Some(5), "the flip publishes NDV");
         }
     });
 }
@@ -10293,17 +10330,17 @@ fn check_materialize_flip_under_catalog_fault(failures: usize) {
 #[cfg(feature = "datafusion-integration")]
 #[test]
 fn materialize_skips_the_flip_and_gc_when_the_catalog_read_fails() {
-    check_materialize_flip_under_catalog_fault(usize::MAX);
+    check_materialize_flip_under_catalog_fault(usize::MAX, "flip_fault_persistent");
 }
 
 #[cfg(feature = "datafusion-integration")]
 #[test]
 fn materialize_retries_a_transient_catalog_read_failure_and_flips() {
-    check_materialize_flip_under_catalog_fault(1);
+    check_materialize_flip_under_catalog_fault(1, "flip_fault_transient");
 }
 
 #[cfg(feature = "datafusion-integration")]
 #[test]
 fn materialize_flips_and_collects_when_the_catalog_reads() {
-    check_materialize_flip_under_catalog_fault(0);
+    check_materialize_flip_under_catalog_fault(0, "flip_fault_control");
 }

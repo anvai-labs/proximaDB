@@ -3501,8 +3501,9 @@ impl DmlService {
         // and writing this layout alone would drop other representations'. The
         // read is retried (3 attempts, short exponential backoff) so a transient
         // error does not cost the flip. If every attempt fails, the flip, the NDV
-        // publish and this run's GC are skipped — the same state a failed layout
-        // write or a crash between commit and flip leaves: readers open the
+        // publish and this run's GC are skipped and MATERIALIZE returns an error
+        // naming the committed version — the same state (and the same Err) a
+        // failed layout write leaves, like a crash between commit and flip: readers open the
         // Iceberg tip V (they LIST the latest metadata) while the layout records
         // V-1 and its snapshot_lsn. Without deletion vectors the OLAP merge stays
         // exact; a table whose base carries deletion vectors fails closed — merged
@@ -3513,6 +3514,7 @@ impl DmlService {
             2,
             std::time::Duration::from_millis(50),
         );
+        let mut flip_read_failure = None;
         let existing_layouts = match flip_read.execute(|| catalog.get_table(&table_id)).await {
             Ok(schema) => Some(schema.storage_layouts),
             Err(proximadb_resilience::RetryError::RetriesExhausted {
@@ -3525,6 +3527,7 @@ impl DmlService {
                     attempts,
                     "MATERIALIZE: catalog read before the flip failed: {last_error:#}"
                 );
+                flip_read_failure = Some((attempts, last_error));
                 None
             }
         };
@@ -3542,13 +3545,20 @@ impl DmlService {
                 true
             }
             materialize_stream::CatalogFlip::LayoutsUnreadable => {
-                warn!(
-                    table = %table_name,
-                    version,
-                    "MATERIALIZE: the catalog was unreadable after the commit; the catalog \
-                     flip and GC are skipped until a later MATERIALIZE reads it"
-                );
-                return Ok(location);
+                // Reported as an error, like a failed layout write: the
+                // publication is committed but not yet the table's layout.
+                let (attempts, cause) = match flip_read_failure {
+                    Some((attempts, cause)) => (attempts, cause),
+                    None => (0, anyhow!("the catalog read returned no layouts")),
+                };
+                return Err(cause.context(format!(
+                    "MATERIALIZE {table_name}: committed Iceberg metadata v{version}, but the \
+                     catalog could not be read to flip the table's layout after {attempts} \
+                     attempts; the layout still records the previous publication. The table \
+                     stays readable, but if it carries deletion vectors its merged OLAP reads \
+                     are refused until the layout is flipped: re-run MATERIALIZE once the \
+                     catalog is reachable (it reconciles with a full rewrite; no data is lost)"
+                )));
             }
         };
         // The catalog now records `snapshot_lsn`; published snapshots hold the WAL
