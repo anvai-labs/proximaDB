@@ -451,6 +451,24 @@ if [ "$SCOPE" = "qa" ]; then
     --test object_store_restart_recovery \
     -- --ignored --nocapture --test-threads=1
 
+  # TD-CI-8 #2 (restart subsumption): the four TD-CACHE-7 / spill lib
+  # contracts moved here from ci.yml's --restart promotion arm (deleted at
+  # the medium tier). SAME feature set as the original proof (--features
+  # azure), SAME ignored-only selection, SAME adls:// endpoint family — the
+  # assertions move intact; only the tier that runs them changed. This is
+  # the qa scope's FIRST root-lib-test build (the reason mlflow got its own
+  # --mlflow-s3 scope: lib-test does not share the server build), so it adds
+  # a build; recorded against TD-OBJSTORE-5's QA budget ratchet.
+  echo "==> QA tier: TD-CACHE-7/spill object-store lib contracts (azure)"
+  CARGO_BUILD_JOBS=1 cargo test -p proximadb --features azure --lib --no-run
+  PROXIMADB_OBJECT_STORE_URL="adls://$CONTAINER_BUCKET/qa-restart-azure" \
+    CARGO_BUILD_JOBS=1 cargo nextest run -p proximadb --features azure --lib \
+    --run-ignored only --retries 0 --no-tests fail \
+    -E 'test(/::warm_manifest_round_trips_on_object_store$/)
+      | test(/::a_missing_object_is_not_found_on_object_store$/)
+      | test(/::spill_segments_round_trip_on_object_store$/)
+      | test(/::placement_is_claimed_and_fenced_on_object_store$/)'
+
   echo "==> QA tier: stopping Azurite (S3 must not be able to reach Azure)"
   docker rm -f azurite >/dev/null 2>&1 || true
 

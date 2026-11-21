@@ -2755,14 +2755,20 @@ jobs:
             name: Object-store library contracts (Azurite)
     timeout-minutes: 100
     needs: [changes]
-    # TD-CITIER-1: path-scoped on feat->develop (widened filter), and
-    # UNCONDITIONAL at develop->qa / qa->main (`medium_tier`) so no promotion
-    # can skip the process-boundary restart proof.
+    # TD-CITIER-1: path-scoped on feat->develop (widened filter).
+    # TD-CI-8 #2 (2026-11-21): the promotion arm is GONE — at develop->qa and
+    # qa->main the process-boundary restart proof (server restarts on Azure
+    # AND S3, strictly more than this job's Azure-only arm, PLUS the four
+    # TD-CACHE-7 lib contracts moved intact) runs in qa-gate's
+    # `objstore-restart-qa-tier`, which is REQUIRED via the `QA Gate Success`
+    # aggregate (branch protection flipped 2026-11-21). Running both compiled
+    # the azure/cloud-full server graphs twice per promotion. This job now
+    # exists for the feat->develop early proof only, gated on the restart
+    # path filter.
     if: |
       !inputs.skip_tests &&
       needs.changes.outputs.test_tier == 'true' &&
-      (needs.changes.outputs.medium_tier == 'true' ||
-       needs.changes.outputs.object_store_restart_changes == 'true') &&
+      needs.changes.outputs.object_store_restart_changes == 'true' &&
       !contains(needs.changes.outputs.reused, ',object-store-restart-recovery,')
     # Job-level CARGO_*/RUST* env is folded into the rust-cache key, so it lives
     # on the build steps instead: a job-level value would give this job a
