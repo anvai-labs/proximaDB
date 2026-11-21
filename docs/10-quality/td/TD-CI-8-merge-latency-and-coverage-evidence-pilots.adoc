@@ -155,6 +155,17 @@ classified every overlap candidate as STRICTLY-SUBSUMED, PARTIAL-OVERLAP, or DIS
   release link/codegen proof runs at qa→main before the release cut.
 * **#6 rust-affected-fast — ALREADY SATISFIED.** The lane early-exits when no
   eligible leaf crate changed (`exit 0` on empty selection); no edit needed.
+* **Pilot 3 — DONE (2026-11-21):** clean qa-gate dispatch (run
+  44876346830, ~95 min, all jobs green — also the aggregate's first runtime
+  validation: guards correctly skipped on dispatch, `QA Gate Success` green)
+  seeded `rust:proximadb = 65.7` into COVERAGE_BASELINE.json (sdk entry
+  preserved). The ratchet flipped REQUIRED: `continue-on-error` removed, the
+  aggregate's hard gate names its failure+cancelled, and the wiring guard
+  pins the former-advisory split (`ADVISORY_JOBS` emptied; new
+  `test_formerly_advisory_jobs_are_now_required`). Below-target is a WARNING
+  for baselined components, so 65.7 gates as a floor of 65.2 (tolerance 0.5)
+  and ratchets up over time. Negative controls verified: at-seed PASS,
+  −0.7% FAIL. Duplicate Tarpaulin build already retired (#2548).
 * **Pilot 4 slice 1 — DONE (2026-11-21):** qa-gate.yml gained a
   `qa-gate-summary` aggregate (context **"QA Gate Success"**) requiring every
   qa-gate job green (skipped⇒pass), with the coverage ratchet advisory
