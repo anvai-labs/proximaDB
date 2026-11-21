@@ -176,13 +176,19 @@ classified every overlap candidate as STRICTLY-SUBSUMED, PARTIAL-OVERLAP, or DIS
   window — until that flip, the aggregate is a shadow. **#2 restart
   subsumption is now UNBLOCKED once the protection flip is verified.**
 
-* **#2 restart subsumption — BLOCKED, precondition FALSE.** Branch protection on
-  `qa`/`main` requires ONLY `CI Success` (`contexts: ["CI Success"]`) — qa-gate's
-  jobs are NOT individually required, contradicting the census premise. Moving
-  the restart proof from ci.yml (inside the required aggregate) to qa-gate
-  (unrequired) would WEAKEN the gate. New precondition: qa-gate needs a required
-  aggregate check wired into branch protection — belongs to Pilot 4's "one
-  required summary per promotion". Do NOT subsume until that exists.
+* **#2 restart subsumption — DONE (2026-11-21), precondition satisfied first.**
+  The protection flip (#2550) made qa-gate's `objstore-restart-qa-tier`
+  REQUIRED; ci.yml's restart job dropped its medium-tier arm (feat→develop
+  path-gated early proof only), and the qa `--qa` scope absorbed the four
+  TD-CACHE-7/spill lib contracts INTACT — same `--features azure`, same
+  ignored-only selection, same adls:// endpoint family (census correction:
+  the "near-free incremental" claim was wrong — lib-test is a distinct
+  codegen unit, the real cost is one azure lib-test build per qa run,
+  recorded against TD-OBJSTORE-5's budget ratchet). Net ~100
+  runner-min/develop→qa. The original ~130-min estimate overstated ci.yml's
+  azure arm saving; the qa scope's growth is accounted above. **BLOCKED
+  period (2026-11-20 → 2026-11-21):** precondition was false until the
+  protection flip (see the finding under the decision table).
 * **#4 coverage-on-python-test — OPEN**, gated on a denominator-parity
   validation run (ratchet exclusions must reproduce the committed 80.0 baseline
   within tolerance).
