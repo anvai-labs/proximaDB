@@ -5,7 +5,7 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | **Open, HIGH (filed 2026-11-12).** Found by the #2521 adversarial review round 4 and demonstrated there. Pre-existing on develop. Next PR after #2521.
+| Status | **Scoping + serialization RESOLVED (2026-11-13); physical GC still open.** Found by the #2521 adversarial review round 4 (demonstrated there; pre-existing on develop). Fix shape steps 1-2 and the `do_compact` invalidation are done (see Resolution). Steps 3-4 (crash-safe delete ordering, re-enabling GC) are the next PR.
 | Invariant | CLAUDE.md co-design mandate #3 / path isolation: every object-storage write lands under `DrPathBuilder` (`data/{tenant}/{namespace}/...`), and isolation is structural, never a per-query predicate.
 | Severity | Cross-tenant data movement on every HELIX L0 compaction. The data is not destroyed today, but it is moved out of its own collection's directory.
 |===
@@ -54,3 +54,54 @@ a compaction reads or where it writes.
 
 Acceptance: a two-collection, two-tenant seam test where compacting A never reads,
 moves or deletes B's files, plus the GC tests from the #2521 round-3 design.
+
+== Resolution (steps 1-2)
+
+* `compaction::owns_sstable(data_dir, path)` compares the **canonical** parent
+  directory (`canonical_location`: strip `file://`, absolutize relative paths, fold
+  the `adls`/`abfs`/`azure` aliases to `az` and `gcs` to `gs`, drop `.` components).
+  `owned()` dedupes by canonical path, `retain_unconsumed` and the L0 trigger match
+  canonically, version-resolution scope is canonical, and the compaction guard is
+  keyed canonically. Rediscovered
+  SSTables come back as absolute `file://` URLs, while the default storage URL is
+  the relative `file://./data`. A raw comparison made every rediscovered file "not
+  owned", so that collection never compacted again (#2530 review HIGH-1). Every compaction path (L0->L1, level->next, max-level recluster)
+  selects only its own collection's files.
+* `should_compact` counts only the triggering collection's L0 files.
+* A per-collection compaction guard (`HelixEngine::compaction_guards`): the
+  flush-triggered task `try_lock`s and skips while one runs; `do_compact` waits.
+* `do_compact` invalidates only its own collection's L0/L1 entries. It used to call
+  `remove(&0)` / `remove(&1)` over every collection; the structural guard test now
+  scans `helix/mod.rs` too.
+* Seam test `compaction_never_reads_moves_or_deletes_another_collections_files`
+  (both L0 paths). Negative control: selecting the whole level compacts 8 files
+  instead of A's 4 and fails it.
+
+== Still shared across collections (same root cause; found by the #2530 review; not fixed here)
+
+* **`pca_model` is one engine-wide model.** Collection B reuses A's in-memory PCA
+  model: wrong pruning, `transform` errors when dimensions differ, and B's model is
+  never persisted.
+* **Query-optimizer result cache: no cross-tenant leak (refuted 2026-11-13).** The
+  search path builds a fresh `HelixEngine` per `CollectionObjectId`
+  (`VectorOperationsService::engine_cache` -> `StorageFormatFactory::create_from_proto_async`
+  -> `HelixEngine::new()`), so each instance's cache serves exactly one collection.
+  It is still not invalidated by writes, because flushes run on a different
+  instance. An empirical probe (flush a new exact match after warming the query)
+  found the new record, so staleness did not reproduce end to end.
+* **Search's level cache is never refreshed by flushes (load-bearing workaround).**
+  Flushes register SSTables in the FLUSH path's shared engine instance, not in the
+  per-collection search instance. For `file://` data dirs, search's string
+  `starts_with` cache check never matches, so every search rediscovers from the
+  directory listing. That accident is what keeps search fresh: a #2530 attempt to
+  "fix" the match made HELIX overwrite-then-expire resurface (the conformance
+  matrix caught it), and it was reverted. Plain-path data dirs DO hit that cache
+  and can serve a stale file list (pre-existing). The real fix is for search to
+  refresh its level map from flushes (shared registry, or invalidate on flush),
+  after which the match can become `owns_sstable`.
+* **Search's per-collection filter is a string `starts_with`** (see above). Discovery
+  now dedupes by canonical path (#2530), so the level map no longer grows by one copy
+  per search.
+* `compaction_guards` gains one entry per collection and never shrinks (small;
+  bounded by the number of collections ever seen).
+* A skipped flush trigger leaves >= 4 L0 files until that collection's next flush.
