@@ -189,9 +189,21 @@ classified every overlap candidate as STRICTLY-SUBSUMED, PARTIAL-OVERLAP, or DIS
   azure arm saving; the qa scope's growth is accounted above. **BLOCKED
   period (2026-11-20 → 2026-11-21):** precondition was false until the
   protection flip (see the finding under the decision table).
-* **#4 coverage-on-python-test — OPEN**, gated on a denominator-parity
-  validation run (ratchet exclusions must reproduce the committed 80.0 baseline
-  within tolerance).
+* **#4 coverage-on-python-test — REJECTED (2026-11-21), experiment recorded.**
+  Local parity experiment (isolated venv; Run A = current single-process
+  ratchet semantics: 4,905 passed / 1 failed, 3m14s; Run B = per-file
+  COVERAGE_FILE + combine): (a) pytest-cov's engine does NOT honor per-file
+  COVERAGE_FILE — `coverage combine` received zero data files, so the
+  proposed mechanism needs different engineering (parallel=true suffixing or
+  xdist-style distributed coverage); (b) 11 test files FAIL under the
+  ratchet's env (PROXIMADB_TEST_FORCE_FALLBACK_EMBEDDINGS + marker filters)
+  in per-file isolation while passing in python-test's own per-file loop —
+  riding coverage on python-test couples pass/fail sets and the coverage
+  denominator to instrumentation in exactly the way the separate-jobs design
+  avoids. The ~6-min/Python-PR saving does not justify that coupling; the
+  separate sdk-coverage-ratchet job stays. This CLOSES the owner-decision
+  table: 1/3/5 landed (#2548), 2 landed (#2555), 4 rejected with data,
+  6 already satisfied.
 
 
 |===
