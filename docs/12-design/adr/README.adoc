@@ -2,7 +2,7 @@
 :toc: left
 :icons: font
 :last-updated: 2026-07-21
-// status-as-of: 2026-09-21
+// status-as-of: 2026-11-21
 
 [.lead]
 This directory contains Architecture Decision Records (ADRs) governing ProximaDB's implementation across all open issues (#25-#61). Each ADR defines canonical contracts, interfaces, and file plans that implementation must follow.
