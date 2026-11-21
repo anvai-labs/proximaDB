@@ -510,6 +510,23 @@ impl FilesystemFactory {
         }
     }
 
+    /// Test-only: replace the `scheme` backend with `wrap(backend)` (e.g. a
+    /// range-recording decorator), below every decorator `get_filesystem`
+    /// stacks on top. Must be called before any I/O.
+    #[cfg(test)]
+    pub fn wrap_test_backend(
+        &mut self,
+        scheme: &str,
+        wrap: impl FnOnce(Arc<dyn FileSystem>) -> Arc<dyn FileSystem>,
+    ) {
+        if let Some(inner) = self.filesystems.remove(scheme) {
+            self.filesystems.insert(scheme.to_string(), wrap(inner));
+        }
+        if let Ok(mut memo) = self.wrapper_memo.lock() {
+            memo.clear();
+        }
+    }
+
     /// Initialize all configured filesystem backends
     async fn initialize_filesystems(&mut self) -> FsResult<()> {
         // Initialize local filesystem with root directory resolution

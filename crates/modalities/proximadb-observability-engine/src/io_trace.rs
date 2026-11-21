@@ -225,6 +225,13 @@ pub struct IoTrace {
     /// `get_ops`/`bytes_read` as unfetched reads.
     pax_footer_total_blocks: AtomicU64,
     pax_footer_pruned_blocks: AtomicU64,
+    /// ADR-042 / TD-PAXMETA-1: a filtered query planned on the collection
+    /// segment directory's per-block prune statistics — segments planned,
+    /// segments skipped (no block can match), and blocks considered / pruned.
+    pax_directory_segments_planned: AtomicU64,
+    pax_directory_segments_pruned: AtomicU64,
+    pax_directory_blocks_total: AtomicU64,
+    pax_directory_blocks_pruned: AtomicU64,
     /// General bounded-concurrent `read_ranges` metrics (TD-RDSTRAT-12).
     /// Populated by any `read_ranges` or `read_ranges_prefetch` call with
     /// `parallel > 1` / `inflight > 1`. Unlike IVF-specific fields, these
@@ -920,6 +927,24 @@ impl IoTrace {
             .fetch_add(pruned, Ordering::Relaxed);
     }
 
+    /// ADR-042 / TD-PAXMETA-1: record a filtered query's directory plan.
+    pub fn record_pax_directory_filter_prune(
+        &self,
+        segments_planned: u64,
+        segments_pruned: u64,
+        blocks_total: u64,
+        blocks_pruned: u64,
+    ) {
+        self.pax_directory_segments_planned
+            .fetch_add(segments_planned, Ordering::Relaxed);
+        self.pax_directory_segments_pruned
+            .fetch_add(segments_pruned, Ordering::Relaxed);
+        self.pax_directory_blocks_total
+            .fetch_add(blocks_total, Ordering::Relaxed);
+        self.pax_directory_blocks_pruned
+            .fetch_add(blocks_pruned, Ordering::Relaxed);
+    }
+
     /// Record a general bounded-concurrent `read_ranges` outcome (TD-RDSTRAT-12):
     /// `fetch_rounds` = number of parallel rounds issued, `max_inflight` = peak
     /// in-flight reads in any round. Covers ALL ranged-read paths (footer fetches,
@@ -1210,6 +1235,14 @@ impl IoTrace {
             ivf_region_b_bytes: self.ivf_region_b_bytes.load(Ordering::Relaxed),
             pax_footer_total_blocks: self.pax_footer_total_blocks.load(Ordering::Relaxed),
             pax_footer_pruned_blocks: self.pax_footer_pruned_blocks.load(Ordering::Relaxed),
+            pax_directory_segments_planned: self
+                .pax_directory_segments_planned
+                .load(Ordering::Relaxed),
+            pax_directory_segments_pruned: self
+                .pax_directory_segments_pruned
+                .load(Ordering::Relaxed),
+            pax_directory_blocks_total: self.pax_directory_blocks_total.load(Ordering::Relaxed),
+            pax_directory_blocks_pruned: self.pax_directory_blocks_pruned.load(Ordering::Relaxed),
             read_ranges_fetch_rounds: self.read_ranges_fetch_rounds.load(Ordering::Relaxed),
             read_ranges_max_inflight: self.read_ranges_max_inflight.load(Ordering::Relaxed),
             tier_get_ops: std::array::from_fn(|i| self.tier_get_ops[i].load(Ordering::Relaxed)),
@@ -1349,6 +1382,17 @@ pub struct IoTraceSnapshot {
     pub pax_footer_total_blocks: u64,
     #[serde(default)]
     pub pax_footer_pruned_blocks: u64,
+    /// ADR-042 / TD-PAXMETA-1: filtered-query segment-directory plan —
+    /// segments planned / skipped (no block can match) and blocks
+    /// considered / pruned by the directory's per-block prune statistics.
+    #[serde(default)]
+    pub pax_directory_segments_planned: u64,
+    #[serde(default)]
+    pub pax_directory_segments_pruned: u64,
+    #[serde(default)]
+    pub pax_directory_blocks_total: u64,
+    #[serde(default)]
+    pub pax_directory_blocks_pruned: u64,
     /// General bounded-concurrent `read_ranges` metrics (TD-RDSTRAT-12).
     /// Populated by any `read_ranges` or `read_ranges_prefetch` call with
     /// `parallel > 1` / `inflight > 1`. Unlike IVF-specific fields, these
@@ -1746,6 +1790,25 @@ pub fn record_pax_region_bytes(region_a: u64, region_b: u64) {
 /// See [`IoTrace::record_pax_footer_prune`].
 pub fn record_pax_footer_prune(total: u64, pruned: u64) {
     let _ = IO_TRACE.try_with(|t| t.record_pax_footer_prune(total, pruned));
+}
+
+/// ADR-042 / TD-PAXMETA-1: record a filtered query's segment-directory plan
+/// for the active query. No-ops outside a query scope. See
+/// [`IoTrace::record_pax_directory_filter_prune`].
+pub fn record_pax_directory_filter_prune(
+    segments_planned: u64,
+    segments_pruned: u64,
+    blocks_total: u64,
+    blocks_pruned: u64,
+) {
+    let _ = IO_TRACE.try_with(|t| {
+        t.record_pax_directory_filter_prune(
+            segments_planned,
+            segments_pruned,
+            blocks_total,
+            blocks_pruned,
+        )
+    });
 }
 
 /// Record general bounded-concurrent `read_ranges` metrics for the active query

@@ -1845,14 +1845,17 @@ impl SstEngine {
         // planned here too (the P5b gate run found every "directory on" query
         // on this path with the directory dark). Same preconditions and the
         // same per-segment scope as `fallback_to_direct_search_arc`.
+        // ADR-042: a filtered query plans on the directory's per-block prune
+        // stats instead (segments no block of which can match are skipped).
         let directory_cells = self
-            .centroid_directory_cells(
+            .directory_choices(
                 storage_url,
                 &sstable_files,
                 query_vector,
                 k,
                 distance_metric,
-                filter_expression.is_some() || prune_config.force_exact,
+                filter_expression,
+                prune_config.force_exact,
             )
             .await;
         let sstable_files: Vec<DiscoveredSstFile> = sstable_files
@@ -1860,7 +1863,7 @@ impl SstEngine {
             .filter(|f| {
                 directory_cells
                     .get(&f.url)
-                    .is_none_or(|c| !c.cells.is_empty())
+                    .is_none_or(|c| c.keeps_segment())
             })
             .collect();
         let discovery_us = discovery_start.elapsed().as_micros() as u64;
@@ -2541,6 +2544,96 @@ self.try_pax_cascade(
         Ok(())
     }
 
+    /// The collection segment directory's per-segment choices for one query,
+    /// keyed by segment URL (empty map = unused): the ADR-042 filtered plan
+    /// for a filtered query, the TD-PAXDIR-1 D2 A0 cell choice otherwise.
+    /// Segments whose choice does not keep them are skipped with zero reads.
+    pub(crate) async fn directory_choices(
+        &self,
+        storage_url: &str,
+        files: &[DiscoveredSstFile],
+        query: &[f32],
+        k: usize,
+        distance_metric: DistanceMetric,
+        filter_expression: Option<&FilterExpression>,
+        force_exact: bool,
+    ) -> std::collections::HashMap<
+        String,
+        std::sync::Arc<crate::storage::engines::sst::centroid_directory_reader::DirectoryChoice>,
+    > {
+        match filter_expression {
+            Some(filter) => {
+                self.filtered_directory_choices(storage_url, files, filter)
+                    .await
+            }
+            None => {
+                self.centroid_directory_cells(
+                    storage_url,
+                    files,
+                    query,
+                    k,
+                    distance_metric,
+                    force_exact,
+                )
+                .await
+            }
+        }
+    }
+
+    /// ADR-042 / TD-PAXMETA-1: plan a FILTERED query on the collection segment
+    /// directory's per-block prune statistics
+    /// ([`reader::plan_filtered_segments`]). Unused (empty map) unless both
+    /// directory read gates are on and the prune-stats kill switch
+    /// (`PROXIMADB_PAX_READ_BLOCK_PRUNE_STATS_DISABLE`) is unset. Skipping a
+    /// segment is sound on every scan route (cascade or exact): a segment
+    /// with no block that can match contributes no row, exactly as an empty
+    /// Stage-F allow-set or the exact path's per-record filter would.
+    async fn filtered_directory_choices(
+        &self,
+        storage_url: &str,
+        files: &[DiscoveredSstFile],
+        filter: &FilterExpression,
+    ) -> std::collections::HashMap<
+        String,
+        std::sync::Arc<crate::storage::engines::sst::centroid_directory_reader::DirectoryChoice>,
+    > {
+        use crate::storage::engines::sst::centroid_directory_reader as reader;
+        if !(reader::centroid_directory_read_enabled()
+            && reader::directory_decode_keys_read_enabled()
+            && crate::storage::engines::sst::segment_format::block_prune_stats_read_enabled())
+        {
+            return Default::default();
+        }
+        let Ok(fs) = self.filesystem().get_filesystem(storage_url) else {
+            return Default::default();
+        };
+        let Some(dir) = reader::load_directory(fs.as_ref(), storage_url).await else {
+            return Default::default();
+        };
+        let (choices, counts) = reader::plan_filtered_segments(
+            &dir,
+            files
+                .iter()
+                .map(|f| (f.url.as_str(), f.size_bytes, f.etag.as_deref())),
+            filter,
+        );
+        crate::observability::io_trace::record_pax_directory_filter_prune(
+            counts.segments_planned,
+            counts.segments_pruned,
+            counts.blocks_total,
+            counts.blocks_pruned,
+        );
+        tracing::debug!(
+            storage_url,
+            segments_planned = counts.segments_planned,
+            segments_pruned = counts.segments_pruned,
+            blocks_total = counts.blocks_total,
+            blocks_pruned = counts.blocks_pruned,
+            "ADR-042: filtered query planned on the segment directory"
+        );
+        choices
+    }
+
     /// TD-PAXDIR-1 D2: the collection centroid directory's per-segment A0
     /// cell choice for this query, keyed by segment URL (empty map = unused).
     ///
@@ -2683,20 +2776,22 @@ self.try_pax_cascade(
             .await?;
         // TD-PAXDIR-1 D2: segments the collection centroid directory plans
         // carry their selected A0 cells; those that own none are skipped.
+        // ADR-042: a filtered query plans on the directory's prune stats.
         let directory_cells = self
-            .centroid_directory_cells(
+            .directory_choices(
                 storage_url,
                 &sstable_files,
                 query_vector,
                 k,
                 distance_metric,
-                filter_expression.is_some() || prune_config.force_exact,
+                filter_expression,
+                prune_config.force_exact,
             )
             .await;
         sstable_files.retain(|f| {
             directory_cells
                 .get(&f.url)
-                .is_none_or(|c| !c.cells.is_empty())
+                .is_none_or(|c| c.keeps_segment())
         });
 
         let file_count = u16::try_from(sstable_files.len()).unwrap_or(u16::MAX);

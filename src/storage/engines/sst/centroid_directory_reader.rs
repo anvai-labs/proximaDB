@@ -27,6 +27,18 @@
 //! rebuilds its header, Region A0, Region-A header and ANN footer from the
 //! directory on an invariants-cache miss, so its first read is its probed
 //! cells ([`DirectoryChoice::decode_invariants`]).
+//!
+//! ADR-042 / TD-PAXMETA-1 (filtered queries, [`plan_filtered_segments`]): a
+//! FILTERED query on a segment whose v3 entry matches the listing's `(size,
+//! ETag)` binding evaluates the entry's per-block prune statistics in RAM. A
+//! segment none of whose blocks can match is skipped with zero reads; a
+//! surviving segment's Stage F takes its block table, shred field map and
+//! surviving blocks from the entry (no header or footer read) and fetches only
+//! the surviving blocks, and its cascade and rehydration take their metadata
+//! from the decode key exactly as a D6-planned segment does. Gates: both read
+//! gates above, and `PROXIMADB_PAX_READ_BLOCK_PRUNE_STATS_DISABLE` (unset ⇒
+//! on; truthy ⇒ filtered queries never use the directory, the pre-ADR-042
+//! path).
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
@@ -67,6 +79,22 @@ pub(crate) struct DirectoryChoice {
     /// offset), handed to this query's rehydration so the rows cost one wave.
     /// Lives as long as the query's choice; rehydration takes what it uses.
     blocks: Mutex<HashMap<u64, Arc<[u8]>>>,
+    /// ADR-042: set on a FILTERED query's choice (whose `cells` are empty and
+    /// unused — the filtered coarse probe ranks its own A0).
+    filtered: Option<FilteredSegmentPlan>,
+}
+
+/// ADR-042 / TD-PAXMETA-1: one segment's part of a filtered query planned on
+/// the directory's per-block prune statistics.
+#[derive(Debug)]
+pub(crate) struct FilteredSegmentPlan {
+    /// The footer Stage F needs, rebuilt from the decode key (block table,
+    /// shred field map, prune stats). Never the segment's own footer.
+    pub(crate) footer: proximadb_storage_common::segment_layout::SegmentFooterIndex,
+    /// The segment carries Region E, which the directory does not describe.
+    pub(crate) has_filter_region: bool,
+    /// Blocks the prune stats keep (every block when the entry has none).
+    pub(crate) candidate_blocks: Vec<usize>,
 }
 
 impl DirectoryChoice {
@@ -77,13 +105,16 @@ impl DirectoryChoice {
     /// to the invariants cache.
     pub(crate) fn decode_invariants(&self) -> Option<SegmentInvariants> {
         let (dir, idx) = self.decode.as_ref()?;
-        match dir.segment_decode(*idx) {
+        // An uncovered keyed entry (ADR-042 filtered plans only) has no A0:
+        // its header and footer come from the key, Region A is read as usual.
+        match dir.segment_metadata_decode(*idx) {
             Ok(d) => Some(SegmentInvariants {
                 header_bytes: d.header_prefix,
                 region_bytes: None,
                 footer_bytes: d.ann_footer,
-                a0_bytes: Some(Arc::from(d.a0)),
-                rabitq_header_bytes: Some(Arc::from(d.rabitq_header)),
+                a0_bytes: (!d.a0.is_empty()).then(|| Arc::from(d.a0)),
+                rabitq_header_bytes: (!d.rabitq_header.is_empty())
+                    .then(|| Arc::from(d.rabitq_header)),
             }),
             Err(error) => {
                 tracing::debug!(%error, "decode key unusable; reading segment metadata");
@@ -102,6 +133,110 @@ impl DirectoryChoice {
     pub(crate) fn take_block(&self, offset: u64) -> Option<Arc<[u8]>> {
         lock(&self.blocks).remove(&offset)
     }
+
+    /// ADR-042: the filtered plan, when this is a filtered query's choice.
+    pub(crate) fn filtered(&self) -> Option<&FilteredSegmentPlan> {
+        self.filtered.as_ref()
+    }
+
+    /// Whether the query scans this segment at all: an unfiltered choice
+    /// with no selected cell, or a filtered one with no surviving block, is
+    /// skipped with zero reads.
+    pub(crate) fn keeps_segment(&self) -> bool {
+        match &self.filtered {
+            Some(plan) => !plan.candidate_blocks.is_empty(),
+            None => !self.cells.is_empty(),
+        }
+    }
+}
+
+/// Outcome of [`plan_filtered_segments`] for the query-scoped I/O trace.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FilteredPlanCounts {
+    /// Segments planned on the directory (entry valid and carrying facts).
+    pub(crate) segments_planned: u64,
+    /// Planned segments skipped because no block can match.
+    pub(crate) segments_pruned: u64,
+    /// Blocks of planned segments, and those the prune stats dropped.
+    pub(crate) blocks_total: u64,
+    pub(crate) blocks_pruned: u64,
+}
+
+/// ADR-042 / TD-PAXMETA-1: plan a FILTERED query on the directory. Every
+/// discovered segment whose entry carries a v3 decode key matching the
+/// listing's `(size, ETag)` binding gets a choice: the blocks its prune
+/// statistics keep for `filter` (all blocks when the entry has no stats), and
+/// — when the segment is larger than the cold prefix read, as for D6 — its
+/// decode key for the cascade's metadata. Segments absent from the map keep
+/// the per-segment path (stale, missing, v2 or unkeyed entries).
+pub(crate) fn plan_filtered_segments<'a>(
+    dir: &Arc<PaxCentroidDirectory>,
+    files: impl IntoIterator<Item = (&'a str, Option<u64>, Option<&'a str>)>,
+    filter: &proximadb_filter_expression::FilterExpression,
+) -> (HashMap<String, Arc<DirectoryChoice>>, FilteredPlanCounts) {
+    let by_name: HashMap<&str, usize> = dir
+        .segments
+        .iter()
+        .enumerate()
+        .map(|(idx, s)| (s.name.as_str(), idx))
+        .collect();
+    let mut counts = FilteredPlanCounts::default();
+    let mut out = HashMap::new();
+    for (url, size, etag) in files {
+        let Some(&idx) = by_name.get(object_name(url)) else {
+            continue;
+        };
+        let entry = &dir.segments[idx];
+        if !entry.key_matches_listing(size, etag) {
+            continue;
+        }
+        let Some(key) = entry.decode_key.as_ref() else {
+            continue;
+        };
+        let footer = match key.filtered_footer() {
+            Ok(Some(footer)) => footer,
+            Ok(None) => continue, // a v2 key: no facts
+            Err(error) => {
+                tracing::debug!(%error, url, "filter facts unusable; per-segment path");
+                continue;
+            }
+        };
+        let has_filter_region = key
+            .filter_facts
+            .as_ref()
+            .is_some_and(|facts| facts.has_filter_region);
+        let candidate_blocks: Vec<usize> = (0..footer.blocks.len())
+            .filter(|&b| {
+                footer
+                    .block_prune_stats
+                    .as_ref()
+                    .is_none_or(|stats| stats.block_may_match(b, filter))
+            })
+            .collect();
+        counts.segments_planned += 1;
+        counts.blocks_total += footer.blocks.len() as u64;
+        counts.blocks_pruned += (footer.blocks.len() - candidate_blocks.len()) as u64;
+        if candidate_blocks.is_empty() {
+            counts.segments_pruned += 1;
+        }
+        let decode = size
+            .is_some_and(|size| !prefix_read_covers_segment(size))
+            .then(|| (Arc::clone(dir), idx));
+        out.insert(
+            url.to_owned(),
+            Arc::new(DirectoryChoice {
+                cells: Arc::from(Vec::new()),
+                decode,
+                blocks: Mutex::default(),
+                filtered: Some(FilteredSegmentPlan {
+                    footer,
+                    has_filter_region,
+                    candidate_blocks,
+                }),
+            }),
+        );
+    }
+    (out, counts)
 }
 
 /// Collection directories whose parsed centroid directory stays cached. Each
@@ -297,6 +432,7 @@ pub(crate) fn plan_segments<'a>(
                             cells,
                             decode,
                             blocks: Mutex::default(),
+                            filtered: None,
                         }),
                     )
                 })

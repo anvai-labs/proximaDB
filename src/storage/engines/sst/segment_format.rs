@@ -1183,6 +1183,16 @@ proximadb_config::env_kill_switch! {
     pub(crate) fn pax_filtered_cascade_enabled() { gate: "PROXIMADB_PAX_FILTERED_CASCADE", default: true }
 }
 
+/// ADR-042 / TD-PAXMETA-1 kill switch for the per-block prune statistics:
+/// unset ⇒ ON. Truthy (`1|true|on|yes`) disables BOTH uses — filtered
+/// queries are never planned on the collection segment directory (no segment
+/// skip, no footer-less Stage F, no directory metadata for a filtered
+/// cascade) and Stage F ignores the footer's prune-stats section — which is
+/// exactly the pre-ADR-042 filtered path. Not memoized (tests flip it).
+pub(crate) fn block_prune_stats_read_enabled() -> bool {
+    !proximadb_config::env_flag_now("PROXIMADB_PAX_READ_BLOCK_PRUNE_STATS_DISABLE")
+}
+
 /// Stage-F observability counters (ADR-089 P1): what the metadata pre-stage
 /// pruned and matched, per segment.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1196,6 +1206,12 @@ pub(crate) struct FilteredRowAllowStats {
     /// stats — no body GET at all (the zero-GET win). A subset-by-mechanism of
     /// `blocks_total`, disjoint from `blocks_pruned`.
     pub blocks_pruned_footer: usize,
+    /// ADR-042: of `blocks_pruned_footer`, the blocks the per-block prune
+    /// statistics (footer section 9 / directory v3) ruled out.
+    pub blocks_pruned_stats: usize,
+    /// ADR-042: the block table, shred map and prune stats came from the
+    /// collection segment directory — no header or footer was read.
+    pub from_directory: bool,
     pub rows_matched: usize,
     /// TD-FPRUNE-1 PR-E: the allow-set came from Region E (filter columns),
     /// not from decoding Region D.
@@ -1233,8 +1249,12 @@ pub(crate) async fn pax_filtered_row_allow(
 
     // 1–2. Header prefix + footer. PR-D L1b: a warm invariants-cache entry
     // (admitted by the cascade, same segment) supplies both with no request
-    // at all; cold, the listed size skips the HEAD. A directory-decoded
-    // footer is never used here — it is ANN-only (no shred map / stats).
+    // at all; cold, the listed size skips the HEAD. The ANN-only D6 decoded
+    // footer is never used here (no shred map / stats); ADR-042: a filtered
+    // directory plan supplies a footer that DOES carry them (block table,
+    // shred map, prune stats), so a cold directory-covered segment reads
+    // neither header nor footer — unless it has a Region E to answer from,
+    // which only its own footer locates.
     let cached = match cache {
         Some(cache) => cache.get_or_promote(path).await.value(),
         None => None,
@@ -1244,8 +1264,14 @@ pub(crate) async fn pax_filtered_row_allow(
         (inv.footer_bytes.len() as u64 == header.footer_len)
             .then(|| (header, inv.footer_bytes.clone()))
     });
-    let (header, footer_bytes) = if let Some(layout) = cached_layout {
-        layout
+    let directory_footer = directory_filtered_choice().and_then(|choice| {
+        let plan = choice.filtered()?;
+        (!(plan.has_filter_region && filter_region_read_enabled())).then(|| plan.footer.clone())
+    });
+    let (header, footer) = if let Some((header, footer_bytes)) = cached_layout {
+        (Some(header), SegmentFooterIndex::parse(&footer_bytes)?)
+    } else if let Some(footer) = directory_footer {
+        (None, footer)
     } else {
         let size = segment_size_or_stat(fs, path, known_size, "filtered stage-F").await?;
         if size < (SEG_HEADER_PREFIX_LEN as u64 + SEGMENT_MAGIC.len() as u64) {
@@ -1272,10 +1298,9 @@ pub(crate) async fn pax_filtered_row_allow(
             .await
             .map_err(|e| anyhow::anyhow!("filtered stage-F footer {path}: {e}"))?;
         record_get_physical(CacheTier::FilterRowAllow, header.footer_len, trace_on);
-        (header, footer_bytes)
+        (Some(header), SegmentFooterIndex::parse(&footer_bytes)?)
     };
     fetch_us += fetch_started.elapsed().as_micros() as u64;
-    let footer = SegmentFooterIndex::parse(&footer_bytes)?;
     // TD-FPRUNE-1 P2 engagement: resolve filter field names → PAX col-ids via
     // the segment's self-describing shred field-map (written from the P-Shred
     // spec) — user shreds only, see R5 below. This lets a USER-TAG filter (e.g.
@@ -1311,6 +1336,7 @@ pub(crate) async fn pax_filtered_row_allow(
     let mut allow = RowAllow::new(n_rows);
     let mut stats = FilteredRowAllowStats {
         blocks_total: footer.blocks.len(),
+        from_directory: header.is_none(),
         ..Default::default()
     };
 
@@ -1321,17 +1347,24 @@ pub(crate) async fn pax_filtered_row_allow(
     // A Region-E error (a corrupt chunk, a short read) falls through to the
     // Region-D path below — never to the whole-object exact scan, which an
     // immutable segment would then pay on every filtered query.
-    match stage_f_from_filter_region(
-        fs,
-        path,
-        filter,
-        &footer,
-        header.footer_off,
-        n_rows,
-        trace_on,
-    )
-    .await
-    {
+    // (A directory-planned Stage F has no header: it was only planned so
+    // when the segment has no Region E to use.)
+    let region_e = match header.as_ref() {
+        Some(header) => {
+            stage_f_from_filter_region(
+                fs,
+                path,
+                filter,
+                &footer,
+                header.footer_off,
+                n_rows,
+                trace_on,
+            )
+            .await
+        }
+        None => Ok(None),
+    };
+    match region_e {
         Ok(Some(region)) => {
             stats.rows_matched = region.rows_matched;
             stats.region_e = true;
@@ -1370,8 +1403,21 @@ pub(crate) async fn pax_filtered_row_allow(
         .iter()
         .map(|(idx, payload)| (*idx, payload.as_slice()))
         .collect();
+    // ADR-042: the per-block prune statistics (footer section 9, or the same
+    // table carried by the directory) — computed from each row's resolved
+    // filter literal, so they decide absent/null/typed rows exactly as the
+    // evaluator does. Kill switch: `PROXIMADB_PAX_READ_BLOCK_PRUNE_STATS_DISABLE`.
+    let prune_stats = footer
+        .block_prune_stats
+        .as_ref()
+        .filter(|_| block_prune_stats_read_enabled());
     let candidate_blocks: Vec<usize> = (0..footer.blocks.len())
         .filter(|&bi| {
+            if prune_stats.is_some_and(|table| !table.block_may_match(bi, filter)) {
+                stats.blocks_pruned_footer += 1;
+                stats.blocks_pruned_stats += 1;
+                return false;
+            }
             let Some(payload) = filterable_stats.get(&(bi as u32)).copied() else {
                 return true; // no footer stats → must fetch
             };
@@ -4260,6 +4306,15 @@ impl TopkHandoff {
     }
 }
 
+/// ADR-042: the directory choice of a FILTERED query's segment scan, when
+/// the scan runs inside one.
+fn directory_filtered_choice() -> Option<Arc<DirectoryChoice>> {
+    DIRECTORY_CHOICE
+        .try_with(Arc::clone)
+        .ok()
+        .filter(|choice| choice.filtered().is_some())
+}
+
 /// TD-PAXDIR-1 D6: this segment's metadata rebuilt from the directory's
 /// decode key, when the scan runs inside a directory scope that has one.
 fn directory_decoded_invariants() -> Option<SegmentInvariants> {
@@ -5320,9 +5375,12 @@ pub async fn rabitq_search_segment_coalesced_allowed(
     // cells. Unfiltered only, and never admitted to the cache: the rebuilt
     // footer carries only this cascade's fields.
     let mut directory_decoded = false;
+    // ADR-042: a FILTERED query's directory-planned segment (its choice is
+    // filtered — empty cells, so the filtered probe still ranks its own A0)
+    // takes the same decoded metadata: the cascade under an allow-set reads
+    // the same header/A0/Region-A header/footer fields as without one.
     let cached = invariant_lookup.value().or_else(|| {
-        let decoded = row_allow
-            .is_none()
+        let decoded = (row_allow.is_none() || directory_filtered_choice().is_some())
             .then(directory_decoded_invariants)
             .flatten()?;
         directory_decoded = true;
