@@ -155,6 +155,16 @@ classified every overlap candidate as STRICTLY-SUBSUMED, PARTIAL-OVERLAP, or DIS
   release link/codegen proof runs at qa→main before the release cut.
 * **#6 rust-affected-fast — ALREADY SATISFIED.** The lane early-exits when no
   eligible leaf crate changed (`exit 0` on empty selection); no edit needed.
+* **Pilot 4 slice 1 — DONE (2026-11-21):** qa-gate.yml gained a
+  `qa-gate-summary` aggregate (context **"QA Gate Success"**) requiring every
+  qa-gate job green (skipped⇒pass), with the coverage ratchet advisory
+  (failure non-blocking, cancelled gating) until Pilot 3 seeds the rust
+  baseline. Wiring pinned by `tests/scripts/test_qa_gate_summary.py`
+  (`make qa-gate-summary-check`, in work-commit-check). Branch protection on
+  qa/main updated to require `["CI Success", "QA Gate Success"]` in the same
+  window — until that flip, the aggregate is a shadow. **#2 restart
+  subsumption is now UNBLOCKED once the protection flip is verified.**
+
 * **#2 restart subsumption — BLOCKED, precondition FALSE.** Branch protection on
   `qa`/`main` requires ONLY `CI Success` (`contexts: ["CI Success"]`) — qa-gate's
   jobs are NOT individually required, contradicting the census premise. Moving

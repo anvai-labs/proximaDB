@@ -642,3 +642,67 @@ jobs:
             /tmp/llvm-cov.json
             rust-coverage-seed.json
           if-no-files-found: ignore
+
+  # ============================================================================
+  # ONE REQUIRED SUMMARY FOR THE PROMOTION TIER (TD-CI-8 Pilot 4 slice 1).
+  # Branch protection on qa/main requires only "CI Success" — qa-gate's jobs
+  # were never individually required (verified 2026-11-21 via the branches
+  # API), so a red conformance/restart/recall job could not block a promotion.
+  # This aggregate is the single context "QA Gate Success" that branch
+  # protection now requires alongside CI Success.
+  # Semantics (mirrors ci-success):
+  #   * every REQUIRED job: failure or cancelled -> RED; skipped (event-gated,
+  #     e.g. push-to-qa skips the pull_request-only guards) -> pass;
+  #   * rust-coverage-ratchet stays ADVISORY (continue-on-error until Pilot 3
+  #     seeds the rust baseline): its failure is reported in the summary but
+  #     does not gate; a CANCELLED coverage run still gates (a cancelled
+  #     promotion proves nothing).
+  qa-gate-summary:
+    name: QA Gate Success
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs:
+      - promotion-source-guard
+      - promotion-ancestry-guard
+      - pgwire-recall-tests
+      - sift-pax-recall
+      - objstore-restart-qa-tier
+      - mlflow-s3-artifact-seam
+      - cloud-emulator-object-store
+      - rust-coverage-ratchet
+    if: always()
+    steps:
+      - name: Require qa-gate jobs green (coverage advisory)
+        if: |-
+          needs.promotion-source-guard.result == 'failure' ||
+          needs.promotion-source-guard.result == 'cancelled' ||
+          needs.promotion-ancestry-guard.result == 'failure' ||
+          needs.promotion-ancestry-guard.result == 'cancelled' ||
+          needs.pgwire-recall-tests.result == 'failure' ||
+          needs.pgwire-recall-tests.result == 'cancelled' ||
+          needs.sift-pax-recall.result == 'failure' ||
+          needs.sift-pax-recall.result == 'cancelled' ||
+          needs.objstore-restart-qa-tier.result == 'failure' ||
+          needs.objstore-restart-qa-tier.result == 'cancelled' ||
+          needs.mlflow-s3-artifact-seam.result == 'failure' ||
+          needs.mlflow-s3-artifact-seam.result == 'cancelled' ||
+          needs.cloud-emulator-object-store.result == 'failure' ||
+          needs.cloud-emulator-object-store.result == 'cancelled' ||
+          needs.rust-coverage-ratchet.result == 'cancelled'
+        run: |
+          echo "::error::A required QA Gate job failed or was cancelled — blocking promotion."
+          {
+            echo "## QA Gate Summary"
+            echo ""
+            echo "❌ A required QA Gate job failed or was cancelled (coverage ratchet is advisory; a cancelled one still gates)."
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 1
+
+      - name: QA gate passed
+        run: |
+          {
+            echo "## QA Gate Summary"
+            echo ""
+            echo "✅ All required QA Gate jobs green."
+            echo "coverage-ratchet: ${{ needs.rust-coverage-ratchet.result }} (advisory — non-blocking until the rust baseline is seeded; TD-CI-8 Pilot 3)"
+          } >> "$GITHUB_STEP_SUMMARY"
