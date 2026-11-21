@@ -5,6 +5,7 @@
 
 pub mod auto_scheduler;
 pub mod bitmap;
+pub mod block_prune_stats;
 pub mod cache_config;
 pub mod centroid_directory;
 pub mod coarse_directory;
