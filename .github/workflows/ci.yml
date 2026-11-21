@@ -148,9 +148,11 @@ jobs:
       #     suites (TPC-H/TPC-DS over pgwire, ANN recall ratchets incl. the
       #     SIFT PAX N=10k ratchet in this file), and the specialised suites
       #     above run UNCONDITIONALLY (`medium_tier` bypasses their path filter).
-      #   * qa -> main = FULL (`extensive`): MEDIUM + docker-build, coverage,
+      #   * qa -> main = FULL (`extensive`): MEDIUM + docker-build,
       #     python multi-version, cross integration-test, benchmarks, CodeQL.
-      #     The heaviest, pre-promotion gate.
+      #     The heaviest, pre-promotion gate. (Rust coverage moved to qa-gate's
+      #     llvm-cov ratchet — TD-CI-8 #1: one metric, one instrumented build;
+      #     Tarpaulin retired.)
       # `test_tier` is true for base develop, qa, or main (and pushes to qa/main);
       # `extensive` is true only for base main (and pushes to main).
       # `medium_tier` is true for base qa or main (and pushes to qa/main) — i.e.
@@ -2434,7 +2436,13 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 75
     needs: [changes]
-    if: (needs.changes.outputs.rust == 'true' && needs.changes.outputs.medium_tier == 'true' && !inputs.skip_tests) && !contains(needs.changes.outputs.reused, ',rust-build-release,')
+    # TD-CI-8 #5: FULL-tier only — the artifact's sole consumer is
+    # `integration-test` (extensive), so at develop->qa this job built three
+    # release binaries nobody downloaded (30-60 runner-min per promotion).
+    # The qa-tier release-compile proof is intentionally dropped: type-level
+    # correctness is covered by check/clippy/tests/feature-matrix; the
+    # release link/codegen proof runs at qa->main, before the release cut.
+    if: (needs.changes.outputs.rust == 'true' && needs.changes.outputs.extensive == 'true' && !inputs.skip_tests) && !contains(needs.changes.outputs.reused, ',rust-build-release,')
     steps:
       - name: Job timing (start)
         run: echo "JOB_START_EPOCH=$(date -u +%s)" >> "$GITHUB_ENV"
@@ -3495,115 +3503,6 @@ jobs:
             echo "⏱️ job=$GITHUB_JOB wall=$(( $(date -u +%s) - JOB_START_EPOCH ))s (excludes queue time)" >> "$GITHUB_STEP_SUMMARY"
           fi
 
-  rust-coverage:
-    name: Code Coverage
-    runs-on: ubuntu-24.04
-    # FULL tier only (qa -> main). rust-test runs at the MEDIUM tier (qa), but
-    # coverage is expensive, so gate it to the main-promotion gate explicitly.
-    needs: [changes, rust-test]
-    # TD-CITIER-2: a `rust-test` SKIPPED because the reuse step proved it green
-    # on this exact tree must not silently skip coverage (a main-only extra)
-    # via the implicit success() of `needs`. Any other skip keeps the old
-    # behavior (skip with it).
-    if: >-
-      !cancelled() && needs.changes.result == 'success' &&
-      needs.changes.outputs.extensive == 'true' &&
-      (needs.rust-test.result == 'success' ||
-       (needs.rust-test.result == 'skipped' && contains(needs.changes.outputs.reused, ',rust-test,')))
-    continue-on-error: true
-    # 83 minutes then evicted mid-`Generate Coverage` with no logs uploaded on the
-    # v0.4.0 qa->main promotion -- the runner-OOM signature, not a coverage result.
-    # `cargo tarpaulin --lib` builds the `proximadb` lib-test target: cfg(test)
-    # over ~779k LOC and ~7,100 inline tests, which #1971 identified as the
-    # largest codegen unit in the workspace and fixed for three other jobs with
-    # exactly these three settings. ubuntu-24.04 (this job's runner) ships only
-    # ~2 GiB of swap (measured: 14 GiB total after this step adds 12), so a peak
-    # above ~18GB kills the runner instead of slowing down; debug info is the other
-    # dominant term in rustc peak memory, and nothing here reads a backtrace
-    # symbol. An earlier revision of this change instead removed the job from
-    # `ci-success.needs`, which was wrong twice over: the tiering comment at the
-    # top of this file names coverage as part of the FULL qa->main gate, and
-    # whether `continue-on-error` even lets the aggregator see a `failure` is
-    # unsettled -- so de-gating may have fixed nothing while quietly ensuring the
-    # job can never gate again. Fix the eviction, keep the gate.
-    timeout-minutes: 150
-    # was 120 against a measured 86-min step span (1.4x)
-    # RUSTC_WRAPPER/SCCACHE_DIR live on the cargo steps: job-level CARGO*/RUST*
-    # env is hashed into the rust-cache key (see the policy header). The
-    # CARGO_PROFILE_*_DEBUG=0 this job also set is the workflow-level default.
-    steps:
-      # ubuntu-24.04 ships only ~2 GiB of swap, so a residual peak above ~18GB kills the
-      # runner rather than slowing down. 12G on the big ephemeral /mnt disk,
-      # mirroring the three jobs #1971 fixed and the two that already had it.
-      - name: Add swap headroom
-        run: |
-          sudo fallocate -l 12G /mnt/swapfile-ci
-          sudo chmod 600 /mnt/swapfile-ci
-          sudo mkswap /mnt/swapfile-ci
-          sudo swapon /mnt/swapfile-ci
-          free -h
-      - uses: actions/checkout@v7
-      - uses: ./.github/actions/rust-setup
-        with:
-          shared-key: "dev-test"
-          save-if: false
-          add-job-id-key: false
-      - uses: mozilla-actions/sccache-action@v0.0.11
-      - uses: actions/cache@v6
-        with:
-          path: /home/runner/.cache/sccache
-          key: sccache-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: sccache-${{ runner.os }}-
-      - name: Install Dependencies
-        env:
-          RUSTC_WRAPPER: sccache
-          SCCACHE_DIR: /home/runner/.cache/sccache
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libssl-dev pkg-config protobuf-compiler
-          cargo install cargo-tarpaulin
-      - name: Generate Coverage
-        env:
-          RUSTC_WRAPPER: sccache
-          SCCACHE_DIR: /home/runner/.cache/sccache
-          CARGO_PROFILE_DEV_DEBUG: 0
-          # Serialize crate compilation: the root crate's instrumented test
-          # binary OOM-kills the 16GB runner (exit 143) during the build phase,
-          # before the `|| echo continuing` fallback can run. Same peak-rustc
-          # -memory issue mitigated in the unit-test job.
-          CARGO_BUILD_JOBS: 1
-        run: |
-          # Use --lib only and limit parallelism to avoid OOM on CI runners.
-          # The `--fail-under 60` result is NOT swallowed: a sub-floor or failed
-          # run fails the STEP (visible in the job result and run history). The
-          # job-level `continue-on-error` keeps it advisory at the workflow
-          # level until the llvm-cov pipeline (qa-gate rust-coverage-ratchet)
-          # seeds the Rust baseline — but an advisory check still has to RECORD
-          # its failure; `|| echo continuing` turned every below-floor run into
-          # a green step nobody could distinguish from a pass.
-          cargo tarpaulin --lib --timeout 600 \
-            --out xml --out html \
-            --output-dir coverage \
-            --skip-clean \
-            --jobs 2 \
-            --fail-under 60
-      - name: Upload Coverage Report
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: coverage-report
-          path: coverage/
-          retention-days: 30
-      - uses: codecov/codecov-action@v7
-        if: always()
-        with:
-          files: coverage/cobertura.xml
-          fail_ci_if_error: false
-      - name: sccache stats
-        env:
-          SCCACHE_DIR: /home/runner/.cache/sccache
-        run: sccache --show-stats || true
-
   # ============================================================================
   # PYTHON SDK TESTS
   # ============================================================================
@@ -4214,9 +4113,14 @@ jobs:
     # matched core_changes but not storage_changes and ran no ratchet) cannot
     # recur: every promotion is measured regardless of which paths moved. workflow_dispatch still runs it on
     # demand for a branch that wants the early signal.
+    # TD-CI-8 #3: promotion measurement deduplicated — qa-gate's
+    # `sift-pax-recall` (N=100k, 1000 queries, default floor 0.90 per the test
+    # harness) is a STRICTLY stronger ratchet than this job's 0.85@10k, so
+    # running both at develop->qa compiled the same release-shape binary twice
+    # for a weaker assertion. Dispatch-only now; the promotion ratchet lives
+    # in qa-gate.
     if: >
-      (github.event_name == 'workflow_dispatch' ||
-      needs.changes.outputs.medium_tier == 'true') &&
+      github.event_name == 'workflow_dispatch' &&
       !contains(needs.changes.outputs.reused, ',sift-recall-ratchet,')
     steps:
       - uses: actions/checkout@v7
@@ -4426,7 +4330,6 @@ jobs:
       - rust-build
       - rust-build-release
       - rust-test
-      - rust-coverage
       - rust-integration-test-storage
       - rust-integration-test-authz
       - rust-integration-test-query
