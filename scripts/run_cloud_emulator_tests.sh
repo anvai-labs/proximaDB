@@ -24,7 +24,9 @@
 #            Split the restart proof into CI steps. With no phase, run all steps.
 #   --sift-get-counts : ONLY Azurite, then the TD-PAXMETA-1 SIFT request-count
 #            harness (tests/sift_pax_recall_ratchet_test.rs, `sift_get_counts_*`)
-#            over adls:// with the flush-time directory publish OFF and ON.
+#            over adls:// with the flush-time directory publish OFF and ON
+#            (each test pins PROXIMADB_PAX_WRITE_DIRECTORY_AT_FLUSH=0/1 itself;
+#            the shipped default is ON, so OFF is the explicit kill switch).
 #            Deterministic per-query GET / range-GET / LIST / HEAD counts only —
 #            emulator latency is not evidence and is not reported. Needs
 #            PROXIMADB_SIFT_DATASET_DIR. Summary lines are appended (JSON lines)

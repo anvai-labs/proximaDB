@@ -787,8 +787,8 @@ impl SstEngine {
         }
 
         // TD-PAXMETA-1 (ADR-098 D2): keep the collection segment directory
-        // current with the segment this flush just published (default OFF:
-        // PROXIMADB_PAX_WRITE_DIRECTORY_AT_FLUSH). The publish never fails
+        // current with the segment this flush just published (default ON;
+        // kill switch PROXIMADB_PAX_WRITE_DIRECTORY_AT_FLUSH=0). The publish never fails
         // the flush — the directory is a projection, and without one readers
         // use the per-segment footer path.
         if block_format == BlockFormat::PaxBlock {
@@ -1025,7 +1025,7 @@ impl SstEngine {
 
     /// TD-PAXMETA-1 (ADR-098 D2): bring the collection segment directory up to
     /// date after this flush published `final_file_path`, behind the
-    /// default-OFF `PROXIMADB_PAX_WRITE_DIRECTORY_AT_FLUSH` gate (the
+    /// default-ON `PROXIMADB_PAX_WRITE_DIRECTORY_AT_FLUSH` kill switch (the
     /// compaction publish path stays on
     /// `PROXIMADB_PAX_WRITE_CENTROID_DIRECTORY`). A publish failure is logged
     /// and never fails the flush — the same discipline as the compaction
@@ -3036,13 +3036,14 @@ mod tests {
     }
 
     /// TD-PAXMETA-1 (ADR-098 D2): `PROXIMADB_PAX_WRITE_DIRECTORY_AT_FLUSH`
-    /// (default OFF). With the gate unset a PAX flush publishes NO directory
-    /// object (the flush path is byte-for-byte today's behavior); opted in,
-    /// the flush's untrained segments appear in the directory as `NO_MODEL`
-    /// entries carrying their zero-encoded decode keys.
+    /// (default ON, kill switch). Killed (`=0`) a PAX flush publishes NO
+    /// directory object; with the gate UNSET (the shipped default) the
+    /// flush's untrained segments appear in the directory as `NO_MODEL`
+    /// entries carrying their zero-encoded decode keys; and the master
+    /// `PROXIMADB_PAX_WRITE_CENTROID_DIRECTORY` kill switch still wins.
     #[tokio::test]
     #[serial_test::serial]
-    async fn flush_publishes_the_segment_directory_only_when_gated_on() {
+    async fn flush_publishes_the_segment_directory_by_default_unless_killed() {
         use crate::core::search::SearchParams;
         use crate::proto::proximadb_v1::{Collection, CollectionConfig, StorageAssignment};
         use crate::storage::traits::{FlushParameters, StorageQueryContext, UnifiedStorageFormat};
@@ -3052,7 +3053,7 @@ mod tests {
         // the gate world private to this test in the shared `cargo test --lib`
         // process, and the vars are restored at the end.
         unsafe {
-            std::env::remove_var("PROXIMADB_PAX_WRITE_DIRECTORY_AT_FLUSH");
+            std::env::set_var("PROXIMADB_PAX_WRITE_DIRECTORY_AT_FLUSH", "0");
             std::env::set_var("PROXIMADB_PAX_WRITE_CENTROID_DIRECTORY", "1");
             std::env::set_var("PROXIMADB_PAX_COALESCED_RABITQ", "1");
             std::env::set_var("PROXIMADB_PAX_WRITE_DIRECTORY_DECODE_KEYS", "1");
@@ -3141,17 +3142,18 @@ mod tests {
                 .collect::<Vec<_>>()
         };
 
-        // Gate OFF (the default): the flush succeeds and writes NO directory.
+        // Kill switch set: the flush succeeds and writes NO directory.
         assert!(flush(0).await.success);
         assert!(
             directories().is_empty(),
-            "default OFF: no directory object after a PAX flush"
+            "AT_FLUSH=0: no directory object after a PAX flush"
         );
 
-        // Opted in: the next flush publishes generation 1, covering both
-        // untrained flush segments with zero-encoded decode keys.
+        // Gate UNSET (the shipped default): the next flush publishes
+        // generation 1, covering both untrained flush segments with
+        // zero-encoded decode keys.
         // SAFETY: see above.
-        unsafe { std::env::set_var("PROXIMADB_PAX_WRITE_DIRECTORY_AT_FLUSH", "1") };
+        unsafe { std::env::remove_var("PROXIMADB_PAX_WRITE_DIRECTORY_AT_FLUSH") };
         assert!(flush(1).await.success);
         let published = directories();
         assert_eq!(published.len(), 1, "exactly the newest generation is kept");
@@ -3171,7 +3173,7 @@ mod tests {
         }
 
         // Negative control for the master WRITE kill-switch: AT_FLUSH still
-        // on, but PROXIMADB_PAX_WRITE_CENTROID_DIRECTORY off ⇒ the flush
+        // on (unset = default ON), but PROXIMADB_PAX_WRITE_CENTROID_DIRECTORY off ⇒ the flush
         // succeeds and publishes no new generation.
         // SAFETY: see above.
         unsafe { std::env::set_var("PROXIMADB_PAX_WRITE_CENTROID_DIRECTORY", "0") };

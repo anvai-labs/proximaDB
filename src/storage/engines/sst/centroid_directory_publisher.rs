@@ -68,11 +68,15 @@ proximadb_config::env_kill_switch! {
 // also refreshes the collection directory — the same create-only reconcile
 // the compaction publish runs — so flush-written (uncovered) segments appear
 // with their untrained decode keys instead of waiting for the next
-// compaction. Default OFF until baked (a flush is the hot ingest path; the
-// publish adds one LIST plus per-changed-segment reads off the query path).
-// Read on every call (not memoized) so tests can flip it mid-process.
-pub fn directory_at_flush_write_enabled() -> bool {
-    proximadb_config::env_flag_now("PROXIMADB_PAX_WRITE_DIRECTORY_AT_FLUSH")
+// compaction. Default ON since the request-count flip evidence
+// (`paxmeta1_directory_at_flush_request_counts_azurite`: cold collection-level
+// metadata GETs 20→0 / 40→0 on Azurite, same recall). Each flush pays ~4 GETs
+// + 1 LIST (+1 PUT, +1 DELETE once two generations exist) off the query path;
+// `0/false/off/no` is the kill switch. Not memoized (`env_kill_switch!`) so
+// tests can flip it mid-process.
+proximadb_config::env_kill_switch! {
+    /// Kill-switch gate; default ON (0|false|off|no disables).
+    pub fn directory_at_flush_write_enabled() { gate: "PROXIMADB_PAX_WRITE_DIRECTORY_AT_FLUSH", default: true }
 }
 
 /// Directory objects in a listing, newest generation first.
@@ -898,21 +902,23 @@ pub(crate) mod tests {
         unsafe { std::env::remove_var("PROXIMADB_PAX_WRITE_CENTROID_DIRECTORY") };
     }
 
-    /// TD-PAXMETA-1: the flush-publish gate is default-OFF opt-in — the
-    /// registry's truthy set enables it, anything else (including unset and
-    /// unrecognized values) keeps the flush path unchanged.
+    /// TD-PAXMETA-1: the flush-publish gate is a default-ON kill switch —
+    /// unset (and unrecognized values) publish at flush; the kill-switch set
+    /// `0|false|off|no` (case-insensitive, whitespace-tolerant) disables it.
     #[test]
-    fn at_flush_gate_defaults_off_opt_in() {
-        // SAFETY: nextest runs each test in its own process.
+    #[serial_test::serial]
+    fn at_flush_gate_defaults_on_with_kill_switch() {
+        // SAFETY: #[serial] keeps the gate private to this test in the
+        // shared `cargo test --lib` process; restored at the end.
         unsafe { std::env::remove_var("PROXIMADB_PAX_WRITE_DIRECTORY_AT_FLUSH") };
-        assert!(!directory_at_flush_write_enabled(), "default OFF");
-        for on in ["1", "true", "on", "yes"] {
+        assert!(directory_at_flush_write_enabled(), "default ON");
+        for on in ["1", "true", "on", "yes", "bogus"] {
             unsafe { std::env::set_var("PROXIMADB_PAX_WRITE_DIRECTORY_AT_FLUSH", on) };
-            assert!(directory_at_flush_write_enabled(), "{on} opts in");
+            assert!(directory_at_flush_write_enabled(), "{on} keeps it on");
         }
-        for off in ["0", "false", "off", "no", "bogus"] {
+        for off in ["0", "false", "off", "no", " OFF "] {
             unsafe { std::env::set_var("PROXIMADB_PAX_WRITE_DIRECTORY_AT_FLUSH", off) };
-            assert!(!directory_at_flush_write_enabled(), "{off} stays off");
+            assert!(!directory_at_flush_write_enabled(), "{off} kills it");
         }
         unsafe { std::env::remove_var("PROXIMADB_PAX_WRITE_DIRECTORY_AT_FLUSH") };
     }

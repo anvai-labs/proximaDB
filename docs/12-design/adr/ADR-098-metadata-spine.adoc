@@ -103,7 +103,9 @@ directory (D2).
   carries the decode key (header-prefix extents, footer offset/length, rows, quant tag,
   `has_f32_tier`, block stats, etag) and the per-segment statistics of ADR-042.
 . It is **published at flush and at compaction**, create-only at generation g+1 (the existing
-  `publish_centroid_directory` protocol), behind a default-OFF write gate (`PROXIMADB_PAX_WRITE_DIRECTORY_AT_FLUSH`) until baked.
+  `publish_centroid_directory` protocol), behind a write gate (`PROXIMADB_PAX_WRITE_DIRECTORY_AT_FLUSH`)
+  that shipped default-OFF until baked and was flipped default ON on 2026-11-20 (now a kill switch;
+  evidence: TD-PAXMETA-1 "Measured on Azurite", ledger `paxmeta1_directory_at_flush_request_counts_azurite`).
 . It is **never authoritative.** LIST remains the discovery authority (ADR-063 D4); an entry is
   used only when its etag matches the LISTed object, otherwise the reader falls back to the footer.
   The object itself stays self-describing and wins on divergence (ADR-062, TD-USUB-8 rules).
