@@ -84,7 +84,6 @@ JOB_NAMES = [
     "Python SDK Tests (3.12)",
     "Python SDK round-trip (ADR-068 D5)",
     "OpenAPI Spec From Code (TD-126)",
-    "Code Coverage",
     "Docker Build",
     "CI Success",
 ]
@@ -1355,7 +1354,6 @@ class Wiring(unittest.TestCase):
 
     def test_main_only_extras_and_hard_gates_are_never_reusable(self):
         for key in (
-            "rust-coverage",
             "docker-build",
             "integration-test",
             "benchmarks",

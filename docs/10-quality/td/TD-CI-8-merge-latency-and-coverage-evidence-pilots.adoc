@@ -140,7 +140,32 @@ classified every overlap candidate as STRICTLY-SUBSUMED, PARTIAL-OVERLAP, or DIS
   are installed there anyway. ~5–7 min per Python PR; `python-lint` gate widened with
   `openapi_spec` (the drift check's input; mandate #15).
 
-**Owner decisions pending (each moves a gate or a metric — file the decision, then a PR):**
+**Owner decisions — RESOLVED 2026-11-20 (implemented in the filing PR unless noted):**
+
+* **#1 coverage unification — DONE (llvm-cov wins).** ci.yml's Tarpaulin job
+  retired (advisory today; qa-gate's llvm-cov ratchet is the surviving metric and
+  the future gate — Pilot 3 unchanged for the baseline seeding).
+* **#3 SIFT double-ratchet — DONE (qa-gate wins outright).** The test harness's
+  DEFAULT floor is 0.90 (`tests/sift_pax_recall_ratchet_test.rs:34`), so
+  qa-gate's 100k/1000q run asserts STRICTLY more than ci.yml's 0.85@10k —
+  porting 0.85 would have weakened it. ci.yml's job is dispatch-only now; no
+  qa-gate change.
+* **#5 release-proof — DONE (FULL tier only).** `rust-build-release` gated to
+  `extensive`; the qa-tier 30–60-min unconsumed-artifact build is gone; the
+  release link/codegen proof runs at qa→main before the release cut.
+* **#6 rust-affected-fast — ALREADY SATISFIED.** The lane early-exits when no
+  eligible leaf crate changed (`exit 0` on empty selection); no edit needed.
+* **#2 restart subsumption — BLOCKED, precondition FALSE.** Branch protection on
+  `qa`/`main` requires ONLY `CI Success` (`contexts: ["CI Success"]`) — qa-gate's
+  jobs are NOT individually required, contradicting the census premise. Moving
+  the restart proof from ci.yml (inside the required aggregate) to qa-gate
+  (unrequired) would WEAKEN the gate. New precondition: qa-gate needs a required
+  aggregate check wired into branch protection — belongs to Pilot 4's "one
+  required summary per promotion". Do NOT subsume until that exists.
+* **#4 coverage-on-python-test — OPEN**, gated on a denominator-parity
+  validation run (ratchet exclusions must reproduce the committed 80.0 baseline
+  within tolerance).
+
 
 |===
 | # | Candidate | Saving | Semantics change |
