@@ -1,0 +1,64 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-SPINE-4 evidence: manifest cache + manifest pruning + lazy footers (io_trace, pgwire)
+
+[cols="1,3"]
+|===
+| Date | 2026-11-20
+| Version | proximadb 0.7.0 @ branch `feat/spine-iceberg-read-path-followups` (base 4cd469982)
+| Hardware | Apple M1 Max (aarch64-apple-darwin). The quantities are request and footer counts, deterministic for this fixture; no latency is claimed.
+| Storage regime | **local `file://` object store on a tempdir**, not cloud. Request counts transfer; latency does not.
+| Command | `RUST_MIN_STACK=8388608 cargo nextest run --test tpc_perf_ledger_e2e manifest_levers_cut_footer_gets_over_pgwire --no-capture`
+| Source | `tests/tpc_perf_ledger_e2e.rs` (`manifest_levers_cut_footer_gets_over_pgwire`)
+|===
+
+== Fixture
+
+A real server over pgwire. Table `mlev (id INT, v INT)`, four `ALTER TABLE … MATERIALIZE` rounds of
+250 new rows each; insert-only republication appends one part each, so the snapshot holds four
+Parquet files with manifest `id` bounds [1,250], [251,500], [501,750], [751,1000]. Each query runs
+twice ("first", "repeat") in each mode; numbers are the per-query io_trace billing snapshot.
+
+* **before** — all three kill-switches set: `PROXIMADB_OLAP_MANIFEST_CACHE_DISABLE=1`,
+  `PROXIMADB_OLAP_MANIFEST_PRUNE_DISABLE=1`, `PROXIMADB_OLAP_LAZY_FOOTER_DISABLE=1` (the pre-TD-SPINE-4 read path).
+* **after** — all unset (defaults).
+
+== Results
+
+[cols="2,1,1,1,1,1,1,1", options="header"]
+|===
+| Query (mode, temperature) | get_ops | range_gets | bytes_read | footer_reads | files_pruned | manifest hit | manifest miss
+| `WHERE id <= 250` before (both) | 13 | 7 | 64,296 | 4 | 0 | 0 | 0
+| `WHERE id <= 250` after first | 7 | 4 | 30,828 | 1 | 3 | 0 | 1
+| `WHERE id <= 250` after repeat | 4 | 4 | 23,781 | 1 | 3 | 1 | 0
+| `WHERE id > 750` before (both) | 13 | 7 | 64,296 | 4 | 0 | 0 | 0
+| `WHERE id > 750` after (both) | 6 | 5 | 34,937 | 2 | 3 | 1 | 0
+| `WHERE id > 0` before (both) — negative control | 19 | 16 | 102,171 | 4 | 0 | 0 | 0
+| `WHERE id > 0` after (both) — negative control | 16 | 16 | 95,124 | 4 | 0 | 1 | 0
+|===
+
+Answers (`SUM(v), COUNT(*)`) are identical in every mode and temperature (asserted).
+
+== Reading the numbers honestly
+
+* `footer_reads` is the new `parquet_footer_reads` io_trace counter (discovery footers only; a
+  Bloom or key-set read re-opens a footer outside it). With the levers on, a filter keeping S of
+  the four files reads `|S ∪ {first file}|` footers: the first file in path order is the
+  planning-schema source and is read at open (`id > 750` therefore reads 2, not 1).
+* `get_ops` counts BOTH stores. The data-plane reads go through the `TracingObjectStore` the
+  table wraps (HEADs and ranged footer/row-group GETs; ranged ones also count in `range_gets`).
+  The Iceberg reads go through the bridge's `ProximaObjectStore`, whose full-object GETs are
+  recorded by the process `IoRecorder` the server installs at boot (`src/database.rs`,
+  `IoTraceObjectStoreRecorder`): one `get_ops` + bytes each, no `range_gets`. Only the
+  latest-version LIST is unrecorded (`list_ops` reads 0 in both modes).
+* Attribution verified by a per-path instrumented run (a temporary `eprintln!` in
+  `ProximaObjectStore::get_with_meta`, reverted): every manifest-cache MISS issues exactly three
+  full GETs — `vN.metadata.json`, `snap-…-list.avro`, `vN-…-m0.avro` — and a HIT issues none.
+  So `id <= 250` reads 7 `get_ops` on the miss and 4 on the hit with `range_gets` unchanged at 4
+  and ~7 KB fewer bytes: the 3 saved requests are those three metadata GETs. The negative
+  control's 19 → 16 is the same three (the "after" run is a cache hit), with the same 4 footers.
+* With the kill-switches set, each query pays the three metadata GETs (no cache) plus a HEAD and
+  a footer for every file; the per-request split of the remaining data-plane GETs was not
+  itemized.
+* The `after` first-run of `id <= 250` pays the manifest miss; later queries hit. HEADs are
+  deferred with the footers (a pruned file is never HEADed).

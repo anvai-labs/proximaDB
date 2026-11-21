@@ -4008,15 +4008,23 @@ struct InvFixture {
     dml: DmlService,
     root_url: String,
     bridge: Arc<proximadb_iceberg_engine::IcebergObjectStoreBridge>,
+    /// The table's name (`inv` unless a test needs process-unique state).
+    table: String,
 }
 
 #[cfg(feature = "datafusion-integration")]
 impl InvFixture {
     async fn new(wal: &str, rows: usize) -> Self {
+        Self::named(wal, rows, "inv").await
+    }
+
+    /// The same fixture under table `table`: process-global state keyed by
+    /// the table name (the NDV statistics registry) stays per test.
+    async fn named(wal: &str, rows: usize, table: &str) -> Self {
         let wal_dir = tempfile::tempdir().expect("tempdir");
         let (manager, dml) = dml_over_wal_table(
             wal_dir.path(),
-            "CREATE TABLE inv (id TEXT NOT NULL, qty INT, PRIMARY KEY (id));",
+            &format!("CREATE TABLE {table} (id TEXT NOT NULL, qty INT, PRIMARY KEY (id));"),
             wal,
         )
         .await;
@@ -4032,10 +4040,13 @@ impl InvFixture {
             dml,
             root_url,
             bridge,
+            table: table.to_string(),
         };
         for i in 0..rows {
             fixture
-                .exec(&format!("INSERT INTO inv (id, qty) VALUES ('i{i}', {i});"))
+                .exec(&format!(
+                    "INSERT INTO {table} (id, qty) VALUES ('i{i}', {i});"
+                ))
                 .await;
         }
         fixture
@@ -4054,9 +4065,16 @@ impl InvFixture {
 
     async fn materialize(&self) -> String {
         self.dml
-            .materialize_table_to_parquet(&*self.bridge, &self.root_url, "inv", None)
+            .materialize_table_to_parquet(&*self.bridge, &self.root_url, &self.table, None)
             .await
             .expect("materialize")
+    }
+
+    /// One MATERIALIZE, returning its result rather than expecting success.
+    async fn try_materialize(&self) -> anyhow::Result<String> {
+        self.dml
+            .materialize_table_to_parquet(&*self.bridge, &self.root_url, &self.table, None)
+            .await
     }
 
     /// The published data prefix of a location, and its metadata prefix.
@@ -9860,4 +9878,469 @@ async fn update_does_not_carry_undeclared_props() {
             row.props
         );
     }
+}
+
+/// TD-SPINE-3 review M1: a delegating catalog whose `get_table` fails once the
+/// table's Iceberg tip has moved past `fail_after_version` — i.e. exactly the
+/// flip-time read after MATERIALIZE's commit. Every other method delegates.
+#[cfg(feature = "datafusion-integration")]
+mod flip_fault {
+    use proximadb_catalog::*;
+    use proximadb_storage_common::object_store_bridge::ObjectStoreBridge;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+    pub(super) struct FlipReadFaultCatalog {
+        pub(super) inner: Arc<dyn Catalog>,
+        pub(super) bridge: Arc<proximadb_iceberg_engine::IcebergObjectStoreBridge>,
+        pub(super) metadata_prefix: String,
+        /// `u64::MAX` = disarmed.
+        pub(super) fail_after_version: AtomicU64,
+        /// Failures still to inject once armed (`usize::MAX` = persistent).
+        pub(super) budget: AtomicUsize,
+        pub(super) injected: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl Catalog for FlipReadFaultCatalog {
+        fn name(&self) -> &str {
+            self.inner.name()
+        }
+        fn catalog_type(&self) -> &str {
+            self.inner.catalog_type()
+        }
+        fn identity_authority(&self) -> Option<&dyn CatalogAuthority> {
+            self.inner.identity_authority()
+        }
+        async fn create_namespace(
+            &self,
+            namespace: &[String],
+            properties: HashMap<String, String>,
+        ) -> anyhow::Result<CatalogNamespace> {
+            self.inner.create_namespace(namespace, properties).await
+        }
+        async fn create_namespace_for_tenant(
+            &self,
+            namespace: &[String],
+            properties: HashMap<String, String>,
+            _tenant: Option<&str>,
+        ) -> anyhow::Result<CatalogNamespace> {
+            self.inner
+                .create_namespace_for_tenant(namespace, properties, _tenant)
+                .await
+        }
+        async fn drop_namespace(
+            &self,
+            namespace: &[String],
+            cascade: bool,
+        ) -> anyhow::Result<bool> {
+            self.inner.drop_namespace(namespace, cascade).await
+        }
+        async fn list_namespaces(
+            &self,
+            parent: Option<&[String]>,
+        ) -> anyhow::Result<Vec<CatalogNamespace>> {
+            self.inner.list_namespaces(parent).await
+        }
+        async fn namespace_exists(&self, namespace: &[String]) -> anyhow::Result<bool> {
+            self.inner.namespace_exists(namespace).await
+        }
+        async fn get_namespace(&self, namespace: &[String]) -> anyhow::Result<CatalogNamespace> {
+            self.inner.get_namespace(namespace).await
+        }
+        async fn account_id_u32(&self, account: &str) -> anyhow::Result<Option<u32>> {
+            self.inner.account_id_u32(account).await
+        }
+        fn account_id_u32_lookup(&self, account: &str) -> Option<u32> {
+            self.inner.account_id_u32_lookup(account)
+        }
+        async fn max_object_id(&self) -> anyhow::Result<Option<u64>> {
+            self.inner.max_object_id().await
+        }
+        async fn allocate_object_id(&self) -> anyhow::Result<Option<u64>> {
+            self.inner.allocate_object_id().await
+        }
+        async fn mint_collection_typed_identity(
+            &self,
+            account: &str,
+            namespace_key: &str,
+        ) -> anyhow::Result<Option<(u32, u16, u32)>> {
+            self.inner
+                .mint_collection_typed_identity(account, namespace_key)
+                .await
+        }
+        async fn update_namespace_properties(
+            &self,
+            namespace: &[String],
+            updates: HashMap<String, String>,
+            removals: Vec<String>,
+        ) -> anyhow::Result<()> {
+            self.inner
+                .update_namespace_properties(namespace, updates, removals)
+                .await
+        }
+        async fn create_table_inner(
+            &self,
+            identifier: &TableIdentifier,
+            schema: CatalogTableSchema,
+        ) -> anyhow::Result<CatalogTableSchema> {
+            self.inner.create_table_inner(identifier, schema).await
+        }
+        fn require_object_id(
+            &self,
+            verb: &str,
+            identifier: &TableIdentifier,
+            written: &CatalogTableSchema,
+        ) -> anyhow::Result<()> {
+            self.inner.require_object_id(verb, identifier, written)
+        }
+        async fn replace_table_inner(
+            &self,
+            identifier: &TableIdentifier,
+            schema: CatalogTableSchema,
+        ) -> anyhow::Result<CatalogTableSchema> {
+            self.inner.replace_table_inner(identifier, schema).await
+        }
+        async fn drop_table(
+            &self,
+            identifier: &TableIdentifier,
+            purge: bool,
+        ) -> anyhow::Result<bool> {
+            self.inner.drop_table(identifier, purge).await
+        }
+        async fn list_tables(&self, namespace: &[String]) -> anyhow::Result<Vec<TableIdentifier>> {
+            self.inner.list_tables(namespace).await
+        }
+        async fn table_exists(&self, identifier: &TableIdentifier) -> anyhow::Result<bool> {
+            self.inner.table_exists(identifier).await
+        }
+        async fn get_table(
+            &self,
+            identifier: &TableIdentifier,
+        ) -> anyhow::Result<CatalogTableSchema> {
+            let armed = self.fail_after_version.load(Ordering::SeqCst);
+            if armed != u64::MAX {
+                let latest = self
+                    .bridge
+                    .latest_metadata_version(&self.metadata_prefix)
+                    .await
+                    .ok()
+                    .flatten();
+                let spend = |left: usize| match left {
+                    0 => None,
+                    usize::MAX => Some(usize::MAX),
+                    n => Some(n - 1),
+                };
+                if latest.is_some_and(|v| v > armed)
+                    && self
+                        .budget
+                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, spend)
+                        .is_ok()
+                {
+                    self.injected.fetch_add(1, Ordering::SeqCst);
+                    return Err(anyhow::anyhow!("injected get_table fault after v{armed}"));
+                }
+            }
+            self.inner.get_table(identifier).await
+        }
+        async fn list_all_tables_in_scope(
+            &self,
+            scope: Option<&[String]>,
+        ) -> anyhow::Result<Vec<TableIdentifier>> {
+            self.inner.list_all_tables_in_scope(scope).await
+        }
+        async fn get_table_by_object_id(
+            &self,
+            object_id: u64,
+        ) -> anyhow::Result<Option<TableIdentifier>> {
+            self.inner.get_table_by_object_id(object_id).await
+        }
+        async fn get_namespace_by_object_id(
+            &self,
+            object_id: u64,
+        ) -> anyhow::Result<Option<Vec<String>>> {
+            self.inner.get_namespace_by_object_id(object_id).await
+        }
+        async fn resolve_embedding_model_binding(
+            &self,
+            binding: &CatalogEmbeddingConfig,
+            policy: &mlops::CatalogModelUsePolicy,
+        ) -> anyhow::Result<mlops::CatalogResolvedEmbeddingModel> {
+            self.inner
+                .resolve_embedding_model_binding(binding, policy)
+                .await
+        }
+        async fn rename_table(
+            &self,
+            from: &TableIdentifier,
+            to: &TableIdentifier,
+        ) -> anyhow::Result<()> {
+            self.inner.rename_table(from, to).await
+        }
+        async fn evolve_schema(
+            &self,
+            identifier: &TableIdentifier,
+            evolution: CatalogSchemaEvolution,
+        ) -> anyhow::Result<CatalogTableSchema> {
+            self.inner.evolve_schema(identifier, evolution).await
+        }
+        async fn get_schema_version(&self, identifier: &TableIdentifier) -> anyhow::Result<i32> {
+            self.inner.get_schema_version(identifier).await
+        }
+        async fn get_schema_by_version(
+            &self,
+            identifier: &TableIdentifier,
+            version: i32,
+        ) -> anyhow::Result<CatalogTableSchema> {
+            self.inner.get_schema_by_version(identifier, version).await
+        }
+        async fn create_index(
+            &self,
+            identifier: &TableIdentifier,
+            index: CatalogIndex,
+        ) -> anyhow::Result<CatalogIndex> {
+            self.inner.create_index(identifier, index).await
+        }
+        async fn drop_index(
+            &self,
+            identifier: &TableIdentifier,
+            index_name: &str,
+        ) -> anyhow::Result<bool> {
+            self.inner.drop_index(identifier, index_name).await
+        }
+        async fn list_indexes(
+            &self,
+            identifier: &TableIdentifier,
+        ) -> anyhow::Result<Vec<CatalogIndex>> {
+            self.inner.list_indexes(identifier).await
+        }
+        async fn get_statistics(
+            &self,
+            identifier: &TableIdentifier,
+        ) -> anyhow::Result<CatalogTableStatistics> {
+            self.inner.get_statistics(identifier).await
+        }
+        async fn update_statistics(
+            &self,
+            identifier: &TableIdentifier,
+            stats: CatalogTableStatistics,
+        ) -> anyhow::Result<()> {
+            self.inner.update_statistics(identifier, stats).await
+        }
+        async fn get_partition_spec(
+            &self,
+            identifier: &TableIdentifier,
+        ) -> anyhow::Result<Option<CatalogPartitionSpec>> {
+            self.inner.get_partition_spec(identifier).await
+        }
+        async fn update_partition_spec(
+            &self,
+            identifier: &TableIdentifier,
+            spec: CatalogPartitionSpec,
+        ) -> anyhow::Result<()> {
+            self.inner.update_partition_spec(identifier, spec).await
+        }
+        async fn get_sort_order(
+            &self,
+            identifier: &TableIdentifier,
+        ) -> anyhow::Result<Option<CatalogSortOrder>> {
+            self.inner.get_sort_order(identifier).await
+        }
+        async fn update_sort_order(
+            &self,
+            identifier: &TableIdentifier,
+            order: CatalogSortOrder,
+        ) -> anyhow::Result<()> {
+            self.inner.update_sort_order(identifier, order).await
+        }
+        async fn set_primary_pod(
+            &self,
+            identifier: &TableIdentifier,
+            primary: Option<CatalogPrimaryPod>,
+        ) -> anyhow::Result<()> {
+            self.inner.set_primary_pod(identifier, primary).await
+        }
+        async fn set_storage_layouts(
+            &self,
+            identifier: &TableIdentifier,
+            layouts: Vec<CatalogStorageLayout>,
+        ) -> anyhow::Result<CatalogTableSchema> {
+            self.inner.set_storage_layouts(identifier, layouts).await
+        }
+        async fn apply_model_registry_mutation(
+            &self,
+            identifier: &TableIdentifier,
+            expected_revision: u64,
+            mutation: mlops::CatalogModelRegistryMutation,
+        ) -> anyhow::Result<CatalogTableSchema> {
+            self.inner
+                .apply_model_registry_mutation(identifier, expected_revision, mutation)
+                .await
+        }
+        async fn health_check(&self) -> anyhow::Result<CatalogHealth> {
+            self.inner.health_check().await
+        }
+        async fn close(&self) -> anyhow::Result<()> {
+            self.inner.close().await
+        }
+    }
+}
+
+/// TD-SPINE-3 review rounds 1-3: MATERIALIZE through the real path with a
+/// catalog whose flip-time read (after the commit lands) fails `failures`
+/// times. The read is retried (3 attempts): one transient failure is absorbed
+/// and the flip lands; a persistent one returns an error naming the committed
+/// version, leaves the layout on the previous version, skips this run's NDV
+/// publish and GC (v0's metadata survives), and the next MATERIALIZE that
+/// reads the catalog flips. `failures == 0` is the positive control (flip to
+/// v3, v0 collected). Every MATERIALIZE here is a full rewrite (append and
+/// incremental-DV planning off), so the faulted run is one whose success
+/// WOULD publish NDV; the table name is per test, so the process-global NDV
+/// registry entry is too.
+#[cfg(feature = "datafusion-integration")]
+fn check_materialize_flip_under_catalog_fault(failures: usize, table: &str) {
+    let _append = EnvGuard::set("PROXIMADB_MATERIALIZE_APPEND_MAX_ROWS", "0");
+    let _dv = EnvGuard::set("PROXIMADB_MATERIALIZE_INCREMENTAL_DV", "0");
+    let table = table.to_string();
+    crate::query::execution::test_runtime::run_with_timeout(60, async move {
+        use std::sync::atomic::Ordering;
+        let inv = InvFixture::named(&format!("{table}.wal"), 4, &table).await;
+        let location = inv.materialize().await;
+        let (prefix, metadata_prefix) = inv.prefixes(&location);
+        for round in 1..3 {
+            inv.exec(&format!(
+                "UPDATE {table} SET qty = {} WHERE id = 'i{round}';",
+                70 + round
+            ))
+            .await;
+            inv.materialize().await;
+        }
+        let tip = || async {
+            inv.bridge
+                .latest_metadata_version(&metadata_prefix)
+                .await
+                .expect("list")
+                .expect("a version")
+        };
+        assert_eq!(tip().await, 2, "v0..v2 published");
+        let (_, table_id) = inv
+            ._manager
+            .resolve_table_scoped(&table, None)
+            .await
+            .expect("resolve");
+        let inner = inv._manager.get_catalog("native").await.expect("native");
+        let recorded = |inner: Arc<dyn proximadb_catalog::Catalog>| {
+            let table_id = table_id.clone();
+            async move {
+                inner
+                    .get_table(&table_id)
+                    .await
+                    .expect("catalog read")
+                    .storage_layouts
+                    .iter()
+                    .find(|l| l.name == "parquet-snapshot")
+                    .and_then(|l| {
+                        l.properties
+                            .get(super::materialize_stream::METADATA_VERSION_PROPERTY)
+                            .and_then(|v| v.parse::<u64>().ok())
+                    })
+            }
+        };
+        // The NDV summary the last (full) MATERIALIZE published: 4 rows.
+        let ndv_records = || {
+            crate::core::statistics::statistics_registry()
+                .envelope(&crate::core::statistics::table_statistics_key(None, &table))
+                .map(|e| e.record_count)
+        };
+        let ndv_before = ndv_records();
+        assert_eq!(ndv_before, Some(4), "the full MATERIALIZE published NDV");
+        assert_eq!(recorded(inner.clone()).await, Some(2));
+        let files_before = published_data_files(&inv.bridge, &prefix).await;
+        let faulty = Arc::new(flip_fault::FlipReadFaultCatalog {
+            inner: inner.clone(),
+            bridge: inv.bridge.clone(),
+            metadata_prefix: metadata_prefix.clone(),
+            fail_after_version: std::sync::atomic::AtomicU64::new(2),
+            budget: std::sync::atomic::AtomicUsize::new(failures),
+            injected: std::sync::atomic::AtomicUsize::new(0),
+        });
+        // Same name: replaces the native catalog the DML service resolves.
+        inv._manager
+            .register(faulty.clone())
+            .await
+            .expect("register");
+
+        // A fifth row: a publish from this run would record 5, not 4.
+        inv.exec(&format!("INSERT INTO {table} (id, qty) VALUES ('i9', 99);"))
+            .await;
+        let outcome = inv.try_materialize().await;
+        assert_eq!(tip().await, 3, "v3 committed");
+        let files_after = published_data_files(&inv.bridge, &prefix).await;
+        assert!(
+            files_after.iter().all(|f| !files_before.contains(f)),
+            "the faulted run is a full rewrite (no file carried): \
+             {files_before:?} -> {files_after:?}"
+        );
+        let v0_survives = inv
+            .bridge
+            .read_table_metadata(&metadata_prefix, 0)
+            .await
+            .is_ok();
+        let injected = faulty.injected.load(Ordering::SeqCst);
+        if failures == usize::MAX {
+            let err = outcome.expect_err("a skipped flip is not reported as success");
+            let message = err.to_string();
+            assert!(
+                message.contains("committed Iceberg metadata v3")
+                    && message.contains("after 3 attempts")
+                    && message.contains("re-run MATERIALIZE"),
+                "the error names the committed version and the remedy: {message}"
+            );
+            assert_eq!(injected, 3, "every one of the 3 flip-read attempts failed");
+            assert_eq!(
+                recorded(inner.clone()).await,
+                Some(2),
+                "an unreadable catalog leaves the previous layout in place"
+            );
+            assert!(v0_survives, "GC is skipped when the flip is skipped");
+            assert_eq!(ndv_records(), ndv_before, "no NDV publish without the flip");
+            // Liveness: re-running MATERIALIZE once the catalog reads flips it.
+            faulty.fail_after_version.store(u64::MAX, Ordering::SeqCst);
+            assert_eq!(inv.try_materialize().await.expect("re-run"), location);
+            assert_eq!(recorded(inner.clone()).await, Some(4));
+            assert_eq!(ndv_records(), Some(5), "the re-run publishes NDV");
+        } else {
+            assert_eq!(outcome.expect("the flip lands"), location);
+            assert_eq!(
+                injected, failures,
+                "{failures} transient failure(s) injected"
+            );
+            assert_eq!(
+                recorded(inner.clone()).await,
+                Some(3),
+                "the flip lands (a transient failure is retried)"
+            );
+            assert!(!v0_survives, "GC collects v0 below the window");
+            assert_eq!(ndv_records(), Some(5), "the flip publishes NDV");
+        }
+    });
+}
+
+#[cfg(feature = "datafusion-integration")]
+#[test]
+fn materialize_skips_the_flip_and_gc_when_the_catalog_read_fails() {
+    check_materialize_flip_under_catalog_fault(usize::MAX, "flip_fault_persistent");
+}
+
+#[cfg(feature = "datafusion-integration")]
+#[test]
+fn materialize_retries_a_transient_catalog_read_failure_and_flips() {
+    check_materialize_flip_under_catalog_fault(1, "flip_fault_transient");
+}
+
+#[cfg(feature = "datafusion-integration")]
+#[test]
+fn materialize_flips_and_collects_when_the_catalog_reads() {
+    check_materialize_flip_under_catalog_fault(0, "flip_fault_control");
 }

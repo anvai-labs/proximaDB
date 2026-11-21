@@ -145,12 +145,16 @@ impl DataFusionLocalEngine {
             // Warm the route-time shape cache for free — the footer is already
             // read, so the next route decision can classify this location's
             // fan-out / cardinality without a cold read (co-design: zero extra
-            // I/O on the route path).
-            crate::query::route_cost_model::record_table_shape_stat(
-                location,
-                table.split_count() as u32,
-                table.estimated_rows(),
-            );
+            // I/O on the route path). A lazily-opened manifest table
+            // (TD-SPINE-4) knows only its first footer here; its scan records
+            // the stat once every footer is resolved.
+            if table.footers_complete() {
+                crate::query::route_cost_model::record_table_shape_stat(
+                    location,
+                    table.split_count() as u32,
+                    table.estimated_rows(),
+                );
+            }
         }
 
         // TD-USUB-2: register native (non-Parquet) relational tables so the full ANSI

@@ -466,6 +466,37 @@ pub(super) fn layout_is_newer(
         .any(|theirs| theirs > ours)
 }
 
+/// What MATERIALIZE does to the catalog after its Iceberg commit (see
+/// [`plan_catalog_flip`]).
+#[derive(Debug)]
+pub(super) enum CatalogFlip {
+    /// Write these layouts (the incoming one upserted by name).
+    Flip(Vec<proximadb_catalog::CatalogStorageLayout>),
+    /// A newer publication already flipped the catalog: keep it.
+    Overtaken,
+    /// The current layouts could not be read: leave the catalog alone (fail
+    /// safe; the next MATERIALIZE reconciles it).
+    LayoutsUnreadable,
+}
+
+/// TD-SPINE-3 (deferred LOW): decide the catalog flip. `existing` is the
+/// table's current layouts, or `None` when the catalog read failed. With the
+/// layouts in hand the forward-only rule ([`layout_is_newer`]) decides.
+/// Without them nothing is written: "no layouts" must never stand in for "not
+/// overtaken" (a stale below-tip commit would move the catalog backwards), and
+/// writing the incoming layout into an empty list would drop other
+/// representations' layouts. Even a tip commit waits for the next MATERIALIZE.
+pub(super) fn plan_catalog_flip(
+    existing: Option<Vec<proximadb_catalog::CatalogStorageLayout>>,
+    incoming: proximadb_catalog::CatalogStorageLayout,
+) -> CatalogFlip {
+    match existing {
+        None => CatalogFlip::LayoutsUnreadable,
+        Some(existing) if layout_is_newer(&existing, &incoming) => CatalogFlip::Overtaken,
+        Some(existing) => CatalogFlip::Flip(super::upsert_storage_layout(existing, incoming)),
+    }
+}
+
 /// Held for a whole publication of one table in this process.
 pub(super) type PublishGuard = tokio::sync::OwnedMutexGuard<()>;
 
@@ -533,6 +564,42 @@ mod tests {
             "other layouts"
         );
         assert!(!layout_is_newer(&[], &layout(Some(0))));
+    }
+
+    /// TD-SPINE-3 deferred LOW: a failed catalog read must not be taken for
+    /// "no existing layouts": nothing is written, whatever the commit's
+    /// standing. With the layouts in hand the forward-only rule decides.
+    #[test]
+    fn an_unreadable_catalog_never_flips() {
+        let other = proximadb_catalog::CatalogStorageLayout {
+            name: "other".to_string(),
+            ..layout(Some(9))
+        };
+        assert!(matches!(
+            plan_catalog_flip(None, layout(Some(3))),
+            CatalogFlip::LayoutsUnreadable
+        ));
+        assert!(matches!(
+            plan_catalog_flip(Some(vec![layout(Some(5))]), layout(Some(3))),
+            CatalogFlip::Overtaken
+        ));
+        // Positive control: readable layouts flip, keeping other representations.
+        let CatalogFlip::Flip(layouts) =
+            plan_catalog_flip(Some(vec![other, layout(Some(2))]), layout(Some(3)))
+        else {
+            panic!("readable, older layouts must flip");
+        };
+        let flipped: Vec<(String, Option<u64>)> = layouts
+            .iter()
+            .map(|l| (l.name.clone(), metadata_version_of(l)))
+            .collect();
+        assert_eq!(
+            flipped,
+            vec![
+                ("other".to_string(), Some(9)),
+                ("parquet-snapshot".to_string(), Some(3))
+            ]
+        );
     }
 
     #[tokio::test]

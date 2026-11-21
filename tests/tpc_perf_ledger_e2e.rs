@@ -2692,3 +2692,180 @@ fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     }
     out
 }
+
+/// TD-SPINE-4 evidence + ratchet: a MATERIALIZEd table of four appended
+/// parts with disjoint `id` ranges, queried over pgwire (the DataFusion route)
+/// with the manifest cache, manifest-bound pruning and lazy footers ON vs all
+/// three kill-switches set (the pre-TD-SPINE-4 read path). Per-query io_trace:
+/// GETs, LISTs, discovery footer reads, files pruned. Results must be
+/// identical; with the levers on, a filter that keeps `S` of the four files
+/// reads `|S ∪ {first file}|` footers (the first file is the planning-schema
+/// source), never four. Storage regime: local file:// (not cloud).
+#[test]
+fn manifest_levers_cut_footer_gets_over_pgwire() {
+    // 8 MB stacks, as for `tpc_perf_ledger` (debug-build server futures).
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .thread_stack_size(8 * 1024 * 1024)
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+    rt.block_on(manifest_levers_cut_footer_gets_over_pgwire_inner());
+}
+
+async fn manifest_levers_cut_footer_gets_over_pgwire_inner() {
+    const KILL_SWITCHES: [&str; 3] = [
+        "PROXIMADB_OLAP_MANIFEST_CACHE_DISABLE",
+        "PROXIMADB_OLAP_MANIFEST_PRUNE_DISABLE",
+        "PROXIMADB_OLAP_LAZY_FOOTER_DISABLE",
+    ];
+    let server = TestPgServer::start().await.expect("server start");
+    io_trace::set_billing_observer(Some(Box::new(|snap: &IoTraceSnapshot, _tenant| {
+        CAPTURE.lock().expect("capture lock").push(snap.clone());
+    })));
+    let client = connect(&server).await;
+    let _ = client.simple_query("DROP TABLE IF EXISTS mlev").await;
+    client
+        .simple_query("CREATE TABLE mlev (id INT, v INT)")
+        .await
+        .expect("create");
+    // Four MATERIALIZEs of 250 new rows each: insert-only republications
+    // append one part each, so the snapshot holds four files whose manifest
+    // `id` bounds are [1,250], [251,500], [501,750], [751,1000].
+    for part in 0..4 {
+        let rows: Vec<String> = (1..=250)
+            .map(|i| {
+                let id = part * 250 + i;
+                format!("({id}, {})", id % 7)
+            })
+            .collect();
+        for sql in chunked_inserts("mlev", "id, v", rows, 250) {
+            client.simple_query(&sql).await.expect("insert");
+        }
+        client
+            .simple_query("ALTER TABLE mlev MATERIALIZE")
+            .await
+            .unwrap_or_else(|e| panic!("materialize: {}", pg_server::db_err(&e)));
+    }
+    let queries = [
+        // (name, sql, footers read with the levers on, files pruned)
+        (
+            "first_file",
+            "SELECT SUM(v), COUNT(*) FROM mlev WHERE id <= 250",
+            1_u64,
+            3_u64,
+        ),
+        (
+            "last_file",
+            "SELECT SUM(v), COUNT(*) FROM mlev WHERE id > 750",
+            2,
+            3,
+        ),
+        // Negative control: every file matches, nothing is pruned.
+        (
+            "all_files",
+            "SELECT SUM(v), COUNT(*) FROM mlev WHERE id > 0",
+            4,
+            0,
+        ),
+    ];
+    let set_switches = |on: bool| {
+        // SAFETY: nextest runs this test in its own process; the switches are
+        // read per table open, between queries.
+        unsafe {
+            for k in KILL_SWITCHES {
+                if on {
+                    std::env::set_var(k, "1");
+                } else {
+                    std::env::remove_var(k);
+                }
+            }
+        }
+    };
+    let answer = |msgs: &[SimpleQueryMessage]| -> Vec<String> {
+        msgs.iter()
+            .filter_map(|m| match m {
+                SimpleQueryMessage::Row(r) => Some(
+                    (0..r.len())
+                        .map(|i| r.get(i).unwrap_or("NULL").to_string())
+                        .collect::<Vec<_>>()
+                        .join(","),
+                ),
+                _ => None,
+            })
+            .collect()
+    };
+    let mut results: std::collections::HashMap<(&str, bool), Vec<String>> =
+        std::collections::HashMap::new();
+    for kill in [true, false] {
+        set_switches(kill);
+        let mode = if kill {
+            "before(kill-switches)"
+        } else {
+            "after(levers on)"
+        };
+        for (name, sql, lazy_footers, pruned) in queries {
+            for temperature in ["first", "repeat"] {
+                CAPTURE.lock().expect("lock").clear();
+                let msgs = client
+                    .simple_query(sql)
+                    .await
+                    .unwrap_or_else(|e| panic!("{name}: {}", pg_server::db_err(&e)));
+                let mut snap = IoTraceSnapshot::default();
+                for _ in 0..200 {
+                    if let Some(s) = CAPTURE.lock().expect("lock").pop() {
+                        snap = s;
+                        break;
+                    }
+                    sleep(Duration::from_millis(5)).await;
+                }
+                eprintln!(
+                    "TD-SPINE-4 evidence {mode} {name} {temperature}: get_ops={} list_ops={} \
+                     range_gets={} bytes_read={} footer_reads={} files_pruned={} \
+                     manifest_cache hit/miss={}/{}",
+                    snap.get_ops,
+                    snap.list_ops,
+                    snap.range_gets,
+                    snap.bytes_read,
+                    snap.parquet_footer_reads,
+                    snap.manifest_files_pruned,
+                    snap.manifest_cache_hits,
+                    snap.manifest_cache_misses,
+                );
+                let rows = answer(&msgs);
+                let previous = results.entry((name, kill)).or_insert_with(|| rows.clone());
+                assert_eq!(previous, &rows, "{name}: repeat changed the answer");
+                if kill {
+                    assert_eq!(snap.parquet_footer_reads, 4, "{name}: eager reads all four");
+                    assert_eq!(snap.manifest_files_pruned, 0, "{name}: pruning off");
+                } else {
+                    assert_eq!(
+                        snap.parquet_footer_reads, lazy_footers,
+                        "{name}: lazy footers read only the kept files + the schema source"
+                    );
+                    assert_eq!(
+                        snap.manifest_files_pruned, pruned,
+                        "{name}: files pruned by manifest bounds"
+                    );
+                }
+            }
+        }
+    }
+    set_switches(false);
+    for (name, _, _, _) in queries {
+        assert_eq!(
+            results[&(name, true)],
+            results[&(name, false)],
+            "{name}: the levers must not change the answer"
+        );
+    }
+    // Absolute answers for every query (SUM(v), COUNT(*)), v = id % 7.
+    let expect = |ids: std::ops::RangeInclusive<i64>| {
+        let count = ids.clone().count();
+        let sum: i64 = ids.map(|id| id % 7).sum();
+        vec![format!("{sum},{count}")]
+    };
+    assert_eq!(results[&("first_file", false)], expect(1..=250));
+    assert_eq!(results[&("last_file", false)], expect(751..=1000));
+    assert_eq!(results[&("all_files", false)], expect(1..=1000));
+}
