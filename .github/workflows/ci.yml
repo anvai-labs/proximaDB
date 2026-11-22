@@ -1608,6 +1608,27 @@ jobs:
           save-if: false
           add-job-id-key: false
           apt-packages: 'g++ libssl-dev pkg-config protobuf-compiler'
+      - name: Verify release object-store HTTPS features
+        if: matrix.label == 'cloud-full'
+        run: |
+          release_tree=$(cargo tree --locked -p proximadb-server -p proximadb-bench -p proximadb-migrate \
+            --features cloud-full,vendored-openssl --edges normal --prefix none --format '{p} {f}' \
+            -i reqwest@0.13)
+          if ! grep -q '^object_store v' <<< "$release_tree"; then
+            echo "::error::The release object_store no longer uses reqwest 0.13. Update this check for the new transport."
+            exit 1
+          fi
+          features=$(awk '/^reqwest v0\.13\./ && !found {print $3; found=1}' <<< "$release_tree")
+          for required in http2 rustls; do
+            if [[ ",$features," != *",$required,"* ]]; then
+              echo "::error::The object_store reqwest build is missing $required"
+              exit 1
+            fi
+          done
+          if [[ ",$features," == *,__native-tls,* ]]; then
+            echo "::error::The object_store reqwest build selects native TLS instead of rustls"
+            exit 1
+          fi
       - name: cargo check -p ${{ matrix.pkg }} --tests ${{ matrix.args }}
         env:
           CARGO_PROFILE_DEV_DEBUG: 0
@@ -1717,7 +1738,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15  # max 4 min over 14 runs, 2026-10-09..11
     needs: changes
-    if: needs.changes.outputs.rust == 'true'
+    if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.rust_sdk == 'true'
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/rust-setup
@@ -1732,7 +1753,9 @@ jobs:
       # (or a yank, which the gate does not track as a class — see the file
       # header) turns this red and blocks the PR.
       - name: Run security audit
-        run: cargo audit -D warnings --no-yanked
+        run: |
+          cargo audit -D warnings --no-yanked
+          cargo audit -D warnings --no-yanked --file clients/rust/codegen/Cargo.lock
 
   python-lint:
     name: Python Lint

@@ -60,6 +60,18 @@ publish the port. See
 ./proximadb-server --config config/config.toml
 ----
 
+== Outbound HTTP Clients
+
+Server clients such as OIDC and CDC webhooks use the platform certificate store.
+On Linux, install the distribution's `ca-certificates` package before running a
+standalone binary. The published container images include this package. For
+self-hosted identity providers, use `ca_cert_path` to add a private CA.
+
+For clients that use automatic proxy discovery, set `HTTP_PROXY` and
+`HTTPS_PROXY` in the server process environment and configure bypasses with
+`NO_PROXY`. On macOS and Windows, copy any system-only proxy settings into those
+environment variables before upgrading.
+
 == Data Layout
 
 [source,text]

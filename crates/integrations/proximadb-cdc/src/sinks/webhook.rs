@@ -290,7 +290,9 @@ impl WebhookSink {
             return Ok(());
         }
 
-        let client = reqwest::Client::new();
+        let client = reqwest::Client::builder().build().map_err(|err| {
+            SinkError::Connection(format!("Cannot initialize webhook HTTP client: {err}"))
+        })?;
 
         let mut request = match self.config.method {
             HttpMethod::Get => client.get(url),

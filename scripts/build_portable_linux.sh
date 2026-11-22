@@ -12,8 +12,7 @@
 #   * glibc: compile inside the manylinux_2_28 image (AlmaLinux 8, glibc 2.28,
 #     gcc-toolset); a binary links against the OLDEST glibc it is built on.
 #   * OpenSSL: the server's `vendored-openssl` feature statically links OpenSSL
-#     (openssl-sys reaches the tree only through reqwest 0.11 / lettre
-#     native-tls). Same TLS stack and behaviour; native-tls still locates the
+#     for native-tls consumers such as lettre. Native TLS still locates the
 #     system CA bundle through openssl-probe.
 #
 # Runs on the host: starts the container and builds in it. Then fails unless

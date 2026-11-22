@@ -34,7 +34,7 @@ echo "==> down-converting OpenAPI 3.1 -> 3.0 (${SPEC_31})"
 "${PYTHON}" "${SCRIPT_DIR}/openapi_31_to_30.py" "${SPEC_31}" "${TMP_SPEC}"
 
 echo "==> building the generator (progenitor, pinned in codegen/Cargo.toml)"
-( cd "${SCRIPT_DIR}" && cargo build --release --quiet )
+( cd "${SCRIPT_DIR}" && cargo build --locked --release --quiet )
 
 echo "==> generating ${OUT}"
 mkdir -p "$(dirname "${OUT}")"
