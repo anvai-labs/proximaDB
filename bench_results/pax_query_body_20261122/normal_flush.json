@@ -1,0 +1,147 @@
+[
+  {
+    "mode": "at_flush_off",
+    "pax_write_directory_at_flush": false,
+    "store": "az",
+    "n": 10000,
+    "flush_batch": 1000,
+    "segments": 10,
+    "directory_objects_at_rest": 0,
+    "queries": 10,
+    "top_k": 10,
+    "recall_at_10": 0.98,
+    "ingest": {
+      "get_ops": 10,
+      "range_gets": 0,
+      "list_ops": 20,
+      "head_ops": 10,
+      "put_ops": 0,
+      "requests": 40,
+      "bytes_read": 7485110,
+      "waves": 40
+    },
+    "cold_first_query_approx": {
+      "get_ops": 10,
+      "range_gets": 10,
+      "list_ops": 1,
+      "head_ops": 0,
+      "put_ops": 0,
+      "requests": 11,
+      "bytes_read": 7485110,
+      "waves": 2
+    },
+    "cold_first_query_adaptive": {
+      "get_ops": 30,
+      "range_gets": 30,
+      "list_ops": 1,
+      "head_ops": 0,
+      "put_ops": 0,
+      "requests": 31,
+      "bytes_read": 7488240,
+      "waves": 4
+    },
+    "cold_metadata": {
+      "get_ops": 20,
+      "range_gets": 20,
+      "list_ops": 0,
+      "head_ops": 0,
+      "requests": 20
+    },
+    "steady": {
+      "queries": 10,
+      "total": {
+        "get_ops": 53,
+        "range_gets": 53,
+        "list_ops": 0,
+        "head_ops": 0,
+        "requests": 53,
+        "bytes_read": 3935826,
+        "waves": 10,
+        "queries_without_waves": 0
+      },
+      "per_query": {
+        "get_ops": 5.3,
+        "range_gets": 5.3,
+        "list_ops": 0.0,
+        "head_ops": 0.0,
+        "waves": 1.0
+      }
+    },
+    "latency": "not measured (emulator latency is not evidence)",
+    "probe_directory_facts_off_first_query_gets": null
+  },
+  {
+    "mode": "at_flush_on",
+    "pax_write_directory_at_flush": true,
+    "store": "az",
+    "n": 10000,
+    "flush_batch": 1000,
+    "segments": 10,
+    "directory_objects_at_rest": 2,
+    "queries": 10,
+    "top_k": 10,
+    "recall_at_10": 0.98,
+    "ingest": {
+      "get_ops": 39,
+      "range_gets": 20,
+      "list_ops": 30,
+      "head_ops": 10,
+      "put_ops": 0,
+      "requests": 79,
+      "bytes_read": 7503855,
+      "waves": 79
+    },
+    "cold_first_query_approx": {
+      "get_ops": 11,
+      "range_gets": 10,
+      "list_ops": 1,
+      "head_ops": 0,
+      "put_ops": 0,
+      "requests": 12,
+      "bytes_read": 7488540,
+      "waves": 3
+    },
+    "cold_first_query_adaptive": {
+      "get_ops": 11,
+      "range_gets": 10,
+      "list_ops": 1,
+      "head_ops": 0,
+      "put_ops": 0,
+      "requests": 12,
+      "bytes_read": 7488540,
+      "waves": 3
+    },
+    "cold_metadata": {
+      "get_ops": 0,
+      "range_gets": 0,
+      "list_ops": 0,
+      "head_ops": 0,
+      "requests": 0
+    },
+    "steady": {
+      "queries": 10,
+      "total": {
+        "get_ops": 53,
+        "range_gets": 53,
+        "list_ops": 0,
+        "head_ops": 0,
+        "requests": 53,
+        "bytes_read": 3935826,
+        "waves": 10,
+        "queries_without_waves": 0
+      },
+      "per_query": {
+        "get_ops": 5.3,
+        "range_gets": 5.3,
+        "list_ops": 0.0,
+        "head_ops": 0.0,
+        "waves": 1.0
+      }
+    },
+    "latency": "not measured (emulator latency is not evidence)",
+    "probe_directory_facts_off_first_query_gets": {
+      "approx": 11,
+      "adaptive": 31
+    }
+  }
+]
