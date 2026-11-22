@@ -2083,10 +2083,7 @@ mod tests {
             "_operator/catalog/_shards/74656e616e742d6f6e65/"
         );
         assert_eq!(
-            DrPathBuilder::system_catalog_shard_manifests_subprefix_from(
-                &canonical,
-                "tenant-one"
-            ),
+            DrPathBuilder::system_catalog_shard_manifests_subprefix_from(&canonical, "tenant-one"),
             DrPathBuilder::system_catalog_shard_manifests_subprefix("tenant-one")
         );
         // Trailing slashes and single-segment prefixes degrade, never panic.

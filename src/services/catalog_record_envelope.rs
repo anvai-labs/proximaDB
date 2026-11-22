@@ -167,7 +167,10 @@ mod tests {
             "enveloped records must lead with the magic"
         );
         assert_eq!(bytes[CATALOG_RECORD_MAGIC.len()], ENVELOPE_FORMAT_VERSION);
-        assert_eq!(bytes[CATALOG_RECORD_MAGIC.len() + 1], BODY_CODEC_MSGPACK_NAMED);
+        assert_eq!(
+            bytes[CATALOG_RECORD_MAGIC.len() + 1],
+            BODY_CODEC_MSGPACK_NAMED
+        );
         let sniffed = sniff_enveloped(&bytes).expect("sniff");
         match &sniffed {
             Enveloped::Enveloped {
@@ -212,7 +215,10 @@ mod tests {
         bytes[CATALOG_RECORD_MAGIC.len()] = ENVELOPE_FORMAT_VERSION + 1;
         let err = sniff_enveloped(&bytes).expect_err("must fail closed");
         let msg = format!("{err:#}");
-        assert!(msg.contains("format version 2"), "error names the version: {msg}");
+        assert!(
+            msg.contains("format version 2"),
+            "error names the version: {msg}"
+        );
         assert!(from_enveloped_slice::<Probe>(&bytes).is_err());
     }
 

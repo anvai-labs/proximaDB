@@ -114,9 +114,8 @@ impl CatalogDelta {
     /// (accepted pre-GA break); this binary decodes both directions by
     /// sniffing the magic.
     pub fn to_operation(&self) -> Result<CanonicalOperation> {
-        let bytes =
-            crate::services::catalog_record_envelope::to_enveloped_vec_named(self)
-                .context("encoding catalog delta")?;
+        let bytes = crate::services::catalog_record_envelope::to_enveloped_vec_named(self)
+            .context("encoding catalog delta")?;
         Ok(CanonicalOperation::CatalogMutation {
             key: self.routing_key(),
             bytes,
@@ -330,13 +329,14 @@ impl CatalogInner {
             self.ns_children.entry(levels.clone()).or_default();
         }
         self.namespaces.extend(shard.namespaces);
-        self.tables
-            .extend(shard.tables.into_iter().map(|(id, schema)| (id, Arc::new(schema))));
+        self.tables.extend(
+            shard
+                .tables
+                .into_iter()
+                .map(|(id, schema)| (id, Arc::new(schema))),
+        );
         self.statistics.extend(shard.statistics);
-        let entry = self
-            .account_ns_high_water
-            .entry(shard.account)
-            .or_insert(0);
+        let entry = self.account_ns_high_water.entry(shard.account).or_insert(0);
         *entry = (*entry).max(account_ns);
     }
 
@@ -865,7 +865,12 @@ impl SystemCatalogState {
     /// dropped ids must stay reserved across compaction, which is exactly
     /// why this map, not the live namespace set, seeds the allocator floors).
     pub fn ns_high_water_accounts(&self) -> std::collections::HashSet<String> {
-        self.inner.read().account_ns_high_water.keys().cloned().collect()
+        self.inner
+            .read()
+            .account_ns_high_water
+            .keys()
+            .cloned()
+            .collect()
     }
 
     /// TD-SPINE-2: serialize the **root** image (global registries + id
@@ -893,8 +898,7 @@ impl SystemCatalogState {
     pub fn to_shard_bytes(&self, account: &str) -> Result<Vec<u8>> {
         let inner = self.inner.read();
         let mut namespaces = HashMap::new();
-        let mut member: std::collections::HashSet<Vec<String>> =
-            std::collections::HashSet::new();
+        let mut member: std::collections::HashSet<Vec<String>> = std::collections::HashSet::new();
         for namespace in inner.namespaces.values() {
             if shard_key_of_tenant(namespace.tenant_id.as_deref()) == account {
                 member.insert(namespace.levels.clone());
@@ -972,10 +976,7 @@ impl SystemCatalogState {
     /// in its index (boot / follower assembly). The root contributes the
     /// global registries and high-water; each shard contributes its
     /// account's rows and per-account namespace-id high-water.
-    pub fn from_root_and_shards(
-        root_bytes: &[u8],
-        shards: &[(String, Vec<u8>)],
-    ) -> Result<Self> {
+    pub fn from_root_and_shards(root_bytes: &[u8], shards: &[(String, Vec<u8>)]) -> Result<Self> {
         let root: CatalogRootRecord =
             crate::services::catalog_record_envelope::from_enveloped_slice(root_bytes)
                 .context("decoding catalog root")?;
@@ -1014,7 +1015,9 @@ impl SystemCatalogState {
                 .context("decoding catalog root")?;
         let mut inner = self.inner.write();
         inner.account_ids = root.account_ids;
-        inner.ids_high_water.merge_max(root.ids_high_water.unwrap_or_default());
+        inner
+            .ids_high_water
+            .merge_max(root.ids_high_water.unwrap_or_default());
         inner.applied_seq = inner.applied_seq.max(root.applied_seq);
         inner.loaded_writer_version = Some(root.writer_version);
         Ok(())
@@ -1534,10 +1537,7 @@ mod tests {
         assert!(op_bytes.starts_with(env::CATALOG_RECORD_MAGIC));
         match CatalogDelta::decode(&op_bytes)? {
             CatalogDelta::UpsertNamespace { .. } => {}
-            other => panic!(
-                "delta round trip mismatch: {}",
-                other.routing_key()
-            ),
+            other => panic!("delta round trip mismatch: {}", other.routing_key()),
         }
 
         let state = SystemCatalogState::new();
@@ -1550,8 +1550,10 @@ mod tests {
         );
         let snapshot_bytes = state.to_snapshot_bytes()?;
         assert!(snapshot_bytes.starts_with(env::CATALOG_RECORD_MAGIC));
-        assert!(SystemCatalogState::from_snapshot_bytes(&snapshot_bytes)?
-            .table_exists(&tid(&["s"], "t")));
+        assert!(
+            SystemCatalogState::from_snapshot_bytes(&snapshot_bytes)?
+                .table_exists(&tid(&["s"], "t"))
+        );
 
         let sidecar_bytes = state.to_identity_high_water_sidecar_bytes()?;
         assert!(sidecar_bytes.starts_with(env::CATALOG_RECORD_MAGIC));
@@ -1610,9 +1612,8 @@ mod tests {
             },
         };
         let fresh = SystemCatalogState::new();
-        fresh.adopt_identity_high_water_sidecar_bytes(&rmp_serde::to_vec_named(
-            &legacy_sidecar,
-        )?)?;
+        fresh
+            .adopt_identity_high_water_sidecar_bytes(&rmp_serde::to_vec_named(&legacy_sidecar)?)?;
         assert_eq!(fresh.max_object_id(), Some(50));
         assert_eq!(fresh.max_collection_id_ever(), Some(7));
         assert_eq!(fresh.max_namespace_id_ever(), Some(3));
@@ -1711,9 +1712,7 @@ mod tests {
     fn seeded_state() -> SystemCatalogState {
         let state = SystemCatalogState::new();
         let mut seq = 0;
-        let mut apply = |state: &SystemCatalogState,
-                         delta: CatalogDelta,
-                         seq: &mut u64| {
+        let mut apply = |state: &SystemCatalogState, delta: CatalogDelta, seq: &mut u64| {
             *seq += 1;
             state.apply_committed(*seq, delta);
         };
@@ -1831,7 +1830,12 @@ mod tests {
         // Full assembly from root + shards reproduces the whole read surface.
         let shards: Vec<(String, Vec<u8>)> = ["_default", "acme", "globex"]
             .iter()
-            .map(|account| ((*account).to_string(), state.to_shard_bytes(account).unwrap()))
+            .map(|account| {
+                (
+                    (*account).to_string(),
+                    state.to_shard_bytes(account).unwrap(),
+                )
+            })
             .collect();
         let rebuilt = SystemCatalogState::from_root_and_shards(&root_bytes, &shards)?;
         for (namespace, table) in [

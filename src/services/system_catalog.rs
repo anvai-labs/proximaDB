@@ -272,9 +272,7 @@ impl SystemCatalog {
     /// ones included, via the per-account high-water), and ids other
     /// accounts minted do not reserve anything for it. Existing ids are
     /// never renumbered; they simply stay owned by their account.
-    fn identity_allocator_seed(
-        state: &SystemCatalogState,
-    ) -> (u64, u64, NamespaceIdAllocator) {
+    fn identity_allocator_seed(state: &SystemCatalogState) -> (u64, u64, NamespaceIdAllocator) {
         let object_floor = state.max_object_id().map_or(1, |id| id.saturating_add(1));
         let mut collection_floor = 1_u64;
         let mut namespace_alloc = NamespaceIdAllocator::default();
@@ -504,14 +502,10 @@ impl SystemCatalog {
                         // Mixed-read source: a whole-image snapshot written
                         // before sharding (or by an escaped pod). Decodes
                         // unchanged; the owner re-publishes it sharded below.
-                        let state =
-                            SystemCatalogState::from_snapshot_bytes(&read.bytes)
-                                .with_context(|| {
-                                    format!(
-                                        "decoding catalog snapshot {}",
-                                        snapshot_store.describe()
-                                    )
-                                })?;
+                        let state = SystemCatalogState::from_snapshot_bytes(&read.bytes)
+                            .with_context(|| {
+                                format!("decoding catalog snapshot {}", snapshot_store.describe())
+                            })?;
                         state.replay(&entries)?;
                         needs_shard_migration = true;
                         (state, read.version, read.generation, HashMap::new())
@@ -530,7 +524,8 @@ impl SystemCatalog {
             // Kill switch OFF on a store that HAD sharding on: assemble the
             // (newer) sharded image so the escape loses nothing, claim above
             // its generation, and re-seed the legacy whole-image log below.
-            let (state, versions) = Self::assemble_root_and_shards(&root_read, snapshot_store.as_ref()).await?;
+            let (state, versions) =
+                Self::assemble_root_and_shards(&root_read, snapshot_store.as_ref()).await?;
             state.replay(&entries)?;
             let legacy_generation = snapshot_store
                 .read()
@@ -547,10 +542,9 @@ impl SystemCatalog {
         } else {
             match snapshot_store.read().await? {
                 Some(read) => {
-                    let state =
-                        SystemCatalogState::from_snapshot_bytes(&read.bytes).with_context(|| {
-                            format!("decoding catalog snapshot {}", snapshot_store.describe())
-                        })?;
+                    let state = SystemCatalogState::from_snapshot_bytes(&read.bytes).with_context(
+                        || format!("decoding catalog snapshot {}", snapshot_store.describe()),
+                    )?;
                     state.replay(&entries)?;
                     (state, read.version, read.generation, HashMap::new())
                 }
@@ -1022,9 +1016,9 @@ impl SystemCatalog {
             .map(|account| {
                 Ok((
                     account.clone(),
-                    self.state.to_shard_bytes(account).with_context(|| {
-                        format!("serializing catalog shard '{account}'")
-                    })?,
+                    self.state
+                        .to_shard_bytes(account)
+                        .with_context(|| format!("serializing catalog shard '{account}'"))?,
                 ))
             })
             .collect::<Result<Vec<_>>>()?;
@@ -1153,7 +1147,8 @@ impl SystemCatalog {
         // ONLY the shards whose versions changed (never swap the whole
         // image). Falls back to the legacy whole-image reload when no root
         // has been published yet (mixed-read: pre-migration or escaped pods).
-        if sharded_catalog_snapshots_enabled() && cfg.store.supports_sharded_publish()
+        if sharded_catalog_snapshots_enabled()
+            && cfg.store.supports_sharded_publish()
             && let Some(root_read) = cfg.store.read_root().await?
         {
             return self.reload_sharded_locked(cfg, root_read).await;
@@ -1195,15 +1190,15 @@ impl SystemCatalog {
             }
             match cfg.store.read_shard(account).await? {
                 Some(read) => {
-                    self.state.load_shard_bytes(account, &read.bytes).with_context(
-                        || {
+                    self.state
+                        .load_shard_bytes(account, &read.bytes)
+                        .with_context(|| {
                             format!(
                                 "reloading catalog '{}' shard '{account}' from {}",
                                 self.name,
                                 cfg.store.describe()
                             )
-                        },
-                    )?;
+                        })?;
                     updated.insert(account.clone(), read.version);
                 }
                 None => tracing::warn!(
@@ -1237,7 +1232,8 @@ impl SystemCatalog {
         }
         self.merge_namespace_allocator_seed();
         *self.shard_versions.write() = updated;
-        self.loaded_version.store(root_read.version, Ordering::SeqCst);
+        self.loaded_version
+            .store(root_read.version, Ordering::SeqCst);
         self.loaded_generation
             .store(root_read.generation, Ordering::SeqCst);
         let superseded = root_read.generation > self.generation.load(Ordering::SeqCst);
@@ -3814,7 +3810,8 @@ mod tests {
         );
         // Sanity: the DDL is durable and visible after a fresh boot.
         drop(owner);
-        let reopened = open_owner_counting(&dir.path().join("owner.wal"), &ledger, &backing).await?;
+        let reopened =
+            open_owner_counting(&dir.path().join("owner.wal"), &ledger, &backing).await?;
         assert!(
             reopened
                 .table_exists(&TableIdentifier::new(small_ns, "second"))
@@ -3844,7 +3841,11 @@ mod tests {
         // Follower boots from root + both shards.
         let follower =
             open_follower_counting(&dir.path().join("follower.wal"), &ledger, &backing).await?;
-        assert!(follower.table_exists(&TableIdentifier::new(big_ns.clone(), "t000")).await?);
+        assert!(
+            follower
+                .table_exists(&TableIdentifier::new(big_ns.clone(), "t000"))
+                .await?
+        );
         ledger.reset();
 
         // Owner DDLs in the SMALL account and republishes.
@@ -3920,11 +3921,13 @@ mod tests {
         // 1. A pre-SPINE-2 writer publishes whole-image snapshots only.
         {
             let _guard = EnvGuard::set("PROXIMADB_CATALOG_SHARDED_SNAPSHOT_DISABLE", "1");
-            let store = Arc::new(crate::services::catalog_snapshot_store::ObjectStoreSnapshotStore::new(
-                proximadb_object_store::ProximaObjectStore::new(backing.clone()),
-                "memory:///",
-                legacy_prefix,
-            ));
+            let store = Arc::new(
+                crate::services::catalog_snapshot_store::ObjectStoreSnapshotStore::new(
+                    proximadb_object_store::ProximaObjectStore::new(backing.clone()),
+                    "memory:///",
+                    legacy_prefix,
+                ),
+            );
             let legacy = SystemCatalog::open_with_snapshot_store(
                 "default",
                 dir.path().join("legacy.wal"),
@@ -3932,7 +3935,11 @@ mod tests {
             )
             .await?;
             legacy
-                .create_namespace_for_tenant(&nslevels(&["acme", "sales"]), HashMap::new(), Some("acme"))
+                .create_namespace_for_tenant(
+                    &nslevels(&["acme", "sales"]),
+                    HashMap::new(),
+                    Some("acme"),
+                )
                 .await?;
             create_named(&legacy, &nslevels(&["acme", "sales"]), "orders").await?;
             create_named(&legacy, &nslevels(&["acme", "sales"]), "customers").await?;
@@ -3943,19 +3950,27 @@ mod tests {
 
         // 2. The new binary boots (kill switch unset = sharded): it reads the
         //    legacy whole image, then re-publishes root + the acme shard.
-        let store = Arc::new(crate::services::catalog_snapshot_store::ObjectStoreSnapshotStore::new(
-            proximadb_object_store::ProximaObjectStore::new(backing.clone()),
-            "memory:///",
-            legacy_prefix,
-        ));
+        let store = Arc::new(
+            crate::services::catalog_snapshot_store::ObjectStoreSnapshotStore::new(
+                proximadb_object_store::ProximaObjectStore::new(backing.clone()),
+                "memory:///",
+                legacy_prefix,
+            ),
+        );
         let migrated = SystemCatalog::open_with_snapshot_store(
             "default",
             dir.path().join("owner.wal"),
             store.clone(),
         )
         .await?;
-        let root = store.read_root().await?.expect("migration published a root");
-        let (_, _, _, _, index) = crate::services::system_catalog_state::SystemCatalogState::decode_catalog_root(&root.bytes)?;
+        let root = store
+            .read_root()
+            .await?
+            .expect("migration published a root");
+        let (_, _, _, _, index) =
+            crate::services::system_catalog_state::SystemCatalogState::decode_catalog_root(
+                &root.bytes,
+            )?;
         assert!(
             index.contains_key("acme"),
             "the root index names the migrated account: {index:?}"
@@ -3965,20 +3980,23 @@ mod tests {
         // Both tables live in the shard image.
         assert!(
             migrated
-                .table_exists(&TableIdentifier::new(nslevels(&["acme", "sales"]), "orders"))
+                .table_exists(&TableIdentifier::new(
+                    nslevels(&["acme", "sales"]),
+                    "orders"
+                ))
                 .await?
         );
 
         // 3. A follower assembles root + shards and sees the migrated rows.
-        let follower = SystemCatalog::open_follower(
-            "default",
-            dir.path().join("follower.wal"),
-            store.clone(),
-        )
-        .await?;
+        let follower =
+            SystemCatalog::open_follower("default", dir.path().join("follower.wal"), store.clone())
+                .await?;
         assert!(
             follower
-                .table_exists(&TableIdentifier::new(nslevels(&["acme", "sales"]), "customers"))
+                .table_exists(&TableIdentifier::new(
+                    nslevels(&["acme", "sales"]),
+                    "customers"
+                ))
                 .await?
         );
         // And the legacy chain is still readable (mixed-read: nothing was
@@ -3988,7 +4006,10 @@ mod tests {
             crate::services::system_catalog_state::SystemCatalogState::from_snapshot_bytes(
                 &legacy_read.bytes
             )?
-            .table_exists(&TableIdentifier::new(nslevels(&["acme", "sales"]), "orders"))
+            .table_exists(&TableIdentifier::new(
+                nslevels(&["acme", "sales"]),
+                "orders"
+            ))
         );
         Ok(())
     }
@@ -4006,11 +4027,13 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let backing: Arc<dyn object_store::ObjectStore> =
             Arc::new(object_store::memory::InMemory::new());
-        let store = Arc::new(crate::services::catalog_snapshot_store::ObjectStoreSnapshotStore::new(
-            proximadb_object_store::ProximaObjectStore::new(backing.clone()),
-            "memory:///",
-            "_operator/catalog/_manifests/",
-        ));
+        let store = Arc::new(
+            crate::services::catalog_snapshot_store::ObjectStoreSnapshotStore::new(
+                proximadb_object_store::ProximaObjectStore::new(backing.clone()),
+                "memory:///",
+                "_operator/catalog/_manifests/",
+            ),
+        );
         let owner = SystemCatalog::open_with_snapshot_store(
             "default",
             dir.path().join("owner.wal"),
@@ -4018,7 +4041,11 @@ mod tests {
         )
         .await?;
         owner
-            .create_namespace_for_tenant(&nslevels(&["acme", "sales"]), HashMap::new(), Some("acme"))
+            .create_namespace_for_tenant(
+                &nslevels(&["acme", "sales"]),
+                HashMap::new(),
+                Some("acme"),
+            )
             .await?;
         create_named(&owner, &nslevels(&["acme", "sales"]), "orders").await?;
         let root_v1 = store.read_root().await?.expect("root published").version;
@@ -4028,15 +4055,15 @@ mod tests {
             )?;
 
         // Follower adopts root v1.
-        let follower = SystemCatalog::open_follower(
-            "default",
-            dir.path().join("follower.wal"),
-            store.clone(),
-        )
-        .await?;
+        let follower =
+            SystemCatalog::open_follower("default", dir.path().join("follower.wal"), store.clone())
+                .await?;
         assert!(
             follower
-                .table_exists(&TableIdentifier::new(nslevels(&["acme", "sales"]), "orders"))
+                .table_exists(&TableIdentifier::new(
+                    nslevels(&["acme", "sales"]),
+                    "orders"
+                ))
                 .await?
         );
 
@@ -4075,7 +4102,10 @@ mod tests {
         }
         assert!(
             follower
-                .table_exists(&TableIdentifier::new(nslevels(&["acme", "sales"]), "orders"))
+                .table_exists(&TableIdentifier::new(
+                    nslevels(&["acme", "sales"]),
+                    "orders"
+                ))
                 .await?
         );
         assert!(
@@ -4171,12 +4201,19 @@ mod tests {
             state.apply_committed(
                 seq,
                 CatalogDelta::UpsertTable {
-                    identifier: TableIdentifier::new(nslevels(&["acme", "sales"]), format!("t{id}")),
+                    identifier: TableIdentifier::new(
+                        nslevels(&["acme", "sales"]),
+                        format!("t{id}"),
+                    ),
                     schema: Box::new(schema),
                 },
             );
         }
-        let cat = SystemCatalog::new("legacy", state, Arc::new(crate::services::canonical_wal::MemoryTableWalAppender::new()));
+        let cat = SystemCatalog::new(
+            "legacy",
+            state,
+            Arc::new(crate::services::canonical_wal::MemoryTableWalAppender::new()),
+        );
         // The per-account floor for acme sits above ITS OWN high-water (5)…
         let acme_ns2 = nslevels(&["acme", "hr"]);
         // (namespace must exist for the typed mint to fire)
@@ -4186,11 +4223,18 @@ mod tests {
         let minted = cat
             .create_table(&TableIdentifier::new(acme_ns2, "people"), schema)
             .await?;
-        assert_eq!(minted.stable_namespace_id, Some(6), "acme continues above its own high-water");
+        assert_eq!(
+            minted.stable_namespace_id,
+            Some(6),
+            "acme continues above its own high-water"
+        );
         // …and every pre-existing id is still exactly what it was.
         for id in 1_u16..=5 {
             let table = cat
-                .get_table(&TableIdentifier::new(nslevels(&["acme", "sales"]), format!("t{id}")))
+                .get_table(&TableIdentifier::new(
+                    nslevels(&["acme", "sales"]),
+                    format!("t{id}"),
+                ))
                 .await?;
             assert_eq!(table.stable_namespace_id, Some(id));
         }
@@ -4210,11 +4254,13 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let backing: Arc<dyn object_store::ObjectStore> =
             Arc::new(object_store::memory::InMemory::new());
-        let store = Arc::new(crate::services::catalog_snapshot_store::ObjectStoreSnapshotStore::new(
-            proximadb_object_store::ProximaObjectStore::new(backing.clone()),
-            "memory:///",
-            "_operator/catalog/_manifests/",
-        ));
+        let store = Arc::new(
+            crate::services::catalog_snapshot_store::ObjectStoreSnapshotStore::new(
+                proximadb_object_store::ProximaObjectStore::new(backing.clone()),
+                "memory:///",
+                "_operator/catalog/_manifests/",
+            ),
+        );
         let _guard = EnvGuard::set("PROXIMADB_CATALOG_SHARDED_SNAPSHOT_DISABLE", "1");
         let cat = SystemCatalog::open_with_snapshot_store(
             "default",
@@ -4222,7 +4268,8 @@ mod tests {
             store.clone(),
         )
         .await?;
-        cat.create_namespace(&nslevels(&["s"]), HashMap::new()).await?;
+        cat.create_namespace(&nslevels(&["s"]), HashMap::new())
+            .await?;
         create_named(&cat, &nslevels(&["s"]), "t1").await?;
 
         // The legacy whole-image log carried the publish…

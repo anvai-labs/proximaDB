@@ -421,13 +421,16 @@ async fn read_log_tip(
     what: &str,
     label: &str,
 ) -> Result<Option<SnapshotRead>> {
-    match committer.latest_version().await.with_context(|| {
-        format!("reading catalog snapshot {what} log {label}")
-    })? {
+    match committer
+        .latest_version()
+        .await
+        .with_context(|| format!("reading catalog snapshot {what} log {label}"))?
+    {
         Some(version) => {
-            let (generation, payload) = committer.read_fenced(version).await.with_context(|| {
-                format!("reading catalog snapshot {what} {label}@{version}")
-            })?;
+            let (generation, payload) = committer
+                .read_fenced(version)
+                .await
+                .with_context(|| format!("reading catalog snapshot {what} {label}@{version}"))?;
             Ok(Some(SnapshotRead {
                 version,
                 generation,
@@ -593,8 +596,9 @@ impl CatalogSnapshotStore for ObjectStoreSnapshotStore {
             match committer
                 .commit_fenced(parent, generation, bytes::Bytes::from(bytes.clone()))
                 .await
-                .with_context(|| format!("committing catalog shard '{account}' at {}", self.label))?
-            {
+                .with_context(|| {
+                    format!("committing catalog shard '{account}' at {}", self.label)
+                })? {
                 CommitOutcome::Committed(version) => {
                     versions.insert(account.clone(), version);
                 }
@@ -617,7 +621,11 @@ impl CatalogSnapshotStore for ObjectStoreSnapshotStore {
             .with_context(|| format!("reading catalog snapshot root head {}", self.label))?;
         match self
             .root_committer
-            .commit_fenced(parent, generation, bytes::Bytes::copy_from_slice(root_bytes))
+            .commit_fenced(
+                parent,
+                generation,
+                bytes::Bytes::copy_from_slice(root_bytes),
+            )
             .await
             .with_context(|| format!("committing catalog snapshot root {}", self.label))?
         {
@@ -941,7 +949,8 @@ mod tests {
     async fn sharded_surface_round_trips_and_fences_stale_writers() -> Result<()> {
         let backing =
             ProximaObjectStore::new(std::sync::Arc::new(object_store::memory::InMemory::new()));
-        let store = ObjectStoreSnapshotStore::new(backing, "memory:///", "_operator/catalog/_manifests/");
+        let store =
+            ObjectStoreSnapshotStore::new(backing, "memory:///", "_operator/catalog/_manifests/");
         assert!(store.supports_sharded_publish());
 
         // Empty: no root, no shard.
@@ -972,7 +981,10 @@ mod tests {
         assert_eq!((root.version, root.generation), (0, 2));
         assert_eq!(root.bytes, b"root-v1");
         let acme = store.read_shard("acme").await?.expect("acme shard");
-        assert_eq!((acme.version, acme.generation, acme.bytes.as_slice()), (0, 2, b"acme-shard-v1"));
+        assert_eq!(
+            (acme.version, acme.generation, acme.bytes.as_slice()),
+            (0, 2, b"acme-shard-v1")
+        );
 
         // A stale writer (generation 1) is fenced on BOTH surfaces, and the
         // stale shard commit is rejected BEFORE any root moves.
@@ -982,8 +994,14 @@ mod tests {
                 .await?,
             ShardCommit::Fenced
         );
-        assert_eq!(store.commit_root(1, b"stale-root").await?, SnapshotWrite::Fenced);
-        assert_eq!(store.read_shard("acme").await?.unwrap().bytes, b"acme-shard-v1");
+        assert_eq!(
+            store.commit_root(1, b"stale-root").await?,
+            SnapshotWrite::Fenced
+        );
+        assert_eq!(
+            store.read_shard("acme").await?.unwrap().bytes,
+            b"acme-shard-v1"
+        );
         assert_eq!(store.read_root().await?.unwrap().bytes, b"root-v1");
 
         // The legacy whole-image log is untouched by the sharded path.
@@ -1033,7 +1051,9 @@ mod tests {
         );
         assert_eq!(
             Path::from(format!("_operator/catalog/_shards/{hex}/").as_str()),
-            Path::from(DrPathBuilder::system_catalog_shard_manifests_subprefix("tenant one/x").as_str())
+            Path::from(
+                DrPathBuilder::system_catalog_shard_manifests_subprefix("tenant one/x").as_str()
+            )
         );
         Ok(())
     }
