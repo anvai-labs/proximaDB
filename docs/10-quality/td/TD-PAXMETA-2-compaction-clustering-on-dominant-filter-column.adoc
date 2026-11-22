@@ -24,6 +24,17 @@ column (time-ordered ingest filtered on time, one tag per flush batch).
 
 == Fix direction
 
+*Amended 2026-11-22 (ADR-099, owner input 2026-11-21):* the ordering within a cell takes
+**vector precedence** — the primary order stays the A0/PCA cell order (vector locality, which
+ANN scan cost depends on), and the dominant filter column is the *secondary* sort inside each
+cell. Rationale: the filter columns this optimizes for (filename, subject, area, tenant tag)
+are low-cardinality and encode well at any position, while vector locality is the expensive
+property to lose; conversely a scalar-primary order is the TD-FPRUNE-3 partition layout, which
+cost unfiltered recall. This matches the Iceberg-side z-order intuition from the ADR-099
+thought experiment (Morton/Hilbert over scalars with vector-primary clustering), implemented
+where it does not disturb the cell extents.
+
+
 * Record a per-collection **dominant filter column** (off by default) — explicit config, or
   derived from the filter-column histogram the query path already observes.
 * At compaction, order rows within each coarse cell (or within each output segment when the

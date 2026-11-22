@@ -1,0 +1,48 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-ICEPROJ-1: build the ADR-099 unified Iceberg projection (vector columns, CSR adjacency, any-column export) and its bake-off
+:status: Open
+:dim: D4
+:pillar: PERF
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open** (filed 2026-11-22 with ADR-099; sequenced after TD-SPINE-1/2 unless the owner re-prioritizes).
+| Priority | MEDIUM (strategy: unlocks ecosystem interop + one-plan cross-modality queries; not on the serving path).
+| Component | Iceberg export seam (`crates/storage/proximadb-iceberg-engine`, ADR-097 S4/S7), ORION projection, document store projection, publish orchestration.
+| Relates to | link:../../12-design/adr/ADR-099-unified-iceberg-projection.adoc[ADR-099] (owns the decisions); link:../../12-design/adr/ADR-097-foundational-seams-single-logical-ir.adoc[ADR-097] S4/S7; TD-SPINE-3/4 (projection tables inherit metadata GC, manifest pruning, lazy footers); TD-PAXMETA-2.
+|===
+
+== Problem
+
+ADR-099 keeps PAX/PXCD and ORION as the hot formats and designates Iceberg as the cold store
+and interop seam, but today's export (ADR-097 S4/S7) is row-per-edge graph rows, no vector
+columns, and a filterable-only column restriction — so external engines cannot read vector
+data, graph traversals degrade to filter-scans, and a single DataFusion plan cannot join the
+three modalities on one snapshot.
+
+== Work items
+
+. *Vector columns:* export id + f32/f16 as `fixed(L)`/`binary`; optional SQ8 and RaBitQ variants
+  with the per-segment model in Iceberg file metadata / column properties (an ignorable
+  convention for external engines); configurable projection shape (full rows | id + vector).
+. *CSR adjacency:* node table + `(node_id, list<neighbor_id>, …edge props)` adjacency table
+  (ADR-099 D2); replaces the row-per-edge projection.
+. *Any-column export:* lift the filterable-only restriction at the projection layer (the
+  restriction remains a directory-side cost cap, ADR-042).
+. *Document payloads:* Jsonb/MessagePack as `binary` + type tag in schema metadata.
+. *One-plan proof:* an end-to-end query joining vector candidates ⋈ graph adjacency ⋈ document
+  filters over one snapshot via DataFusion (the ADR-099 D3 acceptance).
+. *Bake-off (ADR-099 D5):* per-modality measured comparisons on the request-count harness
+  (emulator, deterministic counts) + real-cloud latency when available: projection-vs-PAX ANN
+  (S/25% count criterion), CSR one-hop vs ORION answer-set parity, per-hop GET counts.
+
+== Acceptance
+
+. A Spark/Trino/DuckDB (or pyiceberg) client reads vector bytes and CSR adjacency from the
+   projection tables without ProximaDB code.
+. The D3 cross-modality query returns the same rows as the equivalent engine-bridged query.
+. Bake-off table recorded in `BENCHMARK_EVIDENCE.toml` (counts measured; latency marked as a
+   real-cloud follow-up), and each D5 exit criterion answered yes/no with evidence.
+. Projection freshness is asynchronous and never on the serving path (assert in tests).
