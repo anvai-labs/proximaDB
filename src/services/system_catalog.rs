@@ -3888,7 +3888,7 @@ mod tests {
             0,
             "reload must not touch the unchanged big shard at all"
         );
-        assert_eq!(
+        assert!(
             ledger.get_count_matching(&format!(
                 "_shards/{}",
                 hex_segment("small-tenant")
