@@ -305,9 +305,10 @@ link:https://github.com/anvai-labs/proximaDB/actions/runs/45030315199/job/137254
   binary. Leave the broad check, Clippy and coverage intact. Separate the
   build and execution timestamps on the same runner. Compare fresh and
   warm runs under one and two compiler jobs before raising the limit.
-  GNU time reports maximum process RSS. The VM samples report host free
-  memory, paging and swap. Readable v2 cgroup counters before and after
-  the build report that group's high-water marks and pressure. A group
+  GNU time reports maximum process RSS. Minute samples report host available memory, swap and paging, the
+  four largest compiler/linker RSS values in KiB, and each rustc crate
+  name. Readable v2 cgroup counters report usage, high-water marks,
+  OOM events and pressure during the build. A group
   can include earlier steps or other processes. Runner loss can prevent
   log upload.
 . *Reuse dependencies where it pays.* The enterprise job restores the
@@ -335,3 +336,107 @@ link:https://github.com/anvai-labs/proximaDB/actions/runs/45030315199/job/137254
   any root-harness coverage. Compare largest process RSS and whole-job
   memory high-water marks because one rustc/link can exceed the available
   memory even with Cargo concurrency capped at one.
+
+=== CI build cost and dependency audit on develop a0a084d5a
+
+*Keep correctness gates required when selected.* The enterprise check exercises
+catalog test targets, feature-enabled REST behavior and lint. On #2563 GitHub
+reported loss of contact with its hosted runner during the combined build/test
+step. The preceding check succeeded. The required aggregate correctly failed.
+No OOM counter or compiler failure survived that attempt. A retry of the same
+lane on #2565 succeeded on unchanged code. Its URL lockfile change and #2563's
+both matched the enterprise selector. An optional check would allow a broken
+catalog route to land. Keep exploratory timing comparisons advisory until a
+repeatable baseline can support a regression limit.
+link:https://github.com/anvai-labs/proximaDB/actions/runs/45057408698/job/137338489857[#2563 runner loss] and
+link:https://github.com/anvai-labs/proximaDB/actions/runs/45058443254/job/137342002619[#2565 retry].
+
+[cols="2,2,3",options="header"]
+|===
+| Measured work on #2562, first attempt | Runner time | Decision
+| Seven default-feature integration lanes
+| 134.7 min combined, including 99.4 min in their first Cargo builds
+| Pilot shared compilation for cluster and API. Keep query/storage stack sizes, ignored replays, authz features and fixture isolation intact.
+| Cluster and API together
+| 29.8 min. First builds took 13m49s and 12m59s.
+| One checkout, cache restore and target directory. Run both lists in separate steps on one runner. Each failure fails the gate. Reuse requires a successful combined job.
+| Seventeen other feature-matrix jobs
+| 137.4 min combined. ONNX/CDC/DuckDB took 26.6 min.
+| Retain distinct feature combinations. Shadow affected-package and reverse-dependency selection for narrow PRs. Broad changes and promotions still need full coverage.
+| Burn-down integration suite
+| Build 17m24s, execute 642 tests across 68 binaries in 5m51s.
+| Include build, archive compression, transfer, runner disk and queue time before splitting this suite.
+| Query lane
+| All 29 query-cache cases ran three times under identical settings.
+| Deduplicate overlapping globs in first-match order. Keep the facade zero-test guard. All 12 distinct query invocations are preserved.
+|===
+link:https://github.com/anvai-labs/proximaDB/actions/runs/45030315199[Source run].
+Times are summed job spans. Parallel jobs overlap on the PR clock. The retained
+first-attempt logs account for 437.8 runner-minutes plus 75.0 minutes recorded for
+the enterprise job whose log was lost. The burn-down and cluster/API rows are
+subsets of the seven lanes.
+
+*Thought experiment for cluster and API.* Let S be the common compilation
+time avoided on the second suite. Holding other durations fixed, a serial
+combined job costs approximately 29.8 − S minutes. Sharing the entire shorter
+first build would put S at 12m59s. Each suite still links its own test targets,
+so the measured saving can be smaller. On that run the unit job took 38m43s,
+which leaves room to reduce runner-minutes without lengthening the PR.
+Compare the combined job with both old jobs across similar cache states. Check
+the 18 API and 127 cluster case IDs from this sample, time to the aggregate,
+failures and memory high-water marks before extending the pattern.
+
+==== Cargo build graph
+
+Counted unique package IDs with Cargo 1.100 on x86_64 Linux. The starting root
+default graph has 761 normal/build packages, 799 with dev edges. Enterprise has
+763 and 801 respectively. The two extra packages in the enterprise test graph
+are `hyper-tls` and `tokio-native-tls`. Features also change code inside existing
+packages. The standalone catalog with Unity, Polaris and Delta features has
+345 packages including dev edges. The root also pulls 30 DataFusion packages.
+The bundled DuckDB, ONNX runtime and AWS SDK are already outside this enterprise
+graph. Preserve their explicit feature lanes.
+
+Audited the root crate's 262 normal, seven build and eleven dev declarations
+and screened the manifests and Rust targets of 153 workspace packages. Literal
+absence is a lead for checking generated code, Cargo features, targets, renamed
+libraries and owners. The root build script uses only the standard library.
+Remove its seven host edges, including the duplicate Avro compilation.
+The proto crate retains its regeneration dependency, and the reader retains
+runtime Avro. Remove unused `flume` and `tracing-appender` root edges. The server
+application owns its logging appender. Neither the root nor the block-format
+crate imports `proptest` in any Rust target, so their dev edges can also go.
+The remaining integration and bench dependencies have concrete consumers.
+For example, the OIDC unit tests use `httpmock`.
+
+For the enterprise root unit-test binary the plan falls from *1,018 to 970
+Cargo units*, and from 801 to 789 package IDs. A unit can be a crate, build
+script, or alternate feature/profile compilation. These counts describe work
+Cargo plans. A cache hit can satisfy a unit immediately.
+
+[cols="3,1,1,2",options="header"]
+|===
+| Local manifest experiment | Units | Packages | Root build modes
+| Applied cleanup | 970 | 789 | Test and normal library
+| Move embedded fixtures and their ABAC forwarding to their owning package | 968 | 788 | Test only
+| Isolate Criterion benchmarks | 956 | 775 | Test and normal library
+| Both moves | 954 | 774 | Test only
+|===
+
+The root dev-depends on `proximadb-embedded`, which links the normal root
+library back into the test graph. Removing that edge saves just two units but
+eliminates an entire root compilation. Eleven integration files and three
+bench files use the embedded API. Preserve their invocations, features and
+ABAC behavior before relocating them. Criterion also has real bench callers.
+The last three rows came from disposable manifest edits. Their test suites
+were not migrated or timed. Compare peak RSS and compiler wall time by crate,
+especially both root build modes, before choosing between them.
+
+Run `cargo tree --locked -p proximadb -e normal,build,dev --features enterprise-catalogs`
+to inspect package paths. On the pinned toolchain, the local diagnostic
+`RUSTC_BOOTSTRAP=1 cargo test --locked -p proximadb --lib --features enterprise-catalogs -Z unstable-options --unit-graph`
+emits the build plan without compiling. Count `units` and distinct `pkg_id`
+values. The hosted build keeps the standard stable Cargo invocation and
+uploads its Cargo timing report. Compare healthy runs under one and two build
+jobs with the same inputs and cache provenance. Treat maximum RSS for one
+process and the runner's cgroup peak as separate measurements.

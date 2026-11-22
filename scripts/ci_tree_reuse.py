@@ -159,8 +159,7 @@ GROUPS: tuple[Group, ...] = (
         exact=("Rust Integration Tests (pgwire accuracy)",),
     ),
     Group("rust-integration-test-graph", exact=("Rust Integration Tests (graph)",)),
-    Group("rust-integration-test-cluster", exact=("Rust Integration Tests (cluster)",)),
-    Group("rust-integration-test-api", exact=("Rust Integration Tests (api surface)",)),
+    Group("rust-integration-test-cluster-api", exact=("Rust Integration Tests (cluster and API)",)),
     Group("rust-integration-test-burndown", exact=("Rust Integration Tests (burn-down)",)),
     Group("object-store-emulator-tests", exact=("Object-store Cool tier (emulators)",)),
     Group(

@@ -35,6 +35,3 @@ proximadb-filter-expression = { workspace = true }
 
 # FP16 support for the configurable tier-2 rerank column
 half = "2.4"
-
-[dev-dependencies]
-proptest = "1"

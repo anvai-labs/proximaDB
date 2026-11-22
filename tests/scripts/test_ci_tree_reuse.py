@@ -71,8 +71,7 @@ JOB_NAMES = [
     "Rust Integration Tests (query)",
     "Rust Integration Tests (pgwire accuracy)",
     "Rust Integration Tests (graph)",
-    "Rust Integration Tests (cluster)",
-    "Rust Integration Tests (api surface)",
+    "Rust Integration Tests (cluster and API)",
     "Rust Integration Tests (burn-down)",
     "Object-store Cool tier (emulators)",
     "Object-store restart recovery (Azurite)",
@@ -386,6 +385,14 @@ class RunsEverything(unittest.TestCase):
         )
         self.assertNotIn("rust-test", d.reused)
         self.assertIn("feature-matrix", d.reused)
+
+    def test_old_standalone_suite_success_cannot_skip_combined_job(self):
+        combined = "Rust Integration Tests (cluster and API)"
+        recorded = [job for job in jobs() if job["name"] != combined]
+        for old_name in ("Rust Integration Tests (cluster)", "Rust Integration Tests (api surface)"):
+            recorded.append({"name": old_name, "status": "completed", "conclusion": "success"})
+        decision = decide(FakeApi([run(100)], {100: recorded}))
+        self.assertNotIn("rust-integration-test-cluster-api", decision.reused)
 
     def test_partially_skipped_group_is_not_proven(self):
         r = run(100)

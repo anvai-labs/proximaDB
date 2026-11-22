@@ -1716,18 +1716,28 @@ jobs:
         env:
           CARGO_BUILD_JOBS: "1"
         run: |
+          # Sample during the build. A lost runner can never run its EXIT trap.
+          # Report crate names and RSS only. Linker argument lists can be huge.
           cgroup=$(awk -F: '$1 == "0" {print $3}' /proc/self/cgroup)
           report_memory() {
-            for metric in memory.peak memory.swap.peak memory.events memory.pressure; do
+            date -u
+            awk '/^(MemAvailable|SwapFree):/' /proc/meminfo
+            awk '/^(pswpin|pswpout) /' /proc/vmstat
+            for metric in memory.current memory.peak memory.swap.current memory.swap.peak memory.events memory.pressure; do
               file="/sys/fs/cgroup${cgroup}/${metric}"
               if [[ -n "$cgroup" && -r "$file" ]]; then
                 echo "$metric"
                 cat "$file"
               fi
             done
+            ps -eww -o rss=,comm=,args= | awk '
+              $2 ~ /^(rustc|rust-lld|ld\.lld|ld|cc1plus)$/ {
+                crate = "-"
+                for (i=3; i<NF; i++) if ($i=="--crate-name") { crate=$(i+1); break }
+                print $1, $2, crate
+              }' | sort -nr | awk 'NR<=4 {print "compiler_rss_KiB", $0}'
           }
-          report_memory
-          vmstat -w -t 60 &
+          (while true; do report_memory; sleep 60; done) &
           sampler_pid=$!
           trap 'kill "$sampler_pid" 2>/dev/null || true; report_memory' EXIT
           /usr/bin/time -v cargo test -p proximadb --lib --features enterprise-catalogs --no-run --timings
@@ -3200,8 +3210,12 @@ jobs:
           # step, not the job: job-level RUST* env changes the rust-cache key.
           RUST_MIN_STACK: "8388608"
         run: |
-          for test_file in tests/*query*.rs tests/*federated*.rs tests/*cache*.rs tests/filtered_ann_recall_bands.rs tests/query_cache_test.rs tests/vector_ann_recall_e2e.rs tests/retrieval_quality_gates.rs tests/nl_translate_eval.rs; do
-            if [ -f "$test_file" ]; then
+          # Overlapping globs selected query_cache_test three times. Preserve
+          # first-match order and run each target once with the same stack.
+          declare -A ran_query_target=()
+          for test_file in tests/*query*.rs tests/*federated*.rs tests/*cache*.rs tests/filtered_ann_recall_bands.rs tests/vector_ann_recall_e2e.rs tests/retrieval_quality_gates.rs tests/nl_translate_eval.rs; do
+            if [[ -f "$test_file" && -z "${ran_query_target[$test_file]:-}" ]]; then
+              ran_query_target["$test_file"]=1
               test_name=$(basename "$test_file" .rs)
               echo "Running $test_name..."
               cargo test --test "$test_name" -- --test-threads=1
@@ -3354,16 +3368,14 @@ jobs:
             fi
           done
 
-  rust-integration-test-cluster:
-    name: Rust Integration Tests (cluster)
+  # Both suites use identical change selectors, runner image, features,
+  # cache, stack and serial execution. Keep one target/ on the runner so
+  # the second suite links its own tests against the compiled dependencies.
+  # A reusable success on this job proves both suites ran together.
+  rust-integration-test-cluster-api:
+    name: Rust Integration Tests (cluster and API)
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
-    # was 45; green spans reach 30-34 min across the integration legs
-    # TD-CITIER-1 precedent (rust-test, authz): NO `rust-build` in needs —
-    # nothing here downloads its artifact; the lane compiles its own tests
-    # from the shared dev-test rust-cache shape. The edge only serialized
-    # this lane (the run's last-to-finish job) behind Rust Build (dev) for
-    # no artifact; start it as soon as change detection finishes.
+    timeout-minutes: 75
     needs: [changes]
     if: |
       !inputs.skip_tests &&
@@ -3371,10 +3383,11 @@ jobs:
       needs.changes.outputs.rust == 'true' &&
       (needs.changes.outputs.network_changes == 'true' ||
        needs.changes.outputs.core_changes == 'true') &&
-      !contains(needs.changes.outputs.reused, ',rust-integration-test-cluster,')
+      !contains(needs.changes.outputs.reused, ',rust-integration-test-cluster-api,')
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/rust-setup
+        id: setup
         with:
           shared-key: "dev-test"
           save-if: false
@@ -3389,53 +3402,17 @@ jobs:
               cargo test --test "$test_name" -- --test-threads=1
             fi
           done
-
-  # Functional regression for the REST API surfaces documented in the OpenAPI
-  # spec (time-series TD-TS-1, external collections Phase 8 F5). These exercise
-  # the REAL store (full round-trips) — the router-level drift gate only checks
-  # route existence, and `build_test_app_state`'s embedded profile cannot do
-  # write→read round-trips. The former tdd.yml ran the broader REST suite only
-  # at qa→main, and only advisorily (continue-on-error; deleted in CI redesign
-  # PR1), so without this job these surfaces had NO functional coverage. Runs on network/core
-  # changes; skipped⇒pass in ci-success, so it gates only when it runs.
-  # (CDC REST `/changes` is route-covered by the drift gate; its functional
-  # round-trip needs the full server + is exercised by the cdc-kafka-gated
-  # `cdc_*` tests — a deliberate, narrower scope.)
-  rust-integration-test-api:
-    name: Rust Integration Tests (api surface)
-    runs-on: ubuntu-24.04
-    timeout-minutes: 45
-    # TD-CITIER-1 precedent (rust-test, authz): NO `rust-build` in needs —
-    # nothing here downloads its artifact; the lane compiles its own tests
-    # from the shared dev-test rust-cache shape. The edge only serialized
-    # this lane (the run's last-to-finish job) behind Rust Build (dev) for
-    # no artifact; start it as soon as change detection finishes.
-    needs: [changes]
-    if: |
-      !inputs.skip_tests &&
-      needs.changes.outputs.test_tier == 'true' &&
-      needs.changes.outputs.rust == 'true' &&
-      (needs.changes.outputs.network_changes == 'true' ||
-       needs.changes.outputs.core_changes == 'true') &&
-      !contains(needs.changes.outputs.reused, ',rust-integration-test-api,')
-    steps:
-      - uses: actions/checkout@v7
-      - uses: ./.github/actions/rust-setup
-        with:
-          shared-key: "dev-test"
-          save-if: false
-          add-job-id-key: false
-          apt-packages: 'libssl-dev pkg-config protobuf-compiler'
       - name: Run API Surface Integration Tests
+        # Each suite previously ran independently. Collect both results when
+        # the cluster suite fails, provided setup succeeded and CI is active.
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
         run: |
           # Explicitly named only — verify each passes before adding (these were
           # not previously in any CI glob). Add the cdc_* / external_collection_bm25
           # tests as follow-ups once verified (cdc_* require the cdc-kafka feature).
           for test_name in tst_integration_test external_collection_index_in_place_test; do
-            if [ -f "tests/${test_name}.rs" ]; then
-              echo "Running $test_name..."
-              cargo test --test "$test_name" -- --test-threads=1
-            fi
+            echo "Running $test_name..."
+            cargo test --test "$test_name" -- --test-threads=1
           done
 
   # Lane-coverage burn-down (ranked cleanup item 7). These integration
@@ -4433,8 +4410,7 @@ jobs:
       - rust-integration-test-query
       - rust-integration-test-pgwire-accuracy
       - rust-integration-test-graph
-      - rust-integration-test-cluster
-      - rust-integration-test-api
+      - rust-integration-test-cluster-api
       - rust-integration-test-burndown
       - object-store-emulator-tests
       - object-store-restart-recovery
