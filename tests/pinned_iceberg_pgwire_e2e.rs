@@ -9,6 +9,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use bytes::Bytes;
 use object_store::path::Path;
 use parquet::arrow::{ArrowWriter, PARQUET_FIELD_ID_META_KEY};
+use proximadb::observability::io_trace;
 use proximadb_iceberg_engine::{
     IcebergObjectStoreBridge, deletion_vector::PositionDeletes, iceberg::IcebergField,
 };
@@ -180,6 +181,30 @@ async fn pinned_external_full_tpc_sql() -> anyhow::Result<()> {
         );
     }
     let mut failures = 0;
+    // A simple query's ReadyForQuery follows its trace flush. The serial sweep
+    // has one outstanding query, so a single buffered trace is sufficient.
+    let (trace_tx, trace_rx) = std::sync::mpsc::sync_channel(1);
+    io_trace::set_trace_observer(Some(Box::new(move |trace, _tenant| {
+        if !trace.pinned_binds.is_empty() {
+            let _ = trace_tx.try_send(serde_json::json!({
+                "setup_ms": trace.setup_ms,
+                "session_ms": trace.session_ms,
+                "open_ms": trace.open_ms,
+                "plan_ms": trace.plan_ms,
+                "compute_ms": trace.compute_ms,
+                "emit_ms": trace.emit_ms,
+                "pinned_binds": trace.pinned_binds,
+            }));
+        }
+    })));
+    struct ResetTraceObserver;
+    impl Drop for ResetTraceObserver {
+        fn drop(&mut self) {
+            io_trace::set_trace_observer(None);
+        }
+    }
+    let _reset_trace = ResetTraceObserver;
+    let mut trace_rx = Some(trace_rx);
     for query in fixture.queries {
         let sql = std::fs::read_to_string(root.join(&query.sql))?;
         let digest = hex::encode(Sha256::digest(sql.as_bytes()));
@@ -198,6 +223,22 @@ async fn pinned_external_full_tpc_sql() -> anyhow::Result<()> {
             "sql_sha256": digest,
             "elapsed_ms": start.elapsed().as_millis() as u64,
         });
+        if result.is_err() {
+            // The cancelled response can flush after the client deadline.
+            // Stop attaching traces so it cannot be paired with a later query.
+            trace_rx = None;
+        }
+        if let Some(trace_rx) = &trace_rx {
+            match trace_rx.try_recv() {
+                Ok(trace) => record["trace"] = trace,
+                Err(error) if matches!(result, Ok(Ok(_))) => {
+                    failures += 1;
+                    record["trace_error"] =
+                        serde_json::json!(format!("missing binding trace: {error}"));
+                }
+                Err(_) => {}
+            }
+        }
         match result {
             Ok(Ok(messages)) => {
                 let columns = messages.iter().find_map(|msg| match msg {
@@ -230,7 +271,7 @@ async fn pinned_external_full_tpc_sql() -> anyhow::Result<()> {
     }
     anyhow::ensure!(
         failures == 0,
-        "{failures}/{query_count} query executions failed; see TPC_OPEN_RESULTS"
+        "{failures}/{query_count} queries had execution or trace failures; see TPC_OPEN_RESULTS"
     );
     Ok(())
 }

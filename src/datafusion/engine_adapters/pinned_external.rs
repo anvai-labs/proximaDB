@@ -1,10 +1,13 @@
 //! Bind a cataloged external table before constructing its execution adapter.
 
+use std::time::Instant;
+
 use anyhow::{Context, ensure};
 use proximadb_catalog::{CatalogColumn, CatalogTableSchema};
 
 use super::pinned_iceberg;
 use super::pinned_table::PinnedTable;
+use crate::observability::io_trace::{PinnedSourceFormat, current_handle};
 use crate::query::execution::engine::ExecutionControls;
 use crate::services::ddl::pinned_external::{PinnedExternalFormat, PinnedExternalLocation};
 
@@ -19,28 +22,50 @@ pub(crate) async fn open_table(
     let (format, layout) = layouts.next().context("expected one pinned layout")?;
     ensure!(layouts.next().is_none(), "expected one pinned layout");
 
-    let bound = match format.parse_location(layout)? {
-        PinnedExternalLocation::Iceberg(location) => {
-            pinned_iceberg::open_reader(location, &schema.columns)
-                .await
-                .map(PinnedTable::new)
-        }
-        #[cfg(unix)]
-        PinnedExternalLocation::Ndjson(location) => {
-            super::pinned_ndjson::PinnedNdjsonReader::open(location, &schema.columns)
+    let trace = current_handle().map(|handle| (handle, Instant::now()));
+    let bound = async {
+        let bound = match format.parse_location(layout)? {
+            PinnedExternalLocation::Iceberg(location) => {
+                pinned_iceberg::open_reader(location, &schema.columns)
+                    .await
+                    .map(PinnedTable::new)
+            }
+            #[cfg(unix)]
+            PinnedExternalLocation::Ndjson(location) => {
+                super::pinned_ndjson::PinnedNdjsonReader::open(location, &schema.columns)
+                    .await
+                    .map(PinnedTable::from_source)
+            }
+            #[cfg(unix)]
+            PinnedExternalLocation::Delta(location) => {
+                super::pinned_delta::PinnedDeltaReader::open(
+                    location,
+                    &schema.columns,
+                    controls.clone(),
+                )
                 .await
                 .map(PinnedTable::from_source)
-        }
-        #[cfg(unix)]
-        PinnedExternalLocation::Delta(location) => super::pinned_delta::PinnedDeltaReader::open(
-            location,
-            &schema.columns,
-            controls.clone(),
-        )
-        .await
-        .map(PinnedTable::from_source),
-    };
-    controls.check_cancelled()?;
+            }
+        };
+        controls.check_cancelled()?;
+        bound
+    }
+    .await;
+    if let Some((trace, started)) = trace {
+        let label = match format {
+            PinnedExternalFormat::Iceberg => PinnedSourceFormat::Iceberg,
+            PinnedExternalFormat::Delta => PinnedSourceFormat::Delta,
+            PinnedExternalFormat::Ndjson => PinnedSourceFormat::Ndjson,
+        };
+        trace.record_pinned_bind(
+            label,
+            started.elapsed().as_micros().try_into().unwrap_or(u64::MAX),
+            bound
+                .as_ref()
+                .ok()
+                .map(|table| table.bound_split_count() as u64),
+        );
+    }
     bound
 }
 

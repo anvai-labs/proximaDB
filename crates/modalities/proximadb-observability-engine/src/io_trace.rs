@@ -338,6 +338,7 @@ pub struct IoTrace {
     /// collection + xCatalog schema pre-resolution + route classification. Paid
     /// only on the DataFusion (path-2) route, not the native early-return path.
     setup_ms: AtomicU64,
+    pinned_binds: Mutex<BTreeMap<PinnedSourceFormat, PinnedBindTrace>>,
     /// pgwire result EMIT wall milliseconds (TD-OLAP-4): encoding the materialized
     /// rows to `RowDescription` + `DataRow` frames and writing them to the socket,
     /// AFTER execution — the last unmeasured span in the per-query wall floor.
@@ -1077,6 +1078,21 @@ impl IoTrace {
         self.setup_ms.fetch_add(ms, Ordering::Relaxed);
     }
 
+    /// Record one binding that returned, including a failed or cancelled bind.
+    pub fn record_pinned_bind(
+        &self,
+        format: PinnedSourceFormat,
+        elapsed_us: u64,
+        bound_splits: Option<u64>,
+    ) {
+        let mut bindings = self.pinned_binds.lock().unwrap_or_else(|p| p.into_inner());
+        let bind = bindings.entry(format).or_default();
+        bind.attempts += 1;
+        bind.failures += u64::from(bound_splits.is_none());
+        bind.elapsed_us = bind.elapsed_us.saturating_add(elapsed_us);
+        bind.bound_splits = bind.bound_splits.saturating_add(bound_splits.unwrap_or(0));
+    }
+
     /// Add to the SessionContext build wall milliseconds.
     pub fn record_session_ms(&self, ms: u64) {
         self.session_ms.fetch_add(ms, Ordering::Relaxed);
@@ -1275,6 +1291,11 @@ impl IoTrace {
                 .unwrap_or_else(|p| p.into_inner())
                 .clone(),
             setup_ms: self.setup_ms.load(Ordering::Relaxed),
+            pinned_binds: self
+                .pinned_binds
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone(),
             emit_ms: self.emit_ms.load(Ordering::Relaxed),
             session_ms: self.session_ms.load(Ordering::Relaxed),
             open_ms: self.open_ms.load(Ordering::Relaxed),
@@ -1311,6 +1332,27 @@ impl IoTrace {
             query_id: self.query_id(),
         }
     }
+}
+
+/// Bounded labels for external source bindings. Identifiers and locations stay
+/// out of trace fields.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum PinnedSourceFormat {
+    Iceberg,
+    Delta,
+    Ndjson,
+}
+
+/// Work attributed to a format while preparing one statement's pinned sources.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PinnedBindTrace {
+    pub attempts: u64,
+    pub failures: u64,
+    pub elapsed_us: u64,
+    pub bound_splits: u64,
 }
 
 /// Immutable, plain-value view of an [`IoTrace`] at a point in time — what gets
@@ -1491,6 +1533,9 @@ pub struct IoTraceSnapshot {
     /// resolution + route classification, DataFusion route only (TD-OLAP-4).
     #[serde(default)]
     pub setup_ms: u64,
+    /// Pinned inventory resolution inside setup, grouped by source format.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub pinned_binds: BTreeMap<PinnedSourceFormat, PinnedBindTrace>,
     /// pgwire result-emit wall ms — row encode + socket write, post-execution
     /// (TD-OLAP-4).
     #[serde(default)]
@@ -1596,7 +1641,7 @@ impl IoTraceSnapshot {
         }
     }
 
-    /// `true` when nothing was recorded — used to suppress empty trace events.
+    /// `true` when there is no metering or route-observer activity.
     pub fn is_empty(&self) -> bool {
         self.total_ops() == 0
             && self.bytes_read == 0
@@ -1639,7 +1684,7 @@ impl IoTraceSnapshot {
     /// route/cache/**billing** observers in [`instrument`] are unaffected and stay
     /// always-on (billing is never gated — ADR-027 non-entanglement).
     pub fn emit(&self, tenant_id: Option<&str>, route: &str) {
-        if self.is_empty() {
+        if self.is_empty() && self.pinned_binds.is_empty() {
             return;
         }
         #[cfg(feature = "io-trace")]
@@ -1670,6 +1715,7 @@ impl IoTraceSnapshot {
             embedding_tokens_total = self.total_embedding_tokens(),
             compute_ms_total = self.total_compute_ms(),
             compute_ms_by_engine = ?self.compute_ms,
+            pinned_binds = ?self.pinned_binds,
             "per-query I/O trace"
         );
         // Perf emission compiled out (default): consume the args so the signature
@@ -2325,7 +2371,7 @@ where
                 // TD-TRACE-2 durable trace sink (separate, default-OFF observer —
                 // billing above stays always-on/never-gated). Fires last; only
                 // enqueues the completed snapshot for background export.
-                if !snap.is_empty() {
+                if !snap.is_empty() || !snap.pinned_binds.is_empty() {
                     notify_trace_observer(&snap, tenant_id.as_deref());
                 }
             }
@@ -2338,7 +2384,34 @@ where
 /// module below needs the non-default `io-trace` feature).
 #[cfg(test)]
 mod wave_tests {
-    use super::{critical_path_waves, overlap_waves};
+    use super::{IoTrace, PinnedSourceFormat, critical_path_waves, overlap_waves};
+
+    #[test]
+    fn pinned_bind_trace_keeps_format_and_empty_inventory_outcomes() {
+        let trace = IoTrace::new();
+        trace.record_pinned_bind(PinnedSourceFormat::Delta, 100, Some(0));
+        trace.record_pinned_bind(PinnedSourceFormat::Delta, 200, None);
+        trace.record_pinned_bind(PinnedSourceFormat::Iceberg, 300, Some(3));
+        let snapshot = trace.snapshot();
+        assert!(
+            snapshot.is_empty(),
+            "binding diagnostics carry no metered activity"
+        );
+        let delta = &snapshot.pinned_binds[&PinnedSourceFormat::Delta];
+        assert_eq!(
+            (
+                delta.attempts,
+                delta.failures,
+                delta.elapsed_us,
+                delta.bound_splits
+            ),
+            (2, 1, 300, 0)
+        );
+        let payload = crate::trace_envelope::TracePayload::classify(&snapshot);
+        let encoded = serde_json::to_value(payload).unwrap();
+        assert_eq!(encoded["pinned_binds"]["iceberg"]["bound_splits"], 3);
+        assert_eq!(encoded["pinned_binds"]["delta"]["failures"], 1);
+    }
 
     /// TD-PAXDIR-1 D7: overlapping requests of one task form one wave,
     /// sequential ones do not.

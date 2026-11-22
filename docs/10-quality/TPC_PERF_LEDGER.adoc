@@ -49,6 +49,12 @@ registers the pinned tables in pgwire, checks table counts, runs the full
 hashed SQL inventory and saves wire values or SQL errors for every query.
 The verifier checks typed row multiplicities, including exact decimal values
 and a default floating-point tolerance of 1e-9 relative and absolute.
+The JSONL records also include query trace timings and completed pinned
+binds by format. Each format reports attempts, failures, summed
+`elapsed_us` and the number of splits in successfully bound inventories.
+Bind time is part of setup. Split count describes the bound inventory, and
+does not count scan opens or requests. The sweep stops attaching traces
+after a client timeout to avoid assigning a late trace to the next query.
 It evaluates the top-level `ORDER BY` against the typed wire rows, applies
 explicit NULL placement or PostgreSQL defaults, and accepts any sequence
 within a group of equal sort keys. An expression that cannot be evaluated

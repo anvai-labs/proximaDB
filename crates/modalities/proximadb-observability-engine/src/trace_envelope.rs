@@ -153,6 +153,9 @@ pub enum TracePayload {
 /// exec actuals (TD-TRACE-1 S2), and OLAP scan pruning outcomes.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RelationalPayload {
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub pinned_binds:
+        BTreeMap<crate::io_trace::PinnedSourceFormat, crate::io_trace::PinnedBindTrace>,
     #[serde(default)]
     pub plan_depth: u64,
     #[serde(default)]
@@ -317,8 +320,10 @@ impl TracePayload {
             || !snap.exec_ops.is_empty()
             || snap.splits_total > 0
             || snap.plan_ms > 0
+            || !snap.pinned_binds.is_empty()
         {
             TracePayload::Relational(RelationalPayload {
+                pinned_binds: snap.pinned_binds.clone(),
                 plan_depth: snap.plan_depth,
                 plan_nodes: snap.plan_nodes,
                 plan_leaves: snap.plan_leaves,
