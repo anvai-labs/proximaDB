@@ -8,11 +8,69 @@ import json
 import re
 import sys
 from collections import Counter, defaultdict
+from decimal import Decimal
 from pathlib import Path
 from statistics import mean, median
 from urllib.parse import parse_qs, unquote, urlsplit
 
 from pax_scale_cost import RANGE_CAPS_MIB, SCALE_ROWS
+
+RATE_CARD = (
+    Path(__file__).resolve().parents[2]
+    / "bench_results/pax_sift_scale_20261122/request_rates.csv"
+)
+DFS_READ_UNIT = 4 * 1024 * 1024
+
+
+def load_rate_card(path=RATE_CARD):
+    allowed = {
+        "get": {"get", "dfs_read_units"},
+        "list": {"list"},
+        "head": {"head"},
+        "retrieval": {"object_bytes"},
+    }
+    with path.open(newline="") as card:
+        rates = list(csv.DictReader(card))
+    operations = defaultdict(set)
+    for rate in rates:
+        profile, op = rate["profile"], rate["operation"]
+        if op in operations[profile] or rate["counter"] not in allowed.get(op, set()):
+            raise ValueError(
+                f"duplicate or unknown rate component: {profile}/{op}/{rate['counter']}"
+            )
+        usd = Decimal(rate["usd"])
+        if not usd.is_finite() or usd < 0 or int(rate["per_units"]) <= 0:
+            raise ValueError(f"invalid rate: {profile}/{op}")
+        operations[profile].add(op)
+    if not rates or any(ops != allowed.keys() for ops in operations.values()):
+        raise ValueError("each profile needs a GET, LIST, HEAD and retrieval rate")
+    return rates
+
+
+def estimate_request_cost(rows, rates):
+    # Quote the complete request mix only when all observed responses succeeded.
+    # An S3/DFS charge for a failed Blob request cannot be inferred from its verb.
+    quoted = all(not r["wire"].get("unpriced_responses", 0) for r in rows)
+    costs = {"cost_status": "modeled" if quoted else "unpriced_response"}
+    totals = {}
+    for rate in rates:
+        profile = rate["profile"]
+        units = sum(r["wire"].get(rate["counter"], 0) for r in rows)
+        price = (
+            Decimal(rate["usd"])
+            * 1_000_000
+            * units
+            / (int(rate["per_units"]) * len(rows))
+        )
+        totals[profile] = totals.get(profile, Decimal(0)) + price
+        costs[f"{profile}_{rate['operation']}_usd_per_m_queries"] = (
+            float(round(price, 6)) if quoted else None
+        )
+    for profile, total in totals.items():
+        costs[f"{profile}_total_usd_per_m_queries"] = (
+            float(round(total, 6)) if quoted else None
+        )
+    return costs
 
 
 def read_windows(rows, lines):
@@ -70,12 +128,19 @@ def read_windows(rows, lines):
             if verb == "GET" and status in {"200", "206"}:
                 if length == "-":
                     raise ValueError(f"missing object response length for {url}")
-                counts["object_bytes"] += int(length)
+                response_bytes = int(length)
+                counts["object_bytes"] += response_bytes
+                # DFS pricing projection, calculated per successful data response.
+                counts["dfs_read_units"] += max(
+                    1, (response_bytes + DFS_READ_UNIT - 1) // DFS_READ_UNIT
+                )
                 if status == "206":
                     counts["partial_get"] += 1
                     counts["max_range_bytes"] = max(
                         counts["max_range_bytes"], int(length)
                     )
+        if status not in {"200", "206"}:
+            counts["unpriced_responses"] += 1
         if int(status) >= 400:
             counts["errors"] += 1
     if ended != set(windows) or active is not None:
@@ -141,6 +206,7 @@ def summarize(raw, log, sizes, caps, queries):
         groups[r["rows"], r["route"], r["cap_mib"], r["budget_mib"], r["phase"]].append(
             r
         )
+    rates = load_rate_card()
     summary = []
     for (n, route, cap, budget, phase), rs in sorted(groups.items()):
         wire = {
@@ -180,7 +246,11 @@ def summarize(raw, log, sizes, caps, queries):
                     if route == "ann"
                     else None
                 ),
+                modeled_dfs_read_units=round(
+                    mean(r["wire"].get("dfs_read_units", 0) for r in rs), 6
+                ),
                 wire=wire,
+                **estimate_request_cost(rs, rates),
                 **stats,
             )
         )

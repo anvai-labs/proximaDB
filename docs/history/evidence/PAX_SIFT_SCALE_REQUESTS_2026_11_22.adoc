@@ -79,6 +79,59 @@ build with production concurrency to set a latency or memory SLO.
 | 1,000,000 | 712.90 | 41.74 | 12126.0 | 361.1 | 16.1 / 16.1
 |===
 
+== Per-operation request cost by endpoint
+
+link:PAX_OBJECT_STORE_COST_ATLAS_2026_11_22.md[Eight figures: IOPS, recall, corpus size, 128d dimension increments, object tiers, caches and publish economics].
+
+Cold forced ANN with an 8 MiB merge setting. Counts are means per search.
+Prices are USD per million searches. Each price cell shows read + list = total.
+HEAD and write charges here are zero. Both the cold and reopened process use
+one list page. The DRAM repeat uses none. The CSV includes separate GET/read,
+LIST, HEAD/properties and total cost columns for every route, cap and cache state.
+The same HTTP request mix is replayed against three pricing profiles. Only the
+Blob endpoint request counts were measured, on Azurite.
+
+[cols="1,1,1,1,2,2,2",options="header"]
+|===
+| Vectors | Object GETs | LISTs | DFS read units | S3 Standard USD/M | Azure Blob Hot USD/M | ADLS DFS Hot USD/M
+| 1,000 | 3 | 1 | 3 | 1.2 + 5 = 6.2 | 1.2 + 5 = 6.2 | 1.56 + 6.5 = 8.06
+| 10,000 | 4 | 1 | 4 | 1.6 + 5 = 6.6 | 1.6 + 5 = 6.6 | 2.08 + 6.5 = 8.58
+| 33,000 | 4 | 1 | 4 | 1.6 + 5 = 6.6 | 1.6 + 5 = 6.6 | 2.08 + 6.5 = 8.58
+| 100,000 | 6.3 | 1 | 8.3 | 2.52 + 5 = 7.52 | 2.52 + 5 = 7.52 | 4.316 + 6.5 = 10.816
+| 333,000 | 9.1 | 1 | 11.8 | 3.64 + 5 = 8.64 | 3.64 + 5 = 8.64 | 6.136 + 6.5 = 12.636
+| 1,000,000 | 18 | 1 | 21.4 | 7.2 + 5 = 12.2 | 7.2 + 5 = 12.2 | 11.128 + 6.5 = 17.628
+|===
+
+The frozen 2026-11-22 USD rates are for S3 Standard in us-east-1, flat GPv2
+Blob Hot LRS in eastus, and ADLS Gen2 Hot LRS with HNS through the DFS
+endpoint in eastus. For one million successful operations the respective
+read / list / properties rates are USD 0.40 / 5.00 / 0.40,
+0.40 / 5.00 / 0.40 and 0.52 / 6.50 / 0.52. Blob properties use the
+Other meter. DFS Path List uses Iterative Read. For a DFS read, round each
+successful response length up to units of 4 MiB with a minimum of one, then
+sum. Counting an entire 8 MiB response as one DFS read would underprice it.
+The projection assumes the same ranges and pagination. An ABFS client can
+change the mix through buffering, readahead, properties probes or retries.
+Proxima’s current az/adls/abfs schemes all select its Blob endpoint adapter.
+Choose the account namespace, tier and actual endpoint for pricing.
+link:../../../src/storage/persistence/filesystem/mod.rs[Filesystem registration],
+link:https://learn.microsoft.com/en-us/azure/storage/blobs/map-rest-apis-transaction-categories[Azure API-to-meter mapping] and
+link:https://learn.microsoft.com/en-us/azure/storage/blobs/blob-storage-estimate-costs[Microsoft endpoint and read-unit rules].
+
+The rate card stores AWS SKUs and Azure meter IDs from the public price
+lists. The Azure filter is service Storage, armRegionName eastus, Consumption,
+Hot LRS. These hot profiles cover successful query operations. The accompanying rate card also prices GCS and online retrieval tiers for all three clouds. The report
+leaves dollar columns empty for a group containing an unpriced response.
+Writes, compaction, catalog discovery outside the query window, storage,
+local compute and cache costs belong in the workload-level calculation.
+link:../../../bench_results/pax_sift_scale_20261122/request_rates.csv[Frozen rate card],
+link:https://pricing.us-east-1.amazonaws.com/offers/v1.0/aws/AmazonS3/current/us-east-1/index.json[AWS regional price list],
+link:https://learn.microsoft.com/en-us/rest/api/cost-management/retail-prices/azure-retail-prices[Azure Retail Prices API], and
+link:../../../bench_results/pax_sift_scale_20261122/groups.csv[144 cost breakdowns].
+
+For the small-object design and the interaction with discovery authority see
+link:../../12-design/PAX_SPEC_THOUGHT_EXPERIMENTS_2026_10.adoc#small-object-cost[Small-object reads and collection discovery].
+
 == Adaptive route selected
 
 A fresh process ran query zero with each f32 budget at a fixed 4 MiB read

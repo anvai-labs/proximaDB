@@ -1401,3 +1401,163 @@ The paired SIFT prefix ledger covers 1K, 10K, 33K, 100K, 333K and 1M at
 4–32 MiB read caps. It reports cold, DRAM-repeat and disk-reopen wire counts,
 and checks the separate adaptive exact budget against the route that ran.
 link:../history/evidence/PAX_SIFT_SCALE_REQUESTS_2026_11_22.adoc[PAX SIFT scale and request ledger].
+
+[[small-object-cost]]
+== 10. Price discovery and data reads together
+
+*Recommendation for the MVP.* Keep one LIST-discovered membership set and
+the existing PXCD fact cache. Add a whole-object candidate to the physical
+reader. For a collection whose complete selected PAX bodies fit in an 8 MiB
+aggregate budget, compare fetching each missing object once with the current
+range plan. Evaluate the query from the chosen bytes. Introduce no new
+manifest format for this optimization. This section is a design proposal.
+link:adr/ADR-098-metadata-spine.adoc[Current discovery and metadata authority] and
+link:../history/evidence/PAX_OBJECT_STORE_COST_ATLAS_2026_11_22.md[Pricing assumptions, tier comparisons and dimension figures].
+
+=== Why 1K pays for three GETs
+
+The 1,000 × 128 fixture is one 748,270-byte object with two blocks, two
+IVF cells and an explicit f32 tier. On a cold process the same LIST found
+the object for all three routes. The access log for query zero gives:
+
+[cols="1,3,2",options="header"]
+|===
+| Requested route | Object response bytes, in order | Reason
+| Forced ANN | 748,270 + 128,000 + 34,413 | The 1 MiB prefix prefetch reached EOF. Later ANN stages issued two ranged reads in the same immutable object. The log measures their lengths and object identity, without recording range offsets. Both responses were already contained in the first.
+| Adaptive → exact | 88 + 363 + 748,270 | This direct-writer fixture has no PXCD. The count/authority check fetched the header and footer before the exact scanner fetched the full object.
+| Forced exact | 748,270 | The scanner fetched and scored the object once.
+|===
+
+This accounts for 910,683, 748,721 and 748,270 object bytes respectively.
+The ANN duplication cost two GETs and 162,413 bytes. Reuse also works for
+a caller that explicitly asks for ANN: run the same probe and ranking over
+local slices. On the normal flush path a validated PXCD can already answer
+the metadata questions. Its fetch costs a request when cold. Price that
+request before accessing PXCD for a tiny collection.
+link:../history/evidence/PAX_SIFT_SCALE_REQUESTS_2026_11_22.adoc[Raw request evidence],
+link:../../src/storage/engines/sst/segment_format.rs[Prefix, quantized candidate and result reads], and
+link:../10-quality/td/TD-PAXMETA-1-collection-level-segment-facts.adoc[Flush-published directory evidence].
+
+At 1K × 768, f32 alone occupies 2.93 MiB. Under the measured 1K layout's
+overhead and the three-tier dimension model, the whole object would occupy
+3.84 MiB at 768d and 7.60 MiB at 1536d. Adding 8 KiB of incompressible
+user data per row would add 7.81 MiB at any width. Use the actual LISTed
+length; dimension gives a useful estimate before the data has been written.
+The 8 MiB read-merge setting, the proposed whole-object working budget, and
+the current adaptive f32 admission budget (default 64 MiB plus a row ceiling)
+are independent controls.
+
+=== Execution order and boundaries
+
+. *Establish membership once.* Use the collection's tenant, immutable
+  collection identity, storage assignment and read snapshot. Reuse an eligible
+  in-process discovery result under its existing invalidation contract.
+  Otherwise LIST the exact data prefix, count every page, apply retirement
+  filtering and retain each live object's identity, size and validator.
+  The same listing locates PXCD. Skip per-object HEAD when a validated
+  listing already supplies the needed facts. Keep active WAL rows and
+  snapshot-visible deletes in the normal query path.
+. *Compare feasible plans before fetching optional metadata.* Enumerate
+  already-resident bytes, one full read per missing object, selective reads
+  with validated PXCD facts, and the existing footer fallback. Skip a cold
+  directory GET when membership and whole bytes can answer every required
+  fact in the same data read. If one object is small enough, the full reader
+  validates its header, footer, coverage and exact authority locally.
+  For several objects, cap their combined cold bytes and reserve capacity
+  across concurrent queries. Eight 1 MiB objects still require eight GETs.
+  Check all eligible segments before claiming exactness. A restored, lossy or
+  legacy segment must obey the existing authority, visibility and fallback
+  semantics. Explicit ANN and exact intents retain their quality contracts.
+. *Read each extent once.* Carry a query-scoped immutable byte view through
+  admission, ranking, optional filters and result materialization. An extent
+  contained in that view costs zero further remote GETs. Deduplicate
+  concurrent fills for the same object version. Use a versioned read or a
+  condition on the fetched identity where available, check length, bounds
+  and integrity, and discard the entire tentative plan on a version change.
+  A short read, bad footer or a missing object can never authorize a partial
+  exact result. Retry within an appropriate snapshot or surface the error.
+. *Choose on economics.* First enforce result semantics, recall and hard
+  safety/SLO bounds. Rank feasible plans by marginal dollars (request
+  classes, retrieval, applicable transfer and attributable compute/cache
+  expense), then latency, then transferred bytes, then CPU and memory
+  demand. If two plans issue one GET, a narrow contiguous read that already
+  satisfies the request can beat a full GET. Reuse checked resident extents
+  first. On DFS price each range's 4 MiB units separately. On retrieval-priced
+  tiers include actual fetched bytes, even in the same region. Record predicted
+  and actual GET, LIST, HEAD, retries, response bytes, billed units, time and
+  peak bytes. A wider read cap supplies no upper bound on a single extent.
+. *Separate transient reuse from retention.* The first query can reuse its
+  complete object in memory without admitting it into either long-lived
+  cache. Admit durable reusable bytes by reuse frequency, saved dollars per
+  resident byte, tenant quota and local disk pressure. Key immutable data by
+  tenant, resolver/storage identity, collection, key and version. Cache a
+  decoded representation only if its measured CPU savings justify its cost.
+  A local persistent-cache hit proves possession of the object, not membership
+  in the current snapshot. Never treat a TTL, object-store notification,
+  same-size overwrite or another tenant's key as a membership proof.
+  link:../10-quality/td/TD-PAXDIR-2-collection-listing-cache.adoc[Discovery invalidation and multi-writer limits].
+
+=== Price the alternatives
+
+For one ≤4 MiB object under the S3 Standard / flat Blob Hot example rates,
+one cold LIST + one full GET costs USD 5.40/M searches. One LIST + three
+GETs costs USD 6.20/M. A current cached listing brings the whole-object plan
+to USD 0.40/M. With both membership and complete immutable bytes reusable
+the remote operations can reach zero. On an independent restart with only
+local data bytes populated the cold LIST still costs USD 5.00/M. These
+last two outcomes are targets. Include any catalog service call made to
+obtain proof of membership in its own meter.
+
+*Fragmentation.* At the same 8 MiB total, eight cold files give one LIST +
+eight GETs, USD 8.20/M on S3 Standard. One compact object gives USD 5.40/M.
+For 8 MiB of data, a true DFS single-body read costs two read units while
+eight separate 1 MiB reads cost eight units. Compact only when estimated
+read savings exceed the write/PUT, temporary retained bytes and compute
+cost before the next replacement. Retention of large source payloads can
+change this choice even when vector count stays fixed.
+
+*Discovery across processes.* The current ADR makes LIST the membership
+authority, and PXCD is an optional derived fact cache. Persisting yesterday's
+listing does not remove today's proof obligation. A future cross-node head
+would need an explicit ADR-063/ADR-098 authority decision. Model a known
+per-collection key with conditional publication, a bounded inline single-file
+descriptor or immutable manifest-generation reference, monotonically fenced
+commits and snapshot retention. Publish immutable objects first, then commit
+the head against its predecessor. Competing writers must reconcile on a
+conflict. Readers pin the committed generation, then use version-bound data
+and delete references. An unobserved write, stale leader, interrupted publish
+or removed generation must never turn a best-effort cache into authority.
+Recovery should handle orphaned data, lagging workers, version upgrades
+and GC without admitting uncommitted or retired inputs. LIST remains the
+current cold-start path until these semantics are designed and accepted.
+
+Under an illustrative future head that replaces one LIST with one GET,
+one cold discovery saves USD 4.60/M discoveries. At one or two *additional*
+USD 5/M PUTs per publish, read savings exceed incremental write cost only
+above 1.09 or 2.17 cold discoveries per publish. A second uncached manifest
+GET reduces the saving to USD 4.20/M. Include CAS retries, orphan cleanup,
+LIST pagination, storage and control-plane reads before deciding. Do not add
+a pointer GET ahead of a LIST on the common small-object path.
+
+*Cache admission.* At a hypothetical incremental local storage cost of USD
+0.10/GiB-month, reserving 8 MiB costs USD 0.00078125/month. Saving one
+S3 Standard GET per hit needs about 1,954 hits/month to recover that cost
+alone. Saving a larger cold-tier retrieval, a LIST, multiple range GETs or
+CPU time can move the break-even sharply. Local capacity shared with
+another hot collection has an opportunity cost even on a prepaid host.
+
+=== Acceptance before promotion
+
+First replay the 1K and 10K normal flush and direct-writer fixtures with and
+without a valid directory. On a single ≤8 MiB object, compare a cold
+LIST + one body GET proposal with today's actual path for explicit ANN, exact
+and adaptive. Prove no subsequent covered subread, identical route-appropriate
+results and complete snapshot visibility. Include a lossy-only object,
+filters, hydrated payloads, partial cache coverage, and 8 MiB ± one byte.
+Test one vs many immutable objects at the same total bytes, overlapping
+fills, cross-tenant storage keys, a concurrent publish/restart and stale
+or failed reads. Measure peak transient bytes, L1/L2 occupancy and
+real-cloud p95 under concurrency. Only then promote the small-object rule.
+Evaluate a cross-process head separately against incremental publish cost
+and failure recovery. All thresholds and dollar savings in this section are
+plan hypotheses unless the linked ledger identifies a measured run.
