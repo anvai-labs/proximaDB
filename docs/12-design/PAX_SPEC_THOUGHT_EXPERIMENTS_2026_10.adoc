@@ -1156,7 +1156,7 @@ only after the read-only controls isolate the extra wins.
 The October fixed-object sweep held the objects, query IDs and binary
 constant within each scale. The 3M and 10M corpora were prefixes of the
 ANN_SIFT1B learn split, each with its own exact ground truth. Values below
-are object-cold requests of all metered verbs per query on MinIO. The 1M
+are object-cold GET + LIST + HEAD requests per query on MinIO. The 1M
 fixture used SIFT1M. Only the 1M sweep repeated each cap twice. The
 3M/10M sweeps ran once per cap. These are historical runs.
 
@@ -1231,8 +1231,9 @@ held-out, quality-qualified plan for the collection, model, metric,
 top-k and filter workload. Cost the actual extents and waves. The large
 spread of the 100M curves is a sensitivity range for candidate work.
 Recall, bytes, GETs and latency at 100M remain open. Extending the same
-density to 1B implies about 30,500 cells, past the current 4,096-cell
-per-model writer cap. A sharded or hierarchical search needs its own
+density to 1B implies about 30,500 cells. Automatic per-segment writer
+sizing clamps at 4,096 cells (the experimental IVF_K override bypasses
+the clamp). A sharded or hierarchical search needs its own
 fan-out, pruning, quality and budget model at that point.
 
 === Count vectors, dimensions and retained originals separately
@@ -1254,6 +1255,15 @@ with different dimensions and input precisions. Training, validation and
 cost estimates should identify the corpus family and metric as well as N.
 link:https://microsoft.github.io/msmarco/[MS MARCO], and
 link:https://big-ann-benchmarks.com/neurips21.html[Big ANN benchmark datasets].
+
+In a May 2025 production talk, Notion reported over 10 billion text
+chunks across millions of workspaces and about 15 billion embeddings
+processed per month as content changed. Queries applied permission
+filters and could search several sources. For that workload, searchable
+vectors per workspace, total live storage and monthly rewrite volume
+lead to three different capacity estimates. The talk did not publish a
+median workspace size.
+link:https://turbopuffer.com/blog/video-data-council-notion[Notion Data Council talk].
 
 For one dense embedding of dimension `d` per row in the coalesced layout,
 let `n` be the row count in one segment and `v = ceil(n/8)`.
