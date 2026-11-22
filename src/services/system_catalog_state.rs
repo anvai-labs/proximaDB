@@ -1514,4 +1514,422 @@ mod tests {
         assert_eq!(state.applied_seq(), 2);
         Ok(())
     }
+
+    // ── TD-SPINE-1: record envelope (mixed-read at the byte level) ─────────
+
+    /// Every writer-side entry point emits the envelope, and every reader
+    /// side sniffs it back off: delta, snapshot and sidecar all round-trip
+    /// through the framed bytes.
+    #[test]
+    fn every_persisted_record_is_envelope_framed() -> Result<()> {
+        use crate::services::catalog_record_envelope as env;
+
+        let delta = CatalogDelta::UpsertNamespace {
+            namespace: Box::new(ns(&["s"])),
+        };
+        let op_bytes = match delta.to_operation()? {
+            CanonicalOperation::CatalogMutation { bytes, .. } => bytes,
+            other => panic!("unexpected op {other:?}"),
+        };
+        assert!(op_bytes.starts_with(env::CATALOG_RECORD_MAGIC));
+        match CatalogDelta::decode(&op_bytes)? {
+            CatalogDelta::UpsertNamespace { .. } => {}
+            other => panic!(
+                "delta round trip mismatch: {}",
+                other.routing_key()
+            ),
+        }
+
+        let state = SystemCatalogState::new();
+        state.apply_committed(
+            1,
+            CatalogDelta::UpsertTable {
+                identifier: tid(&["s"], "t"),
+                schema: Box::new(CatalogTableSchema::new("t")),
+            },
+        );
+        let snapshot_bytes = state.to_snapshot_bytes()?;
+        assert!(snapshot_bytes.starts_with(env::CATALOG_RECORD_MAGIC));
+        assert!(SystemCatalogState::from_snapshot_bytes(&snapshot_bytes)?
+            .table_exists(&tid(&["s"], "t")));
+
+        let sidecar_bytes = state.to_identity_high_water_sidecar_bytes()?;
+        assert!(sidecar_bytes.starts_with(env::CATALOG_RECORD_MAGIC));
+        state
+            .adopt_identity_high_water_sidecar_bytes(&sidecar_bytes)
+            .map(|_| ())?;
+        Ok(())
+    }
+
+    /// Mixed-read, legacy→new: a snapshot and sidecar written by the
+    /// pre-envelope writer (bare field-named MessagePack) decode unchanged,
+    /// and the tombstone/collection ids they carry survive. Extends the
+    /// `identity_high_water_is_mixed_read_safe` shape to the envelope.
+    #[test]
+    fn legacy_unframed_snapshot_and_sidecar_still_decode() -> Result<()> {
+        // Legacy snapshot: the pre-TD-PATH-2 shape re-encoded by hand —
+        // bare bytes, no envelope.
+        let mut live = CatalogTableSchema::new("live");
+        live.stable_collection_id = Some(3);
+        #[derive(Serialize, Deserialize)]
+        struct LegacySnapshot {
+            account_ids: HashMap<String, u32>,
+            namespaces: HashMap<Vec<String>, CatalogNamespace>,
+            tables: HashMap<TableIdentifier, CatalogTableSchema>,
+            statistics: HashMap<TableIdentifier, CatalogTableStatistics>,
+            applied_seq: u64,
+        }
+        let legacy = LegacySnapshot {
+            account_ids: HashMap::from([("legacy".to_string(), 7)]),
+            namespaces: HashMap::from([(vec!["t".to_string()], ns(&["t"]))]),
+            tables: HashMap::from([(tid(&["t"], "live"), live)]),
+            statistics: HashMap::new(),
+            applied_seq: 9,
+        };
+        let legacy_bytes = rmp_serde::to_vec_named(&legacy)?;
+        let restored = SystemCatalogState::from_snapshot_bytes(&legacy_bytes)?;
+        assert!(restored.table_exists(&tid(&["t"], "live")));
+        assert_eq!(restored.account_id_u32("legacy"), Some(7));
+        assert_eq!(restored.applied_seq(), 9);
+        assert_eq!(restored.max_collection_id_ever(), Some(3));
+
+        // Legacy sidecar: bare bytes.
+        #[derive(Serialize, Deserialize)]
+        struct LegacySidecar {
+            #[serde(default)]
+            writer_version: Option<u32>,
+            #[serde(default)]
+            high_water: IdsHighWater,
+        }
+        let legacy_sidecar = LegacySidecar {
+            writer_version: None,
+            high_water: IdsHighWater {
+                object_id: 50,
+                collection_id: 7,
+                namespace_id: 3,
+            },
+        };
+        let fresh = SystemCatalogState::new();
+        fresh.adopt_identity_high_water_sidecar_bytes(&rmp_serde::to_vec_named(
+            &legacy_sidecar,
+        )?)?;
+        assert_eq!(fresh.max_object_id(), Some(50));
+        assert_eq!(fresh.max_collection_id_ever(), Some(7));
+        assert_eq!(fresh.max_namespace_id_ever(), Some(3));
+        Ok(())
+    }
+
+    /// Fail-closed at the record boundary: a snapshot whose envelope names a
+    /// future format version (or codec) is a typed error, not a legacy
+    /// mis-decode, not a panic. Same teeth for the sidecar.
+    #[test]
+    fn snapshot_with_unknown_envelope_version_fails_closed() -> Result<()> {
+        use crate::services::catalog_record_envelope as env;
+
+        let state = SystemCatalogState::new();
+        state.apply_committed(
+            1,
+            CatalogDelta::UpsertNamespace {
+                namespace: Box::new(ns(&["s"])),
+            },
+        );
+        let mut bytes = state.to_snapshot_bytes()?;
+        let version_at = env::CATALOG_RECORD_MAGIC.len();
+        assert_eq!(bytes[version_at], env::ENVELOPE_FORMAT_VERSION);
+
+        bytes[version_at] = env::ENVELOPE_FORMAT_VERSION + 1;
+        let err = SystemCatalogState::from_snapshot_bytes(&bytes)
+            .expect_err("future envelope version must fail closed");
+        assert!(format!("{err:#}").contains("format version 2"));
+
+        bytes[version_at] = env::ENVELOPE_FORMAT_VERSION;
+        bytes[version_at + 1] = env::BODY_CODEC_MSGPACK_NAMED + 3;
+        let err = SystemCatalogState::from_snapshot_bytes(&bytes)
+            .expect_err("unknown body codec must fail closed");
+        assert!(format!("{err:#}").contains("codec 3"));
+
+        let mut sidecar = state.to_identity_high_water_sidecar_bytes()?;
+        sidecar[version_at] = env::ENVELOPE_FORMAT_VERSION + 1;
+        assert!(
+            state
+                .adopt_identity_high_water_sidecar_bytes(&sidecar)
+                .is_err()
+        );
+        Ok(())
+    }
+
+    /// Mixed WAL chain: entries written by a pre-envelope binary (bare
+    /// MessagePack payloads) replay alongside enveloped entries from the
+    /// current writer — the sniff is per-entry, so an upgraded pod folds the
+    /// whole chain.
+    #[tokio::test]
+    async fn mixed_legacy_and_enveloped_wal_chain_replays() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let wal_path = dir.path().join("catalog.wal");
+        let appender = FramedTableWalAppender::open(&wal_path).await?;
+
+        // Legacy entry: a pre-envelope writer's payload (bare bytes).
+        let legacy_delta = CatalogDelta::UpsertNamespace {
+            namespace: Box::new(ns(&["legacy"])),
+        };
+        let legacy_op = CanonicalOperation::CatalogMutation {
+            key: legacy_delta.routing_key(),
+            bytes: rmp_serde::to_vec_named(&legacy_delta)?,
+        };
+        // Enveloped entries: the current writer.
+        let enveloped_ops = vec![
+            CatalogDelta::UpsertTable {
+                identifier: tid(&["legacy"], "from-old"),
+                schema: Box::new(CatalogTableSchema::new("from-old")),
+            }
+            .to_operation()?,
+            CatalogDelta::UpsertTable {
+                identifier: tid(&["legacy"], "from-new"),
+                schema: Box::new(CatalogTableSchema::new("from-new")),
+            }
+            .to_operation()?,
+        ];
+        appender
+            .append_operations(
+                std::iter::once(legacy_op).chain(enveloped_ops).collect(),
+                None,
+            )
+            .await?;
+
+        let reopened = FramedTableWalAppender::open(&wal_path).await?;
+        let entries = reopened.read_entries().await?;
+        let state = SystemCatalogState::from_wal_entries(&entries)?;
+        assert!(state.namespace_exists(&["legacy".to_string()]));
+        assert!(state.table_exists(&tid(&["legacy"], "from-old")));
+        assert!(state.table_exists(&tid(&["legacy"], "from-new")));
+        assert_eq!(state.applied_seq(), 3);
+        Ok(())
+    }
+
+    // ── TD-SPINE-2: sharded snapshot model ─────────────────────────────────
+
+    fn seeded_state() -> SystemCatalogState {
+        let state = SystemCatalogState::new();
+        let mut seq = 0;
+        let mut apply = |state: &SystemCatalogState,
+                         delta: CatalogDelta,
+                         seq: &mut u64| {
+            *seq += 1;
+            state.apply_committed(*seq, delta);
+        };
+        apply(
+            &state,
+            CatalogDelta::UpsertAccount {
+                account: "acme".into(),
+                stable_id: 1,
+            },
+            &mut seq,
+        );
+        apply(
+            &state,
+            CatalogDelta::UpsertAccount {
+                account: "globex".into(),
+                stable_id: 2,
+            },
+            &mut seq,
+        );
+        // acme: namespace + two tables (one carrying a typed ns id).
+        apply(
+            &state,
+            CatalogDelta::UpsertNamespace {
+                namespace: Box::new(with_tenant(ns(&["acme", "sales"]), Some("acme"))),
+            },
+            &mut seq,
+        );
+        let mut orders = CatalogTableSchema::new("orders");
+        orders.stable_namespace_id = Some(4);
+        apply(
+            &state,
+            CatalogDelta::UpsertTable {
+                identifier: tid(&["acme", "sales"], "orders"),
+                schema: Box::new(orders),
+            },
+            &mut seq,
+        );
+        apply(
+            &state,
+            CatalogDelta::UpsertTable {
+                identifier: tid(&["acme", "sales"], "returns"),
+                schema: Box::new(CatalogTableSchema::new("returns")),
+            },
+            &mut seq,
+        );
+        // globex: namespace + one table.
+        apply(
+            &state,
+            CatalogDelta::UpsertNamespace {
+                namespace: Box::new(with_tenant(ns(&["globex", "ops"]), Some("globex"))),
+            },
+            &mut seq,
+        );
+        apply(
+            &state,
+            CatalogDelta::UpsertTable {
+                identifier: tid(&["globex", "ops"], "metrics"),
+                schema: Box::new(CatalogTableSchema::new("metrics")),
+            },
+            &mut seq,
+        );
+        // A tenant-less namespace lands in the DEFAULT shard.
+        apply(
+            &state,
+            CatalogDelta::UpsertNamespace {
+                namespace: Box::new(ns(&["public"])),
+            },
+            &mut seq,
+        );
+        apply(
+            &state,
+            CatalogDelta::UpsertTable {
+                identifier: tid(&["public"], "shared"),
+                schema: Box::new(CatalogTableSchema::new("shared")),
+            },
+            &mut seq,
+        );
+        state
+    }
+
+    fn with_tenant(mut namespace: CatalogNamespace, tenant: Option<&str>) -> CatalogNamespace {
+        namespace.tenant_id = tenant.map(str::to_string);
+        namespace
+    }
+
+    /// Shard partitioning: every row lands in exactly one shard, keyed by
+    /// its namespace's tenant; tenant-less rows share the default shard; the
+    /// account registry and global high-water live in the ROOT, not shards.
+    #[test]
+    fn shards_partition_rows_by_account_and_root_carries_globals() -> Result<()> {
+        let state = seeded_state();
+        assert_eq!(
+            crate::services::system_catalog_state::shard_key_of_tenant(Some("acme")),
+            "acme"
+        );
+        assert_eq!(
+            crate::services::system_catalog_state::shard_key_of_tenant(None),
+            DEFAULT_SHARD_KEY
+        );
+
+        let index = std::collections::BTreeMap::from([
+            ("_default".to_string(), 3),
+            ("acme".to_string(), 1),
+            ("globex".to_string(), 2),
+        ]);
+        let root_bytes = state.to_root_bytes(&index)?;
+        let (accounts, high_water, _stamp, applied, decoded_index) =
+            SystemCatalogState::decode_catalog_root(&root_bytes)?;
+        assert_eq!(accounts.get("acme"), Some(&1));
+        assert_eq!(accounts.get("globex"), Some(&2));
+        assert_eq!(high_water.namespace_id, 4, "global record keeps the max");
+        assert_eq!(applied, state.applied_seq());
+        assert_eq!(decoded_index, index);
+
+        // Full assembly from root + shards reproduces the whole read surface.
+        let shards: Vec<(String, Vec<u8>)> = ["_default", "acme", "globex"]
+            .iter()
+            .map(|account| ((*account).to_string(), state.to_shard_bytes(account).unwrap()))
+            .collect();
+        let rebuilt = SystemCatalogState::from_root_and_shards(&root_bytes, &shards)?;
+        for (namespace, table) in [
+            (vec!["acme".to_string(), "sales".to_string()], "orders"),
+            (vec!["acme".to_string(), "sales".to_string()], "returns"),
+            (vec!["globex".to_string(), "ops".to_string()], "metrics"),
+            (vec!["public".to_string()], "shared"),
+        ] {
+            assert!(
+                rebuilt.table_exists(&TableIdentifier::new(namespace, table)),
+                "{table} must survive the sharded round trip"
+            );
+        }
+        assert_eq!(rebuilt.account_id_u32("globex"), Some(2));
+        assert_eq!(rebuilt.max_namespace_id_ever_for("acme"), Some(4));
+        assert_eq!(rebuilt.applied_seq(), state.applied_seq());
+        // A shard body carrying a different account identity is rejected.
+        let mislabeled = state.to_shard_bytes("acme")?;
+        assert!(
+            rebuilt.load_shard_bytes("globex", &mislabeled).is_err(),
+            "shard identity mismatch must fail closed"
+        );
+        Ok(())
+    }
+
+    /// Per-shard adoption replaces EXACTLY that account's rows: adopting an
+    /// emptied acme shard removes acme's tables while globex and the default
+    /// shard are untouched.
+    #[test]
+    fn shard_adoption_replaces_only_that_accounts_rows() -> Result<()> {
+        let state = seeded_state();
+        let empty_acme = SystemCatalogState::new(); // no acme rows at all
+        let empty_shard_bytes = empty_acme.to_shard_bytes("acme")?;
+
+        state.load_shard_bytes("acme", &empty_shard_bytes)?;
+        assert!(
+            !state.table_exists(&tid(&["acme", "sales"], "orders")),
+            "acme rows are retired by the emptied shard image"
+        );
+        assert!(state.namespace_exists(&["public".to_string()]));
+        assert!(
+            state.table_exists(&tid(&["globex", "ops"], "metrics")),
+            "globex rows are untouched by acme's adoption"
+        );
+        assert!(
+            state.table_exists(&tid(&["public"], "shared")),
+            "default-shard rows are untouched"
+        );
+        // The per-account high-water SURVIVES the emptied shard (dropped ids
+        // stay reserved) — `to_shard_bytes` carries it from state.
+        assert_eq!(state.max_namespace_id_ever_for("acme"), Some(4));
+        Ok(())
+    }
+
+    /// The per-account namespace-id high-water remembers DROPPED ids, and
+    /// only within their own account: emptying acme's highest namespace
+    /// keeps acme's floor while globex mints its own ids from its own floor.
+    #[test]
+    fn per_account_namespace_high_water_is_scoped_and_survives_drops() -> Result<()> {
+        let state = SystemCatalogState::new();
+        // The namespace record is what attributes its tables to the account
+        // shard (the tenant id rides the namespace, matching the mint path).
+        state.apply_committed(
+            1,
+            CatalogDelta::UpsertNamespace {
+                namespace: Box::new(with_tenant(ns(&["acme", "sales"]), Some("acme"))),
+            },
+        );
+        let mut acme_table = CatalogTableSchema::new("orders");
+        acme_table.stable_namespace_id = Some(5);
+        state.apply_committed(
+            2,
+            CatalogDelta::UpsertTable {
+                identifier: tid(&["acme", "sales"], "orders"),
+                schema: Box::new(acme_table),
+            },
+        );
+        assert_eq!(state.max_namespace_id_ever_for("acme"), Some(5));
+        assert_eq!(state.max_namespace_id_ever_for("globex"), None);
+
+        // Drop the only row carrying the id: the floor must persist.
+        state.apply_committed(
+            3,
+            CatalogDelta::DropTable {
+                identifier: tid(&["acme", "sales"], "orders"),
+            },
+        );
+        assert_eq!(
+            state.max_namespace_id_ever_for("acme"),
+            Some(5),
+            "a dropped namespace id stays reserved per account"
+        );
+        // And the reserved id survives the sharded round trip (the shard
+        // body carries the per-account high-water).
+        let shard = state.to_shard_bytes("acme")?;
+        let round = SystemCatalogState::new();
+        round.load_shard_bytes("acme", &shard)?;
+        assert_eq!(round.max_namespace_id_ever_for("acme"), Some(5));
+        Ok(())
+    }
 }

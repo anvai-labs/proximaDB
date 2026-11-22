@@ -708,6 +708,7 @@ fn catalog_snapshot_min_age_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::trait_components::path_resolver::DrPathBuilder;
 
     fn body(opt: Option<SnapshotRead>) -> Option<Vec<u8>> {
         opt.map(|r| r.bytes)
@@ -927,5 +928,113 @@ mod tests {
         let read = pod_b.read().await.unwrap().unwrap();
         assert_eq!(read.generation, 2);
         assert_eq!(read.bytes, b"from-B");
+    }
+
+    // ── TD-SPINE-2: sharded surface (root + per-account shard logs) ─────────
+
+    /// The sharded surface round-trips over the real commit protocol: shards
+    /// commit through their own CAS logs, the root through its, `read_root`
+    /// / `read_shard` return the tips, and a STALE generation is fenced on
+    /// BOTH surfaces (a superseded pod can neither move a shard nor the
+    /// root). The legacy whole-image log is untouched by the sharded path.
+    #[tokio::test]
+    async fn sharded_surface_round_trips_and_fences_stale_writers() -> Result<()> {
+        let backing =
+            ProximaObjectStore::new(std::sync::Arc::new(object_store::memory::InMemory::new()));
+        let store = ObjectStoreSnapshotStore::new(backing, "memory:///", "_operator/catalog/_manifests/");
+        assert!(store.supports_sharded_publish());
+
+        // Empty: no root, no shard.
+        assert!(store.read_root().await?.is_none());
+        assert!(store.read_shard("acme").await?.is_none());
+
+        // A newer pod (generation 2) owns the logs and publishes.
+        let committed = match store
+            .commit_shards(
+                2,
+                &[
+                    ("acme".to_string(), b"acme-shard-v1".to_vec()),
+                    ("globex".to_string(), b"globex-shard-v1".to_vec()),
+                ],
+            )
+            .await?
+        {
+            ShardCommit::Committed(versions) => versions,
+            ShardCommit::Fenced => panic!("first shard commit must land"),
+        };
+        assert_eq!(committed["acme"], 0);
+        assert_eq!(committed["globex"], 0);
+        assert_eq!(
+            store.commit_root(2, b"root-v1").await?,
+            SnapshotWrite::Published { version: 0 }
+        );
+        let root = store.read_root().await?.expect("root");
+        assert_eq!((root.version, root.generation), (0, 2));
+        assert_eq!(root.bytes, b"root-v1");
+        let acme = store.read_shard("acme").await?.expect("acme shard");
+        assert_eq!((acme.version, acme.generation, acme.bytes.as_slice()), (0, 2, b"acme-shard-v1"));
+
+        // A stale writer (generation 1) is fenced on BOTH surfaces, and the
+        // stale shard commit is rejected BEFORE any root moves.
+        assert_eq!(
+            store
+                .commit_shards(1, &[("acme".to_string(), b"stale".to_vec())])
+                .await?,
+            ShardCommit::Fenced
+        );
+        assert_eq!(store.commit_root(1, b"stale-root").await?, SnapshotWrite::Fenced);
+        assert_eq!(store.read_shard("acme").await?.unwrap().bytes, b"acme-shard-v1");
+        assert_eq!(store.read_root().await?.unwrap().bytes, b"root-v1");
+
+        // The legacy whole-image log is untouched by the sharded path.
+        assert!(store.read().await?.is_none());
+        Ok(())
+    }
+
+    /// The shard and root logs live at the DrPathBuilder-derived sibling
+    /// prefixes of the whole-image log (`_operator/catalog/_shards/{hex}/`,
+    /// `_operator/catalog/_root/`), NOT inside the legacy `_manifests/`
+    /// prefix — a legacy reader's LIST of the whole-image log never sees
+    /// them, and per-account prefixes are structurally distinct.
+    #[tokio::test]
+    async fn shard_and_root_objects_land_on_drpath_sibling_prefixes() -> Result<()> {
+        use object_store::ObjectStore;
+        use object_store::path::Path;
+
+        let inner = std::sync::Arc::new(object_store::memory::InMemory::new());
+        let backing = ProximaObjectStore::new(inner.clone());
+        let store = ObjectStoreSnapshotStore::new(
+            backing,
+            "memory:///",
+            DrPathBuilder::system_catalog_manifests_subprefix(),
+        );
+        store
+            .commit_shards(1, &[("tenant one/x".to_string(), b"s".to_vec())])
+            .await?;
+        store.commit_root(1, b"r").await?;
+
+        let mut keys: Vec<String> = inner
+            .list(None)
+            .await
+            .map(|meta| meta.location.to_string())
+            .collect()
+            .await;
+        keys.sort();
+        // Hex encoding: even a separator-bearing tenant id becomes one
+        // path-safe segment.
+        let hex = DrPathBuilder::encode_system_catalog_shard_segment("tenant one/x");
+        assert!(!hex.contains('/'));
+        assert_eq!(
+            keys,
+            vec![
+                format!("_operator/catalog/_root/v00000000000000000000.manifest"),
+                format!("_operator/catalog/_shards/{hex}/v00000000000000000000.manifest"),
+            ]
+        );
+        assert_eq!(
+            Path::from(format!("_operator/catalog/_shards/{hex}/").as_str()),
+            Path::from(DrPathBuilder::system_catalog_shard_manifests_subprefix("tenant one/x").as_str())
+        );
+        Ok(())
     }
 }

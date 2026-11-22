@@ -3544,4 +3544,699 @@ mod tests {
         );
         Ok(())
     }
+
+    // ── TD-SPINE-2: per-account sharded snapshot publish / reload ───────────
+
+    /// Records every PUT (path + byte length) and GET (path) against a real
+    /// in-memory backend, so the O(account) and only-changed-shards
+    /// assertions observe actual object-store traffic, not assertions about
+    /// helper calls.
+    #[derive(Debug, Default)]
+    struct IoLedger {
+        puts: std::sync::Mutex<Vec<(String, usize)>>,
+        gets: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl IoLedger {
+        fn put_bytes_matching(&self, needle: &str) -> usize {
+            self.puts
+                .lock()
+                .expect("puts lock")
+                .iter()
+                .filter(|(path, _)| path.contains(needle))
+                .map(|(_, len)| *len)
+                .sum()
+        }
+
+        fn put_paths_matching(&self, needle: &str) -> usize {
+            self.puts
+                .lock()
+                .expect("puts lock")
+                .iter()
+                .filter(|(path, _)| path.contains(needle))
+                .count()
+        }
+
+        fn get_count_matching(&self, needle: &str) -> usize {
+            self.gets
+                .lock()
+                .expect("gets lock")
+                .iter()
+                .filter(|path| path.contains(needle))
+                .count()
+        }
+
+        fn reset(&self) {
+            self.puts.lock().expect("puts lock").clear();
+            self.gets.lock().expect("gets lock").clear();
+        }
+    }
+
+    #[derive(Debug)]
+    struct CountingStore {
+        inner: Arc<object_store::memory::InMemory>,
+        ledger: Arc<IoLedger>,
+    }
+
+    impl std::fmt::Display for CountingStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("CountingStore")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl object_store::ObjectStore for CountingStore {
+        async fn put_opts(
+            &self,
+            path: &object_store::path::Path,
+            payload: object_store::PutPayload,
+            options: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            self.ledger
+                .puts
+                .lock()
+                .expect("puts lock")
+                .push((path.to_string(), payload.len()));
+            self.inner.put_opts(path, payload, options).await
+        }
+        async fn put_multipart_opts(
+            &self,
+            path: &object_store::path::Path,
+            options: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(path, options).await
+        }
+        async fn get_opts(
+            &self,
+            path: &object_store::path::Path,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            self.ledger
+                .gets
+                .lock()
+                .expect("gets lock")
+                .push(path.to_string());
+            self.inner.get_opts(path, options).await
+        }
+        fn delete_stream(
+            &self,
+            paths: futures::stream::BoxStream<
+                'static,
+                object_store::Result<object_store::path::Path>,
+            >,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>
+        {
+            self.inner.delete_stream(paths)
+        }
+        fn list(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(prefix)
+        }
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+        async fn copy_opts(
+            &self,
+            from: &object_store::path::Path,
+            to: &object_store::path::Path,
+            options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    fn hex_segment(account: &str) -> String {
+        crate::storage::trait_components::path_resolver::DrPathBuilder::encode_system_catalog_shard_segment(account)
+    }
+
+    /// Guard that sets an env gate for one test and restores the prior value
+    /// (or removes it) on drop — `#[serial]` keeps concurrent tests from
+    /// observing the mutation.
+    struct EnvGuard(&'static str, Option<String>);
+    impl EnvGuard {
+        fn set(name: &'static str, value: &str) -> Self {
+            let prior = std::env::var(name).ok();
+            std::env::set_var(name, value);
+            Self(name, prior)
+        }
+    }
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match self.1.take() {
+                Some(value) => std::env::set_var(self.0, value),
+                None => std::env::remove_var(self.0),
+            }
+        }
+    }
+
+    async fn open_owner_counting(
+        wal: &std::path::Path,
+        ledger: &Arc<IoLedger>,
+        backing: &Arc<object_store::memory::InMemory>,
+    ) -> Result<SystemCatalog> {
+        let store = Arc::new(
+            crate::services::catalog_snapshot_store::ObjectStoreSnapshotStore::new(
+                proximadb_object_store::ProximaObjectStore::new(Arc::new(CountingStore {
+                    inner: backing.clone(),
+                    ledger: ledger.clone(),
+                })),
+                "memory:///",
+                crate::storage::trait_components::path_resolver::DrPathBuilder::system_catalog_manifests_subprefix(),
+            ),
+        );
+        SystemCatalog::open_with_snapshot_store("default", wal, store).await
+    }
+
+    /// Seed two accounts of very different sizes: `big` with `big_tables`
+    /// tables, `small` with one. Both accounts are minted (registry) and
+    /// their namespaces are tenant-scoped, so each lands in its own shard.
+    async fn seed_two_accounts(
+        owner: &SystemCatalog,
+        big_tables: usize,
+    ) -> Result<(Vec<String>, Vec<String>)> {
+        let big_ns = nslevels(&["big", "prod"]);
+        let small_ns = nslevels(&["small", "prod"]);
+        owner.account_id_u32("big-tenant").await?;
+        owner.account_id_u32("small-tenant").await?;
+        owner
+            .create_namespace_for_tenant(&big_ns, HashMap::new(), Some("big-tenant"))
+            .await?;
+        owner
+            .create_namespace_for_tenant(&small_ns, HashMap::new(), Some("small-tenant"))
+            .await?;
+        for i in 0..big_tables {
+            owner
+                .create_table(
+                    &TableIdentifier::new(big_ns.clone(), &format!("t{i:03}")),
+                    vec_schema(&format!("t{i:03}")),
+                )
+                .await?;
+        }
+        owner
+            .create_table(
+                &TableIdentifier::new(small_ns.clone(), "only"),
+                vec_schema("only"),
+            )
+            .await?;
+        Ok((big_ns, small_ns))
+    }
+
+    /// The O(account) target (ADR-098 D1.3 / TD-SPINE-2 acceptance): a DDL
+    /// in the SMALL account publishes that account's shard + the small root
+    /// — measured PUT bytes stay proportional to the small account's catalog
+    /// and NEVER touch the big account's shard object. Mutation control: if
+    /// the publish regressed to a whole-image write, the big account's shard
+    /// prefix would see zero PUTs but the legacy `_manifests/` prefix would
+    /// carry the full fleet image and the byte assertions would fail.
+    #[tokio::test]
+    async fn ddl_publishes_only_its_accounts_shard_bytes_scale_with_account() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let backing = Arc::new(object_store::memory::InMemory::new());
+        let ledger = Arc::new(IoLedger::default());
+        let owner = open_owner_counting(&dir.path().join("owner.wal"), &ledger, &backing).await?;
+        let (big_ns, small_ns) = seed_two_accounts(&owner, 40).await?;
+
+        let big_shard_alone = owner.state.to_shard_bytes("big-tenant")?.len();
+        assert!(
+            big_shard_alone > 8_000,
+            "the big account's shard must dominate the fixture ({big_shard_alone} bytes)"
+        );
+        ledger.reset();
+
+        // One DDL in the SMALL account.
+        owner
+            .create_table(
+                &TableIdentifier::new(small_ns.clone(), "second"),
+                vec_schema("second"),
+            )
+            .await?;
+
+        // The big account's shard object is untouched...
+        assert_eq!(
+            ledger.put_paths_matching(&format!("_shards/{}", hex_segment("big-tenant"))),
+            0,
+            "a small-account DDL must not republish the big account's shard"
+        );
+        // ...and the small account's shard IS republished.
+        assert_eq!(
+            ledger.put_paths_matching(&format!("_shards/{}", hex_segment("small-tenant"))),
+            1,
+            "the small account's shard is republished exactly once"
+        );
+        // The root is published once and stays small (registry-sized, not
+        // table-sized).
+        assert_eq!(ledger.put_paths_matching("_root/"), 1);
+        assert!(
+            ledger.put_bytes_matching("_root/") < big_shard_alone / 4,
+            "root bytes must be registry-sized, not fleet-sized"
+        );
+        // Total bytes for the DDL are O(small account): far below the big
+        // account's shard alone (the legacy path would rewrite ~the whole
+        // fleet image through _manifests/).
+        assert_eq!(ledger.put_paths_matching("_manifests/"), 0);
+        let total: usize = ledger
+            .puts
+            .lock()
+            .expect("puts lock")
+            .iter()
+            .map(|(_, len)| *len)
+            .sum();
+        assert!(
+            total < big_shard_alone,
+            "bytes per DDL ({total}) must be O(account), below the big account's \
+             shard alone ({big_shard_alone})"
+        );
+        // Sanity: the DDL is durable and visible after a fresh boot.
+        drop(owner);
+        let reopened = open_owner_counting(&dir.path().join("owner.wal"), &ledger, &backing).await?;
+        assert!(
+            reopened
+                .table_exists(&TableIdentifier::new(small_ns, "second"))
+                .await?
+        );
+        assert!(
+            reopened
+                .table_exists(&TableIdentifier::new(big_ns, "t000"))
+                .await?
+        );
+        Ok(())
+    }
+
+    /// Cross-pod reload adopts ONLY the changed shards (ADR-098 D1.3): after
+    /// the owner DDLs in the small account, the follower's reload fetches
+    /// the root + the small shard and NEVER GETs the big account's shard —
+    /// while the big account's rows stay intact in RAM (no whole-image swap,
+    /// so its read-your-writes window is undisturbed).
+    #[tokio::test]
+    async fn follower_reload_adopts_only_the_changed_shard() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let backing = Arc::new(object_store::memory::InMemory::new());
+        let ledger = Arc::new(IoLedger::default());
+        let owner = open_owner_counting(&dir.path().join("owner.wal"), &ledger, &backing).await?;
+        let (big_ns, small_ns) = seed_two_accounts(&owner, 25).await?;
+
+        // Follower boots from root + both shards.
+        let follower =
+            open_follower_counting(&dir.path().join("follower.wal"), &ledger, &backing).await?;
+        assert!(follower.table_exists(&TableIdentifier::new(big_ns.clone(), "t000")).await?);
+        ledger.reset();
+
+        // Owner DDLs in the SMALL account and republishes.
+        owner
+            .create_table(
+                &TableIdentifier::new(small_ns.clone(), "second"),
+                vec_schema("second"),
+            )
+            .await?;
+
+        match follower.reload_if_stale().await? {
+            ReloadOutcome::Reloaded { superseded, .. } => assert!(!superseded),
+            other => panic!("expected a reload, got {other:?}"),
+        }
+        // The new table is visible, the big account's rows survived...
+        assert!(
+            follower
+                .table_exists(&TableIdentifier::new(small_ns, "second"))
+                .await?
+        );
+        assert!(
+            follower
+                .table_exists(&TableIdentifier::new(big_ns, "t024"))
+                .await?
+        );
+        // ...and the reload fetched only root + the small shard: no GET of
+        // the big account's shard object, no whole-image read.
+        assert_eq!(
+            ledger.get_count_matching(&format!("_shards/{}", hex_segment("big-tenant"))),
+            0,
+            "reload must not fetch the unchanged big shard"
+        );
+        assert_eq!(
+            ledger.get_count_matching(&format!("_shards/{}", hex_segment("small-tenant"))),
+            1,
+            "reload fetches the changed small shard exactly once"
+        );
+        assert!(ledger.get_count_matching("_root/") >= 1);
+        Ok(())
+    }
+
+    async fn open_follower_counting(
+        wal: &std::path::Path,
+        ledger: &Arc<IoLedger>,
+        backing: &Arc<object_store::memory::InMemory>,
+    ) -> Result<SystemCatalog> {
+        let store = Arc::new(
+            crate::services::catalog_snapshot_store::ObjectStoreSnapshotStore::new(
+                proximadb_object_store::ProximaObjectStore::new(Arc::new(CountingStore {
+                    inner: backing.clone(),
+                    ledger: ledger.clone(),
+                })),
+                "memory:///",
+                crate::storage::trait_components::path_resolver::DrPathBuilder::system_catalog_manifests_subprefix(),
+            ),
+        );
+        SystemCatalog::open_follower("default", wal, store).await
+    }
+
+    /// TD-SPINE-2 migration (mixed-read): a legacy whole-image snapshot
+    /// (written with the kill switch OFF, exactly as a pre-SPINE-2 binary
+    /// would) boots under the new code, is re-published as root + shards,
+    /// and a follower then assembles the sharded image. The legacy chain
+    /// stays readable throughout.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn legacy_whole_image_snapshot_migrates_to_root_and_shards() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let backing: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let legacy_prefix = "_operator/catalog/_manifests/";
+
+        // 1. A pre-SPINE-2 writer publishes whole-image snapshots only.
+        {
+            let _guard = EnvGuard::set("PROXIMADB_CATALOG_SHARDED_SNAPSHOT_DISABLE", "1");
+            let store = Arc::new(crate::services::catalog_snapshot_store::ObjectStoreSnapshotStore::new(
+                proximadb_object_store::ProximaObjectStore::new(backing.clone()),
+                "memory:///",
+                legacy_prefix,
+            ));
+            let legacy = SystemCatalog::open_with_snapshot_store(
+                "default",
+                dir.path().join("legacy.wal"),
+                store.clone(),
+            )
+            .await?;
+            legacy
+                .create_namespace_for_tenant(&nslevels(&["acme", "sales"]), HashMap::new(), Some("acme"))
+                .await?;
+            create_named(&legacy, &nslevels(&["acme", "sales"]), "orders").await?;
+            create_named(&legacy, &nslevels(&["acme", "sales"]), "customers").await?;
+            // The legacy log carries the whole image; no root exists yet.
+            assert!(store.read().await?.is_some());
+            assert!(store.read_root().await?.is_none());
+        }
+
+        // 2. The new binary boots (kill switch unset = sharded): it reads the
+        //    legacy whole image, then re-publishes root + the acme shard.
+        let store = Arc::new(crate::services::catalog_snapshot_store::ObjectStoreSnapshotStore::new(
+            proximadb_object_store::ProximaObjectStore::new(backing.clone()),
+            "memory:///",
+            legacy_prefix,
+        ));
+        let migrated = SystemCatalog::open_with_snapshot_store(
+            "default",
+            dir.path().join("owner.wal"),
+            store.clone(),
+        )
+        .await?;
+        let root = store.read_root().await?.expect("migration published a root");
+        let (_, _, _, _, index) = crate::services::system_catalog_state::SystemCatalogState::decode_catalog_root(&root.bytes)?;
+        assert!(
+            index.contains_key("acme"),
+            "the root index names the migrated account: {index:?}"
+        );
+        let shard = store.read_shard("acme").await?.expect("acme shard exists");
+        assert_eq!(shard.version, index["acme"]);
+        // Both tables live in the shard image.
+        assert!(
+            migrated
+                .table_exists(&TableIdentifier::new(nslevels(&["acme", "sales"]), "orders"))
+                .await?
+        );
+
+        // 3. A follower assembles root + shards and sees the migrated rows.
+        let follower = SystemCatalog::open_follower(
+            "default",
+            dir.path().join("follower.wal"),
+            store.clone(),
+        )
+        .await?;
+        assert!(
+            follower
+                .table_exists(&TableIdentifier::new(nslevels(&["acme", "sales"]), "customers"))
+                .await?
+        );
+        // And the legacy chain is still readable (mixed-read: nothing was
+        // destroyed by the migration).
+        let legacy_read = store.read().await?.expect("legacy log intact");
+        assert!(
+            crate::services::system_catalog_state::SystemCatalogState::from_snapshot_bytes(
+                &legacy_read.bytes
+            )?
+            .table_exists(&TableIdentifier::new(nslevels(&["acme", "sales"]), "orders"))
+        );
+        Ok(())
+    }
+
+    /// TD-SPINE-2 crash-consistency: a publish that dies between the shard
+    /// commit and the root commit leaves an ORPHAN shard — a committed
+    /// version the root does not name. The orphan is invisible to reloads
+    /// (the ROOT version is the sinval key; a shard commit alone never
+    /// moves it), and the owner's next publish heals it idempotently: it
+    /// re-serializes the same in-RAM shard image onto the next slot of the
+    /// log the orphan already advanced, and the follower converges without
+    /// ever observing a torn account.
+    #[tokio::test]
+    async fn crash_between_shard_and_root_publish_is_idempotent() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let backing: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let store = Arc::new(crate::services::catalog_snapshot_store::ObjectStoreSnapshotStore::new(
+            proximadb_object_store::ProximaObjectStore::new(backing.clone()),
+            "memory:///",
+            "_operator/catalog/_manifests/",
+        ));
+        let owner = SystemCatalog::open_with_snapshot_store(
+            "default",
+            dir.path().join("owner.wal"),
+            store.clone(),
+        )
+        .await?;
+        owner
+            .create_namespace_for_tenant(&nslevels(&["acme", "sales"]), HashMap::new(), Some("acme"))
+            .await?;
+        create_named(&owner, &nslevels(&["acme", "sales"]), "orders").await?;
+        let root_v1 = store.read_root().await?.expect("root published").version;
+        let (_, _, _, _, index_v1) =
+            crate::services::system_catalog_state::SystemCatalogState::decode_catalog_root(
+                &store.read_root().await?.unwrap().bytes,
+            )?;
+
+        // Follower adopts root v1.
+        let follower = SystemCatalog::open_follower(
+            "default",
+            dir.path().join("follower.wal"),
+            store.clone(),
+        )
+        .await?;
+        assert!(
+            follower
+                .table_exists(&TableIdentifier::new(nslevels(&["acme", "sales"]), "orders"))
+                .await?
+        );
+
+        // The crash window: a shard version commits (by the owner's own
+        // serializer, same generation — exactly what a lost root PUT leaves
+        // behind) but the root does not advance.
+        let orphan_bytes = owner.state.to_shard_bytes("acme")?;
+        let orphan_version = match store
+            .commit_shards(owner.generation(), &[("acme".to_string(), orphan_bytes)])
+            .await?
+        {
+            crate::services::catalog_snapshot_store::ShardCommit::Committed(versions) => {
+                versions["acme"]
+            }
+            other => panic!("expected the orphan shard commit to land, got {other:?}"),
+        };
+        assert!(
+            orphan_version > index_v1["acme"],
+            "the orphan shard is ahead of the version the root names"
+        );
+        assert_eq!(
+            store.latest_root_version().await?,
+            Some(root_v1),
+            "a shard-only commit never advances the root"
+        );
+        // The follower is unaffected: no root advance, no reload.
+        assert_eq!(follower.reload_if_stale().await?, ReloadOutcome::UpToDate);
+
+        // Heal: the owner's next DDL re-serializes its shard image (the
+        // orphan's successor slot — idempotent, no conflict) and publishes
+        // the root that finally names it.
+        create_named(&owner, &nslevels(&["acme", "sales"]), "later").await?;
+        match follower.reload_if_stale().await? {
+            ReloadOutcome::Reloaded { superseded, .. } => assert!(!superseded),
+            other => panic!("expected the healed publish to reload, got {other:?}"),
+        }
+        assert!(
+            follower
+                .table_exists(&TableIdentifier::new(nslevels(&["acme", "sales"]), "orders"))
+                .await?
+        );
+        assert!(
+            follower
+                .table_exists(&TableIdentifier::new(nslevels(&["acme", "sales"]), "later"))
+                .await?,
+            "the healed root converges the follower"
+        );
+        Ok(())
+    }
+
+    /// TD-SPINE-2 per-account namespace floor (ADR-098 D1.4): two accounts
+    /// each mint stable namespace id 1 for their first namespace — the id
+    /// scopes an `accounts/{a}/{n}/…` path, so uniqueness is per-account —
+    /// and each account's subsequent ids continue from ITS OWN floor.
+    #[tokio::test]
+    async fn per_account_namespace_floor_two_accounts_each_mint_id_one() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let cat = catalog(dir.path()).await;
+        cat.account_id_u32("acme").await?;
+        cat.account_id_u32("globex").await?;
+
+        let acme_ns = nslevels(&["acme", "sales"]);
+        let globex_ns = nslevels(&["globex", "ops"]);
+        cat.create_namespace_for_tenant(&acme_ns, HashMap::new(), Some("acme"))
+            .await?;
+        cat.create_namespace_for_tenant(&globex_ns, HashMap::new(), Some("globex"))
+            .await?;
+        let acme_orders = create_named(&cat, &acme_ns, "orders").await?;
+        let globex_metrics = create_named(&cat, &globex_ns, "metrics").await?;
+        assert_eq!(acme_orders.stable_namespace_id, Some(1));
+        assert_eq!(
+            globex_metrics.stable_namespace_id,
+            Some(1),
+            "the namespace floor is per-account: globex mints its own id 1"
+        );
+
+        // Each account's second namespace continues from its own floor.
+        let acme_ns2 = nslevels(&["acme", "hr"]);
+        cat.create_namespace_for_tenant(&acme_ns2, HashMap::new(), Some("acme"))
+            .await?;
+        let acme_people = create_named(&cat, &acme_ns2, "people").await?;
+        assert_eq!(acme_people.stable_namespace_id, Some(2));
+        drop(cat);
+
+        // Existing ids are never renumbered across a restart; new allocations
+        // continue per-account.
+        let reopened = catalog(dir.path()).await;
+        let again = reopened
+            .get_table(&TableIdentifier::new(acme_ns.clone(), "orders"))
+            .await?;
+        assert_eq!(again.stable_namespace_id, Some(1), "existing ids unchanged");
+        let globex_again = reopened
+            .get_table(&TableIdentifier::new(globex_ns.clone(), "metrics"))
+            .await?;
+        assert_eq!(globex_again.stable_namespace_id, Some(1));
+        let acme_ns3 = nslevels(&["acme", "legal"]);
+        reopened
+            .create_namespace_for_tenant(&acme_ns3, HashMap::new(), Some("acme"))
+            .await?;
+        let acme_contracts = create_named(&reopened, &acme_ns3, "contracts").await?;
+        assert_eq!(
+            acme_contracts.stable_namespace_id,
+            Some(3),
+            "acme's floor continues from its own high-water after restart"
+        );
+        Ok(())
+    }
+
+    /// Legacy-global ids are NOT renumbered when the per-account floor turns
+    /// on: an account whose ids were minted under the old global counter
+    /// keeps every one of them, and only its NEW allocations draw from its
+    /// own (lower) per-account floor.
+    #[tokio::test]
+    async fn pre_existing_global_namespace_ids_are_never_renumbered() -> Result<()> {
+        let state = crate::services::system_catalog_state::SystemCatalogState::new();
+        // A legacy account whose ids were minted by the GLOBAL counter: acme
+        // holds 1..5, globex holds 6 (as the old single floor would mint).
+        state.apply_committed(
+            1,
+            CatalogDelta::UpsertNamespace {
+                namespace: Box::new({
+                    let mut ns =
+                        proximadb_catalog::CatalogNamespace::new(nslevels(&["acme", "sales"]));
+                    ns.tenant_id = Some("acme".to_string());
+                    ns
+                }),
+            },
+        );
+        for (seq, id) in [(2_u64, 1_u16), (3, 2), (4, 3), (5, 4), (6, 5)] {
+            let mut schema = CatalogTableSchema::new(&format!("t{id}"));
+            schema.stable_namespace_id = Some(id);
+            state.apply_committed(
+                seq,
+                CatalogDelta::UpsertTable {
+                    identifier: TableIdentifier::new(nslevels(&["acme", "sales"]), format!("t{id}")),
+                    schema: Box::new(schema),
+                },
+            );
+        }
+        let cat = SystemCatalog::new("legacy", state, Arc::new(crate::services::canonical_wal::MemoryTableWalAppender::new()));
+        // The per-account floor for acme sits above ITS OWN high-water (5)…
+        let acme_ns2 = nslevels(&["acme", "hr"]);
+        // (namespace must exist for the typed mint to fire)
+        cat.create_namespace_for_tenant(&acme_ns2, HashMap::new(), Some("acme"))
+            .await?;
+        let schema = vec_schema("people");
+        let minted = cat
+            .create_table(&TableIdentifier::new(acme_ns2, "people"), schema)
+            .await?;
+        assert_eq!(minted.stable_namespace_id, Some(6), "acme continues above its own high-water");
+        // …and every pre-existing id is still exactly what it was.
+        for id in 1_u16..=5 {
+            let table = cat
+                .get_table(&TableIdentifier::new(nslevels(&["acme", "sales"]), format!("t{id}")))
+                .await?;
+            assert_eq!(table.stable_namespace_id, Some(id));
+        }
+        Ok(())
+    }
+
+    /// Kill-switch negative control: with
+    /// `PROXIMADB_CATALOG_SHARDED_SNAPSHOT_DISABLE=1` the catalog publishes
+    /// the legacy whole-image log and creates NO root or shard objects.
+    /// Mutation-proven: flipping the gate's default in
+    /// `sharded_catalog_snapshots_enabled` to `false` (or making the store
+    /// ignore the flag) fails this test — the sharded branch fires and the
+    /// root object appears.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn kill_switch_reverts_publish_to_the_legacy_whole_image_log() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let backing: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let store = Arc::new(crate::services::catalog_snapshot_store::ObjectStoreSnapshotStore::new(
+            proximadb_object_store::ProximaObjectStore::new(backing.clone()),
+            "memory:///",
+            "_operator/catalog/_manifests/",
+        ));
+        let _guard = EnvGuard::set("PROXIMADB_CATALOG_SHARDED_SNAPSHOT_DISABLE", "1");
+        let cat = SystemCatalog::open_with_snapshot_store(
+            "default",
+            dir.path().join("owner.wal"),
+            store.clone(),
+        )
+        .await?;
+        cat.create_namespace(&nslevels(&["s"]), HashMap::new()).await?;
+        create_named(&cat, &nslevels(&["s"]), "t1").await?;
+
+        // The legacy whole-image log carried the publish…
+        let legacy = store.read().await?.expect("whole-image publish");
+        assert!(
+            crate::services::system_catalog_state::SystemCatalogState::from_snapshot_bytes(
+                &legacy.bytes
+            )?
+            .table_exists(&tid("t1"))
+        );
+        // …and the sharded surface was never touched.
+        assert!(store.read_root().await?.is_none());
+        assert!(store.latest_root_version().await?.is_none());
+        assert!(store.read_shard("_default").await?.is_none());
+        Ok(())
+    }
 }

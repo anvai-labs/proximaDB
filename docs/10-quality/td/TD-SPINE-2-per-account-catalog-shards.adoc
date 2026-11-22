@@ -5,13 +5,105 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | **Open** (filed 2026-11-19). Blocked on TD-SPINE-1.
+| Status | **Implemented (2026-11-22)** — PR pending; see Evidence. (Was Open, blocked on TD-SPINE-1; both landed together.)
 | Priority | **HIGH** for multi-tenant SaaS scale. Cost and recovery time grow with the whole fleet's catalog, and one tenant's DDL rewrites every tenant's metadata.
-| Component | `src/services/system_catalog_state.rs` (`CatalogSnapshot` :279, whole-image `load_from_snapshot_bytes` :562); `src/services/system_catalog.rs` (checkpoint :558/:691, `reload_if_stale` :767, `reload_from_store_locked` :791, namespace floor `allocate_bounded(&self.namespace_floor…)` :304); `src/services/catalog_snapshot_store.rs` (`requires_snapshot_on_commit` :372, `ObjectStoreSnapshotStore` :313).
+| Component | `src/services/system_catalog_state.rs` (root/shard records, `to_root_bytes` / `to_shard_bytes` / `from_root_and_shards` / `load_shard_bytes`, per-account ns high-water); `src/services/system_catalog.rs` (`checkpoint_sharded_locked`, `reload_sharded_locked`, sharded `open_inner` boot + migration, per-account `NamespaceIdAllocator`); `src/services/catalog_snapshot_store.rs` (sharded trait surface + `ObjectStoreSnapshotStore` root/shard manifest logs); `src/storage/trait_components/path_resolver.rs` (root/shard prefixes).
 | Authority | link:../../12-design/adr/ADR-098-metadata-spine.adoc[ADR-098] D1.3–D1.4
 | Supersedes | link:TD-SC-3-object_id-keyed-metadata-layout.adoc[TD-SC-3] (oid-keyed layout, conflicts with ADR-0083), link:TD-SC-5-multi-pod-shared-corpus-version-store.adoc[TD-SC-5] (shard generation becomes the shared version) — see each entry
 | Relates to | TD-NS-1 S4 (fences the separate `CatalogIdService::mint_namespace_id` path; this TD owns SystemCatalog's floor), TD-CAT-7 item 4, TD-CAT-11, ADR-035 D2/D4 (cache re-keyed on shard), ADR-073 D3
 |===
+
+== Implementation notes (2026-11-22)
+
+* **Object layout.** The whole-image manifest log (`_operator/catalog/
+  _manifests/`, unchanged, still the kill-switch publish target and the
+  legacy read source) gains two DrPathBuilder-derived siblings: the ROOT log
+  `_operator/catalog/_root/` (global registries, fleet id high-water,
+  `account → shard log version` index) and one SHARD log per account
+  `_operator/catalog/_shards/{hex(account)}/`. The account segment is
+  hex-encoded (`DrPathBuilder::encode_system_catalog_shard_segment`), so any
+  account string — non-ASCII, separator-bearing — maps to exactly one
+  path-safe segment; canonical/derived equivalence is pinned by test. All
+  three logs commit through the same generation-fenced `ManifestCommitter`
+  CAS; the envelope (TD-SPINE-1) rides inside every root/shard body.
+* **Publish protocol.** A commit records the touched accounts (shard key =
+  namespace tenant, `_default` when none; DropNamespace resolves pre-fold).
+  `checkpoint_sharded_locked` commits those shards, then the root naming the
+  merged index, then the identity-high-water sidecar, then compacts the WAL —
+  the same crash-consistency ordering as the whole-image branch. Publish
+  order shard→root makes a mid-publish crash an invisible orphan (the root
+  still names the predecessors); the next publish heals idempotently.
+* **Read protocol.** The ROOT's existence IS the mode: boot assembles root +
+  every indexed shard (O(fleet) decode once at boot, as before); reload
+  probes only the root version and adopts ONLY shards whose index version
+  changed (never a whole-image swap). No root yet ⇒ legacy whole-image log
+  (mixed-read). Migration: an owner booting on a legacy image with sharding
+  on re-publishes it as root + shards before serving.
+* **Fencing.** Shards and root each fence on the pod generation; a fenced
+  shard or root triggers the same step-down-and-reload as the whole-image
+  branch.
+* **Per-account namespace floor.** `NamespaceIdAllocator` (ids + per-account
+  floors under one lock) replaces the global counter; two accounts each mint
+  id 1, existing ids are never renumbered, and each account's floor sits
+  above its own high-water (dropped ids stay reserved per account, carried in
+  the shard body). The GLOBAL `ids_high_water.namespace_id` record survives
+  in the root/snapshot for whole-image readers and never bounds per-account
+  allocation. TD-NS-1 S4 (the separate `CatalogIdService` mint) is NOT
+  changed here.
+* **Kill switch.** `PROXIMADB_CATALOG_SHARDED_SNAPSHOT_DISABLE` (registry
+  row added; default unset = sharded). OFF ⇒ publish + tail revert to the
+  legacy whole-image log; a pod booting OFF on a previously-sharded store
+  still ASSEMBLES root+shards once (no data loss) and an owner re-seeds the
+  legacy log. **Breaking change (accepted pre-GA, 2026-11-22):** a mixed
+  ON/OFF fleet diverges by design — the escape is fleet-wide. Round-trip per
+  DDL is 2 extra HEAD/LIST probes (shard + root logs) vs 1 on the legacy
+  path; bytes per DDL drop from O(fleet) to O(account) — the trade ADR-098
+  D1.3 chooses.
+* **System-scope read paths (Fix item 4 inventory).** The in-RAM authority
+  stays one unified image (sharding is a persistence concern), so
+  `list_namespaces(None)` and `get_namespace_by_object_id` remain
+  **system-scope by design**: they answer over the assembled image at zero
+  extra I/O, which is the desired behavior for introspection/admin surfaces.
+  No caller was scoped down; none needed it.
+
+== Evidence (2026-11-22)
+
+* **O(account):** `ddl_publishes_only_its_accounts_shard_bytes_scale_with_
+  account` — accounts `big-tenant` (40 tables, shard image >8 KB) and
+  `small-tenant` (1 table); a DDL in the small account PUTs 0 objects under
+  the big account's shard prefix, republishes the small shard + a
+  registry-sized root (< 1/4 of the big shard), writes NOTHING to the
+  legacy `_manifests/` prefix, and its total PUT bytes stay below the big
+  account's shard image alone. Measured on a real (in-memory) object store
+  via a PUT/GET-counting backend.
+* **Only-changed-shards reload:** `follower_reload_adopts_only_the_changed_
+  shard` — after the owner DDLs in the small account, the follower's reload
+  GETs root + the small shard exactly once and the big account's shard zero
+  times, while the big account's rows stay intact in RAM.
+* **Migration + mixed-read:** `legacy_whole_image_snapshot_migrates_to_
+  root_and_shards` — a whole-image snapshot written with the kill switch OFF
+  boots under the new code, is re-published as root + shards, a follower
+  assembles it, and the legacy chain stays readable.
+* **Crash idempotence:** `crash_between_shard_and_root_publish_is_idempotent`
+  — an orphan shard commit (root not advanced) never triggers a follower
+  reload; the owner's next publish heals it; convergence without a torn view.
+* **Per-account floor:** `per_account_namespace_floor_two_accounts_each_
+  mint_id_one` (both mint 1; continuation per-account across restart) and
+  `pre_existing_global_namespace_ids_are_never_renumbered`.
+* **Kill switch negative control (mutation-proven):**
+  `kill_switch_reverts_publish_to_the_legacy_whole_image_log` — OFF ⇒
+  whole-image publish lands on the legacy log and NO root/shard objects
+  exist. Mutation check: inverting the gate default in
+  `sharded_catalog_snapshots_enabled` flips this test red (the sharded branch
+  fires and a root object appears) — observed, then restored.
+* **Cross-pod suite:** the pre-existing suite
+  (`follower_tails_owner_and_rejects_writes`,
+  `owner_read_your_writes_survives_poll`, `superseded_owner_steps_down_via_
+  poll`, `fenced_checkpoint_steps_down_and_reloads`,
+  `coherence_is_inert_for_local_and_injected`) now runs the sharded path by
+  default and stays green; the embedded follower tests
+  (`crates/binding/proximadb-embedded/src/catalog_follower.rs`) are untouched
+  and green (injected stores report `supports_sharded_publish() = false`).
 
 == Problem
 
