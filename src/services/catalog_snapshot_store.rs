@@ -1015,6 +1015,7 @@ mod tests {
     /// them, and per-account prefixes are structurally distinct.
     #[tokio::test]
     async fn shard_and_root_objects_land_on_drpath_sibling_prefixes() -> Result<()> {
+        use futures::TryStreamExt;
         use object_store::ObjectStore;
         use object_store::path::Path;
 
@@ -1030,13 +1031,13 @@ mod tests {
             .await?;
         store.commit_root(1, b"r").await?;
 
+        // Flat (recursive) list — `list_with_delimiter` would stop at the
+        // `_operator/` common prefix.
         let mut keys: Vec<String> = inner
-            .list_with_delimiter(None)
-            .await?
-            .objects
-            .into_iter()
-            .map(|meta| meta.location.to_string())
-            .collect();
+            .list(None)
+            .map_ok(|meta| meta.location.to_string())
+            .try_collect()
+            .await?;
         keys.sort();
         // Hex encoding: even a separator-bearing tenant id becomes one
         // path-safe segment.
