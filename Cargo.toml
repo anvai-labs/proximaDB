@@ -740,7 +740,6 @@ time = { version = "0.3", features = ["std"] }  # Time handling for certificates
 # Logging & Monitoring
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tracing-appender = "0.2"
 prometheus.workspace = true
 
 # Configuration
@@ -782,7 +781,6 @@ nom = "7"
 # Multi-model storage (Document + Observability)
 tantivy = "0.27"  # Full-text search for documents
 jsonpath-rust = "0.5"  # JSON path queries for document filtering (actively maintained)
-flume = "0.12"  # High-performance MPSC channels for observability
 
 # PostgreSQL wire protocol compatibility
 pgwire = "0.21"  # PostgreSQL wire protocol for pgvector migration
@@ -822,20 +820,10 @@ tokio-util = { version = "0.7", optional = true }
 metal = { version = "0.27", optional = true }  # Metal GPU acceleration for Apple Silicon
 
 # Build dependencies
-[build-dependencies]
-tonic-build = "0.14"
-tonic-prost-build = "0.14"  # Required for prost-based protobuf compilation in tonic-build 0.14+
-apache-avro = "0.21"
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-tracing = "0.1"
-tracing-subscriber = "0.3"
-
 # Development dependencies
 [dev-dependencies]
 proximadb-records = { path = "crates/foundation/proximadb-records", features = ["test-support"] }
 criterion = { version = "0.5", features = ["async_tokio"] }
-proptest = "1.0"
 # In-process gather of the default prometheus registry where the per-tenant
 # consumption counters live (tests/documents_convergence_bake.rs measures the
 # metering delta at the registry, not just the /metrics/prometheus endpoint —
