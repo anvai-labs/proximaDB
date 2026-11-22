@@ -4,7 +4,7 @@
 :toc: left
 :toclevels: 2
 :icons: font
-:last-updated: 2026-10-19
+:last-updated: 2026-11-22
 
 [cols="1,3", options="header"]
 |===
@@ -22,6 +22,9 @@ commit `635757f2`. Citations to them below use line numbers from that commit (AD
 :82-92; seams Part C at :263-355, P5 at :509-521). This document takes the decided direction as
 given: PAX is the vector authority, with a collection-global centroid directory, cluster-contiguous
 compaction with A+B co-located, and HNSW only as a hot projection.
+
+The dated study occupies sections 1–7. Section 8 records the current ANN
+read-path review and the conditions for changing PAX or PXCD layout.
 
 == 1. Executive summary
 
@@ -930,3 +933,216 @@ bytes ingested), compaction wall time and RSS, and manifest and directory size.
   `flush/mod.rs`:1296-1301 and :1457-1484, `record.rs`:336-344 and `legacy.rs`:1801-1810 were
   re-read here. The `flush/mod.rs` :1360-1395 and :1523-1560 ranges and the `writer.rs` ranges
   were not.
+
+== 8. ANN request economics review (2026-11-22)
+
+The current collection metadata cache is the PXCD v3 directory. It holds bound
+segment decode keys and optional filter facts. The PAX segment header and
+row-group payload layout have their own versions. The earlier PXM1 serving-set
+proposal is historical in this study. Current segment discovery uses LIST and
+validates directory facts against the live object. Where listing omits an ETag,
+the binding relies on immutable object names and recorded size. Preserve LIST
+authority and the stale or missing key fallback while improving the read path.
+See link:adr/ADR-098-metadata-spine.adoc[ADR-098 D2] and
+link:../10-quality/td/TD-PAXMETA-1-collection-level-segment-facts.adoc[TD-PAXMETA-1].
+
+image::../assets/benchmarks/sift1m-ann-get-attribution.png[SIFT1M ANN read breakdown and the one-segment coalescing trade-off]
+
+link:../../scripts/bench/diagrams/sift1m-ann-get-attribution.mmd[Mermaid source]
+
+=== TE-C1 — Reuse bytes before changing the format
+
+The local SIFT1M cache-disabled trace averaged 319.33 ranged GETs across
+three paired ANN queries over 50 untrained L0 segments. Each query issued
+50 header-prefix, 50 whole Region A, 50 footer, 151.33 SQ8 survivor, and
+18 result-rehydration reads. The filesystem trace showed that each
+`[88, 483116)` Region A request was covered by the earlier
+`[0, 1048576)` prefix. All 50 segments repeated the pattern in all three
+queries. The whole-region fallback in `segment_format.rs` bypasses
+`prefetched_slice`, which the coarse-probe path already uses. The
+fallback also skips a footer covered by the prefix when no probe ran.
+These files' footers were outside the prefix.
+
+The request experiments used debug test binaries on develop base
+`f0c3b52bd`, with the TEXMEX corpus and first 100 queries unless noted.
+The 50-segment paired trace used `sift_pax_cascade_recall_at_10_ratchet_rg_layout`
+and `PROXIMADB_TRACE_GETS=1` for physical offsets. The layout and range
+sweeps used `sift_get_counts_directory_at_flush_on`, varying
+`PROXIMADB_SIFT_FLUSH_BATCH` and the reader's
+`PROXIMADB_PAX_COALESCE_RANGE` and `PROXIMADB_PAX_COALESCE_GAP`.
+
+Thought experiment: reusing the complete prefetched Region A slice alone
+would remove 50 ranged GETs and 24.15 MB per paired query, leaving
+about 269.33 ranged GETs with identical rank inputs. Treat that as an
+expected delta until verified in the read path. Check coverage with
+checked offsets and lengths. Exercise both covered and uncovered
+extents, cold operation, and result identity. Next, pass validated size,
+header and footer facts to top-k rehydration within the same query so
+that the existing cache is an optional accelerator. Preserve the
+snapshot, object identity and invalidation checks on this handoff.
+
+=== TE-C2 — Price the coalesced plan on the deployed backend
+
+The separate request-count harness used the same SIFT1M corpus, 100
+queries, and directory-at-flush mode. Going from 50 to 10 to one
+untrained segment changed steady GETs/query from 154.63 to 123.34 to
+92.24 and cold first-query GETs from 309 to 165 to 107. Cold sequential
+request estimates rose from 16 to 28 to 108 as file concurrency fell.
+The single-file coalesced benchmark also failed its below-60 gate at
+93.84 ranged GETs/query, with 88.64 attributable to survivor reads.
+
+With one local file, varying only the reader's range cap and merge gap
+gave the following steady results. Aggregate recall@10 was 0.988 in
+all four arms. These runs use local PAX geometry and provide no
+cloud latency, wire-count, or result-identity measurement.
+
+[cols="1,1,1,1",options="header"]
+|===
+| Max range | Max gap | GETs/query | MB/query
+| 1 MiB | 256 KiB | 92.24 | 49.63
+| 8 MiB | 256 KiB | 62.68 | 51.23
+| 1 MiB | 2 MiB | 76.56 | 60.92
+| 8 MiB | 2 MiB | 19.61 | 83.58
+|===
+
+Thought experiment: increase the cap while holding the gap fixed first.
+This removed 32% of application GETs with 3% more payload. The combined
+change removed 79% with 68% more payload. Compare final coalesced extents
+at the actual read endpoint and access tier before changing a default.
+The current SST chooser holds the gap fixed and passes no access tier
+to its cost-profile resolver. Explicit overrides bypass that chooser.
+
+Keep a hard resident-byte limit across files and concurrent queries.
+A range can remain in memory after its transfer completes, and an
+in-flight count alone does not bound that memory. Record application
+reads, final wire attempts by verb, range lengths, retries and provider
+billing units separately. The current tier trace can double-attribute a
+footer batched with a coarse probe and can count ranges before the
+filesystem merges them or serves from residency. Reconcile the wire
+and provider meters before using tier counters for chargeback.
+
+A same-region S3 Standard service can be request-dominant. At the
+published Northern Virginia example price of $0.0004 per 1,000 GETs,
+50 avoided GETs/query save $20 per million queries in GET charges.
+Retrieval and transfer can be priced separately. Azure's Data Lake
+endpoint and Blob endpoint have different transaction rules. Track
+per-verb provider prices, user-visible p95/p99, bytes, and peak RSS.
+link:https://aws.amazon.com/s3/pricing/[AWS S3 pricing] and
+link:https://learn.microsoft.com/en-us/azure/storage/blobs/blob-storage-estimate-costs[Azure Blob cost model].
+
+=== TE-C3 — Compare sublinear selectors at equal result quality
+
+There are three separate knobs. The legacy block selector's square-root
+mode applies a count to blocks ranked by centroid and optional radius.
+The trained PAX A0 selector applies the probe policy to candidate cells.
+The RaBitQ survivor pool is downstream and currently has a k-dependent
+floor plus a linear row fraction. The 50-L0 trace entered the untrained
+fallback, so an A0 exponent change would leave that trace unaffected.
+
+A local pilot reused one trained 64-cell PAX file over the first
+100,000 SIFT base rows. All five policies used the same first 100
+query vectors and exact subset ground truth. Every query engaged the
+probe with zero whole-region fallbacks. This is direct file search
+with the database caches disabled. It isolates local per-file cell
+selection from collection-directory planning. The full SIFT1M
+trained-compaction run stopped at the 60-second quiescence guard
+before it reached its query arms.
+
+The pilot used the existing `write_ivf2_geometry` and `run_ivf2_bake_arm`
+helpers with `PROXIMADB_IVF_K=64` and
+`PROXIMADB_PAX_READ_PROBE_EXPERIMENTAL=1`. It set each algorithm through
+`CoarseProbeConfig` and retained the default multiplier 2, cell floor 3,
+no separate cell ceiling, and 4 MiB base / 32 MiB cap for byte budget.
+The pilot asserted complete results, an active probe, and zero fallback
+before emitting each row. For the deployed follow-up,
+`scripts/bench/sift1m_get_reduction.py --probe-algorithm` selects the
+existing policies and captures the server path.
+
+[cols="1,1,1,1,1",options="header"]
+|===
+| Policy | Cells/query | Ranged GETs/query | MB/query | Recall@10
+| Square root | 16 | 15.53 | 4.84 | 0.989
+| Cube root | 8 | 12.12 | 3.05 | 0.973
+| Fourth root | 6 | 10.67 | 2.60 | 0.952
+| Logarithmic | 13 | 14.59 | 4.20 | 0.986
+| Byte budget | 55 | 14.62 | 8.88 | 0.989
+|===
+
+Thought experiment: fit each exponent's multiplier at the same recall on a
+calibration split, then test it on a held-out scale and a shifted query set.
+For example, anchor all four count rules at 16 probes with 64 candidate
+cells. At 4,096 cells, the unclamped square-root, cube-root, fourth-root,
+and normalized log rules predict 128, 64, 46, and 32 probes respectively.
+These are extrapolated cell counts. A recall test and range plan are still
+required at the larger scale.
+At the same multiplier, halving the cell count in this pilot cut requests
+by 22% and cost 1.6 percentage points of recall. Conversely, the byte-budget
+arm touched 55 cells with roughly the same calls as log's 13. Actual
+adjacency and coalescing determine the billable extent count. The existing
+byte-budget mode estimates from mean cell size and can exceed its band
+to admit one cell or satisfy the row floor. Apply any new hard budget
+to the final extent plan and all remaining work.
+
+Use the existing TD-RDSTRAT-14 ladder as the fixed-policy control.
+Its 10M promotion objective is recall@10 at least 0.97 with a 0.98
+sensitivity row and at most half the square-root control GETs.
+Also report paired recall loss and under-target tail rates across
+top-k, filtered queries, and cold/DRAM/disk phases. Use a full-cell
+reference to distinguish selection loss from quantization and rerank loss.
+
+Test an adaptive arm that starts with one small, collection-wide wave.
+Rank by estimated remaining-neighbor mass and incrementally cost the
+coalesced extents. A provable distance stop requires a conservative
+upper bound on the kth live, filter-matching full-precision result and
+strictly worse conservative lower bounds for all unscored candidates on
+the same snapshot. This includes candidates discarded by RaBitQ or SQ8
+inside visited cells. The metric, score direction, precision and tie
+rules must support the bound. Centroid distances, projected radii and
+learned scores on their own support an empirical recall estimate.
+
+Calibrate that estimate and reserve the work needed for the square-root
+fallback before sending requests when the policy lacks reliable evidence.
+Hard caps apply across the collection, including uncovered segments.
+If the remaining budget cannot serve the requested quality contract,
+decline explicitly. The planner must account for waves because iterative
+single-cell expansion can reduce calls while making tail latency worse.
+
+Faiss treats query-time nprobe as a tunable search depth. SPANN uses
+query-relative centroid distance, Quake uses partition geometry and the
+current kth radius, and DARTH learns when to stop at a target recall.
+Those studies motivate controls, with storage cost tested separately.
+link:https://github.com/facebookresearch/faiss/wiki/Faiss-indexes[Faiss IVF],
+link:https://arxiv.org/abs/2111.08566[SPANN],
+link:https://arxiv.org/html/2506.03437v2[Quake], and
+link:https://arxiv.org/abs/2505.19001[DARTH].
+See link:../10-quality/td/TD-RDSTRAT-14-probe-policy-controller.adoc[TD-RDSTRAT-14].
+
+=== TE-C4 — Gate directory and payload changes on remaining cost
+
+First test whether existing v3 keys can supply metadata for untrained L0
+reads without making those files eligible for A0 pruning. Keep an explicit
+fallback for stale keys, object mismatch and unsupported fields. Compare
+the current segment-local full-index path with a metadata-only directory
+plan and measure both sides of the publish trade-off. In the 50-segment
+test, publishing added 149 ingest GETs and saved 99 cold Adaptive GETs
+against publish-off, while steady reads stayed equal. The GET-only
+break-even is about 1.5 such cold queries per 50 flushes. Publishing
+also added 50 LISTs. Even if GET and LIST had the same price, the
+read-request break-even would reach about 2.0 cold queries. The full
+calculation includes weighted LIST, PUT and retention activity.
+
+If the remaining cost is duplicate or oversized directory traffic,
+measure one small immutable root and batched leaves versus current
+whole-object reads. Key directory data by generation and keep stale
+read fallback. Include cold extra waves, cache residency, directory
+rewrite bytes and recovery inventory cost. The root/leaf layout earns a
+format revision only if the directory is a material bottleneck at scale.
+
+If survivor retrieval or result rehydration still dominates after request-aware cell
+selection and coalescing, test a write-layout A/B. Independently vary
+cell population, cell placement, and read extents. Compare current
+split regions with cell-adjacent runs gated on fewer backend reads at
+matched recall, memory and latency. Keep f32 authority, filter and
+delete semantics and mixed-version reads. Rewrites must amortize their
+I/O across actual query/update rates. Consider PAX or PXCD wire changes
+only after the read-only controls isolate the extra wins.
