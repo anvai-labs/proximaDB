@@ -941,9 +941,9 @@ pub async fn try_run_select(
     // `CatalogLookup`/`ReaderFactory` traits can't await). Rows are fetched
     // lazily per scan in `DmlTableReader::open`, with the executor's
     // projection/predicate/limit pushed into storage.
-    let mut names = Vec::new();
-    collect_table_names(query, &mut names);
+    let (names, sql_names) = crate::core::utils::collect_query_binding_names(query);
     let mut tables: HashMap<String, PreparedTable> = HashMap::new();
+    let mut seen_sql_names = std::collections::HashSet::new();
     let mut unresolved = None;
     let mut pinned = HashMap::new();
     // P1: per-table Parquet location (object-store backed), populated only under the
@@ -966,9 +966,8 @@ pub async fn try_run_select(
     > = HashMap::new();
     // TD-OLAP-1 Test 2.1: per-table PAX-backed flag (has ProximaBlock format layout)
     let mut pax_tables: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for raw in &names {
-        let key = normalize_table_key(raw);
-        if tables.contains_key(&key) || pinned.contains_key(&key) {
+    for (raw, sql_name) in names.iter().zip(sql_names) {
+        if !seen_sql_names.insert((raw.as_str(), sql_name.clone())) {
             continue;
         }
         match dml.resolve_relational_schema(raw, tenant).await {
@@ -978,9 +977,22 @@ pub async fn try_run_select(
                     .iter()
                     .any(is_pinned_external_layout)
                 {
-                    pinned.insert(key, catalog_schema);
+                    match pinned.entry(sql_name) {
+                        std::collections::hash_map::Entry::Vacant(entry) => {
+                            entry.insert(catalog_schema);
+                        }
+                        std::collections::hash_map::Entry::Occupied(entry) => {
+                            if entry.get().name != catalog_schema.name {
+                                return Some(Err(format!(
+                                    "ambiguous pinned table {}",
+                                    entry.key()
+                                )));
+                            }
+                        }
+                    }
                     continue;
                 }
+                let key = normalize_table_key(raw);
                 #[cfg(feature = "datafusion-integration")]
                 if let Some(location) = catalog_table_is_parquet_backed(&catalog_schema) {
                     if let Some(params) = olap_delta_table_params(&catalog_schema, &location) {
@@ -1612,7 +1624,7 @@ async fn execute_pinned_external_select(
         let provider = pinned_external::open_table(&schema, &controls).await;
         controls.check_cancelled().map_err(|e| e.to_string())?;
         let provider = provider.map_err(|e| format!("pinned external table {name}: {e:#}"))?;
-        providers.push((schema.name, Arc::new(provider)));
+        providers.push((name, Arc::new(provider)));
     }
     let context = QueryExecutionContext {
         pinned_external_tables: providers,

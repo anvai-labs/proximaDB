@@ -592,18 +592,29 @@ pub(crate) fn collect_sql_catalog_targets(sql: &str, targets: &mut Vec<String>) 
         }
     };
 
-    collect_ast_relations(&statements, targets, true);
+    collect_ast_relations(&statements, targets, true, None);
 }
 
 /// Collect base table references in SQL scope for the catalog resolver.
 pub(crate) fn collect_query_relations(query: &sqlparser::ast::Query, targets: &mut Vec<String>) {
-    collect_ast_relations(query, targets, false);
+    collect_ast_relations(query, targets, false, None);
+}
+
+/// Collect paired catalog and SQL-engine names, preserving quoted identifiers.
+pub(crate) fn collect_query_binding_names(
+    query: &sqlparser::ast::Query,
+) -> (Vec<String>, Vec<String>) {
+    let mut catalog_names = Vec::new();
+    let mut sql_names = Vec::new();
+    collect_ast_relations(query, &mut catalog_names, false, Some(&mut sql_names));
+    (catalog_names, sql_names)
 }
 
 fn collect_ast_relations(
     ast: &impl sqlparser::ast::Visit,
     targets: &mut Vec<String>,
     include_function_targets: bool,
+    sql_names: Option<&mut Vec<String>>,
 ) {
     use core::ops::ControlFlow;
     use sqlparser::ast::{
@@ -613,6 +624,7 @@ fn collect_ast_relations(
 
     struct RelationCollector<'a> {
         targets: &'a mut Vec<String>,
+        sql_names: Option<&'a mut Vec<String>>,
         include_function_targets: bool,
         cte_scopes: Vec<CteScope>,
         cte_children: std::collections::HashMap<usize, (usize, usize)>,
@@ -661,7 +673,11 @@ fn collect_ast_relations(
             {
                 // The catalog resolver uses dots as separators. Keep the
                 // existing refusal behavior for identifiers it cannot represent.
-                self.targets.push(relation.to_string());
+                let name = relation.to_string();
+                if let Some(sql_names) = &mut self.sql_names {
+                    sql_names.push(name.clone());
+                }
+                self.targets.push(name);
             } else {
                 self.push_relation_unconditionally(relation);
             }
@@ -671,12 +687,27 @@ fn collect_ast_relations(
             let components = relation
                 .0
                 .iter()
-                .map(|part| part.as_ident().map(|ident| ident.value.as_str()))
+                .map(|part| part.as_ident())
                 .collect::<Option<Vec<_>>>();
             if let Some(components) = components
                 && !components.is_empty()
             {
-                self.targets.push(components.join("."));
+                self.targets.push(
+                    components
+                        .iter()
+                        .map(|ident| ident.value.as_str())
+                        .collect::<Vec<_>>()
+                        .join("."),
+                );
+                if let Some(sql_names) = &mut self.sql_names {
+                    sql_names.push(
+                        components
+                            .into_iter()
+                            .map(Self::identifier_key)
+                            .collect::<Vec<_>>()
+                            .join("."),
+                    );
+                }
             }
         }
 
@@ -887,6 +918,7 @@ fn collect_ast_relations(
 
     let mut collector = RelationCollector {
         targets,
+        sql_names,
         include_function_targets,
         cte_scopes: Vec::new(),
         cte_children: std::collections::HashMap::new(),

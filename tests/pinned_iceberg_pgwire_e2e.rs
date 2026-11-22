@@ -599,6 +599,11 @@ async fn pgwire_reads_only_the_authorized_pinned_snapshot() {
         })
         .collect();
     assert_eq!(rows, vec![("10", "123.45"), ("12", "-1.23")]);
+    let ddl_error = client
+        .simple_query("ALTER TABLE pinned_read ADD COLUMN extra BIGINT")
+        .await
+        .unwrap_err();
+    assert!(pg_error(&ddl_error).contains("read-only"), "{ddl_error:?}");
     let ordered = client
         .simple_query("SELECT amount, value FROM pinned_read ORDER BY 2 DESC LIMIT 1")
         .await
@@ -635,11 +640,12 @@ async fn pgwire_reads_only_the_authorized_pinned_snapshot() {
     );
     let statement = client
         .prepare_typed(
-            "SELECT value FROM pinned_read WHERE value > $1 ORDER BY value",
+            "SELECT value AS renamed FROM pinned_read WHERE value > $1",
             &[tokio_postgres::types::Type::INT8],
         )
         .await
         .unwrap();
+    assert_eq!(statement.columns()[0].name(), "renamed");
     let rows = client.query(&statement, &[&10i64]).await.unwrap();
     assert_eq!(
         rows.iter()
@@ -653,9 +659,14 @@ async fn pgwire_reads_only_the_authorized_pinned_snapshot() {
     create_delta(&client, "delta_v0", &delta, 0).await;
     create_delta(&client, "delta_v1", &delta, 1).await;
     create_delta(&client, "delta_bad_path", &delta, 2).await;
+    create_delta(&client, "\"MixedPinned\"", &delta, 0).await;
     for (sql, expected) in [
         ("SELECT id FROM delta_v0 ORDER BY id", &[10, 11, 12][..]),
         ("SELECT id FROM delta_v1 ORDER BY id", &[11, 12][..]),
+        (
+            "SELECT id FROM \"MixedPinned\" EXCEPT SELECT id FROM delta_v1 ORDER BY id",
+            &[10][..],
+        ),
         (
             "SELECT d.id FROM delta_v1 d JOIN pinned_read i ON d.id = i.value ORDER BY d.id",
             &[12][..],

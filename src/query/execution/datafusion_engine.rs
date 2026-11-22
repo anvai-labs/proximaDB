@@ -101,10 +101,13 @@ impl DataFusionLocalEngine {
         // which happens before execution and is invisible to `record_compute_ms`.
         let open_start = std::time::Instant::now();
         for (name, table) in &context.pinned_external_tables {
-            ctx.register_table(name.as_str(), table.clone())
-                .map_err(|e| {
-                    ExecutionError::Context(format!("register pinned external table {name}: {e}"))
-                })?;
+            ctx.register_table(
+                datafusion::common::TableReference::bare(name.as_str()),
+                table.clone(),
+            )
+            .map_err(|e| {
+                ExecutionError::Context(format!("register pinned external table {name}: {e}"))
+            })?;
         }
         for (name, location) in &context.parquet_tables {
             // ADR-025 (relational cold path): a materialized table reads its cold
@@ -261,15 +264,29 @@ impl DataFusionLocalEngine {
         // TD-OLAP-4: time lowering + logical/physical planning (the other half of
         // the per-query floor, separate from execution).
         let plan_start = std::time::Instant::now();
+        let pinned_requires_exact_names = context.pinned_external_tables.iter().any(|(name, _)| {
+            name != &normalize_table_key(name)
+                || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        });
         let mut schemas: HashMap<String, std::sync::Arc<RelationalSchema>> = HashMap::new();
-        for name in context
+        for (name, reference) in context
             .parquet_tables
             .iter()
-            .map(|(name, _)| name)
-            .chain(context.pinned_external_tables.iter().map(|(name, _)| name))
+            .map(|(name, _)| {
+                (
+                    name,
+                    datafusion::common::TableReference::from(name.as_str()),
+                )
+            })
+            .chain(context.pinned_external_tables.iter().map(|(name, _)| {
+                (
+                    name,
+                    datafusion::common::TableReference::bare(name.as_str()),
+                )
+            }))
         {
             let provider = ctx
-                .table_provider(name.as_str())
+                .table_provider(reference)
                 .await
                 .map_err(|e| ExecutionError::Context(format!("table_provider({name}): {e}")))?;
 
@@ -294,8 +311,11 @@ impl DataFusionLocalEngine {
         let catalog = ParquetSchemaCatalog { schemas };
 
         // P4 lowering
-        let lowered_plan = match lower_sql(sql, &catalog) {
-            Ok(node) => {
+        // The shared catalog folds table keys and cannot represent case-distinct
+        // pinned names. Use DataFusion's exact SQL identifiers for these scans.
+        let lowered_plan = match (!pinned_requires_exact_names).then(|| lower_sql(sql, &catalog)) {
+            None => None,
+            Some(Ok(node)) => {
                 match crate::datafusion::logical_lowering::lower_logical_node(&ctx, &node).await {
                     Ok(plan) => Some(plan),
                     // The shared frontend accepted the SQL but the DataFusion
@@ -315,7 +335,7 @@ impl DataFusionLocalEngine {
                     }
                 }
             }
-            Err(e) if context.allow_engine_sql_fallback => {
+            Some(Err(e)) if context.allow_engine_sql_fallback => {
                 tracing::debug!(
                     target: "proximadb::compute_route",
                     error = %e,
@@ -323,7 +343,7 @@ impl DataFusionLocalEngine {
                 );
                 None
             }
-            Err(e) => {
+            Some(Err(e)) => {
                 return Err(ExecutionError::Planning(format!(
                     "shared relational frontend declined SQL: {e}"
                 )));
@@ -331,6 +351,10 @@ impl DataFusionLocalEngine {
         };
 
         let df = match lowered_plan {
+            None if pinned_requires_exact_names => ctx
+                .sql(sql)
+                .await
+                .map_err(|e| ExecutionError::Execution(format!("sql: {e}")))?,
             Some(plan) => {
                 tracing::debug!(
                     target: "proximadb::compute_route",

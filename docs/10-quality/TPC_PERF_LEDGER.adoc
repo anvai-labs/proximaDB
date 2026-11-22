@@ -70,8 +70,10 @@ For NDJSON, set `TPC_OPEN_FORMAT=ndjson`,
 `PROXIMADB_EXTERNAL_TABLE_ROOTS=file:///tmp/open-tpch/delta`. The harness
 uses the Delta version recorded for each table. The default format is Iceberg.
 
-The separate `pinned_delta_checkpoint_replay` test uses
-`TPC_DELTA_CHECKPOINT_FIXTURE` and the operator allowlist. Its delta-rs fixture
+The storage integration lane generates an independent Delta fixture with
+`scripts/bench/build_delta_checkpoint_fixture.py` and runs
+`pinned_delta_checkpoint_replay` with `TPC_DELTA_CHECKPOINT_FIXTURE`
+and the operator allowlist. Its delta-rs fixture
 defines one BIGINT column named `id`. Version 0 contains 1 and 2, version 1
 appends 3, version 2 overwrites the table with 4 and 5 and writes a checkpoint,
 and version 3 appends 6. Retire the JSON commits through version 2 while

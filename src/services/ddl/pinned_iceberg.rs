@@ -35,6 +35,10 @@ impl PinnedIcebergLocation {
             .ok_or_else(|| anyhow!("external Iceberg requires {METADATA_LOCATION}"))?;
         let root = root.trim_end_matches('/');
         let url = Url::parse(root)?;
+        #[cfg(not(unix))]
+        if url.scheme() == "file" {
+            bail!("confined local Iceberg reads require Unix");
+        }
         if !matches!(url.scheme(), "file" | "s3" | "gs" | "gcs")
             || (url.scheme() == "file" && (url.host_str().is_some() || url.path() == "/"))
             || (url.scheme() != "file" && url.host_str().is_none())

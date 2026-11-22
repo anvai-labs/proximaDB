@@ -1352,6 +1352,13 @@ impl DdlService {
         if !catalog.table_exists(&table_id).await? {
             return Err(anyhow!("Table '{}' does not exist", table_name));
         }
+        let schema = catalog.get_table(&table_id).await?;
+        if schema.storage_layouts.iter().any(is_pinned_external_layout) {
+            return Err(anyhow!(
+                "Pinned external table '{}' is read-only",
+                table_name
+            ));
+        }
 
         // TD-DML-3: a dropped column's values must never come back. Rows keep
         // a column's value as a prop keyed by its name, so (a) before a column
@@ -1377,7 +1384,6 @@ impl DdlService {
             })
             .collect();
         if !added.is_empty() {
-            let schema = catalog.get_table(&table_id).await?;
             let stale: Vec<String> = added
                 .into_iter()
                 .filter(|name| !schema.columns.iter().any(|column| &column.name == name))
