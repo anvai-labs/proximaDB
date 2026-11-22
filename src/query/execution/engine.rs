@@ -144,6 +144,8 @@ pub enum RowLimitMode {
 /// Request-scoped execution controls shared by physical engines.
 #[derive(Clone, Default)]
 pub struct ExecutionControls {
+    /// Extended pgwire execution of a prepared statement, after parameter binding.
+    pub prepared_statement: bool,
     /// Optional maximum number of materialized rows the caller will accept.
     pub max_rows: Option<usize>,
     /// How to react when `max_rows` is reached (error vs. truncate).
@@ -172,6 +174,9 @@ impl ExecutionControls {
 pub struct QueryExecutionContext {
     /// Tables backed by Parquet files (name -> location).
     pub parquet_tables: Vec<(String, String)>,
+    /// Already authorized, pinned external providers for the DataFusion route.
+    #[cfg(feature = "datafusion-integration")]
+    pub pinned_external_tables: Vec<(String, Arc<dyn datafusion::datasource::TableProvider>)>,
     /// ADR-058 D5/§9.A: per-table footer-stats trust, keyed by table name
     /// (parallel to `parquet_tables`). Drives whether the DataFusion adapter may
     /// answer COUNT/MIN/MAX from the parquet FOOTER (`Trusted`) or must scan

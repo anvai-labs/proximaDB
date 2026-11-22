@@ -211,6 +211,7 @@ jobs:
       - name: Build wheels (maturin)
         uses: PyO3/maturin-action@v1
         with:
+          rust-toolchain: '1.100.0'
           target: ${{ matrix.target }}
           manylinux: ${{ matrix.manylinux || '' }}
           args: --release --out dist --features python,vendored-openssl

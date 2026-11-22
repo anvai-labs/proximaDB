@@ -7,6 +7,11 @@
 //! - CREATE INDEX / DROP INDEX
 //! - CREATE NAMESPACE / DROP NAMESPACE
 
+pub(crate) mod pinned_delta;
+pub(crate) mod pinned_external;
+pub(crate) mod pinned_iceberg;
+pub(crate) mod pinned_ndjson;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -21,6 +26,7 @@ use proximadb_catalog::{
 use proximadb_data_model::ProximaType;
 use tracing::{error, info};
 
+use self::pinned_external::PinnedExternalFormat;
 use crate::catalog::CatalogManager;
 
 /// Count of `DROP TABLE`s whose record-tier purge failed, leaving durable objects
@@ -427,6 +433,8 @@ pub struct DdlResult {
     pub message: String,
     /// Warnings (if any)
     pub warnings: Vec<String>,
+    /// Whether pgwire should provision a collection for the resolved table.
+    pub(crate) provision_backing_collection: bool,
 }
 
 impl DdlResult {
@@ -437,6 +445,7 @@ impl DdlResult {
             affected_count: 1,
             message: message.into(),
             warnings: Vec::new(),
+            provision_backing_collection: false,
         }
     }
 
@@ -447,6 +456,7 @@ impl DdlResult {
             affected_count: 0,
             message: format!("{} '{}' already exists", object_type, name),
             warnings: Vec::new(),
+            provision_backing_collection: false,
         }
     }
 
@@ -457,6 +467,7 @@ impl DdlResult {
             affected_count: 0,
             message: format!("{} '{}' does not exist", object_type, name),
             warnings: Vec::new(),
+            provision_backing_collection: false,
         }
     }
 
@@ -1137,7 +1148,10 @@ impl DdlService {
         // Check if table exists
         if catalog.table_exists(&table_id).await? {
             if if_not_exists {
-                return Ok(DdlResult::already_exists("Table", table_name));
+                let schema = catalog.get_table(&table_id).await?;
+                let mut result = DdlResult::already_exists("Table", table_name);
+                result.provision_backing_collection = !is_catalog_only_external_table(&schema);
+                return Ok(result);
             } else {
                 return Err(anyhow!("Table '{}' already exists", table_name));
             }
@@ -1145,6 +1159,7 @@ impl DdlService {
 
         // Build catalog schema
         let schema = self.build_catalog_schema(&table_id.name, columns, constraints, properties)?;
+        let provision_backing_collection = !is_catalog_only_external_table(&schema);
 
         // PostgreSQL clients routinely create unqualified tables without
         // explicitly creating a schema first. Keep the native catalog path
@@ -1162,10 +1177,9 @@ impl DdlService {
         catalog.create_table(&table_id, schema).await?;
 
         info!(table = %table_name, "Created table");
-        Ok(DdlResult::success(format!(
-            "Created table '{}'",
-            table_name
-        )))
+        let mut result = DdlResult::success(format!("Created table '{}'", table_name));
+        result.provision_backing_collection = provision_backing_collection;
+        Ok(result)
     }
 
     /// Drop a table from the catalog, optionally purging its data.
@@ -1338,6 +1352,13 @@ impl DdlService {
         if !catalog.table_exists(&table_id).await? {
             return Err(anyhow!("Table '{}' does not exist", table_name));
         }
+        let schema = catalog.get_table(&table_id).await?;
+        if schema.storage_layouts.iter().any(is_pinned_external_layout) {
+            return Err(anyhow!(
+                "Pinned external table '{}' is read-only",
+                table_name
+            ));
+        }
 
         // TD-DML-3: a dropped column's values must never come back. Rows keep
         // a column's value as a prop keyed by its name, so (a) before a column
@@ -1363,7 +1384,6 @@ impl DdlService {
             })
             .collect();
         if !added.is_empty() {
-            let schema = catalog.get_table(&table_id).await?;
             let stale: Vec<String> = added
                 .into_iter()
                 .filter(|name| !schema.columns.iter().any(|column| &column.name == name))
@@ -2513,6 +2533,28 @@ fn apply_projection_freshness_options(schema: &mut CatalogTableSchema) {
     }
 }
 
+/// External Parquet and pinned Iceberg scans resolve their files through the
+/// relational catalog. A collection would allocate an unused native engine.
+pub(crate) fn is_catalog_only_external_table(schema: &CatalogTableSchema) -> bool {
+    schema
+        .storage_layouts
+        .iter()
+        .any(is_catalog_only_external_layout)
+}
+
+pub(crate) fn is_pinned_external_layout(layout: &CatalogStorageLayout) -> bool {
+    PinnedExternalFormat::for_layout(layout).is_some()
+}
+
+fn is_catalog_only_external_layout(layout: &CatalogStorageLayout) -> bool {
+    is_pinned_external_layout(layout)
+        || (layout.physical_format == CatalogPhysicalFormat::Parquet
+            && matches!(
+                layout.authority,
+                CatalogAuthorityMode::ExternalAuthoritative | CatalogAuthorityMode::FederatedRead
+            ))
+}
+
 fn add_open_table_layouts(schema: &mut CatalogTableSchema) -> Result<()> {
     let Some(format) = schema
         .properties
@@ -2605,6 +2647,11 @@ fn add_open_table_layouts(schema: &mut CatalogTableSchema) -> Result<()> {
         }
     };
 
+    let pinned = PinnedExternalFormat::for_layout(&layout);
+    if let Some(format) = pinned {
+        format.copy_options_and_validate(&mut layout, schema)?;
+    }
+
     if let Some(snapshot) = schema
         .properties
         .get("snapshot_semantics")
@@ -2623,6 +2670,13 @@ fn add_open_table_layouts(schema: &mut CatalogTableSchema) -> Result<()> {
         layout
             .properties
             .insert("schema_mode".into(), schema_mode.clone());
+    }
+    if is_catalog_only_external_layout(&layout) {
+        layout.write_mode = proximadb_catalog::CatalogWriteMode::ReadOnly;
+    }
+    if let Some(format) = pinned {
+        layout.snapshot_semantics = Some(format.snapshot_semantics().into());
+        layout.policy_enforced_in_proxima = false;
     }
 
     schema.storage_layouts.push(layout);
@@ -2645,24 +2699,28 @@ fn add_open_table_layouts(schema: &mut CatalogTableSchema) -> Result<()> {
 /// path boundary — a root `file:///data/ext` matches `file:///data/ext/a.parquet`
 /// but NOT `file:///data/ext-evil/…`.
 pub(crate) fn external_location_allowed(location: &str) -> bool {
+    external_location_root(location).is_some()
+}
+
+pub(crate) fn external_location_root(location: &str) -> Option<String> {
     let loc = location.trim();
     if loc.is_empty() || loc.contains("..") {
-        return false;
+        return None;
     }
-    let Ok(roots) = std::env::var("PROXIMADB_EXTERNAL_TABLE_ROOTS") else {
-        return false;
-    };
+    let roots = std::env::var("PROXIMADB_EXTERNAL_TABLE_ROOTS").ok()?;
     roots
         .split(',')
         .map(str::trim)
         .filter(|root| !root.is_empty())
-        .any(|root| {
+        .filter_map(|root| {
             // Normalize the root's trailing slash so `file:///x/` and `file:///x`
             // both denote the same directory: a location is allowed when it IS
             // the root or sits strictly beneath it (path boundary).
             let root_norm = root.trim_end_matches('/');
-            loc == root_norm || loc.starts_with(&format!("{root_norm}/"))
+            (loc == root_norm || loc.starts_with(&format!("{root_norm}/"))).then_some(root_norm)
         })
+        .max_by_key(|root| root.len())
+        .map(str::to_owned)
 }
 
 fn parse_physical_format(value: &str) -> Option<CatalogPhysicalFormat> {

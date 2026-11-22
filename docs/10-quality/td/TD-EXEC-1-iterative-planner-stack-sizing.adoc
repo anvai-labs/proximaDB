@@ -28,6 +28,18 @@ does recurse too (answering first-principles questions 1–3).
 
 Evidence: release conformance gate executes Q2 (TPC-H 22/22, TPC-DS 18/18).
 
+With the boxed pgwire dispatcher (link:TD-STACK-1-document-pgwire-worker-stack-overflow.adoc[TD-STACK-1]),
+the Rust 1.100 Linux debug fixtures passed at 2 MiB. TPC-H and TPC-DS retained
+their 16/16 and 18/18 anchored accuracy results, and the separate native
+Q18/Q20 test passed its row-value assertions at the same stack size.
+The harnesses now inherit the stack budget so CI can enforce it.
+
+The full SF0.001 ledger also completed at 2 MiB, with a 20-second per-query
+timeout in the local run. The largest recorded native planner or executor
+stack high-water delta was 193,360 bytes on TPC-H Q8. The existing hooks reported
+a nonzero delta on only 2 of 170 DataFusion-route attempts. That telemetry
+does not yet establish how much stack the DataFusion planner or optimizer uses.
+
 == Open
 
 === Phase 2: Iterative planner (efficiency)

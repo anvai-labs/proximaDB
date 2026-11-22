@@ -95,11 +95,10 @@ semi-joins), no Adaptive Query Execution.
   CDC/replica/cache Frankenstein stack that causes vector+SQL to "silently discard over 30%
   of correct results" on JOINs (arXiv 2506.23071).
 
-* **The boundary is the contract; keep it standard outside.** Iceberg+Parquet is the
-  interop seam (the format war is decided: AWS S3 Tables chose Iceberg Dec 2024; Databricks
-  acquired Tabular Jun 2024; Apache Polaris graduated TLP Feb 2026 and now owns the catalog
-  fight). ProximaDB keeps internal verticality (PAX scan + ANN co-design) and external
-  standardness. The *working* federation seam today is **Iceberg REST** (ADR-007, live — Spark/Trino/DuckDB/Snowflake read the tables natively) plus **Arrow Flight SQL**; the engine-neutral `LogicalNode` IR is *structurally compatible* with a future Substrait binding, but Substrait is not yet production-federation-ready for the Spark/Trino mainstream: Spark/Trino do not natively consume it (Gluten bridges Spark), and DataFusion's own Substrait plan-validation suite is still landing (apache/datafusion#15069). ADR-033/039 unchanged.
+* **Federation boundary.** Iceberg REST lets external readers resolve a managed publication.
+  Qualify each client and feature set with pinned value read-back. DataFusion supplies the
+  analytical plan over qualified sources. See link:ADR-097-foundational-seams-single-logical-ir.adoc[ADR-097 D1/D3]
+  for the current planner and publication contract.
 
 == Decision (invariants)
 
@@ -225,7 +224,9 @@ testable via ports, and reversible (every slice is flag-gated, default-off).
 
 A re-research pass (5 agents, primary-sourced) corrected three framing points. **None alters invariants 1–5**; they retire an unfalsifiable claim and record context the original omitted.
 
-* **Federation seam (corrects the prior "Substrait-ready `LogicalNode`" phrasing).** Substrait is *not* production-federation-ready for the Spark/Trino mainstream in 2026 — Spark/Trino do not natively produce/consume it (Gluten is the de-facto Spark bridge, not Spark itself), and DataFusion's own Substrait plan-validation suite is still landing (apache/datafusion#15069, epic #16248; earlier plan-validity gaps tracked in #12244). The *actual* working federation seam today is **Iceberg REST** (ADR-007, live — Spark/Trino/DuckDB/Snowflake read the tables natively) + **Arrow Flight SQL**. `LogicalNode` remains structurally compatible with a future Substrait binding (engine-neutral, zero DataFusion deps per ADR-039); the correction is to stop calling it "ready."
+* **Federation seam.** The July correction withdrew the claim of production Substrait integration.
+  ADR-097 subsequently set the logical IR and the external publication boundary.
+
 * **Distributed execution (context for the "no Ballista now" non-goal).** The deferral is behind an *existing sequenced* blueprint — `DATAFUSION_BALLISTA_DISTRIBUTED_EXECUTION_2026_06_05.adoc` (P0 contract → P1 DataFusionLocal splits → P2 Ballista adapter → P3 multi-node): the path exists and is deferred, not absent. Re-research reaffirmed single-node/elastic is the correct 2026 posture: only **0.03% of Redshift queries scan >10 TB** (MotherDuck "Redshift Files" analysis of AWS's public Redset fleet dataset — VLDB 2024, PVLDB vol. 17 — ~500M queries); DuckDB runs **TPC-H SF100,000 (100 TB)** on a single `i8g.48xlarge` (1.5 TB RAM, 192 Graviton4 cores); MotherDuck's **<100 ms per-tenant cold-start / scale-to-zero** (Duckling spin-up — not query latency) is the production proof that single-node elastic competes; Ballista's production footprint is thin (Spice AI — its most advanced user — built multi-active HA, mTLS, and an object-store shuffle serialized with Vortex IPC — Vortex itself is SpiralDB / Linux Foundation — themselves, in a fork).
 * **Elastic-single-node posture (recorded, not actioned).** The defensible Rust wedge is **not** "scale to zero" (table-stakes in 2026 — every vendor markets it; PointFive May 2026: 34% of Snowflake warehouse spend is idle warehouses) and **not** "no GC pauses" (Generational ZGC, Java 21+, drives pause times to sub-millisecond in production — Netflix 2024). It is **no JIT warmup + 5–10× lower memory + single-binary density** (Spice AI: 2–8× faster at ~8× less RAM than Spark, per benchmark; Arroyo: a single ~50 MB Rust binary vs a JVM Flink stack — faster startup, smaller footprint). The only honest claim is a *measured* cold-start number on a real ProximaDB analytical workload — recorded as a Phase-4 measurement target (a TD-OLAP-4-style evidence ledger), off the critical path while TD-OLAP-1..6 prove single-node competitiveness.
 * **Tracked set extended.** TD-OLAP-6 (sort-on-materialize — team), TD-OLAP-7 (selective GPU OLAP — the only analytics cohort the original plan didn't address; libcudf-via-FFI behind the `ExecutionEngine` seam + the fused ANN+filter+agg wedge), TD-OLAP-8 (incremental / materialized-view / streaming-OLAP — attacks bytes-RECOMPUTED, Quanton's wedge) — all Phase-2/strategic (P3), sequenced after the TD-OLAP-1..6 scan-avoidance foundation; none gates current execution.

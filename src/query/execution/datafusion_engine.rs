@@ -25,6 +25,70 @@ use std::collections::{HashMap, VecDeque};
 /// vectorized execution engine.
 pub struct DataFusionLocalEngine;
 
+#[cfg(feature = "datafusion-integration")]
+fn pinned_table_uses_exact_identifier(name: &str) -> bool {
+    name != normalize_table_key(name)
+        || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
+#[cfg(feature = "datafusion-integration")]
+pub(crate) async fn describe_pinned_projection(
+    sql: &str,
+    tables: Vec<(String, proximadb_catalog::CatalogTableSchema)>,
+) -> Result<Vec<(String, proximadb_data_model::ProximaType)>, ExecutionError> {
+    use datafusion::{catalog::empty::EmptyTable, datasource::TableProvider};
+    use std::sync::Arc;
+
+    // Describe uses the same planner as Execute. Register catalog schemas
+    // only, so describing a prepared statement cannot open external data.
+    let pinned_external_tables = tables
+        .into_iter()
+        .map(|(name, table)| {
+            let schema = arrow_schema::Schema::new(
+                table
+                    .columns
+                    .iter()
+                    .map(|column| {
+                        arrow_schema::Field::new(
+                            &column.name,
+                            crate::datafusion::schema_inference::proxima_to_arrow_type(
+                                &column.data_type,
+                            ),
+                            column.nullable,
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+            );
+            let provider: Arc<dyn TableProvider> = Arc::new(EmptyTable::new(Arc::new(schema)));
+            (name, provider)
+        })
+        .collect();
+    let context = QueryExecutionContext {
+        pinned_external_tables,
+        allow_engine_sql_fallback: true,
+        controls: crate::query::execution::engine::ExecutionControls {
+            prepared_statement: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let (_, frame) = DataFusionLocalEngine
+        .prepare_dataframe(sql, &context)
+        .await?;
+    Ok(frame
+        .schema()
+        .as_arrow()
+        .fields()
+        .iter()
+        .map(|field| {
+            (
+                field.name().clone(),
+                arrow_type_to_proxima(field.data_type()),
+            )
+        })
+        .collect())
+}
+
 #[async_trait]
 impl ExecutionEngine for DataFusionLocalEngine {
     async fn execute_sql(
@@ -100,6 +164,15 @@ impl DataFusionLocalEngine {
         // TD-OLAP-4: time the table-OPEN floor (LIST + HEAD + footer discovery),
         // which happens before execution and is invisible to `record_compute_ms`.
         let open_start = std::time::Instant::now();
+        for (name, table) in &context.pinned_external_tables {
+            ctx.register_table(
+                datafusion::common::TableReference::bare(name.as_str()),
+                table.clone(),
+            )
+            .map_err(|e| {
+                ExecutionError::Context(format!("register pinned external table {name}: {e}"))
+            })?;
+        }
         for (name, location) in &context.parquet_tables {
             // ADR-025 (relational cold path): a materialized table reads its cold
             // Parquet base reconciled with the authoritative post-snapshot WAL
@@ -255,10 +328,31 @@ impl DataFusionLocalEngine {
         // TD-OLAP-4: time lowering + logical/physical planning (the other half of
         // the per-query floor, separate from execution).
         let plan_start = std::time::Instant::now();
+        let pinned_uses_engine_sql = !context.pinned_external_tables.is_empty()
+            && (context.controls.prepared_statement
+                || context
+                    .pinned_external_tables
+                    .iter()
+                    .any(|(name, _)| pinned_table_uses_exact_identifier(name)));
         let mut schemas: HashMap<String, std::sync::Arc<RelationalSchema>> = HashMap::new();
-        for (name, _) in &context.parquet_tables {
+        for (name, reference) in context
+            .parquet_tables
+            .iter()
+            .map(|(name, _)| {
+                (
+                    name,
+                    datafusion::common::TableReference::from(name.as_str()),
+                )
+            })
+            .chain(context.pinned_external_tables.iter().map(|(name, _)| {
+                (
+                    name,
+                    datafusion::common::TableReference::bare(name.as_str()),
+                )
+            }))
+        {
             let provider = ctx
-                .table_provider(name.as_str())
+                .table_provider(reference)
                 .await
                 .map_err(|e| ExecutionError::Context(format!("table_provider({name}): {e}")))?;
 
@@ -283,8 +377,12 @@ impl DataFusionLocalEngine {
         let catalog = ParquetSchemaCatalog { schemas };
 
         // P4 lowering
-        let lowered_plan = match lower_sql(sql, &catalog) {
-            Ok(node) => {
+        // The shared frontend folds table keys. Use DataFusion SQL for exact
+        // pinned identifiers and to keep one planner before and after Bind
+        // substitutes parameters.
+        let lowered_plan = match (!pinned_uses_engine_sql).then(|| lower_sql(sql, &catalog)) {
+            None => None,
+            Some(Ok(node)) => {
                 match crate::datafusion::logical_lowering::lower_logical_node(&ctx, &node).await {
                     Ok(plan) => Some(plan),
                     // The shared frontend accepted the SQL but the DataFusion
@@ -304,7 +402,7 @@ impl DataFusionLocalEngine {
                     }
                 }
             }
-            Err(e) if context.allow_engine_sql_fallback => {
+            Some(Err(e)) if context.allow_engine_sql_fallback => {
                 tracing::debug!(
                     target: "proximadb::compute_route",
                     error = %e,
@@ -312,7 +410,7 @@ impl DataFusionLocalEngine {
                 );
                 None
             }
-            Err(e) => {
+            Some(Err(e)) => {
                 return Err(ExecutionError::Planning(format!(
                     "shared relational frontend declined SQL: {e}"
                 )));
@@ -320,6 +418,10 @@ impl DataFusionLocalEngine {
         };
 
         let df = match lowered_plan {
+            None if pinned_uses_engine_sql => ctx
+                .sql(sql)
+                .await
+                .map_err(|e| ExecutionError::Execution(format!("sql: {e}")))?,
             Some(plan) => {
                 tracing::debug!(
                     target: "proximadb::compute_route",
@@ -1119,7 +1221,9 @@ async fn register_merged_olap_table(
 }
 
 #[cfg(feature = "datafusion-integration")]
-fn arrow_type_to_proxima(dt: &arrow_schema::DataType) -> proximadb_data_model::ProximaType {
+pub(crate) fn arrow_type_to_proxima(
+    dt: &arrow_schema::DataType,
+) -> proximadb_data_model::ProximaType {
     use arrow_schema::DataType as D;
     use proximadb_data_model::ProximaType;
     match dt {
@@ -1134,6 +1238,10 @@ fn arrow_type_to_proxima(dt: &arrow_schema::DataType) -> proximadb_data_model::P
         D::UInt64 => ProximaType::UInt64,
         D::Float16 | D::Float32 => ProximaType::Float32,
         D::Float64 => ProximaType::Float64,
+        D::Decimal128(precision, scale) if *scale >= 0 => ProximaType::Decimal {
+            precision: *precision,
+            scale: *scale as u8,
+        },
         D::Utf8 | D::LargeUtf8 => ProximaType::String,
         D::Binary | D::LargeBinary => ProximaType::Binary,
         D::Date32 => ProximaType::Date,
@@ -1217,6 +1325,10 @@ fn arrow_cell_to_proxima(
         D::UInt64 => v!(UInt64Array, ProximaValue::UInt64),
         D::Float32 => v!(Float32Array, ProximaValue::Float32),
         D::Float64 => v!(Float64Array, ProximaValue::Float64),
+        D::Decimal128(_, scale) if *scale >= 0 => array
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .map(|a| ProximaValue::Decimal(a.value_as_string(row))),
         D::Utf8 => array
             .as_any()
             .downcast_ref::<StringArray>()

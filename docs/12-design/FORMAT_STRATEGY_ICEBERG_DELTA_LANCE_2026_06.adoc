@@ -24,19 +24,10 @@ executable spec lives in the qa-gate harnesses and the `proximadb-iceberg-engine
 
 == Strategic north star
 
-Two camps, not three competitors:
-
-* *Iceberg & Delta* — warehouse table formats. Broad engine ecosystem, governance,
-  time-travel; *index-blind* for vector/full-text. Converging (Delta UniForm, Apache
-  XTable, REST Catalog).
-* *Lance* — AI-native format. Vector + full-text + random access; ecosystem-thin, weak
-  on relational/governance/multi-engine.
-* *ProximaDB* — the only one attempting unified multi-modal over one router + pgwire.
-
-[.lead]
-*Interoperate with Iceberg/Delta on the warehouse boundary, out-engineer Lance on the
-vector format, and win on the layers all three ignore — the unified router, pgwire
-protocol, multi-modal breadth, and multi-tenant economics.*
+Iceberg and Delta define separate table protocols. A producer can expose a read-only
+Iceberg projection over compatible Delta data. For managed relational data ProximaDB
+publishes Iceberg. For vector storage it invests in PAX and evaluates Lance capabilities
+against the existing vector quality and cost gates.
 
 === Feature matrix
 
@@ -59,9 +50,8 @@ protocol, multi-modal breadth, and multi-tenant economics.*
 
 == Iceberg v3 alignment (V3-FIRST)
 
-v3 is *ProximaDB's target and default*. Its headline features map onto ProximaDB's
-differentiators, so building toward v3 directly avoids double-spending on v2-only
-mechanisms:
+v3 is the managed write target. Activation of first-publication defaults is gated
+separately. Each optional feature requires independent reader evidence.
 
 [cols="2,3",options="header"]
 |===
@@ -73,35 +63,18 @@ mechanisms:
 | Default values | constraints (TD-110)
 |===
 
-Decision: the v2/v3 metadata+manifest *core is shared* (build-once;
-`FormatVersion {V2,V3}`, default `V3`). Divergent features are built *in their v3 form
-only*. v2 stays reachable via the enum for v2-only external readers (capability
-negotiation). Caveat: v3-default means v2-only external engines can't read our tables
-until their v3 support lands — accepted, since v3 is where our differentiators live.
+Preserve legacy v2 reads and explicit atomic upgrades. The new-table policy and its
+rollout gates belong to link:adr/ADR-097-foundational-seams-single-logical-ir.adoc[ADR-097 D3]
+and the link:../current/LAKEHOUSE_PLAN.adoc[lakehouse plan].
 
 == Workstreams
 
-=== P1 — Real Iceberg manifests + versioned snapshots  [SHIPPED]
+=== P1 — Managed Iceberg publication
 
-The `proximadb-iceberg-engine` manifest was a custom newline-delimited key list,
-readable only by ProximaDB. Replaced with spec-shaped content:
-
-* `iceberg` module: Avro manifest (one `manifest_entry`/data file, Iceberg field-ids) +
-  Avro manifest list + `TableMetadata` JSON; `FormatVersion::{V2,V3}` (V3 default).
-* Bridge `publish_iceberg_snapshot` / `read_iceberg_snapshot` (atomic CAS commit; record
-  counts from the Parquet footer).
-* `ObjectStoreBridge::publish_iceberg_table` / `read_iceberg_table` (storage-common-typed
-  `IcebergSnapshotField`) so the warehouse materializer can call it through `dyn`.
-* `MATERIALIZE` (dml) emits a v3 Iceberg table best-effort under `{prefix}/metadata`
-  (field types lock-step with the Parquet physical types; deterministic table-uuid).
-
-Verified: 24 leaf-crate tests + an e2e (`tests/iceberg_interop_e2e.rs`) asserting a
-`v*.metadata.json` (format-version 3 → manifest list) + Avro manifest/list + Parquet on
-disk after pgwire `MATERIALIZE`. Additive: SELECTs read the catalog storage layout, not
-the manifest, so TPC-H 22/22 stays green.
-
-REMAINING: serve the current `TableMetadata` via the native Iceberg REST catalog
-(`load_table` discovery); partitioned layout; column statistics in manifests.
+The engine writes versioned metadata, Avro manifest lists and manifests pointing to
+data files. REST serves the engine metadata for managed publications. TD-SEAM-1 owns
+production wiring and schema fidelity. link:../../roadmap/techdebt/TD_119_REAL_ICEBERG_TABLE_FORMAT_2026_06_17.adoc[TD-119]
+owns external qualification.
 
 === P2 — CDC change-feed (`since_lsn` + surfaces)  [CORE + REST SHIPPED; pgwire TVF + pgoutput pending]
 
@@ -148,15 +121,19 @@ recall ratchet must hold with ~30× smaller payload.
 === P4 — Adaptive clustering + relational streaming freshness  [PLANNED — detailed in link:../history/planning/CLUSTERING_AND_STREAMING_FRESHNESS_PLAN_2026_06.adoc[CLUSTERING_AND_STREAMING_FRESHNESS_PLAN] (canonical); deletion vectors shipped separately under TD-DELVEC-1]
 
 `cluster_by` / `allow_zorder_pruning` are catalog-only stubs. Thread `cluster_by` into
-the flush sort + optional Z-order in the PAX writer (tighter zone-map skip). Union the
-memtable delta into relational streaming reads (gated by `VectorFreshnessMode`) so OLAP
-reads aren't stale. v3 alignment: deletes via *deletion vectors* (Puffin), not v2
-positional/equality deletes.
+the flush sort + optional Z-order in the PAX writer (tighter zone-map skip). For relational
+streaming reads, bind the requested freshness and reconcile the visible WAL tail by record
+identity and version. An update suppresses the older base row and a tombstone suppresses
+the deleted row. Apply value filters and limits only where newest-version semantics survive.
+The managed publication uses v3-style deletion vectors (Puffin). The
+link:PUBLICATION_WAL_VISIBILITY_FENCE_2026_10_27.adoc[publication fence] governs reader
+behavior when the WAL and published deletion vectors cannot be ordered.
 
 === Phase 2 — spec-only (sequenced)
 
-* *Delta read + UniForm exposure*: parse `_delta_log/*.json`; expose Iceberg metadata
-  alongside Delta. (`proximadb-catalog/src/delta.rs` is a stub today.)
+* *External Delta reads.* First qualify producer-supplied Iceberg read projections.
+  Direct Delta reads cover tables without a qualifying projection. The Delta owner controls
+  commits. link:../rfcs/0003-open-table-analytics.adoc#iceberg-delta-compatibility[Version evidence and fixtures]
 * *Remaining Lance-parity*: FSST strings, mini-block metadata random-access, AIMD/byte-
   backpressure I/O scheduler, explicit deletion-vector bitmap, quantized hot-tier cache
   (R3) + zero-copy `Bytes` read path (R1).
@@ -166,16 +143,9 @@ positional/equality deletes.
   / cdc-time-travel / hybrid-vector signals; compute-time + cardinality billing emit
   points; RL feedback.
 
-== What NOT to do
+== Verification
 
-* Don't build a third warehouse format — interoperate (Iceberg now, Delta/UniForm next).
-* Don't out-warehouse Snowflake/Databricks on pure relational.
-* Don't build a proprietary catalog ecosystem — adopt the REST Catalog protocol.
-* Don't let PAX diverge so far it can't export to Iceberg/Delta.
-
-== Verification ledger
-
-* P1: `cargo test -p proximadb-iceberg-engine` (24), `--test iceberg_interop_e2e`,
-  `--test tpch_pgwire_e2e` (regression).
-* P2/P3/P4: per-workstream TDD + the existing modality/SQL suites as regression gates
-  (TPC-H 22, TPC-DS 16, document 11, events 10, vector recall, graph 10).
+For P1, run the Iceberg engine tests, the pinned external read-back legs of
+`tests/iceberg_interop_e2e.rs` and the pgwire SQL regressions. TD-119 defines the
+additional producer-published fixtures. P2/P3/P4 retain their change-feed, modality,
+SQL and vector recall gates.

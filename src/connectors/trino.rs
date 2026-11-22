@@ -701,12 +701,11 @@ impl TrinoPageSink {
             self.schema_sent = true;
         }
 
-        let messages =
-            arrow_flight::utils::batches_to_flight_data(batch_schema.as_ref(), vec![batch.clone()])
-                .map_err(|e| TrinoError {
-                    error_code: TrinoErrorCode::GenericInternalError,
-                    message: format!("batch encode failed: {e}"),
-                })?;
+        let messages = arrow_flight::utils::batches_to_flight_data(batch_schema.as_ref(), [&batch])
+            .map_err(|e| TrinoError {
+                error_code: TrinoErrorCode::GenericInternalError,
+                message: format!("batch encode failed: {e}"),
+            })?;
         // batches_to_flight_data prepends a schema message we've
         // already sent above; skip it.
         for msg in messages.into_iter().skip(1) {

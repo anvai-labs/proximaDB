@@ -175,15 +175,7 @@ updates:
       actions-all:
         patterns: ["*"]
     ignore:
-      # DO NOT let dependabot touch this one. `dtolnay/rust-toolchain`'s git tag
-      # IS the Rust toolchain version, not the action's own version — so a
-      # routine "action bump" silently rewrites the COMPILER pin. The first
-      # actions-all group PR did exactly that: 1.95.0 -> 1.100.0 across 44 sites
-      # in 7 workflows, and Rust 1.100.0 does not exist (static.rust-lang.org
-      # returns 404), so every toolchain setup failed with
-      # "could not download nonexistent rust version".
-      #
-      # The toolchain is pinned by rust-toolchain.toml (channel = "1.99.0") and
-      # must only ever move by editing that file deliberately. Bump both together
-      # by hand when the toolchain moves.
+      # The dtolnay/rust-toolchain tag selects the compiler version. Update the
+      # action refs and rust-toolchain.toml together after verifying the compiler
+      # release is available through rustup.
       - dependency-name: "dtolnay/rust-toolchain"

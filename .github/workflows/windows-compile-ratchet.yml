@@ -52,7 +52,7 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.99.0
+      - uses: dtolnay/rust-toolchain@1.100.0
         # Step-level, NOT workflow env: rust-cache hashes every CARGO*/RUST*
         # env var into its cache key, so a workflow-level var would cold-start
         # every cache (#2502 review). rustup's default is 3 retries.

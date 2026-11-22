@@ -2,7 +2,7 @@
 # Single container with ProximaDB server
 
 # Stage 1: Build ProximaDB server
-FROM rust:1.95-slim AS builder
+FROM rust:1.100.0-slim AS builder
 
 # Install build dependencies
 RUN apt-get update && apt-get install -y \

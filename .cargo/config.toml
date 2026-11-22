@@ -19,6 +19,10 @@ RUST_TEST_THREADS = "1"
 # Use sparse protocol for faster dependency resolution (2-3x faster)
 protocol = "sparse"
 
+[net]
+# Use Git's transport for the pinned DataFusion source and its submodules.
+git-fetch-with-cli = true
+
 # NOTE: Profile settings ([profile.*]) must be in Cargo.toml, not here
 # See Cargo.toml for: release-fast, dev, test, bench profiles
 

@@ -49,6 +49,13 @@ vs Snowflake/Databricks:
 
 == Verification
 
+* Reproduce the scale-0.1 TPC-DS q17 native XX000 (`ss_quantity`, expected Int32, got
+  Float64). Minimize the expression and compare declared types, values and NULL handling
+  against an independent nonempty fixture through pgwire. The native frontend previously
+  let `stddev_samp` fall into scalar lowering, where the source column ordinal can bind
+  to an aggregate output. The frontend regression covers the explicit decline. The
+  provider regression checks a nonempty result and singleton NULL without MATERIALIZE.
+
 * ANSI function-coverage ratchet rises monotonically; pgwire BI-tool smoke tests (psql,
   Metabase/Superset-class) pass against a representative TPC-DS workload.
 * Late-materialization: a measured bytes-decoded reduction on selective scans in the TD-OLAP-4

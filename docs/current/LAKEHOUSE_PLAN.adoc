@@ -96,17 +96,12 @@ Published DV readers, v3 new-table policy/upgrade, lineage proof, oid-position m
 live-delete publisher have landed (#2256/#2260–#2262/#2266). See
 link:../history/evidence/INTEGRATION_RECONCILIATION_2026_10_28.adoc[completed scope and limits].
 Both `PROXIMADB_ICEBERG_V3_DEFAULT` and `PROXIMADB_LIVE_DELETE_PUBLISHER` remain default OFF.
-Remaining activation work:
-
-. Complete the visibility contract's race, lease, crash-gap recovery and reader-standing gates
-  through the real facade. The active fence-gates branch is not merged acceptance evidence.
-. Preserve DV inheritance, schema checks, external-parent refusal and shared publication/WAL
-  ordering. Prove replay/recovery across successor CAS and catalog layout update before relaxing
-  refusals; do not assume successful WAL acknowledgement implies published-view freshness.
-. Finish incremental update/upsert semantics and the P1 facade/schema/tenant gates. The landed
-  tombstone publisher is not a general incremental update publisher.
-. Roll out only after internal/external gates; record a compatibility/rollback boundary
-  (a format upgrade may require forward recovery, not an older binary opening new data).
+Incremental MATERIALIZE for updates/deletes is a separate default-on path. The live publisher
+is opt-in for delete bursts. Retain the existing race, lease, crash-gap and reader-standing
+tests when changing either path. TD-LIVEDEL-1 owns the live-publisher reach and cleanup
+conditions. Complete production facade/schema/tenant qualification and document the forward
+recovery boundary before activating a new default.
+link:../12-design/ENV_GATE_REGISTRY.adoc[Gate defaults and activation conditions]
 
 Variant and other v3 features each require their own compatibility gate; v3-first does not
 mean enabling every optional feature at once. No new v2 position-delete implementation.
@@ -135,6 +130,17 @@ fallback. Runtime join filters must not prune the newest visible version through
 Register PaxTableProvider only when it shares the same WAL tail, liveness and policy contract;
 its existence is insufficient admission. UDTF-only queries need DataFusion routing without a
 tenant-policy bypass. Probe SBBF for runtime filters in the real split reader.
+
+=== Open-table SQL qualification
+
+DataFusion runs the full fixed-parameter TPC query suites over local pinned
+Iceberg, NDJSON and Delta through pgwire. At SF1, each format matched all
+121 independent typed answers at the ledger's declared float tolerances
+and passed all 108 top-level ordering checks. A mixed-format join exercises
+their shared Arrow batch scan contract. Preserve type and version identity
+when extending the contract to Volcano. Release throughput, bounded memory
+and format-feature qualification remain separate acceptance gates.
+link:../10-quality/TPC_PERF_LEDGER.adoc#_full_open_table_sql_qualification[Fixture and sweep]
 
 === FilteredAnnExec
 
@@ -198,7 +204,10 @@ register claimable numbers in the evidence ledger. No pricing promise before int
 and correctness gates in link:STORAGE_PLAN.adoc[storage plan].
 
 [[native-execution-research]]
-== Native execution: differentiation before expansion
+== Volcano native execution research
+
+For analytical SQL and batch jobs, use the link:../rfcs/0003-open-table-analytics.adoc#analytics-evidence[RFC-0003 experiments].
+TD-119 owns format read-back and TD-OLAP-4 owns timing evidence.
 
 Owner request 2026-10-26: native execution must solve a demonstrated workload problem, not
 reimplement another engine because it uses Arrow or Rust. The dated

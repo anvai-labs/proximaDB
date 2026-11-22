@@ -8,7 +8,7 @@ echo "🏗️ Building ProximaDB base image with all dependencies..."
 # Create temporary Dockerfile for base image
 cat > Dockerfile.base << 'EOF'
 # Base image with all dependencies pre-installed  
-FROM rust:1.82-slim as rust-base
+FROM rust:1.100.0-slim as rust-base
 
 # Install Rust build dependencies
 RUN apt-get update && apt-get install -y \

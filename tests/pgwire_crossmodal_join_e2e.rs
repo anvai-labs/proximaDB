@@ -244,4 +244,17 @@ async fn crossmodal_timeseries_join_returns_rest_seeded_rows() {
     )
     .await;
     assert_eq!(high, 1, "expected exactly the 9000-value point, got {high}");
+
+    // TD-XMODAL-7: the UDTF is inside an aggregating derived table joined to
+    // a materialized Parquet table. The top-level join above cannot cover this
+    // planner path.
+    let query = format!(
+        "SELECT d.id, ts.peak FROM {wh} d
+         CROSS JOIN (SELECT max(value) AS peak FROM timeseries_range('{coll}', 0, 9999999)) ts
+         WHERE d.id = 'anchor' GROUP BY d.id, ts.peak"
+    );
+    assert_eq!(
+        pg_server::rows(&client, &query).await,
+        vec![vec!["anchor", "9000"]]
+    );
 }

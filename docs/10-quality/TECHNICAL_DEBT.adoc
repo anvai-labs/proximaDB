@@ -183,8 +183,8 @@ Co-design D1/D3 work — the dominant cloud-DB cost term. See `PROXIMADB_AS_LAKE
 | TD-114 | Background L0→base compactor + merge-on-read deletion vectors | HIGH | Partial | D1,D3 | PERF
 | *Foundation landed 2026-06-17 (`71dbd3b17`):* tested PAX merge-on-read core (`compact_pax_segments`, drops tombstones) + flag-gated trigger (`PROXIMADB_L0_COMPACTION_ENABLED`, default OFF). Residual: live auto-invoke from flush, orchestrator integration, deletion-vector read-path overlay (wire dormant `enable_deletion_vectors`). Plan `TD_114_*`. Related: TD-112.
 
-| TD-119 | Promote v1 key-list manifest → real Iceberg snapshots | MED | Partial | D1 | OE
-| *Phase 1 landed 2026-06-18:* persisted versioned `metadata.json` + manifest-log snapshot history (parent chain, v2 seq, `refs.main`) + `MetadataCommitter` CAS + GET route. Residual (Phase 2): Avro manifest-list + per-file `DataFile` stats (so Spark/Trino scan data files); tenant-scope the Iceberg REST endpoints. Unblocks TD-117. Plan `TD_119_*`.
+| TD-119 | Qualify Iceberg snapshot interoperability | MED | Partial | D1 | OE
+| Managed snapshot and manifest production landed. Verify outbound REST read-back under TD-SEAM-1 and inbound producer-published projections against pinned Delta versions. TD-117 retains the snapshot-ref dependency. link:../../roadmap/techdebt/TD_119_REAL_ICEBERG_TABLE_FORMAT_2026_06_17.adoc[TD-119 acceptance]
 
 | TD-116 | WAL tiering + read-as-of-LSN time travel | MED | Open | D1 | REL
 | WAL is local-only (`WalEntryStatus::Archived` never set); no sealed-segment offload to object store; `time_travel()` stubs. → archival task (copy `Flushed` segments to object store, set Archived), archive read-back, `scan_records_at_lsn`, `SELECT … AS OF (LSN/TIMESTAMP/SNAPSHOT)`. *Unblocks* TD-117. Plan `TD_116_*`.

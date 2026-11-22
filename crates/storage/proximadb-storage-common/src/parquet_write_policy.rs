@@ -531,12 +531,10 @@ mod tests {
         assert_eq!(sorting[0].column_idx, 0);
         assert!(!sorting[0].descending);
 
-        let offset_index = meta.offset_index().expect("offset index written");
-        assert!(
-            offset_index[0][0].page_locations().len() >= 10,
-            "≈1k-row pages"
-        );
-        assert!(meta.column_index().is_some(), "column index written");
+        let page_index = meta.page_index_for_row_group(0);
+        let offset_index = page_index.offset_index(0).expect("offset index written");
+        assert!(offset_index.page_locations().len() >= 10, "≈1k-row pages");
+        assert!(page_index.column_index(0).is_some(), "column index written");
 
         let rg_reader = reader.get_row_group(0).unwrap();
         assert!(

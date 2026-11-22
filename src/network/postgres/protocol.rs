@@ -3108,14 +3108,14 @@ impl PostgresProtocol {
         // scope — matching REST's request_id middleware — so logs and error
         // envelopes carry it; then the per-query io_trace span (tenant-attributed).
         let request_id = crate::network::middleware::request_id::RequestId::generate();
+        // Keep the dispatcher out of the enclosing task-local futures. Debug
+        // builds otherwise reserve large stack slots for the dispatcher at
+        // each wrapper, including on short catalog-only statements.
+        let execution = Box::pin(self.execute_query_with_controls_inner(query, controls));
         proximadb_api::rest::errors::REQUEST_ID
             .scope(
                 request_id.0,
-                crate::observability::io_trace::instrument(
-                    Some(tenant),
-                    "pgwire.query",
-                    self.execute_query_with_controls_inner(query, controls),
-                ),
+                crate::observability::io_trace::instrument(Some(tenant), "pgwire.query", execution),
             )
             .await
     }
@@ -3420,17 +3420,11 @@ impl PostgresProtocol {
                         .await
                     {
                         Ok(result) => {
-                            if upper.starts_with("CREATE TABLE")
-                                // The AST name (quoted/mixed-case names
-                                // diverged from string extraction — a stray
-                                // backing collection was minted while the
-                                // real table got none). Under
-                                // upper.starts_with("CREATE TABLE") with a
-                                // parsed statement it is ALWAYS Some.
-                                && let Some(table_name) = ddl_table.clone()
+                            if result.provision_backing_collection
+                                && let Some(table_name) = &ddl_table
                             {
                                 self.ensure_relational_backing_collection(
-                                    &table_name,
+                                    table_name,
                                     ddl_scope.as_deref(),
                                     backing_precision.as_deref(),
                                     backing_dimension,
@@ -7223,7 +7217,7 @@ impl PostgresProtocol {
         }
 
         let upper = query.trim().to_uppercase();
-        if !upper.starts_with("SELECT") {
+        if !upper.starts_with("SELECT") && !upper.starts_with("WITH") {
             return DescribedShape::Unknown;
         }
         // Special cases `execute_query` answers before its SELECT dispatch —
@@ -7239,14 +7233,56 @@ impl PostgresProtocol {
         let tenant = self.pgwire_resolve_read_tenant().await;
         let tenant = (!tenant.is_empty()).then_some(tenant.as_str());
 
+        #[cfg(feature = "datafusion-integration")]
+        if self.session.read().await.current_schema() == "public"
+            && let Some(names) = super::relational_pipeline::pinned_query_table_names(query)
+        {
+            let count = names.len();
+            let mut pinned = Vec::new();
+            for name in names {
+                if let Ok(schema) = dml_service
+                    .resolve_relational_schema_exact(&name, tenant)
+                    .await
+                    && schema
+                        .storage_layouts
+                        .iter()
+                        .any(crate::services::ddl::is_pinned_external_layout)
+                {
+                    pinned.push((name, schema));
+                }
+            }
+            if !pinned.is_empty() {
+                if pinned.len() != count {
+                    return DescribedShape::Unknown;
+                }
+                let Ok(columns) = Box::pin(
+                    crate::query::execution::datafusion_engine::describe_pinned_projection(
+                        query, pinned,
+                    ),
+                )
+                .await
+                else {
+                    return DescribedShape::Unknown;
+                };
+                let fields = columns
+                    .into_iter()
+                    .map(|(name, column_type)| {
+                        let ty = super::relational_pipeline::pg_type_for(&column_type);
+                        (FieldDescription::new(&name, ty.clone()), ty)
+                    })
+                    .collect();
+                return DescribedShape::Fields(fields);
+            }
+        }
+        if !upper.starts_with("SELECT") {
+            return DescribedShape::Unknown;
+        }
         if super::relational_pipeline::select_engages_relational_engine(query) {
-            // The pipeline resolves tables in the session's `search_path`
-            // namespace; `describe_select_columns` resolves the default one.
+            // The pipeline resolves tables in the session's search-path namespace.
             if self.session.read().await.current_schema() != "public" {
                 return DescribedShape::Unknown;
             }
-            let Some(projection) = crate::network::postgres::describe::pipeline_projection(query)
-            else {
+            let Some(projection) = super::describe::pipeline_projection(query) else {
                 return DescribedShape::Unknown;
             };
             let sources: Vec<String> = projection
@@ -7798,6 +7834,7 @@ impl PostgresProtocol {
                 self.try_run_relational_select_pipeline(
                     query,
                     ExecutionControls {
+                        prepared_statement: true,
                         cancellation_flag: Some(cancellation_flag),
                         ..Default::default()
                     },
@@ -7995,9 +8032,13 @@ impl PostgresProtocol {
     /// `PortalSuspended` when more rows remain.
     fn execution_controls_for_execute_max_rows(max_rows: i32) -> ExecutionControls {
         if max_rows <= 0 {
-            return ExecutionControls::default();
+            return ExecutionControls {
+                prepared_statement: true,
+                ..Default::default()
+            };
         }
         ExecutionControls {
+            prepared_statement: true,
             max_rows: Some(max_rows as usize),
             row_limit_mode: RowLimitMode::Truncate,
             ..Default::default()

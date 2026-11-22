@@ -412,3 +412,6 @@ mod execution_tests {
         })
     }
 }
+
+#[cfg(feature = "datafusion-integration")]
+pub(crate) mod pinned_source;

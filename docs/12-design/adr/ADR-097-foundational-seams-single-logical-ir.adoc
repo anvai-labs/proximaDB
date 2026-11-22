@@ -123,6 +123,13 @@ metadata tree, its own identity) is a defect against this ADR.
 * CI reads published tables back with an external reader and compares values with pgwire
   (TD-SEAM-1).
 
+*Scope clarification, 2026-11-21.* D3 governs managed publication. A Delta owner may expose
+a read-only Iceberg projection over the same Parquet files. Admit that projection only when
+its recorded Delta version satisfies the requested read and its schema and deletes can be
+interpreted. Route mutations through the declared owner. A source with only a Delta log
+requires a qualified Delta reader. The local DataFusion plan consumes the resulting scan
+in either case. link:../../rfcs/0003-open-table-analytics.adoc#iceberg-delta-compatibility[Version evidence and fixtures]
+
 *Status note 2026-11-19:* the verbatim path holds only for engine-published tables. For other tables, REST `load_table` still falls through to `catalog_schema_to_iceberg_metadata`, which synthesizes a snapshot whose `manifest-list` URL (`…/manifests/snap-{id}.avro`) is not served by any route; and `commit_table` applies no data — its `AddSnapshot` arm only logs (`crates/control/proximadb-catalog/src/iceberg_rest_service.rs`). The residual is tracked in TD-SEAM-1.
 
 === D4 — Positioning

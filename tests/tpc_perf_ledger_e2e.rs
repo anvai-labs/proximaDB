@@ -221,8 +221,8 @@ fn validate_perf_run(
     cgroup_limit_mib: Option<u64>,
     host_total_mib: Option<u64>,
     required_headroom_mib: u64,
+    cgroup_high_mib: Option<u64>,
 ) -> Result<PerfRunPreflight, String> {
-    let cgroup_high_mib = current_cgroup_memory_high_mib();
     if !scale.is_finite() || scale <= 0.0 {
         return Err("TPC_PERF_SCALE must be a finite number greater than zero".to_string());
     }
@@ -234,6 +234,16 @@ fn validate_perf_run(
         cgroup_high_mib,
         host_total_mib,
     };
+    let effective_budget = cgroup_limit_mib.into_iter().chain(cgroup_high_mib).min();
+    if let Some(budget) = effective_budget
+        && estimated_peak_mib > budget
+    {
+        return Err(format!(
+            "estimated peak {estimated_peak_mib} MiB exceeds cgroup budget {budget} MiB \
+             (memory.high={cgroup_high_mib:?}, memory.max={cgroup_limit_mib:?}); \
+             lower TPC_PERF_SCALE or use a larger isolated envelope"
+        ));
+    }
     if estimated_peak_mib <= SAFE_ESTIMATED_PEAK_MIB {
         return Ok(preflight);
     }
@@ -1380,6 +1390,9 @@ struct TableTiming {
     /// statements run one at a time, so this is the table's share of the wall
     /// time; above 1 they overlap and the sum exceeds the wall time.
     ms: u128,
+    /// Rows acknowledged in INSERT command tags and SQL bytes sent during load.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    insert: Option<InsertVolume>,
     /// MATERIALIZE outcome; a failed INSERT panics, so load entries are `true`.
     ok: bool,
 }
@@ -1391,14 +1404,40 @@ fn insert_target(sql: &str) -> &str {
         .unwrap_or("?")
 }
 
-/// Per-table `(statements, time)` accumulated across load connections.
-type LoadTally = std::sync::Arc<Mutex<std::collections::HashMap<String, (usize, Duration)>>>;
+#[derive(Debug, Default, serde::Serialize)]
+struct InsertVolume {
+    acknowledged_rows: u64,
+    sql_bytes: usize,
+}
 
-fn tally_statement(tally: &LoadTally, sql: &str, elapsed: Duration) {
+#[derive(Default)]
+struct InsertTally {
+    statements: usize,
+    elapsed: Duration,
+    volume: InsertVolume,
+}
+
+/// Per-table INSERT metrics accumulated across load connections.
+type LoadTally = std::sync::Arc<Mutex<std::collections::HashMap<String, InsertTally>>>;
+
+fn tally_statement(
+    tally: &LoadTally,
+    sql: &str,
+    elapsed: Duration,
+    messages: &[SimpleQueryMessage],
+) {
     let mut tally = tally.lock().expect("load tally lock");
     let entry = tally.entry(insert_target(sql).to_string()).or_default();
-    entry.0 += 1;
-    entry.1 += elapsed;
+    entry.statements += 1;
+    entry.elapsed += elapsed;
+    entry.volume.sql_bytes += sql.len();
+    entry.volume.acknowledged_rows += messages
+        .iter()
+        .filter_map(|message| match message {
+            SimpleQueryMessage::CommandComplete(rows) => Some(*rows),
+            _ => None,
+        })
+        .sum::<u64>();
 }
 
 /// Peak memory of one harness phase. `peak_rss_mib` is this process's VmHWM,
@@ -1706,22 +1745,55 @@ fn ledger_out_path() -> String {
         .unwrap_or_else(|_| "target/tpc-perf-ledger/ledger.json".to_string())
 }
 
-/// Append one record to `<out>.partial.jsonl`. Best-effort by design: the
-/// sidecar is diagnostics, so an append failure must never fail the harness.
+fn ledger_directory(out_path: &str) -> &std::path::Path {
+    std::path::Path::new(out_path)
+        .parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."))
+}
+
+fn prepare_ledger_output(out_path: &str) -> std::io::Result<()> {
+    let path = std::path::Path::new(out_path);
+    if path.file_name().is_none() || out_path.ends_with(std::path::is_separator) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "ledger path must name a file",
+        ));
+    }
+    let dir = ledger_directory(out_path);
+    std::fs::create_dir_all(dir)?;
+    if path.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::IsADirectory,
+            "ledger path points to a directory",
+        ));
+    }
+    // Exercise the same directory permissions the final atomic write needs.
+    tempfile::NamedTempFile::new_in(dir)?;
+    std::fs::File::create(format!("{out_path}.partial.jsonl"))?;
+    Ok(())
+}
+
+fn write_ledger<T: serde::Serialize>(out_path: &str, ledger: &T) -> std::io::Result<()> {
+    let mut file = tempfile::NamedTempFile::new_in(ledger_directory(out_path))?;
+    serde_json::to_writer_pretty(&mut file, ledger)?;
+    file.as_file().sync_all()?;
+    file.persist(out_path)?;
+    Ok(())
+}
+
+/// Append one measurement to the sidecar without discarding the in-memory record
+/// when the diagnostic path becomes unavailable.
 fn append_partial_record<T: serde::Serialize>(out_path: &str, rec: &T) {
     use std::io::Write as _;
     let path = format!("{out_path}.partial.jsonl");
-    if let Some(dir) = std::path::Path::new(&path).parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    if let (Ok(line), Ok(mut f)) = (
-        serde_json::to_string(rec),
-        std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path),
-    ) {
-        let _ = writeln!(f, "{line}");
+    let append = || -> std::io::Result<()> {
+        let line = serde_json::to_string(rec)?;
+        let mut file = std::fs::OpenOptions::new().append(true).open(&path)?;
+        writeln!(file, "{line}")
+    };
+    if let Err(error) = append() {
+        eprintln!("TPC ledger could not append {path}: {error}");
     }
 }
 
@@ -1937,6 +2009,20 @@ fn run_duckdb_baseline(
     }
 }
 
+fn record_completed_insert_batch(
+    batches: &std::sync::atomic::AtomicUsize,
+    benchmark: &str,
+    started: Instant,
+) {
+    let done = batches.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if done == 1 || done.is_multiple_of(128) {
+        eprintln!(
+            "[{benchmark}] load progress: {done} insert batches in {} ms",
+            started.elapsed().as_millis()
+        );
+    }
+}
+
 async fn seed(
     client: &Client,
     conn_str: &str,
@@ -1967,18 +2053,19 @@ async fn seed(
         .filter(|&n| n >= 1)
         .unwrap_or(1);
     let t0 = Instant::now();
+    eprintln!("[{benchmark}] waiting for generated insert batches (parallelism {parallelism})");
     let batches = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let tally = LoadTally::default();
     if parallelism == 1 {
         let mut inserts = inserts;
         while let Some(sql) = inserts.recv().await {
             let t = Instant::now();
-            client
+            let messages = client
                 .simple_query(&sql)
                 .await
                 .unwrap_or_else(|e| panic!("INSERT: {}", pg_server::db_err(&e)));
-            tally_statement(&tally, &sql, t.elapsed());
-            batches.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            tally_statement(&tally, &sql, t.elapsed(), &messages);
+            record_completed_insert_batch(&batches, benchmark, t0);
         }
     } else {
         let inserts = std::sync::Arc::new(tokio::sync::Mutex::new(inserts));
@@ -1988,6 +2075,7 @@ async fn seed(
             let inserts = inserts.clone();
             let batches = batches.clone();
             let tally = tally.clone();
+            let benchmark = benchmark.to_owned();
             set.spawn(async move {
                 let (c, conn) = tokio_postgres::connect(&cs, tokio_postgres::NoTls)
                     .await
@@ -2000,12 +2088,12 @@ async fn seed(
                         return Ok(());
                     };
                     let t = Instant::now();
-                    c.simple_query(&sql).await.map_err(|e| {
+                    let messages = c.simple_query(&sql).await.map_err(|e| {
                         let head = &sql[..sql.len().min(120)];
                         format!("INSERT: {} :: {}", pg_server::db_err(&e), head)
                     })?;
-                    tally_statement(&tally, &sql, t.elapsed());
-                    batches.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    tally_statement(&tally, &sql, t.elapsed(), &messages);
+                    record_completed_insert_batch(&batches, &benchmark, t0);
                 }
             });
         }
@@ -2030,13 +2118,16 @@ async fn seed(
     let load_tables = schema
         .iter()
         .map(|(name, _)| {
-            let (statements, elapsed) = tally.remove(*name).unwrap_or_default();
-            TableTiming {
+            let insert = tally.remove(*name).unwrap_or_default();
+            let timing = TableTiming {
                 table: name.to_string(),
-                statements,
-                ms: elapsed.as_millis(),
+                statements: insert.statements,
+                ms: insert.elapsed.as_millis(),
+                insert: Some(insert.volume),
                 ok: true,
-            }
+            };
+            eprintln!("[{benchmark}] · load {timing:?}");
+            timing
         })
         .collect();
     // Every statement targets a schema table; anything left is a parse miss.
@@ -2124,6 +2215,7 @@ async fn run_benchmark(
             table: name.to_string(),
             statements: 1,
             ms: t.elapsed().as_millis(),
+            insert: None,
             ok,
         };
         eprintln!("[{benchmark}] · {timing:?}");
@@ -2223,20 +2315,9 @@ async fn connect(server: &TestPgServer) -> Client {
     client
 }
 
-/// 8 MB stack — same fix as tpch_pgwire_e2e.rs (planner recursion on deep plans).
-#[test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "perf evidence-ledger harness (TD-OLAP-4) — advisory; run with --ignored --nocapture"]
-fn tpc_perf_ledger() {
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(4)
-        .thread_stack_size(8 * 1024 * 1024)
-        .enable_all()
-        .build()
-        .expect("tokio runtime");
-    rt.block_on(tpc_perf_ledger_inner());
-}
-
-async fn tpc_perf_ledger_inner() {
+async fn tpc_perf_ledger() {
     let scale_raw = std::env::var("TPC_PERF_SCALE").unwrap_or_else(|_| "0.001".to_string());
     let scale: f64 = scale_raw
         .parse()
@@ -2252,6 +2333,7 @@ async fn tpc_perf_ledger_inner() {
         current_cgroup_memory_limit_mib(),
         host_total_memory_mib(),
         required_host_headroom_mib(),
+        current_cgroup_memory_high_mib(),
     )
     .unwrap_or_else(|message| panic!("TPC performance preflight rejected the run: {message}"));
     let query_filter: Option<Vec<String>> = std::env::var("TPC_PERF_QUERIES")
@@ -2272,15 +2354,17 @@ async fn tpc_perf_ledger_inner() {
         "=== tpc-perf-ledger harness (TPC_PERF_SCALE={scale}, estimated_peak={} MiB, cgroup_limit={:?} MiB) ===",
         preflight.estimated_peak_mib, preflight.cgroup_limit_mib
     );
-    // Fresh partial sidecar per run — stale lines from a prior run must not
-    // mix into this run's crash-safe trail.
-    let _ = std::fs::remove_file(format!("{}.partial.jsonl", ledger_out_path()));
+    let out_path = ledger_out_path();
+    prepare_ledger_output(&out_path)
+        .unwrap_or_else(|error| panic!("prepare ledger output {out_path}: {error}"));
+    eprintln!("TPC ledger output: {out_path}");
 
     let mut records = Vec::new();
     let mut load_stats: Vec<LoadStats> = Vec::new();
 
     // Fresh server per benchmark: TPC-H and TPC-DS both define `customer`.
     if benchmark_filter.as_deref().is_none_or(|b| b == "tpch") {
+        eprintln!("[tpch] starting server");
         let server = TestPgServer::start().await.expect("server start (tpch)");
         // Override the process billing observer (installed by db.start()) with
         // a collector that captures each query's snapshot for this harness.
@@ -2319,6 +2403,7 @@ async fn tpc_perf_ledger_inner() {
         }
     }
     if benchmark_filter.as_deref().is_none_or(|b| b == "tpcds") {
+        eprintln!("[tpcds] starting server");
         let server = TestPgServer::start().await.expect("server start (tpcds)");
         // Override the process billing observer (installed by db.start()) with
         // a collector that captures each query's snapshot for this harness.
@@ -2395,15 +2480,8 @@ async fn tpc_perf_ledger_inner() {
         load_stats,
     };
 
-    let out_path = ledger_out_path();
-    if let Some(dir) = std::path::Path::new(&out_path).parent() {
-        std::fs::create_dir_all(dir).expect("create ledger dir");
-    }
-    std::fs::write(
-        &out_path,
-        serde_json::to_vec_pretty(&ledger).expect("serialize ledger"),
-    )
-    .expect("write ledger");
+    write_ledger(&out_path, &ledger)
+        .unwrap_or_else(|error| panic!("write ledger {out_path}: {error}"));
     eprintln!("ledger written: {out_path}");
 
     // Advisory skeleton: assert only harness integrity, never perf numbers.
@@ -2509,34 +2587,37 @@ fn perf_preflight_accepts_default_scale_without_cgroup() {
         None,
         Some(128 * 1024),
         REQUIRED_HOST_HEADROOM_MIB,
+        None,
     )
     .expect("the default diagnostic scale must remain easy to run");
     assert!(result.estimated_peak_mib < SAFE_ESTIMATED_PEAK_MIB);
 }
 
 #[test]
-fn perf_preflight_rejects_sf1_without_explicit_acknowledgement() {
+fn perf_preflight_rejects_large_run_without_explicit_acknowledgement() {
     let error = validate_perf_run(
-        1.0,
+        0.1,
         Some("tpch"),
         None,
         Some(64 * 1024),
         Some(128 * 1024),
         REQUIRED_HOST_HEADROOM_MIB,
+        None,
     )
-    .expect_err("SF1 must fail closed without the exact acknowledgement");
+    .expect_err("large runs must require exact acknowledgement");
     assert!(error.contains("TPC_PERF_ALLOW_LARGE_SCALE"));
 }
 
 #[test]
 fn perf_preflight_rejects_large_run_in_unbounded_cgroup() {
     let error = validate_perf_run(
-        1.0,
+        0.1,
         Some("tpch"),
         Some(LARGE_SCALE_ACK),
         None,
         Some(128 * 1024),
         REQUIRED_HOST_HEADROOM_MIB,
+        None,
     )
     .expect_err("an acknowledgement alone must never bypass resource isolation");
     assert!(error.contains("finite cgroup memory.max"));
@@ -2545,12 +2626,13 @@ fn perf_preflight_rejects_large_run_in_unbounded_cgroup() {
 #[test]
 fn perf_preflight_rejects_limit_that_starves_host() {
     let error = validate_perf_run(
-        1.0,
+        0.1,
         Some("tpch"),
         Some(LARGE_SCALE_ACK),
         Some(120 * 1024),
         Some(128 * 1024),
         REQUIRED_HOST_HEADROOM_MIB,
+        None,
     )
     .expect_err("the benchmark cgroup must reserve memory for CI and the host");
     assert!(error.contains("host headroom"));
@@ -2559,14 +2641,15 @@ fn perf_preflight_rejects_limit_that_starves_host() {
 #[test]
 fn perf_preflight_accepts_isolated_large_run_with_headroom() {
     let result = validate_perf_run(
-        1.0,
+        0.1,
         Some("tpch"),
         Some(LARGE_SCALE_ACK),
         Some(64 * 1024),
         Some(128 * 1024),
         REQUIRED_HOST_HEADROOM_MIB,
+        None,
     )
-    .expect("a bounded SF1 run with substantial host headroom is allowed");
+    .expect("a bounded scale-0.1 run with substantial host headroom is allowed");
     assert!(result.estimated_peak_mib > SAFE_ESTIMATED_PEAK_MIB);
 }
 
@@ -2574,9 +2657,58 @@ fn perf_preflight_accepts_isolated_large_run_with_headroom() {
 fn perf_preflight_rejects_non_finite_or_non_positive_scale() {
     for scale in [0.0, -0.1, f64::INFINITY, f64::NAN] {
         assert!(
-            validate_perf_run(scale, None, None, None, None, REQUIRED_HOST_HEADROOM_MIB).is_err()
+            validate_perf_run(
+                scale,
+                None,
+                None,
+                None,
+                None,
+                REQUIRED_HOST_HEADROOM_MIB,
+                None
+            )
+            .is_err()
         );
     }
+}
+
+#[test]
+fn perf_preflight_rejects_a_run_over_the_cgroup_budget() {
+    for (scale, limit, high) in [
+        (1.0, 64 * 1024, None),
+        (0.1, 64 * 1024, Some(8 * 1024)),
+        (0.001, 64, None),
+    ] {
+        let error = validate_perf_run(
+            scale,
+            Some("tpch"),
+            Some(LARGE_SCALE_ACK),
+            Some(limit),
+            Some(128 * 1024),
+            REQUIRED_HOST_HEADROOM_MIB,
+            high,
+        )
+        .expect_err("the estimated peak must fit the cgroup budget at any scale");
+        assert!(error.contains("exceeds cgroup budget"), "{error}");
+    }
+}
+
+#[test]
+fn ledger_output_is_prepared_before_measurements() {
+    let temp = tempfile::tempdir().unwrap();
+    let out = temp.path().join("new-directory/ledger.json");
+    let path = out.to_str().unwrap();
+    prepare_ledger_output(path).unwrap();
+    append_partial_record(path, &serde_json::json!({"rows": 3}));
+    let sidecar = format!("{path}.partial.jsonl");
+    assert_eq!(std::fs::read_to_string(&sidecar).unwrap(), "{\"rows\":3}\n");
+    write_ledger(path, &serde_json::json!({"rows": 3})).unwrap();
+    let actual: serde_json::Value = serde_json::from_slice(&std::fs::read(&out).unwrap()).unwrap();
+    assert_eq!(actual, serde_json::json!({"rows": 3}));
+    prepare_ledger_output(path).unwrap();
+    assert_eq!(std::fs::metadata(&sidecar).unwrap().len(), 0);
+    assert!(prepare_ledger_output(out.parent().unwrap().to_str().unwrap()).is_err());
+    assert!(prepare_ledger_output("").is_err());
+    assert!(prepare_ledger_output(&format!("{path}/")).is_err());
 }
 
 /// TD-OLAP-6 regression: MATERIALIZE must publish CLUSTERED row groups.
@@ -2701,19 +2833,8 @@ fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
 /// identical; with the levers on, a filter that keeps `S` of the four files
 /// reads `|S ∪ {first file}|` footers (the first file is the planning-schema
 /// source), never four. Storage regime: local file:// (not cloud).
-#[test]
-fn manifest_levers_cut_footer_gets_over_pgwire() {
-    // 8 MB stacks, as for `tpc_perf_ledger` (debug-build server futures).
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(4)
-        .thread_stack_size(8 * 1024 * 1024)
-        .enable_all()
-        .build()
-        .expect("tokio runtime");
-    rt.block_on(manifest_levers_cut_footer_gets_over_pgwire_inner());
-}
-
-async fn manifest_levers_cut_footer_gets_over_pgwire_inner() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn manifest_levers_cut_footer_gets_over_pgwire() {
     const KILL_SWITCHES: [&str; 3] = [
         "PROXIMADB_OLAP_MANIFEST_CACHE_DISABLE",
         "PROXIMADB_OLAP_MANIFEST_PRUNE_DISABLE",

@@ -5,7 +5,7 @@
 # ============================================================================
 # Stage 1: Builder
 # ============================================================================
-FROM rust:1.95-slim-bookworm AS builder
+FROM rust:1.100.0-slim-bookworm AS builder
 
 # Install build dependencies
 RUN apt-get update && apt-get install -y \
@@ -59,7 +59,7 @@ RUN strip /build/target/release/proximadb-server
 # 2.41 / GCC 14. This is independent of the minimal builder — the default image
 # stays on bookworm. g++ provides libstdc++ for the C++ onnxruntime link.
 # ============================================================================
-FROM rust:1.95-slim-trixie AS builder-full
+FROM rust:1.100.0-slim-trixie AS builder-full
 RUN apt-get update && apt-get install -y --no-install-recommends \
     pkg-config \
     libssl-dev \

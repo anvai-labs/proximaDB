@@ -390,8 +390,13 @@ impl QueryLowering {
 
         for order_expr in order_by {
             let expr = self.lower_expr(&order_expr.expr).await?;
-            // In sqlparser 0.59, asc is in options.asc: Option<bool> where Some(true) = ASC, Some(false) = DESC, None = ASC (default)
-            let asc = order_expr.options.asc.unwrap_or(true);
+            let asc = match &order_expr.options.sort {
+                None | Some(sqlparser::ast::OrderBySort::Asc) => true,
+                Some(sqlparser::ast::OrderBySort::Desc) => false,
+                Some(sqlparser::ast::OrderBySort::Using(_)) => {
+                    return Err(anyhow!("ORDER BY USING is unsupported"));
+                }
+            };
 
             order_exprs.push(OrderByExpr { expr, asc });
         }

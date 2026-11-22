@@ -17,6 +17,14 @@ AKS, Helm, autoscaling, node pools, and cost controls are not database semantics
 deployment/control-plane responsibilities owned outside this repository. ProximaDB owns the route
 contract and the client/runtime adapter that can target a Ballista scheduler when one is configured.
 
+P2 scopes that OSS adapter to submission, status and cancellation at an explicitly configured
+endpoint. The coordinator owns membership, placement, attempt fencing, retry and recovery across
+nodes. ProximaDB-specific multi-node coordination belongs in the commercial workspace under
+link:adr/ADR-084-oss-commercial-placement-worm-and-distribution.adoc[ADR-084 D2].
+An ambiguous submission response is resolved using the same submission identity. The client
+must never start a second job to resolve that ambiguity. See the
+link:../rfcs/0003-open-table-analytics.adoc#binding[RFC-0003 handoff and compatibility tests].
+
 == Repository Boundary
 
 [cols="1,2,3"]

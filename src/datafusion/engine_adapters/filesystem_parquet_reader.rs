@@ -200,7 +200,7 @@ impl TableProvider for FilesystemParquetTable {
     async fn scan(
         &self,
         state: &dyn Session,
-        projection: Option<&Vec<usize>>,
+        projection: Option<&[usize]>,
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
@@ -209,7 +209,7 @@ impl TableProvider for FilesystemParquetTable {
             .schema(self.schema.clone())
             .splits(self.splits.clone())
             .reader(self.reader())
-            .projection(projection.cloned())
+            .projection(projection.map(<[usize]>::to_vec))
             .filters(filters.to_vec())
             .limit(limit)
             .collection_name(self.file_path.clone())

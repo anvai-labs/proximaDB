@@ -120,7 +120,7 @@ impl TableProvider for PaxTableProvider {
     async fn scan(
         &self,
         state: &dyn Session,
-        projection: Option<&Vec<usize>>,
+        projection: Option<&[usize]>,
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
@@ -138,7 +138,7 @@ impl TableProvider for PaxTableProvider {
             .schema(self.schema.clone())
             .splits(self.splits.clone())
             .reader(self.reader(physical_filters))
-            .projection(projection.cloned())
+            .projection(projection.map(<[usize]>::to_vec))
             .filters(filters.to_vec())
             .limit(limit)
             .collection_name(self.collection_name.clone())

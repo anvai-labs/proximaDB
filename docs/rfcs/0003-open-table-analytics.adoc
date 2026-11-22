@@ -1,0 +1,279 @@
+// SPDX-License-Identifier: Apache-2.0
+= RFC-0003 Open-table analytics and batch execution
+:status: Planning baseline; qualification pending
+:date: 2026-11-21
+:toc:
+
+== Recommendation
+
+Use DataFusion for relational planning and as the reference physical executor for analytical SQL. Make an unmaterialized ProximaDB table, a published Iceberg snapshot and a supported external Delta version eligible inputs to the same join. A user should be able to run that join through pgwire without first copying each source to a preferred format. Eligibility requires a reader that can prove visibility, types and access policy for that particular read.
+
+Invest first in getting fewer bytes to the operators and in bounding the cost of loading and opening tables. A native scan, join or fused operator earns a place under the DataFusion plan when it gives correct answers and a repeatable end-to-end gain over the best existing provider on identical input. Keep the legacy native route available for its current callers and as a diagnostic control. Evaluate Ballista first for remote execution after the local contracts pass. These requirements guide P3/P5/P6 and the later scale-out review. Release order remains with the link:../current/ROADMAP.adoc[roadmap].
+
+== What the benchmark establishes
+
+The retained console log (ledger-0.1b.log, November 20–21) covers synthetic TPC-shaped data at scale 0.1. The generator's roughly 866k estimate covers all eight TPC-H tables. It generates 150k orders with 1–7 lineitems each. The log supplies no exact lineitem count. The benchmark process failed creating the final ledger directory after both suites. The numbers below are successful-query repeat medians and completion counts, independent of value parity.
+
+[cols="1,2,2",options="header"]
+|===
+| Workload | Before MATERIALIZE, native sweep | After MATERIALIZE, DataFusion sweep
+| TPC-H | 21/22, 15,206 ms median. Q21 hit the 300 s deadline twice. | 22/22, 39 ms median. Q21 repeated in 60 ms.
+| TPC-DS subset | 28/63. Of 35 failures, 34 returned 0A000 and q17 returned XX000. | 63/63, 20 ms median. q17 returned zero rows.
+|===
+
+TPC-H load consumed 17,730,719 ms for 4,334 INSERT batches at parallelism one. Publishing all eight tables then took 19,545 ms. TPC-DS load consumed 221,382 ms for 2,944 batches. Peak recorded process RSS across the phases was 14,749 MiB. The benchmark changed both storage representation and executor between sweeps. It measured neither an isolated join-kernel gain nor a comparison against Spark or Trino. Publication cost belongs in time-to-first-answer for a fresh load.
+
+Two specific regressions belong in the evidence gate. For q17, minimize the native expression that expects Int32 and receives Float64 at ss_quantity ordinal 10. Exercise a nonempty result with known values and verify declared types, coercion and NULL behavior. For the reported SF1 stall, the 135,313 MiB estimate exceeds the 65,536 MiB envelope. In the reviewed harness the banner prints *after* validation. The guard checks acknowledgement, finite limit and host headroom but never compares estimated peak with that limit. At 0.1 the 8,192 MiB acknowledgement check runs before the finite-limit check, and the successful invocation reports Some(65536). The SF1 blocked operation remains unknown. Require an over-budget refusal before server startup, phase heartbeat and a bounded no-progress timeout. Verify the guard with synthetic limits.
+
+== Implementation review at develop d4a870665
+
+[cols="2,3,3",options="header"]
+|===
+| Existing boundary | What the code gives us | Consequence
+| link:../../src/query/compute_scheduler.rs[ComputeScheduler] and link:../../src/query/read_route.rs[RoutedReadPlan] | A typed backend decision and route explanation. link:../../src/query/execution/native_engine.rs[Native vectorization] already has opt-in physical substitutions. | Record the executed provider and physical operator as well as the requested sweep. Cost only candidates that satisfy access and visibility.
+| link:../../src/query/execution/native_table_provider.rs[NativeTableSource] and link:../../src/query/execution/layer_a/provider.rs[LayerATableProvider] | Opt-in native registration can stream a Layer A snapshot. Its fallback builds a row-capped MemTable. Mixed queries can explicitly decline an over-cap input. | Compare the existing streaming provider against both sweeps before funding another executor. Default-on still requires the P3 mixed-layout, policy and bounded-memory gates.
+| link:../../crates/storage/proximadb-storage-common/src/format_traits.rs[StorageFormat and OpenTableFormat], link:../../crates/storage/proximadb-storage-common/src/format_splits.rs[FileSplit and SplitGenerator], link:../../src/datafusion/proxima_scan_exec.rs[ProximaScanExec] | Arrow batch streams, split statistics/locality and late runtime filter hooks already exist. The generic format read context is path-based and list_files returns a vector. | Attach the pinned view and exact capability decisions above the decoder. Page inventories and feed readers on demand. Reuse the TD-097 split contract for external consumers.
+| link:../../src/query/table_write_executor.rs[TableWriteExecutor], link:../../crates/storage/proximadb-iceberg-engine/src/lib.rs[Iceberg engine], link:../../crates/control/proximadb-catalog/src/delta.rs[Delta catalog] | Routed writes distinguish PlannedOnly and Completed. Iceberg has a publication engine. The optional Delta catalog persists a last-writer-wins catalog object and handles log metadata. | Trace a real SQL call through commit and independent read-back before declaring an operation supported. Catalog registration alone establishes neither Delta protocol coverage nor concurrent commit safety.
+| link:../../tests/tpc_perf_ledger_e2e.rs[Ledger generator and load loop] | TPC-H collects gen_tpch(scale) before emitting statements, including sorted lineitems. TPC-DS emits through gen_tpcds_into. The consumer tallies per-table statement time, and wall time includes waiting for production. | Separate time to first batch, generator wait and server-side work. Test the generator under a byte limit. Neither this asymmetry nor batch count identifies the 4.9-hour bottleneck.
+|===
+
+== Prior art and resulting constraints
+
+The design choice that matters across these systems is where a pipeline may block, spill, replay or publish. A lazy DAG can still need a wide shuffle. An MPP stage can use a durable exchange. The same query may benefit from both behaviors.
+
+[cols="2,3,3",options="header"]
+|===
+| System | Mechanism and cost | Requirement for ProximaDB
+| Hadoop MapReduce and Hive | Map outputs undergo partition, sort and shuffle. Chaining jobs can persist intermediate output. Hive metastore partitions can drift from files added out of band. https://hadoop.apache.org/docs/current/hadoop-mapreduce-client/hadoop-mapreduce-client-core/MapReduceTutorial.html[MapReduce tutorial], https://hive.apache.org/docs/latest/language/languagemanual-ddl/[Hive partition management]
+| Pipeline local filters and projections. Introduce an exchange only for required distribution, ordering or recovery. Resolve table membership through the format's authority.
+| Spark | Data Source V2 negotiates pushdown and supplies task inputs. Runtime statistics let adaptive execution coalesce small partitions, split skewed ones or change joins after a shuffle. https://spark.apache.org/docs/latest/sql-v2-data-sources.html[Data Source V2], https://spark.apache.org/docs/latest/sql-performance-tuning.html[adaptive execution]
+| Keep connector capabilities explicit. Measure partition bytes, max-to-median skew and build-side size. Allow bounded replanning of unconsumed stages while preserving key distribution and results already emitted.
+| Trino | Pipelined execution limits interactive latency. Task retry can reuse spooled exchanges, paying storage and I/O costs and requiring connector support. https://trino.io/docs/current/admin/fault-tolerant-execution.html[Fault-tolerant execution]
+| Choose exchange durability by query class, replay cost and available budget. Require a retry-safe source and sink before enabling task replay.
+| Impala | Concurrent queries can exhaust memory or saturate I/O. Admission pools bound concurrency, queue length and wait time. https://impala.apache.org/docs/build/html/topics/impala_admission.html[Admission control]
+| Reserve coordinator and worker resources per tenant. Give interactive reads and backfills separate admission budgets and finite queue deadlines. Measure p95 under concurrent load.
+| DataFusion and Ballista | A DataFusion memory pool covers participating operators. Process memory includes other allocations. Ballista divides plans into stages and sends tasks to executors that exchange Arrow data. Extensions must be understood at both ends. https://datafusion.apache.org/library-user-guide/securing-datafusion.html[Runtime limits], https://datafusion.apache.org/ballista/contributors-guide/architecture.html[Ballista architecture]
+| Account separately for metadata, decoders, joins, network buffers and spill. Negotiate plan/extension versions before placement. Prove a custom scan can run on a worker with only its declared inputs.
+| Airflow | A task may retry after upstream data changes or on a different machine. Tasks need stable partitions, durable outputs and idempotent effects. https://airflow.apache.org/docs/apache-airflow/stable/best-practices.html[Task best practices]
+| Expose submit/status/cancel and a durable output receipt for retryable jobs. Leave calendars, backfill dependencies and cross-service orchestration with the workflow tool.
+|===
+
+=== Execution representations and Volcano
+
+Trino supplies column blocks through its page-source SPI and negotiates split discovery and pushdown at the connector. Hive's vectorized operators consume `VectorizedRowBatch` and benefit from ORC stripe and row-group indexes. Impala's C++ runtime passes batches of tuple rows with attached memory, and can distribute runtime join filters to scan nodes. Redshift documents columnar storage, distributed slices and compiled query segments. This describes different execution and storage choices even where engines can all read Parquet. Redshift's published performance design leaves its internal batch ABI unspecified. https://trino.io/docs/current/develop/connectors.html[Trino connector SPI], https://github.com/apache/hive/blob/master/ql/src/java/org/apache/hadoop/hive/ql/exec/vector/VectorGroupByOperator.java[Hive vectorized aggregation], https://hive.apache.org/docs/latest/language/languagemanual-orc/[Hive ORC], https://github.com/apache/impala/blob/master/be/src/runtime/row-batch.h[Impala RowBatch], https://impala.apache.org/docs/build/html/topics/impala_runtime_filtering.html[Impala runtime filtering], https://docs.aws.amazon.com/redshift/latest/dg/c_challenges_achieving_high_performance_queries.html[Redshift performance]
+
+Use *Volcano* as the working product name for the native executor. Keep the bound scan contract independent of a DataFusion `TableProvider` or `ExecutionPlan`. A format-specific binder owns version and feature negotiation. The resulting scan describes the visible schema, projections, exact and residual predicates, replayable splits, deletes and placement. Both executors consume that contract. Start with Arrow batches at the local source boundary. A Volcano operator may retain dictionaries, carry a selection vector, or fuse operators within one fragment if the boundary preserves values, order guarantees, cancellation and memory accounting. Count conversion and exchange bytes before adopting another representation.
+
+Prioritize projection and physical pruning, then safe runtime filters, partitioned hash joins and bounded aggregation with spill. Keep the generic batch path available for every supported type. Gate specialization and compiled fragments on measured kernel and end-to-end wins that include cold setup and compilation. Measure shared scans before attributing a speedup to an executor. Carry the same visibility and split contracts to a distributed worker before adding a second scheduler. Reserve memory for batches and dictionaries still referenced by downstream operators, even after the producing stage yields.
+
+== Pinned source design after the SF1 checkpoint
+
+Catalog classification owns the authority and format decision for DDL, write
+refusal and read routing. At statement setup, the binder requires one eligible
+layout and resolves its exact snapshot, log version or manifest digest. Each
+format reader owns protocol interpretation, schema mapping and delete
+application. The local Arrow batch source exposes schema, a stable split
+inventory and repeatable projected scans without optimizer types. DataFusion
+plans against the bound source and opens each scan partition on first demand.
+Unpushed filters stay in DataFusion. These boundaries let another executor
+reuse the readers while keeping its plan, scheduling and SQL semantics above
+the batch contract.
+link:../../src/services/ddl/pinned_external.rs[Catalog classification],
+link:../../src/datafusion/engine_adapters/pinned_external.rs[Statement bind],
+link:../../src/query/execution/pinned_source.rs[Batch contract],
+link:../../src/datafusion/engine_adapters/pinned_table.rs[DataFusion adapter],
+https://datafusion.apache.org/versions/55.0.0/library-user-guide/custom-table-providers.html[DataFusion provider guidance].
+
+Pinned pgwire reads resolve SQL-folded unquoted names and preserve quoted
+spelling. Prepared pinned statements use DataFusion SQL for both Describe
+and Execute, including before and after parameter substitution. Describe
+plans against catalog-only schemas without opening files. Retain this
+single-planner behavior when the shared frontend gains typed placeholders
+and case-sensitive table keys.
+
+[cols="2,3,3",options="header"]
+|===
+| Pressure observed at the checkpoint | Next design step | Evidence required
+| Queries reopen metadata, and binding materializes each inventory before planning.
+| Attribute bind latency, metadata requests and inventory bytes by format. Page inventories and admit concurrent binds against a shared budget if the measurements justify it. Reuse parsed metadata only with a verified version or content identity. Recheck authorization on each bind.
+| Compare cold and warm runs over the same SQL and source versions. Exercise same-name replacement, source expiry, policy change and an interrupted bind. A cache hit must never authorize stale data or suppress expiry.
+| Equal split counts can assign uneven work. Delta has bounded queues per stream, and the NDJSON reader holds a verified byte range while decoding.
+| Measure compressed bytes, decoded bytes, CPU and queue time per split before choosing scheduling weights. Reserve aggregate scan bytes and blocking work across partitions and concurrent queries. Keep the cap effective when projection is empty or input rows are wide.
+| Compare skewed files and mixed-width queries under a fixed memory budget. Confirm cancellation and early LIMIT release reservations and stop further opens.
+| The local pinned split index lives only inside one binding. Existing `ProximaScanExec` already has pruning and runtime-filter hooks for file splits.
+| Reuse those planning hooks once the file-split contract carries bound object identity and visibility. Keep residual predicates above the scan until the reader proves exactness. Send portable versioned descriptors to workers and bind them to the verified input and execution attempt.
+| Compare typed answers and ordering with pruning enabled and disabled, including deletes, NULL and outer joins. Reject a changed object or unauthorized attempt before delivering rows.
+|===
+
+== Source and sink requirements
+
+. *Bind the view once.* Resolve each relation to tenant, catalog identity, schema/field identities, supported format features, policy generation and immutable snapshot or file-set token. Managed fresh tables also pin a reconciled WAL visibility boundary. State the consistency level of a join across independently committed catalogs. A caller requiring atomic cross-table visibility receives a refusal unless the catalog can supply it. Record how long the source can serve the selected version and return snapshot-expired if it becomes unavailable. Reauthorize a resumed job.
+. *Negotiate the scan.* Describe projection, predicates (exact, pruning-only, unsupported), splitability, ordering, partitioning, estimate confidence and freshness per source. SQL residuals run on all surviving rows. Apply LIMIT after visibility, policy and residuals unless equivalence is proved. Statistics may select join order, broadcast or repartition. Unknown estimates cannot authorize unbounded broadcast. Runtime filters must preserve outer/anti-join semantics and newer WAL versions.
+. *Enumerate and execute.* A replayable split names an immutable source version, object identity, logical range, schema, partition transform and applicable deletes. An expiring opaque credential reference is scoped to the tenant and input. Page manifests under a coordinator byte limit and coalesce small files without losing per-file identity. A worker opens the split and yields byte-bounded Arrow RecordBatch streams under backpressure. Count decode, copies, range reads and cancellations. Arrow defines the in-process data representation. Transport encoding is negotiated separately. https://arrow.apache.org/docs/format/Columnar.html[Arrow columnar format]
+. *Publish once.* A CTAS or INSERT SELECT job fixes its source versions, target parent and run key. Workers stage uniquely named files and report their checksums, partitions, schema and row counts. The target owner validates the winning attempts and fences a single metadata commit. Bind the run key and input digest to its outcome durably so a lost acknowledgement can return the prior receipt. A changed input under the same key conflicts. On abort, clean unreferenced files after checking outstanding leases. For native DML preserve canonical WAL ordering, constraints and recovery. Overwrite and MERGE each need independent conflict and crash proofs.
+
+[cols="1,3,3",options="header"]
+|===
+| Source | First capability to qualify | Adversarial fixture
+| Managed Layer A / PAX | Snapshot and WAL-tail scan, stable oid, newest live version, policy-aware pushdown. | Update a pruning key during flush, then delete. Repeated local and resumed split reads return the same authorized rows for the pinned view.
+| Iceberg | Resolve a catalog snapshot through manifest lists and manifests. Respect field IDs, partition-spec evolution, sequence numbers and applicable delete files or deletion vectors. Negotiate each v2/v3 feature. https://iceberg.apache.org/spec/[Iceberg specification] | Read two externally written snapshots across rename, repartition and delete. Refuse an unsupported delete representation before emitting rows. An independent reader verifies managed publication.
+| Delta | Read-only first. Resolve log version from checkpoint and subsequent actions, honor add/remove, reader protocol, column mapping and deletion vectors when advertised. https://github.com/delta-io/delta/blob/master/PROTOCOL.md[Delta protocol] | After overwrite, rename and deletion, compare each version with a pinned Delta reader. Unsupported required features and missing history fail at binding. Review writes separately.
+| Parquet files | Pin an explicit inventory with immutable identities. Read projected row groups with conservative typed statistics. | Replace a same-name object mid-read and reject the changed input. An empty inventory still returns the declared schema.
+| CSV and JSON | Require declared schema or persist an inferred schema with the inventory. Pin encoding, CSV quoting, null and header rules, JSON framing and nested mapping. Initial NDJSON reads use a declared schema, fail on malformed records, and preserve exact decimals and dates. | Quoted multiline CSV, a record spanning a buffer, missing and null JSON fields, a value exceeding decimal precision, and unsplittable compression. Use a whole-file streaming reader where safe boundaries are unavailable.
+| Avro | Resolve writer/reader schemas and defaults, logical types and unions. Split object-container files only at valid block boundaries. | Evolve a nullable field with a default, change decimal scale, replay a compressed block. Reject lossy conversion unless explicitly requested.
+|===
+
+A raw-file listing becomes repeatable only with an immutable inventory and enforceable object versions or equivalent immutability. ADLS, S3 and local files may offer different guarantees. Raw-file exports return a manifest of completed objects. Atomic table replacement requires a transactional target. Test decimal precision, timestamp zones, NULLs, duplicate keys, empty input and nested values across every supported adapter.
+
+The local NDJSON reader uses a declared flat SQL schema and one `.jsonl` file
+beneath an operator-allowlisted directory. Register it through pgwire with
+`format='json'`, `authority='external'`, a canonical `external_location` file
+URI, and `ndjson_manifest_sha256`. The sibling `<file>.manifest.json` is capped
+at 1 MiB. Version 1 stores the file size and a contiguous sequence of ranges,
+each with an exclusive `end` byte offset and a hexadecimal `sha256`. Every
+range ends at a newline and is capped at 8 MiB. Verify each accessed range before
+decoding any of its records. A query with early termination may leave
+unneeded ranges unread. Missing nullable fields become NULL. Undeclared
+fields, invalid types and fixed-point decimals that require rounding fail
+during decode. Both the manifest and data use confined local handles.
+The DataFusion provider consumes the same Arrow split interface for Iceberg
+and NDJSON, and can join pinned tables in either format.
+
+Evaluate Delta Kernel for binding and scan planning. The published 0.30.1 manifest pairs its `arrow-60` feature with Arrow and Parquet 60 and object_store 0.14.2. Its default engine accepts a caller-supplied object store. Exercise that interface with confined log discovery and file reads, and carry query cancellation into snapshot replay and scans. The legacy local Delta connector defers checkpoint replay. Require successful checkpoint, feature and delete fixtures before exposing a direct Delta reader. https://docs.rs/crate/delta_kernel/0.30.1/source/Cargo.toml[Delta Kernel dependency manifest], https://docs.rs/delta_kernel_default_engine/0.30.1/delta_kernel_default_engine/struct.DefaultEngine.html[default engine], link:../../src/storage/formats/open/delta.rs[existing connector]
+
+A standalone compatibility test compiled Delta Kernel 0.30.1 with Arrow 60.1
+and object_store 0.14.2. It matched a delta-rs writer's four versions across an
+append, overwrite, checkpoint and subsequent append. With the JSON commits
+through the checkpoint removed from the fixture's log, versions 2 and 3
+still returned the expected values and version 0 failed to bind. This
+exercised the default local object store.
+
+The read-only pgwire registration uses `format='delta'`, `authority='external'`,
+a directory `external_location` and an explicit `delta_version`. The
+directory must be within the operator's local allowlist. Delta Kernel
+resolves the version, checks protocol features, replays checkpoints and
+builds file transforms. Directory handles confine log listing, Parquet and
+deletion-vector reads. File references cannot use remote or presigned URLs.
+The provider streams Arrow batches with one queued batch per scan partition
+and applies sparse deletion vectors to physical row positions. Positional
+Kernel transforms and literal partition-value insertions push projection
+into Parquet while preserving those positions. Other transforms apply
+projection to the logical output.
+Initial DV support
+covers inline and table-relative files. The local adapter caps both log
+directory entries and active data files at 16,384. Metadata or DV blobs
+read in full are capped at 16 MiB, and a DV may represent at most 1,048,576
+deleted rows. The reader relies on the producer's immutable data-file and
+transaction-log contract at the registered root.
+
+== Distribution and data engineering
+
+Keep planning lazy until required properties are known. A scan/filter/local aggregate can run as one pipeline. A large fact-to-fact join may need hash repartition on both sides. A small dimension may be broadcast only within each worker's reservation. Preserve hash function/version, key coercion, NULL semantics and partition count across exchange. Mark partial aggregation states with a merge-compatible type and version. Global ordering, DISTINCT and windows require their SQL distribution/order guarantees.
+
+The coordinator owns admission, tracks each input’s retention guarantee, renews available leases, and owns fragment attempts and the terminal outcome. Workers own cancellable split reads, bounded compute and staged exchange partitions. Use the same split and physical operator on one node without a network hop. Across nodes, negotiate protocol, Arrow schema and extension codecs. A node-local Layer A or WAL tail requires proven placement and retention for the full read, or a safe pinned alternative. Show the refusal reason in EXPLAIN if neither is available.
+
+Interactive work may pipeline exchanges and fail promptly on loss. Restartable batch work may checkpoint selected wide exchanges on durable storage. Record bytes and lifetimes for each choice. Fence stale attempts and deduplicate partition completions. After worker loss, retry only deterministic input ranges with valid leases. After coordinator loss, recover ownership and reconcile target commit status before acknowledging a write. A query that already streamed rows needs a resumable output cursor or an explicit client-visible failure. Never replay a partial result transparently. Cap retries and clean up leases, buffers and exchange files on timeout. Bound coordinator state with paged split assignment and test cancellation while a consumer stalls.
+
+For a backfill, the orchestrator submits an input manifest or version interval and stable run key. A bounded job reads CSV/Avro/JSON, conforms types, joins a pinned dimension and publishes partitioned output. Return row counts, rejected records under the selected error policy, input versions and output snapshot. For incremental loads persist the consumed offset with the commit, or reconcile it through the same receipt. Test duplicate delivery, late records, overlapping backfills, schema drift and restart after commit. Continuous streaming and watermark semantics need a separate contract.
+
+[[analytics-evidence]]
+== Acceptance experiments
+
+Release order lives in the link:../current/ROADMAP.adoc[roadmap]. TD-119 owns reader
+qualification and TD-OLAP-4 owns matched timing evidence.
+
+[cols="1,3,4",options="header"]
+|===
+| Gate | Experiment | Decision rule
+| Ledger integrity | Write the existing partial sidecar and final JSON to a verified writable path outside the worktree. Persist run identity, phase progress, actual rows/bytes per table and failure counters. Trace Q3/Q17/Q18/Q21 and sample batches across the full load. Break query latency into queue, plan, table open, scan, join/spill and delivery. Break load into generation, parse/bind, constraint checks, WAL append/sync, index/apply, acknowledgement and publish. | Explain the dominant critical path using timings and counters before changing it. Exercise the guard and q17 regression above. Cross-check known nonempty reference results. A timeout or declined query counts against coverage.
+| SQL provider parity | Keep the 22 H and 63 DS regression ledger. Qualify the full fixed-parameter 22 H and 99 DS query inventories separately through pgwire on DataFusion, using the same generated tables as typed NDJSON, direct Delta and Iceberg. Run the same cases over eligible native storage. Include mixed tables, ABAC, concurrent updates and a dataset beyond the MemTable cap. | Require independent typed results, including duplicates, ordering when specified and declared float tolerances. Record executed SQL hashes and explicit dialect adaptations, missing cases, failures, provider, pruning, spill, peak RSS and query tails. Default changes follow the existing P3 soak and rollback gate. link:../10-quality/TPC_PERF_LEDGER.adoc[Fixture and sweep]
+| Comparative performance | Compare ProximaDB with standalone DataFusion and DuckDB on identical files first. Compare Spark SQL and Trino on identical snapshots, hardware, worker counts and storage next. Pin versions, generators, parameters, layout, codecs, memory, concurrency and cache state. Separate warm repeats, process cold starts, local and object-store runs. Measure ingestion through first correct answer, isolated queries, mixed streams and backfill with interactive traffic. | Report per-query ratios, geometric mean on the common successful set, p95 over repeated runs, timeouts, throughput, bytes/requests and resource cost. Publish coverage beside ratios. The proposed local review target is within 1.25x of standalone DataFusion’s geometric mean on equivalent scans. Investigate each reproducible query over 2x and require value parity throughout. Ratify thresholds after measuring variance. An external competitiveness claim requires a named matched competitor and scope.
+| Reader and sink qualification | Run each format fixture above via the public entry point. Use TD-119 for managed Iceberg and qualified UniForm projections. Cover direct Delta and raw-file ingestion as those readers land. Exercise CTAS, partition overwrite and incremental replay on each advertised writable target. | Publish a read/write/feature/version matrix. Readers must agree on types and values. Kill the writer before commit and after commit before acknowledgement. Each successful run key produces exactly one visible target commit.
+| Scale and recovery | After a bounded load path exists, run faithful dbgen/dsdgen data at SF1 then SF10 on admitted hardware. Track query-template coverage separately from the synthetic subsets. Compare one and multiple workers on a scan, a skewed join and a restartable backfill. Inject lost workers, coordinator restart, stale policy, full spill disk, network delay and slow consumers. | Require stable result digests, bounded resource use, no duplicate effects and terminal outcomes within configured deadlines. Report speedup, efficiency, recovery delay and shuffle cost at fixed data size and at fixed bytes per worker. Adopt a distributed substrate only if it meets these gates.
+|===
+
+[[decisions]]
+== Design decisions and compatibility
+
+These decisions define the target for this RFC. Implementation status and release support continue to follow the tracker and the evidence gates above.
+
+[cols="2,3,3",options="header"]
+|===
+| Decision | Rationale and governing spec | Consequence for implementation
+| Use the shared SQL planner and DataFusion analytical operators. Qualify the native streaming provider first.
+| TPC sweeps confound the executor with the input layout. ADR-097 owns the logical IR and ADR-039 retains the adapter boundary. A second planner would duplicate type coercion, policy and freshness decisions.
+| Register sources through the existing SQL decision path. Compare pgwire and canonical SQL with the same principal, parameters, snapshot and physical inputs. The pgwire external Parquet integration test already exercises catalog registration, allowlisted location and SELECT. The separate facade strategy recognizes names by string and declines execution. Extend the catalog-backed path. link:../../tests/external_table_pgwire_e2e.rs[pgwire fixture], link:../../src/query/facade/strategies/external_table.rs[facade strategy], link:../12-design/adr/ADR-098-metadata-spine.adoc[ADR-098 D5]
+| Treat local DataFusion overhead and native-operator promotion as separate decisions.
+| The proposed 1.25x diagnostic compares equivalent local scans. ADR-054 already requires flag-gated native operators and parity-or-better workload evidence against DuckDB and standalone DataFusion at SF1 on the same object store, including ClickBench.
+| Use the local comparison to locate overhead. Keep the ADR-054 gate for promotion. A repeatable exact-result mismatch disqualifies the affected case regardless of the aggregate speedup. Shadow demotion thresholds govern rollout monitoring. link:../12-design/adr/ADR-054-native-execution-engine-progressive-cutover.adoc[ADR-054], link:../current/LAKEHOUSE_PLAN.adoc#native-execution-research[native research gates]
+| Qualify external Delta reads first. Keep the existing Iceberg publication owner for managed data.
+| The Delta log owns a Delta table's version. A managed WAL boundary, Iceberg snapshot ID and Delta version each have different visibility rules. A second writable head for one table makes recovery ambiguous.
+| Registering a Delta location grants read capability only after protocol qualification. First qualify an existing UniForm read projection alongside a Delta reference reader. Verify which Delta version it represents. Tables without a qualifying projection require the direct Delta reader. Direct all mutations to the one declared authority. A managed Delta target needs its own conflict, fencing and read-back decision before admission. link:../12-design/FORMAT_STRATEGY_ICEBERG_DELTA_LANCE_2026_06.adoc[format strategy]
+| Keep file decoding at the external source boundary.
+| ADR-098 D4 specifies Avro for Iceberg manifests and enumerates encodings for the internal metadata spine. Reading an upstream Avro data file requires a decoder. It introduces no new persisted ProximaDB metadata encoding.
+| CSV, JSON and Avro inputs yield typed batches with an explicit schema and conversion policy. WAL, PXCD, catalog and Iceberg metadata keep their specified encodings. Native segment membership uses LIST and directory/ETag validation. Iceberg membership uses the selected snapshot's manifests. The catalog stores pointers and summaries. link:../12-design/adr/ADR-098-metadata-spine.adoc[ADR-098 D1–D4]
+| Place a thin Ballista submission client and portable execution descriptions in OSS. Keep ProximaDB multi-node coordination in the commercial workspace.
+| The Ballista blueprint assigns submission to ProximaDB. ADR-084 assigns multi-node coordination to the commercial layer. A client addressing a configured scheduler performs neither membership nor placement.
+| OSS may submit an admitted plan and query status or request cancellation through an existing transport. The coordinating layer owns assignment, leader/attempt epochs, durable retry state, recovery and fleet policy. A client retry can look up the same submission ID. It cannot independently redispatch a fragment. Local and mock-remote contract tests run without a cluster dependency. link:../12-design/DATAFUSION_BALLISTA_DISTRIBUTED_EXECUTION_2026_06_05.adoc[Ballista blueprint], link:../12-design/adr/ADR-084-oss-commercial-placement-worm-and-distribution.adoc[ADR-084 D2]
+|===
+
+[[iceberg-delta-compatibility]]
+== Which Iceberg and Delta versions interoperate?
+
+Specification and tagged-source review, 2026-11-21. Iceberg format version, Delta library release, Delta minimum reader/writer protocols and Delta compatibility feature are independent numbers. No released pair reviewed defines a common transaction log, table head or commit protocol. An Iceberg reader follows a table metadata pointer to snapshots and manifests. A Delta reader reconstructs a version from its log actions and available checkpoints, using the catalog where the protocol requires it. An Iceberg REST endpoint can serve the former view of a Delta table if the producer has published it. https://iceberg.apache.org/spec/[Iceberg specification], https://iceberg.apache.org/rest-catalog-spec/[Iceberg REST specification], https://github.com/delta-io/delta/blob/v4.4.1/PROTOCOL.md[Delta 4.4.1 protocol]
+
+[cols="2,2,4",options="header"]
+|===
+| Producer or feature | Iceberg read surface | Evidence and limits
+| Delta 3.0.0 introduced IcebergCompatV1. Delta 3.1.0 introduced IcebergCompatV2.
+| The reference Spark converter maps *both* features to Iceberg format v2. Read the format-version in the published metadata.
+| Both are writer features for convertible data. Column mapping and writer protocol 7 are required. Reader protocol 2, or 3 with column mapping declared, handles the mapping. V1 forbids DV feature support. V2 forbids active DVs. Readers need generated Iceberg metadata. V2 improves nested field identification. https://docs.delta.io/versioning/[Feature introduction versions], https://github.com/delta-io/delta/blob/v4.4.1/PROTOCOL.md#iceberg-compatibility-v2[Delta writer requirements], https://github.com/delta-io/delta/blob/v4.4.1/spark/src/main/scala/org/apache/spark/sql/delta/IcebergCompat.scala[version mapping]
+| OSS Delta Kernel 4.1.0 has V3 feature tests. Delta Spark 4.3.0 explicitly maps IcebergCompatV3 to Iceberg format v3.
+| Generated v3 metadata for enabled tables. The 4.3 release uses Iceberg-Spark 1.11.0 for UniForm. This is a producer dependency, not a reader minimum.
+| The V3 requirements are in a separate RFC in the 4.4.1 tag. They require column mapping and row tracking and permit deletion vectors. The tagged converter handles on-disk DVs with offsets and rejects inline DVs in that conversion path. The 4.3 release adds atomic conversion on bulk-commit paths and incremental conversion. Verify the represented version for the actual deployment. https://github.com/delta-io/delta/blob/v4.1.0/kernel/kernel-defaults/src/test/scala/io/delta/kernel/defaults/DeltaIcebergCompatV3Suite.scala[Kernel tests], https://github.com/delta-io/delta/blob/v4.3.0/spark/src/main/scala/org/apache/spark/sql/delta/IcebergCompat.scala[Spark mapping], https://github.com/delta-io/delta/blob/v4.4.1/protocol_rfcs/iceberg-compat-v3.md[V3 RFC], https://github.com/delta-io/delta/blob/v4.4.1/iceberg/src/main/scala/org/apache/spark/sql/delta/icebergShaded/DeltaToIcebergConvert.scala[converter], https://github.com/delta-io/delta/releases/tag/v4.3.0[release notes]
+| Databricks Runtime 18 LTS and later, Unity Catalog managed Delta with Iceberg reads enabled
+| Documented Iceberg v3 read projection, including deletion vectors when enabled.
+| This is a product-specific producer contract. UniForm documents read-only Iceberg access. In the reverse direction a service can publish Delta-readable metadata for managed Iceberg tables, for example through Databricks Compatibility Mode. Each view has its own refresh and access contract. https://docs.databricks.com/aws/en/iceberg/iceberg-v3[managed v3 requirements], https://docs.delta.io/delta-uniform/[UniForm read and version rules], https://docs.databricks.com/gcp/en/external-access/compatibility-mode[Compatibility Mode]
+|===
+
+*The shared bytes.* Eligible views can reference the same Parquet objects. For a portable on-disk deletion vector, Iceberg's Puffin blob uses the Delta-compatible length, magic, Roaring bitmap and checksum framing. The table metadata still determines which data file, byte range and snapshot the deletes apply to. The Delta converter records that reference in an Iceberg manifest. Our existing reader fetches exactly the declared blob range and checks cardinality. This is a concrete reuse opportunity, subject to a cross-produced fixture. https://iceberg.apache.org/puffin-spec/#deletion-vector-v1-blob-type[Puffin blob specification], https://github.com/delta-io/delta/blob/v4.4.1/PROTOCOL.md#deletion-vector-file-storage-format[Delta framing], link:../../crates/storage/proximadb-iceberg-engine/src/snapshot_deletes.rs[ProximaDB range reader]
+
+*Future convergence.* Delta's adaptiveMetadata RFC proposes using Iceberg v4 structures for content metadata. Its compatibility section explicitly leaves Iceberg reader/writer access to a separate feature. Reopen the authority decision only when a released specification and independent implementations demonstrate cross-client conflicting commits, retry, snapshot expiry and cleanup against one head. https://github.com/delta-io/delta/blob/v4.4.1/protocol_rfcs/iceberg-v4-metadata.md#compatibility-notes[Adaptive metadata RFC]
+
+*First execution experiment.* Use the existing Iceberg/Parquet scan path for two independently produced fixtures: a V2 projection and a V3 projection with a nonempty on-disk DV. Pin the Delta source version and the corresponding Iceberg snapshot using producer-recorded mapping (for the documented UniForm path, converted_delta_version). Snapshot IDs and commit timestamps cannot substitute for that mapping. Compare exact typed rows, including a renamed field and a row deleted between versions, with a Delta reference reader. Require a stale projection to decline a latest-version request when freshness cannot be established. Cover a plain Delta table without a projection and an unsupported feature as negative cases. Then hold the DataFusion compute plan, visible rows, Parquet objects, storage and cache state fixed. Report cold metadata requests and open latency, scan bytes, DV application, and end-to-end query latency independently. Shared files avoid a copy in the eligible case. Their presence establishes no TPC speedup. https://docs.delta.io/delta-uniform/[UniForm version correspondence]
+
+[[binding]]
+== What crosses the planner and worker boundary
+
+The fields below specify information that must survive a handoff. Extend the existing route, split and write contracts where they already carry it. Keep EXPLAIN redacted and descriptive. An explanation has no power to authorize a read.
+
+[cols="2,3,3",options="header"]
+|===
+| Handoff | Required information | Failure or compatibility rule
+| Bind each relation once per statement | Catalog table ID and incarnation, authority mode, source version, schema and field mapping, requested freshness, explicit identity and policy generation. For a managed fresh read include the evidenced publication/WAL boundary. Repeated references and self-joins share the binding. | Native transactional reads retain their existing isolation promise. A federated statement binds a repeatable version per input. Expose the selected versions. Reject requests for a common atomic cut across independently versioned authorities unless an authority can establish one. Imported snapshots retain their recorded import boundary. link:../../src/query/read_route.rs[ReadFreshnessSla and ReadPolicyBoundary]
+| Produce splits | Bind each split to the source version, partition transform, deletes and policy context. Distinguish the file's total size from a split's length. Carry an immutable version or a backend-enforced conditional-read validator through every range fetch. | Older local splits lacking these fields use the existing local path when eligible. Remote replay requires a verifiable binding. Test a same-name replacement between footer and data reads and a duplicate split delivery. link:../../crates/storage/proximadb-storage-common/src/format_splits.rs[FileSplit]
+| Dispatch and return batches | Bind plan version, required operator/extension codecs, Arrow schema including decimal/timezone metadata, hash partition contract, query/attempt ID, input handles, budget and deadline. The worker authenticates and validates compatibility before opening inputs. | Reject unknown required features before any output or side effect. Optional hints may be ignored with an explanation. Keep credentials out of serialized plans and EXPLAIN. Compare local and remote results with shuffled split order, null join keys and mixed worker versions.
+| Recover an attempt | Reuse the bound inputs, session semantics, parameters and deterministic expression state. Freeze statement-stable values at bind. Classify volatile functions, external side effects and unordered LIMIT before admitting automatic replay. | Recompute deterministic fragments behind an unconsumed exchange. For a non-repeatable fragment require persisted winning output for replay or surface a failure. A policy generation change invalidates old grants and cached intermediates for release. Reauthorize before any resumed read or publication. A worker unable to establish the required policy boundary is ineligible.
+|===
+
+*Backfill expiry decision (owner-confirmed).* Managed Iceberg currently retains a clock-free generation window for data and metadata (default three). Binding a version identifies data but does not extend that window. For the first release, confirmed expiry of any still-required input version before publication ends the job with a terminal snapshot-expired outcome. Report the source and version to the authorized caller. Preserve the same terminal result on same-key retry and reclaim uncommitted staged output after reachability checks. The caller can start a new run with a new key and newly bound versions. A transient read error requires retry or an I/O failure. If publication was attempted, reconcile its outcome first so input expiry cannot mask an already committed write. A completion guarantee across source expiry requires either an enforceable upstream retention agreement or a fully staged, verified input manifest with all referenced data and deletes under job-owned retention. A list of URIs is insufficient. Pause a backfill mid-scan, advance one source beyond its retention window and resume. Assert that the target head stays fixed, same-key retry reproduces expiry and a new-key run reports its own input versions and result. Repeat with a lost target commit response to verify that committed work returns its receipt. link:../10-quality/td/TD-GCRETAIN-1-dv-generation-gc-keeps-two-generations-and-a-pinned-reader-loses-files-mid-scan.adoc[generation retention], link:../10-quality/td/TD-SPINE-3-iceberg-metadata-gc.adoc[metadata GC]
+
+*Visibility example.* An owner commits an explicit tombstone after the last Iceberg publication. A fresh query can use Layer A or a proven merge against the WAL boundary. A remote worker holding only that older publication must decline the fresh placement. An explicitly requested historical snapshot may still contain the row. Test the same race with a deletion vector and a catalog flip delayed after commit. Preserve the fence's existing refusal for an unordered delta. Its current guarantee covers explicit tombstones, and a caller requiring exact TTL visibility needs a provider that can prove it. link:../12-design/PUBLICATION_WAL_VISIBILITY_FENCE_2026_10_27.adoc[publication/WAL fence]
+
+[[retryable-writes]]
+== Outcome of a retryable batch write
+
+The first sink to qualify is a single managed target. Use pgwire as the SQL-write authority and the existing table-write and publication paths. A job API can observe and cancel authorized work when it exists. The design requires a persisted recovery record before promising retries across process loss. Neither a successful flush nor a planned route is a commit receipt. link:../current/PLATFORM_PLAN.adoc#embedded-cloud-lifecycle[platform lifecycle]
+
+Scope the caller's run key to tenant and target incarnation. Bind it to the logical operation, normalized parameters, source versions, target precondition, schema and session semantics. Physical replanning and attempt numbers do not change that identity. Concurrent submissions of the same key and digest join the existing outcome. A different digest conflicts. Keep a durable target-side commit identifier or atomically recoverable association to the run key through the advertised retry window, even when snapshot metadata ages out. After that window a replay must return an explicit expiry under the key-reuse policy. Blind execution of an old key can duplicate a successful append.
+
+[cols="2,3,3",options="header"]
+|===
+| Observable state | Recovery action | Acceptance case
+| Staged, with positive evidence that publication did not land | The fenced owner may resume or abort. Clean only proven unreachable artifacts after accounting for competing attempts. | Kill one of two attempts after writing its files. Exactly one winning file set is visible.
+| Commit outcome unknown | Return pending reconciliation, preserve the staged objects and query the authoritative history using the commit identity. Lost acknowledgement or a failed metadata read alone cannot authorize a second append. | Drop the commit response and temporarily deny the metadata read. A same-key retry produces one effect after recovery.
+| Snapshot committed, catalog layout behind | Record the landed snapshot. Complete or reconcile the forward-only catalog update under the publication fence. Expose the intermediate state to status callers and withhold job-complete acknowledgement until its promised visibility holds. | Restart after Iceberg CAS and before catalog flip. A newer valid tip stays ahead, affected fresh reads agree or refuse, and retry does not append rows again.
+| Completed, or cancelled racing with commit | Completed returns the same authorized receipt with target ID, snapshot, counts and input digest. Cancellation can abort before commit. If publication won the race, report its committed outcome. | Lose the final response, revoke access, then retry from another process. Recheck authorization before disclosing the receipt. A failed access check cannot trigger another write.
+|===
+
+The current publisher already distinguishes landed, not landed and unknown. Its proof is scoped to the existing MATERIALIZE operation. A durable backfill receipt additionally needs cross-process run identity and the retention rule above. Arbitrary opaque keys require a durable deduplication marker after the full receipt expires. An alternative is an issued, expiring run identity whose expiry can still be verified after collection. Pick one before allowing deletion of replay evidence. For ingestion from offsets, advance the source checkpoint only after recovering the matching target commit. Initially scope this guarantee to one target. Multi-target atomic publication requires a separate transaction contract. link:../../src/services/dml/materialize_stream.rs[commit reconciliation], link:../10-quality/td/TD-SPINE-3-iceberg-metadata-gc.adoc[catalog flip failure behavior]

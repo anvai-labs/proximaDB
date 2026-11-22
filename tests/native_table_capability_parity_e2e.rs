@@ -233,6 +233,36 @@ async fn body() {
         "LAG deltas must be the real previous-row differences (20-5, 12-20, 40-12)"
     );
 
+    client
+        .batch_execute(
+            "CREATE TABLE native_stats (grp INT, quantity INT);
+             INSERT INTO native_stats (grp, quantity) VALUES (1, 2), (1, 4), (1, NULL), (2, 7);",
+        )
+        .await
+        .expect("seed statistical aggregate fixture");
+    let messages = client
+        .simple_query(
+            "SELECT grp, count(quantity), stddev_samp(quantity) / avg(quantity) AS cv
+             FROM native_stats GROUP BY grp ORDER BY grp",
+        )
+        .await
+        .expect("DataFusion should serve the q17 aggregate shape on an unmaterialized table");
+    let rows: Vec<_> = messages
+        .iter()
+        .filter_map(|message| match message {
+            tokio_postgres::SimpleQueryMessage::Row(row) => Some(row),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].get(0), Some("1"));
+    assert_eq!(rows[0].get(1), Some("2"));
+    let cv: f64 = rows[0].get(2).unwrap().parse().unwrap();
+    assert!((cv - 2.0_f64.sqrt() / 3.0).abs() < 1e-12, "{cv}");
+    assert_eq!(rows[1].get(0), Some("2"));
+    assert_eq!(rows[1].get(1), Some("1"));
+    assert_eq!(rows[1].get(2), None, "sample stddev of one value is NULL");
+
     // SAFETY: restore the default so the process leaves no gate set.
     unsafe { std::env::remove_var("PROXIMADB_NATIVE_TABLE_PROVIDER") };
 }

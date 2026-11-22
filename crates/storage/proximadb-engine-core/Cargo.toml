@@ -49,8 +49,8 @@ bytemuck = { version = "1.14", features = ["derive"] }
 arrow-schema.workspace = true
 arrow.workspace = true
 arrow-array.workspace = true
-arrow-buffer = { version = "59", default-features = false }
-arrow-select = { version = "59", default-features = false }
+arrow-buffer = { version = "60.1.0", default-features = false }
+arrow-select = { version = "60.1.0", default-features = false }
 memmap2 = "0.9"
 parquet.workspace = true
 bytes = "1.5"

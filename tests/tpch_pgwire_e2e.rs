@@ -125,23 +125,8 @@ fn tpch_queries() -> Vec<(&'static str, String)> {
     ]
 }
 
-/// Stack-size-boosted test runner: the default 2 MB tokio worker stack overflows
-/// on TPC-H's deeply nested multi-join + subquery plans (Q2, Q7). Boosting to
-/// 8 MB lets the planner complete without masking the real issue (unbounded
-/// recursion — a separate bug to fix). This lets us collect the FULL conformance
-/// posture (all 22 queries) with native ON.
-#[test]
-fn tpch_pgwire_conformance() {
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(4)
-        .thread_stack_size(8 * 1024 * 1024) // 8 MB — handles deep plan recursion
-        .enable_all()
-        .build()
-        .expect("tokio runtime");
-    rt.block_on(tpch_pgwire_conformance_inner());
-}
-
-async fn tpch_pgwire_conformance_inner() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tpch_pgwire_conformance() {
     let server = TestPgServer::start().await.expect("server start");
     let (client, conn) = tokio_postgres::connect(&server.conn_str(), tokio_postgres::NoTls)
         .await

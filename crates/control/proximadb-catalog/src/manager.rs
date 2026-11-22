@@ -796,6 +796,26 @@ impl CatalogManager {
         fqn: &str,
         tenant: Option<&str>,
     ) -> Result<(Arc<dyn Catalog>, TableIdentifier)> {
+        self.resolve_table_scoped_with_case_fold(fqn, tenant, ident_case_fold_env_enabled())
+            .await
+    }
+
+    /// Resolve an already canonicalized SQL identifier without a case-fold fallback.
+    pub async fn resolve_table_scoped_exact(
+        &self,
+        fqn: &str,
+        tenant: Option<&str>,
+    ) -> Result<(Arc<dyn Catalog>, TableIdentifier)> {
+        self.resolve_table_scoped_with_case_fold(fqn, tenant, false)
+            .await
+    }
+
+    async fn resolve_table_scoped_with_case_fold(
+        &self,
+        fqn: &str,
+        tenant: Option<&str>,
+        case_fold_on_miss: bool,
+    ) -> Result<(Arc<dyn Catalog>, TableIdentifier)> {
         // Structural system-catalog isolation (validate input first): the tenant
         // id becomes `namespace[0]`, so a tenant must never shadow a reserved
         // control-plane / per-tenant system subtree. Those are the
@@ -834,7 +854,7 @@ impl CatalogManager {
         // TD-OLAP-18 fold-on-miss (see doc comment). `table_exists` is a
         // CatalogCache hit on every path that would succeed exactly, so the
         // common case pays one cached lookup, not a listing.
-        if ident_case_fold_env_enabled() && !catalog.table_exists(&id).await.unwrap_or(false) {
+        if case_fold_on_miss && !catalog.table_exists(&id).await.unwrap_or(false) {
             let candidates: Vec<TableIdentifier> = catalog
                 .list_tables(&id.namespace)
                 .await

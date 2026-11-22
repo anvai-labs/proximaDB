@@ -161,6 +161,95 @@ async fn a_snapshot_with_deletion_vectors_reads_back_with_them() {
 }
 
 #[tokio::test]
+async fn pinned_producer_metadata_is_independent_of_the_managed_tip() {
+    let b = bridge().with_root_url("memory://warehouse");
+    let a = part(&b, "t/data/a.parquet", &[10, 11]).await;
+    let deletion = deletes(&[1]);
+    let dv = b
+        .write_deletion_vectors(&Path::from("t/data/dv.puffin"), &[(a.clone(), &deletion)])
+        .await
+        .unwrap();
+    let version = publish(&b, std::slice::from_ref(&a), &dv, None, 7)
+        .await
+        .unwrap();
+    let committer = metadata::MetadataCommitter::new(b.store.clone(), META);
+    let mut doc: serde_json::Value =
+        serde_json::from_slice(&committer.read_metadata(version).await.unwrap()).unwrap();
+    doc["table-uuid"] = serde_json::json!("eeff0011-2233-4455-6677-8899aabbccdd");
+    doc["location"] = serde_json::json!(b.object_uri("t"));
+    doc["properties"]["converted_delta_version"] = serde_json::json!("42");
+    let key = Path::from("t/metadata/00000-producer.metadata.json");
+    b.store
+        .put(&key, Bytes::from(serde_json::to_vec(&doc).unwrap()))
+        .await
+        .unwrap();
+    let metadata_uri = b.object_uri(key.as_ref());
+    let table = Path::from("t");
+
+    let newer = part(&b, "t/data/newer.parquet", &[20]).await;
+    publish(&b, &[newer], &[], Some(version), 8).await.unwrap();
+    let pinned = b
+        .read_pinned_iceberg_snapshot(&table, &metadata_uri, Some(42))
+        .await
+        .unwrap();
+    assert_eq!(pinned.snapshot_id, 7);
+    assert_eq!(
+        pinned.table_uuid.to_string(),
+        "eeff0011-2233-4455-6677-8899aabbccdd"
+    );
+    assert_eq!(pinned.format_version, 3);
+    assert_eq!(pinned.converted_delta_version, Some(42));
+    assert_eq!(pinned.plan.files.data_files, vec![a]);
+    assert_eq!(pinned.plan.fields[0].id, 1);
+    let [vector] = pinned.plan.files.deletion_vectors.as_slice() else {
+        panic!("expected one deletion vector");
+    };
+    assert_eq!(
+        b.read_deletion_vector(vector).await.unwrap().positions(),
+        deletion.positions()
+    );
+
+    for (case, bad_list) in [
+        "memory://warehouse/t-other/snap.avro",
+        "memory://warehouse/t/../t-other/snap.avro",
+        "memory://warehouse/t/%2e%2e/snap.avro",
+        "memory://another/t/snap.avro",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        doc["snapshots"][0]["manifest-list"] = serde_json::json!(bad_list);
+        let malformed_key = Path::from(format!("t/metadata/case-{case}.metadata.json"));
+        b.store
+            .put(
+                &malformed_key,
+                Bytes::from(serde_json::to_vec(&doc).unwrap()),
+            )
+            .await
+            .unwrap();
+        let metadata_uri = b.object_uri(malformed_key.as_ref());
+        let err = b
+            .read_pinned_iceberg_snapshot(&table, &metadata_uri, Some(43))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("expected UniForm Delta version 43"),
+            "{err}"
+        );
+        let err = b
+            .read_pinned_iceberg_snapshot(&table, &metadata_uri, Some(42))
+            .await
+            .unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("unsupported Iceberg URI") || message.contains("pinned Iceberg key"),
+            "{err}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn a_snapshot_without_deletes_reads_as_before() {
     let b = bridge();
     let a = part(&b, "t/data/a.parquet", &[1, 2]).await;
@@ -349,17 +438,18 @@ async fn carried_deletion_vectors_survive_a_successor_publication() {
 /// gated on lineage + reader compatibility + external delete read-back).
 #[tokio::test]
 async fn a_v2_table_stays_v2_without_an_explicit_upgrade() {
-    use proximadb_storage_common::object_store_bridge::ObjectStoreBridge as _;
-
-    let b = bridge();
+    let b = bridge().with_root_url("memory://warehouse");
+    let table = Path::from("t");
+    let location = b.object_uri(table.as_ref());
+    let uuid = "eeff0011-2233-4455-6677-8899aabbccdd";
     let a = part(&b, "t/data/a.parquet", &[1, 2]).await;
     let v1 = b
         .publish_iceberg_files(
             std::slice::from_ref(&a),
             None,
             META,
-            "uuid-v2",
-            "memory:///t",
+            uuid,
+            &location,
             &fields(),
             21,
             1_700_000_000_000,
@@ -372,8 +462,8 @@ async fn a_v2_table_stays_v2_without_an_explicit_upgrade() {
             std::slice::from_ref(&a),
             Some(v1),
             META,
-            "uuid-v2",
-            "memory:///t",
+            uuid,
+            &location,
             &fields(),
             22,
             1_700_000_000_001,
@@ -389,6 +479,25 @@ async fn a_v2_table_stays_v2_without_an_explicit_upgrade() {
             "v2 stays v2 without an explicit upgrade (v{version})"
         );
     }
+    let uri = b.metadata_file_uri(META, v1);
+    let pinned = b
+        .read_pinned_iceberg_snapshot(&table, &uri, None)
+        .await
+        .unwrap();
+    assert_eq!(pinned.format_version, 2);
+    assert_eq!(pinned.snapshot_id, 21);
+    assert_eq!(pinned.plan.files.data_files, vec![a]);
+    assert!(pinned.plan.files.deletion_vectors.is_empty());
+    assert!(pinned.converted_delta_version.is_none());
+    let err = b
+        .read_pinned_iceberg_snapshot(&table, &uri, Some(42))
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("expected UniForm Delta version 42"),
+        "{err}"
+    );
 }
 
 /// TD-USUB-10 3c rung 1: a **v2 parent** that carries deletion vectors into its
@@ -802,4 +911,236 @@ async fn the_deletion_vector_seam_round_trips_positions() {
         assert_eq!(vector.cardinality, want.len() as u64);
         assert_eq!(vector.puffin_file, Path::from("t/data/dv-mat-seam.puffin"));
     }
+}
+
+#[tokio::test]
+async fn pinned_reader_projects_field_ids_and_applies_physical_deletes() {
+    use arrow_array::{Array, Int32Array, Int64Array, RecordBatch, StringArray};
+    use arrow_schema::{DataType, Field, Schema};
+    use futures::TryStreamExt;
+    use parquet::arrow::{ArrowWriter, PARQUET_FIELD_ID_META_KEY};
+
+    let b = bridge().with_root_url("memory://warehouse");
+    let table = Path::from("t");
+    let old = Path::from("t/data/old.parquet");
+    let current = Path::from("t/data/current.parquet");
+    let no_ids = Path::from("t/data/without-ids.parquet");
+    let field = |name, data_type, id: i32| {
+        Field::new(name, data_type, false)
+            .with_metadata([(PARQUET_FIELD_ID_META_KEY.to_string(), id.to_string())])
+    };
+    let old_file = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            field("old_name", DataType::Int32, 7),
+            // The current name has been reused for a different field ID.
+            field("value", DataType::Utf8, 9),
+        ])),
+        vec![
+            Arc::new(Int32Array::from(vec![10, 11, 12])),
+            Arc::new(StringArray::from(vec!["old-a", "deleted", "old-c"])),
+        ],
+    )
+    .unwrap();
+    let new_file = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            field("extra", DataType::Int64, 12),
+            field("label", DataType::Utf8, 9),
+            field("value", DataType::Int64, 7),
+        ])),
+        vec![
+            Arc::new(Int64Array::from(vec![100])),
+            Arc::new(StringArray::from(vec!["current"])),
+            Arc::new(Int64Array::from(vec![20])),
+        ],
+    )
+    .unwrap();
+    let file_without_ids = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            false,
+        )])),
+        vec![Arc::new(Int64Array::from(vec![99]))],
+    )
+    .unwrap();
+    for (path, batch) in [
+        (&old, old_file),
+        (&current, new_file),
+        (&no_ids, file_without_ids),
+    ] {
+        let mut bytes = Vec::new();
+        let mut writer = ArrowWriter::try_new(&mut bytes, batch.schema(), None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        b.store.put(path, Bytes::from(bytes)).await.unwrap();
+    }
+
+    let dv = b
+        .write_deletion_vectors(
+            &Path::from("t/data/filter.puffin"),
+            &[(old.clone(), &deletes(&[1]))],
+        )
+        .await
+        .unwrap();
+    let version = publish(&b, &[old, current], &dv, None, 7).await.unwrap();
+    let committer = metadata::MetadataCommitter::new(b.store.clone(), META);
+    let mut doc: serde_json::Value =
+        serde_json::from_slice(&committer.read_metadata(version).await.unwrap()).unwrap();
+    doc["table-uuid"] = serde_json::json!("eeff0011-2233-4455-6677-8899aabbccdd");
+    doc["location"] = serde_json::json!(b.object_uri("t"));
+    doc["schemas"][0]["fields"] = serde_json::json!([
+        {"id": 9, "name": "label", "type": "string", "required": true},
+        {"id": 12, "name": "extra", "type": "long", "required": false},
+        {"id": 7, "name": "value", "type": "long", "required": true},
+    ]);
+    let key = Path::from("t/metadata/00007-producer.metadata.json");
+    b.store
+        .put(&key, Bytes::from(serde_json::to_vec(&doc).unwrap()))
+        .await
+        .unwrap();
+    let reader = b
+        .open_pinned_iceberg_reader(&table, &b.object_uri(key.as_ref()), None)
+        .await
+        .unwrap();
+    let batches: Vec<_> = reader
+        .scan(Some(&[2, 0, 1]), 1)
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    let mut rows = Vec::new();
+    for batch in &batches {
+        assert_eq!(batch.schema().field(0).name(), "value");
+        let values = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let labels = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let extra = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        rows.extend((0..batch.num_rows()).map(|i| {
+            (
+                values.value(i),
+                labels.value(i),
+                (!extra.is_null(i)).then(|| extra.value(i)),
+            )
+        }));
+    }
+    rows.sort_unstable();
+    assert_eq!(
+        rows,
+        vec![
+            (10, "old-a", None),
+            (12, "old-c", None),
+            (20, "current", Some(100))
+        ]
+    );
+    let count_batches: Vec<_> = reader
+        .scan(Some(&[]), 1)
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    assert!(count_batches.iter().all(|batch| batch.num_columns() == 0));
+    assert_eq!(
+        count_batches
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum::<usize>(),
+        3
+    );
+
+    // An older file cannot stand in for an omitted partition value or default.
+    for (name, column_override) in [
+        ("default", serde_json::json!({"initial-default": 50})),
+        ("required", serde_json::json!({"required": true})),
+    ] {
+        let mut unsupported = doc.clone();
+        unsupported["schemas"][0]["fields"][1]
+            .as_object_mut()
+            .unwrap()
+            .extend(column_override.as_object().unwrap().clone());
+        let key = Path::from(format!("t/metadata/{name}.metadata.json"));
+        b.store
+            .put(&key, Bytes::from(serde_json::to_vec(&unsupported).unwrap()))
+            .await
+            .unwrap();
+        let reader = b
+            .open_pinned_iceberg_reader(&table, &b.object_uri(key.as_ref()), None)
+            .await
+            .unwrap();
+        let err = reader
+            .scan(None, 2)
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("missing field ID 12 requires a value"),
+            "{err}"
+        );
+    }
+
+    let mut identity_partitioned = doc.clone();
+    identity_partitioned["partition-specs"][0]["fields"] = serde_json::json!([
+        {"source-id": 12, "field-id": 1000, "name": "extra", "transform": "identity"}
+    ]);
+    let key = Path::from("t/metadata/identity.metadata.json");
+    b.store
+        .put(
+            &key,
+            Bytes::from(serde_json::to_vec(&identity_partitioned).unwrap()),
+        )
+        .await
+        .unwrap();
+    let reader = b
+        .open_pinned_iceberg_reader(&table, &b.object_uri(key.as_ref()), None)
+        .await
+        .unwrap();
+    let err = reader
+        .scan(None, 2)
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("missing field ID 12 requires a value"),
+        "{err}"
+    );
+
+    let bad_version = publish(&b, &[no_ids], &[], Some(version), 8).await.unwrap();
+    let bad: serde_json::Value =
+        serde_json::from_slice(&committer.read_metadata(bad_version).await.unwrap()).unwrap();
+    doc["snapshots"] = bad["snapshots"].clone();
+    doc["current-snapshot-id"] = bad["current-snapshot-id"].clone();
+    let key = Path::from("t/metadata/no-ids.metadata.json");
+    b.store
+        .put(&key, Bytes::from(serde_json::to_vec(&doc).unwrap()))
+        .await
+        .unwrap();
+    let reader = b
+        .open_pinned_iceberg_reader(&table, &b.object_uri(key.as_ref()), None)
+        .await
+        .unwrap();
+    let err = reader
+        .scan(None, 2)
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("Parquet column value has no field ID"),
+        "{err}"
+    );
 }

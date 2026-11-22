@@ -3460,7 +3460,6 @@ self.try_pax_cascade(
 
     /// Parse storage URL to extract base URL and collection ID
     #[allow(dead_code)]
-    #[allow(dead_code)]
     fn parse_storage_url(&self, storage_url: &str) -> Result<(String, String)> {
         // Fallback: assume storage_url is base_url/collection_id format
         if let Some(last_slash) = storage_url.rfind('/') {
