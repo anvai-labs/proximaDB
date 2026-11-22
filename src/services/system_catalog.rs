@@ -3673,20 +3673,23 @@ mod tests {
 
     /// Guard that sets an env gate for one test and restores the prior value
     /// (or removes it) on drop — `#[serial]` keeps concurrent tests from
-    /// observing the mutation.
+    /// observing the mutation. Env-var writes require `unsafe` in edition
+    /// 2024 (concurrent reads could observe a partial write); the guard's
+    /// callers are `#[serial]` single-threaded tests, so the pre-condition
+    /// holds — the same pattern as `primary_pod_registry`'s pod-id slot.
     struct EnvGuard(&'static str, Option<String>);
     impl EnvGuard {
         fn set(name: &'static str, value: &str) -> Self {
             let prior = std::env::var(name).ok();
-            std::env::set_var(name, value);
+            unsafe { std::env::set_var(name, value) };
             Self(name, prior)
         }
     }
     impl Drop for EnvGuard {
         fn drop(&mut self) {
             match self.1.take() {
-                Some(value) => std::env::set_var(self.0, value),
-                None => std::env::remove_var(self.0),
+                Some(value) => unsafe { std::env::set_var(self.0, value) },
+                None => unsafe { std::env::remove_var(self.0) },
             }
         }
     }
