@@ -266,3 +266,64 @@ checkout — functionally safe, preserve if deemed semantic.
   fold's first-attempt record (the fold's two genuine defects — checkout
   before local composite, undeclared input — were caught by guards on
   earlier runs of this same PR and fixed pre-merge).
+
+=== Enterprise catalog build review (2026-11-22)
+
+Three successful jobs spent 8m58s–14m13s checking root test targets,
+21m59s–25m36s building the linked root unit-test binary, and
+5m03s–5m48s in enterprise Clippy. The 258–262 selected catalog tests
+executed in 0.44–0.78 seconds. The enterprise gate covers different
+contracts in its three steps. The wide check includes eligible integration
+targets (239 at the reviewed head), the filtered run exercises the actual
+serving contract, and Clippy runs its lint driver. All three already
+share one runner and one Cargo target directory.
+link:https://github.com/anvai-labs/proximaDB/actions/runs/44911190081/job/136867576144[Warm job],
+link:https://github.com/anvai-labs/proximaDB/actions/runs/44833310990/job/136623878109[second warm job], and
+link:https://github.com/anvai-labs/proximaDB/actions/runs/44790112122/job/136475929059[cold job].
+
+On PR #2562, attempt 1 passed its check in 7m42s and then lost its runner
+66m20s into the combined build/run step. The runner supplied no job log.
+Two attempts of another PR that day reported the same GitHub communication
+error. The initial evidence establishes where the time went on successful
+runs and where the failed runner was last seen. Its peak RSS, swap usage,
+last compiler process and cause of death are unknown. On the same PR head,
+the default-feature unit job used one Cargo build job, built in 33m30s and
+ran 7,090 tests in 121s. Its features and cache differ from enterprise.
+link:https://github.com/anvai-labs/proximaDB/actions/runs/45030315199/job/137232860664[Enterprise attempt 1],
+link:https://github.com/anvai-labs/proximaDB/actions/runs/44991252452/job/137131221523[another runner loss], and
+link:https://github.com/anvai-labs/proximaDB/actions/runs/45030315199/job/137232861384[same-head unit job].
+
+. *First trial.* Cap Cargo at one job for building and serving the test
+  binary. Leave the broad check, Clippy and coverage intact. Separate the
+  build and execution timestamps on the same runner. Compare fresh and
+  warm runs under one and two compiler jobs before raising the limit.
+  GNU time reports maximum process RSS. The VM samples report host free
+  memory, paging and swap. Readable v2 cgroup counters before and after
+  the build report that group's high-water marks and pressure. A group
+  can include earlier steps or other processes. Runner loss can prevent
+  log upload.
+. *Reuse dependencies where it pays.* The enterprise job restores the
+  read-only `check` shape. A check produces metadata and codegen still
+  has to produce a linkable test executable. Two check-cache hits logged
+  667 Cargo compilation lines during the build, compared with 670 on a
+  miss. Compare `check` and `dev-test` on the same SHA, with restore time,
+  total compile, lint and runner-minutes. A shared cache key or a job
+  dependency alone cannot deliver a specific binary.
+  link:https://doc.rust-lang.org/cargo/commands/cargo-check.html[Cargo check semantics].
+. *Archive only for compatible consumers.* For integration suites that
+  share a binary, pilot one nextest archive per exact tree, lockfile,
+  toolchain, target, features, build profile and flags. Match runtime
+  libraries, fixtures and executed test IDs. Include packing, transfer,
+  restore and added critical-path waits in the comparison. The current
+  enterprise executable has one subsecond consumer. Run it beside the
+  producer. Default and enterprise builds exercise different feature
+  behavior and require distinct evidence.
+  link:https://nexte.st/docs/ci-features/archiving/[Nextest archives].
+. *Reduce the link input.* Candidate refactor: run catalog implementation
+  tests in `proximadb-catalog` with the Unity, Polaris and Delta features.
+  Move the production REST mount, authorization and failure cases to a
+  focused root integration target. Demonstrate executed test-ID and
+  behavior parity, including feature-disabled cases, before retiring
+  any root-harness coverage. Compare largest process RSS and whole-job
+  memory high-water marks because one rustc/link can exceed the available
+  memory even with Cargo concurrency capped at one.
