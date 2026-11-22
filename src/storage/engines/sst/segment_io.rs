@@ -26,6 +26,8 @@
 //! Inert unless a grant's protection group exists: with none, reads take one
 //! lock-free flag check and nothing is written.
 
+use super::query_body;
+
 use std::path::Path;
 use std::sync::Arc;
 
@@ -167,6 +169,35 @@ impl Drop for WarmClaim {
     }
 }
 
+fn body_range(body: &[u8], offset: u64, length: u64) -> FsResult<Vec<u8>> {
+    let range = offset
+        .checked_add(length)
+        .and_then(|end| Some(usize::try_from(offset).ok()?..usize::try_from(end).ok()?));
+    range
+        .and_then(|r| body.get(r))
+        .map(<[u8]>::to_vec)
+        .ok_or_else(|| FilesystemError::InvalidOperation("range outside complete PAX body".into()))
+}
+
+/// Whether a range reached the filesystem matters when attributing tier GETs.
+pub(super) async fn read_range_with_source<T: FileSystem + ?Sized>(
+    fs: &T,
+    path: &str,
+    offset: u64,
+    length: u64,
+) -> FsResult<(Vec<u8>, bool)> {
+    if let Some(body) = query_body::get(path) {
+        return Ok((body_range(&body, offset, length)?, false));
+    }
+    if let Some(resident) = Resident::lookup(path)
+        && let Some(bytes) = resident.range(offset, length).await
+    {
+        crate::storage::engines::sst::metrics::record_resident_hit();
+        return Ok((bytes, false));
+    }
+    Ok((fs.read_range(path, offset, length).await?, true))
+}
+
 /// Segment reads that prefer a resident whole-segment copy.
 #[async_trait::async_trait]
 pub trait ResidentRangeRead {
@@ -193,13 +224,9 @@ pub trait ResidentRangeRead {
 #[async_trait::async_trait]
 impl<T: FileSystem + ?Sized> ResidentRangeRead for T {
     async fn read_range_resident(&self, path: &str, offset: u64, length: u64) -> FsResult<Vec<u8>> {
-        if let Some(resident) = Resident::lookup(path)
-            && let Some(bytes) = resident.range(offset, length).await
-        {
-            crate::storage::engines::sst::metrics::record_resident_hit();
-            return Ok(bytes);
-        }
-        self.read_range(path, offset, length).await
+        read_range_with_source(self, path, offset, length)
+            .await
+            .map(|(bytes, _)| bytes)
     }
 
     async fn read_ranges_prefetch_resident(
@@ -207,6 +234,17 @@ impl<T: FileSystem + ?Sized> ResidentRangeRead for T {
         path: &str,
         ranges: Vec<std::ops::Range<u64>>,
     ) -> FsResult<Vec<Vec<u8>>> {
+        if let Some(body) = query_body::get(path) {
+            return ranges
+                .into_iter()
+                .map(|r| {
+                    let len = r.end.checked_sub(r.start).ok_or_else(|| {
+                        FilesystemError::InvalidOperation("reversed PAX range".into())
+                    })?;
+                    body_range(&body, r.start, len)
+                })
+                .collect();
+        }
         if let Some(resident) = Resident::lookup(path)
             && ranges
                 .iter()
@@ -261,6 +299,9 @@ impl<T: FileSystem + ?Sized> ResidentRangeRead for T {
     }
 
     async fn read_resident(&self, path: &str) -> FsResult<Vec<u8>> {
+        if let Some(body) = query_body::get(path) {
+            return Ok((*body).clone());
+        }
         if let Some(resident) = Resident::lookup(path)
             && let Some(bytes) = resident.range(0, resident.len).await
         {
@@ -271,6 +312,9 @@ impl<T: FileSystem + ?Sized> ResidentRangeRead for T {
     }
 
     async fn object_size_resident(&self, path: &str) -> FsResult<u64> {
+        if let Some(body) = query_body::get(path) {
+            return Ok(body.len() as u64);
+        }
         if let Some(resident) = Resident::lookup(path) {
             return Ok(resident.len);
         }
