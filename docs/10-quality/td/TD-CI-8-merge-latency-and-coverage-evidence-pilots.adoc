@@ -293,6 +293,14 @@ link:https://github.com/anvai-labs/proximaDB/actions/runs/45030315199/job/137232
 link:https://github.com/anvai-labs/proximaDB/actions/runs/44991252452/job/137131221523[another runner loss], and
 link:https://github.com/anvai-labs/proximaDB/actions/runs/45030315199/job/137232861384[same-head unit job].
 
+The failed-job retry on the identical #2562 head succeeded using the
+original workflow. Its type check took 9m17s, its test build 26m33s, and
+Clippy 4m54s. Libtest executed 262 catalog tests in 1.03s and filtered
+out 6,849 other tests in the linked harness. The runner restored a
+1.23 GB cache and reported 15 GiB RAM and 14 GiB configured swap before
+the check. This supplies an unchanged-workflow control for the trial.
+link:https://github.com/anvai-labs/proximaDB/actions/runs/45030315199/job/137254141372[Successful enterprise retry].
+
 . *First trial.* Cap Cargo at one job for building and serving the test
   binary. Leave the broad check, Clippy and coverage intact. Separate the
   build and execution timestamps on the same runner. Compare fresh and
