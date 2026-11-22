@@ -1,0 +1,21 @@
+---
+title: SIFT1M ANN range reads and the coalescing trade-off
+config:
+  theme: neutral
+  fontFamily: system-ui
+  flowchart:
+    nodeSpacing: 24
+    rankSpacing: 35
+---
+flowchart LR
+    cohort["50 untrained L0 segments<br/>319.33 ranged GETs per paired ANN query"]
+    cohort --> index["150 per-segment reads<br/>50 header prefixes · 50 RaBitQ indexes<br/>50 footers"]
+    cohort --> survivor["151.33 SQ8 survivor reads<br/>Largest request and byte contributor"]
+    cohort --> topk["18 result rehydration reads"]
+    trial["One-segment ANN sweep<br/>100 queries · 98.8% recall@10"]
+    trial --> local["1 MiB range / 256 KiB gap<br/>92.24 steady GETs per query<br/>49.63 MB per query"]
+    trial --> wide["8 MiB range / 2 MiB gap<br/>19.61 steady GETs per query<br/>83.58 MB per query"]
+    classDef base fill:#dcecf8,stroke:#416b9e,color:#142741
+    classDef evidence fill:#f3f7f8,stroke:#718996,color:#142741
+    class cohort,trial base
+    class index,survivor,topk,local,wide evidence

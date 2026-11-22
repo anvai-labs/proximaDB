@@ -1,0 +1,21 @@
+flowchart TD
+    a["One collection, one compact PAX object"]
+    b{"Requested search mode"}
+    c["Adaptive checks f32 eligibility, row count<br/>and rows × dimensions × 4 against scan budget"]
+    d["Exact<br/>Read full object and score every eligible f32 vector"]
+    e["ANN<br/>Select IVF cells and quantized candidates"]
+    f["Resolve cache hits and misses<br/>DRAM or persistent byte store"]
+    g["Plan and fetch uncached ranges<br/>Vary merge cap at fixed gap<br/>Single extents can exceed the cap"]
+    h["Meter object GETs, LISTs, HEADs and response bytes<br/>Compare returned IDs with exact top ten"]
+    a --> b
+    b -->|Exact| d
+    b -->|Adaptive| c
+    b -->|Approximate| e
+    c -->|Admitted to exact| d
+    c -->|Use ANN| e
+    e --> f --> g --> h
+    d --> h
+    classDef decision fill:#e5eff9,stroke:#37628c,color:#152b45
+    classDef route fill:#eff5ec,stroke:#537450,color:#173d28
+    class b,c decision
+    class d,e route

@@ -74,6 +74,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 use tempfile::TempDir;
 
+#[cfg(feature = "io-trace")]
+#[path = "sift_pax_recall_ratchet_test/scale_cost.rs"]
+mod scale_cost;
+
 const DIMENSION: usize = 128;
 const TOP_K: usize = 10;
 const BATCH_SIZE: usize = 20_000;

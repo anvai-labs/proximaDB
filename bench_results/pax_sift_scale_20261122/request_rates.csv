@@ -1,0 +1,53 @@
+profile,operation,counter,region,endpoint_api,usd,per_units,sku_or_meter
+s3,get,get,us-east-1,GetObject,0.004,10000,ZWQ6Q48CRJXX4FXE
+s3,list,list,us-east-1,ListObjectsV2,0.005,1000,E9YHNFENF4XQBZR6
+s3,head,head,us-east-1,HeadObject,0.004,10000,ZWQ6Q48CRJXX4FXE
+s3,retrieval,object_bytes,us-east-1,Successful object body bytes,0,1073741824,S3 Standard
+s3_ia,get,get,us-east-1,GetObject,0.01,10000,GWU4HUHFNSRYMYNK
+s3_ia,list,list,us-east-1,ListObjectsV2,0.005,1000,E9YHNFENF4XQBZR6
+s3_ia,head,head,us-east-1,HeadObject,0.01,10000,GWU4HUHFNSRYMYNK
+s3_ia,retrieval,object_bytes,us-east-1,Successful object body bytes,0.01,1073741824,7594RTQEE8ND34GA
+s3_gir,get,get,us-east-1,GetObject,0.1,10000,6WKRC2AMC45PNCVZ
+s3_gir,list,list,us-east-1,ListObjectsV2,0.005,1000,E9YHNFENF4XQBZR6
+s3_gir,head,head,us-east-1,HeadObject,0.1,10000,6WKRC2AMC45PNCVZ
+s3_gir,retrieval,object_bytes,us-east-1,Successful object body bytes,0.03,1073741824,CN3DWKRWAMMHWCA3
+blob,get,get,eastus,Get Blob,0.004,10000,c5248cf8-ecba-4807-9304-6a8f14b5805a
+blob,list,list,eastus,List Blobs,0.05,10000,14854f12-8d37-4299-842a-b0f2df82a305
+blob,head,head,eastus,Get Blob Properties (Other),0.004,10000,0b248445-aa24-4fe8-a794-a174929327bd
+blob,retrieval,object_bytes,eastus,Successful object body bytes,0,1073741824,Blob Hot
+blob_cool,get,get,eastus,Get Blob,0.01,10000,003afa77-88c3-4da1-9464-69f643721f8b
+blob_cool,list,list,eastus,List Blobs,0.05,10000,14854f12-8d37-4299-842a-b0f2df82a305
+blob_cool,head,head,eastus,Get Blob Properties (Other),0.004,10000,0b248445-aa24-4fe8-a794-a174929327bd
+blob_cool,retrieval,object_bytes,eastus,Successful object body bytes,0.01,1073741824,7fee4018-c73d-4765-9c46-98b2b9b57b16
+blob_cold,get,get,eastus,Get Blob,0.1,10000,5627e12d-19b2-5b9e-b2f1-3a3679e1cdd4
+blob_cold,list,list,eastus,List Blobs,0.05,10000,14854f12-8d37-4299-842a-b0f2df82a305
+blob_cold,head,head,eastus,Get Blob Properties (Other),0.004,10000,0b248445-aa24-4fe8-a794-a174929327bd
+blob_cold,retrieval,object_bytes,eastus,Successful object body bytes,0.03,1073741824,22d64f41-e0d8-5498-91e7-ea4d1e5d0a0c
+dfs,get,dfs_read_units,eastus,Path Read (4 MiB units),0.0052,10000,bf3be05d-6993-4d0f-9034-b359a0201744
+dfs,list,list,eastus,Path List (iterative read),0.065,10000,5bfb25fe-30a1-4204-9216-3396a00e190a
+dfs,head,head,eastus,Path Get Properties,0.0052,10000,bf3be05d-6993-4d0f-9034-b359a0201744
+dfs,retrieval,object_bytes,eastus,Successful object body bytes,0,1073741824,DFS Hot
+dfs_cool,get,dfs_read_units,eastus,Path Read (4 MiB units),0.013,10000,192fe26e-f6f5-48da-b576-96e00bc429fa
+dfs_cool,list,list,eastus,Path List (iterative read),0.065,10000,5bfb25fe-30a1-4204-9216-3396a00e190a
+dfs_cool,head,head,eastus,Path Get Properties,0.013,10000,192fe26e-f6f5-48da-b576-96e00bc429fa
+dfs_cool,retrieval,object_bytes,eastus,Successful object body bytes,0.01,1073741824,d5a4164f-2835-4565-b2d0-2e1f5e12d77e
+dfs_cold,get,dfs_read_units,eastus,Path Read (4 MiB units),0.13,10000,de26e09d-50fe-5a1d-a905-2ec3d2a7009a
+dfs_cold,list,list,eastus,Path List (iterative read),0.065,10000,5bfb25fe-30a1-4204-9216-3396a00e190a
+dfs_cold,head,head,eastus,Path Get Properties,0.13,10000,de26e09d-50fe-5a1d-a905-2ec3d2a7009a
+dfs_cold,retrieval,object_bytes,eastus,Successful object body bytes,0.03,1073741824,ccf3229b-e826-5ccd-a5d2-f0c3e2f20c56
+gcs,get,get,us-central1,storage.objects.get,0.004,10000,regional flat Standard B
+gcs,list,list,us-central1,storage.objects.list (Standard-default bucket),0.005,1000,regional flat Standard A
+gcs,head,head,us-central1,Object metadata read,0.004,10000,regional flat Standard B
+gcs,retrieval,object_bytes,us-central1,Successful object body bytes,0,1073741824,GCS Standard
+gcs_nearline,get,get,us-central1,storage.objects.get,0.01,10000,regional flat Nearline B
+gcs_nearline,list,list,us-central1,storage.objects.list (Standard-default bucket),0.005,1000,regional flat Standard A
+gcs_nearline,head,head,us-central1,Object metadata read,0.01,10000,regional flat Nearline B
+gcs_nearline,retrieval,object_bytes,us-central1,Successful object body bytes,0.01,1073741824,GCS Nearline
+gcs_coldline,get,get,us-central1,storage.objects.get,0.1,10000,regional flat Coldline B
+gcs_coldline,list,list,us-central1,storage.objects.list (Standard-default bucket),0.005,1000,regional flat Standard A
+gcs_coldline,head,head,us-central1,Object metadata read,0.1,10000,regional flat Coldline B
+gcs_coldline,retrieval,object_bytes,us-central1,Successful object body bytes,0.02,1073741824,GCS Coldline
+gcs_archive,get,get,us-central1,storage.objects.get,0.5,10000,regional flat Archive B
+gcs_archive,list,list,us-central1,storage.objects.list (Standard-default bucket),0.005,1000,regional flat Standard A
+gcs_archive,head,head,us-central1,Object metadata read,0.5,10000,regional flat Archive B
+gcs_archive,retrieval,object_bytes,us-central1,Successful object body bytes,0.05,1073741824,GCS Archive

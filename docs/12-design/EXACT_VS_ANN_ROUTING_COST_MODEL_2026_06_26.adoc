@@ -31,7 +31,7 @@ existing `SearchMode` intent knob.
 
 == First-principles cost decomposition
 
-For a cloud DB the dominant cost term is *I/O round-trips + egress bytes, not CPU*.
+For hosted PAX objects, price object requests and any billable retrieval or transfer by deployment. CPU time, link throughput and peak memory also constrain the viable plan. The table models cold alternatives, including a projected f32-only exact reader.
 
 [cols="1,2,1,1,1,1",options="header"]
 |===
@@ -65,14 +65,21 @@ Consequences:
 
 == The threshold is a byte budget, not a vector count
 
-Cost is `N·dim·4` bytes. `10k×64` (2.5 MB) vs `10k×1536` (61 MB) differ ~25×. The
+The current SST implementation uses f32 coordinate bytes for *admission*,
+then reads the full PAX object for exact search. Cold adaptive routing may
+also read the header and footer to count rows. Size the wire and memory
+budget using actual object bytes and physical requests. The November ledger
+checks both the route and its request cost over six SIFT prefixes.
+link:../history/evidence/PAX_SIFT_SCALE_REQUESTS_2026_11_22.adoc[Measured exact and ANN I/O].
+
+The f32 coordinate admission estimate is `N·dim·4` bytes. `10k×64` (2.5 MB) vs `10k×1536` (61 MB) differ ~25×. The
 crossover is storage-class-dependent: object store is *round-trip-bound* (one
 sequential exact read beats several index-metadata round-trips for small N); local
 NVMe is *bandwidth-bound* (higher threshold). So:
 
 [source]
 ----
-exact  if  N · dim · bytes_per_elem  ≤  EXACT_SCAN_BYTE_BUDGET   // one efficient ranged GET, ~32–64 MB, per storage class
+adaptive_exact = eligible_f32 && 0 < N && N <= row_ceiling && N * dim * 4 <= exact_byte_budget
 ----
 
 == When to use what — scenario matrix + interplay

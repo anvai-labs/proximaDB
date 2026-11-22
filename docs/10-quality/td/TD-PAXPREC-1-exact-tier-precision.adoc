@@ -6,14 +6,21 @@
 |===
 | Field | Value
 | Status | **Open** (filed 2026-10-19). Direction set by the owner on 2026-10-19: fp16 exact tier by default, fp32 opt-in. The default flip is gated on experiment E10 in `docs/12-design/PAX_SPEC_THOUGHT_EXPERIMENTS_2026_10.adoc` (TE-P5).
-| Priority | **HIGH**. Today default collections keep no exact copy (a lossy read-back), while declared-fp16 collections pay the rounding loss *and* f32 storage.
+| Priority | **HIGH**. The RaBitQ flush default now retains f32. The coalesced row-group writer still uses four bytes per coordinate when it emits Region C, including values rounded to fp16 on ingest.
 | Component | PAX flush/writer (`src/storage/engines/sst/flush/mod.rs`, `crates/storage/proximadb-block-format/src/{writer.rs,record.rs}`), REST v2 precision parsing (`src/network/rest/v2/collections.rs`), Region C layout (TD-PAXRG-1)
 | Relates to | TD-READFID-1 (lossy point reads on default collections), TD-READFID-2 (exact tier survives compaction), TD-111 (non-f32 Arrow widths), TD-PAXMETA-1, TD-SEAM-10, ADR-026, ADR-065, ADR-097 D2
 |===
 
 == Problem
 
-Three facts, from a code trace on 2026-10-19:
+The following observations describe the 2026-10-19 code trace. On the
+2026-11-22 review baseline (`f0c3b52bd`), `resolve_pax_f32_tier_decision`
+defaults the f32 tier on for RaBitQ. Collection tags, declared fp32 and
+environment settings participate in the selection. New flushes can
+therefore have a different layout from existing segments. Read the segment's
+declared tiers when checking fidelity. Keeping canonical fp16 as two-byte
+Region C data and the E10 precision gate remain open.
+link:../../12-design/PAX_SPEC_THOUGHT_EXPERIMENTS_2026_10.adoc[Scale and storage model, section 9].
 
 * **Default PAX keeps no exact vectors.** Without a declared precision, a flushed segment holds
   only RaBitQ codes and the SQ8 rerank (`flush/mod.rs`:1360-1395, :1473-1476). Exact search and
