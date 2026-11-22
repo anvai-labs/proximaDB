@@ -144,6 +144,8 @@ pub enum RowLimitMode {
 /// Request-scoped execution controls shared by physical engines.
 #[derive(Clone, Default)]
 pub struct ExecutionControls {
+    /// Extended pgwire execution of a prepared statement, after parameter binding.
+    pub prepared_statement: bool,
     /// Optional maximum number of materialized rows the caller will accept.
     pub max_rows: Option<usize>,
     /// How to react when `max_rows` is reached (error vs. truncate).

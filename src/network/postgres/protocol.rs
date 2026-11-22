@@ -7217,7 +7217,7 @@ impl PostgresProtocol {
         }
 
         let upper = query.trim().to_uppercase();
-        if !upper.starts_with("SELECT") {
+        if !upper.starts_with("SELECT") && !upper.starts_with("WITH") {
             return DescribedShape::Unknown;
         }
         // Special cases `execute_query` answers before its SELECT dispatch —
@@ -7273,6 +7273,9 @@ impl PostgresProtocol {
                     .collect();
                 return DescribedShape::Fields(fields);
             }
+        }
+        if !upper.starts_with("SELECT") {
+            return DescribedShape::Unknown;
         }
         if super::relational_pipeline::select_engages_relational_engine(query) {
             // The pipeline resolves tables in the session's search-path namespace.
@@ -7831,6 +7834,7 @@ impl PostgresProtocol {
                 self.try_run_relational_select_pipeline(
                     query,
                     ExecutionControls {
+                        prepared_statement: true,
                         cancellation_flag: Some(cancellation_flag),
                         ..Default::default()
                     },
@@ -8028,9 +8032,13 @@ impl PostgresProtocol {
     /// `PortalSuspended` when more rows remain.
     fn execution_controls_for_execute_max_rows(max_rows: i32) -> ExecutionControls {
         if max_rows <= 0 {
-            return ExecutionControls::default();
+            return ExecutionControls {
+                prepared_statement: true,
+                ..Default::default()
+            };
         }
         ExecutionControls {
+            prepared_statement: true,
             max_rows: Some(max_rows as usize),
             row_limit_mode: RowLimitMode::Truncate,
             ..Default::default()

@@ -66,10 +66,14 @@ pub(crate) async fn describe_pinned_projection(
     let context = QueryExecutionContext {
         pinned_external_tables,
         allow_engine_sql_fallback: true,
+        controls: crate::query::execution::engine::ExecutionControls {
+            prepared_statement: true,
+            ..Default::default()
+        },
         ..Default::default()
     };
     let (_, frame) = DataFusionLocalEngine
-        .prepare_datafusion(sql, &context)
+        .prepare_dataframe(sql, &context)
         .await?;
     Ok(frame
         .schema()
@@ -324,10 +328,12 @@ impl DataFusionLocalEngine {
         // TD-OLAP-4: time lowering + logical/physical planning (the other half of
         // the per-query floor, separate from execution).
         let plan_start = std::time::Instant::now();
-        let pinned_requires_exact_names = context
-            .pinned_external_tables
-            .iter()
-            .any(|(name, _)| pinned_table_uses_exact_identifier(name));
+        let pinned_uses_engine_sql = !context.pinned_external_tables.is_empty()
+            && (context.controls.prepared_statement
+                || context
+                    .pinned_external_tables
+                    .iter()
+                    .any(|(name, _)| pinned_table_uses_exact_identifier(name)));
         let mut schemas: HashMap<String, std::sync::Arc<RelationalSchema>> = HashMap::new();
         for (name, reference) in context
             .parquet_tables
@@ -371,9 +377,10 @@ impl DataFusionLocalEngine {
         let catalog = ParquetSchemaCatalog { schemas };
 
         // P4 lowering
-        // The shared catalog folds table keys and cannot represent case-distinct
-        // pinned names. Use DataFusion's exact SQL identifiers for these scans.
-        let lowered_plan = match (!pinned_requires_exact_names).then(|| lower_sql(sql, &catalog)) {
+        // The shared frontend folds table keys and declines placeholders. Keep
+        // prepared statements on one planner before and after Bind substitutes
+        // literals. Exact pinned identifiers also use this planner.
+        let lowered_plan = match (!pinned_uses_engine_sql).then(|| lower_sql(sql, &catalog)) {
             None => None,
             Some(Ok(node)) => {
                 match crate::datafusion::logical_lowering::lower_logical_node(&ctx, &node).await {
@@ -411,7 +418,7 @@ impl DataFusionLocalEngine {
         };
 
         let df = match lowered_plan {
-            None if pinned_requires_exact_names => ctx
+            None if pinned_uses_engine_sql => ctx
                 .sql(sql)
                 .await
                 .map_err(|e| ExecutionError::Execution(format!("sql: {e}")))?,

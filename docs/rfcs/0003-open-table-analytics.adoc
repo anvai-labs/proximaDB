@@ -84,6 +84,13 @@ link:../../src/query/execution/pinned_source.rs[Batch contract],
 link:../../src/datafusion/engine_adapters/pinned_table.rs[DataFusion adapter],
 https://datafusion.apache.org/versions/55.0.0/library-user-guide/custom-table-providers.html[DataFusion provider guidance].
 
+Pinned pgwire reads resolve SQL-folded unquoted names and preserve quoted
+spelling. Prepared pinned statements use DataFusion SQL for both Describe
+and Execute, including before and after parameter substitution. Describe
+plans against catalog-only schemas without opening files. Retain this
+single-planner behavior when the shared frontend gains typed placeholders
+and case-sensitive table keys.
+
 [cols="2,3,3",options="header"]
 |===
 | Pressure observed at the checkpoint | Next design step | Evidence required

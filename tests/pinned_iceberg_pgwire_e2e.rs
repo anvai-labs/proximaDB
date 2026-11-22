@@ -640,7 +640,7 @@ async fn pgwire_reads_only_the_authorized_pinned_snapshot() {
     );
     let statement = client
         .prepare_typed(
-            "SELECT value AS renamed FROM pinned_read WHERE value > $1",
+            "SELECT value AS Renamed FROM pinned_read WHERE value > $1",
             &[tokio_postgres::types::Type::INT8],
         )
         .await
