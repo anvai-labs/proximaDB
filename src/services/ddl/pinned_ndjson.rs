@@ -1,18 +1,9 @@
 //! Catalog binding for a pinned NDJSON file and its byte-range manifest.
 
-use proximadb_catalog::{CatalogAuthorityMode, CatalogPhysicalFormat, CatalogStorageLayout};
-
-pub(crate) fn is_external_ndjson(layout: &CatalogStorageLayout) -> bool {
-    layout.physical_format == CatalogPhysicalFormat::Json
-        && matches!(
-            layout.authority,
-            CatalogAuthorityMode::ExternalAuthoritative
-                | CatalogAuthorityMode::ImportedSnapshot
-                | CatalogAuthorityMode::FederatedRead
-        )
-}
-
 #[cfg(all(unix, feature = "datafusion-integration"))]
+use proximadb_catalog::CatalogStorageLayout;
+
+#[cfg(feature = "datafusion-integration")]
 pub(crate) const MANIFEST_DIGEST: &str = "ndjson_manifest_sha256";
 
 #[cfg(all(unix, feature = "datafusion-integration"))]

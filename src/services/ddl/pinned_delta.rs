@@ -1,18 +1,9 @@
 //! Catalog binding for a local, explicitly versioned Delta table.
 
-use proximadb_catalog::{CatalogAuthorityMode, CatalogPhysicalFormat, CatalogStorageLayout};
-
-pub(crate) fn is_external_delta(layout: &CatalogStorageLayout) -> bool {
-    layout.physical_format == CatalogPhysicalFormat::Delta
-        && matches!(
-            layout.authority,
-            CatalogAuthorityMode::ExternalAuthoritative
-                | CatalogAuthorityMode::ImportedSnapshot
-                | CatalogAuthorityMode::FederatedRead
-        )
-}
-
 #[cfg(all(unix, feature = "datafusion-integration"))]
+use proximadb_catalog::CatalogStorageLayout;
+
+#[cfg(feature = "datafusion-integration")]
 pub(crate) const DELTA_VERSION: &str = "delta_version";
 
 #[cfg(all(unix, feature = "datafusion-integration"))]

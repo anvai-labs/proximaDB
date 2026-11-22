@@ -66,6 +66,38 @@ Use *Volcano* as the working product name for the native executor. Keep the boun
 
 Prioritize projection and physical pruning, then safe runtime filters, partitioned hash joins and bounded aggregation with spill. Keep the generic batch path available for every supported type. Gate specialization and compiled fragments on measured kernel and end-to-end wins that include cold setup and compilation. Measure shared scans before attributing a speedup to an executor. Carry the same visibility and split contracts to a distributed worker before adding a second scheduler. Reserve memory for batches and dictionaries still referenced by downstream operators, even after the producing stage yields.
 
+== Pinned source design after the SF1 checkpoint
+
+Catalog classification owns the authority and format decision for DDL, write
+refusal and read routing. At statement setup, the binder requires one eligible
+layout and resolves its exact snapshot, log version or manifest digest. Each
+format reader owns protocol interpretation, schema mapping and delete
+application. The local Arrow batch source exposes schema, a stable split
+inventory and repeatable projected scans without optimizer types. DataFusion
+plans against the bound source and opens each scan partition on first demand.
+Unpushed filters stay in DataFusion. These boundaries let another executor
+reuse the readers while keeping its plan, scheduling and SQL semantics above
+the batch contract.
+link:../../src/services/ddl/pinned_external.rs[Catalog classification],
+link:../../src/datafusion/engine_adapters/pinned_external.rs[Statement bind],
+link:../../src/query/execution/pinned_source.rs[Batch contract],
+link:../../src/datafusion/engine_adapters/pinned_table.rs[DataFusion adapter],
+https://datafusion.apache.org/versions/55.0.0/library-user-guide/custom-table-providers.html[DataFusion provider guidance].
+
+[cols="2,3,3",options="header"]
+|===
+| Pressure observed at the checkpoint | Next design step | Evidence required
+| Queries reopen metadata, and binding materializes each inventory before planning.
+| Attribute bind latency, metadata requests and inventory bytes by format. Page inventories and admit concurrent binds against a shared budget if the measurements justify it. Reuse parsed metadata only with a verified version or content identity. Recheck authorization on each bind.
+| Compare cold and warm runs over the same SQL and source versions. Exercise same-name replacement, source expiry, policy change and an interrupted bind. A cache hit must never authorize stale data or suppress expiry.
+| Equal split counts can assign uneven work. Delta has bounded queues per stream, and the NDJSON reader holds a verified byte range while decoding.
+| Measure compressed bytes, decoded bytes, CPU and queue time per split before choosing scheduling weights. Reserve aggregate scan bytes and blocking work across partitions and concurrent queries. Keep the cap effective when projection is empty or input rows are wide.
+| Compare skewed files and mixed-width queries under a fixed memory budget. Confirm cancellation and early LIMIT release reservations and stop further opens.
+| The local pinned split index lives only inside one binding. Existing `ProximaScanExec` already has pruning and runtime-filter hooks for file splits.
+| Reuse those planning hooks once the file-split contract carries bound object identity and visibility. Keep residual predicates above the scan until the reader proves exactness. Send portable versioned descriptors to workers and bind them to the verified input and execution attempt.
+| Compare typed answers and ordering with pruning enabled and disabled, including deletes, NULL and outer joins. Reject a changed object or unauthorized attempt before delivering rows.
+|===
+
 == Source and sink requirements
 
 . *Bind the view once.* Resolve each relation to tenant, catalog identity, schema/field identities, supported format features, policy generation and immutable snapshot or file-set token. Managed fresh tables also pin a reconciled WAL visibility boundary. State the consistency level of a join across independently committed catalogs. A caller requiring atomic cross-table visibility receives a refusal unless the catalog can supply it. Record how long the source can serve the selected version and return snapshot-expired if it becomes unavailable. Reauthorize a resumed job.

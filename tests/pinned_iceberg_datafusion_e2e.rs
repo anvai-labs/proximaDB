@@ -84,6 +84,10 @@ async fn datafusion_queries_project_and_count_pinned_iceberg_rows() {
             "SELECT value FROM pinned WHERE value >= 11 ORDER BY value LIMIT 1",
             vec![20],
         ),
+        (
+            "SELECT value FROM pinned WHERE value >= 21 LIMIT 1",
+            vec![21],
+        ),
     ] {
         let batches = ctx.sql(query).await.unwrap().collect().await.unwrap();
         let actual: Vec<_> = batches

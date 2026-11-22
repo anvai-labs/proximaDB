@@ -4,7 +4,8 @@
 use anyhow::{Result, anyhow, bail};
 #[cfg(feature = "datafusion-integration")]
 use object_store::path::Path;
-use proximadb_catalog::{CatalogAuthorityMode, CatalogPhysicalFormat, CatalogStorageLayout};
+#[cfg(feature = "datafusion-integration")]
+use proximadb_catalog::CatalogStorageLayout;
 #[cfg(feature = "datafusion-integration")]
 use url::Url;
 
@@ -19,16 +20,6 @@ pub(crate) struct PinnedIcebergLocation {
     pub table_root: String,
     pub metadata_uri: String,
     pub expected_delta_version: Option<u64>,
-}
-
-pub(crate) fn is_external_iceberg(layout: &CatalogStorageLayout) -> bool {
-    matches!(layout.physical_format, CatalogPhysicalFormat::Iceberg)
-        && matches!(
-            layout.authority,
-            CatalogAuthorityMode::ExternalAuthoritative
-                | CatalogAuthorityMode::ImportedSnapshot
-                | CatalogAuthorityMode::FederatedRead
-        )
 }
 
 #[cfg(feature = "datafusion-integration")]

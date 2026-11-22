@@ -278,7 +278,7 @@ impl PinnedDeltaReader {
                 .with_cancellation_token(token.clone())
                 .build()?;
             let schema: Schema = scan.logical_schema().as_ref().try_into_arrow()?;
-            super::pinned_iceberg::validate_external_schema(&schema, &columns)
+            super::pinned_external::validate_external_schema(&schema, &columns)
                 .context("external Delta catalog columns must match the pinned schema")?;
             let root = Url::parse(DELTA_ROOT)?;
             let mut files = Vec::new();

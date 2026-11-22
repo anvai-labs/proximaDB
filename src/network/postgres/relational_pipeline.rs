@@ -1604,67 +1604,14 @@ async fn execute_pinned_external_select(
     controls: ExecutionControls,
     setup_start: std::time::Instant,
 ) -> Result<ExecutionPipelineResult, String> {
-    use crate::datafusion::engine_adapters::pinned_iceberg::PinnedIcebergTable;
+    use crate::datafusion::engine_adapters::pinned_external;
     use crate::query::table_write_plan::ComputeBackend;
-    use crate::services::ddl::pinned_iceberg::PinnedIcebergLocation;
 
     let mut providers = Vec::with_capacity(pinned.len());
     for (name, schema) in pinned {
+        let provider = pinned_external::open_table(&schema, &controls).await;
         controls.check_cancelled().map_err(|e| e.to_string())?;
-        let mut layouts = schema
-            .storage_layouts
-            .iter()
-            .filter(|layout| is_pinned_external_layout(layout));
-        let layout = layouts
-            .next()
-            .filter(|_| layouts.next().is_none())
-            .ok_or_else(|| format!("pinned external table {name}: expected one pinned layout"))?;
-        if crate::services::ddl::pinned_ndjson::is_external_ndjson(layout) {
-            #[cfg(not(unix))]
-            return Err("external NDJSON requires Unix".into());
-            #[cfg(unix)]
-            {
-                use crate::datafusion::engine_adapters::pinned_ndjson::PinnedNdjsonReader;
-                use crate::services::ddl::pinned_ndjson::PinnedNdjsonLocation;
-
-                let location = PinnedNdjsonLocation::from_layout(layout)
-                    .map_err(|e| format!("pinned NDJSON {name}: {e:#}"))?;
-                let reader = PinnedNdjsonReader::open(location, &schema.columns)
-                    .await
-                    .map_err(|e| format!("pinned NDJSON {name}: {e:#}"))?;
-                providers.push((
-                    schema.name,
-                    Arc::new(PinnedIcebergTable::from_source(reader)),
-                ));
-                continue;
-            }
-        }
-        if crate::services::ddl::pinned_delta::is_external_delta(layout) {
-            #[cfg(not(unix))]
-            return Err("external Delta requires Unix".into());
-            #[cfg(unix)]
-            {
-                use crate::datafusion::engine_adapters::pinned_delta::PinnedDeltaReader;
-                use crate::services::ddl::pinned_delta::PinnedDeltaLocation;
-
-                let location = PinnedDeltaLocation::from_layout(layout)
-                    .map_err(|e| format!("pinned Delta {name}: {e:#}"))?;
-                let reader =
-                    PinnedDeltaReader::open(location, &schema.columns, controls.clone()).await;
-                controls.check_cancelled().map_err(|e| e.to_string())?;
-                let reader = reader.map_err(|e| format!("pinned Delta {name}: {e:#}"))?;
-                providers.push((
-                    schema.name,
-                    Arc::new(PinnedIcebergTable::from_source(reader)),
-                ));
-                continue;
-            }
-        }
-        let location = PinnedIcebergLocation::from_layout(layout)
-            .map_err(|e| format!("pinned Iceberg {name}: {e}"))?;
-        let provider = PinnedIcebergTable::open_catalog_snapshot(&location, &schema.columns)
-            .await
-            .map_err(|e| format!("pinned Iceberg {name}: {e:#}"))?;
+        let provider = provider.map_err(|e| format!("pinned external table {name}: {e:#}"))?;
         providers.push((schema.name, Arc::new(provider)));
     }
     let context = QueryExecutionContext {

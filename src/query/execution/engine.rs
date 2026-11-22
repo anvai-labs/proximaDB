@@ -176,7 +176,7 @@ pub struct QueryExecutionContext {
     #[cfg(feature = "datafusion-integration")]
     pub pinned_external_tables: Vec<(
         String,
-        Arc<crate::datafusion::engine_adapters::pinned_iceberg::PinnedTable>,
+        Arc<crate::datafusion::engine_adapters::pinned_table::PinnedTable>,
     )>,
     /// ADR-058 D5/§9.A: per-table footer-stats trust, keyed by table name
     /// (parallel to `parquet_tables`). Drives whether the DataFusion adapter may

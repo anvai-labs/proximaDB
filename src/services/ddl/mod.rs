@@ -8,6 +8,7 @@
 //! - CREATE NAMESPACE / DROP NAMESPACE
 
 pub(crate) mod pinned_delta;
+pub(crate) mod pinned_external;
 pub(crate) mod pinned_iceberg;
 pub(crate) mod pinned_ndjson;
 
@@ -25,6 +26,7 @@ use proximadb_catalog::{
 use proximadb_data_model::ProximaType;
 use tracing::{error, info};
 
+use self::pinned_external::PinnedExternalFormat;
 use crate::catalog::CatalogManager;
 
 /// Count of `DROP TABLE`s whose record-tier purge failed, leaving durable objects
@@ -2535,9 +2537,7 @@ pub(crate) fn is_catalog_only_external_table(schema: &CatalogTableSchema) -> boo
 }
 
 pub(crate) fn is_pinned_external_layout(layout: &CatalogStorageLayout) -> bool {
-    pinned_iceberg::is_external_iceberg(layout)
-        || pinned_ndjson::is_external_ndjson(layout)
-        || pinned_delta::is_external_delta(layout)
+    PinnedExternalFormat::for_layout(layout).is_some()
 }
 
 fn is_catalog_only_external_layout(layout: &CatalogStorageLayout) -> bool {
@@ -2641,52 +2641,9 @@ fn add_open_table_layouts(schema: &mut CatalogTableSchema) -> Result<()> {
         }
     };
 
-    if pinned_iceberg::is_external_iceberg(&layout) {
-        #[cfg(not(feature = "datafusion-integration"))]
-        return Err(anyhow!("external Iceberg requires datafusion-integration"));
-        #[cfg(feature = "datafusion-integration")]
-        {
-            for name in [
-                pinned_iceberg::METADATA_LOCATION,
-                pinned_iceberg::DELTA_VERSION,
-            ] {
-                if let Some(value) = schema.properties.get(name) {
-                    layout.properties.insert(name.into(), value.clone());
-                }
-            }
-            pinned_iceberg::PinnedIcebergLocation::from_layout(&layout)?;
-        }
-    }
-
-    if pinned_ndjson::is_external_ndjson(&layout) {
-        #[cfg(not(all(unix, feature = "datafusion-integration")))]
-        return Err(anyhow!(
-            "external NDJSON requires Unix and datafusion-integration"
-        ));
-        #[cfg(all(unix, feature = "datafusion-integration"))]
-        {
-            let key = pinned_ndjson::MANIFEST_DIGEST;
-            if let Some(value) = schema.properties.get(key) {
-                layout.properties.insert(key.into(), value.clone());
-            }
-            pinned_ndjson::PinnedNdjsonLocation::from_layout(&layout)?;
-            crate::datafusion::engine_adapters::pinned_ndjson::ndjson_schema(&schema.columns)?;
-        }
-    }
-
-    if pinned_delta::is_external_delta(&layout) {
-        #[cfg(not(all(unix, feature = "datafusion-integration")))]
-        return Err(anyhow!(
-            "external Delta requires Unix and datafusion-integration"
-        ));
-        #[cfg(all(unix, feature = "datafusion-integration"))]
-        {
-            let key = pinned_delta::DELTA_VERSION;
-            if let Some(value) = schema.properties.get(key) {
-                layout.properties.insert(key.into(), value.clone());
-            }
-            pinned_delta::PinnedDeltaLocation::from_layout(&layout)?;
-        }
+    let pinned = PinnedExternalFormat::for_layout(&layout);
+    if let Some(format) = pinned {
+        format.copy_options_and_validate(&mut layout, schema)?;
     }
 
     if let Some(snapshot) = schema
@@ -2711,17 +2668,8 @@ fn add_open_table_layouts(schema: &mut CatalogTableSchema) -> Result<()> {
     if is_catalog_only_external_layout(&layout) {
         layout.write_mode = proximadb_catalog::CatalogWriteMode::ReadOnly;
     }
-    if pinned_iceberg::is_external_iceberg(&layout) {
-        layout.snapshot_semantics = Some("pinned-iceberg-snapshot".into());
-        layout.policy_enforced_in_proxima = false;
-    }
-    if pinned_ndjson::is_external_ndjson(&layout) {
-        layout.snapshot_semantics = Some("pinned-ndjson-manifest".into());
-        layout.policy_enforced_in_proxima = false;
-    }
-
-    if pinned_delta::is_external_delta(&layout) {
-        layout.snapshot_semantics = Some("pinned-delta-version".into());
+    if let Some(format) = pinned {
+        layout.snapshot_semantics = Some(format.snapshot_semantics().into());
         layout.policy_enforced_in_proxima = false;
     }
 
