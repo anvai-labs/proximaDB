@@ -1396,3 +1396,8 @@ predicted read extents and bytes, collection geometry and cache state to
 choose the route. The SST router already has a dimension-aware byte
 test. Further calibrate its crossover from the paired measurements.
 link:EXACT_VS_ANN_ROUTING_COST_MODEL_2026_06_26.adoc[Exact and adaptive route cost model].
+
+The paired SIFT prefix ledger covers 1K, 10K, 33K, 100K, 333K and 1M at
+4–32 MiB read caps. It reports cold, DRAM-repeat and disk-reopen wire counts,
+and checks the separate adaptive exact budget against the route that ran.
+link:../history/evidence/PAX_SIFT_SCALE_REQUESTS_2026_11_22.adoc[PAX SIFT scale and request ledger].

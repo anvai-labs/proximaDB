@@ -47,6 +47,8 @@ def read_windows(rows, lines):
                     active = None
                 else:
                     raise ValueError(f"overlapping or invalid marker {path}")
+            elif active is not None:
+                raise ValueError(f"unrelated or failed marker inside {active}: {path}")
             continue
         if active is None:
             continue
@@ -55,7 +57,13 @@ def read_windows(rows, lines):
                 f"unexpected {verb} inside read-only query window {active}"
             )
         counts = requests[active]
-        if verb == "GET" and parse_qs(parsed.query).get("comp") == ["list"]:
+        query = parse_qs(parsed.query)
+        is_list = verb == "GET" and query.get("comp") == ["list"]
+        target = path + "/" + query.get("prefix", [""])[0] if is_list else path
+        fixture = active.rsplit("/_meter/", 1)[0] + "/"
+        if not target.startswith(fixture):
+            raise ValueError(f"unrelated request inside {active}: {url}")
+        if is_list:
             counts["list"] += 1
         else:
             counts[verb.lower()] += 1
@@ -65,6 +73,9 @@ def read_windows(rows, lines):
                 counts["object_bytes"] += int(length)
                 if status == "206":
                     counts["partial_get"] += 1
+                    counts["max_range_bytes"] = max(
+                        counts["max_range_bytes"], int(length)
+                    )
         if int(status) >= 400:
             counts["errors"] += 1
     if ended != set(windows) or active is not None:
@@ -72,7 +83,21 @@ def read_windows(rows, lines):
             f"incomplete access log: {len(ended)} of {len(windows)} windows"
         )
     for key, row in windows.items():
-        row["wire"] = dict(requests[key])
+        counts = requests[key]
+        # This adapter meters physical reads. Wire attempts can exceed the
+        # client counters (e.g. a retry). A deficit needs an investigation
+        # before this log can serve as billing evidence.
+        for app, wire in (
+            ("get", "get"),
+            ("list", "list"),
+            ("head", "head"),
+            ("bytes", "object_bytes"),
+        ):
+            if counts[wire] < row[app]:
+                raise ValueError(
+                    f"incomplete wire {wire} in {key}: {counts[wire]} < {row[app]}"
+                )
+        row["wire"] = dict(counts)
 
 
 def validate_matrix(fixtures, rows, sizes, caps, queries):
@@ -122,6 +147,7 @@ def summarize(raw, log, sizes, caps, queries):
             key: round(mean(r["wire"].get(key, 0) for r in rs), 3)
             for key in ("get", "partial_get", "list", "head", "errors", "object_bytes")
         }
+        wire["max_range_bytes"] = max(r["wire"].get("max_range_bytes", 0) for r in rs)
         stats = {
             key: round(mean(r[key] for r in rs), 3)
             for key in (
