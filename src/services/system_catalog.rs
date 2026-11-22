@@ -3858,6 +3858,9 @@ mod tests {
                 vec_schema("second"),
             )
             .await?;
+        // Attribute the remaining traffic to the FOLLOWER alone: the owner's
+        // publish (shard-CAS generation prechecks, format probes) is done.
+        ledger.reset();
 
         match follower.reload_if_stale().await? {
             ReloadOutcome::Reloaded { superseded, .. } => assert!(!superseded),
@@ -3874,17 +3877,23 @@ mod tests {
                 .table_exists(&TableIdentifier::new(big_ns, "t024"))
                 .await?
         );
-        // ...and the reload fetched only root + the small shard: no GET of
-        // the big account's shard object, no whole-image read.
+        // ...and the reload fetched only root + the small shard: the big
+        // account's shard prefix sees ZERO object-store traffic of any kind
+        // (no manifest GET, no format probe), and the small shard's manifest
+        // IS fetched. (The committer's CAS does a couple of per-log format/
+        // generation probes on the logs it touches — the invariant is which
+        // LOGS are touched, not the per-log probe count.)
         assert_eq!(
             ledger.get_count_matching(&format!("_shards/{}", hex_segment("big-tenant"))),
             0,
-            "reload must not fetch the unchanged big shard"
+            "reload must not touch the unchanged big shard at all"
         );
         assert_eq!(
-            ledger.get_count_matching(&format!("_shards/{}", hex_segment("small-tenant"))),
-            1,
-            "reload fetches the changed small shard exactly once"
+            ledger.get_count_matching(&format!(
+                "_shards/{}",
+                hex_segment("small-tenant")
+            )) >= 1,
+            "reload fetches the changed small shard"
         );
         assert!(ledger.get_count_matching("_root/") >= 1);
         Ok(())
@@ -4184,34 +4193,40 @@ mod tests {
     /// own (lower) per-account floor.
     #[tokio::test]
     async fn pre_existing_global_namespace_ids_are_never_renumbered() -> Result<()> {
-        let state = crate::services::system_catalog_state::SystemCatalogState::new();
-        // A legacy account whose ids were minted by the GLOBAL counter: acme
-        // holds 1..5, globex holds 6 (as the old single floor would mint).
-        state.apply_committed(
-            1,
-            CatalogDelta::UpsertNamespace {
-                namespace: Box::new({
-                    let mut ns =
-                        proximadb_catalog::CatalogNamespace::new(nslevels(&["acme", "sales"]));
-                    ns.tenant_id = Some("acme".to_string());
-                    ns
-                }),
-            },
-        );
-        for (seq, id) in [(2_u64, 1_u16), (3, 2), (4, 3), (5, 4), (6, 5)] {
+        // Seed through a LEGACY whole-image snapshot (bare field-named
+        // MessagePack — also exercising the TD-SPINE-1 legacy read path):
+        // a pre-TD-SPINE-2 deployment where acme's ids 1..5 were minted by
+        // the old GLOBAL counter. `applied_seq` stays 0 so the injected
+        // appender's fresh sequence space applies on top.
+        #[derive(serde::Serialize, serde::Deserialize)]
+        struct LegacyImage {
+            account_ids: HashMap<String, u32>,
+            namespaces: HashMap<Vec<String>, proximadb_catalog::CatalogNamespace>,
+            tables: HashMap<TableIdentifier, CatalogTableSchema>,
+            statistics: HashMap<TableIdentifier, CatalogTableStatistics>,
+            applied_seq: u64,
+        }
+        let mut ns = proximadb_catalog::CatalogNamespace::new(nslevels(&["acme", "sales"]));
+        ns.tenant_id = Some("acme".to_string());
+        let mut tables = HashMap::new();
+        for id in 1_u16..=5 {
             let mut schema = CatalogTableSchema::new(&format!("t{id}"));
             schema.stable_namespace_id = Some(id);
-            state.apply_committed(
-                seq,
-                CatalogDelta::UpsertTable {
-                    identifier: TableIdentifier::new(
-                        nslevels(&["acme", "sales"]),
-                        format!("t{id}"),
-                    ),
-                    schema: Box::new(schema),
-                },
+            tables.insert(
+                TableIdentifier::new(nslevels(&["acme", "sales"]), format!("t{id}")),
+                schema,
             );
         }
+        let legacy = LegacyImage {
+            account_ids: HashMap::new(),
+            namespaces: HashMap::from([(nslevels(&["acme", "sales"]), ns)]),
+            tables,
+            statistics: HashMap::new(),
+            applied_seq: 0,
+        };
+        let state = crate::services::system_catalog_state::SystemCatalogState::from_snapshot_bytes(
+            &rmp_serde::to_vec_named(&legacy)?,
+        )?;
         let cat = SystemCatalog::new(
             "legacy",
             state,
@@ -4219,12 +4234,10 @@ mod tests {
         );
         // The per-account floor for acme sits above ITS OWN high-water (5)…
         let acme_ns2 = nslevels(&["acme", "hr"]);
-        // (namespace must exist for the typed mint to fire)
         cat.create_namespace_for_tenant(&acme_ns2, HashMap::new(), Some("acme"))
             .await?;
-        let schema = vec_schema("people");
         let minted = cat
-            .create_table(&TableIdentifier::new(acme_ns2, "people"), schema)
+            .create_table(&TableIdentifier::new(acme_ns2, "people"), vec_schema("people"))
             .await?;
         assert_eq!(
             minted.stable_namespace_id,

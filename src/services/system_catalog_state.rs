@@ -1255,7 +1255,19 @@ mod tests {
         assert_eq!(restored.max_collection_id_ever(), Some(3));
 
         let new_bytes = restored.to_snapshot_bytes()?;
-        let decoded_by_old: PreHighWaterSnapshot = rmp_serde::from_slice(&new_bytes)?;
+        // TD-SPINE-1: new bytes are envelope-framed. A literal pre-envelope
+        // binary can no longer decode them (accepted pre-GA break, 2026-11-22
+        // — the envelope's first byte `P` reads as fixint 80 to a bare rmp
+        // reader). What this arm still pins is the property the envelope
+        // exists to preserve: the BODY is unchanged field-named MessagePack,
+        // so a reader that strips the frame (every post-SPINE-1 binary, via
+        // the sniff) decodes it with the OLD struct — additive keys ignored,
+        // semantics intact.
+        let body = match crate::services::catalog_record_envelope::sniff_enveloped(&new_bytes)? {
+            crate::services::catalog_record_envelope::Enveloped::Enveloped { body, .. } => body,
+            crate::services::catalog_record_envelope::Enveloped::Legacy(body) => body,
+        };
+        let decoded_by_old: PreHighWaterSnapshot = rmp_serde::from_slice(body)?;
         assert_eq!(decoded_by_old.applied_seq, 9);
         assert!(
             decoded_by_old
