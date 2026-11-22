@@ -174,6 +174,24 @@ fn equality_range_and_in_prune_only_provably_empty_blocks() {
         t.block_may_match(0, &eq_four_float),
         "4 == 4.0 in the evaluator"
     );
+    // MUTATION PROBE (pinned): the evaluator's relative-epsilon equality spans
+    // 4.0's 1-ULP neighbours (the mut_probe test pins 4.0 == 3.9999999999999996),
+    // so a block holding 4.0 must be kept for those literals — only
+    // slack-aware bounds may prune them.
+    // 11 distinct values (so the distinct set is DROPPED and only the bounds
+    // speak), one of them 4.0.
+    let block0: Vec<_> = std::iter::once(f(4.0))
+        .chain((5..=15).map(|k| f(k as f64)))
+        .map(|v| (None, v))
+        .collect();
+    let (f_t, f_rows) = table(&[block0]);
+    assert!(f_t.blocks[0][1].distinct.is_none(), "bounds-only block");
+    let eq = cmp(COL2, ComparisonOperator::Equals, json!(3.9999999999999996));
+    assert!(
+        f_t.block_may_match(0, &eq),
+        "evaluator matches 3.9999999999999996 against the 4.0 row; bounds-only pruning must keep"
+    );
+    assert!(any_row_matches(&f_rows[0], &eq), "positive control");
 }
 
 #[test]
@@ -348,7 +366,12 @@ fn value_pool(kind: usize, rng: &mut Rng) -> Option<PV> {
     ];
     let pick_int = |rng: &mut Rng| [-5i64, -1, 0, 1, 2, 3, 4, 7, 100, (1 << 60) + 1][rng.below(10)];
     let pick_float =
-        |rng: &mut Rng| [-2.5f64, 0.0, 0.5, 1.0, 1.5, 3.0, 4.000000000000001, 1e20][rng.below(8)];
+        // 4.0 and its 1-ULP neighbours: the evaluator's relative-epsilon
+        // equality spans them, so only slack-aware bounds may prune them.
+        |rng: &mut Rng| {
+            [-2.5f64, 0.0, 0.5, 1.0, 1.5, 3.0, 4.0, 4.000000000000001, 3.9999999999999996, 1e20]
+                [rng.below(10)]
+        };
     match kind {
         0 => None,
         1 => Some(PV::Null),
@@ -374,6 +397,7 @@ fn literal_pool(rng: &mut Rng) -> Value {
         json!(4),
         json!(4.0),
         json!(4.000000000000001),
+        json!(3.9999999999999996),
         json!(-5),
         json!(1.5),
         json!(100),
@@ -446,6 +470,25 @@ fn random_filter(rng: &mut Rng, depth: usize) -> FilterExpression {
             random_filter(rng, depth - 1),
         ]),
         _ => FilterExpression::Not(Box::new(random_filter(rng, depth - 1))),
+    }
+}
+
+#[test]
+fn mut_probe_evaluator_float_equality() {
+    use proximadb_search_types::sql_value_filter::evaluate_filter_resolved;
+    let f = FilterExpression::Comparison {
+        field: "x".into(),
+        operator: ComparisonOperator::Equals,
+        value: serde_json::json!(3.9999999999999996),
+    };
+    for row in [
+        json!(4.0),
+        json!(4),
+        json!(4.000000000000001),
+        json!(3.9999999999999996),
+    ] {
+        let m = evaluate_filter_resolved(&f, &|_: &str| Some(row.clone()));
+        eprintln!("PROBE {row} matches: {m}");
     }
 }
 
