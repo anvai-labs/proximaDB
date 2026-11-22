@@ -66,7 +66,11 @@ The operator's `PROXIMADB_EXTERNAL_TABLE_ROOTS` allowlist must cover the table r
 The read route checks the allowlist again on open. Unix local reads open files
 relative to the configured directory and refuse symlinks beneath it. S3 and GCS
 use their object-store backends when present in the build. Registered pinned
-tables are read-only. The first pgwire slice handles unqualified names in the
+tables are read-only. Iceberg and Delta reads depend on the producer keeping
+the selected metadata, data and delete objects immutable and retaining them
+for the read. Source version selection does not enforce object immutability.
+NDJSON checks each range against the pinned manifest digest chain.
+The first pgwire slice handles unqualified names in the
 default namespace and reads pinned Iceberg tables under an ungoverned identity.
 Mixed-storage queries, policy-governed scans and EXPLAIN are deferred.
 pgwire renders exact decimal values as text with its current wire type mapping.

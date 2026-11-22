@@ -141,7 +141,7 @@ mod imp {
         ];
         let batch = RecordBatch::try_new(schema.clone(), columns).unwrap();
         let props = WriterProperties::builder()
-            .set_max_row_group_size(8192)
+            .set_max_row_group_row_count(Some(8192))
             .build();
         let file = std::fs::File::create(path).unwrap();
         let mut writer = ArrowWriter::try_new(file, schema, Some(props)).unwrap();

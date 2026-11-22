@@ -160,8 +160,8 @@ impl ScanProjection {
         // Entries pair a logical output expression with the physical field
         // it reads. Kernel evaluates the retained literals using their types.
         let mut outputs = Vec::new();
-        fn insert_literals<'a>(
-            outputs: &mut Vec<(Option<&'a str>, ExpressionRef)>,
+        fn insert_literals(
+            outputs: &mut Vec<(Option<&str>, ExpressionRef)>,
             expressions: &[ExpressionRef],
         ) -> bool {
             if expressions

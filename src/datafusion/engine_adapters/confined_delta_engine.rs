@@ -44,7 +44,7 @@ impl ConfinedDeltaEngine {
             LazyLock::new(|| Arc::new(TokioBackgroundExecutor::new()));
         let inner = DefaultEngine::builder(store.clone())
             .with_task_executor(EXECUTOR.clone())
-            .with_batch_size(NonZeroUsize::new(8192).unwrap())
+            .with_batch_size(NonZeroUsize::new(8192).unwrap_or(NonZeroUsize::MIN))
             .with_buffer_size(NonZeroUsize::MIN)
             .build();
         Self { inner }
