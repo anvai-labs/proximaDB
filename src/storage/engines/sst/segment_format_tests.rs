@@ -1403,6 +1403,12 @@ fn rawf32_pax_segment_round_trips_exact() {
     let bytes = std::fs::read(&path).unwrap();
     assert_eq!(SegmentFormat::detect(&bytes), SegmentFormat::Pax);
 
+    assert!(
+        checked_complete_footer(&bytes).unwrap().is_none(),
+        "legacy body is reusable without coalesced facts"
+    );
+    assert!(checked_complete_footer(&bytes[..bytes.len() - 1]).is_err());
+
     // Round-trip: RawF32 decodes to the EXACT input vectors (not an
     // approximation, unlike RaBitQ/SQ8 reconstruction).
     let back = read_segment_records(&bytes, &[], &[], None).unwrap();
@@ -2008,6 +2014,7 @@ async fn unreadable_compaction_input_is_an_error_not_lossy() {
 /// reads — stands in for an `s3://`/`az://` backend behind the port.
 #[derive(Debug, Default)]
 struct CountingObjectStore {
+    reject_range_len: Option<u64>,
     objects: std::collections::HashMap<String, Vec<u8>>,
     whole_reads: std::sync::atomic::AtomicUsize,
     ranged_reads: std::sync::atomic::AtomicUsize,
@@ -2047,6 +2054,13 @@ impl proximadb_storage_filesystem_types::FileSystem for CountingObjectStore {
     ) -> proximadb_storage_filesystem_types::FsResult<Vec<u8>> {
         self.ranged_reads
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self.reject_range_len == Some(length) {
+            return Err(
+                proximadb_storage_filesystem_types::FilesystemError::Network(
+                    "range too large".into(),
+                ),
+            );
+        }
         let bytes = self.object(path)?;
         let start = (offset as usize).min(bytes.len());
         let end = (offset.saturating_add(length) as usize).min(bytes.len());
@@ -2476,6 +2490,13 @@ fn coalesced_region_and_footer_parse_from_written_segment() {
     assert!(meta.block_count >= 1);
 
     let bytes = std::fs::read(&path).unwrap();
+
+    assert!(checked_complete_footer(&bytes).unwrap().is_some());
+    assert!(checked_complete_footer(&bytes[..bytes.len() - 1]).is_err());
+    let mut corrupt = bytes.clone();
+    let footer_length = corrupt.len() - 16;
+    corrupt[footer_length..footer_length + 8].fill(255);
+    assert!(checked_complete_footer(&corrupt).is_err());
 
     // Footer-index: block table + rabitq mirror match the SegmentMeta.
     let footer = SegmentFooterIndex::locate_in_segment(&bytes)
@@ -6408,5 +6429,105 @@ async fn l2_resident_region_a_probe_ranges_are_not_refetched() {
     assert!(
         probe_gets.is_empty(),
         "L2-resident Region-A ranges must be served from L2, not re-GET: {probe_gets:?}"
+    );
+}
+
+// These serial tests exercise the two independent operator settings. Keep
+// process-global env restoration panic-safe even when a fixture fails.
+struct TestReadLimits([(&'static str, Option<std::ffi::OsString>); 2]);
+
+impl TestReadLimits {
+    fn install() -> Self {
+        Self(
+            [
+                ("PROXIMADB_PAX_PREFIX_PREFETCH_BYTES", "128"),
+                ("PROXIMADB_PAX_WHOLE_OBJECT_MAX_BYTES", "8388608"),
+            ]
+            .map(|(key, value)| {
+                let before = std::env::var_os(key);
+                unsafe { std::env::set_var(key, value) };
+                (key, before)
+            }),
+        )
+    }
+}
+impl Drop for TestReadLimits {
+    fn drop(&mut self) {
+        for (key, value) in &self.0 {
+            match value {
+                Some(v) => unsafe { std::env::set_var(key, v) },
+                None => unsafe { std::env::remove_var(key) },
+            }
+        }
+    }
+}
+
+#[test]
+#[serial]
+fn whole_object_limit_does_not_widen_a_large_segment_prefix() {
+    let _settings = TestReadLimits::install();
+    assert!(whole_query_body_eligible((8 << 20) - 1));
+    assert!(whole_query_body_eligible(8 << 20));
+    assert!(!whole_query_body_eligible((8 << 20) + 1));
+    assert!(!prefix_read_covers_segment(129));
+}
+
+#[tokio::test]
+#[serial]
+async fn failed_wide_query_body_keeps_the_ann_range_plan() {
+    let _settings = TestReadLimits::install();
+    let dir = tempfile::tempdir().unwrap();
+    let local = dir.path().join("small.pax");
+    let corpus = write_oid_failure_fixture(&local, false);
+    let path = "s3://test/immutable-small.pax";
+    let bytes = std::fs::read(local).unwrap();
+    let size = bytes.len() as u64;
+    let mut fs = CountingObjectStore::default();
+    fs.objects.insert(path.to_owned(), bytes);
+    let original = rabitq_search_segment_coalesced_allowed(
+        &fs,
+        path,
+        &corpus[0],
+        3,
+        RankMetric::L2,
+        None,
+        None,
+        None,
+        Some(size),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let baseline_reads = fs.ranged_reads.swap(0, std::sync::atomic::Ordering::SeqCst);
+    fs.reject_range_len = Some(size);
+    let fallback = super::super::query_body::QueryBodies::default()
+        .scope(rabitq_search_segment_coalesced_allowed(
+            &fs,
+            path,
+            &corpus[0],
+            3,
+            RankMetric::L2,
+            None,
+            None,
+            None,
+            Some(size),
+        ))
+        .await
+        .unwrap()
+        .expect("ordinary ranges still serve ANN");
+    assert_eq!(
+        fs.ranged_reads.load(std::sync::atomic::Ordering::SeqCst),
+        baseline_reads + 1,
+        "one failed speculative GET must precede the same successful ranges"
+    );
+    assert_eq!(
+        original
+            .into_iter()
+            .map(|h| (h.oid, h.distance))
+            .collect::<Vec<_>>(),
+        fallback
+            .into_iter()
+            .map(|h| (h.oid, h.distance))
+            .collect::<Vec<_>>()
     );
 }

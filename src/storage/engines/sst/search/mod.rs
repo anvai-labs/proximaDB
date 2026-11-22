@@ -181,7 +181,12 @@ tokio::task_local! {
 
 /// Run one search with a per-query discovery memo (see [`DISCOVERY_MEMO`]).
 async fn scope_discovery_memo<F: std::future::Future>(search: F) -> F::Output {
-    DISCOVERY_MEMO.scope(Default::default(), search).await
+    DISCOVERY_MEMO
+        .scope(
+            Default::default(),
+            super::query_body::QueryBodies::default().scope(search),
+        )
+        .await
 }
 
 /// The live segment data files in one LIST of a collection data directory:
@@ -586,7 +591,7 @@ impl SstEngine {
                     // segment keeps the whole collection on the cascade.
                     Some(facts) if !facts.has_f32_tier => SegmentCountFact::Lossy,
                     Some(facts) => SegmentCountFact::Rows(facts.row_count),
-                    None => self.segment_count_fact(&f.url).await,
+                    None => self.segment_count_fact(f, files.len() == 1).await,
                 }
             }))
             .await;
@@ -607,9 +612,13 @@ impl SstEngine {
     }
 
     /// One segment's contribution to `segment_vector_count`.
-    async fn segment_count_fact(&self, url: &str) -> SegmentCountFact {
+    async fn segment_count_fact(&self, file: &DiscoveredSstFile, single: bool) -> SegmentCountFact {
+        let url = &file.url;
         if url.ends_with(".pax") {
-            match self.pax_footer_facts(url).await {
+            match self
+                .pax_footer_facts(url, if single { file.size_bytes } else { None })
+                .await
+            {
                 Some(facts) if !facts.exact_authority => SegmentCountFact::Lossy,
                 Some(facts) => SegmentCountFact::Rows(facts.row_count),
                 None => SegmentCountFact::Unknown,
@@ -629,20 +638,34 @@ impl SstEngine {
     /// per segment, not per query. `None` for a legacy (non-coalesced) PAX
     /// segment or any read error — the gate then treats that segment as
     /// uncounted, as before (TD-SEAM-11).
-    async fn pax_footer_facts(&self, url: &str) -> Option<PaxFooterFacts> {
+    async fn pax_footer_facts(&self, url: &str, listed: Option<u64>) -> Option<PaxFooterFacts> {
         if let Some(facts) = PAX_FOOTER_FACTS.get(url) {
             return Some(*facts);
         }
-        let port = self.filesystem_port();
-        let footer =
-            crate::storage::engines::sst::segment_format::read_coalesced_segment_footer(&port, url)
+        // On a directory miss, the same bounded object can serve admission
+        // and the eventual exact or ANN scorer. Keep the normal footer path
+        // for unreadable/legacy inputs, old snapshots and busy reservations.
+        let body = if listed.is_some_and(super::segment_format::whole_query_body_eligible)
+            && let Ok(fs) = self.filesystem().get_filesystem(url)
+        {
+            super::segment_format::small_query_body(fs.as_ref(), url, listed).await
+        } else {
+            None
+        };
+        let footer = match body {
+            Some(Ok(bytes)) => super::segment_format::checked_complete_footer(&bytes)
+                .ok()
+                .flatten()?,
+            _ => super::segment_format::read_coalesced_segment_footer(&self.filesystem_port(), url)
                 .await
                 .ok()
-                .flatten()?;
+                .flatten()?,
+        };
         let facts = PaxFooterFacts {
             row_count: usize::try_from(footer.row_count).ok()?,
             exact_authority: footer.has_f32_tier,
         };
+
         if PAX_FOOTER_FACTS.len() >= PAX_FOOTER_FACTS_CACHE_MAX {
             // Bounded: entries for compacted-away segments are never read again,
             // so a full reset only costs a re-read of live segments.
@@ -1457,6 +1480,16 @@ impl SstEngine {
         !files.is_empty()
     }
 
+    async fn read_pax_body(&self, path: &str) -> Result<std::sync::Arc<Vec<u8>>> {
+        if let Some(bytes) = super::query_body::get(path) {
+            return Ok(bytes);
+        }
+        super::staged_write::read_object_bytes(&self.filesystem_port(), path)
+            .await
+            .map(std::sync::Arc::new)
+            .map_err(|e| anyhow::anyhow!("read pax segment {path}: {e}"))
+    }
+
     /// Read all records from one SST segment, dispatching on the engine's block
     /// format (an engine writes a single format, so no per-file detection).
     async fn read_segment_records(
@@ -1488,12 +1521,7 @@ impl SstEngine {
             BlockFormat::PaxBlock => {
                 // P3: read a PAX segment via the mixed-format primitive (magic-detected,
                 // reuses PaxSegmentScanner). Best-effort schema keys (empty) for now.
-                let bytes = crate::storage::engines::sst::staged_write::read_object_bytes(
-                    &self.filesystem_port(),
-                    file,
-                )
-                .await
-                .map_err(|e| anyhow::anyhow!("read pax segment {file}: {e}"))?;
+                let bytes = self.read_pax_body(file).await?;
                 // tenant_ctx None: the AXIS rebuild indexes vectors per-collection and
                 // does not consume record.tenant_id. (Deriving the owning tenant from
                 // the DrPathBuilder segment path is a follow-up for when the
@@ -2845,6 +2873,7 @@ self.try_pax_cascade(
                 let cid = collection_id.to_string();
                 let url = storage_url.to_string();
                 let prune = prune_config.clone();
+                let bodies = super::query_body::QueryBodies::current();
                 let trace = trace_handle.clone();
                 let scan_path = path.clone();
                 let cells = directory_cells.get(&path).cloned();
@@ -2881,7 +2910,7 @@ self.try_pax_cascade(
                                     known_size,
                                     deferred.as_deref(),
                                 );
-                                let scan = scope_directory_cells(cells, scan);
+                                let scan = bodies.scope(scope_directory_cells(cells, scan));
                                 if let Some(trace) = trace {
                                     crate::observability::io_trace::scope_with_handle(trace, scan)
                                         .await
@@ -3731,12 +3760,7 @@ self.try_pax_cascade(
 
         debug!("📦 Exact PAX scan: {}", pax_path);
 
-        let bytes = crate::storage::engines::sst::staged_write::read_object_bytes(
-            &self.filesystem_port(),
-            pax_path,
-        )
-        .await
-        .map_err(|e| anyhow::anyhow!("read pax segment {pax_path}: {e}"))?;
+        let bytes = self.read_pax_body(pax_path).await?;
         if require_exact_authority
             && !crate::storage::engines::sst::segment_format::pax_segment_has_exact_vector_authority(
                 &bytes,
@@ -4952,7 +4976,7 @@ mod tests {
             .unwrap();
             let url = format!("file://{}", path.display());
             let facts = engine
-                .pax_footer_facts(&url)
+                .pax_footer_facts(&url, None)
                 .await
                 .expect("coalesced footer facts");
             assert_eq!(facts.row_count, 5, "{name}");
