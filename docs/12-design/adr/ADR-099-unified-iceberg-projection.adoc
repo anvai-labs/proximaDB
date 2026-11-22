@@ -7,7 +7,7 @@
 
 [cols="1,3"]
 |===
-| Status | **Accepted (owner decision 2026-11-22, after the Iceberg-primary thought experiments of 2026-11-21/22).** Implementation Open; tracked under TD-SPINE-4 follow-ups, TD-PAXMETA-2 and a new TD-ICEPROJ-1.
+| Status | **Accepted (owner decision 2026-11-22, after the Iceberg-primary thought experiments of 2026-11-21/22).** Implementation Open; tracked under TD-ICEPROJ-1 (new) and TD-PAXMETA-2 (amended); the projection inherits TD-SPINE-3/4 mechanisms (metadata GC, manifest pruning, lazy footers) as dependencies.
 | Date | 2026-11-22
 | Deciders | Vijaykumar Singh
 | Amends | link:ADR-097-foundational-seams-single-logical-ir.adoc[ADR-097] S4/S7 (the Iceberg export seam becomes a *unified projection* with the obligations below; reciprocal dated note added to ADR-097).
@@ -38,7 +38,8 @@ segments and blocks from one directory GET, zero footer reads).
 |===
 | Dimension | PAX/PXCD hot + Iceberg projection (chosen) | Iceberg-primary (rejected for the hot path)
 | Cold filtered query | 1 directory GET → 0 footers (measured, #2559) | 3 GETs + LIST per commit generation; row-group pruning after footer reads
-| ANN scan | Coalesced ranged RaBitQ scan (TD-RDSTRAT-12: 1.61× aggregate, 1.54× cold at 50 ms RTT; 2.78–2.81× at 100–150 ms real-cloud RTT) | Rebuild page-offset coalescing on top of Parquet encodings
+| ANN scan | Coalesced ranged RaBitQ scan (TD-RDSTRAT-12: 1.61× aggregate, 1.54× cold at 50 ms RTT; 2.78–2.81× with 100–150 ms Toxiproxy-injected RTT on the Azurite bed (the
+  S3/MinIO bed did not reproduce ≥2× there: 1.22–1.46× — real-cloud latency remains unmeasured)) | Rebuild page-offset coalescing on top of Parquet encodings
 | Per-flush cost | 3 GETs + 1 LIST + 1 PUT (+1 DELETE of the oldest directory generation from the third flush on), bounded 5 s | metadata.json + manifest list + manifest Avro per commit; grows with file count; invalidates the manifest cache for every pod
 | Compaction clustering | PCA/IVF ours, one pass (TD-PAXMETA-2) | Algorithm ours anyway (ecosystem rewrite_data_files sorts scalars only) + Parquet re-encode per pass
 | Graph traversal | ORION adjacency layout (no e2e traversal bench in the ledger yet; TD-ICEPROJ-1 pins one before any comparison) | CSR-on-Parquet possible but pays footer/page-index per hop

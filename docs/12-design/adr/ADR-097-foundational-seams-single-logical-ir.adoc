@@ -66,10 +66,6 @@ remain open. No change to the accepted single-IR or modality-format decisions is
 | S6 Plan | One logical IR (D1).
 | S7 Index | Indexes are catalog projections, rebuildable from object storage and invalidated by LSN or snapshot.
 
-*Amended 2026-11-22 (link:ADR-099-unified-iceberg-projection.adoc[ADR-099]):* the S4/S7 Iceberg
-export seam is re-specified as a **unified projection** — vectors as `fixed`/`binary` columns
-with per-segment model metadata, graph adjacency as native `list` CSR tables, any-column
-export, and one-plan cross-modality queries. See ADR-099 D2 for the obligations.
 | S8 Cost | One ADR-033 cost spine (DEPTH ≫ WIDTH ≫ BYTES ≫ CPU) chooses engine, exact vs ANN vs prefilter (ADR-011 thresholds), and tier.
 | S9 Govern | ABAC row and column filters are enforced in every S5 provider; no UDTF path bypasses them.
 |===
@@ -77,6 +73,11 @@ export, and one-plan cross-modality queries. See ADR-099 D2 for the obligations.
 A new modality, operator or format is admitted by naming which seam it implements and showing
 that it honours that seam's contract. Code that writes around a seam (its own WAL, its own
 metadata tree, its own identity) is a defect against this ADR.
+
+*Amended 2026-11-22 (link:ADR-099-unified-iceberg-projection.adoc[ADR-099]):* the S4/S7 Iceberg
+export seam is re-specified as a **unified projection** — vectors as `fixed`/`binary` columns
+with per-segment model metadata, graph adjacency as native `list` CSR tables, any-column
+export, and one-plan cross-modality queries. See ADR-099 D2 for the obligations.
 
 *Amended 2026-11-19 (link:ADR-098-metadata-spine.adoc[ADR-098]):* ADR-098 adds seam **S10 Catalog** (L0 SystemCatalog record envelope + per-account snapshot shards) and specifies the S2 declared durability mode, the S4 metadata hygiene (Iceberg metadata GC, bounded metadata log, manifest-stats pruning and cache) and the S7 L1 collection segment directory.
 
