@@ -1766,6 +1766,7 @@ jobs:
           CARGO_PROFILE_DEV_DEBUG: 0
         run: cargo clippy -p proximadb --lib --features enterprise-catalogs -- -D warnings
       - name: Save enterprise test build timings
+        continue-on-error: true  # Diagnostic storage availability is independent of correctness.
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v7
         with:
@@ -3213,7 +3214,7 @@ jobs:
           # Overlapping globs selected query_cache_test three times. Preserve
           # first-match order and run each target once with the same stack.
           declare -A ran_query_target=()
-          for test_file in tests/*query*.rs tests/*federated*.rs tests/*cache*.rs tests/filtered_ann_recall_bands.rs tests/vector_ann_recall_e2e.rs tests/retrieval_quality_gates.rs tests/nl_translate_eval.rs; do
+          for test_file in tests/*query*.rs tests/*federated*.rs tests/*cache*.rs tests/filtered_ann_recall_bands.rs tests/query_cache_test.rs tests/vector_ann_recall_e2e.rs tests/retrieval_quality_gates.rs tests/nl_translate_eval.rs; do
             if [[ -f "$test_file" && -z "${ran_query_target[$test_file]:-}" ]]; then
               ran_query_target["$test_file"]=1
               test_name=$(basename "$test_file" .rs)
