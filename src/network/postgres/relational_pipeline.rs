@@ -1646,8 +1646,15 @@ async fn execute_pinned_external_select(
         Vec::with_capacity(pinned.len());
     for (name, schema) in pinned {
         let provider = pinned_external::open_table(&schema, &controls).await;
-        controls.check_cancelled().map_err(|e| e.to_string())?;
-        let provider = provider.map_err(|e| format!("pinned external table {name}: {e:#}"))?;
+        let provider = controls
+            .check_cancelled()
+            .map_err(|e| e.to_string())
+            .and_then(|()| provider.map_err(|e| format!("pinned external table {name}: {e:#}")))
+            .inspect_err(|_| {
+                crate::observability::io_trace::record_setup_ms(
+                    setup_start.elapsed().as_millis() as u64
+                );
+            })?;
         providers.push((name, Arc::new(provider)));
     }
     let context = QueryExecutionContext {
