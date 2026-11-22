@@ -53,12 +53,17 @@ The JSONL records also include query trace timings and completed pinned
 binds by format. Each format reports attempts, failures, summed
 `elapsed_us` and the number of splits in successfully bound inventories.
 Setup includes elapsed bind time, including on a bind failure. Split count
-describes the bound inventory. Scan opens and requests have separate counters.
+describes the bound inventory. It excludes scan opens and requests.
 After a SQL error, a command on the same connection lets the server finish
 publishing the error trace before the sweep reads it. When a client deadline or
 connection failure prevents synchronization, the sweep marks traces unavailable
 for the affected and subsequent queries.
-It evaluates the top-level `ORDER BY` against the typed wire rows, applies
+
+image::../assets/benchmarks/tpc-pinned-query-trace.png[Pinned-source trace attribution on success, SQL error, and deadline or connection failure]
+
+link:../assets/benchmarks/tpc-pinned-query-trace.mmd[Mermaid source]
+
+The verifier evaluates the top-level `ORDER BY` against the typed wire rows, applies
 explicit NULL placement or PostgreSQL defaults, and accepts any sequence
 within a group of equal sort keys. An expression that cannot be evaluated
 from the returned columns fails verification. LIMIT queries still compare

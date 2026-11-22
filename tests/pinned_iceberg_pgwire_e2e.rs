@@ -800,7 +800,7 @@ async fn pgwire_reads_only_the_authorized_pinned_snapshot() {
         wait_for_failed_query_trace(&client).await.unwrap();
         let failed = traces.try_recv().expect("trace for failed Delta bind");
         assert_eq!(failed.pinned_binds.len(), 1);
-        let delta = &failed.pinned_binds["delta"];
+        let delta = &failed.pinned_binds[&io_trace::PinnedSourceFormat::Delta];
         assert_eq!(
             (delta.attempts, delta.failures, delta.bound_splits),
             (1, 1, 0)
@@ -815,7 +815,7 @@ async fn pgwire_reads_only_the_authorized_pinned_snapshot() {
             .try_recv()
             .expect("trace for successful Iceberg bind");
         assert_eq!(succeeded.pinned_binds.len(), 1);
-        let iceberg = &succeeded.pinned_binds["iceberg"];
+        let iceberg = &succeeded.pinned_binds[&io_trace::PinnedSourceFormat::Iceberg];
         assert_eq!((iceberg.attempts, iceberg.failures), (1, 0));
         assert!(traces.try_recv().is_err());
     }

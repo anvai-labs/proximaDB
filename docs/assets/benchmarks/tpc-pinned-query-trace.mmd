@@ -1,0 +1,35 @@
+---
+title: Pinned-source trace attribution in the TPC sweep
+config:
+  theme: neutral
+  fontFamily: system-ui
+  sequence:
+    useMaxWidth: false
+    wrap: true
+    width: 165
+    messageMargin: 28
+    diagramMarginX: 20
+    mirrorActors: false
+---
+sequenceDiagram
+    accTitle: Pinned-source trace attribution in the TPC sweep
+    accDescr: Successful queries read their trace after ReadyForQuery. SQL errors require a synchronization query. Deadlines and connection failures disable trace capture for the rest of the sweep.
+    participant Sweep as TPC sweep
+    participant Server as pgwire and pinned binder
+    participant Buffer as Trace buffer
+
+    Sweep->>Server: Send one SQL statement
+    Note over Server,Buffer: Time each pinned-source bind.<br/>Iceberg, Delta, and NDJSON<br/>Record attempts, failures, and splits.<br/>Include bind time in setup.
+    alt Successful SQL statement
+        Server->>Buffer: Publish completed trace
+        Server-->>Sweep: ReadyForQuery after the rows
+        Sweep->>Buffer: Take the trace and attach it to this row
+    else SQL error
+        Server-->>Sweep: ErrorResponse can arrive first
+        Sweep->>Server: Send SELECT 1 on the same connection
+        Server->>Buffer: Publish the failed statement's trace if it bound a source
+        Server-->>Sweep: ReadyForQuery for SELECT 1
+        Sweep->>Buffer: Take the failed statement's trace if present
+    else Deadline, connection loss, or failed synchronization
+        Note over Sweep,Buffer: Record trace_error and disable later attachments.<br/>A trace could arrive after the client stops waiting.
+    end
