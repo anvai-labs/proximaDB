@@ -107,6 +107,104 @@ dated 2026-07-15/16, before the TD-COMPACT-5 training arm landed (#1207,
 2026-07-25), and a single-batch flush cannot reach count 5 -- so compaction
 legitimately never became due for them.
 
+== Reproducing SIFT1M request, byte, and cache measurements
+
+Use the three TEXMEX corpus files `sift_base.fvecs`, `sift_query.fvecs`, and
+`sift_groundtruth.ivecs`. From the repository root, run each test in its own
+process because the harness sets PAX environment variables. This local
+recipe ingests all 1,000,000 vectors and searches the first 100 queries at
+top-10. Both recall arms use the uncompacted layout. The two L0 overrides
+allow the 50 flushes to finish in the disposable test process, where no
+compaction drains L0.
+
+[source,bash]
+----
+export PROXIMADB_SIFT_DATASET_DIR=/path/to/sift1m
+export PROXIMADB_RECALL_DATASET_REQUIRED=1 PROXIMADB_SIFT_N=1000000 PROXIMADB_SIFT_QUERIES=100
+export PROXIMADB_L0_STOP_TRIGGER=0 PROXIMADB_L0_SLOWDOWN_TRIGGER=0
+unset PROXIMADB_OBJECT_STORE_URL PROXIMADB_PAX_READ_BLOCK_PRUNE_STATS_DISABLE
+export PROXIMADB_SEGMENT_INVARIANTS_CACHE_MB=0 PROXIMADB_SURVIVOR_CACHE_BUDGET_MB=0
+
+cargo test --locked --features io-trace --test sift_pax_recall_ratchet_test \
+  sift_pax_cascade_recall_at_10_ratchet_rg_layout -- --exact --nocapture
+cargo test --locked --features io-trace --test sift_pax_recall_ratchet_test \
+  sift_pax_filtered_cascade_recall_ratchet_shipped_defaults -- --exact --nocapture
+
+PROXIMADB_SIFT_FLUSH_BATCH=20000 cargo test --locked --features io-trace \
+  --test sift_pax_recall_ratchet_test sift_get_counts_directory_at_flush_on \
+  -- --ignored --exact --nocapture --test-threads=1
+PROXIMADB_SIFT_FLUSH_BATCH=20000 cargo test --locked --features io-trace \
+  --test sift_pax_recall_ratchet_test sift_get_counts_directory_at_flush_off \
+  -- --ignored --exact --nocapture --test-threads=1
+----
+
+* The unfiltered arm emits `SIFT paired exact/ANN evidence` and
+  `SIFT {exact,ANN} cache-outcome evidence`. At N=1M the exact-scan budget gives
+  three paired queries. The GET, ranged GET, bytes, compute time, latency and
+  cache outcome lines cover those three pairs. Recall@10 covers all 100 ANN
+  queries. The filtered arm measures recall against a filter-specific exact
+  reference and emits no comparable request or cache counters.
+* The `SIFT_GET_COUNTS` JSON records ingest, fresh-process first-query
+  reads, and steady Adaptive reads. `cold_metadata` is the first-query
+  Adaptive minus Approximate request count. These arms run the same query
+  through ANN, with Adaptive also asking for the collection row count.
+  For steady bytes per query, divide `steady.total.bytes_read` by
+  `steady.queries`. GET includes ranged GET. Read requests sum GET, LIST,
+  and HEAD. `waves` estimates sequential request depth from traced
+  concurrency, with `null` for an unavailable single-query estimate.
+  The counts are traced storage operations and payload bytes. Use the
+  cache-tier sweep for reconciliation against the emulator's wire log.
+  See link:TD-PAXMETA-1-collection-level-segment-facts.adoc#_request_count_evidence_harness_counts_only[TD-PAXMETA-1].
+* `--features io-trace` enables detailed cache outcomes. Request and byte
+  counters are always available. `footer` reports instrumented footer
+  lookups, `survivor-L1` reports DRAM lookups for survivor ranges, and
+  `L2` reports persistent local-cache lookups. These are database cache
+  tiers. Each counter describes its own lookup site, and zero hits plus
+  zero misses means there is no observed hit rate. `bypass` with
+  `cache_policy=disabled` is the cache-disabled baseline. `cold` records
+  misses and GETs with no hits, `mixed` records hits and GETs, and `warm`
+  records hits with no GETs in the measured scope. OS page-cache state is
+  uncontrolled in the local recipe.
+* To sample the paired harness with DRAM caches, set explicit nonzero
+  `PROXIMADB_SEGMENT_INVARIANTS_CACHE_MB` and/or
+  `PROXIMADB_SURVIVOR_CACHE_BUDGET_MB`. The harness injects fresh
+  memory-only caches. For a deliberate object-cold, DRAM-warm, and
+  persistent-disk-warm comparison, use
+  `scripts/bench/cache_tier_sweep.py --help` with an `io-trace`-enabled
+  server, an Azurite store and its debug log, and one fixed corpus and layout.
+  The sweep verifies actual local-disk hits after a restart and reconciles
+  ranged GETs against the wire log. For latency comparisons, use release
+  builds and match storage, layout, query slice, concurrency, and cache
+  treatment across runs.
+
+=== Local baseline on 2026-11-22
+
+Commit `e97d74f6b` on develop base `f0c3b52bd`, debug build, file storage,
+50 uncompacted segments of 20,000 rows. Both the unfiltered and filtered
+arms reached 0.9820 recall@10 across 100 queries each. The filtered arm
+uses eight interleaved partitions. In the three unfiltered pairs, exact averaged
+50.00 GETs (0 ranged) and 752,311,900 bytes per query. ANN averaged 319.67
+GETs (319.33 ranged) and 196,007,668 bytes. Both arms reported `bypass`.
+This build omitted `io-trace`, and the paired cache policy was disabled.
+Paired median times were 5.91 s (exact) and 0.578 s (ANN). With three
+samples these times describe this debug run.
+
+In the dedicated request-count run, both modes reached 0.9820 recall@10.
+Their steady averages were identical at 154.63 ranged GETs and
+114,154,443.6 bytes per query.
+
+[cols="1,1,1,1,1,1",options="header"]
+|===
+| Directory at flush | Cold metadata GETs | Cold Adaptive GETs | Cold Adaptive waves | Ingest GET / LIST / HEAD | Ingest read bytes
+| Off | 100 | 408 | 115 | 0 / 100 / 50 | 0
+| On | 0 | 309 | 16 | 149 / 150 / 50 | 559,960
+|===
+
+With the directory present, disabling directory decode keys for the
+fresh-process probe increased the first-query count from 309 GETs in
+Approximate to 409 in Adaptive. This confirms the scope of the 100-GET
+metadata saving at 50 segments.
+
 === Confirmed by execution — and superseded by the `compaction:off` tag
 
 Minting an id in the shared helper was the obvious fix. I made that change and
