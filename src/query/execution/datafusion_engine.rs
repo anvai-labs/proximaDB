@@ -377,9 +377,9 @@ impl DataFusionLocalEngine {
         let catalog = ParquetSchemaCatalog { schemas };
 
         // P4 lowering
-        // The shared frontend folds table keys and declines placeholders. Keep
-        // prepared statements on one planner before and after Bind substitutes
-        // literals. Exact pinned identifiers also use this planner.
+        // The shared frontend folds table keys. Use DataFusion SQL for exact
+        // pinned identifiers and to keep one planner before and after Bind
+        // substitutes parameters.
         let lowered_plan = match (!pinned_uses_engine_sql).then(|| lower_sql(sql, &catalog)) {
             None => None,
             Some(Ok(node)) => {

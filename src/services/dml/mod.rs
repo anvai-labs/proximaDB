@@ -2234,7 +2234,7 @@ impl DmlService {
             .catalog_manager
             .resolve_table_scoped_exact(sql_name, tenant)
             .await?;
-        Ok(catalog.get_table(&table_id).await?)
+        catalog.get_table(&table_id).await
     }
 
     /// FA-c Phase 2: resolve the ABAC row filter for a relational scan. Returns
