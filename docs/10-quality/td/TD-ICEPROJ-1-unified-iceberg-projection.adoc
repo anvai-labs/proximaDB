@@ -17,12 +17,16 @@
 == Problem
 
 ADR-099 keeps PAX/PXCD and ORION as the hot formats and designates Iceberg as the cold store
-and interop seam, but today's export (ADR-097 S4/S7) is row-per-edge graph rows, no vector
-columns, and a filterable-only column restriction — so external engines cannot read vector
-data, graph traversals degrade to filter-scans, and a single DataFusion plan cannot join the
+and interop seam, but the export contract (ADR-097 S4/S7) lands graph edges as row-per-edge catalog-schema
+Parquet, vector data in PAX only, and the projection carries no vector columns — so external
+engines cannot read vector data, graph traversals degrade to filter-scans, and a single DataFusion plan cannot join the
 three modalities on one snapshot.
 
 == Work items
+
+. *Pin the bake-off SLOs:* the ANN latency target and recall floor the vector criterion uses
+   (no ANN latency SLO exists in the repo today; recall floors are per-ratchet, e.g. filtered
+   SIFT 0.90), plus an ORION one-hop traversal bench (none exists in the ledger).
 
 . *Vector columns:* export id + f32/f16 as `fixed(L)`/`binary`; optional SQ8 and RaBitQ variants
   with the per-segment model in Iceberg file metadata / column properties (an ignorable
@@ -36,7 +40,7 @@ three modalities on one snapshot.
   filters over one snapshot via DataFusion (the ADR-099 D3 acceptance).
 . *Bake-off (ADR-099 D5):* per-modality measured comparisons on the request-count harness
   (emulator, deterministic counts) + real-cloud latency when available: projection-vs-PAX ANN
-  (S/25% count criterion), CSR one-hop vs ORION answer-set parity, per-hop GET counts.
+  (recall floor + pinned latency target at ≤ 1.25× the PAX request count per query), CSR one-hop vs ORION answer-set parity, per-hop GET counts.
 
 == Acceptance
 

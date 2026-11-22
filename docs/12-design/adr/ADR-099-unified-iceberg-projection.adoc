@@ -10,10 +10,10 @@
 | Status | **Accepted (owner decision 2026-11-22, after the Iceberg-primary thought experiments of 2026-11-21/22).** Implementation Open; tracked under TD-SPINE-4 follow-ups, TD-PAXMETA-2 and a new TD-ICEPROJ-1.
 | Date | 2026-11-22
 | Deciders | Vijaykumar Singh
-| Amends | link:ADR-097-foundational-seams-single-logical-ir.adoc[ADR-097] S4/S7 (the Iceberg export seam becomes a *unified projection* with the obligations below); link:ADR-042-canonical-segment-statistics-contract.adoc[ADR-042] (its 2026-11-20 amendment's pruning rules apply to the projection's row-group stats unchanged).
+| Amends | link:ADR-097-foundational-seams-single-logical-ir.adoc[ADR-097] S4/S7 (the Iceberg export seam becomes a *unified projection* with the obligations below; reciprocal dated note added to ADR-097).
 | Records the rejected alternative | **Iceberg-primary**: storing the hot serving data itself as Iceberg/Parquet with vector-native column types (RaBitQ/SQ8/f16/f32, CSR adjacency), memtable → Iceberg flush, LSM-style Iceberg compaction. Rejected for the hot path by the analysis below; revisitable per the bake-off criteria in D5.
-| Relates to | ADR-033 (cost spine DEPTH ≫ WIDTH), ADR-052 (DataFusion OLAP), ADR-063 (serverless object-store posture), link:ADR-098-metadata-spine.adoc[ADR-098] D2/D4 (PXCD is L1; Avro only at the Iceberg seam)
-| Tracked under | TD-ICEPROJ-1 (new), TD-PAXMETA-2 (clustering, amended), TD-SPINE-4 F1
+| Relates to | ADR-033 (cost spine DEPTH ≫ WIDTH), ADR-052 (DataFusion OLAP), ADR-063 (serverless object-store posture), link:ADR-098-metadata-spine.adoc[ADR-098] D2/D4 (PXCD is L1; Avro only at the Iceberg seam), link:ADR-042-canonical-segment-statistics-contract.adoc[ADR-042] (its 2026-11-20 pruning rules apply to the projection's row-group stats unchanged — application, not amendment)
+| Tracked under | TD-ICEPROJ-1 (new), TD-PAXMETA-2 (clustering, amended)
 |===
 
 == Context
@@ -38,10 +38,10 @@ segments and blocks from one directory GET, zero footer reads).
 |===
 | Dimension | PAX/PXCD hot + Iceberg projection (chosen) | Iceberg-primary (rejected for the hot path)
 | Cold filtered query | 1 directory GET → 0 footers (measured, #2559) | 3 GETs + LIST per commit generation; row-group pruning after footer reads
-| ANN scan | Coalesced ranged RaBitQ scan (TD-RDSTRAT-12: 1.61× aggregate, 1.54× cold) | Rebuild page-offset coalescing on top of Parquet encodings
-| Per-flush cost | 3 GETs + 1 LIST + 1 PUT, bounded 5 s | metadata.json + manifest list + manifest Avro per commit; grows with file count; invalidates the manifest cache for every pod
+| ANN scan | Coalesced ranged RaBitQ scan (TD-RDSTRAT-12: 1.61× aggregate, 1.54× cold at 50 ms RTT; 2.78–2.81× at 100–150 ms real-cloud RTT) | Rebuild page-offset coalescing on top of Parquet encodings
+| Per-flush cost | 3 GETs + 1 LIST + 1 PUT (+1 DELETE of the oldest directory generation from the third flush on), bounded 5 s | metadata.json + manifest list + manifest Avro per commit; grows with file count; invalidates the manifest cache for every pod
 | Compaction clustering | PCA/IVF ours, one pass (TD-PAXMETA-2) | Algorithm ours anyway (ecosystem rewrite_data_files sorts scalars only) + Parquet re-encode per pass
-| Graph traversal | ORION adjacency layout (sub-10 ms hops) | CSR-on-Parquet possible but pays footer/page-index per hop
+| Graph traversal | ORION adjacency layout (no e2e traversal bench in the ledger yet; TD-ICEPROJ-1 pins one before any comparison) | CSR-on-Parquet possible but pays footer/page-index per hop
 | Spark/Trino/DuckDB read | via the projection (this ADR) | native (scalar columns only until engines adopt our vector types)
 |===
 
@@ -56,8 +56,8 @@ The decisive observations:
   consumer would need our extensions; shipping them in N engines is the actual cost of "custom
   datatypes", and without them the bytes are inert — defeating the interop that motivated the
   pivot.
-* CSR needs **zero** custom types: an Iceberg `list<long>` adjacency column is CSR with the
-  offsets array stored for free (repetition levels). Graph is therefore the modality where the
+* CSR needs **zero** custom types: an Iceberg `list<long>` adjacency column is CSR — the offsets
+  array is derivable by prefix-sum over the per-row list lengths the repetition levels encode. Graph is therefore the modality where the
   projection is fully native *today*.
 
 == Decision
@@ -77,7 +77,7 @@ fail-closed and ours; the projection carries their content outward.
   via native `list` types; upgrades today's row-per-edge projection (which forces filter-scans
   for neighbor sets) to a traversal-capable one. Interactive multi-hop stays on ORION.
 * *Documents:* Jsonb/MessagePack payloads project as `binary` with a type tag in schema metadata
-  (the convention ADR-098 D4 already names for the seam).
+  (a NEW convention at the ADR-098 D4 seam — no precedent exists there today).
 * *Freshness:* the projection is **asynchronous** (ADR-097's projection seam) — it trails the hot
   store; it is never on the serving path (ADR-098 D2's LIST-is-the-authority rule applies
   unchanged).
@@ -95,10 +95,13 @@ projection as to any Iceberg table.
 bake-off with exit criteria (co-design mandate #2: request counts deterministic on an emulator;
 latency only on real cloud):
 
-* *Vector serving* stays PAX unless the projection + cache meets the ANN latency/recall SLO at
-  ≤ 1.25× the PAX request count per query on the SIFT harness.
+* *Vector serving* stays PAX unless the projection + cache meets the recall floor and the
+  latency target TD-ICEPROJ-1 pins before the bake-off runs (no ANN latency SLO exists in the
+  repo today) at ≤ 1.25× the PAX request count per query on the SIFT harness.
 * *Graph analytics* moves to the projection when a Trino/Spark/DuckDB one-hop over the CSR table
-  matches ORION's answer set.
+  matches ORION's answer set **and** its request count per hop is ≤ ORION's measured count on the
+  same harness (answer-set parity alone is achievable by construction — a precondition, not the
+  criterion).
 * *Interactive traversal* stays ORION unless per-hop GETs on the projection beat the adjacency
   layout's measured counts.
 * If a majority of modalities flip on that evidence, re-open this ADR (it would then be an

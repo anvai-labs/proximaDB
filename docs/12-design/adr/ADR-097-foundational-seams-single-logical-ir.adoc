@@ -65,6 +65,11 @@ remain open. No change to the accepted single-IR or modality-format decisions is
 | S5 Scan | Every physical layout has a streaming `TableProvider` with projection, filter and limit pushdown, ABAC, and a WAL-tail union. No `MemTable` on a hot path.
 | S6 Plan | One logical IR (D1).
 | S7 Index | Indexes are catalog projections, rebuildable from object storage and invalidated by LSN or snapshot.
+
+*Amended 2026-11-22 (link:ADR-099-unified-iceberg-projection.adoc[ADR-099]):* the S4/S7 Iceberg
+export seam is re-specified as a **unified projection** — vectors as `fixed`/`binary` columns
+with per-segment model metadata, graph adjacency as native `list` CSR tables, any-column
+export, and one-plan cross-modality queries. See ADR-099 D2 for the obligations.
 | S8 Cost | One ADR-033 cost spine (DEPTH ≫ WIDTH ≫ BYTES ≫ CPU) chooses engine, exact vs ANN vs prefilter (ADR-011 thresholds), and tier.
 | S9 Govern | ABAC row and column filters are enforced in every S5 provider; no UDTF path bypasses them.
 |===
