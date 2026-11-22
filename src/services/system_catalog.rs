@@ -3612,7 +3612,7 @@ mod tests {
                 .puts
                 .lock()
                 .expect("puts lock")
-                .push((path.to_string(), payload.as_bytes().len()));
+                .push((path.to_string(), payload.content_length()));
             self.inner.put_opts(path, payload, options).await
         }
         async fn put_multipart_opts(
