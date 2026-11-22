@@ -25,6 +25,8 @@ compaction with A+B co-located, and HNSW only as a hot projection.
 
 The dated study occupies sections 1–7. Section 8 records the current ANN
 read-path review and the conditions for changing PAX or PXCD layout.
+Section 9 compares the historical scale measurements and models the cost
+of retaining vectors and source data.
 
 == 1. Executive summary
 
@@ -1146,3 +1148,189 @@ matched recall, memory and latency. Keep f32 authority, filter and
 delete semantics and mixed-version reads. Rewrites must amortize their
 I/O across actual query/update rates. Consider PAX or PXCD wire changes
 only after the read-only controls isolate the extra wins.
+
+== 9. Scale, precision and retained source data (2026-11-22)
+
+=== What changed at 3M and 10M
+
+The October fixed-object sweep held the objects, query IDs and binary
+constant within each scale. The 3M and 10M corpora were prefixes of the
+ANN_SIFT1B learn split, each with its own exact ground truth. Values below
+are object-cold requests of all metered verbs per query on MinIO. The 1M
+fixture used SIFT1M. Only the 1M sweep repeated each cap twice. The
+3M/10M sweeps ran once per cap. These are historical runs.
+
+[cols="1,2,1,1,1,1",options="header"]
+|===
+| Rows | Trained segments | 4 MiB | 16 MiB | Median waves, 4 → 16 MiB | Recall@10
+| 1M | 1 | 18.46 | 13.17 | 3 → 3 | 0.9822–0.9825
+| 3M | 1 | 36.34 | 23.63 | 5 → 4 | 0.9740
+| 10M | 3 | 81.42 | 76.91 | 5 → 5 | 0.9715
+|===
+
+On the 3M fixture, raising the cap again to 40 MiB saved 0.56 more
+requests/query. At 10M it saved 0.02 more. The geometric probe plan missed
+0.98 recall in both fixtures at every cap. A wider GET can join extents in
+one object. It cannot bridge two object keys or recover an unvisited
+neighbor. The fixed-3M fragmentation ladder provides a control. At 16 MiB,
+1/2/3/4 settled segments cost 24.56/42.74/50.93/40.68 requests/query.
+Changing the compaction ceiling also changed training and cell geometry.
+Multiplying a per-segment GET average by file count would miss the reversal
+between three and four segments.
+link:../history/evidence/TIER1_E1_FIXED_OBJECT_CAP_SWEEP_2026_10_26.adoc[1M cap repeat],
+link:../history/evidence/TIER1_E1_SCALE_CAP_SWEEP_2026_10_27.adoc[3M and 10M cap evidence], and
+link:../history/evidence/TIER1_E1_FRAGMENT_LADDER_2026_10_27.adoc[fixed-3M fragmentation ladder].
+
+A separate August BIGANN series held the binary, single trained segment,
+backend (Azurite), and 1,000 query IDs fixed across scale. At 3.3M/100 cells,
+the GET-cost knee was 8 probes and the first sampled point at or above
+0.98 recall@10 was 16. At 10M/305 cells, those objectives coincided at 22
+probes, 0.9804 recall@10, 52.90 physical GETs and 130.86 MB/query. Top-20
+needed 26 probes at the first qualifying point. The 3.3M and 10M grids did
+not sample every intermediate count. The 52.90 GETs and the 76.91 total
+requests above came from different binaries, geometries, protocols and
+meters. Price deltas only within a paired arm.
+link:../_internal/status/BIGANN_NPROBE_GEOMETRY_COMPLETE_2026_08_06.adoc[Complete same-binary BIGANN matrix].
+
+image::../assets/benchmarks/ann-scale-cost-levers.png[Measured search depth and range-cap trade-offs across two scale studies]
+
+link:../../scripts/bench/diagrams/ann-scale-cost-levers.mmd[Mermaid source]
+
+The untrained 20k-row flush geometry from TE-C1 gives a separate thought
+experiment. If every file is searched cold with that same header, A and
+footer path, 3M/10M rows would span 150/500 files and issue 450/1,500
+fixed reads before survivor or winner reads. At 128 dimensions, reusing
+the prefix would remove 150/500 calls under those assumptions. At 768
+dimensions the same 20k-row Region A is 2,085,588 bytes and no longer
+fits the 1 MiB prefix. A larger prefetch across 500 files would trade
+saved calls for bytes and memory in every query. First price the planned
+prefix and A extents together, including peak resident bytes across files.
+Compaction, directory coverage, cache hits or segment pruning change
+this arithmetic. The trained scale runs above exercised different paths.
+
+=== How far a smaller exponent could take us
+
+For a thought experiment, anchor every candidate at the observed 16 probes
+for 100 cells. For roots, use `ceil(16 × (C/100)^p)`. For log, use
+`ceil(16 × log(C+1)/log(101))`. These are normalized, unclamped planning
+curves. Each table entry is a count of cells in one searchable directory.
+
+[cols="2,1,1,1,1",options="header"]
+|===
+| Candidate cells | Square root | Cube root | Fourth root | Log
+| 100 (3.3M measured geometry) | 16 | 16 | 16 | 16
+| 305 (10M measured geometry) | 28 | 24 | 22 | 20
+| 3,050 (100M hypothetical at the same mean rows/cell) | 89 | 50 | 38 | 28
+|===
+
+Fourth root happens to land on the observed 10M quality point. The same
+BIGANN study found that interpolating its anchors at 90 cells gives 15
+probes, while BGE text embeddings needed 25 for top-10 at that cell count.
+Cell imbalance at 10M reached 2.63 times the mean. Select the smallest
+held-out, quality-qualified plan for the collection, model, metric,
+top-k and filter workload. Cost the actual extents and waves. The large
+spread of the 100M curves is a sensitivity range for candidate work.
+Recall, bytes, GETs and latency at 100M remain open. Extending the same
+density to 1B implies about 30,500 cells, past the current 4,096-cell
+per-model writer cap. A sharded or hierarchical search needs its own
+fan-out, pruning, quality and budget model at that point.
+
+=== Count vectors, dimensions and retained originals separately
+
+One million source documents at three chunks/document and one embedding per
+chunk give 3M searchable vectors. Re-embedding those chunks while serving
+two model versions can temporarily produce 6M stored vectors. The query
+can still address just one model. Similarly 1,000 isolated tenants with
+10,000 vectors each occupy 10M vectors in aggregate. A tenant-scoped query
+can address only 10,000 if the storage routing isolates those tenants.
+Size the store on all retained vectors and versions, the directory on the
+actual searchable collection, and the cache on active queries and tenants.
+
+Public corpora give relevant scales without establishing a production
+median. MS MARCO has 8.8M passages in the original passage-ranking
+collection. One vector per passage already approaches the 10M fixture.
+BIG ANN includes billion-vector image, text-to-image and search datasets
+with different dimensions and input precisions. Training, validation and
+cost estimates should identify the corpus family and metric as well as N.
+link:https://microsoft.github.io/msmarco/[MS MARCO], and
+link:https://big-ann-benchmarks.com/neurips21.html[Big ANN benchmark datasets].
+
+For one dense embedding of dimension `d` per row in the coalesced layout,
+let `n` be the row count in one segment and `v = ceil(n/8)`.
+The writer sizes Region A as `16 + 4d + v + n × (8 + ceil(d/8))` bytes
+and Region B as `24 + v + n × d`. Thus the “1 bit” includes eight
+bytes of row parameters, and both A and B have validity maps. Current
+row-group Region C adds `8 + v + 4nd` bytes when present. On this
+baseline the flush resolver defaults the f32 tier on for a RaBitQ base
+and allows explicit overrides. The native fp16 Region C remains a design
+target. A declared fp16 value can be widened to f32 by the current PAX
+writer. Reconstructability is defined by the retained precision and source
+identity. A compressed index alone cannot reproduce the input.
+See `coalesced_rabitq::region_len`, `coalesced_sq8::region_len`,
+`pax_block::encode_exact_region` and `flush::resolve_pax_f32_tier_decision`.
+link:../10-quality/td/TD-PAXPREC-1-exact-tier-precision.adoc[Exact-tier precision and acceptance].
+
+The following arithmetic shows decimal GB for one logical copy. The
+fp16 scenario assumes a Region C with the same header and validity map
+as f32, at two bytes per coordinate. Storage columns are cumulative
+vector tiers. The final column is additive and assumes a distinct,
+1 KiB already-encoded source payload per vector. Values are rounded.
+
+[cols="1,1,1,1,1,1",options="header"]
+|===
+| Vectors | Dimensions | A+B | A+B + modeled fp16 | A+B + f32 | Extra for source payload
+| 3M | 128 | 0.46 | 1.23 | 1.99 | 3.07
+| 3M | 768 | 2.62 | 7.23 | 11.83 | 3.07
+| 10M | 128 | 1.52 | 4.08 | 6.64 | 10.24
+| 10M | 768 | 8.72 | 24.08 | 39.44 | 10.24
+| 100M | 768 | 87.23 | 240.84 | 394.44 | 102.40
+| 1B | 768 | 872.25 | 2,408.38 | 3,944.38 | 1,024.00
+|===
+
+Add row IDs, timestamps, filter columns, residual properties, coarse index
+and directory, object overhead, WAL retention, compaction overlap and any
+application-level copies or replicas separately. The 3M fragmentation
+study's 741 MB single-segment object illustrates the difference between
+physical PAX size and the 0.46 GB A+B estimate. Verify the footer and
+per-region lengths before attributing a physical size difference to any
+one tier. If ten chunks share one document, retaining that 1 KiB source
+once per distinct document reduces its 10M-vector contribution from
+10.24 GB to 1.024 GB plus references. Re-embedding from the original
+text or media also requires the source version and preprocessing/model
+identity. A retained f32 embedding supplies vector fidelity for rescoring
+or compaction even if the source document is unavailable.
+
+=== When an optional payload changes the query bill
+
+Size retention and access independently. For a 10M × 768 collection with
+a distinct 1 KiB stored payload/row, f32 + A+B + payload occupies about
+49.68 GB before the other items above. An IDs-and-scores query needs no
+source bytes by contract. A top-10 request including all ten payloads
+has 10 KiB of useful source data. Ten distinct, cold external objects
+can add ten successful GETs/query in a one-GET-per-object implementation,
+or 10M GETs per million such searches. Packing the ten winners into one
+contiguous extent could serve them with one GET but also reads the gaps.
+With 5% of searches requesting payloads, the scattered case adds
+0.5 GET/search averaged across that mix. Cold exact-vector gather is a
+separate charge and can add 30 KiB useful f32 at top-10 × 768.
+
+An older 3M `category=3` fixture shows how predicates can defeat a
+payload budget. Whole-row Stage F consumed about 834 MB/query of a
+936.93 MB total. On a separate three-segment fixture, switching reads
+from D to opt-in written Region E for the same predicate changed
+240.2 to 74.2 GETs and 769 to 196 MB/query at identical 0.9786 recall.
+The current reader can use E for covered fields and falls back to D as
+needed. Keep IDs and filter fields independently addressable. Include
+residual-field fallback and user-requested source hydration in the
+collection-wide budget. For external sources, require a version-bound
+reference when replay or exact source retrieval is part of the contract.
+link:../history/evidence/TIER1_E1_FILTERED_QUERIES_2026_10_28.adoc[3M full-row filter evidence], and
+link:../history/evidence/REGION_E_FILTER_COLUMNS_2026_10_31.adoc[paired Region E evidence].
+
+Prioritize duplicate-read removal on untrained segments, then the range
+plan and query-wide admission on trained multi-segment data. Price the
+IDs-only, filtered, exact-vector and source-returning routes separately
+at matched recall and under the same peak-resident-byte limit. Revisit
+cell placement or PXCD paging when the remaining metered cost justifies
+the additional format and rewrite cost. Corpus size alone supplies no
+cutover for those decisions.

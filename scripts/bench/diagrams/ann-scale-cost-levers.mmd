@@ -1,0 +1,20 @@
+---
+title: Cold ANN reads at 3M and 10M
+config:
+  theme: neutral
+  fontFamily: system-ui
+  flowchart:
+    nodeSpacing: 22
+    rankSpacing: 32
+---
+flowchart TB
+    cap["October · fixed objects on MinIO<br/>Raise maximum read range from 4 to 16 MiB"]
+    cap --> one["3M · one segment<br/>36.34 → 23.63 requests/query<br/>5 → 4 median waves · recall@10 0.9740"]
+    cap --> three["10M · three segments<br/>81.42 → 76.91 requests/query<br/>5 → 5 median waves · recall@10 0.9715"]
+    probe["August · one trained segment on Azurite<br/>Vary cells probed against exact top-10"]
+    probe --> small["3.3M · 100 cells<br/>GET-cost knee at 8 probes<br/>First sampled ≥0.98 recall at 16"]
+    probe --> large["10M · 305 cells<br/>GET-cost knee and quality point at 22 probes<br/>52.90 physical GETs/query · recall@10 0.9804"]
+    classDef study fill:#dcecf8,stroke:#416b9e,color:#142741
+    classDef result fill:#f3f7f8,stroke:#718996,color:#142741
+    class cap,probe study
+    class one,three,small,large result
