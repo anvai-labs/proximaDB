@@ -557,7 +557,7 @@ mod tests {
     fn registration_is_overwrite_not_first_wins() {
         let first = IopsBudget {
             min: 512 * 1024,
-            target: 1 * 1024 * 1024,
+            target: 1024 * 1024,
             max: 2 * 1024 * 1024,
         };
         let second = IopsBudget {

@@ -284,16 +284,14 @@ mod tests {
                 filterable_columns: vec![
                     crate::proto::proximadb_v1::FilterableColumnSpec {
                         name: "bucket".into(),
-                        data_type:
-                            crate::proto::proximadb_v1::FilterableDataType::FilterableInteger
-                                as i32,
+                        data_type: crate::proto::proximadb_v1::FilterableDataType::FilterableInteger
+                            as i32,
                         ..Default::default()
                     },
                     crate::proto::proximadb_v1::FilterableColumnSpec {
                         name: "color".into(),
-                        data_type:
-                            crate::proto::proximadb_v1::FilterableDataType::FilterableString
-                                as i32,
+                        data_type: crate::proto::proximadb_v1::FilterableDataType::FilterableString
+                            as i32,
                         ..Default::default()
                     },
                 ],
@@ -650,7 +648,11 @@ mod tests {
             }
         }
         // The rewritten rows are found (they now match), and every hit matches.
-        assert_eq!(got.first().map(|(id, _)| id.as_str()), Some("s1r3"), "{got:?}");
+        assert_eq!(
+            got.first().map(|(id, _)| id.as_str()),
+            Some("s1r3"),
+            "{got:?}"
+        );
         assert!(
             got.iter()
                 .all(|(id, _)| id.starts_with("s1r") || id.starts_with("s2r"))
@@ -783,45 +785,40 @@ mod tests {
         let arm = arm_with("dbp-flush", false).await;
         const FLUSHES: usize = 3;
         for s in 0..FLUSHES {
-            let records: Vec<crate::proto::proximadb_v1::VectorRecord> =
-                segment_records(s, 200)
-                    .into_iter()
-                    .map(|r| {
-                        let mut metadata = HashMap::new();
+            let records: Vec<crate::proto::proximadb_v1::VectorRecord> = segment_records(s, 200)
+                .into_iter()
+                .map(|r| {
+                    let mut metadata = HashMap::new();
+                    metadata.insert(
+                        "bucket".to_string(),
+                        crate::proto::proximadb_v1::SqlValue {
+                            value: Some(crate::proto::proximadb_v1::sql_value::Value::Int64Value(
+                                s as i64,
+                            )),
+                        },
+                    );
+                    if let Some(ProximaTreeNode::Value(PV::String(color))) = r.props.get("color") {
                         metadata.insert(
-                            "bucket".to_string(),
+                            "color".to_string(),
                             crate::proto::proximadb_v1::SqlValue {
                                 value: Some(
-                                    crate::proto::proximadb_v1::sql_value::Value::Int64Value(
-                                        s as i64,
+                                    crate::proto::proximadb_v1::sql_value::Value::StringValue(
+                                        color.clone(),
                                     ),
                                 ),
                             },
                         );
-                        if let Some(ProximaTreeNode::Value(PV::String(color))) =
-                            r.props.get("color")
-                        {
-                            metadata.insert(
-                                "color".to_string(),
-                                crate::proto::proximadb_v1::SqlValue {
-                                    value: Some(
-                                        crate::proto::proximadb_v1::sql_value::Value::StringValue(
-                                            color.clone(),
-                                        ),
-                                    ),
-                                },
-                            );
-                        }
-                        crate::proto::proximadb_v1::VectorRecord {
-                            id: r.oid.clone(),
-                            vector: r.embeddings[0].as_fp32_cow().to_vec(),
-                            metadata,
-                            timestamp: Some(1),
-                            version: Some(1),
-                            ..Default::default()
-                        }
-                    })
-                    .collect();
+                    }
+                    crate::proto::proximadb_v1::VectorRecord {
+                        id: r.oid.clone(),
+                        vector: r.embeddings[0].as_fp32_cow().to_vec(),
+                        metadata,
+                        timestamp: Some(1),
+                        version: Some(1),
+                        ..Default::default()
+                    }
+                })
+                .collect();
             let params = FlushParameters {
                 collection_id: Some(arm.collection.id.clone()),
                 vector_records: records.into_iter().map(Into::into).collect(),
@@ -840,19 +837,31 @@ mod tests {
         }
         // The newest published directory: every flushed segment has a v3 key
         // whose prune stats summarize its blocks.
-        let fs = arm.engine.filesystem().get_filesystem(&arm.storage_url).unwrap();
-        let dir = crate::storage::engines::sst::centroid_directory_publisher::load_newest_directory(
-            fs.as_ref(),
-            &arm.storage_url,
-        )
-        .await
-        .expect("flush-time publish");
-        let pax: Vec<_> = dir.segments.iter().filter(|s| s.name.ends_with(".pax")).collect();
+        let fs = arm
+            .engine
+            .filesystem()
+            .get_filesystem(&arm.storage_url)
+            .unwrap();
+        let dir =
+            crate::storage::engines::sst::centroid_directory_publisher::load_newest_directory(
+                fs.as_ref(),
+                &arm.storage_url,
+            )
+            .await
+            .expect("flush-time publish");
+        let pax: Vec<_> = dir
+            .segments
+            .iter()
+            .filter(|s| s.name.ends_with(".pax"))
+            .collect();
         assert_eq!(pax.len(), FLUSHES, "{:?}", dir.segments);
         for entry in &pax {
             let key = entry.decode_key.as_ref().expect("keyed entry");
             let facts = key.filter_facts.as_ref().expect("v3 facts");
-            let stats = facts.prune_stats.as_ref().expect("prune stats from the footer");
+            let stats = facts
+                .prune_stats
+                .as_ref()
+                .expect("prune stats from the footer");
             assert_eq!(stats.block_count(), key.blocks.len());
             assert!(stats.columns.iter().any(|c| c.name == "bucket"));
         }

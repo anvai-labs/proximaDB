@@ -1813,9 +1813,9 @@ mod tests {
         assert_eq!(parsed.footer_off, 400_000);
     }
 
-    /// TD-PAXRG-1 Phase A (mixed-read contract): a pre-v4 binary — whose parse
-    /// accepted only v1/v3 — must REJECT a v4 prefix fail-closed, never
-    /// mis-probe it as a v3 segment (mirror of the v1/v3 freeze test).
+    // TD-PAXRG-1 Phase A (mixed-read contract): a pre-v4 binary — whose parse
+    // accepted only v1/v3 — must REJECT a v4 prefix fail-closed, never
+    // mis-probe it as a v3 segment (mirror of the v1/v3 freeze test).
 
     /// TD-PAXRG-1 Phase C: the Region C extent round-trips as the
     /// `SECTION_EXACT_REGION` footer mirror, and a footer without it (c_len 0)
@@ -1989,11 +1989,11 @@ mod tests {
         assert!(!is_coalesced_segment(&[]));
     }
 
-    /// TD-RDSTRAT-8 mixed-read contract: a **version-1-only reader** (any binary
-    /// that predates the two-level layout) must reject a v3 segment cleanly.
-    /// Old binaries are frozen, so this pins the two facts their rejection
-    /// depends on: the on-disk version byte is 3 (not 1), and a strict
-    /// `version == 1` check therefore fails.
+    // TD-RDSTRAT-8 mixed-read contract: a **version-1-only reader** (any binary
+    // that predates the two-level layout) must reject a v3 segment cleanly.
+    // Old binaries are frozen, so this pins the two facts their rejection
+    // depends on: the on-disk version byte is 3 (not 1), and a strict
+    // `version == 1` check therefore fails.
 
     /// TD-FPRUNE-1 P5 slice 3: the shred field-map section round-trips with
     /// declared types (v2), an all-untyped map stays byte-identical v1, an
@@ -2038,7 +2038,6 @@ mod tests {
             0x04, 0x00, // name_len 4 (u16 LE)
             b'l', b'a', b'n', b'g', 0x65, 0x00, 0x00, 0x00, // col_id 101 (i32 LE)
         ];
-        let needle = [5u8, 1u8];
         let mut sec_off = None;
         let mut i = 0;
         while i + 6 <= v1_bytes.len() {

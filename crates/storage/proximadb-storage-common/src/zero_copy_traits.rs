@@ -585,8 +585,10 @@ mod tests {
         assert_eq!(filter_context.collection_id, "docs");
         assert_eq!(filter_context.metadata_filters["status"], "active");
 
-        let mut batch = QueryContext::default();
-        batch.query_type = QueryType::Batch;
+        let batch = QueryContext {
+            query_type: QueryType::Batch,
+            ..Default::default()
+        };
         assert!(batch.is_batch_query());
     }
 

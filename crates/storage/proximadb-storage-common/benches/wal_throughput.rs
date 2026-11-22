@@ -8,8 +8,8 @@
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use proximadb_records::ProximaRecord;
 use proximadb_storage_common::{
-    CanonicalOperation, CanonicalWalEntry, EdgeRef, ProjectionDirective, ProjectionRebuilder,
-    SnapshotManifest, latest_checkpoint, recover_from_canonical_wal,
+    CanonicalOperation, CanonicalWalEntry, EdgeRef, ProjectionDirective, SnapshotManifest,
+    latest_checkpoint, recover_from_canonical_wal,
 };
 
 // ---------------------------------------------------------------------------

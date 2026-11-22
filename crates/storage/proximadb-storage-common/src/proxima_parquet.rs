@@ -105,7 +105,7 @@ mod tests {
 
     use arrow_array::{Array, FixedSizeBinaryArray, Float64Array, Int64Array, StringArray};
     use arrow_schema::{DataType, Field, Schema};
-    use proximadb_records::{EmbeddingCell, EmbeddingValues, ProximaTreeNode, ProximaValue};
+    use proximadb_records::{EmbeddingCell, ProximaTreeNode, ProximaValue};
 
     use proximadb_data_model::{ProximaType, VectorElement as DmVectorElement};
 

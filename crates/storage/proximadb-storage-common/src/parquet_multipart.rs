@@ -375,6 +375,9 @@ mod tests {
     use futures::stream::BoxStream;
     use object_store::memory::InMemory;
     use parquet::arrow::ParquetRecordBatchStreamBuilder;
+    // TODO: migrate to `SpawnedReader` (arrow-rs #10308 deprecation) — the
+    // deprecated reader still serves the test bridge.
+    #[allow(deprecated)]
     use parquet::arrow::async_reader::ParquetObjectReader;
     use proximadb_records::ProximaRecord;
 

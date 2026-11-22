@@ -511,8 +511,12 @@ mod tests {
         };
         let batch = fact_batch(30_000);
         let props = policy.writer_properties(&batch, &hints());
-        let bytes =
-            record_batches_to_parquet_bytes(&[batch.clone()], batch.schema(), Some(props)).unwrap();
+        let bytes = record_batches_to_parquet_bytes(
+            std::slice::from_ref(&batch),
+            batch.schema(),
+            Some(props),
+        )
+        .unwrap();
 
         let opts = ReadOptionsBuilder::new()
             .with_page_index()
@@ -561,8 +565,12 @@ mod tests {
         let policy = ParquetWritePolicy::legacy(10_000);
         let batch = fact_batch(30_000);
         let props = policy.writer_properties(&batch, &hints());
-        let bytes =
-            record_batches_to_parquet_bytes(&[batch.clone()], batch.schema(), Some(props)).unwrap();
+        let bytes = record_batches_to_parquet_bytes(
+            std::slice::from_ref(&batch),
+            batch.schema(),
+            Some(props),
+        )
+        .unwrap();
         let opts = ReadOptionsBuilder::new()
             .with_reader_properties(
                 ReaderProperties::builder()

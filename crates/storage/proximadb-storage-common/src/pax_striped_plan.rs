@@ -223,7 +223,7 @@ mod tests {
     use crate::pax_block::PaxSegmentWriter;
     use proximadb_block_format::record::col_id;
     use proximadb_block_format::{BlockCompression, BlockMode};
-    use proximadb_records::{EmbeddingCell, EmbeddingValues, ProximaRecord};
+    use proximadb_records::{EmbeddingCell, ProximaRecord};
 
     const DIM: usize = 128;
 

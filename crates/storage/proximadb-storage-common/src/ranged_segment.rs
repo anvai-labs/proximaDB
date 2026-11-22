@@ -565,7 +565,7 @@ mod tests {
     use crate::pax_block::{PaxSegmentScanner, PaxSegmentWriter, ScanPredicate};
     use async_trait::async_trait;
     use proximadb_block_format::col_id;
-    use proximadb_records::{EmbeddingCell, EmbeddingValues, ProximaRecord};
+    use proximadb_records::{EmbeddingCell, ProximaRecord};
     use std::sync::atomic::{AtomicU64, Ordering};
 
     /// A bridge over an in-memory segment that serves true byte ranges and
