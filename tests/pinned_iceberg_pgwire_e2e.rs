@@ -295,7 +295,18 @@ async fn pinned_external_full_tpc_sql() -> anyhow::Result<()> {
             Err(_) => {
                 failures += 1;
                 record["error"] = serde_json::json!("120 second client deadline");
-                client.cancel_token().cancel_query(NoTls).await?;
+                let cancel = client.cancel_token();
+                match tokio::time::timeout(Duration::from_secs(5), cancel.cancel_query(NoTls)).await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
+                        record["cancel_error"] = serde_json::json!(error.to_string());
+                    }
+                    Err(_) => {
+                        record["cancel_error"] =
+                            serde_json::json!("5 second cancellation deadline");
+                    }
+                }
             }
         }
         writeln!(output, "{record}")?;
@@ -816,7 +827,10 @@ async fn pgwire_reads_only_the_authorized_pinned_snapshot() {
             .expect("trace for successful Iceberg bind");
         assert_eq!(succeeded.pinned_binds.len(), 1);
         let iceberg = &succeeded.pinned_binds[&io_trace::PinnedSourceFormat::Iceberg];
-        assert_eq!((iceberg.attempts, iceberg.failures), (1, 0));
+        assert_eq!(
+            (iceberg.attempts, iceberg.failures, iceberg.bound_splits),
+            (1, 0, 1)
+        );
         assert!(traces.try_recv().is_err());
     }
     let error = client
