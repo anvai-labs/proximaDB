@@ -226,7 +226,7 @@ mod tests {
         // An empty source can never prune — every predicate "may match".
         assert!(stats.may_contain_i64(100, 12345));
         let filter = eq_i64("part", 5);
-        let f2c: &(dyn Fn(&str) -> Option<i32>) = &|f| (f == "part").then_some(100);
+        let f2c: &dyn Fn(&str) -> Option<i32> = &|f| (f == "part").then_some(100);
         assert_eq!(evaluate_block(&stats, &filter, f2c), PruneResult::MayMatch);
     }
 
@@ -235,7 +235,7 @@ mod tests {
         // Column 100 holds values in [5, 9].
         let metas = vec![i64_col(100, 5, 9)];
         let stats = FooterBlockStats::from_column_metas(16, &metas, &[100]);
-        let f2c: &(dyn Fn(&str) -> Option<i32>) = &|f| (f == "part").then_some(100);
+        let f2c: &dyn Fn(&str) -> Option<i32> = &|f| (f == "part").then_some(100);
 
         // == 7 is inside [5,9] ⇒ may match (must read the block).
         assert_eq!(
@@ -255,7 +255,7 @@ mod tests {
         // pruning from the block body's ColumnMeta (both are the same bounds).
         let metas = vec![i64_col(100, 10, 20)];
         let stats = FooterBlockStats::from_column_metas(8, &metas, &[100]);
-        let f2c: &(dyn Fn(&str) -> Option<i32>) = &|f| (f == "p").then_some(100);
+        let f2c: &dyn Fn(&str) -> Option<i32> = &|f| (f == "p").then_some(100);
         for (v, expected) in [
             (15, PruneResult::MayMatch),
             (10, PruneResult::MayMatch),

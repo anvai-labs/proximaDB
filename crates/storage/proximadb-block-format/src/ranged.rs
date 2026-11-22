@@ -348,7 +348,7 @@ mod tests {
     use crate::reader::PaxBlockReader;
     use crate::record::col_id;
     use crate::writer::PaxBlockWriter;
-    use proximadb_records::{EmbeddingCell, EmbeddingValues, ProximaRecord};
+    use proximadb_records::{EmbeddingCell, ProximaRecord};
     use std::cell::Cell;
 
     /// A mock object that serves byte ranges from an in-memory block and counts

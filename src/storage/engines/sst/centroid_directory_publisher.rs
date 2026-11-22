@@ -442,12 +442,14 @@ pub async fn publish_centroid_directory(
         let base = load_newest_valid(fs, &objects).await;
         let decode_keys = directory_decode_keys_write_enabled();
         // D6: a carried entry whose key no longer matches its object (a
-        // rewrite in place) is reloaded, cells included.
+        // rewrite in place) is reloaded, cells included. ADR-042: so is a key
+        // carried from a v2 base (no filter facts) — a one-time re-read of
+        // that segment's header and footer, after which the v3 entry is
+        // carried like any other.
         let mut plan = plan_reconcile_keeping(base.as_ref(), &live, |segment| {
-            segment
-                .decode_key
-                .as_ref()
-                .is_none_or(|_| key_matches_listing(segment, &urls))
+            segment.decode_key.as_ref().is_none_or(|key| {
+                key_matches_listing(segment, &urls) && (key.filter_facts.is_some() || !decode_keys)
+            })
         });
         // A base older than the newest object (the newest was corrupt) is
         // republished even if it matches the live set, and so is one whose
@@ -777,7 +779,9 @@ pub(crate) mod tests {
             .read(&format!("{dir_url}/{}", object_name(1)))
             .await
             .unwrap();
-        assert_eq!(keyed[4], 2, "v2 with a key");
+        // ADR-042 (2026-11-21): a keyed directory is written as v3 (the key
+        // carries the filter facts; breaking change accepted pre-GA).
+        assert_eq!(keyed[4], 3, "v3 with a key");
 
         // No live change: turning the gate off alone republishes as v1,
         // once; a later change keeps v1.

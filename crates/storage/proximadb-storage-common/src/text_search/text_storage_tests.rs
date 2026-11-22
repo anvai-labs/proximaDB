@@ -112,8 +112,10 @@ fn test_writer_chunking() {
 
 #[test]
 fn test_writer_max_size() {
-    let mut config = TextStorageConfig::default();
-    config.max_text_size = 100;
+    let config = TextStorageConfig {
+        max_text_size: 100,
+        ..Default::default()
+    };
 
     let mut writer = TextColumnWriter::new(config);
 
@@ -225,14 +227,18 @@ fn test_chunking_config_validation() {
     assert!(valid.validate().is_ok());
 
     // Overlap >= chunk_size is invalid
-    let mut invalid = ChunkingConfig::default();
-    invalid.overlap = 600;
+    let invalid = ChunkingConfig {
+        overlap: 600,
+        ..Default::default()
+    };
     assert!(invalid.validate().is_err());
 
     // chunk_size < min_chunk_size is invalid
-    let mut invalid2 = ChunkingConfig::default();
-    invalid2.chunk_size = 32;
-    invalid2.min_chunk_size = 64;
+    let invalid2 = ChunkingConfig {
+        chunk_size: 32,
+        min_chunk_size: 64,
+        ..Default::default()
+    };
     assert!(invalid2.validate().is_err());
 }
 
@@ -450,6 +456,7 @@ fn test_text_chunker_get_chunks_for_parent() {
 // =========================================================================
 
 #[test]
+#[allow(clippy::field_reassign_with_default)]
 fn test_writer_with_rag_chunking() {
     let mut config = TextStorageConfig::default();
     config.strategy = TextStorageStrategy::Chunked;
@@ -467,6 +474,7 @@ fn test_writer_with_rag_chunking() {
 }
 
 #[test]
+#[allow(clippy::field_reassign_with_default)]
 fn test_writer_rag_chunking_produces_overlap() {
     let mut config = TextStorageConfig::default();
     config.strategy = TextStorageStrategy::Chunked;
@@ -497,6 +505,7 @@ fn test_writer_rag_chunking_produces_overlap() {
 }
 
 #[test]
+#[allow(clippy::field_reassign_with_default)]
 fn test_writer_without_rag_chunking_fallback() {
     let mut config = TextStorageConfig::default();
     config.strategy = TextStorageStrategy::Chunked;
@@ -718,6 +727,7 @@ fn test_fulltext_clear() {
 }
 
 #[test]
+#[allow(clippy::field_reassign_with_default)]
 fn test_fulltext_index_from_chunks() {
     let mut config = TextStorageConfig::default();
     config.strategy = TextStorageStrategy::Chunked;

@@ -789,11 +789,13 @@ mod tests {
 
     #[test]
     fn test_filter_stats() {
-        let mut stats = TextFilterStats::default();
-        stats.bloom_filter_used = 100;
-        stats.bloom_filter_rejections = 80;
-        stats.rows_scanned = 1000;
-        stats.rows_matched = 50;
+        let stats = TextFilterStats {
+            bloom_filter_used: 100,
+            bloom_filter_rejections: 80,
+            rows_scanned: 1000,
+            rows_matched: 50,
+            ..Default::default()
+        };
 
         assert!((stats.bloom_effectiveness() - 0.8).abs() < 0.001);
         assert!((stats.selectivity() - 0.05).abs() < 0.001);

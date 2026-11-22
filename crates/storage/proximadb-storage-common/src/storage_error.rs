@@ -946,6 +946,6 @@ mod tests {
         assert_eq!(converted.message, "generic");
 
         let result: StorageResult<u32> = Ok(42);
-        assert_eq!(result.unwrap(), 42);
+        assert!(matches!(result, Ok(42)));
     }
 }

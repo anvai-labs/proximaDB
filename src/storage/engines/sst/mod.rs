@@ -294,6 +294,9 @@ mod cold_compaction_dv_test;
 #[cfg(test)]
 #[path = "tests/centroid_directory_search_test.rs"]
 mod centroid_directory_search_test;
+#[cfg(test)]
+#[path = "tests/directory_block_prune_test.rs"]
+mod directory_block_prune_test;
 pub mod flush;
 #[cfg(feature = "cold-deletion-vectors")]
 pub mod oid_resolve; // TD-DELVEC-1 WI-3c-1c: resolve_oid_positions + read_resolver lazy-load

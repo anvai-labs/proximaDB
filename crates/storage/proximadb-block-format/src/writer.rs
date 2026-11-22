@@ -2055,7 +2055,9 @@ fn hash_bound_bytes(hash: u64) -> [u8; 16] {
     bytes
 }
 
-fn bloom_insert_hash(bloom: &mut [u8], hash: u64) {
+/// Insert a 64-bit key hash into a PAX string bloom (3 salted probes over
+/// `bloom.len() * 8` bits). The inverse is [`crate::reader::bloom_may_contain_hash`].
+pub fn bloom_insert_hash(bloom: &mut [u8], hash: u64) {
     if bloom.is_empty() {
         return;
     }

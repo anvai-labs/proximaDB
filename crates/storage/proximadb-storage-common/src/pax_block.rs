@@ -926,6 +926,12 @@ pub struct PaxSegmentWriter {
     filter_region_on: bool,
     /// Region-E rows accumulated in `add_record` order (= on-disk ordinals).
     filter_region: Option<crate::filter_region::FilterRegionBuilder>,
+    /// ADR-042 / TD-PAXMETA-1: per-block prune statistics of the shred-spec
+    /// columns (coalesced layout), accumulated in `add_record` order and cut
+    /// at every block boundary; emitted as footer section 9.
+    prune_stats: Option<crate::block_prune_stats::BlockPruneStatsBuilder>,
+    /// Whether `prune_stats` was already initialized for this segment.
+    prune_stats_started: bool,
 
     current_writer: PaxBlockWriter,
     index: SegmentIndex,
@@ -1054,6 +1060,8 @@ impl PaxSegmentWriter {
             shred_spec: Vec::new(),
             filter_region_on: false,
             filter_region: None,
+            prune_stats: None,
+            prune_stats_started: false,
             current_writer: writer,
             index: SegmentIndex { blocks: Vec::new() },
             block_stats: Vec::new(),
@@ -1390,6 +1398,26 @@ impl PaxSegmentWriter {
                 })
                 .push_row(&record.props);
         }
+        // ADR-042 / TD-PAXMETA-1: the per-block prune stats follow the same
+        // rows, in the same order, for every coalesced segment with shred
+        // columns (no gate: a few hundred bytes per block in the footer).
+        if self.coalesced_rabitq && !self.shred_spec.is_empty() {
+            if !self.prune_stats_started {
+                self.prune_stats_started = true;
+                self.prune_stats = crate::block_prune_stats::BlockPruneStatsBuilder::new(
+                    self.shred_spec
+                        .iter()
+                        .map(|c| crate::block_prune_stats::PruneColumn {
+                            name: c.key.clone(),
+                            column_id: c.column_id,
+                        })
+                        .collect(),
+                );
+            }
+            if let Some(builder) = self.prune_stats.as_mut() {
+                builder.push_row(&record.props);
+            }
+        }
         if let Some(t) = t {
             d_raw = t.elapsed();
         }
@@ -1655,6 +1683,11 @@ impl PaxSegmentWriter {
             zone,
             footer_stats,
         });
+        // ADR-042: cut the prune stats at the same boundary (a row-count
+        // disagreement poisons the builder, so no misaligned stats are written).
+        if let Some(builder) = self.prune_stats.as_mut() {
+            builder.cut_block(row_count);
+        }
         if self.local_spill.is_none() {
             self.file_buf.extend_from_slice(&block_bytes);
         }
@@ -2020,6 +2053,7 @@ impl PaxSegmentWriter {
                     .collect()
             },
             filter_region,
+            block_prune_stats: self.prune_stats.take().and_then(|b| b.finish()),
         };
         let footer_body = footer.to_bytes()?;
         let footer_off = e_off + filter_region_bytes.len() as u64;
@@ -2567,6 +2601,7 @@ impl PaxSegmentWriter {
                     .collect()
             },
             filter_region,
+            block_prune_stats: self.prune_stats.take().and_then(|b| b.finish()),
         };
         let footer_body = footer.to_bytes()?;
         let footer_off = e_off + filter_region_bytes.len() as u64;
@@ -3284,10 +3319,10 @@ mod tests {
                 "cat".into(),
                 ProximaTreeNode::Value(ProximaValue::Int64((row % 4) as i64)),
             );
-            if row % 3 != 0 {
+            if !row.is_multiple_of(3) {
                 record.props.insert(
                     "flag".into(),
-                    ProximaTreeNode::Value(ProximaValue::Boolean(row % 2 == 0)),
+                    ProximaTreeNode::Value(ProximaValue::Boolean(row.is_multiple_of(2))),
                 );
             }
             record.embeddings.push(EmbeddingCell::new_fp32(
@@ -3365,7 +3400,7 @@ mod tests {
 
     #[test]
     fn local_spill_writer_is_byte_identical_and_reclaims_scratch() -> Result<()> {
-        use proximadb_records::{EmbeddingCell, EmbeddingValues};
+        use proximadb_records::EmbeddingCell;
 
         const DIM: usize = 8;
         let output = tempfile::tempdir()?;
@@ -3433,7 +3468,7 @@ mod tests {
 
     #[test]
     fn cache_seed_is_byte_identical_to_published_regions() -> Result<()> {
-        use proximadb_records::{EmbeddingCell, EmbeddingValues};
+        use proximadb_records::EmbeddingCell;
 
         const DIM: usize = 8;
         let dir = tempfile::tempdir()?;
@@ -3510,7 +3545,7 @@ mod tests {
 
     #[test]
     fn coalesced_footer_does_not_advertise_hoisted_sq8_as_block_transform() -> Result<()> {
-        use proximadb_records::{EmbeddingCell, EmbeddingValues};
+        use proximadb_records::EmbeddingCell;
 
         const ROWS_PER_CLUSTER: usize = 256;
         const DIM: usize = 32;
@@ -3573,7 +3608,7 @@ mod tests {
     /// emitted (`opr_len == 0`) — the segment is byte-for-byte the pre-WI-2c form.
     #[test]
     fn coalesced_segment_embeds_oid_resolver_footer_region() -> Result<()> {
-        use proximadb_records::{EmbeddingCell, EmbeddingValues};
+        use proximadb_records::EmbeddingCell;
 
         const DIM: usize = 32;
         let oids: Vec<String> = (0..8).map(|i| format!("oid-{i}")).collect();
@@ -3665,7 +3700,7 @@ mod tests {
         f32_tier: bool,
         spill: Option<&std::path::Path>,
     ) -> Result<()> {
-        use proximadb_records::{EmbeddingCell, EmbeddingValues};
+        use proximadb_records::EmbeddingCell;
         const DIM: usize = 32;
         let mut writer = PaxSegmentWriter::new(
             path,
@@ -3798,7 +3833,7 @@ mod tests {
     /// (fixed cost ≤ ~1%).
     #[test]
     fn rg_target_floor_clamps_pathological_block_size() -> Result<()> {
-        use proximadb_records::{EmbeddingCell, EmbeddingValues};
+        use proximadb_records::EmbeddingCell;
         const ROWS: usize = 2_000;
         const DIM: usize = 32;
         let dir = tempfile::tempdir()?;
@@ -3906,7 +3941,7 @@ mod tests {
     /// stats column is empty (zero-length payloads, byte-identical footers).
     #[test]
     fn rg_layout_gate_default_off_writes_v1_v3_bytes() -> Result<()> {
-        use proximadb_records::{EmbeddingCell, EmbeddingValues};
+        use proximadb_records::EmbeddingCell;
         const DIM: usize = 32;
         unsafe { std::env::set_var("PROXIMADB_PAX_WRITE_RG_LAYOUT", "0") };
         let dir = tempfile::tempdir()?;
@@ -4002,7 +4037,7 @@ mod tests {
     /// the hoist moves bytes, never fidelity.
     #[test]
     fn region_c_reconstruction_matches_block_f32_tier_reconstruction() -> Result<()> {
-        use proximadb_records::{EmbeddingCell, EmbeddingValues};
+        use proximadb_records::EmbeddingCell;
         const DIM: usize = 32;
         const ROWS: usize = 64;
         let dir = tempfile::tempdir()?;
@@ -4070,7 +4105,7 @@ mod tests {
     /// two-block shape is independent of the encoding-aware byte estimator.
     #[test]
     fn block_centroids_are_exact_per_block_means() {
-        use proximadb_records::{EmbeddingCell, EmbeddingValues};
+        use proximadb_records::EmbeddingCell;
         let rec = |oid: &str, v: Vec<f32>| {
             let dim = v.len() as u32;
             let mut r = ProximaRecord {
@@ -4138,7 +4173,7 @@ mod tests {
     /// verified by code read (§9.2) + a WI-2c scan integration test.
     #[test]
     fn oid_resolver_captures_stream_order_and_is_off_by_default() {
-        use proximadb_records::{EmbeddingCell, EmbeddingValues};
+        use proximadb_records::EmbeddingCell;
         let rec = |oid: &str| {
             let mut r = ProximaRecord {
                 oid: oid.into(),
@@ -4211,7 +4246,7 @@ mod tests {
     /// symmetry). A block of identical rows must clamp to exactly 0.0.
     #[test]
     fn block_radii_are_exact_rms_spread() {
-        use proximadb_records::{EmbeddingCell, EmbeddingValues};
+        use proximadb_records::EmbeddingCell;
         let rec = |oid: &str, v: Vec<f32>| {
             let dim = v.len() as u32;
             let mut r = ProximaRecord {
@@ -4296,7 +4331,7 @@ mod tests {
     /// centroid the elementwise mean of its block's 16-dim vectors.
     #[test]
     fn block_centroids_16dim_exact_means() {
-        use proximadb_records::{EmbeddingCell, EmbeddingValues};
+        use proximadb_records::EmbeddingCell;
         let dim = 16usize;
         let rec = |oid: &str, fill: f32| {
             let mut r = ProximaRecord {
@@ -4350,7 +4385,7 @@ mod tests {
     fn block_centroids_empty_when_not_opted_in() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("seg.pax");
-        use proximadb_records::{EmbeddingCell, EmbeddingValues};
+        use proximadb_records::EmbeddingCell;
         let mut r = make_record("a", "t", 1);
         r.embeddings
             .push(EmbeddingCell::new_fp32("", "dense", 2, vec![1.0, 2.0]));
@@ -4552,7 +4587,7 @@ mod tests {
 
     #[test]
     fn compaction_preserves_exact_only_when_every_input_has_authority() {
-        use proximadb_records::{EmbeddingCell, EmbeddingValues};
+        use proximadb_records::EmbeddingCell;
 
         let vector_record = |oid: &str, values: Vec<f32>| {
             let mut record = make_record(oid, "t", 1);
@@ -4728,7 +4763,7 @@ mod tests {
     /// timestamps, and the dense embedding all round-trip (not just oid+vector).
     #[test]
     fn segment_read_records_round_trips_full_fidelity() {
-        use proximadb_records::{EmbeddingCell, EmbeddingValues, ProximaTreeNode, ProximaValue};
+        use proximadb_records::{EmbeddingCell, ProximaTreeNode, ProximaValue};
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("full.pax");
@@ -4835,7 +4870,7 @@ mod tests {
     #[test]
     fn two_level_writer_emits_v3_with_exact_cell_extents() -> Result<()> {
         use crate::segment_layout::SEG_HEADER_PREFIX_LEN;
-        use proximadb_records::{EmbeddingCell, EmbeddingValues};
+        use proximadb_records::EmbeddingCell;
 
         const DIM: usize = 16;
         // Three coarse cells (middle one empty) + 5 tail rows without embeddings.
@@ -5010,7 +5045,7 @@ mod tests {
     /// record's id + vector.
     #[test]
     fn two_level_row_bound_splits_giant_cells() -> Result<()> {
-        use proximadb_records::{EmbeddingCell, EmbeddingValues};
+        use proximadb_records::EmbeddingCell;
 
         const DIM: usize = 8;
         // One cell well past the row bound + a small trailing cell.
@@ -5146,7 +5181,7 @@ mod tests {
     /// a mis-addressed segment.
     #[test]
     fn two_level_writer_fails_closed_on_row_mismatch() -> Result<()> {
-        use proximadb_records::{EmbeddingCell, EmbeddingValues};
+        use proximadb_records::EmbeddingCell;
         const DIM: usize = 8;
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("mismatch.pax");
@@ -5197,7 +5232,7 @@ mod tests {
     #[test]
     fn v4_cells_never_straddle_row_groups() -> Result<()> {
         use crate::coarse_directory::CoarseModel;
-        use proximadb_records::{EmbeddingCell, EmbeddingValues};
+        use proximadb_records::EmbeddingCell;
 
         const DIM: usize = 8;
         let model = CoarseModel {
@@ -5260,7 +5295,7 @@ mod tests {
     /// comparison on narrow data is a documented boundary, not a claim.
     #[test]
     fn rg_layout_at_rest_is_not_larger_than_legacy_blocks() -> Result<()> {
-        use proximadb_records::{EmbeddingCell, EmbeddingValues};
+        use proximadb_records::EmbeddingCell;
         const DIM: usize = 32;
         const ROWS: usize = 4_000;
         let dir = tempfile::tempdir()?;
@@ -5314,7 +5349,7 @@ mod tests {
     /// round-trips EXACT embeddings through Region C.
     #[test]
     fn rg_spill_with_f32_region_c_round_trips_and_matches_memory_twin() -> Result<()> {
-        use proximadb_records::{EmbeddingCell, EmbeddingValues};
+        use proximadb_records::EmbeddingCell;
         const DIM: usize = 16;
         const ROWS: usize = 64;
         let dir = tempfile::tempdir()?;

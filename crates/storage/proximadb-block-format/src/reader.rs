@@ -1244,7 +1244,9 @@ const PAX_BLOOM_SALTS: [u64; 3] = [
     0x94d0_49bb_1331_11eb,
 ];
 
-fn bloom_may_contain_hash(bloom: &[u8], hash: u64) -> bool {
+/// Whether a PAX string bloom may contain `hash` (no false negatives; an empty
+/// bloom always answers `true`). The inverse of [`crate::writer::bloom_insert_hash`].
+pub fn bloom_may_contain_hash(bloom: &[u8], hash: u64) -> bool {
     if bloom.is_empty() {
         return true;
     }
