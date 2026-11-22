@@ -1,0 +1,128 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= ADR-099: Unified Iceberg projection — the cold store is Iceberg, the hot formats stay PAX/PXCD and ORION adjacency
+:toc: left
+:toclevels: 2
+:last-updated: 2026-11-22
+
+[cols="1,3"]
+|===
+| Status | **Accepted (owner decision 2026-11-22, after the Iceberg-primary thought experiments of 2026-11-21/22).** Implementation Open; tracked under TD-ICEPROJ-1 (new) and TD-PAXMETA-2 (amended); the projection inherits TD-SPINE-3/4 mechanisms (metadata GC, manifest pruning, lazy footers) as dependencies.
+| Date | 2026-11-22
+| Deciders | Vijaykumar Singh
+| Amends | link:ADR-097-foundational-seams-single-logical-ir.adoc[ADR-097] S4/S7 (the Iceberg export seam becomes a *unified projection* with the obligations below; reciprocal dated note added to ADR-097).
+| Records the rejected alternative | **Iceberg-primary**: storing the hot serving data itself as Iceberg/Parquet with vector-native column types (RaBitQ/SQ8/f16/f32, CSR adjacency), memtable → Iceberg flush, LSM-style Iceberg compaction. Rejected for the hot path by the analysis below; revisitable per the bake-off criteria in D5.
+| Relates to | ADR-033 (cost spine DEPTH ≫ WIDTH), ADR-052 (DataFusion OLAP), ADR-063 (serverless object-store posture), link:ADR-098-metadata-spine.adoc[ADR-098] D2/D4 (PXCD is L1; Avro only at the Iceberg seam), link:ADR-042-canonical-segment-statistics-contract.adoc[ADR-042] (its 2026-11-20 pruning rules apply to the projection's row-group stats unchanged — application, not amendment)
+| Tracked under | TD-ICEPROJ-1 (new), TD-PAXMETA-2 (clustering, amended)
+|===
+
+== Context
+
+Two owner-driven thought experiments (2026-11-21/22) asked whether ProximaDB should consolidate
+all modalities onto Iceberg now that the metadata spine is built:
+
+1. *Vectors:* keep the data in Iceberg and add custom datatypes (RaBitQ binary, SQ8/int8, f16,
+   f32) as additional columns; drop the "filterable column" distinction so any column is
+   exportable; memtable → Iceberg flush, LSM-style compaction with z-order/Morton/PCA/Hilbert
+   clustering (vector precedence, since scalar metadata is low-cardinality and encodes better);
+   keep L1/L2 and result caches; support MessagePack/Jsonb types.
+2. *Graph:* project nodes/edges the way the relational store does, but as a **CSR** (compressed
+   sparse row) layout so traversals become ranged reads.
+
+The analysis compared that against what shipped this week: TD-SPINE-3/4 (Iceberg metadata GC,
+bounded log, manifest-bounds file pruning, manifest cache), lazy footers (#2539), the flush-time
+PXCD directory (#2549), and ADR-042 per-block prune statistics (#2559: filtered queries prune
+segments and blocks from one directory GET, zero footer reads).
+
+[cols="1,2,2", options="header"]
+|===
+| Dimension | PAX/PXCD hot + Iceberg projection (chosen) | Iceberg-primary (rejected for the hot path)
+| Cold filtered query | 1 directory GET → 0 footers (measured, #2559) | 3 GETs + LIST per commit generation; row-group pruning after footer reads
+| ANN scan | Coalesced ranged RaBitQ scan (TD-RDSTRAT-12: 1.61× aggregate, 1.54× cold at 50 ms RTT; 2.78–2.81× with 100–150 ms Toxiproxy-injected RTT on the Azurite bed (the
+  S3/MinIO bed did not reproduce ≥2× there: 1.22–1.46× — real-cloud latency remains unmeasured)) | Rebuild page-offset coalescing on top of Parquet encodings
+| Per-flush cost | 3 GETs + 1 LIST + 1 PUT (+1 DELETE of the oldest directory generation from the third flush on), bounded 5 s | metadata.json + manifest list + manifest Avro per commit; grows with file count; invalidates the manifest cache for every pod
+| Compaction clustering | PCA/IVF ours, one pass (TD-PAXMETA-2) | Algorithm ours anyway (ecosystem rewrite_data_files sorts scalars only) + Parquet re-encode per pass
+| Graph traversal | ORION adjacency layout (no e2e traversal bench in the ledger yet; TD-ICEPROJ-1 pins one before any comparison) | CSR-on-Parquet possible but pays footer/page-index per hop
+| Spark/Trino/DuckDB read | via the projection (this ADR) | native (scalar columns only until engines adopt our vector types)
+|===
+
+The decisive observations:
+
+* Everything Iceberg is credited for at the *metadata* layer — bounded log, snapshot GC, manifest
+  stats pruning — the spine program already built (and in the smaller, LIST-validated form of
+  ADR-098 D2). The remaining unique benefit is **ecosystem interop**, which does not require
+  owning the hot path.
+* Parquet/Iceberg can *store* vector bytes (`fixed(L)`/`binary`) — the real gap is *semantics*
+  (per-segment models, centroid pruning, coalesced extents) plus **access pattern**. Every
+  consumer would need our extensions; shipping them in N engines is the actual cost of "custom
+  datatypes", and without them the bytes are inert — defeating the interop that motivated the
+  pivot.
+* CSR needs **zero** custom types: an Iceberg `list<long>` adjacency column is CSR — the offsets
+  array is derivable by prefix-sum over the per-row list lengths the repetition levels encode. Graph is therefore the modality where the
+  projection is fully native *today*.
+
+== Decision
+
+**D1 — Iceberg is the cold store and the interop seam; PAX/PXCD (vectors) and ORION adjacency
+(graph) remain the hot serving formats.** No format pivot. The hot formats stay small, versioned,
+fail-closed and ours; the projection carries their content outward.
+
+**D2 — the unified projection (amending ADR-097 S4/S7):**
+
+* *Vectors:* per collection, an Iceberg table exporting the id column, the f32 (or f16) vector as
+  `fixed(L)`/`binary`, optional quantized variants (SQ8 packs; RaBitQ codes + the per-segment
+  model in Iceberg **file metadata / column properties** — a convention engines can ignore), and
+  **any** exported scalar column (the filterable-only restriction is a directory-side cost cap,
+  not a projection restriction). Projection shape configurable: full rows, or id + vector.
+* *Graph:* node table + adjacency table `(node_id, list<neighbor_id>, …edge props)` — CSR-shaped
+  via native `list` types; upgrades today's row-per-edge projection (which forces filter-scans
+  for neighbor sets) to a traversal-capable one. Interactive multi-hop stays on ORION.
+* *Documents:* Jsonb/MessagePack payloads project as `binary` with a type tag in schema metadata
+  (a NEW convention at the ADR-098 D4 seam — no precedent exists there today).
+* *Freshness:* the projection is **asynchronous** (ADR-097's projection seam) — it trails the hot
+  store; it is never on the serving path (ADR-098 D2's LIST-is-the-authority rule applies
+  unchanged).
+
+**D3 — one plan across modalities.** The projection tables live in one catalog, so a single
+DataFusion plan joins vector candidates, graph adjacency and document filters on one Iceberg
+snapshot — the Graph-RAG / hybrid-query capability this ADR exists to enable. No engine bridges.
+
+**D4 — pruning parity.** The projection's row-group stats follow the TD-SPINE-4/ADR-042
+conservative rules verbatim (missing stat ⇒ keep; truncated string upper bound never prunes;
+type mismatch ⇒ keep). Manifest-bounds file pruning and lazy footers (#2536/#2539) apply to the
+projection as to any Iceberg table.
+
+**D5 — the pivot stays answerable by measurement, not debate.** TD-ICEPROJ-1 carries a per-modality
+bake-off with exit criteria (co-design mandate #2: request counts deterministic on an emulator;
+latency only on real cloud):
+
+* *Vector serving* stays PAX unless the projection + cache meets the recall floor and the
+  latency target TD-ICEPROJ-1 pins before the bake-off runs (no ANN latency SLO exists in the
+  repo today) at ≤ 1.25× the PAX request count per query on the SIFT harness.
+* *Graph analytics* moves to the projection when a Trino/Spark/DuckDB one-hop over the CSR table
+  matches ORION's answer set **and** its request count per hop is ≤ ORION's measured count on the
+  same harness (answer-set parity alone is achievable by construction — a precondition, not the
+  criterion).
+* *Interactive traversal* stays ORION unless per-hop GETs on the projection beat the adjacency
+  layout's measured counts.
+* If a majority of modalities flip on that evidence, re-open this ADR (it would then be an
+  Iceberg-primary decision with the custom-type costs priced in).
+
+== Consequences
+
+* The export seam gains obligations (vector columns, CSR adjacency, any-column export) — one
+  coherent PR series on TD-ICEPROJ-1, after SPINE-1/2 unless the owner re-prioritizes.
+* PXCD v3 (ADR-042) remains the serving-side prune source; the projection is not a cache input.
+* Breaking changes at the projection are pre-GA breaks (documented, not gated) per the owner's
+  2026-11-20 no-backward-compatibility decision.
+* TD-PAXMETA-2 (clustering on the dominant filter column) is amended by this ADR to state the
+  vector-precedence ordering rationale.
+
+== Supersession / amendment notes
+
+* ADR-097 S4/S7: the Iceberg seam is re-specified as the unified projection (D2). Not
+  superseded — extended.
+* ADR-098 D2/D4 stand: PXCD is L1 for the hot store; Avro/Iceberg encodings live only at this
+  seam.
+* The Iceberg-primary alternative is **recorded as rejected** with its costs (this ADR's Context
+  table) so it is re-openable against D5's evidence rather than re-argued from scratch.

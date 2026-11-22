@@ -8,7 +8,7 @@
 | Status | **Open** (filed 2026-11-21 as the named follow-up of the ADR-042 per-block prune statistics PR; out of that PR's scope by decision).
 | Priority | MEDIUM. Correctness is unaffected; the cost is pruning that does not fire.
 | Component | SST compaction record ordering (`src/storage/engines/sst/compaction.rs`, `block_cluster.rs`), collection config (a per-collection dominant filter column), the writer's per-block prune stats (`crates/storage/proximadb-storage-common/src/block_prune_stats.rs`)
-| Relates to | link:../../12-design/adr/ADR-042-canonical-segment-statistics-contract.adoc[ADR-042] (amended 2026-11-20: "compaction may cluster on the collection's dominant filter column, recorded per collection, off by default"), link:TD-PAXMETA-1-collection-level-segment-facts.adoc[TD-PAXMETA-1], link:TD-FPRUNE-3-partition-layout-recall-safe-reenable.adoc[TD-FPRUNE-3] (the tag-aware partition layout that cost unfiltered recall), TD-OLAP-6 (sort-on-materialize cluster keys, the warehouse analogue)
+| Relates to | link:../../12-design/adr/ADR-099-unified-iceberg-projection.adoc[ADR-099] (vector-precedence ordering rationale); link:../../12-design/adr/ADR-042-canonical-segment-statistics-contract.adoc[ADR-042] (amended 2026-11-20: "compaction may cluster on the collection's dominant filter column, recorded per collection, off by default"), link:TD-PAXMETA-1-collection-level-segment-facts.adoc[TD-PAXMETA-1], link:TD-FPRUNE-3-partition-layout-recall-safe-reenable.adoc[TD-FPRUNE-3] (the tag-aware partition layout that cost unfiltered recall), TD-OLAP-6 (sort-on-materialize cluster keys, the warehouse analogue)
 |===
 
 == Problem
@@ -23,6 +23,17 @@ stats prune nothing. Today pruning pays off only when the data arrives clustered
 column (time-ordered ingest filtered on time, one tag per flush batch).
 
 == Fix direction
+
+*Amended 2026-11-22 (link:../../12-design/adr/ADR-099-unified-iceberg-projection.adoc[ADR-099], owner input 2026-11-21):* the ordering within a cell takes
+**vector precedence** — the primary order stays the A0/PCA cell order (vector locality, which
+ANN scan cost depends on), and the dominant filter column is the *secondary* sort inside each
+cell. Rationale: the filter columns this optimizes for (filename, subject, area, tenant tag)
+are low-cardinality and encode well at any position, while vector locality is the expensive
+property to lose; conversely a scalar-primary order is the TD-FPRUNE-3 partition layout, which
+cost unfiltered recall. This matches the Iceberg-side z-order intuition from the ADR-099
+thought experiment (Morton/Hilbert over scalars with vector-primary clustering), implemented
+where it does not disturb the cell extents.
+
 
 * Record a per-collection **dominant filter column** (off by default) — explicit config, or
   derived from the filter-column histogram the query path already observes.
