@@ -981,10 +981,9 @@ mod tests {
         assert_eq!((root.version, root.generation), (0, 2));
         assert_eq!(root.bytes, b"root-v1");
         let acme = store.read_shard("acme").await?.expect("acme shard");
-        assert_eq!(
-            (acme.version, acme.generation, acme.bytes.as_slice()),
-            (0, 2, b"acme-shard-v1")
-        );
+        assert_eq!(acme.version, 0);
+        assert_eq!(acme.generation, 2);
+        assert_eq!(acme.bytes, b"acme-shard-v1");
 
         // A stale writer (generation 1) is fenced on BOTH surfaces, and the
         // stale shard commit is rejected BEFORE any root moves.
@@ -1032,11 +1031,12 @@ mod tests {
         store.commit_root(1, b"r").await?;
 
         let mut keys: Vec<String> = inner
-            .list(None)
-            .await
+            .list_with_delimiter(None)
+            .await?
+            .objects
+            .into_iter()
             .map(|meta| meta.location.to_string())
-            .collect()
-            .await;
+            .collect();
         keys.sort();
         // Hex encoding: even a separator-bearing tenant id becomes one
         // path-safe segment.
