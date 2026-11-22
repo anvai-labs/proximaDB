@@ -46,7 +46,9 @@ def recall_plot(anns, exact, dest):
         x, y = float(r["recall_at_10"]), QPS * ops(r)
         ax.scatter(x, y, s=60, color=COLORS[0], zorder=3)
         ax.annotate(
-            size_label(int(r["rows"])),
+            f"{size_label(int(r['rows']))} · {x:.2f}"
+            if int(r["rows"]) in (33_000, 333_000)
+            else size_label(int(r["rows"])),
             (x, y),
             xytext=(7, 3),
             textcoords="offset points",

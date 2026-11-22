@@ -24,6 +24,12 @@ Proxima routes its Azure aliases `az://`, `azure://`, `adls://` and `abfs://` th
 
 At 1M the ANN point is 0.980 recall and 1,900 projected object IOPS, comprising 18 GETs and one LIST per search. At 33K the same sampled recall requires 500 IOPS. The single-object exact controls coincide at 1.000 recall and 200 IOPS across sizes, although the object grows from 0.71 to 712.90 MiB. These points compare corpus sizes. A quality tuning curve requires varying the candidate budget on the **same** corpus and a larger query sample.
 
+**33K reached 0.98; the 0.96 point is 333K.** The denominator at each size is 100 neighbor slots (ten queries × ten IDs). At 33K, queries 0 and 2 each missed one exact ID. Both IVF cells and all 33,000 rows were already probed. A control passing *every row* to the SQ8 reranker returned the same two substitutions. In the source f32 vectors the missing IDs ranked 10th and 9th respectively; each replacement ranked 11th. Neither cutoff was tied.
+
+At 333K, queries 0, 2, 5 and 8 missed one ID each on the default path (ten of 24 cells). Keeping all survivors **within those same ten cells** recovered the missing rank-two neighbor for query 0 and the full top ten for query 8. Query 0 then missed a different neighbor. With all 24 cells and all 333,000 rows reaching SQ8, queries 0, 2 and 5 still returned 9/10. Candidate selection and quantized final ranking both matter here. A fixed global increase in GETs or probes cannot guarantee 0.98. An f32 rerank experiment should compare accuracy at the same candidate depth and price the extra reads.
+
+These paired diagnostic replays used the same compacted objects locally. The default top-ten sets matched the archived cold Azure run on all six affected queries. To reproduce, prepare the 33K and 333K scale fixtures, replay the query IDs in the CSV with the scale worker, then vary `PROXIMADB_PAX_READ_COARSE_NPROBE` (default or all cells) and `PROXIMADB_PAX_RABITQ_POOL` (default or the corpus row count). The diagnostic subset was selected for misses; it estimates their causes and cannot establish population recall. [Per-query control results](../../../bench_results/pax_sift_scale_20261122/recall_miss_controls.csv)
+
 ## 2. Object IOPS and cost on hot storage at 1M
 
 ![GET and LIST contributions to cold ANN operations and costs on three hot object stores.](../../assets/benchmarks/pax-iops-tier-cost.svg)
@@ -68,7 +74,7 @@ For example, with half the queries cold and half reopening from disk, S3 costs `
 
 ![Modeled net request savings as cold discoveries per publish increase for one or two incremental PUTs.](../../assets/benchmarks/pax-manifest-break-even.svg)
 
-A hypothetical authoritative head that replaces one LIST with one GET saves $4.60/M cold discoveries at S3 Standard rates. One extra PUT per publish needs more than 1.09 cold discoveries per publish to pay back. Two extra PUTs need more than 2.17. Cached discoveries save nothing here. Measure the workload ratio and publication overhead before changing authority. Current ADR-098 keeps LIST authoritative. [Design and publication constraints](../../12-design/PAX_SPEC_THOUGHT_EXPERIMENTS_2026_10.adoc#small-object-cost)
+A hypothetical authoritative head that replaces one LIST with one GET saves $4.60/M cold discoveries at S3 Standard rates. One extra PUT per publish needs more than 1.09 cold discoveries per publish to pay back. Two extra PUTs need more than 2.17. At two cold discoveries per publish and one additional PUT, the model saves `2 × $4.60 − $5 = $4.20` per million publishes. Above the horizontal zero line, the request savings exceed the publication cost. Cached discoveries save nothing here. Measure the workload ratio and publication overhead before changing authority. Current ADR-098 keeps LIST authoritative. [Design and publication constraints](../../12-design/PAX_SPEC_THOUGHT_EXPERIMENTS_2026_10.adoc#small-object-cost)
 
 ## 8. When S3 Standard pays for itself
 
