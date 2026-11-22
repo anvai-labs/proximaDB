@@ -107,19 +107,28 @@ impl CatalogDelta {
     }
 
     /// Encode this delta as a `CanonicalOperation::CatalogMutation` ready for
-    /// [`TableWalAppender::append_operations`]. Uses field-named MessagePack so
-    /// the additive-serde evolution of `CatalogTableSchema` stays compatible.
+    /// [`TableWalAppender::append_operations`]. The body is field-named
+    /// MessagePack (so the additive-serde evolution of `CatalogTableSchema`
+    /// stays compatible), framed by the TD-SPINE-1 record envelope: magic +
+    /// format version + body codec. A pre-envelope binary cannot decode it
+    /// (accepted pre-GA break); this binary decodes both directions by
+    /// sniffing the magic.
     pub fn to_operation(&self) -> Result<CanonicalOperation> {
-        let bytes = rmp_serde::to_vec_named(self).context("encoding catalog delta")?;
+        let bytes =
+            crate::services::catalog_record_envelope::to_enveloped_vec_named(self)
+                .context("encoding catalog delta")?;
         Ok(CanonicalOperation::CatalogMutation {
             key: self.routing_key(),
             bytes,
         })
     }
 
-    /// Decode a delta from a `CatalogMutation` payload.
+    /// Decode a delta from a `CatalogMutation` payload. Sniffs the envelope:
+    /// magic present ⇒ envelope, absent ⇒ legacy bare MessagePack (mixed-read
+    /// forever); unknown envelope version/codec fails closed.
     pub fn decode(bytes: &[u8]) -> Result<Self> {
-        rmp_serde::from_slice(bytes).context("decoding catalog delta")
+        crate::services::catalog_record_envelope::from_enveloped_slice(bytes)
+            .context("decoding catalog delta")
     }
 }
 
@@ -149,6 +158,13 @@ struct CatalogInner {
     /// persisted separately: WAL replay and snapshot load rebuild it from the
     /// authoritative schemas, so it cannot drift from `tables`.
     object_ids: HashMap<u64, TableIdentifier>,
+    /// TD-SPINE-2: per-account namespace-id high-water (the highest typed
+    /// namespace id ever minted in that account, dropped ones included). The
+    /// namespace-id floor is **per-account** for NEW allocations; existing
+    /// ids are never renumbered. Like the global `ids_high_water` it is
+    /// rebuilt by replay/snapshot/shard folds, and each account's shard
+    /// persists its own value so compaction cannot forget a dropped id.
+    account_ns_high_water: HashMap<String, u16>,
     /// Highest WAL sequence number folded in (the replay watermark).
     applied_seq: u64,
     /// TD-PATH-2: the highest identity ever minted, which drops never lower.
@@ -168,8 +184,10 @@ struct CatalogInner {
 }
 
 /// TD-PATH-2: monotonic identity high-water marks (see `CatalogInner`).
+/// Public because the TD-SPINE-2 root decode surface hands it to the
+/// catalog's boot/reload protocol.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-struct IdsHighWater {
+pub struct IdsHighWater {
     object_id: u64,
     collection_id: u32,
     /// Typed namespace ids (`{n}` of `accounts/{a}/{n}/{c}`), recovered from
@@ -214,6 +232,114 @@ impl IdsHighWater {
 }
 
 impl CatalogInner {
+    /// TD-SPINE-2: fold a table schema's typed namespace id into the
+    /// per-account high-water. The account is the namespace's tenant (the
+    /// same attribution `resolve_typed_triple` mints under); a table whose
+    /// namespace is absent folds into the shared default shard so the floor
+    /// can never under-count.
+    fn fold_table_account_ns(&mut self, namespace_levels: &[String], schema: &CatalogTableSchema) {
+        if let Some(namespace_id) = schema.stable_namespace_id {
+            let account = self.shard_key_of_levels(namespace_levels);
+            let entry = self.account_ns_high_water.entry(account).or_insert(0);
+            *entry = (*entry).max(namespace_id);
+        }
+    }
+
+    /// TD-SPINE-2: the shard key of a namespace path — its namespace's
+    /// tenant when recorded, else the shared default shard.
+    fn shard_key_of_levels(&self, levels: &[String]) -> String {
+        shard_key_of_tenant(
+            self.namespaces
+                .get(levels)
+                .and_then(|namespace| namespace.tenant_id.as_deref()),
+        )
+    }
+
+    /// TD-SPINE-2: remove every row belonging to `account`'s shard — the
+    /// inverse of [`Self::apply_shard`], so adopting a shard image replaces
+    /// exactly that account's rows (dropped namespaces cascade to their
+    /// tables/statistics exactly like the `DropNamespace` fold).
+    fn remove_shard_rows(&mut self, account: &str) {
+        let doomed: Vec<Vec<String>> = self
+            .namespaces
+            .values()
+            .filter(|namespace| shard_key_of_tenant(namespace.tenant_id.as_deref()) == account)
+            .map(|namespace| namespace.levels.clone())
+            .collect();
+        for levels in doomed {
+            self.namespaces.remove(&levels);
+            if let Some(children) = self.ns_children.remove(&levels) {
+                for name in children {
+                    let id = TableIdentifier::new(levels.clone(), name);
+                    if let Some(schema) = self.tables.remove(&id)
+                        && let Some(object_id) = schema.object_id
+                    {
+                        self.object_ids.remove(&object_id);
+                    }
+                    self.statistics.remove(&id);
+                }
+            }
+        }
+        // Defensive: orphan tables (namespace record missing) live in the
+        // default shard, so adopting the default shard retires them too.
+        if account == DEFAULT_SHARD_KEY {
+            let orphans: Vec<TableIdentifier> = self
+                .tables
+                .keys()
+                .filter(|id| !self.namespaces.contains_key(&id.namespace))
+                .cloned()
+                .collect();
+            for id in orphans {
+                if let Some(schema) = self.tables.remove(&id)
+                    && let Some(object_id) = schema.object_id
+                {
+                    self.object_ids.remove(&object_id);
+                }
+                self.statistics.remove(&id);
+                if let Some(children) = self.ns_children.get_mut(&id.namespace) {
+                    children.remove(&id.name);
+                }
+            }
+        }
+    }
+
+    /// TD-SPINE-2: fold a decoded shard image into state (boot assembly and
+    /// per-account reload adoption). Mirrors the snapshot-load folding so
+    /// secondary indexes and the per-account namespace-id high-water stay
+    /// consistent; the GLOBAL high-water also merges (it is the legacy
+    /// fleet-wide record and must never regress).
+    fn apply_shard(&mut self, shard: CatalogShardRecord) {
+        for namespace in shard.namespaces.values() {
+            self.ids_high_water.fold_namespace(namespace);
+        }
+        let mut account_ns = shard.namespace_id_high_water;
+        for (id, schema) in &shard.tables {
+            self.ids_high_water.fold_table(schema);
+            if let Some(namespace_id) = schema.stable_namespace_id {
+                account_ns = account_ns.max(namespace_id);
+            }
+            self.ns_children
+                .entry(id.namespace.clone())
+                .or_default()
+                .insert(id.name.clone());
+            if let Some(object_id) = schema.object_id {
+                self.object_ids.insert(object_id, id.clone());
+            }
+        }
+        for levels in shard.namespaces.keys() {
+            self.ns_children.entry(levels.clone()).or_default();
+        }
+        self.namespaces.extend(shard.namespaces);
+        self.tables
+            .extend(shard.tables.into_iter().map(|(id, schema)| (id, Arc::new(schema))));
+        self.statistics.extend(shard.statistics);
+        let entry = self
+            .account_ns_high_water
+            .entry(shard.account)
+            .or_insert(0);
+        *entry = (*entry).max(account_ns);
+    }
+
     fn apply(&mut self, delta: CatalogDelta) {
         match delta {
             CatalogDelta::UpsertAccount { account, stable_id } => {
@@ -241,6 +367,7 @@ impl CatalogInner {
             }
             CatalogDelta::UpsertTable { identifier, schema } => {
                 self.ids_high_water.fold_table(&schema);
+                self.fold_table_account_ns(&identifier.namespace, &schema);
                 if let Some(previous) = self.tables.get(&identifier)
                     && let Some(object_id) = previous.object_id
                 {
@@ -297,6 +424,63 @@ struct CatalogSnapshot {
     /// a high-water-aware binary WARNs when it adopts such a snapshot.
     #[serde(default)]
     writer_version: Option<u32>,
+}
+
+/// TD-SPINE-2 (ADR-098 D1.3): the shared shard key for namespaces (and their
+/// tables/statistics) that carry no owning account — namespaces created
+/// without a tenant scope. It is a *shard* key, not a path segment; the
+/// on-storage path is hex-encoded by `DrPathBuilder`, so the reserved-looking
+/// underscore is inert there.
+pub const DEFAULT_SHARD_KEY: &str = "_default";
+
+/// TD-SPINE-2 (ADR-098 D1.3): the shard key of a namespace — its owning
+/// account (tenant) when recorded, else the shared default shard. A pure
+/// function of persisted state so the publisher and every follower agree on
+/// shard membership without coordination: `namespace.tenant_id` is durable
+/// (it rides the namespace record in WAL deltas, snapshots and shards).
+pub fn shard_key_of_tenant(tenant_id: Option<&str>) -> String {
+    match tenant_id {
+        Some(tenant) if !tenant.is_empty() => tenant.to_string(),
+        _ => DEFAULT_SHARD_KEY.to_string(),
+    }
+}
+
+/// TD-SPINE-2 (ADR-098 D1.3): the **root** record — the small global half of
+/// the sharded catalog snapshot. Carries the global registries (account →
+/// stable id), the fleet-wide identity high-water (object/collection ids are
+/// one global sequence; the `namespace_id` member stays the legacy GLOBAL
+/// record for whole-image readers and never bounds per-account floors), the
+/// publisher's replay watermark, and the `account → shard log version` index
+/// followers diff against. `BTreeMap` so the encoding is byte-deterministic.
+#[derive(Debug, Serialize, Deserialize)]
+struct CatalogRootRecord {
+    account_ids: HashMap<String, u32>,
+    #[serde(default)]
+    ids_high_water: Option<IdsHighWater>,
+    applied_seq: u64,
+    /// account (shard key) → version of that account's shard manifest log
+    /// this root reflects.
+    shard_index: std::collections::BTreeMap<String, u64>,
+    #[serde(default)]
+    writer_version: Option<u32>,
+}
+
+/// TD-SPINE-2 (ADR-098 D1.3): one **account shard** — every namespace,
+/// table and statistics row whose shard key is this account. Self-describing
+/// (`account`) so adoption knows exactly which account's rows to replace,
+/// and it carries the account's own namespace-id high-water so a dropped
+/// namespace's id stays reserved across compaction.
+#[derive(Debug, Serialize, Deserialize)]
+struct CatalogShardRecord {
+    account: String,
+    namespaces: HashMap<Vec<String>, CatalogNamespace>,
+    tables: HashMap<TableIdentifier, CatalogTableSchema>,
+    #[serde(default)]
+    statistics: HashMap<TableIdentifier, CatalogTableStatistics>,
+    #[serde(default)]
+    namespace_id_high_water: u16,
+    #[serde(default)]
+    applied_seq: u64,
 }
 
 /// TD-PATH-2 4a: the durable identity-high-water SIDECAR image — a tiny
@@ -523,7 +707,8 @@ impl SystemCatalogState {
 
     // --- snapshot (de)serialization (bounds Phase 3 replay) ---
 
-    /// Serialize the full state to a snapshot blob (field-named MessagePack).
+    /// Serialize the full state to a snapshot blob (envelope-framed
+    /// field-named MessagePack, TD-SPINE-1).
     pub fn to_snapshot_bytes(&self) -> Result<Vec<u8>> {
         let inner = self.inner.read();
         let snapshot = CatalogSnapshot {
@@ -539,11 +724,12 @@ impl SystemCatalogState {
             ids_high_water: Some(inner.ids_high_water),
             writer_version: Some(proximadb_catalog::IDENTITY_WRITER_VERSION_HIGH_WATER),
         };
-        rmp_serde::to_vec_named(&snapshot).context("encoding catalog snapshot")
+        crate::services::catalog_record_envelope::to_enveloped_vec_named(&snapshot)
+            .context("encoding catalog snapshot")
     }
 
     /// Reconstruct state from a snapshot blob, rebuilding the `ns_children`
-    /// secondary index.
+    /// secondary index. Legacy (unframed) blobs decode unchanged.
     pub fn from_snapshot_bytes(bytes: &[u8]) -> Result<Self> {
         Ok(Self {
             inner: RwLock::new(Self::inner_from_snapshot_bytes(bytes)?),
@@ -570,7 +756,8 @@ impl SystemCatalogState {
     /// omits as pure derivations of `tables`).
     fn inner_from_snapshot_bytes(bytes: &[u8]) -> Result<CatalogInner> {
         let snapshot: CatalogSnapshot =
-            rmp_serde::from_slice(bytes).context("decoding catalog snapshot")?;
+            crate::services::catalog_record_envelope::from_enveloped_slice(bytes)
+                .context("decoding catalog snapshot")?;
         let mut ns_children: HashMap<Vec<String>, HashSet<String>> = HashMap::new();
         // Every namespace gets an entry (so list_tables on an empty namespace
         // returns an empty set, not "missing").
@@ -580,11 +767,34 @@ impl SystemCatalogState {
         let mut tables = HashMap::with_capacity(snapshot.tables.len());
         let mut object_ids = HashMap::with_capacity(snapshot.tables.len());
         let mut ids_high_water = snapshot.ids_high_water.unwrap_or_default();
+        // TD-SPINE-2: whole-image loads rebuild the per-account namespace-id
+        // high-water from the rows (the image carries no per-account field;
+        // shards do). Live rows bound the floor; dropped-id memory for the
+        // whole image lives in the global record + the sidecar.
+        let mut account_ns_high_water: HashMap<String, u16> = HashMap::new();
+        let namespace_accounts: HashMap<Vec<String>, String> = snapshot
+            .namespaces
+            .iter()
+            .map(|(levels, namespace)| {
+                (
+                    levels.clone(),
+                    shard_key_of_tenant(namespace.tenant_id.as_deref()),
+                )
+            })
+            .collect();
         for namespace in snapshot.namespaces.values() {
             ids_high_water.fold_namespace(namespace);
         }
         for (id, schema) in snapshot.tables {
             ids_high_water.fold_table(&schema);
+            if let Some(namespace_id) = schema.stable_namespace_id {
+                let account = namespace_accounts
+                    .get(&id.namespace)
+                    .cloned()
+                    .unwrap_or_else(|| DEFAULT_SHARD_KEY.to_string());
+                let entry = account_ns_high_water.entry(account).or_insert(0);
+                *entry = (*entry).max(namespace_id);
+            }
             ns_children
                 .entry(id.namespace.clone())
                 .or_default()
@@ -601,6 +811,7 @@ impl SystemCatalogState {
             ns_children,
             statistics: snapshot.statistics,
             object_ids,
+            account_ns_high_water,
             applied_seq: snapshot.applied_seq,
             ids_high_water,
             loaded_writer_version: Some(snapshot.writer_version),
@@ -615,22 +826,241 @@ impl SystemCatalogState {
         self.inner.read().loaded_writer_version
     }
 
+    // --- TD-SPINE-2: sharded snapshot (root + one shard per account) -------
+
+    /// The highest typed namespace id ever minted **in one account** (live or
+    /// emptied; `None` when the account never minted one). The per-account
+    /// allocator floor for NEW allocations sits above it; existing ids in
+    /// other accounts are irrelevant (per-account uniqueness is the
+    /// documented `accounts/{a}/{n}/{c}` model).
+    pub fn max_namespace_id_ever_for(&self, account: &str) -> Option<u16> {
+        self.inner
+            .read()
+            .account_ns_high_water
+            .get(account)
+            .copied()
+            .filter(|id| *id > 0)
+    }
+
+    /// Every shard key with rows in state — the full account set a migration
+    /// or full republish must cover.
+    pub fn shard_keys(&self) -> std::collections::HashSet<String> {
+        let inner = self.inner.read();
+        inner
+            .namespaces
+            .values()
+            .map(|namespace| shard_key_of_tenant(namespace.tenant_id.as_deref()))
+            .collect()
+    }
+
+    /// TD-SPINE-2: the shard key of a namespace path in the current state
+    /// (its namespace's tenant when recorded, else the default shard; an
+    /// unknown namespace defaults too — mirroring the writer-side rule).
+    pub fn shard_key_of_namespace(&self, levels: &[String]) -> String {
+        self.inner.read().shard_key_of_levels(levels)
+    }
+
+    /// TD-SPINE-2: every account the per-account namespace-id high-water
+    /// remembers — including accounts whose namespaces are all gone (their
+    /// dropped ids must stay reserved across compaction, which is exactly
+    /// why this map, not the live namespace set, seeds the allocator floors).
+    pub fn ns_high_water_accounts(&self) -> std::collections::HashSet<String> {
+        self.inner.read().account_ns_high_water.keys().cloned().collect()
+    }
+
+    /// TD-SPINE-2: serialize the **root** image (global registries + id
+    /// high-water + watermark + shard index), envelope-framed.
+    pub fn to_root_bytes(
+        &self,
+        shard_index: &std::collections::BTreeMap<String, u64>,
+    ) -> Result<Vec<u8>> {
+        let inner = self.inner.read();
+        let root = CatalogRootRecord {
+            account_ids: inner.account_ids.clone(),
+            ids_high_water: Some(inner.ids_high_water),
+            applied_seq: inner.applied_seq,
+            shard_index: shard_index.clone(),
+            writer_version: Some(proximadb_catalog::IDENTITY_WRITER_VERSION_HIGH_WATER),
+        };
+        crate::services::catalog_record_envelope::to_enveloped_vec_named(&root)
+            .context("encoding catalog root")
+    }
+
+    /// TD-SPINE-2: serialize **one account's shard** image (its namespaces,
+    /// tables, statistics and namespace-id high-water), envelope-framed.
+    /// Rows are selected by shard key: a table/statistic belongs to its
+    /// namespace's shard, or the default shard when the namespace is absent.
+    pub fn to_shard_bytes(&self, account: &str) -> Result<Vec<u8>> {
+        let inner = self.inner.read();
+        let mut namespaces = HashMap::new();
+        let mut member: std::collections::HashSet<Vec<String>> =
+            std::collections::HashSet::new();
+        for namespace in inner.namespaces.values() {
+            if shard_key_of_tenant(namespace.tenant_id.as_deref()) == account {
+                member.insert(namespace.levels.clone());
+                namespaces.insert(namespace.levels.clone(), namespace.clone());
+            }
+        }
+        // A table whose namespace is missing from state (should not happen;
+        // defensive) shards with the default shard, mirroring the
+        // shard-key rule for absent namespaces.
+        let tables: HashMap<TableIdentifier, CatalogTableSchema> = inner
+            .tables
+            .iter()
+            .filter(|(id, _)| {
+                member.contains(&id.namespace)
+                    || (account == DEFAULT_SHARD_KEY
+                        && !inner.namespaces.contains_key(&id.namespace))
+            })
+            .map(|(id, schema)| (id.clone(), (**schema).clone()))
+            .collect();
+        let statistics = inner
+            .statistics
+            .iter()
+            .filter(|(id, _)| {
+                member.contains(&id.namespace)
+                    || (account == DEFAULT_SHARD_KEY
+                        && !inner.namespaces.contains_key(&id.namespace))
+            })
+            .map(|(id, stats)| (id.clone(), stats.clone()))
+            .collect();
+        // The durable per-account high-water is the max of the folded floor
+        // (which replay keeps above every live and dropped id) and whatever
+        // the rows themselves carry.
+        let mut namespace_id_high_water = inner.account_ns_high_water.get(account).copied();
+        for schema in tables.values() {
+            if let Some(id) = schema.stable_namespace_id {
+                namespace_id_high_water = Some(namespace_id_high_water.unwrap_or(0).max(id));
+            }
+        }
+        let shard = CatalogShardRecord {
+            account: account.to_string(),
+            namespaces,
+            tables,
+            statistics,
+            namespace_id_high_water: namespace_id_high_water.unwrap_or(0),
+            applied_seq: inner.applied_seq,
+        };
+        crate::services::catalog_record_envelope::to_enveloped_vec_named(&shard)
+            .context("encoding catalog shard")
+    }
+
+    /// The decoded root, for the boot/reload protocol (shard-index diffing)
+    /// without folding anything into state.
+    pub fn decode_catalog_root(
+        bytes: &[u8],
+    ) -> Result<(
+        HashMap<String, u32>,
+        IdsHighWater,
+        Option<u32>,
+        u64,
+        std::collections::BTreeMap<String, u64>,
+    )> {
+        let root: CatalogRootRecord =
+            crate::services::catalog_record_envelope::from_enveloped_slice(bytes)
+                .context("decoding catalog root")?;
+        Ok((
+            root.account_ids,
+            root.ids_high_water.unwrap_or_default(),
+            root.writer_version,
+            root.applied_seq,
+            root.shard_index,
+        ))
+    }
+
+    /// TD-SPINE-2: build the full state from a root image plus every shard
+    /// in its index (boot / follower assembly). The root contributes the
+    /// global registries and high-water; each shard contributes its
+    /// account's rows and per-account namespace-id high-water.
+    pub fn from_root_and_shards(
+        root_bytes: &[u8],
+        shards: &[(String, Vec<u8>)],
+    ) -> Result<Self> {
+        let root: CatalogRootRecord =
+            crate::services::catalog_record_envelope::from_enveloped_slice(root_bytes)
+                .context("decoding catalog root")?;
+        let mut inner = CatalogInner {
+            account_ids: root.account_ids,
+            applied_seq: root.applied_seq,
+            ids_high_water: root.ids_high_water.unwrap_or_default(),
+            loaded_writer_version: Some(root.writer_version),
+            ..CatalogInner::default()
+        };
+        for (account, shard_bytes) in shards {
+            let shard: CatalogShardRecord =
+                crate::services::catalog_record_envelope::from_enveloped_slice(shard_bytes)
+                    .with_context(|| format!("decoding catalog shard '{account}'"))?;
+            if &shard.account != account {
+                anyhow::bail!(
+                    "catalog shard identity mismatch: log key '{account}' carries \
+                     shard '{}'",
+                    shard.account
+                );
+            }
+            inner.apply_shard(shard);
+        }
+        Ok(Self {
+            inner: RwLock::new(inner),
+        })
+    }
+
+    /// TD-SPINE-2: adopt a newer **root** in place (cross-pod reload). The
+    /// global registries are replaced wholesale (small, root-authoritative);
+    /// the identity high-water merges monotonically (never lowers); the
+    /// replay watermark advances to the publisher's.
+    pub fn adopt_root_bytes(&self, root_bytes: &[u8]) -> Result<()> {
+        let root: CatalogRootRecord =
+            crate::services::catalog_record_envelope::from_enveloped_slice(root_bytes)
+                .context("decoding catalog root")?;
+        let mut inner = self.inner.write();
+        inner.account_ids = root.account_ids;
+        inner.ids_high_water.merge_max(root.ids_high_water.unwrap_or_default());
+        inner.applied_seq = inner.applied_seq.max(root.applied_seq);
+        inner.loaded_writer_version = Some(root.writer_version);
+        Ok(())
+    }
+
+    /// TD-SPINE-2: adopt one account's shard in place (cross-pod reload).
+    /// Replaces EXACTLY that account's rows — every other account's rows,
+    /// and the read-your-writes window for them, are untouched — and folds
+    /// the shard's per-account namespace-id high-water monotonically.
+    pub fn load_shard_bytes(&self, account: &str, shard_bytes: &[u8]) -> Result<()> {
+        let shard: CatalogShardRecord =
+            crate::services::catalog_record_envelope::from_enveloped_slice(shard_bytes)
+                .with_context(|| format!("decoding catalog shard '{account}'"))?;
+        if shard.account != account {
+            anyhow::bail!(
+                "catalog shard identity mismatch: log key '{account}' carries \
+                 shard '{}'",
+                shard.account
+            );
+        }
+        let mut inner = self.inner.write();
+        inner.remove_shard_rows(account);
+        inner.apply_shard(shard);
+        Ok(())
+    }
+
     /// TD-PATH-2 4a: encode the durable high-water sidecar image (see
-    /// [`IdentityHighWaterSidecar`]). Stamped with the current writer version.
+    /// [`IdentityHighWaterSidecar`]). Stamped with the current writer version
+    /// and framed by the TD-SPINE-1 record envelope.
     pub fn to_identity_high_water_sidecar_bytes(&self) -> Result<Vec<u8>> {
         let sidecar = IdentityHighWaterSidecar {
             writer_version: Some(proximadb_catalog::IDENTITY_WRITER_VERSION_HIGH_WATER),
             high_water: self.inner.read().ids_high_water,
         };
-        rmp_serde::to_vec_named(&sidecar).context("encoding identity high-water sidecar")
+        crate::services::catalog_record_envelope::to_enveloped_vec_named(&sidecar)
+            .context("encoding identity high-water sidecar")
     }
 
     /// TD-PATH-2 4a: fold a sidecar image into state — monotone (`merge_max`,
     /// never lowers) — and return the sidecar's writer-version stamp so the
-    /// caller can WARN on a lagging (pre-high-water) writer.
+    /// caller can WARN on a lagging (pre-high-water) writer. Legacy
+    /// (unframed) sidecar bodies decode unchanged (TD-SPINE-1 mixed-read).
     pub fn adopt_identity_high_water_sidecar_bytes(&self, bytes: &[u8]) -> Result<Option<u32>> {
         let sidecar: IdentityHighWaterSidecar =
-            rmp_serde::from_slice(bytes).context("decoding identity high-water sidecar")?;
+            crate::services::catalog_record_envelope::from_enveloped_slice(bytes)
+                .context("decoding identity high-water sidecar")?;
         let stamp = sidecar.writer_version;
         self.inner
             .write()

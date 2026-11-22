@@ -178,6 +178,7 @@ pub mod bulk_load;
 pub mod canonical_wal;
 pub mod catalog_backend_choice;
 pub mod catalog_introspection;
+pub mod catalog_record_envelope;
 pub mod catalog_snapshot_store;
 pub mod collection;
 pub mod ddl;

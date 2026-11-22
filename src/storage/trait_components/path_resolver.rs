@@ -1205,6 +1205,89 @@ impl DrPathBuilder {
     pub fn system_catalog_manifests_subprefix() -> String {
         format!("{}_manifests/", Self::system_catalog_subprefix())
     }
+
+    /// Reserved segment holding the sharded catalog snapshot's **root**
+    /// manifest log (TD-SPINE-2 / ADR-098 D1.3): global registries, id
+    /// high-waters and the `account → shard log version` index.
+    pub const SYSTEM_CATALOG_ROOT_SUBPATH: &'static str = "_root";
+
+    /// Reserved segment holding the sharded catalog snapshot's **per-account
+    /// shard** manifest logs (TD-SPINE-2 / ADR-098 D1.3): one manifest log
+    /// per account under `_shards/{encoded-account}/`.
+    pub const SYSTEM_CATALOG_SHARDS_SUBPATH: &'static str = "_shards";
+
+    /// TD-SPINE-2: encode an account (shard key) into a path-safe manifest-log
+    /// segment. Hex (2× length, `[0-9a-f]`) so ANY account string — including
+    /// non-ASCII or separator-bearing tenant ids — maps to exactly one valid
+    /// single path segment with no escaping and no validation failure; the
+    /// mapping is deterministic and injective, so distinct accounts never
+    /// share a shard log.
+    pub fn encode_system_catalog_shard_segment(account: &str) -> String {
+        let mut encoded = String::with_capacity(account.len() * 2);
+        for byte in account.bytes() {
+            use std::fmt::Write as _;
+            let _ = write!(encoded, "{byte:02x}");
+        }
+        encoded
+    }
+
+    /// TD-SPINE-2: relative prefix of the sharded catalog snapshot's **root**
+    /// manifest log: `_operator/catalog/_root/` (sibling of the legacy
+    /// whole-image `_manifests/` log).
+    pub fn system_catalog_root_manifests_subprefix() -> String {
+        format!(
+            "{}{}/",
+            Self::system_catalog_subprefix(),
+            Self::SYSTEM_CATALOG_ROOT_SUBPATH
+        )
+    }
+
+    /// TD-SPINE-2: relative prefix of one account's **shard** manifest log:
+    /// `_operator/catalog/_shards/{hex(account)}/`. Structural per-account
+    /// isolation (ADR-098 D1.3): a DDL publishes only its account's shard
+    /// object under this prefix, never a fleet-wide image.
+    pub fn system_catalog_shard_manifests_subprefix(account: &str) -> String {
+        format!(
+            "{}{}/{}/",
+            Self::system_catalog_subprefix(),
+            Self::SYSTEM_CATALOG_SHARDS_SUBPATH,
+            Self::encode_system_catalog_shard_segment(account)
+        )
+    }
+
+    /// TD-SPINE-2: derive the root-log prefix as a **sibling** of an arbitrary
+    /// system-catalog manifests prefix (the canonical
+    /// [`system_catalog_manifests_subprefix`](Self::system_catalog_manifests_subprefix)
+    /// yields exactly [`system_catalog_root_manifests_subprefix`](Self::system_catalog_root_manifests_subprefix);
+    /// pinned by test). Lets a snapshot store opened at a caller-supplied
+    /// prefix reach its root log without a second constructor.
+    pub fn system_catalog_root_manifests_subprefix_from(manifests_prefix: &str) -> String {
+        let trimmed = manifests_prefix.trim_end_matches('/');
+        match trimmed.rfind('/') {
+            Some(idx) => format!("{}/{}/", &trimmed[..idx], Self::SYSTEM_CATALOG_ROOT_SUBPATH),
+            None => format!("{}/", Self::SYSTEM_CATALOG_ROOT_SUBPATH),
+        }
+    }
+
+    /// TD-SPINE-2: derive one account's shard-log prefix as a sibling of an
+    /// arbitrary system-catalog manifests prefix (canonical equivalence
+    /// pinned by test).
+    pub fn system_catalog_shard_manifests_subprefix_from(
+        manifests_prefix: &str,
+        account: &str,
+    ) -> String {
+        let trimmed = manifests_prefix.trim_end_matches('/');
+        let parent = match trimmed.rfind('/') {
+            Some(idx) => &trimmed[..idx],
+            None => "",
+        };
+        format!(
+            "{}/{}/{}/",
+            parent,
+            Self::SYSTEM_CATALOG_SHARDS_SUBPATH,
+            Self::encode_system_catalog_shard_segment(account)
+        )
+    }
 }
 
 #[cfg(test)]
@@ -1950,6 +2033,72 @@ mod tests {
         assert_eq!(
             collection_index_path_typed(base, cid, None),
             StoragePath::collection_index_path(base, cid)
+        );
+    }
+
+    /// TD-SPINE-2: shard segments are pure lowercase hex — any account string
+    /// (non-ASCII, separators, traversal) maps to exactly one path-safe
+    /// single segment, and distinct accounts never collide.
+    #[test]
+    fn system_catalog_shard_segment_is_path_safe_hex() {
+        assert_eq!(
+            DrPathBuilder::encode_system_catalog_shard_segment("tenant-one"),
+            "74656e616e742d6f6e65"
+        );
+        // Hostile ids cannot escape the segment: separators, traversal and
+        // non-ASCII all encode to hex.
+        for hostile in ["a/b", "..", "\u{4e2d}\u{6587}", "a b", "\0"] {
+            let segment = DrPathBuilder::encode_system_catalog_shard_segment(hostile);
+            assert!(
+                segment.chars().all(|c| c.is_ascii_hexdigit()),
+                "segment must be hex: {segment}"
+            );
+            assert!(!segment.contains('/'));
+        }
+        assert_ne!(
+            DrPathBuilder::encode_system_catalog_shard_segment("a"),
+            DrPathBuilder::encode_system_catalog_shard_segment("b")
+        );
+    }
+
+    /// TD-SPINE-2: the canonical root/shard prefixes live beside the legacy
+    /// whole-image log, and the sibling derivation from the canonical
+    /// manifests prefix is byte-identical to the canonical builders — the
+    /// snapshot store opens at the manifests prefix and derives its root and
+    /// shard logs, so the two must never drift.
+    #[test]
+    fn system_catalog_root_and_shard_prefixes_are_canonical_siblings() {
+        let canonical = DrPathBuilder::system_catalog_manifests_subprefix();
+        assert_eq!(canonical, "_operator/catalog/_manifests/");
+        assert_eq!(
+            DrPathBuilder::system_catalog_root_manifests_subprefix(),
+            "_operator/catalog/_root/"
+        );
+        assert_eq!(
+            DrPathBuilder::system_catalog_root_manifests_subprefix_from(&canonical),
+            DrPathBuilder::system_catalog_root_manifests_subprefix()
+        );
+        assert_eq!(
+            DrPathBuilder::system_catalog_shard_manifests_subprefix("tenant-one"),
+            "_operator/catalog/_shards/74656e616e742d6f6e65/"
+        );
+        assert_eq!(
+            DrPathBuilder::system_catalog_shard_manifests_subprefix_from(
+                &canonical,
+                "tenant-one"
+            ),
+            DrPathBuilder::system_catalog_shard_manifests_subprefix("tenant-one")
+        );
+        // Trailing slashes and single-segment prefixes degrade, never panic.
+        assert_eq!(
+            DrPathBuilder::system_catalog_root_manifests_subprefix_from(
+                "_operator/catalog/_manifests/"
+            ),
+            "_operator/catalog/_root/"
+        );
+        assert_eq!(
+            DrPathBuilder::system_catalog_root_manifests_subprefix_from("_manifests"),
+            "_root/"
         );
     }
 }

@@ -52,6 +52,19 @@ pub enum SnapshotWrite {
     Fenced,
 }
 
+/// TD-SPINE-2: outcome of committing a publish's account shards.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ShardCommit {
+    /// Every shard landed; carries each account's NEW manifest-log version
+    /// for the root index the caller is about to commit.
+    Committed(std::collections::HashMap<String, u64>),
+    /// At least one shard log was claimed or fenced by a newer writer
+    /// (higher generation). The caller must NOT publish a root referencing
+    /// versions it does not own — step down and reload instead. Shards that
+    /// did land are harmless: the root still names their predecessors.
+    Fenced,
+}
+
 /// Durable, atomically-replaceable home for the catalog snapshot blob.
 ///
 /// `write_atomic` must guarantee a reader concurrent with the write observes
@@ -108,6 +121,64 @@ pub trait CatalogSnapshotStore: Send + Sync {
         _min_age: std::time::Duration,
     ) -> Result<usize> {
         Ok(0)
+    }
+
+    // ── TD-SPINE-2 (ADR-098 D1.3): per-account sharded snapshot publish/read ──
+    //
+    // The whole-image `read`/`write_atomic` surface above stays exactly as it
+    // is (it is the local-store path AND the kill-switch escape path). The
+    // sharded surface below splits one whole-image blob into a small ROOT
+    // manifest log (global registries + the `account → shard log version`
+    // index) plus one SHARD manifest log per account, each a sibling of the
+    // whole-image log, committed through the same generation-fenced
+    // [`ManifestCommitter`]. Defaults make every non-object store (local fs,
+    // injected test stores) report "unsupported", which the catalog reads as
+    // "keep the whole-image path".
+
+    /// Whether this store implements the sharded publish/read surface.
+    fn supports_sharded_publish(&self) -> bool {
+        false
+    }
+
+    /// Read the current ROOT record (pointer version + fencing generation +
+    /// envelope-framed body), or `None` when no root has been published yet
+    /// (fresh deployment, or a pre-TD-SPINE-2 deployment still on the
+    /// whole-image log — mixed-read).
+    async fn read_root(&self) -> Result<Option<SnapshotRead>> {
+        Ok(None)
+    }
+
+    /// Cheap probe of the latest published ROOT pointer version (the sharded
+    /// sinval key followers tail) without fetching any payload.
+    async fn latest_root_version(&self) -> Result<Option<u64>> {
+        Ok(None)
+    }
+
+    /// Commit the given account shards at `generation`. Each shard is its own
+    /// manifest log (CAS on the successor slot, fenced on generation), so a
+    /// stale writer is rejected before any root is moved. Returns the new
+    /// per-account versions, or [`ShardCommit::Fenced`] when any shard log
+    /// was claimed/fenced by a newer writer (the caller must step down, not
+    /// publish a root referencing versions it does not own).
+    async fn commit_shards(
+        &self,
+        _generation: u64,
+        _shards: &[(String, Vec<u8>)],
+    ) -> Result<ShardCommit> {
+        anyhow::bail!("store does not support sharded catalog snapshots")
+    }
+
+    /// Commit the ROOT record at `generation` (carrying the caller's
+    /// post-shard-commit index). Fenced/conflicting outcomes surface as
+    /// [`SnapshotWrite::Fenced`], exactly like [`Self::write_atomic`].
+    async fn commit_root(&self, _generation: u64, _root_bytes: &[u8]) -> Result<SnapshotWrite> {
+        anyhow::bail!("store does not support sharded catalog snapshots")
+    }
+
+    /// Read one account's current shard record (its manifest log's tip), or
+    /// `None` when that account has never published a shard.
+    async fn read_shard(&self, _account: &str) -> Result<Option<SnapshotRead>> {
+        anyhow::bail!("store does not support sharded catalog snapshots")
     }
 
     /// TD-PATH-2 4a: read the durable identity-high-water sidecar, if this
@@ -312,6 +383,13 @@ impl CatalogSnapshotStore for LocalSnapshotStore {
 /// `proximadb-object-store` crate's cloud features, `s3://`/`gs://`/`az://`.
 pub struct ObjectStoreSnapshotStore {
     committer: ManifestCommitter,
+    /// TD-SPINE-2: the ROOT manifest log — a sibling of the whole-image log
+    /// (`_operator/catalog/_root/` in the canonical wiring, derived via
+    /// `DrPathBuilder` so the two can never drift; pinned by test).
+    root_committer: ManifestCommitter,
+    /// TD-SPINE-2: the whole-image log prefix this store was opened at; the
+    /// root and per-account shard logs are derived from it as siblings.
+    manifests_prefix: String,
     /// TD-PATH-2 4a: the same backing store the committer resolves relative
     /// paths against, used for the sidecar object beside the manifest log.
     sidecar_store: ProximaObjectStore,
@@ -331,6 +409,32 @@ fn sibling_sidecar_key(manifests_prefix: &str) -> String {
     match trimmed.rfind('/') {
         Some(idx) => format!("{}/identity_high_water", &trimmed[..idx]),
         None => "identity_high_water".to_string(),
+    }
+}
+
+/// TD-SPINE-2: read a generation-fenced manifest log's TIP as a
+/// [`SnapshotRead`] — the shared body of `read_root` and `read_shard`.
+/// `None` when the log is still empty (a fresh account, or a pre-TD-SPINE-2
+/// deployment with no root yet).
+async fn read_log_tip(
+    committer: &ManifestCommitter,
+    what: &str,
+    label: &str,
+) -> Result<Option<SnapshotRead>> {
+    match committer.latest_version().await.with_context(|| {
+        format!("reading catalog snapshot {what} log {label}")
+    })? {
+        Some(version) => {
+            let (generation, payload) = committer.read_fenced(version).await.with_context(|| {
+                format!("reading catalog snapshot {what} {label}@{version}")
+            })?;
+            Ok(Some(SnapshotRead {
+                version,
+                generation,
+                bytes: payload.to_vec(),
+            }))
+        }
+        None => Ok(None),
     }
 }
 
@@ -355,15 +459,33 @@ impl ObjectStoreSnapshotStore {
         let manifests_prefix = manifests_prefix.into();
         let label = format!("{base_url}::{manifests_prefix}");
         let sidecar_key = sibling_sidecar_key(&manifests_prefix);
+        // TD-SPINE-2: the root log is a DrPathBuilder-derived sibling of the
+        // whole-image log (canonical equivalence pinned by test).
+        let root_prefix = crate::storage::trait_components::path_resolver::DrPathBuilder::system_catalog_root_manifests_subprefix_from(&manifests_prefix);
         Self {
-            committer: ManifestCommitter::new(store.clone(), manifests_prefix)
+            committer: ManifestCommitter::new(store.clone(), manifests_prefix.clone())
                 .with_legacy_encoding(
                     proximadb_iceberg_engine::manifest::LegacyEncoding::GenerationPrefixed,
                 ),
+            root_committer: ManifestCommitter::new(store.clone(), root_prefix)
+                .with_legacy_encoding(
+                    proximadb_iceberg_engine::manifest::LegacyEncoding::GenerationPrefixed,
+                ),
+            manifests_prefix,
             sidecar_store: store,
             sidecar_key,
             label,
         }
+    }
+
+    /// TD-SPINE-2: one account's shard manifest log — also a DrPathBuilder-
+    /// derived sibling of the whole-image log. Fresh per call: a committer is
+    /// a thin (store-clone + prefix) handle, and accounts are unbounded.
+    fn shard_committer(&self, account: &str) -> ManifestCommitter {
+        let prefix = crate::storage::trait_components::path_resolver::DrPathBuilder::system_catalog_shard_manifests_subprefix_from(&self.manifests_prefix, account);
+        ManifestCommitter::new(self.sidecar_store.clone(), prefix).with_legacy_encoding(
+            proximadb_iceberg_engine::manifest::LegacyEncoding::GenerationPrefixed,
+        )
     }
 }
 
@@ -440,6 +562,72 @@ impl CatalogSnapshotStore for ObjectStoreSnapshotStore {
             .latest_version()
             .await
             .with_context(|| format!("probing catalog snapshot version {}", self.label))
+    }
+
+    fn supports_sharded_publish(&self) -> bool {
+        true
+    }
+
+    async fn read_root(&self) -> Result<Option<SnapshotRead>> {
+        read_log_tip(&self.root_committer, "root", &self.label).await
+    }
+
+    async fn latest_root_version(&self) -> Result<Option<u64>> {
+        self.root_committer
+            .latest_version()
+            .await
+            .with_context(|| format!("probing catalog snapshot root version {}", self.label))
+    }
+
+    async fn commit_shards(
+        &self,
+        generation: u64,
+        shards: &[(String, Vec<u8>)],
+    ) -> Result<ShardCommit> {
+        let mut versions = std::collections::HashMap::with_capacity(shards.len());
+        for (account, bytes) in shards {
+            let committer = self.shard_committer(account);
+            let parent = committer.latest_version().await.with_context(|| {
+                format!("reading catalog shard '{account}' head at {}", self.label)
+            })?;
+            match committer
+                .commit_fenced(parent, generation, bytes::Bytes::from(bytes.clone()))
+                .await
+                .with_context(|| format!("committing catalog shard '{account}' at {}", self.label))?
+            {
+                CommitOutcome::Committed(version) => {
+                    versions.insert(account.clone(), version);
+                }
+                // Fenced on the shard (stale generation) or lost the successor
+                // slot to a same-or-newer writer: either way this writer does
+                // not own that shard's tip, so it must not publish a root
+                // naming it. Shards that already landed are harmless — the
+                // root still references their predecessors.
+                CommitOutcome::Conflict { .. } => return Ok(ShardCommit::Fenced),
+            }
+        }
+        Ok(ShardCommit::Committed(versions))
+    }
+
+    async fn commit_root(&self, generation: u64, root_bytes: &[u8]) -> Result<SnapshotWrite> {
+        let parent = self
+            .root_committer
+            .latest_version()
+            .await
+            .with_context(|| format!("reading catalog snapshot root head {}", self.label))?;
+        match self
+            .root_committer
+            .commit_fenced(parent, generation, bytes::Bytes::copy_from_slice(root_bytes))
+            .await
+            .with_context(|| format!("committing catalog snapshot root {}", self.label))?
+        {
+            CommitOutcome::Committed(version) => Ok(SnapshotWrite::Published { version }),
+            CommitOutcome::Conflict { .. } => Ok(SnapshotWrite::Fenced),
+        }
+    }
+
+    async fn read_shard(&self, account: &str) -> Result<Option<SnapshotRead>> {
+        read_log_tip(&self.shard_committer(account), account, &self.label).await
     }
 
     async fn read_identity_high_water(&self) -> Result<Option<Vec<u8>>> {

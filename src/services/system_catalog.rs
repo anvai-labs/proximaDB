@@ -54,6 +54,21 @@ const DEFAULT_SNAPSHOT_THRESHOLD: u64 = 1000;
 /// version `0`, the first real published version. Versions never reach `u64::MAX`.
 const NO_VERSION: u64 = u64::MAX;
 
+/// TD-SPINE-2 (ADR-098 D1.3) kill switch: disable the per-account sharded
+/// catalog-snapshot publish/read path and revert to the legacy whole-image
+/// snapshot log. Unset = sharded (the shipped default). This is the RISK
+/// escape hatch the pre-GA policy allows (no backward-compat gates, but a
+/// runtime off-switch for the new publish path): with it set, the catalog
+/// publishes the whole image to the legacy `_manifests/` log and tails THAT
+/// log, never the root. On a deployment that already published root+shards,
+/// an escaping pod still ASSEMBLES the sharded image once at boot (so no
+/// data is lost) and then re-seeds the legacy log; mixed ON/OFF fleets
+/// diverge by design — the escape is fleet-wide, documented in TD-SPINE-2.
+/// Non-memoized: `#[serial]` tests flip it mid-process.
+fn sharded_catalog_snapshots_enabled() -> bool {
+    !proximadb_config::env_flag_now("PROXIMADB_CATALOG_SHARDED_SNAPSHOT_DISABLE")
+}
+
 /// Outcome of a Phase 6b sinval staleness check ([`SystemCatalog::reload_if_stale`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReloadOutcome {
@@ -88,6 +103,45 @@ struct SnapshotConfig {
     threshold: u64,
 }
 
+/// TD-SPINE-2 (ADR-098 D1.4): the stable namespace-id allocator — the durable
+/// `(account, namespace) → id` registry plus the **per-account** allocation
+/// floor for NEW ids. Existing ids are never renumbered; two accounts may
+/// each mint id 1 (the typed id scopes an `accounts/{a}/{n}/…` path, so
+/// uniqueness is per-account by design — the schema always documented it
+/// that way; the allocator had been one global counter, making the u16
+/// bound fleet-wide). One lock guards both maps so check-and-mint is atomic.
+#[derive(Debug, Default)]
+struct NamespaceIdAllocator {
+    /// (account, namespace key) → stable id. Durable schemas are the
+    /// authority; rebuilt from them after every replay/snapshot/shard load.
+    ids: HashMap<(String, String), u16>,
+    /// account → next id to mint (floor sits above every id the account ever
+    /// minted, dropped ones included, via the per-account high-water).
+    floors: HashMap<String, u64>,
+}
+
+impl NamespaceIdAllocator {
+    /// Mint the next id for `account`, or error when the u16 space is spent.
+    fn allocate(&mut self, account: &str) -> Result<u16> {
+        let floor = self.floors.entry(account.to_string()).or_insert(1);
+        if *floor > u64::from(u16::MAX) {
+            return Err(anyhow!(
+                "stable namespace id space exhausted for account '{account}'"
+            ));
+        }
+        let id = u16::try_from(*floor)
+            .map_err(|_| anyhow!("stable namespace id space exhausted for account '{account}'"))?;
+        *floor += 1;
+        Ok(id)
+    }
+
+    /// Raise an account's floor above `id` (adopt-or-allocate semantics).
+    fn raise_floor(&mut self, account: &str, id: u16) {
+        let floor = self.floors.entry(account.to_string()).or_insert(1);
+        *floor = (*floor).max(u64::from(id) + 1);
+    }
+}
+
 /// WAL-backed read-heavy system catalog.
 pub struct SystemCatalog {
     name: String,
@@ -112,13 +166,15 @@ pub struct SystemCatalog {
     /// Next globally unique catalog object id (table/column/index). Recovered
     /// from durable schemas at boot; starts at one because zero is reserved.
     object_floor: AtomicU64,
-    /// Next stable namespace/collection ids. The typed ids are narrower than
-    /// object ids, so u64 floors let allocation detect exhaustion before casts.
-    namespace_floor: AtomicU64,
+    /// Next stable collection id. The typed id is narrower than object ids,
+    /// so a u64 floor lets allocation detect exhaustion before casts.
+    /// (Collection ids stay a GLOBAL sequence — TD-SPINE-2 scopes only the
+    /// namespace floor per account.)
     collection_floor: AtomicU64,
-    /// Stable namespace id per (account, logical namespace). Durable schemas
-    /// are the authority; this map is rebuilt from them after replay.
-    namespace_ids: parking_lot::RwLock<HashMap<(String, String), u16>>,
+    /// TD-SPINE-2: stable namespace id per (account, logical namespace) +
+    /// the per-account allocation floor. Durable schemas are the authority;
+    /// both maps are rebuilt from them after replay/snapshot/shard loads.
+    namespace_alloc: parking_lot::RwLock<NamespaceIdAllocator>,
     appender: Arc<dyn TableWalAppender>,
     /// Serializes the durable-append → in-RAM-apply pair so concurrent DDL can
     /// never interleave such that a lower-LSN mutation applies after a higher
@@ -152,6 +208,14 @@ pub struct SystemCatalog {
     /// snapshot — the bounded-staleness read replica. The single-pod default
     /// (an owner) leaves this `false`, so behaviour is unchanged.
     read_only: AtomicBool,
+    /// TD-SPINE-2: the shard-log versions this pod's in-RAM authority
+    /// reflects (the local copy of the root's `account → version` index).
+    /// Diffed against each published root to adopt ONLY changed shards.
+    shard_versions: parking_lot::RwLock<HashMap<String, u64>>,
+    /// TD-SPINE-2: accounts touched by commits since the last sharded
+    /// publish — exactly the shards the next publish must write, which is
+    /// what makes bytes-per-DDL O(account) instead of O(fleet).
+    pending_shards: parking_lot::Mutex<std::collections::HashSet<String>>,
 }
 
 impl SystemCatalog {
@@ -163,7 +227,7 @@ impl SystemCatalog {
         state: SystemCatalogState,
         appender: Arc<dyn TableWalAppender>,
     ) -> Self {
-        let (object_floor, namespace_floor, collection_floor, namespace_ids) =
+        let (object_floor, collection_floor, namespace_alloc) =
             Self::identity_allocator_seed(&state);
         let account_floor = state.max_account_id().map_or(1, |id| u64::from(id) + 1);
         let object_id_floor = state.max_object_id().map_or(1, |id| id + 1);
@@ -174,9 +238,8 @@ impl SystemCatalog {
             account_floor: AtomicU64::new(account_floor),
             object_id_floor: AtomicU64::new(object_id_floor),
             object_floor: AtomicU64::new(object_floor),
-            namespace_floor: AtomicU64::new(namespace_floor),
             collection_floor: AtomicU64::new(collection_floor),
-            namespace_ids: parking_lot::RwLock::new(namespace_ids),
+            namespace_alloc: parking_lot::RwLock::new(namespace_alloc),
             appender,
             write_lock: tokio::sync::Mutex::new(()),
             snapshot: None,
@@ -185,6 +248,8 @@ impl SystemCatalog {
             loaded_version: AtomicU64::new(NO_VERSION),
             loaded_generation: AtomicU64::new(0),
             read_only: AtomicBool::new(false),
+            shard_versions: parking_lot::RwLock::new(HashMap::new()),
+            pending_shards: parking_lot::Mutex::new(std::collections::HashSet::new()),
         }
     }
 
@@ -202,40 +267,58 @@ impl SystemCatalog {
 
     /// Recover every transient identity allocator from the durable table
     /// schemas folded into `state`. Skipped ids are harmless; reuse is not.
+    /// TD-SPINE-2: the namespace-id floor is seeded **per account** — each
+    /// account's floor sits above every id THAT account ever minted (dropped
+    /// ones included, via the per-account high-water), and ids other
+    /// accounts minted do not reserve anything for it. Existing ids are
+    /// never renumbered; they simply stay owned by their account.
     fn identity_allocator_seed(
         state: &SystemCatalogState,
-    ) -> (u64, u64, u64, HashMap<(String, String), u16>) {
+    ) -> (u64, u64, NamespaceIdAllocator) {
         let object_floor = state.max_object_id().map_or(1, |id| id.saturating_add(1));
-        let mut namespace_floor = 1_u64;
         let mut collection_floor = 1_u64;
-        let mut namespace_ids = HashMap::new();
+        let mut namespace_alloc = NamespaceIdAllocator::default();
         for (identifier, schema) in state.table_entries() {
             if let Some(namespace_id) = schema.stable_namespace_id {
-                namespace_floor = namespace_floor.max(u64::from(namespace_id) + 1);
                 if let Some(account) = state
                     .get_namespace(&identifier.namespace)
                     .and_then(|namespace| namespace.tenant_id)
                 {
-                    namespace_ids.insert((account, identifier.namespace.join(".")), namespace_id);
+                    namespace_alloc
+                        .ids
+                        .insert((account, identifier.namespace.join(".")), namespace_id);
                 }
             }
             if let Some(collection_id) = schema.stable_collection_id {
                 collection_floor = collection_floor.max(u64::from(collection_id) + 1);
             }
         }
-        // TD-PATH-2: above every typed id ever minted, dropped ones too.
+        // TD-PATH-2: above every typed collection id ever minted, dropped
+        // ones too (global sequence — unchanged).
         if let Some(collection_id) = state.max_collection_id_ever() {
             collection_floor = collection_floor.max(u64::from(collection_id) + 1);
         }
-        if let Some(namespace_id) = state.max_namespace_id_ever() {
-            namespace_floor = namespace_floor.max(u64::from(namespace_id) + 1);
+        // TD-SPINE-2: each account's floor sits above its own high-water
+        // (live rows folded above, dropped ids from the per-account
+        // high-water record that shards and WAL replay rebuild). The
+        // high-water map is the authority for the floor precisely because it
+        // remembers accounts with NO live namespace left — an emptied
+        // account must not re-mint its retired ids after compaction.
+        for account in state.ns_high_water_accounts() {
+            namespace_alloc.raise_floor(
+                &account,
+                state.max_namespace_id_ever_for(&account).unwrap_or(0),
+            );
         }
-        (
-            object_floor,
-            namespace_floor,
-            collection_floor,
-            namespace_ids,
-        )
+        let live_ids: Vec<(String, u16)> = namespace_alloc
+            .ids
+            .iter()
+            .map(|((account, _key), id)| (account.clone(), *id))
+            .collect();
+        for (account, id) in live_ids {
+            namespace_alloc.raise_floor(&account, id);
+        }
+        (object_floor, collection_floor, namespace_alloc)
     }
 
     fn mint_object_id(&self, existing: Option<u64>) -> Result<u64> {
@@ -276,10 +359,12 @@ impl SystemCatalog {
         };
         let key = (account.to_string(), namespace_key.to_string());
         let namespace_id = if let Some(id) = existing_namespace {
-            self.namespace_floor
-                .fetch_max(u64::from(id) + 1, Ordering::SeqCst);
-            let mut registry = self.namespace_ids.write();
-            match registry.get(&key) {
+            let mut alloc = self.namespace_alloc.write();
+            // TD-SPINE-2: adopt-or-allocate raises the ACCOUNT's floor, not a
+            // global counter — existing ids in other accounts do not reserve
+            // anything here (per-account floor, new allocations only).
+            alloc.raise_floor(account, id);
+            match alloc.ids.get(&key) {
                 Some(current) if *current != id => {
                     return Err(anyhow!(
                         "stable namespace identity mismatch for '{}': {} != {}",
@@ -290,23 +375,23 @@ impl SystemCatalog {
                 }
                 Some(_) => {}
                 None => {
-                    registry.insert(key, id);
+                    alloc.ids.insert(key, id);
                 }
             }
             id
-        } else if let Some(id) = self.namespace_ids.read().get(&key).copied() {
+        } else if let Some(id) = self.namespace_alloc.read().ids.get(&key).copied() {
             id
         } else {
-            let mut registry = self.namespace_ids.write();
-            if let Some(id) = registry.get(&key).copied() {
+            let mut alloc = self.namespace_alloc.write();
+            if let Some(id) = alloc.ids.get(&key).copied() {
                 id
             } else {
-                let id = self.allocate_bounded(
-                    &self.namespace_floor,
-                    u64::from(u16::MAX),
-                    "stable namespace",
-                )? as u16;
-                registry.insert(key, id);
+                // TD-SPINE-2: mint from the ACCOUNT's floor (starts at 1 for
+                // a fresh account — two accounts can each mint id 1; the id
+                // scopes an accounts/{a}/{n}/… path, so per-account
+                // uniqueness is the contract).
+                let id = alloc.allocate(account)?;
+                alloc.ids.insert(key, id);
                 id
             }
         };
@@ -389,27 +474,93 @@ impl SystemCatalog {
         let appender = Arc::new(crate::services::FramedTableWalAppender::open(&wal_path).await?);
         let entries = appender.read_entries().await?;
 
-        // A snapshot that exists but fails to decode is **fatal**: after a
-        // compaction the WAL alone no longer carries the pre-watermark history,
-        // so silently falling back to a WAL-only replay would lose committed DDL.
-        // `read` also yields the snapshot's pointer version + fencing generation.
-        let (state, prior_version, prior_generation) = match snapshot_store.read().await? {
-            Some(read) => {
-                let state =
-                    SystemCatalogState::from_snapshot_bytes(&read.bytes).with_context(|| {
-                        format!("decoding catalog snapshot {}", snapshot_store.describe())
-                    })?;
-                // The local WAL tail (entries past the snapshot watermark) is a
-                // no-op for a follower (it never appends), and the owner's own
-                // post-snapshot durability for an owner.
-                state.replay(&entries)?;
-                (state, read.version, read.generation)
+        // TD-SPINE-2: sharded boot when the store supports it and the kill
+        // switch is ON. The ROOT log's existence IS the mode — a published
+        // root ⇒ root + per-account shards; no root ⇒ the legacy whole-image
+        // log (the mixed-read source an owner then re-publishes as root +
+        // shards on first boot). With the kill switch OFF an object-store
+        // catalog still ASSEMBLES root+shards once (data preservation on
+        // escape) and then re-seeds the legacy whole-image log.
+        let sharded_reader =
+            sharded_catalog_snapshots_enabled() && snapshot_store.supports_sharded_publish();
+        // Set when the durable image came from the LEGACY whole-image log and
+        // sharding is ON: the owner re-publishes it as root + shards before
+        // serving, so followers converge on the sharded protocol.
+        let mut needs_shard_migration = false;
+        // Set when the image was assembled from root+shards but this pod will
+        // publish whole-image (kill switch OFF): re-seed the legacy log once.
+        let mut needs_legacy_reseed = false;
+
+        let (state, prior_version, prior_generation, shard_versions) = if sharded_reader {
+            match snapshot_store.read_root().await? {
+                Some(root_read) => {
+                    let (state, versions) =
+                        Self::assemble_root_and_shards(&root_read, snapshot_store.as_ref()).await?;
+                    state.replay(&entries)?;
+                    (state, root_read.version, root_read.generation, versions)
+                }
+                None => match snapshot_store.read().await? {
+                    Some(read) => {
+                        // Mixed-read source: a whole-image snapshot written
+                        // before sharding (or by an escaped pod). Decodes
+                        // unchanged; the owner re-publishes it sharded below.
+                        let state =
+                            SystemCatalogState::from_snapshot_bytes(&read.bytes)
+                                .with_context(|| {
+                                    format!(
+                                        "decoding catalog snapshot {}",
+                                        snapshot_store.describe()
+                                    )
+                                })?;
+                        state.replay(&entries)?;
+                        needs_shard_migration = true;
+                        (state, read.version, read.generation, HashMap::new())
+                    }
+                    None => (
+                        SystemCatalogState::from_wal_entries(&entries)?,
+                        NO_VERSION,
+                        0,
+                        HashMap::new(),
+                    ),
+                },
             }
-            None => (
-                SystemCatalogState::from_wal_entries(&entries)?,
+        } else if snapshot_store.supports_sharded_publish()
+            && let Some(root_read) = snapshot_store.read_root().await?
+        {
+            // Kill switch OFF on a store that HAD sharding on: assemble the
+            // (newer) sharded image so the escape loses nothing, claim above
+            // its generation, and re-seed the legacy whole-image log below.
+            let (state, versions) = Self::assemble_root_and_shards(&root_read, snapshot_store.as_ref()).await?;
+            state.replay(&entries)?;
+            let legacy_generation = snapshot_store
+                .read()
+                .await?
+                .map(|read| read.generation)
+                .unwrap_or(0);
+            needs_legacy_reseed = claim_owner;
+            (
+                state,
                 NO_VERSION,
-                0,
-            ),
+                root_read.generation.max(legacy_generation),
+                versions,
+            )
+        } else {
+            match snapshot_store.read().await? {
+                Some(read) => {
+                    let state =
+                        SystemCatalogState::from_snapshot_bytes(&read.bytes).with_context(|| {
+                            format!("decoding catalog snapshot {}", snapshot_store.describe())
+                        })?;
+                    state.replay(&entries)?;
+                    (state, read.version, read.generation, HashMap::new())
+                }
+                None => (
+                    SystemCatalogState::from_wal_entries(&entries)?,
+                    NO_VERSION,
+                    0,
+                    HashMap::new(),
+                ),
+            }
         };
 
         // Seed the appender's sequence floor from the snapshot watermark so a
@@ -459,20 +610,19 @@ impl SystemCatalog {
             .filter(|n| *n > 0)
             .unwrap_or(DEFAULT_SNAPSHOT_THRESHOLD);
 
-        let (object_floor, namespace_floor, collection_floor, namespace_ids) =
+        let (object_floor, collection_floor, namespace_alloc) =
             Self::identity_allocator_seed(&state);
         let account_floor = state.max_account_id().map_or(1, |id| u64::from(id) + 1);
         let object_id_floor = state.max_object_id().map_or(1, |id| id + 1);
-        Ok(Self {
+        let catalog = Self {
             name: name.into(),
             role: proximadb_catalog::CatalogRole::Operator,
             state: Arc::new(state),
             account_floor: AtomicU64::new(account_floor),
             object_id_floor: AtomicU64::new(object_id_floor),
             object_floor: AtomicU64::new(object_floor),
-            namespace_floor: AtomicU64::new(namespace_floor),
             collection_floor: AtomicU64::new(collection_floor),
-            namespace_ids: parking_lot::RwLock::new(namespace_ids),
+            namespace_alloc: parking_lot::RwLock::new(namespace_alloc),
             appender,
             write_lock: tokio::sync::Mutex::new(()),
             snapshot: Some(SnapshotConfig {
@@ -485,7 +635,59 @@ impl SystemCatalog {
             loaded_version: AtomicU64::new(prior_version),
             loaded_generation: AtomicU64::new(prior_generation),
             read_only: AtomicBool::new(!claim_owner),
-        })
+            shard_versions: parking_lot::RwLock::new(shard_versions),
+            pending_shards: parking_lot::Mutex::new(std::collections::HashSet::new()),
+        };
+        // TD-SPINE-2 migration (owner only): the durable image came from the
+        // legacy whole-image log and sharding is ON ⇒ re-publish it as root +
+        // one shard per account NOW (mixed-read-safe: the legacy chain stays
+        // readable; followers converge on their next reload). With the kill
+        // switch OFF on a previously-sharded store, the assembled root+shard
+        // image is re-seeded onto the legacy whole-image log instead, so the
+        // escape never strands the sharded window's data on the root.
+        if (needs_shard_migration || needs_legacy_reseed) && claim_owner {
+            if let Some(cfg) = &catalog.snapshot {
+                let _guard = catalog.write_lock.lock().await;
+                *catalog.pending_shards.lock() = catalog.state.shard_keys();
+                catalog.checkpoint_locked(cfg).await?;
+                catalog.commits_since_snapshot.store(0, Ordering::SeqCst);
+            }
+        }
+        Ok(catalog)
+    }
+
+    /// TD-SPINE-2: assemble the full in-RAM authority from a published ROOT
+    /// plus every shard in its index (boot / follower assembly), returning
+    /// the per-account shard-log versions observed (the local copy of the
+    /// root index that reload later diffs against). A shard the root
+    /// references but whose log is absent is skipped with a WARN — the root's
+    /// own index still governs what that account's rows should be, and the
+    /// next publish repairs it.
+    async fn assemble_root_and_shards(
+        root_read: &crate::services::catalog_snapshot_store::SnapshotRead,
+        store: &dyn CatalogSnapshotStore,
+    ) -> Result<(SystemCatalogState, HashMap<String, u64>)> {
+        let (_, _, _, _, shard_index) =
+            SystemCatalogState::decode_catalog_root(&root_read.bytes)
+                .with_context(|| format!("decoding catalog root {}", store.describe()))?;
+        let mut shards = Vec::with_capacity(shard_index.len());
+        let mut versions = HashMap::with_capacity(shard_index.len());
+        for (account, _root_version) in &shard_index {
+            match store.read_shard(account).await? {
+                Some(read) => {
+                    shards.push((account.clone(), read.bytes));
+                    versions.insert(account.clone(), read.version);
+                }
+                None => tracing::warn!(
+                    account = %account,
+                    store = %store.describe(),
+                    "catalog root references a shard with no committed log; \
+                     skipping it (the root's older version still governs)"
+                ),
+            }
+        }
+        let state = SystemCatalogState::from_root_and_shards(&root_read.bytes, &shards)?;
+        Ok((state, versions))
     }
 
     /// Durably append the deltas to the WAL, then fold them into the in-RAM
@@ -516,9 +718,50 @@ impl SystemCatalog {
         let entries = self.appender.append_operations(ops, None).await?;
         let applied = entries.len() as u64;
         let touches_ids = deltas.iter().any(CatalogDelta::touches_ids_high_water);
+        // TD-SPINE-2: capture the shard keys a `DropNamespace` retires
+        // BEFORE the fold removes the namespace record (its tenant is the
+        // shard attribution)...
+        let mut touched: std::collections::HashSet<String> = deltas
+            .iter()
+            .filter_map(|delta| match delta {
+                CatalogDelta::DropNamespace { levels } => {
+                    let tenant = self
+                        .state
+                        .get_namespace(levels)
+                        .and_then(|namespace| namespace.tenant_id);
+                    Some(crate::services::system_catalog_state::shard_key_of_tenant(
+                        tenant.as_deref(),
+                    ))
+                }
+                _ => None,
+            })
+            .collect();
+        // ...and the namespace paths every OTHER delta touches, resolved
+        // AFTER the fold (a create-namespace + create-table batch must see
+        // the namespace the same batch just created).
+        let touched_levels: Vec<Vec<String>> = deltas
+            .iter()
+            .filter_map(|delta| match delta {
+                CatalogDelta::UpsertNamespace { namespace } => Some(namespace.levels.clone()),
+                CatalogDelta::UpsertTable { identifier, .. }
+                | CatalogDelta::DropTable { identifier }
+                | CatalogDelta::UpsertStatistics { identifier, .. } => {
+                    Some(identifier.namespace.clone())
+                }
+                _ => None,
+            })
+            .collect();
         for (entry, delta) in entries.into_iter().zip(deltas) {
             self.state.apply_committed(entry.sequence_number, delta);
         }
+        touched.extend(
+            touched_levels
+                .iter()
+                .map(|levels| self.state.shard_key_of_namespace(levels)),
+        );
+        // TD-SPINE-2: exactly these shards (plus the always-written root) are
+        // republished at the next checkpoint — bytes-per-DDL O(account).
+        self.pending_shards.lock().extend(touched);
         if let Some(cfg) = &self.snapshot {
             // TD-PATH-2 4a: the mint/drop durability point. The WAL entry is
             // durable and folded; persist the sidecar so an older binary that
@@ -689,6 +932,13 @@ impl SystemCatalog {
     /// - after compaction: WAL holds only `> watermark`; boot seeds from the
     ///   snapshot then replays exactly those. No loss.
     async fn checkpoint_locked(&self, cfg: &SnapshotConfig) -> Result<()> {
+        // TD-SPINE-2: the sharded publish path (default ON; kill switch
+        // `PROXIMADB_CATALOG_SHARDED_SNAPSHOT_DISABLE` reverts to the legacy
+        // whole-image branch below). Local/injected stores never support the
+        // sharded surface and keep the whole-image behavior.
+        if sharded_catalog_snapshots_enabled() && cfg.store.supports_sharded_publish() {
+            return self.checkpoint_sharded_locked(cfg).await;
+        }
         let watermark = self.state.applied_seq();
 
         // 1. Durable snapshot. The store guarantees an atomic replace (local:
@@ -749,6 +999,98 @@ impl SystemCatalog {
         Ok(())
     }
 
+    /// TD-SPINE-2 (ADR-098 D1.3): the sharded checkpoint — publish ONLY the
+    /// accounts touched since the last publish (each as its own
+    /// generation-fenced shard manifest, O(account) bytes), then the root
+    /// carrying the merged `account → shard version` index. Crash-consistent
+    /// by publish order: shards first, root last. A crash between the two
+    /// leaves the root naming the shards' PREDECESSORS — followers keep the
+    /// older-but-consistent image and the owner's next publish (which
+    /// re-serializes the same in-RAM shard image idempotently) heals it.
+    /// **The write lock must be held.**
+    async fn checkpoint_sharded_locked(&self, cfg: &SnapshotConfig) -> Result<()> {
+        let watermark = self.state.applied_seq();
+        let generation = self.generation.load(Ordering::SeqCst);
+
+        // 1. Commit the touched shards (idempotent images of the in-RAM
+        //    authority for exactly those accounts).
+        let touched: Vec<String> = std::mem::take(&mut *self.pending_shards.lock())
+            .into_iter()
+            .collect();
+        let shard_writes: Vec<(String, Vec<u8>)> = touched
+            .iter()
+            .map(|account| {
+                Ok((
+                    account.clone(),
+                    self.state.to_shard_bytes(account).with_context(|| {
+                        format!("serializing catalog shard '{account}'")
+                    })?,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let committed = match cfg.store.commit_shards(generation, &shard_writes).await? {
+            crate::services::catalog_snapshot_store::ShardCommit::Committed(versions) => versions,
+            crate::services::catalog_snapshot_store::ShardCommit::Fenced => {
+                // A newer writer owns at least one shard log. Our shards did
+                // not become the named tips; do NOT publish a root over
+                // them. Step down exactly like a fenced whole-image
+                // checkpoint (reload the winner's image, go read-only).
+                tracing::warn!(
+                    catalog = %self.name,
+                    generation,
+                    store = %cfg.store.describe(),
+                    "sharded catalog checkpoint was fenced by a newer pod on a \
+                     shard log; stepping down to read-only and reloading its snapshot"
+                );
+                self.reload_from_store_locked(cfg).await?;
+                return Ok(());
+            }
+        };
+
+        // 2. Commit the root with the merged index (touched shards at their
+        //    NEW versions, every other account at the version this pod
+        //    already reflects).
+        let mut index: std::collections::BTreeMap<String, u64> =
+            self.shard_versions.read().clone().into_iter().collect();
+        index.extend(committed);
+        let root_bytes = self.state.to_root_bytes(&index)?;
+        match cfg.store.commit_root(generation, &root_bytes).await? {
+            SnapshotWrite::Published { version } => {
+                *self.shard_versions.write() = index.into_iter().collect();
+                self.loaded_version.store(version, Ordering::SeqCst);
+                self.loaded_generation.store(generation, Ordering::SeqCst);
+            }
+            SnapshotWrite::Fenced => {
+                tracing::warn!(
+                    catalog = %self.name,
+                    generation,
+                    store = %cfg.store.describe(),
+                    "catalog root commit was fenced by a newer pod; stepping \
+                     down to read-only and reloading its snapshot"
+                );
+                self.reload_from_store_locked(cfg).await?;
+                return Ok(());
+            }
+        }
+
+        // 3. TD-PATH-2 4a: the durable high-water sidecar BEFORE compaction
+        //    (identical contract to the whole-image branch: the sidecar is
+        //    what makes WAL compaction safe whatever the commit mix was).
+        self.persist_identity_high_water_sidecar(cfg).await?;
+
+        // 4. Compact the WAL: keep only entries the published image does not
+        //    cover (identical to the whole-image branch).
+        let entries = self.appender.read_all_entries().await?;
+        if entries.iter().any(|e| e.sequence_number <= watermark) {
+            let kept: Vec<_> = entries
+                .into_iter()
+                .filter(|e| e.sequence_number > watermark)
+                .collect();
+            crate::services::canonical_wal::rewrite_canonical_wal(&cfg.wal_path, &kept).await?;
+        }
+        Ok(())
+    }
+
     // ── Phase 6b: cross-pod cache coherence (sinval-style invalidation) ───────
 
     /// **Sinval staleness check.** Compare this pod's cached snapshot version
@@ -769,6 +1111,24 @@ impl SystemCatalog {
             Some(cfg) => cfg,
             None => return Ok(ReloadOutcome::Disabled),
         };
+        // TD-SPINE-2: with sharding enabled the ROOT pointer is the sinval
+        // key (cheap probe, no payload). Before the first root exists (a
+        // pre-migration deployment, or an owner that has not published yet)
+        // the legacy whole-image log still governs — probe that instead.
+        if sharded_catalog_snapshots_enabled() && cfg.store.supports_sharded_publish() {
+            match cfg.store.latest_root_version().await? {
+                Some(v) => {
+                    let loaded = self.loaded_version.load(Ordering::SeqCst);
+                    if version_is_newer(loaded, v) {
+                        let _guard = self.write_lock.lock().await;
+                        return self.reload_from_store_locked(cfg).await;
+                    }
+                    return Ok(ReloadOutcome::UpToDate);
+                }
+                // No root yet: fall through to the legacy whole-image probe.
+                None => {}
+            }
+        }
         // Cheap probe first — no payload fetch.
         let latest = cfg.store.latest_version().await?;
         let loaded = self.loaded_version.load(Ordering::SeqCst);
@@ -789,6 +1149,126 @@ impl SystemCatalog {
     /// Re-checks the version under the lock so two concurrent reloaders don't
     /// double-apply, and never moves backward.
     async fn reload_from_store_locked(&self, cfg: &SnapshotConfig) -> Result<ReloadOutcome> {
+        // TD-SPINE-2: the sharded reload — adopt the root's global halves and
+        // ONLY the shards whose versions changed (never swap the whole
+        // image). Falls back to the legacy whole-image reload when no root
+        // has been published yet (mixed-read: pre-migration or escaped pods).
+        if sharded_catalog_snapshots_enabled() && cfg.store.supports_sharded_publish()
+            && let Some(root_read) = cfg.store.read_root().await?
+        {
+            return self.reload_sharded_locked(cfg, root_read).await;
+        }
+        self.reload_whole_image_locked(cfg).await
+    }
+
+    /// TD-SPINE-2: the sharded reload. The root's `account → shard version`
+    /// index is diffed against this pod's known versions; only changed
+    /// shards are fetched and adopted IN PLACE (each adoption replaces
+    /// exactly that account's rows), so a DDL in one account never disturbs
+    /// another account's read-your-writes window. Globals (account
+    /// registry, identity high-water, watermark) come from the root.
+    async fn reload_sharded_locked(
+        &self,
+        cfg: &SnapshotConfig,
+        root_read: crate::services::catalog_snapshot_store::SnapshotRead,
+    ) -> Result<ReloadOutcome> {
+        let loaded = self.loaded_version.load(Ordering::SeqCst);
+        if !version_is_newer(loaded, root_read.version) {
+            // Another reload already pulled this version (or newer); never
+            // reload an older root over a current one (monotonic reads).
+            return Ok(ReloadOutcome::UpToDate);
+        }
+        let (_, _, writer_version, _, shard_index) =
+            SystemCatalogState::decode_catalog_root(&root_read.bytes).with_context(|| {
+                format!(
+                    "reloading catalog '{}' from root {}",
+                    self.name,
+                    cfg.store.describe()
+                )
+            })?;
+        self.state.adopt_root_bytes(&root_read.bytes)?;
+        let known = self.shard_versions.read().clone();
+        let mut updated = known.clone();
+        for (account, root_version) in &shard_index {
+            if known.get(account) == Some(root_version) {
+                continue; // unchanged shard — do not even fetch it
+            }
+            match cfg.store.read_shard(account).await? {
+                Some(read) => {
+                    self.state.load_shard_bytes(account, &read.bytes).with_context(
+                        || {
+                            format!(
+                                "reloading catalog '{}' shard '{account}' from {}",
+                                self.name,
+                                cfg.store.describe()
+                            )
+                        },
+                    )?;
+                    updated.insert(account.clone(), read.version);
+                }
+                None => tracing::warn!(
+                    catalog = %self.name,
+                    account = %account,
+                    store = %cfg.store.describe(),
+                    "published root names a shard with no committed log; \
+                     keeping the previously adopted image for that account"
+                ),
+            }
+        }
+        if proximadb_catalog::identity_writer_version_lags(writer_version) {
+            tracing::warn!(
+                catalog = %self.name,
+                store = %cfg.store.describe(),
+                "adopted an unstamped peer catalog root (writer predates \
+                 writer-version stamping; if it also predates the identity \
+                 high-water, the floor leans on the sidecar)"
+            );
+        }
+        Self::adopt_identity_high_water_sidecar(&self.state, cfg.store.as_ref()).await;
+        if let Some(max) = self.state.max_account_id() {
+            self.account_floor
+                .fetch_max(u64::from(max) + 1, Ordering::SeqCst);
+        }
+        if let Some(max) = self.state.max_object_id() {
+            let next = max
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("catalog object-id space exhausted at {max}"))?;
+            self.object_id_floor.fetch_max(next, Ordering::SeqCst);
+        }
+        self.merge_namespace_allocator_seed();
+        *self.shard_versions.write() = updated;
+        self.loaded_version.store(root_read.version, Ordering::SeqCst);
+        self.loaded_generation
+            .store(root_read.generation, Ordering::SeqCst);
+        let superseded = root_read.generation > self.generation.load(Ordering::SeqCst);
+        if superseded {
+            self.read_only.store(true, Ordering::SeqCst);
+        }
+        Ok(ReloadOutcome::Reloaded {
+            version: root_read.version,
+            generation: root_read.generation,
+            superseded,
+        })
+    }
+
+    /// TD-SPINE-2: merge the allocator seed derived from the (just-adopted)
+    /// state into the transient allocators — registry rows are replaced
+    /// (adopted authority wins), floors merge with max so an id this pod
+    /// ever minted can never be re-issued.
+    fn merge_namespace_allocator_seed(&self) {
+        let (_object_floor, _collection_floor, seed) = Self::identity_allocator_seed(&self.state);
+        let mut alloc = self.namespace_alloc.write();
+        alloc.ids.extend(seed.ids);
+        for (account, floor) in seed.floors {
+            let entry = alloc.floors.entry(account).or_insert(1);
+            *entry = (*entry).max(floor);
+        }
+    }
+
+    /// The legacy whole-image reload (Phase 6b): swap the ENTIRE in-RAM
+    /// authority from one snapshot blob. Still the path for local stores,
+    /// injected stores, the kill-switch escape, and pre-migration roots.
+    async fn reload_whole_image_locked(&self, cfg: &SnapshotConfig) -> Result<ReloadOutcome> {
         let read = match cfg.store.read().await? {
             Some(read) => read,
             // Nothing published (or it vanished) — nothing to adopt.
@@ -842,17 +1322,16 @@ impl SystemCatalog {
             self.object_id_floor.fetch_max(next, Ordering::SeqCst);
         }
         // The adopted authority may also carry object/typed ids minted by the
-        // publisher after this pod booted. Re-seed every transient allocator and
-        // replace the namespace map while the catalog write lock is held, so a
-        // same-generation reload cannot later reuse an adopted id.
-        let (object_floor, namespace_floor, collection_floor, namespace_ids) =
+        // publisher after this pod booted. Re-seed every transient allocator
+        // while the catalog write lock is held, so a same-generation reload
+        // cannot later reuse an adopted id. TD-SPINE-2: the namespace
+        // allocator merges per-account floors (never lowers).
+        let (object_floor, collection_floor, _namespace_alloc) =
             Self::identity_allocator_seed(&self.state);
         self.object_floor.fetch_max(object_floor, Ordering::SeqCst);
-        self.namespace_floor
-            .fetch_max(namespace_floor, Ordering::SeqCst);
         self.collection_floor
             .fetch_max(collection_floor, Ordering::SeqCst);
-        *self.namespace_ids.write() = namespace_ids;
+        self.merge_namespace_allocator_seed();
         self.loaded_version.store(read.version, Ordering::SeqCst);
         self.loaded_generation
             .store(read.generation, Ordering::SeqCst);
