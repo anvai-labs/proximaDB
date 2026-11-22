@@ -779,7 +779,9 @@ pub(crate) mod tests {
             .read(&format!("{dir_url}/{}", object_name(1)))
             .await
             .unwrap();
-        assert_eq!(keyed[4], 2, "v2 with a key");
+        // ADR-042 (2026-11-21): a keyed directory is written as v3 (the key
+        // carries the filter facts; breaking change accepted pre-GA).
+        assert_eq!(keyed[4], 3, "v3 with a key");
 
         // No live change: turning the gate off alone republishes as v1,
         // once; a later change keeps v1.
