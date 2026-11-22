@@ -29,6 +29,7 @@ use crate::query::execution::{
 };
 #[cfg(feature = "datafusion-integration")]
 use crate::query::execution::{QueryExecutionContext, execute_sql_with_backend};
+use crate::services::ddl::is_pinned_external_layout;
 use async_trait::async_trait;
 use once_cell::sync::Lazy;
 use proximadb_data_model::{ProximaType, ProximaValue, StatsTrust};
@@ -157,7 +158,10 @@ fn lower_pgvector_select(sql: &str) -> Result<Option<PgVectorSelectPlan>, String
             "pgvector search requires exactly one distance expression in ORDER BY".to_string(),
         );
     };
-    if order.options.asc == Some(false) {
+    if !matches!(
+        order.options.sort,
+        None | Some(sqlparser::ast::OrderBySort::Asc)
+    ) {
         return Err("pgvector nearest-neighbour ORDER BY must be ascending".to_string());
     }
 
@@ -901,17 +905,10 @@ pub async fn try_run_select(
     }
 
     // ADR-018 Phase 2: Allow opting out with explicit "0" value
-    if std::env::var("PROXIMADB_PGWIRE_RELATIONAL_PIPELINE")
+    let disable_pipeline = std::env::var("PROXIMADB_PGWIRE_RELATIONAL_PIPELINE")
         .ok()
         .as_deref()
-        == Some("0")
-    {
-        tracing::debug!(
-            target: "proximadb::pgwire::new_pipeline",
-            "PROXIMADB_PGWIRE_RELATIONAL_PIPELINE=0; skipping new pipeline"
-        );
-        return None;
-    }
+        == Some("0");
 
     // TD-OLAP-4 result-path probe: time ALL of `try_run_select` before execution
     // — including the path-1 engine-catalog `lower_sql` attempt below, which a
@@ -925,40 +922,30 @@ pub async fn try_run_select(
     //    engine's own catalog; a catalog miss falls through to the real-data
     //    path below.
     let engine = GLOBAL_ENGINE.clone();
-    if !relational_abac_required && let Ok(logical) = lower_sql(sql, &EngineCatalog(engine.clone()))
-    {
-        let factory = EngineReaderFactory::new(engine);
-        let resolver = StaticCapabilities {
-            caps: ReaderCapabilities::full(),
-            pk_columns: Vec::new(),
-            secondary_columns: Vec::new(),
-        };
-        return Some(run_plan(&factory, resolver, logical, controls).await);
-    }
+    let demo_plan = (!disable_pipeline && !relational_abac_required)
+        .then(|| lower_sql(sql, &EngineCatalog(engine.clone())).ok())
+        .flatten();
 
     // 2) Real-data path (gated, additive). Engage ONLY for queries the legacy
     //    single-table path can't serve — joins / GROUP BY / aggregates / HAVING
     //    / set-ops — leaving simple SELECTs on the (hardened) legacy path.
-    let dml = dml?;
+    let Some(dml) = dml else {
+        let logical = demo_plan?;
+        return Some(run_demo_select(engine, logical, controls).await);
+    };
     let statements = Parser::parse_sql(&GenericDialect {}, sql).ok()?;
     let [Statement::Query(query)] = statements.as_slice() else {
         return None;
     };
-    // Engaged = a relational shape the legacy single-table path can't serve
-    // (joins / GROUP BY / aggregates / set-ops). pgwire keeps simple SELECTs on
-    // its legacy path (`require_engagement = true`); off-pgwire callers route any
-    // resolvable relational SELECT here (`require_engagement = false`).
-    if require_engagement && !query_engages_relational_engine(query) {
-        return None;
-    }
-
     // Pre-resolve every referenced table's SCHEMA from xCatalog (the sync
     // `CatalogLookup`/`ReaderFactory` traits can't await). Rows are fetched
     // lazily per scan in `DmlTableReader::open`, with the executor's
     // projection/predicate/limit pushed into storage.
     let mut names = Vec::new();
-    let cte_names = collect_table_names(query, &mut names);
+    collect_table_names(query, &mut names);
     let mut tables: HashMap<String, PreparedTable> = HashMap::new();
+    let mut unresolved = None;
+    let mut pinned = HashMap::new();
     // P1: per-table Parquet location (object-store backed), populated only under the
     // `datafusion-integration` feature so the OLAP DataFusion route is never taken
     // (nor advertised) when the build can't honor it.
@@ -981,16 +968,19 @@ pub async fn try_run_select(
     let mut pax_tables: std::collections::HashSet<String> = std::collections::HashSet::new();
     for raw in &names {
         let key = normalize_table_key(raw);
-        // TD-185a: a WITH-defined name is resolved by the SQL engine, not the
-        // catalog — it must never fail snapshot preparation.
-        if cte_names.contains(&key) {
-            continue;
-        }
-        if tables.contains_key(&key) {
+        if tables.contains_key(&key) || pinned.contains_key(&key) {
             continue;
         }
         match dml.resolve_relational_schema(raw, tenant).await {
             Ok(catalog_schema) => {
+                if catalog_schema
+                    .storage_layouts
+                    .iter()
+                    .any(is_pinned_external_layout)
+                {
+                    pinned.insert(key, catalog_schema);
+                    continue;
+                }
                 #[cfg(feature = "datafusion-integration")]
                 if let Some(location) = catalog_table_is_parquet_backed(&catalog_schema) {
                     if let Some(params) = olap_delta_table_params(&catalog_schema, &location) {
@@ -1014,12 +1004,47 @@ pub async fn try_run_select(
                 // say why this table has no relational route (a typo, a vector
                 // collection) rather than suggest enabling one. System catalogs
                 // keep their legacy stubs.
-                if require_engagement && !is_system_catalog_relation(raw) {
-                    return unresolved_window_decline(query, raw, &e).map(Err);
-                }
-                return None;
+                unresolved.get_or_insert((raw, e));
             }
         }
+    }
+
+    if !pinned.is_empty() {
+        if disable_pipeline || relational_abac_required {
+            return Some(Err(
+                "pinned external read is unavailable under the active execution policy".into(),
+            ));
+        }
+        if namespace.is_some_and(|ns| ns != "public")
+            || !tables.is_empty()
+            || unresolved.is_some()
+            || names.iter().any(|name| name.contains('.'))
+            || !query_reads_only_bound_relations(query)
+        {
+            return Some(Err(
+                "pinned external reads require only unqualified pinned tables or CTEs".into(),
+            ));
+        }
+        #[cfg(not(feature = "datafusion-integration"))]
+        return Some(Err(
+            "pinned external reads require datafusion-integration".into()
+        ));
+        #[cfg(feature = "datafusion-integration")]
+        return Some(
+            execute_pinned_external_select(sql, pinned, identity, controls, setup_start).await,
+        );
+    }
+    if let Some(logical) = demo_plan {
+        return Some(run_demo_select(engine, logical, controls).await);
+    }
+    if disable_pipeline || (require_engagement && !query_engages_relational_engine(query)) {
+        return None;
+    }
+    if let Some((raw, error)) = unresolved {
+        if require_engagement && !is_system_catalog_relation(raw) {
+            return unresolved_window_decline(query, raw, &error).map(Err);
+        }
+        return None;
     }
 
     #[cfg(feature = "datafusion-integration")]
@@ -1398,6 +1423,7 @@ pub async fn try_run_select(
         // OLAP-over-parquet route.
         let context = QueryExecutionContext {
             parquet_tables,
+            pinned_external_tables: Vec::new(),
             parquet_table_trust,
             vector_ops,
             graph_ops,
@@ -1554,6 +1580,111 @@ pub async fn try_run_select(
         }
         Err(e) => Some(Err(e)),
     }
+}
+
+async fn run_demo_select(
+    engine: Arc<InMemoryRelationalEngine>,
+    logical: proximadb_relational_algebra::LogicalNode,
+    controls: ExecutionControls,
+) -> Result<ExecutionPipelineResult, String> {
+    let factory = EngineReaderFactory::new(engine);
+    let resolver = StaticCapabilities {
+        caps: ReaderCapabilities::full(),
+        pk_columns: Vec::new(),
+        secondary_columns: Vec::new(),
+    };
+    run_plan(&factory, resolver, logical, controls).await
+}
+
+#[cfg(feature = "datafusion-integration")]
+async fn execute_pinned_external_select(
+    sql: &str,
+    pinned: HashMap<String, proximadb_catalog::CatalogTableSchema>,
+    identity: proximadb_runtime::OwnedPortIdentity,
+    controls: ExecutionControls,
+    setup_start: std::time::Instant,
+) -> Result<ExecutionPipelineResult, String> {
+    use crate::datafusion::engine_adapters::pinned_iceberg::PinnedIcebergTable;
+    use crate::query::table_write_plan::ComputeBackend;
+    use crate::services::ddl::pinned_iceberg::PinnedIcebergLocation;
+
+    let mut providers = Vec::with_capacity(pinned.len());
+    for (name, schema) in pinned {
+        controls.check_cancelled().map_err(|e| e.to_string())?;
+        let mut layouts = schema
+            .storage_layouts
+            .iter()
+            .filter(|layout| is_pinned_external_layout(layout));
+        let layout = layouts
+            .next()
+            .filter(|_| layouts.next().is_none())
+            .ok_or_else(|| format!("pinned external table {name}: expected one pinned layout"))?;
+        if crate::services::ddl::pinned_ndjson::is_external_ndjson(layout) {
+            #[cfg(not(unix))]
+            return Err("external NDJSON requires Unix".into());
+            #[cfg(unix)]
+            {
+                use crate::datafusion::engine_adapters::pinned_ndjson::PinnedNdjsonReader;
+                use crate::services::ddl::pinned_ndjson::PinnedNdjsonLocation;
+
+                let location = PinnedNdjsonLocation::from_layout(layout)
+                    .map_err(|e| format!("pinned NDJSON {name}: {e:#}"))?;
+                let reader = PinnedNdjsonReader::open(location, &schema.columns)
+                    .await
+                    .map_err(|e| format!("pinned NDJSON {name}: {e:#}"))?;
+                providers.push((
+                    schema.name,
+                    Arc::new(PinnedIcebergTable::from_source(reader)),
+                ));
+                continue;
+            }
+        }
+        if crate::services::ddl::pinned_delta::is_external_delta(layout) {
+            #[cfg(not(unix))]
+            return Err("external Delta requires Unix".into());
+            #[cfg(unix)]
+            {
+                use crate::datafusion::engine_adapters::pinned_delta::PinnedDeltaReader;
+                use crate::services::ddl::pinned_delta::PinnedDeltaLocation;
+
+                let location = PinnedDeltaLocation::from_layout(layout)
+                    .map_err(|e| format!("pinned Delta {name}: {e:#}"))?;
+                let reader =
+                    PinnedDeltaReader::open(location, &schema.columns, controls.clone()).await;
+                controls.check_cancelled().map_err(|e| e.to_string())?;
+                let reader = reader.map_err(|e| format!("pinned Delta {name}: {e:#}"))?;
+                providers.push((
+                    schema.name,
+                    Arc::new(PinnedIcebergTable::from_source(reader)),
+                ));
+                continue;
+            }
+        }
+        let location = PinnedIcebergLocation::from_layout(layout)
+            .map_err(|e| format!("pinned Iceberg {name}: {e}"))?;
+        let provider = PinnedIcebergTable::open_catalog_snapshot(&location, &schema.columns)
+            .await
+            .map_err(|e| format!("pinned Iceberg {name}: {e:#}"))?;
+        providers.push((schema.name, Arc::new(provider)));
+    }
+    let context = QueryExecutionContext {
+        pinned_external_tables: providers,
+        identity,
+        allow_engine_sql_fallback: true,
+        controls,
+        ..Default::default()
+    };
+    crate::observability::io_trace::record_setup_ms(setup_start.elapsed().as_millis() as u64);
+    let start = std::time::Instant::now();
+    crate::observability::io_trace::record_route("external-pinned", "DataFusionLocal");
+    let cancellation = context.controls.clone();
+    let result = execute_sql_with_backend(ComputeBackend::DataFusionLocal, sql, context).await;
+    cancellation.check_cancelled().map_err(|e| e.to_string())?;
+    crate::observability::io_trace::record_compute_ms(
+        "DataFusionLocal",
+        start.elapsed().as_millis() as u64,
+    );
+    result.map_err(|e| e.to_string())
 }
 
 /// Plan + build + drain an executor for `logical` against `factory`, using
@@ -3263,14 +3394,10 @@ async fn build_snapshot(
 ) -> Option<SnapshotCatalog> {
     let tenant = identity.tenant_id;
     let mut names = Vec::new();
-    let cte_names = collect_table_names(query, &mut names);
+    collect_table_names(query, &mut names);
     let mut tables: HashMap<String, PreparedTable> = HashMap::new();
     for raw in &names {
         let key = normalize_table_key(raw);
-        // TD-185a: WITH-defined names resolve by the SQL engine, not the catalog.
-        if cte_names.contains(&key) {
-            continue;
-        }
         if tables.contains_key(&key) {
             continue;
         }
@@ -3354,27 +3481,20 @@ async fn route_and_plan_select(
     #[cfg(feature = "datafusion-integration")]
     {
         let mut names = Vec::new();
-        let cte_names = collect_table_names(query, &mut names);
+        collect_table_names(query, &mut names);
         if !names.is_empty() {
             let mut all_parquet = true;
             let mut locations = Vec::with_capacity(names.len());
             for raw in &names {
-                // TD-185a: WITH-defined names resolve by the SQL engine.
-                if cte_names.contains(&normalize_table_key(raw)) {
-                    continue;
-                }
                 match dml.resolve_relational_schema(raw, tenant).await {
+                    Ok(schema) if schema.storage_layouts.iter().any(is_pinned_external_layout) => {
+                        return Err("EXPLAIN for pinned external reads is unavailable".into());
+                    }
                     Ok(schema) => match catalog_table_is_parquet_backed(&schema) {
                         Some(location) => locations.push(location),
-                        None => {
-                            all_parquet = false;
-                            break;
-                        }
+                        None => all_parquet = false,
                     },
-                    _ => {
-                        all_parquet = false;
-                        break;
-                    }
+                    _ => all_parquet = false,
                 }
             }
             parquet_backed = all_parquet;
@@ -3931,6 +4051,48 @@ fn query_has_table_function(query: &SqlQuery) -> bool {
         return true;
     }
     set_expr_has_tvf(&query.body)
+}
+
+/// The pinned external route admits set operators and subqueries only when all
+/// their sources can be bound as catalog tables or scoped CTE references.
+fn query_reads_only_bound_relations(query: &SqlQuery) -> bool {
+    use std::ops::ControlFlow;
+
+    use sqlparser::ast::{Visit, Visitor};
+
+    struct BoundRelations;
+    impl Visitor for BoundRelations {
+        type Break = ();
+
+        fn pre_visit_query(&mut self, query: &SqlQuery) -> ControlFlow<()> {
+            if !query.pipe_operators.is_empty() {
+                return ControlFlow::Break(());
+            }
+            let mut bodies = vec![query.body.as_ref()];
+            while let Some(body) = bodies.pop() {
+                match body {
+                    SetExpr::Select(select) if select.into.is_none() => {}
+                    SetExpr::Query(_) | SetExpr::Values(_) => {}
+                    SetExpr::SetOperation { left, right, .. } => {
+                        bodies.extend([left.as_ref(), right.as_ref()]);
+                    }
+                    _ => return ControlFlow::Break(()),
+                }
+            }
+            ControlFlow::Continue(())
+        }
+
+        fn pre_visit_table_factor(&mut self, factor: &TableFactor) -> ControlFlow<()> {
+            match factor {
+                TableFactor::Table { args: None, .. }
+                | TableFactor::Derived { .. }
+                | TableFactor::NestedJoin { .. } => ControlFlow::Continue(()),
+                _ => ControlFlow::Break(()),
+            }
+        }
+    }
+
+    query.visit(&mut BoundRelations).is_continue()
 }
 
 /// ADR-097 P3.2: does `query` read table functions the DataFusion floor
@@ -4576,81 +4738,8 @@ fn expr_has_aggregate(expr: &SqlExpr) -> bool {
 /// this, the CTE name was collected as a table, schema resolution failed,
 /// and the whole WITH query silently bounced to the legacy single-table
 /// path (the recursive-CTE empty-result bug).
-fn collect_table_names(
-    query: &SqlQuery,
-    out: &mut Vec<String>,
-) -> std::collections::HashSet<String> {
-    let mut cte_names = std::collections::HashSet::new();
-    collect_query_tables(query, out, &mut cte_names);
-    cte_names
-}
-
-fn collect_query_tables(
-    query: &SqlQuery,
-    out: &mut Vec<String>,
-    cte_names: &mut std::collections::HashSet<String>,
-) {
-    // Nested WITH scopes add their CTE names to the shared set. SQL shadowing
-    // semantics would confine a CTE name to its own scope; the shared set is
-    // wider, and only in the pathological case of a real table shadowed by a
-    // same-named CTE outside its scope — acceptable for snapshot preparation.
-    if let Some(with) = &query.with {
-        for cte in &with.cte_tables {
-            cte_names.insert(normalize_table_key(&cte.alias.name.value));
-            collect_query_tables(&cte.query, out, cte_names);
-        }
-    }
-    collect_from_set_expr(&query.body, out, cte_names);
-}
-
-fn collect_from_set_expr(
-    body: &SetExpr,
-    out: &mut Vec<String>,
-    cte_names: &mut std::collections::HashSet<String>,
-) {
-    match body {
-        SetExpr::Select(select) => {
-            for twj in &select.from {
-                collect_from_table_with_joins(twj, out, cte_names);
-            }
-            // Also descend into WHERE subqueries (IN/EXISTS lower to Semi/Anti joins
-            // whose right side scans the subquery's tables) so those tables get
-            // prepared in the snapshot — otherwise the subquery fails to lower and
-            // the query silently falls through to the legacy path.
-            if let Some(where_expr) = &select.selection {
-                collect_subquery_tables_in_expr(where_expr, out, cte_names);
-            }
-        }
-        SetExpr::Query(q) => collect_query_tables(q, out, cte_names),
-        SetExpr::SetOperation { left, right, .. } => {
-            collect_from_set_expr(left, out, cte_names);
-            collect_from_set_expr(right, out, cte_names);
-        }
-        _ => {}
-    }
-}
-
-/// Collect table names referenced by subqueries inside a WHERE expression
-/// (`IN (…)`, `EXISTS`, scalar subqueries), recursing through boolean structure.
-fn collect_subquery_tables_in_expr(
-    expr: &SqlExpr,
-    out: &mut Vec<String>,
-    cte_names: &mut std::collections::HashSet<String>,
-) {
-    match expr {
-        SqlExpr::InSubquery { subquery, .. } | SqlExpr::Exists { subquery, .. } => {
-            collect_query_tables(subquery, out, cte_names);
-        }
-        SqlExpr::Subquery(q) => collect_query_tables(q, out, cte_names),
-        SqlExpr::BinaryOp { left, right, .. } => {
-            collect_subquery_tables_in_expr(left, out, cte_names);
-            collect_subquery_tables_in_expr(right, out, cte_names);
-        }
-        SqlExpr::UnaryOp { expr, .. } | SqlExpr::Nested(expr) => {
-            collect_subquery_tables_in_expr(expr, out, cte_names);
-        }
-        _ => {}
-    }
+fn collect_table_names(query: &SqlQuery, out: &mut Vec<String>) {
+    crate::core::utils::collect_query_relations(query, out);
 }
 
 /// True if the FROM item (or any of its joins) is a derived table — a subquery in
@@ -4662,46 +4751,6 @@ fn table_with_joins_has_derived(twj: &TableWithJoins) -> bool {
             .joins
             .iter()
             .any(|j| matches!(j.relation, TableFactor::Derived { .. }))
-}
-
-fn collect_from_table_with_joins(
-    twj: &TableWithJoins,
-    out: &mut Vec<String>,
-    cte_names: &mut std::collections::HashSet<String>,
-) {
-    collect_from_table_factor(&twj.relation, out, cte_names);
-    for join in &twj.joins {
-        collect_from_table_factor(&join.relation, out, cte_names);
-    }
-}
-
-fn collect_from_table_factor(
-    factor: &TableFactor,
-    out: &mut Vec<String>,
-    cte_names: &mut std::collections::HashSet<String>,
-) {
-    match factor {
-        // A `FROM name(args)` item is a table-valued function (cross-modal source:
-        // vector_search / timeseries_range / graph_traverse), NOT a catalog table.
-        // Collecting it as a table name makes catalog resolution decline the query to
-        // the legacy path AND breaks the parquet-backed route check. Skip it here and
-        // let the DataFusion `ctx.sql` fallback (which has the UDTFs registered) resolve it.
-        // Only a plain `name` (args: None) is a catalog table. A `FROM name(args)` item is a
-        // table-valued function (cross-modal source: vector_search / timeseries_range /
-        // graph_traverse) — it matches neither arm below, falls through to `_`, and is left for
-        // the DataFusion `ctx.sql` fallback (where the UDTFs are registered) to resolve.
-        // TD-185a: a reference to a WITH-defined name resolves by the SQL
-        // engine, not the catalog — the match guard skips it so it can't fail
-        // snapshot preparation.
-        TableFactor::Table {
-            name, args: None, ..
-        } if !cte_names.contains(&normalize_table_key(&name.to_string())) => {
-            out.push(name.to_string());
-        }
-        TableFactor::Table { args: None, .. } => {}
-        TableFactor::Derived { subquery, .. } => collect_query_tables(subquery, out, cte_names),
-        _ => {}
-    }
 }
 
 // =========================================================================
@@ -5729,17 +5778,33 @@ mod tests {
     }
 
     #[test]
+    fn pinned_reads_find_nested_sources_across_set_branches() {
+        let query = parse_query(
+            "SELECT CASE WHEN EXISTS (SELECT 1 FROM child) THEN 1 ELSE 0 END FROM parent \
+             UNION ALL (WITH parent AS (SELECT id FROM sibling) SELECT id FROM parent)",
+        );
+        let mut names = Vec::new();
+        collect_table_names(&query, &mut names);
+        names.sort();
+        assert_eq!(names, ["child", "parent", "sibling"]);
+        assert!(query_reads_only_bound_relations(&query));
+        assert!(!query_reads_only_bound_relations(&parse_query(
+            "SELECT 1 WHERE EXISTS (SELECT 1 FROM timeseries_range('x', 0, 1))"
+        )));
+    }
+
+    #[test]
     fn collect_table_names_treats_cte_names_as_engine_local_not_catalog_tables() {
         // TD-185a: the CTE name must not be collected as a catalog table (that
         // resolution failure bounced WITH queries to the legacy path), while the
         // base tables INSIDE the CTE body must be collected for the snapshot.
         let query = parse_query(
-            "WITH reach(id) AS (SELECT 1 UNION SELECT k.k_person2 FROM knows k \
+            "WITH RECURSIVE reach(id) AS (SELECT 1 UNION SELECT k.k_person2 FROM knows k \
              JOIN reach r ON k.k_person1 = r.id) \
              SELECT count(distinct id) FROM reach",
         );
         let mut names = Vec::new();
-        let cte_names = collect_table_names(&query, &mut names);
+        collect_table_names(&query, &mut names);
         let keys: Vec<String> = names.iter().map(|n| normalize_table_key(n)).collect();
         assert!(
             keys.contains(&"knows".to_string()),
@@ -5748,11 +5813,6 @@ mod tests {
         assert!(
             !keys.iter().any(|k| k == "reach"),
             "CTE name must not be collected as a catalog table, got {keys:?}"
-        );
-        assert!(
-            cte_names.contains("reach"),
-            "got {cte_keys:?}",
-            cte_keys = cte_names
         );
     }
 

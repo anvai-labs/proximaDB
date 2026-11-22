@@ -489,9 +489,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@1.99.0
-        with:
-          toolchain: stable
+        uses: dtolnay/rust-toolchain@1.100.0
       - name: Await the version on crates.io
         run: |
           bash scripts/release_smoke/await_url.sh "crates.io proximadb-sdk ${VERSION}" \

@@ -1402,7 +1402,6 @@ impl ModularBlockReader {
     }
 
     #[allow(dead_code)]
-    #[allow(dead_code)]
     fn decompress_block(&self, data: &[u8], algorithm: CompressionAlgorithm) -> Result<Vec<u8>> {
         match algorithm {
             CompressionAlgorithm::None => Ok(data.to_vec()),

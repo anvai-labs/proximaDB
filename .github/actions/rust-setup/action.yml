@@ -25,7 +25,7 @@ inputs:
   toolchain:
     description: 'Rust toolchain pin'
     required: false
-    default: '1.99.0'
+    default: '1.100.0'
   components:
     description: 'rustup components, comma/space separated (e.g. llvm-tools-preview)'
     required: false
@@ -63,7 +63,7 @@ inputs:
 runs:
   using: composite
   steps:
-    - uses: dtolnay/rust-toolchain@1.99.0
+    - uses: dtolnay/rust-toolchain@1.100.0
       with:
         toolchain: ${{ inputs.toolchain }}
         components: ${{ inputs.components }}

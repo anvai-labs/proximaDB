@@ -199,79 +199,12 @@ fn run_duckdb(
         .map_err(|e| ExecutionError::Execution(format!("duckdb execute: {e}")))?;
     // Keep the result schema: an empty result yields zero batches but is still a
     // valid answer (seven TPC-DS queries return no rows at small scale factors).
-    let duck_schema = arrow.get_schema();
-    let duck_batches: Vec<duckdb::arrow::array::RecordBatch> = arrow.collect();
+    let empty_schema = arrow.get_schema();
+    let batches: Vec<arrow_array::RecordBatch> = arrow.collect();
     let compute_ms = started.elapsed().as_millis() as u64;
-    // Arrow → ExecutionPipelineResult (same bridge DataFusion uses). duckdb
-    // vendors its own arrow 58 while the workspace builds against 59, so the
-    // RecordBatch types no longer unify — the batches cross the Arrow C-data
-    // FFI, whose struct layout is stable across these minors.
-    let batches = duck_batches
-        .iter()
-        .map(ffi_batch_58_to_59)
-        .collect::<Result<Vec<_>, ExecutionError>>()?;
-    let schema = match batches.first() {
-        Some(b) => b.schema(),
-        None => ffi_schema_58_to_59(duck_schema.as_ref())?,
-    };
+    let schema = batches.first().map_or(empty_schema, |batch| batch.schema());
     let result = super::native_engine::record_batches_to_pipeline_result(&schema, &batches);
     Ok((result, compute_ms))
-}
-
-/// duckdb vendors `arrow ^58` internally; the workspace builds against arrow
-/// 59, so the `RecordBatch`/`FFI_*` types are distinct crates and data crosses
-/// the Arrow C-data interface at the raw-struct level. `FFI_ArrowArray` and
-/// `FFI_ArrowSchema` are `#[repr(C)]` with field-for-field identical
-/// definitions in 58.3.0 and 59.3.0 (the C-data-interface layout is frozen),
-/// so the exported structs are moved across the two crate versions verbatim;
-/// `mem::transmute` compile-errors if the sizes ever diverge. The `release`
-/// callback is an `extern "C"` fn owned by the producing (duckdb) side and
-/// stays valid in-process; the importing side's `Drop` invokes it identically.
-/// Convert a duckdb (arrow 58) schema to the workspace arrow 59 schema across the
-/// stable Arrow C-data interface (see [`ffi_batch_58_to_59`]).
-fn ffi_schema_58_to_59(
-    schema: &duckdb::arrow::datatypes::Schema,
-) -> Result<arrow_schema::SchemaRef, ExecutionError> {
-    let ffi_schema = duckdb::arrow::ffi::FFI_ArrowSchema::try_from(schema)
-        .map_err(|e| ExecutionError::Execution(format!("duckdb arrow schema FFI: {e}")))?;
-    // SAFETY: identical `#[repr(C)]` layout in arrow 58.3 and 59.3 (C-data interface).
-    let schema_59: arrow::ffi::FFI_ArrowSchema = unsafe { std::mem::transmute(ffi_schema) };
-    Ok(std::sync::Arc::new(
-        arrow_schema::Schema::try_from(&schema_59)
-            .map_err(|e| ExecutionError::Execution(format!("duckdb arrow schema FFI: {e}")))?,
-    ))
-}
-
-fn ffi_batch_58_to_59(
-    batch: &duckdb::arrow::array::RecordBatch,
-) -> Result<arrow_array::RecordBatch, ExecutionError> {
-    let ffi_schema = duckdb::arrow::ffi::FFI_ArrowSchema::try_from(batch.schema().as_ref())
-        .map_err(|e| ExecutionError::Execution(format!("duckdb arrow schema FFI: {e}")))?;
-    let schema_59: arrow::ffi::FFI_ArrowSchema = unsafe { std::mem::transmute(ffi_schema) };
-    let out_schema = std::sync::Arc::new(
-        arrow_schema::Schema::try_from(&schema_59)
-            .map_err(|e| ExecutionError::Execution(format!("duckdb arrow schema FFI: {e}")))?,
-    );
-    let columns = batch
-        .columns()
-        .iter()
-        .enumerate()
-        .map(|(i, col)| {
-            let ffi_arr = duckdb::arrow::ffi::FFI_ArrowArray::new(&col.to_data());
-            // SAFETY: the transmuted `FFI_ArrowArray` wraps buffers of the
-            // live in-process `col` (duckdb's arrow) with duckdb's release
-            // callback, and `schema_59.child(i)` (the same bytes, read
-            // through the identically-laid-out 59 type) is its matching type
-            // record; `from_ffi` copies into a workspace arrow-59 `ArrayData`
-            // before the FFI wrapper drops and releases.
-            let arr_59: arrow::ffi::FFI_ArrowArray = unsafe { std::mem::transmute(ffi_arr) };
-            let data = unsafe { arrow::ffi::from_ffi(arr_59, schema_59.child(i)) }
-                .map_err(|e| ExecutionError::Execution(format!("duckdb arrow data FFI: {e}")))?;
-            Ok(arrow_array::make_array(data))
-        })
-        .collect::<Result<Vec<_>, ExecutionError>>()?;
-    arrow_array::RecordBatch::try_new(out_schema, columns)
-        .map_err(|e| ExecutionError::Execution(format!("duckdb arrow batch FFI: {e}")))
 }
 
 #[cfg(test)]

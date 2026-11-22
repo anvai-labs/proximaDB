@@ -58,11 +58,10 @@ pub fn page_row_selection(
         rows_total,
         ..Default::default()
     };
-    let (Some(column_index), Some(offset_index)) =
-        (metadata.column_index(), metadata.offset_index())
-    else {
+    let Some(page_index) = metadata.page_index().filter(|index| index.is_complete()) else {
         return outcome;
     };
+    let page_index = page_index.as_ref();
     let parquet_schema = metadata.file_metadata().schema_descr();
 
     let mut combined: Option<RowSelection> = None;
@@ -73,10 +72,10 @@ pub fn page_row_selection(
         };
         let rgs = [row_group];
         let (Ok(mins), Ok(maxes), Ok(nulls), Ok(Some(row_counts))) = (
-            converter.data_page_mins(column_index, offset_index, &rgs),
-            converter.data_page_maxes(column_index, offset_index, &rgs),
-            converter.data_page_null_counts(column_index, offset_index, &rgs),
-            converter.data_page_row_counts(offset_index, metadata.row_groups(), &rgs),
+            converter.data_page_mins(page_index, &rgs),
+            converter.data_page_maxes(page_index, &rgs),
+            converter.data_page_null_counts(page_index, &rgs),
+            converter.data_page_row_counts(page_index, metadata.row_groups(), &rgs),
         ) else {
             continue;
         };

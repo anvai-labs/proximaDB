@@ -90,6 +90,19 @@ async fn external_parquet_table_registers_and_reads_via_datafusion() {
         .await
         .expect("create external table");
 
+    // A repeated CREATE must consult the persisted layout, even when it has no WITH clause.
+    client
+        .simple_query("CREATE TABLE IF NOT EXISTS ext_hits (id INT)")
+        .await
+        .expect("repeat registration");
+    let (http, base) = server.rest_client().unwrap();
+    let collection = http
+        .get(format!("{base}/api/v2/collections/ext_hits"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(collection.status(), reqwest::StatusCode::NOT_FOUND);
+
     // SELECT routes to the DataFusion OLAP engine and reads the object directly.
     // NOTE: the query must "engage" the relational pipeline (join / GROUP BY /
     // aggregate) — pgwire keeps a *simple* single-table SELECT on the legacy path
@@ -120,6 +133,12 @@ async fn external_parquet_table_registers_and_reads_via_datafusion() {
         ],
         "external parquet rows must be read back via the DataFusion route"
     );
+
+    let write = client
+        .simple_query("INSERT INTO ext_hits (id, name) VALUES (4, 'd')")
+        .await
+        .expect_err("external Parquet is read-only");
+    assert!(write.as_db_error().unwrap().message().contains("read-only"));
 
     unsafe { std::env::remove_var("PROXIMADB_EXTERNAL_TABLE_ROOTS") };
 }

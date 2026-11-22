@@ -110,19 +110,8 @@ fn tpcds_queries() -> Vec<(&'static str, String)> {
     ]
 }
 
-/// Same 8MB stack boost as TPC-H (see tpch_pgwire_e2e.rs for rationale).
-#[test]
-fn tpcds_pgwire_conformance() {
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(4)
-        .thread_stack_size(8 * 1024 * 1024)
-        .enable_all()
-        .build()
-        .expect("tokio runtime");
-    rt.block_on(tpcds_pgwire_conformance_inner());
-}
-
-async fn tpcds_pgwire_conformance_inner() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tpcds_pgwire_conformance() {
     let server = TestPgServer::start().await.expect("server start");
     let (client, conn) = tokio_postgres::connect(&server.conn_str(), tokio_postgres::NoTls)
         .await

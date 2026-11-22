@@ -3,7 +3,7 @@
 :toclevels: 2
 :icons: font
 :sectnums:
-:revdate: 2026-10-17
+:revdate: 2026-11-21
 
 [IMPORTANT]
 ====
@@ -117,6 +117,11 @@ link:../11-usecases/USECASE_CATALOG.adoc[use-case catalog], not in this list (AD
   then elastic modes (TD-089).
 * **External collections** — ProximaDB indexes over lake-resident Iceberg, Lance or Parquet data
   without copying it (TD-090, TD-091).
+* **Analytical reads and backfills** — a SQL user can join managed rows with a qualified
+  external table version and inspect the source versions used. A batch job can ingest typed
+  CSV, JSON or Avro input and publish one recoverable managed result. If an input expires
+  before publication, a fresh selection requires a new run. Ambiguous commits are reconciled
+  before retry. link:../rfcs/0003-open-table-analytics.adoc[RFC-0003 acceptance cases]
 * **Billion-scale vector indexes** — DiskANN, once predicate-aware top-k correctness is explicit
   (TD-064).
 

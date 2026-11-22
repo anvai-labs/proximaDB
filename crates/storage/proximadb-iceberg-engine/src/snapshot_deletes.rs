@@ -63,7 +63,201 @@ pub struct IcebergSnapshotPlan {
     pub fields: Vec<iceberg::IcebergField>,
 }
 
+/// The identity and manifest plan of a producer-published Iceberg snapshot.
+#[derive(Debug, Clone)]
+pub struct PinnedIcebergSnapshot {
+    pub table_uuid: uuid::Uuid,
+    pub snapshot_id: i64,
+    pub format_version: u8,
+    /// Source version reported by UniForm, when the property is present.
+    pub converted_delta_version: Option<u64>,
+    pub plan: IcebergSnapshotPlan,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+struct ProducerMetadata {
+    table_uuid: String,
+    location: String,
+    format_version: u8,
+    current_snapshot_id: i64,
+    snapshots: Vec<ProducerSnapshot>,
+    #[serde(default)]
+    properties: std::collections::HashMap<String, String>,
+    current_schema_id: Option<i32>,
+    schemas: Option<Vec<serde_json::Value>>,
+    partition_specs: Option<Vec<serde_json::Value>>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+struct ProducerSnapshot {
+    snapshot_id: i64,
+    manifest_list: Option<String>,
+    key_id: Option<String>,
+}
+
 impl IcebergObjectStoreBridge {
+    /// Plan the current snapshot of one immutable producer metadata object.
+    ///
+    /// The caller must authorize the table prefix independently of the document.
+    /// Use a trusted store with filesystem confinement when applicable. This
+    /// validates object keys lexically and does not enforce filesystem symlink
+    /// isolation. Every reference must be an absolute URI under the authorized
+    /// table root, using the same spelling as the bridge and unescaped keys.
+    /// When supplied, the Delta version must match before any manifest I/O.
+    /// Use [`open_pinned_iceberg_reader`](Self::open_pinned_iceberg_reader)
+    /// for a reader that projects by field ID and applies deletion vectors.
+    pub async fn read_pinned_iceberg_snapshot(
+        &self,
+        authorized_table_prefix: &Path,
+        metadata_uri: &str,
+        expected_delta_version: Option<u64>,
+    ) -> Result<PinnedIcebergSnapshot, StorageError> {
+        let (snapshot, _) = self
+            .load_pinned_iceberg_snapshot(
+                authorized_table_prefix,
+                metadata_uri,
+                expected_delta_version,
+            )
+            .await?;
+        Ok(snapshot)
+    }
+
+    /// Open a flat, field-ID-bearing Parquet snapshot with the same storage
+    /// authorization requirements as [`read_pinned_iceberg_snapshot`](Self::read_pinned_iceberg_snapshot).
+    pub async fn open_pinned_iceberg_reader(
+        &self,
+        authorized_table_prefix: &Path,
+        metadata_uri: &str,
+        expected_delta_version: Option<u64>,
+    ) -> Result<crate::PinnedIcebergReader, StorageError> {
+        let (snapshot, metadata) = self
+            .load_pinned_iceberg_snapshot(
+                authorized_table_prefix,
+                metadata_uri,
+                expected_delta_version,
+            )
+            .await?;
+        let id = metadata.current_schema_id.map(i64::from);
+        let schema = metadata
+            .schemas
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .find(|schema| id.is_some() && schema["schema-id"].as_i64() == id)
+            .ok_or_else(|| invalid("pinned Iceberg current schema is absent"))?;
+        crate::PinnedIcebergReader::try_new(
+            self.clone(),
+            snapshot,
+            schema,
+            metadata.partition_specs.as_deref(),
+        )
+    }
+
+    async fn load_pinned_iceberg_snapshot(
+        &self,
+        authorized_table_prefix: &Path,
+        metadata_uri: &str,
+        expected_delta_version: Option<u64>,
+    ) -> Result<(PinnedIcebergSnapshot, ProducerMetadata), StorageError> {
+        if !self
+            .root_url
+            .as_deref()
+            .is_some_and(|root| root.contains("://"))
+        {
+            return Err(invalid(
+                "pinned Iceberg reads require an absolute bridge root",
+            ));
+        }
+        let table_root = self.object_uri(authorized_table_prefix.as_ref());
+        let table_root = table_root.trim_end_matches('/');
+        let resolve = |uri: &str| {
+            let key = uri
+                .strip_prefix(table_root)
+                .and_then(|suffix| suffix.strip_prefix('/'))
+                .filter(|key| {
+                    !key.is_empty()
+                        && key
+                            .bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || b"/-_.~=".contains(&b))
+                })
+                .ok_or_else(|| {
+                    invalid(format!("unsupported Iceberg URI under {table_root}: {uri}"))
+                })?;
+            let path = Path::parse(key).map_err(|e| read_err("pinned Iceberg key", e))?;
+            if path.as_ref() != key {
+                return Err(invalid(format!("non-canonical Iceberg URI: {uri}")));
+            }
+            Ok(if authorized_table_prefix.as_ref().is_empty() {
+                path
+            } else {
+                Path::parse(format!("{authorized_table_prefix}/{path}"))
+                    .map_err(|e| read_err("pinned Iceberg key", e))?
+            })
+        };
+        let bytes = self.store.get(&resolve(metadata_uri)?).await?;
+        let json = std::str::from_utf8(&bytes).map_err(|e| read_err("metadata utf8", e))?;
+        let meta: ProducerMetadata =
+            serde_json::from_str(json).map_err(|e| read_err("producer metadata", e))?;
+        if meta.location.trim_end_matches('/') != table_root {
+            return Err(invalid(
+                "producer metadata location differs from the authorized table root",
+            ));
+        }
+        let table_uuid = uuid::Uuid::parse_str(&meta.table_uuid)
+            .map_err(|e| read_err("producer table UUID", e))?;
+        if !matches!(meta.format_version, 2 | 3) {
+            return Err(invalid(format!(
+                "unsupported Iceberg format v{}",
+                meta.format_version
+            )));
+        }
+        let converted_delta_version = meta
+            .properties
+            .get("converted_delta_version")
+            .map(|version| version.parse::<u64>())
+            .transpose()
+            .map_err(|e| read_err("UniForm converted_delta_version", e))?;
+        if let Some(expected) = expected_delta_version
+            && converted_delta_version != Some(expected)
+        {
+            return Err(invalid(format!(
+                "expected UniForm Delta version {expected}, metadata records {converted_delta_version:?}"
+            )));
+        }
+        let snapshot_id = meta.current_snapshot_id;
+        let snapshot = meta
+            .snapshots
+            .iter()
+            .find(|s| s.snapshot_id == snapshot_id)
+            .ok_or_else(|| invalid(format!("current snapshot {snapshot_id} is absent")))?;
+        if snapshot.key_id.is_some() {
+            return Err(invalid("encrypted Iceberg manifests are unsupported"));
+        }
+        let list = snapshot
+            .manifest_list
+            .as_deref()
+            .ok_or_else(|| invalid(format!("snapshot {snapshot_id} has no manifest list")))?;
+        let plan = self
+            .read_manifest_plan(
+                list,
+                iceberg::current_schema_fields(json),
+                snapshot_id,
+                meta.format_version == 3,
+                resolve,
+            )
+            .await?;
+        let pinned = PinnedIcebergSnapshot {
+            table_uuid,
+            snapshot_id,
+            format_version: meta.format_version,
+            converted_delta_version,
+            plan,
+        };
+        Ok((pinned, meta))
+    }
+
     /// The current snapshot of metadata `version` under `metadata_prefix`: its data
     /// files and its deletion vectors, both as bridge-relative keys.
     pub async fn read_iceberg_snapshot_with_deletes(
@@ -107,18 +301,33 @@ impl IcebergObjectStoreBridge {
             .strip_suffix("metadata")
             .map(|p| p.trim_end_matches('/'))
             .unwrap_or("");
-        let resolve =
-            |p: &str| self.resolve_recorded_path(p, table_location.as_deref(), table_prefix);
-        let list_bytes = self.store.get(&resolve(&list_loc)).await?;
+        self.read_manifest_plan(&list_loc, fields, version, true, |path| {
+            Ok(self.resolve_recorded_path(path, table_location.as_deref(), table_prefix))
+        })
+        .await
+    }
+
+    async fn read_manifest_plan(
+        &self,
+        list_loc: &str,
+        fields: Vec<iceberg::IcebergField>,
+        snapshot: impl std::fmt::Display,
+        allow_deletion_vectors: bool,
+        resolve: impl Fn(&str) -> Result<Path, StorageError>,
+    ) -> Result<IcebergSnapshotPlan, StorageError> {
+        let list_bytes = self.store.get(&resolve(list_loc)?).await?;
         let mut out = IcebergSnapshotFiles::default();
         let mut file_stats = Vec::new();
         let mut vectors = Vec::new();
         for m in iceberg::read_manifest_list(&list_bytes)? {
-            let bytes = self.store.get(&resolve(&m.manifest_path)).await?;
+            if m.content == iceberg::ManifestContent::Deletes && !allow_deletion_vectors {
+                return Err(invalid("delete manifests in Iceberg v2 are unsupported"));
+            }
+            let bytes = self.store.get(&resolve(&m.manifest_path)?).await?;
             match m.content {
                 iceberg::ManifestContent::Data => {
                     for df in iceberg::read_manifest(&bytes)? {
-                        let path = resolve(&df.file_path);
+                        let path = resolve(&df.file_path)?;
                         file_stats.push((path.clone(), df.column_stats));
                         out.data_files.push(path);
                     }
@@ -129,23 +338,28 @@ impl IcebergObjectStoreBridge {
             }
         }
         let data: HashSet<&Path> = out.data_files.iter().collect();
+        if data.len() != out.data_files.len() {
+            return Err(invalid(format!(
+                "duplicate data files in snapshot {snapshot}"
+            )));
+        }
         let mut seen: HashSet<Path> = HashSet::new();
         for v in vectors {
-            let data_file = resolve(&v.referenced_data_file);
+            let data_file = resolve(&v.referenced_data_file)?;
             if !data.contains(&data_file) {
                 return Err(invalid(format!(
                     "a deletion vector references {data_file}, which is not a data file of \
-                     snapshot {version}"
+                     snapshot {snapshot}"
                 )));
             }
             if !seen.insert(data_file.clone()) {
                 return Err(invalid(format!(
-                    "{data_file} has more than one deletion vector in snapshot {version}"
+                    "{data_file} has more than one deletion vector in snapshot {snapshot}"
                 )));
             }
             out.deletion_vectors.push(SnapshotDeletionVector {
                 data_file,
-                puffin_file: resolve(&v.file_path),
+                puffin_file: resolve(&v.file_path)?,
                 content_offset: to_u64(v.content_offset, "content_offset")?,
                 content_size_in_bytes: to_u64(v.content_size_in_bytes, "content_size_in_bytes")?,
                 puffin_file_size_in_bytes: to_u64(v.file_size_in_bytes, "file_size_in_bytes")?,

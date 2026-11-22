@@ -1543,7 +1543,7 @@ impl ObjectStoreParquetTable {
                 if field.metadata().is_empty() {
                     field
                 } else {
-                    field.with_metadata(Default::default())
+                    field.with_metadata(arrow_schema::Metadata::new())
                 }
             })
             .collect();
@@ -2277,7 +2277,7 @@ impl TableProvider for ObjectStoreParquetTable {
     async fn scan(
         &self,
         state: &dyn Session,
-        projection: Option<&Vec<usize>>,
+        projection: Option<&[usize]>,
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
@@ -2315,14 +2315,14 @@ impl TableProvider for ObjectStoreParquetTable {
                 df_stats_value_bounds_enabled(),
                 self.stats_trust,
             ),
-            projection.map(|p| p.as_slice()),
+            projection,
         );
         Self::apply_deletion_statistics(&self.deletions, &splits, &pruned, &mut scan_stats);
         let exec = ProximaScanExec::builder()
             .schema(self.schema.clone())
             .splits(pruned)
             .reader(self.reader_over(filters, spec_cfg, &file_sizes))
-            .projection(projection.cloned())
+            .projection(projection.map(<[usize]>::to_vec))
             .filters(filters.to_vec())
             .limit(limit)
             .collection_name(self.location.clone())

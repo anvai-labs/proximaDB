@@ -804,10 +804,7 @@ impl MetadataStoreInterface for AtomicMetadataStore {
                 {
                     return false;
                 }
-                if !f.tags.is_empty() && !f.tags.iter().all(|tag| versioned.tags.contains(tag)) {
-                    return false;
-                }
-                true
+                f.tags.iter().all(|tag| versioned.tags.contains(tag))
             }) as Box<dyn Fn(&VersionedCollectionMetadata) -> bool + Send>
         });
 

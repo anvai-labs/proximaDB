@@ -198,7 +198,7 @@ impl TableProvider for ProximaDBTableProvider {
     async fn scan(
         &self,
         _state: &dyn Session,
-        projection: Option<&Vec<usize>>,
+        projection: Option<&[usize]>,
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
@@ -238,7 +238,7 @@ impl TableProvider for ProximaDBTableProvider {
             self.schema.clone(),
             self.storage_format.clone(),
             self.base_path.clone(),
-            projection.cloned(),
+            projection.map(<[usize]>::to_vec),
             combined_filter,
             limit,
             self.config.max_partitions,
@@ -482,7 +482,7 @@ impl TableProvider for ProximaDataFusionTable {
     async fn scan(
         &self,
         _state: &dyn Session,
-        projection: Option<&Vec<usize>>,
+        projection: Option<&[usize]>,
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
@@ -518,7 +518,7 @@ impl TableProvider for ProximaDataFusionTable {
         let exec = ProximaScanExec::builder()
             .schema(self.schema.clone())
             .splits(pruned_splits)
-            .projection(projection.cloned())
+            .projection(projection.map(<[usize]>::to_vec))
             .filters(filters.to_vec())
             .limit(limit)
             .reader(self.reader.clone())

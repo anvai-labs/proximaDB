@@ -95,12 +95,12 @@ impl TableProvider for OlapMergeTable {
     async fn scan(
         &self,
         state: &dyn Session,
-        projection: Option<&Vec<usize>>,
+        projection: Option<&[usize]>,
         filters: &[Expr],
         _limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         let output: Vec<usize> = projection
-            .cloned()
+            .map(<[usize]>::to_vec)
             .unwrap_or_else(|| (0..self.schema.fields().len()).collect());
         // The key is read even when not projected, and dropped after.
         let mut read = output.clone();

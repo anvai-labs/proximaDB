@@ -64,7 +64,7 @@ flowchart LR
   operators — and transactional writes are part of that contract
   (link:../12-design/adr/ADR-095-postgres-compatible-oltp-on-object-storage.adoc[ADR-095]).
   The native REST v2 record API serves SDKs and services directly.
-* **One canonical record; every model is a projection of it.** A record has an identifier,
+* **One canonical record for managed data.** A record has an identifier,
   typed properties and embeddings. The relational row, the vector index, the document view and
   the graph are projections of that record
   (link:../12-design/adr/ADR-094-unified-storage-substrate-and-compute-seam.adoc[ADR-094]), not
@@ -126,9 +126,8 @@ link:PLATFORM_PLAN.adoc#embedded-cloud-lifecycle[platform plan].
 
 == Non-goals
 
-* **Not a general-purpose cloud data warehouse.** ProximaDB runs analytical SQL well enough to
-  pass TPC-H and TPC-DS over pgwire, and that conformance is a quality bar. It does not compete
-  feature-for-feature with Snowflake or Databricks on petabyte batch analytics.
+* **Warehouse scope.** TPC-shaped workloads measure analytical SQL correctness, load time
+  and cost over governed data. Full warehouse feature parity is outside the product scope.
 * **Not a full PostgreSQL replacement in the current release.** Postgres-compatible OLTP is
   being built in compatibility levels behind default-off gates
   (link:../12-design/adr/ADR-095-postgres-compatible-oltp-on-object-storage.adoc[ADR-095]);
@@ -190,8 +189,10 @@ Go-to-market sequence; the engineering sequence is the roadmap.
 
 == Decision boundary
 
-Iceberg is v3-first (ADR-097 D3): preserve legacy v2 reads and atomic upgrade, without
-building a new v2 delete writer. DataFusion LogicalPlan is the logical IR; native physical
-operators remain adapters. HNSW is a persisted hot projection of PAX.
+A SQL client should be able to join managed records to an authorized version of an external
+table in place. The external owner determines its committed state. ProximaDB publishes managed
+data through one Iceberg writer, targeting v3 and preserving legacy v2 reads. DataFusion
+plans analytical SQL over eligible providers, including native physical adapters. HNSW is a
+persisted hot projection of PAX. link:../12-design/adr/ADR-097-foundational-seams-single-logical-ir.adoc[ADR-097]
 
 Earlier rationale: link:../history/planning/VISION.adoc[vision snapshot].

@@ -46,6 +46,10 @@
 //! ctx.register_table("vectors", Arc::new(sst_provider))?;
 //! ```
 
+#[cfg(unix)]
+mod confined_delta_engine;
+#[cfg(unix)]
+mod confined_file_store;
 pub mod filesystem_parquet_reader;
 pub mod helix_adapter;
 pub(crate) mod manifest_plan_cache;
@@ -53,6 +57,11 @@ pub mod object_store_parquet_reader;
 pub mod pax_adapter;
 pub mod pax_segment_locator;
 pub mod pax_table_provider;
+#[cfg(unix)]
+pub(crate) mod pinned_delta;
+pub mod pinned_iceberg;
+#[cfg(unix)]
+pub(crate) mod pinned_ndjson;
 pub mod sst_adapter;
 pub mod table_open_cache;
 pub mod viper_adapter;
@@ -94,7 +103,7 @@ pub(crate) fn build_scan_exec(
     collection_name: String,
     splits: Vec<FileSplit>,
     reader: Arc<dyn SplitReader>,
-    projection: Option<&Vec<usize>>,
+    projection: Option<&[usize]>,
     filters: &[Expr],
     limit: Option<usize>,
 ) -> DFResult<Arc<dyn ExecutionPlan>> {
@@ -102,7 +111,7 @@ pub(crate) fn build_scan_exec(
         .schema(schema)
         .splits(splits)
         .reader(reader)
-        .projection(projection.cloned())
+        .projection(projection.map(<[usize]>::to_vec))
         .filters(filters.to_vec())
         .limit(limit)
         .collection_name(collection_name)

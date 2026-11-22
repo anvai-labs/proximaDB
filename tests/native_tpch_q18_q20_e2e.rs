@@ -17,8 +17,7 @@ use pg_server::{TestPgServer, rows};
 #[test]
 fn native_tpch_q18_and_q20_execute_row_exact() {
     std::thread::Builder::new()
-        .name("native-tpch-q18-q20-e2e-16m".into())
-        .stack_size(16 * 1024 * 1024)
+        .name("native-tpch-q18-q20-e2e".into())
         .spawn(|| {
             tokio::runtime::Builder::new_current_thread()
                 .enable_all()

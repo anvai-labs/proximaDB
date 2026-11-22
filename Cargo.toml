@@ -210,20 +210,21 @@ rustls = { version = "0.23" }
 # `sqlparser = { workspace = true }` without first declaring the
 # dep at the workspace level. Same pin as the root `[dependencies]`
 # entry.
-sqlparser = { version = "0.62", features = ["visitor"] }
-arrow = { version = "59", features = ["prettyprint", "ffi"] }
-arrow-array = { version = "59", default-features = false }
+sqlparser = { version = "0.63", features = ["visitor"] }
+arrow = { version = "60.1.0", features = ["prettyprint", "ffi"] }
+arrow-array = { version = "60.1.0", default-features = false }
 # Workspace-level so the root crate and `proximadb-embedded` resolve the SAME
 # datafusion. The embedded Python binding passes `SessionContext`/`DataFrame`
 # across the crate boundary, so two independently-specified versions would be two
 # distinct types and fail to compile in a way that is tedious to diagnose.
-datafusion = { version = "55.0", default-features = false, features = ["sql", "regex_expressions", "unicode_expressions", "datetime_expressions", "math_expressions"] }
+# DataFusion 56 RC2 is the Arrow/Parquet 60 and object_store 0.14 line.
+datafusion = { version = "56.0.0", git = "https://github.com/apache/datafusion.git", rev = "7e7ae72a820e2bf87da1205b96639fba334ed2f7", default-features = false, features = ["sql", "regex_expressions", "unicode_expressions", "datetime_expressions", "math_expressions"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 bincode = "1.3"
-arrow-flight = { version = "59", features = ["flight-sql-experimental"] }
-arrow-schema = { version = "59", default-features = false }
-parquet = { version = "59", default-features = false, features = ["arrow", "object_store", "zstd", "lz4", "snap", "brotli", "flate2", "flate2-rust_backened"] }
-object_store = "0.13"
+arrow-flight = { version = "60.1.0", features = ["flight-sql"] }
+arrow-schema = { version = "60.1.0", default-features = false }
+parquet = { version = "60.1.0", default-features = false, features = ["arrow", "object_store", "zstd", "lz4", "snap", "brotli", "flate2", "flate2-rust_backened"] }
+object_store = "0.14.2"
 async-trait = "0.1"
 axum = { version = "0.8", features = ["json", "ws"] }
 chrono = { version = "0.4.31", features = ["serde"] }
@@ -581,7 +582,7 @@ proximadb-vector-query = { path = "crates/query/proximadb-vector-query" }
 proximadb-catalog-introspection = { version = "0.7.0", path = "crates/binding/proximadb-catalog-introspection" }
 
 # SQL Parsing
-sqlparser = { version = "0.62", features = ["visitor"] }
+sqlparser.workspace = true
 
 # Async recursion support
 async-recursion = "1.0"
@@ -640,28 +641,28 @@ tokio-postgres = { version = "0.7", optional = true }  # PostgreSQL client for C
 sqlx = { version = "0.9", features = ["runtime-tokio", "tls-native-tls", "json", "chrono", "uuid"], optional = true }  # OLTP catalog backends (oltp-catalog)
 tempfile = "3.0"
 rayon = "1.10"  # Parallel processing for search optimization
-# Parquet and Arrow dependencies - using v57+ for improved performance and tonic 0.14 compatibility
-parquet = { version = "59", default-features = false, features = ["arrow", "async", "zstd", "lz4", "snap", "brotli", "flate2", "flate2-rust_backened"] }
-# Arrow dependencies matching parquet v57
-arrow = { version = "59", features = ["prettyprint", "ffi"] }
-arrow-array = { version = "59", default-features = false }
-arrow-buffer = { version = "59", default-features = false }
-arrow-schema = { version = "59", default-features = false }
-arrow-data = { version = "59", default-features = false }
-arrow-ipc = { version = "59", default-features = false, features = ["lz4", "zstd"] }
-arrow-select = { version = "59", default-features = false }
-arrow-ord = { version = "59", default-features = false }
-arrow-flight = { version = "59", features = ["flight-sql-experimental"] }
-arrow-cast = { version = "59", default-features = false }
+# Parquet and Arrow versions match the DataFusion release line.
+parquet = { version = "60.1.0", default-features = false, features = ["arrow", "async", "zstd", "lz4", "snap", "brotli", "flate2", "flate2-rust_backened"] }
+arrow = { version = "60.1.0", features = ["prettyprint", "ffi"] }
+arrow-array = { version = "60.1.0", default-features = false }
+arrow-buffer = { version = "60.1.0", default-features = false }
+arrow-schema = { version = "60.1.0", default-features = false }
+arrow-data = { version = "60.1.0", default-features = false }
+arrow-ipc = { version = "60.1.0", default-features = false, features = ["lz4", "zstd"] }
+arrow-select = { version = "60.1.0", default-features = false }
+arrow-ord = { version = "60.1.0", default-features = false }
+arrow-flight = { version = "60.1.0", features = ["flight-sql"] }
+arrow-cast = { version = "60.1.0", default-features = false }
 
-# DataFusion for SQL and compute engine compatibility (Arrow 57 compatible)
-datafusion = { version = "55.0", default-features = false, features = ["sql", "regex_expressions", "unicode_expressions", "datetime_expressions", "math_expressions"], optional = true }
-datafusion-common = { version = "55.0", optional = true }
+# DataFusion for SQL and compute engine compatibility.
+datafusion = { workspace = true, optional = true }
+datafusion-common = { version = "56.0.0", git = "https://github.com/apache/datafusion.git", rev = "7e7ae72a820e2bf87da1205b96639fba334ed2f7", optional = true }
 # ADR-059: DuckDB-Local as a plugin OLAP engine (in-process, behind the
 # `duckdb` feature, default OFF). `bundled` builds libduckdb from source so no
 # system DuckDB is required. Used by the perf-ledger harnesses for an
 # in-process, io-traced DuckDB baseline (ADR-059 D1/D2).
-duckdb = { version = "1.1", features = ["bundled", "parquet"], optional = true }
+# Keep DuckDB on the Arrow 60 line so its result batches use the shared Arrow types.
+duckdb = { version = "=1.20000.1", features = ["bundled", "parquet"], optional = true }
 
 # Advanced compression for recovery-optimized WAL
 lz4_flex = "0.11"        # Faster LZ4 implementation
@@ -806,6 +807,12 @@ proximadb-raptor-common = { version = "0.7.0", path = "crates/storage/proximadb-
 proximadb-raptor-engine = { version = "0.7.0", path = "crates/storage/proximadb-raptor-engine" }
 proximadb-engine-core = { version = "0.7.0", path = "crates/storage/proximadb-engine-core" }
 proximadb-mongodb-parser = { version = "0.7.0", path = "crates/binding/proximadb-mongodb-parser" }
+
+# Pinned Delta reads (Unix file confinement).
+[target.'cfg(unix)'.dependencies]
+delta_kernel = { version = "=0.30.1", features = ["arrow-60", "default-engine-base", "internal-api"], optional = true }
+delta_kernel_default_engine = { version = "=0.30.1", default-features = false, features = ["arrow-60", "rustls"], optional = true }
+tokio-util = { version = "0.7", optional = true }
 
 # GPU acceleration dependencies (platform-specific)
 [target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
@@ -1051,9 +1058,8 @@ canonical-document-store = []
 # When disabled, falls back to legacy split storage
 graph-first-sks = []
 
-# DataFusion integration for compute engine compatibility
-# DataFusion 51.x uses Arrow 57.x — versions are aligned as of 2026-04
-datafusion-integration = ["dep:datafusion", "dep:datafusion-common"]
+# DataFusion SQL and compute plus pinned external readers.
+datafusion-integration = ["dep:datafusion", "dep:datafusion-common", "dep:delta_kernel", "dep:delta_kernel_default_engine", "dep:tokio-util"]
 # ADR-059: in-process DuckDB OLAP engine (default OFF — adds the libduckdb C++
 # build). Enables the perf-ledger harnesses to run DuckDB in-process (io-traced,
 # same parquet/SQL) instead of the CLI subprocess. Needs the DataFusion

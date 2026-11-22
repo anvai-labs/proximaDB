@@ -133,7 +133,7 @@ jobs:
       SCCACHE_DIR: /home/runner/.cache/sccache
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.99.0
+      - uses: dtolnay/rust-toolchain@1.100.0
         # Step-level, NOT workflow env: rust-cache hashes every CARGO*/RUST*
         # env var into its cache key, so a workflow-level var would cold-start
         # every cache (#2502 review). rustup's default is 3 retries.
@@ -171,11 +171,11 @@ jobs:
           cargo test --features experimental-engines --test raptor_recall_test --no-run
       - name: Run TPC-H over pgwire
         env:
-          # 8MB worker stack: correlated subqueries (Q2/Q20-Q22) produce
-          # deep-but-finite async call chains that overflow the default ~2MB.
-          RUST_MIN_STACK: "8388608"
+          RUST_MIN_STACK: "2097152"
         run: cargo test --test tpch_pgwire_e2e -- --nocapture
       - name: Run TPC-DS over pgwire
+        env:
+          RUST_MIN_STACK: "2097152"
         run: cargo test --test tpcds_pgwire_e2e -- --nocapture
       - name: Run PAX recall ratchets
         run: cargo test -p proximadb-block-format --lib recall -- --nocapture
@@ -241,7 +241,7 @@ jobs:
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.99.0
+      - uses: dtolnay/rust-toolchain@1.100.0
         # Step-level, NOT workflow env: rust-cache hashes every CARGO*/RUST*
         # env var into its cache key, so a workflow-level var would cold-start
         # every cache (#2502 review). rustup's default is 3 retries.
@@ -374,7 +374,7 @@ jobs:
           sudo swapon /mnt/swapfile-ci
           free -h
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.99.0
+      - uses: dtolnay/rust-toolchain@1.100.0
         # Step-level, NOT workflow env: rust-cache hashes every CARGO*/RUST*
         # env var into its cache key, so a workflow-level var would cold-start
         # every cache (#2502 review). rustup's default is 3 retries.
@@ -459,7 +459,7 @@ jobs:
           sudo swapon /mnt/swapfile-ci
           free -h
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.99.0
+      - uses: dtolnay/rust-toolchain@1.100.0
         # Step-level, NOT workflow env: rust-cache hashes every CARGO*/RUST*
         # env var into its cache key, so a workflow-level var would cold-start
         # every cache (#2502 review). rustup's default is 3 retries.
@@ -524,7 +524,7 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: "0"
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.99.0
+      - uses: dtolnay/rust-toolchain@1.100.0
         # Step-level, NOT workflow env: rust-cache hashes every CARGO*/RUST*
         # env var into its cache key, so a workflow-level var would cold-start
         # every cache (#2502 review). rustup's default is 3 retries.
@@ -592,7 +592,7 @@ jobs:
     # below-target components fail) — the floor ratchets up over time.
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.99.0
+      - uses: dtolnay/rust-toolchain@1.100.0
         # Step-level, NOT workflow env: rust-cache hashes every CARGO*/RUST*
         # env var into its cache key, so a workflow-level var would cold-start
         # every cache (#2502 review). rustup's default is 3 retries.

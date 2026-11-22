@@ -2085,6 +2085,7 @@ impl DmlService {
         let (table_schema, table_id_name) = self
             .resolve_select_table(table_name, tenant_context.map(|t| t.tenant_id.as_str()))
             .await?;
+        Self::ensure_native_select_layout(&table_schema)?;
         let selected_columns =
             Self::resolve_select_projection(&table_schema, projection_column_names)?;
         let predicates = Self::resolve_select_predicates(&table_schema, predicates)?;
@@ -2150,6 +2151,7 @@ impl DmlService {
         let (table_schema, table_id_name) = self
             .resolve_select_table(table_name, tenant_context.map(|t| t.tenant_id.as_str()))
             .await?;
+        Self::ensure_native_select_layout(&table_schema)?;
         let selected_columns =
             Self::resolve_select_projection(&table_schema, projection_column_names)?;
 
@@ -2382,6 +2384,7 @@ impl DmlService {
         let (table_schema, table_id_name) = self
             .resolve_select_table(table_name, tenant_context.map(|t| t.tenant_id.as_str()))
             .await?;
+        Self::ensure_native_select_layout(&table_schema)?;
         #[cfg(feature = "abac-policy")]
         let access = match self.abac_row_filter(identity, &table_schema) {
             None | Some(crate::security::rls::AbacScanResult::Unrestricted) => {
@@ -4309,6 +4312,24 @@ impl DmlService {
         Ok((catalog.get_table(&table_id).await?, table_id.name.clone()))
     }
 
+    fn ensure_native_select_layout(schema: &CatalogTableSchema) -> Result<()> {
+        if schema
+            .storage_layouts
+            .iter()
+            .any(crate::services::ddl::is_pinned_external_layout)
+        {
+            return Err(anyhow!("external table requires the pinned read route"));
+        }
+        Ok(())
+    }
+
+    fn ensure_writable_layout(schema: &CatalogTableSchema) -> Result<()> {
+        if crate::services::ddl::is_catalog_only_external_table(schema) {
+            return Err(anyhow!("external file tables are read-only"));
+        }
+        Ok(())
+    }
+
     async fn select_table_records_with_resolved_predicates(
         &self,
         table_schema: &CatalogTableSchema,
@@ -4503,6 +4524,7 @@ impl DmlService {
                 tenant_context.map(|tc| tc.tenant_id.as_str()),
             )
             .await?;
+        Self::ensure_writable_layout(&table_schema)?;
         let (_catalog, target_table_id) = self
             .catalog_manager
             .resolve_table_scoped(
@@ -4520,6 +4542,9 @@ impl DmlService {
             )
             .await?;
         let source_schema = source_metadata.as_ref().map(|(schema, _)| schema);
+        if let Some(schema) = source_schema {
+            Self::ensure_native_select_layout(schema)?;
+        }
         let source_stats = source_metadata.as_ref().map(|(_, stats)| stats);
         // The bulk-append lane must refuse above a DV-carrying parent BEFORE
         // the executor writes any Parquet (a commit-time refusal strands the
@@ -5398,6 +5423,7 @@ impl DmlService {
 
         // Get table schema for column mapping
         let table_schema = catalog.get_table(&table_id).await?;
+        Self::ensure_writable_layout(&table_schema)?;
         let dml_lock_guard = self
             .acquire_table_dml_lock(&table_id, tenant_context, LockIntent::Write)
             .await?;
@@ -5546,6 +5572,7 @@ impl DmlService {
             .await?;
 
         let table_schema = catalog.get_table(&table_id).await?;
+        Self::ensure_writable_layout(&table_schema)?;
         let dml_lock_guard = self
             .acquire_table_dml_lock(&table_id, tenant_context, LockIntent::Write)
             .await?;
@@ -6413,6 +6440,7 @@ impl DmlService {
             .await?;
 
         let table_schema = catalog.get_table(&table_id).await?;
+        Self::ensure_writable_layout(&table_schema)?;
         let dml_lock_guard = self
             .acquire_table_dml_lock(&table_id, tenant_context, LockIntent::Write)
             .await?;
@@ -6633,6 +6661,7 @@ impl DmlService {
 
         // Get table schema
         let table_schema = catalog.get_table(&table_id).await?;
+        Self::ensure_writable_layout(&table_schema)?;
         // Bind the clause before taking any lock: a bad target or expression
         // is a statement error, not a write.
         let arbiters = Self::resolve_conflict_arbiters(&table_schema, &on_conflict.target)?;

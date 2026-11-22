@@ -134,7 +134,6 @@ impl UnifiedSWIFTReader {
 
     /// Convert to legacy SwiftReadStrategy for compatibility
     #[allow(dead_code)]
-    #[allow(dead_code)]
     fn to_swift_strategy(&self) -> super::proximablocks_compact_reader::SwiftReadStrategy {
         match &self.strategy {
             ReadAccessStrategy::DirectStream => {

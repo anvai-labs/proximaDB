@@ -26,7 +26,9 @@ object_store.workspace = true
 parquet.workspace = true
 bytes = "1.5"
 arrow-array.workspace = true
+arrow-cast = { version = "60.1.0", default-features = false }
 arrow-schema.workspace = true
+arrow-select = { version = "60.1.0", default-features = false }
 async-trait.workspace = true
 futures.workspace = true
 # Spec-compliant Iceberg manifest / manifest-list (Avro) + TableMetadata (JSON).

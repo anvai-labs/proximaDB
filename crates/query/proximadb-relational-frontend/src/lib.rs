@@ -993,12 +993,25 @@ fn expr_contains_aggregate(e: &SqlExpr) -> bool {
 
 fn is_aggregate_function_name(name: &ObjectName) -> bool {
     let n = name.to_string().to_uppercase();
-    // Builtin aggregates, plus any aggregate registered in the shared function registry
-    // (so a custom UDAF like `product` is routed to the aggregate path, not scalar lowering).
-    matches!(n.as_str(), "COUNT" | "SUM" | "AVG" | "MIN" | "MAX")
-        || proximadb_functions::builtins()
-            .lookup_aggregate(&n)
-            .is_some()
+    // Recognize the statistical aggregates so native lowering can decline them.
+    // Treating one as a scalar in a grouped projection binds its argument to
+    // a pre-aggregate ordinal, which can point at an unrelated result column.
+    matches!(
+        n.as_str(),
+        "COUNT"
+            | "SUM"
+            | "AVG"
+            | "MIN"
+            | "MAX"
+            | "STDDEV"
+            | "STDDEV_POP"
+            | "STDDEV_SAMP"
+            | "VARIANCE"
+            | "VAR_POP"
+            | "VAR_SAMP"
+    ) || proximadb_functions::builtins()
+        .lookup_aggregate(&n)
+        .is_some()
 }
 
 fn projection_alias_for_expr(e: &SqlExpr) -> Option<String> {
@@ -2652,19 +2665,48 @@ fn apply_order_by(
         // projected output column therefore resolves by its bare column name
         // (ANSI: sort keys designate output columns). Without this fallback the
         // whole query declines to the legacy single-table path (TD-REL-LOWER-1).
-        let expr = match (lower_expr_sealed(&o.expr, &scope), &o.expr) {
-            (Ok(e), _) => e,
-            (Err(FrontendError::ColumnNotFound(_)), SqlExpr::CompoundIdentifier(parts))
-                if !parts.is_empty() =>
-            {
-                Expr::column(scope.resolve_unqualified(
-                    &parts[parts.len() - 1].value,
-                    parts[parts.len() - 1].quote_style.is_some(),
-                )?)
+        let expr = match &o.expr {
+            SqlExpr::Value(ValueWithSpan {
+                value: SqlValue::Number(position, _),
+                ..
+            }) if position.bytes().all(|digit| digit.is_ascii_digit()) => {
+                let column = position
+                    .parse::<usize>()
+                    .ok()
+                    .and_then(|position| position.checked_sub(1))
+                    .and_then(|index| scope.columns.get(index))
+                    .ok_or_else(|| {
+                        FrontendError::InvalidLiteral(format!(
+                            "ORDER BY position {position} is outside the select list"
+                        ))
+                    })?;
+                Expr::column(ColumnRef {
+                    name: column.column.name.clone(),
+                    ordinal: column.ordinal,
+                    ty: column.column.ty.clone(),
+                    nullable: column.column.nullable,
+                })
             }
-            (Err(e), _) => return Err(e),
+            _ => match (lower_expr_sealed(&o.expr, &scope), &o.expr) {
+                (Ok(e), _) => e,
+                (Err(FrontendError::ColumnNotFound(_)), SqlExpr::CompoundIdentifier(parts))
+                    if !parts.is_empty() =>
+                {
+                    Expr::column(scope.resolve_unqualified(
+                        &parts[parts.len() - 1].value,
+                        parts[parts.len() - 1].quote_style.is_some(),
+                    )?)
+                }
+                (Err(e), _) => return Err(e),
+            },
         };
-        let descending = matches!(o.options.asc, Some(false));
+        let descending = match &o.options.sort {
+            None | Some(sqlparser::ast::OrderBySort::Asc) => false,
+            Some(sqlparser::ast::OrderBySort::Desc) => true,
+            Some(sqlparser::ast::OrderBySort::Using(_)) => {
+                return Err(FrontendError::Unsupported("ORDER BY USING".into()));
+            }
+        };
         let nulls_first = match o.options.nulls_first {
             Some(b) => b,
             None => descending, // ASC → NULLS LAST, DESC → NULLS FIRST
@@ -3096,6 +3138,19 @@ mod tests {
 
     fn lower(sql: &str) -> LogicalNode {
         lower_sql(sql, &catalog()).unwrap_or_else(|e| panic!("lower failed: {e:?}"))
+    }
+
+    #[test]
+    fn statistical_aggregate_in_grouped_ratio_declines_native_lowering() {
+        let error = lower_sql(
+            "SELECT uid, count(total), stddev_samp(total) / avg(total) FROM orders GROUP BY uid",
+            &catalog(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, FrontendError::Unsupported(ref name) if name == "aggregate function STDDEV_SAMP"),
+            "{error:?}"
+        );
     }
 
     /// TD-DML-3: an ON CONFLICT expression sees the existing row (unqualified
@@ -4847,5 +4902,32 @@ mod td_rel_lower_order_by {
             matches!(err, FrontendError::ColumnNotFound(_)),
             "got {err:?}"
         );
+    }
+
+    #[test]
+    fn order_by_position_uses_the_projected_column_and_null_order() {
+        let LogicalNode::Sort { keys, .. } = lower_sql(
+            "SELECT id, name AS label FROM users ORDER BY 2 DESC NULLS LAST",
+            &catalog(),
+        )
+        .expect("lower ORDER BY position") else {
+            panic!("expected Sort");
+        };
+        let Expr::Column(column) = &keys[0].expr else {
+            panic!("expected projected column");
+        };
+        assert_eq!(column.name, "label");
+        assert_eq!(column.ordinal, 1);
+        assert!(keys[0].descending);
+        assert!(!keys[0].nulls_first);
+        for position in [0, 3] {
+            assert!(matches!(
+                lower_sql(
+                    &format!("SELECT id, name FROM users ORDER BY {position}"),
+                    &catalog()
+                ),
+                Err(FrontendError::InvalidLiteral(_)),
+            ));
+        }
     }
 }

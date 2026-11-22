@@ -207,11 +207,7 @@ const MAX_SQL_AUTHORITY_LEXEMES: usize = 16_384;
 /// same parsed tree.
 pub(crate) fn collect_sql_catalog_targets(sql: &str, targets: &mut Vec<String>) {
     use core::ops::ControlFlow;
-    use sqlparser::ast::{
-        Expr, FromTable, Function, FunctionArg, FunctionArgExpr, FunctionArguments, Ident,
-        ObjectName, PipeOperator, Query, SetExpr, Statement, TableFactor, TableObject, Visit,
-        Visitor,
-    };
+    use sqlparser::ast::{Query, SetExpr, Visit, Visitor};
     use sqlparser::dialect::GenericDialect;
     use sqlparser::keywords::Keyword;
     use sqlparser::parser::Parser;
@@ -596,8 +592,28 @@ pub(crate) fn collect_sql_catalog_targets(sql: &str, targets: &mut Vec<String>) 
         }
     };
 
+    collect_ast_relations(&statements, targets, true);
+}
+
+/// Collect base table references in SQL scope for the catalog resolver.
+pub(crate) fn collect_query_relations(query: &sqlparser::ast::Query, targets: &mut Vec<String>) {
+    collect_ast_relations(query, targets, false);
+}
+
+fn collect_ast_relations(
+    ast: &impl sqlparser::ast::Visit,
+    targets: &mut Vec<String>,
+    include_function_targets: bool,
+) {
+    use core::ops::ControlFlow;
+    use sqlparser::ast::{
+        Expr, FromTable, Function, FunctionArg, FunctionArgExpr, FunctionArguments, Ident,
+        ObjectName, PipeOperator, Query, Statement, TableFactor, TableObject, Visitor,
+    };
+
     struct RelationCollector<'a> {
         targets: &'a mut Vec<String>,
+        include_function_targets: bool,
         cte_scopes: Vec<CteScope>,
         cte_children: std::collections::HashMap<usize, (usize, usize)>,
         query_restorations: Vec<Option<(usize, usize)>>,
@@ -637,15 +653,17 @@ pub(crate) fn collect_sql_catalog_targets(sql: &str, targets: &mut Vec<String>) 
             if self.is_cte_reference(relation) {
                 return;
             }
-            let components = relation
-                .0
-                .iter()
-                .map(|part| part.as_ident().map(|ident| ident.value.as_str()))
-                .collect::<Option<Vec<_>>>();
-            if let Some(components) = components
-                && !components.is_empty()
+            if !self.include_function_targets
+                && relation.0.iter().any(|part| {
+                    part.as_ident()
+                        .is_none_or(|ident| ident.value.contains('.'))
+                })
             {
-                self.targets.push(components.join("."));
+                // The catalog resolver uses dots as separators. Keep the
+                // existing refusal behavior for identifiers it cannot represent.
+                self.targets.push(relation.to_string());
+            } else {
+                self.push_relation_unconditionally(relation);
             }
         }
 
@@ -710,7 +728,8 @@ pub(crate) fn collect_sql_catalog_targets(sql: &str, targets: &mut Vec<String>) 
         }
 
         fn push_catalog_function(&mut self, name: &ObjectName, args: &[FunctionArg]) {
-            if Self::is_catalog_function(name)
+            if self.include_function_targets
+                && Self::is_catalog_function(name)
                 && let Some(target) = Self::function_target(args)
             {
                 self.targets.push(target);
@@ -868,11 +887,12 @@ pub(crate) fn collect_sql_catalog_targets(sql: &str, targets: &mut Vec<String>) 
 
     let mut collector = RelationCollector {
         targets,
+        include_function_targets,
         cte_scopes: Vec::new(),
         cte_children: std::collections::HashMap::new(),
         query_restorations: Vec::new(),
     };
-    let _ = statements.visit(&mut collector);
+    let _ = ast.visit(&mut collector);
 }
 
 /// Case-insensitive `IF NOT EXISTS` prefix strip with a word boundary

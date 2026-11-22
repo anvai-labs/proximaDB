@@ -2378,7 +2378,6 @@ type BloomFilterMetadata = proximadb_raptor_common::BloomFilterMetadata;
 
 impl MetadataEncoding {
     #[allow(dead_code)]
-    #[allow(dead_code)]
     fn to_byte(self) -> u8 {
         match self {
             Self::Dictionary => 0x10,

@@ -97,7 +97,7 @@ impl TableProvider for LayerATableProvider {
     async fn scan(
         &self,
         state: &dyn Session,
-        projection: Option<&Vec<usize>>,
+        projection: Option<&[usize]>,
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
@@ -111,7 +111,7 @@ impl TableProvider for LayerATableProvider {
         let ctx = ConformContext::new(
             self.table.schema.clone(),
             table_name,
-            projection.map(Vec::as_slice),
+            projection,
             self.table.access.clone(),
             crate::services::record_spill::now_ns(),
         )

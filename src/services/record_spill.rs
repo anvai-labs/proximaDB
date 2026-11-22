@@ -4256,7 +4256,11 @@ mod tests {
         )?;
         let meta = reader.metadata();
         assert_eq!(meta.num_row_groups(), 3, "10 rows at 4 per row group");
-        assert!(meta.column_index().is_some(), "page index written");
+        assert!(
+            meta.page_index()
+                .is_some_and(|index| index.has_column_indexes()),
+            "page index written"
+        );
         let oid_column = meta
             .file_metadata()
             .schema_descr()

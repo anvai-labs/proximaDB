@@ -7,6 +7,10 @@
 //! - CREATE INDEX / DROP INDEX
 //! - CREATE NAMESPACE / DROP NAMESPACE
 
+pub(crate) mod pinned_delta;
+pub(crate) mod pinned_iceberg;
+pub(crate) mod pinned_ndjson;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -427,6 +431,8 @@ pub struct DdlResult {
     pub message: String,
     /// Warnings (if any)
     pub warnings: Vec<String>,
+    /// Whether pgwire should provision a collection for the resolved table.
+    pub(crate) provision_backing_collection: bool,
 }
 
 impl DdlResult {
@@ -437,6 +443,7 @@ impl DdlResult {
             affected_count: 1,
             message: message.into(),
             warnings: Vec::new(),
+            provision_backing_collection: false,
         }
     }
 
@@ -447,6 +454,7 @@ impl DdlResult {
             affected_count: 0,
             message: format!("{} '{}' already exists", object_type, name),
             warnings: Vec::new(),
+            provision_backing_collection: false,
         }
     }
 
@@ -457,6 +465,7 @@ impl DdlResult {
             affected_count: 0,
             message: format!("{} '{}' does not exist", object_type, name),
             warnings: Vec::new(),
+            provision_backing_collection: false,
         }
     }
 
@@ -1137,7 +1146,10 @@ impl DdlService {
         // Check if table exists
         if catalog.table_exists(&table_id).await? {
             if if_not_exists {
-                return Ok(DdlResult::already_exists("Table", table_name));
+                let schema = catalog.get_table(&table_id).await?;
+                let mut result = DdlResult::already_exists("Table", table_name);
+                result.provision_backing_collection = !is_catalog_only_external_table(&schema);
+                return Ok(result);
             } else {
                 return Err(anyhow!("Table '{}' already exists", table_name));
             }
@@ -1145,6 +1157,7 @@ impl DdlService {
 
         // Build catalog schema
         let schema = self.build_catalog_schema(&table_id.name, columns, constraints, properties)?;
+        let provision_backing_collection = !is_catalog_only_external_table(&schema);
 
         // PostgreSQL clients routinely create unqualified tables without
         // explicitly creating a schema first. Keep the native catalog path
@@ -1162,10 +1175,9 @@ impl DdlService {
         catalog.create_table(&table_id, schema).await?;
 
         info!(table = %table_name, "Created table");
-        Ok(DdlResult::success(format!(
-            "Created table '{}'",
-            table_name
-        )))
+        let mut result = DdlResult::success(format!("Created table '{}'", table_name));
+        result.provision_backing_collection = provision_backing_collection;
+        Ok(result)
     }
 
     /// Drop a table from the catalog, optionally purging its data.
@@ -2513,6 +2525,30 @@ fn apply_projection_freshness_options(schema: &mut CatalogTableSchema) {
     }
 }
 
+/// External Parquet and pinned Iceberg scans resolve their files through the
+/// relational catalog. A collection would allocate an unused native engine.
+pub(crate) fn is_catalog_only_external_table(schema: &CatalogTableSchema) -> bool {
+    schema
+        .storage_layouts
+        .iter()
+        .any(is_catalog_only_external_layout)
+}
+
+pub(crate) fn is_pinned_external_layout(layout: &CatalogStorageLayout) -> bool {
+    pinned_iceberg::is_external_iceberg(layout)
+        || pinned_ndjson::is_external_ndjson(layout)
+        || pinned_delta::is_external_delta(layout)
+}
+
+fn is_catalog_only_external_layout(layout: &CatalogStorageLayout) -> bool {
+    is_pinned_external_layout(layout)
+        || (layout.physical_format == CatalogPhysicalFormat::Parquet
+            && matches!(
+                layout.authority,
+                CatalogAuthorityMode::ExternalAuthoritative | CatalogAuthorityMode::FederatedRead
+            ))
+}
+
 fn add_open_table_layouts(schema: &mut CatalogTableSchema) -> Result<()> {
     let Some(format) = schema
         .properties
@@ -2605,6 +2641,54 @@ fn add_open_table_layouts(schema: &mut CatalogTableSchema) -> Result<()> {
         }
     };
 
+    if pinned_iceberg::is_external_iceberg(&layout) {
+        #[cfg(not(feature = "datafusion-integration"))]
+        return Err(anyhow!("external Iceberg requires datafusion-integration"));
+        #[cfg(feature = "datafusion-integration")]
+        {
+            for name in [
+                pinned_iceberg::METADATA_LOCATION,
+                pinned_iceberg::DELTA_VERSION,
+            ] {
+                if let Some(value) = schema.properties.get(name) {
+                    layout.properties.insert(name.into(), value.clone());
+                }
+            }
+            pinned_iceberg::PinnedIcebergLocation::from_layout(&layout)?;
+        }
+    }
+
+    if pinned_ndjson::is_external_ndjson(&layout) {
+        #[cfg(not(all(unix, feature = "datafusion-integration")))]
+        return Err(anyhow!(
+            "external NDJSON requires Unix and datafusion-integration"
+        ));
+        #[cfg(all(unix, feature = "datafusion-integration"))]
+        {
+            let key = pinned_ndjson::MANIFEST_DIGEST;
+            if let Some(value) = schema.properties.get(key) {
+                layout.properties.insert(key.into(), value.clone());
+            }
+            pinned_ndjson::PinnedNdjsonLocation::from_layout(&layout)?;
+            crate::datafusion::engine_adapters::pinned_ndjson::ndjson_schema(&schema.columns)?;
+        }
+    }
+
+    if pinned_delta::is_external_delta(&layout) {
+        #[cfg(not(all(unix, feature = "datafusion-integration")))]
+        return Err(anyhow!(
+            "external Delta requires Unix and datafusion-integration"
+        ));
+        #[cfg(all(unix, feature = "datafusion-integration"))]
+        {
+            let key = pinned_delta::DELTA_VERSION;
+            if let Some(value) = schema.properties.get(key) {
+                layout.properties.insert(key.into(), value.clone());
+            }
+            pinned_delta::PinnedDeltaLocation::from_layout(&layout)?;
+        }
+    }
+
     if let Some(snapshot) = schema
         .properties
         .get("snapshot_semantics")
@@ -2623,6 +2707,22 @@ fn add_open_table_layouts(schema: &mut CatalogTableSchema) -> Result<()> {
         layout
             .properties
             .insert("schema_mode".into(), schema_mode.clone());
+    }
+    if is_catalog_only_external_layout(&layout) {
+        layout.write_mode = proximadb_catalog::CatalogWriteMode::ReadOnly;
+    }
+    if pinned_iceberg::is_external_iceberg(&layout) {
+        layout.snapshot_semantics = Some("pinned-iceberg-snapshot".into());
+        layout.policy_enforced_in_proxima = false;
+    }
+    if pinned_ndjson::is_external_ndjson(&layout) {
+        layout.snapshot_semantics = Some("pinned-ndjson-manifest".into());
+        layout.policy_enforced_in_proxima = false;
+    }
+
+    if pinned_delta::is_external_delta(&layout) {
+        layout.snapshot_semantics = Some("pinned-delta-version".into());
+        layout.policy_enforced_in_proxima = false;
     }
 
     schema.storage_layouts.push(layout);
@@ -2645,24 +2745,28 @@ fn add_open_table_layouts(schema: &mut CatalogTableSchema) -> Result<()> {
 /// path boundary — a root `file:///data/ext` matches `file:///data/ext/a.parquet`
 /// but NOT `file:///data/ext-evil/…`.
 pub(crate) fn external_location_allowed(location: &str) -> bool {
+    external_location_root(location).is_some()
+}
+
+pub(crate) fn external_location_root(location: &str) -> Option<String> {
     let loc = location.trim();
     if loc.is_empty() || loc.contains("..") {
-        return false;
+        return None;
     }
-    let Ok(roots) = std::env::var("PROXIMADB_EXTERNAL_TABLE_ROOTS") else {
-        return false;
-    };
+    let roots = std::env::var("PROXIMADB_EXTERNAL_TABLE_ROOTS").ok()?;
     roots
         .split(',')
         .map(str::trim)
         .filter(|root| !root.is_empty())
-        .any(|root| {
+        .filter_map(|root| {
             // Normalize the root's trailing slash so `file:///x/` and `file:///x`
             // both denote the same directory: a location is allowed when it IS
             // the root or sits strictly beneath it (path boundary).
             let root_norm = root.trim_end_matches('/');
-            loc == root_norm || loc.starts_with(&format!("{root_norm}/"))
+            (loc == root_norm || loc.starts_with(&format!("{root_norm}/"))).then_some(root_norm)
         })
+        .max_by_key(|root| root.len())
+        .map(str::to_owned)
 }
 
 fn parse_physical_format(value: &str) -> Option<CatalogPhysicalFormat> {

@@ -209,9 +209,8 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Install Rust Toolchain
-        uses: dtolnay/rust-toolchain@1.99.0
+        uses: dtolnay/rust-toolchain@1.100.0
         with:
-          toolchain: stable
           targets: ${{ matrix.target }}
 
       - name: Install Cross (for cross-compilation)
@@ -367,9 +366,7 @@ jobs:
   #         python-version: "3.11"
   #
   #     - name: Install Rust Toolchain
-  #       uses: dtolnay/rust-toolchain@1.99.0
-  #       with:
-  #         toolchain: stable
+  #       uses: dtolnay/rust-toolchain@1.100.0
   #
   #     - name: Install Maturin
   #       run: pip install maturin

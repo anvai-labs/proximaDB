@@ -1328,7 +1328,7 @@ impl ArrowProtoCodec {
     ) -> Result<Vec<FlightData>> {
         Ok(arrow_flight::utils::batches_to_flight_data(
             &batch.schema(),
-            vec![batch.clone()],
+            [batch],
         )?)
     }
 

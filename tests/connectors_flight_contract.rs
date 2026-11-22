@@ -629,7 +629,7 @@ mod trino_flight_pilot {
         )
         .unwrap();
         let messages =
-            arrow_flight::utils::batches_to_flight_data(&schema, vec![batch_a, batch_b]).unwrap();
+            arrow_flight::utils::batches_to_flight_data(&schema, [&batch_a, &batch_b]).unwrap();
 
         let (port, _shutdown) = start_mock_flight_server_with_do_get(messages).await;
 

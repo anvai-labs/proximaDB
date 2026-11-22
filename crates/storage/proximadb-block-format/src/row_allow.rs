@@ -75,8 +75,7 @@ impl RowAllow {
             return false;
         }
         let (first_w, last_w) = (start / 64, (end - 1) / 64);
-        for w in first_w..=last_w {
-            let mut word = self.words[w];
+        for (w, mut word) in (first_w..=last_w).zip(self.words[first_w..=last_w].iter().copied()) {
             if w == first_w {
                 word &= u64::MAX << (start % 64);
             }
@@ -104,8 +103,7 @@ impl RowAllow {
         }
         let (first_w, last_w) = (start / 64, (end - 1) / 64);
         let mut count = 0usize;
-        for w in first_w..=last_w {
-            let mut word = self.words[w];
+        for (w, mut word) in (first_w..=last_w).zip(self.words[first_w..=last_w].iter().copied()) {
             if w == first_w {
                 word &= u64::MAX << (start % 64);
             }

@@ -14,6 +14,7 @@ point at deterministic policies:
 * query ratchets count only executed queries and cloud proofs cover every backend
 * rust-cache inputs resolve to keys accepted by GitHub's cache service
 * every ci.yml rust-cache step shares a shape key, and only a develop push saves it
+* the shared CI Rust setup uses the exact workspace compiler release
 * every Dockerfile a workflow `file:`-builds is visible to the `docker` path filter
 * `serde_json` is declared with `preserve_order` where the OpenAPI doc is serialised
 * conflict markers are not staged into source/docs
@@ -27,7 +28,6 @@ import sys
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
-
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -799,22 +799,39 @@ def check_rust_setup_action(findings: list[Finding]) -> None:
                 f"a different prefix strands every shared shape key",
             )
         )
-    if "uses: dtolnay/rust-toolchain@1.99.0" not in text:
+    channel = None
+    try:
+        with (ROOT / "rust-toolchain.toml").open("rb") as toolchain_file:
+            toolchain = tomllib.load(toolchain_file).get("toolchain")
+            if isinstance(toolchain, dict):
+                channel = toolchain.get("channel")
+    except (OSError, tomllib.TOMLDecodeError):
+        pass
+    if not isinstance(channel, str) or not re.fullmatch(r"\d+\.\d+\.\d+", channel):
         findings.append(
             Finding(
                 "rust-setup-action",
-                f"{RUST_SETUP_ACTION} no longer pins dtolnay/rust-toolchain@1.99.0 "
-                f"-- a toolchain bump is a whole-fleet event, land it deliberately",
+                "rust-toolchain.toml must declare an exact compiler release",
             )
         )
-    if "default: '1.99.0'" not in text:
-        findings.append(
-            Finding(
-                "rust-setup-action",
-                f"{RUST_SETUP_ACTION} toolchain input default drifted from '1.99.0' "
-                f"-- keep the uses ref and the default in lockstep",
+    else:
+        if not re.search(
+            rf"^\s*- uses: dtolnay/rust-toolchain@{re.escape(channel)}\s*$", text, re.MULTILINE
+        ):
+            findings.append(
+                Finding(
+                    "rust-setup-action",
+                    f"{RUST_SETUP_ACTION} must pin dtolnay/rust-toolchain@{channel} "
+                    "-- update the CI action and rust-toolchain.toml together",
+                )
             )
-        )
+        if f"default: '{channel}'" not in text:
+            findings.append(
+                Finding(
+                    "rust-setup-action",
+                    f"{RUST_SETUP_ACTION} toolchain input must default to '{channel}'",
+                )
+            )
     if "RUSTUP_MAX_RETRIES" not in text:
         findings.append(
             Finding(

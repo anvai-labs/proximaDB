@@ -96,9 +96,13 @@ pub mod manifest;
 pub mod metadata;
 mod metadata_gc;
 pub use metadata_gc::{MetadataGcPlan, TipEvidence, below_tip_evidence, plan_metadata_gc};
+mod pinned_reader;
+pub use pinned_reader::PinnedIcebergReader;
 pub mod retention;
 mod snapshot_deletes;
-pub use snapshot_deletes::{IcebergSnapshotFiles, IcebergSnapshotPlan, SnapshotDeletionVector};
+pub use snapshot_deletes::{
+    IcebergSnapshotFiles, IcebergSnapshotPlan, PinnedIcebergSnapshot, SnapshotDeletionVector,
+};
 /// Puffin files: the container of a v3 table's deletion vectors.
 pub mod puffin;
 /// Parquet footer → Iceberg manifest column metrics.

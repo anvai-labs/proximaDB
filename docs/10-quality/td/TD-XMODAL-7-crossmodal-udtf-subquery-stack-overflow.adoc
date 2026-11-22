@@ -25,6 +25,9 @@
   `thread_stack_size(32 * 1024 * 1024)`. Regression test
   `src/datafusion/cross_modal.rs::udtf_in_aggregating_subquery_does_not_recurse` pins the in-process
   planning shape; the pgwire end-to-end shape is exercised by `demo/data-engineering/`.
+* **2 MiB regression coverage.** The pgwire cross-modal CI target also runs an aggregating
+  `timeseries_range` derived table joined to a materialized table and checks the exact seeded result.
+  Both cross-modal pgwire tests passed on Rust 1.100 with 2 MiB workers.
 
 == Follow-up (open)
 

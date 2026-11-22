@@ -12,7 +12,7 @@
 # CARGO_FEATURE_PYLIB is set, and maturin builds the pyo3 cdylib via the
 # `python,pylib` features (see clients/python-embedded/pyproject.toml).
 # ----------------------------------------------------------------------------
-FROM rust:1.95-slim-bookworm AS wheelbuilder
+FROM rust:1.100.0-slim-bookworm AS wheelbuilder
 
 # python3-dev + libpython for PyO3 link; maturin for the wheel.
 RUN apt-get update && apt-get install -y --no-install-recommends \

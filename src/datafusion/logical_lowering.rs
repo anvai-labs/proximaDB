@@ -530,6 +530,7 @@ fn lower_scalar_function(name: &str, args: Vec<Expr>) -> DFResult<Expr> {
         "floor" => f::floor(one(name, args)?),
         "sqrt" => f::sqrt(one(name, args)?),
         "concat" => f::concat(args), // variadic
+        "substr" | "substring" => datafusion::functions::unicode::substr().call(args),
         // JSON extraction is a registry function (for native + frontend typing), but on the
         // OLAP side it has dedicated Arrow-vectorized UDFs (`udf.rs`). Bind THOSE here — NOT
         // the engine-neutral kernel via the F2 fallback below, whose untyped (0-arity)

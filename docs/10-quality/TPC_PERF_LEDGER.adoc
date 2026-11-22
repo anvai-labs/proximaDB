@@ -13,12 +13,152 @@ into a versioned JSON ledger artifact. ProximaDB latency and bytes-scanned on th
 
 [source,bash]
 ----
-TPC_PERF_SCALE=0.001 cargo test --test tpc_perf_ledger_e2e -- --ignored --nocapture
+RUST_MIN_STACK=2097152 TPC_PERF_SCALE=0.001 cargo test --test tpc_perf_ledger_e2e -- --ignored --nocapture
 # artifact: target/tpc-perf-ledger/ledger.json (override: TPC_PERF_LEDGER_OUT)
-# debug builds: RUST_MIN_STACK=16777216 — plan-time recursion on the Q2-class
-# join+subquery shapes overflows default thread stacks on some environments
-# (reproduced on WSL2 debug even without column statistics).
 ----
+
+The full SF0.001 ledger completed on Linux x86-64 with Rust 1.100 and 2 MiB
+workers after the pgwire dispatcher change. It exercised both native and
+DataFusion routes, with 22/22 TPC-H queries succeeding on each, and 28/63 native
+and 63/63 DataFusion TPC-DS queries succeeding. This measures the small test
+profile run. Production worker sizing and larger-scale runs have separate
+validation requirements.
+
+== Full open-table SQL qualification
+
+Generate both suites with the DuckDB extensions for the same release. Use the
+extension's fixed parameters. The fixture contains all 22 TPC-H or 99 TPC-DS
+query IDs, each SQL file and its SHA-256, and typed Arrow IPC reference answers
+computed on the generated source tables. Each source table also has a declared
+Arrow schema, NDJSON rows and a byte-range manifest, a versioned Delta log
+and an Iceberg v2 metadata pointer. Keep the fixture at its original absolute
+location for Iceberg reads.
+https://duckdb.org/docs/1.4/core_extensions/tpch[DuckDB TPC-H],
+https://duckdb.org/docs/1.4/core_extensions/tpcds[DuckDB TPC-DS]
+
+[source,bash]
+----
+python -m pip install duckdb==1.4.4 pyarrow==26.0.1 deltalake==1.6.6 'pyiceberg[pyarrow,sql-sqlite]==0.12.0'
+python -c 'import duckdb; c = duckdb.connect(); c.install_extension("tpch"); c.install_extension("tpcds")'
+python scripts/bench/build_open_table_tpc_fixture.py tpch /tmp/open-tpch --scale 0.001
+python scripts/bench/build_open_table_tpc_fixture.py tpcds /tmp/open-tpcds
+----
+
+Run this sweep once per fixture and format. The in-process test server
+registers the pinned tables in pgwire, checks table counts, runs the full
+hashed SQL inventory and saves wire values or SQL errors for every query.
+The verifier checks typed row multiplicities, including exact decimal values
+and a default floating-point tolerance of 1e-9 relative and absolute.
+It evaluates the top-level `ORDER BY` against the typed wire rows, applies
+explicit NULL placement or PostgreSQL defaults, and accepts any sequence
+within a group of equal sort keys. An expression that cannot be evaluated
+from the returned columns fails verification. LIMIT queries still compare
+row membership against the fixture answer, including rows at tied cutoffs.
+
+[source,bash]
+----
+TPC_OPEN_FIXTURE=/tmp/open-tpch TPC_OPEN_RESULTS=/tmp/open-tpch-iceberg.jsonl \
+PROXIMADB_EXTERNAL_TABLE_ROOTS=file:///tmp/open-tpch/iceberg RUST_MIN_STACK=2097152 \
+cargo test --features datafusion-integration --test pinned_iceberg_pgwire_e2e \
+    pinned_external_full_tpc_sql -- --ignored --nocapture
+python scripts/bench/verify_open_table_tpc_results.py /tmp/open-tpch /tmp/open-tpch-iceberg.jsonl
+----
+
+For NDJSON, set `TPC_OPEN_FORMAT=ndjson`,
+`PROXIMADB_EXTERNAL_TABLE_ROOTS=file:///tmp/open-tpch/json` and use a new
+`TPC_OPEN_RESULTS` path. For Delta, set `TPC_OPEN_FORMAT=delta` and
+`PROXIMADB_EXTERNAL_TABLE_ROOTS=file:///tmp/open-tpch/delta`. The harness
+uses the Delta version recorded for each table. The default format is Iceberg.
+
+The separate `pinned_delta_checkpoint_replay` test uses
+`TPC_DELTA_CHECKPOINT_FIXTURE` and the operator allowlist. Its delta-rs fixture
+defines one BIGINT column named `id`. Version 0 contains 1 and 2, version 1
+appends 3, version 2 overwrites the table with 4 and 5 and writes a checkpoint,
+and version 3 appends 6. Retire the JSON commits through version 2 while
+keeping the checkpoint, the version 3 commit and the referenced files.
+
+The TPC-DS SF1 fixture contains about 19.6 million rows, and its NDJSON alone
+took about 4.9 GiB in the local build. The named memory limit applies to DuckDB.
+These fixtures record explicit source versions and compare each format
+independently. The fixture and
+conformance sweep are internal engineering evidence. An audited TPC run
+requires the benchmark's prescribed parameters, streams and reporting.
+
+=== Local SF1 evidence (Rust 1.100, 2 MiB workers)
+
+Independent readers matched row counts and typed checksums for all 32 SF1
+tables across NDJSON, Delta and Iceberg. The pgwire sweep registered the
+Iceberg v2 fixtures and passed all 22 TPC-H and 99 TPC-DS executions. The
+full inventory exposed three issues corrected in the sweep: catalog binding
+for quoted names and nested queries, `SUBSTRING` coercion, and positional
+`ORDER BY` losing the sort before LIMIT.
+
+[cols="1,1,1,1,1",options="header"]
+|===
+| Suite | SQL success | Row multisets at 1e-9 relative and absolute | Wall time | Peak process RSS
+| TPC-H | 22/22 | 20/22 | 7.0 s | 4.4 GiB
+| TPC-DS | 99/99 | 87/99 | 44.7 s | 23.7 GiB
+|===
+
+All 121 row multisets matched with float tolerances of 2e-6 relative and 1e-6
+absolute. The decimal, integer, date, text and null comparisons stayed exact.
+The saved SF1 results from Iceberg, Delta and NDJSON each passed the sort
+check for all 18 ordered TPC-H queries and all 90 ordered TPC-DS queries.
+The stricter differences are in results DuckDB represents as floating point
+and DataFusion evaluates with finite-scale decimal AVG or division. Retain
+the 1e-9 comparison as a diagnostic. These debug-process wall times include
+server startup, table registration and count checks. The performance gate
+still needs release runs, bounded query memory and plan attribution,
+especially for TPC-DS Q72, which took about 17 seconds in this sweep.
+
+The same SF1 suites also ran through pgwire with pinned NDJSON. All 121
+executions passed and the DuckDB comparator reproduced both the strict
+and tolerant match counts above. The debug sweeps took 2m23s for TPC-H
+and 18m28s for TPC-DS, with 4.9 and 24.6 GiB peak process RSS respectively.
+These sweeps include raw JSON parsing, per-range SHA-256 verification and
+table counts. Use the JSON route for direct file access and isolate parsing,
+verification and query compute in release measurements.
+
+Pinned Delta passed all 121 SF1 executions over pgwire at the same worker
+stack size. Both DuckDB comparison counts matched the Iceberg and NDJSON
+sweeps. Before Delta projection pushdown, the debug runs took 20.4 s and
+2m20s, with 4.7 and 24.3 GiB peak process RSS. TPC-DS Q72 took 22.5 s.
+
+Delta sends projected physical schemas to the Parquet reader for
+positional transforms, including pure column renames, and for standard
+partition-value insertions. Other transforms apply projection to the
+logical output. Row-only and partition-only scans carry one physical
+column through Kernel to preserve batch cardinality.
+On a local fixture with 131,072 rows and a 256-byte payload column, Linux
+`rchar` increased by 34.9 MB on a full scan and 0.79 MB on an ID-only
+scan. The row count matched. These are process-read bytes and include
+reads from the page cache.
+
+The same row count and payload width in an independently written,
+partitioned Delta fixture used 34.9 MB of process reads on a full scan
+and 0.78 MB when selecting the ID and partition value. The projected
+scan preserved all 131,072 rows, including 65,536 null partition values.
+
+With projection pushdown, both local SF1 debug sweeps again passed all
+121 queries and reproduced both DuckDB comparison counts. Wall time fell
+from 20.4 s to 8.2 s for TPC-H and from 140.0 s to 54.5 s for TPC-DS.
+Peak RSS was 4.4 and 23.7 GiB respectively. TPC-DS Q72 fell from 22.5 s
+to 16.8 s and remained the slowest query.
+
+The pgwire regression covers two versions of one Parquet file with an
+on-disk deletion vector, a join across all three formats, outside-file
+reference rejection, read-only enforcement and cancellation during log
+replay. The delta-rs checkpoint fixture returned the expected rows at
+versions 2 and 3 and declined expired version 0.
+
+For long or isolated runs, set `TPC_PERF_LEDGER_OUT` to an absolute path outside the
+worktree. The harness prepares the JSONL sidecar before starting the server and
+publishes the final JSON with an atomic rename in that directory. Preflight refuses
+estimates above the tighter available cgroup threshold (`memory.high` or `memory.max`).
+The large-run acknowledgement also requires a finite hard limit and host headroom.
+Load output reports completed batches and per-table `insert.acknowledged_rows`,
+`insert.sql_bytes` and summed statement time. The row count comes from pgwire
+command tags. SQL bytes measure client payload size.
 
 CI: the `tpc-perf-ledger` job in `.github/workflows/ci.yml` runs at small scale
 on develop pushes / manual dispatch, `continue-on-error: true` (ADVISORY — it
@@ -38,11 +178,11 @@ pattern when promoting).
   Object-store regimes (MinIO/Azurite/real cloud) are a follow-up section.
 
 | routes
-| `native` (row-wise Volcano, pre-MATERIALIZE) and `datafusion`
-  (Parquet-backed, post-`ALTER TABLE … MATERIALIZE`) — the in-repo baseline
-  pair that TD-OLAP-1 promotion decisions consume. Both routes emit the full
-  I/O trace (the DataFusion Parquet leaf is instrumented via
-  `TracingObjectStore`).
+| The `native` sweep runs before MATERIALIZE, and the `datafusion` sweep runs after
+  publication. Inspect each record's stamped `route` for the backend. With
+  `PROXIMADB_NATIVE_TABLE_PROVIDER=1`, the pre-publication sweep can use DataFusion.
+  Record the spill setting and read counters as well when comparing Layer A. The
+  DataFusion Parquet leaf emits I/O counters through `TracingObjectStore`.
 
 | temperature
 | `first` vs `repeat` against a warm process. This is NOT a cold-page-cache
@@ -60,11 +200,10 @@ pattern when promoting).
   prerequisite for real SF1/SF10 entries.
 
 | baselines
-| External engines (DuckDB, plain DataFusion-on-Parquet standalone,
-  ClickHouse) are DEFERRED: no CI service-container pattern exists in this
-  repo yet; the dual-route comparison above is the in-repo baseline. When
-  added, each baseline's ledger entry must pin engine version, storage
-  config, and cache state.
+| The harness can run DuckDB in-process with the `duckdb` feature or via `DUCKDB_BIN`
+  in a build without that feature. Record which path ran, the version, layout and cache
+  state. A skipped baseline contributes no comparison. Standalone DataFusion and deferred
+  ClickHouse comparisons are tracked in link:td/TD-OLAP-4-tpcds-performance-evidence-ledger.adoc[TD-OLAP-4].
 
 | honesty rule
 | The ledger records where ProximaDB *loses* (e.g. DataFusion hash-join

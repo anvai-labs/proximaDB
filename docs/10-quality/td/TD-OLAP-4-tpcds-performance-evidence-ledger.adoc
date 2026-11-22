@@ -5,7 +5,7 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | **Partial: dual-route ledger harness + advisory `tpc-perf-ledger` CI job + methodology doc, date-clustered generator + row-group cap, ClickBench track (`tests/clickbench_ledger_e2e.rs`) and the DuckDB external baseline (fixed in #846) shipped; open: faithful datagen + bulk load for real SF1/SF10, the object-store regime section, ClickHouse baseline (deferred as server-based), per-query peak-memory + join-build ledger columns (absent from `tests/tpc_perf_ledger_e2e.rs`, 2026-10-15), advisory→gate promotion — LOAD LEG ADVANCED 2026-11-01 (release-review F3): `enforce_load_peaks_within_cgroup` in tests/tpc_perf_ledger_e2e.rs now asserts every load/MATERIALIZE phase's recorded cgroup peak stays within the cgroup bound (memory.high where one exists, else the hard limit, plus a small batched-charge tolerance) on BOTH benchmark legs (and that a peak WAS recorded), so the P2.4 claim (ledger id `p24_sf1_bounded_memory_load`) fails the run that produced it on regression instead of being a recorded number with no assertion; the harness remains #[ignore]/manual cgroup-gated, so query-leg promotion is still open. SF≥0.06 runs must use the `scripts/run_tpc_perf_ledger.sh` cgroup wrapper (OOM hazard).** History: (P0b skeleton **landed 2026-07-04**: `tests/tpc_perf_ledger_e2e.rs` dual-route harness + advisory `tpc-perf-ledger` CI job + methodology doc `docs/10-quality/TPC_PERF_LEDGER.adoc`; first dated artifact **2026-07-04**: `docs/_internal/status/TPC_PERF_GATE_EVIDENCE_2026_07_04.adoc`, BENCHMARK_EVIDENCE `tpc_perf_ledger_dual_route` promoted to `measured`; generator fact tables now date-CLUSTERED and the warehouse writer row-group cap landed (`PROXIMADB_MATERIALIZE_ROW_GROUP_ROWS`, default 65,536); evidence v2 artifact `TPC_PERF_GATE_EVIDENCE_V2_2026_07_04.adoc` root-causes the remaining blocker as TD-OLAP-6 sort-on-materialize; remaining: TD-OLAP-6 re-run, faithful datagen + bulk load for real SF1/SF10, object-store regime section, external baselines; amendment 2026-07-06: + ClickBench single-node/embedded track + peak-memory & join-build ledger columns; amendment 2026-07-07: + DuckDB external baseline on the TPC track (`run_duckdb_baseline`, `DUCKDB_BIN`-gated, reuses the ClickBench out-of-process CLI pattern — no new dependency; ClickHouse deferred as server-based))
+| Status | Partial. The dual-route harness, advisory CI, ClickBench, optional DuckDB and load/MATERIALIZE memory checks have landed. Open work includes load attribution, matched query evidence, faithful SF1/SF10 data, object-store baselines, per-query peak memory and join-build bytes. ClickHouse remains deferred. link:../TPC_PERF_LEDGER.adoc[Harness methodology]
 | Priority | **P0b** in the ADR-052 execution order — the harness skeleton lands *before* any optimization (measure-first); it is the promotion gate for TD-OLAP-1/3/5
 | Severity | High — co-design principle #11: reject component microbenchmarks masquerading as e2e claims; method step 2: capture the trace first
 | Component | `tests/{tpcds,tpch}_pgwire_e2e.rs`, `tools/benchbase/`, `.github/workflows/qa-gate.yml`, new evidence-ledger harness
@@ -13,39 +13,45 @@
 | Relates to | ADR-040 (accuracy harness — the correctness counterpart), TD-158 (per-query I/O trace), ADR-030 (trace/meter seam)
 |===
 
-== Why
+== Next evidence
 
-Today `tests/{tpcds,tpch}_pgwire_e2e.rs` assert *query counts* (TPC-H 22, TPC-DS 16) over a
-tiny deterministic dataset — a SQL-conformance harness, not a performance benchmark. No scale
-factor, no latency/throughput, no baseline. "Competitive with Photon/Snowflake" is therefore
-unmeasured. The co-design mandate is explicit: a green conformance test does not prove the
-integrated path is fast, and no optimization lands without a trace + evidence ledger.
+. Use a writable output path outside the worktree for the ledger and partial sidecar. Verify
+  that preflight rejects an estimated peak above the effective envelope before server startup.
+  The harness logs startup and insert progress. A bounded load-stall timeout remains open.
+. The harness records acknowledged rows and SQL bytes per table. On an admitted scale,
+  profile per-batch generation, client wait and server work. Attribute slow queries to plan, open, scan, join
+  and delivery. Keep failures in the denominator. TD-OLAP-5 owns the native q17 type error.
+. Compare the streaming provider, native control and published route against typed results.
+  Once TD-119 qualifies external snapshots, time both read paths against the same files and
+  visible data. Report metadata round trips, DV application and total query latency separately.
+. Collect release SF1 then SF10 on suitable hardware with faithful data and bounded loading.
+  Preserve the local ClickBench track, object-store TPC track and ADR-054 native promotion
+  criteria. Promote an advisory CI budget only after measuring variance.
+  link:../../rfcs/0003-open-table-analytics.adoc#analytics-evidence[workloads and comparison rules]
 
-== Rollout
+== First diagnostic run
 
-. **SF1 first, SF10 next:** generate TPC-DS/TPC-H at SF1 (1 GB) and SF10 into the object
-  store as Iceberg/Parquet (the OLAP path) AND PAX (the native-scan path) so both routes are
-  measured.
-. **Baseline harness:** run the same SF on DuckDB, plain DataFusion-on-Parquet, and
-  ClickHouse on the same object store / instance class. **Methodology (pinned per ledger
-  entry):** engine versions; each baseline's storage configuration (local NVMe vs object
-  store — ClickHouse-on-S3 ≠ local MergeTree, DuckDB is local-first); cold vs warm cache
-  state, recorded separately. The two cost regimes (object-store: bytes-scanned-dominant;
-  local-NVMe: CPU-dominant) are reported as separate ledger sections — never averaged.
-  Record latency-per-query + total bytes-scanned (TD-158 trace, **Resolved** — available)
-  into a versioned evidence ledger (JSON/Markdown under `docs/10-quality/` or a bench
-  artifact).
-. **ClickBench track (single-node / embedded regime):** add https://github.com/ClickHouse/ClickBench[ClickBench] (one wide table, ~43 queries — the de-facto single-node OLAP signal where DuckDB / DataFusion / ClickHouse publish) as a ledger track *alongside* TPC-DS. TPC-DS stays primary for the **object-store / scan-avoidance** regime (star joins, DPP, TD-OLAP-3 promotion); ClickBench is primary for the **local-NVMe / single-node / embedded** regime (the "win single-node first" non-goal) where DataFusion's per-op CPU ceiling vs Velox/DuckDB is the binding constraint. Mostly mechanical wiring into the existing `tests/tpc_perf_ledger_e2e.rs` dual-route harness, plus a ClickBench data-gen/loader step (a ~100 M-row `hits` table — the one non-trivial piece).
-. **CI tier (advisory→gate):** add a `tpcds-perf` job that records the ledger on develop
-  pushes; gate (ratchet on a *budget*, not a single run) only once variance is bounded —
-  mirror the `pax-recall-ratchet` pattern (advisory until evidence is stable).
-. **Honest trade capture:** the ledger must record where ProximaDB *loses* (e.g. DataFusion
-  hash-join no-spill on large joins; per-op ceiling vs Velox) so ADR-052's tradeoffs stay
-  visible, not hidden.
+A local debug run on `d4a870665` with the benchmark admission and artifact changes used
+synthetic scale 0.001 and queried TPC-H Q3, Q17, Q18 and Q21. The full JSON and
+partial JSONL agreed on all 16 records. The TPC-H load acknowledged 6,019 lineitem
+rows in 31 batches. All four queries completed in both sweeps. The Q21 native
+repeat charged 756 ms of its 760 ms wall time to native compute. The published
+DataFusion sweep changed both storage and compute, and this diagnostic leaves open
+which native operator accounts for the cost at scale 0.1.
+
+A matched follow-up enabled native table registration. Repeat Q21 took 757 ms with
+the default storage setup and 130 ms when the resident limit was lowered to 128 rows
+to exercise spilled Layer A. Both runs used DataFusionLocal before publication.
+The forced-spill run increased total load time from 1.62 s to 8.48 s. This debug
+fixture identifies a query-versus-load tradeoff for further measurement. The
+reported row counts agree, and typed result equality remains a separate gate.
+The forced-spill configuration also completed all four queries and wrote both
+ledger artifacts after the Arrow 60 and DataFusion 56 RC2 upgrade.
 
 == Verification
 
-* A ledger entry exists for SF1 TPC-DS with ProximaDB vs DuckDB/DataFusion/ClickHouse
-  latency + bytes-scanned before any "competitive" claim is cited in a doc or ADR.
+* A competitive claim names the measured engine, workload, scale and storage regime and
+  cites the matched results. Publish value coverage alongside latency and bytes scanned.
+  Include ClickHouse when its deferred benchmark runs. ADR-054 governs native promotion.
 * Each ledger entry records per-query **peak memory + join-build bytes** (calibrates the TD-OLAP-1 hash-join-no-spill routing threshold and future per-tenant memory budgeting).
-* Conformance ratchets (TPC-H 22 / TPC-DS 16) remain green and monotonically non-decreasing.
+* Keep existing pgwire conformance and value ratchets green. Report suite, query set, scale and successful, failed and declined counts for every comparison.

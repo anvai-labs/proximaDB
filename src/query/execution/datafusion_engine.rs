@@ -100,6 +100,12 @@ impl DataFusionLocalEngine {
         // TD-OLAP-4: time the table-OPEN floor (LIST + HEAD + footer discovery),
         // which happens before execution and is invisible to `record_compute_ms`.
         let open_start = std::time::Instant::now();
+        for (name, table) in &context.pinned_external_tables {
+            ctx.register_table(name.as_str(), table.clone())
+                .map_err(|e| {
+                    ExecutionError::Context(format!("register pinned external table {name}: {e}"))
+                })?;
+        }
         for (name, location) in &context.parquet_tables {
             // ADR-025 (relational cold path): a materialized table reads its cold
             // Parquet base reconciled with the authoritative post-snapshot WAL
@@ -256,7 +262,12 @@ impl DataFusionLocalEngine {
         // the per-query floor, separate from execution).
         let plan_start = std::time::Instant::now();
         let mut schemas: HashMap<String, std::sync::Arc<RelationalSchema>> = HashMap::new();
-        for (name, _) in &context.parquet_tables {
+        for name in context
+            .parquet_tables
+            .iter()
+            .map(|(name, _)| name)
+            .chain(context.pinned_external_tables.iter().map(|(name, _)| name))
+        {
             let provider = ctx
                 .table_provider(name.as_str())
                 .await
@@ -1119,7 +1130,9 @@ async fn register_merged_olap_table(
 }
 
 #[cfg(feature = "datafusion-integration")]
-fn arrow_type_to_proxima(dt: &arrow_schema::DataType) -> proximadb_data_model::ProximaType {
+pub(crate) fn arrow_type_to_proxima(
+    dt: &arrow_schema::DataType,
+) -> proximadb_data_model::ProximaType {
     use arrow_schema::DataType as D;
     use proximadb_data_model::ProximaType;
     match dt {
@@ -1134,6 +1147,10 @@ fn arrow_type_to_proxima(dt: &arrow_schema::DataType) -> proximadb_data_model::P
         D::UInt64 => ProximaType::UInt64,
         D::Float16 | D::Float32 => ProximaType::Float32,
         D::Float64 => ProximaType::Float64,
+        D::Decimal128(precision, scale) if *scale >= 0 => ProximaType::Decimal {
+            precision: *precision,
+            scale: *scale as u8,
+        },
         D::Utf8 | D::LargeUtf8 => ProximaType::String,
         D::Binary | D::LargeBinary => ProximaType::Binary,
         D::Date32 => ProximaType::Date,
@@ -1217,6 +1234,10 @@ fn arrow_cell_to_proxima(
         D::UInt64 => v!(UInt64Array, ProximaValue::UInt64),
         D::Float32 => v!(Float32Array, ProximaValue::Float32),
         D::Float64 => v!(Float64Array, ProximaValue::Float64),
+        D::Decimal128(_, scale) if *scale >= 0 => array
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .map(|a| ProximaValue::Decimal(a.value_as_string(row))),
         D::Utf8 => array
             .as_any()
             .downcast_ref::<StringArray>()

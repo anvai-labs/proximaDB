@@ -535,12 +535,27 @@ jobs:
               - 'src/services/dml/**'
               - 'src/services/storage_format.rs'
               - 'tests/iceberg_interop_e2e.rs'
+              - 'tests/external_table_pgwire_e2e.rs'
+              - 'tests/pinned_iceberg_*_e2e.rs'
+              - 'src/services/ddl/**'
+              - 'src/network/postgres/protocol.rs'
+              - 'src/network/postgres/relational_pipeline.rs'
+              - 'src/core/utils/mod.rs'
+              - 'src/datafusion/logical_lowering.rs'
+              - 'src/datafusion/engine_adapters/*iceberg*.rs'
+              - 'src/datafusion/engine_adapters/pinned_ndjson.rs'
+              - 'src/datafusion/engine_adapters/pinned_delta.rs'
+              - 'src/datafusion/engine_adapters/confined_delta_engine.rs'
+              - 'src/datafusion/engine_adapters/confined_file_store.rs'
+              - 'src/query/execution/pinned_source.rs'
+              - 'crates/query/proximadb-relational-frontend/**'
               - 'scripts/iceberg_readback.py'
               # Release-review F2: the ordered-DV-base OLAP merge and the
               # DV-applying DataFusion Parquet reader are what the soak's
               # OLAP view and the external read-back assert — a PR confined
               # to them previously skipped this lane until develop->qa.
               - 'src/query/execution/datafusion_engine.rs'
+              - 'src/query/execution/engine.rs'
               - 'src/datafusion/**'
               - 'tests/v2_post_flush_search_e2e.rs'
             # Cloud object-store Cool-tier validation (TD-168). The tier-mapping code
@@ -1085,7 +1100,7 @@ jobs:
     if: needs.changes.outputs.sweep == 'true' || needs.changes.outputs.proto == 'true' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.python == 'true'
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.99.0
+      - uses: dtolnay/rust-toolchain@1.100.0
         # Step-level, NOT workflow env: rust-cache hashes every CARGO*/RUST*
         # env var into its cache key, so a workflow-level var would cold-start
         # every cache (#2502 review). rustup's default is 3 retries.
@@ -1239,7 +1254,7 @@ jobs:
     if: needs.changes.outputs.sweep == 'true' || needs.changes.outputs.rust_sdk == 'true' || needs.changes.outputs.openapi_spec == 'true'
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.99.0
+      - uses: dtolnay/rust-toolchain@1.100.0
         # Step-level, NOT workflow env: rust-cache hashes every CARGO*/RUST*
         # env var into its cache key, so a workflow-level var would cold-start
         # every cache (#2502 review). rustup's default is 3 retries.
@@ -1941,7 +1956,7 @@ jobs:
 
       # Toolchain setup — one branch per matrix cell
       - if: matrix.setup == 'rust'
-        uses: dtolnay/rust-toolchain@1.99.0
+        uses: dtolnay/rust-toolchain@1.100.0
         # Step-level, NOT workflow env: rust-cache hashes every CARGO*/RUST*
         # env var into its cache key (#2502 review). rustup's default is 3.
         env:
@@ -2066,7 +2081,7 @@ jobs:
     if: needs.changes.outputs.spark_jni == 'true'
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.99.0
+      - uses: dtolnay/rust-toolchain@1.100.0
         # Step-level, NOT workflow env: rust-cache hashes every CARGO*/RUST*
         # env var into its cache key, so a workflow-level var would cold-start
         # every cache (#2502 review). rustup's default is 3 retries.
@@ -2912,6 +2927,11 @@ jobs:
               fi
             fi
           done
+      - name: Verify external file tables on 2 MiB worker stacks
+        env:
+          RUST_MIN_STACK: "2097152"
+        run: |
+          cargo test --test external_table_pgwire_e2e --test pinned_iceberg_pgwire_e2e --test pinned_iceberg_datafusion_e2e -- --test-threads=1
 
   # TD-MLOPS-1 slice 2: real-client MLflow conformance ratchet. Builds the
   # server, spawns it with PROXIMADB_MLFLOW_COMPAT_ENABLE=1, and drives the
@@ -3166,13 +3186,8 @@ jobs:
           apt-packages: 'libssl-dev pkg-config protobuf-compiler'
       - name: Run pgwire accuracy e2e
         env:
-          # TD-STACK-1 mitigation: the document/JSON pgwire path carries a latent
-          # ~2 MB-deep recursion that overflows tokio's default worker stacks
-          # (document_json_pgwire_e2e + events_tsbs_pgwire_e2e SIGABRT; bisect
-          # landed on a pure-function commit — a code-layout straw, not the
-          # cause). tokio workers are std threads and honor RUST_MIN_STACK when
-          # no explicit stack size is set; 16 MiB is empirically green. Remove
-          # once the recursion itself is fixed (see TD-STACK-1).
+          # TD-STACK-1: keep the 16 MiB budget for targets whose stack
+          # requirements have yet to be measured individually.
           RUST_MIN_STACK: "16777216"
         run: |
           # native_tpch_q18_q20_e2e joined this list when TD-CONV-1 closed: the
@@ -3230,6 +3245,12 @@ jobs:
             if [ "$test_name" = "pgwire_fk_referential_actions_e2e" ]; then
               cargo test --test "$test_name" -- --test-threads=1 --skip pgwire_cascade_recurses
             else
+              case "$test_name" in
+                document_json_pgwire_e2e|events_tsbs_pgwire_e2e|pgwire_extended_relational_e2e|pgwire_insert_props_e2e|native_tpch_q18_q20_e2e|udtf_only_datafusion_e2e|pgwire_crossmodal_join_e2e)
+                  RUST_MIN_STACK=2097152 cargo test --test "$test_name" -- --test-threads=1
+                  continue
+                  ;;
+              esac
               cargo test --test "$test_name" -- --test-threads=1
             fi
           done
@@ -4035,10 +4056,9 @@ jobs:
         env:
           TPC_PERF_SCALE: "0.001"
           TPC_PERF_LEDGER_OUT: target/tpc-perf-ledger/ledger.json
-          # Debug-build planning of join+subquery-heavy TPC shapes runs deep;
-          # 16 MiB thread stacks guard against environment-dependent overflow.
-          RUST_MIN_STACK: "16777216"
+          RUST_MIN_STACK: "2097152"
         run: |
+          set -o pipefail
           cargo test --test tpc_perf_ledger_e2e -- --ignored --nocapture 2>&1 | tail -40
 
       - name: Upload ledger artifact
@@ -4216,7 +4236,7 @@ jobs:
           sudo swapon /mnt/swapfile-ci
           free -h
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.99.0
+      - uses: dtolnay/rust-toolchain@1.100.0
         # Step-level, NOT workflow env: rust-cache hashes every CARGO*/RUST*
         # env var into its cache key.
         env:

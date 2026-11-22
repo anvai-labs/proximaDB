@@ -1048,8 +1048,13 @@ impl SqlFrontendParser {
 
     fn convert_order_by_expr(&self, order_expr: &SqlOrderByExpr) -> Result<OrderByExpr> {
         let expr = self.convert_expr(&order_expr.expr)?;
-        // In sqlparser 0.59, asc is in options.asc
-        let asc = order_expr.options.asc.unwrap_or(true); // Default to ascending
+        let asc = match &order_expr.options.sort {
+            None | Some(sqlparser::ast::OrderBySort::Asc) => true,
+            Some(sqlparser::ast::OrderBySort::Desc) => false,
+            Some(sqlparser::ast::OrderBySort::Using(_)) => {
+                return Err(anyhow!("ORDER BY USING is unsupported"));
+            }
+        };
 
         Ok(OrderByExpr { expr, asc })
     }

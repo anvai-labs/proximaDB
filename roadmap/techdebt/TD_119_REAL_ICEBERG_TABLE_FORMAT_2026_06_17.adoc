@@ -1,53 +1,78 @@
-= TD-119 Promote v1 Key-List Manifest to Real Iceberg Snapshots
+= TD-119 Qualify Iceberg snapshot interoperability
 :toc:
-:toclevels: 3
-:sectnums:
 
-Status: Open / proposed +
-Date: 2026-06-17 +
+Status: Partial +
+Reviewed: 2026-11-21 +
 Owner: Storage, catalog
 
-== Context
+== Managed publication
 
-The design doc `docs/12-design/PROXIMADB_AS_LAKEHOUSE_NATIVE_PG_ENGINE_2026_06_17.md` §3.4/6 and §9-P6
-calls for real Iceberg snapshots so external engines can consume ProximaDB tables and so branching
-(TD-117) has a snapshot-ref substrate (Iceberg `refs` map). The current v1 manifest is an opaque
-key-list, which keeps the "Snowflake/Trino interop" claim FALSE.
+The original June key-list migration delivered versioned metadata, Avro manifests and manifest
+lists. Managed publication now goes through the Iceberg engine. TD-SEAM-1 owns production
+writer/REST discovery and schema fidelity. TD-SPINE-3 and TD-SPINE-4 own metadata retention
+and scan planning. TD-117 retains its dependency on usable snapshot refs for branching.
+link:../../docs/12-design/adr/ADR-097-foundational-seams-single-logical-ir.adoc[ADR-097 D3],
+link:../../docs/current/LAKEHOUSE_PLAN.adoc[publication and read-back contract]
 
-== Current State (grounded)
+Qualify each managed publication using the production SQL and REST catalog paths.
+Compare pgwire values with pinned external readers across two snapshots, including deletes
+and a tenant-negative case. Record the producer, reader, table format version, enabled
+features and snapshot IDs. Existing PyIceberg/DuckDB tests supply the starting fixtures.
+link:../../tests/iceberg_interop_e2e.rs[external read-back tests]
 
-* v1 manifest = newline-delimited list of object keys
-  (`crates/storage/proximadb-iceberg-engine/src/lib.rs:99`) committed under CAS as `v{N}.manifest`.
-  No `metadata.json`, snapshot layer, manifest list, `refs` map, or column statistics.
-* Iceberg REST service (`src/catalog/iceberg_rest_service.rs`) returns **stub** snapshot structures.
-* `DrPathBuilder::snapshots_subprefix()` is reserved but unused for a real snapshot layer.
+== External read qualification
 
-== Target Design
+In the reverse direction, read a producer-published UniForm projection through pgwire.
+Compare typed rows with an independent Delta reader at the represented source version.
+Exercise both Iceberg v2 and v3 projections, including a nonempty deletion vector on v3.
+Reject an inadequate freshness guarantee or unsupported feature. A plain Delta log goes
+through the separate Delta read track. RFC-0003 owns the source matrix and fixture details.
+link:../../docs/rfcs/0003-open-table-analytics.adoc#iceberg-delta-compatibility[protocol evidence and fixtures]
 
-Emit a real Iceberg `metadata.json` + manifest-list Avro alongside each `v{N}.manifest` commit, as a
-**derived index** (the v1 key-list stays the low-level store, backward compatible). Populate column
-stats from PAX `BlockStats`. Wire the REST service to serve the real metadata.
+The Iceberg storage planner accepts a producer-supplied immutable metadata URI and
+an independently authorized table root. A UniForm caller supplies the expected
+`converted_delta_version`. The planner requires an exact match before opening the
+manifest list and resolves the referenced objects within the authorized prefix.
+The storage regression uses a locally generated producer-style metadata filename,
+advances the managed tip, and verifies that the older pinned snapshot and its
+deletion vector still resolve.
 
-== Deliverables
+The pinned DataFusion provider projects each Parquet file by its physical Iceberg
+field IDs, returns the current schema's names and order, and applies v3 deletion vectors
+before emitting rows. This covers flat schemas with field-ID-bearing Parquet, including
+renamed or reordered fields and optional additions without a stored default or identity
+partition value. Nested projection, name mapping for ID-less files, and synthesizing
+non-null defaults or missing identity partition values remain outside this slice.
 
-1. `IcebergSnapshot` / `SnapshotSummary` types + a `metadata.json` writer (snapshots list,
-   `current-snapshot-id`, `refs`, schema, parent-snapshot-id) under
-   `DrPathBuilder::snapshots_subprefix()`.
-2. A manifest-list Avro per snapshot pointing at the existing key-list.
-3. Populate column stats from `BlockStats` (PAX) into manifest entries.
-4. Wire `iceberg_rest_service.rs` `/v1/{ns}/{table}` + `/snapshots` to read the real `metadata.json`.
-5. (Design sub-task) Evaluate the DuckLake model — move the manifest/branch registry into a
-   transactional catalog DB if S3 metadata ops dominate at branch scale.
+For the pgwire read slice, register the producer's table root and its immutable
+metadata URI separately. Supply the exact converted version when reading a UniForm
+projection. The SQL columns must match the supported snapshot schema in name, type
+and order.
 
-== Acceptance
+[source,sql]
+----
+CREATE TABLE sales_snapshot (id BIGINT, amount DECIMAL(12,2))
+WITH (
+  format = 'iceberg',
+  authority = 'external',
+  external_location = 's3://warehouse/sales',
+  iceberg_metadata_location = 's3://warehouse/sales/metadata/00007-producer.metadata.json',
+  converted_delta_version = '42'
+);
+SELECT id, amount FROM sales_snapshot ORDER BY id;
+----
 
-* PyIceberg/Spark reads a ProximaDB table including snapshot history.
-* The CAPABILITY_MATRIX interop claim can be evidenced (no longer FALSE).
+The operator's `PROXIMADB_EXTERNAL_TABLE_ROOTS` allowlist must cover the table root.
+The read route checks the allowlist again on open. Unix local reads open files
+relative to the configured directory and refuse symlinks beneath it. S3 and GCS
+use their object-store backends when present in the build. Registered pinned
+tables are read-only. The first pgwire slice handles unqualified names in the
+default namespace and reads pinned Iceberg tables under an ungoverned identity.
+Mixed-storage queries, policy-governed scans and EXPLAIN are deferred.
+pgwire renders exact decimal values as text with its current wire type mapping.
 
-== Dependencies & Sequencing
+Qualify the catalog-backed path with independently produced UniForm fixtures.
 
-Independent to start; **enables TD-117** (manifest-version refs).
-
-== References
-
-Design doc §3.4/6 and §9-P6; Iceberg spec (`refs` / snapshot model); TECHNICAL_DEBT.adoc TD-119.
+Attach a result per tested producer/reader/feature combination. Wider Spark/Trino
+certification follows the release roadmap. TD-OLAP-4 owns comparative timings after
+value parity. link:../../docs/current/ROADMAP.adoc[release sequence]

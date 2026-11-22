@@ -537,7 +537,7 @@ pub fn write_manifest(
     with_verbatim_schema(container, MANIFEST_SCHEMA_JSON, &user_metadata)
 }
 
-/// Read an Iceberg v2 manifest Avro back into the data-file list.
+/// Read an Iceberg Avro data manifest containing Parquet files.
 pub fn read_manifest(bytes: &[u8]) -> Result<Vec<DataFileMeta>, StorageError> {
     let schema =
         Schema::parse_str(MANIFEST_SCHEMA_JSON).map_err(|e| ser_err("parse manifest schema", e))?;
@@ -551,6 +551,21 @@ pub fn read_manifest(bytes: &[u8]) -> Result<Vec<DataFileMeta>, StorageError> {
         // status 2 == DELETED; skip deleted entries when surfacing live data files.
         if entry.status == 2 {
             continue;
+        }
+        if !matches!(entry.status, 0 | 1)
+            || entry.data_file.content != 0
+            || !entry.data_file.file_format.eq_ignore_ascii_case("PARQUET")
+        {
+            return Err(ser_err(
+                "read data manifest",
+                format!(
+                    "unsupported entry for {} (status {}, content {}, format {})",
+                    entry.data_file.file_path,
+                    entry.status,
+                    entry.data_file.content,
+                    entry.data_file.file_format
+                ),
+            ));
         }
         let column_stats = stats_from_avro(&entry.data_file);
         out.push(DataFileMeta {

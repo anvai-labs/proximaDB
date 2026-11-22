@@ -10,7 +10,6 @@ from unittest.mock import patch
 
 from scripts import check_deterministic_commit_contract as contract
 
-
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -364,9 +363,14 @@ class RustSetupActionContractTest(unittest.TestCase):
     """TD-CI-8 step-block fold: the constants the cache policy leans on moved
     into the composite action file — pin them there."""
 
-    def findings_for(self, action_text: str | None) -> list[contract.Finding]:
+    def findings_for(
+        self, action_text: str | None, channel: str = "1.100.0"
+    ) -> list[contract.Finding]:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
+            (root / "rust-toolchain.toml").write_text(
+                f'[toolchain]\nchannel = "{channel}"\n', encoding="utf-8"
+            )
             action_dir = root / ".github" / "actions" / "rust-setup"
             if action_text is not None:
                 action_dir.mkdir(parents=True)
@@ -381,7 +385,7 @@ class RustSetupActionContractTest(unittest.TestCase):
         "  using: composite\n"
         "  steps:\n"
         "    - uses: actions/checkout@v7\n"
-        "    - uses: dtolnay/rust-toolchain@1.99.0\n"
+        "    - uses: dtolnay/rust-toolchain@1.100.0\n"
         "      with:\n"
         "        toolchain: ${{ inputs.toolchain }}\n"
         "      env:\n"
@@ -391,7 +395,7 @@ class RustSetupActionContractTest(unittest.TestCase):
         "        prefix-key: 'v2-rust'\n"
         "inputs:\n"
         "  toolchain:\n"
-        "    default: '1.99.0'\n"
+        "    default: '1.100.0'\n"
     )
 
     def test_good_action_passes(self) -> None:
@@ -410,9 +414,21 @@ class RustSetupActionContractTest(unittest.TestCase):
         self.assertTrue(any("prefix-key" in f.message for f in findings), findings)
 
     def test_toolchain_bump_in_action_fails(self) -> None:
-        bad = self.GOOD.replace("dtolnay/rust-toolchain@1.99.0", "dtolnay/rust-toolchain@2.0.0")
+        bad = self.GOOD.replace("dtolnay/rust-toolchain@1.100.0", "dtolnay/rust-toolchain@2.0.0")
         findings = self.findings_for(bad)
-        self.assertTrue(any("toolchain bump" in f.message for f in findings), findings)
+        self.assertTrue(
+            any("update the CI action and rust-toolchain.toml together" in f.message for f in findings),
+            findings,
+        )
+
+    def test_worktree_toolchain_bump_requires_action_ref_and_default(self) -> None:
+        findings = self.findings_for(self.GOOD, channel="1.101.0")
+        self.assertTrue(any("rust-toolchain@1.101.0" in f.message for f in findings), findings)
+        self.assertTrue(any("default to '1.101.0'" in f.message for f in findings), findings)
+
+    def test_rolling_worktree_toolchain_fails(self) -> None:
+        findings = self.findings_for(self.GOOD, channel="stable")
+        self.assertTrue(any("exact compiler release" in f.message for f in findings), findings)
 
     def test_composite_level_env_fails(self) -> None:
         bad = self.GOOD.replace("  steps:\n", "  env:\n    CARGO_INCREMENTAL: '0'\n  steps:\n", 1)

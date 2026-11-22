@@ -440,7 +440,6 @@ impl RaptorCompactor {
 
     /// Create row group from vector list
     #[allow(dead_code)]
-    #[allow(dead_code)]
     fn create_row_group_from_vectors(&self, vectors: Vec<VectorRecord>) -> RowGroup {
         let mut row_group = RowGroup::new(0);
         row_group.vector_count = vectors.len();

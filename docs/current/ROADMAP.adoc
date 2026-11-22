@@ -1,6 +1,6 @@
 = Release roadmap
 :toc:
-:last-updated: 2026-10-26
+:last-updated: 2026-11-21
 
 Release ordering and exit criteria live here. link:TRACKER.adoc[Tracker] owns delivery status
 and session ownership; the plans own implementation contracts. TDs retain issue-level detail.
@@ -71,7 +71,7 @@ remain dependent designs until their failure/recovery proofs exist.
 | TD-TIER-1, TD-PAXDIR-2, TD-OBJSTORE-1, TD-WAL-2
 
 | Native table provider by default
-| Window functions and ABAC behave the same for every session.
+| Through pgwire the native streaming provider returns the same typed answers for windows and joins over fresh and published rows. Policy, delete visibility and memory bounds hold under the default-on soak.
 | TD-USUB-2, TD-USUB-3
 
 | Tenant safety on every surface
@@ -146,8 +146,12 @@ the one canonical record.
 | TD-OBJSTORE-1, MVP corridor
 
 | Scan and cache economics
-| SIFT1M cache acceptance, IVF training, streaming compaction and the SF1/SF10 analytical ledger recorded with dated evidence. Compare direct object reads against optional disk admission over one job and repeated jobs, charging idle provisioned disks and lost-cache restarts; no cache default from query count alone.
-| TD-CACHE-9, TD-IVF-2, TD-COMPACT-2, TD-COMPACT-10, TD-COMPACT-11, TD-OLAP-2, TD-OLAP-4, TD-OLAP-11
+| SIFT1M cache acceptance, IVF training and streaming compaction recorded with dated evidence. Compare direct object reads against optional disk admission over one job and repeated jobs, charging idle provisioned disks and lost-cache restarts; no cache default from query count alone.
+| TD-CACHE-9, TD-IVF-2, TD-COMPACT-2, TD-COMPACT-10, TD-COMPACT-11
+
+| Analytical SQL and open-table evidence (P6)
+| Use the completed local SF1 Iceberg, NDJSON and Delta typed-answer and ordering checks as the correctness baseline. Attribute load, open and scan costs on an admitted small run. Compare the native control, streaming Layer A and published Parquet providers. Compare existing UniForm v2/v3 projections with their pinned Delta inputs. Advance to matched, bounded release runs at SF1 then SF10 on suitable hardware. Publish latency, I/O, memory and coverage for each regime.
+| TD-119, TD-OLAP-2, TD-OLAP-4, TD-OLAP-5, TD-OLAP-11
 
 | Storage layout
 | Background compaction runs live; point reads avoid scan-sized I/O; one cache and tier policy.
@@ -192,13 +196,17 @@ Supported.
 
 == Later (ordered, after v1.0)
 
-. **Scale out**: distributed transport and failover verification (TD-077), then replication and
-  multi-node failure-injection validation, then elastic compute modes (TD-089).
+. **Scale out**: reuse qualified local splits and operators in a Ballista submission trial.
+  Require equivalent results under worker loss and fenced retry before promoting a remote
+  route. TD-077 governs transport and failover verification, followed by replication and
+  multi-node failure injection, then elastic compute modes (TD-089).
 . **Agent memory**: write surface, framework adapters, branching, and the neutral fusion core
   (TD-101, TD-102, TD-117, TD-136, TD-137).
 . **Time-series, events and observability** graduate as projections of the canonical record
   (TD-063); time travel by LSN (TD-116).
 . **Lineage** hooks for vector, document and graph writes, beyond MLOps (TD-MLOPS-1).
-. **Broader interoperability**: Spark/Trino certification beyond the immediate v3 read-back gate (TD-119), Lance (TD-091),
-  Spark and Hadoop connectors (TD-097, TD-099), external collections residual (TD-090).
+. **Broader interoperability**: after the bounded read experiments, qualify direct Delta
+  reads for tables without a usable Iceberg projection, raw-file ingestion and single-target
+  backfill recovery. Spark/Trino certification (TD-119), Lance (TD-091), Spark/Hadoop
+  connectors (TD-097, TD-099) and external collections (TD-090) retain their own gates.
 . **In-database inference** and **billion-scale vector indexes** (DiskANN, after TD-064).
