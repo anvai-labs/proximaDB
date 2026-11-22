@@ -3,14 +3,12 @@
 
 import argparse
 import csv
-from itertools import pairwise
 from pathlib import Path
 
 import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from matplotlib.ticker import FuncFormatter
 from pax_scale_wire_report import (
     DFS_READ_UNIT,
     RATE_CARD,
@@ -19,21 +17,7 @@ from pax_scale_wire_report import (
 )
 
 ROOT = Path(__file__).resolve().parents[2]
-PROFILES = {
-    "AWS S3": [
-        ("s3", "Standard"),
-        ("s3_ia", "Standard-IA"),
-        ("s3_gir", "Glacier Instant Retrieval"),
-    ],
-    "Azure Blob": [("blob", "Hot"), ("blob_cool", "Cool"), ("blob_cold", "Cold")],
-    "Azure DFS": [("dfs", "Hot"), ("dfs_cool", "Cool"), ("dfs_cold", "Cold")],
-    "Google Cloud Storage": [
-        ("gcs", "Standard"),
-        ("gcs_nearline", "Nearline"),
-        ("gcs_coldline", "Coldline"),
-        ("gcs_archive", "Archive"),
-    ],
-}
+HOT_LABEL = "S3 Standard / Azure Blob Hot (abfs://) / GCS Standard"
 COLORS = ["#086b71", "#be5d0b", "#5756a4", "#a13560"]
 QPS = 100
 
@@ -50,7 +34,9 @@ def save(fig, dest, name):
     path = dest / f"pax-{name}.svg"
     fig.savefig(path, metadata={"Date": None}, bbox_inches="tight")
     # Matplotlib leaves trailing spaces in multiline SVG paths.
-    path.write_text("\n".join(line.rstrip() for line in path.read_text().splitlines()) + "\n")
+    path.write_text(
+        "\n".join(line.rstrip() for line in path.read_text().splitlines()) + "\n"
+    )
     plt.close(fig)
 
 
@@ -92,79 +78,74 @@ def recall_plot(anns, exact, dest):
     save(fig, dest, "iops-recall")
 
 
+def hot_costs(rows):
+    """Draw the shared price only while the three serving endpoints agree."""
+
+    def series(key):
+        return [float(r[key + "_total_usd_per_m_queries"]) for r in rows]
+
+    flat = series("s3")
+    if any(series(k) != flat for k in ("blob", "gcs")):
+        raise ValueError("hot endpoint prices diverged; show individual curves")
+    return flat
+
+
 def tier_plot(r, dest):
-    fig, (left, right) = plt.subplots(
-        1, 2, sharey=True, figsize=(11.4, 6.6), layout="constrained"
+    fig, axes = plt.subplots(1, 2, figsize=(8.3, 3.1), layout="constrained")
+    costs = [float(r["s3_" + op + "_usd_per_m_queries"]) for op in ("get", "list")]
+    counts = [QPS * float(r["wire_" + op]) for op in ("get", "list")]
+    total = hot_costs([r])[0]
+    for ax, values, title in zip(
+        axes,
+        [counts, costs],
+        ["Object operations / second", "USD / million searches"],
+        strict=True,
+    ):
+        bars = ax.bar(["GET", "LIST"], values, color=COLORS[:2], width=0.55)
+        ax.bar_label(
+            bars, labels=[f"{v:,.0f}" if ax is axes[0] else f"${v:.2f}" for v in values]
+        )
+        ax.set(title=title, ylim=(0, max(values) * 1.22))
+    fig.suptitle(
+        f"1M vectors · {sum(counts):,.0f} object IOPS · ${total:.2f}/M searches",
+        weight="bold",
     )
-    labels = []
-    for backend, tiers in PROFILES.items():
-        for key, name in tiers:
-            y = len(labels)
-            labels.append(f"{backend}  ·  {name}")
-            cost = float(r[key + "_total_usd_per_m_queries"])
-            wire = ops(r) * QPS
-            read_units = float(
-                r["modeled_dfs_read_units"] if backend == "Azure DFS" else r["wire_get"]
-            )
-            billable = QPS * (
-                read_units + float(r["wire_list"]) + float(r["wire_head"])
-            )
-            left.scatter(
-                wire, y, s=56, facecolors="none", edgecolors=COLORS[0], zorder=4
-            )
-            left.scatter(billable, y, marker="x", color=COLORS[1], zorder=3)
-            right.scatter(cost, y, color=COLORS[0], s=36)
-            right.annotate(
-                f"${cost:,.2f}",
-                (cost, y),
-                xytext=(7, -3),
-                textcoords="offset points",
-                size=8,
-            )
-    left.set_yticks(range(len(labels)), labels)
-    left.invert_yaxis()
-    left.set(xlabel="Operations / second at 100 searches/s", xlim=(1770, 2370))
-    left.set_xticks([1900, 2100, 2240])
-    right.set(xscale="log", xlim=(8, 8500), xlabel="USD / million searches (log scale)")
-    right.xaxis.set_major_formatter(FuncFormatter(lambda x, _: f"${x:,.0f}"))
-    fig.suptitle("1M vectors · cold ANN by storage tier", weight="bold")
     fig.text(
         0.5,
-        -0.02,
-        "○  Wire IOPS     ×  Modeled billed units/s     •  USD from Blob trace replay, including retrieval\n8 MiB merge cap   ·   Hot Azure account / Standard-default GCS bucket",
+        -0.035,
+        HOT_LABEL + " · cold ANN · 100 searches/s assumed · 8 MiB merge cap",
         ha="center",
         size=9,
     )
     save(fig, dest, "iops-tier-cost")
 
 
-def scale_plot(anns, dest):
-    fig, axes = plt.subplots(
-        2, 2, figsize=(11, 7.1), sharex=True, sharey=True, layout="constrained"
-    )
+def scale_plot(anns, exact, dest):
+    fig, ax = plt.subplots(figsize=(8.3, 4.2), layout="constrained")
     xs = [int(r["rows"]) for r in anns]
-    for ax, (provider, tiers) in zip(axes.flat, PROFILES.items(), strict=True):
-        for i, (key, name) in enumerate(tiers):
-            values = [float(r[key + "_total_usd_per_m_queries"]) for r in anns]
-            ax.plot(
-                xs,
-                values,
-                color=COLORS[i],
-                marker=["o", "s", "^", "D"][i],
-                markersize=4,
-                label=name,
-            )
-        ax.set(xscale="log", yscale="log", title=provider, ylim=(3.5, 4500))
-        ax.set_xticks(xs, [size_label(n) for n in xs])
-        ax.set_yticks([5, 20, 100, 500, 2500], ["$5", "$20", "$100", "$500", "$2,500"])
-        ax.legend(loc="upper left", fontsize=8)
-    fig.suptitle("Corpus size and cold ANN read cost", weight="bold")
-    fig.supxlabel("Vectors in one collection (log scale)")
-    fig.supylabel("USD / million searches (log scale)")
+    for i, (route, rows) in enumerate((("ANN", anns), ("Exact · one full GET", exact))):
+        values = hot_costs(rows)
+        ax.plot(xs, values, marker=("o", "s")[i], color=COLORS[i], label=route)
+        ax.annotate(
+            f"${values[-1]:.2f}",
+            (xs[-1], values[-1]),
+            xytext=(-6, 7),
+            ha="right",
+            textcoords="offset points",
+        )
+    ax.set(
+        xscale="log",
+        xlabel="Vectors in one collection",
+        ylabel="USD / million searches",
+        title="Cold ANN and exact read cost · " + HOT_LABEL,
+    )
+    ax.set_xticks(xs, [size_label(n) for n in xs])
+    ax.margins(y=0.18)
+    ax.legend()
     fig.text(
         0.5,
-        -0.02,
-        "Blob trace replay with tier rates   ·   128d, 8 MiB cap   ·   Hot Azure account / Standard-default GCS bucket",
+        -0.10,
+        "Hot/Standard minimizes modeled read cost for active PAX segments.\n128d SIFT · 8 MiB ANN merge cap · GET and LIST priced from the Blob trace",
         ha="center",
         size=9,
     )
@@ -225,19 +206,7 @@ def dimension_plots(model, dest):
             color=COLORS[i],
             label=label,
         )
-        for j, (profile, tier) in enumerate(
-            (("s3", "S3 Standard"), ("s3_ia", "S3 Standard-IA"), ("dfs", "DFS Hot"))
-        ):
-            if i and profile == "dfs":
-                continue  # Aligned windows have the same billed units at every width.
-            right.plot(
-                DIMENSIONS,
-                [r[profile + "_total_usd_per_m_queries"] for r in rs],
-                color=COLORS[j],
-                linestyle=("--" if i else "-"),
-                marker=".",
-                label=(tier + " · both" if profile == "dfs" else tier + " · " + label),
-            )
+        right.plot(DIMENSIONS, hot_costs(rs), color=COLORS[i], marker=".", label=label)
     left.set(
         title="HTTP IOPS at 100 searches/s", yscale="log", ylabel="Operations / second"
     )
@@ -249,54 +218,56 @@ def dimension_plots(model, dest):
         ax.tick_params(axis="x", labelrotation=32, labelsize=8)
         ax.legend(fontsize=8)
     fig.suptitle(
-        "1M vectors · dimension sensitivity of two exact read plans", weight="bold"
+        "1M vectors · two exact read plans on hot object storage", weight="bold"
     )
     fig.text(
         0.5,
         -0.025,
-        "Model at 128d steps   ·   single cold segment, one LIST   ·   ranges cover identical data   ·   128d file size measured",
+        HOT_LABEL + " · one LIST · both plans read identical data",
         ha="center",
         size=9,
     )
     save(fig, dest, "cost-iops-dimension")
 
-    fig, axes = plt.subplots(
-        1, 3, figsize=(13.8, 4.6), sharex=True, sharey=True, layout="constrained"
-    )
+    fig, ax = plt.subplots(figsize=(9.4, 4.9), layout="constrained")
     cmap = plt.get_cmap("viridis")
     norm = matplotlib.colors.Normalize(vmin=128, vmax=1536)
-    examples = (
-        ("s3", "S3 Standard"),
-        ("dfs", "Azure DFS Hot"),
-        ("gcs_coldline", "GCS Coldline"),
+    for d in DIMENSIONS:
+        rows = [r for r in model if r["dimensions"] == d and r["plan"] == "8MiB_ranges"]
+        xs = [r["rows"] for r in rows]
+        ax.plot(xs, hot_costs(rows), marker=".", linewidth=1.3, color=cmap(norm(d)))
+    whole = [r for r in model if r["plan"] == "whole"]
+    totals = set(hot_costs(whole))
+    if len(totals) != 1:
+        raise ValueError("whole-read prices vary by dimension or corpus; split curves")
+    price = totals.pop()
+    ax.axhline(
+        price,
+        linestyle="--",
+        color="#97420d",
+        lw=2,
+        label=f"Single GET · ${price:.2f} at every width",
     )
-    for ax, (profile, name) in zip(axes, examples, strict=True):
-        for d in DIMENSIONS:
-            rows = [r for r in model if r["dimensions"] == d and r["plan"] == "whole"]
-            xs = [r["rows"] for r in rows]
-            ax.plot(
-                xs,
-                [r[profile + "_total_usd_per_m_queries"] for r in rows],
-                marker=".",
-                linewidth=1.2,
-                color=cmap(norm(d)),
-            )
-        ax.set(xscale="log", yscale="log", title=name)
-        ax.set_xticks(xs, [size_label(n) for n in xs], fontsize=8)
-    axes[0].set_ylabel("USD / million searches (log scale)")
-    axes[0].text(0.04, 0.12, "All widths coincide", transform=axes[0].transAxes, size=9)
+    ax.legend(loc="upper left")
+    ax.set(
+        xscale="log",
+        yscale="log",
+        xlabel="Vectors in one collection",
+        ylabel="USD / million searches (log scale)",
+        title="Exact scan cost by corpus size and dimension · " + HOT_LABEL,
+    )
+    ax.set_xticks(xs, [size_label(n) for n in xs])
+    ax.set_ylim(bottom=4.0)
     fig.colorbar(
         matplotlib.cm.ScalarMappable(norm=norm, cmap=cmap),
-        ax=axes,
+        ax=ax,
         ticks=DIMENSIONS,
-        label="Dimensions",
+        label="Dimensions · 8 MiB range plan",
     )
-    fig.supxlabel("Vectors in one collection (log scale)")
-    fig.suptitle("Whole-object exact · corpus size and dimension", weight="bold")
     fig.text(
         0.5,
-        -0.03,
-        "One cold LIST + one object GET   ·   128–1536d, step 128   ·   f32 + SQ8 + 1-bit tiers   ·   fixed non-vector overhead per corpus",
+        -0.055,
+        "One cold LIST per search. Both plans read the entire object. More 8 MiB GETs raise request cost.",
         ha="center",
         size=9,
     )
@@ -309,36 +280,36 @@ def cache_plot(groups, dest):
         for r in groups
         if r["rows"] == "1000000" and r["route"] == "ann" and r["cap_mib"] == "8"
     }
-    fig, axes = plt.subplots(
-        1, 2, figsize=(9.8, 4.2), layout="constrained", sharey=True
-    )
-    for ax, (profile, label) in zip(
-        axes, (("s3", "S3 Standard"), ("dfs", "Azure DFS Hot")), strict=True
+    fig, ax = plt.subplots(figsize=(8.3, 4.0), layout="constrained")
+    cold = hot_costs([rows["cold"]])[0]
+    for i, (phase, title) in enumerate(
+        (("l1_repeat", "DRAM repeat"), ("l2_reopen", "Disk-cache reopen"))
     ):
-        key = profile + "_total_usd_per_m_queries"
-        cold = float(rows["cold"][key])
-        for i, (phase, title) in enumerate(
-            (("l1_repeat", "DRAM repeat"), ("l2_reopen", "Disk-cache reopen"))
-        ):
-            warm = float(rows[phase][key])
-            ax.plot([0, 100], [warm, cold], color=COLORS[i], marker="o", label=title)
-            ax.annotate(
-                f"${warm:.2f}",
-                (0, warm),
-                xytext=(5, 5),
-                textcoords="offset points",
-                size=8,
-            )
-        ax.set(
-            title=label, xlabel="Cold queries in mix (%)", xlim=(-3, 104), ylim=(0, 20)
+        warm = hot_costs([rows[phase]])[0]
+        ax.plot([0, 100], [warm, cold], color=COLORS[i], marker="o", label=title)
+        ax.annotate(
+            f"${warm:.2f}", (0, warm), xytext=(5, 7), textcoords="offset points"
         )
-        ax.legend(loc="upper left", fontsize=8)
-    axes[0].set_ylabel("USD / million searches")
-    fig.suptitle("1M vectors · what a process restart costs", weight="bold")
+    ax.annotate(
+        f"${cold:.2f}",
+        (100, cold),
+        xytext=(-5, 6),
+        ha="right",
+        textcoords="offset points",
+    )
+    ax.set(
+        title="1M vectors · cost as the share of cold searches grows",
+        xlabel="Searches starting cold (%)",
+        ylabel="USD / million searches",
+        xticks=[0, 25, 50, 75, 100],
+        xlim=(-3, 104),
+        ylim=(0, 14),
+    )
+    ax.legend(loc="upper left")
     fig.text(
         0.5,
-        -0.03,
-        "Azurite request counts and bytes   ·   prices and mixes modeled   ·   fresh discovery adds one LIST at reopen",
+        -0.05,
+        HOT_LABEL + " · remaining searches repeat in DRAM or reopen from disk",
         ha="center",
         size=9,
     )
@@ -385,45 +356,46 @@ def publication_plot(dest, rates):
 
 def storage_break_even_plot(ann, exact, dest):
     gib = float(exact["wire_object_bytes"]) / (1 << 30)
-    plans = []
     with (RATE_CARD.parent / "s3_capacity_rates.csv").open() as f:
-        for rate, (key, label) in zip(
-            csv.DictReader(f), PROFILES["AWS S3"], strict=True
-        ):
-            if rate["profile"] != key:
-                raise ValueError("capacity and transaction profiles differ")
-            monthly = gib * float(rate["usd_per_gib_month"])
-            per_search = float(ann[key + "_total_usd_per_m_queries"]) / 1_000_000
-            plans.append((label, monthly, per_search))
-    fig, ax = plt.subplots(figsize=(8.4, 4.3), layout="constrained")
-    for i, (label, monthly, per_search) in enumerate(plans):
-        ax.plot(
-            [0, 35],
-            [100 * monthly, 100 * (monthly + 35 * per_search)],
-            label=label,
-            color=COLORS[i],
-        )
-    for left, right in pairwise(plans):
-        knee = (left[1] - right[1]) / (right[2] - left[2])
-        cost = 100 * (left[1] + knee * left[2])
-        ax.scatter(knee, cost, color="#344454", zorder=3)
-        ax.annotate(
-            f"{knee:.1f} searches",
-            (knee, cost),
-            xytext=(3, 8),
-            textcoords="offset points",
-            size=9,
-        )
+        storage = {
+            r["profile"]: gib * float(r["usd_per_gib_month"]) for r in csv.DictReader(f)
+        }
+    reads = {k: float(ann[k + "_total_usd_per_m_queries"]) / 1_000_000 for k in storage}
+    # Standard becomes the cheapest when it crosses every cheaper-capacity alternative.
+    knee = max(
+        (storage["s3"] - monthly) / (reads[k] - reads["s3"])
+        for k, monthly in storage.items()
+        if k != "s3"
+    )
+    fig, ax = plt.subplots(figsize=(8.2, 3.8), layout="constrained")
+    xs = [0, 35]
+    ax.plot(
+        xs,
+        [100 * (storage["s3"] + x * reads["s3"]) for x in xs],
+        label="S3 Standard · storage + cold reads",
+        color=COLORS[0],
+        lw=2.2,
+    )
+    ax.axvspan(knee, xs[-1], color=COLORS[0], alpha=0.09)
+    ax.axvline(knee, linestyle="--", color=COLORS[0])
+    ax.text(
+        knee + 1,
+        0.85,
+        f"Standard is cheapest above\n{knee:.1f} cold searches/month",
+        transform=ax.get_xaxis_transform(),
+        fontsize=9,
+    )
     ax.set(
         xlabel="Cold ANN searches per month",
         ylabel="US cents / month",
-        title="S3 at 1M vectors · storage savings versus read frequency",
+        xlim=xs,
+        title="S3 Standard · monthly cost for one 1M-vector segment",
     )
-    ax.legend(fontsize=9)
+    ax.legend(loc="lower right", fontsize=9)
     fig.text(
         0.5,
-        -0.03,
-        "One 712.90 MiB object   ·   128d, 8 MiB cap   ·   capacity + LIST + GET + retrieval   ·   retained beyond tier minimums",
+        -0.035,
+        "712.90 MiB · us-east-1 · cold-read mix fixed · retained past alternative tiers’ minimum durations",
         ha="center",
         size=9,
     )
@@ -470,7 +442,7 @@ def main():
     args.output.mkdir(parents=True, exist_ok=True)
     recall_plot(ann, exact, args.output)
     tier_plot(ann[-1], args.output)
-    scale_plot(ann, args.output)
+    scale_plot(ann, exact, args.output)
     rates = load_rate_card()
     model = dimension_model(exact, rates)
     with args.dimension_csv.open("w", newline="") as out:
