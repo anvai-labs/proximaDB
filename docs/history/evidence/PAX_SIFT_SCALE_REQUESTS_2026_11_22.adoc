@@ -1,5 +1,10 @@
 = PAX object reads from 1K to 1M SIFT vectors
 
+These tables are the wire baseline before query-scoped whole-object reuse.
+On the same 1K fixture the shipped reader reduced cold forced ANN and adaptive
+exact from three data GETs to one. Each cold discovery still used one LIST.
+link:PAX_QUERY_BODY_REUSE_2026_11_22.md[Measured reader changes and current defaults].
+
 At 1K through 100K, widening the merge cap from 4 to 32 MiB saved zero
 GETs on this SIFT fixture. At 333K and 1M, 8 MiB captured the entire
 observed reduction. At 1M, the 4→8 change used 56,589 additional bytes
@@ -274,8 +279,9 @@ neighbor during scoring and candidate selection.
 
 == Reproduction and audit
 
-Run from the repository root with the three TEXMEX files and a dedicated
-Azurite container and a shell with PAX tuning overrides unset. Configure
+To remeasure the historical wire traffic, use a disposable worktree containing
+the original reader and the archived benchmark harness. Use the three TEXMEX
+files, a dedicated Azurite container and a shell with PAX tuning overrides unset. Configure
 the Azure filesystem for that local emulator
 and create the `pax-knee` blob container first. The measurement driver
 writes objects below a unique prefix. Stop the disposable emulator after
@@ -284,6 +290,13 @@ and five caps of this ledger.
 
 [source,bash]
 ----
+trace_tree=$(mktemp -d)
+git worktree add --detach "$trace_tree" f0c3b52bd5ff435f98a168b7375087fe36f68fb2
+cd "$trace_tree"
+git restore --source=e692c677a5c88b5449c4ea19aa00f86220b8fd61 -- \
+  tests/sift_pax_recall_ratchet_test.rs tests/sift_pax_recall_ratchet_test/scale_cost.rs \
+  scripts/bench/pax_scale_cost.py scripts/bench/pax_scale_wire_report.py \
+  bench_results/pax_sift_scale_20261122/request_rates.csv
 cargo test --locked --features azure,io-trace --test sift_pax_recall_ratchet_test --no-run
 python3 scripts/bench/pax_scale_cost.py --binary "$SIFT_TEST_BINARY" \
   --dataset "$SIFT_DIR" --storage-url az://pax-knee/ann-scale \

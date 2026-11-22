@@ -1405,16 +1405,21 @@ link:../history/evidence/PAX_SIFT_SCALE_REQUESTS_2026_11_22.adoc[PAX SIFT scale 
 [[small-object-cost]]
 == 10. Price discovery and data reads together
 
-*Recommendation for the MVP.* Keep one LIST-discovered membership set and
-the existing PXCD fact cache. Add a whole-object candidate to the physical
-reader. For a collection whose complete selected PAX bodies fit in an 8 MiB
-aggregate budget, compare fetching each missing object once with the current
-range plan. Evaluate the query from the chosen bytes. Introduce no new
-manifest format for this optimization. This section is a design proposal.
-link:adr/ADR-098-metadata-spine.adoc[Current discovery and metadata authority] and
+*Shipped in #2565.* The reader reuses a complete immutable object when its
+ordinary prefix reaches EOF. An optional limit permits whole-object reads
+up to 8 MiB. The reader reserves at most 8 MiB per query against a shared
+32 MiB pool and preserves the existing LIST discovery and PXCD fact cache.
+One cold 1K search now uses one LIST and one data GET on the measured fixture.
+link:../history/evidence/PAX_QUERY_BODY_REUSE_2026_11_22.md[Implementation, limits and wire evidence].
+
+*Proposed extension.* Compare the aggregate cost of missing bodies across
+a collection with selective range reads. The alternatives below describe
+broader planning and cache admission. A published manifest head requires
+a separate decision on membership authority.
+link:adr/ADR-098-metadata-spine.adoc[Discovery and metadata authority] and
 link:../history/evidence/PAX_OBJECT_STORE_COST_ATLAS_2026_11_22.md[Pricing assumptions, tier comparisons and dimension figures].
 
-=== Why 1K pays for three GETs
+=== Why the baseline issued three GETs at 1K
 
 The 1,000 × 128 fixture is one 748,270-byte object with two blocks, two
 IVF cells and an explicit f32 tier. On a cold process the same LIST found
@@ -1443,7 +1448,7 @@ overhead and the three-tier dimension model, the whole object would occupy
 3.84 MiB at 768d and 7.60 MiB at 1536d. Adding 8 KiB of incompressible
 user data per row would add 7.81 MiB at any width. Use the actual LISTed
 length; dimension gives a useful estimate before the data has been written.
-The 8 MiB read-merge setting, the proposed whole-object working budget, and
+The 8 MiB read-merge setting, the bounded whole-object read budget, and
 the current adaptive f32 admission budget (default 64 MiB plus a row ceiling)
 are independent controls.
 
@@ -1546,11 +1551,16 @@ alone. Saving a larger cold-tier retrieval, a LIST, multiple range GETs or
 CPU time can move the break-even sharply. Local capacity shared with
 another hot collection has an opportunity cost even on a prepaid host.
 
-=== Acceptance before promotion
+=== Evidence required to expand the shipped policy
 
-First replay the 1K and 10K normal flush and direct-writer fixtures with and
+The bounded reader passed the recorded single-object replays and the
+directory-on/off controls for ten normally flushed segments. An 8 MiB
+whole-object read remains opt-in. Before broadening its default or adopting
+the multi-object planner, extend those controls as follows.
+
+Replay the 1K and 10K normal flush and direct-writer fixtures with and
 without a valid directory. On a single ≤8 MiB object, compare a cold
-LIST + one body GET proposal with today's actual path for explicit ANN, exact
+LIST + one body GET plan with the shipped default for explicit ANN, exact
 and adaptive. Prove no subsequent covered subread, identical route-appropriate
 results and complete snapshot visibility. Include a lossy-only object,
 filters, hydrated payloads, partial cache coverage, and 8 MiB ± one byte.
