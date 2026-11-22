@@ -27,7 +27,7 @@ sequenceDiagram
     else SQL error
         Server-->>Sweep: ErrorResponse can arrive first
         Sweep->>Server: Send SELECT 1 on the same connection
-        Server->>Buffer: Publish the failed statement's trace if it bound a source
+        Server->>Buffer: Publish the failed statement's trace for any attempted bind
         Server-->>Sweep: ReadyForQuery for SELECT 1
         Sweep->>Buffer: Take the failed statement's trace if present
     else Deadline, connection loss, or failed synchronization

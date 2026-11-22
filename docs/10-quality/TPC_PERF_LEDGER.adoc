@@ -61,7 +61,7 @@ for the affected and subsequent queries.
 
 image::../assets/benchmarks/tpc-pinned-query-trace.png[Pinned-source trace attribution on success, SQL error, and deadline or connection failure]
 
-link:../assets/benchmarks/tpc-pinned-query-trace.mmd[Mermaid source]
+link:../../scripts/bench/diagrams/tpc-pinned-query-trace.mmd[Mermaid source]
 
 The verifier evaluates the top-level `ORDER BY` against the typed wire rows, applies
 explicit NULL placement or PostgreSQL defaults, and accepts any sequence

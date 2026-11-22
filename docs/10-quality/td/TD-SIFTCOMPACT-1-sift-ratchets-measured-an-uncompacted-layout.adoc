@@ -111,7 +111,7 @@ legitimately never became due for them.
 
 image::../../assets/benchmarks/sift1m-io-cache-measurement.png[SIFT1M search and directory measurements plus the three cache sweep phases]
 
-link:../../assets/benchmarks/sift1m-io-cache-measurement.mmd[Mermaid source]
+link:../../../scripts/bench/diagrams/sift1m-io-cache-measurement.mmd[Mermaid source]
 
 Use the three TEXMEX corpus files `sift_base.fvecs`, `sift_query.fvecs`, and
 `sift_groundtruth.ivecs`. From the repository root, run each test in its own
