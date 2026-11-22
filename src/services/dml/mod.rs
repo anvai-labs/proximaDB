@@ -2225,6 +2225,18 @@ impl DmlService {
         Ok(table_schema)
     }
 
+    pub(crate) async fn resolve_relational_schema_exact(
+        &self,
+        sql_name: &str,
+        tenant: Option<&str>,
+    ) -> Result<CatalogTableSchema> {
+        let (catalog, table_id) = self
+            .catalog_manager
+            .resolve_table_scoped_exact(sql_name, tenant)
+            .await?;
+        Ok(catalog.get_table(&table_id).await?)
+    }
+
     /// FA-c Phase 2: resolve the ABAC row filter for a relational scan. Returns
     /// `None` when enforcement does not apply (no enforcer wired, or no client
     /// subject — e.g. an internal read). Otherwise resolves the subject's

@@ -174,10 +174,7 @@ pub struct QueryExecutionContext {
     pub parquet_tables: Vec<(String, String)>,
     /// Already authorized, pinned external providers for the DataFusion route.
     #[cfg(feature = "datafusion-integration")]
-    pub pinned_external_tables: Vec<(
-        String,
-        Arc<crate::datafusion::engine_adapters::pinned_table::PinnedTable>,
-    )>,
+    pub pinned_external_tables: Vec<(String, Arc<dyn datafusion::datasource::TableProvider>)>,
     /// ADR-058 D5/§9.A: per-table footer-stats trust, keyed by table name
     /// (parallel to `parquet_tables`). Drives whether the DataFusion adapter may
     /// answer COUNT/MIN/MAX from the parquet FOOTER (`Trusted`) or must scan

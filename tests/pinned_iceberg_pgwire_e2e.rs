@@ -659,12 +659,21 @@ async fn pgwire_reads_only_the_authorized_pinned_snapshot() {
     create_delta(&client, "delta_v0", &delta, 0).await;
     create_delta(&client, "delta_v1", &delta, 1).await;
     create_delta(&client, "delta_bad_path", &delta, 2).await;
+    let case_fold = std::env::var_os("PROXIMADB_IDENT_CASE_FOLD");
+    unsafe { std::env::set_var("PROXIMADB_IDENT_CASE_FOLD", "0") };
     create_delta(&client, "\"MixedPinned\"", &delta, 0).await;
+    create_delta(&client, "mixedpinned", &delta, 1).await;
+    unsafe {
+        match case_fold {
+            Some(value) => std::env::set_var("PROXIMADB_IDENT_CASE_FOLD", value),
+            None => std::env::remove_var("PROXIMADB_IDENT_CASE_FOLD"),
+        }
+    }
     for (sql, expected) in [
         ("SELECT id FROM delta_v0 ORDER BY id", &[10, 11, 12][..]),
         ("SELECT id FROM delta_v1 ORDER BY id", &[11, 12][..]),
         (
-            "SELECT id FROM \"MixedPinned\" EXCEPT SELECT id FROM delta_v1 ORDER BY id",
+            "SELECT id FROM \"MixedPinned\" EXCEPT SELECT id FROM MixedPinned ORDER BY id",
             &[10][..],
         ),
         (
@@ -679,6 +688,36 @@ async fn pgwire_reads_only_the_authorized_pinned_snapshot() {
             .unwrap_or_else(|e| panic!("{sql}: {}", pg_error(&e)));
         assert_eq!(delta_rows(&rows), expected, "{sql}");
     }
+    for (sql, name, expected) in [
+        (
+            "SELECT id AS Renamed FROM \"MixedPinned\" WHERE id = 10",
+            "renamed",
+            10i64,
+        ),
+        (
+            "SELECT id AS Renamed FROM mixedpinned WHERE id = 11 AND EXISTS (SELECT 1 FROM \"MixedPinned\")",
+            "renamed",
+            11i64,
+        ),
+        ("SELECT count(*) FROM \"MixedPinned\"", "count(*)", 3i64),
+    ] {
+        let prepared = client.prepare(sql).await.unwrap();
+        assert_eq!(prepared.columns()[0].name(), name);
+        assert_eq!(
+            client
+                .query_one(&prepared, &[])
+                .await
+                .unwrap()
+                .get::<_, i64>(0),
+            expected
+        );
+    }
+    let wildcard = client
+        .prepare("SELECT * FROM MixedPinned WHERE id = 10")
+        .await
+        .unwrap();
+    assert_eq!(wildcard.columns()[0].name(), "id");
+    assert!(client.query(&wildcard, &[]).await.unwrap().is_empty());
     let error = client
         .simple_query("SELECT id FROM delta_bad_path LIMIT 1")
         .await

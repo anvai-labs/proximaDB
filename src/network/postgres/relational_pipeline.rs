@@ -970,7 +970,24 @@ pub async fn try_run_select(
         if !seen_sql_names.insert((raw.as_str(), sql_name.clone())) {
             continue;
         }
-        match dml.resolve_relational_schema(raw, tenant).await {
+        let exact = dml.resolve_relational_schema_exact(&sql_name, tenant).await;
+        let resolved = match exact {
+            Ok(schema)
+                if raw == &sql_name
+                    || schema.storage_layouts.iter().any(is_pinned_external_layout) =>
+            {
+                Ok(schema)
+            }
+            _ => match dml.resolve_relational_schema(raw, tenant).await {
+                Ok(schema) if schema.storage_layouts.iter().any(is_pinned_external_layout) => {
+                    return Some(Err(format!(
+                        "pinned external table {sql_name} does not exist"
+                    )));
+                }
+                other => other,
+            },
+        };
+        match resolved {
             Ok(catalog_schema) => {
                 if catalog_schema
                     .storage_layouts
@@ -993,6 +1010,9 @@ pub async fn try_run_select(
                     continue;
                 }
                 let key = normalize_table_key(raw);
+                if tables.contains_key(&key) {
+                    continue;
+                }
                 #[cfg(feature = "datafusion-integration")]
                 if let Some(location) = catalog_table_is_parquet_backed(&catalog_schema) {
                     if let Some(params) = olap_delta_table_params(&catalog_schema, &location) {
@@ -1008,6 +1028,9 @@ pub async fn try_run_select(
                 tables.insert(key, PreparedTable::from_catalog(raw, &catalog_schema));
             }
             Err(e) => {
+                if tables.contains_key(&normalize_table_key(raw)) {
+                    continue;
+                }
                 tracing::debug!(
                     target: "proximadb::pgwire::new_pipeline",
                     "relational schema resolve for `{raw}` failed: {e}; falling through to legacy"
@@ -1619,7 +1642,8 @@ async fn execute_pinned_external_select(
     use crate::datafusion::engine_adapters::pinned_external;
     use crate::query::table_write_plan::ComputeBackend;
 
-    let mut providers = Vec::with_capacity(pinned.len());
+    let mut providers: Vec<(String, Arc<dyn datafusion::datasource::TableProvider>)> =
+        Vec::with_capacity(pinned.len());
     for (name, schema) in pinned {
         let provider = pinned_external::open_table(&schema, &controls).await;
         controls.check_cancelled().map_err(|e| e.to_string())?;
@@ -3377,6 +3401,25 @@ async fn build_snapshot(
         // identity and composition semantics as normal execution.
         identity: identity.into_owned(),
     })
+}
+
+/// Name the exact scoped inputs for the restricted pinned pgwire route.
+#[cfg(feature = "datafusion-integration")]
+pub(super) fn pinned_query_table_names(sql: &str) -> Option<Vec<String>> {
+    let statements = Parser::parse_sql(&GenericDialect {}, sql).ok()?;
+    let [Statement::Query(query)] = statements.as_slice() else {
+        return None;
+    };
+    if !query_reads_only_bound_relations(query) {
+        return None;
+    }
+    let (_, mut names) = crate::core::utils::collect_query_binding_names(query);
+    if names.is_empty() || names.iter().any(|name| name.contains('.')) {
+        return None;
+    }
+    names.sort_unstable();
+    names.dedup();
+    Some(names)
 }
 
 /// Catalog-free `EXPLAIN SELECT` route (shape only). Reports the Volcano/Native route;

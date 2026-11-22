@@ -7233,28 +7233,53 @@ impl PostgresProtocol {
         let tenant = self.pgwire_resolve_read_tenant().await;
         let tenant = (!tenant.is_empty()).then_some(tenant.as_str());
 
-        let engages_pipeline = super::relational_pipeline::select_engages_relational_engine(query);
-        let projection = super::describe::pipeline_projection(query);
-        let pinned = if !engages_pipeline && let Some(projection) = &projection {
-            dml_service
-                .resolve_relational_schema(&projection.table, tenant)
-                .await
-                .is_ok_and(|schema| {
-                    schema
+        #[cfg(feature = "datafusion-integration")]
+        if self.session.read().await.current_schema() == "public"
+            && let Some(names) = super::relational_pipeline::pinned_query_table_names(query)
+        {
+            let count = names.len();
+            let mut pinned = Vec::new();
+            for name in names {
+                if let Ok(schema) = dml_service
+                    .resolve_relational_schema_exact(&name, tenant)
+                    .await
+                    && schema
                         .storage_layouts
                         .iter()
                         .any(crate::services::ddl::is_pinned_external_layout)
-                })
-        } else {
-            false
-        };
-        if engages_pipeline || pinned {
-            // The pipeline resolves tables in the session's `search_path`
-            // namespace; `describe_select_columns` resolves the default one.
+                {
+                    pinned.push((name, schema));
+                }
+            }
+            if !pinned.is_empty() {
+                if pinned.len() != count {
+                    return DescribedShape::Unknown;
+                }
+                let Ok(columns) = Box::pin(
+                    crate::query::execution::datafusion_engine::describe_pinned_projection(
+                        query, pinned,
+                    ),
+                )
+                .await
+                else {
+                    return DescribedShape::Unknown;
+                };
+                let fields = columns
+                    .into_iter()
+                    .map(|(name, column_type)| {
+                        let ty = super::relational_pipeline::pg_type_for(&column_type);
+                        (FieldDescription::new(&name, ty.clone()), ty)
+                    })
+                    .collect();
+                return DescribedShape::Fields(fields);
+            }
+        }
+        if super::relational_pipeline::select_engages_relational_engine(query) {
+            // The pipeline resolves tables in the session's search-path namespace.
             if self.session.read().await.current_schema() != "public" {
                 return DescribedShape::Unknown;
             }
-            let Some(projection) = projection else {
+            let Some(projection) = super::describe::pipeline_projection(query) else {
                 return DescribedShape::Unknown;
             };
             let sources: Vec<String> = projection

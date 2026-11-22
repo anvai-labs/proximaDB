@@ -25,6 +25,66 @@ use std::collections::{HashMap, VecDeque};
 /// vectorized execution engine.
 pub struct DataFusionLocalEngine;
 
+#[cfg(feature = "datafusion-integration")]
+fn pinned_table_uses_exact_identifier(name: &str) -> bool {
+    name != normalize_table_key(name)
+        || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
+#[cfg(feature = "datafusion-integration")]
+pub(crate) async fn describe_pinned_projection(
+    sql: &str,
+    tables: Vec<(String, proximadb_catalog::CatalogTableSchema)>,
+) -> Result<Vec<(String, proximadb_data_model::ProximaType)>, ExecutionError> {
+    use datafusion::{catalog::empty::EmptyTable, datasource::TableProvider};
+    use std::sync::Arc;
+
+    // Describe uses the same planner as Execute. Register catalog schemas
+    // only, so describing a prepared statement cannot open external data.
+    let pinned_external_tables = tables
+        .into_iter()
+        .map(|(name, table)| {
+            let schema = arrow_schema::Schema::new(
+                table
+                    .columns
+                    .iter()
+                    .map(|column| {
+                        arrow_schema::Field::new(
+                            &column.name,
+                            crate::datafusion::schema_inference::proxima_to_arrow_type(
+                                &column.data_type,
+                            ),
+                            column.nullable,
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+            );
+            let provider: Arc<dyn TableProvider> = Arc::new(EmptyTable::new(Arc::new(schema)));
+            (name, provider)
+        })
+        .collect();
+    let context = QueryExecutionContext {
+        pinned_external_tables,
+        allow_engine_sql_fallback: true,
+        ..Default::default()
+    };
+    let (_, frame) = DataFusionLocalEngine
+        .prepare_datafusion(sql, &context)
+        .await?;
+    Ok(frame
+        .schema()
+        .as_arrow()
+        .fields()
+        .iter()
+        .map(|field| {
+            (
+                field.name().clone(),
+                arrow_type_to_proxima(field.data_type()),
+            )
+        })
+        .collect())
+}
+
 #[async_trait]
 impl ExecutionEngine for DataFusionLocalEngine {
     async fn execute_sql(
@@ -264,10 +324,10 @@ impl DataFusionLocalEngine {
         // TD-OLAP-4: time lowering + logical/physical planning (the other half of
         // the per-query floor, separate from execution).
         let plan_start = std::time::Instant::now();
-        let pinned_requires_exact_names = context.pinned_external_tables.iter().any(|(name, _)| {
-            name != &normalize_table_key(name)
-                || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
-        });
+        let pinned_requires_exact_names = context
+            .pinned_external_tables
+            .iter()
+            .any(|(name, _)| pinned_table_uses_exact_identifier(name));
         let mut schemas: HashMap<String, std::sync::Arc<RelationalSchema>> = HashMap::new();
         for (name, reference) in context
             .parquet_tables
