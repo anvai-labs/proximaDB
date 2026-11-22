@@ -262,6 +262,13 @@ mod tests {
     }
 
     async fn arm(id: &str) -> Arm {
+        arm_with(id, true).await
+    }
+
+    /// With `write_segments`, the arm holds `SEGMENTS` shredded segments and
+    /// a published directory; without, an empty collection directory (the
+    /// flush test ingests through `do_flush`).
+    async fn arm_with(id: &str, write_segments: bool) -> Arm {
         let temp = TempDir::new().unwrap();
         let base = temp.path().to_str().unwrap().to_string();
         let collection = Collection {
@@ -270,6 +277,27 @@ mod tests {
                 name: id.to_string(),
                 dimension: DIM as u32,
                 storage_engine: Some(StorageEngine::Sst as i32),
+                distance_metric: Some(DistanceMetric::Euclidean as i32),
+                // The flush path shreds declared filterable columns only for
+                // ProximaRecord collections (`resolve_flush_shred_spec`).
+                enable_proxima_record: Some(true),
+                filterable_columns: vec![
+                    crate::proto::proximadb_v1::FilterableColumnSpec {
+                        name: "bucket".into(),
+                        data_type:
+                            crate::proto::proximadb_v1::FilterableDataType::FilterableInteger
+                                as i32,
+                        ..Default::default()
+                    },
+                    crate::proto::proximadb_v1::FilterableColumnSpec {
+                        name: "color".into(),
+                        data_type:
+                            crate::proto::proximadb_v1::FilterableDataType::FilterableString
+                                as i32,
+                        ..Default::default()
+                    },
+                ],
+                tags: vec!["compaction:off".to_string()],
                 ..Default::default()
             }),
             storage_assignment: Some(StorageAssignment {
@@ -305,19 +333,21 @@ mod tests {
         );
         let storage_url = ctx.collection_storage_path().unwrap();
         tokio::fs::create_dir_all(&storage_url).await.unwrap();
-        for s in 0..SEGMENTS {
-            write_segment(
-                Path::new(&format!("{storage_url}/seg-{s}.pax")),
-                &segment_records(s, ROWS),
+        if write_segments {
+            for s in 0..SEGMENTS {
+                write_segment(
+                    Path::new(&format!("{storage_url}/seg-{s}.pax")),
+                    &segment_records(s, ROWS),
+                );
+            }
+            let fs = factory.get_filesystem(&storage_url).unwrap();
+            assert!(
+                publish_centroid_directory(fs.as_ref(), &storage_url)
+                    .await
+                    .unwrap()
+                    .is_some()
             );
         }
-        let fs = factory.get_filesystem(&storage_url).unwrap();
-        assert!(
-            publish_centroid_directory(fs.as_ref(), &storage_url)
-                .await
-                .unwrap()
-                .is_some()
-        );
         let arm = Arm {
             _temp: temp,
             engine,
@@ -425,7 +455,10 @@ mod tests {
 
     fn reads_of<'a>(reads: &'a [Read], url: &'a str) -> impl Iterator<Item = &'a Read> + 'a {
         reads.iter().filter(move |r| match r {
-            Read::Whole(p) | Read::Range(p, ..) => p == url,
+            // The engine addresses objects as `file://<path>`.
+            Read::Whole(p) | Read::Range(p, ..) => {
+                p.strip_prefix("file://").unwrap_or(p) == url.strip_prefix("file://").unwrap_or(url)
+            }
         })
     }
 
@@ -592,7 +625,9 @@ mod tests {
         }
         write_segment(Path::new(&arm.segment_url(1)), &records);
         let filter = cmp("bucket", Op::Equals, json!(2));
-        let got = search(&arm, &query(5), &filter).await;
+        // Query AT a rewritten row: it must come back (distance 0).
+        let q = records[3].embeddings[0].as_fp32_cow().to_vec();
+        let got = search(&arm, &q, &filter).await;
         let reads = arm.take_reads();
         let stale = classify(
             &reads,
@@ -615,13 +650,13 @@ mod tests {
             }
         }
         // The rewritten rows are found (they now match), and every hit matches.
-        assert!(got.iter().any(|(id, _)| id.starts_with("s1r")), "{got:?}");
+        assert_eq!(got.first().map(|(id, _)| id.as_str()), Some("s1r3"), "{got:?}");
         assert!(
             got.iter()
                 .all(|(id, _)| id.starts_with("s1r") || id.starts_with("s2r"))
         );
         set_pruning(false);
-        let off = search(&arm, &query(5), &filter).await;
+        let off = search(&arm, &q, &filter).await;
         set_pruning(true);
         assert_eq!(got, off);
     }
@@ -733,5 +768,116 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The production write path: segments flushed through `do_flush` for a
+    /// collection with declared filterable columns carry the prune stats in
+    /// their footers, the flush-time directory publish copies them into v3
+    /// entries, and a filtered query then skips the segments no block of
+    /// which can match — with the answer the kill switch gives.
+    #[tokio::test]
+    #[serial]
+    async fn flushed_segments_publish_prune_stats_and_filtered_queries_skip_segments() {
+        use crate::storage::traits::{FlushParameters, UnifiedStorageEngine};
+        enable_env(false);
+        let arm = arm_with("dbp-flush", false).await;
+        const FLUSHES: usize = 3;
+        for s in 0..FLUSHES {
+            let records: Vec<crate::proto::proximadb_v1::VectorRecord> =
+                segment_records(s, 200)
+                    .into_iter()
+                    .map(|r| {
+                        let mut metadata = HashMap::new();
+                        metadata.insert(
+                            "bucket".to_string(),
+                            crate::proto::proximadb_v1::SqlValue {
+                                value: Some(
+                                    crate::proto::proximadb_v1::sql_value::Value::Int64Value(
+                                        s as i64,
+                                    ),
+                                ),
+                            },
+                        );
+                        if let Some(ProximaTreeNode::Value(PV::String(color))) =
+                            r.props.get("color")
+                        {
+                            metadata.insert(
+                                "color".to_string(),
+                                crate::proto::proximadb_v1::SqlValue {
+                                    value: Some(
+                                        crate::proto::proximadb_v1::sql_value::Value::StringValue(
+                                            color.clone(),
+                                        ),
+                                    ),
+                                },
+                            );
+                        }
+                        crate::proto::proximadb_v1::VectorRecord {
+                            id: r.oid.clone(),
+                            vector: r.embeddings[0].as_fp32_cow().to_vec(),
+                            metadata,
+                            timestamp: Some(1),
+                            version: Some(1),
+                            ..Default::default()
+                        }
+                    })
+                    .collect();
+            let params = FlushParameters {
+                collection_id: Some(arm.collection.id.clone()),
+                vector_records: records.into_iter().map(Into::into).collect(),
+                force: true,
+                synchronous: true,
+                hints: HashMap::new(),
+                timeout_ms: None,
+                trigger_compaction: false,
+                batch_ids: vec![],
+                collection_config: Some(arm.collection.clone()),
+                estimated_size: 0,
+                collection_properties: None,
+            };
+            let result = arm.engine.do_flush(&params).await.expect("flush");
+            assert!(result.success);
+        }
+        // The newest published directory: every flushed segment has a v3 key
+        // whose prune stats summarize its blocks.
+        let fs = arm.engine.filesystem().get_filesystem(&arm.storage_url).unwrap();
+        let dir = crate::storage::engines::sst::centroid_directory_publisher::load_newest_directory(
+            fs.as_ref(),
+            &arm.storage_url,
+        )
+        .await
+        .expect("flush-time publish");
+        let pax: Vec<_> = dir.segments.iter().filter(|s| s.name.ends_with(".pax")).collect();
+        assert_eq!(pax.len(), FLUSHES, "{:?}", dir.segments);
+        for entry in &pax {
+            let key = entry.decode_key.as_ref().expect("keyed entry");
+            let facts = key.filter_facts.as_ref().expect("v3 facts");
+            let stats = facts.prune_stats.as_ref().expect("prune stats from the footer");
+            assert_eq!(stats.block_count(), key.blocks.len());
+            assert!(stats.columns.iter().any(|c| c.name == "bucket"));
+        }
+        arm.take_reads();
+
+        let filter = cmp("bucket", Op::Equals, json!(1));
+        let q = query(77);
+        let trace = Arc::new(crate::observability::io_trace::IoTrace::new());
+        let got = crate::observability::io_trace::scope_with_handle(
+            Arc::clone(&trace),
+            search(&arm, &q, &filter),
+        )
+        .await;
+        let snapshot = trace.snapshot();
+        assert_eq!(snapshot.pax_directory_segments_planned, FLUSHES as u64);
+        assert_eq!(
+            snapshot.pax_directory_segments_pruned,
+            (FLUSHES - 1) as u64,
+            "bucket 0 and 2 segments are skipped"
+        );
+        assert!(!got.is_empty());
+        assert!(got.iter().all(|(id, _)| id.starts_with("s1r")), "{got:?}");
+        set_pruning(false);
+        let off = search(&arm, &q, &filter).await;
+        set_pruning(true);
+        assert_eq!(got, off);
     }
 }

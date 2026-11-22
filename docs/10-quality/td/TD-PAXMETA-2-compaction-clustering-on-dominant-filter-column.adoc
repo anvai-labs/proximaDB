@@ -1,0 +1,43 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-PAXMETA-2: compaction does not cluster on a collection's dominant filter column, so per-block prune bounds only pay off on data that arrives clustered
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open** (filed 2026-11-21 as the named follow-up of the ADR-042 per-block prune statistics PR; out of that PR's scope by decision).
+| Priority | MEDIUM. Correctness is unaffected; the cost is pruning that does not fire.
+| Component | SST compaction record ordering (`src/storage/engines/sst/compaction.rs`, `block_cluster.rs`), collection config (a per-collection dominant filter column), the writer's per-block prune stats (`crates/storage/proximadb-storage-common/src/block_prune_stats.rs`)
+| Relates to | link:../../12-design/adr/ADR-042-canonical-segment-statistics-contract.adoc[ADR-042] (amended 2026-11-20: "compaction may cluster on the collection's dominant filter column, recorded per collection, off by default"), link:TD-PAXMETA-1-collection-level-segment-facts.adoc[TD-PAXMETA-1], link:TD-FPRUNE-3-partition-layout-recall-safe-reenable.adoc[TD-FPRUNE-3] (the tag-aware partition layout that cost unfiltered recall), TD-OLAP-6 (sort-on-materialize cluster keys, the warehouse analogue)
+|===
+
+== Problem
+
+The ADR-042 per-block prune statistics (bounds, null counts, capped distinct sets, string blooms;
+footer section 9, PXCD v3) let a filtered query skip a block or a whole segment without reading
+it. Bounds and distinct sets prune only when a block holds a narrow slice of the filter column's
+values. The writer orders rows by vector locality (the A0/PCA cell order and the block-cluster
+order), not by any scalar column, so an uncorrelated filter column (a tenant tag, a category,
+a timestamp bucket ingested out of order) gives every block nearly the full value range and the
+stats prune nothing. Today pruning pays off only when the data arrives clustered on the filter
+column (time-ordered ingest filtered on time, one tag per flush batch).
+
+== Fix direction
+
+* Record a per-collection **dominant filter column** (off by default) — explicit config, or
+  derived from the filter-column histogram the query path already observes.
+* At compaction, order rows within each coarse cell (or within each output segment when the
+  collection is untrained) by that column before cutting blocks, so blocks hold narrow ranges.
+  Ordering inside a cell keeps the A0 cell extents and the vector-locality contract; ordering
+  across cells is the TD-FPRUNE-3 partition layout, which cost unfiltered recall and is not
+  this change.
+* Gate on evidence: a filtered request-count arm (blocks and segments pruned per query, the
+  directory counters `pax_directory_segments_pruned` / `pax_directory_blocks_pruned`) plus the
+  unfiltered SIFT recall ratchet unchanged.
+
+== Acceptance
+
+. A collection with the column configured prunes ≥ 50% of blocks for a selective equality
+  filter on uncorrelated ingest after one compaction (request counts, file:// and Azurite).
+. Unfiltered recall@10 on the SIFT ratchet within tolerance of the unclustered layout.
+. Off by default; unset leaves compaction output byte-identical.
