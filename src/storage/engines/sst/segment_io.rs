@@ -1705,7 +1705,7 @@ mod tests {
         assert!(
             // plan_segments' final statement: the DirectoryChoice build-up.
             norm(&centroid_reader).ends_with(&norm(
-                "blocks: Mutex::default(),\n                        }),\n                    )\n                })\n            })\n            .collect(),\n    )\n}",
+                "blocks: Mutex::default(),\n                            filtered: None,\n                        }),\n                    )\n                })\n            })\n            .collect(),\n    )\n}",
             )),
             "centroid_directory_reader.rs preparation lost the file's production tail"
         );
