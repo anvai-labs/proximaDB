@@ -277,15 +277,15 @@ impl SystemCatalog {
         let mut collection_floor = 1_u64;
         let mut namespace_alloc = NamespaceIdAllocator::default();
         for (identifier, schema) in state.table_entries() {
-            if let Some(namespace_id) = schema.stable_namespace_id {
-                if let Some(account) = state
+            if let (Some(namespace_id), Some(account)) = (
+                schema.stable_namespace_id,
+                state
                     .get_namespace(&identifier.namespace)
-                    .and_then(|namespace| namespace.tenant_id)
-                {
-                    namespace_alloc
-                        .ids
-                        .insert((account, identifier.namespace.join(".")), namespace_id);
-                }
+                    .and_then(|namespace| namespace.tenant_id),
+            ) {
+                namespace_alloc
+                    .ids
+                    .insert((account, identifier.namespace.join(".")), namespace_id);
             }
             if let Some(collection_id) = schema.stable_collection_id {
                 collection_floor = collection_floor.max(u64::from(collection_id) + 1);
@@ -639,13 +639,14 @@ impl SystemCatalog {
         // switch OFF on a previously-sharded store, the assembled root+shard
         // image is re-seeded onto the legacy whole-image log instead, so the
         // escape never strands the sharded window's data on the root.
-        if (needs_shard_migration || needs_legacy_reseed) && claim_owner {
-            if let Some(cfg) = &catalog.snapshot {
-                let _guard = catalog.write_lock.lock().await;
-                *catalog.pending_shards.lock() = catalog.state.shard_keys();
-                catalog.checkpoint_locked(cfg).await?;
-                catalog.commits_since_snapshot.store(0, Ordering::SeqCst);
-            }
+        if (needs_shard_migration || needs_legacy_reseed)
+            && claim_owner
+            && let Some(cfg) = &catalog.snapshot
+        {
+            let _guard = catalog.write_lock.lock().await;
+            *catalog.pending_shards.lock() = catalog.state.shard_keys();
+            catalog.checkpoint_locked(cfg).await?;
+            catalog.commits_since_snapshot.store(0, Ordering::SeqCst);
         }
         Ok(catalog)
     }
@@ -666,18 +667,17 @@ impl SystemCatalog {
                 .with_context(|| format!("decoding catalog root {}", store.describe()))?;
         let mut shards = Vec::with_capacity(shard_index.len());
         let mut versions = HashMap::with_capacity(shard_index.len());
-        for (account, _root_version) in &shard_index {
-            match store.read_shard(account).await? {
-                Some(read) => {
-                    shards.push((account.clone(), read.bytes));
-                    versions.insert(account.clone(), read.version);
-                }
-                None => tracing::warn!(
+        for account in shard_index.keys() {
+            if let Some(read) = store.read_shard(account).await? {
+                shards.push((account.clone(), read.bytes));
+                versions.insert(account.clone(), read.version);
+            } else {
+                tracing::warn!(
                     account = %account,
                     store = %store.describe(),
                     "catalog root references a shard with no committed log; \
                      skipping it (the root's older version still governs)"
-                ),
+                );
             }
         }
         let state = SystemCatalogState::from_root_and_shards(&root_read.bytes, &shards)?;
@@ -1110,17 +1110,14 @@ impl SystemCatalog {
         // pre-migration deployment, or an owner that has not published yet)
         // the legacy whole-image log still governs — probe that instead.
         if sharded_catalog_snapshots_enabled() && cfg.store.supports_sharded_publish() {
-            match cfg.store.latest_root_version().await? {
-                Some(v) => {
-                    let loaded = self.loaded_version.load(Ordering::SeqCst);
-                    if version_is_newer(loaded, v) {
-                        let _guard = self.write_lock.lock().await;
-                        return self.reload_from_store_locked(cfg).await;
-                    }
-                    return Ok(ReloadOutcome::UpToDate);
+            // No root yet (None): fall through to the legacy whole-image probe.
+            if let Some(v) = cfg.store.latest_root_version().await? {
+                let loaded = self.loaded_version.load(Ordering::SeqCst);
+                if version_is_newer(loaded, v) {
+                    let _guard = self.write_lock.lock().await;
+                    return self.reload_from_store_locked(cfg).await;
                 }
-                // No root yet: fall through to the legacy whole-image probe.
-                None => {}
+                return Ok(ReloadOutcome::UpToDate);
             }
         }
         // Cheap probe first — no payload fetch.
@@ -3889,10 +3886,7 @@ mod tests {
             "reload must not touch the unchanged big shard at all"
         );
         assert!(
-            ledger.get_count_matching(&format!(
-                "_shards/{}",
-                hex_segment("small-tenant")
-            )) >= 1,
+            ledger.get_count_matching(&format!("_shards/{}", hex_segment("small-tenant"))) >= 1,
             "reload fetches the changed small shard"
         );
         assert!(ledger.get_count_matching("_root/") >= 1);
@@ -4237,7 +4231,10 @@ mod tests {
         cat.create_namespace_for_tenant(&acme_ns2, HashMap::new(), Some("acme"))
             .await?;
         let minted = cat
-            .create_table(&TableIdentifier::new(acme_ns2, "people"), vec_schema("people"))
+            .create_table(
+                &TableIdentifier::new(acme_ns2, "people"),
+                vec_schema("people"),
+            )
             .await?;
         assert_eq!(
             minted.stable_namespace_id,
