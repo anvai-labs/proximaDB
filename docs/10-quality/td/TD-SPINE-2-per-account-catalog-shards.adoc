@@ -54,11 +54,49 @@
   row added; default unset = sharded). OFF ⇒ publish + tail revert to the
   legacy whole-image log; a pod booting OFF on a previously-sharded store
   still ASSEMBLES root+shards once (no data loss) and an owner re-seeds the
-  legacy log. **Breaking change (accepted pre-GA, 2026-11-22):** a mixed
-  ON/OFF fleet diverges by design — the escape is fleet-wide. Round-trip per
-  DDL is 2 extra HEAD/LIST probes (shard + root logs) vs 1 on the legacy
+  legacy log. **Flip-flop safety (review HIGH-1, fixed 2026-11-22):** after
+  an OFF window the legacy log is the NEWER authority (its commits carry a
+  higher fencing generation than the stale root's); a boot in EITHER mode
+  reconciles the two logs by fencing generation and ADOPTS the newer image
+  (the ON owner then re-publishes it as root + shards, superseding the
+  stale root) — a DDL dropped/created during the escape window is never
+  resurrected or lost. **Breaking change (accepted pre-GA, 2026-11-22):** a
+  mixed ON/OFF fleet diverges by design — the escape is fleet-wide. Round-trip
+  per DDL is 2 extra HEAD/LIST probes (shard + root logs) vs 1 on the legacy
   path; bytes per DDL drop from O(fleet) to O(account) — the trade ADR-098
   D1.3 chooses.
+* **Version spaces (review HIGH-2, fixed 2026-11-22):** the root and legacy
+  logs number their snapshots independently (each from 0). Reload
+  comparisons are space-aware (`reload_needed`): a pod whose loaded version
+  comes from the OTHER log reloads exactly once on the crossover, so a
+  follower that booted under the legacy log adopts the freshly migrated
+  root at version 0 instead of freezing until the root counter passes the
+  legacy count.
+* **Dropped-id memory across recovery (review MED-1, fixed 2026-11-22):**
+  the whole-image snapshot AND the root carry the per-account namespace-id
+  high-water (`account_ns_high_water`, additive `#[serde(default)]`), so a
+  migration or escape-reseed boot preserves each account's dropped-id
+  reservation. A LEGACY image (no per-account field) recovers it
+  conservatively from the pre-SPINE-2 GLOBAL high-water at decode time —
+  every account that could have minted is bounded by the global max, so a
+  dropped id minted under the global counter is never re-minted; accounts
+  with a genuine per-account record keep their own (lower) floor, and
+  brand-new accounts still start at 1.
+* **Review LOW dispositions (2026-11-22):** LOW-1 fixed (a fenced sharded
+  checkpoint restores the drained pending-shard set before stepping down, so
+  a pod that later reacquires write authority republishes those accounts);
+  LOW-2 FILED as a follow-up — root/shard manifest logs are never pruned
+  (one immutable object per DDL per touched account + the root, forever;
+  at-rest cost grows in GB-months exactly the dimension ADR-098 D1.3
+  trades against — fold into TD-SPINE-3's metadata-GC window);
+  LOW-3 noted — the two env-mutating tests are `#[serial]`, and the
+  non-serial tests that READ the gate do so per call; under nextest's
+  process-per-test isolation the gate is never observed mid-flip (under
+  `cargo test`'s shared process the serial guard alone would not protect
+  parallel readers — run with nextest); LOW-4 documented in code — a boot
+  WARN-skip of a root-referenced-but-absent shard leaves that account absent
+  from RAM until its next DDL, reachable only by external deletion (the
+  publish order shard-then-root never produces a dangling index entry).
 * **System-scope read paths (Fix item 4 inventory).** The in-RAM authority
   stays one unified image (sharding is a persistence concern), so
   `list_namespaces(None)` and `get_namespace_by_object_id` remain

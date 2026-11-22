@@ -187,12 +187,12 @@ struct CatalogInner {
 /// catalog's boot/reload protocol.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IdsHighWater {
-    object_id: u64,
-    collection_id: u32,
+    pub object_id: u64,
+    pub collection_id: u32,
     /// Typed namespace ids (`{n}` of `accounts/{a}/{n}/{c}`), recovered from
     /// table schemas: emptying the highest namespace must not free its id.
     #[serde(default)]
-    namespace_id: u16,
+    pub namespace_id: u16,
 }
 
 impl IdsHighWater {
@@ -424,6 +424,14 @@ struct CatalogSnapshot {
     /// a high-water-aware binary WARNs when it adopts such a snapshot.
     #[serde(default)]
     writer_version: Option<u32>,
+    /// TD-SPINE-2 (review MED-1): per-account namespace-id high-water, so a
+    /// whole-image snapshot (the kill-switch path AND the legacy mixed-read
+    /// source) preserves each account's dropped-id memory. Absent on a
+    /// legacy image ⇒ no per-account record (the allocator then bounds those
+    /// accounts by the legacy GLOBAL high-water — see
+    /// `SystemCatalog::identity_allocator_seed`).
+    #[serde(default)]
+    account_ns_high_water: HashMap<String, u16>,
 }
 
 /// TD-SPINE-2 (ADR-098 D1.3): the shared shard key for namespaces (and their
@@ -432,6 +440,34 @@ struct CatalogSnapshot {
 /// on-storage path is hex-encoded by `DrPathBuilder`, so the reserved-looking
 /// underscore is inert there.
 pub const DEFAULT_SHARD_KEY: &str = "_default";
+
+/// TD-SPINE-2 review MED-1: recover the per-account namespace-id high-water
+/// map of a LEGACY image. Pre-SPINE-2 snapshots/roots carry no per-account
+/// field (the map decodes empty) and every id was minted under the GLOBAL
+/// fleet-wide counter — so any account that could have minted (the registry
+/// plus live namespaces) is conservatively bounded by the global high-water.
+/// Without this, a migration or escape-reseed boot rebuilds each account's
+/// floor from LIVE rows only and can re-mint a dropped namespace's id in
+/// that account, aliasing its stale `accounts/{a}/{n}/…` paths (TD-PATH-2:
+/// "skipped ids are harmless; reuse is not"). A NON-empty map is a
+/// post-SPINE-2 image and is trusted as-is — that is the per-account
+/// minting contract (two accounts may each hold id 1).
+fn recover_legacy_account_ns_high_water(
+    decoded: HashMap<String, u16>,
+    global_namespace_id: Option<u16>,
+    candidate_accounts: std::collections::HashSet<String>,
+) -> HashMap<String, u16> {
+    if !decoded.is_empty() {
+        return decoded;
+    }
+    match global_namespace_id {
+        Some(global) if global > 0 => candidate_accounts
+            .into_iter()
+            .map(|account| (account, global))
+            .collect(),
+        _ => decoded,
+    }
+}
 
 /// TD-SPINE-2 (ADR-098 D1.3): the shard key of a namespace — its owning
 /// account (tenant) when recorded, else the shared default shard. A pure
@@ -463,6 +499,12 @@ struct CatalogRootRecord {
     shard_index: std::collections::BTreeMap<String, u64>,
     #[serde(default)]
     writer_version: Option<u32>,
+    /// TD-SPINE-2 (review MED-1): the per-account namespace-id high-water
+    /// map, so the root — the image a migration or escape reseed rebuilds
+    /// from — preserves each account's dropped-id memory even when a shard
+    /// body is missing. Merged (max) on adoption; never lowers.
+    #[serde(default)]
+    account_ns_high_water: HashMap<String, u16>,
 }
 
 /// TD-SPINE-2 (ADR-098 D1.3): one **account shard** — every namespace,
@@ -723,6 +765,7 @@ impl SystemCatalogState {
             applied_seq: inner.applied_seq,
             ids_high_water: Some(inner.ids_high_water),
             writer_version: Some(proximadb_catalog::IDENTITY_WRITER_VERSION_HIGH_WATER),
+            account_ns_high_water: inner.account_ns_high_water.clone(),
         };
         crate::services::catalog_record_envelope::to_enveloped_vec_named(&snapshot)
             .context("encoding catalog snapshot")
@@ -767,11 +810,27 @@ impl SystemCatalogState {
         let mut tables = HashMap::with_capacity(snapshot.tables.len());
         let mut object_ids = HashMap::with_capacity(snapshot.tables.len());
         let mut ids_high_water = snapshot.ids_high_water.unwrap_or_default();
-        // TD-SPINE-2: whole-image loads rebuild the per-account namespace-id
-        // high-water from the rows (the image carries no per-account field;
-        // shards do). Live rows bound the floor; dropped-id memory for the
-        // whole image lives in the global record + the sidecar.
-        let mut account_ns_high_water: HashMap<String, u16> = HashMap::new();
+        // TD-SPINE-2 (+ review MED-1): whole-image loads rebuild the
+        // per-account namespace-id high-water from BOTH the persisted
+        // per-account map (dropped-id memory, carried since the review fix —
+        // absent on older legacy images) and the live rows (folded below).
+        let mut account_ns_high_water: HashMap<String, u16> = recover_legacy_account_ns_high_water(
+            snapshot.account_ns_high_water,
+            snapshot
+                .ids_high_water
+                .map(|high_water| high_water.namespace_id),
+            snapshot
+                .account_ids
+                .keys()
+                .cloned()
+                .chain(
+                    snapshot
+                        .namespaces
+                        .values()
+                        .map(|ns| shard_key_of_tenant(ns.tenant_id.as_deref())),
+                )
+                .collect(),
+        );
         let namespace_accounts: HashMap<Vec<String>, String> = snapshot
             .namespaces
             .iter()
@@ -886,6 +945,7 @@ impl SystemCatalogState {
             applied_seq: inner.applied_seq,
             shard_index: shard_index.clone(),
             writer_version: Some(proximadb_catalog::IDENTITY_WRITER_VERSION_HIGH_WATER),
+            account_ns_high_water: inner.account_ns_high_water.clone(),
         };
         crate::services::catalog_record_envelope::to_enveloped_vec_named(&root)
             .context("encoding catalog root")
@@ -981,10 +1041,20 @@ impl SystemCatalogState {
             crate::services::catalog_record_envelope::from_enveloped_slice(root_bytes)
                 .context("decoding catalog root")?;
         let mut inner = CatalogInner {
-            account_ids: root.account_ids,
+            account_ids: root.account_ids.clone(),
             applied_seq: root.applied_seq,
             ids_high_water: root.ids_high_water.unwrap_or_default(),
             loaded_writer_version: Some(root.writer_version),
+            // MED-1: the root's per-account high-water seeds dropped-id
+            // memory before shards fold in (apply_shard merges max); an
+            // empty map on a legacy-root-shaped body recovers from the
+            // global high-water.
+            account_ns_high_water: recover_legacy_account_ns_high_water(
+                root.account_ns_high_water,
+                root.ids_high_water
+                    .map(|high_water| high_water.namespace_id),
+                root.account_ids.keys().cloned().collect(),
+            ),
             ..CatalogInner::default()
         };
         for (account, shard_bytes) in shards {
@@ -1020,6 +1090,12 @@ impl SystemCatalogState {
             .merge_max(root.ids_high_water.unwrap_or_default());
         inner.applied_seq = inner.applied_seq.max(root.applied_seq);
         inner.loaded_writer_version = Some(root.writer_version);
+        // MED-1: fold the root's per-account high-water monotonically so a
+        // reload never loses dropped-id memory.
+        for (account, id) in root.account_ns_high_water {
+            let entry = inner.account_ns_high_water.entry(account).or_insert(0);
+            *entry = (*entry).max(id);
+        }
         Ok(())
     }
 
