@@ -284,7 +284,10 @@ tracing = "0.1"
 # unification from the root crate rather than on what they actually read. See
 # TD-SPECORD-1 for the mechanism and the measured cost of a flip.
 serde_json = { version = "1.0", features = ["preserve_order"] }
-sqlx = { version = "0.9", features = ["runtime-tokio", "tls-native-tls", "json", "chrono", "uuid"] }
+# Match object_store's rustls backend on reqwest 0.13. Keep the TLS
+# selection explicit so the embedding clients retain their reqwest 0.12 features.
+reqwest = { version = "0.13", default-features = false, features = ["charset", "json", "rustls"] }
+sqlx = { version = "0.9.1", features = ["runtime-tokio", "tls-native-tls", "json", "chrono", "uuid"] }
 prost = "0.14"
 prost-types = "0.14"
 futures = "0.3"
@@ -613,7 +616,7 @@ http-body-util = "0.1"  # Body utilities for http 1.x (tonic compatibility)
 tower = { version = "0.5", features = ["limit"] }
 tower-http = { version = "0.6", features = ["cors", "trace", "fs", "compression-full", "decompression-full", "timeout"] }
 url = "2.4"
-reqwest = { version = "0.11", features = ["json"] }
+reqwest.workspace = true
 lettre = "0.11"  # Email sending for alert notifications
 
 # OTLP metering push (TD-161 dual-sink, ADR-027). OPTIONAL + default-OFF behind the
@@ -621,7 +624,7 @@ lettre = "0.11"  # Email sending for alert notifications
 # deps); only the external OTLP push pulls these. On the 0.33 line; 0.32 was the
 # first to resolve against the repo's own `tonic 0.14` / `prost 0.14` with NO duplicate
 # gRPC stack (otlp <=0.30 drags in a second tonic 0.12-0.13 + prost 0.13). `grpc-tonic`
-# reuses the existing tonic transport and avoids pulling reqwest 0.12.
+# reuses the existing tonic transport for OTLP.
 opentelemetry = { version = "0.33", optional = true }
 # `rt-tokio` + `experimental_metrics_periodicreader_with_async_runtime` gate
 # `runtime::Tokio` and the async-runtime `PeriodicReader`, which drive export on the
@@ -638,7 +641,7 @@ mime_guess = { version = "2", optional = true }
 memmap2 = "0.9"
 rocksdb = { version = "0.21", optional = true }  # Optional for metadata backend
 tokio-postgres = { version = "0.7", optional = true }  # PostgreSQL client for CDC (experimental-cdc-connectors)
-sqlx = { version = "0.9", features = ["runtime-tokio", "tls-native-tls", "json", "chrono", "uuid"], optional = true }  # OLTP catalog backends (oltp-catalog)
+sqlx = { version = "0.9.1", features = ["runtime-tokio", "tls-native-tls", "json", "chrono", "uuid"], optional = true }  # OLTP catalog backends (oltp-catalog)
 tempfile = "3.0"
 rayon = "1.10"  # Parallel processing for search optimization
 # Parquet and Arrow versions match the DataFusion release line.
@@ -793,8 +796,8 @@ moka = { version = "0.12", features = ["future"] }
 # Language bindings (optional, for embedded mode)
 # Python bindings via PyO3
 # Vendored OpenSSL for the embedded wheel build only (see the `python` feature).
-# `openssl-sys` reaches the tree transitively (sqlx tls-native-tls + reqwest 0.11
-# default-tls). The manylinux wheel container has no system openssl, so the
+# `openssl-sys` reaches the tree through native-tls consumers such as lettre.
+# The manylinux wheel container has no system OpenSSL, so the
 # maturin build fails at link time. Declaring openssl here with `vendored` and
 # gating it under `python` makes only the wheel build compile OpenSSL from source
 # (portable, cross-target-safe); the OSS server build never pulls this dep and

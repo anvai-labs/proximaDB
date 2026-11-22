@@ -356,7 +356,7 @@ impl OidcTokenVerifier {
             })?;
             let cert = reqwest::Certificate::from_pem(pem.as_bytes())
                 .map_err(|e| OidcError::Rejected(format!("bad CA PEM at {ca_path}: {e}")))?;
-            builder = builder.add_root_certificate(cert);
+            builder = builder.tls_certs_merge([cert]);
         }
         let client = builder
             .build()

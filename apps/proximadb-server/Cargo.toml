@@ -72,9 +72,8 @@ gcp = ["proximadb/gcp"]
 # Convenience: all three cloud backends (mirrors the root crate's cloud-full).
 cloud-full = ["aws", "azure", "gcp"]
 # Statically link OpenSSL instead of the system libssl/libcrypto. `openssl-sys`
-# reaches the tree only transitively (reqwest 0.11 / lettre native-tls); the TLS
-# stack and its behaviour are unchanged (native-tls still finds the system CA
-# bundle via openssl-probe). The RELEASE binaries build with it so one archive
+# reaches the tree through native-tls consumers such as lettre. Those clients
+# still locate the system CA bundle through openssl-probe. The RELEASE binaries build with it so one archive
 # runs on every glibc >= 2.28 distro whatever OpenSSL major it ships
 # (scripts/build_portable_linux.sh). Off by default: dev and Docker builds keep
 # the system OpenSSL.
@@ -106,7 +105,7 @@ libc = "0.2"
 
 [dev-dependencies]
 proximadb-queue = { path = "../../crates/horizontal/proximadb-queue" }
-reqwest = { version = "0.11", features = ["json"] }
+reqwest.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
 uuid = { version = "1.0", features = ["v4"] }

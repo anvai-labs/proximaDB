@@ -20,27 +20,24 @@ pub struct NotificationManager {
     /// Registered channels
     channels: RwLock<HashMap<String, NotificationChannel>>,
     /// HTTP client for webhooks
-    client: reqwest::Client,
+    client: std::result::Result<reqwest::Client, reqwest::Error>,
 }
 
 impl NotificationManager {
     /// Create a new notification manager
     pub fn new() -> Self {
-        let client = reqwest::Client::builder()
-            .no_proxy()
-            .build()
-            .unwrap_or_else(|err| {
-                warn!(
-                    "Failed to build no-proxy reqwest client for NotificationManager; falling back to default client: {}",
-                    err
-                );
-                reqwest::Client::new()
-            });
+        let client = reqwest::Client::builder().no_proxy().build();
 
         Self {
             channels: RwLock::new(HashMap::new()),
             client,
         }
+    }
+
+    fn http_client(&self) -> Result<&reqwest::Client> {
+        self.client
+            .as_ref()
+            .map_err(|err| anyhow::anyhow!("Cannot initialize notification HTTP client: {err}"))
     }
 
     /// Register a notification channel
@@ -96,7 +93,7 @@ impl NotificationManager {
             timestamp: chrono::Utc::now().to_rfc3339(),
         };
 
-        let mut request = self.client.post(&config.url);
+        let mut request = self.http_client()?.post(&config.url);
 
         // Add custom headers
         for (key, value) in &config.headers {
@@ -165,7 +162,7 @@ impl NotificationManager {
         });
 
         let response = self
-            .client
+            .http_client()?
             .post(&config.webhook_url)
             .json(&payload)
             .send()
@@ -209,7 +206,7 @@ impl NotificationManager {
         });
 
         let response = self
-            .client
+            .http_client()?
             .post("https://events.pagerduty.com/v2/enqueue")
             .json(&payload)
             .send()
