@@ -667,6 +667,16 @@ impl FilesystemFactory {
         }
     }
 
+    /// Resolve a local location using the configured backend's root rules.
+    pub(crate) fn local_path_identity(&self, location: &str) -> Option<String> {
+        let root = self
+            .config
+            .local
+            .as_ref()
+            .and_then(|config| config.root_dir.as_deref());
+        local::local_path_identity(location, root).ok()
+    }
+
     /// Resolve discovery identity through the selected backend. Unknown local
     /// wrappers bypass caching rather than guessing root semantics. Remote
     /// factories are isolated until stable endpoint-aware identities are wired

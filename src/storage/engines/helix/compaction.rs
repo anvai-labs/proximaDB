@@ -5,7 +5,7 @@
 
 use anyhow::Result;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
@@ -13,7 +13,7 @@ use tracing::{debug, info, warn};
 use crate::proto::proximadb_v1::VectorRecord;
 use crate::storage::common::compaction_orchestrator::FilenameCodec;
 use crate::storage::persistence::filesystem::{
-    FileSystem, caching_filesystem::UnifiedCachingFilesystem,
+    FileSystem, FilesystemFactory, caching_filesystem::UnifiedCachingFilesystem,
 };
 use proximadb_records::ProximaRecord;
 
@@ -29,6 +29,7 @@ pub struct LeveledCompactor {
     config: HelixConfig,
     filesystem: Arc<UnifiedCachingFilesystem>,
     data_dir: PathBuf,
+    factory: Arc<FilesystemFactory>,
     liquid_config: LiquidClusteringConfig,
     query_tracker: Arc<RwLock<QueryPatternTracker>>,
     filename_codec: FilenameCodec,
@@ -40,11 +41,13 @@ impl LeveledCompactor {
         config: HelixConfig,
         filesystem: Arc<UnifiedCachingFilesystem>,
         data_dir: PathBuf,
+        factory: Arc<FilesystemFactory>,
     ) -> Self {
         Self {
             config,
             filesystem,
             data_dir,
+            factory,
             liquid_config: LiquidClusteringConfig::default(),
             query_tracker: Arc::new(RwLock::new(QueryPatternTracker::default())),
             filename_codec: FilenameCodec::new(),
@@ -61,7 +64,7 @@ impl LeveledCompactor {
         // Get L0 files
         let l0_files = {
             let levels_read = levels.read().await;
-            owned(levels_read.get(&0), &self.data_dir)
+            owned(levels_read.get(&0), &self.data_dir, &self.factory)
         };
 
         if l0_files.len() < self.config.level0_file_num_compaction_trigger {
@@ -136,7 +139,7 @@ impl LeveledCompactor {
 
         for (chunk_idx, chunk) in all_records.chunks(target_file_size).enumerate() {
             let filename = self.filename_codec.generate(1, "helix");
-            let file_path = self.data_dir.join(&filename);
+            let file_path = sstable_path(&self.data_dir, &filename);
 
             // Get Hilbert keys for this chunk
             let chunk_start = chunk_idx * target_file_size;
@@ -213,7 +216,7 @@ impl LeveledCompactor {
             // Remove exactly the consumed files. `remove(&0)` also dropped L0
             // files flushed after this compaction's snapshot (e.g. a tombstone
             // file), which search then never saw again.
-            retain_unconsumed(&mut levels_write, 0, &l0_files);
+            retain_unconsumed(&mut levels_write, 0, &l0_files, &self.factory);
 
             debug!(
                 "HELIX Compaction: Adding {} new L1 files to metadata",
@@ -277,7 +280,7 @@ impl LeveledCompactor {
         // In production, implement proper k-way merge with iterators
         for sstable in &l0_files {
             let records = self.read_sstable(&sstable.path).await?;
-            let scope = collection_scope(&sstable.path);
+            let scope = collection_scope(&sstable.path, &self.factory);
 
             // Records are already sorted, just append
             if let Some((min_key, max_key)) = sstable.hilbert_range {
@@ -330,7 +333,7 @@ impl LeveledCompactor {
 
         for (chunk_idx, chunk) in all_records.chunks(target_file_size).enumerate() {
             let filename = self.filename_codec.generate(1, "helix");
-            let file_path = self.data_dir.join(&filename);
+            let file_path = sstable_path(&self.data_dir, &filename);
 
             let chunk_start = chunk_idx * target_file_size;
             let chunk_end = std::cmp::min(chunk_start + chunk.len(), all_keys.len());
@@ -403,7 +406,7 @@ impl LeveledCompactor {
 
         // Remove exactly the consumed files: `remove(&0)` also dropped L0 files
         // flushed after this compaction's snapshot (#2521 review round 4).
-        retain_unconsumed(&mut levels_write, 0, &l0_files);
+        retain_unconsumed(&mut levels_write, 0, &l0_files, &self.factory);
 
         debug!(
             "HELIX Optimized Merge: Adding {} new L1 files to metadata",
@@ -464,8 +467,8 @@ impl LeveledCompactor {
         let (curr_files, next_files) = {
             let levels_read = levels.read().await;
             (
-                owned(levels_read.get(&level), &self.data_dir),
-                owned(levels_read.get(&(level + 1)), &self.data_dir),
+                owned(levels_read.get(&level), &self.data_dir, &self.factory),
+                owned(levels_read.get(&(level + 1)), &self.data_dir, &self.factory),
             )
         };
 
@@ -520,7 +523,7 @@ impl LeveledCompactor {
 
         for (chunk_idx, chunk) in all_records.chunks(target_file_size).enumerate() {
             let filename = self.filename_codec.generate((level + 1) as u32, "helix");
-            let file_path = self.data_dir.join(&filename);
+            let file_path = sstable_path(&self.data_dir, &filename);
 
             // Get Hilbert keys for this chunk
             let chunk_start = chunk_idx * target_file_size;
@@ -591,15 +594,13 @@ impl LeveledCompactor {
         {
             let mut levels_write = levels.write().await;
 
-            // Remove compacted files from current level
-            if let Some(curr_level_files) = levels_write.get_mut(&level) {
-                curr_level_files.retain(|f| !files_to_compact.iter().any(|cf| cf.path == f.path));
-            }
-
-            // Remove compacted files from next level
-            if let Some(next_level_files) = levels_write.get_mut(&(level + 1)) {
-                next_level_files.retain(|f| !files_to_compact.iter().any(|cf| cf.path == f.path));
-            }
+            retain_unconsumed(&mut levels_write, level, &files_to_compact, &self.factory);
+            retain_unconsumed(
+                &mut levels_write,
+                level + 1,
+                &files_to_compact,
+                &self.factory,
+            );
 
             // Add new files to next level
             levels_write.entry(level + 1).or_default().extend(new_files);
@@ -630,10 +631,11 @@ impl LeveledCompactor {
         curr_files: &[SStableMetadata],
         next_files: &[SStableMetadata],
     ) -> Result<Vec<SStableMetadata>> {
-        let mut files_to_compact = Vec::new();
-
-        // Add all current level files
-        files_to_compact.extend_from_slice(curr_files);
+        let mut files_to_compact = curr_files.to_vec();
+        let mut selected: std::collections::HashSet<_> = curr_files
+            .iter()
+            .map(|file| canonical_location(&file.path, &self.factory))
+            .collect();
 
         // Add overlapping files from next level
         for curr_file in curr_files {
@@ -641,9 +643,9 @@ impl LeveledCompactor {
                 for next_file in next_files {
                     if let Some((next_min, next_max)) = next_file.hilbert_range {
                         // Check for overlap
-                        if !(curr_max < next_min
-                            || curr_min > next_max
-                            || files_to_compact.iter().any(|f| f.path == next_file.path))
+                        if curr_max >= next_min
+                            && curr_min <= next_max
+                            && selected.insert(canonical_location(&next_file.path, &self.factory))
                         {
                             files_to_compact.push(next_file.clone());
                         }
@@ -713,7 +715,7 @@ impl LeveledCompactor {
     ) -> Result<(Vec<VectorRecord>, Vec<bool>)> {
         let mut all = Vec::new();
         for path in paths {
-            let scope = collection_scope(path);
+            let scope = collection_scope(path, &self.factory);
             all.extend(
                 self.read_sstable(path)
                     .await?
@@ -778,7 +780,7 @@ impl LeveledCompactor {
         // Get files at max level
         let max_level_files = {
             let levels_read = levels.read().await;
-            owned(levels_read.get(&max_level), &self.data_dir)
+            owned(levels_read.get(&max_level), &self.data_dir, &self.factory)
         };
 
         if max_level_files.is_empty() {
@@ -904,58 +906,80 @@ where
 /// map merged every collection's L0 into the triggering collection's
 /// directory: cross-tenant data movement, a path-isolation violation
 /// (TD-HELIX-COMPACT-SCOPE-1).
-pub(super) fn owns_sstable(data_dir: &std::path::Path, path: &std::path::Path) -> bool {
-    path.parent()
-        .is_some_and(|parent| canonical_location(parent) == canonical_location(data_dir))
+pub(super) fn owns_sstable(data_dir: &Path, path: &Path, factory: &FilesystemFactory) -> bool {
+    sstable_parent(path).is_some_and(|parent| {
+        canonical_location(parent, factory) == collection_directory(data_dir, factory)
+    })
 }
 
-/// One canonical form for a storage location, so the SAME directory compares
-/// equal however it was spelled (#2530 review HIGH-1). Flushed SSTable paths are
-/// built from the raw `data_dir` string (e.g. the default `file://./data`), but
-/// SSTables rediscovered from a directory listing come back as absolute
-/// `file:///abs/...` URLs. Comparing raw forms made every rediscovered file
-/// "not owned", and that collection never compacted again.
-///
-/// `file://` is stripped and relative paths are absolutized (as the local
-/// filesystem's listing does). The Azure scheme aliases (`adls`/`abfs`/`azure`)
-/// fold to `az`, the one flat Blob backend they all resolve to (ADR-036). `.`
-/// components and trailing separators are dropped.
-pub(super) fn canonical_location(location: &std::path::Path) -> std::path::PathBuf {
+/// Normalize local paths through the configured filesystem, and fold only
+/// backend aliases for remote paths. Object keys retain every key byte.
+pub(super) fn canonical_location(location: &Path, factory: &FilesystemFactory) -> String {
     let raw = location.to_string_lossy();
-    let mut s: String = raw.into_owned();
-    // Scheme aliases that resolve to ONE backend fold to the scheme its
-    // listing returns: Azure (`adls`/`abfs`/`azure` -> `az`, ADR-036) and GCS
-    // (`gcs` -> `gs`: `GcsFileSystem::list` returns `gs://`; #2530 review r2).
-    for (alias, canonical) in [
-        ("adls://", "az://"),
-        ("abfs://", "az://"),
-        ("azure://", "az://"),
-        ("gcs://", "gs://"),
-    ] {
-        if let Some(rest) = s.strip_prefix(alias) {
-            s = format!("{canonical}{rest}");
-            break;
-        }
+    if !is_object_location(&raw) {
+        return factory
+            .local_path_identity(&raw)
+            .unwrap_or_else(|| raw.into_owned());
     }
-    let local = match s.strip_prefix("file://") {
-        Some(rest) => Some(rest.to_string()),
-        None if !s.contains("://") => Some(s.clone()),
-        None => None,
-    };
-    let path = match local {
-        Some(p) => {
-            let p = std::path::PathBuf::from(p);
-            if p.is_absolute() {
-                p
-            } else {
-                std::path::absolute(&p).unwrap_or(p)
-            }
+    // The cache also recognizes abfss, which is not a registered backend
+    // alias here. Keep the unsupported spelling distinct.
+    if raw.starts_with("abfss://") {
+        return raw.into_owned();
+    }
+    proximadb_cache::canonical_location(&raw)
+}
+
+fn is_object_location(path: &str) -> bool {
+    path.contains("://") && !path.starts_with("file://")
+}
+
+/// Match the single separator used when forming an SSTable URL.
+pub(super) fn collection_directory(path: &Path, factory: &FilesystemFactory) -> String {
+    if let Some(raw) = path.to_str().filter(|raw| is_object_location(raw)) {
+        return canonical_location(Path::new(raw.strip_suffix('/').unwrap_or(raw)), factory);
+    }
+    canonical_location(path, factory)
+}
+
+pub(super) fn sstable_path(directory: &Path, filename: &str) -> PathBuf {
+    if let Some(raw) = directory.to_str().filter(|raw| is_object_location(raw)) {
+        return PathBuf::from(format!(
+            "{}/{filename}",
+            raw.strip_suffix('/').unwrap_or(raw)
+        ));
+    }
+    directory.join(filename)
+}
+
+fn sstable_parent(path: &Path) -> Option<&Path> {
+    if let Some(raw) = path.to_str().filter(|raw| is_object_location(raw)) {
+        let (scheme, rest) = raw.split_once("://")?;
+        let (parent, filename) = rest.rsplit_once('/')?;
+        if parent.is_empty() || filename.is_empty() {
+            return None;
         }
-        None => std::path::PathBuf::from(s),
-    };
-    path.components()
-        .filter(|c| !matches!(c, std::path::Component::CurDir))
-        .collect()
+        return Some(Path::new(&raw[..scheme.len() + 3 + parent.len()]));
+    }
+    // Strip file:// before using Path::parent, so file:///name keeps the
+    // absolute root and file://name keeps the process-relative root.
+    if let Some(raw) = path.to_str().and_then(|raw| raw.strip_prefix("file://")) {
+        let Some((parent, _)) = raw.rsplit_once('/') else {
+            return Some(Path::new("file://."));
+        };
+        let prefix_len = if parent.is_empty() {
+            8
+        } else {
+            7 + parent.len()
+        };
+        return Some(Path::new(&path.to_str()?[..prefix_len]));
+    }
+    path.parent().map(|parent| {
+        if parent.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            parent
+        }
+    })
 }
 
 /// The L0 compaction trigger for ONE collection: its own L0 files only. The
@@ -964,13 +988,14 @@ pub(super) fn l0_trigger_reached(
     levels: &HashMap<usize, Vec<SStableMetadata>>,
     data_dir: &std::path::Path,
     trigger: usize,
+    factory: &FilesystemFactory,
 ) -> bool {
     levels.get(&0).is_some_and(|l0| {
         // Distinct physical files: the same SSTable may be registered under
         // two spellings (see `owned`).
         l0.iter()
-            .filter(|f| owns_sstable(data_dir, &f.path))
-            .map(|f| canonical_location(&f.path))
+            .filter(|f| owns_sstable(data_dir, &f.path, factory))
+            .map(|f| canonical_location(&f.path, factory))
             .collect::<std::collections::HashSet<_>>()
             .len()
             >= trigger
@@ -992,7 +1017,11 @@ pub(super) async fn acquire_compaction(
 }
 
 /// The files of one level that belong to the collection at `data_dir`.
-fn owned(files: Option<&Vec<SStableMetadata>>, data_dir: &std::path::Path) -> Vec<SStableMetadata> {
+fn owned(
+    files: Option<&Vec<SStableMetadata>>,
+    data_dir: &Path,
+    factory: &FilesystemFactory,
+) -> Vec<SStableMetadata> {
     // One entry per physical file: the level map can hold the same SSTable
     // under two spellings (flushed raw `file://./..` vs rediscovered
     // `file:///abs/..`). Compacting both copies duplicated their records and
@@ -1001,8 +1030,8 @@ fn owned(files: Option<&Vec<SStableMetadata>>, data_dir: &std::path::Path) -> Ve
     files
         .map(|v| {
             v.iter()
-                .filter(|f| owns_sstable(data_dir, &f.path))
-                .filter(|f| seen.insert(canonical_location(&f.path)))
+                .filter(|f| owns_sstable(data_dir, &f.path, factory))
+                .filter(|f| seen.insert(canonical_location(&f.path, factory)))
                 .cloned()
                 .collect()
         })
@@ -1017,15 +1046,16 @@ fn retain_unconsumed(
     levels: &mut HashMap<usize, Vec<SStableMetadata>>,
     level: usize,
     consumed: &[SStableMetadata],
+    factory: &FilesystemFactory,
 ) {
     // Canonical match: every spelling of a consumed file goes (otherwise the
     // other spelling would stay registered, pointing at a deleted file).
-    let consumed: std::collections::HashSet<PathBuf> = consumed
+    let consumed: std::collections::HashSet<String> = consumed
         .iter()
-        .map(|s| canonical_location(&s.path))
+        .map(|s| canonical_location(&s.path, factory))
         .collect();
     if let Some(files) = levels.get_mut(&level) {
-        files.retain(|f| !consumed.contains(&canonical_location(&f.path)));
+        files.retain(|f| !consumed.contains(&canonical_location(&f.path, factory)));
     }
 }
 
@@ -1034,11 +1064,11 @@ fn retain_unconsumed(
 /// (TD-HELIX-COMPACT-SCOPE-1), so a compaction input can mix collections.
 /// Version resolution must never let one collection's copy supersede another
 /// collection's record with the same id (#2521 review round 4).
-fn collection_scope(path: &std::path::Path) -> String {
+fn collection_scope(path: &Path, factory: &FilesystemFactory) -> String {
     // Canonical, so two spellings of one collection directory are ONE scope
     // (#2530 review r2, M-2 probe A).
-    path.parent()
-        .map(|p| canonical_location(p).to_string_lossy().into_owned())
+    sstable_parent(path)
+        .map(|parent| canonical_location(parent, factory))
         .unwrap_or_default()
 }
 
@@ -1094,7 +1124,7 @@ mod tests {
 
         let data_dir = PathBuf::from("/tmp/helix_test");
 
-        let compactor = LeveledCompactor::new(config, filesystem, data_dir);
+        let compactor = LeveledCompactor::new(config, filesystem, data_dir, factory);
         assert!(compactor.liquid_config.enabled);
     }
 
@@ -1150,6 +1180,7 @@ mod tests {
             HelixConfig::default(),
             filesystem.clone(),
             dir.to_path_buf(),
+            factory,
         );
         (compactor, filesystem)
     }
@@ -1233,7 +1264,7 @@ mod tests {
         );
         let mut rows = Vec::new();
         for file in &l1 {
-            let scope = super::collection_scope(&file.path);
+            let scope = super::collection_scope(&file.path, &compactor.factory);
             for r in compactor
                 .read_sstable(&file.path)
                 .await
@@ -1345,8 +1376,9 @@ mod tests {
         }
     }
 
-    #[test]
-    fn retain_unconsumed_keeps_files_registered_after_the_snapshot() {
+    #[tokio::test]
+    async fn retain_unconsumed_keeps_files_registered_after_the_snapshot() {
+        let factory = FilesystemFactory::create(Default::default()).await.unwrap();
         // Round 3/4 HIGH-2: `remove(&0)` dropped L0 files flushed mid-compaction.
         let meta = |name: &str| SStableMetadata {
             path: PathBuf::from(name),
@@ -1360,7 +1392,7 @@ mod tests {
         };
         let consumed = vec![meta("a"), meta("b")];
         let mut levels = HashMap::from([(0_usize, vec![meta("a"), meta("late"), meta("b")])]);
-        super::retain_unconsumed(&mut levels, 0, &consumed);
+        super::retain_unconsumed(&mut levels, 0, &consumed, &factory);
         let left: Vec<_> = levels[&0].iter().map(|f| f.path.clone()).collect();
         assert_eq!(left, vec![PathBuf::from("late")]);
     }
@@ -1446,25 +1478,30 @@ mod tests {
         );
     }
 
-    #[test]
-    fn owns_sstable_is_exact_per_collection_directory() {
+    #[tokio::test]
+    async fn owns_sstable_is_exact_per_collection_directory() {
+        let factory = FilesystemFactory::create(Default::default()).await.unwrap();
         use std::path::Path;
         let dir = Path::new("/data/t1/ns/coll_1");
         assert!(super::owns_sstable(
             dir,
-            Path::new("/data/t1/ns/coll_1/L0_a.helix")
+            Path::new("/data/t1/ns/coll_1/L0_a.helix"),
+            &factory
         ));
         assert!(!super::owns_sstable(
             dir,
-            Path::new("/data/t1/ns/coll_10/L0_a.helix")
+            Path::new("/data/t1/ns/coll_10/L0_a.helix"),
+            &factory
         ));
         assert!(!super::owns_sstable(
             dir,
-            Path::new("/data/t2/ns/coll_1/L0_a.helix")
+            Path::new("/data/t2/ns/coll_1/L0_a.helix"),
+            &factory
         ));
         assert!(!super::owns_sstable(
             dir,
-            Path::new("/data/t1/ns/coll_1/__model/x.helix")
+            Path::new("/data/t1/ns/coll_1/__model/x.helix"),
+            &factory
         ));
     }
 
@@ -1540,7 +1577,7 @@ mod tests {
             );
             for f in &l1 {
                 assert!(
-                    super::owns_sstable(&dir_a, &f.path),
+                    super::owns_sstable(&dir_a, &f.path, &compactor.factory),
                     "[sorted={sorted}] an output landed outside A's directory: {}",
                     f.path.display()
                 );
@@ -1561,8 +1598,9 @@ mod tests {
         }
     }
 
-    #[test]
-    fn owns_sstable_matches_rediscovered_files_in_every_data_dir_form() {
+    #[tokio::test]
+    async fn owns_sstable_matches_rediscovered_files_in_every_data_dir_form() {
+        let factory = FilesystemFactory::create(Default::default()).await.unwrap();
         // #2530 review HIGH-1: rediscovered SSTables come back as absolute
         // `file://` URLs, whatever form the collection's data_dir was written
         // in. The default storage URL is the RELATIVE `file://./data`.
@@ -1579,36 +1617,106 @@ mod tests {
             abs.display().to_string(),
         ] {
             assert!(
-                super::owns_sstable(Path::new(&data_dir), &discovered),
+                super::owns_sstable(Path::new(&data_dir), &discovered, &factory),
                 "data_dir {data_dir} must own {}",
                 discovered.display()
             );
         }
         // Flushed form (built from the raw data_dir) still matches.
         let raw = Path::new("file://./rel_data/c1");
-        assert!(super::owns_sstable(raw, &raw.join("L0_y.helix")));
+        assert!(super::owns_sstable(raw, &raw.join("L0_y.helix"), &factory));
         // Still exact: another collection is never owned.
         assert!(!super::owns_sstable(
             Path::new("file://./rel_data/c1"),
             &PathBuf::from(format!(
                 "file://{}/L0_x.helix",
                 cwd.join("rel_data").join("c10").display()
-            ))
+            )),
+            &factory
         ));
         // Azure aliases resolve to the one flat Blob backend.
         assert!(super::owns_sstable(
             Path::new("adls://cont/t/ns/c1/data"),
-            Path::new("az://cont/t/ns/c1/data/L0_z.helix")
+            Path::new("az://cont/t/ns/c1/data/L0_z.helix"),
+            &factory
         ));
         // GCS: `gcs://` is registered alongside `gs://`, and listing returns `gs://`.
         assert!(super::owns_sstable(
             Path::new("gcs://bucket/t/ns/c1/data"),
-            Path::new("gs://bucket/t/ns/c1/data/L0_z.helix")
+            Path::new("gs://bucket/t/ns/c1/data/L0_z.helix"),
+            &factory
         ));
     }
 
-    #[test]
-    fn l0_trigger_counts_only_the_collections_own_files_in_any_form() {
+    #[tokio::test]
+    async fn ownership_matches_local_root_and_preserves_object_key_bytes() -> Result<()> {
+        use crate::storage::persistence::filesystem::{FilesystemConfig, local::LocalConfig};
+        let root = tempfile::tempdir()?;
+        let factory = FilesystemFactory::create(FilesystemConfig {
+            local: Some(LocalConfig {
+                root_dir: Some(root.path().to_path_buf()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .await?;
+
+        let rooted = root.path().join("c/L0.helix");
+        assert!(owns_sstable(Path::new("c"), &rooted, &factory));
+        assert!(!owns_sstable(Path::new("file://c"), &rooted, &factory));
+        #[cfg(unix)]
+        assert!(owns_sstable(
+            Path::new("/"),
+            Path::new("file:///L0.helix"),
+            &factory
+        ));
+
+        let with_slash = Path::new("gs://bucket/a//c/L0.helix");
+        assert_eq!(
+            sstable_path(Path::new("gs://bucket/a//c/"), "L0.helix").to_str(),
+            with_slash.to_str(),
+        );
+        let with_dot = Path::new("gs://bucket/a/./c/L0.helix");
+        let plain = Path::new("gs://bucket/a/c/L0.helix");
+        assert!(owns_sstable(
+            Path::new("gcs://bucket/a//c"),
+            with_slash,
+            &factory
+        ));
+        assert!(!owns_sstable(
+            Path::new("gcs://bucket/a/c"),
+            with_slash,
+            &factory
+        ));
+        assert!(!owns_sstable(
+            Path::new("gs://bucket/a/c"),
+            with_dot,
+            &factory
+        ));
+        assert_ne!(
+            canonical_location(with_slash, &factory),
+            canonical_location(plain, &factory)
+        );
+        assert_ne!(
+            collection_scope(with_dot, &factory),
+            collection_scope(plain, &factory)
+        );
+        assert!(owns_sstable(
+            Path::new("gs://bucket/d//"),
+            Path::new("gs://bucket/d//L0.helix"),
+            &factory
+        ));
+        assert!(!owns_sstable(
+            Path::new("gs://bucket/d/"),
+            Path::new("gs://bucket/d//L0.helix"),
+            &factory
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn l0_trigger_counts_only_the_collections_own_files_in_any_form() {
+        let factory = FilesystemFactory::create(Default::default()).await.unwrap();
         // Round review MEDIUM-1 (M3): the trigger must count only this
         // collection, including its rediscovered (URL-form) files.
         let meta = |p: &str| SStableMetadata {
@@ -1630,11 +1738,11 @@ mod tests {
         l0.extend((0..5).map(|i| meta(&format!("/d/t2/c9/{i}.helix"))));
         let levels = HashMap::from([(0_usize, l0)]);
         assert!(
-            !super::l0_trigger_reached(&levels, dir, 4),
+            !super::l0_trigger_reached(&levels, dir, 4, &factory),
             "3 own files < 4 (others ignored)"
         );
         assert!(
-            super::l0_trigger_reached(&levels, dir, 3),
+            super::l0_trigger_reached(&levels, dir, 3, &factory),
             "rediscovered URL form counts"
         );
     }
@@ -1686,16 +1794,16 @@ mod tests {
         // are scoped to the collection; so is the size-ratio trigger (#2530 r2
         // L-2: m7/m8/m9 survived without these).
         assert!(
-            engine
-                .contains("files.retain(|f| !compaction::owns_sstable(&collection_dir, &f.path))"),
+            engine.contains("files.retain(|f| !owns_collection_file(&f.path))"),
             "do_compact must invalidate only its own collection's entries"
         );
         assert!(
-            engine.contains(".filter(|f| compaction::owns_sstable(&collection_dir, &f.path))"),
+            engine.contains(".filter(|f| owns_collection_file(&f.path))"),
             "do_compact must invalidate only its own collection's optimizer entries"
         );
         assert!(
-            engine.contains(".filter(|f| compaction::owns_sstable(data_dir, &f.path))"),
+            engine
+                .contains("compaction::owns_sstable(data_dir, &f.path, &self.filesystem_factory)"),
             "the size-ratio trigger must count only this collection's files"
         );
     }

@@ -361,7 +361,7 @@ pub struct HelixEngine {
     /// One compaction at a time per collection data directory
     /// (TD-HELIX-COMPACT-SCOPE-1). Every flush past the L0 trigger used to spawn
     /// another unsynchronized compaction over the same files.
-    compaction_guards: Arc<dashmap::DashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>,
+    compaction_guards: Arc<dashmap::DashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 
     /// **Query Optimizer**
     ///
@@ -889,7 +889,10 @@ impl HelixEngine {
     fn compaction_guard(&self, data_dir: &std::path::Path) -> Arc<tokio::sync::Mutex<()>> {
         // Canonical key: two spellings of one directory share ONE guard.
         self.compaction_guards
-            .entry(compaction::canonical_location(data_dir))
+            .entry(compaction::collection_directory(
+                data_dir,
+                &self.filesystem_factory,
+            ))
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone()
     }
@@ -904,6 +907,7 @@ impl HelixEngine {
             &levels,
             data_dir,
             self.config.level0_file_num_compaction_trigger,
+            &self.filesystem_factory,
         ) {
             return true;
         }
@@ -917,7 +921,9 @@ impl HelixEngine {
                 let own = |files: &Vec<SStableMetadata>| -> u64 {
                     files
                         .iter()
-                        .filter(|f| compaction::owns_sstable(data_dir, &f.path))
+                        .filter(|f| {
+                            compaction::owns_sstable(data_dir, &f.path, &self.filesystem_factory)
+                        })
                         .map(|f| f.size_bytes)
                         .sum()
                 };
@@ -1085,8 +1091,17 @@ impl HelixEngine {
             );
 
             // Only process .helix files
-            if !filename.ends_with(".helix") {
-                tracing::trace!("[HELIX] Skipping non-.helix file: {}", filename);
+            if !filename.ends_with(".helix")
+                || !compaction::owns_sstable(
+                    Path::new(data_dir),
+                    Path::new(file_path),
+                    &self.filesystem_factory,
+                )
+            {
+                tracing::trace!(
+                    "[HELIX] Skipping entry outside the collection SSTables: {}",
+                    filename
+                );
                 continue;
             }
 
@@ -1337,7 +1352,7 @@ impl UnifiedStorageFormat for HelixEngine {
         // Create directory if it doesn't exist
         filesystem.create_dir_all(&data_dir).await?;
 
-        let file_path = std::path::Path::new(&data_dir).join(&filename);
+        let file_path = compaction::sstable_path(Path::new(&data_dir), &filename);
 
         // Write unified SIMD-optimized Proxima blocks
         let bytes_written = proxima::write_helix_sstable(
@@ -1404,6 +1419,7 @@ impl UnifiedStorageFormat for HelixEngine {
                 self.config.clone(),
                 filesystem.clone(),
                 collection_dir.clone(),
+                self.filesystem_factory.clone(),
             ));
             let levels = self.levels.clone();
             let guard = self.compaction_guard(&collection_dir);
@@ -1442,8 +1458,14 @@ impl UnifiedStorageFormat for HelixEngine {
         let data_dir = self.get_data_dir_from_compaction_params(params)?;
         let filesystem = self.filesystem_for_url(&data_dir, &collection_id)?;
         let collection_dir = PathBuf::from(&data_dir);
-        let compactor =
-            LeveledCompactor::new(self.config.clone(), filesystem, collection_dir.clone());
+        let compactor = LeveledCompactor::new(
+            self.config.clone(),
+            filesystem,
+            collection_dir.clone(),
+            self.filesystem_factory.clone(),
+        );
+        let owns_collection_file =
+            |path| compaction::owns_sstable(&collection_dir, path, &self.filesystem_factory);
         // Serialized with any flush-triggered compaction of this collection.
         let guard = self.compaction_guard(&collection_dir);
         let _running = compaction::acquire_compaction(guard, true).await;
@@ -1461,7 +1483,7 @@ impl UnifiedStorageFormat for HelixEngine {
                 .map(|files| {
                     files
                         .iter()
-                        .filter(|f| compaction::owns_sstable(&collection_dir, &f.path))
+                        .filter(|f| owns_collection_file(&f.path))
                         .map(|f| f.path.to_string_lossy().to_string())
                         .collect::<Vec<_>>()
                 })
@@ -1497,7 +1519,7 @@ impl UnifiedStorageFormat for HelixEngine {
             // dropped every collection's entries (TD-HELIX-COMPACT-SCOPE-1).
             for level in [0_usize, 1] {
                 if let Some(files) = levels_write.get_mut(&level) {
-                    files.retain(|f| !compaction::owns_sstable(&collection_dir, &f.path));
+                    files.retain(|f| !owns_collection_file(&f.path));
                 }
             }
 
@@ -1763,7 +1785,15 @@ impl UnifiedStorageFormat for HelixEngine {
                         .unwrap_or(&sstable_path_str);
 
                     if normalized_path.starts_with(&collection_data_dir)
-                        && seen_canonical.insert(compaction::canonical_location(&sstable.path))
+                        && compaction::owns_sstable(
+                            Path::new(&collection_data_dir),
+                            &sstable.path,
+                            &self.filesystem_factory,
+                        )
+                        && seen_canonical.insert(compaction::canonical_location(
+                            &sstable.path,
+                            &self.filesystem_factory,
+                        ))
                     {
                         tracing::trace!("[HELIX] Matched! Adding to cached_sstables");
                         cached_sstables.push(sstable.clone());
@@ -1811,12 +1841,13 @@ impl UnifiedStorageFormat for HelixEngine {
                         sstable.path
                     );
                     // Never register a second spelling of a file already cached.
-                    let canonical = compaction::canonical_location(&sstable.path);
+                    let canonical =
+                        compaction::canonical_location(&sstable.path, &self.filesystem_factory);
                     let files = levels_write.entry(level).or_insert_with(Vec::new);
-                    if !files
-                        .iter()
-                        .any(|f| compaction::canonical_location(&f.path) == canonical)
-                    {
+                    if !files.iter().any(|f| {
+                        compaction::canonical_location(&f.path, &self.filesystem_factory)
+                            == canonical
+                    }) {
                         files.push(sstable.clone());
                     }
                 }

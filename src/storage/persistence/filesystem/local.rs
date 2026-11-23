@@ -278,34 +278,39 @@ const MIN_MMAP_SIZE: u64 = 512 * 1024;
 /// Maximum number of files to keep in mmap cache
 const MMAP_CACHE_SIZE: usize = 64;
 
+fn resolve_local_path(url: &str, root: Option<&std::path::Path>) -> FsResult<String> {
+    let path = super::FilesystemFactory::resolve_path(url)?;
+    let path_buf = std::path::Path::new(&path);
+    if !path_buf.is_absolute()
+        && !url.contains("://")
+        && let Some(root) = root
+    {
+        return Ok(root.join(path_buf).to_string_lossy().into_owned());
+    }
+    Ok(path)
+}
+
+pub(super) fn local_path_identity(url: &str, root: Option<&std::path::Path>) -> FsResult<String> {
+    let resolved = resolve_local_path(url, root)?;
+    let absolute = std::path::absolute(resolved).map_err(|error| {
+        FilesystemError::Config(format!("Cannot resolve local path identity: {error}"))
+    })?;
+    Ok(absolute
+        .components()
+        .collect::<PathBuf>()
+        .to_string_lossy()
+        .into_owned())
+}
+
 impl LocalFileSystem {
     /// Extract path from URL for stateless operations (uses centralized utility)
     fn resolve_path(&self, url: &str) -> FsResult<String> {
-        use crate::storage::persistence::filesystem::FilesystemFactory;
-
-        let path = FilesystemFactory::resolve_path(url)?;
-        // For bare relative paths (no scheme), anchor to root_dir so each
-        // LocalFileSystem instance with its own root_dir stays isolated.
-        // Paths that came in with a scheme (file://, etc.) keep their
-        // extracted form so callers can reason about them directly.
-        let path_buf = PathBuf::from(&path);
-        if !path_buf.is_absolute()
-            && !url.contains("://")
-            && let Some(ref root) = self.config.root_dir
-        {
-            return Ok(root.join(&path_buf).to_string_lossy().into_owned());
-        }
-        Ok(path)
+        resolve_local_path(url, self.config.root_dir.as_deref())
     }
 
-    /// Identity uses the same root/CWD rules as actual local I/O, without
-    /// issuing metadata requests or changing the path used for the operation.
+    /// Identity uses the same root/CWD rules as actual local I/O.
     pub(crate) fn directory_cache_identity(&self, url: &str) -> FsResult<String> {
-        let resolved = self.resolve_path(url)?;
-        let absolute = std::path::absolute(resolved).map_err(|error| {
-            FilesystemError::Config(format!("Cannot resolve local cache identity: {error}"))
-        })?;
-        Ok(absolute.to_string_lossy().trim_end_matches('/').to_string())
+        local_path_identity(url, self.config.root_dir.as_deref())
     }
 
     /// Create new local filesystem instance with encryption support
