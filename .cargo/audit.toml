@@ -20,12 +20,6 @@
 
 [advisories]
 ignore = [
-    # parquet 60.1.0 RUSTSEC-2026-0595 (unsound: Bloom filters written as
-    # plaintext when writing ENCRYPTED Parquet; published 2026-11-23, no
-    # patched release yet). ProximaDB writes plaintext Parquet only — the
-    # encryption path the advisory targets is unused — so the unsoundness
-    # does not apply to our usage. Revisit when a patched parquet releases.
-    "RUSTSEC-2026-0595",
     # --- unmaintained (transitive; no patched line exists) ---
 
     # bincode 1.x unmaintained (RUSTSEC-2025-0141) — 2.x is a different API.

@@ -1279,12 +1279,23 @@ impl SystemCatalog {
                                 cfg.store.describe()
                             )
                         })?;
+                    // Review round 6 (MED-A): compare the tip against the
+                    // ADOPTED view, not the post-extend index — for a
+                    // touched account `committed` is always >= the tip (the
+                    // shard-log CAS appends the successor of the current
+                    // head), which made the version guard vacuous exactly
+                    // where a stale base could clobber a concurrent
+                    // same-account DDL. The adopted map is what this pod has
+                    // actually seen.
+                    let adopted = self.shard_versions.read().clone();
                     let regressed: Vec<&String> = tip_index
                         .iter()
-                        .filter(|(account, tip_version)| match index.get(account.as_str()) {
-                            Some(ours) => *tip_version > ours,
-                            None => true,
-                        })
+                        .filter(
+                            |(account, tip_version)| match adopted.get(account.as_str()) {
+                                Some(ours) => *tip_version > ours,
+                                None => true,
+                            },
+                        )
                         .map(|(account, _)| account)
                         .collect();
                     if !regressed.is_empty() {
@@ -1292,7 +1303,7 @@ impl SystemCatalog {
                             catalog = %self.name,
                             tip_version = tip.version,
                             accounts = ?regressed,
-                            "shard-index regression refused: a concurrent owner advanced                                  accounts/versions this pod has not adopted; adopting the tip                                  and surfacing the conflict (restart the pod and retry the DDL)"
+                            "shard-index regression refused: a concurrent owner advanced accounts/versions this pod has not adopted; adopting the tip                                  and surfacing the conflict (restart the pod and retry the DDL)"
                         );
                         if let Err(reload_error) = self.reload_from_store_locked(cfg).await {
                             tracing::warn!(
@@ -1301,7 +1312,7 @@ impl SystemCatalog {
                             );
                         }
                         anyhow::bail!(
-                            "catalog '{}': concurrent owner advanced the root to v{} with                                  accounts/versions {regressed:?} this pod had not adopted; the                                  pod has reloaded — restart it and retry the DDL",
+                            "catalog '{}': concurrent owner advanced the root to v{} with accounts/versions {regressed:?} this pod had not adopted; the pod has reloaded — restart it and retry the DDL",
                             self.name,
                             tip.version
                         );
@@ -5564,6 +5575,78 @@ mod tests {
             !reborn
                 .table_exists(&TableIdentifier::new(gamma.clone(), "t"))
                 .await?
+        );
+        Ok(())
+    }
+
+    /// Review round 6 (MED-A, transcribed from the reviewer's
+    /// `zz_probe_r6_shared_account_stale_base_clobbers_concurrent_ddl`): the
+    /// version guard must compare the tip against the ADOPTED view — for a
+    /// TOUCHED account the post-extend index is always >= the tip, so a
+    /// stale-base same-account publish would otherwise clobber the concurrent
+    /// owner's committed DDL fleet-wide.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn same_account_stale_base_cannot_clobber_a_concurrent_ddl() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let backing: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let acme = nslevels(&["acme", "sales"]);
+
+        // Seed: acme t1 (root v1, acme shard v1).
+        {
+            let store = object_store(&backing);
+            let seed = SystemCatalog::open_with_snapshot_store(
+                "default",
+                dir.path().join("seed.wal"),
+                store.clone(),
+            )
+            .await?;
+            seed.create_namespace_for_tenant(&acme, HashMap::new(), Some("acme"))
+                .await?;
+            create_named(&seed, &acme, "t1").await?;
+        }
+        // A boots at v1 and holds its view; B creates t2 -> acme@v2, root v2.
+        let store = object_store(&backing);
+        let owner_a = SystemCatalog::open_with_snapshot_store(
+            "default",
+            dir.path().join("a.wal"),
+            store.clone(),
+        )
+        .await?;
+        {
+            let owner_b = SystemCatalog::open_with_snapshot_store(
+                "default",
+                dir.path().join("b.wal"),
+                store.clone(),
+            )
+            .await?;
+            create_named(&owner_b, &acme, "t2").await?;
+        }
+        // A DDLs the SAME account from its stale base: the publish must be
+        // REFUSED (the tip pins acme@2 above A's ADOPTED acme@1), not clobber
+        // t2 with a shard built from A's stale rows.
+        match create_named(&owner_a, &acme, "t3").await {
+            Err(error) => {
+                let text = format!("{error:#}");
+                assert!(
+                    text.contains("concurrent owner advanced the root"),
+                    "expected the stale-base refusal, got: {text}"
+                );
+            }
+            Ok(_) => panic!("the same-account stale-base publish must be refused"),
+        }
+        let fresh = SystemCatalog::open_with_snapshot_store(
+            "default",
+            dir.path().join("fresh.wal"),
+            store.clone(),
+        )
+        .await?;
+        assert!(
+            fresh
+                .table_exists(&TableIdentifier::new(acme.clone(), "t2"))
+                .await?,
+            "B's committed t2 must survive A's same-account stale-base publish"
         );
         Ok(())
     }
