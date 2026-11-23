@@ -161,6 +161,7 @@ vendored-openssl = ["openssl/vendored"]
 [dev-dependencies]
 async-trait.workspace = true
 criterion = { version = "0.5", features = ["async_tokio"] }
+httpmock.workspace = true
 proximadb-distance-types.workspace = true
 proximadb-storage-filesystem-types.workspace = true
 rand.workspace = true

@@ -35,7 +35,7 @@ test: test-rust test-python
 
 test-rust:
 	@echo "🧪 Running Rust tests..."
-	cargo test --verbose
+	cargo test -p proximadb -p proximadb-embedded --verbose
 
 test-integration:
 	@echo "🔗 Running integration tests..."
@@ -111,7 +111,7 @@ test-python-install:
 # Benchmark targets
 benchmark:
 	@echo "📊 Running benchmarks..."
-	cargo bench
+	cargo bench -p proximadb -p proximadb-embedded
 
 benchmark-vector:
 	@echo "📊 Running vector operation benchmarks..."
