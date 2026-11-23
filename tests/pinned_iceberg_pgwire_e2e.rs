@@ -9,6 +9,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use bytes::Bytes;
 use object_store::path::Path;
 use parquet::arrow::{ArrowWriter, PARQUET_FIELD_ID_META_KEY};
+use proximadb::observability::io_trace;
 use proximadb_iceberg_engine::{
     IcebergObjectStoreBridge, deletion_vector::PositionDeletes, iceberg::IcebergField,
 };
@@ -89,6 +90,35 @@ fn columns_for_tpc_table(table: &TpcTable) -> anyhow::Result<String> {
         columns.push(format!("{} {sql_type}", quote_identifier(field.name())));
     }
     Ok(columns.join(", "))
+}
+
+struct ResetTraceObserver;
+
+impl Drop for ResetTraceObserver {
+    fn drop(&mut self) {
+        io_trace::set_trace_observer(None);
+    }
+}
+
+fn capture_pinned_traces() -> (
+    std::sync::mpsc::Receiver<io_trace::IoTraceSnapshot>,
+    ResetTraceObserver,
+) {
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    io_trace::set_trace_observer(Some(Box::new(move |trace, _tenant| {
+        if !trace.pinned_binds.is_empty() {
+            let _ = sender.try_send(trace.clone());
+        }
+    })));
+    (receiver, ResetTraceObserver)
+}
+
+async fn wait_for_failed_query_trace(client: &Client) -> anyhow::Result<()> {
+    // The client can return on ErrorResponse before the server publishes the
+    // trace and sends ReadyForQuery. A successful command on the same
+    // connection waits behind that work and has no pinned binds of its own.
+    tokio::time::timeout(Duration::from_secs(5), client.simple_query("SELECT 1")).await??;
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -180,6 +210,8 @@ async fn pinned_external_full_tpc_sql() -> anyhow::Result<()> {
         );
     }
     let mut failures = 0;
+    let (trace_rx, _reset_trace) = capture_pinned_traces();
+    let mut trace_rx = Some(trace_rx);
     for query in fixture.queries {
         let sql = std::fs::read_to_string(root.join(&query.sql))?;
         let digest = hex::encode(Sha256::digest(sql.as_bytes()));
@@ -198,6 +230,46 @@ async fn pinned_external_full_tpc_sql() -> anyhow::Result<()> {
             "sql_sha256": digest,
             "elapsed_ms": start.elapsed().as_millis() as u64,
         });
+        let trace_sync = match &result {
+            Ok(Err(error)) if error.as_db_error().is_some() && trace_rx.is_some() => {
+                wait_for_failed_query_trace(&client).await
+            }
+            Ok(Err(error)) if error.as_db_error().is_none() => Err(anyhow::anyhow!(
+                "pgwire connection failed before trace completion"
+            )),
+            Err(_) => Err(anyhow::anyhow!(
+                "client deadline expired before trace completion"
+            )),
+            _ => Ok(()),
+        };
+        if let Err(error) = trace_sync {
+            trace_rx = None;
+            record["trace_error"] = serde_json::json!(error.to_string());
+        }
+        if let Some(trace_rx) = &trace_rx {
+            match trace_rx.try_recv() {
+                Ok(trace) => {
+                    record["trace"] = serde_json::json!({
+                        "setup_ms": trace.setup_ms,
+                        "session_ms": trace.session_ms,
+                        "open_ms": trace.open_ms,
+                        "plan_ms": trace.plan_ms,
+                        "compute_ms": trace.compute_ms,
+                        "emit_ms": trace.emit_ms,
+                        "pinned_binds": trace.pinned_binds,
+                    });
+                }
+                Err(error) if matches!(result, Ok(Ok(_))) => {
+                    failures += 1;
+                    record["trace_error"] =
+                        serde_json::json!(format!("missing binding trace: {error}"));
+                }
+                Err(_) => {}
+            }
+        } else if record.get("trace_error").is_none() {
+            record["trace_error"] =
+                serde_json::json!("trace capture disabled after an earlier query");
+        }
         match result {
             Ok(Ok(messages)) => {
                 let columns = messages.iter().find_map(|msg| match msg {
@@ -223,14 +295,25 @@ async fn pinned_external_full_tpc_sql() -> anyhow::Result<()> {
             Err(_) => {
                 failures += 1;
                 record["error"] = serde_json::json!("120 second client deadline");
-                client.cancel_token().cancel_query(NoTls).await?;
+                let cancel = client.cancel_token();
+                match tokio::time::timeout(Duration::from_secs(5), cancel.cancel_query(NoTls)).await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
+                        record["cancel_error"] = serde_json::json!(error.to_string());
+                    }
+                    Err(_) => {
+                        record["cancel_error"] =
+                            serde_json::json!("5 second cancellation deadline");
+                    }
+                }
             }
         }
         writeln!(output, "{record}")?;
     }
     anyhow::ensure!(
         failures == 0,
-        "{failures}/{query_count} query executions failed; see TPC_OPEN_RESULTS"
+        "{failures}/{query_count} queries had execution or trace failures; see TPC_OPEN_RESULTS"
     );
     Ok(())
 }
@@ -718,11 +801,38 @@ async fn pgwire_reads_only_the_authorized_pinned_snapshot() {
         .unwrap();
     assert_eq!(wildcard.columns()[0].name(), "id");
     assert!(client.query(&wildcard, &[]).await.unwrap().is_empty());
-    let error = client
-        .simple_query("SELECT id FROM delta_bad_path LIMIT 1")
-        .await
-        .unwrap_err();
-    assert!(pg_error(&error).contains("invalid relative Delta data path"));
+    {
+        let (traces, _reset_trace) = capture_pinned_traces();
+        let error = client
+            .simple_query("SELECT id FROM delta_bad_path LIMIT 1")
+            .await
+            .unwrap_err();
+        assert!(pg_error(&error).contains("invalid relative Delta data path"));
+        wait_for_failed_query_trace(&client).await.unwrap();
+        let failed = traces.try_recv().expect("trace for failed Delta bind");
+        assert_eq!(failed.pinned_binds.len(), 1);
+        let delta = &failed.pinned_binds[&io_trace::PinnedSourceFormat::Delta];
+        assert_eq!(
+            (delta.attempts, delta.failures, delta.bound_splits),
+            (1, 1, 0)
+        );
+        assert!(failed.setup_ms >= delta.elapsed_us / 1000);
+
+        client
+            .simple_query("SELECT value FROM pinned_read LIMIT 1")
+            .await
+            .unwrap();
+        let succeeded = traces
+            .try_recv()
+            .expect("trace for successful Iceberg bind");
+        assert_eq!(succeeded.pinned_binds.len(), 1);
+        let iceberg = &succeeded.pinned_binds[&io_trace::PinnedSourceFormat::Iceberg];
+        assert_eq!(
+            (iceberg.attempts, iceberg.failures, iceberg.bound_splits),
+            (1, 0, 1)
+        );
+        assert!(traces.try_recv().is_err());
+    }
     let error = client
         .simple_query("INSERT INTO delta_v1 VALUES (1)")
         .await

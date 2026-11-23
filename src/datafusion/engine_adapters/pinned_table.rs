@@ -25,6 +25,10 @@ pub struct PinnedTable {
 }
 
 impl PinnedTable {
+    pub(super) fn bound_split_count(&self) -> usize {
+        self.reader.split_count()
+    }
+
     pub(crate) fn from_source(reader: impl PinnedBatchSource + 'static) -> Self {
         Self {
             reader: Arc::new(reader),

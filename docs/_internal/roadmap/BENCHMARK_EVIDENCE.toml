@@ -1577,3 +1577,31 @@ artifact = "docs/_internal/status/SPINE4_MANIFEST_LEVERS_IO_TRACE_2026_11_20.ado
 hardware = "Apple M1 Max (aarch64-apple-darwin). Request counts are deterministic for this fixture; hardware-independent."
 date = "2026-11-20"
 version = "proximadb 0.7.0 @ feat/spine-iceberg-read-path-followups (PR #2539, rebased onto develop 647eadef0; GET counts measured on base 4cd469982, and the test — which asserts footer reads, files pruned and answers — passes on 647eadef0)"
+
+[[claims]]
+id = "sift1m_uncompacted_file_exact_ann"
+claim = "TD-SIFTCOMPACT-1 local SIFT1M baseline with 50 uncompacted segments: unfiltered and filtered ANN each measured 0.9820 recall@10 over 100 queries. Three paired unfiltered queries averaged 50.00 GETs and 752,311,900 bytes for exact vs 319.67 GETs and 196,007,668 bytes for ANN."
+metric = "recall@10, traced GETs and payload bytes per query, paired debug latency"
+status = "measured"
+asserted_in = ["docs/10-quality/td/TD-SIFTCOMPACT-1-sift-ratchets-measured-an-uncompacted-layout.adoc"]
+bench_source = "tests/sift_pax_recall_ratchet_test.rs"
+bench_command = "Set the corpus, cache, and layout controls in TD-SIFTCOMPACT-1, then run the sift_pax_cascade_recall_at_10_ratchet_rg_layout and sift_pax_filtered_cascade_recall_ratchet_shipped_defaults test cases separately with cargo test --locked --test sift_pax_recall_ratchet_test <case> -- --exact --nocapture."
+artifact = "docs/10-quality/td/TD-SIFTCOMPACT-1-sift-ratchets-measured-an-uncompacted-layout.adoc"
+hardware = "Local file storage; runner hardware was not recorded in the baseline summary."
+date = "2026-11-22"
+version = "e97d74f6bca7d72d500d303d674dfe29bbe0437a (develop base f0c3b52bd)"
+notes = "Debug build without io-trace and with paired caches disabled. The three paired samples had median times of 5.91 s exact and 0.578 s ANN. OS page-cache state was uncontrolled. These timings only describe this run."
+
+[[claims]]
+id = "sift1m_uncompacted_file_directory_at_flush"
+claim = "TD-SIFTCOMPACT-1 local SIFT1M directory-at-flush comparison with 50 uncompacted segments: cold metadata GETs moved from 100 to 0 and first Adaptive GETs from 408 to 309. Steady Adaptive held at 154.63 ranged GETs and 114,154,443.6 bytes per query. Both modes measured 0.9820 recall@10."
+metric = "traced GETs, payload bytes, estimated request waves, ingest GET/LIST/HEAD, and recall@10"
+status = "measured"
+asserted_in = ["docs/10-quality/td/TD-SIFTCOMPACT-1-sift-ratchets-measured-an-uncompacted-layout.adoc"]
+bench_source = "tests/sift_pax_recall_ratchet_test.rs"
+bench_command = "Set the corpus, cache, and layout controls in TD-SIFTCOMPACT-1. Use PROXIMADB_SIFT_FLUSH_BATCH=20000 and run both sift_get_counts_directory_at_flush_on and sift_get_counts_directory_at_flush_off separately with cargo test --locked --test sift_pax_recall_ratchet_test <case> -- --ignored --exact --nocapture --test-threads=1."
+artifact = "docs/10-quality/td/TD-SIFTCOMPACT-1-sift-ratchets-measured-an-uncompacted-layout.adoc"
+hardware = "Local file storage; runner hardware was not recorded in the baseline summary."
+date = "2026-11-22"
+version = "e97d74f6bca7d72d500d303d674dfe29bbe0437a (develop base f0c3b52bd)"
+notes = "The artifact records ingest costs for both arms. The directory-decode negative control showed a 100-GET cold metadata delta on the same directory-backed layout."

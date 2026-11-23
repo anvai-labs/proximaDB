@@ -1,0 +1,31 @@
+---
+title: SIFT1M I/O and cache measurements
+config:
+  theme: neutral
+  fontFamily: system-ui
+  flowchart:
+    htmlLabels: false
+    useMaxWidth: false
+    nodeSpacing: 24
+    rankSpacing: 35
+---
+flowchart LR
+    accTitle: SIFT1M I/O and cache measurements
+    accDescr: Paired search compares exact and ANN reads. Directory tests count cold metadata and steady reads. The cache sweep exercises cold object reads, DRAM survivor-cache hits, and persistent L2 hits across restart.
+    corpus["TEXMEX SIFT1M<br/>1,000,000 base vectors"]
+    corpus --> paired["Recall ratchets · local L0 layout"]
+    corpus --> counts["Directory at flush · ON and OFF"]
+    corpus --> sweep["Cache-tier sweep · Azurite"]
+    paired --> pairRead["Three exact/ANN pairs<br/>GETs, ranged GETs, bytes, compute, latency"]
+    paired --> recall["100 ANN queries per recall arm<br/>Filtered arm uses its own exact reference"]
+    counts --> cold["Fresh-process first query<br/>Adaptive minus Approximate<br/>Marginal metadata GETs"]
+    counts --> steady["Ingest and 100 steady Adaptive queries<br/>Requests, bytes, and request waves"]
+    sweep --> states["Matched queries across three phases<br/>Object cold · DRAM warm<br/>Disk warm after restart"]
+    states --> tiers["Database cache probes<br/>Footer lookups · Survivor L1 DRAM<br/>Persistent L2"]
+    states --> wire["Application versus Azurite wire log<br/>Check ranged GET counts"]
+    classDef input fill:#eef4ff,stroke:#416b9e,color:#142741
+    classDef arm fill:#dcecf8,stroke:#416b9e,color:#142741
+    classDef evidence fill:#f3f7f8,stroke:#718996,color:#142741
+    class corpus input
+    class paired,counts,sweep arm
+    class pairRead,recall,cold,steady,states,tiers,wire evidence

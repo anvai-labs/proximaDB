@@ -95,7 +95,7 @@ and case-sensitive table keys.
 |===
 | Pressure observed at the checkpoint | Next design step | Evidence required
 | Queries reopen metadata, and binding materializes each inventory before planning.
-| Attribute bind latency, metadata requests and inventory bytes by format. Page inventories and admit concurrent binds against a shared budget if the measurements justify it. Reuse parsed metadata only with a verified version or content identity. Recheck authorization on each bind.
+| Query traces and the TPC sweep record bind duration and split counts by format. Add metadata requests and inventory bytes before choosing a budget or cache. Page inventories and admit concurrent binds against a shared budget if the measurements justify it. Reuse parsed metadata only with a verified version or content identity. Recheck authorization on each bind.
 | Compare cold and warm runs over the same SQL and source versions. Exercise same-name replacement, source expiry, policy change and an interrupted bind. A cache hit must never authorize stale data or suppress expiry.
 | Equal split counts can assign uneven work. Delta has bounded queues per stream, and the NDJSON reader holds a verified byte range while decoding.
 | Measure compressed bytes, decoded bytes, CPU and queue time per split before choosing scheduling weights. Reserve aggregate scan bytes and blocking work across partitions and concurrent queries. Keep the cap effective when projection is empty or input rows are wide.
