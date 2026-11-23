@@ -908,7 +908,7 @@ where
 /// (TD-HELIX-COMPACT-SCOPE-1).
 pub(super) fn owns_sstable(data_dir: &Path, path: &Path, factory: &FilesystemFactory) -> bool {
     sstable_parent(path).is_some_and(|parent| {
-        canonical_location(parent, factory) == collection_directory(data_dir, factory)
+        canonical_location(&parent, factory) == collection_directory(data_dir, factory)
     })
 }
 
@@ -926,7 +926,41 @@ pub(super) fn canonical_location(location: &Path, factory: &FilesystemFactory) -
     if raw.starts_with("abfss://") {
         return raw.into_owned();
     }
-    proximadb_cache::canonical_location(&raw)
+    let canonical = proximadb_cache::canonical_location(&raw);
+    if let Some((scheme, bucket, key)) = encoded_store_parts(&canonical) {
+        let key = object_store::path::Path::from(key);
+        return format!("{scheme}://{bucket}/{key}");
+    }
+    canonical
+}
+
+fn encoded_store_parts(url: &str) -> Option<(&str, &str, &str)> {
+    let (scheme, location) = url.split_once("://")?;
+    if !matches!(scheme, "s3" | "az") {
+        return None;
+    }
+    let (bucket, key) = location.split_once('/')?;
+    Some((scheme, bucket, key))
+}
+
+/// S3 and Azure list encoded object_store paths. Reconstruct a matching
+/// entry from the original directory so subsequent I/O encodes it once.
+pub(super) fn discovered_sstable_path(
+    directory: &Path,
+    entry: &Path,
+    factory: &FilesystemFactory,
+) -> Option<PathBuf> {
+    let canonical = proximadb_cache::canonical_location(entry.to_str()?);
+    if let Some((scheme, bucket, key)) = encoded_store_parts(&canonical) {
+        let (parent, filename) = key.rsplit_once('/')?;
+        if format!("{scheme}://{bucket}/{parent}") != collection_directory(directory, factory)
+            || object_store::path::Path::from(filename).as_ref() != filename
+        {
+            return None;
+        }
+        return Some(sstable_path(directory, filename));
+    }
+    owns_sstable(directory, entry, factory).then(|| entry.to_path_buf())
 }
 
 fn is_object_location(path: &str) -> bool {
@@ -951,35 +985,35 @@ pub(super) fn sstable_path(directory: &Path, filename: &str) -> PathBuf {
     directory.join(filename)
 }
 
-fn sstable_parent(path: &Path) -> Option<&Path> {
+fn sstable_parent(path: &Path) -> Option<std::borrow::Cow<'_, Path>> {
+    use std::borrow::Cow;
     if let Some(raw) = path.to_str().filter(|raw| is_object_location(raw)) {
         let (scheme, rest) = raw.split_once("://")?;
         let (parent, filename) = rest.rsplit_once('/')?;
         if parent.is_empty() || filename.is_empty() {
             return None;
         }
-        return Some(Path::new(&raw[..scheme.len() + 3 + parent.len()]));
+        return Some(Cow::Borrowed(Path::new(
+            &raw[..scheme.len() + 3 + parent.len()],
+        )));
     }
-    // Strip file:// before using Path::parent, so file:///name keeps the
-    // absolute root and file://name keeps the process-relative root.
+    fn local_parent(path: &Path) -> Option<&Path> {
+        path.parent().map(|parent| {
+            if parent.as_os_str().is_empty() {
+                Path::new(".")
+            } else {
+                parent
+            }
+        })
+    }
     if let Some(raw) = path.to_str().and_then(|raw| raw.strip_prefix("file://")) {
-        let Some((parent, _)) = raw.rsplit_once('/') else {
-            return Some(Path::new("file://."));
-        };
-        let prefix_len = if parent.is_empty() {
-            8
-        } else {
-            7 + parent.len()
-        };
-        return Some(Path::new(&path.to_str()?[..prefix_len]));
+        let parent = local_parent(Path::new(raw))?;
+        return Some(Cow::Owned(PathBuf::from(format!(
+            "file://{}",
+            parent.display()
+        ))));
     }
-    path.parent().map(|parent| {
-        if parent.as_os_str().is_empty() {
-            Path::new(".")
-        } else {
-            parent
-        }
-    })
+    local_parent(path).map(Cow::Borrowed)
 }
 
 /// The L0 compaction trigger for ONE collection: its own L0 files only. The
@@ -1068,7 +1102,7 @@ fn collection_scope(path: &Path, factory: &FilesystemFactory) -> String {
     // Canonical, so two spellings of one collection directory are ONE scope
     // (#2530 review r2, M-2 probe A).
     sstable_parent(path)
-        .map(|parent| canonical_location(parent, factory))
+        .map(|parent| canonical_location(&parent, factory))
         .unwrap_or_default()
 }
 
@@ -1663,6 +1697,8 @@ mod tests {
 
         let rooted = root.path().join("c/L0.helix");
         assert!(owns_sstable(Path::new("c"), &rooted, &factory));
+        let listed = PathBuf::from(format!("file://{}", rooted.display()));
+        assert!(owns_sstable(Path::new("c"), &listed, &factory));
         assert!(!owns_sstable(Path::new("file://c"), &rooted, &factory));
         #[cfg(unix)]
         assert!(owns_sstable(
@@ -1711,6 +1747,24 @@ mod tests {
             Path::new("gs://bucket/d//L0.helix"),
             &factory
         ));
+        for (uri, listed) in [
+            ("s3://bucket/a//b%q", "s3://bucket/a/b%25q/L0.helix"),
+            ("adls://bucket/a//b%q", "az://bucket/a/b%25q/L0.helix"),
+        ] {
+            let directory = Path::new(uri);
+            let path = discovered_sstable_path(directory, Path::new(listed), &factory)
+                .expect("listing must round-trip through the encoded backend");
+            assert_eq!(path, sstable_path(directory, "L0.helix"));
+            assert!(owns_sstable(directory, &path, &factory));
+            assert!(
+                discovered_sstable_path(
+                    directory,
+                    Path::new(&listed.replace("b%25q", "b%2525q")),
+                    &factory,
+                )
+                .is_none()
+            );
+        }
         Ok(())
     }
 
@@ -1793,10 +1847,6 @@ mod tests {
         // do_compact's level-map invalidation and optimizer-cache invalidation
         // are scoped to the collection; so is the size-ratio trigger (#2530 r2
         // L-2: m7/m8/m9 survived without these).
-        assert!(
-            engine.contains("files.retain(|f| !owns_collection_file(&f.path))"),
-            "do_compact must invalidate only its own collection's entries"
-        );
         assert!(
             engine.contains(".filter(|f| owns_collection_file(&f.path))"),
             "do_compact must invalidate only its own collection's optimizer entries"

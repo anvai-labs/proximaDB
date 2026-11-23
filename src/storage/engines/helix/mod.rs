@@ -1090,22 +1090,21 @@ impl HelixEngine {
                 file_path
             );
 
-            // Only process .helix files
-            if !filename.ends_with(".helix")
-                || !compaction::owns_sstable(
-                    Path::new(data_dir),
-                    Path::new(file_path),
-                    &self.filesystem_factory,
-                )
-            {
-                tracing::trace!(
-                    "[HELIX] Skipping entry outside the collection SSTables: {}",
-                    filename
-                );
+            if !filename.ends_with(".helix") {
                 continue;
             }
-
-            tracing::debug!("[HELIX] Found .helix file: {}", filename);
+            let Some(path) = compaction::discovered_sstable_path(
+                Path::new(data_dir),
+                Path::new(file_path),
+                &self.filesystem_factory,
+            ) else {
+                tracing::trace!(
+                    path = file_path.as_str(),
+                    "Skipping entry outside the collection SSTables"
+                );
+                continue;
+            };
+            let file_path = path.to_string_lossy();
 
             // Parse filename to extract level using FilenameCodec pattern
             // Expected format: L{level}_{timestamp}_{hash}.helix
@@ -1125,7 +1124,7 @@ impl HelixEngine {
             // Read both pruning range and vector count through the backend
             // selected from this collection URL.
             let (hilbert_range, num_vectors) =
-                Self::read_file_metadata_from_header(&filesystem, file_path)
+                Self::read_file_metadata_from_header(&filesystem, &file_path)
                     .await
                     .unwrap_or_else(|e| {
                         warn!(
@@ -1137,7 +1136,7 @@ impl HelixEngine {
 
             // Create metadata with Hilbert range for pruning
             let metadata = SStableMetadata {
-                path: std::path::PathBuf::from(file_path),
+                path,
                 level,
                 hilbert_range, // Now populated from file footer
                 num_vectors: num_vectors as usize,
@@ -1505,26 +1504,8 @@ impl UnifiedStorageFormat for HelixEngine {
                 .await?
         };
 
-        // Invalidate SSTable metadata cache for compacted files
-        // IMPORTANT: L0 files were compacted to L1, so we must clear the cache
-        // to force rediscovery and ensure Hilbert ranges are populated
-        {
-            let mut levels_write = self.levels.write().await;
-            debug!(
-                "HELIX: Clearing SSTable metadata cache after compaction to ensure fresh discovery"
-            );
-
-            // Clear THIS collection's L0 and L1 metadata to force its
-            // rediscovery with Hilbert ranges. `remove(&0)` / `remove(&1)`
-            // dropped every collection's entries (TD-HELIX-COMPACT-SCOPE-1).
-            for level in [0_usize, 1] {
-                if let Some(files) = levels_write.get_mut(&level) {
-                    files.retain(|f| !owns_collection_file(&f.path));
-                }
-            }
-
-            debug!("HELIX: Cache invalidated for levels 0 and 1 - will rediscover on next search");
-        }
+        // The compactor already removes consumed paths and registers its
+        // outputs. Preserve any files flushed after its input snapshot.
 
         // Also invalidate query optimizer cache for compacted files
         if !files_to_invalidate.is_empty() {
@@ -2143,11 +2124,17 @@ impl UnifiedStorageFormat for HelixEngine {
         let mut copies: Vec<proximadb_records::ProximaRecord> = Vec::new();
         for entry in entries {
             if entry.name.ends_with(".helix") || entry.name.ends_with(".sstable") {
-                let file_path = format!("{}/{}", data_dir, entry.name);
+                let Some(path) = compaction::discovered_sstable_path(
+                    Path::new(&data_dir),
+                    Path::new(&entry.url),
+                    &self.filesystem_factory,
+                ) else {
+                    continue;
+                };
 
                 // Load SSTable metadata
                 let metadata = SStableMetadata {
-                    path: std::path::PathBuf::from(&file_path),
+                    path,
                     level: 0,
                     hilbert_range: None,
                     num_vectors: 0,
@@ -2266,7 +2253,13 @@ impl UnifiedStorageFormat for HelixEngine {
                             .url
                             .ends_with(crate::storage::engines::constants::HELIX_FILE_EXT)
                     {
-                        files.push(entry.url.clone());
+                        if let Some(path) = compaction::discovered_sstable_path(
+                            Path::new(&storage_url),
+                            Path::new(&entry.url),
+                            &self.filesystem_factory,
+                        ) {
+                            files.push(path.to_string_lossy().into_owned());
+                        }
                     }
                 }
             }
