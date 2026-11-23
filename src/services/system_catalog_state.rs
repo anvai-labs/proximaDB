@@ -1107,8 +1107,12 @@ impl SystemCatalogState {
         for account in retired_accounts {
             inner.remove_shard_rows(account);
         }
-        for shard in shards {
+        // Remove old ownership before loading any replacement rows. A
+        // namespace path can move between accounts in the same root change.
+        for shard in &shards {
             inner.remove_shard_rows(&shard.account);
+        }
+        for shard in shards {
             inner.apply_shard(shard);
         }
         Ok(())
