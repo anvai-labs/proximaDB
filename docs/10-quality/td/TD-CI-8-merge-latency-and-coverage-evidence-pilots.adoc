@@ -457,3 +457,85 @@ values. The hosted build keeps the standard stable Cargo invocation and
 uploads its Cargo timing report. Compare healthy runs under one and two build
 jobs with the same inputs and cache provenance. Treat maximum RSS for one
 process and the runner's cgroup peak as separate measurements.
+
+==== Feature matrix memory isolation
+
+The original feature matrix inherited the workspace's five Cargo jobs and
+allocated no additional swap. The root unit and enterprise binary-build
+steps use one Cargo job and add a 12 GiB swap file. A successful enterprise
+runner reported 14 GiB total swap after setup. Burn-down also adds 12 GiB
+and uses two Cargo jobs for its linked test targets. The feature-matrix
+jobs type-check the normal root library and test harness, so the correction
+separates their memory peaks. Each of the four staged jobs also allocates a
+10 GiB swap file on `/mnt` as runner headroom and logs processor count,
+RAM and swap after setup.
+
+On #2570, the OLTP integrity, experimental engines, cold deletion vectors
+and TurboQuant checks repeatedly failed during `cargo check --tests`.
+Several attempts logged a runner shutdown or ended without job logs. Reproducing the TurboQuant leg with four CPUs,
+15 GiB of RAM and 2 GiB of swap exhausted both budgets with either five or
+two Cargo jobs. The kernel identified `rustc` as the victim in both cgroups.
+The last sample before the five-job kill showed the normal root library at
+6.67 GiB RSS and the root unit-test harness at 8.45 GiB RSS at the same time.
+The hosted shutdown logs do not contain a matching kernel record.
+link:https://github.com/anvai-labs/proximaDB/actions/runs/45089139210/attempts/3[Hosted attempt].
+
+[cols="3,1,1,1,2",options="header"]
+|===
+| Cold TurboQuant root check | Elapsed | Cgroup RAM peak | Swap peak | Outcome
+| Full `--tests`, five Cargo jobs | 7m15s* | 15.00 GiB | 2.00 GiB | Kernel OOM kill
+| Full `--tests`, two Cargo jobs | 9m45s* | 15.00 GiB | 2.00 GiB | Kernel OOM kill
+| Full `--tests`, one Cargo job | 19m17s | 11.92 GiB | 0 | Passed
+| Staged, four jobs then two | 10m22s | 11.90 GiB | 0 | Passed
+|===
+
+The starred times end at the last recorded sample before termination.
+The successful staged TurboQuant check also compiled all five companion
+packages. These are local checks on Linux with the Rust 1.100 toolchain
+and a cold target directory for each row. Registry sources were already
+available offline. The local limits approximate the runner. The root
+warmup and final check took 6m23s and 3m58s. Cargo recorded the normal
+root library only in the warmup and the test harness only in the final
+phase.
+
+The four affected jobs now complete the normal root check first. The
+`embedded_service_profile` integration target activates the same dev-dependency
+graph as `--tests` while leaving the unit-test harness out of the first
+invocation. A library-only check would resolve a different graph.
+The second invocation retains `--tests` and uses two Cargo jobs.
+The root test harness can then overlap a smaller integration check.
+The existing per-package checks still cover embedded engines and all five
+TurboQuant companion packages. Cold unit graphs matched the normal library
+and the selected integration target between the two invocations for each
+affected feature.
+
+All four staged legs also passed in separate four-CPU cgroups with 13 GiB
+of RAM and swap disabled. The targets reused dependency metadata from the
+failed controls or earlier constrained checks. There were no OOM events.
+
+[cols="2,1,1",options="header"]
+|===
+| Full feature leg under 13 GiB without swap | Elapsed | Cgroup RAM peak
+| OLTP integrity | 10m42s | 11.33 GiB
+| Cold deletion vectors | 10m16s | 10.84 GiB
+| Experimental engines, including embedded | 13m29s | 11.24 GiB
+| TurboQuant, including companion packages | 12m57s | 11.33 GiB
+|===
+
+Use a fresh `CARGO_TARGET_DIR` for each cold comparison, then reuse the same
+directory between phases. This example covers the root portion of the
+TurboQuant leg. Choose four available CPU IDs for `taskset`.
+
+[source,bash]
+----
+export CARGO_TARGET_DIR="$(mktemp -d)"
+export CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0
+systemd-run --user --scope --collect \
+  -p MemoryMax=15G -p MemorySwapMax=2G -p CPUQuota=400% \
+  taskset -c 0,2,4,6 bash -ec '
+    cargo check --locked --timings --jobs 4 -p proximadb \
+      --features experimental-turboquant --lib --test embedded_service_profile
+    cargo check --locked --timings --jobs 2 -p proximadb \
+      --features experimental-turboquant --tests
+  '
+----
