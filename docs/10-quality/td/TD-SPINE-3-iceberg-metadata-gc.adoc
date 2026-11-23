@@ -12,6 +12,15 @@
 | Relates to | **TD-GCRETAIN-1** (the generation-window, clock-free data-file GC this must match), TD-SEAM-1 (single writer), TD-SEAM-4 (incremental publisher), TD-SEAM-7 (observability retention = snapshot expiry), TD-MANIFEST-1 (retention semantics), TD-SPINE-4
 |===
 
+== Follow-up owned here (filed 2026-11-22, from TD-SPINE-2 review)
+
+* **Catalog root/shard manifest-log pruning:** TD-SPINE-2's root log and the
+  per-account shard logs (ManifestCommitter objects) are never pruned — one
+  immutable object per DDL per touched account plus the root, forever
+  (GB-months, the exact dimension ADR-098 D1.3 trades against). Fold them
+  into this TD's generation-window GC semantics (rank-based keep-k ≥ 2, never
+  the tip, best-effort deletes) once TD-SPINE-2 lands.
+
 == Problem
 
 * Data-file GC exists (`gc_older_generations`, keep N generations; DV Puffin grace), but nothing
