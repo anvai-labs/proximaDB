@@ -787,7 +787,10 @@ impl SystemCatalog {
         // a root. Re-publish both live and previously indexed accounts so a
         // replayed last-row drop also reaches its shard before WAL compaction.
         let mut pending_shards = std::collections::HashSet::new();
-        if claim_owner && replayed_root_wal {
+        if claim_owner
+            && sharded_reader
+            && (replayed_root_wal || (prior_version == NO_VERSION && state.applied_seq() > 0))
+        {
             pending_shards.extend(state.shard_keys());
             pending_shards.extend(shard_versions.keys().cloned());
         }
@@ -2872,6 +2875,7 @@ mod tests {
     async fn legacy_owner_retries_sidecar_recovery_before_minting() -> Result<()> {
         #[derive(serde::Serialize)]
         struct LegacySnapshot {
+            account_ids: HashMap<String, u32>,
             namespaces: HashMap<Vec<String>, CatalogNamespace>,
             tables: HashMap<TableIdentifier, CatalogTableSchema>,
             applied_seq: u64,
@@ -2885,7 +2889,8 @@ mod tests {
         let mut live = CatalogTableSchema::new("t");
         live.stable_namespace_id = Some(1);
         let legacy = LegacySnapshot {
-            namespaces: HashMap::from([(live_ns.clone(), CatalogNamespace::new(live_ns.clone()))]),
+            account_ids: HashMap::from([("acme".into(), 1)]),
+            namespaces: HashMap::from([(live_ns.clone(), namespace)]),
             tables: HashMap::from([(TableIdentifier::new(live_ns, "t"), live)]),
             applied_seq: 0,
         };
@@ -4305,6 +4310,7 @@ mod tests {
         let ledger = Arc::new(IoLedger::default());
         let backing = Arc::new(object_store::memory::InMemory::new());
         let owner = open_owner_counting(&owner_wal, &ledger, &backing).await?;
+        owner.account_id_u32("acme").await?;
         let ns = nslevels(&["acme", "sales"]);
         owner
             .create_namespace_for_tenant(&ns, HashMap::new(), Some("acme"))
@@ -4327,6 +4333,32 @@ mod tests {
             reader.table_exists(&recovered).await?,
             "the healed root must name the replayed shard"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn first_root_publish_recovers_namespace_from_the_wal() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let owner_wal = dir.path().join("owner.wal");
+        let ledger = Arc::new(IoLedger::default());
+        let backing = Arc::new(object_store::memory::InMemory::new());
+        let owner = open_owner_counting(&owner_wal, &ledger, &backing).await?;
+        let ns = nslevels(&["acme", "sales"]);
+        ledger.fail_root_puts.store(true, Ordering::SeqCst);
+        assert!(
+            owner
+                .create_namespace_for_tenant(&ns, HashMap::new(), Some("acme"))
+                .await
+                .is_err()
+        );
+        drop(owner);
+
+        ledger.fail_root_puts.store(false, Ordering::SeqCst);
+        let owner = open_owner_counting(&owner_wal, &ledger, &backing).await?;
+        assert!(owner.pending_shards.lock().contains("acme"));
+        owner.checkpoint().await?;
+        let fresh = open_owner_counting(&dir.path().join("fresh.wal"), &ledger, &backing).await?;
+        assert!(fresh.state.get_namespace(&ns).is_some());
         Ok(())
     }
 
