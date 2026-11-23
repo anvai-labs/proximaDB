@@ -120,7 +120,7 @@ cloud-full = ["aws", "azure", "gcp"]
 # (`--no-default-features`) yields the exact-scan embedded build.
 axis = ["proximadb/axis"]
 # Engine matrix for the embedded integration tests and engine benchmarks.
-experimental-engines = ["proximadb/experimental-engines"]
+experimental-engines = ["axis", "proximadb/experimental-engines"]
 # FA-b: mirrors root's `abac-policy`. OFF by default — embedded mode is
 # in-process and the host application owns authorization, so ABAC (a server-side
 # multi-tenant concern) does not apply. The feature exists so the abac
