@@ -662,7 +662,7 @@ impl HelixEngine {
         };
 
         // Initialize levels from existing files
-        let levels = Self::load_levels(&filesystem, &data_dir).await?;
+        let levels = Self::load_levels(&filesystem, &data_dir, &filesystem_factory).await?;
 
         // Create query optimizer
         let query_optimizer = Arc::new(QueryOptimizer::new(
@@ -761,6 +761,7 @@ impl HelixEngine {
             crate::storage::persistence::filesystem::caching_filesystem::UnifiedCachingFilesystem,
         >,
         data_dir: &Path,
+        factory: &FilesystemFactory,
     ) -> Result<HashMap<usize, Vec<SStableMetadata>>> {
         use crate::storage::persistence::filesystem::FileSystem;
 
@@ -784,22 +785,26 @@ impl HelixEngine {
         for file in files {
             let file_name = &file.name;
             if file_name.ends_with(HELIX_FILE_EXT) {
+                let Some(path) =
+                    compaction::discovered_sstable_path(data_dir, Path::new(&file.url), factory)
+                else {
+                    continue;
+                };
+                let url = path.to_string_lossy();
                 // Parse level from filename
                 let codec = FilenameCodec::new();
                 let level = codec.parse_level(file_name) as usize;
 
                 // Read Hilbert range from file footer for proper spatial pruning
-                let hilbert_range = Self::read_hilbert_range_static(filesystem, &file.url)
-                    .await
-                    .ok();
+                let hilbert_range = Self::read_hilbert_range_static(filesystem, &url).await.ok();
 
                 // Read num_vectors from file header
-                let num_vectors = Self::read_num_vectors_static(filesystem, &file.url)
+                let num_vectors = Self::read_num_vectors_static(filesystem, &url)
                     .await
                     .unwrap_or(0) as usize;
 
                 let metadata = SStableMetadata {
-                    path: PathBuf::from(&file.url),
+                    path,
                     level,
                     hilbert_range,
                     num_vectors,
@@ -1741,47 +1746,20 @@ impl UnifiedStorageFormat for HelixEngine {
             let mut cached_sstables: Vec<SStableMetadata> = Vec::new();
             let mut seen_canonical = std::collections::HashSet::new();
 
-            // Collect all SSTables from all levels for this collection
-            for sstables in levels_read.values() {
-                for sstable in sstables {
-                    tracing::trace!(
-                        "[HELIX] Checking cached sstable: path={:?}, collection_data_dir={}",
-                        sstable.path,
-                        collection_data_dir
-                    );
-                    // Filter by collection directory to ensure collection isolation
-                    // Handle both file:// URLs and plain paths
-                    //
-                    // NOTE (TD-HELIX-COMPACT-SCOPE-1): for `file://` data dirs this
-                    // string match never hits, so every search rediscovers from the
-                    // directory listing. That is load-bearing today: flushes
-                    // register new SSTables in the FLUSH path's engine instance, not
-                    // in this search instance, so a working cache hit would serve a
-                    // stale file list (#2530 review r2 follow-up; the conformance
-                    // matrix caught it). Do not "fix" the match until search
-                    // refreshes its level map from flushes.
-                    let sstable_path_str = sstable.path.to_string_lossy();
-                    let normalized_path = sstable_path_str
-                        .strip_prefix("file://")
-                        .unwrap_or(&sstable_path_str);
-
-                    if normalized_path.starts_with(&collection_data_dir)
-                        && compaction::owns_sstable(
-                            Path::new(&collection_data_dir),
-                            &sstable.path,
-                            &self.filesystem_factory,
-                        )
-                        && seen_canonical.insert(compaction::canonical_location(
-                            &sstable.path,
-                            &self.filesystem_factory,
-                        ))
-                    {
-                        tracing::trace!("[HELIX] Matched! Adding to cached_sstables");
+            // URL-backed searches refresh listings because the flush path
+            // may run on a different engine instance. Cached registrations
+            // can otherwise hide newer live files or tombstones.
+            if !collection_data_dir.contains("://") {
+                for sstable in levels_read.values().flatten() {
+                    if compaction::owns_sstable(
+                        Path::new(&collection_data_dir),
+                        &sstable.path,
+                        &self.filesystem_factory,
+                    ) && seen_canonical.insert(compaction::canonical_location(
+                        &sstable.path,
+                        &self.filesystem_factory,
+                    )) {
                         cached_sstables.push(sstable.clone());
-                    } else {
-                        tracing::trace!(
-                            "[HELIX] Not matched - path doesn't start with collection_data_dir"
-                        );
                     }
                 }
             }
