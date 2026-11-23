@@ -122,6 +122,14 @@ class PanicScopeTests(unittest.TestCase):
         self.assertNotEqual(proc.returncode, 0)
         self.assertIn("increased by 1", proc.stdout)
 
+    def test_standalone_cargo_benchmark_is_outside_production_scope(self):
+        self.fixture.baseline("workspace", "baseline.json")
+        bench = self.repo / "crates" / "storage" / "crate-one" / "benches"
+        bench.mkdir()
+        (bench / "io_counts.rs").write_text("fn main() { None::<u8>.unwrap(); }\n")
+        proc = self.ratchet("--scope", "workspace")
+        self.assertEqual(proc.returncode, 0, proc.stdout)
+
     def test_workspace_ratchet_fails_on_a_new_crate_with_a_site(self):
         """A crate absent from the baseline counts against an implicit 0."""
         self.fixture.baseline("workspace", "baseline.json")
