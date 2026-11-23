@@ -20,6 +20,15 @@
 
 [advisories]
 ignore = [
+    # parquet 60.1.0 RUSTSEC-2026-0595 (unsound: Bloom filters written as
+    # plaintext when writing ENCRYPTED Parquet). Exposure is nil — the repo
+    # does not enable parquet's `encryption` feature and writes plaintext
+    # Parquet only. A patched release EXISTS (60.2.0) and is caret-compatible,
+    # but bumping breaks viper compaction (ArrowWriter "writer has 10
+    # top-level fields but batch has 13 columns" — 3/8
+    # viper::tests::compaction_tests fail; 8/8 on 60.1.0), so the bump is an
+    # owned follow-up, not a drop-in. Revisit with the arrow-wide 60.2 move.
+    "RUSTSEC-2026-0595",
     # --- unmaintained (transitive; no patched line exists) ---
 
     # bincode 1.x unmaintained (RUSTSEC-2025-0141) — 2.x is a different API.
