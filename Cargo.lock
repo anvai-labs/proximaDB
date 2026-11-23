@@ -7388,6 +7388,7 @@ dependencies = [
  "crc32fast",
  "criterion",
  "datafusion",
+ "half",
  "hostname",
  "httpmock",
  "jni 0.21.1",
