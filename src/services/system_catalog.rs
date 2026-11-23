@@ -1245,6 +1245,42 @@ impl SystemCatalog {
         let mut index: std::collections::BTreeMap<String, u64> =
             self.shard_versions.read().clone().into_iter().collect();
         index.extend(committed);
+        // Review round 4 (MED): the candidate index is built from this pod's
+        // adopted view; a concurrently published root (equal fencing
+        // generation — the dual-boot model) may name accounts this pod has
+        // never seen, and publishing our index over it would REGRESS the
+        // root, which the retirement rule turns into live-row deletion on
+        // every follower. Refuse when the current tip is genuinely unseen
+        // (its version is above what this pod adopted) AND this pod's image
+        // does not outrank it by generation (the escape/heal window, where
+        // retirement of escape-dropped accounts is authoritative) AND the
+        // candidate drops accounts the tip names. Adopt the tip and surface
+        // the conflict: the retried DDL then covers.
+        if let Some(tip) = cfg.store.read_root().await? {
+            let outranks = self.loaded_generation.load(Ordering::SeqCst) > tip.generation;
+            let seen = tip.version <= self.loaded_version.load(Ordering::SeqCst);
+            if !outranks && !seen {
+                let (_, _, _, _, tip_index) = SystemCatalogState::decode_catalog_root(&tip.bytes)?;
+                let missing: Vec<&String> = tip_index
+                    .keys()
+                    .filter(|account| !index.contains_key(account.as_str()))
+                    .collect();
+                if !missing.is_empty() {
+                    tracing::warn!(
+                        catalog = %self.name,
+                        tip_version = tip.version,
+                        accounts = ?missing,
+                        "shard-index regression refused: a concurrent owner published                          accounts this pod has not adopted; reloading and surfacing                          the conflict (retry the DDL)"
+                    );
+                    self.reload_from_store_locked(cfg).await?;
+                    anyhow::bail!(
+                        "catalog '{}': concurrent owner advanced the root to v{} with                          accounts {missing:?} this pod had not adopted; the pod has                          reloaded — retry the DDL",
+                        self.name,
+                        tip.version
+                    );
+                }
+            }
+        }
         let root_bytes = self.state.to_root_bytes(&index)?;
         match cfg.store.commit_root(generation, &root_bytes).await? {
             SnapshotWrite::Published { version } => {
@@ -5158,6 +5194,116 @@ mod tests {
             Some(2),
             "globex's own high-water (1) floors its next mint — the reseeded \
              image must carry PER-ACCOUNT values, not the global recovery"
+        );
+        Ok(())
+    }
+
+    /// Review round 4 (MED): the publish index is built from the pod's
+    /// adopted view. Two owners that boot at the same root and both claim
+    /// the next fencing generation (the dual-boot model) could regress the
+    /// index — dropping an account the other owner just added — which the
+    /// retirement rule turns into live-row deletion on every follower. The
+    /// commit-time coverage check refuses the regressed publish (after
+    /// adopting the unseen tip), and the retried DDL covers.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn concurrent_owner_cannot_regress_the_shard_index() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let backing: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let acme = nslevels(&["acme", "sales"]);
+        let gamma = nslevels(&["gamma", "ops"]);
+        let beta = nslevels(&["beta", "eng"]);
+
+        // Seed root v1 (acme only).
+        {
+            let store = object_store(&backing);
+            let owner = SystemCatalog::open_with_snapshot_store(
+                "default",
+                dir.path().join("seed.wal"),
+                store.clone(),
+            )
+            .await?;
+            owner
+                .create_namespace_for_tenant(&acme, HashMap::new(), Some("acme"))
+                .await?;
+            create_named(&owner, &acme, "t").await?;
+        }
+        // A boots at v1 FIRST and holds that view (no follower poll by
+        // default), then B boots and adds gamma -> root v2.
+        let store = object_store(&backing);
+        let owner_a = SystemCatalog::open_with_snapshot_store(
+            "default",
+            dir.path().join("a.wal"),
+            store.clone(),
+        )
+        .await?;
+        {
+            let owner_b = SystemCatalog::open_with_snapshot_store(
+                "default",
+                dir.path().join("b.wal"),
+                store.clone(),
+            )
+            .await?;
+            owner_b
+                .create_namespace_for_tenant(&gamma, HashMap::new(), Some("gamma"))
+                .await?;
+            create_named(&owner_b, &gamma, "t").await?;
+        }
+        // A still holds its v1 view: its first publish must be REFUSED
+        // (gamma unseen), not land a regressed root — the refusal reloads,
+        // so the retry covers.
+        // Bring A to the pre-B view: boot happened at v1 (A opened before B
+        // in this fixture is simulated by holding no further reloads).
+        let first = match owner_a
+            .create_namespace_for_tenant(&beta, HashMap::new(), Some("beta"))
+            .await
+        {
+            Err(error) => Err(error),
+            Ok(_) => create_named(&owner_a, &beta, "t").await,
+        };
+        match first {
+            Err(error) => {
+                let text = format!("{error:#}");
+                assert!(
+                    text.contains("concurrent owner advanced the root"),
+                    "expected the regression refusal, got: {text}"
+                );
+            }
+            Ok(_) => panic!("the stale-view publish must be refused, not land a regressed root"),
+        }
+        // The retry succeeds from a pod whose allocator seeded after the
+        // reload (A's own pre-reload allocator may hold ids the reloaded
+        // state already assigned — the pre-existing dual-boot id hazard,
+        // out of scope here; a fresh boot covers).
+        {
+            let owner_a2 = SystemCatalog::open_with_snapshot_store(
+                "default",
+                dir.path().join("a2.wal"),
+                store.clone(),
+            )
+            .await?;
+            owner_a2
+                .create_namespace_for_tenant(&beta, HashMap::new(), Some("beta"))
+                .await?;
+            create_named(&owner_a2, &beta, "t2").await?;
+        }
+        // A fresh boot sees BOTH owners' accounts — gamma was never retired.
+        let fresh = SystemCatalog::open_with_snapshot_store(
+            "default",
+            dir.path().join("fresh.wal"),
+            store.clone(),
+        )
+        .await?;
+        assert!(
+            fresh
+                .table_exists(&TableIdentifier::new(gamma.clone(), "t"))
+                .await?
+        );
+        assert!(
+            fresh
+                .table_exists(&TableIdentifier::new(beta.clone(), "t2"))
+                .await?
         );
         Ok(())
     }

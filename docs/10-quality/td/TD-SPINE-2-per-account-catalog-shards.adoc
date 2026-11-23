@@ -82,6 +82,27 @@
   dropped id minted under the global counter is never re-minted; accounts
   with a genuine per-account record keep their own (lower) floor, and
   brand-new accounts still start at 1.
+* **Review round 4 fix (2026-11-23, MED):** the commit-time **index-coverage
+  check** — `checkpoint_sharded_locked` reads the fresh root tip before
+  publishing and REFUSES the commit when the tip is genuinely unseen (its
+  version above the pod's adopted one, and the pod's image does not outrank
+  it by fencing generation — the escape/heal window keeps its authority) and
+  the candidate index drops accounts the tip names. The refusal adopts the
+  tip and surfaces a "concurrent owner advanced the root" error; the retried
+  DDL then covers. This closes the equal-generation dual-owner regression
+  that the retirement rule would have turned into live-row deletion on
+  followers (`concurrent_owner_cannot_regress_the_shard_index`). (LOW-3) the
+  conservative sidecar smear's negative side is pinned
+  (`legacy_sidecar_does_not_smear_a_populated_map`).
+* **Operational notes (review round 4, LOW-1/LOW-2 — fail-closed by design,
+  no operator escape short of object surgery):** a root-referenced shard that
+  is missing or undecodable fails boot and every reload (followers serve
+  their last adopted image with errors; an owner crash-loops until the object
+  is restored or the root advances past referencing it), and an undecodable
+  identity sidecar wedges every checkpoint (the WAL never compacts again)
+  and bricks a writable legacy image's boot — replacing either blindly could
+  lower a durable floor (TD-PATH-2), so both require restoring the object or
+  removing it deliberately.
 * **Review round 2 fixes (2026-11-22):** (HIGH) `reload_sharded_locked` now
   skips a root tip whose fencing generation is BELOW the loaded image's — in
   the un-healed flip-flop window (a follower crossed to the newer legacy log

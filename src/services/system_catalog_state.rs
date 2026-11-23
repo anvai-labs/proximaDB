@@ -2158,4 +2158,47 @@ mod tests {
         assert_eq!(fresh.max_namespace_id_ever_for("emptied"), Some(5));
         Ok(())
     }
+
+    /// Review round 4 (LOW-3): the conservative global smear fires only for
+    /// the legacy boot (empty map / fieldless snapshot). A MODERN snapshot
+    /// (attributed map) that adopts a LEGACY map-less sidecar must keep its
+    /// per-account precision — an account that minted only id 1 stays at 1,
+    /// not at some other account's global high-water.
+    #[test]
+    fn legacy_sidecar_does_not_smear_a_populated_map() -> Result<()> {
+        let mut alpha = ns(&["acme", "alpha"]);
+        alpha.tenant_id = Some("acme".to_string());
+        let snapshot = CatalogSnapshot {
+            account_ids: HashMap::from([("acme".into(), 1), ("globex".into(), 2)]),
+            namespaces: HashMap::from([(alpha.levels.clone(), alpha)]),
+            tables: HashMap::new(),
+            statistics: HashMap::new(),
+            applied_seq: 5,
+            ids_high_water: None,
+            writer_version: Some(proximadb_catalog::IDENTITY_WRITER_VERSION_HIGH_WATER),
+            account_ns_high_water: Some(HashMap::from([("acme".into(), 3), ("globex".into(), 1)])),
+        };
+        let state = SystemCatalogState::from_snapshot_bytes(&rmp_serde::to_vec_named(&snapshot)?)?;
+        let legacy = IdentityHighWaterSidecar {
+            writer_version: None,
+            high_water: IdsHighWater {
+                namespace_id: 8,
+                ..IdsHighWater::default()
+            },
+            account_ns_high_water: None,
+        };
+        state.adopt_identity_high_water_sidecar_bytes(&rmp_serde::to_vec_named(&legacy)?)?;
+        assert_eq!(
+            state.max_namespace_id_ever_for("acme"),
+            Some(3),
+            "acme keeps its attributed floor (3), not the legacy global (8)"
+        );
+        assert_eq!(
+            state.max_namespace_id_ever_for("globex"),
+            Some(1),
+            "globex keeps its attributed floor (1) — the smear must not fire \
+             on a populated map"
+        );
+        Ok(())
+    }
 }
