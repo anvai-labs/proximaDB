@@ -1406,10 +1406,14 @@ impl SystemCatalog {
                 )
             })?;
         let known = self.shard_versions.read().clone();
-        let retired: Vec<_> = known
-            .keys()
-            .filter(|account| !shard_index.contains_key(*account))
-            .cloned()
+        let mut previous_accounts: std::collections::HashSet<_> = known.keys().cloned().collect();
+        if !loaded_is_root {
+            // A whole-image reader may hold namespaces without a shard index.
+            previous_accounts.extend(self.state.shard_keys());
+        }
+        let retired: Vec<_> = previous_accounts
+            .into_iter()
+            .filter(|account| !shard_index.contains_key(account))
             .collect();
         let mut changed = Vec::new();
         for (account, root_version) in &shard_index {
