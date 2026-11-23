@@ -1066,16 +1066,7 @@ impl SystemCatalogState {
             ..CatalogInner::default()
         };
         for (account, shard_bytes) in shards {
-            let shard: CatalogShardRecord =
-                crate::services::catalog_record_envelope::from_enveloped_slice(shard_bytes)
-                    .with_context(|| format!("decoding catalog shard '{account}'"))?;
-            if &shard.account != account {
-                anyhow::bail!(
-                    "catalog shard identity mismatch: log key '{account}' carries \
-                     shard '{}'",
-                    shard.account
-                );
-            }
+            let shard = Self::decode_shard(account, shard_bytes)?;
             inner.apply_shard(shard);
         }
         Ok(Self {
@@ -1091,6 +1082,7 @@ impl SystemCatalogState {
         &self,
         root_bytes: &[u8],
         shards: &[(String, Vec<u8>)],
+        retired_accounts: &[String],
     ) -> Result<()> {
         let root: CatalogRootRecord =
             crate::services::catalog_record_envelope::from_enveloped_slice(root_bytes)
@@ -1111,6 +1103,9 @@ impl SystemCatalogState {
         for (account, id) in root.account_ns_high_water {
             let entry = inner.account_ns_high_water.entry(account).or_insert(0);
             *entry = (*entry).max(id);
+        }
+        for account in retired_accounts {
+            inner.remove_shard_rows(account);
         }
         for shard in shards {
             inner.remove_shard_rows(&shard.account);
@@ -2078,6 +2073,36 @@ mod tests {
         let round = SystemCatalogState::new();
         round.load_shard_bytes("acme", &shard)?;
         assert_eq!(round.max_namespace_id_ever_for("acme"), Some(5));
+        Ok(())
+    }
+
+    #[test]
+    fn adopting_root_removes_retired_shard_rows_but_keeps_its_floor() -> Result<()> {
+        let state = SystemCatalogState::new();
+        let mut namespace = ns(&["acme", "sales"]);
+        namespace.tenant_id = Some("acme".into());
+        state.apply_committed(
+            1,
+            CatalogDelta::UpsertNamespace {
+                namespace: Box::new(namespace),
+            },
+        );
+        let identifier = tid(&["acme", "sales"], "retired");
+        let mut table = CatalogTableSchema::new("retired");
+        table.stable_namespace_id = Some(5);
+        state.apply_committed(
+            2,
+            CatalogDelta::UpsertTable {
+                identifier: identifier.clone(),
+                schema: Box::new(table),
+            },
+        );
+        assert!(state.table_exists(&identifier));
+
+        let empty_root = SystemCatalogState::new().to_root_bytes(&Default::default())?;
+        state.adopt_root_with_shards(&empty_root, &[], &["acme".into()])?;
+        assert!(!state.table_exists(&identifier));
+        assert_eq!(state.max_namespace_id_ever_for("acme"), Some(5));
         Ok(())
     }
 

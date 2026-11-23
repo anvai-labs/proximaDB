@@ -1390,18 +1390,21 @@ impl SystemCatalog {
                 )
             })?;
         let known = self.shard_versions.read().clone();
-        let mut updated = known.clone();
+        let retired: Vec<_> = known
+            .keys()
+            .filter(|account| !shard_index.contains_key(*account))
+            .cloned()
+            .collect();
         let mut changed = Vec::new();
         for (account, root_version) in &shard_index {
             if known.get(account) == Some(root_version) {
                 continue;
             }
             let read = cfg.store.read_shard_version(account, *root_version).await?;
-            updated.insert(account.clone(), *root_version);
             changed.push((account.clone(), read.bytes));
         }
         self.state
-            .adopt_root_with_shards(&root_read.bytes, &changed)?;
+            .adopt_root_with_shards(&root_read.bytes, &changed, &retired)?;
         if proximadb_catalog::identity_writer_version_lags(writer_version) {
             tracing::warn!(
                 catalog = %self.name,
@@ -1423,7 +1426,7 @@ impl SystemCatalog {
             self.object_id_floor.fetch_max(next, Ordering::SeqCst);
         }
         self.merge_namespace_allocator_seed();
-        *self.shard_versions.write() = updated;
+        *self.shard_versions.write() = shard_index.into_iter().collect();
         self.loaded_version
             .store(root_read.version, Ordering::SeqCst);
         self.loaded_version_is_root.store(true, Ordering::SeqCst);
@@ -2863,7 +2866,9 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let wal = dir.path().join("legacy.wal");
         let inner = LocalSnapshotStore::new(wal.with_extension("snapshot"));
-        let live_ns = nslevels(&["live"]);
+        let live_ns = nslevels(&["acme", "live"]);
+        let mut namespace = CatalogNamespace::new(live_ns.clone());
+        namespace.tenant_id = Some("acme".into());
         let mut live = CatalogTableSchema::new("t");
         live.stable_namespace_id = Some(1);
         let legacy = LegacySnapshot {
@@ -2889,8 +2894,10 @@ mod tests {
         );
 
         let recovered = SystemCatalog::open_with_snapshot_store("default", &wal, store).await?;
-        let fresh = nslevels(&["fresh"]);
-        recovered.create_namespace(&fresh, HashMap::new()).await?;
+        let fresh = nslevels(&["acme", "fresh"]);
+        recovered
+            .create_namespace_for_tenant(&fresh, HashMap::new(), Some("acme"))
+            .await?;
         let table = create_named(&recovered, &fresh, "t").await?;
         assert_eq!(table.stable_namespace_id, Some(6));
         Ok(())
