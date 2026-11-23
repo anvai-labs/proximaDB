@@ -466,7 +466,7 @@ steps use one Cargo job and add a 12 GiB swap file. A successful enterprise
 runner reported 14 GiB total swap after setup. Burn-down also adds 12 GiB
 and uses two Cargo jobs for its linked test targets. The feature-matrix
 jobs type-check the normal root library and test harness, so the correction
-separates their memory peaks. Each of the four staged jobs also allocates a
+separates their memory peaks. Each staged job also allocates a
 10 GiB swap file on `/mnt` as runner headroom and logs processor count,
 RAM and swap after setup.
 
@@ -509,7 +509,26 @@ TurboQuant companion packages. Cold unit graphs matched the normal library
 and the selected integration target between the two invocations for each
 affected feature.
 
-All four staged legs also passed in separate four-CPU cgroups with 13 GiB
+The experimental ledger check also shut down on the hosted run and its
+failed-job retry. The five-job check reproduced a kernel OOM in a cold local
+cgroup with four CPUs, 15 GiB of RAM and 2 GiB of swap. Both budgets were
+exhausted while the normal library and root test harness were running. The
+last sample showed 6.62 GiB and 8.53 GiB of process RSS respectively.
+The kernel identified `rustc` as the victim. The ledger leg now uses the same
+staging with the same `--features experimental-ledger` and full `--tests`
+coverage. link:https://github.com/anvai-labs/proximaDB/actions/runs/45118740213/job/137541561865[Hosted retry].
+
+The ONNX, CDC and DuckDB leg reproduced the same local kernel OOM at
+15 GiB of RAM and nearly 2 GiB of swap in the last sample. Its normal
+library and test harness were active at the same time, with 7.00 GiB and
+8.55 GiB of RSS respectively. This control reused dependency metadata
+from the ledger comparison and compiled the ONNX and bundled
+DuckDB dependencies for the first time in that target directory.
+The staged lane retains the full feature check and its separate ONNX
+runtime test step.
+link:https://github.com/anvai-labs/proximaDB/actions/runs/45118740213/job/137541562106[Hosted retry].
+
+The staged legs passed in separate four-CPU cgroups with 13 GiB
 of RAM and swap disabled. The targets reused dependency metadata from the
 failed controls or earlier constrained checks. There were no OOM events.
 
@@ -520,6 +539,8 @@ failed controls or earlier constrained checks. There were no OOM events.
 | Cold deletion vectors | 10m16s | 10.84 GiB
 | Experimental engines, including embedded | 13m29s | 11.24 GiB
 | TurboQuant, including companion packages | 12m57s | 11.33 GiB
+| Experimental ledger | 7m17s | 11.43 GiB
+| ONNX, CDC and DuckDB | 7m03s | 10.99 GiB
 |===
 
 Use a fresh `CARGO_TARGET_DIR` for each cold comparison, then reuse the same

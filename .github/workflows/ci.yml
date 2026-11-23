@@ -1548,7 +1548,9 @@ jobs:
           - { label: "ledger-durable",      pkg: proximadb-ledger, args: "--features durable" }
           # Ledger modality gRPC service (S3, ADR-071) — the ProximaLedgerService + its port wiring
           # are behind the non-default `experimental-ledger` feature on the root crate.
-          - { label: "experimental-ledger", pkg: proximadb,        args: "--features experimental-ledger" }
+          # Stage this check because a local runner-sized cgroup reproduced the
+          # overlapping root library and unit-test compiler OOM.
+          - { label: "experimental-ledger", pkg: proximadb,        staged_root: true, args: "--features experimental-ledger" }
           # rank-onnx BERT tokenizer surface (bert_pair_tokenizing_extractor):
           # the feature is non-default, so two of its tests rotted silently for
           # months (still asserting the pre-#1741 pad-to-max_seq_len contract;
@@ -1583,11 +1585,12 @@ jobs:
           # dependencies as libs only, so their gated #[cfg(test)] code needs its own -p.
           - { label: "experimental-turboquant", pkg: "proximadb proximadb-quantization-types proximadb-quantization-model proximadb-distance-kernel proximadb-vector proximadb-quantization-kernel", staged_root: true, args: "--features experimental-turboquant" }
           # TD-TQFEAT-1 class: three more non-default root features whose gated code
-          # (incl. the onnx-gated service_tests module and cdc-kafka's three
+          # (incl. the ONNX-gated Arrow IPC service test and cdc-kafka's three
           # required-features [[test]] targets) no leg compiled. The server's own
           # `onnx` feature forwards only to proximadb-embedding, so root onnx code
-          # needs this -p proximadb leg.
-          - { label: "onnx-cdc-duckdb",     pkg: proximadb,        args: "--features onnx,cdc-kafka,duckdb" }
+          # needs this -p proximadb leg. A local cgroup reproduced the
+          # overlapping root compiler OOM during this check as well.
+          - { label: "onnx-cdc-duckdb",     pkg: proximadb,        staged_root: true, args: "--features onnx,cdc-kafka,duckdb" }
           # Embedded crate (default, no language bindings) — validates the extracted
           # crate compiles against root at every tier. The full wheel build stays in
           # release-python.yml (heavy pyo3/numpy deps).
