@@ -1364,6 +1364,24 @@ impl SystemCatalog {
             // reload an older root over a current one (monotonic reads).
             return Ok(ReloadOutcome::UpToDate);
         }
+        // Review round 2 (HIGH): in the un-healed flip-flop window the loaded
+        // image — adopted from the NEWER legacy log while the kill switch was
+        // OFF, or by the boot reconciliation — outranks the still-stale root
+        // tip by fencing generation. Adopting that root would resurrect
+        // tables dropped in the escape window and hide the window's DDLs.
+        // Stay put; the owner's heal publish carries generation >= loaded+1
+        // and reloads normally below.
+        let loaded_generation = self.loaded_generation.load(Ordering::SeqCst);
+        if root_read.generation < loaded_generation {
+            tracing::warn!(
+                catalog = %self.name,
+                root_generation = root_read.generation,
+                loaded_generation,
+                "sharded reload skipped: the loaded image outranks the root tip \
+                 (un-healed kill-switch flip window); waiting for the heal publish"
+            );
+            return Ok(ReloadOutcome::UpToDate);
+        }
         let (_, _, writer_version, _, shard_index) =
             SystemCatalogState::decode_catalog_root(&root_read.bytes).with_context(|| {
                 format!(
@@ -4837,6 +4855,172 @@ mod tests {
                  by the legacy GLOBAL high-water — ids 2..5 must not be re-minted"
             );
         }
+        Ok(())
+    }
+
+    /// Review round 2 (HIGH, adapted from the reviewer's
+    /// `zz_probe_r2_reload_crossover_adopts_stale_root_in_unhealed_window`):
+    /// a follower that correctly crossed to the newer LEGACY image during the
+    /// OFF window must NOT flip back to the stale root before the owner's
+    /// heal publish. Mutation control: removing the generation guard in
+    /// `reload_sharded_locked` (adopt any root passing `reload_needed`)
+    /// resurrects t1 in Phase 4.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn zz_probe_reload_crossover_skips_the_stale_root_in_the_unhealed_window() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let backing: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let namespace = nslevels(&["acme", "sales"]);
+        let t1 = TableIdentifier::new(namespace.clone(), "t1");
+        let t2 = TableIdentifier::new(namespace.clone(), "t2");
+
+        // ON: publish root (generation G1) with t1.
+        {
+            let store = object_store(&backing);
+            let owner = SystemCatalog::open_with_snapshot_store(
+                "default",
+                dir.path().join("on1.wal"),
+                store.clone(),
+            )
+            .await?;
+            owner
+                .create_namespace_for_tenant(&namespace, HashMap::new(), Some("acme"))
+                .await?;
+            create_named(&owner, &namespace, "t1").await?;
+        }
+        // OFF escape: DROP t1, CREATE t2 — the legacy log outranks the root.
+        {
+            let _guard = EnvGuard::set("PROXIMADB_CATALOG_SHARDED_SNAPSHOT_DISABLE", "1");
+            let store = object_store(&backing);
+            let owner = SystemCatalog::open_with_snapshot_store(
+                "default",
+                dir.path().join("off.wal"),
+                store.clone(),
+            )
+            .await?;
+            assert!(owner.drop_table(&t1, false).await?);
+            create_named(&owner, &namespace, "t2").await?;
+        }
+        // ON follower boots: the reconciliation adopts the NEWER legacy image
+        // (t1 gone, t2 present) at a generation above the stale root's.
+        let store = object_store(&backing);
+        let follower =
+            SystemCatalog::open_follower("default", dir.path().join("follower.wal"), store.clone())
+                .await?;
+        assert!(!follower.table_exists(&t1).await?);
+        assert!(follower.table_exists(&t2).await?);
+
+        // The un-healed window: the root tip is unchanged and STALE. The
+        // reload must skip it (UpToDate on the correct image), not adopt it.
+        assert_eq!(follower.reload_if_stale().await?, ReloadOutcome::UpToDate);
+        assert!(
+            !follower.table_exists(&t1).await?,
+            "the stale root must not resurrect a table dropped in the escape window"
+        );
+        assert!(
+            follower.table_exists(&t2).await?,
+            "the stale root must not hide a table created in the escape window"
+        );
+
+        // Heal: an ON owner boots, reconciles and republishes root+shards at
+        // a generation above the follower's loaded image — the follower now
+        // adopts it, and the image is still the escape window's.
+        {
+            let owner = SystemCatalog::open_with_snapshot_store(
+                "default",
+                dir.path().join("on2.wal"),
+                store.clone(),
+            )
+            .await?;
+            assert!(!owner.table_exists(&t1).await?);
+        }
+        match follower.reload_if_stale().await? {
+            ReloadOutcome::Reloaded { .. } => {}
+            other => panic!("the healed root must reload the follower, got {other:?}"),
+        }
+        assert!(!follower.table_exists(&t1).await?);
+        assert!(follower.table_exists(&t2).await?);
+        Ok(())
+    }
+
+    /// Review round 2 (LOW-c): the reseeded whole image must carry the
+    /// PER-ACCOUNT high-water, not just the global recovery — globex minted
+    /// only id 1, so after the escape its next mint is 2, not 6 (the global
+    /// recovery would seed every account with acme's high-water 5).
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn per_account_high_water_carries_per_account_values_not_the_global_recovery()
+    -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let backing: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+
+        // ON: acme mints namespace ids 1..=5; globex mints id 1.
+        {
+            let store = object_store(&backing);
+            let owner = SystemCatalog::open_with_snapshot_store(
+                "default",
+                dir.path().join("on.wal"),
+                store.clone(),
+            )
+            .await?;
+            for i in 1..=5u16 {
+                let ns = nslevels(&["acme", &format!("n{i}")]);
+                owner
+                    .create_namespace_for_tenant(&ns, HashMap::new(), Some("acme"))
+                    .await?;
+                let table = create_named(&owner, &ns, "t").await?;
+                assert_eq!(table.stable_namespace_id, Some(i));
+            }
+            let ns = nslevels(&["globex", "only"]);
+            owner
+                .create_namespace_for_tenant(&ns, HashMap::new(), Some("globex"))
+                .await?;
+            let table = create_named(&owner, &ns, "t").await?;
+            assert_eq!(table.stable_namespace_id, Some(1));
+        }
+        // Escape OFF (reseed) and back ON: per-account values must survive.
+        {
+            let _guard = EnvGuard::set("PROXIMADB_CATALOG_SHARDED_SNAPSHOT_DISABLE", "1");
+            let store = object_store(&backing);
+            let _owner = SystemCatalog::open_with_snapshot_store(
+                "default",
+                dir.path().join("off.wal"),
+                store.clone(),
+            )
+            .await?;
+        }
+        let store = object_store(&backing);
+        let reborn = SystemCatalog::open_with_snapshot_store(
+            "default",
+            dir.path().join("on2.wal"),
+            store.clone(),
+        )
+        .await?;
+        let acme_next = nslevels(&["acme", "next"]);
+        reborn
+            .create_namespace_for_tenant(&acme_next, HashMap::new(), Some("acme"))
+            .await?;
+        assert_eq!(
+            create_named(&reborn, &acme_next, "t")
+                .await?
+                .stable_namespace_id,
+            Some(6),
+            "acme's own high-water (5) floors its next mint"
+        );
+        let globex_next = nslevels(&["globex", "next"]);
+        reborn
+            .create_namespace_for_tenant(&globex_next, HashMap::new(), Some("globex"))
+            .await?;
+        assert_eq!(
+            create_named(&reborn, &globex_next, "t")
+                .await?
+                .stable_namespace_id,
+            Some(2),
+            "globex's own high-water (1) floors its next mint — the reseeded \
+             image must carry PER-ACCOUNT values, not the global recovery"
+        );
         Ok(())
     }
 }
