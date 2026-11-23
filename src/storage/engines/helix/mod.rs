@@ -2235,14 +2235,13 @@ impl UnifiedStorageFormat for HelixEngine {
                         && entry
                             .url
                             .ends_with(crate::storage::engines::constants::HELIX_FILE_EXT)
-                    {
-                        if let Some(path) = compaction::discovered_sstable_path(
-                            Path::new(&storage_url),
+                        && let Some(path) = compaction::discovered_sstable_path(
+                            Path::new(storage_url),
                             Path::new(&entry.url),
                             &self.filesystem_factory,
-                        ) {
-                            files.push(path.to_string_lossy().into_owned());
-                        }
+                        )
+                    {
+                        files.push(path.to_string_lossy().into_owned());
                     }
                 }
             }
