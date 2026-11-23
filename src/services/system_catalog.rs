@@ -750,7 +750,12 @@ impl SystemCatalog {
         // allocator floors are seeded, so an older binary's field-less
         // snapshot + compacted WAL cannot lower the floor below an id this
         // deployment already minted.
-        Self::adopt_identity_high_water_sidecar(&state, snapshot_store.as_ref()).await;
+        Self::adopt_identity_high_water_sidecar(
+            &state,
+            snapshot_store.as_ref(),
+            claim_owner && state.loaded_legacy_namespace_snapshot(),
+        )
+        .await?;
 
         // Owner claims the next generation — a pod taking the catalog over
         // outranks the one it replaced, so its first fenced commit fences any
@@ -824,11 +829,7 @@ impl SystemCatalog {
 
     /// TD-SPINE-2: assemble the full in-RAM authority from a published ROOT
     /// plus every shard in its index (boot / follower assembly), returning
-    /// the per-account shard-log versions observed (the local copy of the
-    /// root index that reload later diffs against). A shard the root
-    /// references but whose log is absent is skipped with a WARN — the root's
-    /// own index still governs what that account's rows should be, and the
-    /// next publish repairs it.
+    /// the exact per-account shard-log versions named by the root.
     async fn assemble_root_and_shards(
         root_read: &crate::services::catalog_snapshot_store::SnapshotRead,
         store: &dyn CatalogSnapshotStore,
@@ -838,18 +839,10 @@ impl SystemCatalog {
                 .with_context(|| format!("decoding catalog root {}", store.describe()))?;
         let mut shards = Vec::with_capacity(shard_index.len());
         let mut versions = HashMap::with_capacity(shard_index.len());
-        for account in shard_index.keys() {
-            if let Some(read) = store.read_shard(account).await? {
-                shards.push((account.clone(), read.bytes));
-                versions.insert(account.clone(), read.version);
-            } else {
-                tracing::warn!(
-                    account = %account,
-                    store = %store.describe(),
-                    "catalog root references a shard with no committed log; \
-                     skipping it (the root's older version still governs)"
-                );
-            }
+        for (account, version) in shard_index {
+            let read = store.read_shard_version(&account, version).await?;
+            versions.insert(account.clone(), version);
+            shards.push((account, read.bytes));
         }
         let state = SystemCatalogState::from_root_and_shards(&root_read.bytes, &shards)?;
         Ok((state, versions))
@@ -997,15 +990,14 @@ impl SystemCatalog {
 
     /// TD-PATH-2 4a: fold the durable high-water sidecar into `state`
     /// (`fetch_max(sidecar, snapshot.ids_high_water, WAL replay)`) and WARN on
-    /// a lagging stamp. Non-fatal by design: a missing, unreadable or corrupt
-    /// sidecar only loses DROPPED-id memory (live schemas still bound the
-    /// floor), and the merge-before-write in
-    /// [`Self::persist_identity_high_water_sidecar`] repairs the file before
-    /// the next checkpoint compacts anything.
+    /// a lagging stamp. A writable legacy image can depend on the sidecar
+    /// to reserve retired namespace IDs, so read and decode errors prevent
+    /// that owner from accepting writes.
     async fn adopt_identity_high_water_sidecar(
         state: &SystemCatalogState,
         store: &dyn CatalogSnapshotStore,
-    ) {
+        required: bool,
+    ) -> Result<()> {
         match store.read_identity_high_water().await {
             Ok(Some(bytes)) => match state.adopt_identity_high_water_sidecar_bytes(&bytes) {
                 Ok(stamp) => {
@@ -1021,6 +1013,10 @@ impl SystemCatalog {
                         );
                     }
                 }
+                Err(error) if required => {
+                    return Err(error)
+                        .context("recovering namespace IDs from a legacy catalog sidecar");
+                }
                 Err(error) => tracing::warn!(
                     store = %store.describe(),
                     error = %error,
@@ -1028,6 +1024,9 @@ impl SystemCatalog {
                 ),
             },
             Ok(None) => {}
+            Err(error) if required => {
+                return Err(error).context("reading the legacy catalog identity sidecar");
+            }
             Err(error) => tracing::warn!(
                 store = %store.describe(),
                 error = %error,
@@ -1035,6 +1034,7 @@ impl SystemCatalog {
                  before the next sidecar write"
             ),
         }
+        Ok(())
     }
 
     /// TD-PATH-2 4a: persist the identity high-water sidecar. Merge-first: the
@@ -1045,13 +1045,22 @@ impl SystemCatalog {
     async fn persist_identity_high_water_sidecar(&self, cfg: &SnapshotConfig) -> Result<()> {
         match cfg.store.read_identity_high_water().await {
             Ok(Some(bytes)) => {
-                if let Err(error) = self.state.adopt_identity_high_water_sidecar_bytes(&bytes) {
-                    tracing::warn!(
-                        store = %cfg.store.describe(),
-                        error = %error,
-                        "existing identity high-water sidecar is unreadable; replacing \
-                         it with the state-derived floor"
-                    );
+                self.state
+                    .adopt_identity_high_water_sidecar_bytes(&bytes)
+                    .context("merging existing identity high-water sidecar before rewrite")?;
+                let floors: Vec<_> = self
+                    .state
+                    .ns_high_water_accounts()
+                    .into_iter()
+                    .filter_map(|account| {
+                        self.state
+                            .max_namespace_id_ever_for(&account)
+                            .map(|floor| (account, floor))
+                    })
+                    .collect();
+                let mut allocator = self.namespace_alloc.write();
+                for (account, floor) in floors {
+                    allocator.raise_floor(&account, floor);
                 }
             }
             Ok(None) => {}
@@ -1181,9 +1190,9 @@ impl SystemCatalog {
 
         // 1. Commit the touched shards (idempotent images of the in-RAM
         //    authority for exactly those accounts).
-        let touched: Vec<String> = std::mem::take(&mut *self.pending_shards.lock())
-            .into_iter()
-            .collect();
+        // Keep the pending set until the root commits. Any serialization,
+        // shard, or root error leaves the entire set available for retry.
+        let touched = self.pending_shards.lock().clone();
         let shard_writes: Vec<(String, Vec<u8>)> = touched
             .iter()
             .map(|account| {
@@ -1202,14 +1211,6 @@ impl SystemCatalog {
                 // not become the named tips; do NOT publish a root over
                 // them. Step down exactly like a fenced whole-image
                 // checkpoint (reload the winner's image, go read-only).
-                // LOW-1 (review): the drained pending set is RESTORED — the
-                // step-down reloads the winner's image, but if this pod ever
-                // reacquires write authority (the Phase 7 lease), its next
-                // publish must still carry these accounts, not silently
-                // drop them.
-                self.pending_shards
-                    .lock()
-                    .extend(shard_writes.iter().map(|(account, _)| account.clone()));
                 tracing::warn!(
                     catalog = %self.name,
                     generation,
@@ -1237,12 +1238,6 @@ impl SystemCatalog {
                 self.loaded_generation.store(generation, Ordering::SeqCst);
             }
             SnapshotWrite::Fenced => {
-                // LOW-1 (review): restore the pending set — the shards DID
-                // land (orphan tips the stale root does not name), and a pod
-                // that later reacquires write authority must republish them.
-                self.pending_shards
-                    .lock()
-                    .extend(shard_writes.iter().map(|(account, _)| account.clone()));
                 tracing::warn!(
                     catalog = %self.name,
                     generation,
@@ -1254,6 +1249,10 @@ impl SystemCatalog {
                 return Ok(());
             }
         }
+
+        self.pending_shards
+            .lock()
+            .retain(|account| !touched.contains(account));
 
         // 3. TD-PATH-2 4a: the durable high-water sidecar BEFORE compaction
         //    (identical contract to the whole-image branch: the sidecar is
@@ -1390,43 +1389,19 @@ impl SystemCatalog {
                     cfg.store.describe()
                 )
             })?;
-        self.state.adopt_root_bytes(&root_read.bytes)?;
         let known = self.shard_versions.read().clone();
         let mut updated = known.clone();
+        let mut changed = Vec::new();
         for (account, root_version) in &shard_index {
             if known.get(account) == Some(root_version) {
-                continue; // unchanged shard — do not even fetch it
+                continue;
             }
-            match cfg.store.read_shard(account).await? {
-                Some(read) => {
-                    self.state
-                        .load_shard_bytes(account, &read.bytes)
-                        .with_context(|| {
-                            format!(
-                                "reloading catalog '{}' shard '{account}' from {}",
-                                self.name,
-                                cfg.store.describe()
-                            )
-                        })?;
-                    updated.insert(account.clone(), read.version);
-                }
-                None => tracing::warn!(
-                    catalog = %self.name,
-                    account = %account,
-                    store = %cfg.store.describe(),
-                    // LOW-4 (review): this skip leaves that account's rows
-                    // absent from RAM until its next DDL republishes the
-                    // shard. It is reachable only by EXTERNAL deletion of a
-                    // committed shard object (the publish protocol commits a
-                    // shard before the root that names it, so a healthy
-                    // writer never produces a dangling index entry); the
-                    // alternative — adopting a fabricated empty shard —
-                    // would retire live rows.
-                    "published root names a shard with no committed log; \
-                     keeping the previously adopted image for that account"
-                ),
-            }
+            let read = cfg.store.read_shard_version(account, *root_version).await?;
+            updated.insert(account.clone(), *root_version);
+            changed.push((account.clone(), read.bytes));
         }
+        self.state
+            .adopt_root_with_shards(&root_read.bytes, &changed)?;
         if proximadb_catalog::identity_writer_version_lags(writer_version) {
             tracing::warn!(
                 catalog = %self.name,
@@ -1436,7 +1411,7 @@ impl SystemCatalog {
                  high-water, the floor leans on the sidecar)"
             );
         }
-        Self::adopt_identity_high_water_sidecar(&self.state, cfg.store.as_ref()).await;
+        Self::adopt_identity_high_water_sidecar(&self.state, cfg.store.as_ref(), false).await?;
         if let Some(max) = self.state.max_account_id() {
             self.account_floor
                 .fetch_max(u64::from(max) + 1, Ordering::SeqCst);
@@ -1521,7 +1496,7 @@ impl SystemCatalog {
                  high-water, the floor leans on the sidecar)"
             );
         }
-        Self::adopt_identity_high_water_sidecar(&self.state, cfg.store.as_ref()).await;
+        Self::adopt_identity_high_water_sidecar(&self.state, cfg.store.as_ref(), false).await?;
         // The snapshot may contain account ids minted by another pod after
         // this instance booted. Keep the local allocator strictly above every
         // adopted id even when the reload is same-generation (and therefore
@@ -2807,6 +2782,7 @@ mod tests {
     /// it is warn-only, and a reader cannot tell it succeeded.)
     struct FailingSidecarStore {
         inner: LocalSnapshotStore,
+        fail_first_read: AtomicBool,
     }
 
     #[async_trait::async_trait]
@@ -2818,6 +2794,12 @@ mod tests {
         }
         async fn write_atomic(&self, generation: u64, bytes: &[u8]) -> Result<SnapshotWrite> {
             self.inner.write_atomic(generation, bytes).await
+        }
+        async fn read_identity_high_water(&self) -> Result<Option<Vec<u8>>> {
+            if self.fail_first_read.swap(false, Ordering::SeqCst) {
+                anyhow::bail!("injected sidecar-read failure");
+            }
+            self.inner.read_identity_high_water().await
         }
         async fn write_identity_high_water(&self, _bytes: &[u8]) -> Result<()> {
             Err(anyhow!("injected sidecar-write failure (test)"))
@@ -2837,6 +2819,7 @@ mod tests {
         let wal = dir.path().join("catalog.wal");
         let store = Arc::new(FailingSidecarStore {
             inner: LocalSnapshotStore::new(wal.with_extension("snapshot")),
+            fail_first_read: AtomicBool::new(false),
         });
         let ns = nslevels(&["sidecar_fail"]);
         let cat = SystemCatalog::open_with_snapshot_store("default", &wal, store).await?;
@@ -2866,6 +2849,50 @@ mod tests {
                 .table_exists(&TableIdentifier::new(ns, "t"))
                 .await?
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn legacy_owner_retries_sidecar_recovery_before_minting() -> Result<()> {
+        #[derive(serde::Serialize)]
+        struct LegacySnapshot {
+            namespaces: HashMap<Vec<String>, CatalogNamespace>,
+            tables: HashMap<TableIdentifier, CatalogTableSchema>,
+            applied_seq: u64,
+        }
+        let dir = tempfile::tempdir()?;
+        let wal = dir.path().join("legacy.wal");
+        let inner = LocalSnapshotStore::new(wal.with_extension("snapshot"));
+        let live_ns = nslevels(&["live"]);
+        let mut live = CatalogTableSchema::new("t");
+        live.stable_namespace_id = Some(1);
+        let legacy = LegacySnapshot {
+            namespaces: HashMap::from([(live_ns.clone(), CatalogNamespace::new(live_ns.clone()))]),
+            tables: HashMap::from([(TableIdentifier::new(live_ns, "t"), live)]),
+            applied_seq: 0,
+        };
+        inner
+            .write_atomic(1, &rmp_serde::to_vec_named(&legacy)?)
+            .await?;
+        let sidecar = rmp_serde::to_vec_named(
+            &serde_json::json!({"high_water": {"object_id": 0, "collection_id": 0, "namespace_id": 5}}),
+        )?;
+        inner.write_identity_high_water(&sidecar).await?;
+        let store = Arc::new(FailingSidecarStore {
+            inner,
+            fail_first_read: AtomicBool::new(true),
+        });
+        let refused = SystemCatalog::open_with_snapshot_store("default", &wal, store.clone()).await;
+        assert!(
+            refused.is_err(),
+            "owner cannot serve while the legacy floor is unknown"
+        );
+
+        let recovered = SystemCatalog::open_with_snapshot_store("default", &wal, store).await?;
+        let fresh = nslevels(&["fresh"]);
+        recovered.create_namespace(&fresh, HashMap::new()).await?;
+        let table = create_named(&recovered, &fresh, "t").await?;
+        assert_eq!(table.stable_namespace_id, Some(6));
         Ok(())
     }
 
@@ -4299,7 +4326,15 @@ mod tests {
         // The crash window: a shard version commits (by the owner's own
         // serializer, same generation — exactly what a lost root PUT leaves
         // behind) but the root does not advance.
-        let orphan_bytes = owner.state.to_shard_bytes("acme")?;
+        let orphan = SystemCatalogState::from_snapshot_bytes(&owner.state.to_snapshot_bytes()?)?;
+        let orders = TableIdentifier::new(nslevels(&["acme", "sales"]), "orders");
+        orphan.apply_committed(
+            orphan.applied_seq() + 1,
+            CatalogDelta::DropTable {
+                identifier: orders.clone(),
+            },
+        );
+        let orphan_bytes = orphan.to_shard_bytes("acme")?;
         let orphan_version = match store
             .commit_shards(owner.generation(), &[("acme".to_string(), orphan_bytes)])
             .await?
@@ -4317,6 +4352,13 @@ mod tests {
             store.latest_root_version().await?,
             Some(root_v1),
             "a shard-only commit never advances the root"
+        );
+        let fresh =
+            SystemCatalog::open_follower("default", dir.path().join("fresh.wal"), store.clone())
+                .await?;
+        assert!(
+            fresh.table_exists(&orders).await?,
+            "a fresh reader must use the shard named by the root"
         );
         // The follower is unaffected: no root advance, no reload.
         assert_eq!(follower.reload_if_stale().await?, ReloadOutcome::UpToDate);

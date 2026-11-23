@@ -181,6 +181,11 @@ pub trait CatalogSnapshotStore: Send + Sync {
         anyhow::bail!("store does not support sharded catalog snapshots")
     }
 
+    /// Read exactly the shard version named by a published catalog root.
+    async fn read_shard_version(&self, _account: &str, _version: u64) -> Result<SnapshotRead> {
+        anyhow::bail!("store does not support sharded catalog snapshots")
+    }
+
     /// TD-PATH-2 4a: read the durable identity-high-water sidecar, if this
     /// store keeps one and it has been written. The sidecar is a sibling of
     /// the snapshot pointer, deliberately OUTSIDE every path a snapshot
@@ -636,6 +641,24 @@ impl CatalogSnapshotStore for ObjectStoreSnapshotStore {
 
     async fn read_shard(&self, account: &str) -> Result<Option<SnapshotRead>> {
         read_log_tip(&self.shard_committer(account), account, &self.label).await
+    }
+
+    async fn read_shard_version(&self, account: &str, version: u64) -> Result<SnapshotRead> {
+        let (generation, bytes) = self
+            .shard_committer(account)
+            .read_fenced(version)
+            .await
+            .with_context(|| {
+                format!(
+                    "reading catalog shard '{account}' at {}@{version}",
+                    self.label
+                )
+            })?;
+        Ok(SnapshotRead {
+            version,
+            generation,
+            bytes: bytes.to_vec(),
+        })
     }
 
     async fn read_identity_high_water(&self) -> Result<Option<Vec<u8>>> {

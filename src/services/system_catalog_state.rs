@@ -889,6 +889,10 @@ impl SystemCatalogState {
         self.inner.read().loaded_writer_version
     }
 
+    pub(super) fn loaded_legacy_namespace_snapshot(&self) -> bool {
+        self.inner.read().loaded_legacy_namespace_snapshot
+    }
+
     // --- TD-SPINE-2: sharded snapshot (root + one shard per account) -------
 
     /// The highest typed namespace id ever minted **in one account** (live or
@@ -1083,10 +1087,18 @@ impl SystemCatalogState {
     /// global registries are replaced wholesale (small, root-authoritative);
     /// the identity high-water merges monotonically (never lowers); the
     /// replay watermark advances to the publisher's.
-    pub fn adopt_root_bytes(&self, root_bytes: &[u8]) -> Result<()> {
+    pub fn adopt_root_with_shards(
+        &self,
+        root_bytes: &[u8],
+        shards: &[(String, Vec<u8>)],
+    ) -> Result<()> {
         let root: CatalogRootRecord =
             crate::services::catalog_record_envelope::from_enveloped_slice(root_bytes)
                 .context("decoding catalog root")?;
+        let shards = shards
+            .iter()
+            .map(|(account, bytes)| Self::decode_shard(account, bytes))
+            .collect::<Result<Vec<_>>>()?;
         let mut inner = self.inner.write();
         inner.account_ids = root.account_ids;
         inner
@@ -1100,6 +1112,10 @@ impl SystemCatalogState {
             let entry = inner.account_ns_high_water.entry(account).or_insert(0);
             *entry = (*entry).max(id);
         }
+        for shard in shards {
+            inner.remove_shard_rows(&shard.account);
+            inner.apply_shard(shard);
+        }
         Ok(())
     }
 
@@ -1107,7 +1123,16 @@ impl SystemCatalogState {
     /// Replaces EXACTLY that account's rows — every other account's rows,
     /// and the read-your-writes window for them, are untouched — and folds
     /// the shard's per-account namespace-id high-water monotonically.
+    #[cfg(test)]
     pub fn load_shard_bytes(&self, account: &str, shard_bytes: &[u8]) -> Result<()> {
+        let shard = Self::decode_shard(account, shard_bytes)?;
+        let mut inner = self.inner.write();
+        inner.remove_shard_rows(account);
+        inner.apply_shard(shard);
+        Ok(())
+    }
+
+    fn decode_shard(account: &str, shard_bytes: &[u8]) -> Result<CatalogShardRecord> {
         let shard: CatalogShardRecord =
             crate::services::catalog_record_envelope::from_enveloped_slice(shard_bytes)
                 .with_context(|| format!("decoding catalog shard '{account}'"))?;
@@ -1118,10 +1143,7 @@ impl SystemCatalogState {
                 shard.account
             );
         }
-        let mut inner = self.inner.write();
-        inner.remove_shard_rows(account);
-        inner.apply_shard(shard);
-        Ok(())
+        Ok(shard)
     }
 
     /// TD-PATH-2 4a: encode the durable high-water sidecar image (see

@@ -63,7 +63,7 @@
   resurrected or lost. **Breaking change (accepted pre-GA, 2026-11-22):** a
   mixed ON/OFF fleet diverges by design — the escape is fleet-wide. Round-trip
   per DDL is 2 extra HEAD/LIST probes (shard + root logs) vs 1 on the legacy
-  path; bytes per DDL drop from O(fleet) to O(account) — the trade ADR-098
+  path; shard payload bytes per DDL scale with the changed account — the trade ADR-098
   D1.3 chooses.
 * **Version spaces (review HIGH-2, fixed 2026-11-22):** the root and legacy
   logs number their snapshots independently (each from 0). Reload
@@ -88,20 +88,17 @@
   during the OFF window; the ON owner has not yet healed the root) the reload
   stays put instead of adopting the stale root, closing reader-visible
   resurrection of dropped tables (`zz_probe_reload_crossover_skips_the_stale_root_in_the_unhealed_window`).
-  (MED) the identity sidecar's GLOBAL namespace-id high-water floors
-  the per-account map after the sidecar merge, but ONLY when the map is
-  EMPTY at the fold (`adopt_identity_high_water_sidecar_bytes`) — the
-  legacy fieldless boot with no live stable-id rows, where the sidecar is
-  the sole witness (`fieldless_snapshot_preserves_legacy_and_attributed_sidecar_floors`).
-  Round 3 found that a fieldless legacy snapshot with live stable-ID rows
-  rebuilt a non-empty map before the sidecar was read. The reader now tracks
-  whether the snapshot contained that field. For a legacy sidecar with a
-  global floor, migration reserves that floor for the snapshot's known
-  accounts, including the default shard and accounts with no live rows.
-  New sidecars record each account's floor and merge those floors
-  monotonically. This preserves per-account allocation for modern snapshots
-  and retains dropped namespace IDs when a legacy writer omits the
-  per-account field. The regression covers both sidecar formats.
+  (MED) the identity sidecar now preserves the per-account namespace floor.
+  A legacy snapshot that lacks this map conservatively reserves an
+  unattributed sidecar floor for known historical accounts, even when live
+  rows rebuilt a partial map. Modern sidecars carry attributed floors.
+  An owner recovering a fieldless snapshot fails startup when the sidecar
+  cannot be read or decoded. The owner retries without allocating IDs.
+  The root and sidecar still carry fleet-wide account metadata, and identity
+  writes read existing sidecar metadata before replacing it. The account-sized
+  result describes shard payloads and excludes both of these global records.
+  Shard reads use the exact version published by the root, and an aborted
+  checkpoint retains its pending accounts for retry.
   (LOW-c) the
   reseed path's per-account carry is pinned by a two-account precision test
   (`per_account_high_water_carries_per_account_values_not_the_global_recovery`).
