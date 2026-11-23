@@ -1540,7 +1540,9 @@ jobs:
           - { label: "cloud-full",          pkg: proximadb-server, args: "--features cloud-full" }
           - { label: "cloud-full+onnx",     pkg: proximadb-server, args: "--features cloud-full,onnx" }
           # Other gated surfaces invisible to default CI:
-          - { label: "cluster",             pkg: proximadb,        args: "--features cluster" }
+          # Use the existing staged root build after the hosted cluster
+          # runner disconnected without producing a compiler result.
+          - { label: "cluster",             pkg: proximadb,        staged_root: true, args: "--features cluster" }
           # enterprise-catalogs moved to its own path-scoped job
           # (feature-matrix-enterprise-catalogs, same check name) — TD-CITIER-1.
           # Ledger modality durable backend (S2, ADR-071) — the WAL-backed impl is behind the
