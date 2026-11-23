@@ -1563,7 +1563,9 @@ jobs:
           # Refactor/move coverage: these configurations catch cfg drift hidden
           # by the default build. Keep them in the same mandatory matrix rather
           # than relying on a PR being correctly labelled as mechanical.
-          - { label: "no-default-features",  pkg: proximadb,        args: "--no-default-features" }
+          # Check the supported minimal library shape. Default-dependent
+          # integration targets (for example AXIS) compile in the workspace lane.
+          - { label: "no-default-features", pkg: proximadb, targets: "--lib", args: "--no-default-features" }
           # AXIS cfg feature (TD-AXIS-4 Superseded): default ON; this variant turns
           # it OFF while keeping the other defaults on — the PAX-exact-scan build that
           # excludes the AXIS index engine + its recall/advisor/drift surfaces. Catches
@@ -1634,14 +1636,14 @@ jobs:
             echo "::error::The object_store reqwest build selects native TLS instead of rustls"
             exit 1
           fi
-      - name: cargo check -p ${{ matrix.pkg }} --tests ${{ matrix.args }}
+      - name: cargo check -p ${{ matrix.pkg }} ${{ matrix.targets || '--tests' }} ${{ matrix.args }}
         env:
           CARGO_PROFILE_DEV_DEBUG: 0
         run: |
           # Batched small-crates entry: check each package sequentially on one runner.
           for pkg in ${{ matrix.pkg }}; do
-            echo "::group::cargo check -p $pkg --tests ${{ matrix.args }}"
-            cargo check -p "$pkg" --tests ${{ matrix.args }}
+            echo "::group::cargo check -p $pkg ${{ matrix.targets || '--tests' }} ${{ matrix.args }}"
+            cargo check -p "$pkg" ${{ matrix.targets || '--tests' }} ${{ matrix.args }}
             echo "::endgroup::"
           done
       # Same compile-is-not-verification rule as the enterprise-catalogs job
@@ -2979,7 +2981,7 @@ jobs:
           # (TD-RDSTRAT-14 / #2419: create refuses unpersisted properties, the
           # PATCH route is gone). It was in NO lane, so those assertions never
           # gated — a re-added route or a relaxed guard would have shipped.
-          for test_file in tests/*sst*.rs tests/*storage*.rs tests/*wal*.rs crates/binding/proximadb-embedded/tests/embedded_tenant_context.rs tests/td112_postflush_recall_e2e.rs tests/v2_post_flush_search_e2e.rs tests/recall_tune_auth_e2e.rs tests/mlflow_run_store_test.rs tests/iceberg_interop_e2e.rs; do
+          for test_file in tests/*sst*.rs tests/*storage*.rs tests/*wal*.rs tests/td112_postflush_recall_e2e.rs tests/v2_post_flush_search_e2e.rs tests/recall_tune_auth_e2e.rs tests/mlflow_run_store_test.rs tests/iceberg_interop_e2e.rs; do
             if [ -f "$test_file" ]; then
               test_name=$(basename "$test_file" .rs)
               echo "Running $test_name..."
@@ -2992,13 +2994,15 @@ jobs:
                 # manifest is a set-once singleton, so it needs the same
                 # process-per-test isolation.)
                 cargo nextest run --test "$test_name" --profile integration --retries 0
-              elif [[ "$test_name" == embedded_tenant_context ]]; then
-                cargo test -p proximadb-embedded --test "$test_name" -- --test-threads=1
               else
                 cargo test --test "$test_name" -- --test-threads=1
               fi
             fi
           done
+      - name: Verify embedded tenant isolation
+        env:
+          RUST_MIN_STACK: "8388608"
+        run: cargo test -p proximadb-embedded --test embedded_tenant_context -- --test-threads=1
       - name: Verify external file tables on 2 MiB worker stacks
         env:
           RUST_MIN_STACK: "2097152"

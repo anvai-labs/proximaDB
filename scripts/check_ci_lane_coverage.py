@@ -151,12 +151,29 @@ INLINE_FOR_RE = re.compile(r"\bfor\s+\w+\s+in\s+([^;\n]*);\s*do\b")
 COMPILE_ONLY_RE = re.compile(r"--no-run\b|\bnextest\s+list\b|--list\b")
 
 
+def package_runs_test(text: str, package: str, test_name: str) -> bool:
+    """Accept a named integration target only with its Cargo package selector."""
+    commands = re.sub(r"\\[ \t]*\n[ \t]*", " ", text)
+    package_option = rf"(?:-p[ =]|--package[ =]){re.escape(package)}(?=\s|$)"
+    test_option = rf"--test[ =]{re.escape(test_name)}(?=\s|$)"
+    return any(
+        re.search(package_option, command)
+        and re.search(test_option, command)
+        and not COMPILE_ONLY_RE.search(command)
+        for command in re.findall(r"(?m)^\s*(?:run:\s*)?cargo (?:test|nextest run)\s+([^\n]+)", commands)
+    )
+
+
 def is_covered(stem: str, file_name: str, text: str, patterns: list[str], *, directory: str = "tests") -> bool:
     """Covered = any reference anywhere in any workflow.
+
+    Embedded paths require a Cargo invocation naming both the package and target.
 
     Checks, in order: a `--test <stem>` invocation, the bare stem as a
     for-loop word, the literal file path, and finally glob expansion.
     """
+    if directory != "tests":
+        return package_runs_test(text, "proximadb-embedded", stem)
     if re.search(rf"--test[= ]{re.escape(stem)}\b", text):
         return True
     # Bare for-loop word: alone, with a line-continuation backslash, or as
@@ -187,7 +204,7 @@ def main() -> int:
         return 2
     text, compile_only_lines = run_block_text()
     # Execution globs inside run blocks, e.g. tests/*wal*.rs in a for-loop.
-    patterns = sorted(set(re.findall(r"((?:crates/[\w/-]+/)?tests/[^\s'\";)]+)", text)))
+    patterns = sorted(set(re.findall(r"(tests/[^\s'\";)]+)", text)))
     baseline = baseline_names()
 
     uncovered: set[str] = set()

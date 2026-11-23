@@ -35,6 +35,8 @@ from fnmatch import fnmatch
 from pathlib import Path
 import tomllib
 
+from check_ci_lane_coverage import package_runs_test
+
 ROOT = Path(__file__).resolve().parents[1]
 CONTRACT_PATH = ROOT / "docs" / "10-quality" / "RISK_CONTRACT.toml"
 CI_PATH = ROOT / ".github" / "workflows" / "ci.yml"
@@ -217,12 +219,19 @@ def main() -> int:
                 f"— the tier is not a required gate"
             )
             continue
-        if not _job_block(ci, tier):
+        block = _job_block(ci, tier)
+        if block is None:
             errors.append(f"[{rclass}] must_run_in_tier {tier!r} is not a job in ci.yml")
             continue
+        package = risk.get("test_package")
         for test_file in test_files:
-            tier_runs_test(ci, tier, test_file, errors, rclass)
-            tier_wiring_precise(ci, tier, test_file, declared_files, errors, rclass)
+            if package:
+                name = Path(test_file).stem
+                if not package_runs_test(block, package, name):
+                    errors.append(f"[{rclass}] tier {tier!r} must run cargo test -p {package} --test {name}")
+            else:
+                tier_runs_test(ci, tier, test_file, errors, rclass)
+                tier_wiring_precise(ci, tier, test_file, declared_files, errors, rclass)
 
     if errors:
         print("Risk-coverage contract validation failed:")

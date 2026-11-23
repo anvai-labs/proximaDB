@@ -433,6 +433,10 @@ Criterion-only and combined rows model separate benchmark packaging.
 Storage, graph, burn-down and QA lanes still select the same moved targets.
 The ABAC lane explicitly checks the embedded package against the ABAC-enabled
 root. The experimental-engine matrix also compiles its embedded tests.
+The root minimal-feature lane now checks the library with defaults disabled.
+The old dev dependency enabled AXIS through the embedded package, which
+masked unguarded AXIS imports in default integration targets. The workspace
+lane still compiles those targets with the default features.
 Run a moved target with `cargo test -p proximadb-embedded --test <target>`
 or `cargo bench -p proximadb-embedded --bench <target>`.
 

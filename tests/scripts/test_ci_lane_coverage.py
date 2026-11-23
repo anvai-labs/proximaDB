@@ -167,6 +167,15 @@ class BaselineRatchet(unittest.TestCase):
                 self.assertIn(target, guard.integration_targets())
                 self.assertEqual(guard.main(), 1)
                 workflow = tree.root / ".github/workflows/w0.yml"
+                for wrong_command in (
+                    "cargo test --test new_embedded_e2e",
+                    "cargo test -p proximadb-embedded --test new_embedded_e2e --no-run",
+                ):
+                    workflow.write_text(
+                        WORKFLOW_WITH_RUN_LIST + f"          {wrong_command}\n",
+                        encoding="utf-8",
+                    )
+                    self.assertEqual(guard.main(), 1)
                 workflow.write_text(
                     WORKFLOW_WITH_RUN_LIST
                     + "          cargo test -p proximadb-embedded --test new_embedded_e2e\n",
