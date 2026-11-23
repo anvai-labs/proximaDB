@@ -1245,39 +1245,67 @@ impl SystemCatalog {
         let mut index: std::collections::BTreeMap<String, u64> =
             self.shard_versions.read().clone().into_iter().collect();
         index.extend(committed);
-        // Review round 4 (MED): the candidate index is built from this pod's
-        // adopted view; a concurrently published root (equal fencing
-        // generation — the dual-boot model) may name accounts this pod has
-        // never seen, and publishing our index over it would REGRESS the
-        // root, which the retirement rule turns into live-row deletion on
-        // every follower. Refuse when the current tip is genuinely unseen
-        // (its version is above what this pod adopted) AND this pod's image
-        // does not outrank it by generation (the escape/heal window, where
-        // retirement of escape-dropped accounts is authoritative) AND the
-        // candidate drops accounts the tip names. Adopt the tip and surface
-        // the conflict: the retried DDL then covers.
-        if let Some(tip) = cfg.store.read_root().await? {
-            let outranks = self.loaded_generation.load(Ordering::SeqCst) > tip.generation;
-            let seen = tip.version <= self.loaded_version.load(Ordering::SeqCst);
-            if !outranks && !seen {
-                let (_, _, _, _, tip_index) = SystemCatalogState::decode_catalog_root(&tip.bytes)?;
-                let missing: Vec<&String> = tip_index
-                    .keys()
-                    .filter(|account| !index.contains_key(account.as_str()))
-                    .collect();
-                if !missing.is_empty() {
-                    tracing::warn!(
-                        catalog = %self.name,
-                        tip_version = tip.version,
-                        accounts = ?missing,
-                        "shard-index regression refused: a concurrent owner published                          accounts this pod has not adopted; reloading and surfacing                          the conflict (retry the DDL)"
-                    );
-                    self.reload_from_store_locked(cfg).await?;
-                    anyhow::bail!(
-                        "catalog '{}': concurrent owner advanced the root to v{} with                          accounts {missing:?} this pod had not adopted; the pod has                          reloaded — retry the DDL",
-                        self.name,
-                        tip.version
-                    );
+        // Review rounds 4-5 (MED): the candidate index is built from this
+        // pod's adopted view; a concurrently published root (equal fencing
+        // generation — the dual-boot model) may name accounts or shard
+        // versions this pod has not adopted, and publishing our index over
+        // it would REGRESS the root — which the retirement rule turns into
+        // live-row deletion on every follower. Probe the tip's VERSION
+        // first (cheap, no payload); only when it is genuinely unseen —
+        // NO_VERSION counts as unseen, and a legacy-space counter is never
+        // compared against a root tip (round 5 MED-1) — fetch the payload
+        // and refuse when the pod's image does not outrank it by
+        // generation (the escape/heal window keeps its authority) and the
+        // candidate would drop an account the tip names or pin a shard at
+        // an OLDER version than the tip's (round 5 MED-2). The refusal
+        // adopts the tip and surfaces the conflict; the DDL is retried
+        // after a pod restart (the pre-reload allocator may hold ids the
+        // reloaded state already assigned — the dual-boot id hazard).
+        {
+            let loaded = self.loaded_version.load(Ordering::SeqCst);
+            let loaded_is_root = self.loaded_version_is_root.load(Ordering::SeqCst);
+            let seen_by_version = cfg
+                .store
+                .latest_root_version()
+                .await?
+                .is_none_or(|tip_version| loaded_is_root && !version_is_newer(loaded, tip_version));
+            if !seen_by_version && let Some(tip) = cfg.store.read_root().await? {
+                let outranks = self.loaded_generation.load(Ordering::SeqCst) > tip.generation;
+                if !outranks {
+                    let (_, _, _, _, tip_index) =
+                        SystemCatalogState::decode_catalog_root(&tip.bytes).with_context(|| {
+                            format!(
+                                "decoding the root tip for the coverage check of '{}'",
+                                cfg.store.describe()
+                            )
+                        })?;
+                    let regressed: Vec<&String> = tip_index
+                        .iter()
+                        .filter(|(account, tip_version)| match index.get(account.as_str()) {
+                            Some(ours) => *tip_version > ours,
+                            None => true,
+                        })
+                        .map(|(account, _)| account)
+                        .collect();
+                    if !regressed.is_empty() {
+                        tracing::warn!(
+                            catalog = %self.name,
+                            tip_version = tip.version,
+                            accounts = ?regressed,
+                            "shard-index regression refused: a concurrent owner advanced                                  accounts/versions this pod has not adopted; adopting the tip                                  and surfacing the conflict (restart the pod and retry the DDL)"
+                        );
+                        if let Err(reload_error) = self.reload_from_store_locked(cfg).await {
+                            tracing::warn!(
+                                error = %reload_error,
+                                "post-refusal reload failed; surfacing the conflict anyway"
+                            );
+                        }
+                        anyhow::bail!(
+                            "catalog '{}': concurrent owner advanced the root to v{} with                                  accounts/versions {regressed:?} this pod had not adopted; the                                  pod has reloaded — restart it and retry the DDL",
+                            self.name,
+                            tip.version
+                        );
+                    }
                 }
             }
         }
@@ -5303,6 +5331,238 @@ mod tests {
         assert!(
             fresh
                 .table_exists(&TableIdentifier::new(beta.clone(), "t2"))
+                .await?
+        );
+        Ok(())
+    }
+
+    /// Review round 5 (MED-1, from the reviewer's
+    /// `zz_probe_r5_fresh_store_dual_boot`): a fresh store's boot carries
+    /// NO_VERSION — the coverage check must treat that as "nothing seen",
+    /// not "seen everything", or the FIRST dual-boot publish of a new
+    /// deployment regresses the root and followers retire the other
+    /// owner's account.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn fresh_store_dual_boot_cannot_drop_the_other_owners_account() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let backing: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let gamma = nslevels(&["gamma", "ops"]);
+        let beta = nslevels(&["beta", "eng"]);
+
+        // Both owners boot the BRAND-NEW store (no root yet; equal
+        // generation claims). A boots first and holds its view.
+        let store = object_store(&backing);
+        let owner_a = SystemCatalog::open_with_snapshot_store(
+            "default",
+            dir.path().join("a.wal"),
+            store.clone(),
+        )
+        .await?;
+        {
+            let owner_b = SystemCatalog::open_with_snapshot_store(
+                "default",
+                dir.path().join("b.wal"),
+                store.clone(),
+            )
+            .await?;
+            owner_b
+                .create_namespace_for_tenant(&gamma, HashMap::new(), Some("gamma"))
+                .await?;
+            create_named(&owner_b, &gamma, "t").await?;
+        }
+        // A's first publish must REFUSE (gamma unseen), not land a root
+        // without gamma.
+        let first = match owner_a
+            .create_namespace_for_tenant(&beta, HashMap::new(), Some("beta"))
+            .await
+        {
+            Err(error) => Err(error),
+            Ok(_) => create_named(&owner_a, &beta, "t").await,
+        };
+        match first {
+            Err(error) => {
+                let text = format!("{error:#}");
+                assert!(
+                    text.contains("concurrent owner advanced the root"),
+                    "expected the regression refusal, got: {text}"
+                );
+            }
+            Ok(_) => panic!("the fresh-store stale-view publish must be refused"),
+        }
+        let fresh = SystemCatalog::open_with_snapshot_store(
+            "default",
+            dir.path().join("fresh.wal"),
+            store.clone(),
+        )
+        .await?;
+        assert!(
+            fresh
+                .table_exists(&TableIdentifier::new(gamma.clone(), "t"))
+                .await?,
+            "gamma must survive an equal-generation owner that booted the fresh store"
+        );
+        Ok(())
+    }
+
+    /// Review round 5 (MED-2, from the reviewer's
+    /// `zz_probe_r5_shared_account_version_regression`): the coverage check
+    /// must guard shard VERSIONS, not just membership — a disjoint-account
+    /// publish must not pin the SHARED account at the older shard version
+    /// the pod booted with, silently reverting the concurrent owner's
+    /// committed DDL fleet-wide.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn disjoint_account_publish_cannot_regress_a_shared_shard_version() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let backing: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let acme = nslevels(&["acme", "sales"]);
+        let beta = nslevels(&["beta", "eng"]);
+
+        // Seed: acme t1 (root v1, acme shard v1).
+        {
+            let store = object_store(&backing);
+            let seed = SystemCatalog::open_with_snapshot_store(
+                "default",
+                dir.path().join("seed.wal"),
+                store.clone(),
+            )
+            .await?;
+            seed.create_namespace_for_tenant(&acme, HashMap::new(), Some("acme"))
+                .await?;
+            create_named(&seed, &acme, "t1").await?;
+        }
+        // A boots at root v1 (acme@v1) and holds its view.
+        let store = object_store(&backing);
+        let owner_a = SystemCatalog::open_with_snapshot_store(
+            "default",
+            dir.path().join("a.wal"),
+            store.clone(),
+        )
+        .await?;
+        // B boots at v1, DDLs only the SHARED account -> root v2 names
+        // acme@v2.
+        {
+            let owner_b = SystemCatalog::open_with_snapshot_store(
+                "default",
+                dir.path().join("b.wal"),
+                store.clone(),
+            )
+            .await?;
+            create_named(&owner_b, &acme, "t2").await?;
+        }
+        // A DDLs the DISJOINT account beta: its publish must REFUSE (the
+        // tip pins acme@v2 > A's acme@v1), not land {acme@v1, beta@new}.
+        let first = match owner_a
+            .create_namespace_for_tenant(&beta, HashMap::new(), Some("beta"))
+            .await
+        {
+            Err(error) => Err(error),
+            Ok(_) => create_named(&owner_a, &beta, "t").await,
+        };
+        match first {
+            Err(error) => {
+                let text = format!("{error:#}");
+                assert!(
+                    text.contains("concurrent owner advanced the root"),
+                    "expected the version-regression refusal, got: {text}"
+                );
+            }
+            Ok(_) => panic!("the shared-account version regression must be refused"),
+        }
+        let fresh = SystemCatalog::open_with_snapshot_store(
+            "default",
+            dir.path().join("fresh.wal"),
+            store.clone(),
+        )
+        .await?;
+        assert!(
+            fresh
+                .table_exists(&TableIdentifier::new(acme.clone(), "t2"))
+                .await?,
+            "B's t2 in the SHARED account must survive A's disjoint-account publish"
+        );
+        Ok(())
+    }
+
+    /// Review round 5 (M2 pin): the generation exemption is what lets an
+    /// escape-window heal legitimately RETIRE an account the stale root
+    /// still names — without it the heal would be refused forever.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn escape_heal_may_retire_an_account_the_stale_root_still_names() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let backing: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let acme = nslevels(&["acme", "sales"]);
+        let gamma = nslevels(&["gamma", "ops"]);
+
+        // ON: acme + gamma (root names both).
+        {
+            let store = object_store(&backing);
+            let owner = SystemCatalog::open_with_snapshot_store(
+                "default",
+                dir.path().join("on.wal"),
+                store.clone(),
+            )
+            .await?;
+            owner
+                .create_namespace_for_tenant(&acme, HashMap::new(), Some("acme"))
+                .await?;
+            create_named(&owner, &acme, "t").await?;
+            owner
+                .create_namespace_for_tenant(&gamma, HashMap::new(), Some("gamma"))
+                .await?;
+            create_named(&owner, &gamma, "t").await?;
+        }
+        // OFF escape: DROP gamma entirely (the legacy log outranks).
+        {
+            let _guard = EnvGuard::set("PROXIMADB_CATALOG_SHARDED_SNAPSHOT_DISABLE", "1");
+            let store = object_store(&backing);
+            let owner = SystemCatalog::open_with_snapshot_store(
+                "default",
+                dir.path().join("off.wal"),
+                store.clone(),
+            )
+            .await?;
+            assert!(
+                owner
+                    .drop_table(&TableIdentifier::new(gamma.clone(), "t"), false)
+                    .await?
+            );
+            owner.drop_namespace(&gamma, true).await?;
+        }
+        // ON reborn: the heal publishes a root WITHOUT gamma even though
+        // the stale root still names it (loaded_generation outranks).
+        let store = object_store(&backing);
+        let reborn = SystemCatalog::open_with_snapshot_store(
+            "default",
+            dir.path().join("on2.wal"),
+            store.clone(),
+        )
+        .await?;
+        let fresh = SystemCatalog::open_with_snapshot_store(
+            "default",
+            dir.path().join("fresh.wal"),
+            store.clone(),
+        )
+        .await?;
+        assert!(
+            !fresh
+                .table_exists(&TableIdentifier::new(gamma.clone(), "t"))
+                .await?,
+            "the escape-window drop must stay retired by the heal"
+        );
+        assert!(
+            fresh
+                .table_exists(&TableIdentifier::new(acme.clone(), "t"))
+                .await?
+        );
+        assert!(
+            !reborn
+                .table_exists(&TableIdentifier::new(gamma.clone(), "t"))
                 .await?
         );
         Ok(())

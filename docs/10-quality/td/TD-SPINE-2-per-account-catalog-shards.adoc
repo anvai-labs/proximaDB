@@ -82,6 +82,24 @@
   dropped id minted under the global counter is never re-minted; accounts
   with a genuine per-account record keep their own (lower) floor, and
   brand-new accounts still start at 1.
+* **Review round 5 fixes (2026-11-23, MED×2):** the coverage check is now
+  sentinel- and space-aware (`NO_VERSION` counts as unseen; a legacy-space
+  counter is never compared against a root tip — `seen` requires
+  `loaded_is_root && !version_is_newer`), so a fresh-store dual boot is
+  refused too (`fresh_store_dual_boot_cannot_drop_the_other_owners_account`,
+  mutation-proven); and the coverage diff guards shard VERSIONS, not just
+  membership — a disjoint-account publish cannot pin the shared account at
+  the older shard version the pod booted with
+  (`disjoint_account_publish_cannot_regress_a_shared_shard_version`,
+  mutation-proven). The generation exemption is now pinned
+  (`escape_heal_may_retire_an_account_the_stale_root_still_names`): without
+  it, an escape-window heal could never retire an account the stale root
+  still names. The check probes the tip's VERSION first and fetches the
+  payload only when unseen (the per-DDL steady state pays no extra payload
+  GET); the refusal error says "restart the pod and retry the DDL" (the
+  pre-reload allocator may hold ids the reloaded state assigned — the
+  dual-boot id hazard; same-pod retry is not actionable); the post-refusal
+  reload no longer masks the conflict error.
 * **Review round 4 fix (2026-11-23, MED):** the commit-time **index-coverage
   check** — `checkpoint_sharded_locked` reads the fresh root tip before
   publishing and REFUSES the commit when the tip is genuinely unseen (its
