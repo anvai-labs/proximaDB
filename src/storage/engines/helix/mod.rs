@@ -1751,14 +1751,19 @@ impl UnifiedStorageFormat for HelixEngine {
             // can otherwise hide newer live files or tombstones.
             if !collection_data_dir.contains("://") {
                 for sstable in levels_read.values().flatten() {
-                    if compaction::owns_sstable(
-                        Path::new(&collection_data_dir),
-                        &sstable.path,
-                        &self.filesystem_factory,
-                    ) && seen_canonical.insert(compaction::canonical_location(
-                        &sstable.path,
-                        &self.filesystem_factory,
-                    )) {
+                    let path = sstable.path.to_string_lossy();
+                    let path = path.strip_prefix("file://").unwrap_or(&path);
+                    if path.starts_with(&collection_data_dir)
+                        && compaction::owns_sstable(
+                            Path::new(&collection_data_dir),
+                            &sstable.path,
+                            &self.filesystem_factory,
+                        )
+                        && seen_canonical.insert(compaction::canonical_location(
+                            &sstable.path,
+                            &self.filesystem_factory,
+                        ))
+                    {
                         cached_sstables.push(sstable.clone());
                     }
                 }

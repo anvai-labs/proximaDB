@@ -1695,7 +1695,7 @@ mod tests {
         })
         .await?;
 
-        let rooted = root.path().join("c/L0.helix");
+        let rooted = root.path().join("c").join("L0.helix");
         assert!(owns_sstable(Path::new("c"), &rooted, &factory));
         let listed = PathBuf::from(format!("file://{}", rooted.display()));
         assert!(owns_sstable(Path::new("c"), &listed, &factory));
