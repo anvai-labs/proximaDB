@@ -164,6 +164,8 @@ struct CatalogInner {
     /// rebuilt by replay/snapshot/shard folds, and each account's shard
     /// persists its own value so compaction cannot forget a dropped id.
     account_ns_high_water: HashMap<String, u16>,
+    // Preserve field absence before live rows rebuild the per-account map.
+    loaded_legacy_namespace_snapshot: bool,
     /// Highest WAL sequence number folded in (the replay watermark).
     applied_seq: u64,
     /// TD-PATH-2: the highest identity ever minted, which drops never lower.
@@ -424,17 +426,10 @@ struct CatalogSnapshot {
     /// a high-water-aware binary WARNs when it adopts such a snapshot.
     #[serde(default)]
     writer_version: Option<u32>,
-    /// TD-SPINE-2 (review MED-1): per-account namespace-id high-water, so a
-    /// whole-image snapshot (the kill-switch path AND the legacy mixed-read
-    /// source) preserves each account's dropped-id memory. Absent on a
-    /// legacy image ⇒ no per-account record; the decode-time recovery
-    /// (`recover_legacy_account_ns_high_water`) seeds every candidate
-    /// account from the snapshot's GLOBAL high-water, and the identity
-    /// sidecar merge (`adopt_identity_high_water_sidecar_bytes`) re-floors
-    /// the map from the sidecar's global — the two durable witnesses of
-    /// dropped ids a fieldless snapshot cannot carry.
-    #[serde(default)]
-    account_ns_high_water: HashMap<String, u16>,
+    /// The per-account namespace floor, including dropped namespaces. Keep
+    /// legacy field absence distinct from a present map rebuilt from live rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    account_ns_high_water: Option<HashMap<String, u16>>,
 }
 
 /// TD-SPINE-2 (ADR-098 D1.3): the shared shard key for namespaces (and their
@@ -535,7 +530,7 @@ struct CatalogShardRecord {
 /// key and compacts the WAL past the watermark, destroying the create deltas
 /// replay would fold; the sidecar is the floor record that publisher cannot
 /// touch (it never names the sidecar's path/key).
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct IdentityHighWaterSidecar {
     /// TD-PATH-2 4c stamp (`None` = written before the stamp existed).
     #[serde(default)]
@@ -543,6 +538,10 @@ struct IdentityHighWaterSidecar {
     /// The floor itself (all fields always encoded by this writer).
     #[serde(default)]
     high_water: IdsHighWater,
+    /// Absent on legacy sidecars. New sidecars retain the account that owns
+    /// each namespace ID floor even if an old snapshot writer omits the map.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    account_ns_high_water: Option<HashMap<String, u16>>,
 }
 
 /// In-RAM authoritative system-catalog state.
@@ -768,7 +767,7 @@ impl SystemCatalogState {
             applied_seq: inner.applied_seq,
             ids_high_water: Some(inner.ids_high_water),
             writer_version: Some(proximadb_catalog::IDENTITY_WRITER_VERSION_HIGH_WATER),
-            account_ns_high_water: inner.account_ns_high_water.clone(),
+            account_ns_high_water: Some(inner.account_ns_high_water.clone()),
         };
         crate::services::catalog_record_envelope::to_enveloped_vec_named(&snapshot)
             .context("encoding catalog snapshot")
@@ -817,8 +816,9 @@ impl SystemCatalogState {
         // per-account namespace-id high-water from BOTH the persisted
         // per-account map (dropped-id memory, carried since the review fix —
         // absent on older legacy images) and the live rows (folded below).
+        let loaded_legacy_namespace_snapshot = snapshot.account_ns_high_water.is_none();
         let mut account_ns_high_water: HashMap<String, u16> = recover_legacy_account_ns_high_water(
-            snapshot.account_ns_high_water,
+            snapshot.account_ns_high_water.unwrap_or_default(),
             snapshot
                 .ids_high_water
                 .map(|high_water| high_water.namespace_id),
@@ -874,6 +874,7 @@ impl SystemCatalogState {
             statistics: snapshot.statistics,
             object_ids,
             account_ns_high_water,
+            loaded_legacy_namespace_snapshot,
             applied_seq: snapshot.applied_seq,
             ids_high_water,
             loaded_writer_version: Some(snapshot.writer_version),
@@ -1127,9 +1128,11 @@ impl SystemCatalogState {
     /// [`IdentityHighWaterSidecar`]). Stamped with the current writer version
     /// and framed by the TD-SPINE-1 record envelope.
     pub fn to_identity_high_water_sidecar_bytes(&self) -> Result<Vec<u8>> {
+        let inner = self.inner.read();
         let sidecar = IdentityHighWaterSidecar {
             writer_version: Some(proximadb_catalog::IDENTITY_WRITER_VERSION_HIGH_WATER),
-            high_water: self.inner.read().ids_high_water,
+            high_water: inner.ids_high_water,
+            account_ns_high_water: Some(inner.account_ns_high_water.clone()),
         };
         crate::services::catalog_record_envelope::to_enveloped_vec_named(&sidecar)
             .context("encoding identity high-water sidecar")
@@ -1146,33 +1149,34 @@ impl SystemCatalogState {
         let stamp = sidecar.writer_version;
         let mut inner = self.inner.write();
         inner.ids_high_water.merge_max(sidecar.high_water);
-        // TD-SPINE-2 review round 2 (MED): the sidecar's GLOBAL namespace-id
-        // high-water must keep flooring the per-account map on the legacy
-        // fieldless boot — a snapshot that carries neither the per-account
-        // record nor a snapshot global — where the sidecar is the ONLY
-        // durable witness of dropped ids (`identity_allocator_seed` no
-        // longer reads the global dimension itself).
-        let global = inner.ids_high_water.namespace_id;
-        // Precision rule (review round 2): seed ONLY when the map is empty
-        // (the decode-time recovery's rule, mirrored). A non-empty map means
-        // post-cutover records exist and are authoritative per account;
-        // seeding known-but-unmapped accounts from the GLOBAL would destroy
-        // per-account precision (an account that minted only id 1 would be
-        // floored at every other account's high-water).
-        if global > 0 && inner.account_ns_high_water.is_empty() {
-            let accounts: Vec<String> = inner
-                .account_ids
-                .keys()
-                .cloned()
-                .chain(
-                    inner
-                        .namespaces
-                        .values()
-                        .map(|namespace| shard_key_of_tenant(namespace.tenant_id.as_deref())),
-                )
-                .collect();
-            for account in accounts {
-                inner.account_ns_high_water.insert(account, global);
+        if let Some(account_floors) = sidecar.account_ns_high_water {
+            for (account, floor) in account_floors {
+                let current = inner.account_ns_high_water.entry(account).or_default();
+                *current = (*current).max(floor);
+            }
+        } else if inner.loaded_legacy_namespace_snapshot || inner.account_ns_high_water.is_empty() {
+            // An unattributed legacy floor may belong to any account known to
+            // the reconstructed catalog. Reserve it conservatively once;
+            // subsequent sidecars preserve these account floors explicitly.
+            let floor = inner.ids_high_water.namespace_id;
+            if floor > 0 {
+                let accounts: HashSet<_> = inner
+                    .account_ids
+                    .keys()
+                    .cloned()
+                    .chain(inner.account_ns_high_water.keys().cloned())
+                    .chain(
+                        inner
+                            .namespaces
+                            .values()
+                            .map(|ns| shard_key_of_tenant(ns.tenant_id.as_deref())),
+                    )
+                    .chain(std::iter::once(DEFAULT_SHARD_KEY.to_string()))
+                    .collect();
+                for account in accounts {
+                    let current = inner.account_ns_high_water.entry(account).or_default();
+                    *current = (*current).max(floor);
+                }
             }
         }
         Ok(stamp)
@@ -2055,43 +2059,52 @@ mod tests {
         Ok(())
     }
 
-    /// Review round 2 (MED): a legacy fieldless snapshot carries neither the
-    /// per-account high-water nor a snapshot global — the identity SIDECAR is
-    /// then the only durable witness of dropped namespace ids, and its global
-    /// namespace_id must floor the per-account map after the merge (the
-    /// allocator no longer reads the global dimension itself).
     #[test]
-    fn sidecar_namespace_floor_floors_the_per_account_high_water() {
-        let state = SystemCatalogState::new();
+    fn fieldless_snapshot_preserves_legacy_and_attributed_sidecar_floors() -> Result<()> {
         let mut alpha = ns(&["acme", "alpha"]);
         alpha.tenant_id = Some("acme".to_string());
-        state.apply_committed(
-            1,
-            CatalogDelta::UpsertNamespace {
-                namespace: Box::new(alpha),
-            },
-        );
-        // A legacy boot: live rows exist, no per-account record, no snapshot
-        // global — only the sidecar knows ids up to 5 were minted.
-        state.inner.write().account_ns_high_water.clear();
-        let sidecar = IdentityHighWaterSidecar {
+        let mut live = CatalogTableSchema::new("live");
+        live.stable_namespace_id = Some(1);
+        let snapshot = CatalogSnapshot {
+            account_ids: HashMap::from([("acme".into(), 1), ("emptied".into(), 2)]),
+            namespaces: HashMap::from([(alpha.levels.clone(), alpha)]),
+            tables: HashMap::from([(tid(&["acme", "alpha"], "live"), live)]),
+            statistics: HashMap::new(),
+            applied_seq: 5,
+            ids_high_water: None,
+            writer_version: None,
+            account_ns_high_water: None,
+        };
+        let bytes = rmp_serde::to_vec_named(&snapshot)?;
+        let read = SystemCatalogState::from_snapshot_bytes(&bytes)?;
+        assert_eq!(read.max_namespace_id_ever_for("acme"), Some(1));
+        let mut sidecar = IdentityHighWaterSidecar {
             writer_version: None,
             high_water: IdsHighWater {
-                object_id: 0,
-                collection_id: 0,
                 namespace_id: 5,
+                ..IdsHighWater::default()
             },
+            account_ns_high_water: None,
         };
-        let bytes = crate::services::catalog_record_envelope::to_enveloped_vec_named(&sidecar)
-            .expect("encoding sidecar");
-        state
-            .adopt_identity_high_water_sidecar_bytes(&bytes)
-            .expect("folding sidecar");
-        assert_eq!(
-            state.max_namespace_id_ever_for("acme"),
-            Some(5),
-            "the sidecar's namespace-id floor (5) must floor the account — \
-             without the fold, id 2 would be re-minted below it"
-        );
+        let legacy_bytes = rmp_serde::to_vec_named(&sidecar)?;
+        read.adopt_identity_high_water_sidecar_bytes(&legacy_bytes)?;
+        assert_eq!(read.max_namespace_id_ever_for("acme"), Some(5));
+        assert_eq!(read.max_namespace_id_ever_for("emptied"), Some(5));
+        assert_eq!(read.max_namespace_id_ever_for(DEFAULT_SHARD_KEY), Some(5));
+
+        let recovered = SystemCatalogState::from_snapshot_bytes(&bytes)?;
+        sidecar.account_ns_high_water =
+            Some(HashMap::from([("acme".into(), 3), ("emptied".into(), 5)]));
+        recovered.adopt_identity_high_water_sidecar_bytes(
+            &crate::services::catalog_record_envelope::to_enveloped_vec_named(&sidecar)?,
+        )?;
+        assert_eq!(recovered.max_namespace_id_ever_for("acme"), Some(3));
+        assert_eq!(recovered.max_namespace_id_ever_for("emptied"), Some(5));
+        let recorded = recovered.to_identity_high_water_sidecar_bytes()?;
+        let fresh = SystemCatalogState::from_snapshot_bytes(&bytes)?;
+        fresh.adopt_identity_high_water_sidecar_bytes(&recorded)?;
+        assert_eq!(fresh.max_namespace_id_ever_for("acme"), Some(3));
+        assert_eq!(fresh.max_namespace_id_ever_for("emptied"), Some(5));
+        Ok(())
     }
 }

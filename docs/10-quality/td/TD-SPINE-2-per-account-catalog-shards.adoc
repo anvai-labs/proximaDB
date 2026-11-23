@@ -92,23 +92,16 @@
   the per-account map after the sidecar merge, but ONLY when the map is
   EMPTY at the fold (`adopt_identity_high_water_sidecar_bytes`) — the
   legacy fieldless boot with no live stable-id rows, where the sidecar is
-  the sole witness (`sidecar_namespace_floor_floors_the_per_account_high_water`).
-  **Residual (review round 3, proven):** a fieldless snapshot WITH live
-  stable-id rows decodes a non-empty map (live-row fold), so the sidecar's
-  global — potentially the only witness of dropped ids ABOVE the live max —
-  never applies, and ids between the live max and the sidecar floor remain
-  re-mintable (TD-PATH-2 exposure). Reachable only from the pre-4a build
-  band (stable ids existed, `ids_high_water` snapshot field did not;
-  2026-06-30..2026-10-31) with a compacted WAL and a newer sidecar. Both
-  stronger rules are PROVEN broken: per-account or_insert seeds
-  registered-but-unminted accounts at the global during NORMAL operation
-  (`persist_identity_high_water_sidecar` re-adopts the sidecar into state
-  every checkpoint, making the wrong floor durable), and raising tracked
-  entries to the global destroys per-account minting (the precision test).
-  The empty-only rule is therefore the best available under the current
-  sidecar format; follow-up F-sidecar-per-account: add an ATTRIBUTED
-  per-account ns dimension to the sidecar record (envelope-versioned,
-  additive), which closes the residual exactly.
+  the sole witness (`fieldless_snapshot_preserves_legacy_and_attributed_sidecar_floors`).
+  Round 3 found that a fieldless legacy snapshot with live stable-ID rows
+  rebuilt a non-empty map before the sidecar was read. The reader now tracks
+  whether the snapshot contained that field. For a legacy sidecar with a
+  global floor, migration reserves that floor for the snapshot's known
+  accounts, including the default shard and accounts with no live rows.
+  New sidecars record each account's floor and merge those floors
+  monotonically. This preserves per-account allocation for modern snapshots
+  and retains dropped namespace IDs when a legacy writer omits the
+  per-account field. The regression covers both sidecar formats.
   (LOW-c) the
   reseed path's per-account carry is pinned by a two-account precision test
   (`per_account_high_water_carries_per_account_values_not_the_global_recovery`).
