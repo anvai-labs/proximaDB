@@ -88,15 +88,34 @@
   during the OFF window; the ON owner has not yet healed the root) the reload
   stays put instead of adopting the stale root, closing reader-visible
   resurrection of dropped tables (`zz_probe_reload_crossover_skips_the_stale_root_in_the_unhealed_window`).
-  (MED) the identity sidecar's GLOBAL namespace-id high-water again floors
-  the per-account map after the sidecar merge
-  (`adopt_identity_high_water_sidecar_bytes`) — a legacy fieldless snapshot
-  + sidecar boot no longer re-mints dropped ids below the sidecar floor
-  (`sidecar_namespace_floor_floors_the_per_account_high_water`). (LOW-c) the
+  (MED) the identity sidecar's GLOBAL namespace-id high-water floors
+  the per-account map after the sidecar merge, but ONLY when the map is
+  EMPTY at the fold (`adopt_identity_high_water_sidecar_bytes`) — the
+  legacy fieldless boot with no live stable-id rows, where the sidecar is
+  the sole witness (`sidecar_namespace_floor_floors_the_per_account_high_water`).
+  **Residual (review round 3, proven):** a fieldless snapshot WITH live
+  stable-id rows decodes a non-empty map (live-row fold), so the sidecar's
+  global — potentially the only witness of dropped ids ABOVE the live max —
+  never applies, and ids between the live max and the sidecar floor remain
+  re-mintable (TD-PATH-2 exposure). Reachable only from the pre-4a build
+  band (stable ids existed, `ids_high_water` snapshot field did not;
+  2026-06-30..2026-10-31) with a compacted WAL and a newer sidecar. Both
+  stronger rules are PROVEN broken: per-account or_insert seeds
+  registered-but-unminted accounts at the global during NORMAL operation
+  (`persist_identity_high_water_sidecar` re-adopts the sidecar into state
+  every checkpoint, making the wrong floor durable), and raising tracked
+  entries to the global destroys per-account minting (the precision test).
+  The empty-only rule is therefore the best available under the current
+  sidecar format; follow-up F-sidecar-per-account: add an ATTRIBUTED
+  per-account ns dimension to the sidecar record (envelope-versioned,
+  additive), which closes the residual exactly.
+  (LOW-c) the
   reseed path's per-account carry is pinned by a two-account precision test
   (`per_account_high_water_carries_per_account_values_not_the_global_recovery`).
-* **Cost note (review round 2):** an ON boot GETs the full legacy whole-image
+* **Cost note (review rounds 2-3):** an ON boot GETs the full legacy whole-image
   payload once to learn its fencing generation — O(fleet) metered bytes per
+  boot; during an un-healed flip window each follower reload tick additionally
+  pays a root GET + WARN until an owner heals (bounded by the window). A
   boot, forever (the legacy log is only keep-k-pruned, never removed). A
   generation-only probe would avoid it; follow-up.
 * **Review LOW dispositions (2026-11-22):** LOW-1 fixed (a fenced sharded
