@@ -846,9 +846,6 @@ proximadb-sdk = { path = "clients/rust", default-features = false, features = ["
 # gates load docs/openapi/proximadb-openapi.yaml directly.
 httpmock.workspace = true
 serde_yaml = "0.9"
-# Test-only: integration tests use EmbeddedProximaDB from the embedded crate.
-# Dev-deps don't create build cycles (test-mode only).
-proximadb-embedded = { path = "crates/binding/proximadb-embedded" }
 # `cargo test --lib` runs every unit test in ONE process, so tests that mutate
 # process-global state (env gates, global counters, fault injection) must be
 # mutually serialized; nextest isolates them per process but the plain
@@ -890,7 +887,7 @@ oltp-integrity = ["dep:proximadb-cks-local"]
 # read primitives run unchanged; on, the compile bridge + admits_with_security
 # filter rows by the subject's policy. The abac crate itself stays un-gated
 # (a security substrate that never compiles is never tested).
-abac-policy = ["dep:proximadb-abac", "proximadb-embedded/abac-policy"]
+abac-policy = ["dep:proximadb-abac"]
 # F3v (TD-DELVEC-1 / ADR-072 D14): enable cold-tier deletion vectors. Off by
 # default → the default flush path is byte-for-byte unchanged; on, PAX segment
 # writes capture the OID→position resolver (footer region, WI-2c) so a
@@ -1334,11 +1331,6 @@ harness = false
 path = "benches/bench_18_fp16_centroid_performance.rs"
 
 [[bench]]
-name = "bench_19_comprehensive_optimization"
-harness = false
-path = "benches/bench_19_comprehensive_optimization.rs"
-
-[[bench]]
 name = "bench_20_facade_routing"
 harness = false
 path = "benches/bench_20_facade_routing.rs"
@@ -1406,20 +1398,6 @@ path = "benches/bench_vector_object_economy_e2e.rs"
 name = "bench_23_recall_at_k"
 harness = false
 path = "benches/bench_23_recall_at_k.rs"
-
-# Real engine Recall@k (index-vs-ground-truth) — builds a real ANN index via the
-# embedded engine and measures actual recall against a brute-force oracle, unlike
-# bench_23 which times the recall computation over simulated results.
-[[bench]]
-name = "bench_24_recall_at_k_engine"
-harness = false
-path = "benches/bench_24_recall_at_k_engine.rs"
-
-# TD-096 S2 / S1.5: per-search GET-count (SST vs HELIX) on the filesystem seam.
-[[bench]]
-name = "bench_25_search_get_count"
-harness = false
-path = "benches/bench_25_search_get_count.rs"
 
 # Value codec: one-pass visitor vs old Value-first DOM path (indicative).
 [[bench]]

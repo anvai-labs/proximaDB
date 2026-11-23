@@ -9,7 +9,7 @@ composite-FK / tenant-isolation / ANN-recall e2e tests were silently un-enforced
 until they were wired into CI tiers (CI was green, but the risk was not covered).
 
 Checks, for each [[risk]]:
-  1. each `required_tests` resolves to an existing tests/<name>.rs file;
+  1. each required test resolves under its configured test directory (default tests/);
   2. each `required_scenarios` marker (`scenario: <name>`) appears in at least
      one of its required_tests;
   3. `must_run_in_tier` is a job listed in ci-success.needs; AND
@@ -84,9 +84,9 @@ def tier_selection(ci: str, job: str) -> tuple[list[str], list[str]]:
     return globs, names
 
 
-def tier_runs_test(ci: str, job: str, test_name: str, errors: list[str], rclass: str) -> None:
+def tier_runs_test(ci: str, job: str, test_file: str, errors: list[str], rclass: str) -> None:
     globs, names = tier_selection(ci, job)
-    test_file = f"tests/{test_name}.rs"
+    test_name = Path(test_file).stem
     if names:
         if test_name not in names:
             errors.append(
@@ -109,7 +109,7 @@ def tier_runs_test(ci: str, job: str, test_name: str, errors: list[str], rclass:
 
 
 def tier_wiring_precise(
-    ci: str, job: str, test_name: str, declared_files: set[str], errors: list[str], rclass: str
+    ci: str, job: str, test_file: str, declared_files: set[str], errors: list[str], rclass: str
 ) -> None:
     """Fail if a required test is wired ONLY via a wildcard glob.
 
@@ -122,7 +122,6 @@ def tier_wiring_precise(
     drags in.
     """
     globs, names = tier_selection(ci, job)
-    test_file = f"tests/{test_name}.rs"
     if names:
         return  # explicit-list tier: membership (already asserted) is precise
     if not globs or test_file in globs:
@@ -132,10 +131,10 @@ def tier_wiring_precise(
         return
     swept = sorted(
         {
-            f"tests/{p.name}"
+            path
             for g in wildcards
-            for p in (ROOT / "tests").glob("*.rs")
-            if fnmatch(f"tests/{p.name}", g) and f"tests/{p.name}" not in declared_files
+            for p in (ROOT / Path(test_file).parent).glob("*.rs")
+            if fnmatch(path := p.relative_to(ROOT).as_posix(), g) and path not in declared_files
         }
     )
     if swept:
@@ -168,7 +167,7 @@ def main() -> int:
     errors: list[str] = []
     seen_classes: set[str] = set()
     declared_files: set[str] = {
-        f"tests/{t}.rs"
+        f"{risk.get('test_directory', 'tests')}/{t}.rs"
         for risk in risks
         for t in (risk.get("required_tests") or [])
         if isinstance(t, str)
@@ -184,16 +183,21 @@ def main() -> int:
         if not isinstance(tests, list) or not tests:
             errors.append(f"[{rclass}] required_tests must be a non-empty list")
             tests = []
-        for t in tests:
-            if not (ROOT / "tests" / f"{t}.rs").exists():
-                errors.append(f"[{rclass}] required test missing: tests/{t}.rs")
+        directory = Path(risk.get("test_directory", "tests"))
+        if directory.is_absolute() or ".." in directory.parts:
+            errors.append(f"[{rclass}] test_directory must stay inside the repository")
+            continue
+        test_files = [(directory / f"{name}.rs").as_posix() for name in tests]
+        for test_file in test_files:
+            if not (ROOT / test_file).is_file():
+                errors.append(f"[{rclass}] required test missing: {test_file}")
 
         scenarios = risk.get("required_scenarios", [])
         if scenarios:
             blob = "".join(
-                (ROOT / "tests" / f"{t}.rs").read_text(encoding="utf-8", errors="replace")
-                for t in tests
-                if (ROOT / "tests" / f"{t}.rs").exists()
+                (ROOT / test_file).read_text(encoding="utf-8", errors="replace")
+                for test_file in test_files
+                if (ROOT / test_file).is_file()
             )
             found = set(re.findall(r"scenario:\s*([a-z][a-z0-9-]*)", blob))
             for sc in scenarios:
@@ -216,9 +220,9 @@ def main() -> int:
         if not _job_block(ci, tier):
             errors.append(f"[{rclass}] must_run_in_tier {tier!r} is not a job in ci.yml")
             continue
-        for t in tests:
-            tier_runs_test(ci, tier, t, errors, rclass)
-            tier_wiring_precise(ci, tier, t, declared_files, errors, rclass)
+        for test_file in test_files:
+            tier_runs_test(ci, tier, test_file, errors, rclass)
+            tier_wiring_precise(ci, tier, test_file, declared_files, errors, rclass)
 
     if errors:
         print("Risk-coverage contract validation failed:")

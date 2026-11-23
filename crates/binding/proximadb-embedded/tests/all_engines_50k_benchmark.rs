@@ -6,10 +6,10 @@
 //! Run with:
 //! ```bash
 //! # Default workload (10K vectors)
-//! cargo test --test all_engines_50k_benchmark -- --nocapture --test-threads=1 --ignored
+//! cargo test -p proximadb-embedded --test all_engines_50k_benchmark -- --nocapture --test-threads=1 --ignored
 //!
 //! # Heavier workload (50K vectors)
-//! PROXIMADB_BENCH_VECTOR_COUNT=50000 cargo test --test all_engines_50k_benchmark -- --nocapture --test-threads=1 --ignored
+//! PROXIMADB_BENCH_VECTOR_COUNT=50000 cargo test -p proximadb-embedded --test all_engines_50k_benchmark -- --nocapture --test-threads=1 --ignored
 //! ```
 
 use proximadb_embedded::{EmbeddedConfig, EmbeddedProximaDB};

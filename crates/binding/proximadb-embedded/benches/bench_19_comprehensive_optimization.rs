@@ -7,8 +7,9 @@
 //
 // This benchmark uses the embedded database API for simplicity and stability.
 
-mod common;
-use common::benchmark_utils::print_system_info;
+#[path = "../../../../benches/common/benchmark_utils.rs"]
+mod benchmark_utils;
+use benchmark_utils::print_system_info;
 
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 use proximadb_embedded::{EmbeddedConfig, EmbeddedProximaDB, StorageLocationConfig};

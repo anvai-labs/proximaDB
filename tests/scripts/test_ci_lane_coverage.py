@@ -155,6 +155,25 @@ class BaselineRatchet(unittest.TestCase):
             with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                 self.assertEqual(guard.main(), 1)
 
+    def test_moved_embedded_target_remains_in_the_ratchet(self):
+        tree = GuardTree(["alpha_e2e.rs"], [WORKFLOW_WITH_RUN_LIST])
+        self.addCleanup(tree.tmp.cleanup)
+        embedded = tree.root / "crates/binding/proximadb-embedded/tests"
+        embedded.mkdir(parents=True)
+        target = embedded / "new_embedded_e2e.rs"
+        target.write_text("// integration test\n", encoding="utf-8")
+        with tree.patch(), mock.patch.object(sys, "argv", ["check"]):
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                self.assertIn(target, guard.integration_targets())
+                self.assertEqual(guard.main(), 1)
+                workflow = tree.root / ".github/workflows/w0.yml"
+                workflow.write_text(
+                    WORKFLOW_WITH_RUN_LIST
+                    + "          cargo test -p proximadb-embedded --test new_embedded_e2e\n",
+                    encoding="utf-8",
+                )
+                self.assertEqual(guard.main(), 0)
+
     def test_stale_baseline_fails(self):
         # alpha_e2e is executed by the run list AND still on the baseline.
         tree = GuardTree(

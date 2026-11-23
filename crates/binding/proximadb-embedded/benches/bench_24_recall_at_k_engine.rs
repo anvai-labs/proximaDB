@@ -11,10 +11,10 @@
 //!
 //! Run with:
 //! ```bash
-//! cargo bench --bench bench_24_recall_at_k_engine
+//! cargo bench -p proximadb-embedded --bench bench_24_recall_at_k_engine
 //! # heavier / different engine:
 //! PROXIMADB_BENCH_VECTOR_COUNT=50000 PROXIMADB_BENCH_ENGINE=helix \
-//!   cargo bench --bench bench_24_recall_at_k_engine
+//!   cargo bench -p proximadb-embedded --bench bench_24_recall_at_k_engine
 //! ```
 //!
 //! Adapted from the `tests/all_engines_50k_benchmark.rs` harness (same embedded

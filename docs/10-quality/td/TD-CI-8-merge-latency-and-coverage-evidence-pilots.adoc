@@ -418,19 +418,32 @@ Cargo plans. A cache hit can satisfy a unit immediately.
 |===
 | Local manifest experiment | Units | Packages | Root build modes
 | Applied cleanup | 970 | 789 | Test and normal library
-| Move embedded fixtures and their ABAC forwarding to their owning package | 968 | 788 | Test only
+| Embedded test and benchmark ownership | 968 | 788 | Test only
 | Isolate Criterion benchmarks | 956 | 775 | Test and normal library
 | Both moves | 954 | 774 | Test only
 |===
 
-The root dev-depends on `proximadb-embedded`, which links the normal root
-library back into the test graph. Removing that edge saves just two units but
-eliminates an entire root compilation. Eleven integration files and three
-bench files use the embedded API. Preserve their invocations, features and
-ABAC behavior before relocating them. Criterion also has real bench callers.
-The last three rows came from disposable manifest edits. Their test suites
-were not migrated or timed. Compare peak RSS and compiler wall time by crate,
-especially both root build modes, before choosing between them.
+The root used to dev-depend on `proximadb-embedded`, which pulled the normal
+root library into the unit-test build. The embedded package now owns its
+eleven integration targets and three benchmark targets. The enterprise unit
+plan verifies 968 units and a single root test compilation. Criterion remains
+a dependency of both packages because each has benchmarks that use it. The
+Criterion-only and combined rows model separate benchmark packaging.
+
+Storage, graph, burn-down and QA lanes still select the same moved targets.
+The ABAC lane explicitly checks the embedded package against the ABAC-enabled
+root. The experimental-engine matrix also compiles its embedded tests.
+Run a moved target with `cargo test -p proximadb-embedded --test <target>`
+or `cargo bench -p proximadb-embedded --bench <target>`.
+
+Before the migration, a warm-dependency local probe at one Cargo job
+measured 5m40s and 11.05 GiB peak RSS for the normal root library. The
+separate root test build took 6m20s and 15.01 GiB peak RSS. The migration
+removes the first compilation from the unit lane. The test harness still
+sets the per-process memory budget. Compare hosted step durations, cache
+hits and memory across equivalent runs in
+link:https://github.com/anvai-labs/proximaDB/issues/2568[#2568] before
+changing the enterprise Cargo job limit.
 
 Run `cargo tree --locked -p proximadb -e normal,build,dev --features enterprise-catalogs`
 to inspect package paths. On the pinned toolchain, the local diagnostic

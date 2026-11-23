@@ -505,6 +505,7 @@ jobs:
               # this filter tracks what can break it, not who owns the code.
               - 'src/services/**'
             storage_changes:
+              - 'crates/binding/proximadb-embedded/**'
               - 'src/storage/**'
               - 'tests/*storage*'
               - 'tests/*sst*'
@@ -733,6 +734,7 @@ jobs:
               - 'rust-toolchain*'
               - '.cargo/**'
             graph_changes:
+              - 'crates/binding/proximadb-embedded/tests/embedded_code_graph_parity_e2e.rs'
               - 'src/graph/**'
               - 'tests/*graph*'
             core_changes:
@@ -750,6 +752,9 @@ jobs:
             # the #1430 lesson, where a recall lane skipped on the very PR that
             # broke recall because the changed path matched no filter.
             authz_changes:
+              - 'crates/binding/proximadb-embedded/Cargo.toml'
+              - 'crates/binding/proximadb-embedded/src/**'
+              - 'crates/binding/proximadb-embedded/tests/engine_ttl_conformance_test.rs'
               - 'src/database.rs'
               - 'src/network/**'
               - 'crates/foundation/proximadb-config/**'
@@ -1564,7 +1569,7 @@ jobs:
           # excludes the AXIS index engine + its recall/advisor/drift surfaces. Catches
           # cfg drift where axis code leaks out of the `#[cfg(feature = "axis")]` gates.
           - { label: "no-axis", pkg: proximadb-server, args: "--no-default-features --features sql_frontend,graph-first-sks,unified-facade-routing,canonical-document-store,datafusion-integration,otlp-metering" }
-          - { label: "experimental-engines", pkg: proximadb,        args: "--features experimental-engines" }
+          - { label: "experimental-engines", pkg: "proximadb proximadb-embedded",        args: "--features experimental-engines" }
           # F3v (TD-DELVEC-1): cold-tier deletion vectors — feature-gated PAX flush-path
           # resolver capture. Check it compiles so cfg drift in that path is caught.
           - { label: "cold-deletion-vectors", pkg: proximadb,      args: "--features cold-deletion-vectors" }
@@ -2974,7 +2979,7 @@ jobs:
           # (TD-RDSTRAT-14 / #2419: create refuses unpersisted properties, the
           # PATCH route is gone). It was in NO lane, so those assertions never
           # gated — a re-added route or a relaxed guard would have shipped.
-          for test_file in tests/*sst*.rs tests/*storage*.rs tests/*wal*.rs tests/embedded_tenant_context.rs tests/td112_postflush_recall_e2e.rs tests/v2_post_flush_search_e2e.rs tests/recall_tune_auth_e2e.rs tests/mlflow_run_store_test.rs tests/iceberg_interop_e2e.rs; do
+          for test_file in tests/*sst*.rs tests/*storage*.rs tests/*wal*.rs crates/binding/proximadb-embedded/tests/embedded_tenant_context.rs tests/td112_postflush_recall_e2e.rs tests/v2_post_flush_search_e2e.rs tests/recall_tune_auth_e2e.rs tests/mlflow_run_store_test.rs tests/iceberg_interop_e2e.rs; do
             if [ -f "$test_file" ]; then
               test_name=$(basename "$test_file" .rs)
               echo "Running $test_name..."
@@ -2987,6 +2992,8 @@ jobs:
                 # manifest is a set-once singleton, so it needs the same
                 # process-per-test isolation.)
                 cargo nextest run --test "$test_name" --profile integration --retries 0
+              elif [[ "$test_name" == embedded_tenant_context ]]; then
+                cargo test -p proximadb-embedded --test "$test_name" -- --test-threads=1
               else
                 cargo test --test "$test_name" -- --test-threads=1
               fi
@@ -3157,6 +3164,8 @@ jobs:
           save-if: false
           add-job-id-key: false
           apt-packages: 'libssl-dev pkg-config protobuf-compiler'
+      - name: Check embedded against the ABAC-enabled root
+        run: cargo check -p proximadb-embedded --tests --features abac-policy
       - name: Run Authorization E2E (live transports)
         env:
           RUST_MIN_STACK: "8388608"
@@ -3368,6 +3377,8 @@ jobs:
               cargo test --test "$test_name" -- --test-threads=1
             fi
           done
+      - name: Verify embedded code graph parity
+        run: cargo test -p proximadb-embedded --test embedded_code_graph_parity_e2e -- --test-threads=1
 
   # Both suites use identical change selectors, runner image, features,
   # cache, stack and serial execution. Keep one target/ on the runner so
@@ -3494,7 +3505,7 @@ jobs:
           # pristine develop) is the likely family. The binary's other tests
           # (all-engine search matrix) keep gating. Rabitq -E precedent: the
           # unit lane's slow synthetic recall ratchet.
-          cargo nextest run -p proximadb --profile integration --retries 0 \
+          cargo nextest run -p proximadb -p proximadb-embedded --profile integration --retries 0 \
               -E 'not test(test_multiple_flush_cycles_all_engines)' \
               --test agent_memory_ingest_e2e \
               --test arrow_native_format_integration_test \
