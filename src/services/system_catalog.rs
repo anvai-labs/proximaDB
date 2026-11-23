@@ -534,6 +534,7 @@ impl SystemCatalog {
         // down, and the generation signal is sound). A tie is unreachable in
         // steady state; treated as root-newer (the migration invariant root ⊇
         // legacy at equal generation) with a WARN naming both.
+        let mut replayed_root_wal = false;
         let (state, prior_version, prior_generation, shard_versions, loaded_is_root) =
             if sharded_reader {
                 let root_read = snapshot_store.read_root().await?;
@@ -587,7 +588,9 @@ impl SystemCatalog {
                         let (state, versions) =
                             Self::assemble_root_and_shards(&root_read, snapshot_store.as_ref())
                                 .await?;
+                        let published_seq = state.applied_seq();
                         state.replay(&entries)?;
+                        replayed_root_wal = state.applied_seq() > published_seq;
                         (
                             state,
                             root_read.version,
@@ -602,7 +605,9 @@ impl SystemCatalog {
                         let (state, versions) =
                             Self::assemble_root_and_shards(&root_read, snapshot_store.as_ref())
                                 .await?;
+                        let published_seq = state.applied_seq();
                         state.replay(&entries)?;
+                        replayed_root_wal = state.applied_seq() > published_seq;
                         (
                             state,
                             root_read.version,
@@ -778,6 +783,14 @@ impl SystemCatalog {
             Self::identity_allocator_seed(&state);
         let account_floor = state.max_account_id().map_or(1, |id| u64::from(id) + 1);
         let object_id_floor = state.max_object_id().map_or(1, |id| id + 1);
+        // WAL may contain DDL whose shard was written but never published by
+        // a root. Re-publish both live and previously indexed accounts so a
+        // replayed last-row drop also reaches its shard before WAL compaction.
+        let mut pending_shards = std::collections::HashSet::new();
+        if claim_owner && replayed_root_wal {
+            pending_shards.extend(state.shard_keys());
+            pending_shards.extend(shard_versions.keys().cloned());
+        }
         let catalog = Self {
             name: name.into(),
             role: proximadb_catalog::CatalogRole::Operator,
@@ -800,7 +813,7 @@ impl SystemCatalog {
             loaded_generation: AtomicU64::new(prior_generation),
             read_only: AtomicBool::new(!claim_owner),
             shard_versions: parking_lot::RwLock::new(shard_versions),
-            pending_shards: parking_lot::Mutex::new(std::collections::HashSet::new()),
+            pending_shards: parking_lot::Mutex::new(pending_shards),
             loaded_version_is_root: AtomicBool::new(loaded_is_root),
         };
         // TD-SPINE-2 migration / reconciliation publish (owner only): the
@@ -3803,6 +3816,7 @@ mod tests {
     /// helper calls.
     #[derive(Debug, Default)]
     struct IoLedger {
+        fail_root_puts: AtomicBool,
         puts: std::sync::Mutex<Vec<(String, usize)>>,
         gets: std::sync::Mutex<Vec<String>>,
     }
@@ -3862,6 +3876,13 @@ mod tests {
             payload: object_store::PutPayload,
             options: object_store::PutOptions,
         ) -> object_store::Result<object_store::PutResult> {
+            if path.as_ref().contains("_root/") && self.ledger.fail_root_puts.load(Ordering::SeqCst)
+            {
+                return Err(object_store::Error::Generic {
+                    store: "CountingStore",
+                    source: Box::new(std::io::Error::other("injected root write failure")),
+                });
+            }
             self.ledger
                 .puts
                 .lock()
@@ -4273,6 +4294,38 @@ mod tests {
                 nslevels(&["acme", "sales"]),
                 "orders"
             ))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failed_root_publish_recovers_its_pending_shard_after_restart() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let owner_wal = dir.path().join("owner.wal");
+        let ledger = Arc::new(IoLedger::default());
+        let backing = Arc::new(object_store::memory::InMemory::new());
+        let owner = open_owner_counting(&owner_wal, &ledger, &backing).await?;
+        let ns = nslevels(&["acme", "sales"]);
+        owner
+            .create_namespace_for_tenant(&ns, HashMap::new(), Some("acme"))
+            .await?;
+        let recovered = TableIdentifier::new(ns.clone(), "recovered");
+
+        ledger.fail_root_puts.store(true, Ordering::SeqCst);
+        assert!(create_named(&owner, &ns, "recovered").await.is_err());
+        assert!(owner.pending_shards.lock().contains("acme"));
+        drop(owner);
+
+        ledger.fail_root_puts.store(false, Ordering::SeqCst);
+        let reopened = open_owner_counting(&owner_wal, &ledger, &backing).await?;
+        assert!(reopened.table_exists(&recovered).await?);
+        assert!(reopened.pending_shards.lock().contains("acme"));
+        reopened.checkpoint().await?;
+
+        let reader = open_owner_counting(&dir.path().join("fresh.wal"), &ledger, &backing).await?;
+        assert!(
+            reader.table_exists(&recovered).await?,
+            "the healed root must name the replayed shard"
         );
         Ok(())
     }

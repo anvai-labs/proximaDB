@@ -119,10 +119,9 @@
   non-serial tests that READ the gate do so per call; under nextest's
   process-per-test isolation the gate is never observed mid-flip (under
   `cargo test`'s shared process the serial guard alone would not protect
-  parallel readers — run with nextest); LOW-4 documented in code — a boot
-  WARN-skip of a root-referenced-but-absent shard leaves that account absent
-  from RAM until its next DDL, reachable only by external deletion (the
-  publish order shard-then-root never produces a dangling index entry).
+  parallel readers — run with nextest). A missing root-referenced shard
+  now fails load before in-memory adoption. WAL replay preserves pending
+  account shards across restart after an interrupted root write.
 * **System-scope read paths (Fix item 4 inventory).** The in-RAM authority
   stays one unified image (sharding is a persistence concern), so
   `list_namespaces(None)` and `get_namespace_by_object_id` remain
