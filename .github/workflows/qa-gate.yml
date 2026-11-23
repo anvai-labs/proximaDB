@@ -160,7 +160,7 @@ jobs:
         run: |
           cargo test --test tpch_pgwire_e2e --test tpcds_pgwire_e2e --no-run
           cargo test -p proximadb-block-format --lib --no-run
-          cargo test --test embedded_flush_recovery --no-run
+          cargo test -p proximadb-embedded --test embedded_flush_recovery --no-run
           # TD-182 P0b: previously-orphaned vector recall ratchets (gate them here).
           cargo test --test vector_ann_recall_e2e --test nova_cold_search_recall_test \
             --test td112_postflush_recall_e2e \
@@ -185,7 +185,7 @@ jobs:
         # cold-read ranking regression the vec_0-only assertion in
         # sst_block_serialization_roundtrip missed (why TD-165 was marked Resolved
         # prematurely). Well-separated seeded vectors → recall@10 = 1.0 on both paths.
-        run: cargo test --test embedded_flush_recovery recall -- --nocapture
+        run: cargo test -p proximadb-embedded --test embedded_flush_recovery recall -- --nocapture
       - name: Run deletion-vector ratchet (TD-DELVEC-1 F3v)
         # F3v cold-tier deletion vectors — gates the develop→qa→main promotion.
         # Currently runs the OID→position resolver substrate (ORP1+CRC32 format,

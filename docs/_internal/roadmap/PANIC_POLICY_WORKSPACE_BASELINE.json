@@ -760,8 +760,8 @@
     "proximadb-storage-common": {
       "expect": 3,
       "path": "crates/storage/proximadb-storage-common",
-      "total": 12,
-      "unwrap": 9
+      "total": 9,
+      "unwrap": 6
     },
     "proximadb-storage-encryption": {
       "expect": 0,
@@ -911,7 +911,7 @@
   "scope": "workspace",
   "totals": {
     "expect": 100,
-    "total": 312,
-    "unwrap": 212
+    "total": 309,
+    "unwrap": 209
   }
 }

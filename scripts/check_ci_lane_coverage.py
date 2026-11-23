@@ -8,7 +8,7 @@ extended-Describe fixes they pin were not ratcheted. A fix whose test never
 runs is a fix that silently regresses.
 
 Contract:
-  * Every `tests/*.rs` (top-level integration targets only; `tests/common/`
+  * Every root or embedded `tests/*.rs` (top-level integration targets only; `tests/common/`
     and `tests/scripts/` are modules, not targets) must be EXECUTED by some
     `.github/workflows/*.yml` — referenced inside a `run:` block as a
     `--test <name>` invocation, a bare for-loop name, a literal
@@ -52,10 +52,12 @@ NON_TARGET_DIRS = {"common", "scripts"}
 
 
 def integration_targets() -> list[Path]:
+    directories = (TESTS_DIR, ROOT / "crates/binding/proximadb-embedded/tests")
     return sorted(
-        p
-        for p in TESTS_DIR.glob("*.rs")
-        if p.is_file() and p.stem not in NON_TARGET_DIRS
+        path
+        for directory in directories
+        for path in directory.glob("*.rs")
+        if path.is_file() and path.stem not in NON_TARGET_DIRS
     )
 
 
@@ -149,12 +151,29 @@ INLINE_FOR_RE = re.compile(r"\bfor\s+\w+\s+in\s+([^;\n]*);\s*do\b")
 COMPILE_ONLY_RE = re.compile(r"--no-run\b|\bnextest\s+list\b|--list\b")
 
 
-def is_covered(stem: str, file_name: str, text: str, patterns: list[str]) -> bool:
+def package_runs_test(text: str, package: str, test_name: str) -> bool:
+    """Accept a named integration target only with its Cargo package selector."""
+    commands = re.sub(r"\\[ \t]*\n[ \t]*", " ", text)
+    package_option = rf"(?:-p[ =]|--package[ =]){re.escape(package)}(?=\s|$)"
+    test_option = rf"--test[ =]{re.escape(test_name)}(?=\s|$)"
+    return any(
+        re.search(package_option, command)
+        and re.search(test_option, command)
+        and not COMPILE_ONLY_RE.search(command)
+        for command in re.findall(r"(?m)^\s*(?:run:\s*)?cargo (?:test|nextest run)\s+([^\n]+)", commands)
+    )
+
+
+def is_covered(stem: str, file_name: str, text: str, patterns: list[str], *, directory: str = "tests") -> bool:
     """Covered = any reference anywhere in any workflow.
+
+    Embedded paths require a Cargo invocation naming both the package and target.
 
     Checks, in order: a `--test <stem>` invocation, the bare stem as a
     for-loop word, the literal file path, and finally glob expansion.
     """
+    if directory != "tests":
+        return package_runs_test(text, "proximadb-embedded", stem)
     if re.search(rf"--test[= ]{re.escape(stem)}\b", text):
         return True
     # Bare for-loop word: alone, with a line-continuation backslash, or as
@@ -170,9 +189,8 @@ def is_covered(stem: str, file_name: str, text: str, patterns: list[str]) -> boo
     for words in INLINE_FOR_RE.findall(text):
         if stem in words.split():
             return True
-    if f"tests/{file_name}" in text:
-        return True
-    return any(fnmatch(f"tests/{file_name}", pat) for pat in patterns)
+    test_path = f"{directory}/{file_name}"
+    return any(fnmatch(test_path, pat) for pat in patterns)
 
 
 def main() -> int:
@@ -191,7 +209,7 @@ def main() -> int:
 
     uncovered: set[str] = set()
     for path in targets:
-        if not is_covered(path.stem, path.name, text, patterns):
+        if not is_covered(path.stem, path.name, text, patterns, directory=path.parent.relative_to(ROOT).as_posix()):
             uncovered.add(path.name)
 
     if update:
@@ -204,7 +222,7 @@ def main() -> int:
     if new_uncovered:
         print("CI lane coverage check failed — NEW integration tests no lane executes:", file=sys.stderr)
         for name in new_uncovered:
-            print(f"  tests/{name}", file=sys.stderr)
+            print(f"  {name}", file=sys.stderr)
         print(
             "\nWire the test into a lane's run list in .github/workflows/ci.yml (and its\n"
             "path filter), or record it in the baseline with --update-baseline only if it\n"

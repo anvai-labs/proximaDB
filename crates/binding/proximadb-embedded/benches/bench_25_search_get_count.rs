@@ -10,10 +10,10 @@
 //!
 //! Run with:
 //! ```bash
-//! cargo bench --bench bench_25_search_get_count
+//! cargo bench -p proximadb-embedded --bench bench_25_search_get_count
 //! # heavier / HELIX:
 //! PROXIMADB_BENCH_ENGINE=helix PROXIMADB_BENCH_VECTOR_COUNT=100000 \
-//!   cargo bench --bench bench_25_search_get_count
+//!   cargo bench -p proximadb-embedded --bench bench_25_search_get_count
 //! ```
 //! (`PROXIMADB_COUNT_FS_IO` is set by the bench itself.)
 

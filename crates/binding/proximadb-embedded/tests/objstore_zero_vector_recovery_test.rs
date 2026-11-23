@@ -36,7 +36,10 @@ fn seed(data_path: &str) {
         HashMap::from([("kind".to_string(), serde_json::json!("embedded"))]),
         HashMap::from([
             ("kind".to_string(), serde_json::json!("api_key")),
-            ("secret".to_string(), serde_json::json!("sk-anvaiops-123")),
+            (
+                "secret".to_string(),
+                serde_json::json!("fixture-catalog-token"),
+            ),
         ]),
     ];
     db.insert(COLLECTION, ids, vectors, Some(metadata))

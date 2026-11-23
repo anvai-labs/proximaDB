@@ -15,27 +15,23 @@ use std::time::Duration;
 use proximadb::core::Config;
 use proximadb::database::ProximaDB;
 use tempfile::TempDir;
-use tokio::time::sleep;
+use tokio::time::{Instant, sleep, timeout_at};
 use tokio_postgres::SimpleQueryMessage;
 
-fn free_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind port 0");
-    let port = listener.local_addr().expect("local_addr").port();
-    drop(listener);
-    port
-}
-
 struct PgwireTestServer {
-    pg_port: u16,
+    client: tokio_postgres::Client,
     db: Option<ProximaDB>,
     _tmp_data: TempDir,
 }
 
 impl PgwireTestServer {
     async fn start() -> anyhow::Result<Self> {
-        let pg_port = free_port();
-        let rest_port = free_port();
-        let grpc_port = free_port();
+        let pg_listener = TcpListener::bind("127.0.0.1:0")?;
+        let rest_listener = TcpListener::bind("127.0.0.1:0")?;
+        let grpc_listener = TcpListener::bind("127.0.0.1:0")?;
+        let pg_port = pg_listener.local_addr()?.port();
+        let rest_port = rest_listener.local_addr()?.port();
+        let grpc_port = grpc_listener.local_addr()?.port();
         let tmp_data = TempDir::new()?;
 
         let mut config = Config::default();
@@ -50,46 +46,53 @@ impl PgwireTestServer {
             url: format!("file://{}", tmp_data.path().display()),
             ..Default::default()
         }];
+        config.storage.metadata_url = format!("file://{}/metadata", tmp_data.path().display());
         config.storage.wal_config.write_buffer_directory =
             format!("file://{}/wal", tmp_data.path().display());
 
         let mut db = ProximaDB::new(config).await?;
+        drop((pg_listener, rest_listener, grpc_listener));
         db.start().await?;
 
-        let http_client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(2))
-            .no_proxy()
-            .build()?;
-        let health_url = format!("http://127.0.0.1:{}/health", rest_port);
-        let deadline = std::time::Instant::now() + Duration::from_secs(20);
-        loop {
-            match http_client.get(&health_url).send().await {
-                Ok(resp) if resp.status().is_success() => break,
-                _ => {
-                    if std::time::Instant::now() > deadline {
-                        anyhow::bail!(
-                            "REST server didn't become ready on port {} within 20s",
-                            rest_port
-                        );
-                    }
+        let connection_string =
+            format!("host=127.0.0.1 port={pg_port} user=postgres dbname=proximadb sslmode=disable");
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let client = loop {
+            match timeout_at(
+                deadline,
+                tokio_postgres::connect(&connection_string, tokio_postgres::NoTls),
+            )
+            .await
+            {
+                Ok(Ok((client, connection))) => {
+                    tokio::spawn(async move {
+                        if let Err(error) = connection.await {
+                            eprintln!("pgwire connection error: {error}");
+                        }
+                    });
+                    break client;
+                }
+                Ok(Err(error)) if error.as_db_error().is_none() && Instant::now() < deadline => {
                     sleep(Duration::from_millis(100)).await;
                 }
+                Ok(Err(error)) => {
+                    let _ = db.shutdown().await;
+                    return Err(anyhow::Error::new(error)
+                        .context(format!("connecting to pgwire on port {pg_port}")));
+                }
+                Err(error) => {
+                    let _ = db.shutdown().await;
+                    return Err(anyhow::Error::new(error)
+                        .context(format!("waiting for pgwire on port {pg_port}")));
+                }
             }
-        }
-        sleep(Duration::from_millis(200)).await;
+        };
 
         Ok(Self {
-            pg_port,
+            client,
             db: Some(db),
             _tmp_data: tmp_data,
         })
-    }
-
-    fn pg_connection_string(&self) -> String {
-        format!(
-            "host=127.0.0.1 port={} user=postgres dbname=proximadb sslmode=disable",
-            self.pg_port
-        )
     }
 }
 
@@ -143,15 +146,7 @@ fn set(items: &[&str]) -> BTreeSet<String> {
 async fn pgwire_relational_engine_serves_joins_and_aggregates_over_real_data() {
     let server = PgwireTestServer::start().await.expect("server start");
 
-    let (client, connection) =
-        tokio_postgres::connect(&server.pg_connection_string(), tokio_postgres::NoTls)
-            .await
-            .expect("tokio-postgres connect");
-    tokio::spawn(async move {
-        if let Err(e) = connection.await {
-            eprintln!("pgwire connection error: {e}");
-        }
-    });
+    let client = &server.client;
 
     let suffix = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

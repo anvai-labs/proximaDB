@@ -505,6 +505,7 @@ jobs:
               # this filter tracks what can break it, not who owns the code.
               - 'src/services/**'
             storage_changes:
+              - 'crates/binding/proximadb-embedded/**'
               - 'src/storage/**'
               - 'tests/*storage*'
               - 'tests/*sst*'
@@ -733,6 +734,7 @@ jobs:
               - 'rust-toolchain*'
               - '.cargo/**'
             graph_changes:
+              - 'crates/binding/proximadb-embedded/tests/embedded_code_graph_parity_e2e.rs'
               - 'src/graph/**'
               - 'tests/*graph*'
             core_changes:
@@ -750,6 +752,9 @@ jobs:
             # the #1430 lesson, where a recall lane skipped on the very PR that
             # broke recall because the changed path matched no filter.
             authz_changes:
+              - 'crates/binding/proximadb-embedded/Cargo.toml'
+              - 'crates/binding/proximadb-embedded/src/**'
+              - 'crates/binding/proximadb-embedded/tests/engine_ttl_conformance_test.rs'
               - 'src/database.rs'
               - 'src/network/**'
               - 'crates/foundation/proximadb-config/**'
@@ -1535,7 +1540,9 @@ jobs:
           - { label: "cloud-full",          pkg: proximadb-server, args: "--features cloud-full" }
           - { label: "cloud-full+onnx",     pkg: proximadb-server, args: "--features cloud-full,onnx" }
           # Other gated surfaces invisible to default CI:
-          - { label: "cluster",             pkg: proximadb,        args: "--features cluster" }
+          # Use the existing staged root build after the hosted cluster
+          # runner disconnected without producing a compiler result.
+          - { label: "cluster",             pkg: proximadb,        staged_root: true, args: "--features cluster" }
           # enterprise-catalogs moved to its own path-scoped job
           # (feature-matrix-enterprise-catalogs, same check name) — TD-CITIER-1.
           # Ledger modality durable backend (S2, ADR-071) — the WAL-backed impl is behind the
@@ -1543,7 +1550,9 @@ jobs:
           - { label: "ledger-durable",      pkg: proximadb-ledger, args: "--features durable" }
           # Ledger modality gRPC service (S3, ADR-071) — the ProximaLedgerService + its port wiring
           # are behind the non-default `experimental-ledger` feature on the root crate.
-          - { label: "experimental-ledger", pkg: proximadb,        args: "--features experimental-ledger" }
+          # Stage this check because a local runner-sized cgroup reproduced the
+          # overlapping root library and unit-test compiler OOM.
+          - { label: "experimental-ledger", pkg: proximadb,        staged_root: true, args: "--features experimental-ledger" }
           # rank-onnx BERT tokenizer surface (bert_pair_tokenizing_extractor):
           # the feature is non-default, so two of its tests rotted silently for
           # months (still asserting the pre-#1741 pad-to-max_seq_len contract;
@@ -1554,33 +1563,36 @@ jobs:
           # F2 (ADR-072 D3/D5): the fenced ConditionalKeyStore in the relational insert
           # path is behind the non-default `oltp-integrity` feature; check it compiles so
           # cfg drift in that path is caught (the feature-gated test executes locally).
-          - { label: "oltp-integrity",       pkg: proximadb,        args: "--features oltp-integrity" }
+          - { label: "oltp-integrity",       pkg: proximadb,        staged_root: true, args: "--features oltp-integrity" }
           # Refactor/move coverage: these configurations catch cfg drift hidden
           # by the default build. Keep them in the same mandatory matrix rather
           # than relying on a PR being correctly labelled as mechanical.
-          - { label: "no-default-features",  pkg: proximadb,        args: "--no-default-features" }
+          # Check the supported minimal library shape. Default-dependent
+          # integration targets (for example AXIS) compile in the workspace lane.
+          - { label: "no-default-features", pkg: proximadb, targets: "--lib", args: "--no-default-features" }
           # AXIS cfg feature (TD-AXIS-4 Superseded): default ON; this variant turns
           # it OFF while keeping the other defaults on — the PAX-exact-scan build that
           # excludes the AXIS index engine + its recall/advisor/drift surfaces. Catches
           # cfg drift where axis code leaks out of the `#[cfg(feature = "axis")]` gates.
           - { label: "no-axis", pkg: proximadb-server, args: "--no-default-features --features sql_frontend,graph-first-sks,unified-facade-routing,canonical-document-store,datafusion-integration,otlp-metering" }
-          - { label: "experimental-engines", pkg: proximadb,        args: "--features experimental-engines" }
+          - { label: "experimental-engines", pkg: "proximadb proximadb-embedded",        staged_root: true, args: "--features experimental-engines" }
           # F3v (TD-DELVEC-1): cold-tier deletion vectors — feature-gated PAX flush-path
           # resolver capture. Check it compiles so cfg drift in that path is caught.
-          - { label: "cold-deletion-vectors", pkg: proximadb,      args: "--features cold-deletion-vectors" }
+          - { label: "cold-deletion-vectors", pkg: proximadb,      staged_root: true, args: "--features cold-deletion-vectors" }
           # TD-TQFEAT-1: TurboQuant (ADR-021) is non-default, so no leg compiled it and
           # tests/turboquant_e2e_propagation_test.rs rotted unnoticed against three
           # TraceBuilderInputs changes (egress_bytes, then #863 flattening `plan`, then
           # #1091's object-store meters). The root crate is checked with its tests, and
           # so is each sub-crate that declares the feature: `-p proximadb --tests` builds
           # dependencies as libs only, so their gated #[cfg(test)] code needs its own -p.
-          - { label: "experimental-turboquant", pkg: "proximadb proximadb-quantization-types proximadb-quantization-model proximadb-distance-kernel proximadb-vector proximadb-quantization-kernel", args: "--features experimental-turboquant" }
+          - { label: "experimental-turboquant", pkg: "proximadb proximadb-quantization-types proximadb-quantization-model proximadb-distance-kernel proximadb-vector proximadb-quantization-kernel", staged_root: true, args: "--features experimental-turboquant" }
           # TD-TQFEAT-1 class: three more non-default root features whose gated code
-          # (incl. the onnx-gated service_tests module and cdc-kafka's three
+          # (incl. the ONNX-gated Arrow IPC service test and cdc-kafka's three
           # required-features [[test]] targets) no leg compiled. The server's own
           # `onnx` feature forwards only to proximadb-embedding, so root onnx code
-          # needs this -p proximadb leg.
-          - { label: "onnx-cdc-duckdb",     pkg: proximadb,        args: "--features onnx,cdc-kafka,duckdb" }
+          # needs this -p proximadb leg. A local cgroup reproduced the
+          # overlapping root compiler OOM during this check as well.
+          - { label: "onnx-cdc-duckdb",     pkg: proximadb,        staged_root: true, args: "--features onnx,cdc-kafka,duckdb" }
           # Embedded crate (default, no language bindings) — validates the extracted
           # crate compiles against root at every tier. The full wheel build stays in
           # release-python.yml (heavy pyo3/numpy deps).
@@ -1629,14 +1641,40 @@ jobs:
             echo "::error::The object_store reqwest build selects native TLS instead of rustls"
             exit 1
           fi
-      - name: cargo check -p ${{ matrix.pkg }} --tests ${{ matrix.args }}
+      - name: Add swap headroom for the staged root checks
+        if: matrix.staged_root == true
+        run: |
+          sudo fallocate -l 10G /mnt/swapfile-ci
+          sudo chmod 600 /mnt/swapfile-ci
+          sudo mkswap /mnt/swapfile-ci
+          sudo swapon /mnt/swapfile-ci
+      - name: Check the root library before its test harness
+        if: matrix.staged_root == true
         env:
           CARGO_PROFILE_DEV_DEBUG: 0
         run: |
+          echo "Available processors: $(nproc)"
+          free -h
+          # A plain --lib check resolves a different graph. This small
+          # integration target activates the same dev dependencies as --tests
+          # and gives Cargo a reusable normal-library artifact before it
+          # schedules the root unit-test harness.
+          cargo check --jobs 4 -p proximadb --lib --test embedded_service_profile ${{ matrix.args }}
+      - name: cargo check -p ${{ matrix.pkg }} ${{ matrix.targets || '--tests' }} ${{ matrix.args }}
+        env:
+          CARGO_PROFILE_DEV_DEBUG: 0
+          STAGED_ROOT_CHECK: ${{ matrix.staged_root || false }}
+        run: |
           # Batched small-crates entry: check each package sequentially on one runner.
           for pkg in ${{ matrix.pkg }}; do
-            echo "::group::cargo check -p $pkg --tests ${{ matrix.args }}"
-            cargo check -p "$pkg" --tests ${{ matrix.args }}
+            build_jobs=()
+            if [[ "$pkg" == proximadb && "$STAGED_ROOT_CHECK" == true ]]; then
+              # The normal root library is warm. Keep the test harness from
+              # overlapping more than one integration check on this runner.
+              build_jobs=(--jobs 2)
+            fi
+            echo "::group::cargo check ${build_jobs[*]} -p $pkg ${{ matrix.targets || '--tests' }} ${{ matrix.args }}"
+            cargo check "${build_jobs[@]}" -p "$pkg" ${{ matrix.targets || '--tests' }} ${{ matrix.args }}
             echo "::endgroup::"
           done
       # Same compile-is-not-verification rule as the enterprise-catalogs job
@@ -2974,7 +3012,7 @@ jobs:
           # (TD-RDSTRAT-14 / #2419: create refuses unpersisted properties, the
           # PATCH route is gone). It was in NO lane, so those assertions never
           # gated — a re-added route or a relaxed guard would have shipped.
-          for test_file in tests/*sst*.rs tests/*storage*.rs tests/*wal*.rs tests/embedded_tenant_context.rs tests/td112_postflush_recall_e2e.rs tests/v2_post_flush_search_e2e.rs tests/recall_tune_auth_e2e.rs tests/mlflow_run_store_test.rs tests/iceberg_interop_e2e.rs; do
+          for test_file in tests/*sst*.rs tests/*storage*.rs tests/*wal*.rs tests/td112_postflush_recall_e2e.rs tests/v2_post_flush_search_e2e.rs tests/recall_tune_auth_e2e.rs tests/mlflow_run_store_test.rs tests/iceberg_interop_e2e.rs; do
             if [ -f "$test_file" ]; then
               test_name=$(basename "$test_file" .rs)
               echo "Running $test_name..."
@@ -2992,6 +3030,10 @@ jobs:
               fi
             fi
           done
+      - name: Verify embedded tenant isolation
+        env:
+          RUST_MIN_STACK: "8388608"
+        run: cargo test -p proximadb-embedded --test embedded_tenant_context -- --test-threads=1
       - name: Verify external file tables on 2 MiB worker stacks
         env:
           RUST_MIN_STACK: "2097152"
@@ -3157,6 +3199,8 @@ jobs:
           save-if: false
           add-job-id-key: false
           apt-packages: 'libssl-dev pkg-config protobuf-compiler'
+      - name: Check embedded against the ABAC-enabled root
+        run: cargo check -p proximadb-embedded --tests --features abac-policy
       - name: Run Authorization E2E (live transports)
         env:
           RUST_MIN_STACK: "8388608"
@@ -3368,6 +3412,8 @@ jobs:
               cargo test --test "$test_name" -- --test-threads=1
             fi
           done
+      - name: Verify embedded code graph parity
+        run: cargo test -p proximadb-embedded --test embedded_code_graph_parity_e2e -- --test-threads=1
 
   # Both suites use identical change selectors, runner image, features,
   # cache, stack and serial execution. Keep one target/ on the runner so
@@ -3494,7 +3540,7 @@ jobs:
           # pristine develop) is the likely family. The binary's other tests
           # (all-engine search matrix) keep gating. Rabitq -E precedent: the
           # unit lane's slow synthetic recall ratchet.
-          cargo nextest run -p proximadb --profile integration --retries 0 \
+          cargo nextest run -p proximadb -p proximadb-embedded --profile integration --retries 0 \
               -E 'not test(test_multiple_flush_cycles_all_engines)' \
               --test agent_memory_ingest_e2e \
               --test arrow_native_format_integration_test \

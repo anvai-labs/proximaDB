@@ -193,7 +193,7 @@ def include_file(rel_path: Path) -> bool:
     name = rel_path.name
     lower_name = name.lower()
 
-    if "tests" in parts:
+    if "tests" in parts or "benches" in parts:
         return False
     if name.startswith("test_"):
         return False

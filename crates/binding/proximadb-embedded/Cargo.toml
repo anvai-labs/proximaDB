@@ -15,8 +15,8 @@ path = "src/lib.rs"
 # `cdylib` is what maturin packages as the Python extension module
 # (`proximadb_embedded._proximadb_embedded`); the PyO3 entry point lives in
 # `src/python.rs` behind the `python` feature. `rlib` must stay: this crate is a
-# normal Rust dependency of `proximadb-spark-jni` and a dev-dependency of the
-# root crate's integration tests. Dropping either breaks one of those consumers.
+# normal Rust dependency of `proximadb-spark-jni` and the integration tests
+# and benchmarks in this package.
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
@@ -32,8 +32,8 @@ crate-type = ["cdylib", "rlib"]
 # CI cost note: this edge makes `-p proximadb-embedded` compile the whole root
 # monolith, so this crate is excluded from the advisory touched-crate fast lane
 # (`rust-affected-fast` in ci.yml, via `affected_crates.py
-# --exclude-dependents-of proximadb`). It stays covered by the required
-# `rust-test` job. It becomes fast-lane-eligible again if this edge ever goes.
+# --exclude-dependents-of proximadb`). Required integration lanes and the
+# feature matrix cover this crate explicitly.
 proximadb = { path = "../../..", default-features = false }
 # FA-b: optional, behind the `abac-policy` feature. Embedded mode is abac-OFF by
 # design (in-process; the host app owns authorization) — this dep exists only so
@@ -119,11 +119,13 @@ cloud-full = ["aws", "azure", "gcp"]
 # In-memory ANN index engine (AXIS: HNSW/IVF/RaBitQ). ON by default; OFF
 # (`--no-default-features`) yields the exact-scan embedded build.
 axis = ["proximadb/axis"]
+# Engine matrix for the embedded integration tests and engine benchmarks.
+experimental-engines = ["axis", "proximadb/experimental-engines"]
 # FA-b: mirrors root's `abac-policy`. OFF by default — embedded mode is
 # in-process and the host application owns authorization, so ABAC (a server-side
 # multi-tenant concern) does not apply. The feature exists so the abac
 # verification can build embedded against root's threaded signature; run it with
-# `--features abac-policy,proximadb-embedded/abac-policy`.
+# `-p proximadb-embedded --features abac-policy`.
 abac-policy = ["proximadb/abac-policy", "dep:proximadb-abac"]
 # Python bindings (PyO3 + zero-copy numpy).
 # `arrow/pyarrow` is required by the `arrow::pyarrow::{PyArrowType, ToPyArrow}`
@@ -158,6 +160,27 @@ vendored-openssl = ["openssl/vendored"]
 
 [dev-dependencies]
 async-trait.workspace = true
+criterion = { version = "0.5", features = ["async_tokio"] }
+half = "2.4"
+httpmock.workspace = true
+proximadb-distance-types.workspace = true
+proximadb-storage-filesystem-types.workspace = true
+rand.workspace = true
+tracing-subscriber.workspace = true
+
+[[bench]]
+name = "bench_19_comprehensive_optimization"
+harness = false
+
+# Real index Recall@k against a brute-force oracle.
+[[bench]]
+name = "bench_24_recall_at_k_engine"
+harness = false
+
+# TD-096 S2 / S1.5: per-search GET count on the filesystem seam.
+[[bench]]
+name = "bench_25_search_get_count"
+harness = false
 
 [lints]
 workspace = true

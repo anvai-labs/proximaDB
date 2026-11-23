@@ -13,7 +13,9 @@
 #
 # To add a risk class: append a [[risk]] block.
 #   surface            = path globs whose change makes this risk relevant
-#   required_tests     = bare test names (resolved to tests/<name>.rs)
+#   required_tests     = bare test names (resolved to <test_directory>/<name>.rs)
+#   test_directory    = optional repository-relative directory (default tests)
+#   test_package      = require a named Cargo package and target in the tier
 #   required_scenarios = markers (`scenario: <name>`) that must appear in a
 #                        required test (documents what is covered)
 #   must_run_in_tier   = a ci-success.needs job whose test-selection (globs or
@@ -32,7 +34,9 @@ must_run_in_tier = "rust-integration-test-pgwire-accuracy"
 
 [[risk]]
 class = "tenant-isolation"        # writes must be tenant-scoped
-surface = ["src/embedded/**", "src/**/tenant*"]
+surface = ["src/embedded/**", "src/**/tenant*", "crates/binding/proximadb-embedded/**"]
+test_directory = "crates/binding/proximadb-embedded/tests"
+test_package = "proximadb-embedded"
 required_tests = ["embedded_tenant_context"]
 required_scenarios = ["tenant-stamped", "default-single-tenant"]
 must_run_in_tier = "rust-integration-test-storage"
