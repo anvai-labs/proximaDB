@@ -242,8 +242,11 @@ pub mod utils {
             // Same engine - no migration needed
             (a, b) if a == b => false,
 
-            // VIPER was removed (ADR-093): no migration path exists — the
-            // target engine list intentionally omits it.
+            // VIPER was removed (ADR-093): no migration path exists in
+            // either direction — guard it before the wildcard arms.
+            (ProtoStorageEngine::Viper, _) => false,
+            (_, ProtoStorageEngine::Viper) => false,
+
             (ProtoStorageEngine::Sst, _) => true,
             (ProtoStorageEngine::Swift, _) => true,
             (ProtoStorageEngine::Nova, _) => true,
