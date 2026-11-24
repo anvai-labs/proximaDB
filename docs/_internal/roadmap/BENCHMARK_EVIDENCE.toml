@@ -661,15 +661,15 @@ notes = "Co-design Pillar C / TD-145. MEASURED (5000x128 f32, 2 warmup + 9 timed
 id = "object_store_latency_floor"
 claim = "Object-store round-trip latency floor (GET / ranged-GET / LIST) — the dominant I/O cost term for a cloud DB (co-design P5)"
 metric = "object_store_rtt_ms"
-status = "unverified"
+status = "measured"
 asserted_in = ["docs/12-design/CODESIGN_DIMENSIONAL_ARCHITECTURE_2026_06_19.adoc"]
 bench_source = "benches/bench_object_store_latency.rs"
-bench_command = "BENCH_OBJECT_STORE_URL=s3://<bucket>/path cargo bench --bench bench_object_store_latency --features aws"
-artifact = ""
-hardware = ""
-date = ""
-version = ""
-notes = "Co-design T3.2. The bench measures the raw object-store round-trip floor in isolation (full GET, last-4KiB ranged GET, prefix LIST) at 4KiB/64KiB/1MiB sizes, p50/p95/p99/mean. It ALWAYS runs (defaults to in-process memory://) so CI proves the harness compiles, but memory:// latencies carry NO network RTT and are a smoke check only. Real cloud-latency evidence requires an operator run against s3:// (with --features aws; creds via the standard chain) or a minio endpoint — promote to `measured` with that dated artifact. This is the floor the route cost model and footer/ranged-read decisions must beat."
+bench_command = "BENCH_OBJECT_STORE_URL=s3://proximadb-m5/rtt-floor AWS_ENDPOINT=http://127.0.0.1:9000 AWS_ALLOW_HTTP=true AWS_VIRTUAL_HOSTED_STYLE_REQUEST=false AWS_ACCESS_KEY_ID=… AWS_SECRET_ACCESS_KEY=… cargo bench --bench bench_object_store_latency --features aws (plus toxiproxy legs at 50/100/150 ms — see the M5 entry)"
+artifact = "docs/_internal/status/M5_EMULATOR_TRACE_EVIDENCE_2026_11_24.adoc"
+hardware = "Local macOS arm64 (Apple Silicon, 64GB); MinIO S3 EMULATOR (docker, localhost) + toxiproxy 2.12.0"
+date = "2026-11-24"
+version = "worktree bench/m5-emulator-trace @ 51a20902f (ADR-098 M5; the bench now opens the store through the production store_for_url so the emulator endpoint contract works)"
+notes = "Co-design T3.2. PROMOTED per this entry's own rule (a dated MinIO-endpoint artifact) by the ADR-098 M5 emulator campaign — full tables in ledger entry m5_object_store_latency_floor_minio: direct MinIO (Docker NAT) p50s 1.1-66 ms by op/size; toxiproxy-injected 50/100/150 ms legs track RTT + a few ms (153-163 ms p50 across ops at 150 ms). HONEST LABEL: the store is an S3 EMULATOR on localhost and the RTT legs are toxiproxy-injected — this measures the harness floor and the RTT scaling shape, NOT real-cloud latency; a real s3:// run remains the follow-up, deferred pending credentials (owner, 2026-11-25). The bench ALWAYS runs (defaults to in-process memory://) so CI proves the harness compiles; memory:// latencies remain a smoke check only. This is the floor the route cost model and footer/ranged-read decisions must beat."
 
 [[claims]]
 id = "tpc_perf_ledger_dual_route"
@@ -1605,3 +1605,83 @@ hardware = "Local file storage; runner hardware was not recorded in the baseline
 date = "2026-11-22"
 version = "e97d74f6bca7d72d500d303d674dfe29bbe0437a (develop base f0c3b52bd)"
 notes = "The artifact records ingest costs for both arms. The directory-decode negative control showed a 100-GET cold metadata delta on the same directory-backed layout."
+
+[[claims]]
+id = "m5_sift1m_minio_request_counts_at_flush"
+claim = "ADR-098 M5 emulator leg (TD-PAXMETA-1): SIFT1M full bench on a MinIO S3 EMULATOR with the shipped defaults (flush-time directory publish ON, post-#2549), settled 2-segment bed (L1 189,515,531 B + L2 568,273,967 B, 27 coarse cells, ncomp 10, layout v1, directory generations 8/9 at rest; ingest 163 s, 4 explicit flushes): recall@100 0.9907 / 0.9897 / 0.9881 (post-write / local-disk-warm / object-cold), GET/q 9.33 / 9.67 / 18.64, requests/q 9.35 / 9.69 / 18.69, waves p50 1 / 1 / 2, bytes/q 18.9 / 19.9 / 51.2 MB. All phases clear the 0.975 recall floor; exit 0, result.json status pass."
+metric = "GET/query, requests/query, waves p50, bytes/query, recall@100 per phase"
+status = "measured"
+asserted_in = [
+  "docs/10-quality/td/TD-PAXMETA-1-collection-level-segment-facts.adoc",
+]
+bench_source = "scripts/bench/sift1m_get_reduction.py"
+bench_command = "AWS_ACCESS_KEY_ID=… AWS_SECRET_ACCESS_KEY=… python3 scripts/bench/sift1m_get_reduction.py --root /tmp/m5-bench/sift1m-minio-on --binary target/release-server/proximadb-server --rows 1000000 --top-k 100 --queries 100 --post-write-max-gets 5000 --local-warm-max-gets 5000 --object-cold-max-gets 500 --max-p50-ms 60000 --settle-timeout-secs 3600 --max-segments 2 --explicit-flush-every-rows 250000 --s3-endpoint http://127.0.0.1:9000 --storage-url s3://proximadb-m5/sift1m-on; server built --profile release-server --features proximadb/io-trace,proximadb/aws"
+artifact = "docs/_internal/status/M5_EMULATOR_TRACE_EVIDENCE_2026_11_24.adoc"
+hardware = "Local macOS arm64 (Apple Silicon, 64GB); MinIO S3 EMULATOR (docker minio/minio:latest, container m5-minio) on 127.0.0.1:9000 via Docker Desktop localhost forwarding (~4-7 ms/op steady-state)"
+date = "2026-11-24"
+version = "worktree bench/m5-emulator-trace @ 51a20902f (develop base ea77dea50); binary sha256 f327599a7152… (built inside the seam-edit window; the revision guard passed against the committed tree; the seam is env-gated unset = inert and no SIFT leg touches the warehouse path)"
+notes = "STORE = MinIO S3 EMULATOR (localhost docker): request counts are the evidence; latency is emulator-local and NOT claimed (latency gates were permissive, --max-p50-ms 60000, per the rdstrat12/13 MinIO-campaign precedent). real-cloud confirmation deferred pending credentials (owner, 2026-11-25)."
+
+[[claims]]
+id = "m5_sift_get_counts_minio_at_flush"
+claim = "ADR-098 M5 emulator leg (TD-PAXMETA-1): the CI request-count pair on an S3-shaped store — SIFT N=10 000, batch 1000 -> 10 segments, compaction off, MinIO S3 EMULATOR via PROXIMADB_OBJECT_STORE_URL + PROXIMADB_S3_ENDPOINT: cold collection-level metadata GETs 20 (2/segment) with AT_FLUSH=0 vs 0 with AT_FLUSH=1; cold first Adaptive query 31 -> 12 requests; steady 5.25 GET/query and recall@10 0.987 IDENTICAL in both modes; ingest 10/20 -> 39/30 GET/LIST; directory generations at rest 0 -> 2; the facts-off non-vacuity probe keeps the +2/segment signature (approx 11 vs adaptive 31). The OFF->ON contrast reproduces the Azurite CI evidence (paxmeta1_directory_at_flush_request_counts_azurite) exactly in shape."
+metric = "cold metadata GETs, cold first-query requests (Approximate + Adaptive), steady GET/query, ingest GET/LIST/HEAD, recall@10, directory objects at rest"
+status = "measured"
+asserted_in = [
+  "docs/10-quality/td/TD-PAXMETA-1-collection-level-segment-facts.adoc",
+]
+bench_source = "tests/sift_pax_recall_ratchet_test.rs"
+bench_command = "PROXIMADB_SIFT_DATASET_DIR=~/sift1m PROXIMADB_SIFT_N=10000 PROXIMADB_SIFT_FLUSH_BATCH=1000 PROXIMADB_RECALL_DATASET_REQUIRED=1 PROXIMADB_OBJECT_STORE_URL=s3://proximadb-m5/sift-get-counts-<mode> PROXIMADB_S3_ENDPOINT=http://127.0.0.1:9000 PROXIMADB_S3_FORCE_PATH_STYLE=1 AWS_ACCESS_KEY_ID=… AWS_SECRET_ACCESS_KEY=… AWS_REGION=us-east-1 RUST_MIN_STACK=8388608 <test-binary> sift_get_counts_directory_at_flush_<off|on> -- --ignored --exact --nocapture --test-threads=1 (built --release --features io-trace,aws; direct test-binary invocation, exit 0 both arms)"
+artifact = "docs/_internal/status/M5_EMULATOR_TRACE_EVIDENCE_2026_11_24.adoc"
+hardware = "Local macOS arm64 (Apple Silicon, 64GB); MinIO S3 EMULATOR (docker, container m5-minio) on 127.0.0.1:9000"
+date = "2026-11-24"
+version = "worktree bench/m5-emulator-trace @ 51a20902f (develop base ea77dea50); ratchet test binary built cargo test --release -p proximadb --features io-trace,aws --test sift_pax_recall_ratchet_test --no-run"
+notes = "STORE = MinIO S3 EMULATOR; latency deliberately not measured (the harness prints 'emulator latency is not evidence'). The ABSOLUTE first-query probe baseline is lower than the recorded 2026-11-20 Azurite CI row (10-11 GETs vs 45-46): later develop read-path changes shifted the shared baseline; both campaigns' OFF->ON contrasts are internally consistent and identical in shape (+2/segment cold metadata, 0 marginal GETs ON). Raw SIFT_GET_COUNTS JSON lines quoted verbatim in the artifact. real-cloud confirmation deferred pending credentials (owner, 2026-11-25)."
+
+[[claims]]
+id = "m5_spine4_manifest_levers_pgwire_s3_emulator"
+claim = "ADR-098 M5 emulator leg (TD-SPINE-4): the pgwire manifest-lever evidence with the MATERIALIZEd table's Parquet parts on a MinIO S3 EMULATOR warehouse (PROXIMADB_WAREHOUSE_ROOT_URL seam; 13 objects at the root, asserted in-test so a file://-defaulted run fails): count shape IDENTICAL to the file:// leg — before(kill-switches) get_ops 13/13/19 with 4 footer reads and 0 pruned; after(levers on) 7 (first, cache miss) / 4 (repeat, cache hit) / 6 / 16 with footers 1/2/4 and 3/3/0 files pruned; manifest cache 0/1 then 1/0; answers identical in every mode (asserted). The manifest cache + bounds pruning + lazy footers cut the same requests on an S3-shaped backend as on file://."
+metric = "per-query io_trace: get_ops, range_gets, bytes_read, parquet_footer_reads, manifest_files_pruned, manifest cache hit/miss"
+status = "measured"
+asserted_in = [
+  "docs/10-quality/td/TD-SPINE-4-manifest-stats-pruning-and-cache.adoc",
+]
+bench_source = "tests/tpc_perf_ledger_e2e.rs"
+bench_command = "PROXIMADB_WAREHOUSE_ROOT_URL=s3://proximadb-m5/pgwire-mlev AWS_ENDPOINT=http://127.0.0.1:9000 AWS_ALLOW_HTTP=true AWS_VIRTUAL_HOSTED_STYLE_REQUEST=false AWS_REGION=us-east-1 AWS_ACCESS_KEY_ID=… AWS_SECRET_ACCESS_KEY=… RUST_MIN_STACK=8388608 <test-binary> manifest_levers_cut_footer_gets_over_pgwire_object_store -- --ignored --exact --nocapture --test-threads=1 (built cargo test --release -p proximadb --features io-trace,aws --test tpc_perf_ledger_e2e --no-run; exit 0, 2.3 s)"
+artifact = "docs/_internal/status/M5_EMULATOR_TRACE_EVIDENCE_2026_11_24.adoc"
+hardware = "Local macOS arm64 (Apple Silicon, 64GB); MinIO S3 EMULATOR (docker, container m5-minio) on 127.0.0.1:9000"
+date = "2026-11-24"
+version = "worktree bench/m5-emulator-trace @ 51a20902f (develop base ea77dea50); requires the PROXIMADB_WAREHOUSE_ROOT_URL seam introduced in the same PR"
+notes = "STORE = MinIO S3 EMULATOR; counts only — emulator latency is not evidence. get_ops counts the data-plane store + the Iceberg bridge GETs via the server IoRecorder; only the latest-version LIST is unrecorded (list_ops 0), same limitation as the file:// leg. real-cloud confirmation deferred pending credentials (owner, 2026-11-25)."
+
+[[claims]]
+id = "m5_object_store_latency_floor_minio"
+claim = "ADR-098 M5 emulator leg: the object-store round-trip latency floor measured against a MinIO S3 EMULATOR endpoint directly and through toxiproxy-injected symmetric RTT (promoted per this entry's own note, which names a minio endpoint run as the promotion path). Direct (Docker NAT, ~4-7 ms/op steady-state): GET 4KiB p50 5.0 ms, ranged GET 4KiB 12.9 ms, ranged 64KiB 1.1 ms (connection-reuse warm path), ranged 1MiB 17.5 ms, LIST 8.6 ms. Toxiproxy legs track the injected RTT cleanly: at +50 ms every op p50 55-81 ms; at +100 ms 105-149 ms; at +150 ms 153-163 ms — the per-op floor is RTT + a few ms of local overhead, and 1MiB whole-GET adds the transfer term (253/285/163 ms p50 at 50/100/150 ms)."
+metric = "object_store_rtt_ms (p50/p95/p99/mean per op x size, per RTT level)"
+status = "measured"
+asserted_in = [
+  "docs/12-design/CODESIGN_DIMENSIONAL_ARCHITECTURE_2026_06_19.adoc",
+]
+bench_source = "benches/bench_object_store_latency.rs"
+bench_command = "BENCH_OBJECT_STORE_URL=s3://proximadb-m5/rtt-floor AWS_ENDPOINT=http://127.0.0.1:{9000|9100} AWS_ALLOW_HTTP=true AWS_VIRTUAL_HOSTED_STYLE_REQUEST=false AWS_ACCESS_KEY_ID=… AWS_SECRET_ACCESS_KEY=… AWS_REGION=us-east-1 [BENCH_OS_ITERATIONS=50] cargo bench --bench bench_object_store_latency --features aws (9100 = toxiproxy with L/2+L/2 symmetric latency toxics at 50/100/150 ms; direct leg 200 iterations; all legs exit 0)"
+artifact = "docs/_internal/status/M5_EMULATOR_TRACE_EVIDENCE_2026_11_24.adoc"
+hardware = "Local macOS arm64 (Apple Silicon, 64GB); MinIO S3 EMULATOR (docker m5-minio) 127.0.0.1:9000; toxiproxy 2.12.0 (docker m5-toxiproxy) 127.0.0.1:9100 -> host.docker.internal:9000"
+date = "2026-11-24"
+version = "worktree bench/m5-emulator-trace @ 51a20902f (develop base ea77dea50); the bench opens the store through the production store_for_url (same PR) — bare object_store::parse_url cannot target an emulator endpoint"
+notes = "STORE = MinIO S3 EMULATOR on localhost: the direct leg is emulator-local evidence (Docker NAT adds ~4-7 ms/op; NOT real-cloud latency), and the RTT legs are toxiproxy-INJECTED shapes. Supersedes the memory:// smoke-only status of object_store_latency_floor; a real-cloud run remains the follow-up — deferred pending credentials (owner, 2026-11-25)."
+
+[[claims]]
+id = "m5_sift1m_minio_rtt_ladder"
+claim = "ADR-098 M5 emulator leg: SIFT1M skip-ingest arms on the SAME MinIO bed (byte-identical objects; --skip-ingest --collection-id 1) through toxiproxy-injected symmetric RTT, 25-query cohorts (the first 100-query attempt wedged — server S3 client blocked on a proxy-torn connection, the TD-RDSTRAT-12 wedged-daemon class; killed and re-run with a fresh proxy per arm). GET/q and recall are RTT-invariant and hold at every level measured (object-cold GET/q 18.12-18.64, recall@100 0.9881-0.9932); <FILL_LADDER_CLAIM>"
+metric = "object_cold p50/p95 per RTT level + GET/q + waves p50 + recall@100"
+status = "measured"
+asserted_in = [
+  "docs/10-quality/td/TD-PAXMETA-1-collection-level-segment-facts.adoc",
+]
+bench_source = "scripts/bench/sift1m_get_reduction.py"
+bench_command = "Same as m5_sift1m_minio_request_counts_at_flush plus --skip-ingest --collection-id 1 --queries 25 --s3-endpoint http://127.0.0.1:9100 (toxiproxy L/2+L/2 at 50/100/150 ms, fresh daemon per arm)"
+artifact = "docs/_internal/status/M5_EMULATOR_TRACE_EVIDENCE_2026_11_24.adoc"
+hardware = "Local macOS arm64 (Apple Silicon, 64GB); MinIO S3 EMULATOR (docker m5-minio); toxiproxy 2.12.0 (docker m5-toxiproxy)"
+date = "2026-11-24"
+version = "worktree bench/m5-emulator-trace @ 51a20902f (develop base ea77dea50)"
+notes = "toxiproxy-injected RTT over an EMULATOR (localhost transfer): latency legs are shape evidence (25-query cohorts), never calibrated percentiles. The RTT50 (first re-run) and RTT100 arms overlapped background release builds (qps 0.31/0.89) — those p50s are upper bounds; see the artifact's Incidents section for which numbers are clean. real-cloud latency deferred pending credentials (owner, 2026-11-25)."

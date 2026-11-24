@@ -116,9 +116,25 @@ Manifest cache hit/miss: 0/1 on the first lever-on query, 1/0 thereafter. Answer
 mode (asserted). **The count shape is IDENTICAL to the file:// evidence** (13→7/4, 6, 19→16; footers
 4→1/2/4; pruned 3/3/0) — the manifest levers cut the same requests on an S3-shaped backend.
 
-== 5. Object-store round-trip latency floor (bench_object_store_latency)
+== 5. Object-store round-trip latency floor (bench_object_store_latency) — exit 0 ×4
 
-<FILL_LEG_5>
+All four legs via the production `store_for_url` (the same PR routes this bench through it — bare
+`parse_url` cannot target an emulator endpoint). Direct leg: 200 iterations; toxiproxy legs: 50.
+
+[cols="1,1,1,1,1,1,1", options="header"]
+|===
+| Leg | GET 4KiB p50 | ranged 4KiB p50 | ranged 64KiB p50 | ranged 1MiB p50 | whole 1MiB p50 | LIST p50
+| direct MinIO (Docker NAT) | 5.0 ms | 12.9 ms | 1.1 ms | 17.5 ms | 65.6 ms | 8.6 ms
+| +50 ms injected RTT | 60.2 ms | 55.3 ms | 80.8 ms | 81.4 ms | 253.2 ms | 79.4 ms
+| +100 ms injected RTT | 130.4 ms | 128.2 ms | 131.9 ms | 129.3 ms | 285.0 ms | 104.9 ms
+| +150 ms injected RTT | 153.5 ms | 153.6 ms | 153.9 ms | 154.3 ms | 162.7 ms | 153.9 ms
+|===
+
+Reading: the per-op floor tracks injected RTT + a few ms of local overhead at every level (at
++150 ms every small op is 153-155 ms p50 — the emulator/proxy overhead term is ≈ 4 ms); whole-object
+1 MiB GET adds the transfer term. The direct leg's 64 KiB ranged p50 of 1.1 ms is the warm
+connection-reuse path (first-connection setup dominates the 4 KiB rows). These are FLOOR shapes on
+an emulator — the numbers a route-cost model must beat, not cloud SLAs.
 
 == Incidents (recorded, not hidden)
 
