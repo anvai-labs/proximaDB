@@ -1082,7 +1082,11 @@ async fn execute_sql_in_scope(
         ));
     }
 
-    // Prefer unified query port (decoupled from concrete QueryFacadeAdapter type)
+    // Prefer unified query port (decoupled from concrete QueryFacadeAdapter type).
+    // ADR-098 D5 / TD-SPINE-6: the port carries the caller's tenant as DATA on
+    // the context (the task-local `with_request_tenant` scope above stays as
+    // the fallback) and delegates plain SQL to the ComputeScheduler decision
+    // path — the same planner decision as /api/v2/sql and pgwire.
     if let Some(ref qp) = state.unified_query_port {
         debug!("Using unified query port for SQL query");
         let query_with_hint = if let Some(ref seeding) = request.seeding {
@@ -1100,6 +1104,9 @@ async fn execute_sql_in_scope(
                 sql_params_to_proxima_values(request.parameters.clone()),
                 request.collection.clone(),
                 None,
+                proximadb_runtime::UnifiedQueryPortContext::for_identity(
+                    proximadb_runtime::PortIdentity::for_tenant(&scoped_tenant),
+                ),
             )
             .await
         {
@@ -2700,12 +2707,14 @@ mod tests {
             _: Option<Vec<proximadb_data_model::ProximaValue>>,
             _: Option<String>,
             _: Option<u32>,
+            _: proximadb_runtime::UnifiedQueryPortContext<'_>,
         ) -> anyhow::Result<serde_json::Value> {
             anyhow::bail!("mock")
         }
         async fn execute_multi_model_query(
             &self,
             _: serde_json::Value,
+            _: proximadb_runtime::UnifiedQueryPortContext<'_>,
         ) -> anyhow::Result<serde_json::Value> {
             anyhow::bail!("mock")
         }
@@ -2713,12 +2722,14 @@ mod tests {
             &self,
             _: String,
             _: Option<Vec<proximadb_data_model::ProximaValue>>,
+            _: proximadb_runtime::UnifiedQueryPortContext<'_>,
         ) -> anyhow::Result<serde_json::Value> {
             anyhow::bail!("mock")
         }
         async fn execute_distributed_query(
             &self,
             _: serde_json::Value,
+            _: proximadb_runtime::UnifiedQueryPortContext<'_>,
         ) -> anyhow::Result<serde_json::Value> {
             anyhow::bail!("mock")
         }
@@ -2726,6 +2737,7 @@ mod tests {
             &self,
             _: String,
             _: Option<String>,
+            _: proximadb_runtime::UnifiedQueryPortContext<'_>,
         ) -> anyhow::Result<serde_json::Value> {
             anyhow::bail!("mock")
         }
@@ -2735,6 +2747,7 @@ mod tests {
             _: String,
             _: bool,
             _: Option<u64>,
+            _: proximadb_runtime::UnifiedQueryPortContext<'_>,
         ) -> anyhow::Result<String> {
             anyhow::bail!("mock")
         }
@@ -2743,13 +2756,22 @@ mod tests {
             _: String,
             _: Option<Vec<proximadb_data_model::ProximaValue>>,
             _: Option<String>,
+            _: proximadb_runtime::UnifiedQueryPortContext<'_>,
         ) -> anyhow::Result<serde_json::Value> {
             anyhow::bail!("mock")
         }
-        async fn delete_prepared(&self, _: String) -> anyhow::Result<()> {
+        async fn delete_prepared(
+            &self,
+            _: String,
+            _: proximadb_runtime::UnifiedQueryPortContext<'_>,
+        ) -> anyhow::Result<()> {
             anyhow::bail!("mock")
         }
-        async fn get_prepared_stats(&self, _: Vec<String>) -> anyhow::Result<serde_json::Value> {
+        async fn get_prepared_stats(
+            &self,
+            _: Vec<String>,
+            _: proximadb_runtime::UnifiedQueryPortContext<'_>,
+        ) -> anyhow::Result<serde_json::Value> {
             anyhow::bail!("mock")
         }
     }

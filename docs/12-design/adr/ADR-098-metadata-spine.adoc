@@ -212,6 +212,14 @@ task-local, and honours freshness. The transport-parity suite extends to canonic
 pgwire. Owner-versus-reader *placement* (writes and Strong reads on the partition-lease holder;
 scans on cache-affine stateless readers) is the follow-on direction and is not decided here.
 
+*Implemented (TD-SPINE-6, 2026-11-24):* the shared SQL-authority body is
+`QueryFacadeAdapter::execute_sql_via_authority`; every port SQL entry funnels plain SQL through
+it (multi-model extensions keep their federated lowering — no relational table resolves for them,
+so the scheduler decision has nothing to decide), `UnifiedQueryPortContext` carries
+`PortIdentity` + `VectorFreshnessMode` (Strong bypasses the OLAP result-cache lookup, mandate
+#16c), and the parity suites cover pgwire, REST v2 `/sql`+`/api/v2/query`, canonical `/sql`,
+gRPC and MCP with a mutation probe.
+
 [[_d6_supersessions]]
 === D6 — Supersessions and amendments
 

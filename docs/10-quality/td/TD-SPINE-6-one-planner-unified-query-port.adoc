@@ -5,11 +5,11 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | **Open** (filed 2026-11-19).
+| Status | **Implemented** (filed 2026-11-19; implemented 2026-11-24 — see *Evidence*).
 | Priority | **MEDIUM-HIGH**. The same SQL can behave differently by surface: freshness, routing, the ADR-025 delta merge and caching exist on one core only. This is the per-surface fork that CLAUDE.md #18b forbids.
-| Component | `crates/platform/proximadb-runtime/src/unified_query_port.rs` (:37); `src/query/unified_query_port_impl.rs` (port methods :550-723, which lower to `QueryFacadeAdapter::federated_query`, `src/query/facade/adapter.rs:443`); `src/query/federated/mod.rs` (`FederatedQueryContext::execute` :276, refuses `QueryType::Sql` :310); `src/query/facade/adapter.rs` (`execute_sql` :727, which calls the free function `relational_pipeline::try_run_select` at :811); `src/query/compute_scheduler.rs`; callers: `src/network/rest/canonical/handlers.rs` (:1086), `src/network/rest/v2/query.rs` (:91, :148), MCP (`multi_server.rs` :493).
+| Component | `crates/platform/proximadb-runtime/src/unified_query_port.rs` (the port trait + `UnifiedQueryPortContext`); `src/query/unified_query_port_impl.rs` (the delegation seam `run_sql_via_one_planner`); `src/query/facade/adapter.rs` (`execute_sql_via_authority`, extracted from the `QueryAdapterPort::execute_sql` body — the ONE SQL authority); `src/query/compute_scheduler.rs` (unchanged — still the only engine-selection point); callers: `src/network/rest/canonical/handlers.rs`, `src/network/rest/v2/query.rs`, `src/network/mcp/backend.rs`, `crates/platform/proximadb-api/src/rest/canonical/multimodal_query.rs`.
 | Authority | link:../../12-design/adr/ADR-098-metadata-spine.adoc[ADR-098] D5 (seam S6); ADR-097 D1, ADR-064 D1, ADR-053 D2
-| Relates to | TD-CONN-1 (surface parity), TD-ROUTE-3 (decision/dispatch, pgwire-only), TD-ABAC-7 (`PortIdentity` consolidation), `tests/integration/query_facade/test_sql_transport_rendering_parity.rs`
+| Relates to | TD-CONN-1 (surface parity), TD-ROUTE-3 (decision/dispatch, pgwire-only), TD-ABAC-7 (`PortIdentity` consolidation), `tests/integration/query_facade/test_sql_transport_rendering_parity.rs`, `tests/spine6_one_planner_parity_e2e.rs`
 |===
 
 == Problem
@@ -37,9 +37,82 @@
 . Owner-versus-reader placement (partition-lease holder vs cache-affine stateless readers) is a
   follow-on TD once one decision path exists.
 
+== Implementation (2026-11-24)
+
+. **Delegation seam.** The `QueryAdapterPort::execute_sql` body (EXPLAIN-DML routing →
+  `try_sql_write_dispatch` → `try_run_select`, whose SELECT arm is the `ComputeScheduler` decision
+  → facade fallback) is extracted into the inherent
+  `QueryFacadeAdapter::execute_sql_via_authority(query, collection, identity, result_cache)`.
+  The trait method forwards to it **unchanged** (same cache policy, same behavior — pgwire,
+  `/api/v2/sql` and gRPC are untouched). `UnifiedQueryPortImpl::run_sql_via_one_planner` funnels
+  every port SQL entry (`execute_unified_query`, `execute_multi_model_query`,
+  `execute_federated_query`, `execute_prepared`) through that ONE body for plain SQL,
+  discriminated by the adapter's single `should_use_federated_request` (now `pub(crate)`).
+  The port grows **no routing of its own**: `ComputeScheduler::route_select*` remains the only
+  engine-selection point reached by every surface.
+. **UQL claiming rule.** The UQL grammar overlaps plain SQL and an un-prefixed `FROM` defaults
+  to the Vector model, so a plain `SELECT ... FROM t` used to die in UQL lowering with
+  "UQL vector queries require VECTOR_SIMILAR(...)". `uql_to_federated_sql` now returns
+  `Ok(None)` (no claim) for a parsed SELECT with no `VECTOR_SIMILAR`/`VECTOR_DISTANCE`
+  condition, routing the text as plain SQL through the seam. That shape was a hard error
+  pre-convergence, so nothing working changes; genuine vector UQL still lowers (and still
+  validates its parameters).
+. **Why extension SQL keeps the federated path.** `VECTOR_SEARCH`/`GRAPH_QUERY`/`DOCUMENT_QUERY`/
+  `LOGS`/`METRICS`/`RERANK`/`<->` queries resolve no relational table, so the scheduler decision
+  has nothing to decide; engine selection for vector/graph/document search happens inside the
+  engine layer behind the facade strategies (`SqlStrategy` → `FederatedQueryContext` → executor).
+  They keep their federated lowering AND their port result rendering (`{id, score, rank}`), so
+  multimodal consumers (MCP search, `/api/v2/query` UQL) see zero change.
+. **Freshness.** The port context carries `VectorFreshnessMode`. `Strong` ⇒ the delegated path is
+  handed `None` as the OLAP result cache (mandate #16c: gate the lookup on `!Strong` — a Strong
+  read always computes fresh); non-Strong modes hand the cache through (hits inside
+  `try_run_select` are LSN-pinned, never staler than the requested mode). The
+  **api_handlers/pgwire callers keep the pre-existing policy** (consult under Strong
+  LSN-pinned eligibility, ADR-051 D2) — no behavior change. The federated result cache
+  (`FederatedQueryResultCache`) is not wired in the live server (`FederatedQueryContext::new`
+  sets `cache: None`); if it is ever enabled it must honor this mode at that seam.
+. **Identity.** New `UnifiedQueryPortContext { identity: PortIdentity, freshness }` on every port
+  method. `/api/v2/query` now extracts `ResolvedRequestIdentity` (the same fail-closed contract as
+  `/api/v2/sql`); the canonical `/sql` handler passes `PortIdentity::for_tenant(scoped_tenant)`;
+  MCP passes its configured tenant; the multimodal `/api/v2/unified/*` handlers take
+  `Option<Extension<ResolvedRequestIdentity>>`. The task-local `request_scope` remains ONLY as
+  the documented fallback (bare-mounted test routers; the federated lowering's own scope
+  requirement) — prepared-statement owner keying prefers the explicit identity tenant, then the
+  scope. Plain SQL with neither identity nor scope fails closed ("no request identity").
+. **`execute_distributed_query`** deliberately does NOT route through the seam: it is an explicit
+  `force_path = "distributed"` override onto the `DistributedQueryCoordinator` — a placement
+  decision orthogonal to local engine selection (ADR-098 D5's owner-versus-reader placement is
+  the follow-on and is not decided here).
+
 == Acceptance
 
 * The same SQL returns the same rows and the same route decision over pgwire, REST v2, canonical
   `/sql`, gRPC and MCP (parity suite, with a mutation probe proving the comparison is not tautological).
 * A Strong-freshness read through the port bypasses the query cache (mandate #16c).
 * Tenant isolation: a request without identity fails closed on every surface.
+
+== Evidence
+
+* `tests/integration/query_facade/test_sql_transport_rendering_parity.rs`:
+  `plain_sql_runs_through_the_scheduler_on_every_in_process_surface` (REST v2 `/sql` reference vs
+  canonical `/sql` port leg vs gRPC vs MCP — identical rendered rows; DDL+DML seeded THROUGH the
+  port, which the federated core used to refuse); `parity_comparator_detects_mutated_legs`
+  (mutation probe: mutated cell / dropped row / added row each break the comparator);
+  `plain_sql_through_the_port_fails_closed_without_identity_or_scope` (fail-closed gate + a
+  positive control with an explicit identity tenant).
+* `tests/spine6_one_planner_parity_e2e.rs` (full server):
+  `same_sql_one_planner_across_pgwire_rest_v2_and_unified_query_e2e` (pgwire vs `/api/v2/sql` vs
+  `/api/v2/query` with a plain-SQL body — one server, identical rows);
+  `strong_freshness_port_read_sees_every_write_with_result_cache_on_e2e`
+  (`PROXIMADB_QUERY_RESULT_CACHE=1`, cache primed, write committed after, the port's Strong read
+  observes it).
+* Unit: `olap_cache_policy_strong_bypasses_the_result_cache`,
+  `plain_sql_delegates_to_the_scheduler_discriminator`,
+  `plain_relational_select_is_not_a_uql_claim`,
+  `sql_result_renders_the_port_envelope`, `prepared_owner_prefers_the_explicit_identity_tenant`
+  (`src/query/unified_query_port_impl.rs`).
+* Route-decision parity is structural: every surface now reaches the one
+  `ComputeScheduler::route_select*` call site inside `try_run_select` (no second decision path
+  exists to diverge), and row/rendering parity is asserted end-to-end above.
+* Regression: pgwire, `/api/v2/sql`, gRPC `ExecuteQuery` and `api_handlers` are untouched code
+  paths (the trait method forwards with the same cache argument); their suites stay green.

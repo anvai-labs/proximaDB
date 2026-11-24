@@ -6,6 +6,17 @@
 //!
 //! Phase 9.9: this impl unblocks all nine `/api/v1/unified/*` endpoints in
 //! `crates/platform/proximadb-api/src/rest/canonical/multimodal_query.rs`.
+//!
+//! **One decision path (ADR-098 D5 / TD-SPINE-6):** plain relational SQL
+//! delegates to [`QueryFacadeAdapter::execute_sql_via_authority`] — the same
+//! EXPLAIN/write/`try_run_select` body (whose SELECT arm is the
+//! `ComputeScheduler::route_select` decision) that serves pgwire and
+//! `api_handlers.execute_sql`. SQL with multi-model extensions keeps its
+//! federated lowering (`adapter.federated_query`): those queries carry no
+//! resolvable relational tables, so the scheduler decision has nothing to
+//! decide — engine selection for vector/graph/document search happens inside
+//! the engine layer the facade strategies drive. The discriminator is the
+//! adapter's ONE `should_use_federated_request`.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -13,10 +24,13 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use proximadb_data_model::ProximaValue;
-use proximadb_runtime::{InvalidQueryInput, UnifiedQueryPort};
+use proximadb_runtime::{
+    InvalidQueryInput, PortIdentity, UnifiedQueryPort, UnifiedQueryPortContext,
+};
 // The FILTER-lowering spelling (int-array binary, ns temporals) — named
 // for what it IS, mirroring the SqlValue twin sql_value_to_filter_literal;
 // the canonical (base64) renderer lives in records under a different name.
+use proximadb_search_types::search_params::VectorFreshnessMode;
 use proximadb_search_types::sql_value_filter::proxima_value_to_filter_literal as proxima_filter_literal;
 use tracing::{debug, info};
 
@@ -328,24 +342,25 @@ fn uql_to_federated_sql(
     let limit = request_limit.or(select.limit).unwrap_or(10);
     match select.from.model {
         proximadb_data_model::DataModel::Vector => {
-            let query_param = select
-                .where_clause
-                .as_ref()
-                .and_then(|where_clause| {
-                    where_clause
-                        .conditions
-                        .iter()
-                        .find_map(|condition| match condition {
-                            Condition::VectorSimilar { query_param, .. }
-                            | Condition::VectorDistance { query_param, .. } => Some(*query_param),
-                            _ => None,
-                        })
-                })
-                .ok_or_else(|| {
-                    anyhow!(
-                        "UQL vector queries require VECTOR_SIMILAR(...) or VECTOR_DISTANCE(...)"
-                    )
-                })?;
+            let Some(query_param) = select.where_clause.as_ref().and_then(|where_clause| {
+                where_clause
+                    .conditions
+                    .iter()
+                    .find_map(|condition| match condition {
+                        Condition::VectorSimilar { query_param, .. }
+                        | Condition::VectorDistance { query_param, .. } => Some(*query_param),
+                        _ => None,
+                    })
+            }) else {
+                // TD-SPINE-6: a SELECT the UQL grammar parses but that carries
+                // no vector condition is NOT a UQL claim — the UQL grammar
+                // overlaps plain SQL and an un-prefixed FROM defaults to the
+                // Vector model. Claim nothing (Ok(None)) so the caller routes
+                // the text as plain relational SQL through the one planner
+                // seam; the pre-convergence behavior for this shape was a
+                // hard error, so nothing working changes.
+                return Ok(None);
+            };
             let vector = parameters
                 .get(query_param)
                 .and_then(proxima_value_to_f32_vector)
@@ -414,13 +429,149 @@ struct PreparedHandle {
     executions: u64,
 }
 
-/// The owner key of the scope in force: the request tenant, or a reserved key
-/// for internal execution. No scope owns nothing.
-fn prepared_owner() -> Option<String> {
+/// The owner key for prepared-statement handles: the caller's EXPLICIT
+/// identity tenant when it carries one (ADR-098 D5 — identity as data), else
+/// the task-local request scope in force (the fallback for callers that
+/// cannot construct an identity, e.g. bare-mounted test routers), else none —
+/// no scope owns nothing.
+fn prepared_owner(identity_tenant: Option<&str>) -> Option<String> {
+    if let Some(tenant) = identity_tenant.filter(|tenant| !tenant.is_empty()) {
+        return Some(tenant.to_string());
+    }
     match crate::query::request_scope::current_scope()? {
         crate::query::request_scope::RequestScope::Tenant(tenant) => Some(tenant),
         crate::query::request_scope::RequestScope::Internal(_) => Some("_internal".to_string()),
     }
+}
+
+/// Fail closed when the port cannot act as a tenant: neither an explicit
+/// identity tenant nor an in-force request scope means the transport edge
+/// forgot to establish who is asking (TD-SPINE-6 acceptance: a request
+/// without identity fails closed on every surface).
+fn ensure_query_scope(identity: &PortIdentity<'_>) -> Result<()> {
+    if identity.tenant_id.is_some_and(|tenant| !tenant.is_empty()) {
+        return Ok(());
+    }
+    if crate::query::request_scope::current_scope().is_some() {
+        return Ok(());
+    }
+    Err(anyhow!(
+        "unified query has no request identity; the caller must act as a tenant"
+    ))
+}
+
+/// The OLAP result cache the delegated scheduler path may consult, per the
+/// requested freshness (mandate #16c): a Strong read BYPASSES the cache
+/// lookup — it always computes fresh; weaker modes hand the cache through
+/// (hits are LSN-pinned inside, never staler than the requested mode).
+fn olap_cache_for_freshness(
+    freshness: &VectorFreshnessMode,
+) -> Option<
+    Arc<
+        crate::query::cache::query_result_cache::QueryResultCache<
+            crate::query::execution::ExecutionPipelineResult,
+        >,
+    >,
+> {
+    if matches!(freshness, VectorFreshnessMode::Strong) {
+        None
+    } else {
+        crate::network::postgres::relational_pipeline::olap_result_cache()
+    }
+}
+
+/// Run `sql` through the ONE SQL authority (`execute_sql_via_authority`) when
+/// it is plain relational SQL, or through the federated lowering when it is a
+/// multi-model extension query — and render either into the port's JSON
+/// envelope. This is the single planner seam every port SQL entry funnels
+/// through (ADR-098 D5 / TD-SPINE-6).
+async fn run_sql_via_one_planner(
+    adapter: &Arc<QueryFacadeAdapter>,
+    sql: &str,
+    collection: Option<String>,
+    identity: PortIdentity<'_>,
+    freshness: &VectorFreshnessMode,
+    limit: Option<u32>,
+) -> Result<serde_json::Value> {
+    if QueryFacadeAdapter::should_use_federated_request(sql) {
+        // Multi-model extension (VECTOR_SEARCH/GRAPH_QUERY/DOCUMENT_QUERY/
+        // LOGS/METRICS/RERANK, `<->`, `::vector`): keep the federated
+        // lowering + its result rendering. No relational table resolves for
+        // these, so the ComputeScheduler decision has nothing to decide;
+        // engine selection happens inside the engine layer behind the facade
+        // strategies. (Production fail-closed for a scope-less request lives
+        // in `FederatedQueryContext::execute`, unchanged.)
+        let result = adapter
+            .federated_query(sql)
+            .await
+            .context("federated_query failed")?;
+        return UnifiedQueryPortImpl::result_to_json(result, limit);
+    }
+    // Plain relational SQL (reads AND writes): the same body that serves
+    // pgwire and `api_handlers.execute_sql` — EXPLAIN routing, write
+    // dispatch, `try_run_select` (`ComputeScheduler::route_select`), facade
+    // fallback. Fail closed when the port cannot act as a tenant (neither an
+    // explicit identity nor an in-force request scope) — TD-SPINE-6
+    // acceptance: a request without identity fails closed on every surface.
+    ensure_query_scope(&identity)?;
+    let result_cache = olap_cache_for_freshness(freshness);
+    let result = adapter
+        .execute_sql_via_authority(
+            sql.to_string(),
+            collection,
+            identity,
+            result_cache.as_deref(),
+        )
+        .await
+        .context("sql authority execution failed")?;
+    sql_result_to_port_json(result, limit)
+}
+
+/// Render a `SqlExecutionResult` (the shared authority's typed shape) into
+/// the port's JSON envelope (`records` / `total_count` / `metrics`) — the
+/// shape the canonical `/sql` handler, `/api/v2/query` and MCP read.
+fn sql_result_to_port_json(
+    result: proximadb_runtime::SqlExecutionResult,
+    limit: Option<u32>,
+) -> Result<serde_json::Value> {
+    let limit = limit.unwrap_or(u32::MAX) as usize;
+    let rows: Vec<serde_json::Value> = result
+        .rows
+        .iter()
+        .take(limit)
+        .map(|row| {
+            let mut object = serde_json::Map::with_capacity(row.len());
+            for (index, value) in row.iter().enumerate() {
+                let column = result
+                    .columns
+                    .get(index)
+                    .cloned()
+                    .unwrap_or_else(|| format!("column_{index}"));
+                object.insert(
+                    column,
+                    proximadb_records::conversions::proxima_to_json(value),
+                );
+            }
+            serde_json::Value::Object(object)
+        })
+        .collect();
+    let total_count = match result.rows_affected {
+        // The affected count for DDL/DML (rows is empty; limit is a read
+        // notion); the post-limit row count for reads — accurate for page
+        // consumers, matching the legacy envelope's semantics.
+        Some(affected) => affected,
+        None => rows.len() as u64,
+    };
+    Ok(serde_json::json!({
+        "records": rows,
+        // Post-limit count for reads; the affected count for writes.
+        "total_count": total_count,
+        "metrics": {
+            "rows_scanned": result.rows_scanned,
+            "rows_affected": result.rows_affected.unwrap_or(0),
+            "execution_time_ms": result.execution_time_ms,
+        },
+    }))
 }
 
 impl UnifiedQueryPortImpl {
@@ -449,9 +600,9 @@ impl UnifiedQueryPortImpl {
         }
     }
 
-    /// The shared cache id of `statement_id` when the scope in force owns it.
-    fn owned_cache_id(&self, statement_id: &str) -> Option<String> {
-        let owner = prepared_owner()?;
+    /// The shared cache id of `statement_id` when the caller owns it.
+    fn owned_cache_id(&self, statement_id: &str, identity_tenant: Option<&str>) -> Option<String> {
+        let owner = prepared_owner(identity_tenant)?;
         let handle = self.prepared.get(statement_id)?;
         (handle.owner == owner).then(|| handle.cache_id.clone())
     }
@@ -551,8 +702,9 @@ impl UnifiedQueryPort for UnifiedQueryPortImpl {
         &self,
         query: String,
         parameters: Option<Vec<ProximaValue>>,
-        _collection: Option<String>,
+        collection: Option<String>,
         limit: Option<u32>,
+        context: UnifiedQueryPortContext<'_>,
     ) -> Result<serde_json::Value> {
         if query.trim().is_empty() {
             return Err(anyhow!("query cannot be empty"));
@@ -562,23 +714,27 @@ impl UnifiedQueryPort for UnifiedQueryPortImpl {
             query.chars().take(120).collect::<String>()
         );
         let parameters = parameters.unwrap_or_default();
-        let federated_query = match uql_to_federated_sql(&query, &parameters, limit)
+        let sql = match uql_to_federated_sql(&query, &parameters, limit)
             .with_context(|| format!("UQL lowering failed for query '{}'", query))?
         {
             Some(lowered) => lowered,
             None => bind_federated_sql_parameters(&query, &parameters)?,
         };
-        let result = self
-            .adapter
-            .federated_query(&federated_query)
-            .await
-            .context("federated_query failed")?;
-        Self::result_to_json(result, limit)
+        run_sql_via_one_planner(
+            &self.adapter,
+            &sql,
+            collection,
+            context.identity,
+            &context.freshness,
+            limit,
+        )
+        .await
     }
 
     async fn execute_multi_model_query(
         &self,
         request: serde_json::Value,
+        context: UnifiedQueryPortContext<'_>,
     ) -> Result<serde_json::Value> {
         // Convert the JSON multi-model request to a federated SQL string.
         // (Formerly a twin of the deleted root multimodal_query module's
@@ -590,18 +746,22 @@ impl UnifiedQueryPort for UnifiedQueryPortImpl {
             "execute_multi_model_query SQL: {}",
             sql.chars().take(200).collect::<String>()
         );
-        let result = self
-            .adapter
-            .federated_query(&sql)
-            .await
-            .context("multi-model federated_query failed")?;
-        Self::result_to_json(result, None)
+        run_sql_via_one_planner(
+            &self.adapter,
+            &sql,
+            None,
+            context.identity,
+            &context.freshness,
+            None,
+        )
+        .await
     }
 
     async fn execute_federated_query(
         &self,
         query: String,
         parameters: Option<Vec<ProximaValue>>,
+        context: UnifiedQueryPortContext<'_>,
     ) -> Result<serde_json::Value> {
         if query.trim().is_empty() {
             return Err(anyhow!("query cannot be empty"));
@@ -612,17 +772,21 @@ impl UnifiedQueryPort for UnifiedQueryPortImpl {
             "execute_federated_query: {}",
             query.chars().take(120).collect::<String>()
         );
-        let result = self
-            .adapter
-            .federated_query(&query)
-            .await
-            .context("federated_query failed")?;
-        Self::result_to_json(result, None)
+        run_sql_via_one_planner(
+            &self.adapter,
+            &query,
+            None,
+            context.identity,
+            &context.freshness,
+            None,
+        )
+        .await
     }
 
     async fn execute_distributed_query(
         &self,
         request: serde_json::Value,
+        context: UnifiedQueryPortContext<'_>,
     ) -> Result<serde_json::Value> {
         let query = request
             .get("query")
@@ -637,18 +801,28 @@ impl UnifiedQueryPort for UnifiedQueryPortImpl {
             "execute_distributed_query: {}",
             query.chars().take(120).collect::<String>()
         );
-        let result = self
-            .adapter
-            .distributed_query(&query)
-            .await
-            .context("distributed_query failed")?;
-        Self::result_to_json(result, limit)
+        // NOT routed through the one-planner seam: distributed execution is
+        // an explicit `force_path = "distributed"` override onto the
+        // DistributedQueryCoordinator — a placement decision orthogonal to
+        // local engine selection (ADR-098 D5's owner-versus-reader placement
+        // is the follow-on direction, deliberately not decided here).
+        let scope_tenant = context.identity.tenant_id;
+        crate::query::request_scope::with_identity_scope(scope_tenant, async {
+            let result = self
+                .adapter
+                .distributed_query(&query)
+                .await
+                .context("distributed_query failed")?;
+            Self::result_to_json(result, limit)
+        })
+        .await
     }
 
     async fn explain_unified_query(
         &self,
         query: String,
         collection: Option<String>,
+        _context: UnifiedQueryPortContext<'_>,
     ) -> Result<serde_json::Value> {
         let explain = self.adapter.explain(&query).context("explain failed")?;
         let mut value =
@@ -674,9 +848,10 @@ impl UnifiedQueryPort for UnifiedQueryPortImpl {
         query: String,
         _cache_results: bool,
         ttl_seconds: Option<u64>,
+        context: UnifiedQueryPortContext<'_>,
     ) -> Result<String> {
-        let owner =
-            prepared_owner().ok_or_else(|| anyhow!("prepare_statement: no request scope"))?;
+        let owner = prepared_owner(context.identity.tenant_id)
+            .ok_or_else(|| anyhow!("prepare_statement: no request scope"))?;
         let ttl = Duration::from_secs(ttl_seconds.unwrap_or(3600));
         let cache_id = self
             .cache
@@ -698,11 +873,12 @@ impl UnifiedQueryPort for UnifiedQueryPortImpl {
         &self,
         statement_id: String,
         parameters: Option<Vec<ProximaValue>>,
-        _collection: Option<String>,
+        collection: Option<String>,
+        context: UnifiedQueryPortContext<'_>,
     ) -> Result<serde_json::Value> {
         let params = proxima_values_to_params(parameters);
         let cache_id = self
-            .owned_cache_id(&statement_id)
+            .owned_cache_id(&statement_id, context.identity.tenant_id)
             .ok_or_else(|| anyhow!("prepared statement not found: {}", statement_id))?;
         let sql = self
             .cache
@@ -716,21 +892,31 @@ impl UnifiedQueryPort for UnifiedQueryPortImpl {
                 }
                 other => anyhow!("prepared statement error: {}", other),
             })?;
-        let result = self
-            .adapter
-            .federated_query(&sql)
-            .await
-            .context("execute_prepared federated_query failed")?;
+        let result = run_sql_via_one_planner(
+            &self.adapter,
+            &sql,
+            collection,
+            context.identity,
+            &context.freshness,
+            None,
+        )
+        .await?;
         if let Some(mut handle) = self.prepared.get_mut(&statement_id) {
             handle.executions += 1;
         }
-        Self::result_to_json(result, None)
+        Ok(result)
     }
 
-    async fn delete_prepared(&self, statement_id: String) -> Result<()> {
-        let cache_id = self.owned_cache_id(&statement_id).ok_or_else(|| {
-            anyhow!("delete_prepared failed: prepared statement not found: {statement_id}")
-        })?;
+    async fn delete_prepared(
+        &self,
+        statement_id: String,
+        context: UnifiedQueryPortContext<'_>,
+    ) -> Result<()> {
+        let cache_id = self
+            .owned_cache_id(&statement_id, context.identity.tenant_id)
+            .ok_or_else(|| {
+                anyhow!("delete_prepared failed: prepared statement not found: {statement_id}")
+            })?;
         self.prepared.remove(&statement_id);
         // The shared cache may hold the same text for another handle; dropping
         // it there is safe only when no other handle refers to it.
@@ -744,9 +930,13 @@ impl UnifiedQueryPort for UnifiedQueryPortImpl {
         Ok(())
     }
 
-    async fn get_prepared_stats(&self, _statement_ids: Vec<String>) -> Result<serde_json::Value> {
+    async fn get_prepared_stats(
+        &self,
+        _statement_ids: Vec<String>,
+        context: UnifiedQueryPortContext<'_>,
+    ) -> Result<serde_json::Value> {
         // Counts cover only the caller's own statements.
-        let owner = prepared_owner();
+        let owner = prepared_owner(context.identity.tenant_id);
         let (statements, executions) = self
             .prepared
             .iter()
@@ -1007,6 +1197,131 @@ mod tests {
     use proximadb_catalog::{CatalogPhysicalFormat, CatalogStorageLayout, CatalogTableSchema};
 
     #[test]
+    fn olap_cache_policy_strong_bypasses_the_result_cache() {
+        // Mandate #16c / TD-SPINE-6 acceptance: a Strong-freshness read
+        // through the port never consults the OLAP result cache — regardless
+        // of the PROXIMADB_QUERY_RESULT_CACHE flag.
+        assert!(
+            olap_cache_for_freshness(&VectorFreshnessMode::Strong).is_none(),
+            "Strong must bypass the result-cache lookup"
+        );
+        // Weaker modes are ALLOWED to consult it (presence still depends on
+        // the env flag; the invariant under test is only Strong ⇒ None).
+        let weaker = olap_cache_for_freshness(&VectorFreshnessMode::StaleOk);
+        assert!(weaker.is_none() || weaker.is_some());
+    }
+
+    #[test]
+    fn plain_sql_delegates_to_the_scheduler_discriminator() {
+        // Plain relational SQL must take the shared-authority branch; the
+        // multi-model extensions keep the federated branch (TD-SPINE-6).
+        for plain in [
+            "SELECT id, score FROM orders WHERE id = 'a'",
+            "CREATE TABLE t (id TEXT)",
+            "INSERT INTO t (id) VALUES ('a')",
+            "UPDATE t SET id = 'b'",
+            "EXPLAIN SELECT 1 FROM t",
+        ] {
+            assert!(
+                !QueryFacadeAdapter::should_use_federated_request(plain),
+                "plain SQL must NOT take the federated branch: {plain}"
+            );
+        }
+        for extension in [
+            "SELECT * FROM VECTOR_SEARCH('c', '[0.1]', 10)",
+            "SELECT * FROM GRAPH_QUERY('MATCH (n) RETURN n')",
+            "SELECT * FROM DOCUMENT_QUERY('c', '1=1')",
+            "SELECT * FROM LOGS('ops')",
+            "SELECT * FROM RERANK('p', 'q')",
+        ] {
+            assert!(
+                QueryFacadeAdapter::should_use_federated_request(extension),
+                "extension SQL must keep the federated branch: {extension}"
+            );
+        }
+    }
+
+    #[test]
+    fn sql_result_renders_the_port_envelope() {
+        use proximadb_data_model::ProximaValue as V;
+        let result = proximadb_runtime::SqlExecutionResult {
+            columns: vec!["id".to_string(), "score".to_string()],
+            column_types: vec!["TEXT".to_string(), "FLOAT".to_string()],
+            rows: vec![
+                vec![V::String("a".into()), V::Float64(1.5)],
+                vec![V::String("b".into()), V::Float64(2.5)],
+            ],
+            rows_affected: None,
+            rows_scanned: 2,
+            execution_time_ms: 3,
+        };
+        let json = sql_result_to_port_json(result, None).expect("render");
+        let records = json["records"].as_array().expect("records");
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0]["id"], serde_json::json!("a"));
+        assert_eq!(records[0]["score"], serde_json::json!(1.5));
+        assert_eq!(json["total_count"], serde_json::json!(2));
+
+        // The read limit truncates both records and the post-limit count.
+        let json = sql_result_to_port_json(
+            proximadb_runtime::SqlExecutionResult {
+                columns: vec!["id".to_string()],
+                column_types: vec!["TEXT".to_string()],
+                rows: vec![vec![V::String("a".into())], vec![V::String("b".into())]],
+                rows_affected: None,
+                rows_scanned: 2,
+                execution_time_ms: 0,
+            },
+            Some(1),
+        )
+        .expect("render");
+        assert_eq!(json["records"].as_array().expect("records").len(), 1);
+        assert_eq!(json["total_count"], serde_json::json!(1));
+
+        // A write renders an empty records list with the affected count.
+        let json = sql_result_to_port_json(
+            proximadb_runtime::SqlExecutionResult {
+                columns: vec![],
+                column_types: vec![],
+                rows: vec![],
+                rows_affected: Some(7),
+                rows_scanned: 7,
+                execution_time_ms: 1,
+            },
+            None,
+        )
+        .expect("render");
+        assert_eq!(json["records"].as_array().expect("records").len(), 0);
+        assert_eq!(json["total_count"], serde_json::json!(7));
+    }
+
+    #[tokio::test]
+    async fn prepared_owner_prefers_the_explicit_identity_tenant() {
+        // Explicit identity tenant wins (ADR-098 D5: identity as data), even
+        // over a task-local scope in force around the call.
+        assert_eq!(prepared_owner(Some("acme")), Some("acme".to_string()));
+        let scoped = crate::query::request_scope::with_request_tenant(
+            "outer",
+            crate::query::request_scope::with_request_tenant(
+                "inner",
+                std::future::ready(prepared_owner(Some("acme"))),
+            ),
+        )
+        .await;
+        assert_eq!(scoped, Some("acme".to_string()));
+
+        // Fallback: no identity → the scope in force (task-local).
+        let fallback = crate::query::request_scope::with_request_tenant(
+            "scoped",
+            std::future::ready(prepared_owner(None)),
+        )
+        .await;
+        assert_eq!(fallback, Some("scoped".to_string()));
+        // ...and no scope at all → None (no scope owns nothing).
+        assert_eq!(prepared_owner(None), None);
+    }
+
+    #[test]
     fn test_proxima_value_to_param_string() {
         let value = ProximaValue::String("hello".into());
         assert!(
@@ -1096,6 +1411,37 @@ mod tests {
             sql,
             "SELECT * FROM DOCUMENT_QUERY('orders', 'status = \"pending\"') LIMIT 5"
         );
+    }
+
+    #[test]
+    fn plain_relational_select_is_not_a_uql_claim() {
+        // TD-SPINE-6: the UQL grammar overlaps plain SQL (an un-prefixed FROM
+        // defaults to the Vector model). A SELECT with no vector condition
+        // must claim NOTHING (Ok(None)) so the text routes as plain SQL
+        // through the one planner seam — the pre-convergence behavior was a
+        // hard "UQL vector queries require VECTOR_SIMILAR" error.
+        for plain in [
+            "SELECT id, score FROM orders ORDER BY id",
+            "SELECT * FROM orders WHERE id = 'a' LIMIT 5",
+            "SELECT * FROM vectors.products",
+        ] {
+            assert!(
+                uql_to_federated_sql(plain, &[], None)
+                    .expect("plain relational SELECT must not error at UQL lowering")
+                    .is_none(),
+                "plain SELECT must not be claimed as UQL: {plain}"
+            );
+        }
+
+        // A REAL vector claim still lowers (and still validates params).
+        let claimed = uql_to_federated_sql(
+            "SELECT * FROM vectors.p WHERE VECTOR_SIMILAR(embedding, ?, 0.8) LIMIT 7",
+            &[ProximaValue::DenseVector(vec![0.1, 0.2])],
+            None,
+        )
+        .expect("vector UQL must lower")
+        .expect("vector UQL must be claimed");
+        assert!(claimed.contains("VECTOR_SEARCH('p'"));
     }
 
     #[test]

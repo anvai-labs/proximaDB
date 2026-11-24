@@ -165,13 +165,19 @@ impl ReferenceBackend for EngineBackend {
             .as_ref()
             .ok_or_else(|| BackendError::internal("query facade not available".to_string()))?;
         // The MCP session acts as its configured tenant (default when none).
+        // ADR-098 D5 / TD-SPINE-6: the tenant travels as DATA on the port
+        // context; the task-local scope stays wrapped as the fallback for the
+        // federated lowering path.
         let tenant = self
             .tenant
             .clone()
             .unwrap_or_else(|| proximadb_tenant::DEFAULT_TENANT.to_string());
+        let context = proximadb_runtime::UnifiedQueryPortContext::for_identity(
+            proximadb_runtime::PortIdentity::for_tenant(&tenant),
+        );
         crate::query::request_scope::with_request_tenant(
-            tenant,
-            port.explain_unified_query(q, Some(id)),
+            tenant.clone(),
+            port.explain_unified_query(q, Some(id), context),
         )
         .await
         .map_err(|e| BackendError::internal(format!("explain failed: {e}")))
@@ -189,9 +195,12 @@ impl ReferenceBackend for EngineBackend {
             .tenant
             .clone()
             .unwrap_or_else(|| proximadb_tenant::DEFAULT_TENANT.to_string());
+        let context = proximadb_runtime::UnifiedQueryPortContext::for_identity(
+            proximadb_runtime::PortIdentity::for_tenant(&tenant),
+        );
         crate::query::request_scope::with_request_tenant(
-            tenant,
-            port.execute_unified_query(q, None, Some(id), limit),
+            tenant.clone(),
+            port.execute_unified_query(q, None, Some(id), limit, context),
         )
         .await
         .map_err(|e| BackendError::internal(format!("search failed: {e}")))

@@ -4,7 +4,7 @@
 //! lower textual AQL/UQL into the shared `UnifiedQueryPort`. Plain SQL uses the
 //! distinct `/api/v2/sql` transport adapter so language contracts do not blur.
 
-use axum::{Json, extract::State};
+use axum::{Extension, Json, extract::State};
 use proximadb_data_model::ProximaValue;
 use proximadb_records::conversions::json_to_proxima;
 use serde::{Deserialize, Serialize};
@@ -84,6 +84,7 @@ fn json_to_proxima_values(params: Option<Vec<serde_json::Value>>) -> Option<Vec<
 )]
 pub async fn execute_query(
     State(state): State<AppState>,
+    Extension(identity): Extension<proximadb_tenant::ResolvedRequestIdentity>,
     Json(request): Json<QueryRequest>,
 ) -> ApiResult<Json<serde_json::Value>> {
     validate_query(request.language, &request.query)?;
@@ -91,6 +92,14 @@ pub async fn execute_query(
         .unified_query_port
         .as_ref()
         .ok_or_else(|| ApiError::Internal("Unified query port is not configured".to_string()))?;
+
+    // ADR-098 D5 / TD-SPINE-6: the port carries the caller's identity as data
+    // (same fail-closed extraction contract as /api/v2/sql — the tenant
+    // middleware inserts the foundation identity; a router mounted without it
+    // fails closed here instead of constructing an anonymous carrier).
+    let context = proximadb_runtime::UnifiedQueryPortContext::for_identity(
+        proximadb_runtime::PortIdentity::from(&identity),
+    );
 
     let result = match request.language {
         QueryLanguage::Uql => {
@@ -100,12 +109,17 @@ pub async fn execute_query(
                     json_to_proxima_values(request.parameters),
                     request.collection,
                     request.limit,
+                    context,
                 )
                 .await
         }
         QueryLanguage::Federated => {
             query_port
-                .execute_federated_query(request.query, json_to_proxima_values(request.parameters))
+                .execute_federated_query(
+                    request.query,
+                    json_to_proxima_values(request.parameters),
+                    context,
+                )
                 .await
         }
         QueryLanguage::Aql => {
@@ -141,6 +155,7 @@ pub async fn execute_query(
 )]
 pub async fn explain_query(
     State(state): State<AppState>,
+    Extension(identity): Extension<proximadb_tenant::ResolvedRequestIdentity>,
     Json(request): Json<ExplainQueryRequest>,
 ) -> ApiResult<Json<serde_json::Value>> {
     validate_query(request.language, &request.query)?;
@@ -150,7 +165,13 @@ pub async fn explain_query(
         .ok_or_else(|| ApiError::Internal("Unified query port is not configured".to_string()))?;
 
     query_port
-        .explain_unified_query(request.query, request.collection)
+        .explain_unified_query(
+            request.query,
+            request.collection,
+            proximadb_runtime::UnifiedQueryPortContext::for_identity(
+                proximadb_runtime::PortIdentity::from(&identity),
+            ),
+        )
         .await
         .map(Json)
         .map_err(|error| {

@@ -5,6 +5,13 @@
 //! `serde_json::Value` for query payloads and results because no dedicated proto
 //! message types exist yet for unified/federated queries.
 //!
+//! **One decision path (ADR-098 D5 / TD-SPINE-6):** every SQL-bearing entry on
+//! this port carries an explicit [`UnifiedQueryPortContext`] — the caller's
+//! identity as *data* plus the requested freshness — and the implementation
+//! delegates plain SQL to the same `ComputeScheduler` decision path that serves
+//! pgwire and `api_handlers.execute_sql`. The transport-edge task-local scope
+//! remains only as a fallback for callers that cannot construct an identity.
+//!
 //! **Phase 9.9 blocker**: the root-crate implementation of this trait depends on
 //! `CollectionService`, `DocumentService`, `ObservabilityService`, and
 //! `QueryFacadeAdapter` being fully extracted.  Until then, `proximadb-api`
@@ -13,12 +20,50 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use proximadb_data_model::ProximaValue;
+use proximadb_search_types::search_params::VectorFreshnessMode;
+
+use crate::service_ports::PortIdentity;
 
 /// A request reached the unified query port but its client-supplied query
 /// shape or values are invalid. Protocol adapters map this error to their
 /// invalid-argument status instead of reporting an internal server failure.
 #[derive(Debug)]
 pub struct InvalidQueryInput(pub String);
+
+/// Explicit per-request execution context for `UnifiedQueryPort` calls
+/// (ADR-098 D5 / TD-SPINE-6).
+///
+/// * `identity` — the caller's identity travels as **data** on the call
+///   (tenant scope + ABAC principal) instead of relying on the transport-edge
+///   task-local scope. `tenant_id: None` means "no identity supplied"; the
+///   implementation then falls back to the task-local request scope and fails
+///   closed when neither is present.
+/// * `freshness` — honored at every result cache the delegated decision path
+///   consults: `Strong` bypasses the OLAP result-cache lookup entirely
+///   (CLAUDE.md mandate #16c — gate the lookup on `!Strong`); weaker modes may
+///   consult it under the existing LSN-pinned eligibility, which is never
+///   staler than the requested mode.
+#[derive(Debug, Clone)]
+pub struct UnifiedQueryPortContext<'a> {
+    pub identity: PortIdentity<'a>,
+    pub freshness: VectorFreshnessMode,
+}
+
+impl<'a> UnifiedQueryPortContext<'a> {
+    /// The caller's identity with the default (Strong) freshness.
+    pub fn for_identity(identity: PortIdentity<'a>) -> Self {
+        Self {
+            identity,
+            freshness: VectorFreshnessMode::default(),
+        }
+    }
+
+    /// Override the freshness mode (identity unchanged).
+    pub fn with_freshness(mut self, freshness: VectorFreshnessMode) -> Self {
+        self.freshness = freshness;
+        self
+    }
+}
 
 impl std::fmt::Display for InvalidQueryInput {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -39,14 +84,16 @@ pub trait UnifiedQueryPort: Send + Sync {
 
     /// Execute a unified SQL-like query (may contain multi-model extensions).
     ///
-    /// Routes through `QueryFacadeAdapter::federated_query()` when the adapter
-    /// is configured; falls back to the internal decomposer/executor pipeline.
+    /// Plain relational SQL delegates to the one SQL authority
+    /// (`ComputeScheduler::route_select` decision path — ADR-098 D5 /
+    /// TD-SPINE-6); multi-model extensions keep their federated lowering.
     async fn execute_unified_query(
         &self,
         query: String,
         parameters: Option<Vec<ProximaValue>>,
         collection: Option<String>,
         limit: Option<u32>,
+        context: UnifiedQueryPortContext<'_>,
     ) -> Result<serde_json::Value>;
 
     /// Execute a multi-model structured query.
@@ -56,6 +103,7 @@ pub trait UnifiedQueryPort: Send + Sync {
     async fn execute_multi_model_query(
         &self,
         request: serde_json::Value,
+        context: UnifiedQueryPortContext<'_>,
     ) -> Result<serde_json::Value>;
 
     /// Execute a federated SQL query with multi-model extensions such as
@@ -64,12 +112,14 @@ pub trait UnifiedQueryPort: Send + Sync {
         &self,
         query: String,
         parameters: Option<Vec<ProximaValue>>,
+        context: UnifiedQueryPortContext<'_>,
     ) -> Result<serde_json::Value>;
 
     /// Execute a distributed query across shards or remote nodes.
     async fn execute_distributed_query(
         &self,
         request: serde_json::Value,
+        context: UnifiedQueryPortContext<'_>,
     ) -> Result<serde_json::Value>;
 
     // ── Query explanation ─────────────────────────────────────────────────────
@@ -82,6 +132,7 @@ pub trait UnifiedQueryPort: Send + Sync {
         &self,
         query: String,
         collection: Option<String>,
+        context: UnifiedQueryPortContext<'_>,
     ) -> Result<serde_json::Value>;
 
     // ── Prepared statements ───────────────────────────────────────────────────
@@ -93,6 +144,7 @@ pub trait UnifiedQueryPort: Send + Sync {
         query: String,
         cache_results: bool,
         ttl_seconds: Option<u64>,
+        context: UnifiedQueryPortContext<'_>,
     ) -> Result<String>;
 
     /// Execute a previously prepared statement with the given parameter bindings.
@@ -101,11 +153,20 @@ pub trait UnifiedQueryPort: Send + Sync {
         statement_id: String,
         parameters: Option<Vec<ProximaValue>>,
         collection: Option<String>,
+        context: UnifiedQueryPortContext<'_>,
     ) -> Result<serde_json::Value>;
 
     /// Delete a previously prepared statement.
-    async fn delete_prepared(&self, statement_id: String) -> Result<()>;
+    async fn delete_prepared(
+        &self,
+        statement_id: String,
+        context: UnifiedQueryPortContext<'_>,
+    ) -> Result<()>;
 
     /// Return cache/execution statistics for the given statement IDs.
-    async fn get_prepared_stats(&self, statement_ids: Vec<String>) -> Result<serde_json::Value>;
+    async fn get_prepared_stats(
+        &self,
+        statement_ids: Vec<String>,
+        context: UnifiedQueryPortContext<'_>,
+    ) -> Result<serde_json::Value>;
 }

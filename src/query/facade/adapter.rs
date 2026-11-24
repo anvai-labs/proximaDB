@@ -590,7 +590,7 @@ impl QueryFacadeAdapter {
         })
     }
 
-    fn should_use_federated_request(sql: &str) -> bool {
+    pub(crate) fn should_use_federated_request(sql: &str) -> bool {
         let sql_upper = sql.to_uppercase();
         sql_upper.contains("VECTOR_SEARCH")
             || sql_upper.contains("GRAPH_QUERY")
@@ -727,8 +727,43 @@ impl proximadb_runtime::QueryAdapterPort for QueryFacadeAdapter {
     async fn execute_sql(
         &self,
         query: String,
+        collection: Option<String>,
+        identity: proximadb_runtime::PortIdentity<'_>,
+    ) -> anyhow::Result<proximadb_runtime::SqlExecutionResult> {
+        // Unchanged cache policy for the api_handlers/pgwire callers: the OLAP
+        // result cache is consulted under Strong LSN-pinned eligibility
+        // (ADR-051 D2) — byte-identical to the pre-TD-SPINE-6 behavior.
+        let olap_result_cache = crate::network::postgres::relational_pipeline::olap_result_cache();
+        self.execute_sql_via_authority(query, collection, identity, olap_result_cache.as_deref())
+            .await
+    }
+}
+
+impl QueryFacadeAdapter {
+    /// The ONE SQL authority body (TD-104 S1; the TD-SPINE-6 delegation seam).
+    ///
+    /// EXPLAIN-DML routing → relational write dispatch → tenant-scoped
+    /// relational SELECT via `relational_pipeline::try_run_select` (the
+    /// `ComputeScheduler::route_select` decision path) → facade fallback for
+    /// vector/graph SQL. `UnifiedQueryPortImpl` delegates plain SQL here so
+    /// every surface shares one planner decision (ADR-098 D5).
+    ///
+    /// `result_cache` is the OLAP result cache the SELECT routing may consult;
+    /// the CALLER owns the freshness policy: the port passes `None` for a
+    /// `VectorFreshnessMode::Strong` read (mandate #16c — gate the lookup on
+    /// `!Strong`), the api_handlers path hands the cache through unchanged.
+    /// A hit inside `try_run_select` is additionally LSN-pinned, so a non-Strong
+    /// caller never reads anything staler than its requested mode.
+    pub async fn execute_sql_via_authority(
+        &self,
+        query: String,
         _collection: Option<String>,
         identity: proximadb_runtime::PortIdentity<'_>,
+        result_cache: Option<
+            &crate::query::cache::query_result_cache::QueryResultCache<
+                crate::query::execution::ExecutionPipelineResult,
+            >,
+        >,
     ) -> anyhow::Result<proximadb_runtime::SqlExecutionResult> {
         // The statement runs in the caller's scope: its tenant when the
         // identity carries one (collections resolve within it), else the
@@ -800,12 +835,10 @@ impl proximadb_runtime::QueryAdapterPort for QueryFacadeAdapter {
             // pipeline here. `require_engagement=false`
             // routes any resolvable relational SELECT; queries whose tables don't
             // resolve return `None` and fall through to `sql_query` (vector/graph
-            // SQL, unchanged). The OLAP result cache IS consulted (same-crate call,
-            // no layering issue) — default-OFF behind PROXIMADB_QUERY_RESULT_CACHE,
-            // so this is a no-op unless the flag is set.
+            // SQL, unchanged). The OLAP result cache IS consulted when the caller
+            // handed one (default-OFF behind PROXIMADB_QUERY_RESULT_CACHE) — the
+            // Strong-freshness port caller passes `None` instead (mandate #16c).
             // namespace=None: SQL port path has no pgwire search_path.
-            let olap_result_cache =
-                crate::network::postgres::relational_pipeline::olap_result_cache();
             if let Some(dml) = self.dml_service.as_ref()
                 && let Some(outcome) =
                     crate::network::postgres::relational_pipeline::try_run_select(
@@ -817,7 +850,7 @@ impl proximadb_runtime::QueryAdapterPort for QueryFacadeAdapter {
                         crate::query::execution::ExecutionControls::default(),
                         false,
                         None,
-                        olap_result_cache.as_deref(),
+                        result_cache,
                     )
                     .await
             {
