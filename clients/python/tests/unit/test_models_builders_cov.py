@@ -95,9 +95,7 @@ def test_server_capabilities_methods():
     assert models.ServerCapabilities.is_supported("quantization_type", "binary")
     assert models.ServerCapabilities.is_supported("unknown_type", "whatever")
     # fallbacks
-    assert (
-        models.ServerCapabilities.get_fallback_for("storage_engine", "mmap") == "sst"
-    )
+    assert models.ServerCapabilities.get_fallback_for("storage_engine", "mmap") == "sst"
     assert (
         models.ServerCapabilities.get_fallback_for("distance_metric", "cosine") is None
     )

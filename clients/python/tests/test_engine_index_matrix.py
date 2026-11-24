@@ -349,9 +349,7 @@ class TestCrossEngineConsistency:
         yield db
         db.close()
 
-    @pytest.mark.parametrize(
-        "engine", ["sst", "helix", "swift", "nova", "raptor"]
-    )
+    @pytest.mark.parametrize("engine", ["sst", "helix", "swift", "nova", "raptor"])
     def test_engine_returns_results(
         self, multi_engine_dbs, test_vectors, query_vectors, engine
     ):
@@ -376,9 +374,7 @@ class TestCrossEngineConsistency:
 
         assert len(results) >= 1, f"Engine {engine} should return at least 1 result"
 
-    @pytest.mark.parametrize(
-        "engine", ["sst", "helix", "swift", "nova", "raptor"]
-    )
+    @pytest.mark.parametrize("engine", ["sst", "helix", "swift", "nova", "raptor"])
     def test_engine_self_match_works(self, multi_engine_dbs, test_vectors, engine):
         """Parametrized test: each engine should find self-match."""
         collection_name = f"selfmatch_{engine}"

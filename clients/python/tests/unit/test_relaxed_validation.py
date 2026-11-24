@@ -40,21 +40,31 @@ class TestRelaxedValidation:
         # Unknown metrics return None (no fallback defined)
         assert caps.get_fallback_for("distance_metric", "unknown_metric") is None
 
+    def test_collection_builder_defaults_to_sst(self):
+        """ADR-093 S3: the bare builder must default to SST (was VIPER — a live
+        S2-era bug where every default collection creation was rejected)."""
+        from proximadb_sdk.builders.collection import CollectionBuilder
+
+        config = CollectionBuilder("defaulted", 8).build()
+        assert config.storage_engine.value == "sst"
+
     def test_storage_engine_capabilities(self):
         """Test storage engine capabilities detection"""
         caps = ServerCapabilities()
 
-        # Test supported engines (no fallback)
-        assert caps.is_supported("storage_engine", "viper")
+        # Test supported engines (no fallback) — VIPER removed (ADR-093 S3)
         assert caps.is_supported("storage_engine", "sst")
+        assert caps.is_supported("storage_engine", "nova")
+        assert caps.is_supported("storage_engine", "helix")
+        assert not caps.is_supported("storage_engine", "viper")
 
         # Test engines that fallback
         assert not caps.is_supported("storage_engine", "mmap")
         assert not caps.is_supported("storage_engine", "hybrid")
 
         # Test fallback values
-        assert caps.get_fallback_for("storage_engine", "mmap") == "viper"
-        assert caps.get_fallback_for("storage_engine", "hybrid") == "viper"
+        assert caps.get_fallback_for("storage_engine", "mmap") == "sst"
+        assert caps.get_fallback_for("storage_engine", "hybrid") == "sst"
 
     def test_indexing_algorithm_capabilities(self):
         """Test indexing algorithm capabilities detection"""
@@ -175,7 +185,7 @@ class TestRelaxedValidation:
 
         assert "intelligent fallbacks" in caps.notes["fallback_policy"]
         assert "65536" in caps.notes["dimension_limit"]
-        assert "VIPER engine only" in caps.notes["quantization_engine"]
+        assert "pax_vector_quant" in caps.notes["quantization_engine"]
 
 
 if __name__ == "__main__":

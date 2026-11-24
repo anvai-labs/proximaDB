@@ -39,7 +39,7 @@ maybe("live e2e smoke (re-based generated transport)", () => {
     await client
       .createCollection(name)
       .dimension(dim)
-      .engine(StorageEngine.Viper)
+      .engine(StorageEngine.SST)
       .execute();
 
     // listCollections must work and return an array; we do NOT assert global

@@ -443,9 +443,7 @@ class TestVectorOperationsSDK:
         )
 
         sst_collection = rest_client.create_collection(sst_config.name, sst_config)
-        nova_collection = grpc_client.create_collection(
-            nova_config.name, nova_config
-        )
+        nova_collection = grpc_client.create_collection(nova_config.name, nova_config)
 
         try:
             # Insert same data into both collections

@@ -54,7 +54,7 @@ func TestLiveSmokeE2E(t *testing.T) {
 		Name:      name,
 		Dimension: dim,
 		Metric:    "cosine",
-		Engine:    "viper",
+		Engine:    "sst",
 	})
 	if err != nil {
 		t.Fatalf("CreateCollection: %v", err)

@@ -1717,7 +1717,7 @@ mod tests {
         );
         assert!(
             !handler
-                .matches_pattern("nova_data.parquet", "nova_*.parquet")
+                .matches_pattern("helix_data.parquet", "nova_*.parquet")
                 .expect("Pattern match failed")
         );
 

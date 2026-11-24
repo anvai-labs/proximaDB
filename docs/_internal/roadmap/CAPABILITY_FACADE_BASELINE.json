@@ -1,5 +1,5 @@
 {
-  "total": 1003,
+  "total": 1002,
   "by_file": {
     "apps/proximadb-migrate/src/main.rs": 2,
     "crates/binding/proximadb-embedded/src/lib.rs": 9,
@@ -129,7 +129,7 @@
     "crates/storage/proximadb-storage-common/src/text_search/sdp.rs": 2,
     "crates/storage/proximadb-storage-common/src/text_search/text_storage.rs": 1,
     "crates/storage/proximadb-storage-encryption/src/filesystem.rs": 1,
-    "crates/storage/proximadb-storage-operations/src/compaction/manager.rs": 5,
+    "crates/storage/proximadb-storage-operations/src/compaction/manager.rs": 4,
     "crates/storage/proximadb-storage-operations/src/flush.rs": 1,
     "crates/storage/proximadb-storage-operations/src/lib.rs": 3,
     "crates/storage/proximadb-storage-operations/src/requantization.rs": 2,
