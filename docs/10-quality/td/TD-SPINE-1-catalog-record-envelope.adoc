@@ -5,12 +5,58 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | **Open** (filed 2026-11-19).
+| Status | **Implemented (2026-11-22)** — PR pending; see Evidence.
 | Priority | **HIGH**. No defect today, but every future change to the catalog's persisted shape (body codec, sharding in TD-SPINE-2) is a flag day without it. The catalog is the recovery root (ADR-063 D2).
-| Component | `src/services/system_catalog_state.rs`: `CatalogDelta::to_operation` (:112) / decode (:121), `to_snapshot_bytes` (:527) / `inner_from_snapshot_bytes` (:571), `IdentityHighWaterSidecar` encode (:620) / decode (:631). Generation-prefixed payload in `crates/storage/proximadb-iceberg-engine/src/manifest.rs` (`encode_fenced`, :309).
+| Component | `src/services/catalog_record_envelope.rs` (the envelope); applied at `src/services/system_catalog_state.rs`: `CatalogDelta::to_operation` / `decode`, `to_snapshot_bytes` / `inner_from_snapshot_bytes`, sidecar encode / `adopt_identity_high_water_sidecar_bytes`, and the TD-SPINE-2 root (`to_root_bytes`) / shard (`to_shard_bytes`) bodies. The generation-prefixed manifest payload (`manifest.rs` `encode_fenced`) carries the envelope INSIDE the fenced payload — see Implementation notes.
 | Authority | link:../../12-design/adr/ADR-098-metadata-spine.adoc[ADR-098] D1.1–D1.2
 | Relates to | TD-SPINE-2 (shards build on the envelope), TD-MANIFEST-1, ADR-063 D4 r3.1 (binary envelope pattern), PMHEAD (`manifest/head.rs`)
 |===
+
+== Implementation notes (2026-11-22)
+
+* **No write gate.** The original Fix text proposed an opt-in write gate
+  (default OFF) per CLAUDE.md #8. The owner decision of 2026-11-20 (pre-GA:
+  no backward-compat gates — document breaks, don't gate them; see
+  `feedback_prerelease_no_backward_compat`) overrides it: the writer emits the
+  envelope unconditionally and readers sniff unconditionally. Mixed-read still
+  works **by construction** — absent magic ⇒ legacy field-named MessagePack —
+  so an upgraded binary reads every legacy record forever.
+* **Breaking change (accepted pre-GA, 2026-11-22):** a pre-envelope binary
+  cannot decode enveloped records (WAL payloads, snapshots, sidecars). There
+  is no gate and no dual-write window.
+* **Layout** (`src/services/catalog_record_envelope.rs`):
+  `[magic "PXCATREC":8][format_version:u8 = 1][body_codec:u8 = 0][body]`,
+  following the PMHEAD magic-prefix pattern. Body codec 0 = field-named
+  MessagePack. Sniffing is unambiguous at the byte level: every legacy record
+  is a MessagePack map (first byte `0x8n`/`0xDE`/`0xDF`), which can never
+  begin with ASCII `P`. Unknown `format_version`/`body_codec` fails **closed**
+  with a typed error naming the value; a torn header (magic present, header
+  cut) fails closed; a short non-magic buffer is left to the MessagePack
+  decoder.
+* **Generation-prefixed payload:** the catalog snapshot bytes are enveloped
+  at the record boundary (in `to_snapshot_bytes`) BEFORE
+  `ManifestCommitter::commit_fenced` prefixes the 8-byte generation, so the
+  fenced payload is `[generation:8][envelope]`. The committer itself stays
+  codec-agnostic on purpose: it is shared with partition-lease manifests, and
+  re-framing `encode_fenced` would envelope lease payloads too. A legacy
+  `[generation:8][bare rmp]` manifest decodes unchanged (strip 8, sniff, no
+  magic ⇒ legacy).
+
+== Evidence (2026-11-22)
+
+* `catalog_record_envelope` unit tests: round-trip; legacy sniff;
+  unknown-version / unknown-codec / torn-header fail-closed (errors name the
+  offending value).
+* `system_catalog_state` tests: `every_persisted_record_is_envelope_framed`
+  (delta + snapshot + sidecar all emit the magic);
+  `legacy_unframed_snapshot_and_sidecar_still_decode` (extends the
+  `identity_high_water_is_mixed_read_safe` shape);
+  `snapshot_with_unknown_envelope_version_fails_closed`;
+  `mixed_legacy_and_enveloped_wal_chain_replays` (a WAL with legacy frames
+  then enveloped frames folds cleanly — the per-entry sniff).
+* All pre-existing `system_catalog_state` tests green (legacy fixtures in
+  `legacy_snapshot_publisher_cannot_destroy_the_dropped_id_floor` decode
+  through the sniffer).
 
 == Problem
 

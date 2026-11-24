@@ -76,6 +76,16 @@ directory (D2).
 
 === D1 — L0 catalog records: an envelope now, per-account shards next
 
+Implementation status (2026-11-22): D1.1–D1.2 (envelope; body codec stays
+MessagePack) and D1.3–D1.4 (per-account shards + per-account namespace floor)
+are **implemented** — TD-SPINE-1 and TD-SPINE-2 carry the evidence and the
+one deviation from this section's text: per the pre-GA owner decision of
+2026-11-20 there is **no opt-in envelope write gate** (the writer emits the
+envelope unconditionally; readers sniff unconditionally, so mixed-read holds
+by construction). The sharded publish/read path ships behind the
+`PROXIMADB_CATALOG_SHARDED_SNAPSHOT_DISABLE` kill switch (default ON =
+sharded).
+
 . **Envelope.** Every persisted SystemCatalog record — WAL delta payload, snapshot, identity
   sidecar — is written as `{magic, format_version, body_codec, body}`. The pattern reuses the
   existing binary framings (PMHEAD `b"PMHEAD\0\x01"` in `manifest/head.rs`; ADR-063 D4 r3.1's
