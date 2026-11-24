@@ -77,10 +77,13 @@ use proximadb_hardware_caps::HardwareCapabilities;
 /// - **Selective Query**: ~5-15ms (progressive filtering eliminates 95%+ candidates)
 /// - **Batch Scan**: ~50-200ms (full columnar scan with SIMD)
 /// - **Compression**: 8-12x (multiple quantization levels + ZSTD)
+///
 /// Per-row values of a `vector_fp32` column, accepting both Arrow list flavors
 /// the writers emit: `List` from the shared columnar path, and `FixedSizeList`
-/// from the Parquet factory. Re-homed from the removed VIPER engine
-/// (ADR-093 S3), which shared the same Parquet schema via the common writer.
+/// from the Parquet factory.
+///
+/// Re-homed from the removed VIPER engine (ADR-093 S3), which shared the same
+/// Parquet schema via the common writer.
 fn list_row_values(
     col: &dyn arrow_array::Array,
     row_idx: usize,

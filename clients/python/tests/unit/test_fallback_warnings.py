@@ -99,7 +99,7 @@ class TestFallbackWarnings:
             assert len(w) == 1
             warning_message = str(w[0].message).lower()
             assert "mmap" in warning_message
-            assert "fallback to 'viper'" in warning_message
+            assert "fallback to 'sst'" in warning_message
             assert "server decision" in warning_message
 
     @patch("proximadb_sdk.protocols.rest_sync.ProximaDBClient._make_request")

@@ -14,7 +14,7 @@ This document specifies the design for integrating Apache Arrow IPC (Inter-Proce
 * Add Arrow Flight-based server on port 5680 alongside REST (5678) and gRPC (5679)
 * Enable high-throughput bulk vector ingestion for ETL and data migration workloads
 * Provide direct engine write path bypassing WAL for maximum performance
-* Support all 6 storage engines (SST, HELIX, VIPER, NOVA, SWIFT, RAPTOR)
+* Support the storage engines (SST, HELIX, NOVA, SWIFT, RAPTOR)
 * Maintain synchronous write acknowledgment for durability guarantees
 * Enable explicit flush and compaction triggering via Arrow IPC commands
 
@@ -58,7 +58,7 @@ Both protocols share a common `UnifiedHandlers` business logic layer, eliminatin
 ProximaDB already has extensive Arrow support:
 
 * **Dependencies**: Arrow 56.1 (core, array, schema, IPC, buffer)
-* **Parquet Support**: All columnar engines (VIPER, NOVA) use Arrow-backed Parquet
+* **Parquet Support**: The columnar engines (NOVA) use Arrow-backed Parquet
 * **Existing IPC**: File-based Arrow IPC for compaction and full scans
 * **Zero-Copy**: `UnifiedColumnarIO` with zero-copy RecordBatch operations
 
@@ -95,7 +95,7 @@ graph TB
 
     subgraph "Storage Layer"
         WAL[Write-Ahead Log<br/>Optional Bypass]
-        SE[Storage Engines<br/>SST/HELIX/VIPER/etc]
+        SE[Storage Engines<br/>SST/HELIX/NOVA/etc]
     end
 
     VOS --> WAL

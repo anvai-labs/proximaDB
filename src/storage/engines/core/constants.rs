@@ -190,8 +190,6 @@ pub mod block_sizes {
     /// Default block size in bytes for SST (16KB)
     pub const SST_DEFAULT_BLOCK_SIZE_BYTES: usize = 16 * 1024;
 
-    /// Default page size for Parquet (256KB - balanced for embeddings)
-
     /// Target file size for SST files (64MB)
     pub const SST_TARGET_FILE_SIZE_BYTES: usize = 64 * 1024 * 1024;
 

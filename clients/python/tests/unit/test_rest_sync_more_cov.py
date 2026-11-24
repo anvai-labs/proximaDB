@@ -127,7 +127,7 @@ def test_create_collection_nested_collection_response(monkeypatch):
                     "name": "mycoll_x",
                     "dimension": 64,
                     "distance_metric": 2,  # euclidean
-                    "storage_engine": 1,  # viper
+                    "storage_engine": 2,  # sst
                 },
                 "created_at": 111,
                 "updated_at": 222,
