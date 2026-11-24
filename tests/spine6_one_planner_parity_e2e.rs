@@ -55,9 +55,8 @@ async fn same_sql_one_planner_across_pgwire_rest_v2_and_unified_query_e2e() {
 
     let table = server.unique_name("spine6");
     let ddl = format!("CREATE TABLE {table} (id TEXT, score DOUBLE, label TEXT)");
-    let dml = format!(
-        "INSERT INTO {table} (id, score, label) VALUES ('a', 1.5, 'x'), ('b', 2.5, 'y')"
-    );
+    let dml =
+        format!("INSERT INTO {table} (id, score, label) VALUES ('a', 1.5, 'x'), ('b', 2.5, 'y')");
     let select = format!("SELECT id, score, label FROM {table} ORDER BY id");
 
     // Seed over pgwire: the write surfaces share one WAL/store, so the rows
@@ -132,13 +131,18 @@ async fn same_sql_one_planner_across_pgwire_rest_v2_and_unified_query_e2e() {
 async fn strong_freshness_port_read_sees_every_write_with_result_cache_on_e2e() {
     // BEFORE boot: enable the (default-OFF) OLAP result cache. Read per call
     // (no OnceLock), but set it first so the initial SELECT can populate it.
-    std::env::set_var("PROXIMADB_QUERY_RESULT_CACHE", "1");
+    // Edition 2024: set_var is unsafe (single-threaded test prologue here).
+    unsafe { std::env::set_var("PROXIMADB_QUERY_RESULT_CACHE", "1") };
     let server = TestPgServer::start().await.expect("server start");
     let client = server.connect().await.expect("pgwire connect");
 
     let table = server.unique_name("spine6_fresh");
     pg_server::rows(&client, &format!("CREATE TABLE {table} (id TEXT)")).await;
-    pg_server::rows(&client, &format!("INSERT INTO {table} (id) VALUES ('a'), ('b')")).await;
+    pg_server::rows(
+        &client,
+        &format!("INSERT INTO {table} (id) VALUES ('a'), ('b')"),
+    )
+    .await;
     let select = format!("SELECT id FROM {table} ORDER BY id");
 
     let (http, base) = server.rest_client().expect("rest client");

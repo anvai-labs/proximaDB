@@ -3600,6 +3600,7 @@ jobs:
               --test sks_fixtures_test \
               --test sks_integration_test \
               --test small_batch_brute_force_test \
+              --test spine6_one_planner_parity_e2e \
               --test td134_keu_rbac_e2e \
               --test tdd_infrastructure_test \
               --test test_zero_copy_verification \

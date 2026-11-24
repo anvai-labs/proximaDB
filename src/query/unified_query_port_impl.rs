@@ -1205,10 +1205,9 @@ mod tests {
             olap_cache_for_freshness(&VectorFreshnessMode::Strong).is_none(),
             "Strong must bypass the result-cache lookup"
         );
-        // Weaker modes are ALLOWED to consult it (presence still depends on
-        // the env flag; the invariant under test is only Strong ⇒ None).
-        let weaker = olap_cache_for_freshness(&VectorFreshnessMode::StaleOk);
-        assert!(weaker.is_none() || weaker.is_some());
+        // (Non-Strong modes MAY hand the cache through — presence depends on
+        // the PROXIMADB_QUERY_RESULT_CACHE flag, so their side is asserted in
+        // the dedicated e2e file with the flag set, not here.)
     }
 
     #[test]

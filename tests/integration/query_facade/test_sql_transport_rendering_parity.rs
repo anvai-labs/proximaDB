@@ -319,10 +319,7 @@ async fn build_port_stack() -> (AppState, Arc<SharedServices>, tempfile::TempDir
 /// Canonical /sql leg: the REAL canonical handler (handlers::execute_sql)
 /// called in-process — the route the canonical REST surface uses. Runs the
 /// caller's tenant through the port context (identity as data).
-async fn canonical_port_sql(
-    state: &AppState,
-    sql: &str,
-) -> serde_json::Value {
+async fn canonical_port_sql(state: &AppState, sql: &str) -> serde_json::Value {
     let tenant = proximadb::network::middleware::tenant::TenantContext::new(
         "default",
         proximadb::network::middleware::tenant::TenantIdSource::Default,
@@ -354,7 +351,13 @@ async fn mcp_search(
     port: Arc<dyn proximadb_runtime::UnifiedQueryPort>,
     query: &str,
 ) -> serde_json::Value {
-    let backend = EngineBackend::new(api_handlers, Some(port), None, None, Some("default".to_string()));
+    let backend = EngineBackend::new(
+        api_handlers,
+        Some(port),
+        None,
+        None,
+        Some("default".to_string()),
+    );
     backend
         .search(&json!({ "collection_id": "spine6", "query": query }))
         .await
@@ -418,7 +421,11 @@ async fn plain_sql_runs_through_the_scheduler_on_every_in_process_surface() {
         .iter()
         .map(|row| cells_of(row, &columns))
         .collect();
-    assert_eq!(reference.len(), 2, "seeded rows must be visible: {reference:?}");
+    assert_eq!(
+        reference.len(),
+        2,
+        "seeded rows must be visible: {reference:?}"
+    );
 
     // Canonical /sql (unified query port → scheduler decision path).
     let canonical = canonical_port_sql(&state, select).await;
@@ -555,7 +562,9 @@ async fn plain_sql_through_the_port_fails_closed_without_identity_or_scope() {
         .await
         .expect("identity-carrying plain SQL must execute via the scheduler");
     assert!(
-        ok["records"].as_array().is_some_and(|rows| !rows.is_empty()),
+        ok["records"]
+            .as_array()
+            .is_some_and(|rows| !rows.is_empty()),
         "the seeded row must be visible: {ok}"
     );
 }
