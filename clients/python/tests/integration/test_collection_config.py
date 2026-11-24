@@ -156,7 +156,7 @@ class TestCollectionConfigComprehensive:
     def test_storage_engine_combinations(self, rest_client, grpc_client):
         """Test all storage engine options"""
         storage_engines = [
-            StorageEngine.VIPER,
+            StorageEngine.NOVA,
             StorageEngine.SST,
             StorageEngine.MMAP,
             StorageEngine.HYBRID,
@@ -553,7 +553,7 @@ class TestCollectionConfigComprehensive:
                 "name": "test_config_combo_viper_hnsw_scalar",
                 "dimension": 384,
                 "distance_metric": DistanceMetric.COSINE,
-                "storage_engine": StorageEngine.VIPER,
+                "storage_engine": StorageEngine.NOVA,
                 "primary_indexing_algorithm": IndexingAlgorithm.HNSW,
                 "quantization_config": QuantizationConfig(
                     enabled=True, type=QuantizationType.SCALAR, bits_per_vector=8
@@ -594,7 +594,7 @@ class TestCollectionConfigComprehensive:
                 "name": "test_config_combo_viper_multi_binary",
                 "dimension": 1024,
                 "distance_metric": DistanceMetric.HAMMING,
-                "storage_engine": StorageEngine.VIPER,
+                "storage_engine": StorageEngine.NOVA,
                 "index_configs": [
                     IndexConfiguration(
                         index_name="primary",
@@ -616,7 +616,7 @@ class TestCollectionConfigComprehensive:
                 "name": "test_config_combo_full_features",
                 "dimension": 768,
                 "distance_metric": DistanceMetric.COSINE,
-                "storage_engine": StorageEngine.VIPER,
+                "storage_engine": StorageEngine.NOVA,
                 "primary_indexing_algorithm": IndexingAlgorithm.HNSW,
                 "filterable_columns": [
                     FilterableColumn(
@@ -757,7 +757,7 @@ class TestCollectionConfigComprehensive:
             name="test_config_protocol_consistency",
             dimension=512,
             distance_metric=DistanceMetric.COSINE,
-            storage_engine=StorageEngine.VIPER,
+            storage_engine=StorageEngine.NOVA,
             primary_indexing_algorithm=IndexingAlgorithm.HNSW,
             quantization_config=QuantizationConfig(
                 enabled=True, type=QuantizationType.SCALAR, bits_per_vector=8
@@ -815,7 +815,7 @@ class TestCollectionConfigComprehensive:
                 name=collection_name,
                 dimension=128,
                 distance_metric=metric,
-                storage_engine=StorageEngine.VIPER,
+                storage_engine=StorageEngine.NOVA,
                 description=f"Test collection for {metric.value} distance metric",
             )
 
@@ -909,7 +909,7 @@ class TestCollectionConfigComprehensive:
                 name=collection_name,
                 dimension=256,
                 distance_metric=DistanceMetric.COSINE,
-                storage_engine=StorageEngine.VIPER,
+                storage_engine=StorageEngine.NOVA,
                 primary_indexing_algorithm=algorithm,
                 description=f"Test collection for {algorithm.value} indexing algorithm",
             )

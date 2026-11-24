@@ -7,7 +7,7 @@ Enables zero-copy data export to PyArrow, Polars, DuckDB, and pandas.
 Supports all storage formats:
 - ArrowBlock (.arrow) - Arrow IPC format from SST engine
 - ProximaBlocks (.sst) - Native SST format (converted on-the-fly)
-- Parquet (.parquet) - From Nova and VIPER engines
+- Parquet (.parquet) - From the Nova engine
 
 Copyright 2025 ProximaDB Contributors
 Licensed under the Apache License, Version 2.0

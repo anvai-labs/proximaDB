@@ -69,7 +69,7 @@ flowchart TB
 
 **Rationale**:
 - Real-time workloads need fast writes → SST
-- Analytics need columnar scans → VIPER
+- Analytics need columnar scans → NOVA (vector) / DataFusion over Parquet (SQL)
 - Small datasets need ultra-low latency → SWIFT
 
 **Trade-offs**:
@@ -81,7 +81,7 @@ flowchart TB
 **Engines**:
 - **SST**: Write-optimized LSM-tree
 - **HELIX**: Locality-optimized (Hilbert curve)
-- **VIPER**: Columnar Parquet (analytics)
+- **NOVA**: Columnar Parquet (analytics)
 - **SWIFT**: In-memory (small datasets)
 - **NOVA**: Progressive columnar (mixed)
 - **RAPTOR**: Adaptive (auto-tuning)

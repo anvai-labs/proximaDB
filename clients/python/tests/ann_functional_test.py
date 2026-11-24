@@ -222,7 +222,7 @@ class ANNFunctionalTest:
         # ============================================================
         # 1. STORAGE ENGINE TESTS
         # ============================================================
-        engines = ["sst", "viper", "nova", "helix", "swift", "raptor"]
+        engines = ["sst", "nova", "helix", "swift", "raptor"]
         for engine in engines:
             configs.append(
                 TestConfig(
@@ -318,7 +318,7 @@ class ANNFunctionalTest:
             configs.append(
                 TestConfig(
                     name=f"quant_{qt}",
-                    engine="viper",  # VIPER supports quantization
+                    engine="nova",  # NOVA supports quantization
                     dimension=self.dimension,
                     distance_metric="cosine",
                     quantization_type=qt,

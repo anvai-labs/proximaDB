@@ -31,7 +31,6 @@ from proximadb.models import (
     FooterCacheSettings,
     HybridWriterSettings,
     SstEngineSettings,
-    ViperEngineSettings,
     AccessPattern,
     DataDensity,
     StorageEngine,
@@ -48,7 +47,7 @@ def create_cloud_optimized_collection(client: ProximaDBClient):
         name="cloud_vectors",
         dimension=768,
         distance_metric=DistanceMetric.COSINE,
-        storage_engine=StorageEngine.VIPER,
+        storage_engine=StorageEngine.NOVA,
         storage_engine_config=StorageEngineConfig(
             # Optimization hints
             access_pattern=AccessPattern.READ_HEAVY,
@@ -179,7 +178,7 @@ def create_archive_collection(client: ProximaDBClient):
         name="archive_vectors",
         dimension=1024,
         distance_metric=DistanceMetric.DOT_PRODUCT,
-        storage_engine=StorageEngine.VIPER,
+        storage_engine=StorageEngine.NOVA,
         storage_engine_config=StorageEngineConfig(
             # Optimization hints
             access_pattern=AccessPattern.ARCHIVE,
@@ -196,58 +195,6 @@ def create_archive_collection(client: ProximaDBClient):
                 dictionary_threshold=0.9  # Aggressive dictionary encoding
             ),
             
-            # VIPER-specific compression
-            viper_settings=ViperEngineSettings(
-                enable_columnar_compression=True,
-                enable_vector_quantization=True,  # Quantize for space
-                enable_lazy_loading=True  # Don't load until needed
-            )
-        )
-    )
-    
-    collection = client.create_collection(config=config)
-    print(f"✅ Created archive collection: {collection.id}")
-    
-    # Insert archival data
-    vectors = [
-        {
-            "id": f"archive_vec_{i}",
-            "vector": np.random.rand(1024).tolist(),
-            "metadata": {
-                "archived_date": "2024-01-01",
-                "retention_years": 7,
-                "compliance": "GDPR"
-            }
-        }
-        for i in range(50)
-    ]
-    
-    result = client.insert_vectors("archive_vectors", vectors)
-    print(f"✅ Archived {len(vectors)} vectors")
-    return collection
-
-
-def create_memory_constrained_collection(client: ProximaDBClient):
-    """Create a collection optimized for memory-constrained environments"""
-    print("\n=== Creating Memory-Constrained Collection ===")
-    
-    config = CollectionConfig(
-        name="memory_limited_vectors",
-        dimension=512,
-        distance_metric=DistanceMetric.COSINE,
-        storage_engine=StorageEngine.VIPER,
-        storage_engine_config=StorageEngineConfig(
-            # Use memory-constrained preset
-            preset="memory_constrained",
-            
-            # Disable memory-heavy features
-            parquet_writer=ParquetWriterSettings(
-                row_group_size=1000,  # Small row groups
-                page_size=262144,  # 256KB pages
-                enable_bloom_filters=False,  # Save memory
-                enable_pq_sorting=False,  # Skip sorting
-                write_batch_size=100  # Small batches
-            ),
             
             # Minimal footer cache
             footer_cache=FooterCacheSettings(

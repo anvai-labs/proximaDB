@@ -43,7 +43,7 @@ def test_distance_metrics():
                 name=collection_name,
                 dimension=128,
                 distance_metric=metric_enum,
-                storage_engine=StorageEngine.VIPER,
+                storage_engine=StorageEngine.NOVA,
             )
 
             print(

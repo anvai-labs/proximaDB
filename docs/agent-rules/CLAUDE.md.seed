@@ -139,8 +139,8 @@ multiplexed on port 5678 (`multi_server.rs`, `multiplex/`). Tenant identity ente
 engine behind the `ComputeBackend` seam (ADR-052, Accepted) — the seam keeps it swappable;
 native OLAP operators exist only under ADR-054 (default-OFF, ledger-gated via TD-OLAP-4), and
 the primary native investment is the PAX-native scan (TD-OLAP-1). Vector/ANN work runs on the specialized
-engines in `src/storage/engines/`: **SST** (Supported; auto default from v0.5, TD-ENGSEL-1), **HELIX** and **NOVA** (Beta); **VIPER** is
-deprecated (ADR-093) and RAPTOR/SWIFT are gated experimental engines deleted in v0.6; graph is **ORION**.
+engines in `src/storage/engines/`: **SST** (Supported; auto default from v0.5, TD-ENGSEL-1), **HELIX** and **NOVA** (Beta); **VIPER** was
+removed (ADR-093 stage 3 — wire value retained, rejected fail-closed) and RAPTOR/SWIFT are gated experimental engines deleted in v0.6; graph is **ORION**.
 
 **Storage.** Write path: WAL (`src/storage/persistence/write_ahead_log/`) → memtable → flush
 (`flush_materializer.rs`) into the custom **PAX block format**

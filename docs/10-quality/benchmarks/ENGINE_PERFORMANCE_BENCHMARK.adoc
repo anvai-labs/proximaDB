@@ -24,7 +24,6 @@ make benchmark-vector
 
 * **SST**: best for streaming ingestion and balanced read/write
 * **HELIX**: best for clustered vectors and read-heavy workloads
-* **VIPER**: best for analytics scans (Parquet)
 * **SWIFT/NOVA/RAPTOR**: balanced or adaptive strategies
 
 == Notes

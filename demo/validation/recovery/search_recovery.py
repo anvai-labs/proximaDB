@@ -174,9 +174,9 @@ def main():
     
     # Test collections to verify
     test_collections = [
-        ("rest_viper_persist_test", "rest", "viper", connect_rest("http://localhost:5678")),
+        ("rest_nova_persist_test", "rest", "nova", connect_rest("http://localhost:5678")),
         ("rest_lsm_persist_test", "rest", "lsm", connect_rest("http://localhost:5678")),
-        ("grpc_viper_persist_test", "grpc", "viper", connect_grpc("http://localhost:5679")),
+        ("grpc_nova_persist_test", "grpc", "nova", connect_grpc("http://localhost:5679")),
         ("grpc_lsm_persist_test", "grpc", "lsm", connect_grpc("http://localhost:5679"))
     ]
     

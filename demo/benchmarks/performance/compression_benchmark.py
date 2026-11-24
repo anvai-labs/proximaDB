@@ -243,7 +243,7 @@ class CompressionBenchmark:
                         name=collection_name,
                         dimension=dimension,
                         distance_metric=DistanceMetric.COSINE,
-                        storage_engine=StorageEngine.VIPER
+                        storage_engine=StorageEngine.NOVA
                     )
                     client.create_collection(collection_name, col_config)
                     

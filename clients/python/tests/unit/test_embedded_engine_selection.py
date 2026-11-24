@@ -66,9 +66,9 @@ async def test_configured_engine_is_sent(monkeypatch):
 async def test_explicit_engine_argument_wins(monkeypatch):
     sink = []
     db = _db(monkeypatch, sink, vector_engine="SST")
-    await db.create_collection("c", dimension=8, engine="viper")
+    await db.create_collection("c", dimension=8, engine="nova")
     _, body = sink[0]
-    assert body["engine"] == "viper"
+    assert body["engine"] == "nova"
 
 
 @pytest.mark.asyncio

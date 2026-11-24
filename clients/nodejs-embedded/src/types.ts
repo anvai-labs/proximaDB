@@ -35,7 +35,7 @@ export enum StorageEngine {
   Sst = "sst",
   /** Locality-optimized with Hilbert curves */
   Helix = "helix",
-  /** Columnar Parquet for analytics */
+  /** REMOVED (ADR-093 stage 3) — wire value only; the server rejects new selections. Use Nova. */
   Viper = "viper",
   /** Ultra-low latency for small datasets */
   Swift = "swift",

@@ -29,7 +29,7 @@ def test_wal_directory_creation():
         "name": collection_name,
         "dimension": 128,
         "distance_metric": 1,  # COSINE
-        "storage_engine": 1,  # VIPER
+        "storage_engine": 2,  # SST
         "tags": [],
         "filterable_columns": [],
         "index_configs": [

@@ -226,7 +226,7 @@ def list_collections(ctx: click.Context) -> None:
 @click.option("--dimension", "-d", required=True, type=int, help="Vector dimension")
 @click.option(
     "--engine",
-    type=click.Choice(["sst", "viper", "nova", "swift", "raptor", "helix"]),
+    type=click.Choice(["sst", "nova", "swift", "raptor", "helix"]),
     default="sst",
     help="Storage engine to use",
 )

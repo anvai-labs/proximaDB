@@ -152,8 +152,8 @@ class ProximaDBClientV1:
                 13: "custom",
             }
             STORAGE_ENGINE_MAP = {
-                0: "viper",
-                1: "viper",
+                0: "unspecified",
+                1: "viper",  # REMOVED engine (ADR-093); decode truthfully
                 2: "sst",
                 3: "nova",
                 4: "helix",

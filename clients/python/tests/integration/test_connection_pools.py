@@ -309,7 +309,7 @@ class TestRestConnectionPool(BaseProximaDBTest):
                 json={
                     "id": f"test_compression_{int(time.time())}",
                     "dimension": 384,
-                    "engine": "viper",
+                    "engine": "nova",
                 },
                 headers={"Accept-Encoding": "gzip"},
             )

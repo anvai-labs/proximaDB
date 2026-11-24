@@ -152,7 +152,7 @@ class TestAllCollectionConfigurations:
     def test_all_storage_engines(self, rest_client, grpc_client):
         """Test all storage engine combinations"""
         engines = [
-            StorageEngine.VIPER,
+            StorageEngine.NOVA,
             StorageEngine.SST,
             StorageEngine.MMAP,
             StorageEngine.HYBRID,
@@ -366,7 +366,7 @@ class TestAllCollectionConfigurations:
                 "name": "test_all_config_basic",
                 "dimension": 128,
                 "distance_metric": DistanceMetric.COSINE,
-                "storage_engine": StorageEngine.VIPER,
+                "storage_engine": StorageEngine.NOVA,
                 "primary_indexing_algorithm": IndexingAlgorithm.HNSW,
             },
             # With quantization
@@ -385,7 +385,7 @@ class TestAllCollectionConfigurations:
                 "name": "test_all_config_with_filters",
                 "dimension": 256,
                 "distance_metric": DistanceMetric.DOT_PRODUCT,
-                "storage_engine": StorageEngine.VIPER,
+                "storage_engine": StorageEngine.NOVA,
                 "primary_indexing_algorithm": IndexingAlgorithm.FLAT,
                 "filterable_columns": [
                     FilterableColumn(name="type", data_type=FilterableDataType.STRING),
@@ -397,7 +397,7 @@ class TestAllCollectionConfigurations:
                 "name": "test_all_config_full",
                 "dimension": 768,
                 "distance_metric": DistanceMetric.COSINE,
-                "storage_engine": StorageEngine.VIPER,
+                "storage_engine": StorageEngine.NOVA,
                 "primary_indexing_algorithm": IndexingAlgorithm.HNSW,
                 "quantization_config": QuantizationConfig(
                     enabled=True,

@@ -56,7 +56,7 @@ class TestSDKUpsertOperations:
             name=collection_name,
             dimension=4,
             distance_metric=DistanceMetric.COSINE,
-            storage_engine=StorageEngine.VIPER,
+            storage_engine=StorageEngine.NOVA,
             description="SDK upsert test collection - REST",
         )
 
@@ -78,7 +78,7 @@ class TestSDKUpsertOperations:
             name=collection_name,
             dimension=4,
             distance_metric=DistanceMetric.COSINE,
-            storage_engine=StorageEngine.VIPER,
+            storage_engine=StorageEngine.NOVA,
             description="SDK upsert test collection - gRPC",
         )
 

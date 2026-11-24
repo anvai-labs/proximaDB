@@ -191,7 +191,7 @@ ProximaDB supports multiple storage engines optimized for different use cases:
 
   - SST: Write-optimized, real-time ingestion
   - HELIX: Locality-optimized with Hilbert curves
-  - VIPER: Columnar Parquet for analytics
+  - NOVA: Progressive columnar for analytics
   - SWIFT: Ultra-low latency for small collections
   - NOVA: Progressive columnar for mixed workloads
   - RAPTOR: Adaptive row-group for dynamic workloads

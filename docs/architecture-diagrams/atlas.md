@@ -194,7 +194,7 @@ flowchart TD
     SCHED --> SHAPE{"Inspect QueryShape"}
     SHAPE -->|"parquet-backed (MATERIALIZE)"| DF["DataFusion OLAP backend<br/>datafusion/ proxima_table_provider + proxima_scan_exec<br/>(PAX-native scan TD-OLAP-1)"]
     SHAPE -->|"vector/point-lookup"| NATIVE["Native Volcano<br/>query/execution/engine.rs (OLTP floor)"]
-    SHAPE -->|"vector/ANN"| ANN["Vector engines SST/HELIX/NOVA<br/>(VIPER deprecated: existing collections only)"]
+    SHAPE -->|"vector/ANN"| ANN["Vector engines SST/HELIX/NOVA<br/>(VIPER removed, ADR-093)"]
     DF & NATIVE & ANN --> RRP["RoutedReadPlan (SelectRouteDecision)"]
     RRP --> EXEC["ExecNode tree<br/>relational-executor/lib.rs:427"]
     EXEC --> DIST["Distributed shuffle ShuffleKey<br/>crates/query/.../distributed/shuffle.rs:145"]
@@ -213,7 +213,6 @@ flowchart TD
     TRAIT(("UnifiedStorageFormat (trait, port)<br/>~30 methods: strategy/do_flush/<br/>search_vectors_unified/create_scan/<br/>read_all_records/health_check/rls_record_filter"))
     FACTORY -.->|creates Arc<dyn>| TRAIT
     SST["SSTEngine (columnar, write-opt)"] --> TRAIT
-    VIPER["ViperEngine (deprecated, ADR-093)"] --> TRAIT
     NOVA["NovaEngine (next-gen mixed)"] --> TRAIT
     SWIFT["SwiftEngine (experimental)"] --> TRAIT
     HELIX[HelixEngine] --> TRAIT
@@ -235,7 +234,7 @@ flowchart LR
         CAP[engine_capabilities.rs]
     end
     subgraph ENG["Engines"]
-        ENGINES[engines/ factory + sst/viper/nova/swift/helix/raptor]
+        ENGINES[engines/ factory + sst/nova/swift/helix/raptor]
     end
     subgraph PERSIST["Persistence (write path)"]
         WAL[write_ahead_log/ WriteAheadLogManager]

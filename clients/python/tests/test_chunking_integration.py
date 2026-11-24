@@ -64,7 +64,7 @@ class TestChunkingIntegration:
             )
         )
 
-        text = "ProximaDB is a high-performance vector database designed for AI applications. It supports multiple storage engines including SST and VIPER for different use cases."
+        text = "ProximaDB is a high-performance vector database designed for AI applications. It supports multiple storage engines including SST and NOVA for different use cases."
         chunks = chunker.chunk_text(text, source_id="doc_123")
 
         # Verify chunking worked
@@ -164,7 +164,7 @@ class TestChunkingIntegration:
                 name=collection_name,
                 dimension=384,
                 distance_metric=DistanceMetric.COSINE,
-                storage_engine=StorageEngine.VIPER,
+                storage_engine=StorageEngine.NOVA,
                 description="Integration test for chunking",
             )
             collection = rest_client.create_collection(
@@ -515,7 +515,7 @@ class TestChunkingIntegration:
         The SST storage engine provides excellent write performance and is optimized for high-throughput ingestion scenarios.
         This makes it ideal for real-time applications that require immediate indexing of new vectors as they arrive.
         
-        The VIPER storage engine focuses on analytical workloads with columnar storage and advanced compression techniques.
+        The NOVA storage engine focuses on analytical workloads with columnar storage and advanced compression techniques.
         It excels at complex queries involving metadata filtering and provides superior performance for read-heavy workloads.
         
         Both engines support comprehensive metadata capabilities, allowing applications to store structured information alongside vector data.
@@ -560,7 +560,7 @@ class TestChunkingIntegration:
                 name=collection_name,
                 dimension=384,  # BERT mini (all-MiniLM-L6-v2) embedding dimension
                 distance_metric=DistanceMetric.COSINE,
-                storage_engine=StorageEngine.VIPER,
+                storage_engine=StorageEngine.NOVA,
                 description="Chunking strategy comparison test with BERT embeddings",
             )
             client.create_collection(collection_name, collection_config)
@@ -811,7 +811,7 @@ class TestChunkingIntegration:
         The SST storage engine provides excellent write performance and is optimized for high-throughput ingestion scenarios.
         This makes it ideal for real-time applications that require immediate indexing of new vectors as they arrive.
         
-        The VIPER storage engine focuses on analytical workloads with columnar storage and advanced compression techniques.
+        The NOVA storage engine focuses on analytical workloads with columnar storage and advanced compression techniques.
         It excels at complex queries involving metadata filtering and provides superior performance for read-heavy workloads.
         
         Both engines support comprehensive metadata capabilities, allowing applications to store structured information alongside vector data.
@@ -834,7 +834,7 @@ class TestChunkingIntegration:
             (ChunkingStrategy.FIXED_SIZE, 120, "fixed_size"),
         ]
 
-        storage_engines = [(StorageEngine.SST, "sst"), (StorageEngine.VIPER, "viper")]
+        storage_engines = [(StorageEngine.SST, "sst"), (StorageEngine.NOVA, "nova")]
 
         protocols = [
             (Protocol.REST, "rest", "http://localhost:5678"),

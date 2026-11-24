@@ -612,7 +612,7 @@ client.create_collection(
     name="documents",
     dimension=768,
     distance_metric=pb2.DistanceMetric.COSINE,
-    storage_engine=pb2.StorageEngine.VIPER,
+    storage_engine=pb2.StorageEngine.SST,
     index_configs=[ic],
     quantization_config=qcfg,
 )

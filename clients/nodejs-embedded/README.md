@@ -90,7 +90,7 @@ Configuration options:
 - `dataDirs` - Array of disk configurations for multi-disk
 - `metadataDir` - Metadata storage path
 - `cacheSizeMb` - Cache size in MB (default: 512)
-- `defaultEngine` - Storage engine: "sst" (recommended), "nova", "helix", etc. (`viper` is DEPRECATED — see ADR-093, do not select for new collections)
+- `defaultEngine` - Storage engine: "sst" (recommended), "nova", "helix", etc. (`viper` was REMOVED — see ADR-093)
 - `enableWal` - Enable write-ahead logging (default: true)
 - `walSyncMode` - WAL sync: "immediate", "batch", "async"
 

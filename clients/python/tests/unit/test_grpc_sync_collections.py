@@ -141,7 +141,7 @@ def test_grpc_sync_collection_ops(monkeypatch):
         name="test_docs",  # Must be >8 chars
         dimension=128,
         distance_metric=DistanceMetricType.COSINE,
-        storage_engine=StorageEngineType.VIPER,
+        storage_engine=StorageEngineType.NOVA,
     )
     client.get_collection_v1("test_docs")
     client.list_collections_v1()

@@ -16,7 +16,6 @@
 Most vector databases optimize for either:
 
 * **OLTP (SST)**: Fast writes, simple queries, real-time updates
-* **OLAP (VIPER)**: Batch analytics, high compression, columnar scans
 
 But many workloads are **mixed**: real-time updates with analytical queries. NOVA bridges this gap with hierarchical zone maps that enable both fast writes AND intelligent pruning.
 
@@ -181,7 +180,7 @@ graph LR
         N3[Read: 120ms selective]
     end
 
-    subgraph VIPER["VIPER: Analytics"]
+    subgraph NOVA_AN["NOVA: Analytics"]
         V1[Columnar + Statistics]
         V2[Write: 50K ops/sec]
         V3[Read: 180ms batch]
@@ -194,11 +193,11 @@ graph LR
     end
 
     Q1["Mixed read/write?"] --> NOVA
-    Q2["Pure analytics?"] --> VIPER
+    Q2["Pure analytics?"] --> NOVA_AN
     Q3["Real-time OLTP?"] --> SST
 
     style NOVA fill:#e6ffe6,stroke:#93c47d
-    style VIPER fill:#e6f3ff,stroke:#4a90e2
+    style NOVA_AN fill:#e6f3ff,stroke:#4a90e2
     style SST fill:#ffd966,stroke:#cc9900
 ----
 
@@ -215,7 +214,7 @@ graph LR
 | Zone maps provide 90%+ pruning for selective queries
 
 | **Moderate update frequency**
-| Handles updates better than pure columnar (VIPER)
+| Handles updates better than pure columnar
 
 | **Analytics + real-time queries**
 | Five-stage progressive search balances recall and latency
@@ -227,11 +226,7 @@ graph LR
 |===
 | Scenario | Better Choice | Why
 
-| Pure batch analytics
-| **VIPER**
-| VIPER's pure columnar achieves better compression
-
-| Real-time point queries
+| Pure batch analytics| Real-time point queries
 | **SST**
 | SST's bloom filters are faster for point lookups
 
@@ -418,5 +413,4 @@ RUST_LOG=proximadb::storage::engines::impls::nova::operations::compaction=debug
 **See Also**:
 
 * link:sst-engine-deep-dive.adoc[SST Engine] - Real-time OLTP alternative
-* link:viper-engine-deep-dive.adoc[VIPER Engine] - Pure analytics alternative
 * link:swift-engine-deep-dive.adoc[SWIFT Engine] - Multi-tenant alternative

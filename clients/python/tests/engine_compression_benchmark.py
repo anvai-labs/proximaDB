@@ -10,7 +10,7 @@ Comprehensive benchmark testing all ProximaDB storage engines with:
 Engines tested with optimal compression:
 - SST: LZ4 level 1 (fast encode/decode)
 - HELIX: No compression (uses PCA dimensionality reduction)
-- VIPER: ZSTD level 3 (balanced columnar compression)
+- NOVA: ZSTD level 3 (balanced columnar compression)
 - NOVA: ZSTD level 3 (mixed workload optimization)
 - SWIFT: LZ4 level 1 (ultra-low latency)
 - RAPTOR: ZSTD level 3 (adaptive compression)
@@ -45,12 +45,6 @@ COMPRESSION_CONFIGS = {
     ],
     "helix": [
         ("No Compression (PCA)", None),  # HELIX uses PCA, not traditional compression
-    ],
-    "viper": [
-        ("No Compression", None),
-        ("ZSTD-3 (Default)", {"algorithm": "zstd", "level": 3}),
-        ("ZSTD-1 (Fast)", {"algorithm": "zstd", "level": 1}),
-        ("ZSTD-7 (High)", {"algorithm": "zstd", "level": 7}),
     ],
     "nova": [
         ("No Compression", None),
@@ -314,7 +308,7 @@ def run_comprehensive_benchmark(batch_sizes: list[int]):
     print("""
 1. COMPRESSION IMPACT BY ENGINE:
    - SST: LZ4-1 provides ~2-3x compression with minimal performance impact
-   - VIPER: ZSTD-3 achieves ~3-5x compression, best for columnar data
+   - NOVA: ZSTD-3 achieves ~3-5x compression, best for columnar data
    - NOVA: ZSTD-3 balances compression and speed for mixed workloads
    - HELIX: Uses PCA dimensionality reduction instead of compression
    - SWIFT: LZ4-1 maintains ultra-low latency with light compression
@@ -334,7 +328,7 @@ def run_comprehensive_benchmark(batch_sizes: list[int]):
 
 4. RECOMMENDATIONS:
    - Real-time ingestion: SST with LZ4-1 or no compression
-   - Analytics workloads: VIPER with ZSTD-3
+   - Analytics workloads: NOVA with ZSTD-3
    - Mixed workloads: NOVA with ZSTD-3
    - Ultra-low latency: SWIFT with LZ4-1 or no compression
    - High-dimensional data: HELIX (PCA reduction)

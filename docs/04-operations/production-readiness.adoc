@@ -362,8 +362,9 @@ does not acquire a support tier merely by appearing in the repository.
   remote execution remain partial. Multi-region operation is not Beta.
 * **SWIFT / RAPTOR** - ⚠️ Experimental, feature-gated engines; neither is
   a supported migration target.
-* **VIPER** - ⚠️ Deprecated per ADR-093; existing collections remain
-  readable while migration proceeds, but new deployments should use SST.
+* **VIPER** - ❌ Removed per ADR-093 stage 3 (2026-11-23, pre-GA clean break):
+  the engine code is deleted and every construction boundary rejects the
+  retained wire value; use SST (default) or NOVA (columnar analytics).
 * **PULSAR / QUASAR** - ❌ Retired names, not experimental engines. Use ORION.
 * **Full SQL parity, LLM joins, and AVX512 paths** - ⚠️ Experimental or
   unsupported as scoped by the canonical matrix.

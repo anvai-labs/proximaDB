@@ -38,8 +38,8 @@ class TestCompressionConfig:
         assert config.block_size_kb is None
         assert config.dynamic_block_sizing is False
 
-    def test_compression_config_viper_optimized(self):
-        """Test VIPER-optimized compression configuration"""
+    def test_compression_config_columnar_optimized(self):
+        """Test columnar-optimized compression configuration"""
         config = CompressionConfig(
             algorithm=CompressionAlgorithm.LZ4,
             level=1,
@@ -143,8 +143,8 @@ class TestCollectionConfigWithCompression:
         )  # Default is SST (fast, production-ready)
         # Note: primary_indexing_algorithm is Optional, may not have default
 
-    def test_collection_config_with_viper_compression(self):
-        """Test CollectionConfig with VIPER-specific compression"""
+    def test_collection_config_with_columnar_compression(self):
+        """Test CollectionConfig with columnar-engine compression"""
         compression = CompressionConfig(
             algorithm=CompressionAlgorithm.ZSTD,
             level=6,
@@ -153,9 +153,9 @@ class TestCollectionConfigWithCompression:
         )
 
         collection_config = CollectionConfig(
-            name="viper_compressed",
+            name="columnar_compressed",
             dimension=1536,
-            storage_engine=StorageEngine.VIPER,
+            storage_engine=StorageEngine.NOVA,
             compression=compression,
         )
 
@@ -197,42 +197,6 @@ class TestCollectionConfigWithCompression:
         assert "compression" in data
         assert data["compression"]["algorithm"] == "snappy"
         assert data["compression"]["adaptive"] is True
-
-    def test_engine_specific_validation_warnings(self):
-        """Test that engine-specific validation provides warnings"""
-        # VIPER with SST settings should warn
-        compression = CompressionConfig(
-            algorithm=CompressionAlgorithm.ZSTD,
-            enable_quantization=True,
-            block_size_kb=8192,  # SST setting on VIPER
-        )
-
-        with pytest.warns(
-            UserWarning, match="block_size_kb is ignored by VIPER engine"
-        ):
-            collection_config = CollectionConfig(
-                name="warning_test",
-                dimension=384,
-                storage_engine=StorageEngine.VIPER,
-                compression=compression,
-            )
-
-        # SST with VIPER settings should warn
-        compression = CompressionConfig(
-            algorithm=CompressionAlgorithm.LZ4,
-            enable_quantization=True,  # VIPER setting on SST
-            quantization_type="int8",
-        )
-
-        with pytest.warns(
-            UserWarning, match="enable_quantization is ignored by SST engine"
-        ):
-            collection_config = CollectionConfig(
-                name="warning_test2",
-                dimension=384,
-                storage_engine=StorageEngine.SST,
-                compression=compression,
-            )
 
 
 class TestSearchOptimizationWithCompression:
@@ -309,8 +273,8 @@ class TestCompressionIntegrationScenarios:
         assert call_args.compression.algorithm == CompressionAlgorithm.ZSTD
         assert call_args.compression.block_size_kb == 16384
 
-    def test_unified_compression_viper_scenario(self, mock_client):
-        """Test VIPER storage with unified compression config"""
+    def test_unified_compression_columnar_scenario(self, mock_client):
+        """Test columnar storage with unified compression config"""
         compression = CompressionConfig(
             algorithm=CompressionAlgorithm.LZ4,
             level=1,
@@ -320,9 +284,9 @@ class TestCompressionIntegrationScenarios:
         )
 
         collection_config = CollectionConfig(
-            name="viper_compressed",
+            name="columnar_compressed",
             dimension=768,
-            storage_engine=StorageEngine.VIPER,
+            storage_engine=StorageEngine.NOVA,
             compression=compression,
         )
 

@@ -193,7 +193,7 @@ def test_rl_with_different_engines():
     - SST: Write-optimized, real-time (LSM-tree based)
     - HELIX: Locality-optimized with Hilbert curve clustering
     - SWIFT: Ultra-low latency for small datasets (<5K vectors)
-    - VIPER: Columnar Parquet for analytics workloads
+    - NOVA: Columnar Parquet for analytics workloads
     - NOVA: Progressive columnar with zone maps
     - RAPTOR: Adaptive row-group for dynamic workloads
 
@@ -202,7 +202,7 @@ def test_rl_with_different_engines():
     print("\n=== Test: RL with All 6 Storage Engines ===")
 
     # All 6 ProximaDB storage engines
-    engines = ["sst", "helix", "swift", "viper", "nova", "raptor"]
+    engines = ["sst", "helix", "swift", "nova", "raptor"]
 
     with tempfile.TemporaryDirectory() as temp_dir:
         db_multi_engine = EmbeddedProximaDB(temp_dir)

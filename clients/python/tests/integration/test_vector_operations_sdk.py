@@ -299,7 +299,7 @@ class TestVectorOperationsSDK:
             name=collection_name,
             dimension=self.MODEL_DIMENSIONS[model],
             distance_metric=DistanceMetric.COSINE,
-            storage_engine=StorageEngine.VIPER,
+            storage_engine=StorageEngine.NOVA,
             description="VIPER engine test with columnar metadata optimization",
         )
 
@@ -439,7 +439,7 @@ class TestVectorOperationsSDK:
             name=f"{base_name}_viper",
             dimension=self.MODEL_DIMENSIONS[model],
             distance_metric=DistanceMetric.COSINE,
-            storage_engine=StorageEngine.VIPER,
+            storage_engine=StorageEngine.NOVA,
         )
 
         sst_collection = rest_client.create_collection(sst_config.name, sst_config)
@@ -569,7 +569,7 @@ class TestVectorOperationsSDK:
             name=collection_name,
             dimension=self.MODEL_DIMENSIONS[model],
             distance_metric=DistanceMetric.COSINE,
-            storage_engine=StorageEngine.VIPER,
+            storage_engine=StorageEngine.NOVA,
             description="Test collection for SDK ingest_text functionality",
         )
 

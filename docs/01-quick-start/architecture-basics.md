@@ -121,7 +121,7 @@ flowchart TB
 ```
 
 SST is the Supported storage engine. Today a vector collection created without `engine` (and without an index or quantization) is auto-routed to HELIX, which is Beta; pass `engine="sst"` for the Supported tier. SST becomes the automatic default in v0.5 (TD-ENGSEL-1). HELIX and NOVA are Beta
-options. VIPER is deprecated (new VIPER collections are rejected). SWIFT and RAPTOR are
+options. VIPER was removed (ADR-093 stage 3 — the wire value is rejected). SWIFT and RAPTOR are
 **experimental**, off by default behind the `experimental-engines` cargo feature, and are deleted
 in roadmap release v0.6. Analytical SQL is not an engine choice: it runs on DataFusion over
 Parquet once a relational table is materialized.

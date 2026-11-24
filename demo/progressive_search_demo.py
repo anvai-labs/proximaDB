@@ -120,7 +120,7 @@ class ProximaDBProgressiveClient:
             "name": collection_id,
             "dimension": dimension,
             "distance_metric": "cosine",
-            "storage_engine": "sst",  # or "viper"
+            "storage_engine": "sst",  # or "nova"
             "quantization": {
                 "enable_binary": enable_progressive,
                 "enable_int8": enable_progressive,

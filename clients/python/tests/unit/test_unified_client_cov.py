@@ -1150,8 +1150,8 @@ def test_proto_to_pydantic_distance_and_engine_and_algo():
     c = make_client()
     metric = c._pydantic_to_proto_distance_metric(DistanceMetric.COSINE)
     assert c._proto_to_pydantic_distance_metric(metric) == DistanceMetric.COSINE
-    engine = c._pydantic_to_proto_storage_engine(StorageEngine.VIPER)
-    assert c._proto_to_pydantic_storage_engine(engine) == StorageEngine.VIPER
+    engine = c._pydantic_to_proto_storage_engine(StorageEngine.NOVA)
+    assert c._proto_to_pydantic_storage_engine(engine) == StorageEngine.NOVA
     algo = c._pydantic_to_proto_indexing_algorithm(IndexingAlgorithm.HNSW)
     assert c._proto_to_pydantic_indexing_algorithm(algo) == IndexingAlgorithm.HNSW
 

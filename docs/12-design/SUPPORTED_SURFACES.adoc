@@ -110,7 +110,7 @@ Current relational/pgwire DML and compute-routing implementation tracker:
 | Projection | Status | Notes
 | HNSW index | ✅ Retained (rebuildable) | `ProjectionDirective::HnswIndex`. Rebuilt from canonical `ProximaRecord::embeddings` fields. Predicate-aware ACORN construction per spec §6.1.
 | IVF / PQ quantized index | ✅ Retained (rebuildable) | Quantization lives in `proximadb-vector` modality crate. Foundation types from `proximadb-quantization-types`.
-| Storage engine vector layouts (SST/HELIX/VIPER/NOVA/SWIFT) | ✅ Retained (canonical record layouts/access methods); engine tiers per `docs/SUPPORTED_SURFACE.adoc` — VIPER Deprecated (ADR-093), SWIFT Experimental | Flush, compaction, ProximaBlocks/columnar serialization, filtering, and search result shaping are migrating to `ProximaRecord::embeddings` + `props`. Legacy `VectorRecord` is allowed only in explicit v1 compatibility helpers while client/proto migration completes.
+| Storage engine vector layouts (SST/HELIX/NOVA/SWIFT) | ✅ Retained (canonical record layouts/access methods); engine tiers per `docs/SUPPORTED_SURFACE.adoc` — VIPER Removed (ADR-093 stage 3), SWIFT Experimental | Flush, compaction, ProximaBlocks/columnar serialization, filtering, and search result shaping are migrating to `ProximaRecord::embeddings` + `props`. Legacy `VectorRecord` is allowed only in explicit v1 compatibility helpers while client/proto migration completes.
 |===
 
 ---

@@ -60,15 +60,6 @@ prefetch_size_kb = 128
 bits_per_key = 12  # Higher precision for production
 enabled = true
 
-[storage.viper_config]
-row_group_size = 250000  # Larger row groups for production
-compression = "zstd"
-compression_enabled = true
-compression_level = 6
-enable_statistics = true
-data_directory = "/var/lib/proximadb/viper_data"
-cache_size_mb = 4096  # 4GB VIPER cache
-
 [storage.filesystem_config]
 enable_write_strategy_cache = true
 temp_strategy = "SameDirectory"

@@ -41,7 +41,7 @@ def test_atomic_wal_behavior():
             name=collection_id,
             dimension=384,
             distance_metric="cosine",
-            storage_engine="viper",
+            storage_engine="nova",
         )
         print(f"✅ Collection created: {result}")
     except Exception as e:

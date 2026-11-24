@@ -255,7 +255,7 @@ if __name__ == "__main__":
     # Example context from vector search
     context = [
         {"content": "ProximaDB is a high-performance vector database designed for AI applications."},
-        {"content": "It supports multiple storage engines including VIPER and SST."},
+        {"content": "It supports multiple storage engines including NOVA and SST."},
         {"content": "ProximaDB offers both REST and gRPC APIs for flexible integration."}
     ]
     

@@ -52,18 +52,6 @@ max_levels = 7                  # Support up to 7 levels
 strategy = "hybrid"             # Use both count and size thresholds
 target_file_size_mb = 128       # Create 128MB output files
 
-[storage.viper_config]
-row_group_size = 100000  # Optimized for analytics workloads
-compression = "zstd"
-compression_enabled = true
-compression_level = 3
-enable_statistics = true
-data_directory = "./viper_data"
-cache_size_mb = 512  # Increased for better columnar performance
-enable_quantization = true  # Two-stage search optimization
-quantization_type = "int8"  # INT8 quantization for memory efficiency
-
-# HELIX engine configuration (experimental clustering engine)
 [storage.helix]
 # Compaction settings
 compaction_threads = 4

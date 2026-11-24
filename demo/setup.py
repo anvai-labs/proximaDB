@@ -144,13 +144,13 @@ class DemoSetup:
             name="ecommerce_demo",
             dimension=768,
             distance_metric=DistanceMetric.COSINE,
-            storage_engine=StorageEngine.VIPER,
+            storage_engine=StorageEngine.NOVA,
             primary_indexing_algorithm=IndexType.HNSW,
             filterable_metadata_fields=[
                 "category", "brand", "price", "rating", "in_stock", "tags", "created_at"
             ],
-            description="E-commerce product catalog with VIPER storage engine",
-            tags=["demo", "ecommerce", "bert", "viper"]
+            description="E-commerce product catalog with NOVA storage engine",
+            tags=["demo", "ecommerce", "bert", "nova"]
         )
         
         if self._create_collection("ecommerce_demo", config):
@@ -168,13 +168,13 @@ class DemoSetup:
             name="sec_edgar_large_filings",
             dimension=768,
             distance_metric=DistanceMetric.COSINE,
-            storage_engine=StorageEngine.VIPER,
+            storage_engine=StorageEngine.NOVA,
             primary_indexing_algorithm=IndexType.HNSW,
             filterable_metadata_fields=[
                 "company", "ticker", "filing_type", "section", "fiscal_year"
             ],
             description="SEC EDGAR filing documents from S&P 50 companies",
-            tags=["demo", "sec", "financial", "viper"]
+            tags=["demo", "sec", "financial", "nova"]
         )
         
         if self._create_collection("sec_edgar_large_filings", config):

@@ -633,7 +633,7 @@ if __name__ == "__main__":
     # Test text
     test_text = """
     ProximaDB is a high-performance vector database designed for modern AI applications.
-    It supports multiple storage engines including VIPER for analytics and SST for write optimization.
+    It supports multiple storage engines including NOVA for analytics and SST for write optimization.
     The database provides both REST and gRPC APIs with comprehensive query capabilities.
     Advanced features include SIMD acceleration, GPU support, and sophisticated indexing algorithms.
     """

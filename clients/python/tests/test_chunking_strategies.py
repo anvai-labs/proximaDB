@@ -23,7 +23,7 @@ class TestChunkingStrategies:
         """Sample text for testing"""
         return """ProximaDB is a high-performance vector database. It supports multiple storage engines.
 
-The VIPER engine uses columnar storage for analytics. It provides excellent compression and query performance.
+The NOVA engine uses columnar storage for analytics. It provides excellent compression and query performance.
 
 The SST engine uses row-based storage. It excels at write-heavy workloads and provides consistent performance.
 
@@ -72,7 +72,7 @@ ProximaDB is a high-performance vector database.
 
 ## Storage Engines
 
-The VIPER engine uses columnar storage.
+The NOVA engine uses columnar storage.
 The SST engine uses row-based storage.
 
 ## Indexing Algorithms

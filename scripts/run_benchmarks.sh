@@ -72,11 +72,6 @@ if [[ "$ENGINE" == "all" || "$ENGINE" == "helix" ]]; then
     cargo bench --bench bench_04_storage_unified -- --save-baseline "${TIMESTAMP}_helix" | tee "${OUTPUT_DIR}/helix_benchmark.txt"
 fi
 
-if [[ "$ENGINE" == "all" || "$ENGINE" == "viper" ]]; then
-    echo -e "${YELLOW}Running VIPER engine benchmarks...${NC}"
-    cargo bench --bench bench_09_columnar_viper -- --save-baseline "${TIMESTAMP}_viper" | tee "${OUTPUT_DIR}/viper_benchmark.txt"
-fi
-
 # Run hybrid search benchmarks
 echo -e "${YELLOW}Running hybrid search benchmarks...${NC}"
 cargo bench --bench hybrid_search -- --save-baseline "${TIMESTAMP}_hybrid" 2>/dev/null | tee "${OUTPUT_DIR}/hybrid_benchmark.txt" || echo "Hybrid search benchmarks not found"

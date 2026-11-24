@@ -34,15 +34,6 @@ cache_size_mb = 512
 mmap_enabled = true
 data_directory = "./data/sks-demo/sst"
 
-[storage.viper_config]
-row_group_size = 100000
-compression = "zstd"
-compression_level = 3
-enable_statistics = true
-data_directory = "./data/sks-demo/viper"
-cache_size_mb = 512
-
-# Semantic Knowledge Store Configuration
 [sks]
 enabled = true
 enable_entities = true
@@ -55,7 +46,7 @@ max_traversal_depth = 5
 entity_cache_mb = 512
 relations_cache_mb = 256
 default_embedding_model = "openai/text-embedding-3-large"
-storage_backend = "sst"  # Options: "memory", "sst", "viper"
+storage_backend = "sst"  # Options: "memory", "sst"
 
 [api]
 grpc_port = 5679

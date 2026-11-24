@@ -126,7 +126,7 @@ transactions over pgwire work today at Beta._
 
 | HELIX / NOVA engines
 | Beta
-| VIPER is **deprecated** (ADR-093). Do not create new VIPER collections.
+| VIPER was **removed** (ADR-093 stage 3). The wire value is retained; creation is rejected.
 
 | Arrow Flight as a customer transport, distributed cluster execution, SWIFT / RAPTOR
 | Experimental

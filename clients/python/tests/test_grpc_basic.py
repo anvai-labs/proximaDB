@@ -38,7 +38,7 @@ def test_grpc_basic():
             name=collection_name,
             dimension=128,
             distance_metric="cosine",
-            storage_engine="viper",
+            storage_engine="nova",
         )
         print(f"✅ Collection created: {collection.config.name}")
         print(f"   ID: {collection.id}")

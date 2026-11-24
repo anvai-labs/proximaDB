@@ -66,7 +66,7 @@ def create_compressed_collections(client: ProximaDBClient):
         name="compressed_viper_collection",
         dimension=1536,
         distance_metric=DistanceMetric.EUCLIDEAN,
-        storage_engine=StorageEngine.VIPER,
+        storage_engine=StorageEngine.NOVA,
         compression_config=CompressionConfig(
             algorithm=CompressionAlgorithm.LZ4,
             level=1,  # Fast compression (CompressionLevel.FAST if enum used)

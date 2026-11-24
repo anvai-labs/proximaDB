@@ -60,7 +60,7 @@ def test_collection_builder_fluent_methods_and_helpers():
         .viper_storage()
         .sst_storage()
         .hybrid_storage()
-        .storage_engine(StorageEngine.VIPER)
+        .storage_engine(StorageEngine.NOVA)
         .hnsw_index()
         .ivf_index()
         .flat_index()
@@ -88,7 +88,7 @@ def test_collection_builder_fluent_methods_and_helpers():
     assert config.name == "test_collection"
     assert config.dimension == 128
     assert config.distance_metric == DistanceMetric.COSINE
-    assert config.storage_engine == StorageEngine.VIPER
+    assert config.storage_engine == StorageEngine.NOVA
     assert config.description == "unit test collection"
     assert builder._compression == CompressionType.LZ4
     assert builder._enable_bloom_filter is False

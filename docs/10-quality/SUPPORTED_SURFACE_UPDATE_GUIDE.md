@@ -47,7 +47,6 @@ Generate updated capability snapshots:
 
 This creates/updates JSON files in `snapshots/capabilities/`:
 - `sst.json`
-- `viper.json`
 - `helix.json`
 - `nova.json`
 - `swift.json`
@@ -150,7 +149,7 @@ Add to SST engine section:
 
 Update feature matrix:
 ```markdown
-| Feature | SST | VIPER | HELIX | NOVA |
+| Feature | SST | HELIX | NOVA |
 |---------|-----|-------|-------|------|
 | **Indexes** |
 | Full-Text | ✅ | ❌ | ✅ | ❌ |  # NEW

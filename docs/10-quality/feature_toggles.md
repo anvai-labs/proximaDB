@@ -53,7 +53,7 @@ cargo build --features tenant_access
 **Test Coverage**: 30-50%  
 **Backward Compatibility**: NOT guaranteed  
 **Known Issues**:
-- SWIFT/RAPTOR: Archived research engines, superseded by SST/VIPER
+- SWIFT/RAPTOR: Archived research engines, superseded by SST/NOVA
 
 **How to Enable**:
 ```bash

@@ -137,7 +137,7 @@ def test_create_collection_typeerror_falls_back_to_kwargs():
 
     db.create_collection = cc
     a = make_adapter(db)
-    coll = a.create_collection(COLL, dimension=16, storage_engine="viper")
+    coll = a.create_collection(COLL, dimension=16, storage_engine="nova")
     assert coll.dimension == 16
 
 

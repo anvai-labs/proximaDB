@@ -432,7 +432,7 @@ PR #265). Moved to the closed archive.
 | 49.3%→54.9% (+940 tests); CI threshold enforced (50% min, ratchet 55% Q2 / 60% Q3). Pure-logic surface exhausted; further gains need integration-test infra (HTTP test clients, storage-engine setup). audit 28→92, auth 42→86, api_handlers 5→43, network 30→45.
 
 | TD-024 | SWIFT engine incomplete (30+ TODOs) | MED | Open | D4 | REL
-| Header `INCOMPLETE`; progressive search, file loading, batch-id tracking, vector counting (hardcoded 0). Feature-gated behind `experimental-engines`; production uses SST/VIPER/HELIX/NOVA. Not blocking v1.0 unless needed.
+| Header `INCOMPLETE`; progressive search, file loading, batch-id tracking, vector counting (hardcoded 0). Feature-gated behind `experimental-engines`; production uses SST/HELIX/NOVA. Not blocking v1.0 unless needed.
 
 | TD-025 | RAPTOR engine experimental (35+ TODOs) | MED | Open | D4 | REL
 | Header `EXPERIMENTAL`; bloom-filter lookup, clustering, cohesion calc, caching APIs, row-group extraction. Feature-gated `experimental-engines`. Same guidance as TD-024.
@@ -456,7 +456,7 @@ PR #265). Moved to the closed archive.
 | TD-151 | PAX ranged-read range-coalescing + block pruning | MED | Partial | D1 | COST
 | Measured (PR #341): footer cache works (95% hit, -57% bytes) BUT naive per-block ranged reads fragment into thousands of small GETs (+29,900%) — fee-dominated; naively wiring *raises* cloud cost. Fix = coalesce column stripes / whole blocks into fewer ~8-16 MiB GETs (the S3 cost-throughput optimum) + block pruning (cuts bytes AND GETs). The `SegmentReadStats.range_gets` / avg-GET-size is the ratchet. See ADR-026.
 | TD-152 | Retire SWIFT + RAPTOR engines (v1.0, atomic) | LOW | Open | D1 | MAINT
-| Both dead + `experimental-engines`-gated + factory-deprecated; already uninstantiable in default builds. Removal is a ~50-file refactor (`StorageEngineType::SWIFT/RAPTOR` in 43 match sites / ~19 files: engine_type, extractor, adapters, formats, traits, metrics, planner) + proto `StorageEngine` variant drop + regen. Do it as ONE atomic removal (internal enum + proto together) at v1.0, not piecemeal. NOVA/VIPER/HELIX are LIVE — NOT in scope. See ADR-026.
+| Both dead + `experimental-engines`-gated + factory-deprecated; already uninstantiable in default builds. Removal is a ~50-file refactor (`StorageEngineType::SWIFT/RAPTOR` in 43 match sites / ~19 files: engine_type, extractor, adapters, formats, traits, metrics, planner) + proto `StorageEngine` variant drop + regen. Do it as ONE atomic removal (internal enum + proto together) at v1.0, not piecemeal. NOVA/HELIX are LIVE — NOT in scope (VIPER was removed by ADR-093). See ADR-026.
 | TD-153 | Fold Hilbert locality into PAX (write-side pre-sort) | MED | Open | D1 | PERF
 | Reuse `src/storage/engines/helix/hilbert_curve.rs`. Add an optional pre-sort stage before `write_pax_segment` (today rows are insertion-order); co-locates neighbors -> tighter block zone maps -> better skip pruning. Mixed-read-safe (version bump; ordering is a write-side optimization, reads unaffected). Re-run recall ratchet. See ADR-026 (fold from HELIX).
 | TD-154 | Hierarchical (multi-level) zone maps in PAX | MED | Open | D1 | PERF

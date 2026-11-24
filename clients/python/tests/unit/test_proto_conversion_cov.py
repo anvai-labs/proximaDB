@@ -117,8 +117,8 @@ def test_storage_engine_to_str_all_inputs():
     assert ProtoConverter.storage_engine_to_str(None) == "sst"
     assert ProtoConverter.storage_engine_to_str("nova") == "nova"
     assert ProtoConverter.storage_engine_to_str("NOVA") == "nova"
-    assert ProtoConverter.storage_engine_to_str("mmap") == "viper"
-    assert ProtoConverter.storage_engine_to_str("hybrid") == "viper"
+    assert ProtoConverter.storage_engine_to_str("mmap") == "sst"
+    assert ProtoConverter.storage_engine_to_str("hybrid") == "sst"
     assert ProtoConverter.storage_engine_to_str("unknown") == "sst"  # default
     assert ProtoConverter.storage_engine_to_str(2) == "sst"
     assert ProtoConverter.storage_engine_to_str(999) == "sst"  # unknown int default

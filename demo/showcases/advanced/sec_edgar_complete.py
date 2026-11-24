@@ -1101,7 +1101,7 @@ class SECEdgarIngestionPipeline:
                 name=f"{self.config.collection_prefix}_main",
                 dimension=self.embedding_strategy.get_dimension(),
                 distance_metric=DistanceMetric.COSINE,
-                storage_engine=StorageEngine.VIPER,
+                storage_engine=StorageEngine.NOVA,
                 compression=CompressionType[self.config.compression_type] if self.config.enable_compression else None,
                 quantization={
                     'type': QuantizationType[self.config.quantization_type],

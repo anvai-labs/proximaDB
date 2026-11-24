@@ -82,7 +82,7 @@ python quickstart/feature_showcase.py
 * `comprehensive_suite.py` - Complete benchmark suite
 * `performance/compression_benchmark.py` - Compression analysis
 * `performance/protocol_comparison.py` - REST vs gRPC vs SQL
-* `storage/engines_comparison.py` - SST vs VIPER comparison
+* `storage/engines_comparison.py` - engine comparison
 
 === validation/ - Testing (2 files)
 * `integration/integration_test_matrix.py` - System validation
@@ -147,7 +147,7 @@ python showcases/advanced/embedding_service.py
 |Concurrent Search |842 QPS |1,770 QPS |2.1x
 |===
 
-**Storage**: SST (row-based, OLTP) vs VIPER (columnar, analytics)
+**Storage**: SST (row-based, OLTP) vs NOVA (columnar, analytics)
 
 == 🚨 Troubleshooting
 
@@ -199,7 +199,7 @@ demo/
 │   │   ├── protocol_comparison.py      # REST vs gRPC vs SQL
 │   │   └── simd_performance.rs         # SIMD acceleration
 │   └── storage/
-│       └── engines_comparison.py       # SST vs VIPER comparison
+│       └── engines_comparison.py       # engine comparison
 │
 ├── validation/                    # ✅ Essential testing (2 categories)
 │   ├── integration/

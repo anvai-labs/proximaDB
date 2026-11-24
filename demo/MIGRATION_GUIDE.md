@@ -198,7 +198,7 @@ print(f"Vectors: {info.get('vector_count', 0)}")
 ### gRPC API (integer codes)
 - `0` = Auto-select (recommended)
 - `1` = SST (write-optimized)
-- `2` = VIPER (columnar analytics)
+- `2` = SST (write-optimized)
 - `3` = NOVA (progressive search)
 - `4` = SWIFT (low-latency)
 - `5` = RAPTOR (adaptive)
@@ -206,7 +206,7 @@ print(f"Vectors: {info.get('vector_count', 0)}")
 
 ### REST API (string names)
 - `"auto"` = Auto-select
-- `"sst"`, `"viper"`, `"nova"`, `"swift"`, `"raptor"`, `"helix"` = Specific engines
+- `"sst"`, `"nova"`, `"nova"`, `"swift"`, `"raptor"`, `"helix"` = Specific engines
 
 ## Common Migration Tasks
 

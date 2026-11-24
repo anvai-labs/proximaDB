@@ -222,7 +222,7 @@ def test_performance_data_models_and_helper_factories():
         precision=0.8,
     )
     engine = EnginePerformance(
-        engine_name="viper",
+        engine_name="nova",
         insert_metrics=metrics,
         flush_time_ms=3.0,
         storage_size_mb=1.5,
@@ -240,8 +240,8 @@ def test_performance_data_models_and_helper_factories():
         total_queries_executed=2,
         avg_insert_latency_ms=1.2,
         avg_search_latency_ms=2.3,
-        best_engine_insert="viper",
-        best_engine_search="viper",
+        best_engine_insert="nova",
+        best_engine_search="nova",
         recommendations=["keep baseline"],
     )
     report = PerformanceReport(
@@ -253,13 +253,13 @@ def test_performance_data_models_and_helper_factories():
             create_validation_result(
                 "latency", 3.0, 2.0, threshold=2.0, comparator="<="
             ),
-            create_validation_result("exact", "viper", "viper"),
+            create_validation_result("exact", "nova", "nova"),
         ],
         summary=summary,
         competitor_comparison={"other": {"latency": 5.0}},
     )
 
-    assert report.benchmark_results[0].engine_results[0].engine_name == "viper"
+    assert report.benchmark_results[0].engine_results[0].engine_name == "nova"
     assert report.validation_results[0].status == ValidationStatus.PASS
     assert report.validation_results[1].status == ValidationStatus.FAIL
     assert report.validation_results[2].status == ValidationStatus.PASS
@@ -302,7 +302,7 @@ def test_proto_converter_distance_storage_index_mappings():
     assert ProtoConverter.storage_engine_to_int("unknown") == 2
     # mmap is a KNOWN engine that maps to the viper int slot (pre-existing
     # table); only unknown/None fall back to SST now.
-    assert ProtoConverter.storage_engine_to_str("mmap") == "viper"
+    assert ProtoConverter.storage_engine_to_str("mmap") == "sst"
     assert ProtoConverter.storage_engine_to_str(3) == "nova"
     assert ProtoConverter.storage_engine_to_str("unknown") == "sst"
 

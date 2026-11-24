@@ -396,19 +396,19 @@ in the Current Matrix stay authoritative for API-level claims. `StorageEngineStr
 | The safe default for adoption and examples.
 
 | VIPER
-| Deprecated
-| `Viper` variant, factory-reachable, ungated (stage 1). Columnar Parquet with advanced quantization; analytics-leaning. DEPRECATED per ADR-093 — staged retirement in progress (TD-VIPER-1).
-| Do NOT create new VIPER collections: use SST (Supported), NOVA (columnar-analytics vector), or the DataFusion/Parquet path (analytics). Existing collections remain readable; stage 2 rejects new selections at the collection boundary while preserving legacy reads, and stage 3 requires verified migration of all persisted VIPER collections before code removal.
+| Removed
+| `Viper` proto value and string conversions retained for wire compatibility only; the engine implementation was deleted (ADR-093 stage 3 / TD-VIPER-1 S3, pre-GA clean break). The factory and the collection create/update boundary reject it.
+| Do not reference in new code or docs except as removed. Columnar analytics: NOVA; warehouse analytics: the DataFusion/Parquet path.
 
 | HELIX
 | Beta
 | `Helix` variant, factory-reachable, ungated. Spatial-locality vector storage (Hilbert-curve clustering, zone maps).
-| Same Beta cap as VIPER; see also TD-HELIX-1.
+| Same Beta cap as NOVA; see also TD-HELIX-1.
 
 | NOVA
 | Beta
 | `Nova` variant, factory-reachable, ungated. Columnar analytics engine with hierarchical statistics and integrated quantization.
-| Same Beta cap as VIPER/HELIX.
+| Same Beta cap as HELIX/NOVA.
 
 | TST (TimeSeries)
 | Beta
@@ -447,7 +447,7 @@ in the Current Matrix stay authoritative for API-level claims. `StorageEngineStr
 
 | CHRONO
 | Removed
-| `Chrono` variant and proto value retained for wire compatibility only; the factory returns an error ("use SST, VIPER, HELIX, or NOVA").
+| `Chrono` variant and proto value retained for wire compatibility only; the factory returns an error ("use SST, HELIX, or NOVA").
 | Do not reference in new code or docs except as removed.
 
 | TITAN

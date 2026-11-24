@@ -12,7 +12,8 @@ Rules are declarative (regex + allow-list), not asciidoc-table parsing (brittle)
   1. Retired graph engines PULSAR/QUASAR may appear ONLY in allow-listed
      retirement/migration docs. Anywhere else is a violation (use ORION).
   2. Claims of 4/6 supported storage engines are wrong — SST is Supported;
-     VIPER/HELIX/NOVA are Beta; SWIFT/RAPTOR are Experimental.
+     HELIX/NOVA are Beta; SWIFT/RAPTOR are Experimental; VIPER is removed
+     (ADR-093) and may only appear in retirement/migration docs.
   3. SWIFT, RAPTOR, and Arrow Flight are experimental: any in-scope doc that
      mentions one of them must ALSO carry the word "experimental" (the
      off-by-default caveat). A doc listing them as supported without that caveat

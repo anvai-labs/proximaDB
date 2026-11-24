@@ -49,7 +49,7 @@ that the leaf name is unique repository-wide.
 Prefer prefixes in this priority order:
 
 1. *Engine / layer name* (most specific): `SstQueryCacheStats`,
-   `ViperFactoryCompactionConfig`, `OrionTraversalStats`,
+   `OrionTraversalStats`,
    `RelationalRouteStats`.
 2. *Module path leaf* when no canonical engine name exists:
    `MultimodalGraphStoreParticipant`, `ColumnarUtilsOperationMetrics`,
@@ -101,7 +101,7 @@ all callers have migrated to the new name.
 
 == Engines → formats convergence
 
-ProximaDB's storage "engines" (SST, VIPER, HELIX, NOVA, SWIFT, RAPTOR,
+ProximaDB's storage "engines" (SST, HELIX, NOVA, SWIFT, RAPTOR,
 …) are conceptually *format/layout specializations*. The catalog layer
 already speaks this vocabulary (`CatalogPhysicalFormat`,
 `CatalogStorageLayoutKind`); the runtime is converging on it. Following

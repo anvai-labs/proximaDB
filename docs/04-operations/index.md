@@ -238,7 +238,7 @@ sudo systemctl start proximadb
 
 What a backup contains:
 
-- **Every local root**: `data_dir`, metadata, storage locations, WAL, SST/VIPER data. Files are copied byte for byte and SHA-256 checksummed.
+- **Every local root**: `data_dir`, metadata, storage locations, WAL, SST data. Files are copied byte for byte and SHA-256 checksummed.
 - **`manifest.json`, written last and atomically.** A directory without a manifest is an incomplete backup, and restore refuses it.
 - **Not included:**
   - object-storage roots: they are listed as *uncovered* and a warning is printed;
@@ -300,8 +300,9 @@ worker_threads = 8  # Set to CPU cores
 | Analytical SQL | Relational table + `ALTER TABLE … MATERIALIZE` | Routes to DataFusion over Parquet |
 | Mixed read/write layout | NOVA collection | Beta; measure against SST first |
 
-VIPER is deprecated and SWIFT/RAPTOR are experimental (deleted in roadmap v0.6); do not create
-new collections on them. See the storage engine guide (`docs/05-concepts/storage-engines.adoc`).
+VIPER was removed (ADR-093 stage 3) and SWIFT/RAPTOR are experimental (deleted in roadmap
+v0.6); do not create new collections on them. See the storage engine guide
+(`docs/05-concepts/storage-engines.adoc`).
 
 ---
 

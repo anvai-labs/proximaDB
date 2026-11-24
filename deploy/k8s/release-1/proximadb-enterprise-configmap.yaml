@@ -80,7 +80,6 @@ data:
     
     # Enhanced Storage Engine Configuration
     sst_tenant_partitioning = true
-    viper_domain_awareness = true
     nova_multi_tenant_zones = true
     swift_tenant_superblocks = true
     raptor_domain_adaptation = true

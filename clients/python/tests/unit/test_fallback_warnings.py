@@ -32,7 +32,7 @@ class TestFallbackWarnings:
                     "name": "test_collection",
                     "dimension": 128,
                     "distance_metric": "manhattan",  # Now supported natively
-                    "storage_engine": "viper",
+                    "storage_engine": "sst",
                     "primary_indexing_algorithm": "hnsw",
                 },
                 "created_at": 1643723400,
@@ -75,7 +75,7 @@ class TestFallbackWarnings:
                     "name": "test_collection",
                     "dimension": 256,
                     "distance_metric": "cosine",
-                    "storage_engine": "viper",  # Server fell back to viper
+                    "storage_engine": "sst",  # Server fell back to sst
                     "primary_indexing_algorithm": "hnsw",
                 },
                 "created_at": 1643723400,
@@ -113,7 +113,7 @@ class TestFallbackWarnings:
                     "name": "test_collection",
                     "dimension": 384,
                     "distance_metric": "cosine",
-                    "storage_engine": "viper",
+                    "storage_engine": "sst",
                     "primary_indexing_algorithm": "lsh",  # Now supported natively
                 },
                 "created_at": 1643723400,
@@ -154,7 +154,7 @@ class TestFallbackWarnings:
                     "name": "test_collection",
                     "dimension": 512,
                     "distance_metric": "hamming",  # Now supported natively (no fallback)
-                    "storage_engine": "viper",  # Fell back from hybrid
+                    "storage_engine": "sst",  # Fell back from hybrid
                     "primary_indexing_algorithm": "lsh",  # Now supported natively (no fallback)
                 },
                 "created_at": 1643723400,
@@ -186,7 +186,7 @@ class TestFallbackWarnings:
             # Indexing algorithm should NOT be in fallback warning anymore
             assert "lsh" not in warning_message or "fallback" not in warning_message
             # Only storage engine fallback should be present
-            assert "hybrid" in warning_message and "viper" in warning_message
+            assert "hybrid" in warning_message and "sst" in warning_message
             assert "server decision" in warning_message
 
     @patch("proximadb_sdk.protocols.rest_sync.ProximaDBClient._make_request")
@@ -200,7 +200,7 @@ class TestFallbackWarnings:
                     "name": "test_collection",
                     "dimension": 128,
                     "distance_metric": "manhattan",  # Now supported natively
-                    "storage_engine": "viper",
+                    "storage_engine": "sst",
                     "primary_indexing_algorithm": "lsh",  # Now supported natively
                 },
                 "created_at": 1643723400,
@@ -215,7 +215,7 @@ class TestFallbackWarnings:
             name="test_supported_config",
             dimension=128,
             distance_metric=DistanceMetric.MANHATTAN,  # Now fully supported (previously fallback)
-            storage_engine=StorageEngine.VIPER,  # Supported
+            storage_engine=StorageEngine.NOVA,  # Supported
             primary_indexing_algorithm=IndexingAlgorithm.LSH,  # Now fully supported (previously fallback)
         )
 
