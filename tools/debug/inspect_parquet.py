@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Inspect VIPER parquet files in detail"""
+"""Inspect columnar parquet files in detail"""
 
 import pyarrow.parquet as pq
 import pandas as pd
@@ -87,7 +87,7 @@ if __name__ == "__main__":
     import re
     
     # Run the test to get file path
-    print("🚀 Running VIPER debug test to generate files...")
+    print("🚀 Running the debug test to generate files...")
     result = subprocess.run(
         ["cargo", "test", "viper::tests::debug_compaction_test::test_viper_flush_and_compaction_debug", "--", "--nocapture"],
         capture_output=True,

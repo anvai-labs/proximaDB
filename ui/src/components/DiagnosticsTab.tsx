@@ -58,7 +58,7 @@ const DiagnosticsTab: React.FC = () => {
             thread_count: 64,
           },
           configuration: {
-            storage_engines: ['SST', 'VIPER', 'NOVA', 'SWIFT', 'RAPTOR', 'PRISM', 'HELIX'],
+            storage_engines: ['SST', 'NOVA', 'SWIFT', 'RAPTOR', 'PRISM', 'HELIX'],
             cache_size_mb: 2048,
             max_connections: 1000,
             query_timeout_ms: 30000,

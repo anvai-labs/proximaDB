@@ -16,7 +16,7 @@ def create_collection(collection_name: str, port: int = 5678) -> bool:
             "name": collection_name,
             "dimension": 128,
             "distance_metric": "cosine",
-            "storage_engine": "VIPER"
+            "storage_engine": "NOVA"
         }
     }
     response = requests.post(url, json=data)

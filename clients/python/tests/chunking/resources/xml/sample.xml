@@ -154,7 +154,7 @@
             <cacheSize unit="GB">1</cacheSize>
         </engine>
 
-        <engine name="viper" enabled="true">
+        <engine name="nova" enabled="true">
             <parquet>
                 <rowGroupSize>1000000</rowGroupSize>
                 <compression>snappy</compression>
