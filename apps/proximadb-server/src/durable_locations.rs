@@ -115,16 +115,23 @@ pub(crate) fn effective_durable_locations(
         );
     }
     {
-        let effective_root = durability
-            .effective_wal_root(
+        // Review round 1 (MED-2): the entry's effective root must fold the
+        // ENV root in too — the engine's env>TOML>default ladder, so the
+        // record, the boot log and write placement agree on ONE root.
+        let explicit = env("PROXIMADB_WAL_LOCAL_DIR")
+            .map(|dir| dir.trim().trim_end_matches('/').to_string())
+            .filter(|dir| !dir.is_empty())
+            .or_else(|| {
                 config
                     .storage
                     .wal_config
                     .wal_local_dir
                     .as_deref()
-                    .map(|dir| dir.trim().trim_end_matches('/'))
-                    .filter(|dir| !dir.is_empty()),
-            )
+                    .map(|dir| dir.trim().trim_end_matches('/').to_string())
+                    .filter(|dir| !dir.is_empty())
+            });
+        let effective_root = durability
+            .effective_wal_root(explicit.as_deref())
             .unwrap_or_else(|| {
                 config
                     .storage
@@ -133,13 +140,33 @@ pub(crate) fn effective_durable_locations(
                     .trim_end_matches('/')
                     .to_string()
             });
+        // Review round 1 (HIGH-1): materialize the local default WAL root
+        // now (it lives inside the leased data_dir, so this stays within
+        // the lease) and record its CANONICALIZED spelling — with the dir
+        // existing, cold backup's canonicalize-with-fallback resolves the
+        // same symlinked path the lease plan canonicalizes, so an
+        // unresolved /var vs /private/var mismatch can no longer falsely
+        // fail the unleased-state check on symlinked hosts.
+        let location = match local_path(&effective_root) {
+            Some(path)
+                if explicit.is_none()
+                    && durability.default_wal_root.is_some()
+                    && !path.exists() =>
+            {
+                std::fs::create_dir_all(&path).ok();
+                std::fs::canonicalize(&path)
+                    .map(|canonical| canonical.display().to_string())
+                    .unwrap_or(effective_root.clone())
+            }
+            _ => effective_root.clone(),
+        };
         push(
             &format!(
                 "[storage.wal_config] durability_mode ({} — {})",
                 durability.mode,
                 durability.source.label(),
             ),
-            effective_root,
+            location,
             Some(durability.mode),
         );
     }
@@ -335,17 +362,15 @@ mod tests {
             Some(DurabilityMode::LocalVolume)
         );
         assert!(mode_entry.source.contains("local_volume"));
-        assert!(
-            mode_entry.location.ends_with("/wal"),
-            "defaulted root {{data_dir}}/wal: {}",
-            mode_entry.location
-        );
-        assert!(
-            mode_entry
-                .location
-                .starts_with(temp.path().display().to_string().as_str()),
-            "root lives under data_dir: {}",
-            mode_entry.location
+        // Review round 1 (HIGH-1): the entry records the CANONICALIZED
+        // spelling of the materialized default root, so symlinked hosts
+        // (/var vs /private/var) match the canonicalized lease.
+        let canonical = std::fs::canonicalize(temp.path().join("wal"))
+            .expect("default root materialized");
+        assert_eq!(
+            mode_entry.location,
+            canonical.display().to_string(),
+            "defaulted root {{data_dir}}/wal, canonicalized"
         );
     }
 

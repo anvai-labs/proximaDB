@@ -12,6 +12,23 @@
 | Relates to | TD-WAL-1 (implements `local_volume`), TD-WAL-5 (resolved replay-root fix), TD-SEAM-14 (spill durability/ownership boundary — owns that detail; see *Coordination* below), ADR-063 D3/D4, ADR-069 D1, ADR-095 D1; registry rows `PROXIMADB_WAL_LOCAL_DIR`, `PROXIMADB_WAL_DURABILITY_MODE`
 |===
 
+
+*Amended 2026-11-25 (review round 1):* three corrections. (1) **Embedded scope:** the
+default-root move applies to the SERVER path only — embedded bindings construct
+`SharedServices` directly (no `ProximaDB::new`), so `data_dir=None` and WAL placement
+keeps the legacy co-located form; internally consistent (write+replay agree), but identical
+config files yield different WAL roots on server vs embedded — pinned as a known difference,
+to be unified if embedded adopts `ProximaDB::new`. (2) **Mixed-shape callout (reasoned):**
+`storage_locations = [s3://…]` with a default/local `write_buffer_directory` infers
+`local_volume` from the LOCAL buffer dir (the ladder's input is the pre-overwrite
+`data_directories[0]`), flipping WAL placement from the catalog's s3 assignment to
+`{data_dir}/wal` — recovery-safe (the catalog base is still scanned; legacy files are
+replayed then deleted) but an availability posture flip for ephemeral-disk serverless
+deployments; such deployments MUST declare `durability_mode = "object_store_serverless"`.
+(3) **Record root:** the durable_locations entry folds the env root into its effective root
+(env>TOML>default, matching the engine) and materializes the local default `{data_dir}/wal`
+at record time so symlinked-host cold backups canonicalize both sides identically.
+
 == Problem
 
 * `wal_local_dir` is opt-in. When unset, the WAL follows the catalog `base_location` or
