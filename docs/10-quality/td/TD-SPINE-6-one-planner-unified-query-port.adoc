@@ -73,7 +73,9 @@
   sets `cache: None`); if it is ever enabled it must honor this mode at that seam.
 . **Identity.** New `UnifiedQueryPortContext { identity: PortIdentity, freshness }` on every port
   method. `/api/v2/query` now extracts `ResolvedRequestIdentity` (the same fail-closed contract as
-  `/api/v2/sql`); the canonical `/sql` handler passes `PortIdentity::for_tenant(scoped_tenant)`;
+  `/api/v2/sql`); the canonical `/sql` handler passes `PortIdentity::for_tenant(scoped_tenant)`
+  (that handler is currently unrouted since the v1 surface removal — TD-V1SUNSET-1 — but remains
+  the canonical module's SQL entry and is exercised in-process by the parity suite);
   MCP passes its configured tenant; the multimodal `/api/v2/unified/*` handlers take
   `Option<Extension<ResolvedRequestIdentity>>`. The task-local `request_scope` remains ONLY as
   the documented fallback (bare-mounted test routers; the federated lowering's own scope
