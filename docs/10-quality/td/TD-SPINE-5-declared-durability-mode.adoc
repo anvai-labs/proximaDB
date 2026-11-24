@@ -5,11 +5,11 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | **Open** (filed 2026-11-19).
+| Status | **Implemented (2026-11-24)** — PR pending; see Evidence.
 | Priority | **HIGH**. Operators cannot tell from config or logs whether an ack means "fsync'd on a local volume" (ADR-069) or "durable and LISTable on object storage" (ADR-063 D3). The guard only warns, and only checks `write_buffer_directory`.
-| Component | `src/storage/persistence/write_ahead_log/config.rs` (`wal_local_dir` :335-347, default `None` :392); `write_ahead_log/mod.rs` (`local_wal_dir` :133, effective base location :1704-1711); `recovery_manager.rs` (:48, :104); `src/network/shared_services.rs` (warning guard :3523-3551); `apps/proximadb-server/src/main.rs` (`rebase_default_relative_paths` :569-638); `durable_locations.rs`; `config/config.toml` `[storage.wal_config]`.
+| Component | `src/storage/persistence/write_ahead_log/config.rs` (`DurabilityMode`, `resolve_durability_mode`, env reader); `src/core/config.rs` (`WriteBufferUserConfig::durability_mode` / `resolved_durability` / `resolve_durability_mode` / `apply_durability_mode_resolution` / `effective_wal_local_dir`); `src/database.rs` (boot stamp); `src/network/shared_services.rs` (`convert_toml_to_wal_config` — resolution log replacing the warning guard); `src/storage/engine.rs` (replay-manager root/mode); `recovery_manager.rs` (mode log; legacy-root candidate bases); `apps/proximadb-server/src/durable_locations.rs` (`durability_mode` field); `apps/proximadb-server/tests/object_store_restart_recovery.rs` (declares `object_store_serverless`); `config/config.toml`; `docs/12-design/ENV_GATE_REGISTRY.adoc`.
 | Authority | link:../../12-design/adr/ADR-098-metadata-spine.adoc[ADR-098] D3 (seam S2)
-| Relates to | TD-WAL-1 (implements `local_volume`), TD-WAL-5 (resolved replay-root fix), TD-SEAM-14 (spill durability/ownership boundary — owns that detail), ADR-063 D3/D4, ADR-069 D1, ADR-095 D1; registry row `PROXIMADB_WAL_LOCAL_DIR`
+| Relates to | TD-WAL-1 (implements `local_volume`), TD-WAL-5 (resolved replay-root fix), TD-SEAM-14 (spill durability/ownership boundary — owns that detail; see *Coordination* below), ADR-063 D3/D4, ADR-069 D1, ADR-095 D1; registry rows `PROXIMADB_WAL_LOCAL_DIR`, `PROXIMADB_WAL_DURABILITY_MODE`
 |===
 
 == Problem
@@ -43,3 +43,121 @@
 * `wal_fsync_crash_recovery.rs`, `cold_backup_restore.rs` and `object_store_restart_recovery.rs`
   green; boot log names the mode in each.
 * Coordinated with the TD-SEAM-14 owner so spill placement resolves to one of the two modes.
+
+== Implementation notes (2026-11-24)
+
+* **Config.** `[storage.wal_config].durability_mode = "local_volume" |
+  "object_store_serverless"` (serde-exact spellings; an unknown DECLARED value
+  fails the config load — fail-fast applies only to the declared key, never to
+  an existing config). Env mirror `PROXIMADB_WAL_DURABILITY_MODE`
+  (registry row: tier config-mirror; unset ⇒ INFER — this is not a
+  kill-switch and gates nothing off; an invalid value is logged at error and
+  treated as unset per the ADR-098 D3 no-boot-break rule).
+* **Resolution (one pure ladder).**
+  `write_ahead_log::config::resolve_durability_mode(declared, wal_local_dir,
+  primary_wal_location, data_dir)`: declared wins; else a set global
+  `wal_local_dir` (env > TOML) ⇒ `local_volume`; else the scheme of the
+  primary WAL location (`write_buffer_directory` — the pre-overwrite
+  `data_directories[0]`): object URL (`://` and not `file:`) ⇒
+  `object_store_serverless`, local path ⇒ `local_volume` **with the WAL root
+  defaulting to `file://{data_dir}/wal`**. `data_dir: None` (a conversion that
+  cannot know it) skips only the default-root move, never the mode.
+* **One stamp, stable evidence.** `ProximaDB::new` (server AND embedded —
+  `main.rs` boots through it) calls
+  `WriteBufferUserConfig::apply_durability_mode_resolution(&server.data_dir)`
+  ONCE, caching the resolution on the user config. Every later conversion
+  (`to_engine_config`, `engine.rs`'s replay manager, `SharedServices`)
+  reads the CACHED resolution, so the `{data_dir}/wal` default flows to write
+  path AND replay (TD-WAL-5's one-root rule) while the boot log keeps the
+  ORIGINAL inference evidence (a naive stamp into `wal_local_dir` would have
+  degraded a re-resolution's evidence to "wal_local_dir set").
+* **The loud log** replaces the former ADR-069 S1 remote-WAL warning in
+  `SharedServices::convert_toml_to_wal_config` (INFO):
++
+```
+durability_mode=local_volume resolved_from="primary WAL location scheme" \
+evidence="./data/write_buffer" effective_wal_root="file:///data/wal" \
+wal_root_defaulted=true \
+pin_with="[storage.wal_config].durability_mode (env PROXIMADB_WAL_DURABILITY_MODE)" \
+"ADR-098 D3 / TD-SPINE-5: WAL durability mode resolved — no silent legacy path"
+```
++
+The old guard's error/warn (remote `write_buffer_directory` + PerBatch) is
+GONE by design: under ADR-098 D3 an object-store WAL is the *declared
+posture*, not a misconfiguration; the contradictory shape (declared
+`object_store_serverless` + explicit `wal_local_dir`) logs a WARN naming both.
+* **Recovery.** `RecoveryManager::new` logs the mode + resolved root.
+  `wal_candidate_bases` already unions, in order: the resolved WAL root (now
+  possibly the `{data_dir}/wal` default), the catalog base, every manifest
+  `storage_url`, and the configured primary base — the catalog and primary
+  bases ARE the legacy co-located roots, so replay scans the configured root
+  AND the legacy root; the upgrade ratchet below pins it.
+* **Recording.** `durable_locations` gains an additive `durability_mode`
+  field (`serde(default)` — pre-SPINE-5 records read back with `None`),
+  carried on every WAL-serving entry; the resolution itself is an entry
+  (source = `[storage.wal_config] durability_mode ({mode} — {label})`,
+  location = the effective WAL root: explicit root, `{data_dir}/wal` default,
+  or the primary WAL location under serverless). The defaulted root lives
+  under `data_dir`, already a leased root, so cold backup's unleased check is
+  unaffected.
+* **Serverless e2e.** `object_store_restart_recovery.rs` now DECLARES
+  `durability_mode = "object_store_serverless"` in its `[storage.wal_config]`,
+  so the proof no longer rides on inference.
+
+== Coordination — TD-SEAM-14 (spill durability boundary)
+
+TD-SEAM-14 owns the object-store spill placement durability/ownership boundary
+(`src/services/spill_placement.rs`; runtime owner fence, epoch-stamped
+segments, durability-boundary spec — per its design handoff). Its vocabulary
+is `OwnerFence` / `OwnerMarker` / epoch-stamped `spill-{epoch}-{range}.parquet`
+segment names — **no `durability_mode` key, enum, or config surface**, so this
+TD's vocabulary (`DurabilityMode`, `durability_mode`,
+`PROXIMADB_WAL_DURABILITY_MODE`) does not collide with the seam. Per ADR-098
+D3, whatever durability boundary SEAM-14 documents for spill must resolve to
+one of these two modes; when its durability-boundary spec lands
+(`docs/10-quality/td/TD-SEAM-14-durability-boundary.adoc`, planned), it should
+REFERENCE `DurabilityMode` rather than mint a third mode.
+
+== Evidence (2026-11-24)
+
+* **Inference, local scheme + default root (ratchet):**
+  `spine5_local_scheme_infers_local_volume_with_default_root` — local
+  `write_buffer_directory` ⇒ `local_volume`, root
+  `file://{data_dir}/wal`, and the resolved root's scheme is local.
+* **Inference, object scheme (ratchet):**
+  `spine5_object_scheme_infers_serverless_without_local_root` — `s3://`,
+  `az://`, `gcs://` primaries ⇒ `object_store_serverless`, NO local default
+  root (per-collection WAL stays under the catalog base).
+* **Declared wins, both directions:** `spine5_declared_mode_wins_over_inference`;
+  a declared `local_volume` over an object primary still gets the
+  `{data_dir}/wal` default. User-config level:
+  `declared_toml_mode_wins`, `durability_mode_toml_default_and_rejection`
+  (unset ⇒ None/infer; unknown declared value FAILS the load).
+* **`wal_local_dir` ⇒ local_volume:** `spine5_wal_local_dir_infers_local_volume`
+  (suppresses the default root);
+  `explicit_wal_local_dir_wins_over_the_default_root`.
+* **Boot stamp:** `boot_stamp_infers_local_volume_and_defaults_the_root`,
+  `boot_stamp_is_idempotent_and_evidence_stable` (re-resolution keeps the
+  ORIGINAL PrimaryScheme evidence after the root is in force),
+  `to_engine_config_carries_mode_and_effective_root` (unstamped conversions
+  resolve the mode but apply no root move — legacy placement).
+* **Upgrade ratchet:** `spine5_legacy_root_wal_replays_after_the_default_root_move`
+  — a WAL written at the legacy co-located root REPLAYS under the
+  upgrade-shaped config (defaulted `wal_local_dir` + legacy primary base),
+  proving recovery scans the configured root AND the legacy root.
+* **Recording:** `wal_durability_mode_recorded_local_volume_default_root`,
+  `wal_durability_mode_recorded_object_store_serverless`,
+  `declared_durability_mode_wins_in_the_record`,
+  `pre_spine5_record_reads_back_without_a_mode` (mixed-version record
+  negative control), `record_round_trips` extended with the mode field.
+* **Mutation check (observed, then restored):** hardcoding
+  `resolve_durability_mode` to return `ObjectStoreServerless` flips
+  `spine5_local_scheme_infers_local_volume_with_default_root` AND
+  `boot_stamp_infers_local_volume_and_defaults_the_root` red (mode + root
+  assertions); hardcoding `LocalVolume` flips
+  `spine5_object_scheme_infers_serverless_without_local_root` and the
+  durable-locations serverless record test red. The inference is load-bearing.
+* **Suites:** `wal_fsync_crash_recovery`, `cold_backup_restore`,
+  `object_store_restart_recovery` — see the PR body for the exact runs
+  (the object-store suite is credential-gated and runs via
+  `scripts/prove_object_store_durability.sh`).

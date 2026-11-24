@@ -1162,7 +1162,13 @@ impl SharedServices {
         // 🚀 Create VectorOperationsService directly for 40-60% performance improvement
         // Use WAL config from TOML configuration
         debug!("🔧 SharedServices::new - Converting WAL config from TOML...");
-        let mut wal_config = Self::convert_toml_to_wal_config(&storage_config.wal_config);
+        // TD-SPINE-5: the boot resolution needs `server.data_dir` for the
+        // local_volume `{data_dir}/wal` default root; without a full config
+        // (direct/test construction) the mode still resolves and logs, only
+        // the default-root move is skipped.
+        let wal_data_dir = opt_config.map(|config| config.server.data_dir.clone());
+        let mut wal_config =
+            Self::convert_toml_to_wal_config(&storage_config.wal_config, wal_data_dir.as_deref());
 
         // Override data_directories with storage_locations if available
         // This ensures embedded mode and config-specified storage locations are honored
@@ -3506,37 +3512,44 @@ impl SharedServices {
     /// Convert TOML WALConfig to internal WALConfig
     fn convert_toml_to_wal_config(
         toml_config: &crate::core::config::WriteBufferUserConfig,
+        data_dir: Option<&std::path::Path>,
     ) -> crate::storage::persistence::write_ahead_log::config::WALConfig {
-        // ADR-069 S1 guardrail: the WAL belongs on a local reattachable disk
-        // (object-store WAL was the pre-pivot architecture and pays an I/O
-        // round-trip per append). Warn — at `error` level when a durability-
-        // sensitive `sync_mode` is also set, because an object store does not
-        // honour `fsync` the way a local block device does, so a remote WAL +
-        // PerBatch/Always makes a durability claim that does not hold. A bare
-        // path (no `scheme://`) is local (resolved to `file://`).
+        // TD-SPINE-5 (ADR-098 D3): the durability-mode resolution REPLACES the
+        // former ADR-069 S1 "WAL on a remote scheme" warning. An object-store
+        // WAL is not a misconfiguration to warn about — it is the declared
+        // `object_store_serverless` posture (ADR-063 D3: an ack means durable
+        // AND LISTable), and `local_volume` (ADR-069 D1: fsync on a local
+        // reattachable volume) is the other. Exactly one applies, resolved at
+        // boot — declared, or inferred from one deterministic input — and
+        // logged HERE so operators can see which contract an ack carries.
+        let resolution = toml_config.resolve_durability_mode(data_dir);
+        // Env-aware effective root (env > TOML > the resolution's default).
+        let effective_wal_root = toml_config
+            .effective_wal_local_dir()
+            .or_else(|| resolution.default_wal_root.clone());
+        tracing::info!(
+            durability_mode = %resolution.mode,
+            resolved_from = %resolution.source.label(),
+            evidence = %resolution.evidence,
+            effective_wal_root = ?effective_wal_root,
+            wal_root_defaulted = resolution.default_wal_root.is_some(),
+            pin_with = "[storage.wal_config].durability_mode (env PROXIMADB_WAL_DURABILITY_MODE)",
+            "ADR-098 D3 / TD-SPINE-5: WAL durability mode resolved — no silent legacy path"
+        );
+        // Contradictory explicit config: a declared/inferred serverless mode
+        // alongside an explicit local WAL root. The explicit root keeps
+        // governing placement (config is king), so say so loudly instead of
+        // silently picking one.
+        if resolution.mode
+            == crate::storage::persistence::write_ahead_log::DurabilityMode::ObjectStoreServerless
+            && effective_wal_root.is_some()
         {
-            let dir = toml_config.write_buffer_directory.trim();
-            let is_remote = dir.contains("://") && !dir.starts_with("file:");
-            if is_remote {
-                let sync = toml_config.sync_mode.to_lowercase();
-                if matches!(sync.as_str(), "perbatch" | "always") {
-                    tracing::error!(
-                        wal_dir = %dir,
-                        sync_mode = %toml_config.sync_mode,
-                        "ADR-069 S1: WAL write_buffer_directory is on a remote (object-store) \
-                         scheme with a durability-sensitive sync_mode — object stores do not \
-                         honour fsync like a local disk, so the durability claim is not trustworthy. \
-                         Move the WAL to a local file:// path."
-                    );
-                } else {
-                    tracing::warn!(
-                        wal_dir = %dir,
-                        "ADR-069 S1: WAL write_buffer_directory is on a remote (object-store) \
-                         scheme; ADR-069 places the WAL on local disk. Remote WAL pays an I/O \
-                         round-trip per append."
-                    );
-                }
-            }
+            tracing::warn!(
+                durability_mode = %resolution.mode,
+                wal_local_dir = ?effective_wal_root,
+                "durability_mode is object_store_serverless but an explicit wal_local_dir is \
+                 set — the explicit root governs WAL placement; remove one of the two"
+            );
         }
 
         // TD-CONFIG-CONSOLIDATE-1 step 2: delegate the field-mapping to the SINGLE
@@ -3545,7 +3558,16 @@ impl SharedServices {
         // `enable_wal` (the embedded path intentionally keeps it off). Removes the
         // dual-maintenance drift where every new WAL field had to be wired into BOTH
         // converters (the wal_local_dir near-miss during ADR-069 S1).
-        let mut cfg = toml_config.to_engine_config();
+        // TD-SPINE-5: attach the resolution to the config handed to the
+        // conversion so the {data_dir}/wal default root reaches the engine
+        // WALConfig even when this SharedServices was built without the
+        // ProximaDB::new boot stamp (direct construction). Cached-when-present,
+        // so this is a no-op on the normal boot path.
+        let mut effective_toml = toml_config.clone();
+        if effective_toml.resolved_durability.is_none() {
+            effective_toml.resolved_durability = Some(resolution);
+        }
+        let mut cfg = effective_toml.to_engine_config();
         cfg.enable_optimized_writer = toml_config.enable_wal;
         cfg
     }

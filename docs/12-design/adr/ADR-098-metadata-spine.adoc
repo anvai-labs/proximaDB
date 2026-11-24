@@ -151,6 +151,13 @@ sharded).
 * The object-store spill placement durability/ownership boundary is TD-SEAM-14's and is not
   restated here; it must resolve to one of these two modes.
 
+Implemented 2026-11-24 (TD-SPINE-5): the declared key is
+`[storage.wal_config].durability_mode` (env mirror `PROXIMADB_WAL_DURABILITY_MODE`,
+registry tier config-mirror; unset ⇒ infer — not a kill-switch); the resolution ladder,
+the `{data_dir}/wal` default-root move, the legacy-root recovery scan, and the
+`durable_locations` recording are specified and evidenced in
+link:../../10-quality/td/TD-SPINE-5-declared-durability-mode.adoc[TD-SPINE-5].
+
 === D4 — Encodings by layer, and S4 metadata hygiene
 
 . **Encodings.**

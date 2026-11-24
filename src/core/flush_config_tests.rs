@@ -48,6 +48,9 @@ mod tests {
             enable_wal: false,
             global_manifest_url: None,
             wal_local_dir: None,
+            // TD-SPINE-5 (ADR-098 D3): unset ⇒ inferred at boot.
+            durability_mode: None,
+            resolved_durability: None,
             // ADR-069 tiered-flush knobs.
             flush_interval_secs: 300,
             flush_floor_predicted_mb: 128,

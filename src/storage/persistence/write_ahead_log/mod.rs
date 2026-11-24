@@ -143,11 +143,13 @@ pub(crate) fn local_wal_dir(config: &config::WALConfig) -> Option<String> {
 }
 
 /// ADR-069 S1: the env half of [`local_wal_dir`] (`PROXIMADB_WAL_LOCAL_DIR`),
-/// read once per process. Private on purpose (TD-WAL-5): an env-only read on
-/// the replay side, while the write side also honoured the TOML field, lost
+/// read once per process. `pub(crate)` on purpose (TD-WAL-5): an env-only read
+/// on the replay side, while the write side also honoured the TOML field, lost
 /// acknowledged writes. Every reader — write path AND recovery — must go
-/// through [`local_wal_dir`] with the same `WALConfig`.
-fn local_wal_dir_env() -> Option<String> {
+/// through [`local_wal_dir`] with the same `WALConfig`; the boot durability
+/// resolution (TD-SPINE-5) shares this reader so it merges env > TOML the
+/// same way.
+pub(crate) fn local_wal_dir_env() -> Option<String> {
     static ENV: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     ENV.get_or_init(|| {
         std::env::var("PROXIMADB_WAL_LOCAL_DIR")
@@ -168,7 +170,10 @@ pub use compaction_coordinator::{
     CompactionStats, CompactionTask,
 };
 pub use config::WriteBufferStrategyType;
-pub use config::{CompressionConfig, PerformanceConfig, WALConfig};
+pub use config::{
+    CompressionConfig, DurabilityMode, DurabilityModeSource, PerformanceConfig,
+    ResolvedDurabilityMode, WALConfig,
+};
 pub use disk_manager::{DiskStats, WalFileInfo, WriteAheadLogDiskManager};
 pub use flush_coordinator::{
     CleanupInstructions, FlushCoordinatorCallbacks, FlushDataSource, FlushState, PendingFlush,

@@ -94,7 +94,12 @@ impl StorageEngine {
         // `WALConfig::default()`, it dropped a config-file `wal_local_dir`, and
         // replay never listed the segments written there: acknowledged writes
         // were lost on a crash before a manifest entry recorded that base.
-        wal_config.wal_local_dir = config.wal_config.wal_local_dir.clone();
+        // TD-SPINE-5: `effective_wal_local_dir` also folds the boot
+        // resolution's `{data_dir}/wal` default (local_volume with no explicit
+        // root) and carries the resolved durability mode, so replay and the
+        // write path keep seeing one root and one mode.
+        wal_config.wal_local_dir = config.wal_config.effective_wal_local_dir();
+        wal_config.durability_mode = Some(config.wal_config.resolve_durability_mode(None).mode);
         wal_config.multi_disk.data_directories = config
             .storage_locations
             .iter()

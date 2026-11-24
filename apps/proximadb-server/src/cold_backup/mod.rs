@@ -955,6 +955,7 @@ mod tests {
             &[durable_locations::DurableLocation {
                 source: "PROXIMADB_WAL_LOCAL_DIR".into(),
                 location: temp.path().join("pod-wal").display().to_string(),
+                durability_mode: None,
             }],
         )
         .expect("record");

@@ -2,6 +2,7 @@ use crate::ai::LLMConfig;
 use crate::network::NetworkConfig;
 use crate::query::unified::RerankConfig;
 use crate::security::SecurityConfig;
+use crate::storage::persistence::write_ahead_log::{DurabilityMode, ResolvedDurabilityMode};
 use proximadb_storage_filesystem_types::ObjectAccessTier;
 use serde::{Deserialize, Serialize};
 use tracing::info;
@@ -1305,6 +1306,26 @@ pub struct WriteBufferUserConfig {
     #[serde(default)]
     pub wal_local_dir: Option<String>,
 
+    /// ADR-098 D3 / TD-SPINE-5 — the DECLARED WAL durability mode. Unset ⇒
+    /// inferred at boot from one deterministic input (the global
+    /// `wal_local_dir` if set ⇒ `local_volume`; else the scheme of the primary
+    /// WAL location — this `write_buffer_directory` field: an object URL ⇒
+    /// `object_store_serverless`, a local path ⇒ `local_volume` with the WAL
+    /// root defaulting to `{data_dir}/wal`). The resolution is logged at INFO
+    /// and recorded in `durable_locations`; there is no silent legacy path and
+    /// no boot break for existing configs. Env mirror:
+    /// `PROXIMADB_WAL_DURABILITY_MODE` (wins over TOML, repo convention).
+    #[serde(default)]
+    pub durability_mode: Option<DurabilityMode>,
+
+    /// TD-SPINE-5: the boot resolution, cached once by
+    /// [`apply_durability_mode_resolution`] so every later conversion reports
+    /// the SAME mode with the SAME original evidence (a re-resolution after
+    /// the default-root move would otherwise degrade its evidence to
+    /// "wal_local_dir set"). Not a TOML key.
+    #[serde(skip)]
+    pub resolved_durability: Option<ResolvedDurabilityMode>,
+
     /// ADR-069 D2 — time-based WAL flush interval (seconds); 0 = disabled. The RPO
     /// floor: bounds worst-case loss on permanent local-volume loss to this interval for
     /// low-traffic collections that never reach the inline size trigger
@@ -1378,6 +1399,8 @@ impl Default for WriteBufferUserConfig {
             enable_wal: true,
             global_manifest_url: None,
             wal_local_dir: None,
+            durability_mode: None,
+            resolved_durability: None,
             // ADR-069 D2: time floor defaults to 300s (RPO safety net; the inline
             // size trigger handles throughput). wal_max_bytes stays 0 → S4 backpressure OFF.
             flush_interval_secs: default_flush_interval_secs(),
@@ -1390,6 +1413,74 @@ impl Default for WriteBufferUserConfig {
 }
 
 impl WriteBufferUserConfig {
+    /// ADR-098 D3 / TD-SPINE-5: resolve the WAL durability mode. Declared
+    /// (`PROXIMADB_WAL_DURABILITY_MODE` > TOML `durability_mode`) wins; else
+    /// a set global `wal_local_dir` (`PROXIMADB_WAL_LOCAL_DIR` > TOML) ⇒
+    /// `local_volume`; else the scheme of `write_buffer_directory` (the
+    /// primary WAL location — `multi_disk.data_directories[0]` before the
+    /// storage-locations overwrite): an object URL ⇒
+    /// `object_store_serverless`, a local path ⇒ `local_volume` with the WAL
+    /// root defaulting to `{data_dir}/wal`. Returns the CACHED boot
+    /// resolution when one exists (stable evidence); `data_dir: None` (callers
+    /// that cannot know it) skips only the default-root move, never the mode.
+    pub fn resolve_durability_mode(
+        &self,
+        data_dir: Option<&std::path::Path>,
+    ) -> crate::storage::persistence::write_ahead_log::config::ResolvedDurabilityMode {
+        use crate::storage::persistence::write_ahead_log::{
+            config::{self, resolve_durability_mode as resolve},
+            local_wal_dir_env,
+        };
+        if let Some(cached) = self.resolved_durability.clone() {
+            return cached;
+        }
+        let declared = config::durability_mode_env().or(self.durability_mode);
+        let wal_local_dir = local_wal_dir_env().or_else(|| {
+            self.wal_local_dir
+                .as_deref()
+                .map(|dir| dir.trim().trim_end_matches('/').to_string())
+                .filter(|dir| !dir.is_empty())
+        });
+        resolve(
+            declared,
+            wal_local_dir.as_deref(),
+            &self.write_buffer_directory,
+            data_dir,
+        )
+    }
+
+    /// TD-SPINE-5 boot stamp: resolve once (see [`Self::resolve_durability_mode`])
+    /// and CACHE the resolution on this config so every later conversion —
+    /// SharedServices, the WAL manifest init, the engine replay managers —
+    /// applies the same mode and the same effective local WAL root
+    /// ([`Self::effective_wal_local_dir`]). Idempotent: an already-resolved
+    /// config is returned unchanged. The boot LOG is emitted where the legacy
+    /// ADR-069 warning stood (`SharedServices::convert_toml_to_wal_config`).
+    pub fn apply_durability_mode_resolution(&mut self, data_dir: &std::path::Path) {
+        if self.resolved_durability.is_some() {
+            return;
+        }
+        let resolution = self.resolve_durability_mode(Some(data_dir));
+        self.resolved_durability = Some(resolution);
+    }
+
+    /// TD-SPINE-5: the global local WAL root in force — env
+    /// `PROXIMADB_WAL_LOCAL_DIR` > TOML `wal_local_dir` > the boot
+    /// resolution's `{data_dir}/wal` default (local_volume with no explicit
+    /// root). `None` ⇒ per-collection WAL under the catalog-derived base
+    /// location (`object_store_serverless` / unresolved legacy).
+    pub fn effective_wal_local_dir(&self) -> Option<String> {
+        use crate::storage::persistence::write_ahead_log::local_wal_dir_env;
+        let explicit = local_wal_dir_env().or_else(|| {
+            self.wal_local_dir
+                .as_deref()
+                .map(|dir| dir.trim().trim_end_matches('/').to_string())
+                .filter(|dir| !dir.is_empty())
+        });
+        self.resolve_durability_mode(None)
+            .effective_wal_root(explicit.as_deref())
+    }
+
     /// Convert user configuration to internal engine configuration.
     ///
     /// This is the SINGLE canonical `WriteBufferUserConfig -> WALConfig` conversion,
@@ -1452,7 +1543,10 @@ impl WriteBufferUserConfig {
             enable_background_compaction: true,
             collection_overrides: std::collections::HashMap::new(),
             global_manifest_url: self.global_manifest_url.clone(),
-            wal_local_dir: self.wal_local_dir.clone(),
+            // TD-SPINE-5: the effective local WAL root (env > TOML > the
+            // boot resolution's {data_dir}/wal default) + the resolved mode.
+            wal_local_dir: self.effective_wal_local_dir(),
+            durability_mode: Some(self.resolve_durability_mode(None).mode),
             enable_optimized_writer: false, // embedded default; server overrides to enable_wal
             optimized_writer_batch_size: None,
             optimized_writer_batch_timeout_ms: None,
@@ -2499,5 +2593,152 @@ impl RLPlannerConfig {
             log_path: self.log_path.clone(),
             default_goal: goal,
         }
+    }
+}
+
+#[cfg(test)]
+mod durability_mode_tests {
+    use super::*;
+    use crate::storage::persistence::write_ahead_log::{DurabilityMode, DurabilityModeSource};
+
+    fn user_config(write_buffer_directory: &str) -> WriteBufferUserConfig {
+        WriteBufferUserConfig {
+            write_buffer_directory: write_buffer_directory.to_string(),
+            ..WriteBufferUserConfig::default()
+        }
+    }
+
+    /// TD-SPINE-5: the boot stamp (`apply_durability_mode_resolution`) infers
+    /// `local_volume` for a local primary scheme and makes the
+    /// `{data_dir}/wal` default root visible to every conversion.
+    #[test]
+    fn boot_stamp_infers_local_volume_and_defaults_the_root() {
+        let data_dir = std::path::Path::new("/srv/pdb");
+        let mut config = user_config("./data/write_buffer");
+        config.apply_durability_mode_resolution(data_dir);
+        let resolution = config.resolve_durability_mode(Some(data_dir));
+        assert_eq!(resolution.mode, DurabilityMode::LocalVolume);
+        assert_eq!(resolution.source, DurabilityModeSource::PrimaryScheme);
+        assert_eq!(
+            config.effective_wal_local_dir().as_deref(),
+            Some("file:///srv/pdb/wal")
+        );
+    }
+
+    /// TD-SPINE-5: the stamp is IDEMPOTENT and the cached resolution keeps
+    /// its ORIGINAL evidence after the default root is in force (a
+    /// re-resolution must not degrade to "wal_local_dir set").
+    #[test]
+    fn boot_stamp_is_idempotent_and_evidence_stable() {
+        let data_dir = std::path::Path::new("/srv/pdb");
+        let mut config = user_config("./data/write_buffer");
+        config.apply_durability_mode_resolution(data_dir);
+        let first = config.resolve_durability_mode(Some(data_dir));
+        config.apply_durability_mode_resolution(data_dir);
+        let second = config.resolve_durability_mode(Some(data_dir));
+        assert_eq!(first, second);
+        assert_eq!(second.source, DurabilityModeSource::PrimaryScheme);
+        // Even though the effective root is now set, the evidence stays the
+        // scheme inference, and `effective_wal_local_dir` still yields the
+        // default (env > TOML are both unset).
+        assert_eq!(second.evidence, "./data/write_buffer");
+        assert_eq!(
+            config.effective_wal_local_dir().as_deref(),
+            Some("file:///srv/pdb/wal")
+        );
+    }
+
+    /// TD-SPINE-5: an explicit TOML `wal_local_dir` suppresses the default
+    /// root and infers `local_volume` from the root itself.
+    #[test]
+    fn explicit_wal_local_dir_wins_over_the_default_root() {
+        let data_dir = std::path::Path::new("/srv/pdb");
+        let mut config = user_config("s3://bucket/wal");
+        config.wal_local_dir = Some("file:///waldisk".to_string());
+        config.apply_durability_mode_resolution(data_dir);
+        let resolution = config.resolve_durability_mode(Some(data_dir));
+        assert_eq!(resolution.mode, DurabilityMode::LocalVolume);
+        assert_eq!(resolution.source, DurabilityModeSource::WalLocalDir);
+        assert_eq!(
+            config.effective_wal_local_dir().as_deref(),
+            Some("file:///waldisk")
+        );
+    }
+
+    /// TD-SPINE-5: a declared TOML mode wins over inference; a declared
+    /// `local_volume` with no explicit root gets the same `{data_dir}/wal`
+    /// default.
+    #[test]
+    fn declared_toml_mode_wins() {
+        let data_dir = std::path::Path::new("/srv/pdb");
+        let mut config = user_config("s3://bucket/wal");
+        config.durability_mode = Some(DurabilityMode::ObjectStoreServerless);
+        config.apply_durability_mode_resolution(data_dir);
+        let resolution = config.resolve_durability_mode(Some(data_dir));
+        assert_eq!(resolution.mode, DurabilityMode::ObjectStoreServerless);
+        assert_eq!(resolution.source, DurabilityModeSource::Declared);
+        assert_eq!(config.effective_wal_local_dir(), None);
+
+        let mut declared_local = user_config("s3://bucket/wal");
+        declared_local.durability_mode = Some(DurabilityMode::LocalVolume);
+        declared_local.apply_durability_mode_resolution(data_dir);
+        assert_eq!(
+            declared_local.effective_wal_local_dir().as_deref(),
+            Some("file:///srv/pdb/wal")
+        );
+    }
+
+    /// TD-SPINE-5: the canonical conversion carries the resolved mode and the
+    /// effective root into the engine `WALConfig` (so `local_wal_dir` — write
+    /// path AND recovery — sees one root).
+    #[test]
+    fn to_engine_config_carries_mode_and_effective_root() {
+        let data_dir = std::path::Path::new("/srv/pdb");
+        let mut config = user_config("./data/write_buffer");
+        config.apply_durability_mode_resolution(data_dir);
+        let engine = config.to_engine_config();
+        assert_eq!(engine.durability_mode, Some(DurabilityMode::LocalVolume));
+        assert_eq!(engine.wal_local_dir.as_deref(), Some("file:///srv/pdb/wal"));
+
+        // Without the boot stamp the mode is still resolved (reportable), but
+        // no default-root move happens — the legacy placement stays.
+        let unstamped = user_config("./data/write_buffer");
+        let engine = unstamped.to_engine_config();
+        assert_eq!(engine.durability_mode, Some(DurabilityMode::LocalVolume));
+        assert_eq!(engine.wal_local_dir, None);
+    }
+
+    /// TD-SPINE-5: `durability_mode` parses from TOML with unset ⇒ None
+    /// (infer), a declared value parses, and an unknown value fails the load
+    /// (fail-fast on a DECLARED key; inference is only for the unset case).
+    #[test]
+    fn durability_mode_toml_default_and_rejection() {
+        let base = r#"
+            write_buffer_size_mb = 8192
+            memory_flush_size_bytes = 16777216
+            memtable_type = "BTree"
+            sync_mode = "PerBatch"
+            write_buffer_directory = "./data/write_buffer"
+            enable_wal = true
+            "#;
+        let unset: WriteBufferUserConfig =
+            toml::from_str(base).expect("unset durability_mode parses");
+        assert_eq!(unset.durability_mode, None);
+        assert!(unset.resolved_durability.is_none());
+
+        let declared: WriteBufferUserConfig = toml::from_str(&format!(
+            "{base}durability_mode = \"object_store_serverless\"\n"
+        ))
+        .expect("declared durability_mode parses");
+        assert_eq!(
+            declared.durability_mode,
+            Some(DurabilityMode::ObjectStoreServerless)
+        );
+
+        let bad = format!("{base}durability_mode = \"serverless\"\n");
+        assert!(
+            toml::from_str::<WriteBufferUserConfig>(&bad).is_err(),
+            "unknown declared value must fail, not default"
+        );
     }
 }
