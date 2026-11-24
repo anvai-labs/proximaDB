@@ -92,11 +92,7 @@ async fn demo_basic_distance_computation(adapter: &UniversalDistanceAdapter) -> 
     let query_vector = create_random_vector(128);
     let candidates = create_demo_candidates(100, 128);
 
-    let engines = vec![
-        EngineType::NOVA,
-        EngineType::SWIFT,
-        EngineType::SST,
-    ];
+    let engines = vec![EngineType::NOVA, EngineType::SWIFT, EngineType::SST];
 
     for engine_type in engines {
         let start_time = Instant::now();

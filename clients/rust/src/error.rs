@@ -61,9 +61,7 @@ pub enum CollectionError {
     DimensionMismatch { expected: u32, actual: u32 },
 
     /// Unknown storage engine
-    #[error(
-        "Unknown storage engine: {engine}. Supported: sst, helix, nova, swift, raptor, tst"
-    )]
+    #[error("Unknown storage engine: {engine}. Supported: sst, helix, nova, swift, raptor, tst")]
     UnknownEngine { engine: String },
 }
 

@@ -591,7 +591,6 @@ mod tests {
         let sst = SstCapabilities;
         assert!(sst.is_compression_supported(CompressionAlgorithm::CompressionZstd));
         assert!(sst.is_compression_supported(CompressionAlgorithm::CompressionLz4));
-
     }
 
     #[test]

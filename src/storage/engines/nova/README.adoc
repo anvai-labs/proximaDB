@@ -563,5 +563,5 @@ if self.get_total_vectors() < 100_000 {
 
 * Parent Module: Storage Engines
 * SST Engine: link:../sst/README.adoc[SST README]
-* NOVA Engine: link:../viper/README.adoc[NOVA README]
+* NOVA Engine: link:../nova/README.adoc[NOVA README]
 * Main Documentation: ProximaDB Docs

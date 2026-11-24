@@ -207,10 +207,7 @@ impl<E: UnifiedStorageFormat + 'static> StorageFormat for InternalFormatAdapter<
                 self.engine.strategy(),
                 StorageFormatStrategy::Sst | StorageFormatStrategy::Swift
             ),
-            "columnar_storage" => matches!(
-                self.engine.strategy(),
-                StorageFormatStrategy::Nova
-            ),
+            "columnar_storage" => matches!(self.engine.strategy(), StorageFormatStrategy::Nova),
             "progressive_search" => matches!(
                 self.engine.strategy(),
                 StorageFormatStrategy::Sst

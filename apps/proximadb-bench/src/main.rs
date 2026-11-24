@@ -286,7 +286,6 @@ enum CriterionSuite {
     #[value(name = "bench_09", alias = "quantization")]
     QuantizationSst,
 
-
     /// [11] Query progressive benchmarks
     #[value(name = "bench_11", alias = "query")]
     QueryProgressive,

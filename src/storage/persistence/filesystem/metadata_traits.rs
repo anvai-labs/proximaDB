@@ -110,4 +110,3 @@ impl EngineMetadataSerializer for GenericMetadataSerializer {
         "generic"
     }
 }
-

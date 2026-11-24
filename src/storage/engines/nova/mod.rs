@@ -186,7 +186,6 @@ use arrow_schema::{DataType, Field, Schema};
 use parquet::file::metadata::RowGroupMetaData;
 use std::sync::Arc;
 
-
 // Import shared columnar infrastructure
 use crate::storage::engines::core::formats::columnar::{ColumnarFileMetadata, QuantizationConfig};
 

@@ -114,9 +114,7 @@ impl ZeroCopyReaderIntegration {
         for engine_type in engine_types {
             let workload_type = match engine_type {
                 "SST" => crate::storage::engines::core::io::zero_copy::WorkloadType::HighThroughput,
-                "NOVA" => {
-                    crate::storage::engines::core::io::zero_copy::WorkloadType::Analytics
-                }
+                "NOVA" => crate::storage::engines::core::io::zero_copy::WorkloadType::Analytics,
                 "SWIFT" | "RAPTOR" => {
                     crate::storage::engines::core::io::zero_copy::WorkloadType::RealTime
                 }

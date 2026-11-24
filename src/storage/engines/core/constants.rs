@@ -165,7 +165,6 @@ pub mod block_sizes {
     /// Default vectors per SWIFT superblock
     pub const SWIFT_DEFAULT_VECTORS_PER_SUPERBLOCK: usize = 256;
 
-
     /// Default vectors per NOVA progressive block
     pub const NOVA_DEFAULT_VECTORS_PER_BLOCK: usize = 100;
 

@@ -428,6 +428,6 @@ bloom_filter_fp_rate = 0.001  # Lower false positive rate (larger bloom filter)
 == See Also
 
 * Parent Module: Storage Engines
-* NOVA Engine: link:../viper/README.adoc[NOVA README]
+* NOVA Engine: link:../nova/README.adoc[NOVA README]
 * NOVA Engine: link:../nova/README.adoc[NOVA README]
 * Main Documentation: ProximaDB Docs

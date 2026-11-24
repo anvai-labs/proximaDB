@@ -86,7 +86,6 @@ pub mod swift_comprehensive_filter_test;
 // Write Buffer optimization integration tests - NEW optimized Write Buffer writer
 // pub mod write_ahead_log_optimization_integration_test; // File doesn't exist
 
-
 // Nova engine integration tests
 pub mod nova_engine_test;
 
@@ -124,7 +123,6 @@ pub mod write_buffer_recovery_stress_test;
 // Storage engine integration tests
 pub mod storage_engine_adapters_test;
 pub mod storage_table_provider_test;
-
 
 // Assignment service recovery integration tests
 // pub mod assignment_service_recovery_integration_test; // File not found - commented for now

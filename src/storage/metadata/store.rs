@@ -647,9 +647,7 @@ impl MetadataStoreInterface for MetadataStore {
                         distance_metric: Some(
                             crate::proto::proximadb_v1::DistanceMetric::Cosine as i32,
                         ),
-                        storage_engine: Some(
-                            crate::proto::proximadb_v1::StorageEngine::Sst as i32,
-                        ),
+                        storage_engine: Some(crate::proto::proximadb_v1::StorageEngine::Sst as i32),
                         storage_config: None,
                         index_configs: Vec::new(),
                         primary_index: Some(String::new()),

@@ -67,8 +67,8 @@ fn bench_recall_report(c: &mut Criterion) {
         // Simulate different recall levels for different engines
         // In real benchmarks, run engine.search() and compare to ground_truth
         let recall_factor = match engine_name {
-            "sst" => 0.95,   // High recall (exact search)
-            "nova" => 0.90,  // Good recall
+            "sst" => 0.95,  // High recall (exact search)
+            "nova" => 0.90, // Good recall
             _ => 0.80,
         };
 

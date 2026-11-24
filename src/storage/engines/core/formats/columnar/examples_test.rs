@@ -321,7 +321,6 @@ pub async fn run_all_examples() -> Result<()> {
     eprintln!("{}", "=".repeat(60));
     eprintln!();
 
-
     // Run NOVA example
     nova_optimization_example().await?;
 

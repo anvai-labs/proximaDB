@@ -392,7 +392,6 @@ mod tests {
             } else {
                 eprintln!("WARNING: SST search returned 0 results for ID {}", id);
             }
-
         }
 
         Ok(())

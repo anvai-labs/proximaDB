@@ -1679,9 +1679,7 @@ impl UnifiedStorageFormat for NovaEngine {
 
                     let vector_values = batch
                         .column_by_name(FIELD_VECTOR_FP32)
-                        .and_then(|col| {
-                            list_row_values(col, row_idx)
-                        })
+                        .and_then(|col| list_row_values(col, row_idx))
                         .ok_or_else(|| anyhow!("Missing or invalid 'vector_fp32' column"))?;
                     let vector_float_array = vector_values
                         .as_any()

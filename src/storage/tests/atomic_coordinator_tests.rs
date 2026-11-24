@@ -570,7 +570,11 @@ async fn test_flush_stage_atomic_operations() {
         .expect("Failed to begin flush");
 
     coordinator
-        .write_to_staging(&operation.operation_id, "vectors/data.parquet", b"mock parquet data")
+        .write_to_staging(
+            &operation.operation_id,
+            "vectors/data.parquet",
+            b"mock parquet data",
+        )
         .await
         .expect("Failed to write parquet");
 

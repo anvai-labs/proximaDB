@@ -679,7 +679,6 @@ impl UnifiedTestEnvironment {
         // Use default config since struct fields may vary
         proximadb::core::config::Config::default()
     }
-
 }
 
 /// Multiple isolated environments for concurrency testing

@@ -1504,7 +1504,11 @@ mod tests {
         let metadata = coordinator.begin_atomic_operation(&config).await.unwrap();
 
         coordinator
-            .write_to_staging(&metadata.operation_id, "vectors/batch_001.parquet", b"mock parquet data")
+            .write_to_staging(
+                &metadata.operation_id,
+                "vectors/batch_001.parquet",
+                b"mock parquet data",
+            )
             .await
             .unwrap();
 
