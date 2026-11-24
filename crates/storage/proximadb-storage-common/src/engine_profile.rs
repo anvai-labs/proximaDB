@@ -8,6 +8,5 @@ pub enum EngineProfile {
     Swift,
     Helix,
     Raptor,
-    Viper,
     Nova,
 }

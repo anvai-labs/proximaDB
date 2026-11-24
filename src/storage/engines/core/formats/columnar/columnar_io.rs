@@ -1,6 +1,6 @@
 //! Unified Columnar I/O Module - Consolidated Parquet and Arrow IPC operations
 //!
-//! This module consolidates all columnar I/O operations for VIPER and NOVA engines,
+//! This module consolidates all columnar I/O operations for the columnar engines,
 //! ensuring maximum code reuse and consistent optimizations.
 //!
 //! ## Key Design Decisions
@@ -85,10 +85,10 @@ pub struct UnifiedColumnarConfig {
     pub ipc_compression: Option<arrow_ipc::CompressionType>,
 
     // === Engine-specific Features ===
-    /// VIPER: Enable predicate pushdown
-    pub viper_predicate_pushdown: bool,
-    /// VIPER: Parallel column evaluation
-    pub viper_parallel_columns: bool,
+    /// Enable predicate pushdown (columnar engines)
+    pub columnar_predicate_pushdown: bool,
+    /// Parallel column evaluation (columnar engines)
+    pub columnar_parallel_columns: bool,
     /// NOVA: Enable progressive quantization
     pub nova_progressive_search: bool,
     /// NOVA: Enable zone maps
@@ -132,8 +132,8 @@ impl Default for UnifiedColumnarConfig {
             ipc_compression: None, // No compression for maximum speed
 
             // Engine features
-            viper_predicate_pushdown: true,
-            viper_parallel_columns: true,
+            columnar_predicate_pushdown: true,
+            columnar_parallel_columns: true,
             nova_progressive_search: true,
             nova_zone_maps: true,
 

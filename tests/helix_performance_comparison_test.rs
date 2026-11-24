@@ -1,6 +1,6 @@
 //! Performance comparison tests between HELIX and other storage engines
 //!
-//! This test suite compares HELIX against SST, VIPER, and RAPTOR engines
+//! This test suite compares HELIX against the SST engine
 //! across various workloads and metrics.
 
 // Import test utilities
@@ -15,7 +15,6 @@ mod performance_comparison_tests {
     use proximadb::core::search::BlockPruneConfig;
     use proximadb::storage::engines::helix::{HelixConfig, HelixEngine};
     use proximadb::storage::engines::sst::SstEngine;
-    use proximadb::storage::engines::viper::ViperEngine;
     use proximadb::storage::traits::StorageQueryMetadata;
     use proximadb::storage::traits::{
         CompactionParameters, FlushParameters, StorageQueryContext, UnifiedStorageEngine,
@@ -171,7 +170,7 @@ mod performance_comparison_tests {
         let flush_throughput = vectors.len() as f64 / flush_time.as_secs_f64();
 
         // Measure compaction performance (if applicable)
-        let (compaction_time, compaction_throughput) = if engine_name != "viper" {
+        let (compaction_time, compaction_throughput) = if engine_name != "none" {
             let compact_start = Instant::now();
             let compact_params = CompactionParameters {
                 full_target_segments: None,
@@ -265,7 +264,6 @@ mod performance_comparison_tests {
             let storage_strategy = match engine_name.to_lowercase().as_str() {
                 "helix" => proximadb::storage::traits::StorageEngineStrategy::Helix,
                 "sst" => proximadb::storage::traits::StorageEngineStrategy::Sst,
-                "viper" => proximadb::storage::traits::StorageEngineStrategy::Viper,
                 "raptor" => proximadb::storage::traits::StorageEngineStrategy::Raptor,
                 "nova" => proximadb::storage::traits::StorageEngineStrategy::Nova,
                 "swift" => proximadb::storage::traits::StorageEngineStrategy::Swift,
@@ -384,9 +382,6 @@ mod performance_comparison_tests {
 
         let sst_engine = Arc::new(SstEngine::new().await.unwrap()) as Arc<dyn UnifiedStorageEngine>;
 
-        let viper_engine =
-            Arc::new(ViperEngine::new().await.unwrap()) as Arc<dyn UnifiedStorageEngine>;
-
         // Benchmark each engine
         let helix_metrics = benchmark_engine(
             helix_engine,
@@ -406,30 +401,15 @@ mod performance_comparison_tests {
         )
         .await;
 
-        let viper_metrics = benchmark_engine(
-            viper_engine,
-            &vectors,
-            &query_vectors,
-            "test_collection",
-            temp_dir.path().to_str().unwrap(),
-        )
-        .await;
-
         // Print results
         helix_metrics.print_summary();
         sst_metrics.print_summary();
-        viper_metrics.print_summary();
 
         // Compare HELIX performance
         println!("\n=== Performance Comparison ===");
         println!(
             "HELIX vs SST Query Speedup: {:.2}x",
             sst_metrics.avg_query_time.as_micros() as f64
-                / helix_metrics.avg_query_time.as_micros() as f64
-        );
-        println!(
-            "HELIX vs VIPER Query Speedup: {:.2}x",
-            viper_metrics.avg_query_time.as_micros() as f64
                 / helix_metrics.avg_query_time.as_micros() as f64
         );
     }
@@ -814,7 +794,6 @@ mod performance_comparison_tests {
         // Create temp dirs (need to keep them alive)
         let temp_dir_helix = TempDir::new().unwrap();
         let temp_dir_sst = TempDir::new().unwrap();
-        let temp_dir_viper = TempDir::new().unwrap();
 
         // Measure memory usage for each engine
         let engines: Vec<(&str, Arc<dyn UnifiedStorageEngine>, &str)> = vec![
@@ -830,11 +809,6 @@ mod performance_comparison_tests {
                 "SST",
                 { Arc::new(SstEngine::new().await.unwrap()) as Arc<dyn UnifiedStorageEngine> },
                 temp_dir_sst.path().to_str().unwrap(),
-            ),
-            (
-                "VIPER",
-                { Arc::new(ViperEngine::new().await.unwrap()) as Arc<dyn UnifiedStorageEngine> },
-                temp_dir_viper.path().to_str().unwrap(),
             ),
         ];
 

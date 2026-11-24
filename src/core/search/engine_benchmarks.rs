@@ -141,7 +141,7 @@ impl BenchmarkConfig {
 /// Engine-specific benchmark results
 #[derive(Debug, Clone)]
 pub struct EngineBenchmarkResults {
-    /// Engine name (SST, VIPER, NOVA, SWIFT, RAPTOR, PRISM)
+    /// Engine name (SST, NOVA, SWIFT, RAPTOR, PRISM)
     pub engine_name: String,
 
     /// Direct FP32 search performance by dataset size
@@ -372,7 +372,6 @@ impl StorageEngineBenchmark {
         // For now, return estimates based on engine characteristics
         let base_memory = match engine_name {
             "SST" => 100.0,    // Hybrid columnar (ProximaBlocks), bloom filters
-            "VIPER" => 150.0,  // Columnar, Parquet overhead
             "NOVA" => 180.0,   // Enhanced columnar with stats
             "SWIFT" => 80.0,   // Zero-overhead design
             "RAPTOR" => 200.0, // Arrow RecordBatch, HNSW
@@ -583,21 +582,6 @@ pub mod engine_specific {
 
         // Benchmark hierarchical block structure
         metrics.insert("hierarchical_block_speedup".to_string(), 1.8);
-
-        Ok(metrics)
-    }
-
-    /// VIPER-specific optimizations and benchmarks
-    pub async fn benchmark_viper_specific(
-        _engine: Arc<dyn UnifiedStorageFormat>,
-    ) -> Result<HashMap<String, f32>> {
-        let mut metrics = HashMap::new();
-
-        // Benchmark Parquet columnar advantages
-        metrics.insert("columnar_scan_speedup".to_string(), 3.2);
-
-        // Benchmark compression benefits
-        metrics.insert("compression_ratio".to_string(), 4.5);
 
         Ok(metrics)
     }

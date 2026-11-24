@@ -26,7 +26,7 @@ pub trait EngineMetadataSerializer: Send + Sync + Debug {
     /// Get the engine type this serializer handles
     fn engine_type(&self) -> &str;
 
-    /// Extract cacheable metadata components (e.g., Parquet footer for VIPER)
+    /// Extract cacheable metadata components (e.g., Parquet footer)
     /// Returns None if no special caching is needed
     fn extract_cacheable_component(&self, _data: &[u8], _file_path: &str) -> Option<Bytes> {
         None
@@ -111,78 +111,3 @@ impl EngineMetadataSerializer for GenericMetadataSerializer {
     }
 }
 
-/// Example: VIPER engine metadata serializer
-/// This would be implemented in the VIPER engine module
-#[cfg(test)]
-mod viper_example {
-    use super::*;
-    use serde::{Deserialize, Serialize};
-
-    #[allow(dead_code)]
-    #[derive(Debug, Clone, Serialize, Deserialize)]
-    pub struct ViperMetadata {
-        pub row_groups: Vec<RowGroupInfo>,
-        pub total_rows: usize,
-        pub parquet_footer: Option<Vec<u8>>,
-    }
-
-    #[allow(dead_code)]
-    #[derive(Debug, Clone, Serialize, Deserialize)]
-    pub struct RowGroupInfo {
-        pub id: u32,
-        pub row_count: usize,
-        pub file_offset: u64,
-    }
-
-    #[allow(dead_code)]
-    #[derive(Debug)]
-    pub struct ViperMetadataSerializer;
-
-    impl EngineMetadataSerializer for ViperMetadataSerializer {
-        fn serialize(&self, metadata: &dyn Any) -> Result<Bytes> {
-            if let Some(viper_meta) = metadata.downcast_ref::<ViperMetadata>() {
-                let bytes = bincode::serialize(viper_meta)?;
-                Ok(Bytes::from(bytes))
-            } else {
-                anyhow::bail!("Expected ViperMetadata type")
-            }
-        }
-
-        fn deserialize(&self, bytes: &[u8]) -> Result<Box<dyn Any + Send + Sync>> {
-            let viper_meta: ViperMetadata = bincode::deserialize(bytes)?;
-            Ok(Box::new(viper_meta))
-        }
-
-        fn engine_type(&self) -> &str {
-            "viper"
-        }
-
-        fn extract_cacheable_component(&self, data: &[u8], file_path: &str) -> Option<Bytes> {
-            // Extract Parquet footer for VIPER files
-            if file_path.ends_with(".parquet") && data.len() > 8 {
-                // Check for PAR1 magic bytes
-                if &data[0..4] == b"PAR1" && &data[data.len() - 4..] == b"PAR1" {
-                    // Read footer size (last 4 bytes before final PAR1)
-                    let footer_size_bytes = &data[data.len() - 8..data.len() - 4];
-                    let footer_size = u32::from_le_bytes([
-                        footer_size_bytes[0],
-                        footer_size_bytes[1],
-                        footer_size_bytes[2],
-                        footer_size_bytes[3],
-                    ]) as usize;
-
-                    if footer_size < data.len() - 8 {
-                        let footer_start = data.len() - 8 - footer_size;
-                        return Some(Bytes::copy_from_slice(&data[footer_start..data.len() - 8]));
-                    }
-                }
-            }
-            None
-        }
-
-        fn should_cache_metadata(&self, file_path: &str) -> bool {
-            // Cache metadata for Parquet files
-            file_path.ends_with(".parquet")
-        }
-    }
-}

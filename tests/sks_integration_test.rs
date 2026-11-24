@@ -59,7 +59,7 @@ mod sks_integration_tests {
                 "1.0.0"
             }
             fn strategy(&self) -> StorageEngineStrategy {
-                StorageEngineStrategy::Viper
+                StorageEngineStrategy::Nova
             }
 
             async fn do_flush(&self, _params: &FlushParameters) -> Result<FlushResult> {

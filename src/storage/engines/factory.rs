@@ -15,7 +15,6 @@
 //!
 //! | Strategy | Engine | Use Case | Format |
 //! |----------|--------|----------|--------|
-//! | Viper | VIPER | Analytics, batch | Columnar (Parquet) |
 //! | Lsm | SST | OLTP, real-time | Hybrid columnar (ProximaBlocks) |
 //! | Hybrid | RAPTOR | Graph navigation | Matrix Trinity |
 //! | Swift | SWIFT | Fast traversal | Row-based optimized |
@@ -31,20 +30,18 @@
 //! - **NOVA**: Advanced columnar analytics, 66+ tests, zone maps & predicate pushdown
 //! - **HELIX**: High-dimensional data, 38+ tests, PCA dimension reduction
 //!
-//! **⚠️ DEPRECATED (ADR-093 / TD-VIPER-1):**
-//! - **VIPER**: staged retirement in progress — new collections should use SST
-//!   (default), NOVA, or the DataFusion/Parquet path; existing VIPER collections
-//!   remain readable. (The per-engine latency numbers previously quoted in this
-//!   header (~5.32/13.2/89.5/101.6 ms) have NO entries in
-//!   `docs/_internal/roadmap/BENCHMARK_EVIDENCE.toml` and were removed — see the
-//!   evidence ledger for measured claims only.)
+//! **REMOVED (ADR-093 stage 3 / TD-VIPER-1 S3):**
+//! - **VIPER**: the engine implementation is deleted. The proto enum value and
+//!   its string conversions are retained for wire compatibility; the factory
+//!   rejects it with an error naming the replacements (SST default, NOVA
+//!   columnar-analytics vector, DataFusion/Parquet for warehouse analytics).
 //!
 //! **⚠️ DEPRECATED - Experimental (Requires `experimental-engines` feature flag):**
 //! - **SWIFT**: ⚠️ DEPRECATED - Incomplete hierarchical storage, 30+ DEFERREDs
 //! - **RAPTOR**: ⚠️ DEPRECATED - Experimental Matrix Trinity, 35+ DEFERREDs
 //!
 //! **IMPORTANT**: SWIFT and RAPTOR are deprecated and will be removed in v1.0.
-//! Use SST, VIPER, HELIX, or NOVA instead. See `/docs/storage/EXPERIMENTAL_ENGINES_STATUS.md`
+//! Use SST, HELIX, or NOVA instead. See `/docs/storage/EXPERIMENTAL_ENGINES_STATUS.md`
 //!
 //! To enable deprecated engines: `cargo build --features experimental-engines`
 //!
@@ -114,7 +111,7 @@ use crate::proto::proximadb_v1::StorageEngine as ProtoStorageEngine;
 use crate::storage::traits::{StorageEngineStrategy, UnifiedStorageFormat};
 use proximadb_query_capability::CapabilityRegistry;
 
-use super::{nova::NovaEngine, sst::SstEngine, viper::ViperEngine};
+use super::{nova::NovaEngine, sst::SstEngine};
 #[cfg(feature = "experimental-engines")]
 use super::{raptor::RaptorEngine, swift::SwiftEngine};
 
@@ -181,10 +178,14 @@ impl StorageEngineFactory {
     ) -> Result<Arc<dyn UnifiedStorageFormat>> {
         match engine_type {
             ProtoStorageEngine::Unspecified => {
-                warn!("Unspecified storage engine, defaulting to SST (VIPER not available)");
+                warn!("Unspecified storage engine, defaulting to SST");
                 Self::create_sst()
             }
-            ProtoStorageEngine::Viper => Self::create_viper(),
+            ProtoStorageEngine::Viper => anyhow::bail!(
+                "VIPER engine has been removed (ADR-093 / TD-VIPER-1). \
+                 Use SST (default), NOVA, or HELIX instead; warehouse analytics \
+                 belongs on the DataFusion/Parquet path."
+            ),
             ProtoStorageEngine::Sst => Self::create_sst(),
             ProtoStorageEngine::Helix => Self::create_helix(),
             ProtoStorageEngine::Swift => {
@@ -196,7 +197,7 @@ impl StorageEngineFactory {
                 {
                     anyhow::bail!(
                         "SWIFT engine is experimental and disabled in default builds. \
-                         Use SST, VIPER, HELIX, or NOVA instead. \
+                         Use SST, HELIX, or NOVA instead. \
                          To enable: cargo build --features experimental-engines"
                     )
                 }
@@ -211,16 +212,16 @@ impl StorageEngineFactory {
                 {
                     anyhow::bail!(
                         "RAPTOR engine is experimental and disabled in default builds. \
-                         Use SST, VIPER, HELIX, or NOVA instead. \
+                         Use SST, HELIX, or NOVA instead. \
                          To enable: cargo build --features experimental-engines"
                     )
                 }
             }
             ProtoStorageEngine::Tst => Self::create_tst(),
             ProtoStorageEngine::Cedar => Self::create_cedar(),
-            ProtoStorageEngine::Chrono => anyhow::bail!(
-                "CHRONO engine has been removed. Use SST, VIPER, HELIX, or NOVA instead."
-            ),
+            ProtoStorageEngine::Chrono => {
+                anyhow::bail!("CHRONO engine has been removed. Use SST, HELIX, or NOVA instead.")
+            }
             ProtoStorageEngine::Titan => {
                 // TITAN is primarily a GraphEngine; for UnifiedStorageFormat, use SST as backing
                 warn!("TITAN is a graph engine; using SST for vector storage operations");
@@ -245,10 +246,14 @@ impl StorageEngineFactory {
     ) -> Result<Arc<dyn UnifiedStorageFormat>> {
         match engine_type {
             ProtoStorageEngine::Unspecified => {
-                warn!("Unspecified storage engine, defaulting to SST (VIPER not available)");
+                warn!("Unspecified storage engine, defaulting to SST");
                 Self::create_sst_async().await
             }
-            ProtoStorageEngine::Viper => Self::create_viper_async().await,
+            ProtoStorageEngine::Viper => anyhow::bail!(
+                "VIPER engine has been removed (ADR-093 / TD-VIPER-1). \
+                 Use SST (default), NOVA, or HELIX instead; warehouse analytics \
+                 belongs on the DataFusion/Parquet path."
+            ),
             ProtoStorageEngine::Sst => Self::create_sst_async().await,
             ProtoStorageEngine::Helix => Self::create_helix_async().await,
             ProtoStorageEngine::Swift => {
@@ -260,7 +265,7 @@ impl StorageEngineFactory {
                 {
                     anyhow::bail!(
                         "SWIFT engine is experimental and disabled in default builds. \
-                         Use SST, VIPER, HELIX, or NOVA instead. \
+                         Use SST, HELIX, or NOVA instead. \
                          To enable: cargo build --features experimental-engines"
                     )
                 }
@@ -275,16 +280,16 @@ impl StorageEngineFactory {
                 {
                     anyhow::bail!(
                         "RAPTOR engine is experimental and disabled in default builds. \
-                         Use SST, VIPER, HELIX, or NOVA instead. \
+                         Use SST, HELIX, or NOVA instead. \
                          To enable: cargo build --features experimental-engines"
                     )
                 }
             }
             ProtoStorageEngine::Tst => Self::create_tst_async().await,
             ProtoStorageEngine::Cedar => Self::create_cedar_async().await,
-            ProtoStorageEngine::Chrono => anyhow::bail!(
-                "CHRONO engine has been removed. Use SST, VIPER, HELIX, or NOVA instead."
-            ),
+            ProtoStorageEngine::Chrono => {
+                anyhow::bail!("CHRONO engine has been removed. Use SST, HELIX, or NOVA instead.")
+            }
             ProtoStorageEngine::Titan => {
                 warn!("TITAN is a graph engine; using SST for vector storage operations");
                 Self::create_sst_async().await
@@ -310,7 +315,6 @@ impl StorageEngineFactory {
     /// Used by query planner and collection configuration.
     ///
     /// ### Strategy Selection:
-    /// - **Viper**: Columnar for analytics/batch
     /// - **Lsm**: Row-based for OLTP
     /// - **Hybrid**: RAPTOR for mixed workloads
     /// - **Swift**: Optimized row-based for speed
@@ -320,7 +324,11 @@ impl StorageEngineFactory {
         strategy: StorageEngineStrategy,
     ) -> Result<Arc<dyn UnifiedStorageFormat>> {
         match strategy {
-            StorageEngineStrategy::Viper => Self::create_viper(),
+            StorageEngineStrategy::Viper => anyhow::bail!(
+                "VIPER engine has been removed (ADR-093 / TD-VIPER-1). \
+                 Use SST (default), NOVA, or HELIX instead; warehouse analytics \
+                 belongs on the DataFusion/Parquet path."
+            ),
             StorageEngineStrategy::Sst => Self::create_sst(),
             StorageEngineStrategy::Hybrid => {
                 #[cfg(feature = "experimental-engines")]
@@ -333,7 +341,7 @@ impl StorageEngineFactory {
                 {
                     anyhow::bail!(
                         "RAPTOR engine (hybrid strategy) is experimental and disabled in default builds. \
-                         Use SST, VIPER, HELIX, or NOVA instead. \
+                         Use SST, HELIX, or NOVA instead. \
                          To enable: cargo build --features experimental-engines"
                     )
                 }
@@ -348,7 +356,7 @@ impl StorageEngineFactory {
                 {
                     anyhow::bail!(
                         "SWIFT engine is experimental and disabled in default builds. \
-                         Use SST, VIPER, HELIX, or NOVA instead. \
+                         Use SST, HELIX, or NOVA instead. \
                          To enable: cargo build --features experimental-engines"
                     )
                 }
@@ -367,7 +375,7 @@ impl StorageEngineFactory {
                 {
                     anyhow::bail!(
                         "RAPTOR engine is experimental and disabled in default builds. \
-                         Use SST, VIPER, HELIX, or NOVA instead. \
+                         Use SST, HELIX, or NOVA instead. \
                          To enable: cargo build --features experimental-engines"
                     )
                 }
@@ -384,9 +392,9 @@ impl StorageEngineFactory {
                 info!("Creating CEDAR (Document) engine");
                 Self::create_cedar()
             }
-            StorageEngineStrategy::Chrono => anyhow::bail!(
-                "CHRONO engine has been removed. Use SST, VIPER, HELIX, or NOVA instead."
-            ),
+            StorageEngineStrategy::Chrono => {
+                anyhow::bail!("CHRONO engine has been removed. Use SST, HELIX, or NOVA instead.")
+            }
         }
     }
 
@@ -407,7 +415,7 @@ impl StorageEngineFactory {
     /// Run an async engine constructor on a fresh multi-thread tokio runtime,
     /// returning its output — WITHOUT dropping the runtime.
     ///
-    /// The engine constructors (`SstEngine::new`, `ViperEngine::new`, …) spawn
+    /// The engine constructors (`SstEngine::new`, `NovaEngine::new`, …) spawn
     /// background workers (compaction, etc.) on the runtime they're called from.
     /// A plain `let rt = Runtime::new()?; rt.block_on(..)` would drop `rt` on
     /// return, and `Runtime::drop` shuts the runtime down + aborts those workers
@@ -449,44 +457,6 @@ impl StorageEngineFactory {
     /// Async version for CEDAR
     pub async fn create_cedar_async() -> Result<Arc<dyn UnifiedStorageFormat>> {
         Self::create_cedar()
-    }
-
-    /// Create VIPER engine with default configuration
-    ///
-    /// ## VIPER Initialization:
-    ///
-    /// VIPER requires async initialization for:
-    /// - Filesystem setup (S3/Azure/GCS support)
-    /// - Quantization engine initialization
-    /// - Footer cache warming
-    ///
-    /// Uses tokio runtime blocking to bridge async/sync gap.
-    /// In production, prefer async factory methods.
-    pub fn create_viper() -> Result<Arc<dyn UnifiedStorageFormat>> {
-        warn!(
-            "VIPER is DEPRECATED (ADR-093 / TD-VIPER-1): its columnar-analytics niche is served \
-             by SST (default), NOVA (columnar-analytics vector), and the DataFusion/Parquet path. \
-             Do not create new VIPER collections; existing collections remain readable."
-        );
-        info!("Creating VIPER storage engine");
-        let engine = Self::block_on_with_persistent_runtime(async { ViperEngine::new().await })?;
-        let engine: Arc<dyn UnifiedStorageFormat> = Arc::new(engine);
-        register_engine_capabilities(&engine);
-        Ok(engine)
-    }
-
-    /// Async version for use within async contexts (e.g., tests)
-    pub async fn create_viper_async() -> Result<Arc<dyn UnifiedStorageFormat>> {
-        warn!(
-            "VIPER is DEPRECATED (ADR-093 / TD-VIPER-1): its columnar-analytics niche is served \
-             by SST (default), NOVA (columnar-analytics vector), and the DataFusion/Parquet path. \
-             Do not create new VIPER collections; existing collections remain readable."
-        );
-        info!("Creating VIPER storage engine");
-        let engine = ViperEngine::new().await?;
-        let engine: Arc<dyn UnifiedStorageFormat> = Arc::new(engine);
-        register_engine_capabilities(&engine);
-        Ok(engine)
     }
 
     /// Create SST engine with default configuration
@@ -710,8 +680,8 @@ impl StorageEngineFactory {
                 }
             }
             WorkloadType::Mixed => {
-                info!("Mixed workload detected, using VIPER for balanced performance");
-                Self::create_viper()
+                info!("Mixed workload detected, using NOVA for balanced performance");
+                Self::create_nova()
             }
             WorkloadType::Experimental => {
                 info!("Experimental workload, using HELIX for PCA + Hilbert clustering");
@@ -724,7 +694,6 @@ impl StorageEngineFactory {
     pub fn recommend_engine(requirements: &EngineRequirements) -> ProtoStorageEngine {
         // Score each engine based on requirements
         let mut scores = vec![
-            (ProtoStorageEngine::Viper, 0),
             (ProtoStorageEngine::Sst, 0),
             (ProtoStorageEngine::Swift, 0),
             (ProtoStorageEngine::Nova, 0),
@@ -751,19 +720,6 @@ impl StorageEngineFactory {
         let mut score = 0;
 
         match engine {
-            ProtoStorageEngine::Viper => {
-                // VIPER: Good for general use, columnar storage
-                if req.needs_columnar {
-                    score += 20;
-                }
-                if req.needs_compression {
-                    score += 15;
-                }
-                if req.needs_batch_operations {
-                    score += 10;
-                }
-                score += 10; // Base score for maturity
-            }
             ProtoStorageEngine::Sst => {
                 // SST: Good for write-heavy, row-based
                 if req.needs_fast_writes {
@@ -881,7 +837,7 @@ impl Default for EngineRequirements {
 /// - <60: Not optimized for this workload
 #[derive(Debug)]
 pub struct EngineComparison {
-    /// Engine identifier (e.g., "SST", "VIPER")
+    /// Engine identifier (e.g., "SST", "NOVA")
     pub engine_name: String,
     /// Key advantages of this engine
     pub pros: Vec<String>,
@@ -899,24 +855,6 @@ impl StorageEngineFactory {
     /// Compare all available engines
     pub fn compare_engines() -> Vec<EngineComparison> {
         vec![
-            EngineComparison {
-                engine_name: "VIPER".to_string(),
-                pros: vec![
-                    "Columnar storage for analytics".to_string(),
-                    "Excellent compression".to_string(),
-                    "Parquet integration".to_string(),
-                ],
-                cons: vec![
-                    "Higher write latency".to_string(),
-                    "Complex compaction_info".to_string(),
-                ],
-                best_for: vec![
-                    "Analytics workloads".to_string(),
-                    "Read-heavy applications".to_string(),
-                ],
-                performance_score: 80,
-                maturity_score: 90,
-            },
             EngineComparison {
                 engine_name: "SST".to_string(),
                 pros: vec![
@@ -1063,14 +1001,6 @@ mod tests {
             .await
             .expect("Failed to create SST engine");
         assert_eq!(engine.format_name(), "sst");
-    }
-
-    #[tokio::test]
-    async fn test_create_viper_engine() {
-        let engine = StorageEngineFactory::create_viper_async()
-            .await
-            .expect("Failed to create VIPER engine");
-        assert_eq!(engine.format_name(), "VIPER");
     }
 
     #[tokio::test]
@@ -1240,8 +1170,9 @@ mod tests {
     fn test_engine_comparison() {
         let comparisons = StorageEngineFactory::compare_engines();
 
-        // Now includes all 6 engines: SST, VIPER, SWIFT, NOVA, HELIX, RAPTOR
-        assert_eq!(comparisons.len(), 6);
+        // Now includes all 5 engines: SST, SWIFT, NOVA, HELIX, RAPTOR
+        // (VIPER was removed by ADR-093 stage 3 / TD-VIPER-1 S3.)
+        assert_eq!(comparisons.len(), 5);
 
         // NOVA should have highest performance score
         let nova = comparisons
@@ -1250,12 +1181,9 @@ mod tests {
             .unwrap();
         assert_eq!(nova.performance_score, 90);
 
-        // VIPER and SST should have highest maturity
-        let viper = comparisons
-            .iter()
-            .find(|c| c.engine_name == "VIPER")
-            .unwrap();
-        assert_eq!(viper.maturity_score, 90);
+        // SST should have highest maturity
+        let sst = comparisons.iter().find(|c| c.engine_name == "SST").unwrap();
+        assert_eq!(sst.maturity_score, 90);
 
         // RAPTOR should be marked as experimental (lower maturity)
         let raptor = comparisons

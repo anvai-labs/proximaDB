@@ -1,5 +1,5 @@
 //! Engine metrics integration test
-//! Demonstrates DSST and DVIPER integration with unified metrics framework
+//! Demonstrates engine integration with the unified metrics framework (ORPHANED: references removed DSST/DVIPER engines; see TD-ORPHAN-1)
 
 use anyhow::Result;
 use proximadb::{

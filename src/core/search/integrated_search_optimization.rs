@@ -33,7 +33,7 @@ use crate::index::axis::management::manager::AxisManager;
 #[cfg(feature = "axis")]
 use crate::index::axis::storage::serialization::Index;
 // `axis_manager` is never `Some` in production (only the storage engine sets it, and
-// the viper orchestrator doesn't). Aliased so the field compiles with `axis` off.
+// the columnar orchestrator doesn't). Aliased so the field compiles with `axis` off.
 #[cfg(feature = "axis")]
 type AxisManagerField = Option<Arc<AxisManager>>;
 #[cfg(not(feature = "axis"))]

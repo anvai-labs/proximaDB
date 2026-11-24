@@ -810,7 +810,6 @@ impl FilesystemFactory {
         let metadata_serializer: Arc<dyn crate::storage::persistence::filesystem::metadata_traits::EngineMetadataSerializer> =
             match engine_type.as_str() {
                 "sst" => Arc::new(crate::storage::engines::core::sst_format_serializer::SstUnifiedMetadataSerializer::new()),
-                "viper" => Arc::new(crate::storage::engines::core::parquet_format_serializer::ViperMetadataSerializer::new()),
                 "raptor" => Arc::new(crate::storage::engines::core::matrix_trinity_serializer::RaptorUnifiedMetadataSerializer::new()),
                 "nova" => Arc::new(crate::storage::engines::core::columnar_format_serializer::NovaUnifiedMetadataSerializer::new()),
                 "swift" => Arc::new(crate::storage::engines::core::proximablocks_compact_serializer::SwiftUnifiedMetadataSerializer::new()),

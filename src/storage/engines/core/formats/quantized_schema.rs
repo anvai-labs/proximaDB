@@ -2,7 +2,7 @@
 //!
 //! This module provides unified schema building for quantized vector storage
 //! across both ProximaBlock-based engines (SST, SWIFT, HELIX) and Parquet-based
-//! engines (VIPER, NOVA).
+//! engines (NOVA).
 //!
 //! Key Design:
 //! - Schema is built once and reused across all files in a collection

@@ -8,7 +8,7 @@
 //! ```text
 //! StorageFormat (base)
 //!       │
-//!       ├── InternalFormat (SST, Helix, Viper, etc.)
+//!       ├── InternalFormat (SST, Helix, etc.)
 //!       │   - Full control over format
 //!       │   - Managed compaction
 //!       │   - ProximaDB-native statistics
@@ -339,7 +339,6 @@ pub enum FormatType {
     // Internal formats
     Sst,
     Helix,
-    Viper,
     Nova,
     Swift,
     Raptor,
@@ -386,7 +385,7 @@ pub trait StorageFormat: Send + Sync + Debug {
     fn supports_feature(&self, feature: &str) -> bool;
 }
 
-/// Internal formats with full control (SST, Helix, Viper, etc.)
+/// Internal formats with full control (SST, Helix, etc.)
 ///
 /// Internal formats are fully managed by ProximaDB and provide:
 /// - Direct control over file layout

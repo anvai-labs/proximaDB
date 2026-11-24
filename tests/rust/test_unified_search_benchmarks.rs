@@ -1,4 +1,8 @@
 // Import the common test helpers
+// ORPHANED TEST (not in any compile target — see TD-ORPHAN-1): references the
+// VIPER engine removed by ADR-093 stage 3 / TD-VIPER-1 S3. Unreachable code;
+// cleanup of the file itself belongs to the orphan-file program, not the
+// engine-removal PR.
 #[path = "../common/mod.rs"]
 mod common;
 

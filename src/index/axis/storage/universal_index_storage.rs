@@ -21,8 +21,8 @@
 //!
 //! Key Principles:
 //! - Memory: bincode format, LRU eviction triggers demotion to disk
-//! - NVMe/HDD: SST or VIPER format, only eviction (no demotion between disk tiers)
-//! - S3: SST or VIPER format, promotion to local disk for bloom filter/columnar scan benefits
+//! - NVMe/HDD: SST format, only eviction (no demotion between disk tiers)
+//! - S3: SST format, promotion to local disk for bloom filter/columnar scan benefits
 //! - S3 → Disk promotion uses /tmp (if NVMe not configured) or HDD as staging
 
 use anyhow::{Result, anyhow};
@@ -52,17 +52,17 @@ pub trait IndexData: Serialize + for<'de> Deserialize<'de> + Clone + Send + Sync
 pub enum StorageLocation {
     /// In-memory with bincode format
     Memory,
-    /// NVMe SSD with SST/VIPER format
+    /// NVMe SSD with SST format
     NvmeSsd {
         /// Root directory on the NVMe SSD
         path: PathBuf,
     },
-    /// HDD with SST/VIPER format
+    /// HDD with SST format
     HardDisk {
         /// Root directory on the hard disk
         path: PathBuf,
     },
-    /// S3 Express One Zone with SST/VIPER format
+    /// S3 Express One Zone with SST format
     S3Express {
         /// S3 bucket name
         bucket: String,
@@ -76,8 +76,6 @@ pub enum StorageLocation {
 pub enum StorageEngine {
     /// Sorted String Table engine — bloom-filter accelerated key lookup
     SST,
-    /// VIPER columnar engine — Parquet-based analytical storage
-    VIPER,
 }
 
 /// Index storage configuration
@@ -209,7 +207,7 @@ impl<T: IndexData> UniversalIndexStorage<T> {
                 }
             }
             Some(StorageLocation::NvmeSsd { path }) => {
-                // Read from NVMe using SST/VIPER
+                // Read from NVMe using SST
                 let data = self.read_from_disk(&path, id).await?;
                 if let Some(d) = data {
                     // Promote to memory
@@ -218,7 +216,7 @@ impl<T: IndexData> UniversalIndexStorage<T> {
                 }
             }
             Some(StorageLocation::HardDisk { path }) => {
-                // Read from HDD using SST/VIPER
+                // Read from HDD using SST
                 let data = self.read_from_disk(&path, id).await?;
                 if let Some(d) = data {
                     // Promote to memory (and optionally NVMe if available)
@@ -307,7 +305,7 @@ impl<T: IndexData> UniversalIndexStorage<T> {
         Ok(())
     }
 
-    /// Demote data from memory to disk (convert bincode → SST/VIPER)
+    /// Demote data from memory to disk (convert bincode → SST)
     async fn demote_to_disk(
         &self,
         id: &str,
@@ -347,18 +345,13 @@ impl<T: IndexData> UniversalIndexStorage<T> {
                 let sorted_records_iter = records.into_values(); // Extract values from BTreeMap
                 writer.write_pax_segment(sorted_records_iter, id).await?;
             }
-            StorageEngine::VIPER => {
-                // Write as VIPER (Parquet)
-                // In production, use VIPER writer
-                debug!("Writing {} to VIPER at {:?}", id, file_path);
-            }
         }
 
         self.data_locations.insert(id.to_string(), location);
         Ok(())
     }
 
-    /// Read data from disk (SST/VIPER format)
+    /// Read data from disk (SST format)
     async fn read_from_disk(&self, path: &PathBuf, id: &str) -> Result<Option<T>> {
         let file_path = self.get_disk_path(path, id);
 
@@ -405,11 +398,6 @@ impl<T: IndexData> UniversalIndexStorage<T> {
                     );
                 }
             }
-            StorageEngine::VIPER => {
-                // Read from VIPER (Parquet)
-                // In production, use VIPER reader
-                debug!("Reading {} from VIPER at {:?}", id, file_path);
-            }
         }
 
         Ok(None)
@@ -437,24 +425,16 @@ impl<T: IndexData> UniversalIndexStorage<T> {
             bucket, s3_key, staging_file
         );
 
-        // Read from staging using SST/VIPER reader
-        match self.storage_engine {
-            StorageEngine::SST => {
-                if staging_file.exists() {
-                    // For now, skip reading from staged S3 file since it's complex to implement properly
-                    debug!("Skipping S3 staged file read for id: {}", id);
-                }
-            }
-            StorageEngine::VIPER => {
-                // Use VIPER reader for Parquet
-                debug!("Reading promoted VIPER data from {:?}", staging_file);
-            }
+        // Read from staging using the SST reader
+        if staging_file.exists() {
+            // For now, skip reading from staged S3 file since it's complex to implement properly
+            debug!("Skipping S3 staged file read for id: {}", id);
         }
 
         Ok(None)
     }
 
-    /// Promote data to memory (convert SST/VIPER → bincode)
+    /// Promote data to memory (convert SST → bincode)
     async fn promote_to_memory(&self, id: &str, data: T) -> Result<()> {
         let bytes = bincode::serialize(&data)?;
         self.memory_cache.insert(id.to_string(), bytes);
@@ -485,7 +465,7 @@ impl<T: IndexData> UniversalIndexStorage<T> {
     async fn demote_to_s3(&self, id: &str, data: T, bucket: &str) -> Result<()> {
         let prefix = format!("{}/{}", self.collection_id, self.index_type);
 
-        // First write to staging in SST/VIPER format
+        // First write to staging in SST format
         let staging_file = self
             .staging_path
             .join(format!("{}_{}", self.collection_id, id));
@@ -527,10 +507,6 @@ impl<T: IndexData> UniversalIndexStorage<T> {
                 let sorted_records_iter = records.into_values(); // Extract values from BTreeMap
                 writer.write_pax_segment(sorted_records_iter, id).await?;
             }
-            StorageEngine::VIPER => {
-                // Write VIPER format
-                debug!("Writing VIPER to staging {:?}", staging_file);
-            }
         }
 
         // Upload to S3
@@ -553,7 +529,6 @@ impl<T: IndexData> UniversalIndexStorage<T> {
     fn get_disk_path(&self, base: &PathBuf, id: &str) -> PathBuf {
         let ext = match self.storage_engine {
             StorageEngine::SST => "sst",
-            StorageEngine::VIPER => "parquet",
         };
         base.join(&self.collection_id)
             .join(&self.index_type)

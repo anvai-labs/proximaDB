@@ -17,7 +17,7 @@
 //! Unified Vector Serialization Utilities
 //!
 //! This module provides centralized, high-performance vector serialization
-//! that can be shared across all storage engines (SST, VIPER, HELIX, NOVA, SWIFT, RAPTOR).
+//! that can be shared across all storage engines (SST, HELIX, NOVA, SWIFT, RAPTOR).
 //!
 //! ## Design Principles
 //!

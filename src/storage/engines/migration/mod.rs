@@ -1,5 +1,5 @@
 // Engine Migration Utilities
-// Tools for migrating data between different storage engines (VIPER ↔ SST ↔ SWIFT ↔ NOVA)
+// Tools for migrating data between different storage engines (SST ↔ SWIFT ↔ NOVA)
 
 pub mod migrator;
 // Deferred: Implement missing modules for full migration support
@@ -181,7 +181,7 @@ pub enum MigrationEventType {
 impl Default for EngineMigrationConfig {
     fn default() -> Self {
         Self {
-            source_engine: ProtoStorageEngine::Viper,
+            source_engine: ProtoStorageEngine::Sst,
             target_engine: ProtoStorageEngine::Nova,
             collections: Vec::new(),
             strategy: MigrationStrategy::CopyThenSwitch,
@@ -242,14 +242,13 @@ pub mod utils {
             // Same engine - no migration needed
             (a, b) if a == b => false,
 
-            // All engines support migration to/from each other
-            (ProtoStorageEngine::Viper, _) => true,
+            // VIPER was removed (ADR-093): no migration path exists — the
+            // target engine list intentionally omits it.
             (ProtoStorageEngine::Sst, _) => true,
             (ProtoStorageEngine::Swift, _) => true,
             (ProtoStorageEngine::Nova, _) => true,
 
-            // From any engine to VIPER/SST/SWIFT/NOVA
-            (_, ProtoStorageEngine::Viper) => true,
+            // From any engine to SST/SWIFT/NOVA
             (_, ProtoStorageEngine::Sst) => true,
             (_, ProtoStorageEngine::Swift) => true,
             (_, ProtoStorageEngine::Nova) => true,
@@ -266,16 +265,6 @@ pub mod utils {
         data_size_gb: f64,
     ) -> MigrationStrategy {
         match (source, target) {
-            // Columnar to columnar (VIPER ↔ NOVA) - fast migration
-            (ProtoStorageEngine::Viper, ProtoStorageEngine::Nova)
-            | (ProtoStorageEngine::Nova, ProtoStorageEngine::Viper) => {
-                if data_size_gb < 100.0 {
-                    MigrationStrategy::CopyThenSwitch
-                } else {
-                    MigrationStrategy::GradualWithDualWrite
-                }
-            }
-
             // Row-based to row-based (SST ↔ SWIFT) - medium complexity
             (ProtoStorageEngine::Sst, ProtoStorageEngine::Swift)
             | (ProtoStorageEngine::Swift, ProtoStorageEngine::Sst) => {
@@ -303,9 +292,6 @@ pub mod utils {
         // Base throughput estimates (GB/hour)
         let throughput = match (source, target) {
             // Same paradigm migrations
-            (ProtoStorageEngine::Viper, ProtoStorageEngine::Nova)
-            | (ProtoStorageEngine::Nova, ProtoStorageEngine::Viper) => 50.0,
-
             (ProtoStorageEngine::Sst, ProtoStorageEngine::Swift)
             | (ProtoStorageEngine::Swift, ProtoStorageEngine::Sst) => 40.0,
 
@@ -335,7 +321,6 @@ pub mod utils {
     /// Get engine display name
     pub fn engine_display_name(engine: ProtoStorageEngine) -> &'static str {
         match engine {
-            ProtoStorageEngine::Viper => "VIPER (Columnar Analytics)",
             ProtoStorageEngine::Sst => "SST (Hybrid Columnar OLTP)",
             ProtoStorageEngine::Swift => "SWIFT (Instant Fast Traversal)",
             ProtoStorageEngine::Nova => "NOVA (Optimized Vector Analytics)",
@@ -393,13 +378,13 @@ mod tests {
     fn test_migration_support() {
         // Same engine - no migration needed
         assert!(!is_migration_supported(
-            ProtoStorageEngine::Viper,
-            ProtoStorageEngine::Viper
+            ProtoStorageEngine::Sst,
+            ProtoStorageEngine::Sst
         ));
 
         // Supported migrations
         assert!(is_migration_supported(
-            ProtoStorageEngine::Viper,
+            ProtoStorageEngine::Sst,
             ProtoStorageEngine::Nova
         ));
         assert!(is_migration_supported(
@@ -414,37 +399,39 @@ mod tests {
         // Reverse directions
         assert!(is_migration_supported(
             ProtoStorageEngine::Nova,
-            ProtoStorageEngine::Viper
+            ProtoStorageEngine::Sst
         ));
         assert!(is_migration_supported(
             ProtoStorageEngine::Swift,
             ProtoStorageEngine::Sst
         ));
+
+        // VIPER was removed (ADR-093): no migration path in either direction
+        assert!(!is_migration_supported(
+            ProtoStorageEngine::Viper,
+            ProtoStorageEngine::Sst
+        ));
+        assert!(!is_migration_supported(
+            ProtoStorageEngine::Sst,
+            ProtoStorageEngine::Viper
+        ));
     }
 
     #[test]
     fn test_migration_strategy_recommendation() {
-        // Small data - copy then switch
+        // Cross-paradigm - copy-then-switch for small data
         let strategy = recommend_migration_strategy(
-            ProtoStorageEngine::Viper,
             ProtoStorageEngine::Nova,
+            ProtoStorageEngine::Sst,
             10.0, // 10GB
         );
         assert!(matches!(strategy, MigrationStrategy::CopyThenSwitch));
 
-        // Large data - gradual migration
-        let strategy = recommend_migration_strategy(
-            ProtoStorageEngine::Viper,
-            ProtoStorageEngine::Nova,
-            500.0, // 500GB
-        );
-        assert!(matches!(strategy, MigrationStrategy::GradualWithDualWrite));
-
         // Cross-paradigm - blue-green for large data
         let strategy = recommend_migration_strategy(
-            ProtoStorageEngine::Viper,
+            ProtoStorageEngine::Nova,
             ProtoStorageEngine::Sst,
-            100.0, // 100GB
+            500.0, // 500GB
         );
         assert!(matches!(strategy, MigrationStrategy::BlueGreen));
     }
@@ -454,8 +441,8 @@ mod tests {
         let config = MigrationPerformanceConfig::default();
 
         let duration = estimate_migration_time(
-            ProtoStorageEngine::Viper,
-            ProtoStorageEngine::Nova,
+            ProtoStorageEngine::Sst,
+            ProtoStorageEngine::Swift,
             100.0, // 100GB
             &config,
         );
@@ -484,10 +471,6 @@ mod tests {
 
     #[test]
     fn test_engine_display_names() {
-        assert_eq!(
-            engine_display_name(ProtoStorageEngine::Viper),
-            "VIPER (Columnar Analytics)"
-        );
         assert_eq!(
             engine_display_name(ProtoStorageEngine::Swift),
             "SWIFT (Instant Fast Traversal)"

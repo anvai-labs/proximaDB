@@ -93,7 +93,7 @@
 //! 2. **Zero-Copy Operations**: Minimize data copying throughout the pipeline
 //! 3. **Hardware Adaptive**: Automatic detection and use of SIMD/GPU capabilities
 //! 4. **Cloud-Native Storage**: Seamless integration with S3, Azure Blob, GCS
-//! 5. **Pluggable Storage Engines**: Support for different workload patterns (SST, VIPER, NOVA, etc.)
+//! 5. **Pluggable Storage Engines**: Support for different workload patterns (SST, NOVA, etc.)
 //!
 //! ## Key Features
 //!

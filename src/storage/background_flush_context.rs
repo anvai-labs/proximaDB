@@ -19,8 +19,6 @@ use proximadb_storage_ports::CollectionMetadataPort;
 /// Storage engine types supported by ProximaDB
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StorageEngineType {
-    /// VIPER - Columnar Parquet-based engine for analytics workloads
-    Viper,
     /// SST - Hybrid columnar SSTable engine for OLTP workloads (ProximaBlocks format)
     Sst,
     /// TST - Time-series optimized storage engine
@@ -32,9 +30,8 @@ impl TryFrom<i32> for StorageEngineType {
 
     fn try_from(value: i32) -> Result<Self> {
         match value {
-            x if x == crate::proto::proximadb_v1::StorageEngine::Viper as i32 => {
-                Ok(StorageEngineType::Viper)
-            }
+            // VIPER (proto value 1) fails closed here: the engine was removed
+            // (ADR-093 S3) and no background flush can target it.
             x if x == crate::proto::proximadb_v1::StorageEngine::Sst as i32 => {
                 Ok(StorageEngineType::Sst)
             }
@@ -102,7 +99,7 @@ pub struct BackgroundFlushContext {
     pub collection_id: String,
 
     // === Engine Configuration ===
-    /// Storage engine type (VIPER vs SST)
+    /// Storage engine type (SST / TST)
     pub storage_engine: StorageEngineType,
     /// Base storage location path (e.g., "file:///data/disk1")
     pub base_location: String,
@@ -186,7 +183,6 @@ impl BackgroundFlushContext {
         use crate::proto::proximadb_v1::StorageEngine as ProtoStorageEngine;
 
         match engine {
-            StorageEngineType::Viper => ProtoStorageEngine::Viper as i32,
             StorageEngineType::Sst => ProtoStorageEngine::Sst as i32,
             StorageEngineType::Tst => ProtoStorageEngine::Tst as i32,
         }
@@ -289,11 +285,6 @@ impl BackgroundFlushContext {
 
         // Create compression config based on storage engine defaults
         let compression_config = match storage_engine {
-            StorageEngineType::Viper => BackgroundFlushCompressionConfig {
-                enabled: true,
-                compression_type: "zstd".to_string(),
-                level: 3, // Balanced for Parquet
-            },
             StorageEngineType::Sst => BackgroundFlushCompressionConfig {
                 enabled: true,
                 compression_type: "snappy".to_string(),
@@ -332,7 +323,6 @@ impl BackgroundFlushContext {
 
         // Determine batch size hint based on dimension and engine
         let batch_size_hint = match storage_engine {
-            StorageEngineType::Viper => Some(1000.min(10000 / (config.dimension / 100).max(1))),
             StorageEngineType::Sst => Some(500.min(5000 / (config.dimension / 100).max(1))),
             StorageEngineType::Tst => Some(2000.min(20000 / (config.dimension / 100).max(1))),
         };
@@ -383,21 +373,14 @@ impl BackgroundFlushContext {
     /// Get engine name as string (for compatibility with existing code)
     pub fn engine_name(&self) -> &str {
         match self.storage_engine {
-            StorageEngineType::Viper => "viper",
             StorageEngineType::Sst => "sst",
             StorageEngineType::Tst => "tst",
         }
     }
 
-    /// Get suggested row group size for Parquet (VIPER engine)
+    /// Get suggested row group size for Parquet
     pub fn row_group_size(&self) -> usize {
         match self.storage_engine {
-            StorageEngineType::Viper => {
-                // Balance between compression efficiency and memory usage
-                let base_size = 10_000;
-                let dimension_factor = (self.dimension / 100).max(1);
-                (base_size / dimension_factor).clamp(1_000, 50_000)
-            }
             StorageEngineType::Sst => 1_000, // Smaller for OLTP workloads
             StorageEngineType::Tst => {
                 let base_size = 20_000;
@@ -410,12 +393,6 @@ impl BackgroundFlushContext {
     /// Get suggested flush threshold in number of vectors
     pub fn flush_threshold(&self) -> usize {
         match self.storage_engine {
-            StorageEngineType::Viper => {
-                // VIPER benefits from larger batches for columnar compression
-                let base_threshold = 50_000;
-                let dimension_factor = (self.dimension / 100).max(1);
-                (base_threshold / dimension_factor).clamp(10_000, 100_000)
-            }
             StorageEngineType::Sst => {
                 // SST optimized for smaller, frequent flushes
                 let base_threshold = 10_000;

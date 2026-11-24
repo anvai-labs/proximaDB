@@ -10,7 +10,7 @@
 //! - **WS3**: Smart I/O Layer with ParallelReader
 //! - **WS4**: DataFusion TableProvider integration
 //! - **WS5**: ProximaRecordBridge for Arrow conversions
-//! - **WS6**: Engine TableProvider Adapters (SST, HELIX, VIPER)
+//! - **WS6**: Engine TableProvider Adapters (SST, HELIX)
 //!
 //! ## Test Categories
 //!

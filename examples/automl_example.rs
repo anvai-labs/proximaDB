@@ -319,7 +319,7 @@ async fn tune_index_parameters(algorithm: &str) -> Result<(), Box<dyn std::error
 // ✅ Optimization complete!
 //   Optimal Index: HNSW
 //   Optimal Quantization: PQ8
-//   Optimal Engine: VIPER
+//   Optimal Engine: NOVA
 //   Optimal Cache: 1024 MB
 // 🎯 Tuning hyperparameters...
 // Running hyperparameter tuning with TPE algorithm...

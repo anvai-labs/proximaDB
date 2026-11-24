@@ -43,7 +43,7 @@ pub struct DomainSearchResult {
 pub type DistanceMetric = String;
 /// Indexing algorithm name (e.g., "hnsw", "ivf", "flat")
 pub type IndexingAlgorithm = String;
-/// Storage engine name (e.g., "sst", "viper", "helix")
+/// Storage engine name (e.g., "sst", "nova", "helix")
 pub type StorageEngine = String;
 
 // Re-export foundation compression algorithm type for backward compatibility

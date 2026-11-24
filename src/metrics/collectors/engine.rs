@@ -1,7 +1,7 @@
 //! # Engine Metrics Collector Module
 //!
 //! This module provides comprehensive metrics collection for ProximaDB's storage
-//! engines (SST, VIPER, NOVA, SWIFT, RAPTOR, PRISM). It tracks performance,
+//! engines (SST, NOVA, SWIFT, RAPTOR, PRISM). It tracks performance,
 //! resource usage, and operational health for each engine.
 //!
 //! ## Architecture
@@ -26,7 +26,6 @@
 //!
 //! ### Engine-Specific Metrics
 //! - **SST**: Compaction stats, bloom filter efficiency
-//! - **VIPER**: Parquet row group statistics, zone map hits
 //! - **NOVA**: Columnar scan efficiency, predicate pushdown
 //! - **SWIFT**: Block cache hit rate, superblock utilization
 //! - **RAPTOR**: Matrix operations, HNSW graph metrics
@@ -59,7 +58,7 @@ use tracing::debug;
 /// 4. **Thread Safety**: RwLock for safe concurrent access with read-heavy workload
 pub struct EngineMetricsCollector {
     /// Weak references to engines to avoid circular dependencies
-    /// Key: engine name (e.g., "sst_collection1", "viper_analytics")
+    /// Key: engine name (e.g., "sst_collection1", "nova_analytics")
     engines: Arc<RwLock<HashMap<String, Weak<dyn UnifiedStorageFormat>>>>,
 
     /// Last collection time for rate calculations

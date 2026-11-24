@@ -605,16 +605,6 @@ fn rebase_default_relative_paths(
         tracing::info!(dir = %next, "rebased shipped-/tmp WAL directory under the data dir");
         config.storage.wal_config.write_buffer_directory = next;
     }
-    if let Some(viper) = config.storage.viper_config.as_mut() {
-        let value = viper.data_directory.clone();
-        if value == "./data/viper_data" {
-            viper.data_directory = format!("{base}/data/viper_data");
-            tracing::info!(dir = %viper.data_directory, "rebased default viper directory under the data dir");
-        } else if let Some(next) = rebase_default_root(&value, &base, false) {
-            tracing::info!(dir = %next, "rebased shipped-/tmp viper directory under the data dir");
-            viper.data_directory = next;
-        }
-    }
     if let Some(sst) = config.storage.sst_config.as_mut() {
         let value = sst.data_directory.clone();
         if value == "./sst_data" {
@@ -715,10 +705,6 @@ mod path_rebase_tests {
             data_directory: "/tmp/proximadb/data/sst_data".into(),
             ..Default::default()
         });
-        config.storage.viper_config = Some(proximadb::core::config::ViperConfig {
-            data_directory: "/tmp/proximadb/data/data/viper_data".into(),
-            ..Default::default()
-        });
         config.security = Some(security_config_with_file_audit("/tmp/proximadb/audit"));
 
         rebase_default_relative_paths(&mut config, std::path::Path::new("/var/lib/proximadb"));
@@ -750,10 +736,6 @@ mod path_rebase_tests {
         assert_eq!(
             config.storage.sst_config.as_ref().unwrap().data_directory,
             "/var/lib/proximadb/data/sst_data"
-        );
-        assert_eq!(
-            config.storage.viper_config.as_ref().unwrap().data_directory,
-            "/var/lib/proximadb/data/data/viper_data"
         );
         match &config.security.as_ref().unwrap().audit.storage_backend {
             proximadb::security::AuditStorageBackend::File { directory } => {

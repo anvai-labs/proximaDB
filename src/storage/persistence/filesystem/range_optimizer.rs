@@ -94,7 +94,7 @@ impl RangeOptimizer {
         // Optimize based on storage engine type
         match storage_engine.to_lowercase().as_str() {
             "viper" | "nova" => {
-                // VIPER and NOVA use Parquet format
+                // NOVA uses Parquet format
                 // Always need the footer (last 8 bytes + footer size)
                 // Estimate footer size as 1% of file or 64KB, whichever is smaller
                 let footer_size = std::cmp::min(file_size / 100, 65536);

@@ -223,7 +223,6 @@
 //! |--------|---------------|---------|
 //! | SST | `block_index`, `bloom_filter`, `sst_level` | LSM-tree |
 //! | HELIX | `hilbert_config`, `pca_model` | Spatial locality |
-//! | VIPER | Parquet row-groups | Columnar analytics |
 //! | NOVA | `hierarchical_stats`, `zone_maps` | Progressive columnar |
 //! | SWIFT | `composite_indexes` | Ultra-low latency |
 //! | RAPTOR | `centroid_matrix` | Adaptive clustering |

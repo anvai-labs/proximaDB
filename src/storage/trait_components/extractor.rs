@@ -5,7 +5,7 @@
 //!
 //! ## Design Goals
 //!
-//! 1. **Engine-Agnostic**: Same interface for SST, HELIX, VIPER, NOVA, SWIFT, RAPTOR
+//! 1. **Engine-Agnostic**: Same interface for SST, HELIX, NOVA, SWIFT, RAPTOR
 //! 2. **Flexible Extraction**: Support full, incremental, and selective extraction
 //! 3. **Format Awareness**: Handle FP32, INT8, Binary, and PQ vectors
 //! 4. **Cost Estimation**: Enable query planning with extraction cost estimates
@@ -62,7 +62,7 @@ pub trait VectorExtractor: Send + Sync {
 /// Build the O(1) selective-extraction id filter (TD-DSEFF-1 pattern): a set
 /// built once per extraction so the per-record membership check is O(1).
 /// Previously each engine hand-rolled this — sst/nova/swift used the set,
-/// helix/viper/raptor did a linear `ids.contains` per record, and tst
+/// helix/raptor did a linear `ids.contains` per record, and tst
 /// ignored `vector_ids` entirely (redundancy pass 3 harmonization).
 ///
 /// Note: engines currently consult the filter at different points — some
@@ -548,9 +548,6 @@ impl ExtractionFactory {
             ),
             StorageEngineType::HELIX => Arc::new(
                 crate::storage::engines::helix::extraction::HelixExtractor::new(filesystem),
-            ),
-            StorageEngineType::VIPER => Arc::new(
-                crate::storage::engines::viper::extraction::ViperExtractor::new(filesystem),
             ),
             StorageEngineType::NOVA => {
                 Arc::new(crate::storage::engines::nova::extraction::NovaExtractor::new(filesystem))

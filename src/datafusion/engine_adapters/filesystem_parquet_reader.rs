@@ -1,7 +1,7 @@
 //! # Parquet-over-FileSystem Table Provider
 //!
 //! Reads external Parquet files through ProximaDB's canonical [`FileSystem`] trait — the
-//! same abstraction VIPER uses — so the *same code path* serves a local `file://` Parquet
+//! same abstraction NOVA uses — so the *same code path* serves a local `file://` Parquet
 //! in dev and an `s3://` object-store Parquet in production. This is the I/O side of the
 //! financial benchmark (`docs/12-design/PROXIMA_NOTEBOOK_PSEUDO_DISTRIBUTED_BLUEPRINT_2026_06_04.adoc`):
 //! demonstrate object-storage reads + DataFusion parallel compute without a JVM.
@@ -113,8 +113,8 @@ impl SplitReader for FilesystemParquetSplitReader {
     }
 
     fn engine_type(&self) -> EngineType {
-        // Parquet/columnar — reuse the VIPER engine label.
-        EngineType::Viper
+        // Parquet/columnar — reuse the NOVA engine label (VIPER removed, ADR-093).
+        EngineType::Nova
     }
 
     fn supports_projection_pushdown(&self) -> bool {

@@ -4,7 +4,7 @@
 //! checks the write buffer first, then resolves the collection's persisted
 //! storage assignment and delegates to that engine's neutral `point_lookup`
 //! contract. Keeping this boundary in one place prevents protocol surfaces from
-//! inventing SST-specific fallbacks that bypass HELIX/VIPER/NOVA or object-store
+//! inventing SST-specific fallbacks that bypass HELIX/NOVA or object-store
 //! routing.
 
 use std::sync::Arc;

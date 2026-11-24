@@ -178,8 +178,6 @@ To benchmark individual storage engines:
 # SST engine
 cargo test --bench sst_engine -- --nocapture
 
-# VIPER engine (Parquet)
-cargo test --bench viper_engine -- --nocapture
 
 # All engines
 cargo test --benches -- --nocapture

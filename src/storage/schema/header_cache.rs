@@ -61,7 +61,7 @@ pub struct CachedHeader {
     pub last_modified: i64,
     /// Header size in bytes (for cache memory tracking)
     pub header_size_bytes: usize,
-    /// Format type (SST, HELIX, VIPER, etc.)
+    /// Format type (SST, HELIX, etc.)
     pub format_type: String,
     /// Engine-specific metadata
     pub engine_metadata: HashMap<String, String>,
@@ -435,7 +435,7 @@ pub enum SpatialRange {
     },
     /// SST: Block ID range (sequential blocks)
     BlockRange { start_block: u32, end_block: u32 },
-    /// VIPER: Parquet rowgroup (native Parquet stats)
+    /// Parquet rowgroup (native Parquet stats, NOVA)
     ParquetRowGroup { row_group_index: usize },
 }
 

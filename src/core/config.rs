@@ -889,7 +889,6 @@ impl Default for StorageConfig {
             prune_mode: None,
             mmap_enabled: true,
             sst_config: Some(SstConfig::default()),
-            viper_config: Some(ViperConfig::default()),
             cache_size_mb: 512,
             bloom_filter_config: Some(BloomFilterConfig::default()),
             compaction_config: CompactionConfig::default(),
@@ -964,8 +963,6 @@ pub struct CoreStorageConfig {
     /// lapsed the incarnation and fenced an ingest batch).
     #[serde(default = "default_write_lease_ttl_ms")]
     pub write_lease_ttl_ms: u64,
-    /// VIPER columnar engine configuration
-    pub viper_config: Option<ViperConfig>,
     /// Global read cache size in megabytes
     pub cache_size_mb: u64,
     /// Bloom filter settings for metadata filtering
@@ -1942,43 +1939,6 @@ fn default_block_format() -> String {
     "ProximaBlocks".to_string()
 }
 
-/// VIPER (columnar storage) engine configuration
-///
-/// **Note**: VIPER uses Parquet's native columnar format and does NOT use ProximaDataBlocks.
-/// Therefore, it does not have `vector_encoding_strategy` (that's only for ProximaDataBlocks
-/// which use columnar encoding within blocks, as used by SST engine).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ViperConfig {
-    /// Parquet file configuration
-    pub row_group_size: usize,
-    /// Compression for Parquet files (snappy, gzip, lz4, zstd)
-    pub compression: String,
-    /// Compression level (1-22 for ZSTD, ignored for other algorithms)
-    pub compression_level: i32,
-    /// Enable statistics in Parquet files
-    pub enable_statistics: bool,
-    /// Data directory for VIPER files
-    pub data_directory: String,
-    /// Cache size for columnar data in MB
-    pub cache_size_mb: u64,
-
-    /// Compaction configuration (overrides common config if specified)
-    pub compaction_config: Option<CompactionConfig>,
-}
-
-impl Default for ViperConfig {
-    fn default() -> Self {
-        Self {
-            row_group_size: 65536,           // ~32MB row groups for 128D vectors
-            compression: "zstd".to_string(), // ZSTD for better compression
-            compression_level: 3,            // Balanced speed/compression
-            enable_statistics: true,
-            data_directory: "./data/viper_data".to_string(),
-            cache_size_mb: 512,
-            compaction_config: None, // Use common config by default
-        }
-    }
-}
 #[allow(dead_code)]
 fn default_compression_level() -> i32 {
     3 // Balanced compression level

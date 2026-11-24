@@ -401,13 +401,13 @@ impl WALFlushCoordinator {
                 // Map proto storage engine enum to string
                 use crate::proto::proximadb_v1::StorageEngine;
                 match StorageEngine::try_from(config.storage_engine.unwrap_or(0)) {
-                    Ok(StorageEngine::Viper) => "viper",
+                    Ok(StorageEngine::Viper) => "viper", // wire label; engine removed (ADR-093)
                     Ok(StorageEngine::Sst) => "sst",
                     Ok(StorageEngine::Tst) => "tst",
-                    _ => preferred_engine.unwrap_or("viper"), // Default to viper or provided preference
+                    _ => preferred_engine.unwrap_or("sst"),
                 }
             } else {
-                preferred_engine.unwrap_or("viper")
+                preferred_engine.unwrap_or("sst")
             }
         } else {
             preferred_engine.ok_or_else(|| {

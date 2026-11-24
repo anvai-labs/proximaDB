@@ -528,9 +528,6 @@ impl UniversalDistanceAdapter {
                 EngineType::SWIFT => {
                     Arc::new(super::storage_integration::SWIFTAdapter::new(engine_config).await?)
                 }
-                EngineType::VIPER => {
-                    Arc::new(super::storage_integration::VIPERAdapter::new(engine_config).await?)
-                }
                 EngineType::SST => {
                     Arc::new(super::storage_integration::SSTAdapter::new(engine_config).await?)
                 }

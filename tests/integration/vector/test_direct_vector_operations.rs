@@ -115,7 +115,7 @@ async fn test_basic_vector_operations() {
         name: "test_collection".to_string(),
         dimension: 128,
         distance_metric: DistanceMetric::Cosine as i32,
-        storage_engine: StorageEngine::Viper as i32,
+        storage_engine: StorageEngine::Sst as i32,
         primary_indexing_algorithm: IndexingAlgorithm::Hnsw as i32,
         ..Default::default()
                 compression: None,
@@ -241,7 +241,7 @@ async fn test_streaming_search() {
         name: "streaming_test_collection".to_string(),
         dimension: 128,
         distance_metric: DistanceMetric::Manhattan as i32,
-        storage_engine: StorageEngine::Viper as i32,
+        storage_engine: StorageEngine::Sst as i32,
         primary_indexing_algorithm: IndexingAlgorithm::Hnsw as i32,
         ..Default::default()
                 compression: None,
@@ -298,7 +298,7 @@ async fn test_metadata_filtering() {
         name: "filter_test_collection".to_string(),
         dimension: 128,
         distance_metric: DistanceMetric::Cosine as i32,
-        storage_engine: StorageEngine::Viper as i32,
+        storage_engine: StorageEngine::Sst as i32,
         primary_indexing_algorithm: IndexingAlgorithm::Hnsw as i32,
         filterable_columns: vec![
             "category".to_string(),
@@ -468,7 +468,7 @@ async fn test_metrics_and_health() {
         name: "metrics_test_collection".to_string(),
         dimension: 128,
         distance_metric: DistanceMetric::Cosine as i32,
-        storage_engine: StorageEngine::Viper as i32,
+        storage_engine: StorageEngine::Sst as i32,
         primary_indexing_algorithm: IndexingAlgorithm::Hnsw as i32,
         ..Default::default()
                 compression: None,

@@ -148,18 +148,18 @@ def measure_concurrent_performance(client, collection_id, dimension=128):
     
     return results
 
-def test_viper_rest():
-    """Test VIPER engine with REST protocol"""
-    print_section("VIPER Engine + REST Protocol (REAL)")
+def test_nova_rest():
+    """Test NOVA engine with REST protocol"""
+    print_section("NOVA Engine + REST Protocol (REAL)")
     
     client = connect_rest("http://localhost:5678")
-    collection_id = f"viper_rest_bench_{int(time.time())}"
+    collection_id = f"nova_rest_bench_{int(time.time())}"
     
     try:
         config = CollectionConfig(
             name=collection_id,
             dimension=128,
-            storage_engine=StorageEngine.VIPER
+            storage_engine=StorageEngine.NOVA
         )
         client.create_collection(collection_id, config)
         
@@ -208,18 +208,18 @@ def test_sst_rest():
         client.delete_collection(collection_id)
         client.close()
 
-def test_viper_grpc():
-    """Test VIPER engine with gRPC protocol"""
-    print_section("VIPER Engine + gRPC Protocol (REAL)")
+def test_nova_grpc():
+    """Test NOVA engine with gRPC protocol"""
+    print_section("NOVA Engine + gRPC Protocol (REAL)")
     
     client = connect_grpc("grpc://localhost:5679")
-    collection_id = f"viper_grpc_bench_{int(time.time())}"
+    collection_id = f"nova_grpc_bench_{int(time.time())}"
     
     try:
         config = CollectionConfig(
             name=collection_id,
             dimension=128,
-            storage_engine=StorageEngine.VIPER
+            storage_engine=StorageEngine.NOVA
         )
         client.create_collection(collection_id, config)
         
@@ -276,11 +276,11 @@ def test_sql_performance():
     collection_id = f"sql_bench_{int(time.time())}"
     
     try:
-        # Create collection with VIPER for better SQL performance
+        # Create collection with NOVA for better SQL performance
         config = CollectionConfig(
             name=collection_id,
             dimension=128,
-            storage_engine=StorageEngine.VIPER
+            storage_engine=StorageEngine.NOVA
         )
         client.create_collection(collection_id, config)
         
@@ -355,9 +355,9 @@ def main():
     
     try:
         # Run all tests
-        all_results['VIPER+REST'] = test_viper_rest()
+        all_results['NOVA+REST'] = test_nova_rest()
         all_results['SST+REST'] = test_sst_rest()
-        all_results['VIPER+gRPC'] = test_viper_grpc()
+        all_results['NOVA+gRPC'] = test_nova_grpc()
         all_results['SST+gRPC'] = test_sst_grpc()
         
         # SQL performance

@@ -9,6 +9,10 @@
 //! - Codebook persistence and reuse across queries for collections
 //! - Performance benefits from collection-partitioned caching
 
+// ORPHANED TEST (not in any compile target — see TD-ORPHAN-1): references the
+// VIPER engine removed by ADR-093 stage 3 / TD-VIPER-1 S3. Unreachable code;
+// cleanup of the file itself belongs to the orphan-file program, not the
+// engine-removal PR.
 use proximadb::compute::{UnifiedQuantizationLevel, QuantizationLevel, ProductQuantization};
 use proximadb::proto::proximadb_v1::{
     VectorRecord, Collection, CollectionConfig, QuantizationConfig,

@@ -117,7 +117,7 @@ async fn test_collection_operations() {
         "name": "test_collection",
         "dimension": 128,
         "distance_metric": "COSINE",
-        "storage_engine": "VIPER",
+        "storage_engine": "SST",
         "primary_indexing_algorithm": "HNSW",
         "filterable_columns": ["category", "score"]
     });
@@ -262,7 +262,7 @@ async fn test_vector_search_operations() {
         "name": "search_test_collection",
         "dimension": 128,
         "distance_metric": "COSINE",
-        "storage_engine": "VIPER",
+        "storage_engine": "SST",
         "primary_indexing_algorithm": "HNSW",
         "filterable_columns": ["category", "score"]
     });
@@ -410,7 +410,7 @@ async fn test_health_and_metrics() {
         "name": "metrics_test_collection",
         "dimension": 128,
         "distance_metric": "COSINE",
-        "storage_engine": "VIPER",
+        "storage_engine": "SST",
         "primary_indexing_algorithm": "HNSW"
     });
     
@@ -502,7 +502,7 @@ async fn test_internal_endpoints() {
         "name": "flush_test_collection",
         "dimension": 128,
         "distance_metric": "COSINE",
-        "storage_engine": "VIPER",
+        "storage_engine": "SST",
         "primary_indexing_algorithm": "HNSW"
     });
     

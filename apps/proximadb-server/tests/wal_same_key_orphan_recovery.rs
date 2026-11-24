@@ -66,9 +66,6 @@ sync_mode = "PerBatch"
 data_directory = "{root}/collections"
 mmap_enabled = false
 
-[storage.viper_config]
-data_directory = "{root}/collections"
-
 [api]
 rest_port = {rest}
 grpc_port = {grpc}

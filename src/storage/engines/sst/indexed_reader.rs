@@ -78,7 +78,7 @@ impl SSTMetadataSource {
                 String::from("indexed_reader"),
             );
 
-        // Load metadata to build index cache - SST doesn't support full read like VIPER
+        // Load metadata to build index cache - SST doesn't support full-column reads
         reader.load_metadata(file_path).await?;
 
         // For SST, we'll build minimal metadata since we can't read all records efficiently
@@ -270,7 +270,7 @@ impl IndexBasedDataReader for SSTIndexBasedReader {
         // For SST, the benefit is primarily in memory usage and post-processing
         let selectivity = indices.len() as f32 / total_rows as f32;
 
-        // SST benefit is lower than VIPER since we still read entire blocks
+        // SST benefit is lower than a columnar engine since we still read entire blocks
         // But we save on memory allocation and post-processing time
         (1.0 - selectivity) * 0.3 // Up to 30% benefit for memory and processing
     }

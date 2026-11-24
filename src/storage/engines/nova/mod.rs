@@ -71,20 +71,8 @@
 //! - **Implementation**: Chunked processing with adaptive memory management
 //! - **Benefit**: Handles massive datasets without memory overflow
 //!
-//! ## 🔍 **NOVA vs VIPER: Key Differentiators**
-//!
-//! | Feature | NOVA (Analytics) | VIPER (Production) |
-//! |---------|------------------|-------------------|
-//! | **Focus** | Advanced analytics & research | High-throughput production |
-//! | **Compression** | 80-90% with hierarchical chains | 50-80% per-column optimization |
-//! | **Search** | 3-tier statistics hierarchy | Direct columnar scan |
-//! | **Quantization** | Adaptive progressive selection | Binary/INT8/PQ fixed levels |
-//! | **Use Cases** | Research, complex analytics | Real-time search, production |
-//! | **I/O Optimization** | 70-90% reduction via pruning | Standard range optimization |
-//!
 //! ## ❌ **NOT OPTIMAL FOR:**
 //!
-//! - **Simple Production Workloads**: VIPER better for straightforward use cases
 //! - **Real-Time Applications**: SST engine better for low-latency requirements
 //! - **Memory-Constrained Systems**: Streaming helps but still resource-intensive
 //! - **Small Datasets**: Overhead not justified for datasets under 1M vectors
@@ -198,7 +186,6 @@ use arrow_schema::{DataType, Field, Schema};
 use parquet::file::metadata::RowGroupMetaData;
 use std::sync::Arc;
 
-use crate::storage::engines::core::formats::columnar::FilterCondition;
 
 // Import shared columnar infrastructure
 use crate::storage::engines::core::formats::columnar::{ColumnarFileMetadata, QuantizationConfig};
@@ -241,21 +228,6 @@ pub struct NovaRowGroupStats {
     pub compressed_size: u64,
     pub id_range: (String, String),
     pub has_quantized_columns: bool,
-}
-
-/// VIPER-specific optimizations
-pub struct ViperOptimizations {
-    /// Columnar projection - only load needed columns
-    pub projection: Vec<String>,
-
-    /// Predicate pushdown - filter at storage level
-    pub predicates: Vec<FilterCondition>,
-
-    /// Row group pruning - skip irrelevant groups
-    pub pruned_groups: Vec<usize>,
-
-    /// Quantization level for search
-    pub quantization_level: QuantizationLevel,
 }
 
 #[derive(Debug, Clone)]

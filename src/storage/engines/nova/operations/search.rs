@@ -221,7 +221,7 @@ impl NovaSearchOperations {
             // id/timestamp/updated_at/version/expires_at, never the vectors).
             //
             // On the service path this branch is not reached for NOVA:
-            // `StorageQueryContext` forces `force_exact` for NOVA/VIPER/RAPTOR,
+            // `StorageQueryContext` forces `force_exact` for NOVA/RAPTOR,
             // so it is defence-in-depth for direct-engine callers.
             // Pass 1 (TD-ENGINE-MVCC-1): each id's newest copy across EVERY row of
             // EVERY file, before anything is scored, so a row is scored only if it is

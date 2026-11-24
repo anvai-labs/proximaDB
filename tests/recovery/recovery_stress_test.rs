@@ -60,8 +60,7 @@ mod recovery_stress_tests {
                 assignment_config: Default::default(),
                 mmap_enabled: true,
                 sst_config: Default::default(),
-                viper_config: Default::default(),
-                wal_config: Default::default(),
+                    wal_config: Default::default(),
                 cache_size_mb: 256,
                 bloom_filter_config: None,
                 filesystem_config: Default::default(),
@@ -167,12 +166,6 @@ mod recovery_stress_tests {
                 create_test_data(base_path, &collection_id, 5).await?;
             }
             
-            // Create VIPER collections
-            for i in 0..5 {
-                let collection_id = format!("viper_collection_{}", i);
-                create_test_data(base_path, &collection_id, 5).await?;
-            }
-            
             db.stop().await?;
         }
         
@@ -186,13 +179,6 @@ mod recovery_stress_tests {
                 let collection_id = format!("sst_collection_{}", i);
                 let collection_dir = PathBuf::from(base_path).join(&collection_id).join("data");
                 assert!(collection_dir.exists(), "SST collection {} should exist", collection_id);
-            }
-            
-            // Verify VIPER collections
-            for i in 0..5 {
-                let collection_id = format!("viper_collection_{}", i);
-                let collection_dir = PathBuf::from(base_path).join(&collection_id).join("data");
-                assert!(collection_dir.exists(), "VIPER collection {} should exist", collection_id);
             }
             
             db.stop().await?;

@@ -1,12 +1,12 @@
 //! # RDBMS Store
 //!
-//! Combines SST (OLTP row store) and VIPER (OLAP column store) for HTAP workloads.
+//! Combines SST (OLTP row store) and a columnar OLAP store for HTAP workloads.
 //!
 //! ## HTAP Architecture (inspired by TiDB)
 //!
 //! - **SST Engine**: Row-oriented storage for OLTP (point queries, transactions)
-//! - **VIPER Engine**: Column-oriented storage for OLAP (analytics, aggregations)
-//! - **Async Replication**: Changes flow from SST to VIPER with configurable lag
+//! - **Columnar engine**: Column-oriented storage for OLAP (analytics, aggregations)
+//! - **Async Replication**: Changes flow from SST to the column store with configurable lag
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -24,7 +24,7 @@ pub struct RDBMSStoreConfig {
     pub enable_btree_indexes: bool,
     /// Enable constraint enforcement
     pub enable_constraints: bool,
-    /// OLAP query threshold (rows) - queries above this use VIPER
+    /// OLAP query threshold (rows) - queries above this use the column store
     pub olap_query_threshold: usize,
 }
 
@@ -44,13 +44,13 @@ impl Default for RDBMSStoreConfig {
 pub enum QueryType {
     /// Point query or small scan - use SST
     OLTP,
-    /// Analytics/aggregation - use VIPER
+    /// Analytics/aggregation - use the column store
     OLAP,
     /// Unknown - analyze query to decide
     Unknown,
 }
 
-/// RDBMSStore implements HTAP with SST (OLTP) + VIPER (OLAP) separation
+/// RDBMSStore implements HTAP with SST (OLTP) + columnar (OLAP) separation
 ///
 /// ## Architecture
 ///
@@ -64,7 +64,7 @@ pub enum QueryType {
 /// │  └───────────────────────────────────────────────────┘  │
 /// │                  │                   │                   │
 /// │    ┌─────────────▼─────────┐   ┌────▼──────────────┐   │
-/// │    │     SST Engine        │   │   VIPER Engine     │   │
+/// │    │     SST Engine        │   │  Columnar Engine   │   │
 /// │    │   (OLTP - Row Store)  │   │ (OLAP - Columnar) │   │
 /// │    │  - Point queries      │   │ - Analytics        │   │
 /// │    │  - Transactions       │   │ - Aggregations     │   │
@@ -78,7 +78,7 @@ pub enum QueryType {
 pub struct RDBMSStore {
     /// Row-oriented engine for OLTP (SST)
     row_store: Option<Arc<dyn UnifiedStorageFormat>>,
-    /// Column-oriented engine for OLAP (VIPER)
+    /// Column-oriented engine for OLAP
     column_store: Option<Arc<dyn UnifiedStorageFormat>>,
     /// Current replication lag in nanoseconds
     replication_lag_ns: AtomicI64,
@@ -103,7 +103,7 @@ impl RDBMSStore {
         self
     }
 
-    /// Set the VIPER engine for OLAP
+    /// Set the columnar engine for OLAP
     pub fn with_column_store(mut self, engine: Arc<dyn UnifiedStorageFormat>) -> Self {
         self.column_store = Some(engine);
         self
@@ -118,7 +118,7 @@ impl RDBMSStore {
             supports_acid: true,
             supports_streaming: true,
             max_recommended_records: Some(1_000_000_000), // 1B rows
-            description: "HTAP relational storage with SST (OLTP) + VIPER (OLAP)".to_string(),
+            description: "HTAP relational storage with SST (OLTP) + columnar (OLAP)".to_string(),
         }
     }
 
@@ -148,7 +148,7 @@ impl RDBMSStore {
         self.row_store.as_ref()
     }
 
-    /// Get the column store (VIPER) engine
+    /// Get the column store engine
     pub fn column_store(&self) -> Option<&Arc<dyn UnifiedStorageFormat>> {
         self.column_store.as_ref()
     }

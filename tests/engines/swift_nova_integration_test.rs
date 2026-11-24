@@ -1,4 +1,4 @@
-// Integration tests for DSST and DVIPER dual-mode engines
+// Integration tests for dual-mode engines (ORPHANED: references removed DSST/DVIPER engines; see TD-ORPHAN-1)
 // Tests engine creation, basic operations, and mode switching
 
 use anyhow::Result;

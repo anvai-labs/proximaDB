@@ -29,9 +29,9 @@ use proximadb::proto::proximadb_v1::{
 ///     .with_dimension(256)
 ///     .build();
 ///
-/// // VIPER collection with compression
+/// // NOVA columnar collection with compression
 /// let (collection, _temp_dir) = TestCollectionBuilder::new()
-///     .with_engine(StorageEngine::Viper)
+///     .with_engine(StorageEngine::Nova)
 ///     .with_compression(CompressionAlgorithm::Lz4)
 ///     .with_dimension(512)
 ///     .build();
@@ -293,10 +293,10 @@ pub mod presets {
             .with_dimension(128)
     }
 
-    /// VIPER collection optimized for analytics
-    pub fn viper_analytics() -> TestCollectionBuilder {
+    /// NOVA columnar collection optimized for analytics
+    pub fn nova_analytics() -> TestCollectionBuilder {
         TestCollectionBuilder::new()
-            .with_engine(StorageEngineType::Viper)
+            .with_engine(StorageEngineType::Nova)
             .with_compression(CompressionAlgorithm::CompressionZstd)
             .with_dimension(512)
     }
@@ -351,14 +351,14 @@ mod tests {
         let (collection, _temp_dir) = TestCollectionBuilder::new()
             .with_id("custom_test")
             .with_dimension(256)
-            .with_engine(StorageEngineType::Viper)
+            .with_engine(StorageEngineType::Nova)
             .with_compression(CompressionAlgorithm::CompressionLz4)
             .build();
 
         assert_eq!(collection.id, "custom_test");
         let config = collection.config.as_ref().unwrap();
         assert_eq!(config.dimension, 256);
-        assert_eq!(config.storage_engine, Some(StorageEngineType::Viper as i32));
+        assert_eq!(config.storage_engine, Some(StorageEngineType::Nova as i32));
         let storage_config = config.storage_config.as_ref().unwrap();
         assert_eq!(
             storage_config.compression,
@@ -393,13 +393,13 @@ mod tests {
             Some(CompressionAlgorithm::CompressionLz4 as i32)
         );
 
-        let (viper, _) = presets::viper_analytics().build();
-        let viper_config = viper.config.as_ref().unwrap();
+        let (nova, _) = presets::nova_analytics().build();
+        let nova_config = nova.config.as_ref().unwrap();
         assert_eq!(
-            viper_config.storage_engine,
-            Some(StorageEngineType::Viper as i32)
+            nova_config.storage_engine,
+            Some(StorageEngineType::Nova as i32)
         );
-        assert_eq!(viper_config.dimension, 512);
+        assert_eq!(nova_config.dimension, 512);
 
         let (metadata_coll, _) = presets::with_metadata_filtering().build();
         assert_eq!(

@@ -776,14 +776,14 @@ async fn create_collection_v2_checked(
 
     // Validate engine if specified
     let engine = request.engine.as_deref().unwrap_or("auto");
-    // "viper" deliberately excluded (TD-VIPER-1 S2 / ADR-093): it's no
-    // longer selectable for new collections. Reject it here with a proper
+    // "viper" deliberately excluded (TD-VIPER-1 / ADR-093): the engine was
+    // removed at S3 and is no longer selectable. Reject it here with a proper
     // 400 rather than letting it fall through to CollectionService's
     // generic 500 (ApiError::Internal) three layers down.
     let valid_engines = ["auto", "sst", "helix", "swift", "nova", "raptor", "tst"];
     if !valid_engines.contains(&engine) {
         let hint = if engine == "viper" {
-            " (VIPER is deprecated, ADR-093 — use sst/nova/helix instead)"
+            " (VIPER was removed, ADR-093 — use sst/nova/helix instead)"
         } else {
             ""
         };
@@ -4240,7 +4240,7 @@ mod tests {
     fn route_health_object_economy_is_retired_for_every_engine() {
         // TD-OEDIRWM-1: no engine produces or reads the directory, so the
         // route is not applicable anywhere — including SST.
-        for engine in ["sst", "viper"] {
+        for engine in ["sst", "nova"] {
             let h = build_route_health(
                 "c".to_string(),
                 engine.to_string(),
@@ -5313,7 +5313,7 @@ mod tests {
         for (engine, distance) in [
             ("sst", "cosine"),
             ("helix", "euclidean"),
-            ("viper", "dot_product"),
+            ("nova", "dot_product"),
             ("auto", "cosine"),
         ] {
             let h = build_route_health(

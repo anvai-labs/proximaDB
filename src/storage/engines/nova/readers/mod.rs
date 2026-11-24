@@ -2,7 +2,7 @@
 //!
 //! NOVA uses standard Parquet format with embedded zone maps in metadata.
 //! This module re-exports the UnifiedParquetReader from the columnar module
-//! following the same pattern as VIPER.
+//! following the same reader pattern as the other engines.
 //!
 //! ## Architecture
 //! - UnifiedParquetReader: Re-exported from columnar module

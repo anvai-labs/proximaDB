@@ -76,9 +76,6 @@ pub mod semantic_distance_integration;
 // Unified search integration tests - NEW unified search interface
 pub mod unified_search_integration;
 
-// Comprehensive filter integration tests - Tests all data types and operators
-pub mod comprehensive_filter_test;
-
 // SST engine comprehensive filter tests
 pub mod sst_comprehensive_filter_test;
 
@@ -89,8 +86,6 @@ pub mod swift_comprehensive_filter_test;
 // Write Buffer optimization integration tests - NEW optimized Write Buffer writer
 // pub mod write_ahead_log_optimization_integration_test; // File doesn't exist
 
-// VIPER engine integration tests
-pub mod viper;
 
 // Nova engine integration tests
 pub mod nova_engine_test;
@@ -130,9 +125,6 @@ pub mod write_buffer_recovery_stress_test;
 pub mod storage_engine_adapters_test;
 pub mod storage_table_provider_test;
 
-// VIPER engine integration tests (additional)
-// TEMPORARILY DISABLED: Test needs API updates to match current ViperEngine interface
-// pub mod viper_engine_test;
 
 // Assignment service recovery integration tests
 // pub mod assignment_service_recovery_integration_test; // File not found - commented for now
@@ -146,7 +138,6 @@ pub mod optimization_e2e_test;
 pub mod sst_compression_comprehensive_test;
 pub mod sst_compression_integration_test;
 pub mod sst_compression_sparse_dense_test;
-pub mod viper_compression_integration_test;
 
 // Benchmark and comparison tests - moved to benches/
 // pub mod comprehensive_engine_benchmark_report; // Moved to benches/comprehensive_engine_report.rs

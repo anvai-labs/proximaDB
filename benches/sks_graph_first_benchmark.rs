@@ -32,7 +32,7 @@ fn bench_entity_insertion_small(c: &mut Criterion) {
     group.bench_function("legacy_split_storage", |b| {
         b.iter(|| {
             // Simulate legacy approach:
-            // 1. Insert vectors into SST/VIPER
+            // 1. Insert vectors into SST
             // 2. Insert relations into HashMap
             // 3. Insert metadata into KV store
             // This is a placeholder - actual implementation will come later
@@ -90,7 +90,7 @@ fn bench_hybrid_query(c: &mut Criterion) {
     group.bench_function("legacy_split_storage", |b| {
         b.iter(|| {
             // Simulate legacy approach:
-            // 1. Vector search in SST/VIPER (returns entity IDs)
+            // 1. Vector search in SST (returns entity IDs)
             // 2. Lookup relations in HashMap (separate data structure)
             // 3. Lookup entity metadata in KV store
             // 4. Merge results (expensive!)

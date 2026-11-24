@@ -198,7 +198,7 @@ mod tests {
 
     #[test]
     fn test_cache_key_generation() {
-        let key = create_cache_key("my_collection", "viper", "/data/file.parquet");
-        assert_eq!(key, "/data/file.parquet:my_collection:viper");
+        let key = create_cache_key("my_collection", "nova", "/data/file.parquet");
+        assert_eq!(key, "/data/file.parquet:my_collection:nova");
     }
 }

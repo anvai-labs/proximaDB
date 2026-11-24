@@ -21,7 +21,7 @@ use crate::storage::persistence::filesystem::FilesystemFactory;
 
 /// Canonical storage engine type (re-exported from `proximadb-storage-common` via
 /// `core::types`). The previous local 7-variant copy was consolidated into the
-/// single source of truth — variant sets were identical (SST/VIPER/NOVA/SWIFT/
+/// single source of truth — variant sets were identical (SST/NOVA/SWIFT/
 /// HELIX/RAPTOR/TST). The dead `from_proto`/`from_str_uppercase`/`file_extension`
 /// helpers had no external callers and were dropped (proto bridging lives on the
 /// canonical type and the proto-bridge impls in `background_flush_context`).
@@ -43,7 +43,7 @@ pub struct FilteredCompactionFiles {
 }
 
 /// Unified file discovery with EventLog filtering
-/// This eliminates duplicate logic between SST and VIPER engines
+/// This eliminates duplicate logic across the SST-family engines
 pub struct CompactionFileDiscovery {
     registry: TieredFileRegistry,
     filesystem: Arc<FilesystemFactory>,
@@ -289,7 +289,7 @@ fn select_compaction_morsel(
 
 impl CompactionTaskBuilder {
     /// Check if compaction is needed and build task if necessary
-    /// This unifies logic from SST's check_compaction_needed and VIPER's discover_compactable_files
+    /// This unifies logic from SST's check_compaction_needed and the columnar engines' discover_compactable_files
     pub async fn check_and_build_compaction_task(
         collection_id: &str,
         data_directory: &str,
@@ -519,7 +519,7 @@ impl CompactionTaskBuilder {
         Ok(None)
     }
 
-    /// Get all compactable files for a collection (used by VIPER for size-based compaction)
+    /// Get all compactable files for a collection (used by the columnar engines for size-based compaction)
     pub async fn get_all_compactable_files(
         collection_id: &str,
         data_directory: &str,
@@ -694,7 +694,7 @@ mod tests {
         assert_eq!(morsel.input_bytes, 180 * MIB);
 
         assert_eq!(
-            l0_minimum_morsel_files(&config, &StorageEngineType::VIPER, "parquet"),
+            l0_minimum_morsel_files(&config, &StorageEngineType::NOVA, "parquet"),
             2,
             "threshold one must not turn non-PAX compaction into one-file rewrites"
         );

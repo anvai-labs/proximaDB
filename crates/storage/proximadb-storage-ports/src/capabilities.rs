@@ -31,7 +31,8 @@ pub enum StorageEngineStrategy {
     #[default]
     Sst,
 
-    /// VIPER engine - columnar Parquet with advanced quantization
+    /// VIPER engine - removed (ADR-093); retained for wire compatibility only
+    /// (the factory and capability registry reject/fall back on it)
     Viper,
 
     /// HELIX engine - spatial-locality vector storage (Hilbert-curve clustering, zone maps)
@@ -73,7 +74,7 @@ pub type StorageFormatStrategy = StorageEngineStrategy;
 /// Scan capabilities derived from actual engine implementations
 #[derive(Debug, Clone, Default)]
 pub struct ScanCapabilities {
-    // From VIPER/NOVA (columnar engines)
+    // From the columnar engines (NOVA)
     pub supports_predicate_pushdown: bool,
     pub supports_column_projection: bool,
     pub supports_row_group_pruning: bool,
@@ -293,47 +294,6 @@ impl EngineCapabilities for HelixCapabilities {
     }
 }
 
-/// VIPER engine capabilities
-pub struct ViperCapabilities;
-
-impl EngineCapabilities for ViperCapabilities {
-    fn engine_name(&self) -> &'static str {
-        "VIPER"
-    }
-
-    fn scan_capabilities(&self) -> ScanCapabilities {
-        ScanCapabilities {
-            supports_predicate_pushdown: true,
-            supports_column_projection: true,
-            supports_row_group_pruning: true,
-            supports_parallel_column_evaluation: true,
-            supports_zone_maps: true,
-            supports_streaming: true,
-            ..Default::default()
-        }
-    }
-
-    fn supports_collection_level_operations(&self) -> bool {
-        true // VIPER supports collection-level ops
-    }
-
-    fn supports_atomic_operations(&self) -> bool {
-        true
-    }
-
-    fn supported_compression(&self) -> HashSet<CompressionAlgorithm> {
-        // Parquet-compatible algorithms
-        let mut supported = HashSet::new();
-        supported.insert(CompressionAlgorithm::CompressionNone);
-        supported.insert(CompressionAlgorithm::CompressionZstd);
-        supported.insert(CompressionAlgorithm::CompressionLz4);
-        supported.insert(CompressionAlgorithm::CompressionSnappy);
-        supported.insert(CompressionAlgorithm::CompressionGzip);
-        supported.insert(CompressionAlgorithm::CompressionBrotli);
-        supported
-    }
-}
-
 /// SWIFT engine capabilities
 pub struct SwiftCapabilities;
 
@@ -401,8 +361,14 @@ impl EngineCapabilities for NovaCapabilities {
     }
 
     fn supported_compression(&self) -> HashSet<CompressionAlgorithm> {
-        // Same as VIPER (columnar-based)
-        ViperCapabilities.supported_compression()
+        // Parquet-compatible columnar set
+        // Parquet-compatible algorithms (shared by the columnar engines)
+        let mut supported = HashSet::new();
+        supported.insert(CompressionAlgorithm::CompressionNone);
+        supported.insert(CompressionAlgorithm::CompressionZstd);
+        supported.insert(CompressionAlgorithm::CompressionLz4);
+        supported.insert(CompressionAlgorithm::CompressionSnappy);
+        supported
     }
 }
 
@@ -438,7 +404,13 @@ impl EngineCapabilities for TstCapabilities {
     }
 
     fn supported_compression(&self) -> HashSet<CompressionAlgorithm> {
-        ViperCapabilities.supported_compression()
+        // Parquet-compatible algorithms (shared by the columnar engines)
+        let mut supported = HashSet::new();
+        supported.insert(CompressionAlgorithm::CompressionNone);
+        supported.insert(CompressionAlgorithm::CompressionZstd);
+        supported.insert(CompressionAlgorithm::CompressionLz4);
+        supported.insert(CompressionAlgorithm::CompressionSnappy);
+        supported
     }
 }
 
@@ -482,8 +454,14 @@ impl EngineCapabilities for RaptorCapabilities {
     }
 
     fn supported_compression(&self) -> HashSet<CompressionAlgorithm> {
-        // Same as VIPER (columnar-based)
-        ViperCapabilities.supported_compression()
+        // Parquet-compatible columnar set
+        // Parquet-compatible algorithms (shared by the columnar engines)
+        let mut supported = HashSet::new();
+        supported.insert(CompressionAlgorithm::CompressionNone);
+        supported.insert(CompressionAlgorithm::CompressionZstd);
+        supported.insert(CompressionAlgorithm::CompressionLz4);
+        supported.insert(CompressionAlgorithm::CompressionSnappy);
+        supported
     }
 }
 
@@ -517,7 +495,6 @@ impl CapabilityFactory {
         match strategy {
             StorageFormatStrategy::Sst => Box::new(SstCapabilities),
             StorageFormatStrategy::Helix => Box::new(HelixCapabilities),
-            StorageFormatStrategy::Viper => Box::new(ViperCapabilities),
             StorageFormatStrategy::Swift => Box::new(SwiftCapabilities),
             StorageFormatStrategy::Nova => Box::new(NovaCapabilities),
             StorageFormatStrategy::TimeSeries => Box::new(TstCapabilities),
@@ -535,7 +512,7 @@ impl CapabilityFactory {
         match engine {
             StorageEngine::Sst => Box::new(SstCapabilities),
             StorageEngine::Helix => Box::new(HelixCapabilities),
-            StorageEngine::Viper => Box::new(ViperCapabilities),
+            // VIPER removed (ADR-093): fall through to the SST baseline below
             StorageEngine::Swift => Box::new(SwiftCapabilities),
             StorageEngine::Nova => Box::new(NovaCapabilities),
             StorageEngine::Tst => Box::new(TstCapabilities),
@@ -570,15 +547,6 @@ mod tests {
         assert!(caps.supports_bloom_filters());
         assert!(!caps.supports_zone_maps());
         assert!(!caps.supports_collection_level_operations());
-    }
-
-    #[test]
-    fn test_viper_capabilities() {
-        let caps = ViperCapabilities;
-        assert_eq!(caps.engine_name(), "VIPER");
-        assert!(caps.scan_capabilities().supports_predicate_pushdown);
-        assert!(caps.scan_capabilities().supports_column_projection);
-        assert!(caps.supports_collection_level_operations());
     }
 
     #[test]
@@ -624,9 +592,6 @@ mod tests {
         assert!(sst.is_compression_supported(CompressionAlgorithm::CompressionZstd));
         assert!(sst.is_compression_supported(CompressionAlgorithm::CompressionLz4));
 
-        let viper = ViperCapabilities;
-        // VIPER supports fewer algorithms (Parquet-compatible)
-        assert!(viper.is_compression_supported(CompressionAlgorithm::CompressionZstd));
     }
 
     #[test]
@@ -640,8 +605,13 @@ mod tests {
 
     #[test]
     fn test_capability_factory_from_proto_engine() {
+        let caps = CapabilityFactory::from_proto_engine(StorageEngine::Sst);
+        assert_eq!(caps.engine_name(), "SST");
+
+        // VIPER was removed (ADR-093): the wire value falls back to the SST
+        // baseline rather than naming a removed engine.
         let caps = CapabilityFactory::from_proto_engine(StorageEngine::Viper);
-        assert_eq!(caps.engine_name(), "VIPER");
+        assert_eq!(caps.engine_name(), "SST");
     }
 
     #[test]

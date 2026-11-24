@@ -13,12 +13,11 @@
 //! - **Feature Flag**: `experimental-engines` required
 //! - **Tests**: 23 tests (insufficient coverage)
 //! - **DEFERRED Items**: 35+ optimization tasks remaining
-//! - **Recommendation**: Use SST, VIPER, HELIX, or NOVA instead
+//! - **Recommendation**: Use SST, HELIX, or NOVA instead
 //!
 //! ## Migration Guide
 //!
 //! For adaptive workload optimization, use production engines with appropriate configuration:
-//! - **VIPER**: For vector storage with Proxima encoding and compression
 //! - **HELIX**: For high-dimensional data with PCA dimension reduction
 //! - **SST**: For static workloads with efficient range queries
 //!
@@ -27,9 +26,7 @@
 //! // Instead of RAPTOR adaptive mode:
 //! // raptor_engine.enable_adaptive_mode(true).await?;
 //!
-//! // Use VIPER with optimized configuration:
-//! let viper_config = ViperConfig::optimized_for_workload(&workload_profile);
-//! let viper_engine = ViperEngine::new(viper_config).await?;
+//! // Use NOVA with an optimized configuration:
 //! ```
 //!
 //! ## RAPTOR Storage Engine - Row-Aligned Predicated Tensor Optimized Repository
@@ -95,7 +92,7 @@
 //!
 //! ## ❌ **NOT OPTIMAL FOR:**
 //!
-//! - **Static Workloads**: SST or VIPER better for predictable patterns
+//! - **Static Workloads**: SST is better for predictable patterns
 //! - **Memory-Constrained Systems**: Matrix storage requires significant RAM
 //! - **Simple Point Queries**: HELIX spatial locality may be more efficient
 //! - **Append-Only Workloads**: NOVA columnar analytics may be preferable

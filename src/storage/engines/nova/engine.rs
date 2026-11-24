@@ -70,7 +70,6 @@ use proximadb_hardware_caps::HardwareCapabilities;
 ///
 /// ### Key Differentiators:
 /// - **vs SST**: Pure columnar (Parquet) vs hybrid columnar (ProximaBlocks), 10x better compression
-/// - **vs VIPER**: Progressive search vs full scan, 5x faster selective queries
 /// - **vs SWIFT**: Higher compression vs lower latency
 ///
 /// ### Performance Characteristics:
@@ -78,6 +77,26 @@ use proximadb_hardware_caps::HardwareCapabilities;
 /// - **Selective Query**: ~5-15ms (progressive filtering eliminates 95%+ candidates)
 /// - **Batch Scan**: ~50-200ms (full columnar scan with SIMD)
 /// - **Compression**: 8-12x (multiple quantization levels + ZSTD)
+/// Per-row values of a `vector_fp32` column, accepting both Arrow list flavors
+/// the writers emit: `List` from the shared columnar path, and `FixedSizeList`
+/// from the Parquet factory. Re-homed from the removed VIPER engine
+/// (ADR-093 S3), which shared the same Parquet schema via the common writer.
+fn list_row_values(
+    col: &dyn arrow_array::Array,
+    row_idx: usize,
+) -> Option<std::sync::Arc<dyn arrow_array::Array>> {
+    if let Some(list) = col.as_any().downcast_ref::<arrow_array::ListArray>() {
+        Some(list.value(row_idx))
+    } else if let Some(fixed) = col
+        .as_any()
+        .downcast_ref::<arrow_array::FixedSizeListArray>()
+    {
+        Some(fixed.value(row_idx))
+    } else {
+        None
+    }
+}
+
 pub struct NovaEngine {
     /// **Filesystem Factory**
     ///
@@ -1661,7 +1680,7 @@ impl UnifiedStorageFormat for NovaEngine {
                     let vector_values = batch
                         .column_by_name(FIELD_VECTOR_FP32)
                         .and_then(|col| {
-                            crate::storage::engines::viper::engine::list_row_values(col, row_idx)
+                            list_row_values(col, row_idx)
                         })
                         .ok_or_else(|| anyhow!("Missing or invalid 'vector_fp32' column"))?;
                     let vector_float_array = vector_values

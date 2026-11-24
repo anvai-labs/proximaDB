@@ -2,7 +2,7 @@
 //!
 //! This test validates:
 //! - Bytemuck serialization across both engines
-//! - ZSTD compression for SST and VIPER
+//! - ZSTD compression for SST
 //! - Memory pooling effectiveness
 //! - Search performance on compressed data
 //! - Configuration-based compression control
@@ -17,7 +17,6 @@ use proximadb::proto::proximadb_v1::{
     Collection, CollectionConfig, DistanceMetric, SqlValue, StorageEngine, VectorRecord, sql_value,
 };
 use proximadb::storage::engines::sst::SstEngine;
-use proximadb::storage::engines::viper::ViperEngine;
 use proximadb::storage::metadata::store::{MetadataStore, MetadataStoreConfig};
 use proximadb::storage::persistence::filesystem::FilesystemFactory;
 use proximadb::storage::traits::UnifiedStorageEngine;
@@ -179,16 +178,6 @@ async fn test_optimization_end_to_end() -> anyhow::Result<()> {
         ..Default::default()
     });
 
-    let viper_config = proximadb::core::config::ViperConfig {
-        row_group_size: 50_000,
-        compression: "zstd".to_string(),
-        compression_level: 3,
-        enable_statistics: true,
-        data_directory: format!("{}/viper_data", temp_dir.path().display()),
-        cache_size_mb: 256,
-        compaction_config: None,
-    };
-
     // Setup infrastructure
     let filesystem = Arc::new(FilesystemFactory::create(Default::default()).await?);
     let _metadata_url = format!("file://{}/metadata", temp_dir.path().display());
@@ -223,10 +212,6 @@ async fn test_optimization_end_to_end() -> anyhow::Result<()> {
     ));
     let sst_engine = SstEngine::new().await?;
 
-    // Create VIPER engine
-    let viper_engine = ViperEngine::from_core_config(viper_config, filesystem.clone()).await?;
-
-    // Register collection for VIPER with proper storage assignment
     // IMPORTANT: Use standard path format: {baseurl}/{collectionid}/data
     let _collection_storage_path = format!("{}/optimization_test", temp_dir.path().display());
     let collection = Collection {
@@ -286,10 +271,7 @@ async fn test_optimization_end_to_end() -> anyhow::Result<()> {
         serialization_time
     );
 
-    // Split vectors for both engines
-    let (sst_vectors, viper_vectors): (Vec<_>, Vec<_>) = vectors
-        .into_iter()
-        .partition(|v| v.id.contains("sparse") || v.id.contains("sequential"));
+    let sst_vectors = vectors;
 
     // Flush to SST with compression - pass collection config through flush params
     info!(
@@ -314,27 +296,6 @@ async fn test_optimization_end_to_end() -> anyhow::Result<()> {
         "SST flush: {} records in {:?}",
         sst_flush_result.entries_flushed.unwrap_or(0),
         sst_flush_time
-    );
-
-    // Flush to VIPER with compression - pass collection config through flush params
-    let start = Instant::now();
-    let flush_params = proximadb::storage::traits::FlushParameters {
-        collection_id: Some("optimization_test".to_string()),
-        vector_records: viper_vectors
-            .into_iter()
-            .map(|v: VectorRecord| v.into())
-            .collect(),
-        force: true,
-        collection_config: Some(collection.clone()), // Pass the collection config with storage assignment
-        ..Default::default()
-    };
-    let viper_flush_result = viper_engine.do_flush(&flush_params).await?;
-    let viper_flush_time = start.elapsed();
-
-    info!(
-        "VIPER flush: {} records in {:?}",
-        viper_flush_result.entries_flushed.unwrap_or(0),
-        viper_flush_time
     );
 
     // Test search on compressed SST data
@@ -462,87 +423,6 @@ async fn test_optimization_end_to_end() -> anyhow::Result<()> {
         "SST search returned no results with filter pattern='sparse'"
     );
 
-    // Test search on compressed VIPER data
-    let filter_expr = FilterExpression::Comparison {
-        field: "pattern".to_string(),
-        operator: proximadb::core::search::ComparisonOperator::Equals,
-        value: serde_json::Value::String("sine".to_string()),
-    };
-
-    let viper_search_params = SearchParams {
-        query_vectors: Some(vec![vec![0.5; 128]]), // Match the dimension of test vectors
-        top_k: Some(20),
-        filter_expression: Some(filter_expr),
-        ..Default::default()
-    };
-
-    let start = Instant::now();
-    // Create search context for VIPER engine
-    let viper_search_context_params = std::sync::Arc::new(proximadb::core::search::SearchParams {
-        vector: Some(viper_search_params.query_vectors.as_ref().unwrap()[0].clone()),
-        query_vectors: None,
-        top_k: Some(viper_search_params.top_k.unwrap_or(20)),
-        distance_metric: Some(proximadb::compute::distance_computation::DistanceMetric::Cosine),
-        filter_expression: viper_search_params.filter_expression.clone(),
-        timeout_ms: None,
-        accuracy_threshold: None,
-        ..Default::default()
-    });
-
-    let viper_collection_config = proximadb::proto::proximadb_v1::CollectionConfig {
-        name: "optimization_test".to_string(),
-        dimension: viper_search_params.query_vectors.as_ref().unwrap()[0].len() as u32,
-        distance_metric: Some(proximadb::proto::proximadb_v1::DistanceMetric::Cosine as i32),
-        storage_engine: Some(proximadb::proto::proximadb_v1::StorageEngine::Viper as i32),
-        primary_index: Some("default".to_string()),
-        auto_index_selection: Some(false),
-        tags: vec![],
-        embedding_models: vec![],
-        owner: None,
-        ..Default::default()
-    };
-
-    let viper_collection = std::sync::Arc::new(proximadb::proto::proximadb_v1::Collection {
-        storage_class_status: None,
-        id: "optimization_test".to_string(),
-        config: Some(viper_collection_config),
-        stats: None,
-        created_at: 0,
-        updated_at: 0,
-        storage_assignment: Some(proximadb::proto::proximadb_v1::StorageAssignment {
-            primary_path: format!("{}", temp_dir.path().display()),
-            backup_paths: vec![],
-            engine: StorageEngine::Viper as i32,
-            engine_config: std::collections::HashMap::new(),
-            base_location: format!("{}", temp_dir.path().display()),
-            assigned_at: chrono::Utc::now().timestamp_micros(),
-            ..Default::default()
-        }),
-    });
-
-    let viper_query_context = proximadb::storage::traits::StorageQueryContext {
-        search_params: viper_search_context_params,
-        collection: viper_collection,
-        metadata: proximadb::storage::traits::StorageQueryMetadata {
-            collection_id: "optimization_test".to_string(),
-            use_axis_indexes: false,
-            ..Default::default()
-        },
-        user_context: None,
-        tenant_context: None,
-    };
-
-    let viper_results = viper_engine
-        .search_vectors_unified(&viper_query_context)
-        .await?;
-    let viper_search_time = start.elapsed();
-
-    info!(
-        "VIPER search found {} results in {:?}",
-        viper_results.len(),
-        viper_search_time
-    );
-
     // Trigger compaction on SST to test compressed block handling
     let compact_params = proximadb::storage::traits::CompactionParameters {
         full: false,
@@ -556,10 +436,8 @@ async fn test_optimization_end_to_end() -> anyhow::Result<()> {
 
     // Calculate storage efficiency
     let sst_size = calculate_directory_size(&format!("{}/sst", temp_dir.path().display()));
-    let viper_size = calculate_directory_size(&format!("{}/viper", temp_dir.path().display()));
 
-    let total_vectors =
-        sst_vectors.len() + viper_flush_result.entries_flushed.unwrap_or(0) as usize;
+    let total_vectors = sst_vectors.len();
     let avg_vector_size = 512; // Average dimension
     let uncompressed_estimate = total_vectors * avg_vector_size * 4; // 4 bytes per f32
 
@@ -569,15 +447,10 @@ async fn test_optimization_end_to_end() -> anyhow::Result<()> {
         sst_size,
         sst_vectors.len()
     );
-    info!(
-        "  VIPER: {} bytes for {} vectors",
-        viper_size,
-        viper_flush_result.entries_flushed.unwrap_or(0)
-    );
     info!("  Estimated uncompressed: {} bytes", uncompressed_estimate);
     info!(
         "  Overall compression ratio: {:.2}%",
-        ((sst_size + viper_size) as f64 / uncompressed_estimate as f64) * 100.0
+        (sst_size as f64 / uncompressed_estimate as f64) * 100.0
     );
 
     // Validate results contain expected metadata (SearchResult uses HashMap)
@@ -594,7 +467,6 @@ async fn test_optimization_end_to_end() -> anyhow::Result<()> {
         "Serialization too slow"
     );
     assert!(sst_search_time.as_millis() < 500, "SST search too slow"); // Increased from 100ms to 500ms for realistic multi-file search
-    assert!(viper_search_time.as_millis() < 500, "VIPER search too slow"); // Increased from 100ms to 500ms for consistency
 
     Ok(())
 }

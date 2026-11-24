@@ -135,7 +135,7 @@ mod tests {
         }
 
         fn strategy(&self) -> crate::storage::traits::StorageFormatStrategy {
-            crate::storage::traits::StorageFormatStrategy::Viper
+            crate::storage::traits::StorageFormatStrategy::Nova
         }
 
         async fn collect_engine_metrics(&self) -> Result<HashMap<String, serde_json::Value>> {
@@ -351,14 +351,14 @@ mod tests {
         flush_coordinator.set_metrics_updater(metrics_updater.clone());
 
         // Create and register mock storage engine
-        let mock_engine = Arc::new(MockStorageEngineWithMetrics::new("viper"));
+        let mock_engine = Arc::new(MockStorageEngineWithMetrics::new("tst"));
         flush_coordinator
-            .register_storage_engine("viper", mock_engine.clone())
+            .register_storage_engine("tst", mock_engine.clone())
             .await;
 
         let collection_id = "flushcoordinator_integration_test";
         let test_vectors = create_test_vectors(50);
-        let context = create_test_context(collection_id, StorageEngineType::Viper);
+        let context = create_test_context(collection_id, StorageEngineType::Tst);
 
         // Execute coordinated flush with metrics
         let flush_data = crate::storage::persistence::write_ahead_log::flush_coordinator::FlushDataSource::VectorRecords(
@@ -436,20 +436,20 @@ mod tests {
         // bg_manager.set_metrics_updater(metrics_updater.clone());
 
         // Create and register mock storage engine
-        let mock_engine = Arc::new(MockStorageEngineWithMetrics::new("viper"));
+        let mock_engine = Arc::new(MockStorageEngineWithMetrics::new("tst"));
         bg_manager
-            .register_storage_engine("viper", mock_engine.clone())
+            .register_storage_engine("tst", mock_engine.clone())
             .await
             .unwrap();
 
         let collection_id = "backgroundmanager_integration_test";
-        let context = create_test_context(collection_id, StorageEngineType::Viper);
+        let context = create_test_context(collection_id, StorageEngineType::Tst);
 
         // Create storage engines registry for compaction
         let storage_engines = Arc::new(RwLock::new({
             let mut engines = HashMap::new();
             engines.insert(
-                "viper".to_string(),
+                "tst".to_string(),
                 mock_engine.clone() as Arc<dyn UnifiedStorageFormat>,
             );
             engines
@@ -532,17 +532,17 @@ mod tests {
         // Note: bg_manager doesn't have set_metrics_updater method, which is fine for this test
 
         // Create mock storage engine
-        let mock_engine = Arc::new(MockStorageEngineWithMetrics::new("viper"));
+        let mock_engine = Arc::new(MockStorageEngineWithMetrics::new("tst"));
         flush_coordinator
-            .register_storage_engine("viper", mock_engine.clone())
+            .register_storage_engine("tst", mock_engine.clone())
             .await;
         bg_manager
-            .register_storage_engine("viper", mock_engine.clone())
+            .register_storage_engine("tst", mock_engine.clone())
             .await
             .unwrap();
 
         let collection_id = "end_to_end_integration_test";
-        let context = create_test_context(collection_id, StorageEngineType::Viper);
+        let context = create_test_context(collection_id, StorageEngineType::Tst);
 
         // Step 1: Simulate VectorOperationsService operations
         let operation_update = OperationMetricsUpdate {
@@ -585,7 +585,7 @@ mod tests {
         let storage_engines = Arc::new(RwLock::new({
             let mut engines = HashMap::new();
             engines.insert(
-                "viper".to_string(),
+                "tst".to_string(),
                 mock_engine.clone() as Arc<dyn UnifiedStorageFormat>,
             );
             engines
@@ -708,14 +708,14 @@ mod tests {
         let mut flush_coordinator = WALFlushCoordinator::new();
         flush_coordinator.set_metrics_updater(metrics_updater.clone());
 
-        let mock_engine = Arc::new(MockStorageEngineWithMetrics::new("viper"));
+        let mock_engine = Arc::new(MockStorageEngineWithMetrics::new("tst"));
         flush_coordinator
-            .register_storage_engine("viper", mock_engine.clone())
+            .register_storage_engine("tst", mock_engine.clone())
             .await;
 
         // Process operations for each collection
         for (i, collection_id) in collections.iter().enumerate() {
-            let context = create_test_context(collection_id, StorageEngineType::Viper);
+            let context = create_test_context(collection_id, StorageEngineType::Tst);
 
             // Record different metrics for each collection
             let operation_update = OperationMetricsUpdate {

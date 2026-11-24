@@ -19,8 +19,6 @@ use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info, warn};
 
-// Temporarily disabled due to arrow-arith compilation conflicts - DEFERRED: Re-enable when resolved
-// use crate::storage::engines::viper::ViperEngine;
 use crate::storage::engines::sst::SstEngine;
 use crate::storage::traits::FlushResult;
 use proximadb_index_traits::IndexMaintenance;
@@ -32,15 +30,14 @@ use super::compaction_axis_integration::CompactionAxisUpdater;
 /// **Architecture:**
 /// - Monitors flush operations from WALFlushCoordinator
 /// - Automatically triggers compaction when thresholds are met
-/// - Coordinates compaction across VIPER and LSM engines
+/// - Coordinates compaction across the SST (LSM) engine
 /// - Provides intelligent scheduling to minimize I/O contention
 #[derive(Clone)]
 pub struct CompactionCoordinator {
     /// Per-collection compaction state
     collection_states: Arc<RwLock<HashMap<String, CollectionCompactionState>>>,
 
-    /// Storage engines for compaction
-    viper_engine: Arc<crate::storage::engines::viper::engine::ViperEngine>,
+    /// Storage engine for compaction (SST; VIPER removed per ADR-093)
     sst_engine: Arc<SstEngine>,
 
     /// Compaction configuration
@@ -86,7 +83,7 @@ impl Default for CollectionCompactionState {
             last_compaction: None,
             flushes_since_compaction: 0,
             compaction_in_progress: false,
-            preferred_engine: "VIPER".to_string(), // Default to VIPER
+            preferred_engine: "LSM".to_string(), // SST-backed LSM compaction
         }
     }
 }
@@ -207,7 +204,6 @@ pub struct WalCompactionResult {
 impl CompactionCoordinator {
     /// Create new compaction coordinator
     pub fn new(
-        viper_engine: Arc<crate::storage::engines::viper::engine::ViperEngine>,
         sst_engine: Arc<SstEngine>,
         config: Option<WalCompactionConfig>,
         axis_manager: Option<Arc<dyn IndexMaintenance>>,
@@ -227,7 +223,6 @@ impl CompactionCoordinator {
 
         Self {
             collection_states: Arc::new(RwLock::new(HashMap::new())),
-            viper_engine,
             sst_engine,
             config,
             active_compactions: Arc::new(Mutex::new(HashMap::new())),
@@ -398,7 +393,7 @@ impl CompactionCoordinator {
         // Also check actual file count in storage (not just tracked state)
         let preferred_engine = state
             .as_ref()
-            .map_or("viper", |s| s.preferred_engine.as_str());
+            .map_or("LSM", |s| s.preferred_engine.as_str());
         let actual_file_count = match self
             .discover_existing_files_for_collection(collection_id, preferred_engine)
             .await
@@ -494,7 +489,7 @@ impl CompactionCoordinator {
             let states = self.collection_states.read().await;
             states
                 .get(&collection_id)
-                .map_or_else(|| "VIPER".to_string(), |s| s.preferred_engine.clone())
+                .map_or_else(|| "LSM".to_string(), |s| s.preferred_engine.clone())
         };
 
         // Create compaction task
@@ -545,14 +540,15 @@ impl CompactionCoordinator {
 
         // Execute compaction based on engine type
         let compaction_result = match engine_type {
-            "VIPER" => self.execute_viper_compaction(collection_id).await,
             "LSM" => self.execute_lsm_compaction(collection_id).await,
-            _ => {
+            legacy @ ("VIPER" | _) => {
+                // VIPER was removed (ADR-093); legacy state strings fall back
+                // to the SST-backed LSM compaction.
                 warn!(
-                    "⚠️ CompactionCoordinator: Unknown engine type {}, defaulting to VIPER",
-                    engine_type
+                    "⚠️ CompactionCoordinator: Engine type '{}' unavailable, defaulting to LSM compaction",
+                    legacy
                 );
-                self.execute_viper_compaction(collection_id).await
+                self.execute_lsm_compaction(collection_id).await
             }
         };
 
@@ -568,7 +564,7 @@ impl CompactionCoordinator {
 
                 // Update AXIS indexes with compaction results
                 // Note: WAL compaction doesn't track vector-level changes
-                // Only storage engines (LSM/VIPER) track deleted/merged vectors
+                // Only storage engines (LSM) track deleted/merged vectors
                 // For now, pass empty arrays since WAL doesn't have this data
                 use std::collections::HashMap;
                 if let Err(e) = self
@@ -622,56 +618,6 @@ impl CompactionCoordinator {
                     completed_at: Utc::now(),
                     engine_type: engine_type.to_string(),
                 })
-            }
-        }
-    }
-
-    /// Execute VIPER engine compaction
-    async fn execute_viper_compaction(&self, collection_id: &str) -> Result<WalCompactionResult> {
-        debug!(
-            "🔧 CompactionCoordinator: Executing VIPER compaction for {}",
-            collection_id
-        );
-
-        // Use VIPER's do_compact method through unified framework
-        let params = crate::storage::CompactionParameters {
-            full_target_segments: None,
-            full: false,
-            collection_id: Some(collection_id.to_string()),
-            force: false,
-            synchronous: true,
-            hints: std::collections::HashMap::new(),
-            timeout_ms: Some(30000),
-            priority: crate::storage::traits::OperationPriority::Medium,
-            collection_config: None,
-            estimated_input_size: 0,
-        };
-        match self.viper_engine.do_compact(&params).await {
-            Ok(enhanced_result) => {
-                info!(
-                    "✅ VIPER compaction completed: {} entries processed, {} bytes written, {} entries removed",
-                    enhanced_result.entries_processed.unwrap_or(0),
-                    enhanced_result.bytes_written.unwrap_or(0),
-                    enhanced_result.entries_removed.unwrap_or(0)
-                );
-
-                // Convert storage::WalCompactionResult to local WalCompactionResult
-                Ok(WalCompactionResult {
-                    success: true,
-                    collections_affected: enhanced_result.collections_affected,
-                    files_compacted: enhanced_result.input_files.unwrap_or(0),
-                    bytes_reclaimed: enhanced_result
-                        .bytes_written
-                        .unwrap_or(0)
-                        .saturating_sub(enhanced_result.bytes_read.unwrap_or(0)),
-                    duration_ms: 0, // Will be filled by caller
-                    completed_at: Utc::now(),
-                    engine_type: "VIPER".to_string(),
-                })
-            }
-            Err(e) => {
-                warn!("❌ VIPER compaction failed: {}", e);
-                Err(e)
             }
         }
     }
@@ -834,7 +780,7 @@ impl CompactionCoordinator {
     ) -> Result<Option<WalCompactionResult>> {
         // Initialize collection state if not exists
         if self.get_collection_state(collection_id).await.is_none() {
-            self.initialize_collection(collection_id, "VIPER").await?;
+            self.initialize_collection(collection_id, "LSM").await?;
         }
 
         // Check if compaction is needed
@@ -854,23 +800,14 @@ impl CompactionCoordinator {
     /// Discover existing files for a collection
     async fn discover_existing_files_for_collection(
         &self,
-        collection_id: &str,
+        _collection_id: &str,
         engine_type: &str,
     ) -> Result<Vec<String>> {
-        match engine_type {
-            "VIPER" => {
-                // Use VIPER engine's file discovery
-                self.viper_engine
-                    .parquet_files_for_collection(collection_id)
-                    .await
-            }
-            "LSM" | "SST" => {
-                // For SST engine, we'd need to implement similar discovery
-                // For now, return empty as SST handles its own compaction differently
-                Ok(vec![])
-            }
-            _ => Ok(vec![]),
-        }
+        let _ = engine_type;
+        // For the SST engine, we'd need to implement similar discovery; for
+        // now, return empty as SST handles its own compaction internally.
+        // (VIPER's Parquet-based discovery was removed with the engine, ADR-093.)
+        Ok(vec![])
     }
 }
 
@@ -918,6 +855,6 @@ mod tests {
         assert_eq!(state.uncompacted_size_bytes, 0);
         assert_eq!(state.flushes_since_compaction, 0);
         assert!(!state.compaction_in_progress);
-        assert_eq!(state.preferred_engine, "VIPER");
+        assert_eq!(state.preferred_engine, "LSM");
     }
 }

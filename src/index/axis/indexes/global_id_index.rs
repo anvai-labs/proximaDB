@@ -54,7 +54,7 @@ pub struct GlobalIdIndex {
 /// Storage location information for a vector
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StorageLocation {
-    /// Storage engine type (SST, VIPER, etc.)
+    /// Storage engine type (SST, NOVA, etc.)
     pub engine_type: String,
     /// File path where vector is stored
     pub file_path: String,

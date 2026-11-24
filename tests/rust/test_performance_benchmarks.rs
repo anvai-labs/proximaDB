@@ -249,7 +249,7 @@ mod performance_tests {
                         name: collection_name.clone(),
                         dimension,
                         distance_metric: proximadb::proto::proximadb_v1::DistanceMetric::Cosine as i32,
-                        storage_engine: proximadb::proto::proximadb_v1::StorageEngine::Viper as i32,
+                        storage_engine: proximadb::proto::proximadb_v1::StorageEngine::Sst as i32,
                         primary_indexing_algorithm: proximadb::proto::proximadb_v1::IndexingAlgorithm::Hnsw as i32,
                         filterable_columns: vec![
                             FilterableColumnSpec {

@@ -14,7 +14,6 @@ pub mod io; // I/O operations: zero-copy, filesystem abstractions
 pub mod matrix_trinity_serializer; // Matrix Trinity (RAPTOR) metadata serializer
 pub mod metadata_serializer; // Shared metadata serializer helpers (DRY across engines)
 pub mod ops; // Common operations: compression, encoding, optimization
-pub mod parquet_format_serializer; // Parquet format (VIPER) metadata serializer
 pub mod pca; // PCA model management for spatial clustering
 pub mod proximablocks_compact_serializer; // ProximaBlocks compact (SWIFT) metadata serializer
 pub mod proximablocks_format_serializer; // ProximaBlocks format (HELIX) metadata serializer

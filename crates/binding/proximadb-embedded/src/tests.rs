@@ -1082,7 +1082,7 @@ mod tests {
             ],
             metadata_path: "/nvme/metadata".to_string(),
             cache_size_mb: 2048,
-            default_engine: "viper".to_string(),
+            default_engine: "nova".to_string(),
             enable_wal: false,
             wal_sync_mode: "immediate".to_string(),
             block_prune_mode: "ratio".to_string(),
@@ -1111,7 +1111,7 @@ mod tests {
         );
         assert_eq!(config.metadata_path, "/nvme/metadata");
         assert_eq!(config.cache_size_mb, 2048);
-        assert_eq!(config.default_engine, "viper");
+        assert_eq!(config.default_engine, "nova");
         assert!(!config.enable_wal);
         assert_eq!(config.wal_sync_mode, "immediate");
         assert_eq!(config.block_prune_mode, "ratio");

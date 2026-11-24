@@ -70,7 +70,7 @@ pub trait StorageReader: Send + Sync {
     ///
     /// Each engine implements its own optimization strategy:
     /// - **SST**: 3-stage pipeline (Bloom → Row filter → Vector)
-    /// - **VIPER**: Columnar predicate pushdown, Parquet filtering
+    /// - **NOVA**: Columnar predicate pushdown, Parquet filtering
     /// - **HELIX**: Hilbert curve spatial pruning
     /// - **NOVA**: 5-stage progressive filtering
     /// - **RAPTOR**: Matrix Trinity navigation

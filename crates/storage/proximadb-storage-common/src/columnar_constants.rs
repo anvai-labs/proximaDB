@@ -32,7 +32,6 @@ pub const FIELD_IS_DELETED: &str = "is_deleted";
 pub const FIELD_SCHEMA_VERSION: &str = "schema_version";
 
 pub const PARQUET_EXTENSION: &str = ".parquet";
-pub const VIPER_FILE_EXTENSION: &str = ".viper.parquet";
 
 pub const DEFAULT_ROW_GROUP_SIZE: usize = 2048;
 pub const DEFAULT_PAGE_SIZE: usize = 256 * 1024;

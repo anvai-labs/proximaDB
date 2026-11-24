@@ -187,8 +187,6 @@ pub enum StorageEngineType {
     LSH,
     /// SST (Sorted String Table) storage engine
     SST,
-    /// VIPER storage engine
-    VIPER,
     /// HELIX storage engine
     HELIX,
     /// NOVA storage engine

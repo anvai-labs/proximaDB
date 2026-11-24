@@ -79,7 +79,7 @@ class ProximaDBVectorDBClient:
         self.metric_type = metric_type
 
         requested_engine = str(self.storage_engine).lower()
-        if requested_engine in {"sst", "viper", "nova", "swift", "raptor", "helix"}:
+        if requested_engine in {"sst", "nova", "swift", "raptor", "helix"}:
             storage_engine = requested_engine
         else:
             storage_engine = "sst"

@@ -1,7 +1,7 @@
 //! Common Progressive Search Implementation
 //!
 //! This module provides shared progressive search logic that can be used by all storage engines
-//! (SST, VIPER, NOVA, SWIFT, etc.) to implement multi-stage quantization-aware search.
+//! (SST, NOVA, SWIFT, etc.) to implement multi-stage quantization-aware search.
 //!
 //! ## FLEXIBLE QUANTIZATION ARCHITECTURE (2025-08-21):
 //!

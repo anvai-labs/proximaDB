@@ -31,7 +31,7 @@ const COLD_TIER_MAX_IDS_PER_LOOKUP: usize = u16::MAX as usize;
 /// different implementations based on the underlying storage backend.
 ///
 /// Implementations can be:
-/// - Storage engine based (SST, VIPER, etc.)
+/// - Storage engine based (SST, NOVA, etc.)
 /// - External storage (S3, GCS, etc.)
 /// - Hybrid approaches
 #[async_trait::async_trait]

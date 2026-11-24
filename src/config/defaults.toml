@@ -39,13 +39,6 @@ mmap_enabled = true
 prefetch_enabled = true
 prefetch_size_kb = 64
 
-[storage.viper_config]
-row_group_size = 100000
-compression = "snappy"
-enable_statistics = true
-data_directory = "./data/viper_data"
-cache_size_mb = 512
-
 [storage.bloom_filter_config]
 bits_per_key = 10
 enabled = true

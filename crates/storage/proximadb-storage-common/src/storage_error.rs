@@ -3,7 +3,7 @@
 //! Provides a comprehensive error type hierarchy for all storage-related operations
 //! in ProximaDB. This unifies error handling across:
 //! - WAL operations (write, flush, recovery)
-//! - Storage engines (SST, VIPER, HELIX, NOVA, SWIFT, RAPTOR)
+//! - Storage engines (SST, HELIX, NOVA, SWIFT, RAPTOR)
 //! - Filesystem operations (local, S3, Azure, GCS)
 //! - Compaction and optimization
 //! - Backup and recovery
@@ -186,8 +186,6 @@ pub enum StorageErrorKind {
     // === Engine-Specific Errors ===
     /// SST engine error
     SstEngine,
-    /// VIPER engine error
-    ViperEngine,
     /// HELIX engine error
     HelixEngine,
     /// NOVA engine error
@@ -291,7 +289,6 @@ impl fmt::Display for StorageErrorKind {
             StorageErrorKind::Conflict => write!(f, "conflict"),
             StorageErrorKind::StaleRead => write!(f, "stale read"),
             StorageErrorKind::SstEngine => write!(f, "SST engine error"),
-            StorageErrorKind::ViperEngine => write!(f, "VIPER engine error"),
             StorageErrorKind::HelixEngine => write!(f, "HELIX engine error"),
             StorageErrorKind::NovaEngine => write!(f, "NOVA engine error"),
             StorageErrorKind::SwiftEngine => write!(f, "SWIFT engine error"),
@@ -420,7 +417,6 @@ impl StorageError {
     pub fn engine_error(engine: &str, message: impl Into<String>) -> Self {
         let kind = match engine.to_uppercase().as_str() {
             "SST" => StorageErrorKind::SstEngine,
-            "VIPER" => StorageErrorKind::ViperEngine,
             "HELIX" => StorageErrorKind::HelixEngine,
             "NOVA" => StorageErrorKind::NovaEngine,
             "SWIFT" => StorageErrorKind::SwiftEngine,
@@ -704,7 +700,6 @@ mod tests {
             (StorageErrorKind::Conflict, "conflict"),
             (StorageErrorKind::StaleRead, "stale read"),
             (StorageErrorKind::SstEngine, "SST engine error"),
-            (StorageErrorKind::ViperEngine, "VIPER engine error"),
             (StorageErrorKind::HelixEngine, "HELIX engine error"),
             (StorageErrorKind::NovaEngine, "NOVA engine error"),
             (StorageErrorKind::SwiftEngine, "SWIFT engine error"),
@@ -763,9 +758,6 @@ mod tests {
         let sst_err = StorageError::engine_error("SST", "Block read failed");
         assert_eq!(sst_err.kind, StorageErrorKind::SstEngine);
         assert_eq!(sst_err.context.engine.as_deref(), Some("SST"));
-
-        let viper_err = StorageError::engine_error("VIPER", "Parquet decode failed");
-        assert_eq!(viper_err.kind, StorageErrorKind::ViperEngine);
 
         assert_eq!(
             StorageError::engine_error("HELIX", "hilbert failed").kind,

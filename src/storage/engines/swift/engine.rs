@@ -186,7 +186,6 @@ pub fn get_collection_pca_model(
 ///
 /// ### Key Differentiators:
 /// - **vs SST**: Proxima format vs SSTable, 3x faster point queries
-/// - **vs VIPER**: Row-based vs columnar, better for OLTP
 /// - **vs NOVA**: Lower latency vs higher compression
 ///
 /// ### Performance Characteristics:
@@ -350,19 +349,19 @@ impl SwiftEngine {
     /// SWIFT engine is DEPRECATED and INCOMPLETE. Do not use in production.
     ///
     /// **Status**: Will be removed in v1.0 unless completed by contributors
-    /// **Alternatives**: Use SST, VIPER, HELIX, or NOVA engines instead
+    /// **Alternatives**: Use SST, HELIX, or NOVA engines instead
     /// **Documentation**: See `/docs/storage/EXPERIMENTAL_ENGINES_STATUS.md`
     ///
     /// For hierarchical storage, use application-level hierarchy with production engines.
     #[deprecated(
         since = "0.2.0",
-        note = "SWIFT engine is deprecated. Use SST, VIPER, HELIX, or NOVA instead."
+        note = "SWIFT engine is deprecated. Use SST, HELIX, or NOVA instead."
     )]
     pub async fn new() -> Result<Self> {
         tracing::warn!(
             "⚠️  SWIFT ENGINE DEPRECATION WARNING ⚠️ \
              SWIFT is deprecated and incomplete. \
-             Use SST, VIPER, HELIX, or NOVA instead. \
+             Use SST, HELIX, or NOVA instead. \
              See /docs/storage/EXPERIMENTAL_ENGINES_STATUS.md for details."
         );
 

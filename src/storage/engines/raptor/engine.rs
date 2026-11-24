@@ -474,19 +474,19 @@ impl RaptorEngine {
     /// RAPTOR engine is DEPRECATED and EXPERIMENTAL. Do not use in production.
     ///
     /// **Status**: Will be removed in v1.0 unless completed by contributors
-    /// **Alternatives**: Use SST, VIPER, HELIX, or NOVA engines instead
+    /// **Alternatives**: Use SST, HELIX, or NOVA engines instead
     /// **Documentation**: See `/docs/storage/EXPERIMENTAL_ENGINES_STATUS.md`
     ///
     /// For adaptive workloads, use production engines with appropriate configuration.
     #[deprecated(
         since = "0.2.0",
-        note = "RAPTOR engine is deprecated. Use SST, VIPER, HELIX, or NOVA instead."
+        note = "RAPTOR engine is deprecated. Use SST, HELIX, or NOVA instead."
     )]
     pub async fn new() -> Result<Self> {
         tracing::warn!(
             "⚠️  RAPTOR ENGINE DEPRECATION WARNING ⚠️ \
              RAPTOR is deprecated and experimental. \
-             Use SST, VIPER, HELIX, or NOVA instead. \
+             Use SST, HELIX, or NOVA instead. \
              See /docs/storage/EXPERIMENTAL_ENGINES_STATUS.md for details."
         );
 

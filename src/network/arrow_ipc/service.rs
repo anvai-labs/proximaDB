@@ -211,7 +211,7 @@ fn graph_flight_err(e: anyhow::Error) -> FlightError {
 /// ## Supported File Formats
 ///
 /// - **.arrow**: Arrow IPC files (from SST, HELIX engines)
-/// - **.parquet**: Parquet files (from Nova, VIPER engines)
+/// - **.parquet**: Parquet files (from Nova)
 pub struct ProximaFlightService {
     // TD-104 S3 / TD-FLIGHT-1: the Flight service depends on ports + the
     // concrete services it actually uses, not a monolithic handler. Canonical

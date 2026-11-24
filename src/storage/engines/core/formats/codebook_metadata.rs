@@ -2,7 +2,7 @@
 //!
 //! This module provides unified codebook serialization and storage for all engines.
 //! - ProximaBlock engines (SST, SWIFT, HELIX): Store as footer metadata
-//! - Parquet engines (VIPER, NOVA): Store as sidecar files
+//! - Parquet engines (NOVA): Store as sidecar files
 //!
 //! Integrates with existing UnifiedQuantizationEngine and GlobalQuantizationCache.
 

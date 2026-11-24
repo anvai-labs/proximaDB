@@ -463,7 +463,7 @@ impl ProximaDB {
             tracing::info!("✅ ProximaDB::new - Global catalog set for WAL/recovery");
         }
 
-        // Step 5: Initialize the storage engine (SST/VIPER/etc)
+        // Step 5: Initialize the storage engine (SST/etc)
         tracing::info!("🌐 ProximaDB::new - Creating StorageEngine...");
         let mut storage_engine =
             storage::StorageEngine::new_without_collection_service(config.storage.clone())
@@ -897,16 +897,6 @@ impl ProximaDB {
                     .sst_config
                     .as_ref()
                     .and_then(|sst| sst.compaction_config.as_ref()),
-            ),
-            // Validated at load like the other two, so its deprecated values
-            // must be reported too (#2418 review round 15).
-            (
-                "storage.viper_config.compaction_config",
-                self._config
-                    .storage
-                    .viper_config
-                    .as_ref()
-                    .and_then(|viper| viper.compaction_config.as_ref()),
             ),
         ] {
             for note in cfg

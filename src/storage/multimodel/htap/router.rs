@@ -1,7 +1,7 @@
 //! # Workload Router
 //!
 //! Intelligent query routing based on workload characteristics.
-//! Routes queries to OLTP (SST) or OLAP (VIPER) based on:
+//! Routes queries to OLTP (SST) or OLAP based on:
 //! - Query pattern analysis
 //! - Estimated row count
 //! - Presence of aggregations

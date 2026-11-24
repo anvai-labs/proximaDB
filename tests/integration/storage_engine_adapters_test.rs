@@ -1,6 +1,6 @@
 //! # Engine Adapters Unit Tests
 //!
-//! Tests for the engine-specific TableProvider adapters (SST, HELIX, VIPER).
+//! Tests for the engine-specific TableProvider adapters (SST, HELIX).
 //!
 //! ## Test Coverage
 //!
@@ -313,30 +313,31 @@ mod helix_adapter_tests {
 }
 
 // ============================================================================
-// VIPER Adapter Tests
+// NOVA Adapter Tests (columnar row-group splits; the VIPER adapter was removed
+// with the engine per ADR-093 — this coverage is engine-generic)
 // ============================================================================
 
-mod viper_adapter_tests {
+mod nova_adapter_tests {
     use super::*;
 
-    fn create_viper_collection_info() -> CollectionInfo {
-        CollectionInfo::new("test_viper".to_string(), 1536, EngineType::Viper)
+    fn create_nova_collection_info() -> CollectionInfo {
+        CollectionInfo::new("test_nova".to_string(), 1536, EngineType::Nova)
             .with_vector_count(1000000)
             .with_storage_size(1024 * 1024 * 1024 * 2) // 2GB
             .with_file_count(50)
-            .with_base_path("/data/viper_test".to_string())
+            .with_base_path("/data/nova_test".to_string())
     }
 
     #[test]
-    fn test_viper_collection_info() {
-        let info = create_viper_collection_info();
-        assert_eq!(info.engine_type, EngineType::Viper);
+    fn test_nova_collection_info() {
+        let info = create_nova_collection_info();
+        assert_eq!(info.engine_type, EngineType::Nova);
         assert_eq!(info.dimension, 1536);
         assert_eq!(info.vector_count, 1000000);
     }
 
     #[test]
-    fn test_viper_row_group_split_creation() {
+    fn test_nova_row_group_split_creation() {
         let split = FileSplit::new_row_group(
             "/data/test/file.parquet".to_string(),
             0,
@@ -362,7 +363,7 @@ mod viper_adapter_tests {
     }
 
     #[test]
-    fn test_viper_split_with_column_statistics() {
+    fn test_nova_split_with_column_statistics() {
         let mut split = FileSplit::new_row_group(
             "/data/test/file.parquet".to_string(),
             0,
@@ -399,7 +400,7 @@ mod viper_adapter_tests {
     }
 
     #[test]
-    fn test_viper_scalar_predicate_pruning() {
+    fn test_nova_scalar_predicate_pruning() {
         let bounds = ColumnBounds {
             min: Some(serde_json::json!(10)),
             max: Some(serde_json::json!(100)),
@@ -429,7 +430,7 @@ mod viper_adapter_tests {
     }
 
     #[test]
-    fn test_viper_split_cost_row_group() {
+    fn test_nova_split_cost_row_group() {
         let split = FileSplit::new_row_group(
             "/data/test/file.parquet".to_string(),
             0,
@@ -446,11 +447,11 @@ mod viper_adapter_tests {
     }
 
     #[test]
-    fn test_viper_pruning_statistics() {
+    fn test_nova_pruning_statistics() {
         let splits = vec![
-            create_viper_split_with_stats(0),
-            create_viper_split_with_stats(1),
-            create_viper_split_with_stats(2),
+            create_nova_split_with_stats(0),
+            create_nova_split_with_stats(1),
+            create_nova_split_with_stats(2),
         ];
 
         let stats = PruningStatistics::from_splits(&splits);
@@ -461,7 +462,7 @@ mod viper_adapter_tests {
         assert!(stats.is_pruning_effective());
     }
 
-    fn create_viper_split_with_stats(index: usize) -> FileSplit {
+    fn create_nova_split_with_stats(index: usize) -> FileSplit {
         let mut split = FileSplit::new_row_group(
             format!("/data/file_{}.parquet", index),
             index,
@@ -484,7 +485,7 @@ mod viper_adapter_tests {
     }
 
     #[test]
-    fn test_viper_storage_tier_assignment() {
+    fn test_nova_storage_tier_assignment() {
         let mut split = FileSplit::new_row_group(
             "/data/test/file.parquet".to_string(),
             0,
@@ -493,7 +494,7 @@ mod viper_adapter_tests {
             128000,
         );
 
-        // VIPER/Parquet files are typically on warm/cold tier
+        // Columnar Parquet files are typically on warm/cold tier
         split.locality.storage_tier = StorageTier::Warm;
         assert_eq!(split.locality.storage_tier, StorageTier::Warm);
 
@@ -524,8 +525,8 @@ mod cross_engine_tests {
             StorageEngineStrategy::Helix
         );
         assert_eq!(
-            StorageEngineStrategy::from(EngineType::Viper),
-            StorageEngineStrategy::Viper
+            StorageEngineStrategy::from(EngineType::Nova),
+            StorageEngineStrategy::Nova
         );
 
         // Test StorageEngineStrategy -> EngineType
@@ -538,8 +539,8 @@ mod cross_engine_tests {
             EngineType::Helix
         );
         assert_eq!(
-            EngineType::from(StorageEngineStrategy::Viper),
-            EngineType::Viper
+            EngineType::from(StorageEngineStrategy::Nova),
+            EngineType::Nova
         );
     }
 
@@ -569,9 +570,9 @@ mod cross_engine_tests {
         let helix_info = CollectionInfo::new("helix".to_string(), 768, EngineType::Helix);
         assert_eq!(helix_info.avg_vector_size_bytes(), 768 * 4); // 3072 bytes
 
-        // VIPER with 1536D vectors (OpenAI ada-002)
-        let viper_info = CollectionInfo::new("viper".to_string(), 1536, EngineType::Viper);
-        assert_eq!(viper_info.avg_vector_size_bytes(), 1536 * 4); // 6144 bytes
+        // NOVA with 1536D vectors (OpenAI ada-002)
+        let nova_info = CollectionInfo::new("nova".to_string(), 1536, EngineType::Nova);
+        assert_eq!(nova_info.avg_vector_size_bytes(), 1536 * 4); // 6144 bytes
     }
 
     #[test]

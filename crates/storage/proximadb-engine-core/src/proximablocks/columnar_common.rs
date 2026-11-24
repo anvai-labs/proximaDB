@@ -1,6 +1,6 @@
-//! Common Columnar Logic for VIPER and NOVA Engines
+//! Common Columnar Logic for the NOVA Engine
 //!
-//! This module extracts shared functionality between VIPER and NOVA engines,
+//! This module extracts columnar functionality shared across engines,
 //! eliminating code duplication while providing specialized optimizations
 //! for each engine through composition and configuration.
 
@@ -28,7 +28,7 @@ use proximadb_storage_common::columnar_schema_full::{
 };
 use proximadb_storage_ports::{FilesystemPort, StorageQuantizationEnginePort};
 
-/// Common configuration for VIPER and NOVA engines
+/// Common columnar-engine configuration (NOVA and friends)
 #[derive(Debug, Clone, Default)]
 pub struct CommonColumnarConfig {
     /// Base columnar configuration
@@ -289,30 +289,11 @@ pub struct HardwareAccelerationConfig {
 /// Engine-specific optimizations
 #[derive(Debug, Clone, Default)]
 pub struct EngineOptimizations {
-    /// VIPER-specific optimizations
-    pub viper_optimizations: ViperOptimizations,
-
     /// NOVA-specific optimizations
     pub nova_optimizations: NovaOptimizations,
 
     /// Shared optimizations
     pub shared_optimizations: SharedOptimizations,
-}
-
-/// VIPER-specific optimizations
-#[derive(Debug, Clone)]
-pub struct ViperOptimizations {
-    /// Optimize for append-heavy workloads
-    pub optimize_for_append: bool,
-
-    /// Enable columnar compression
-    pub enable_columnar_compression: bool,
-
-    /// Row group size optimization
-    pub row_group_size_optimization: RowGroupSizeOptimization,
-
-    /// Enable predicate pushdown
-    pub enable_predicate_pushdown: bool,
 }
 
 /// NOVA-specific optimizations
@@ -730,7 +711,7 @@ impl CommonColumnarOperations {
     }
 
     // Distance computation methods removed - use compute module directly
-    // Engines (NOVA, VIPER) should use:
+    // Columnar engines (NOVA) should use:
     // - proximadb_distance_kernel::engine::UnifiedDistanceCompute
     // - crate::compute::quantization::storage_engine::StorageQuantizationEngine
 
@@ -1174,17 +1155,6 @@ impl Default for HardwareAccelerationConfig {
     }
 }
 
-impl Default for ViperOptimizations {
-    fn default() -> Self {
-        Self {
-            optimize_for_append: true,
-            enable_columnar_compression: true,
-            row_group_size_optimization: RowGroupSizeOptimization::default(),
-            enable_predicate_pushdown: true,
-        }
-    }
-}
-
 impl Default for NovaOptimizations {
     fn default() -> Self {
         Self {
@@ -1274,7 +1244,7 @@ impl Default for ResourceColumnarMonitoringConfig {
 }
 
 /// Map core compression algorithm to Parquet compression
-/// This is shared by both NOVA and VIPER engines for consistent compression handling
+/// This is shared across columnar engines for consistent compression handling
 pub fn map_core_to_parquet_compression(
     algorithm: CompressionAlgorithm,
     level: Option<i32>,
@@ -1360,12 +1330,6 @@ mod tests {
         // Distance config removed - engines use compute module directly
 
         // Test engine optimizations
-        assert!(
-            config
-                .engine_optimizations
-                .viper_optimizations
-                .optimize_for_append
-        );
         assert!(
             config
                 .engine_optimizations

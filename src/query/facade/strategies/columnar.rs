@@ -24,7 +24,7 @@
 //!       │         └── Used when data is in memory cache
 //!       │
 //!       └──> ParquetRangePrunedProvider (on-disk Parquet/SST)
-//!                 └── Used for VIPER/NOVA engine files
+//!                 └── Used for NOVA engine files
 //!                 └── Supports row group pruning via statistics
 //!       │
 //!       ▼

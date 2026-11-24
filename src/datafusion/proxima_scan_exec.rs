@@ -23,7 +23,7 @@
 //! │  │  SplitReader Implementations                                          │  │
 //! │  │  - SstSplitReader                                                     │  │
 //! │  │  - HelixSplitReader                                                   │  │
-//! │  │  - ViperSplitReader (Parquet)                                         │  │
+//! │  │  - NovaSplitReader (Parquet)                                         │  │
 //! │  │  - NovaSplitReader                                                    │  │
 //! │  │  - SwiftSplitReader                                                   │  │
 //! │  │  - RaptorSplitReader                                                  │  │
@@ -963,7 +963,7 @@ mod tests {
     #[test]
     fn test_proxima_scan_exec_new() {
         let schema = test_schema();
-        let reader = Arc::new(NullSplitReader::new(schema.clone(), EngineType::Viper));
+        let reader = Arc::new(NullSplitReader::new(schema.clone(), EngineType::Nova));
         let splits = vec![FileSplit::new_row_group(
             "/f1.parquet".to_string(),
             0,
@@ -974,7 +974,7 @@ mod tests {
 
         let exec = ProximaScanExec::new(schema, splits, reader);
 
-        assert_eq!(exec.engine_type(), EngineType::Viper);
+        assert_eq!(exec.engine_type(), EngineType::Nova);
         assert_eq!(exec.total_split_count(), 1);
     }
 
@@ -1102,7 +1102,7 @@ mod tests {
             .splits(vec![])
             .reader(Arc::new(NullSplitReader::new(
                 schema.clone(),
-                EngineType::Viper,
+                EngineType::Nova,
             )))
             .collection_name("t".to_string())
             .target_partitions(1)

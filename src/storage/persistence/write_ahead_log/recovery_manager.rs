@@ -3,7 +3,7 @@
 //! This module handles WAL recovery with proper separation of concerns:
 //! - Disk manager for reading WAL files
 //! - Serialization adapters for deserializing data
-//! - Storage engines (LSM/VIPER) as primary recovery destination
+//! - Storage engines (LSM) as primary recovery destination
 //! - Flush coordinator for coordinating recovery and flush operations
 //!
 //! Key Design Decision: Recovery goes directly to storage engines, not memtable.
@@ -34,7 +34,7 @@ pub enum RecoveryMode {
 pub struct RecoveryManager {
     /// Disk manager for reading WAL files
     disk_manager: Arc<WriteAheadLogDiskManager>,
-    /// Storage engines by collection (LSM or VIPER)
+    /// Storage engines by collection (LSM)
     storage_engines: Arc<tokio::sync::RwLock<HashMap<String, Arc<dyn UnifiedStorageFormat>>>>,
     /// Flush coordinator for managing recovery coordination
     flush_coordinator: Arc<WALFlushCoordinator>,
@@ -145,7 +145,7 @@ impl RecoveryManager {
         engines.insert(collection_id.to_string(), engine.clone());
 
         // Also register with flush coordinator by engine type
-        // The flush coordinator needs engines registered by type (VIPER, LSM), not collection
+        // The flush coordinator needs engines registered by type (LSM), not collection
         let engine_type = engine.format_name(); // Get the engine name
         self.flush_coordinator
             .register_storage_engine(engine_type, engine)

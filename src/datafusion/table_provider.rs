@@ -71,7 +71,7 @@ impl Default for ProximaDBTableProviderConfig {
 
 /// DataFusion TableProvider for ProximaDB collections.
 ///
-/// Provides SQL access to vector collections stored in VIPER, NOVA, or other engines.
+/// Provides SQL access to vector collections stored in NOVA, SST, or other engines.
 pub struct ProximaDBTableProvider {
     /// Collection name
     collection_name: String,
@@ -262,16 +262,6 @@ impl TableProvider for ProximaDBTableProvider {
 // ============================================================================
 // Factory Functions
 // ============================================================================
-
-/// Create a TableProvider for a VIPER collection.
-pub fn create_viper_table_provider(
-    collection_name: String,
-    proxima_schema: Arc<ProximaSchema>,
-    storage_format: Arc<dyn InternalFormat>,
-    base_path: String,
-) -> ProximaDBTableProvider {
-    ProximaDBTableProvider::new(collection_name, proxima_schema, storage_format, base_path)
-}
 
 /// Create a TableProvider for a NOVA collection.
 pub fn create_nova_table_provider(
@@ -616,8 +606,8 @@ mod tests {
         use crate::datafusion::proxima_scan_exec::NullSplitReader;
 
         let schema = test_schema();
-        let info = CollectionInfo::new("test".to_string(), 128, EngineType::Viper);
-        let reader = Arc::new(NullSplitReader::new(schema.clone(), EngineType::Viper));
+        let info = CollectionInfo::new("test".to_string(), 128, EngineType::Nova);
+        let reader = Arc::new(NullSplitReader::new(schema.clone(), EngineType::Nova));
 
         let splits = vec![
             FileSplit::new_row_group("/data/file1.parquet".to_string(), 0, 0, 65536, 10000),

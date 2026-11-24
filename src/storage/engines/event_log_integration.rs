@@ -116,83 +116,6 @@ impl EventLogNotifier for SstEventLogNotifier {
     }
 }
 
-/// VIPER engine event log integration
-pub struct ViperEventLogNotifier {
-    event_log: Arc<dyn StorageEventLogPort>,
-}
-
-impl ViperEventLogNotifier {
-    pub fn new(event_log: Arc<dyn StorageEventLogPort>) -> Self {
-        Self { event_log }
-    }
-}
-
-#[async_trait::async_trait]
-impl EventLogNotifier for ViperEventLogNotifier {
-    async fn notify_flush(
-        &self,
-        collection_id: &str,
-        flushed_files: Vec<String>,
-        vector_count: usize,
-        has_quantized: bool,
-        has_fp32: bool,
-    ) -> Result<(), anyhow::Error> {
-        self.event_log
-            .notify_flush(
-                collection_id,
-                flushed_files,
-                vector_count,
-                StorageEngineType::VIPER,
-                has_quantized,
-                has_fp32,
-            )
-            .await?;
-
-        trace!("EventLog acknowledged VIPER flush for {}", collection_id);
-        Ok(())
-    }
-
-    async fn notify_compaction(
-        &self,
-        collection_id: &str,
-        output_files: Vec<String>,
-        vector_count: usize,
-    ) -> Result<(), anyhow::Error> {
-        self.event_log
-            .notify_compaction(
-                collection_id,
-                output_files,
-                vector_count,
-                StorageEngineType::VIPER,
-            )
-            .await?;
-
-        trace!(
-            "EventLog acknowledged VIPER compaction for {}",
-            collection_id
-        );
-        Ok(())
-    }
-
-    async fn can_compact_files(&self, collection_id: &str, files: &[String]) -> bool {
-        for file in files {
-            match self.event_log.can_compact(collection_id, file).await {
-                Ok(can_compact) => {
-                    if !can_compact {
-                        debug!("File {} not ready for compaction (indexes pending)", file);
-                        return false;
-                    }
-                }
-                Err(_) => {
-                    // Don't block on errors
-                    return true;
-                }
-            }
-        }
-        true
-    }
-}
-
 /// Factory for creating event log notifiers
 pub struct EventLogNotifierFactory;
 
@@ -202,11 +125,6 @@ impl EventLogNotifierFactory {
         SstEventLogNotifier::new(event_log)
     }
 
-    /// Create VIPER notifier
-    pub fn create_viper_notifier(event_log: Arc<dyn StorageEventLogPort>) -> ViperEventLogNotifier {
-        ViperEventLogNotifier::new(event_log)
-    }
-
     /// Create notifier based on engine type
     pub fn create_notifier(
         engine_type: &str,
@@ -214,7 +132,6 @@ impl EventLogNotifierFactory {
     ) -> Result<Box<dyn EventLogNotifier + Send + Sync>, anyhow::Error> {
         match engine_type.to_lowercase().as_str() {
             "sst" => Ok(Box::new(Self::create_sst_notifier(event_log))),
-            "viper" => Ok(Box::new(Self::create_viper_notifier(event_log))),
             "nova" | "swift" | "raptor" | "prism" | "helix" => {
                 // For now, use SST notifier for engines without specific implementations
                 // Deferred: Implement specific notifiers for each engine
@@ -250,19 +167,13 @@ impl FlushParametersExt for FlushParameters {
     }
 
     fn has_fp32(&self) -> bool {
-        // SST/VIPER always store FP32 unless explicitly quantized-only
+        // SST-family engines always store FP32 unless explicitly quantized-only
         true
     }
 
     fn storage_engine(&self) -> StorageEngineType {
-        // Could check hints or collection config
-        if self.hints.contains_key("engine")
-            && self.hints["engine"] == serde_json::Value::String("viper".to_string())
-        {
-            StorageEngineType::VIPER
-        } else {
-            StorageEngineType::SST
-        }
+        // VIPER was removed (ADR-093); no hint can select it any more.
+        StorageEngineType::SST
     }
 }
 
@@ -274,13 +185,7 @@ pub trait CompactionParametersExt {
 
 impl CompactionParametersExt for CompactionParameters {
     fn storage_engine(&self) -> StorageEngineType {
-        if self.hints.contains_key("engine")
-            && self.hints["engine"] == serde_json::Value::String("viper".to_string())
-        {
-            StorageEngineType::VIPER
-        } else {
-            StorageEngineType::SST
-        }
+        StorageEngineType::SST
     }
 }
 

@@ -110,8 +110,6 @@ pub struct GeneralFilesystemMetrics {
     // Storage engine file type metrics
     pub sst_files_read: AtomicU64,
     pub sst_files_written: AtomicU64,
-    pub viper_files_read: AtomicU64,
-    pub viper_files_written: AtomicU64,
     pub nova_files_read: AtomicU64,
     pub nova_files_written: AtomicU64,
     pub raptor_files_read: AtomicU64,
@@ -124,8 +122,6 @@ pub struct GeneralFilesystemMetrics {
     // Engine-specific byte tracking
     pub sst_bytes_read: AtomicU64,
     pub sst_bytes_written: AtomicU64,
-    pub viper_bytes_read: AtomicU64,
-    pub viper_bytes_written: AtomicU64,
     pub nova_bytes_read: AtomicU64,
     pub nova_bytes_written: AtomicU64,
     pub raptor_bytes_read: AtomicU64,
@@ -176,22 +172,6 @@ impl FilesystemMetricsCollector {
                     .fetch_add(1, Ordering::Relaxed);
                 self.general_metrics
                     .sst_bytes_written
-                    .fetch_add(bytes, Ordering::Relaxed);
-            }
-            (StorageEngineType::VIPER, FileOperation::Read) => {
-                self.general_metrics
-                    .viper_files_read
-                    .fetch_add(1, Ordering::Relaxed);
-                self.general_metrics
-                    .viper_bytes_read
-                    .fetch_add(bytes, Ordering::Relaxed);
-            }
-            (StorageEngineType::VIPER, FileOperation::Write) => {
-                self.general_metrics
-                    .viper_files_written
-                    .fetch_add(1, Ordering::Relaxed);
-                self.general_metrics
-                    .viper_bytes_written
                     .fetch_add(bytes, Ordering::Relaxed);
             }
             (StorageEngineType::NOVA, FileOperation::Read) => {
@@ -297,24 +277,6 @@ impl FilesystemMetricsCollector {
                 bytes_written: self
                     .general_metrics
                     .sst_bytes_written
-                    .load(Ordering::Relaxed),
-            },
-            StorageEngineType::VIPER => EngineFileStats {
-                files_read: self
-                    .general_metrics
-                    .viper_files_read
-                    .load(Ordering::Relaxed),
-                files_written: self
-                    .general_metrics
-                    .viper_files_written
-                    .load(Ordering::Relaxed),
-                bytes_read: self
-                    .general_metrics
-                    .viper_bytes_read
-                    .load(Ordering::Relaxed),
-                bytes_written: self
-                    .general_metrics
-                    .viper_bytes_written
                     .load(Ordering::Relaxed),
             },
             StorageEngineType::NOVA => EngineFileStats {
@@ -640,31 +602,6 @@ impl FilesystemMetricsCollector {
         );
 
         metrics.insert(
-            "fs.engine.viper.files_read".to_string(),
-            self.general_metrics
-                .viper_files_read
-                .load(Ordering::Relaxed) as f64,
-        );
-        metrics.insert(
-            "fs.engine.viper.files_written".to_string(),
-            self.general_metrics
-                .viper_files_written
-                .load(Ordering::Relaxed) as f64,
-        );
-        metrics.insert(
-            "fs.engine.viper.bytes_read".to_string(),
-            self.general_metrics
-                .viper_bytes_read
-                .load(Ordering::Relaxed) as f64,
-        );
-        metrics.insert(
-            "fs.engine.viper.bytes_written".to_string(),
-            self.general_metrics
-                .viper_bytes_written
-                .load(Ordering::Relaxed) as f64,
-        );
-
-        metrics.insert(
             "fs.engine.nova.files_read".to_string(),
             self.general_metrics.nova_files_read.load(Ordering::Relaxed) as f64,
         );
@@ -914,10 +851,6 @@ impl GeneralFilesystemMetrics {
             sst_files_written: AtomicU64::new(0),
             sst_bytes_read: AtomicU64::new(0),
             sst_bytes_written: AtomicU64::new(0),
-            viper_files_read: AtomicU64::new(0),
-            viper_files_written: AtomicU64::new(0),
-            viper_bytes_read: AtomicU64::new(0),
-            viper_bytes_written: AtomicU64::new(0),
             nova_files_read: AtomicU64::new(0),
             nova_files_written: AtomicU64::new(0),
             nova_bytes_read: AtomicU64::new(0),

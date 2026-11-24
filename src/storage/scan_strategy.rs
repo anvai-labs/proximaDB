@@ -2,13 +2,13 @@
 //!
 //! This module unifies the scan patterns found across all storage engines:
 //! - **SST**: full_scan_strategy, filtered_scan_strategy_modular, parallel_full_scan
-//! - **VIPER**: evaluate_predicate_pushdown, columnar filtering with parallel evaluation
+//! - **NOVA**: evaluate_predicate_pushdown, columnar filtering with progressive stages
 //! - **NOVA**: Progressive columnar search, streaming processor, zone maps
 //! - **RAPTOR**: scan_vectors_with_strategy, full_scan_all_vectors, filtered_scan_vectors
 //!
 //! Key insights from existing implementations:
 //! 1. All engines separate full scan (for compaction) from filtered scan (for queries)
-//! 2. Columnar engines (VIPER/NOVA) have predicate pushdown capabilities
+//! 2. Columnar engines (NOVA) have predicate pushdown capabilities
 //! 3. Hybrid columnar engines (SST) use bloom filters and block-level filtering
 //! 4. RAPTOR provides a unified ScanStrategy enum pattern
 //! 5. Parallel processing is key for multi-file scenarios
@@ -78,15 +78,6 @@ pub mod engine_impl {
         pub bloom_filter_enabled: bool,
     }
 
-    /// VIPER scan implementation traits  
-    pub struct VIPERScanIterator {
-        /// Based on column_filter.rs patterns
-        pub parallel_column_evaluation: bool,
-        pub predicate_pushdown_enabled: bool,
-        pub selective_column_loading: bool,
-        pub qualifying_indices: Vec<usize>,
-    }
-
     /// NOVA scan implementation traits
     pub struct NOVAScanIterator {
         /// Based on columnar_search.rs patterns
@@ -110,7 +101,7 @@ pub mod engine_impl {
 pub mod scan_helpers {
     use super::*;
 
-    /// From VIPER: Extract columns needed for filter evaluation
+    /// Extract columns needed for filter evaluation
     pub fn extract_filter_columns(filter: &FilterExpression) -> HashSet<String> {
         let mut columns = HashSet::new();
         match filter {

@@ -37,7 +37,7 @@ python test_comprehensive_grpc_operations.py
 
 echo ""
 echo "2️⃣ Running Vector Coordinator Integration Test..."
-echo "   Tests: gRPC → UnifiedAvroService → VectorCoordinator → VIPER → WAL"
+echo "   Tests: gRPC → UnifiedAvroService → VectorCoordinator → SST → WAL"
 python test_vector_coordinator_integration.py
 
 echo ""
@@ -68,5 +68,5 @@ echo ""
 echo "📈 Performance Characteristics:"
 echo "   - Zero-copy Avro for inserts"
 echo "   - Trust-but-verify WAL writes"
-echo "   - VIPER storage engine with Parquet"
+echo "   - SST storage engine"
 echo "   - HNSW indexing for similarity search"

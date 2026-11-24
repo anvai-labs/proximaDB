@@ -24,9 +24,6 @@ pub enum EngineType {
     /// SWIFT - Storage With Instant Fast Traversal
     SWIFT,
 
-    /// VIPER - Vectorized Indexed Parquet Engine for Retrieval
-    VIPER,
-
     /// SST - Sorted String Table engine
     SST,
 }
@@ -754,5 +751,4 @@ macro_rules! create_simple_adapter {
 
 // Apply the macro to create the remaining adapters
 create_simple_adapter!(SWIFTAdapter, SWIFT, "SWIFT adapter");
-create_simple_adapter!(VIPERAdapter, VIPER, "VIPER adapter");
 create_simple_adapter!(SSTAdapter, SST, "SST adapter");

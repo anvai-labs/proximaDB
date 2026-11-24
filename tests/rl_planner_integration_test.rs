@@ -197,7 +197,6 @@ async fn test_action_space_coverage() {
     let engines = [
         StorageEngineType::SST,
         StorageEngineType::HELIX,
-        StorageEngineType::VIPER,
         StorageEngineType::SWIFT,
         StorageEngineType::NOVA,
         StorageEngineType::RAPTOR,

@@ -46,7 +46,7 @@ mod tests {
         // let (collection, _temp) = TestCollectionBuilder::new()
         //     .with_id("my_test")
         //     .with_dimension(512)
-        //     .with_engine(StorageEngine::Viper)
+        //     .with_engine(StorageEngine::Nova)
         //     .with_compression(CompressionAlgorithm::Zstd)
         //     .with_filterable_column("category", "STRING")
         //     .with_filterable_column("price", "FLOAT")
@@ -64,7 +64,7 @@ mod tests {
         // use tests::common::collection_builder::presets;
         //
         // let (sst_coll, _) = presets::sst_oltp().build();
-        // let (viper_coll, _) = presets::viper_analytics().build();
+        // let (nova_coll, _) = presets::nova_analytics().build();
         // let (swift_coll, _) = presets::swift_low_latency().build();
         // let (helix_coll, _) = presets::helix_spatial().build();
 

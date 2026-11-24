@@ -1086,12 +1086,13 @@ impl CollectionService {
         // engine choices are passed through untouched.
         let (selected_engine, selection_reason) =
             crate::services::collection::engine_selector::infer_storage_engine(&enriched_config);
-        // TD-VIPER-1 S2 (ADR-093): reject NEW VIPER selections at creation.
-        // Existing VIPER collections remain readable via the context-free
-        // factory; only new creations are refused (staged retirement S1 → S2).
+        // TD-VIPER-1 (ADR-093): reject NEW VIPER selections at creation.
+        // Since S3 the engine implementation is deleted outright (pre-GA
+        // clean break); the gate stays as the fail-closed boundary for the
+        // retained wire value.
         if selected_engine == crate::proto::proximadb_v1::StorageEngine::Viper {
             return Err(anyhow::anyhow!(
-                "VIPER is deprecated (ADR-093) and can no longer be selected for new \
+                "VIPER was removed (ADR-093 S3) and can no longer be selected for new \
                  collections: use SST (default), NOVA (columnar analytics), HELIX, or the \
                  DataFusion/Parquet path for warehouse-shaped analytics"
             ));
@@ -2001,28 +2002,12 @@ impl CollectionService {
                     config.storage_engine.unwrap_or(StorageEngine::Sst as i32),
                 );
 
-                let mut storage_config = serde_json::json!({
+                let storage_config = serde_json::json!({
                     "engine": engine_name,
                     "enable_compression": true,
                     "enable_deduplication": false, // Not exposed in proto yet
                     "enable_multi_tenancy": false,  // Not exposed in proto yet
                 });
-
-                // Add engine-specific configurations
-                if engine_name == "VIPER" {
-                    storage_config["parquet_config"] = serde_json::json!({
-                        "row_group_size": 65536,
-                        "compression": "snappy",
-                        "enable_statistics": true,
-                        "enable_bloom_filter": true,
-                    });
-
-                    // Add quantization config if present
-                    if let Some(quant_config) = &config.quantization {
-                        storage_config["quantization_enabled"] = serde_json::json!(true);
-                        storage_config["quantization_level"] = serde_json::json!(quant_config);
-                    }
-                }
 
                 Ok(Some(storage_config))
             } else {
@@ -2329,7 +2314,7 @@ impl CollectionService {
                         == Some(crate::proto::proximadb_v1::StorageEngine::Viper as i32)
                     {
                         return Err(anyhow::anyhow!(
-                            "VIPER is deprecated (ADR-093) and can no longer be selected: \
+                            "VIPER was removed (ADR-093 S3) and can no longer be selected: \
                              use SST (default), NOVA (columnar analytics), HELIX, or the \
                              DataFusion/Parquet path for warehouse-shaped analytics"
                         ));

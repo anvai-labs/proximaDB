@@ -1,7 +1,7 @@
 //! Engine Safety Tests
 //!
 //! Verifies that experimental engines (SWIFT, RAPTOR) are blocked by default
-//! and that production-ready engines (SST, VIPER, HELIX, NOVA) remain available.
+//! and that production-ready engines (SST, HELIX, NOVA) remain available.
 //!
 //! These tests run WITHOUT the `experimental-engines` feature flag to confirm
 //! the safety guards are active.
@@ -23,7 +23,7 @@ mod engine_safety_tests {
             "Error should mention 'experimental', got: {err_msg}"
         );
         assert!(
-            err_msg.contains("SST") || err_msg.contains("VIPER"),
+            err_msg.contains("SST"),
             "Error should suggest alternatives, got: {err_msg}"
         );
     }
@@ -40,7 +40,7 @@ mod engine_safety_tests {
             "Error should mention 'experimental', got: {err_msg}"
         );
         assert!(
-            err_msg.contains("SST") || err_msg.contains("VIPER"),
+            err_msg.contains("SST"),
             "Error should suggest alternatives, got: {err_msg}"
         );
     }
@@ -54,11 +54,18 @@ mod engine_safety_tests {
     }
 
     #[test]
-    fn test_viper_available() {
+    fn test_viper_removed_fails_closed() {
+        // ADR-093 S3: the engine is deleted; the retained wire value must be
+        // rejected with an error naming the removal, not fall back to SST.
         let result = StorageEngineFactory::create_from_proto(ProtoStorageEngine::Viper);
-        if let Err(e) = &result {
-            panic!("VIPER should always be available: {e}");
-        }
+        let err_msg = match result {
+            Ok(_) => panic!("VIPER must be rejected after removal (ADR-093)"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err_msg.contains("removed"),
+            "Error should name the removal, got: {err_msg}"
+        );
     }
 
     #[test]

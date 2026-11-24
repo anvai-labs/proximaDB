@@ -1,4 +1,4 @@
-// Batch operations for VIPER - Optimized columnar batch ID lookups
+// Batch operations for NOVA - Optimized columnar batch ID lookups
 // Clean implementation leveraging Parquet's row group structure
 
 use super::NovaFile;

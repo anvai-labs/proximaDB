@@ -347,7 +347,7 @@ fn test_proxima_scan_exec_partitioning() {
 #[test]
 fn test_proxima_scan_exec_projection() {
     let schema = test_schema();
-    let reader = Arc::new(NullSplitReader::new(schema.clone(), EngineType::Viper));
+    let reader = Arc::new(NullSplitReader::new(schema.clone(), EngineType::Nova));
 
     let exec = ProximaScanExec::builder()
         .schema(schema)
@@ -399,8 +399,8 @@ fn test_datafusion_table_schema() {
 #[test]
 fn test_datafusion_table_with_splits() {
     let schema = test_schema();
-    let info = CollectionInfo::new("test".to_string(), 768, EngineType::Viper);
-    let reader = Arc::new(NullSplitReader::new(schema.clone(), EngineType::Viper));
+    let info = CollectionInfo::new("test".to_string(), 768, EngineType::Nova);
+    let reader = Arc::new(NullSplitReader::new(schema.clone(), EngineType::Nova));
 
     let splits = vec![
         FileSplit::new_row_group("/data/part1.parquet".to_string(), 0, 0, 65536, 10000),
@@ -481,7 +481,7 @@ fn test_collection_info_creation() {
 
 #[test]
 fn test_collection_info_vector_size() {
-    let info = CollectionInfo::new("test".to_string(), 768, EngineType::Viper);
+    let info = CollectionInfo::new("test".to_string(), 768, EngineType::Nova);
     assert_eq!(info.avg_vector_size_bytes(), 768 * 4); // Float32 = 4 bytes
 }
 
@@ -502,7 +502,7 @@ fn test_engine_type_display() {
     assert_eq!(format!("{}", EngineType::Helix), "HELIX");
     assert_eq!(format!("{}", EngineType::Swift), "SWIFT");
     assert_eq!(format!("{}", EngineType::Nova), "NOVA");
-    assert_eq!(format!("{}", EngineType::Viper), "VIPER");
+    assert_eq!(format!("{}", EngineType::Nova), "NOVA");
     assert_eq!(format!("{}", EngineType::Raptor), "RAPTOR");
 }
 
@@ -515,8 +515,8 @@ fn test_engine_type_conversion() {
         EngineType::Sst
     );
     assert_eq!(
-        EngineType::from(StorageEngineStrategy::Viper),
-        EngineType::Viper
+        EngineType::from(StorageEngineStrategy::Nova),
+        EngineType::Nova
     );
     assert_eq!(
         StorageEngineStrategy::from(EngineType::Nova),
@@ -560,7 +560,7 @@ async fn test_null_provider_get_splits() {
 #[tokio::test]
 async fn test_full_pipeline() {
     // Create collection info
-    let info = CollectionInfo::new("products".to_string(), 768, EngineType::Viper)
+    let info = CollectionInfo::new("products".to_string(), 768, EngineType::Nova)
         .with_vector_count(50000)
         .with_storage_size(1024 * 1024 * 500) // 500MB
         .with_file_count(5);
@@ -574,7 +574,7 @@ async fn test_full_pipeline() {
     ]));
 
     // Create reader
-    let reader = Arc::new(NullSplitReader::new(schema.clone(), EngineType::Viper));
+    let reader = Arc::new(NullSplitReader::new(schema.clone(), EngineType::Nova));
 
     // Create splits with statistics
     let splits: Vec<FileSplit> = (0..5)

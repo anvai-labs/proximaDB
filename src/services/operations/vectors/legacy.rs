@@ -5,13 +5,12 @@
 //! This service orchestrates all vector search operations across the system:
 //!
 //! 1. **Unified Search Interface**: All storage engines implement `search_vectors_unified`
-//!    - VIPER: Uses columnar Parquet format with predicate pushdown
 //!    - NOVA: Extends Parquet with additional statistics for aggressive I/O pruning
 //!    - SST: Uses hybrid columnar format (ProximaBlocks) with bloom filters and hierarchical blocks
 //!    - SWIFT: Zero-overhead storage with progressive quantization
 //!
 //! 2. **Shared Infrastructure**:
-//!    - `columnar/parquet_reader.rs`: Shared Parquet reader for VIPER and NOVA
+//!    - `columnar/parquet_reader.rs`: Shared Parquet reader for the columnar engines
 //!    - `compute/quantization/storage_engine.rs`: Common quantization for all engines
 //!    - `compute/distance_computation/engine.rs`: Unified distance computation
 //!
@@ -23,7 +22,6 @@
 //!
 //! 4. **Engine-Specific Optimizations**:
 //!    - NOVA: Maintains additional stats beyond Parquet for aggressive pruning
-//!    - VIPER: Leverages Parquet column statistics and zone maps
 //!    - SST: Uses hierarchical bloom filters for block-level filtering
 //!
 //! All searches flow through this service → storage engine's search_vectors_unified →
@@ -567,7 +565,7 @@ pub struct VectorOperationsService {
     storage_engine: Arc<SstEngine>,
 
     /// Dynamic engine cache keyed by the catalog's globally unique object id.
-    /// This enables each collection to use its configured engine (SST, HELIX, VIPER, etc.)
+    /// This enables each collection to use its configured engine (SST, HELIX, NOVA, etc.)
     engine_cache: Arc<
         dashmap::DashMap<crate::core::stable_id::CollectionObjectId, Arc<dyn UnifiedStorageFormat>>,
     >,
@@ -4374,7 +4372,7 @@ impl VectorOperationsService {
         );
 
         // Get the correct engine for this collection (CRITICAL for multi-engine support)
-        // This ensures HELIX collections use HELIX, VIPER uses VIPER, etc.
+        // This ensures HELIX collections use HELIX, etc.
         let engine = self.get_engine_for_collection(collection_id).await?;
 
         // OPTIMIZED: Sequential search with early termination

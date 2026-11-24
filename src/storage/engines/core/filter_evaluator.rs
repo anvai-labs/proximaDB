@@ -1,7 +1,7 @@
 //! Unified Filter Evaluator Module
 //!
 //! This module provides a comprehensive, thread-safe filter evaluation system
-//! that can be used across all storage engines (SST, VIPER, HELIX, etc.).
+//! that can be used across all storage engines (SST, NOVA, HELIX, etc.).
 //!
 //! Features:
 //! - Thread-safe evaluation with Send+Sync support

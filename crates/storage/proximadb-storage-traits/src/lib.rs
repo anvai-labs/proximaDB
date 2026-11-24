@@ -499,7 +499,10 @@ pub trait UnifiedStorageFormat: Send + Sync {
     fn engine_type(&self) -> StorageEngineType {
         match self.strategy() {
             StorageEngineStrategy::Sst => StorageEngineType::SST,
-            StorageEngineStrategy::Viper => StorageEngineType::VIPER,
+            // VIPER removed (ADR-093); the factory rejects the strategy, so
+            // this mapping is unreachable for live engines — SST baseline,
+            // matching the Chrono tombstone arm below.
+            StorageEngineStrategy::Viper => StorageEngineType::SST,
             StorageEngineStrategy::Helix => StorageEngineType::HELIX,
             StorageEngineStrategy::Nova => StorageEngineType::NOVA,
             StorageEngineStrategy::Swift => StorageEngineType::SWIFT,

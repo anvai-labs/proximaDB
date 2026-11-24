@@ -43,6 +43,10 @@
 //! cargo test --test capability_contract_test generate_snapshots -- --nocapture
 //! ```
 
+// ORPHANED TEST (not in any compile target — see TD-ORPHAN-1): references the
+// VIPER engine removed by ADR-093 stage 3 / TD-VIPER-1 S3. Unreachable code;
+// cleanup of the file itself belongs to the orphan-file program, not the
+// engine-removal PR.
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 

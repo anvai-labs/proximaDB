@@ -6,7 +6,7 @@
 //! - Bandwidth reduction through smart caching and prefetching
 //! - Hardware-accelerated operations
 //!
-//! This module eliminates code duplication across SST, VIPER, SWIFT, and other engines.
+//! This module eliminates code duplication across SST, SWIFT, and other engines.
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -788,7 +788,7 @@ pub trait UniversallyOptimized {
 /// Insert the standard `universal_*` optimizer metrics into a stats map.
 ///
 /// Shared implementation for the `UniversallyOptimized` engines'
-/// `collect_performance_metrics` overrides (NOVA/RAPTOR/SWIFT/VIPER) — each
+/// `collect_performance_metrics` overrides (NOVA/RAPTOR/SWIFT) — each
 /// engine keeps its own prefixed keys at the call site and appends this block
 /// for the optimizer's configuration surface.
 pub fn insert_universal_optimizer_metrics(

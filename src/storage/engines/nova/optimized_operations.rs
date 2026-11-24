@@ -1,4 +1,4 @@
-// Optimized operations for VIPER dual-mode using existing infrastructure
+// Optimized operations for the NOVA dual-mode using existing infrastructure
 // Leverages columnar format, memory pools, and hardware acceleration
 
 use anyhow::{Result, anyhow};
@@ -466,7 +466,7 @@ impl ColumnarStats {
 mod tests {
     use super::*;
     #[tokio::test]
-    async fn test_optimized_viper_operations() {
+    async fn test_optimized_nova_operations() {
         // Initialize hardware capabilities
         let _ = proximadb_hardware::hardware_capabilities(); // OnceLock auto-init
         let ops = OptimizedNovaOperations::new().unwrap();

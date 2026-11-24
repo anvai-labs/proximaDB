@@ -22,7 +22,6 @@ use proximadb::index::axis::eventlog_consumer::{start_axis_consumer, ConsumerCon
 use proximadb::proto::proximadb_v1::{Collection, CollectionConfig, DistanceMetric};
 use proximadb::services::event_log_service::EventLogServiceImpl;
 use proximadb::storage::engines::sst::SstEngine;
-use proximadb::storage::engines::viper::ViperEngine;
 use proximadb::storage::persistence::filesystem::FilesystemFactory;
 use dashmap::DashMap;
 
@@ -356,18 +355,19 @@ async fn test_self_healing_behavior() -> Result<()> {
 }
 
 #[tokio::test]
-async fn test_viper_event_processing() -> Result<()> {
+async fn test_nova_event_processing() -> Result<()> {
     let _ = tracing_subscriber::fmt::try_init();
-    info!("Testing VIPER event processing");
-    
+    info!("Testing NOVA (columnar Parquet) event processing");
+
     let mut fixture = TestFixture::new().await?;
-    let collection_id = "test_viper_collection";
-    
-    // Create collection with VIPER engine
+    let collection_id = "test_nova_collection";
+
+    // Create collection with the NOVA engine (columnar Parquet path formerly
+    // also exercised via VIPER, removed by ADR-093)
     let collection = Arc::new(Collection {
         id: collection_id.to_string(),
         dimension: 384,
-        storage_engine: Some(1), // VIPER
+        storage_engine: Some(3), // NOVA
         config: Some(CollectionConfig {
             dimension: 384,
             distance_metric: DistanceMetric::Cosine as i32,
@@ -392,15 +392,15 @@ async fn test_viper_event_processing() -> Result<()> {
     // Create test Parquet files
     let data_files = fixture.create_test_parquet_files(collection_id, 2).await;
     
-    // Send flush event for VIPER
-    info!("Sending VIPER flush event for collection {}", collection_id);
+    // Send flush event for NOVA
+    info!("Sending NOVA flush event for collection {}", collection_id);
     fixture.event_log.notify_flush(
         collection_id.to_string(),
         data_files.clone(),
         200,
         true, // has_quantized
         true, // has_fp32
-        StorageEngineType::VIPER,
+        StorageEngineType::NOVA,
     ).await?;
     
     // Wait for processing
@@ -408,15 +408,15 @@ async fn test_viper_event_processing() -> Result<()> {
     
     // Check if event was processed
     let pending_events = fixture.event_log.get_pending_events_for_collection(collection_id).await?;
-    assert_eq!(pending_events.len(), 0, "VIPER flush event should be processed");
+    assert_eq!(pending_events.len(), 0, "NOVA flush event should be processed");
     
     // Check if files are now compactable
     for file in &data_files {
         let is_pending = fixture.event_log.is_file_pending_indexing(file).await?;
-        assert!(!is_pending, "VIPER file {} should no longer be pending", file);
+        assert!(!is_pending, "NOVA file {} should no longer be pending", file);
     }
     
-    info!("✅ VIPER event processing test passed");
+    info!("✅ NOVA event processing test passed");
     
     // Cleanup
     fixture.stop_consumer().await;
@@ -546,7 +546,7 @@ async fn test_compaction_with_eventlog_integration() -> Result<()> {
     let _ = tracing_subscriber::fmt::try_init();
     info!("Testing compaction with EventLog integration");
     
-    // This test would integrate with actual SST/VIPER compaction
+    // This test would integrate with actual SST compaction
     // For now, we verify the concept
     
     let fixture = TestFixture::new().await?;
@@ -616,7 +616,7 @@ async fn test_extraction_modes() -> Result<()> {
         let collection = Arc::new(Collection {
             id: collection_id.to_string(),
             dimension: 256,
-            storage_engine: Some(1), // VIPER
+            storage_engine: Some(3), // NOVA
             config: Some(CollectionConfig {
                 dimension: 256,
                 distance_metric: DistanceMetric::Cosine as i32,

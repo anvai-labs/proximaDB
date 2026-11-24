@@ -687,7 +687,6 @@ mod tests {
             format!("file://{}", base.join("wal").display());
         config.storage.wal_config.wal_local_dir = None;
         config.storage.sst_config = None;
-        config.storage.viper_config = None;
         config.queue = None;
         config
     }

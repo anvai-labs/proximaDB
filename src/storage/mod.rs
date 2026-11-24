@@ -24,7 +24,7 @@
 //! ### 1. **Storage Engines** (`engines/`)
 //! Six specialized engines for different workloads:
 //! - **SST**: Hybrid columnar (ProximaBlocks) for OLTP, real-time queries
-//! - **VIPER**: Columnar Parquet (deprecated, ADR-093; existing collections only)
+//! - **NOVA**: Columnar Parquet analytics (VIPER was removed by ADR-093)
 //! - **NOVA**: Hybrid quantized columnar
 //! - **SWIFT**: High-speed hierarchical blocks
 //! - **PRISM**: Tree-based with Proxima
@@ -301,8 +301,6 @@ pub use trait_components::{
 
 // Engine exports
 pub use engines::sst::SstEngine;
-// Arrow integration re-enabled - compilation conflicts resolved
-// pub use engines::viper::ViperEngine;
 
 // Persistence exports
 pub use persistence::{DiskManager, FilesystemConfig, FilesystemFactory};
@@ -310,7 +308,7 @@ pub use persistence::{DiskManager, FilesystemConfig, FilesystemFactory};
 // Atomic operations exports
 pub use transaction_coordinator::{
     StagingConfig, TransactionCoordinator, TransactionStageType, TransactionalOperationMetadata,
-    TransactionalOperationStatus, ViperTransactionalOperations, WalTransactionalOperations,
+    TransactionalOperationStatus, WalTransactionalOperations,
 };
 
 // Storage engine exports

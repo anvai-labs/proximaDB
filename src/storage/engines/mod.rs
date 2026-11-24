@@ -13,7 +13,7 @@
 //!                    ┌──────────────────┴───────────────────┐
 //!                    │         Storage Engines               │
 //!                    ├────────────────────────────────────────┤
-//!                    │ SST │ VIPER │ NOVA │ SWIFT │ RAPTOR │ HELIX │
+//!                    │ SST │ NOVA │ SWIFT │ RAPTOR │ HELIX │
 //!                    └────────────────────────────────────────┘
 //!                                       ↓
 //!                         Core Infrastructure (Shared)
@@ -33,7 +33,6 @@
 //!
 //! - **`impls/`**: Engine implementations with unique characteristics
 //!   - `sst/`: Hybrid columnar SSTable (ProximaBlocks) for OLTP workloads
-//!   - `viper/`: Columnar Parquet for analytics
 //!   - `nova/`: Hybrid quantized columnar engine
 //!   - `swift/`: High-speed hierarchical blocks
 //!   - `raptor/`: Matrix-optimized with adaptive PXK
@@ -43,7 +42,6 @@
 //! | Engine | Best For | Storage Format | Key Features |
 //! |--------|----------|----------------|--------------|
 //! | **SST** | Real-time queries, frequent updates | Hybrid columnar (ProximaBlocks) | Three-stage filtering, bloom filters |
-//! | **VIPER** | Analytics, batch operations | Columnar Parquet | Advanced quantization, high compression |
 //! | **NOVA** | Mixed workloads | Hybrid columnar | Quantized columns, progressive search |
 //! | **SWIFT** | High-throughput | Hierarchical blocks | Superblock caching, ID indexing |
 //! | **RAPTOR** | Matrix operations | Matrix-optimized | Adaptive PXK, boundary detection |
@@ -91,8 +89,8 @@
 //! )?;
 //!
 //! // Direct engine selection
-//! let viper = StorageEngineFactory::create_engine(
-//!     "viper",
+//! let sst = StorageEngineFactory::create_engine(
+//!     "sst",
 //!     &collection_config
 //! )?;
 //! ```
@@ -113,7 +111,8 @@ pub mod sst; // Phase 1: Moved from impls/sst/
 // feature).
 #[cfg(feature = "experimental-engines")]
 pub mod swift; // Phase 1: Moved from impls/swift/
-pub mod viper; // Phase 1: Moved from impls/viper/ // Phase 1: Moved from impls/helix/
+// VIPER: removed (ADR-093 stage 3 / TD-VIPER-1 S3). The proto enum value and
+// string conversions remain for wire compatibility; the factory rejects it.
 // Phase 2: Moved remaining specialized engines from impls/
 pub mod cedar; // CEDAR: Columnar Extensible Document Archive
 pub mod eventlog; // Event Sourcing Engine
@@ -148,8 +147,6 @@ pub use sst::SstEngine; // Phase 1: Moved from impls/
 #[cfg(feature = "experimental-engines")]
 #[allow(deprecated)]
 pub use swift::SwiftEngine; // Phase 1: Moved from impls/
-#[allow(deprecated)]
-pub use viper::ViperEngine; // Phase 1: Moved from impls/ // Phase 1: Moved from impls/
 // Phase 2: Moved remaining specialized engines from impls/
 pub use cedar::CedarEngine;
 pub use eventlog::EventLogEngine;
