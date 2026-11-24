@@ -405,7 +405,7 @@ mod tests {
         // MED-B: env root set, TOML unset — the durability entry's root is
         // the ENV root (absolutized), not the write-buffer fallback.
         let env_root = temp.path().join("env_wal");
-        let entries = effective_durable_locations(&config, &|key: &str| {
+        let entries = effective_durable_locations(&config, |key: &str| {
             (key == "PROXIMADB_WAL_LOCAL_DIR").then(|| env_root.display().to_string())
         });
         let mode_entry = entries
