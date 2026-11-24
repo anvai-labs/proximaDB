@@ -39,6 +39,24 @@ fn cells_of(row: &serde_json::Value, columns: &[&str]) -> Vec<String> {
         .collect()
 }
 
+/// POST `path` with the pgwire connection's tenant pinned via X-Tenant-ID:
+/// the pgwire startup `database` doubles as the tenant/catalog (TD-064), and
+/// TestPgServer connects with `dbname=proximadb` — without the header the
+/// REST surfaces would act as the `default` tenant and not resolve the
+/// pgwire-seeded table.
+async fn post_tenant_json(
+    http: &reqwest::Client,
+    url: String,
+    tenant: &str,
+    body: serde_json::Value,
+) -> Result<reqwest::Response, reqwest::Error> {
+    http.post(url)
+        .header("X-Tenant-ID", tenant)
+        .json(&body)
+        .send()
+        .await
+}
+
 fn legs_agree(reference: &[Vec<String>], candidate: &[Vec<String>]) -> bool {
     reference.len() == candidate.len()
         && reference
@@ -73,12 +91,14 @@ async fn same_sql_one_planner_across_pgwire_rest_v2_and_unified_query_e2e() {
     let (http, base) = server.rest_client().expect("rest client");
 
     // REST /api/v2/sql leg (api_handlers spine — the control).
-    let sql_response = http
-        .post(format!("{base}/api/v2/sql"))
-        .json(&json!({ "query": select }))
-        .send()
-        .await
-        .expect("POST /api/v2/sql");
+    let sql_response = post_tenant_json(
+        &http,
+        format!("{base}/api/v2/sql"),
+        "proximadb",
+        json!({ "query": select }),
+    )
+    .await
+    .expect("POST /api/v2/sql");
     assert_eq!(
         sql_response.status(),
         reqwest::StatusCode::OK,
@@ -94,12 +114,14 @@ async fn same_sql_one_planner_across_pgwire_rest_v2_and_unified_query_e2e() {
 
     // REST /api/v2/query leg (unified query port; UQL language with a plain
     // SQL body — pre-TD-SPINE-6 this body was refused by the federated core).
-    let query_response = http
-        .post(format!("{base}/api/v2/query"))
-        .json(&json!({ "language": "uql", "query": select }))
-        .send()
-        .await
-        .expect("POST /api/v2/query");
+    let query_response = post_tenant_json(
+        &http,
+        format!("{base}/api/v2/query"),
+        "proximadb",
+        json!({ "language": "uql", "query": select }),
+    )
+    .await
+    .expect("POST /api/v2/query");
     assert_eq!(
         query_response.status(),
         reqwest::StatusCode::OK,
@@ -150,14 +172,15 @@ async fn strong_freshness_port_read_sees_every_write_with_result_cache_on_e2e() 
     // Prime the cache through the api_handlers surface (consults it under
     // Strong LSN-pinned eligibility) and the port surface (Strong ⇒ bypass).
     for _ in 0..2 {
-        let status = http
-            .post(format!("{base}/api/v2/sql"))
-            .json(&json!({ "query": select }))
-            .send()
-            .await
-            .expect("POST /api/v2/sql")
-            .status();
-        assert_eq!(status, reqwest::StatusCode::OK);
+        let response = post_tenant_json(
+            &http,
+            format!("{base}/api/v2/sql"),
+            "proximadb",
+            json!({ "query": select }),
+        )
+        .await
+        .expect("POST /api/v2/sql");
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
     }
 
     // A committed write AFTER the cached reads.
@@ -165,15 +188,17 @@ async fn strong_freshness_port_read_sees_every_write_with_result_cache_on_e2e() 
 
     // The port's Strong read must see all three rows — never a stale cached
     // two-row result (the 16c guarantee the bypass provides).
-    let port_json: serde_json::Value = http
-        .post(format!("{base}/api/v2/query"))
-        .json(&json!({ "language": "uql", "query": select }))
-        .send()
-        .await
-        .expect("POST /api/v2/query")
-        .json()
-        .await
-        .expect("port JSON");
+    let port_json: serde_json::Value = post_tenant_json(
+        &http,
+        format!("{base}/api/v2/query"),
+        "proximadb",
+        json!({ "language": "uql", "query": select }),
+    )
+    .await
+    .expect("POST /api/v2/query")
+    .json()
+    .await
+    .expect("port JSON");
     let rows = port_json["records"]
         .as_array()
         .unwrap_or_else(|| panic!("port records array missing: {port_json}"));
