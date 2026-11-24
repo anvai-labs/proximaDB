@@ -136,8 +136,14 @@ async fn open_store(url: &str) -> Result<Arc<dyn ObjectStore>, Box<dyn std::erro
         return Ok(Arc::new(object_store::memory::InMemory::new()));
     }
     let parsed = url::Url::parse(url)?;
-    let (store, _) = object_store::parse_url(&parsed)?;
-    Ok(Arc::from(store))
+    // Route through the production `store_for_url` (ADR-098 M5): it forwards
+    // the process environment (lower-cased) into `parse_url_opts`, so the
+    // standard S3 emulator contract (AWS_ENDPOINT, AWS_ALLOW_HTTP=true,
+    // AWS_VIRTUAL_HOSTED_STYLE_REQUEST=false, keys) reaches MinIO/LocalStack —
+    // bare `parse_url` builds a real-AWS endpoint and cannot target an
+    // emulator, which is exactly the run this bench's own notes ask for.
+    let (store, _) = proximadb_object_store::store_for_url(parsed.as_str())?;
+    Ok(store)
 }
 
 // ────────────────────────────────────────────────────────────────────────
