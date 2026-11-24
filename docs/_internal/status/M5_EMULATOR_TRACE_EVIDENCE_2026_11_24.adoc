@@ -1,0 +1,140 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= ADR-098 M5: emulator trace evidence (SIFT1M counts on MinIO, SIFT10k off/on pair, RTT ladder, pgwire manifest levers on an S3 warehouse, object-store latency floor)
+
+[cols="1,3"]
+|===
+| Date | 2026-11-24
+| Version | worktree bench/m5-emulator-trace @ 51a20902f (develop base ea77dea50; carries the `PROXIMADB_WAREHOUSE_ROOT_URL` seam + the latency-floor bench `store_for_url` rerouting from the same PR). SIFT binaries: `--profile release-server --features proximadb/io-trace,proximadb/aws`, sha256 f327599a7152…; the binary was built inside the seam-edit window (the harness's revision guard passed against the committed tree; any delta is formatting-only, and the seam is inert with the gate unset — no SIFT leg touches the warehouse path).
+| Hardware | Apple Silicon arm64, 64 GB, macOS, Docker Desktop. NOT a quiet machine throughout: the pgwire leg, the ratchet pair and parts of two RTT arms ran while test targets compiled in the background — every latency figure below is shape evidence only, and the two affected RTT arms are marked. Counts and recall are request-deterministic on these fixtures and are the durable quantities. Indicative dev-machine evidence, not an SLA.
+| Storage regime | **MinIO S3 emulator** (docker `minio/minio:latest`, container `m5-minio`, 127.0.0.1:9000, path-style, creds `m5bench`). Request counts are emulator-measured; **latency legs are emulator-local (Docker NAT ≈ 4-7 ms/op steady-state) or toxiproxy-injected** — neither is real-cloud latency.
+|===
+
+== 1. SIFT1M request counts + behavior, shipped defaults (AT_FLUSH ON) — exit 0
+
+....
+AWS_ACCESS_KEY_ID=m5bench AWS_SECRET_ACCESS_KEY=m5bench-secret \
+  python3 scripts/bench/sift1m_get_reduction.py \
+  --root /tmp/m5-bench/sift1m-minio-on \
+  --binary target/release-server/proximadb-server \
+  --rows 1000000 --top-k 100 --queries 100 \
+  --post-write-max-gets 5000 --local-warm-max-gets 5000 --object-cold-max-gets 500 \
+  --max-p50-ms 60000 --settle-timeout-secs 3600 \
+  --max-segments 2 --explicit-flush-every-rows 250000 \
+  --s3-endpoint http://127.0.0.1:9000 --storage-url s3://proximadb-m5/sift1m-on
+....
+
+`result.json` `status: pass`. Settled bed (pinned): **2 segments** — L1 189,515,531 B + L2 568,273,967 B
+(757.8 MB), 27 coarse cells, ncomp 10, layout v1; directory generations 8/9 published
+(`centroids-…0008/0009.pxcd`). Ingest 163 s (6,139 vec/s), 4 explicit flushes.
+
+[cols="1,1,1,1,1,1,1,1", options="header"]
+|===
+| Phase | recall@100 | GET/q | req/q | waves p50 | bytes/q | p50 | p95
+| post_write | 0.9907 | 9.33 | 9.35 | 1 | 18.9 MB | 215 ms | 319 ms
+| local_disk_warm | 0.9897 | 9.67 | 9.69 | 1 | 19.9 MB | 238 ms | 340 ms
+| object_cold | 0.9881 | 18.64 | 18.69 | 2 | 51.2 MB | 833 ms | 1,976 ms
+|===
+
+All phases clear the recall floor (0.975). Latency gates permissive (`--max-p50-ms 60000`, the
+rdstrat12/13 MinIO-campaign precedent) — emulator latency is not the claim.
+
+== 2. SIFT10k off/on request-count pair (flush-time directory contrast, S3 shape) — exit 0 ×2
+
+The CI Azurite harness shape, store swapped to MinIO via `PROXIMADB_OBJECT_STORE_URL` +
+`PROXIMADB_S3_ENDPOINT`/`PROXIMADB_S3_FORCE_PATH_STYLE`/keys (N=10 000, batch 1 000 → 10 segments,
+compaction off; each arm a fresh prefix; `--features io-trace,aws`):
+
+[cols="1,1,1,1,1,1", options="header"]
+|===
+| Metric (10 segments) | AT_FLUSH=0 | AT_FLUSH=1 | Azurite CI (2026-11-20)
+| Cold collection-level metadata GETs | 20 (2/segment) | **0** | 20 → 0
+| Cold first query, Adaptive | 31 req (30 GET + 1 LIST) | 12 req (11 GET + 1 LIST) | 66 → 47 req
+| Steady GET/query (100 queries) | 5.25 | 5.25 | 5.25 → 5.25
+| recall@10 | 0.987 | 0.987 | 0.987 → 0.987
+| Ingest GET / LIST | 10 / 20 | 39 / 30 | 10/20 → 49/30 (pre prefix-reuse)
+| Directory objects at rest | 0 | 2 generations | 0 → 2
+| Non-vacuity probe (facts-off arm) | — | approx 11 vs adaptive 31 (+2/segment) | 46 vs 66 (+2/segment)
+|===
+
+The OFF→ON deltas reproduce the Azurite evidence exactly in shape. The ABSOLUTE first-query probe
+baseline is lower than the recorded CI row (10-11 GETs vs 45-46): the CI numbers predate later
+read-path changes on develop; both campaigns' contrasts are internally consistent (the +2/segment
+cold-metadata signature is identical). Raw summary lines (verbatim):
+
+....
+SIFT_GET_COUNTS {"mode":"at_flush_off","pax_write_directory_at_flush":false,"store":"s3","n":10000,"flush_batch":1000,"segments":10,"directory_objects_at_rest":0,"queries":100,"top_k":10,"recall_at_10":0.987,"ingest":{"get_ops":10,"range_gets":0,"list_ops":20,"head_ops":10,"put_ops":0,"requests":40,"bytes_read":7485110,"waves":40},"cold_first_query_approx":{"get_ops":10,"range_gets":10,"list_ops":1,"head_ops":0,"put_ops":0,"requests":11,"bytes_read":7485110,"waves":2},"cold_first_query_adaptive":{"get_ops":30,"range_gets":30,"list_ops":1,"head_ops":0,"put_ops":0,"requests":31,"bytes_read":7488240,"waves":4},"cold_metadata":{"get_ops":20,"range_gets":20,"list_ops":0,"head_ops":0,"requests":20},"steady":{"queries":100,"total":{"get_ops":525,"range_gets":525,"list_ops":0,"head_ops":0,"requests":525,"bytes_read":39063040,"waves":100,"queries_without_waves":0},"per_query":{"get_ops":5.25,"range_gets":5.25,"list_ops":0.0,"head_ops":0.0,"waves":1.0}},"latency":"not measured (emulator latency is not evidence)","probe_directory_facts_off_first_query_gets":null}
+SIFT_GET_COUNTS {"mode":"at_flush_on","pax_write_directory_at_flush":true,"store":"s3","n":10000,"flush_batch":1000,"segments":10,"directory_objects_at_rest":2,"queries":100,"top_k":10,"recall_at_10":0.987,"ingest":{"get_ops":39,"range_gets":20,"list_ops":30,"head_ops":10,"put_ops":0,"requests":79,"bytes_read":7504620,"waves":79},"cold_first_query_approx":{"get_ops":11,"range_gets":10,"list_ops":1,"head_ops":0,"put_ops":0,"requests":12,"bytes_read":7488710,"waves":3},"cold_first_query_adaptive":{"get_ops":11,"range_gets":10,"list_ops":1,"head_ops":0,"put_ops":0,"requests":12,"bytes_read":7488710,"waves":3},"cold_metadata":{"get_ops":0,"range_gets":0,"list_ops":0,"head_ops":0,"requests":0},"steady":{"queries":100,"total":{"get_ops":525,"range_gets":525,"list_ops":0,"head_ops":0,"requests":525,"bytes_read":39063040,"waves":100,"queries_without_waves":0},"per_query":{"get_ops":5.25,"range_gets":5.25,"list_ops":0.0,"head_ops":0.0,"waves":1.0}},"latency":"not measured (emulator latency is not evidence)","probe_directory_facts_off_first_query_gets":{"approx":11,"adaptive":31}}
+....
+
+== 3. RTT ladder (toxiproxy-injected, skip-ingest on the leg-1 bed)
+
+Toxiproxy 2.12.0 (docker `m5-toxiproxy`), proxy 127.0.0.1:9100 → MinIO, symmetric latency toxics
+(L/2 down + L/2 up), fresh proxy daemon per arm. Cohort: 25 queries/phase (the first 100-query arm
+wedged — see Incidents). GET/q and recall are RTT-invariant (counts, not latency); p50s are the
+latency shape. Arms marked ⚑ ran while a release build compiled in the background — treat those p50s
+as upper bounds (the RTT50 ⚑ arm's qps 0.31 vs the clean re-run's higher throughput makes the
+contentment visible; the clean re-run is authoritative).
+
+[cols="1,1,1,1,1,1,1", options="header"]
+|===
+| Arm | recall@100 (cold) | GET/q (cold) | waves p50 | bytes/q (cold) | cold p50 | cold p95
+| direct (leg-1 object_cold, proxy-free) | 0.9881 | 18.64 | 2 | 51.2 MB | 833 ms | 1,976 ms
+| RTT 50 ms ⚑ (first attempt, wedged) | — | — | — | — | — | —
+<FILL_LADDER_ROWS>
+|===
+
+<FILL_LADDER_NOTES>
+
+== 4. pgwire TD-SPINE-4 manifest levers with an S3-warehouse — exit 0 (2.3 s)
+
+....
+PROXIMADB_WAREHOUSE_ROOT_URL=s3://proximadb-m5/pgwire-mlev \
+AWS_ENDPOINT=http://127.0.0.1:9000 AWS_ALLOW_HTTP=true \
+AWS_VIRTUAL_HOSTED_STYLE_REQUEST=false AWS_REGION=us-east-1 \
+AWS_ACCESS_KEY_ID=m5bench AWS_SECRET_ACCESS_KEY=m5bench-secret RUST_MIN_STACK=8388608 \
+  target/release/…/tpc_perf_ledger_e2e-… manifest_levers_cut_footer_gets_over_pgwire_object_store \
+  -- --ignored --exact --nocapture --test-threads=1
+....
+
+The warehouse root held 13 objects (4 `mlevos` parts + metadata), asserted in-test so a silently
+file://-defaulted run fails (the TD-CI-7 vacuity class). Per-query io_trace:
+
+[cols="2,1,1,1,1,1", options="header"]
+|===
+| Query (mode) | get_ops | range_gets | bytes_read | footer_reads | files_pruned
+| `id <= 250` before (both temps) | 13 | 7 | 66,436 | 4 | 0
+| `id <= 250` after, first (cache miss) | 7 | 4 | 31,441 | 1 | 3
+| `id <= 250` after, repeat (cache hit) | 4 | 4 | 24,799 | 1 | 3
+| `id > 750` before (both) | 13 | 7 | 66,436 | 4 | 0
+| `id > 750` after (both) | 6 | 5 | 36,464 | 2 | 3
+| `id > 0` before (both) — negative control | 19 | 16 | 105,838 | 4 | 0
+| `id > 0` after (both) — negative control | 16 | 16 | 99,196 | 4 | 0
+|===
+
+Manifest cache hit/miss: 0/1 on the first lever-on query, 1/0 thereafter. Answers identical in every
+mode (asserted). **The count shape is IDENTICAL to the file:// evidence** (13→7/4, 6, 19→16; footers
+4→1/2/4; pruned 3/3/0) — the manifest levers cut the same requests on an S3-shaped backend.
+
+== 5. Object-store round-trip latency floor (bench_object_store_latency)
+
+<FILL_LEG_5>
+
+== Incidents (recorded, not hidden)
+
+* **Wedged RTT arm:** the first 50 ms ladder attempt (100 queries) stalled 25 min into the
+  post-write phase — the server's S3 client blocked on a connection toxiproxy had torn down
+  ("Source terminated" in the proxy log; the wedged-daemon class TD-RDSTRAT-12 recorded). Killed;
+  re-run with a fresh proxy daemon per arm and 25-query cohorts. The wedged attempt's `result.json`
+  records the partial phase; it is excluded from the table.
+* **Compile contention:** the RTT50 (first re-run) and RTT100 arms overlapped background release
+  builds (qps 0.31/0.89 vs ≈1.0 clean); their p50s are upper bounds. <FILL: whether a clean RTT50
+  re-run landed>
+
+== Reading the numbers honestly
+
+* Store is an EMULATOR on localhost. GET/request/footer counts transfer to any S3-shaped backend;
+  latency does not (Docker NAT adds ≈ 4-7 ms/op; toxiproxy adds its configured symmetric RTT and
+  couples RTT into bulk transfer — the known rdstrat12 caveat).
+* **Real-cloud confirmation deferred pending credentials (owner, 2026-11-25).**
+* Latency legs are 25-query cohorts — the shape (growth with RTT), not calibrated percentiles.

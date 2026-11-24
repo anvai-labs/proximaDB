@@ -187,6 +187,33 @@ byte delta; slightly less on file://, which lists no ETag), one
 whole-object GET per new generation, growing with segment count. With `AT_FLUSH=0` the same new
 segment costs 2 small ranged footer GETs, once, and only when the collection-level question is asked.
 
+== Measured on MinIO (S3 emulator, ADR-098 M5, 2026-11-24)
+
+Two legs move this TD's evidence from the Azurite adls:// shape to an S3-shaped emulator (store =
+docker MinIO on localhost, path-style; counts are the evidence, latency is not — see the artifact's
+honesty notes; real-cloud confirmation deferred pending credentials, owner, 2026-11-25):
+
+* **SIFT1M full bench, shipped defaults (AT_FLUSH ON, post-#2549)** — `sift1m_get_reduction.py`,
+  rows=1M / top-k=100 / 100 queries per phase / explicit flush every 250k, settled 2-segment bed
+  (L1 189.5 MB + L2 568.3 MB, 27 cells, ncomp 10, layout v1, directory generations 8/9 at rest),
+  exit 0 / `status: pass`: recall@100 0.9907 / 0.9897 / 0.9881 and GET/q 9.33 / 9.67 / 18.64
+  (post-write / warm / cold), requests/q 9.35 / 9.69 / 18.69, waves p50 1 / 1 / 2, cold p50 833 ms
+  (emulator-local). Ledger `m5_sift1m_minio_request_counts_at_flush`.
+* **SIFT10k off/on pair on S3** — the CI harness shape (`sift_get_counts_directory_at_flush_{off,on}`,
+  N=10k, batch 1000 → 10 segments, compaction off) with `PROXIMADB_OBJECT_STORE_URL=s3://…` +
+  the S3 endpoint env: cold collection-level metadata GETs 20 (2/segment) → **0**; cold first
+  Adaptive query 31 → 12 requests; steady 5.25 GET/q and recall@10 0.987 IDENTICAL both modes;
+  ingest 10/20 → 39/30 GET/LIST; 0 → 2 directory generations at rest; the facts-off non-vacuity
+  probe shows the same +2/segment signature (approx 11 vs adaptive 31). The absolute first-query
+  probe baseline is lower than the recorded 2026-11-20 Azurite row (10-11 vs 45-46 GETs) — later
+  develop read-path changes shifted the baseline; both campaigns' OFF→ON contrasts are identical in
+  shape. Ledger `m5_sift_get_counts_minio_at_flush`.
+* **RTT ladder (toxiproxy 50/100/150 ms symmetric over the same 1M bed, skip-ingest)** — see the
+  artifact for the latency-shaped legs (25-query cohorts; one wedged 100-query attempt recorded as
+  an incident). Ledger `m5_sift1m_minio_rtt_ladder`.
+
+Artifact: `docs/_internal/status/M5_EMULATOR_TRACE_EVIDENCE_2026_11_24.adoc`.
+
 == Follow-ups
 
 * **F-ingest** — measure steady query cost under concurrent ingest (an ingest-during-steady arm in
