@@ -222,7 +222,7 @@ def test_selector_target_latency_penalty():
     s = EngineSelector()
     wc = WorkloadCharacteristics(vector_count=1000, target_latency_ms=1)
     rec = s.recommend(wc, OptimizationGoal.LATENCY)
-    assert rec.engine != "viper"
+    assert rec.engine != "nova"
 
 
 def test_selector_target_throughput_penalty():

@@ -17,7 +17,7 @@ pub enum StorageEngine {
     Sst,
     /// HELIX - Locality-optimized with Hilbert curves
     Helix,
-    /// VIPER - Columnar Parquet for analytics
+    /// VIPER - REMOVED (ADR-093 stage 3); wire value only, the server rejects it
     Viper,
     /// SWIFT - Ultra-low latency for small datasets
     Swift,

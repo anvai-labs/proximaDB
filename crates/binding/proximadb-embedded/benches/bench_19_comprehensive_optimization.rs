@@ -1,7 +1,7 @@
 // Comprehensive Optimization Benchmark
 //
 // Tests all optimization permutations systematically using the embedded API:
-// - 6 storage engines (SST, HELIX, VIPER, SWIFT, NOVA, RAPTOR)
+// - the selectable storage engines (SST, HELIX, NOVA, …)
 // - 3 search modes (Exact, Approximate, Adaptive)
 // - 2 distance metrics (Cosine, Euclidean)
 //
@@ -22,9 +22,9 @@ use std::time::{Duration, Instant};
 
 /// Storage engines to benchmark
 #[cfg(feature = "experimental-engines")]
-const ENGINES: &[&str] = &["sst", "helix", "viper", "swift", "nova", "raptor"];
+const ENGINES: &[&str] = &["sst", "helix", "swift", "nova", "raptor"];
 #[cfg(not(feature = "experimental-engines"))]
-const ENGINES: &[&str] = &["sst", "helix", "viper", "nova"];
+const ENGINES: &[&str] = &["sst", "helix", "nova"];
 
 /// Search modes: "exact", "approximate:N", "adaptive:N"
 const SEARCH_MODES: &[&str] = &["exact", "approximate:10", "adaptive:5000"];

@@ -1,11 +1,11 @@
 //! Unified Quantization System for ProximaDB
 //!
 //! This module provides a unified quantization abstraction that works seamlessly
-//! across all storage engines (VIPER, LSM, WAL). It integrates with the unified
+//! across all storage engines (columnar engines, LSM, WAL). It integrates with the unified
 //! distance computation system to provide efficient similarity search on quantized vectors.
 //!
 //! Key Design Principles:
-//! - Storage-agnostic interface that works with both VIPER and LSM
+//! - Storage-agnostic interface that works with the columnar engines and LSM
 //! - Flexible quantization levels supporting 1-32 bits per dimension
 //! - Efficient distance computation with hardware acceleration
 //! - Metadata-driven codebook storage and retrieval

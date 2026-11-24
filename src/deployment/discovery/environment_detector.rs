@@ -748,7 +748,7 @@ impl EnvironmentDetector {
         let recommended_storage_engine = if memory_gb >= 32 && cpu_cores >= 16 {
             "NOVA".to_string() // High-performance for well-resourced environments
         } else if memory_gb >= 16 {
-            "VIPER".to_string() // Balanced performance for medium resources
+            "NOVA".to_string() // Balanced performance for medium resources
         } else {
             "SST".to_string() // Memory-efficient for resource-constrained environments
         };

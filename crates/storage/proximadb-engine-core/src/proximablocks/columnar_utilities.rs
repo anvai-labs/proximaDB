@@ -1,5 +1,5 @@
 // Columnar Storage Utilities
-// Common utilities for NOVA and VIPER engines
+// Common utilities for NOVA and NOVA engines
 
 use anyhow::Result;
 use std::collections::HashMap;

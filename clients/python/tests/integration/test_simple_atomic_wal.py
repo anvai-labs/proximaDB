@@ -38,7 +38,7 @@ def test_atomic_wal():
         "name": collection_id,
         "dimension": 384,
         "distance_metric": "cosine",
-        "storage_engine": "viper",
+        "storage_engine": "nova",
     }
 
     # Use the correct REST API endpoint with proper request format

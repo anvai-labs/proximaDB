@@ -900,7 +900,7 @@ class ProximaDBClient:
         # Debug print
         logger.debug(f"Collection create request: {request_data}")
 
-        # Add VIPER-specific optimization fields
+        # Add columnar optimization fields
         if config.filterable_metadata_fields:
             config_data["filterable_columns"] = [
                 {"name": field, "data_type": "string", "indexed": True}
@@ -1133,11 +1133,11 @@ class ProximaDBClient:
             # Extract and convert storage_engine
             se_val = cfg_src.get("storage_engine")
             if isinstance(se_val, int):
-                storage_engine = STORAGE_ENGINE_MAP.get(se_val, "viper")
+                storage_engine = STORAGE_ENGINE_MAP.get(se_val, "sst")
             elif se_val:
                 storage_engine = se_val
             else:
-                se = getattr(config, "storage_engine", "viper")
+                se = getattr(config, "storage_engine", "sst")
                 storage_engine = se.value if hasattr(se, "value") else se
 
             # Deserialize filterable_columns from server response
@@ -1296,7 +1296,7 @@ class ProximaDBClient:
                 distance_metric_value, "cosine"
             )
 
-        storage_engine_value = collection_data.get("storage_engine", "viper")
+        storage_engine_value = collection_data.get("storage_engine", "sst")
         if isinstance(storage_engine_value, int):
             # Map proto enum values to string names
             storage_engine_map = {
@@ -1307,7 +1307,7 @@ class ProximaDBClient:
                 5: "swift",
                 6: "raptor",
             }
-            storage_engine_value = storage_engine_map.get(storage_engine_value, "viper")
+            storage_engine_value = storage_engine_map.get(storage_engine_value, "sst")
 
         # Create CollectionConfig from response
         # Note: name might not be in config if it's at the parent level
@@ -1441,9 +1441,9 @@ class ProximaDBClient:
 
             se_val = cfg_src.get("storage_engine")
             storage_engine = (
-                STORAGE_ENGINE_MAP.get(se_val, "viper")
+                STORAGE_ENGINE_MAP.get(se_val, "sst")
                 if isinstance(se_val, int)
-                else (se_val or "viper")
+                else (se_val or "sst")
             )
 
             # Create CollectionConfig from response

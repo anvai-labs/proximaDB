@@ -4,7 +4,7 @@
 //! IR used by the compute scheduler and provider layer.
 //!
 //! This module implements the MultiModelPlan contract that enables unified query
-//! execution across all ProximaDB storage engines (SST, HELIX, VIPER, SWIFT, NOVA, RAPTOR).
+//! execution across all ProximaDB storage engines (SST, HELIX, NOVA, SWIFT, NOVA, RAPTOR).
 //!
 //! ## Architecture
 //!
@@ -29,7 +29,7 @@
 //!     ┌─────────────────────────────────────────┐
 //!     │      Storage Engine Dispatch            │
 //!     ├─────────────────────────────────────────┤
-//!     │ SST │ HELIX │ VIPER │ SWIFT │ NOVA │... │
+//!     │ SST │ HELIX │ NOVA │ SWIFT │ NOVA │... │
 //!     └─────────────────────────────────────────┘
 //! ```
 //!

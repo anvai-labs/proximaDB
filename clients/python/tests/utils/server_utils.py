@@ -38,7 +38,7 @@ def ensure_server_running():
 
 
 def create_test_collection(
-    client, name: str, dimension: int = 384, engine: str = "viper"
+    client, name: str, dimension: int = 384, engine: str = "nova"
 ):
     """
     Create a test collection with error handling
@@ -47,7 +47,7 @@ def create_test_collection(
         client: ProximaDB client
         name: Collection name
         dimension: Vector dimension
-        engine: Storage engine (viper or sst)
+        engine: Storage engine (nova or sst)
     """
     try:
         # Try to delete if exists

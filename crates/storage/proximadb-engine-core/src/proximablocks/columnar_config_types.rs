@@ -53,7 +53,7 @@ pub struct OptimizationThresholds {
     pub gpu_threshold: usize,
 }
 
-/// File metadata common to both NOVA and VIPER
+/// File metadata common to both NOVA and NOVA
 #[derive(Debug, Clone)]
 pub struct ColumnarFileMetadata {
     /// Collection ID

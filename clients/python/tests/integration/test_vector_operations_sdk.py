@@ -30,9 +30,9 @@ class TestVectorOperationsSDK:
 
     # Sample paragraphs for testing
     SAMPLE_TEXTS = [
-        "ProximaDB is a high-performance vector database designed for AI applications. It supports multiple storage engines including SST and VIPER for different use cases.",
+        "ProximaDB is a high-performance vector database designed for AI applications. It supports multiple storage engines including SST and NOVA for different use cases.",
         "The SST engine is optimized for write-heavy workloads with sequential storage. It provides excellent performance for streaming data and time-series applications.",
-        "VIPER engine uses columnar storage with Parquet format, making it ideal for analytics workloads. It supports advanced features like predicate pushdown and column filtering.",
+        "NOVA engine uses columnar storage with Parquet format, making it ideal for analytics workloads. It supports advanced features like predicate pushdown and column filtering.",
         "Vector search is at the heart of modern AI applications. ProximaDB supports multiple distance metrics including cosine, euclidean, and dot product similarity.",
         "Metadata filtering allows you to combine semantic search with structured queries. This enables powerful hybrid search capabilities for real-world applications.",
     ]
@@ -237,7 +237,7 @@ class TestVectorOperationsSDK:
             # chunk_index might be in extra_metadata
             assert "chunk_index" in metadata or "custom_chunk_index" in metadata
 
-            # Test search with query about "VIPER engine"
+            # Test search with query about "NOVA engine"
             query_text = "columnar storage analytics"
             query_embedding = generate_embedding(query_text, model=model)
 
@@ -287,20 +287,20 @@ class TestVectorOperationsSDK:
             # Cleanup
             rest_client.delete_collection(collection_id)
 
-    def test_viper_engine_operations(
+    def test_nova_engine_operations(
         self, grpc_client, chunk_and_embed_text, generate_embedding
     ):
-        """Test comprehensive operations with VIPER engine via gRPC"""
-        collection_name = f"test_viper_{int(time.time())}_{uuid.uuid4().hex[:8]}"
+        """Test comprehensive operations with NOVA engine via gRPC"""
+        collection_name = f"test_nova_{int(time.time())}_{uuid.uuid4().hex[:8]}"
         model = "all-mpnet-base-v2"  # 768 dimensions for more complex embeddings
 
-        # Create collection with VIPER engine and metadata optimization
+        # Create collection with NOVA engine and metadata optimization
         config = CollectionConfig(
             name=collection_name,
             dimension=self.MODEL_DIMENSIONS[model],
             distance_metric=DistanceMetric.COSINE,
             storage_engine=StorageEngine.NOVA,
-            description="VIPER engine test with columnar metadata optimization",
+            description="NOVA engine test with columnar metadata optimization",
         )
 
         collection = grpc_client.create_collection(collection_name, config)
@@ -313,7 +313,7 @@ class TestVectorOperationsSDK:
             for idx, text in enumerate(self.SAMPLE_TEXTS):
                 source_id = f"article_{idx}"
 
-                # Different metadata pattern for VIPER testing
+                # Different metadata pattern for NOVA testing
                 custom_metadata = {
                     "author": ["Dr. Smith", "Prof. Johnson", "Dr. Williams"][idx % 3],
                     "department": ["AI Research", "Database Systems", "Infrastructure"][
@@ -423,7 +423,7 @@ class TestVectorOperationsSDK:
     def test_cross_engine_consistency(
         self, rest_client, grpc_client, chunk_and_embed_text, generate_embedding
     ):
-        """Test consistency between SST and VIPER engines"""
+        """Test consistency between SST and NOVA engines"""
         base_name = f"test_consistency_{int(time.time())}"
         model = "all-MiniLM-L6-v2"  # Use same model for consistency
 
@@ -435,16 +435,16 @@ class TestVectorOperationsSDK:
             storage_engine=StorageEngine.SST,
         )
 
-        viper_config = CollectionConfig(
-            name=f"{base_name}_viper",
+        nova_config = CollectionConfig(
+            name=f"{base_name}_nova",
             dimension=self.MODEL_DIMENSIONS[model],
             distance_metric=DistanceMetric.COSINE,
             storage_engine=StorageEngine.NOVA,
         )
 
         sst_collection = rest_client.create_collection(sst_config.name, sst_config)
-        viper_collection = grpc_client.create_collection(
-            viper_config.name, viper_config
+        nova_collection = grpc_client.create_collection(
+            nova_config.name, nova_config
         )
 
         try:
@@ -468,14 +468,14 @@ class TestVectorOperationsSDK:
                 sst_result, "metrics"
             ) and sst_result.metrics.successful_count == len(vector_records)
 
-            # Insert via gRPC to VIPER
-            viper_result = grpc_client.insert_vectors(
-                collection_id=viper_collection.id, records=vector_records
+            # Insert via gRPC to NOVA
+            nova_result = grpc_client.insert_vectors(
+                collection_id=nova_collection.id, records=vector_records
             )
-            assert viper_result.success is True
+            assert nova_result.success is True
             assert hasattr(
-                viper_result, "metrics"
-            ) and viper_result.metrics.successful_count == len(vector_records)
+                nova_result, "metrics"
+            ) and nova_result.metrics.successful_count == len(vector_records)
 
             # Search both with same query
             query = generate_embedding("high-performance database", model=model)
@@ -487,8 +487,8 @@ class TestVectorOperationsSDK:
                 include_metadata=True,
             )
 
-            viper_search = grpc_client.search(
-                collection_id=viper_collection.id,
+            nova_search = grpc_client.search(
+                collection_id=nova_collection.id,
                 vector=query,
                 top_k=3,
                 include_metadata=True,
@@ -503,15 +503,15 @@ class TestVectorOperationsSDK:
             else:
                 sst_results = sst_search.get("results", [])
 
-            if hasattr(viper_search, "results"):
-                viper_results = viper_search.results
-            elif isinstance(viper_search, list):
-                viper_results = viper_search
+            if hasattr(nova_search, "results"):
+                nova_results = nova_search.results
+            elif isinstance(nova_search, list):
+                nova_results = nova_search
             else:
-                viper_results = viper_search.get("results", [])
+                nova_results = nova_search.get("results", [])
 
             assert len(sst_results) > 0
-            assert len(viper_results) > 0
+            assert len(nova_results) > 0
 
             # Top results should be similar (same chunks)
             sst_top_id = (
@@ -519,13 +519,13 @@ class TestVectorOperationsSDK:
                 if hasattr(sst_results[0], "id")
                 else sst_results[0]["id"]
             )
-            viper_top_id = (
-                viper_results[0].id
-                if hasattr(viper_results[0], "id")
-                else viper_results[0]["id"]
+            nova_top_id = (
+                nova_results[0].id
+                if hasattr(nova_results[0], "id")
+                else nova_results[0]["id"]
             )
             assert (
-                sst_top_id == viper_top_id
+                sst_top_id == nova_top_id
             ), "Top results should be the same across engines"
 
             # Verify metadata consistency
@@ -538,26 +538,26 @@ class TestVectorOperationsSDK:
             else:
                 sst_metadata = sst_results[0].get("metadata", {})
 
-            if hasattr(viper_results[0], "metadata"):
-                viper_metadata = (
-                    dict(viper_results[0].metadata)
-                    if hasattr(viper_results[0].metadata, "__iter__")
-                    else viper_results[0].metadata
+            if hasattr(nova_results[0], "metadata"):
+                nova_metadata = (
+                    dict(nova_results[0].metadata)
+                    if hasattr(nova_results[0].metadata, "__iter__")
+                    else nova_results[0].metadata
                 )
             else:
-                viper_metadata = viper_results[0].get("metadata", {})
+                nova_metadata = nova_results[0].get("metadata", {})
 
             # Check key metadata fields are consistent
             for field in ["content_type", "has_technical_terms", "text"]:
-                if field in sst_metadata and field in viper_metadata:
+                if field in sst_metadata and field in nova_metadata:
                     assert (
-                        sst_metadata[field] == viper_metadata[field]
+                        sst_metadata[field] == nova_metadata[field]
                     ), f"Metadata field '{field}' should be consistent"
 
         finally:
             # Cleanup
             rest_client.delete_collection(sst_collection.id)
-            grpc_client.delete_collection(viper_collection.id)
+            grpc_client.delete_collection(nova_collection.id)
 
     def test_sdk_ingest_text_integration(self, rest_client):
         """Test the SDK's ingest_text function with real integration"""
@@ -584,7 +584,7 @@ class TestVectorOperationsSDK:
             Chapter 1: Vector Storage Engines
             ProximaDB offers two powerful storage engines optimized for different use cases.
             The SST engine excels at write-heavy workloads with its sequential storage design.
-            Meanwhile, the VIPER engine leverages columnar storage for analytical queries.
+            Meanwhile, the NOVA engine leverages columnar storage for analytical queries.
             
             Chapter 2: Metadata Filtering
             Advanced metadata filtering allows combining semantic search with structured queries.

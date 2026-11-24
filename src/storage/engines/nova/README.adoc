@@ -402,7 +402,7 @@ compaction_interval_secs = 1800  # 30 minutes
 ❌ **Not Ideal For**:
 
 * Pure write-heavy workloads (use SST)
-* Pure analytical (use VIPER)
+* Pure analytical (use NOVA)
 * Small datasets (<100K vectors)
 * Maximum compression priority
 
@@ -563,5 +563,5 @@ if self.get_total_vectors() < 100_000 {
 
 * Parent Module: Storage Engines
 * SST Engine: link:../sst/README.adoc[SST README]
-* VIPER Engine: link:../viper/README.adoc[VIPER README]
+* NOVA Engine: link:../viper/README.adoc[NOVA README]
 * Main Documentation: ProximaDB Docs

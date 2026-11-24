@@ -62,7 +62,7 @@ pub struct SchemaCollectionMetrics {
     pub p99_search_latency_us: f64,
 
     // === Storage Layer Metrics ===
-    pub parquet_file_count: i32,   // VIPER engine files
+    pub parquet_file_count: i32,   // NOVA engine files
     pub sstable_file_count: i32,   // SST engine files
     pub wal_size_bytes: i64,       // Write-ahead log size
     pub memtable_size_bytes: i64,  // In-memory buffer size

@@ -97,7 +97,7 @@ pub struct QuantizationConfiguration {
 /// Engine configuration options
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EngineConfiguration {
-    /// Storage engine type (e.g. `"SST"`, `"VIPER"`, `"NOVA"`)
+    /// Storage engine type (e.g. `"SST"`, `"NOVA"`, `"NOVA"`)
     pub engine_type: String,
     /// In-memory write buffer size (MB) before flushing to disk
     pub flush_threshold_mb: f64,
@@ -370,7 +370,7 @@ impl OptimizationPipeline {
                 compaction_interval_secs: 300,
             },
             EngineConfiguration {
-                engine_type: "VIPER".to_string(),
+                engine_type: "NOVA".to_string(),
                 flush_threshold_mb: 128.0,
                 compaction_interval_secs: 600,
             },

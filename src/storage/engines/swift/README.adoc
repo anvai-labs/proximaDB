@@ -510,7 +510,7 @@ Via API:
 
 [cols="2,3,3,3"]
 |===
-|Feature |SWIFT |SST |VIPER
+|Feature |SWIFT |SST |NOVA
 
 |Architecture
 |Three-tier hierarchical

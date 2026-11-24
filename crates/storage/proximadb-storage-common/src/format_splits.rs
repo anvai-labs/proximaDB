@@ -1,7 +1,7 @@
 //! # File Split Abstraction for Parallel Reading
 //!
 //! Provides a unified split abstraction for parallel scanning across all
-//! ProximaDB storage engines (SST, HELIX, SWIFT, NOVA, VIPER, RAPTOR).
+//! ProximaDB storage engines (SST, HELIX, SWIFT, NOVA, NOVA, RAPTOR).
 //!
 //! FileSplits represent independent units of work that can be processed
 //! in parallel, enabling efficient distributed query execution.
@@ -96,7 +96,7 @@ pub enum SplitType {
         block_count: usize,
         block_ids: Vec<u32>,
     },
-    /// NOVA/VIPER/RAPTOR: Parquet row group
+    /// NOVA/NOVA/RAPTOR: Parquet row group
     RowGroup {
         row_group_index: usize,
         row_count: i64,
@@ -267,7 +267,7 @@ impl FileSplit {
         }
     }
 
-    /// Create a new row group split (for NOVA/VIPER/RAPTOR)
+    /// Create a new row group split (for NOVA/NOVA/RAPTOR)
     pub fn new_row_group(
         file_path: String,
         row_group_index: usize,

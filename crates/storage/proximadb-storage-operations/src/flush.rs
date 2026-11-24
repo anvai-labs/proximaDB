@@ -13,12 +13,11 @@ use tracing::{debug, info};
 /// Flush manager coordinating memtable → storage transitions
 ///
 /// The flush manager handles the critical operation of persisting in-memory data
-/// to storage across all 7 storage engines, ensuring data durability and optimal
+/// to storage across the storage engines, ensuring data durability and optimal
 /// memory utilization.
 pub struct FlushManager {
     /// Engine-specific flush coordinators
     sst_flusher: Arc<SstFlushCoordinator>,
-    viper_flusher: Arc<ViperFlushCoordinator>,
     helix_flusher: Arc<HelixFlushCoordinator>,
 
     /// Flush statistics and monitoring
@@ -32,7 +31,6 @@ impl FlushManager {
 
         Ok(Self {
             sst_flusher: Arc::new(SstFlushCoordinator::new()?),
-            viper_flusher: Arc::new(ViperFlushCoordinator::new()?),
             helix_flusher: Arc::new(HelixFlushCoordinator::new()?),
             metrics: Arc::new(FlushMetrics::new()),
         })
@@ -65,36 +63,6 @@ impl FlushManager {
             bytes_written: result.bytes_written,
             duration,
             should_trigger_compaction: result.l0_file_count > 4, // Trigger compaction if too many L0 files
-        })
-    }
-
-    /// Flush VIPER engine memtable to Parquet files
-    ///
-    /// VIPER flushes create columnar Parquet files with advanced compression
-    /// and quantization for analytical workloads.
-    pub async fn flush_viper(&self, collection_id: &str) -> Result<FlushResult> {
-        info!("🔄 Executing VIPER flush for collection: {}", collection_id);
-        let start_time = Instant::now();
-
-        // Execute VIPER-specific flush with columnar optimization
-        let result = self.viper_flusher.execute_flush(collection_id).await?;
-
-        let duration = start_time.elapsed();
-        self.metrics
-            .record_viper_flush(collection_id, duration, &result)
-            .await;
-
-        info!(
-            "✅ VIPER flush completed for collection: {} in {:?}",
-            collection_id, duration
-        );
-
-        Ok(FlushResult {
-            collection_id: collection_id.to_string(),
-            files_created: result.parquet_files,
-            bytes_written: result.bytes_written,
-            duration,
-            should_trigger_compaction: result.file_count > 10, // VIPER can handle more files
         })
     }
 
@@ -132,7 +100,6 @@ impl FlushManager {
     pub async fn get_flush_status(&self) -> FlushStatus {
         FlushStatus {
             sst_active_flushes: self.sst_flusher.get_active_count().await,
-            viper_active_flushes: self.viper_flusher.get_active_count().await,
             helix_active_flushes: self.helix_flusher.get_active_count().await,
             total_flushes_completed: self.metrics.get_total_flushes().await,
             average_flush_time_ms: self.metrics.get_average_flush_time().await,
@@ -168,39 +135,6 @@ impl SstFlushCoordinator {
             bytes_written: 1024000,
             l0_file_count: 3,
             bloom_filter_size: 8192,
-        };
-
-        self.active_count.fetch_sub(1, Ordering::Relaxed);
-        Ok(result)
-    }
-
-    async fn get_active_count(&self) -> usize {
-        self.active_count.load(Ordering::Relaxed)
-    }
-}
-
-/// VIPER flush coordinator
-struct ViperFlushCoordinator {
-    active_count: AtomicUsize,
-}
-
-impl ViperFlushCoordinator {
-    fn new() -> Result<Self> {
-        Ok(Self {
-            active_count: AtomicUsize::new(0),
-        })
-    }
-
-    async fn execute_flush(&self, collection_id: &str) -> Result<ViperFlushResult> {
-        self.active_count.fetch_add(1, Ordering::Relaxed);
-        debug!("VIPER flush executing for collection: {}", collection_id);
-
-        // Flush pipeline: memtable → columnar conversion → compression → Parquet
-        let result = ViperFlushResult {
-            parquet_files: vec![format!("{}_batch.parquet", collection_id)],
-            bytes_written: 2048000,
-            file_count: 2,
-            compression_ratio: 3.5,
         };
 
         self.active_count.fetch_sub(1, Ordering::Relaxed);
@@ -257,15 +191,6 @@ struct SstFlushResult {
 }
 
 #[derive(Debug, Clone)]
-struct ViperFlushResult {
-    parquet_files: Vec<String>,
-    bytes_written: u64,
-    file_count: u32,
-    #[allow(dead_code)]
-    compression_ratio: f64,
-}
-
-#[derive(Debug, Clone)]
 struct HelixFlushResult {
     hilbert_sorted_files: Vec<String>,
     bytes_written: u64,
@@ -295,19 +220,6 @@ impl FlushMetrics {
         _collection_id: &str,
         duration: std::time::Duration,
         result: &SstFlushResult,
-    ) {
-        self.total_flushes.fetch_add(1, Ordering::Relaxed);
-        self.total_bytes_written
-            .fetch_add(result.bytes_written, Ordering::Relaxed);
-        self.total_duration_us
-            .fetch_add(duration.as_micros() as u64, Ordering::Relaxed);
-    }
-
-    async fn record_viper_flush(
-        &self,
-        _collection_id: &str,
-        duration: std::time::Duration,
-        result: &ViperFlushResult,
     ) {
         self.total_flushes.fetch_add(1, Ordering::Relaxed);
         self.total_bytes_written
@@ -347,7 +259,6 @@ impl FlushMetrics {
 #[derive(Debug, Clone)]
 pub struct FlushStatus {
     pub sst_active_flushes: usize,
-    pub viper_active_flushes: usize,
     pub helix_active_flushes: usize,
     pub total_flushes_completed: u64,
     pub average_flush_time_ms: f64,
@@ -363,7 +274,6 @@ mod flush_tests {
         let status = flush_manager.get_flush_status().await;
 
         assert_eq!(status.sst_active_flushes, 0);
-        assert_eq!(status.viper_active_flushes, 0);
         assert_eq!(status.helix_active_flushes, 0);
     }
 
@@ -373,18 +283,6 @@ mod flush_tests {
 
         // Test SST flush
         let result = flush_manager.flush_sst("test_collection").await.unwrap();
-
-        assert_eq!(result.collection_id, "test_collection");
-        assert!(!result.files_created.is_empty());
-        assert!(result.bytes_written > 0);
-    }
-
-    #[tokio::test]
-    async fn test_viper_flush_execution() {
-        let flush_manager = FlushManager::new().unwrap();
-
-        // Test VIPER flush
-        let result = flush_manager.flush_viper("test_collection").await.unwrap();
 
         assert_eq!(result.collection_id, "test_collection");
         assert!(!result.files_created.is_empty());

@@ -43,7 +43,7 @@ pub struct EnterpriseDeploymentRequest {
 /// Custom configuration overrides
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CustomConfiguration {
-    /// Preferred storage engine name (e.g., "NOVA", "VIPER", "SST"); defaults to auto-detected
+    /// Preferred storage engine name (e.g., "NOVA", "SST"); defaults to auto-detected
     pub storage_engine_preference: Option<String>,
     /// Override for memory allocated to ProximaDB in megabytes
     pub memory_allocation_mb: Option<u32>,
@@ -556,7 +556,7 @@ pub struct EnterpriseConfiguration {
     pub customer_name: String,
     /// Tenant identifier used to isolate this customer's data and resources
     pub tenant_id: String,
-    /// Name of the selected storage engine (e.g., "NOVA", "VIPER", "SST")
+    /// Name of the selected storage engine (e.g., "NOVA", "SST")
     pub storage_engine: String,
     /// Memory allocated to the ProximaDB process in megabytes
     pub memory_allocation_mb: u32,

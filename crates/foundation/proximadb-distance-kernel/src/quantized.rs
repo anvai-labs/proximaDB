@@ -1,7 +1,7 @@
 //! Unified Quantized Distance Computation
 //!
 //! This module provides SIMD-optimized distance calculations for quantized vectors
-//! across all storage engines (SST, VIPER, NOVA). It integrates with the unified
+//! across all storage engines (SST, NOVA, NOVA). It integrates with the unified
 //! distance computation infrastructure and provides specialized implementations
 //! for binary, INT8, and PQ quantization with proper data types.
 
@@ -1039,7 +1039,7 @@ impl QuantizedDistanceCalculator {
     }
 
     /// Compute batch distances for columnar storage operations
-    /// This is the centralized method for all columnar engines (VIPER, NOVA)
+    /// This is the centralized method for all columnar engines (NOVA, NOVA)
     pub async fn compute_columnar_batch_distances(
         &self,
         query_vector: &[f32],

@@ -298,26 +298,6 @@ class CompressionBenchmark:
                 StorageEngine.SST,
                 0.8,
             ),  # 80% sparse
-            # VIPER configurations
-            ("viper_baseline", CompressionConfig(), StorageEngine.VIPER, 0.0),
-            (
-                "viper_lz4",
-                CompressionConfig(
-                    viper_compression_algorithm=CompressionAlgorithm.LZ4,
-                    viper_compression_level=1,
-                ),
-                StorageEngine.VIPER,
-                0.0,
-            ),
-            (
-                "viper_dual_columns",
-                CompressionConfig(
-                    viper_compression_algorithm=CompressionAlgorithm.LZ4,
-                    viper_enable_dual_columns=True,
-                ),
-                StorageEngine.VIPER,
-                0.0,
-            ),
         ]
 
         # Run benchmarks

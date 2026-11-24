@@ -1,5 +1,5 @@
 //! Storage adapter trait for ProximaDB's relational query path
-//! (ADR-019 L5 / S4). Each storage engine (SST, VIPER, NOVA, future
+//! (ADR-019 L5 / S4). Each storage engine (SST, NOVA, NOVA, future
 //! external readers) implements [`RelationalReader`] and declares
 //! its [`ReaderCapabilities`]. The planner consults capabilities
 //! to decide what stays in the executor vs what pushes down.
@@ -24,7 +24,7 @@
 //!
 //! See [`VecReader`] for a reference in-memory implementation that
 //! satisfies every capability flag. Real engine adapters (SST,
-//! VIPER, NOVA) live in the root crate and wrap their engine's
+//! NOVA, NOVA) live in the root crate and wrap their engine's
 //! reader API.
 
 use async_trait::async_trait;
@@ -378,7 +378,7 @@ pub trait RelationalReader: Send + Sync {
 /// - `bloom_probe` / `zone_map_skip`: declared but no-op (the
 ///   single in-memory block has no skip metadata).
 ///
-/// Real engine adapters (SST, VIPER, NOVA) follow the same shape
+/// Real engine adapters (SST, NOVA, NOVA) follow the same shape
 /// but plug into their engine's storage primitives.
 pub struct VecReader {
     full_schema: RelationalSchema,

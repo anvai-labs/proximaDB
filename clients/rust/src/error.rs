@@ -62,7 +62,7 @@ pub enum CollectionError {
 
     /// Unknown storage engine
     #[error(
-        "Unknown storage engine: {engine}. Supported: sst, helix, viper, nova, swift, raptor, tst"
+        "Unknown storage engine: {engine}. Supported: sst, helix, nova, swift, raptor, tst"
     )]
     UnknownEngine { engine: String },
 }
@@ -312,7 +312,7 @@ mod tests {
                 CollectionError::UnknownEngine {
                     engine: "bad".to_string(),
                 },
-                "Unknown storage engine: bad. Supported: sst, helix, viper, nova, swift, raptor, tst",
+                "Unknown storage engine: bad. Supported: sst, helix, nova, swift, raptor, tst",
             ),
         ];
 

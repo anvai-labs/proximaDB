@@ -28,7 +28,7 @@ impl StoragePath {
     /// - Multi-tenant: `{base_url}/tenants/{tenant_id}/{collection_id}/data`
     ///
     /// This is the standard location where all storage engines should store their data files.
-    /// Using this helper ensures consistency across SST, VIPER, NOVA, SWIFT, RAPTOR, and HELIX engines.
+    /// Using this helper ensures consistency across SST, NOVA, NOVA, SWIFT, RAPTOR, and HELIX engines.
     ///
     /// # Arguments
     /// * `base_url` - The base storage URL (e.g., "file:///path/to/storage" or "s3://bucket/path")

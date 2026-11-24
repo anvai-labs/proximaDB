@@ -1,7 +1,7 @@
 //! Unified Operations Coordination - Flush, Compaction, and Re-quantization
 //!
 //! This module implements the critical infrastructure for coordinating background operations
-//! across all storage engines (SST, VIPER, RAPTOR, NOVA, SWIFT, PRISM, HELIX).
+//! across all storage engines (SST, RAPTOR, NOVA, SWIFT, PRISM, HELIX).
 //!
 //! Key responsibilities:
 //! - Prevent data corruption through intelligent locking
@@ -77,7 +77,7 @@ pub struct UnifiedOperationCoordinator {
     compaction_manager: Arc<compaction::CompactionManager>,
 
     /// Compaction scheduler with priority queue and pluggable strategies
-    /// (Leveled for SST/Nova/Raptor, Tiered for Viper/Helix/Swift)
+    /// (Leveled for SST/Nova/Raptor, Tiered for Helix/Swift)
     #[allow(dead_code)]
     compaction_scheduler: Arc<CompactionScheduler>,
 
@@ -179,7 +179,7 @@ impl UnifiedOperationCoordinator {
     ///
     /// The scheduler automatically registers:
     /// - LeveledCompactionStrategy for SST, Nova, Raptor engines (LSM-tree style)
-    /// - TieredCompactionStrategy for Viper, Helix, Swift engines (columnar/size-tiered)
+    /// - TieredCompactionStrategy for Helix and Swift engines (size-tiered)
     pub fn new() -> Result<Self> {
         info!("Initializing UnifiedOperationCoordinator");
 
@@ -235,7 +235,6 @@ impl UnifiedOperationCoordinator {
         let start_time = std::time::Instant::now();
         let result = match engine_type {
             StorageEngineType::Sst => self.flush_manager.flush_sst(collection_id).await?,
-            StorageEngineType::Viper => self.flush_manager.flush_viper(collection_id).await?,
             StorageEngineType::Helix => self.flush_manager.flush_helix(collection_id).await?,
             _ => {
                 return Err(anyhow::anyhow!(

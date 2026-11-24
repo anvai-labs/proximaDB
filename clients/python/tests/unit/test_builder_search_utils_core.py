@@ -57,7 +57,7 @@ def test_collection_builder_fluent_methods_and_helpers():
         .hamming_distance()
         .jaccard_similarity()
         .distance_metric(DistanceMetric.COSINE)
-        .viper_storage()
+        .nova_storage()
         .sst_storage()
         .hybrid_storage()
         .storage_engine(StorageEngine.NOVA)
