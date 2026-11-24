@@ -1672,7 +1672,7 @@ notes = "STORE = MinIO S3 EMULATOR on localhost: the direct leg is emulator-loca
 
 [[claims]]
 id = "m5_sift1m_minio_rtt_ladder"
-claim = "ADR-098 M5 emulator leg: SIFT1M skip-ingest arms on the SAME MinIO bed (byte-identical objects; --skip-ingest --collection-id 1) through toxiproxy-injected symmetric RTT, 25-query cohorts (the first 100-query attempt wedged — server S3 client blocked on a proxy-torn connection, the TD-RDSTRAT-12 wedged-daemon class; killed and re-run with a fresh proxy per arm). GET/q and recall are RTT-invariant and hold at every level measured (object-cold GET/q 18.12-18.64, recall@100 0.9881-0.9932); <FILL_LADDER_CLAIM>"
+claim = "ADR-098 M5 emulator leg: SIFT1M skip-ingest arms on the SAME MinIO bed (byte-identical objects; --skip-ingest --collection-id 1) through toxiproxy-injected symmetric RTT, 25-query cohorts (the first 100-query attempt wedged — server S3 client blocked on a proxy-torn connection, the TD-RDSTRAT-12 wedged-daemon class; killed and re-run with a fresh proxy per arm). GET/q and recall are RTT-invariant and hold at every level measured (object-cold GET/q 18.12-18.64, recall@100 0.9881-0.9932). object_cold p50 ladder: direct 833 ms -> 770 ms @50 ms (clean) -> 882 ms @100 ms -> 1,033 ms @150 ms (both last ⚑ compile-contended upper bounds); on this localhost bed the transfer+compute terms dominate and the ~6.3 sequential fetch rounds add only rounds x RTT — the counts, not these localhost p50s, are the transferable evidence"
 metric = "object_cold p50/p95 per RTT level + GET/q + waves p50 + recall@100"
 status = "measured"
 asserted_in = [

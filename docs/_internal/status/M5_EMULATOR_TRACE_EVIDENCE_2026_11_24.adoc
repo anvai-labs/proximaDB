@@ -6,7 +6,7 @@
 |===
 | Date | 2026-11-24
 | Version | worktree bench/m5-emulator-trace @ 51a20902f (develop base ea77dea50; carries the `PROXIMADB_WAREHOUSE_ROOT_URL` seam + the latency-floor bench `store_for_url` rerouting from the same PR). SIFT binaries: `--profile release-server --features proximadb/io-trace,proximadb/aws`, sha256 f327599a7152…; the binary was built inside the seam-edit window (the harness's revision guard passed against the committed tree; any delta is formatting-only, and the seam is inert with the gate unset — no SIFT leg touches the warehouse path).
-| Hardware | Apple Silicon arm64, 64 GB, macOS, Docker Desktop. NOT a quiet machine throughout: the pgwire leg, the ratchet pair and parts of two RTT arms ran while test targets compiled in the background — every latency figure below is shape evidence only, and the two affected RTT arms are marked. Counts and recall are request-deterministic on these fixtures and are the durable quantities. Indicative dev-machine evidence, not an SLA.
+| Hardware | Apple Silicon arm64, 64 GB, macOS, Docker Desktop. NOT a quiet machine throughout: the SIFT1M leg-1 phase sweeps, the RTT50(b)/RTT100 arms, (briefly) the pgwire leg, and the RTT150 arm overlapped background release compiles — the affected latency rows are marked ⚑ and are upper bounds; the floor-bench legs and the clean RTT50 re-run ran with no compile jobs. Every latency figure below is shape evidence only. Counts and recall are request-deterministic on these fixtures and are the durable quantities. Indicative dev-machine evidence, not an SLA.
 | Storage regime | **MinIO S3 emulator** (docker `minio/minio:latest`, container `m5-minio`, 127.0.0.1:9000, path-style, creds `m5bench`). Request counts are emulator-measured; **latency legs are emulator-local (Docker NAT ≈ 4-7 ms/op steady-state) or toxiproxy-injected** — neither is real-cloud latency.
 |===
 
@@ -80,11 +80,21 @@ contentment visible; the clean re-run is authoritative).
 |===
 | Arm | recall@100 (cold) | GET/q (cold) | waves p50 | bytes/q (cold) | cold p50 | cold p95
 | direct (leg-1 object_cold, proxy-free) | 0.9881 | 18.64 | 2 | 51.2 MB | 833 ms | 1,976 ms
-| RTT 50 ms ⚑ (first attempt, wedged) | — | — | — | — | — | —
-<FILL_LADDER_ROWS>
+| RTT 50 ms — first 100-query attempt | wedged after 86/100 post-write queries (see Incidents); killed, excluded | | | | |
+| RTT 50 ms — clean 25q re-run, exit 0 | 0.9932 | 18.12 | 2 | 50.9 MB | 770 ms | 1,108 ms
+| RTT 50 ms ⚑ contended 25q, exit 0 | 0.9932 | 18.12 | 2 | 50.9 MB | 2,234 ms | 11,305 ms
+| RTT 100 ms ⚑ contended 25q, exit 0 | 0.9932 | 18.12 | 2 | 50.9 MB | 882 ms | 1,247 ms
+| RTT 150 ms ⚑ contended 25q, exit 0 | 0.9932 | 18.12 | 2 | 50.9 MB | 1,033 ms | 3,858 ms |
 |===
 
-<FILL_LADDER_NOTES>
+Reading: counts and recall are RTT-INVARIANT — GET/q (18.12-18.64), requests/q and recall@100
+(0.9881-0.9932 across cohorts) hold at every level; the billed shape does not change with latency.
+The clean 50 ms arm's cold p50 (770 ms) sits near the proxy-free direct leg (833 ms): on localhost
+the transfer+compute terms dominate and the ~6.3 sequential fetch rounds only add rounds × RTT
+(≈ 315 ms at 50 ms), partially hidden under the 25-query cohort's tail. The ⚑ contended rows show
+the compile-contention effect (2,234 ms vs the clean 770 ms at the SAME 50 ms RTT — the ⚑ rows are
+upper bounds, kept for the record, never for comparison). A real-cloud link couples RTT with limited
+bandwidth — these localhost shapes bound nothing about cloud latency.
 
 == 4. pgwire TD-SPINE-4 manifest levers with an S3-warehouse — exit 0 (2.3 s)
 
@@ -143,9 +153,13 @@ an emulator — the numbers a route-cost model must beat, not cloud SLAs.
   ("Source terminated" in the proxy log; the wedged-daemon class TD-RDSTRAT-12 recorded). Killed;
   re-run with a fresh proxy daemon per arm and 25-query cohorts. The wedged attempt's `result.json`
   records the partial phase; it is excluded from the table.
-* **Compile contention:** the RTT50 (first re-run) and RTT100 arms overlapped background release
-  builds (qps 0.31/0.89 vs ≈1.0 clean); their p50s are upper bounds. <FILL: whether a clean RTT50
-  re-run landed>
+* **Compile contention:** the leg-1 SIFT1M phase sweeps, the first RTT50 25q re-run and the RTT100
+  arm overlapped background release builds (visible as qps 0.29-0.31 vs 1.07-1.34 on the clean
+  runs); their p50s are upper bounds, marked ⚑. A clean RTT50 re-run landed (770 ms cold p50 vs the
+  contended arm's 2,234 ms at the same injected RTT) and is the authoritative 50 ms row.
+* **Dirty-worktree guard firings (2):** two ladder launches were refused by the harness's own
+  "benchmark refuses a dirty worktree" guard after in-flight doc edits — recorded as exit 1 with
+  that message; re-launched after committing. No measurement was affected.
 
 == Reading the numbers honestly
 
