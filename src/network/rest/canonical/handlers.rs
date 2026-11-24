@@ -2017,7 +2017,8 @@ pub fn create_router(state: AppState) -> axum::Router {
         // materialize/write path uses (`file://{data_dir}/warehouse`), so the manifest log
         // drives snapshot history and `metadata-location` resolves. Best-effort: if the
         // store is unavailable, metadata is still served inline (synthesized, no persistence).
-        let warehouse_root_url = format!("file://{}/warehouse", state.data_dir.display());
+        let warehouse_root_url =
+            crate::network::shared_services::warehouse_root_url(&state.data_dir);
         match proximadb_iceberg_engine::IcebergObjectStoreBridge::from_url(&warehouse_root_url) {
             Ok(bridge) => {
                 iceberg_state = iceberg_state.with_object_store_bridge(std::sync::Arc::new(bridge));

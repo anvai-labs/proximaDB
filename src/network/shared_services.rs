@@ -107,6 +107,33 @@ pub(crate) fn join_storage_url(base: &str, sub: &str) -> String {
     }
 }
 
+/// Warehouse object-store root for `ALTER TABLE … MATERIALIZE` Parquet
+/// snapshots and the Iceberg REST metadata persistence (TD-119).
+///
+/// Default: `file://{data_dir}/warehouse` — the same server-data-dir derivation
+/// every call site hard-coded before this seam existed. The
+/// `PROXIMADB_WAREHOUSE_ROOT_URL` override (ADR-098 M5) lets the warehouse live
+/// on an object-store URL (`s3://bucket/prefix`, `adls://…`) while `data_dir`
+/// stays a local path — the configuration cloud deployments and the cloud-trace
+/// evidence ledger need, and until now impossible to express: the URL was
+/// formatted from a `PathBuf` at three independent call sites. The override is
+/// taken verbatim (scheme included); an unparsable/failed open still degrades
+/// the same way it always did — `with_materializer` / the Iceberg REST wiring
+/// warn and leave MATERIALIZE unwired rather than break the server.
+pub(crate) fn warehouse_root_url(data_dir: &std::path::Path) -> String {
+    match std::env::var("PROXIMADB_WAREHOUSE_ROOT_URL") {
+        Ok(url) if !url.trim().is_empty() => {
+            tracing::info!(
+                "warehouse root overridden by PROXIMADB_WAREHOUSE_ROOT_URL: {url} \
+                 (default file://{}/warehouse)",
+                data_dir.display()
+            );
+            url
+        }
+        _ => format!("file://{}/warehouse", data_dir.display()),
+    }
+}
+
 /// The local-filesystem view of a storage base, for subsystems that cannot yet
 /// run over an object store (TD-OBJSTORE-1 deferred set — e.g. the TST
 /// time-series engine). Returns `None` when the base carries a non-`file`
