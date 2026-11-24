@@ -7,7 +7,7 @@
 //! ## Role in ProximaDB Architecture
 //!
 //! This module serves as the contract between the service layer and the storage layer, enabling:
-//! - **Storage Engine Abstraction**: Uniform interface for all storage engines (SST, VIPER, NOVA, etc.)
+//! - **Storage Engine Abstraction**: Uniform interface for all storage engines (SST, NOVA, etc.)
 //! - **Workload Optimization**: Different engines for different access patterns (OLTP vs OLAP)
 //! - **Zero-Copy Operations**: Direct protocol buffer flow without intermediate conversions
 //! - **Cloud-Native Integration**: Seamless support for S3, Azure Blob, GCS backends
@@ -23,7 +23,6 @@
 //! 1. **SST (SSTEngine)**: Hybrid columnar (ProximaBlocks), write-optimized with three-stage filtering
 //!    - Best for: Real-time queries, frequent updates, OLTP workloads
 //!
-//! 2. **VIPER (ViperEngine)**: Columnar Parquet format with advanced quantization
 //!    - Best for: Analytics, batch operations, compression, OLAP workloads
 //!
 //! 3. **NOVA (NovaEngine)**: Next-gen columnar with integrated quantization
@@ -416,7 +415,7 @@ pub struct CollectionStats {
     /// Approximate number of rows/vectors in the collection.
     ///
     /// This is **not** an exact live count (TD-148). Engines derive it two ways, both
-    /// approximate: VIPER/HELIX use an insert-only atomic counter that is never
+    /// approximate: some engines use an insert-only atomic counter that is never
     /// decremented on delete/tombstone (so it includes dead/expired records), and
     /// SST/NOVA estimate it from bytes-on-disk. Treat it as a cost-planning hint,
     /// never as a source of truth — the record-returning read paths (#305/#313)
@@ -613,7 +612,7 @@ pub trait UnifiedStorageFormat: Send + Sync {
 
     /// Engine-specific unified search with optimization capabilities (required)
     /// Each engine implements its own optimizations:
-    /// - VIPER: Columnar predicate pushdown, Parquet filtering, ML clustering
+    /// - NOVA: Columnar predicate pushdown, Parquet filtering
     /// - LSM: Bloom filter hints, range scans, SSTable optimizations
     /// - SST: Hierarchical bloom filters, progressive quantization
     /// - NOVA: Extended Parquet statistics, aggressive pruning
@@ -645,7 +644,7 @@ pub trait UnifiedStorageFormat: Send + Sync {
     /// ## Per-engine optimization (Phase 2F-b follow-ups)
     ///
     /// Each engine that owns its own flush SST-writer (NOVA, SST,
-    /// VIPER, RAPTOR, CHRONO, SEQUOIA) overrides this method to call
+    /// NOVA, RAPTOR, CHRONO, SEQUOIA) overrides this method to call
     /// its own writer directly with the provided sorted iterator,
     /// skipping the WAL+memtable cost. Those optimizations land as
     /// focused per-engine commits — the trait surface is stable so
@@ -815,7 +814,7 @@ pub trait UnifiedStorageFormat: Send + Sync {
     /// This follows the successful pattern from RAPTOR's scan_vectors_with_strategy
     /// and is implemented differently by each engine:
     /// - SST: Uses modular block readers with bloom filters
-    /// - VIPER: Uses columnar predicate pushdown
+    /// - NOVA: Uses columnar predicate pushdown
     /// - NOVA: Uses progressive quantization stages
     /// - RAPTOR: Uses tier-aware consolidated reading
     ///
@@ -840,7 +839,7 @@ pub trait UnifiedStorageFormat: Send + Sync {
     /// collection's resolved data location (the service layer resolves it from
     /// collection metadata and passes it down — engines stay pure format
     /// readers and do not resolve paths themselves). Default returns empty; the
-    /// SST/VIPER/NOVA/HELIX format readers override this.
+    /// SST/NOVA/HELIX format readers override this.
     async fn read_all_records(
         &self,
         _collection_id: &str,
@@ -1053,7 +1052,7 @@ pub trait UnifiedStorageFormat: Send + Sync {
         // NOTE: AXIS/EventLog flush notification is intentionally NOT done here.
         // The traits layer is a pure consumer (no root-service dependency) — each
         // engine that needs to trigger async AXIS index building on flush notifies
-        // the EventLog from its own `do_flush` (see VIPER, HELIX, SWIFT, NOVA), and
+        // the EventLog from its own `do_flush` (see HELIX, SWIFT, NOVA), and
         // SST performs direct AXIS indexing via TD-112 `index_flushed_into_axis`.
         // Centralizing it here created a reach-in into the root event-log service
         // that blocks moving this module to a crate (root-crate decomposition gap 4).
@@ -1103,10 +1102,11 @@ pub trait UnifiedStorageFormat: Send + Sync {
     /// Check if flush is needed with engine-specific heuristics
     async fn should_flush(&self, _collection_id: Option<&str>) -> Result<bool> {
         match self.strategy() {
+            // VIPER removed (ADR-093); unreachable for live engines (the
+            // factory rejects the strategy) — SST-baseline heuristic.
             StorageEngineStrategy::Viper => {
-                // VIPER default: flush when memory usage exceeds threshold
                 let stats = self.get_engine_stats().await?;
-                Ok(stats.memory_usage_bytes > 100 * 1024 * 1024) // 100MB default
+                Ok(stats.memory_usage_bytes > 64 * 1024 * 1024)
             }
             StorageEngineStrategy::Sst => {
                 // LSM default: flush when memtable size exceeds threshold
@@ -1114,7 +1114,7 @@ pub trait UnifiedStorageFormat: Send + Sync {
                 Ok(stats.memory_usage_bytes > 64 * 1024 * 1024) // 64MB default
             }
             StorageEngineStrategy::Hybrid => {
-                // Hybrid: use VIPER heuristics
+                // Hybrid: columnar-style thresholds
                 let stats = self.get_engine_stats().await?;
                 Ok(stats.memory_usage_bytes > 100 * 1024 * 1024)
             }
@@ -1159,10 +1159,10 @@ pub trait UnifiedStorageFormat: Send + Sync {
     /// Check if compaction is needed with engine-specific heuristics
     async fn should_compact(&self, collection_id: Option<&str>) -> Result<bool> {
         match self.strategy() {
+            // VIPER removed (ADR-093); unreachable for live engines — reuse
+            // the SST-baseline heuristic below.
             StorageEngineStrategy::Viper => {
-                // VIPER default: compact when too many small files
                 let stats = self.get_engine_stats().await?;
-                // Engine-specific logic would go in metrics
                 Ok(stats
                     .engine_specific
                     .get("vector_count")
@@ -1509,7 +1509,7 @@ pub trait UnifiedStorageFormat: Send + Sync {
 /// neither is present (passthrough — no filtering).
 ///
 /// This is the shared implementation behind the engine overrides of
-/// [`UnifiedStorageFormat::rls_record_filter`] (SST/NOVA/VIPER/HELIX); the
+/// [`UnifiedStorageFormat::rls_record_filter`] (SST/NOVA/HELIX); the
 /// trait default stays `None` for engines that do not override it.
 pub fn rls_predicate_from_ctx(ctx: &StorageQueryContext) -> Option<RlsRecordPredicate> {
     // Prefer explicit tenant context (String); fall back to user context (Option<String>)
@@ -1536,7 +1536,7 @@ pub fn rls_predicate_from_ctx(ctx: &StorageQueryContext) -> Option<RlsRecordPred
 }
 
 /// Legacy alias for [`UnifiedStorageFormat`] (engines → formats convergence).
-/// ProximaDB's storage "engines" (SST/VIPER/HELIX/NOVA/…) are format/layout
+/// ProximaDB's storage "engines" (SST/HELIX/NOVA/…) are format/layout
 /// specializations; `UnifiedStorageFormat` is now the canonical name, aligned
 /// with the catalog's `CatalogPhysicalFormat`/`CatalogStorageLayoutKind`
 /// vocabulary. `UnifiedStorageEngine` is retained during the migration window

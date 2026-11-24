@@ -62,7 +62,7 @@ pub struct FlushParameters {
     /// review round 8): `Some(map)` — the catalog was consulted, and an EMPTY
     /// map means the collection set nothing, so server defaults apply as
     /// normal; `None` — this flush path never consulted the catalog
-    /// (bulk-ingest, the WAL flush coordinator, recovery, VIPER), so a
+    /// (bulk-ingest, the WAL flush coordinator, recovery), so a
     /// per-collection opt-out would be invisible and the server's broader
     /// defaults must not be applied on its behalf. A bare `HashMap` forced
     /// an emptiness heuristic that either left the server default inert for
@@ -164,7 +164,7 @@ pub struct CompactionParameters {
     /// Wait for completion before returning
     pub synchronous: bool,
 
-    /// Engine-specific hints (e.g., target level for LSM, cluster hints for VIPER)
+    /// Engine-specific hints (e.g., target level for LSM, cluster hints)
     pub hints: HashMap<String, serde_json::Value>,
 
     /// Maximum time to wait for operation
