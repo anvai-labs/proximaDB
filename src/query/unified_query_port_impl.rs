@@ -1297,13 +1297,15 @@ mod tests {
     #[tokio::test]
     async fn prepared_owner_prefers_the_explicit_identity_tenant() {
         // Explicit identity tenant wins (ADR-098 D5: identity as data), even
-        // over a task-local scope in force around the call.
+        // over a task-local scope in force around the call. (The async block
+        // is REQUIRED: `std::future::ready(expr)` evaluates `expr` eagerly,
+        // OUTSIDE the task-local scope.)
         assert_eq!(prepared_owner(Some("acme")), Some("acme".to_string()));
         let scoped = crate::query::request_scope::with_request_tenant(
             "outer",
             crate::query::request_scope::with_request_tenant(
                 "inner",
-                std::future::ready(prepared_owner(Some("acme"))),
+                async { prepared_owner(Some("acme")) },
             ),
         )
         .await;
@@ -1312,7 +1314,7 @@ mod tests {
         // Fallback: no identity → the scope in force (task-local).
         let fallback = crate::query::request_scope::with_request_tenant(
             "scoped",
-            std::future::ready(prepared_owner(None)),
+            async { prepared_owner(None) },
         )
         .await;
         assert_eq!(fallback, Some("scoped".to_string()));
