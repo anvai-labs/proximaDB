@@ -101,7 +101,7 @@ flowchart TB
   subgraph EXEC[Physical Execution]
     VOL["Native Volcano<br/>fresh relational / OLTP / WAL+RecordStorage"]:::svc
     DF["DataFusionLocal<br/>OLAP/parquet path; vector_search UDTF; distributed adapter planned"]:::svc
-    VEC["Vector engines<br/>SST, HELIX, NOVA<br/>VIPER deprecated · SWIFT, RAPTOR experimental"]:::svc
+    VEC["Vector engines<br/>SST, HELIX, NOVA<br/>VIPER removed (ADR-093) · SWIFT, RAPTOR experimental"]:::svc
     MOD["Modality runtimes<br/>document, ORION graph, observability, queue, rank"]:::svc
     IDX["AXIS / DiskANN indexes<br/>HNSW, IVF, PQ, Annoy, LSH, geo"]:::svc
     CMP["compute/<br/>distance, SIMD, quantization"]:::svc
@@ -336,7 +336,7 @@ flowchart TB
 
   subgraph DATAEXEC[Data & Execution]
     direction TB
-    STO["storage/<br/>vector engines: SST·HELIX·NOVA<br/>(VIPER deprecated · SWIFT·RAPTOR experimental, deleted in v0.6)<br/>time/event foundations · WAL · persistence · filesystem · document/sdp"]:::sub
+    STO["storage/<br/>vector engines: SST·HELIX·NOVA<br/>(VIPER removed, ADR-093 · SWIFT·RAPTOR experimental, deleted in v0.7)<br/>time/event foundations · WAL · persistence · filesystem · document/sdp"]:::sub
     CMP["compute/<br/>distance (L2/cos/dot) · SIMD detect · quantization/unified"]:::sub
     IDX["index/<br/>AXIS (HNSW·IVF·PQ·Annoy·LSH) · DiskANN · geo"]:::sub
     GRA["graph/<br/>ORION · CSR projections · rag/ (RGL)<br/>distributed/tiered policy via relational/storage substrate"]:::sub
@@ -388,7 +388,7 @@ flowchart LR
   N --> H["wire adapter<br/>runtime handler or typed DDL/DML port"]:::n
   H --> S["services/<br/>operations·dml"]:::n
   S --> W["storage/persistence/<br/>write_ahead_log (canonical WAL)"]:::n
-  W --> E["engine writer + UnifiedStorageFormat<br/>(SST/HELIX/VIPER/…)"]:::n
+  W --> E["engine writer + UnifiedStorageFormat<br/>(SST/HELIX/NOVA/…)"]:::n
   E --> F["storage/persistence/<br/>filesystem"]:::n
   S -. authority .-> X["xCatalog<br/>(proximadb-catalog)"]:::n
 ----

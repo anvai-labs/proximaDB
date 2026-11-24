@@ -9,7 +9,7 @@ Databases tested:
 - ProximaDB (native Rust via PyO3) with all storage engines:
   - SST: Write-optimized, real-time ingestion
   - HELIX: Locality-optimized with Hilbert curve indexing
-  - VIPER: Columnar Parquet for analytics workloads
+  - NOVA: Columnar Parquet for analytics workloads
   - NOVA: Progressive columnar for mixed workloads
   - SWIFT: Ultra-low latency for small datasets
   - RAPTOR: Adaptive row-group for dynamic workloads
@@ -341,7 +341,7 @@ def parse_sizes(raw: str) -> list[int]:
 
 def parse_engines(raw: str) -> list[str]:
     """Parse comma-separated engine names."""
-    all_engines = ["sst", "helix", "viper", "nova", "swift", "raptor"]
+    all_engines = ["sst", "helix", "nova", "swift", "raptor"]
     if raw.strip().lower() == "all":
         return all_engines
     return [part.strip().lower() for part in raw.split(",") if part.strip()]

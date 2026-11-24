@@ -995,7 +995,7 @@ compile_protobuf = []
 #   - test-unit: Unit tests in src/ (always run, fastest)
 #   - test-integration: Integration tests in tests/ (run on PRs)
 #   - test-graph: Graph database tests (test_graph_*, graph_*)
-#   - test-storage: Storage engine tests (sst, helix, viper, nova, swift, raptor)
+#   - test-storage: Storage engine tests (sst, helix, nova, swift, raptor)
 #   - test-query: Query engine tests (sql, unified_query, federated)
 #   - test-perf: Performance benchmarks (slow, CI-gated)
 #   - test-security: Security/penetration tests
@@ -1252,11 +1252,6 @@ path = "benches/bench_04_storage_unified.rs"
 name = "bench_08_quantization_sst"
 harness = false
 path = "benches/bench_08_quantization_sst.rs"
-
-[[bench]]
-name = "bench_09_columnar_viper"
-harness = false
-path = "benches/bench_09_columnar_viper.rs"
 
 # 3. SEARCH & QUERY BENCHMARKS (10)
 [[bench]]

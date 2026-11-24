@@ -27,7 +27,7 @@ use crate::storage::traits::UnifiedStorageFormat;
 /// Central registry for all storage formats
 ///
 /// The registry maintains:
-/// - Internal formats (SST, Helix, Viper, etc.)
+/// - Internal formats (SST, Helix, etc.)
 /// - Open table formats (Delta, Iceberg, Hudi, etc.)
 /// - Format detectors for auto-detection
 ///
@@ -93,7 +93,6 @@ impl FormatRegistry {
         match format_type {
             FormatType::Sst
             | FormatType::Helix
-            | FormatType::Viper
             | FormatType::Nova
             | FormatType::Swift
             | FormatType::Raptor
@@ -285,7 +284,6 @@ impl FormatRegistry {
             format_type,
             FormatType::Sst
                 | FormatType::Helix
-                | FormatType::Viper
                 | FormatType::Nova
                 | FormatType::Swift
                 | FormatType::Raptor
@@ -392,7 +390,6 @@ mod tests {
     fn test_is_internal_format() {
         assert!(FormatRegistry::is_internal_format(FormatType::Sst));
         assert!(FormatRegistry::is_internal_format(FormatType::Helix));
-        assert!(FormatRegistry::is_internal_format(FormatType::Viper));
         assert!(!FormatRegistry::is_internal_format(FormatType::DeltaLake));
         assert!(!FormatRegistry::is_internal_format(FormatType::Iceberg));
     }

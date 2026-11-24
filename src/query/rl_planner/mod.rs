@@ -45,7 +45,7 @@
 //! - **Search Modes**: Exact, Approximate, Adaptive
 //! - **Quantization**: Binary, INT8, PQ4, PQ8, FP32 (Progressive pipelines)
 //! - **Block Pruning**: Off, Sqrt, Ratio-based
-//! - **Storage Engines**: SST, HELIX, VIPER, SWIFT, NOVA, RAPTOR
+//! - **Storage Engines**: SST, HELIX, SWIFT, NOVA, RAPTOR
 //!
 //! ## Usage
 //!

@@ -50,7 +50,6 @@ mod writer;
 pub use capabilities::{
     CapabilityFactory, CompactionHeuristics, EngineBundle, EngineCapabilities, FlushThresholds,
     HelixCapabilities, NovaCapabilities, RaptorCapabilities, SstCapabilities, SwiftCapabilities,
-    ViperCapabilities,
 };
 pub use compactor::StorageCompactor;
 pub use extractor::{

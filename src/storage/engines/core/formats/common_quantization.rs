@@ -1,7 +1,7 @@
 //! Common Quantized Data Structure for All Storage Engines
 //!
 //! This module provides a unified quantized data structure that works across
-//! all storage engines (ProximaBlock-based: SST/SWIFT/HELIX and Parquet-based: VIPER/NOVA).
+//! all storage engines (ProximaBlock-based: SST/SWIFT/HELIX and Parquet-based: NOVA).
 //!
 //! The design ensures:
 //! - File-level quantization for optimal performance
@@ -254,37 +254,6 @@ pub mod conversion {
             StorageQuantizationFormat::ProductFormat(_) => true, // PQ compatible with everything
         }
     }
-
-    /// Get the recommended compression aggressiveness for a given storage format
-    ///
-    /// This maps storage formats to compression aggressiveness levels for VIPER engine.
-    ///
-    /// ## Mapping
-    ///
-    /// - `BinaryFormat` → `High` (maximum compression)
-    /// - `ScalarFormat(Int4)` → `High`
-    /// - `ScalarFormat(Int8/UInt8)` → `Medium`
-    /// - `ProductFormat(*)` → `Low` (lower compression, higher accuracy)
-    pub fn recommended_aggressiveness(
-        storage_format: &StorageQuantizationFormat,
-    ) -> crate::storage::engines::viper::types::QuantizationAggressiveness {
-        match storage_format {
-            StorageQuantizationFormat::BinaryFormat => {
-                crate::storage::engines::viper::types::QuantizationAggressiveness::High
-            }
-            StorageQuantizationFormat::ScalarFormat(bits) => match bits {
-                ScalarQuantizationBits::Int4 => {
-                    crate::storage::engines::viper::types::QuantizationAggressiveness::High
-                }
-                ScalarQuantizationBits::Int8 | ScalarQuantizationBits::UInt8 => {
-                    crate::storage::engines::viper::types::QuantizationAggressiveness::Medium
-                }
-            },
-            StorageQuantizationFormat::ProductFormat(_) => {
-                crate::storage::engines::viper::types::QuantizationAggressiveness::Low
-            }
-        }
-    }
 }
 
 // Re-export conversion module for convenience
@@ -414,7 +383,7 @@ pub enum EngineQuantizationConfig {
         /// Block size for quantized data
         quantized_block_size_kb: usize,
     },
-    /// Parquet configuration (VIPER, NOVA)
+    /// Parquet configuration (NOVA)
     Parquet {
         /// Separate columns for each quantization level
         separate_columns: bool,
@@ -792,7 +761,7 @@ impl EngineQuantizationConfig {
         }
     }
 
-    /// Create Parquet configuration for VIPER/NOVA
+    /// Create Parquet configuration for NOVA
     pub fn parquet_separate_columns() -> Self {
         Self::Parquet {
             separate_columns: true,
@@ -1045,39 +1014,6 @@ mod tests {
         assert!(is_compatible(ApiQuantizationLevel::Int4, &pq8_format));
         assert!(is_compatible(ApiQuantizationLevel::Int8, &pq8_format));
         assert!(is_compatible(ApiQuantizationLevel::FP32, &pq8_format));
-    }
-
-    #[test]
-    fn test_recommended_aggressiveness_binary() {
-        let binary_format = StorageQuantizationFormat::BinaryFormat;
-        let aggressiveness = recommended_aggressiveness(&binary_format);
-
-        assert_eq!(
-            aggressiveness,
-            crate::storage::engines::viper::types::QuantizationAggressiveness::High
-        );
-    }
-
-    #[test]
-    fn test_recommended_aggressiveness_scalar_int8() {
-        let int8_format = StorageQuantizationFormat::ScalarFormat(ScalarQuantizationBits::Int8);
-        let aggressiveness = recommended_aggressiveness(&int8_format);
-
-        assert_eq!(
-            aggressiveness,
-            crate::storage::engines::viper::types::QuantizationAggressiveness::Medium
-        );
-    }
-
-    #[test]
-    fn test_recommended_aggressiveness_product_pq8() {
-        let pq8_format = StorageQuantizationFormat::ProductFormat(ProductQuantizationBits::PQ8);
-        let aggressiveness = recommended_aggressiveness(&pq8_format);
-
-        assert_eq!(
-            aggressiveness,
-            crate::storage::engines::viper::types::QuantizationAggressiveness::Low
-        );
     }
 
     #[test]

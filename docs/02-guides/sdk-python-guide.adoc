@@ -125,7 +125,7 @@ creates that omit the engine also get SST (TD-ENGSEL-1); HELIX is an explicit op
 | `storage_engine="nova"`
 |===
 
-VIPER is deprecated (new VIPER collections are rejected), and SWIFT/RAPTOR are experimental
+VIPER was removed (ADR-093 stage 3), and SWIFT/RAPTOR are experimental
 engines a stock server rejects. For analytical SQL, use a relational table over pgwire and
 `ALTER TABLE … MATERIALIZE` it.
 
@@ -355,7 +355,7 @@ results = semantic_search_with_graph(
 
 A client-side heuristic that suggests an engine for a workload. It runs locally and does not
 measure your data; treat it as a starting point and measure recall before committing. It can
-name an engine the server rejects (VIPER is deprecated; SWIFT and RAPTOR are experimental), so
+name an engine the server rejects (VIPER was removed; SWIFT and RAPTOR are experimental), so
 check the suggestion against the
 link:../05-concepts/storage-engines.adoc[engine tiers].
 

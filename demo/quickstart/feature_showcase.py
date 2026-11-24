@@ -6,7 +6,7 @@ Now uses pre-generated datasets for consistent and fast demos
 
 Features Demonstrated:
 🚀 Performance: High-speed batch insertion and search
-🏗️ Storage Engines: SST (row-based) vs VIPER (columnar) comparison  
+🏗️ Storage Engines: SST (row-based) vs NOVA (columnar) comparison  
 🔍 Search Methods: Vector similarity, SQL queries, metadata filtering
 📊 Distance Metrics: 13 supported metrics with hardware acceleration
 ⚡ Hardware Acceleration: GPU/SIMD auto-detection and optimization
@@ -17,7 +17,7 @@ Features Demonstrated:
 📈 Optimization: Caching, indexing, query optimization
 
 Usage:
-    python feature_showcase_with_pregenerated.py [--quick] [--protocol rest|grpc] [--engine sst|viper]
+    python feature_showcase_with_pregenerated.py [--quick] [--protocol rest|grpc] [--engine sst|nova]
 """
 
 import sys
@@ -48,7 +48,7 @@ PRE_DIR = Path("pre")
 class ProximaDBFeatureShowcase:
     """Comprehensive ProximaDB feature demonstration using pre-generated data"""
     
-    def __init__(self, protocol: str = "grpc", engine: str = "viper", quick_mode: bool = False):
+    def __init__(self, protocol: str = "grpc", engine: str = "nova", quick_mode: bool = False):
         self.logger = DemoLogger("feature_showcase")
         self.protocol = protocol
         self.engine = engine
@@ -97,14 +97,14 @@ class ProximaDBFeatureShowcase:
     
     def demo_storage_engines(self):
         """Demonstrate storage engine capabilities using pre-generated data"""
-        self.logger.section("🏗️ Storage Engine Comparison: SST vs VIPER")
+        self.logger.section("🏗️ Storage Engine Comparison: SST vs NOVA")
         
         # Use e-commerce data for this demo
         sample_data = self.get_sample_vectors("ecommerce", 200)
         
         engines = {
             "SST": StorageEngine.SST,
-            "VIPER": StorageEngine.VIPER
+            "NOVA": StorageEngine.NOVA
         }
         
         # Test selected engine or both
@@ -170,7 +170,7 @@ class ProximaDBFeatureShowcase:
             config = CollectionConfig(
                 name=collection_name,
                 dimension=self.dimension,
-                storage_engine=StorageEngine.VIPER,
+                storage_engine=StorageEngine.NOVA,
                 distance_metric=DistanceMetric.COSINE
             )
             self.client.create_collection(name=collection_name, config=config)
@@ -310,7 +310,7 @@ class ProximaDBFeatureShowcase:
                 config = CollectionConfig(
                     name=collection_name,
                     dimension=self.dimension,
-                    storage_engine=StorageEngine.VIPER,
+                    storage_engine=StorageEngine.NOVA,
                     distance_metric=DistanceMetric.COSINE
                 )
                 self.client.create_collection(name=collection_name, config=config)
@@ -381,7 +381,7 @@ class ProximaDBFeatureShowcase:
                 config = CollectionConfig(
                     name=collection_name,
                     dimension=self.dimension,
-                    storage_engine=StorageEngine.VIPER,
+                    storage_engine=StorageEngine.NOVA,
                     distance_metric=DistanceMetric.COSINE
                 )
                 client.create_collection(name=collection_name, config=config)
@@ -477,8 +477,8 @@ def main():
     parser.add_argument("--quick", action="store_true", help="Run in quick mode with fewer examples")
     parser.add_argument("--protocol", choices=["rest", "grpc"], default="grpc", 
                       help="Protocol to use (default: grpc)")
-    parser.add_argument("--engine", choices=["sst", "viper", "both"], default="viper",
-                      help="Storage engine to test (default: viper)")
+    parser.add_argument("--engine", choices=["sst", "nova", "both"], default="nova",
+                      help="Storage engine to test (default: nova)")
     
     args = parser.parse_args()
     

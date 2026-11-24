@@ -149,12 +149,12 @@ graph LR
 
     subgraph READ["Read-Heavy"]
         HELIX["HELIX<br/>Spatial locality<br/>Hilbert curves"]
-        VIPER["VIPER<br/>Analytics<br/>Columnar"]
+        NOVA["NOVA<br/>Analytics<br/>Columnar"]
     end
 
     style SST fill:#ffd966,stroke:#cc9900,stroke-width:3px
     style HELIX fill:#93c47d,stroke:#5a8047
-    style VIPER fill:#e6f3ff,stroke:#4a90e2
+    style NOVA fill:#e6f3ff,stroke:#4a90e2
     style NOVA fill:#fff3e6,stroke:#f4a261
     style SWIFT fill:#e6ffe6,stroke:#93c47d
     style RAPTOR fill:#ffe6f3,stroke:#e066a0
@@ -166,7 +166,6 @@ graph LR
 
 | **SST** | Fast | Medium | Real-time writes, ACID
 | **HELIX** | Medium | Fast | Spatial/clustered data
-| **VIPER** | Slow | Fast | Batch analytics
 | **NOVA** | Medium | Medium | Mixed workloads
 | **SWIFT** | Fast | Fast | Low-latency, small data
 | **RAPTOR** | Medium | Adaptive | Unknown patterns
@@ -201,7 +200,7 @@ graph LR
 | Scenario | Better Choice | Why
 
 | Pure analytics, batch queries
-| **VIPER**
+| **NOVA**
 | Pure columnar + predicate pushdown
 
 | Spatial clustering queries
@@ -491,5 +490,4 @@ RUST_LOG=proximadb::storage::engines::impls::sst::flush=debug
 **See Also**:
 
 * link:helix-engine-deep-dive.adoc[HELIX Engine] - Spatial locality optimization
-* link:viper-engine-deep-dive.adoc[VIPER Engine] - Pure columnar analytics
 * link:../../05-concepts/quantization.md[Quantization Guide] - Compression strategies

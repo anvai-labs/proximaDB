@@ -13,7 +13,7 @@ Test Coverage:
 Engines Tested:
 - SST: Write-optimized, real-time ingestion (~5ms P99)
 - HELIX: Locality-optimized with Hilbert curve (~13ms)
-- VIPER: Columnar Parquet for analytics (~90ms)
+- NOVA: Columnar Parquet for analytics
 - SWIFT: Ultra-low latency for small datasets (~5ms)
 - NOVA: Progressive columnar for mixed workloads (~30ms)
 - RAPTOR: Adaptive row-group for dynamic workloads (~10ms)
@@ -475,16 +475,16 @@ class TestHELIXEngine(BaseEngineTest):
 
 
 @pytest.mark.skipif(not PROXIMADB_AVAILABLE, reason="ProximaDB embedded not available")
-class TestVIPEREngine(BaseEngineTest):
-    """Tests for VIPER engine (columnar Parquet for analytics)."""
-    engine_name = "viper"
+class TestNOVAEngine(BaseEngineTest):
+    """Tests for the NOVA engine (columnar Parquet for analytics)."""
+    engine_name = "nova"
 
-    def test_viper_columnar_efficiency(self, db, large_sample_vectors):
-        """Test VIPER's columnar storage efficiency."""
-        collection_name = "test_viper_columnar"
+    def test_nova_columnar_efficiency(self, db, large_sample_vectors):
+        """Test NOVA's columnar storage efficiency."""
+        collection_name = "test_nova_columnar"
         self.create_collection(db, collection_name, large_sample_vectors["dimension"])
 
-        # Bulk insert (VIPER excels at this)
+        # Bulk insert (columnar engines excel at this)
         db.insert(
             collection_name,
             ids=large_sample_vectors["ids"],
@@ -814,7 +814,7 @@ class TestArrowEmbeddedIntegration:
         db.flush()
         db.close()
 
-    @pytest.mark.parametrize("engine", ["sst", "helix", "viper", "swift", "nova", "raptor"])
+    @pytest.mark.parametrize("engine", ["sst", "helix", "nova", "swift", "nova", "raptor"])
     def test_arrow_to_embedded_roundtrip(self, db, sample_vectors, engine):
         """Test Arrow -> Python -> Embedded DB roundtrip for each engine."""
         collection_name = f"arrow_integration_{engine}"
@@ -850,7 +850,7 @@ class TestArrowEmbeddedIntegration:
 
     def test_all_engines_comparison(self, db, large_sample_vectors):
         """Compare all engines with Arrow-formatted data."""
-        engines = ["sst", "helix", "viper", "swift", "nova", "raptor"]
+        engines = ["sst", "helix", "nova", "swift", "nova", "raptor"]
         dimension = large_sample_vectors["dimension"]
         num_vectors = 500  # Use subset for speed
 

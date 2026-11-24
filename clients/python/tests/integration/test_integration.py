@@ -29,7 +29,7 @@ class TestComprehensiveIntegration:
             name=self.collection_name,
             dimension=384,
             distance_metric="cosine",
-            storage_engine="viper",
+            storage_engine="nova",
             indexing_algorithm="hnsw",
         )
 

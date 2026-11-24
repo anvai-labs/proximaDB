@@ -350,7 +350,7 @@ class EngineSelector:
 
         for engine, profile in self.ENGINE_PROFILES.items():
             # TD-SDKENG-1: never RECOMMEND an engine the server rejects or
-            # gates — VIPER is deprecated (ADR-093), SWIFT/RAPTOR are
+            # gates — VIPER was removed (ADR-093), SWIFT/RAPTOR are
             # experimental. Profiles stay for scoring history.
             if engine in ("viper", "swift", "raptor"):
                 continue
@@ -539,9 +539,9 @@ class EngineSelector:
 
     def _engine_selectable(self, engine: str) -> bool:
         # TD-SDKENG-1: never hand back an engine the server would reject —
-        # VIPER is deprecated (ADR-093), SWIFT/RAPTOR experimental, and
-        # MMAP/HYBRID map to VIPER on the gRPC path and are absent from the
-        # v2 REST engine options (round-3 review).
+        # VIPER was removed (ADR-093), SWIFT/RAPTOR experimental, and
+        # MMAP/HYBRID are absent from the v2 REST engine options
+        # (round-3 review).
         return engine in ("sst", "nova", "helix")
 
     def _get_engine_recommendation(
@@ -554,7 +554,7 @@ class EngineSelector:
         if not profile:
             return None
         # TD-SDKENG-1: no recommendation for engines the server rejects or
-        # gates (VIPER deprecated, SWIFT/RAPTOR experimental).
+        # gates (VIPER removed, SWIFT/RAPTOR experimental).
         if not self._engine_selectable(engine):
             return None
 

@@ -180,10 +180,6 @@ impl CompactionManager {
                 self.compact_sst_levels(collection_id, start_level, end_level)
                     .await?
             }
-            StorageEngineType::Viper => {
-                self.compact_viper_parquet(collection_id, start_level, end_level)
-                    .await?
-            }
             StorageEngineType::Helix => {
                 self.compact_helix_segments(collection_id, start_level, end_level)
                     .await?
@@ -277,7 +273,6 @@ impl CompactionManager {
         // Execute engine-specific major compaction
         let result = match engine_type {
             StorageEngineType::Sst => self.compact_sst_full_collection(collection_id).await?,
-            StorageEngineType::Viper => self.compact_viper_full_collection(collection_id).await?,
             StorageEngineType::Helix => self.compact_helix_full_collection(collection_id).await?,
             _ => {
                 return Err(anyhow::anyhow!(
@@ -389,33 +384,6 @@ impl CompactionManager {
         })
     }
 
-    async fn compact_viper_parquet(
-        &self,
-        collection_id: &str,
-        start_level: u32,
-        end_level: u32,
-    ) -> Result<CompactionResult> {
-        // Deferred: Implement VIPER Parquet compaction
-        // 1. Identify small Parquet files in level range
-        // 2. Merge files with optimal row group sizes
-        // 3. Rewrite with updated statistics and column pruning
-        // 4. Update columnar indices and zone maps
-
-        debug!(
-            "Compacting VIPER Parquet levels {}-{} for collection: {}",
-            start_level, end_level, collection_id
-        );
-
-        Ok(CompactionResult {
-            collection_id: collection_id.to_string(),
-            files_compacted: vec![format!("level_{}_{}.parquet", start_level, end_level)],
-            files_created: vec![format!("compacted_{}_{}.parquet", start_level, end_level)],
-            bytes_freed: 2048 * 1024, // Placeholder
-            duration: Duration::from_secs(45),
-            should_trigger_requantization: true, // VIPER often benefits from re-quantization
-        })
-    }
-
     async fn compact_helix_segments(
         &self,
         collection_id: &str,
@@ -454,20 +422,6 @@ impl CompactionManager {
             bytes_freed: 5120 * 1024,
             duration: Duration::from_secs(120),
             should_trigger_requantization: false,
-        })
-    }
-
-    async fn compact_viper_full_collection(&self, collection_id: &str) -> Result<CompactionResult> {
-        // Deferred: Implement full VIPER collection compaction
-        debug!("Full VIPER compaction for collection: {}", collection_id);
-
-        Ok(CompactionResult {
-            collection_id: collection_id.to_string(),
-            files_compacted: vec!["all_levels.parquet".to_string()],
-            files_created: vec!["compacted_full.parquet".to_string()],
-            bytes_freed: 7168 * 1024,
-            duration: Duration::from_secs(180),
-            should_trigger_requantization: true,
         })
     }
 

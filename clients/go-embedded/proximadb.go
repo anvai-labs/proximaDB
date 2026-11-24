@@ -85,7 +85,7 @@ type Config struct {
 	MetadataDir string
 	// CacheSizeMB is the cache size in megabytes (default: 512)
 	CacheSizeMB int
-	// DefaultEngine is the default storage engine ("sst", "viper", "nova", etc.)
+	// DefaultEngine is the default storage engine ("sst", "nova", "helix", etc.)
 	DefaultEngine string
 }
 

@@ -108,7 +108,7 @@ def test_vector_wal_recovery():
         name=collection_name,
         dimension=128,
         distance_metric=DistanceMetric.COSINE,
-        storage_engine=StorageEngine.VIPER,
+        storage_engine=StorageEngine.NOVA,
         description="Vector WAL recovery test collection"
     )
     

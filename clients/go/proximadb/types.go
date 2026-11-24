@@ -50,7 +50,9 @@ const (
 	EngineSst StorageEngine = "sst"
 	// EngineHelix is the locality-optimized Hilbert curve engine.
 	EngineHelix StorageEngine = "helix"
-	// EngineViper is the columnar Parquet engine for analytics.
+	// EngineViper is a REMOVED engine (ADR-093 stage 3): retained as a wire
+	// value only — the server rejects new selections; use EngineNova for
+	// columnar analytics.
 	EngineViper StorageEngine = "viper"
 	// EngineSwift is the ultra-low latency engine for small collections.
 	EngineSwift StorageEngine = "swift"

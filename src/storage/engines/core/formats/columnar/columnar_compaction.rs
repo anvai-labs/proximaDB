@@ -1,4 +1,4 @@
-// Unified Parquet Compaction for Columnar Engines (VIPER, NOVA, etc.)
+// Unified Parquet Compaction for Columnar Engines (NOVA, etc.)
 //
 // Works directly with Arrow RecordBatches for efficient columnar compaction
 // without unnecessary conversions to/from ProximaRecord

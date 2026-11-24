@@ -28,7 +28,7 @@
 //! Graph engines support three embedding storage modes:
 //!
 //! - **None** (DEFAULT): No embeddings stored - pure graph, best performance
-//! - **Cold**: Embeddings in vector engine (SST/HELIX/VIPER) - SKS with large graphs
+//! - **Cold**: Embeddings in vector engine (SST/HELIX) - SKS with large graphs
 //! - **Memory**: Embeddings cached in memory - SKS-heavy workloads, consumer override
 //!
 //! CSR (Compressed Sparse Row) format NEVER contains embedding data and is not
@@ -63,7 +63,7 @@ pub enum EmbeddingMode {
     #[default]
     None,
 
-    /// Embeddings stored in cold tier vector engine (SST/HELIX/VIPER)
+    /// Embeddings stored in cold tier vector engine (SST/HELIX)
     ///
     /// Use this for:
     /// - SKS (Semantic Knowledge Search) with large graphs

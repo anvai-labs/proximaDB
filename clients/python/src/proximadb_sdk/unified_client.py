@@ -1468,7 +1468,7 @@ class ProximaDBClient:
             storage_engine=(
                 self._proto_to_pydantic_storage_engine(proto_config.storage_engine)
                 if hasattr(proto_config, "storage_engine")
-                else StorageEngine.VIPER
+                else StorageEngine.SST
             ),
             storage_config=None,  # Simplified for now - proto storage_config needs conversion
             quantization=None,  # Simplified for now - proto quantization needs conversion

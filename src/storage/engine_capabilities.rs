@@ -101,17 +101,6 @@ impl EngineCapabilities {
                 CompressionAlgorithm::CompressionBrotli
             }
 
-            // VIPER engine recommendations
-            (StorageEngine::Viper, CompressionPriority::Speed) => {
-                CompressionAlgorithm::CompressionSnappy
-            }
-            (StorageEngine::Viper, CompressionPriority::Balanced) => {
-                CompressionAlgorithm::CompressionZstd
-            }
-            (StorageEngine::Viper, CompressionPriority::Ratio) => {
-                CompressionAlgorithm::CompressionBrotli
-            }
-
             // HELIX and SWIFT engine recommendations (SST-based, use LZ4 for speed)
             (StorageEngine::Helix, CompressionPriority::Speed)
             | (StorageEngine::Swift, CompressionPriority::Speed) => {
@@ -214,25 +203,11 @@ impl EngineCapabilities {
         }
     }
 
-    /// Check if an engine supports a specific storage feature
-    pub fn is_feature_supported(engine: StorageEngine, feature: StorageFeature) -> bool {
-        match feature {
-            StorageFeature::Quantization => matches!(engine, StorageEngine::Viper),
-            StorageFeature::FilterPushdown => matches!(engine, StorageEngine::Viper),
-            StorageFeature::ColumnProjection => matches!(engine, StorageEngine::Viper),
-            StorageFeature::BloomFilter => matches!(engine, StorageEngine::Sst),
-            StorageFeature::AtomicFlush => true, // All engines support atomic flush
-            StorageFeature::Compaction => true,  // All engines support compaction
-            StorageFeature::TieredStorage => matches!(engine, StorageEngine::Sst),
-            StorageFeature::CacheOptimized => matches!(engine, StorageEngine::Sst),
-        }
-    }
-
     /// Get the engine name as a string
     pub fn get_engine_name(engine: StorageEngine) -> &'static str {
         match engine {
             StorageEngine::Sst => "SST",
-            StorageEngine::Viper => "VIPER",
+            StorageEngine::Viper => "VIPER (removed, ADR-093)",
             StorageEngine::Helix => "HELIX",
             StorageEngine::Nova => "NOVA",
             StorageEngine::Swift => "SWIFT",
@@ -265,7 +240,6 @@ impl EngineCapabilities {
                 SearchIndexType::IVF,
                 SearchIndexType::HilbertCurve, // Specialized for HELIX
             ],
-            StorageEngine::Viper => vec![SearchIndexType::Flat, SearchIndexType::IVF],
             StorageEngine::Swift => vec![
                 SearchIndexType::Flat,
                 SearchIndexType::HNSW,
@@ -301,9 +275,6 @@ impl EngineCapabilities {
                 SearchQuantizationLevel::Binary,
                 SearchQuantizationLevel::PQ8,
             ],
-            StorageEngine::Viper => {
-                vec![SearchQuantizationLevel::FP32, SearchQuantizationLevel::INT8]
-            }
             StorageEngine::Swift => vec![
                 SearchQuantizationLevel::FP32,
                 SearchQuantizationLevel::INT8,
@@ -336,10 +307,6 @@ impl EngineCapabilities {
                 SearchPruningStrategy::HilbertRange,
                 SearchPruningStrategy::ZoneMap,
                 SearchPruningStrategy::BlockCentroid,
-            ],
-            StorageEngine::Viper => vec![
-                SearchPruningStrategy::None,
-                SearchPruningStrategy::RowGroupStats,
             ],
             StorageEngine::Swift => vec![
                 SearchPruningStrategy::None,
@@ -471,8 +438,6 @@ pub enum SearchPruningStrategy {
     AdaCurvePruning,
     /// Zone map pruning (NOVA)
     ZoneMap,
-    /// Row group statistics pruning (VIPER)
-    RowGroupStats,
     /// Column statistics pruning (NOVA)
     ColumnStats,
     /// Superblock signature pruning (SWIFT)
@@ -509,27 +474,6 @@ pub enum CompressionPriority {
     Ratio,
 }
 
-/// Storage features that may or may not be supported by engines
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StorageFeature {
-    /// Vector quantization support
-    Quantization,
-    /// Predicate pushdown for filtering
-    FilterPushdown,
-    /// Column projection for selective reads
-    ColumnProjection,
-    /// Bloom filter support
-    BloomFilter,
-    /// Atomic flush operations
-    AtomicFlush,
-    /// Background compaction
-    Compaction,
-    /// Tiered storage with hot/cold separation
-    TieredStorage,
-    /// Cache-optimized storage format
-    CacheOptimized,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -552,27 +496,6 @@ mod tests {
     }
 
     #[test]
-    fn test_viper_compression_support() {
-        // VIPER should support limited set
-        assert!(EngineCapabilities::is_compression_supported(
-            StorageEngine::Viper,
-            CompressionAlgorithm::CompressionZstd
-        ));
-        assert!(EngineCapabilities::is_compression_supported(
-            StorageEngine::Viper,
-            CompressionAlgorithm::CompressionSnappy
-        ));
-        assert!(!EngineCapabilities::is_compression_supported(
-            StorageEngine::Viper,
-            CompressionAlgorithm::CompressionBzip2
-        ));
-        assert!(!EngineCapabilities::is_compression_supported(
-            StorageEngine::Viper,
-            CompressionAlgorithm::CompressionLzma
-        ));
-    }
-
-    #[test]
     fn test_compression_recommendations() {
         // Test speed optimized recommendations
         assert_eq!(
@@ -581,14 +504,6 @@ mod tests {
                 CompressionPriority::Speed
             ),
             CompressionAlgorithm::CompressionLz4
-        );
-
-        assert_eq!(
-            EngineCapabilities::get_recommended_compression(
-                StorageEngine::Viper,
-                CompressionPriority::Speed
-            ),
-            CompressionAlgorithm::CompressionSnappy
         );
 
         // Test ratio optimized recommendations
@@ -627,26 +542,5 @@ mod tests {
             ),
             11
         );
-    }
-
-    #[test]
-    fn test_feature_support() {
-        // VIPER should support quantization
-        assert!(EngineCapabilities::is_feature_supported(
-            StorageEngine::Viper,
-            StorageFeature::Quantization
-        ));
-
-        // SST should support bloom filters
-        assert!(EngineCapabilities::is_feature_supported(
-            StorageEngine::Sst,
-            StorageFeature::BloomFilter
-        ));
-
-        // SST should not support quantization
-        assert!(!EngineCapabilities::is_feature_supported(
-            StorageEngine::Sst,
-            StorageFeature::Quantization
-        ));
     }
 }

@@ -907,7 +907,7 @@ impl WALBehaviorWrapper {
     /// Get unflushed batches for collection (MODERN - for direct storage engine flush)
     pub async fn get_unflushed_batches(&self, collection_id: &str) -> Result<Vec<WALVectorBatch>> {
         // Return deserialized vector batches directly to storage engines
-        // Storage engines handle their own serialization (SST for LSM, Parquet for VIPER)
+        // Storage engines handle their own serialization (SST for LSM, NOVA for Parquet)
         // This avoids double serialization/deserialization overhead
 
         let coordinator = self.batch_coordinator.read().await;

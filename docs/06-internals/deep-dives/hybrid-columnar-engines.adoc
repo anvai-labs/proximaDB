@@ -54,7 +54,7 @@ flowchart TD
     subgraph ENGINES["🗄️ Specialized Storage Engines"]
         direction TB
         K["📝 SST Engine<br/><small>Fast writes & real-time</small>"]
-        L["📊 VIPER Engine<br/><small>Columnar analytics</small>"]
+        L["📊 NOVA Engine<br/><small>Columnar analytics</small>"]
         M["⚖️ NOVA Engine<br/><small>Balanced performance</small>"]
         N["⚡ SWIFT Engine<br/><small>Ultra-low latency</small>"]
         O["🌍 HELIX Engine<br/><small>Spatial optimization</small>"]
@@ -642,7 +642,7 @@ impl EngineSelector {
             WorkloadPattern::RealTimeQueries => Ok(EngineType::Swift),   // Hierarchical ProximaBlocks
             WorkloadPattern::WriteHeavy => Ok(EngineType::Sst),          // Modular ProximaBlocks
             WorkloadPattern::DynamicWorkload => Ok(EngineType::Raptor),  // Matrix Trinity Architecture
-            WorkloadPattern::AnalyticalQueries => Ok(EngineType::Viper), // Pure Columnar
+            WorkloadPattern::AnalyticalQueries => Ok(EngineType::Nova), // Pure Columnar
             WorkloadPattern::ProgressiveSearch => Ok(EngineType::Nova),  // Progressive Columnar
             WorkloadPattern::SpatialQueries => Ok(EngineType::Helix),   // Hilbert Columnar
         }
@@ -945,7 +945,7 @@ Instead of making you choose, we automatically select the optimal storage engine
 |50% faster queries, 60% storage savings
 
 |**Content Platform**
-|SST engine for real-time user feeds, VIPER for analytics
+|SST engine for real-time user feeds, NOVA for analytics
 |Sub-millisecond user experience, instant insights
 
 |**Computer Vision Company**

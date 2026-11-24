@@ -1039,7 +1039,7 @@ def benchmark_vector_store(
 
     # Define engine configurations
     # Exact mode: Supported by all engines
-    engines_exact = ["sst", "helix", "viper", "nova", "swift", "raptor"]
+    engines_exact = ["sst", "helix", "nova", "swift", "raptor"]
     # Approximate (sqrt) mode: Supported by specific engines
     engines_approx = ["sst", "helix", "swift"]
 
@@ -2062,7 +2062,7 @@ def render_engine_comparison_table(results: list[BenchmarkResult]) -> None:
             table.add_column("Search (ms)", justify="right")
             table.add_column("p95 Search", justify="right")
 
-            engines = ["sst", "helix", "viper", "nova", "swift", "raptor"]
+            engines = ["sst", "helix", "nova", "swift", "raptor"]
             for engine in engines:
                 insert_result = next(
                     (
@@ -2225,7 +2225,7 @@ def write_consolidated_report(results: list[BenchmarkResult]) -> None:
     )
     lines.append("| --- | ---: | ---: | ---: | ---: |")
 
-    engines = ["sst", "helix", "viper", "nova", "swift", "raptor"]
+    engines = ["sst", "helix", "nova", "swift", "raptor"]
     for engine in engines:
         insert_result = next(
             (
@@ -2299,7 +2299,7 @@ def write_consolidated_report(results: list[BenchmarkResult]) -> None:
 
     # Collect QPS values for search operations
     qps_values = []
-    for engine in ["sst", "helix", "viper", "nova", "swift", "raptor"]:
+    for engine in ["sst", "helix", "nova", "swift", "raptor"]:
         search_result = next(
             (
                 r
@@ -2329,7 +2329,7 @@ def write_consolidated_report(results: list[BenchmarkResult]) -> None:
 
     # Collect ingestion throughput values
     ingest_values = []
-    for engine in ["sst", "helix", "viper", "nova", "swift", "raptor"]:
+    for engine in ["sst", "helix", "nova", "swift", "raptor"]:
         insert_result = next(
             (
                 r
@@ -2350,7 +2350,7 @@ def write_consolidated_report(results: list[BenchmarkResult]) -> None:
 
     # Recall Chart (if recall data available)
     recall_values = []
-    for engine in ["sst", "helix", "viper", "nova", "swift", "raptor"]:
+    for engine in ["sst", "helix", "nova", "swift", "raptor"]:
         search_result = next(
             (
                 r
@@ -2586,7 +2586,6 @@ def benchmark_sift_1m(
         "sst_approx",
         "sst",
         "helix",
-        "viper",
         "nova",
         "swift",
         "raptor",
@@ -2603,7 +2602,7 @@ def benchmark_sift_1m(
     run_sst_approx = "sst_approx" in selected_engines
     run_raptor = "raptor" in selected_engines
     proximadb_engines_to_run = [
-        e for e in ["sst", "helix", "viper", "nova", "swift"] if e in selected_engines
+        e for e in ["sst", "helix", "nova", "swift"] if e in selected_engines
     ]
 
     # =========================================================================
@@ -3288,7 +3287,7 @@ def benchmark_sift_1m(
 
     # Define engine configurations
     # Exact mode: Supported by all engines
-    engines_exact = ["sst", "helix", "viper", "nova", "swift", "raptor"]
+    engines_exact = ["sst", "helix", "nova", "swift", "raptor"]
     # Approximate (sqrt) mode: Supported by specific engines
     engines_approx = ["sst", "helix", "swift"]
 
@@ -4217,7 +4216,6 @@ def _print_sift_summary_table(results: list[BenchmarkResult]):
         "sst_approx",
         "sst",
         "helix",
-        "viper",
         "nova",
         "swift",
         "raptor",

@@ -104,7 +104,7 @@ def test_create_collection_collection_id_response(monkeypatch):
             "collection_id": "abc",
             "name": "products_x",
             "dimension": 128,
-            "engine": "viper",
+            "engine": "nova",
         },
     )
     cfg = CollectionConfig(name="products_x", dimension=128)
@@ -127,7 +127,7 @@ def test_create_collection_nested_collection_response(monkeypatch):
                     "name": "mycoll_x",
                     "dimension": 64,
                     "distance_metric": 2,  # euclidean
-                    "storage_engine": 1,  # viper
+                    "storage_engine": 2,  # sst
                 },
                 "created_at": 111,
                 "updated_at": 222,
@@ -138,13 +138,13 @@ def test_create_collection_nested_collection_response(monkeypatch):
     coll = c.create_collection("mycoll_x", cfg)
     assert coll.id == "id123"
     assert coll.config.distance_metric.value == "euclidean"
-    assert coll.config.storage_engine.value == "viper"
+    assert coll.config.storage_engine.value == "sst"
 
 
 def test_create_collection_builds_config_from_kwargs(monkeypatch):
     c = _make_client(
         monkeypatch,
-        resp_body={"collection_id": "z", "dimension": 32, "engine": "viper"},
+        resp_body={"collection_id": "z", "dimension": 32, "engine": "sst"},
     )
     coll = c.create_collection("kwargcoll", dimension=32)
     assert coll.id == "z"
@@ -153,7 +153,7 @@ def test_create_collection_builds_config_from_kwargs(monkeypatch):
 def test_create_collection_warns_on_too_many_filterable(monkeypatch):
     c = _make_client(
         monkeypatch,
-        resp_body={"collection_id": "w", "dimension": 8, "engine": "viper"},
+        resp_body={"collection_id": "w", "dimension": 8, "engine": "sst"},
     )
     cfg = CollectionConfig(
         name="warncoll_xx",

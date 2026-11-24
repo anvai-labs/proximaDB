@@ -146,7 +146,7 @@ pub enum DdlStatement {
         collection_name: String,
         /// Vector dimensionality for this collection.
         dimension: u32,
-        /// Optional storage engine override (e.g., "HELIX", "VIPER").
+        /// Optional storage engine override (e.g., "HELIX", "NOVA").
         engine: Option<String>,
         /// When `true`, silently succeeds if the collection already exists.
         if_not_exists: bool,

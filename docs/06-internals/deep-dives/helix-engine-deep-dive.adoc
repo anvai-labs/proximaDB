@@ -553,4 +553,3 @@ RUST_LOG=proximadb::storage::engines::impls::helix::compaction=debug
 
 * link:sst-engine-deep-dive.adoc[SST Engine] - Write-optimized alternative
 * link:swift-engine-deep-dive.adoc[SWIFT Engine] - Ultra-low latency for small datasets
-* link:viper-engine-deep-dive.adoc[VIPER Engine] - Pure columnar for analytics

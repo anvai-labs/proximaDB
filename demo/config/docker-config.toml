@@ -55,17 +55,6 @@ prefetch_threshold = 3  # Prefetch after 3 accesses
 ttl_seconds = 0  # No expiration for maximum performance
 invalidation_check_interval_seconds = 60
 
-[storage.viper_config]
-row_group_size = 100000  # Optimized for analytics workloads
-compression = "zstd"  # ZSTD for columnar data
-compression_enabled = true  # Enable compression by default  
-compression_level = 3  # Balanced speed/compression
-enable_statistics = true
-data_directory = "/data/viper_data"
-cache_size_mb = 512  # Increased for better columnar performance
-enable_quantization = true  # Two-stage search optimization
-quantization_type = "int8"  # INT8 quantization for memory efficiency
-
 [storage.filesystem_config]
 enable_write_strategy_cache = true
 temp_strategy = "SameDirectory"

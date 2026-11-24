@@ -1,3 +1,7 @@
+// ORPHANED TEST (not in any compile target — see TD-ORPHAN-1): references the
+// VIPER engine removed by ADR-093 stage 3 / TD-VIPER-1 S3. Unreachable code;
+// cleanup of the file itself belongs to the orphan-file program, not the
+// engine-removal PR.
 #![cfg(feature = "experimental-engines")] // RAPTOR needs the `experimental-engines` feature.
 //! Unified Quantization Cache Integration Tests
 //!

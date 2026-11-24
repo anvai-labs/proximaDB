@@ -80,7 +80,7 @@
 //! ## ❌ WHEN TO AVOID HELIX
 //!
 //! - **Random Access Patterns**: Use SST or SWIFT instead
-//! - **Heavy Write Workloads**: VIPER or SST handle writes better
+//! - **Heavy Write Workloads**: SST handles writes better
 //! - **Small Collections**: Overhead not justified for <10K vectors
 //! - **Frequent Schema Changes**: Static PCA model becomes outdated
 //!
@@ -256,7 +256,7 @@ pub struct SStableMetadata {
 ///
 /// ### Key Differentiators:
 /// - **vs SST**: Hilbert ordering vs no ordering, 10x better range queries
-/// - **vs VIPER**: Spatial locality vs pure columnar, better for clustering
+/// - Spatial locality focus, better for clustering workloads
 /// - **vs RAPTOR**: Space-filling curves vs graph, different access patterns
 ///
 /// ### Performance Characteristics:
@@ -582,7 +582,7 @@ impl HelixEngine {
             Arc::new(FilesystemFactory::create(filesystem_config).await?)
         };
 
-        // Create UnifiedCachingFilesystem with engine-aware serialization (like SST/VIPER/RAPTOR)
+        // Create UnifiedCachingFilesystem with engine-aware serialization (like SST/RAPTOR)
         // This provides metadata caching, disk caching, and prefetch optimization
         let data_dir_url = data_dir
             .to_str()

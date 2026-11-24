@@ -19,5 +19,5 @@
 pub use proximadb_storage_ports::{
     CapabilityFactory, CompactionHeuristics, EngineBundle, EngineCapabilities, FlushThresholds,
     HelixCapabilities, NovaCapabilities, RaptorCapabilities, ScanCapabilities, SstCapabilities,
-    SwiftCapabilities, TstCapabilities, ViperCapabilities,
+    SwiftCapabilities, TstCapabilities,
 };

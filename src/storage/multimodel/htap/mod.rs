@@ -1,6 +1,6 @@
 //! # HTAP (Hybrid Transactional/Analytical Processing) Module
 //!
-//! Provides async replication from OLTP (SST) to OLAP (VIPER) stores,
+//! Provides async replication from OLTP (SST) to OLAP stores,
 //! with intelligent workload-aware query routing.
 //!
 //! ## Architecture
@@ -11,7 +11,7 @@
 //! │  ┌─────────────────────────────────────────────────────────┐ │
 //! │  │              Replication Manager                         │ │
 //! │  │  - Change Data Capture (CDC) from SST                   │ │
-//! │  │  - Async batch replication to VIPER                     │ │
+//! │  │  - Async batch replication to the OLAP store            │ │
 //! │  │  - LSN tracking for consistency                         │ │
 //! │  └─────────────────────────────────────────────────────────┘ │
 //! │                                                               │

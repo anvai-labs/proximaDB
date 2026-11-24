@@ -34,7 +34,6 @@ test-seq = "test --all -- --nocapture"
 # Storage-specific test suites
 test-sst = "test unit_tests::storage -- --nocapture"
 test-atomic = "test unit_tests::storage::sst_atomic_operations_test -- --nocapture"
-test-viper = "test unit_tests::storage::viper -- --nocapture"
 test-batch = "test unit_tests::storage::write_buffer -- --nocapture"
 
 # Coverage testing

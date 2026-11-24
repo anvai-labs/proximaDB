@@ -757,7 +757,7 @@ impl StorageEngine {
         // - Batching and backpressure control
         //
         // Note: AXIS indexing still happens, just asynchronously during flush operations
-        // via FlushAxisUpdater.queue_flush_updates() in SST and VIPER engines.
+        // via FlushAxisUpdater.queue_flush_updates() in SST-family engines.
 
         tracing::debug!(
             "✅ Vector {} written to WAL for collection {} (AXIS indexing will happen async during flush)",

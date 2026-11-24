@@ -95,9 +95,7 @@ def test_server_capabilities_methods():
     assert models.ServerCapabilities.is_supported("quantization_type", "binary")
     assert models.ServerCapabilities.is_supported("unknown_type", "whatever")
     # fallbacks
-    assert (
-        models.ServerCapabilities.get_fallback_for("storage_engine", "mmap") == "viper"
-    )
+    assert models.ServerCapabilities.get_fallback_for("storage_engine", "mmap") == "sst"
     assert (
         models.ServerCapabilities.get_fallback_for("distance_metric", "cosine") is None
     )
@@ -191,7 +189,6 @@ def test_settings_models():
     models.FooterCacheSettings(enable=True, max_entries=100)
     models.HybridWriterSettings(enable=True, initial_mode="adaptive")
     models.SstEngineSettings(enable_bloom_filters=True, block_size_kb=512)
-    models.ViperEngineSettings(enable_columnar_compression=True)
     models.NovaEngineSettings(enable_real_time_mode=True)
     models.HnswConfig(m=32)
     models.IvfConfig(n_lists=200)
@@ -275,31 +272,6 @@ def test_collection_config_quantization_alias():
     cfg = models.CollectionConfig(name="collection1", dimension=8, quantization=qc)
     assert cfg.quantization is qc
     assert cfg.quantization_config is qc
-
-
-def test_collection_config_viper_compression_autoenable():
-    comp = models.CompressionConfig(quantization_type="int8")
-    cfg = models.CollectionConfig(
-        name="collection1",
-        dimension=8,
-        storage_engine=models.StorageEngine.VIPER,
-        compression=comp,
-    )
-    # quantization auto-enabled for VIPER
-    assert cfg.compression.enable_quantization is True
-
-
-def test_collection_config_viper_block_size_warns():
-    comp = models.CompressionConfig(block_size_kb=512)
-    with warnings.catch_warnings(record=True) as w:
-        warnings.simplefilter("always")
-        models.CollectionConfig(
-            name="collection1",
-            dimension=8,
-            storage_engine=models.StorageEngine.VIPER,
-            compression=comp,
-        )
-    assert any("block_size_kb" in str(x.message) for x in w)
 
 
 def test_collection_config_sst_quant_warns_and_default_block():
@@ -511,7 +483,6 @@ def test_storage_and_health_models():
         footer_cache=models.FooterCacheSettings(),
         hybrid_writer=models.HybridWriterSettings(),
         sst_settings=models.SstEngineSettings(),
-        viper_settings=models.ViperEngineSettings(),
         nova_settings=models.NovaEngineSettings(),
     )
     assert sc.persistent is True
@@ -802,10 +773,9 @@ def test_collection_builder_fluent():
         .hamming_distance()
         .jaccard_similarity()
         .distance_metric(models.DistanceMetric.COSINE)
-        .viper_storage()
         .sst_storage()
         .hybrid_storage()
-        .storage_engine(models.StorageEngine.VIPER)
+        .storage_engine(models.StorageEngine.NOVA)
         .hnsw_index()
         .ivf_index()
         .flat_index()

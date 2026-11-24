@@ -9,7 +9,7 @@
 //! │                     FORMAT ABSTRACTION LAYER                                 │
 //! │  ┌───────────────────────────────────────┐  ┌─────────────────────────────┐ │
 //! │  │         INTERNAL FORMATS              │  │    OPEN TABLE FORMATS       │ │
-//! │  │  SST, Helix, Viper, Nova, Swift,     │  │  Delta Lake, Iceberg, Hudi, │ │
+//! │  │  SST, Helix, Nova, Swift,            │  │  Delta Lake, Iceberg, Hudi, │ │
 //! │  │  Raptor, Orion                       │  │  LanceDB, DuckDB, Parquet   │ │
 //! │  └───────────────────────────────────────┘  └─────────────────────────────┘ │
 //! │                          │                              │                    │
@@ -167,12 +167,10 @@ pub use adapters::{
     NovaFormatAdapter,
     // Engine-specific type aliases
     SstFormatAdapter,
-    ViperFormatAdapter,
     create_helix_adapter,
     create_nova_adapter,
     // Factory functions
     create_sst_adapter,
-    create_viper_adapter,
 };
 // SWIFT adapters are `experimental-engines`-gated (TD-152 deprecation; same as RAPTOR).
 #[cfg(feature = "experimental-engines")]
@@ -194,7 +192,6 @@ mod tests {
         // Internal formats
         assert!(FormatRegistry::is_internal_format(FormatType::Sst));
         assert!(FormatRegistry::is_internal_format(FormatType::Helix));
-        assert!(FormatRegistry::is_internal_format(FormatType::Viper));
         assert!(FormatRegistry::is_internal_format(FormatType::Nova));
         assert!(FormatRegistry::is_internal_format(FormatType::Swift));
         assert!(FormatRegistry::is_internal_format(FormatType::Raptor));

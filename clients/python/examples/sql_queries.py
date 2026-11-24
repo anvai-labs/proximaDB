@@ -29,7 +29,7 @@ def main():
     config = CollectionConfig(
         name=collection_name,
         dimension=384,  # Common embedding dimension
-        storage_engine=StorageEngine.VIPER,
+        storage_engine=StorageEngine.NOVA,
     )
 
     try:
@@ -38,7 +38,7 @@ def main():
         pass
 
     collection = client.create_collection(
-        collection_name, dimension=384, storage_engine=StorageEngine.VIPER
+        collection_name, dimension=384, storage_engine=StorageEngine.NOVA
     )
     print(f"Created collection: {collection_name}")
 

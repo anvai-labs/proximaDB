@@ -47,7 +47,7 @@ export enum DistanceMetric {
 
 export enum StorageEngine {
   STORAGE_ENGINE_UNSPECIFIED = 0,
-  VIPER = 1,
+  VIPER = 1, // REMOVED (ADR-093) — wire value only
   SST = 2,
   MMAP = 3,
   HYBRID = 4,

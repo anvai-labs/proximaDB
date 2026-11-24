@@ -222,7 +222,7 @@ class FeatureTableDDL:
     event_time: str = "event_time"
     features_column: str = "features"
     embedding_dimension: int | None = None
-    storage_engine: str = "VIPER"
+    storage_engine: str = "SST"
     physical_layout: str = "columnar"
     catalog_namespace: str | None = None
 

@@ -50,7 +50,7 @@ async fn main() -> proximadb_sdk::Result<()> {
     client
         .create_collection(collection_name)
         .dimension(512) // Vector dimension
-        .engine(StorageEngine::Sst) // Storage engine (SST, HELIX, VIPER, etc.)
+        .engine(StorageEngine::Sst) // Storage engine (SST, HELIX, NOVA, etc.)
         .index(IndexType::Hnsw) // Index type (HNSW, IVF, LSH, Flat)
         .metric(DistanceMetric::Cosine) // Distance metric
         .execute()

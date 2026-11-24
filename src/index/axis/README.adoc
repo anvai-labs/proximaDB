@@ -53,7 +53,7 @@ graph TB
 
     subgraph STORAGE["Storage Integration"]
         O[SST Engine]
-        P[VIPER Engine]
+        P[NOVA Engine]
         Q[SWIFT Engine]
         R[HELIX Engine]
         S[NOVA Engine]
@@ -698,7 +698,7 @@ AXIS seamlessly integrates with all ProximaDB storage engines:
 |Real-time EventLog updates, WAL coordination
 |HNSW (dynamic updates)
 
-|**VIPER**
+|**NOVA**
 |Batch operations, columnar scans
 |IVF (large scale)
 

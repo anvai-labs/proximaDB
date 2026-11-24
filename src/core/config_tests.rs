@@ -75,7 +75,6 @@ mod tests {
             assignment_config: AssignmentConfig::default(),
             mmap_enabled: true,
             sst_config: Default::default(),
-            viper_config: Default::default(),
             wal_config: Default::default(),
             cache_size_mb: 2048,
             bloom_filter_config: Some(BloomFilterConfig {
@@ -116,7 +115,6 @@ mod tests {
                 },
             ],
             metadata_url: "file:///fast-ssd/metadata_info".to_string(),
-            viper_config: Default::default(),
             wal_config: Default::default(),
             ..Default::default()
         };
@@ -168,7 +166,6 @@ mod tests {
                 },
             ],
             metadata_url: "file:///fast-ssd/metadata_info".to_string(),
-            viper_config: Default::default(),
             wal_config: Default::default(),
             ..Default::default()
         };
@@ -206,7 +203,6 @@ mod tests {
                 strategy: "hash".to_string(),
                 affinity: true,
             },
-            viper_config: Default::default(),
             wal_config: Default::default(),
             ..Default::default()
         };

@@ -133,7 +133,7 @@ impl MetadataStore {
 }
 
 // ========================================================================================
-// Parquet Metadata Cache Operations - Extending MetadataStore for VIPER Engine Integration
+// Parquet Metadata Cache Operations - Extending MetadataStore for the columnar engines
 // ========================================================================================
 
 /// Parquet schema mapping for efficient column access

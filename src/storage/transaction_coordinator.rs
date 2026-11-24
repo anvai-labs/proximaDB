@@ -6,7 +6,7 @@
 //! Unified Atomic Operations Package for ProximaDB Storage Components
 //!
 //! This module provides common atomic operations infrastructure that can be used
-//! across all storage components: VIPER, WAL, and the system catalog.
+//! across all storage components: the storage engines, WAL, and the system catalog.
 //!
 //! ## Key Features:
 //! - **Staging Pattern**: Write to `__flush/`, `__temp/`, or custom staging directories
@@ -1324,62 +1324,6 @@ pub fn generate_transaction_id(prefix: &str) -> String {
     format!("{}_{}_{}", prefix, timestamp, counter)
 }
 
-/// Convenience wrapper for VIPER-specific atomic operations
-pub struct ViperTransactionalOperations {
-    coordinator: Arc<UnifiedTransactionCoordinator>,
-}
-
-impl ViperTransactionalOperations {
-    pub fn new(coordinator: Arc<UnifiedTransactionCoordinator>) -> Self {
-        Self { coordinator }
-    }
-
-    /// Begin flush operation for a collection
-    pub async fn begin_flush_operation(
-        &self,
-        collection_id: &str,
-        storage_url: &str,
-    ) -> Result<TransactionalOperationMetadata> {
-        let config = StagingConfig {
-            base_url: storage_url.to_string(),
-            collection_id: Some(collection_id.to_string()),
-            operation_type: TransactionStageType::Flush,
-            auto_cleanup: true,
-            skip_uuid_subdir: true, // Avoid creating subdirectories that get left behind
-            ..Default::default()
-        };
-
-        self.coordinator.begin_atomic_operation(&config).await
-    }
-
-    /// Write Parquet file to flush staging
-    pub async fn write_parquet_to_staging(
-        &self,
-        operation_id: &OperationId,
-        parquet_filename: &str,
-        parquet_data: &[u8],
-    ) -> Result<()> {
-        let relative_path = format!("vectors/{}", parquet_filename);
-        self.coordinator
-            .write_to_staging(operation_id, &relative_path, parquet_data)
-            .await
-    }
-
-    /// Finalize flush operation
-    pub async fn finalize_flush(&self, operation_id: &OperationId) -> Result<()> {
-        self.coordinator
-            .finalize_atomic_operation(operation_id)
-            .await
-    }
-
-    /// Abort flush operation
-    pub async fn abort_flush(&self, operation_id: &OperationId, reason: &str) -> Result<()> {
-        self.coordinator
-            .abort_atomic_operation(operation_id, reason)
-            .await
-    }
-}
-
 /// Convenience wrapper for Write Buffer-specific atomic operations
 pub struct WalTransactionalOperations {
     coordinator: Arc<UnifiedTransactionCoordinator>,
@@ -1542,29 +1486,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_viper_atomic_operations() {
+    async fn test_flush_stage_atomic_operations() {
+        // Generic flush-staging coverage (previously reached through the
+        // VIPER wrapper, removed with the engine per ADR-093).
         let (coordinator, temp_dir) = create_test_coordinator().await;
         let temp_path = temp_dir.path().to_string_lossy().to_string();
         let coordinator = Arc::new(coordinator);
 
-        let viper_ops = ViperTransactionalOperations::new(coordinator);
+        let config = StagingConfig {
+            base_url: format!("file://{}", temp_path),
+            collection_id: Some("test_collection".to_string()),
+            operation_type: TransactionStageType::Flush,
+            auto_cleanup: true,
+            skip_uuid_subdir: true,
+            ..Default::default()
+        };
+        let metadata = coordinator.begin_atomic_operation(&config).await.unwrap();
 
-        // Begin flush operation
-        let metadata = viper_ops
-            .begin_flush_operation("test_collection", &format!("file://{}", temp_path))
+        coordinator
+            .write_to_staging(
+                &metadata.operation_id,
+                "vectors/batch_001.parquet",
+                b"mock parquet data",
+            )
             .await
             .unwrap();
 
-        // Write Parquet data
-        let parquet_data = b"mock parquet data";
-        viper_ops
-            .write_parquet_to_staging(&metadata.operation_id, "batch_001.parquet", parquet_data)
-            .await
-            .unwrap();
-
-        // Finalize flush
-        viper_ops
-            .finalize_flush(&metadata.operation_id)
+        coordinator
+            .finalize_atomic_operation(&metadata.operation_id)
             .await
             .unwrap();
     }

@@ -471,7 +471,7 @@ mod tests {
                 embedding_config: None,
                 dimension: 128,
                 distance_metric: Some(DistanceMetric::Cosine as i32),
-                storage_engine: Some(StorageEngine::Viper as i32),
+                storage_engine: Some(StorageEngine::Nova as i32),
                 filterable_columns: vec![],
                 index_configs: vec![],
                 quantization: None,
@@ -502,7 +502,7 @@ mod tests {
             storage_assignment: Some(crate::proto::proximadb_v1::StorageAssignment {
                 primary_path: format!("{}", temp_dir.path().display()),
                 backup_paths: vec![],
-                engine: StorageEngine::Viper as i32,
+                engine: StorageEngine::Nova as i32,
                 engine_config: std::collections::HashMap::new(),
                 base_location: format!("{}", temp_dir.path().display()),
                 assigned_at: chrono::Utc::now().timestamp_micros(),

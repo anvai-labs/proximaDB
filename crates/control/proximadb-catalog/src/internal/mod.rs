@@ -536,7 +536,7 @@ pub enum ModelProperties {
 /// RDBMS-specific properties
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RdbmsProperties {
-    /// Storage engine (SST, VIPER for HTAP)
+    /// Storage engine (SST + columnar engine for HTAP)
     pub storage_engine: Option<String>,
     /// Row format (COMPACT, DYNAMIC, COMPRESSED)
     pub row_format: Option<String>,

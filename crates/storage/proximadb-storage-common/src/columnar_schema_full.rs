@@ -1,6 +1,6 @@
 //! Unified Columnar Schema Generation
 use arrow_schema::DataType;
-// This module provides automatic quantization-aware schema generation for VIPER and NOVA engines.
+// This module provides automatic quantization-aware schema generation for NOVA and NOVA engines.
 // When QuantizationConfig is detected, schemas automatically include quantized columns with
 // optimized mixed compression strategies per column type.
 
@@ -41,7 +41,7 @@ pub fn convert_filterable_spec(spec: &FilterableColumnSpec) -> ColumnarFilterabl
 }
 
 /// Create Arrow schema for Parquet files from proto specs
-/// Used by both VIPER and NOVA engines for consistent schema generation
+/// Used by both NOVA and NOVA engines for consistent schema generation
 pub fn create_parquet_schema_from_specs(
     dimension: usize,
     filterable_specs: &[FilterableColumnSpec],
@@ -306,7 +306,7 @@ impl Default for SchemaOptimization {
     }
 }
 
-/// Unified schema builder for VIPER and NOVA engines
+/// Unified schema builder for NOVA and NOVA engines
 pub struct ColumnarSchemaBuilder {
     /// Schema cache to avoid regenerating identical schemas
     schema_cache: Arc<RwLock<HashMap<String, CachedSchema>>>,

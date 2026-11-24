@@ -261,7 +261,7 @@ graph LR
 | Pre-computation overhead not justified
 
 | Memory-constrained
-| **VIPER** or **SST**
+| **NOVA** or **SST**
 | Matrix storage requires ~2-3GB for 10M vectors
 
 | Simple point queries

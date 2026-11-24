@@ -60,7 +60,7 @@ When changing a storage format, reader, codec, cache, or engine you MUST:
 - **Tokio & Axum/Tonic:** Asynchronous runtime and networking (REST/gRPC).
 - **Parquet/Arrow:** Columnar storage and memory representation.
 - **SIMD:** Hardware-accelerated vector operations (AVX2, AVX-512, NEON).
-- **Multi-Engine Storage:** SST (Supported; becomes the auto default in v0.5, TD-ENGSEL-1), HELIX and NOVA (Beta); VIPER deprecated (ADR-093); SWIFT and RAPTOR experimental and deleted in v0.6 (ADR-006).
+- **Multi-Engine Storage:** SST (Supported; becomes the auto default in v0.5, TD-ENGSEL-1), HELIX and NOVA (Beta); VIPER removed (ADR-093 stage 3 — wire value retained, rejected fail-closed); SWIFT and RAPTOR experimental and deleted in v0.6 (ADR-006).
 
 ## 📂 Project Organization
 - `src/`: Core Rust library crate (storage, graph, query, vector, api_handlers).

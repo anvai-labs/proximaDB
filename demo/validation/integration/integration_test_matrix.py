@@ -320,7 +320,7 @@ class CollectionManagementTests:
                 name=TEST_CONFIG["collections"]["test_collection"],
                 dimension=TEST_CONFIG["collections"]["dimension"],
                 distance_metric=DistanceMetric.COSINE,
-                storage_engine=StorageEngine.VIPER,
+                storage_engine=StorageEngine.NOVA,
                 description="Integration test collection for OpenAI embeddings"
             )
             
@@ -540,7 +540,7 @@ class AlgorithmTests:
                     name=collection_name,
                     dimension=128,  # Smaller for faster testing
                     distance_metric=metric,
-                    storage_engine=StorageEngine.VIPER,
+                    storage_engine=StorageEngine.NOVA,
                     description=f"Test collection for {metric} metric"
                 )
                 
@@ -598,7 +598,7 @@ class WALPersistenceTests:
                 name=collection_name,
                 dimension=256,
                 distance_metric=DistanceMetric.COSINE,
-                storage_engine=StorageEngine.VIPER,
+                storage_engine=StorageEngine.NOVA,
                 description="WAL flush test collection"
             )
             

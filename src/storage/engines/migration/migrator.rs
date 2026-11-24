@@ -1,5 +1,5 @@
 // Engine Migration Implementation
-// Handles migration between different storage engines (VIPER ↔ SST ↔ SWIFT ↔ NOVA)
+// Handles migration between different storage engines (SST ↔ SWIFT ↔ NOVA)
 
 use anyhow::Result;
 use std::collections::HashMap;
@@ -559,7 +559,7 @@ mod tests {
     #[tokio::test]
     async fn test_migration_plan_creation() {
         let config = MigrationConfig {
-            source_engine: ProtoStorageEngine::Viper,
+            source_engine: ProtoStorageEngine::Sst,
             target_engine: ProtoStorageEngine::Nova,
             collections: vec!["test_collection".to_string()],
             // strategy removed -  MigrationStrategy::CopyThenSwitch,
@@ -569,7 +569,7 @@ mod tests {
         let migrator = EngineMigrator::new(config).await.unwrap();
         let plan = migrator.create_plan().await.unwrap();
 
-        assert_eq!(plan.source_engine, ProtoStorageEngine::Viper);
+        assert_eq!(plan.source_engine, ProtoStorageEngine::Sst);
         assert_eq!(plan.target_engine, ProtoStorageEngine::Nova);
         assert_eq!(plan.collections.len(), 1);
         assert!(plan.estimated_duration.num_seconds() > 0);

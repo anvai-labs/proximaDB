@@ -33,14 +33,6 @@ graph TB
         NOVA_ROOT --> NOVA_SEARCH
     end
 
-    subgraph "VIPER Engine (src/storage/engines/viper/)"
-        VIPER_ROOT["VIPER Engine (deprecated, ADR-093)\nParquet Columnar · existing collections only"]
-        VIPER_PARQUET["Parquet Writer\nArrow RecordBatch → Parquet\nRow-group sizing\nDictionary encoding"]
-        VIPER_ICEBERG["Iceberg Integration\nManifest management\nSnapshot isolation\nTime-travel"]
-        VIPER_ROOT --> VIPER_PARQUET
-        VIPER_ROOT --> VIPER_ICEBERG
-    end
-
     subgraph "Experimental Engines"
         RAPTOR["RAPTOR (exp)\nParallel Tiered Storage\nMatrix-optimized · PXK adaptive"]
         SWIFT["SWIFT (exp)\nHierarchical Superblocks\nFast traversal · Hot cache"]
@@ -67,13 +59,11 @@ graph TB
     FACTORY --> SST_ROOT
     FACTORY --> HELIX_ROOT
     FACTORY --> NOVA_ROOT
-    FACTORY --> VIPER_ROOT
     FACTORY --> RAPTOR
     FACTORY --> SWIFT
     SST_ROOT --> PAX
     HELIX_ROOT --> PAX
     NOVA_ROOT --> PAX
-    VIPER_ROOT --> VIPER_PARQUET
     PAX --> OBJ
     WAL_WRITE --> MEMTABLE
     MEMTABLE --> FLUSH
@@ -81,7 +71,6 @@ graph TB
     SST_ROOT --> OBJ
     HELIX_ROOT --> OBJ
     NOVA_ROOT --> OBJ
-    VIPER_ROOT --> OBJ
     OBJ --> CACHE
     SST_READ --> CACHE
 
@@ -94,7 +83,7 @@ graph TB
     classDef exp fill:#e0e0e0,stroke:#9e9e9e
 
     class FACTORY factory
-    class SST_ROOT,SST_WRITE,SST_READ,SST_COMPACT,HELIX_ROOT,HELIX_INDEX,HELIX_STORE,NOVA_ROOT,NOVA_ENCODE,NOVA_SEARCH,VIPER_ROOT,VIPER_PARQUET,VIPER_ICEBERG engine
+    class SST_ROOT,SST_WRITE,SST_READ,SST_COMPACT,HELIX_ROOT,HELIX_INDEX,HELIX_STORE,NOVA_ROOT,NOVA_ENCODE,NOVA_SEARCH engine
     class PAX pax
     class OBJ obj
     class WAL_WRITE,MEMTABLE,FLUSH wal

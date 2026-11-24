@@ -60,16 +60,15 @@ fn bench_recall_report(c: &mut Criterion) {
 
     // Simulate approximate search results for demonstration
     // In production, this would come from actual engine.search() calls
-    let engines = vec!["sst", "viper", "nova"];
+    let engines = vec!["sst", "nova"];
     let k_values = vec![1, 5, 10, 50, 100];
 
     for engine_name in engines {
         // Simulate different recall levels for different engines
         // In real benchmarks, run engine.search() and compare to ground_truth
         let recall_factor = match engine_name {
-            "sst" => 0.95,   // High recall (exact search)
-            "viper" => 0.85, // Good recall
-            "nova" => 0.90,  // Good recall
+            "sst" => 0.95,  // High recall (exact search)
+            "nova" => 0.90, // Good recall
             _ => 0.80,
         };
 
@@ -109,10 +108,9 @@ fn bench_recall_report(c: &mut Criterion) {
     eprintln!("📄 CSV Output:");
     eprintln!("engine,k,recall");
 
-    for engine_name in ["sst", "viper", "nova"] {
+    for engine_name in ["sst", "nova"] {
         let recall_factor = match engine_name {
             "sst" => 0.95,
-            "viper" => 0.85,
             "nova" => 0.90,
             _ => 0.80,
         };

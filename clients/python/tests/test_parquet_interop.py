@@ -1,7 +1,7 @@
 """
-Test PyArrow/DuckDB/Polars interoperability with ProximaDB Nova and Viper Parquet files.
+Test PyArrow/DuckDB/Polars interoperability with ProximaDB Nova Parquet files.
 
-This test verifies that Parquet files produced by ProximaDB's Nova and Viper storage
+This test verifies that Parquet files produced by ProximaDB's Nova storage
 engines can be read by standard data processing tools:
 - PyArrow: pq.read_table(), pq.ParquetFile()
 - DuckDB: SELECT * FROM 'file.parquet'
@@ -199,19 +199,19 @@ def create_nova_parquet_file(
     return num_vectors, dimension, vectors
 
 
-def create_viper_parquet_file(
+def create_nova_parquet_file(
     path: str,
     num_vectors: int = 100,
     dimension: int = 64,
-    include_quantization: bool = True,  # VIPER typically uses quantization
+    include_quantization: bool = True,  # the columnar engine typically uses quantization
     compression: str = "zstd",
 ) -> tuple:
-    """Create a test Parquet file matching VIPER engine format.
+    """Create a test Parquet file matching the NOVA engine format.
 
-    VIPER is columnar Parquet optimized for analytics with progressive search
+    NOVA is columnar Parquet optimized for analytics with progressive search
     (Binary -> INT8 -> FP32) and aggressive quantization.
     """
-    # VIPER uses the same schema as NOVA with different defaults
+    # Same schema shape the columnar engines share
     return create_nova_parquet_file(
         path,
         num_vectors=num_vectors,
@@ -250,13 +250,13 @@ class TestPyArrowInterop:
             if os.path.exists(parquet_path):
                 os.unlink(parquet_path)
 
-    def test_pyarrow_read_viper_parquet(self):
-        """Verify PyArrow can read VIPER Parquet files."""
+    def test_pyarrow_read_nova_parquet(self):
+        """Verify PyArrow can read NOVA Parquet files."""
         with tempfile.NamedTemporaryFile(suffix=".parquet", delete=False) as f:
             parquet_path = f.name
 
         try:
-            num_vectors, dimension, _ = create_viper_parquet_file(parquet_path)
+            num_vectors, dimension, _ = create_nova_parquet_file(parquet_path)
 
             # Read with pq.read_table()
             table = pq.read_table(parquet_path)
@@ -264,7 +264,7 @@ class TestPyArrowInterop:
             assert len(table) == num_vectors
             assert FIELD_ID in table.schema.names
             assert FIELD_VECTOR_FP32 in table.schema.names
-            # VIPER includes quantization columns by default
+            # the columnar engine includes quantization columns by default
             assert FIELD_Q_BINARY in table.schema.names
             assert FIELD_Q_INT8 in table.schema.names
 
@@ -401,7 +401,7 @@ class TestVectorExtraction:
             parquet_path = f.name
 
         try:
-            num_vectors, dimension, original_vectors = create_viper_parquet_file(
+            num_vectors, dimension, original_vectors = create_nova_parquet_file(
                 parquet_path, num_vectors=50, dimension=64, include_quantization=True
             )
 
@@ -434,7 +434,7 @@ class TestVectorExtraction:
             parquet_path = f.name
 
         try:
-            num_vectors, dimension, _ = create_viper_parquet_file(
+            num_vectors, dimension, _ = create_nova_parquet_file(
                 parquet_path, num_vectors=50, dimension=64, include_quantization=True
             )
 
@@ -538,15 +538,15 @@ class TestDuckDBInterop:
             if os.path.exists(parquet_path):
                 os.unlink(parquet_path)
 
-    def test_duckdb_read_viper_parquet(self):
-        """Verify DuckDB can read VIPER Parquet files with quantization columns."""
+    def test_duckdb_read_nova_parquet(self):
+        """Verify DuckDB can read NOVA Parquet files with quantization columns."""
         duckdb = pytest.importorskip("duckdb")
 
         with tempfile.NamedTemporaryFile(suffix=".parquet", delete=False) as f:
             parquet_path = f.name
 
         try:
-            num_vectors, _, _ = create_viper_parquet_file(parquet_path)
+            num_vectors, _, _ = create_nova_parquet_file(parquet_path)
 
             conn = duckdb.connect()
             result = conn.execute(f"SELECT * FROM '{parquet_path}'").fetchall()
@@ -726,15 +726,15 @@ class TestPolarsInterop:
             if os.path.exists(parquet_path):
                 os.unlink(parquet_path)
 
-    def test_polars_read_viper_parquet(self):
-        """Verify Polars can read VIPER Parquet files."""
+    def test_polars_read_nova_parquet(self):
+        """Verify Polars can read NOVA Parquet files."""
         pl = pytest.importorskip("polars")
 
         with tempfile.NamedTemporaryFile(suffix=".parquet", delete=False) as f:
             parquet_path = f.name
 
         try:
-            num_vectors, _, _ = create_viper_parquet_file(parquet_path)
+            num_vectors, _, _ = create_nova_parquet_file(parquet_path)
 
             df = pl.read_parquet(parquet_path)
 
@@ -1011,7 +1011,7 @@ class TestCrossToolConsistency:
 
 @pytest.mark.skipif(not PYARROW_AVAILABLE, reason="PyArrow required")
 class TestCompressionFormats:
-    """Test different compression formats used by NOVA/VIPER."""
+    """Test different compression formats used by NOVA."""
 
     @pytest.mark.parametrize("compression", ["zstd", "snappy", "gzip", "none"])
     def test_compression_readable(self, compression):
@@ -1035,7 +1035,7 @@ class TestCompressionFormats:
                 os.unlink(parquet_path)
 
     def test_zstd_compression_efficiency(self):
-        """Verify ZSTD compression (NOVA/VIPER default) is applied and provides some compression.
+        """Verify ZSTD compression (NOVA default) is applied and provides some compression.
 
         Note: Random float32 vectors don't compress as well as real-world data
         with structure, so we use a modest threshold. Real ProximaDB workloads

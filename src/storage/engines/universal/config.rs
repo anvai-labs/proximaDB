@@ -378,31 +378,6 @@ impl StorageEngineConfig {
         }
     }
 
-    /// Create default configuration for VIPER engine
-    pub fn viper_default() -> Self {
-        let mut settings = HashMap::new();
-        settings.insert("parquet_row_group_size".to_string(), "100000".to_string());
-        settings.insert("compression_codec".to_string(), "ZSTD".to_string());
-
-        Self {
-            engine_type: super::storage_integration::EngineType::VIPER,
-            settings,
-            supported_formats: Self::supported_formats(false),
-            default_format: Self::default_int8_format(),
-            performance_preferences: PerformancePreferences {
-                prefer_speed: false,
-                target_latency_us: 5000,
-                quality_speed_tradeoff: 0.9, // Strongly prefer quality
-                ..Default::default()
-            },
-            memory_limits: MemoryLimits {
-                max_memory_per_operation_mb: 1024,
-                max_total_memory_mb: 8192,
-                ..Default::default()
-            },
-        }
-    }
-
     /// Create default configuration for SST engine
     pub fn sst_default() -> Self {
         let mut settings = HashMap::new();

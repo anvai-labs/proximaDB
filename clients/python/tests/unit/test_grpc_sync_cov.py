@@ -468,7 +468,7 @@ def test_create_collection_engine_alias_and_string(client, monkeypatch):
         "c2",
         dimension=4,
         indexing_algorithm=1,
-        engine="viper",
+        engine="nova",
     )
     assert res.name == "c2"
 

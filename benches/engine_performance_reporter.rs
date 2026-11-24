@@ -16,7 +16,7 @@ use proximadb::{
     proto::proximadb_v1::VectorRecord,
     proto::proximadb_v1::{SqlValue, sql_value},
     storage::{
-        engines::{sst::SstEngine, viper::ViperEngine},
+        engines::sst::SstEngine,
         persistence::filesystem::FilesystemFactory,
         traits::{CompactionParameters, FlushParameters, UnifiedStorageEngine},
     },
@@ -137,10 +137,6 @@ async fn benchmark_engine_configuration(
             proximadb::proto::proximadb_v1::StorageEngine::Sst as i32,
             proximadb::proto::proximadb_v1::DistanceMetric::Cosine as i32,
         ),
-        "VIPER" => (
-            proximadb::proto::proximadb_v1::StorageEngine::Viper as i32,
-            proximadb::proto::proximadb_v1::DistanceMetric::Cosine as i32,
-        ),
         _ => (
             proximadb::proto::proximadb_v1::StorageEngine::Sst as i32,
             proximadb::proto::proximadb_v1::DistanceMetric::Cosine as i32,
@@ -238,70 +234,6 @@ async fn benchmark_engine_configuration(
             let compressed_size =
                 config.vectors_per_batch * config.batch_count * config.dimension * 4;
             let uncompressed_size = compressed_size; // Would measure actual file sizes
-
-            (
-                uncompressed_size as u64,
-                compressed_size as u64,
-                compaction_time,
-            )
-        }
-        "VIPER" => {
-            // Create VIPER engine with singleton pattern
-            let engine = ViperEngine::new().await?;
-
-            // Flush batches
-            for batch_id in 0..config.batch_count {
-                let vectors = create_vectors_with_sparsity(
-                    config.vectors_per_batch,
-                    config.dimension,
-                    config.sparsity_percent,
-                    batch_id,
-                );
-
-                let start_flush = Instant::now();
-                let flush_params = FlushParameters {
-                    collection_id: Some(collection_id.clone()),
-                    vector_records: vectors
-                        .into_iter()
-                        .map(proximadb::proto::defaults::vector_record_to_proxima_record)
-                        .collect(),
-                    force: true,
-                    collection_config: Some(collection_proto.clone()),
-                    ..Default::default()
-                };
-                let result = engine.flush(flush_params).await?;
-                flush_times.push(start_flush.elapsed().as_millis() as u64);
-
-                // Validate flush results
-                assert!(result.success, "Flush should succeed");
-                if result.entries_flushed.unwrap_or(0) == 0 {
-                    eprintln!("WARNING: No vectors written in batch {}", batch_id);
-                }
-                if result.bytes_written.unwrap_or(0) == 0 {
-                    eprintln!("WARNING: No bytes written in batch {}", batch_id);
-                }
-            }
-
-            // Measure compaction
-            // VIPER compaction requires collection assignment (storage_assignment in collection_config)
-            let start_compact = Instant::now();
-            let compact_params = CompactionParameters {
-                collection_id: Some(collection_id.clone()),
-                collection_config: Some(collection_proto.clone()), // Include storage assignment
-                force: true,
-                ..Default::default()
-            };
-            let compaction_time = match engine.compact(compact_params).await {
-                Ok(_r) => start_compact.elapsed().as_millis() as u64,
-                Err(e) => {
-                    eprintln!("Compaction failed (VIPER): {}", e);
-                    0
-                }
-            };
-
-            let compressed_size =
-                config.vectors_per_batch * config.batch_count * config.dimension * 4;
-            let uncompressed_size = compressed_size;
 
             (
                 uncompressed_size as u64,
@@ -452,7 +384,7 @@ async fn main() -> Result<()> {
     // Test configurations
     let sparsity_levels = vec![10, 50, 90]; // Dense, medium, sparse
     let algorithms = vec![("none", 0), ("zstd", 3), ("lz4", 0), ("snappy", 0)];
-    let engines = vec!["SST", "VIPER"];
+    let engines = vec!["SST"];
 
     let mut all_results = Vec::new();
 

@@ -22,7 +22,7 @@ use crate::storage::traits::StorageFormatStrategy;
 /// }
 /// ```
 pub trait StorageIdentity: Send + Sync {
-    /// Human-readable engine name (e.g., "SST", "VIPER", "HELIX")
+    /// Human-readable engine name (e.g., "SST", "NOVA", "HELIX")
     fn engine_name(&self) -> &'static str;
 
     /// Engine version string (semver format preferred)
@@ -40,7 +40,9 @@ pub trait StorageIdentity: Send + Sync {
         // Default implementation maps from strategy for backward compatibility
         match self.strategy() {
             StorageFormatStrategy::Sst => StorageEngineType::SST,
-            StorageFormatStrategy::Viper => StorageEngineType::VIPER,
+            // VIPER removed (ADR-093); unreachable for live engines (factory
+            // rejects it) — SST baseline like the Chrono arm.
+            StorageFormatStrategy::Viper => StorageEngineType::SST,
             StorageFormatStrategy::Helix => StorageEngineType::HELIX,
             StorageFormatStrategy::Nova => StorageEngineType::NOVA,
             StorageFormatStrategy::Swift => StorageEngineType::SWIFT,

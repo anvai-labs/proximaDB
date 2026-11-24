@@ -31,7 +31,7 @@
 //!        +---> ColumnarReadProvider (trait)
 //!              |
 //!              +---> ArrowInMemoryProvider (cached data)
-//!              +---> ParquetRangePrunedProvider (VIPER/NOVA)
+//!              +---> ParquetRangePrunedProvider (NOVA)
 //!              +---> ProximaBlockProvider (SST columnar)
 //! ```
 //!

@@ -237,7 +237,7 @@ class TestBatchVectorOperations:
             dimension=384,
             distance_metric="cosine",
             description="Batch operations test collection",
-            storage_engine=StorageEngine.VIPER,
+            storage_engine=StorageEngine.NOVA,
             flush_config=FlushConfig(max_wal_size_mb=32.0),
         )
 
@@ -338,7 +338,7 @@ class TestLargeScaleOperations:
             dimension=512,  # Larger dimension for more data per vector
             distance_metric="cosine",
             description="Large-scale operations test",
-            storage_engine=StorageEngine.VIPER,
+            storage_engine=StorageEngine.NOVA,
             flush_config=FlushConfig(
                 max_wal_size_mb=16.0
             ),  # Lower threshold to trigger flush

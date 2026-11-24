@@ -1209,19 +1209,6 @@ impl SharedServices {
         // document/timeseries service singletons.
         crate::services::document_service::set_filesystem_factory(filesystem_factory.clone());
 
-        // Create VIPER engine
-        debug!("🔧 SharedServices::new - Creating VIPER engine...");
-        let viper_config = crate::core::config::ViperConfig::default();
-        debug!("🔧 SharedServices::new - VIPER config created, now creating engine...");
-        let _viper_engine = Arc::new(
-            crate::storage::engines::viper::ViperEngine::from_core_config(
-                viper_config,
-                filesystem_factory.clone(),
-            )
-            .await?,
-        );
-        debug!("✅ SharedServices::new - VIPER engine created successfully");
-
         // Phase 6: per-collection pinning registry constructed up
         // front so REST handlers (control plane) and the SST
         // tier-migration integration (data plane) share the same

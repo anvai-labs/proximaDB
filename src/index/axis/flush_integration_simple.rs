@@ -128,21 +128,14 @@ impl SimpleFlushNotifier {
         (has_quantization, true)
     }
 
-    fn detect_storage_engine(params: &FlushParameters) -> StorageEngineType {
-        // Could check hints or config
-        if params.hints.contains_key("viper") {
-            StorageEngineType::VIPER
-        } else {
-            StorageEngineType::SST
-        }
+    fn detect_storage_engine(_params: &FlushParameters) -> StorageEngineType {
+        // VIPER was removed (ADR-093); every remaining engine that reports
+        // through this notifier maps to the SST-baseline event.
+        StorageEngineType::SST
     }
 
-    fn detect_storage_engine_from_compaction(params: &CompactionParameters) -> StorageEngineType {
-        if params.hints.contains_key("viper") {
-            StorageEngineType::VIPER
-        } else {
-            StorageEngineType::SST
-        }
+    fn detect_storage_engine_from_compaction(_params: &CompactionParameters) -> StorageEngineType {
+        StorageEngineType::SST
     }
 }
 
@@ -168,31 +161,6 @@ impl SimpleFlushNotifier {
                     StorageEngineType::SST,
                     has_quantized,
                     true, // SST always has FP32
-                )
-                .await;
-        });
-    }
-
-    /// Called by VIPER engine after flush
-    pub fn viper_flush_complete(
-        &self,
-        collection_id: &str,
-        flushed_files: Vec<String>,
-        vector_count: usize,
-        has_quantized: bool,
-    ) {
-        let service = self.queue_service.clone();
-        let collection_id = collection_id.to_string();
-
-        tokio::spawn(async move {
-            let _ = service
-                .add_flush_event(
-                    &collection_id,
-                    flushed_files,
-                    vector_count,
-                    StorageEngineType::VIPER,
-                    has_quantized,
-                    true, // VIPER stores FP32 in one column
                 )
                 .await;
         });

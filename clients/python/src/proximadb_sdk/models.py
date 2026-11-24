@@ -96,12 +96,12 @@ class DistanceMetricType(int, Enum):
 class StorageEngine(str, Enum):
     """Storage engines for ProximaDB
 
-    Default: SST (row-based, write-optimized). VIPER is deprecated (ADR-093)
-    and can no longer be selected; SWIFT/RAPTOR are experimental
-    (TD-SDKENG-1).
+    Default: SST (row-based, write-optimized). VIPER was removed (ADR-093
+    stage 3) — the value is retained for wire compatibility and the server
+    rejects it; SWIFT/RAPTOR are experimental (TD-SDKENG-1).
     """
 
-    VIPER = "viper"  # DEPRECATED (ADR-093) — the server rejects it
+    VIPER = "viper"  # REMOVED (ADR-093 S3) — wire-compat value; server rejects it
     SST = "sst"  # Row-based, write-optimized with three-stage filtering (DEFAULT)
     NOVA = "nova"  # Progressive columnar storage with multi-level quantization
     HELIX = "helix"  # Locality-optimized storage with Hilbert curve clustering
@@ -232,14 +232,15 @@ class StorageEngineType(int, Enum):
     Maps to proximadb.v1.types_pb2.StorageEngine enum.
     Use these constants when working with gRPC to avoid magic numbers.
 
-    ProximaDB supports 6 specialized storage engines that auto-optimize for different workloads.
+    ProximaDB supports several specialized storage engines that auto-optimize
+    for different workloads.
 
     Example:
-        config = CollectionConfig(storage_engine=StorageEngineType.VIPER, ...)
+        config = CollectionConfig(storage_engine=StorageEngineType.SST, ...)
     """
 
     UNSPECIFIED = 0
-    VIPER = 1  # Columnar Parquet format with advanced quantization (DEFAULT)
+    VIPER = 1  # REMOVED (ADR-093 S3) — wire-compat value only; server rejects it
     SST = 2  # Row-based, write-optimized with three-stage filtering
     NOVA = 3  # Progressive columnar storage with multi-level quantization
     HELIX = 4  # Locality-optimized storage with Hilbert curve clustering
@@ -330,9 +331,9 @@ class ServerCapabilities(BaseModel):
     fallback_distance_metrics: list[str] = []
 
     # Fully supported storage engines (no fallback)
-    supported_storage_engines: list[str] = ["viper", "sst"]
+    supported_storage_engines: list[str] = ["sst", "nova", "helix"]
 
-    # Storage engines that fallback to viper
+    # Storage engines that fallback to sst
     fallback_storage_engines: list[str] = ["mmap", "hybrid"]
 
     # Fully supported indexing algorithms (no fallback) - All 6 algorithms supported as of 2025-08
@@ -348,7 +349,7 @@ class ServerCapabilities(BaseModel):
     # Indexing algorithms that fallback to hnsw (none - all are now supported natively)
     fallback_indexing_algorithms: list[str] = []
 
-    # Quantization types (all supported in VIPER engine)
+    # Quantization types
     supported_quantization_types: list[str] = [
         "none",
         "uniform",
@@ -363,7 +364,7 @@ class ServerCapabilities(BaseModel):
         "fallback_policy": "Server uses intelligent fallbacks instead of errors",
         "dimension_limit": "Server default maximum is 65536 dimensions (configurable)",
         "name_validation": "Collection names must be 8+ characters to avoid collision with 7-char base62 IDs",
-        "quantization_engine": "Quantization fully supported in VIPER engine only",
+        "quantization_engine": "Quantization is configured per collection (pax_vector_quant)",
         "filterable_columns": "All FilterableDataType values supported",
     }
 
@@ -377,7 +378,7 @@ class ServerCapabilities(BaseModel):
                 return "cosine"
         elif config_type == "storage_engine":
             if value in capabilities.fallback_storage_engines:
-                return "viper"
+                return "sst"
         elif config_type == "indexing_algorithm":
             if value in capabilities.fallback_indexing_algorithms:
                 return "hnsw"
@@ -490,7 +491,7 @@ class StorageQuantizationConfig(BaseModel):
     level: QuantizationLevel | None = None
     codebook_id: str | None = None
     progressive_quantization: bool = False
-    storage_compatibility: str = "VIPER_ONLY"
+    storage_compatibility: str = "PAX"
 
 
 class IndexQuantizationStrategy(BaseModel):
@@ -536,7 +537,7 @@ class CompressionConfig(BaseModel):
     providing a unified interface where engine-specific features are
     automatically applied based on the collection's storage_engine.
 
-    Defaults are optimized for VIPER engine (server default).
+    Defaults follow the server-side engine defaults (SST).
     """
 
     # Unified compression settings (proto fields 1-2)
@@ -558,28 +559,28 @@ class CompressionConfig(BaseModel):
         description="Minimum compression ratio (e.g., 1.5 = 50% reduction)",
     )
 
-    # VIPER-specific quantization (proto fields 5-7)
+    # Columnar-engine quantization (proto fields 5-7)
     enable_quantization: bool = Field(
         default=False,
-        description="Enable VIPER dual columns (FP32 + quantized). Ignored by SST engine.",
+        description="Enable dual columns (FP32 + quantized). Ignored by SST engine.",
     )
     quantization_type: str | None = Field(
         default=None,
-        description="VIPER quantization method: 'int8', 'pq8', 'pq4'. Ignored by SST engine.",
+        description="Quantization method: 'int8', 'pq8', 'pq4'. Ignored by SST engine.",
     )
     normalization_method: str | None = Field(
         default=None,
-        description="VIPER normalization: 'mean', 'trimmed_mean', 'median'. Ignored by SST engine.",
+        description="Normalization: 'mean', 'trimmed_mean', 'median'. Ignored by SST engine.",
     )
 
     # SST-specific block sizing (proto fields 8-9)
     block_size_kb: int | None = Field(
         default=None,
-        description="SST block size in KB (256-16384). Ignored by VIPER engine.",
+        description="SST block size in KB (256-16384).",
     )
     dynamic_block_sizing: bool = Field(
         default=False,
-        description="Auto-adjust SST block size based on vector dimensions. Ignored by VIPER engine.",
+        description="Auto-adjust SST block size based on vector dimensions.",
     )
 
     @field_validator("level")
@@ -768,16 +769,6 @@ class SstEngineSettings(BaseModel):
     max_write_buffers: int | None = None
     block_size_kb: int | None = None
     dynamic_block_sizing: bool | None = None
-
-
-class ViperEngineSettings(BaseModel):
-    """VIPER-specific engine settings"""
-
-    inherit_global_settings: bool | None = None
-    enable_columnar_compression: bool | None = None
-    enable_vector_quantization: bool | None = None
-    vector_chunk_size: int | None = None
-    enable_lazy_loading: bool | None = None
 
 
 class NovaEngineSettings(BaseModel):
@@ -1012,35 +1003,16 @@ class CollectionConfig(BaseModel):
         if not self.compression:
             return
 
-        # TD-SDKENG-1: SST is the default; VIPER is deprecated (ADR-093).
+        # TD-SDKENG-1: SST is the default; VIPER was removed (ADR-093 S3).
         engine = self.storage_engine or StorageEngine.SST
 
-        if engine == StorageEngine.VIPER:
-            # VIPER engine: quantization features are valid
-            if self.compression.block_size_kb is not None:
-                import warnings
-
-                warnings.warn(
-                    "block_size_kb is ignored by VIPER engine (only applies to SST engine)",
-                    UserWarning,
-                    stacklevel=2,
-                )
-
-            # Apply VIPER-optimized defaults
-            if (
-                self.compression.quantization_type
-                and not self.compression.enable_quantization
-            ):
-                # Auto-enable quantization if type is specified
-                self.compression.enable_quantization = True
-
-        elif engine == StorageEngine.SST:
-            # SST engine: quantization features are ignored
+        if engine == StorageEngine.SST:
+            # SST engine: legacy quantization fields are ignored
             if self.compression.enable_quantization:
                 import warnings
 
                 warnings.warn(
-                    "enable_quantization is ignored by SST engine (only applies to VIPER engine)",
+                    "enable_quantization is ignored by SST engine (configure pax_vector_quant instead)",
                     UserWarning,
                     stacklevel=2,
                 )
@@ -1049,7 +1021,7 @@ class CollectionConfig(BaseModel):
                 import warnings
 
                 warnings.warn(
-                    "quantization_type is ignored by SST engine (only applies to VIPER engine)",
+                    "quantization_type is ignored by SST engine (configure pax_vector_quant instead)",
                     UserWarning,
                     stacklevel=2,
                 )
@@ -1659,7 +1631,6 @@ class StorageConfig(BaseModel):
 
     # Engine-specific settings
     sst_settings: SstEngineSettings | None = None
-    viper_settings: ViperEngineSettings | None = None
     nova_settings: NovaEngineSettings | None = None
 
 

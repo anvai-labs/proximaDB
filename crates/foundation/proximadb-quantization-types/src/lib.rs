@@ -394,7 +394,7 @@ pub fn derive_rotation_seed(collection_id: &str) -> u64 {
 /// Drives the routing decision between cached codes (WORM-friendly write-time
 /// quantization) and on-the-fly encoding (adhoc / research workload friendly
 /// read-time quantization). The progressive-search dispatcher (`Phase C`) and
-/// the VIPER storage writer use this to pick between persisting codes or
+/// the NOVA storage writer use this to pick between persisting codes or
 /// skipping the columnar path. See ADR-021 §"Authority mode" and
 /// `EMBEDDING_PRECISION_LLD_2026_05_22.adoc` Q12.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]

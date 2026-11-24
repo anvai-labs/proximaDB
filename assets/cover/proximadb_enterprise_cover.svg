@@ -188,7 +188,7 @@
     <g id="storage-engines">
       <rect x="0" y="0" width="140" height="100" fill="rgba(76, 175, 80, 0.15)" rx="10"/>
       <text x="70" y="20" font-family="Arial, sans-serif" font-size="12" font-weight="600" fill="#4caf50" text-anchor="middle">💾 7 Storage Engines</text>
-      <text x="15" y="35" font-family="Arial, sans-serif" font-size="8" fill="#333">SST • VIPER • NOVA</text>
+      <text x="15" y="35" font-family="Arial, sans-serif" font-size="8" fill="#333">SST • NOVA • HELIX</text>
       <text x="15" y="50" font-family="Arial, sans-serif" font-size="8" fill="#333">SWIFT • RAPTOR • PRISM</text>
       <text x="15" y="65" font-family="Arial, sans-serif" font-size="8" fill="#333">HELIX • Workload Optimized</text>
       <text x="70" y="85" font-family="Arial, sans-serif" font-size="9" font-weight="600" fill="#4caf50" text-anchor="middle">✅ Production Ready</text>

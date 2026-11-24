@@ -8,7 +8,6 @@ pub mod nova_paths;
 pub mod raptor_paths;
 pub mod sst_paths;
 pub mod swift_paths;
-pub mod viper_paths;
 
 use super::action::ExecutionAction;
 use super::state::StorageEngineType;
@@ -18,7 +17,6 @@ pub fn get_paths(engine: StorageEngineType) -> Vec<OptimizationPath> {
     match engine {
         StorageEngineType::SST => sst_paths::paths(),
         StorageEngineType::HELIX => helix_paths::paths(),
-        StorageEngineType::VIPER => viper_paths::paths(),
         StorageEngineType::SWIFT => swift_paths::paths(),
         StorageEngineType::NOVA => nova_paths::paths(),
         StorageEngineType::RAPTOR => raptor_paths::paths(),
@@ -238,7 +236,6 @@ mod tests {
         for engine in &[
             StorageEngineType::SST,
             StorageEngineType::HELIX,
-            StorageEngineType::VIPER,
             StorageEngineType::SWIFT,
             StorageEngineType::NOVA,
             StorageEngineType::RAPTOR,

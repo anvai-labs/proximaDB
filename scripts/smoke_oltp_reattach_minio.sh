@@ -123,9 +123,6 @@ sync_mode = "PerBatch"
 data_directory = "$vol/collections"
 mmap_enabled = false
 
-[storage.viper_config]
-data_directory = "$vol/collections"
-
 [api]
 rest_port = $rest
 grpc_port = $grpc

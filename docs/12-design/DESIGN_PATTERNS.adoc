@@ -56,11 +56,11 @@ Search follows a three-stage path: memtable (in-memory, latest data) -> L0 SSTab
 
 === Columnar Storage
 
-**Used by**: VIPER (Parquet), NOVA (Progressive Columnar)
+**Used by**: NOVA (Progressive Columnar)
 
 **When to use**: Analytics workloads, batch processing, column-level filtering. Arrow-native ML pipelines where only specific dimensions are needed.
 
-**How ProximaDB uses it**: VIPER uses Apache Parquet format natively, providing excellent compression and compatibility with the broader data ecosystem. NOVA uses progressive columnar storage with hierarchical statistics, enabling early termination when query predicates can be resolved from column metadata alone.
+**How ProximaDB uses it**: NOVA uses Parquet-based progressive columnar storage with hierarchical statistics, enabling early termination when query predicates can be resolved from column metadata alone, with strong compression and ecosystem compatibility.
 
 **Trade-offs**:
 
@@ -214,7 +214,7 @@ flowchart LR
 
 **Pattern**: Estimate cost of different query plans based on statistics (cardinality, selectivity, I/O cost). Enumerate candidate plans and choose the one with the lowest estimated cost.
 
-**How ProximaDB uses it**: Cross-model cost estimation spanning vector, graph, document, and observability queries. Join reordering and predicate pushdown across models. The optimizer considers engine-specific costs -- an SST search has different cost characteristics than a VIPER columnar scan.
+**How ProximaDB uses it**: Cross-model cost estimation spanning vector, graph, document, and observability queries. Join reordering and predicate pushdown across models. The optimizer considers engine-specific costs -- an SST search has different cost characteristics than a NOVA columnar scan.
 
 === RL-Based Adaptive Planning
 
@@ -307,7 +307,7 @@ flowchart TB
     SVC --> FACTORY[Engine Factory]
     FACTORY --> SST[SST Engine\nWrite-Heavy]
     FACTORY --> HELIX[HELIX Engine\nSpatial Locality]
-    FACTORY --> VIPER[VIPER Engine\nColumnar Analytics]
+    FACTORY --> NOVA_E[Nova Engine\nColumnar Analytics]
     FACTORY --> SWIFT[SWIFT Engine\nUltra-Low Latency]
     FACTORY --> NOVA[NOVA Engine\nProgressive Columnar]
     FACTORY --> RAPTOR[RAPTOR Engine\nAdaptive Row-Group]
@@ -317,13 +317,13 @@ flowchart TB
     style FACTORY fill:#4a90e2,stroke:#2e5c8a,color:#000
     style SST fill:#fff,stroke:#2e5c8a,color:#000
     style HELIX fill:#fff,stroke:#2e5c8a,color:#000
-    style VIPER fill:#fff,stroke:#2e5c8a,color:#000
+    style NOVA_E fill:#fff,stroke:#2e5c8a,color:#000
     style SWIFT fill:#fff,stroke:#2e5c8a,color:#000
     style NOVA fill:#fff,stroke:#2e5c8a,color:#000
     style RAPTOR fill:#fff,stroke:#2e5c8a,color:#000
 ----
 
-**Rationale**: A vector search engine optimized for LSM (SST) has fundamentally different requirements than a columnar analytics engine (VIPER) or a time-series engine (TST). No single design can be optimal for all workloads.
+**Rationale**: A vector search engine optimized for LSM (SST) has fundamentally different requirements than a columnar analytics engine (NOVA) or a time-series engine (TST). No single design can be optimal for all workloads.
 
 **Implementation**: The `UnifiedStorageEngine` trait defines the contract all engines must satisfy. A factory pattern in `src/storage/engines/factory.rs` handles engine selection. AutoML-based engine recommendation is planned to automatically choose the best engine based on workload profiling.
 

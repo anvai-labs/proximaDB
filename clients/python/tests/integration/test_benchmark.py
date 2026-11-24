@@ -466,7 +466,7 @@ class TestComprehensiveBenchmark:
             ChunkingStrategy.RECURSIVE,
         ]
 
-        storage_engines = [StorageEngine.SST, StorageEngine.VIPER]
+        storage_engines = [StorageEngine.SST, StorageEngine.NOVA]
         protocols = ["rest", "grpc"]
 
         # Run benchmarks

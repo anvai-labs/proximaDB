@@ -377,8 +377,8 @@ impl PyDataFusionSession {
                 table_name.clone(),
                 info.dimension as usize,
                 match info.engine.as_str() {
-                    "viper" => proximadb::datafusion::EngineType::Viper,
                     "helix" => proximadb::datafusion::EngineType::Helix,
+                    "nova" => proximadb::datafusion::EngineType::Nova,
                     _ => proximadb::datafusion::EngineType::Sst,
                 },
             );
@@ -398,13 +398,6 @@ impl PyDataFusionSession {
             let table: Arc<dyn datafusion::datasource::TableProvider> = match df_info.engine_type {
                 proximadb::datafusion::EngineType::Sst => Arc::new(
                     proximadb::datafusion::engine_adapters::SstTableProvider::new(
-                        df_info.clone(),
-                        base_path.clone(),
-                        filesystem_factory.clone(),
-                    ),
-                ),
-                proximadb::datafusion::EngineType::Viper => Arc::new(
-                    proximadb::datafusion::engine_adapters::ViperTableProvider::new(
                         df_info.clone(),
                         base_path.clone(),
                         filesystem_factory.clone(),

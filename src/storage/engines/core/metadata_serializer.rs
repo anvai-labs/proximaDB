@@ -15,7 +15,7 @@
 //! Shared metadata serializer helpers for storage engines.
 //!
 //! This module consolidates the duplicated `unified_metadata_serializer.rs` files
-//! found across multiple engines (raptor, nova, sst, swift, viper, helix) into
+//! found across multiple engines (raptor, nova, sst, swift, helix) into
 //! a single shared implementation. Engines should migrate to using these helpers
 //! and remove their per-engine copies.
 //!

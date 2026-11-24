@@ -59,7 +59,7 @@ struct Cli {
     /// Benchmark suite to run (defaults to 'all')
     #[arg(
         value_enum,
-        help = "Available suites: bench_01-bench_13 or aliases (distance, simd, memory, storage, vectors, index, encoding, quantization, viper, query, system, graph, all)"
+        help = "Available suites: bench_01-bench_13 or aliases (distance, simd, memory, storage, vectors, index, encoding, quantization, query, system, graph, all)"
     )]
     suite: Option<CriterionSuite>,
 
@@ -212,14 +212,6 @@ enum Commands {
         sample_size: usize,
     },
 
-    /// [10] Columnar VIPER benchmarks
-    #[command(name = "bench_10", alias = "viper")]
-    Bench10Viper {
-        /// Sample size for statistical analysis (encoding ops are slow, use 10-20 for large datasets)
-        #[arg(short = 's', long, default_value_t = 20)]
-        sample_size: usize,
-    },
-
     /// [11] Query progressive benchmarks
     #[command(name = "bench_11", alias = "query")]
     Bench11Query {
@@ -293,10 +285,6 @@ enum CriterionSuite {
     /// [08] Quantization SST benchmarks
     #[value(name = "bench_09", alias = "quantization")]
     QuantizationSst,
-
-    /// [10] Columnar VIPER benchmarks
-    #[value(name = "bench_10", alias = "viper")]
-    ColumnarViper,
 
     /// [11] Query progressive benchmarks
     #[value(name = "bench_11", alias = "query")]
@@ -596,7 +584,6 @@ async fn main() -> Result<()> {
         println!("  bench_07 (encoding)     - Proxima encoding benchmarks");
         println!("  bench_08 (compression)  - Compression algorithms benchmarks");
         println!("  bench_09 (quantization) - Quantization SST benchmarks");
-        println!("  bench_10 (viper)        - Columnar VIPER benchmarks");
         println!("  bench_11 (query)        - Query progressive benchmarks");
         println!("  bench_12 (system)       - System optimization benchmarks");
         println!("  bench_13 (graph)        - Graph operations benchmarks");
@@ -749,14 +736,6 @@ async fn main() -> Result<()> {
             Commands::Bench09Quantization { sample_size } => {
                 run_criterion_benchmarks(
                     CriterionSuite::QuantizationSst,
-                    *sample_size,
-                    cli.measurement_time,
-                )
-                .await?;
-            }
-            Commands::Bench10Viper { sample_size } => {
-                run_criterion_benchmarks(
-                    CriterionSuite::ColumnarViper,
                     *sample_size,
                     cli.measurement_time,
                 )
@@ -1500,7 +1479,6 @@ async fn run_criterion_benchmarks(
         CriterionSuite::MemoryVector => run_memory_vector_benchmarks(sample_size),
         CriterionSuite::StorageUnified => run_storage_unified_benchmarks(sample_size),
         CriterionSuite::QuantizationSst => run_quantization_sst_benchmarks(sample_size),
-        CriterionSuite::ColumnarViper => run_columnar_viper_benchmarks(sample_size),
         CriterionSuite::QueryProgressive => run_query_progressive_benchmarks(sample_size),
         CriterionSuite::SystemOptimization => run_system_optimization_benchmarks(sample_size),
         CriterionSuite::GraphOps => run_graph_operations_benchmarks(sample_size),
@@ -2755,12 +2733,6 @@ fn print_storage_interpretation_guide() {
 fn run_quantization_sst_benchmarks(_sample_size: usize) -> Result<()> {
     println!("\nQuantization SST Benchmarks");
     println!("Deferred: Migrate bench_08_quantization_sst");
-    Ok(())
-}
-
-fn run_columnar_viper_benchmarks(_sample_size: usize) -> Result<()> {
-    println!("\nColumnar VIPER Benchmarks");
-    println!("Deferred: Migrate bench_09_columnar_viper");
     Ok(())
 }
 

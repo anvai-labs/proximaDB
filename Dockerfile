@@ -53,7 +53,7 @@ RUN useradd -m -u 1001 -s /bin/bash proximadb
 
 # Create directory structure for both ProximaDB and demo UI
 RUN mkdir -p /opt/proximadb/{bin,config,logs} && \
-    mkdir -p /data/{wal,metadata,collections,logs,viper_data} && \
+    mkdir -p /data/{wal,metadata,collections,logs} && \
     mkdir -p /app/{static,utils,results,embedding_cache} && \
     chown -R proximadb:proximadb /opt/proximadb /data /app
 

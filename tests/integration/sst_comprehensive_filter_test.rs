@@ -467,6 +467,61 @@ async fn test_sst_not_filter() {
 }
 
 #[tokio::test]
+/// Review round 1 (M2, from the deleted comprehensive_filter suite): the
+/// zero-results negative control — an over-constrained filter must return
+/// ZERO rows, not everything (the dropped-filter-silently-matches-everything
+/// class). VIPER's suite carried it; the SST matrix inherits it.
+async fn test_sst_complex_nested_filter_zero_results() {
+    let temp_dir = TempDir::new().unwrap();
+    let collection = create_test_collection(&temp_dir);
+    let filesystem = Arc::new(FilesystemFactory::create_default().await.unwrap());
+    let distance_compute = Arc::new(UnifiedDistanceCompute::default());
+    let engine = SstEngine::new_with_config(Default::default(), filesystem, distance_compute)
+        .await
+        .unwrap();
+
+    let vectors = create_test_vectors("test_sst_filter_zero", 100);
+    let params = FlushParameters {
+        collection_id: Some(collection.id.clone()),
+        collection_config: Some(collection.clone()),
+        vector_records: vectors,
+        force: true,
+        synchronous: true,
+        ..Default::default()
+    };
+    engine.flush(params).await.unwrap();
+
+    // Over-constrained: enabled = true AND enabled = false can match nothing.
+    let filter = FilterExpression::And(vec![
+        FilterExpression::Comparison {
+            field: "enabled".to_string(),
+            operator: ComparisonOperator::Equals,
+            value: json!(true),
+        },
+        FilterExpression::Comparison {
+            field: "enabled".to_string(),
+            operator: ComparisonOperator::Equals,
+            value: json!(false),
+        },
+    ]);
+
+    let search_params = Arc::new(SearchParams {
+        vector: Some(vec![0.1; 128]),
+        top_k: Some(100),
+        filter_expression: Some(filter),
+        ..Default::default()
+    });
+    let ctx = StorageQueryContext::new(search_params, Arc::new(collection));
+    let results = engine.search_vectors_unified(&ctx).await.unwrap();
+
+    assert!(
+        results.is_empty(),
+        "an over-constrained filter must return zero rows, got {}",
+        results.len()
+    );
+}
+
+#[tokio::test]
 async fn test_sst_complex_nested_filter() {
     let temp_dir = TempDir::new().unwrap();
     let collection = create_test_collection(&temp_dir);

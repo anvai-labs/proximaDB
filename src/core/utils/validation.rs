@@ -407,12 +407,10 @@ pub fn validate_distance_metric(metric: &str) -> Result<()> {
 /// * Ok(()) if valid, Err with description if invalid
 pub fn validate_storage_engine(engine: &str) -> Result<()> {
     static VALID_ENGINES: Lazy<HashSet<&'static str>> = Lazy::new(|| {
-        [
-            "viper", "sst", "raptor", "nova", "swift", "prism", "helix", "tst",
-        ]
-        .iter()
-        .cloned()
-        .collect()
+        ["sst", "raptor", "nova", "swift", "prism", "helix", "tst"]
+            .iter()
+            .cloned()
+            .collect()
     });
 
     let engine_lower = engine.to_lowercase();

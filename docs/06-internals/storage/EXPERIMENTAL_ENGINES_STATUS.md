@@ -93,7 +93,7 @@ let sales_collection = sst_engine.create_collection("sales").await?;
 let raptor_engine = RaptorEngine::new(config).await?;
 raptor_engine.enable_adaptive_mode(true).await?;
 
-// Use an SST collection (the supported default); VIPER is deprecated (ADR-093):
+// Use an SST collection (the supported default); VIPER was removed (ADR-093 stage 3):
 let collection = sst_engine.create_collection("vectors").await?;
 ```
 

@@ -1353,7 +1353,7 @@ prefetch_budget = 4
             name: Collection name
             dimension: Vector dimension (auto-detected from embedding model if not provided)
             distance_metric: Distance metric (cosine, euclidean, dot)
-            engine: Storage engine ("sst", "helix", "viper", "auto"). Defaults to
+            engine: Storage engine ("sst", "helix", "nova", "auto"). Defaults to
                 ``EmbeddedConfig.vector_engine``. Previously never sent, so the
                 server silently applied "auto".
             embedding_model: Embedding model for auto-embedding. Can be:

@@ -4,7 +4,7 @@ ProximaDB E-commerce Demo with Optimized Metadata Storage
 =========================================================
 
 This demo showcases:
-- Smart metadata separation for VIPER engine optimization
+- Smart metadata separation for the columnar engine
 - Real BERT embeddings for semantic product search
 - High-performance gRPC for bulk operations
 - Flexible search: REST, gRPC, and SQL options
@@ -149,7 +149,7 @@ class EcommerceDemo:
         """Create collection with optimized metadata configuration"""
         print(f"\n📦 Setting up collection: {self.collection_id}")
         
-        # Define filterable fields for VIPER optimization
+        # Define filterable fields for columnar optimization
         filterable_fields = [
             # Core search fields
             "text", "chunk_index", "source_type",
@@ -169,13 +169,13 @@ class EcommerceDemo:
                     name=self.collection_id,
                     dimension=768,  # all-mpnet-base-v2 dimension
                     distance_metric=DistanceMetric.COSINE,
-                    storage_engine=StorageEngine.VIPER,  # Columnar storage
+                    storage_engine=StorageEngine.NOVA,  # Columnar storage
                     filterable_metadata_fields=filterable_fields  # Specify indexed fields
                 )
                 
                 result = self.rest_client.create_collection(self.collection_id, config)
                 print(f"✅ Collection created via REST with {len(filterable_fields)} filterable fields")
-                print(f"   Engine: VIPER (columnar storage)")
+                print(f"   Engine: NOVA (columnar storage)")
                 print(f"   Filterable: {', '.join(filterable_fields[:5])}...")
                 return
                 
@@ -193,7 +193,7 @@ class EcommerceDemo:
                     name=self.collection_id,
                     dimension=768,
                     distance_metric=DistanceMetric.COSINE,
-                    storage_engine=StorageEngine.VIPER,
+                    storage_engine=StorageEngine.NOVA,
                     filterable_metadata_fields=filterable_fields
                 )
                 
@@ -296,7 +296,7 @@ class EcommerceDemo:
             elapsed = time.time() - start_time
             rate = len(vectors) / elapsed
             print(f"✅ Inserted {len(vectors)} products in {elapsed:.2f}s ({rate:.0f} products/sec)")
-            print(f"   Metadata fields optimized for VIPER columnar storage")
+            print(f"   Metadata fields optimized for NOVA columnar storage")
             
         except Exception as e:
             print(f"❌ gRPC insert failed: {e}")
@@ -612,7 +612,7 @@ class EcommerceDemo:
         print("\n\n✅ E-commerce demo completed!")
         print("\n📊 Key Insights:")
         print("1. gRPC provides 2-3x faster performance for bulk operations")
-        print("2. VIPER engine with filterable metadata enables efficient queries")
+        print("2. NOVA engine with filterable metadata enables efficient queries")
         print("3. SQL interface allows complex filtering with natural syntax")
         print("4. Metadata separation optimizes storage and query performance")
         

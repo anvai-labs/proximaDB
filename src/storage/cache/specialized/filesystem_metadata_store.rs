@@ -53,7 +53,7 @@ pub struct FilesystemMetadata {
     /// Collection ID this file belongs to
     pub collection_id: String,
 
-    /// Engine type (SST, VIPER, etc.)
+    /// Engine type (SST, NOVA, etc.)
     pub engine_type: String,
 }
 

@@ -51,21 +51,6 @@ pub mod sst {
     pub const DEFAULT_TARGET_FILE_SIZE: usize = 64 * 1024 * 1024;
 }
 
-/// VIPER engine specific constants
-pub mod viper {
-    /// VIPER file magic constant (4 bytes)
-    pub const MAGIC: [u8; 4] = *b"VIPR";
-
-    /// Current VIPER file format version
-    pub const VERSION: u32 = 2;
-
-    /// Default row group size for Parquet
-    pub const DEFAULT_ROW_GROUP_SIZE: usize = 2048;
-
-    /// Default page size for Parquet (1MB)
-    pub const DEFAULT_PAGE_SIZE: usize = 256 * 1024; // 256KB default pages (balanced for embeddings)
-}
-
 /// NOVA engine specific constants
 pub mod nova {
     /// NOVA file magic constant (4 bytes)
@@ -180,9 +165,6 @@ pub mod block_sizes {
     /// Default vectors per SWIFT superblock
     pub const SWIFT_DEFAULT_VECTORS_PER_SUPERBLOCK: usize = 256;
 
-    /// Default vectors per VIPER row group
-    pub const VIPER_DEFAULT_VECTORS_PER_ROWGROUP: usize = 2048;
-
     /// Default vectors per NOVA progressive block
     pub const NOVA_DEFAULT_VECTORS_PER_BLOCK: usize = 100;
 
@@ -207,9 +189,6 @@ pub mod block_sizes {
 
     /// Default block size in bytes for SST (16KB)
     pub const SST_DEFAULT_BLOCK_SIZE_BYTES: usize = 16 * 1024;
-
-    /// Default page size for Parquet (256KB - balanced for embeddings)
-    pub const VIPER_DEFAULT_PAGE_SIZE_BYTES: usize = 256 * 1024;
 
     /// Target file size for SST files (64MB)
     pub const SST_TARGET_FILE_SIZE_BYTES: usize = 64 * 1024 * 1024;
@@ -280,7 +259,6 @@ mod tests {
     fn test_constants_consistency() {
         // Ensure all magic constants are 4 bytes
         assert_eq!(sst::MAGIC.len(), 4);
-        assert_eq!(viper::MAGIC.len(), 4);
         assert_eq!(nova::MAGIC.len(), 4);
         assert_eq!(swift::MAGIC.len(), 4);
         assert_eq!(raptor::MAGIC.len(), 4);

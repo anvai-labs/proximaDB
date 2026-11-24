@@ -1135,7 +1135,7 @@ impl SstEngine {
         // which converges.
         // `None` ≠ "no properties": it means THIS flush path never consulted
         // the catalog (bulk-ingest, the WAL flush coordinator, recovery,
-        // VIPER). Collapsing the two would make a stored
+        // the columnar engines). Collapsing the two would make a stored
         // `compaction.strategy = 'consolidate'` invisible on those paths —
         // the refusal NOTICE would never fire for exactly the collections
         // whose operator needs telling (#2418 review round 22; the gap is

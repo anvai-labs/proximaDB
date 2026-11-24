@@ -84,7 +84,11 @@ claim.
 |Memory (MB)|15|220|1,450
 |===]
 
-=== VIPER Engine (Analytics-Optimized)
+=== VIPER Engine (Analytics-Optimized) — REMOVED
+
+[NOTE]
+Engine deleted (ADR-093 stage 3 / TD-VIPER-1 S3); numbers retained as
+historical measurements only.
 
 [.table-striped]
 [cols="1,1,1,1"]
@@ -108,7 +112,6 @@ claim.
 
 |SST|125K|8ms|LZ4: 2.1x
 |HELIX|95K|12ms|LZ4: 2.0x
-|VIPER|45K|25ms|Snappy: 1.8x
 |RAPTOR|115K|9ms|LZ4: 2.1x
 |===]
 

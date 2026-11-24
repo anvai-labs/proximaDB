@@ -233,7 +233,6 @@ impl Default for StorageOperationMetrics {
 #[derive(Debug, Clone)]
 pub struct FlushStatus {
     pub sst_active_flushes: usize,
-    pub viper_active_flushes: usize,
     pub helix_active_flushes: usize,
     pub total_flushes_completed: u64,
     pub average_flush_time_ms: f64,

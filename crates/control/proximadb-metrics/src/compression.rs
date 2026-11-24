@@ -3,7 +3,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 
-//! Compression metrics tracking for SST and VIPER engines
+//! Compression metrics tracking for the storage engines
 //!
 //! Tracks compression ratios, performance, and storage savings across different
 //! compression strategies and engines.
@@ -17,7 +17,7 @@ use std::time::Duration;
 #[derive(Debug, Clone, Default)]
 pub struct CompressionMetrics {
     pub collection_id: String,
-    pub engine_type: String, // "sst" or "viper"
+    pub engine_type: String, // engine label ("sst", "nova", …)
 
     // === Overall Compression Statistics ===
     pub total_uncompressed_bytes: u64,
@@ -35,7 +35,7 @@ pub struct CompressionMetrics {
     pub sst_compression_algorithm: String, // "zstd", "lz4", etc.
     pub sst_compression_level: i32,
 
-    // === VIPER Column Compression ===
+    // === Columnar compression (column engines) ===
     pub viper_fp32_column_bytes: u64,
     pub viper_fp32_compressed_bytes: u64,
     pub viper_fp32_compression_ratio: f32,

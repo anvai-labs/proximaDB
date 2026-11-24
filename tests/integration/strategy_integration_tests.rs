@@ -4,6 +4,10 @@
 //! pattern consistently and that strategy selection works correctly across engines.
 
 // SWIFT is compiled only under `experimental-engines` (TD-152 deprecation gate).
+// ORPHANED TEST (not in any compile target — see TD-ORPHAN-1): references the
+// VIPER engine removed by ADR-093 stage 3 / TD-VIPER-1 S3. Unreachable code;
+// cleanup of the file itself belongs to the orphan-file program, not the
+// engine-removal PR.
 #![cfg(feature = "experimental-engines")]
 
 use std::sync::Arc;

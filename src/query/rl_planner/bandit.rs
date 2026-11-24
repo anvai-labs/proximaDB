@@ -176,7 +176,7 @@ impl ContextualBanditPlanner {
         // retired/experimental-off; a query routed to an engine without a space
         // falls back to `default_action_space` (SST) via the `unwrap_or` in
         // select/exploit, which is safe.
-        for engine in &["SST", "HELIX", "VIPER", "NOVA"] {
+        for engine in &["SST", "HELIX", "NOVA"] {
             engine_action_spaces.insert(engine.to_string(), ActionSpace::for_engine(engine));
         }
 

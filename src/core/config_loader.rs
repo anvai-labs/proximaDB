@@ -182,22 +182,9 @@ impl ConfigLoader {
         // TD-COMPACT-15: strategy values fail closed at load — an unknown
         // value (including 'consolidate' in the legacy count/size field)
         // must abort startup, not silently run the wrong policy. EVERY
-        // section that carries a CompactionConfig is validated, VIPER's
-        // included — a section left out keeps the dead-config hazard on
-        // that path.
-        if let Some(viper_config) = &config.storage.viper_config
-            && let Some(compaction_cfg) = &viper_config.compaction_config
-        {
-            compaction_cfg
-                .validate("storage.viper_config.compaction_config")
-                .map_err(|err| {
-                    let message = format!("Invalid VIPER compaction configuration: {err}");
-                    Box::new(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        message,
-                    )) as Box<dyn std::error::Error + Send + Sync>
-                })?;
-        }
+        // section that carries a CompactionConfig is validated — a section
+        // left out keeps the dead-config hazard on that path. (The former
+        // VIPER section was removed with the engine, ADR-093 S3.)
         config
             .storage
             .compaction_config
@@ -340,7 +327,7 @@ impl ConfigLoader {
     /// than the process cwd). URLs and already-absolute paths pass through
     /// unchanged.
     ///
-    /// TD-WAL-4: the WAL write buffer and the SST/VIPER data dirs are rooted
+    /// TD-WAL-4: the WAL write buffer and the SST data dirs are rooted
     /// under the instance's `data_dir` with this, so two servers launched from
     /// the same working directory with distinct `data_dir` never silently share
     /// a physical WAL write buffer (which cross-contaminated recovery — each
@@ -449,7 +436,7 @@ impl ConfigLoader {
         // Resolve metadata URL
         config.storage.metadata_url = to_file_url(&config.storage.metadata_url)?;
 
-        // TD-WAL-4: anchor the WAL write buffer + SST/VIPER data dirs under the
+        // TD-WAL-4: anchor the WAL write buffer + SST data dirs under the
         // instance's `data_dir` (already resolved to absolute above), NOT the
         // process cwd that `resolve_path` uses. Without this, two servers
         // launched from the same directory with distinct `data_dir` but an unset
@@ -468,12 +455,6 @@ impl ConfigLoader {
                 sst_config.cache_local_disk_path =
                     Some(Self::resolve_path_under(&data_dir, cache_path));
             }
-        }
-
-        // Resolve VIPER data directory if configured
-        if let Some(ref mut viper_config) = config.storage.viper_config {
-            viper_config.data_directory =
-                Self::resolve_path_under(&data_dir, &viper_config.data_directory);
         }
 
         // Resolve TLS certificate paths if configured

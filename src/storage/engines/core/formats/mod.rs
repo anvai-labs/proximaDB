@@ -14,7 +14,7 @@ pub mod vector_serialization;
 mod codebook_integration_test;
 
 // Proxima block-columnar formats are used by SST and SWIFT (vectors are columnar-encoded within blocks)
-// Pure columnar formats are used by VIPER and NOVA (Parquet-based)
+// Pure columnar formats are used by NOVA (Parquet-based)
 
 pub use proximablocks::{ProximaBlockMetadata, ProximaDataBlock, SstIOLayer};
 

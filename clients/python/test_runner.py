@@ -55,7 +55,7 @@ def test_basic_operations():
             name=test_collection,
             dimension=128,
             distance_metric=DistanceMetric.COSINE,
-            storage_engine=StorageEngine.VIPER,
+            storage_engine=StorageEngine.NOVA,
         )
 
         # REST - pass individual params, not config object

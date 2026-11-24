@@ -5,7 +5,7 @@
 //!
 //! ## Reuse Strategy
 //!
-//! - **Parquet Engines (VIPER/NOVA/RAPTOR)**: Uses SharedParquetFormatReader for footer caching
+//! - **Parquet Engines (NOVA/RAPTOR)**: Uses SharedParquetFormatReader for footer caching
 //! - **ProximaBlocks Engines (SST/HELIX/SWIFT)**: Uses RowBasedHeader parsing
 //!
 //! ## Integration Points
@@ -27,10 +27,10 @@ use super::header_cache::{
 use crate::storage::persistence::filesystem::FileSystem;
 
 // ============================================================================
-// Parquet-Based Header Loader (VIPER, NOVA, RAPTOR)
+// Parquet-Based Header Loader (NOVA, RAPTOR)
 // ============================================================================
 
-/// Header loader for Parquet-based engines (VIPER, NOVA, RAPTOR).
+/// Header loader for Parquet-based engines (NOVA, RAPTOR).
 /// Reuses SharedParquetFormatReader infrastructure for footer caching.
 pub struct ParquetHeaderLoader {
     /// Filesystem for I/O operations
@@ -46,11 +46,6 @@ impl ParquetHeaderLoader {
             filesystem,
             engine_type: engine_type.to_string(),
         }
-    }
-
-    /// Create loader for VIPER engine.
-    pub fn viper(filesystem: Arc<dyn FileSystem>) -> Self {
-        Self::new(filesystem, "viper")
     }
 
     /// Create loader for NOVA engine.
@@ -595,7 +590,6 @@ impl HeaderLoaderRegistry {
         let mut registry = Self::new();
 
         // Parquet-based loaders
-        registry.register(Arc::new(ParquetHeaderLoader::viper(filesystem.clone())));
         registry.register(Arc::new(ParquetHeaderLoader::nova(filesystem.clone())));
         registry.register(Arc::new(ParquetHeaderLoader::raptor(filesystem.clone())));
 

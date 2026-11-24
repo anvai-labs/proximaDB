@@ -64,7 +64,7 @@ class TestImports:
         # Test enums
         assert DistanceMetric.COSINE
         assert IndexingAlgorithm.HNSW
-        assert StorageEngine.VIPER
+        assert StorageEngine.NOVA
         assert QuantizationType.UNIFORM
 
     def test_exception_imports(self):

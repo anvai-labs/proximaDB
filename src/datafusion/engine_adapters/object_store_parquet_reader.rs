@@ -848,7 +848,7 @@ impl SplitReader for ObjectStoreParquetSplitReader {
     }
 
     fn engine_type(&self) -> EngineType {
-        EngineType::Viper
+        EngineType::Nova
     }
 
     fn supports_projection_pushdown(&self) -> bool {

@@ -174,7 +174,7 @@ def create_collection(client):
         name=COLLECTION_NAME,
         dimension=DIMENSION,
         distance_metric=DistanceMetric.COSINE,
-        storage_engine=StorageEngine.VIPER
+        storage_engine=StorageEngine.NOVA
     )
 
     collection = client.create_collection(COLLECTION_NAME, config)

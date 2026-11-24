@@ -41,7 +41,7 @@ def test_grpc_end_to_end_basic():
             name=coll,
             dimension=4,
             distance_metric=DistanceMetricType.COSINE,
-            storage_engine=StorageEngineType.VIPER,
+            storage_engine=StorageEngineType.NOVA,
             index_configs=[ic],
         )
 

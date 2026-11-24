@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-ProximaDB Storage Engines Demo - LSM vs VIPER Comparison
+ProximaDB Storage Engines Demo - LSM vs NOVA Comparison
 
 This demo showcases the unique strengths of each storage engine:
 - LSM Engine: Optimized for frequent updates and mixed workloads
-- VIPER Engine: Optimized for read-heavy workloads with compression
+- NOVA Engine: Optimized for read-heavy workloads with compression
 """
 
 import time
@@ -25,7 +25,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 class StorageEnginesDemo:
-    """Demonstrates LSM vs VIPER storage engine capabilities"""
+    """Demonstrates LSM vs NOVA storage engine capabilities"""
     
     def __init__(self, server_url="http://localhost:5678", grpc_url="grpc://localhost:5679"):
         self.server_url = server_url
@@ -35,12 +35,12 @@ class StorageEnginesDemo:
         
         # Collection names with engine-specific suffixes
         self.lsm_collection = f"lsm_demo_{int(time.time())}"
-        self.viper_collection = f"viper_demo_{int(time.time())}"
+        self.nova_collection = f"nova_demo_{int(time.time())}"
         
         # Performance tracking
         self.performance_data = {
             "lsm": {"insert": [], "search": [], "update": [], "delete": []},
-            "viper": {"insert": [], "search": [], "compression": [], "analytics": []}
+            "nova": {"insert": [], "search": [], "compression": [], "analytics": []}
         }
 
     @staticmethod
@@ -77,14 +77,14 @@ class StorageEnginesDemo:
             lsm_collection = self.rest_client.create_collection(self.lsm_collection, lsm_config)
             logger.info(f"✅ Created LSM collection: {lsm_collection.name}")
             
-            # Create VIPER-optimized collection
-            viper_config = CollectionConfig(
-                name=self.viper_collection,
+            # Create NOVA-optimized collection
+            nova_config = CollectionConfig(
+                name=self.nova_collection,
                 dimension=512,
                 distance_metric=DistanceMetric.EUCLIDEAN,
-                description="VIPER engine demo - optimized for analytics and compression",
+                description="NOVA engine demo - optimized for analytics and compression",
                 storage_config={
-                    "engine": "viper",
+                    "engine": "nova",
                     "compression": "snappy",
                     "quantization": {
                         "enabled": True,
@@ -96,8 +96,8 @@ class StorageEnginesDemo:
                     "batch_size": 10000
                 }
             )
-            viper_collection = self.rest_client.create_collection(self.viper_collection, viper_config)
-            logger.info(f"✅ Created VIPER collection: {viper_collection.name}")
+            nova_collection = self.rest_client.create_collection(self.nova_collection, nova_config)
+            logger.info(f"✅ Created NOVA collection: {nova_collection.name}")
             
             return True
         except Exception as e:
@@ -241,11 +241,11 @@ class StorageEnginesDemo:
         
         return True
     
-    def demonstrate_viper_strengths(self):
-        """Demonstrate VIPER engine strengths: analytics, compression, read performance"""
-        print("\n🗂️ VIPER Engine Strengths Demonstration")
+    def demonstrate_nova_strengths(self):
+        """Demonstrate NOVA engine strengths: analytics, compression, read performance"""
+        print("\n🗂️ NOVA Engine Strengths Demonstration")
         print("=" * 60)
-        print("VIPER engines excel at:")
+        print("NOVA engines excel at:")
         print("• Analytics and large-scale data processing")
         print("• Massive storage compression (4x+)")
         print("• Read-heavy workloads optimization")
@@ -302,7 +302,7 @@ class StorageEnginesDemo:
         print("\n📥 Test 1: Bulk Analytical Data Loading")
         start_time = time.time()
         
-        # Large batch sizes for VIPER (optimized for bulk operations)
+        # Large batch sizes for NOVA (optimized for bulk operations)
         batch_size = 500
         total_compressed_size = 0
         
@@ -313,14 +313,14 @@ class StorageEnginesDemo:
             
             insert_start = time.time()
             result = self.grpc_client.insert_records(
-                self.viper_collection,
+                self.nova_collection,
                 self._records_from_vectors(batch_vectors, batch_ids, batch_metadata),
             )
             insert_time = time.time() - insert_start
-            self.performance_data["viper"]["insert"].append(insert_time * 1000)
+            self.performance_data["nova"]["insert"].append(insert_time * 1000)
         
         total_load_time = time.time() - start_time
-        print(f"✅ VIPER Bulk Load: {len(vectors)/total_load_time:.0f} vectors/sec")
+        print(f"✅ NOVA Bulk Load: {len(vectors)/total_load_time:.0f} vectors/sec")
         
         # Test 2: Compression analysis
         print("\n🗜️ Test 2: Storage Compression Analysis")
@@ -330,7 +330,7 @@ class StorageEnginesDemo:
         compressed_size_mb = raw_size_mb / 4.0  # 4x compression with quantization
         
         compression_ratio = raw_size_mb / compressed_size_mb
-        self.performance_data["viper"]["compression"].append(compression_ratio)
+        self.performance_data["nova"]["compression"].append(compression_ratio)
         
         print(f"✅ Raw vector size: {raw_size_mb:.1f} MB")
         print(f"✅ Compressed size: {compressed_size_mb:.1f} MB") 
@@ -364,13 +364,13 @@ class StorageEnginesDemo:
             
             # Perform search
             results = self.rest_client.search(
-                self.viper_collection,
+                self.nova_collection,
                 query_vector,
                 k=50  # Larger result sets for analytics
             )
             
             query_time = time.time() - query_start
-            self.performance_data["viper"]["analytics"].append(query_time * 1000)
+            self.performance_data["nova"]["analytics"].append(query_time * 1000)
             
             print(f"✅ {query_config['name']}: {query_time*1000:.1f}ms for top-50 results")
         
@@ -384,7 +384,7 @@ class StorageEnginesDemo:
             # Get sample of results for aggregation
             sample_query = vectors[0]
             sample_results = self.rest_client.search(
-                self.viper_collection,
+                self.nova_collection,
                 sample_query,
                 k=1000
             )
@@ -417,33 +417,33 @@ class StorageEnginesDemo:
         except Exception as e:
             print(f"⚠️ Aggregation simulation: {e}")
         
-        print("\n📊 VIPER Engine Summary:")
+        print("\n📊 NOVA Engine Summary:")
         print(f"• Excellent compression: {compression_ratio:.1f}x storage reduction")
         print(f"• Optimized bulk loading: {len(vectors)/total_load_time:.0f} vectors/sec")
-        print(f"• Fast analytical queries: {np.mean(self.performance_data['viper']['analytics']):.1f}ms average")
+        print(f"• Fast analytical queries: {np.mean(self.performance_data['nova']['analytics']):.1f}ms average")
         print(f"• Columnar aggregations: Optimized for metadata analysis")
         
         return True
     
     def compare_engines(self):
-        """Compare LSM vs VIPER performance characteristics"""
-        print("\n⚖️ LSM vs VIPER Engine Comparison")
+        """Compare LSM vs NOVA performance characteristics"""
+        print("\n⚖️ LSM vs NOVA Engine Comparison")
         print("=" * 60)
         
         # Performance comparison
         lsm_avg_search = np.mean(self.performance_data["lsm"]["search"])
-        viper_avg_analytics = np.mean(self.performance_data["viper"]["analytics"])
+        nova_avg_analytics = np.mean(self.performance_data["nova"]["analytics"])
         
         lsm_avg_update = np.mean(self.performance_data["lsm"]["update"])
-        viper_compression = np.mean(self.performance_data["viper"]["compression"])
+        nova_compression = np.mean(self.performance_data["nova"]["compression"])
         
         print("🔍 Search Performance Comparison:")
         print(f"• LSM (mixed workload): {lsm_avg_search:.1f}ms average")
-        print(f"• VIPER (analytical): {viper_avg_analytics:.1f}ms average")
+        print(f"• NOVA (analytical): {nova_avg_analytics:.1f}ms average")
         
         print("\n📊 Workload Optimization:")
         print(f"• LSM update performance: {lsm_avg_update:.1f}ms (excellent for real-time)")
-        print(f"• VIPER compression ratio: {viper_compression:.1f}x (excellent for storage)")
+        print(f"• NOVA compression ratio: {nova_compression:.1f}x (excellent for storage)")
         
         print("\n🎯 Use Case Recommendations:")
         print("\n📱 Choose LSM Engine for:")
@@ -453,7 +453,7 @@ class StorageEnginesDemo:
         print("• ACID transaction requirements")
         print("• Low-latency search requirements")
         
-        print("\n📊 Choose VIPER Engine for:")
+        print("\n📊 Choose NOVA Engine for:")
         print("• Analytics and data warehousing")
         print("• Read-heavy workloads")
         print("• Large-scale data storage (cost optimization)")
@@ -462,7 +462,7 @@ class StorageEnginesDemo:
         
         print("\n💡 Hybrid Deployment Strategy:")
         print("• Use LSM for 'hot' data (recent, frequently updated)")
-        print("• Use VIPER for 'warm/cold' data (historical, analytical)")
+        print("• Use NOVA for 'warm/cold' data (historical, analytical)")
         print("• Implement data lifecycle policies for automatic tiering")
         print("• Leverage ProximaDB's storage-aware search for optimal performance")
         
@@ -477,10 +477,10 @@ class StorageEnginesDemo:
             fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(15, 10))
             
             # Insert performance
-            engines = ['LSM', 'VIPER']
+            engines = ['LSM', 'NOVA']
             insert_times = [
                 np.mean(self.performance_data["lsm"]["insert"]),
-                np.mean(self.performance_data["viper"]["insert"])
+                np.mean(self.performance_data["nova"]["insert"])
             ]
             ax1.bar(engines, insert_times, color=['#FF6B6B', '#4ECDC4'])
             ax1.set_title('Insert Performance (ms)')
@@ -489,7 +489,7 @@ class StorageEnginesDemo:
             # Search performance  
             search_times = [
                 np.mean(self.performance_data["lsm"]["search"]),
-                np.mean(self.performance_data["viper"]["analytics"])
+                np.mean(self.performance_data["nova"]["analytics"])
             ]
             ax2.bar(engines, search_times, color=['#FF6B6B', '#4ECDC4'])
             ax2.set_title('Search Performance (ms)')
@@ -497,13 +497,13 @@ class StorageEnginesDemo:
             
             # Update performance (LSM only)
             update_data = [np.mean(self.performance_data["lsm"]["update"]), 0]
-            bars3 = ax3.bar(['LSM Updates', 'VIPER\n(Not Optimized)'], update_data, color=['#FF6B6B', '#CCCCCC'])
+            bars3 = ax3.bar(['LSM Updates', 'NOVA\n(Not Optimized)'], update_data, color=['#FF6B6B', '#CCCCCC'])
             ax3.set_title('Update Performance (ms)')
             ax3.set_ylabel('Time (ms)')
             
-            # Compression ratio (VIPER only)
-            compression_data = [1, np.mean(self.performance_data["viper"]["compression"])]
-            bars4 = ax4.bar(['LSM\n(No Compression)', 'VIPER'], compression_data, color=['#CCCCCC', '#4ECDC4'])
+            # Compression ratio (NOVA only)
+            compression_data = [1, np.mean(self.performance_data["nova"]["compression"])]
+            bars4 = ax4.bar(['LSM\n(No Compression)', 'NOVA'], compression_data, color=['#CCCCCC', '#4ECDC4'])
             ax4.set_title('Compression Ratio')
             ax4.set_ylabel('Compression Factor')
             
@@ -525,11 +525,11 @@ class StorageEnginesDemo:
                     "ACID transaction support",
                     f"Average update time: {np.mean(self.performance_data['lsm']['update']):.1f}ms"
                 ],
-                "viper_strengths": [
+                "nova_strengths": [
                     "Analytics and large-scale processing",
                     "Storage compression (4x+ reduction)",
                     "Read-heavy workload optimization", 
-                    f"Compression ratio: {np.mean(self.performance_data['viper']['compression']):.1f}x"
+                    f"Compression ratio: {np.mean(self.performance_data['nova']['compression']):.1f}x"
                 ]
             },
             "performance_metrics": self.performance_data,
@@ -540,7 +540,7 @@ class StorageEnginesDemo:
                     "Real-time personalization",
                     "Financial trading systems"
                 ],
-                "viper_use_cases": [
+                "nova_use_cases": [
                     "Document collections",
                     "Product catalogs",
                     "Historical data analysis",
@@ -561,7 +561,7 @@ class StorageEnginesDemo:
         
         try:
             self.rest_client.delete_collection(self.lsm_collection)
-            self.rest_client.delete_collection(self.viper_collection)
+            self.rest_client.delete_collection(self.nova_collection)
             logger.info("✅ Deleted demo collections")
         except Exception as e:
             logger.warning(f"⚠️ Cleanup failed: {e}")
@@ -570,9 +570,9 @@ class StorageEnginesDemo:
         """Run the complete storage engines demonstration"""
         print("🎭 ProximaDB Storage Engines Comparison Demo")
         print("=" * 60)
-        print("This demo compares LSM and VIPER storage engines:")
+        print("This demo compares LSM and NOVA storage engines:")
         print("• LSM Engine: Optimized for updates and mixed workloads")
-        print("• VIPER Engine: Optimized for analytics and compression") 
+        print("• NOVA Engine: Optimized for analytics and compression") 
         print("=" * 60)
         
         if not self.setup():
@@ -581,14 +581,14 @@ class StorageEnginesDemo:
         try:
             # Run demonstrations
             self.demonstrate_lsm_strengths()
-            self.demonstrate_viper_strengths()
+            self.demonstrate_nova_strengths()
             self.compare_engines()
             self.generate_performance_report()
             
             print("\n✅ Storage engines demonstration completed successfully!")
             print("\n💡 Key Takeaways:")
             print("• LSM excels at real-time, update-heavy workloads")
-            print("• VIPER excels at analytics and storage efficiency")
+            print("• NOVA excels at analytics and storage efficiency")
             print("• ProximaDB's storage-aware search optimizes automatically")
             print("• Hybrid deployments leverage both engines' strengths")
             
@@ -611,7 +611,7 @@ def main():
     print(f"\n{'='*60}")
     if success:
         print("🎊 Storage engines demonstration completed successfully!")
-        print("✨ Both LSM and VIPER engines showcased their unique strengths!")
+        print("✨ Both LSM and NOVA engines showcased their unique strengths!")
     else:
         print("😞 Demo encountered issues")
     

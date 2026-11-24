@@ -5,7 +5,7 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | **Partial: S1 soft-deprecation (#1770) and S2 rejection of NEW VIPER collection selections (commit `e55df2325`) shipped. Open: S3 deletion of `src/storage/engines/viper/`, gated on S2 soak.**
+| Status | **Resolved (2026-11-23): S1 soft-deprecation (#1770), S2 rejection of NEW VIPER collection selections (`e55df2325`), and S3 code removal all shipped.**
 | Severity | Low-Medium — maintenance tax on an unexercised Beta engine; no user-visible defect
 | Component | `src/storage/engines/viper/`, `src/storage/engines/factory.rs`, `docs/SUPPORTED_SURFACE.adoc`, all-engines test loops
 | Decision record | link:../../12-design/adr/ADR-093-viper-engine-deprecation.adoc[ADR-093] (executes the retirement ADR-026 deferred)
@@ -17,15 +17,24 @@
 
 * *S1 (#1770):* SUPPORTED_SURFACE → Deprecated; factory `warn!` on every VIPER construction; VIPER removed from benchmark promotion sweeps while conformance coverage remains.
 * *S2 (`e55df2325`):* collection create/update rejects NEW VIPER selections with a migration pointer (SST default, NOVA columnar, DataFusion/Parquet for warehouse analytics); the context-free factory remains for existing reads.
+* *S3 (2026-11-23):* `src/storage/engines/viper/` deleted and the full match-site fan-out swept (`StorageEngineType::VIPER`, `FormatType::Viper`, `EngineProfile::Viper`, `TierDataFormat::VIPER`, the DataFusion `EngineType::Viper`, `ViperConfig`/`[storage.viper_config]`, `ViperCapabilities`, `ViperOptimizations`, `ViperTransactionalOperations`, capabilities/metrics/benchmarks/tests). The proto `StorageEngine.VIPER = 1` variant, its string conversions, and `StorageEngineStrategy::Viper` (as a serde/wire tombstone mapping to SST baselines, mirroring the CHRONO pattern) are retained; every construction path fails closed with an error naming ADR-093.
 
 *Why retire:* #1743 found VIPER's point-read broken for its own writer's format (`FixedSizeList` written vs `ListArray` read) with zero production exposure; `factory.rs` hardcodes `FixedSizeList(Float32, 128)` (#1768); the niche is covered by DataFusion/Parquet (analytics), SST (ANN default) and NOVA (columnar vector). Further VIPER-side unit/type inconsistencies are recorded in TD-DSEFF-2 and are subsumed here.
 
-== Open
+== Stage-3 gate closure (2026-11-23)
 
-|===
-| Stage | Contents | Gate to advance
-| S3 | Delete `src/storage/engines/viper/` + the ~19-file match-site fan-out (ADR-026 census); KEEP `StorageEngine::Viper` proto variant + string conversions forever (wire compat) | S2 soak with zero VIPER construction telemetry and verified empty persisted-VIPER inventory after migration
-|===
+ADR-093's stage-3 gate ("stage-2 soak, zero telemetry signals, and a verified
+empty persisted-VIPER inventory after migration") is recorded as satisfied by
+owner decision under the pre-GA no-backward-compatibility policy
+(2026-11-20): there are no deployed fleets, no production telemetry
+collection, and no production VIPER collections — the only persisted VIPER
+data was test fixtures.
+
+*Accepted break (dated 2026-11-23):* existing VIPER collections (test
+fixtures only) have no migration path; pre-GA clean break. The retained wire
+value is rejected fail-closed at every construction boundary rather than
+readable, so stale clients receive an actionable error instead of silent
+data loss.
 
 == Not in scope
 

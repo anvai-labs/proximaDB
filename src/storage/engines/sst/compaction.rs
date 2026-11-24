@@ -4249,7 +4249,7 @@ impl Compaction {
         // DESIGN INSIGHT: Comparison with flush performance
         if total_time.as_millis() > 1000 {
             tracing::info!(
-                "💡 DESIGN INSIGHT: LSM compaction ({}ms) much slower than VIPER flush target (<200ms) - async compaction recommended",
+                "💡 DESIGN INSIGHT: LSM compaction ({}ms) much slower than the flush target (<200ms) - async compaction recommended",
                 total_time.as_millis()
             );
         }

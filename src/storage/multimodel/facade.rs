@@ -51,23 +51,23 @@ pub struct MultiModelFacadeConfig {
 ///         ▼                     ▼                     ▼
 /// ┌───────────────┐    ┌───────────────┐    ┌───────────────┐
 /// │  VectorStore  │    │  GraphStore   │    │  RDBMSStore   │
-/// │  (Helix+SST)  │    │   (Orion)     │    │  (SST+Viper)  │
+/// │  (Helix+SST)  │    │   (Orion)     │    │  (SST+column) │
 /// └───────────────┘    └───────────────┘    └───────────────┘
 ///         │                     │                     │
 /// ┌───────────────┐    ┌───────────────┐
 /// │ DocumentStore │    │ Observability │
-/// │ (SST+Viper+   │    │ (Partitioned+ │
+/// │ (SST+column+  │    │ (Partitioned+ │
 /// │  Tantivy)     │    │  WAL+Rollups) │
 /// └───────────────┘    └───────────────┘
 /// ```
 pub struct MultiModelStorageFacade {
     /// Vector store (Helix + SST)
     vector_store: Option<Arc<VectorStore>>,
-    /// Document store (SST + VIPER + Tantivy)
+    /// Document store (SST + columnar + Tantivy)
     document_store: Option<Arc<DocumentStore>>,
     /// Graph store (Orion)
     graph_store: Option<Arc<GraphStore>>,
-    /// RDBMS store (SST + VIPER HTAP)
+    /// RDBMS store (SST + columnar HTAP)
     rdbms_store: Option<Arc<RDBMSStore>>,
     /// Observability store (Time-partitioned + WAL)
     observability_store: Option<Arc<ObservabilityStore>>,

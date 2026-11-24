@@ -1158,7 +1158,7 @@ def main():
     📦 Deps: qdrant-client (~30MB)
 
   ProximaDB (via gRPC - NOT truly embedded yet):
-    ✅ 6 specialized storage engines (SST, HELIX, VIPER, etc.)
+    ✅ specialized storage engines (SST, HELIX, etc.)
     ✅ Graph database integration (ORION, PULSAR, QUASAR)
     ✅ Rich quantization (Binary, INT8, PQ)
     ✅ Multiple distance metrics (Cosine, Euclidean, DotProduct)

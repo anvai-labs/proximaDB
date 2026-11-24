@@ -579,13 +579,13 @@ impl AutoMLService {
 
         // Engine selection based on workload:
         // - SST for write-heavy (rw_ratio < 2.0) - LSM-tree optimized for writes
-        // - VIPER for read-heavy analytics (rw_ratio > 10.0) - Parquet columnar
+        // - NOVA for read-heavy analytics (rw_ratio > 10.0) - Parquet columnar
         // - NOVA for mixed with predicate pushdown needs
         // - HELIX for high-dimensional data
         let (recommendation, estimated_throughput_gain) = if rw_ratio < 2.0 {
             ("SST", 1.3) // 30% throughput improvement for write-heavy
         } else if rw_ratio > 10.0 {
-            ("VIPER", 1.5) // 50% improvement for analytics
+            ("NOVA", 1.5) // 50% improvement for analytics
         } else {
             ("NOVA", 1.2) // 20% improvement for mixed
         };

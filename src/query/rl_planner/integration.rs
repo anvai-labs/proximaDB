@@ -90,7 +90,6 @@ impl RLPlannerIntegration {
         match engine {
             StorageEngineType::SST => StorageEngine::Sst,
             StorageEngineType::HELIX => StorageEngine::Helix,
-            StorageEngineType::VIPER => StorageEngine::Viper,
             StorageEngineType::SWIFT => StorageEngine::Swift,
             StorageEngineType::NOVA => StorageEngine::Nova,
             StorageEngineType::RAPTOR => StorageEngine::Raptor,
@@ -205,7 +204,6 @@ impl RLPlannerIntegration {
             return match config.storage_engine() {
                 StorageEngine::Sst => StorageEngineType::SST,
                 StorageEngine::Helix => StorageEngineType::HELIX,
-                StorageEngine::Viper => StorageEngineType::VIPER,
                 StorageEngine::Swift => StorageEngineType::SWIFT,
                 StorageEngine::Nova => StorageEngineType::NOVA,
                 StorageEngine::Raptor => StorageEngineType::RAPTOR,

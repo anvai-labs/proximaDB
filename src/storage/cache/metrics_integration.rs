@@ -165,7 +165,6 @@ impl CacheMetricsCollector {
     async fn report_engine_cache_metrics(&self) -> Result<()> {
         let engines = vec![
             ("helix", "HELIX Engine"),
-            ("viper", "VIPER Engine"),
             ("sst", "SST Engine"),
             ("nova", "NOVA Engine"),
             ("swift", "SWIFT Engine"),

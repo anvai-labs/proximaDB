@@ -186,7 +186,7 @@ with ProximaDB(data_dirs="./data") as db:
 
 1. **Use NumPy arrays**: Pass `np.float32` arrays directly for zero-copy transfer
 2. **Batch inserts**: Insert vectors in batches of 1000-10000 for best throughput
-3. **Choose the right engine**: Use `sst` for real-time, `nova` for analytics/mixed workloads (`viper` is DEPRECATED — ADR-093)
+3. **Choose the right engine**: Use `sst` for real-time, `nova` for analytics/mixed workloads (`viper` was REMOVED — ADR-093)
 4. **Enable batch WAL**: Use `wal_sync_mode="batch"` for better write throughput
 5. **Size cache appropriately**: Larger cache = better read performance
 

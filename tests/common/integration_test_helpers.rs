@@ -3,7 +3,6 @@
 //!
 //! This module provides comprehensive test utilities for all ProximaDB components:
 //! - SST storage engine tests
-//! - VIPER storage engine tests  
 //! - Flush and compaction operations
 //! - Vector operations and search
 //! - Metadata handling
@@ -21,7 +20,6 @@ use uuid::Uuid;
 // Core ProximaDB imports
 use proximadb::compute::distance_computation::engine::UnifiedDistanceCompute;
 use proximadb::core::config::StorageLocation;
-use proximadb::core::config::ViperConfig;
 use proximadb::core::config::{BloomFilterConfig, SstConfig};
 use proximadb::core::search::results::OptimizedSearchRecord;
 use proximadb::proto::proximadb_v1::{
@@ -30,7 +28,6 @@ use proximadb::proto::proximadb_v1::{
 };
 use proximadb::services::vector_operations_service::VectorOperationsService;
 use proximadb::storage::engines::sst::SstEngine;
-use proximadb::storage::engines::viper::ViperEngine;
 use proximadb::storage::metadata::store::MetadataCacheConfig;
 use proximadb::storage::persistence::filesystem::{FilesystemConfig, FilesystemFactory};
 use proximadb::storage::persistence::write_ahead_log::config::WriteBufferStrategyType;
@@ -81,7 +78,6 @@ pub struct UnifiedTestEnvironment {
     pub persistent_dir: PathBuf,
     pub filesystem: Arc<FilesystemFactory>,
     pub sst_config: SstConfig,
-    pub viper_config: ViperConfig,
     pub storage_locations: Vec<StorageLocation>,
     pub distance_compute: Arc<UnifiedDistanceCompute>,
 }
@@ -113,7 +109,6 @@ impl UnifiedTestEnvironment {
 
         // Create optimized configs for testing
         let sst_config = Self::create_test_sst_config(&persistent_dir);
-        let viper_config = Self::create_test_viper_config(&persistent_dir);
 
         let storage_locations = vec![StorageLocation {
             url: format!("file://{}", persistent_dir.to_str().unwrap()),
@@ -129,7 +124,6 @@ impl UnifiedTestEnvironment {
             persistent_dir,
             filesystem,
             sst_config,
-            viper_config,
             storage_locations,
             distance_compute: Arc::new(UnifiedDistanceCompute::default()),
         })
@@ -149,16 +143,6 @@ impl UnifiedTestEnvironment {
         SstEngine::new()
             .await
             .map_err(|e| anyhow::anyhow!("Failed to create SST storage: {}", e))
-    }
-
-    /// Create a VIPER storage engine for this environment
-    pub async fn create_viper_engine(&self) -> Result<ViperEngine> {
-        info!(
-            "🏭 Creating VIPER engine for collection: {}",
-            self.collection_id
-        );
-
-        ViperEngine::new().await
     }
 
     /// Assemble the **real** `VectorOperationsService` stack (SST + WAL + Axis +
@@ -266,16 +250,9 @@ impl UnifiedTestEnvironment {
         self.persistent_dir.join("data")
     }
 
-    /// Get the data directory path for VIPER operations
-    pub fn get_viper_data_directory(&self) -> PathBuf {
-        // VIPER writes to configured data directory
-        PathBuf::from(&self.viper_config.data_directory)
-    }
-
     /// Ensure data directories exist for operations
     pub async fn ensure_all_directories(&self) -> Result<()> {
         tokio::fs::create_dir_all(self.get_sst_data_directory()).await?;
-        tokio::fs::create_dir_all(self.get_viper_data_directory()).await?;
         Ok(())
     }
 
@@ -369,31 +346,6 @@ impl UnifiedTestEnvironment {
         Ok((flush_params, data_dir, collection_config))
     }
 
-    /// Unified setup for VIPER operations with proper paths and configuration
-    pub async fn setup_viper_test(
-        &self,
-        vectors: Vec<VectorRecord>,
-    ) -> Result<(FlushParameters, PathBuf, Collection)> {
-        let data_dir = self.get_viper_data_directory();
-        tokio::fs::create_dir_all(&data_dir).await?;
-
-        let collection_config = self.create_test_collection_for_engine(StorageEngine::Viper);
-
-        let flush_params = FlushParameters {
-            collection_id: Some(self.collection_id.clone()),
-            vector_records: vectors
-                .into_iter()
-                .map(|v: VectorRecord| v.into())
-                .collect(),
-            force: true,
-            synchronous: true,
-            collection_config: Some(collection_config.clone()),
-            ..Default::default()
-        };
-
-        Ok((flush_params, data_dir, collection_config))
-    }
-
     /// Create SST files using proper flush mechanism (from sst_compactor_tests)
     pub async fn create_sst_files_with_engine(
         &self,
@@ -463,32 +415,6 @@ impl UnifiedTestEnvironment {
         }
 
         Ok(sst_files)
-    }
-
-    /// Check if VIPER files exist in the expected location
-    pub async fn verify_viper_files_exist(&self) -> Result<Vec<std::fs::DirEntry>> {
-        let data_dir = self.get_viper_data_directory();
-        if !data_dir.exists() {
-            return Err(anyhow::anyhow!(
-                "VIPER data directory doesn't exist: {}",
-                data_dir.display()
-            ));
-        }
-
-        let entries = std::fs::read_dir(&data_dir)?;
-        let parquet_files: Vec<_> = entries
-            .filter_map(|e| e.ok())
-            .filter(|e| e.path().extension().is_some_and(|ext| ext == "parquet"))
-            .collect();
-
-        if parquet_files.is_empty() {
-            return Err(anyhow::anyhow!(
-                "No Parquet files found in: {}",
-                data_dir.display()
-            ));
-        }
-
-        Ok(parquet_files)
     }
 
     /// Create test vectors with metadata (enhanced version)
@@ -753,19 +679,6 @@ impl UnifiedTestEnvironment {
         // Use default config since struct fields may vary
         proximadb::core::config::Config::default()
     }
-
-    /// Create test VIPER configuration optimized for testing
-    fn create_test_viper_config(base_path: &std::path::Path) -> ViperConfig {
-        ViperConfig {
-            row_group_size: 50_000,
-            compression: "none".to_string(), // No compression for faster tests
-            compression_level: 0,
-            enable_statistics: true,
-            data_directory: base_path.join("data").to_str().unwrap().to_string(),
-            cache_size_mb: 64,
-            compaction_config: Default::default(),
-        }
-    }
 }
 
 /// Multiple isolated environments for concurrency testing
@@ -854,69 +767,12 @@ pub mod operations {
     // REMOVED: build_sst_flush_params_with_compression - Use build_sst_flush_params_with_collection
     // Tests must create collection config once and reuse it for both flush and compaction
 
-    /// Build FlushParameters for VIPER with custom compression
-    /// VIPER/Parquet supports: none, snappy, gzip, lz4, zstd, brotli (limited by Parquet format)
-    pub async fn build_viper_flush_params_with_compression(
-        environment: &UnifiedTestEnvironment,
-        vectors: Vec<ProximaRecord>,
-        compression_algo: &str,
-        _compression_level: i32,
-    ) -> Result<FlushParameters> {
-        environment.ensure_all_directories().await?;
-
-        let mut collection = environment.create_test_collection_for_engine(StorageEngine::Viper);
-
-        // VIPER uses Parquet compression, configured through collection config
-        if let Some(ref mut _config) = collection.config {
-            use proximadb::proto::proximadb_v1::CompressionAlgorithm;
-
-            // Map to Parquet-supported algorithms
-            let _algorithm = match compression_algo {
-                "none" | "uncompressed" => CompressionAlgorithm::CompressionNone as i32,
-                "zstd" => CompressionAlgorithm::CompressionZstd as i32,
-                "snappy" => CompressionAlgorithm::CompressionSnappy as i32,
-                "gzip" => CompressionAlgorithm::CompressionGzip as i32,
-                "lz4" => CompressionAlgorithm::CompressionLz4 as i32,
-                "brotli" => CompressionAlgorithm::CompressionBrotli as i32,
-                // Unsupported algorithms default to snappy
-                _ => {
-                    debug!(
-                        "Algorithm {} not supported by Parquet, using snappy",
-                        compression_algo
-                    );
-                    CompressionAlgorithm::CompressionSnappy as i32
-                }
-            };
-
-            // Compression config is handled by storage_config, not directly on collection config
-            // The compression will be applied through storage engine configuration
-        }
-
-        Ok(FlushParameters {
-            collection_id: Some(environment.collection_id().to_string()),
-            vector_records: vectors,
-            force: true,
-            synchronous: true,
-            collection_config: Some(collection),
-            ..Default::default()
-        })
-    }
-
     /// Build correct storage URL for SST search operations
     pub fn build_sst_storage_url(environment: &UnifiedTestEnvironment) -> String {
         // SST expects storage_url to point directly to where .sst files are located
         format!(
             "file://{}",
             environment.get_sst_data_directory().to_str().unwrap()
-        )
-    }
-
-    /// Build correct storage URL for VIPER search operations
-    pub fn build_viper_storage_url(environment: &UnifiedTestEnvironment) -> String {
-        // VIPER expects storage_url to point to where parquet files are located
-        format!(
-            "file://{}",
-            environment.get_viper_data_directory().to_str().unwrap()
         )
     }
 
@@ -959,60 +815,6 @@ pub mod operations {
                     })
                     .unwrap_or(proximadb::compute::distance_computation::DistanceMetric::Cosine),
                 storage_strategy: proximadb::storage::engines::StorageEngineStrategy::Sst,
-                storage_path: collection
-                    .storage_assignment
-                    .as_ref()
-                    .map(|sa| sa.base_location.clone())
-                    .unwrap_or_default(),
-                quantization_config: None,
-                estimated_vector_count: 0,
-                estimated_size_bytes: 0,
-                performance_tier: proximadb::storage::traits::PerformanceTier::Hot,
-                compression_enabled: false,
-                quantization_enabled: false,
-            },
-            user_context: None,
-            tenant_context: None,
-        };
-
-        engine.search_vectors_unified(&query_context).await
-    }
-
-    /// Search vectors in VIPER engine - REAL search, not simulated.
-    /// Returns `OptimizedSearchRecord` with canonical `ProximaValue` metadata.
-    pub async fn search_vectors_viper(
-        engine: &proximadb::storage::engines::viper::ViperEngine,
-        environment: &UnifiedTestEnvironment,
-        query_vector: &[f32],
-        top_k: usize,
-    ) -> Result<Vec<OptimizedSearchRecord>> {
-        let collection = Arc::new(environment.create_test_collection());
-        let search_params = Arc::new(proximadb::core::search::SearchParams {
-            vector: Some(query_vector.to_vec()),
-            top_k: Some(top_k as u16),
-            distance_metric: Some(proximadb::compute::distance_computation::DistanceMetric::Cosine),
-            ..Default::default()
-        });
-        let query_context = proximadb::storage::traits::StorageQueryContext {
-            search_params,
-            collection: collection.clone(),
-            metadata: proximadb::storage::traits::StorageQueryMetadata {
-                collection_id: collection.id.clone(),
-                use_axis_indexes: false,
-                has_quantization: false,
-                dimension: collection.config.as_ref().map(|c| c.dimension).unwrap_or(0) as usize,
-                distance_metric: collection
-                    .config
-                    .as_ref()
-                    .and_then(|c| c.distance_metric)
-                    .and_then(|dm| {
-                        std::convert::TryInto::<
-                            proximadb::compute::distance_computation::DistanceMetric,
-                        >::try_into(dm)
-                        .ok()
-                    })
-                    .unwrap_or(proximadb::compute::distance_computation::DistanceMetric::Cosine),
-                storage_strategy: proximadb::storage::engines::StorageEngineStrategy::Viper,
                 storage_path: collection
                     .storage_assignment
                     .as_ref()
@@ -1381,21 +1183,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_sst_and_viper_creation() {
+    async fn test_sst_creation() {
         let env = UnifiedTestEnvironment::new().await.unwrap();
 
         // Test SST engine creation
         let _sst_engine = env.create_sst_engine().await.unwrap();
         debug!("✅ Created SST engine for: {}", env.collection_id());
 
-        // Test VIPER engine creation
-        let _viper_engine = env.create_viper_engine().await.unwrap();
-        debug!("✅ Created VIPER engine for: {}", env.collection_id());
-
         // Test directory creation
         env.ensure_all_directories().await.unwrap();
         assert!(env.get_sst_data_directory().exists());
-        assert!(env.get_viper_data_directory().exists());
     }
 
     #[tokio::test]

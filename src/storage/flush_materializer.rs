@@ -65,7 +65,7 @@ pub struct CollectionFlushPlan {
     pub collection_identity: Option<crate::core::stable_id::CollectionIdentity>,
     /// Proto `StorageEngine` discriminant for the collection's configured engine.
     pub engine_type: i32,
-    /// Vector dimension (required by VIPER/NOVA flush).
+    /// Vector dimension (required by NOVA flush).
     pub dimension: u32,
     /// Owning tenant, when known — the A6 fence input. `None` ⇒ fence fails open.
     pub tenant_id: Option<String>,
@@ -723,7 +723,7 @@ async fn materialize_collection_with_coordinator_mode(
     // Per-tenant object-store WRITE metering (co-design KIU/KSU write side). This is the single
     // tenant-aware flush funnel through which every engine's memtable→object-store segment write
     // passes, so metering here — rather than at each per-engine PAX/segment write call site —
-    // keeps the emission DRY and engine-neutral (SST/HELIX/NOVA/VIPER all funnel through
+    // keeps the emission DRY and engine-neutral (SST/HELIX/NOVA all funnel through
     // `engine.flush()` above). It mirrors the read side's `record_object_store_op(.., "fetch_pax")`.
     //
     // OSS boundary: this emits NEUTRAL usage telemetry only (byte + op counts attributed by

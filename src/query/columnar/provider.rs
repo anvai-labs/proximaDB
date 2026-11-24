@@ -18,7 +18,7 @@
 //!
 //! This trait provides a unified abstraction for:
 //! - In-memory Arrow RecordBatch access (query result caching, intermediate results)
-//! - On-disk Parquet files (VIPER/NOVA engines)
+//! - On-disk Parquet files (NOVA)
 //! - On-disk ProximaBlocks (SST engine columnar mode)
 //! - Range-pruned I/O with predicate pushdown
 //!
@@ -138,7 +138,7 @@ pub struct ColumnarCapabilities {
 ///
 /// This trait abstracts over:
 /// - In-memory Arrow RecordBatches (from cache or intermediate results)
-/// - On-disk Parquet files (VIPER/NOVA engines)
+/// - On-disk Parquet files (NOVA)
 /// - On-disk ProximaBlocks (SST columnar mode)
 ///
 /// # Performance Considerations

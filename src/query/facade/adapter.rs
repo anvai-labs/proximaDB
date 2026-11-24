@@ -183,7 +183,7 @@ impl QueryFacadeAdapter {
     /// ## Arguments
     ///
     /// * `plan` - The plan node to validate
-    /// * `engine_name` - The name of the storage engine (e.g., "SST", "VIPER")
+    /// * `engine_name` - The name of the storage engine (e.g., "SST", "NOVA")
     ///
     /// ## Returns
     ///

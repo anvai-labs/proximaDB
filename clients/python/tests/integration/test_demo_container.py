@@ -78,7 +78,7 @@ class TestDockerDemoContainer:
         try:
             # Test create collection using SDK
             collection = client.create_collection(
-                collection_name, dimension=384, distance_metric="cosine", engine="viper"
+                collection_name, dimension=384, distance_metric="cosine", engine="nova"
             )
             assert (
                 collection is not None
@@ -145,7 +145,7 @@ class TestDockerDemoContainer:
         try:
             # Create test collection using SDK
             client.create_collection(
-                collection_name, dimension=3, distance_metric="cosine", engine="viper"
+                collection_name, dimension=3, distance_metric="cosine", engine="nova"
             )
 
             # Test vector insert using SDK (handles metadata conversion)

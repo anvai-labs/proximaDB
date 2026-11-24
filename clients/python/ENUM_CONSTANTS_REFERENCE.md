@@ -91,7 +91,7 @@ from proximadb.models import StorageEngineType
 client.create_collection(
     name="analytics_collection",
     dimension=768,
-    storage_engine=StorageEngineType.VIPER  # Clear: using VIPER for analytics
+    storage_engine=StorageEngineType.SST   # Clear: using SST for production
 )
 
 # ✅ Let ProximaDB auto-select best engine
@@ -112,7 +112,7 @@ client.create_collection(
 | Constant | Value | Engine | Best For |
 |----------|-------|--------|----------|
 | `StorageEngineType.UNSPECIFIED` | 0 | Auto-select | Let ProximaDB choose optimal engine |
-| `StorageEngineType.VIPER` | 1 | VIPER | Analytics, batch operations, compression |
+| `StorageEngineType.VIPER` | 1 | VIPER | REMOVED (ADR-093) — wire value only; use NOVA for analytics |
 | `StorageEngineType.SST` | 2 | SST | Real-time queries, frequent updates |
 | `StorageEngineType.NOVA` | 3 | NOVA | Mixed workloads, progressive search |
 | `StorageEngineType.HELIX` | 4 | HELIX | Spatial locality, range queries |
@@ -161,7 +161,7 @@ collection_id = client.create_collection(
     name="fast_search_collection",
     dimension=768,
     distance_metric=DistanceMetricType.COSINE,
-    storage_engine=StorageEngineType.VIPER,
+    storage_engine=StorageEngineType.SST,
     index_configs=[hnsw_index]
 )
 ```
@@ -179,7 +179,7 @@ collection_id = client.create_collection(
     name="analytics_vectors",
     dimension=512,
     distance_metric=DistanceMetricType.EUCLIDEAN,
-    storage_engine=StorageEngineType.VIPER  # Columnar format for analytics
+    storage_engine=StorageEngineType.NOVA  # Columnar format for analytics
 )
 ```
 
@@ -231,7 +231,7 @@ client.create_collection(
     name="my_collection",
     dimension=1536,
     distance_metric=DistanceMetricType.COSINE,  # Clear!
-    storage_engine=StorageEngineType.VIPER      # Clear!
+    storage_engine=StorageEngineType.SST       # Clear!
 )
 
 index_config = IndexConfig(
@@ -327,7 +327,7 @@ client.create_collection(
     name="explicit_collection",
     dimension=1536,
     distance_metric=DistanceMetricType.COSINE,
-    storage_engine=StorageEngineType.VIPER,
+    storage_engine=StorageEngineType.SST,
     index_configs=[hnsw_index]
 )
 ```

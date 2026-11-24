@@ -132,7 +132,7 @@ def advanced_collection_config() -> CollectionConfig:
         dimension=768,
         distance_metric="cosine",
         description="Advanced test collection with BERT dimensions",
-        storage_engine=StorageEngine.VIPER,
+        storage_engine=StorageEngine.NOVA,
     )
 
 

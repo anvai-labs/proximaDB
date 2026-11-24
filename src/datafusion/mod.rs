@@ -92,7 +92,6 @@ pub use table_provider::{
     ProximaDataFusionTableConfig,
     create_nova_table_provider,
     // Factory functions
-    create_viper_table_provider,
 };
 
 pub use scan_executor::{PartitionInfo, ProximaDBScanExec};
@@ -142,9 +141,6 @@ pub use engine_adapters::{
     SstSplitReader,
     // SST engine adapter
     SstTableProvider,
-    ViperSplitReader,
-    // VIPER engine adapter
-    ViperTableProvider,
     open_object_store_parquet_location,
     register_object_store_parquet_location,
     register_parquet_path,

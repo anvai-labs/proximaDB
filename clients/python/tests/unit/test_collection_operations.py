@@ -159,7 +159,7 @@ class TestCollectionConfiguration:
             dimension=384,
             distance_metric="euclidean",
             index_configs=[index_config],
-            storage_engine=StorageEngine.VIPER,
+            storage_engine=StorageEngine.NOVA,
             description="Advanced test collection",
             filterable_metadata_fields=["category", "timestamp"],
             compression={"algorithm": CompressionType.LZ4},
@@ -202,7 +202,7 @@ class TestCollectionConfiguration:
     def test_storage_engines(self):
         """Test storage engine options"""
         engines = [
-            StorageEngine.VIPER,
+            StorageEngine.NOVA,
             StorageEngine.SST,
             StorageEngine.MMAP,
             StorageEngine.HYBRID,

@@ -84,7 +84,7 @@ pub struct FlushMetricsUpdate {
     pub bytes_written: i64,
     pub duration_ms: i64,
     pub files_created: i32,
-    pub engine_type: String, // "VIPER" or "SST"
+    pub engine_type: String, // "NOVA" or "SST"
     pub timestamp: i64,
 }
 
@@ -309,7 +309,7 @@ impl AsyncMetricsUpdater {
                 metrics.last_flush_timestamp = update.timestamp;
                 metrics.last_flush_duration_ms = update.duration_ms;
 
-                if update.engine_type == "VIPER" {
+                if update.engine_type == "NOVA" {
                     metrics.parquet_file_count += update.files_created;
                 } else if update.engine_type == "SST" {
                     metrics.sstable_file_count += update.files_created;
@@ -632,7 +632,7 @@ impl InternalMetricsUpdater for MetricsUpdateService {
 
         // Update file counts based on engine type
         match update.engine_type.as_str() {
-            "VIPER" => metrics.parquet_file_count += update.files_created,
+            "NOVA" => metrics.parquet_file_count += update.files_created,
             "SST" => metrics.sstable_file_count += update.files_created,
             _ => {}
         }
@@ -834,7 +834,7 @@ mod tests {
             bytes_written: 10 * 1024 * 1024,
             duration_ms: 2500,
             files_created: 3,
-            engine_type: "VIPER".to_string(),
+            engine_type: "NOVA".to_string(),
             timestamp: chrono::Utc::now().timestamp_millis(),
         };
 
@@ -1009,7 +1009,7 @@ mod tests {
                     bytes_written: (i + 1) * 1024 * 1024,
                     duration_ms: 1000 + (i * 100),
                     files_created: 1,
-                    engine_type: if i % 2 == 0 { "VIPER" } else { "SST" }.to_string(),
+                    engine_type: if i % 2 == 0 { "NOVA" } else { "SST" }.to_string(),
                     timestamp: chrono::Utc::now().timestamp_millis(),
                 };
 
@@ -1149,7 +1149,7 @@ mod tests {
             bytes_written: 1024 * 1024,
             duration_ms: 1000,
             files_created: 1,
-            engine_type: "VIPER".to_string(),
+            engine_type: "NOVA".to_string(),
             timestamp: chrono::Utc::now().timestamp_millis(),
         };
 
@@ -1212,7 +1212,7 @@ mod tests {
             bytes_written: 5 * 1024 * 1024,
             duration_ms: 1200,
             files_created: 2,
-            engine_type: "VIPER".to_string(),
+            engine_type: "NOVA".to_string(),
             timestamp: chrono::Utc::now().timestamp_millis(),
         };
         updater

@@ -432,7 +432,7 @@ pub mod filter_extraction {
     /// Extract simple equality conditions from filter expressions
     ///
     /// This extracts field/value pairs from FilterExpression for efficient metadata filtering
-    /// Used consistently across SST, VIPER, and Write Buffer engines
+    /// Used consistently across SST, NOVA, and Write Buffer engines
     ///
     /// # Examples
     /// ```rust,ignore

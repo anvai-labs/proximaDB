@@ -156,7 +156,7 @@ Storage engines notify EventLog after successful flush:
 
 [source,rust]
 ----
-// In SST/VIPER/NOVA flush operation
+// In SST/NOVA/NOVA flush operation
 pub async fn flush(&self, params: FlushParameters) -> Result<FlushResult> {
     // 1. Write data to disk
     let flushed_files = self.write_to_disk(&vectors).await?;

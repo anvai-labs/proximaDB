@@ -17,7 +17,7 @@
 //! ParquetRangePrunedProvider - Parquet reader with range pruning
 //!
 //! Provides optimized disk I/O with predicate pushdown for:
-//! - VIPER engine Parquet files
+//! - NOVA Parquet files
 //! - NOVA engine columnar files
 //! - Any Parquet-formatted vector data
 //!

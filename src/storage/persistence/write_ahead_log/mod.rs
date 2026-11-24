@@ -13,7 +13,7 @@
 //!
 //! The WAL system sits between the API layer and storage engines:
 //! ```text
-//! API Handlers → WAL (Memory + Disk) → Storage Engines (SST/VIPER/etc)
+//! API Handlers → WAL (Memory + Disk) → Storage Engines (SST/etc)
 //!                 ↓                      ↑
 //!              Memtable              Flush Process
 //! ```
@@ -3457,14 +3457,14 @@ mod simple_context_tests {
 
         debug!("🧪 TEST: BackgroundFlushContext creation and validation");
 
-        let context = flush_context("test_collection", StorageEngineType::Viper, 1000);
+        let context = flush_context("test_collection", StorageEngineType::Tst, 1000);
 
         // Validate context fields
         assert_eq!(context.collection_id, "test_collection");
-        assert_eq!(context.storage_engine, StorageEngineType::Viper);
+        assert_eq!(context.storage_engine, StorageEngineType::Tst);
         assert_eq!(context.dimension, 384);
         assert_eq!(context.distance_metric, DistanceMetric::Cosine);
-        assert_eq!(context.engine_name(), "viper");
+        assert_eq!(context.engine_name(), "tst");
 
         // Test SST engine as well
         let sst_context = flush_context("sst_collection", StorageEngineType::Sst, 500);
@@ -3479,23 +3479,23 @@ mod simple_context_tests {
 
         debug!("🧪 TEST: Context performance configuration");
 
-        let viper_context = flush_context("perf_test", StorageEngineType::Viper, 1000);
+        let tst_context = flush_context("perf_test", StorageEngineType::Tst, 1000);
 
         // Test dimension-based optimizations
-        assert_eq!(viper_context.dimension, 384);
+        assert_eq!(tst_context.dimension, 384);
 
         // Test batch size hint calculation
-        assert!(viper_context.batch_size_hint.is_some());
-        let batch_size = viper_context.batch_size_hint.unwrap();
-        assert!(batch_size > 0 && batch_size <= 10000);
+        assert!(tst_context.batch_size_hint.is_some());
+        let batch_size = tst_context.batch_size_hint.unwrap();
+        assert!(batch_size > 0 && batch_size <= 20000);
 
-        // Test row group size optimization for VIPER
-        let row_group_size = viper_context.row_group_size();
-        assert!((1000..=50000).contains(&row_group_size));
+        // Test row group size optimization
+        let row_group_size = tst_context.row_group_size();
+        assert!((2000..=100000).contains(&row_group_size));
 
         // Test flush threshold optimization
-        let flush_threshold = viper_context.flush_threshold();
-        assert!((10000..=100000).contains(&flush_threshold));
+        let flush_threshold = tst_context.flush_threshold();
+        assert!(flush_threshold > 0);
 
         info!("✅ Context performance configuration test passed");
     }
@@ -3797,7 +3797,7 @@ mod optimization_validation_tests {
         let _result = mock_service.get_collection("test_collection").await;
         debug!("   VectorOperationsService → Collection Service Call #1 (creates context)");
 
-        let context = flush_context("test_collection", StorageEngineType::Viper, 1000);
+        let context = flush_context("test_collection", StorageEngineType::Sst, 1000);
 
         debug!("   BackgroundManager → Uses pre-computed context (NO service call)");
         debug!("   FlushCoordinator → Uses pre-computed context (NO service call)");
@@ -3806,7 +3806,7 @@ mod optimization_validation_tests {
         let dimension = context.dimension;
         let batch_hint = context.batch_size_hint;
 
-        assert_eq!(engine_name, "viper");
+        assert_eq!(engine_name, "sst");
         assert_eq!(dimension, 384);
         assert!(batch_hint.is_some());
 
@@ -3845,7 +3845,7 @@ mod optimization_validation_tests {
 
         let context = BackgroundFlushContext {
             collection_id: "completeness_test".to_string(),
-            storage_engine: StorageEngineType::Viper,
+            storage_engine: StorageEngineType::Sst,
             base_location: "file:///tmp/test".to_string(),
             dimension: 512,
             distance_metric: DistanceMetric::Euclidean,
@@ -3870,8 +3870,8 @@ mod optimization_validation_tests {
         };
 
         assert_eq!(context.collection_id, "completeness_test");
-        assert_eq!(context.storage_engine, StorageEngineType::Viper);
-        assert_eq!(context.engine_name(), "viper");
+        assert_eq!(context.storage_engine, StorageEngineType::Sst);
+        assert_eq!(context.engine_name(), "sst");
         assert_eq!(context.dimension, 512);
         assert_eq!(context.distance_metric, DistanceMetric::Euclidean);
         assert_eq!(context.base_location, "file:///tmp/test");

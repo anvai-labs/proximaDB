@@ -1,6 +1,6 @@
 //! # Shared Columnar Storage Infrastructure - Apache Parquet-based Vector Storage
 //!
-//! This module provides the columnar storage foundation for NOVA and VIPER engines,
+//! This module provides the columnar storage foundation for the columnar engines,
 //! implementing high-performance Apache Parquet-based storage with extensive optimizations
 //! for vector search workloads. It eliminates code duplication while providing each engine
 //! the flexibility to implement their specific optimizations.
@@ -76,7 +76,7 @@
 // 3. **ID-Aware Storage**: Keep customer ID column with optional row offset optimizations
 // 4. **Progressive Search**: Binary → INT8 → PQ → FP32 quantization pipeline
 // 5. **Unified Optimization**: Shared caching, statistics, and query planning
-// ## Benefits for Both VIPER and NOVA
+// ## Benefits for the columnar engines
 // - 95% reduction in metadata scanning overhead (bloom filters)
 // - 80% memory reduction during large file processing (streaming)
 // - Dictionary encoding for efficient ID storage with fast lookups
@@ -148,7 +148,7 @@ pub use constants::{
     FIELD_QP_INT8_MAX, FIELD_QP_INT8_MIN, FIELD_QP_INT8_SCALE, FIELD_QP_PQ_CENTROIDS,
     FIELD_QP_PQ_SUBQUANTIZERS, FIELD_ROW_GROUP_OFFSET, FIELD_ROW_INDEX, FIELD_SCHEMA_VERSION,
     FIELD_SOURCE, FIELD_TIMESTAMP, FIELD_UPDATED_AT, FIELD_VECTOR_FP32, FIELD_VERSION,
-    PARQUET_EXTENSION, VIPER_FILE_EXTENSION,
+    PARQUET_EXTENSION,
 };
 
 // Re-exports for convenience
@@ -240,7 +240,7 @@ pub use serialization::{
 pub use common::{
     CommonColumnarConfig, CommonColumnarOperations, DistanceComputationConfig, OptimalBatchSizes,
     PerformanceMonitor, RowGroupSizeOptimization, SchemaGenerationConfig,
-    SerializationOptimizationConfig, ViperOptimizations,
+    SerializationOptimizationConfig,
 };
 
 // TEXT column storage and filtering re-exports
@@ -497,7 +497,7 @@ pub fn estimate_row_group_memory(row_group: &RowGroupMetaData, schema: &Schema) 
 pub struct ColumnarFactory;
 
 impl ColumnarFactory {
-    /// Create optimized Parquet reader for VIPER/NOVA engines
+    /// Create optimized Parquet reader for the columnar engines
     /// Note: enable_id_less is optimization only, ID column is always kept
     pub async fn create_optimized_reader(
         _filesystem: Arc<crate::storage::persistence::filesystem::FilesystemFactory>,

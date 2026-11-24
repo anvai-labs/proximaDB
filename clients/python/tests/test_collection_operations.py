@@ -177,14 +177,14 @@ class TestCollectionConfiguration:
             name="test_collection_advanced",  # Minimum 8 characters
             dimension=384,
             distance_metric="euclidean",
-            storage_engine=StorageEngine.VIPER,
+            storage_engine=StorageEngine.NOVA,
             index_configs=[index_config],
             description="Advanced test collection",
         )
 
         assert config.dimension == 384
         assert config.distance_metric == "euclidean"
-        assert config.storage_engine == StorageEngine.VIPER
+        assert config.storage_engine == StorageEngine.NOVA
         assert len(config.index_configs) == 1
         assert config.index_configs[0].algorithm == IndexType.HNSW
 
@@ -257,7 +257,7 @@ class TestCollectionConfiguration:
             dimension=384,
             distance_metric="cosine",
             description="Configuration test collection",
-            storage_engine=StorageEngine.VIPER,
+            storage_engine=StorageEngine.NOVA,
         )
 
         try:

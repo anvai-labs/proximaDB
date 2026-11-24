@@ -34,7 +34,7 @@
 //!
 //! The plan originally placed `bulk_load.rs` in `crates/modalities/
 //! proximadb-vector`. That crate doesn't currently own the actual
-//! storage-engine integration code — the engines (NOVA, SST, VIPER,
+//! storage-engine integration code — the engines (NOVA, SST,
 //! etc.) live in this crate (`src/storage/engines/`). Locating
 //! `BulkLoader` here avoids a circular dep: `proximadb-vector` cannot
 //! reach back into the main `proximadb` crate. When the storage-engine
@@ -158,7 +158,7 @@ impl BulkLoader {
 
         // Phase 2F-b activation: try the engine-specific LSM-bypass
         // path first. Engines that ship `ingest_sorted_segment`
-        // overrides (NOVA so far; SST/VIPER/RAPTOR/CHRONO/SEQUOIA as
+        // overrides (NOVA so far; SST/RAPTOR/CHRONO/SEQUOIA as
         // they migrate) write a single SST/Parquet file directly,
         // skipping WAL+memtable for ~30% storage-layer savings on top
         // of the inference-layer batching. Engines without an override

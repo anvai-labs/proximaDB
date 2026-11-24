@@ -17,7 +17,7 @@ use crate::storage::traits::StorageFormatStrategy;
 /// engine-specific optimizations:
 ///
 /// - **SST**: Bloom filters, range scans, block cache
-/// - **VIPER**: Predicate pushdown, column projection, row group pruning
+/// - **NOVA**: Predicate pushdown, column projection, row group pruning
 /// - **NOVA**: Progressive quantization, zone maps, streaming
 /// - **RAPTOR**: Tier-aware scanning, consolidated reading
 #[async_trait]
@@ -31,7 +31,7 @@ pub trait StorageScan: Send + Sync {
     /// and is implemented differently by each engine:
     ///
     /// - **SST**: Uses modular block readers with bloom filters
-    /// - **VIPER**: Uses columnar predicate pushdown
+    /// - **NOVA**: Uses columnar predicate pushdown
     /// - **NOVA**: Uses progressive quantization stages
     /// - **RAPTOR**: Uses tier-aware consolidated reading
     ///

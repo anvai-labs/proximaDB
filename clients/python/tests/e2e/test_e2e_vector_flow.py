@@ -114,7 +114,7 @@ def test_end_to_end_flow():
             name=collection_name,
             dimension=dimension,
             distance_metric="cosine",
-            storage_engine=StorageEngine.VIPER,
+            storage_engine=StorageEngine.NOVA,
             description="BERT embedding test collection",
         )
 

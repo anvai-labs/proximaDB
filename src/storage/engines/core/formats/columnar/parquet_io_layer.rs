@@ -280,7 +280,7 @@ impl SharedParquetFormatReader {
         row_filter: Option<&FilterExpression>,
     ) -> Result<Vec<RecordBatch>, ProximaDBError> {
         // CACHE-FIRST PATTERN: Check zero-copy metadata cache for Parquet metadata
-        // Cache key format: filename:collection_id:engine (parquet/viper/nova)
+        // Cache key format: filename:collection_id:engine (parquet/nova)
         let cache_key = format!("{}:{}:parquet", file_path, collection_id);
 
         match self.zero_copy_system.get_cached_metadata(&cache_key).await {

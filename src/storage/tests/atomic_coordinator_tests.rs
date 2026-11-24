@@ -534,7 +534,7 @@ async fn test_cleanup_orphaned_operations() {
 }
 
 #[tokio::test]
-async fn test_viper_atomic_operations() {
+async fn test_flush_stage_atomic_operations() {
     // Use timestamp-based directory names to avoid URL parsing issues
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -552,28 +552,36 @@ async fn test_viper_atomic_operations() {
     .await
     .unwrap();
 
-    let viper_ops = crate::storage::transaction_coordinator::ViperTransactionalOperations::new(
-        Arc::new(coordinator),
-    );
+    let coordinator = Arc::new(coordinator);
 
-    // Test VIPER-specific flush operation
-    let operation = viper_ops
-        .begin_flush_operation("viper_collection", temp_dir.path().to_str().unwrap())
+    // Generic flush-staging coverage (previously reached through the VIPER
+    // wrapper, removed with the engine per ADR-093).
+    let config = StagingConfig {
+        base_url: temp_dir.path().to_str().unwrap().to_string(),
+        collection_id: Some("flush_collection".to_string()),
+        operation_type: TransactionStageType::Flush,
+        auto_cleanup: true,
+        skip_uuid_subdir: true,
+        ..Default::default()
+    };
+    let operation = coordinator
+        .begin_atomic_operation(&config)
         .await
-        .expect("Failed to begin VIPER flush");
+        .expect("Failed to begin flush");
 
-    // Write parquet data
-    let parquet_data = b"mock parquet data";
-    viper_ops
-        .write_parquet_to_staging(&operation.operation_id, "data.parquet", parquet_data)
+    coordinator
+        .write_to_staging(
+            &operation.operation_id,
+            "vectors/data.parquet",
+            b"mock parquet data",
+        )
         .await
         .expect("Failed to write parquet");
 
-    // Finalize flush
-    viper_ops
-        .finalize_flush(&operation.operation_id)
+    coordinator
+        .finalize_atomic_operation(&operation.operation_id)
         .await
-        .expect("Failed to finalize VIPER flush");
+        .expect("Failed to finalize flush");
 }
 
 #[tokio::test]

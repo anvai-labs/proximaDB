@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Comprehensive ProximaDB Performance Test
-Tests REST and gRPC protocols with SST and VIPER engines
+Tests REST and gRPC protocols with SST and NOVA engines
 Including quantization performance (16-bit, 8-bit, 4-bit)
 """
 
@@ -113,7 +113,7 @@ def test_protocol_engine_combination(
         name=collection_name,
         dimension=DIMENSION,
         distance_metric=DistanceMetric.COSINE,
-        storage_engine=StorageEngine.VIPER if engine == "viper" else StorageEngine.SST,
+        storage_engine=StorageEngine.NOVA if engine == "nova" else StorageEngine.SST,
         description=f"Performance test: {protocol}/{engine}/{quantization or 'FP32'}"
     )
     
@@ -171,9 +171,9 @@ def test_protocol_engine_combination(
     
     print(f"✅ Insert complete: {avg_batch_time:.2f}ms per batch, {(NUM_VECTORS / total_insert_time) * 1000:.0f} vectors/sec")
     
-    # Wait for data to be flushed if VIPER
-    if engine == "viper":
-        print("⏳ Waiting for VIPER flush...")
+    # Wait for data to be flushed if NOVA
+    if engine == "nova":
+        print("⏳ Waiting for NOVA flush...")
         time.sleep(2)
     
     # Test search performance and accuracy
@@ -235,20 +235,20 @@ def run_comprehensive_tests():
     # Test combinations
     test_cases = [
         # REST tests
-        ("rest", "viper", None),      # REST + VIPER + FP32
-        ("rest", "viper", "pq16"),    # REST + VIPER + PQ16
-        ("rest", "viper", "pq8"),     # REST + VIPER + PQ8
-        ("rest", "viper", "pq4"),     # REST + VIPER + PQ4
+        ("rest", "nova", None),      # REST + NOVA + FP32
+        ("rest", "nova", "pq16"),    # REST + NOVA + PQ16
+        ("rest", "nova", "pq8"),     # REST + NOVA + PQ8
+        ("rest", "nova", "pq4"),     # REST + NOVA + PQ4
         ("rest", "sst", None),        # REST + SST + FP32
         ("rest", "sst", "pq16"),      # REST + SST + PQ16
         ("rest", "sst", "pq8"),       # REST + SST + PQ8
         ("rest", "sst", "pq4"),       # REST + SST + PQ4
         
         # gRPC tests
-        ("grpc", "viper", None),      # gRPC + VIPER + FP32
-        ("grpc", "viper", "pq16"),    # gRPC + VIPER + PQ16
-        ("grpc", "viper", "pq8"),     # gRPC + VIPER + PQ8
-        ("grpc", "viper", "pq4"),     # gRPC + VIPER + PQ4
+        ("grpc", "nova", None),      # gRPC + NOVA + FP32
+        ("grpc", "nova", "pq16"),    # gRPC + NOVA + PQ16
+        ("grpc", "nova", "pq8"),     # gRPC + NOVA + PQ8
+        ("grpc", "nova", "pq4"),     # gRPC + NOVA + PQ4
         ("grpc", "sst", None),        # gRPC + SST + FP32
         ("grpc", "sst", "pq16"),      # gRPC + SST + PQ16
         ("grpc", "sst", "pq8"),       # gRPC + SST + PQ8
@@ -305,7 +305,7 @@ def print_performance_summary(results: Dict[str, Any]):
     print("QUANTIZATION TRADEOFFS")
     print("="*80)
     
-    for engine in ["viper", "sst"]:
+    for engine in ["nova", "sst"]:
         print(f"\n{engine.upper()} Engine:")
         print("-"*60)
         
@@ -335,7 +335,7 @@ def print_performance_summary(results: Dict[str, Any]):
 
 if __name__ == "__main__":
     print("🚀 Starting Comprehensive ProximaDB Performance Test")
-    print("   Testing REST and gRPC with SST and VIPER engines")
+    print("   Testing REST and gRPC with SST and NOVA engines")
     print("   Including PQ16, PQ8, and PQ4 quantization")
     
     run_comprehensive_tests()

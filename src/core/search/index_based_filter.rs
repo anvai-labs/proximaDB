@@ -4,7 +4,7 @@
 //! 1. Filter evaluation returns qualifying ROW INDICES
 //! 2. Top-level orchestrator uses indices for engine-specific optimizations
 //! 3. SST: Uses indices to filter already-read block data
-//! 4. VIPER: Uses indices to selectively read parquet rows/columns
+//! 4. NOVA: Uses indices to selectively read parquet rows/columns
 //! 5. Empty indices = skip entire blocks/row groups (early termination)
 
 use anyhow::Result;

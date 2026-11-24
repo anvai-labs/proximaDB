@@ -9,8 +9,5 @@
 [storage.sst_config]
 block_size_kb = 256  # 256KB blocks for fast random access
 
-# For Parquet-based engines (VIPER, NOVA), smaller row groups and pages
-# allow for more granular pruning and less data read on point queries.
-[storage.viper_config]
 row_group_size = 65536       # ~65k vectors, results in ~32MB row groups
 page_size = 524288          # 512KB pages

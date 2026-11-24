@@ -6,7 +6,7 @@
 //!
 //! ## Design Principles
 //!
-//! - **Storage Agnostic**: Traits work across VIPER, SST, HELIX, and other engines
+//! - **Storage Agnostic**: Traits work across NOVA, SST, HELIX, and other engines
 //! - **Hardware Abstraction**: SIMD/GPU acceleration hidden behind traits
 //! - **Cache Flexibility**: Pluggable caching implementations
 //! - **Async First**: All storage operations are async for scalability

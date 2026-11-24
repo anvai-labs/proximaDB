@@ -24,7 +24,7 @@ ProximaDB provides native Arrow Flight support for exporting data to analytics t
 
 |Parquet
 |`.parquet`
-|NOVA (VIPER: deprecated, existing collections only)
+|NOVA
 |===
 
 All formats are accessible via Arrow Flight on the multiplexed port 5678.
@@ -434,7 +434,7 @@ If you see "Format not supported" errors:
 
 1. Check that the file exists and has a valid extension
 2. Ensure the ProximaDB server is running with Arrow Flight enabled
-3. Verify the collection uses an exportable engine (SST, or NOVA; VIPER only for existing collections)
+3. Verify the collection uses an exportable engine (SST or NOVA)
 
 === Large File Timeouts
 
@@ -481,7 +481,7 @@ Choose the block format based on your use case:
 |Analytics/export workloads
 |Native Arrow, fastest scans
 
-|Parquet (NOVA; VIPER deprecated)
+|Parquet (NOVA)
 |Columnar analytics
 |Best compression, excellent for batch processing
 |===
@@ -517,7 +517,7 @@ Benchmark results for 1000 vectors with 128 dimensions:
 |10.8
 |Direct
 
-|Viper/Parquet
+|NOVA/Parquet
 |*22.5*
 |*260.9*
 |12.4
@@ -534,11 +534,11 @@ _* indicates best performance for that metric_
 |Metric |Winner |Value
 
 |Fastest Write
-|Viper/Parquet
+|NOVA/Parquet
 |22.5 ms
 
 |Smallest Size
-|Viper/Parquet
+|NOVA/Parquet
 |260.9 KB
 
 |Fastest Scan
@@ -546,7 +546,7 @@ _* indicates best performance for that metric_
 |8.8 ms
 
 |Fastest Filter
-|Viper/Parquet
+|NOVA/Parquet
 |4.9 ms
 |===
 
@@ -573,7 +573,7 @@ All formats are now accessible via Arrow Flight:
 |Direct
 |Direct
 
-|Viper/Parquet (.parquet)
+|NOVA/Parquet (.parquet)
 |Direct
 |Direct
 |Direct

@@ -164,8 +164,8 @@ def test_benchmark_metrics_nested():
 
 
 def test_engine_performance_defaults():
-    ep = dm.EnginePerformance(engine_name="viper")
-    assert ep.engine_name == "viper"
+    ep = dm.EnginePerformance(engine_name="nova")
+    assert ep.engine_name == "nova"
     assert ep.insert_metrics is None
     assert ep.flush_time_ms is None
 
@@ -176,12 +176,12 @@ def test_benchmark_result_and_report():
         duration_seconds=12.5,
         vector_count=1000,
         dimension=384,
-        engine_results=[dm.EnginePerformance(engine_name="viper")],
+        engine_results=[dm.EnginePerformance(engine_name="nova")],
         metadata={"host": "ci"},
     )
     assert result.success is True
     assert isinstance(result.timestamp, datetime)
-    assert result.engine_results[0].engine_name == "viper"
+    assert result.engine_results[0].engine_name == "nova"
 
     report = dm.PerformanceReport(report_id="r-1")
     assert report.report_id == "r-1"

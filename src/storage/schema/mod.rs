@@ -93,7 +93,7 @@ pub use header_cache::{
 pub use header_loaders::{
     // Registry
     HeaderLoaderRegistry,
-    // Parquet-based loaders (VIPER, NOVA, RAPTOR)
+    // Parquet-based loaders (NOVA, RAPTOR)
     ParquetHeaderLoader,
     // ProximaBlocks-based loaders (SST, HELIX, SWIFT)
     ProximaBlocksHeaderLoader,

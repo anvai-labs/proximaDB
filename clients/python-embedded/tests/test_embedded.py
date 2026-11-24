@@ -659,7 +659,7 @@ class TestEngines:
     """Storage engine tests"""
 
     @pytest.mark.parametrize(
-        "engine", ["sst", "viper", "nova", "swift", "raptor", "helix"]
+        "engine", ["sst", "nova", "swift", "raptor", "helix"]
     )
     def test_engine_types(self, engine):
         """Test different storage engines"""

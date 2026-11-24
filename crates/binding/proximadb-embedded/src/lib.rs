@@ -28,7 +28,7 @@
 //! │   - Node.js: NAPI-RS (feature = "nodejs")               │
 //! ├─────────────────────────────────────────────────────────────┤
 //! │         ProximaDB Core (Rust)                           │
-//! │   - Storage Engines (SST, VIPER, NOVA, SWIFT, etc.)     │
+//! │   - Storage Engines (SST, NOVA, SWIFT, etc.)            │
 //! │   - Multi-disk support via StorageLocation              │
 //! │   - WAL persistence                                     │
 //! │   - Compute (SIMD-accelerated)                          │
@@ -1414,7 +1414,7 @@ impl EmbeddedProximaDB {
     /// # Arguments
     /// * `name` - Collection name
     /// * `dimension` - Vector dimension
-    /// * `engine` - Optional storage engine ("sst", "helix", "viper", "swift", "nova", "raptor", "tst")
+    /// * `engine` - Optional storage engine ("sst", "helix", "swift", "nova", "raptor", "tst")
     /// * `index_type` - Index type: "hnsw", "ivf", "flat", "lsh", or "none"
     ///
     /// # Example

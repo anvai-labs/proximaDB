@@ -937,7 +937,7 @@ def test_create_collection_request_matches_spec(
         "collection_id": "col_abc",
         "name": "my_collection",
         "dimension": 128,
-        "engine": "viper",
+        "engine": "nova",
         "proxima_record_enabled": True,
         "storage_class": "balanced",
         "storage_class_status": {

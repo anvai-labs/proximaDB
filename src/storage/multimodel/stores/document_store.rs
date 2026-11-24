@@ -1,12 +1,12 @@
 //! # Document Store
 //!
-//! Combines SST (hot tier), VIPER (cold tier), and Tantivy (full-text search)
+//! Combines SST (hot tier), columnar Parquet (cold tier), and Tantivy (full-text search)
 //! for MongoDB-like JSON document storage.
 //!
 //! ## Storage Strategy (from `/src/storage/document/mod.rs`)
 //!
 //! - **Hot tier**: SST engine with document-optimized blocks
-//! - **Cold tier**: VIPER/Parquet columnar storage
+//! - **Cold tier**: Parquet columnar storage
 //! - **Indexes**: JSON path (B+ tree), Array (inverted), Full-text (Tantivy)
 
 use async_trait::async_trait;
@@ -68,7 +68,7 @@ impl Default for DocumentStoreConfig {
 /// │  └─────────────────────────────────────┘│
 /// │              │                │          │
 /// │    ┌─────────▼───────┐ ┌─────▼────────┐ │
-/// │    │   SST Engine    │ │ VIPER Engine │ │
+/// │    │   SST Engine    │ │ Columnar Eng │ │
 /// │    │  (Hot Tier)     │ │ (Cold Tier)  │ │
 /// │    │  - Real-time    │ │ - Columnar   │ │
 /// │    │  - Low-latency  │ │ - Analytics  │ │
@@ -112,7 +112,7 @@ impl DocumentStore {
             supports_streaming: true,
             max_recommended_records: Some(10_000_000), // 10M documents
             description:
-                "MongoDB-like JSON documents with SST (hot) + VIPER (cold) + Tantivy (full-text)"
+                "MongoDB-like JSON documents with SST (hot) + Parquet (cold) + Tantivy (full-text)"
                     .to_string(),
         }
     }

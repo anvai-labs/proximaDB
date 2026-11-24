@@ -33,7 +33,7 @@ fn demonstrate_direct_engine_access() -> Result<(), Box<dyn std::error::Error>> 
     // Major Engines (Phase 1)
     println!("   🏭 Major Engines (Phase 1):");
     println!("      use proximadb::storage::engines::sst::SstEngine;");
-    println!("      use proximadb::storage::engines::viper::ViperEngine;");
+    println!("      use proximadb::storage::engines::nova::NovaEngine;");
     println!("      use proximadb::storage::engines::nova::NovaEngine;");
     println!("      use proximadb::storage::engines::swift::SwiftEngine;");
     println!("      use proximadb::storage::engines::raptor::RaptorEngine;");
@@ -71,9 +71,9 @@ async fn demonstrate_automatic_selection() -> Result<(), Box<dyn std::error::Err
     let oltp_engine = StorageEngineFactory::create_for_workload(WorkloadType::Transactional)?;
     println!("   📊 Transactional Workload → SST Engine (Real-time queries, frequent updates)");
 
-    // Analytics workload → VIPER engine
+    // Analytics workload → NOVA engine
     let olap_engine = StorageEngineFactory::create_for_workload(WorkloadType::Analytics)?;
-    println!("   📈 Analytics Workload → VIPER Engine (Analytics, batch operations)");
+    println!("   📈 Analytics Workload → NOVA Engine (Analytics, batch operations)");
 
     // Mixed workload → NOVA engine
     let mixed_engine = StorageEngineFactory::create_for_workload(WorkloadType::Mixed)?;
@@ -96,7 +96,7 @@ async fn demonstrate_all_engines() -> Result<(), Box<dyn std::error::Error>> {
             "Real-time queries, frequent updates",
             "Transactional",
         ),
-        ("VIPER", "Analytics, batch operations", "Analytics"),
+        ("NOVA", "Analytics, batch operations", "Analytics"),
         ("NOVA", "Mixed workloads", "Mixed"),
         ("SWIFT", "High-throughput", "Experimental"),
         ("RAPTOR", "Matrix operations", "Analytics"),

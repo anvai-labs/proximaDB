@@ -247,7 +247,7 @@ class TestProtoQuantizationMessages:
         config.name = "test_collection"
         config.dimension = 768
         config.distance_metric = proximadb_pb2.COSINE
-        config.storage_engine = proximadb_pb2.StorageEngine.VIPER
+        config.storage_engine = proximadb_pb2.StorageEngine.NOVA
         config.primary_indexing_algorithm = proximadb_pb2.IndexingAlgorithm.HNSW
 
         # Add quantization config

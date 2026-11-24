@@ -2,7 +2,7 @@
 //!
 //! This module provides a unified interface for distance computations across all storage engines.
 //! It integrates the PQ and INT8 optimized distance computations and provides progressive
-//! refinement capabilities for all storage engines (PRISM, NOVA, SWIFT, VIPER, SST).
+//! refinement capabilities for all storage engines (PRISM, NOVA, SWIFT, SST).
 //!
 //! ## Common Capabilities Provided
 //!
@@ -31,7 +31,7 @@
 //! - **Accuracy Tracking**: Compare against full precision baseline
 //!
 //! ### 5. Storage Engine Integration
-//! - **Engine Adapters**: Standardized adapters for PRISM, NOVA, SWIFT, VIPER, SST
+//! - **Engine Adapters**: Standardized adapters for PRISM, NOVA, SWIFT, SST
 //! - **Engine-Specific Optimization**: Custom optimizations per engine type
 //! - **Metadata Management**: Unified handling of vector metadata across engines
 //! - **Collection Context**: Shared collection configuration and caching
@@ -58,7 +58,7 @@
 //! │  │   Calculator    │  │   Pipeline      │  │    Manager      │ │
 //! │  └─────────────────┘  └─────────────────┘  └─────────────────┘ │
 //! ├─────────────────────────────────────────────────────────────┤
-//! │ PRISM │ NOVA │ SWIFT │ VIPER │ SST │ Future Engines...      │
+//! │ PRISM │ NOVA │ SWIFT │ SST │ Future Engines...               │
 //! └─────────────────────────────────────────────────────────────┘
 //! ```
 //!
@@ -123,7 +123,7 @@ pub use progressive_refinement::{
 
 pub use storage_integration::{
     EngineType, IntegrationError, NOVAAdapter, PRISMAdapter, SSTAdapter, SWIFTAdapter,
-    StorageEngineAdapter, VIPERAdapter,
+    StorageEngineAdapter,
 };
 
 /// Current version of the universal adapter system
@@ -151,7 +151,6 @@ impl Default for UniversalAdapterConfig {
                 StorageEngineConfig::prism_default(),
                 StorageEngineConfig::nova_default(),
                 StorageEngineConfig::swift_default(),
-                StorageEngineConfig::viper_default(),
                 StorageEngineConfig::sst_default(),
             ],
         }

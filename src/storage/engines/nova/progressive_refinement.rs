@@ -1,4 +1,4 @@
-// Progressive refinement search for VIPER dual-mode
+// Progressive refinement search for the NOVA dual-mode
 // Implements multi-stage search with increasing precision
 
 use crate::proto::proximadb_v1::VectorRecord;

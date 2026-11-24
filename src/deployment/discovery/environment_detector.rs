@@ -745,10 +745,9 @@ impl EnvironmentDetector {
         let estimated_qps = (base_qps as f64 * storage_multiplier) as u32;
 
         // Recommend storage engine based on resources
-        let recommended_storage_engine = if memory_gb >= 32 && cpu_cores >= 16 {
-            "NOVA".to_string() // High-performance for well-resourced environments
-        } else if memory_gb >= 16 {
-            "VIPER".to_string() // Balanced performance for medium resources
+        let recommended_storage_engine = if memory_gb >= 16 {
+            // Well-resourced and medium environments: the columnar engine
+            "NOVA".to_string()
         } else {
             "SST".to_string() // Memory-efficient for resource-constrained environments
         };

@@ -204,7 +204,7 @@ pub struct HybridParquetWriter {
     /// Metadata collector for hierarchical metadata (NOVA)
     metadata_collector: Arc<Mutex<Option<Box<dyn super::metadata_collector::MetadataCollector>>>>,
 
-    /// Filterable columns for metadata extraction (VIPER)
+    /// Filterable columns for metadata extraction (columnar)
     filterable_columns: Option<Vec<crate::proto::proximadb_v1::FilterableColumnSpec>>,
 
     /// Last flush time
@@ -378,7 +378,7 @@ impl HybridParquetWriter {
         *metadata_lock = Some(collector);
     }
 
-    /// Set filterable columns for metadata extraction (VIPER)
+    /// Set filterable columns for metadata extraction (columnar)
     pub fn set_filterable_columns(
         &mut self,
         columns: Vec<crate::proto::proximadb_v1::FilterableColumnSpec>,

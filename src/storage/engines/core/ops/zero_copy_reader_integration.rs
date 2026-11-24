@@ -70,7 +70,7 @@ impl ZeroCopyReaderIntegration {
             .get_unified_caching_filesystem(
                 base_path,
                 collection_id.to_string(),
-                "VIPER".to_string(),
+                "NOVA".to_string(),
             )
             .map_err(|e| ProximaDBError::Internal(e.to_string()))?;
 
@@ -114,9 +114,7 @@ impl ZeroCopyReaderIntegration {
         for engine_type in engine_types {
             let workload_type = match engine_type {
                 "SST" => crate::storage::engines::core::io::zero_copy::WorkloadType::HighThroughput,
-                "VIPER" | "NOVA" => {
-                    crate::storage::engines::core::io::zero_copy::WorkloadType::Analytics
-                }
+                "NOVA" => crate::storage::engines::core::io::zero_copy::WorkloadType::Analytics,
                 "SWIFT" | "RAPTOR" => {
                     crate::storage::engines::core::io::zero_copy::WorkloadType::RealTime
                 }
@@ -142,7 +140,7 @@ impl ZeroCopyReaderIntegration {
             // Create appropriate reader type
             let reader: Box<dyn EnhancedReader> = match engine_type {
                 "SST" => Box::new(EnhancedSstReader::new(zero_copy_fs.clone())),
-                "VIPER" => Box::new(EnhancedParquetReader::new(zero_copy_fs.clone())),
+                "NOVA" => Box::new(EnhancedParquetReader::new(zero_copy_fs.clone())),
                 "SWIFT" => Box::new(EnhancedSwiftReader::new(zero_copy_fs.clone())),
                 _ => {
                     return Err(ProximaDBError::Config(format!(
@@ -238,7 +236,7 @@ impl EnhancedParquetReader {
 
 impl EnhancedReader for EnhancedParquetReader {
     fn engine_type(&self) -> &str {
-        "VIPER"
+        "NOVA"
     }
 
     fn read_optimized<'a>(
@@ -402,7 +400,7 @@ mod tests {
             "test_collection",
             temp_dir.path().to_str().unwrap(),
             filesystem_factory,
-            vec!["SST", "VIPER", "SWIFT"],
+            vec!["SST", "NOVA", "SWIFT"],
         )
         .await;
 
@@ -410,7 +408,7 @@ mod tests {
         let readers = readers.unwrap();
         assert_eq!(readers.len(), 3);
         assert_eq!(readers[0].engine_type(), "SST");
-        assert_eq!(readers[1].engine_type(), "VIPER");
+        assert_eq!(readers[1].engine_type(), "NOVA");
         assert_eq!(readers[2].engine_type(), "SWIFT");
     }
 }

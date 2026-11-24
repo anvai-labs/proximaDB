@@ -1,6 +1,6 @@
 //! Unified Columnar Optimization Module
 //!
-//! Provides shared optimizations for both VIPER and NOVA engines:
+//! Provides shared optimizations for the columnar engines:
 //! - Parquet bloom filter optimization
 //! - Streaming row group access
 //! - Progressive search with quantization

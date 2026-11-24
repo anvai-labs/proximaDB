@@ -13,7 +13,7 @@
 //! - **Feature Flag**: `experimental-engines` required
 //! - **Tests**: 41 tests (insufficient coverage)
 //! - **DEFERRED Items**: 30+ critical features missing
-//! - **Recommendation**: Use SST, VIPER, HELIX, or NOVA instead
+//! - **Recommendation**: Use SST, HELIX, or NOVA instead
 //!
 //! ## Migration Guide
 //!
@@ -131,7 +131,7 @@
 //!
 //! ## ❌ **NOT OPTIMAL FOR:**
 //!
-//! - **Flat Data Structures**: SST or VIPER better for non-hierarchical data
+//! - **Flat Data Structures**: SST is better for non-hierarchical data
 //! - **Simple Use Cases**: Overhead not justified for basic vector storage
 //! - **Real-Time Analytics**: NOVA better for complex analytical workloads
 //! - **Memory-Constrained Systems**: Three-tier overhead requires adequate RAM

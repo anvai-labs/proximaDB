@@ -173,7 +173,7 @@ public class ProximaDB implements Closeable, AutoCloseable {
 
         /**
          * Set the default storage engine.
-         * Options: "sst", "viper", "nova", "swift", "raptor", "helix"
+         * Options: "sst", "nova", "swift", "raptor", "helix"
          */
         public Builder defaultEngine(String engine) {
             this.defaultEngine = engine;

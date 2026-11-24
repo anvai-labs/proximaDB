@@ -36,7 +36,7 @@ pub fn comprehensive_qps_benchmark(c: &mut Criterion) {
     let dataset_sizes = vec![1_000, 10_000, 100_000, 500_000, 1_000_000];
 
     // Test different storage engines
-    let storage_engines = vec!["SST", "VIPER", "NOVA", "SWIFT", "RAPTOR", "HELIX"];
+    let storage_engines = vec!["SST", "NOVA", "SWIFT", "RAPTOR", "HELIX"];
 
     // Track all benchmark results
     let mut all_results = Vec::new();

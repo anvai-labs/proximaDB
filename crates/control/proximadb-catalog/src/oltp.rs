@@ -22,7 +22,7 @@
 //! ## Stacked Durability Mandate
 //!
 //! The OLTP catalog stores ONLY catalog metadata (schema, stats, snapshots).
-//! ProximaDB record data always stays in the internal storage engines (VIPER/NOVA/HELIX).
+//! ProximaDB record data always stays in the internal storage engines (NOVA/HELIX/SST).
 //! The OLTP DB is not a durable record store — it is a fast, ACID metadata authority.
 //!
 //! ## Size-Based Routing

@@ -5,7 +5,7 @@
 #   adls://container/proximadb/prod
 #
 # server.data_dir remains a local working volume for caches/staging only. The
-# collection catalog, WAL, SST/VIPER segments, and indexes are rooted below the
+# collection catalog, WAL, SST segments, and indexes are rooted below the
 # object-store URL so a replacement VM can recover with an empty local disk.
 
 [server]
@@ -22,7 +22,7 @@ tags = ["cloud", "durable", "primary"]
 
 [storage.optimization]
 # CRITICAL: mmap is a local-file primitive and cannot be used for remote SST or
-# VIPER objects. ProximaDB also fails closed at startup if this is true for a
+# objects. ProximaDB also fails closed at startup if this is true for a
 # cloud storage location.
 enable_mmap = false
 enable_zone_map_pruning = true
@@ -42,13 +42,6 @@ data_directory = "${PROXIMADB_OBJECT_STORE_URL}/collections"
 block_size_kb = 4096
 mmap_enabled = false
 prefetch_enabled = true
-
-[storage.viper_config]
-data_directory = "${PROXIMADB_OBJECT_STORE_URL}/collections"
-row_group_size = 262144
-compression = "zstd"
-compression_level = 3
-enable_statistics = true
 
 [storage.filesystem_config]
 enable_write_strategy_cache = true

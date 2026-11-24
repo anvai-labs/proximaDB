@@ -52,7 +52,7 @@ def test_pydantic_model_creation():
         name="test_collection",
         dimension=128,
         distance_metric="cosine",
-        storage_engine=StorageEngine.VIPER,
+        storage_engine=StorageEngine.NOVA,
         description="Test collection",
         tags=["test", "example"],
         owner="unittest",
@@ -61,7 +61,7 @@ def test_pydantic_model_creation():
     assert config.name == "test_collection"
     assert config.dimension == 128
     assert config.distance_metric == "cosine"
-    assert config.storage_engine == StorageEngine.VIPER
+    assert config.storage_engine == StorageEngine.NOVA
     assert config.description == "Test collection"
     assert config.tags == ["test", "example"]
     assert config.owner == "unittest"
@@ -112,7 +112,7 @@ def test_type_conversion_helpers():
     assert client._proto_to_pydantic_distance_metric(3) == "dot_product"
 
     # Test storage engine conversion
-    assert client._proto_to_pydantic_storage_engine(1) == StorageEngine.VIPER
+    assert client._proto_to_pydantic_storage_engine(1) == StorageEngine.NOVA
     assert client._proto_to_pydantic_storage_engine(2) == StorageEngine.SST
     assert client._proto_to_pydantic_storage_engine(3) == StorageEngine.NOVA
 
@@ -127,8 +127,8 @@ def test_type_conversion_helpers():
 
         assert client._pydantic_to_proto_distance_metric("cosine") == pb2.COSINE
         assert (
-            client._pydantic_to_proto_storage_engine(StorageEngine.VIPER)
-            == pb2.StorageEngine.VIPER
+            client._pydantic_to_proto_storage_engine(StorageEngine.NOVA)
+            == pb2.StorageEngine.NOVA
         )
         assert (
             client._pydantic_to_proto_indexing_algorithm(IndexingAlgorithm.HNSW)

@@ -150,7 +150,6 @@ mod tests {
             EngineType::PRISM,
             EngineType::NOVA,
             EngineType::SWIFT,
-            EngineType::VIPER,
             EngineType::SST,
         ];
 

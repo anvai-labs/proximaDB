@@ -30,7 +30,7 @@ proximadb.init_logging("warn")
 from proximadb import ProximaDB as EmbeddedProximaDB
 
 # Test configuration
-ENGINES = ["sst", "helix", "viper", "swift", "nova", "raptor"]
+ENGINES = ["sst", "helix", "swift", "nova", "raptor"]
 FULL_VECTOR_COUNT = 50000
 QUICK_VECTOR_COUNT = 1000
 DIMENSION = 128

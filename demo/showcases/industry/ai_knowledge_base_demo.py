@@ -311,7 +311,7 @@ class AIKnowledgeBase:
                 name=self.collection_name,
                 dimension=768,  # all-mpnet-base-v2 dimension
                 distance_metric=DistanceMetric.COSINE,
-                storage_engine=StorageEngine.VIPER,  # Optimized for metadata filtering
+                storage_engine=StorageEngine.NOVA,  # Optimized for metadata filtering
                 filterable_metadata_fields=filterable_fields  # Specify indexed fields
             )
             
@@ -322,7 +322,7 @@ class AIKnowledgeBase:
             
             print(f"✅ Created collection: {self.collection_name}")
             print(f"   - Dimension: 768 (BERT all-mpnet-base-v2)")
-            print(f"   - Engine: VIPER (columnar storage)")
+            print(f"   - Engine: NOVA (columnar storage)")
             print(f"   - Distance: Cosine similarity")
             print(f"   - Protocol: gRPC (high performance)")
             print(f"   - Filterable fields: {len(filterable_fields)} configured")
@@ -472,7 +472,7 @@ class AIKnowledgeBase:
                 print(f"   ❌ Failed to ingest: {e}")
         
         print(f"\n📊 Total chunks in knowledge base: {total_chunks}")
-        print(f"   💾 Metadata optimized for VIPER columnar storage")
+        print(f"   💾 Metadata optimized for NOVA columnar storage")
         return total_chunks
     
     def perform_rag_query(self, query: str, top_k: int = 3):
@@ -726,7 +726,7 @@ class AIKnowledgeBase:
         
         print("\n🎉 RAG demo completed!")
         print("\n📝 Key Features Demonstrated:")
-        print("✅ Smart metadata separation for VIPER optimization")
+        print("✅ Smart metadata separation for NOVA optimization")
         print("✅ Rich content analysis (code detection, difficulty levels)")
         print("✅ Filtered search by topic, difficulty, and content type")
         print("✅ LLM-powered answer generation with context")

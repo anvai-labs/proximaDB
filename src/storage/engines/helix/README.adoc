@@ -353,7 +353,7 @@ let nearby = helix_engine.range_search(
 
 * **SST**: Random access, write-heavy workloads
 * **SWIFT**: Hierarchical organization, multi-tenant
-* **Analytics**: a relational table materialized for DataFusion (VIPER is deprecated, ADR-093)
+* **Analytics**: a relational table materialized for DataFusion (NOVA is deprecated, ADR-093)
 * **RAPTOR**: Dynamic adaptive access patterns
 
 == Key Components
@@ -735,7 +735,7 @@ Via API:
 
 [cols="2,3,3,3,3"]
 |===
-|Feature |HELIX |SST |VIPER |SWIFT
+|Feature |HELIX |SST |NOVA |SWIFT
 
 |Core Technology
 |Hilbert curve + PCA
@@ -803,7 +803,7 @@ Via API:
 **When to Choose Alternatives**:
 
 * **SST**: Random access, write-heavy, small collections
-* **Analytics**: a relational table materialized for DataFusion (VIPER is deprecated, ADR-093)
+* **Analytics**: a relational table materialized for DataFusion (NOVA is deprecated, ADR-093)
 * **SWIFT**: Multi-tenant, hierarchical organization, billions of vectors
 * **RAPTOR**: Dynamic adaptive access, graph-like relationships
 

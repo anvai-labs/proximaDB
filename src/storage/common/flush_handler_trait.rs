@@ -53,9 +53,6 @@ impl FlushHandlerFactory {
             super::compaction_utils::StorageEngineType::SST => {
                 Box::new(SstFlushHandlerAdapter::new())
             }
-            super::compaction_utils::StorageEngineType::VIPER => {
-                Box::new(ViperFlushHandlerAdapter::new())
-            }
             super::compaction_utils::StorageEngineType::NOVA => Box::new(NovaFlushHandler::new()),
             super::compaction_utils::StorageEngineType::SWIFT => Box::new(SwiftFlushHandler::new()),
             super::compaction_utils::StorageEngineType::HELIX => Box::new(HelixFlushHandler::new()),
@@ -121,55 +118,6 @@ impl FlushHandler for SstFlushHandlerAdapter {
     }
 }
 
-// Adapter for VIPER engine
-struct ViperFlushHandlerAdapter {
-    inner: crate::storage::engines::viper::eventlog_flush::ViperFlushNotifier,
-}
-
-impl ViperFlushHandlerAdapter {
-    fn new() -> Self {
-        Self {
-            inner: crate::storage::engines::viper::eventlog_flush::ViperFlushNotifier::new(),
-        }
-    }
-}
-
-#[async_trait]
-impl FlushHandler for ViperFlushHandlerAdapter {
-    async fn can_compact_files(&self, collection_id: &str, files: &[String]) -> Result<bool> {
-        // ViperFlushNotifier's can_compact_files returns bool
-        Ok(self.inner.can_compact_files(collection_id, files).await)
-    }
-
-    async fn compact_files(
-        &self,
-        collection_id: &str,
-        files: &[String],
-        output_path: &str,
-    ) -> Result<()> {
-        // VIPER flush handler doesn't have compact_files method, so we implement basic compaction logic
-        info!(
-            "VIPER compaction initiated: {} files -> {} for collection {}",
-            files.len(),
-            output_path,
-            collection_id
-        );
-
-        // Notify about compaction completion using available methods
-        self.inner.notify_compaction_complete(
-            collection_id,
-            vec![output_path.to_string()],
-            0, // Vector count would be calculated during actual compaction
-        );
-
-        Ok(())
-    }
-
-    fn engine_name(&self) -> &'static str {
-        "VIPER"
-    }
-}
-
 // Nova engine handler
 struct NovaFlushHandler;
 
@@ -182,7 +130,7 @@ impl NovaFlushHandler {
 #[async_trait]
 impl FlushHandler for NovaFlushHandler {
     async fn can_compact_files(&self, _collection_id: &str, _files: &[String]) -> Result<bool> {
-        // Nova uses columnar format similar to VIPER
+        // Nova uses a columnar format
         // For now, all files are compactable
         Ok(true)
     }

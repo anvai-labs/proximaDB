@@ -105,7 +105,7 @@ def setup_collection(client: ProximaDBClient, collection_name: str) -> None:
         name=collection_name,
         dimension=384,  # Common embedding dimension
         distance_metric=DistanceMetric.COSINE,
-        storage_engine=StorageEngine.VIPER,  # Columnar for metadata filtering
+        storage_engine=StorageEngine.NOVA,  # Columnar for metadata filtering
         metadata={
             "description": "Product catalog for advanced search demo",
             "index_type": "hnsw",

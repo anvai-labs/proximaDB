@@ -1,5 +1,5 @@
 //! Shared bulk-ingest plumbing for `ingest_sorted_segment` (redundancy
-//! pass 3). The four engine copies (SST/NOVA/VIPER/RAPTOR) were
+//! pass 3). The engine copies (SST/NOVA/RAPTOR) were
 //! line-identical modulo the engine label, the fallback segment-id
 //! prefix, and which flush seam they call — that seam stays at each call
 //! site; everything else lives here.

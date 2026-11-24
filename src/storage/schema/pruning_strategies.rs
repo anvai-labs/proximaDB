@@ -332,7 +332,7 @@ pub enum SpatialRangeType {
     ZoneMap,
     /// Block range (SST)
     BlockRange,
-    /// Parquet rowgroup (VIPER)
+    /// Parquet rowgroup (NOVA)
     ParquetRowGroup,
 }
 

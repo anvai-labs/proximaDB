@@ -7,7 +7,7 @@
 //!
 //! Flush→AXIS used to be split by engine. SST called
 //! `AxisManager::handle_flushed_vectors` **directly** with the in-memory
-//! `ProximaRecord`s it already held (zero I/O). VIPER / HELIX / NOVA instead
+//! `ProximaRecord`s it already held (zero I/O). HELIX / NOVA instead
 //! published a metadata event to the AXIS coordination queue, whose consumer
 //! then **re-read those same vectors back out of storage** — N round-trips to
 //! recover bytes the flush had in hand. On object storage that is the dominant
@@ -321,7 +321,7 @@ mod tests {
         );
     }
 
-    /// VIPER/HELIX/NOVA construct `axis_manager: None`, so their engines pass
+    /// HELIX/NOVA construct `axis_manager: None`, so their engines pass
     /// `None` explicitly and rely on the boot-registered global (the SST-style
     /// `set_flush_axis_manager` registration `SharedServices::new` now also wires
     /// for the shared hook). This pins that fallback path.

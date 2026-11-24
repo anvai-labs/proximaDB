@@ -642,7 +642,7 @@ impl AxisEventLogConsumer {
     ///
     /// This method uses the ExtractionFactory to create engine-specific extractors,
     /// providing a consistent interface across all storage engines (SST, SWIFT, HELIX,
-    /// VIPER, NOVA, RAPTOR).
+    /// NOVA, RAPTOR).
     async fn read_vectors_from_files(
         &self,
         files: &[String],

@@ -1,7 +1,7 @@
 //! # Engine-Specific TableProvider Adapters
 //!
 //! This module provides engine-specific implementations of the `ProximaTableProvider` trait
-//! for SST, HELIX, and VIPER storage engines.
+//! for SST and HELIX storage engines.
 //!
 //! ## Architecture
 //!
@@ -16,7 +16,7 @@
 //! │         ┌────────────────────────────────────────────────────┐              │
 //! │         │                   Implementations                   │              │
 //! │  ┌──────┴──────┐    ┌──────────────┐    ┌────────────────┐   │              │
-//! │  │ SST Adapter │    │ HELIX Adapter │    │ VIPER Adapter │   │              │
+//! │  │ SST Adapter │    │ HELIX Adapter │                  │              │
 //! │  │ Block-based │    │ Hilbert-based │    │ Parquet-based │   │              │
 //! │  │ + Bloom     │    │ + Spatial     │    │ + Columnar    │   │              │
 //! │  └─────────────┘    └──────────────┘    └────────────────┘   │              │
@@ -36,7 +36,7 @@
 //!
 //! ```rust,ignore
 //! use proximadb::datafusion::engine_adapters::{
-//!     SstTableProvider, HelixTableProvider, ViperTableProvider
+//!     SstTableProvider, HelixTableProvider
 //! };
 //!
 //! // Create SST table provider
@@ -66,7 +66,6 @@ pub(crate) mod pinned_ndjson;
 pub mod pinned_table;
 pub mod sst_adapter;
 pub mod table_open_cache;
-pub mod viper_adapter;
 
 // Re-export main types for convenience
 pub use filesystem_parquet_reader::{
@@ -81,7 +80,6 @@ pub use pax_adapter::PaxSplitReader;
 pub use pax_segment_locator::discover_pax_segments;
 pub use pax_table_provider::{PaxTableProvider, register_pax_location};
 pub use sst_adapter::{SstSplitReader, SstTableProvider};
-pub use viper_adapter::{ViperSplitReader, ViperTableProvider};
 
 use std::sync::Arc;
 
@@ -94,7 +92,7 @@ use crate::datafusion::proxima_scan_exec::{ProximaScanExec, SplitReader};
 use crate::storage::formats::FileSplit;
 
 /// Shared body of the engine-adapter `TableProvider::scan` implementations
-/// (SST / VIPER / HELIX): feed the discovered `splits` and the per-engine
+/// (SST / HELIX): feed the discovered `splits` and the per-engine
 /// `reader` into the `ProximaScanExec` builder seam (ADR-052).
 ///
 /// The engine-specific part — constructing the `SplitReader` — stays at the

@@ -15,7 +15,7 @@ use proximadb_filter_expression::FilterExpression;
 /// Unified read access strategy used across all storage engines
 ///
 /// This enum provides consistent naming for read strategies to improve
-/// code readability and maintenance across SST, SWIFT, NOVA, VIPER, HELIX, etc.
+/// code readability and maintenance across SST, SWIFT, NOVA, HELIX, etc.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ReadAccessStrategy {
     /// Direct read without caching - for full sequential scans

@@ -393,10 +393,6 @@ collection_affinity = true
 # nprobe_max = 0                             # 0 = unlimited (capped at ncells)
 # ncomp_floor = 0                            # 0 = legacy coarse-PCA width formula (TD-IVF-3)
 
-# [storage.viper_config]
-# row_group_size = 100000
-# compression = "zstd"
-
 # [cache]
 # total_memory_mb = 512
 

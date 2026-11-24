@@ -1,4 +1,4 @@
-// Unified ID Index for Columnar Storage (NOVA and VIPER)
+// Unified ID Index for Columnar Storage (NOVA and NOVA)
 // Provides efficient ID lookups with row group and page-level indexing
 
 use anyhow::Result;

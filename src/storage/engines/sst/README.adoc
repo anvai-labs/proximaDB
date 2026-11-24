@@ -299,7 +299,7 @@ block_size = 4096  # bytes
 
 ❌ **Not Ideal For**:
 
-* Pure analytical workloads (use VIPER)
+* Pure analytical workloads (use NOVA)
 * Very large batch inserts (use NOVA)
 * Sparse vectors (use specialized sparse engine)
 
@@ -428,6 +428,6 @@ bloom_filter_fp_rate = 0.001  # Lower false positive rate (larger bloom filter)
 == See Also
 
 * Parent Module: Storage Engines
-* VIPER Engine: link:../viper/README.adoc[VIPER README]
+* NOVA Engine: link:../nova/README.adoc[NOVA README]
 * NOVA Engine: link:../nova/README.adoc[NOVA README]
 * Main Documentation: ProximaDB Docs

@@ -52,7 +52,6 @@ pub enum DataFreshnessTier {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeduplicationStorageEngine {
     SST,
-    VIPER,
     WAL,
 }
 
@@ -463,7 +462,7 @@ mod tests {
             record: make_record("vector_1", 1, vec![1.0, 2.0, 3.0]),
             similarity: 0.5,
             tier: DataFreshnessTier::Compacted,
-            engine: DeduplicationStorageEngine::VIPER,
+            engine: DeduplicationStorageEngine::SST,
             timestamp: now,
             sequence: 100,
             file_path: Some("/data/compacted.parquet".to_string()),
@@ -575,19 +574,19 @@ mod tests {
                 record: make_record("", 1, vec![1.0, 0.0, 0.0]),
                 similarity: 0.9,
                 tier: DataFreshnessTier::Flushed,
-                engine: DeduplicationStorageEngine::VIPER,
+                engine: DeduplicationStorageEngine::SST,
                 timestamp: Utc::now(),
                 sequence: 100,
-                file_path: Some("/data/viper/vectors.parquet".to_string()),
+                file_path: Some("/data/nova/vectors.parquet".to_string()),
             },
             TieredSearchCandidate {
                 record: make_record("", 1, vec![0.0, 1.0, 0.0]),
                 similarity: 0.85,
                 tier: DataFreshnessTier::Flushed,
-                engine: DeduplicationStorageEngine::VIPER,
+                engine: DeduplicationStorageEngine::SST,
                 timestamp: Utc::now(),
                 sequence: 101,
-                file_path: Some("/data/viper/vectors.parquet".to_string()),
+                file_path: Some("/data/nova/vectors.parquet".to_string()),
             },
         ];
 
@@ -676,7 +675,7 @@ mod tests {
                 ),
                 0.9,
                 DataFreshnessTier::Flushed,
-                DeduplicationStorageEngine::VIPER,
+                DeduplicationStorageEngine::SST,
                 0,
             ),
             candidate(
@@ -688,7 +687,7 @@ mod tests {
                 ),
                 0.8,
                 DataFreshnessTier::Flushed,
-                DeduplicationStorageEngine::VIPER,
+                DeduplicationStorageEngine::SST,
                 1,
             ),
         ];
@@ -720,7 +719,7 @@ mod tests {
                 make_record("vec1", 2, vec![1.0, 0.0, 0.0]),
                 0.85,
                 DataFreshnessTier::Compacted,
-                DeduplicationStorageEngine::VIPER,
+                DeduplicationStorageEngine::SST,
                 200,
             ),
             candidate(
@@ -810,13 +809,13 @@ mod tests {
             (
                 1u64,
                 DataFreshnessTier::Compacted,
-                DeduplicationStorageEngine::VIPER,
+                DeduplicationStorageEngine::SST,
                 150u64,
             ),
             (
                 2,
                 DataFreshnessTier::Flushed,
-                DeduplicationStorageEngine::VIPER,
+                DeduplicationStorageEngine::SST,
                 250,
             ),
         ] {
@@ -834,7 +833,7 @@ mod tests {
             record: make_record("", 1, vec![0.0, 0.0, 1.0]),
             similarity: 0.85,
             tier: DataFreshnessTier::Flushed,
-            engine: DeduplicationStorageEngine::VIPER,
+            engine: DeduplicationStorageEngine::SST,
             timestamp: Utc::now() - Duration::hours(4),
             sequence: 1000,
             file_path: Some("/data/immutable.parquet".to_string()),

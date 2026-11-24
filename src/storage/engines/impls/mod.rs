@@ -19,7 +19,6 @@
 //!
 //! All engines are now directly available at `crate::storage::engines::<engine_name>`:
 //! - **SST**: `crate::storage::engines::sst` (Phase 1: Moved from impls/sst/)
-//! - **VIPER**: `crate::storage::engines::viper` (Phase 1: Moved from impls/viper/)
 //! - **HELIX**: `crate::storage::engines::helix` (Phase 1: Moved from impls/helix/)
 //! - **NOVA**: `crate::storage::engines::nova` (Phase 1: Moved from impls/nova/)
 //! - **SWIFT**: `crate::storage::engines::swift` (Phase 1: Moved from impls/swift/)

@@ -78,7 +78,7 @@ storage:
       hilbert_order: 16
       cache_size: 1GB
 
-    viper:
+    nova:
       enabled: true
       parquet:
         row_group_size: 1000000

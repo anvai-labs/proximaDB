@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Test Server-Side Metadata Filtering with VIPER Parquet Column Pushdown
+Test Server-Side Metadata Filtering with Parquet Column Pushdown
 Demonstrates performance improvements with 1MB flush size
 """
 
@@ -48,7 +48,7 @@ class ServerSideFilteringTest:
     def run_filtering_performance_test(self):
         """Run comprehensive server-side filtering performance test"""
         print("🚀 SERVER-SIDE METADATA FILTERING PERFORMANCE TEST")
-        print("Testing VIPER Parquet column pushdown with 1MB flush size")
+        print("Testing Parquet column pushdown with 1MB flush size")
         print("=" * 75)
         
         try:
@@ -87,7 +87,7 @@ class ServerSideFilteringTest:
             name=self.collection_name,
             dimension=768,
             distance_metric=DistanceMetric.COSINE,
-            storage_engine=StorageEngine.VIPER,
+            storage_engine=StorageEngine.NOVA,
             description="Server-side filtering demo collection"
         )
         collection = self.client.create_collection(self.collection_name, config)
@@ -261,7 +261,7 @@ class ServerSideFilteringTest:
             client_result = self.test_client_side_filtering(scenario["filters"])
             results.append(client_result)
             
-            # Test 2: Server-side filtering (VIPER Parquet)
+            # Test 2: Server-side filtering (NOVA Parquet)
             server_result = self.test_server_side_filtering(scenario["filters"])
             results.append(server_result)
             
@@ -305,10 +305,10 @@ class ServerSideFilteringTest:
         return result
     
     def test_server_side_filtering(self, filters: Dict[str, str]) -> FilteringTestResult:
-        """Test server-side metadata filtering with VIPER Parquet pushdown"""
+        """Test server-side metadata filtering with NOVA Parquet pushdown"""
         start_time = time.time()
         
-        print("🏗️ Testing Server-Side Filtering (VIPER Parquet)...")
+        print("🏗️ Testing Server-Side Filtering (NOVA Parquet)...")
         
         try:
             # Convert filters to JSON format for server
@@ -322,7 +322,7 @@ class ServerSideFilteringTest:
             query_time_ms = (time.time() - start_time) * 1000
             
             result = FilteringTestResult(
-                method="Server-Side (VIPER Parquet)",
+                method="Server-Side (NOVA Parquet)",
                 query_time_ms=query_time_ms,
                 results_count=len(results),
                 filter_efficiency=0.7,  # Simulated high efficiency
@@ -437,7 +437,7 @@ def main():
         print("=" * 75)
         print("✅ SUCCESSFULLY DEMONSTRATED SERVER-SIDE OPTIMIZATIONS:")
         print("")
-        print("🏗️ VIPER Engine Enhancements:")
+        print("🏗️ NOVA Engine Enhancements:")
         print("  • Pre-configured filterable columns (category, author, doc_type, year, tags)")
         print("  • Parquet column pushdown for efficient filtering")
         print("  • Multiple index types (Hash, B-Tree, Bloom Filter)")

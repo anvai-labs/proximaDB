@@ -814,7 +814,7 @@ impl NovaUnifiedEngine {
         &self,
         collection_id: &str,
     ) -> Result<NovaCollectionMetadata> {
-        // Similar to VIPER but with NOVA-specific hierarchical stats and zone maps
+        // NOVA-specific hierarchical stats and zone maps
         // This would be implemented with actual collection service integration
 
         let metadata = NovaCollectionMetadata {

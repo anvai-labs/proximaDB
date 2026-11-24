@@ -51,7 +51,7 @@ pub struct IndexEvent {
     pub collection_id: String,       // Which collection
     pub file_paths: Vec<String>,     // Files to index
     pub vector_count: usize,         // # vectors
-    pub storage_engine: StorageEngineType,  // SST, VIPER, etc.
+    pub storage_engine: StorageEngineType,  // SST, NOVA, etc.
     pub has_quantized: bool,         // Contains quantized vectors?
     pub has_fp32: bool,              // Contains FP32 vectors?
     pub timestamp: u64,              // When created
@@ -106,7 +106,7 @@ pub enum ServiceMode {
 === 1. Storage Engines → EventLog
 
 **When**: After flush/compaction completes
-**Who**: All storage engines (SST, VIPER, NOVA, SWIFT, RAPTOR, HELIX)
+**Who**: All storage engines (SST, NOVA, NOVA, SWIFT, RAPTOR, HELIX)
 **How**: Via `src/services/events/log.rs` wrapper
 
 [source,rust]
@@ -119,7 +119,7 @@ event_log.notify_flush(
     vector_count,
     has_quantized,
     has_fp32,
-    StorageEngineType::VIPER,
+    StorageEngineType::NOVA,
 ).await?;  // Blocks until event persisted
 ----
 

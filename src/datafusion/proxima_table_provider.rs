@@ -20,7 +20,7 @@
 //! │                                      ▼                                       │
 //! │  ┌───────────────────────────────────────────────────────────────────────┐  │
 //! │  │                      ENGINE IMPLEMENTATIONS                            │  │
-//! │  │  SST │ HELIX │ SWIFT │ NOVA │ VIPER │ RAPTOR                          │  │
+//! │  │  SST │ HELIX │ SWIFT │ NOVA │ RAPTOR                                 │  │
 //! │  └───────────────────────────────────────────────────────────────────────┘  │
 //! └─────────────────────────────────────────────────────────────────────────────┘
 //! ```
@@ -64,10 +64,9 @@ pub enum EngineType {
     Helix,
     /// SWIFT: Ultra-low latency with hierarchical superblocks
     Swift,
-    /// NOVA: Progressive columnar with zone maps
+    /// NOVA: Progressive columnar with zone maps (the columnar-Parquet label;
+    /// VIPER was removed by ADR-093)
     Nova,
-    /// VIPER: Columnar Parquet for analytics
-    Viper,
     /// RAPTOR: Adaptive row-group with dynamic tiering
     Raptor,
 }
@@ -79,14 +78,16 @@ impl From<StorageFormatStrategy> for EngineType {
             StorageFormatStrategy::Helix => EngineType::Helix,
             StorageFormatStrategy::Swift => EngineType::Swift,
             StorageFormatStrategy::Nova => EngineType::Nova,
-            StorageFormatStrategy::Viper => EngineType::Viper,
             StorageFormatStrategy::Raptor => EngineType::Raptor,
-            StorageFormatStrategy::Hybrid => EngineType::Viper, // Default to VIPER for hybrid
+            StorageFormatStrategy::Hybrid => EngineType::Nova, // columnar default for hybrid
             // Specialized engines have no dedicated DataFusion reader yet; route them to
             // the columnar/time-series readers that best match their on-disk layout.
             StorageFormatStrategy::TimeSeries => EngineType::Helix, // HELIX is time-series
             StorageFormatStrategy::Chrono => EngineType::Helix,     // temporal -> time-series
-            StorageFormatStrategy::Cedar => EngineType::Viper,      // multimodal -> columnar
+            StorageFormatStrategy::Cedar => EngineType::Nova,       // multimodal -> columnar
+            // VIPER removed (ADR-093): the wire tombstone routes to NOVA,
+            // the surviving columnar-Parquet label.
+            StorageFormatStrategy::Viper => EngineType::Nova,
         }
     }
 }
@@ -98,7 +99,6 @@ impl From<EngineType> for StorageFormatStrategy {
             EngineType::Helix => StorageFormatStrategy::Helix,
             EngineType::Swift => StorageFormatStrategy::Swift,
             EngineType::Nova => StorageFormatStrategy::Nova,
-            EngineType::Viper => StorageFormatStrategy::Viper,
             EngineType::Raptor => StorageFormatStrategy::Raptor,
         }
     }
@@ -111,7 +111,6 @@ impl std::fmt::Display for EngineType {
             EngineType::Helix => write!(f, "HELIX"),
             EngineType::Swift => write!(f, "SWIFT"),
             EngineType::Nova => write!(f, "NOVA"),
-            EngineType::Viper => write!(f, "VIPER"),
             EngineType::Raptor => write!(f, "RAPTOR"),
         }
     }
@@ -491,9 +490,10 @@ mod tests {
             EngineType::from(StorageFormatStrategy::Sst),
             EngineType::Sst
         );
+        // VIPER tombstone routes to the NOVA columnar label (ADR-093)
         assert_eq!(
             EngineType::from(StorageFormatStrategy::Viper),
-            EngineType::Viper
+            EngineType::Nova
         );
         assert_eq!(
             StorageFormatStrategy::from(EngineType::Nova),
@@ -505,7 +505,7 @@ mod tests {
     fn test_engine_type_display() {
         assert_eq!(format!("{}", EngineType::Sst), "SST");
         assert_eq!(format!("{}", EngineType::Helix), "HELIX");
-        assert_eq!(format!("{}", EngineType::Viper), "VIPER");
+        assert_eq!(format!("{}", EngineType::Nova), "NOVA");
     }
 
     #[test]
@@ -528,7 +528,7 @@ mod tests {
 
     #[test]
     fn test_collection_info_vector_size() {
-        let info = DataFusionCollectionInfo::new("test".to_string(), 768, EngineType::Viper);
+        let info = DataFusionCollectionInfo::new("test".to_string(), 768, EngineType::Nova);
         assert_eq!(info.avg_vector_size_bytes(), 768 * 4);
     }
 

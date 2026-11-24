@@ -71,7 +71,7 @@ impl RlsRecordPredicate {
 /// - `core::search::SearchPlan` - Used for search planning/optimization
 /// - `core::service_types::SearchRequest` - Used for API request representation
 ///
-/// Used by: Storage engines (SST, VIPER, NOVA, SWIFT, RAPTOR)
+/// Used by: Storage engines (SST, NOVA, NOVA, SWIFT, RAPTOR)
 /// Created by: VectorOperationsService.execute_search_internal()
 ///
 /// Design principles:
@@ -296,9 +296,7 @@ impl StorageQueryContext {
         let mut adjusted_params = (*search_params).clone();
         if matches!(
             storage_strategy,
-            StorageFormatStrategy::Viper
-                | StorageFormatStrategy::Nova
-                | StorageFormatStrategy::Raptor
+            StorageFormatStrategy::Nova | StorageFormatStrategy::Raptor
         ) {
             adjusted_params.block_prune.force_exact = true;
             adjusted_params.block_prune.mode = BlockPruneMode::Sqrt;

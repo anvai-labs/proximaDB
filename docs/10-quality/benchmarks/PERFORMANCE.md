@@ -152,7 +152,9 @@ All benchmarks are run on standardized hardware following the ANN-benchmarks met
 
 ## Storage Engine Benchmarks
 
-### All 6 Storage Engines (10K vectors, 768D)
+### All Storage Engines (10K vectors, 768D) — historical measurements
+
+(VIPER was removed by ADR-093 stage 3; its row is retained as a historical measurement.)
 
 | Engine | Write Latency | Read Latency | Storage Size |
 |--------|---------------|--------------|--------------|
@@ -169,7 +171,7 @@ All benchmarks are run on standardized hardware following the ANN-benchmarks met
 |----------|-------------|--------|
 | Real-time ingestion | SST | Lowest write latency |
 | Mixed read/write | RAPTOR | Balanced performance |
-| Analytics queries | VIPER | Best compression |
+| Analytics queries | NOVA | Columnar analytics |
 | Ultra-low latency | SWIFT | Fastest reads |
 | Locality-sensitive | HELIX | Hilbert curve optimization |
 | Adaptive workloads | NOVA | Dynamic row-group sizing |

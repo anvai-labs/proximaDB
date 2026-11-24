@@ -119,7 +119,7 @@ fn create_engine_stub(&self, collection: &Collection) -> Arc<dyn UnifiedStorageE
     // Will be replaced with full engine later
     match collection.storage_engine {
         StorageEngine::SST => create_sst_stub(),
-        StorageEngine::VIPER => create_viper_stub(),
+        StorageEngine::NOVA => create_nova_stub(),
         // etc.
     }
 }

@@ -639,7 +639,6 @@ impl ActionSpace {
         let actions = match engine.to_uppercase().as_str() {
             "SST" => Self::sst_actions(),
             "HELIX" => Self::helix_actions(),
-            "VIPER" => Self::viper_actions(),
             "SWIFT" => Self::swift_actions(),
             "NOVA" => Self::nova_actions(),
             "RAPTOR" => Self::raptor_actions(),
@@ -744,36 +743,6 @@ impl ActionSpace {
                     expansion_factor: 3.0,
                 },
                 block_pruning: BlockPruneConfig::CentroidDistance { threshold: 2.0 },
-                ..Default::default()
-            },
-        ]
-    }
-
-    /// VIPER engine actions (Columnar Parquet)
-    fn viper_actions() -> Vec<ExecutionAction> {
-        vec![
-            // 1. RowGroupScan + FP32 (baseline)
-            ExecutionAction::default(),
-            // 2. RowGroupPrune + FP32
-            ExecutionAction::default().with_block_pruning(BlockPruneConfig::Ratio(0.5)),
-            // 3. ColumnProjection + FP32
-            ExecutionAction::default(),
-            // 4. Binary Pre-filter + FP32
-            ExecutionAction {
-                quantization_stages: vec![QuantizationStage::Binary, QuantizationStage::FP32],
-                ..Default::default()
-            },
-            // 5. INT8 Columnar + FP32
-            ExecutionAction {
-                quantization_stages: vec![QuantizationStage::INT8, QuantizationStage::FP32],
-                ..Default::default()
-            },
-            // 6. HNSW + RowGroupPrune
-            ExecutionAction::with_hnsw(100).with_block_pruning(BlockPruneConfig::Ratio(0.3)),
-            // 7. IVF + Columnar + INT8
-            ExecutionAction {
-                index_strategy: Some(IndexStrategy::IVF { n_probe: 16 }),
-                quantization_stages: vec![QuantizationStage::INT8, QuantizationStage::FP32],
                 ..Default::default()
             },
         ]
@@ -910,7 +879,7 @@ mod tests {
 
     #[test]
     fn test_action_space_for_engines() {
-        for engine in &["SST", "HELIX", "VIPER", "SWIFT", "NOVA", "RAPTOR"] {
+        for engine in &["SST", "HELIX", "SWIFT", "NOVA", "RAPTOR"] {
             let space = ActionSpace::for_engine(engine);
             assert!(!space.is_empty(), "Empty action space for {}", engine);
             assert!(space.len() >= 5, "Too few actions for {}", engine);

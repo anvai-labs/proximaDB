@@ -80,7 +80,7 @@ async fn create_test_collection(client: &Client, collection_name: &str) -> Resul
         name: collection_name.to_string(),
         dimension: 384,
         distance_metric: "cosine".to_string(),
-        storage_engine: "viper".to_string(),
+        storage_engine: "sst".to_string(),
         indexing_algorithm: "hnsw".to_string(),
         quantization: Some(quantization),
     };

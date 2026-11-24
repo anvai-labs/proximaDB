@@ -14,7 +14,7 @@ from proximadb_sdk import StorageEngine, VectorRecord, connect_grpc
 # Test parameters for each engine
 ENGINES_TO_TEST = [
     StorageEngine.SST,
-    StorageEngine.VIPER,
+    StorageEngine.NOVA,
     StorageEngine.NOVA,
     StorageEngine.SWIFT,
     StorageEngine.RAPTOR,
@@ -371,7 +371,7 @@ class TestEngineComparison:
         engine_results = {}
 
         # Test each engine
-        for engine in [StorageEngine.SST, StorageEngine.VIPER]:  # Test subset for speed
+        for engine in [StorageEngine.SST, StorageEngine.NOVA]:  # Test subset for speed
             collection_name = f"test_consistency_{engine.value}"
 
             # Cleanup if exists

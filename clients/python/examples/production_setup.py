@@ -389,7 +389,7 @@ def demo_production_operations(client: ProductionProximaDBClient):
         name=collection_name,
         dimension=768,  # BERT-base dimension
         distance_metric=DistanceMetric.COSINE,
-        storage_engine=StorageEngine.VIPER,
+        storage_engine=StorageEngine.NOVA,
         metadata={
             "description": "Production demo collection",
             "created_by": "production_setup.py",

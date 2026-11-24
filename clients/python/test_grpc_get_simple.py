@@ -26,7 +26,7 @@ def test_grpc_vector_get():
         name=collection_name,
         dimension=128,
         distance_metric="cosine",
-        storage_engine="viper",
+        storage_engine="nova",
     )
 
     # Test vectors

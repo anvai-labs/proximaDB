@@ -20,7 +20,7 @@
 //!
 //! Key Design Decision:
 //! - AXIS indexes (HNSW graphs, IVF clusters) use Bincode/Avro for ALL tiers
-//! - Vector data (actual vectors) continue using SST/VIPER for storage engines
+//! - Vector data (actual vectors) continue using SST for storage engines
 //! - This separation allows optimal formats for each data type
 
 use bincode;

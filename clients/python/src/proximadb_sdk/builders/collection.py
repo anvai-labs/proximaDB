@@ -23,7 +23,7 @@ class CollectionBuilder:
         # Simple collection
         config = (CollectionBuilder("my_collection", 384)
             .cosine_similarity()
-            .viper_storage()
+            .sst_storage()
             .hnsw_index()
             .build())
 
@@ -51,7 +51,7 @@ class CollectionBuilder:
         self._name = name
         self._dimension = dimension
         self._distance_metric = DistanceMetric.COSINE
-        self._storage_engine = StorageEngine.VIPER
+        self._storage_engine = StorageEngine.SST
         self._index_type = IndexingAlgorithm.HNSW
         self._description: str | None = None
         self._index_params: dict[str, Any] = {}
@@ -94,11 +94,6 @@ class CollectionBuilder:
         return self
 
     # Storage engines
-    def viper_storage(self) -> "CollectionBuilder":
-        """Use VIPER columnar storage (default, optimized for analytics)"""
-        self._storage_engine = StorageEngine.VIPER
-        return self
-
     def sst_storage(self) -> "CollectionBuilder":
         """Use SST row-based storage (optimized for writes)"""
         self._storage_engine = StorageEngine.SST
@@ -270,7 +265,7 @@ def text_collection(
     return (
         CollectionBuilder(name, dimension)
         .cosine_similarity()
-        .viper_storage()
+        .sst_storage()
         .hnsw_index()
         .zstd_compression()
         .enable_bloom_filter()

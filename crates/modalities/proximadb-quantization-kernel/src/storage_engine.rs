@@ -1,7 +1,7 @@
 //! Common Quantization Infrastructure for Storage Engines
 //!
 //! This module provides shared quantization functionality for all storage engines
-//! (VIPER, SST, and future engines), eliminating code duplication while preserving
+//! (NOVA, SST, and future engines), eliminating code duplication while preserving
 //! engine-specific optimizations through adapters.
 
 use anyhow::Result;

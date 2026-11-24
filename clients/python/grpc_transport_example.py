@@ -44,7 +44,7 @@ async def example_usage():
             name="example_collection",
             dimension=384,
             distance_metric="cosine",
-            storage_engine="viper",
+            storage_engine="nova",
             description="Example collection for testing",
         )
         print(f"📁 Collection created: {collection_result['success']}")

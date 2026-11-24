@@ -117,7 +117,7 @@ proximadb/
 │   ├── api_handlers/       # REST/gRPC endpoints
 │   ├── storage/           # Storage engines
 │   │   └── engines/
-│   │       └── impls/     # SST, HELIX, VIPER, etc.
+│   │       └── impls/     # SST, HELIX, etc.
 │   ├── graph/             # Graph engines
 │   ├── query/             # Query planner
 │   ├── compute/           # Quantization, distance

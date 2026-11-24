@@ -54,7 +54,6 @@ pub(crate) enum RootRole {
     /// Persistent warm-tier cache: derived and rebuildable, so backup skips its
     /// contents (it is still locked like every other root).
     SstCache,
-    ViperData,
 }
 
 /// Every root the configuration names, labelled by role. `local` roots are
@@ -96,9 +95,6 @@ pub(crate) fn root_plan(config: &Config) -> RootPlan {
             push_root(&mut plan, RootRole::SstCache, path);
         }
     }
-    if let Some(viper) = config.storage.viper_config.as_ref() {
-        push_root(&mut plan, RootRole::ViperData, &viper.data_directory);
-    }
     plan
 }
 
@@ -139,7 +135,6 @@ mod tests {
         config.storage.wal_config.write_buffer_directory =
             format!("file://{}", root.join("wal").display());
         config.storage.sst_config = None;
-        config.storage.viper_config = None;
         config
     }
 

@@ -25,7 +25,6 @@ use super::StorageIdentity;
 ///
 /// - **SST**: Leveled compaction (LSM-tree style)
 /// - **HELIX**: Liquid clustering with PCA + Hilbert curves
-/// - **VIPER**: Basic Parquet merge
 /// - **NOVA**: Deduplication + ID sorting
 /// - **RAPTOR**: Tier-aware compaction
 #[async_trait]

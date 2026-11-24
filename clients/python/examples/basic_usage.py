@@ -59,7 +59,7 @@ def main():
             name=collection_name,
             dimension=384,  # BERT mini (all-MiniLM-L6-v2) dimensions
             distance_metric=DistanceMetric.COSINE,
-            storage_engine=StorageEngine.VIPER,  # Columnar storage for analytics
+            storage_engine=StorageEngine.NOVA,  # Columnar storage for analytics
             metadata={
                 "description": "Demo collection for basic usage",
                 "created_by": "basic_usage.py",

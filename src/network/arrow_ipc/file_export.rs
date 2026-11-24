@@ -14,7 +14,7 @@
 //! |--------|-----------|---------|----------------|
 //! | ArrowBlock | `.arrow` | SST, HELIX | Direct |
 //! | ProximaBlocks | `.sst` | SST (default) | via Flight (on-the-fly conversion) |
-//! | Parquet | `.parquet` | Nova, VIPER | Direct |
+//! | Parquet | `.parquet` | Nova | Direct |
 //!
 //! All formats are streamed as Arrow RecordBatches via Flight, providing a unified interface.
 //!
@@ -25,7 +25,7 @@
 //! | SST/ProximaBlocks | 331.8 | 573.9 | 21.4 | 16.6 |
 //! | SST/ArrowBlock | 240.8 | 609.5 | 8.8 | 8.3 |
 //! | Nova/Parquet | 127.9 | 1646.9 | 10.6 | 10.8 |
-//! | Viper/Parquet | 22.5 | 260.9 | 12.4 | 4.9 |
+//! | NOVA/Parquet | 22.5 | 260.9 | 12.4 | 4.9 |
 //!
 //! ## Endpoints
 //!
@@ -335,7 +335,7 @@ pub struct SstArrowCacheStats {
 pub enum ExportFileFormat {
     /// Arrow IPC format (.arrow files)
     Arrow,
-    /// Parquet columnar format (.parquet files, from Nova/VIPER engines)
+    /// Parquet columnar format (.parquet files, from Nova)
     Parquet,
     /// ProximaBlocks SST format (.sst files, from SST engine)
     Sst,
@@ -777,7 +777,7 @@ impl ArrowFileExportHandler {
     /// This method searches for both Arrow IPC files (.arrow) and Parquet files (.parquet)
     /// in the collection's data directory. Use file_pattern to filter:
     /// - `*.arrow` - Arrow IPC files only
-    /// - `*.parquet` - Parquet files only (Nova, VIPER engines)
+    /// - `*.parquet` - Parquet files only (Nova)
     /// - `*` or None - All supported files (both formats)
     pub fn list_arrow_files(
         &self,
@@ -1024,7 +1024,7 @@ impl ArrowFileExportHandler {
         Ok((num_batches, total_records, dimension))
     }
 
-    /// Read metadata from Parquet file (Nova, VIPER engines)
+    /// Read metadata from Parquet file (Nova)
     fn read_parquet_metadata(
         &self,
         path: &Path,
@@ -1041,7 +1041,7 @@ impl ArrowFileExportHandler {
             .sum();
 
         // Try to get dimension from the schema
-        // Nova/VIPER store vectors as FixedSizeBinary(dimension * 4)
+        // Nova stores vectors as FixedSizeBinary(dimension * 4)
         let schema = builder.schema();
         let dimension = schema
             .fields()
@@ -1177,7 +1177,7 @@ impl ArrowFileExportHandler {
         Ok(batches)
     }
 
-    /// Read RecordBatches from a Parquet file (Nova, VIPER engines)
+    /// Read RecordBatches from a Parquet file (Nova)
     fn read_parquet_file(&self, file_path: &str) -> Result<Vec<RecordBatch>> {
         let file = fs::File::open(file_path).context("Failed to open Parquet file")?;
         let builder = ParquetRecordBatchReaderBuilder::try_new(file)
@@ -1700,7 +1700,7 @@ mod tests {
         );
         assert!(
             handler
-                .matches_pattern("viper_data.parquet", "*.parquet")
+                .matches_pattern("nova_data.parquet", "*.parquet")
                 .expect("Pattern match failed")
         );
         assert!(
@@ -1717,7 +1717,7 @@ mod tests {
         );
         assert!(
             !handler
-                .matches_pattern("viper_data.parquet", "nova_*.parquet")
+                .matches_pattern("helix_data.parquet", "nova_*.parquet")
                 .expect("Pattern match failed")
         );
 

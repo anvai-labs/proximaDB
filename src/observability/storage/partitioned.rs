@@ -58,7 +58,7 @@ pub enum PartitionTier {
     Hot,
     /// Warm tier - on disk SST, full resolution
     Warm,
-    /// Cold tier - on disk VIPER/Parquet, possibly compressed
+    /// Cold tier - on disk Parquet, possibly compressed
     Cold,
     /// Archived - offloaded to object storage
     Archived,
@@ -329,7 +329,7 @@ impl PartitionedStorage {
 
     /// Tier down old partitions
     ///
-    /// Transitions partitions from Hot → Warm (SST) → Cold (VIPER/Parquet)
+    /// Transitions partitions from Hot → Warm (SST) → Cold (Parquet)
     /// based on age threshold.
     pub async fn tier_down(&self, age_ns: i64) -> Result<usize> {
         let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
@@ -362,7 +362,7 @@ impl PartitionedStorage {
                         }
                     }
                     PartitionTier::Warm => {
-                        // Move to cold - convert to Parquet/VIPER for compression
+                        // Move to cold - convert to Parquet for compression
                         if let Some(ref engine) = self.storage_engine {
                             match self
                                 .convert_partition_to_cold(engine, partition, *key)
@@ -445,11 +445,11 @@ impl PartitionedStorage {
         }
     }
 
-    /// Convert a warm partition to cold storage (Parquet/VIPER format)
+    /// Convert a warm partition to cold storage (Parquet format)
     ///
     /// This method compresses log data for long-term storage using:
     /// - Columnar Parquet format for efficient querying
-    /// - VIPER compression for maximal space savings
+    /// - Parquet compression for maximal space savings
     async fn convert_partition_to_cold(
         &self,
         engine: &Arc<dyn UnifiedStorageFormat>,
@@ -493,7 +493,7 @@ impl PartitionedStorage {
         // For now, we use the existing SST format but mark as cold
         // In production, this would:
         // 1. Write data to Parquet files with appropriate schema
-        // 2. Store in VIPER (compressed SST) for maximum efficiency
+        // 2. Store in cold Parquet for maximum efficiency
         // 3. Update partition metadata to point to cold files
 
         let vector_records: Vec<proximadb_records::ProximaRecord> = entries

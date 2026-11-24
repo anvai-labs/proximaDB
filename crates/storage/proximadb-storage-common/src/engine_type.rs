@@ -8,7 +8,6 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum StorageEngineType {
     SST,
-    VIPER,
     NOVA,
     RAPTOR,
     SWIFT,
@@ -20,7 +19,6 @@ impl StorageEngineType {
     pub fn as_str(self) -> &'static str {
         match self {
             StorageEngineType::SST => "SST",
-            StorageEngineType::VIPER => "VIPER",
             StorageEngineType::NOVA => "NOVA",
             StorageEngineType::RAPTOR => "RAPTOR",
             StorageEngineType::SWIFT => "SWIFT",
@@ -32,7 +30,6 @@ impl StorageEngineType {
     pub fn from_name(s: &str) -> Option<Self> {
         match s.to_uppercase().as_str() {
             "SST" => Some(StorageEngineType::SST),
-            "VIPER" => Some(StorageEngineType::VIPER),
             "NOVA" => Some(StorageEngineType::NOVA),
             "RAPTOR" => Some(StorageEngineType::RAPTOR),
             "SWIFT" => Some(StorageEngineType::SWIFT),
@@ -66,7 +63,6 @@ mod tests {
     fn every_engine_round_trips_through_name_display_and_parser() {
         let cases = [
             (StorageEngineType::SST, "SST"),
-            (StorageEngineType::VIPER, "VIPER"),
             (StorageEngineType::NOVA, "NOVA"),
             (StorageEngineType::RAPTOR, "RAPTOR"),
             (StorageEngineType::SWIFT, "SWIFT"),

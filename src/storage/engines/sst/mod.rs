@@ -109,7 +109,7 @@
 //!
 //! ## 🔍 **SST vs Other Engines**
 //!
-//! | Feature | SST (Real-time) | VIPER (Production) | NOVA (Analytics) |
+//! | Feature | SST (Real-time) | NOVA (Analytics) |
 //! |---------|-----------------|-------------------|------------------|
 //! | **Focus** | Low-latency OLTP | High-throughput batch | Advanced analytics |
 //! | **Architecture** | LSM-tree row-based | Parquet columnar | Enhanced columnar |
@@ -120,9 +120,9 @@
 //!
 //! ## ❌ **NOT OPTIMAL FOR:**
 //!
-//! - **Large Analytical Queries**: VIPER or NOVA better for complex analytics
+//! - **Large Analytical Queries**: NOVA better for complex analytics
 //! - **Hierarchical Data**: SWIFT better for organized hierarchical storage
-//! - **Batch-Heavy Workloads**: VIPER more efficient for large batch processing
+//! - **Batch-Heavy Workloads**: NOVA more efficient for large batch processing
 //! - **Memory-Constrained Systems**: Row-based format uses more memory than columnar
 //!
 //! ## 📊 PERFORMANCE CHARACTERISTICS

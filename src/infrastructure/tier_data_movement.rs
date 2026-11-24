@@ -18,8 +18,8 @@
 //!
 //! Key principle: Each tier uses its native storage format
 //! - Memory: bincode for fast serialization
-//! - Disk (NVMe/HDD): SST or VIPER native formats
-//! - Cloud (S3): SST or VIPER native formats
+//! - Disk (NVMe/HDD): SST native format
+//! - Cloud (S3): SST native format
 //!
 //! Data movement between tiers respects format boundaries
 
@@ -32,10 +32,6 @@ use crate::storage::engines::sst::readers::sst_query_engine::UnifiedSstableReade
 use crate::storage::engines::sst::writer::SstableWriter;
 use crate::storage::persistence::filesystem::caching_filesystem::UnifiedCachingFilesystem;
 use proximadb_records::ProximaRecord;
-// Temporarily disabled due to arrow-arith compilation conflicts - DEFERRED: Re-enable when resolved
-// use crate::storage::engines::viper::readers::unified_parquet_reader::UnifiedParquetReader;
-// use crate::storage::engines::viper::flush::ViperFlushOperation; // Deferred: Import correct flush module
-
 /// Data format used by each tier
 #[derive(Debug, Clone)]
 pub enum TierDataFormat {
@@ -43,30 +39,23 @@ pub enum TierDataFormat {
     Bincode,
     /// SST format for hybrid columnar storage (ProximaBlocks)
     SST,
-    /// VIPER format for columnar storage
-    VIPER,
 }
 
 /// Tier data movement coordinator
 pub struct TierDataMovement {
     /// Collection this coordinator operates on
     collection_id: String,
-    /// Storage engine that determines the on-disk serialization format
-    storage_engine: StorageEngineType,
 }
 
 /// Canonical storage engine type (re-exported from `proximadb-storage-common` via
-/// `core::types`). The previous local 2-variant copy (a subset: SST, VIPER) was
+/// `core::types`). The previous local 2-variant copy was
 /// consolidated into the single source of truth.
 pub use crate::core::types::StorageEngineType;
 
 impl TierDataMovement {
     /// Create a new coordinator for the given collection and storage engine type
-    pub fn new(collection_id: String, storage_engine: StorageEngineType) -> Self {
-        Self {
-            collection_id,
-            storage_engine,
-        }
+    pub fn new(collection_id: String) -> Self {
+        Self { collection_id }
     }
 
     /// Get the native format for a tier
@@ -79,14 +68,13 @@ impl TierDataMovement {
             | InfrastructureTier::CloudStandard { .. }
             | InfrastructureTier::CloudInfrequentAccess { .. }
             | InfrastructureTier::CloudArchive { .. }
-            | InfrastructureTier::CloudDeepArchive { .. } => match self.storage_engine {
-                StorageEngineType::SST => TierDataFormat::SST,
-                StorageEngineType::VIPER => TierDataFormat::VIPER,
-                // Non-columnar engines (TST/NOVA/etc.) default to the SST
-                // (ProximaBlocks) tier format — consistent with the strategy→type
-                // mapping in `storage/traits` (Cedar/Chrono→SST).
-                _ => TierDataFormat::SST,
-            },
+            | InfrastructureTier::CloudDeepArchive { .. } => {
+                // Every remaining engine defaults to the SST (ProximaBlocks)
+                // tier format — consistent with the strategy→type mapping in
+                // `storage/traits` (Cedar/Chrono→SST). VIPER was removed
+                // (ADR-093).
+                TierDataFormat::SST
+            }
         }
     }
 
@@ -175,10 +163,6 @@ impl TierDataMovement {
                 // Read from SST format using SSTable reader
                 self.read_from_sst_tier(ids, tier).await
             }
-            TierDataFormat::VIPER => {
-                // Read from VIPER format using Parquet reader
-                self.read_from_viper_tier(ids, tier).await
-            }
         }
     }
 
@@ -197,10 +181,6 @@ impl TierDataMovement {
             TierDataFormat::SST => {
                 // Write to SST format using SSTable writer
                 self.write_to_sst_tier(records, tier).await
-            }
-            TierDataFormat::VIPER => {
-                // Write to VIPER format using Parquet writer
-                self.write_to_viper_tier(records, tier).await
             }
         }
     }
@@ -328,60 +308,6 @@ impl TierDataMovement {
         Ok(total_bytes)
     }
 
-    /// Read from VIPER tier
-    async fn read_from_viper_tier(
-        &self,
-        ids: &[String],
-        tier: &InfrastructureTier,
-    ) -> Result<Vec<ProximaRecord>> {
-        let path = self.get_tier_path(tier)?;
-        debug!("Reading {} vectors from VIPER at {}", ids.len(), path);
-
-        // Use Parquet reader to load vectors
-        let config = crate::storage::persistence::filesystem::FilesystemConfig {
-            default_fs: Some(path.clone()),
-            ..Default::default()
-        };
-        let _filesystem = Arc::new(
-            crate::storage::persistence::filesystem::FilesystemFactory::create(config)
-                .await
-                .map_err(|e| anyhow!("Failed to create filesystem: {}", e))?,
-        );
-        // Deferred: Re-enable when UnifiedParquetReader is available
-        // let reader = UnifiedParquetReader::new(filesystem);
-        let records = Vec::new();
-
-        // Deferred: Implement VIPER reading when UnifiedParquetReader is restored
-        // let all_vectors = reader.read_all_vectors(&path, &["id", "vector", "metadata_info"]).await?;
-        // for vector in all_vectors {
-        //     if let Some(ref vec_id) = vector.id {
-        //         if ids.contains_hash(vec_id) {
-        //             vectors.push(vector);
-        //         }
-        //     }
-        // }
-
-        Ok(records)
-    }
-
-    /// Write to VIPER tier
-    async fn write_to_viper_tier(
-        &self,
-        records: Vec<ProximaRecord>,
-        tier: &InfrastructureTier,
-    ) -> Result<usize> {
-        let path = self.get_tier_path(tier)?;
-        debug!("Writing {} records to VIPER at {}", records.len(), path);
-
-        // Deferred: Use VIPER flush operation to write Parquet
-        // In production, this would use the VIPER writer
-        // For now, estimate bytes written
-        let bytes_per_vector = 1024; // Rough estimate
-        let total_bytes = records.len() * bytes_per_vector;
-
-        Ok(total_bytes)
-    }
-
     /// Remove vectors from a tier
     async fn remove_from_tier(&self, ids: &[String], tier: &InfrastructureTier) -> Result<()> {
         debug!("Removing {} vectors from {:?}", ids.len(), tier);
@@ -453,7 +379,7 @@ mod tests {
 
     #[test]
     fn test_tier_format_selection() {
-        let movement = TierDataMovement::new("test_collection".to_string(), StorageEngineType::SST);
+        let movement = TierDataMovement::new("test_collection".to_string());
 
         // Memory always uses bincode
         assert!(matches!(
@@ -467,16 +393,6 @@ mod tests {
                 mount_path: "/mnt/nvme".to_string()
             }),
             TierDataFormat::SST
-        ));
-
-        // VIPER engine uses VIPER format for disk
-        let viper_movement =
-            TierDataMovement::new("test_collection".to_string(), StorageEngineType::VIPER);
-        assert!(matches!(
-            viper_movement.get_tier_format(&InfrastructureTier::HardDisk {
-                mount_path: "/mnt/disk".to_string()
-            }),
-            TierDataFormat::VIPER
         ));
     }
 }

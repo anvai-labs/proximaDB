@@ -1,7 +1,7 @@
 //! Tiered Compaction Strategy
 //!
 //! Implements size-tiered compaction, ideal for write-heavy workloads.
-//! Used by VIPER (Parquet) and HELIX engines.
+//! Used by the HELIX engine (and Parquet-layout engines).
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -316,7 +316,7 @@ impl CompactionStrategy for TieredCompactionStrategy {
     fn applies_to_engine(&self, engine_name: &str) -> bool {
         matches!(
             engine_name.to_lowercase().as_str(),
-            "viper" | "helix" | "swift" | "parquet"
+            "helix" | "swift" | "parquet"
         )
     }
 
@@ -409,8 +409,7 @@ mod tests {
     fn test_applies_to_engine() {
         let strategy = TieredCompactionStrategy::new();
 
-        assert!(strategy.applies_to_engine("viper"));
-        assert!(strategy.applies_to_engine("VIPER"));
+        assert!(!strategy.applies_to_engine("viper"));
         assert!(strategy.applies_to_engine("helix"));
         assert!(strategy.applies_to_engine("swift"));
         assert!(!strategy.applies_to_engine("sst"));

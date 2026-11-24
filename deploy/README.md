@@ -285,7 +285,6 @@ refuses the listener and the server exits 1. Tracked in
 |--------|----------|-------------|
 | `sst` | Write-optimized, real-time | ~5ms (10K vectors) |
 | `helix` | Locality-optimized | ~13ms |
-| `viper` | Columnar analytics | ~90ms |
 | `nova` | Progressive columnar | ~100ms |
 
 `swift` and `raptor` remain behind `experimental-engines` as deprecated research engines. Do not use them for new production deployments.

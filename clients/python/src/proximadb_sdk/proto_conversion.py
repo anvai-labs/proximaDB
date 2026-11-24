@@ -71,15 +71,17 @@ class ProtoConverter:
 
     _STORAGE_ENGINE_STR_TO_INT: dict[str, int] = {
         "unspecified": 0,
+        # VIPER=1 is retained for truthful round-trips of legacy data;
+        # the server rejects new selections (ADR-093 S3).
         "viper": 1,
         "sst": 2,
         "nova": 3,
         "helix": 4,
         "swift": 5,
         "raptor": 6,
-        # Legacy fallbacks (map to viper)
-        "mmap": 1,
-        "hybrid": 1,
+        # Legacy fallbacks (map to SST; the former viper target was removed)
+        "mmap": 2,
+        "hybrid": 2,
         # Encode parity for the proto engines the SDK does not explicitly
         # model (#2446 review MEDIUM-6): decode is truthful (reverse table
         # below), so encode must round-trip the same names rather than
@@ -99,9 +101,9 @@ class ProtoConverter:
         5: "swift",
         6: "raptor",
         # Decode truthfully what the server sent. The FORWARD aliases
-        # above (mmap/hybrid -> viper) are the deliberate TD-SDKENG-1
-        # deprecation design and stay; but a server response carrying
-        # MMAP=7 must not silently decode as "sst"/"viper".
+        # above (mmap/hybrid -> sst) are the deliberate TD-SDKENG-1
+        # design; a server response carrying MMAP=7 must not silently
+        # decode as "sst"/"viper".
         7: "mmap",
         8: "hybrid",
         9: "tst",
@@ -193,11 +195,11 @@ class ProtoConverter:
             value: String name, integer value, or enum instance
 
         Returns:
-            Integer representation for gRPC (1=viper as default)
+            Integer representation for gRPC (2=sst as default)
         """
         if value is None:
-            # TD-SDKENG-1 (round-2 review): SST is the default; VIPER is
-            # deprecated (ADR-093) and the server rejects it.
+            # TD-SDKENG-1 (round-2 review): SST is the default; VIPER was
+            # removed (ADR-093 S3) and the server rejects it.
             return cls._STORAGE_ENGINE_STR_TO_INT.get("sst", 2)
         if isinstance(value, int):
             return value

@@ -103,8 +103,12 @@ def test_storage_engine_to_int_all_inputs():
     assert ProtoConverter.storage_engine_to_int(5) == 5
     assert ProtoConverter.storage_engine_to_int("nova") == 3
     assert ProtoConverter.storage_engine_to_int("RAPTOR") == 6
-    assert ProtoConverter.storage_engine_to_int("mmap") == 1  # legacy alias
-    assert ProtoConverter.storage_engine_to_int("hybrid") == 1  # legacy alias
+    assert (
+        ProtoConverter.storage_engine_to_int("mmap") == 2
+    )  # legacy alias -> sst (ADR-093 S3)
+    assert (
+        ProtoConverter.storage_engine_to_int("hybrid") == 2
+    )  # legacy alias -> sst (ADR-093 S3)
     assert ProtoConverter.storage_engine_to_int("unknown") == 2  # default
     assert ProtoConverter.storage_engine_to_int(IntEngine.NOVA) == 3
     assert ProtoConverter.storage_engine_to_int(StrEngine.VIPER) == 1
@@ -117,8 +121,8 @@ def test_storage_engine_to_str_all_inputs():
     assert ProtoConverter.storage_engine_to_str(None) == "sst"
     assert ProtoConverter.storage_engine_to_str("nova") == "nova"
     assert ProtoConverter.storage_engine_to_str("NOVA") == "nova"
-    assert ProtoConverter.storage_engine_to_str("mmap") == "viper"
-    assert ProtoConverter.storage_engine_to_str("hybrid") == "viper"
+    assert ProtoConverter.storage_engine_to_str("mmap") == "sst"
+    assert ProtoConverter.storage_engine_to_str("hybrid") == "sst"
     assert ProtoConverter.storage_engine_to_str("unknown") == "sst"  # default
     assert ProtoConverter.storage_engine_to_str(2) == "sst"
     assert ProtoConverter.storage_engine_to_str(999) == "sst"  # unknown int default

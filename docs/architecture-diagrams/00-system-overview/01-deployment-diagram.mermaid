@@ -50,7 +50,6 @@ graph TB
 
     subgraph "Storage Engines"
         SST["SST Engine\nLSM-tree / ProximaBlocks\nOLTP optimized"]
-        VIPER["VIPER Engine (deprecated, ADR-093)\nexisting collections only"]
         NOVA["NOVA Engine\nAdvanced columnar\nQuantization"]
         HELIX["HELIX Engine\nPCA + Hilbert curves\nHigh-dim"]
         ORION["ORION Engine\nGraph storage"]
@@ -120,7 +119,6 @@ graph TB
     EXEC --> SE
     SE --> TRAITS
     TRAITS --> SST
-    TRAITS --> VIPER
     TRAITS --> NOVA
     TRAITS --> HELIX
 
@@ -129,16 +127,13 @@ graph TB
     WAL --> MEMTABLE
     MEMTABLE --> FLUSH
     FLUSH --> SST
-    FLUSH --> VIPER
 
     %% Index
     EXEC --> AXIS
     AXIS --> SST
-    AXIS --> VIPER
 
     %% Object store
     SST --> OBJ
-    VIPER --> OBJ
     VIPER --> ICEBERG
     SST --> PAX
 

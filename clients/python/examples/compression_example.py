@@ -61,12 +61,12 @@ def create_compressed_collections(client: ProximaDBClient):
     sst_collection = client.create_collection(sst_config.name, sst_config)
     print(f"✅ Created: {sst_collection.id}")
 
-    # 2. VIPER collection with LZ4 compression
-    viper_config = CollectionConfig(
-        name="compressed_viper_collection",
+    # 2. NOVA collection with LZ4 compression
+    nova_config = CollectionConfig(
+        name="compressed_nova_collection",
         dimension=1536,
         distance_metric=DistanceMetric.EUCLIDEAN,
-        storage_engine=StorageEngine.VIPER,
+        storage_engine=StorageEngine.NOVA,
         compression_config=CompressionConfig(
             algorithm=CompressionAlgorithm.LZ4,
             level=1,  # Fast compression (CompressionLevel.FAST if enum used)
@@ -76,9 +76,9 @@ def create_compressed_collections(client: ProximaDBClient):
         ),
     )
 
-    print("Creating VIPER collection with LZ4 compression...")
-    viper_collection = client.create_collection(viper_config.name, viper_config)
-    print(f"✅ Created: {viper_collection.id}")
+    print("Creating NOVA collection with LZ4 compression...")
+    nova_collection = client.create_collection(nova_config.name, nova_config)
+    print(f"✅ Created: {nova_collection.id}")
 
     # 3. Mixed collection with adaptive compression
     mixed_config = CollectionConfig(
@@ -98,7 +98,7 @@ def create_compressed_collections(client: ProximaDBClient):
     mixed_collection = client.create_collection(mixed_config.name, mixed_config)
     print(f"✅ Created: {mixed_collection.id}")
 
-    return sst_collection, viper_collection, mixed_collection
+    return sst_collection, nova_collection, mixed_collection
 
 
 def insert_and_search_compressed(client: ProximaDBClient, collection_name: str):
@@ -242,11 +242,11 @@ def main():
 
     try:
         # Create collections with different compression configs
-        sst_col, viper_col, mixed_col = create_compressed_collections(client)
+        sst_col, nova_col, mixed_col = create_compressed_collections(client)
 
         # Test compression-aware operations
         insert_and_search_compressed(client, sst_col.name)
-        insert_and_search_compressed(client, viper_col.name)
+        insert_and_search_compressed(client, nova_col.name)
 
         # Demonstrate adaptive compression
         demonstrate_adaptive_compression(client)
@@ -260,7 +260,7 @@ def main():
         print("\n🧹 Cleaning up...")
         try:
             client.delete_collection("compressed_sst_collection")
-            client.delete_collection("compressed_viper_collection")
+            client.delete_collection("compressed_nova_collection")
             client.delete_collection("adaptive_compression_collection")
             client.delete_collection("adaptive_demo_collection")
         except:

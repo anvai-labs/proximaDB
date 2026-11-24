@@ -105,7 +105,6 @@ impl<E: UnifiedStorageFormat> InternalFormatAdapter<E> {
         match self.engine.strategy() {
             StorageFormatStrategy::Sst => FormatType::Sst,
             StorageFormatStrategy::Helix => FormatType::Helix,
-            StorageFormatStrategy::Viper => FormatType::Viper,
             StorageFormatStrategy::Nova => FormatType::Nova,
             StorageFormatStrategy::Swift => FormatType::Swift,
             StorageFormatStrategy::Raptor => FormatType::Raptor,
@@ -113,6 +112,9 @@ impl<E: UnifiedStorageFormat> InternalFormatAdapter<E> {
             StorageFormatStrategy::TimeSeries => FormatType::Sst,
             StorageFormatStrategy::Cedar => FormatType::Sst, // CEDAR uses SST-like block format
             StorageFormatStrategy::Chrono => FormatType::Sst, // CHRONO uses time-partitioned blocks
+            // VIPER removed (ADR-093); unreachable for live engines (factory
+            // rejects the strategy) — SST baseline like the tombstone arms above.
+            StorageFormatStrategy::Viper => FormatType::Sst,
         }
     }
 }
@@ -205,10 +207,7 @@ impl<E: UnifiedStorageFormat + 'static> StorageFormat for InternalFormatAdapter<
                 self.engine.strategy(),
                 StorageFormatStrategy::Sst | StorageFormatStrategy::Swift
             ),
-            "columnar_storage" => matches!(
-                self.engine.strategy(),
-                StorageFormatStrategy::Viper | StorageFormatStrategy::Nova
-            ),
+            "columnar_storage" => matches!(self.engine.strategy(), StorageFormatStrategy::Nova),
             "progressive_search" => matches!(
                 self.engine.strategy(),
                 StorageFormatStrategy::Sst
@@ -414,7 +413,7 @@ impl<E: UnifiedStorageFormat + 'static> InternalFormat for InternalFormatAdapter
                 // SST: Compact when file count is high
                 stats.file_count > 10
             }
-            StorageFormatStrategy::Viper | StorageFormatStrategy::Nova => {
+            StorageFormatStrategy::Nova => {
                 // Columnar: Compact when many small files
                 let small_file_threshold: u64 = 64 * 1024 * 1024;
                 stats.file_count > 5
@@ -552,9 +551,6 @@ pub type SstFormatAdapter = InternalFormatAdapter<crate::storage::engines::sst::
 /// Type alias for HELIX format adapter
 pub type HelixFormatAdapter = InternalFormatAdapter<crate::storage::engines::helix::HelixEngine>;
 
-/// Type alias for VIPER format adapter
-pub type ViperFormatAdapter = InternalFormatAdapter<crate::storage::engines::viper::ViperEngine>;
-
 /// Type alias for NOVA format adapter
 pub type NovaFormatAdapter = InternalFormatAdapter<crate::storage::engines::nova::NovaEngine>;
 
@@ -583,13 +579,6 @@ pub fn create_sst_adapter(
 pub fn create_helix_adapter(
     engine: Arc<crate::storage::engines::helix::HelixEngine>,
 ) -> HelixFormatAdapter {
-    InternalFormatAdapter::new(engine)
-}
-
-/// Create a VIPER format adapter from an existing engine
-pub fn create_viper_adapter(
-    engine: Arc<crate::storage::engines::viper::ViperEngine>,
-) -> ViperFormatAdapter {
     InternalFormatAdapter::new(engine)
 }
 

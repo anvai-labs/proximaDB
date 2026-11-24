@@ -48,7 +48,7 @@ impl VectorExtractor for SstExtractor {
         }
 
         // Convert file:// URLs to local paths if needed. SST strips upfront
-        // (unlike nova/viper/raptor/swift, which strip only for the existence
+        // (unlike nova/raptor/swift, which strip only for the existence
         // check) because UnifiedSstableReader wants local paths.
         let file_paths: Vec<String> = request
             .file_paths

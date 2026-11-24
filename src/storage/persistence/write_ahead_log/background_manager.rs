@@ -116,35 +116,24 @@ impl BackgroundMaintenanceManager {
         // Get storage engine for delegation using pre-computed engine type
         let engines = storage_engines.read().await;
 
-        // Use the engine type from context instead of defaulting to VIPER
+        // Use the engine type from context instead of a hard-coded default
         let engine = if let Some(engine) = engines.get(engine_name) {
             info!(
                 "🏭 [COMPACTION] Using {} storage engine for collection {}",
                 engine_name, context.collection_id
             );
             engine.clone()
+        } else if let Some(sst_engine) = engines.get("SST") {
+            warn!(
+                "⚠️ [COMPACTION] Requested engine '{}' not found, falling back to SST for collection {}",
+                engine_name, context.collection_id
+            );
+            sst_engine.clone()
         } else {
-            // Fallback to VIPER if the requested engine isn't available
-            if let Some(viper_engine) = engines.get("VIPER") {
-                warn!(
-                    "⚠️ [COMPACTION] Requested engine '{}' not found, falling back to VIPER for collection {}",
-                    engine_name, context.collection_id
-                );
-                viper_engine.clone()
-            } else if let Some(sst_engine) = engines.get("SST") {
-                warn!(
-                    "⚠️ [COMPACTION] Neither '{}' nor 'viper' found, falling back to SST for collection {}",
-                    engine_name, context.collection_id
-                );
-                sst_engine.clone()
-            } else {
-                warn!(
-                    "⚠️ [COMPACTION] No storage engines registered, cannot perform compaction_info"
-                );
-                return Err(anyhow::anyhow!(
-                    "No storage engines available for compaction_info"
-                ));
-            }
+            warn!("⚠️ [COMPACTION] No storage engines registered, cannot perform compaction_info");
+            return Err(anyhow::anyhow!(
+                "No storage engines available for compaction_info"
+            ));
         };
 
         drop(engines); // Release the read lock
@@ -234,7 +223,7 @@ impl BackgroundMaintenanceManager {
                         );
                     }
 
-                    // Return file list for compatibility - for VIPER this would be the compacted files
+                    // Return file list for compatibility with the legacy compacted-files contract
                     // Since the UnifiedStorageFormat doesn't return file paths, we'll return a placeholder
                     Ok(vec![format!(
                         "compacted_collection_{}_{}files",

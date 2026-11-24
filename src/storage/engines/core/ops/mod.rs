@@ -1,7 +1,7 @@
 //! Common operations for all storage engines
 //!
 //! This module provides shared infrastructure and utilities used across all
-//! storage engine implementations (SST, SWIFT, VIPER, NOVA, RAPTOR, HELIX).
+//! storage engine implementations (SST, SWIFT, NOVA, RAPTOR, HELIX).
 //!
 //! ## Module Organization
 //!
@@ -24,7 +24,7 @@
 //! the new `ProximaCodec` API. See `proximacodec` module for details.
 
 // Common Storage Engine Infrastructure
-// Shared capabilities and abstractions for all storage engines (SST, SWIFT, VIPER, NOVA)
+// Shared capabilities and abstractions for all storage engines (SST, SWIFT, NOVA)
 
 // Core operations modules
 // NOTE: search modules moved to core/search
@@ -275,7 +275,7 @@ pub struct UniversalEngineConfig {
 pub enum EngineType {
     /// Row-based storage (SST, SWIFT)
     RowBased,
-    /// Columnar storage (VIPER, NOVA)
+    /// Columnar storage (NOVA)
     Columnar,
     /// Hybrid storage
     Hybrid,

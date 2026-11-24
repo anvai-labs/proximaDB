@@ -17,7 +17,6 @@ graph TB
         SST["🟩 SST Engine\nsrc/storage/engines/sst/\n- Stable Storage Tier\n- Primary vector engine\n- HNSW index\n- PAX block format"]
         HELIX["🟩 HELIX Engine\nsrc/storage/engines/helix/\n- Helical index\n- Hybrid graph+vector\n- Co-design optimized"]
         NOVA["🟩 NOVA Engine\nsrc/storage/engines/nova/\n- New Observable Vector Architecture\n- SIMD-optimized\n- Freshness-optimized"]
-        VIPER["🟥 VIPER Engine (deprecated, ADR-093)\nsrc/storage/engines/viper/\n- Vector index persistence engine\n- Specialized compaction"]
         RAPTOR["🟩 RAPTOR Engine (exp)\n- Feature-gated\n- experimental-engines"]
         SWIFT["🟩 SWIFT Engine (exp)\n- Feature-gated\n- experimental-engines"]
 
@@ -84,7 +83,6 @@ graph TB
     SST --> PAX_BLOCK
     HELIX --> PAX_BLOCK
     NOVA --> PAX_BLOCK
-    VIPER --> PAX_BLOCK
     PAX_BLOCK --> OBJ_STORE
     PAX_BLOCK --> HOT_CACHE
 
@@ -93,7 +91,6 @@ graph TB
     FACTORY --> SST
     FACTORY --> HELIX
     FACTORY --> NOVA
-    FACTORY --> VIPER
     FACTORY --> RAPTOR
     FACTORY --> SWIFT
 
@@ -137,7 +134,7 @@ graph TB
 
     class STORE_ENGINE,STORE_MOD,SCAN_STRAT facade
     class FACTORY,ENG_CAPS factory
-    class SST,HELIX,NOVA,VIPER,RAPTOR,SWIFT engine
+    class SST,HELIX,NOVA,RAPTOR,SWIFT engine
     class PAX_BLOCK,PAX_SEGMENTS,BLOCK_WRITER pax
     class WAL,MEMTABLE,FLUSH_MAT,TX_COORD,WRITE_FENCE write
     class HOT_CACHE,BLOCK_CACHE cache

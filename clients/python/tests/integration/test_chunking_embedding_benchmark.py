@@ -168,11 +168,11 @@ class TestChunkingEmbeddingBenchmark:
         configs = [
             # (chunking_strategy, embedding_provider, storage_engine, protocol)
             (ChunkingStrategy.SLIDING_WINDOW, "simulated", StorageEngine.SST, "rest"),
-            (ChunkingStrategy.SLIDING_WINDOW, "simulated", StorageEngine.VIPER, "grpc"),
+            (ChunkingStrategy.SLIDING_WINDOW, "simulated", StorageEngine.NOVA, "grpc"),
             (ChunkingStrategy.PARAGRAPH, "simulated", StorageEngine.SST, "grpc"),
-            (ChunkingStrategy.PARAGRAPH, "simulated", StorageEngine.VIPER, "rest"),
+            (ChunkingStrategy.PARAGRAPH, "simulated", StorageEngine.NOVA, "rest"),
             (ChunkingStrategy.SEMANTIC, "simulated", StorageEngine.SST, "rest"),
-            (ChunkingStrategy.SEMANTIC, "simulated", StorageEngine.VIPER, "grpc"),
+            (ChunkingStrategy.SEMANTIC, "simulated", StorageEngine.NOVA, "grpc"),
         ]
 
         # Try to add real embedding provider if available
@@ -184,7 +184,7 @@ class TestChunkingEmbeddingBenchmark:
                         (
                             ChunkingStrategy.SEMANTIC,
                             "sentence-transformer",
-                            StorageEngine.VIPER,
+                            StorageEngine.NOVA,
                             "grpc",
                         ),
                         (
