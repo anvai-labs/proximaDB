@@ -147,12 +147,13 @@ pub(crate) fn effective_durable_locations(
         // same symlinked path the lease plan canonicalizes, so an
         // unresolved /var vs /private/var mismatch can no longer falsely
         // fail the unleased-state check on symlinked hosts.
+        // Review round 2 (MED-A): unconditional — create_dir_all is
+        // idempotent, and canonicalizing on EVERY boot keeps the record's
+        // spelling stable instead of flipping to the unresolved form on
+        // the second boot (the first-boot-only guard lapsed the fix's own
+        // guarantee).
         let location = match local_path(&effective_root) {
-            Some(path)
-                if explicit.is_none()
-                    && durability.default_wal_root.is_some()
-                    && !path.exists() =>
-            {
+            Some(path) if explicit.is_none() && durability.default_wal_root.is_some() => {
                 std::fs::create_dir_all(&path).ok();
                 std::fs::canonicalize(&path)
                     .map(|canonical| canonical.display().to_string())
@@ -371,6 +372,53 @@ mod tests {
             mode_entry.location,
             canonical.display().to_string(),
             "defaulted root {{data_dir}}/wal, canonicalized"
+        );
+    }
+
+    /// Review round 2 (MED-A + MED-B): the durability entry's root is
+    /// STABLE across boots (canonicalized every time — not first-boot-only)
+    /// and folds the ENV root in when TOML is unset (the engine's
+    /// env>TOML>default ladder, pinned).
+    #[test]
+    fn durability_entry_root_is_stable_and_folds_env() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut config = Config::default();
+        config.server.data_dir = temp.path().to_path_buf();
+
+        // MED-A: two consecutive "boots" record the SAME canonical spelling
+        // (boot 2 sees the dir already existing and must not flip to the
+        // unresolved form).
+        let first = effective_durable_locations(&config, env_of(&[]))
+            .iter()
+            .find(|loc| loc.source.contains("durability_mode"))
+            .expect("durability mode entry")
+            .location
+            .clone();
+        let second = effective_durable_locations(&config, env_of(&[]))
+            .iter()
+            .find(|loc| loc.source.contains("durability_mode"))
+            .expect("durability mode entry")
+            .location
+            .clone();
+        assert_eq!(first, second, "record spelling must be boot-stable");
+
+        // MED-B: env root set, TOML unset — the durability entry's root is
+        // the ENV root (absolutized), not the write-buffer fallback.
+        let env_root = temp.path().join("env_wal");
+        let entries = effective_durable_locations(&config, &|key: &str| {
+            (key == "PROXIMADB_WAL_LOCAL_DIR").then(|| env_root.display().to_string())
+        });
+        let mode_entry = entries
+            .iter()
+            .find(|loc| loc.source.contains("durability_mode"))
+            .expect("durability mode entry");
+        let expected = std::path::absolute(&env_root)
+            .expect("absolutize env root")
+            .display()
+            .to_string();
+        assert_eq!(
+            mode_entry.location, expected,
+            "the durability entry folds the ENV root into its effective root"
         );
     }
 
