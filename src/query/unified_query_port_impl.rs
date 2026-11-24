@@ -1303,19 +1303,17 @@ mod tests {
         assert_eq!(prepared_owner(Some("acme")), Some("acme".to_string()));
         let scoped = crate::query::request_scope::with_request_tenant(
             "outer",
-            crate::query::request_scope::with_request_tenant(
-                "inner",
-                async { prepared_owner(Some("acme")) },
-            ),
+            crate::query::request_scope::with_request_tenant("inner", async {
+                prepared_owner(Some("acme"))
+            }),
         )
         .await;
         assert_eq!(scoped, Some("acme".to_string()));
 
         // Fallback: no identity → the scope in force (task-local).
-        let fallback = crate::query::request_scope::with_request_tenant(
-            "scoped",
-            async { prepared_owner(None) },
-        )
+        let fallback = crate::query::request_scope::with_request_tenant("scoped", async {
+            prepared_owner(None)
+        })
         .await;
         assert_eq!(fallback, Some("scoped".to_string()));
         // ...and no scope at all → None (no scope owns nothing).
