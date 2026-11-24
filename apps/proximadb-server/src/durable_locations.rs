@@ -365,8 +365,8 @@ mod tests {
         // Review round 1 (HIGH-1): the entry records the CANONICALIZED
         // spelling of the materialized default root, so symlinked hosts
         // (/var vs /private/var) match the canonicalized lease.
-        let canonical = std::fs::canonicalize(temp.path().join("wal"))
-            .expect("default root materialized");
+        let canonical =
+            std::fs::canonicalize(temp.path().join("wal")).expect("default root materialized");
         assert_eq!(
             mode_entry.location,
             canonical.display().to_string(),
