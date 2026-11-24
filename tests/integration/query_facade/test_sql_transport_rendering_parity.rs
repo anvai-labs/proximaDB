@@ -324,7 +324,7 @@ async fn canonical_port_sql(state: &AppState, sql: &str) -> serde_json::Value {
         "default",
         proximadb::network::middleware::tenant::TenantIdSource::Default,
     );
-    let result = canonical_execute_sql(
+    let Json(body) = canonical_execute_sql(
         State(state.clone()),
         Some(Extension(tenant)),
         Json(SqlQueryRequest {
@@ -336,11 +336,8 @@ async fn canonical_port_sql(state: &AppState, sql: &str) -> serde_json::Value {
         }),
     )
     .await
-    .expect("canonical handler must not reject the request");
-    match result {
-        Ok(JsonResponse(body)) => body.0,
-        Err(error) => panic!("canonical /sql leg failed for {sql}: {error:?}"),
-    }
+    .unwrap_or_else(|error| panic!("canonical /sql leg failed for {sql}: {error:?}"));
+    body
 }
 
 /// MCP leg: the REAL engine backend's `search` tool over the SAME port. The
