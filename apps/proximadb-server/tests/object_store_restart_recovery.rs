@@ -48,6 +48,10 @@ enable_mmap = false
 
 [storage.wal_config]
 write_buffer_directory = "{root}/wal"
+# TD-SPINE-5 (ADR-098 D3): DECLARE the posture this proof depends on — the
+# WAL lives on the object store, an ack means durable + LISTable (ADR-063
+# D3), and no local_volume `{{data_dir}}/wal` default-root move may apply.
+durability_mode = "object_store_serverless"
 enable_wal = true
 sync_mode = "PerBatch"
 

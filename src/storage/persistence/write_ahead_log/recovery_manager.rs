@@ -102,6 +102,28 @@ impl RecoveryManager {
             "🎯 Creating RecoveryManager with direct-to-storage recovery (catalog-backed config resolution)"
         );
         let local_wal_dir = crate::storage::persistence::write_ahead_log::local_wal_dir(&config);
+        // TD-SPINE-5 (ADR-098 D3): name the durability contract this recovery
+        // serves, and the roots it scans. `wal_candidate_bases` unions the
+        // resolved WAL root (which may be the local_volume `{data_dir}/wal`
+        // DEFAULT — the TD-SPINE-5 root move) with the LEGACY co-located
+        // roots (the catalog-assigned base and the configured primary base),
+        // so an upgrade across the default-root move never strands unflushed
+        // WAL objects written at the legacy location.
+        match config.durability_mode {
+            Some(mode) => info!(
+                durability_mode = %mode,
+                resolved_wal_root = ?local_wal_dir,
+                legacy_roots_scanned = true,
+                "WAL recovery serving ADR-098 D3 durability mode; replay lists the resolved \
+                 WAL root AND the legacy co-located roots"
+            ),
+            None => info!(
+                resolved_wal_root = ?local_wal_dir,
+                legacy_roots_scanned = true,
+                "WAL recovery with no resolved durability mode (programmatic config); replay \
+                 lists every candidate base"
+            ),
+        }
 
         // Create disk manager
         let disk_manager = Arc::new(WriteAheadLogDiskManager::new(
@@ -776,11 +798,16 @@ impl RecoveryManager {
 
     /// Issue #1125: assemble the ordered, deduplicated list of WAL base URLs a
     /// collection's files may live under. Priority: the resolved local WAL
-    /// root (ADR-069 S1 / TD-WAL-5), then the catalog-assigned
-    /// base_location (what the write path uses), then every distinct manifest
-    /// storage_url (where files were actually recorded), then the configured
-    /// primary base (this recovery manager's disk_manager root). Trailing
-    /// slashes are normalized so `file:///x/` and `file:///x` dedupe.
+    /// root (ADR-069 S1 / TD-WAL-5 — under TD-SPINE-5 this may be the
+    /// local_volume `{data_dir}/wal` DEFAULT applied by the boot resolution),
+    /// then the catalog-assigned base_location (what the write path uses),
+    /// then every distinct manifest storage_url (where files were actually
+    /// recorded), then the configured primary base (this recovery manager's
+    /// disk_manager root). TD-SPINE-5: the catalog base and the primary base
+    /// ARE the legacy co-located WAL roots — every base is LISTed and unioned,
+    /// so a WAL written at the legacy location before the default-root move
+    /// still replays after the upgrade. Trailing slashes are normalized so
+    /// `file:///x/` and `file:///x` dedupe.
     fn wal_candidate_bases(
         local_wal_dir: Option<&str>,
         catalog_base: Option<&str>,
@@ -1648,6 +1675,111 @@ mod tests {
         );
         assert_eq!(unioned[0].collection_id, collection_id);
         drop(primary_dir);
+    }
+
+    /// TD-SPINE-5 (ADR-098 D3) upgrade ratchet: after the local_volume
+    /// default-root move (`{data_dir}/wal`), a WAL written at the LEGACY
+    /// co-located root (the configured primary base, where the write path
+    /// rooted it pre-upgrade) must still REPLAY — the candidate bases scan
+    /// the configured WAL root AND the legacy root, so an upgrade never
+    /// strands unflushed WAL objects.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn spine5_legacy_root_wal_replays_after_the_default_root_move() {
+        if std::env::var("PROXIMADB_WAL_LOCAL_DIR").is_ok() {
+            return; // env override would win; this test pins the config path
+        }
+        let legacy_dir = TempDir::new().expect("legacy co-located root");
+        let new_root_dir = TempDir::new().expect("TD-SPINE-5 default root");
+        let legacy_base = legacy_dir.path().to_str().unwrap().to_string();
+        let new_root = format!("file://{}/wal", new_root_dir.path().display());
+        let collection_id = "spine5_upgrade_coll";
+
+        let filesystem = Arc::new(
+            FilesystemFactory::create(FilesystemConfig::default())
+                .await
+                .expect("filesystem factory"),
+        );
+
+        // Re-arm the process-global manifest on THIS test's runtime (see
+        // test_recovery_manager_direct_to_storage), rooted at the legacy dir.
+        {
+            let mut wal_config =
+                crate::storage::persistence::write_ahead_log::config::WALConfig::default();
+            wal_config.multi_disk.data_directories = vec![legacy_base.clone()];
+            let _ = crate::storage::persistence::write_ahead_log::manifest::reset().await;
+            crate::storage::persistence::write_ahead_log::manifest::init(&wal_config)
+                .await
+                .expect("re-init global manifest on this test's runtime");
+        }
+
+        // Pre-upgrade write: the WAL lands at the LEGACY co-located root.
+        let write_disk_manager = Arc::new(WriteAheadLogDiskManager::new(
+            filesystem.clone(),
+            legacy_base.clone(),
+        ));
+        use crate::storage::persistence::write_ahead_log::serialization::{
+            ProtocolBuffersSerializer, VectorBatchSerializer,
+        };
+        let serializer = ProtocolBuffersSerializer::new();
+        let vector = create_test_vector("spine5-r0");
+        let data = serializer
+            .serialize_batch(std::slice::from_ref(&vector))
+            .expect("serialize");
+        write_disk_manager
+            .write_batch(
+                collection_id,
+                &BatchId::new(),
+                &data,
+                SerializationFormat::ProtocolBuffers,
+                1,
+            )
+            .await
+            .expect("write pre-upgrade WAL at the legacy root");
+        assert!(
+            !new_root_dir.path().join(collection_id).join("wal").exists(),
+            "sanity: nothing was written under the new default root"
+        );
+
+        // Post-upgrade config shape: the mode is local_volume (inferred from
+        // a local primary scheme at boot, root defaulted to {data_dir}/wal —
+        // materialized here as wal_local_dir), and the primary base stays the
+        // legacy co-located root.
+        let mut config = crate::storage::persistence::write_ahead_log::config::WALConfig::default();
+        config.multi_disk.data_directories = vec![legacy_base.clone()];
+        config.wal_local_dir = Some(new_root.clone());
+        config.durability_mode =
+            Some(crate::storage::persistence::write_ahead_log::config::DurabilityMode::LocalVolume);
+        let wal_behavior = Arc::new(
+            crate::storage::memtable::specialized::wal_behavior::WALBehaviorWrapper::new(
+                crate::storage::memtable::MemtableConfig::default(),
+            ),
+        );
+        let recovery_manager = RecoveryManager::new(config, wal_behavior, filesystem.clone());
+        assert_eq!(
+            recovery_manager.local_wal_dir.as_deref(),
+            Some(new_root.as_str()),
+            "the resolved (defaulted) WAL root is the replay's first candidate"
+        );
+
+        let (storage_engine, _flush_hints) = create_mock_storage_engine();
+        recovery_manager
+            .register_storage_engine(collection_id, storage_engine)
+            .await
+            .expect("register mock engine");
+
+        // The upgrade ratchet: the legacy-root WAL replays.
+        let recovered = recovery_manager
+            .recover_collection(collection_id)
+            .await
+            .expect("recover after the default-root move");
+        assert_eq!(
+            recovered.total_vectors_recovered, 1,
+            "the WAL planted at the legacy co-located root must replay after the upgrade"
+        );
+        assert_eq!(recovered.total_files_recovered, 1);
+
+        let _ = crate::storage::persistence::write_ahead_log::manifest::reset().await;
     }
 
     // Mock storage engine for testing. Returns the engine and a capture of

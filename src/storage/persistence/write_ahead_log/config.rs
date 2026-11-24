@@ -11,6 +11,194 @@ pub use crate::core::CompressionAlgorithm;
 
 use serde::{Deserialize, Serialize};
 
+/// ADR-098 D3 (TD-SPINE-5): the WAL durability mode — exactly one of two
+/// contracts governs what an acknowledged write survives. The mode is
+/// **declared** (`[storage.wal_config].durability_mode`, env mirror
+/// `PROXIMADB_WAL_DURABILITY_MODE`) or **inferred at boot** from one
+/// deterministic input (see [`resolve_durability_mode`]); it is logged at INFO
+/// and recorded in `durable_locations`. There is no silent legacy path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DurabilityMode {
+    /// The WAL frame is fsync'd on a local, reattachable volume (ADR-069 D1 /
+    /// ADR-095 D1); the object store is the coalesced durable tier for flushed
+    /// data.
+    #[serde(rename = "local_volume")]
+    LocalVolume,
+    /// The WAL object is durable and LISTable on the object store (ADR-063 D3
+    /// plus the WAL-object parts of D4: pre-PUT ordering token, put-if-absent
+    /// WAL objects, LIST replay under `{collection}/wal/`). This is the
+    /// intended serverless posture, not a degraded one.
+    #[serde(rename = "object_store_serverless")]
+    ObjectStoreServerless,
+}
+
+impl std::fmt::Display for DurabilityMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DurabilityMode::LocalVolume => write!(f, "local_volume"),
+            DurabilityMode::ObjectStoreServerless => write!(f, "object_store_serverless"),
+        }
+    }
+}
+
+impl DurabilityMode {
+    /// Parse a config/env value (case-insensitive, surrounding whitespace
+    /// tolerated). Unknown values are errors, not silent fallbacks — the
+    /// TOML path (serde) already rejects them at config load.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "local_volume" => Some(DurabilityMode::LocalVolume),
+            "object_store_serverless" => Some(DurabilityMode::ObjectStoreServerless),
+            _ => None,
+        }
+    }
+}
+
+/// Where a resolved [`DurabilityMode`] came from — evidence for the boot log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DurabilityModeSource {
+    /// Declared via TOML `[storage.wal_config].durability_mode` or its env
+    /// mirror `PROXIMADB_WAL_DURABILITY_MODE` (env wins, repo convention).
+    Declared,
+    /// Inferred: a global `wal_local_dir` is set (`PROXIMADB_WAL_LOCAL_DIR`
+    /// > TOML), and an explicit local WAL root IS the `local_volume` posture.
+    WalLocalDir,
+    /// Inferred from the scheme of the server's primary WAL location
+    /// (`write_buffer_directory`, else `data_directories[0]`): an object URL
+    /// ⇒ `object_store_serverless`, a local path ⇒ `local_volume`.
+    PrimaryScheme,
+}
+
+impl DurabilityModeSource {
+    /// Short label for logs.
+    pub fn label(&self) -> &'static str {
+        match self {
+            DurabilityModeSource::Declared => "declared",
+            DurabilityModeSource::WalLocalDir => "wal_local_dir set",
+            DurabilityModeSource::PrimaryScheme => "primary WAL location scheme",
+        }
+    }
+}
+
+/// The boot resolution of [`DurabilityMode`] (ADR-098 D3 / TD-SPINE-5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedDurabilityMode {
+    /// The effective mode.
+    pub mode: DurabilityMode,
+    /// How it was decided.
+    pub source: DurabilityModeSource,
+    /// The input value that decided it (declared spelling, the set
+    /// `wal_local_dir`, or the primary WAL location URL) — log evidence.
+    pub evidence: String,
+    /// TD-SPINE-5 default-root move: `Some("{data_dir}/wal")` when
+    /// `local_volume` was resolved with NO explicit `wal_local_dir`, so the
+    /// WAL root moves off the legacy co-located-with-data location. `None`
+    /// when an explicit root already applies or the mode is
+    /// `object_store_serverless` (per-collection WAL stays under the
+    /// catalog-derived base location). Recovery still scans the legacy
+    /// co-located root, so an upgrade never strands unflushed WAL objects.
+    pub default_wal_root: Option<String>,
+}
+
+impl ResolvedDurabilityMode {
+    /// The WAL root in force: an explicit `wal_local_dir` when set, else the
+    /// TD-SPINE-5 default when one applies. `None` ⇒ per-collection WAL under
+    /// the catalog-derived base location (legacy/serverless placement).
+    pub fn effective_wal_root(&self, explicit_wal_local_dir: Option<&str>) -> Option<String> {
+        let explicit = explicit_wal_local_dir
+            .map(|dir| dir.trim().trim_end_matches('/').to_string())
+            .filter(|dir| !dir.is_empty());
+        explicit.or_else(|| self.default_wal_root.clone())
+    }
+}
+
+/// True when `url` names a remote (object-store) scheme: it carries a
+/// `scheme://` authority that is NOT `file:`. A bare path (no `://`) is local.
+/// Mirrors the classification the former ADR-069 S1 boot guard used.
+pub fn is_object_store_url(url: &str) -> bool {
+    url.contains("://") && !url.starts_with("file:")
+}
+
+/// Resolve the WAL durability mode (ADR-098 D3 / TD-SPINE-5). Pure.
+///
+/// Ladder: a **declared** mode wins; else a set global `wal_local_dir` ⇒
+/// `local_volume`; else the scheme of the **primary WAL location**
+/// (`write_buffer_directory`, else `data_directories[0]` — the caller folds
+/// that ladder into `primary_wal_location`): an object URL ⇒
+/// `object_store_serverless`, a local path ⇒ `local_volume` with the WAL root
+/// defaulting to `{data_dir}/wal`. `data_dir` is `None` only for conversions
+/// that cannot know it (programmatic/embedded callers); then no default-root
+/// move happens — the legacy co-located placement stays — and the mode is
+/// still resolved and reportable.
+pub fn resolve_durability_mode(
+    declared: Option<DurabilityMode>,
+    wal_local_dir: Option<&str>,
+    primary_wal_location: &str,
+    data_dir: Option<&std::path::Path>,
+) -> ResolvedDurabilityMode {
+    let explicit_root = wal_local_dir
+        .map(|dir| dir.trim().trim_end_matches('/').to_string())
+        .filter(|dir| !dir.is_empty());
+    let local_default_root = |apply: bool| {
+        apply
+            .then(|| data_dir.map(|dir| format!("file://{}/wal", dir.display())))
+            .flatten()
+    };
+    if let Some(mode) = declared {
+        return ResolvedDurabilityMode {
+            mode,
+            source: DurabilityModeSource::Declared,
+            evidence: mode.to_string(),
+            default_wal_root: local_default_root(
+                mode == DurabilityMode::LocalVolume && explicit_root.is_none(),
+            ),
+        };
+    }
+    if let Some(root) = explicit_root.clone() {
+        return ResolvedDurabilityMode {
+            mode: DurabilityMode::LocalVolume,
+            source: DurabilityModeSource::WalLocalDir,
+            evidence: root,
+            default_wal_root: None,
+        };
+    }
+    let primary = primary_wal_location.trim();
+    let mode = if is_object_store_url(primary) {
+        DurabilityMode::ObjectStoreServerless
+    } else {
+        DurabilityMode::LocalVolume
+    };
+    ResolvedDurabilityMode {
+        mode,
+        source: DurabilityModeSource::PrimaryScheme,
+        evidence: primary.to_string(),
+        default_wal_root: local_default_root(mode == DurabilityMode::LocalVolume),
+    }
+}
+
+/// TD-SPINE-5 env mirror of `[storage.wal_config].durability_mode` (tier
+/// config-mirror; unset ⇒ infer). Read once per process. An INVALID value is
+/// logged at error and treated as unset (the ADR-098 D3 no-boot-break rule:
+/// existing configurations must keep booting; the error names the fix).
+pub(crate) fn durability_mode_env() -> Option<DurabilityMode> {
+    static ENV: std::sync::OnceLock<Option<DurabilityMode>> = std::sync::OnceLock::new();
+    *ENV.get_or_init(|| {
+        let raw = std::env::var("PROXIMADB_WAL_DURABILITY_MODE").ok()?;
+        match DurabilityMode::parse(&raw) {
+            Some(mode) => Some(mode),
+            None => {
+                tracing::error!(
+                    value = %raw,
+                    "PROXIMADB_WAL_DURABILITY_MODE must be 'local_volume' or \
+                     'object_store_serverless'; ignoring the invalid value and inferring the \
+                     durability mode (ADR-098 D3 / TD-SPINE-5)"
+                );
+                None
+            }
+        }
+    })
+}
+
 /// Backwards-compat alias for [`WalEncryptionConfig`].
 pub type EncryptionConfig = WalEncryptionConfig;
 
@@ -346,6 +534,13 @@ pub struct WALConfig {
     /// value could be `s3://…` (S3 Express) or another backend.
     pub wal_local_dir: Option<String>,
 
+    /// ADR-098 D3 / TD-SPINE-5: the RESOLVED WAL durability mode, carried from
+    /// the boot resolution (`WriteBufferUserConfig::resolve_durability_mode`)
+    /// so engine-side surfaces (recovery, observability) can report it. `None`
+    /// on programmatically built configs that never went through the boot
+    /// resolution — then no mode claim is made (legacy behavior).
+    pub durability_mode: Option<DurabilityMode>,
+
     /// Compression settings
     pub compression: WalCompressionConfig,
 
@@ -390,6 +585,7 @@ impl Default for WALConfig {
             memtable: MemTableConfig::default(), // ART for metadata filtering efficiency
             multi_disk: MultiDiskConfig::default(), // LoadBalanced for bulk insert optimization
             wal_local_dir: None,                 // ADR-069 S1: opt-in; None = legacy WAL-with-data
+            durability_mode: None,               // TD-SPINE-5: set by the boot resolution
             compression: WalCompressionConfig::default(), // Snappy for balanced performance
             encryption: WalEncryptionConfig::default(), // Encryption disabled by default (TD-016)
             performance: WalPerformanceConfig::default(), // Optimized for large vectors and bulk processing
@@ -853,6 +1049,7 @@ mod tests {
             },
             global_manifest_url: None,
             wal_local_dir: None,
+            durability_mode: None,
             memtable: MemTableConfig {
                 memtable_type: MemTableType::SkipList,
                 global_memory_limit: 256 * 1024 * 1024,
@@ -938,6 +1135,7 @@ mod tests {
             },
             global_manifest_url: None,
             wal_local_dir: None,
+            durability_mode: None,
             memtable: MemTableConfig {
                 memtable_type: MemTableType::Art,
                 global_memory_limit: 512 * 1024 * 1024,
@@ -1403,5 +1601,168 @@ mod tests {
             deserialized.global_shrink_factor
         );
         assert!(deserialized.cloud_backup.is_none());
+    }
+
+    // -------------------------------------------------------------------------
+    // TD-SPINE-5 (ADR-098 D3): the durability-mode resolution ladder.
+    // -------------------------------------------------------------------------
+
+    fn data_dir() -> std::path::PathBuf {
+        std::path::PathBuf::from("/srv/proximadb/data")
+    }
+
+    /// Per-mode ratchet (ADR-098 D3): a local primary WAL location infers
+    /// `local_volume` AND applies the `{data_dir}/wal` default root; the
+    /// resolved root's scheme is local.
+    #[test]
+    fn spine5_local_scheme_infers_local_volume_with_default_root() {
+        let resolution =
+            resolve_durability_mode(None, None, "./data/write_buffer", Some(&data_dir()));
+        assert_eq!(resolution.mode, DurabilityMode::LocalVolume);
+        assert_eq!(resolution.source, DurabilityModeSource::PrimaryScheme);
+        assert_eq!(resolution.evidence, "./data/write_buffer");
+        assert_eq!(
+            resolution.default_wal_root.as_deref(),
+            Some("file:///srv/proximadb/data/wal"),
+            "local_volume defaults the WAL root to {{data_dir}}/wal"
+        );
+        assert!(
+            !is_object_store_url(
+                resolution
+                    .effective_wal_root(None)
+                    .as_deref()
+                    .unwrap_or_default()
+            ),
+            "the resolved WAL root's scheme must match the mode (ratchet)"
+        );
+    }
+
+    /// Per-mode ratchet (ADR-098 D3): an object-store primary WAL location
+    /// infers `object_store_serverless` — the ADR-063 posture, not a bug —
+    /// and applies NO local default root (per-collection WAL stays under the
+    /// catalog-derived base).
+    #[test]
+    fn spine5_object_scheme_infers_serverless_without_local_root() {
+        for url in ["s3://bucket/wal", "az://acct/container/wal", "gcs://b/wal"] {
+            let resolution = resolve_durability_mode(None, None, url, Some(&data_dir()));
+            assert_eq!(
+                resolution.mode,
+                DurabilityMode::ObjectStoreServerless,
+                "{url}"
+            );
+            assert_eq!(resolution.source, DurabilityModeSource::PrimaryScheme);
+            assert!(
+                resolution.default_wal_root.is_none(),
+                "{url}: serverless keeps the catalog-derived base, not a local root"
+            );
+            assert!(resolution.effective_wal_root(None).is_none());
+        }
+    }
+
+    /// A `file://` primary location is LOCAL (not an object URL).
+    #[test]
+    fn spine5_file_scheme_is_local_volume() {
+        let resolution =
+            resolve_durability_mode(None, None, "file:///waldisk/buffer", Some(&data_dir()));
+        assert_eq!(resolution.mode, DurabilityMode::LocalVolume);
+        assert!(!is_object_store_url("file:///waldisk"));
+    }
+
+    /// A declared mode wins over inference, in BOTH directions.
+    #[test]
+    fn spine5_declared_mode_wins_over_inference() {
+        let declared = resolve_durability_mode(
+            Some(DurabilityMode::ObjectStoreServerless),
+            None,
+            "./data/write_buffer",
+            Some(&data_dir()),
+        );
+        assert_eq!(declared.mode, DurabilityMode::ObjectStoreServerless);
+        assert_eq!(declared.source, DurabilityModeSource::Declared);
+        assert!(declared.default_wal_root.is_none());
+
+        let declared_local = resolve_durability_mode(
+            Some(DurabilityMode::LocalVolume),
+            None,
+            "s3://bucket/wal",
+            Some(&data_dir()),
+        );
+        assert_eq!(declared_local.mode, DurabilityMode::LocalVolume);
+        assert_eq!(
+            declared_local.default_wal_root.as_deref(),
+            Some("file:///srv/proximadb/data/wal"),
+            "declared local_volume with no explicit root gets the same default"
+        );
+    }
+
+    /// A set global `wal_local_dir` ⇒ `local_volume` (an explicit local root
+    /// IS that posture) and suppresses the default-root move.
+    #[test]
+    fn spine5_wal_local_dir_infers_local_volume() {
+        let resolution = resolve_durability_mode(
+            None,
+            Some("file:///waldisk"),
+            "s3://bucket/wal",
+            Some(&data_dir()),
+        );
+        assert_eq!(resolution.mode, DurabilityMode::LocalVolume);
+        assert_eq!(resolution.source, DurabilityModeSource::WalLocalDir);
+        assert_eq!(resolution.evidence, "file:///waldisk");
+        assert!(resolution.default_wal_root.is_none());
+        assert_eq!(
+            resolution
+                .effective_wal_root(Some("file:///waldisk"))
+                .as_deref(),
+            Some("file:///waldisk")
+        );
+    }
+
+    /// `data_dir: None` (a conversion that cannot know it) still resolves the
+    /// mode — only the default-root move is skipped, never the mode claim.
+    #[test]
+    fn spine5_unknown_data_dir_resolves_mode_without_default_root() {
+        let resolution = resolve_durability_mode(None, None, "./data/write_buffer", None);
+        assert_eq!(resolution.mode, DurabilityMode::LocalVolume);
+        assert!(resolution.default_wal_root.is_none());
+    }
+
+    /// The env-value parser accepts exactly the two documented spellings
+    /// (case-insensitively); anything else is None so the caller can log and
+    /// infer rather than silently guess.
+    #[test]
+    fn spine5_mode_parsing() {
+        assert_eq!(
+            DurabilityMode::parse("local_volume"),
+            Some(DurabilityMode::LocalVolume)
+        );
+        assert_eq!(
+            DurabilityMode::parse("Object_Store_Serverless"),
+            Some(DurabilityMode::ObjectStoreServerless)
+        );
+        assert_eq!(
+            DurabilityMode::parse(" object_store_serverless "),
+            Some(DurabilityMode::ObjectStoreServerless)
+        );
+        assert_eq!(DurabilityMode::parse("serverless"), None);
+        assert_eq!(DurabilityMode::parse(""), None);
+    }
+
+    /// The TOML spelling round-trips through serde (the declared key fails
+    /// config load on an unknown value — fail-fast, not a silent default).
+    #[test]
+    fn spine5_mode_serde_round_trip() {
+        #[derive(serde::Deserialize)]
+        struct Wrapper {
+            durability_mode: DurabilityMode,
+        }
+        let local: Wrapper = toml::from_str("durability_mode = \"local_volume\"").unwrap();
+        assert_eq!(local.durability_mode, DurabilityMode::LocalVolume);
+        let serverless: Wrapper =
+            toml::from_str("durability_mode = \"object_store_serverless\"").unwrap();
+        assert_eq!(
+            serverless.durability_mode,
+            DurabilityMode::ObjectStoreServerless
+        );
+        assert!(toml::from_str::<Wrapper>("durability_mode = \"serverless\"").is_err());
     }
 }

@@ -307,6 +307,14 @@ max_entries = 10000
 [storage.wal_config]
 # Global manifest location (centralized tracking of all WAL files)
 global_manifest_url = "file:///tmp/proximadb/manifest"
+# ADR-098 D3 / TD-SPINE-5 — the WAL durability mode: what an acknowledged
+# write survives. "local_volume" = fsync on a local reattachable volume
+# (ADR-069 D1; the WAL root defaults to {data_dir}/wal when no wal_local_dir
+# is set); "object_store_serverless" = durable and LISTable on the object
+# store (ADR-063 D3; per-collection WAL under the catalog base location).
+# UNSET (default) = inferred at boot from the storage scheme and logged at
+# INFO — no silent legacy path. Env mirror: PROXIMADB_WAL_DURABILITY_MODE.
+# durability_mode = "local_volume"
 # ADR-069 auto-flush driver RPO floor (seconds). DEFAULT 300 — the driver
 # spawns whenever this is > 0 and time-drains memtables to L0 PAX segments on
 # its tick; the RPO timer overrides the predicted-segment floor, so a trickle

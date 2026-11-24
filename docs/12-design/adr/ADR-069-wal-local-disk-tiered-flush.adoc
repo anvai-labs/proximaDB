@@ -174,6 +174,10 @@ New `[storage.wal_config]` keys: `flush_interval_secs`, `wal_max_bytes`, `high_w
 `critical_watermark_pct`. Defaults are chosen so an operator who sets none still gets bounded, durable
 behavior (a sane time interval + a budget derived from the volume). No runtime mutation — the config is the
 version-controlled source of truth (repo convention).
+Added 2026-11-24 (ADR-098 D3 / TD-SPINE-5): `durability_mode` (`local_volume` |
+`object_store_serverless`, env mirror `PROXIMADB_WAL_DURABILITY_MODE`; unset ⇒ inferred at boot
+and logged at INFO). In `local_volume` with no `wal_local_dir` set, the WAL root defaults to
+`{data_dir}/wal`; recovery also scans the legacy co-located root so upgrades never strand WALs.
 
 === Embedded and short-lived compute clarification (2026-11-02)
 

@@ -121,6 +121,25 @@ impl ProximaDB {
     pub async fn new(config: core::Config) -> anyhow::Result<Self> {
         tracing::info!("🚀 ProximaDB::new - STARTING database initialization");
         tracing::debug!("🔍 ProximaDB::new - Config: {:?}", config);
+        let mut config = config;
+
+        // TD-SPINE-5 (ADR-098 D3): resolve the WAL durability mode ONCE at
+        // boot — declared `durability_mode` wins, else inferred (the global
+        // `wal_local_dir`, else the primary WAL location's scheme) — and cache
+        // it on the user config so every later conversion (SharedServices, the
+        // WAL manifest init, the engine replay managers) applies the same mode
+        // and the same effective local WAL root (`{data_dir}/wal` default in
+        // local_volume; recovery still scans the legacy co-located root, so an
+        // upgrade never strands unflushed WAL objects). The INFO boot log is
+        // emitted where the legacy ADR-069 warning stood
+        // (`SharedServices::convert_toml_to_wal_config`).
+        {
+            let data_dir = config.server.data_dir.clone();
+            config
+                .storage
+                .wal_config
+                .apply_durability_mode_resolution(&data_dir);
+        }
 
         // ADR-095: publish `[oltp] atomic_commit` before SharedServices opens the
         // canonical WAL (which arms group frames from it). Env still overrides.
