@@ -477,18 +477,33 @@ mod tests {
     /// into `effective_durable_locations`, and this check treats every
     /// recorded local location as durable state that must survive compute
     /// replacement.
+    fn on_volume_config(vol: &Path) -> Config {
+        // Round 3 (L4): every config root ON the volume, so the warehouse
+        // override is the only variable under test (Config::default()'s
+        // cwd-relative roots would otherwise pile on as extra offenders).
+        let mut config = Config::default();
+        config.server.data_dir = vol.join("data");
+        config.storage.metadata_url = format!("file://{}", vol.join("metadata").display());
+        config.storage.storage_locations = vec![proximadb::core::config::StorageLocation {
+            url: format!("file://{}", vol.join("collections").display()),
+            ..Default::default()
+        }];
+        config.storage.wal_config.write_buffer_directory =
+            format!("file://{}", vol.join("wal").display());
+        config.storage.wal_config.wal_local_dir = None;
+        config.storage.sst_config = None;
+        config.queue = None;
+        config
+    }
+
     #[test]
     fn local_warehouse_override_off_volume_refuses_boot() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let vol = dir.path().join("vol");
-        std::fs::create_dir_all(&vol).expect("mkdir");
-        // An ON-volume data_dir (no other offender) with the warehouse
-        // override pointing OFF the volume is refused BY NAME — the override
-        // flows into effective_durable_locations and this check treats every
-        // recorded local location as durable state that must survive
-        // compute replacement.
-        let mut config = Config::default();
-        config.server.data_dir = vol.join("data");
+        let vol_raw = dir.path().join("vol");
+        std::fs::create_dir_all(&vol_raw).expect("mkdir");
+        // Canonicalized like the production caller (resolve_durable_volume_root).
+        let vol = vol_raw.canonicalize().expect("canonicalize");
+        let config = on_volume_config(&vol);
         let outside = dir.path().join("pod-warehouse");
         std::fs::create_dir_all(&outside).expect("mkdir");
         let err = check_durable_roots_on_volume_with_env(&config, &vol, |key| {
@@ -501,6 +516,15 @@ mod tests {
             message.contains("PROXIMADB_WAREHOUSE_ROOT_URL"),
             "names the variable: {message}"
         );
+
+        // Positive control: the SAME config with the override ON the volume
+        // passes the check.
+        let inside = vol.join("warehouse");
+        std::fs::create_dir_all(&inside).expect("mkdir");
+        check_durable_roots_on_volume_with_env(&config, &vol, |key| {
+            (key == "PROXIMADB_WAREHOUSE_ROOT_URL").then(|| format!("file://{}", inside.display()))
+        })
+        .expect("on-volume warehouse override passes");
     }
 
     #[test]

@@ -191,7 +191,7 @@ segment costs 2 small ranged footer GETs, once, and only when the collection-lev
 
 Three legs move this TD's evidence from the Azurite adls:// shape to an S3-shaped emulator (store =
 docker MinIO on localhost, path-style; counts are the evidence, latency is not — see the artifact's
-honesty notes; real-cloud confirmation deferred pending credentials, owner, 2026-11-25):
+honesty notes; real-cloud confirmation deferred pending credentials, owner, 2026-11-24):
 
 * **SIFT1M full bench, shipped defaults (AT_FLUSH ON, post-#2549)** — `sift1m_get_reduction.py`,
   rows=1M / top-k=100 / 100 queries per phase / explicit flush every 250k, settled 2-segment bed
@@ -210,8 +210,9 @@ honesty notes; real-cloud confirmation deferred pending credentials, owner, 2026
   cause (later develop read-path changes) is ASSERTED, not proven (no same-revision control was
   run); both campaigns' OFF→ON contrasts are identical in shape. Ledger `m5_sift_get_counts_minio_at_flush`.
 * **RTT ladder (toxiproxy 50/100/150 ms symmetric over the same 1M bed, skip-ingest)** — see the
-  artifact for the latency-shaped legs (25-query cohorts; one wedged 100-query attempt recorded as
-  an incident). Ledger `m5_sift1m_minio_rtt_ladder`.
+  artifact for the latency-shaped legs (25-query cohorts; the first 100-query attempt was killed
+  on a misread hang — resolved as NOT a hang, see the artifact's Incidents and TD-BENCH-3).
+  Ledger `m5_sift1m_minio_rtt_ladder`.
 
 Artifact: `docs/_internal/status/M5_EMULATOR_TRACE_EVIDENCE_2026_11_24.adoc`.
 

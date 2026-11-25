@@ -116,11 +116,17 @@ pub(crate) fn join_storage_url(base: &str, sub: &str) -> String {
 /// on an object-store URL (`s3://bucket/prefix`, `adls://…`) while `data_dir`
 /// stays a local path — the configuration cloud deployments and the cloud-trace
 /// evidence ledger need, and until now impossible to express: the URL was
-/// formatted from a `PathBuf` at three independent call sites. The override is
-/// taken verbatim (scheme included); a value without a `://` scheme separator
-/// is REJECTED with an error naming the variable and the default applies
-/// (the `PROXIMADB_WAL_DURABILITY_MODE` invalid-value posture — logged, never
-/// a boot break); an override whose store then fails to open still degrades
+/// formatted from a `PathBuf` at three independent call sites. The override's
+/// scheme must be in [`WAREHOUSE_SCHEME_ALLOWLIST`] (the schemes the
+/// object-store builder serves); a schemeless value, an unknown scheme,
+/// `memory://` (volatile — not a warehouse) or a non-localhost `file://` host
+/// is REJECTED with an ERROR log naming the variable and the DEFAULT
+/// `{data_dir}/warehouse` applies — a rejected override is a relocation to
+/// the default, loud in the log but silent in placement, hence the error.
+/// The allow-list is deliberately NARROWER than `store_for_url`, which also
+/// accepts `https://…` blob-endpoint forms: those are rejected here by
+/// design (fail-closed — use a scheme the builder maps, not a raw endpoint
+/// URL). An override whose store then fails to open still degrades
 /// the same way it always did — `with_materializer` / the Iceberg REST wiring
 /// warn and leave MATERIALIZE unwired rather than break the server.
 ///
@@ -4402,7 +4408,7 @@ mod abac_composition_root_tests {
 
 #[cfg(test)]
 mod warehouse_root_tests {
-    use super::resolve_warehouse_root;
+    use super::{resolve_warehouse_root, warehouse_root_url};
     use std::path::{Path, PathBuf};
 
     fn lookup<'a>(map: &'a [(&'static str, &'static str)]) -> impl Fn(&str) -> Option<String> + 'a {
@@ -4492,6 +4498,32 @@ mod warehouse_root_tests {
                 "{bad}"
             );
         }
+    }
+
+    /// Round 3 (L5): the production entry point (the one the network call
+    /// sites use) really reads the environment — set, observe, unset. Runs
+    /// under nextest's process-per-test isolation.
+    #[test]
+    fn production_entry_point_reads_the_environment() {
+        // SAFETY: nextest isolates this test in its own process; the variable
+        // is removed before the assertions that must not see it.
+        unsafe {
+            std::env::set_var(
+                "PROXIMADB_WAREHOUSE_ROOT_URL",
+                "file:///definitely-not-the-default/wh",
+            );
+        }
+        assert_eq!(
+            warehouse_root_url(Path::new("/data")),
+            "file:///definitely-not-the-default/wh"
+        );
+        unsafe {
+            std::env::remove_var("PROXIMADB_WAREHOUSE_ROOT_URL");
+        }
+        assert_eq!(
+            warehouse_root_url(Path::new("/data")),
+            "file:///data/warehouse"
+        );
     }
 
     #[test]

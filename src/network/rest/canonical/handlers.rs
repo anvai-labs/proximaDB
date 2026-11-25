@@ -2014,7 +2014,9 @@ pub fn create_router(state: AppState) -> axum::Router {
         let mut iceberg_state = IcebergRestState::with_defaults(state.catalog_manager.clone())
             .with_segment_registry(state.segment_registry.clone());
         // TD-119: persist/serve a real metadata.json from the SAME warehouse root the
-        // materialize/write path uses (`file://{data_dir}/warehouse`), so the manifest log
+        // materialize/write path uses (the resolver's default
+        // `file://{data_dir}/warehouse`, env-overridable — see
+        // `shared_services::warehouse_root_url`), so the manifest log
         // drives snapshot history and `metadata-location` resolves. Best-effort: if the
         // store is unavailable, metadata is still served inline (synthesized, no persistence).
         let warehouse_root_url =

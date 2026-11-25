@@ -143,10 +143,16 @@ fn unleased_durable_state(config: &Config) -> anyhow::Result<Vec<String>> {
     let mine =
         durable_locations::effective_durable_locations(config, |key| std::env::var(key).ok());
 
-    let leased: Vec<PathBuf> = root_plan(config)
-        .local
+    // Round 3 (MED-2): containment must match what backup actually COPIES.
+    // A root group whose roles are all SstCache is ExcludedCache — its
+    // contents are skipped as rebuildable — so a durable location that only
+    // sits under such a group would be silently omitted; it must refuse.
+    // Built from the same grouped_roots the copy loop uses, so the two can
+    // never disagree.
+    let leased: Vec<PathBuf> = grouped_roots(config, false)?
         .into_iter()
-        .filter_map(|(_, root)| absolute(&root).ok())
+        .filter(|root| root.content == RootContent::Full)
+        .map(|root| root.path)
         .collect();
     let mut found = Vec::new();
     for location in recorded.iter().chain(mine.iter()) {
@@ -361,6 +367,22 @@ pub(crate) fn run_backup(config: &Config, to: &Path) -> anyhow::Result<Summary> 
             "{:?} lives in object storage ({}) and is NOT in this backup",
             root.role, root.url
         ));
+    }
+    // Round 3 (L6): a REMOTE warehouse override (PROXIMADB_WAREHOUSE_ROOT_URL)
+    // is not a root_plan root, so the uncovered loop above never sees it —
+    // every MATERIALIZEd table's Parquet parts + Iceberg metadata live there
+    // and are NOT in this backup. Say so instead of staying invisible.
+    {
+        let warehouse = proximadb::network::shared_services::resolve_warehouse_root(
+            &config.server.data_dir,
+            |key| std::env::var(key).ok(),
+        );
+        if warehouse.from_override && warehouse.local_path.is_none() {
+            warnings.push(format!(
+                "the warehouse root {} (PROXIMADB_WAREHOUSE_ROOT_URL) is REMOTE: every                  MATERIALIZEd table's Parquet parts and Iceberg metadata live there and are                  NOT in this backup",
+                warehouse.url
+            ));
+        }
     }
 
     let manifest = Manifest {
@@ -997,6 +1019,82 @@ mod tests {
     /// `effective_durable_locations` makes THIS test fail, not just the unit
     /// test): a LOCAL override outside every leased root refuses the backup
     /// naming the variable and writes nothing.
+    /// Round 3 (MED-2): a warehouse override under the EXCLUDED cache root
+    /// is not copied by backup (the group's contents are skipped as
+    /// rebuildable) — so it must REFUSE, not silently omit the parts. The
+    /// reviewer's probe showed backup succeeding with files=3 and the part
+    /// missing before the containment set was aligned with the copy set.
+    #[test]
+    fn backup_refuses_warehouse_root_under_the_excluded_cache_root() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let base = temp.path().join("live");
+        let mut config = local_config(&base);
+        let cache = base.join("cache");
+        config.storage.sst_config = Some(proximadb::core::config::SstConfig {
+            data_directory: base.join("sst").display().to_string(),
+            cache_local_disk_path: Some(cache.display().to_string()),
+            ..Default::default()
+        });
+        seed(&config);
+        let warehouse = cache.join("warehouse");
+        std::fs::create_dir_all(&warehouse).expect("mkdir");
+        std::fs::write(warehouse.join("part-0.parquet"), b"parquet").expect("part");
+        durable_locations::write_record(
+            &config.server.data_dir,
+            &durable_locations::effective_durable_locations(&config, |key| {
+                (key == "PROXIMADB_WAREHOUSE_ROOT_URL")
+                    .then(|| format!("file://{}", warehouse.display()))
+            }),
+        )
+        .expect("record");
+        let backup = temp.path().join("bk");
+        let err = run_backup(&config, &backup).expect_err("cache-root warehouse must refuse");
+        let message = format!("{err:#}");
+        assert!(message.contains("ownership lease"), "{message}");
+        assert!(
+            message.contains("PROXIMADB_WAREHOUSE_ROOT_URL"),
+            "names the variable: {message}"
+        );
+        assert!(
+            !backup.join(MANIFEST_FILE).exists(),
+            "a refused backup must leave no manifest"
+        );
+    }
+
+    /// Round 3 (L5): the containment check resolves the nearest existing
+    /// ancestor, so a SYMLINKED path component cannot make an outside
+    /// location look leased: `roots/alias/wh` where `alias` points outside
+    /// the roots reads as inside on a naive prefix match and outside once
+    /// canonicalized.
+    #[test]
+    fn symlinked_ancestor_cannot_fake_containment() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let base = temp.path().join("live");
+        let config = local_config(&base);
+        seed(&config);
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(&outside).expect("mkdir");
+        let alias = base.join("collections-alias");
+        std::os::unix::fs::symlink(&outside, &alias).expect("symlink");
+        let wh = alias.join("wh");
+        std::fs::create_dir_all(&wh).expect("mkdir");
+        durable_locations::write_record(
+            &config.server.data_dir,
+            &[durable_locations::DurableLocation {
+                source: "PROXIMADB_WAREHOUSE_ROOT_URL".into(),
+                location: wh.display().to_string(),
+                durability_mode: None,
+            }],
+        )
+        .expect("record");
+        let err = run_backup(&config, &temp.path().join("bk"))
+            .expect_err("symlinked alias must not count as leased");
+        assert!(
+            format!("{err:#}").contains("PROXIMADB_WAREHOUSE_ROOT_URL"),
+            "names the variable"
+        );
+    }
+
     #[test]
     fn backup_refuses_unleased_warehouse_root_and_writes_nothing() {
         let temp = tempfile::tempdir().expect("tempdir");

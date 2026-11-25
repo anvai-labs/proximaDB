@@ -997,8 +997,9 @@ impl MultiServer {
             let primary_pod_registry = services.primary_pod_registry.clone();
             let self_pod_id = services.self_pod_id.clone();
             let partition_lease_manager = services.partition_lease_manager.clone();
-            // Warehouse object-store root for `ALTER TABLE … MATERIALIZE`, derived from
-            // the server data dir the same way document/observability roots are.
+            // Warehouse object-store root for `ALTER TABLE … MATERIALIZE`: the
+            // resolver's data-dir default, env-overridable via
+            // PROXIMADB_WAREHOUSE_ROOT_URL (see shared_services).
             let warehouse_root_url =
                 crate::network::shared_services::warehouse_root_url(&self.config.data_dir);
 

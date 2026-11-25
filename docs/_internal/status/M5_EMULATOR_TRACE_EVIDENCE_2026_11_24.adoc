@@ -30,10 +30,13 @@ AWS_ACCESS_KEY_ID=m5bench AWS_SECRET_ACCESS_KEY=m5bench-secret \
 
 [cols="1,1,1,1,1,1,1,1", options="header"]
 |===
-| Phase | recall@100 | GET/q | req/q | waves p50 | bytes/q | p50 | p95
+| Phase | recall@100 | GET/q | req/q | waves p50 | bytes/q | p50 ⚑ | p95 ⚑
 | post_write | 0.9907 | 9.33 | 9.35 | 1 | 18.9 MB | 215 ms | 319 ms
 | local_disk_warm | 0.9897 | 9.67 | 9.69 | 1 | 19.9 MB | 238 ms | 340 ms
 | object_cold | 0.9881 | 18.64 | 18.69 | 2 | 51.2 MB | 833 ms | 1,976 ms
+
+⚑ these phase sweeps overlapped background release compiles (see Incidents) — the p50/p95 cells are
+upper bounds; the count and recall columns are request-deterministic and unaffected.
 |===
 
 All phases clear the recall floor (0.975). The bench's gates were deliberately loosened for the
@@ -75,17 +78,18 @@ SIFT_GET_COUNTS {"mode":"at_flush_on","pax_write_directory_at_flush":true,"store
 
 Toxiproxy 2.12.0 (docker `m5-toxiproxy`), proxy 127.0.0.1:9100 → MinIO, symmetric latency toxics
 (L/2 down + L/2 up), fresh proxy daemon per arm. Cohort: 25 queries/phase (the first 100-query arm
-wedged — see Incidents and
-link:../../10-quality/td/TD-S3STALL-1-query-path-blocking-read-mechanism-unknown.adoc[TD-S3STALL-1]). GET/q and recall are RTT-invariant (counts, not latency); p50s are the
-latency shape. Arms marked ⚑ ran while a release build compiled in the background — treat those p50s
-as upper bounds (the RTT50 ⚑ arm's qps 0.31 vs the clean re-run's higher throughput makes the
-contention visible; the clean re-run is authoritative).
+was killed mid-phase on a misread "hang" — see Incidents; it was slow, never stuck). GET/q and
+recall are RTT-invariant (counts, not latency); p50s are the latency shape. Arms marked ⚑ ran
+while a release build compiled in the background — treat those p50s as upper bounds (the
+contention signal is the RTT50 PAIR's qps: 0.29-0.31 for the two contended 25q arms vs 1.07-1.34
+for the clean re-runs; no qps was recorded for the other legs, so the marker there rests on the
+build-calendar, not a measured signal).
 
 [cols="1,1,1,1,1,1,1", options="header"]
 |===
 | Arm | recall@100 (cold) | GET/q (cold) | waves p50 | bytes/q (cold) | cold p50 | cold p95
 | direct ⚑ (leg-1 object_cold, proxy-free; compile-contended AND a 100-query cohort vs the 25-query arms) | 0.9881 | 18.64 | 2 | 51.2 MB | 833 ms | 1,976 ms
-| RTT 50 ms — first 100-query attempt | wedged after 86/100 post-write queries (see Incidents); killed, excluded | | | | |
+| RTT 50 ms — first 100-query attempt ⚑ | killed mid-phase on a misread hang (see Incidents: slow under contention, never stuck); excluded — no phase completed | | | | |
 | RTT 50 ms — clean 25q re-run, exit 0 | 0.9932 | 18.12 | 2 | 50.9 MB | 770 ms | 1,108 ms
 | RTT 50 ms ⚑ contended 25q, exit 0 | 0.9932 | 18.12 | 2 | 50.9 MB | 2,234 ms | 11,305 ms
 | RTT 100 ms ⚑ contended 25q, exit 0 | 0.9932 | 18.12 | 2 | 50.9 MB | 882 ms | 1,247 ms
@@ -100,7 +104,7 @@ bound: the ⚑ rows overlapped background release compiles (the 2,234 ms vs 770 
 against 25-query arms — no rung-to-rung latency comparison is sound, and none is made. A real-cloud
 link couples RTT with limited bandwidth; these localhost shapes bound nothing about cloud latency.
 
-== 4. pgwire TD-SPINE-4 manifest levers with an S3-warehouse — exit 0 (2.3 s)
+== 4. pgwire TD-SPINE-4 manifest levers with an S3-warehouse — HARDENED test, exit 0 (2.0 s)
 
 ....
 PROXIMADB_WAREHOUSE_ROOT_URL=s3://proximadb-m5/pgwire-mlev \
@@ -111,8 +115,13 @@ AWS_ACCESS_KEY_ID=m5bench AWS_SECRET_ACCESS_KEY=m5bench-secret RUST_MIN_STACK=83
   -- --ignored --exact --nocapture --test-threads=1
 ....
 
-The warehouse root held 13 objects (4 `mlevos` parts + metadata), asserted in-test so a silently
-file://-defaulted run fails (the TD-CI-7 vacuity class). Per-query io_trace:
+RE-MEASURED 2026-11-25 (review round 3, MED-1) with the HARDENED test (the round-3 tree) against
+a FRESH prefix (`s3://proximadb-m5/pgwire-mlev-r3`): the guard printed "holds 13 objects (13 fresh
+this run; mlevos_25693_1795608241360 parts + metadata)" — the per-run table name and the
+list-before/list-after diff both fired, and get_ops is ASSERTED (pinned to these counts), not just
+printed. (The round-1 numbers below came from the pre-hardening test; the re-run's counts are
+IDENTICAL — bytes differ slightly with the fresh metadata payload. Raw output:
+`m5_raw_pgwire_hardened.txt`.) Per-query io_trace:
 
 [cols="2,1,1,1,1,1", options="header"]
 |===
@@ -137,37 +146,41 @@ All four legs via the production `store_for_url` (the same PR routes this bench 
 
 [cols="1,1,1,1,1,1,1,1", options="header"]
 |===
-| Leg | GET 4KiB p50 | ranged 4KiB p50 | GET 64KiB p50 | ranged 64KiB p50 | ranged 1MiB p50 | whole 1MiB p50 | LIST p50
+| Leg | GET 4KiB p50 | last-4KiB-range 4KiB obj p50 | GET 64KiB p50 | last-4KiB-range 64KiB obj p50 | last-4KiB-range 1MiB obj p50 | whole 1MiB p50 | LIST p50
 | direct MinIO (Docker NAT) | 5.0 ms | 12.9 ms | 12.7 ms | 1.1 ms | 17.5 ms | 65.6 ms | 8.6 ms
 | +50 ms injected RTT | 60.2 ms | 55.3 ms | 65.5 ms | 80.8 ms | 81.4 ms | 253.2 ms | 79.4 ms
 | +100 ms injected RTT | 130.4 ms | 128.2 ms | 149.7 ms | 131.9 ms | 129.3 ms | 285.0 ms | 104.9 ms
 | +150 ms injected RTT | 153.5 ms | 153.6 ms | 154.1 ms | 153.9 ms | 154.3 ms | 162.7 ms | 153.9 ms
 |===
 
-Reading: the small-op overhead above the injected RTT is +3.5 to +4.3 ms at +150 ms, but larger
-and wider at +50 ms (+5.3 to +31.4 ms) and +100 ms (+4.9 to +49.7 ms, the whole-GET 64 KiB row) —
-NOT attributed here (no per-op breakdown was measured; after the bench's 10-op warmup,
-"first-connection setup" cannot be the explanation either). Whole-object 1 MiB GET clearly adds a
-transfer term (253-285 ms at +50/+100 ms; 162.7 ms at +150 ms where the toxic's shaping binds
-differently). Failed operations COUNT AS SAMPLES (the bench records a failing op's observed
-latency and emits no error counts), and every cell is 10 warmup + 50 timed iterations
-(200 direct). All p50s in this table are transcribed from the run's raw stdout (the whole-GET
-64 KiB column was added in review round 2 against that output, not from memory). These are FLOOR shapes on an emulator — the numbers a route-cost model must beat,
-not cloud SLAs.
+Reading: the per-op overhead above the injected RTT varies by leg (+3.5 to +4.3 ms at +150 ms;
++5.3 to +31.4 ms at +50 ms; +4.9 to +49.7 ms at +100 ms, the whole-GET 64 KiB row) and is NOT
+attributed — no per-op breakdown was measured. Whole-object 1 MiB GET clearly adds a transfer
+term (253-285 ms at +50/+100 ms; 162.7 ms at +150 ms). The "range" columns are the bench's
+last-4KiB tail ranges of each object size (the footer-read shape), not ranges of that many bytes.
+Failed operations COUNT AS SAMPLES (the bench records a failing op's observed latency and emits
+no error counts), and every cell is 10 warmup + 50 timed iterations (200 direct). All p50s in
+this table are transcribed from the run's raw stdout (now committed beside this artifact — see
+`m5_raw_floor_bench.txt`; the whole-GET 64 KiB column was added in review round 2 against that
+output, not from memory). These are FLOOR shapes on an emulator — the numbers a route-cost model
+must beat, not cloud SLAs.
 
 == Incidents (recorded, not hidden)
 
-* **Wedged RTT arm
-  (link:../../10-quality/td/TD-S3STALL-1-query-path-blocking-read-mechanism-unknown.adoc[TD-S3STALL-1]):**
-  the first 50 ms ladder attempt (100 queries) stalled 25 min into the post-write phase after
-  86/100 queries — the server's S3 READ on the query path blocked on a connection toxiproxy had
-  torn down ("Source terminated" in the proxy log) for 25+ minutes with NO error and NO
-  warn-log from the read path — despite object_store 0.14.2's defaults applying to this store
-  (30 s request timeout, 5 s connect, max 10 retries in 180 s), which should have surfaced a
-  stalled read within ~30 s. Mechanism UNKNOWN (TD-S3STALL-1 re-diagnosed in review round 2);
-  diagnosis-first fix direction there. Killed; re-run with a fresh proxy daemon per arm and
-  25-query cohorts. The wedged attempt's `result.json` records the partial phase; it is excluded
-  from the table.
+* **Apparent hang at RTT50 — RESOLVED AS NOT A HANG (round 3, verified against the run's complete
+  server log; the previously filed the withdrawn S3-stall TD is WITHDRAWN and
+  link:../../10-quality/td/TD-BENCH-3-sift-harness-no-intra-phase-progress.adoc[TD-BENCH-3]
+  records the real gap):** the first 50 ms ladder attempt (100 queries) was killed mid-phase in
+  the belief the server had blocked on a proxy-torn connection. The log shows the opposite:
+  server lifetime 23:02:42.954Z → SIGTERM 23:10:09.357Z (7 min 26 s total — which rules out any
+  multi-minute block); 46 search requests, 45 completed, the 46th 6.3 s in flight at
+  SIGTERM; largest gap between search completions 38 s; the last completion 6.3 s before SIGTERM.
+  One query hit the store's default request timeout ("Encountered error while reading response
+  body … Retrying in 0.1s", exactly 30.00 s after that search started) and its RETRY SUCCEEDED
+  (completed in 38,016 ms, 100 results). The run was SLOW under concurrent compile load
+  (~7-12 s/query vs ~0.9 s clean) and never stuck; the harness prints only at phase end, so a
+  slow phase reads as a hang from the outside. The kill left no result.json (my round-1-2 claim
+  that it "records the partial phase" was wrong).
 * **Compile contention — THE authoritative contended-arm list (the ledger points here and does
   not re-enumerate):** the leg-1 SIFT1M phase sweeps (including the 833 ms direct rung), the
   first RTT50 25q re-run, the RTT100 arm, the RTT150 arm, and briefly the pgwire leg overlapped
@@ -184,5 +197,5 @@ not cloud SLAs.
 * Store is an EMULATOR on localhost. GET/request/footer counts transfer to any S3-shaped backend;
   latency does not (Docker NAT adds ≈ 4-7 ms/op; toxiproxy adds its configured symmetric RTT and
   couples RTT into bulk transfer — the known rdstrat12 caveat).
-* **Real-cloud confirmation deferred pending credentials (owner, 2026-11-25).**
+* **Real-cloud confirmation deferred pending credentials (owner, 2026-11-24).**
 * Latency legs are 25-query cohorts — the shape (growth with RTT), not calibrated percentiles.

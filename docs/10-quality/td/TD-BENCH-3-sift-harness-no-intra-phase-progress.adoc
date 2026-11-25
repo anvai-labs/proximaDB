@@ -1,0 +1,47 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-BENCH-3: SIFT harness emits no intra-phase progress — a contended slow phase is indistinguishable from a hang
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open** (filed 2026-11-25; the misdiagnosis that motivated it is withdrawn — see the incident record).
+| Priority | LOW (harness ergonomics; cost one wrong multi-minute-block diagnosis and a withdrawn TD)
+| Component | `scripts/bench/sift1m_get_reduction.py` (`run_query_sweep`)
+| Relates to | ADR-098 (M5 emulator campaign), the M5 evidence artifact's Incidents section
+|===
+
+== What happened (verified against the raw server log)
+
+During the M5 RTT-ladder campaign, the first 50 ms arm (100 queries) was killed mid-phase on the
+belief it had hung: the harness stdout had shown no phase line for a long time and the server log's
+tail appeared frozen. Re-reading the complete server log afterwards showed the run was merely SLOW
+under concurrent compile load and never stuck: 46 search requests, 45 completed (the 46th was
+6.3 s in flight at SIGTERM), a largest inter-completion gap of 38 s, the server's default
+object_store request timeout firing once and its retry succeeding (the affected query completed
+with 100 results), and search completions continuing right up to SIGTERM. The harness prints ONE
+line per PHASE (`{phase}: recall@…`), only after all of that phase's queries finish — so a phase
+running at ~7-12 s/query under contention (vs ~1 s clean) produces no output for many minutes and
+reads exactly like a hang from the outside.
+
+== The gap
+
+`run_query_sweep` has no per-query progress output and no heartbeat: during a phase there is no
+signal distinguishing "slow but progressing" from "stuck". The operator's only recourse is to
+tail the SERVER log and re-derive the timeline by hand (as had to be done here).
+
+== Fix direction
+
+Print intra-phase progress from the sweep loop — either a per-query line when a phase is slow
+(elapsed > N s since the last completion) or a fixed heartbeat every K queries ("phase post_write:
+37/100, last query 8.1 s"). Keep the final phase summary line unchanged so downstream parsers and
+the result.json contract are untouched. As a bonus, the per-query latencies are already in memory;
+a slow-cohort marker in result.json would have made the contention-vs-hang distinction machine-
+readable.
+
+== Incident record
+
+`docs/_internal/status/M5_EMULATOR_TRACE_EVIDENCE_2026_11_24.adoc` (Incidents: "apparent hang at
+RTT50, resolved as NOT a hang"). The previously filed S3-stall TD (a claimed multi-minute silent block on the query read path) was
+withdrawn 2026-11-25: the block it described never happened — the server's total lifetime in that
+run was 7 min 26 s.

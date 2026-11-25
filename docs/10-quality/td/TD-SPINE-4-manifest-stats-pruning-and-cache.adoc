@@ -51,4 +51,4 @@ count shape IDENTICAL to file:// — before 13/13/19 `get_ops` with 4 footers an
 7 (miss) / 4 (hit) / 6 / 16 with footers 1/2/4 and 3/3/0 pruned; answers identical in every mode.
 Ledger `m5_spine4_manifest_levers_pgwire_s3_emulator`; artifact
 `docs/_internal/status/M5_EMULATOR_TRACE_EVIDENCE_2026_11_24.adoc`. Counts only — emulator latency
-is not evidence; real-cloud confirmation deferred pending credentials (owner, 2026-11-25).
+is not evidence; real-cloud confirmation deferred pending credentials (owner, 2026-11-24).
