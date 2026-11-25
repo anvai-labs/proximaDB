@@ -135,6 +135,17 @@ pub async fn execute_query(
         if let Some(missing) = crate::services::operations::vectors::collection_not_found(&error) {
             return ApiError::CollectionNotFound(missing.identifier.clone());
         }
+        // MED-4/MED-3 (round-1 review): client-shaped port rejections map to
+        // 4xx — a read-only-policy violation (DDL/DML on this query surface)
+        // is a 400 naming the policy; a missing identity is a 401.
+        if error.downcast_ref::<proximadb_runtime::InvalidQueryInput>().is_some() {
+            return ApiError::InvalidArgument(format!(
+                "Query rejected: {error}. Plain SQL on this surface is read-only; use /api/v2/sql for writes."
+            ));
+        }
+        if error.downcast_ref::<proximadb_runtime::MissingQueryIdentity>().is_some() {
+            return ApiError::Unauthorized(format!("Query rejected: {error}"));
+        }
         error!("v2 query execution failed: {}", error);
         ApiError::Internal(format!("Query execution failed: {}", error))
     })

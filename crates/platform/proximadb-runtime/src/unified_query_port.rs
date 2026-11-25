@@ -30,6 +30,13 @@ use crate::service_ports::PortIdentity;
 #[derive(Debug)]
 pub struct InvalidQueryInput(pub String);
 
+/// A query reached the unified query port with neither an explicit identity
+/// tenant nor an in-force request scope (TD-SPINE-6 fail-closed gate).
+/// Protocol adapters map this to their unauthorized status (401): the caller
+/// did not establish who is asking.
+#[derive(Debug)]
+pub struct MissingQueryIdentity(pub &'static str);
+
 /// Explicit per-request execution context for `UnifiedQueryPort` calls
 /// (ADR-098 D5 / TD-SPINE-6).
 ///
@@ -72,6 +79,14 @@ impl std::fmt::Display for InvalidQueryInput {
 }
 
 impl std::error::Error for InvalidQueryInput {}
+
+impl std::fmt::Display for MissingQueryIdentity {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.0)
+    }
+}
+
+impl std::error::Error for MissingQueryIdentity {}
 
 /// Port for cross-model unified and federated query execution.
 ///

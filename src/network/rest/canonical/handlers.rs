@@ -1046,17 +1046,35 @@ async fn default_tenant_if_unresolved(
 
 pub async fn execute_sql(
     State(state): State<AppState>,
+    identity: Option<Extension<proximadb_tenant::ResolvedRequestIdentity>>,
     tenant: Option<Extension<crate::network::middleware::tenant::TenantContext>>,
     Json(request): Json<SqlQueryRequest>,
 ) -> ApiResult<JsonResponse<serde_json::Value>> {
     // Collections are resolved within the request tenant (absent ⇒ the
     // default tenant) for the whole statement, through every query layer.
+    // LOW-2 (round-1 review): when the foundation identity is present it is
+    // preferred — the ABAC subject/stable key/auth class travel with the
+    // tenant into the port context, matching `/api/v2/sql`; the tenant-only
+    // `TenantContext` remains the fallback for mounts without the middleware.
     let request_tenant = tenant
         .map(|Extension(t)| t.tenant_id)
         .unwrap_or_else(|| proximadb_tenant::DEFAULT_TENANT.to_string());
+    let identity = match identity {
+        Some(Extension(resolved)) => {
+            // The foundation identity wins: the ABAC subject/stable key/auth
+            // class travel with the tenant into the port context.
+            proximadb_runtime::PortIdentity::from(&resolved).into_owned()
+        }
+        None => proximadb_runtime::OwnedPortIdentity {
+            tenant_id: Some(request_tenant.clone()),
+            subject: None,
+            tenant_stable_id: None,
+            auth_class: proximadb_tenant::AuthClass::Anonymous,
+        },
+    };
     crate::query::request_scope::with_request_tenant(
         request_tenant.clone(),
-        execute_sql_in_scope(state, request, request_tenant),
+        execute_sql_in_scope(state, request, request_tenant, identity),
     )
     .await
 }
@@ -1065,6 +1083,7 @@ async fn execute_sql_in_scope(
     state: AppState,
     request: SqlQueryRequest,
     scoped_tenant: String,
+    identity: proximadb_runtime::OwnedPortIdentity,
 ) -> ApiResult<JsonResponse<serde_json::Value>> {
     let start_time = std::time::Instant::now();
     let request_id = Uuid::new_v4().to_string();
@@ -1104,9 +1123,10 @@ async fn execute_sql_in_scope(
                 sql_params_to_proxima_values(request.parameters.clone()),
                 request.collection.clone(),
                 None,
-                proximadb_runtime::UnifiedQueryPortContext::for_identity(
-                    proximadb_runtime::PortIdentity::for_tenant(&scoped_tenant),
-                ),
+                // LOW-2: the full identity (subject + stable key + auth
+                // class when the middleware supplied one) — not just the
+                // tenant — reaches the port.
+                proximadb_runtime::UnifiedQueryPortContext::for_identity(identity.as_borrowed()),
             )
             .await
         {

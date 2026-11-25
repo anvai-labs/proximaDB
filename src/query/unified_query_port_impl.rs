@@ -25,7 +25,8 @@ use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use proximadb_data_model::ProximaValue;
 use proximadb_runtime::{
-    InvalidQueryInput, PortIdentity, UnifiedQueryPort, UnifiedQueryPortContext,
+    InvalidQueryInput, MissingQueryIdentity, OwnedPortIdentity, PortIdentity, UnifiedQueryPort,
+    UnifiedQueryPortContext,
 };
 // The FILTER-lowering spelling (int-array binary, ns temporals) — named
 // for what it IS, mirroring the SqlValue twin sql_value_to_filter_literal;
@@ -444,27 +445,97 @@ fn prepared_owner(identity_tenant: Option<&str>) -> Option<String> {
     }
 }
 
-/// Fail closed when the port cannot act as a tenant: neither an explicit
-/// identity tenant nor an in-force request scope means the transport edge
-/// forgot to establish who is asking (TD-SPINE-6 acceptance: a request
-/// without identity fails closed on every surface).
-fn ensure_query_scope(identity: &PortIdentity<'_>) -> Result<()> {
+/// The identity the ONE SQL authority executes as (MED-3, round-1 review):
+///
+/// * the caller's EXPLICIT identity tenant wins when it carries one;
+/// * else a `Tenant` request scope in force is **derived into the identity**
+///   (an anonymous-identity call inside `with_request_tenant(t)` runs fully
+///   scoped as `t` — it can never execute unscoped, so the documented
+///   task-local fallback no longer opens a shared unscoped namespace);
+/// * else an `Internal` scope stays in force via the authority's
+///   `with_identity_scope(None)` (explicitly-internal execution keeps its
+///   designed unscoped-collection semantics);
+/// * else **fail closed** with the typed [`MissingQueryIdentity`] (401 at the
+///   HTTP surfaces — TD-SPINE-6 acceptance: a request without identity fails
+///   closed on every surface).
+fn effective_identity_or_fail(identity: &PortIdentity<'_>) -> Result<OwnedPortIdentity> {
     if identity.tenant_id.is_some_and(|tenant| !tenant.is_empty()) {
+        return Ok(identity.into_owned());
+    }
+    match crate::query::request_scope::current_scope() {
+        Some(crate::query::request_scope::RequestScope::Tenant(tenant)) => {
+            let mut derived = identity.into_owned();
+            derived.tenant_id = Some(tenant);
+            Ok(derived)
+        }
+        // Internal scope: keep the (empty) identity — the authority's
+        // `with_identity_scope(None)` leaves the internal scope in force.
+        Some(crate::query::request_scope::RequestScope::Internal(_)) => Ok(identity.into_owned()),
+        None => Err(MissingQueryIdentity(
+            "unified query has no request identity; the caller must act as a tenant",
+        )
+        .into()),
+    }
+}
+
+/// MED-4 (round-1 review) — dated behavior note 2026-11-24: **plain SQL on
+/// the unified query port is READ-ONLY.** The port surfaces are query
+/// surfaces (`UnifiedQueryPort`, MCP `search`, `/api/v2/query`,
+/// `/api/v2/unified/*`); writes are served by the guarded write surfaces —
+/// `/api/v2/sql` (single-statement validation + 1 MiB cap + deadline),
+/// gRPC `ExecuteQuery`, and pgwire. A DDL/DML statement on a port surface is
+/// rejected as a client error naming the policy, never silently executed or
+/// silently lost. Reads = `SELECT`/`WITH…SELECT`/`EXPLAIN` (a plain `EXPLAIN`
+/// or an `EXPLAIN` of a read; `EXPLAIN ANALYZE` of a write may execute it and
+/// is rejected).
+fn ensure_plain_sql_is_read(sql: &str) -> Result<()> {
+    use sqlparser::ast::Statement as SqlStatement;
+    use sqlparser::dialect::GenericDialect;
+    use sqlparser::parser::Parser;
+
+    let statements = Parser::parse_sql(&GenericDialect {}, sql)
+        .map_err(|error| InvalidQueryInput(format!("cannot parse statement: {error}")))?;
+    let is_read = match statements.as_slice() {
+        // Exactly one statement — the port, like /api/v2/sql, is a
+        // single-statement surface.
+        [statement] => match statement {
+            SqlStatement::Query(_) => true,
+            SqlStatement::Explain {
+                statement, analyze, ..
+            } => !analyze || matches!(statement.as_ref(), SqlStatement::Query(_)),
+            _ => false,
+        },
+        _ => false,
+    };
+    if is_read {
         return Ok(());
     }
-    if crate::query::request_scope::current_scope().is_some() {
-        return Ok(());
-    }
-    Err(anyhow!(
-        "unified query has no request identity; the caller must act as a tenant"
-    ))
+    Err(InvalidQueryInput(
+        "plain SQL on the unified query port is read-only (SELECT/EXPLAIN); writes are served by /api/v2/sql (REST), gRPC ExecuteQuery, or pgwire"
+            .to_string(),
+    )
+    .into())
 }
 
 /// The OLAP result cache the delegated scheduler path may consult, per the
 /// requested freshness (mandate #16c): a Strong read BYPASSES the cache
 /// lookup — it always computes fresh; weaker modes hand the cache through
 /// (hits are LSN-pinned inside, never staler than the requested mode).
+///
+/// LOW-5 (round-1 review), decided 2026-11-24: no live surface exposes a
+/// freshness knob, so every port call defaults to `Strong` (bypass) — which
+/// is exactly these surfaces' PRE-PR behavior (they never consulted the OLAP
+/// result cache). `UnifiedQueryPortContext::with_freshness` is the seam for
+/// a future surface-level knob; wiring one is deliberately NOT invented
+/// here.
 fn olap_cache_for_freshness(
+    enabled_cache: Option<
+        Arc<
+            crate::query::cache::query_result_cache::QueryResultCache<
+                crate::query::execution::ExecutionPipelineResult,
+            >,
+        >,
+    >,
     freshness: &VectorFreshnessMode,
 ) -> Option<
     Arc<
@@ -473,10 +544,13 @@ fn olap_cache_for_freshness(
         >,
     >,
 > {
-    if matches!(freshness, VectorFreshnessMode::Strong) {
-        None
-    } else {
-        crate::network::postgres::relational_pipeline::olap_result_cache()
+    match freshness {
+        // Mandate #16c: gate the lookup on `!Strong`. (Mutation-proven
+        // 2026-11-24: removing this arm fails
+        // `olap_cache_policy_strong_bypasses_the_result_cache` in the
+        // default env.)
+        VectorFreshnessMode::Strong => None,
+        _ => enabled_cache,
     }
 }
 
@@ -485,6 +559,26 @@ fn olap_cache_for_freshness(
 /// multi-model extension query — and render either into the port's JSON
 /// envelope. This is the single planner seam every port SQL entry funnels
 /// through (ADR-098 D5 / TD-SPINE-6).
+/// Whether `sql` is text the PORT itself synthesized from a UQL or
+/// multi-model lowering (trusted extension SQL) versus RAW user text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PortSqlOrigin {
+    /// Synthesized by `uql_to_federated_sql` / `json_to_multi_model_sql`:
+    /// genuine extension SQL (`SELECT * FROM VECTOR_SEARCH(...)` etc.) —
+    /// takes the federated branch directly, keeping its `{id, score, rank}`
+    /// rendering.
+    PortLowered,
+    /// Verbatim user text (bound parameters spliced in): MUST go through the
+    /// ONE SQL authority FIRST. The authority itself falls back to the
+    /// federated facade for genuine extension SQL — but only AFTER
+    /// `try_run_select` declines, so plain SQL that merely CONTAINS an
+    /// extension keyword (in a string literal or a comment) executes as the
+    /// plain SQL it is (HIGH-1, round-1 review: the raw-substring
+    /// discriminator pre-routing here silently dropped such writes and
+    /// mis-executed such reads).
+    RawUserText,
+}
+
 async fn run_sql_via_one_planner(
     adapter: &Arc<QueryFacadeAdapter>,
     sql: &str,
@@ -492,13 +586,14 @@ async fn run_sql_via_one_planner(
     identity: PortIdentity<'_>,
     freshness: &VectorFreshnessMode,
     limit: Option<u32>,
+    origin: PortSqlOrigin,
 ) -> Result<serde_json::Value> {
-    if QueryFacadeAdapter::should_use_federated_request(sql) {
-        // Multi-model extension (VECTOR_SEARCH/GRAPH_QUERY/DOCUMENT_QUERY/
-        // LOGS/METRICS/RERANK, `<->`, `::vector`): keep the federated
-        // lowering + its result rendering. No relational table resolves for
-        // these, so the ComputeScheduler decision has nothing to decide;
-        // engine selection happens inside the engine layer behind the facade
+    if origin == PortSqlOrigin::PortLowered {
+        // Port-synthesized extension SQL (VECTOR_SEARCH/GRAPH_QUERY/
+        // DOCUMENT_QUERY/LOGS/METRICS/RERANK): keep the federated lowering +
+        // its result rendering. No relational table resolves for these, so
+        // the ComputeScheduler decision has nothing to decide; engine
+        // selection happens inside the engine layer behind the facade
         // strategies. (Production fail-closed for a scope-less request lives
         // in `FederatedQueryContext::execute`, unchanged.)
         let result = adapter
@@ -507,23 +602,35 @@ async fn run_sql_via_one_planner(
             .context("federated_query failed")?;
         return UnifiedQueryPortImpl::result_to_json(result, limit);
     }
-    // Plain relational SQL (reads AND writes): the same body that serves
-    // pgwire and `api_handlers.execute_sql` — EXPLAIN routing, write
-    // dispatch, `try_run_select` (`ComputeScheduler::route_select`), facade
-    // fallback. Fail closed when the port cannot act as a tenant (neither an
-    // explicit identity nor an in-force request scope) — TD-SPINE-6
-    // acceptance: a request without identity fails closed on every surface.
-    ensure_query_scope(&identity)?;
-    let result_cache = olap_cache_for_freshness(freshness);
-    let result = adapter
+    // RAW user text: the same body that serves pgwire and
+    // `api_handlers.execute_sql` — write classification (MED-4: port plain
+    // SQL is read-only), `try_run_select` (`ComputeScheduler::route_select`),
+    // then the facade fallback (which promotes GENUINE extension SQL to the
+    // federated executor). Identity resolution per MED-3: explicit tenant,
+    // else scope-derived, else internal in force, else fail closed (401).
+    ensure_plain_sql_is_read(sql)?;
+    let effective = effective_identity_or_fail(&identity)?;
+    let result_cache = olap_cache_for_freshness(
+        crate::network::postgres::relational_pipeline::olap_result_cache(),
+        freshness,
+    );
+    let started = std::time::Instant::now();
+    let mut result = adapter
         .execute_sql_via_authority(
             sql.to_string(),
             collection,
-            identity,
+            effective.as_borrowed(),
             result_cache.as_deref(),
         )
         .await
         .context("sql authority execution failed")?;
+    // LOW-4: the authority body does not time itself (the runtime HANDLER
+    // wrapper does); time the delegated call here so the port's metrics are
+    // real.
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    if result.execution_time_ms < elapsed_ms {
+        result.execution_time_ms = elapsed_ms;
+    }
     sql_result_to_port_json(result, limit)
 }
 
@@ -714,11 +821,17 @@ impl UnifiedQueryPort for UnifiedQueryPortImpl {
             query.chars().take(120).collect::<String>()
         );
         let parameters = parameters.unwrap_or_default();
-        let sql = match uql_to_federated_sql(&query, &parameters, limit)
+        let (sql, origin) = match uql_to_federated_sql(&query, &parameters, limit)
             .with_context(|| format!("UQL lowering failed for query '{}'", query))?
         {
-            Some(lowered) => lowered,
-            None => bind_federated_sql_parameters(&query, &parameters)?,
+            // Port-lowered extension SQL is trusted to take the federated
+            // branch; raw user text (parse failed / no UQL claim) goes to the
+            // authority first (HIGH-1).
+            Some(lowered) => (lowered, PortSqlOrigin::PortLowered),
+            None => (
+                bind_federated_sql_parameters(&query, &parameters)?,
+                PortSqlOrigin::RawUserText,
+            ),
         };
         run_sql_via_one_planner(
             &self.adapter,
@@ -727,6 +840,7 @@ impl UnifiedQueryPort for UnifiedQueryPortImpl {
             context.identity,
             &context.freshness,
             limit,
+            origin,
         )
         .await
     }
@@ -739,7 +853,7 @@ impl UnifiedQueryPort for UnifiedQueryPortImpl {
         // Convert the JSON multi-model request to a federated SQL string.
         // (Formerly a twin of the deleted root multimodal_query module's
         // convert_multi_model_to_sql; this is now the only copy.)
-        let sql = multi_model_sql_from_request(&request)?;
+        let (sql, origin) = multi_model_sql_from_request(&request)?;
         // chars().take — a byte-indexed slice can land mid-character in
         // the user-controlled cypher/collection text now spliced verbatim.
         info!(
@@ -753,6 +867,7 @@ impl UnifiedQueryPort for UnifiedQueryPortImpl {
             context.identity,
             &context.freshness,
             None,
+            origin,
         )
         .await
     }
@@ -772,6 +887,12 @@ impl UnifiedQueryPort for UnifiedQueryPortImpl {
             "execute_federated_query: {}",
             query.chars().take(120).collect::<String>()
         );
+        // HIGH-1: even the federated surface sends RAW user text to the
+        // authority first — the authority's fallback promotes GENUINE
+        // extension SQL to the federated executor after the scheduler
+        // declines, so behavior for real federated queries is unchanged,
+        // while plain SQL carrying extension-looking literals/comments
+        // executes as the plain SQL it is.
         run_sql_via_one_planner(
             &self.adapter,
             &query,
@@ -779,6 +900,7 @@ impl UnifiedQueryPort for UnifiedQueryPortImpl {
             context.identity,
             &context.freshness,
             None,
+            PortSqlOrigin::RawUserText,
         )
         .await
     }
@@ -822,24 +944,34 @@ impl UnifiedQueryPort for UnifiedQueryPortImpl {
         &self,
         query: String,
         collection: Option<String>,
-        _context: UnifiedQueryPortContext<'_>,
+        context: UnifiedQueryPortContext<'_>,
     ) -> Result<serde_json::Value> {
-        let explain = self.adapter.explain(&query).context("explain failed")?;
-        let mut value =
-            serde_json::to_value(&explain).context("failed to serialize explain result")?;
-        let storage_authority = self
-            .explain_storage_authority_from_catalog(collection.as_deref(), &query)
-            .await?;
-        if let Some(storage_authority) = storage_authority
-            && let serde_json::Value::Object(ref mut object) = value
-        {
-            object.insert(
-                "storage_authority".to_string(),
-                serde_json::to_value(storage_authority)
-                    .context("failed to serialize storage authority")?,
-            );
-        }
-        Ok(value)
+        // LOW-1 (round-1 review): the context is USED — the explain runs in
+        // the caller's identity scope so any tenant-scoped resolution inside
+        // acts as the caller. (`adapter.explain` is a heuristic plan sketch,
+        // not an execution — the freshness mode has nothing to gate and is
+        // deliberately ignored; see the LOW-5 note on
+        // `olap_cache_for_freshness`.)
+        let scope_tenant = context.identity.tenant_id;
+        crate::query::request_scope::with_identity_scope(scope_tenant, async {
+            let explain = self.adapter.explain(&query).context("explain failed")?;
+            let mut value =
+                serde_json::to_value(&explain).context("failed to serialize explain result")?;
+            let storage_authority = self
+                .explain_storage_authority_from_catalog(collection.as_deref(), &query)
+                .await?;
+            if let Some(storage_authority) = storage_authority
+                && let serde_json::Value::Object(ref mut object) = value
+            {
+                object.insert(
+                    "storage_authority".to_string(),
+                    serde_json::to_value(storage_authority)
+                        .context("failed to serialize storage authority")?,
+                );
+            }
+            Ok(value)
+        })
+        .await
     }
 
     async fn prepare_statement(
@@ -892,6 +1024,7 @@ impl UnifiedQueryPort for UnifiedQueryPortImpl {
                 }
                 other => anyhow!("prepared statement error: {}", other),
             })?;
+        // The prepared text is user-authored: raw user text (HIGH-1).
         let result = run_sql_via_one_planner(
             &self.adapter,
             &sql,
@@ -899,6 +1032,7 @@ impl UnifiedQueryPort for UnifiedQueryPortImpl {
             context.identity,
             &context.freshness,
             None,
+            PortSqlOrigin::RawUserText,
         )
         .await?;
         if let Some(mut handle) = self.prepared.get_mut(&statement_id) {
@@ -953,11 +1087,13 @@ impl UnifiedQueryPort for UnifiedQueryPortImpl {
     }
 }
 
-fn multi_model_sql_from_request(request: &serde_json::Value) -> Result<String> {
+/// The SQL to run and whether the PORT synthesized it (component lowering)
+/// versus it being raw user text (the `query` passthrough) — HIGH-1.
+fn multi_model_sql_from_request(request: &serde_json::Value) -> Result<(String, PortSqlOrigin)> {
     match json_to_multi_model_sql(request)
         .map_err(|error| InvalidQueryInput(error.to_string()))?
     {
-        Some(sql) => Ok(sql),
+        Some(sql) => Ok((sql, PortSqlOrigin::PortLowered)),
         // None unambiguously means 'not a multi-model request' (the
         // callee errs on every components-present shape — empty,
         // malformed, unknown — since round 41). The raw-query fallback
@@ -967,7 +1103,7 @@ fn multi_model_sql_from_request(request: &serde_json::Value) -> Result<String> {
             .get("query")
             .and_then(serde_json::Value::as_str)
             .filter(|query| !query.trim().is_empty())
-            .map(str::to_string)
+            .map(|query| (query.to_string(), PortSqlOrigin::RawUserText))
             .ok_or_else(|| {
                 InvalidQueryInput(
                     "multi-model request without components must include a non-empty string 'query' field"
@@ -1198,46 +1334,108 @@ mod tests {
 
     #[test]
     fn olap_cache_policy_strong_bypasses_the_result_cache() {
-        // Mandate #16c / TD-SPINE-6 acceptance: a Strong-freshness read
-        // through the port never consults the OLAP result cache — regardless
-        // of the PROXIMADB_QUERY_RESULT_CACHE flag.
+        // MED-2 (round-1 review): the gate is pinned IN THE DEFAULT ENV —
+        // with an INJECTED enabled cache, Strong must STILL yield None
+        // (removing the Strong arm makes this return Some and FAILS this
+        // test), and a weaker mode hands the very same cache through.
+        // No env flag involved: the policy is pure over its input.
+        let cache =
+            Arc::new(crate::query::cache::query_result_cache::QueryResultCache::with_defaults());
         assert!(
-            olap_cache_for_freshness(&VectorFreshnessMode::Strong).is_none(),
-            "Strong must bypass the result-cache lookup"
+            olap_cache_for_freshness(Some(cache.clone()), &VectorFreshnessMode::Strong).is_none(),
+            "Strong must bypass the result-cache lookup even when the cache is enabled"
         );
-        // (Non-Strong modes MAY hand the cache through — presence depends on
-        // the PROXIMADB_QUERY_RESULT_CACHE flag, so their side is asserted in
-        // the dedicated e2e file with the flag set, not here.)
+        assert!(
+            olap_cache_for_freshness(Some(cache.clone()), &VectorFreshnessMode::StaleOk)
+                .as_ref()
+                .is_some_and(|handed| Arc::ptr_eq(handed, &cache)),
+            "a weaker mode must hand the SAME cache through"
+        );
     }
 
     #[test]
-    fn plain_sql_delegates_to_the_scheduler_discriminator() {
-        // Plain relational SQL must take the shared-authority branch; the
-        // multi-model extensions keep the federated branch (TD-SPINE-6).
-        for plain in [
+    fn plain_sql_read_classifier_accepts_reads_and_rejects_writes() {
+        // MED-4: the port's plain-SQL surface is read-only. Reads pass…
+        for read in [
             "SELECT id, score FROM orders WHERE id = 'a'",
+            "WITH t AS (SELECT 1 AS x) SELECT x FROM t",
+            "EXPLAIN SELECT 1 FROM orders",
+            // A trailing comment does not change the statement class.
+            "SELECT 1 -- uses <-> operator",
+        ] {
+            ensure_plain_sql_is_read(read)
+                .unwrap_or_else(|error| panic!("read must pass the classifier: {read} — {error}"));
+        }
+        // …and extension-looking LITERALS do not either (HIGH-1: classification
+        // is syntactic, not substring).
+        ensure_plain_sql_is_read(
+            "SELECT id FROM t WHERE note = 'LOGS(app) literal' OR note LIKE '%VECTOR_SEARCH(%'",
+        )
+        .expect("literal-containing SELECT is a read");
+
+        // Writes are rejected — including writes whose payloads contain
+        // extension keywords (the HIGH-1 silent-write-loss probes).
+        for write in [
             "CREATE TABLE t (id TEXT)",
             "INSERT INTO t (id) VALUES ('a')",
             "UPDATE t SET id = 'b'",
-            "EXPLAIN SELECT 1 FROM t",
+            "DELETE FROM t",
+            "DROP TABLE t",
+            "INSERT INTO probe VALUES ('p', 'logged VECTOR_SEARCH(v, [0.1], 10)')",
+            "UPDATE t SET note = 'GRAPH_QUERY(MATCH (n) RETURN n)'",
+            // EXPLAIN ANALYZE of a write may execute it → rejected.
+            "EXPLAIN ANALYZE DELETE FROM t",
+            // Multi-statement text is not a single read.
+            "SELECT 1; SELECT 2",
         ] {
+            let error = ensure_plain_sql_is_read(write)
+                .expect_err("a write must be rejected by the read-only classifier");
             assert!(
-                !QueryFacadeAdapter::should_use_federated_request(plain),
-                "plain SQL must NOT take the federated branch: {plain}"
+                error.to_string().contains("read-only"),
+                "the rejection must name the policy: {write} — {error}"
             );
         }
-        for extension in [
-            "SELECT * FROM VECTOR_SEARCH('c', '[0.1]', 10)",
-            "SELECT * FROM GRAPH_QUERY('MATCH (n) RETURN n')",
-            "SELECT * FROM DOCUMENT_QUERY('c', '1=1')",
-            "SELECT * FROM LOGS('ops')",
-            "SELECT * FROM RERANK('p', 'q')",
-        ] {
-            assert!(
-                QueryFacadeAdapter::should_use_federated_request(extension),
-                "extension SQL must keep the federated branch: {extension}"
-            );
-        }
+    }
+
+    #[test]
+    fn effective_identity_prefers_explicit_then_derives_scope() {
+        // MED-3: explicit identity tenant wins…
+        let explicit = effective_identity_or_fail(&PortIdentity::for_tenant("acme"))
+            .expect("explicit identity resolves");
+        assert_eq!(explicit.tenant_id.as_deref(), Some("acme"));
+
+        // …a Tenant scope is DERIVED into an anonymous identity (asserted in
+        // the async test below — task-locals need a lazy async block)…
+
+        // …and neither identity nor scope fails closed with the TYPED error.
+        let error = effective_identity_or_fail(&PortIdentity::anonymous())
+            .expect_err("anonymous + scope-less must fail closed");
+        assert!(
+            error
+                .downcast_ref::<proximadb_runtime::MissingQueryIdentity>()
+                .is_some(),
+            "the gate must be typed MissingQueryIdentity: {error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn effective_identity_derives_the_scope_tenant() {
+        // (The async block is REQUIRED — `std::future::ready(expr)` evaluates
+        // `expr` eagerly, OUTSIDE the task-local scope.)
+        let derived = crate::query::request_scope::with_request_tenant("scoped", async {
+            effective_identity_or_fail(&PortIdentity::anonymous())
+        })
+        .await
+        .expect("scope-derived identity resolves");
+        assert_eq!(derived.tenant_id.as_deref(), Some("scoped"));
+
+        // An explicit identity inside a DIFFERENT scope still wins.
+        let explicit_wins = crate::query::request_scope::with_request_tenant("outer", async {
+            effective_identity_or_fail(&PortIdentity::for_tenant("acme"))
+        })
+        .await
+        .expect("explicit identity resolves");
+        assert_eq!(explicit_wins.tenant_id.as_deref(), Some("acme"));
     }
 
     #[test]
@@ -1697,7 +1895,9 @@ mod tests {
     fn test_json_to_multi_model_sql_no_components_field() {
         let req = serde_json::json!({ "query": "SELECT 1" });
         assert!(json_to_multi_model_sql(&req).unwrap().is_none());
-        assert_eq!(multi_model_sql_from_request(&req).unwrap(), "SELECT 1");
+        let (sql, origin) = multi_model_sql_from_request(&req).unwrap();
+        assert_eq!(sql, "SELECT 1");
+        assert_eq!(origin, PortSqlOrigin::RawUserText);
     }
 
     #[test]

@@ -144,17 +144,66 @@ async fn same_sql_one_planner_across_pgwire_rest_v2_and_unified_query_e2e() {
         legs_agree(&pg_rows, &port_rows),
         "pgwire vs REST /api/v2/query (port) divergence:\n  pgwire: {pg_rows:?}\n  port:  {port_rows:?}"
     );
+
+    // MED-4 (round-1 review): a write on the port surface is a clean 4xx
+    // naming the read-only policy — never a silent loss, never a mutation.
+    let rejected = post_tenant_json(
+        &http,
+        format!("{base}/api/v2/query"),
+        "proximadb",
+        json!({ "language": "uql", "query": format!("DELETE FROM {table}") }),
+    )
+    .await
+    .expect("DELETE probe request sends");
+    let status = rejected.status();
+    let body: serde_json::Value = rejected.json().await.expect("rejection body");
+    assert_eq!(
+        status,
+        reqwest::StatusCode::BAD_REQUEST,
+        "DELETE via /api/v2/query must be a 400, got {status}: {body}"
+    );
+    assert!(
+        body.to_string().contains("read-only"),
+        "the rejection must name the policy: {body}"
+    );
+    // …and the rows survive.
+    let after = pg_server::rows(&client, &select).await;
+    assert_eq!(after.len(), 2, "no row may be deleted: {after:?}");
 }
 
-/// Strong freshness through the port with the OLAP result cache ON: every
-/// committed write must be visible (mandate #16c — the Strong path bypasses
-/// the query-cache lookup, so a stale cache entry can never be served).
+/// MED-2 (round-1 review), reworked to have teeth. With the OLAP result
+/// cache ON in this process (env set before boot; nextest runs each test in
+/// its own process):
+///
+/// * Arm A — the cache IS consulted by the api_handlers path: a second
+///   identical read over `/api/v2/sql` performs a LOOKUP (Strong-LSN-pinned)
+///   — the lookup counter moves whether it hits or misses.
+/// * Arm B — the PORT (Strong) BYPASSES the lookup entirely: the SAME SQL
+///   over `/api/v2/query` leaves the lookup counter UNMOVED while returning
+///   the identical rows. If the bypass were removed, this read would perform
+///   a lookup (a miss if nothing was stamped, a hit if it was) and the
+///   counter WOULD move — the test fails either way. (The gate's
+///   pure-contract pin, default-env, lives in the unit test
+///   `olap_cache_policy_strong_bypasses_the_result_cache`.)
+/// * Read-after-write: a write committed after the cached reads is observed
+///   by the port's Strong read (16c's user-visible guarantee).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn strong_freshness_port_read_sees_every_write_with_result_cache_on_e2e() {
     // BEFORE boot: enable the (default-OFF) OLAP result cache. Read per call
     // (no OnceLock), but set it first so the initial SELECT can populate it.
     // Edition 2024: set_var is unsafe (single-threaded test prologue here).
     unsafe { std::env::set_var("PROXIMADB_QUERY_RESULT_CACHE", "1") };
+
+    /// Total cache LOOKUPS (hits + misses) — the consultation signal. A
+    /// lookup moves this even when it misses; the Strong bypass performs no
+    /// lookup at all.
+    fn cache_lookups() -> u64 {
+        let stats = proximadb::network::postgres::relational_pipeline::olap_result_cache()
+            .expect("cache flag is set in this process")
+            .stats();
+        stats.hits + stats.misses
+    }
+
     let server = TestPgServer::start().await.expect("server start");
     let client = server.connect().await.expect("pgwire connect");
 
@@ -170,24 +219,90 @@ async fn strong_freshness_port_read_sees_every_write_with_result_cache_on_e2e() 
     let (http, base) = server.rest_client().expect("rest client");
 
     // Prime the cache through the api_handlers surface (consults it under
-    // Strong LSN-pinned eligibility) and the port surface (Strong ⇒ bypass).
-    for _ in 0..2 {
-        let response = post_tenant_json(
-            &http,
-            format!("{base}/api/v2/sql"),
-            "proximadb",
-            json!({ "query": select }),
-        )
-        .await
-        .expect("POST /api/v2/sql");
-        assert_eq!(response.status(), reqwest::StatusCode::OK);
-    }
+    // Strong LSN-pinned eligibility — a miss + insert on first read).
+    let first: serde_json::Value = post_tenant_json(
+        &http,
+        format!("{base}/api/v2/sql"),
+        "proximadb",
+        json!({ "query": select }),
+    )
+    .await
+    .expect("prime read sends")
+    .json()
+    .await
+    .expect("prime read body");
+    assert_eq!(
+        first["rows"].as_array().map(Vec::len),
+        Some(2),
+        "prime read: {first}"
+    );
 
-    // A committed write AFTER the cached reads.
+    // Arm A: the SECOND identical api_handlers read CONSULTS the cache — its
+    // lookup runs (the counter moves whether it hits or misses). Without a
+    // consultation the Strong-bypass differential below proves nothing.
+    let lookups_before = cache_lookups();
+    let second: serde_json::Value = post_tenant_json(
+        &http,
+        format!("{base}/api/v2/sql"),
+        "proximadb",
+        json!({ "query": select }),
+    )
+    .await
+    .expect("second read sends")
+    .json()
+    .await
+    .expect("second read body");
+    let lookups_after_control = cache_lookups();
+    assert_eq!(
+        second["rows"].as_array().map(Vec::len),
+        Some(2),
+        "second read: {second}"
+    );
+    assert!(
+        lookups_after_control > lookups_before,
+        "Arm A: the /api/v2/sql control read must CONSULT the cache ({lookups_before} -> {lookups_after_control}); \
+         without a consultation the Strong-bypass differential below proves nothing"
+    );
+
+    // Arm B: the SAME SQL through the port (Strong ⇒ bypass) does NOT move
+    // the hit counter — yet returns the identical rows.
+    let port_json: serde_json::Value = post_tenant_json(
+        &http,
+        format!("{base}/api/v2/query"),
+        "proximadb",
+        json!({ "language": "uql", "query": select }),
+    )
+    .await
+    .expect("port read sends")
+    .json()
+    .await
+    .expect("port read body");
+    let lookups_after_port = cache_lookups();
+    let port_rows: Vec<Vec<String>> = port_json["records"]
+        .as_array()
+        .unwrap_or_else(|| panic!("port records array missing: {port_json}"))
+        .iter()
+        .map(|row| cells_of(row, &["id"]))
+        .collect();
+    let control_rows: Vec<Vec<String>> = second["rows"]
+        .as_array()
+        .expect("control rows")
+        .iter()
+        .map(|row| cells_of(row, &["id"]))
+        .collect();
+    assert!(
+        legs_agree(&control_rows, &port_rows),
+        "port and control must render identical rows: {control_rows:?} vs {port_rows:?}"
+    );
+    assert_eq!(
+        lookups_after_port, lookups_after_control,
+        "Arm B: the port's Strong read must NOT even LOOK UP the cache \
+         ({lookups_after_control} -> {lookups_after_port}); if it did, the 16c bypass is gone"
+    );
+
+    // Read-after-write: a committed write after the cached reads is observed
+    // by the port's Strong read (never a stale cached two-row result).
     pg_server::rows(&client, &format!("INSERT INTO {table} (id) VALUES ('c')")).await;
-
-    // The port's Strong read must see all three rows — never a stale cached
-    // two-row result (the 16c guarantee the bypass provides).
     let port_json: serde_json::Value = post_tenant_json(
         &http,
         format!("{base}/api/v2/query"),

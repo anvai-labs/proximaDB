@@ -291,16 +291,16 @@ async fn uuid_cells_render_identically_across_transports() {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// TD-SPINE-6 (ADR-098 D5): one decision path for every surface.
+// TD-SPINE-6 (ADR-098 D5): one decision path for every surface — round-1
+// review hardening.
 //
-// The legs above prove REST-v2/sql ↔ gRPC over the api_handlers spine. The
-// tests below extend the SAME-SQL parity to the surfaces that reach the
-// engine through `UnifiedQueryPort` — the canonical /sql handler, and MCP —
-// which NOW delegate plain SQL to the same `QueryFacadeAdapter`
-// SQL-authority body (ComputeScheduler::route_select decision path) instead
-// of the federated core that used to refuse plain SQL. The pgwire +
-// REST-v2/query legs live in tests/spine6_one_planner_parity_e2e.rs (they
-// need a full server boot).
+// Legs: REST v2 /sql (authority control), canonical /sql handler (port, in
+// process), gRPC, MCP. Port plain SQL is READ-ONLY (MED-4): DDL/DML through
+// a port surface is a typed 400 — never silently executed and never
+// silently lost. Raw user text always routes through the ONE SQL authority
+// first (HIGH-1) — extension-looking SUBSTRINGS (literals, comments) cannot
+// reroute it. pgwire + live-HTTP legs live in tests/spine6_one_planner_
+// parity_e2e.rs.
 // ════════════════════════════════════════════════════════════════════════════
 
 /// Same stack as `build_stack`, plus the unified query port wired onto the
@@ -326,6 +326,7 @@ async fn canonical_port_sql(state: &AppState, sql: &str) -> serde_json::Value {
     );
     let Json(body) = canonical_execute_sql(
         State(state.clone()),
+        None,
         Some(Extension(tenant)),
         Json(SqlQueryRequest {
             query: sql.to_string(),
@@ -340,25 +341,41 @@ async fn canonical_port_sql(state: &AppState, sql: &str) -> serde_json::Value {
     body
 }
 
-/// MCP leg: the REAL engine backend's `search` tool over the SAME port. The
-/// backend's other dependencies (event log, vector ops) are not on the SQL
-/// search path and stay unwired, exactly like the minimal MCP mount.
+/// The port leg, driven DIRECTLY (no HTTP): asserts the typed error class
+/// for statements the read-only policy rejects.
+async fn canonical_port_sql_err(state: &AppState, sql: &str) -> anyhow::Error {
+    let tenant = proximadb::network::middleware::tenant::TenantContext::new(
+        "default",
+        proximadb::network::middleware::tenant::TenantIdSource::Default,
+    );
+    canonical_execute_sql(
+        State(state.clone()),
+        None,
+        Some(Extension(tenant)),
+        Json(SqlQueryRequest {
+            query: sql.to_string(),
+            parameters: None,
+            collection: None,
+            timeout_ms: None,
+            seeding: None,
+        }),
+    )
+    .await
+    .expect_err(&format!("port must reject: {sql}"))
+    .into()
+}
+
+/// MCP leg: the REAL engine backend's `search` tool over the SAME port.
 async fn mcp_search(
     api_handlers: Arc<dyn proximadb_runtime::ApiHandlersPort>,
     port: Arc<dyn proximadb_runtime::UnifiedQueryPort>,
     query: &str,
-) -> serde_json::Value {
-    let backend = EngineBackend::new(
-        api_handlers,
-        Some(port),
-        None,
-        None,
-        Some("default".to_string()),
-    );
+) -> Result<serde_json::Value, String> {
+    let backend = EngineBackend::new(api_handlers, Some(port), None, None, Some("default".into()));
     backend
         .search(&json!({ "collection_id": "spine6", "query": query }))
         .await
-        .expect("MCP search must succeed")
+        .map_err(|error| format!("{} (code {})", error.message, error.code))
 }
 
 /// Render one JSON row object into ordered cells for the named columns.
@@ -376,8 +393,17 @@ fn cells_of(row: &serde_json::Value, columns: &[&str]) -> Vec<String> {
         .collect()
 }
 
+fn rows_of(body: &serde_json::Value, rows_key: &str, columns: &[&str]) -> Vec<Vec<String>> {
+    body[rows_key]
+        .as_array()
+        .unwrap_or_else(|| panic!("{rows_key} array missing: {body}"))
+        .iter()
+        .map(|row| cells_of(row, columns))
+        .collect()
+}
+
 /// The one-planner row comparator: legs agree on the ordered, rendered cells
-/// of every row. Exposed so the mutation probe can prove it detects drift.
+/// of every row.
 fn legs_agree(reference: &[Vec<String>], candidate: &[Vec<String>]) -> bool {
     reference.len() == candidate.len()
         && reference
@@ -394,30 +420,33 @@ fn assert_leg(reference: &[Vec<String>], candidate: &[Vec<String>], leg: &str) {
     );
 }
 
+/// Render a gRPC row (HashMap<String, TypedValue>) as a JSON object the
+/// shared cell renderer can read.
+fn grpc_row_to_json(row: &V2QueryRow) -> serde_json::Value {
+    let mut object = serde_json::Map::new();
+    for (column, cell) in &row.values {
+        object.insert(column.clone(), typed_to_json(cell));
+    }
+    serde_json::Value::Object(object)
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn plain_sql_runs_through_the_scheduler_on_every_in_process_surface() {
     let (state, services, _temp) = build_port_stack().await;
 
-    // Seed THROUGH THE PORT (canonical /sql): DDL and DML through the unified
-    // port exercise the shared write dispatch — pre-TD-SPINE-6 these were
-    // refused by the federated core ("Standard relational SQL execution is
-    // not configured").
+    // Seed through the AUTHORITY surface (REST v2 /sql over the real router):
+    // the port is read-only for plain SQL (MED-4).
     let ddl = "CREATE TABLE spine6_port (id TEXT, score DOUBLE, label TEXT)";
     let dml = "INSERT INTO spine6_port (id, score, label) VALUES ('a', 1.5, 'x'), ('b', 2.5, 'y')";
     let select = "SELECT id, score, label FROM spine6_port ORDER BY id";
-    canonical_port_sql(&state, ddl).await;
-    canonical_port_sql(&state, dml).await;
+    rest_sql(&state, ddl).await;
+    rest_sql(&state, dml).await;
 
     let columns = ["id", "score", "label"];
 
-    // Reference: the api_handlers spine (REST v2 /sql over the REAL router).
+    // Reference: the api_handlers spine (REST v2 /sql).
     let rest = rest_sql(&state, select).await;
-    let reference: Vec<Vec<String>> = rest["rows"]
-        .as_array()
-        .expect("REST rows")
-        .iter()
-        .map(|row| cells_of(row, &columns))
-        .collect();
+    let reference = rows_of(&rest, "rows", &columns);
     assert_eq!(
         reference.len(),
         2,
@@ -426,13 +455,11 @@ async fn plain_sql_runs_through_the_scheduler_on_every_in_process_surface() {
 
     // Canonical /sql (unified query port → scheduler decision path).
     let canonical = canonical_port_sql(&state, select).await;
-    let canonical_rows: Vec<Vec<String>> = canonical["rows"]
-        .as_array()
-        .expect("canonical /sql rows")
-        .iter()
-        .map(|row| cells_of(row, &columns))
-        .collect();
-    assert_leg(&reference, &canonical_rows, "canonical /sql (port)");
+    assert_leg(
+        &reference,
+        &rows_of(&canonical, "rows", &columns),
+        "canonical /sql (port)",
+    );
 
     // gRPC (api_handlers spine — already scheduler-routed; must stay equal).
     let grpc = grpc_sql(&services, select).await;
@@ -444,92 +471,308 @@ async fn plain_sql_runs_through_the_scheduler_on_every_in_process_surface() {
     assert_leg(&reference, &grpc_rows, "gRPC");
 
     // MCP (unified query port → scheduler decision path).
-    let port = state
-        .unified_query_port
-        .clone()
-        .expect("port wired by build_port_stack");
-    let mcp = mcp_search(services.api_handlers.clone(), port, select).await;
-    let mcp_records = mcp["records"]
-        .as_array()
-        .unwrap_or_else(|| panic!("MCP records array missing: {mcp}"));
-    let mcp_rows: Vec<Vec<String>> = mcp_records
-        .iter()
-        .map(|row| cells_of(row, &columns))
-        .collect();
-    assert_leg(&reference, &mcp_rows, "MCP search (port)");
-}
+    let port = state.unified_query_port.clone().expect("port wired");
+    let mcp = mcp_search(services.api_handlers.clone(), port.clone(), select)
+        .await
+        .expect("MCP search must serve plain reads");
+    assert_leg(
+        &reference,
+        &rows_of(&mcp, "records", &columns),
+        "MCP search (port)",
+    );
 
-/// Render a gRPC row (HashMap<String, TypedValue>) as a JSON object the
-/// shared cell renderer can read.
-fn grpc_row_to_json(row: &proximadb::proto::proximadb_v2::V2QueryRow) -> serde_json::Value {
-    let mut object = serde_json::Map::new();
-    for (column, cell) in &row.values {
-        object.insert(column.clone(), typed_to_json(cell));
+    // LOW-4: the port envelope's metrics carry a timed (u64)
+    // execution_time_ms — the delegated call is timed in
+    // `run_sql_via_one_planner` (previously the field was always 0 on the
+    // port path). The canonical HANDLER projects only rows/counts, so the
+    // envelope is asserted through a direct port call.
+    {
+        let envelope = port
+            .execute_unified_query(
+                select.to_string(),
+                None,
+                None,
+                None,
+                proximadb_runtime::UnifiedQueryPortContext::for_identity(
+                    proximadb_runtime::PortIdentity::for_tenant("default"),
+                ),
+            )
+            .await
+            .expect("direct port read for the metrics pin");
+        assert!(
+            envelope["metrics"]["execution_time_ms"].as_u64().is_some(),
+            "metrics.execution_time_ms must be a timed u64: {envelope}"
+        );
     }
-    serde_json::Value::Object(object)
 }
 
-/// TD-SPINE-6 mutation probe: the parity comparator must FAIL when any leg's
-/// rendering drifts (a cell altered, a row dropped, a row added) — proving
-/// the one-planner comparisons above are not tautological.
-#[test]
-fn parity_comparator_detects_mutated_legs() {
-    let reference = vec![
-        vec!["a".to_string(), "1.5".to_string()],
-        vec!["b".to_string(), "2.5".to_string()],
-    ];
-    // A mutated cell.
-    let mutated_cell = vec![
-        vec!["a".to_string(), "9.9".to_string()],
-        vec!["b".to_string(), "2.5".to_string()],
-    ];
+/// HIGH-1 (round-1 review), every probe: raw text containing extension
+/// KEYWORDS as literals/comments must route through the ONE SQL authority
+/// and behave EXACTLY like the /api/v2/sql leg — reads return identical
+/// rows; writes are cleanly REJECTED by the read-only policy (MED-4), never
+/// silently lost, while the authority surface writes them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn extension_keywords_in_literals_and_comments_route_through_the_authority() {
+    let (state, _services, _temp) = build_port_stack().await;
+    let columns = ["id", "note"];
+
+    rest_sql(&state, "CREATE TABLE spine6_probe (id TEXT, note TEXT)").await;
+    rest_sql(
+        &state,
+        "INSERT INTO spine6_probe (id, note) VALUES ('p', 'plain seed')",
+    )
+    .await;
+
+    // Probe 1 — the silent-write-loss INSERT: the port leg must REJECT it
+    // (read-only, typed 400-class error naming the policy), NOT report a
+    // federated success while the table stays empty.
+    let silent_write = "INSERT INTO spine6_probe (id, note) VALUES ('w', 'logged VECTOR_SEARCH(probe_vec, [0.1], 10)')";
+    let error = canonical_port_sql_err(&state, silent_write).await;
+    let message = format!("{error:#}");
     assert!(
-        !legs_agree(&reference, &mutated_cell),
+        message.contains("read-only"),
+        "the write must be rejected by the read-only policy, got: {message}"
+    );
+    // …and nothing was written (no partial/silent effect).
+    let after = rest_sql(&state, "SELECT id, note FROM spine6_probe ORDER BY id").await;
+    assert_eq!(
+        rows_of(&after, "rows", &columns).len(),
+        1,
+        "no row may appear: {after}"
+    );
+    // The SAME statement via the authority surface writes the row.
+    rest_sql(&state, silent_write).await;
+    let after = rest_sql(&state, "SELECT id, note FROM spine6_probe ORDER BY id").await;
+    assert_eq!(
+        rows_of(&after, "rows", &columns).len(),
+        2,
+        "authority writes: {after}"
+    );
+
+    // Probe 2 — a SELECT whose WHERE literal contains `LOGS(app)`: the port
+    // leg returns the SAME rows as /api/v2/sql (previously: "Namespace 'app'
+    // not found" from the mis-routed federated path).
+    let select_literal =
+        "SELECT id, note FROM spine6_probe WHERE note = 'LOGS(app) literal' OR id = 'w'";
+    let reference = rows_of(&rest_sql(&state, select_literal).await, "rows", &columns);
+    let port_rows = rows_of(
+        &canonical_port_sql(&state, select_literal).await,
+        "rows",
+        &columns,
+    );
+    assert_leg(&reference, &port_rows, "literal-containing SELECT");
+
+    // Probe 3 — an UPDATE carrying a GRAPH_QUERY literal: rejected on the
+    // port, executed by the authority.
+    let update = "UPDATE spine6_probe SET note = 'GRAPH_QUERY(MATCH (n) RETURN n)' WHERE id = 'w'";
+    let error = canonical_port_sql_err(&state, update).await;
+    assert!(format!("{error:#}").contains("read-only"), "got: {error:#}");
+    rest_sql(&state, update).await;
+    let after = rest_sql(&state, "SELECT note FROM spine6_probe WHERE id = 'w'").await;
+    assert!(
+        rows_of(&after, "rows", &["note"])[0][0].contains("GRAPH_QUERY"),
+        "authority executed the update: {after}"
+    );
+
+    // Probe 4 — a trailing comment mentioning `<->`: identical rows on both
+    // legs (previously: "Unsupported vector expression").
+    let select_comment = "SELECT id FROM spine6_probe ORDER BY id -- uses <-> operator";
+    let reference = rows_of(&rest_sql(&state, select_comment).await, "rows", &["id"]);
+    let port_rows = rows_of(
+        &canonical_port_sql(&state, select_comment).await,
+        "rows",
+        &["id"],
+    );
+    assert_leg(&reference, &port_rows, "comment-containing SELECT");
+}
+
+/// MED-4 (round-1 review): DELETE via the MCP `search` tool is rejected with
+/// the policy message (MCP is a query surface; it must not mutate).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_search_rejects_delete_statements() {
+    let (state, services, _temp) = build_port_stack().await;
+    rest_sql(&state, "CREATE TABLE spine6_mcp (id TEXT)").await;
+    rest_sql(&state, "INSERT INTO spine6_mcp (id) VALUES ('a')").await;
+    let port = state.unified_query_port.clone().expect("port wired");
+    let error = mcp_search(
+        services.api_handlers.clone(),
+        port,
+        "DELETE FROM spine6_mcp",
+    )
+    .await
+    .expect_err("DELETE via MCP search must be rejected");
+    assert!(
+        error.contains("read-only"),
+        "the rejection must name the read-only policy, got: {error}"
+    );
+    // …and the row survives.
+    let after = rest_sql(&state, "SELECT id FROM spine6_mcp").await;
+    assert_eq!(
+        rows_of(&after, "rows", &["id"]).len(),
+        1,
+        "row must survive: {after}"
+    );
+}
+
+/// MED-3 (round-1 review): an anonymous identity inside a tenant scope is
+/// DERIVED into the identity — the scheduler path resolves and writes within
+/// that tenant (previously: unscoped resolution — silent empty reads, and
+/// writes landing in a shared unscoped namespace).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn anonymous_identity_inside_a_tenant_scope_reads_that_tenant() {
+    let (state, _services, _temp) = build_port_stack().await;
+    rest_sql(&state, "CREATE TABLE spine6_scope (id TEXT)").await;
+    rest_sql(&state, "INSERT INTO spine6_scope (id) VALUES ('a'), ('b')").await;
+    let select = "SELECT id FROM spine6_scope ORDER BY id";
+    let port = state.unified_query_port.clone().expect("port wired");
+
+    // Anonymous identity + default-tenant scope in force → the tenant's rows
+    // (scope-derived identity reaches the scheduler path; pre-MED-3 this
+    // resolved unscoped and silently returned nothing).
+    let in_default = anonymous_call_in_scope(&port, "default", select)
+        .await
+        .expect("scope-derived identity must resolve the default tenant's table");
+    let rows = rows_of(&in_default, "records", &["id"]);
+    assert_eq!(
+        rows.len(),
+        2,
+        "scope-derived identity must see the tenant's rows: {in_default}"
+    );
+
+    // The SAME anonymous call inside a DIFFERENT tenant's scope must not
+    // observe the default tenant's rows: the table does not resolve for
+    // `acme` (an error) or returns different/no rows — never the default
+    // tenant's data.
+    match anonymous_call_in_scope(&port, "acme", select).await {
+        Ok(in_acme) => {
+            let acme_rows = rows_of(&in_acme, "records", &["id"]);
+            assert!(
+                acme_rows.is_empty() || !legs_agree(&rows, &acme_rows),
+                "another tenant's scope must not observe the default tenant's rows: {in_acme}"
+            );
+        }
+        Err(error) => {
+            // A resolution failure for the other tenant is the correct
+            // fail-closed outcome.
+            assert!(
+                !format!("{error:#}").is_empty(),
+                "expected a resolution error for the other tenant"
+            );
+        }
+    }
+}
+
+/// Drive the port with an ANONYMOUS identity inside `with_request_tenant`
+/// (the documented task-local fallback shape MED-3 hardens).
+async fn anonymous_call_in_scope(
+    port: &Arc<dyn proximadb_runtime::UnifiedQueryPort>,
+    tenant: &str,
+    sql: &str,
+) -> anyhow::Result<serde_json::Value> {
+    let query = sql.to_string();
+    proximadb::query::request_scope::with_request_tenant(tenant, async move {
+        port.execute_unified_query(
+            query,
+            None,
+            None,
+            None,
+            proximadb_runtime::UnifiedQueryPortContext::for_identity(
+                proximadb_runtime::PortIdentity::anonymous(),
+            ),
+        )
+        .await
+    })
+    .await
+}
+
+/// LOW-6 (round-1 review): the mutation probe mutates a REAL leg's rendered
+/// output (the canonical port leg's rows), not hand-built vectors — proving
+/// the comparator guards the actual rendering path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn parity_comparator_detects_mutated_legs() {
+    let (state, _services, _temp) = build_port_stack().await;
+    rest_sql(&state, "CREATE TABLE spine6_probe6 (id TEXT, score DOUBLE)").await;
+    rest_sql(
+        &state,
+        "INSERT INTO spine6_probe6 (id, score) VALUES ('a', 1.5), ('b', 2.5)",
+    )
+    .await;
+    let select = "SELECT id, score FROM spine6_probe6 ORDER BY id";
+    let real = rows_of(
+        &canonical_port_sql(&state, select).await,
+        "rows",
+        &["id", "score"],
+    );
+    assert_eq!(real.len(), 2, "real leg output: {real:?}");
+
+    // A mutated cell in the REAL leg's rendering must break parity.
+    let mut mutated_cell = real.clone();
+    mutated_cell[0][1] = "9.9".to_string();
+    assert!(
+        !legs_agree(&real, &mutated_cell),
         "a mutated cell must break parity"
     );
 
-    // A dropped row and an added row.
-    let dropped_row = vec![vec!["a".to_string(), "1.5".to_string()]];
+    // A dropped row and an added row, both derived from the real output.
+    let dropped = real[..1].to_vec();
     assert!(
-        !legs_agree(&reference, &dropped_row),
+        !legs_agree(&real, &dropped),
         "a dropped row must break parity"
     );
-    let added_row = vec![
-        vec!["a".to_string(), "1.5".to_string()],
-        vec!["b".to_string(), "2.5".to_string()],
-        vec!["c".to_string(), "3.5".to_string()],
-    ];
-    assert!(
-        !legs_agree(&reference, &added_row),
-        "an added row must break parity"
-    );
+    let mut added = real.clone();
+    added.push(vec!["c".to_string(), "3.5".to_string()]);
+    assert!(!legs_agree(&real, &added), "an added row must break parity");
 
-    // And the identity check: an unmutated leg agrees.
-    let same = reference.clone();
-    assert!(legs_agree(&reference, &same), "an unmutated leg must agree");
+    // And the unmutated leg agrees with itself.
+    let same = real.clone();
+    assert!(legs_agree(&real, &same), "an unmutated leg must agree");
+}
+
+/// LOW-6 (round-1 review): the fail-closed gate is a 401 at the HTTP surface
+/// (not a 500): the multimodal router, mounted bare (no identity extension,
+/// no scope), answers 401 for a plain read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scope_less_port_call_is_unauthorized_not_internal() {
+    use proximadb_api::rest::{UnifiedQueryRestState, create_multimodal_router};
+
+    let (state, _services, _temp) = build_port_stack().await;
+    let port = state.unified_query_port.clone().expect("port wired");
+    let router = create_multimodal_router().with_state(UnifiedQueryRestState {
+        unified_query_port: port,
+    });
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/execute")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({ "query": "SELECT 1 AS one" }).to_string(),
+                ))
+                .expect("request builds"),
+        )
+        .await
+        .expect("oneshot");
+
+    assert_eq!(
+        response.status(),
+        StatusCode::UNAUTHORIZED,
+        "no identity and no scope must be a 401, not a 500"
+    );
 }
 
 /// TD-SPINE-6 fail-closed acceptance: with neither an explicit identity
 /// tenant nor an in-force request scope, plain SQL through the port errors
-/// instead of executing unscoped.
+/// instead of executing unscoped — with the TYPED MissingQueryIdentity.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn plain_sql_through_the_port_fails_closed_without_identity_or_scope() {
     let (state, _services, _temp) = build_port_stack().await;
-    let port = state
-        .unified_query_port
-        .clone()
-        .expect("port wired by build_port_stack");
+    let port = state.unified_query_port.clone().expect("port wired");
 
-    // Seed a real table through the canonical leg (it wraps a scope).
-    canonical_port_sql(&state, "CREATE TABLE spine6_gate (id TEXT)").await;
-    canonical_port_sql(&state, "INSERT INTO spine6_gate (id) VALUES ('a')").await;
-    let select = "SELECT id FROM spine6_gate";
-
-    // No task-local scope on this thread (nothing wrapped the call), and an
-    // anonymous context carries no tenant: the port must refuse.
     let error = port
         .execute_unified_query(
-            select.to_string(),
+            "SELECT id FROM spine6_gate".to_string(),
             None,
             None,
             None,
@@ -543,12 +786,20 @@ async fn plain_sql_through_the_port_fails_closed_without_identity_or_scope() {
         error.to_string().contains("no request identity"),
         "unexpected error class: {error}"
     );
+    assert!(
+        error
+            .downcast_ref::<proximadb_runtime::MissingQueryIdentity>()
+            .is_some(),
+        "the gate must be the typed MissingQueryIdentity (401 at HTTP): {error:#}"
+    );
 
     // The same call WITH an explicit identity tenant succeeds through the
     // scheduler path (the positive control — the gate is not a blanket deny).
+    rest_sql(&state, "CREATE TABLE spine6_gate (id TEXT)").await;
+    rest_sql(&state, "INSERT INTO spine6_gate (id) VALUES ('a')").await;
     let ok = port
         .execute_unified_query(
-            select.to_string(),
+            "SELECT id FROM spine6_gate".to_string(),
             None,
             None,
             None,

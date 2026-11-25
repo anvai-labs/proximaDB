@@ -32,7 +32,9 @@ use axum::{
 };
 use proximadb_data_model::ProximaValue;
 use proximadb_records::conversions::json_to_proxima;
-use proximadb_runtime::{InvalidQueryInput, UnifiedQueryPort, UnifiedQueryPortContext};
+use proximadb_runtime::{
+    InvalidQueryInput, MissingQueryIdentity, UnifiedQueryPort, UnifiedQueryPortContext,
+};
 use serde::Deserialize;
 use tracing::{error, info};
 
@@ -166,6 +168,21 @@ fn empty_query_response() -> axum::response::Response {
 fn port_error_response(op: &str, e: anyhow::Error) -> axum::response::Response {
     if e.to_string().contains("not implemented") || e.to_string().contains("UNIMPLEMENTED") {
         not_implemented(op).into_response()
+    } else if e.downcast_ref::<MissingQueryIdentity>().is_some() {
+        // MED-3 (round-1 review): no identity and no scope → 401, not 500.
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response()
+    } else if e.downcast_ref::<InvalidQueryInput>().is_some() {
+        // MED-4 (round-1 review): the read-only policy rejection (or any
+        // client-shaped query input) → 400, not 500.
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response()
     } else {
         error!("{op} failed: {e}");
         (

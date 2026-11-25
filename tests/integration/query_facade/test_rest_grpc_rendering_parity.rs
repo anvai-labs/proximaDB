@@ -167,17 +167,23 @@ async fn rest_leg(adapter: Arc<QueryFacadeAdapter>) -> Vec<serde_json::Value> {
     let body = json!({
         "query": "SELECT * FROM VECTOR_SEARCH('parity_collection', '[0.1, 0.2]', 3)",
     });
-    let response = router
-        .oneshot(
+    // TD-SPINE-6 round-1 (MED-3): the bare-mounted router carries no identity
+    // extension, and user-written extension SQL is raw text through the ONE
+    // authority — the port now fails closed (401) without a scope. This file
+    // tests RENDERING parity, so the leg acts as the default tenant.
+    let response = proximadb::query::request_scope::with_request_tenant(
+        "default",
+        router.oneshot(
             Request::builder()
                 .method("POST")
                 .uri("/federated")
                 .header("content-type", "application/json")
                 .body(Body::from(body.to_string()))
                 .expect("request builds"),
-        )
-        .await
-        .expect("oneshot completes");
+        ),
+    )
+    .await
+    .expect("oneshot completes");
 
     assert_eq!(
         response.status(),
@@ -294,5 +300,16 @@ async fn rest_leg_renders_the_port_json_shape() {
     let first = &rest[0];
     assert!(first.get("id").is_some(), "REST record has id");
     assert!(first.get("score").is_some(), "REST record has score");
-    assert_eq!(first["rank"].as_u64(), Some(1), "REST record carries rank");
+    // TD-SPINE-6 round-1 (MED-4, dated 2026-11-24): user-written extension SQL
+    // is raw text through the ONE authority, whose typed fallback renders
+    // `{id, score, metadata}` — the old federated-only `{id, score, rank}`
+    // shape applies only to PORT-LOWERED (UQL/multi-model) text.
+    assert!(
+        first.get("metadata").is_some(),
+        "REST record carries the authority's metadata cell: {first}"
+    );
+    assert!(
+        first.get("rank").is_none(),
+        "rank is gone for raw extension SQL"
+    );
 }
