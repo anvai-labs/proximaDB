@@ -2999,9 +2999,14 @@ async fn manifest_levers_cut_footer_gets_over_pgwire() {
 /// Counts only — emulator latency is not evidence (same posture as the
 /// TD-PAXMETA-1 SIFT request-count harness).
 ///
-/// `#[ignore]`d + env-gated like the other emulator proofs. Run with the S3
-/// env contract the object_store builder reads (the qa scope's s3:// restart
-/// set):
+/// `#[ignore]`d + env-gated like the other emulator proofs. When the env is
+/// unset the test prints a loud `SKIP (not run)` line and RETURNS — which
+/// libtest (and therefore CI's advisory `--ignored` lane) reports as `ok`;
+/// that is the documented repo convention for `#[ignore]`d emulator tests
+/// (see `put_with_tier_accepted_by_s3_emulator`) and is accepted because no
+/// merge lane runs the `--ignored` lane without the emulator env contract.
+/// Run with the S3 env contract the object_store builder reads (the qa
+/// scope's s3:// restart set):
 ///
 /// ```text
 /// PROXIMADB_WAREHOUSE_ROOT_URL=s3://bucket/m5-pgwire \

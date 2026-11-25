@@ -119,7 +119,12 @@ gaps. The load-bearing findings:
   (`object_store_parquet_reader.rs:557-560`), while writes **strip the scheme/authority**
   (`table_write_executor.rs:661-667 normalize_object_path_prefix`) and land in the one
   global bridge. The warehouse root is a hardcoded `format!("file://{}/warehouse", ..)`
-  (`multi_server.rs:904`).
+  (`multi_server.rs:904`). *Amended 2026-11-24 (ADR-098 M5):* no longer hardcoded — one
+  `resolve_warehouse_root` helper derives the default and honors the
+  `PROXIMADB_WAREHOUSE_ROOT_URL` override (registry row; scheme allow-list,
+  boot-record integration, `[oltp.durable_volume]` fail-closed refusal for local
+  overrides off the volume). The per-tenant resolver this ADR calls for is still
+  open.
 * `storage_config.storage_path` on collection create is accepted **verbatim, unvalidated**
   (`collection/manager.rs:1057-1073`) — currently unreachable from the network surface,
   but wiring it through as-is would ship an SSRF/exfiltration primitive.
@@ -224,7 +229,9 @@ gaps. The load-bearing findings:
 * **Close the back door first**: `storage_config.storage_path` gets scheme/allowlist
   validation *before* any network surface exposes it; writes stop stripping
   scheme/authority (`normalize_object_path_prefix`) once the resolver exists; the
-  hardcoded warehouse root becomes a `StorageLocation`.
+  hardcoded warehouse root becomes a `StorageLocation` (*partially shipped 2026-11-24:*
+  `PROXIMADB_WAREHOUSE_ROOT_URL` makes the root operator-configurable per process —
+  ADR-098 M5; per-tenant binding remains open).
 * Commercial note (per co-design §2.5): BYOB/BYOK is the edition-gated enterprise margin
   surface. OSS ships the mechanism (bindings, resolver, validation); anvaiops ships the
   policy/entitlement (which tiers may bind their own storage), per the OSS boundary.
@@ -318,7 +325,9 @@ federation (`SubjectId` unqualified); (20) `permitted_principals` cannot name a 
 per-tenant/collection credential record (both candidate types inert); (3) factory keyed
 by scheme ⇒ one account per cloud (`mod.rs:263`); (4) writes strip scheme/authority from
 per-table location (`table_write_executor.rs:661-667`); (5) warehouse root hardcoded
-(`multi_server.rs:904`); (6) `storage_config.storage_path` unvalidated back door
+(`multi_server.rs:904`) — *relaxed 2026-11-24: env-overridable per process via
+`PROXIMADB_WAREHOUSE_ROOT_URL` (ADR-098 M5); still one root per process, not per
+tenant*; (6) `storage_config.storage_path` unvalidated back door
 (`manager.rs:1057-1073`); (7) reads honor arbitrary layout URIs with no read-time
 revalidation, allowlist only on the DDL path; (8) allowlist is process-global env, not
 per-tenant; (9) placement is `choose(rng)` random (`engine.rs:826-833`); (10)

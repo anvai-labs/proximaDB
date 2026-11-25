@@ -177,14 +177,17 @@ pub(crate) fn effective_durable_locations(
     if let Some(path) = env("PROXIMADB_CORPUS_VERSION_PATH") {
         push("PROXIMADB_CORPUS_VERSION_PATH", path, None);
     }
-    // ADR-098 M5 (review round 1, HIGH-1): an env-overridden warehouse root
-    // holds every MATERIALIZEd table's Parquet parts + Iceberg metadata, and
-    // a LOCAL override (e.g. file:///mnt/warehouse) can sit outside every
-    // leased root — cold backup must see it to refuse instead of silently
-    // shipping a backup without the warehouse. Resolved through the SAME
-    // `resolve_warehouse_root` the network call sites use (the injected env
-    // here is the boot-resolved read), so the served root and the recorded
-    // root cannot diverge. Remote schemes are skipped, consistent with this
+    // ADR-098 M5 (review round 1, HIGH-1; round 2, MED-3): an env-overridden
+    // warehouse root holds every MATERIALIZEd table's Parquet parts + Iceberg
+    // metadata, and a LOCAL override (e.g. file:///mnt/warehouse) can sit
+    // outside every leased root — cold backup must see it to refuse instead
+    // of silently shipping a backup without the warehouse. ONE resolver
+    // (`resolve_warehouse_root`) serves every consumer — the server/pgwire
+    // builds, the router build, this boot record, backup's own env pass and
+    // the writer-epoch check — with no per-request read, so the served root
+    // and the recorded root cannot diverge; the recorded LOCATION is the
+    // resolver's PARSED local path (host-checked, percent-decoded), never a
+    // naive strip_prefix. Remote schemes are skipped, consistent with this
     // module's contract (object storage is durable on its own; the record's
     // refusal path is for local locations) — and the in-lease default is not
     // recorded at all, only the override.
@@ -193,8 +196,12 @@ pub(crate) fn effective_durable_locations(
             &config.server.data_dir,
             |key| env(key),
         );
-        if warehouse.from_override && local_path(&warehouse.url).is_some() {
-            push("PROXIMADB_WAREHOUSE_ROOT_URL", warehouse.url, None);
+        if let Some(path) = warehouse.local_path.filter(|_| warehouse.from_override) {
+            push(
+                "PROXIMADB_WAREHOUSE_ROOT_URL",
+                path.display().to_string(),
+                None,
+            );
         }
     }
     // io_trace sink spool — mirrors `ResolvedIoTraceSinkConfig::try_resolve`'s

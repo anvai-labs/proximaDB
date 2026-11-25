@@ -103,14 +103,13 @@ fn grouped_roots(config: &Config, canonical: bool) -> anyhow::Result<Vec<Manifes
         .collect())
 }
 
-/// Absolute without touching the filesystem — but canonical when the path
-/// exists, so an existing target compares equal to its canonical source.
+/// Absolute, canonicalising the NEAREST EXISTING ANCESTOR (roots may not
+/// exist yet), so an existing target compares equal to its canonical source
+/// and a symlinked ancestor cannot fake containment — the SPINE-5 /var vs
+/// /private/var class (review round 2, MED-3). Delegates to the same
+/// resolver the writer-epoch check uses.
 fn absolute(path: &Path) -> anyhow::Result<PathBuf> {
-    if let Ok(canonical) = path.canonicalize() {
-        return Ok(canonical);
-    }
-    std::path::absolute(path)
-        .map_err(|e| anyhow::anyhow!("absolute path for {}: {e}", path.display()))
+    crate::writer_epoch::resolve(path)
 }
 
 fn other_roots(roots: &[ManifestRoot], index: usize) -> BTreeSet<PathBuf> {
@@ -990,6 +989,77 @@ mod tests {
         assert!(format!("{err:#}").contains("did not complete"), "{err:#}");
         run_restore(&config, &backup, true).expect("forced restore");
         assert!(!sentinel.exists(), "a completed restore clears the marker");
+    }
+
+    /// Review round 2 (L2): the END-TO-END warehouse-root refusal. The record
+    /// is derived from `effective_durable_locations` WITH the override env a
+    /// real boot would have seen (so deleting the record push in
+    /// `effective_durable_locations` makes THIS test fail, not just the unit
+    /// test): a LOCAL override outside every leased root refuses the backup
+    /// naming the variable and writes nothing.
+    #[test]
+    fn backup_refuses_unleased_warehouse_root_and_writes_nothing() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let base = temp.path().join("live");
+        let config = local_config(&base);
+        seed(&config);
+        let outside = temp.path().join("pod-warehouse");
+        std::fs::create_dir_all(&outside).expect("mkdir");
+        durable_locations::write_record(
+            &config.server.data_dir,
+            &durable_locations::effective_durable_locations(&config, |key| {
+                (key == "PROXIMADB_WAREHOUSE_ROOT_URL")
+                    .then(|| format!("file://{}", outside.display()))
+            }),
+        )
+        .expect("record");
+        let backup = temp.path().join("bk");
+        let err = run_backup(&config, &backup).expect_err("unleased warehouse root");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("ownership lease"),
+            "refusal reason: {message}"
+        );
+        assert!(
+            message.contains("PROXIMADB_WAREHOUSE_ROOT_URL"),
+            "names the variable: {message}"
+        );
+        assert!(
+            !backup.join(MANIFEST_FILE).exists(),
+            "a refused backup must leave no manifest"
+        );
+    }
+
+    /// The positive control for the same seam: an override INSIDE data_dir is
+    /// leased, backed up (4 files: the two seeded + the record + the
+    /// warehouse part), and restore round-trips the part.
+    #[test]
+    fn backup_includes_leased_warehouse_root_override() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let base = temp.path().join("live");
+        let config = local_config(&base);
+        seed(&config);
+        let inside = config.server.data_dir.join("warehouse");
+        std::fs::create_dir_all(&inside).expect("mkdir");
+        std::fs::write(inside.join("part-0.parquet"), b"parquet-bytes").expect("part");
+        durable_locations::write_record(
+            &config.server.data_dir,
+            &durable_locations::effective_durable_locations(&config, |key| {
+                (key == "PROXIMADB_WAREHOUSE_ROOT_URL")
+                    .then(|| format!("file://{}", inside.display()))
+            }),
+        )
+        .expect("record");
+        let backup = temp.path().join("bk");
+        let summary = run_backup(&config, &backup).expect("backup");
+        assert_eq!(summary.files, 4, "two seeds + record + warehouse part");
+
+        wipe_all(&base);
+        run_restore(&config, &backup, false).expect("restore");
+        assert_eq!(
+            std::fs::read(config.server.data_dir.join("warehouse/part-0.parquet")).expect("part"),
+            b"parquet-bytes"
+        );
     }
 
     #[test]

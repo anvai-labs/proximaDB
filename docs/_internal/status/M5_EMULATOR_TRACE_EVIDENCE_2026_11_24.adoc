@@ -76,10 +76,10 @@ SIFT_GET_COUNTS {"mode":"at_flush_on","pax_write_directory_at_flush":true,"store
 Toxiproxy 2.12.0 (docker `m5-toxiproxy`), proxy 127.0.0.1:9100 → MinIO, symmetric latency toxics
 (L/2 down + L/2 up), fresh proxy daemon per arm. Cohort: 25 queries/phase (the first 100-query arm
 wedged — see Incidents and
-link:../../10-quality/td/TD-S3STALL-1-query-path-blocking-read-without-timeout.adoc[TD-S3STALL-1]). GET/q and recall are RTT-invariant (counts, not latency); p50s are the
+link:../../10-quality/td/TD-S3STALL-1-query-path-blocking-read-mechanism-unknown.adoc[TD-S3STALL-1]). GET/q and recall are RTT-invariant (counts, not latency); p50s are the
 latency shape. Arms marked ⚑ ran while a release build compiled in the background — treat those p50s
 as upper bounds (the RTT50 ⚑ arm's qps 0.31 vs the clean re-run's higher throughput makes the
-contentment visible; the clean re-run is authoritative).
+contention visible; the clean re-run is authoritative).
 
 [cols="1,1,1,1,1,1,1", options="header"]
 |===
@@ -135,38 +135,46 @@ mode (asserted). **The count shape is IDENTICAL to the file:// evidence** (13→
 All four legs via the production `store_for_url` (the same PR routes this bench through it — bare
 `parse_url` cannot target an emulator endpoint). Direct leg: 200 iterations; toxiproxy legs: 50.
 
-[cols="1,1,1,1,1,1,1", options="header"]
+[cols="1,1,1,1,1,1,1,1", options="header"]
 |===
-| Leg | GET 4KiB p50 | ranged 4KiB p50 | ranged 64KiB p50 | ranged 1MiB p50 | whole 1MiB p50 | LIST p50
-| direct MinIO (Docker NAT) | 5.0 ms | 12.9 ms | 1.1 ms | 17.5 ms | 65.6 ms | 8.6 ms
-| +50 ms injected RTT | 60.2 ms | 55.3 ms | 80.8 ms | 81.4 ms | 253.2 ms | 79.4 ms
-| +100 ms injected RTT | 130.4 ms | 128.2 ms | 131.9 ms | 129.3 ms | 285.0 ms | 104.9 ms
-| +150 ms injected RTT | 153.5 ms | 153.6 ms | 153.9 ms | 154.3 ms | 162.7 ms | 153.9 ms
+| Leg | GET 4KiB p50 | ranged 4KiB p50 | GET 64KiB p50 | ranged 64KiB p50 | ranged 1MiB p50 | whole 1MiB p50 | LIST p50
+| direct MinIO (Docker NAT) | 5.0 ms | 12.9 ms | 12.7 ms | 1.1 ms | 17.5 ms | 65.6 ms | 8.6 ms
+| +50 ms injected RTT | 60.2 ms | 55.3 ms | 65.5 ms | 80.8 ms | 81.4 ms | 253.2 ms | 79.4 ms
+| +100 ms injected RTT | 130.4 ms | 128.2 ms | 149.7 ms | 131.9 ms | 129.3 ms | 285.0 ms | 104.9 ms
+| +150 ms injected RTT | 153.5 ms | 153.6 ms | 154.1 ms | 153.9 ms | 154.3 ms | 162.7 ms | 153.9 ms
 |===
 
-Reading: at +150 ms every op sits at RTT + ~4 ms; at +50/+100 ms the small-op overhead above RTT
-is larger (+5 to +32 ms) and is NOT attributed here — no per-op breakdown was measured, and after
-the bench's 10-op warmup "first-connection setup" cannot be the explanation. Whole-object 1 MiB GET
-clearly adds a transfer term (253-285 ms at +50/+100 ms; 162.7 ms at +150 ms where the toxic's
-shaping binds differently). Failed operations COUNT AS SAMPLES (the bench records a failing op's
-observed latency and emits no error counts), and every cell is 10 warmup + 50 timed iterations
-(200 direct). These are FLOOR shapes on an emulator — the numbers a route-cost model must beat,
+Reading: the small-op overhead above the injected RTT is +3.5 to +4.3 ms at +150 ms, but larger
+and wider at +50 ms (+5.3 to +31.4 ms) and +100 ms (+4.9 to +49.7 ms, the whole-GET 64 KiB row) —
+NOT attributed here (no per-op breakdown was measured; after the bench's 10-op warmup,
+"first-connection setup" cannot be the explanation either). Whole-object 1 MiB GET clearly adds a
+transfer term (253-285 ms at +50/+100 ms; 162.7 ms at +150 ms where the toxic's shaping binds
+differently). Failed operations COUNT AS SAMPLES (the bench records a failing op's observed
+latency and emits no error counts), and every cell is 10 warmup + 50 timed iterations
+(200 direct). All p50s in this table are transcribed from the run's raw stdout (the whole-GET
+64 KiB column was added in review round 2 against that output, not from memory). These are FLOOR shapes on an emulator — the numbers a route-cost model must beat,
 not cloud SLAs.
 
 == Incidents (recorded, not hidden)
 
 * **Wedged RTT arm
-  (link:../../10-quality/td/TD-S3STALL-1-query-path-blocking-read-without-timeout.adoc[TD-S3STALL-1]):**
+  (link:../../10-quality/td/TD-S3STALL-1-query-path-blocking-read-mechanism-unknown.adoc[TD-S3STALL-1]):**
   the first 50 ms ladder attempt (100 queries) stalled 25 min into the post-write phase after
   86/100 queries — the server's S3 READ on the query path blocked on a connection toxiproxy had
-  torn down ("Source terminated" in the proxy log) with no effective request timeout (the block
-  vastly outlived any configured bound). Killed; re-run with a fresh proxy daemon per arm and
+  torn down ("Source terminated" in the proxy log) for 25+ minutes with NO error and NO
+  warn-log from the read path — despite object_store 0.14.2's defaults applying to this store
+  (30 s request timeout, 5 s connect, max 10 retries in 180 s), which should have surfaced a
+  stalled read within ~30 s. Mechanism UNKNOWN (TD-S3STALL-1 re-diagnosed in review round 2);
+  diagnosis-first fix direction there. Killed; re-run with a fresh proxy daemon per arm and
   25-query cohorts. The wedged attempt's `result.json` records the partial phase; it is excluded
   from the table.
-* **Compile contention:** the leg-1 SIFT1M phase sweeps, the first RTT50 25q re-run and the RTT100
-  arm overlapped background release builds (visible as qps 0.29-0.31 vs 1.07-1.34 on the clean
-  runs); their p50s are upper bounds, marked ⚑. A clean RTT50 re-run landed (770 ms cold p50 vs the
-  contended arm's 2,234 ms at the same injected RTT) and is the authoritative 50 ms row.
+* **Compile contention — THE authoritative contended-arm list (the ledger points here and does
+  not re-enumerate):** the leg-1 SIFT1M phase sweeps (including the 833 ms direct rung), the
+  first RTT50 25q re-run, the RTT100 arm, the RTT150 arm, and briefly the pgwire leg overlapped
+  background release builds (visible as qps 0.29-0.31 vs 1.07-1.34 on the clean runs); their
+  p50s are upper bounds, marked ⚑ where they appear in tables. A clean RTT50 re-run landed
+  (770 ms cold p50 vs the contended arm's 2,234 ms at the same injected RTT) and is the
+  authoritative 50 ms row.
 * **Dirty-worktree guard firings (2):** two ladder launches were refused by the harness's own
   "benchmark refuses a dirty worktree" guard after in-flight doc edits — recorded as exit 1 with
   that message; re-launched after committing. No measurement was affected.
