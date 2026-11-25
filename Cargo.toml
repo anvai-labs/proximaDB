@@ -434,7 +434,7 @@ serde_urlencoded.workspace = true
 # one-way (ProximaDB → Sandhi, ADR-060). Consumed API surface: UsageBasis, UsageCompleteness,
 # UsageEvent, Backend, usage::{parse_anthropic_usage, parse_cohere_usage, parse_ollama_usage,
 # parse_openai_usage}. Wire types verified compatible across 0.2→0.14 jump.
-sandhi-core = "0.14"
+sandhi-core = "0.26.1"
 
 # OpenAPI spec-from-code (TD-126 Phase 1). The `ToSchema`/`IntoParams`/`path`
 # derives annotate the v2 REST DTOs + handlers so `docs/openapi/proximadb-openapi.yaml`
