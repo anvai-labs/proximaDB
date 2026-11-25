@@ -1,0 +1,46 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-MANIFEST-2: ad-hoc metadata formats outside the ADR-098 layers have no owner
+:status: Open
+:dim: D1
+:pillar: REL
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open** (filed 2026-11-25 by the ADR-098 scope reconciliation, Completion ledger G14).
+| Priority | **P3.** No defect today. Each extra format is one more encoder, decoder, versioning rule and recovery path to keep mixed-read safe (CLAUDE.md #8, #19).
+| Component | WAL manifest log `manifest_{min_lsn}_{max_lsn}.jsonl` (`src/storage/persistence/write_ahead_log/manifest/service.rs`); SST restart warm-set manifest `warm_cache.json` (`src/storage/engines/sst/warming.rs`, `WarmManifest`, `WARM_MANIFEST_VERSION`); opt-in PMHEAD manifest head with a bincode body (`crates/storage/proximadb-iceberg-engine/src/manifest/head.rs`); the generation-prefixed `ManifestCommitter` payload (`[generation:8][payload]`, `crates/storage/proximadb-iceberg-engine/src/manifest.rs`); the Iceberg export (Avro manifests + JSON `metadata.json`, the spec-mandated seam format).
+| Authority | link:../../12-design/adr/ADR-098-metadata-spine.adoc[ADR-098] D4.1 (encodings by layer: L0 envelope, L1 PXCD, L2 footers, Avro/JSON only at the Iceberg seam) and Completion ledger G14.
+| Relates to | link:TD-MANIFEST-1-manifest-retention.adoc[TD-MANIFEST-1] (retention of the `ManifestCommitter` logs), TD-WAL-6 (the WAL's `proto`/`avro` slots are a bincode facade), link:TD-SPINE-1-catalog-record-envelope.adoc[TD-SPINE-1] (the L0 envelope), link:TD-PAXMETA-1-collection-level-segment-facts.adoc[TD-PAXMETA-1] (deleted the SST JSON manifest), TD-LEASE-INFRA-1 (PMHEAD's origin)
+|===
+
+== Problem
+
+ADR-098 D4.1 assigns one encoding per metadata layer. Several persisted metadata formats sit
+outside that table and have no owner. The SST JSON manifest (`src/storage/engines/sst/manifest.rs`)
+was deleted in TD-PAXMETA-1 PR-A. The ones listed under Component remain. Each has its own
+framing, its own version rule (or none) and its own recovery reading. The 2026-11-19
+checkpoint's STOP list named them for retirement, but no TD carried them.
+
+== Fix
+
+. **Census.** Inventory every persisted metadata format, meaning anything that is written to
+  disk or object storage and read back to decide what data exists or how to read it. Do not
+  stop at the list above. For each format record the writer, the readers, the version or magic
+  marker (if any), whether recovery depends on it, and its at-rest object count. Data formats
+  (PAX, Parquet) and transport encodings are out of scope.
+. **Target.** Map each format to one of the ADR-098 D4.1 layers: the L0 envelope (TD-SPINE-1)
+  for catalog-like records, L1 PXCD for collection-level facts, or the Iceberg seam for
+  interop. A format with no layer is either retired or the census explains why it is a cache
+  and not authority (for example the warm-set manifest, which is a hint and may be lost).
+. Migrations follow the pre-GA rule: a clean break with version bytes kept and fail-closed
+  reads, documented in the PR that makes it.
+
+== Acceptance
+
+* The census is committed (in this TD or a linked doc), with one row per format and the fields
+  above, verified against develop by file path.
+* At GA, at most two persisted metadata formats exist besides the Iceberg export, counting the
+  L0 envelope and L1 PXCD. Any exception is named, with the reason it is not authority.
+* Each retired format has its decoder deleted, not left behind a flag.

@@ -3,11 +3,11 @@
 = ADR-098: Metadata spine — catalog-rooted L0, LIST-validated L1 directory, declared durability mode, one planner
 :toc: left
 :toclevels: 2
-:last-updated: 2026-11-19
+:last-updated: 2026-11-25
 
 [cols="1,3"]
 |===
-| Status | **Accepted (owner decision 2026-11-19).** Implementation Open; tracked by TD-SPINE-1 … TD-SPINE-6 and TD-PAXMETA-1.
+| Status | **Accepted (owner decision 2026-11-19).** Implementation partial; tracked by TD-SPINE-1 … TD-SPINE-6 and TD-PAXMETA-1. Per-goal status against develop is the <<_completion_ledger_2026_11_25,Completion ledger (2026-11-25)>>.
 | Date | 2026-11-19
 | Deciders | Vijaykumar Singh
 | Amends | link:ADR-097-foundational-seams-single-logical-ir.adoc[ADR-097] D0 (adds seam **S10 Catalog**; specifies S2/S4/S6/S7 metadata obligations); link:ADR-063-objstore-native-catalog-driven-restartability.adoc[ADR-063] D3 and the WAL-object parts of D4 (scoped to one declared mode; D4's LIST-discovery rule stays mode-independent); link:ADR-069-wal-local-disk-tiered-flush.adoc[ADR-069] D1 (scoped to the other); link:ADR-094-unified-storage-substrate-and-compute-seam.adoc[ADR-094] D4 (Layer B carrier); link:ADR-010-pax-block-format.adoc[ADR-010] (truncation wording); link:ADR-032-durable-tenant-prefixed-object-store-catalog.adoc[ADR-032]; link:ADR-037-statistics-substrate-and-reference-mcp.adoc[ADR-037]; link:ADR-042-canonical-segment-statistics-contract.adoc[ADR-042]; link:ADR-045-pax-durable-core-vs-serving-metadata.adoc[ADR-045]; link:ADR-050-statistics-fed-datafusion-route-selection.adoc[ADR-050]; link:ADR-053-cross-modal-query-fabric.adoc[ADR-053]; link:ADR-064-query-engine-pipeline-decision-dispatch-lowering-trace.adoc[ADR-064]; link:ADR-073-disk-cache-tier-and-backend-aware-coalescing.adoc[ADR-073]; link:ADR-0083-consolidated-catalog-identity-model.adoc[ADR-0083]; link:ADR-007-iceberg-rest-catalog-server.adoc[ADR-007]
@@ -96,11 +96,21 @@ sharded).
 . **Body codec stays MessagePack for now.** Choosing protobuf (field numbers) for the 41-field
   `CatalogTableSchema` is a separate, later decision; the envelope makes it a non-flag-day change.
   The existing `catalog.proto` messages are a smaller wire API and are not the persisted schema.
-. **Per-account shards (next).** The single global snapshot is replaced by a small root
+. **Per-account shards.** The single global snapshot is replaced by a small root
   (global registries, id high-waters, `account → shard generation`) plus one shard per account,
   each committed through `ManifestCommitter` and stored **under the account's tenant prefix via
   `DrPathBuilder`** (structural isolation, carrying TD-CAT-2). A DDL publishes its account's shard and the root;
   followers adopt only changed shards. Bytes written per DDL become O(account), not O(fleet).
++
+*Status 2026-11-25:* the root/shard split, changed-shard reload and the per-account floor are
+built (TD-SPINE-2, #2566), but the shards are **not** under the tenant prefix. They live at
+`_operator/catalog/_shards/{hex(account)}/`, beside the root at `_operator/catalog/_root/`
+(`DrPathBuilder::system_catalog_shard_manifests_subprefix`,
+`src/storage/trait_components/path_resolver.rs`). The tenant-prefix placement is **required and
+not yet built**; it is TD-SPINE-2 R1. The "implemented" note at the top of D1 covers the layout
+and the floor, not this placement. O(account) bytes per DDL is shown by a two-account unit test,
+not measured at fleet scale (TD-SPINE-2 R2), and the root and identity sidecar still carry
+fleet-wide account metadata.
 . **Per-account namespace floor** for new allocations; existing stable ids are never renumbered
   (TD-SPINE-2; TD-NS-1 S4 separately fences the `CatalogIdService` minting path).
 
@@ -125,7 +135,10 @@ sharded).
   **both** PAX read lanes: the SST search route and the DataFusion PAX lane
   (`PaxSplitReader::load_ranged`), which takes footer and SegmentIndex extents from the entry's
   decode key instead of probing the tail. Blooms, deletion vectors and stripe data stay in the
-  object and are fetched by reference.
+  object and are fetched by reference. _(2026-11-25)_ The planned priming of `SegmentIndexCache`
+  and the footer caches from the directory shipped instead as a direct decode-key read
+  (`directory_index` in `src/datafusion/engine_adapters/pax_adapter.rs`); the key-derived index
+  is deliberately not admitted to `SegmentIndexCache`, and no cache-priming path exists.
 . Target: a cold vector query costs LIST + directory + one data wave; collection-level questions
   (vector counts, exact-authority checks, coarse probing) read no segment bodies or footers.
 . A new metadata format is **not** introduced for this (an Arrow-IPC manifest was considered and
@@ -259,8 +272,8 @@ gives the same observability without a flag day (owner decision).
 * Catalog cost scales with tenants' own activity, not the fleet (D1.3).
 * Interop stays standard (Iceberg REST, Parquet, Avro only at the seam) while the internals stay
   vertical (CODESIGN mandate 4).
-* Risks: the directory and its LIST validation add a publish step to flush (gated, default OFF until
-  baked); metadata GC deletes files (retention follows the clock-free generation window (TD-GCRETAIN-1) + reachability check + interop read-back gate);
+* Risks: the directory and its LIST validation add a publish step to flush (gated; flipped default
+  ON 2026-11-20, with `PROXIMADB_PAX_WRITE_DIRECTORY_AT_FLUSH` kept as a kill switch); metadata GC deletes files (retention follows the clock-free generation window (TD-GCRETAIN-1) + reachability check + interop read-back gate);
   shard migration touches the catalog's recovery root (mixed-read-safe envelope first, then shards).
 
 == Sequencing and gates
@@ -276,4 +289,114 @@ gives the same observability without a flag day (owner decision).
 | TD-SPINE-5 | D3 durability mode | Per-mode WAL-root ratchet; crash-recovery and object-store restart suites green
 | TD-SPINE-6 | D5 one decision path | Transport parity extended to canonical `/sql` and pgwire
 | Runbook | Real S3/Azure traces | `cloud_latency` / `object_store_latency_floor` move from unverified to measured
+|===
+
+[[_completion_ledger_2026_11_25]]
+== Completion ledger (2026-11-25)
+
+This ledger supersedes the "Gate" column of <<_sequencing_and_gates>> wherever the two differ. It
+lists the program's long-term goals (G1–G16, from the 2026-11-19 checkpoint's thought experiments)
+with the gate each one needs. The status column describes develop @ `ea77dea50`. A result that
+exists only in an open PR is marked as such and does not count as met on develop. Ledger ids
+refer to `docs/_internal/roadmap/BENCHMARK_EVIDENCE.toml`.
+
+[cols="1,3,3,5,3", options="header"]
+|===
+| # | Goal | Gate | Status @ `ea77dea50` | Owner / correction
+
+| G1
+| Cold vector query in 1–2 dependent waves (the turbopuffer bar)
+| Object-cold p50 waves ≤ 2 at SIFT1M
+| Not met on develop. The D8 run measured p50 = 3 waves (`paxdir_d8_defaults_on_sift1m`, MinIO + Toxiproxy, 2026-10-25). Open PR #2575 measures 2 waves object-cold (post-write / local-warm / object-cold = 1 / 1 / 2) on a 2-segment MinIO SIFT1M bed, recall@100. Emulator only; real cloud pending.
+| TD-PAXMETA-1. Real-cloud confirmation: Runbook (M5).
+
+| G2
+| Collection-level questions read no footers (L1)
+| Cold metadata GETs = 0 with a valid directory
+| **Met.** Azurite 20 → 0 GETs (10 segments) and 40 → 0 (20 segments), `paxmeta1_directory_at_flush_request_counts_azurite`. Local SIFT1M, 50 uncompacted segments: 100 → 0, `sift1m_uncompacted_file_directory_at_flush`.
+| TD-PAXMETA-1
+
+| G3
+| Cold request count low enough for request-priced egress
+| The checkpoint's "~82 → ≤ 6 GETs/q" was a model that conflated waves with requests
+| Not met at ≤ 6. Compacted SIFT1M object-cold: 19.55 req/q (`paxdir_d8_defaults_on_sift1m`); 18.69 req/q (18.64 GET/q) in open PR #2575. Uncompacted 50-segment steady state: 154.63 ranged GETs/q (`sift1m_uncompacted_file_directory_at_flush`, TD-SIFTCOMPACT-1).
+| **Re-scoped.** ≤ 6 is dropped as a GA gate (it is a waves target in disguise). New gate: compacted object-cold ≤ 20 req/q, ratcheted (already the D8 harness ceiling, `--object-cold-max-requests 20`), plus a cost-per-query ledger entry (TD-PAXMETA-1; acceptance re-scope in open PR #2575). Going below 20 needs per-cell probe coalescing: link:../../10-quality/td/TD-COLDREQ-1-cold-probe-request-coalescing.adoc[TD-COLDREQ-1].
+
+| G4
+| The footer joins the data wave (L1 extents)
+| A cold read skips the SegmentIndex fetch
+| **Met by a different mechanism.** The SegmentIndex is rebuilt from the directory entry's decode key (D2.4); the planned `SegmentIndexCache` / footer-cache priming was not built.
+| Recorded in D2 (2026-11-25). TD-PAXMETA-1.
+
+| G5
+| Metadata debris stays bounded
+| Iceberg metadata objects bounded under a 1-hour sustained-ingest run
+| Not measured. Metadata GC and the bounded `metadata-log` ship with unit and MATERIALIZE-level tests only (#2536).
+| link:../../10-quality/td/TD-SPINE-3-iceberg-metadata-gc.adoc[TD-SPINE-3] (Partial), R1.
+
+| G6
+| Manifests are planning data
+| File pruning from manifest stats; manifest cache; plan-time stats from manifests
+| Pruning and the manifest cache are **met** (`spine4_manifest_levers_footer_gets_pgwire`). Plan-time stats are **not met**: with lazy footers, `ObjectStoreParquetTable::statistics()` returns `None` until every footer is resolved (`src/datafusion/engine_adapters/object_store_parquet_reader.rs`).
+| TD-SPINE-4. Its follow-up F1 covers only the route-shape stat; whole-table statistics from manifest bounds have no acceptance bullet yet. ADR-050 D2, ADR-042 and ADR-037 wording corrected 2026-11-25.
+
+| G7
+| Catalog cost is O(account), not O(fleet)
+| Bytes per DDL vs account count, measured
+| Asserted only, by the two-account unit test `ddl_publishes_only_its_accounts_shard_bytes_scale_with_account`. The root and the identity sidecar still carry fleet-wide account metadata.
+| link:../../10-quality/td/TD-SPINE-2-per-account-catalog-shards.adoc[TD-SPINE-2] R2.
+
+| G8
+| Tenant isolation is structural (`DrPathBuilder` `data/{tenant}/…`)
+| Per-account catalog shards live under the tenant's prefix
+| **Not met.** Shards live at `_operator/catalog/_shards/{hex(account)}/` (`src/storage/trait_components/path_resolver.rs`). D1.3 and TD-SPINE-2 Fix 1 claimed the tenant prefix.
+| TD-SPINE-2 R1 (required; pre-GA clean break, version bytes stay). TD-CAT-2's isolation goal points here.
+
+| G9
+| Every I/O boundary is metered per tenant (co-design #5)
+| The directory publish carries `TenantContext`
+| **Not met.** The flush and compaction publishes resolve an untenanted filesystem (`get_filesystem(dir_url)` in `src/storage/engines/sst/flush/mod.rs` `refresh_directory_after_flush` and `compaction.rs` `refresh_centroid_directory`).
+| link:../../10-quality/td/TD-METERDIR-1-directory-publish-tenant-metering.adoc[TD-METERDIR-1] (new, P1).
+
+| G10
+| One durability contract (D3)
+| Per-mode ratchet; crash-recovery and object-store restart suites green; TD-WAL-1 soak
+| The per-mode ratchet is **met** (TD-SPINE-5 tests). The Azurite object-store restart suite and `cold_backup_restore` passed in CI run 45465402994 (#2573 head `9c1b51e4c`). `wal_fsync_crash_recovery` runs in no CI lane. Open PR #2575 fixes two macOS cold-backup restore-path failures. The TD-WAL-1 soak has not run.
+| link:../../10-quality/td/TD-SPINE-5-declared-durability-mode.adoc[TD-SPINE-5] (Partial). Soak: TD-WAL-1.
+
+| G11
+| Format agility
+| An envelope on every L0 record; legacy records readable forever
+| **Met for the envelope** (#2566). The mixed legacy/enveloped chain is proven in one process only (`mixed_legacy_and_enveloped_wal_chain_replays`); a cross-pod mixed chain is untested. The protobuf body is a deferred decision (D1.2), triggered by the first incompatible schema evolution; it has no TD.
+| link:../../10-quality/td/TD-SPINE-1-catalog-record-envelope.adoc[TD-SPINE-1] (Partial), R1.
+
+| G12
+| One planner
+| Same rows and the same route decision on every surface; owner/reader placement; cache-affine readers
+| In open PR #2574, not on develop: read-row parity across pgwire, `/api/v2/sql` and `/api/v2/query` (live server) and canonical `/sql`, gRPC and MCP (in-process; canonical `/sql` is unrouted since TD-V1SUNSET-1). Route-decision parity is structural only.
+| TD-SPINE-6 (#2574). Placement: a separate placement TD, to be filed by #2574 (not yet in its diff on 2026-11-25).
+
+| G13
+| Iceberg as an async projection of L1
+| Spark/Trino read-back matches pgwire
+| Decision only (ADR-099).
+| TD-ICEPROJ-1 (Open).
+
+| G14
+| Retire the ad-hoc manifest formats
+| At most two metadata formats besides the Iceberg export
+| The SST JSON manifest is deleted (TD-PAXMETA-1 PR-A). The WAL `manifest_{min}_{max}.jsonl` log, the SST `warm_cache.json` warm-set manifest and the opt-in PMHEAD manifest head (bincode body) remain, with no owner before 2026-11-25.
+| link:../../10-quality/td/TD-MANIFEST-2-metadata-format-consolidation.adoc[TD-MANIFEST-2] (new, P3).
+
+| G15
+| The leaf-format choice is evidence-based (PAX vs Lance)
+| A Lance baseline on the same cold-read trace
+| Not filed before 2026-11-25.
+| link:../../10-quality/td/TD-LANCE-1-lance-cold-read-baseline.adoc[TD-LANCE-1] (new, P3).
+
+| G16
+| Real-cloud latency (Runbook)
+| `cloud_latency`, `object_store_latency_floor` and Iceberg planning GETs measured on real S3/Azure
+| Both ledger entries are `unverified` on develop. Open PR #2575 adds MinIO emulator legs and promotes `object_store_latency_floor` to measured on a localhost emulator.
+| Runbook. #2575 is to re-tag that entry so it cannot be cited as a cloud floor. Real cloud needs credentials.
 |===

@@ -160,6 +160,11 @@ one `namespace_floor: AtomicU64` per `SystemCatalog` (`src/services/system_catal
 link:../../10-quality/td/TD-SPINE-2-per-account-catalog-shards.adoc[TD-SPINE-2] makes the floor
 per-account. (TD-NS-1 S4 is the related fence on the separate per-account
 `CatalogIdService::mint_namespace_id` allocator; it does not by itself localize this floor.)
++
+*Updated 2026-11-25:* the paragraph above describes the code before #2566. Since #2566 (merged
+2026-11-24) the floor is per-account. `NamespaceIdAllocator` (`src/services/system_catalog.rs`)
+keeps the ids and the per-account floors under one lock, so the 65,536-namespace bound applies
+per account (TD-SPINE-2; test `per_account_namespace_floor_two_accounts_each_mint_id_one`).
 
 == Addendum: ABAC `tenant_stable_id` (TD-TENANT-1 item 3)
 

@@ -102,6 +102,18 @@ directory entries (ADR-098 D2); Parquet/Iceberg: manifest per-file `ColumnFileSt
 footers are the fallback for both. The shipped slice above (`ObjectStoreParquetTable`) is
 Parquet, so it uses the manifest.
 
+*Corrected 2026-11-25:* the amendment above states the target, not the code. Plan-time
+statistics from manifests are **not built**. `ObjectStoreParquetTable::statistics()`
+(`src/datafusion/engine_adapters/object_store_parquet_reader.rs`) still derives whole-table
+statistics from Parquet footers. On lazily opened, manifest-managed tables (TD-SPINE-4 Fix 4) it
+returns `None` until every footer has been resolved, so a planner can see no table statistics for
+a table whose filters prune files. The manifest's per-file `ColumnFileStats` are used for file
+pruning only. The work is owned by link:../../10-quality/td/TD-SPINE-4-manifest-stats-pruning-and-cache.adoc[TD-SPINE-4]:
+its follow-up F1 covers the route-shape stat from manifest per-file counts, and whole-table
+statistics from manifest bounds have no acceptance bullet there yet. The PAX side has no
+plan-time statistics from directory entries either. See ADR-098 "Completion ledger (2026-11-25)"
+G6.
+
 === D3 — Treat statistics as freshness-bounded hints (ADR-038)
 
 Each `SegmentStatistics` block carries its own freshness watermark; the envelope floor is

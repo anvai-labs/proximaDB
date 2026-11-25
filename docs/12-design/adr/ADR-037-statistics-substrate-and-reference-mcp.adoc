@@ -53,7 +53,9 @@ The sketches are **mergeable**, so compaction merges segment-level sketches into
 
 This is the ADR-030 co-design pattern applied to the **write** boundary: instrument the flush/compaction pass once; **zone-map pruning, KSU storage accrual, and the statistics envelope all read the same written segment.** One pass, three readers.
 
-*Amended 2026-11-19 (link:ADR-098-metadata-spine.adoc[ADR-098]):* Mechanism: ADR-042 (per-segment `SegmentStatistics`, aggregated from L1 directory entries per ADR-098 D2). This ADR owns the principle and the D2 wire envelope.
+*Amended 2026-11-19 (link:ADR-098-metadata-spine.adoc[ADR-098]):* Mechanism: ADR-042 (per-segment statistics aggregated from L1 directory entries per ADR-098 D2). This ADR owns the principle and the D2 wire envelope.
+
+*Corrected 2026-11-25:* the 2026-11-19 amendment named a per-segment `SegmentStatistics` type, and no such canonical type exists. What directory entries carry today is the segment's `BlockPruneStatsTable` (per-block bounds, null counts, capped distinct sets and blooms; `crates/storage/proximadb-storage-common/src/block_prune_stats.rs`, copied into the PXCD v3 decode key). The SST search route consumes it for segment and block pruning. The private `SegmentStatistics` in `src/query/execution/layer_a/prune.rs` is an unrelated Parquet row-group pruning adapter. The mergeable sketches this ADR describes are not carried in directory entries.
 
 == Decision 2 — The statistics envelope is the boundary object: versioned, modality-neutral, units-only
 
