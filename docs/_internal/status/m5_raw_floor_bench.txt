@@ -1,0 +1,97 @@
+// Raw stdout of the M5 object-store latency-floor bench runs (2026-11-24).
+// Legs: DIRECT (200 iterations), toxiproxy +50/+100/+150 ms (50 iterations).
+// Committed verbatim (no ANSI present); the artifact table transcribes these p50s.
+//Source: /tmp/m5-bench/floor-bench.log
+
+=== DIRECT (no proxy) ===
+================================================================================
+   ProximaDB — Object-Store Round-Trip Latency Floor (T3.2)
+================================================================================
+
+Configuration:
+  store_url:  s3://proximadb-m5/rtt-floor
+  iterations: 200 per (op × size)
+  sizes:      4KiB, 64KiB, 1MiB bytes
+
+Results (per-operation latency, 200 iterations each):
+
+  op               size     p50 (ms)     p95 (ms)     p99 (ms)    mean (ms)
+  ------------------------------------------------------------------------
+  GET              4KiB        5.035       20.021       26.715        7.730
+  GET range        4KiB       12.924       24.509       36.859       13.367
+  GET             64KiB       12.703       53.818       72.198       19.107
+  GET range       64KiB        1.122        2.330        3.341        1.275
+  GET              1MiB       65.587      291.026      331.420      108.593
+  GET range        1MiB       17.474       36.780       48.638       18.910
+  LIST                -        8.615       38.343       68.689       13.170
+
+EXIT_DIRECT=0
+=== RTT=50ms ===
+================================================================================
+   ProximaDB — Object-Store Round-Trip Latency Floor (T3.2)
+================================================================================
+
+Configuration:
+  store_url:  s3://proximadb-m5/rtt-floor
+  iterations: 50 per (op × size)
+  sizes:      4KiB, 64KiB, 1MiB bytes
+
+Results (per-operation latency, 50 iterations each):
+
+  op               size     p50 (ms)     p95 (ms)     p99 (ms)    mean (ms)
+  ------------------------------------------------------------------------
+  GET              4KiB       60.190      115.798      128.839       73.377
+  GET range        4KiB       55.303       95.025      103.672       64.264
+  GET             64KiB       65.462      120.247      144.577       75.025
+  GET range       64KiB       80.822      108.919      129.073       83.056
+  GET              1MiB      253.154      352.794      433.638      256.477
+  GET range        1MiB       81.402      105.914      116.465       83.033
+  LIST                -       79.379       93.989      100.423       79.665
+
+EXIT_RTT50=0
+=== RTT=100ms ===
+================================================================================
+   ProximaDB — Object-Store Round-Trip Latency Floor (T3.2)
+================================================================================
+
+Configuration:
+  store_url:  s3://proximadb-m5/rtt-floor
+  iterations: 50 per (op × size)
+  sizes:      4KiB, 64KiB, 1MiB bytes
+
+Results (per-operation latency, 50 iterations each):
+
+  op               size     p50 (ms)     p95 (ms)     p99 (ms)    mean (ms)
+  ------------------------------------------------------------------------
+  GET              4KiB      130.407      163.134      173.665      131.636
+  GET range        4KiB      128.208      146.758      159.299      126.651
+  GET             64KiB      149.742      184.742      187.573      150.825
+  GET range       64KiB      131.874      152.651      161.130      131.043
+  GET              1MiB      284.993      524.306      603.858      288.536
+  GET range        1MiB      129.278      151.394      165.642      129.299
+  LIST                -      104.899      141.138      155.968      114.332
+
+EXIT_RTT100=0
+=== RTT=150ms ===
+================================================================================
+   ProximaDB — Object-Store Round-Trip Latency Floor (T3.2)
+================================================================================
+
+Configuration:
+  store_url:  s3://proximadb-m5/rtt-floor
+  iterations: 50 per (op × size)
+  sizes:      4KiB, 64KiB, 1MiB bytes
+
+Results (per-operation latency, 50 iterations each):
+
+  op               size     p50 (ms)     p95 (ms)     p99 (ms)    mean (ms)
+  ------------------------------------------------------------------------
+  GET              4KiB      153.490      154.966      157.872      153.702
+  GET range        4KiB      153.574      155.711      160.119      153.806
+  GET             64KiB      154.111      155.551      157.274      154.239
+  GET range       64KiB      153.862      155.268      158.339      153.985
+  GET              1MiB      162.712      171.237      177.902      163.492
+  GET range        1MiB      154.295      155.932      156.333      154.394
+  LIST                -      153.890      156.478      158.400      154.202
+
+EXIT_RTT150=0

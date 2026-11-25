@@ -1,0 +1,231 @@
+// Raw inputs behind the M5 RTT-ladder table + the resolved NOT-a-hang incident (2026-11-24).
+// (1) the first RTT50 attempt's server log: boot, SIGTERM, every 'V2 API: Search ... completed'
+//     line, the one timeout+retry pair, and the derived timeline;
+// (2) each completed arm's bench phase lines.
+// ANSI stripped; timestamps verbatim.
+//Source: /tmp/m5-bench/sift1m-minio-rtt50{b,c}/…, sift1m-minio-rtt{100,150}/…
+
+== RTT50 first attempt (killed; complete server log: 997 lines)
+2026-11-24T23:02:42.954014Z  INFO 🚀 ProximaDB Server v0.7.0 starting
+2026-11-24T23:03:52.481056Z  INFO V2 API: Search request 5e53cf17-dd0c-4c1f-a322-99d8b1fe370c for collection '1', top_k=100
+2026-11-24T23:03:52.481622Z  INFO 🔍 SST: Starting unified search
+2026-11-24T23:03:52.481631Z  INFO 🚀 SST: Starting unified search for collection 1 with 128 dimensions
+2026-11-24T23:03:57.247150Z  INFO V2 API: Search 5e53cf17-dd0c-4c1f-a322-99d8b1fe370c completed in 4766ms, 100 results
+2026-11-24T23:03:57.252348Z  INFO V2 API: Search request cc4ad601-8aa8-495d-8c8b-ce7a297cf11d for collection '1', top_k=100
+2026-11-24T23:03:57.252508Z  INFO 🔍 SST: Starting unified search
+2026-11-24T23:03:57.252516Z  INFO 🚀 SST: Starting unified search for collection 1 with 128 dimensions
+2026-11-24T23:04:17.060470Z  INFO V2 API: Search cc4ad601-8aa8-495d-8c8b-ce7a297cf11d completed in 19807ms, 100 results
+2026-11-24T23:04:17.063121Z  INFO V2 API: Search request fdfd10a9-7fd9-48ce-bee3-4ef98ded666b for collection '1', top_k=100
+2026-11-24T23:04:17.063339Z  INFO 🔍 SST: Starting unified search
+2026-11-24T23:04:17.063357Z  INFO 🚀 SST: Starting unified search for collection 1 with 128 dimensions
+2026-11-24T23:04:47.067379Z  INFO Encountered error while reading response body: HTTP error: request or response body error. Retrying in 0.1s
+2026-11-24T23:04:55.080270Z  INFO V2 API: Search fdfd10a9-7fd9-48ce-bee3-4ef98ded666b completed in 38016ms, 100 results
+2026-11-24T23:04:55.081649Z  INFO V2 API: Search request c43fc5ae-699b-49f2-8dbf-ec73f0c64edb for collection '1', top_k=100
+2026-11-24T23:04:55.081770Z  INFO 🔍 SST: Starting unified search
+2026-11-24T23:04:55.081780Z  INFO 🚀 SST: Starting unified search for collection 1 with 128 dimensions
+2026-11-24T23:05:00.035622Z  INFO V2 API: Search c43fc5ae-699b-49f2-8dbf-ec73f0c64edb completed in 4953ms, 100 results
+2026-11-24T23:05:00.037320Z  INFO V2 API: Search request b47e9763-c953-4b59-8921-cf98b38fc6eb for collection '1', top_k=100
+2026-11-24T23:05:00.037534Z  INFO 🔍 SST: Starting unified search
+2026-11-24T23:05:00.037542Z  INFO 🚀 SST: Starting unified search for collection 1 with 128 dimensions
+2026-11-24T23:05:04.150494Z  INFO V2 API: Search b47e9763-c953-4b59-8921-cf98b38fc6eb completed in 4113ms, 100 results
+2026-11-24T23:05:04.151682Z  INFO V2 API: Search request 6a83590e-765c-412b-a48d-dfc790b5f84a for collection '1', top_k=100
+2026-11-24T23:05:04.151896Z  INFO 🔍 SST: Starting unified search
+2026-11-24T23:05:04.151912Z  INFO 🚀 SST: Starting unified search for collection 1 with 128 dimensions
+2026-11-24T23:05:09.680163Z  INFO V2 API: Search 6a83590e-765c-412b-a48d-dfc790b5f84a completed in 5528ms, 100 results
+2026-11-24T23:05:09.688423Z  INFO V2 API: Search request 914f1056-df87-46c7-936d-040725566c5f for collection '1', top_k=100
+2026-11-24T23:05:09.688541Z  INFO 🔍 SST: Starting unified search
+2026-11-24T23:05:09.688548Z  INFO 🚀 SST: Starting unified search for collection 1 with 128 dimensions
+2026-11-24T23:05:11.937191Z  INFO V2 API: Search 914f1056-df87-46c7-936d-040725566c5f completed in 2248ms, 100 results
+2026-11-24T23:05:11.938346Z  INFO V2 API: Search request 618020a2-0371-4b55-a894-099825ca3ddc for collection '1', top_k=100
+2026-11-24T23:05:11.938446Z  INFO 🔍 SST: Starting unified search
+2026-11-24T23:05:11.938455Z  INFO 🚀 SST: Starting unified search for collection 1 with 128 dimensions
+2026-11-24T23:05:13.611089Z  INFO V2 API: Search 618020a2-0371-4b55-a894-099825ca3ddc completed in 1672ms, 100 results
+2026-11-24T23:05:13.612171Z  INFO V2 API: Search request 7d79d058-7698-4b3b-bacb-37c167d00e92 for collection '1', top_k=100
+2026-11-24T23:05:13.612277Z  INFO 🔍 SST: Starting unified search
+2026-11-24T23:05:13.612287Z  INFO 🚀 SST: Starting unified search for collection 1 with 128 dimensions
+2026-11-24T23:05:17.086962Z  INFO V2 API: Search 7d79d058-7698-4b3b-bacb-37c167d00e92 completed in 3474ms, 100 results
+2026-11-24T23:05:17.088011Z  INFO V2 API: Search request 1cfbf4ed-e1b7-4aa8-86e4-bf6d64d63ee6 for collection '1', top_k=100
+2026-11-24T23:05:17.088109Z  INFO 🔍 SST: Starting unified search
+2026-11-24T23:05:17.088120Z  INFO 🚀 SST: Starting unified search for collection 1 with 128 dimensions
+2026-11-24T23:05:18.646630Z  INFO V2 API: Search 1cfbf4ed-e1b7-4aa8-86e4-bf6d64d63ee6 completed in 1558ms, 100 results
+2026-11-24T23:05:18.648012Z  INFO V2 API: Search request f9bbb861-bd25-45e3-a09b-1ba299700dc7 for collection '1', top_k=100
+2026-11-24T23:05:18.648134Z  INFO 🔍 SST: Starting unified search
+2026-11-24T23:05:18.648144Z  INFO 🚀 SST: Starting unified search for collection 1 with 128 dimensions
+2026-11-24T23:05:21.371034Z  INFO V2 API: Search f9bbb861-bd25-45e3-a09b-1ba299700dc7 completed in 2722ms, 100 results
+2026-11-24T23:05:21.386034Z  INFO V2 API: Search request 584325ab-883f-44dd-8d6a-7b0a899ec103 for collection '1', top_k=100
+2026-11-24T23:05:21.386152Z  INFO 🔍 SST: Starting unified search
+2026-11-24T23:05:21.386160Z  INFO 🚀 SST: Starting unified search for collection 1 with 128 dimensions
+2026-11-24T23:05:23.087673Z  INFO V2 API: Search 584325ab-883f-44dd-8d6a-7b0a899ec103 completed in 1701ms, 100 results
+2026-11-24T23:05:23.088779Z  INFO V2 API: Search request 96bced9d-a428-4839-98f5-035d754aefe9 for collection '1', top_k=100
+2026-11-24T23:05:23.088893Z  INFO 🔍 SST: Starting unified search
+2026-11-24T23:05:23.088901Z  INFO 🚀 SST: Starting unified search for collection 1 with 128 dimensions
+2026-11-24T23:05:25.172919Z  INFO V2 API: Search 96bced9d-a428-4839-98f5-035d754aefe9 completed in 2084ms, 100 results
+2026-11-24T23:05:25.173847Z  INFO V2 API: Search request 5fb9f4d6-c380-49f5-9329-4a33d8b02d37 for collection '1', top_k=100
+2026-11-24T23:05:25.173950Z  INFO 🔍 SST: Starting unified search
+2026-11-24T23:05:25.173958Z  INFO 🚀 SST: Starting unified search for collection 1 with 128 dimensions
+2026-11-24T23:05:26.849824Z  INFO V2 API: Search 5fb9f4d6-c380-49f5-9329-4a33d8b02d37 completed in 1675ms, 100 results
+2026-11-24T23:05:26.851022Z  INFO V2 API: Search request cf70c0f5-4b4c-44eb-afae-42eb15ac70b5 for collection '1', top_k=100
+2026-11-24T23:05:26.851111Z  INFO 🔍 SST: Starting unified search
+2026-11-24T23:05:26.851118Z  INFO 🚀 SST: Starting unified search for collection 1 with 128 dimensions
+2026-11-24T23:05:32.087306Z  INFO V2 API: Search cf70c0f5-4b4c-44eb-afae-42eb15ac70b5 completed in 5236ms, 100 results
+2026-11-24T23:05:32.088471Z  INFO V2 API: Search request ca113d3f-8fc5-4df6-819a-62beb50bb97f for collection '1', top_k=100
+2026-11-24T23:05:32.088579Z  INFO 🔍 SST: Starting unified search
+2026-11-24T23:05:32.088586Z  INFO 🚀 SST: Starting unified search for collection 1 with 128 dimensions
+2026-11-24T23:05:33.449064Z  INFO V2 API: Search ca113d3f-8fc5-4df6-819a-62beb50bb97f completed in 1360ms, 100 results
+2026-11-24T23:05:33.450238Z  INFO V2 API: Search request 8762f985-30c5-4844-8f8e-fc5261b6fda7 for collection '1', top_k=100
+2026-11-24T23:05:33.450358Z  INFO 🔍 SST: Starting unified search
+2026-11-24T23:05:33.450367Z  INFO 🚀 SST: Starting unified search for collection 1 with 128 dimensions
+2026-11-24T23:05:35.269256Z  INFO V2 API: Search 8762f985-30c5-4844-8f8e-fc5261b6fda7 completed in 1818ms, 100 results
+2026-11-24T23:05:35.270277Z  INFO V2 API: Search request 00ed4c95-68ab-4cfd-9153-512d5ad1d959 for collection '1', top_k=100
+2026-11-24T23:05:35.270382Z  INFO 🔍 SST: Starting unified search
+2026-11-24T23:05:35.270390Z  INFO 🚀 SST: Starting unified search for collection 1 with 128 dimensions
+2026-11-24T23:05:36.286516Z  INFO V2 API: Search 00ed4c95-68ab-4cfd-9153-512d5ad1d959 completed in 1016ms, 100 results
+2026-11-24T23:05:36.287541Z  INFO V2 API: Search request e469f40d-1c5c-4f07-a209-ab28784e9f53 for collection '1', top_k=100
+2026-11-24T23:05:36.287633Z  INFO 🔍 SST: Starting unified search
+2026-11-24T23:05:36.287641Z  INFO 🚀 SST: Starting unified search for collection 1 with 128 dimensions
+2026-11-24T23:05:38.040227Z  INFO V2 API: Search e469f40d-1c5c-4f07-a209-ab28784e9f53 completed in 1752ms, 100 results
+2026-11-24T23:05:38.045925Z  INFO V2 API: Search request 731d1613-1c65-4a3d-8ac0-50c4bc04de0d for collection '1', top_k=100
+2026-11-24T23:05:38.046057Z  INFO 🔍 SST: Starting unified search
+2026-11-24T23:05:38.046067Z  INFO 🚀 SST: Starting unified search for collection 1 with 128 dimensions
+2026-11-24T23:05:43.988619Z  INFO V2 API: Search 731d1613-1c65-4a3d-8ac0-50c4bc04de0d completed in 5942ms, 100 results
+2026-11-24T23:05:43.990356Z  INFO V2 API: Search request a6b3b1e1-3fb2-49be-b993-0273755a36fc for collection '1', top_k=100
+2026-11-24T23:05:43.990480Z  INFO 🔍 SST: Starting unified search
+2026-11-24T23:05:43.990493Z  INFO 🚀 SST: Starting unified search for collection 1 with 128 dimensions
+2026-11-24T23:05:46.579338Z  INFO V2 API: Search a6b3b1e1-3fb2-49be-b993-0273755a36fc completed in 2588ms, 100 results
+2026-11-24T23:05:46.590352Z  INFO V2 API: Search request ca1fc790-f830-44af-84a1-1df7452761c7 for collection '1', top_k=100
+2026-11-24T23:05:46.590629Z  INFO 🔍 SST: Starting unified search
+2026-11-24T23:05:46.590648Z  INFO 🚀 SST: Starting unified search for collection 1 with 128 dimensions
+2026-11-24T23:06:00.277642Z  INFO V2 API: Search ca1fc790-f830-44af-84a1-1df7452761c7 completed in 13687ms, 100 results
+2026-11-24T23:06:00.279483Z  INFO V2 API: Search request 7199197e-57c9-4d74-9462-1c4454dd16da for collection '1', top_k=100
+2026-11-24T23:06:00.280024Z  INFO 🔍 SST: Starting unified search
+2026-11-24T23:06:00.280043Z  INFO 🚀 SST: Starting unified search for collection 1 with 128 dimensions
+2026-11-24T23:06:15.093923Z  INFO V2 API: Search 7199197e-57c9-4d74-9462-1c4454dd16da completed in 14814ms, 100 results
+2026-11-24T23:06:15.095643Z  INFO V2 API: Search request 38de5780-e2e7-4ddc-a5f6-7d956b606957 for collection '1', top_k=100
+2026-11-24T23:06:15.095739Z  INFO 🔍 SST: Starting unified search
+2026-11-24T23:06:15.095748Z  INFO 🚀 SST: Starting unified search for collection 1 with 128 dimensions
+2026-11-24T23:06:31.682957Z  INFO V2 API: Search 38de5780-e2e7-4ddc-a5f6-7d956b606957 completed in 16587ms, 100 results
+2026-11-24T23:06:31.686208Z  INFO V2 API: Search request bfc6bd34-c2f7-4ec3-9d3c-e9618d42a032 for collection '1', top_k=100
+2026-11-24T23:06:31.686427Z  INFO 🔍 SST: Starting unified search
+2026-11-24T23:06:31.686444Z  INFO 🚀 SST: Starting unified search for collection 1 with 128 dimensions
+2026-11-24T23:06:40.779788Z  INFO V2 API: Search bfc6bd34-c2f7-4ec3-9d3c-e9618d42a032 completed in 9093ms, 100 results
+2026-11-24T23:06:40.785037Z  INFO V2 API: Search request 5a916c0f-79d0-4f51-9764-e2cee8045aee for collection '1', top_k=100
+2026-11-24T23:06:40.785188Z  INFO 🔍 SST: Starting unified search
+2026-11-24T23:06:40.785197Z  INFO 🚀 SST: Starting unified search for collection 1 with 128 dimensions
+2026-11-24T23:06:48.401515Z  INFO V2 API: Search 5a916c0f-79d0-4f51-9764-e2cee8045aee completed in 7616ms, 100 results
+2026-11-24T23:06:48.403113Z  INFO V2 API: Search request 8d5b22fe-8f36-47a2-917d-e3f2a03a73f4 for collection '1', top_k=100
+2026-11-24T23:06:48.403232Z  INFO 🔍 SST: Starting unified search
+2026-11-24T23:06:48.403240Z  INFO 🚀 SST: Starting unified search for collection 1 with 128 dimensions
+2026-11-24T23:06:50.343628Z  INFO V2 API: Search 8d5b22fe-8f36-47a2-917d-e3f2a03a73f4 completed in 1940ms, 100 results
+2026-11-24T23:06:50.344956Z  INFO V2 API: Search request 529e076e-e8c0-470f-a452-633d5b834a90 for collection '1', top_k=100
+2026-11-24T23:06:50.345073Z  INFO 🔍 SST: Starting unified search
+2026-11-24T23:06:50.345084Z  INFO 🚀 SST: Starting unified search for collection 1 with 128 dimensions
+2026-11-24T23:06:51.244912Z  INFO V2 API: Search 529e076e-e8c0-470f-a452-633d5b834a90 completed in 899ms, 100 results
+2026-11-24T23:06:51.246033Z  INFO V2 API: Search request 14cb0747-04e3-4f1b-ae33-abd05e15ef2d for collection '1', top_k=100
+2026-11-24T23:06:51.246140Z  INFO 🔍 SST: Starting unified search
+2026-11-24T23:06:51.246148Z  INFO 🚀 SST: Starting unified search for collection 1 with 128 dimensions
+2026-11-24T23:07:04.431523Z  INFO V2 API: Search 14cb0747-04e3-4f1b-ae33-abd05e15ef2d completed in 13185ms, 100 results
+2026-11-24T23:07:04.433093Z  INFO V2 API: Search request 3d70abf0-2c59-452d-9430-47b93df5968e for collection '1', top_k=100
+2026-11-24T23:07:04.433206Z  INFO 🔍 SST: Starting unified search
+2026-11-24T23:07:04.433216Z  INFO 🚀 SST: Starting unified search for collection 1 with 128 dimensions
+2026-11-24T23:07:12.005630Z  INFO V2 API: Search 3d70abf0-2c59-452d-9430-47b93df5968e completed in 7572ms, 100 results
+2026-11-24T23:07:12.007957Z  INFO V2 API: Search request 0b1ba55c-ea10-4bb3-9402-5f14b617e5fa for collection '1', top_k=100
+2026-11-24T23:07:12.008054Z  INFO 🔍 SST: Starting unified search
+2026-11-24T23:07:12.008064Z  INFO 🚀 SST: Starting unified search for collection 1 with 128 dimensions
+2026-11-24T23:07:19.927271Z  INFO V2 API: Search 0b1ba55c-ea10-4bb3-9402-5f14b617e5fa completed in 7919ms, 100 results
+2026-11-24T23:07:19.928791Z  INFO V2 API: Search request 6e3605a7-d019-48d9-b4d1-546815419bd0 for collection '1', top_k=100
+2026-11-24T23:07:19.928882Z  INFO 🔍 SST: Starting unified search
+2026-11-24T23:07:19.928890Z  INFO 🚀 SST: Starting unified search for collection 1 with 128 dimensions
+2026-11-24T23:07:28.494734Z  INFO V2 API: Search 6e3605a7-d019-48d9-b4d1-546815419bd0 completed in 8565ms, 100 results
+2026-11-24T23:07:28.496493Z  INFO V2 API: Search request aa939470-5e7a-4de5-9a3f-70ef33445da8 for collection '1', top_k=100
+2026-11-24T23:07:28.496596Z  INFO 🔍 SST: Starting unified search
+2026-11-24T23:07:28.496605Z  INFO 🚀 SST: Starting unified search for collection 1 with 128 dimensions
+2026-11-24T23:07:36.021178Z  INFO V2 API: Search aa939470-5e7a-4de5-9a3f-70ef33445da8 completed in 7524ms, 100 results
+2026-11-24T23:07:36.023204Z  INFO V2 API: Search request 45b0dd72-e2d8-4f7a-93a6-08f5d0e26020 for collection '1', top_k=100
+2026-11-24T23:07:36.023595Z  INFO 🔍 SST: Starting unified search
+2026-11-24T23:07:36.023630Z  INFO 🚀 SST: Starting unified search for collection 1 with 128 dimensions
+2026-11-24T23:07:49.380468Z  INFO V2 API: Search 45b0dd72-e2d8-4f7a-93a6-08f5d0e26020 completed in 13357ms, 100 results
+2026-11-24T23:07:49.382422Z  INFO V2 API: Search request 63908cd2-78a6-4d63-b584-a682a48a0509 for collection '1', top_k=100
+2026-11-24T23:07:49.382536Z  INFO 🔍 SST: Starting unified search
+2026-11-24T23:07:49.382544Z  INFO 🚀 SST: Starting unified search for collection 1 with 128 dimensions
+2026-11-24T23:08:03.012343Z  INFO V2 API: Search 63908cd2-78a6-4d63-b584-a682a48a0509 completed in 13629ms, 100 results
+2026-11-24T23:08:03.015924Z  INFO V2 API: Search request 0c4bc872-0ad1-4dee-a007-4e86d2648031 for collection '1', top_k=100
+2026-11-24T23:08:03.016057Z  INFO 🔍 SST: Starting unified search
+2026-11-24T23:08:03.016078Z  INFO 🚀 SST: Starting unified search for collection 1 with 128 dimensions
+2026-11-24T23:08:23.641488Z  INFO V2 API: Search 0c4bc872-0ad1-4dee-a007-4e86d2648031 completed in 20625ms, 100 results
+2026-11-24T23:08:23.643252Z  INFO V2 API: Search request 249c33f1-8997-4257-99b3-2222aebd5783 for collection '1', top_k=100
+2026-11-24T23:08:23.643477Z  INFO 🔍 SST: Starting unified search
+2026-11-24T23:08:23.643487Z  INFO 🚀 SST: Starting unified search for collection 1 with 128 dimensions
+2026-11-24T23:08:34.549850Z  INFO V2 API: Search 249c33f1-8997-4257-99b3-2222aebd5783 completed in 10906ms, 100 results
+2026-11-24T23:08:34.551086Z  INFO V2 API: Search request 4e273bca-bb9a-4650-83f8-89fc3dac30cf for collection '1', top_k=100
+2026-11-24T23:08:34.551243Z  INFO 🔍 SST: Starting unified search
+2026-11-24T23:08:34.551251Z  INFO 🚀 SST: Starting unified search for collection 1 with 128 dimensions
+2026-11-24T23:08:46.175167Z  INFO V2 API: Search 4e273bca-bb9a-4650-83f8-89fc3dac30cf completed in 11625ms, 100 results
+2026-11-24T23:08:46.177291Z  INFO V2 API: Search request 0c4a6c97-7af0-40dd-8ff0-67181d252fc6 for collection '1', top_k=100
+2026-11-24T23:08:46.177503Z  INFO 🔍 SST: Starting unified search
+2026-11-24T23:08:46.177521Z  INFO 🚀 SST: Starting unified search for collection 1 with 128 dimensions
+2026-11-24T23:08:53.407498Z  INFO V2 API: Search 0c4a6c97-7af0-40dd-8ff0-67181d252fc6 completed in 7230ms, 100 results
+2026-11-24T23:08:53.409128Z  INFO V2 API: Search request a73f385e-391b-4f7c-8732-8daf5a886975 for collection '1', top_k=100
+2026-11-24T23:08:53.409826Z  INFO 🔍 SST: Starting unified search
+2026-11-24T23:08:53.409835Z  INFO 🚀 SST: Starting unified search for collection 1 with 128 dimensions
+2026-11-24T23:08:59.676543Z  INFO V2 API: Search a73f385e-391b-4f7c-8732-8daf5a886975 completed in 6267ms, 100 results
+2026-11-24T23:08:59.678720Z  INFO V2 API: Search request 378be3dd-835c-44a8-8ccf-ffe7ff64ebe6 for collection '1', top_k=100
+2026-11-24T23:08:59.679476Z  INFO 🔍 SST: Starting unified search
+2026-11-24T23:08:59.679485Z  INFO 🚀 SST: Starting unified search for collection 1 with 128 dimensions
+2026-11-24T23:09:14.496510Z  INFO V2 API: Search 378be3dd-835c-44a8-8ccf-ffe7ff64ebe6 completed in 14818ms, 100 results
+2026-11-24T23:09:14.498484Z  INFO V2 API: Search request 3c5a08a9-a7f2-4de7-9bf7-48e11d685e2e for collection '1', top_k=100
+2026-11-24T23:09:14.498701Z  INFO 🔍 SST: Starting unified search
+2026-11-24T23:09:14.498718Z  INFO 🚀 SST: Starting unified search for collection 1 with 128 dimensions
+2026-11-24T23:09:23.089331Z  INFO V2 API: Search 3c5a08a9-a7f2-4de7-9bf7-48e11d685e2e completed in 8590ms, 100 results
+2026-11-24T23:09:23.103715Z  INFO V2 API: Search request ee581f52-35ca-4c33-ab9e-20be091c9c27 for collection '1', top_k=100
+2026-11-24T23:09:23.103854Z  INFO 🔍 SST: Starting unified search
+2026-11-24T23:09:23.103863Z  INFO 🚀 SST: Starting unified search for collection 1 with 128 dimensions
+2026-11-24T23:09:40.046869Z  INFO V2 API: Search ee581f52-35ca-4c33-ab9e-20be091c9c27 completed in 16943ms, 100 results
+2026-11-24T23:09:40.048006Z  INFO V2 API: Search request 4fe36949-9c72-4356-9acf-03740b7ba5e0 for collection '1', top_k=100
+2026-11-24T23:09:40.048107Z  INFO 🔍 SST: Starting unified search
+2026-11-24T23:09:40.048114Z  INFO 🚀 SST: Starting unified search for collection 1 with 128 dimensions
+2026-11-24T23:09:52.861634Z  INFO V2 API: Search 4fe36949-9c72-4356-9acf-03740b7ba5e0 completed in 12813ms, 100 results
+2026-11-24T23:09:52.863892Z  INFO V2 API: Search request 501f4bbf-f29b-4d78-9932-722005e3ee79 for collection '1', top_k=100
+2026-11-24T23:09:52.864014Z  INFO 🔍 SST: Starting unified search
+2026-11-24T23:09:52.864022Z  INFO 🚀 SST: Starting unified search for collection 1 with 128 dimensions
+2026-11-24T23:10:03.032096Z  INFO V2 API: Search 501f4bbf-f29b-4d78-9932-722005e3ee79 completed in 10168ms, 100 results
+2026-11-24T23:10:03.034212Z  INFO V2 API: Search request 826821dd-d276-442f-9a50-f2cb7769e5e5 for collection '1', top_k=100
+2026-11-24T23:10:03.034308Z  INFO 🔍 SST: Starting unified search
+2026-11-24T23:10:03.034315Z  INFO 🚀 SST: Starting unified search for collection 1 with 128 dimensions
+2026-11-24T23:10:09.357014Z  INFO Received SIGTERM, stopping server...
+2026-11-24T23:10:09.357467Z  INFO Graceful shutdown requested
+
+Derived (scripted re-derivation from the log): server lifetime 23:02:42.954Z -> 23:10:09.357Z = 7 min 26 s;
+46 search requests, 45 completed, the 46th 6.3 s in flight at SIGTERM; last completion 6.3 s before SIGTERM;
+largest inter-completion gap 38.0 s; the 'Retrying in 0.1s' line is 30.004 s after that search started and
+the query completed in 38,016 ms with 100 results (retry succeeded).
+
+== RTT50 clean re-run (25q)
+post_write: recall@100=0.9876 GET/q=20.48 req/q=20.56 waves p50=2.0 bytes/q=56.63MB p50=891.35ms p95=1296.36ms c=1 qps=1.07 cells/q=22.00 rows/q=404521 rounds/q=5.84 local_hits=0 regionD/q=20.20MB stageF fetch/decode ms/q=0.0/0.0 $/Mq=8.41
+local_disk_warm: recall@100=0.9904 GET/q=18.12 req/q=18.20 waves p50=2.0 bytes/q=46.47MB p50=749.36ms p95=1068.71ms c=1 qps=1.28 cells/q=22.00 rows/q=402306 rounds/q=5.96 local_hits=94 regionD/q=22.69MB stageF fetch/decode ms/q=0.0/0.0 $/Mq=7.46
+object_cold: recall@100=0.9932 GET/q=18.12 req/q=18.20 waves p50=2.0 bytes/q=50.93MB p50=770.28ms p95=1107.76ms c=1 qps=1.34 cells/q=22.00 rows/q=403819 rounds/q=6.28 local_hits=0 regionD/q=15.53MB stageF fetch/decode ms/q=0.0/0.0 $/Mq=7.46
+EXIT=0
+
+== RTT50 contended 25q (excluded from comparisons)
+post_write: recall@100=0.9872 GET/q=20.48 req/q=20.64 waves p50=2.0 bytes/q=56.63MB p50=2486.81ms p95=6894.75ms c=1 qps=0.31 cells/q=22.00 rows/q=404521 rounds/q=5.84 local_hits=0 regionD/q=20.20MB stageF fetch/decode ms/q=0.0/0.0 $/Mq=8.81
+local_disk_warm: recall@100=0.9904 GET/q=18.12 req/q=18.32 waves p50=2.0 bytes/q=46.47MB p50=3714.98ms p95=10562.58ms c=1 qps=0.23 cells/q=22.00 rows/q=402306 rounds/q=5.96 local_hits=94 regionD/q=22.69MB stageF fetch/decode ms/q=0.0/0.0 $/Mq=8.06
+object_cold: recall@100=0.9932 GET/q=18.12 req/q=18.28 waves p50=2.0 bytes/q=50.93MB p50=2234.43ms p95=11304.76ms c=1 qps=0.29 cells/q=22.00 rows/q=403819 rounds/q=6.28 local_hits=0 regionD/q=15.53MB stageF fetch/decode ms/q=0.0/0.0 $/Mq=7.86
+EXIT=0
+
+== RTT100 contended 25q
+post_write: recall@100=0.9872 GET/q=20.48 req/q=20.56 waves p50=2.0 bytes/q=56.63MB p50=1027.51ms p95=1802.92ms c=1 qps=0.89 cells/q=22.00 rows/q=404521 rounds/q=5.84 local_hits=0 regionD/q=20.20MB stageF fetch/decode ms/q=0.0/0.0 $/Mq=8.41
+local_disk_warm: recall@100=0.9904 GET/q=18.12 req/q=18.20 waves p50=2.0 bytes/q=46.47MB p50=990.63ms p95=1352.75ms c=1 qps=1.00 cells/q=22.00 rows/q=402306 rounds/q=5.96 local_hits=94 regionD/q=22.69MB stageF fetch/decode ms/q=0.0/0.0 $/Mq=7.46
+object_cold: recall@100=0.9932 GET/q=18.12 req/q=18.20 waves p50=2.0 bytes/q=50.93MB p50=881.76ms p95=1246.91ms c=1 qps=1.15 cells/q=22.00 rows/q=403819 rounds/q=6.28 local_hits=0 regionD/q=15.53MB stageF fetch/decode ms/q=0.0/0.0 $/Mq=7.46
+EXIT=0
+
+== RTT150 contended 25q
+post_write: recall@100=0.9876 GET/q=20.48 req/q=20.60 waves p50=2.0 bytes/q=56.63MB p50=1273.02ms p95=4649.75ms c=1 qps=0.53 cells/q=22.00 rows/q=404521 rounds/q=5.84 local_hits=0 regionD/q=20.20MB stageF fetch/decode ms/q=0.0/0.0 $/Mq=8.61
+local_disk_warm: recall@100=0.9904 GET/q=18.12 req/q=18.24 waves p50=2.0 bytes/q=46.47MB p50=2020.81ms p95=5203.61ms c=1 qps=0.44 cells/q=22.00 rows/q=402306 rounds/q=5.96 local_hits=94 regionD/q=22.69MB stageF fetch/decode ms/q=0.0/0.0 $/Mq=7.66
+object_cold: recall@100=0.9932 GET/q=18.12 req/q=18.24 waves p50=2.0 bytes/q=50.93MB p50=1032.77ms p95=3858.26ms c=1 qps=0.74 cells/q=22.00 rows/q=403819 rounds/q=6.28 local_hits=0 regionD/q=15.53MB stageF fetch/decode ms/q=0.0/0.0 $/Mq=7.66
+EXIT=0
+
+== direct leg-1 (100q)
+post_write: recall@100=0.9907 GET/q=9.33 req/q=9.35 waves p50=1.0 bytes/q=18.88MB p50=214.84ms p95=318.54ms c=1 qps=4.69 cells/q=22.00 rows/q=403476 rounds/q=6.12 local_hits=0 regionD/q=18.88MB stageF fetch/decode ms/q=0.0/0.0 $/Mq=3.79
+local_disk_warm: recall@100=0.9897 GET/q=9.67 req/q=9.69 waves p50=1.0 bytes/q=19.91MB p50=238.40ms p95=339.54ms c=1 qps=4.30 cells/q=22.00 rows/q=406821 rounds/q=5.97 local_hits=1394 regionD/q=19.91MB stageF fetch/decode ms/q=0.0/0.0 $/Mq=3.92
+object_cold: recall@100=0.9881 GET/q=18.64 req/q=18.69 waves p50=2.0 bytes/q=51.20MB p50=833.33ms p95=1975.56ms c=1 qps=1.05 cells/q=22.00 rows/q=403600 rounds/q=5.89 local_hits=0 regionD/q=22.51MB stageF fetch/decode ms/q=0.0/0.0 $/Mq=7.66
+EXIT=0
+
