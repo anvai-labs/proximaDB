@@ -117,21 +117,67 @@ pub(crate) fn join_storage_url(base: &str, sub: &str) -> String {
 /// stays a local path — the configuration cloud deployments and the cloud-trace
 /// evidence ledger need, and until now impossible to express: the URL was
 /// formatted from a `PathBuf` at three independent call sites. The override is
-/// taken verbatim (scheme included); an unparsable/failed open still degrades
+/// taken verbatim (scheme included); a value without a `://` scheme separator
+/// is REJECTED with an error naming the variable and the default applies
+/// (the `PROXIMADB_WAL_DURABILITY_MODE` invalid-value posture — logged, never
+/// a boot break); an override whose store then fails to open still degrades
 /// the same way it always did — `with_materializer` / the Iceberg REST wiring
 /// warn and leave MATERIALIZE unwired rather than break the server.
-pub(crate) fn warehouse_root_url(data_dir: &std::path::Path) -> String {
-    match std::env::var("PROXIMADB_WAREHOUSE_ROOT_URL") {
-        Ok(url) if !url.trim().is_empty() => {
-            tracing::info!(
-                "warehouse root overridden by PROXIMADB_WAREHOUSE_ROOT_URL: {url} \
-                 (default file://{}/warehouse)",
-                data_dir.display()
-            );
-            url
+///
+/// [`resolve_warehouse_root`] is the single resolution BOTH consumers use
+/// (the network call sites via [`warehouse_root_url`], and the bin crate's
+/// `durable_locations` boot record via its injected env) so the served root
+/// and the recorded root cannot diverge into two independent env reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedWarehouseRoot {
+    /// The effective root URL: the override verbatim, or the data-dir default.
+    pub url: String,
+    /// True when an explicit, accepted `PROXIMADB_WAREHOUSE_ROOT_URL`
+    /// produced `url` (a rejected invalid value falls back and reports
+    /// `false` — the location is then the in-lease default).
+    pub from_override: bool,
+}
+
+/// Resolve the warehouse root from an injected env lookup (test seam; the
+/// production callers pass `std::env::var`). See [`warehouse_root_url`].
+pub fn resolve_warehouse_root(
+    data_dir: &std::path::Path,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> ResolvedWarehouseRoot {
+    let default = format!("file://{}/warehouse", data_dir.display());
+    match lookup("PROXIMADB_WAREHOUSE_ROOT_URL") {
+        Some(url) if !url.trim().is_empty() => {
+            if !url.contains("://") {
+                tracing::error!(
+                    "PROXIMADB_WAREHOUSE_ROOT_URL='{url}' has no '<scheme>://' separator — \
+                     the override is rejected and the default {default} applies"
+                );
+                ResolvedWarehouseRoot {
+                    url: default,
+                    from_override: false,
+                }
+            } else {
+                tracing::info!(
+                    "warehouse root overridden by PROXIMADB_WAREHOUSE_ROOT_URL: {url} \
+                     (default {default})"
+                );
+                ResolvedWarehouseRoot {
+                    url,
+                    from_override: true,
+                }
+            }
         }
-        _ => format!("file://{}/warehouse", data_dir.display()),
+        _ => ResolvedWarehouseRoot {
+            url: default,
+            from_override: false,
+        },
     }
+}
+
+/// The effective warehouse root URL for this process (see
+/// [`resolve_warehouse_root`]).
+pub fn warehouse_root_url(data_dir: &std::path::Path) -> String {
+    resolve_warehouse_root(data_dir, |key| std::env::var(key).ok()).url
 }
 
 /// The local-filesystem view of a storage base, for subsystems that cannot yet
@@ -4291,5 +4337,69 @@ mod abac_composition_root_tests {
             SharedServices::build_abac_enforcer(None).is_none(),
             "no opt_config ⇒ no enforcer (status quo)"
         );
+    }
+}
+
+#[cfg(test)]
+mod warehouse_root_tests {
+    use super::{resolve_warehouse_root, warehouse_root_url};
+    use std::path::Path;
+
+    fn lookup<'a>(map: &'a [(&'static str, &'static str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |key| {
+            map.iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, v)| v.to_string())
+        }
+    }
+
+    #[test]
+    fn unset_falls_back_to_the_data_dir_default() {
+        let resolved = resolve_warehouse_root(Path::new("/data"), lookup(&[]));
+        assert_eq!(resolved.url, "file:///data/warehouse");
+        assert!(!resolved.from_override);
+    }
+
+    #[test]
+    fn scheme_bearing_override_is_taken_verbatim() {
+        let resolved = resolve_warehouse_root(
+            Path::new("/data"),
+            lookup(&[("PROXIMADB_WAREHOUSE_ROOT_URL", "s3://bucket/prefix")]),
+        );
+        assert_eq!(resolved.url, "s3://bucket/prefix");
+        assert!(resolved.from_override);
+    }
+
+    #[test]
+    fn schemeless_override_is_rejected_to_the_default() {
+        // L7 (review round 1): a bare path is NOT silently accepted as a
+        // relative file URL — the variable is named in the error and the
+        // in-lease default applies.
+        let resolved = resolve_warehouse_root(
+            Path::new("/data"),
+            lookup(&[("PROXIMADB_WAREHOUSE_ROOT_URL", "mnt/warehouse")]),
+        );
+        assert_eq!(resolved.url, "file:///data/warehouse");
+        assert!(!resolved.from_override);
+    }
+
+    #[test]
+    fn whitespace_only_override_is_ignored() {
+        let resolved = resolve_warehouse_root(
+            Path::new("/data"),
+            lookup(&[("PROXIMADB_WAREHOUSE_ROOT_URL", "   ")]),
+        );
+        assert_eq!(resolved.url, "file:///data/warehouse");
+        assert!(!resolved.from_override);
+    }
+
+    #[test]
+    fn production_entry_point_matches_resolve_with_env() {
+        // The network call sites go through this; it must delegate to the
+        // same ladder (a regression here is a served/recorded divergence).
+        let via_entry = warehouse_root_url(Path::new("/data"));
+        let via_resolve =
+            resolve_warehouse_root(Path::new("/data"), |key| std::env::var(key).ok()).url;
+        assert_eq!(via_entry, via_resolve);
     }
 }

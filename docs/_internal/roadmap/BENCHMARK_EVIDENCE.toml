@@ -659,8 +659,8 @@ notes = "Co-design Pillar C / TD-145. MEASURED (5000x128 f32, 2 warmup + 9 timed
 
 [[claims]]
 id = "object_store_latency_floor"
-claim = "Object-store round-trip latency floor (GET / ranged-GET / LIST) — the dominant I/O cost term for a cloud DB (co-design P5)"
-metric = "object_store_rtt_ms"
+claim = "Object-store per-op round-trip p50 latency (GET / ranged-GET / LIST at 4KiB/64KiB/1MiB), measured on a MinIO S3 EMULATOR endpoint directly and under toxiproxy-injected symmetric RTT (see m5_object_store_latency_floor_minio for the tables; failed ops count as samples). The cloud-DB cost-term framing lives in the notes, deliberately outside this measured claim. Real s3:// latency remains unmeasured."
+metric = "object_store_rtt_ms (p50 only, per op x size x RTT level)"
 status = "measured"
 asserted_in = ["docs/12-design/CODESIGN_DIMENSIONAL_ARCHITECTURE_2026_06_19.adoc"]
 bench_source = "benches/bench_object_store_latency.rs"
@@ -1608,7 +1608,7 @@ notes = "The artifact records ingest costs for both arms. The directory-decode n
 
 [[claims]]
 id = "m5_sift1m_minio_request_counts_at_flush"
-claim = "ADR-098 M5 emulator leg (TD-PAXMETA-1): SIFT1M full bench on a MinIO S3 EMULATOR with the shipped defaults (flush-time directory publish ON, post-#2549), settled 2-segment bed (L1 189,515,531 B + L2 568,273,967 B, 27 coarse cells, ncomp 10, layout v1, directory generations 8/9 at rest; ingest 163 s, 4 explicit flushes): recall@100 0.9907 / 0.9897 / 0.9881 (post-write / local-disk-warm / object-cold), GET/q 9.33 / 9.67 / 18.64, requests/q 9.35 / 9.69 / 18.69, waves p50 1 / 1 / 2, bytes/q 18.9 / 19.9 / 51.2 MB. All phases clear the 0.975 recall floor; exit 0, result.json status pass."
+claim = "ADR-098 M5 emulator leg (TD-PAXMETA-1): SIFT1M full bench on a MinIO S3 EMULATOR with the shipped defaults (flush-time directory publish ON, post-#2549), settled 2-segment bed (L1 189,515,531 B + L2 568,273,967 B, 27 coarse cells, ncomp 10, layout v1, directory generations 8/9 at rest; ingest 163 s, 4 explicit flushes): recall@100 0.9907 / 0.9897 / 0.9881 (post-write / local-disk-warm / object-cold), GET/q 9.33 / 9.67 / 18.64, requests/q 9.35 / 9.69 / 18.69, waves p50 1 / 1 / 2, bytes/q 18.9 / 19.9 / 51.2 MB. All phases clear the 0.975 recall floor; exit 0, result.json status pass — recorded with the bench's latency/GET gates deliberately loosened for the emulator (GET ceilings 5000/5000/500, --max-p50-ms 60000), so pass = recall floor + completion, not the production latency gates."
 metric = "GET/query, requests/query, waves p50, bytes/query, recall@100 per phase"
 status = "measured"
 asserted_in = [
@@ -1619,7 +1619,7 @@ bench_command = "AWS_ACCESS_KEY_ID=… AWS_SECRET_ACCESS_KEY=… python3 scripts
 artifact = "docs/_internal/status/M5_EMULATOR_TRACE_EVIDENCE_2026_11_24.adoc"
 hardware = "Local macOS arm64 (Apple Silicon, 64GB); MinIO S3 EMULATOR (docker minio/minio:latest, container m5-minio) on 127.0.0.1:9000 via Docker Desktop localhost forwarding (~4-7 ms/op steady-state)"
 date = "2026-11-24"
-version = "worktree bench/m5-emulator-trace @ 51a20902f (develop base ea77dea50); binary sha256 f327599a7152… (built inside the seam-edit window; the revision guard passed against the committed tree; the seam is env-gated unset = inert and no SIFT leg touches the warehouse path)"
+version = "worktree bench/m5-emulator-trace @ 51a20902f (develop base ea77dea50); binary sha256 f327599a7152… (built inside the seam-edit window — the harness's guard only verifies a CLEAN TREE at run time, not binary provenance, so the binary may differ from the recorded revision by formatting-only deltas; the seam is env-gated unset = inert and no SIFT leg touches the warehouse path)"
 notes = "STORE = MinIO S3 EMULATOR (localhost docker): request counts are the evidence; latency is emulator-local and NOT claimed (latency gates were permissive, --max-p50-ms 60000, per the rdstrat12/13 MinIO-campaign precedent). real-cloud confirmation deferred pending credentials (owner, 2026-11-25)."
 
 [[claims]]
@@ -1636,7 +1636,7 @@ artifact = "docs/_internal/status/M5_EMULATOR_TRACE_EVIDENCE_2026_11_24.adoc"
 hardware = "Local macOS arm64 (Apple Silicon, 64GB); MinIO S3 EMULATOR (docker, container m5-minio) on 127.0.0.1:9000"
 date = "2026-11-24"
 version = "worktree bench/m5-emulator-trace @ 51a20902f (develop base ea77dea50); ratchet test binary built cargo test --release -p proximadb --features io-trace,aws --test sift_pax_recall_ratchet_test --no-run"
-notes = "STORE = MinIO S3 EMULATOR; latency deliberately not measured (the harness prints 'emulator latency is not evidence'). The ABSOLUTE first-query probe baseline is lower than the recorded 2026-11-20 Azurite CI row (10-11 GETs vs 45-46): later develop read-path changes shifted the shared baseline; both campaigns' OFF->ON contrasts are internally consistent and identical in shape (+2/segment cold metadata, 0 marginal GETs ON). Raw SIFT_GET_COUNTS JSON lines quoted verbatim in the artifact. real-cloud confirmation deferred pending credentials (owner, 2026-11-25)."
+notes = "STORE = MinIO S3 EMULATOR; latency deliberately not measured (the harness prints 'emulator latency is not evidence'). The ABSOLUTE first-query probe baseline is lower than the recorded 2026-11-20 Azurite CI row (10-11 GETs vs 45-46) — ASSERTED to later develop read-path changes, not proven: no same-revision control was run; what IS measured is that both campaigns' OFF->ON contrasts are internally consistent and identical in shape (+2/segment cold metadata, 0 marginal GETs ON). Raw SIFT_GET_COUNTS JSON lines quoted verbatim in the artifact. Ingest bytes_read is ~400x the file:// figures (7,485,110 B over 10 flushes vs 18,500 B on file://, same N/batch) — cause not investigated (S3 read sizing vs local reads; noted, not explained). real-cloud confirmation deferred pending credentials (owner, 2026-11-25)."
 
 [[claims]]
 id = "m5_spine4_manifest_levers_pgwire_s3_emulator"
@@ -1656,8 +1656,8 @@ notes = "STORE = MinIO S3 EMULATOR; counts only — emulator latency is not evid
 
 [[claims]]
 id = "m5_object_store_latency_floor_minio"
-claim = "ADR-098 M5 emulator leg: the object-store round-trip latency floor measured against a MinIO S3 EMULATOR endpoint directly and through toxiproxy-injected symmetric RTT (promoted per this entry's own note, which names a minio endpoint run as the promotion path). Direct (Docker NAT, ~4-7 ms/op steady-state): GET 4KiB p50 5.0 ms, ranged GET 4KiB 12.9 ms, ranged 64KiB 1.1 ms (connection-reuse warm path), ranged 1MiB 17.5 ms, LIST 8.6 ms. Toxiproxy legs track the injected RTT cleanly: at +50 ms every op p50 55-81 ms; at +100 ms 105-149 ms; at +150 ms 153-163 ms — the per-op floor is RTT + a few ms of local overhead, and 1MiB whole-GET adds the transfer term (253/285/163 ms p50 at 50/100/150 ms)."
-metric = "object_store_rtt_ms (p50/p95/p99/mean per op x size, per RTT level)"
+claim = "ADR-098 M5 emulator leg: per-operation p50 round-trip latency of GET / ranged-GET / LIST at 4KiB/64KiB/1MiB against a MinIO S3 EMULATOR endpoint, measured directly and through toxiproxy-injected symmetric RTT (the entry's own promotion path names a minio endpoint run). EMULATOR p50s ONLY — no cloud claim. Failed operations COUNT AS SAMPLES (the bench records a failing op's observed latency; no error counts are emitted), and each (op x size) cell had a 10-op warmup plus 50 timed iterations (200 direct). p50 ms, [direct | +50 ms | +100 ms | +150 ms]: GET 4KiB 5.0 | 60.2 | 130.4 | 153.5; GET range 4KiB 12.9 | 55.3 | 128.2 | 153.6; GET 64KiB 12.7 | 65.5 | 149.7 | 154.1; GET range 64KiB 1.1 | 80.8 | 131.9 | 153.9; GET 1MiB 65.6 | 253.2 | 285.0 | 162.7; GET range 1MiB 17.5 | 81.4 | 129.3 | 154.3; LIST 8.6 | 79.4 | 104.9 | 153.9. At +150 ms every op sits at RTT + ~4 ms; at +50/+100 ms the small-op overhead above RTT is larger (+5 to +32 ms) and NOT attributed (no per-op breakdown was measured)."
+metric = "object_store_rtt_ms (p50 only, per op x size x RTT level)"
 status = "measured"
 asserted_in = [
   "docs/12-design/CODESIGN_DIMENSIONAL_ARCHITECTURE_2026_06_19.adoc",
@@ -1672,8 +1672,8 @@ notes = "STORE = MinIO S3 EMULATOR on localhost: the direct leg is emulator-loca
 
 [[claims]]
 id = "m5_sift1m_minio_rtt_ladder"
-claim = "ADR-098 M5 emulator leg: SIFT1M skip-ingest arms on the SAME MinIO bed (byte-identical objects; --skip-ingest --collection-id 1) through toxiproxy-injected symmetric RTT, 25-query cohorts (the first 100-query attempt wedged — server S3 client blocked on a proxy-torn connection, the TD-RDSTRAT-12 wedged-daemon class; killed and re-run with a fresh proxy per arm). GET/q and recall are RTT-invariant and hold at every level measured (object-cold GET/q 18.12-18.64, recall@100 0.9881-0.9932). object_cold p50 ladder: direct 833 ms -> 770 ms @50 ms (clean) -> 882 ms @100 ms -> 1,033 ms @150 ms (both last ⚑ compile-contended upper bounds); on this localhost bed the transfer+compute terms dominate and the ~6.3 sequential fetch rounds add only rounds x RTT — the counts, not these localhost p50s, are the transferable evidence"
-metric = "object_cold p50/p95 per RTT level + GET/q + waves p50 + recall@100"
+claim = "ADR-098 M5 emulator leg: SIFT1M skip-ingest arms on the SAME MinIO bed (byte-identical objects; --skip-ingest --collection-id 1) through toxiproxy-injected symmetric RTT, 25-query cohorts. THE MEASURED CLAIM IS THE RTT-INVARIANCE OF THE COUNTS: object-cold GET/q 18.12-18.64 and recall@100 0.9881-0.9932 at EVERY level (direct + 50/100/150 ms), requests/q and waves p50 likewise unchanged — the billed-request shape of the default (post-#2549) read path does not change with latency. All p50s are REPORTED-ONLY (see notes), not part of the measured claim."
+metric = "object-cold GET/q + requests/q + waves p50 + recall@100 per RTT level (counts only)"
 status = "measured"
 asserted_in = [
   "docs/10-quality/td/TD-PAXMETA-1-collection-level-segment-facts.adoc",
@@ -1684,4 +1684,4 @@ artifact = "docs/_internal/status/M5_EMULATOR_TRACE_EVIDENCE_2026_11_24.adoc"
 hardware = "Local macOS arm64 (Apple Silicon, 64GB); MinIO S3 EMULATOR (docker m5-minio); toxiproxy 2.12.0 (docker m5-toxiproxy)"
 date = "2026-11-24"
 version = "worktree bench/m5-emulator-trace @ 51a20902f (develop base ea77dea50)"
-notes = "toxiproxy-injected RTT over an EMULATOR (localhost transfer): latency legs are shape evidence (25-query cohorts), never calibrated percentiles. The RTT50 (first re-run) and RTT100 arms overlapped background release builds (qps 0.31/0.89) — those p50s are upper bounds; see the artifact's Incidents section for which numbers are clean. real-cloud latency deferred pending credentials (owner, 2026-11-25)."
+notes = "toxiproxy-injected RTT over an EMULATOR (localhost transfer). REPORTED-ONLY p50s, ALL upper bounds — every arm except the clean 50 ms re-run overlapped background release compiles (qps 0.29-0.31 contended vs 1.07-1.34 clean; the artifact's Incidents section is the ONE authoritative contended-arm list: the leg-1 SIFT1M sweeps including the 833 ms direct rung, the first RTT50 25q re-run, RTT100, RTT150 and briefly the pgwire leg), and the direct 833 ms rung is additionally a 100-query cohort vs the 25-query ladder arms — cohort and contention both differ, so no rung-to-rung latency comparison is sound. Reported for the record: cold p50 833 ms direct, 770 ms @50 ms (clean), 882 ms @100 ms, 1,033 ms @150 ms (last two contended). The first 100-query 50 ms attempt WEDGED (server S3 read blocked ~25 min on a proxy-torn connection with no effective request timeout — TD-S3STALL-1, filed for it; NOT a TD-RDSTRAT-12 class) and was killed and excluded. real-cloud latency deferred pending credentials (owner, 2026-11-25)."

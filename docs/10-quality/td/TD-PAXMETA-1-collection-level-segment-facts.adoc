@@ -189,7 +189,7 @@ segment costs 2 small ranged footer GETs, once, and only when the collection-lev
 
 == Measured on MinIO (S3 emulator, ADR-098 M5, 2026-11-24)
 
-Two legs move this TD's evidence from the Azurite adls:// shape to an S3-shaped emulator (store =
+Three legs move this TD's evidence from the Azurite adls:// shape to an S3-shaped emulator (store =
 docker MinIO on localhost, path-style; counts are the evidence, latency is not — see the artifact's
 honesty notes; real-cloud confirmation deferred pending credentials, owner, 2026-11-25):
 

@@ -5,7 +5,7 @@
 [cols="1,3"]
 |===
 | Date | 2026-11-24
-| Version | worktree bench/m5-emulator-trace @ 51a20902f (develop base ea77dea50; carries the `PROXIMADB_WAREHOUSE_ROOT_URL` seam + the latency-floor bench `store_for_url` rerouting from the same PR). SIFT binaries: `--profile release-server --features proximadb/io-trace,proximadb/aws`, sha256 f327599a7152…; the binary was built inside the seam-edit window (the harness's revision guard passed against the committed tree; any delta is formatting-only, and the seam is inert with the gate unset — no SIFT leg touches the warehouse path).
+| Version | worktree bench/m5-emulator-trace @ 51a20902f (develop base ea77dea50; carries the `PROXIMADB_WAREHOUSE_ROOT_URL` seam + the latency-floor bench `store_for_url` rerouting from the same PR). SIFT binaries: `--profile release-server --features proximadb/io-trace,proximadb/aws`, sha256 f327599a7152…; the binary was built inside the seam-edit window — the harness's guard only verifies a CLEAN TREE at run time, not binary provenance, so the binary may differ from the recorded revision by formatting-only deltas; the seam is inert with the gate unset, and no SIFT leg touches the warehouse path.
 | Hardware | Apple Silicon arm64, 64 GB, macOS, Docker Desktop. NOT a quiet machine throughout: the SIFT1M leg-1 phase sweeps, the RTT50(b)/RTT100 arms, (briefly) the pgwire leg, and the RTT150 arm overlapped background release compiles — the affected latency rows are marked ⚑ and are upper bounds; the floor-bench legs and the clean RTT50 re-run ran with no compile jobs. Every latency figure below is shape evidence only. Counts and recall are request-deterministic on these fixtures and are the durable quantities. Indicative dev-machine evidence, not an SLA.
 | Storage regime | **MinIO S3 emulator** (docker `minio/minio:latest`, container `m5-minio`, 127.0.0.1:9000, path-style, creds `m5bench`). Request counts are emulator-measured; **latency legs are emulator-local (Docker NAT ≈ 4-7 ms/op steady-state) or toxiproxy-injected** — neither is real-cloud latency.
 |===
@@ -36,8 +36,10 @@ AWS_ACCESS_KEY_ID=m5bench AWS_SECRET_ACCESS_KEY=m5bench-secret \
 | object_cold | 0.9881 | 18.64 | 18.69 | 2 | 51.2 MB | 833 ms | 1,976 ms
 |===
 
-All phases clear the recall floor (0.975). Latency gates permissive (`--max-p50-ms 60000`, the
-rdstrat12/13 MinIO-campaign precedent) — emulator latency is not the claim.
+All phases clear the recall floor (0.975). The bench's gates were deliberately loosened for the
+emulator (GET ceilings 5000/5000/500, `--max-p50-ms 60000`, the rdstrat12/13 MinIO-campaign
+precedent), so `status: pass` here means recall floor + completion, NOT the production latency
+gates — emulator latency is not the claim.
 
 == 2. SIFT10k off/on request-count pair (flush-time directory contrast, S3 shape) — exit 0 ×2
 
@@ -45,7 +47,7 @@ The CI Azurite harness shape, store swapped to MinIO via `PROXIMADB_OBJECT_STORE
 `PROXIMADB_S3_ENDPOINT`/`PROXIMADB_S3_FORCE_PATH_STYLE`/keys (N=10 000, batch 1 000 → 10 segments,
 compaction off; each arm a fresh prefix; `--features io-trace,aws`):
 
-[cols="1,1,1,1,1,1", options="header"]
+[cols="1,1,1,1", options="header"]
 |===
 | Metric (10 segments) | AT_FLUSH=0 | AT_FLUSH=1 | Azurite CI (2026-11-20)
 | Cold collection-level metadata GETs | 20 (2/segment) | **0** | 20 → 0
@@ -58,9 +60,11 @@ compaction off; each arm a fresh prefix; `--features io-trace,aws`):
 |===
 
 The OFF→ON deltas reproduce the Azurite evidence exactly in shape. The ABSOLUTE first-query probe
-baseline is lower than the recorded CI row (10-11 GETs vs 45-46): the CI numbers predate later
-read-path changes on develop; both campaigns' contrasts are internally consistent (the +2/segment
-cold-metadata signature is identical). Raw summary lines (verbatim):
+baseline is lower than the recorded CI row (10-11 GETs vs 45-46) — ASSERTED to later develop
+read-path changes, not proven (no same-revision control was run); what is measured is that both
+campaigns' contrasts are internally consistent (the +2/segment cold-metadata signature is identical). Ingest `bytes_read` is ~400x the file:// figures (7,485,110 B over 10 flushes vs 18,500 B on
+file://, same N/batch) — cause not investigated (S3 read sizing vs local reads; noted, not
+explained). Raw summary lines (verbatim):
 
 ....
 SIFT_GET_COUNTS {"mode":"at_flush_off","pax_write_directory_at_flush":false,"store":"s3","n":10000,"flush_batch":1000,"segments":10,"directory_objects_at_rest":0,"queries":100,"top_k":10,"recall_at_10":0.987,"ingest":{"get_ops":10,"range_gets":0,"list_ops":20,"head_ops":10,"put_ops":0,"requests":40,"bytes_read":7485110,"waves":40},"cold_first_query_approx":{"get_ops":10,"range_gets":10,"list_ops":1,"head_ops":0,"put_ops":0,"requests":11,"bytes_read":7485110,"waves":2},"cold_first_query_adaptive":{"get_ops":30,"range_gets":30,"list_ops":1,"head_ops":0,"put_ops":0,"requests":31,"bytes_read":7488240,"waves":4},"cold_metadata":{"get_ops":20,"range_gets":20,"list_ops":0,"head_ops":0,"requests":20},"steady":{"queries":100,"total":{"get_ops":525,"range_gets":525,"list_ops":0,"head_ops":0,"requests":525,"bytes_read":39063040,"waves":100,"queries_without_waves":0},"per_query":{"get_ops":5.25,"range_gets":5.25,"list_ops":0.0,"head_ops":0.0,"waves":1.0}},"latency":"not measured (emulator latency is not evidence)","probe_directory_facts_off_first_query_gets":null}
@@ -71,7 +75,8 @@ SIFT_GET_COUNTS {"mode":"at_flush_on","pax_write_directory_at_flush":true,"store
 
 Toxiproxy 2.12.0 (docker `m5-toxiproxy`), proxy 127.0.0.1:9100 → MinIO, symmetric latency toxics
 (L/2 down + L/2 up), fresh proxy daemon per arm. Cohort: 25 queries/phase (the first 100-query arm
-wedged — see Incidents). GET/q and recall are RTT-invariant (counts, not latency); p50s are the
+wedged — see Incidents and
+link:../../10-quality/td/TD-S3STALL-1-query-path-blocking-read-without-timeout.adoc[TD-S3STALL-1]). GET/q and recall are RTT-invariant (counts, not latency); p50s are the
 latency shape. Arms marked ⚑ ran while a release build compiled in the background — treat those p50s
 as upper bounds (the RTT50 ⚑ arm's qps 0.31 vs the clean re-run's higher throughput makes the
 contentment visible; the clean re-run is authoritative).
@@ -79,22 +84,21 @@ contentment visible; the clean re-run is authoritative).
 [cols="1,1,1,1,1,1,1", options="header"]
 |===
 | Arm | recall@100 (cold) | GET/q (cold) | waves p50 | bytes/q (cold) | cold p50 | cold p95
-| direct (leg-1 object_cold, proxy-free) | 0.9881 | 18.64 | 2 | 51.2 MB | 833 ms | 1,976 ms
+| direct ⚑ (leg-1 object_cold, proxy-free; compile-contended AND a 100-query cohort vs the 25-query arms) | 0.9881 | 18.64 | 2 | 51.2 MB | 833 ms | 1,976 ms
 | RTT 50 ms — first 100-query attempt | wedged after 86/100 post-write queries (see Incidents); killed, excluded | | | | |
 | RTT 50 ms — clean 25q re-run, exit 0 | 0.9932 | 18.12 | 2 | 50.9 MB | 770 ms | 1,108 ms
 | RTT 50 ms ⚑ contended 25q, exit 0 | 0.9932 | 18.12 | 2 | 50.9 MB | 2,234 ms | 11,305 ms
 | RTT 100 ms ⚑ contended 25q, exit 0 | 0.9932 | 18.12 | 2 | 50.9 MB | 882 ms | 1,247 ms
-| RTT 150 ms ⚑ contended 25q, exit 0 | 0.9932 | 18.12 | 2 | 50.9 MB | 1,033 ms | 3,858 ms |
+| RTT 150 ms ⚑ contended 25q, exit 0 | 0.9932 | 18.12 | 2 | 50.9 MB | 1,033 ms | 3,858 ms
 |===
 
 Reading: counts and recall are RTT-INVARIANT — GET/q (18.12-18.64), requests/q and recall@100
 (0.9881-0.9932 across cohorts) hold at every level; the billed shape does not change with latency.
-The clean 50 ms arm's cold p50 (770 ms) sits near the proxy-free direct leg (833 ms): on localhost
-the transfer+compute terms dominate and the ~6.3 sequential fetch rounds only add rounds × RTT
-(≈ 315 ms at 50 ms), partially hidden under the 25-query cohort's tail. The ⚑ contended rows show
-the compile-contention effect (2,234 ms vs the clean 770 ms at the SAME 50 ms RTT — the ⚑ rows are
-upper bounds, kept for the record, never for comparison). A real-cloud link couples RTT with limited
-bandwidth — these localhost shapes bound nothing about cloud latency.
+THAT invariance is this leg's measured claim. Every p50 in this table is REPORTED-ONLY and an upper
+bound: the ⚑ rows overlapped background release compiles (the 2,234 ms vs 770 ms pair at the SAME
+50 ms RTT shows the contention factor), and the direct rung additionally mixes a 100-query cohort
+against 25-query arms — no rung-to-rung latency comparison is sound, and none is made. A real-cloud
+link couples RTT with limited bandwidth; these localhost shapes bound nothing about cloud latency.
 
 == 4. pgwire TD-SPINE-4 manifest levers with an S3-warehouse — exit 0 (2.3 s)
 
@@ -140,19 +144,25 @@ All four legs via the production `store_for_url` (the same PR routes this bench 
 | +150 ms injected RTT | 153.5 ms | 153.6 ms | 153.9 ms | 154.3 ms | 162.7 ms | 153.9 ms
 |===
 
-Reading: the per-op floor tracks injected RTT + a few ms of local overhead at every level (at
-+150 ms every small op is 153-155 ms p50 — the emulator/proxy overhead term is ≈ 4 ms); whole-object
-1 MiB GET adds the transfer term. The direct leg's 64 KiB ranged p50 of 1.1 ms is the warm
-connection-reuse path (first-connection setup dominates the 4 KiB rows). These are FLOOR shapes on
-an emulator — the numbers a route-cost model must beat, not cloud SLAs.
+Reading: at +150 ms every op sits at RTT + ~4 ms; at +50/+100 ms the small-op overhead above RTT
+is larger (+5 to +32 ms) and is NOT attributed here — no per-op breakdown was measured, and after
+the bench's 10-op warmup "first-connection setup" cannot be the explanation. Whole-object 1 MiB GET
+clearly adds a transfer term (253-285 ms at +50/+100 ms; 162.7 ms at +150 ms where the toxic's
+shaping binds differently). Failed operations COUNT AS SAMPLES (the bench records a failing op's
+observed latency and emits no error counts), and every cell is 10 warmup + 50 timed iterations
+(200 direct). These are FLOOR shapes on an emulator — the numbers a route-cost model must beat,
+not cloud SLAs.
 
 == Incidents (recorded, not hidden)
 
-* **Wedged RTT arm:** the first 50 ms ladder attempt (100 queries) stalled 25 min into the
-  post-write phase — the server's S3 client blocked on a connection toxiproxy had torn down
-  ("Source terminated" in the proxy log; the wedged-daemon class TD-RDSTRAT-12 recorded). Killed;
-  re-run with a fresh proxy daemon per arm and 25-query cohorts. The wedged attempt's `result.json`
-  records the partial phase; it is excluded from the table.
+* **Wedged RTT arm
+  (link:../../10-quality/td/TD-S3STALL-1-query-path-blocking-read-without-timeout.adoc[TD-S3STALL-1]):**
+  the first 50 ms ladder attempt (100 queries) stalled 25 min into the post-write phase after
+  86/100 queries — the server's S3 READ on the query path blocked on a connection toxiproxy had
+  torn down ("Source terminated" in the proxy log) with no effective request timeout (the block
+  vastly outlived any configured bound). Killed; re-run with a fresh proxy daemon per arm and
+  25-query cohorts. The wedged attempt's `result.json` records the partial phase; it is excluded
+  from the table.
 * **Compile contention:** the leg-1 SIFT1M phase sweeps, the first RTT50 25q re-run and the RTT100
   arm overlapped background release builds (visible as qps 0.29-0.31 vs 1.07-1.34 on the clean
   runs); their p50s are upper bounds, marked ⚑. A clean RTT50 re-run landed (770 ms cold p50 vs the

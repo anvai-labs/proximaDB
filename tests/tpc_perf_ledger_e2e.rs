@@ -3019,24 +3019,54 @@ async fn manifest_levers_cut_footer_gets_over_pgwire_object_store() {
         "PROXIMADB_OLAP_MANIFEST_PRUNE_DISABLE",
         "PROXIMADB_OLAP_LAZY_FOOTER_DISABLE",
     ];
+    // MED-5 (review round 1): an unset env must SKIP, and libtest reports a
+    // returned test as `ok` — accepted per the repo's `#[ignore]`d
+    // emulator-test convention (see `put_with_tier_accepted_by_s3_emulator`)
+    // because the `--ignored` lane is advisory: no merge lane runs it, and
+    // the emulator scopes that do always set the env. The loud SKIP line is
+    // the first thing a hand-run without an emulator prints.
     let Ok(warehouse_root) = std::env::var("PROXIMADB_WAREHOUSE_ROOT_URL") else {
         eprintln!(
-            "skip: set PROXIMADB_WAREHOUSE_ROOT_URL (e.g. s3://bucket/prefix) \
-                   plus the S3 emulator env contract"
+            "SKIP (not run): manifest_levers_cut_footer_gets_over_pgwire_object_store needs \
+             PROXIMADB_WAREHOUSE_ROOT_URL (e.g. s3://bucket/prefix) plus the S3 emulator env \
+             contract (AWS_ENDPOINT, AWS_ALLOW_HTTP=true, \
+             AWS_VIRTUAL_HOSTED_STYLE_REQUEST=false, keys)"
         );
         return;
     };
     if !warehouse_root.contains("://") {
         panic!("PROXIMADB_WAREHOUSE_ROOT_URL must be a URL with a scheme, got {warehouse_root}");
     }
+    // MED-5: stale-proof fixture — a per-run table name (pid + millis) AND a
+    // list-before/list-after diff, so leftovers from an earlier run under
+    // the same prefix can never satisfy the parts-on-object-store guard.
+    let table = format!(
+        "mlevos_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0)
+    );
+    let parts_probe = proximadb_object_store::ProximaObjectStore::from_url(&warehouse_root)
+        .expect("open the warehouse root object store");
+    let before_parts: Vec<String> = parts_probe
+        .list(None)
+        .await
+        .expect("list the warehouse root (before)")
+        .into_iter()
+        .map(|meta| meta.location.to_string())
+        .collect();
     let server = TestPgServer::start().await.expect("server start");
     io_trace::set_billing_observer(Some(Box::new(|snap: &IoTraceSnapshot, _tenant| {
         CAPTURE.lock().expect("capture lock").push(snap.clone());
     })));
     let client = connect(&server).await;
-    let _ = client.simple_query("DROP TABLE IF EXISTS mlevos").await;
+    let _ = client
+        .simple_query(&format!("DROP TABLE IF EXISTS {table}"))
+        .await;
     client
-        .simple_query("CREATE TABLE mlevos (id INT, v INT)")
+        .simple_query(&format!("CREATE TABLE {table} (id INT, v INT)"))
         .await
         .expect("create");
     for part in 0..4 {
@@ -3046,49 +3076,66 @@ async fn manifest_levers_cut_footer_gets_over_pgwire_object_store() {
                 format!("({id}, {})", id % 7)
             })
             .collect();
-        for sql in chunked_inserts("mlevos", "id, v", rows, 250) {
+        for sql in chunked_inserts(&table, "id, v", rows, 250) {
             client.simple_query(&sql).await.expect("insert");
         }
         client
-            .simple_query("ALTER TABLE mlevos MATERIALIZE")
+            .simple_query(&format!("ALTER TABLE {table} MATERIALIZE"))
             .await
             .unwrap_or_else(|e| panic!("materialize: {}", pg_server::db_err(&e)));
     }
     // The parts MUST be on the object store, or this silently measures the
-    // file:// default again (the vacuity class TD-CI-7 exists to prevent).
+    // file:// default again (the vacuity class TD-CI-7 exists to prevent) —
+    // and they must be NEW objects this run published (the before/after
+    // diff), not stale leftovers under the same prefix.
     {
-        let store = proximadb_object_store::ProximaObjectStore::from_url(&warehouse_root)
-            .expect("open the warehouse root object store");
-        let metas = store.list(None).await.expect("list the warehouse root");
+        let after_parts: Vec<String> = parts_probe
+            .list(None)
+            .await
+            .expect("list the warehouse root (after)")
+            .into_iter()
+            .map(|meta| meta.location.to_string())
+            .collect();
+        let fresh: Vec<&String> = after_parts
+            .iter()
+            .filter(|key| !before_parts.contains(key))
+            .collect();
         assert!(
-            metas.iter().any(|m| m.location.as_ref().contains("mlevos")),
-            "no mlevos objects under {warehouse_root}: MATERIALIZE did not publish to the \
-             overridden warehouse root (is PROXIMADB_WAREHOUSE_ROOT_URL honored?)"
+            fresh.iter().any(|key| key.contains(&table)),
+            "no fresh {table} objects under {warehouse_root}: MATERIALIZE did not publish \
+             to the overridden warehouse root (is PROXIMADB_WAREHOUSE_ROOT_URL honored?)"
         );
         eprintln!(
             "TD-SPINE-4 M5 emulator: warehouse root {warehouse_root} holds {} objects \
-             (mlevos parts + metadata)",
-            metas.len()
+             ({} fresh this run; {table} parts + metadata)",
+            after_parts.len(),
+            fresh.len()
         );
     }
-    let queries = [
+    // (name, sql, footers with the levers on, files pruned, get_ops with the
+    // levers on [first, repeat]) — get_ops is now ASSERTED (MED-5), pinned to
+    // the same counts the file:// twin measured.
+    let queries: Vec<(&str, String, u64, u64, [u64; 2])> = vec![
         (
             "first_file",
-            "SELECT SUM(v), COUNT(*) FROM mlevos WHERE id <= 250",
-            1_u64,
-            3_u64,
+            format!("SELECT SUM(v), COUNT(*) FROM {table} WHERE id <= 250"),
+            1,
+            3,
+            [7, 4],
         ),
         (
             "last_file",
-            "SELECT SUM(v), COUNT(*) FROM mlevos WHERE id > 750",
+            format!("SELECT SUM(v), COUNT(*) FROM {table} WHERE id > 750"),
             2,
             3,
+            [6, 6],
         ),
         (
             "all_files",
-            "SELECT SUM(v), COUNT(*) FROM mlevos WHERE id > 0",
+            format!("SELECT SUM(v), COUNT(*) FROM {table} WHERE id > 0"),
             4,
             0,
+            [16, 16],
         ),
     ];
     let set_switches = |on: bool| {
@@ -3126,8 +3173,8 @@ async fn manifest_levers_cut_footer_gets_over_pgwire_object_store() {
         } else {
             "after(levers on)"
         };
-        for (name, sql, lazy_footers, pruned) in queries {
-            for temperature in ["first", "repeat"] {
+        for (name, sql, lazy_footers, pruned, lever_get_ops) in &queries {
+            for (round, temperature) in ["first", "repeat"].into_iter().enumerate() {
                 CAPTURE.lock().expect("lock").clear();
                 let msgs = client
                     .simple_query(sql)
@@ -3141,6 +3188,13 @@ async fn manifest_levers_cut_footer_gets_over_pgwire_object_store() {
                     }
                     sleep(Duration::from_millis(5)).await;
                 }
+                // MED-5: get_ops is ASSERTED, not just printed — a snapshot
+                // that was never captured (all-zero default) fails here
+                // instead of vacuously passing.
+                assert!(
+                    snap.get_ops > 0,
+                    "{name} {temperature}: no io_trace snapshot captured (get_ops=0)"
+                );
                 eprintln!(
                     "TD-SPINE-4 M5 emulator {mode} {name} {temperature}: get_ops={} list_ops={} \
                      range_gets={} bytes_read={} footer_reads={} files_pruned={} \
@@ -3155,29 +3209,38 @@ async fn manifest_levers_cut_footer_gets_over_pgwire_object_store() {
                     snap.manifest_cache_misses,
                 );
                 let rows = answer(&msgs);
-                let previous = results.entry((name, kill)).or_insert_with(|| rows.clone());
+                let previous = results.entry((*name, kill)).or_insert_with(|| rows.clone());
                 assert_eq!(previous, &rows, "{name}: repeat changed the answer");
                 if kill {
                     assert_eq!(snap.parquet_footer_reads, 4, "{name}: eager reads all four");
                     assert_eq!(snap.manifest_files_pruned, 0, "{name}: pruning off");
+                    let eager = if *name == "all_files" { 19 } else { 13 };
+                    assert_eq!(
+                        snap.get_ops, eager,
+                        "{name} {temperature}: kill-switch GET count"
+                    );
                 } else {
                     assert_eq!(
-                        snap.parquet_footer_reads, lazy_footers,
+                        snap.parquet_footer_reads, *lazy_footers,
                         "{name}: lazy footers read only the kept files + the schema source"
                     );
                     assert_eq!(
-                        snap.manifest_files_pruned, pruned,
+                        snap.manifest_files_pruned, *pruned,
                         "{name}: files pruned by manifest bounds"
+                    );
+                    assert_eq!(
+                        snap.get_ops, lever_get_ops[round],
+                        "{name} {temperature}: lever-on GET count"
                     );
                 }
             }
         }
     }
     set_switches(false);
-    for (name, _, _, _) in queries {
+    for (name, _, _, _, _) in &queries {
         assert_eq!(
-            results[&(name, true)],
-            results[&(name, false)],
+            results[&(*name, true)],
+            results[&(*name, false)],
             "{name}: the levers must not change the answer"
         );
     }
