@@ -5,7 +5,7 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | **Implemented (2026-11-24)** — PR pending; see Evidence.
+| Status | **Partial (reconciled 2026-11-25).** The declared/inferred mode, the per-mode ratchets, the default-root move, the legacy-root replay and the `durable_locations` record are implemented and merged in #2573 (ea77dea50, merged 2026-11-24); see Evidence. Acceptance bullets 1 and 2 have test evidence. Bullet 3 is partly evidenced: `wal_fsync_crash_recovery` runs in no CI lane, and no suite asserts that the boot log names the mode. Bullet 4 is vocabulary-only so far. See Remaining scope (2026-11-25). (Was: "Implemented (2026-11-24) — PR pending".)
 | Priority | **HIGH**. Operators cannot tell from config or logs whether an ack means "fsync'd on a local volume" (ADR-069) or "durable and LISTable on object storage" (ADR-063 D3). The guard only warns, and only checks `write_buffer_directory`.
 | Component | `src/storage/persistence/write_ahead_log/config.rs` (`DurabilityMode`, `resolve_durability_mode`, env reader); `src/core/config.rs` (`WriteBufferUserConfig::durability_mode` / `resolved_durability` / `resolve_durability_mode` / `apply_durability_mode_resolution` / `effective_wal_local_dir`); `src/database.rs` (boot stamp); `src/network/shared_services.rs` (`convert_toml_to_wal_config` — resolution log replacing the warning guard); `src/storage/engine.rs` (replay-manager root/mode); `recovery_manager.rs` (mode log; legacy-root candidate bases); `apps/proximadb-server/src/durable_locations.rs` (`durability_mode` field); `apps/proximadb-server/tests/object_store_restart_recovery.rs` (declares `object_store_serverless`); `config/config.toml`; `docs/12-design/ENV_GATE_REGISTRY.adoc`.
 | Authority | link:../../12-design/adr/ADR-098-metadata-spine.adoc[ADR-098] D3 (seam S2)
@@ -121,6 +121,27 @@ posture*, not a misconfiguration; the contradictory shape (declared
   `durability_mode = "object_store_serverless"` in its `[storage.wal_config]`,
   so the proof no longer rides on inference.
 
+== Remaining scope (2026-11-25)
+
+* **R1. Put `wal_fsync_crash_recovery` in a CI lane.** It SIGKILLs a real server, so it belongs
+  beside `cold_backup_restore` in "Rust Build (dev)" or in the qa tier. *Acceptance:* a CI run id
+  in which the step ran and passed, cited here.
+* **R2. Assert the resolved mode in each suite (acceptance bullet 3, "boot log names the
+  mode").** Only `object_store_restart_recovery` mentions the mode, and only by declaring it in
+  its config. No suite asserts the resolved mode. *Acceptance:* each of
+  `wal_fsync_crash_recovery`, `cold_backup_restore` and `object_store_restart_recovery` asserts
+  its expected mode, either from the boot log line (`durability_mode=…`) or from the
+  `durable_locations` record's `durability_mode` field. A wrong-mode mutation fails at least one
+  of them.
+* **R3. macOS cold-backup restore-path failures.** Fixed in open PR #2575. *Acceptance:* #2575
+  merged, and `cold_backup_restore` green on macOS locally (or on a macOS CI leg).
+* **R4. TD-SEAM-14 durability boundary (acceptance bullet 4).** So far the coordination is
+  vocabulary only (see below). No separate spec is needed: the existing link:TD-SEAM-14-object-store-recovery-and-ownership-boundary.adoc[TD-SEAM-14] already has a
+  "Durability boundary and operator recovery" section (§8), and its bounded delivery (§2)
+  assumes an intact durable local WAL/metadata volume. *Acceptance:* TD-SEAM-14 §8 states which
+  `DurabilityMode` its spill placement resolves to (one of the two, no third mode), and this
+  TD cites that line.
+
 == Coordination — TD-SEAM-14 (spill durability boundary)
 
 TD-SEAM-14 owns the object-store spill placement durability/ownership boundary
@@ -132,8 +153,8 @@ TD's vocabulary (`DurabilityMode`, `durability_mode`,
 `PROXIMADB_WAL_DURABILITY_MODE`) does not collide with the seam. Per ADR-098
 D3, whatever durability boundary SEAM-14 documents for spill must resolve to
 one of these two modes; when its durability-boundary spec lands
-(`docs/10-quality/td/TD-SEAM-14-durability-boundary.adoc`, planned), it should
-REFERENCE `DurabilityMode` rather than mint a third mode.
+(*corrected 2026-11-25:* there is no separate planned file; the durability boundary is
+§8 of TD-SEAM-14 itself), it should REFERENCE `DurabilityMode` rather than mint a third mode.
 
 == Evidence (2026-11-24)
 
@@ -174,7 +195,21 @@ REFERENCE `DurabilityMode` rather than mint a third mode.
   assertions); hardcoding `LocalVolume` flips
   `spine5_object_scheme_infers_serverless_without_local_root` and the
   durable-locations serverless record test red. The inference is load-bearing.
-* **Suites:** `wal_fsync_crash_recovery`, `cold_backup_restore`,
-  `object_store_restart_recovery` — see the PR body for the exact runs
-  (the object-store suite is credential-gated and runs via
-  `scripts/prove_object_store_durability.sh`).
+* **Suites (CI evidence, corrected 2026-11-25; this bullet used to defer to
+  "the PR body"):** CI run 45465402994, the `pull_request` run on the #2573
+  head `9c1b51e4c`, concluded success.
+** `object_store_restart_recovery`: green in job "Object-store restart recovery
+   (Azurite)", step "Run the server tests over Azurite (adls://)"
+   (`scripts/run_cloud_emulator_tests.sh --restart test-server`). The lane is
+   path-gated on feat→develop. At develop→qa and qa→main the same proof runs
+   in qa-gate's `objstore-restart-qa-tier`. Locally it is credential-gated
+   (`scripts/prove_object_store_durability.sh`).
+** `cold_backup_restore`: green in job "Rust Build (dev)", step "Verify cold
+   backup/restore round trip (real server)" (`.github/workflows/ci.yml`,
+   `cargo test -p proximadb-server --test cold_backup_restore`). That is the
+   Linux runner. On macOS, two pre-existing restore-path tests fail; open PR
+   #2575 fixes them by canonicalizing with `absolute()` in cold backup.
+   Until #2575 merges this is a residual (R3).
+** `wal_fsync_crash_recovery`: **not in any CI lane.** No workflow, script
+   or Makefile target names it. Evidence for this suite is local runs only
+   (R1).

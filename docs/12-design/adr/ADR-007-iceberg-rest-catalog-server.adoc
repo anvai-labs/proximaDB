@@ -98,6 +98,15 @@ the REST service serves the Iceberg engine's own `metadata.json` verbatim. The s
 remains only for tables the engine has not published, which is the residual tracked in
 TD-SEAM-1.
 
+*Residual named 2026-11-25:* for such a never-MATERIALIZEd table the synthetic snapshot's
+manifest list is `{base}/namespaces/{ns}/tables/{t}/manifests/snap-{id}.avro`
+(`crates/control/proximadb-catalog/src/iceberg_rest_service.rs`), and no route serves
+`/manifests/` (the router in `src/network/rest/canonical/iceberg_rest_catalog.rs` serves only
+`metadata/{file}`). An external client that follows the URL gets a dangling reference. `load_table`
+must not serve those URLs; the item and its acceptance are in the TD-SEAM-1 row of
+`docs/10-quality/TECHNICAL_DEBT.adoc`. The "manifests/current" URL in the bullet list above
+describes the original design, not the current code.
+
 === Hadoop Split Mapping
 
 [source]

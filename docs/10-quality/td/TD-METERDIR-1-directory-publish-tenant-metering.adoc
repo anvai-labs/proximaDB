@@ -1,0 +1,62 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-METERDIR-1: PAX flush and compaction I/O (segment writes and the directory publish) runs without a TenantContext, so it is not metered per tenant
+:status: Open
+:dim: D5
+:pillar: COST
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open** (filed 2026-11-25 by the ADR-098 scope reconciliation, Completion ledger G9). It started as follow-up **F-tenant** in link:TD-PAXMETA-1-collection-level-segment-facts.adoc[TD-PAXMETA-1] (review L3, 2026-11-21). Scope widened 2026-11-25 (review of #2576) from the directory publish to every directory and segment publish I/O on flush and compaction. A pointer from TD-PAXMETA-1 to this TD is to be added after open PR #2575, which owns that file, merges.
+| Priority | **P1.** This is a mandate gap, not polish. Co-design mandates #3 and #5 require every I/O boundary to carry `TenantContext` and every dimension to be metered per tenant. Since the flush-time publish was flipped default ON (2026-11-20), every PAX flush does this I/O.
+| Component | Flush segment write: the staged write in `src/storage/engines/sst/flush/mod.rs` (`self.filesystem().get_filesystem(&staging_url)` and `get_filesystem(&final_url)`). Compaction output write: `get_filesystem(&output_path)` in `src/storage/engines/sst/compaction.rs`. Flush directory publish: `refresh_directory_after_flush` in `src/storage/engines/sst/flush/mod.rs` (`self.filesystem().get_filesystem(dir_url)`). Compaction publish: `refresh_centroid_directory` in `src/storage/engines/sst/compaction.rs` (`self.filesystem_factory.get_filesystem(&dir_url)`). The same file's `shared_collection_model` loads the newest directory the same untenanted way. Publisher: `publish_centroid_directory` / `publish_centroid_directory_bounded` in `src/storage/engines/sst/centroid_directory_publisher.rs`.
+| Authority | CLAUDE.md co-design mandates #3 and #5; link:../../12-design/adr/ADR-098-metadata-spine.adoc[ADR-098] D2.2 (publish at flush and compaction) and Completion ledger G9.
+| Relates to | link:TD-PAXMETA-1-collection-level-segment-facts.adoc[TD-PAXMETA-1] (F-tenant, F-ingest), TD-TIER-1 (directory residency for granted collections)
+|===
+
+== Problem
+
+From TD-PAXMETA-1 F-tenant (review L3, 2026-11-21), confirmed against develop @ `ea77dea50`.
+The directory publish, at flush and at compaction, resolves its filesystem with an untenanted
+`get_filesystem(dir_url)`. The same holds for the flush's segment write itself
+(`get_filesystem(&staging_url)` and `get_filesystem(&final_url)` in `flush/mod.rs`) and, on a
+first look, for the compaction output write (`get_filesystem(&output_path)` in `compaction.rs`).
+So the directory publish is one known gap, not the only one. No `TenantContext` reaches it. Each flush does roughly 3 GETs (2
+ranged plus the directory), 1 LIST, 1 PUT and, from the third flush on, 1 DELETE (TD-PAXMETA-1
+Status). None of the directory requests is metered or billed per tenant. Whether the segment-write
+bytes are metered some other way (for example by a decorator below `get_filesystem`) is not yet
+verified; that is the census step below.
+
+Isolation is not affected. The directory path is derived by `DrPathBuilder` under the
+collection's tenant prefix, so isolation stays structural. The gap is metering and billing only.
+
+== Fix
+
+. **Census.** List every filesystem resolution on the PAX flush and compaction paths (segment
+  staging and final writes, compaction output, directory publish and directory load, deletes of
+  superseded generations). For each one, record whether a `TenantContext` reaches it and whether
+  its requests and bytes are metered per tenant. Commit the list here.
+. **Verify the premise.** Identify the per-tenant I/O metering seam that the tenanted SST
+  read and write paths already use, and count its callers. If that seam does not exist at this
+  layer, say so here before building one.
+. Plumb the flush's and the compaction's `TenantContext` into every untenanted call the census finds,
+  including `refresh_directory_after_flush`, `refresh_centroid_directory`,
+  `shared_collection_model` and the segment write. Resolve each filesystem through that seam so
+  the GET, LIST, PUT and DELETE requests are attributed to the tenant.
+. Fail closed per the boundary contract. A directory publish that cannot resolve its tenant does
+  not run untenanted; it is skipped with a warning. The directory is a projection, so the flush
+  still succeeds and readers keep the footer path. A segment write is not optional, so the PR
+  must state and test its behavior when no tenant resolves: either the flush fails, or the write
+  is attributed to an explicit operator/untenanted account. It must never silently go
+  unmetered.
+
+== Acceptance
+
+* The census is committed in this TD.
+* A counting test runs a flush and a compaction on a tenanted collection. It shows every
+  request of the segment writes and the directory publish (GET, LIST, PUT, DELETE) attributed to
+  that tenant in the metering output, and none recorded untenanted.
+* Negative control: removing the `TenantContext` plumbing turns the test red.
+* The existing directory tests (TD-PAXMETA-1 evidence) and the Azurite request-count harness
+  (`sift-object-store-request-counts`) are unchanged.

@@ -1,0 +1,72 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-COLDREQ-1: object-cold vector requests per query below the ≤ 20 gate (range-cap widening and per-cell probe coalescing as candidate levers)
+:status: Open
+:dim: D1
+:pillar: COST
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open** (filed 2026-11-25 by the ADR-098 scope reconciliation, Completion ledger G3).
+| Priority | **P2.** Not a GA gate. The GA gate is compacted object-cold ≤ 20 requests per query, to be ratcheted (ADR-098 Completion ledger G3). The D8 run measured 19.55 req/q at its default cap. The best measured arm is 13.169 req/q (ledger `tier1_e1_fixed_object_cap_sweep`, cap 4 → 16 MiB). This TD owns going below the gate and choosing the lever.
+| Component | The PAX cascade's cold ranged reads: `read_ranges_prefetch_resident` call sites in `src/storage/engines/sst/segment_format.rs`; range coalescing in `crates/storage/proximadb-storage-filesystem-types/src/read_ranges_plan.rs` (`coalesce_ranges_with_mapping`) and `range_coalescer.rs`; probe fan-out policy (TD-RDSTRAT-14); the query-scoped I/O trace (`crates/modalities/proximadb-observability-engine/src/io_trace.rs`).
+| Authority | link:../../12-design/adr/ADR-098-metadata-spine.adoc[ADR-098] D2 ("a cold vector query costs LIST + directory + one data wave") and its Completion ledger G3; ADR-033 (DEPTH ≫ WIDTH ≫ BYTES ≫ CPU).
+| Relates to | link:TD-RDSTRAT-11-probe-locality-cell-placement.adoc[TD-RDSTRAT-11] (superseded; this TD addresses the trace-derived TD that TD-RDSTRAT-11 calls for. Its condition is that a co-probe-affinity optimizer must beat the current control, so S1's placement candidate counts only if it does), link:TD-RDSTRAT-8-two-level-ivf-coarse-probe.adoc[TD-RDSTRAT-8], link:TD-RDSTRAT-12-bounded-parallel-read-ranges.adoc[TD-RDSTRAT-12], link:TD-RDSTRAT-13-object-cold-probe-rank-morsels-and-round-collapse.adoc[TD-RDSTRAT-13], link:TD-RDSTRAT-14-probe-policy-controller.adoc[TD-RDSTRAT-14], link:TD-SEARCH-3-per-operation-read-coalescing.adoc[TD-SEARCH-3], link:TD-TIER-1-collection-storage-policy-and-residency.adoc[TD-TIER-1] (range-cap sweep), link:TD-PAXMETA-1-collection-level-segment-facts.adoc[TD-PAXMETA-1] (owns the ≤ 20 gate), link:TD-SIFTCOMPACT-1-sift-ratchets-measured-an-uncompacted-layout.adoc[TD-SIFTCOMPACT-1] (uncompacted layouts)
+|===
+
+== Problem
+
+The 2026-11-19 checkpoint set a target of "~82 → ≤ 6 GETs per query" for a cold vector query.
+That number was a model, and it conflated dependent *waves* with *requests*. The measured
+request counts are much higher than 6:
+
+* Compacted SIFT1M, object-cold: **19.55 requests per query** (GET + LIST + HEAD) at p50 = 3
+  waves (ledger `paxdir_d8_defaults_on_sift1m`, MinIO + Toxiproxy, 2026-10-25). Open PR #2575
+  measures 18.69 req/q (18.64 GET/q) at 2 waves on a 2-segment MinIO SIFT1M bed (recall@100).
+* Uncompacted, 50 segments: 154.63 ranged GETs per query in steady state (ledger
+  `sift1m_uncompacted_file_directory_at_flush`). That is a layout problem (TD-SIFTCOMPACT-1), not
+  this TD.
+
+On request-priced object storage, requests per query are a direct cost term. The waves target
+(ADR-098 Completion ledger G1) bounds latency; it does not bound the request bill. The remaining
+requests have not yet been broken down by class. The working hypothesis, which S0 must confirm
+or refute, is that most of them are probe ranges for the selected cells.
+
+The cap alone already moves the count a long way. The TD-TIER-1 fixed-object sweep (ledger
+`tier1_e1_fixed_object_cap_sweep`, one 36-cell SIFT1M fixture, 2 repeats per cap) measured
+object-cold requests at 18.462 req/q with a 4 MiB coalescing cap and **13.169 req/q at 16 MiB**,
+with recall ≥ 0.9822 and waves p50 3 in all arms. That cost +4.5% bytes (50.7 → 53.0 MB/q), and
+the ledger notes it is a workload-specific tradeoff at n = 2, not a proven optimum. So going
+below 20 does not *need* per-cell probe coalescing; 13.169 req/q is the existing best measured
+arm and the baseline this TD must beat. Co-probed cells that are not adjacent in the object
+still cost one request each whatever the cap, which is why coalescing remains a candidate.
+
+== Fix (trace first)
+
+. **S0 — breakdown.** On the fixed-object protocol of `tier1_e1_fixed_object_cap_sweep`, at the
+  16 MiB cap, attribute every object-cold request by class: discovery
+  LIST, directory, per-cell probe range, rerank / f32 tier, oid tail, HEAD. Record it in the
+  I/O trace, which already carries per-tier counters (TD-RDSTRAT-13 C1). The fix is chosen from
+  this breakdown, not from the model.
+. **S1 — pick a lever from S0.** Candidates, none of them a prerequisite: (a) widen the
+  read-time coalescing cap, per collection under the TD-TIER-1 policy, which is already
+  measured at 13.169 req/q; (b) coalesce per-cell probes into one request per run of co-probed
+  cells; (c) place cells at compaction so co-probed cells are adjacent, a co-probe-affinity
+  order that must beat the current Hilbert order (TD-RDSTRAT-11's condition). Whichever is
+  chosen must be justified by S0's trace.
+. Do not change recall semantics or the probe count to buy requests. Fewer probes is the
+  TD-RDSTRAT-14 dial and is out of scope here.
+
+== Acceptance
+
+* S0: a ledger entry with the per-class request breakdown of object-cold queries on the
+  compacted SIFT1M bed.
+* S1: a ledger entry (status `measured`, fixed-object protocol) shows object-cold requests per
+  query below the 13.169 req/q baseline arm (`tier1_e1_fixed_object_cap_sweep`, 16 MiB) on
+  identical objects. Recall@10 stays within 0.002 of the
+  baseline arm, and p50 waves do not increase. The target value is set from S0 and written here
+  before S1 is merged.
+* The ≤ 20 req/q gate still holds. It is owned by TD-PAXMETA-1; its acceptance re-scope is to be added by open PR #2575.
+* Bytes per query is reported beside requests, because coalescing trades over-read bytes for
+  fewer requests.

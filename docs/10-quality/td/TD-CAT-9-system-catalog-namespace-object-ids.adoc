@@ -8,7 +8,7 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | **Done.** `SystemCatalog` mints namespace `object_id`s from the shared system-wide sequence, and the recovery floor folds them (#1687). *Note 2026-11-19:* the namespace stable-id floor (`namespace_floor` in `src/services/system_catalog.rs`) is still global, not per account; making it per-account is link:TD-SPINE-2-per-account-catalog-shards.adoc[TD-SPINE-2]; link:TD-NS-1-namespace-isolation-slices.adoc[TD-NS-1] S4 covers the related `CatalogIdService` allocator fence.
+| Status | **Done.** `SystemCatalog` mints namespace `object_id`s from the shared system-wide sequence, and the recovery floor folds them (#1687). *Note 2026-11-19, updated 2026-11-25:* the namespace stable-id floor has been per-account since #2566 (merged 2026-11-24). `NamespaceIdAllocator` in `src/services/system_catalog.rs` holds per-account floors (link:TD-SPINE-2-per-account-catalog-shards.adoc[TD-SPINE-2]; test `per_account_namespace_floor_two_accounts_each_mint_id_one`). The 2026-11-19 text called it global, which was true before #2566; link:TD-NS-1-namespace-isolation-slices.adoc[TD-NS-1] S4 covers the related `CatalogIdService` allocator fence.
 | Severity | Medium — latent (no consumer), but a divergence between two backends that report the same `catalog_type`
 | Component | `src/services/system_catalog.rs`, `src/services/system_catalog_state.rs`
 | Relates to | link:TD-CAT-7-catalog-trait-split-unforgettable-minting.adoc[TD-CAT-7] (found it), ADR-031 / TD-181 P0
