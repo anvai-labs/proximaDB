@@ -7137,7 +7137,7 @@ async fn explain_analyze_executes_write_and_returns_execution_stats() {
         .expect("parse")
         .expect("dml");
     let explanation = dml
-        .explain_analyze_table_write(stmt)
+        .explain_analyze_table_write(stmt, None)
         .await
         .expect("explain analyze must succeed");
 

@@ -54,6 +54,31 @@ fn port_context<'a>(
     }
 }
 
+/// L4 (round 2): the unified surfaces now run relational reads through the
+/// SQL authority, so they carry /api/v2/sql's deadline contract (fixed 60s —
+/// these request shapes have no timeout field).
+const UNIFIED_QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Run a port execution under [`UNIFIED_QUERY_TIMEOUT`] and render it: the
+/// result as JSON, a port error through [`port_error_response`], an expired
+/// deadline as 504 (the /api/v2/sql deadline class — never a 400/500).
+async fn respond_within_deadline(
+    op: &str,
+    execution: impl std::future::Future<Output = anyhow::Result<serde_json::Value>>,
+) -> axum::response::Response {
+    match tokio::time::timeout(UNIFIED_QUERY_TIMEOUT, execution).await {
+        Ok(Ok(result)) => Json(result).into_response(),
+        Ok(Err(e)) => port_error_response(op, e),
+        Err(_) => (
+            StatusCode::GATEWAY_TIMEOUT,
+            Json(serde_json::json!({
+                "error": format!("{op} exceeded the {UNIFIED_QUERY_TIMEOUT:?} deadline")
+            })),
+        )
+            .into_response(),
+    }
+}
+
 // ── State ─────────────────────────────────────────────────────────────────────
 
 /// Axum state for unified multi-model query REST handlers.
@@ -211,20 +236,14 @@ async fn execute_query(
     );
 
     let params = json_to_proxima_values(req.parameters);
-    match s
-        .unified_query_port
-        .execute_unified_query(
-            req.query,
-            params,
-            req.collection,
-            req.limit,
-            port_context(&identity),
-        )
-        .await
-    {
-        Ok(result) => Json(result).into_response(),
-        Err(e) => port_error_response("execute_unified_query", e),
-    }
+    let execution = s.unified_query_port.execute_unified_query(
+        req.query,
+        params,
+        req.collection,
+        req.limit,
+        port_context(&identity),
+    );
+    respond_within_deadline("execute_unified_query", execution).await
 }
 
 async fn execute_multi_model_query(
@@ -267,14 +286,10 @@ async fn execute_federated_query(
     }
 
     let params = json_to_proxima_values(req.parameters);
-    match s
-        .unified_query_port
-        .execute_federated_query(req.query, params, port_context(&identity))
-        .await
-    {
-        Ok(result) => Json(result).into_response(),
-        Err(e) => port_error_response("execute_federated_query", e),
-    }
+    let execution =
+        s.unified_query_port
+            .execute_federated_query(req.query, params, port_context(&identity));
+    respond_within_deadline("execute_federated_query", execution).await
 }
 
 async fn execute_distributed_query(
@@ -283,14 +298,10 @@ async fn execute_distributed_query(
     body: Result<Json<serde_json::Value>, JsonRejection>,
 ) -> impl IntoResponse {
     let req = parse_body!(body);
-    match s
+    let execution = s
         .unified_query_port
-        .execute_distributed_query(req, port_context(&identity))
-        .await
-    {
-        Ok(result) => Json(result).into_response(),
-        Err(e) => port_error_response("execute_distributed_query", e),
-    }
+        .execute_distributed_query(req, port_context(&identity));
+    respond_within_deadline("execute_distributed_query", execution).await
 }
 
 async fn explain_query(
@@ -343,19 +354,13 @@ async fn execute_prepared_statement(
 ) -> impl IntoResponse {
     let req = parse_body!(body);
     let params = json_to_proxima_values(req.parameters);
-    match s
-        .unified_query_port
-        .execute_prepared(
-            statement_id,
-            params,
-            req.collection,
-            port_context(&identity),
-        )
-        .await
-    {
-        Ok(result) => Json(result).into_response(),
-        Err(e) => port_error_response("execute_prepared", e),
-    }
+    let execution = s.unified_query_port.execute_prepared(
+        statement_id,
+        params,
+        req.collection,
+        port_context(&identity),
+    );
+    respond_within_deadline("execute_prepared", execution).await
 }
 
 async fn delete_prepared_statement(

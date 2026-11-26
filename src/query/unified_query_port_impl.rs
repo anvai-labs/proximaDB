@@ -485,36 +485,111 @@ fn effective_identity_or_fail(identity: &PortIdentity<'_>) -> Result<OwnedPortId
 /// `/api/v2/sql` (single-statement validation + 1 MiB cap + deadline),
 /// gRPC `ExecuteQuery`, and pgwire. A DDL/DML statement on a port surface is
 /// rejected as a client error naming the policy, never silently executed or
-/// silently lost. Reads = `SELECT`/`WITH…SELECT`/`EXPLAIN` (a plain `EXPLAIN`
-/// or an `EXPLAIN` of a read; `EXPLAIN ANALYZE` of a write may execute it and
-/// is rejected).
+/// silently lost. Round 2 (2026-11-25): reads = a single PURE query
+/// (`SELECT` / `WITH…SELECT` / `VALUES` / `TABLE`, no write anywhere in the
+/// tree — see [`query_is_pure_read`]); EVERY `EXPLAIN` form (including
+/// `EXPLAIN SELECT`) is rejected with a message naming EXPLAIN, and the
+/// accepted read then runs through the authority's read-only entry.
 fn ensure_plain_sql_is_read(sql: &str) -> Result<()> {
     use sqlparser::ast::Statement as SqlStatement;
-    use sqlparser::dialect::GenericDialect;
+    use sqlparser::dialect::PostgreSqlDialect;
     use sqlparser::parser::Parser;
 
-    let statements = Parser::parse_sql(&GenericDialect {}, sql)
+    // PostgreSqlDialect (MED-1, round 2): the relational pipeline's own
+    // lowering (`lower_pgvector_select`) parses with it — the GenericDialect
+    // does not tokenize `<->`, which rejected valid KNN reads.
+    let statements = Parser::parse_sql(&PostgreSqlDialect {}, sql)
         .map_err(|error| InvalidQueryInput(format!("cannot parse statement: {error}")))?;
-    let is_read = match statements.as_slice() {
+    let (is_read, explain_shaped) = match statements.as_slice() {
         // Exactly one statement — the port, like /api/v2/sql, is a
-        // single-statement surface.
-        [statement] => match statement {
-            SqlStatement::Query(_) => true,
-            SqlStatement::Explain {
-                statement, analyze, ..
-            } => !analyze || matches!(statement.as_ref(), SqlStatement::Query(_)),
-            _ => false,
-        },
-        _ => false,
+        // single-statement surface. HIGH-1 (round 2): read-vs-write is
+        // decided on the AST, never on a text substring or a parser flag —
+        // `sqlparser`'s `analyze` flag is false for EVERY parenthesized
+        // option list (`(ANALYZE)`, `(FORMAT JSON, ANALYZE)`, `(ANALYZE
+        // off)`, lowercase…), which let `EXPLAIN (ANALYZE) <DML>` through
+        // the flag-based rule while the authority's explainer executed the
+        // write. EXPLAIN is no longer advertised on the port at all (L7):
+        // the authority's `EXPLAIN SELECT` path is a pre-existing 500, so
+        // the honest contract is a clear rejection naming EXPLAIN.
+        [SqlStatement::Query(query)] => (query_is_pure_read(query), false),
+        [SqlStatement::Explain { .. }] => (false, true),
+        _ => (false, false),
     };
     if is_read {
         return Ok(());
     }
-    Err(InvalidQueryInput(
-        "plain SQL on the unified query port is read-only (SELECT/EXPLAIN); writes are served by /api/v2/sql (REST), gRPC ExecuteQuery, or pgwire"
-            .to_string(),
-    )
-    .into())
+    let message = if explain_shaped {
+        "EXPLAIN is not served on the read-only unified query port; use /api/v2/sql (REST), gRPC ExecuteQuery, or pgwire"
+    } else {
+        "plain SQL on the unified query port is read-only (pure SELECT); writes are served by /api/v2/sql (REST), gRPC ExecuteQuery, or pgwire"
+    };
+    Err(InvalidQueryInput(message.to_string()).into())
+}
+
+/// A `Query` is a pure read only when NOTHING in it can execute a write
+/// (HIGH-1, round 2): data-modifying set-expression bodies
+/// (`SetExpr::Insert/Update/Delete/Merge`, including parenthesized and
+/// set-operation positions like `SELECT 1 UNION (DELETE … RETURNING *)`),
+/// data-modifying CTEs (`WITH del AS (DELETE …) SELECT …`), and
+/// `SELECT … INTO` all reject.
+///
+/// The walk is the sqlparser AST visitor, so EVERY nested `Query` is checked
+/// — CTE bodies, parenthesized bodies, set-operation operands, derived
+/// tables in FROM, and expression subqueries alike — and ANY nested
+/// non-query `Statement` (the payload of `SetExpr::Insert/Update/Delete/
+/// Merge`) fails the read. No position in the tree is exempt.
+fn query_is_pure_read(query: &sqlparser::ast::Query) -> bool {
+    use sqlparser::ast::{Query, Statement, Visit, Visitor};
+    use std::ops::ControlFlow;
+
+    struct WriteFinder;
+    impl Visitor for WriteFinder {
+        type Break = ();
+        fn pre_visit_statement(&mut self, statement: &Statement) -> ControlFlow<()> {
+            // The walk starts at a `Query`, so any `Statement` reached is a
+            // nested statement body — only a nested query is a read.
+            if matches!(statement, Statement::Query(_)) {
+                ControlFlow::Continue(())
+            } else {
+                ControlFlow::Break(())
+            }
+        }
+        fn pre_visit_query(&mut self, query: &Query) -> ControlFlow<()> {
+            if set_expr_is_pure_read(query.body.as_ref()) {
+                ControlFlow::Continue(())
+            } else {
+                ControlFlow::Break(())
+            }
+        }
+    }
+    query.visit(&mut WriteFinder).is_continue()
+}
+
+fn set_expr_is_pure_read(body: &sqlparser::ast::SetExpr) -> bool {
+    use sqlparser::ast::SetExpr;
+    match body {
+        SetExpr::Select(select) => select.into.is_none(), // SELECT … INTO writes
+        SetExpr::Values(_) | SetExpr::Table(_) => true,
+        SetExpr::Query(inner) => query_is_pure_read(inner),
+        SetExpr::SetOperation { left, right, .. } => {
+            set_expr_is_pure_read(left) && set_expr_is_pure_read(right)
+        }
+        SetExpr::Insert(_) | SetExpr::Update(_) | SetExpr::Delete(_) | SetExpr::Merge(_) => false,
+    }
+}
+
+/// L4 (round 2): the port surfaces carry /api/v2/sql's query-size contract —
+/// a plain-SQL body is capped at 1 MiB.
+const MAX_PORT_QUERY_BYTES: usize = 1024 * 1024;
+
+fn ensure_query_size(sql: &str) -> Result<()> {
+    if sql.len() > MAX_PORT_QUERY_BYTES {
+        return Err(InvalidQueryInput(format!(
+            "query exceeds the {MAX_PORT_QUERY_BYTES}-byte limit"
+        ))
+        .into());
+    }
+    Ok(())
 }
 
 /// The OLAP result cache the delegated scheduler path may consult, per the
@@ -554,11 +629,6 @@ fn olap_cache_for_freshness(
     }
 }
 
-/// Run `sql` through the ONE SQL authority (`execute_sql_via_authority`) when
-/// it is plain relational SQL, or through the federated lowering when it is a
-/// multi-model extension query — and render either into the port's JSON
-/// envelope. This is the single planner seam every port SQL entry funnels
-/// through (ADR-098 D5 / TD-SPINE-6).
 /// Whether `sql` is text the PORT itself synthesized from a UQL or
 /// multi-model lowering (trusted extension SQL) versus RAW user text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -579,6 +649,14 @@ enum PortSqlOrigin {
     RawUserText,
 }
 
+/// Run `sql` through the ONE SQL authority when it is raw user text, or
+/// through the federated lowering when it is port-synthesized extension SQL —
+/// and render either into the port's JSON envelope. This is the single
+/// planner seam every port SQL entry funnels through (ADR-098 D5 /
+/// TD-SPINE-6). Raw text is classified read-only on the AST (HIGH-1/2,
+/// round 2) and executes through `execute_sql_read_only_via_authority`,
+/// which structurally cannot reach the EXPLAIN-DML explainer or the write
+/// dispatch.
 async fn run_sql_via_one_planner(
     adapter: &Arc<QueryFacadeAdapter>,
     sql: &str,
@@ -588,26 +666,31 @@ async fn run_sql_via_one_planner(
     limit: Option<u32>,
     origin: PortSqlOrigin,
 ) -> Result<serde_json::Value> {
+    // L4: the size cap applies to every text the port executes.
+    ensure_query_size(sql)?;
     if origin == PortSqlOrigin::PortLowered {
         // Port-synthesized extension SQL (VECTOR_SEARCH/GRAPH_QUERY/
         // DOCUMENT_QUERY/LOGS/METRICS/RERANK): keep the federated lowering +
         // its result rendering. No relational table resolves for these, so
         // the ComputeScheduler decision has nothing to decide; engine
         // selection happens inside the engine layer behind the facade
-        // strategies. (Production fail-closed for a scope-less request lives
-        // in `FederatedQueryContext::execute`, unchanged.)
+        // strategies. L2 (round 2): the fail-closed gate is typed here too —
+        // `FederatedQueryContext` denies a scope-less request with an
+        // untyped (500-class) error.
+        effective_identity_or_fail(&identity)?;
         let result = adapter
             .federated_query(sql)
             .await
             .context("federated_query failed")?;
         return UnifiedQueryPortImpl::result_to_json(result, limit);
     }
-    // RAW user text: the same body that serves pgwire and
-    // `api_handlers.execute_sql` — write classification (MED-4: port plain
-    // SQL is read-only), `try_run_select` (`ComputeScheduler::route_select`),
-    // then the facade fallback (which promotes GENUINE extension SQL to the
-    // federated executor). Identity resolution per MED-3: explicit tenant,
-    // else scope-derived, else internal in force, else fail closed (401).
+    // RAW user text: AST read classification (HIGH-1, round 2 — never a
+    // substring or a parser flag), identity resolution per MED-3 (explicit
+    // tenant, else scope-derived, else internal in force, else 401), then
+    // the READ-ONLY authority entry (HIGH-1: structurally cannot reach the
+    // EXPLAIN-DML explainer or the write dispatch — only `try_run_select`,
+    // the `ComputeScheduler::route_select` decision, and the facade fallback
+    // which promotes GENUINE extension SQL to the federated executor).
     ensure_plain_sql_is_read(sql)?;
     let effective = effective_identity_or_fail(&identity)?;
     let result_cache = olap_cache_for_freshness(
@@ -616,7 +699,7 @@ async fn run_sql_via_one_planner(
     );
     let started = std::time::Instant::now();
     let mut result = adapter
-        .execute_sql_via_authority(
+        .execute_sql_read_only_via_authority(
             sql.to_string(),
             collection,
             effective.as_borrowed(),
@@ -913,7 +996,11 @@ impl UnifiedQueryPort for UnifiedQueryPortImpl {
         let query = request
             .get("query")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow!("distributed query request must have a 'query' field"))?
+            .ok_or_else(|| {
+                anyhow::Error::new(InvalidQueryInput(
+                    "distributed query request must have a 'query' field".to_string(),
+                ))
+            })?
             .to_string();
         let limit = request
             .get("limit")
@@ -923,20 +1010,22 @@ impl UnifiedQueryPort for UnifiedQueryPortImpl {
             "execute_distributed_query: {}",
             query.chars().take(120).collect::<String>()
         );
-        // NOT routed through the one-planner seam: distributed execution is
-        // an explicit `force_path = "distributed"` override onto the
-        // DistributedQueryCoordinator — a placement decision orthogonal to
-        // local engine selection (ADR-098 D5's owner-versus-reader placement
-        // is the follow-on direction, deliberately not decided here).
-        let scope_tenant = context.identity.tenant_id;
-        crate::query::request_scope::with_identity_scope(scope_tenant, async {
-            let result = self
-                .adapter
-                .distributed_query(&query)
-                .await
-                .context("distributed_query failed")?;
-            Self::result_to_json(result, limit)
-        })
+        // MED-2 (round 2): plain SQL on the distributed surface routes
+        // through the SAME read-only seam as every other port entry. The old
+        // path force-routed to the DistributedQueryCoordinator, which silently
+        // returned EMPTY rows for plain SQL (no local resolution, no error).
+        // The explicit `force_path = "distributed"` placement remains
+        // reachable through `QueryFacadeAdapter::distributed_query` for
+        // embedders; the port no longer invokes it (documented in the TD).
+        run_sql_via_one_planner(
+            &self.adapter,
+            &query,
+            None,
+            context.identity,
+            &context.freshness,
+            limit,
+            PortSqlOrigin::RawUserText,
+        )
         .await
     }
 
@@ -982,13 +1071,16 @@ impl UnifiedQueryPort for UnifiedQueryPortImpl {
         ttl_seconds: Option<u64>,
         context: UnifiedQueryPortContext<'_>,
     ) -> Result<String> {
-        let owner = prepared_owner(context.identity.tenant_id)
-            .ok_or_else(|| anyhow!("prepare_statement: no request scope"))?;
+        let owner = prepared_owner(context.identity.tenant_id).ok_or(MissingQueryIdentity(
+            "prepare_statement has no request identity; the caller must act as a tenant",
+        ))?;
         let ttl = Duration::from_secs(ttl_seconds.unwrap_or(3600));
         let cache_id = self
             .cache
             .prepare_with_ttl(&query, ttl)
-            .map_err(|e| anyhow!("prepare_statement failed: {}", e))?;
+            // L2 (round 2): a text the prepared-statement cache cannot parse
+            // or optimize is a caller error (400), not a 500.
+            .map_err(|e| InvalidQueryInput(format!("prepare_statement failed: {e}")))?;
         let statement_id = format!("stmt_{}", uuid::Uuid::new_v4().simple());
         self.prepared.insert(
             statement_id.clone(),
@@ -1359,9 +1451,17 @@ mod tests {
         for read in [
             "SELECT id, score FROM orders WHERE id = 'a'",
             "WITH t AS (SELECT 1 AS x) SELECT x FROM t",
-            "EXPLAIN SELECT 1 FROM orders",
             // A trailing comment does not change the statement class.
             "SELECT 1 -- uses <-> operator",
+            // MED-1 (round 2): the PostgreSqlDialect tokenizes `<->`, so the
+            // KNN WHERE-form parses (the GenericDialect rejected it).
+            "SELECT id FROM c WHERE embedding <-> '[1.0, 0.0]' < 1.5",
+            "SELECT * FROM c ORDER BY embedding <-> '[1.0, 0.0]' LIMIT 3",
+            "SELECT * FROM c ORDER BY vector <-> '[1,0]'::vector LIMIT 2",
+            // Positive controls for the nested-write walk: nested READS pass.
+            "SELECT * FROM (SELECT id FROM t) AS d",
+            "SELECT * FROM t WHERE id IN (SELECT id FROM u) UNION SELECT 'x'",
+            "WITH a AS (SELECT 1 AS x), b AS (SELECT x FROM a) SELECT * FROM b",
         ] {
             ensure_plain_sql_is_read(read)
                 .unwrap_or_else(|error| panic!("read must pass the classifier: {read} — {error}"));
@@ -1383,8 +1483,6 @@ mod tests {
             "DROP TABLE t",
             "INSERT INTO probe VALUES ('p', 'logged VECTOR_SEARCH(v, [0.1], 10)')",
             "UPDATE t SET note = 'GRAPH_QUERY(MATCH (n) RETURN n)'",
-            // EXPLAIN ANALYZE of a write may execute it → rejected.
-            "EXPLAIN ANALYZE DELETE FROM t",
             // Multi-statement text is not a single read.
             "SELECT 1; SELECT 2",
         ] {
@@ -1395,6 +1493,118 @@ mod tests {
                 "the rejection must name the policy: {write} — {error}"
             );
         }
+    }
+
+    /// HIGH-1 (round 2): every EXPLAIN form is rejected — the flag-based rule
+    /// let ALL parenthesized ANALYZE options through (sqlparser sets
+    /// `analyze` only for the bare keyword), executing the write.
+    #[test]
+    fn every_explain_form_is_rejected_by_the_read_only_classifier() {
+        for explain in [
+            "EXPLAIN SELECT 1 FROM t",
+            "EXPLAIN ANALYZE INSERT INTO t (id) VALUES ('a')",
+            // The round-2 bypass shapes: parenthesized option lists.
+            "EXPLAIN (ANALYZE) INSERT INTO t (id) VALUES ('a')",
+            "EXPLAIN (FORMAT JSON, ANALYZE) INSERT INTO t (id) VALUES ('a')",
+            "EXPLAIN (ANALYZE, VERBOSE) DELETE FROM t",
+            "EXPLAIN (ANALYZE off) DELETE FROM t",
+            "EXPLAIN (analyze) UPDATE t SET id = 'b'",
+            "EXPLAIN (x ANALYZE) DELETE FROM t",
+            "EXPLAIN (ANALYZE true) DELETE FROM t",
+        ] {
+            let error = ensure_plain_sql_is_read(explain)
+                .expect_err(&format!("every EXPLAIN form must be rejected: {explain}"));
+            assert!(
+                error.to_string().contains("EXPLAIN"),
+                "the rejection must name EXPLAIN: {explain} — {error}"
+            );
+        }
+        // `EXPLAIN DESCRIBE <DML>` does not parse under the PostgreSqlDialect
+        // ("Explain must be root of the plan") — a fail-closed parse
+        // rejection, which is equally a non-read.
+        assert!(
+            ensure_plain_sql_is_read("EXPLAIN DESCRIBE INSERT INTO t (id) VALUES ('a')").is_err()
+        );
+        // `DESCRIBE <DML>` (an EXPLAIN alias) is rejected too.
+        assert!(ensure_plain_sql_is_read("DESCRIBE INSERT INTO t (id) VALUES ('a')").is_err());
+        assert!(ensure_plain_sql_is_read("DESCRIBE DELETE FROM t").is_err());
+    }
+
+    /// HIGH-1 (round 2): a Query is a pure read only when NOTHING in it can
+    /// execute a write — data-modifying set-expr bodies (parenthesized or in
+    /// set operations), data-modifying CTEs, and SELECT … INTO all reject.
+    #[test]
+    fn query_shaped_writes_are_rejected_by_the_read_only_classifier() {
+        for write_shaped in [
+            // A set-expression body that IS a write.
+            "(DELETE FROM t RETURNING *)",
+            "(INSERT INTO t (id) VALUES ('a') RETURNING *)",
+            // A write in a set-operation position.
+            "SELECT 1 UNION (DELETE FROM t RETURNING *)",
+            "SELECT 1 UNION ALL (UPDATE t SET id = 'b' RETURNING *)",
+            // A data-modifying CTE.
+            "WITH del AS (DELETE FROM t RETURNING *) SELECT * FROM del",
+            "WITH ins AS (INSERT INTO t (id) VALUES ('a') RETURNING *) SELECT * FROM ins",
+            "WITH x AS (SELECT 1) DELETE FROM t",
+            "(WITH x AS (SELECT 1) DELETE FROM t)",
+            // SELECT … INTO creates a table.
+            "SELECT id INTO new_table FROM t",
+            // Writes nested below the top level: a derived table in FROM, an
+            // expression subquery, and a set-operation operand inside a CTE.
+            "SELECT * FROM (DELETE FROM t RETURNING *) AS d",
+            "SELECT * FROM t WHERE id IN (SELECT id FROM (DELETE FROM t RETURNING id) AS d)",
+            "WITH x AS (SELECT 1 UNION (UPDATE t SET id = 'b' RETURNING 1)) SELECT * FROM x",
+            "SELECT * FROM (SELECT id INTO t2 FROM t) AS d",
+        ] {
+            let error = ensure_plain_sql_is_read(write_shaped).expect_err(&format!(
+                "a query-shaped write must be rejected: {write_shaped}"
+            ));
+            assert!(
+                error.to_string().contains("read-only"),
+                "the rejection must name the policy: {write_shaped} — {error}"
+            );
+        }
+    }
+
+    /// HIGH-2 (round 2): `parse_explain_kind` parses the option list —
+    /// `(ANALYZE off)` is NOT analyze (PostgreSQL semantics; the old
+    /// substring check executed a write the user asked to only plan).
+    #[test]
+    fn parse_explain_kind_parses_the_option_list() {
+        use crate::query::sql_frontend::parse_explain_kind;
+        assert_eq!(
+            parse_explain_kind("EXPLAIN (ANALYZE) DELETE FROM t"),
+            Some((true, "DELETE FROM t"))
+        );
+        assert_eq!(
+            parse_explain_kind("EXPLAIN (FORMAT JSON, ANALYZE) DELETE FROM t"),
+            Some((true, "DELETE FROM t"))
+        );
+        assert_eq!(
+            parse_explain_kind("EXPLAIN (analyze, verbose) DELETE FROM t"),
+            Some((true, "DELETE FROM t"))
+        );
+        assert_eq!(
+            parse_explain_kind("EXPLAIN (ANALYZE off) DELETE FROM t"),
+            Some((false, "DELETE FROM t"))
+        );
+        assert_eq!(
+            parse_explain_kind("EXPLAIN (ANALYZE false) DELETE FROM t"),
+            Some((false, "DELETE FROM t"))
+        );
+        assert_eq!(
+            parse_explain_kind("EXPLAIN (ANALYZE 0) DELETE FROM t"),
+            Some((false, "DELETE FROM t"))
+        );
+        assert_eq!(
+            parse_explain_kind("EXPLAIN (VERBOSE) SELECT 1"),
+            Some((false, "SELECT 1"))
+        );
+        assert_eq!(
+            parse_explain_kind("EXPLAIN ANALYZE SELECT 1"),
+            Some((true, "SELECT 1"))
+        );
+        assert_eq!(parse_explain_kind("SELECT 1"), None);
     }
 
     #[test]

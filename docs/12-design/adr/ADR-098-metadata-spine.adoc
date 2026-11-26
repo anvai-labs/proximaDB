@@ -221,13 +221,25 @@ relational table resolves for them, so the scheduler decision has nothing to
 decide), `UnifiedQueryPortContext` carries `PortIdentity` +
 `VectorFreshnessMode` (Strong bypasses the OLAP result-cache lookup, mandate
 #16c), and the parity suites cover pgwire, REST v2 `/sql`+`/api/v2/query`,
-canonical `/sql`, gRPC and MCP with a mutation probe on a real leg. Two
-carve-outs: `execute_distributed_query` stays on its explicit
-`force_path="distributed"` placement override, and the port's `explain`
-remains the adapter's heuristic sketch (not the scheduler's decision trace).
-Plain SQL on the port surfaces is read-only (DDL/DML → 4xx naming the
-policy); the guarded write surfaces are `/api/v2/sql`, gRPC `ExecuteQuery`
-and pgwire.
+canonical `/sql`, gRPC and MCP with a mutation probe on a real leg (live
+parity: pgwire + `/api/v2/sql` + `/api/v2/query`; canonical `/sql` is
+unrouted and, with MCP, has in-process parity only; route-decision parity is
+structural, not asserted — see TD-SPINE-6 *Acceptance as delivered*). One
+carve-out: the port's `explain` remains the adapter's heuristic sketch (not
+the scheduler's decision trace). Round 2 (2026-11-25): `execute_distributed_query`
+no longer force-routes plain SQL to the distributed coordinator (it returned
+silent-empty rows); it runs through the same read-only seam. Owner/reader
+placement is filed as TD-PLACE-1.
+
+*Decision (2026-11-25):* plain SQL on UnifiedQueryPort surfaces (MCP search,
+/api/v2/query, /api/v2/unified/*, prepared, canonical /sql) is read-only;
+writes are served by /api/v2/sql. Rationale: those surfaces lacked
+/api/v2/sql's single-statement, size and deadline guards and ABAC/permission
+mapping. Read-vs-write is decided on the statement AST (a single pure query
+— no data-modifying set-expression bodies or CTEs, no `SELECT … INTO`, no
+`EXPLAIN`), and accepted reads execute through the authority's read-only
+entry `execute_sql_read_only_via_authority`, which structurally cannot reach
+the EXPLAIN-DML explainer or the write dispatch.
 
 [[_d6_supersessions]]
 === D6 — Supersessions and amendments

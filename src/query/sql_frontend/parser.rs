@@ -74,7 +74,27 @@ pub fn parse_explain_kind(query: &str) -> Option<(bool, &str)> {
     if after_explain.starts_with('(') {
         let close = after_explain.find(')')?;
         let options = &after_explain[1..close];
-        let is_analyze = options.to_ascii_uppercase().contains("ANALYZE");
+        // TD-SPINE-6 round 2 (HIGH-1): parse the option list, do not substring
+        // it. PostgreSQL semantics: `ANALYZE` (bare) or with a truthy value
+        // (`ANALYZE true/on/1`) enables execution; a falsy value
+        // (`ANALYZE off/false/0`) DISABLES it — the old
+        // `options.contains("ANALYZE")` treated `(ANALYZE off)` as an
+        // executing analyze, running a write the user asked to only plan.
+        let is_analyze = options.split(',').any(|option| {
+            let option = option.trim();
+            let upper = option.to_ascii_uppercase();
+            if let Some(value) = upper.strip_prefix("ANALYZE") {
+                let value = value.trim();
+                match value {
+                    "" | "TRUE" | "ON" | "1" => true,
+                    "FALSE" | "OFF" | "0" => false,
+                    // Unknown value: fail closed (treat as executing).
+                    _ => true,
+                }
+            } else {
+                false
+            }
+        });
         let rest = after_explain[close + 1..].trim_start();
         return Some((is_analyze, rest));
     }

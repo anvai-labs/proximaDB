@@ -1,0 +1,61 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-PLACE-1: owner-versus-reader placement + cache-affine reader hashing
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open** (filed 2026-11-25).
+| Priority | **MEDIUM**. Scans on a multi-pod deployment land on arbitrary pods, so the
+footer/segment/result caches warm on every pod for the same partition instead of one. The cost is
+the dominant cloud term: repeated object-store GETs and cold-cache latency (co-design mandate:
+I/O round-trips). Correctness is unaffected, so this is not HIGH.
+| Component | `src/query/compute_scheduler.rs` (the ONE decision path — TD-SPINE-6 — where a placement
+decision would attach); `src/network/multi_server.rs` / the request router in front of the pods;
+the partition-lease / write-fence machinery (`docs/12-design/LEASE_FENCE_REREVIEW_AND_A6_TD_2026_06_25.adoc`);
+the per-pod caches (footer cache, segment directory cache, OLAP result cache).
+| Authority | link:../../12-design/adr/ADR-098-metadata-spine.adoc[ADR-098] D5 (follow-on direction, "not decided here")
+| Relates to | TD-SPINE-6 (one decision path — prerequisite, implemented 2026-11-24/25), ADR-098 D5,
+`docs/12-design/TENANT_COLLECTION_POD_AFFINITY_2026_05_27.adoc` (tenant/collection → pod affinity design note)
+|===
+
+== Problem
+
+ADR-098 D5 (from the 2026-11-19 pre-GA spine checkpoint, ADR-098 *Context*) names
+owner-versus-reader placement as the follow-on to the one-decision-path work and leaves it
+undecided. TD-SPINE-6 converged every surface onto the `ComputeScheduler` decision path, which is
+the precondition ("once one decision path exists"), but the placement itself was only a sentence in
+the TD-SPINE-6 *Fix* list and was never filed. Today:
+
+* Writes and `VectorFreshnessMode::Strong` reads have no notion of the partition-lease holder at
+  the routing layer; a request reaches whichever pod received it.
+* Scans (Eventual/Bounded reads) are not hashed to a stable reader, so the same partition's cache
+  footprint is duplicated across pods and the hit rate per node is diluted by the pod count.
+
+== Design direction (from ADR-098 D5 and the checkpoint)
+
+. **Owner router.** Writes and Strong reads for a (tenant, collection/partition) route to the
+  current partition-lease holder (the writer that owns the WAL + memtable for it). The lease/fence
+  is the authority; the router only caches the holder and re-resolves on a fence mismatch.
+. **Reader router.** Non-Strong scans route to a stateless reader chosen by a cache-affine hash
+  (rendezvous / consistent hashing over the healthy reader set) of the (tenant, collection,
+  partition) key, so one reader keeps a partition's footer/segment/result caches warm. Membership
+  change moves only ~1/N of keys.
+. **One decision path.** The placement decision is an attribute of the existing
+  `ComputeScheduler` decision (backend + placement), not a second router beside it (CLAUDE.md
+  #18b); it emits the query-scoped I/O trace so the cache-hit dimension is observable.
+. Isolation stays structural: the hash key includes `tenant_id`, every hop carries
+  `TenantContext`, and placement never widens what a tenant can read.
+
+== Acceptance
+
+* **Cache-hit-rate per node** (the gate): on a multi-pod run (≥ 3 readers) replaying a fixed scan
+  trace, the per-node footer/segment cache hit rate with cache-affine routing is measured against
+  the round-robin baseline on the SAME trace, and the object-store GETs per query drop
+  accordingly; both recorded in `BENCHMARK_EVIDENCE.toml` (measured end-to-end, not a kernel
+  microbenchmark).
+* A membership-change test shows only the moved keys' caches go cold (hit rate on unmoved keys
+  unchanged within tolerance).
+* Writes and Strong reads always execute on the lease holder (negative control: a stale holder
+  cache is fenced and re-resolved, never served).
+* Tenant isolation tests unchanged and green.

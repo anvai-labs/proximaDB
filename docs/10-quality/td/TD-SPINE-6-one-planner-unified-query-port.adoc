@@ -5,7 +5,7 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | **Implemented** (filed 2026-11-19; implemented 2026-11-24 — see *Evidence*).
+| Status | **Implemented (scoped — see dated acceptance note)** (filed 2026-11-19; implemented 2026-11-24, hardened 2026-11-25 — see *Acceptance as delivered* and *Evidence*).
 | Priority | **MEDIUM-HIGH**. The same SQL can behave differently by surface: freshness, routing, the ADR-025 delta merge and caching exist on one core only. This is the per-surface fork that CLAUDE.md #18b forbids.
 | Component | `crates/platform/proximadb-runtime/src/unified_query_port.rs` (the port trait + `UnifiedQueryPortContext`); `src/query/unified_query_port_impl.rs` (the delegation seam `run_sql_via_one_planner`); `src/query/facade/adapter.rs` (`execute_sql_via_authority`, extracted from the `QueryAdapterPort::execute_sql` body — the ONE SQL authority); `src/query/compute_scheduler.rs` (unchanged — still the only engine-selection point); callers: `src/network/rest/canonical/handlers.rs`, `src/network/rest/v2/query.rs`, `src/network/mcp/backend.rs`, `crates/platform/proximadb-api/src/rest/canonical/multimodal_query.rs`.
 | Authority | link:../../12-design/adr/ADR-098-metadata-spine.adoc[ADR-098] D5 (seam S6); ADR-097 D1, ADR-064 D1, ADR-053 D2
@@ -37,7 +37,30 @@
   identity struct).
 . Extend the parity suite to canonical `/sql` and pgwire with the same SQL.
 . Owner-versus-reader placement (partition-lease holder vs cache-affine stateless readers) is a
-  follow-on TD once one decision path exists.
+  follow-on TD once one decision path exists — filed as
+  link:TD-PLACE-1-owner-reader-placement-cache-affine-routing.adoc[TD-PLACE-1].
+
+== Acceptance as delivered (dated note, 2026-11-25)
+
+The plan's acceptance was "same rows AND the same route decision over pgwire, REST v2, canonical
+`/sql`, gRPC and MCP". What this TD actually proves is narrower:
+
+* **Proven — live (full server, `tests/spine6_one_planner_parity_e2e.rs`):** row parity for the
+  same SQL over pgwire + `/api/v2/sql` + `/api/v2/query`.
+* **Proven — in-process only (`tests/integration/query_facade/test_sql_transport_rendering_parity.rs`):**
+  row parity for canonical `/sql` (that handler is NOT mounted on the live router — it is
+  unrouted, so only its in-process handler is exercised) and MCP `search`, plus REST v2 vs gRPC
+  rendering parity; the round-2 read-only/EXPLAIN-bypass and tenant-scoping regressions on every
+  port leg.
+* **Structural, not proven by a test:** every surface's relational READ reaches the single
+  `ComputeScheduler::route_select*` call site inside `try_run_select`; no second decision path
+  exists. **Route-decision parity itself is NOT asserted** (no test compares the decision object
+  across surfaces).
+* **NOT implemented:** routing multi-model extension-SQL plans through the same
+  `SelectRouteDecision` (they keep the federated lowering), and owner/reader placement
+  (TD-PLACE-1).
+* **Policy outside the plan:** plain SQL on the port surfaces is READ-ONLY — recorded as a dated
+  decision in ADR-098 D5.
 
 == Implementation (2026-11-24)
 
@@ -50,6 +73,9 @@
   every port SQL entry (`execute_unified_query`, `execute_multi_model_query`,
   `execute_federated_query`, `execute_prepared`) through that ONE body for plain SQL,
   discriminated by the adapter's single `should_use_federated_request` (now `pub(crate)`).
+  _Superseded:_ round 1 replaced that text discriminator with the `PortSqlOrigin` tag (only
+  port-synthesized UQL/multi-model text takes the federated branch), and round 2 routes raw
+  user text through the read-only entry `execute_sql_read_only_via_authority` (see below).
   The port grows **no routing of its own**: `ComputeScheduler::route_select*` remains the only
   engine-selection point reached by every surface.
 . **UQL claiming rule.** The UQL grammar overlaps plain SQL and an un-prefixed `FROM` defaults
@@ -130,7 +156,9 @@
 * **MED-4 (writes on read-labelled surfaces — policy decided, dated
   2026-11-24):** plain SQL on `UnifiedQueryPort` surfaces (MCP `search`,
   `/api/v2/query`, `/api/v2/unified/*`, canonical `/sql`, prepared) is
-  **READ-ONLY** — `SELECT`/`WITH…SELECT`/`EXPLAIN` of a read. DDL/DML
+  **READ-ONLY** — `SELECT`/`WITH…SELECT`/`EXPLAIN` of a read (_round 2
+  narrowed this: a single pure query only, and EVERY `EXPLAIN` form is
+  rejected — see below_). DDL/DML
   (including `EXPLAIN ANALYZE` of a write) is rejected as a client error
   (400 at HTTP; a typed tool error on MCP) naming the policy and pointing at
   the guarded write surfaces (`/api/v2/sql` with single-statement validation
@@ -153,6 +181,50 @@
   port's `explain` remains the adapter's heuristic sketch, not the
   scheduler's decision trace.
 
+== Round-2 review fixes (2026-11-25, fresh-agent adversarial review)
+
+* **HIGH-1 (the read-only classifier was bypassable — fixed on BOTH axes):**
+  (a) the classifier now decides on the statement **AST** — a single pure
+  `SELECT` only: data-modifying set-expression bodies (`SELECT 1 UNION
+  (DELETE … RETURNING *)`), data-modifying CTEs, `SELECT … INTO`, and EVERY
+  `EXPLAIN` (parenthesized `ANALYZE` forms included — sqlparser's `analyze`
+  flag is false for all of them, so the flag is no longer consulted) are
+  rejected; parsing moved to `PostgreSqlDialect`. (b) the authority gained a
+  **read-only entry** (`execute_sql_read_only_via_authority`) that
+  structurally cannot reach the EXPLAIN-DML explainer or the write dispatch,
+  and the port routes raw text through it — the port no longer depends on a
+  parallel classifier matching the authority's parsing.
+* **HIGH-2 (pre-existing, newly reachable — fixed):** `EXPLAIN (ANALYZE)
+  <DML>` executed the write **unscoped** (`execute_scoped(statement, None)`).
+  `explain_analyze_table_write` now takes the caller's `TenantContext` —
+  threaded from the port identity in the adapter and from the connection's
+  write tenant in pgwire — so an analyzed DML executes within its tenant.
+  `parse_explain_kind` now parses the option list (`(ANALYZE off)` is NOT
+  analyze — PostgreSQL semantics; the old substring check executed a write
+  the user asked to only plan).
+* **MED-1:** the classifier parses with `PostgreSqlDialect`, so `<->` KNN reads
+  are no longer rejected; the port adds no GenericDialect validation of its
+  own. Over a real vector collection the WHERE form returns the authority
+  body's rows on every port leg; the `ORDER BY … <-> … LIMIT` forms are an
+  authority-body error in the embedded stack ("vector search service is
+  unavailable", pre-existing) and the port legs fail identically.
+  `/api/v2/sql` still rejects `<->` at its GenericDialect single-statement
+  validation (pre-existing, unchanged).
+* **MED-2:** `/api/v2/unified/distributed` plain SQL routes through the same
+  read-only seam (no more silent-empty for keyword-bearing SELECTs); the
+  forced-distributed placement stays reachable via
+  `QueryFacadeAdapter::distributed_query` for embedders.
+* **L2–L5:** typed 401/400 for the fail-closed paths (prepare-without-identity,
+  UQL-lowered-without-scope, distributed — plus canonical `sql_error_to_api`
+  mappings); MCP policy rejections are JSON-RPC INVALID_PARAMS (-32602);
+  1 MiB cap on every port text + 60s deadline on `/api/v2/query` and
+  `/unified/*` (504 on expiry); prepared-cache parse/optimize failures are
+  400; no "use /api/v2/sql for writes" suffix is appended to read parse
+  failures (the policy rejection itself names `/api/v2/sql`).
+* **L7 (decision):** EXPLAIN is **not served** on the read-only port — a
+  clear 400 names it (the authority's `EXPLAIN SELECT` is a pre-existing 500
+  on `/api/v2/sql`; advertising it here would promise a path that errors).
+
 == Evidence
 
 * `tests/integration/query_facade/test_sql_transport_rendering_parity.rs`:
@@ -169,6 +241,19 @@
   rendering); `scope_less_port_call_is_unauthorized_not_internal` (LOW-6: 401);
   `plain_sql_through_the_port_fails_closed_without_identity_or_scope` (typed gate + positive
   control).
+* Round 2 (2026-11-25), `test_sql_transport_rendering_parity.rs`:
+  `explain_bypass_and_query_shaped_writes_are_400_with_state_unchanged_on_every_port_leg`
+  (15 shapes × 8 port legs: 400 + tenant view AND unscoped view unchanged; positive read
+  control); `explain_analyze_dml_is_tenant_scoped_and_cannot_touch_another_tenant` (HIGH-2);
+  `pgvector_knn_sql_on_every_port_leg_matches_the_authority_body` (MED-1);
+  `distributed_plain_sql_returns_the_authority_rows` (MED-2);
+  `mcp_and_prepared_reject_explain_analyze_writes` (L3). E2E:
+  `explain_analyze_dml_is_rejected_on_the_query_surface_e2e`,
+  `pgvector_knn_read_is_not_rejected_by_the_port_classifier_e2e`,
+  `explain_analyze_dml_is_tenant_scoped_e2e`. Unit:
+  `every_explain_form_is_rejected_by_the_read_only_classifier`,
+  `query_shaped_writes_are_rejected_by_the_read_only_classifier`,
+  `parse_explain_kind_parses_the_option_list`.
 * `tests/spine6_one_planner_parity_e2e.rs` (full server):
   `same_sql_one_planner_across_pgwire_rest_v2_and_unified_query_e2e` (pgwire vs `/api/v2/sql` vs
   `/api/v2/query` with a plain-SQL body — one server, identical rows; plus the MED-4 DELETE probe:
@@ -182,8 +267,11 @@
   `plain_relational_select_is_not_a_uql_claim`, `sql_result_renders_the_port_envelope`,
   `prepared_owner_prefers_the_explicit_identity_tenant`
   (`src/query/unified_query_port_impl.rs`).
-* Route-decision parity is structural: every surface now reaches the one
+* Route-decision parity is structural: every surface's relational READS reach the one
   `ComputeScheduler::route_select*` call site inside `try_run_select` (no second decision path
-  exists to diverge), and row/rendering parity is asserted end-to-end above.
+  exists to diverge). Qualification (round 2): the authority's write/EXPLAIN-DML arms remain
+  reachable only from the WRITE surfaces (`/api/v2/sql`, gRPC, pgwire); the port's explain is
+  the heuristic sketch; `distributed` no longer force-routes. Row/rendering parity is asserted
+  end-to-end above.
 * Regression: pgwire, `/api/v2/sql`, gRPC `ExecuteQuery` and `api_handlers` are untouched code
   paths (the trait method forwards with the same cache argument); their suites stay green.

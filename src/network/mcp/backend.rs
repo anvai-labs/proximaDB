@@ -203,7 +203,24 @@ impl ReferenceBackend for EngineBackend {
             port.execute_unified_query(q, None, Some(id), limit, context),
         )
         .await
-        .map_err(|e| BackendError::internal(format!("search failed: {e}")))
+        .map_err(|error| {
+            // L3 (round 2): client-shaped rejections are INVALID_PARAMS
+            // (JSON-RPC -32602), not INTERNAL — the read-only policy and the
+            // query-shape rejections are caller errors.
+            if error
+                .downcast_ref::<proximadb_runtime::InvalidQueryInput>()
+                .is_some()
+            {
+                BackendError::invalid_params(format!("search rejected: {error}"))
+            } else if error
+                .downcast_ref::<proximadb_runtime::MissingQueryIdentity>()
+                .is_some()
+            {
+                BackendError::invalid_params(format!("search has no tenant identity: {error}"))
+            } else {
+                BackendError::internal(format!("search failed: {error}"))
+            }
+        })
     }
 
     async fn memory(&self, args: &Value) -> Result<Value, BackendError> {

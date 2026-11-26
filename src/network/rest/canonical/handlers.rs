@@ -1273,6 +1273,20 @@ async fn execute_sql_in_scope(
 fn sql_error_to_api(error: anyhow::Error) -> ApiError {
     match crate::services::operations::vectors::collection_not_found(&error) {
         Some(missing) => ApiError::CollectionNotFound(missing.identifier.clone()),
+        // L2 (round 2): typed port rejections map to 4xx — the read-only
+        // policy / query-shape class is a 400; a missing identity is a 401.
+        None if error
+            .downcast_ref::<proximadb_runtime::InvalidQueryInput>()
+            .is_some() =>
+        {
+            ApiError::InvalidArgument(error.to_string())
+        }
+        None if error
+            .downcast_ref::<proximadb_runtime::MissingQueryIdentity>()
+            .is_some() =>
+        {
+            ApiError::Unauthorized(error.to_string())
+        }
         None => ApiError::Internal(error.to_string()),
     }
 }

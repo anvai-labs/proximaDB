@@ -1160,8 +1160,11 @@ export interface paths {
         put?: never;
         /**
          * Execute a unified (UQL) query.
-         * @description The optional `X-Tenant-ID` header is not consulted by this
-         *     handler — unified queries run without tenant selection.
+         * @description The `X-Tenant-ID` header (or the authenticated tenant) scopes this
+         *     query — it is threaded as the port identity (ADR-098 D5 /
+         *     TD-SPINE-6); without it the query fails closed (401). Plain SQL on
+         *     this surface is read-only (pure SELECT); writes are served by
+         *     /api/v2/sql.
          */
         post: operations["executeUnifiedQuery"];
         delete?: never;
@@ -1181,8 +1184,11 @@ export interface paths {
         put?: never;
         /**
          * Execute a multi-model query (free-form body).
-         * @description The optional `X-Tenant-ID` header is not consulted by this
-         *     handler — unified queries run without tenant selection.
+         * @description The `X-Tenant-ID` header (or the authenticated tenant) scopes this
+         *     query — it is threaded as the port identity (ADR-098 D5 /
+         *     TD-SPINE-6); without it the query fails closed (401). Plain SQL on
+         *     this surface is read-only (pure SELECT); writes are served by
+         *     /api/v2/sql.
          */
         post: operations["executeMultiModelQuery"];
         delete?: never;
@@ -1202,8 +1208,11 @@ export interface paths {
         put?: never;
         /**
          * Execute a federated query.
-         * @description The optional `X-Tenant-ID` header is not consulted by this
-         *     handler — unified queries run without tenant selection.
+         * @description The `X-Tenant-ID` header (or the authenticated tenant) scopes this
+         *     query — it is threaded as the port identity (ADR-098 D5 /
+         *     TD-SPINE-6); without it the query fails closed (401). Plain SQL on
+         *     this surface is read-only (pure SELECT); writes are served by
+         *     /api/v2/sql.
          */
         post: operations["executeFederatedQuery"];
         delete?: never;
@@ -1223,8 +1232,11 @@ export interface paths {
         put?: never;
         /**
          * Execute a distributed query.
-         * @description The optional `X-Tenant-ID` header is not consulted by this
-         *     handler — unified queries run without tenant selection.
+         * @description The `X-Tenant-ID` header (or the authenticated tenant) scopes this
+         *     query — it is threaded as the port identity (ADR-098 D5 /
+         *     TD-SPINE-6); without it the query fails closed (401). Plain SQL on
+         *     this surface is read-only (pure SELECT); writes are served by
+         *     /api/v2/sql.
          */
         post: operations["executeDistributedQuery"];
         delete?: never;
@@ -1244,8 +1256,11 @@ export interface paths {
         put?: never;
         /**
          * Explain a unified query (plan, no execution).
-         * @description The optional `X-Tenant-ID` header is not consulted by this
-         *     handler — unified queries run without tenant selection.
+         * @description The `X-Tenant-ID` header (or the authenticated tenant) scopes this
+         *     query — it is threaded as the port identity (ADR-098 D5 /
+         *     TD-SPINE-6); without it the query fails closed (401). Plain SQL on
+         *     this surface is read-only (pure SELECT); writes are served by
+         *     /api/v2/sql.
          */
         post: operations["explainUnifiedQuery"];
         delete?: never;
@@ -1265,8 +1280,11 @@ export interface paths {
         put?: never;
         /**
          * Prepare a statement for repeated execution.
-         * @description The optional `X-Tenant-ID` header is not consulted by this
-         *     handler — unified queries run without tenant selection.
+         * @description The `X-Tenant-ID` header (or the authenticated tenant) scopes this
+         *     query — it is threaded as the port identity (ADR-098 D5 /
+         *     TD-SPINE-6); without it the query fails closed (401). Plain SQL on
+         *     this surface is read-only (pure SELECT); writes are served by
+         *     /api/v2/sql.
          */
         post: operations["prepareStatement"];
         delete?: never;
@@ -1288,8 +1306,11 @@ export interface paths {
         put?: never;
         /**
          * Execute a prepared statement with parameters.
-         * @description The optional `X-Tenant-ID` header is not consulted by this
-         *     handler — unified queries run without tenant selection.
+         * @description The `X-Tenant-ID` header (or the authenticated tenant) scopes this
+         *     query — it is threaded as the port identity (ADR-098 D5 /
+         *     TD-SPINE-6); without it the query fails closed (401). Plain SQL on
+         *     this surface is read-only (pure SELECT); writes are served by
+         *     /api/v2/sql.
          */
         post: operations["executePreparedStatement"];
         delete?: never;
@@ -1312,8 +1333,11 @@ export interface paths {
         post?: never;
         /**
          * Delete a prepared statement.
-         * @description The optional `X-Tenant-ID` header is not consulted by this
-         *     handler — unified queries run without tenant selection.
+         * @description The `X-Tenant-ID` header (or the authenticated tenant) scopes this
+         *     query — it is threaded as the port identity (ADR-098 D5 /
+         *     TD-SPINE-6); without it the query fails closed (401). Plain SQL on
+         *     this surface is read-only (pure SELECT); writes are served by
+         *     /api/v2/sql.
          */
         delete: operations["deletePreparedStatement"];
         options?: never;
@@ -1332,8 +1356,11 @@ export interface paths {
         put?: never;
         /**
          * Prepared-statement execution statistics.
-         * @description The optional `X-Tenant-ID` header is not consulted by this
-         *     handler — unified queries run without tenant selection.
+         * @description The `X-Tenant-ID` header (or the authenticated tenant) scopes this
+         *     query — it is threaded as the port identity (ADR-098 D5 /
+         *     TD-SPINE-6); without it the query fails closed (401). Plain SQL on
+         *     this surface is read-only (pure SELECT); writes are served by
+         *     /api/v2/sql.
          */
         post: operations["getPreparedStats"];
         delete?: never;

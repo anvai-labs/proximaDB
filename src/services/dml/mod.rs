@@ -4425,13 +4425,20 @@ impl DmlService {
 
     /// Plan the write and then execute it, returning the route explanation enriched with actual
     /// wall-clock time and rows written. Used for `EXPLAIN ANALYZE <DML>`.
+    ///
+    /// TD-SPINE-6 round 2 (HIGH-2): the ANALYZED write executes **within the
+    /// caller's tenant scope** — previously `self.execute(...)` ran unscoped
+    /// (`execute_scoped(statement, None)`), so a tenant's `EXPLAIN (ANALYZE)
+    /// <DML>` could mutate another tenant's (unscoped) rows. `None` keeps the
+    /// legacy single-tenant semantics.
     pub async fn explain_analyze_table_write(
         &self,
         statement: DmlStatement,
+        tenant_context: Option<&TenantContext>,
     ) -> Result<TableWriteRouteExplanation> {
         let mut explanation = self.explain_table_write(statement.clone()).await?;
         let t0 = std::time::Instant::now();
-        let result = self.execute(statement).await?;
+        let result = self.execute_scoped(statement, tenant_context).await?;
         let elapsed_us = t0.elapsed().as_micros() as u64;
         explanation.execution_elapsed_us = Some(elapsed_us);
         explanation.execution_rows_written = Some(result.rows_affected);

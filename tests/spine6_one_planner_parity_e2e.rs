@@ -327,3 +327,201 @@ async fn strong_freshness_port_read_sees_every_write_with_result_cache_on_e2e() 
         "Strong-freshness port read must observe every committed write: {port_json}"
     );
 }
+
+/// HIGH-1 (round 2): `EXPLAIN (ANALYZE) <DML>` over the live `/api/v2/query`
+/// surface is a 400 with STATE UNCHANGED (the parenthesized-ANALYZE bypass
+/// executed the write pre-fix).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn explain_analyze_dml_is_rejected_on_the_query_surface_e2e() {
+    let server = TestPgServer::start().await.expect("server start");
+    let client = server.connect().await.expect("pgwire connect");
+    let table = server.unique_name("spine6_r2");
+    pg_server::rows(&client, &format!("CREATE TABLE {table} (id TEXT)")).await;
+    pg_server::rows(
+        &client,
+        &format!("INSERT INTO {table} (id) VALUES ('keep')"),
+    )
+    .await;
+    let (http, base) = server.rest_client().expect("rest client");
+
+    for statement in [
+        format!("EXPLAIN (ANALYZE) INSERT INTO {table} (id) VALUES ('rogue')"),
+        format!("EXPLAIN (FORMAT JSON, ANALYZE) DELETE FROM {table}"),
+        format!("EXPLAIN (ANALYZE, VERBOSE) UPDATE {table} SET id = 'x'"),
+    ] {
+        let response = post_tenant_json(
+            &http,
+            format!("{base}/api/v2/query"),
+            "proximadb",
+            json!({ "language": "uql", "query": statement }),
+        )
+        .await
+        .expect("probe sends");
+        let status = response.status();
+        let body: serde_json::Value = response.json().await.expect("rejection body");
+        assert_eq!(
+            status,
+            reqwest::StatusCode::BAD_REQUEST,
+            "EXPLAIN Analyze DML must be a 400: {body}"
+        );
+        assert!(
+            body.to_string().contains("EXPLAIN"),
+            "the rejection must name EXPLAIN: {body}"
+        );
+    }
+
+    // State unchanged (the tenant view over pgwire).
+    let rows = pg_server::rows(&client, &format!("SELECT id FROM {table}")).await;
+    assert_eq!(
+        rows,
+        vec![vec!["keep".to_string()]],
+        "state must be unchanged: {rows:?}"
+    );
+}
+
+/// MED-1 (round 2): on the LIVE server, a `<->` KNN read on `/api/v2/query`
+/// is no longer rejected by the port's classifier (the GenericDialect
+/// classifier answered a wrong "read-only" 400). Row parity against the
+/// authority body over a real vector collection is pinned in-process
+/// (`pgvector_knn_sql_on_every_port_leg_matches_the_authority_body`);
+/// `/api/v2/sql` itself still rejects `<->` at its GenericDialect
+/// single-statement validation (pre-existing, unchanged by this PR).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pgvector_knn_read_is_not_rejected_by_the_port_classifier_e2e() {
+    let server = TestPgServer::start().await.expect("server start");
+    let client = server.connect().await.expect("pgwire connect");
+    let table = server.unique_name("spine6_knn");
+    pg_server::rows(
+        &client,
+        &format!("CREATE TABLE {table} (id TEXT, embedding TEXT)"),
+    )
+    .await;
+    let (http, base) = server.rest_client().expect("rest client");
+    for knn in [
+        format!("SELECT id FROM {table} WHERE embedding <-> '[1.0, 0.0]' < 1.5"),
+        format!("SELECT id FROM {table} ORDER BY embedding <-> '[1.0, 0.0]' LIMIT 3"),
+    ] {
+        let port = post_tenant_json(
+            &http,
+            format!("{base}/api/v2/query"),
+            "proximadb",
+            json!({ "language": "uql", "query": knn }),
+        )
+        .await
+        .expect("port leg sends");
+        let status = port.status();
+        let text = port.text().await.unwrap_or_default();
+        assert!(
+            !text.contains("read-only") && !text.contains("cannot parse"),
+            "a <-> read must not be rejected by the port classifier ({status}): {knn} — {text}"
+        );
+    }
+}
+
+/// HIGH-2 (round 2): `EXPLAIN (ANALYZE) <DML>` executes within the CALLER's
+/// tenant — tenant `acme`'s analyzed DELETE cannot touch tenant `default`'s
+/// rows in the same table name (pre-fix the analyzed write ran unscoped).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn explain_analyze_dml_is_tenant_scoped_e2e() {
+    let server = TestPgServer::start().await.expect("server start");
+    let table = server.unique_name("spine6_xt");
+    let (http, base) = server.rest_client().expect("rest client");
+
+    // The VICTIM table lives in the DEFAULT tenant (the namespace unscoped
+    // resolution sees — exactly the pre-fix exploit's target); the ATTACKER
+    // is tenant acme.
+    // /api/v2/sql is single-statement: seed with two requests.
+    for seed in [
+        format!("CREATE TABLE {table} (id TEXT)"),
+        format!("INSERT INTO {table} (id) VALUES ('victim-row')"),
+    ] {
+        let victim_seed = post_tenant_json(
+            &http,
+            format!("{base}/api/v2/sql"),
+            "default",
+            json!({ "query": seed }),
+        )
+        .await
+        .expect("victim seed sends");
+        let seed_status = victim_seed.status();
+        assert_eq!(
+            seed_status,
+            reqwest::StatusCode::OK,
+            "victim seed {seed}: {}",
+            victim_seed.text().await.unwrap_or_default()
+        );
+    }
+
+    // The ATTACK: tenant acme runs an ANALYZEd DELETE against the victim's
+    // table. Pre-fix the analyzed write executed UNSCOPED and deleted the
+    // victim's row; post-fix the execution is scoped to acme, which has no
+    // such table — the write fails WITHOUT touching the victim's data. (The
+    // EXPLAIN planning itself resolving the default-tenant table unscoped is
+    // pre-existing schema-existence visibility, unchanged by this PR.)
+    let attack = post_tenant_json(
+        &http,
+        format!("{base}/api/v2/sql"),
+        "acme",
+        json!({ "query": format!("EXPLAIN (ANALYZE, VERBOSE) DELETE FROM {table} WHERE id = 'victim-row'") }),
+    )
+    .await
+    .expect("attack sends");
+    let attack_status = attack.status();
+
+    // The victim's row must SURVIVE the attack regardless of the attack's
+    // own outcome.
+    let victim_after = post_tenant_json(
+        &http,
+        format!("{base}/api/v2/sql"),
+        "default",
+        json!({ "query": format!("SELECT id FROM {table}") }),
+    )
+    .await
+    .expect("victim read sends");
+    let body: serde_json::Value = victim_after.json().await.expect("victim read body");
+    let ids: Vec<String> = body["rows"]
+        .as_array()
+        .map(|rows| {
+            rows.iter()
+                .map(|row| row["id"].as_str().unwrap_or_default().to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    assert_eq!(
+        ids,
+        vec!["victim-row".to_string()],
+        "acme's analyzed DELETE must not touch the default tenant's rows (attack status {attack_status}): {body}"
+    );
+
+    // Positive scoped arm: the DEFAULT tenant's own analyzed DELETE executes
+    // (planning resolves for it) and deletes ITS OWN row — the write path is
+    // alive, only the CROSS-tenant reach is closed.
+    let own = post_tenant_json(
+        &http,
+        format!("{base}/api/v2/sql"),
+        "default",
+        json!({ "query": format!("EXPLAIN (ANALYZE) DELETE FROM {table} WHERE id = 'victim-row'") }),
+    )
+    .await
+    .expect("own analyzed delete sends");
+    assert_eq!(
+        own.status(),
+        reqwest::StatusCode::OK,
+        "the tenant's own analyzed delete must execute: {}",
+        own.text().await.unwrap_or_default()
+    );
+    let after = post_tenant_json(
+        &http,
+        format!("{base}/api/v2/sql"),
+        "default",
+        json!({ "query": format!("SELECT id FROM {table}") }),
+    )
+    .await
+    .expect("final read sends");
+    let after_body: serde_json::Value = after.json().await.expect("final read body");
+    assert_eq!(
+        after_body["rows"].as_array().map(Vec::len),
+        Some(0),
+        "the tenant's own row must be deleted: {after_body}"
+    );
+}

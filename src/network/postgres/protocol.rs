@@ -3906,8 +3906,15 @@ impl PostgresProtocol {
         };
 
         let write_intent_overrides = self.write_intent_overrides_from_session().await;
+        // TD-SPINE-6 round 2 (HIGH-2): the ANALYZEd write executes within the
+        // connection's write tenant — previously it ran unscoped.
+        let analyze_tenant = self.pgwire_resolve_write_tenant().await;
+        let analyze_tenant_ctx =
+            crate::storage::tenant::context::TenantContext::for_tenant_id(&analyze_tenant);
         let explain_result = if is_analyze {
-            dml_service.explain_analyze_table_write(statement).await
+            dml_service
+                .explain_analyze_table_write(statement, Some(&analyze_tenant_ctx))
+                .await
         } else {
             dml_service
                 .explain_table_write_with_overrides(statement, Some(&write_intent_overrides))

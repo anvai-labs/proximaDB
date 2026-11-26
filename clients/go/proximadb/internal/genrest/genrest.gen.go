@@ -7470,8 +7470,11 @@ type ClientInterface interface {
 
 	// ExecuteDistributedQueryWithBody Execute a distributed query.
 	//
-	// The optional `X-Tenant-ID` header is not consulted by this
-	// handler — unified queries run without tenant selection.
+	// The `X-Tenant-ID` header (or the authenticated tenant) scopes this
+	// query — it is threaded as the port identity (ADR-098 D5 /
+	// TD-SPINE-6); without it the query fails closed (401). Plain SQL on
+	// this surface is read-only (pure SELECT); writes are served by
+	// /api/v2/sql.
 	//
 	// Takes any type of body and a specified content type.
 	//
@@ -7480,8 +7483,11 @@ type ClientInterface interface {
 
 	// ExecuteDistributedQuery Execute a distributed query.
 	//
-	// The optional `X-Tenant-ID` header is not consulted by this
-	// handler — unified queries run without tenant selection.
+	// The `X-Tenant-ID` header (or the authenticated tenant) scopes this
+	// query — it is threaded as the port identity (ADR-098 D5 /
+	// TD-SPINE-6); without it the query fails closed (401). Plain SQL on
+	// this surface is read-only (pure SELECT); writes are served by
+	// /api/v2/sql.
 	//
 	// Takes a body of the `application/json` content type.
 	//
@@ -7490,8 +7496,11 @@ type ClientInterface interface {
 
 	// ExecuteUnifiedQueryWithBody Execute a unified (UQL) query.
 	//
-	// The optional `X-Tenant-ID` header is not consulted by this
-	// handler — unified queries run without tenant selection.
+	// The `X-Tenant-ID` header (or the authenticated tenant) scopes this
+	// query — it is threaded as the port identity (ADR-098 D5 /
+	// TD-SPINE-6); without it the query fails closed (401). Plain SQL on
+	// this surface is read-only (pure SELECT); writes are served by
+	// /api/v2/sql.
 	//
 	// Takes any type of body and a specified content type.
 	//
@@ -7500,8 +7509,11 @@ type ClientInterface interface {
 
 	// ExecuteUnifiedQuery Execute a unified (UQL) query.
 	//
-	// The optional `X-Tenant-ID` header is not consulted by this
-	// handler — unified queries run without tenant selection.
+	// The `X-Tenant-ID` header (or the authenticated tenant) scopes this
+	// query — it is threaded as the port identity (ADR-098 D5 /
+	// TD-SPINE-6); without it the query fails closed (401). Plain SQL on
+	// this surface is read-only (pure SELECT); writes are served by
+	// /api/v2/sql.
 	//
 	// Takes a body of the `application/json` content type.
 	//
@@ -7510,8 +7522,11 @@ type ClientInterface interface {
 
 	// ExecutePreparedStatementWithBody Execute a prepared statement with parameters.
 	//
-	// The optional `X-Tenant-ID` header is not consulted by this
-	// handler — unified queries run without tenant selection.
+	// The `X-Tenant-ID` header (or the authenticated tenant) scopes this
+	// query — it is threaded as the port identity (ADR-098 D5 /
+	// TD-SPINE-6); without it the query fails closed (401). Plain SQL on
+	// this surface is read-only (pure SELECT); writes are served by
+	// /api/v2/sql.
 	//
 	// Takes any type of body and a specified content type.
 	//
@@ -7520,8 +7535,11 @@ type ClientInterface interface {
 
 	// ExecutePreparedStatement Execute a prepared statement with parameters.
 	//
-	// The optional `X-Tenant-ID` header is not consulted by this
-	// handler — unified queries run without tenant selection.
+	// The `X-Tenant-ID` header (or the authenticated tenant) scopes this
+	// query — it is threaded as the port identity (ADR-098 D5 /
+	// TD-SPINE-6); without it the query fails closed (401). Plain SQL on
+	// this surface is read-only (pure SELECT); writes are served by
+	// /api/v2/sql.
 	//
 	// Takes a body of the `application/json` content type.
 	//
@@ -7530,8 +7548,11 @@ type ClientInterface interface {
 
 	// ExplainUnifiedQueryWithBody Explain a unified query (plan, no execution).
 	//
-	// The optional `X-Tenant-ID` header is not consulted by this
-	// handler — unified queries run without tenant selection.
+	// The `X-Tenant-ID` header (or the authenticated tenant) scopes this
+	// query — it is threaded as the port identity (ADR-098 D5 /
+	// TD-SPINE-6); without it the query fails closed (401). Plain SQL on
+	// this surface is read-only (pure SELECT); writes are served by
+	// /api/v2/sql.
 	//
 	// Takes any type of body and a specified content type.
 	//
@@ -7540,8 +7561,11 @@ type ClientInterface interface {
 
 	// ExplainUnifiedQuery Explain a unified query (plan, no execution).
 	//
-	// The optional `X-Tenant-ID` header is not consulted by this
-	// handler — unified queries run without tenant selection.
+	// The `X-Tenant-ID` header (or the authenticated tenant) scopes this
+	// query — it is threaded as the port identity (ADR-098 D5 /
+	// TD-SPINE-6); without it the query fails closed (401). Plain SQL on
+	// this surface is read-only (pure SELECT); writes are served by
+	// /api/v2/sql.
 	//
 	// Takes a body of the `application/json` content type.
 	//
@@ -7550,8 +7574,11 @@ type ClientInterface interface {
 
 	// ExecuteFederatedQueryWithBody Execute a federated query.
 	//
-	// The optional `X-Tenant-ID` header is not consulted by this
-	// handler — unified queries run without tenant selection.
+	// The `X-Tenant-ID` header (or the authenticated tenant) scopes this
+	// query — it is threaded as the port identity (ADR-098 D5 /
+	// TD-SPINE-6); without it the query fails closed (401). Plain SQL on
+	// this surface is read-only (pure SELECT); writes are served by
+	// /api/v2/sql.
 	//
 	// Takes any type of body and a specified content type.
 	//
@@ -7560,8 +7587,11 @@ type ClientInterface interface {
 
 	// ExecuteFederatedQuery Execute a federated query.
 	//
-	// The optional `X-Tenant-ID` header is not consulted by this
-	// handler — unified queries run without tenant selection.
+	// The `X-Tenant-ID` header (or the authenticated tenant) scopes this
+	// query — it is threaded as the port identity (ADR-098 D5 /
+	// TD-SPINE-6); without it the query fails closed (401). Plain SQL on
+	// this surface is read-only (pure SELECT); writes are served by
+	// /api/v2/sql.
 	//
 	// Takes a body of the `application/json` content type.
 	//
@@ -7570,8 +7600,11 @@ type ClientInterface interface {
 
 	// ExecuteMultiModelQueryWithBody Execute a multi-model query (free-form body).
 	//
-	// The optional `X-Tenant-ID` header is not consulted by this
-	// handler — unified queries run without tenant selection.
+	// The `X-Tenant-ID` header (or the authenticated tenant) scopes this
+	// query — it is threaded as the port identity (ADR-098 D5 /
+	// TD-SPINE-6); without it the query fails closed (401). Plain SQL on
+	// this surface is read-only (pure SELECT); writes are served by
+	// /api/v2/sql.
 	//
 	// Takes any type of body and a specified content type.
 	//
@@ -7580,8 +7613,11 @@ type ClientInterface interface {
 
 	// ExecuteMultiModelQuery Execute a multi-model query (free-form body).
 	//
-	// The optional `X-Tenant-ID` header is not consulted by this
-	// handler — unified queries run without tenant selection.
+	// The `X-Tenant-ID` header (or the authenticated tenant) scopes this
+	// query — it is threaded as the port identity (ADR-098 D5 /
+	// TD-SPINE-6); without it the query fails closed (401). Plain SQL on
+	// this surface is read-only (pure SELECT); writes are served by
+	// /api/v2/sql.
 	//
 	// Takes a body of the `application/json` content type.
 	//
@@ -7590,8 +7626,11 @@ type ClientInterface interface {
 
 	// PrepareStatementWithBody Prepare a statement for repeated execution.
 	//
-	// The optional `X-Tenant-ID` header is not consulted by this
-	// handler — unified queries run without tenant selection.
+	// The `X-Tenant-ID` header (or the authenticated tenant) scopes this
+	// query — it is threaded as the port identity (ADR-098 D5 /
+	// TD-SPINE-6); without it the query fails closed (401). Plain SQL on
+	// this surface is read-only (pure SELECT); writes are served by
+	// /api/v2/sql.
 	//
 	// Takes any type of body and a specified content type.
 	//
@@ -7600,8 +7639,11 @@ type ClientInterface interface {
 
 	// PrepareStatement Prepare a statement for repeated execution.
 	//
-	// The optional `X-Tenant-ID` header is not consulted by this
-	// handler — unified queries run without tenant selection.
+	// The `X-Tenant-ID` header (or the authenticated tenant) scopes this
+	// query — it is threaded as the port identity (ADR-098 D5 /
+	// TD-SPINE-6); without it the query fails closed (401). Plain SQL on
+	// this surface is read-only (pure SELECT); writes are served by
+	// /api/v2/sql.
 	//
 	// Takes a body of the `application/json` content type.
 	//
@@ -7610,8 +7652,11 @@ type ClientInterface interface {
 
 	// GetPreparedStatsWithBody Prepared-statement execution statistics.
 	//
-	// The optional `X-Tenant-ID` header is not consulted by this
-	// handler — unified queries run without tenant selection.
+	// The `X-Tenant-ID` header (or the authenticated tenant) scopes this
+	// query — it is threaded as the port identity (ADR-098 D5 /
+	// TD-SPINE-6); without it the query fails closed (401). Plain SQL on
+	// this surface is read-only (pure SELECT); writes are served by
+	// /api/v2/sql.
 	//
 	// Takes any type of body and a specified content type.
 	//
@@ -7620,8 +7665,11 @@ type ClientInterface interface {
 
 	// GetPreparedStats Prepared-statement execution statistics.
 	//
-	// The optional `X-Tenant-ID` header is not consulted by this
-	// handler — unified queries run without tenant selection.
+	// The `X-Tenant-ID` header (or the authenticated tenant) scopes this
+	// query — it is threaded as the port identity (ADR-098 D5 /
+	// TD-SPINE-6); without it the query fails closed (401). Plain SQL on
+	// this surface is read-only (pure SELECT); writes are served by
+	// /api/v2/sql.
 	//
 	// Takes a body of the `application/json` content type.
 	//
@@ -7630,8 +7678,11 @@ type ClientInterface interface {
 
 	// DeletePreparedStatement Delete a prepared statement.
 	//
-	// The optional `X-Tenant-ID` header is not consulted by this
-	// handler — unified queries run without tenant selection.
+	// The `X-Tenant-ID` header (or the authenticated tenant) scopes this
+	// query — it is threaded as the port identity (ADR-098 D5 /
+	// TD-SPINE-6); without it the query fails closed (401). Plain SQL on
+	// this surface is read-only (pure SELECT); writes are served by
+	// /api/v2/sql.
 	//
 	// Corresponds with DELETE /api/v2/unified/prepared/{statement_id} (the `DeletePreparedStatement` operationId).
 	DeletePreparedStatement(ctx context.Context, statementId string, params *DeletePreparedStatementParams, reqEditors ...RequestEditorFn) (*http.Response, error)
@@ -11209,8 +11260,11 @@ func (c *Client) QueryTimeseries(ctx context.Context, collectionId string, param
 
 // ExecuteDistributedQueryWithBody Execute a distributed query.
 //
-// The optional `X-Tenant-ID` header is not consulted by this
-// handler — unified queries run without tenant selection.
+// The `X-Tenant-ID` header (or the authenticated tenant) scopes this
+// query — it is threaded as the port identity (ADR-098 D5 /
+// TD-SPINE-6); without it the query fails closed (401). Plain SQL on
+// this surface is read-only (pure SELECT); writes are served by
+// /api/v2/sql.
 //
 // Takes any type of body and a specified content type.
 //
@@ -11229,8 +11283,11 @@ func (c *Client) ExecuteDistributedQueryWithBody(ctx context.Context, params *Ex
 
 // ExecuteDistributedQuery Execute a distributed query.
 //
-// The optional `X-Tenant-ID` header is not consulted by this
-// handler — unified queries run without tenant selection.
+// The `X-Tenant-ID` header (or the authenticated tenant) scopes this
+// query — it is threaded as the port identity (ADR-098 D5 /
+// TD-SPINE-6); without it the query fails closed (401). Plain SQL on
+// this surface is read-only (pure SELECT); writes are served by
+// /api/v2/sql.
 //
 // Takes a body of the `application/json` content type.
 //
@@ -11249,8 +11306,11 @@ func (c *Client) ExecuteDistributedQuery(ctx context.Context, params *ExecuteDis
 
 // ExecuteUnifiedQueryWithBody Execute a unified (UQL) query.
 //
-// The optional `X-Tenant-ID` header is not consulted by this
-// handler — unified queries run without tenant selection.
+// The `X-Tenant-ID` header (or the authenticated tenant) scopes this
+// query — it is threaded as the port identity (ADR-098 D5 /
+// TD-SPINE-6); without it the query fails closed (401). Plain SQL on
+// this surface is read-only (pure SELECT); writes are served by
+// /api/v2/sql.
 //
 // Takes any type of body and a specified content type.
 //
@@ -11269,8 +11329,11 @@ func (c *Client) ExecuteUnifiedQueryWithBody(ctx context.Context, params *Execut
 
 // ExecuteUnifiedQuery Execute a unified (UQL) query.
 //
-// The optional `X-Tenant-ID` header is not consulted by this
-// handler — unified queries run without tenant selection.
+// The `X-Tenant-ID` header (or the authenticated tenant) scopes this
+// query — it is threaded as the port identity (ADR-098 D5 /
+// TD-SPINE-6); without it the query fails closed (401). Plain SQL on
+// this surface is read-only (pure SELECT); writes are served by
+// /api/v2/sql.
 //
 // Takes a body of the `application/json` content type.
 //
@@ -11289,8 +11352,11 @@ func (c *Client) ExecuteUnifiedQuery(ctx context.Context, params *ExecuteUnified
 
 // ExecutePreparedStatementWithBody Execute a prepared statement with parameters.
 //
-// The optional `X-Tenant-ID` header is not consulted by this
-// handler — unified queries run without tenant selection.
+// The `X-Tenant-ID` header (or the authenticated tenant) scopes this
+// query — it is threaded as the port identity (ADR-098 D5 /
+// TD-SPINE-6); without it the query fails closed (401). Plain SQL on
+// this surface is read-only (pure SELECT); writes are served by
+// /api/v2/sql.
 //
 // Takes any type of body and a specified content type.
 //
@@ -11309,8 +11375,11 @@ func (c *Client) ExecutePreparedStatementWithBody(ctx context.Context, statement
 
 // ExecutePreparedStatement Execute a prepared statement with parameters.
 //
-// The optional `X-Tenant-ID` header is not consulted by this
-// handler — unified queries run without tenant selection.
+// The `X-Tenant-ID` header (or the authenticated tenant) scopes this
+// query — it is threaded as the port identity (ADR-098 D5 /
+// TD-SPINE-6); without it the query fails closed (401). Plain SQL on
+// this surface is read-only (pure SELECT); writes are served by
+// /api/v2/sql.
 //
 // Takes a body of the `application/json` content type.
 //
@@ -11329,8 +11398,11 @@ func (c *Client) ExecutePreparedStatement(ctx context.Context, statementId strin
 
 // ExplainUnifiedQueryWithBody Explain a unified query (plan, no execution).
 //
-// The optional `X-Tenant-ID` header is not consulted by this
-// handler — unified queries run without tenant selection.
+// The `X-Tenant-ID` header (or the authenticated tenant) scopes this
+// query — it is threaded as the port identity (ADR-098 D5 /
+// TD-SPINE-6); without it the query fails closed (401). Plain SQL on
+// this surface is read-only (pure SELECT); writes are served by
+// /api/v2/sql.
 //
 // Takes any type of body and a specified content type.
 //
@@ -11349,8 +11421,11 @@ func (c *Client) ExplainUnifiedQueryWithBody(ctx context.Context, params *Explai
 
 // ExplainUnifiedQuery Explain a unified query (plan, no execution).
 //
-// The optional `X-Tenant-ID` header is not consulted by this
-// handler — unified queries run without tenant selection.
+// The `X-Tenant-ID` header (or the authenticated tenant) scopes this
+// query — it is threaded as the port identity (ADR-098 D5 /
+// TD-SPINE-6); without it the query fails closed (401). Plain SQL on
+// this surface is read-only (pure SELECT); writes are served by
+// /api/v2/sql.
 //
 // Takes a body of the `application/json` content type.
 //
@@ -11369,8 +11444,11 @@ func (c *Client) ExplainUnifiedQuery(ctx context.Context, params *ExplainUnified
 
 // ExecuteFederatedQueryWithBody Execute a federated query.
 //
-// The optional `X-Tenant-ID` header is not consulted by this
-// handler — unified queries run without tenant selection.
+// The `X-Tenant-ID` header (or the authenticated tenant) scopes this
+// query — it is threaded as the port identity (ADR-098 D5 /
+// TD-SPINE-6); without it the query fails closed (401). Plain SQL on
+// this surface is read-only (pure SELECT); writes are served by
+// /api/v2/sql.
 //
 // Takes any type of body and a specified content type.
 //
@@ -11389,8 +11467,11 @@ func (c *Client) ExecuteFederatedQueryWithBody(ctx context.Context, params *Exec
 
 // ExecuteFederatedQuery Execute a federated query.
 //
-// The optional `X-Tenant-ID` header is not consulted by this
-// handler — unified queries run without tenant selection.
+// The `X-Tenant-ID` header (or the authenticated tenant) scopes this
+// query — it is threaded as the port identity (ADR-098 D5 /
+// TD-SPINE-6); without it the query fails closed (401). Plain SQL on
+// this surface is read-only (pure SELECT); writes are served by
+// /api/v2/sql.
 //
 // Takes a body of the `application/json` content type.
 //
@@ -11409,8 +11490,11 @@ func (c *Client) ExecuteFederatedQuery(ctx context.Context, params *ExecuteFeder
 
 // ExecuteMultiModelQueryWithBody Execute a multi-model query (free-form body).
 //
-// The optional `X-Tenant-ID` header is not consulted by this
-// handler — unified queries run without tenant selection.
+// The `X-Tenant-ID` header (or the authenticated tenant) scopes this
+// query — it is threaded as the port identity (ADR-098 D5 /
+// TD-SPINE-6); without it the query fails closed (401). Plain SQL on
+// this surface is read-only (pure SELECT); writes are served by
+// /api/v2/sql.
 //
 // Takes any type of body and a specified content type.
 //
@@ -11429,8 +11513,11 @@ func (c *Client) ExecuteMultiModelQueryWithBody(ctx context.Context, params *Exe
 
 // ExecuteMultiModelQuery Execute a multi-model query (free-form body).
 //
-// The optional `X-Tenant-ID` header is not consulted by this
-// handler — unified queries run without tenant selection.
+// The `X-Tenant-ID` header (or the authenticated tenant) scopes this
+// query — it is threaded as the port identity (ADR-098 D5 /
+// TD-SPINE-6); without it the query fails closed (401). Plain SQL on
+// this surface is read-only (pure SELECT); writes are served by
+// /api/v2/sql.
 //
 // Takes a body of the `application/json` content type.
 //
@@ -11449,8 +11536,11 @@ func (c *Client) ExecuteMultiModelQuery(ctx context.Context, params *ExecuteMult
 
 // PrepareStatementWithBody Prepare a statement for repeated execution.
 //
-// The optional `X-Tenant-ID` header is not consulted by this
-// handler — unified queries run without tenant selection.
+// The `X-Tenant-ID` header (or the authenticated tenant) scopes this
+// query — it is threaded as the port identity (ADR-098 D5 /
+// TD-SPINE-6); without it the query fails closed (401). Plain SQL on
+// this surface is read-only (pure SELECT); writes are served by
+// /api/v2/sql.
 //
 // Takes any type of body and a specified content type.
 //
@@ -11469,8 +11559,11 @@ func (c *Client) PrepareStatementWithBody(ctx context.Context, params *PrepareSt
 
 // PrepareStatement Prepare a statement for repeated execution.
 //
-// The optional `X-Tenant-ID` header is not consulted by this
-// handler — unified queries run without tenant selection.
+// The `X-Tenant-ID` header (or the authenticated tenant) scopes this
+// query — it is threaded as the port identity (ADR-098 D5 /
+// TD-SPINE-6); without it the query fails closed (401). Plain SQL on
+// this surface is read-only (pure SELECT); writes are served by
+// /api/v2/sql.
 //
 // Takes a body of the `application/json` content type.
 //
@@ -11489,8 +11582,11 @@ func (c *Client) PrepareStatement(ctx context.Context, params *PrepareStatementP
 
 // GetPreparedStatsWithBody Prepared-statement execution statistics.
 //
-// The optional `X-Tenant-ID` header is not consulted by this
-// handler — unified queries run without tenant selection.
+// The `X-Tenant-ID` header (or the authenticated tenant) scopes this
+// query — it is threaded as the port identity (ADR-098 D5 /
+// TD-SPINE-6); without it the query fails closed (401). Plain SQL on
+// this surface is read-only (pure SELECT); writes are served by
+// /api/v2/sql.
 //
 // Takes any type of body and a specified content type.
 //
@@ -11509,8 +11605,11 @@ func (c *Client) GetPreparedStatsWithBody(ctx context.Context, params *GetPrepar
 
 // GetPreparedStats Prepared-statement execution statistics.
 //
-// The optional `X-Tenant-ID` header is not consulted by this
-// handler — unified queries run without tenant selection.
+// The `X-Tenant-ID` header (or the authenticated tenant) scopes this
+// query — it is threaded as the port identity (ADR-098 D5 /
+// TD-SPINE-6); without it the query fails closed (401). Plain SQL on
+// this surface is read-only (pure SELECT); writes are served by
+// /api/v2/sql.
 //
 // Takes a body of the `application/json` content type.
 //
@@ -11529,8 +11628,11 @@ func (c *Client) GetPreparedStats(ctx context.Context, params *GetPreparedStatsP
 
 // DeletePreparedStatement Delete a prepared statement.
 //
-// The optional `X-Tenant-ID` header is not consulted by this
-// handler — unified queries run without tenant selection.
+// The `X-Tenant-ID` header (or the authenticated tenant) scopes this
+// query — it is threaded as the port identity (ADR-098 D5 /
+// TD-SPINE-6); without it the query fails closed (401). Plain SQL on
+// this surface is read-only (pure SELECT); writes are served by
+// /api/v2/sql.
 //
 // Corresponds with DELETE /api/v2/unified/prepared/{statement_id} (the `DeletePreparedStatement` operationId).
 func (c *Client) DeletePreparedStatement(ctx context.Context, statementId string, params *DeletePreparedStatementParams, reqEditors ...RequestEditorFn) (*http.Response, error) {
@@ -20575,8 +20677,11 @@ type ClientWithResponsesInterface interface {
 
 	// ExecuteDistributedQueryWithBodyWithResponse Execute a distributed query.
 	//
-	// The optional `X-Tenant-ID` header is not consulted by this
-	// handler — unified queries run without tenant selection.
+	// The `X-Tenant-ID` header (or the authenticated tenant) scopes this
+	// query — it is threaded as the port identity (ADR-098 D5 /
+	// TD-SPINE-6); without it the query fails closed (401). Plain SQL on
+	// this surface is read-only (pure SELECT); writes are served by
+	// /api/v2/sql.
 	//
 	// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
 	//
@@ -20585,8 +20690,11 @@ type ClientWithResponsesInterface interface {
 
 	// ExecuteDistributedQueryWithResponse Execute a distributed query.
 	//
-	// The optional `X-Tenant-ID` header is not consulted by this
-	// handler — unified queries run without tenant selection.
+	// The `X-Tenant-ID` header (or the authenticated tenant) scopes this
+	// query — it is threaded as the port identity (ADR-098 D5 /
+	// TD-SPINE-6); without it the query fails closed (401). Plain SQL on
+	// this surface is read-only (pure SELECT); writes are served by
+	// /api/v2/sql.
 	//
 	// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
 	//
@@ -20595,8 +20703,11 @@ type ClientWithResponsesInterface interface {
 
 	// ExecuteUnifiedQueryWithBodyWithResponse Execute a unified (UQL) query.
 	//
-	// The optional `X-Tenant-ID` header is not consulted by this
-	// handler — unified queries run without tenant selection.
+	// The `X-Tenant-ID` header (or the authenticated tenant) scopes this
+	// query — it is threaded as the port identity (ADR-098 D5 /
+	// TD-SPINE-6); without it the query fails closed (401). Plain SQL on
+	// this surface is read-only (pure SELECT); writes are served by
+	// /api/v2/sql.
 	//
 	// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
 	//
@@ -20605,8 +20716,11 @@ type ClientWithResponsesInterface interface {
 
 	// ExecuteUnifiedQueryWithResponse Execute a unified (UQL) query.
 	//
-	// The optional `X-Tenant-ID` header is not consulted by this
-	// handler — unified queries run without tenant selection.
+	// The `X-Tenant-ID` header (or the authenticated tenant) scopes this
+	// query — it is threaded as the port identity (ADR-098 D5 /
+	// TD-SPINE-6); without it the query fails closed (401). Plain SQL on
+	// this surface is read-only (pure SELECT); writes are served by
+	// /api/v2/sql.
 	//
 	// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
 	//
@@ -20615,8 +20729,11 @@ type ClientWithResponsesInterface interface {
 
 	// ExecutePreparedStatementWithBodyWithResponse Execute a prepared statement with parameters.
 	//
-	// The optional `X-Tenant-ID` header is not consulted by this
-	// handler — unified queries run without tenant selection.
+	// The `X-Tenant-ID` header (or the authenticated tenant) scopes this
+	// query — it is threaded as the port identity (ADR-098 D5 /
+	// TD-SPINE-6); without it the query fails closed (401). Plain SQL on
+	// this surface is read-only (pure SELECT); writes are served by
+	// /api/v2/sql.
 	//
 	// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
 	//
@@ -20625,8 +20742,11 @@ type ClientWithResponsesInterface interface {
 
 	// ExecutePreparedStatementWithResponse Execute a prepared statement with parameters.
 	//
-	// The optional `X-Tenant-ID` header is not consulted by this
-	// handler — unified queries run without tenant selection.
+	// The `X-Tenant-ID` header (or the authenticated tenant) scopes this
+	// query — it is threaded as the port identity (ADR-098 D5 /
+	// TD-SPINE-6); without it the query fails closed (401). Plain SQL on
+	// this surface is read-only (pure SELECT); writes are served by
+	// /api/v2/sql.
 	//
 	// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
 	//
@@ -20635,8 +20755,11 @@ type ClientWithResponsesInterface interface {
 
 	// ExplainUnifiedQueryWithBodyWithResponse Explain a unified query (plan, no execution).
 	//
-	// The optional `X-Tenant-ID` header is not consulted by this
-	// handler — unified queries run without tenant selection.
+	// The `X-Tenant-ID` header (or the authenticated tenant) scopes this
+	// query — it is threaded as the port identity (ADR-098 D5 /
+	// TD-SPINE-6); without it the query fails closed (401). Plain SQL on
+	// this surface is read-only (pure SELECT); writes are served by
+	// /api/v2/sql.
 	//
 	// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
 	//
@@ -20645,8 +20768,11 @@ type ClientWithResponsesInterface interface {
 
 	// ExplainUnifiedQueryWithResponse Explain a unified query (plan, no execution).
 	//
-	// The optional `X-Tenant-ID` header is not consulted by this
-	// handler — unified queries run without tenant selection.
+	// The `X-Tenant-ID` header (or the authenticated tenant) scopes this
+	// query — it is threaded as the port identity (ADR-098 D5 /
+	// TD-SPINE-6); without it the query fails closed (401). Plain SQL on
+	// this surface is read-only (pure SELECT); writes are served by
+	// /api/v2/sql.
 	//
 	// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
 	//
@@ -20655,8 +20781,11 @@ type ClientWithResponsesInterface interface {
 
 	// ExecuteFederatedQueryWithBodyWithResponse Execute a federated query.
 	//
-	// The optional `X-Tenant-ID` header is not consulted by this
-	// handler — unified queries run without tenant selection.
+	// The `X-Tenant-ID` header (or the authenticated tenant) scopes this
+	// query — it is threaded as the port identity (ADR-098 D5 /
+	// TD-SPINE-6); without it the query fails closed (401). Plain SQL on
+	// this surface is read-only (pure SELECT); writes are served by
+	// /api/v2/sql.
 	//
 	// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
 	//
@@ -20665,8 +20794,11 @@ type ClientWithResponsesInterface interface {
 
 	// ExecuteFederatedQueryWithResponse Execute a federated query.
 	//
-	// The optional `X-Tenant-ID` header is not consulted by this
-	// handler — unified queries run without tenant selection.
+	// The `X-Tenant-ID` header (or the authenticated tenant) scopes this
+	// query — it is threaded as the port identity (ADR-098 D5 /
+	// TD-SPINE-6); without it the query fails closed (401). Plain SQL on
+	// this surface is read-only (pure SELECT); writes are served by
+	// /api/v2/sql.
 	//
 	// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
 	//
@@ -20675,8 +20807,11 @@ type ClientWithResponsesInterface interface {
 
 	// ExecuteMultiModelQueryWithBodyWithResponse Execute a multi-model query (free-form body).
 	//
-	// The optional `X-Tenant-ID` header is not consulted by this
-	// handler — unified queries run without tenant selection.
+	// The `X-Tenant-ID` header (or the authenticated tenant) scopes this
+	// query — it is threaded as the port identity (ADR-098 D5 /
+	// TD-SPINE-6); without it the query fails closed (401). Plain SQL on
+	// this surface is read-only (pure SELECT); writes are served by
+	// /api/v2/sql.
 	//
 	// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
 	//
@@ -20685,8 +20820,11 @@ type ClientWithResponsesInterface interface {
 
 	// ExecuteMultiModelQueryWithResponse Execute a multi-model query (free-form body).
 	//
-	// The optional `X-Tenant-ID` header is not consulted by this
-	// handler — unified queries run without tenant selection.
+	// The `X-Tenant-ID` header (or the authenticated tenant) scopes this
+	// query — it is threaded as the port identity (ADR-098 D5 /
+	// TD-SPINE-6); without it the query fails closed (401). Plain SQL on
+	// this surface is read-only (pure SELECT); writes are served by
+	// /api/v2/sql.
 	//
 	// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
 	//
@@ -20695,8 +20833,11 @@ type ClientWithResponsesInterface interface {
 
 	// PrepareStatementWithBodyWithResponse Prepare a statement for repeated execution.
 	//
-	// The optional `X-Tenant-ID` header is not consulted by this
-	// handler — unified queries run without tenant selection.
+	// The `X-Tenant-ID` header (or the authenticated tenant) scopes this
+	// query — it is threaded as the port identity (ADR-098 D5 /
+	// TD-SPINE-6); without it the query fails closed (401). Plain SQL on
+	// this surface is read-only (pure SELECT); writes are served by
+	// /api/v2/sql.
 	//
 	// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
 	//
@@ -20705,8 +20846,11 @@ type ClientWithResponsesInterface interface {
 
 	// PrepareStatementWithResponse Prepare a statement for repeated execution.
 	//
-	// The optional `X-Tenant-ID` header is not consulted by this
-	// handler — unified queries run without tenant selection.
+	// The `X-Tenant-ID` header (or the authenticated tenant) scopes this
+	// query — it is threaded as the port identity (ADR-098 D5 /
+	// TD-SPINE-6); without it the query fails closed (401). Plain SQL on
+	// this surface is read-only (pure SELECT); writes are served by
+	// /api/v2/sql.
 	//
 	// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
 	//
@@ -20715,8 +20859,11 @@ type ClientWithResponsesInterface interface {
 
 	// GetPreparedStatsWithBodyWithResponse Prepared-statement execution statistics.
 	//
-	// The optional `X-Tenant-ID` header is not consulted by this
-	// handler — unified queries run without tenant selection.
+	// The `X-Tenant-ID` header (or the authenticated tenant) scopes this
+	// query — it is threaded as the port identity (ADR-098 D5 /
+	// TD-SPINE-6); without it the query fails closed (401). Plain SQL on
+	// this surface is read-only (pure SELECT); writes are served by
+	// /api/v2/sql.
 	//
 	// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
 	//
@@ -20725,8 +20872,11 @@ type ClientWithResponsesInterface interface {
 
 	// GetPreparedStatsWithResponse Prepared-statement execution statistics.
 	//
-	// The optional `X-Tenant-ID` header is not consulted by this
-	// handler — unified queries run without tenant selection.
+	// The `X-Tenant-ID` header (or the authenticated tenant) scopes this
+	// query — it is threaded as the port identity (ADR-098 D5 /
+	// TD-SPINE-6); without it the query fails closed (401). Plain SQL on
+	// this surface is read-only (pure SELECT); writes are served by
+	// /api/v2/sql.
 	//
 	// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
 	//
@@ -20735,8 +20885,11 @@ type ClientWithResponsesInterface interface {
 
 	// DeletePreparedStatementWithResponse Delete a prepared statement.
 	//
-	// The optional `X-Tenant-ID` header is not consulted by this
-	// handler — unified queries run without tenant selection.
+	// The `X-Tenant-ID` header (or the authenticated tenant) scopes this
+	// query — it is threaded as the port identity (ADR-098 D5 /
+	// TD-SPINE-6); without it the query fails closed (401). Plain SQL on
+	// this surface is read-only (pure SELECT); writes are served by
+	// /api/v2/sql.
 	//
 	// Returns a wrapper object for the known response body format(s).
 	//
@@ -30650,8 +30803,11 @@ func (c *ClientWithResponses) QueryTimeseriesWithResponse(ctx context.Context, c
 
 // ExecuteDistributedQueryWithBodyWithResponse Execute a distributed query.
 //
-// The optional `X-Tenant-ID` header is not consulted by this
-// handler — unified queries run without tenant selection.
+// The `X-Tenant-ID` header (or the authenticated tenant) scopes this
+// query — it is threaded as the port identity (ADR-098 D5 /
+// TD-SPINE-6); without it the query fails closed (401). Plain SQL on
+// this surface is read-only (pure SELECT); writes are served by
+// /api/v2/sql.
 //
 // Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
 //
@@ -30666,8 +30822,11 @@ func (c *ClientWithResponses) ExecuteDistributedQueryWithBodyWithResponse(ctx co
 
 // ExecuteDistributedQueryWithResponse Execute a distributed query.
 //
-// The optional `X-Tenant-ID` header is not consulted by this
-// handler — unified queries run without tenant selection.
+// The `X-Tenant-ID` header (or the authenticated tenant) scopes this
+// query — it is threaded as the port identity (ADR-098 D5 /
+// TD-SPINE-6); without it the query fails closed (401). Plain SQL on
+// this surface is read-only (pure SELECT); writes are served by
+// /api/v2/sql.
 //
 // Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
 //
@@ -30682,8 +30841,11 @@ func (c *ClientWithResponses) ExecuteDistributedQueryWithResponse(ctx context.Co
 
 // ExecuteUnifiedQueryWithBodyWithResponse Execute a unified (UQL) query.
 //
-// The optional `X-Tenant-ID` header is not consulted by this
-// handler — unified queries run without tenant selection.
+// The `X-Tenant-ID` header (or the authenticated tenant) scopes this
+// query — it is threaded as the port identity (ADR-098 D5 /
+// TD-SPINE-6); without it the query fails closed (401). Plain SQL on
+// this surface is read-only (pure SELECT); writes are served by
+// /api/v2/sql.
 //
 // Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
 //
@@ -30698,8 +30860,11 @@ func (c *ClientWithResponses) ExecuteUnifiedQueryWithBodyWithResponse(ctx contex
 
 // ExecuteUnifiedQueryWithResponse Execute a unified (UQL) query.
 //
-// The optional `X-Tenant-ID` header is not consulted by this
-// handler — unified queries run without tenant selection.
+// The `X-Tenant-ID` header (or the authenticated tenant) scopes this
+// query — it is threaded as the port identity (ADR-098 D5 /
+// TD-SPINE-6); without it the query fails closed (401). Plain SQL on
+// this surface is read-only (pure SELECT); writes are served by
+// /api/v2/sql.
 //
 // Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
 //
@@ -30714,8 +30879,11 @@ func (c *ClientWithResponses) ExecuteUnifiedQueryWithResponse(ctx context.Contex
 
 // ExecutePreparedStatementWithBodyWithResponse Execute a prepared statement with parameters.
 //
-// The optional `X-Tenant-ID` header is not consulted by this
-// handler — unified queries run without tenant selection.
+// The `X-Tenant-ID` header (or the authenticated tenant) scopes this
+// query — it is threaded as the port identity (ADR-098 D5 /
+// TD-SPINE-6); without it the query fails closed (401). Plain SQL on
+// this surface is read-only (pure SELECT); writes are served by
+// /api/v2/sql.
 //
 // Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
 //
@@ -30730,8 +30898,11 @@ func (c *ClientWithResponses) ExecutePreparedStatementWithBodyWithResponse(ctx c
 
 // ExecutePreparedStatementWithResponse Execute a prepared statement with parameters.
 //
-// The optional `X-Tenant-ID` header is not consulted by this
-// handler — unified queries run without tenant selection.
+// The `X-Tenant-ID` header (or the authenticated tenant) scopes this
+// query — it is threaded as the port identity (ADR-098 D5 /
+// TD-SPINE-6); without it the query fails closed (401). Plain SQL on
+// this surface is read-only (pure SELECT); writes are served by
+// /api/v2/sql.
 //
 // Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
 //
@@ -30746,8 +30917,11 @@ func (c *ClientWithResponses) ExecutePreparedStatementWithResponse(ctx context.C
 
 // ExplainUnifiedQueryWithBodyWithResponse Explain a unified query (plan, no execution).
 //
-// The optional `X-Tenant-ID` header is not consulted by this
-// handler — unified queries run without tenant selection.
+// The `X-Tenant-ID` header (or the authenticated tenant) scopes this
+// query — it is threaded as the port identity (ADR-098 D5 /
+// TD-SPINE-6); without it the query fails closed (401). Plain SQL on
+// this surface is read-only (pure SELECT); writes are served by
+// /api/v2/sql.
 //
 // Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
 //
@@ -30762,8 +30936,11 @@ func (c *ClientWithResponses) ExplainUnifiedQueryWithBodyWithResponse(ctx contex
 
 // ExplainUnifiedQueryWithResponse Explain a unified query (plan, no execution).
 //
-// The optional `X-Tenant-ID` header is not consulted by this
-// handler — unified queries run without tenant selection.
+// The `X-Tenant-ID` header (or the authenticated tenant) scopes this
+// query — it is threaded as the port identity (ADR-098 D5 /
+// TD-SPINE-6); without it the query fails closed (401). Plain SQL on
+// this surface is read-only (pure SELECT); writes are served by
+// /api/v2/sql.
 //
 // Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
 //
@@ -30778,8 +30955,11 @@ func (c *ClientWithResponses) ExplainUnifiedQueryWithResponse(ctx context.Contex
 
 // ExecuteFederatedQueryWithBodyWithResponse Execute a federated query.
 //
-// The optional `X-Tenant-ID` header is not consulted by this
-// handler — unified queries run without tenant selection.
+// The `X-Tenant-ID` header (or the authenticated tenant) scopes this
+// query — it is threaded as the port identity (ADR-098 D5 /
+// TD-SPINE-6); without it the query fails closed (401). Plain SQL on
+// this surface is read-only (pure SELECT); writes are served by
+// /api/v2/sql.
 //
 // Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
 //
@@ -30794,8 +30974,11 @@ func (c *ClientWithResponses) ExecuteFederatedQueryWithBodyWithResponse(ctx cont
 
 // ExecuteFederatedQueryWithResponse Execute a federated query.
 //
-// The optional `X-Tenant-ID` header is not consulted by this
-// handler — unified queries run without tenant selection.
+// The `X-Tenant-ID` header (or the authenticated tenant) scopes this
+// query — it is threaded as the port identity (ADR-098 D5 /
+// TD-SPINE-6); without it the query fails closed (401). Plain SQL on
+// this surface is read-only (pure SELECT); writes are served by
+// /api/v2/sql.
 //
 // Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
 //
@@ -30810,8 +30993,11 @@ func (c *ClientWithResponses) ExecuteFederatedQueryWithResponse(ctx context.Cont
 
 // ExecuteMultiModelQueryWithBodyWithResponse Execute a multi-model query (free-form body).
 //
-// The optional `X-Tenant-ID` header is not consulted by this
-// handler — unified queries run without tenant selection.
+// The `X-Tenant-ID` header (or the authenticated tenant) scopes this
+// query — it is threaded as the port identity (ADR-098 D5 /
+// TD-SPINE-6); without it the query fails closed (401). Plain SQL on
+// this surface is read-only (pure SELECT); writes are served by
+// /api/v2/sql.
 //
 // Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
 //
@@ -30826,8 +31012,11 @@ func (c *ClientWithResponses) ExecuteMultiModelQueryWithBodyWithResponse(ctx con
 
 // ExecuteMultiModelQueryWithResponse Execute a multi-model query (free-form body).
 //
-// The optional `X-Tenant-ID` header is not consulted by this
-// handler — unified queries run without tenant selection.
+// The `X-Tenant-ID` header (or the authenticated tenant) scopes this
+// query — it is threaded as the port identity (ADR-098 D5 /
+// TD-SPINE-6); without it the query fails closed (401). Plain SQL on
+// this surface is read-only (pure SELECT); writes are served by
+// /api/v2/sql.
 //
 // Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
 //
@@ -30842,8 +31031,11 @@ func (c *ClientWithResponses) ExecuteMultiModelQueryWithResponse(ctx context.Con
 
 // PrepareStatementWithBodyWithResponse Prepare a statement for repeated execution.
 //
-// The optional `X-Tenant-ID` header is not consulted by this
-// handler — unified queries run without tenant selection.
+// The `X-Tenant-ID` header (or the authenticated tenant) scopes this
+// query — it is threaded as the port identity (ADR-098 D5 /
+// TD-SPINE-6); without it the query fails closed (401). Plain SQL on
+// this surface is read-only (pure SELECT); writes are served by
+// /api/v2/sql.
 //
 // Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
 //
@@ -30858,8 +31050,11 @@ func (c *ClientWithResponses) PrepareStatementWithBodyWithResponse(ctx context.C
 
 // PrepareStatementWithResponse Prepare a statement for repeated execution.
 //
-// The optional `X-Tenant-ID` header is not consulted by this
-// handler — unified queries run without tenant selection.
+// The `X-Tenant-ID` header (or the authenticated tenant) scopes this
+// query — it is threaded as the port identity (ADR-098 D5 /
+// TD-SPINE-6); without it the query fails closed (401). Plain SQL on
+// this surface is read-only (pure SELECT); writes are served by
+// /api/v2/sql.
 //
 // Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
 //
@@ -30874,8 +31069,11 @@ func (c *ClientWithResponses) PrepareStatementWithResponse(ctx context.Context, 
 
 // GetPreparedStatsWithBodyWithResponse Prepared-statement execution statistics.
 //
-// The optional `X-Tenant-ID` header is not consulted by this
-// handler — unified queries run without tenant selection.
+// The `X-Tenant-ID` header (or the authenticated tenant) scopes this
+// query — it is threaded as the port identity (ADR-098 D5 /
+// TD-SPINE-6); without it the query fails closed (401). Plain SQL on
+// this surface is read-only (pure SELECT); writes are served by
+// /api/v2/sql.
 //
 // Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
 //
@@ -30890,8 +31088,11 @@ func (c *ClientWithResponses) GetPreparedStatsWithBodyWithResponse(ctx context.C
 
 // GetPreparedStatsWithResponse Prepared-statement execution statistics.
 //
-// The optional `X-Tenant-ID` header is not consulted by this
-// handler — unified queries run without tenant selection.
+// The `X-Tenant-ID` header (or the authenticated tenant) scopes this
+// query — it is threaded as the port identity (ADR-098 D5 /
+// TD-SPINE-6); without it the query fails closed (401). Plain SQL on
+// this surface is read-only (pure SELECT); writes are served by
+// /api/v2/sql.
 //
 // Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
 //
@@ -30906,8 +31107,11 @@ func (c *ClientWithResponses) GetPreparedStatsWithResponse(ctx context.Context, 
 
 // DeletePreparedStatementWithResponse Delete a prepared statement.
 //
-// The optional `X-Tenant-ID` header is not consulted by this
-// handler — unified queries run without tenant selection.
+// The `X-Tenant-ID` header (or the authenticated tenant) scopes this
+// query — it is threaded as the port identity (ADR-098 D5 /
+// TD-SPINE-6); without it the query fails closed (401). Plain SQL on
+// this surface is read-only (pure SELECT); writes are served by
+// /api/v2/sql.
 //
 // Returns a wrapper object for the known response body format(s).
 //

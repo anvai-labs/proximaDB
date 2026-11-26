@@ -816,3 +816,658 @@ async fn plain_sql_through_the_port_fails_closed_without_identity_or_scope() {
         "the seeded row must be visible: {ok}"
     );
 }
+
+// ── Round-2 review regressions (HIGH-1 / HIGH-2 / MED-1) ────────────────────
+
+fn identity_for(tenant: &str) -> proximadb_tenant::ResolvedRequestIdentity {
+    proximadb_tenant::ResolvedRequestIdentity {
+        tenant: tenant.to_string(),
+        subject: None,
+        auth_class: proximadb_tenant::AuthClass::Anonymous,
+        tenant_stable_id: None,
+    }
+}
+
+async fn read_response(response: axum::response::Response) -> (StatusCode, serde_json::Value) {
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    let value = serde_json::from_slice(&bytes)
+        .unwrap_or_else(|_| json!({ "raw": String::from_utf8_lossy(&bytes).to_string() }));
+    (status, value)
+}
+
+/// POST to the REAL v2 router acting as `tenant`.
+async fn v2_post_as(
+    state: &AppState,
+    tenant: &str,
+    uri: &str,
+    body: serde_json::Value,
+) -> (StatusCode, serde_json::Value) {
+    let router = create_v2_router()
+        .with_state(state.clone())
+        .layer(axum::Extension(identity_for(tenant)))
+        .layer(axum::Extension(
+            proximadb::network::middleware::tenant::TenantContext::new(
+                tenant,
+                proximadb::network::middleware::tenant::TenantIdSource::Header,
+            ),
+        ));
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .expect("request builds"),
+        )
+        .await
+        .expect("oneshot");
+    read_response(response).await
+}
+
+/// POST to the REAL `/api/v2/unified/*` router acting as `tenant`.
+async fn unified_post_as(
+    state: &AppState,
+    tenant: &str,
+    uri: &str,
+    body: serde_json::Value,
+) -> (StatusCode, serde_json::Value) {
+    use proximadb_api::rest::{UnifiedQueryRestState, create_multimodal_router};
+    let port = state.unified_query_port.clone().expect("port wired");
+    let router = create_multimodal_router()
+        .with_state(UnifiedQueryRestState {
+            unified_query_port: port,
+        })
+        .layer(axum::Extension(identity_for(tenant)));
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .expect("request builds"),
+        )
+        .await
+        .expect("oneshot");
+    read_response(response).await
+}
+
+/// Every port surface that accepts raw SQL text, as the `default` tenant.
+const PORT_LEGS: &[&str] = &[
+    "v2 /query uql",
+    "v2 /query federated",
+    "unified /execute",
+    "unified /federated",
+    "unified /distributed",
+    "unified prepare->execute",
+    "MCP search",
+    "canonical /sql",
+];
+
+/// Drive one port leg; returns the HTTP-equivalent status + body. MCP maps
+/// JSON-RPC INVALID_PARAMS (-32602) to 400 and anything else to 500, so a
+/// policy rejection reported as INTERNAL fails the 400 assertion (L3).
+async fn port_leg(
+    state: &AppState,
+    services: &Arc<SharedServices>,
+    leg: &str,
+    sql: &str,
+) -> (StatusCode, serde_json::Value) {
+    match leg {
+        "v2 /query uql" => {
+            v2_post_as(
+                state,
+                "default",
+                "/query",
+                json!({ "language": "uql", "query": sql }),
+            )
+            .await
+        }
+        "v2 /query federated" => {
+            v2_post_as(
+                state,
+                "default",
+                "/query",
+                json!({ "language": "federated", "query": sql }),
+            )
+            .await
+        }
+        "unified /execute" => {
+            unified_post_as(state, "default", "/execute", json!({ "query": sql })).await
+        }
+        "unified /federated" => {
+            unified_post_as(state, "default", "/federated", json!({ "query": sql })).await
+        }
+        "unified /distributed" => {
+            unified_post_as(state, "default", "/distributed", json!({ "query": sql })).await
+        }
+        "unified prepare->execute" => {
+            let (status, body) =
+                unified_post_as(state, "default", "/prepare", json!({ "query": sql })).await;
+            if status != StatusCode::CREATED {
+                return (status, body);
+            }
+            let id = body["statement_id"]
+                .as_str()
+                .expect("statement_id")
+                .to_string();
+            unified_post_as(
+                state,
+                "default",
+                &format!("/execute/{id}"),
+                json!({ "parameters": [] }),
+            )
+            .await
+        }
+        "MCP search" => {
+            let port = state.unified_query_port.clone().expect("port wired");
+            let backend = EngineBackend::new(
+                services.api_handlers.clone(),
+                Some(port),
+                None,
+                None,
+                Some("default".into()),
+            );
+            match backend
+                .search(&json!({ "collection_id": "spine6", "query": sql }))
+                .await
+            {
+                Ok(value) => (StatusCode::OK, value),
+                Err(error) => {
+                    let status = if error.code == -32602 {
+                        StatusCode::BAD_REQUEST
+                    } else {
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    };
+                    (
+                        status,
+                        json!({ "error": error.message, "code": error.code }),
+                    )
+                }
+            }
+        }
+        "canonical /sql" => {
+            let tenant = proximadb::network::middleware::tenant::TenantContext::new(
+                "default",
+                proximadb::network::middleware::tenant::TenantIdSource::Default,
+            );
+            let outcome = canonical_execute_sql(
+                State(state.clone()),
+                None,
+                Some(Extension(tenant)),
+                Json(SqlQueryRequest {
+                    query: sql.to_string(),
+                    parameters: None,
+                    collection: None,
+                    timeout_ms: None,
+                    seeding: None,
+                }),
+            )
+            .await;
+            match outcome {
+                Ok(Json(body)) => (StatusCode::OK, body),
+                Err(error) => {
+                    let response = axum::response::IntoResponse::into_response(error);
+                    read_response(response).await
+                }
+            }
+        }
+        other => panic!("unknown leg {other}"),
+    }
+}
+
+/// `table` rows (ordered ids) as `tenant` sees them through /api/v2/sql.
+async fn tenant_ids(state: &AppState, tenant: &str, table: &str) -> Vec<String> {
+    let (status, body) = v2_post_as(
+        state,
+        tenant,
+        "/sql",
+        json!({ "query": format!("SELECT id FROM {table} ORDER BY id") }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{tenant} read-back of {table}: {body}"
+    );
+    rows_of(&body, "rows", &["id"])
+        .into_iter()
+        .map(|row| row.join("|"))
+        .collect()
+}
+
+/// `table` rows as the UNSCOPED / internal view sees them (straight through
+/// the authority body inside an internal scope, anonymous identity) — where
+/// an unscoped write (`DmlService::execute` ⇒ `tenant_context: None`) lands.
+async fn unscoped_ids(services: &Arc<SharedServices>, table: &str) -> String {
+    let outcome = proximadb::query::request_scope::with_internal_scope(
+        "spine6-round2-unscoped-view",
+        services.query_adapter.execute_sql_via_authority(
+            format!("SELECT id FROM {table} ORDER BY id"),
+            None,
+            proximadb_runtime::PortIdentity::anonymous(),
+            None,
+        ),
+    )
+    .await;
+    match outcome {
+        Ok(result) => result
+            .rows
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .map(|cell| proximadb_records::conversions::proxima_to_json(cell).to_string())
+                    .collect::<Vec<_>>()
+                    .join("=")
+            })
+            .collect::<Vec<_>>()
+            .join(","),
+        Err(error) => format!("<unscoped read failed: {error:#}>"),
+    }
+}
+
+/// HIGH-1 (round 2): every EXPLAIN bypass shape and every query-shaped write
+/// is a 400 on EVERY port surface, with STATE UNCHANGED in both the tenant
+/// view and the unscoped/internal view (an executed-but-unscoped write would
+/// surface only there). A plant through the authority before each probe
+/// gives DELETE/UPDATE shapes a live target.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn explain_bypass_and_query_shaped_writes_are_400_with_state_unchanged_on_every_port_leg() {
+    const TABLE: &str = "spine6_r2";
+    let (state, services, _temp) = build_port_stack().await;
+    rest_sql(
+        &state,
+        &format!("CREATE TABLE {TABLE} (id TEXT, note TEXT)"),
+    )
+    .await;
+    rest_sql(
+        &state,
+        &format!("INSERT INTO {TABLE} (id, note) VALUES ('a', 'seed-a'), ('b', 'seed-b')"),
+    )
+    .await;
+    let baseline_tenant = tenant_ids(&state, "default", TABLE).await;
+    let baseline_unscoped = unscoped_ids(&services, TABLE).await;
+    assert_eq!(baseline_tenant, vec!["a", "b"], "two seeded rows");
+
+    let dangerous = [
+        // The parenthesized-ANALYZE bypass shapes (sqlparser's `analyze`
+        // flag is false for every one of them) + lowercase + valued forms.
+        format!("EXPLAIN (ANALYZE) INSERT INTO {TABLE} (id, note) VALUES ('x', 'rogue')"),
+        format!("EXPLAIN (FORMAT JSON, ANALYZE) INSERT INTO {TABLE} (id, note) VALUES ('x', 'r')"),
+        format!("EXPLAIN (ANALYZE, VERBOSE) DELETE FROM {TABLE}"),
+        format!("EXPLAIN (ANALYZE true) DELETE FROM {TABLE}"),
+        format!("EXPLAIN (ANALYZE off) DELETE FROM {TABLE}"),
+        format!("explain (analyze) update {TABLE} set note = 'rogue'"),
+        format!("EXPLAIN ANALYZE DELETE FROM {TABLE}"),
+        // L7: EXPLAIN of a pure read is rejected clearly too.
+        format!("EXPLAIN SELECT id FROM {TABLE}"),
+        // Query-shaped writes.
+        format!("WITH del AS (DELETE FROM {TABLE} RETURNING *) SELECT * FROM del"),
+        format!("(WITH x AS (SELECT 1) DELETE FROM {TABLE})"),
+        format!("SELECT 1 UNION (DELETE FROM {TABLE} RETURNING 1)"),
+        format!("SELECT * FROM (DELETE FROM {TABLE} RETURNING *) AS d"),
+        format!("SELECT id INTO {TABLE}_copy FROM {TABLE}"),
+        // Plain writes.
+        format!("DELETE FROM {TABLE}"),
+        format!("INSERT INTO {TABLE} (id, note) VALUES ('x', 'rogue')"),
+    ];
+    for statement in &dangerous {
+        for leg in PORT_LEGS {
+            let (status, body) = port_leg(&state, &services, leg, statement).await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "{leg} must reject with 400: {statement} — {body}"
+            );
+            let text = body.to_string();
+            // The prepare leg may reject at PREPARE time (a 400 from the
+            // prepared-statement cache, which cannot optimize the shape) —
+            // never executing it; every execution-time rejection names the
+            // read-only policy.
+            assert!(
+                text.contains("read-only")
+                    || text.contains("EXPLAIN")
+                    || (*leg == "unified prepare->execute"
+                        && text.contains("prepare_statement failed")),
+                "{leg} rejection must name the policy: {statement} — {text}"
+            );
+            assert_eq!(
+                tenant_ids(&state, "default", TABLE).await,
+                baseline_tenant,
+                "tenant rows changed by {leg}: {statement}"
+            );
+            assert_eq!(
+                unscoped_ids(&services, TABLE).await,
+                baseline_unscoped,
+                "unscoped rows changed by {leg}: {statement}"
+            );
+        }
+    }
+    // SELECT … INTO must not have created a table either.
+    let (status, _) = v2_post_as(
+        &state,
+        "default",
+        "/sql",
+        json!({ "query": format!("SELECT * FROM {TABLE}_copy") }),
+    )
+    .await;
+    assert_ne!(
+        status,
+        StatusCode::OK,
+        "SELECT … INTO must not create a table"
+    );
+
+    // Positive control: a pure read still serves on every leg.
+    for leg in PORT_LEGS {
+        let (status, body) = port_leg(
+            &state,
+            &services,
+            leg,
+            &format!("SELECT id FROM {TABLE} ORDER BY id"),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{leg} must serve a pure read: {body}"
+        );
+    }
+}
+
+/// HIGH-2 (round 2), dated 2026-11-25: `EXPLAIN ANALYZE <DML>` on the
+/// authority surface executes within the CALLER's tenant — it was unscoped
+/// (`execute_scoped(statement, None)`), so tenant `acme`'s analyzed write
+/// landed in (and could mutate) the shared unscoped partition. Tenant
+/// `acme`'s analyzed INSERT/DELETE must change ONLY acme's rows: tenant
+/// `default`'s rows and the unscoped view stay put.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn explain_analyze_dml_is_tenant_scoped_and_cannot_touch_another_tenant() {
+    const TABLE: &str = "spine6_xt";
+    let (state, services, _temp) = build_port_stack().await;
+    for (tenant, row) in [("default", "d-row"), ("acme", "a-row")] {
+        let (status, body) = v2_post_as(
+            &state,
+            tenant,
+            "/sql",
+            json!({ "query": format!("CREATE TABLE {TABLE} (id TEXT)") }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{tenant} create: {body}");
+        let (status, body) = v2_post_as(
+            &state,
+            tenant,
+            "/sql",
+            json!({ "query": format!("INSERT INTO {TABLE} (id) VALUES ('{row}')") }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{tenant} insert: {body}");
+    }
+    let unscoped_baseline = unscoped_ids(&services, TABLE).await;
+    assert_eq!(tenant_ids(&state, "default", TABLE).await, vec!["d-row"]);
+    assert_eq!(tenant_ids(&state, "acme", TABLE).await, vec!["a-row"]);
+
+    // (1) acme's analyzed INSERT lands in ACME's partition.
+    let (status, body) = v2_post_as(
+        &state,
+        "acme",
+        "/sql",
+        json!({ "query": format!("EXPLAIN (ANALYZE) INSERT INTO {TABLE} (id) VALUES ('a-explain')") }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "acme analyzed insert: {body}");
+    assert_eq!(
+        tenant_ids(&state, "acme", TABLE).await,
+        vec!["a-explain", "a-row"],
+        "acme's analyzed INSERT must land in acme's partition"
+    );
+    assert_eq!(
+        tenant_ids(&state, "default", TABLE).await,
+        vec!["d-row"],
+        "acme's analyzed INSERT must not touch tenant default"
+    );
+    assert_eq!(
+        unscoped_ids(&services, TABLE).await,
+        unscoped_baseline,
+        "acme's analyzed INSERT must not land unscoped"
+    );
+
+    // (2) `(ANALYZE off)` PLANS only (PostgreSQL semantics) — no execution.
+    let (status, body) = v2_post_as(
+        &state,
+        "acme",
+        "/sql",
+        json!({ "query": format!("EXPLAIN (ANALYZE off) DELETE FROM {TABLE} WHERE id IN ('a-explain', 'a-row')") }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "acme (ANALYZE off) plan: {body}");
+    assert_eq!(
+        tenant_ids(&state, "acme", TABLE).await,
+        vec!["a-explain", "a-row"],
+        "(ANALYZE off) must not execute the DELETE"
+    );
+
+    // (3) acme's analyzed DELETE removes ONLY acme's rows.
+    let (status, body) = v2_post_as(
+        &state,
+        "acme",
+        "/sql",
+        json!({ "query": format!("EXPLAIN (ANALYZE, VERBOSE) DELETE FROM {TABLE} WHERE id IN ('a-explain', 'a-row', 'd-row')") }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "acme analyzed delete: {body}");
+    assert!(
+        tenant_ids(&state, "acme", TABLE).await.is_empty(),
+        "acme's analyzed DELETE must delete acme's rows"
+    );
+    assert_eq!(
+        tenant_ids(&state, "default", TABLE).await,
+        vec!["d-row"],
+        "acme's analyzed DELETE must not touch tenant default's rows"
+    );
+    assert_eq!(
+        unscoped_ids(&services, TABLE).await,
+        unscoped_baseline,
+        "acme's analyzed DELETE must not touch the unscoped partition"
+    );
+}
+
+/// MED-1 (round 2): pgvector `<->` KNN SQL over a real vector collection
+/// gets, on EVERY port leg, exactly the authority body's outcome
+/// (`execute_sql_via_authority`) — the GenericDialect classifier rejected
+/// every `<->` form with a wrong "read-only" 400. The WHERE form is SERVED
+/// (same rows on every leg). The ORDER BY … LIMIT forms are an authority-body
+/// error in this embedded stack ("vector search service is unavailable" from
+/// the relational pipeline — pre-existing, not a port decision), so the port
+/// legs must fail the same way and never with the classifier's rejection.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pgvector_knn_sql_on_every_port_leg_matches_the_authority_body() {
+    let (state, services, _temp) = build_port_stack().await;
+    let (status, body) = v2_post_as(
+        &state,
+        "default",
+        "/collections",
+        json!({ "name": "spine6_vec", "dimension": 3, "engine": "sst" }),
+    )
+    .await;
+    assert!(status.is_success(), "create collection: {status} {body}");
+    let (status, body) = v2_post_as(
+        &state,
+        "default",
+        "/collections/spine6_vec/records/batch",
+        json!({ "records": [
+            { "id": "a", "vector": [1.0, 0.0, 0.0], "props": { "note": "x" } },
+            { "id": "b", "vector": [0.0, 1.0, 0.0], "props": { "note": "y" } },
+            { "id": "c", "vector": [0.0, 0.0, 1.0], "props": { "note": "z" } }
+        ] }),
+    )
+    .await;
+    assert!(status.is_success(), "insert records: {status} {body}");
+
+    for knn in [
+        "SELECT * FROM spine6_vec ORDER BY embedding <-> '[1.0, 0.0, 0.0]' LIMIT 3",
+        "SELECT * FROM spine6_vec ORDER BY vector <-> '[1,0,0]'::vector LIMIT 2",
+        "SELECT id FROM spine6_vec WHERE embedding <-> '[1.0, 0.0, 0.0]' < 1.5",
+    ] {
+        let authority = services
+            .query_adapter
+            .execute_sql_via_authority(
+                knn.to_string(),
+                None,
+                proximadb_runtime::PortIdentity::for_tenant("default"),
+                None,
+            )
+            .await;
+        let authority_ids: Option<Vec<String>> = authority.as_ref().ok().map(|result| {
+            let mut ids: Vec<String> = result
+                .rows
+                .iter()
+                .map(|row| proximadb_records::conversions::proxima_to_json(&row[0]).to_string())
+                .map(|id| id.trim_matches('"').to_string())
+                .collect();
+            ids.sort();
+            ids
+        });
+        if knn.contains("WHERE") {
+            // Positive control (non-vacuous): the authority body SERVES the
+            // WHERE-form KNN read — the port legs must return these rows.
+            assert_eq!(
+                authority_ids,
+                Some(vec!["a".to_string(), "b".to_string(), "c".to_string()]),
+                "the authority body must serve the WHERE-form KNN: {authority:?}"
+            );
+        }
+        for leg in PORT_LEGS {
+            let (status, body) = port_leg(&state, &services, leg, knn).await;
+            let text = body.to_string();
+            // Never the (wrong) read-only rejection or the GenericDialect
+            // parse rejection — the round-2 regression.
+            assert!(
+                !text.contains("read-only") && !text.contains("cannot parse"),
+                "{leg}: a <-> read must not be rejected by the classifier: {knn} — {text}"
+            );
+            match &authority_ids {
+                Some(expected) => {
+                    assert_eq!(status, StatusCode::OK, "{leg}: {knn} — {text}");
+                    let key = if *leg == "canonical /sql" {
+                        "rows"
+                    } else {
+                        "records"
+                    };
+                    // No ORDER BY on the WHERE form: compare as sets.
+                    let mut got: Vec<String> = rows_of(&body, key, &["id"])
+                        .into_iter()
+                        .map(|row| row.join("|"))
+                        .collect();
+                    got.sort();
+                    assert_eq!(
+                        &got, expected,
+                        "{leg}: rows differ from the authority body for {knn}"
+                    );
+                }
+                None => assert!(
+                    !status.is_success(),
+                    "{leg}: the authority body rejects {knn}, so the port leg must too — {text}"
+                ),
+            }
+        }
+    }
+}
+
+/// MED-2 (round 2): `/unified/distributed` plain SQL no longer returns
+/// silent-empty for keyword-bearing SELECTs — it routes through the same
+/// read-only seam and returns the authority's rows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn distributed_plain_sql_returns_the_authority_rows() {
+    let (state, _services, _temp) = build_port_stack().await;
+    rest_sql(&state, "CREATE TABLE spine6_dist (id TEXT, note TEXT)").await;
+    rest_sql(
+        &state,
+        "INSERT INTO spine6_dist (id, note) VALUES ('seed', 'LOGS(a) literal')",
+    )
+    .await;
+    let select = "SELECT id, note FROM spine6_dist WHERE note = 'LOGS(a)' OR id = 'seed'";
+    let port = state.unified_query_port.clone().expect("port wired");
+
+    let control = rows_of(&rest_sql(&state, select).await, "rows", &["id", "note"]);
+    assert_eq!(control.len(), 1, "the authority sees the row: {control:?}");
+
+    let distributed = port
+        .execute_distributed_query(
+            json!({ "query": select }),
+            proximadb_runtime::UnifiedQueryPortContext::for_identity(
+                proximadb_runtime::PortIdentity::for_tenant("default"),
+            ),
+        )
+        .await
+        .expect("distributed plain SQL must resolve through the seam");
+    let dist_rows = rows_of(&distributed, "records", &["id", "note"]);
+    assert!(
+        legs_agree(&control, &dist_rows),
+        "distributed must not return silent-empty: {distributed}"
+    );
+}
+
+/// MED-4 spot-check (round 2): MCP rejects `EXPLAIN (ANALYZE) DELETE` as
+/// INVALID_PARAMS (a caller error, not INTERNAL) with state unchanged; and a
+/// prepared-then-executed EXPLAIN Analyze write is rejected at execution.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_and_prepared_reject_explain_analyze_writes() {
+    let (state, services, _temp) = build_port_stack().await;
+    rest_sql(&state, "CREATE TABLE spine6_mcp2 (id TEXT)").await;
+    rest_sql(&state, "INSERT INTO spine6_mcp2 (id) VALUES ('keep')").await;
+    let port = state.unified_query_port.clone().expect("port wired");
+
+    // MCP: the rejection is a caller error naming the policy.
+    let error = mcp_search(
+        services.api_handlers.clone(),
+        port.clone(),
+        "EXPLAIN (ANALYZE, VERBOSE) DELETE FROM spine6_mcp2",
+    )
+    .await
+    .expect_err("EXPLAIN (ANALYZE) DELETE via MCP must be rejected");
+    assert!(
+        error.contains("EXPLAIN") || error.contains("read-only"),
+        "the MCP rejection must name the policy: {error}"
+    );
+
+    // Prepared: prepare succeeds (text caching), EXECUTION is rejected.
+    let statement_id = port
+        .prepare_statement(
+            None,
+            "EXPLAIN (ANALYZE) DELETE FROM spine6_mcp2".to_string(),
+            false,
+            None,
+            proximadb_runtime::UnifiedQueryPortContext::for_identity(
+                proximadb_runtime::PortIdentity::for_tenant("default"),
+            ),
+        )
+        .await
+        .expect("prepare caches the text");
+    let error = port
+        .execute_prepared(
+            statement_id,
+            None,
+            None,
+            proximadb_runtime::UnifiedQueryPortContext::for_identity(
+                proximadb_runtime::PortIdentity::for_tenant("default"),
+            ),
+        )
+        .await
+        .expect_err("executing a prepared EXPLAIN Analyze write must be rejected");
+    assert!(
+        format!("{error:#}").contains("EXPLAIN"),
+        "the rejection must name EXPLAIN: {error:#}"
+    );
+
+    // State unchanged.
+    let after = rest_sql(&state, "SELECT id FROM spine6_mcp2").await;
+    assert_eq!(
+        rows_of(&after, "rows", &["id"]).len(),
+        1,
+        "row must survive: {after}"
+    );
+}

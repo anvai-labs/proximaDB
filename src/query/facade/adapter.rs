@@ -770,7 +770,6 @@ impl QueryFacadeAdapter {
         // scope already in force (see `request_scope::with_identity_scope`).
         let scope_tenant = identity.tenant_id;
         crate::query::request_scope::with_identity_scope(scope_tenant, async move {
-            use crate::query::QueryResultData;
             let tenant_id = identity.tenant_id;
 
             // EXPLAIN [ANALYZE] <DML> routing — parity with the ROOT handler's
@@ -784,8 +783,22 @@ impl QueryFacadeAdapter {
                 let parser = crate::query::sql_frontend::SqlFrontendParser::new();
                 match parser.parse_dml(inner_query) {
                     Ok(Some(statement)) => {
+                        // TD-SPINE-6 round 2 (HIGH-2): the ANALYZEd write
+                        // executes within the caller's tenant scope (derived
+                        // from the port identity exactly as `try_run_select`
+                        // derives its TenantContext) — previously it ran
+                        // unscoped, so one tenant's EXPLAIN (ANALYZE) DML
+                        // could mutate another tenant's rows.
+                        let analyze_tenant_ctx = tenant_id.filter(|t| !t.is_empty()).map(|t| {
+                            let mut context =
+                                crate::storage::tenant::context::TenantContext::for_tenant_id(t);
+                            context.tenant_stable_id = identity.tenant_stable_id;
+                            context
+                        });
                         let explanation = if is_analyze {
-                            dml_svc.explain_analyze_table_write(statement).await
+                            dml_svc
+                                .explain_analyze_table_write(statement, analyze_tenant_ctx.as_ref())
+                                .await
                         } else {
                             dml_svc.explain_table_write(statement).await
                         }
@@ -828,63 +841,103 @@ impl QueryFacadeAdapter {
                 });
             }
 
-            // TD-121 relational SELECT routing — parity with the runtime handler's
-            // execute_sql_v1. Both the gRPC and REST SQL routes reach this adapter
-            // (TD-104 S4 converged REST onto the runtime handler → adapter), so
-            // relational SELECT over EITHER surface routes through the tenant-scoped
-            // pipeline here. `require_engagement=false`
-            // routes any resolvable relational SELECT; queries whose tables don't
-            // resolve return `None` and fall through to `sql_query` (vector/graph
-            // SQL, unchanged). The OLAP result cache IS consulted when the caller
-            // handed one (default-OFF behind PROXIMADB_QUERY_RESULT_CACHE) — the
-            // Strong-freshness port caller passes `None` instead (mandate #16c).
-            // namespace=None: SQL port path has no pgwire search_path.
-            if let Some(dml) = self.dml_service.as_ref()
-                && let Some(outcome) =
-                    crate::network::postgres::relational_pipeline::try_run_select(
-                        &query,
-                        Some(dml),
-                        None,
-                        None,
-                        identity,
-                        crate::query::execution::ExecutionControls::default(),
-                        false,
-                        None,
-                        result_cache,
-                    )
-                    .await
-            {
-                return match outcome {
-                    Ok(result) => Ok(pipeline_result_to_sql_result(result)),
-                    Err(msg) => Err(anyhow!("Relational query execution failed: {msg}")),
-                };
-            }
-
-            let query_result = self.sql_query(&query).await?;
-
-            let records: Vec<serde_json::Value> = match query_result.data {
-                QueryResultData::Rows(rows) => rows,
-                QueryResultData::VectorResults(matches) => matches
-                    .into_iter()
-                    .map(|m| {
-                        serde_json::json!({
-                            "id": m.record.oid,
-                            "score": m.score,
-                            "metadata": m.record.props,
-                        })
-                    })
-                    .collect(),
-                QueryResultData::Empty => vec![],
-                QueryResultData::Graph(g) => g
-                    .nodes
-                    .into_iter()
-                    .map(|n| serde_json::to_value(n).unwrap_or_default())
-                    .collect(),
-            };
-
-            Ok(shape_sql_records(records))
+            // The shared read path (see `execute_read_path`) — TD-121 SELECT
+            // routing + the facade fallback.
+            self.execute_read_path(&query, identity, result_cache).await
         })
         .await
+    }
+}
+
+impl QueryFacadeAdapter {
+    /// READ-ONLY SQL authority entry for query surfaces (TD-SPINE-6 round 2,
+    /// HIGH-1): structurally cannot reach the EXPLAIN-DML explainer or the
+    /// relational write dispatch above — only `try_run_select` (the
+    /// `ComputeScheduler::route_select` decision) and the facade fallback.
+    /// `UnifiedQueryPort` routes raw user text through this after its own
+    /// AST read classification, so the port never depends on a parallel
+    /// classifier matching this body's parsing.
+    pub async fn execute_sql_read_only_via_authority(
+        &self,
+        query: String,
+        _collection: Option<String>,
+        identity: proximadb_runtime::PortIdentity<'_>,
+        result_cache: Option<
+            &crate::query::cache::query_result_cache::QueryResultCache<
+                crate::query::execution::ExecutionPipelineResult,
+            >,
+        >,
+    ) -> anyhow::Result<proximadb_runtime::SqlExecutionResult> {
+        let scope_tenant = identity.tenant_id;
+        crate::query::request_scope::with_identity_scope(scope_tenant, async {
+            self.execute_read_path(&query, identity, result_cache).await
+        })
+        .await
+    }
+
+    /// The shared read tail of the SQL authority: TD-121 tenant-scoped
+    /// relational SELECT routing (`try_run_select` — the ComputeScheduler
+    /// decision; `require_engagement=false` routes any resolvable relational
+    /// SELECT, queries whose tables don't resolve fall through) + the facade
+    /// fallback (`sql_query` promotes GENUINE extension SQL to the federated
+    /// executor). The OLAP result cache is consulted when the caller hands
+    /// one (default-OFF behind PROXIMADB_QUERY_RESULT_CACHE); the
+    /// Strong-freshness port caller passes `None` (mandate #16c).
+    /// namespace=None: the SQL port path has no pgwire search_path.
+    async fn execute_read_path(
+        &self,
+        query: &str,
+        identity: proximadb_runtime::PortIdentity<'_>,
+        result_cache: Option<
+            &crate::query::cache::query_result_cache::QueryResultCache<
+                crate::query::execution::ExecutionPipelineResult,
+            >,
+        >,
+    ) -> anyhow::Result<proximadb_runtime::SqlExecutionResult> {
+        use crate::query::QueryResultData;
+        if let Some(dml) = self.dml_service.as_ref()
+            && let Some(outcome) = crate::network::postgres::relational_pipeline::try_run_select(
+                query,
+                Some(dml),
+                None,
+                None,
+                identity,
+                crate::query::execution::ExecutionControls::default(),
+                false,
+                None,
+                result_cache,
+            )
+            .await
+        {
+            return match outcome {
+                Ok(result) => Ok(pipeline_result_to_sql_result(result)),
+                Err(msg) => Err(anyhow!("Relational query execution failed: {msg}")),
+            };
+        }
+
+        let query_result = self.sql_query(query).await?;
+
+        let records: Vec<serde_json::Value> = match query_result.data {
+            QueryResultData::Rows(rows) => rows,
+            QueryResultData::VectorResults(matches) => matches
+                .into_iter()
+                .map(|m| {
+                    serde_json::json!({
+                        "id": m.record.oid,
+                        "score": m.score,
+                        "metadata": m.record.props,
+                    })
+                })
+                .collect(),
+            QueryResultData::Empty => vec![],
+            QueryResultData::Graph(g) => g
+                .nodes
+                .into_iter()
+                .map(|n| serde_json::to_value(n).unwrap_or_default())
+                .collect(),
+        };
+
+        Ok(shape_sql_records(records))
     }
 }
 

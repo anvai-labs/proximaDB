@@ -93,14 +93,25 @@ impl std::error::Error for MissingQueryIdentity {}
 /// Implemented by root-crate services that own `QueryFacadeAdapter`.  Injected
 /// into `proximadb-api` as `Arc<dyn UnifiedQueryPort>` so the API layer carries
 /// zero dependency on root-crate concrete types.
+///
+/// **Read-only contract (TD-SPINE-6 round 2, dated 2026-11-25):** plain SQL
+/// on this port is READ-ONLY. Raw user text is classified on the statement
+/// AST (a single pure `SELECT` — no data-modifying set-expression bodies, no
+/// data-modifying CTEs, no `SELECT … INTO`; EXPLAIN is not served) and
+/// executes through the authority's READ-ONLY entry, which structurally
+/// cannot reach the EXPLAIN-DML explainer or the relational write dispatch.
+/// Writes are served by `/api/v2/sql` (guarded), gRPC `ExecuteQuery`, and
+/// pgwire. Port-lowered (UQL / multi-model) extension SQL keeps its federated
+/// lowering. Query bodies are capped at 1 MiB; rejections are typed
+/// (`InvalidQueryInput` → 400, `MissingQueryIdentity` → 401).
 #[async_trait]
 pub trait UnifiedQueryPort: Send + Sync {
     // ── Core query execution ──────────────────────────────────────────────────
 
     /// Execute a unified SQL-like query (may contain multi-model extensions).
     ///
-    /// Plain relational SQL delegates to the one SQL authority
-    /// (`ComputeScheduler::route_select` decision path — ADR-098 D5 /
+    /// Plain relational SQL delegates to the one SQL authority's read-only
+    /// entry (`ComputeScheduler::route_select` decision path — ADR-098 D5 /
     /// TD-SPINE-6); multi-model extensions keep their federated lowering.
     async fn execute_unified_query(
         &self,

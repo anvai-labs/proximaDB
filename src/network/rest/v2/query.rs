@@ -101,31 +101,43 @@ pub async fn execute_query(
         proximadb_runtime::PortIdentity::from(&identity),
     );
 
-    let result = match request.language {
-        QueryLanguage::Uql => {
-            query_port
-                .execute_unified_query(
-                    request.query,
-                    json_to_proxima_values(request.parameters),
-                    request.collection,
-                    request.limit,
-                    context,
-                )
-                .await
-        }
-        QueryLanguage::Federated => {
-            query_port
-                .execute_federated_query(
-                    request.query,
-                    json_to_proxima_values(request.parameters),
-                    context,
-                )
-                .await
-        }
-        QueryLanguage::Aql => {
-            return Err(ApiError::InvalidArgument(
+    // L4 (round 2): this surface now runs relational reads through the SQL
+    // authority, so it carries /api/v2/sql's deadline contract.
+    const PORT_QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+    let execution = async {
+        match request.language {
+            QueryLanguage::Uql => {
+                query_port
+                    .execute_unified_query(
+                        request.query,
+                        json_to_proxima_values(request.parameters),
+                        request.collection,
+                        request.limit,
+                        context,
+                    )
+                    .await
+            }
+            QueryLanguage::Federated => {
+                query_port
+                    .execute_federated_query(
+                        request.query,
+                        json_to_proxima_values(request.parameters),
+                        context,
+                    )
+                    .await
+            }
+            QueryLanguage::Aql => Err(proximadb_runtime::InvalidQueryInput(
                 "AQL text execution is not yet exposed on /api/v2/query; submit UQL or federated SQL extensions".to_string(),
-            ));
+            )
+            .into()),
+        }
+    };
+    let result = match tokio::time::timeout(PORT_QUERY_TIMEOUT, execution).await {
+        Ok(result) => result,
+        Err(_) => {
+            return Err(ApiError::DeadlineExceeded(format!(
+                "Query exceeded the {PORT_QUERY_TIMEOUT:?} deadline"
+            )));
         }
     };
 
@@ -137,13 +149,21 @@ pub async fn execute_query(
         }
         // MED-4/MED-3 (round-1 review): client-shaped port rejections map to
         // 4xx — a read-only-policy violation (DDL/DML on this query surface)
-        // is a 400 naming the policy; a missing identity is a 401.
-        if error.downcast_ref::<proximadb_runtime::InvalidQueryInput>().is_some() {
-            return ApiError::InvalidArgument(format!(
-                "Query rejected: {error}. Plain SQL on this surface is read-only; use /api/v2/sql for writes."
-            ));
+        // is a 400 naming the policy (the AQL placeholder too); a missing
+        // identity is a 401. L5 (round 2): no write-surface suffix is
+        // appended here — the port's policy rejection already names
+        // /api/v2/sql, and a READ that merely failed to parse must not be
+        // told to use the write surface.
+        if error
+            .downcast_ref::<proximadb_runtime::InvalidQueryInput>()
+            .is_some()
+        {
+            return ApiError::InvalidArgument(format!("Query rejected: {error}"));
         }
-        if error.downcast_ref::<proximadb_runtime::MissingQueryIdentity>().is_some() {
+        if error
+            .downcast_ref::<proximadb_runtime::MissingQueryIdentity>()
+            .is_some()
+        {
             return ApiError::Unauthorized(format!("Query rejected: {error}"));
         }
         error!("v2 query execution failed: {}", error);
