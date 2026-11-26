@@ -876,7 +876,7 @@ dependencies = [
  "hmac",
  "http",
  "percent-encoding",
- "sha2",
+ "sha2 0.11.1",
  "time",
  "tracing",
 ]
@@ -3825,7 +3825,7 @@ dependencies = [
  "rustls-pki-types",
  "serde",
  "serde_json",
- "sha2",
+ "sha2 0.11.1",
  "thiserror 2.0.21",
  "time",
  "tokio",
@@ -3988,7 +3988,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_with",
- "sha2",
+ "sha2 0.11.1",
  "thiserror 2.0.21",
  "tokio",
  "tokio-stream",
@@ -4986,7 +4986,7 @@ dependencies = [
  "pkg-config",
  "serde",
  "serde_json",
- "sha2",
+ "sha2 0.11.1",
  "tar",
  "ureq",
  "vcpkg",
@@ -6440,7 +6440,7 @@ dependencies = [
  "md-5",
  "memchr",
  "rand 0.10.3",
- "sha2",
+ "sha2 0.11.1",
  "stringprep",
 ]
 
@@ -6590,7 +6590,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ad9c5423459fa2f729b8d9235fab810aa29628b171467744fc86d21460ad70d"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools 0.15.0",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
@@ -6866,7 +6866,7 @@ dependencies = [
  "serde_urlencoded",
  "serde_yaml",
  "serial_test",
- "sha2",
+ "sha2 0.11.1",
  "snap",
  "sqlparser",
  "sqlx",
@@ -6908,7 +6908,7 @@ dependencies = [
  "proximadb-filter-expression",
  "serde",
  "serde_json",
- "sha2",
+ "sha2 0.11.1",
  "thiserror 2.0.21",
 ]
 
@@ -7063,7 +7063,7 @@ dependencies = [
  "moka",
  "serde",
  "serde_json",
- "sha2",
+ "sha2 0.11.1",
  "tempfile",
  "tokio",
 ]
@@ -7105,7 +7105,7 @@ dependencies = [
  "reqwest 0.12.28",
  "serde",
  "serde_json",
- "sha2",
+ "sha2 0.11.1",
  "sqlx",
  "tempfile",
  "thiserror 2.0.21",
@@ -7715,7 +7715,7 @@ dependencies = [
  "proximadb-storage-common",
  "serde",
  "serde_json",
- "sha2",
+ "sha2 0.11.1",
  "tempfile",
  "tokio",
  "tracing",
@@ -8689,7 +8689,7 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
- "sha2",
+ "sha2 0.11.1",
  "tempfile",
  "tokio",
  "tokio-postgres",
@@ -8802,7 +8802,7 @@ dependencies = [
  "rand 0.8.8",
  "rayon",
  "serde",
- "sha2",
+ "sha2 0.11.1",
  "tokio",
  "tracing",
 ]
@@ -8992,7 +8992,7 @@ dependencies = [
  "rustls",
  "rustls-pemfile",
  "serde",
- "sha2",
+ "sha2 0.11.1",
  "tempfile",
  "thiserror 2.0.21",
  "time",
@@ -9924,14 +9924,15 @@ dependencies = [
 
 [[package]]
 name = "sandhi-core"
-version = "0.14.1"
+version = "0.24.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "af26524b3d354e529c082c22d98a6ac1b106e880e3a3abb1601085ac94f65f7a"
+checksum = "a377d4a28f631b3cb49a9927cbae3b9b0b96ea122e0916996273100028ca63e9"
 dependencies = [
  "regex",
  "schemars 0.8.22",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "time",
  "tracing",
 ]
@@ -10261,6 +10262,17 @@ dependencies = [
 
 [[package]]
 name = "sha2"
+version = "0.10.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a7507d819769d01a365ab707794a4084392c824f54a7a6a7862f8c3d0892b283"
+dependencies = [
+ "cfg-if",
+ "cpufeatures 0.2.17",
+ "digest 0.10.7",
+]
+
+[[package]]
+name = "sha2"
 version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "47d7069beb7d6ac7b9acd1039986e73443f24234f41074da099d6f994ac9ad19"
@@ -10523,7 +10535,7 @@ dependencies = [
  "percent-encoding",
  "serde",
  "serde_json",
- "sha2",
+ "sha2 0.11.1",
  "smallvec",
  "thiserror 2.0.21",
  "tokio",
@@ -10561,7 +10573,7 @@ dependencies = [
  "quote",
  "serde",
  "serde_json",
- "sha2",
+ "sha2 0.11.1",
  "sqlx-core",
  "sqlx-mysql",
  "sqlx-postgres",
@@ -10593,7 +10605,7 @@ dependencies = [
  "percent-encoding",
  "serde",
  "sha1 0.11.0",
- "sha2",
+ "sha2 0.11.1",
  "sqlx-core",
  "thiserror 2.0.21",
  "tracing",
@@ -10627,7 +10639,7 @@ dependencies = [
  "rand 0.10.3",
  "serde",
  "serde_json",
- "sha2",
+ "sha2 0.11.1",
  "smallvec",
  "sqlx-core",
  "stringprep",
