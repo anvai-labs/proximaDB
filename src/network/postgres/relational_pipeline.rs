@@ -107,10 +107,6 @@ impl PgVectorOutputColumn {
     }
 }
 
-/// Lower the supported pgvector nearest-neighbour SELECT into one typed plan.
-/// `Ok(None)` means the SQL is not a pgvector operator query. Once an operator
-/// is present, malformed or unsupported semantics are errors; they must never
-/// fall through to a string parser or silently widen a metadata predicate.
 /// Whether `sql` is a pgvector KNN SELECT (`ORDER BY <col> <-> <vec> LIMIT
 /// k`) that [`try_run_select`] would execute through a vector search service
 /// — for callers that hold none, so they can reject it with a typed,
@@ -119,6 +115,10 @@ pub(crate) fn is_pgvector_knn_select(sql: &str) -> bool {
     matches!(lower_pgvector_select(sql), Ok(Some(_)))
 }
 
+/// Lower the supported pgvector nearest-neighbour SELECT into one typed plan.
+/// `Ok(None)` means the SQL is not a pgvector operator query. Once an operator
+/// is present, malformed or unsupported semantics are errors; they must never
+/// fall through to a string parser or silently widen a metadata predicate.
 fn lower_pgvector_select(sql: &str) -> Result<Option<PgVectorSelectPlan>, String> {
     let statements = match Parser::parse_sql(&PostgreSqlDialect {}, sql) {
         Ok(statements) => statements,

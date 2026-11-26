@@ -115,7 +115,10 @@ fn map_execution_error(error: anyhow::Error) -> ApiError {
         // resolvable by its tenant) is 404 — one response for both.
         ApiError::CollectionNotFound(missing.identifier.clone())
     } else {
-        ApiError::Internal(format!("SQL execution failed: {error}"))
+        // `{:#}`: the full cause chain — an outer context ("DML failed") must
+        // not hide the actionable cause (e.g. the TD-DML-3 row-level-security
+        // rejection of an ON CONFLICT DO UPDATE).
+        ApiError::Internal(format!("SQL execution failed: {error:#}"))
     }
 }
 

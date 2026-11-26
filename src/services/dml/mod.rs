@@ -627,6 +627,23 @@ pub enum DmlStatement {
 }
 
 impl DmlStatement {
+    /// Stamp the protocol caller onto the statement's `ON CONFLICT` clause
+    /// (TD-DML-3): under `abac-policy` a `DO UPDATE` may only rewrite a
+    /// conflicting row the caller can SEE, and a clause with no caller is
+    /// treated as an internal statement. Every surface that executes a parsed
+    /// upsert for a caller — pgwire DML, pgwire `EXPLAIN ANALYZE`, the SQL
+    /// authority's write dispatch and its `EXPLAIN ANALYZE` — calls this ONE
+    /// helper (TD-SPINE-6 round 4: the EXPLAIN ANALYZE paths skipped it).
+    /// A non-upsert statement is unchanged.
+    pub fn stamp_on_conflict_caller(
+        &mut self,
+        caller: Option<proximadb_runtime::OwnedPortIdentity>,
+    ) {
+        if let Self::Upsert { on_conflict, .. } = self {
+            on_conflict.caller_identity = caller;
+        }
+    }
+
     /// Return the logical target table for all DML variants.
     pub fn target_table_name(&self) -> &str {
         match self {

@@ -1085,8 +1085,12 @@ impl UnifiedQueryPort for UnifiedQueryPortImpl {
         // not an execution — the freshness mode has nothing to gate and is
         // deliberately ignored; see the LOW-5 note on
         // `olap_cache_for_freshness`.)
+        // Round 4 (LOW-3): the port entry contract holds here too — the 1 MiB
+        // cap on the raw input and the port deadline.
+        ensure_query_size(&query)?;
+        let deadline = proximadb_runtime::PORT_QUERY_DEADLINE;
         let scope_tenant = context.identity.tenant_id;
-        crate::query::request_scope::with_identity_scope(scope_tenant, async {
+        let explained = crate::query::request_scope::with_identity_scope(scope_tenant, async {
             let explain = self.adapter.explain(&query).context("explain failed")?;
             let mut value =
                 serde_json::to_value(&explain).context("failed to serialize explain result")?;
@@ -1103,8 +1107,10 @@ impl UnifiedQueryPort for UnifiedQueryPortImpl {
                 );
             }
             Ok(value)
-        })
-        .await
+        });
+        tokio::time::timeout(deadline, explained)
+            .await
+            .map_err(|_| anyhow::Error::new(QueryDeadlineExceeded(deadline)))?
     }
 
     async fn prepare_statement(

@@ -3916,39 +3916,25 @@ impl PostgresProtocol {
         };
 
         let write_intent_overrides = self.write_intent_overrides_from_session().await;
+        let mut statement = statement;
+        // TD-DML-3 (round 4): an analyzed upsert carries the session caller so
+        // `ON CONFLICT DO UPDATE` enforces the read policy exactly as the DML
+        // entry does (it ran as an "internal" statement — `None` caller).
+        statement.stamp_on_conflict_caller(self.session_caller_identity().await);
         let table = statement.target_table_name().to_string();
-        // TD-SPINE-6 round 3 (L2): an ANALYZEd write passes the SAME gates as
-        // the normal DML entry (`execute_dml_via_dml_service`): the primary-pod
-        // gate, tenant visibility, the read-only-transaction rejection and
-        // post-commit cache invalidation. The write tenant is the connection
-        // tenant (round 2, HIGH-2 — it ran unscoped).
-        let write_tenant = if is_analyze {
-            match self
-                .resolve_write_tenant_gated("EXPLAIN ANALYZE for", &table)
-                .await?
-            {
-                Some(tenant) => tenant,
-                None => return Ok(()),
-            }
-        } else {
-            self.pgwire_resolve_write_tenant().await
-        };
-        // Tenant visibility (both modes — L7: a plan-only EXPLAIN must not
-        // disclose another tenant's table): fail closed as a missing relation.
-        if !write_tenant.is_empty()
-            && !dml_service
-                .table_visible_for_tenant(&table, Some(write_tenant.as_str()))
-                .await
-                .unwrap_or(false)
+        // TD-SPINE-6 round 3/4 (L2): the SAME target gate sequence as the DML
+        // entry (`gate_dml_target`): the primary-pod gate for an analyzed write
+        // (a plan-only EXPLAIN writes nothing), then tenant visibility for both
+        // (L7: a plan-only EXPLAIN must not disclose another tenant's table).
+        // The write tenant is the connection tenant (round 2, HIGH-2).
+        let pod_gate_phrase = is_analyze.then_some("EXPLAIN ANALYZE for");
+        let write_tenant = match self
+            .gate_dml_target(&dml_service, &table, pod_gate_phrase)
+            .await?
         {
-            return self
-                .send_error(
-                    "ERROR",
-                    "42P01",
-                    &format!("relation \"{table}\" does not exist"),
-                )
-                .await;
-        }
+            Some(tenant) => tenant,
+            None => return Ok(()),
+        };
         if is_analyze && self.transaction_in_progress().await {
             // An analyzed write executes immediately, so it cannot join the
             // transaction's buffered writes (ADR-018 P2.D).
@@ -4005,10 +3991,26 @@ impl PostgresProtocol {
             }
             Err(error) => {
                 warn!("DmlService EXPLAIN failed: {}", error);
-                self.send_error("ERROR", "0A000", &format!("Explain failed: {}", error))
+                // An analyzed write's integrity / privilege violation keeps its
+                // SQLSTATE (e.g. 42501 for the TD-DML-3 read policy) — the
+                // same mapping the DML entry uses.
+                let code = dml_error_sqlstate(&error, "0A000");
+                self.send_error("ERROR", code, &format!("Explain failed: {}", error))
                     .await
             }
         }
+    }
+
+    /// The session caller as the canonical owned identity — what a parsed
+    /// upsert carries for the TD-DML-3 `ON CONFLICT DO UPDATE` read-policy
+    /// check (`DmlStatement::stamp_on_conflict_caller`).
+    async fn session_caller_identity(&self) -> Option<proximadb_runtime::OwnedPortIdentity> {
+        self.session
+            .read()
+            .await
+            .identity
+            .as_ref()
+            .map(|identity| proximadb_runtime::PortIdentity::from(identity).into_owned())
     }
 
     async fn write_intent_overrides_from_session(&self) -> WriteIntentOverrides {
@@ -6208,6 +6210,48 @@ impl PostgresProtocol {
         Ok(Some(write_tenant))
     }
 
+    /// THE pgwire DML target gate sequence, shared by the DML entry
+    /// (`execute_dml_via_dml_service`) and the `EXPLAIN [ANALYZE]` write path
+    /// so the two cannot drift (TD-SPINE-6 round 4):
+    /// 1. with `pod_gate_phrase`, the TD-PGWIRE-COPY-1 primary-pod gate
+    ///    (57P03 — a write must run on its owner pod); a plan-only EXPLAIN
+    ///    writes nothing and passes `None`;
+    /// 2. the TD-064 write-half tenant visibility gate: a target the
+    ///    connection tenant cannot resolve fails closed as 42P01, never
+    ///    leaking that another tenant's table exists.
+    ///
+    /// Returns `Ok(Some(write_tenant))` to proceed, `Ok(None)` once the error
+    /// frame was sent (the caller must stop), `Err` if it could not be sent.
+    async fn gate_dml_target(
+        &mut self,
+        dml_service: &Arc<DmlService>,
+        table: &str,
+        pod_gate_phrase: Option<&str>,
+    ) -> Result<Option<String>> {
+        let write_tenant = match pod_gate_phrase {
+            Some(phrase) => match self.resolve_write_tenant_gated(phrase, table).await? {
+                Some(tenant) => tenant,
+                None => return Ok(None),
+            },
+            None => self.pgwire_resolve_write_tenant().await,
+        };
+        if !write_tenant.is_empty()
+            && !dml_service
+                .table_visible_for_tenant(table, Some(write_tenant.as_str()))
+                .await
+                .unwrap_or(false)
+        {
+            self.send_error(
+                "ERROR",
+                "42P01",
+                &format!("relation \"{table}\" does not exist"),
+            )
+            .await?;
+            return Ok(None);
+        }
+        Ok(Some(write_tenant))
+    }
+
     /// Execute INSERT through canonical catalog-backed DML (shared body —
     /// see `execute_dml_via_dml_service`).
     async fn execute_insert_via_dml_service(
@@ -6244,14 +6288,7 @@ impl PostgresProtocol {
                 // read policy on the conflicting row (abac-policy), so the
                 // statement carries the session identity — through buffering
                 // too, since it travels with the statement.
-                if let crate::services::dml::DmlStatement::Upsert { on_conflict, .. } =
-                    &mut statement
-                {
-                    on_conflict.caller_identity =
-                        self.session.read().await.identity.as_ref().map(|identity| {
-                            proximadb_runtime::PortIdentity::from(identity).into_owned()
-                        });
-                }
+                statement.stamp_on_conflict_caller(self.session_caller_identity().await);
                 // Slice 6.3: gate runs post-parse so the (tenant_id,
                 // target_table) pair is known; pre-execute so a
                 // misroute never touches the catalog or WAL on this
@@ -6261,37 +6298,18 @@ impl PostgresProtocol {
                 // the session var alone checked `default` for a `database=acme`
                 // client whose write then landed in acme's partition.
                 let table = statement.target_table_name().to_string();
+                // TD-PGWIRE-COPY-1 primary-pod gate + TD-064 write-half tenant
+                // visibility — the ONE gate sequence shared with the
+                // `EXPLAIN ANALYZE` write path (`gate_dml_target`).
                 let write_tenant = match self
-                    .resolve_write_tenant_gated(verb.gate_phrase(), &table)
+                    .gate_dml_target(dml_service, &table, Some(verb.gate_phrase()))
                     .await?
                 {
                     Some(tenant) => tenant,
                     None => return Ok(()),
                 };
-
-                // TD-064 write-half: resolve the tenant scope (catalog/database
-                // binding) and authorize the target table within it. A
-                // cross-tenant target fails closed with 42P01 (never leaking
-                // existence); the scope is then threaded into execute_scoped so
-                // the write lands in the tenant's partition.
-                // `write_tenant` resolved once above, before the gate.
-                let tenant_scope = (!write_tenant.is_empty()).then(|| write_tenant.clone());
-                if let Some(ref tenant) = tenant_scope
-                    && !dml_service
-                        .table_visible_for_tenant(&table, Some(tenant.as_str()))
-                        .await
-                        .unwrap_or(false)
-                {
-                    return self
-                        .send_error(
-                            "ERROR",
-                            "42P01",
-                            &format!("relation \"{}\" does not exist", table),
-                        )
-                        .await;
-                }
-                let tenant_ctx = tenant_scope.as_ref().map(|tenant| {
-                    crate::storage::tenant::context::TenantContext::for_tenant_id(tenant)
+                let tenant_ctx = (!write_tenant.is_empty()).then(|| {
+                    crate::storage::tenant::context::TenantContext::for_tenant_id(&write_tenant)
                 });
 
                 // ADR-018 P2.D: inside an explicit transaction the write

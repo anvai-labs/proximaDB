@@ -789,7 +789,11 @@ impl QueryFacadeAdapter {
             {
                 let parser = crate::query::sql_frontend::SqlFrontendParser::new();
                 match parser.parse_dml(inner_query) {
-                    Ok(Some(statement)) => {
+                    Ok(Some(mut statement)) => {
+                        // TD-DML-3 (round 4): an analyzed upsert carries the
+                        // caller, so `ON CONFLICT DO UPDATE` enforces the read
+                        // policy (it ran as an "internal" statement).
+                        statement.stamp_on_conflict_caller(Some(identity.into_owned()));
                         // TD-SPINE-6 round 2 (HIGH-2): the ANALYZEd write
                         // executes within the caller's tenant scope (derived
                         // from the port identity exactly as `try_run_select`
@@ -857,6 +861,7 @@ impl QueryFacadeAdapter {
             if let Some(rows_affected) = try_sql_write_dispatch(
                 &query,
                 tenant_id,
+                identity,
                 self.dml_service.as_ref(),
                 self.ddl_service.as_ref(),
             )
@@ -896,6 +901,20 @@ impl QueryFacadeAdapter {
             >,
         >,
     ) -> anyhow::Result<proximadb_runtime::SqlExecutionResult> {
+        // Round 3 (L5), scoped in round 4 (LOW-2) to THIS read-only port
+        // entry: the shared read tail hands `try_run_select` no vector search
+        // service, so a pgvector `ORDER BY … <-> … LIMIT` KNN SELECT cannot
+        // execute here (it surfaced as an untyped 500 "vector search service
+        // is unavailable"). The port rejects it as a typed, actionable caller
+        // error; the shared authority body (`/api/v2/sql`, gRPC, api_handlers)
+        // keeps its prior behavior.
+        if self.dml_service.is_some()
+            && crate::network::postgres::relational_pipeline::is_pgvector_knn_select(&query)
+        {
+            return Err(anyhow::Error::new(proximadb_runtime::InvalidQueryInput(
+                "pgvector `ORDER BY <column> <-> <vector> LIMIT k` KNN SQL is not served on this surface (no vector search service on the SQL authority path); use pgwire or the vector search API".to_string(),
+            )));
+        }
         let scope_tenant = identity.tenant_id;
         crate::query::request_scope::with_identity_scope(scope_tenant, async {
             self.execute_read_path(&query, identity, result_cache).await
@@ -923,16 +942,6 @@ impl QueryFacadeAdapter {
         >,
     ) -> anyhow::Result<proximadb_runtime::SqlExecutionResult> {
         use crate::query::QueryResultData;
-        // Round 3 (L5): this path passes `vector_ops = None` to
-        // `try_run_select`, so a pgvector `ORDER BY … <-> … LIMIT` KNN SELECT
-        // cannot execute here on ANY server (it surfaced as an untyped 500
-        // "vector search service is unavailable"). Reject it as a typed,
-        // actionable caller error instead.
-        if crate::network::postgres::relational_pipeline::is_pgvector_knn_select(query) {
-            return Err(anyhow::Error::new(proximadb_runtime::InvalidQueryInput(
-                "pgvector `ORDER BY <column> <-> <vector> LIMIT k` KNN SQL is not served on this surface (no vector search service on the SQL authority path); use pgwire or the vector search API".to_string(),
-            )));
-        }
         if let Some(dml) = self.dml_service.as_ref()
             && let Some(outcome) = crate::network::postgres::relational_pipeline::try_run_select(
                 query,
@@ -991,6 +1000,9 @@ impl QueryFacadeAdapter {
 /// - `Ok(None)` — not a write keyword, OR the matching service isn't wired → the
 ///   caller falls through to read routing / the facade.
 ///
+/// `caller` is stamped onto a parsed upsert (`stamp_on_conflict_caller`) so an
+/// `ON CONFLICT DO UPDATE` enforces the caller's read policy (TD-DML-3).
+///
 /// `tenant_id` scopes the write to its partition (TD-064); `None` writes
 /// unscoped (as pgwire does for a connection with no `database`), never another
 /// tenant's partition. DML errors use `.context` (NOT `anyhow!`) so a typed
@@ -999,6 +1011,7 @@ impl QueryFacadeAdapter {
 pub async fn try_sql_write_dispatch(
     query: &str,
     tenant_id: Option<&str>,
+    caller: proximadb_runtime::PortIdentity<'_>,
     dml: Option<&Arc<crate::services::dml::DmlService>>,
     ddl: Option<&Arc<crate::services::DdlService>>,
 ) -> Result<Option<u64>> {
@@ -1037,8 +1050,12 @@ pub async fn try_sql_write_dispatch(
         || leading.starts_with("UPSERT ")
         || leading.starts_with("MERGE "))
         && let Some(dml) = dml
-        && let Ok(Some(statement)) = SqlFrontendParser::new().parse_dml(query)
+        && let Ok(Some(mut statement)) = SqlFrontendParser::new().parse_dml(query)
     {
+        // TD-DML-3 (round 4): the caller travels with an upsert so its
+        // `ON CONFLICT DO UPDATE` enforces the read policy — this write
+        // dispatch (`/api/v2/sql`, gRPC `ExecuteQuery`) never stamped it.
+        statement.stamp_on_conflict_caller(Some(caller.into_owned()));
         let is_write = matches!(
             statement,
             DmlStatement::Insert { .. }

@@ -541,6 +541,17 @@ async fn connect_as_tenant(server: &TestPgServer, tenant: &str) -> tokio_postgre
     client
 }
 
+/// The server SQLSTATE of a statement, or `"OK"` when it succeeded.
+async fn sqlstate_or_ok(client: &tokio_postgres::Client, sql: &str) -> String {
+    match client.simple_query(sql).await {
+        Ok(_) => "OK".to_string(),
+        Err(error) => error
+            .as_db_error()
+            .map(|db| db.code().code().to_string())
+            .unwrap_or_else(|| format!("<no db error: {error}>")),
+    }
+}
+
 /// The server SQLSTATE of a statement that must fail.
 async fn sqlstate_of(client: &tokio_postgres::Client, sql: &str) -> String {
     match client.simple_query(sql).await {
@@ -606,17 +617,30 @@ async fn pgwire_explain_analyze_options_gates_and_tenant_scoping_e2e() {
         assert_eq!(pg_server::rows(&client, &select).await, keep, "{malformed}");
     }
 
-    // A READ ONLY transaction rejects the analyzed write (25006).
+    // Transaction gates (L2, round 4 negative controls): a READ ONLY
+    // transaction rejects the analyzed write with 25006, and any other open
+    // transaction with 0A000 (it would execute immediately, outside the
+    // transaction's buffered writes). Both outcomes are collected before
+    // asserting so a gate regression reports BOTH arms.
     pg_server::rows(&client, "BEGIN READ ONLY").await;
+    let read_only = sqlstate_or_ok(
+        &client,
+        &format!("EXPLAIN (ANALYZE) INSERT INTO {table} (id) VALUES ('ro')"),
+    )
+    .await;
+    let _ = client.simple_query("ROLLBACK").await;
+    pg_server::rows(&client, "BEGIN").await;
+    let open_tx = sqlstate_or_ok(
+        &client,
+        &format!("EXPLAIN (ANALYZE) INSERT INTO {table} (id) VALUES ('tx')"),
+    )
+    .await;
+    let _ = client.simple_query("ROLLBACK").await;
     assert_eq!(
-        sqlstate_of(
-            &client,
-            &format!("EXPLAIN (ANALYZE) INSERT INTO {table} (id) VALUES ('ro')")
-        )
-        .await,
-        "25006"
+        (read_only.as_str(), open_tx.as_str()),
+        ("25006", "0A000"),
+        "transaction gates for an analyzed write (READ ONLY, open transaction)"
     );
-    pg_server::rows(&client, "ROLLBACK").await;
     assert_eq!(pg_server::rows(&client, &select).await, keep);
 
     // Another tenant's connection: the table does not exist for it — neither
@@ -664,4 +688,101 @@ async fn pgwire_explain_analyze_options_gates_and_tenant_scoping_e2e() {
         })
         .unwrap_or_default();
     assert_eq!(ids, vec!["keep", "on"], "tenant REST view: {body}");
+}
+
+/// OLAP result-cache invalidations so far (the cache flag is set in-process).
+fn olap_cache_invalidations() -> u64 {
+    proximadb::network::postgres::relational_pipeline::olap_result_cache()
+        .expect("cache flag is set in this process")
+        .stats()
+        .invalidations
+}
+
+/// Prime the OLAP result cache for `select` through `/api/v2/sql` (a miss +
+/// insert, then a consulting re-read) and return the rows' ids.
+async fn primed_rest_ids(http: &reqwest::Client, base: &str, select: &str) -> Vec<String> {
+    let mut ids = Vec::new();
+    for _ in 0..2 {
+        let body: serde_json::Value = post_tenant_json(
+            http,
+            format!("{base}/api/v2/sql"),
+            "proximadb",
+            json!({ "query": select }),
+        )
+        .await
+        .expect("read sends")
+        .json()
+        .await
+        .expect("read body");
+        ids = body["rows"]
+            .as_array()
+            .map(|rows| {
+                rows.iter()
+                    .map(|row| row["id"].as_str().unwrap_or_default().to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+    }
+    ids
+}
+
+/// Round 4 (LOW-1), mandate #16b: a committed pgwire `EXPLAIN (ANALYZE)`
+/// write invalidates the tenant's OLAP result-cache entries for the table
+/// (the counter moves), and the next read sees the new row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pgwire_analyzed_write_invalidates_the_olap_result_cache_e2e() {
+    // Edition 2024: set_var is unsafe (single-threaded test prologue).
+    unsafe { std::env::set_var("PROXIMADB_QUERY_RESULT_CACHE", "1") };
+    let server = TestPgServer::start().await.expect("server start");
+    let client = server.connect().await.expect("pgwire connect");
+    let table = server.unique_name("spine6_inv_pg");
+    pg_server::rows(&client, &format!("CREATE TABLE {table} (id TEXT)")).await;
+    pg_server::rows(&client, &format!("INSERT INTO {table} (id) VALUES ('a')")).await;
+    let select = format!("SELECT id FROM {table} ORDER BY id");
+    let (http, base) = server.rest_client().expect("rest client");
+    assert_eq!(primed_rest_ids(&http, &base, &select).await, vec!["a"]);
+
+    let before = olap_cache_invalidations();
+    pg_server::rows(
+        &client,
+        &format!("EXPLAIN (ANALYZE) INSERT INTO {table} (id) VALUES ('b')"),
+    )
+    .await;
+    assert!(
+        olap_cache_invalidations() > before,
+        "the pgwire analyzed write must invalidate the cached read (mandate #16b)"
+    );
+    assert_eq!(primed_rest_ids(&http, &base, &select).await, vec!["a", "b"]);
+}
+
+/// Round 4 (LOW-1): the same for the SQL authority's analyzed write
+/// (`/api/v2/sql` → `QueryFacadeAdapter`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn authority_analyzed_write_invalidates_the_olap_result_cache_e2e() {
+    // Edition 2024: set_var is unsafe (single-threaded test prologue).
+    unsafe { std::env::set_var("PROXIMADB_QUERY_RESULT_CACHE", "1") };
+    let server = TestPgServer::start().await.expect("server start");
+    let client = server.connect().await.expect("pgwire connect");
+    let table = server.unique_name("spine6_inv_rest");
+    pg_server::rows(&client, &format!("CREATE TABLE {table} (id TEXT)")).await;
+    pg_server::rows(&client, &format!("INSERT INTO {table} (id) VALUES ('a')")).await;
+    let select = format!("SELECT id FROM {table} ORDER BY id");
+    let (http, base) = server.rest_client().expect("rest client");
+    assert_eq!(primed_rest_ids(&http, &base, &select).await, vec!["a"]);
+
+    let before = olap_cache_invalidations();
+    let response = post_tenant_json(
+        &http,
+        format!("{base}/api/v2/sql"),
+        "proximadb",
+        json!({ "query": format!("EXPLAIN (ANALYZE) INSERT INTO {table} (id) VALUES ('b')") }),
+    )
+    .await
+    .expect("analyzed write sends");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert!(
+        olap_cache_invalidations() > before,
+        "the authority's analyzed write must invalidate the cached read (mandate #16b)"
+    );
+    assert_eq!(primed_rest_ids(&http, &base, &select).await, vec!["a", "b"]);
 }

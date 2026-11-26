@@ -1344,6 +1344,31 @@ async fn invalid_explain_option_value_is_rejected_and_never_executes() {
     );
 }
 
+/// LOW-3 (round 4): `explain_unified_query` honors the port-entry contract —
+/// an over-cap raw input is the typed 400 class, never parsed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn explain_unified_query_enforces_the_port_size_cap() {
+    let (state, _services, _temp) = build_port_stack().await;
+    let port = state.unified_query_port.clone().expect("port wired");
+    let oversized = format!("SELECT 1 -- {}", "x".repeat(1024 * 1024));
+    let error = port
+        .explain_unified_query(
+            oversized,
+            None,
+            proximadb_runtime::UnifiedQueryPortContext::for_identity(
+                proximadb_runtime::PortIdentity::for_tenant("default"),
+            ),
+        )
+        .await
+        .expect_err("an over-cap explain must be rejected");
+    assert!(
+        error
+            .downcast_ref::<proximadb_runtime::InvalidQueryInput>()
+            .is_some(),
+        "typed InvalidQueryInput expected: {error:#}"
+    );
+}
+
 /// MED-1 (round 2): pgvector `<->` KNN SQL over a real vector collection
 /// gets, on EVERY port leg, exactly the authority body's outcome
 /// (`execute_sql_via_authority`) — the GenericDialect classifier rejected
@@ -1399,6 +1424,26 @@ async fn pgvector_knn_sql_on_every_port_leg_matches_the_authority_body() {
             ids.sort();
             ids
         });
+        if !knn.contains("WHERE") {
+            // LOW-2 (round 4): the typed rejection is scoped to the PORT's
+            // read-only entry — the shared authority body (`/api/v2/sql`,
+            // gRPC, api_handlers) keeps its prior outcome for this shape.
+            let message = format!("{:#}", authority.as_ref().expect_err("authority rejects"));
+            assert!(
+                message.contains("vector search service is unavailable")
+                    && !message.contains("not served on this surface"),
+                "shared authority body must be unchanged for {knn}: {message}"
+            );
+            // …and /api/v2/sql still rejects `<->` at its own GenericDialect
+            // single-statement validation (unchanged vs develop).
+            let (status, body) =
+                v2_post_as(&state, "default", "/sql", json!({ "query": knn })).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "/api/v2/sql: {body}");
+            assert!(
+                body.to_string().contains("SQL parsing failed"),
+                "/api/v2/sql: {body}"
+            );
+        }
         if knn.contains("WHERE") {
             // Positive control (non-vacuous): the authority body SERVES the
             // WHERE-form KNN read — the port legs must return these rows.

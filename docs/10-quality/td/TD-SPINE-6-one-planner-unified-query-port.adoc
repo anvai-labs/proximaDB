@@ -241,7 +241,8 @@ The plan's acceptance was "same rows AND the same route decision over pgwire, RE
   option or a malformed option is an error (pgwire 42601; 400 class on the
   authority surfaces) — never "execute".
 * **L2 (pgwire EXPLAIN ANALYZE skipped the DML gates — fixed):** the analyzed
-  write now passes the normal DML entry's gates: primary-pod gate
+  write now passes the normal DML entry's target gates (round 4: one shared
+  `gate_dml_target` helper) plus the transaction and cache rules: primary-pod gate
   (`resolve_write_tenant_gated`, 57P03), tenant visibility
   (`table_visible_for_tenant`, 42P01), a READ ONLY transaction rejects it
   (25006) and any open transaction rejects it (0A000 — it executes immediately
@@ -273,6 +274,34 @@ The plan's acceptance was "same rows AND the same route decision over pgwire, RE
   resolves target/source metadata within it (adapter: the port identity;
   pgwire: the connection tenant, plus the visibility gate);
   `explain_analyze_table_write` plans in the same scope.
+
+== Round-4 review fixes (2026-11-26, fresh-agent adversarial review)
+
+* **MED-1 (TD-DML-3 read policy skipped by `EXPLAIN (ANALYZE)` upserts —
+  fixed):** an analyzed `INSERT … ON CONFLICT DO UPDATE` was parsed with NO
+  caller (`on_conflict.caller_identity = None` ⇒ "internal statement"), so
+  under `abac-policy` it could rewrite a conflicting row the governed caller
+  cannot see. ONE helper, `DmlStatement::stamp_on_conflict_caller`, stamps the
+  caller on every surface that executes a parsed upsert: pgwire DML, pgwire
+  `EXPLAIN ANALYZE` (`session_caller_identity`), the SQL authority's `EXPLAIN
+  ANALYZE`, and the authority's write dispatch `try_sql_write_dispatch` (which
+  also never stamped it — `/api/v2/sql` and gRPC plain upserts by a governed
+  caller now enforce the policy too). pgwire's DML target gates (primary-pod +
+  tenant visibility) are ONE helper, `gate_dml_target`, shared by the DML entry
+  and the EXPLAIN path; an analyzed write's privilege/integrity error keeps its
+  SQLSTATE (42501). **What still differs from the DML entry, by design:** an
+  analyzed write inside an open transaction is rejected (0A000 / 25006 READ
+  ONLY) instead of being buffered, because it executes immediately.
+* **LOW-1:** cache-invalidation and transaction-gate tests with negative
+  controls (see Evidence).
+* **LOW-2:** the typed pgvector `ORDER BY … <-> … LIMIT` rejection moved into
+  the READ-ONLY port entry only (and only when a DML service is wired); the
+  shared authority body (`/api/v2/sql`, gRPC, api_handlers) keeps its prior
+  outcome.
+* **LOW-3:** `explain_unified_query` applies the 1 MiB cap and the port
+  deadline, so every port entry carries both.
+* **LOW-4:** `is_pgvector_knn_select` no longer splits `lower_pgvector_select`
+  from its doc comment.
 
 == Evidence
 
@@ -331,6 +360,16 @@ The plan's acceptance was "same rows AND the same route decision over pgwire, RE
   `parse_explain_kind_accepts_postgres_boolean_spellings`,
   `parse_explain_kind_rejects_invalid_options`, `test_pgwire_explain_parser_analyze_off_is_plan_only`,
   `port_deadline_maps_to_gateway_timeout_on_every_unified_surface`.
+* Round 4 (2026-11-26): `explain_analyze_upsert_enforces_the_on_conflict_read_policy`
+  (`tests/abac_relational_transport_e2e.rs`, `--features abac-policy`, CI lane "Authorization E2E"
+  when authz paths change: pgwire SCRAM alice — plain upsert control and `EXPLAIN (ANALYZE)` upsert
+  both 42501; `/api/v2/sql` both rejected; row unchanged);
+  `pgwire_analyzed_write_invalidates_the_olap_result_cache_e2e` and
+  `authority_analyzed_write_invalidates_the_olap_result_cache_e2e` (invalidation counter moves; the
+  next read sees the row); the 25006 / 0A000 arms of
+  `pgwire_explain_analyze_options_gates_and_tenant_scoping_e2e`;
+  `explain_unified_query_enforces_the_port_size_cap`; the KNN test pins the shared authority body
+  and `/api/v2/sql` outcomes as unchanged.
 * Regression: `/api/v2/sql`, gRPC `ExecuteQuery` and `api_handlers` keep the shared body (the trait
   method forwards with the same cache argument). pgwire IS touched: its EXPLAIN path now uses the
   shared parser and the DML gates (round 3), and its analyzed write is tenant-scoped (round 2).
