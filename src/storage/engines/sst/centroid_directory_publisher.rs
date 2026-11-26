@@ -209,7 +209,7 @@ fn within(size_bytes: u64, off: u64, len: u64) -> bool {
 /// remembered by the `unkeyable` negative cache; a [`KeyAttempt::Transient`]
 /// read error leaves the object retryable by the next publish.
 enum KeyAttempt {
-    Keyed(SegmentDecodeKey),
+    Keyed(Box<SegmentDecodeKey>),
     Unkeyable,
     Transient,
 }
@@ -217,7 +217,7 @@ enum KeyAttempt {
 impl KeyAttempt {
     fn from_built(built: anyhow::Result<SegmentDecodeKey>, url: &str) -> Self {
         match built {
-            Ok(key) => KeyAttempt::Keyed(key),
+            Ok(key) => KeyAttempt::Keyed(Box::new(key)),
             Err(error) => {
                 tracing::debug!(%url, %error, "segment has no decode key");
                 KeyAttempt::Unkeyable
@@ -358,7 +358,7 @@ async fn attach_untrained_key(
     }
     match read_uncovered_decode_key(fs, url, size_bytes, etag, prefix).await {
         KeyAttempt::Keyed(key) => {
-            if let Err(error) = builder.set_decode_key(name, key) {
+            if let Err(error) = builder.set_decode_key(name, *key) {
                 tracing::debug!(%url, %error, "untrained decode key refused; publishing keyless");
             }
             false
@@ -682,7 +682,7 @@ pub async fn publish_centroid_directory(
                             .await
                         {
                             KeyAttempt::Keyed(key) => {
-                                if plan.builder.set_decode_key(&segment.name, key).is_ok() {
+                                if plan.builder.set_decode_key(&segment.name, *key).is_ok() {
                                     a0_by_name.insert(segment.name.clone(), read.a0_bytes);
                                 }
                             }
