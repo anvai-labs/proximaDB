@@ -153,6 +153,13 @@ fn unleased_durable_state(config: &Config) -> anyhow::Result<Vec<String>> {
     // inside a Full root (`walk::list_root` treats every other root as a
     // boundary), so "under some Full root" is not enough: a location is
     // leased only when its DEEPEST containing root is Full.
+    // Round 5 (L1): the descendant case too — an ExcludedCache root nested
+    // BENEATH a durable location (warehouse `{collections}/wh`, SST cache
+    // `{collections}/wh/data`) carves that location's subtree out of the
+    // copy, so any durable file under the cache would be silently omitted:
+    // refuse when an ExcludedCache root sits at or below the location.
+    // (Durable-location records never name a whole data root, so the
+    // ordinary "cache under a data root" layout is unaffected.)
     let roots = grouped_roots(config, false)?;
     let mut found = Vec::new();
     for location in recorded.iter().chain(mine.iter()) {
@@ -166,6 +173,9 @@ fn unleased_durable_state(config: &Config) -> anyhow::Result<Vec<String>> {
                     .filter(|root| path.starts_with(&root.path))
                     .max_by_key(|root| root.path.components().count())
                     .is_some_and(|root| root.content == RootContent::Full)
+                    && !roots.iter().any(|root| {
+                        root.content == RootContent::ExcludedCache && root.path.starts_with(&path)
+                    })
             })
             .unwrap_or(false);
         let entry = format!("{} = {}", location.source, location.location);
@@ -1135,6 +1145,50 @@ mod tests {
         let backup = temp.path().join("bk");
         let err =
             run_backup(&config, &backup).expect_err("nested-cache-root warehouse must refuse");
+        let message = format!("{err:#}");
+        assert!(message.contains("ownership lease"), "{message}");
+        assert!(
+            message.contains("PROXIMADB_WAREHOUSE_ROOT_URL"),
+            "names the variable: {message}"
+        );
+        assert!(
+            !backup.join(MANIFEST_FILE).exists(),
+            "a refused backup must leave no manifest"
+        );
+    }
+
+    /// Round 5 (L1): the DESCENDANT case — an SST cache root nested beneath
+    /// the warehouse location (`{collections}/wh/data` under
+    /// `{collections}/wh`). The deepest root containing the warehouse is the
+    /// Full collections root, but the copy loop skips the nested cache, so a
+    /// part under it would be silently omitted (reviewer probe: SUCCEEDED,
+    /// no warnings, part missing). It must refuse.
+    #[test]
+    fn backup_refuses_a_durable_location_that_contains_an_excluded_cache_root() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let base = temp.path().join("live");
+        let mut config = local_config(&base);
+        let warehouse = base.join("collections").join("wh");
+        let cache = warehouse.join("data");
+        config.storage.sst_config = Some(proximadb::core::config::SstConfig {
+            data_directory: base.join("sst").display().to_string(),
+            cache_local_disk_path: Some(cache.display().to_string()),
+            ..Default::default()
+        });
+        seed(&config);
+        std::fs::create_dir_all(&cache).expect("mkdir");
+        std::fs::write(cache.join("probe-part2.parquet"), b"parquet").expect("part");
+        durable_locations::write_record(
+            &config.server.data_dir,
+            &durable_locations::effective_durable_locations(&config, |key| {
+                (key == "PROXIMADB_WAREHOUSE_ROOT_URL")
+                    .then(|| format!("file://{}", warehouse.display()))
+            }),
+        )
+        .expect("record");
+        let backup = temp.path().join("bk");
+        let err = run_backup(&config, &backup)
+            .expect_err("a warehouse containing the excluded cache root must refuse");
         let message = format!("{err:#}");
         assert!(message.contains("ownership lease"), "{message}");
         assert!(

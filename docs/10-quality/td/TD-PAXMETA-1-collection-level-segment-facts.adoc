@@ -239,7 +239,7 @@ Artifact: `docs/_internal/status/M5_EMULATOR_TRACE_EVIDENCE_2026_11_24.adoc`.
   filesystem with an untenanted `get_filesystem(dir_url)`: no `TenantContext`, so the ~3 GET + 1 LIST
   + 1 PUT + 1 DELETE per flush are not metered/billed per tenant. Paths are `DrPathBuilder`-derived
   (isolation is structural and holds). Fix: plumb `TenantContext` through the publish (co-design
-  mandate #3/#5). *Promoted 2026-11-25 to `TD-METERDIR-1`* (filed in a sibling docs PR); this bullet stays as
+  mandate #3/#5). *Promoted 2026-11-25 to link:TD-METERDIR-1-directory-publish-tenant-metering.adoc[TD-METERDIR-1]*; this bullet stays as
   the pointer.
 * **F-first-publish** (review L4, 2026-11-21) — the first flush after this upgrade on a collection
   with no directory loads every live segment inline (2 ranged GETs per untrained segment after the
@@ -263,6 +263,7 @@ Artifact: `docs/_internal/status/M5_EMULATOR_TRACE_EVIDENCE_2026_11_24.adoc`.
   `docs/_internal/status/PAX_DATAFUSION_READ_DEPTH_2026_09_27.adoc` to `cold - warm == 0` when the
   entry's etag matches; a stale etag falls back to the tail probe — negative control).
 
+[[acceptance-rescope-2026-11-25]]
 === Acceptance re-scope (2026-11-25)
 
 Recorded after the ADR-098 plan re-review (gate rows G3/G4). Each item names the evidence that
@@ -274,17 +275,23 @@ backs it; nothing here claims real-cloud latency.
   100→0).
 . *Object-cold waves ≤ 2 at SIFT1M — MET ON THE MinIO EMULATOR; real cloud pending.* Waves p50
   1 / 1 / 2 (post-write / warm / object-cold) in ledger `m5_sift1m_minio_request_counts_at_flush`
-  (ADR-098 M5, see "Measured on MinIO" above). Real-cloud confirmation is deferred pending
-  credentials.
+  (ADR-098 M5, see "Measured on MinIO" above). Caveat (as in ADR-098 G1): this was measured on a
+  SETTLED 2-segment bed; the D8 bed (`paxdir_d8_defaults_on_sift1m`) measured p50 = 3 waves, so
+  the two beds are not like-for-like. Real-cloud confirmation is deferred pending credentials.
 . *Request count — the checkpoint target is re-scoped.* The checkpoint's "~82 → ≤6 GETs/q" was a
   model target that conflated dependent waves with requests; it is dropped as a GA gate. The GA
-  request gate is *≤ 20 requests/query, compacted, object-cold* (the existing D8 harness ceiling).
-  Measured 18.6 GET/q (18.69 req/q) in `m5_sift1m_minio_request_counts_at_flush` and 19.55 req/q in
-  `paxdir_d8_defaults_on_sift1m`. Reduction below that ceiling is owned by `TD-COLDREQ-1` (filed in a sibling docs PR).
+  request gate is *≤ 20 requests/query, compacted, object-cold, ratcheted* (already the D8
+  harness ceiling, `--object-cold-max-requests 20`), plus a cost-per-query ledger entry (ADR-098
+  G3; not yet filed). Measured 18.6 GET/q (18.69 req/q) in `m5_sift1m_minio_request_counts_at_flush`
+  and 19.55 req/q in `paxdir_d8_defaults_on_sift1m`; the best measured arm so far is 13.169 req/q
+  (`tier1_e1_fixed_object_cap_sweep`, range-coalescing cap 4 → 16 MiB), the baseline
+  link:TD-COLDREQ-1-cold-probe-request-coalescing.adoc[TD-COLDREQ-1] measures against. Reduction
+  below the gate is owned by TD-COLDREQ-1.
 . *Footer joins the data wave — MET BY A DIFFERENT MECHANISM.* The cold read takes the SegmentIndex
   directly from the directory's decode key instead of priming `SegmentIndexCache` / `FooterCache`.
   The cold-read effect is the same: no index-acquisition round trip (test
   `directory_key_cold_read_skips_the_index_fetch` in
   `src/datafusion/engine_adapters/pax_adapter.rs`).
-. *F-tenant* (the directory publish is unmetered) is promoted to `TD-METERDIR-1` (filed in a sibling docs PR); the F-tenant
+. *F-tenant* (the directory publish is unmetered) is promoted to
+  link:TD-METERDIR-1-directory-publish-tenant-metering.adoc[TD-METERDIR-1]; the F-tenant
   follow-up bullet above stays as the pointer.

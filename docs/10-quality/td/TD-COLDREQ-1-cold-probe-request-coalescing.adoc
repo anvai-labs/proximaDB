@@ -67,6 +67,7 @@ still cost one request each whatever the cap, which is why coalescing remains a 
   identical objects. Recall@10 stays within 0.002 of the
   baseline arm, and p50 waves do not increase. The target value is set from S0 and written here
   before S1 is merged.
-* The ≤ 20 req/q gate still holds. It is owned by TD-PAXMETA-1; its acceptance re-scope is to be added by open PR #2575.
+* The ≤ 20 req/q gate still holds. It is owned by TD-PAXMETA-1, recorded in its
+  link:TD-PAXMETA-1-collection-level-segment-facts.adoc#acceptance-rescope-2026-11-25[Acceptance re-scope (2026-11-25)].
 * Bytes per query is reported beside requests, because coalescing trades over-read bytes for
   fewer requests.

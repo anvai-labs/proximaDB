@@ -320,7 +320,7 @@ refer to `docs/_internal/roadmap/BENCHMARK_EVIDENCE.toml`.
 | Cold request count low enough for request-priced egress
 | The checkpoint's "~82 → ≤ 6 GETs/q" was a model that conflated waves with requests
 | Not met at ≤ 6. Compacted SIFT1M object-cold: 19.55 req/q (`paxdir_d8_defaults_on_sift1m`); 18.69 req/q (18.64 GET/q) in open PR #2575. Uncompacted 50-segment steady state: 154.63 ranged GETs/q (`sift1m_uncompacted_file_directory_at_flush`, TD-SIFTCOMPACT-1).
-| **Re-scoped.** ≤ 6 is dropped as a GA gate (it is a waves target in disguise). New gate: compacted object-cold ≤ 20 req/q, ratcheted (already the D8 harness ceiling, `--object-cold-max-requests 20`), plus a cost-per-query ledger entry (TD-PAXMETA-1; the acceptance re-scope is to be added by open PR #2575). Going below 20 is owned by link:../../10-quality/td/TD-COLDREQ-1-cold-probe-request-coalescing.adoc[TD-COLDREQ-1]. The best measured arm so far is 13.169 req/q from widening the range-coalescing cap alone (4 → 16 MiB, `tier1_e1_fixed_object_cap_sweep`; waves p50 3, recall ≥ 0.9822). Cap widening and per-cell probe coalescing are candidate levers, not prerequisites.
+| **Re-scoped.** ≤ 6 is dropped as a GA gate (it is a waves target in disguise). New gate: compacted object-cold ≤ 20 req/q, ratcheted (already the D8 harness ceiling, `--object-cold-max-requests 20`), plus a cost-per-query ledger entry (TD-PAXMETA-1; recorded in its link:../../10-quality/td/TD-PAXMETA-1-collection-level-segment-facts.adoc#acceptance-rescope-2026-11-25[Acceptance re-scope (2026-11-25)]). Going below 20 is owned by link:../../10-quality/td/TD-COLDREQ-1-cold-probe-request-coalescing.adoc[TD-COLDREQ-1]. The best measured arm so far is 13.169 req/q from widening the range-coalescing cap alone (4 → 16 MiB, `tier1_e1_fixed_object_cap_sweep`; waves p50 3, recall ≥ 0.9822). Cap widening and per-cell probe coalescing are candidate levers, not prerequisites.
 
 | G4
 | The footer joins the data wave (L1 extents)
@@ -397,6 +397,6 @@ refer to `docs/_internal/roadmap/BENCHMARK_EVIDENCE.toml`.
 | G16
 | Real-cloud latency (Runbook)
 | `cloud_latency`, `object_store_latency_floor` and Iceberg planning GETs measured on real S3/Azure
-| Both ledger entries are `unverified` on develop. Open PR #2575 adds MinIO emulator legs and promotes `object_store_latency_floor` to measured on a localhost emulator.
-| Owner (not a TD): the Runbook (M5) row of <<_sequencing_and_gates>>, which needs real-cloud credentials. #2575 is to re-tag the `object_store_latency_floor` entry so it cannot be cited as a cloud floor.
+| Both ledger entries are `unverified`. `object_store_latency_floor` is the CLOUD floor and stays `unverified`; PR #2575's MinIO emulator latency-floor figures live only in `m5_object_store_latency_floor_minio`, which cannot be cited as a cloud floor.
+| Owner (not a TD): the Runbook (M5) row of <<_sequencing_and_gates>>. Real-cloud confirmation needs credentials.
 |===
