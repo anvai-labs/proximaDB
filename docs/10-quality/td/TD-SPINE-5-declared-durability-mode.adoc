@@ -133,8 +133,10 @@ posture*, not a misconfiguration; the contradictory shape (declared
   its expected mode, either from the boot log line (`durability_mode=…`) or from the
   `durable_locations` record's `durability_mode` field. A wrong-mode mutation fails at least one
   of them.
-* **R3. macOS cold-backup restore-path failures.** Fixed in open PR #2575. *Acceptance:* #2575
-  merged, and `cold_backup_restore` green on macOS locally (or on a macOS CI leg).
+* **R3. macOS cold-backup restore-path failures.** Resolved by #2575 (2026-11-25): cold backup's
+  containment and restore root resolution now canonicalize the nearest existing ancestor
+  (`writer_epoch::resolve`), and `backup_refuses_wal_manifest_outside_roots` and
+  `backup_restore_round_trip_preserves_bytes` pass locally on macOS. No macOS CI leg exists.
 * **R4. TD-SEAM-14 durability boundary (acceptance bullet 4).** So far the coordination is
   vocabulary only (see below). No separate spec is needed: the existing link:TD-SEAM-14-object-store-recovery-and-ownership-boundary.adoc[TD-SEAM-14] already has a
   "Durability boundary and operator recovery" section (§8), and its bounded delivery (§2)
@@ -207,9 +209,8 @@ one of these two modes; when its durability-boundary spec lands
 ** `cold_backup_restore`: green in job "Rust Build (dev)", step "Verify cold
    backup/restore round trip (real server)" (`.github/workflows/ci.yml`,
    `cargo test -p proximadb-server --test cold_backup_restore`). That is the
-   Linux runner. On macOS, two pre-existing restore-path tests fail; open PR
-   #2575 fixes them by canonicalizing with `absolute()` in cold backup.
-   Until #2575 merges this is a residual (R3).
+   Linux runner. The two macOS restore-path failures were fixed by #2575
+   (canonicalizing with `absolute()` in cold backup); see R3.
 ** `wal_fsync_crash_recovery`: **not in any CI lane.** No workflow, script
    or Makefile target names it. Evidence for this suite is local runs only
    (R1).

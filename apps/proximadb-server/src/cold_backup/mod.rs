@@ -158,8 +158,12 @@ fn unleased_durable_state(config: &Config) -> anyhow::Result<Vec<String>> {
     // `{collections}/wh/data`) carves that location's subtree out of the
     // copy, so any durable file under the cache would be silently omitted:
     // refuse when an ExcludedCache root sits at or below the location.
-    // (Durable-location records never name a whole data root, so the
-    // ordinary "cache under a data root" layout is unaffected.)
+    // Round 6 (L1): the descendant rule does NOT apply when the location IS
+    // itself a Full root (records do name whole roots: `wal_local_dir` and
+    // the effective WAL root are leased roots). A cache nested inside a Full
+    // root is the ordinary "cache under a data root" layout, which the copy
+    // loop handles the same way it does for `data_dir`, so refusing it would
+    // be a false refusal.
     let roots = grouped_roots(config, false)?;
     let mut found = Vec::new();
     for location in recorded.iter().chain(mine.iter()) {
@@ -168,14 +172,20 @@ fn unleased_durable_state(config: &Config) -> anyhow::Result<Vec<String>> {
         };
         let inside = absolute(&path)
             .map(|path| {
-                roots
+                let Some(deepest) = roots
                     .iter()
                     .filter(|root| path.starts_with(&root.path))
                     .max_by_key(|root| root.path.components().count())
-                    .is_some_and(|root| root.content == RootContent::Full)
-                    && !roots.iter().any(|root| {
-                        root.content == RootContent::ExcludedCache && root.path.starts_with(&path)
-                    })
+                else {
+                    return false;
+                };
+                let is_root_itself = deepest.path == path;
+                deepest.content == RootContent::Full
+                    && (is_root_itself
+                        || !roots.iter().any(|root| {
+                            root.content == RootContent::ExcludedCache
+                                && root.path.starts_with(&path)
+                        }))
             })
             .unwrap_or(false);
         let entry = format!("{} = {}", location.source, location.location);
@@ -1198,6 +1208,40 @@ mod tests {
         assert!(
             !backup.join(MANIFEST_FILE).exists(),
             "a refused backup must leave no manifest"
+        );
+    }
+
+    /// Round 6 (L1): a durable location that IS itself a Full root (here the
+    /// recorded `wal_local_dir`) with an SST cache nested inside it is the
+    /// ordinary "cache under a data root" layout. The descendant rule must not
+    /// refuse it (round 5 falsely did, naming the wrong cause).
+    #[test]
+    fn backup_accepts_a_cache_nested_inside_a_leased_wal_root() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let base = temp.path().join("live");
+        let mut config = local_config(&base);
+        let vol = base.join("vol");
+        std::fs::create_dir_all(&vol).expect("mkdir vol");
+        config.storage.wal_config.wal_local_dir = Some(vol.display().to_string());
+        let cache = vol.join("cache");
+        config.storage.sst_config = Some(proximadb::core::config::SstConfig {
+            data_directory: base.join("sst").display().to_string(),
+            cache_local_disk_path: Some(cache.display().to_string()),
+            ..Default::default()
+        });
+        seed(&config);
+        std::fs::create_dir_all(&cache).expect("mkdir cache");
+        durable_locations::write_record(
+            &config.server.data_dir,
+            &durable_locations::effective_durable_locations(&config, |_| None),
+        )
+        .expect("record");
+        let backup = temp.path().join("bk");
+        run_backup(&config, &backup)
+            .expect("a cache nested inside a leased WAL root must not refuse");
+        assert!(
+            backup.join(MANIFEST_FILE).exists(),
+            "backup wrote its manifest"
         );
     }
 
