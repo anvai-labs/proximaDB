@@ -25,8 +25,8 @@ use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use proximadb_data_model::ProximaValue;
 use proximadb_runtime::{
-    InvalidQueryInput, MissingQueryIdentity, OwnedPortIdentity, PortIdentity, UnifiedQueryPort,
-    UnifiedQueryPortContext,
+    InvalidQueryInput, MissingQueryIdentity, OwnedPortIdentity, PortIdentity,
+    QueryDeadlineExceeded, UnifiedQueryPort, UnifiedQueryPortContext,
 };
 // The FILTER-lowering spelling (int-array binary, ns temporals) — named
 // for what it IS, mirroring the SqlValue twin sql_value_to_filter_literal;
@@ -486,7 +486,7 @@ fn effective_identity_or_fail(identity: &PortIdentity<'_>) -> Result<OwnedPortId
 /// gRPC `ExecuteQuery`, and pgwire. A DDL/DML statement on a port surface is
 /// rejected as a client error naming the policy, never silently executed or
 /// silently lost. Round 2 (2026-11-25): reads = a single PURE query
-/// (`SELECT` / `WITH…SELECT` / `VALUES` / `TABLE`, no write anywhere in the
+/// (`SELECT` / `WITH…SELECT` / `VALUES`, no write anywhere in the
 /// tree — see [`query_is_pure_read`]); EVERY `EXPLAIN` form (including
 /// `EXPLAIN SELECT`) is rejected with a message naming EXPLAIN, and the
 /// accepted read then runs through the authority's read-only entry.
@@ -657,6 +657,13 @@ enum PortSqlOrigin {
 /// round 2) and executes through `execute_sql_read_only_via_authority`,
 /// which structurally cannot reach the EXPLAIN-DML explainer or the write
 /// dispatch.
+///
+/// Round 3 (L3): the whole execution runs under
+/// [`proximadb_runtime::PORT_QUERY_DEADLINE`] — enforced HERE, at the one
+/// seam, so every surface over the port carries the same deadline and maps
+/// the typed [`QueryDeadlineExceeded`] to its timeout status (504 over HTTP).
+/// The deadline stops waiting (the future is dropped); it does not cancel
+/// work already handed to spawned or blocking tasks.
 async fn run_sql_via_one_planner(
     adapter: &Arc<QueryFacadeAdapter>,
     sql: &str,
@@ -666,7 +673,28 @@ async fn run_sql_via_one_planner(
     limit: Option<u32>,
     origin: PortSqlOrigin,
 ) -> Result<serde_json::Value> {
-    // L4: the size cap applies to every text the port executes.
+    let deadline = proximadb_runtime::PORT_QUERY_DEADLINE;
+    tokio::time::timeout(
+        deadline,
+        run_sql_via_one_planner_within_deadline(
+            adapter, sql, collection, identity, freshness, limit, origin,
+        ),
+    )
+    .await
+    .map_err(|_| anyhow::Error::new(QueryDeadlineExceeded(deadline)))?
+}
+
+async fn run_sql_via_one_planner_within_deadline(
+    adapter: &Arc<QueryFacadeAdapter>,
+    sql: &str,
+    collection: Option<String>,
+    identity: PortIdentity<'_>,
+    freshness: &VectorFreshnessMode,
+    limit: Option<u32>,
+    origin: PortSqlOrigin,
+) -> Result<serde_json::Value> {
+    // L4: the size cap applies to every text the port executes (the bound /
+    // lowered text — each entry also checks the RAW input before lowering).
     ensure_query_size(sql)?;
     if origin == PortSqlOrigin::PortLowered {
         // Port-synthesized extension SQL (VECTOR_SEARCH/GRAPH_QUERY/
@@ -706,7 +734,16 @@ async fn run_sql_via_one_planner(
             result_cache.as_deref(),
         )
         .await
-        .context("sql authority execution failed")?;
+        // A typed client rejection (e.g. the pgvector ORDER BY KNN shape this
+        // path cannot serve) keeps its own actionable message; anything else
+        // gains the authority context.
+        .map_err(|error| {
+            if error.downcast_ref::<InvalidQueryInput>().is_some() {
+                error
+            } else {
+                error.context("sql authority execution failed")
+            }
+        })?;
     // LOW-4: the authority body does not time itself (the runtime HANDLER
     // wrapper does); time the delegated call here so the port's metrics are
     // real.
@@ -899,6 +936,8 @@ impl UnifiedQueryPort for UnifiedQueryPortImpl {
         if query.trim().is_empty() {
             return Err(anyhow!("query cannot be empty"));
         }
+        // L4 (round 3): cap the RAW input before UQL lowering / binding.
+        ensure_query_size(&query)?;
         debug!(
             "execute_unified_query: {}",
             query.chars().take(120).collect::<String>()
@@ -936,6 +975,8 @@ impl UnifiedQueryPort for UnifiedQueryPortImpl {
         // Convert the JSON multi-model request to a federated SQL string.
         // (Formerly a twin of the deleted root multimodal_query module's
         // convert_multi_model_to_sql; this is now the only copy.)
+        // L4 (round 3): cap the RAW request before lowering it to SQL.
+        ensure_query_size(&request.to_string())?;
         let (sql, origin) = multi_model_sql_from_request(&request)?;
         // chars().take — a byte-indexed slice can land mid-character in
         // the user-controlled cypher/collection text now spliced verbatim.
@@ -964,6 +1005,8 @@ impl UnifiedQueryPort for UnifiedQueryPortImpl {
         if query.trim().is_empty() {
             return Err(anyhow!("query cannot be empty"));
         }
+        // L4 (round 3): cap the RAW input before parameter binding.
+        ensure_query_size(&query)?;
         let parameters = parameters.unwrap_or_default();
         let query = bind_federated_sql_parameters(&query, &parameters)?;
         debug!(
@@ -1002,6 +1045,7 @@ impl UnifiedQueryPort for UnifiedQueryPortImpl {
                 ))
             })?
             .to_string();
+        ensure_query_size(&query)?;
         let limit = request
             .get("limit")
             .and_then(|v| v.as_u64())
@@ -1074,6 +1118,8 @@ impl UnifiedQueryPort for UnifiedQueryPortImpl {
         let owner = prepared_owner(context.identity.tenant_id).ok_or(MissingQueryIdentity(
             "prepare_statement has no request identity; the caller must act as a tenant",
         ))?;
+        // L4 (round 3): the cap applies at prepare time too.
+        ensure_query_size(&query)?;
         let ttl = Duration::from_secs(ttl_seconds.unwrap_or(3600));
         let cache_id = self
             .cache
@@ -1571,7 +1617,10 @@ mod tests {
     /// substring check executed a write the user asked to only plan).
     #[test]
     fn parse_explain_kind_parses_the_option_list() {
-        use crate::query::sql_frontend::parse_explain_kind;
+        fn parse_explain_kind(query: &str) -> Option<(bool, &str)> {
+            crate::query::sql_frontend::parse_explain_kind(query)
+                .unwrap_or_else(|error| panic!("{query}: {error}"))
+        }
         assert_eq!(
             parse_explain_kind("EXPLAIN (ANALYZE) DELETE FROM t"),
             Some((true, "DELETE FROM t"))

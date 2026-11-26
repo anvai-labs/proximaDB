@@ -37,6 +37,20 @@ pub struct InvalidQueryInput(pub String);
 #[derive(Debug)]
 pub struct MissingQueryIdentity(pub &'static str);
 
+/// A unified-query-port execution exceeded the port's deadline
+/// ([`PORT_QUERY_DEADLINE`]). Protocol adapters map this to their
+/// deadline/gateway-timeout status (HTTP 504). The deadline stops WAITING for
+/// the execution (the future is dropped); work already handed to spawned or
+/// blocking tasks is not cancelled by it.
+#[derive(Debug)]
+pub struct QueryDeadlineExceeded(pub std::time::Duration);
+
+/// The deadline every `UnifiedQueryPort` SQL execution runs under — the same
+/// default as `/api/v2/sql` (TD-SPINE-6 round 3, L3). Enforced inside the
+/// port, so every surface over it (REST v2 query, `/api/v2/unified/*`,
+/// canonical `/sql`, MCP) carries it.
+pub const PORT_QUERY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// Explicit per-request execution context for `UnifiedQueryPort` calls
 /// (ADR-098 D5 / TD-SPINE-6).
 ///
@@ -88,6 +102,14 @@ impl std::fmt::Display for MissingQueryIdentity {
 
 impl std::error::Error for MissingQueryIdentity {}
 
+impl std::fmt::Display for QueryDeadlineExceeded {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "query exceeded the {:?} deadline", self.0)
+    }
+}
+
+impl std::error::Error for QueryDeadlineExceeded {}
+
 /// Port for cross-model unified and federated query execution.
 ///
 /// Implemented by root-crate services that own `QueryFacadeAdapter`.  Injected
@@ -102,8 +124,9 @@ impl std::error::Error for MissingQueryIdentity {}
 /// cannot reach the EXPLAIN-DML explainer or the relational write dispatch.
 /// Writes are served by `/api/v2/sql` (guarded), gRPC `ExecuteQuery`, and
 /// pgwire. Port-lowered (UQL / multi-model) extension SQL keeps its federated
-/// lowering. Query bodies are capped at 1 MiB; rejections are typed
-/// (`InvalidQueryInput` → 400, `MissingQueryIdentity` → 401).
+/// lowering. Query bodies are capped at 1 MiB and executions run under
+/// [`PORT_QUERY_DEADLINE`]; rejections are typed (`InvalidQueryInput` → 400,
+/// `MissingQueryIdentity` → 401, `QueryDeadlineExceeded` → 504).
 #[async_trait]
 pub trait UnifiedQueryPort: Send + Sync {
     // ── Core query execution ──────────────────────────────────────────────────

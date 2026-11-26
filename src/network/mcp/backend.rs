@@ -217,6 +217,13 @@ impl ReferenceBackend for EngineBackend {
                 .is_some()
             {
                 BackendError::invalid_params(format!("search has no tenant identity: {error}"))
+            } else if error
+                .downcast_ref::<proximadb_runtime::QueryDeadlineExceeded>()
+                .is_some()
+            {
+                // L3 (round 3): JSON-RPC has no timeout code; the port
+                // deadline is reported as an internal error that names it.
+                BackendError::internal(format!("search deadline exceeded: {error}"))
             } else {
                 BackendError::internal(format!("search failed: {error}"))
             }

@@ -1275,14 +1275,82 @@ async fn explain_analyze_dml_is_tenant_scoped_and_cannot_touch_another_tenant() 
     );
 }
 
+/// L7 (round 3): a plan-only `EXPLAIN <DML>` resolves the target within the
+/// CALLER's tenant (it resolved unscoped, so tenant `acme` learned that
+/// tenant `default`'s table exists). acme's EXPLAIN of default's table must be
+/// indistinguishable from an EXPLAIN of a table that does not exist; the
+/// owner's own EXPLAIN still plans (positive control).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn plan_only_explain_dml_does_not_disclose_another_tenants_table() {
+    let (state, _services, _temp) = build_port_stack().await;
+    let (status, body) = v2_post_as(
+        &state,
+        "default",
+        "/sql",
+        json!({ "query": "CREATE TABLE spine6_l7 (id TEXT)" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "create: {body}");
+
+    let explain =
+        |table: &str| json!({ "query": format!("EXPLAIN DELETE FROM {table} WHERE id = 'x'") });
+    let (owner_status, owner_body) =
+        v2_post_as(&state, "default", "/sql", explain("spine6_l7")).await;
+    assert_eq!(owner_status, StatusCode::OK, "owner plans: {owner_body}");
+
+    let (existing_status, existing_body) =
+        v2_post_as(&state, "acme", "/sql", explain("spine6_l7")).await;
+    let (missing_status, missing_body) =
+        v2_post_as(&state, "acme", "/sql", explain("spine6_l7_absent")).await;
+    assert_ne!(
+        existing_status,
+        StatusCode::OK,
+        "acme must not plan against default's table: {existing_body}"
+    );
+    assert_eq!(
+        existing_status, missing_status,
+        "same status as a missing table: {existing_body} vs {missing_body}"
+    );
+    assert_eq!(
+        existing_body.to_string().replace("spine6_l7", "<t>"),
+        missing_body.to_string().replace("spine6_l7_absent", "<t>"),
+        "same error as a missing table (no existence leak)"
+    );
+}
+
+/// L1 (round 3): an invalid EXPLAIN option value on the authority surface is
+/// rejected and NEVER executes (the old parser treated an unknown value as
+/// "execute").
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn invalid_explain_option_value_is_rejected_and_never_executes() {
+    let (state, services, _temp) = build_port_stack().await;
+    rest_sql(&state, "CREATE TABLE spine6_l1 (id TEXT)").await;
+    rest_sql(&state, "INSERT INTO spine6_l1 (id) VALUES ('keep')").await;
+    for invalid in [
+        "EXPLAIN (ANALYZE maybe) INSERT INTO spine6_l1 (id) VALUES ('rogue')",
+        "EXPLAIN (VERBOSE ANALYZE) INSERT INTO spine6_l1 (id) VALUES ('rogue')",
+    ] {
+        let (status, body) =
+            v2_post_as(&state, "default", "/sql", json!({ "query": invalid })).await;
+        assert_ne!(status, StatusCode::OK, "{invalid} must be rejected: {body}");
+        assert_eq!(
+            tenant_ids(&state, "default", "spine6_l1").await,
+            vec!["keep"]
+        );
+    }
+    assert_eq!(
+        unscoped_ids(&services, "spine6_l1").await.contains("rogue"),
+        false
+    );
+}
+
 /// MED-1 (round 2): pgvector `<->` KNN SQL over a real vector collection
 /// gets, on EVERY port leg, exactly the authority body's outcome
 /// (`execute_sql_via_authority`) — the GenericDialect classifier rejected
 /// every `<->` form with a wrong "read-only" 400. The WHERE form is SERVED
-/// (same rows on every leg). The ORDER BY … LIMIT forms are an authority-body
-/// error in this embedded stack ("vector search service is unavailable" from
-/// the relational pipeline — pre-existing, not a port decision), so the port
-/// legs must fail the same way and never with the classifier's rejection.
+/// (same rows on every leg). The ORDER BY … LIMIT forms cannot execute on the
+/// SQL authority path on ANY server (it holds no vector search service); round
+/// 3 rejects them with a typed, actionable 400 on every leg.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pgvector_knn_sql_on_every_port_leg_matches_the_authority_body() {
     let (state, services, _temp) = build_port_stack().await;
@@ -1368,10 +1436,20 @@ async fn pgvector_knn_sql_on_every_port_leg_matches_the_authority_body() {
                         "{leg}: rows differ from the authority body for {knn}"
                     );
                 }
-                None => assert!(
-                    !status.is_success(),
-                    "{leg}: the authority body rejects {knn}, so the port leg must too — {text}"
-                ),
+                // Round 3 (L5): the authority path holds no vector search
+                // service, so it rejects the ORDER BY KNN form with a TYPED,
+                // actionable 400 (was an untyped 500) — every leg agrees.
+                None => {
+                    assert_eq!(
+                        status,
+                        StatusCode::BAD_REQUEST,
+                        "{leg}: typed rejection expected for {knn} — {text}"
+                    );
+                    assert!(
+                        text.contains("not served on this surface"),
+                        "{leg}: the rejection must be actionable: {text}"
+                    );
+                }
             }
         }
     }

@@ -49,57 +49,125 @@ pub fn validate_single_statement(sql: &str) -> Result<()> {
     }
 }
 
-/// Detect an `EXPLAIN [ANALYZE] <inner>` wrapper.
+/// Detect and parse an `EXPLAIN [ANALYZE] <inner>` wrapper.
 ///
-/// Returns `Some((is_analyze, inner))` when `query` begins with `EXPLAIN`,
-/// where `inner` is the wrapped statement text with the `EXPLAIN [ANALYZE]`
-/// (or `EXPLAIN (… ANALYZE …)`) prefix stripped, and `is_analyze` is true when
-/// the EXPLAIN requested ANALYZE. Returns `None` when `query` is not an EXPLAIN.
+/// Returns `Ok(Some((is_analyze, inner)))` when `query` begins with `EXPLAIN`,
+/// where `inner` is the wrapped statement text with the `EXPLAIN ANALYZE` /
+/// `EXPLAIN (<options>)` prefix stripped and `is_analyze` says whether the
+/// statement must EXECUTE the inner statement. `Ok(None)` when `query` is not
+/// an EXPLAIN. `Err` for a malformed EXPLAIN (unterminated or invalid option
+/// list, an unparenthesized legacy option, no inner statement).
 ///
-/// This is the single source of truth for EXPLAIN-prefix parsing shared by the
-/// ROOT handler and the `QueryFacadeAdapter` SQL path (TD-104 / seam S1).
-pub fn parse_explain_kind(query: &str) -> Option<(bool, &str)> {
-    let upper = query.to_ascii_uppercase();
+/// This is the ONE EXPLAIN-prefix parser (TD-SPINE-6 round 3): the
+/// `QueryFacadeAdapter` SQL authority and pgwire both call it —
+/// pgwire's former private copy (a substring `contains("ANALYZE")` check that
+/// executed `(ANALYZE off)` writes) was deleted.
+pub fn parse_explain_kind(query: &str) -> Result<Option<(bool, &str)>> {
+    let trimmed = query.trim();
+    let upper = trimmed.to_ascii_uppercase();
     if !upper.starts_with("EXPLAIN") {
-        return None;
+        return Ok(None);
     }
-    let after_explain = query["EXPLAIN".len()..].trim_start();
-    let after_upper = after_explain.to_ascii_uppercase();
+    let mut rest = trimmed["EXPLAIN".len()..].trim_start();
+    let mut is_analyze = false;
 
-    if after_upper.starts_with("ANALYZE") {
-        let inner = after_explain["ANALYZE".len()..].trim_start();
-        return Some((true, inner));
-    }
-
-    if after_explain.starts_with('(') {
-        let close = after_explain.find(')')?;
-        let options = &after_explain[1..close];
-        // TD-SPINE-6 round 2 (HIGH-1): parse the option list, do not substring
-        // it. PostgreSQL semantics: `ANALYZE` (bare) or with a truthy value
-        // (`ANALYZE true/on/1`) enables execution; a falsy value
-        // (`ANALYZE off/false/0`) DISABLES it — the old
-        // `options.contains("ANALYZE")` treated `(ANALYZE off)` as an
-        // executing analyze, running a write the user asked to only plan.
-        let is_analyze = options.split(',').any(|option| {
-            let option = option.trim();
-            let upper = option.to_ascii_uppercase();
-            if let Some(value) = upper.strip_prefix("ANALYZE") {
-                let value = value.trim();
-                match value {
-                    "" | "TRUE" | "ON" | "1" => true,
-                    "FALSE" | "OFF" | "0" => false,
-                    // Unknown value: fail closed (treat as executing).
-                    _ => true,
+    if rest.to_ascii_uppercase().starts_with("ANALYZE") {
+        is_analyze = true;
+        rest = rest["ANALYZE".len()..].trim_start();
+    } else if rest.starts_with('(') {
+        let mut depth = 0usize;
+        let mut close = None;
+        for (index, ch) in rest.char_indices() {
+            match ch {
+                '(' => depth += 1,
+                ')' => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        close = Some(index);
+                        break;
+                    }
                 }
-            } else {
-                false
+                _ => {}
             }
-        });
-        let rest = after_explain[close + 1..].trim_start();
-        return Some((is_analyze, rest));
+        }
+        let close = close.ok_or_else(|| anyhow!("unterminated EXPLAIN option list"))?;
+        is_analyze = parse_explain_options(&rest[1..close])?;
+        rest = rest[close + 1..].trim_start();
     }
 
-    Some((false, after_explain))
+    let rest_upper = rest.to_ascii_uppercase();
+    for keyword in ["VERBOSE", "COSTS", "BUFFERS", "TIMING", "SUMMARY"] {
+        if rest_upper == keyword || rest_upper.starts_with(&format!("{keyword} ")) {
+            return Err(anyhow!(
+                "EXPLAIN option '{keyword}' must use parenthesized syntax"
+            ));
+        }
+    }
+    if rest.is_empty() {
+        return Err(anyhow!("EXPLAIN requires an inner statement"));
+    }
+    Ok(Some((is_analyze, rest)))
+}
+
+/// Parse a parenthesized EXPLAIN option list with PostgreSQL's grammar —
+/// comma-separated `name [value]` — and return whether `ANALYZE` is enabled
+/// (the last occurrence wins, as in PostgreSQL).
+///
+/// Fail-closed (round 3): an option that is not `name [value]` (e.g.
+/// `(VERBOSE ANALYZE)`, a syntax error in PostgreSQL), an unrecognized option
+/// name, or a boolean option with a value outside PostgreSQL's boolean
+/// spellings is an ERROR — never "execute".
+fn parse_explain_options(options: &str) -> Result<bool> {
+    let mut analyze = false;
+    for raw in options.split(',') {
+        let option = raw.trim();
+        let mut words = option.split_whitespace();
+        let name = words
+            .next()
+            .ok_or_else(|| anyhow!("empty EXPLAIN option"))?
+            .to_ascii_uppercase();
+        let value = words.next();
+        if let Some(extra) = words.next() {
+            return Err(anyhow!(
+                "invalid EXPLAIN option \"{option}\": unexpected \"{extra}\""
+            ));
+        }
+        match name.as_str() {
+            "ANALYZE" | "VERBOSE" | "COSTS" | "SETTINGS" | "GENERIC_PLAN" | "BUFFERS" | "WAL"
+            | "TIMING" | "SUMMARY" | "MEMORY" => {
+                let enabled = match value {
+                    None => true,
+                    Some(value) => parse_explain_boolean(value).ok_or_else(|| {
+                        anyhow!("EXPLAIN option {name} requires a Boolean value, got \"{value}\"")
+                    })?,
+                };
+                if name == "ANALYZE" {
+                    analyze = enabled;
+                }
+            }
+            "FORMAT" | "SERIALIZE" => {
+                if value.is_none() {
+                    return Err(anyhow!("EXPLAIN option {name} requires a value"));
+                }
+            }
+            other => return Err(anyhow!("unrecognized EXPLAIN option \"{other}\"")),
+        }
+    }
+    Ok(analyze)
+}
+
+/// PostgreSQL's Boolean spellings (quoted or unquoted, case-insensitive).
+fn parse_explain_boolean(value: &str) -> Option<bool> {
+    let unquoted = value
+        .strip_prefix('\'')
+        .and_then(|v| v.strip_suffix('\''))
+        .or_else(|| value.strip_prefix('"').and_then(|v| v.strip_suffix('"')))
+        .unwrap_or(value);
+    match unquoted.to_ascii_lowercase().as_str() {
+        "on" | "true" | "1" | "yes" | "y" | "t" => Some(true),
+        "off" | "false" | "0" | "no" | "n" | "f" => Some(false),
+        _ => None,
+    }
 }
 
 /// Best-effort output-column label for a single SELECT projection item: the
@@ -4631,33 +4699,86 @@ mod rank_profile_ddl_tests {
 mod parse_explain_kind_tests {
     use super::parse_explain_kind;
 
+    fn kind(query: &str) -> Option<(bool, &str)> {
+        parse_explain_kind(query).unwrap_or_else(|error| panic!("{query}: {error}"))
+    }
+
     #[test]
     fn parse_explain_kind_detects_bare_analyze() {
-        let (is_analyze, inner) =
-            parse_explain_kind("EXPLAIN ANALYZE INSERT INTO t SELECT * FROM s;").unwrap();
-        assert!(is_analyze);
-        assert_eq!(inner, "INSERT INTO t SELECT * FROM s;");
+        assert_eq!(
+            kind("EXPLAIN ANALYZE INSERT INTO t SELECT * FROM s;"),
+            Some((true, "INSERT INTO t SELECT * FROM s;"))
+        );
     }
 
     #[test]
     fn parse_explain_kind_detects_parenthesized_analyze() {
-        let (is_analyze, inner) =
-            parse_explain_kind("EXPLAIN (ANALYZE, VERBOSE) INSERT INTO t SELECT * FROM s;")
-                .unwrap();
-        assert!(is_analyze);
-        assert_eq!(inner, "INSERT INTO t SELECT * FROM s;");
+        assert_eq!(
+            kind("EXPLAIN (ANALYZE, VERBOSE) INSERT INTO t SELECT * FROM s;"),
+            Some((true, "INSERT INTO t SELECT * FROM s;"))
+        );
     }
 
     #[test]
     fn parse_explain_kind_plain_explain_returns_false() {
-        let (is_analyze, inner) =
-            parse_explain_kind("EXPLAIN INSERT INTO t SELECT * FROM s;").unwrap();
-        assert!(!is_analyze);
-        assert_eq!(inner, "INSERT INTO t SELECT * FROM s;");
+        assert_eq!(
+            kind("EXPLAIN INSERT INTO t SELECT * FROM s;"),
+            Some((false, "INSERT INTO t SELECT * FROM s;"))
+        );
     }
 
     #[test]
     fn parse_explain_kind_non_explain_returns_none() {
-        assert!(parse_explain_kind("SELECT * FROM t").is_none());
+        assert_eq!(kind("SELECT * FROM t"), None);
+    }
+
+    /// Round 3 (L1): every PostgreSQL Boolean spelling, quoted or not, any
+    /// case — truthy executes, falsy plans only.
+    #[test]
+    fn parse_explain_kind_accepts_postgres_boolean_spellings() {
+        for truthy in ["on", "TRUE", "1", "yes", "Y", "t", "'on'", "\"True\""] {
+            let query = format!("EXPLAIN (ANALYZE {truthy}) DELETE FROM t");
+            assert_eq!(kind(&query), Some((true, "DELETE FROM t")), "{query}");
+        }
+        for falsy in ["off", "FALSE", "0", "no", "N", "f", "'off'", "\"false\""] {
+            let query = format!("EXPLAIN (ANALYZE {falsy}) DELETE FROM t");
+            assert_eq!(kind(&query), Some((false, "DELETE FROM t")), "{query}");
+        }
+        // The pgwire MED-1 probe shape and last-wins.
+        assert_eq!(
+            kind("EXPLAIN (VERBOSE, ANALYZE off, COSTS) INSERT INTO t VALUES (1)"),
+            Some((false, "INSERT INTO t VALUES (1)"))
+        );
+        assert_eq!(
+            kind("EXPLAIN (ANALYZE, ANALYZE false) DELETE FROM t"),
+            Some((false, "DELETE FROM t"))
+        );
+        assert_eq!(
+            kind("EXPLAIN (FORMAT JSON, analyze) DELETE FROM t"),
+            Some((true, "DELETE FROM t"))
+        );
+    }
+
+    /// Round 3 (L1 / MED-1): malformed or unknown options are errors — never
+    /// treated as "execute".
+    #[test]
+    fn parse_explain_kind_rejects_invalid_options() {
+        for invalid in [
+            "EXPLAIN (ANALYZE maybe) DELETE FROM t",
+            "EXPLAIN (ANALYZE 2) DELETE FROM t",
+            "EXPLAIN (VERBOSE ANALYZE) INSERT INTO t VALUES (1)",
+            "EXPLAIN (x ANALYZE) DELETE FROM t",
+            "EXPLAIN (ANALYZE on off) DELETE FROM t",
+            "EXPLAIN (FORMAT) DELETE FROM t",
+            "EXPLAIN (, ANALYZE) DELETE FROM t",
+            "EXPLAIN (ANALYZE DELETE FROM t",
+            "EXPLAIN VERBOSE DELETE FROM t",
+            "EXPLAIN (ANALYZE)",
+        ] {
+            assert!(
+                parse_explain_kind(invalid).is_err(),
+                "must be rejected, never executed: {invalid}"
+            );
+        }
     }
 }

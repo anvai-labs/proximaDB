@@ -3796,11 +3796,21 @@ impl PostgresProtocol {
     }
 
     async fn execute_explain(&mut self, query: &str) -> Result<()> {
-        let (is_analyze, inner_query) = match Self::extract_explain_with_analyze(query) {
-            Ok(pair) => pair,
+        // TD-SPINE-6 round 3 (MED-1): the ONE shared EXPLAIN parser. pgwire's
+        // private copy substring-matched "ANALYZE" in the option list, so
+        // `EXPLAIN (ANALYZE off) INSERT …` EXECUTED the write; invalid option
+        // lists / values are now syntax errors, never "execute".
+        let (is_analyze, inner_query) = match crate::query::sql_frontend::parse_explain_kind(query)
+        {
+            Ok(Some(pair)) => pair,
+            Ok(None) => {
+                return self
+                    .send_error("ERROR", "42601", "EXPLAIN failed: statement is not EXPLAIN")
+                    .await;
+            }
             Err(error) => {
                 return self
-                    .send_error("ERROR", "0A000", &format!("EXPLAIN failed: {}", error))
+                    .send_error("ERROR", "42601", &format!("EXPLAIN failed: {error}"))
                     .await;
             }
         };
@@ -3906,18 +3916,78 @@ impl PostgresProtocol {
         };
 
         let write_intent_overrides = self.write_intent_overrides_from_session().await;
-        // TD-SPINE-6 round 2 (HIGH-2): the ANALYZEd write executes within the
-        // connection's write tenant — previously it ran unscoped.
-        let analyze_tenant = self.pgwire_resolve_write_tenant().await;
-        let analyze_tenant_ctx =
-            crate::storage::tenant::context::TenantContext::for_tenant_id(&analyze_tenant);
-        let explain_result = if is_analyze {
-            dml_service
-                .explain_analyze_table_write(statement, Some(&analyze_tenant_ctx))
+        let table = statement.target_table_name().to_string();
+        // TD-SPINE-6 round 3 (L2): an ANALYZEd write passes the SAME gates as
+        // the normal DML entry (`execute_dml_via_dml_service`): the primary-pod
+        // gate, tenant visibility, the read-only-transaction rejection and
+        // post-commit cache invalidation. The write tenant is the connection
+        // tenant (round 2, HIGH-2 — it ran unscoped).
+        let write_tenant = if is_analyze {
+            match self
+                .resolve_write_tenant_gated("EXPLAIN ANALYZE for", &table)
+                .await?
+            {
+                Some(tenant) => tenant,
+                None => return Ok(()),
+            }
+        } else {
+            self.pgwire_resolve_write_tenant().await
+        };
+        // Tenant visibility (both modes — L7: a plan-only EXPLAIN must not
+        // disclose another tenant's table): fail closed as a missing relation.
+        if !write_tenant.is_empty()
+            && !dml_service
+                .table_visible_for_tenant(&table, Some(write_tenant.as_str()))
                 .await
+                .unwrap_or(false)
+        {
+            return self
+                .send_error(
+                    "ERROR",
+                    "42P01",
+                    &format!("relation \"{table}\" does not exist"),
+                )
+                .await;
+        }
+        if is_analyze && self.transaction_in_progress().await {
+            // An analyzed write executes immediately, so it cannot join the
+            // transaction's buffered writes (ADR-018 P2.D).
+            return if self.transaction_is_read_only().await {
+                self.send_error(
+                    "ERROR",
+                    "25006",
+                    "cannot execute EXPLAIN ANALYZE of a write in a read-only transaction",
+                )
+                .await
+            } else {
+                self.send_error(
+                    "ERROR",
+                    "0A000",
+                    "EXPLAIN ANALYZE of a write inside a transaction block is not supported",
+                )
+                .await
+            };
+        }
+        let tenant_ctx = (!write_tenant.is_empty())
+            .then(|| crate::storage::tenant::context::TenantContext::for_tenant_id(&write_tenant));
+        let explain_result = if is_analyze {
+            let analyzed = dml_service
+                .explain_analyze_table_write(statement, tenant_ctx.as_ref())
+                .await;
+            if analyzed.is_ok() {
+                // Mandate #16b: the analyzed write committed — invalidate the
+                // tenant-scoped OLAP result cache for the table.
+                super::relational_pipeline::invalidate_olap_result_cache_for(&write_tenant, &table)
+                    .await;
+            }
+            analyzed
         } else {
             dml_service
-                .explain_table_write_with_overrides(statement, Some(&write_intent_overrides))
+                .explain_table_write_with_overrides(
+                    statement,
+                    Some(&write_intent_overrides),
+                    tenant_ctx.as_ref(),
+                )
                 .await
         };
         match explain_result {
@@ -4044,65 +4114,6 @@ impl PostgresProtocol {
             "0" | "off" | "false" | "no" => Some(false),
             _ => None,
         }
-    }
-
-    /// Parse an EXPLAIN [ANALYZE] statement, returning `(is_analyze, inner_dml_sql)`.
-    /// `EXPLAIN ANALYZE` and `EXPLAIN (ANALYZE)` both set `is_analyze = true`.
-    fn extract_explain_with_analyze(query: &str) -> Result<(bool, &str)> {
-        let trimmed = query.trim();
-        let upper = trimmed.to_ascii_uppercase();
-        if !upper.starts_with("EXPLAIN") {
-            return Err(anyhow!("statement is not EXPLAIN"));
-        }
-
-        let mut rest = trimmed["EXPLAIN".len()..].trim_start();
-        let mut is_analyze = false;
-
-        let rest_upper = rest.to_ascii_uppercase();
-        if rest_upper.starts_with("ANALYZE") {
-            is_analyze = true;
-            rest = rest["ANALYZE".len()..].trim_start();
-        } else if rest.starts_with('(') {
-            let mut depth = 0usize;
-            let mut end = None;
-            for (index, ch) in rest.char_indices() {
-                match ch {
-                    '(' => depth += 1,
-                    ')' => {
-                        depth = depth.saturating_sub(1);
-                        if depth == 0 {
-                            end = Some(index);
-                            break;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            let Some(end_index) = end else {
-                return Err(anyhow!("unterminated EXPLAIN option list"));
-            };
-            let options = &rest[1..end_index];
-            if options.to_ascii_uppercase().contains("ANALYZE") {
-                is_analyze = true;
-            }
-            rest = rest[end_index + 1..].trim_start();
-        }
-
-        let rest_upper = rest.to_ascii_uppercase();
-        for keyword in ["VERBOSE", "COSTS", "BUFFERS", "TIMING", "SUMMARY"] {
-            if rest_upper == keyword || rest_upper.starts_with(&format!("{keyword} ")) {
-                return Err(anyhow!(
-                    "EXPLAIN option '{}' must use parenthesized syntax",
-                    keyword
-                ));
-            }
-        }
-
-        if rest.is_empty() {
-            return Err(anyhow!("EXPLAIN requires an inner statement"));
-        }
-
-        Ok((is_analyze, rest))
     }
 
     /// Extract table name from query

@@ -214,8 +214,11 @@ scans on cache-affine stateless readers) is the follow-on direction and is not d
 
 *Implemented (TD-SPINE-6, 2026-11-24; hardened after the round-1 adversarial
 review):* the shared SQL-authority body is `QueryFacadeAdapter::
-execute_sql_via_authority`; every port SQL entry sends RAW user text through
-it (only port-synthesized UQL/multi-model lowering takes the federated branch
+execute_sql_via_authority` (pgwire-equivalent write/EXPLAIN-DML/SELECT body,
+used by `/api/v2/sql` and gRPC); every port SQL entry sends RAW user text
+through its READ-ONLY entry `execute_sql_read_only_via_authority` (round 2 —
+the shared read tail only: `try_run_select` + the facade fallback; only
+port-synthesized UQL/multi-model lowering takes the federated branch
 directly), multi-model extensions keep their federated lowering (no
 relational table resolves for them, so the scheduler decision has nothing to
 decide), `UnifiedQueryPortContext` carries `PortIdentity` +
@@ -402,8 +405,8 @@ refer to `docs/_internal/roadmap/BENCHMARK_EVIDENCE.toml`.
 | G12
 | One planner
 | Same rows and the same route decision on every surface; owner/reader placement; cache-affine readers
-| In open PR #2574, not on develop: read-row parity across pgwire, `/api/v2/sql` and `/api/v2/query` (live server) and canonical `/sql`, gRPC and MCP (in-process; canonical `/sql` is unrouted since TD-V1SUNSET-1). Route-decision parity is structural only.
-| TD-SPINE-6 (#2574). Placement owner: a TD to be filed by #2574 (not in its pushed diff as of 2026-11-25); TD-SPINE-6 is the interim owner.
+| **Partial (scoped)** — landed with #2574: read-row parity across pgwire, `/api/v2/sql` and `/api/v2/query` (live server) and canonical `/sql`, gRPC and MCP (in-process; canonical `/sql` is unrouted since TD-V1SUNSET-1). Route-decision parity is structural only (not asserted). Plain SQL on port surfaces is read-only (D5 decision, 2026-11-25). Owner/reader placement and cache-affine readers: not started.
+| link:../../10-quality/td/TD-SPINE-6-one-planner-unified-query-port.adoc[TD-SPINE-6] (Implemented, scoped — see its dated acceptance note). Placement owner: link:../../10-quality/td/TD-PLACE-1-owner-reader-placement-cache-affine-routing.adoc[TD-PLACE-1] (Open).
 
 | G13
 | Iceberg as an async projection of L1

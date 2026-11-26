@@ -68,8 +68,8 @@ The plan's acceptance was "same rows AND the same route decision over pgwire, RE
   `try_sql_write_dispatch` → `try_run_select`, whose SELECT arm is the `ComputeScheduler` decision
   → facade fallback) is extracted into the inherent
   `QueryFacadeAdapter::execute_sql_via_authority(query, collection, identity, result_cache)`.
-  The trait method forwards to it **unchanged** (same cache policy, same behavior — pgwire,
-  `/api/v2/sql` and gRPC are untouched). `UnifiedQueryPortImpl::run_sql_via_one_planner` funnels
+  The trait method forwards to it **unchanged** (same cache policy, same behavior for
+  `/api/v2/sql` and gRPC; pgwire's EXPLAIN path was later changed by the round-2/3 fixes below). `UnifiedQueryPortImpl::run_sql_via_one_planner` funnels
   every port SQL entry (`execute_unified_query`, `execute_multi_model_query`,
   `execute_federated_query`, `execute_prepared`) through that ONE body for plain SQL,
   discriminated by the adapter's single `should_use_federated_request` (now `pub(crate)`).
@@ -205,9 +205,10 @@ The plan's acceptance was "same rows AND the same route decision over pgwire, RE
 * **MED-1:** the classifier parses with `PostgreSqlDialect`, so `<->` KNN reads
   are no longer rejected; the port adds no GenericDialect validation of its
   own. Over a real vector collection the WHERE form returns the authority
-  body's rows on every port leg; the `ORDER BY … <-> … LIMIT` forms are an
-  authority-body error in the embedded stack ("vector search service is
-  unavailable", pre-existing) and the port legs fail identically.
+  body's rows on every port leg; the `ORDER BY … <-> … LIMIT` forms cannot
+  execute on the SQL authority path on any server (`execute_read_path` hands
+  `try_run_select` no vector search service) — round 3 rejects them with a
+  typed, actionable 400 on every port leg (was an untyped 500).
   `/api/v2/sql` still rejects `<->` at its GenericDialect single-statement
   validation (pre-existing, unchanged).
 * **MED-2:** `/api/v2/unified/distributed` plain SQL routes through the same
@@ -217,13 +218,61 @@ The plan's acceptance was "same rows AND the same route decision over pgwire, RE
 * **L2–L5:** typed 401/400 for the fail-closed paths (prepare-without-identity,
   UQL-lowered-without-scope, distributed — plus canonical `sql_error_to_api`
   mappings); MCP policy rejections are JSON-RPC INVALID_PARAMS (-32602);
-  1 MiB cap on every port text + 60s deadline on `/api/v2/query` and
-  `/unified/*` (504 on expiry); prepared-cache parse/optimize failures are
+  1 MiB cap on every port text; a 60s deadline (superseded by round 3 —
+  see below); prepared-cache parse/optimize failures are
   400; no "use /api/v2/sql for writes" suffix is appended to read parse
   failures (the policy rejection itself names `/api/v2/sql`).
 * **L7 (decision):** EXPLAIN is **not served** on the read-only port — a
   clear 400 names it (the authority's `EXPLAIN SELECT` is a pre-existing 500
   on `/api/v2/sql`; advertising it here would promise a path that errors).
+
+== Round-3 review fixes (2026-11-26, fresh-agent adversarial review)
+
+* **MED-1 (pgwire's duplicate EXPLAIN parser executed `(ANALYZE off)` writes —
+  fixed):** pgwire's private `extract_explain_with_analyze` substring-matched
+  `ANALYZE` in the option list, so `EXPLAIN (ANALYZE off|false|0) INSERT …`,
+  `(VERBOSE, ANALYZE off, COSTS)` and even `(VERBOSE ANALYZE)` executed the
+  write. It is deleted (CLAUDE.md #19); pgwire and the adapter (the SQL
+  authority) call the ONE `sql_frontend::parse_explain_kind`.
+* **L1:** `parse_explain_kind` returns `Result` and parses PostgreSQL's option
+  grammar (`name [value]`, comma-separated, last ANALYZE wins). Boolean
+  options accept PostgreSQL's spellings (`on|true|1|yes|y|t` /
+  `off|false|0|no|n|f`, quoted or not, any case); any other value, an unknown
+  option or a malformed option is an error (pgwire 42601; 400 class on the
+  authority surfaces) — never "execute".
+* **L2 (pgwire EXPLAIN ANALYZE skipped the DML gates — fixed):** the analyzed
+  write now passes the normal DML entry's gates: primary-pod gate
+  (`resolve_write_tenant_gated`, 57P03), tenant visibility
+  (`table_visible_for_tenant`, 42P01), a READ ONLY transaction rejects it
+  (25006) and any open transaction rejects it (0A000 — it executes immediately
+  and cannot join the buffered writes), and a committed analyzed write
+  invalidates the tenant's OLAP result cache (mandate #16b; the adapter's
+  analyze path invalidates too).
+* **L3 (deadline):** ONE deadline, enforced inside the port at
+  `run_sql_via_one_planner` (`proximadb_runtime::PORT_QUERY_DEADLINE`, 60s), so
+  every surface over the port carries it — `/api/v2/query`, every
+  `/api/v2/unified/*` route including multi-model, canonical `/sql` and MCP.
+  It surfaces as the typed `QueryDeadlineExceeded`: **504** on every HTTP port
+  surface (`/api/v2/query` returned 408 via `DeadlineExceeded`); MCP reports an
+  internal error that names the deadline (JSON-RPC has no timeout code).
+  Canonical `/sql`'s `timeout_ms` request field is not consulted (the port
+  deadline applies). `tokio::time::timeout` stops WAITING — the future is
+  dropped; work already handed to spawned or blocking tasks is not cancelled.
+  (`/api/v2/sql` keeps its own per-request `timeout_ms` deadline → 408.)
+* **L4:** `ensure_query_size` (1 MiB) runs at every port entry on the RAW input
+  before UQL lowering / parameter binding (unified, federated, distributed,
+  multi-model request, prepare), and again on the executed text.
+* **L5 (docs + KNN):** the classifier doc no longer claims `TABLE t` is
+  accepted (it does not parse under `PostgreSqlDialect`); pgvector `ORDER BY …
+  <-> … LIMIT` on the authority path is a typed 400 (see MED-1 above).
+* **L6:** ADR-098's Completion ledger G12 names TD-PLACE-1 and the scoped
+  status.
+* **L7 (pre-existing, fixed):** plan-only `EXPLAIN <DML>` resolved the target
+  table UNSCOPED, disclosing whether another tenant's table exists.
+  `explain_table_write_with_overrides` takes the caller's `TenantContext` and
+  resolves target/source metadata within it (adapter: the port identity;
+  pgwire: the connection tenant, plus the visibility gate);
+  `explain_analyze_table_write` plans in the same scope.
 
 == Evidence
 
@@ -273,5 +322,15 @@ The plan's acceptance was "same rows AND the same route decision over pgwire, RE
   reachable only from the WRITE surfaces (`/api/v2/sql`, gRPC, pgwire); the port's explain is
   the heuristic sketch; `distributed` no longer force-routes. Row/rendering parity is asserted
   end-to-end above.
-* Regression: pgwire, `/api/v2/sql`, gRPC `ExecuteQuery` and `api_handlers` are untouched code
-  paths (the trait method forwards with the same cache argument); their suites stay green.
+* Round 3 (2026-11-26): pgwire e2e
+  `pgwire_explain_analyze_options_gates_and_tenant_scoping_e2e` (plan-only falsy ANALYZE writes
+  nothing; malformed options 42601; READ ONLY transaction 25006; another tenant's connection 42P01
+  for plan-only and analyzed; analyzed INSERT lands in the connection tenant, visible over REST);
+  in-process `plan_only_explain_dml_does_not_disclose_another_tenants_table` (L7),
+  `invalid_explain_option_value_is_rejected_and_never_executes` (L1); unit
+  `parse_explain_kind_accepts_postgres_boolean_spellings`,
+  `parse_explain_kind_rejects_invalid_options`, `test_pgwire_explain_parser_analyze_off_is_plan_only`,
+  `port_deadline_maps_to_gateway_timeout_on_every_unified_surface`.
+* Regression: `/api/v2/sql`, gRPC `ExecuteQuery` and `api_handlers` keep the shared body (the trait
+  method forwards with the same cache argument). pgwire IS touched: its EXPLAIN path now uses the
+  shared parser and the DML gates (round 3), and its analyzed write is tenant-scoped (round 2).

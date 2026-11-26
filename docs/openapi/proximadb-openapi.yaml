@@ -1100,6 +1100,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
+        '504':
+          description: Query deadline exceeded.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
       parameters:
       - name: X-Tenant-ID
         in: header

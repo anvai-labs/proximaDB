@@ -63,5 +63,6 @@ pub use service_ports::{
 };
 pub use streaming_port::StreamingPort;
 pub use unified_query_port::{
-    InvalidQueryInput, MissingQueryIdentity, UnifiedQueryPort, UnifiedQueryPortContext,
+    InvalidQueryInput, MissingQueryIdentity, PORT_QUERY_DEADLINE, QueryDeadlineExceeded,
+    UnifiedQueryPort, UnifiedQueryPortContext,
 };

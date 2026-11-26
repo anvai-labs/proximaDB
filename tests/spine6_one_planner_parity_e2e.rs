@@ -525,3 +525,143 @@ async fn explain_analyze_dml_is_tenant_scoped_e2e() {
         "the tenant's own row must be deleted: {after_body}"
     );
 }
+
+/// Connect a second pgwire client whose startup `database` (= tenant /
+/// catalog, TD-064) is `tenant`.
+async fn connect_as_tenant(server: &TestPgServer, tenant: &str) -> tokio_postgres::Client {
+    let conn_str = server
+        .conn_str()
+        .replace("dbname=proximadb", &format!("dbname={tenant}"));
+    let (client, connection) = tokio_postgres::connect(&conn_str, tokio_postgres::NoTls)
+        .await
+        .expect("tenant pgwire connect");
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    client
+}
+
+/// The server SQLSTATE of a statement that must fail.
+async fn sqlstate_of(client: &tokio_postgres::Client, sql: &str) -> String {
+    match client.simple_query(sql).await {
+        Ok(_) => panic!("must fail: {sql}"),
+        Err(error) => error
+            .as_db_error()
+            .map(|db| db.code().code().to_string())
+            .unwrap_or_else(|| format!("<no db error: {error}>")),
+    }
+}
+
+/// TD-SPINE-6 round 3 (MED-1 / L1 / L2 / L7) over the LIVE pgwire surface:
+/// * `EXPLAIN (ANALYZE off|false|0) INSERT` and `(VERBOSE, ANALYZE off,
+///   COSTS) INSERT` PLAN only — pgwire's former substring parser executed
+///   them;
+/// * `(VERBOSE ANALYZE)` / an invalid ANALYZE value is a syntax error (42601),
+///   never "execute";
+/// * `(ANALYZE) INSERT` executes into the CONNECTION tenant's partition
+///   (visible to that tenant over REST; HIGH-2);
+/// * another tenant's connection cannot plan or execute against the table
+///   (42P01 — no existence leak, L7 + the tenant-visibility gate, L2);
+/// * inside a READ ONLY transaction the analyzed write is 25006 (L2).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pgwire_explain_analyze_options_gates_and_tenant_scoping_e2e() {
+    let server = TestPgServer::start().await.expect("server start");
+    let client = server.connect().await.expect("pgwire connect");
+    let table = server.unique_name("spine6_pgx");
+    pg_server::rows(&client, &format!("CREATE TABLE {table} (id TEXT)")).await;
+    pg_server::rows(
+        &client,
+        &format!("INSERT INTO {table} (id) VALUES ('keep')"),
+    )
+    .await;
+    let select = format!("SELECT id FROM {table} ORDER BY id");
+    let keep = vec![vec!["keep".to_string()]];
+
+    // Plan-only shapes: the EXPLAIN succeeds and writes nothing.
+    for plan_only in [
+        format!("EXPLAIN (ANALYZE off) INSERT INTO {table} (id) VALUES ('off')"),
+        format!("EXPLAIN (ANALYZE false) INSERT INTO {table} (id) VALUES ('false')"),
+        format!("EXPLAIN (ANALYZE 0) INSERT INTO {table} (id) VALUES ('zero')"),
+        format!("EXPLAIN (VERBOSE, ANALYZE off, COSTS) INSERT INTO {table} (id) VALUES ('mix')"),
+    ] {
+        let plan = pg_server::rows(&client, &plan_only).await;
+        assert_eq!(plan.len(), 1, "a plan row for: {plan_only}");
+        assert_eq!(
+            pg_server::rows(&client, &select).await,
+            keep,
+            "plan-only EXPLAIN must not write: {plan_only}"
+        );
+    }
+
+    // Malformed option lists are syntax errors, never executed.
+    for malformed in [
+        format!("EXPLAIN (VERBOSE ANALYZE) INSERT INTO {table} (id) VALUES ('bad1')"),
+        format!("EXPLAIN (ANALYZE maybe) INSERT INTO {table} (id) VALUES ('bad2')"),
+    ] {
+        assert_eq!(
+            sqlstate_of(&client, &malformed).await,
+            "42601",
+            "{malformed}"
+        );
+        assert_eq!(pg_server::rows(&client, &select).await, keep, "{malformed}");
+    }
+
+    // A READ ONLY transaction rejects the analyzed write (25006).
+    pg_server::rows(&client, "BEGIN READ ONLY").await;
+    assert_eq!(
+        sqlstate_of(
+            &client,
+            &format!("EXPLAIN (ANALYZE) INSERT INTO {table} (id) VALUES ('ro')")
+        )
+        .await,
+        "25006"
+    );
+    pg_server::rows(&client, "ROLLBACK").await;
+    assert_eq!(pg_server::rows(&client, &select).await, keep);
+
+    // Another tenant's connection: the table does not exist for it — neither
+    // the plan-only EXPLAIN nor the analyzed write reaches it.
+    let other = connect_as_tenant(&server, "spine6_other_tenant").await;
+    for cross in [
+        format!("EXPLAIN INSERT INTO {table} (id) VALUES ('x-plan')"),
+        format!("EXPLAIN (ANALYZE) INSERT INTO {table} (id) VALUES ('x-run')"),
+    ] {
+        assert_eq!(sqlstate_of(&other, &cross).await, "42P01", "{cross}");
+    }
+    assert_eq!(pg_server::rows(&client, &select).await, keep);
+
+    // The executing form writes into the CONNECTION tenant's partition.
+    let plan = pg_server::rows(
+        &client,
+        &format!("EXPLAIN (ANALYZE) INSERT INTO {table} (id) VALUES ('on')"),
+    )
+    .await;
+    assert_eq!(plan.len(), 1, "EXPLAIN ANALYZE returns its plan row");
+    assert_eq!(
+        pg_server::rows(&client, &select).await,
+        vec![vec!["keep".to_string()], vec!["on".to_string()]],
+        "EXPLAIN (ANALYZE) INSERT executes"
+    );
+    // …and the tenant's REST view (X-Tenant-ID = the pgwire database) sees
+    // it: the write landed in the connection tenant's partition, not the
+    // unscoped one.
+    let (http, base) = server.rest_client().expect("rest client");
+    let response = post_tenant_json(
+        &http,
+        format!("{base}/api/v2/sql"),
+        "proximadb",
+        json!({ "query": select }),
+    )
+    .await
+    .expect("rest read sends");
+    let body: serde_json::Value = response.json().await.expect("rest body");
+    let ids: Vec<String> = body["rows"]
+        .as_array()
+        .map(|rows| {
+            rows.iter()
+                .map(|row| row["id"].as_str().unwrap_or_default().to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    assert_eq!(ids, vec!["keep", "on"], "tenant REST view: {body}");
+}

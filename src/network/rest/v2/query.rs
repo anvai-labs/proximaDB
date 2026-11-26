@@ -80,6 +80,7 @@ fn json_to_proxima_values(params: Option<Vec<serde_json::Value>>) -> Option<Vec<
     responses(
         (status = 200, description = "Query result.", body = crate::network::rest::openapi::QueryResponse),
         (status = 400, description = "Invalid request.", body = crate::network::rest::openapi::ErrorResponse),
+        (status = 504, description = "Query deadline exceeded.", body = crate::network::rest::openapi::ErrorResponse),
     ),
 )]
 pub async fn execute_query(
@@ -101,10 +102,10 @@ pub async fn execute_query(
         proximadb_runtime::PortIdentity::from(&identity),
     );
 
-    // L4 (round 2): this surface now runs relational reads through the SQL
-    // authority, so it carries /api/v2/sql's deadline contract.
-    const PORT_QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
-    let execution = async {
+    // L3 (round 3): the deadline is enforced INSIDE the port
+    // (`proximadb_runtime::PORT_QUERY_DEADLINE`) and surfaces as the typed
+    // `QueryDeadlineExceeded` → 504 below — one deadline for every surface.
+    let result = async {
         match request.language {
             QueryLanguage::Uql => {
                 query_port
@@ -131,15 +132,8 @@ pub async fn execute_query(
             )
             .into()),
         }
-    };
-    let result = match tokio::time::timeout(PORT_QUERY_TIMEOUT, execution).await {
-        Ok(result) => result,
-        Err(_) => {
-            return Err(ApiError::DeadlineExceeded(format!(
-                "Query exceeded the {PORT_QUERY_TIMEOUT:?} deadline"
-            )));
-        }
-    };
+    }
+    .await;
 
     result.map(Json).map_err(|error| {
         // A query addressing a collection that does not resolve for the
@@ -165,6 +159,12 @@ pub async fn execute_query(
             .is_some()
         {
             return ApiError::Unauthorized(format!("Query rejected: {error}"));
+        }
+        if error
+            .downcast_ref::<proximadb_runtime::QueryDeadlineExceeded>()
+            .is_some()
+        {
+            return ApiError::QueryDeadline(format!("Query rejected: {error}"));
         }
         error!("v2 query execution failed: {}", error);
         ApiError::Internal(format!("Query execution failed: {}", error))

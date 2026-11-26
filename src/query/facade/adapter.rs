@@ -776,8 +776,15 @@ impl QueryFacadeAdapter {
             // execute_sql_v1. Detected via the shared sql_frontend parser; routed
             // through the DmlService write-plan explainer when one is wired.
             // (TD-104 / seam S1: make this adapter the single SQL authority.)
-            if let Some((is_analyze, inner_query)) =
-                crate::query::sql_frontend::parse_explain_kind(query.trim())
+            // A malformed EXPLAIN (invalid option list / value) is a caller
+            // error, never "execute" (round 3, L1).
+            let explain_kind = crate::query::sql_frontend::parse_explain_kind(query.trim())
+                .map_err(|error| {
+                    anyhow::Error::new(proximadb_runtime::InvalidQueryInput(format!(
+                        "EXPLAIN rejected: {error}"
+                    )))
+                })?;
+            if let Some((is_analyze, inner_query)) = explain_kind
                 && let Some(dml_svc) = self.dml_service.as_ref()
             {
                 let parser = crate::query::sql_frontend::SqlFrontendParser::new();
@@ -788,7 +795,8 @@ impl QueryFacadeAdapter {
                         // from the port identity exactly as `try_run_select`
                         // derives its TenantContext) — previously it ran
                         // unscoped, so one tenant's EXPLAIN (ANALYZE) DML
-                        // could mutate another tenant's rows.
+                        // could mutate another tenant's rows. Round 3 (L7):
+                        // the plan-only EXPLAIN resolves in the same scope.
                         let analyze_tenant_ctx = tenant_id.filter(|t| !t.is_empty()).map(|t| {
                             let mut context =
                                 crate::storage::tenant::context::TenantContext::for_tenant_id(t);
@@ -796,11 +804,31 @@ impl QueryFacadeAdapter {
                             context
                         });
                         let explanation = if is_analyze {
-                            dml_svc
+                            let table = statement.target_table_name().to_string();
+                            let analyzed = dml_svc
                                 .explain_analyze_table_write(statement, analyze_tenant_ctx.as_ref())
-                                .await
+                                .await;
+                            // Mandate #16b: the analyzed write committed —
+                            // invalidate the tenant's OLAP result cache for
+                            // the written table (default-OFF no-op).
+                            if analyzed.is_ok()
+                                && let Some(context) = analyze_tenant_ctx.as_ref()
+                            {
+                                crate::network::postgres::relational_pipeline::invalidate_olap_result_cache_for(
+                                    &context.tenant_id,
+                                    &table,
+                                )
+                                .await;
+                            }
+                            analyzed
                         } else {
-                            dml_svc.explain_table_write(statement).await
+                            dml_svc
+                                .explain_table_write_with_overrides(
+                                    statement,
+                                    None,
+                                    analyze_tenant_ctx.as_ref(),
+                                )
+                                .await
                         }
                         .map_err(|e| anyhow!("EXPLAIN failed: {}", e))?;
                         let plan_json = serde_json::to_string_pretty(&explanation)
@@ -895,6 +923,16 @@ impl QueryFacadeAdapter {
         >,
     ) -> anyhow::Result<proximadb_runtime::SqlExecutionResult> {
         use crate::query::QueryResultData;
+        // Round 3 (L5): this path passes `vector_ops = None` to
+        // `try_run_select`, so a pgvector `ORDER BY … <-> … LIMIT` KNN SELECT
+        // cannot execute here on ANY server (it surfaced as an untyped 500
+        // "vector search service is unavailable"). Reject it as a typed,
+        // actionable caller error instead.
+        if crate::network::postgres::relational_pipeline::is_pgvector_knn_select(query) {
+            return Err(anyhow::Error::new(proximadb_runtime::InvalidQueryInput(
+                "pgvector `ORDER BY <column> <-> <vector> LIMIT k` KNN SQL is not served on this surface (no vector search service on the SQL authority path); use pgwire or the vector search API".to_string(),
+            )));
+        }
         if let Some(dml) = self.dml_service.as_ref()
             && let Some(outcome) = crate::network::postgres::relational_pipeline::try_run_select(
                 query,

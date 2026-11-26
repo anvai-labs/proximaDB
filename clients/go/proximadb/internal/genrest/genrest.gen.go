@@ -26522,6 +26522,8 @@ type ExecuteQueryHTTPResp struct {
 	JSON200 *QueryResponse
 	// JSON400 the response for an HTTP 400 `application/json` response
 	JSON400 *ErrorResponse
+	// JSON504 the response for an HTTP 504 `application/json` response
+	JSON504 *ErrorResponse
 }
 
 // GetJSON200 returns the response for an HTTP 200 `application/json` response
@@ -26532,6 +26534,11 @@ func (r ExecuteQueryHTTPResp) GetJSON200() *QueryResponse {
 // GetJSON400 returns the response for an HTTP 400 `application/json` response
 func (r ExecuteQueryHTTPResp) GetJSON400() *ErrorResponse {
 	return r.JSON400
+}
+
+// GetJSON504 returns the response for an HTTP 504 `application/json` response
+func (r ExecuteQueryHTTPResp) GetJSON504() *ErrorResponse {
+	return r.JSON504
 }
 
 // GetBody returns the raw response body bytes
@@ -35284,6 +35291,13 @@ func ParseExecuteQueryHTTPResp(rsp *http.Response) (*ExecuteQueryHTTPResp, error
 			return nil, err
 		}
 		response.JSON400 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 504:
+		var dest ErrorResponse
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON504 = &dest
 
 	}
 

@@ -33,7 +33,8 @@ use axum::{
 use proximadb_data_model::ProximaValue;
 use proximadb_records::conversions::json_to_proxima;
 use proximadb_runtime::{
-    InvalidQueryInput, MissingQueryIdentity, UnifiedQueryPort, UnifiedQueryPortContext,
+    InvalidQueryInput, MissingQueryIdentity, QueryDeadlineExceeded, UnifiedQueryPort,
+    UnifiedQueryPortContext,
 };
 use serde::Deserialize;
 use tracing::{error, info};
@@ -54,28 +55,17 @@ fn port_context<'a>(
     }
 }
 
-/// L4 (round 2): the unified surfaces now run relational reads through the
-/// SQL authority, so they carry /api/v2/sql's deadline contract (fixed 60s —
-/// these request shapes have no timeout field).
-const UNIFIED_QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
-
-/// Run a port execution under [`UNIFIED_QUERY_TIMEOUT`] and render it: the
-/// result as JSON, a port error through [`port_error_response`], an expired
-/// deadline as 504 (the /api/v2/sql deadline class — never a 400/500).
-async fn respond_within_deadline(
+/// Await a port execution and render it: the result as JSON, a port error
+/// through [`port_error_response`]. The deadline is enforced INSIDE the port
+/// (`proximadb_runtime::PORT_QUERY_DEADLINE`, TD-SPINE-6 round 3) and arrives
+/// here as the typed `QueryDeadlineExceeded` → 504.
+async fn respond_port_result(
     op: &str,
     execution: impl std::future::Future<Output = anyhow::Result<serde_json::Value>>,
 ) -> axum::response::Response {
-    match tokio::time::timeout(UNIFIED_QUERY_TIMEOUT, execution).await {
-        Ok(Ok(result)) => Json(result).into_response(),
-        Ok(Err(e)) => port_error_response(op, e),
-        Err(_) => (
-            StatusCode::GATEWAY_TIMEOUT,
-            Json(serde_json::json!({
-                "error": format!("{op} exceeded the {UNIFIED_QUERY_TIMEOUT:?} deadline")
-            })),
-        )
-            .into_response(),
+    match execution.await {
+        Ok(result) => Json(result).into_response(),
+        Err(e) => port_error_response(op, e),
     }
 }
 
@@ -200,6 +190,13 @@ fn port_error_response(op: &str, e: anyhow::Error) -> axum::response::Response {
             Json(serde_json::json!({ "error": e.to_string() })),
         )
             .into_response()
+    } else if e.downcast_ref::<QueryDeadlineExceeded>().is_some() {
+        // L3 (round 3): the port deadline → 504 on every port surface.
+        (
+            StatusCode::GATEWAY_TIMEOUT,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response()
     } else if e.downcast_ref::<InvalidQueryInput>().is_some() {
         // MED-4 (round-1 review): the read-only policy rejection (or any
         // client-shaped query input) → 400, not 500.
@@ -243,7 +240,7 @@ async fn execute_query(
         req.limit,
         port_context(&identity),
     );
-    respond_within_deadline("execute_unified_query", execution).await
+    respond_port_result("execute_unified_query", execution).await
 }
 
 async fn execute_multi_model_query(
@@ -289,7 +286,7 @@ async fn execute_federated_query(
     let execution =
         s.unified_query_port
             .execute_federated_query(req.query, params, port_context(&identity));
-    respond_within_deadline("execute_federated_query", execution).await
+    respond_port_result("execute_federated_query", execution).await
 }
 
 async fn execute_distributed_query(
@@ -301,7 +298,7 @@ async fn execute_distributed_query(
     let execution = s
         .unified_query_port
         .execute_distributed_query(req, port_context(&identity));
-    respond_within_deadline("execute_distributed_query", execution).await
+    respond_port_result("execute_distributed_query", execution).await
 }
 
 async fn explain_query(
@@ -360,7 +357,7 @@ async fn execute_prepared_statement(
         req.collection,
         port_context(&identity),
     );
-    respond_within_deadline("execute_prepared", execution).await
+    respond_port_result("execute_prepared", execution).await
 }
 
 async fn delete_prepared_statement(
@@ -441,6 +438,7 @@ mod tests {
         NotImplemented,
         InvalidInput,
         Internal,
+        Deadline,
     }
 
     struct MockUnifiedQueryPort {
@@ -466,6 +464,9 @@ mod tests {
                     Err(InvalidQueryInput(format!("{op} not implemented")).into())
                 }
                 MockMode::Internal => Err(anyhow!("{op} failed")),
+                MockMode::Deadline => {
+                    Err(QueryDeadlineExceeded(proximadb_runtime::PORT_QUERY_DEADLINE).into())
+                }
             }
         }
     }
@@ -531,7 +532,7 @@ mod tests {
                 MockMode::InvalidInput => {
                     Err(InvalidQueryInput("prepare_statement input is invalid".to_string()).into())
                 }
-                MockMode::Internal => Err(anyhow!("prepare_statement failed")),
+                MockMode::Internal | MockMode::Deadline => Err(anyhow!("prepare_statement failed")),
             }
         }
 
@@ -556,7 +557,7 @@ mod tests {
                 MockMode::InvalidInput => {
                     Err(InvalidQueryInput("delete_prepared input is invalid".to_string()).into())
                 }
-                MockMode::Internal => Err(anyhow!("delete_prepared failed")),
+                MockMode::Internal | MockMode::Deadline => Err(anyhow!("delete_prepared failed")),
             }
         }
 
@@ -778,6 +779,34 @@ mod tests {
         .await
         .into_response();
         assert_eq!(internal.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    /// L3 (round 3): the port's typed deadline is a 504 on every unified
+    /// surface (including multi-model, which has its own error arm).
+    #[tokio::test]
+    async fn port_deadline_maps_to_gateway_timeout_on_every_unified_surface() {
+        let state = || MockUnifiedQueryPort::state(MockMode::Deadline);
+        let multi_model = execute_multi_model_query(state(), None, Ok(Json(serde_json::json!({}))))
+            .await
+            .into_response();
+        assert_eq!(multi_model.status(), StatusCode::GATEWAY_TIMEOUT);
+        let distributed = execute_distributed_query(state(), None, Ok(Json(serde_json::json!({}))))
+            .await
+            .into_response();
+        assert_eq!(distributed.status(), StatusCode::GATEWAY_TIMEOUT);
+        let execute = execute_query(
+            state(),
+            None,
+            Ok(Json(ExecuteQueryRequest {
+                query: "SELECT 1".to_string(),
+                parameters: None,
+                collection: None,
+                limit: None,
+            })),
+        )
+        .await
+        .into_response();
+        assert_eq!(execute.status(), StatusCode::GATEWAY_TIMEOUT);
     }
 
     #[tokio::test]

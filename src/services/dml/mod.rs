@@ -4414,12 +4414,15 @@ impl DmlService {
         Ok((RelationalSelectAccessPath::TableScan, records))
     }
 
-    /// Explain table-to-table write routing without executing the write.
+    /// Explain table-to-table write routing without executing the write
+    /// (unscoped resolution — single-tenant/legacy callers and tests; the
+    /// request surfaces call [`Self::explain_table_write_with_overrides`] with
+    /// the caller's tenant).
     pub async fn explain_table_write(
         &self,
         statement: DmlStatement,
     ) -> Result<TableWriteRouteExplanation> {
-        self.explain_table_write_with_overrides(statement, None)
+        self.explain_table_write_with_overrides(statement, None, None)
             .await
     }
 
@@ -4430,13 +4433,16 @@ impl DmlService {
     /// caller's tenant scope** — previously `self.execute(...)` ran unscoped
     /// (`execute_scoped(statement, None)`), so a tenant's `EXPLAIN (ANALYZE)
     /// <DML>` could mutate another tenant's (unscoped) rows. `None` keeps the
-    /// legacy single-tenant semantics.
+    /// legacy single-tenant semantics. Round 3: the PLANNING step resolves
+    /// within the same tenant too (it resolved unscoped).
     pub async fn explain_analyze_table_write(
         &self,
         statement: DmlStatement,
         tenant_context: Option<&TenantContext>,
     ) -> Result<TableWriteRouteExplanation> {
-        let mut explanation = self.explain_table_write(statement.clone()).await?;
+        let mut explanation = self
+            .explain_table_write_with_overrides(statement.clone(), None, tenant_context)
+            .await?;
         let t0 = std::time::Instant::now();
         let result = self.execute_scoped(statement, tenant_context).await?;
         let elapsed_us = t0.elapsed().as_micros() as u64;
@@ -4445,17 +4451,28 @@ impl DmlService {
         Ok(explanation)
     }
 
-    /// Explain table-to-table write routing with protocol/session write intent hints.
+    /// Explain table-to-table write routing with protocol/session write intent
+    /// hints, resolving the target (and source) table within `tenant_context`
+    /// (TD-SPINE-6 round 3, L7: planning resolved UNSCOPED, so a tenant's
+    /// `EXPLAIN <DML>` disclosed whether another tenant's table exists).
+    /// `None` keeps the legacy unscoped resolution.
     pub async fn explain_table_write_with_overrides(
         &self,
         statement: DmlStatement,
         write_intent_overrides: Option<&WriteIntentOverrides>,
+        tenant_context: Option<&TenantContext>,
     ) -> Result<TableWriteRouteExplanation> {
+        let tenant = tenant_context.map(|context| context.tenant_id.as_str());
         match statement {
             DmlStatement::InsertSelect { plan, columns }
             | DmlStatement::InsertOverwrite { plan, columns } => {
                 let routed = self
-                    .route_table_write_plan_with_overrides(&plan, &columns, write_intent_overrides)
+                    .route_table_write_plan_with_overrides(
+                        &plan,
+                        &columns,
+                        write_intent_overrides,
+                        tenant,
+                    )
                     .await?;
                 Ok(routed.route_explanation())
             }
@@ -4476,7 +4493,12 @@ impl DmlService {
                     ..plan
                 };
                 let routed = self
-                    .route_table_write_plan_with_overrides(&plan, &columns, Some(&overrides))
+                    .route_table_write_plan_with_overrides(
+                        &plan,
+                        &columns,
+                        Some(&overrides),
+                        tenant,
+                    )
                     .await?;
                 Ok(routed.route_explanation())
             }
@@ -4497,7 +4519,12 @@ impl DmlService {
                     distribution: DistributionMode::Auto,
                 };
                 let routed = self
-                    .route_table_write_plan_with_overrides(&plan, &columns, Some(&overrides))
+                    .route_table_write_plan_with_overrides(
+                        &plan,
+                        &columns,
+                        Some(&overrides),
+                        tenant,
+                    )
                     .await?;
                 Ok(routed.route_explanation())
             }
@@ -4510,7 +4537,12 @@ impl DmlService {
                     distribution: DistributionMode::Auto,
                 };
                 let routed = self
-                    .route_table_write_plan_with_overrides(&plan, &[], write_intent_overrides)
+                    .route_table_write_plan_with_overrides(
+                        &plan,
+                        &[],
+                        write_intent_overrides,
+                        tenant,
+                    )
                     .await?;
                 Ok(routed.route_explanation())
             }
@@ -4523,7 +4555,12 @@ impl DmlService {
                     distribution: DistributionMode::Auto,
                 };
                 let routed = self
-                    .route_table_write_plan_with_overrides(&plan, &[], write_intent_overrides)
+                    .route_table_write_plan_with_overrides(
+                        &plan,
+                        &[],
+                        write_intent_overrides,
+                        tenant,
+                    )
                     .await?;
                 Ok(routed.route_explanation())
             }
@@ -4759,21 +4796,25 @@ impl DmlService {
         plan: &CopyIntoPlan,
         target_columns: &[String],
         write_intent_overrides: Option<&WriteIntentOverrides>,
+        tenant: Option<&str>,
     ) -> Result<RoutedExecutionPlan> {
         let target_table_name = plan.target.qualified_name();
-        // Route/EXPLAIN planning is not a write boundary; resolve unscoped (the
-        // execution path `plan_table_write` resolves scoped via the tenant).
+        // Route/EXPLAIN planning resolves within the caller's tenant (round 3,
+        // L7) — the same scope the execution path `plan_table_write` uses, so
+        // EXPLAIN never discloses another tenant's table.
         let (table_schema, target_stats) = self
-            .resolve_table_metadata(&target_table_name, None)
+            .resolve_table_metadata(&target_table_name, tenant)
             .await?;
-        let source_metadata = self.resolve_table_write_source_metadata(plan, None).await?;
+        let source_metadata = self
+            .resolve_table_write_source_metadata(plan, tenant)
+            .await?;
         let source_schema = source_metadata.as_ref().map(|(schema, _)| schema);
         let source_stats = source_metadata.as_ref().map(|(_, stats)| stats);
         // Computed once per statement, before routing: the lane decision must
         // refuse the bulk path for a DV-carrying parent BEFORE the executor
         // writes any Parquet (a commit-time refusal would strand the parts).
         let parent_has_deletes = self
-            .published_parent_has_deletes(&target_table_name, None)
+            .published_parent_has_deletes(&target_table_name, tenant)
             .await;
         self.route_table_write_with_schemas(
             plan,

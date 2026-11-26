@@ -1287,6 +1287,13 @@ fn sql_error_to_api(error: anyhow::Error) -> ApiError {
         {
             ApiError::Unauthorized(error.to_string())
         }
+        // L3 (round 3): the port deadline → 504, like every port surface.
+        None if error
+            .downcast_ref::<proximadb_runtime::QueryDeadlineExceeded>()
+            .is_some() =>
+        {
+            ApiError::QueryDeadline(error.to_string())
+        }
         None => ApiError::Internal(error.to_string()),
     }
 }
