@@ -1261,15 +1261,22 @@ impl SystemCatalog {
         // adopts the tip and surfaces the conflict; the DDL is retried
         // after a pod restart (the pre-reload allocator may hold ids the
         // reloaded state already assigned — the dual-boot id hazard).
+        // TD-SPINE-2 R4: the root version this check COVERED is the root
+        // CAS's expected parent — never re-read at commit time, so a root
+        // another owner commits between this check and the CAS refuses the
+        // commit (step-down below) instead of being silently overwritten.
+        let checked_parent: Option<u64>;
         {
             let loaded = self.loaded_version.load(Ordering::SeqCst);
             let loaded_is_root = self.loaded_version_is_root.load(Ordering::SeqCst);
-            let seen_by_version = cfg
-                .store
-                .latest_root_version()
-                .await?
+            let probed = cfg.store.latest_root_version().await?;
+            let mut covered = probed;
+            let seen_by_version = probed
                 .is_none_or(|tip_version| loaded_is_root && !version_is_newer(loaded, tip_version));
             if !seen_by_version && let Some(tip) = cfg.store.read_root().await? {
+                // The payload read may observe a newer tip than the probe;
+                // the version actually checked below is that tip's.
+                covered = Some(tip.version);
                 let outranks = self.loaded_generation.load(Ordering::SeqCst) > tip.generation;
                 if !outranks {
                     let (_, _, _, _, tip_index) =
@@ -1319,9 +1326,14 @@ impl SystemCatalog {
                     }
                 }
             }
+            checked_parent = covered;
         }
         let root_bytes = self.state.to_root_bytes(&index)?;
-        match cfg.store.commit_root(generation, &root_bytes).await? {
+        match cfg
+            .store
+            .commit_root(generation, checked_parent, &root_bytes)
+            .await?
+        {
             SnapshotWrite::Published { version } => {
                 *self.shard_versions.write() = index.into_iter().collect();
                 self.loaded_version.store(version, Ordering::SeqCst);
@@ -1332,12 +1344,30 @@ impl SystemCatalog {
                 tracing::warn!(
                     catalog = %self.name,
                     generation,
+                    expected_parent = ?checked_parent,
                     store = %cfg.store.describe(),
-                    "catalog root commit was fenced by a newer pod; stepping \
-                     down to read-only and reloading its snapshot"
+                    "catalog root commit was refused (fenced by a newer pod, or \
+                     another owner committed a root after this pod's coverage \
+                     check); reloading its snapshot"
                 );
                 self.reload_from_store_locked(cfg).await?;
-                return Ok(());
+                // A newer generation superseded this pod: the reload made it
+                // read-only (step-down), exactly as before.
+                if self.read_only.load(Ordering::SeqCst) {
+                    return Ok(());
+                }
+                // TD-SPINE-2 R4: an equal-generation owner committed a root
+                // after this pod's coverage check, so the expected-parent CAS
+                // refused. Nothing was published over it; the pod adopted the
+                // winner's root and keeps its pending shards for the retry.
+                // Surface the conflict like the coverage-check refusal.
+                anyhow::bail!(
+                    "catalog '{}': concurrent owner advanced the root past v{} after this \
+                     pod's coverage check; the root CAS refused and the pod has reloaded \
+                     — restart it and retry the DDL",
+                    self.name,
+                    checked_parent.map_or_else(|| "(none)".to_string(), |v| v.to_string())
+                );
             }
         }
 
@@ -1725,6 +1755,25 @@ impl SystemCatalog {
                 "Namespace '{}' already exists",
                 namespace.join(".")
             ));
+        }
+        // TD-SPINE-2 R1: the tenant id is the account's catalog shard key and
+        // names its shard log under `data/{tenant_id}/` (DrPathBuilder), so it
+        // must be a valid tenant path segment — refused HERE, before the WAL
+        // append, rather than wedging every later checkpoint. `_default` is
+        // the untenanted shard's key (operator-scoped); a tenant of that name
+        // would alias it, so it is refused too.
+        if let Some(tenant) = tenant_id.as_deref() {
+            crate::storage::trait_components::path_resolver::DrPathBuilder::validate_id(
+                "tenant_id",
+                tenant,
+            )
+            .map_err(|e| anyhow!("invalid namespace tenant id: {e}"))?;
+            if tenant == crate::services::system_catalog_state::DEFAULT_SHARD_KEY {
+                return Err(anyhow!(
+                    "invalid namespace tenant id '{tenant}': reserved for the untenanted \
+                     catalog shard"
+                ));
+            }
         }
         let mut ns = CatalogNamespace::new(namespace.to_vec());
         ns.properties = properties;
@@ -4026,8 +4075,11 @@ mod tests {
         }
     }
 
-    fn hex_segment(account: &str) -> String {
-        crate::storage::trait_components::path_resolver::DrPathBuilder::encode_system_catalog_shard_segment(account)
+    /// TD-SPINE-2 R1: the account's relocated shard-log prefix
+    /// (`data/{tenant}/_syscat/shard/`).
+    fn shard_prefix(account: &str) -> String {
+        crate::services::catalog_snapshot_store::catalog_shard_manifests_prefix(account)
+            .expect("test accounts are valid tenant segments")
     }
 
     /// Guard that sets an env gate for one test and restores the prior value
@@ -4137,13 +4189,13 @@ mod tests {
 
         // The big account's shard object is untouched...
         assert_eq!(
-            ledger.put_paths_matching(&format!("_shards/{}", hex_segment("big-tenant"))),
+            ledger.put_paths_matching(&shard_prefix("big-tenant")),
             0,
             "a small-account DDL must not republish the big account's shard"
         );
         // ...and the small account's shard IS republished.
         assert_eq!(
-            ledger.put_paths_matching(&format!("_shards/{}", hex_segment("small-tenant"))),
+            ledger.put_paths_matching(&shard_prefix("small-tenant")),
             1,
             "the small account's shard is republished exactly once"
         );
@@ -4243,15 +4295,377 @@ mod tests {
         // generation probes on the logs it touches — the invariant is which
         // LOGS are touched, not the per-log probe count.)
         assert_eq!(
-            ledger.get_count_matching(&format!("_shards/{}", hex_segment("big-tenant"))),
+            ledger.get_count_matching(&shard_prefix("big-tenant")),
             0,
             "reload must not touch the unchanged big shard at all"
         );
         assert!(
-            ledger.get_count_matching(&format!("_shards/{}", hex_segment("small-tenant"))) >= 1,
+            ledger.get_count_matching(&shard_prefix("small-tenant")) >= 1,
             "reload fetches the changed small shard"
         );
         assert!(ledger.get_count_matching("_root/") >= 1);
+        Ok(())
+    }
+
+    /// TD-SPINE-2 R1 acceptance (counting backend): a DDL in account A PUTs
+    /// A's shard ONLY under A's DrPathBuilder tenant prefix — every other PUT
+    /// is the operator-scoped root or identity sidecar — and nothing lands
+    /// under the retired `_operator/catalog/_shards/`. A second account's DDL
+    /// then writes nothing under A's prefix.
+    #[tokio::test]
+    async fn ddl_shard_puts_land_under_the_accounts_tenant_prefix() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let backing = Arc::new(object_store::memory::InMemory::new());
+        let ledger = Arc::new(IoLedger::default());
+        let owner = open_owner_counting(&dir.path().join("owner.wal"), &ledger, &backing).await?;
+        let (big_ns, small_ns) = seed_two_accounts(&owner, 3).await?;
+        let a_tenant_root = "data/small-tenant/";
+        assert!(shard_prefix("small-tenant").starts_with(a_tenant_root));
+        ledger.reset();
+
+        owner
+            .create_table(
+                &TableIdentifier::new(small_ns.clone(), "a_ddl"),
+                vec_schema("a_ddl"),
+            )
+            .await?;
+        let puts: Vec<String> = ledger
+            .puts
+            .lock()
+            .expect("puts lock")
+            .iter()
+            .map(|(path, _)| path.clone())
+            .collect();
+        assert!(
+            puts.iter()
+                .any(|p| p.starts_with(&shard_prefix("small-tenant"))),
+            "A's shard must be published under A's tenant prefix: {puts:?}"
+        );
+        let root_prefix =
+            crate::storage::trait_components::path_resolver::DrPathBuilder::system_catalog_root_manifests_subprefix();
+        for path in &puts {
+            assert!(
+                path.starts_with(a_tenant_root)
+                    || path.starts_with(&root_prefix)
+                    || path == "_operator/catalog/identity_high_water",
+                "A's DDL PUT an object outside A's tenant prefix and the operator \
+                 root/sidecar: {path}"
+            );
+            assert!(
+                !path.starts_with("_operator/catalog/_shards/"),
+                "no shard object may land under the retired layout: {path}"
+            );
+        }
+
+        // A second account's DDL writes nothing under A's prefix.
+        ledger.reset();
+        owner
+            .create_table(
+                &TableIdentifier::new(big_ns.clone(), "b_ddl"),
+                vec_schema("b_ddl"),
+            )
+            .await?;
+        assert_eq!(ledger.put_paths_matching(a_tenant_root), 0);
+        assert!(ledger.put_paths_matching(&shard_prefix("big-tenant")) >= 1);
+        assert_eq!(ledger.put_paths_matching("_operator/catalog/_shards/"), 0);
+        Ok(())
+    }
+
+    /// TD-SPINE-2 R1 fail-closed: a root that names a shard version missing
+    /// at the relocated tenant prefix — e.g. a store written before R1, whose
+    /// shards sit under the retired `_operator/catalog/_shards/{hex}/` — fails
+    /// BOTH a follower's reload and a fresh boot with an actionable error. It
+    /// never boots or reloads into an image with the account's rows missing,
+    /// and the reader never falls back to the retired layout.
+    #[tokio::test]
+    async fn root_naming_a_shard_missing_at_the_tenant_prefix_fails_closed() -> Result<()> {
+        use futures::TryStreamExt;
+        use object_store::ObjectStore;
+        use object_store::ObjectStoreExt as _;
+
+        let dir = tempfile::tempdir()?;
+        let backing = Arc::new(object_store::memory::InMemory::new());
+        let ledger = Arc::new(IoLedger::default());
+        let owner = open_owner_counting(&dir.path().join("owner.wal"), &ledger, &backing).await?;
+        let (_big_ns, small_ns) = seed_two_accounts(&owner, 1).await?;
+        let follower =
+            open_follower_counting(&dir.path().join("follower.wal"), &ledger, &backing).await?;
+        owner
+            .create_table(
+                &TableIdentifier::new(small_ns.clone(), "second"),
+                vec_schema("second"),
+            )
+            .await?;
+        drop(owner);
+
+        // Move every small-tenant shard object to the retired layout
+        // (`hex("small-tenant")`), as a pre-R1 store would hold it.
+        let moved: Vec<object_store::ObjectMeta> = backing
+            .list(Some(&object_store::path::Path::from(
+                shard_prefix("small-tenant").as_str(),
+            )))
+            .try_collect()
+            .await?;
+        assert!(!moved.is_empty());
+        for meta in &moved {
+            let name = meta.location.filename().expect("manifest file name");
+            let legacy = object_store::path::Path::from(format!(
+                "_operator/catalog/_shards/736d616c6c2d74656e616e74/{name}"
+            ));
+            let bytes = backing.get(&meta.location).await?.bytes().await?;
+            backing.put(&legacy, bytes.into()).await?;
+            backing.delete(&meta.location).await?;
+        }
+
+        // Follower reload: the root advanced to name small-tenant's new
+        // shard, which is gone at the tenant prefix — the reload must fail,
+        // not adopt an image without it.
+        let reload = follower.reload_if_stale().await;
+        let text = format!("{:#}", reload.expect_err("reload must fail closed"));
+        assert!(
+            text.contains("missing at 'data/small-tenant/_syscat/shard/'"),
+            "{text}"
+        );
+        assert!(
+            follower
+                .table_exists(&TableIdentifier::new(small_ns.clone(), "only"))
+                .await?,
+            "the follower keeps serving its last adopted image"
+        );
+
+        // Fresh boot: refused with the same actionable error.
+        let boot = open_owner_counting(&dir.path().join("reboot.wal"), &ledger, &backing).await;
+        let text = match boot {
+            Ok(_) => panic!("boot must fail closed on a missing root-referenced shard"),
+            Err(error) => format!("{error:#}"),
+        };
+        assert!(text.contains("TD-SPINE-2 R1"), "{text}");
+        assert!(text.contains("Re-seed"), "{text}");
+        Ok(())
+    }
+
+    /// TD-SPINE-2 R1: a namespace tenant id is its account's shard key and
+    /// names a `data/{tenant}/` prefix, so a tenant that is not a valid
+    /// DrPathBuilder segment (or that aliases the untenanted `_default`
+    /// shard) is refused at CREATE NAMESPACE — before the WAL append — not
+    /// discovered at checkpoint time.
+    #[tokio::test]
+    async fn namespace_tenant_must_be_a_valid_tenant_segment() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let backing = Arc::new(object_store::memory::InMemory::new());
+        let ledger = Arc::new(IoLedger::default());
+        let owner = open_owner_counting(&dir.path().join("owner.wal"), &ledger, &backing).await?;
+        for hostile in ["a/b", "a b", "..", "_operator", "_default"] {
+            let ns = nslevels(&["hostile", "ns"]);
+            let error = owner
+                .create_namespace_for_tenant(&ns, HashMap::new(), Some(hostile))
+                .await
+                .expect_err("hostile tenant must be refused");
+            assert!(
+                format!("{error:#}").contains("invalid namespace tenant id"),
+                "{error:#}"
+            );
+            assert!(!owner.state.namespace_exists(&ns));
+        }
+        Ok(())
+    }
+
+    /// Test double for TD-SPINE-2 R4: delegates to a real object-store
+    /// snapshot store, but runs a one-shot hook (another owner's DDL) at the
+    /// START of `commit_root` — i.e. after the caller's index-coverage check
+    /// and before its root CAS.
+    struct RootRaceStore {
+        inner: Arc<crate::services::catalog_snapshot_store::ObjectStoreSnapshotStore>,
+        hook: parking_lot::Mutex<
+            Option<std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>>>,
+        >,
+    }
+
+    #[async_trait::async_trait]
+    impl CatalogSnapshotStore for RootRaceStore {
+        fn requires_snapshot_on_commit(&self) -> bool {
+            self.inner.requires_snapshot_on_commit()
+        }
+        async fn read(
+            &self,
+        ) -> Result<Option<crate::services::catalog_snapshot_store::SnapshotRead>> {
+            self.inner.read().await
+        }
+        async fn write_atomic(&self, generation: u64, bytes: &[u8]) -> Result<SnapshotWrite> {
+            self.inner.write_atomic(generation, bytes).await
+        }
+        async fn latest_version(&self) -> Result<Option<u64>> {
+            self.inner.latest_version().await
+        }
+        async fn prune_retention(
+            &self,
+            keep_k: usize,
+            min_age: std::time::Duration,
+        ) -> Result<usize> {
+            self.inner.prune_retention(keep_k, min_age).await
+        }
+        fn supports_sharded_publish(&self) -> bool {
+            self.inner.supports_sharded_publish()
+        }
+        async fn read_root(
+            &self,
+        ) -> Result<Option<crate::services::catalog_snapshot_store::SnapshotRead>> {
+            self.inner.read_root().await
+        }
+        async fn latest_root_version(&self) -> Result<Option<u64>> {
+            self.inner.latest_root_version().await
+        }
+        async fn commit_shards(
+            &self,
+            generation: u64,
+            shards: &[(String, Vec<u8>)],
+        ) -> Result<crate::services::catalog_snapshot_store::ShardCommit> {
+            self.inner.commit_shards(generation, shards).await
+        }
+        async fn commit_root(
+            &self,
+            generation: u64,
+            expected_parent: Option<u64>,
+            root_bytes: &[u8],
+        ) -> Result<SnapshotWrite> {
+            let hook = self.hook.lock().take();
+            if let Some(hook) = hook {
+                hook.await?;
+            }
+            self.inner
+                .commit_root(generation, expected_parent, root_bytes)
+                .await
+        }
+        async fn read_shard(
+            &self,
+            account: &str,
+        ) -> Result<Option<crate::services::catalog_snapshot_store::SnapshotRead>> {
+            self.inner.read_shard(account).await
+        }
+        async fn read_shard_version(
+            &self,
+            account: &str,
+            version: u64,
+        ) -> Result<crate::services::catalog_snapshot_store::SnapshotRead> {
+            self.inner.read_shard_version(account, version).await
+        }
+        async fn read_identity_high_water(&self) -> Result<Option<Vec<u8>>> {
+            self.inner.read_identity_high_water().await
+        }
+        async fn write_identity_high_water(&self, bytes: &[u8]) -> Result<()> {
+            self.inner.write_identity_high_water(bytes).await
+        }
+        fn describe(&self) -> String {
+            self.inner.describe()
+        }
+    }
+
+    /// TD-SPINE-2 R4 (expected-parent CAS): another equal-generation owner's
+    /// root commit lands AFTER this pod's index-coverage check passed and
+    /// BEFORE its root CAS. The CAS is against the checked version, so this
+    /// pod publishes NO root (the DDL fails with the conflict error and the
+    /// pod adopts the other owner's root), and the other owner's account
+    /// survives. With the fresh-parent
+    /// read the commit would land over the other root and drop its account.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn root_commit_after_the_coverage_check_cannot_drop_the_other_owners_account()
+    -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let backing: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let acme = nslevels(&["acme", "sales"]);
+        let gamma = nslevels(&["gamma", "ops"]);
+        let beta = nslevels(&["beta", "eng"]);
+
+        // Seed: a root naming acme.
+        {
+            let seed = SystemCatalog::open_with_snapshot_store(
+                "default",
+                dir.path().join("seed.wal"),
+                object_store(&backing),
+            )
+            .await?;
+            seed.create_namespace_for_tenant(&acme, HashMap::new(), Some("acme"))
+                .await?;
+            create_named(&seed, &acme, "t").await?;
+        }
+        let inner = object_store(&backing);
+        let race = Arc::new(RootRaceStore {
+            inner: inner.clone(),
+            hook: parking_lot::Mutex::new(None),
+        });
+        let owner_a = SystemCatalog::open_with_snapshot_store(
+            "default",
+            dir.path().join("a.wal"),
+            race.clone(),
+        )
+        .await?;
+        let seed_root = inner.latest_root_version().await?;
+
+        // Arm: inside A's next commit_root, owner B (booted at the same root,
+        // so the same fencing generation) adds gamma and publishes a root.
+        let (b_wal, b_inner, b_gamma) = (dir.path().join("b.wal"), inner.clone(), gamma.clone());
+        *race.hook.lock() = Some(Box::pin(async move {
+            let owner_b =
+                SystemCatalog::open_with_snapshot_store("default", b_wal, b_inner).await?;
+            owner_b
+                .create_namespace_for_tenant(&b_gamma, HashMap::new(), Some("gamma"))
+                .await?;
+            create_named(&owner_b, &b_gamma, "t").await?;
+            Ok(())
+        }));
+
+        // A's DDL: its coverage check sees the seed root (seen), then B's
+        // root lands, then A's CAS runs against the checked seed version and
+        // refuses — surfaced as the conflict error.
+        let text = match owner_a
+            .create_namespace_for_tenant(&beta, HashMap::new(), Some("beta"))
+            .await
+        {
+            Ok(_) => panic!("the root CAS must refuse after another owner's root landed"),
+            Err(error) => format!("{error:#}"),
+        };
+        assert!(
+            text.contains("concurrent owner advanced the root"),
+            "{text}"
+        );
+        assert!(race.hook.lock().is_none(), "the race hook must have fired");
+        let b_tip = inner.latest_root_version().await?;
+        assert!(
+            b_tip > seed_root,
+            "B published a root inside the race window"
+        );
+
+        // A published no root over B's ...
+        let tip = inner.read_root().await?.expect("root");
+        let (_, _, _, _, index) = SystemCatalogState::decode_catalog_root(&tip.bytes)?;
+        assert!(
+            index.contains_key("gamma"),
+            "the other owner's account must survive in the root: {index:?}"
+        );
+        assert!(
+            !index.contains_key("beta"),
+            "A must not publish a root after losing the CAS: {index:?}"
+        );
+        // ... and adopted B's root.
+        assert!(
+            owner_a
+                .table_exists(&TableIdentifier::new(gamma.clone(), "t"))
+                .await?
+        );
+        // A fresh boot sees the other owner's account.
+        let fresh = SystemCatalog::open_with_snapshot_store(
+            "default",
+            dir.path().join("fresh.wal"),
+            object_store(&backing),
+        )
+        .await?;
+        assert!(
+            fresh
+                .table_exists(&TableIdentifier::new(gamma.clone(), "t"))
+                .await?
+        );
         Ok(())
     }
 

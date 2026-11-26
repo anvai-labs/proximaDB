@@ -102,15 +102,19 @@ sharded).
   `DrPathBuilder`** (structural isolation, carrying TD-CAT-2). A DDL publishes its account's shard and the root;
   followers adopt only changed shards. Bytes written per DDL become O(account), not O(fleet).
 +
-*Status 2026-11-25:* the root/shard split, changed-shard reload and the per-account floor are
-built (TD-SPINE-2, #2566), but the shards are **not** under the tenant prefix. They live at
-`_operator/catalog/_shards/{hex(account)}/`, beside the root at `_operator/catalog/_root/`
-(`DrPathBuilder::system_catalog_shard_manifests_subprefix`,
-`src/storage/trait_components/path_resolver.rs`). The tenant-prefix placement is **required and
-not yet built**; it is TD-SPINE-2 R1. The "implemented" note at the top of D1 covers the layout
-and the floor, not this placement. O(account) bytes per DDL is shown by a two-account unit test,
-not measured at fleet scale (TD-SPINE-2 R2), and the root and identity sidecar still carry
-fleet-wide account metadata.
+*Status 2026-11-26:* the root/shard split, changed-shard reload and the per-account floor are
+built (TD-SPINE-2, #2566), and since TD-SPINE-2 R1 each account's shard is **under its tenant
+prefix**: `data/{tenant_id}/_syscat/shard/`
+(`DrPathBuilder::system_catalog_tenant_shard_manifests_subprefix`,
+`src/storage/trait_components/path_resolver.rs`). The untenanted (`_default`) shard has no tenant
+and is operator-scoped at `_operator/catalog/_untenanted_shard/`. The root stays at
+`_operator/catalog/_root/`. The relocation is a pre-GA clean break: a root that names a shard
+missing at the new location fails boot and reload closed, and the retired
+`_operator/catalog/_shards/` layout is not read. The root commit is an expected-parent CAS
+against the version the coverage check read (R4). Shard I/O does not yet carry `TenantContext`,
+so catalog bytes are placed per tenant but not metered per tenant. O(account) bytes per DDL is
+shown by a two-account unit test, not measured at fleet scale (TD-SPINE-2 R2), and the root and
+identity sidecar still carry fleet-wide account metadata.
 . **Per-account namespace floor** for new allocations; existing stable ids are never renumbered
   (TD-SPINE-2; TD-NS-1 S4 separately fences the `CatalogIdService` minting path).
 
@@ -381,8 +385,8 @@ refer to `docs/_internal/roadmap/BENCHMARK_EVIDENCE.toml`.
 | G8
 | Tenant isolation is structural (`DrPathBuilder` `data/{tenant}/…`)
 | Per-account catalog shards live under the tenant's prefix
-| **Not met.** Shards live at `_operator/catalog/_shards/{hex(account)}/` (`src/storage/trait_components/path_resolver.rs`). D1.3 and TD-SPINE-2 Fix 1 claimed the tenant prefix.
-| TD-SPINE-2 R1 (required; pre-GA clean break, version bytes stay). TD-CAT-2's isolation goal points here.
+| **Met for shard placement (2026-11-26).** Each account's shard lives at `data/{tenant_id}/_syscat/shard/` (`DrPathBuilder::system_catalog_tenant_shard_manifests_subprefix`); evidence `ddl_shard_puts_land_under_the_accounts_tenant_prefix` and `root_naming_a_shard_missing_at_the_tenant_prefix_fails_closed` (`src/services/system_catalog.rs`). The root, the identity sidecar and the untenanted `_default` shard stay operator-scoped under `_operator/catalog/`. Catalog shard I/O does not carry `TenantContext` (not metered per tenant; G9 scope).
+| TD-SPINE-2 R1 (done; pre-GA clean break, version bytes stay). TD-CAT-2's isolation goal points here.
 
 | G9
 | Every I/O boundary is metered per tenant (co-design #5)

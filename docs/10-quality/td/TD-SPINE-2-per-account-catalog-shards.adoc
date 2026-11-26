@@ -5,7 +5,7 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | **Partial (reconciled 2026-11-25).** #2566 (97f46b34f, merged 2026-11-24 UTC) delivered envelope-framed root and shard logs, the per-account namespace floor and changed-shard reload; see Evidence. Not delivered: the tenant-prefix placement that Fix 1 requires, a fleet-scale measurement of bytes per DDL, and three review follow-ups. See Remaining scope (2026-11-25). (Was: "Implemented (2026-11-22) — PR pending". Before that it was Open, blocked on TD-SPINE-1; both landed together in #2566.)
+| Status | **Partial (updated 2026-11-26).** #2566 (97f46b34f, merged 2026-11-24 UTC) delivered envelope-framed root and shard logs, the per-account namespace floor and changed-shard reload; see Evidence. R1 (shards under the tenant prefix) and R4 (expected-parent root CAS) are done in the 2026-11-26 PR; see "Evidence (2026-11-26)". Still open: R2 (fleet-scale bytes-per-DDL measurement), R3 (generation-only legacy probe) and R5 (root/shard log pruning). See Remaining scope (2026-11-25). (Was: "Implemented (2026-11-22) — PR pending". Before that it was Open, blocked on TD-SPINE-1; both landed together in #2566.)
 | Priority | **HIGH** for multi-tenant SaaS scale. Cost and recovery time grow with the whole fleet's catalog, and one tenant's DDL rewrites every tenant's metadata.
 | Component | `src/services/system_catalog_state.rs` (root/shard records, `to_root_bytes` / `to_shard_bytes` / `from_root_and_shards` / `load_shard_bytes`, per-account ns high-water); `src/services/system_catalog.rs` (`checkpoint_sharded_locked`, `reload_sharded_locked`, sharded `open_inner` boot + migration, per-account `NamespaceIdAllocator`); `src/services/catalog_snapshot_store.rs` (sharded trait surface + `ObjectStoreSnapshotStore` root/shard manifest logs); `src/storage/trait_components/path_resolver.rs` (root/shard prefixes).
 | Authority | link:../../12-design/adr/ADR-098-metadata-spine.adoc[ADR-098] D1.3–D1.4
@@ -32,6 +32,9 @@
   met (R1 below). The hex encoding gives each account its own key prefix, but
   that is a naming convention inside a shared operator prefix, not
   structural isolation.
+  *R1 (2026-11-26):* shards now live under the tenant prefix. See
+  "R1/R4 implementation (2026-11-26)" below; the root and the legacy
+  whole-image log stay under `_operator/catalog/`.
 * **Publish protocol.** A commit records the touched accounts (shard key =
   namespace tenant, `_default` when none; DropNamespace resolves pre-fold).
   `checkpoint_sharded_locked` commits those shards, then the root naming the
@@ -264,7 +267,8 @@
 Each item below needs evidence (a test name, CI run or ledger id) before this TD may read
 Implemented. Owner mapping: ADR-098 "Completion ledger (2026-11-25)" G7 and G8.
 
-* **R1. Relocate shards under the tenant prefix (G8; required).** Build each account's shard log
+* **R1. Relocate shards under the tenant prefix (G8; required). DONE 2026-11-26**, see
+  "R1/R4 implementation (2026-11-26)" and "Evidence (2026-11-26)". Build each account's shard log
   key with `DrPathBuilder` under that tenant's `data/{tenant_id}/…` prefix. The exact sub-path is
   chosen in the PR. The root, which holds global registries, id high-waters and the shard index,
   stays operator-scoped under `_operator/catalog/_root/`, and the PR records where the `_default`
@@ -290,7 +294,8 @@ Implemented. Owner mapping: ADR-098 "Completion ledger (2026-11-25)" G7 and G8.
   payload starts with the 8-byte generation). *Acceptance:* a counting-backend test shows that an
   ON boot with a legacy log present reads at most the generation prefix of the legacy tip, unless
   that image outranks the root and must be adopted.
-* **R4. Expected-parent CAS (closes the check-then-commit TOCTOU).** Found as a LOW in the #2566
+* **R4. Expected-parent CAS (closes the check-then-commit TOCTOU). DONE 2026-11-26**, see
+  "Evidence (2026-11-26)". Found as a LOW in the #2566
   review. `checkpoint_sharded_locked` reads the root tip for the index-coverage check and then
   commits against a parent it reads again (`commit_root` calls `latest_version()`), so a root
   commit that lands between the check and the commit is not covered by the check. Commit the root
@@ -306,3 +311,85 @@ Implemented. Owner mapping: ADR-098 "Completion ledger (2026-11-25)" G7 and G8.
   the tip, best-effort deletes, a failed delete never fails the DDL). *Acceptance:* after N DDLs
   on one account, the root log and that account's shard log each hold at most k objects. A
   follower one version behind still reloads. A failing delete leaves the DDL successful.
+
+== R1/R4 implementation (2026-11-26)
+
+* **Layout.** A tenant's shard log is
+  `data/{tenant_id}/_syscat/shard/` — built by
+  `DrPathBuilder::system_catalog_tenant_shard_manifests_subprefix`, which is
+  `build_tenant_system(None, tenant)` + `DrTenantSystemPath::system_catalog_shard_subprefix`
+  (`src/storage/trait_components/path_resolver.rs`); the store resolves it in
+  `catalog_shard_manifests_prefix` (`src/services/catalog_snapshot_store.rs`). Example: account
+  `acme` writes `data/acme/_syscat/shard/v00000000000000000000.manifest`. `_syscat` is the
+  existing reserved per-tenant system-catalog segment (`validate_id` refuses it as a user id);
+  the `shard/` leaf is disjoint from the NativeCatalog `_syscat/` names. The root stays at
+  `_operator/catalog/_root/`, the legacy whole-image log at `_operator/catalog/_manifests/`
+  and the identity sidecar at `_operator/catalog/identity_high_water`.
+* **`_default` (untenanted) shard.** `_operator/catalog/_untenanted_shard/`. Namespaces created
+  with no tenant have no tenant prefix to live under. They are the deployment's own objects (the
+  single-tenant / OSS default), so they stay operator-scoped beside the root. Putting them under
+  `data/default/` would alias a real tenant called `default`.
+* **Injective mapping, no escaping.** The previous hex encoding is retired. A tenant id that is
+  a valid `DrPathBuilder` segment maps to itself, and `_default` is the only key mapped outside
+  `data/`. `SystemCatalog::create_namespace_inner` now refuses a tenant id that fails
+  `DrPathBuilder::validate_id` (separators, whitespace, non-ASCII, `..`, reserved segments) and
+  the tenant id `_default` (it would alias the untenanted shard). The refusal happens before the
+  WAL append. A key that still fails at commit time (for example from an image written before
+  this check) fails the checkpoint closed with "cannot be placed under a tenant prefix". It is
+  never re-encoded into a prefix another tenant could own. *Breaking change (accepted pre-GA):*
+  tenant ids that are not path-safe were accepted before and are refused now.
+* **Fail closed on a missing shard.** `read_shard_version` reads only the relocated prefix. A
+  root that names a shard version missing there fails boot and every follower reload with an
+  error that names the account, the version, the expected prefix and the operator step. It never
+  falls back to `_operator/catalog/_shards/`, and the follower keeps serving its last adopted
+  image.
+* **Operator step for a store written by #2566 (not tested here; it needs the old binary).**
+  (1) Boot the #2566-era binary once with `PROXIMADB_CATALOG_SHARDED_SNAPSHOT_DISABLE=1`. That
+  re-seeds the legacy whole-image log with the full image. (2) Delete the `_operator/catalog/_root/`
+  and `_operator/catalog/_shards/` prefixes. (3) Boot the new binary; it migrates the legacy image
+  to root + relocated shards. The alternative is restoring the object store.
+* **R4.** `CatalogSnapshotStore::commit_root` now takes `expected_parent`. `checkpoint_sharded_locked`
+  passes the root version its coverage check covered: the probed tip, or the tip whose payload
+  it decoded. `ObjectStoreSnapshotStore::commit_root` passes that parent straight to
+  `ManifestCommitter::commit_fenced`, which returns `Conflict` when `parent != latest`. There is
+  no re-read, so a root another owner commits between the check and the CAS refuses the commit.
+  The pod reloads the winner's root. If the winner has a higher generation, the pod steps down to
+  read-only, as before. At an equal generation (the dual-boot model), the DDL fails with the same
+  "concurrent owner advanced the root … restart it and retry the DDL" error as the coverage-check
+  refusal, and the pending shards stay queued for the retry.
+* **Metering / `TenantContext`.** Not plumbed. Catalog shard I/O goes through the snapshot
+  store's untenanted `ProximaObjectStore` handle; `CatalogSnapshotStore` carries no
+  `TenantContext`, so shard bytes are not attributed to the tenant's meters yet. The placement is
+  structural; the per-tenant billing of catalog bytes is a separate gap.
+
+== Evidence (2026-11-26)
+
+* **R1, counting backend:** `ddl_shard_puts_land_under_the_accounts_tenant_prefix`
+  (`src/services/system_catalog.rs`). A DDL in `small-tenant` PUTs its shard under
+  `data/small-tenant/`; every other PUT is the operator root or the identity sidecar; no PUT is
+  under `_operator/catalog/_shards/`. A following DDL in `big-tenant` PUTs nothing under
+  `data/small-tenant/`. Mutation: building shard prefixes from the retired
+  `_operator/catalog/_shards/{hex}/` layout turns it red.
+* **R1, layout:** `shard_objects_land_under_their_tenant_prefix_root_stays_operator_scoped`
+  (`src/services/catalog_snapshot_store.rs`) lists every key written for two tenants plus
+  `_default` and a root; `system_catalog_tenant_shard_prefix_is_under_the_tenant_root`
+  (`path_resolver.rs`) pins disjoint per-tenant prefixes and refuses hostile ids;
+  `shard_commit_refuses_an_account_that_is_not_a_tenant_segment` and
+  `namespace_tenant_must_be_a_valid_tenant_segment` pin the refusals.
+* **R1, fail closed:** `root_naming_a_shard_missing_at_the_tenant_prefix_fails_closed`
+  (`system_catalog.rs`). The shard objects are moved to the retired layout. The follower reload
+  fails and keeps serving its old image; a fresh boot fails with the actionable error.
+  `missing_relocated_shard_fails_closed_and_ignores_the_retired_layout` (store level) pins that
+  no dual read happens.
+* **R1, cross-pod reload adopts relocated shards:** `follower_reload_adopts_only_the_changed_shard`
+  now matches the relocated prefix: the follower GETs `data/small-tenant/_syscat/shard/` and
+  never `data/big-tenant/_syscat/shard/`. The cross-pod suite named in "Evidence (2026-11-22)"
+  runs on the relocated layout and stays green.
+* **R4:** `root_commit_after_the_coverage_check_cannot_drop_the_other_owners_account`
+  (`system_catalog.rs`). A store double runs owner B's DDL (same fencing generation) at the start
+  of owner A's `commit_root`, after A's coverage check. A's DDL fails with the conflict error,
+  A publishes no root and adopts B's root, and the root tip and a fresh boot both still hold B's
+  account. Mutation: making
+  `commit_root` re-read `latest_version()` as the parent turns it red (A's root lands without B's
+  account). Store level: `root_commit_refuses_a_stale_expected_parent`.
+
