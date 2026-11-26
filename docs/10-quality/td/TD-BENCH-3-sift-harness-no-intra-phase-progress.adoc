@@ -21,7 +21,7 @@ under concurrent compile load and never stuck: 46 search requests, 45 completed 
 object_store request timeout firing once and its retry succeeding (the affected query completed
 with 100 results), and search completions continuing right up to SIGTERM. The harness prints ONE
 line per PHASE (`{phase}: recall@…`), only after all of that phase's queries finish — so a phase
-running at ~7-12 s/query under contention (vs ~1 s clean) produces no output for many minutes and
+running at a per-query median of ~7 s (range 0.9–38 s) under contention (vs ~1 s clean) produces no output for many minutes and
 reads exactly like a hang from the outside.
 
 == The gap

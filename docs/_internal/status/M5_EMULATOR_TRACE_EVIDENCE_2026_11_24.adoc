@@ -7,13 +7,13 @@
 | Date | 2026-11-24
 | Version | worktree bench/m5-emulator-trace @ 51a20902f (develop base ea77dea50; carries the `PROXIMADB_WAREHOUSE_ROOT_URL` seam + the latency-floor bench `store_for_url` rerouting from the same PR). SIFT binaries: `--profile release-server --features proximadb/io-trace,proximadb/aws`, sha256 f327599a7152…; the binary was built inside the seam-edit window — the harness's guard only verifies a CLEAN TREE at run time, not binary provenance, so the binary may differ from the recorded revision by formatting-only deltas; the seam is inert with the gate unset, and no SIFT leg touches the warehouse path.
 | Hardware | Apple Silicon arm64, 64 GB, macOS, Docker Desktop. NOT a quiet machine throughout: the SIFT1M leg-1 phase sweeps, the RTT50(b)/RTT100 arms, (briefly) the pgwire leg, and the RTT150 arm overlapped background release compiles — the affected latency rows are marked ⚑ and are upper bounds; the floor-bench legs and the clean RTT50 re-run ran with no compile jobs. Every latency figure below is shape evidence only. Counts and recall are request-deterministic on these fixtures and are the durable quantities. Indicative dev-machine evidence, not an SLA.
-| Storage regime | **MinIO S3 emulator** (docker `minio/minio:latest`, container `m5-minio`, 127.0.0.1:9000, path-style, creds `m5bench`). Request counts are emulator-measured; **latency legs are emulator-local (Docker NAT ≈ 4-7 ms/op steady-state) or toxiproxy-injected** — neither is real-cloud latency.
+| Storage regime | **MinIO S3 emulator** (docker `minio/minio:latest`, container `m5-minio`, 127.0.0.1:9000, path-style, throwaway emulator creds passed via env — redacted here as `…`). Request counts are emulator-measured; **latency legs are emulator-local (Docker NAT ≈ 4-7 ms/op steady-state) or toxiproxy-injected** — neither is real-cloud latency.
 |===
 
 == 1. SIFT1M request counts + behavior, shipped defaults (AT_FLUSH ON) — exit 0
 
 ....
-AWS_ACCESS_KEY_ID=m5bench AWS_SECRET_ACCESS_KEY=m5bench-secret \
+AWS_ACCESS_KEY_ID=… AWS_SECRET_ACCESS_KEY=… \
   python3 scripts/bench/sift1m_get_reduction.py \
   --root /tmp/m5-bench/sift1m-minio-on \
   --binary target/release-server/proximadb-server \
@@ -81,9 +81,11 @@ Toxiproxy 2.12.0 (docker `m5-toxiproxy`), proxy 127.0.0.1:9100 → MinIO, symmet
 was killed mid-phase on a misread "hang" — see Incidents; it was slow, never stuck). GET/q and
 recall are RTT-invariant (counts, not latency); p50s are the latency shape. Arms marked ⚑ ran
 while a release build compiled in the background — treat those p50s as upper bounds (the
-contention signal is the RTT50 PAIR's qps: 0.29-0.31 for the two contended 25q arms vs 1.07-1.34
-for the clean re-runs; no qps was recorded for the other legs, so the marker there rests on the
-build-calendar, not a measured signal).
+contention signal is the RTT50 PAIR's qps: 0.23-0.31 for the contended 25q arm's phases vs
+1.07-1.34 for the clean re-run's; the other arms' qps — RTT100 0.89-1.15, RTT150 0.44-0.74, the
+direct object_cold rung 1.05 — do not separate cleanly from the clean pair, so the marker there
+rests on the build calendar, not on a measured signal; all qps lines are in
+link:m5_raw_rtt_ladder_inputs.txt[`docs/_internal/status/m5_raw_rtt_ladder_inputs.txt`]).
 
 [cols="1,1,1,1,1,1,1", options="header"]
 |===
@@ -107,10 +109,10 @@ link couples RTT with limited bandwidth; these localhost shapes bound nothing ab
 == 4. pgwire TD-SPINE-4 manifest levers with an S3-warehouse — HARDENED test, exit 0 (2.0 s)
 
 ....
-PROXIMADB_WAREHOUSE_ROOT_URL=s3://proximadb-m5/pgwire-mlev \
+PROXIMADB_WAREHOUSE_ROOT_URL=s3://proximadb-m5/pgwire-mlev-r3 \
 AWS_ENDPOINT=http://127.0.0.1:9000 AWS_ALLOW_HTTP=true \
 AWS_VIRTUAL_HOSTED_STYLE_REQUEST=false AWS_REGION=us-east-1 \
-AWS_ACCESS_KEY_ID=m5bench AWS_SECRET_ACCESS_KEY=m5bench-secret RUST_MIN_STACK=8388608 \
+AWS_ACCESS_KEY_ID=… AWS_SECRET_ACCESS_KEY=… RUST_MIN_STACK=8388608 \
   target/release/…/tpc_perf_ledger_e2e-… manifest_levers_cut_footer_gets_over_pgwire_object_store \
   -- --ignored --exact --nocapture --test-threads=1
 ....
@@ -119,20 +121,24 @@ RE-MEASURED 2026-11-25 (review round 3, MED-1) with the HARDENED test (the round
 a FRESH prefix (`s3://proximadb-m5/pgwire-mlev-r3`): the guard printed "holds 13 objects (13 fresh
 this run; mlevos_25693_1795608241360 parts + metadata)" — the per-run table name and the
 list-before/list-after diff both fired, and get_ops is ASSERTED (pinned to these counts), not just
-printed. (The round-1 numbers below came from the pre-hardening test; the re-run's counts are
-IDENTICAL — bytes differ slightly with the fresh metadata payload. Raw output:
-`m5_raw_pgwire_hardened.txt`.) Per-query io_trace:
+printed. Every figure in the table below is from that HARDENED run (round 4, MED-1 — the table
+previously still quoted the pre-hardening run's bytes). Its counts are IDENTICAL to the
+pre-hardening run's; its bytes are ~1.39× larger (92,053 vs 66,436 and 146,701 vs 105,838 for the
+before-mode queries; 1.33-1.42× across the after-mode rows) — attributed to the fresh run's
+metadata payload, not otherwise investigated. Raw output:
+link:m5_raw_pgwire_hardened.txt[`docs/_internal/status/m5_raw_pgwire_hardened.txt`]. Per-query
+io_trace:
 
 [cols="2,1,1,1,1,1", options="header"]
 |===
 | Query (mode) | get_ops | range_gets | bytes_read | footer_reads | files_pruned
-| `id <= 250` before (both temps) | 13 | 7 | 66,436 | 4 | 0
-| `id <= 250` after, first (cache miss) | 7 | 4 | 31,441 | 1 | 3
-| `id <= 250` after, repeat (cache hit) | 4 | 4 | 24,799 | 1 | 3
-| `id > 750` before (both) | 13 | 7 | 66,436 | 4 | 0
-| `id > 750` after (both) | 6 | 5 | 36,464 | 2 | 3
-| `id > 0` before (both) — negative control | 19 | 16 | 105,838 | 4 | 0
-| `id > 0` after (both) — negative control | 16 | 16 | 99,196 | 4 | 0
+| `id <= 250` before (both temps) | 13 | 7 | 92,053 | 4 | 0
+| `id <= 250` after, first (cache miss) | 7 | 4 | 41,812 | 1 | 3
+| `id <= 250` after, repeat (cache hit) | 4 | 4 | 34,963 | 1 | 3
+| `id > 750` before (both) | 13 | 7 | 92,053 | 4 | 0
+| `id > 750` after (both) | 6 | 5 | 51,710 | 2 | 3
+| `id > 0` before (both) — negative control | 19 | 16 | 146,701 | 4 | 0
+| `id > 0` after (both) — negative control | 16 | 16 | 139,852 | 4 | 0
 |===
 
 Manifest cache hit/miss: 0/1 on the first lever-on query, 1/0 thereafter. Answers identical in every
@@ -161,7 +167,7 @@ last-4KiB tail ranges of each object size (the footer-read shape), not ranges of
 Failed operations COUNT AS SAMPLES (the bench records a failing op's observed latency and emits
 no error counts), and every cell is 10 warmup + 50 timed iterations (200 direct). All p50s in
 this table are transcribed from the run's raw stdout (now committed beside this artifact — see
-`m5_raw_floor_bench.txt`; the whole-GET 64 KiB column was added in review round 2 against that
+link:m5_raw_floor_bench.txt[`docs/_internal/status/m5_raw_floor_bench.txt`]; the whole-GET 64 KiB column was added in review round 2 against that
 output, not from memory). These are FLOOR shapes on an emulator — the numbers a route-cost model
 must beat, not cloud SLAs.
 
@@ -170,7 +176,8 @@ must beat, not cloud SLAs.
 * **Apparent hang at RTT50 — RESOLVED AS NOT A HANG (round 3, verified against the run's complete
   server log; the previously filed the withdrawn S3-stall TD is WITHDRAWN and
   link:../../10-quality/td/TD-BENCH-3-sift-harness-no-intra-phase-progress.adoc[TD-BENCH-3]
-  records the real gap):** the first 50 ms ladder attempt (100 queries) was killed mid-phase in
+  records the real gap; the log excerpt and derived timeline are committed as
+  link:m5_raw_rtt_ladder_inputs.txt[`docs/_internal/status/m5_raw_rtt_ladder_inputs.txt`]):** the first 50 ms ladder attempt (100 queries) was killed mid-phase in
   the belief the server had blocked on a proxy-torn connection. The log shows the opposite:
   server lifetime 23:02:42.954Z → SIGTERM 23:10:09.357Z (7 min 26 s total — which rules out any
   multi-minute block); 46 search requests, 45 completed, the 46th 6.3 s in flight at
@@ -178,14 +185,16 @@ must beat, not cloud SLAs.
   One query hit the store's default request timeout ("Encountered error while reading response
   body … Retrying in 0.1s", exactly 30.00 s after that search started) and its RETRY SUCCEEDED
   (completed in 38,016 ms, 100 results). The run was SLOW under concurrent compile load
-  (~7-12 s/query vs ~0.9 s clean) and never stuck; the harness prints only at phase end, so a
+  (per-query median ~7 s, range 0.9–38 s, vs ~0.9 s clean) and never stuck; the harness prints only at phase end, so a
   slow phase reads as a hang from the outside. The kill left no result.json (my round-1-2 claim
   that it "records the partial phase" was wrong).
 * **Compile contention — THE authoritative contended-arm list (the ledger points here and does
   not re-enumerate):** the leg-1 SIFT1M phase sweeps (including the 833 ms direct rung), the
   first RTT50 25q re-run, the RTT100 arm, the RTT150 arm, and briefly the pgwire leg overlapped
-  background release builds (visible as qps 0.29-0.31 vs 1.07-1.34 on the clean runs); their
-  p50s are upper bounds, marked ⚑ where they appear in tables. A clean RTT50 re-run landed
+  background release builds. Only the RTT50 PAIR shows it in a measured signal (qps 0.23-0.31
+  contended vs 1.07-1.34 clean); the other arms' qps (RTT100 0.89-1.15, RTT150 0.44-0.74, the
+  direct object_cold rung 1.05) do not separate cleanly, so their marker rests on the build
+  calendar. Their p50s are upper bounds, marked ⚑ where they appear in tables. A clean RTT50 re-run landed
   (770 ms cold p50 vs the contended arm's 2,234 ms at the same injected RTT) and is the
   authoritative 50 ms row.
 * **Dirty-worktree guard firings (2):** two ladder launches were refused by the harness's own

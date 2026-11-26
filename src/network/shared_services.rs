@@ -4409,6 +4409,7 @@ mod abac_composition_root_tests {
 #[cfg(test)]
 mod warehouse_root_tests {
     use super::{resolve_warehouse_root, warehouse_root_url};
+    use serial_test::serial;
     use std::path::{Path, PathBuf};
 
     fn lookup<'a>(map: &'a [(&'static str, &'static str)]) -> impl Fn(&str) -> Option<String> + 'a {
@@ -4501,12 +4502,16 @@ mod warehouse_root_tests {
     }
 
     /// Round 3 (L5): the production entry point (the one the network call
-    /// sites use) really reads the environment — set, observe, unset. Runs
-    /// under nextest's process-per-test isolation.
+    /// sites use) really reads the environment — set, observe, unset.
+    /// `#[serial]` holds the crate's shared env lock so the plain libtest
+    /// runner (shared process) cannot interleave another env-touching test.
     #[test]
+    #[serial]
     fn production_entry_point_reads_the_environment() {
-        // SAFETY: nextest isolates this test in its own process; the variable
-        // is removed before the assertions that must not see it.
+        // SAFETY: the `#[serial]` lock (and nextest's process-per-test
+        // isolation) keeps other env-touching tests out while this mutates
+        // the process environment; the variable is removed before the
+        // assertions that must not see it.
         unsafe {
             std::env::set_var(
                 "PROXIMADB_WAREHOUSE_ROOT_URL",
