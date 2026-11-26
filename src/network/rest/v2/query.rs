@@ -149,7 +149,7 @@ pub async fn execute_query(
         }
         // MED-4/MED-3 (round-1 review): client-shaped port rejections map to
         // 4xx — a read-only-policy violation (DDL/DML on this query surface)
-        // is a 400 naming the policy (the AQL placeholder too); a missing
+        // is a 400 naming the policy (unsupported AQL is a 400 too); a missing
         // identity is a 401. L5 (round 2): no write-surface suffix is
         // appended here — the port's policy rejection already names
         // /api/v2/sql, and a READ that merely failed to parse must not be
