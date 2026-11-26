@@ -2990,3 +2990,271 @@ async fn manifest_levers_cut_footer_gets_over_pgwire() {
     assert_eq!(results[&("last_file", false)], expect(751..=1000));
     assert_eq!(results[&("all_files", false)], expect(1..=1000));
 }
+
+/// ADR-098 M5 emulator leg (TD-SPINE-4): the SAME manifest-lever evidence as
+/// [`manifest_levers_cut_footer_gets_over_pgwire`], but the MATERIALIZEd
+/// table's Parquet parts live on an OBJECT STORE pointed at by
+/// `PROXIMADB_WAREHOUSE_ROOT_URL` (e.g. `s3://bucket/prefix` on a MinIO or
+/// LocalStack emulator) instead of the `file://{data_dir}/warehouse` default.
+/// Counts only — emulator latency is not evidence (same posture as the
+/// TD-PAXMETA-1 SIFT request-count harness).
+///
+/// `#[ignore]`d + env-gated like the other emulator proofs. When the env is
+/// unset the test prints a loud `SKIP (not run)` line and RETURNS — which
+/// libtest (and therefore CI's advisory `--ignored` lane) reports as `ok`;
+/// that is the documented repo convention for `#[ignore]`d emulator tests
+/// (see `put_with_tier_accepted_by_s3_emulator`) and is accepted because no
+/// merge lane runs the `--ignored` lane without the emulator env contract.
+/// Run with the S3 env contract the object_store builder reads (the qa
+/// scope's s3:// restart set):
+///
+/// ```text
+/// PROXIMADB_WAREHOUSE_ROOT_URL=s3://bucket/m5-pgwire \
+/// AWS_ENDPOINT=http://127.0.0.1:9000 AWS_ALLOW_HTTP=true \
+/// AWS_VIRTUAL_HOSTED_STYLE_REQUEST=false AWS_REGION=us-east-1 \
+/// AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=... \
+/// cargo test -p proximadb --features io-trace,aws --test tpc_perf_ledger_e2e \
+///   manifest_levers_cut_footer_gets_over_pgwire_object_store -- --ignored --nocapture
+/// ```
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs an object-store warehouse — set PROXIMADB_WAREHOUSE_ROOT_URL + the S3 emulator env"]
+async fn manifest_levers_cut_footer_gets_over_pgwire_object_store() {
+    const KILL_SWITCHES: [&str; 3] = [
+        "PROXIMADB_OLAP_MANIFEST_CACHE_DISABLE",
+        "PROXIMADB_OLAP_MANIFEST_PRUNE_DISABLE",
+        "PROXIMADB_OLAP_LAZY_FOOTER_DISABLE",
+    ];
+    // MED-5 (review round 1): an unset env must SKIP, and libtest reports a
+    // returned test as `ok` — accepted per the repo's `#[ignore]`d
+    // emulator-test convention (see `put_with_tier_accepted_by_s3_emulator`)
+    // because the `--ignored` lane is advisory: no merge lane runs it, and
+    // the emulator scopes that do always set the env. The loud SKIP line is
+    // the first thing a hand-run without an emulator prints.
+    let Ok(warehouse_root) = std::env::var("PROXIMADB_WAREHOUSE_ROOT_URL") else {
+        eprintln!(
+            "SKIP (not run): manifest_levers_cut_footer_gets_over_pgwire_object_store needs \
+             PROXIMADB_WAREHOUSE_ROOT_URL (e.g. s3://bucket/prefix) plus the S3 emulator env \
+             contract (AWS_ENDPOINT, AWS_ALLOW_HTTP=true, \
+             AWS_VIRTUAL_HOSTED_STYLE_REQUEST=false, keys)"
+        );
+        return;
+    };
+    if !warehouse_root.contains("://") {
+        panic!("PROXIMADB_WAREHOUSE_ROOT_URL must be a URL with a scheme, got {warehouse_root}");
+    }
+    // MED-5: stale-proof fixture — a per-run table name (pid + millis) AND a
+    // list-before/list-after diff, so leftovers from an earlier run under
+    // the same prefix can never satisfy the parts-on-object-store guard.
+    let table = format!(
+        "mlevos_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0)
+    );
+    let parts_probe = proximadb_object_store::ProximaObjectStore::from_url(&warehouse_root)
+        .expect("open the warehouse root object store");
+    let before_parts: Vec<String> = parts_probe
+        .list(None)
+        .await
+        .expect("list the warehouse root (before)")
+        .into_iter()
+        .map(|meta| meta.location.to_string())
+        .collect();
+    let server = TestPgServer::start().await.expect("server start");
+    io_trace::set_billing_observer(Some(Box::new(|snap: &IoTraceSnapshot, _tenant| {
+        CAPTURE.lock().expect("capture lock").push(snap.clone());
+    })));
+    let client = connect(&server).await;
+    let _ = client
+        .simple_query(&format!("DROP TABLE IF EXISTS {table}"))
+        .await;
+    client
+        .simple_query(&format!("CREATE TABLE {table} (id INT, v INT)"))
+        .await
+        .expect("create");
+    for part in 0..4 {
+        let rows: Vec<String> = (1..=250)
+            .map(|i| {
+                let id = part * 250 + i;
+                format!("({id}, {})", id % 7)
+            })
+            .collect();
+        for sql in chunked_inserts(&table, "id, v", rows, 250) {
+            client.simple_query(&sql).await.expect("insert");
+        }
+        client
+            .simple_query(&format!("ALTER TABLE {table} MATERIALIZE"))
+            .await
+            .unwrap_or_else(|e| panic!("materialize: {}", pg_server::db_err(&e)));
+    }
+    // The parts MUST be on the object store, or this silently measures the
+    // file:// default again (the vacuity class TD-CI-7 exists to prevent) —
+    // and they must be NEW objects this run published (the before/after
+    // diff), not stale leftovers under the same prefix.
+    {
+        let after_parts: Vec<String> = parts_probe
+            .list(None)
+            .await
+            .expect("list the warehouse root (after)")
+            .into_iter()
+            .map(|meta| meta.location.to_string())
+            .collect();
+        let fresh: Vec<&String> = after_parts
+            .iter()
+            .filter(|key| !before_parts.contains(key))
+            .collect();
+        assert!(
+            fresh.iter().any(|key| key.contains(&table)),
+            "no fresh {table} objects under {warehouse_root}: MATERIALIZE did not publish \
+             to the overridden warehouse root (is PROXIMADB_WAREHOUSE_ROOT_URL honored?)"
+        );
+        eprintln!(
+            "TD-SPINE-4 M5 emulator: warehouse root {warehouse_root} holds {} objects \
+             ({} fresh this run; {table} parts + metadata)",
+            after_parts.len(),
+            fresh.len()
+        );
+    }
+    // (name, sql, footers with the levers on, files pruned, get_ops with the
+    // levers on [first, repeat]) — get_ops is now ASSERTED (MED-5), pinned to
+    // the same counts the file:// twin measured.
+    let queries: Vec<(&str, String, u64, u64, [u64; 2])> = vec![
+        (
+            "first_file",
+            format!("SELECT SUM(v), COUNT(*) FROM {table} WHERE id <= 250"),
+            1,
+            3,
+            [7, 4],
+        ),
+        (
+            "last_file",
+            format!("SELECT SUM(v), COUNT(*) FROM {table} WHERE id > 750"),
+            2,
+            3,
+            [6, 6],
+        ),
+        (
+            "all_files",
+            format!("SELECT SUM(v), COUNT(*) FROM {table} WHERE id > 0"),
+            4,
+            0,
+            [16, 16],
+        ),
+    ];
+    let set_switches = |on: bool| {
+        // SAFETY: nextest runs this test in its own process; the switches are
+        // read per table open, between queries.
+        unsafe {
+            for k in KILL_SWITCHES {
+                if on {
+                    std::env::set_var(k, "1");
+                } else {
+                    std::env::remove_var(k);
+                }
+            }
+        }
+    };
+    let answer = |msgs: &[SimpleQueryMessage]| -> Vec<String> {
+        msgs.iter()
+            .filter_map(|m| match m {
+                SimpleQueryMessage::Row(r) => Some(
+                    (0..r.len())
+                        .map(|i| r.get(i).unwrap_or("NULL").to_string())
+                        .collect::<Vec<_>>()
+                        .join(","),
+                ),
+                _ => None,
+            })
+            .collect()
+    };
+    let mut results: std::collections::HashMap<(&str, bool), Vec<String>> =
+        std::collections::HashMap::new();
+    for kill in [true, false] {
+        set_switches(kill);
+        let mode = if kill {
+            "before(kill-switches)"
+        } else {
+            "after(levers on)"
+        };
+        for (name, sql, lazy_footers, pruned, lever_get_ops) in &queries {
+            for (round, temperature) in ["first", "repeat"].into_iter().enumerate() {
+                CAPTURE.lock().expect("lock").clear();
+                let msgs = client
+                    .simple_query(sql)
+                    .await
+                    .unwrap_or_else(|e| panic!("{name}: {}", pg_server::db_err(&e)));
+                let mut snap = IoTraceSnapshot::default();
+                for _ in 0..200 {
+                    if let Some(s) = CAPTURE.lock().expect("lock").pop() {
+                        snap = s;
+                        break;
+                    }
+                    sleep(Duration::from_millis(5)).await;
+                }
+                // MED-5: get_ops is ASSERTED, not just printed — a snapshot
+                // that was never captured (all-zero default) fails here
+                // instead of vacuously passing.
+                assert!(
+                    snap.get_ops > 0,
+                    "{name} {temperature}: no io_trace snapshot captured (get_ops=0)"
+                );
+                eprintln!(
+                    "TD-SPINE-4 M5 emulator {mode} {name} {temperature}: get_ops={} list_ops={} \
+                     range_gets={} bytes_read={} footer_reads={} files_pruned={} \
+                     manifest_cache hit/miss={}/{}",
+                    snap.get_ops,
+                    snap.list_ops,
+                    snap.range_gets,
+                    snap.bytes_read,
+                    snap.parquet_footer_reads,
+                    snap.manifest_files_pruned,
+                    snap.manifest_cache_hits,
+                    snap.manifest_cache_misses,
+                );
+                let rows = answer(&msgs);
+                let previous = results.entry((*name, kill)).or_insert_with(|| rows.clone());
+                assert_eq!(previous, &rows, "{name}: repeat changed the answer");
+                if kill {
+                    assert_eq!(snap.parquet_footer_reads, 4, "{name}: eager reads all four");
+                    assert_eq!(snap.manifest_files_pruned, 0, "{name}: pruning off");
+                    let eager = if *name == "all_files" { 19 } else { 13 };
+                    assert_eq!(
+                        snap.get_ops, eager,
+                        "{name} {temperature}: kill-switch GET count"
+                    );
+                } else {
+                    assert_eq!(
+                        snap.parquet_footer_reads, *lazy_footers,
+                        "{name}: lazy footers read only the kept files + the schema source"
+                    );
+                    assert_eq!(
+                        snap.manifest_files_pruned, *pruned,
+                        "{name}: files pruned by manifest bounds"
+                    );
+                    assert_eq!(
+                        snap.get_ops, lever_get_ops[round],
+                        "{name} {temperature}: lever-on GET count"
+                    );
+                }
+            }
+        }
+    }
+    set_switches(false);
+    for (name, _, _, _, _) in &queries {
+        assert_eq!(
+            results[&(*name, true)],
+            results[&(*name, false)],
+            "{name}: the levers must not change the answer"
+        );
+    }
+    let expect = |ids: std::ops::RangeInclusive<i64>| {
+        let count = ids.clone().count();
+        let sum: i64 = ids.map(|id| id % 7).sum();
+        vec![format!("{sum},{count}")]
+    };
+    assert_eq!(results[&("first_file", false)], expect(1..=250));
+    assert_eq!(results[&("last_file", false)], expect(751..=1000));
+    assert_eq!(results[&("all_files", false)], expect(1..=1000));
+}

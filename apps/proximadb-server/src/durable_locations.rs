@@ -177,6 +177,33 @@ pub(crate) fn effective_durable_locations(
     if let Some(path) = env("PROXIMADB_CORPUS_VERSION_PATH") {
         push("PROXIMADB_CORPUS_VERSION_PATH", path, None);
     }
+    // ADR-098 M5 (review round 1, HIGH-1; round 2, MED-3): an env-overridden
+    // warehouse root holds every MATERIALIZEd table's Parquet parts + Iceberg
+    // metadata, and a LOCAL override (e.g. file:///mnt/warehouse) can sit
+    // outside every leased root — cold backup must see it to refuse instead
+    // of silently shipping a backup without the warehouse. ONE resolver
+    // (`resolve_warehouse_root`) serves every consumer — the server/pgwire
+    // builds, the router build, this boot record, backup's own env pass and
+    // the writer-epoch check — with no per-request read, so the served root
+    // and the recorded root cannot diverge; the recorded LOCATION is the
+    // resolver's PARSED local path (host-checked, percent-decoded), never a
+    // naive strip_prefix. Remote schemes are skipped, consistent with this
+    // module's contract (object storage is durable on its own; the record's
+    // refusal path is for local locations) — and the in-lease default is not
+    // recorded at all, only the override.
+    {
+        let warehouse = proximadb::network::shared_services::resolve_warehouse_root(
+            &config.server.data_dir,
+            |key| env(key),
+        );
+        if let Some(path) = warehouse.local_path.filter(|_| warehouse.from_override) {
+            push(
+                "PROXIMADB_WAREHOUSE_ROOT_URL",
+                path.display().to_string(),
+                None,
+            );
+        }
+    }
     // io_trace sink spool — mirrors `ResolvedIoTraceSinkConfig::try_resolve`'s
     // env > TOML > default ladder for the enable switch and the directory.
     let sink = config
@@ -301,6 +328,58 @@ mod tests {
             on.iter().any(
                 |loc| loc.source.contains("io_trace") && loc.location.ends_with("log/io_trace")
             )
+        );
+    }
+
+    /// ADR-098 M5 (review round 1, HIGH-1): a LOCAL warehouse-root override
+    /// outside the lease MUST be recorded (cold backup refuses on it); a
+    /// REMOTE override is skipped (object storage is durable on its own);
+    /// the in-lease default is never recorded.
+    #[test]
+    fn local_warehouse_root_override_is_recorded() {
+        let config = Config::default();
+        let found = effective_durable_locations(
+            &config,
+            env_of(&[("PROXIMADB_WAREHOUSE_ROOT_URL", "file:///mnt/warehouse")]),
+        );
+        let warehouse = found
+            .iter()
+            .find(|loc| loc.source == "PROXIMADB_WAREHOUSE_ROOT_URL")
+            .expect("local warehouse override recorded");
+        assert_eq!(warehouse.location, "/mnt/warehouse");
+        assert_eq!(warehouse.durability_mode, None);
+    }
+
+    #[test]
+    fn remote_and_rejected_warehouse_overrides_are_not_recorded() {
+        let config = Config::default();
+        let remote = effective_durable_locations(
+            &config,
+            env_of(&[("PROXIMADB_WAREHOUSE_ROOT_URL", "s3://bucket/warehouse")]),
+        );
+        assert!(
+            !remote
+                .iter()
+                .any(|loc| loc.source == "PROXIMADB_WAREHOUSE_ROOT_URL")
+        );
+        // A schemeless value is rejected by the shared resolver (falls back
+        // to the in-lease default) — nothing to record either.
+        let rejected = effective_durable_locations(
+            &config,
+            env_of(&[("PROXIMADB_WAREHOUSE_ROOT_URL", "mnt/warehouse")]),
+        );
+        assert!(
+            !rejected
+                .iter()
+                .any(|loc| loc.source == "PROXIMADB_WAREHOUSE_ROOT_URL")
+        );
+        // Unset: the default lives under data_dir (inside the lease) and is
+        // deliberately not recorded.
+        let unset = effective_durable_locations(&config, env_of(&[]));
+        assert!(
+            !unset
+                .iter()
+                .any(|loc| loc.source == "PROXIMADB_WAREHOUSE_ROOT_URL")
         );
     }
 

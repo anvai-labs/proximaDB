@@ -107,6 +107,145 @@ pub(crate) fn join_storage_url(base: &str, sub: &str) -> String {
     }
 }
 
+/// Warehouse object-store root for `ALTER TABLE … MATERIALIZE` Parquet
+/// snapshots and the Iceberg REST metadata persistence (TD-119).
+///
+/// Default: `file://{data_dir}/warehouse` — the same server-data-dir derivation
+/// every call site hard-coded before this seam existed. The
+/// `PROXIMADB_WAREHOUSE_ROOT_URL` override (ADR-098 M5) lets the warehouse live
+/// on an object-store URL (`s3://bucket/prefix`, `adls://…`) while `data_dir`
+/// stays a local path — the configuration cloud deployments and the cloud-trace
+/// evidence ledger need, and until now impossible to express: the URL was
+/// formatted from a `PathBuf` at three independent call sites. The override's
+/// scheme must be in [`WAREHOUSE_SCHEME_ALLOWLIST`] (the schemes the
+/// object-store builder serves); a schemeless value, an unknown scheme,
+/// `memory://` (volatile — not a warehouse) or a non-localhost `file://` host
+/// is REJECTED with an ERROR log naming the variable and the DEFAULT
+/// `{data_dir}/warehouse` applies — a rejected override is a relocation to
+/// the default, loud in the log but silent in placement, hence the error.
+/// The allow-list is deliberately NARROWER than `store_for_url`, which also
+/// accepts `https://…` blob-endpoint forms: those are rejected here by
+/// design (fail-closed — use a scheme the builder maps, not a raw endpoint
+/// URL). An override whose store then fails to open still degrades
+/// the same way it always did — `with_materializer` / the Iceberg REST wiring
+/// warn and leave MATERIALIZE unwired rather than break the server.
+///
+/// [`resolve_warehouse_root`] is the single resolution BOTH consumers use
+/// (the network call sites via [`warehouse_root_url`], and the bin crate's
+/// `durable_locations` boot record via its injected env) so the served root
+/// and the recorded root cannot diverge into two independent env reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedWarehouseRoot {
+    /// The effective root URL: the override verbatim, or the data-dir default.
+    pub url: String,
+    /// True when an explicit, accepted `PROXIMADB_WAREHOUSE_ROOT_URL`
+    /// produced `url` (a rejected invalid value falls back and reports
+    /// `false` — the location is then the in-lease default).
+    pub from_override: bool,
+    /// The LOCAL filesystem path this root serves, when `url` is a `file://`
+    /// URL — derived by PARSING it (host must be empty or `localhost`;
+    /// percent-encoding decoded exactly as `object_store`'s
+    /// `Path::from_url_path` decodes it), never by a naive `strip_prefix`
+    /// (review round 2, MED-3: `file://localhost/mnt/wh` and
+    /// `file:///mnt/ware%20house` must not silently record wrong paths).
+    /// `None` for remote schemes.
+    pub local_path: Option<std::path::PathBuf>,
+}
+
+/// Schemes the object-store builder can actually serve for a warehouse root
+/// (review round 2, L1): `file` plus the cloud builders' schemes (the
+/// `adls`/`gcs` aliases our `store_for_url` normalises). `memory` is
+/// deliberately REJECTED — a volatile in-process store is not a warehouse —
+/// and so is every unknown scheme.
+const WAREHOUSE_SCHEME_ALLOWLIST: &[&str] = &[
+    "file", "s3", "s3a", "gs", "gcs", "az", "azure", "adl", "adls", "abfs", "abfss",
+];
+
+/// Resolve the warehouse root from an injected env lookup (test seam; the
+/// production callers pass `std::env::var`). See [`warehouse_root_url`].
+pub fn resolve_warehouse_root(
+    data_dir: &std::path::Path,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> ResolvedWarehouseRoot {
+    let default = |local_path: Option<std::path::PathBuf>| ResolvedWarehouseRoot {
+        url: format!("file://{}/warehouse", data_dir.display()),
+        from_override: false,
+        local_path,
+    };
+    match lookup("PROXIMADB_WAREHOUSE_ROOT_URL") {
+        Some(url) if !url.trim().is_empty() => {
+            let rejected = |reason: &str| {
+                tracing::error!(
+                    "PROXIMADB_WAREHOUSE_ROOT_URL='{url}' {reason} — the override is \
+                     rejected and the data-dir default warehouse applies"
+                );
+            };
+            let Some((scheme, _)) = url.split_once("://") else {
+                rejected("has no '<scheme>://' separator");
+                return default(Some(data_dir.join("warehouse")));
+            };
+            if !WAREHOUSE_SCHEME_ALLOWLIST.contains(&scheme) {
+                rejected(&format!(
+                    "uses the unsupported scheme '{scheme}' (allowed: {})",
+                    WAREHOUSE_SCHEME_ALLOWLIST.join(", ")
+                ));
+                return default(Some(data_dir.join("warehouse")));
+            }
+            // Local path from the PARSED url, mirroring what the object
+            // store itself will open (percent-decoded, host-checked).
+            let local_path = if scheme == "file" {
+                match local_path_of_file_url(&url) {
+                    Ok(path) => Some(path),
+                    Err(error) => {
+                        rejected(&error);
+                        return default(Some(data_dir.join("warehouse")));
+                    }
+                }
+            } else {
+                None
+            };
+            tracing::info!(
+                "warehouse root overridden by PROXIMADB_WAREHOUSE_ROOT_URL: {url} \
+                 (default file://{}/warehouse)",
+                data_dir.display()
+            );
+            ResolvedWarehouseRoot {
+                url,
+                from_override: true,
+                local_path,
+            }
+        }
+        _ => default(Some(data_dir.join("warehouse"))),
+    }
+}
+
+/// The local path a `file://` URL serves, from the parsed URL: the host must
+/// be empty or `localhost` (a `file://other-host/…` URL names a different
+/// machine's file and is rejected), and the path is percent-decoded via
+/// object_store's own `Path::from_url_path` (the same decoding the store
+/// applies when it opens the URL).
+fn local_path_of_file_url(url: &str) -> Result<std::path::PathBuf, String> {
+    let parsed =
+        url::Url::parse(url).map_err(|error| format!("does not parse as a URL: {error}"))?;
+    match parsed.host_str() {
+        None | Some("localhost") => {}
+        Some(host) => {
+            return Err(format!(
+                "names the file host '{host}' (only the empty host or 'localhost' is local)"
+            ));
+        }
+    }
+    let decoded = object_store::path::Path::from_url_path(parsed.path())
+        .map_err(|error| format!("has a path that does not decode: {error}"))?;
+    Ok(std::path::PathBuf::from(format!("/{}", decoded.as_ref())))
+}
+
+/// The effective warehouse root URL for this process (see
+/// [`resolve_warehouse_root`]).
+pub fn warehouse_root_url(data_dir: &std::path::Path) -> String {
+    resolve_warehouse_root(data_dir, |key| std::env::var(key).ok()).url
+}
+
 /// The local-filesystem view of a storage base, for subsystems that cannot yet
 /// run over an object store (TD-OBJSTORE-1 deferred set — e.g. the TST
 /// time-series engine). Returns `None` when the base carries a non-`file`
@@ -4264,5 +4403,141 @@ mod abac_composition_root_tests {
             SharedServices::build_abac_enforcer(None).is_none(),
             "no opt_config ⇒ no enforcer (status quo)"
         );
+    }
+}
+
+#[cfg(test)]
+mod warehouse_root_tests {
+    use super::{resolve_warehouse_root, warehouse_root_url};
+    use serial_test::serial;
+    use std::path::{Path, PathBuf};
+
+    fn lookup<'a>(map: &'a [(&'static str, &'static str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |key| {
+            map.iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, v)| v.to_string())
+        }
+    }
+
+    #[test]
+    fn unset_falls_back_to_the_data_dir_default() {
+        let resolved = resolve_warehouse_root(Path::new("/data"), lookup(&[]));
+        assert_eq!(resolved.url, "file:///data/warehouse");
+        assert!(!resolved.from_override);
+        assert_eq!(resolved.local_path, Some(PathBuf::from("/data/warehouse")));
+    }
+
+    #[test]
+    fn scheme_bearing_override_is_taken_verbatim() {
+        let resolved = resolve_warehouse_root(
+            Path::new("/data"),
+            lookup(&[("PROXIMADB_WAREHOUSE_ROOT_URL", "s3://bucket/prefix")]),
+        );
+        assert_eq!(resolved.url, "s3://bucket/prefix");
+        assert!(resolved.from_override);
+        assert_eq!(
+            resolved.local_path, None,
+            "remote scheme serves no local path"
+        );
+    }
+
+    #[test]
+    fn file_url_local_path_comes_from_the_parsed_url() {
+        // Review round 2 (MED-3): the four spellings a naive strip_prefix
+        // gets wrong. Canonical spelling:
+        let resolved = resolve_warehouse_root(
+            Path::new("/data"),
+            lookup(&[("PROXIMADB_WAREHOUSE_ROOT_URL", "file:///mnt/warehouse")]),
+        );
+        assert!(resolved.from_override);
+        assert_eq!(resolved.local_path, Some(PathBuf::from("/mnt/warehouse")));
+
+        // localhost host is the SAME machine — accepted, path from the URL.
+        let resolved = resolve_warehouse_root(
+            Path::new("/data"),
+            lookup(&[(
+                "PROXIMADB_WAREHOUSE_ROOT_URL",
+                "file://localhost/mnt/warehouse",
+            )]),
+        );
+        assert!(resolved.from_override);
+        assert_eq!(resolved.local_path, Some(PathBuf::from("/mnt/warehouse")));
+
+        // Percent-encoding is DECODED (what object_store opens).
+        let resolved = resolve_warehouse_root(
+            Path::new("/data"),
+            lookup(&[("PROXIMADB_WAREHOUSE_ROOT_URL", "file:///mnt/ware%20house")]),
+        );
+        assert!(resolved.from_override);
+        assert_eq!(resolved.local_path, Some(PathBuf::from("/mnt/ware house")));
+
+        // A non-localhost file host names ANOTHER machine's file — rejected.
+        let resolved = resolve_warehouse_root(
+            Path::new("/data"),
+            lookup(&[(
+                "PROXIMADB_WAREHOUSE_ROOT_URL",
+                "file://other-host/mnt/warehouse",
+            )]),
+        );
+        assert!(!resolved.from_override);
+        assert_eq!(resolved.url, "file:///data/warehouse");
+    }
+
+    #[test]
+    fn schemeless_and_volatile_overrides_are_rejected() {
+        for bad in ["mnt/warehouse", "memory://wh", "bogus://bucket/wh"] {
+            let resolved = resolve_warehouse_root(
+                Path::new("/data"),
+                lookup(&[("PROXIMADB_WAREHOUSE_ROOT_URL", bad)]),
+            );
+            assert!(!resolved.from_override, "{bad} must be rejected");
+            assert_eq!(resolved.url, "file:///data/warehouse", "{bad}");
+            assert_eq!(
+                resolved.local_path,
+                Some(PathBuf::from("/data/warehouse")),
+                "{bad}"
+            );
+        }
+    }
+
+    /// Round 3 (L5): the production entry point (the one the network call
+    /// sites use) really reads the environment — set, observe, unset.
+    /// `#[serial]` holds the crate's shared env lock so the plain libtest
+    /// runner (shared process) cannot interleave another env-touching test.
+    #[test]
+    #[serial]
+    fn production_entry_point_reads_the_environment() {
+        // SAFETY: the `#[serial]` lock (and nextest's process-per-test
+        // isolation) keeps other env-touching tests out while this mutates
+        // the process environment; the variable is removed before the
+        // assertions that must not see it.
+        unsafe {
+            std::env::set_var(
+                "PROXIMADB_WAREHOUSE_ROOT_URL",
+                "file:///definitely-not-the-default/wh",
+            );
+        }
+        assert_eq!(
+            warehouse_root_url(Path::new("/data")),
+            "file:///definitely-not-the-default/wh"
+        );
+        unsafe {
+            std::env::remove_var("PROXIMADB_WAREHOUSE_ROOT_URL");
+        }
+        assert_eq!(
+            warehouse_root_url(Path::new("/data")),
+            "file:///data/warehouse"
+        );
+    }
+
+    #[test]
+    fn whitespace_only_override_is_ignored() {
+        let resolved = resolve_warehouse_root(
+            Path::new("/data"),
+            lookup(&[("PROXIMADB_WAREHOUSE_ROOT_URL", "   ")]),
+        );
+        assert_eq!(resolved.url, "file:///data/warehouse");
+        assert!(!resolved.from_override);
     }
 }

@@ -1,0 +1,27 @@
+// Raw output of the HARDENED M5 pgwire TD-SPINE-4 manifest-levers test against MinIO (re-measured
+// 2026-11-25, review round 3 MED-1 — the round-1 run predated the test hardening).
+// Test: tests/tpc_perf_ledger_e2e.rs::manifest_levers_cut_footer_gets_over_pgwire_object_store
+// Env: PROXIMADB_WAREHOUSE_ROOT_URL=s3://proximadb-m5/pgwire-mlev-r3 (fresh prefix),
+// AWS_ENDPOINT=http://127.0.0.1:9000, path-style, RUST_MIN_STACK=8388608. exit 0, 2.01 s.
+//Source: /tmp/m5-bench/pgwire-s3-hardened.log
+
+
+running 1 test
+test manifest_levers_cut_footer_gets_over_pgwire_object_store ... TD-SPINE-4 M5 emulator: warehouse root s3://proximadb-m5/pgwire-mlev-r3 holds 13 objects (13 fresh this run; mlevos_25693_1795608241360 parts + metadata)
+TD-SPINE-4 M5 emulator before(kill-switches) first_file first: get_ops=13 list_ops=0 range_gets=7 bytes_read=92053 footer_reads=4 files_pruned=0 manifest_cache hit/miss=0/0
+TD-SPINE-4 M5 emulator before(kill-switches) first_file repeat: get_ops=13 list_ops=0 range_gets=7 bytes_read=92053 footer_reads=4 files_pruned=0 manifest_cache hit/miss=0/0
+TD-SPINE-4 M5 emulator before(kill-switches) last_file first: get_ops=13 list_ops=0 range_gets=7 bytes_read=92053 footer_reads=4 files_pruned=0 manifest_cache hit/miss=0/0
+TD-SPINE-4 M5 emulator before(kill-switches) last_file repeat: get_ops=13 list_ops=0 range_gets=7 bytes_read=92053 footer_reads=4 files_pruned=0 manifest_cache hit/miss=0/0
+TD-SPINE-4 M5 emulator before(kill-switches) all_files first: get_ops=19 list_ops=0 range_gets=16 bytes_read=146701 footer_reads=4 files_pruned=0 manifest_cache hit/miss=0/0
+TD-SPINE-4 M5 emulator before(kill-switches) all_files repeat: get_ops=19 list_ops=0 range_gets=16 bytes_read=146701 footer_reads=4 files_pruned=0 manifest_cache hit/miss=0/0
+TD-SPINE-4 M5 emulator after(levers on) first_file first: get_ops=7 list_ops=0 range_gets=4 bytes_read=41812 footer_reads=1 files_pruned=3 manifest_cache hit/miss=0/1
+TD-SPINE-4 M5 emulator after(levers on) first_file repeat: get_ops=4 list_ops=0 range_gets=4 bytes_read=34963 footer_reads=1 files_pruned=3 manifest_cache hit/miss=1/0
+TD-SPINE-4 M5 emulator after(levers on) last_file first: get_ops=6 list_ops=0 range_gets=5 bytes_read=51710 footer_reads=2 files_pruned=3 manifest_cache hit/miss=1/0
+TD-SPINE-4 M5 emulator after(levers on) last_file repeat: get_ops=6 list_ops=0 range_gets=5 bytes_read=51710 footer_reads=2 files_pruned=3 manifest_cache hit/miss=1/0
+TD-SPINE-4 M5 emulator after(levers on) all_files first: get_ops=16 list_ops=0 range_gets=16 bytes_read=139852 footer_reads=4 files_pruned=0 manifest_cache hit/miss=1/0
+TD-SPINE-4 M5 emulator after(levers on) all_files repeat: get_ops=16 list_ops=0 range_gets=16 bytes_read=139852 footer_reads=4 files_pruned=0 manifest_cache hit/miss=1/0
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 2.01s
+
+EXIT=0

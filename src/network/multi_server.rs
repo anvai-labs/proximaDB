@@ -997,9 +997,11 @@ impl MultiServer {
             let primary_pod_registry = services.primary_pod_registry.clone();
             let self_pod_id = services.self_pod_id.clone();
             let partition_lease_manager = services.partition_lease_manager.clone();
-            // Warehouse object-store root for `ALTER TABLE … MATERIALIZE`, derived from
-            // the server data dir the same way document/observability roots are.
-            let warehouse_root_url = format!("file://{}/warehouse", self.config.data_dir.display());
+            // Warehouse object-store root for `ALTER TABLE … MATERIALIZE`: the
+            // resolver's data-dir default, env-overridable via
+            // PROXIMADB_WAREHOUSE_ROOT_URL (see shared_services).
+            let warehouse_root_url =
+                crate::network::shared_services::warehouse_root_url(&self.config.data_dir);
 
             // E0: env-gated per-IP rate limiter for the pgwire query path
             // (PROXIMADB_PGWIRE_RATE_LIMIT_RPM=<n>). Unset/0 → no limiting, so
@@ -1418,7 +1420,8 @@ impl MultiServer {
             let pg_bind_addr = self.config.postgres_config.active_bind_address();
             let services = self.shared_services.clone();
             let direct_write_services = self.build_direct_pgwire_write_services().await?;
-            let warehouse_root_url = format!("file://{}/warehouse", self.config.data_dir.display());
+            let warehouse_root_url =
+                crate::network::shared_services::warehouse_root_url(&self.config.data_dir);
             let tenant_header_trust = self.tenant_header_trust;
             let pgwire_coordinator = self.security_coordinator.clone();
             let pgwire_auth_mode = self.pgwire_auth;

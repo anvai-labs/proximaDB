@@ -503,3 +503,24 @@ Superseded or since-fixed log entries, one line each; the reasoning that still a
   across `GrantSubject` and `Target`. The real discrepancy was *sourcing* `Target.table` from the
   retired `schema.object_id`; sourcing from the typed triple dissolved the truncation hazard and made
   "stamp the typed triple" (not "mint a u64") the invariant every internal catalog must keep.
+
+== Amendment note (2026-11-24): the warehouse root is env-overridable
+
+ADR-098 M5 introduced `PROXIMADB_WAREHOUSE_ROOT_URL` (registry row; opt-in): the object-store root
+for `ALTER TABLE … MATERIALIZE` Parquet snapshots and Iceberg REST metadata can now be moved off
+`{data_dir}/warehouse` by environment. Reconciliation with ADR-090's posture: the ABAC closure of
+the Parquet route to governed sessions is unchanged — `with_materializer` wiring and the
+`window_decline`/MATERIALIZE offer already refuse governed contexts, and the override changes only
+WHERE the (ungoverned-session) parts land, not who may materialize. The governance-relevant
+consequence is operational: a LOCAL override outside the leased roots is now recorded in the boot
+`durable_locations` record (cold backup refuses rather than silently omitting the warehouse), and a
+REMOTE override is recorded nowhere by design (durable on its own) — a deployment that points the
+warehouse at object storage should treat that bucket as part of its data-lake governance perimeter,
+which ADR-090's grant model does not yet see.
+
+* **Round-2 addendum (2026-11-24):** the `[oltp.durable_volume]` interaction of the same seam —
+  a LOCAL warehouse-root override off the volume REFUSES BOOT (fail-closed, via the writer-epoch
+  `check_durable_roots_on_volume`, which now sees the override through `effective_durable_locations`;
+  test `local_warehouse_override_off_volume_refuses_boot`). A REMOTE override boots fine: object
+  storage survives compute replacement by construction and is not volume-checked — which is exactly
+  the governance perimeter note above.
