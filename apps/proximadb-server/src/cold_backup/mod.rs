@@ -159,11 +159,16 @@ fn unleased_durable_state(config: &Config) -> anyhow::Result<Vec<String>> {
     // copy, so any durable file under the cache would be silently omitted:
     // refuse when an ExcludedCache root sits at or below the location.
     // Round 6 (L1): the descendant rule does NOT apply when the location IS
-    // itself a Full root (records do name whole roots: `wal_local_dir` and
-    // the effective WAL root are leased roots). A cache nested inside a Full
-    // root is the ordinary "cache under a data root" layout, which the copy
-    // loop handles the same way it does for `data_dir`, so refusing it would
-    // be a false refusal.
+    // itself a Full root. Records can name a whole root: an explicit
+    // `wal_local_dir` is a leased root. A cache nested inside a Full root is
+    // the ordinary "cache under a data root" layout, which the copy loop
+    // handles the same way it does for `data_dir`, so refusing it would be a
+    // false refusal. The DEFAULT WAL root `{data_dir}/wal` is NOT itself a
+    // root (it is a path inside the `data_dir` root), so a cache placed
+    // inside it (`{data_dir}/wal/cache`) still refuses. That is deliberate
+    // and fail-closed: a cache inside the WAL directory is not a supported
+    // layout, and admitting it would also re-admit the warehouse cases the
+    // round-5 rule refuses.
     let roots = grouped_roots(config, false)?;
     let mut found = Vec::new();
     for location in recorded.iter().chain(mine.iter()) {
