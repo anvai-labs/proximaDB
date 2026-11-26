@@ -135,11 +135,12 @@ posture*, not a misconfiguration; the contradictory shape (declared
   of them.
 * **R3. macOS cold-backup restore-path failures.** Fixed in open PR #2575. *Acceptance:* #2575
   merged, and `cold_backup_restore` green on macOS locally (or on a macOS CI leg).
-* **R4. TD-SEAM-14 durability-boundary spec (acceptance bullet 4).** So far the coordination is
-  vocabulary only (see below). The planned spec
-  (`docs/10-quality/td/TD-SEAM-14-durability-boundary.adoc`) does not exist yet. *Acceptance:*
-  the spec exists and maps spill placement to one of the two `DurabilityMode` values, with no
-  third mode.
+* **R4. TD-SEAM-14 durability boundary (acceptance bullet 4).** So far the coordination is
+  vocabulary only (see below). No separate spec is needed: the existing link:TD-SEAM-14-object-store-recovery-and-ownership-boundary.adoc[TD-SEAM-14] already has a
+  "Durability boundary and operator recovery" section (§8), and its bounded delivery (§2)
+  assumes an intact durable local WAL/metadata volume. *Acceptance:* TD-SEAM-14 §8 states which
+  `DurabilityMode` its spill placement resolves to (one of the two, no third mode), and this
+  TD cites that line.
 
 == Coordination — TD-SEAM-14 (spill durability boundary)
 
@@ -152,8 +153,8 @@ TD's vocabulary (`DurabilityMode`, `durability_mode`,
 `PROXIMADB_WAL_DURABILITY_MODE`) does not collide with the seam. Per ADR-098
 D3, whatever durability boundary SEAM-14 documents for spill must resolve to
 one of these two modes; when its durability-boundary spec lands
-(`docs/10-quality/td/TD-SEAM-14-durability-boundary.adoc`, planned), it should
-REFERENCE `DurabilityMode` rather than mint a third mode.
+(*corrected 2026-11-25:* there is no separate planned file; the durability boundary is
+§8 of TD-SEAM-14 itself), it should REFERENCE `DurabilityMode` rather than mint a third mode.
 
 == Evidence (2026-11-24)
 

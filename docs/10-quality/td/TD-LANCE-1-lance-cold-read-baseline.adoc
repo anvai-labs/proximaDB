@@ -10,7 +10,7 @@
 | Field | Value
 | Status | **Open** (filed 2026-11-25 by the ADR-098 scope reconciliation, Completion ledger G15).
 | Priority | **P3.** Evidence for a decision that has already been made. ADR-098 concluded that "no storage-format pivot is warranted", but no Lance arm was measured.
-| Component | Bench harness `scripts/bench/sift1m_get_reduction.py` (the object-cold trace protocol of ledger `paxdir_d8_defaults_on_sift1m`) and the query-scoped I/O trace (`crates/modalities/proximadb-observability-engine/src/io_trace.rs`). The repo has no Lance reader. The only references are a `FormatType::LanceDb` detection variant in `crates/storage/proximadb-storage-common/src/format_traits.rs` and comments.
+| Component | Bench harness `scripts/bench/sift1m_get_reduction.py` (the object-cold trace protocol of ledger `paxdir_d8_defaults_on_sift1m`) and the query-scoped I/O trace (`crates/modalities/proximadb-observability-engine/src/io_trace.rs`). The product has no Lance reader on the vector read path. Existing Lance references: the `FormatType::LanceDb` detection variant (`crates/storage/proximadb-storage-common/src/format_traits.rs`), its entries in the open-format registry (`src/storage/formats/registry.rs`, two `FormatType::LanceDb` match arms, and the `is_open_format` assertion in `src/storage/formats/mod.rs`), comments, and a client-side LanceDB benchmark (`clients/python/tests/benchmark_vector_dbs.py`, ChromaDB vs LanceDB vs FAISS vs Qdrant).
 | Authority | link:../../12-design/adr/ADR-098-metadata-spine.adoc[ADR-098] Context ("no storage-format pivot is warranted") and Completion ledger G15; ADR-033 (cost spine); CLAUDE.md co-design mandate #2 (trace before you tune).
 | Relates to | TD-091 (Lance interoperability: read/import/external index, `docs/10-quality/TECHNICAL_DEBT.adoc`; a different question), link:../../12-design/adr/ADR-099-unified-iceberg-projection.adoc[ADR-099], link:TD-COLDREQ-1-cold-probe-request-coalescing.adoc[TD-COLDREQ-1]
 |===
@@ -29,7 +29,9 @@ is PAX the better leaf for our cold-read cost terms?
 == Fix
 
 . Build a Lance (`lance` / `pylance`) arm of the SIFT1M object-cold protocol, outside the
-  product. It uses the same corpus, the same MinIO + Toxiproxy bed, a comparable IVF-PQ index
+  product. Reuse the LanceDB setup in `clients/python/tests/benchmark_vector_dbs.py` where it
+  fits; that harness measures local latency, not object-cold request counts, so the trace
+  protocol is new. It uses the same corpus, the same MinIO + Toxiproxy bed, a comparable IVF-PQ index
   geometry, and recall@10 targeted to the PAX arm's.
 . Measure the quantities the PAX trace records: requests per query (GET, LIST, HEAD), dependent
   waves p50, bytes per query, recall@10, and cold and warm p50/p95, on identical objects across

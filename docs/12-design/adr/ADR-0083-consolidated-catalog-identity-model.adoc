@@ -163,8 +163,8 @@ per-account. (TD-NS-1 S4 is the related fence on the separate per-account
 +
 *Updated 2026-11-25:* the paragraph above describes the code before #2566. Since #2566 (merged
 2026-11-24) the floor is per-account. `NamespaceIdAllocator` (`src/services/system_catalog.rs`)
-keeps the ids and the per-account floors under one lock, so the 65,536-namespace bound applies
-per account (TD-SPINE-2; test `per_account_namespace_floor_two_accounts_each_mint_id_one`).
+keeps the ids and the per-account floors under one lock, so the namespace bound applies per
+account. The bound is 65,535, not 65,536: ids are `u16` and start at 1 (TD-SPINE-2; test `per_account_namespace_floor_two_accounts_each_mint_id_one`).
 
 == Addendum: ABAC `tenant_stable_id` (TD-TENANT-1 item 3)
 

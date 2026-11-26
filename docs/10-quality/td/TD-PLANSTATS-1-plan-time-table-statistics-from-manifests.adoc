@@ -1,0 +1,61 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-PLANSTATS-1: plan-time table statistics do not come from manifests or the segment directory
+:status: Open
+:dim: D4
+:pillar: PERF
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open** (filed 2026-11-25 by the ADR-098 scope reconciliation, Completion ledger G6).
+| Priority | **P2.** Results stay correct, but the planner and the route chooser plan blind on cold tables and on tables whose filters prune files.
+| Component | Parquet/Iceberg: `ObjectStoreParquetTable::statistics()` in `src/datafusion/engine_adapters/object_store_parquet_reader.rs` (:2255) and `statistics_from_splits` in `src/datafusion/schema_inference.rs`; manifest per-file `ColumnFileStats` in `crates/storage/proximadb-iceberg-engine/src/iceberg.rs`. PAX: `ProximaDBTableProvider` / `ProximaDataFusionTable` in `src/datafusion/table_provider.rs` (`with_statistics`); directory entries in `crates/storage/proximadb-storage-common/src/centroid_directory.rs`. Statistics envelope: `src/core/statistics/`.
+| Authority | link:../../12-design/adr/ADR-050-statistics-fed-datafusion-route-selection.adoc[ADR-050] D2 (as amended 2026-11-19 and corrected 2026-11-25); link:../../12-design/adr/ADR-042-canonical-segment-statistics-contract.adoc[ADR-042]; link:../../12-design/adr/ADR-037-statistics-substrate-and-reference-mcp.adoc[ADR-037]; link:../../12-design/adr/ADR-098-metadata-spine.adoc[ADR-098] D2, D4.3 and Completion ledger G6.
+| Relates to | link:TD-SPINE-4-manifest-stats-pruning-and-cache.adoc[TD-SPINE-4] follow-up F1 (route-shape stat from manifest per-file counts; narrower than this TD), TD-OLAP-2 (PAX segments feeding the same projection), link:TD-PAXMETA-1-collection-level-segment-facts.adoc[TD-PAXMETA-1] (directory entries)
+|===
+
+== Problem
+
+ADR-050 D2, amended 2026-11-19 under ADR-098, says plan-time statistics come from the metadata
+spine: manifest per-file `ColumnFileStats` for Parquet/Iceberg and L1 directory entries for PAX.
+Neither is built. Verified on develop @ `ea77dea50`:
+
+* **Parquet/Iceberg.** `ObjectStoreParquetTable::statistics()` builds whole-table statistics
+  from Parquet footers. On lazily opened, manifest-managed tables (TD-SPINE-4 Fix 4) it returns
+  `None` until every footer has been resolved (`footers_complete()`). For a table whose filters
+  always prune a file, that never happens, so DataFusion sees no table statistics for it. The
+  manifest bounds are used only for file pruning.
+* **PAX.** Both PAX table providers carry an `Option<Statistics>` set only by `with_statistics`,
+  and `with_statistics` has no callers. So PAX tables expose no table statistics to DataFusion at
+  all. The directory entries carry per-block prune statistics (`BlockPruneStatsTable`), which SST
+  search uses for pruning, but nothing turns them into plan-time statistics.
+* **Statistics envelope.** The registry in `src/core/statistics/` is fed by observing records on
+  the write path (`observe_flush_into_statistics` in `src/storage/engines/sst/flush/mod.rs` at
+  PAX flush, and the MATERIALIZE observer in `src/services/dml/mod.rs`). It never reads L1
+  directory entries or manifests.
+
+== Fix
+
+. **Parquet/Iceberg.** At table open, derive whole-table statistics from the manifest's
+  per-file `record_count`, `file_size_in_bytes` and `ColumnFileStats`: row count and byte size
+  exact, column bounds and null counts `Inexact` per ADR-050 D3. Do this without reading
+  footers. Follow the TD-SPINE-4 truncation rule: a string longer than 16 characters has no
+  trusted upper bound, and a missing bound is unbounded. Footers stay the fallback for
+  manifest-less tables.
+. **PAX.** At table open, derive the same from the collection's directory entries (row counts
+  and per-block bounds), trusting an entry only under the ADR-098 D2 `(size, ETag)` listing
+  binding. Uncovered segments make the statistic unknown, never understated.
+. Feed both into the existing `statistics()` path, so `ComputeScheduler` route decisions and
+  DataFusion planning both see them.
+
+== Acceptance
+
+* A lazily opened, manifest-managed Parquet table returns non-`None` `statistics()` at open with
+  zero footer reads (counted by the I/O trace's `parquet_footer_reads`). Row count equals the
+  manifest's total, and bounds contain the eager footer-derived bounds.
+* A directory-covered PAX table returns non-`None` `statistics()` at open with zero segment
+  footer reads. A stale-ETag entry makes the affected statistic unknown (negative control).
+* A route-decision test: a query on such a table makes the scheduler decision from these
+  statistics (the route trace records the statistics source), where today it is made with none.
+* The TPC-H/TPC-DS pgwire ratchets are unchanged.

@@ -78,7 +78,7 @@ directory (D2).
 
 Implementation status (2026-11-22): D1.1–D1.2 (envelope; body codec stays
 MessagePack) and D1.3–D1.4 (per-account shards + per-account namespace floor)
-are **implemented** — TD-SPINE-1 and TD-SPINE-2 carry the evidence and the
+are **implemented** (partial — see Completion ledger G7/G8/G11) — TD-SPINE-1 and TD-SPINE-2 carry the evidence and the
 one deviation from this section's text: per the pre-GA owner decision of
 2026-11-20 there is **no opt-in envelope write gate** (the writer emits the
 envelope unconditionally; readers sniff unconditionally, so mixed-read holds
@@ -164,7 +164,7 @@ fleet-wide account metadata.
 * The object-store spill placement durability/ownership boundary is TD-SEAM-14's and is not
   restated here; it must resolve to one of these two modes.
 
-Implemented 2026-11-24 (TD-SPINE-5): the declared key is
+Implemented 2026-11-24 (TD-SPINE-5; partial — see Completion ledger G10): the declared key is
 `[storage.wal_config].durability_mode` (env mirror `PROXIMADB_WAL_DURABILITY_MODE`,
 registry tier config-mirror; unset ⇒ infer — not a kill-switch); the resolution ladder,
 the `{data_dir}/wal` default-root move, the legacy-root recovery scan, and the
@@ -320,12 +320,12 @@ refer to `docs/_internal/roadmap/BENCHMARK_EVIDENCE.toml`.
 | Cold request count low enough for request-priced egress
 | The checkpoint's "~82 → ≤ 6 GETs/q" was a model that conflated waves with requests
 | Not met at ≤ 6. Compacted SIFT1M object-cold: 19.55 req/q (`paxdir_d8_defaults_on_sift1m`); 18.69 req/q (18.64 GET/q) in open PR #2575. Uncompacted 50-segment steady state: 154.63 ranged GETs/q (`sift1m_uncompacted_file_directory_at_flush`, TD-SIFTCOMPACT-1).
-| **Re-scoped.** ≤ 6 is dropped as a GA gate (it is a waves target in disguise). New gate: compacted object-cold ≤ 20 req/q, ratcheted (already the D8 harness ceiling, `--object-cold-max-requests 20`), plus a cost-per-query ledger entry (TD-PAXMETA-1; acceptance re-scope in open PR #2575). Going below 20 needs per-cell probe coalescing: link:../../10-quality/td/TD-COLDREQ-1-cold-probe-request-coalescing.adoc[TD-COLDREQ-1].
+| **Re-scoped.** ≤ 6 is dropped as a GA gate (it is a waves target in disguise). New gate: compacted object-cold ≤ 20 req/q, ratcheted (already the D8 harness ceiling, `--object-cold-max-requests 20`), plus a cost-per-query ledger entry (TD-PAXMETA-1; the acceptance re-scope is to be added by open PR #2575). Going below 20 is owned by link:../../10-quality/td/TD-COLDREQ-1-cold-probe-request-coalescing.adoc[TD-COLDREQ-1]. The best measured arm so far is 13.169 req/q from widening the range-coalescing cap alone (4 → 16 MiB, `tier1_e1_fixed_object_cap_sweep`; waves p50 3, recall ≥ 0.9822). Cap widening and per-cell probe coalescing are candidate levers, not prerequisites.
 
 | G4
 | The footer joins the data wave (L1 extents)
 | A cold read skips the SegmentIndex fetch
-| **Met by a different mechanism.** The SegmentIndex is rebuilt from the directory entry's decode key (D2.4); the planned `SegmentIndexCache` / footer-cache priming was not built.
+| **Met by a different mechanism.** The SegmentIndex is rebuilt from the directory entry's decode key (D2.4); the planned `SegmentIndexCache` / footer-cache priming was not built. Evidence: `directory_key_cold_read_skips_the_index_fetch` (`src/datafusion/engine_adapters/pax_adapter.rs`) pins `cold - warm == 0` for a directory-covered cold read, with a stale-ETag negative control.
 | Recorded in D2 (2026-11-25). TD-PAXMETA-1.
 
 | G5
@@ -338,7 +338,7 @@ refer to `docs/_internal/roadmap/BENCHMARK_EVIDENCE.toml`.
 | Manifests are planning data
 | File pruning from manifest stats; manifest cache; plan-time stats from manifests
 | Pruning and the manifest cache are **met** (`spine4_manifest_levers_footer_gets_pgwire`). Plan-time stats are **not met**: with lazy footers, `ObjectStoreParquetTable::statistics()` returns `None` until every footer is resolved (`src/datafusion/engine_adapters/object_store_parquet_reader.rs`).
-| TD-SPINE-4. Its follow-up F1 covers only the route-shape stat; whole-table statistics from manifest bounds have no acceptance bullet yet. ADR-050 D2, ADR-042 and ADR-037 wording corrected 2026-11-25.
+| link:../../10-quality/td/TD-PLANSTATS-1-plan-time-table-statistics-from-manifests.adoc[TD-PLANSTATS-1] (new) owns whole-table plan-time statistics, for Parquet/Iceberg from manifest `ColumnFileStats` and for PAX from directory entries. TD-SPINE-4 F1 (route shape from manifest counts) is related. ADR-050 D2, ADR-042 and ADR-037 wording corrected 2026-11-25.
 
 | G7
 | Catalog cost is O(account), not O(fleet)
@@ -354,14 +354,14 @@ refer to `docs/_internal/roadmap/BENCHMARK_EVIDENCE.toml`.
 
 | G9
 | Every I/O boundary is metered per tenant (co-design #5)
-| The directory publish carries `TenantContext`
-| **Not met.** The flush and compaction publishes resolve an untenanted filesystem (`get_filesystem(dir_url)` in `src/storage/engines/sst/flush/mod.rs` `refresh_directory_after_flush` and `compaction.rs` `refresh_centroid_directory`).
+| Every flush and compaction I/O (segment write and directory publish) carries `TenantContext`
+| **Not met.** The directory publish is one known gap: `refresh_directory_after_flush` (`src/storage/engines/sst/flush/mod.rs`) and `refresh_centroid_directory` (`compaction.rs`) resolve an untenanted `get_filesystem(dir_url)`. The flush's segment write does the same (`get_filesystem(&staging_url)` and `get_filesystem(&final_url)` in `flush/mod.rs`). Other untenanted flush and compaction I/O may exist; TD-METERDIR-1 starts with a census.
 | link:../../10-quality/td/TD-METERDIR-1-directory-publish-tenant-metering.adoc[TD-METERDIR-1] (new, P1).
 
 | G10
 | One durability contract (D3)
 | Per-mode ratchet; crash-recovery and object-store restart suites green; TD-WAL-1 soak
-| The per-mode ratchet is **met** (TD-SPINE-5 tests). The Azurite object-store restart suite and `cold_backup_restore` passed in CI run 45465402994 (#2573 head `9c1b51e4c`). `wal_fsync_crash_recovery` runs in no CI lane. Open PR #2575 fixes two macOS cold-backup restore-path failures. The TD-WAL-1 soak has not run.
+| The per-mode ratchet is **met** (`spine5_local_scheme_infers_local_volume_with_default_root`, `spine5_object_scheme_infers_serverless_without_local_root`, `spine5_declared_mode_wins_over_inference` in `src/storage/persistence/write_ahead_log/config.rs`; upgrade ratchet `spine5_legacy_root_wal_replays_after_the_default_root_move`). The Azurite object-store restart suite and `cold_backup_restore` passed in CI run 45465402994 (#2573 head `9c1b51e4c`). `wal_fsync_crash_recovery` runs in no CI lane. Open PR #2575 fixes two macOS cold-backup restore-path failures. The TD-WAL-1 soak has not run.
 | link:../../10-quality/td/TD-SPINE-5-declared-durability-mode.adoc[TD-SPINE-5] (Partial). Soak: TD-WAL-1.
 
 | G11
@@ -374,7 +374,7 @@ refer to `docs/_internal/roadmap/BENCHMARK_EVIDENCE.toml`.
 | One planner
 | Same rows and the same route decision on every surface; owner/reader placement; cache-affine readers
 | In open PR #2574, not on develop: read-row parity across pgwire, `/api/v2/sql` and `/api/v2/query` (live server) and canonical `/sql`, gRPC and MCP (in-process; canonical `/sql` is unrouted since TD-V1SUNSET-1). Route-decision parity is structural only.
-| TD-SPINE-6 (#2574). Placement: a separate placement TD, to be filed by #2574 (not yet in its diff on 2026-11-25).
+| TD-SPINE-6 (#2574). Placement owner: the TD filed by #2574. It stays unnamed here until #2574 merges.
 
 | G13
 | Iceberg as an async projection of L1
@@ -398,5 +398,5 @@ refer to `docs/_internal/roadmap/BENCHMARK_EVIDENCE.toml`.
 | Real-cloud latency (Runbook)
 | `cloud_latency`, `object_store_latency_floor` and Iceberg planning GETs measured on real S3/Azure
 | Both ledger entries are `unverified` on develop. Open PR #2575 adds MinIO emulator legs and promotes `object_store_latency_floor` to measured on a localhost emulator.
-| Runbook. #2575 is to re-tag that entry so it cannot be cited as a cloud floor. Real cloud needs credentials.
+| Owner (not a TD): the Runbook (M5) row of <<_sequencing_and_gates>>, which needs real-cloud credentials. #2575 is to re-tag the `object_store_latency_floor` entry so it cannot be cited as a cloud floor.
 |===
