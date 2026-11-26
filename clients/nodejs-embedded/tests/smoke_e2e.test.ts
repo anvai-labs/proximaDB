@@ -39,7 +39,7 @@ maybe("live e2e smoke (re-based generated transport)", () => {
     await client
       .createCollection(name)
       .dimension(dim)
-      .engine(StorageEngine.Sst)
+      .engine(StorageEngine.Nova)
       .execute();
 
     // listCollections must work and return an array; we do NOT assert global
@@ -50,9 +50,16 @@ maybe("live e2e smoke (re-based generated transport)", () => {
     const listed = await client.listCollections();
     expect(Array.isArray(listed)).toBe(true);
 
-    const info = (await client.collection(name).info()) as { name?: string };
+    const info = (await client.collection(name).info()) as {
+      name?: string;
+      engine?: string;
+    };
     expect(info).toBeDefined();
     expect(info.name).toBe(name);
+    // The requested engine must reach the server. A NON-default engine is
+    // requested on purpose: the builder and the server both default to SST,
+    // so asserting "sst" would pass even if `.engine(...)` were dropped.
+    expect(info.engine).toBe("nova");
 
     // Record insert -> get round-trip.
     const recordId = "rec_1";

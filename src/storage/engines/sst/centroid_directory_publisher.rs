@@ -16,7 +16,8 @@
 //!    ON since D8): a covered segment also gets a **decode key** (its Region-A header
 //!    and footer: two more ranged reads, and its listed ETag), kept only when
 //!    the A0 the directory rebuilds from it is byte-identical to the
-//!    segment's. Entries carried from the base keep their key, if any.
+//!    segment's. Entries carried from the base keep their key; a carried
+//!    keyless entry is retried for one while keys are written.
 //!    TD-PAXMETA-1 (ADR-098 D2): an UNCOVERED segment that is coalesced PAX
 //!    (the untrained flush layout, or a trained segment whose dimension
 //!    mismatches the directory) also gets a key — the zero-encoded untrained
@@ -202,23 +203,45 @@ fn within(size_bytes: u64, off: u64, len: u64) -> bool {
     off.checked_add(len).is_some_and(|end| end <= size_bytes)
 }
 
+/// Outcome of one decode-key attempt. #2581 review MED-A: only a
+/// [`KeyAttempt::Unkeyable`] outcome (the object's own bytes cannot yield a
+/// key: legacy layout, out-of-bounds or unparsable parts, a refused key) is
+/// remembered by the `unkeyable` negative cache; a [`KeyAttempt::Transient`]
+/// read error leaves the object retryable by the next publish.
+enum KeyAttempt {
+    Keyed(Box<SegmentDecodeKey>),
+    Unkeyable,
+    Transient,
+}
+
+impl KeyAttempt {
+    fn from_built(built: anyhow::Result<SegmentDecodeKey>, url: &str) -> Self {
+        match built {
+            Ok(key) => KeyAttempt::Keyed(Box::new(key)),
+            Err(error) => {
+                tracing::debug!(%url, %error, "segment has no decode key");
+                KeyAttempt::Unkeyable
+            }
+        }
+    }
+}
+
 /// TD-PAXDIR-1 D6: read the rest of a covered segment's query-path metadata
-/// (the Region-A header and the footer) and build its decode key. `None` when
-/// a read fails or the parts disagree: the segment stays covered without a
-/// key and its queries read their own metadata.
+/// (the Region-A header and the footer) and build its decode key. Without a
+/// key the segment stays covered and its queries read their own metadata.
 async fn read_decode_key(
     fs: &dyn FileSystem,
     url: &str,
     size_bytes: u64,
     etag: Option<&str>,
     segment: &SegmentA0,
-) -> Option<SegmentDecodeKey> {
+) -> KeyAttempt {
     let header = &segment.header;
     let hdr_len = proximadb_block_format::region_header_len(segment.a0.model.dim) as u64;
     if !within(size_bytes, header.rabitq_off, hdr_len)
         || !within(size_bytes, header.footer_off, header.footer_len)
     {
-        return None;
+        return KeyAttempt::Unkeyable;
     }
     let read = async {
         let rabitq_header = fs.read_range(url, header.rabitq_off, hdr_len).await?;
@@ -231,13 +254,16 @@ async fn read_decode_key(
         Ok(parts) => parts,
         Err(error) => {
             tracing::debug!(%url, %error, "segment metadata unreadable; no decode key");
-            return None;
+            return KeyAttempt::Transient;
         }
     };
-    let footer = SegmentFooterIndex::parse(&footer).ok()?;
-    SegmentDecodeKey::from_segment(&segment.prefix, &segment.a0, &rabitq_header, &footer, etag)
-        .map_err(|error| tracing::debug!(%url, %error, "segment has no decode key"))
-        .ok()
+    let Ok(footer) = SegmentFooterIndex::parse(&footer) else {
+        return KeyAttempt::Unkeyable;
+    };
+    KeyAttempt::from_built(
+        SegmentDecodeKey::from_segment(&segment.prefix, &segment.a0, &rabitq_header, &footer, etag),
+        url,
+    )
 }
 
 /// Keys the published directory may keep: none when the write gate is off
@@ -261,19 +287,19 @@ fn retain_current_decode_keys(
 /// zero-encoded decode key — the coalesced-but-untrained segments a flush
 /// writes, and trained segments whose dimension mismatches the directory. Two
 /// ranged reads (header prefix, footer) — one when the caller passes the
-/// `prefix` it already read. `None` when the object is not
-/// coalesced PAX or any part disagrees: the segment stays uncovered and
-/// keyless, and its readers keep the per-segment footer path.
+/// `prefix` it already read. Unkeyable when the object is not coalesced PAX
+/// or any part disagrees: the segment stays uncovered and keyless, and its
+/// readers keep the per-segment footer path.
 async fn read_uncovered_decode_key(
     fs: &dyn FileSystem,
     url: &str,
     size_bytes: u64,
     etag: Option<&str>,
     prefix: Option<Vec<u8>>,
-) -> Option<SegmentDecodeKey> {
+) -> KeyAttempt {
     let prefix_len = (SEG_HEADER_PREFIX_LEN as u64).min(size_bytes);
     if prefix_len < SEG_HEADER_PREFIX_LEN as u64 {
-        return None;
+        return KeyAttempt::Unkeyable;
     }
     let prefix = match prefix {
         Some(prefix) => prefix,
@@ -281,18 +307,18 @@ async fn read_uncovered_decode_key(
             Ok(prefix) => prefix,
             Err(error) => {
                 tracing::debug!(%url, %error, "segment header unreadable; no untrained key");
-                return None;
+                return KeyAttempt::Transient;
             }
         },
     };
     if !is_coalesced_segment(&prefix) {
-        return None; // legacy block layout: never keyable
+        return KeyAttempt::Unkeyable; // legacy block layout: never keyable
     }
     let Ok(header) = SegmentHeaderPrefix::parse(&prefix) else {
-        return None;
+        return KeyAttempt::Unkeyable;
     };
     if header.footer_len == 0 || !within(size_bytes, header.footer_off, header.footer_len) {
-        return None;
+        return KeyAttempt::Unkeyable;
     }
     let footer = match fs
         .read_range(url, header.footer_off, header.footer_len)
@@ -301,18 +327,22 @@ async fn read_uncovered_decode_key(
         Ok(footer) => footer,
         Err(error) => {
             tracing::debug!(%url, %error, "segment footer unreadable; no untrained key");
-            return None;
+            return KeyAttempt::Transient;
         }
     };
-    let footer = SegmentFooterIndex::parse(&footer).ok()?;
-    SegmentDecodeKey::from_untrained_segment(&prefix, &footer, etag)
-        .map_err(|error| tracing::debug!(%url, %error, "segment has no untrained decode key"))
-        .ok()
+    let Ok(footer) = SegmentFooterIndex::parse(&footer) else {
+        return KeyAttempt::Unkeyable;
+    };
+    KeyAttempt::from_built(
+        SegmentDecodeKey::from_untrained_segment(&prefix, &footer, etag),
+        url,
+    )
 }
 
 /// Best-effort untrained-key attach for a segment just recorded as uncovered:
 /// a failure leaves it keyless (readers use the footer path), never errors
-/// the publish.
+/// the publish. Returns `true` when the attempt hit a read error (#2581
+/// review MED-A: retryable, so never recorded as unkeyable).
 async fn attach_untrained_key(
     builder: &mut proximadb_storage_common::centroid_directory::DirectoryBuilder,
     fs: &dyn FileSystem,
@@ -322,14 +352,19 @@ async fn attach_untrained_key(
     etag: Option<&str>,
     decode_keys: bool,
     prefix: Option<Vec<u8>>,
-) {
+) -> bool {
     if !decode_keys {
-        return;
+        return false;
     }
-    if let Some(key) = read_uncovered_decode_key(fs, url, size_bytes, etag, prefix).await
-        && let Err(error) = builder.set_decode_key(name, key)
-    {
-        tracing::debug!(%url, %error, "untrained decode key refused; publishing keyless");
+    match read_uncovered_decode_key(fs, url, size_bytes, etag, prefix).await {
+        KeyAttempt::Keyed(key) => {
+            if let Err(error) = builder.set_decode_key(name, *key) {
+                tracing::debug!(%url, %error, "untrained decode key refused; publishing keyless");
+            }
+            false
+        }
+        KeyAttempt::Unkeyable => false,
+        KeyAttempt::Transient => true,
     }
 }
 
@@ -367,25 +402,67 @@ fn verify_decode_keys(dir: &mut PaxCentroidDirectory, a0_by_name: &HashMap<Strin
     }
 }
 
-/// Newest directory in `entries` that reads and parses; corrupt or unreadable
-/// generations are skipped (an older valid base still saves A0 reads).
+/// The first directory among `objects` (`(generation, url)`, newest first)
+/// that reads, parses and records its listed generation; corrupt or
+/// unreadable generations are skipped. Shared by the publisher (an older
+/// valid base still saves A0 reads) and the query-side reader (a corrupt
+/// newest generation falls back instead of disabling the directory).
+/// `resident` serves a resident copy without a GET (TD-TIER-1 SC4-5; the
+/// query path), otherwise every object is read from the store (publish).
+/// Concrete owned inputs and a plain flag, not a generic iterator or an
+/// async closure: either makes the compaction worker future not `Send`.
+pub(crate) async fn first_valid_directory(
+    fs: &dyn FileSystem,
+    objects: &[(u64, String)],
+    resident: bool,
+) -> Option<PaxCentroidDirectory> {
+    first_valid_directory_noting_read_errors(fs, objects, resident)
+        .await
+        .0
+}
+
+/// [`first_valid_directory`], also reporting whether a NEWER object was
+/// skipped because it could not be READ (a possibly transient error), as
+/// opposed to read-but-invalid. #2581 review LOW-1: the reader caches a
+/// fallback only in the second case, so a transient error is retried.
+pub(crate) async fn first_valid_directory_noting_read_errors(
+    fs: &dyn FileSystem,
+    objects: &[(u64, String)],
+    resident: bool,
+) -> (Option<PaxCentroidDirectory>, bool) {
+    let mut skipped_unreadable = false;
+    for (generation, url) in objects {
+        let (generation, url) = (*generation, url.as_str());
+        let read = if resident {
+            crate::storage::engines::sst::segment_io::ResidentRangeRead::read_resident(fs, url)
+                .await
+        } else {
+            fs.read(url).await
+        };
+        match read {
+            Ok(bytes) => match PaxCentroidDirectory::parse(&bytes) {
+                Ok(dir) if dir.generation == generation => {
+                    return (Some(dir), skipped_unreadable);
+                }
+                Ok(_) => tracing::warn!(%url, "centroid directory generation mismatch"),
+                Err(error) => tracing::warn!(%url, %error, "corrupt centroid directory"),
+            },
+            Err(error) => {
+                skipped_unreadable = true;
+                tracing::warn!(%url, %error, "unreadable centroid directory");
+            }
+        }
+    }
+    (None, skipped_unreadable)
+}
+
+/// Newest directory in `objects` that reads and parses.
 async fn load_newest_valid(
     fs: &dyn FileSystem,
     objects: &[(u64, &DirEntry)],
 ) -> Option<PaxCentroidDirectory> {
-    for (generation, entry) in objects {
-        match fs.read(&entry.url).await {
-            Ok(bytes) => match PaxCentroidDirectory::parse(&bytes) {
-                Ok(dir) if dir.generation == *generation => return Some(dir),
-                Ok(_) => tracing::warn!(url = %entry.url, "centroid directory generation mismatch"),
-                Err(error) => {
-                    tracing::warn!(url = %entry.url, %error, "corrupt centroid directory")
-                }
-            },
-            Err(error) => tracing::warn!(url = %entry.url, %error, "unreadable centroid directory"),
-        }
-    }
-    None
+    let objects: Vec<(u64, String)> = objects.iter().map(|(g, e)| (*g, e.url.clone())).collect();
+    first_valid_directory(fs, &objects, false).await
 }
 
 /// The newest valid directory of the collection data directory `dir_url`
@@ -396,6 +473,124 @@ pub(crate) async fn load_newest_directory(
 ) -> Option<PaxCentroidDirectory> {
     let entries = fs.list(dir_url.trim_end_matches('/')).await.ok()?;
     load_newest_valid(fs, &directory_objects_newest_first(&entries)).await
+}
+
+/// Upper bound on keyless entries one publish retries for a key (#2581
+/// review MED-1): keeps the flush-time publish's extra reads bounded
+/// regardless of how many legacy keyless entries a directory carries.
+const MAX_KEY_UPGRADES_PER_PUBLISH: usize = 16;
+
+/// Process-local negative cache of objects a publish tried to key and could
+/// not (#2581 review MED-1), keyed by `(url, size, listed ETag)` so a
+/// rewritten object is tried afresh. Bounded: a full cache is reset, which
+/// only costs one more attempt per object.
+mod unkeyable {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock, PoisonError};
+
+    const MAX_ENTRIES: usize = 4096;
+
+    type Key = (String, u64, Option<String>);
+
+    fn set() -> &'static Mutex<HashSet<Key>> {
+        static SET: OnceLock<Mutex<HashSet<Key>>> = OnceLock::new();
+        SET.get_or_init(Default::default)
+    }
+
+    pub(super) fn contains(url: &str, size: u64, etag: Option<&str>) -> bool {
+        set()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(&(url.to_owned(), size, etag.map(str::to_owned)))
+    }
+
+    pub(super) fn insert(url: &str, size: u64, etag: Option<&str>) {
+        let mut set = set().lock().unwrap_or_else(PoisonError::into_inner);
+        if set.len() >= MAX_ENTRIES {
+            set.clear();
+        }
+        set.insert((url.to_owned(), size, etag.map(str::to_owned)));
+    }
+}
+
+/// Process-local backoff for keyless entries whose key attempt hit a READ
+/// error (#2581 review round 3): e.g. an Archive-tier blob or a persistent
+/// 403 keeps failing, and must not re-cost its reads on every publish nor
+/// hold the retry window. Clock-free by design: the backoff is counted in
+/// publishes that consider the entry (each skips it once), which is the
+/// unit the cost is paid in; a wall clock would add an untested time
+/// dependency and still need a per-publish rate. After the n-th consecutive
+/// failure the entry is skipped by the next `2^(n-1) - 1` publishes (capped
+/// at `MAX_SKIP`): the first retry is immediate. Keyed by
+/// `(url, size, listed ETag)` like the `unkeyable` cache; bounded the same
+/// way (a full map is reset, which only makes entries due early).
+mod retry_backoff {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock, PoisonError};
+
+    const MAX_ENTRIES: usize = 4096;
+    const MAX_SKIP: u32 = 63;
+
+    type Key = (String, u64, Option<String>);
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum Standing {
+        /// Never failed transiently: tried first.
+        Fresh,
+        /// Failed before; its backoff has run out.
+        Due,
+        /// Failed before; skipped by this publish.
+        Waiting,
+    }
+
+    struct State {
+        failures: u32,
+        skip: u32,
+    }
+
+    fn map() -> &'static Mutex<HashMap<Key, State>> {
+        static MAP: OnceLock<Mutex<HashMap<Key, State>>> = OnceLock::new();
+        MAP.get_or_init(Default::default)
+    }
+
+    fn key(url: &str, size: u64, etag: Option<&str>) -> Key {
+        (url.to_owned(), size, etag.map(str::to_owned))
+    }
+
+    /// The entry's standing for this publish; a `Waiting` entry's remaining
+    /// skip count is consumed. Call once per entry per publish.
+    pub(super) fn standing(url: &str, size: u64, etag: Option<&str>) -> Standing {
+        let mut map = map().lock().unwrap_or_else(PoisonError::into_inner);
+        match map.get_mut(&key(url, size, etag)) {
+            None => Standing::Fresh,
+            Some(state) if state.skip == 0 => Standing::Due,
+            Some(state) => {
+                state.skip -= 1;
+                Standing::Waiting
+            }
+        }
+    }
+
+    pub(super) fn record_failure(url: &str, size: u64, etag: Option<&str>) {
+        let mut map = map().lock().unwrap_or_else(PoisonError::into_inner);
+        if map.len() >= MAX_ENTRIES {
+            map.clear();
+        }
+        let state = map.entry(key(url, size, etag)).or_insert(State {
+            failures: 0,
+            skip: 0,
+        });
+        state.failures = state.failures.saturating_add(1);
+        let exp = state.failures.saturating_sub(1).min(31);
+        state.skip = (1u32 << exp).saturating_sub(1).min(MAX_SKIP);
+    }
+
+    pub(super) fn forget(url: &str, size: u64, etag: Option<&str>) {
+        map()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&key(url, size, etag));
+    }
 }
 
 async fn object_size(fs: &dyn FileSystem, entry: &DirEntry) -> Option<u64> {
@@ -413,6 +608,12 @@ pub async fn publish_centroid_directory(
     dir_url: &str,
 ) -> anyhow::Result<Option<u64>> {
     let dir_url = dir_url.trim_end_matches('/');
+    // Per-publish state shared by the create-only retries: keyless entries
+    // this publish already tried, and each entry's backoff standing (read
+    // once per publish, so a retry does not advance the backoff twice).
+    let mut tried_this_publish: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    let mut standings: HashMap<String, retry_backoff::Standing> = HashMap::new();
     for _ in 0..PUBLISH_ATTEMPTS {
         let entries = fs.list(dir_url).await?;
         let pending = retirement_ledger::pending_paths();
@@ -437,6 +638,10 @@ pub async fn publish_centroid_directory(
                 size_bytes,
             });
         }
+        let live_size: HashMap<&str, u64> = live
+            .iter()
+            .map(|s| (s.name.as_str(), s.size_bytes))
+            .collect();
         let objects = directory_objects_newest_first(&entries);
         let newest_generation = objects.first().map(|(g, _)| *g);
         let base = load_newest_valid(fs, &objects).await;
@@ -446,11 +651,78 @@ pub async fn publish_centroid_directory(
         // carried from a v2 base (no filter facts) — a one-time re-read of
         // that segment's header and footer, after which the v3 entry is
         // carried like any other.
-        let mut plan = plan_reconcile_keeping(base.as_ref(), &live, |segment| {
+        let carry = |segment: &DirectorySegment| {
             segment.decode_key.as_ref().is_none_or(|key| {
                 key_matches_listing(segment, &urls) && (key.filter_facts.is_some() || !decode_keys)
             })
+        };
+        // Post-#2535 review M1: a carried KEYLESS entry (a pre-key base, a
+        // transient footer-read failure, a key gate toggled off then on) is
+        // retried for a key while keys are written, instead of being carried
+        // keyless forever. Bounded (#2581 review MED-1): each object is tried
+        // at most once per process (`unkeyable` negative cache, also across
+        // this publish's create-only retries), and at most
+        // MAX_KEY_UPGRADES_PER_PUBLISH per publish, so a collection of
+        // permanently unkeyable legacy segments costs no reads in steady
+        // state. #2581 review LOW-2: a keyless entry records no ETag, so its
+        // carried coverage cannot be shown to describe the listed object; a
+        // COVERED candidate is therefore reloaded whole (cells + key) rather
+        // than given a fresh-ETag key on stale cells. An UNCOVERED candidate
+        // carries only its size, so its key is attached in place.
+        // #2581 review round 3: the window is filled with never-tried
+        // entries first, then entries whose transient-failure backoff has
+        // expired, and never with an entry this publish already tried (its
+        // create-only retries), so persistently failing entries cannot hold
+        // the window and starve keyable ones.
+        let candidates: Vec<DirectorySegment> = match (&base, decode_keys) {
+            (Some(base), true) => {
+                let mut fresh = Vec::new();
+                let mut due = Vec::new();
+                for s in &base.segments {
+                    if s.decode_key.is_some()
+                        || tried_this_publish.contains(&s.name)
+                        || live_size.get(s.name.as_str()) != Some(&s.size_bytes)
+                    {
+                        continue;
+                    }
+                    let Some((url, etag)) = urls.get(&s.name) else {
+                        continue;
+                    };
+                    if unkeyable::contains(url, s.size_bytes, etag.as_deref()) {
+                        continue;
+                    }
+                    let standing = *standings.entry(s.name.clone()).or_insert_with(|| {
+                        retry_backoff::standing(url, s.size_bytes, etag.as_deref())
+                    });
+                    match standing {
+                        retry_backoff::Standing::Fresh => fresh.push(s.clone()),
+                        retry_backoff::Standing::Due => due.push(s.clone()),
+                        retry_backoff::Standing::Waiting => {}
+                    }
+                }
+                fresh
+                    .into_iter()
+                    .chain(due)
+                    .take(MAX_KEY_UPGRADES_PER_PUBLISH)
+                    .collect()
+            }
+            _ => Vec::new(),
+        };
+        let reload: std::collections::HashSet<&str> = candidates
+            .iter()
+            .filter(|s| s.is_covered())
+            .map(|s| s.name.as_str())
+            .collect();
+        let mut plan = plan_reconcile_keeping(base.as_ref(), &live, |segment| {
+            !reload.contains(segment.name.as_str()) && carry(segment)
         });
+        // Whether anything OTHER than an upgrade attempt changed: an attempt
+        // that gains no key must not write a generation on its own.
+        let base_changed = if reload.is_empty() {
+            plan.changed
+        } else {
+            plan_reconcile_keeping(base.as_ref(), &live, carry).changed
+        };
         // A base older than the newest object (the newest was corrupt) is
         // republished even if it matches the live set, and so is one whose
         // keys the write gate no longer allows (turning the gate off must
@@ -460,10 +732,32 @@ pub async fn publish_centroid_directory(
             && base
                 .as_ref()
                 .is_some_and(|d| d.segments.iter().any(|s| s.decode_key.is_some()));
-        if !plan.changed && base_is_newest && !keys_to_drop {
+        if !plan.changed && base_is_newest && !keys_to_drop && candidates.is_empty() {
             return Ok(None);
         }
         let mut a0_by_name = HashMap::new();
+        // Segments whose key attempt this publish hit a READ error: retryable,
+        // never recorded as unkeyable (#2581 review MED-A).
+        let mut transient: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for segment in candidates.iter().filter(|s| !s.is_covered()) {
+            let Some((url, etag)) = urls.get(&segment.name) else {
+                continue;
+            };
+            if attach_untrained_key(
+                &mut plan.builder,
+                fs,
+                &segment.name,
+                url,
+                segment.size_bytes,
+                etag.as_deref(),
+                decode_keys,
+                None,
+            )
+            .await
+            {
+                transient.insert(segment.name.clone());
+            }
+        }
         for segment in &plan.to_load {
             let (url, etag) = &urls[&segment.name];
             match read_segment_a0_with_header(fs, url, segment.size_bytes).await {
@@ -478,7 +772,7 @@ pub async fn publish_centroid_directory(
                         // TD-PAXMETA-1: a trained segment the directory cannot
                         // address (dimension mismatch) still gets its
                         // collection-level facts published.
-                        attach_untrained_key(
+                        if attach_untrained_key(
                             &mut plan.builder,
                             fs,
                             &segment.name,
@@ -488,14 +782,24 @@ pub async fn publish_centroid_directory(
                             decode_keys,
                             Some(read.prefix.clone()),
                         )
-                        .await;
-                    } else if decode_keys
-                        && let Some(key) =
-                            read_decode_key(fs, url, segment.size_bytes, etag.as_deref(), &read)
-                                .await
-                        && plan.builder.set_decode_key(&segment.name, key).is_ok()
-                    {
-                        a0_by_name.insert(segment.name.clone(), read.a0_bytes);
+                        .await
+                        {
+                            transient.insert(segment.name.clone());
+                        }
+                    } else if decode_keys {
+                        match read_decode_key(fs, url, segment.size_bytes, etag.as_deref(), &read)
+                            .await
+                        {
+                            KeyAttempt::Keyed(key) => {
+                                if plan.builder.set_decode_key(&segment.name, *key).is_ok() {
+                                    a0_by_name.insert(segment.name.clone(), read.a0_bytes);
+                                }
+                            }
+                            KeyAttempt::Transient => {
+                                transient.insert(segment.name.clone());
+                            }
+                            KeyAttempt::Unkeyable => {}
+                        }
                     }
                 }
                 Ok(SegmentA0Read::Untrained { prefix }) => {
@@ -503,7 +807,7 @@ pub async fn publish_centroid_directory(
                         .add_uncovered(&segment.name, segment.size_bytes);
                     // TD-PAXMETA-1: a coalesced-but-untrained segment (the
                     // flush layout) carries its footer facts in the directory.
-                    attach_untrained_key(
+                    if attach_untrained_key(
                         &mut plan.builder,
                         fs,
                         &segment.name,
@@ -513,18 +817,67 @@ pub async fn publish_centroid_directory(
                         decode_keys,
                         prefix,
                     )
-                    .await;
+                    .await
+                    {
+                        transient.insert(segment.name.clone());
+                    }
                 }
                 // Transient read failure: leave the segment out of the stamp
                 // entirely, so readers scan it per segment and the next
-                // publish retries it.
-                Err(error) => tracing::warn!(%url, %error, "segment A0 unreadable; not stamped"),
+                // publish retries it (never recorded as unkeyable).
+                Err(error) => {
+                    transient.insert(segment.name.clone());
+                    tracing::warn!(%url, %error, "segment A0 unreadable; not stamped");
+                }
             }
         }
         let generation = newest_generation.map_or(1, |g| g.saturating_add(1));
         let mut dir = plan.builder.build(generation)?;
         verify_decode_keys(&mut dir, &a0_by_name);
         retain_current_decode_keys(&mut dir, decode_keys, &urls);
+        let upgraded = {
+            let by_name = dir.segment_indices_by_name();
+            let keyed = |name: &str| {
+                by_name
+                    .get(name)
+                    .and_then(|&idx| dir.segments.get(idx))
+                    .is_some_and(|s| s.decode_key.is_some())
+            };
+            if decode_keys {
+                // Every object this publish DEFINITIVELY could not key (its
+                // bytes yield none, or the key failed A0 verification) is not
+                // tried again by this process (review MED-1); a read error
+                // stays retryable (review MED-A).
+                let tried = candidates
+                    .iter()
+                    .map(|s| (s.name.as_str(), s.size_bytes))
+                    .chain(plan.to_load.iter().map(|s| (s.name.as_str(), s.size_bytes)));
+                for (name, size) in tried {
+                    let stamped = by_name.contains_key(name);
+                    let is_candidate = candidates.iter().any(|c| c.name == name);
+                    let Some((url, etag)) = urls.get(name) else {
+                        continue;
+                    };
+                    let etag = etag.as_deref();
+                    if keyed(name) {
+                        retry_backoff::forget(url, size, etag);
+                    } else if transient.contains(name) {
+                        // Retryable, but backed off (round 3) so a
+                        // persistently failing object stops costing reads on
+                        // every publish.
+                        retry_backoff::record_failure(url, size, etag);
+                    } else if stamped || is_candidate {
+                        unkeyable::insert(url, size, etag);
+                        retry_backoff::forget(url, size, etag);
+                    }
+                }
+            }
+            tried_this_publish.extend(candidates.iter().map(|c| c.name.clone()));
+            candidates.iter().any(|c| keyed(&c.name))
+        };
+        if !base_changed && base_is_newest && !keys_to_drop && !upgraded {
+            return Ok(None); // no candidate gained a key
+        }
         let bytes = dir.to_bytes()?;
         let url = format!("{dir_url}/{}", object_name(generation));
         // TD-TIER-1 SC5 residual: control objects (the centroid directory)
@@ -1095,6 +1448,455 @@ pub(crate) mod tests {
             assert_eq!(directory_at_flush_timeout(), default, "{keep:?}");
         }
         unsafe { std::env::remove_var(KNOB) };
+    }
+
+    fn range_reads_of(counters: &proximadb_storage_filesystem_types::counting::GetCounters) -> u64 {
+        counters
+            .range_reads
+            .load(std::sync::atomic::Ordering::Relaxed) as u64
+    }
+
+    /// #2581 review MED-1: a carried keyless entry that can never be keyed
+    /// (a legacy non-coalesced object long enough to cost a header read) is
+    /// tried once per process, not on every publish: the first keyed publish
+    /// pays its header read, the next pays none, and neither writes a
+    /// generation.
+    #[tokio::test]
+    async fn an_unkeyable_legacy_entry_is_tried_once_per_process() {
+        enable_trained_layout();
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("legacy.pax"), vec![7u8; 4096]).unwrap();
+        let fs = local_fs().await;
+        let dir_url = tmp.path().to_string_lossy().to_string();
+        // SAFETY: nextest runs each test in its own process.
+        unsafe { std::env::set_var("PROXIMADB_PAX_WRITE_DIRECTORY_DECODE_KEYS", "0") };
+        assert_eq!(
+            publish_centroid_directory(&fs, &dir_url).await.unwrap(),
+            Some(1)
+        );
+        let base = &newest(&fs, &dir_url).await[0].1;
+        let legacy = base.segments.iter().find(|s| s.name == "legacy.pax");
+        assert!(
+            legacy.is_some_and(|s| !s.is_covered() && s.decode_key.is_none()),
+            "the legacy object is stamped uncovered and keyless"
+        );
+
+        unsafe { std::env::set_var("PROXIMADB_PAX_WRITE_DIRECTORY_DECODE_KEYS", "1") };
+        let counters =
+            Arc::new(proximadb_storage_filesystem_types::counting::GetCounters::default());
+        let counting = proximadb_storage_filesystem_types::counting::CountingFileSystem::new(
+            Arc::new(local_fs().await),
+            counters.clone(),
+        );
+        assert_eq!(
+            publish_centroid_directory(&counting, &dir_url)
+                .await
+                .unwrap(),
+            None,
+            "an attempt that gains no key writes no generation"
+        );
+        let first = range_reads_of(&counters);
+        assert!(first >= 1, "the first attempt reads its header");
+        assert_eq!(
+            publish_centroid_directory(&counting, &dir_url)
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            range_reads_of(&counters) - first,
+            0,
+            "a known-unkeyable object is not re-read"
+        );
+    }
+
+    /// Fails the first `fail` ranged reads of `target` past offset 0 (the
+    /// key's footer read, not the header probe): a transient object-store
+    /// blip during a key attempt.
+    #[derive(Debug)]
+    struct FlakyFooterFs {
+        inner: Arc<LocalFileSystem>,
+        target: String,
+        fail: std::sync::atomic::AtomicUsize,
+    }
+
+    proximadb_storage_filesystem_types::forward_filesystem_impl! {
+        impl FileSystem for FlakyFooterFs => inner;
+        forward [
+            as_any, filesystem_type, supports_mmap, write,
+            supports_bounded_local_file_write, write_local_file, write_if_absent, append,
+            supports_append, supports_conditional_replace, delete, exists, metadata,
+            create_dir, create_dir_all, copy, move_file, sync, sync_file, sync_data, open_file,
+        ];
+        {
+            async fn read(&self, path: &str) -> proximadb_storage_filesystem_types::FsResult<Vec<u8>> {
+                self.inner.read(path).await
+            }
+
+            async fn read_range(
+                &self,
+                path: &str,
+                offset: u64,
+                length: u64,
+            ) -> proximadb_storage_filesystem_types::FsResult<Vec<u8>> {
+                use std::sync::atomic::Ordering;
+                if offset > 0
+                    && path.ends_with(&self.target)
+                    && self
+                        .fail
+                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                        .is_ok()
+                {
+                    return Err(FilesystemError::Io(std::io::Error::other(
+                        "injected transient footer read error",
+                    )));
+                }
+                self.inner.read_range(path, offset, length).await
+            }
+
+            async fn list(
+                &self,
+                path: &str,
+            ) -> proximadb_storage_filesystem_types::FsResult<Vec<DirEntry>> {
+                self.inner.list(path).await
+            }
+        }
+    }
+
+    /// #2581 review MED-A: a READ error during a fresh segment's key attempt
+    /// is transient — the segment is published keyless but NOT recorded as
+    /// unkeyable, so the next publish attaches its key.
+    #[tokio::test]
+    async fn a_transient_key_read_error_is_retried_by_the_next_publish() {
+        enable_trained_layout();
+        // SAFETY: nextest runs each test in its own process.
+        unsafe { std::env::set_var("PROXIMADB_PAX_WRITE_DIRECTORY_DECODE_KEYS", "1") };
+        let tmp = tempfile::tempdir().unwrap();
+        crate::storage::engines::sst::segment_format::write_pax_segment(
+            &tmp.path().join("l0.pax"),
+            &records(0, 300),
+            "col",
+            1,
+            VectorQuant::RaBitQ,
+            None,
+            None,
+        )
+        .expect("write untrained segment");
+        let dir_url = tmp.path().to_string_lossy().to_string();
+        let fs = FlakyFooterFs {
+            inner: Arc::new(local_fs().await),
+            target: "/l0.pax".into(),
+            fail: std::sync::atomic::AtomicUsize::new(1),
+        };
+        assert_eq!(
+            publish_centroid_directory(&fs, &dir_url).await.unwrap(),
+            Some(1)
+        );
+        let first = &newest(&fs, &dir_url).await[0].1;
+        assert!(
+            first.segments[0].decode_key.is_none(),
+            "the footer read failed: published keyless"
+        );
+        assert_eq!(
+            publish_centroid_directory(&fs, &dir_url).await.unwrap(),
+            Some(2),
+            "a transient failure is retried, not remembered as unkeyable"
+        );
+        let second = &newest(&fs, &dir_url).await[0].1;
+        assert!(second.segments[0].decode_key.is_some(), "key attached");
+    }
+
+    /// Every ranged read of an object whose name starts with `bad` fails (a
+    /// persistent transient-class error: an Archive-tier blob, a 403);
+    /// counts the failed reads.
+    #[derive(Debug)]
+    struct AlwaysFailingFs {
+        inner: Arc<LocalFileSystem>,
+        failed: std::sync::atomic::AtomicU64,
+    }
+
+    proximadb_storage_filesystem_types::forward_filesystem_impl! {
+        impl FileSystem for AlwaysFailingFs => inner;
+        forward [
+            as_any, filesystem_type, supports_mmap, write,
+            supports_bounded_local_file_write, write_local_file, write_if_absent, append,
+            supports_append, supports_conditional_replace, delete, exists, metadata,
+            create_dir, create_dir_all, copy, move_file, sync, sync_file, sync_data, open_file,
+        ];
+        {
+            async fn read(&self, path: &str) -> proximadb_storage_filesystem_types::FsResult<Vec<u8>> {
+                self.inner.read(path).await
+            }
+
+            async fn read_range(
+                &self,
+                path: &str,
+                offset: u64,
+                length: u64,
+            ) -> proximadb_storage_filesystem_types::FsResult<Vec<u8>> {
+                if path.rsplit('/').next().is_some_and(|n| n.starts_with("bad")) {
+                    self.failed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    return Err(FilesystemError::Io(std::io::Error::other(
+                        "injected persistent read error",
+                    )));
+                }
+                self.inner.read_range(path, offset, length).await
+            }
+
+            async fn list(
+                &self,
+                path: &str,
+            ) -> proximadb_storage_filesystem_types::FsResult<Vec<DirEntry>> {
+                self.inner.list(path).await
+            }
+        }
+    }
+
+    /// #2581 review round 3: more than a window of keyless entries that fail
+    /// TRANSIENTLY on every attempt, ahead (in name order) of one keyable
+    /// entry. Never-tried entries fill the window before retries, so the
+    /// keyable entry gets its key by the second publish; and failing entries
+    /// back off instead of being re-read on every publish.
+    #[tokio::test]
+    async fn persistently_failing_entries_neither_starve_the_window_nor_reread_every_publish() {
+        enable_trained_layout();
+        let tmp = tempfile::tempdir().unwrap();
+        let bad = MAX_KEY_UPGRADES_PER_PUBLISH + 1;
+        let write = |name: &str, seed: usize| {
+            crate::storage::engines::sst::segment_format::write_pax_segment(
+                &tmp.path().join(name),
+                &records(seed, 50),
+                "col",
+                1,
+                VectorQuant::RaBitQ,
+                None,
+                None,
+            )
+            .expect("write untrained segment");
+        };
+        for i in 0..bad {
+            write(&format!("bad{i:02}.pax"), i);
+        }
+        write("good.pax", 99);
+        let local = Arc::new(local_fs().await);
+        let dir_url = tmp.path().to_string_lossy().to_string();
+        // SAFETY: nextest runs each test in its own process.
+        unsafe { std::env::set_var("PROXIMADB_PAX_WRITE_DIRECTORY_DECODE_KEYS", "0") };
+        assert_eq!(
+            publish_centroid_directory(local.as_ref(), &dir_url)
+                .await
+                .unwrap(),
+            Some(1)
+        );
+        unsafe { std::env::set_var("PROXIMADB_PAX_WRITE_DIRECTORY_DECODE_KEYS", "1") };
+        let fs = AlwaysFailingFs {
+            inner: local.clone(),
+            failed: std::sync::atomic::AtomicU64::new(0),
+        };
+        let failed = || fs.failed.load(std::sync::atomic::Ordering::SeqCst);
+        let mut failed_per_publish = Vec::new();
+        let mut good_keyed_at = None;
+        for publish in 1..=3 {
+            let before = failed();
+            publish_centroid_directory(&fs, &dir_url).await.unwrap();
+            failed_per_publish.push(failed() - before);
+            let dir = &newest(&fs, &dir_url).await[0].1;
+            let good = dir.segments.iter().find(|s| s.name == "good.pax").unwrap();
+            if good.decode_key.is_some() && good_keyed_at.is_none() {
+                good_keyed_at = Some(publish);
+            }
+        }
+        assert!(
+            good_keyed_at.is_some_and(|p| p <= 2),
+            "the keyable entry is not starved: keyed at {good_keyed_at:?}"
+        );
+        // Publish 1: a full window of never-tried failing entries. Publish 2:
+        // the last never-tried failing entry + good + due retries. Publish 3:
+        // entries that failed twice wait, so far fewer reads than a window.
+        assert_eq!(failed_per_publish[0], MAX_KEY_UPGRADES_PER_PUBLISH as u64);
+        assert!(
+            failed_per_publish[2] < failed_per_publish[0],
+            "failing entries back off instead of costing a window every publish: \
+             {failed_per_publish:?}"
+        );
+    }
+
+    /// #2581 review LOW-C: with more keyless unkeyable entries than
+    /// MAX_KEY_UPGRADES_PER_PUBLISH, each publish attempts exactly one
+    /// window and the next publish the next one — nothing starves, and once
+    /// every entry is known unkeyable a publish reads nothing.
+    #[tokio::test]
+    async fn keyless_retries_advance_in_capped_windows() {
+        enable_trained_layout();
+        let tmp = tempfile::tempdir().unwrap();
+        let total = MAX_KEY_UPGRADES_PER_PUBLISH + 4;
+        for i in 0..total {
+            std::fs::write(
+                tmp.path().join(format!("legacy{i:02}.pax")),
+                vec![7u8; 4096],
+            )
+            .unwrap();
+        }
+        let fs = local_fs().await;
+        let dir_url = tmp.path().to_string_lossy().to_string();
+        // SAFETY: nextest runs each test in its own process.
+        unsafe { std::env::set_var("PROXIMADB_PAX_WRITE_DIRECTORY_DECODE_KEYS", "0") };
+        assert_eq!(
+            publish_centroid_directory(&fs, &dir_url).await.unwrap(),
+            Some(1)
+        );
+        unsafe { std::env::set_var("PROXIMADB_PAX_WRITE_DIRECTORY_DECODE_KEYS", "1") };
+        let counters =
+            Arc::new(proximadb_storage_filesystem_types::counting::GetCounters::default());
+        let counting = proximadb_storage_filesystem_types::counting::CountingFileSystem::new(
+            Arc::new(local_fs().await),
+            counters.clone(),
+        );
+        let mut attempted = Vec::new();
+        for _ in 0..3 {
+            let before = range_reads_of(&counters);
+            assert_eq!(
+                publish_centroid_directory(&counting, &dir_url)
+                    .await
+                    .unwrap(),
+                None
+            );
+            attempted.push(range_reads_of(&counters) - before);
+        }
+        assert_eq!(
+            attempted,
+            vec![MAX_KEY_UPGRADES_PER_PUBLISH as u64, 4, 0],
+            "one header read per attempted entry: a capped window, then the rest, then none"
+        );
+    }
+
+    /// #2581 review LOW-2: a keyless COVERED entry records no ETag, so its
+    /// carried cells cannot be shown to describe the listed object (a
+    /// same-size in-place rewrite keeps the size stamp). Such an entry is
+    /// reloaded whole (cells + key), never given a fresh-ETag key on the
+    /// carried cells. Stale coverage is planted directly: a keyless base
+    /// generation whose cells no longer match the object.
+    #[tokio::test]
+    async fn a_keyless_covered_entry_is_reloaded_not_keyed_onto_carried_cells() {
+        enable_trained_layout();
+        let tmp = tempfile::tempdir().unwrap();
+        write_segment(tmp.path(), "a.pax", 0);
+        let fs = local_fs().await;
+        let dir_url = tmp.path().to_string_lossy().to_string();
+        // SAFETY: nextest runs each test in its own process.
+        unsafe { std::env::set_var("PROXIMADB_PAX_WRITE_DIRECTORY_DECODE_KEYS", "0") };
+        assert_eq!(
+            publish_centroid_directory(&fs, &dir_url).await.unwrap(),
+            Some(1)
+        );
+        let truth = newest(&fs, &dir_url).await.remove(0).1;
+        let mut stale = truth.clone();
+        stale.generation = 2;
+        stale.cells[0].centroid[0] += 1.0;
+        fs.write_if_absent(
+            &format!("{dir_url}/{}", object_name(2)),
+            &stale.to_bytes().unwrap(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(newest(&fs, &dir_url).await[0].0, 2, "stale base planted");
+
+        unsafe { std::env::set_var("PROXIMADB_PAX_WRITE_DIRECTORY_DECODE_KEYS", "1") };
+        assert_eq!(
+            publish_centroid_directory(&fs, &dir_url).await.unwrap(),
+            Some(3),
+            "the keyless covered entry is reloaded"
+        );
+        let dir = newest(&fs, &dir_url).await.remove(0).1;
+        assert!(dir.segments[0].decode_key.is_some(), "reloaded with a key");
+        assert_eq!(dir.cells, truth.cells, "cells describe the live object");
+        assert_eq!(dir.models, truth.models);
+    }
+
+    /// Post-#2535 review M1: a keyless base (written with the key gate off,
+    /// as a pre-key directory or a transient key-read failure leaves it) is
+    /// upgraded by the next publish once keys are written, though no segment
+    /// changed; an entry that still cannot be keyed does not force a new
+    /// generation. Negative control: with the gate off the keyless base is
+    /// carried with zero segment reads.
+    #[tokio::test]
+    async fn a_keyless_base_entry_is_upgraded_to_a_keyed_one() {
+        enable_trained_layout();
+        let tmp = tempfile::tempdir().unwrap();
+        write_segment(tmp.path(), "a.pax", 0);
+        crate::storage::engines::sst::segment_format::write_pax_segment(
+            &tmp.path().join("l0.pax"),
+            &records(3, 300),
+            "col",
+            1,
+            VectorQuant::RaBitQ,
+            None,
+            None,
+        )
+        .expect("write untrained segment");
+        std::fs::write(tmp.path().join("garbage.pax"), b"not a segment").unwrap();
+        let fs = local_fs().await;
+        let dir_url = tmp.path().to_string_lossy().to_string();
+        // SAFETY: nextest runs each test in its own process.
+        unsafe { std::env::set_var("PROXIMADB_PAX_WRITE_DIRECTORY_DECODE_KEYS", "0") };
+        assert_eq!(
+            publish_centroid_directory(&fs, &dir_url).await.unwrap(),
+            Some(1)
+        );
+        let keyless = &newest(&fs, &dir_url).await[0].1;
+        assert!(keyless.segments.iter().all(|s| s.decode_key.is_none()));
+
+        // Negative control: gate still off ⇒ nothing to upgrade, no reads.
+        let counters =
+            Arc::new(proximadb_storage_filesystem_types::counting::GetCounters::default());
+        let counting = proximadb_storage_filesystem_types::counting::CountingFileSystem::new(
+            Arc::new(local_fs().await),
+            counters.clone(),
+        );
+        assert_eq!(
+            publish_centroid_directory(&counting, &dir_url)
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            counters
+                .range_reads
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "gate off: keyless entries are carried without segment reads"
+        );
+
+        // Gate on: the unchanged live set is republished with keys attached.
+        unsafe { std::env::set_var("PROXIMADB_PAX_WRITE_DIRECTORY_DECODE_KEYS", "1") };
+        assert_eq!(
+            publish_centroid_directory(&fs, &dir_url).await.unwrap(),
+            Some(2),
+            "keyless entries are retried, not carried keyless forever"
+        );
+        let keyed = &newest(&fs, &dir_url).await[0].1;
+        let a = keyed.segments.iter().find(|s| s.name == "a.pax").unwrap();
+        assert!(a.is_covered(), "coverage is carried, not dropped");
+        assert!(a.decode_key.is_some(), "covered entry gained its key");
+        let l0 = keyed.segments.iter().find(|s| s.name == "l0.pax").unwrap();
+        assert!(l0.decode_key.is_some(), "untrained entry gained its key");
+        let garbage = keyed
+            .segments
+            .iter()
+            .find(|s| s.name == "garbage.pax")
+            .unwrap();
+        assert!(
+            garbage.decode_key.is_none(),
+            "unkeyable entry stays keyless"
+        );
+
+        // Only the unkeyable entry is left keyless: it is retried, but no new
+        // generation is written for it.
+        assert_eq!(
+            publish_centroid_directory(&fs, &dir_url).await.unwrap(),
+            None
+        );
     }
 
     /// TD-PAXMETA-1 (ADR-098 D2): an untrained (flush-layout) coalesced

@@ -102,76 +102,131 @@ fn test_fp16_distance_accuracy() {
     );
 }
 
+// Recall fixture for centroid block selection. A single random query made this
+// test flaky: with top-10 the old `>= 0.99` bar meant exactly 10/10, so one
+// near-tie flipped by fp16 rounding at rank 10 failed CI. The fixture is now
+// seeded and scores the MEAN recall@10 over many queries against the ANN
+// target, with a negative control proving the bar can fail.
+const RECALL_CENTROIDS: usize = 100;
+const RECALL_DIMENSION: usize = 128;
+const RECALL_QUERIES: usize = 1000;
+const RECALL_TOP_K: usize = 10;
+const RECALL_SEED: u64 = 0x5EED_F016;
+/// ANN recall target for centroid selection (mean recall@10). Measured
+/// 2026-11-26 (`measure_fp16_recall_margin`): fp16 scores min 0.9988 /
+/// mean 0.9995 over 200 seeds, so the bar has a wide margin.
+const RECALL_TARGET: f64 = 0.975;
+/// Low fp16 mantissa bits dropped by the negative control (fp16 keeps 10).
+/// The smallest count that fails the bar: dropping 5 scores 0.9824 (passes),
+/// dropping 6 scores 0.9668 (fails).
+const COARSE_DROPPED_MANTISSA_BITS: u32 = 6;
+
+fn top_k_ids(query: &[f32], centroids: &[Vec<f32>], k: usize) -> Vec<usize> {
+    let mut distances: Vec<(usize, f32)> = centroids
+        .iter()
+        .enumerate()
+        .map(|(idx, centroid)| (idx, euclidean_distance(query, centroid)))
+        .collect();
+    distances.sort_by(|a, b| a.1.total_cmp(&b.1));
+    distances.iter().take(k).map(|(idx, _)| *idx).collect()
+}
+
+fn fp16_round_trip(values: &[f32]) -> Vec<f32> {
+    fp16_to_fp32(&fp32_to_fp16(values))
+}
+
+/// fp16 round trip with the low `bits` mantissa bits zeroed: a deliberately
+/// coarser conversion the recall bar must reject.
+fn coarse_round_trip(values: &[f32], bits: u32) -> Vec<f32> {
+    let mask: u16 = !((1u16 << bits) - 1);
+    let coarse: Vec<u16> = fp32_to_fp16(values).iter().map(|h| h & mask).collect();
+    fp16_to_fp32(&coarse)
+}
+
+/// Mean recall@10 of `convert`ed centroids against the fp32 ground truth over
+/// `RECALL_QUERIES` seeded queries, plus the number of queries below 10/10.
+fn mean_recall_at_k(seed: u64, convert: &dyn Fn(&[f32]) -> Vec<f32>) -> (f64, usize) {
+    use rand::{Rng, SeedableRng};
+    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+    let centroids: Vec<Vec<f32>> = (0..RECALL_CENTROIDS)
+        .map(|_| {
+            (0..RECALL_DIMENSION)
+                .map(|_| rng.gen_range(0.0..1.0))
+                .collect()
+        })
+        .collect();
+    let converted: Vec<Vec<f32>> = centroids.iter().map(|c| convert(c)).collect();
+
+    let mut hits = 0usize;
+    let mut imperfect = 0usize;
+    for _ in 0..RECALL_QUERIES {
+        let query: Vec<f32> = (0..RECALL_DIMENSION)
+            .map(|_| rng.gen_range(0.0..1.0))
+            .collect();
+        let truth = top_k_ids(&query, &centroids, RECALL_TOP_K);
+        let got = top_k_ids(&query, &converted, RECALL_TOP_K);
+        let found = truth.iter().filter(|id| got.contains(id)).count();
+        hits += found;
+        if found < RECALL_TOP_K {
+            imperfect += 1;
+        }
+    }
+    (
+        hits as f64 / (RECALL_QUERIES * RECALL_TOP_K) as f64,
+        imperfect,
+    )
+}
+
 #[test]
 fn test_fp16_recall_preservation() {
-    // Test that block selection with FP16 centroids maintains high recall
-    // Generate 100 random centroids and a query
-    use rand::Rng;
-    let mut rng = rand::thread_rng();
-
-    let num_centroids = 100;
-    let dimension = 128;
-    let top_k = 10;
-
-    // Generate random query
-    let query: Vec<f32> = (0..dimension).map(|_| rng.gen_range(0.0..1.0)).collect();
-
-    // Generate random centroids
-    let centroids_fp32: Vec<Vec<f32>> = (0..num_centroids)
-        .map(|_| (0..dimension).map(|_| rng.gen_range(0.0..1.0)).collect())
-        .collect();
-
-    // Compute distances with FP32 and find top K
-    let mut distances_fp32: Vec<(usize, f32)> = centroids_fp32
-        .iter()
-        .enumerate()
-        .map(|(idx, centroid)| (idx, euclidean_distance(&query, centroid)))
-        .collect();
-    distances_fp32.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
-    let top_k_fp32: Vec<usize> = distances_fp32
-        .iter()
-        .take(top_k)
-        .map(|(idx, _)| *idx)
-        .collect();
-
-    // Convert centroids to FP16 and back, compute distances, find top K
-    let centroids_fp16: Vec<Vec<u16>> = centroids_fp32.iter().map(|c| fp32_to_fp16(c)).collect();
-    let centroids_fp32_reconstructed: Vec<Vec<f32>> =
-        centroids_fp16.iter().map(|c| fp16_to_fp32(c)).collect();
-
-    let mut distances_fp16: Vec<(usize, f32)> = centroids_fp32_reconstructed
-        .iter()
-        .enumerate()
-        .map(|(idx, centroid)| (idx, euclidean_distance(&query, centroid)))
-        .collect();
-    distances_fp16.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
-    let top_k_fp16: Vec<usize> = distances_fp16
-        .iter()
-        .take(top_k)
-        .map(|(idx, _)| *idx)
-        .collect();
-
-    // Calculate recall
-    let intersection = top_k_fp32
-        .iter()
-        .filter(|&idx| top_k_fp16.contains(idx))
-        .count();
-    let recall = intersection as f32 / top_k as f32;
-
+    let (recall, imperfect) = mean_recall_at_k(RECALL_SEED, &fp16_round_trip);
     println!(
-        "Top-{} recall with FP16 centroids: {:.2}%",
-        top_k,
-        recall * 100.0
+        "fp16 mean recall@{RECALL_TOP_K} over {RECALL_QUERIES} queries: {recall:.4} \
+         ({imperfect} queries below {RECALL_TOP_K}/{RECALL_TOP_K})"
     );
-    println!("FP32 top-{}: {:?}", top_k, top_k_fp32);
-    println!("FP16 top-{}: {:?}", top_k, top_k_fp16);
-
-    // Recall should be >= 99% (allowing for 1 mismatch in top-10)
     assert!(
-        recall >= 0.99,
-        "Recall with FP16 centroids too low: {:.2}%. Expected >= 99%",
-        recall * 100.0
+        recall >= RECALL_TARGET,
+        "fp16 centroid mean recall@{RECALL_TOP_K} {recall:.4} is below the ANN target {RECALL_TARGET}"
     );
+
+    // Negative control: a coarser conversion must fail the same bar, or the
+    // bar proves nothing.
+    let (coarse_recall, _) = mean_recall_at_k(RECALL_SEED, &|values| {
+        coarse_round_trip(values, COARSE_DROPPED_MANTISSA_BITS)
+    });
+    println!(
+        "coarse ({COARSE_DROPPED_MANTISSA_BITS} mantissa bits dropped) mean recall@{RECALL_TOP_K}: {coarse_recall:.4}"
+    );
+    assert!(
+        coarse_recall < RECALL_TARGET,
+        "negative control passed the bar ({coarse_recall:.4} >= {RECALL_TARGET}); the bar has no teeth"
+    );
+}
+
+/// Margin measurement behind `RECALL_TARGET` and `COARSE_DROPPED_MANTISSA_BITS`:
+/// `cargo nextest run --test fp16_centroid_test --run-ignored only --no-capture`.
+#[test]
+#[ignore = "measurement only"]
+fn measure_fp16_recall_margin() {
+    let seeds = 200u64;
+    let mut min = f64::MAX;
+    let mut sum = 0.0;
+    for seed in 0..seeds {
+        let (recall, _) = mean_recall_at_k(seed, &fp16_round_trip);
+        min = min.min(recall);
+        sum += recall;
+    }
+    println!(
+        "fp16 over {seeds} seeds: min {min:.4}, mean {:.4}",
+        sum / seeds as f64
+    );
+    for bits in 1..=8u32 {
+        let (recall, imperfect) =
+            mean_recall_at_k(RECALL_SEED, &|values| coarse_round_trip(values, bits));
+        println!(
+            "drop {bits} mantissa bits: mean recall {recall:.4}, {imperfect} imperfect queries"
+        );
+    }
 }
 
 #[test]

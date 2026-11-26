@@ -71,9 +71,13 @@ pub enum EngineType {
     Raptor,
 }
 
-impl From<StorageFormatStrategy> for EngineType {
-    fn from(strategy: StorageFormatStrategy) -> Self {
-        match strategy {
+/// Fallible: the VIPER wire tombstone (ADR-093) has no reader and must fail
+/// closed rather than be silently read by another engine's reader.
+impl TryFrom<StorageFormatStrategy> for EngineType {
+    type Error = datafusion::error::DataFusionError;
+
+    fn try_from(strategy: StorageFormatStrategy) -> Result<Self, Self::Error> {
+        Ok(match strategy {
             StorageFormatStrategy::Sst => EngineType::Sst,
             StorageFormatStrategy::Helix => EngineType::Helix,
             StorageFormatStrategy::Swift => EngineType::Swift,
@@ -85,10 +89,16 @@ impl From<StorageFormatStrategy> for EngineType {
             StorageFormatStrategy::TimeSeries => EngineType::Helix, // HELIX is time-series
             StorageFormatStrategy::Chrono => EngineType::Helix,     // temporal -> time-series
             StorageFormatStrategy::Cedar => EngineType::Nova,       // multimodal -> columnar
-            // VIPER removed (ADR-093): the wire tombstone routes to NOVA,
-            // the surviving columnar-Parquet label.
-            StorageFormatStrategy::Viper => EngineType::Nova,
-        }
+            // VIPER removed (ADR-093): the wire tombstone value is kept but
+            // has no reader, so it fails closed instead of aliasing NOVA.
+            StorageFormatStrategy::Viper => {
+                return Err(datafusion::error::DataFusionError::NotImplemented(
+                    "storage engine VIPER was removed (ADR-093); \
+                     no DataFusion reader exists for VIPER collections"
+                        .to_string(),
+                ));
+            }
+        })
     }
 }
 
@@ -486,14 +496,18 @@ mod tests {
 
     #[test]
     fn test_engine_type_conversion() {
-        assert_eq!(
-            EngineType::from(StorageFormatStrategy::Sst),
-            EngineType::Sst
-        );
-        // VIPER tombstone routes to the NOVA columnar label (ADR-093)
-        assert_eq!(
-            EngineType::from(StorageFormatStrategy::Viper),
-            EngineType::Nova
+        assert!(matches!(
+            EngineType::try_from(StorageFormatStrategy::Sst),
+            Ok(EngineType::Sst)
+        ));
+        // VIPER tombstone fails closed (ADR-093) instead of aliasing a reader.
+        let err = EngineType::try_from(StorageFormatStrategy::Viper)
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(
+            err.contains("ADR-093"),
+            "VIPER must fail closed, got: {err:?}"
         );
         assert_eq!(
             StorageFormatStrategy::from(EngineType::Nova),

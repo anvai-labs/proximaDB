@@ -500,16 +500,15 @@ describe("OpenAPI contract gate", () => {
     expect(captured.body).toMatchObject({ name: "c", dimension: 4, description: "d" });
   });
 
-  it.each([
+  it.each<[IndexType, Record<string, unknown>, string[]]>([
     [IndexType.Hnsw, { index_type: "hnsw" }, ["index_configs", "index_policy"]],
     [IndexType.Flat, { index_policy: { mode: "exact" } }, ["index_type", "index_configs"]],
     ...[IndexType.Ivf, IndexType.Lsh, IndexType.Pq, IndexType.Annoy].map(
-      (t) =>
-        [
-          t,
-          { index_configs: [{ algorithm: t, is_primary: true }] },
-          ["index_type", "index_policy"],
-        ] as const,
+      (t): [IndexType, Record<string, unknown>, string[]] => [
+        t,
+        { index_configs: [{ algorithm: t, is_primary: true }] },
+        ["index_type", "index_policy"],
+      ],
     ),
   ])("index %s maps to the field that expresses it", async (index, expected, absent) => {
     const captured = await createWithIndex(index);

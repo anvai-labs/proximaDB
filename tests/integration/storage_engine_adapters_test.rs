@@ -530,18 +530,18 @@ mod cross_engine_tests {
         );
 
         // Test StorageEngineStrategy -> EngineType
-        assert_eq!(
-            EngineType::from(StorageEngineStrategy::Sst),
-            EngineType::Sst
-        );
-        assert_eq!(
-            EngineType::from(StorageEngineStrategy::Helix),
-            EngineType::Helix
-        );
-        assert_eq!(
-            EngineType::from(StorageEngineStrategy::Nova),
-            EngineType::Nova
-        );
+        assert!(matches!(
+            EngineType::try_from(StorageEngineStrategy::Sst),
+            Ok(EngineType::Sst)
+        ));
+        assert!(matches!(
+            EngineType::try_from(StorageEngineStrategy::Helix),
+            Ok(EngineType::Helix)
+        ));
+        assert!(matches!(
+            EngineType::try_from(StorageEngineStrategy::Nova),
+            Ok(EngineType::Nova)
+        ));
     }
 
     #[test]

@@ -510,14 +510,14 @@ fn test_engine_type_display() {
 fn test_engine_type_conversion() {
     use proximadb::storage::traits::StorageEngineStrategy;
 
-    assert_eq!(
-        EngineType::from(StorageEngineStrategy::Sst),
-        EngineType::Sst
-    );
-    assert_eq!(
-        EngineType::from(StorageEngineStrategy::Nova),
-        EngineType::Nova
-    );
+    assert!(matches!(
+        EngineType::try_from(StorageEngineStrategy::Sst),
+        Ok(EngineType::Sst)
+    ));
+    assert!(matches!(
+        EngineType::try_from(StorageEngineStrategy::Nova),
+        Ok(EngineType::Nova)
+    ));
     assert_eq!(
         StorageEngineStrategy::from(EngineType::Nova),
         StorageEngineStrategy::Nova

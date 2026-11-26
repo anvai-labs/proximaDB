@@ -1076,6 +1076,16 @@ impl PaxCentroidDirectory {
         Ok(())
     }
 
+    /// Entry index by segment name, built once per call site so a per-file
+    /// lookup over a listing is O(files), not O(files × entries).
+    pub fn segment_indices_by_name(&self) -> HashMap<&str, usize> {
+        self.segments
+            .iter()
+            .enumerate()
+            .map(|(idx, s)| (s.name.as_str(), idx))
+            .collect()
+    }
+
     /// Covered segments by name — the entries a reader may use, provided the
     /// live object still has the recorded size.
     pub fn covered_segments(&self) -> impl Iterator<Item = (usize, &DirectorySegment)> {

@@ -169,7 +169,7 @@ fn run_ttl_conformance(engine: &str, path: PathKind) {
             "TTL_CONFORMANCE engine={engine} path={} verdict=n/a reason=\"create_collection failed: {e}\"",
             path.label()
         );
-        // Not selectable for new collections (e.g. VIPER after ADR-093 S2):
+        // Not selectable for new collections (e.g. VIPER, removed by ADR-093):
         // the create-path matrix does not apply. Fail loudly only if the
         // error is something other than a rejection of the engine itself.
         let msg = e.to_string().to_lowercase();
@@ -319,8 +319,6 @@ ttl_case!(helix_unflushed_hides_expired, "helix", PathKind::Unflushed);
 ttl_case!(helix_flushed_hides_expired, "helix", PathKind::Flushed);
 ttl_case!(nova_unflushed_hides_expired, "nova", PathKind::Unflushed);
 ttl_case!(nova_flushed_hides_expired, "nova", PathKind::Flushed);
-ttl_case!(viper_unflushed_hides_expired, "viper", PathKind::Unflushed);
-ttl_case!(viper_flushed_hides_expired, "viper", PathKind::Flushed);
 ttl_case!(tst_unflushed_hides_expired, "tst", PathKind::Unflushed);
 ttl_case!(
     tst_flushed_hides_expired,

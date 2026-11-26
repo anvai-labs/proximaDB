@@ -1580,8 +1580,8 @@ impl UnifiedStorageFormat for NovaEngine {
         // it builds (see columnar_reader.rs), so it can't be used for MVCC
         // resolution or dead-record filtering. This reads the raw Arrow
         // columns directly instead, mirroring the pattern VIPER's own
-        // point-read and the shared compaction dedup
-        // (columnar_compaction.rs::deduplicate_arrow_batches) already use —
+        // point-read and the former shared compaction dedup (since removed)
+        // used —
         // NOT VIPER's dead-record check itself, which has its own bugs (see
         // TD-DSEFF-2): it compares the millisecond `expires_at` column
         // against `timestamp_micros()` (1000x unit mismatch) and skips
