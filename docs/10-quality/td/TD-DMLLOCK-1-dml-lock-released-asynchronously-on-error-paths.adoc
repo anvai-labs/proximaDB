@@ -1,0 +1,43 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-DMLLOCK-1: a rejected write releases its DML lock asynchronously — the client's next statement can see 55P03
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open** (filed 2026-11-26; surfaced by the TD-SPINE-6 round-5 review).
+| Priority | **MEDIUM**. Not a correctness or isolation bug (the lock is eventually released and no write is lost), but a client-visible spurious failure. A driver that issues its next statement right after a rejected write, for example a retry after a 23505 or a 42501, can get a lock conflict against its OWN previous statement. That is 55P03 on pgwire and 409 `lock_conflict` on REST.
+| Component | `src/cluster/partition_lease.rs` `impl Drop for DmlLockGuard` (~3005-3022): it releases through `tokio::spawn(... release_full ...)`, which is asynchronous and unordered with the caller's next statement. `src/services/dml/mod.rs` `finish_dml_guards` (~1456) is the deterministic release, but only the success and zero-row exits call it (~5632, ~5796, ~6703, ~6908, ~7011). Every `?` error exit after `acquire_table_dml_lock` (~1931) falls back to the `Drop` path instead: constraint violations, the TD-DML-3 RLS denial, coercion and catalog errors.
+| Relates to | TD-DML-1 / TD-DML-3 (the error classes that take the async path), TD-SPINE-6 (round-5 review; the `tests/abac_relational_transport_e2e.rs` retry that works around it)
+|===
+
+== Scenario
+
+. The client sends `INSERT … ON CONFLICT DO UPDATE` and the statement fails after taking the table
+  DML lock, for example with 42501 because the conflicting row is invisible to the caller.
+. The error propagates with `?`, and `DmlLockGuard` drops. `Drop` spawns the release and returns.
+. The client sends its next write on the same table at once. If the spawned release has not run
+  yet, `acquire_dml_lock_guard` fails with a conflict whose holder is the client's own prior
+  statement.
+
+== Fix approach
+
+Release deterministically on every exit, not only on success. Two options:
+
+* Wrap the post-acquisition body in a scope helper, for example
+  `with_dml_guards(guards, async { … }).await`, that awaits `finish_dml_guards` on both `Ok` and
+  `Err` before it returns the result.
+* Restructure each locked section as `let result = async { … }.await; self.finish_dml_guards(guards).await; result`.
+  This turns every `?` inside it into a value that is matched after the release.
+
+Keep `Drop` as the backstop for cancellation, which is the only path that can still be
+asynchronous. Count drop-path releases in a metric so a regression is observable.
+
+== Acceptance
+
+* A statement issued **immediately** after a rejected write never sees 55P03 or REST 409
+  `lock_conflict` caused by that rejected write. Test this on pgwire and REST: 23505, 42501 and a
+  coercion error, each followed at once by a write, with zero sleeps and zero retries.
+* The `tests/abac_relational_transport_e2e.rs` 55P03 / `lock conflict` retry is removed, and that
+  test stays green over repeated runs.
+* The drop-path release metric reads zero on the non-cancelled error paths.

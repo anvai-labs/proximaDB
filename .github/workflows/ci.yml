@@ -762,6 +762,14 @@ jobs:
               - 'tests/auth_failclosed_e2e.rs'
               - 'src/security/**'
               - 'src/services/operations/vectors/**'
+              # TD-SPINE-6 round 5: the relational ABAC row filter and the
+              # TD-DML-3 ON CONFLICT read-policy check live in the DML service,
+              # and the SQL authority stamps the caller in the facade adapter.
+              # (`src/query/**` is deliberately NOT listed whole — it is hot and
+              # mostly authz-neutral; the facade is the authz-bearing seam.)
+              - 'src/services/dml/**'
+              - 'src/query/facade/**'
+              - 'src/query/unified_query_port_impl.rs'
               - 'crates/control/proximadb-abac/**'
               - 'crates/control/proximadb-catalog/**'
               - 'src/network/rest/canonical/abac_admin.rs'

@@ -2509,6 +2509,14 @@ impl ProximaRecordService for ProximaRecordServiceImpl {
                     None => format!("DML lock conflict on {resource}"),
                 };
                 Status::aborted(msg)
+            } else if let Some(violation) =
+                proximadb_catalog::relational::find_relational_constraint_violation(&e)
+            {
+                // Round 5: a typed relational violation keeps its own message
+                // and status class — the same mapping as REST /api/v2/sql
+                // (42501 → PERMISSION_DENIED, 23/21 → ABORTED, else
+                // INVALID_ARGUMENT).
+                crate::network::rest::v2::sql::relational_violation_to_api_error(violation).into()
             } else {
                 Status::internal(format!("ExecuteQuery failed: {e}"))
             }

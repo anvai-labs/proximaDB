@@ -6565,8 +6565,17 @@ export interface operations {
                     "application/json": components["schemas"]["SqlResponse"];
                 };
             };
-            /** @description Invalid SQL request. */
+            /** @description Invalid SQL request (incl. data / undefined-object violations). */
             400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Insufficient privilege (SQLSTATE 42501, e.g. a row-level-security denial). */
+            403: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -6583,7 +6592,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorResponse"];
                 };
             };
-            /** @description Write lock conflict. */
+            /** @description Write lock conflict, or an integrity / cardinality violation (SQLSTATE class 23 / 21). */
             409: {
                 headers: {
                     [name: string]: unknown;

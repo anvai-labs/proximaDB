@@ -1675,8 +1675,9 @@ async fn sql_status(client: &AuthenticatedSqlClient, sql: &str) -> (StatusCode, 
 ///   CONFLICT DO UPDATE` of an invisible row must be 42501, like the plain
 ///   upsert (positive control on the same connection);
 /// * the SQL authority (`/api/v2/sql`): the plain upsert and its `EXPLAIN
-///   (ANALYZE)` form are rejected (the authority's write dispatch never
-///   stamped the caller either).
+///   (ANALYZE)` form are 403 with the RLS message (the authority's write
+///   dispatch never stamped the caller either);
+/// * gRPC `ExecuteQuery` (the same authority): both are PERMISSION_DENIED.
 ///
 /// The row is unchanged afterwards (read back once a permit exists).
 #[test]
@@ -1730,7 +1731,9 @@ async fn explain_analyze_upsert_enforces_the_on_conflict_read_policy_inner() {
     };
     // `DmlLockGuard` releases asynchronously (a spawned task on drop), so a
     // statement issued right after a rejected write can see a transient lock
-    // conflict (55P03); retry ONLY that outcome.
+    // conflict (55P03); retry ONLY that outcome. Tracked as TD-DMLLOCK-1
+    // (docs/10-quality/td/TD-DMLLOCK-1-dml-lock-released-asynchronously-on-error-paths.adoc):
+    // remove this retry once error exits release deterministically.
     async fn pg_outcome(
         pg: &tokio_postgres::Client,
         sql: &str,
@@ -1754,6 +1757,7 @@ async fn explain_analyze_upsert_enforces_the_on_conflict_read_policy_inner() {
 
     // The SQL authority (REST /api/v2/sql).
     for sql in [&upsert, &analyzed] {
+        // Same transient lock conflict as above (TD-DMLLOCK-1).
         let mut outcome = sql_status(&alice, sql).await;
         for _ in 0..40 {
             if !outcome.1.contains("lock conflict") {
@@ -1764,8 +1768,45 @@ async fn explain_analyze_upsert_enforces_the_on_conflict_read_policy_inner() {
         }
         let (status, body) = outcome;
         assert!(
-            !status.is_success() && body.contains("row-level security"),
+            status == StatusCode::FORBIDDEN && body.contains("row-level security"),
             "/api/v2/sql must enforce the ON CONFLICT read policy for {sql}: {status} {body}"
+        );
+    }
+
+    // gRPC ExecuteQuery (round 5, LOW-D): the same authority write dispatch;
+    // the typed RLS denial surfaces as PERMISSION_DENIED with its message.
+    let mut grpc = connect_grpc(&server).await;
+    for sql in [&upsert, &analyzed] {
+        let mut outcome = None;
+        for _ in 0..40 {
+            let request = authenticated_grpc_request(
+                V2QueryRequest {
+                    query: sql.to_string(),
+                    collection_id: String::new(),
+                    limit: None,
+                    offset: None,
+                },
+                ALICE_KEY,
+            );
+            match grpc.execute_query(request).await {
+                // Transient lock conflict from the prior rejected write
+                // (TD-DMLLOCK-1).
+                Err(status) if status.code() == tonic::Code::Aborted => {
+                    sleep(Duration::from_millis(100)).await;
+                }
+                other => {
+                    outcome = Some(other);
+                    break;
+                }
+            }
+        }
+        let status = outcome
+            .expect("gRPC outcome")
+            .expect_err("gRPC must reject the RLS-invisible upsert");
+        assert!(
+            status.code() == tonic::Code::PermissionDenied
+                && status.message().contains("row-level security"),
+            "gRPC must enforce the ON CONFLICT read policy for {sql}: {status:?}"
         );
     }
 

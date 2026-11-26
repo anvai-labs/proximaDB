@@ -303,6 +303,31 @@ The plan's acceptance was "same rows AND the same route decision over pgwire, RE
 * **LOW-4:** `is_pgvector_knn_select` no longer splits `lower_pgvector_select`
   from its doc comment.
 
+== Round-5 review fixes (2026-11-26, fresh-agent adversarial review)
+
+* **MED-A (round-4 regression — fixed):** round 4 rendered the full anyhow
+  chain (`{error:#}`) into `/api/v2/sql`'s `ApiError::Internal`, which reaches
+  clients unsanitised (lock-store keys, object-store endpoints/keys/signed
+  query strings, layout causes). Internal failures again render only the
+  outermost message (the full chain is logged server-side); TYPED relational
+  causes (`find_relational_constraint_violation`) map to their own message +
+  SQLSTATE and status class — 42501 → **403**, class 23/21 → 409, everything
+  else → 400 — on `/api/v2/sql` and (same mapping) gRPC `ExecuteQuery`
+  (42501 → PERMISSION_DENIED). The adapter's EXPLAIN error keeps the typed
+  cause in the chain (`.context`, same client text).
+* **MED-B (pre-existing — filed, not fixed here):** a rejected write releases
+  its DML lock asynchronously, so the client's next statement can see 55P03 /
+  409 `lock_conflict` against its own prior statement —
+  link:TD-DMLLOCK-1-dml-lock-released-asynchronously-on-error-paths.adoc[TD-DMLLOCK-1].
+* **LOW-C:** the CI `authz_changes` filter now includes `src/services/dml/**`,
+  `src/query/facade/**` and `src/query/unified_query_port_impl.rs` (not the
+  whole hot `src/query/**`).
+* **LOW-D:** the governed-upsert test covers gRPC `ExecuteQuery` too.
+* **Narrowing of the round-4 claim:** the ON CONFLICT caller stamp is tested
+  on pgwire (DML + EXPLAIN ANALYZE), `/api/v2/sql` and gRPC `ExecuteQuery`
+  (plain + EXPLAIN ANALYZE) — not on other surfaces (the port surfaces are
+  read-only and never execute an upsert).
+
 == Evidence
 
 * `tests/integration/query_facade/test_sql_transport_rendering_parity.rs`:

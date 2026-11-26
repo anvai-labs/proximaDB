@@ -26708,6 +26708,8 @@ type ExecuteSqlHTTPResp struct {
 	JSON200 *SqlResponse
 	// JSON400 the response for an HTTP 400 `application/json` response
 	JSON400 *ErrorResponse
+	// JSON403 the response for an HTTP 403 `application/json` response
+	JSON403 *ErrorResponse
 	// JSON408 the response for an HTTP 408 `application/json` response
 	JSON408 *ErrorResponse
 	// JSON409 the response for an HTTP 409 `application/json` response
@@ -26724,6 +26726,11 @@ func (r ExecuteSqlHTTPResp) GetJSON200() *SqlResponse {
 // GetJSON400 returns the response for an HTTP 400 `application/json` response
 func (r ExecuteSqlHTTPResp) GetJSON400() *ErrorResponse {
 	return r.JSON400
+}
+
+// GetJSON403 returns the response for an HTTP 403 `application/json` response
+func (r ExecuteSqlHTTPResp) GetJSON403() *ErrorResponse {
+	return r.JSON403
 }
 
 // GetJSON408 returns the response for an HTTP 408 `application/json` response
@@ -35432,6 +35439,13 @@ func ParseExecuteSqlHTTPResp(rsp *http.Response) (*ExecuteSqlHTTPResp, error) {
 			return nil, err
 		}
 		response.JSON400 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 403:
+		var dest ErrorResponse
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON403 = &dest
 
 	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 408:
 		var dest ErrorResponse

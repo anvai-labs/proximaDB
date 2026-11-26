@@ -834,7 +834,15 @@ impl QueryFacadeAdapter {
                                 )
                                 .await
                         }
-                        .map_err(|e| anyhow!("EXPLAIN failed: {}", e))?;
+                        // `.context` (not a re-formatted string) keeps the
+                        // typed cause in the chain — a TD-DML-3 RLS denial
+                        // maps to its own status (round 5).
+                        // Same client-visible text as before ("EXPLAIN
+                        // failed: <the explainer's own message>").
+                        .map_err(|e| {
+                            let message = format!("EXPLAIN failed: {e}");
+                            e.context(message)
+                        })?;
                         let plan_json = serde_json::to_string_pretty(&explanation)
                             .unwrap_or_else(|e| format!("{{\"error\": \"{}\"}}", e));
                         return Ok(proximadb_runtime::SqlExecutionResult {
