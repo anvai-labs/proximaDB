@@ -313,8 +313,10 @@ pub(crate) fn note_listing(dir_url: &str, entries: &[DirEntry]) {
 /// The newest VALID listed directory for `dir_url`, loading it on first use
 /// of the newest listed generation. A corrupt or unreadable newest generation
 /// falls back to the next listed one, as the publisher's base load does
-/// (post-#2535 review L3), and the fallback is cached against the newest
-/// object so the bad one is not re-read per query. Every entry is still
+/// (post-#2535 review L3). The fallback is cached against the newest object
+/// (so a corrupt one is not re-read per query) only when every newer object
+/// was read and found invalid; after a read ERROR it is served uncached, so
+/// the next query retries (#2581 review LOW-1). Every entry is still
 /// validated against the listing by its consumers. `None` when none is
 /// listed or none is valid (the query then runs per segment).
 pub(crate) async fn load_directory(
@@ -330,17 +332,23 @@ pub(crate) async fn load_directory(
         return Some(Arc::clone(dir));
     }
     // TD-TIER-1 SC4-5: a resident directory object costs no GET.
-    let dir = crate::storage::engines::sst::centroid_directory_publisher::first_valid_directory(
-        fs,
-        &listed.generations,
-        true,
-    )
-    .await
-    .map(Arc::new);
-    let Some(dir) = dir else {
+    let (dir, skipped_unreadable) =
+        crate::storage::engines::sst::centroid_directory_publisher::first_valid_directory_noting_read_errors(
+            fs,
+            &listed.generations,
+            true,
+        )
+        .await;
+    let Some(dir) = dir.map(Arc::new) else {
         tracing::debug!(url = %object.url, "no valid centroid directory; per-segment path");
         return None;
     };
+    if skipped_unreadable {
+        // #2581 review LOW-1: a newer generation failed to READ (possibly
+        // transiently): serve the fallback but do not cache it against the
+        // newest object, so the next query retries the newest.
+        return Some(dir);
+    }
     let mut cache = lock(loaded());
     if cache.len() >= MAX_CACHED_DIRECTORIES
         && !cache.contains_key(&key)
@@ -606,5 +614,105 @@ mod tests {
         );
         let again = load_directory(&fs, &dir_url).await.unwrap();
         assert!(Arc::ptr_eq(&dir, &again), "the fallback is cached");
+    }
+
+    /// Fails the first `fail` whole-object reads of `target` (a transient
+    /// object-store error); everything else is the local backend.
+    #[derive(Debug)]
+    struct FlakyReadFs {
+        inner: Arc<LocalFileSystem>,
+        target: String,
+        fail: std::sync::atomic::AtomicUsize,
+    }
+
+    proximadb_storage_filesystem_types::forward_filesystem_impl! {
+        impl FileSystem for FlakyReadFs => inner;
+        forward [
+            as_any, filesystem_type, supports_mmap, write,
+            supports_bounded_local_file_write, write_local_file, write_if_absent, append,
+            supports_append, supports_conditional_replace, delete, exists, metadata,
+            create_dir, create_dir_all, copy, move_file, sync, sync_file, sync_data, open_file,
+        ];
+        {
+            async fn read(&self, path: &str) -> proximadb_storage_filesystem_types::FsResult<Vec<u8>> {
+                use std::sync::atomic::Ordering;
+                if path.ends_with(&self.target)
+                    && self
+                        .fail
+                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                        .is_ok()
+                {
+                    return Err(proximadb_storage_filesystem_types::FilesystemError::Io(
+                        std::io::Error::other("injected transient read error"),
+                    ));
+                }
+                self.inner.read(path).await
+            }
+
+            async fn read_range(
+                &self,
+                path: &str,
+                offset: u64,
+                length: u64,
+            ) -> proximadb_storage_filesystem_types::FsResult<Vec<u8>> {
+                self.inner.read_range(path, offset, length).await
+            }
+
+            async fn list(
+                &self,
+                path: &str,
+            ) -> proximadb_storage_filesystem_types::FsResult<Vec<DirEntry>> {
+                self.inner.list(path).await
+            }
+        }
+    }
+
+    /// #2581 review LOW-1: a newest generation that fails to READ (a
+    /// transient error, not corruption) still falls back for this query, but
+    /// the fallback is not cached against it: the next query retries the
+    /// newest and gets it.
+    #[tokio::test]
+    #[serial]
+    async fn a_transient_read_error_on_the_newest_generation_is_retried() {
+        let tmp = tempfile::tempdir().unwrap();
+        let local = Arc::new(LocalFileSystem::new(LocalConfig::default()).await.unwrap());
+        let dir_url = tmp.path().to_string_lossy().to_string();
+        std::fs::write(tmp.path().join("l0.pax"), b"untrained").unwrap();
+        assert_eq!(
+            publish_centroid_directory(local.as_ref(), &dir_url)
+                .await
+                .unwrap(),
+            Some(1)
+        );
+        std::fs::write(tmp.path().join("l1.pax"), b"untrained").unwrap();
+        assert_eq!(
+            publish_centroid_directory(local.as_ref(), &dir_url)
+                .await
+                .unwrap(),
+            Some(2)
+        );
+        let newest = proximadb_storage_common::centroid_directory::object_name(2);
+        let fs = FlakyReadFs {
+            inner: local.clone(),
+            target: format!("/{newest}"),
+            fail: std::sync::atomic::AtomicUsize::new(1),
+        };
+        let listing = fs.list(&dir_url).await.unwrap();
+        // Serve the newest from the store, not a resident copy, so the
+        // injected read error is what this query sees.
+        for entry in &listing {
+            crate::storage::engines::sst::segment_io::forget_object(&entry.url);
+        }
+        note_listing(&dir_url, &listing);
+        assert_eq!(
+            load_directory(&fs, &dir_url).await.unwrap().generation,
+            1,
+            "this query falls back"
+        );
+        assert_eq!(
+            load_directory(&fs, &dir_url).await.unwrap().generation,
+            2,
+            "the next query retries the newest instead of a cached fallback"
+        );
     }
 }
