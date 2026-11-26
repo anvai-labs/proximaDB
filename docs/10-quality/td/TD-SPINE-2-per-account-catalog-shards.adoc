@@ -380,7 +380,7 @@ Implemented. Owner mapping: ADR-098 "Completion ledger (2026-11-25)" G7 and G8.
   (`system_catalog.rs`). The shard objects are moved to the retired layout. The follower reload
   fails and keeps serving its old image; a fresh boot fails with the actionable error.
   `missing_relocated_shard_fails_closed_and_ignores_the_retired_layout` (store level) pins that
-  no dual read happens.
+  no dual read happens. Mutation: a `NotFound` fallback to the retired layout turns both red.
 * **R1, cross-pod reload adopts relocated shards:** `follower_reload_adopts_only_the_changed_shard`
   now matches the relocated prefix: the follower GETs `data/small-tenant/_syscat/shard/` and
   never `data/big-tenant/_syscat/shard/`. The cross-pod suite named in "Evidence (2026-11-22)"
