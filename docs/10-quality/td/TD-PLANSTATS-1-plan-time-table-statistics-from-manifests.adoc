@@ -12,7 +12,7 @@
 | Priority | **P2.** Results stay correct, but the planner and the route chooser plan blind on cold tables and on tables whose filters prune files.
 | Component | Parquet/Iceberg: `ObjectStoreParquetTable::statistics()` in `src/datafusion/engine_adapters/object_store_parquet_reader.rs` (:2255) and `statistics_from_splits` in `src/datafusion/schema_inference.rs`; manifest per-file `ColumnFileStats` in `crates/storage/proximadb-iceberg-engine/src/iceberg.rs`. PAX: `ProximaDBTableProvider` / `ProximaDataFusionTable` in `src/datafusion/table_provider.rs` (`with_statistics`); directory entries in `crates/storage/proximadb-storage-common/src/centroid_directory.rs`. Statistics envelope: `src/core/statistics/`.
 | Authority | link:../../12-design/adr/ADR-050-statistics-fed-datafusion-route-selection.adoc[ADR-050] D2 (as amended 2026-11-19 and corrected 2026-11-25); link:../../12-design/adr/ADR-042-canonical-segment-statistics-contract.adoc[ADR-042]; link:../../12-design/adr/ADR-037-statistics-substrate-and-reference-mcp.adoc[ADR-037]; link:../../12-design/adr/ADR-098-metadata-spine.adoc[ADR-098] D2, D4.3 and Completion ledger G6.
-| Relates to | link:TD-SPINE-4-manifest-stats-pruning-and-cache.adoc[TD-SPINE-4] follow-up F1 (route-shape stat from manifest per-file counts; narrower than this TD), TD-OLAP-2 (PAX segments feeding the same projection), TD-DFR-1 (PAX-segment stats feeding; boundary: this TD owns producing table-level `Statistics` at provider open from manifests and directory entries, while TD-OLAP-2 and TD-DFR-1 own the segment-to-row-group-to-table statistics hierarchy that a PAX projection would read), link:TD-PAXMETA-1-collection-level-segment-facts.adoc[TD-PAXMETA-1] (directory entries)
+| Relates to | link:TD-SPINE-4-manifest-stats-pruning-and-cache.adoc[TD-SPINE-4] follow-up F1 (route-shape stat from manifest per-file counts; narrower than this TD), TD-OLAP-2 (PAX segments feeding the same projection), TD-DFR-1 (the shipped footer-derived `ColumnStatistics` slice, which this TD replaces at provider open; boundary: this TD owns producing table-level `Statistics` at open from manifests and directory entries, while TD-OLAP-2 owns the segment-to-row-group-to-table statistics hierarchy that a PAX projection would read), link:TD-PAXMETA-1-collection-level-segment-facts.adoc[TD-PAXMETA-1] (directory entries)
 |===
 
 == Problem
@@ -32,7 +32,7 @@ Neither is built. Verified on develop @ `ea77dea50`:
   search uses for pruning, but nothing turns them into plan-time statistics.
 * **Statistics envelope.** The registry in `src/core/statistics/` is fed by observing records on
   the write path (`observe_flush_into_statistics` in `src/storage/engines/sst/flush/mod.rs` at
-  PAX flush, and the MATERIALIZE observer in `src/services/dml/mod.rs`, and the REST v2 collection-stats overlay in `src/network/rest/v2/collections.rs`, which overlays live counts, sizes and schema field facts and can create the summary before any flush). It never reads L1
+  PAX flush, and the MATERIALIZE observer in `src/services/dml/mod.rs`), and separately by the REST v2 statistics GET in `src/network/rest/v2/collections.rs`, a read-path handler that overlays the L0 catalog counters, schema, vector and graph facts and can create the summary before any flush. It never reads L1
   directory entries or manifests.
 
 == Fix
