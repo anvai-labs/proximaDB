@@ -513,6 +513,86 @@ mod unkeyable {
     }
 }
 
+/// Process-local backoff for keyless entries whose key attempt hit a READ
+/// error (#2581 review round 3): e.g. an Archive-tier blob or a persistent
+/// 403 keeps failing, and must not re-cost its reads on every publish nor
+/// hold the retry window. Clock-free by design: the backoff is counted in
+/// publishes that consider the entry (each skips it once), which is the
+/// unit the cost is paid in; a wall clock would add an untested time
+/// dependency and still need a per-publish rate. After the n-th consecutive
+/// failure the entry is skipped by the next `2^(n-1) - 1` publishes (capped
+/// at `MAX_SKIP`): the first retry is immediate. Keyed by
+/// `(url, size, listed ETag)` like the `unkeyable` cache; bounded the same
+/// way (a full map is reset, which only makes entries due early).
+mod retry_backoff {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock, PoisonError};
+
+    const MAX_ENTRIES: usize = 4096;
+    const MAX_SKIP: u32 = 63;
+
+    type Key = (String, u64, Option<String>);
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum Standing {
+        /// Never failed transiently: tried first.
+        Fresh,
+        /// Failed before; its backoff has run out.
+        Due,
+        /// Failed before; skipped by this publish.
+        Waiting,
+    }
+
+    struct State {
+        failures: u32,
+        skip: u32,
+    }
+
+    fn map() -> &'static Mutex<HashMap<Key, State>> {
+        static MAP: OnceLock<Mutex<HashMap<Key, State>>> = OnceLock::new();
+        MAP.get_or_init(Default::default)
+    }
+
+    fn key(url: &str, size: u64, etag: Option<&str>) -> Key {
+        (url.to_owned(), size, etag.map(str::to_owned))
+    }
+
+    /// The entry's standing for this publish; a `Waiting` entry's remaining
+    /// skip count is consumed. Call once per entry per publish.
+    pub(super) fn standing(url: &str, size: u64, etag: Option<&str>) -> Standing {
+        let mut map = map().lock().unwrap_or_else(PoisonError::into_inner);
+        match map.get_mut(&key(url, size, etag)) {
+            None => Standing::Fresh,
+            Some(state) if state.skip == 0 => Standing::Due,
+            Some(state) => {
+                state.skip -= 1;
+                Standing::Waiting
+            }
+        }
+    }
+
+    pub(super) fn record_failure(url: &str, size: u64, etag: Option<&str>) {
+        let mut map = map().lock().unwrap_or_else(PoisonError::into_inner);
+        if map.len() >= MAX_ENTRIES {
+            map.clear();
+        }
+        let state = map.entry(key(url, size, etag)).or_insert(State {
+            failures: 0,
+            skip: 0,
+        });
+        state.failures = state.failures.saturating_add(1);
+        let exp = state.failures.saturating_sub(1).min(31);
+        state.skip = (1u32 << exp).saturating_sub(1).min(MAX_SKIP);
+    }
+
+    pub(super) fn forget(url: &str, size: u64, etag: Option<&str>) {
+        map()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&key(url, size, etag));
+    }
+}
+
 async fn object_size(fs: &dyn FileSystem, entry: &DirEntry) -> Option<u64> {
     if entry.metadata.size > 0 {
         return Some(entry.metadata.size);
@@ -528,6 +608,12 @@ pub async fn publish_centroid_directory(
     dir_url: &str,
 ) -> anyhow::Result<Option<u64>> {
     let dir_url = dir_url.trim_end_matches('/');
+    // Per-publish state shared by the create-only retries: keyless entries
+    // this publish already tried, and each entry's backoff standing (read
+    // once per publish, so a retry does not advance the backoff twice).
+    let mut tried_this_publish: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    let mut standings: HashMap<String, retry_backoff::Standing> = HashMap::new();
     for _ in 0..PUBLISH_ATTEMPTS {
         let entries = fs.list(dir_url).await?;
         let pending = retirement_ledger::pending_paths();
@@ -583,20 +669,43 @@ pub async fn publish_centroid_directory(
         // COVERED candidate is therefore reloaded whole (cells + key) rather
         // than given a fresh-ETag key on stale cells. An UNCOVERED candidate
         // carries only its size, so its key is attached in place.
+        // #2581 review round 3: the window is filled with never-tried
+        // entries first, then entries whose transient-failure backoff has
+        // expired, and never with an entry this publish already tried (its
+        // create-only retries), so persistently failing entries cannot hold
+        // the window and starve keyable ones.
         let candidates: Vec<DirectorySegment> = match (&base, decode_keys) {
-            (Some(base), true) => base
-                .segments
-                .iter()
-                .filter(|s| {
-                    s.decode_key.is_none()
-                        && urls.get(&s.name).is_some_and(|(url, etag)| {
-                            live_size.get(s.name.as_str()) == Some(&s.size_bytes)
-                                && !unkeyable::contains(url, s.size_bytes, etag.as_deref())
-                        })
-                })
-                .take(MAX_KEY_UPGRADES_PER_PUBLISH)
-                .cloned()
-                .collect(),
+            (Some(base), true) => {
+                let mut fresh = Vec::new();
+                let mut due = Vec::new();
+                for s in &base.segments {
+                    if s.decode_key.is_some()
+                        || tried_this_publish.contains(&s.name)
+                        || live_size.get(s.name.as_str()) != Some(&s.size_bytes)
+                    {
+                        continue;
+                    }
+                    let Some((url, etag)) = urls.get(&s.name) else {
+                        continue;
+                    };
+                    if unkeyable::contains(url, s.size_bytes, etag.as_deref()) {
+                        continue;
+                    }
+                    let standing = *standings.entry(s.name.clone()).or_insert_with(|| {
+                        retry_backoff::standing(url, s.size_bytes, etag.as_deref())
+                    });
+                    match standing {
+                        retry_backoff::Standing::Fresh => fresh.push(s.clone()),
+                        retry_backoff::Standing::Due => due.push(s.clone()),
+                        retry_backoff::Standing::Waiting => {}
+                    }
+                }
+                fresh
+                    .into_iter()
+                    .chain(due)
+                    .take(MAX_KEY_UPGRADES_PER_PUBLISH)
+                    .collect()
+            }
             _ => Vec::new(),
         };
         let reload: std::collections::HashSet<&str> = candidates
@@ -746,15 +855,24 @@ pub async fn publish_centroid_directory(
                 for (name, size) in tried {
                     let stamped = by_name.contains_key(name);
                     let is_candidate = candidates.iter().any(|c| c.name == name);
-                    if (stamped || is_candidate)
-                        && !transient.contains(name)
-                        && !keyed(name)
-                        && let Some((url, etag)) = urls.get(name)
-                    {
-                        unkeyable::insert(url, size, etag.as_deref());
+                    let Some((url, etag)) = urls.get(name) else {
+                        continue;
+                    };
+                    let etag = etag.as_deref();
+                    if keyed(name) {
+                        retry_backoff::forget(url, size, etag);
+                    } else if transient.contains(name) {
+                        // Retryable, but backed off (round 3) so a
+                        // persistently failing object stops costing reads on
+                        // every publish.
+                        retry_backoff::record_failure(url, size, etag);
+                    } else if stamped || is_candidate {
+                        unkeyable::insert(url, size, etag);
+                        retry_backoff::forget(url, size, etag);
                     }
                 }
             }
+            tried_this_publish.extend(candidates.iter().map(|c| c.name.clone()));
             candidates.iter().any(|c| keyed(&c.name))
         };
         if !base_changed && base_is_newest && !keys_to_drop && !upgraded {
@@ -1486,6 +1604,121 @@ pub(crate) mod tests {
         );
         let second = &newest(&fs, &dir_url).await[0].1;
         assert!(second.segments[0].decode_key.is_some(), "key attached");
+    }
+
+    /// Every ranged read of an object whose name starts with `bad` fails (a
+    /// persistent transient-class error: an Archive-tier blob, a 403);
+    /// counts the failed reads.
+    #[derive(Debug)]
+    struct AlwaysFailingFs {
+        inner: Arc<LocalFileSystem>,
+        failed: std::sync::atomic::AtomicU64,
+    }
+
+    proximadb_storage_filesystem_types::forward_filesystem_impl! {
+        impl FileSystem for AlwaysFailingFs => inner;
+        forward [
+            as_any, filesystem_type, supports_mmap, write,
+            supports_bounded_local_file_write, write_local_file, write_if_absent, append,
+            supports_append, supports_conditional_replace, delete, exists, metadata,
+            create_dir, create_dir_all, copy, move_file, sync, sync_file, sync_data, open_file,
+        ];
+        {
+            async fn read(&self, path: &str) -> proximadb_storage_filesystem_types::FsResult<Vec<u8>> {
+                self.inner.read(path).await
+            }
+
+            async fn read_range(
+                &self,
+                path: &str,
+                offset: u64,
+                length: u64,
+            ) -> proximadb_storage_filesystem_types::FsResult<Vec<u8>> {
+                if path.rsplit('/').next().is_some_and(|n| n.starts_with("bad")) {
+                    self.failed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    return Err(FilesystemError::Io(std::io::Error::other(
+                        "injected persistent read error",
+                    )));
+                }
+                self.inner.read_range(path, offset, length).await
+            }
+
+            async fn list(
+                &self,
+                path: &str,
+            ) -> proximadb_storage_filesystem_types::FsResult<Vec<DirEntry>> {
+                self.inner.list(path).await
+            }
+        }
+    }
+
+    /// #2581 review round 3: more than a window of keyless entries that fail
+    /// TRANSIENTLY on every attempt, ahead (in name order) of one keyable
+    /// entry. Never-tried entries fill the window before retries, so the
+    /// keyable entry gets its key by the second publish; and failing entries
+    /// back off instead of being re-read on every publish.
+    #[tokio::test]
+    async fn persistently_failing_entries_neither_starve_the_window_nor_reread_every_publish() {
+        enable_trained_layout();
+        let tmp = tempfile::tempdir().unwrap();
+        let bad = MAX_KEY_UPGRADES_PER_PUBLISH + 1;
+        let write = |name: &str, seed: usize| {
+            crate::storage::engines::sst::segment_format::write_pax_segment(
+                &tmp.path().join(name),
+                &records(seed, 50),
+                "col",
+                1,
+                VectorQuant::RaBitQ,
+                None,
+                None,
+            )
+            .expect("write untrained segment");
+        };
+        for i in 0..bad {
+            write(&format!("bad{i:02}.pax"), i);
+        }
+        write("good.pax", 99);
+        let local = Arc::new(local_fs().await);
+        let dir_url = tmp.path().to_string_lossy().to_string();
+        // SAFETY: nextest runs each test in its own process.
+        unsafe { std::env::set_var("PROXIMADB_PAX_WRITE_DIRECTORY_DECODE_KEYS", "0") };
+        assert_eq!(
+            publish_centroid_directory(local.as_ref(), &dir_url)
+                .await
+                .unwrap(),
+            Some(1)
+        );
+        unsafe { std::env::set_var("PROXIMADB_PAX_WRITE_DIRECTORY_DECODE_KEYS", "1") };
+        let fs = AlwaysFailingFs {
+            inner: local.clone(),
+            failed: std::sync::atomic::AtomicU64::new(0),
+        };
+        let failed = || fs.failed.load(std::sync::atomic::Ordering::SeqCst);
+        let mut failed_per_publish = Vec::new();
+        let mut good_keyed_at = None;
+        for publish in 1..=3 {
+            let before = failed();
+            publish_centroid_directory(&fs, &dir_url).await.unwrap();
+            failed_per_publish.push(failed() - before);
+            let dir = &newest(&fs, &dir_url).await[0].1;
+            let good = dir.segments.iter().find(|s| s.name == "good.pax").unwrap();
+            if good.decode_key.is_some() && good_keyed_at.is_none() {
+                good_keyed_at = Some(publish);
+            }
+        }
+        assert!(
+            good_keyed_at.is_some_and(|p| p <= 2),
+            "the keyable entry is not starved: keyed at {good_keyed_at:?}"
+        );
+        // Publish 1: a full window of never-tried failing entries. Publish 2:
+        // the last never-tried failing entry + good + due retries. Publish 3:
+        // entries that failed twice wait, so far fewer reads than a window.
+        assert_eq!(failed_per_publish[0], MAX_KEY_UPGRADES_PER_PUBLISH as u64);
+        assert!(
+            failed_per_publish[2] < failed_per_publish[0],
+            "failing entries back off instead of costing a window every publish: \
+             {failed_per_publish:?}"
+        );
     }
 
     /// #2581 review LOW-C: with more keyless unkeyable entries than
