@@ -44,6 +44,12 @@ pub enum ApiError {
     #[error("Deadline exceeded: {0}")]
     DeadlineExceeded(String),
 
+    /// A unified-query-port execution exceeded the port deadline
+    /// (`proximadb_runtime::PORT_QUERY_DEADLINE`) — HTTP 504, the one status
+    /// every port surface uses for it (TD-SPINE-6 round 3).
+    #[error("Query deadline exceeded: {0}")]
+    QueryDeadline(String),
+
     /// Already exists
     #[error("Already exists: {0}")]
     AlreadyExists(String),
@@ -139,6 +145,7 @@ impl From<ApiError> for tonic::Status {
             ApiError::Forbidden(msg) => tonic::Status::permission_denied(msg),
             ApiError::NotImplemented(msg) => tonic::Status::unimplemented(msg),
             ApiError::DeadlineExceeded(msg) => tonic::Status::deadline_exceeded(msg),
+            ApiError::QueryDeadline(msg) => tonic::Status::deadline_exceeded(msg),
             ApiError::AlreadyExists(msg) => tonic::Status::already_exists(msg),
             ApiError::NotFound(msg) => tonic::Status::not_found(msg),
             ApiError::Gone(msg) => tonic::Status::not_found(format!("Resource expired: {}", msg)),
@@ -210,6 +217,7 @@ impl IntoResponse for ApiError {
             ApiError::Forbidden(_) => (StatusCode::FORBIDDEN, "forbidden"),
             ApiError::NotImplemented(_) => (StatusCode::NOT_IMPLEMENTED, "not_implemented"),
             ApiError::DeadlineExceeded(_) => (StatusCode::REQUEST_TIMEOUT, "deadline_exceeded"),
+            ApiError::QueryDeadline(_) => (StatusCode::GATEWAY_TIMEOUT, "deadline_exceeded"),
             ApiError::AlreadyExists(_) => (StatusCode::CONFLICT, "already_exists"),
             ApiError::NotFound(_) => (StatusCode::NOT_FOUND, "not_found"),
             ApiError::Gone(_) => (StatusCode::GONE, "gone"),

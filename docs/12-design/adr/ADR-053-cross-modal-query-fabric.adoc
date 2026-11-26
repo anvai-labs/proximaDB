@@ -66,7 +66,9 @@ a "not wired" error, and `SharedServices` does not register it; the registered
 `ColumnarStrategy` accepts plain SQL only for collections with a registered columnar provider,
 and the live wiring registers none.
 Convergence onto one planner is ADR-098 D5 /
-link:../../10-quality/td/TD-SPINE-6-one-planner-unified-query-port.adoc[TD-SPINE-6].
+link:../../10-quality/td/TD-SPINE-6-one-planner-unified-query-port.adoc[TD-SPINE-6]
+(*implemented 2026-11-24*: plain SQL on the port delegates to the shared SQL authority and the
+`ComputeScheduler` decision; multi-model extensions keep this ADR's federated lowering).
 3. **The agentic copilot brain stays in the client/agent (MCP) layer.** The database does NOT
    embed a vertical's workflow — no hard-coded "fraud copilot". The reference MCP surface projects
    Layer-1 primitives + Layer-2 relations as tools; the agent composes them; **AnvaiOps** governs

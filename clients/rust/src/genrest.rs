@@ -41054,8 +41054,11 @@ impl Client {
     }
     /// Execute a distributed query
     ///
-    /// The optional `X-Tenant-ID` header is not consulted by this
-    /// handler — unified queries run without tenant selection.
+    /// The `X-Tenant-ID` header (or the authenticated tenant) scopes this
+    /// query — it is threaded as the port identity (ADR-098 D5 /
+    /// TD-SPINE-6); without it the query fails closed (401). Plain SQL on
+    /// this surface is read-only (pure SELECT); writes are served by
+    /// /api/v2/sql.
     ///
     ///
     /// Sends a `POST` request to `/api/v2/unified/distributed`
@@ -41075,8 +41078,11 @@ impl Client {
     }
     /// Execute a unified (UQL) query
     ///
-    /// The optional `X-Tenant-ID` header is not consulted by this
-    /// handler — unified queries run without tenant selection.
+    /// The `X-Tenant-ID` header (or the authenticated tenant) scopes this
+    /// query — it is threaded as the port identity (ADR-098 D5 /
+    /// TD-SPINE-6); without it the query fails closed (401). Plain SQL on
+    /// this surface is read-only (pure SELECT); writes are served by
+    /// /api/v2/sql.
     ///
     ///
     /// Sends a `POST` request to `/api/v2/unified/execute`
@@ -41096,8 +41102,11 @@ impl Client {
     }
     /// Execute a prepared statement with parameters
     ///
-    /// The optional `X-Tenant-ID` header is not consulted by this
-    /// handler — unified queries run without tenant selection.
+    /// The `X-Tenant-ID` header (or the authenticated tenant) scopes this
+    /// query — it is threaded as the port identity (ADR-098 D5 /
+    /// TD-SPINE-6); without it the query fails closed (401). Plain SQL on
+    /// this surface is read-only (pure SELECT); writes are served by
+    /// /api/v2/sql.
     ///
     ///
     /// Sends a `POST` request to `/api/v2/unified/execute/{statement_id}`
@@ -41119,8 +41128,11 @@ impl Client {
     }
     /// Explain a unified query (plan, no execution)
     ///
-    /// The optional `X-Tenant-ID` header is not consulted by this
-    /// handler — unified queries run without tenant selection.
+    /// The `X-Tenant-ID` header (or the authenticated tenant) scopes this
+    /// query — it is threaded as the port identity (ADR-098 D5 /
+    /// TD-SPINE-6); without it the query fails closed (401). Plain SQL on
+    /// this surface is read-only (pure SELECT); writes are served by
+    /// /api/v2/sql.
     ///
     ///
     /// Sends a `POST` request to `/api/v2/unified/explain`
@@ -41140,8 +41152,11 @@ impl Client {
     }
     /// Execute a federated query
     ///
-    /// The optional `X-Tenant-ID` header is not consulted by this
-    /// handler — unified queries run without tenant selection.
+    /// The `X-Tenant-ID` header (or the authenticated tenant) scopes this
+    /// query — it is threaded as the port identity (ADR-098 D5 /
+    /// TD-SPINE-6); without it the query fails closed (401). Plain SQL on
+    /// this surface is read-only (pure SELECT); writes are served by
+    /// /api/v2/sql.
     ///
     ///
     /// Sends a `POST` request to `/api/v2/unified/federated`
@@ -41161,8 +41176,11 @@ impl Client {
     }
     /// Execute a multi-model query (free-form body)
     ///
-    /// The optional `X-Tenant-ID` header is not consulted by this
-    /// handler — unified queries run without tenant selection.
+    /// The `X-Tenant-ID` header (or the authenticated tenant) scopes this
+    /// query — it is threaded as the port identity (ADR-098 D5 /
+    /// TD-SPINE-6); without it the query fails closed (401). Plain SQL on
+    /// this surface is read-only (pure SELECT); writes are served by
+    /// /api/v2/sql.
     ///
     ///
     /// Sends a `POST` request to `/api/v2/unified/multi-model`
@@ -41182,8 +41200,11 @@ impl Client {
     }
     /// Prepare a statement for repeated execution
     ///
-    /// The optional `X-Tenant-ID` header is not consulted by this
-    /// handler — unified queries run without tenant selection.
+    /// The `X-Tenant-ID` header (or the authenticated tenant) scopes this
+    /// query — it is threaded as the port identity (ADR-098 D5 /
+    /// TD-SPINE-6); without it the query fails closed (401). Plain SQL on
+    /// this surface is read-only (pure SELECT); writes are served by
+    /// /api/v2/sql.
     ///
     ///
     /// Sends a `POST` request to `/api/v2/unified/prepare`
@@ -41203,8 +41224,11 @@ impl Client {
     }
     /// Prepared-statement execution statistics
     ///
-    /// The optional `X-Tenant-ID` header is not consulted by this
-    /// handler — unified queries run without tenant selection.
+    /// The `X-Tenant-ID` header (or the authenticated tenant) scopes this
+    /// query — it is threaded as the port identity (ADR-098 D5 /
+    /// TD-SPINE-6); without it the query fails closed (401). Plain SQL on
+    /// this surface is read-only (pure SELECT); writes are served by
+    /// /api/v2/sql.
     ///
     ///
     /// Sends a `POST` request to `/api/v2/unified/prepared/stats`
@@ -41224,8 +41248,11 @@ impl Client {
     }
     /// Delete a prepared statement
     ///
-    /// The optional `X-Tenant-ID` header is not consulted by this
-    /// handler — unified queries run without tenant selection.
+    /// The `X-Tenant-ID` header (or the authenticated tenant) scopes this
+    /// query — it is threaded as the port identity (ADR-098 D5 /
+    /// TD-SPINE-6); without it the query fails closed (401). Plain SQL on
+    /// this surface is read-only (pure SELECT); writes are served by
+    /// /api/v2/sql.
     ///
     ///
     /// Sends a `DELETE` request to `/api/v2/unified/prepared/{statement_id}`
@@ -51972,6 +51999,9 @@ pub mod builder {
                 400u16 => Err(Error::ErrorResponse(
                     ResponseValue::from_response(response).await?,
                 )),
+                504u16 => Err(Error::ErrorResponse(
+                    ResponseValue::from_response(response).await?,
+                )),
                 _ => Err(Error::UnexpectedResponse(response)),
             }
         }
@@ -52268,6 +52298,9 @@ pub mod builder {
             match response.status().as_u16() {
                 200u16 => ResponseValue::from_response(response).await,
                 400u16 => Err(Error::ErrorResponse(
+                    ResponseValue::from_response(response).await?,
+                )),
+                403u16 => Err(Error::ErrorResponse(
                     ResponseValue::from_response(response).await?,
                 )),
                 408u16 => Err(Error::ErrorResponse(

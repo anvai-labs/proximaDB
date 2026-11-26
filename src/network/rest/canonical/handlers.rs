@@ -1046,17 +1046,35 @@ async fn default_tenant_if_unresolved(
 
 pub async fn execute_sql(
     State(state): State<AppState>,
+    identity: Option<Extension<proximadb_tenant::ResolvedRequestIdentity>>,
     tenant: Option<Extension<crate::network::middleware::tenant::TenantContext>>,
     Json(request): Json<SqlQueryRequest>,
 ) -> ApiResult<JsonResponse<serde_json::Value>> {
     // Collections are resolved within the request tenant (absent ⇒ the
     // default tenant) for the whole statement, through every query layer.
+    // LOW-2 (round-1 review): when the foundation identity is present it is
+    // preferred — the ABAC subject/stable key/auth class travel with the
+    // tenant into the port context, matching `/api/v2/sql`; the tenant-only
+    // `TenantContext` remains the fallback for mounts without the middleware.
     let request_tenant = tenant
         .map(|Extension(t)| t.tenant_id)
         .unwrap_or_else(|| proximadb_tenant::DEFAULT_TENANT.to_string());
+    let identity = match identity {
+        Some(Extension(resolved)) => {
+            // The foundation identity wins: the ABAC subject/stable key/auth
+            // class travel with the tenant into the port context.
+            proximadb_runtime::PortIdentity::from(&resolved).into_owned()
+        }
+        None => proximadb_runtime::OwnedPortIdentity {
+            tenant_id: Some(request_tenant.clone()),
+            subject: None,
+            tenant_stable_id: None,
+            auth_class: proximadb_tenant::AuthClass::Anonymous,
+        },
+    };
     crate::query::request_scope::with_request_tenant(
         request_tenant.clone(),
-        execute_sql_in_scope(state, request, request_tenant),
+        execute_sql_in_scope(state, request, request_tenant, identity),
     )
     .await
 }
@@ -1065,6 +1083,7 @@ async fn execute_sql_in_scope(
     state: AppState,
     request: SqlQueryRequest,
     scoped_tenant: String,
+    identity: proximadb_runtime::OwnedPortIdentity,
 ) -> ApiResult<JsonResponse<serde_json::Value>> {
     let start_time = std::time::Instant::now();
     let request_id = Uuid::new_v4().to_string();
@@ -1082,7 +1101,11 @@ async fn execute_sql_in_scope(
         ));
     }
 
-    // Prefer unified query port (decoupled from concrete QueryFacadeAdapter type)
+    // Prefer unified query port (decoupled from concrete QueryFacadeAdapter type).
+    // ADR-098 D5 / TD-SPINE-6: the port carries the caller's tenant as DATA on
+    // the context (the task-local `with_request_tenant` scope above stays as
+    // the fallback) and delegates plain SQL to the ComputeScheduler decision
+    // path — the same planner decision as /api/v2/sql and pgwire.
     if let Some(ref qp) = state.unified_query_port {
         debug!("Using unified query port for SQL query");
         let query_with_hint = if let Some(ref seeding) = request.seeding {
@@ -1100,6 +1123,10 @@ async fn execute_sql_in_scope(
                 sql_params_to_proxima_values(request.parameters.clone()),
                 request.collection.clone(),
                 None,
+                // LOW-2: the full identity (subject + stable key + auth
+                // class when the middleware supplied one) — not just the
+                // tenant — reaches the port.
+                proximadb_runtime::UnifiedQueryPortContext::for_identity(identity.as_borrowed()),
             )
             .await
         {
@@ -1246,6 +1273,27 @@ async fn execute_sql_in_scope(
 fn sql_error_to_api(error: anyhow::Error) -> ApiError {
     match crate::services::operations::vectors::collection_not_found(&error) {
         Some(missing) => ApiError::CollectionNotFound(missing.identifier.clone()),
+        // L2 (round 2): typed port rejections map to 4xx — the read-only
+        // policy / query-shape class is a 400; a missing identity is a 401.
+        None if error
+            .downcast_ref::<proximadb_runtime::InvalidQueryInput>()
+            .is_some() =>
+        {
+            ApiError::InvalidArgument(error.to_string())
+        }
+        None if error
+            .downcast_ref::<proximadb_runtime::MissingQueryIdentity>()
+            .is_some() =>
+        {
+            ApiError::Unauthorized(error.to_string())
+        }
+        // L3 (round 3): the port deadline → 504, like every port surface.
+        None if error
+            .downcast_ref::<proximadb_runtime::QueryDeadlineExceeded>()
+            .is_some() =>
+        {
+            ApiError::QueryDeadline(error.to_string())
+        }
         None => ApiError::Internal(error.to_string()),
     }
 }
@@ -2700,12 +2748,14 @@ mod tests {
             _: Option<Vec<proximadb_data_model::ProximaValue>>,
             _: Option<String>,
             _: Option<u32>,
+            _: proximadb_runtime::UnifiedQueryPortContext<'_>,
         ) -> anyhow::Result<serde_json::Value> {
             anyhow::bail!("mock")
         }
         async fn execute_multi_model_query(
             &self,
             _: serde_json::Value,
+            _: proximadb_runtime::UnifiedQueryPortContext<'_>,
         ) -> anyhow::Result<serde_json::Value> {
             anyhow::bail!("mock")
         }
@@ -2713,12 +2763,14 @@ mod tests {
             &self,
             _: String,
             _: Option<Vec<proximadb_data_model::ProximaValue>>,
+            _: proximadb_runtime::UnifiedQueryPortContext<'_>,
         ) -> anyhow::Result<serde_json::Value> {
             anyhow::bail!("mock")
         }
         async fn execute_distributed_query(
             &self,
             _: serde_json::Value,
+            _: proximadb_runtime::UnifiedQueryPortContext<'_>,
         ) -> anyhow::Result<serde_json::Value> {
             anyhow::bail!("mock")
         }
@@ -2726,6 +2778,7 @@ mod tests {
             &self,
             _: String,
             _: Option<String>,
+            _: proximadb_runtime::UnifiedQueryPortContext<'_>,
         ) -> anyhow::Result<serde_json::Value> {
             anyhow::bail!("mock")
         }
@@ -2735,6 +2788,7 @@ mod tests {
             _: String,
             _: bool,
             _: Option<u64>,
+            _: proximadb_runtime::UnifiedQueryPortContext<'_>,
         ) -> anyhow::Result<String> {
             anyhow::bail!("mock")
         }
@@ -2743,13 +2797,22 @@ mod tests {
             _: String,
             _: Option<Vec<proximadb_data_model::ProximaValue>>,
             _: Option<String>,
+            _: proximadb_runtime::UnifiedQueryPortContext<'_>,
         ) -> anyhow::Result<serde_json::Value> {
             anyhow::bail!("mock")
         }
-        async fn delete_prepared(&self, _: String) -> anyhow::Result<()> {
+        async fn delete_prepared(
+            &self,
+            _: String,
+            _: proximadb_runtime::UnifiedQueryPortContext<'_>,
+        ) -> anyhow::Result<()> {
             anyhow::bail!("mock")
         }
-        async fn get_prepared_stats(&self, _: Vec<String>) -> anyhow::Result<serde_json::Value> {
+        async fn get_prepared_stats(
+            &self,
+            _: Vec<String>,
+            _: proximadb_runtime::UnifiedQueryPortContext<'_>,
+        ) -> anyhow::Result<serde_json::Value> {
             anyhow::bail!("mock")
         }
     }

@@ -24,7 +24,7 @@
 use std::sync::Arc;
 
 use axum::{
-    Json, Router,
+    Extension, Json, Router,
     extract::{Path, State, rejection::JsonRejection},
     http::StatusCode,
     response::IntoResponse,
@@ -32,9 +32,42 @@ use axum::{
 };
 use proximadb_data_model::ProximaValue;
 use proximadb_records::conversions::json_to_proxima;
-use proximadb_runtime::{InvalidQueryInput, UnifiedQueryPort};
+use proximadb_runtime::{
+    InvalidQueryInput, MissingQueryIdentity, QueryDeadlineExceeded, UnifiedQueryPort,
+    UnifiedQueryPortContext,
+};
 use serde::Deserialize;
 use tracing::{error, info};
+
+/// The per-request port context: the foundation identity the tenant
+/// middleware stamps (ADR-087) travels as data on the call (ADR-098 D5 /
+/// TD-SPINE-6). `None` (a bare-mounted router, e.g. tests) leaves the
+/// identity empty — the port then falls back to the task-local request
+/// scope and fails closed when neither is present.
+fn port_context<'a>(
+    identity: &'a Option<Extension<proximadb_tenant::ResolvedRequestIdentity>>,
+) -> UnifiedQueryPortContext<'a> {
+    match identity {
+        Some(Extension(resolved)) => {
+            UnifiedQueryPortContext::for_identity(proximadb_runtime::PortIdentity::from(resolved))
+        }
+        None => UnifiedQueryPortContext::for_identity(proximadb_runtime::PortIdentity::anonymous()),
+    }
+}
+
+/// Await a port execution and render it: the result as JSON, a port error
+/// through [`port_error_response`]. The deadline is enforced INSIDE the port
+/// (`proximadb_runtime::PORT_QUERY_DEADLINE`, TD-SPINE-6 round 3) and arrives
+/// here as the typed `QueryDeadlineExceeded` → 504.
+async fn respond_port_result(
+    op: &str,
+    execution: impl std::future::Future<Output = anyhow::Result<serde_json::Value>>,
+) -> axum::response::Response {
+    match execution.await {
+        Ok(result) => Json(result).into_response(),
+        Err(e) => port_error_response(op, e),
+    }
+}
 
 // ── State ─────────────────────────────────────────────────────────────────────
 
@@ -150,6 +183,28 @@ fn empty_query_response() -> axum::response::Response {
 fn port_error_response(op: &str, e: anyhow::Error) -> axum::response::Response {
     if e.to_string().contains("not implemented") || e.to_string().contains("UNIMPLEMENTED") {
         not_implemented(op).into_response()
+    } else if e.downcast_ref::<MissingQueryIdentity>().is_some() {
+        // MED-3 (round-1 review): no identity and no scope → 401, not 500.
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response()
+    } else if e.downcast_ref::<QueryDeadlineExceeded>().is_some() {
+        // L3 (round 3): the port deadline → 504 on every port surface.
+        (
+            StatusCode::GATEWAY_TIMEOUT,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response()
+    } else if e.downcast_ref::<InvalidQueryInput>().is_some() {
+        // MED-4 (round-1 review): the read-only policy rejection (or any
+        // client-shaped query input) → 400, not 500.
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response()
     } else {
         error!("{op} failed: {e}");
         (
@@ -164,6 +219,7 @@ fn port_error_response(op: &str, e: anyhow::Error) -> axum::response::Response {
 
 async fn execute_query(
     State(s): State<UnifiedQueryRestState>,
+    identity: Option<Extension<proximadb_tenant::ResolvedRequestIdentity>>,
     body: Result<Json<ExecuteQueryRequest>, JsonRejection>,
 ) -> impl IntoResponse {
     let req = parse_body!(body);
@@ -177,22 +233,27 @@ async fn execute_query(
     );
 
     let params = json_to_proxima_values(req.parameters);
-    match s
-        .unified_query_port
-        .execute_unified_query(req.query, params, req.collection, req.limit)
-        .await
-    {
-        Ok(result) => Json(result).into_response(),
-        Err(e) => port_error_response("execute_unified_query", e),
-    }
+    let execution = s.unified_query_port.execute_unified_query(
+        req.query,
+        params,
+        req.collection,
+        req.limit,
+        port_context(&identity),
+    );
+    respond_port_result("execute_unified_query", execution).await
 }
 
 async fn execute_multi_model_query(
     State(s): State<UnifiedQueryRestState>,
+    identity: Option<Extension<proximadb_tenant::ResolvedRequestIdentity>>,
     body: Result<Json<serde_json::Value>, JsonRejection>,
 ) -> impl IntoResponse {
     let req = parse_body!(body);
-    match s.unified_query_port.execute_multi_model_query(req).await {
+    match s
+        .unified_query_port
+        .execute_multi_model_query(req, port_context(&identity))
+        .await
+    {
         Ok(result) => Json(result).into_response(),
         Err(e) => {
             // Downcast FIRST: InvalidQueryInput embeds user-controlled
@@ -213,6 +274,7 @@ async fn execute_multi_model_query(
 
 async fn execute_federated_query(
     State(s): State<UnifiedQueryRestState>,
+    identity: Option<Extension<proximadb_tenant::ResolvedRequestIdentity>>,
     body: Result<Json<ExecuteFederatedRequest>, JsonRejection>,
 ) -> impl IntoResponse {
     let req = parse_body!(body);
@@ -221,35 +283,33 @@ async fn execute_federated_query(
     }
 
     let params = json_to_proxima_values(req.parameters);
-    match s
-        .unified_query_port
-        .execute_federated_query(req.query, params)
-        .await
-    {
-        Ok(result) => Json(result).into_response(),
-        Err(e) => port_error_response("execute_federated_query", e),
-    }
+    let execution =
+        s.unified_query_port
+            .execute_federated_query(req.query, params, port_context(&identity));
+    respond_port_result("execute_federated_query", execution).await
 }
 
 async fn execute_distributed_query(
     State(s): State<UnifiedQueryRestState>,
+    identity: Option<Extension<proximadb_tenant::ResolvedRequestIdentity>>,
     body: Result<Json<serde_json::Value>, JsonRejection>,
 ) -> impl IntoResponse {
     let req = parse_body!(body);
-    match s.unified_query_port.execute_distributed_query(req).await {
-        Ok(result) => Json(result).into_response(),
-        Err(e) => port_error_response("execute_distributed_query", e),
-    }
+    let execution = s
+        .unified_query_port
+        .execute_distributed_query(req, port_context(&identity));
+    respond_port_result("execute_distributed_query", execution).await
 }
 
 async fn explain_query(
     State(s): State<UnifiedQueryRestState>,
+    identity: Option<Extension<proximadb_tenant::ResolvedRequestIdentity>>,
     body: Result<Json<ExplainQueryRequest>, JsonRejection>,
 ) -> impl IntoResponse {
     let req = parse_body!(body);
     match s
         .unified_query_port
-        .explain_unified_query(req.query, req.collection)
+        .explain_unified_query(req.query, req.collection, port_context(&identity))
         .await
     {
         Ok(result) => Json(result).into_response(),
@@ -259,12 +319,19 @@ async fn explain_query(
 
 async fn prepare_statement(
     State(s): State<UnifiedQueryRestState>,
+    identity: Option<Extension<proximadb_tenant::ResolvedRequestIdentity>>,
     body: Result<Json<PrepareStatementRequest>, JsonRejection>,
 ) -> impl IntoResponse {
     let req = parse_body!(body);
     match s
         .unified_query_port
-        .prepare_statement(req.name, req.query, req.cache_results, req.ttl_seconds)
+        .prepare_statement(
+            req.name,
+            req.query,
+            req.cache_results,
+            req.ttl_seconds,
+            port_context(&identity),
+        )
         .await
     {
         Ok(statement_id) => (
@@ -278,26 +345,31 @@ async fn prepare_statement(
 
 async fn execute_prepared_statement(
     State(s): State<UnifiedQueryRestState>,
+    identity: Option<Extension<proximadb_tenant::ResolvedRequestIdentity>>,
     Path(statement_id): Path<String>,
     body: Result<Json<ExecutePreparedRequest>, JsonRejection>,
 ) -> impl IntoResponse {
     let req = parse_body!(body);
     let params = json_to_proxima_values(req.parameters);
-    match s
-        .unified_query_port
-        .execute_prepared(statement_id, params, req.collection)
-        .await
-    {
-        Ok(result) => Json(result).into_response(),
-        Err(e) => port_error_response("execute_prepared", e),
-    }
+    let execution = s.unified_query_port.execute_prepared(
+        statement_id,
+        params,
+        req.collection,
+        port_context(&identity),
+    );
+    respond_port_result("execute_prepared", execution).await
 }
 
 async fn delete_prepared_statement(
     State(s): State<UnifiedQueryRestState>,
+    identity: Option<Extension<proximadb_tenant::ResolvedRequestIdentity>>,
     Path(statement_id): Path<String>,
 ) -> impl IntoResponse {
-    match s.unified_query_port.delete_prepared(statement_id).await {
+    match s
+        .unified_query_port
+        .delete_prepared(statement_id, port_context(&identity))
+        .await
+    {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => port_error_response("delete_prepared", e),
     }
@@ -305,12 +377,13 @@ async fn delete_prepared_statement(
 
 async fn get_prepared_stats(
     State(s): State<UnifiedQueryRestState>,
+    identity: Option<Extension<proximadb_tenant::ResolvedRequestIdentity>>,
     body: Result<Json<PreparedStatsRequest>, JsonRejection>,
 ) -> impl IntoResponse {
     let req = parse_body!(body);
     match s
         .unified_query_port
-        .get_prepared_stats(req.statement_ids)
+        .get_prepared_stats(req.statement_ids, port_context(&identity))
         .await
     {
         Ok(result) => Json(result).into_response(),
@@ -365,6 +438,7 @@ mod tests {
         NotImplemented,
         InvalidInput,
         Internal,
+        Deadline,
     }
 
     struct MockUnifiedQueryPort {
@@ -390,6 +464,9 @@ mod tests {
                     Err(InvalidQueryInput(format!("{op} not implemented")).into())
                 }
                 MockMode::Internal => Err(anyhow!("{op} failed")),
+                MockMode::Deadline => {
+                    Err(QueryDeadlineExceeded(proximadb_runtime::PORT_QUERY_DEADLINE).into())
+                }
             }
         }
     }
@@ -402,6 +479,7 @@ mod tests {
             _parameters: Option<Vec<ProximaValue>>,
             _collection: Option<String>,
             _limit: Option<u32>,
+            _context: UnifiedQueryPortContext<'_>,
         ) -> Result<serde_json::Value> {
             self.result("execute_unified_query")
         }
@@ -409,6 +487,7 @@ mod tests {
         async fn execute_multi_model_query(
             &self,
             _request: serde_json::Value,
+            _context: UnifiedQueryPortContext<'_>,
         ) -> Result<serde_json::Value> {
             self.result("execute_multi_model_query")
         }
@@ -417,6 +496,7 @@ mod tests {
             &self,
             _query: String,
             _parameters: Option<Vec<ProximaValue>>,
+            _context: UnifiedQueryPortContext<'_>,
         ) -> Result<serde_json::Value> {
             self.result("execute_federated_query")
         }
@@ -424,6 +504,7 @@ mod tests {
         async fn execute_distributed_query(
             &self,
             _request: serde_json::Value,
+            _context: UnifiedQueryPortContext<'_>,
         ) -> Result<serde_json::Value> {
             self.result("execute_distributed_query")
         }
@@ -432,6 +513,7 @@ mod tests {
             &self,
             _query: String,
             _collection: Option<String>,
+            _context: UnifiedQueryPortContext<'_>,
         ) -> Result<serde_json::Value> {
             self.result("explain_unified_query")
         }
@@ -442,6 +524,7 @@ mod tests {
             _query: String,
             _cache_results: bool,
             _ttl_seconds: Option<u64>,
+            _context: UnifiedQueryPortContext<'_>,
         ) -> Result<String> {
             match self.mode {
                 MockMode::Ok => Ok("stmt-1".to_string()),
@@ -449,7 +532,7 @@ mod tests {
                 MockMode::InvalidInput => {
                     Err(InvalidQueryInput("prepare_statement input is invalid".to_string()).into())
                 }
-                MockMode::Internal => Err(anyhow!("prepare_statement failed")),
+                MockMode::Internal | MockMode::Deadline => Err(anyhow!("prepare_statement failed")),
             }
         }
 
@@ -458,24 +541,30 @@ mod tests {
             _statement_id: String,
             _parameters: Option<Vec<ProximaValue>>,
             _collection: Option<String>,
+            _context: UnifiedQueryPortContext<'_>,
         ) -> Result<serde_json::Value> {
             self.result("execute_prepared")
         }
 
-        async fn delete_prepared(&self, _statement_id: String) -> Result<()> {
+        async fn delete_prepared(
+            &self,
+            _statement_id: String,
+            _context: UnifiedQueryPortContext<'_>,
+        ) -> Result<()> {
             match self.mode {
                 MockMode::Ok => Ok(()),
                 MockMode::NotImplemented => Err(anyhow!("delete_prepared not implemented")),
                 MockMode::InvalidInput => {
                     Err(InvalidQueryInput("delete_prepared input is invalid".to_string()).into())
                 }
-                MockMode::Internal => Err(anyhow!("delete_prepared failed")),
+                MockMode::Internal | MockMode::Deadline => Err(anyhow!("delete_prepared failed")),
             }
         }
 
         async fn get_prepared_stats(
             &self,
             _statement_ids: Vec<String>,
+            _context: UnifiedQueryPortContext<'_>,
         ) -> Result<serde_json::Value> {
             self.result("get_prepared_stats")
         }
@@ -514,6 +603,7 @@ mod tests {
     async fn handlers_validate_empty_queries_before_delegating() {
         let execute = execute_query(
             MockUnifiedQueryPort::state(MockMode::Ok),
+            None,
             Ok(Json(ExecuteQueryRequest {
                 query: " ".to_string(),
                 parameters: None,
@@ -527,6 +617,7 @@ mod tests {
 
         let federated = execute_federated_query(
             MockUnifiedQueryPort::state(MockMode::Ok),
+            None,
             Ok(Json(ExecuteFederatedRequest {
                 query: "\n".to_string(),
                 parameters: None,
@@ -544,6 +635,7 @@ mod tests {
         assert_eq!(
             execute_query(
                 state.clone(),
+                None,
                 Ok(Json(ExecuteQueryRequest {
                     query: "select * from docs".to_string(),
                     parameters: Some(vec![serde_json::json!("p1")]),
@@ -557,15 +649,20 @@ mod tests {
             StatusCode::OK
         );
         assert_eq!(
-            execute_multi_model_query(state.clone(), Ok(Json(serde_json::json!({"vector": {}}))),)
-                .await
-                .into_response()
-                .status(),
+            execute_multi_model_query(
+                state.clone(),
+                None,
+                Ok(Json(serde_json::json!({"vector": {}}))),
+            )
+            .await
+            .into_response()
+            .status(),
             StatusCode::OK
         );
         assert_eq!(
             execute_federated_query(
                 state.clone(),
+                None,
                 Ok(Json(ExecuteFederatedRequest {
                     query: "select * from docs".to_string(),
                     parameters: Some(vec![serde_json::json!(1)]),
@@ -577,15 +674,20 @@ mod tests {
             StatusCode::OK
         );
         assert_eq!(
-            execute_distributed_query(state.clone(), Ok(Json(serde_json::json!({"shards": []}))),)
-                .await
-                .into_response()
-                .status(),
+            execute_distributed_query(
+                state.clone(),
+                None,
+                Ok(Json(serde_json::json!({"shards": []}))),
+            )
+            .await
+            .into_response()
+            .status(),
             StatusCode::OK
         );
         assert_eq!(
             explain_query(
                 state.clone(),
+                None,
                 Ok(Json(ExplainQueryRequest {
                     query: "select * from docs".to_string(),
                     collection: Some("docs".to_string()),
@@ -599,6 +701,7 @@ mod tests {
         assert_eq!(
             prepare_statement(
                 state.clone(),
+                None,
                 Ok(Json(PrepareStatementRequest {
                     query: "select * from docs".to_string(),
                     name: Some("q1".to_string()),
@@ -614,6 +717,7 @@ mod tests {
         assert_eq!(
             execute_prepared_statement(
                 state.clone(),
+                None,
                 Path("stmt-1".to_string()),
                 Ok(Json(ExecutePreparedRequest {
                     parameters: Some(vec![serde_json::json!(true)]),
@@ -626,7 +730,7 @@ mod tests {
             StatusCode::OK
         );
         assert_eq!(
-            delete_prepared_statement(state.clone(), Path("stmt-1".to_string()))
+            delete_prepared_statement(state.clone(), None, Path("stmt-1".to_string()))
                 .await
                 .into_response()
                 .status(),
@@ -635,6 +739,7 @@ mod tests {
         assert_eq!(
             get_prepared_stats(
                 state,
+                None,
                 Ok(Json(PreparedStatsRequest {
                     statement_ids: vec!["stmt-1".to_string()],
                 })),
@@ -650,6 +755,7 @@ mod tests {
     async fn handlers_map_not_implemented_and_internal_errors_to_expected_statuses() {
         let not_implemented = execute_multi_model_query(
             MockUnifiedQueryPort::state(MockMode::NotImplemented),
+            None,
             Ok(Json(serde_json::json!({}))),
         )
         .await
@@ -658,6 +764,7 @@ mod tests {
 
         let invalid_input = execute_multi_model_query(
             MockUnifiedQueryPort::state(MockMode::InvalidInput),
+            None,
             Ok(Json(serde_json::json!({}))),
         )
         .await
@@ -666,11 +773,40 @@ mod tests {
 
         let internal = execute_distributed_query(
             MockUnifiedQueryPort::state(MockMode::Internal),
+            None,
             Ok(Json(serde_json::json!({}))),
         )
         .await
         .into_response();
         assert_eq!(internal.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    /// L3 (round 3): the port's typed deadline is a 504 on every unified
+    /// surface (including multi-model, which has its own error arm).
+    #[tokio::test]
+    async fn port_deadline_maps_to_gateway_timeout_on_every_unified_surface() {
+        let state = || MockUnifiedQueryPort::state(MockMode::Deadline);
+        let multi_model = execute_multi_model_query(state(), None, Ok(Json(serde_json::json!({}))))
+            .await
+            .into_response();
+        assert_eq!(multi_model.status(), StatusCode::GATEWAY_TIMEOUT);
+        let distributed = execute_distributed_query(state(), None, Ok(Json(serde_json::json!({}))))
+            .await
+            .into_response();
+        assert_eq!(distributed.status(), StatusCode::GATEWAY_TIMEOUT);
+        let execute = execute_query(
+            state(),
+            None,
+            Ok(Json(ExecuteQueryRequest {
+                query: "SELECT 1".to_string(),
+                parameters: None,
+                collection: None,
+                limit: None,
+            })),
+        )
+        .await
+        .into_response();
+        assert_eq!(execute.status(), StatusCode::GATEWAY_TIMEOUT);
     }
 
     #[tokio::test]

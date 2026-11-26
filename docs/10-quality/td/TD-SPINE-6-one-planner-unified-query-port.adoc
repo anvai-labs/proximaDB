@@ -5,11 +5,11 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | **Open** (filed 2026-11-19).
+| Status | **Implemented (scoped — see dated acceptance note)** (filed 2026-11-19; implemented 2026-11-24, hardened 2026-11-25 — see *Acceptance as delivered* and *Evidence*).
 | Priority | **MEDIUM-HIGH**. The same SQL can behave differently by surface: freshness, routing, the ADR-025 delta merge and caching exist on one core only. This is the per-surface fork that CLAUDE.md #18b forbids.
-| Component | `crates/platform/proximadb-runtime/src/unified_query_port.rs` (:37); `src/query/unified_query_port_impl.rs` (port methods :550-723, which lower to `QueryFacadeAdapter::federated_query`, `src/query/facade/adapter.rs:443`); `src/query/federated/mod.rs` (`FederatedQueryContext::execute` :276, refuses `QueryType::Sql` :310); `src/query/facade/adapter.rs` (`execute_sql` :727, which calls the free function `relational_pipeline::try_run_select` at :811); `src/query/compute_scheduler.rs`; callers: `src/network/rest/canonical/handlers.rs` (:1086), `src/network/rest/v2/query.rs` (:91, :148), MCP (`multi_server.rs` :493).
+| Component | `crates/platform/proximadb-runtime/src/unified_query_port.rs` (the port trait + `UnifiedQueryPortContext`); `src/query/unified_query_port_impl.rs` (the delegation seam `run_sql_via_one_planner`); `src/query/facade/adapter.rs` (`execute_sql_via_authority`, extracted from the `QueryAdapterPort::execute_sql` body — the ONE SQL authority); `src/query/compute_scheduler.rs` (unchanged — still the only engine-selection point); callers: `src/network/rest/canonical/handlers.rs`, `src/network/rest/v2/query.rs`, `src/network/mcp/backend.rs`, `crates/platform/proximadb-api/src/rest/canonical/multimodal_query.rs`.
 | Authority | link:../../12-design/adr/ADR-098-metadata-spine.adoc[ADR-098] D5 (seam S6); ADR-097 D1, ADR-064 D1, ADR-053 D2
-| Relates to | TD-CONN-1 (surface parity), TD-ROUTE-3 (decision/dispatch, pgwire-only), TD-ABAC-7 (`PortIdentity` consolidation), `tests/integration/query_facade/test_sql_transport_rendering_parity.rs`
+| Relates to | TD-CONN-1 (surface parity), TD-ROUTE-3 (decision/dispatch, pgwire-only), TD-ABAC-7 (`PortIdentity` consolidation), `tests/integration/query_facade/test_sql_transport_rendering_parity.rs`, `tests/spine6_one_planner_parity_e2e.rs`
 |===
 
 == Problem
@@ -29,17 +29,372 @@
 == Fix
 
 . Plain SQL through `UnifiedQueryPort` delegates to the scheduler path
-  (`QueryFacadeAdapter::execute_sql`; the port impl already holds the adapter); multimodal extensions keep their federated lowering but
-  produce plans that pass through the same `SelectRouteDecision` (`src/query/compute_scheduler.rs`; ADR-064).
+  (`QueryFacadeAdapter::execute_sql`; the port impl already holds the adapter); multimodal extensions keep
+  their federated lowering (no relational table resolves for them, so the scheduler decision has nothing to
+  decide — engine selection stays inside the engine layer behind the facade strategies; routing their plans
+  through the same `SelectRouteDecision` remains future work, NOT implemented by this TD).
 . Thread `PortIdentity` and the freshness level through the port explicitly (TD-ABAC-7 owns the
   identity struct).
 . Extend the parity suite to canonical `/sql` and pgwire with the same SQL.
 . Owner-versus-reader placement (partition-lease holder vs cache-affine stateless readers) is a
-  follow-on TD once one decision path exists.
+  follow-on TD once one decision path exists — filed as
+  link:TD-PLACE-1-owner-reader-placement-cache-affine-routing.adoc[TD-PLACE-1].
+
+== Acceptance as delivered (dated note, 2026-11-25)
+
+The plan's acceptance was "same rows AND the same route decision over pgwire, REST v2, canonical
+`/sql`, gRPC and MCP". What this TD actually proves is narrower:
+
+* **Proven — live (full server, `tests/spine6_one_planner_parity_e2e.rs`):** row parity for the
+  same SQL over pgwire + `/api/v2/sql` + `/api/v2/query`.
+* **Proven — in-process only (`tests/integration/query_facade/test_sql_transport_rendering_parity.rs`):**
+  row parity for canonical `/sql` (that handler is NOT mounted on the live router — it is
+  unrouted, so only its in-process handler is exercised) and MCP `search`, plus REST v2 vs gRPC
+  rendering parity; the round-2 read-only/EXPLAIN-bypass and tenant-scoping regressions on every
+  port leg.
+* **Structural, not proven by a test:** every surface's relational READ reaches the single
+  `ComputeScheduler::route_select*` call site inside `try_run_select`; no second decision path
+  exists. **Route-decision parity itself is NOT asserted** (no test compares the decision object
+  across surfaces).
+* **NOT implemented:** routing multi-model extension-SQL plans through the same
+  `SelectRouteDecision` (they keep the federated lowering), and owner/reader placement
+  (TD-PLACE-1).
+* **Policy outside the plan:** plain SQL on the port surfaces is READ-ONLY — recorded as a dated
+  decision in ADR-098 D5.
+
+== Implementation (2026-11-24)
+
+. **Delegation seam.** The `QueryAdapterPort::execute_sql` body (EXPLAIN-DML routing →
+  `try_sql_write_dispatch` → `try_run_select`, whose SELECT arm is the `ComputeScheduler` decision
+  → facade fallback) is extracted into the inherent
+  `QueryFacadeAdapter::execute_sql_via_authority(query, collection, identity, result_cache)`.
+  The trait method forwards to it **unchanged** (same cache policy, same behavior for
+  `/api/v2/sql` and gRPC; pgwire's EXPLAIN path was later changed by the round-2/3 fixes below). `UnifiedQueryPortImpl::run_sql_via_one_planner` funnels
+  every port SQL entry (`execute_unified_query`, `execute_multi_model_query`,
+  `execute_federated_query`, `execute_prepared`) through that ONE body for plain SQL,
+  discriminated by the adapter's single `should_use_federated_request` (now `pub(crate)`).
+  _Superseded:_ round 1 replaced that text discriminator with the `PortSqlOrigin` tag (only
+  port-synthesized UQL/multi-model text takes the federated branch), and round 2 routes raw
+  user text through the read-only entry `execute_sql_read_only_via_authority` (see below).
+  The port grows **no routing of its own**: `ComputeScheduler::route_select*` remains the only
+  engine-selection point reached by every surface.
+. **UQL claiming rule.** The UQL grammar overlaps plain SQL and an un-prefixed `FROM` defaults
+  to the Vector model, so a plain `SELECT ... FROM t` used to die in UQL lowering with
+  "UQL vector queries require VECTOR_SIMILAR(...)". `uql_to_federated_sql` now returns
+  `Ok(None)` (no claim) for a parsed SELECT with no `VECTOR_SIMILAR`/`VECTOR_DISTANCE`
+  condition, routing the text as plain SQL through the seam. That shape was a hard error
+  pre-convergence, so nothing working changes; genuine vector UQL still lowers (and still
+  validates its parameters).
+. **Why extension SQL keeps the federated path.** `VECTOR_SEARCH`/`GRAPH_QUERY`/`DOCUMENT_QUERY`/
+  `LOGS`/`METRICS`/`RERANK`/`<->` queries resolve no relational table, so the scheduler decision
+  has nothing to decide; engine selection for vector/graph/document search happens inside the
+  engine layer behind the facade strategies (`SqlStrategy` → `FederatedQueryContext` → executor).
+  They keep their federated lowering AND their port result rendering (`{id, score, rank}`), so
+  multimodal consumers (MCP search, `/api/v2/query` UQL) see zero change.
+. **Freshness.** The port context carries `VectorFreshnessMode`. `Strong` ⇒ the delegated path is
+  handed `None` as the OLAP result cache (mandate #16c: gate the lookup on `!Strong` — a Strong
+  read always computes fresh); non-Strong modes hand the cache through (hits inside
+  `try_run_select` are LSN-pinned, never staler than the requested mode). The
+  **api_handlers/pgwire callers keep the pre-existing policy** (consult under Strong
+  LSN-pinned eligibility, ADR-051 D2) — no behavior change. The federated result cache
+  (`FederatedQueryResultCache`) is not wired in the live server (`FederatedQueryContext::new`
+  sets `cache: None`); if it is ever enabled it must honor this mode at that seam.
+. **Identity.** New `UnifiedQueryPortContext { identity: PortIdentity, freshness }` on every port
+  method. `/api/v2/query` now extracts `ResolvedRequestIdentity` (the same fail-closed contract as
+  `/api/v2/sql`); the canonical `/sql` handler passes `PortIdentity::for_tenant(scoped_tenant)`
+  (that handler is currently unrouted since the v1 surface removal — TD-V1SUNSET-1 — but remains
+  the canonical module's SQL entry and is exercised in-process by the parity suite);
+  MCP passes its configured tenant; the multimodal `/api/v2/unified/*` handlers take
+  `Option<Extension<ResolvedRequestIdentity>>`. The task-local `request_scope` remains ONLY as
+  the documented fallback (bare-mounted test routers; the federated lowering's own scope
+  requirement) — prepared-statement owner keying prefers the explicit identity tenant, then the
+  scope. Plain SQL with neither identity nor scope fails closed ("no request identity").
+. **`execute_distributed_query`** deliberately does NOT route through the seam: it is an explicit
+  `force_path = "distributed"` override onto the `DistributedQueryCoordinator` — a placement
+  decision orthogonal to local engine selection (ADR-098 D5's owner-versus-reader placement is
+  the follow-on and is not decided here).
 
 == Acceptance
 
-* The same SQL returns the same rows and the same route decision over pgwire, REST v2, canonical
-  `/sql`, gRPC and MCP (parity suite, with a mutation probe proving the comparison is not tautological).
-* A Strong-freshness read through the port bypasses the query cache (mandate #16c).
-* Tenant isolation: a request without identity fails closed on every surface.
+* The same READ SQL returns the same rows over pgwire, REST v2, canonical `/sql`, gRPC and MCP
+  (parity suites, with a mutation probe on a REAL leg's rendering proving the comparison is not
+  tautological). Route-decision parity is structural: one `ComputeScheduler::route_select*` call
+  site serves every surface. WRITE SQL on the port surfaces is rejected read-only (see the round-1
+  behavior note) — it does not parity-match `/api/v2/sql`, which remains the guarded write surface.
+* A Strong-freshness read through the port bypasses the query-cache LOOKUP (mandate #16c): pinned
+  by a default-env pure-contract unit test (Strong ⇒ None with an injected enabled cache) and an
+  end-to-end differential (cache ON: the `/api/v2/sql` control read HITS, the port's Strong read on
+  the same SQL does not move the hit counter while returning identical rows).
+* Tenant isolation: a request with neither an identity nor a request scope fails closed with the
+  typed `MissingQueryIdentity` (401 at the HTTP surfaces); an anonymous identity inside a tenant
+  scope is DERIVED into that tenant (never executes unscoped).
+
+== Round-1 review fixes (2026-11-24, fresh-agent adversarial review)
+
+* **HIGH-1 (silent write loss — fixed structurally):** the raw-substring
+  discriminator no longer pre-routes ANY raw user text. `PortSqlOrigin` tags
+  each text: only SQL the PORT itself synthesized (UQL lowering, multi-model
+  component lowering) takes the federated branch directly; every raw user
+  text goes to `execute_sql_via_authority` FIRST (which falls back to the
+  federated facade for genuine extension SQL only after the scheduler
+  declines). Extension keywords inside string literals or comments can no
+  longer reroute plain SQL — every probe from the review is a pinned parity
+  test.
+* **MED-2 (toothless 16c tests — reworked):** `olap_cache_for_freshness` is
+  now pure over an injected enabled cache, so the Strong-bypass contract is
+  pinned in the DEFAULT env (removing the Strong arm fails the unit test);
+  the e2e gains two arms on the same data with the cache ON — the
+  `/api/v2/sql` control read HITS (the cache is consulted) while the port's
+  Strong read on the SAME SQL leaves the hit counter unmoved (the bypass),
+  both returning identical rows.
+* **MED-3 (unscoped fallback — closed):** an anonymous identity inside a
+  `Tenant` scope is DERIVED into a full `PortIdentity` for that tenant (the
+  scheduler path and write dispatch resolve within it — never unscoped); an
+  `Internal` scope keeps its designed in-force semantics; neither identity
+  nor scope fails closed with the typed `MissingQueryIdentity`, mapped to
+  **401** (not 500) at the HTTP surfaces.
+* **MED-4 (writes on read-labelled surfaces — policy decided, dated
+  2026-11-24):** plain SQL on `UnifiedQueryPort` surfaces (MCP `search`,
+  `/api/v2/query`, `/api/v2/unified/*`, canonical `/sql`, prepared) is
+  **READ-ONLY** — `SELECT`/`WITH…SELECT`/`EXPLAIN` of a read (_round 2
+  narrowed this: a single pure query only, and EVERY `EXPLAIN` form is
+  rejected — see below_). DDL/DML
+  (including `EXPLAIN ANALYZE` of a write) is rejected as a client error
+  (400 at HTTP; a typed tool error on MCP) naming the policy and pointing at
+  the guarded write surfaces (`/api/v2/sql` with single-statement validation
+  + 1 MiB cap + deadline, gRPC `ExecuteQuery`, pgwire). Rationale: these are
+  query surfaces (the MCP tool is literally `search`); writes there had no
+  guards and, pre-convergence, no reach either. Documented behavior change:
+  raw user-written extension SQL (`SELECT * FROM VECTOR_SEARCH(...)` typed
+  by a client, not UQL-lowered) now renders `{id, score, metadata}` (the
+  authority's typed cells) instead of the old federated `{id, score, rank}`.
+* **LOWs:** `explain_unified_query` runs in the caller's identity scope (the
+  context is used; freshness is inert for a non-executing heuristic explain);
+  canonical `/sql` prefers `ResolvedRequestIdentity` so the ABAC subject
+  travels (tenant-only fallback otherwise); the port times the delegated
+  call so `metrics.execution_time_ms` is real; the freshness default
+  (Strong = bypass) is documented as the surfaces' pre-PR cache behavior
+  with `with_freshness` as the future knob seam; the mutation probe mutates
+  a REAL leg's rendered output; the fail-closed gate is 401.
+* **Carve-outs (unchanged, now stated here):** `execute_distributed_query`
+  stays off the seam (explicit `force_path="distributed"` placement); the
+  port's `explain` remains the adapter's heuristic sketch, not the
+  scheduler's decision trace.
+
+== Round-2 review fixes (2026-11-25, fresh-agent adversarial review)
+
+* **HIGH-1 (the read-only classifier was bypassable — fixed on BOTH axes):**
+  (a) the classifier now decides on the statement **AST** — a single pure
+  `SELECT` only: data-modifying set-expression bodies (`SELECT 1 UNION
+  (DELETE … RETURNING *)`), data-modifying CTEs, `SELECT … INTO`, and EVERY
+  `EXPLAIN` (parenthesized `ANALYZE` forms included — sqlparser's `analyze`
+  flag is false for all of them, so the flag is no longer consulted) are
+  rejected; parsing moved to `PostgreSqlDialect`. (b) the authority gained a
+  **read-only entry** (`execute_sql_read_only_via_authority`) that
+  structurally cannot reach the EXPLAIN-DML explainer or the write dispatch,
+  and the port routes raw text through it — the port no longer depends on a
+  parallel classifier matching the authority's parsing.
+* **HIGH-2 (pre-existing, newly reachable — fixed):** `EXPLAIN (ANALYZE)
+  <DML>` executed the write **unscoped** (`execute_scoped(statement, None)`).
+  `explain_analyze_table_write` now takes the caller's `TenantContext` —
+  threaded from the port identity in the adapter and from the connection's
+  write tenant in pgwire — so an analyzed DML executes within its tenant.
+  `parse_explain_kind` now parses the option list (`(ANALYZE off)` is NOT
+  analyze — PostgreSQL semantics; the old substring check executed a write
+  the user asked to only plan).
+* **MED-1:** the classifier parses with `PostgreSqlDialect`, so `<->` KNN reads
+  are no longer rejected; the port adds no GenericDialect validation of its
+  own. Over a real vector collection the WHERE form returns the authority
+  body's rows on every port leg; the `ORDER BY … <-> … LIMIT` forms cannot
+  execute on the SQL authority path on any server (`execute_read_path` hands
+  `try_run_select` no vector search service) — round 3 rejects them with a
+  typed, actionable 400 on every port leg (was an untyped 500).
+  `/api/v2/sql` still rejects `<->` at its GenericDialect single-statement
+  validation (pre-existing, unchanged).
+* **MED-2:** `/api/v2/unified/distributed` plain SQL routes through the same
+  read-only seam (no more silent-empty for keyword-bearing SELECTs); the
+  forced-distributed placement stays reachable via
+  `QueryFacadeAdapter::distributed_query` for embedders.
+* **L2–L5:** typed 401/400 for the fail-closed paths (prepare-without-identity,
+  UQL-lowered-without-scope, distributed — plus canonical `sql_error_to_api`
+  mappings); MCP policy rejections are JSON-RPC INVALID_PARAMS (-32602);
+  1 MiB cap on every port text; a 60s deadline (superseded by round 3 —
+  see below); prepared-cache parse/optimize failures are
+  400; no "use /api/v2/sql for writes" suffix is appended to read parse
+  failures (the policy rejection itself names `/api/v2/sql`).
+* **L7 (decision):** EXPLAIN is **not served** on the read-only port — a
+  clear 400 names it (the authority's `EXPLAIN SELECT` is a pre-existing 500
+  on `/api/v2/sql`; advertising it here would promise a path that errors).
+
+== Round-3 review fixes (2026-11-26, fresh-agent adversarial review)
+
+* **MED-1 (pgwire's duplicate EXPLAIN parser executed `(ANALYZE off)` writes —
+  fixed):** pgwire's private `extract_explain_with_analyze` substring-matched
+  `ANALYZE` in the option list, so `EXPLAIN (ANALYZE off|false|0) INSERT …`,
+  `(VERBOSE, ANALYZE off, COSTS)` and even `(VERBOSE ANALYZE)` executed the
+  write. It is deleted (CLAUDE.md #19); pgwire and the adapter (the SQL
+  authority) call the ONE `sql_frontend::parse_explain_kind`.
+* **L1:** `parse_explain_kind` returns `Result` and parses PostgreSQL's option
+  grammar (`name [value]`, comma-separated, last ANALYZE wins). Boolean
+  options accept PostgreSQL's spellings (`on|true|1|yes|y|t` /
+  `off|false|0|no|n|f`, quoted or not, any case); any other value, an unknown
+  option or a malformed option is an error (pgwire 42601; 400 class on the
+  authority surfaces) — never "execute".
+* **L2 (pgwire EXPLAIN ANALYZE skipped the DML gates — fixed):** the analyzed
+  write now passes the normal DML entry's target gates (round 4: one shared
+  `gate_dml_target` helper) plus the transaction and cache rules: primary-pod gate
+  (`resolve_write_tenant_gated`, 57P03), tenant visibility
+  (`table_visible_for_tenant`, 42P01), a READ ONLY transaction rejects it
+  (25006) and any open transaction rejects it (0A000 — it executes immediately
+  and cannot join the buffered writes), and a committed analyzed write
+  invalidates the tenant's OLAP result cache (mandate #16b; the adapter's
+  analyze path invalidates too).
+* **L3 (deadline):** ONE deadline, enforced inside the port at
+  `run_sql_via_one_planner` (`proximadb_runtime::PORT_QUERY_DEADLINE`, 60s), so
+  every surface over the port carries it — `/api/v2/query`, every
+  `/api/v2/unified/*` route including multi-model, canonical `/sql` and MCP.
+  It surfaces as the typed `QueryDeadlineExceeded`: **504** on every HTTP port
+  surface (`/api/v2/query` returned 408 via `DeadlineExceeded`); MCP reports an
+  internal error that names the deadline (JSON-RPC has no timeout code).
+  Canonical `/sql`'s `timeout_ms` request field is not consulted (the port
+  deadline applies). `tokio::time::timeout` stops WAITING — the future is
+  dropped; work already handed to spawned or blocking tasks is not cancelled.
+  (`/api/v2/sql` keeps its own per-request `timeout_ms` deadline → 408.)
+* **L4:** `ensure_query_size` (1 MiB) runs at every port entry on the RAW input
+  before UQL lowering / parameter binding (unified, federated, distributed,
+  multi-model request, prepare), and again on the executed text.
+* **L5 (docs + KNN):** the classifier doc no longer claims `TABLE t` is
+  accepted (it does not parse under `PostgreSqlDialect`); pgvector `ORDER BY …
+  <-> … LIMIT` on the authority path is a typed 400 (see MED-1 above).
+* **L6:** ADR-098's Completion ledger G12 names TD-PLACE-1 and the scoped
+  status.
+* **L7 (pre-existing, fixed):** plan-only `EXPLAIN <DML>` resolved the target
+  table UNSCOPED, disclosing whether another tenant's table exists.
+  `explain_table_write_with_overrides` takes the caller's `TenantContext` and
+  resolves target/source metadata within it (adapter: the port identity;
+  pgwire: the connection tenant, plus the visibility gate);
+  `explain_analyze_table_write` plans in the same scope.
+
+== Round-4 review fixes (2026-11-26, fresh-agent adversarial review)
+
+* **MED-1 (TD-DML-3 read policy skipped by `EXPLAIN (ANALYZE)` upserts —
+  fixed):** an analyzed `INSERT … ON CONFLICT DO UPDATE` was parsed with NO
+  caller (`on_conflict.caller_identity = None` ⇒ "internal statement"), so
+  under `abac-policy` it could rewrite a conflicting row the governed caller
+  cannot see. ONE helper, `DmlStatement::stamp_on_conflict_caller`, stamps the
+  caller on every surface that executes a parsed upsert: pgwire DML, pgwire
+  `EXPLAIN ANALYZE` (`session_caller_identity`), the SQL authority's `EXPLAIN
+  ANALYZE`, and the authority's write dispatch `try_sql_write_dispatch` (which
+  also never stamped it — `/api/v2/sql` and gRPC plain upserts by a governed
+  caller now enforce the policy too). pgwire's DML target gates (primary-pod +
+  tenant visibility) are ONE helper, `gate_dml_target`, shared by the DML entry
+  and the EXPLAIN path; an analyzed write's privilege/integrity error keeps its
+  SQLSTATE (42501). **What still differs from the DML entry, by design:** an
+  analyzed write inside an open transaction is rejected (0A000 / 25006 READ
+  ONLY) instead of being buffered, because it executes immediately.
+* **LOW-1:** cache-invalidation and transaction-gate tests with negative
+  controls (see Evidence).
+* **LOW-2:** the typed pgvector `ORDER BY … <-> … LIMIT` rejection moved into
+  the READ-ONLY port entry only (and only when a DML service is wired); the
+  shared authority body (`/api/v2/sql`, gRPC, api_handlers) keeps its prior
+  outcome.
+* **LOW-3:** `explain_unified_query` applies the 1 MiB cap and the port
+  deadline, so every port entry carries both.
+* **LOW-4:** `is_pgvector_knn_select` no longer splits `lower_pgvector_select`
+  from its doc comment.
+
+== Round-5 review fixes (2026-11-26, fresh-agent adversarial review)
+
+* **MED-A (round-4 regression — fixed):** round 4 rendered the full anyhow
+  chain (`{error:#}`) into `/api/v2/sql`'s `ApiError::Internal`, which reaches
+  clients unsanitised (lock-store keys, object-store endpoints/keys/signed
+  query strings, layout causes). Internal failures again render only the
+  outermost message (the full chain is logged server-side); TYPED relational
+  causes (`find_relational_constraint_violation`) map to their own message +
+  SQLSTATE and status class — 42501 → **403**, class 23/21 → 409, everything
+  else → 400 — on `/api/v2/sql` and (same mapping) gRPC `ExecuteQuery`
+  (42501 → PERMISSION_DENIED). The adapter's EXPLAIN error keeps the typed
+  cause in the chain (`.context`, same client text).
+* **MED-B (pre-existing — filed, not fixed here):** a rejected write releases
+  its DML lock asynchronously, so the client's next statement can see 55P03 /
+  409 `lock_conflict` against its own prior statement —
+  link:TD-DMLLOCK-1-dml-lock-released-asynchronously-on-error-paths.adoc[TD-DMLLOCK-1].
+* **LOW-C:** the CI `authz_changes` filter now includes `src/services/dml/**`,
+  `src/query/facade/**` and `src/query/unified_query_port_impl.rs` (not the
+  whole hot `src/query/**`).
+* **LOW-D:** the governed-upsert test covers gRPC `ExecuteQuery` too.
+* **Narrowing of the round-4 claim:** the ON CONFLICT caller stamp is tested
+  on pgwire (DML + EXPLAIN ANALYZE), `/api/v2/sql` and gRPC `ExecuteQuery`
+  (plain + EXPLAIN ANALYZE) — not on other surfaces (the port surfaces are
+  read-only and never execute an upsert).
+
+== Evidence
+
+* `tests/integration/query_facade/test_sql_transport_rendering_parity.rs`:
+  `plain_sql_runs_through_the_scheduler_on_every_in_process_surface` (REST v2 `/sql` reference vs
+  canonical `/sql` port leg vs gRPC vs MCP — identical rendered rows; seeded through the AUTHORITY
+  surface since the port is read-only);
+  `extension_keywords_in_literals_and_comments_route_through_the_authority` (HIGH-1: every review
+  probe — the silent-write-loss INSERT (rejected read-only on the port, written by `/api/v2/sql`),
+  the `LOGS(app)` literal SELECT (identical rows), the `GRAPH_QUERY(...)` UPDATE (rejected on the
+  port, executed by the authority), the `<->` comment SELECT (identical rows));
+  `mcp_search_rejects_delete_statements` (MED-4: the row survives);
+  `anonymous_identity_inside_a_tenant_scope_reads_that_tenant` (MED-3: derived identity, tenant
+  isolation); `parity_comparator_detects_mutated_legs` (LOW-6: mutates the REAL canonical-leg
+  rendering); `scope_less_port_call_is_unauthorized_not_internal` (LOW-6: 401);
+  `plain_sql_through_the_port_fails_closed_without_identity_or_scope` (typed gate + positive
+  control).
+* Round 2 (2026-11-25), `test_sql_transport_rendering_parity.rs`:
+  `explain_bypass_and_query_shaped_writes_are_400_with_state_unchanged_on_every_port_leg`
+  (15 shapes × 8 port legs: 400 + tenant view AND unscoped view unchanged; positive read
+  control); `explain_analyze_dml_is_tenant_scoped_and_cannot_touch_another_tenant` (HIGH-2);
+  `pgvector_knn_sql_on_every_port_leg_matches_the_authority_body` (MED-1);
+  `distributed_plain_sql_returns_the_authority_rows` (MED-2);
+  `mcp_and_prepared_reject_explain_analyze_writes` (L3). E2E:
+  `explain_analyze_dml_is_rejected_on_the_query_surface_e2e`,
+  `pgvector_knn_read_is_not_rejected_by_the_port_classifier_e2e`,
+  `explain_analyze_dml_is_tenant_scoped_e2e`. Unit:
+  `every_explain_form_is_rejected_by_the_read_only_classifier`,
+  `query_shaped_writes_are_rejected_by_the_read_only_classifier`,
+  `parse_explain_kind_parses_the_option_list`.
+* `tests/spine6_one_planner_parity_e2e.rs` (full server):
+  `same_sql_one_planner_across_pgwire_rest_v2_and_unified_query_e2e` (pgwire vs `/api/v2/sql` vs
+  `/api/v2/query` with a plain-SQL body — one server, identical rows; plus the MED-4 DELETE probe:
+  400 read-only, rows survive);
+  `strong_freshness_port_read_sees_every_write_with_result_cache_on_e2e` (MED-2: cache ON, Arm A
+  control HIT vs Arm B port Strong bypass on the same SQL, then read-after-write).
+* Unit: `olap_cache_policy_strong_bypasses_the_result_cache` (MED-2: pure
+  contract, default env), `plain_sql_read_classifier_accepts_reads_and_rejects_writes` (MED-4),
+  `effective_identity_prefers_explicit_then_derives_scope` +
+  `effective_identity_derives_the_scope_tenant` (MED-3),
+  `plain_relational_select_is_not_a_uql_claim`, `sql_result_renders_the_port_envelope`,
+  `prepared_owner_prefers_the_explicit_identity_tenant`
+  (`src/query/unified_query_port_impl.rs`).
+* Route-decision parity is structural: every surface's relational READS reach the one
+  `ComputeScheduler::route_select*` call site inside `try_run_select` (no second decision path
+  exists to diverge). Qualification (round 2): the authority's write/EXPLAIN-DML arms remain
+  reachable only from the WRITE surfaces (`/api/v2/sql`, gRPC, pgwire); the port's explain is
+  the heuristic sketch; `distributed` no longer force-routes. Row/rendering parity is asserted
+  end-to-end above.
+* Round 3 (2026-11-26): pgwire e2e
+  `pgwire_explain_analyze_options_gates_and_tenant_scoping_e2e` (plan-only falsy ANALYZE writes
+  nothing; malformed options 42601; READ ONLY transaction 25006; another tenant's connection 42P01
+  for plan-only and analyzed; analyzed INSERT lands in the connection tenant, visible over REST);
+  in-process `plan_only_explain_dml_does_not_disclose_another_tenants_table` (L7),
+  `invalid_explain_option_value_is_rejected_and_never_executes` (L1); unit
+  `parse_explain_kind_accepts_postgres_boolean_spellings`,
+  `parse_explain_kind_rejects_invalid_options`, `test_pgwire_explain_parser_analyze_off_is_plan_only`,
+  `port_deadline_maps_to_gateway_timeout_on_every_unified_surface`.
+* Round 4 (2026-11-26): `explain_analyze_upsert_enforces_the_on_conflict_read_policy`
+  (`tests/abac_relational_transport_e2e.rs`, `--features abac-policy`, CI lane "Authorization E2E"
+  when authz paths change: pgwire SCRAM alice — plain upsert control and `EXPLAIN (ANALYZE)` upsert
+  both 42501; `/api/v2/sql` both rejected; row unchanged);
+  `pgwire_analyzed_write_invalidates_the_olap_result_cache_e2e` and
+  `authority_analyzed_write_invalidates_the_olap_result_cache_e2e` (invalidation counter moves; the
+  next read sees the row); the 25006 / 0A000 arms of
+  `pgwire_explain_analyze_options_gates_and_tenant_scoping_e2e`;
+  `explain_unified_query_enforces_the_port_size_cap`; the KNN test pins the shared authority body
+  and `/api/v2/sql` outcomes as unchanged.
+* Regression: `/api/v2/sql`, gRPC `ExecuteQuery` and `api_handlers` keep the shared body (the trait
+  method forwards with the same cache argument). pgwire IS touched: its EXPLAIN path now uses the
+  shared parser and the DML gates (round 3), and its analyzed write is tenant-scoped (round 2).

@@ -165,13 +165,19 @@ impl ReferenceBackend for EngineBackend {
             .as_ref()
             .ok_or_else(|| BackendError::internal("query facade not available".to_string()))?;
         // The MCP session acts as its configured tenant (default when none).
+        // ADR-098 D5 / TD-SPINE-6: the tenant travels as DATA on the port
+        // context; the task-local scope stays wrapped as the fallback for the
+        // federated lowering path.
         let tenant = self
             .tenant
             .clone()
             .unwrap_or_else(|| proximadb_tenant::DEFAULT_TENANT.to_string());
+        let context = proximadb_runtime::UnifiedQueryPortContext::for_identity(
+            proximadb_runtime::PortIdentity::for_tenant(&tenant),
+        );
         crate::query::request_scope::with_request_tenant(
-            tenant,
-            port.explain_unified_query(q, Some(id)),
+            tenant.clone(),
+            port.explain_unified_query(q, Some(id), context),
         )
         .await
         .map_err(|e| BackendError::internal(format!("explain failed: {e}")))
@@ -189,12 +195,39 @@ impl ReferenceBackend for EngineBackend {
             .tenant
             .clone()
             .unwrap_or_else(|| proximadb_tenant::DEFAULT_TENANT.to_string());
+        let context = proximadb_runtime::UnifiedQueryPortContext::for_identity(
+            proximadb_runtime::PortIdentity::for_tenant(&tenant),
+        );
         crate::query::request_scope::with_request_tenant(
-            tenant,
-            port.execute_unified_query(q, None, Some(id), limit),
+            tenant.clone(),
+            port.execute_unified_query(q, None, Some(id), limit, context),
         )
         .await
-        .map_err(|e| BackendError::internal(format!("search failed: {e}")))
+        .map_err(|error| {
+            // L3 (round 2): client-shaped rejections are INVALID_PARAMS
+            // (JSON-RPC -32602), not INTERNAL — the read-only policy and the
+            // query-shape rejections are caller errors.
+            if error
+                .downcast_ref::<proximadb_runtime::InvalidQueryInput>()
+                .is_some()
+            {
+                BackendError::invalid_params(format!("search rejected: {error}"))
+            } else if error
+                .downcast_ref::<proximadb_runtime::MissingQueryIdentity>()
+                .is_some()
+            {
+                BackendError::invalid_params(format!("search has no tenant identity: {error}"))
+            } else if error
+                .downcast_ref::<proximadb_runtime::QueryDeadlineExceeded>()
+                .is_some()
+            {
+                // L3 (round 3): JSON-RPC has no timeout code; the port
+                // deadline is reported as an internal error that names it.
+                BackendError::internal(format!("search deadline exceeded: {error}"))
+            } else {
+                BackendError::internal(format!("search failed: {error}"))
+            }
+        })
     }
 
     async fn memory(&self, args: &Value) -> Result<Value, BackendError> {

@@ -791,43 +791,81 @@ fn test_copy_format_detection() {
     );
 }
 
-// Note: a prior `test_extract_explain_inner_query_for_table_write`
-// covered `PostgresProtocol::extract_explain_inner_query`, which
-// was removed alongside `strip_explain_prefix` in clippy cleanup
-// batch 14 (commit `555ed5b2a`). `extract_explain_with_analyze`
-// is the surviving entry point and is exercised below.
+// pgwire's private `extract_explain_with_analyze` was deleted (TD-SPINE-6
+// round 3, MED-1): its substring `contains("ANALYZE")` check executed
+// `EXPLAIN (ANALYZE off) <DML>`. pgwire now calls the ONE shared
+// `sql_frontend::parse_explain_kind`; these pin the pgwire-facing shapes.
 
 #[test]
-fn test_extract_explain_with_analyze_detects_analyze_flag() {
-    let (is_analyze, inner) = PostgresProtocol::extract_explain_with_analyze(
+fn test_pgwire_explain_parser_detects_analyze_flag() {
+    let parsed = crate::query::sql_frontend::parse_explain_kind(
         "EXPLAIN (ANALYZE, FORMAT JSON) INSERT INTO facts SELECT * FROM staging;",
     )
     .expect("analyze EXPLAIN should parse");
-
-    assert!(is_analyze, "ANALYZE option should be detected");
-    assert_eq!(inner, "INSERT INTO facts SELECT * FROM staging;");
+    assert_eq!(
+        parsed,
+        Some((true, "INSERT INTO facts SELECT * FROM staging;"))
+    );
 }
 
 #[test]
-fn test_extract_explain_with_analyze_bare_analyze_keyword() {
-    let (is_analyze, inner) = PostgresProtocol::extract_explain_with_analyze(
+fn test_pgwire_explain_parser_bare_analyze_keyword() {
+    let parsed = crate::query::sql_frontend::parse_explain_kind(
         "EXPLAIN ANALYZE INSERT INTO facts SELECT * FROM staging;",
     )
     .expect("bare EXPLAIN ANALYZE should parse");
-
-    assert!(is_analyze, "bare ANALYZE should be detected");
-    assert_eq!(inner, "INSERT INTO facts SELECT * FROM staging;");
+    assert_eq!(
+        parsed,
+        Some((true, "INSERT INTO facts SELECT * FROM staging;"))
+    );
 }
 
 #[test]
-fn test_extract_explain_without_analyze_returns_false() {
-    let (is_analyze, inner) = PostgresProtocol::extract_explain_with_analyze(
+fn test_pgwire_explain_parser_without_analyze_returns_false() {
+    let parsed = crate::query::sql_frontend::parse_explain_kind(
         "EXPLAIN (FORMAT JSON) INSERT INTO facts SELECT * FROM staging;",
     )
     .expect("plain EXPLAIN should parse");
+    assert_eq!(
+        parsed,
+        Some((false, "INSERT INTO facts SELECT * FROM staging;"))
+    );
+}
 
-    assert!(!is_analyze, "no ANALYZE option — flag should be false");
-    assert_eq!(inner, "INSERT INTO facts SELECT * FROM staging;");
+/// MED-1 (round 3): the pgwire probe shapes — falsy ANALYZE plans only, and
+/// a non-`name [value]` option is a syntax error (PostgreSQL rejects it).
+#[test]
+fn test_pgwire_explain_parser_analyze_off_is_plan_only() {
+    for (query, inner) in [
+        (
+            "EXPLAIN (ANALYZE off) INSERT INTO t VALUES (1)",
+            "INSERT INTO t VALUES (1)",
+        ),
+        (
+            "EXPLAIN (ANALYZE false) INSERT INTO t VALUES (1)",
+            "INSERT INTO t VALUES (1)",
+        ),
+        (
+            "EXPLAIN (ANALYZE 0) INSERT INTO t VALUES (1)",
+            "INSERT INTO t VALUES (1)",
+        ),
+        (
+            "EXPLAIN (VERBOSE, ANALYZE off, COSTS) INSERT INTO t VALUES (1)",
+            "INSERT INTO t VALUES (1)",
+        ),
+    ] {
+        assert_eq!(
+            crate::query::sql_frontend::parse_explain_kind(query).expect("parses"),
+            Some((false, inner)),
+            "{query}"
+        );
+    }
+    assert!(
+        crate::query::sql_frontend::parse_explain_kind(
+            "EXPLAIN (VERBOSE ANALYZE) INSERT INTO t VALUES (1)"
+        )
+        .is_err()
+    );
 }
 
 #[test]

@@ -4,7 +4,7 @@
 //! lower textual AQL/UQL into the shared `UnifiedQueryPort`. Plain SQL uses the
 //! distinct `/api/v2/sql` transport adapter so language contracts do not blur.
 
-use axum::{Json, extract::State};
+use axum::{Extension, Json, extract::State};
 use proximadb_data_model::ProximaValue;
 use proximadb_records::conversions::json_to_proxima;
 use serde::{Deserialize, Serialize};
@@ -80,10 +80,12 @@ fn json_to_proxima_values(params: Option<Vec<serde_json::Value>>) -> Option<Vec<
     responses(
         (status = 200, description = "Query result.", body = crate::network::rest::openapi::QueryResponse),
         (status = 400, description = "Invalid request.", body = crate::network::rest::openapi::ErrorResponse),
+        (status = 504, description = "Query deadline exceeded.", body = crate::network::rest::openapi::ErrorResponse),
     ),
 )]
 pub async fn execute_query(
     State(state): State<AppState>,
+    Extension(identity): Extension<proximadb_tenant::ResolvedRequestIdentity>,
     Json(request): Json<QueryRequest>,
 ) -> ApiResult<Json<serde_json::Value>> {
     validate_query(request.language, &request.query)?;
@@ -92,34 +94,77 @@ pub async fn execute_query(
         .as_ref()
         .ok_or_else(|| ApiError::Internal("Unified query port is not configured".to_string()))?;
 
-    let result = match request.language {
-        QueryLanguage::Uql => {
-            query_port
-                .execute_unified_query(
-                    request.query,
-                    json_to_proxima_values(request.parameters),
-                    request.collection,
-                    request.limit,
-                )
-                .await
-        }
-        QueryLanguage::Federated => {
-            query_port
-                .execute_federated_query(request.query, json_to_proxima_values(request.parameters))
-                .await
-        }
-        QueryLanguage::Aql => {
-            return Err(ApiError::InvalidArgument(
+    // ADR-098 D5 / TD-SPINE-6: the port carries the caller's identity as data
+    // (same fail-closed extraction contract as /api/v2/sql — the tenant
+    // middleware inserts the foundation identity; a router mounted without it
+    // fails closed here instead of constructing an anonymous carrier).
+    let context = proximadb_runtime::UnifiedQueryPortContext::for_identity(
+        proximadb_runtime::PortIdentity::from(&identity),
+    );
+
+    // L3 (round 3): the deadline is enforced INSIDE the port
+    // (`proximadb_runtime::PORT_QUERY_DEADLINE`) and surfaces as the typed
+    // `QueryDeadlineExceeded` → 504 below — one deadline for every surface.
+    let result = async {
+        match request.language {
+            QueryLanguage::Uql => {
+                query_port
+                    .execute_unified_query(
+                        request.query,
+                        json_to_proxima_values(request.parameters),
+                        request.collection,
+                        request.limit,
+                        context,
+                    )
+                    .await
+            }
+            QueryLanguage::Federated => {
+                query_port
+                    .execute_federated_query(
+                        request.query,
+                        json_to_proxima_values(request.parameters),
+                        context,
+                    )
+                    .await
+            }
+            QueryLanguage::Aql => Err(proximadb_runtime::InvalidQueryInput(
                 "AQL text execution is not yet exposed on /api/v2/query; submit UQL or federated SQL extensions".to_string(),
-            ));
+            )
+            .into()),
         }
-    };
+    }
+    .await;
 
     result.map(Json).map_err(|error| {
         // A query addressing a collection that does not resolve for the
         // request (missing, or not resolvable by its tenant) is 404.
         if let Some(missing) = crate::services::operations::vectors::collection_not_found(&error) {
             return ApiError::CollectionNotFound(missing.identifier.clone());
+        }
+        // MED-4/MED-3 (round-1 review): client-shaped port rejections map to
+        // 4xx — a read-only-policy violation (DDL/DML on this query surface)
+        // is a 400 naming the policy (unsupported AQL is a 400 too); a missing
+        // identity is a 401. L5 (round 2): no write-surface suffix is
+        // appended here — the port's policy rejection already names
+        // /api/v2/sql, and a READ that merely failed to parse must not be
+        // told to use the write surface.
+        if error
+            .downcast_ref::<proximadb_runtime::InvalidQueryInput>()
+            .is_some()
+        {
+            return ApiError::InvalidArgument(format!("Query rejected: {error}"));
+        }
+        if error
+            .downcast_ref::<proximadb_runtime::MissingQueryIdentity>()
+            .is_some()
+        {
+            return ApiError::Unauthorized(format!("Query rejected: {error}"));
+        }
+        if error
+            .downcast_ref::<proximadb_runtime::QueryDeadlineExceeded>()
+            .is_some()
+        {
+            return ApiError::QueryDeadline(format!("Query rejected: {error}"));
         }
         error!("v2 query execution failed: {}", error);
         ApiError::Internal(format!("Query execution failed: {}", error))
@@ -141,6 +186,7 @@ pub async fn execute_query(
 )]
 pub async fn explain_query(
     State(state): State<AppState>,
+    Extension(identity): Extension<proximadb_tenant::ResolvedRequestIdentity>,
     Json(request): Json<ExplainQueryRequest>,
 ) -> ApiResult<Json<serde_json::Value>> {
     validate_query(request.language, &request.query)?;
@@ -150,7 +196,13 @@ pub async fn explain_query(
         .ok_or_else(|| ApiError::Internal("Unified query port is not configured".to_string()))?;
 
     query_port
-        .explain_unified_query(request.query, request.collection)
+        .explain_unified_query(
+            request.query,
+            request.collection,
+            proximadb_runtime::UnifiedQueryPortContext::for_identity(
+                proximadb_runtime::PortIdentity::from(&identity),
+            ),
+        )
         .await
         .map(Json)
         .map_err(|error| {

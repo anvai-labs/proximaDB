@@ -97,8 +97,11 @@ def sync_detailed(
 ) -> Response[UnifiedBareError | UnifiedPrepareResponse]:
     """Prepare a statement for repeated execution.
 
-     The optional `X-Tenant-ID` header is not consulted by this
-    handler — unified queries run without tenant selection.
+     The `X-Tenant-ID` header (or the authenticated tenant) scopes this
+    query — it is threaded as the port identity (ADR-098 D5 /
+    TD-SPINE-6); without it the query fails closed (401). Plain SQL on
+    this surface is read-only (pure SELECT); writes are served by
+    /api/v2/sql.
 
     Args:
         x_tenant_id (str | Unset):
@@ -132,8 +135,11 @@ def sync(
 ) -> UnifiedBareError | UnifiedPrepareResponse | None:
     """Prepare a statement for repeated execution.
 
-     The optional `X-Tenant-ID` header is not consulted by this
-    handler — unified queries run without tenant selection.
+     The `X-Tenant-ID` header (or the authenticated tenant) scopes this
+    query — it is threaded as the port identity (ADR-098 D5 /
+    TD-SPINE-6); without it the query fails closed (401). Plain SQL on
+    this surface is read-only (pure SELECT); writes are served by
+    /api/v2/sql.
 
     Args:
         x_tenant_id (str | Unset):
@@ -162,8 +168,11 @@ async def asyncio_detailed(
 ) -> Response[UnifiedBareError | UnifiedPrepareResponse]:
     """Prepare a statement for repeated execution.
 
-     The optional `X-Tenant-ID` header is not consulted by this
-    handler — unified queries run without tenant selection.
+     The `X-Tenant-ID` header (or the authenticated tenant) scopes this
+    query — it is threaded as the port identity (ADR-098 D5 /
+    TD-SPINE-6); without it the query fails closed (401). Plain SQL on
+    this surface is read-only (pure SELECT); writes are served by
+    /api/v2/sql.
 
     Args:
         x_tenant_id (str | Unset):
@@ -195,8 +204,11 @@ async def asyncio(
 ) -> UnifiedBareError | UnifiedPrepareResponse | None:
     """Prepare a statement for repeated execution.
 
-     The optional `X-Tenant-ID` header is not consulted by this
-    handler — unified queries run without tenant selection.
+     The `X-Tenant-ID` header (or the authenticated tenant) scopes this
+    query — it is threaded as the port identity (ADR-098 D5 /
+    TD-SPINE-6); without it the query fails closed (401). Plain SQL on
+    this surface is read-only (pure SELECT); writes are served by
+    /api/v2/sql.
 
     Args:
         x_tenant_id (str | Unset):

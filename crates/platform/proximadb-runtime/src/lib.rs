@@ -62,4 +62,7 @@ pub use service_ports::{
     VectorOpsPort,
 };
 pub use streaming_port::StreamingPort;
-pub use unified_query_port::{InvalidQueryInput, UnifiedQueryPort};
+pub use unified_query_port::{
+    InvalidQueryInput, MissingQueryIdentity, PORT_QUERY_DEADLINE, QueryDeadlineExceeded,
+    UnifiedQueryPort, UnifiedQueryPortContext,
+};

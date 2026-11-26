@@ -114,8 +114,37 @@ fn map_execution_error(error: anyhow::Error) -> ApiError {
         // A collection that does not resolve for the request (missing, or not
         // resolvable by its tenant) is 404 — one response for both.
         ApiError::CollectionNotFound(missing.identifier.clone())
+    } else if let Some(violation) =
+        proximadb_catalog::relational::find_relational_constraint_violation(&error)
+    {
+        // A TYPED user-facing cause (TD-DML-1/TD-DML-3), wherever it sits in
+        // the chain: its own message (the same text pgwire sends with the
+        // SQLSTATE) and a 4xx keyed on the SQLSTATE class (round 5).
+        relational_violation_to_api_error(violation)
     } else {
+        // Internal failures: the client gets ONLY the outermost message — the
+        // full cause chain can carry lock-store keys, object-store endpoints /
+        // keys / signed query strings and layout causes, so it is logged
+        // server-side and never rendered (round 5, MED-A).
+        error!(error = %format!("{error:#}"), "REST SQL internal failure (full cause chain)");
         ApiError::Internal(format!("SQL execution failed: {error}"))
+    }
+}
+
+/// Map a typed relational violation to its REST status by SQLSTATE class:
+/// 42501 (row-level security / insufficient privilege) → 403; class 23
+/// (integrity) and 21 (cardinality) → 409; every other class (22 data
+/// exception, 42 syntax/undefined object, 0A not supported) → 400. The body
+/// is the violation's own message plus its SQLSTATE — what pgwire reports.
+pub(crate) fn relational_violation_to_api_error(
+    violation: &proximadb_catalog::relational::RelationalConstraintViolation,
+) -> ApiError {
+    let sqlstate = violation.sqlstate();
+    let message = format!("{} (SQLSTATE {sqlstate})", violation.message);
+    match sqlstate {
+        "42501" => ApiError::Forbidden(message),
+        state if state.starts_with("23") || state.starts_with("21") => ApiError::Conflict(message),
+        _ => ApiError::InvalidArgument(message),
     }
 }
 
@@ -133,9 +162,10 @@ fn map_execution_error(error: anyhow::Error) -> ApiError {
     request_body = SqlRequest,
     responses(
         (status = 200, description = "SQL result or write count.", body = SqlResponse),
-        (status = 400, description = "Invalid SQL request.", body = crate::network::rest::openapi::ErrorResponse),
+        (status = 400, description = "Invalid SQL request (incl. data / undefined-object violations).", body = crate::network::rest::openapi::ErrorResponse),
+        (status = 403, description = "Insufficient privilege (SQLSTATE 42501, e.g. a row-level-security denial).", body = crate::network::rest::openapi::ErrorResponse),
         (status = 408, description = "Query deadline exceeded.", body = crate::network::rest::openapi::ErrorResponse),
-        (status = 409, description = "Write lock conflict.", body = crate::network::rest::openapi::ErrorResponse),
+        (status = 409, description = "Write lock conflict, or an integrity / cardinality violation (SQLSTATE class 23 / 21).", body = crate::network::rest::openapi::ErrorResponse),
         (status = 500, description = "SQL execution failure.", body = crate::network::rest::openapi::ErrorResponse),
     ),
 )]
@@ -205,6 +235,75 @@ pub async fn execute_sql(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Round 5 (MED-A): typed causes map to their own message + 4xx; an
+    /// internal failure never renders an inner cause to the client.
+    #[test]
+    fn execution_errors_map_typed_causes_and_never_render_inner_internal_causes() {
+        use proximadb_catalog::relational::{
+            RelationalConstraintKind, RelationalConstraintViolation,
+        };
+        let wrapped = |kind, message: &str| {
+            anyhow::Error::new(RelationalConstraintViolation::new(kind, message))
+                .context("DML failed")
+                .context("outer")
+        };
+        let render = |error: ApiError| match error {
+            ApiError::Forbidden(m) => ("403", m),
+            ApiError::Conflict(m) => ("409", m),
+            ApiError::InvalidArgument(m) => ("400", m),
+            ApiError::Internal(m) => ("500", m),
+            other => ("other", other.to_string()),
+        };
+        let (status, message) = render(map_execution_error(wrapped(
+            RelationalConstraintKind::InsufficientPrivilege,
+            "new row violates row-level security policy",
+        )));
+        assert_eq!(status, "403");
+        assert_eq!(
+            message,
+            "new row violates row-level security policy (SQLSTATE 42501)"
+        );
+        assert_eq!(
+            render(map_execution_error(wrapped(
+                RelationalConstraintKind::Unique,
+                "duplicate key"
+            )))
+            .0,
+            "409"
+        );
+        assert_eq!(
+            render(map_execution_error(wrapped(
+                RelationalConstraintKind::InvalidTextRepresentation,
+                "bad int"
+            )))
+            .0,
+            "400"
+        );
+        assert_eq!(
+            render(map_execution_error(wrapped(
+                RelationalConstraintKind::UndefinedColumn,
+                "no column"
+            )))
+            .0,
+            "400"
+        );
+
+        // An internal failure whose INNER cause carries a secret-looking
+        // detail: only the outermost message reaches the client.
+        let internal = anyhow::anyhow!(
+            "object store GET https://acct.blob.core.windows.net/bkt/key?sig=SECRET failed"
+        )
+        .context("lock store tenant=t1 namespace=n1 table=tbl")
+        .context("DML failed");
+        let (status, message) = render(map_execution_error(internal));
+        assert_eq!(status, "500");
+        assert_eq!(message, "SQL execution failed: DML failed");
+        assert!(
+            !message.contains("SECRET") && !message.contains("lock store"),
+            "no inner cause may reach the client: {message}"
+        );
+    }
 
     #[test]
     fn v2_row_render_is_depth_consistent() {

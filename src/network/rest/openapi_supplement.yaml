@@ -842,8 +842,11 @@ paths:
       operationId: executeUnifiedQuery
       summary: Execute a unified (UQL) query.
       description: |
-        The optional `X-Tenant-ID` header is not consulted by this
-        handler — unified queries run without tenant selection.
+        The `X-Tenant-ID` header (or the authenticated tenant) scopes this
+        query — it is threaded as the port identity (ADR-098 D5 /
+        TD-SPINE-6); without it the query fails closed (401). Plain SQL on
+        this surface is read-only (pure SELECT); writes are served by
+        /api/v2/sql.
       requestBody:
         required: true
         content:
@@ -878,8 +881,11 @@ paths:
       operationId: executeMultiModelQuery
       summary: Execute a multi-model query (free-form body).
       description: |
-        The optional `X-Tenant-ID` header is not consulted by this
-        handler — unified queries run without tenant selection.
+        The `X-Tenant-ID` header (or the authenticated tenant) scopes this
+        query — it is threaded as the port identity (ADR-098 D5 /
+        TD-SPINE-6); without it the query fails closed (401). Plain SQL on
+        this surface is read-only (pure SELECT); writes are served by
+        /api/v2/sql.
       requestBody:
         required: true
         content:
@@ -914,8 +920,11 @@ paths:
       operationId: executeFederatedQuery
       summary: Execute a federated query.
       description: |
-        The optional `X-Tenant-ID` header is not consulted by this
-        handler — unified queries run without tenant selection.
+        The `X-Tenant-ID` header (or the authenticated tenant) scopes this
+        query — it is threaded as the port identity (ADR-098 D5 /
+        TD-SPINE-6); without it the query fails closed (401). Plain SQL on
+        this surface is read-only (pure SELECT); writes are served by
+        /api/v2/sql.
       requestBody:
         required: true
         content:
@@ -950,8 +959,11 @@ paths:
       operationId: executeDistributedQuery
       summary: Execute a distributed query.
       description: |
-        The optional `X-Tenant-ID` header is not consulted by this
-        handler — unified queries run without tenant selection.
+        The `X-Tenant-ID` header (or the authenticated tenant) scopes this
+        query — it is threaded as the port identity (ADR-098 D5 /
+        TD-SPINE-6); without it the query fails closed (401). Plain SQL on
+        this surface is read-only (pure SELECT); writes are served by
+        /api/v2/sql.
       requestBody:
         required: true
         content:
@@ -986,8 +998,11 @@ paths:
       operationId: explainUnifiedQuery
       summary: Explain a unified query (plan, no execution).
       description: |
-        The optional `X-Tenant-ID` header is not consulted by this
-        handler — unified queries run without tenant selection.
+        The `X-Tenant-ID` header (or the authenticated tenant) scopes this
+        query — it is threaded as the port identity (ADR-098 D5 /
+        TD-SPINE-6); without it the query fails closed (401). Plain SQL on
+        this surface is read-only (pure SELECT); writes are served by
+        /api/v2/sql.
       requestBody:
         required: true
         content:
@@ -1022,8 +1037,11 @@ paths:
       operationId: prepareStatement
       summary: Prepare a statement for repeated execution.
       description: |
-        The optional `X-Tenant-ID` header is not consulted by this
-        handler — unified queries run without tenant selection.
+        The `X-Tenant-ID` header (or the authenticated tenant) scopes this
+        query — it is threaded as the port identity (ADR-098 D5 /
+        TD-SPINE-6); without it the query fails closed (401). Plain SQL on
+        this surface is read-only (pure SELECT); writes are served by
+        /api/v2/sql.
       requestBody:
         required: true
         content:
@@ -1063,8 +1081,11 @@ paths:
       operationId: executePreparedStatement
       summary: Execute a prepared statement with parameters.
       description: |
-        The optional `X-Tenant-ID` header is not consulted by this
-        handler — unified queries run without tenant selection.
+        The `X-Tenant-ID` header (or the authenticated tenant) scopes this
+        query — it is threaded as the port identity (ADR-098 D5 /
+        TD-SPINE-6); without it the query fails closed (401). Plain SQL on
+        this surface is read-only (pure SELECT); writes are served by
+        /api/v2/sql.
       requestBody:
         required: true
         content:
@@ -1104,8 +1125,11 @@ paths:
       operationId: deletePreparedStatement
       summary: Delete a prepared statement.
       description: |
-        The optional `X-Tenant-ID` header is not consulted by this
-        handler — unified queries run without tenant selection.
+        The `X-Tenant-ID` header (or the authenticated tenant) scopes this
+        query — it is threaded as the port identity (ADR-098 D5 /
+        TD-SPINE-6); without it the query fails closed (401). Plain SQL on
+        this surface is read-only (pure SELECT); writes are served by
+        /api/v2/sql.
       responses:
         "204":
           description: |
@@ -1130,8 +1154,11 @@ paths:
       operationId: getPreparedStats
       summary: Prepared-statement execution statistics.
       description: |
-        The optional `X-Tenant-ID` header is not consulted by this
-        handler — unified queries run without tenant selection.
+        The `X-Tenant-ID` header (or the authenticated tenant) scopes this
+        query — it is threaded as the port identity (ADR-098 D5 /
+        TD-SPINE-6); without it the query fails closed (401). Plain SQL on
+        this surface is read-only (pure SELECT); writes are served by
+        /api/v2/sql.
       requestBody:
         required: true
         content:

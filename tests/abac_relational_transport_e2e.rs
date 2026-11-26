@@ -1647,3 +1647,197 @@ async fn governed_subject_gets_full_sql_surface_with_rows_still_filtered_inner()
     // SAFETY: restore the default so the process leaves no gate set.
     unsafe { std::env::remove_var("PROXIMADB_NATIVE_TABLE_PROVIDER") };
 }
+
+/// `/api/v2/sql` as `client`, returning the status and body WITHOUT asserting
+/// success (for statements that must be rejected).
+async fn sql_status(client: &AuthenticatedSqlClient, sql: &str) -> (StatusCode, String) {
+    let response = client
+        .http
+        .post(&client.url)
+        .header(
+            reqwest::header::AUTHORIZATION,
+            format!("Api-Key {}", client.key),
+        )
+        .header("x-tenant-id", TENANT)
+        .json(&json!({"query": sql}))
+        .send()
+        .await
+        .expect("SQL request");
+    let status = response.status();
+    (status, response.text().await.unwrap_or_default())
+}
+
+/// TD-SPINE-6 round 4 (MED-1) + TD-DML-3: an `ON CONFLICT DO UPDATE` may only
+/// rewrite a conflicting row the governed caller can SEE. The `EXPLAIN
+/// (ANALYZE)` write paths parsed the upsert with NO caller (an "internal"
+/// statement), so the read policy never ran:
+/// * pgwire (SCRAM-authenticated `alice`): `EXPLAIN (ANALYZE) INSERT … ON
+///   CONFLICT DO UPDATE` of an invisible row must be 42501, like the plain
+///   upsert (positive control on the same connection);
+/// * the SQL authority (`/api/v2/sql`): the plain upsert and its `EXPLAIN
+///   (ANALYZE)` form are 403 with the RLS message (the authority's write
+///   dispatch never stamped the caller either);
+/// * gRPC `ExecuteQuery` (the same authority): both are PERMISSION_DENIED.
+///
+/// The row is unchanged afterwards (read back once a permit exists).
+#[test]
+fn explain_analyze_upsert_enforces_the_on_conflict_read_policy() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .thread_stack_size(8 * 1024 * 1024)
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+    runtime.block_on(explain_analyze_upsert_enforces_the_on_conflict_read_policy_inner());
+}
+
+async fn explain_analyze_upsert_enforces_the_on_conflict_read_policy_inner() {
+    let server = TestPgServer::start_with(|config| {
+        config.security = Some(transport_security_config());
+        config.api.enable_pgwire = true;
+    })
+    .await
+    .expect("start live server with authenticated pgwire");
+    let alice = connect(&server, "alice").await;
+    let table = server.unique_name("abac_upsert");
+    exec(
+        &alice,
+        &format!("CREATE TABLE {table} (id INT PRIMARY KEY, value INT)"),
+    )
+    .await;
+    exec(&alice, &format!("INSERT INTO {table} VALUES (1, 10)")).await;
+    // Unprovisioned: alice cannot SEE row 1 (deny-by-default).
+    assert_eq!(
+        scalar(&alice, &format!("SELECT COUNT(*) FROM {table}")).await,
+        "0"
+    );
+    let upsert =
+        format!("INSERT INTO {table} VALUES (1, 99) ON CONFLICT (id) DO UPDATE SET value = 99");
+    let analyzed = format!("EXPLAIN (ANALYZE) {upsert}");
+
+    // pgwire, SCRAM-authenticated as alice.
+    let (pg, connection) =
+        tokio_postgres::connect(&server.pg_conn_str("alice"), tokio_postgres::NoTls)
+            .await
+            .expect("SCRAM pgwire connect as alice");
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    let sqlstate = |error: tokio_postgres::Error| {
+        error
+            .as_db_error()
+            .map(|db| db.code().code().to_string())
+            .unwrap_or_else(|| format!("<no db error: {error}>"))
+    };
+    // `DmlLockGuard` releases asynchronously (a spawned task on drop), so a
+    // statement issued right after a rejected write can see a transient lock
+    // conflict (55P03); retry ONLY that outcome. Tracked as TD-DMLLOCK-1
+    // (docs/10-quality/td/TD-DMLLOCK-1-dml-lock-released-asynchronously-on-error-paths.adoc):
+    // remove this retry once error exits release deterministically.
+    async fn pg_outcome(
+        pg: &tokio_postgres::Client,
+        sql: &str,
+        sqlstate: impl Fn(tokio_postgres::Error) -> String,
+    ) -> Result<(), String> {
+        for _ in 0..40 {
+            match pg.simple_query(sql).await.map(|_| ()).map_err(&sqlstate) {
+                Err(code) if code == "55P03" => sleep(Duration::from_millis(100)).await,
+                outcome => return outcome,
+            }
+        }
+        Err("55P03 (lock never released)".to_string())
+    }
+    let plain = pg_outcome(&pg, &upsert, sqlstate).await;
+    let explained = pg_outcome(&pg, &analyzed, sqlstate).await;
+    assert_eq!(
+        (plain, explained),
+        (Err("42501".to_string()), Err("42501".to_string())),
+        "pgwire: the plain upsert (control) and its EXPLAIN (ANALYZE) form must both enforce the ON CONFLICT read policy"
+    );
+
+    // The SQL authority (REST /api/v2/sql).
+    for sql in [&upsert, &analyzed] {
+        // Same transient lock conflict as above (TD-DMLLOCK-1).
+        let mut outcome = sql_status(&alice, sql).await;
+        for _ in 0..40 {
+            if !outcome.1.contains("lock conflict") {
+                break;
+            }
+            sleep(Duration::from_millis(100)).await;
+            outcome = sql_status(&alice, sql).await;
+        }
+        let (status, body) = outcome;
+        assert!(
+            status == StatusCode::FORBIDDEN && body.contains("row-level security"),
+            "/api/v2/sql must enforce the ON CONFLICT read policy for {sql}: {status} {body}"
+        );
+    }
+
+    // gRPC ExecuteQuery (round 5, LOW-D): the same authority write dispatch;
+    // the typed RLS denial surfaces as PERMISSION_DENIED with its message.
+    let mut grpc = connect_grpc(&server).await;
+    for sql in [&upsert, &analyzed] {
+        let mut outcome = None;
+        for _ in 0..40 {
+            let request = authenticated_grpc_request(
+                V2QueryRequest {
+                    query: sql.to_string(),
+                    collection_id: String::new(),
+                    limit: None,
+                    offset: None,
+                },
+                ALICE_KEY,
+            );
+            match grpc.execute_query(request).await {
+                // Transient lock conflict from the prior rejected write
+                // (TD-DMLLOCK-1).
+                Err(status) if status.code() == tonic::Code::Aborted => {
+                    sleep(Duration::from_millis(100)).await;
+                }
+                other => {
+                    outcome = Some(other);
+                    break;
+                }
+            }
+        }
+        let status = outcome
+            .expect("gRPC outcome")
+            .expect_err("gRPC must reject the RLS-invisible upsert");
+        assert!(
+            status.code() == tonic::Code::PermissionDenied
+                && status.message().contains("row-level security"),
+            "gRPC must enforce the ON CONFLICT read policy for {sql}: {status:?}"
+        );
+    }
+
+    // Read back with a permit: the row is unchanged.
+    let object_id = table_object_id(&alice, &table).await;
+    let table_scope = u32::try_from(object_id).expect("ABAC table scope is u32");
+    let (http, _) = server.rest_client().expect("HTTP client");
+    let auth = format!("Api-Key {OPERATOR_KEY}");
+    let response = http
+        .post(server.admin_url("/api/v2/abac/attribute-bindings"))
+        .header(reqwest::header::AUTHORIZATION, &auth)
+        .json(&json!({ "subject_id": "alice", "tenant": TENANT, "attrs": {} }))
+        .send()
+        .await
+        .expect("provision alice binding");
+    assert_admin_success(response, "provision attribute binding").await;
+    let policy_path = format!(
+        "/api/v2/abac/policy-bindings/{TENANT}/{}",
+        object_id + 1_000_000_000
+    );
+    let response = http
+        .put(server.admin_url(&policy_path))
+        .header(reqwest::header::AUTHORIZATION, &auth)
+        .json(&json!({ "scope": {"Table": table_scope}, "effect": "Permit" }))
+        .send()
+        .await
+        .expect("provision table permit");
+    assert_admin_success(response, "provision table permit").await;
+    assert_eq!(
+        scalar(&alice, &format!("SELECT value FROM {table} WHERE id = 1")).await,
+        "10",
+        "no ON CONFLICT DO UPDATE may have rewritten the invisible row"
+    );
+}
