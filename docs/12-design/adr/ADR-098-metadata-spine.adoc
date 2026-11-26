@@ -374,7 +374,7 @@ refer to `docs/_internal/roadmap/BENCHMARK_EVIDENCE.toml`.
 | One planner
 | Same rows and the same route decision on every surface; owner/reader placement; cache-affine readers
 | In open PR #2574, not on develop: read-row parity across pgwire, `/api/v2/sql` and `/api/v2/query` (live server) and canonical `/sql`, gRPC and MCP (in-process; canonical `/sql` is unrouted since TD-V1SUNSET-1). Route-decision parity is structural only.
-| TD-SPINE-6 (#2574). Placement owner: the TD filed by #2574. It stays unnamed here until #2574 merges.
+| TD-SPINE-6 (#2574). Placement owner: a TD to be filed by #2574 (not in its pushed diff as of 2026-11-25); TD-SPINE-6 is the interim owner.
 
 | G13
 | Iceberg as an async projection of L1
