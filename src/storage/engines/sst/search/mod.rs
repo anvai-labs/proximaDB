@@ -696,12 +696,15 @@ impl SstEngine {
         }
         let fs = self.filesystem().get_filesystem(storage_url).ok()?;
         let dir = reader::load_directory(fs.as_ref(), storage_url).await?;
+        // Post-#2535 review L2: one name index per call, not a linear scan
+        // of the directory per discovered file.
+        let by_name = dir.segment_indices_by_name();
         let mut facts = HashMap::with_capacity(files.len());
         for file in files {
             let Some(name) = file.url.rsplit('/').next() else {
                 continue;
             };
-            let Some(entry) = dir.segments.iter().find(|s| s.name == name) else {
+            let Some(entry) = by_name.get(name).and_then(|&idx| dir.segments.get(idx)) else {
                 continue;
             };
             if !entry.key_matches_listing(file.size_bytes, file.etag.as_deref()) {

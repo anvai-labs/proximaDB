@@ -174,12 +174,7 @@ pub(crate) fn plan_filtered_segments<'a>(
     files: impl IntoIterator<Item = (&'a str, Option<u64>, Option<&'a str>)>,
     filter: &proximadb_filter_expression::FilterExpression,
 ) -> (HashMap<String, Arc<DirectoryChoice>>, FilteredPlanCounts) {
-    let by_name: HashMap<&str, usize> = dir
-        .segments
-        .iter()
-        .enumerate()
-        .map(|(idx, s)| (s.name.as_str(), idx))
-        .collect();
+    let by_name = dir.segment_indices_by_name();
     let mut counts = FilteredPlanCounts::default();
     let mut out = HashMap::new();
     for (url, size, etag) in files {
@@ -254,9 +249,18 @@ struct ListedObject {
     size: u64,
 }
 
-/// Newest directory object per collection data directory, as last listed.
-fn newest_listed() -> &'static Mutex<HashMap<String, ListedObject>> {
-    static MAP: OnceLock<Mutex<HashMap<String, ListedObject>>> = OnceLock::new();
+/// A collection's directory objects as last listed: the newest (the cache
+/// identity) and every listed generation, newest first (the fallback order
+/// when the newest is corrupt or unreadable).
+#[derive(Debug, Clone)]
+struct Listed {
+    newest: ListedObject,
+    generations: Vec<(u64, String)>,
+}
+
+/// Directory objects per collection data directory, as last listed.
+fn newest_listed() -> &'static Mutex<HashMap<String, Listed>> {
+    static MAP: OnceLock<Mutex<HashMap<String, Listed>>> = OnceLock::new();
     MAP.get_or_init(Default::default)
 }
 
@@ -283,16 +287,21 @@ fn dir_key(dir_url: &str) -> String {
 /// Called by discovery with the entries it already listed. A listing with no
 /// directory forgets the collection's cached one too.
 pub(crate) fn note_listing(dir_url: &str, entries: &[DirEntry]) {
-    let newest = directory_objects_newest_first(entries)
-        .first()
-        .map(|(_, entry)| ListedObject {
+    let objects = directory_objects_newest_first(entries);
+    let newest = objects.first().map(|(_, entry)| Listed {
+        newest: ListedObject {
             url: entry.url.clone(),
             size: entry.metadata.size,
-        });
+        },
+        generations: objects
+            .iter()
+            .map(|(generation, entry)| (*generation, entry.url.clone()))
+            .collect(),
+    });
     let key = dir_key(dir_url);
     match newest {
-        Some(object) => {
-            lock(newest_listed()).insert(key, object);
+        Some(listed) => {
+            lock(newest_listed()).insert(key, listed);
         }
         None => {
             lock(newest_listed()).remove(&key);
@@ -301,38 +310,36 @@ pub(crate) fn note_listing(dir_url: &str, entries: &[DirEntry]) {
     }
 }
 
-/// The newest listed directory for `dir_url`, loading it on first use of its
-/// generation. `None` when none is listed or it fails to read or parse (the
-/// query then runs per segment).
+/// The newest VALID listed directory for `dir_url`, loading it on first use
+/// of the newest listed generation. A corrupt or unreadable newest generation
+/// falls back to the next listed one, as the publisher's base load does
+/// (post-#2535 review L3), and the fallback is cached against the newest
+/// object so the bad one is not re-read per query. Every entry is still
+/// validated against the listing by its consumers. `None` when none is
+/// listed or none is valid (the query then runs per segment).
 pub(crate) async fn load_directory(
     fs: &dyn FileSystem,
     dir_url: &str,
 ) -> Option<Arc<PaxCentroidDirectory>> {
     let key = dir_key(dir_url);
-    let object = lock(newest_listed()).get(&key).cloned()?;
+    let listed = lock(newest_listed()).get(&key).cloned()?;
+    let object = listed.newest;
     if let Some((cached, dir)) = lock(loaded()).get(&key)
         && *cached == object
     {
         return Some(Arc::clone(dir));
     }
-    let url = &object.url;
     // TD-TIER-1 SC4-5: a resident directory object costs no GET.
-    let bytes =
-        match crate::storage::engines::sst::segment_io::ResidentRangeRead::read_resident(fs, url)
-            .await
-        {
-            Ok(bytes) => bytes,
-            Err(error) => {
-                tracing::debug!(%url, %error, "centroid directory unreadable; per-segment path");
-                return None;
-            }
-        };
-    let dir = match PaxCentroidDirectory::parse(&bytes) {
-        Ok(dir) => Arc::new(dir),
-        Err(error) => {
-            tracing::warn!(%url, %error, "corrupt centroid directory; per-segment path");
-            return None;
-        }
+    let dir = crate::storage::engines::sst::centroid_directory_publisher::first_valid_directory(
+        fs,
+        &listed.generations,
+        true,
+    )
+    .await
+    .map(Arc::new);
+    let Some(dir) = dir else {
+        tracing::debug!(url = %object.url, "no valid centroid directory; per-segment path");
+        return None;
     };
     let mut cache = lock(loaded());
     if cache.len() >= MAX_CACHED_DIRECTORIES
@@ -542,5 +549,62 @@ mod tests {
         // A listing without any directory forgets it.
         note_listing(&dir_url, &[]);
         assert!(load_directory(&fs, &dir_url).await.is_none());
+    }
+
+    /// Post-#2535 review L3: a corrupt (truncated) newest generation falls
+    /// back to the newest VALID listed one, as the publisher's base load
+    /// does, instead of disabling the directory; the fallback is cached
+    /// against the newest object (no re-read of the bad one per query), and
+    /// its entries still bind to the listing's size.
+    #[tokio::test]
+    #[serial]
+    async fn a_corrupt_newest_generation_falls_back_to_the_newest_valid_one() {
+        // SAFETY: nextest runs each test in its own process.
+        unsafe {
+            std::env::set_var("PROXIMADB_PAX_COALESCED_RABITQ", "1");
+            std::env::set_var("PROXIMADB_PAX_WRITE_A0_TRAIN", "1");
+            std::env::set_var("PROXIMADB_IVF_K", "4");
+            std::env::set_var("PROXIMADB_PAX_WRITE_DIRECTORY_DECODE_KEYS", "1");
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let fs = LocalFileSystem::new(LocalConfig::default()).await.unwrap();
+        let dir_url = tmp.path().to_string_lossy().to_string();
+        let write =
+            crate::storage::engines::sst::centroid_directory_publisher::tests::write_segment;
+        write(tmp.path(), "a.pax", 0);
+        assert_eq!(
+            publish_centroid_directory(&fs, &dir_url).await.unwrap(),
+            Some(1)
+        );
+        write(tmp.path(), "b.pax", 7);
+        assert_eq!(
+            publish_centroid_directory(&fs, &dir_url).await.unwrap(),
+            Some(2)
+        );
+        let newest = tmp
+            .path()
+            .join(proximadb_storage_common::centroid_directory::object_name(2));
+        let bytes = std::fs::read(&newest).unwrap();
+        std::fs::write(&newest, &bytes[..bytes.len() / 2]).unwrap();
+
+        note_listing(&dir_url, &fs.list(&dir_url).await.unwrap());
+        let dir = load_directory(&fs, &dir_url)
+            .await
+            .expect("falls back to the valid older generation");
+        assert_eq!(dir.generation, 1);
+        let by_name = dir.segment_indices_by_name();
+        assert!(!by_name.contains_key("b.pax"), "gen 1 predates b.pax");
+        let a = &dir.segments[by_name["a.pax"]];
+        let size = std::fs::metadata(tmp.path().join("a.pax")).unwrap().len();
+        assert!(
+            a.key_matches_listing(Some(size), None),
+            "a live, unchanged entry"
+        );
+        assert!(
+            !a.key_matches_listing(Some(size + 1), None),
+            "entries still bind to the listed size"
+        );
+        let again = load_directory(&fs, &dir_url).await.unwrap();
+        assert!(Arc::ptr_eq(&dir, &again), "the fallback is cached");
     }
 }

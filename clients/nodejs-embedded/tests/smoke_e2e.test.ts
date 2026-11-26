@@ -50,9 +50,15 @@ maybe("live e2e smoke (re-based generated transport)", () => {
     const listed = await client.listCollections();
     expect(Array.isArray(listed)).toBe(true);
 
-    const info = (await client.collection(name).info()) as { name?: string };
+    const info = (await client.collection(name).info()) as {
+      name?: string;
+      engine?: string;
+    };
     expect(info).toBeDefined();
     expect(info.name).toBe(name);
+    // The requested engine must reach the server: a builder that drops
+    // `.engine(...)` leaves the collection unassigned ("auto"), not "sst".
+    expect(info.engine).toBe("sst");
 
     // Record insert -> get round-trip.
     const recordId = "rec_1";

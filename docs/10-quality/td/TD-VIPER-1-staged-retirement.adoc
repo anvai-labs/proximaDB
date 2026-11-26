@@ -34,7 +34,12 @@ data was test fixtures.
 fixtures only) have no migration path; pre-GA clean break. The retained wire
 value is rejected fail-closed at every construction boundary rather than
 readable, so stale clients receive an actionable error instead of silent
-data loss.
+data loss. This includes boot: one persisted VIPER collection makes
+`StorageEngine::register_collections_for_recovery` (`src/storage/engine.rs`)
+fail, which aborts startup for the whole instance (every tenant), and the
+collection cannot be dropped through the API without a booted server. The
+recovery path is to remove that collection's catalog entry offline or to run
+a pre-removal build.
 
 == Not in scope
 

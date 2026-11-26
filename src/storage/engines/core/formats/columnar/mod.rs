@@ -110,7 +110,6 @@ pub mod parquet_io_layer; // Low-level I/O operations (formerly shared_parquet_r
 pub use metadata_collector::MetadataCollector;
 pub use proximadb_engine_core::proximablocks::columnar_utilities as utilities; // extracted TD-DECOMP-76
 pub use proximadb_engine_core::proximablocks::parquet_metadata; // extracted TD-DECOMP-76
-pub mod columnar_compaction; // Unified Parquet compaction using StreamingParquetWriter
 // quantization_config_conversion moved to common/quantization_adapter.rs
 
 // New unified columnar infrastructure
@@ -152,9 +151,6 @@ pub use constants::{
 };
 
 // Re-exports for convenience
-pub use columnar_compaction::{
-    ColumnarCompactionResult, UnifiedColumnarCompaction, VersionContinuityMode,
-};
 pub use id_index::{ColumnarIdIndex, IndexStats, ParquetLocation};
 pub use optimization::{ColumnarOptimizer, ProgressiveSearchConfig, StreamingRowGroupIterator};
 // Re-export from columnar_query_engine module
