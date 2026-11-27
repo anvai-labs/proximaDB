@@ -5,7 +5,7 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | **Partial (updated 2026-11-26).** #2566 (97f46b34f, merged 2026-11-24 UTC) delivered envelope-framed root and shard logs, the per-account namespace floor and changed-shard reload; see Evidence. R1 (shards under the tenant prefix) and R4 (expected-parent root CAS) are done in the 2026-11-26 PR; see "Evidence (2026-11-26)". Still open: R2 (fleet-scale bytes-per-DDL measurement), R3 (generation-only legacy probe) and R5 (root/shard log pruning). See Remaining scope (2026-11-25). (Was: "Implemented (2026-11-22) — PR pending". Before that it was Open, blocked on TD-SPINE-1; both landed together in #2566.)
+| Status | **Partial (updated 2026-11-26).** #2566 (97f46b34f, merged 2026-11-24 UTC) delivered envelope-framed root and shard logs, the per-account namespace floor and changed-shard reload; see Evidence. R1 (shards under the tenant prefix) and R4 (expected-parent root CAS) are done in the 2026-11-26 PR; see "Evidence (2026-11-26)". Still open: R2 (fleet-scale bytes-per-DDL measurement), R3 (generation-only legacy probe), R5 (root/shard log pruning) and R6 (shard under the tenant's data root and two-tier account root; filed 2026-11-26). See Remaining scope (2026-11-25). (Was: "Implemented (2026-11-22) — PR pending". Before that it was Open, blocked on TD-SPINE-1; both landed together in #2566.)
 | Priority | **HIGH** for multi-tenant SaaS scale. Cost and recovery time grow with the whole fleet's catalog, and one tenant's DDL rewrites every tenant's metadata.
 | Component | `src/services/system_catalog_state.rs` (root/shard records, `to_root_bytes` / `to_shard_bytes` / `from_root_and_shards` / `load_shard_bytes`, per-account ns high-water); `src/services/system_catalog.rs` (`checkpoint_sharded_locked`, `reload_sharded_locked`, sharded `open_inner` boot + migration, per-account `NamespaceIdAllocator`); `src/services/catalog_snapshot_store.rs` (sharded trait surface + `ObjectStoreSnapshotStore` root/shard manifest logs); `src/storage/trait_components/path_resolver.rs` (root/shard prefixes).
 | Authority | link:../../12-design/adr/ADR-098-metadata-spine.adoc[ADR-098] D1.3–D1.4
@@ -312,10 +312,22 @@ Implemented. Owner mapping: ADR-098 "Completion ledger (2026-11-25)" G7 and G8.
   on one account, the root log and that account's shard log each hold at most k objects. A
   follower one version behind still reloads. A failing delete leaves the DDL successful.
 
+* **R6. Shard inside the tenant's data root, including the two-tier form (filed 2026-11-26,
+  round-1 MED-2 of the R1 PR; owner TD-SPINE-2).** R1 places the shard at
+  `${storage.metadata_url}/data/{tenant_id}/_syscat/shard/`. That gives per-tenant write
+  isolation, but it is a tree parallel to the tenant's data root, and it ignores the account
+  tier (`accounts/{account}/{tenant}/`). Tenant-scoped IAM, lifecycle and export rules on the
+  data root therefore do not cover it. Fix: resolve the shard's base from the tenant's
+  `DrTenantSystemPath` (account-aware) on the data store, carrying the account in the shard key
+  or the root index. *Acceptance:* a two-tier tenant's shard lands under
+  `accounts/{account}/{tenant}/`, and a prefix-scoped rule on the tenant's data root covers it.
+
 == R1/R4 implementation (2026-11-26)
 
 * **Layout.** A tenant's shard log is
-  `data/{tenant_id}/_syscat/shard/` — built by
+  `${storage.metadata_url}/data/{tenant_id}/_syscat/shard/`: the key is relative to the catalog
+  snapshot store's base, which is `storage.metadata_url` (`src/network/shared_services.rs`), not
+  the tenant's data root. It is built by
   `DrPathBuilder::system_catalog_tenant_shard_manifests_subprefix`, which is
   `build_tenant_system(None, tenant)` + `DrTenantSystemPath::system_catalog_shard_subprefix`
   (`src/storage/trait_components/path_resolver.rs`); the store resolves it in
@@ -325,6 +337,23 @@ Implemented. Owner mapping: ADR-098 "Completion ledger (2026-11-25)" G7 and G8.
   the `shard/` leaf is disjoint from the NativeCatalog `_syscat/` names. The root stays at
   `_operator/catalog/_root/`, the legacy whole-image log at `_operator/catalog/_manifests/`
   and the identity sidecar at `_operator/catalog/identity_high_water`.
+* **What the placement does and does not give (round-1 MED-2).** Inter-tenant *write*
+  isolation holds: a DDL in one account PUTs only under that account's
+  `data/{tenant_id}/_syscat/shard/` key prefix (plus the operator root and sidecar), never
+  under another tenant's prefix. But the shard tree is parallel to the tenant's data root
+  (`collections/…`, `_metering/`, `_cache/` hang off the data root), not inside it. So
+  tenant-scoped IAM, lifecycle, export or delete rules written against the data root do **not**
+  cover the catalog shard. Also, `build_tenant_system(None, …)` always renders the flat
+  `data/{tenant}/` form, so a two-tier tenant (`accounts/{account}/{tenant}/`) gets its shard
+  outside its account root. Both are R6.
+* **Case folding (round-1 MED-1).** `validate_id` accepts upper-case letters, and real callers
+  use mixed-case tenant ids (for example `x-tenant-id: tenantA` in the test suites), so case is
+  kept. `Acme` and `acme` would map to `data/Acme/…` and `data/acme/…`, which are one directory
+  on a case-insensitive store (macOS APFS default and Windows `file://`, the OSS/dev default).
+  `SystemCatalog::check_namespace_tenant_placement` therefore refuses a namespace whose tenant id
+  equals an existing different account up to ASCII case, on every backend. The check runs under
+  the write lock, before the WAL append. Lower-casing every tenant id was rejected because it
+  would refuse ids that real callers send.
 * **`_default` (untenanted) shard.** `_operator/catalog/_untenanted_shard/`. Namespaces created
   with no tenant have no tenant prefix to live under. They are the deployment's own objects (the
   single-tenant / OSS default), so they stay operator-scoped beside the root. Putting them under
@@ -332,11 +361,20 @@ Implemented. Owner mapping: ADR-098 "Completion ledger (2026-11-25)" G7 and G8.
 * **Injective mapping, no escaping.** The previous hex encoding is retired. A tenant id that is
   a valid `DrPathBuilder` segment maps to itself, and `_default` is the only key mapped outside
   `data/`. `SystemCatalog::create_namespace_inner` now refuses a tenant id that fails
-  `DrPathBuilder::validate_id` (separators, whitespace, non-ASCII, `..`, reserved segments) and
-  the tenant id `_default` (it would alias the untenanted shard). The refusal happens before the
-  WAL append. A key that still fails at commit time (for example from an image written before
-  this check) fails the checkpoint closed with "cannot be placed under a tenant prefix". It is
-  never re-encoded into a prefix another tenant could own. *Breaking change (accepted pre-GA):*
+  `DrPathBuilder::validate_id` (separators, whitespace, non-ASCII, `..`, reserved segments),
+  the tenant id `_default` (it would alias the untenanted shard) and case-fold collisions (see
+  above). The refusal happens under the write lock, before the WAL append. A key is never
+  re-encoded into a prefix another tenant could own.
+* **Unplaceable account already in the image (round-1 LOW-1).** A namespace recorded before
+  this check, replayed from the WAL or migrated from a legacy image, may carry an id that cannot
+  be placed. Every sharded checkpoint first validates all accounts in the image
+  (`catalog_shard_placement_violations`). If any fails, the checkpoint publishes no shard and no
+  root, and the error lists every offending id. Skipping only the offender is not safe:
+  publishing a root without it retires its rows on followers and lets WAL compaction drop them.
+  This wedges **all** accounts' DDL until the offender is gone, and DROP NAMESPACE cannot clear
+  it while sharding is on. Escape: restart the owner with
+  `PROXIMADB_CATALOG_SHARDED_SNAPSHOT_DISABLE=1` (legacy whole-image publish, no placement),
+  drop or recreate the namespaces under valid ids, then unset the switch. *Breaking change (accepted pre-GA):*
   tenant ids that are not path-safe were accepted before and are refused now.
 * **Fail closed on a missing shard.** `read_shard_version` reads only the relocated prefix. A
   root that names a shard version missing there fails boot and every follower reload with an
@@ -344,7 +382,7 @@ Implemented. Owner mapping: ADR-098 "Completion ledger (2026-11-25)" G7 and G8.
   falls back to `_operator/catalog/_shards/`, and the follower keeps serving its last adopted
   image.
 * **Operator step for a store written by #2566 (not tested here; it needs the old binary).**
-  (1) Boot the #2566-era binary once with `PROXIMADB_CATALOG_SHARDED_SNAPSHOT_DISABLE=1`. That
+  Stop all pods first. (1) On the owner pod, boot the #2566-era binary once with `PROXIMADB_CATALOG_SHARDED_SNAPSHOT_DISABLE=1`. That
   re-seeds the legacy whole-image log with the full image. (2) Delete the `_operator/catalog/_root/`
   and `_operator/catalog/_shards/` prefixes. (3) Boot the new binary; it migrates the legacy image
   to root + relocated shards. The alternative is restoring the object store.
@@ -356,7 +394,12 @@ Implemented. Owner mapping: ADR-098 "Completion ledger (2026-11-25)" G7 and G8.
   The pod reloads the winner's root. If the winner has a higher generation, the pod steps down to
   read-only, as before. At an equal generation (the dual-boot model), the DDL fails with the same
   "concurrent owner advanced the root … restart it and retry the DDL" error as the coverage-check
-  refusal, and the pending shards stay queued for the retry.
+  refusal, and the pending shards stay queued for the retry. *Known, pre-existing shape
+  (round-1 LOW-2):* in that refusal the DDL's local WAL entry is already durable although the
+  client saw an error, so a restart on the same disk can replay and publish it. The
+  coverage-check refusal has the same shape. Neither changes here. A fix (report the outcome
+  the WAL recorded, or undo the entry) is an unfiled follow-up, in the spirit of TD-DMLLOCK-1's
+  error-path cleanup.
 * **Metering / `TenantContext`.** Not plumbed. Catalog shard I/O goes through the snapshot
   store's untenanted `ProximaObjectStore` handle; `CatalogSnapshotStore` carries no
   `TenantContext`, so shard bytes are not attributed to the tenant's meters yet. The placement is
@@ -376,6 +419,12 @@ Implemented. Owner mapping: ADR-098 "Completion ledger (2026-11-25)" G7 and G8.
   (`path_resolver.rs`) pins disjoint per-tenant prefixes and refuses hostile ids;
   `shard_commit_refuses_an_account_that_is_not_a_tenant_segment` and
   `namespace_tenant_must_be_a_valid_tenant_segment` pin the refusals.
+* **Round 1:** `case_fold_tenant_collision_is_refused_before_the_wal_append` (MED-1);
+  `unplaceable_account_in_the_image_fails_the_checkpoint_closed_listing_it` (LOW-1, checkpoint
+  validates every account before any PUT and lists the offenders);
+  `placement_violations_list_invalid_and_case_colliding_ids`; and
+  `shard_commit_refuses_an_account_that_is_not_a_tenant_segment`, which now puts a valid account
+  first and proves nothing is written.
 * **R1, fail closed:** `root_naming_a_shard_missing_at_the_tenant_prefix_fails_closed`
   (`system_catalog.rs`). The shard objects are moved to the retired layout. The follower reload
   fails and keeps serving its old image; a fresh boot fails with the actionable error.

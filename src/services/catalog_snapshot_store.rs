@@ -504,6 +504,31 @@ impl ObjectStoreSnapshotStore {
     }
 }
 
+/// TD-SPINE-2 R1 (round-1 LOW-1/MED-1): the account ids among `accounts`
+/// whose shard cannot be placed injectively — not a valid tenant segment, or
+/// equal to another account up to ASCII case (one directory on a
+/// case-insensitive store). Sorted, for a stable error message.
+pub fn catalog_shard_placement_violations(
+    accounts: &std::collections::HashSet<String>,
+) -> Vec<String> {
+    let mut by_fold: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for account in accounts {
+        *by_fold.entry(account.to_ascii_lowercase()).or_default() += 1;
+    }
+    let mut violations: Vec<String> = accounts
+        .iter()
+        .filter(|account| {
+            catalog_shard_manifests_prefix(account).is_err()
+                || by_fold
+                    .get(&account.to_ascii_lowercase())
+                    .is_some_and(|count| *count > 1)
+        })
+        .cloned()
+        .collect();
+    violations.sort();
+    violations
+}
+
 /// TD-SPINE-2 R1 (ADR-098 D1.3): the object-store prefix of one account's
 /// catalog shard manifest log.
 ///
@@ -629,9 +654,14 @@ impl CatalogSnapshotStore for ObjectStoreSnapshotStore {
         generation: u64,
         shards: &[(String, Vec<u8>)],
     ) -> Result<ShardCommit> {
+        // Resolve every placement before the first PUT, so an unplaceable
+        // account never leaves a half-written publish behind.
+        let committers = shards
+            .iter()
+            .map(|(account, _)| self.shard_committer(account))
+            .collect::<Result<Vec<_>>>()?;
         let mut versions = std::collections::HashMap::with_capacity(shards.len());
-        for (account, bytes) in shards {
-            let committer = self.shard_committer(account)?;
+        for ((account, bytes), committer) in shards.iter().zip(committers) {
             let parent = committer.latest_version().await.with_context(|| {
                 format!("reading catalog shard '{account}' head at {}", self.label)
             })?;
@@ -1166,7 +1196,15 @@ mod tests {
             DrPathBuilder::system_catalog_manifests_subprefix(),
         );
         let error = store
-            .commit_shards(1, &[("tenant one/x".to_string(), b"s".to_vec())])
+            .commit_shards(
+                1,
+                &[
+                    // A valid account FIRST: it must not be written either
+                    // (every placement resolves before the first PUT).
+                    ("tenant-a".to_string(), b"a".to_vec()),
+                    ("tenant one/x".to_string(), b"s".to_vec()),
+                ],
+            )
             .await
             .expect_err("a separator-bearing account must be refused");
         assert!(
@@ -1215,6 +1253,21 @@ mod tests {
         assert!(text.contains("Re-seed"), "{text}");
         assert!(store.read_shard("acme").await?.is_none());
         Ok(())
+    }
+
+    /// Round-1 MED-1/LOW-1: placement violations name every unplaceable id
+    /// (invalid segment) and every case-fold collision, and nothing else.
+    #[test]
+    fn placement_violations_list_invalid_and_case_colliding_ids() {
+        let accounts: std::collections::HashSet<String> =
+            ["tenantA", "tenanta", "bad tenant", "ok", "_default"]
+                .into_iter()
+                .map(str::to_string)
+                .collect();
+        assert_eq!(
+            catalog_shard_placement_violations(&accounts),
+            vec!["bad tenant", "tenantA", "tenanta"]
+        );
     }
 
     /// TD-SPINE-2 R4: the root CAS is against the CALLER's expected parent.

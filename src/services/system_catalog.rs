@@ -881,10 +881,62 @@ impl SystemCatalog {
         self.commit_batch_locked(deltas).await
     }
 
+    /// TD-SPINE-2 R1 (+ round-1 MED-1): a namespace tenant id is its
+    /// account's catalog shard key and names the shard log
+    /// `data/{tenant_id}/_syscat/shard/`, so every `UpsertNamespace` is
+    /// checked HERE — under the write lock, before the WAL append — rather
+    /// than wedging every later checkpoint:
+    ///
+    /// * it must be a valid `DrPathBuilder` tenant segment;
+    /// * it must not be `_default` (the untenanted shard's key);
+    /// * it must not differ only in ASCII case from another account already
+    ///   in the catalog (or earlier in the same batch). `Acme` and `acme`
+    ///   would otherwise map to `data/Acme/…` and `data/acme/…` — ONE
+    ///   directory on a case-insensitive store (macOS APFS default, Windows
+    ///   `file://`), so two accounts would share one shard log. Mixed-case
+    ///   tenant ids are used by real callers (`x-tenant-id: tenantA`), so
+    ///   case is preserved and only a case-fold COLLISION is refused,
+    ///   uniformly on every backend.
+    fn check_namespace_tenant_placement(&self, deltas: &[CatalogDelta]) -> Result<()> {
+        let mut accounts: Option<std::collections::HashSet<String>> = None;
+        for delta in deltas {
+            let CatalogDelta::UpsertNamespace { namespace } = delta else {
+                continue;
+            };
+            let Some(tenant) = namespace.tenant_id.as_deref() else {
+                continue;
+            };
+            crate::storage::trait_components::path_resolver::DrPathBuilder::validate_id(
+                "tenant_id",
+                tenant,
+            )
+            .map_err(|e| anyhow!("invalid namespace tenant id: {e}"))?;
+            if tenant == crate::services::system_catalog_state::DEFAULT_SHARD_KEY {
+                return Err(anyhow!(
+                    "invalid namespace tenant id '{tenant}': reserved for the untenanted \
+                     catalog shard"
+                ));
+            }
+            let known = accounts.get_or_insert_with(|| self.state.shard_keys());
+            if let Some(existing) = known.iter().find(|existing| {
+                existing.as_str() != tenant && existing.eq_ignore_ascii_case(tenant)
+            }) {
+                return Err(anyhow!(
+                    "invalid namespace tenant id '{tenant}': it differs only in letter case from \
+                     the existing account '{existing}', and both would name the same catalog \
+                     shard directory on a case-insensitive object store"
+                ));
+            }
+            known.insert(tenant.to_string());
+        }
+        Ok(())
+    }
+
     /// Commit with [`Self::write_lock`] already held. Account-id minting needs
     /// to check-and-insert under the same lock so two first requests for one
     /// tenant cannot receive different ids.
     async fn commit_batch_locked(&self, deltas: Vec<CatalogDelta>) -> Result<()> {
+        self.check_namespace_tenant_placement(&deltas)?;
         let ops = deltas
             .iter()
             .map(|d| d.to_operation())
@@ -1208,6 +1260,28 @@ impl SystemCatalog {
         //    authority for exactly those accounts).
         // Keep the pending set until the root commits. Any serialization,
         // shard, or root error leaves the entire set available for retry.
+        // Round-1 LOW-1: every account in the image must be placeable BEFORE
+        // any shard is written. An unplaceable account (e.g. a namespace a
+        // pre-R1 binary recorded with a tenant id that is not a path segment,
+        // replayed from the WAL or migrated from a legacy image) would
+        // otherwise fail mid-publish. It cannot be skipped: publishing a root
+        // without it retires its rows on followers and lets WAL compaction
+        // drop them. So the checkpoint fails closed, naming every offender
+        // and the escape.
+        let violations =
+            crate::services::catalog_snapshot_store::catalog_shard_placement_violations(
+                &self.state.shard_keys(),
+            );
+        if !violations.is_empty() {
+            anyhow::bail!(
+                "catalog '{}': cannot place the catalog shards of account ids {violations:?} \
+                 under a tenant prefix; no shard or root was published. Escape: restart the \
+                 owner with PROXIMADB_CATALOG_SHARDED_SNAPSHOT_DISABLE=1 (legacy whole-image \
+                 publish), drop or recreate those namespaces under valid tenant ids, then \
+                 unset the switch",
+                self.name
+            );
+        }
         let touched = self.pending_shards.lock().clone();
         let shard_writes: Vec<(String, Vec<u8>)> = touched
             .iter()
@@ -1755,25 +1829,6 @@ impl SystemCatalog {
                 "Namespace '{}' already exists",
                 namespace.join(".")
             ));
-        }
-        // TD-SPINE-2 R1: the tenant id is the account's catalog shard key and
-        // names its shard log under `data/{tenant_id}/` (DrPathBuilder), so it
-        // must be a valid tenant path segment — refused HERE, before the WAL
-        // append, rather than wedging every later checkpoint. `_default` is
-        // the untenanted shard's key (operator-scoped); a tenant of that name
-        // would alias it, so it is refused too.
-        if let Some(tenant) = tenant_id.as_deref() {
-            crate::storage::trait_components::path_resolver::DrPathBuilder::validate_id(
-                "tenant_id",
-                tenant,
-            )
-            .map_err(|e| anyhow!("invalid namespace tenant id: {e}"))?;
-            if tenant == crate::services::system_catalog_state::DEFAULT_SHARD_KEY {
-                return Err(anyhow!(
-                    "invalid namespace tenant id '{tenant}': reserved for the untenanted \
-                     catalog shard"
-                ));
-            }
         }
         let mut ns = CatalogNamespace::new(namespace.to_vec());
         ns.properties = properties;
@@ -4467,6 +4522,94 @@ mod tests {
             );
             assert!(!owner.state.namespace_exists(&ns));
         }
+        Ok(())
+    }
+
+    /// Round-1 MED-1: `Acme` and `acme` are one directory on a
+    /// case-insensitive store, so a namespace whose tenant id case-folds to a
+    /// DIFFERENT existing account is refused under the write lock, before the
+    /// WAL append. Mixed case itself stays legal (`tenantA` is a real
+    /// caller's id), and reusing the exact same id is fine.
+    #[tokio::test]
+    async fn case_fold_tenant_collision_is_refused_before_the_wal_append() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let backing = Arc::new(object_store::memory::InMemory::new());
+        let ledger = Arc::new(IoLedger::default());
+        let owner = open_owner_counting(&dir.path().join("owner.wal"), &ledger, &backing).await?;
+        let first = nslevels(&["a", "one"]);
+        owner
+            .create_namespace_for_tenant(&first, HashMap::new(), Some("tenantA"))
+            .await?;
+        // Same exact id: fine.
+        owner
+            .create_namespace_for_tenant(&nslevels(&["a", "two"]), HashMap::new(), Some("tenantA"))
+            .await?;
+        let wal_before = owner.appender.read_all_entries().await?.len();
+        let clash = nslevels(&["a", "clash"]);
+        let error = owner
+            .create_namespace_for_tenant(&clash, HashMap::new(), Some("tenanta"))
+            .await
+            .expect_err("a case-fold collision must be refused");
+        let text = format!("{error:#}");
+        assert!(text.contains("differs only in letter case"), "{text}");
+        assert!(text.contains("'tenantA'"), "{text}");
+        assert!(!owner.state.namespace_exists(&clash));
+        assert_eq!(
+            owner.appender.read_all_entries().await?.len(),
+            wal_before,
+            "the refusal must happen before the WAL append"
+        );
+        assert_eq!(ledger.put_paths_matching("data/tenanta/"), 0);
+        Ok(())
+    }
+
+    /// Round-1 LOW-1: an account already in the image whose id cannot be
+    /// placed (a namespace a pre-R1 binary recorded with a non-segment tenant
+    /// id) fails every checkpoint closed BEFORE any shard or root is written,
+    /// with one error naming every offender and the escape — and its rows
+    /// are never dropped.
+    #[tokio::test]
+    async fn unplaceable_account_in_the_image_fails_the_checkpoint_closed_listing_it() -> Result<()>
+    {
+        let dir = tempfile::tempdir()?;
+        let backing = Arc::new(object_store::memory::InMemory::new());
+        let ledger = Arc::new(IoLedger::default());
+        let owner = open_owner_counting(&dir.path().join("owner.wal"), &ledger, &backing).await?;
+        let good = nslevels(&["good", "ns"]);
+        owner
+            .create_namespace_for_tenant(&good, HashMap::new(), Some("good-tenant"))
+            .await?;
+        // Simulate a pre-R1 namespace (bypasses the new CREATE-time check).
+        let legacy = nslevels(&["legacy", "ns"]);
+        let mut ns = CatalogNamespace::new(legacy.clone());
+        ns.tenant_id = Some("bad tenant".to_string());
+        owner.state.apply_committed(
+            owner.state.applied_seq() + 1,
+            CatalogDelta::UpsertNamespace {
+                namespace: Box::new(ns),
+            },
+        );
+        ledger.reset();
+
+        let result = owner
+            .create_table(&TableIdentifier::new(good.clone(), "t"), vec_schema("t"))
+            .await;
+        let text = format!("{:#}", result.expect_err("the checkpoint must fail closed"));
+        assert!(text.contains("\"bad tenant\""), "{text}");
+        assert!(
+            text.contains("PROXIMADB_CATALOG_SHARDED_SNAPSHOT_DISABLE=1"),
+            "{text}"
+        );
+        assert_eq!(
+            ledger.put_paths_matching("data/"),
+            0,
+            "no shard may be written before every placement is validated"
+        );
+        assert_eq!(ledger.put_paths_matching("_root/"), 0);
+        assert!(
+            owner.state.namespace_exists(&legacy),
+            "the offending account's rows are never dropped"
+        );
         Ok(())
     }
 
