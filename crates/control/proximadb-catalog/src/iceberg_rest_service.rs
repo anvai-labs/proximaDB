@@ -31,7 +31,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use tracing::debug;
 
@@ -871,11 +871,8 @@ impl IcebergRestService {
     /// Materialize a real, versioned `metadata.json` for `schema` and return it with a
     /// resolvable `metadata-location` (TD-119).
     ///
-    /// When a warehouse bridge is configured AND the table has an object-store location,
-    /// reads the data manifest log to build a parent-chained snapshot history, then
-    /// idempotently persists `metadata.json` (only re-committing when the manifest log has
-    /// advanced). Otherwise falls back to inline-synthesized (still spec-shaped) metadata.
-    /// Persistence is fail-soft: a write error logs and still serves the in-memory metadata.
+    /// URL-addressed publications are read from the engine's committed metadata.
+    /// Legacy tables can build and persist metadata from their data manifest log.
     pub async fn ensure_table_metadata(
         &self,
         identifier: &TableIdentifier,
@@ -883,8 +880,8 @@ impl IcebergRestService {
     ) -> Result<(IcebergTableMetadata, String)> {
         // ADR-097 D3: a table published by the Iceberg engine (MATERIALIZE) is served
         // from the engine's own `metadata.json`, verbatim — one writer, one tree.
-        if let Some(published) = engine_published_metadata(schema).await {
-            return Ok(published);
+        if let Some(location) = published_layout_location(schema) {
+            return engine_published_metadata(location).await;
         }
         // The DataFusion bulk-append executor commits to the same engine metadata
         // log with a BRIDGE-RELATIVE key (its fallback prefixes carry no URL), so
@@ -1584,28 +1581,42 @@ fn uuid_from_name(name: &str) -> String {
     )
 }
 
-/// Iceberg metadata written by the engine's single writer
-/// (`IcebergObjectStoreBridge::publish_iceberg_snapshot`) for a table with a
-/// published Parquet layout: `(metadata, metadata-location)` of the latest
-/// `{table root}/metadata/v*.metadata.json`, or `None` when the table has no
-/// URL-addressed published layout or nothing has been published there yet.
-///
-/// The layout `location` is the directory of the parquet files
-/// (`{table root}/data`); the engine writes metadata to its sibling.
-async fn engine_published_metadata(
-    schema: &CatalogTableSchema,
-) -> Option<(IcebergTableMetadata, String)> {
-    let location = schema.storage_layouts.iter().rev().find_map(|l| {
-        (l.authority == crate::CatalogAuthorityMode::ProjectionPublication
-            && l.physical_format == crate::CatalogPhysicalFormat::Parquet)
-            .then_some(l.location.as_deref())
-            .flatten()
-    })?;
-    if !location.contains("://") {
-        return None;
-    }
-    let table_root = location.trim_end_matches('/').strip_suffix("/data")?;
-    engine_metadata_at_root(table_root).await
+/// The most recent Parquet publication layout, when its location is an absolute URI.
+fn published_layout_location(schema: &CatalogTableSchema) -> Option<&str> {
+    schema
+        .storage_layouts
+        .iter()
+        .rev()
+        .filter(|layout| {
+            layout.authority == crate::CatalogAuthorityMode::ProjectionPublication
+                && layout.physical_format == crate::CatalogPhysicalFormat::Parquet
+        })
+        .find_map(|layout| layout.location.as_deref())
+        .filter(|location| location.contains("://"))
+}
+
+/// An absolute published layout commits the REST read to the Iceberg log.
+/// Its head can advance independently of the local layout and WAL watermark.
+async fn engine_published_metadata(location: &str) -> Result<(IcebergTableMetadata, String)> {
+    const METADATA_DIR: &str = "metadata";
+    let table_root = location
+        .trim_end_matches('/')
+        .strip_suffix("/data")
+        .context("published Iceberg layout must identify its data directory")?;
+    let bridge = proximadb_iceberg_engine::IcebergObjectStoreBridge::from_url(table_root)
+        .context("opening the published Iceberg metadata store")?;
+    let version = bridge
+        .latest_metadata_version(METADATA_DIR)
+        .await
+        .context("resolving the published Iceberg metadata version")?
+        .context("the published Iceberg layout has no committed metadata")?;
+    let bytes = bridge
+        .read_table_metadata(METADATA_DIR, version)
+        .await
+        .with_context(|| format!("reading published Iceberg metadata version {version}"))?;
+    let metadata = serde_json::from_slice(&bytes)
+        .with_context(|| format!("decoding published Iceberg metadata version {version}"))?;
+    Ok((metadata, bridge.metadata_file_uri(METADATA_DIR, version)))
 }
 
 /// Engine-written Iceberg metadata for a table the bulk-append executor
@@ -1666,24 +1677,6 @@ async fn engine_metadata_via_configured_bridge(
         )),
         Err(err) => {
             debug!("iceberg: engine metadata under {metadata_prefix} is unreadable: {err}");
-            None
-        }
-    }
-}
-
-/// Read the latest engine-committed `v*.metadata.json` under `{table_root}/metadata`.
-async fn engine_metadata_at_root(table_root: &str) -> Option<(IcebergTableMetadata, String)> {
-    const METADATA_DIR: &str = "metadata";
-    let bridge = proximadb_iceberg_engine::IcebergObjectStoreBridge::from_url(table_root).ok()?;
-    let version = bridge.latest_metadata_version(METADATA_DIR).await.ok()??;
-    let bytes = bridge
-        .read_table_metadata(METADATA_DIR, version)
-        .await
-        .ok()?;
-    match serde_json::from_slice::<IcebergTableMetadata>(&bytes) {
-        Ok(md) => Some((md, bridge.metadata_file_uri(METADATA_DIR, version))),
-        Err(err) => {
-            debug!("iceberg: engine metadata under {table_root} is unreadable: {err}");
             None
         }
     }

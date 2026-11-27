@@ -205,4 +205,33 @@ async fn load_table_serves_engine_published_metadata_verbatim() {
     for key in written.as_object().unwrap().keys() {
         assert!(served.get(key).is_some(), "served metadata lost `{key}`");
     }
+
+    // A corrupt head must surface an error even when the previous generation
+    // is still retained. A synthetic snapshot could hide the published rows.
+    let head_path = location
+        .strip_prefix("file://")
+        .expect("local metadata URI");
+    tokio::fs::write(head_path, b"invalid Iceberg metadata")
+        .await
+        .expect("corrupt the newest version");
+    let error = svc
+        .ensure_table_metadata(&id, &schema)
+        .await
+        .expect_err("a corrupt publication must refuse the REST read");
+    assert!(
+        error
+            .to_string()
+            .contains("decoding published Iceberg metadata")
+    );
+
+    let empty_root = dir.path().join("empty");
+    tokio::fs::create_dir(&empty_root)
+        .await
+        .expect("empty table root");
+    schema.storage_layouts[0].location = Some(format!("file://{}/data", empty_root.display()));
+    let error = svc
+        .ensure_table_metadata(&id, &schema)
+        .await
+        .expect_err("an unresolvable publication must refuse the REST read");
+    assert!(error.to_string().contains("published Iceberg"));
 }

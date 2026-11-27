@@ -2065,8 +2065,8 @@ pub fn create_router(state: AppState) -> axum::Router {
         // materialize/write path uses (the resolver's default
         // `file://{data_dir}/warehouse`, env-overridable — see
         // `shared_services::warehouse_root_url`), so the manifest log
-        // drives snapshot history and `metadata-location` resolves. Best-effort: if the
-        // store is unavailable, metadata is still served inline (synthesized, no persistence).
+        // drives legacy snapshot history. Absolute published layouts resolve their own
+        // engine metadata and report failure if the publication cannot be read.
         let warehouse_root_url =
             crate::network::shared_services::warehouse_root_url(&state.data_dir);
         match proximadb_iceberg_engine::IcebergObjectStoreBridge::from_url(&warehouse_root_url) {
@@ -2076,7 +2076,7 @@ pub fn create_router(state: AppState) -> axum::Router {
             Err(e) => {
                 info!(
                     "Iceberg REST: warehouse object store unavailable at {warehouse_root_url}: \
-                     {e}; metadata served inline without persistence"
+                     {e}; legacy metadata persistence is unavailable"
                 );
             }
         }
