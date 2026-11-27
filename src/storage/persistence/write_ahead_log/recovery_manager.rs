@@ -1789,7 +1789,6 @@ mod tests {
         Arc<dyn UnifiedStorageFormat>,
         Arc<tokio::sync::Mutex<Vec<HashMap<String, serde_json::Value>>>>,
     ) {
-        use crate::storage::persistence::filesystem::{FilesystemConfig, FilesystemFactory};
         use crate::storage::traits::{
             CompactionParameters, CompactionResult, FlushParameters, FlushResult,
             StorageFormatStrategy, UnifiedStorageFormat,

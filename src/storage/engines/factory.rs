@@ -113,6 +113,10 @@ use proximadb_query_capability::CapabilityRegistry;
 
 use super::{nova::NovaEngine, sst::SstEngine};
 #[cfg(feature = "experimental-engines")]
+#[expect(
+    deprecated,
+    reason = "The opt-in factory still supports both experimental engines"
+)]
 use super::{raptor::RaptorEngine, swift::SwiftEngine};
 
 /// Global capability registry for storage engine capabilities

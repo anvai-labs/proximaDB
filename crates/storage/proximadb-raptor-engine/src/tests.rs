@@ -38,8 +38,6 @@ fn test_compare_proxima_values_cross_numeric_types() {
 
 #[test]
 fn test_predicate_eq_within_range() {
-    use proximadb_raptor_common::{ColumnEncoding, ColumnStats};
-
     let min = MetadataValue::Float64(1.0);
     let max = MetadataValue::Float64(10.0);
     let value = MetadataValue::Float64(5.0);
