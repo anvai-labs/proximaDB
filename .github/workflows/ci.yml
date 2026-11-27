@@ -1697,6 +1697,11 @@ jobs:
           else
             cargo test -p proximadb-rank-onnx --features bert-tokenizer
           fi
+      - name: Verify persisted TurboQuant rotation seed compatibility
+        if: matrix.label == 'experimental-turboquant'
+        env:
+          CARGO_PROFILE_TEST_DEBUG: 0
+        run: cargo test --locked -p proximadb-vector --features experimental-turboquant --lib rotation_matches_persisted_seed_fixture
       # TD-ORT-1's regression gate: two ONNX sessions through the one shared
       # process environment (a per-crate environment fails the second build for
       # the life of the process). Runs on the leg whose feature set pulls ort.

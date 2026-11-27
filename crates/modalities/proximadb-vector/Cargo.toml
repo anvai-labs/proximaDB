@@ -23,7 +23,7 @@ experimental-turboquant = [
     "proximadb-quantization-model/experimental-turboquant",
     "dep:faer",
     "dep:statrs",
-    "dep:rand_chacha",
+    "dep:chacha20",
     "dep:rand_distr",
 ]
 
@@ -36,7 +36,7 @@ proximadb-kernel = { path = "../../foundation/proximadb-kernel" }
 proximadb-proto = { path = "../../foundation/proximadb-proto" }
 proximadb-quantization-types = { path = "../../foundation/proximadb-quantization-types" }
 proximadb-quantization-model = { workspace = true }
-rand.workspace = true
+rand = "0.10"
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
@@ -45,7 +45,7 @@ tracing = "0.1"
 # TurboQuant deps — only compiled when `experimental-turboquant` is on.
 faer = { workspace = true, optional = true }
 statrs = { workspace = true, optional = true }
-rand_chacha = { version = "0.3", optional = true }
+chacha20 = { version = "0.10", default-features = false, features = ["rng"], optional = true }
 rand_distr = { version = "0.6", optional = true }
 
 [dev-dependencies]

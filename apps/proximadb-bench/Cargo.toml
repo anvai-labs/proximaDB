@@ -15,8 +15,8 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
-proximadb = { path = "../../", default-features = false }
-rand = "0.8"
+proximadb = { path = "../../", default-features = false, features = ["axis"] }
+rand = "0.10"
 rand_distr = "0.6"
 tokio.workspace = true
 tracing = "0.1"

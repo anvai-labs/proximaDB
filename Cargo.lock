@@ -6692,7 +6692,7 @@ dependencies = [
  "proximadb-write-intent",
  "rand 0.8.8",
  "rand_chacha 0.3.1",
- "rand_distr",
+ "rand_distr 0.4.3",
  "rayon",
  "rcgen",
  "regex",
@@ -6852,8 +6852,8 @@ dependencies = [
  "anyhow",
  "clap",
  "proximadb",
- "rand 0.8.8",
- "rand_distr",
+ "rand 0.10.3",
+ "rand_distr 0.6.0",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -8867,6 +8867,7 @@ version = "0.7.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "chacha20",
  "chrono",
  "faer",
  "proximadb-hardware",
@@ -8874,9 +8875,8 @@ dependencies = [
  "proximadb-proto",
  "proximadb-quantization-model",
  "proximadb-quantization-types",
- "rand 0.8.8",
- "rand_chacha 0.3.1",
- "rand_distr",
+ "rand 0.10.3",
+ "rand_distr 0.6.0",
  "serde",
  "serde_json",
  "statrs",
@@ -9211,6 +9211,16 @@ name = "rand_core"
 version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "63b8176103e19a2643978565ca18b50549f6101881c443590420e4dc998a3c69"
+
+[[package]]
+name = "rand_distr"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32cb0b9bc82b0a0876c2dd994a7e7a2683d3e7390ca40e6886785ef0c7e3ee31"
+dependencies = [
+ "num-traits",
+ "rand 0.8.8",
+]
 
 [[package]]
 name = "rand_distr"

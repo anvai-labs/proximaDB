@@ -165,8 +165,8 @@ pub fn centroid_in_original_space(centroid_calib: f32, shift_d: f32, scale_tq_d:
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand::{Rng, SeedableRng};
-    use rand_chacha::ChaCha8Rng;
+    use chacha20::ChaCha8Rng;
+    use rand::{RngExt, SeedableRng};
     use rand_distr::StandardNormal;
 
     /// Generate `n` rotated unit-vector samples in `dim` dimensions by
