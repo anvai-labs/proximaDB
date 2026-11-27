@@ -411,6 +411,9 @@ func TestCreateCollectionRequestMatchesSpec(t *testing.T) {
 	if name, _ := parsed["name"].(string); name != "my_collection" {
 		t.Fatalf("body.name: got %v, want my_collection", parsed["name"])
 	}
+	if _, present := parsed["default_access_tier"]; present {
+		t.Fatalf("unset default_access_tier was serialized: %v", parsed["default_access_tier"])
+	}
 	// TD-RESTGET-1: the server persists it, so the adapter must send it.
 	if desc, _ := parsed["description"].(string); desc != "a description" {
 		t.Fatalf("body.description: got %v, want \"a description\"", parsed["description"])

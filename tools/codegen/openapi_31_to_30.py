@@ -36,6 +36,7 @@ the generated Go client's drift gate regenerates through this same transform, so
 the generated artifact stays pinned to the published spec.
 """
 
+import argparse
 import re
 import sys
 
@@ -135,7 +136,7 @@ def _collapse_nullable_combinator(node: dict, key: str) -> None:
         node[key] = non_null
 
 
-def _walk(node):
+def _walk(node, *, go_optional_nullable_omitempty: bool = False):
     if isinstance(node, dict):
         for combinator in ("oneOf", "anyOf"):
             if combinator in node:
@@ -146,19 +147,31 @@ def _walk(node):
         if "const" in node and "enum" not in node:
             node["enum"] = [node.pop("const")]
         for value in node.values():
-            _walk(value)
+            _walk(value, go_optional_nullable_omitempty=go_optional_nullable_omitempty)
+        properties = node.get("properties")
+        if go_optional_nullable_omitempty and isinstance(properties, dict):
+            required = node.get("required", [])
+            for name, schema in properties.items():
+                if (
+                    name not in required
+                    and isinstance(schema, dict)
+                    and schema.get("nullable") is True
+                ):
+                    # Preserve omission of unset SDK request fields after
+                    # oapi-codegen 2.9 switched nullable pointers to emit null.
+                    schema.setdefault("x-omitempty", True)
     elif isinstance(node, list):
         for item in node:
-            _walk(item)
+            _walk(item, go_optional_nullable_omitempty=go_optional_nullable_omitempty)
 
 
 def main() -> int:
-    if len(sys.argv) != 3:
-        sys.stderr.write(
-            "usage: openapi_31_to_30.py <input-3.1.yaml> <output-3.0.yaml>\n"
-        )
-        return 2
-    src, dst = sys.argv[1], sys.argv[2]
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("src")
+    parser.add_argument("dst")
+    parser.add_argument("--go-optional-nullable-omitempty", action="store_true")
+    args = parser.parse_args()
+    src, dst = args.src, args.dst
     with open(src, "r", encoding="utf-8") as fh:
         doc = yaml.load(fh, Loader=_Yaml12CoreBoolLoader)
 
@@ -166,7 +179,7 @@ def main() -> int:
     if isinstance(version, str) and version.startswith("3.1"):
         doc["openapi"] = "3.0.3"
 
-    _walk(doc)
+    _walk(doc, go_optional_nullable_omitempty=args.go_optional_nullable_omitempty)
 
     with open(dst, "w", encoding="utf-8") as fh:
         yaml.safe_dump(doc, fh, sort_keys=True, default_flow_style=False)
