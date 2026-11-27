@@ -434,9 +434,11 @@ struct CatalogSnapshot {
 
 /// TD-SPINE-2 (ADR-098 D1.3): the shared shard key for namespaces (and their
 /// tables/statistics) that carry no owning account — namespaces created
-/// without a tenant scope. It is a *shard* key, not a path segment; the
-/// on-storage path is hex-encoded by `DrPathBuilder`, so the reserved-looking
-/// underscore is inert there.
+/// without a tenant scope. It is a *shard* key, not a path segment. Unlike a
+/// tenant's shard, it is not placed under `data/{tenant}/`: it lives at the
+/// operator-scoped `_operator/catalog/_untenanted_shard/` prefix
+/// (`catalog_shard_manifests_prefix`). A namespace may not use it, in any
+/// letter case, as its tenant id.
 pub const DEFAULT_SHARD_KEY: &str = "_default";
 
 /// TD-SPINE-2 review MED-1: recover the per-account namespace-id high-water

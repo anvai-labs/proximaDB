@@ -129,9 +129,13 @@ pub trait CatalogSnapshotStore: Send + Sync {
     // is (it is the local-store path AND the kill-switch escape path). The
     // sharded surface below splits one whole-image blob into a small ROOT
     // manifest log (global registries + the `account → shard log version`
-    // index) plus one SHARD manifest log per account, each a sibling of the
-    // whole-image log, committed through the same generation-fenced
-    // [`ManifestCommitter`]. Defaults make every non-object store (local fs,
+    // index) at `_operator/catalog/_root/`, plus one SHARD manifest log per
+    // account. A tenant's shard sits under its own tenant prefix,
+    // `data/{tenant}/_syscat/shard/`, built by `DrPathBuilder`; the untenanted
+    // `_default` shard sits beside the root at
+    // `_operator/catalog/_untenanted_shard/`. All are committed through the
+    // same generation-fenced [`ManifestCommitter`]. Defaults make every
+    // non-object store (local fs,
     // injected test stores) report "unsupported", which the catalog reads as
     // "keep the whole-image path".
 
