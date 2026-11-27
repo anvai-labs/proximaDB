@@ -1,5 +1,5 @@
 {
-  "total": 1002,
+  "total": 1001,
   "by_file": {
     "apps/proximadb-migrate/src/main.rs": 2,
     "crates/binding/proximadb-embedded/src/lib.rs": 9,
@@ -77,7 +77,7 @@
     "crates/modalities/proximadb-vector/src/quantization/product.rs": 1,
     "crates/modalities/proximadb-vector/src/quantization/turboquant/id_map.rs": 1,
     "crates/platform/proximadb-api/src/arrow_flight/service.rs": 1,
-    "crates/platform/proximadb-api/src/rest/canonical/multimodal_query.rs": 3,
+    "crates/platform/proximadb-api/src/rest/canonical/multimodal_query.rs": 2,
     "crates/platform/proximadb-runtime/src/cluster/node_registry.rs": 1,
     "crates/platform/proximadb-runtime/src/cluster_rpc/grpc_client.rs": 6,
     "crates/platform/proximadb-runtime/src/handlers.rs": 1,

@@ -160,30 +160,31 @@ fn shared_adapter() -> Arc<QueryFacadeAdapter> {
 /// Returns the rendered `records[].{id, score}` list.
 async fn rest_leg(adapter: Arc<QueryFacadeAdapter>) -> Vec<serde_json::Value> {
     let port: Arc<dyn UnifiedQueryPort> = Arc::new(UnifiedQueryPortImpl::new(adapter));
-    let router = create_multimodal_router().with_state(UnifiedQueryRestState {
-        unified_query_port: port,
-    });
+    let router = create_multimodal_router()
+        .with_state(UnifiedQueryRestState {
+            unified_query_port: port,
+        })
+        .layer(axum::Extension(proximadb_tenant::ResolvedRequestIdentity {
+            tenant: "default".to_owned(),
+            subject: None,
+            auth_class: proximadb_tenant::AuthClass::Anonymous,
+            tenant_stable_id: None,
+        }));
 
     let body = json!({
         "query": "SELECT * FROM VECTOR_SEARCH('parity_collection', '[0.1, 0.2]', 3)",
     });
-    // TD-SPINE-6 round-1 (MED-3): the bare-mounted router carries no identity
-    // extension, and user-written extension SQL is raw text through the ONE
-    // authority — the port now fails closed (401) without a scope. This file
-    // tests RENDERING parity, so the leg acts as the default tenant.
-    let response = proximadb::query::request_scope::with_request_tenant(
-        "default",
-        router.oneshot(
+    let response = router
+        .oneshot(
             Request::builder()
                 .method("POST")
                 .uri("/federated")
                 .header("content-type", "application/json")
                 .body(Body::from(body.to_string()))
                 .expect("request builds"),
-        ),
-    )
-    .await
-    .expect("oneshot completes");
+        )
+        .await
+        .expect("oneshot completes");
 
     assert_eq!(
         response.status(),
