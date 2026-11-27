@@ -528,6 +528,13 @@ The staged lane retains the full feature check and its separate ONNX
 runtime test step.
 link:https://github.com/anvai-labs/proximaDB/actions/runs/45118740213/job/137541562106[Hosted retry].
 
+The cluster leg lost its hosted runner on two different PR heads. The
+five-job local control also exhausted 15 GiB of RAM and 2 GiB of swap.
+The last sample showed the normal library at 6.63 GiB RSS and the unit
+test harness at 8.60 GiB RSS. The kernel identified `rustc` as the OOM
+victim. The cluster leg now stages the same feature and test targets.
+link:https://github.com/anvai-labs/proximaDB/actions/runs/45177446635/job/137703469388[Hosted check].
+
 The staged legs passed in separate four-CPU cgroups with 13 GiB
 of RAM and swap disabled. The targets reused dependency metadata from the
 failed controls or earlier constrained checks. There were no OOM events.
@@ -541,6 +548,7 @@ failed controls or earlier constrained checks. There were no OOM events.
 | TurboQuant, including companion packages | 12m57s | 11.33 GiB
 | Experimental ledger | 7m17s | 11.43 GiB
 | ONNX, CDC and DuckDB | 7m03s | 10.99 GiB
+| Cluster | 7m35s | 11.31 GiB
 |===
 
 Use a fresh `CARGO_TARGET_DIR` for each cold comparison, then reuse the same
