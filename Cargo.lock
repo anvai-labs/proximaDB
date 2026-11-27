@@ -6475,7 +6475,6 @@ dependencies = [
 name = "proximadb"
 version = "0.7.0"
 dependencies = [
- "aes-gcm",
  "anyhow",
  "apache-avro",
  "arc-swap",
