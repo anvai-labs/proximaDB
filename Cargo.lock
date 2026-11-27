@@ -8869,7 +8869,6 @@ dependencies = [
  "async-trait",
  "chrono",
  "faer",
- "proximadb-data-model",
  "proximadb-hardware",
  "proximadb-kernel",
  "proximadb-proto",

@@ -191,8 +191,8 @@ async fn simulate_async_streaming_search(
             let batch: Vec<StreamingSearchResult> = chunk
                 .iter()
                 .map(|(idx, score)| StreamingSearchResult {
-                    id: format!("vec_{}", *idx),
-                    score: *score,
+                    _id: format!("vec_{}", *idx),
+                    _score: *score,
                     metadata: HashMap::new(),
                 })
                 .collect();

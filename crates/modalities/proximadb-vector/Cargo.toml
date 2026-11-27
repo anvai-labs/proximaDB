@@ -31,7 +31,6 @@ experimental-turboquant = [
 anyhow.workspace = true
 async-trait.workspace = true
 chrono.workspace = true
-proximadb-data-model = { workspace = true }
 proximadb-hardware = { path = "../../foundation/proximadb-hardware" }
 proximadb-kernel = { path = "../../foundation/proximadb-kernel" }
 proximadb-proto = { path = "../../foundation/proximadb-proto" }
