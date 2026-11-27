@@ -51,6 +51,7 @@ use proximadb::graph::service::GraphOperationsService;
 use proximadb::network::grpc::v2::graph_service::ProximaGraphServiceImpl;
 use proximadb::proto::proximadb_v2::proxima_graph_service_server::ProximaGraphService as _;
 use proximadb::proto::proximadb_v2::{ExecuteGraphQueryRequest, GraphQueryLanguage};
+use proximadb::query::request_scope::{RequestScope, current_scope, with_request_tenant};
 use proximadb::query::{
     FacadeConfig, QueryContext, QueryFacadeAdapter, QueryRequest, QueryResult, QueryResultData,
     QueryStrategy, QueryType, ScoredRecord, UnifiedQueryFacade, UnifiedQueryPortImpl,
@@ -84,7 +85,9 @@ fn scored_fixture() -> Vec<ScoredRecord> {
 // Mock strategies (mirrored fixtures per query type)
 // =============================================================================
 
-struct FederatedEchoStrategy;
+struct FederatedEchoStrategy {
+    expected_tenant: &'static str,
+}
 struct GraphEchoStrategy;
 
 #[async_trait]
@@ -106,6 +109,10 @@ impl QueryStrategy for FederatedEchoStrategy {
         _request: QueryRequest,
         _ctx: &QueryContext,
     ) -> anyhow::Result<QueryResult> {
+        anyhow::ensure!(
+            matches!(current_scope(), Some(RequestScope::Tenant(tenant)) if tenant == self.expected_tenant),
+            "federated strategy did not receive the resolved REST tenant"
+        );
         Ok(QueryResult {
             data: QueryResultData::VectorResults(scored_fixture()),
             metrics: None,
@@ -146,8 +153,14 @@ impl QueryStrategy for GraphEchoStrategy {
 }
 
 fn shared_adapter() -> Arc<QueryFacadeAdapter> {
-    let strategies: Vec<Arc<dyn QueryStrategy>> =
-        vec![Arc::new(FederatedEchoStrategy), Arc::new(GraphEchoStrategy)];
+    shared_adapter_for_tenant("default")
+}
+
+fn shared_adapter_for_tenant(expected_tenant: &'static str) -> Arc<QueryFacadeAdapter> {
+    let strategies: Vec<Arc<dyn QueryStrategy>> = vec![
+        Arc::new(FederatedEchoStrategy { expected_tenant }),
+        Arc::new(GraphEchoStrategy),
+    ];
     let facade = Arc::new(UnifiedQueryFacade::new(strategies, FacadeConfig::default()));
     Arc::new(QueryFacadeAdapter::without_validation(facade))
 }
@@ -159,26 +172,40 @@ fn shared_adapter() -> Arc<QueryFacadeAdapter> {
 /// REST leg: the real multimodal router over the real port impl.
 /// Returns the rendered `records[].{id, score}` list.
 async fn rest_leg(adapter: Arc<QueryFacadeAdapter>) -> Vec<serde_json::Value> {
+    rest_records(
+        adapter,
+        "/federated",
+        "default",
+        json!({
+            "query": "SELECT * FROM VECTOR_SEARCH('parity_collection', '[0.1, 0.2]', 3)",
+        }),
+    )
+    .await
+}
+
+async fn rest_records(
+    adapter: Arc<QueryFacadeAdapter>,
+    path: &str,
+    tenant: &str,
+    body: serde_json::Value,
+) -> Vec<serde_json::Value> {
     let port: Arc<dyn UnifiedQueryPort> = Arc::new(UnifiedQueryPortImpl::new(adapter));
     let router = create_multimodal_router()
         .with_state(UnifiedQueryRestState {
             unified_query_port: port,
         })
         .layer(axum::Extension(proximadb_tenant::ResolvedRequestIdentity {
-            tenant: "default".to_owned(),
+            tenant: tenant.to_owned(),
             subject: None,
             auth_class: proximadb_tenant::AuthClass::Anonymous,
             tenant_stable_id: None,
         }));
 
-    let body = json!({
-        "query": "SELECT * FROM VECTOR_SEARCH('parity_collection', '[0.1, 0.2]', 3)",
-    });
     let response = router
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/federated")
+                .uri(path)
                 .header("content-type", "application/json")
                 .body(Body::from(body.to_string()))
                 .expect("request builds"),
@@ -313,4 +340,32 @@ async fn rest_leg_renders_the_port_json_shape() {
         first.get("rank").is_none(),
         "rank is gone for raw extension SQL"
     );
+}
+
+#[tokio::test]
+async fn lowered_rest_query_uses_resolved_identity_as_execution_scope() {
+    let tenant = "parity-tenant";
+    let adapter = shared_adapter_for_tenant(tenant);
+    let body = json!({
+        "components": [{
+            "component_type": "vector",
+            "config": {
+                "collection": "parity_collection",
+                "query_vector": [0.1, 0.2],
+                "top_k": 3,
+            },
+        }],
+    });
+    assert!(current_scope().is_none());
+    let records = rest_records(adapter.clone(), "/multi-model", tenant, body.clone()).await;
+    assert_eq!(records[0]["id"], FIXTURE[0].0);
+    assert_eq!(records[0]["rank"], 1);
+    assert!(current_scope().is_none());
+
+    with_request_tenant("outer", async {
+        let records = rest_records(adapter, "/multi-model", tenant, body).await;
+        assert_eq!(records[0]["id"], FIXTURE[0].0);
+        assert_eq!(current_scope(), Some(RequestScope::Tenant("outer".into())));
+    })
+    .await;
 }
