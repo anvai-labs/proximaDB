@@ -13,7 +13,8 @@ order of the first column. Driven by tests/iceberg_interop_e2e.rs:
 
   python3 scripts/iceberg_readback.py --rest-uri http://127.0.0.1:PORT/iceberg \
       --namespace default --table t --metadata-location file:///.../v...json \
-      --expected expected.json [--require pyiceberg-rest,pyiceberg-static,duckdb]
+      --expected expected.json [--require pyiceberg-rest,pyiceberg-static,duckdb] \
+      [--snapshot-id 1234]
 
 A reader that is not installed (module or DuckDB extension missing) is SKIPPED
 unless named in --require; a reader that runs and errors always FAILS. Exit 0 =
@@ -74,7 +75,8 @@ def read_pyiceberg_rest(args, columns):
         props["header.X-Tenant-ID"] = args.tenant
     catalog = load_catalog("proximadb", **props)
     table = catalog.load_table((*args.namespace.split("."), args.table))
-    return table.scan(selected_fields=tuple(columns)).to_arrow().to_pylist(), table.metadata_location
+    scan = table.scan(selected_fields=tuple(columns), snapshot_id=args.snapshot_id)
+    return scan.to_arrow().to_pylist(), table.metadata_location
 
 
 def read_pyiceberg_static(args, columns):
@@ -82,7 +84,8 @@ def read_pyiceberg_static(args, columns):
     from pyiceberg.table import StaticTable
 
     table = StaticTable.from_metadata(args.metadata_location)
-    return table.scan(selected_fields=tuple(columns)).to_arrow().to_pylist(), None
+    scan = table.scan(selected_fields=tuple(columns), snapshot_id=args.snapshot_id)
+    return scan.to_arrow().to_pylist(), None
 
 
 def read_duckdb(args, columns):
@@ -95,7 +98,8 @@ def read_duckdb(args, columns):
         raise Unavailable(f"DuckDB iceberg extension unavailable: {e}") from e
     path = args.metadata_location.removeprefix("file://")
     cols = ", ".join(f'"{c}"' for c in columns)
-    rel = con.sql(f"SELECT {cols} FROM iceberg_scan('{path}')")
+    selector = f", snapshot_from_id = {args.snapshot_id}" if args.snapshot_id is not None else ""
+    rel = con.sql(f"SELECT {cols} FROM iceberg_scan('{path}'{selector})")
     return [dict(zip(columns, r)) for r in rel.fetchall()], None
 
 
@@ -114,6 +118,7 @@ def main():
     p.add_argument("--table", required=True)
     p.add_argument("--metadata-location", required=True)
     p.add_argument("--expected", required=True, help="JSON {columns: [...], rows: [[text|null]]}")
+    p.add_argument("--snapshot-id", type=int, help="exact snapshot to read from the supplied head")
     p.add_argument("--require", default="", help="comma-separated engines that must run")
     args = p.parse_args()
 

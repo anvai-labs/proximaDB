@@ -242,6 +242,94 @@ Specification and tagged-source review, 2026-11-21. Iceberg format version, Delt
 
 *First execution experiment.* Use the existing Iceberg/Parquet scan path for two independently produced fixtures: a V2 projection and a V3 projection with a nonempty on-disk DV. Pin the Delta source version and the corresponding Iceberg snapshot using producer-recorded mapping (for the documented UniForm path, converted_delta_version). Snapshot IDs and commit timestamps cannot substitute for that mapping. Compare exact typed rows, including a renamed field and a row deleted between versions, with a Delta reference reader. Require a stale projection to decline a latest-version request when freshness cannot be established. Cover a plain Delta table without a projection and an unsupported feature as negative cases. Then hold the DataFusion compute plan, visible rows, Parquet objects, storage and cache state fixed. Report cold metadata requests and open latency, scan bytes, DV application, and end-to-end query latency independently. Shared files avoid a copy in the eligible case. Their presence establishes no TPC speedup. https://docs.delta.io/delta-uniform/[UniForm version correspondence]
 
+[[catalog-interoperability]]
+== Proposed catalog contract for ProximaDB and Anvai Lake
+
+Anvai Lake's reference catalog is Lakekeeper. Garage is an S3-compatible file store in its
+cross-profile test bed. Keep catalog and object-store qualification independent.
+ProximaDB's native catalog keeps its local identity and
+recovery role under link:../12-design/adr/ADR-063-objstore-native-catalog-driven-restartability.adoc[ADR-063 D1].
+Offer xCatalog as an optional Iceberg REST provider for Anvai Lake once its profile passes.
+Both products can also connect directly to an enrolled external catalog. Anvai Lake keeps its
+PostgreSQL roles, WAL, managed visibility and publication-attempt ledger. A second product or
+catalog service is unnecessary for ProximaDB native operations. The optional REST endpoint
+serves the same xCatalog authority as the owning ProximaDB deployment.
+
+Distinguish three owners per table. The identity authority maps an authenticated principal into
+the product's tenant and grants. The data writer owns local transaction semantics and publication
+attempts. The catalog authority owns the published head for the bound table and ref. Native
+ProximaDB may fill all three roles. A qualified Anvai Lake writer can keep its local roles and
+delegate the published head to xCatalog or an external catalog. An attached external table uses
+a locally enrolled alias and the provider's table identity, schema, snapshots and retention.
+The alias grants no right to mutate the provider's state. First-class provider support means a
+qualified operation and table profile, including explicitly authorized writes where qualified.
+
+[cols="2,4,4",options="header"]
+|===
+| Boundary | Contract | First negative control
+| Resolve and authorize
+| Bind the authenticated issuer/subject or effective PostgreSQL role to the local tenant and grant generation, then the approved provider instance, warehouse, table UUID/incarnation, ref and object-store endpoint/root. Pin once per statement. Verify required capabilities before opening data files or attempting mutation. Bound retries, pagination, metadata bytes and deadlines.
+| Two tenants use the same table name and snapshot number. Rotate a role mapping, drop and recreate a table, and change an approved endpoint. Reuse a warm cache and a prepared query. Refuse stale authorization or incarnation before forbidden object access.
+| Read the exact publication
+| Return a retained snapshot, schema/field mapping, immutable metadata locator and authorized read scope, or an explicit empty, expired, denied, unsupported or unavailable result. A metadata URI and its inline representation must describe the same persisted publication. Scope cache reuse to the approved storage identity/version and recheck grants. Use a qualified governed plan for row filters or masks, or refuse that profile.
+| Move the head during a scan, omit a required delete file, break the persisted metadata pointer, and revoke access with warm metadata or byte caches. An empty table is a separate positive control. A raw-file route cannot satisfy a required row-policy boundary.
+| Commit and find the outcome
+| Pin the table UUID, ref, expected head, schema/spec preconditions, writer fence and exact attempt identity. Keep durable intent before sending. The catalog atomically advances the head under its supported preconditions. Reconcile ambiguous sends against authoritative, retained operation evidence. A receipt reports the original committed snapshot when proven. A verified rejection can replan under the attempt policy. Unknown remains lookup-only.
+| Two writers race at one head, a fenced writer sends late, and the catalog accepts a commit whose reply is lost. Restart before and after acceptance. Demand one effect, a recoverable receipt and no second send on inconclusive lookup. Refuse a mixed unsupported update before any partial effect.
+| Failover and retention
+| A provider timeout preserves the existing authority and fails the operation where freshness cannot be proven. Catalog migration is an explicit fenced ownership transfer with verified head, retention and unresolved attempts. Require retained or revalidated authorization before reading any old pin. Retention and physical cleanup stay with the publication owner.
+| Stop the external catalog, make a stale local mirror reachable, and expire the pinned inputs. Verify the mirror cannot take over authority and an expired pin cannot silently rebind to the latest version.
+|===
+
+Source blocker on `8765f65f6`. The Iceberg REST `commit_table` path can return success after
+logging `AddSnapshot` without applying it and does not evaluate the request requirements.
+`load_table` can fall back to synthesized metadata when the published lookup cannot establish
+the publication. A qualified native read profile must expose the committed metadata or fail
+explicitly. A qualified write profile must apply and check the requested transaction semantics
+or decline the operation. link:../../crates/control/proximadb-catalog/src/iceberg_rest_service.rs[REST service]
+
+First reuse the same profile fixtures, typed errors, capability receipts and object-request
+accounting in both products. Preserve each product's internal catalog interfaces and WAL format.
+Start with pinned read interchange through xCatalog and Lakekeeper, then repeat the same read
+profile against Polaris on the same qualified storage. Add Glue, Horizon and Unity as separate
+authentication, governance and table-capability profiles. Qualify commit and reconciliation per
+provider after the read profile, with local-write acknowledgement and published visibility
+measured independently. Keep native resolution local and budget catalog round trips at bind,
+outside the split/Parquet hot loop. Any shared client library must earn adoption from two
+conforming implementations with measured dependency and runtime budgets.
+
+For URI-backed ProximaDB Iceberg v2 publications with explicit generation
+files, stable schema and the unpartitioned spec, the persisted head advertises
+retained pins through Iceberg's standard `snapshots` and `snapshot-log`.
+Publication copies the contiguous descriptors from the parent already read for
+the commit. A clock regression leaves exact IDs discoverable and suppresses the
+optional timestamp log until timestamps in the window are ordered. An exact-pin
+reader resolves a retained or expired pin from one current metadata observation.
+It opens the selected manifest tree for a retained pin. The generation count
+governs data and metadata collection. An archived `metadata.json` can contain
+history that was live at its publication time. Each listed pin ages out on its
+own generation. `write.metadata.previous-versions-max` caps the metadata-file
+log independently.
+
+At upgrade, the first compatible publish can carry the legacy parent's
+current snapshot forward. Earlier legacy generations age out under the same
+retention policy. Schema, table root and format transitions start a new
+discovery run until those profiles qualify their historical schema and file
+semantics. The generation window applies during active scans. See the
+link:https://iceberg.apache.org/spec/#table-metadata-and-snapshots[Iceberg metadata contract].
+
+Preserve distinct outcomes for a concealed or missing catalog table, explicit
+authorization refusal, provider failure and a missing snapshot inside a loaded
+table. Stop catalog refusals at the metadata boundary. After a transient
+failure, a fresh statement reauthorizes the same configured pin. Local release
+qualification covers a damaged published head, restoration of that head and
+the same pinned row values after recovery.
+
+For a managed publication, the catalog layout records the metadata generation
+it has acknowledged. The object-store log can advance beyond that generation.
+A listing that ends below the acknowledgement yields an unavailable result,
+even if the remaining archive is readable.
+
 [[binding]]
 == What crosses the planner and worker boundary
 

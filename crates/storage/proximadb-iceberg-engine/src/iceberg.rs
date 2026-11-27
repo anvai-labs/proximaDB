@@ -705,7 +705,7 @@ pub fn schema_json(fields: &[IcebergField]) -> serde_json::Value {
 /// `schema.name-mapping.default`: maps Iceberg field ids to Parquet column names.
 /// ProximaDB's Parquet files carry no embedded field ids, so without this mapping
 /// PyIceberg refuses to read them and other engines fall back to guessing.
-fn name_mapping(fields: &[IcebergField]) -> String {
+pub(crate) fn name_mapping(fields: &[IcebergField]) -> String {
     let entries: Vec<serde_json::Value> = fields
         .iter()
         .map(|f| serde_json::json!({"field-id": f.id, "names": [f.name]}))
@@ -772,14 +772,23 @@ impl Lineage {
         parent_json: Option<&str>,
         parent_location: Option<&str>,
     ) -> Result<Self, StorageError> {
-        let Some(json) = parent_json else {
+        let parent = parent_json
+            .map(serde_json::from_str)
+            .transpose()
+            .map_err(|e| ser_err("parse parent metadata", e))?;
+        Self::from_parent_metadata(parent.as_ref(), parent_location)
+    }
+
+    pub(crate) fn from_parent_metadata(
+        parent: Option<&serde_json::Value>,
+        parent_location: Option<&str>,
+    ) -> Result<Self, StorageError> {
+        let Some(v) = parent else {
             return Ok(Self {
                 sequence_number: 1,
                 ..Default::default()
             });
         };
-        let v: serde_json::Value =
-            serde_json::from_str(json).map_err(|e| ser_err("parse parent metadata", e))?;
         let last_seq = v
             .get("last-sequence-number")
             .and_then(|x| x.as_i64())
@@ -809,7 +818,7 @@ impl Lineage {
                 // with NO row lineage at all, so an absent next-row-id is
                 // adopted as "lineage never started" (start at 0) — but only on
                 // positive evidence that no row id was ever handed out.
-                if parent_format_version == Some(3) && !lineage_never_started(&v) {
+                if parent_format_version == Some(3) && !lineage_never_started(v) {
                     return Err(ser_err(
                         "parent metadata row lineage",
                         "a format-version 3 table must carry next-row-id",
@@ -906,16 +915,22 @@ pub struct SnapshotCommit<'a> {
 
 /// Build the `TableMetadata` JSON for `commit`, chained onto `lineage`.
 ///
-/// The snapshot is the table's complete current file set, so a commit with a parent
-/// is an `overwrite` and the parent snapshot is not carried forward: a rewrite replaces
-/// the parent's files, which are then collected, and an append re-lists the files it
-/// carries (as added, so `added-files`/`added-records` count them). The parent stays referenced through `parent-snapshot-id` and the
-/// previous metadata file through `metadata-log`, exactly as after snapshot expiry.
+/// The snapshot is the table's complete current file set, so a commit with a
+/// parent is an `overwrite`. This entry point emits the current snapshot;
+/// the explicit-file publication path can also supply retained v2 snapshots.
 /// The table is unpartitioned (spec id 0). v3 adds the row-lineage fields
 /// (`next-row-id`, `first-row-id`, `added-rows`).
 pub fn build_table_metadata(
     commit: &SnapshotCommit<'_>,
     lineage: &Lineage,
+) -> Result<String, StorageError> {
+    build_table_metadata_with_history(commit, lineage, None)
+}
+
+pub(crate) fn build_table_metadata_with_history(
+    commit: &SnapshotCommit<'_>,
+    lineage: &Lineage,
+    history: Option<Vec<serde_json::Value>>,
 ) -> Result<String, StorageError> {
     let fields = commit.fields;
     let last_column_id = fields.iter().map(|f| f.id).max().unwrap_or(0);
@@ -961,7 +976,6 @@ pub fn build_table_metadata(
         },
         "current-snapshot-id": commit.snapshot_id,
         "snapshots": [],
-        "snapshot-log": [{"snapshot-id": commit.snapshot_id, "timestamp-ms": commit.timestamp_ms}],
         "metadata-log": lineage.metadata_log,
         "refs": {"main": {"snapshot-id": commit.snapshot_id, "type": "branch"}},
     });
@@ -974,7 +988,31 @@ pub fn build_table_metadata(
         metadata["properties"][crate::retention::PREVIOUS_VERSIONS_MAX_PROPERTY] =
             serde_json::json!(max.to_string());
     }
-    metadata["snapshots"] = serde_json::json!([snapshot]);
+    if history.is_some() {
+        metadata["properties"][crate::snapshot_history::WINDOW_PROPERTY] =
+            serde_json::json!(crate::snapshot_history::WINDOW_POLICY);
+    }
+    let mut snapshots = history.unwrap_or_default();
+    snapshots.push(snapshot);
+    // Keep exact pins discoverable across clock regressions. The optional
+    // timestamp log would misrepresent the order in that case.
+    if snapshots
+        .windows(2)
+        .all(|pair| pair[0]["timestamp-ms"].as_i64() <= pair[1]["timestamp-ms"].as_i64())
+    {
+        metadata["snapshot-log"] = serde_json::Value::Array(
+            snapshots
+                .iter()
+                .map(|entry| {
+                    serde_json::json!({
+                        "snapshot-id": entry["snapshot-id"],
+                        "timestamp-ms": entry["timestamp-ms"],
+                    })
+                })
+                .collect(),
+        );
+    }
+    metadata["snapshots"] = serde_json::Value::Array(snapshots);
     serde_json::to_string_pretty(&metadata).map_err(|e| ser_err("serialize table metadata", e))
 }
 

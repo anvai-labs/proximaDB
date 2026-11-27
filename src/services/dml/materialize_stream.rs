@@ -395,9 +395,7 @@ pub(super) async fn gc_older_generations(
     first_err.map_or(Ok(deleted), Err)
 }
 
-/// Layout property recording the Iceberg metadata version a publication
-/// committed; versions only grow (create-only CAS), so it orders publications.
-pub(super) const METADATA_VERSION_PROPERTY: &str = "iceberg_metadata_version";
+pub(super) use proximadb_catalog::ICEBERG_METADATA_VERSION_PROPERTY as METADATA_VERSION_PROPERTY;
 
 fn metadata_version_of(layout: &proximadb_catalog::CatalogStorageLayout) -> Option<u64> {
     layout

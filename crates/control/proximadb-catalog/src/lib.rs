@@ -209,6 +209,11 @@ pub use proximadb_catalog_schema::{
     RelationalCapabilities, StoragePoolClass, catalog_arrow_type, same_column_set,
 };
 
+/// Layout property recording the latest Iceberg metadata generation the
+/// catalog has acknowledged. Storage can lead this value, for example
+/// between the metadata commit and the layout flip.
+pub const ICEBERG_METADATA_VERSION_PROPERTY: &str = "iceberg_metadata_version";
+
 /// Typed accessors for the opaque `mlops_asset` payload on [`CatalogTableSchema`].
 ///
 /// The `mlops_asset` field is `Option<serde_json::Value>` in the foundation

@@ -4590,7 +4590,14 @@ fn check_commit_never_lands_a_version_below_the_tip_that_nothing_builds_on() {
                 .expect("v2"),
         )
         .expect("json");
-        v2["snapshots"][0]["parent-snapshot-id"] = serde_json::json!(999_999);
+        let current_id = v2["current-snapshot-id"].as_i64().expect("v2 current ID");
+        let current = v2["snapshots"]
+            .as_array_mut()
+            .expect("v2 snapshots")
+            .iter_mut()
+            .find(|snapshot| snapshot["snapshot-id"].as_i64() == Some(current_id))
+            .expect("v2 current snapshot");
+        current["parent-snapshot-id"] = serde_json::json!(999_999);
         inv.bridge
             .object_store()
             .put(

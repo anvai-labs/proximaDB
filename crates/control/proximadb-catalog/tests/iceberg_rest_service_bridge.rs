@@ -116,7 +116,10 @@ async fn ensure_table_metadata_materializes_history_from_manifest_log() {
 /// tree, whose manifest-list URLs do not resolve.
 #[tokio::test]
 async fn load_table_serves_engine_published_metadata_verbatim() {
-    use proximadb_catalog::{CatalogAuthorityMode, CatalogPhysicalFormat, CatalogStorageLayout};
+    use proximadb_catalog::{
+        CatalogAuthorityMode, CatalogPhysicalFormat, CatalogStorageLayout,
+        ICEBERG_METADATA_VERSION_PROPERTY,
+    };
     use proximadb_iceberg_engine::iceberg::{FormatVersion, IcebergField};
 
     let dir = tempfile::tempdir().expect("tempdir");
@@ -161,6 +164,11 @@ async fn load_table_serves_engine_published_metadata_verbatim() {
         authority: CatalogAuthorityMode::ProjectionPublication,
         physical_format: CatalogPhysicalFormat::Parquet,
         location: Some(format!("{table_root}/data")),
+        properties: [(
+            ICEBERG_METADATA_VERSION_PROPERTY.to_string(),
+            "0".to_string(),
+        )]
+        .into(),
         ..Default::default()
     }];
     let id = TableIdentifier::new(vec!["default".to_string()], "events".to_string());
@@ -205,4 +213,52 @@ async fn load_table_serves_engine_published_metadata_verbatim() {
     for key in written.as_object().unwrap().keys() {
         assert!(served.get(key).is_some(), "served metadata lost `{key}`");
     }
+
+    // A corrupt head must surface an error even when the previous generation
+    // is still retained. A synthetic snapshot could hide the published rows.
+    let head_path = location
+        .strip_prefix("file://")
+        .expect("local metadata URI");
+    tokio::fs::write(head_path, b"invalid Iceberg metadata")
+        .await
+        .expect("corrupt the newest version");
+    let error = svc
+        .ensure_table_metadata(&id, &schema)
+        .await
+        .expect_err("a corrupt publication must refuse the REST read");
+    assert!(
+        error
+            .to_string()
+            .contains("decoding published Iceberg metadata")
+    );
+
+    // A failed LIST or deleted tip can leave an older valid generation
+    // visible. The layout's acknowledgement must prevent a rewind.
+    schema.storage_layouts[0].properties.insert(
+        ICEBERG_METADATA_VERSION_PROPERTY.to_string(),
+        "1".to_string(),
+    );
+    tokio::fs::remove_file(head_path)
+        .await
+        .expect("remove published head");
+    let error = svc
+        .ensure_table_metadata(&id, &schema)
+        .await
+        .expect_err("an older archive cannot replace the acknowledged head");
+    assert!(
+        error
+            .to_string()
+            .contains("below the acknowledged generation")
+    );
+
+    let empty_root = dir.path().join("empty");
+    tokio::fs::create_dir(&empty_root)
+        .await
+        .expect("empty table root");
+    schema.storage_layouts[0].location = Some(format!("file://{}/data", empty_root.display()));
+    let error = svc
+        .ensure_table_metadata(&id, &schema)
+        .await
+        .expect_err("an unresolvable publication must refuse the REST read");
+    assert!(error.to_string().contains("published Iceberg"));
 }
