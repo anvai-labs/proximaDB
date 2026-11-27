@@ -285,11 +285,7 @@ fn bench_graph_engine_reporter(c: &mut Criterion) {
     c.bench_function("graph_engine_reporter_generate", |b| {
         b.iter(|| {
             rt.block_on(async {
-                let mut engines = vec!["ORION"];
-                #[cfg(feature = "distributed-graph")]
-                engines.push("PULSAR");
-                #[cfg(feature = "tiered-graph")]
-                engines.push("QUASAR");
+                let engines = ["ORION"];
                 let scales = vec![(1000, 3000), (5000, 15000)];
 
                 let mut results = Vec::new();

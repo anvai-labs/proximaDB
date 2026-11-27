@@ -3797,7 +3797,7 @@ mod tests {
         use crate::index::axis::ColdPathLoadPolicy;
         use crate::index::axis::storage::serialization::IndexSerializer;
         let _ = proximadb_hardware::hardware_capabilities();
-        let (mut index, data) = mixed_sign_trained_index("c_cf").await;
+        let (index, data) = mixed_sign_trained_index("c_cf").await;
         let bytes = IndexSerializer::serialize_ivf(&index, "c_cf")
             .await
             .unwrap();
@@ -3979,7 +3979,7 @@ mod tests {
         use std::sync::Arc;
         let _ = proximadb_hardware::hardware_capabilities();
 
-        let (mut index, data) = mixed_sign_trained_index("c_ranged").await;
+        let (index, data) = mixed_sign_trained_index("c_ranged").await;
         let bytes = IndexSerializer::serialize_ivf(&index, "c_ranged")
             .await
             .unwrap();

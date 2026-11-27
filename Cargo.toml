@@ -452,7 +452,7 @@ proximadb-quantization-model = { path = "crates/foundation/proximadb-quantizatio
 proximadb-catalog = { path = "crates/control/proximadb-catalog", features = ["fc-metamodel", "openapi"] }
 proximadb-catalog-schema = { workspace = true }
 proximadb-multimodel-codec = { workspace = true }
-proximadb-cdc = { workspace = true }
+proximadb-cdc = { workspace = true, optional = true }
 proximadb-abac = { path = "crates/control/proximadb-abac", optional = true }
 proximadb-metrics = { path = "crates/control/proximadb-metrics" }
 proximadb-api = { path = "crates/platform/proximadb-api" }
@@ -536,7 +536,6 @@ proximadb-rank-profile = { path = "crates/modalities/proximadb-rank-profile" }
 proximadb-rank-onnx = { path = "crates/modalities/proximadb-rank-onnx" }
 proximadb-vector = { path = "crates/modalities/proximadb-vector" }
 proximadb-quantization-kernel = { path = "crates/modalities/proximadb-quantization-kernel" }
-proximadb-graph-arrow = { path = "crates/query/proximadb-graph-arrow" }
 proximadb-graph-query = { path = "crates/query/proximadb-graph-query" }
 proximadb-graph-subset = { path = "crates/query/proximadb-graph-subset" }
 proximadb-multimodel-query = { path = "crates/query/proximadb-multimodel-query" }
@@ -687,7 +686,6 @@ half = "2.4"  # FP16 (float16) support for centroid quantization (50% storage re
 
 # CPU optimization
 num_cpus = "1.16"
-raw-cpuid = "11.0"  # CPU feature detection for x86_64
 
 # Random number generation
 rand.workspace = true
@@ -715,7 +713,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 prometheus.workspace = true
 
 # Configuration
-config = "0.15"
 clap = { version = "4.0", features = ["derive"] }
 toml = "1.1"
 
@@ -754,12 +751,8 @@ nom = "7"
 tantivy = "0.27"  # Full-text search for documents
 jsonpath-rust = "0.5"  # JSON path queries for document filtering (actively maintained)
 
-# PostgreSQL wire protocol compatibility
-pgwire = "0.21"  # PostgreSQL wire protocol for pgvector migration
-
 # REST API
 axum = { version = "0.8", features = ["json", "ws"] }
-urlencoding = "2.1.3"
 dashmap = "6.1.0"
 moka = { version = "0.12", features = ["future"] }
 
@@ -777,7 +770,7 @@ moka = { version = "0.12", features = ["future"] }
 # Java bindings via JNI
 # Node.js bindings via NAPI-RS
 proximadb-raptor-common = { version = "0.7.0", path = "crates/storage/proximadb-raptor-common" }
-proximadb-raptor-engine = { version = "0.7.0", path = "crates/storage/proximadb-raptor-engine" }
+proximadb-raptor-engine = { version = "0.7.0", path = "crates/storage/proximadb-raptor-engine", optional = true }
 proximadb-engine-core = { version = "0.7.0", path = "crates/storage/proximadb-engine-core" }
 proximadb-mongodb-parser = { version = "0.7.0", path = "crates/binding/proximadb-mongodb-parser" }
 
@@ -847,7 +840,7 @@ tenant_access = []
 # Experimental storage engines (RAPTOR, SWIFT); disabled by default to prevent
 # server panics from unimplemented code paths. Enable for development/testing only.
 # RAPTOR fundamentally uses AXIS clustering, so this implies `axis`.
-experimental-engines = ["proximadb-raptor-engine/experimental-engines", "axis"]
+experimental-engines = ["dep:proximadb-raptor-engine", "proximadb-raptor-engine/experimental-engines", "axis"]
 # Experimental transactional Ledger modality (ADR-071 / TD-LEDGER-1): the durable atomic-CAS
 # KV + TTL-lease OLTP surface. Off by default; enables the durable backend + its gRPC service.
 experimental-ledger = ["dep:proximadb-ledger", "proximadb-ledger/durable"]
@@ -942,7 +935,7 @@ network-rest = ["proximadb-tls/network-rest"]
 
 # CDC Kafka integration (change data capture to Kafka)
 # Note: rdkafka dependency would be added when enabling this feature
-cdc-kafka = []
+cdc-kafka = ["dep:proximadb-cdc"]
 
 # LLM-driven semantic join modes (TD-049, arXiv:2510.08489 block-batched joins).
 # When enabled, JoinType::Semantic { mode: LlmBlockBatch { ... } } is dispatched

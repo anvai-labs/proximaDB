@@ -429,7 +429,7 @@ async fn test_isolated_sst_multi_batch_flush_compaction() -> Result<()> {
     println!("   Expected files: {}", sst_file_count);
 
     // Let's also check what the collection_config looks like
-    if let Some(ref config) = compact_params.collection_config {
+    if compact_params.collection_config.is_some() {
         println!("   Collection config found");
     }
 

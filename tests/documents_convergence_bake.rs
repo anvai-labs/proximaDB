@@ -309,7 +309,6 @@ fn prom_family_sum(scrape: &str, family: &str) -> f64 {
 struct MeterSnapshot {
     object_store_ops: f64,
     write_bytes_by_tier: f64,
-    kou_bytes: f64,
     storage_bytes_seconds: f64,
 }
 
@@ -330,7 +329,6 @@ async fn scrape_meters_endpoint(http: &reqwest::Client, rest: &str) -> MeterSnap
             &body,
             "proximadb_object_store_write_bytes_by_tier_total",
         ),
-        kou_bytes: prom_family_sum(&body, "proximadb_kou_bytes_total"),
         storage_bytes_seconds: prom_family_sum(&body, "proximadb_storage_bytes_seconds"),
     }
 }
@@ -358,7 +356,6 @@ fn gather_meters_registry() -> MeterSnapshot {
             &text,
             "proximadb_object_store_write_bytes_by_tier_total",
         ),
-        kou_bytes: prom_family_sum(&text, "proximadb_kou_bytes_total"),
         storage_bytes_seconds: prom_family_sum(&text, "proximadb_storage_bytes_seconds"),
     }
 }

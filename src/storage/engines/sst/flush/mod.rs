@@ -3133,7 +3133,6 @@ mod tests {
         let flush = |seed: usize| {
             let engine = &engine;
             let collection = collection.clone();
-            let storage_url = storage_url.clone();
             async move {
                 engine
                     .do_flush(&FlushParameters {

@@ -1800,7 +1800,6 @@ mod tests {
         struct MockStorageEngine {
             vectors_received: Arc<tokio::sync::Mutex<Vec<proximadb_records::ProximaRecord>>>,
             flush_hints_received: Arc<tokio::sync::Mutex<Vec<HashMap<String, serde_json::Value>>>>,
-            filesystem_factory: FilesystemFactory,
         }
 
         #[async_trait]
@@ -1878,20 +1877,12 @@ mod tests {
             }
         }
 
-        // Create a filesystem factory for the mock
-        let filesystem_factory = futures::executor::block_on(async {
-            FilesystemFactory::create(FilesystemConfig::default())
-                .await
-                .expect("Failed to create filesystem factory")
-        });
-
         let hints = Arc::new(tokio::sync::Mutex::new(Vec::new()));
         let engine = Arc::new(MockStorageEngine {
             vectors_received: Arc::new(tokio::sync::Mutex::new(Vec::<
                 proximadb_records::ProximaRecord,
             >::new())),
             flush_hints_received: Arc::clone(&hints),
-            filesystem_factory,
         });
         (engine, hints)
     }

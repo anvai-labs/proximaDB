@@ -48,7 +48,7 @@ async fn aws_detection_uses_imdsv2_session_token() {
         .mock_async(|when, then| {
             when.method(GET)
                 .path(INSTANCE_ID_PATH)
-                .matches(lacks_session_token);
+                .is_true(lacks_session_token);
             then.status(401);
         })
         .await;
@@ -60,12 +60,12 @@ async fn aws_detection_uses_imdsv2_session_token() {
     let reachable = aws_imds_reachable(&client, &imds.base_url()).await;
 
     assert_eq!(
-        tokenless.hits_async().await,
+        tokenless.calls_async().await,
         0,
         "detector issued a token-less IMDSv1 GET"
     );
-    assert_eq!(token_mock.hits_async().await, 1, "no IMDSv2 token PUT");
-    assert_eq!(with_token.hits_async().await, 1, "no token-bearing GET");
+    assert_eq!(token_mock.calls_async().await, 1, "no IMDSv2 token PUT");
+    assert_eq!(with_token.calls_async().await, 1, "no token-bearing GET");
     assert!(reachable, "an IMDSv2-required instance must be detected");
 }
 
@@ -93,7 +93,7 @@ async fn aws_detection_never_falls_back_to_imdsv1() {
     let reachable = aws_imds_reachable(&client, &imds.base_url()).await;
 
     assert_eq!(
-        any_get.hits_async().await,
+        any_get.calls_async().await,
         0,
         "fell back to a token-less GET"
     );

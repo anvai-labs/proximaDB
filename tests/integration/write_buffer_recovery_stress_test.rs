@@ -10,7 +10,7 @@
 
 use anyhow::Result;
 use proximadb::storage::persistence::write_ahead_log::serialization::{
-    SerializationFormat, SerializerFactory, VectorBatchSerializer,
+    SerializationFormat, SerializerFactory,
 };
 use proximadb_records::ProximaRecord;
 use std::path::{Path, PathBuf};

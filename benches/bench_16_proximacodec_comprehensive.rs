@@ -71,7 +71,7 @@ fn generate_time_series(num_vectors: usize, dimension: usize) -> Vec<f32> {
         .map(|i| {
             let baseline = 100.0;
             let trend = i as f32 * 0.05;
-            let noise = ((i as f32 * 0.1).sin() * 2.0);
+            let noise = (i as f32 * 0.1).sin() * 2.0;
             baseline + trend + noise
         })
         .collect()
@@ -141,25 +141,21 @@ fn get_platform_info() -> String {
     let arch = std::env::consts::ARCH;
     let os = std::env::consts::OS;
 
-    #[cfg(all(feature = "metal", target_os = "macos"))]
-    {
+    if cfg!(all(feature = "metal", target_os = "macos")) {
         return format!("{} {} (Metal GPU)", os, arch);
     }
-
-    #[cfg(all(feature = "gpu", target_os = "linux", target_arch = "x86_64"))]
-    {
+    if cfg!(all(
+        feature = "gpu",
+        target_os = "linux",
+        target_arch = "x86_64"
+    )) {
         return format!("{} {} (CUDA GPU)", os, arch);
     }
-
-    #[cfg(all(
-        target_arch = "aarch64",
-        not(all(feature = "metal", target_os = "macos"))
-    ))]
-    {
+    if cfg!(target_arch = "aarch64") {
         return format!("{} {} (NEON SIMD)", os, arch);
     }
 
-    #[cfg(all(target_arch = "x86_64", not(all(feature = "gpu", target_os = "linux"))))]
+    #[cfg(target_arch = "x86_64")]
     {
         if std::is_x86_feature_detected!("avx512f") {
             return format!("{} {} (AVX-512 SIMD)", os, arch);

@@ -521,7 +521,6 @@ mod iceberg_catalog_tests {
 
         let health = catalog.health_check().await.unwrap();
         assert!(health.is_healthy);
-        assert!(health.latency_ms >= 0); // Just checking it exists
 
         cleanup_dir(&temp_dir).await;
     }

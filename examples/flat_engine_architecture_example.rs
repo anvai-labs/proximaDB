@@ -4,7 +4,6 @@
 //! where all 12 engines are accessible directly at the engines/ level.
 
 use proximadb::storage::engines::{StorageEngineFactory, WorkloadType};
-use std::sync::Arc;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -68,15 +67,15 @@ async fn demonstrate_automatic_selection() -> Result<(), Box<dyn std::error::Err
     println!();
 
     // Transactional workload → SST engine
-    let oltp_engine = StorageEngineFactory::create_for_workload(WorkloadType::Transactional)?;
+    let _oltp_engine = StorageEngineFactory::create_for_workload(WorkloadType::Transactional)?;
     println!("   📊 Transactional Workload → SST Engine (Real-time queries, frequent updates)");
 
     // Analytics workload → NOVA engine
-    let olap_engine = StorageEngineFactory::create_for_workload(WorkloadType::Analytics)?;
+    let _olap_engine = StorageEngineFactory::create_for_workload(WorkloadType::Analytics)?;
     println!("   📈 Analytics Workload → NOVA Engine (Analytics, batch operations)");
 
     // Mixed workload → NOVA engine
-    let mixed_engine = StorageEngineFactory::create_for_workload(WorkloadType::Mixed)?;
+    let _mixed_engine = StorageEngineFactory::create_for_workload(WorkloadType::Mixed)?;
     println!("   🔀 Mixed Workload → NOVA Engine (Combined OLTP/OLAP)");
 
     println!("\n   💡 Factory pattern remains unchanged - backward compatible!");

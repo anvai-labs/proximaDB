@@ -1333,22 +1333,8 @@ static GLOBAL_ENTITY_STORE: std::sync::OnceLock<Arc<ProximaEntityStore>> =
 mod tests {
     use super::*;
     use crate::proto::proximadb_v1::{EmbeddingVersion, Entity, Modality, Relation};
-    use crate::storage::persistence::filesystem::{FilesystemConfig, FilesystemFactory};
-
     // Test helper struct for mocking storage engine
-    struct NoopEngine {
-        filesystem_factory: FilesystemFactory,
-    }
-
-    impl NoopEngine {
-        async fn new() -> Self {
-            let config = FilesystemConfig::default();
-            let filesystem_factory = FilesystemFactory::create(config)
-                .await
-                .expect("Failed to create FilesystemFactory in test helper");
-            Self { filesystem_factory }
-        }
-    }
+    struct NoopEngine;
 
     #[async_trait]
     impl UnifiedStorageFormat for NoopEngine {
@@ -1415,7 +1401,7 @@ mod tests {
     async fn test_upsert_and_persist_header_and_embeddings() {
         // Minimal engine: use a dummy unified engine from tests (SST mocked by trait objects would be heavy)
         // For persistence we use filesystem KV; embeddings stored in-memory index
-        let engine = Arc::new(NoopEngine::new().await) as Arc<dyn UnifiedStorageFormat>;
+        let engine = Arc::new(NoopEngine) as Arc<dyn UnifiedStorageFormat>;
         let store = ProximaEntityStore::new(
             engine,
             Arc::new(CsrRelationsStore::new()),
@@ -1497,7 +1483,7 @@ mod tests {
     #[tokio::test]
     async fn test_batch_filter_entities() {
         let store = ProximaEntityStore::new(
-            Arc::new(NoopEngine::new().await),
+            Arc::new(NoopEngine),
             Arc::new(CsrRelationsStore::new()),
             Arc::new(InMemoryProvenanceRegistry::new()),
         );
@@ -1583,7 +1569,7 @@ mod tests {
     #[tokio::test]
     async fn test_streaming_entities() {
         let store = ProximaEntityStore::new(
-            Arc::new(NoopEngine::new().await),
+            Arc::new(NoopEngine),
             Arc::new(CsrRelationsStore::new()),
             Arc::new(InMemoryProvenanceRegistry::new()),
         );
@@ -1642,7 +1628,7 @@ mod tests {
     #[tokio::test]
     async fn test_header_level_filtering() {
         let store = ProximaEntityStore::new(
-            Arc::new(NoopEngine::new().await),
+            Arc::new(NoopEngine),
             Arc::new(CsrRelationsStore::new()),
             Arc::new(InMemoryProvenanceRegistry::new()),
         );

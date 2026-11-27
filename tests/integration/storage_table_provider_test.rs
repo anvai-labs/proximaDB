@@ -22,11 +22,10 @@ use datafusion::prelude::*;
 
 use proximadb::datafusion::{
     CollectionInfo, EngineType, FileSplit, NullProximaTableProvider, NullSplitReader,
-    ProximaDataFusionTable, ProximaDataFusionTableConfig, ProximaScanExec, ProximaTableProvider,
-    PruningStatistics,
+    ProximaDataFusionTable, ProximaScanExec, ProximaTableProvider, PruningStatistics,
 };
 use proximadb::storage::formats::splits::{
-    ColumnBounds, ScalarPredicate, ScalarValue, SpatialBounds, SplitStatistics,
+    ColumnBounds, ScalarPredicate, ScalarValue, SpatialBounds,
 };
 
 // ============================================================================

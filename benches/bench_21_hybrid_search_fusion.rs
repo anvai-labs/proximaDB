@@ -70,6 +70,7 @@ fn bench_rrf(c: &mut Criterion) {
     group.finish();
 }
 
+#[expect(deprecated, reason = "Measures the legacy fusion strategy")]
 fn bench_weighted_linear(c: &mut Criterion) {
     let mut group = c.benchmark_group("fusion_weighted_linear");
 
@@ -99,6 +100,7 @@ fn bench_weighted_linear(c: &mut Criterion) {
     group.finish();
 }
 
+#[expect(deprecated, reason = "Measures the legacy fusion strategy")]
 fn bench_borda_count(c: &mut Criterion) {
     let mut group = c.benchmark_group("fusion_borda_count");
 
@@ -124,6 +126,7 @@ fn bench_borda_count(c: &mut Criterion) {
     group.finish();
 }
 
+#[expect(deprecated, reason = "Measures the legacy fusion strategy")]
 fn bench_comb_sum(c: &mut Criterion) {
     let mut group = c.benchmark_group("fusion_comb_sum");
 
@@ -149,6 +152,7 @@ fn bench_comb_sum(c: &mut Criterion) {
     group.finish();
 }
 
+#[expect(deprecated, reason = "Measures the legacy fusion strategy")]
 fn bench_comb_min(c: &mut Criterion) {
     let mut group = c.benchmark_group("fusion_comb_min");
 
@@ -174,6 +178,7 @@ fn bench_comb_min(c: &mut Criterion) {
     group.finish();
 }
 
+#[expect(deprecated, reason = "Measures the legacy fusion strategy")]
 fn bench_comb_max(c: &mut Criterion) {
     let mut group = c.benchmark_group("fusion_comb_max");
 
@@ -199,6 +204,7 @@ fn bench_comb_max(c: &mut Criterion) {
     group.finish();
 }
 
+#[expect(deprecated, reason = "Measures the legacy fusion strategy")]
 fn bench_condorcet(c: &mut Criterion) {
     let mut group = c.benchmark_group("fusion_condorcet");
 
@@ -225,6 +231,7 @@ fn bench_condorcet(c: &mut Criterion) {
     group.finish();
 }
 
+#[expect(deprecated, reason = "Measures the legacy fusion strategy")]
 fn bench_dempster_shafer(c: &mut Criterion) {
     let mut group = c.benchmark_group("fusion_dempster_shafer");
 
@@ -250,6 +257,7 @@ fn bench_dempster_shafer(c: &mut Criterion) {
     group.finish();
 }
 
+#[expect(deprecated, reason = "Measures the legacy fusion strategy")]
 fn bench_adaptive(c: &mut Criterion) {
     let mut group = c.benchmark_group("fusion_adaptive");
 
@@ -275,6 +283,7 @@ fn bench_adaptive(c: &mut Criterion) {
     group.finish();
 }
 
+#[expect(deprecated, reason = "Measures the legacy fusion strategy")]
 fn bench_projection(c: &mut Criterion) {
     let mut group = c.benchmark_group("fusion_projection");
 
@@ -304,6 +313,7 @@ fn bench_projection(c: &mut Criterion) {
 ///
 /// Each iteration fuses the same BM25 + vector result sets with both strategies
 /// so the relative cost is comparable directly. Report goes in TD-044 closure.
+#[expect(deprecated, reason = "Measures the legacy fusion strategy")]
 fn bench_rrf_vs_projection(c: &mut Criterion) {
     let mut group = c.benchmark_group("fusion_rrf_vs_projection");
 
@@ -344,6 +354,7 @@ fn bench_rrf_vs_projection(c: &mut Criterion) {
     group.finish();
 }
 
+#[expect(deprecated, reason = "Measures the legacy fusion strategy")]
 fn bench_overlap_scenarios(c: &mut Criterion) {
     let mut group = c.benchmark_group("fusion_overlap_scenarios");
 

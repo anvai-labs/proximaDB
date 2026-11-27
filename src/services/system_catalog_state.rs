@@ -1855,7 +1855,7 @@ mod tests {
     fn seeded_state() -> SystemCatalogState {
         let state = SystemCatalogState::new();
         let mut seq = 0;
-        let mut apply = |state: &SystemCatalogState, delta: CatalogDelta, seq: &mut u64| {
+        let apply = |state: &SystemCatalogState, delta: CatalogDelta, seq: &mut u64| {
             *seq += 1;
             state.apply_committed(*seq, delta);
         };

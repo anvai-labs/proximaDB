@@ -4,7 +4,7 @@
 //! with realistic BERT and OpenAI embeddings for accurate performance measurements.
 
 mod common;
-use common::benchmark_utils::{STANDARD_BATCH_SIZES, STANDARD_DIMENSIONS, print_system_info};
+use common::benchmark_utils::{STANDARD_BATCH_SIZES, print_system_info};
 
 use common::{EmbeddingGenerator, EmbeddingModel};
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
@@ -72,7 +72,7 @@ async fn progressive_search_real(
     query: &[f32],
     database: &[VectorRecord],
     k: usize,
-    config: &ProgressiveSearchConfig,
+    _config: &ProgressiveSearchConfig,
 ) -> Vec<(String, f32)> {
     // Initialize real components
     use proximadb::compute::quantization::InMemoryCodebookStore;

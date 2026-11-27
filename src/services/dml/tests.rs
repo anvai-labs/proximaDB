@@ -10052,7 +10052,7 @@ mod flip_fault {
                 if latest.is_some_and(|v| v > armed)
                     && self
                         .budget
-                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, spend)
+                        .try_update(Ordering::SeqCst, Ordering::SeqCst, spend)
                         .is_ok()
                 {
                     self.injected.fetch_add(1, Ordering::SeqCst);

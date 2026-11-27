@@ -7,14 +7,16 @@
 //! cargo bench --bench bench_23_recall_at_k
 //! ```
 
+#[allow(
+    dead_code,
+    reason = "This Criterion target uses only the L2 recall helpers"
+)]
 mod recall_utils;
 use recall_utils::{compute_ground_truth_l2, compute_recall_multi};
 
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 use proximadb::proto::proximadb_v1::VectorRecord;
 use std::time::Duration;
-
-const BASE_PATH: &str = "/tmp/proximadb-recall-bench";
 
 /// Generate test vectors with deterministic IDs
 fn generate_test_vectors(count: usize, dimension: usize) -> Vec<VectorRecord> {

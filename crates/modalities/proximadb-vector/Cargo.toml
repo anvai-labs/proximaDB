@@ -37,7 +37,6 @@ proximadb-kernel = { path = "../../foundation/proximadb-kernel" }
 proximadb-proto = { path = "../../foundation/proximadb-proto" }
 proximadb-quantization-types = { path = "../../foundation/proximadb-quantization-types" }
 proximadb-quantization-model = { workspace = true }
-proximadb-records = { workspace = true }
 rand.workspace = true
 serde.workspace = true
 serde_json.workspace = true

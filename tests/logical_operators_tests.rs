@@ -17,9 +17,7 @@ mod tests {
         ComparisonOperator, FieldQuery, MetadataQuery, MetadataQueryBuilder, MetadataQueryEngine,
     };
     use proximadb_data_model::ProximaValue;
-    use proximadb_records::{
-        EmbeddingCell, EmbeddingValues, ProximaRecord, ProximaTree, ProximaTreeNode,
-    };
+    use proximadb_records::{EmbeddingCell, ProximaRecord, ProximaTree, ProximaTreeNode};
 
     /// Create a test vector record with metadata
     fn create_test_vector(id: &str, metadata: HashMap<String, serde_json::Value>) -> ProximaRecord {
