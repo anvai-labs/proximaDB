@@ -75,15 +75,15 @@
 //! - Aggregations: `count()`, `sum()`, `avg()`, `collect()`
 
 use nom::{
-    IResult,
+    IResult, Parser,
     branch::alt,
     bytes::complete::{tag, tag_no_case},
     character::complete::{char, digit1, multispace0, multispace1},
     combinator::{map, map_res, opt, value},
-    error::VerboseError,
     multi::{many0, many1, separated_list0, separated_list1},
-    sequence::{delimited, pair, preceded, separated_pair, tuple},
+    sequence::{delimited, pair, preceded, separated_pair},
 };
+use nom_language::error::{VerboseError, VerboseErrorKind};
 use proximadb_kernel::error::ProximaDBError;
 // TODO: Move to proximadb-graph crate
 // For now, use local definitions
@@ -888,12 +888,12 @@ fn property_map(input: &str) -> ParseResult<'_, HashMap<String, PropertyConstrai
 
 /// Parse labels: :Label1:Label2
 fn parse_labels(input: &str) -> ParseResult<'_, Vec<String>> {
-    many1(preceded(char(':'), any_identifier))(input)
+    many1(preceded(char(':'), any_identifier)).parse(input)
 }
 
 /// Parse optional labels
 fn parse_optional_labels(input: &str) -> ParseResult<'_, Vec<String>> {
-    map(opt(parse_labels), |labels| labels.unwrap_or_default())(input)
+    map(opt(parse_labels), |labels| labels.unwrap_or_default()).parse(input)
 }
 
 /// Parse node pattern: (variable:Label {props})
@@ -901,12 +901,12 @@ fn parse_node_pattern(input: &str) -> ParseResult<'_, NodePattern> {
     map(
         delimited(
             char('('),
-            tuple((
+            (
                 preceded(multispace0, opt(any_identifier)),
                 parse_optional_labels,
                 preceded(multispace0, opt(property_map)),
                 multispace0,
-            )),
+            ),
             char(')'),
         ),
         |(variable_opt, labels, properties_opt, _)| {
@@ -927,7 +927,8 @@ fn parse_node_pattern(input: &str) -> ParseResult<'_, NodePattern> {
                 optional: false,
             }
         },
-    )(input)
+    )
+    .parse(input)
 }
 
 /// Convert PropertyConstraint to serde_json::Value
@@ -956,12 +957,12 @@ fn property_constraint_to_value(constraint: PropertyConstraint) -> serde_json::V
 
 /// Parse edge direction left: <- or -
 fn parse_edge_left(input: &str) -> ParseResult<'_, bool> {
-    alt((value(true, tag("<-")), value(false, tag("-"))))(input)
+    alt((value(true, tag("<-")), value(false, tag("-")))).parse(input)
 }
 
 /// Parse edge direction right: -> or -
 fn parse_edge_right(input: &str) -> ParseResult<'_, bool> {
-    alt((value(true, tag("->")), value(false, tag("-"))))(input)
+    alt((value(true, tag("->")), value(false, tag("-")))).parse(input)
 }
 
 /// Parse variable-length path: *min..max or *max or *
@@ -983,12 +984,13 @@ fn parse_var_length(input: &str) -> ParseResult<'_, (u32, u32)> {
             // * (default: 1..infinity, we use 99 as max)
             value((1, 99), multispace0),
         )),
-    )(input)
+    )
+    .parse(input)
 }
 
 /// Parse edge type: :TYPE1|TYPE2
 fn parse_edge_types(input: &str) -> ParseResult<'_, Vec<String>> {
-    preceded(char(':'), separated_list1(char('|'), any_identifier))(input)
+    preceded(char(':'), separated_list1(char('|'), any_identifier)).parse(input)
 }
 
 /// Parse edge specification: [variable:TYPE {props}]
@@ -1008,13 +1010,13 @@ fn parse_edge_spec(
     map(
         delimited(
             char('['),
-            tuple((
+            (
                 preceded(multispace0, opt(any_identifier)),
                 opt(parse_edge_types),
                 preceded(multispace0, opt(parse_var_length)),
                 preceded(multispace0, opt(property_map)),
                 multispace0,
-            )),
+            ),
             char(']'),
         ),
         |(var, types, var_len, props, _)| {
@@ -1025,7 +1027,8 @@ fn parse_edge_spec(
                 var_len,
             )
         },
-    )(input)
+    )
+    .parse(input)
 }
 
 /// Parse full edge pattern: <-[spec]- or -[spec]-> or -[spec]-
@@ -1044,19 +1047,20 @@ fn parse_edge_pattern_full(
     ),
 > {
     map(
-        tuple((parse_edge_left, parse_edge_spec, parse_edge_right)),
+        (parse_edge_left, parse_edge_spec, parse_edge_right),
         |(left, (var, types, props, var_len), right)| (left, var, types, props, right, var_len),
-    )(input)
+    )
+    .parse(input)
 }
 
 /// Parse a path segment: (node)-[edge]->(node)
 fn parse_path_segment(input: &str) -> ParseResult<'_, (NodePattern, EdgePattern, NodePattern)> {
     map(
-        tuple((
+        (
             parse_node_pattern,
             preceded(multispace0, parse_edge_pattern_full),
             preceded(multispace0, parse_node_pattern),
-        )),
+        ),
         |(
             from_node,
             (is_incoming, edge_var, edge_types, edge_props, is_outgoing, _var_len),
@@ -1086,7 +1090,8 @@ fn parse_path_segment(input: &str) -> ParseResult<'_, (NodePattern, EdgePattern,
 
             (from_node, edge, to_node)
         },
-    )(input)
+    )
+    .parse(input)
 }
 
 /// Parse comparison operator
@@ -1100,19 +1105,20 @@ fn parse_comparison_op(input: &str) -> ParseResult<'_, &str> {
         tag("="),
         tag("<"),
         tag(">"),
-    ))(input)
+    ))
+    .parse(input)
 }
 
 /// Parse a WHERE property condition: variable.property op value
 fn parse_where_property(input: &str) -> ParseResult<'_, WhereClause> {
     map(
-        tuple((
+        (
             any_identifier,
             char('.'),
             any_identifier,
             delimited(multispace0, parse_comparison_op, multispace0),
             property_value,
-        )),
+        ),
         |(variable, _, property, op, value)| WhereClause::Property {
             variable,
             property,
@@ -1133,20 +1139,21 @@ fn parse_where_property(input: &str) -> ParseResult<'_, WhereClause> {
                 _ => PropertyConstraint::Equals(value),
             },
         },
-    )(input)
+    )
+    .parse(input)
 }
 
 /// Parse IS NULL / IS NOT NULL
 fn parse_is_null(input: &str) -> ParseResult<'_, WhereClause> {
     alt((
         map(
-            tuple((
+            (
                 any_identifier,
                 char('.'),
                 any_identifier,
                 delimited(multispace1, tag_no_case("IS"), multispace1),
                 tag_no_case("NULL"),
-            )),
+            ),
             |(variable, _, property, _, _)| WhereClause::Property {
                 variable,
                 property,
@@ -1154,7 +1161,7 @@ fn parse_is_null(input: &str) -> ParseResult<'_, WhereClause> {
             },
         ),
         map(
-            tuple((
+            (
                 any_identifier,
                 char('.'),
                 any_identifier,
@@ -1162,20 +1169,21 @@ fn parse_is_null(input: &str) -> ParseResult<'_, WhereClause> {
                 tag_no_case("NOT"),
                 multispace1,
                 tag_no_case("NULL"),
-            )),
+            ),
             |(variable, _, property, _, _, _, _)| WhereClause::Property {
                 variable,
                 property,
                 constraint: PropertyConstraint::Exists,
             },
         ),
-    ))(input)
+    ))
+    .parse(input)
 }
 
 /// Parse IN clause
 fn parse_in_clause(input: &str) -> ParseResult<'_, WhereClause> {
     map(
-        tuple((
+        (
             any_identifier,
             char('.'),
             any_identifier,
@@ -1188,20 +1196,21 @@ fn parse_in_clause(input: &str) -> ParseResult<'_, WhereClause> {
                 ),
                 char(']'),
             ),
-        )),
+        ),
         |(variable, _, property, _, values)| WhereClause::Property {
             variable,
             property,
             constraint: PropertyConstraint::In(values),
         },
-    )(input)
+    )
+    .parse(input)
 }
 
 /// Parse STARTS WITH / ENDS WITH / CONTAINS
 fn parse_string_predicates(input: &str) -> ParseResult<'_, WhereClause> {
     alt((
         map(
-            tuple((
+            (
                 any_identifier,
                 char('.'),
                 any_identifier,
@@ -1209,7 +1218,7 @@ fn parse_string_predicates(input: &str) -> ParseResult<'_, WhereClause> {
                 tag_no_case("WITH"),
                 multispace1,
                 string_literal,
-            )),
+            ),
             |(variable, _, property, _, _, _, value)| WhereClause::Property {
                 variable,
                 property,
@@ -1217,7 +1226,7 @@ fn parse_string_predicates(input: &str) -> ParseResult<'_, WhereClause> {
             },
         ),
         map(
-            tuple((
+            (
                 any_identifier,
                 char('.'),
                 any_identifier,
@@ -1225,7 +1234,7 @@ fn parse_string_predicates(input: &str) -> ParseResult<'_, WhereClause> {
                 tag_no_case("WITH"),
                 multispace1,
                 string_literal,
-            )),
+            ),
             |(variable, _, property, _, _, _, value)| WhereClause::Property {
                 variable,
                 property,
@@ -1233,20 +1242,21 @@ fn parse_string_predicates(input: &str) -> ParseResult<'_, WhereClause> {
             },
         ),
         map(
-            tuple((
+            (
                 any_identifier,
                 char('.'),
                 any_identifier,
                 delimited(multispace1, tag_no_case("CONTAINS"), multispace1),
                 string_literal,
-            )),
+            ),
             |(variable, _, property, _, value)| WhereClause::Property {
                 variable,
                 property,
                 constraint: PropertyConstraint::Contains(value),
             },
         ),
-    ))(input)
+    ))
+    .parse(input)
 }
 
 /// Parse primary WHERE condition
@@ -1271,7 +1281,8 @@ fn parse_where_primary(input: &str) -> ParseResult<'_, WhereClause> {
         parse_string_predicates,
         // Property comparison
         parse_where_property,
-    ))(input)
+    ))
+    .parse(input)
 }
 
 /// Parse WHERE condition with AND/OR
@@ -1279,14 +1290,15 @@ fn parse_where_condition(input: &str) -> ParseResult<'_, WhereClause> {
     let (input, first) = parse_where_primary(input)?;
 
     // Try to parse chained AND/OR
-    let result = many0(tuple((
+    let result = many0((
         delimited(
             multispace1,
             alt((tag_no_case("AND"), tag_no_case("OR"), tag_no_case("XOR"))),
             multispace1,
         ),
         parse_where_primary,
-    )))(input);
+    ))
+    .parse(input);
 
     match result {
         Ok((remaining, pairs)) => {
@@ -1319,7 +1331,8 @@ fn parse_where_clause(input: &str) -> ParseResult<'_, WhereClause> {
     preceded(
         pair(tag_no_case("WHERE"), multispace1),
         parse_where_condition,
-    )(input)
+    )
+    .parse(input)
 }
 
 /// Parse aggregation function
@@ -1327,7 +1340,7 @@ fn parse_aggregation(input: &str) -> ParseResult<'_, PropertyProjection> {
     alt((
         // COUNT(*)
         map(
-            tuple((
+            (
                 tag_no_case("COUNT"),
                 multispace0,
                 char('('),
@@ -1335,12 +1348,12 @@ fn parse_aggregation(input: &str) -> ParseResult<'_, PropertyProjection> {
                 char('*'),
                 multispace0,
                 char(')'),
-            )),
+            ),
             |_| PropertyProjection::Count,
         ),
         // COUNT(DISTINCT expr) - we simplify to count
         map(
-            tuple((
+            (
                 tag_no_case("COUNT"),
                 multispace0,
                 char('('),
@@ -1350,12 +1363,12 @@ fn parse_aggregation(input: &str) -> ParseResult<'_, PropertyProjection> {
                 any_identifier,
                 multispace0,
                 char(')'),
-            )),
+            ),
             |_| PropertyProjection::Count,
         ),
         // SUM(variable.property)
         map(
-            tuple((
+            (
                 tag_no_case("SUM"),
                 multispace0,
                 char('('),
@@ -1365,7 +1378,7 @@ fn parse_aggregation(input: &str) -> ParseResult<'_, PropertyProjection> {
                 any_identifier,
                 multispace0,
                 char(')'),
-            )),
+            ),
             |(_, _, _, _, var, _, prop, _, _)| PropertyProjection::Sum {
                 variable: var,
                 property: prop,
@@ -1373,7 +1386,7 @@ fn parse_aggregation(input: &str) -> ParseResult<'_, PropertyProjection> {
         ),
         // AVG(variable.property)
         map(
-            tuple((
+            (
                 tag_no_case("AVG"),
                 multispace0,
                 char('('),
@@ -1383,7 +1396,7 @@ fn parse_aggregation(input: &str) -> ParseResult<'_, PropertyProjection> {
                 any_identifier,
                 multispace0,
                 char(')'),
-            )),
+            ),
             |(_, _, _, _, var, _, prop, _, _)| PropertyProjection::Avg {
                 variable: var,
                 property: prop,
@@ -1391,7 +1404,7 @@ fn parse_aggregation(input: &str) -> ParseResult<'_, PropertyProjection> {
         ),
         // MIN(variable.property)
         map(
-            tuple((
+            (
                 tag_no_case("MIN"),
                 multispace0,
                 char('('),
@@ -1401,7 +1414,7 @@ fn parse_aggregation(input: &str) -> ParseResult<'_, PropertyProjection> {
                 any_identifier,
                 multispace0,
                 char(')'),
-            )),
+            ),
             |(_, _, _, _, var, _, prop, _, _)| PropertyProjection::Min {
                 variable: var,
                 property: prop,
@@ -1409,7 +1422,7 @@ fn parse_aggregation(input: &str) -> ParseResult<'_, PropertyProjection> {
         ),
         // MAX(variable.property)
         map(
-            tuple((
+            (
                 tag_no_case("MAX"),
                 multispace0,
                 char('('),
@@ -1419,13 +1432,14 @@ fn parse_aggregation(input: &str) -> ParseResult<'_, PropertyProjection> {
                 any_identifier,
                 multispace0,
                 char(')'),
-            )),
+            ),
             |(_, _, _, _, var, _, prop, _, _)| PropertyProjection::Max {
                 variable: var,
                 property: prop,
             },
         ),
-    ))(input)
+    ))
+    .parse(input)
 }
 
 /// Parse function call (labels, type, id, etc.)
@@ -1433,7 +1447,7 @@ fn parse_aggregation(input: &str) -> ParseResult<'_, PropertyProjection> {
 fn parse_function_call(input: &str) -> ParseResult<'_, CypherFunction> {
     alt((
         map(
-            tuple((
+            (
                 tag_no_case("labels"),
                 multispace0,
                 char('('),
@@ -1441,11 +1455,11 @@ fn parse_function_call(input: &str) -> ParseResult<'_, CypherFunction> {
                 any_identifier,
                 multispace0,
                 char(')'),
-            )),
+            ),
             |(_, _, _, _, var, _, _)| CypherFunction::Labels(var),
         ),
         map(
-            tuple((
+            (
                 tag_no_case("type"),
                 multispace0,
                 char('('),
@@ -1453,11 +1467,11 @@ fn parse_function_call(input: &str) -> ParseResult<'_, CypherFunction> {
                 any_identifier,
                 multispace0,
                 char(')'),
-            )),
+            ),
             |(_, _, _, _, var, _, _)| CypherFunction::Type(var),
         ),
         map(
-            tuple((
+            (
                 tag_no_case("id"),
                 multispace0,
                 char('('),
@@ -1465,11 +1479,11 @@ fn parse_function_call(input: &str) -> ParseResult<'_, CypherFunction> {
                 any_identifier,
                 multispace0,
                 char(')'),
-            )),
+            ),
             |(_, _, _, _, var, _, _)| CypherFunction::Id(var),
         ),
         map(
-            tuple((
+            (
                 tag_no_case("properties"),
                 multispace0,
                 char('('),
@@ -1477,11 +1491,11 @@ fn parse_function_call(input: &str) -> ParseResult<'_, CypherFunction> {
                 any_identifier,
                 multispace0,
                 char(')'),
-            )),
+            ),
             |(_, _, _, _, var, _, _)| CypherFunction::Properties(var),
         ),
         map(
-            tuple((
+            (
                 tag_no_case("keys"),
                 multispace0,
                 char('('),
@@ -1489,11 +1503,11 @@ fn parse_function_call(input: &str) -> ParseResult<'_, CypherFunction> {
                 any_identifier,
                 multispace0,
                 char(')'),
-            )),
+            ),
             |(_, _, _, _, var, _, _)| CypherFunction::Keys(var),
         ),
         map(
-            tuple((
+            (
                 tag_no_case("exists"),
                 multispace0,
                 char('('),
@@ -1503,11 +1517,11 @@ fn parse_function_call(input: &str) -> ParseResult<'_, CypherFunction> {
                 any_identifier,
                 multispace0,
                 char(')'),
-            )),
+            ),
             |(_, _, _, _, var, _, prop, _, _)| CypherFunction::Exists(var, prop),
         ),
         map(
-            tuple((
+            (
                 tag_no_case("collect"),
                 multispace0,
                 char('('),
@@ -1515,11 +1529,11 @@ fn parse_function_call(input: &str) -> ParseResult<'_, CypherFunction> {
                 any_identifier,
                 multispace0,
                 char(')'),
-            )),
+            ),
             |(_, _, _, _, var, _, _)| CypherFunction::Collect(var),
         ),
         map(
-            tuple((
+            (
                 tag_no_case("collect"),
                 multispace0,
                 char('('),
@@ -1529,10 +1543,11 @@ fn parse_function_call(input: &str) -> ParseResult<'_, CypherFunction> {
                 any_identifier,
                 multispace0,
                 char(')'),
-            )),
+            ),
             |(_, _, _, _, var, _, prop, _, _)| CypherFunction::CollectProperty(var, prop),
         ),
-    ))(input)
+    ))
+    .parse(input)
 }
 
 /// Cypher function types
@@ -1561,13 +1576,13 @@ fn parse_return_item(input: &str) -> ParseResult<'_, (String, PropertyProjection
     alt((
         // Aggregation with alias
         map(
-            tuple((
+            (
                 parse_aggregation,
                 opt(preceded(
                     delimited(multispace1, tag_no_case("AS"), multispace1),
                     any_identifier,
                 )),
-            )),
+            ),
             |(agg, alias)| {
                 let name = alias.unwrap_or_else(|| match &agg {
                     PropertyProjection::Count => "count".to_string(),
@@ -1582,7 +1597,7 @@ fn parse_return_item(input: &str) -> ParseResult<'_, (String, PropertyProjection
         ),
         // Property with alias: n.name AS person_name
         map(
-            tuple((
+            (
                 any_identifier,
                 char('.'),
                 any_identifier,
@@ -1590,7 +1605,7 @@ fn parse_return_item(input: &str) -> ParseResult<'_, (String, PropertyProjection
                     delimited(multispace1, tag_no_case("AS"), multispace1),
                     any_identifier,
                 )),
-            )),
+            ),
             |(var, _, prop, alias)| {
                 let name = alias.unwrap_or_else(|| format!("{}.{}", var, prop));
                 (
@@ -1604,34 +1619,35 @@ fn parse_return_item(input: &str) -> ParseResult<'_, (String, PropertyProjection
         ),
         // Simple variable with alias
         map(
-            tuple((
+            (
                 any_identifier,
                 opt(preceded(
                     delimited(multispace1, tag_no_case("AS"), multispace1),
                     any_identifier,
                 )),
-            )),
+            ),
             |(var, alias)| {
                 let name = alias.unwrap_or_else(|| var.clone());
                 (name, PropertyProjection::Variable(var))
             },
         ),
-    ))(input)
+    ))
+    .parse(input)
 }
 
 /// Parse ORDER BY clause
 fn parse_order_by(input: &str) -> ParseResult<'_, Vec<(String, bool)>> {
     preceded(
-        tuple((
+        (
             tag_no_case("ORDER"),
             multispace1,
             tag_no_case("BY"),
             multispace1,
-        )),
+        ),
         separated_list1(
             delimited(multispace0, char(','), multispace0),
             map(
-                tuple((
+                (
                     any_identifier,
                     opt(preceded(
                         multispace1,
@@ -1640,11 +1656,12 @@ fn parse_order_by(input: &str) -> ParseResult<'_, Vec<(String, bool)>> {
                             value(false, alt((tag_no_case("DESC"), tag_no_case("DESCENDING")))),
                         )),
                     )),
-                )),
+                ),
                 |(var, asc)| (var, asc.unwrap_or(true)),
             ),
         ),
-    )(input)
+    )
+    .parse(input)
 }
 
 /// Parse LIMIT clause
@@ -1652,7 +1669,8 @@ fn parse_limit(input: &str) -> ParseResult<'_, usize> {
     preceded(
         pair(tag_no_case("LIMIT"), multispace1),
         map_res(digit1, |s: &str| s.parse::<usize>()),
-    )(input)
+    )
+    .parse(input)
 }
 
 /// Parse SKIP clause
@@ -1660,13 +1678,14 @@ fn parse_skip(input: &str) -> ParseResult<'_, usize> {
     preceded(
         pair(tag_no_case("SKIP"), multispace1),
         map_res(digit1, |s: &str| s.parse::<usize>()),
-    )(input)
+    )
+    .parse(input)
 }
 
 /// Parse RETURN clause
 fn parse_return_clause(input: &str) -> ParseResult<'_, ReturnSpec> {
     map(
-        tuple((
+        (
             tag_no_case("RETURN"),
             opt(preceded(multispace1, tag_no_case("DISTINCT"))),
             multispace1,
@@ -1677,7 +1696,7 @@ fn parse_return_clause(input: &str) -> ParseResult<'_, ReturnSpec> {
             opt(preceded(multispace1, parse_order_by)),
             opt(preceded(multispace1, parse_skip)),
             opt(preceded(multispace1, parse_limit)),
-        )),
+        ),
         |(_, distinct, _, items, order_by, skip, limit)| {
             let (vars, projections): (Vec<_>, Vec<_>) = items.into_iter().unzip();
             let order_by_strs: Vec<String> = order_by
@@ -1695,7 +1714,8 @@ fn parse_return_clause(input: &str) -> ParseResult<'_, ReturnSpec> {
                 skip,
             }
         },
-    )(input)
+    )
+    .parse(input)
 }
 
 /// Parse MATCH clause
@@ -1724,7 +1744,8 @@ fn parse_match_clause(input: &str) -> ParseResult<'_, (Vec<NodePattern>, Vec<Edg
                 (nodes, edges)
             },
         ),
-    )(input)
+    )
+    .parse(input)
 }
 
 /// Parse CREATE edge spec
@@ -1743,19 +1764,13 @@ fn parse_cypher_query(input: &str) -> ParseResult<'_, CypherQuery> {
                     crate::seam_conversion::seam_query_to_statement(seam_query),
                 ))
             } else {
-                Err(nom::Err::Error(nom::error::VerboseError {
-                    errors: vec![(
-                        remaining,
-                        nom::error::VerboseErrorKind::Nom(nom::error::ErrorKind::Eof),
-                    )],
+                Err(nom::Err::Error(VerboseError {
+                    errors: vec![(remaining, VerboseErrorKind::Nom(nom::error::ErrorKind::Eof))],
                 }))
             }
         }
-        Err(_) => Err(nom::Err::Error(nom::error::VerboseError {
-            errors: vec![(
-                input,
-                nom::error::VerboseErrorKind::Nom(nom::error::ErrorKind::Tag),
-            )],
+        Err(_) => Err(nom::Err::Error(VerboseError {
+            errors: vec![(input, VerboseErrorKind::Nom(nom::error::ErrorKind::Tag))],
         })),
     }
 }
@@ -1763,14 +1778,14 @@ fn parse_cypher_query(input: &str) -> ParseResult<'_, CypherQuery> {
 /// Parse simple MATCH query into CompiledPattern
 fn parse_simple_query(input: &str) -> ParseResult<'_, CompiledPattern> {
     map(
-        tuple((
+        (
             parse_match_clause,
             multispace0,
             opt(parse_where_clause),
             multispace0,
             parse_return_clause,
             multispace0,
-        )),
+        ),
         |((nodes, edges), _, where_opt, _, _return_spec, _)| CompiledPattern {
             nodes,
             edges,
@@ -1779,7 +1794,8 @@ fn parse_simple_query(input: &str) -> ParseResult<'_, CompiledPattern> {
             where_clauses: where_opt.into_iter().collect(),
             with_clauses: vec![],
         },
-    )(input)
+    )
+    .parse(input)
 }
 
 // ============================================================================

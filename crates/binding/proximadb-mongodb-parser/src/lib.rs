@@ -39,12 +39,12 @@ use std::collections::HashMap;
 
 use anyhow::{Context, Result, anyhow};
 use nom::{
-    IResult,
+    IResult, Parser,
     branch::alt,
     bytes::complete::{escaped, tag, take_while1},
     character::complete::{char, digit1, one_of},
     combinator::{opt, recognize, value},
-    sequence::{delimited, pair, tuple},
+    sequence::{delimited, pair},
 };
 use serde_json::Value as JsonValue;
 
@@ -586,7 +586,8 @@ impl MongoDBLexer {
             Self::parse_string,
             Self::parse_number,
             Self::parse_keyword,
-        ))(input)
+        ))
+        .parse(input)
     }
 
     fn parse_structural(input: &str) -> IResult<&str, Token> {
@@ -597,7 +598,8 @@ impl MongoDBLexer {
             value(Token::RightBracket, char(']')),
             value(Token::Colon, char(':')),
             value(Token::Comma, char(',')),
-        ))(input)
+        ))
+        .parse(input)
     }
 
     fn parse_string(input: &str) -> IResult<&str, Token> {
@@ -609,7 +611,8 @@ impl MongoDBLexer {
                 one_of("\"\\nrt"),
             ),
             char('"'),
-        )(input)?;
+        )
+        .parse(input)?;
 
         // Check if this is an operator
         if let Some(op) = MongoOperator::parse_operator(s) {
@@ -620,12 +623,13 @@ impl MongoDBLexer {
     }
 
     fn parse_number(input: &str) -> IResult<&str, Token> {
-        let (remaining, num_str) = recognize(tuple((
+        let (remaining, num_str) = recognize((
             opt(char('-')),
             digit1,
             opt(pair(char('.'), digit1)),
-            opt(tuple((one_of("eE"), opt(one_of("+-")), digit1))),
-        )))(input)?;
+            opt((one_of("eE"), opt(one_of("+-")), digit1)),
+        ))
+        .parse(input)?;
 
         // Try parsing as integer first, then as float
         if let Ok(i) = num_str.parse::<i64>() {
@@ -645,7 +649,8 @@ impl MongoDBLexer {
             value(Token::Boolean(true), tag("true")),
             value(Token::Boolean(false), tag("false")),
             value(Token::Null, tag("null")),
-        ))(input)
+        ))
+        .parse(input)
     }
 }
 
