@@ -769,7 +769,7 @@ moka = { version = "0.12", features = ["future"] }
 # Provides direct buffer access to numpy arrays without Python .tolist() conversion
 # Java bindings via JNI
 # Node.js bindings via NAPI-RS
-proximadb-raptor-common = { version = "0.7.0", path = "crates/storage/proximadb-raptor-common" }
+proximadb-raptor-common = { version = "0.7.0", path = "crates/storage/proximadb-raptor-common", optional = true }
 proximadb-raptor-engine = { version = "0.7.0", path = "crates/storage/proximadb-raptor-engine", optional = true }
 proximadb-engine-core = { version = "0.7.0", path = "crates/storage/proximadb-engine-core" }
 proximadb-mongodb-parser = { version = "0.7.0", path = "crates/binding/proximadb-mongodb-parser" }
@@ -840,7 +840,7 @@ tenant_access = []
 # Experimental storage engines (RAPTOR, SWIFT); disabled by default to prevent
 # server panics from unimplemented code paths. Enable for development/testing only.
 # RAPTOR fundamentally uses AXIS clustering, so this implies `axis`.
-experimental-engines = ["dep:proximadb-raptor-engine", "proximadb-raptor-engine/experimental-engines", "axis"]
+experimental-engines = ["dep:proximadb-raptor-common", "dep:proximadb-raptor-engine", "proximadb-raptor-engine/experimental-engines", "axis"]
 # Experimental transactional Ledger modality (ADR-071 / TD-LEDGER-1): the durable atomic-CAS
 # KV + TTL-lease OLTP surface. Off by default; enables the durable backend + its gRPC service.
 experimental-ledger = ["dep:proximadb-ledger", "proximadb-ledger/durable"]
