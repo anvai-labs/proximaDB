@@ -254,8 +254,8 @@ fn pack_4bit_from_codes(codes: &[u8], dst: &mut [u8]) {
 mod tests {
     use super::super::{codebook::codebook, rotation::make_rotation_matrix};
     use super::*;
-    use rand::{Rng, SeedableRng};
-    use rand_chacha::ChaCha8Rng;
+    use chacha20::ChaCha8Rng;
+    use rand::{RngExt, SeedableRng};
     use rand_distr::StandardNormal;
 
     fn make_rotation(dim: usize, seed: u64) -> Vec<f32> {

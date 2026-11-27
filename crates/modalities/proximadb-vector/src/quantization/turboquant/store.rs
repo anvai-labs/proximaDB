@@ -675,8 +675,8 @@ impl TurboQuantStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand::{Rng, SeedableRng};
-    use rand_chacha::ChaCha8Rng;
+    use chacha20::ChaCha8Rng;
+    use rand::{RngExt, SeedableRng};
     use rand_distr::StandardNormal;
 
     fn random_unit_vectors(n: usize, dim: usize, seed: u64) -> Vec<f32> {

@@ -33,8 +33,8 @@
 //! be unit-tested in isolation. Multi-tenant collections must use
 //! different seeds — see LLD §"Locked Type Signatures" + Q3.
 
-use rand::{Rng, SeedableRng};
-use rand_chacha::ChaCha8Rng;
+use chacha20::ChaCha8Rng;
+use rand::{RngExt, SeedableRng};
 use rand_distr::StandardNormal;
 
 /// Generate an `n x n` orthogonal matrix deterministically from `seed`.
@@ -203,6 +203,18 @@ mod tests {
         for (i, (&av, &bv)) in a.iter().zip(b.iter()).enumerate() {
             assert_eq!(av.to_bits(), bv.to_bits(), "mismatch at index {i}");
         }
+    }
+
+    #[test]
+    fn rotation_matches_persisted_seed_fixture() {
+        // Captured with rand_chacha 0.3 and rand_distr 0.4, which produced
+        // rotations for indexes that still reconstruct the matrix from its seed.
+        let expected = [
+            0x3eaad01b, 0x3eee4e27, 0xbf51de17, 0x3f6e5fb6, 0xbe98d06c, 0x3e568208, 0xbe16b645,
+            0xbf554f08, 0xbf087089,
+        ];
+        let actual = make_rotation_matrix(3, 42);
+        assert!(actual.iter().map(|value| value.to_bits()).eq(expected));
     }
 
     #[test]

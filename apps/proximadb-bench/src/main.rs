@@ -39,8 +39,7 @@ use proximadb::storage::engines::core::formats::proximablocks::{
 use proximadb::storage::engines::core::ops::proximacodec::{
     ProximaCodec, analysis, types::ProximaScheme,
 };
-use rand::prelude::*;
-use rand::{Rng, thread_rng};
+use rand::{RngExt, rng, rngs::ThreadRng};
 
 #[derive(Parser)]
 #[command(name = "proximadb-bench")]
@@ -911,7 +910,7 @@ fn generate_test_vectors_for_encoding(num_vectors: usize, dimension: usize) -> V
     // Random projections, Clustered topics, Time series, Dense normalized,
     // High-frequency audio, Power-law distributions, Binary LSH, Exponential decay
     // This represents production ML embeddings better than synthetic random data
-    let mut rng = thread_rng();
+    let mut rng = rng();
     let num_patterns = 12;
     let chunk_size = dimension / num_patterns;
 
@@ -921,52 +920,52 @@ fn generate_test_vectors_for_encoding(num_vectors: usize, dimension: usize) -> V
 
             // Pattern 1: Sparse (70% zeros) - Common in NLP embeddings (BERT, Word2Vec)
             for _ in 0..chunk_size {
-                vec.push(if rng.gen_bool(0.7) { 0.0 } else { rng.gen_range(-1.0..1.0) });
+                vec.push(if rng.random_bool(0.7) { 0.0 } else { rng.random_range(-1.0..1.0) });
             }
 
             // Pattern 2: Gaussian - Neural network activations (standard normal)
             for _ in 0..chunk_size {
-                let u1: f32 = rng.gen_range(0.001..1.0);
-                let u2: f32 = rng.gen_range(0.0..1.0);
+                let u1: f32 = rng.random_range(0.001..1.0);
+                let u2: f32 = rng.random_range(0.0..1.0);
                 let gaussian = ((-2.0f32 * u1.ln()).sqrt() * (2.0f32 * std::f32::consts::PI * u2).cos()) * 0.3f32;
                 vec.push(gaussian.clamp(-1.0, 1.0));
             }
 
             // Pattern 3: Quantized - Post-quantization (16 discrete levels)
             for _ in 0..chunk_size {
-                let level = rng.gen_range(0..16);
+                let level = rng.random_range(0..16);
                 vec.push(-1.0 + level as f32 * (2.0 / 15.0));
             }
 
             // Pattern 4: Sinusoidal - Positional encodings (transformers, Fourier features)
             let phase = v as f32 * 0.1;
             for d in 0..chunk_size {
-                vec.push(((d as f32 * 0.2 + phase).sin() * 0.5) + rng.gen_range(-0.05..0.05));
+                vec.push(((d as f32 * 0.2 + phase).sin() * 0.5) + rng.random_range(-0.05..0.05));
             }
 
             // Pattern 5: Random Uniform - Unstructured data, random projections
             for _ in 0..chunk_size {
-                vec.push(rng.gen_range(-1.0..1.0));
+                vec.push(rng.random_range(-1.0..1.0));
             }
 
             // Pattern 6: Clustered - K-means centers, topic models (3 clusters)
-            let cluster = rng.gen_range(0..3);
+            let cluster = rng.random_range(0..3);
             let centers = [0.6, 0.0, -0.6];
             for _ in 0..chunk_size {
-                vec.push(centers[cluster] + rng.gen_range(-0.2..0.2));
+                vec.push(centers[cluster] + rng.random_range(-0.2..0.2));
             }
 
             // Pattern 7: Time Series - Sequential data with trend and seasonality
             let trend = (v as f32 / num_vectors as f32) * 0.5;
             for d in 0..chunk_size {
                 let seasonal = (d as f32 / 10.0).sin() * 0.3;
-                vec.push(trend + seasonal + rng.gen_range(-0.1..0.1));
+                vec.push(trend + seasonal + rng.random_range(-0.1..0.1));
             }
 
             // Pattern 8: Normalized Dense - Uniformly distributed on unit sphere
             for _ in 0..chunk_size {
-                let u1: f32 = rng.gen_range(0.001..1.0);
-                let u2: f32 = rng.gen_range(0.0..1.0);
+                let u1: f32 = rng.random_range(0.001..1.0);
+                let u2: f32 = rng.random_range(0.0..1.0);
                 let val = ((-2.0f32 * u1.ln()).sqrt() * (2.0f32 * std::f32::consts::PI * u2).cos());
                 vec.push(val.clamp(-2.0, 2.0));
             }
@@ -980,26 +979,26 @@ fn generate_test_vectors_for_encoding(num_vectors: usize, dimension: usize) -> V
 
             // Pattern 10: Power-Law Distribution - Social networks, natural phenomena
             for _ in 0..chunk_size {
-                let uniform: f32 = rng.gen_range(0.001..1.0);
+                let uniform: f32 = rng.random_range(0.001..1.0);
                 let power_law = uniform.powf(-0.5); // Power law exponent
-                vec.push((power_law / 10.0).clamp(-1.0, 1.0) * if rng.gen_bool(0.5) { 1.0 } else { -1.0 });
+                vec.push((power_law / 10.0).clamp(-1.0, 1.0) * if rng.random_bool(0.5) { 1.0 } else { -1.0 });
             }
 
             // Pattern 11: Binary/Bipolar - Hash-based embeddings, locality-sensitive hashing
             for _ in 0..chunk_size {
-                vec.push(if rng.gen_bool(0.5) { 1.0 } else { -1.0 });
+                vec.push(if rng.random_bool(0.5) { 1.0 } else { -1.0 });
             }
 
             // Pattern 12: Exponential Decay - Attention weights, recency bias
             for d in 0..chunk_size {
-                let decay = (-(d as f32) / 10.0).exp() * rng.gen_range(0.5..1.0);
-                vec.push(decay * if rng.gen_bool(0.5) { 1.0 } else { -1.0 });
+                let decay = (-(d as f32) / 10.0).exp() * rng.random_range(0.5..1.0);
+                vec.push(decay * if rng.random_bool(0.5) { 1.0 } else { -1.0 });
             }
 
             // Fill remaining dimensions if dimension % 12 != 0
             let remaining = dimension - (chunk_size * num_patterns);
             for _ in 0..remaining {
-                vec.push(rng.gen_range(-1.0..1.0));
+                vec.push(rng.random_range(-1.0..1.0));
             }
 
             // Normalize to unit length (common for cosine similarity)
@@ -1377,10 +1376,7 @@ struct EmbeddingGenerator {
 
 impl EmbeddingGenerator {
     fn new(model: EmbeddingModel) -> Self {
-        Self {
-            model,
-            rng: thread_rng(),
-        }
+        Self { model, rng: rng() }
     }
 
     fn generate(&mut self, dimension: usize) -> Vec<f32> {
@@ -1399,8 +1395,8 @@ impl EmbeddingGenerator {
     fn generate_bert_embedding(&mut self, dimension: usize) -> Vec<f32> {
         let mut embedding: Vec<f32> = (0..dimension)
             .map(|_| {
-                let u1: f32 = self.rng.gen_range(0.0001..1.0);
-                let u2: f32 = self.rng.gen_range(0.0..1.0);
+                let u1: f32 = self.rng.random_range(0.0001..1.0);
+                let u2: f32 = self.rng.random_range(0.0..1.0);
                 let val =
                     (-2.0f32 * u1.ln()).sqrt() * (2.0 * std::f32::consts::PI * u2).cos() * 1.5;
                 val.max(-5.0).min(5.0)
@@ -1419,8 +1415,8 @@ impl EmbeddingGenerator {
     fn generate_openai_embedding(&mut self, dimension: usize) -> Vec<f32> {
         (0..dimension)
             .map(|_| {
-                let base = self.rng.gen_range(-0.5..2.0);
-                let noise = self.rng.gen_range(-0.1..0.1);
+                let base = self.rng.random_range(-0.5..2.0);
+                let noise = self.rng.random_range(-0.1..0.1);
                 ((base + noise) as f32).max(-1.0).min(3.0)
             })
             .collect()
@@ -1428,7 +1424,7 @@ impl EmbeddingGenerator {
 
     fn generate_normalized_embedding(&mut self, dimension: usize) -> Vec<f32> {
         let mut vec: Vec<f32> = (0..dimension)
-            .map(|_| self.rng.gen_range(-1.0..1.0))
+            .map(|_| self.rng.random_range(-1.0..1.0))
             .collect();
 
         let norm = vec.iter().map(|x| x * x).sum::<f32>().sqrt();
@@ -1440,7 +1436,7 @@ impl EmbeddingGenerator {
 
     fn generate_random_uniform(&mut self, dimension: usize) -> Vec<f32> {
         (0..dimension)
-            .map(|_| self.rng.gen_range(-1.0..1.0))
+            .map(|_| self.rng.random_range(-1.0..1.0))
             .collect()
     }
 }
@@ -3940,7 +3936,7 @@ fn generate_test_vectors_for_encoding_2(num_vectors: usize, dimension: usize) ->
     // Comprehensive pattern mix covering all realistic embedding scenarios
     // 12 equal patterns: sparse, gaussian, quantized, sinusoidal, random, clustered,
     // time-series, normalized-dense, high-freq, power-law, binary, exponential
-    let mut rng = thread_rng();
+    let mut rng = rng();
     let num_patterns = 12;
     let chunk_size = dimension / num_patterns;
 
@@ -3950,17 +3946,17 @@ fn generate_test_vectors_for_encoding_2(num_vectors: usize, dimension: usize) ->
 
             // Pattern 1: Sparse (70% zeros) - Common in NLP embeddings (BERT, Word2Vec)
             for _ in 0..chunk_size {
-                vec.push(if rng.gen_bool(0.7) {
+                vec.push(if rng.random_bool(0.7) {
                     0.0
                 } else {
-                    rng.gen_range(-1.0..1.0)
+                    rng.random_range(-1.0..1.0)
                 });
             }
 
             // Pattern 2: Gaussian - Neural network activations (standard normal)
             for _ in 0..chunk_size {
-                let u1: f32 = rng.gen_range(0.001..1.0);
-                let u2: f32 = rng.gen_range(0.0..1.0);
+                let u1: f32 = rng.random_range(0.001..1.0);
+                let u2: f32 = rng.random_range(0.0..1.0);
                 let gaussian = ((-2.0f32 * u1.ln()).sqrt()
                     * (2.0f32 * std::f32::consts::PI * u2).cos())
                     * 0.3f32;
@@ -3969,39 +3965,39 @@ fn generate_test_vectors_for_encoding_2(num_vectors: usize, dimension: usize) ->
 
             // Pattern 3: Quantized - Post-quantization (16 discrete levels)
             for _ in 0..chunk_size {
-                let level = rng.gen_range(0..16);
+                let level = rng.random_range(0..16);
                 vec.push(-1.0 + level as f32 * (2.0 / 15.0));
             }
 
             // Pattern 4: Sinusoidal - Positional encodings (transformers, Fourier features)
             let phase = v as f32 * 0.1;
             for d in 0..chunk_size {
-                vec.push(((d as f32 * 0.2 + phase).sin() * 0.5) + rng.gen_range(-0.05..0.05));
+                vec.push(((d as f32 * 0.2 + phase).sin() * 0.5) + rng.random_range(-0.05..0.05));
             }
 
             // Pattern 5: Random Uniform - Unstructured data, random projections
             for _ in 0..chunk_size {
-                vec.push(rng.gen_range(-1.0..1.0));
+                vec.push(rng.random_range(-1.0..1.0));
             }
 
             // Pattern 6: Clustered - K-means centers, topic models (3 clusters)
-            let cluster = rng.gen_range(0..3);
+            let cluster = rng.random_range(0..3);
             let centers = [0.6, 0.0, -0.6];
             for _ in 0..chunk_size {
-                vec.push(centers[cluster] + rng.gen_range(-0.2..0.2));
+                vec.push(centers[cluster] + rng.random_range(-0.2..0.2));
             }
 
             // Pattern 7: Time Series - Sequential data with trend and seasonality
             let trend = (v as f32 / num_vectors as f32) * 0.5;
             for d in 0..chunk_size {
                 let seasonal = (d as f32 / 10.0).sin() * 0.3;
-                vec.push(trend + seasonal + rng.gen_range(-0.1..0.1));
+                vec.push(trend + seasonal + rng.random_range(-0.1..0.1));
             }
 
             // Pattern 8: Normalized Dense - Uniformly distributed on unit sphere
             for _ in 0..chunk_size {
-                let u1: f32 = rng.gen_range(0.001..1.0);
-                let u2: f32 = rng.gen_range(0.0..1.0);
+                let u1: f32 = rng.random_range(0.001..1.0);
+                let u2: f32 = rng.random_range(0.0..1.0);
                 let val = (-2.0f32 * u1.ln()).sqrt() * (2.0f32 * std::f32::consts::PI * u2).cos();
                 vec.push(val.clamp(-2.0, 2.0));
             }
@@ -4015,29 +4011,29 @@ fn generate_test_vectors_for_encoding_2(num_vectors: usize, dimension: usize) ->
 
             // Pattern 10: Power-Law Distribution - Social networks, natural phenomena
             for _ in 0..chunk_size {
-                let uniform: f32 = rng.gen_range(0.001..1.0);
+                let uniform: f32 = rng.random_range(0.001..1.0);
                 let power_law = uniform.powf(-0.5); // Power law exponent
                 vec.push(
                     (power_law / 10.0).clamp(-1.0, 1.0)
-                        * if rng.gen_bool(0.5) { 1.0 } else { -1.0 },
+                        * if rng.random_bool(0.5) { 1.0 } else { -1.0 },
                 );
             }
 
             // Pattern 11: Binary/Bipolar - Hash-based embeddings, locality-sensitive hashing
             for _ in 0..chunk_size {
-                vec.push(if rng.gen_bool(0.5) { 1.0 } else { -1.0 });
+                vec.push(if rng.random_bool(0.5) { 1.0 } else { -1.0 });
             }
 
             // Pattern 12: Exponential Decay - Attention weights, recency bias
             for d in 0..chunk_size {
-                let decay = (-(d as f32) / 10.0).exp() * rng.gen_range(0.5..1.0);
-                vec.push(decay * if rng.gen_bool(0.5) { 1.0 } else { -1.0 });
+                let decay = (-(d as f32) / 10.0).exp() * rng.random_range(0.5..1.0);
+                vec.push(decay * if rng.random_bool(0.5) { 1.0 } else { -1.0 });
             }
 
             // Fill remaining dimensions if dimension % 12 != 0
             let remaining = dimension - (chunk_size * num_patterns);
             for _ in 0..remaining {
-                vec.push(rng.gen_range(-1.0..1.0));
+                vec.push(rng.random_range(-1.0..1.0));
             }
 
             // Normalize to unit length (common for cosine similarity)
@@ -4594,11 +4590,11 @@ fn benchmark_compression_algorithms(vector_count: usize, dimension: usize) -> Re
     println!("{}", "=".repeat(80));
 
     // Generate test data
-    let mut rng = rand::thread_rng();
+    let mut rng = rng();
     let records: Vec<VectorRecord> = (0..vector_count)
         .map(|i| VectorRecord {
             id: format!("vec_{}", i),
-            vector: (0..dimension).map(|_| rng.gen_range(0.0..1.0)).collect(),
+            vector: (0..dimension).map(|_| rng.random_range(0.0..1.0)).collect(),
             metadata: HashMap::new(),
             timestamp: Some(i as i64),
             updated_at: Some(i as i64),
@@ -5252,7 +5248,7 @@ fn benchmark_simd_encoding_schemes(
 /// - Original patterns: sequential, normalized, sparse, random, constant
 /// - New patterns: quantized, gaussian, power_law, near_constant_outliers, bimodal, exponential, extreme_sparse
 fn generate_pattern_data(pattern: &str, count: usize, _dimension: usize) -> Vec<f32> {
-    let mut rng = thread_rng();
+    let mut rng = rng();
 
     match pattern {
         // ===== ORIGINAL PATTERNS =====
@@ -5273,12 +5269,11 @@ fn generate_pattern_data(pattern: &str, count: usize, _dimension: usize) -> Vec<
             // Real-world: Sparse vectors, bag-of-words (moderate sparsity)
             (0..count)
                 .map(|_| {
-                    use rand::Rng as _;
-                    let rand_val: f32 = rng.gen_range(0.0..1.0);
+                    let rand_val: f32 = rng.random_range(0.0..1.0);
                     if rand_val < 0.8 {
                         0.0
                     } else {
-                        rng.gen_range(0.0..10.0)
+                        rng.random_range(0.0..10.0)
                     }
                 })
                 .collect()
@@ -5291,8 +5286,7 @@ fn generate_pattern_data(pattern: &str, count: usize, _dimension: usize) -> Vec<
         "random" => {
             // Random data (tests general-purpose schemes)
             // Real-world: Unstructured data, noise
-            use rand::Rng as _;
-            (0..count).map(|_| rng.gen_range(0.0..1000.0)).collect()
+            (0..count).map(|_| rng.random_range(0.0..1000.0)).collect()
         }
 
         // ===== NEW CRITICAL PATTERNS (50-80% of production data!) =====
@@ -5300,10 +5294,9 @@ fn generate_pattern_data(pattern: &str, count: usize, _dimension: usize) -> Vec<
             // Quantized values: 8 discrete levels (INT8 → f32)
             // Real-world: 50-60% of production systems (OpenAI, Cohere, Anthropic)
             // Post-quantization vectors stored as f32 with limited precision
-            use rand::Rng as _;
             (0..count)
                 .map(|_| {
-                    let level = rng.gen_range(0..8);
+                    let level = rng.random_range(0..8);
                     (level as f32 - 3.5) / 3.5 // Maps to [-1.0, -0.71, -0.43, -0.14, 0.14, 0.43, 0.71, 1.0]
                 })
                 .collect()
@@ -5343,13 +5336,12 @@ fn generate_pattern_data(pattern: &str, count: usize, _dimension: usize) -> Vec<
             // Near-constant with 5% outliers
             // Real-world: 20-30% of pruned models, masked tokens
             // Sparse activations in quantized/pruned networks
-            use rand::Rng;
             (0..count)
                 .map(|_| {
-                    if Rng::r#gen::<f32>(&mut rng) < 0.95 {
+                    if rng.random::<f32>() < 0.95 {
                         0.0 // 95% baseline constant
                     } else {
-                        rng.gen_range(0.0..1.0) // 5% outliers
+                        rng.random_range(0.0..1.0) // 5% outliers
                     }
                 })
                 .collect()
@@ -5360,13 +5352,12 @@ fn generate_pattern_data(pattern: &str, count: usize, _dimension: usize) -> Vec<
             // Bimodal distribution: Two distinct clusters
             // Real-world: 40-60% of recommendation systems
             // Engaged vs. non-engaged users, technical vs. casual content
-            use rand::Rng;
             (0..count)
                 .map(|_| {
-                    if Rng::r#gen::<bool>(&mut rng) {
-                        rng.gen_range(0.0..0.3) // Cluster 1: Low engagement
+                    if rng.random::<bool>() {
+                        rng.random_range(0.0..0.3) // Cluster 1: Low engagement
                     } else {
-                        rng.gen_range(0.7..1.0) // Cluster 2: High engagement
+                        rng.random_range(0.7..1.0) // Cluster 2: High engagement
                     }
                 })
                 .collect()
@@ -5388,12 +5379,11 @@ fn generate_pattern_data(pattern: &str, count: usize, _dimension: usize) -> Vec<
             // Extreme sparsity: 99.5% zeros
             // Real-world: 10-15% of hybrid systems
             // TF-IDF sparse vectors, one-hot encodings, SPLADE
-            use rand::Rng;
             (0..count)
                 .map(|_| {
-                    if Rng::r#gen::<f32>(&mut rng) < 0.005 {
+                    if rng.random::<f32>() < 0.005 {
                         // 0.5% non-zero
-                        rng.gen_range(0.0..1.0)
+                        rng.random_range(0.0..1.0)
                     } else {
                         0.0
                     }
@@ -5405,11 +5395,10 @@ fn generate_pattern_data(pattern: &str, count: usize, _dimension: usize) -> Vec<
             // Correlated dimensions: Adjacent values are related
             // Real-world: 40% of PCA/autoencoder outputs
             // Dimensionality reduction, latent space representations
-            use rand::Rng as _;
             let mut values = Vec::with_capacity(count);
             let mut prev: f32 = 0.5;
             for _ in 0..count {
-                let noise: f32 = rng.gen_range(-0.05..0.05);
+                let noise: f32 = rng.random_range(-0.05..0.05);
                 let val: f32 = (prev + noise).clamp(0.0, 1.0);
                 values.push(val);
                 prev = val * 0.9 + 0.5 * 0.1; // Smooth toward mean
@@ -5432,9 +5421,6 @@ fn generate_pattern_data(pattern: &str, count: usize, _dimension: usize) -> Vec<
         }
 
         // Default fallback
-        _ => {
-            use rand::Rng as _;
-            (0..count).map(|_| rng.gen_range(0.0..1000.0)).collect()
-        }
+        _ => (0..count).map(|_| rng.random_range(0.0..1000.0)).collect(),
     }
 }

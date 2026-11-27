@@ -120,8 +120,8 @@ mod tests {
         rotation::make_rotation_matrix,
     };
     use super::*;
-    use rand::{Rng, SeedableRng};
-    use rand_chacha::ChaCha8Rng;
+    use chacha20::ChaCha8Rng;
+    use rand::{RngExt, SeedableRng};
     use rand_distr::StandardNormal;
 
     /// Generate `n` random unit-norm vectors at dim `dim` with the given
