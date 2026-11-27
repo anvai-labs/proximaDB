@@ -6,7 +6,6 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-homepage = "https://github.com/anvai-labs/proximaDB"
 description = "ProximaDB schema migration tool"
 
 [[bin]]
@@ -20,3 +19,6 @@ proximadb = { path = "../../", default-features = false }
 tokio.workspace = true
 tracing = "0.1"
 tracing-subscriber = "0.3"
+
+[lints]
+workspace = true

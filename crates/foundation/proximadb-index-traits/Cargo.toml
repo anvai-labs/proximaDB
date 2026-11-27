@@ -6,7 +6,6 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-homepage.workspace = true
 description = "Segregated index role traits (ISP) + slim storage-facing query DTO for the storage↔index (AXIS) DIP boundary — foundation layer; AxisManager implements these at the boundary"
 
 [lib]
@@ -21,3 +20,6 @@ serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 proximadb-records.workspace = true
 proximadb-index-types.workspace = true
+
+[lints]
+workspace = true

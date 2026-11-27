@@ -6,7 +6,6 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-homepage.workspace = true
 description = "Usage/metering event types (TD-DECOMP-36)"
 
 [lib]
@@ -19,3 +18,6 @@ serde_json.workspace = true
 tracing.workspace = true
 sandhi-core = "0.14"
 chrono.workspace = true
+
+[lints]
+workspace = true

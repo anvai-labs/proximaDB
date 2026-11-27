@@ -6,7 +6,6 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-homepage.workspace = true
 description = "Batch-group cache tier for stream-based RAG query batching (CALL arXiv 2509.18670) — extracted from root query/cache (TD-DECOMP-25)"
 
 [lib]
@@ -15,3 +14,6 @@ path = "src/lib.rs"
 
 [dependencies]
 tokio.workspace = true
+
+[lints]
+workspace = true

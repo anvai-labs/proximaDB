@@ -6,7 +6,6 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-homepage.workspace = true
 description = "SQL → LogicalNode frontend for ProximaDB's relational query path (ADR-019 L1/S5a)"
 
 [lib]
@@ -22,3 +21,6 @@ proximadb-functions = { workspace = true }
 sqlparser = { workspace = true }
 serde.workspace = true
 thiserror.workspace = true
+
+[lints]
+workspace = true

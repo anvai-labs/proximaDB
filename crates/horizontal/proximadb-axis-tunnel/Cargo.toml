@@ -6,7 +6,6 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-homepage.workspace = true
 description = "AXIS tunnel routing primitive — extracted from root index/axis (TD-DECOMP-30)"
 
 [lib]
@@ -14,3 +13,6 @@ name = "proximadb_axis_tunnel"
 path = "src/lib.rs"
 
 [dependencies]
+
+[lints]
+workspace = true

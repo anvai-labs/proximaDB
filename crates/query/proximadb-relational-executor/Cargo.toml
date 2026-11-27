@@ -6,7 +6,6 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-homepage.workspace = true
 description = "Volcano-style executor for ProximaDB's relational query path (ADR-019 L4/S3)"
 
 [lib]
@@ -27,3 +26,6 @@ thiserror.workspace = true
 
 [dev-dependencies]
 tokio = { version = "1.37", features = ["full"] }
+
+[lints]
+workspace = true

@@ -6,7 +6,6 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-homepage.workspace = true
 description = "Logical algebra (Scan/Filter/Project/Join/Aggregate/Sort/Limit/Distinct/Union) over ProximaDB relational types — ADR-019 L2"
 
 [lib]
@@ -18,3 +17,6 @@ proximadb-data-model = { workspace = true }
 proximadb-relational-types = { workspace = true }
 serde.workspace = true
 thiserror.workspace = true
+
+[lints]
+workspace = true

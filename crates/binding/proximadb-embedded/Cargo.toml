@@ -6,7 +6,6 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-homepage.workspace = true
 description = "Embedded mode for ProximaDB — in-process database with language bindings (Python/Java/Node.js/C-FFI). Separate artifact from the server binary."
 
 [lib]

@@ -6,7 +6,6 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-homepage.workspace = true
 description = "Generation-fenced local-WAL implementation of the ConditionalKeyStore contract (ADR-072 D5, F1b) — the hot, correctness-carrying default"
 
 [lib]

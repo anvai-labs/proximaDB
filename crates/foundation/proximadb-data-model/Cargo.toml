@@ -6,7 +6,6 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-homepage.workspace = true
 description = "Shared ProximaDB data model discriminator contracts"
 
 [lib]
@@ -22,3 +21,6 @@ rmp-serde = "1.1"
 proximadb-proto.workspace = true
 proximadb-interner.workspace = true
 prost-types.workspace = true
+
+[lints]
+workspace = true

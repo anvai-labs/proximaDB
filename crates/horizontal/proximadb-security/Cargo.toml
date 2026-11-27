@@ -6,7 +6,6 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-homepage.workspace = true
 description = "Shared security, audit, and policy contracts for ProximaDB"
 
 [lib]
@@ -23,3 +22,6 @@ serde_json.workspace = true
 ring = "0.17"
 base64 = "0.22"
 thiserror.workspace = true
+
+[lints]
+workspace = true

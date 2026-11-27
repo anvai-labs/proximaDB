@@ -6,7 +6,6 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-homepage.workspace = true
 description = "Decoupled object-storage plumbing (object_store factory + I/O helpers) for the ProximaDB warehouse base tier"
 
 [lib]
@@ -35,3 +34,6 @@ gcp = ["object_store/gcp"]
 async-trait.workspace = true
 tempfile.workspace = true
 tokio = { version = "1.37", features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true

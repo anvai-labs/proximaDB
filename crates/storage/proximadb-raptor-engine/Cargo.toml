@@ -6,7 +6,6 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-homepage.workspace = true
 description = "RAPTOR engine — consolidated reader (the first raptor leaf moved out of the root crate); depends on proximadb-raptor-common downward. Root-crate decomposition (engines extraction)."
 
 [lib]

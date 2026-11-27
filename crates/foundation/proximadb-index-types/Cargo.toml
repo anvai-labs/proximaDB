@@ -6,7 +6,6 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-homepage.workspace = true
 description = "Pure AXIS index configuration/algorithm types (IndexAlgorithm, AxisConfig, IndexSpecification, ...) — foundation layer shared by storage, index, and query planning"
 
 [lib]
@@ -18,3 +17,6 @@ serde = { workspace = true, features = ["derive"] }
 
 [dev-dependencies]
 serde_json.workspace = true
+
+[lints]
+workspace = true

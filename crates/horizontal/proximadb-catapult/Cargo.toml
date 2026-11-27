@@ -6,7 +6,6 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-homepage.workspace = true
 description = "Catapult shortcut-edge optimization for graph ANN search (CatapultDB arXiv 2603.02164) — extracted from root graph/ (TD-DECOMP-28)"
 
 [lib]
@@ -15,3 +14,6 @@ path = "src/lib.rs"
 
 [dependencies]
 tokio.workspace = true
+
+[lints]
+workspace = true

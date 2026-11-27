@@ -6,7 +6,6 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-homepage = "https://github.com/anvai-labs/proximaDB"
 description = "Shared ProximaDB document modality contracts and full-text search primitives"
 
 [lib]
@@ -15,7 +14,6 @@ path = "src/lib.rs"
 
 [dependencies]
 anyhow.workspace = true
-arrow.workspace = true
 async-trait.workspace = true
 proximadb-data-model = { path = "../../foundation/proximadb-data-model" }
 proximadb-kernel = { path = "../../foundation/proximadb-kernel" }
@@ -30,3 +28,6 @@ tracing = "0.1"
 [dev-dependencies]
 proximadb-records = { path = "../../foundation/proximadb-records", features = ["test-support"] }
 tokio = { version = "1.37", features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true

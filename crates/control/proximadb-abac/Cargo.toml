@@ -6,7 +6,6 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-homepage.workspace = true
 description = "ABAC enforcement substrate (TD-FOUNDATION-3 preconditions P1/P3/P4): attribute authority, subject+epoch cache keying, and the non-optional read context"
 
 [lib]
@@ -23,3 +22,6 @@ thiserror.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true
+
+[lints]
+workspace = true

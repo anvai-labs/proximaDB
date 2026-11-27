@@ -6,7 +6,6 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-homepage.workspace = true
 description = "Arrow block secondary index (ArrowBlockIndex + ArrowIndexEntry) — extracted from root storage arrow_block (TD-DECOMP-58)"
 
 [lib]
@@ -15,5 +14,7 @@ path = "src/lib.rs"
 
 [dependencies]
 serde = { workspace = true }
-bytes = "1.5"
 bincode = { workspace = true }
+
+[lints]
+workspace = true

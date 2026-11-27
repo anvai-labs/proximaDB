@@ -6,7 +6,6 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-homepage.workspace = true
 description = "HTTP middleware (CORS, rate-limiting) — extracted from root network/middleware (TD-DECOMP-22)"
 
 [lib]
@@ -21,7 +20,12 @@ serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 thiserror.workspace = true
-toml.workspace = true
 tower-http = { workspace = true, features = ["timeout"] }
 tower = { workspace = true }
 tracing.workspace = true
+
+[dev-dependencies]
+toml.workspace = true
+
+[lints]
+workspace = true

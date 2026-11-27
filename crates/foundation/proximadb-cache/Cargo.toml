@@ -6,7 +6,6 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-homepage.workspace = true
 description = "Multitenant, byte-budgeted, cache-aware primitive (TenantCache) for ProximaDB"
 
 [lib]
@@ -25,3 +24,6 @@ tokio.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+
+[lints]
+workspace = true

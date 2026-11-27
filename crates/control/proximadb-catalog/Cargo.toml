@@ -6,7 +6,6 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-homepage.workspace = true
 description = "xCatalog contract types shared by catalog, query, API, and storage layers"
 
 [lib]
@@ -106,3 +105,6 @@ proximadb-storage-common = { workspace = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 tokio = { version = "1.37", features = ["full", "test-util"] }
+
+[lints]
+workspace = true

@@ -6,7 +6,6 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-homepage.workspace = true
 description = "Query cache policy utilities (per-category policy, mismatch cost, category classifier, result cache gate) — extracted from root query/cache (TD-DECOMP-29)"
 
 [lib]
@@ -21,3 +20,6 @@ arrow.workspace = true
 dashmap.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
+
+[lints]
+workspace = true

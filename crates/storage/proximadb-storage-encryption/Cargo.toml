@@ -6,7 +6,6 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-homepage.workspace = true
 description = "Encryption-at-rest for ProximaDB: AES-256-GCM data/WAL encryption, HKDF key derivation/rotation, and a transparent encrypting FileSystem decorator"
 
 [lib]
@@ -25,8 +24,10 @@ rand.workspace = true
 rayon.workspace = true
 serde.workspace = true
 sha2 = "0.11"
-tokio.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
 
 [lints]
 workspace = true

@@ -6,7 +6,6 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-homepage.workspace = true
 description = "Shared ProximaDB multimodel logical plan and planner support"
 
 [lib]
@@ -23,3 +22,6 @@ uuid = { version = "1", features = ["v4"] }
 proximadb-data-model = { path = "../../foundation/proximadb-data-model" }
 proximadb-filter-expression = { path = "../../foundation/proximadb-filter-expression" }
 proximadb-pipeline-operator = { path = "../../foundation/proximadb-pipeline-operator" }
+
+[lints]
+workspace = true

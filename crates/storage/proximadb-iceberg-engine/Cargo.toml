@@ -6,7 +6,6 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-homepage.workspace = true
 description = "Object-store ObjectStoreBridge implementation (Parquet/Iceberg base tier) for the ProximaDB warehouse (F2)"
 
 [lib]
@@ -51,3 +50,6 @@ tokio = { version = "1.37", features = ["macros", "rt-multi-thread", "sync", "ti
 # Test-only: name `ProximaType` when building a catalog-authoritative schema for
 # the schema-explicit write test.
 proximadb-data-model = { workspace = true }
+
+[lints]
+workspace = true

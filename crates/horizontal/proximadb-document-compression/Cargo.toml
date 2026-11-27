@@ -6,7 +6,6 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-homepage.workspace = true
 description = "Document field compression (DocumentCompressor — per-field codec selection) — extracted from root storage/document (TD-DECOMP-56)"
 
 [lib]
@@ -16,3 +15,6 @@ path = "src/lib.rs"
 [dependencies]
 anyhow = { workspace = true }
 lz4_flex = { workspace = true }
+
+[lints]
+workspace = true

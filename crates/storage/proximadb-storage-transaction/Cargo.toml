@@ -6,7 +6,6 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-homepage.workspace = true
 description = "Multi-model ACID transaction coordinator (manager, contexts, isolation levels, operations, log) for ProximaDB"
 
 [lib]

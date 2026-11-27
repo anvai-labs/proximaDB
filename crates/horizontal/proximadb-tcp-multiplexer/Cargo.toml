@@ -6,7 +6,6 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-homepage.workspace = true
 description = "TCP port multiplexer (serves REST + gRPC + Arrow Flight from one port via protocol sniffing) — extracted from root network/multiplex (TD-DECOMP-46)"
 
 [lib]
@@ -16,3 +15,6 @@ path = "src/lib.rs"
 [dependencies]
 tokio = { workspace = true }
 tracing = { workspace = true }
+
+[lints]
+workspace = true

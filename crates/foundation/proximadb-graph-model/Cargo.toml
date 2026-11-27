@@ -6,7 +6,6 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-homepage.workspace = true
 description = "Foundation graph domain model + proto conversions: Node, Edge, PropertyValue, TraversalRequest/Response, and the From<proto> boundary conversions"
 
 [lib]

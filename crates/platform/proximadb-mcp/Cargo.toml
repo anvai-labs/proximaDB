@@ -6,7 +6,6 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-homepage.workspace = true
 description = "ProximaDB reference MCP surface (OSS, unprivileged) — projects existing engine affordances (the agent-facing catalog reference-MCP design)"
 
 [lib]
@@ -20,3 +19,6 @@ async-trait.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true

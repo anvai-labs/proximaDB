@@ -6,7 +6,6 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-homepage.workspace = true
 description = "Shared ProximaDB multimodel query composition IR"
 
 [lib]
@@ -24,3 +23,6 @@ proximadb-vector-query = { path = "../proximadb-vector-query" }
 
 [dev-dependencies]
 proximadb-query-filter = { path = "../proximadb-query-filter" }
+
+[lints]
+workspace = true

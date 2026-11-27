@@ -6,7 +6,6 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-homepage.workspace = true
 description = "Geohash encoding/decoding + neighbor lookup — extracted from root index/geo (TD-DECOMP-60)"
 
 [lib]
@@ -15,3 +14,6 @@ path = "src/lib.rs"
 
 [dependencies]
 proximadb-geo-types = { workspace = true }
+
+[lints]
+workspace = true

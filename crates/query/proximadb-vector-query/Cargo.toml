@@ -6,7 +6,6 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-homepage.workspace = true
 description = "Shared ProximaDB vector query IR contracts"
 
 [lib]
@@ -27,3 +26,6 @@ proximadb-records = { workspace = true }
 # `VectorQueryService` without coupling back to the wire layer. The
 # orchestration-plane proto→Rust conversion lives at the call site
 # (`src/network/multi_protocol_handler.rs`).
+
+[lints]
+workspace = true

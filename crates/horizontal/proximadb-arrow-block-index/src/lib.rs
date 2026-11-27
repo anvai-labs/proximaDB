@@ -4,7 +4,7 @@
 //! `storage/.../arrow_block` module (TD-DECOMP-58).
 //!
 //! [`index`] provides [`index::ArrowBlockIndex`] + [`index::ArrowIndexEntry`]
-//! for block-level secondary indexing. Depends only on `serde` + `bytes`,
+//! for block-level secondary indexing. Depends only on `serde` + `bincode`,
 //! keeping it a clean horizontal-tier leaf.
 
 pub mod index;

@@ -6,7 +6,6 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-homepage.workspace = true
 description = "Canonical tenant-attribution primitives for ProximaDB: the single fail-closed tenant resolver that every metering and isolation boundary shares (co-design governance/economics dimension)"
 
 [lib]

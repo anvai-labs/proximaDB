@@ -6,7 +6,6 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-homepage.workspace = true
 description = "ProximaDB foundation-tier string interner (StringInterner) — XxHash64-keyed DashMap dedup of Arc<str> shared across metadata/cache layers"
 
 [lib]
@@ -16,3 +15,6 @@ path = "src/lib.rs"
 [dependencies]
 dashmap.workspace = true
 proximadb-kernel.workspace = true
+
+[lints]
+workspace = true

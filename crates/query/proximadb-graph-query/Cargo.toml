@@ -6,7 +6,6 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-homepage.workspace = true
 description = "Shared ProximaDB graph query contracts"
 
 [lib]
@@ -21,3 +20,6 @@ proximadb-proto = { path = "../../foundation/proximadb-proto" }
 proximadb-query-filter = { path = "../proximadb-query-filter" }
 serde.workspace = true
 serde_json.workspace = true
+
+[lints]
+workspace = true

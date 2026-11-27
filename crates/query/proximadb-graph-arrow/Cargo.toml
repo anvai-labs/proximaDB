@@ -6,7 +6,6 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-homepage.workspace = true
 description = "Shared ProximaDB graph query Arrow presentation adapter"
 
 [lib]
@@ -20,3 +19,6 @@ futures = "0.3"
 proximadb-graph-query = { path = "../proximadb-graph-query" }
 proximadb-kernel = { path = "../../foundation/proximadb-kernel" }
 serde_json.workspace = true
+
+[lints]
+workspace = true

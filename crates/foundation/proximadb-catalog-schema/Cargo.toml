@@ -6,7 +6,6 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-homepage.workspace = true
 description = "Foundation-layer xCatalog schema contract types (CatalogTableSchema and dependents)"
 
 [lib]

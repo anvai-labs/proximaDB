@@ -6,7 +6,6 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-homepage.workspace = true
 description = "Shared ProximaDB graph query subset parser, adapter, and execution helpers"
 
 [lib]
@@ -18,3 +17,6 @@ proximadb-query = { path = "../proximadb-query" }
 
 [dev-dependencies]
 tokio = { version = "1.37", features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true

@@ -6,7 +6,6 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-homepage.workspace = true
 description = "Shared ProximaDB document query IR contracts"
 
 [lib]
@@ -18,3 +17,6 @@ async-trait.workspace = true
 proximadb-kernel = { path = "../../foundation/proximadb-kernel" }
 proximadb-proto = { workspace = true }
 proximadb-query-filter = { path = "../proximadb-query-filter" }
+
+[lints]
+workspace = true
