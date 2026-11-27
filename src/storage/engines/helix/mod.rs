@@ -358,6 +358,10 @@ pub struct HelixEngine {
     ///
     /// RwLock allows concurrent reads, exclusive writes
     levels: Arc<RwLock<HashMap<usize, Vec<SStableMetadata>>>>,
+    /// One compaction at a time per collection data directory
+    /// (TD-HELIX-COMPACT-SCOPE-1). Every flush past the L0 trigger used to spawn
+    /// another unsynchronized compaction over the same files.
+    compaction_guards: Arc<dashmap::DashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 
     /// **Query Optimizer**
     ///
@@ -658,7 +662,7 @@ impl HelixEngine {
         };
 
         // Initialize levels from existing files
-        let levels = Self::load_levels(&filesystem, &data_dir).await?;
+        let levels = Self::load_levels(&filesystem, &data_dir, &filesystem_factory).await?;
 
         // Create query optimizer
         let query_optimizer = Arc::new(QueryOptimizer::new(
@@ -685,6 +689,7 @@ impl HelixEngine {
             cache_orchestrator,
             pca_model: Arc::new(RwLock::new(None)),
             levels: Arc::new(RwLock::new(levels)),
+            compaction_guards: Arc::new(dashmap::DashMap::new()),
             query_optimizer,
             event_log,
             axis_manager: None, // AXIS manager will be set externally if available
@@ -756,6 +761,7 @@ impl HelixEngine {
             crate::storage::persistence::filesystem::caching_filesystem::UnifiedCachingFilesystem,
         >,
         data_dir: &Path,
+        factory: &FilesystemFactory,
     ) -> Result<HashMap<usize, Vec<SStableMetadata>>> {
         use crate::storage::persistence::filesystem::FileSystem;
 
@@ -779,22 +785,26 @@ impl HelixEngine {
         for file in files {
             let file_name = &file.name;
             if file_name.ends_with(HELIX_FILE_EXT) {
+                let Some(path) =
+                    compaction::discovered_sstable_path(data_dir, Path::new(&file.url), factory)
+                else {
+                    continue;
+                };
+                let url = path.to_string_lossy();
                 // Parse level from filename
                 let codec = FilenameCodec::new();
                 let level = codec.parse_level(file_name) as usize;
 
                 // Read Hilbert range from file footer for proper spatial pruning
-                let hilbert_range = Self::read_hilbert_range_static(filesystem, &file.url)
-                    .await
-                    .ok();
+                let hilbert_range = Self::read_hilbert_range_static(filesystem, &url).await.ok();
 
                 // Read num_vectors from file header
-                let num_vectors = Self::read_num_vectors_static(filesystem, &file.url)
+                let num_vectors = Self::read_num_vectors_static(filesystem, &url)
                     .await
                     .unwrap_or(0) as usize;
 
                 let metadata = SStableMetadata {
-                    path: PathBuf::from(&file.url),
+                    path,
                     level,
                     hilbert_range,
                     num_vectors,
@@ -880,14 +890,30 @@ impl HelixEngine {
         self.filename_codec.generate(level as u32, "helix")
     }
 
+    /// The compaction guard of one collection data directory.
+    fn compaction_guard(&self, data_dir: &std::path::Path) -> Arc<tokio::sync::Mutex<()>> {
+        // Canonical key: two spellings of one directory share ONE guard.
+        self.compaction_guards
+            .entry(compaction::collection_directory(
+                data_dir,
+                &self.filesystem_factory,
+            ))
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+
     /// Check if compaction is needed
-    async fn should_compact(&self) -> bool {
+    async fn should_compact(&self, data_dir: &std::path::Path) -> bool {
         let levels = self.levels.read().await;
 
-        // Check L0 trigger
-        if let Some(l0_files) = levels.get(&0)
-            && l0_files.len() >= self.config.level0_file_num_compaction_trigger
-        {
+        // Check L0 trigger: THIS collection's L0 files only (the level map is
+        // shared by every collection; TD-HELIX-COMPACT-SCOPE-1).
+        if compaction::l0_trigger_reached(
+            &levels,
+            data_dir,
+            self.config.level0_file_num_compaction_trigger,
+            &self.filesystem_factory,
+        ) {
             return true;
         }
 
@@ -896,8 +922,18 @@ impl HelixEngine {
             if let (Some(curr_level), Some(next_level)) =
                 (levels.get(&level), levels.get(&(level + 1)))
             {
-                let curr_size: u64 = curr_level.iter().map(|f| f.size_bytes).sum();
-                let next_size: u64 = next_level.iter().map(|f| f.size_bytes).sum();
+                // This collection's files only (#2530 review LOW-3).
+                let own = |files: &Vec<SStableMetadata>| -> u64 {
+                    files
+                        .iter()
+                        .filter(|f| {
+                            compaction::owns_sstable(data_dir, &f.path, &self.filesystem_factory)
+                        })
+                        .map(|f| f.size_bytes)
+                        .sum()
+                };
+                let curr_size: u64 = own(curr_level);
+                let next_size: u64 = own(next_level);
 
                 if next_size > 0 && (curr_size as f64 / next_size as f64) > self.config.size_ratio {
                     return true;
@@ -1059,13 +1095,21 @@ impl HelixEngine {
                 file_path
             );
 
-            // Only process .helix files
             if !filename.ends_with(".helix") {
-                tracing::trace!("[HELIX] Skipping non-.helix file: {}", filename);
                 continue;
             }
-
-            tracing::debug!("[HELIX] Found .helix file: {}", filename);
+            let Some(path) = compaction::discovered_sstable_path(
+                Path::new(data_dir),
+                Path::new(file_path),
+                &self.filesystem_factory,
+            ) else {
+                tracing::trace!(
+                    path = file_path.as_str(),
+                    "Skipping entry outside the collection SSTables"
+                );
+                continue;
+            };
+            let file_path = path.to_string_lossy();
 
             // Parse filename to extract level using FilenameCodec pattern
             // Expected format: L{level}_{timestamp}_{hash}.helix
@@ -1085,7 +1129,7 @@ impl HelixEngine {
             // Read both pruning range and vector count through the backend
             // selected from this collection URL.
             let (hilbert_range, num_vectors) =
-                Self::read_file_metadata_from_header(&filesystem, file_path)
+                Self::read_file_metadata_from_header(&filesystem, &file_path)
                     .await
                     .unwrap_or_else(|e| {
                         warn!(
@@ -1097,7 +1141,7 @@ impl HelixEngine {
 
             // Create metadata with Hilbert range for pruning
             let metadata = SStableMetadata {
-                path: std::path::PathBuf::from(file_path),
+                path,
                 level,
                 hilbert_range, // Now populated from file footer
                 num_vectors: num_vectors as usize,
@@ -1312,7 +1356,7 @@ impl UnifiedStorageFormat for HelixEngine {
         // Create directory if it doesn't exist
         filesystem.create_dir_all(&data_dir).await?;
 
-        let file_path = std::path::Path::new(&data_dir).join(&filename);
+        let file_path = compaction::sstable_path(Path::new(&data_dir), &filename);
 
         // Write unified SIMD-optimized Proxima blocks
         let bytes_written = proxima::write_helix_sstable(
@@ -1373,14 +1417,23 @@ impl UnifiedStorageFormat for HelixEngine {
         }
 
         // Trigger compaction if needed
-        if self.should_compact().await {
+        let collection_dir = PathBuf::from(&data_dir);
+        if self.should_compact(&collection_dir).await {
             let compactor = Arc::new(LeveledCompactor::new(
                 self.config.clone(),
                 filesystem.clone(),
-                PathBuf::from(&data_dir),
+                collection_dir.clone(),
+                self.filesystem_factory.clone(),
             ));
             let levels = self.levels.clone();
+            let guard = self.compaction_guard(&collection_dir);
             tokio::spawn(async move {
+                // One compaction per collection at a time: if one is already
+                // running it will see these files on its next trigger.
+                let Some(_running) = compaction::acquire_compaction(guard, false).await else {
+                    debug!("HELIX: compaction already running for this collection; skipped");
+                    return;
+                };
                 if let Err(e) = compactor.compact_l0_to_l1(levels).await {
                     warn!("Background compaction failed: {}", e);
                 }
@@ -1408,8 +1461,18 @@ impl UnifiedStorageFormat for HelixEngine {
         info!("HELIX compaction started for collection {}", collection_id);
         let data_dir = self.get_data_dir_from_compaction_params(params)?;
         let filesystem = self.filesystem_for_url(&data_dir, &collection_id)?;
-        let compactor =
-            LeveledCompactor::new(self.config.clone(), filesystem, PathBuf::from(&data_dir));
+        let collection_dir = PathBuf::from(&data_dir);
+        let compactor = LeveledCompactor::new(
+            self.config.clone(),
+            filesystem,
+            collection_dir.clone(),
+            self.filesystem_factory.clone(),
+        );
+        let owns_collection_file =
+            |path| compaction::owns_sstable(&collection_dir, path, &self.filesystem_factory);
+        // Serialized with any flush-triggered compaction of this collection.
+        let guard = self.compaction_guard(&collection_dir);
+        let _running = compaction::acquire_compaction(guard, true).await;
 
         let start = std::time::Instant::now();
 
@@ -1424,6 +1487,7 @@ impl UnifiedStorageFormat for HelixEngine {
                 .map(|files| {
                     files
                         .iter()
+                        .filter(|f| owns_collection_file(&f.path))
                         .map(|f| f.path.to_string_lossy().to_string())
                         .collect::<Vec<_>>()
                 })
@@ -1445,21 +1509,8 @@ impl UnifiedStorageFormat for HelixEngine {
                 .await?
         };
 
-        // Invalidate SSTable metadata cache for compacted files
-        // IMPORTANT: L0 files were compacted to L1, so we must clear the cache
-        // to force rediscovery and ensure Hilbert ranges are populated
-        {
-            let mut levels_write = self.levels.write().await;
-            debug!(
-                "HELIX: Clearing SSTable metadata cache after compaction to ensure fresh discovery"
-            );
-
-            // Clear only L0 and L1 metadata to force rediscovery with Hilbert ranges
-            levels_write.remove(&0);
-            levels_write.remove(&1);
-
-            debug!("HELIX: Cache invalidated for levels 0 and 1 - will rediscover on next search");
-        }
+        // The compactor already removes consumed paths and registers its
+        // outputs. Preserve any files flushed after its input snapshot.
 
         // Also invalidate query optimizer cache for compacted files
         if !files_to_invalidate.is_empty() {
@@ -1693,29 +1744,27 @@ impl UnifiedStorageFormat for HelixEngine {
         let discovered_sstables = {
             let levels_read = self.levels.read().await;
             let mut cached_sstables: Vec<SStableMetadata> = Vec::new();
+            let mut seen_canonical = std::collections::HashSet::new();
 
-            // Collect all SSTables from all levels for this collection
-            for sstables in levels_read.values() {
-                for sstable in sstables {
-                    tracing::trace!(
-                        "[HELIX] Checking cached sstable: path={:?}, collection_data_dir={}",
-                        sstable.path,
-                        collection_data_dir
-                    );
-                    // Filter by collection directory to ensure collection isolation
-                    // Handle both file:// URLs and plain paths
-                    let sstable_path_str = sstable.path.to_string_lossy();
-                    let normalized_path = sstable_path_str
-                        .strip_prefix("file://")
-                        .unwrap_or(&sstable_path_str);
-
-                    if normalized_path.starts_with(&collection_data_dir) {
-                        tracing::trace!("[HELIX] Matched! Adding to cached_sstables");
+            // URL-backed searches refresh listings because the flush path
+            // may run on a different engine instance. Cached registrations
+            // can otherwise hide newer live files or tombstones.
+            if !collection_data_dir.contains("://") {
+                for sstable in levels_read.values().flatten() {
+                    let path = sstable.path.to_string_lossy();
+                    let path = path.strip_prefix("file://").unwrap_or(&path);
+                    if path.starts_with(&collection_data_dir)
+                        && compaction::owns_sstable(
+                            Path::new(&collection_data_dir),
+                            &sstable.path,
+                            &self.filesystem_factory,
+                        )
+                        && seen_canonical.insert(compaction::canonical_location(
+                            &sstable.path,
+                            &self.filesystem_factory,
+                        ))
+                    {
                         cached_sstables.push(sstable.clone());
-                    } else {
-                        tracing::trace!(
-                            "[HELIX] Not matched - path doesn't start with collection_data_dir"
-                        );
                     }
                 }
             }
@@ -1755,10 +1804,16 @@ impl UnifiedStorageFormat for HelixEngine {
                         level,
                         sstable.path
                     );
-                    levels_write
-                        .entry(level)
-                        .or_insert_with(Vec::new)
-                        .push(sstable.clone());
+                    // Never register a second spelling of a file already cached.
+                    let canonical =
+                        compaction::canonical_location(&sstable.path, &self.filesystem_factory);
+                    let files = levels_write.entry(level).or_insert_with(Vec::new);
+                    if !files.iter().any(|f| {
+                        compaction::canonical_location(&f.path, &self.filesystem_factory)
+                            == canonical
+                    }) {
+                        files.push(sstable.clone());
+                    }
                 }
                 tracing::debug!("[HELIX] Cache populated with {} SSTables", discovered.len());
 
@@ -2052,11 +2107,17 @@ impl UnifiedStorageFormat for HelixEngine {
         let mut copies: Vec<proximadb_records::ProximaRecord> = Vec::new();
         for entry in entries {
             if entry.name.ends_with(".helix") || entry.name.ends_with(".sstable") {
-                let file_path = format!("{}/{}", data_dir, entry.name);
+                let Some(path) = compaction::discovered_sstable_path(
+                    Path::new(&data_dir),
+                    Path::new(&entry.url),
+                    &self.filesystem_factory,
+                ) else {
+                    continue;
+                };
 
                 // Load SSTable metadata
                 let metadata = SStableMetadata {
-                    path: std::path::PathBuf::from(&file_path),
+                    path,
                     level: 0,
                     hilbert_range: None,
                     num_vectors: 0,
@@ -2174,8 +2235,13 @@ impl UnifiedStorageFormat for HelixEngine {
                         && entry
                             .url
                             .ends_with(crate::storage::engines::constants::HELIX_FILE_EXT)
+                        && let Some(path) = compaction::discovered_sstable_path(
+                            Path::new(storage_url),
+                            Path::new(&entry.url),
+                            &self.filesystem_factory,
+                        )
                     {
-                        files.push(entry.url.clone());
+                        files.push(path.to_string_lossy().into_owned());
                     }
                 }
             }
