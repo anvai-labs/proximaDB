@@ -457,4 +457,3 @@ Implemented. Owner mapping: ADR-098 "Completion ledger (2026-11-25)" G7 and G8.
   account. Mutation: making
   `commit_root` re-read `latest_version()` as the parent turns it red (A's root lands without B's
   account). Store level: `root_commit_refuses_a_stale_expected_parent`.
-
