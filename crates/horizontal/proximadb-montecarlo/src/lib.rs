@@ -6,7 +6,7 @@
 //! [`montecarlo`] ships a dependency-free Black-Scholes pricer plus a
 //! parallel ([`montecarlo::mc_price_batch_seq`] / rayon) Monte-Carlo path
 //! simulator for European option pricing. It mirrors how Spark prices
-//! options as a UDF and depends only on `rayon`/`rand`, keeping it a clean
+//! options as a UDF and depends only on `rayon`, keeping it a clean
 //! horizontal-tier leaf.
 
 // Mirrors the root crate's crate-level allow (src/lib.rs:27): the Monte-Carlo

@@ -1997,8 +1997,6 @@ mod tests {
         );
     }
 
-    use super::*;
-
     #[tokio::test]
     async fn test_global_partitioned_batch_operations() {
         use crate::storage::memtable::specialized::wal_behavior::WALVectorBatch;

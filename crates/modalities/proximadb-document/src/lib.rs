@@ -32,7 +32,6 @@
 //! - `proximadb-records` - Canonical `ProximaRecord` envelope
 //! - `proximadb-data-model` - Canonical `ProximaValue` rich type system
 //! - `proximadb-query-filter` - Filter expression contracts
-//! - `arrow` - Columnar data structures for document operations
 
 pub mod projection;
 pub mod query;

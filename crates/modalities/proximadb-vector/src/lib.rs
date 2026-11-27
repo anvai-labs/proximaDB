@@ -34,9 +34,6 @@
 //!
 //! - `proximadb-kernel` - Core error types and foundational contracts
 //! - `proximadb-proto` - Protocol buffer types for VectorRecord
-//! - `proximadb-query-filter` - Filter expression contracts
-//! - `proximadb-vector-query` - Vector query service contract
-//! - `arrow` - Columnar data structures for vector operations
 
 pub mod distance;
 pub mod index;

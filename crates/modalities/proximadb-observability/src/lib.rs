@@ -25,7 +25,6 @@
 //! - `proximadb-kernel` - Core error types and foundational contracts
 //! - `proximadb-proto` - Protocol buffer types
 //! - `proximadb-query-filter` - Filter expression contracts
-//! - `arrow` - Columnar data structures for observability operations
 
 use proximadb_data_model::ProximaValue;
 use proximadb_proto::proto::proximadb_v1::{

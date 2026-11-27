@@ -155,11 +155,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_hybrid_search_parallel_execution() {
-        let coordinator = HybridCoordinator::new(FusionStrategy::WeightedLinear {
-            alpha: 0.5,
-            bm25_normalize: false,
-            vector_normalize: false,
-        });
+        let coordinator = HybridCoordinator::new(FusionStrategy::ReciprocalRank { k: 60 });
 
         let bm25_called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let vector_called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));

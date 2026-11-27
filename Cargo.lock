@@ -8022,6 +8022,7 @@ dependencies = [
 name = "proximadb-onnx-runtime"
 version = "0.7.0"
 dependencies = [
+ "cc",
  "ort",
 ]
 
@@ -8297,7 +8298,6 @@ dependencies = [
  "thiserror 2.0.21",
  "tokenizers",
  "tokio",
- "tracing",
 ]
 
 [[package]]
