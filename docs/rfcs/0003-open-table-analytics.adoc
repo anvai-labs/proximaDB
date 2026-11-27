@@ -325,6 +325,11 @@ failure, a fresh statement reauthorizes the same configured pin. Local release
 qualification covers a damaged published head, restoration of that head and
 the same pinned row values after recovery.
 
+For a managed publication, the catalog layout records the metadata generation
+it has acknowledged. The object-store log can advance beyond that generation.
+A listing that ends below the acknowledgement yields an unavailable result,
+even if the remaining archive is readable.
+
 [[binding]]
 == What crosses the planner and worker boundary
 

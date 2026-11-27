@@ -880,8 +880,14 @@ impl IcebergRestService {
     ) -> Result<(IcebergTableMetadata, String)> {
         // ADR-097 D3: a table published by the Iceberg engine (MATERIALIZE) is served
         // from the engine's own `metadata.json`, verbatim — one writer, one tree.
-        if let Some(location) = published_layout_location(schema) {
-            return engine_published_metadata(location).await;
+        if let Some((layout, location)) = published_layout(schema) {
+            let floor = layout
+                .properties
+                .get(crate::ICEBERG_METADATA_VERSION_PROPERTY)
+                .map(|value| value.parse::<u64>())
+                .transpose()
+                .context("invalid published Iceberg metadata generation in the catalog layout")?;
+            return engine_published_metadata(location, floor).await;
         }
         // The DataFusion bulk-append executor commits to the same engine metadata
         // log with a BRIDGE-RELATIVE key (its fallback prefixes carry no URL), so
@@ -1582,7 +1588,7 @@ fn uuid_from_name(name: &str) -> String {
 }
 
 /// The most recent Parquet publication layout, when its location is an absolute URI.
-fn published_layout_location(schema: &CatalogTableSchema) -> Option<&str> {
+fn published_layout(schema: &CatalogTableSchema) -> Option<(&crate::CatalogStorageLayout, &str)> {
     schema
         .storage_layouts
         .iter()
@@ -1591,13 +1597,16 @@ fn published_layout_location(schema: &CatalogTableSchema) -> Option<&str> {
             layout.authority == crate::CatalogAuthorityMode::ProjectionPublication
                 && layout.physical_format == crate::CatalogPhysicalFormat::Parquet
         })
-        .find_map(|layout| layout.location.as_deref())
-        .filter(|location| location.contains("://"))
+        .find_map(|layout| Some((layout, layout.location.as_deref()?)))
+        .filter(|(_, location)| location.contains("://"))
 }
 
 /// An absolute published layout commits the REST read to the Iceberg log.
 /// Its head can advance independently of the local layout and WAL watermark.
-async fn engine_published_metadata(location: &str) -> Result<(IcebergTableMetadata, String)> {
+async fn engine_published_metadata(
+    location: &str,
+    floor: Option<u64>,
+) -> Result<(IcebergTableMetadata, String)> {
     const METADATA_DIR: &str = "metadata";
     let table_root = location
         .trim_end_matches('/')
@@ -1610,6 +1619,12 @@ async fn engine_published_metadata(location: &str) -> Result<(IcebergTableMetada
         .await
         .context("resolving the published Iceberg metadata version")?
         .context("the published Iceberg layout has no committed metadata")?;
+    if let Some(floor) = floor {
+        anyhow::ensure!(
+            version >= floor,
+            "published Iceberg metadata is below the acknowledged generation: listed {version}, acknowledged {floor}"
+        );
+    }
     let bytes = bridge
         .read_table_metadata(METADATA_DIR, version)
         .await
