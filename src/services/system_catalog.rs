@@ -4723,12 +4723,22 @@ mod tests {
         let legacy = nslevels(&["legacy", "ns"]);
         let mut ns = CatalogNamespace::new(legacy.clone());
         ns.tenant_id = Some("bad tenant".to_string());
-        owner.state.apply_committed(
-            owner.state.applied_seq() + 1,
-            CatalogDelta::UpsertNamespace {
-                namespace: Box::new(ns),
-            },
-        );
+        // Write the legacy namespace through the WAL and apply it at the
+        // sequence the WAL assigned, as replay would. Applying it at
+        // `applied_seq() + 1` without a WAL entry would hand the drop's real
+        // append the same sequence number, so `apply_committed` would skip
+        // the drop and leave the namespace live — and the test would pass on
+        // `shard_keys()` alone, without exercising the pending-shard check.
+        let delta = CatalogDelta::UpsertNamespace {
+            namespace: Box::new(ns),
+        };
+        let entries = owner
+            .appender
+            .append_operations(vec![delta.to_operation()?], None)
+            .await?;
+        owner
+            .state
+            .apply_committed(entries[0].sequence_number, delta);
         ledger.reset();
         let text = format!(
             "{:#}",
@@ -4736,6 +4746,12 @@ mod tests {
                 .drop_namespace(&legacy, true)
                 .await
                 .expect_err("the drop's checkpoint must fail closed")
+        );
+        // The drop applied, so the account is no longer a live shard key:
+        // only the pending-shard set still names it.
+        assert!(
+            !owner.state.namespace_exists(&legacy),
+            "the drop must have applied before its checkpoint failed"
         );
         assert!(text.contains("\"bad tenant\""), "{text}");
         assert!(
