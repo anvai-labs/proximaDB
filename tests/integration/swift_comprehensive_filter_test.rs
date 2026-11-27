@@ -5,6 +5,7 @@
 
 // SWIFT is compiled only under `experimental-engines` (TD-152 deprecation gate).
 #![cfg(feature = "experimental-engines")]
+#![expect(deprecated, reason = "This suite exercises the opt-in legacy engine")]
 
 use proximadb::compute::distance_computation::UnifiedDistanceCompute;
 use proximadb::core::search::{ComparisonOperator, FilterExpression, SearchParams};
@@ -13,7 +14,6 @@ use proximadb::proto::proximadb_v1::{
     sql_value::Value,
 };
 use proximadb::storage::engines::swift::SwiftEngine;
-use proximadb::storage::persistence::filesystem::FilesystemFactory;
 use proximadb::storage::traits::{FlushParameters, StorageQueryContext, UnifiedStorageEngine};
 use serde_json::json;
 use std::collections::HashMap;

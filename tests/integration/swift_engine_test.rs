@@ -2,11 +2,12 @@
 
 // SWIFT is compiled only under `experimental-engines` (TD-152 deprecation gate).
 #![cfg(feature = "experimental-engines")]
+#![expect(deprecated, reason = "This suite exercises the opt-in legacy engine")]
 
 use std::sync::Arc;
 use tempfile::TempDir;
 
-use proximadb::proto::proximadb_v1::{CollectionConfig, DistanceMetric, StorageEngine};
+use proximadb::proto::proximadb_v1::{DistanceMetric, StorageEngine};
 use proximadb::services::collection::manager::CollectionService;
 use proximadb::storage::engines::swift::SwiftEngine;
 use proximadb::storage::persistence::filesystem::{FilesystemConfig, FilesystemFactory};
