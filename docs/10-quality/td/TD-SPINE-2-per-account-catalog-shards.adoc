@@ -351,8 +351,13 @@ Implemented. Owner mapping: ADR-098 "Completion ledger (2026-11-25)" G7 and G8.
   kept. `Acme` and `acme` would map to `data/Acme/…` and `data/acme/…`, which are one directory
   on a case-insensitive store (macOS APFS default and Windows `file://`, the OSS/dev default).
   `SystemCatalog::check_namespace_tenant_placement` therefore refuses a namespace whose tenant id
-  equals an existing different account up to ASCII case, on every backend. The check runs under
-  the write lock, before the WAL append. Lower-casing every tenant id was rejected because it
+  equals a different account up to ASCII case, on every backend. The check runs under the write
+  lock, before the WAL append. *Round 2 (LOW-1):* "existing" means every account the catalog has
+  ever placed. That is the live namespaces' accounts, the adopted root index (which never drops
+  an account), the per-account namespace high-water accounts (kept across drops) and the pending
+  publish set. So dropping `Acme`'s last namespace does not make `acme` legal, and the placement
+  stays injective across drops. The cost: an account id that once existed blocks its case
+  variants for the life of the catalog. Lower-casing every tenant id was rejected because it
   would refuse ids that real callers send.
 * **`_default` (untenanted) shard.** `_operator/catalog/_untenanted_shard/`. Namespaces created
   with no tenant have no tenant prefix to live under. They are the deployment's own objects (the
@@ -362,20 +367,27 @@ Implemented. Owner mapping: ADR-098 "Completion ledger (2026-11-25)" G7 and G8.
   a valid `DrPathBuilder` segment maps to itself, and `_default` is the only key mapped outside
   `data/`. `SystemCatalog::create_namespace_inner` now refuses a tenant id that fails
   `DrPathBuilder::validate_id` (separators, whitespace, non-ASCII, `..`, reserved segments),
-  the tenant id `_default` (it would alias the untenanted shard) and case-fold collisions (see
-  above). The refusal happens under the write lock, before the WAL append. A key is never
-  re-encoded into a prefix another tenant could own.
+  the tenant id `_default` in any letter case (round-2 MED-1: it would alias the untenanted
+  shard key, and `_DEFAULT` would otherwise read as a case-fold collision with it on every later
+  checkpoint) and case-fold collisions (see above). The refusal happens under the write lock,
+  before the WAL append. A key is never re-encoded into a prefix another tenant could own. The
+  untenanted `_default` key is placed under `_operator/`, so the checkpoint's case-fold count
+  leaves it out. *Breaking change (accepted pre-GA):* tenant ids that are not path-safe were
+  accepted before and are refused now.
 * **Unplaceable account already in the image (round-1 LOW-1).** A namespace recorded before
   this check, replayed from the WAL or migrated from a legacy image, may carry an id that cannot
   be placed. Every sharded checkpoint first validates all accounts in the image
   (`catalog_shard_placement_violations`). If any fails, the checkpoint publishes no shard and no
   root, and the error lists every offending id. Skipping only the offender is not safe:
   publishing a root without it retires its rows on followers and lets WAL compaction drop them.
-  This wedges **all** accounts' DDL until the offender is gone, and DROP NAMESPACE cannot clear
-  it while sharding is on. Escape: restart the owner with
+  The validated set is the image's accounts plus the publish's pending accounts (round-2 LOW-2:
+  a dropped account stays pending until its now-empty shard is published). This wedges **all**
+  accounts' DDL until the offender is gone. DROP NAMESPACE cannot clear it while sharding is on,
+  for an invalid-segment id or for a case-fold pair already in a legacy image. The drop's own
+  checkpoint must still publish the dropped account's shard, so the account stays in the
+  validated pending set and the checkpoint keeps failing. Escape: restart the owner with
   `PROXIMADB_CATALOG_SHARDED_SNAPSHOT_DISABLE=1` (legacy whole-image publish, no placement),
-  drop or recreate the namespaces under valid ids, then unset the switch. *Breaking change (accepted pre-GA):*
-  tenant ids that are not path-safe were accepted before and are refused now.
+  drop or recreate the namespaces under valid ids, then unset the switch.
 * **Fail closed on a missing shard.** `read_shard_version` reads only the relocated prefix. A
   root that names a shard version missing there fails boot and every follower reload with an
   error that names the account, the version, the expected prefix and the operator step. It never
@@ -422,7 +434,11 @@ Implemented. Owner mapping: ADR-098 "Completion ledger (2026-11-25)" G7 and G8.
 * **Round 1:** `case_fold_tenant_collision_is_refused_before_the_wal_append` (MED-1);
   `unplaceable_account_in_the_image_fails_the_checkpoint_closed_listing_it` (LOW-1, checkpoint
   validates every account before any PUT and lists the offenders);
-  `placement_violations_list_invalid_and_case_colliding_ids`; and
+  `placement_violations_list_invalid_and_case_colliding_ids`;
+  round 2: `default_shard_key_in_any_case_is_refused_before_the_wal_append` (MED-1),
+  `placement_violations_ignore_the_untenanted_key_for_case_folding` (MED-1),
+  `case_fold_check_survives_dropping_the_other_account` (LOW-1) and
+  `dropped_unplaceable_account_still_fails_closed_with_the_escape` (LOW-2); and
   `shard_commit_refuses_an_account_that_is_not_a_tenant_segment`, which now puts a valid account
   first and proves nothing is written.
 * **R1, fail closed:** `root_naming_a_shard_missing_at_the_tenant_prefix_fails_closed`

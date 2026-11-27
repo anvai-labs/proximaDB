@@ -911,13 +911,17 @@ impl SystemCatalog {
                 tenant,
             )
             .map_err(|e| anyhow!("invalid namespace tenant id: {e}"))?;
-            if tenant == crate::services::system_catalog_state::DEFAULT_SHARD_KEY {
+            // Round-2 MED-1: `_default` is reserved in ANY letter case — a
+            // `_DEFAULT` tenant would otherwise sit beside the untenanted
+            // shard key and read as a case-fold collision with it.
+            if tenant.eq_ignore_ascii_case(crate::services::system_catalog_state::DEFAULT_SHARD_KEY)
+            {
                 return Err(anyhow!(
-                    "invalid namespace tenant id '{tenant}': reserved for the untenanted \
-                     catalog shard"
+                    "invalid namespace tenant id '{tenant}': reserved (in any letter case) for \
+                     the untenanted catalog shard"
                 ));
             }
-            let known = accounts.get_or_insert_with(|| self.state.shard_keys());
+            let known = accounts.get_or_insert_with(|| self.ever_placed_accounts());
             if let Some(existing) = known.iter().find(|existing| {
                 existing.as_str() != tenant && existing.eq_ignore_ascii_case(tenant)
             }) {
@@ -930,6 +934,22 @@ impl SystemCatalog {
             known.insert(tenant.to_string());
         }
         Ok(())
+    }
+
+    /// Round-2 LOW-1: every account this catalog may ever have placed a
+    /// shard log for — the live namespaces' accounts, the accounts named by
+    /// the adopted root index (never removed on DROP), the accounts the
+    /// per-account namespace high-water remembers (kept across drops so
+    /// dropped ids stay reserved) and the accounts pending publish. The
+    /// case-fold check runs against this set, so dropping `Acme`'s last
+    /// namespace does not make `acme` legal: on a case-insensitive store its
+    /// shard log would still be Acme's directory.
+    fn ever_placed_accounts(&self) -> std::collections::HashSet<String> {
+        let mut accounts = self.state.shard_keys();
+        accounts.extend(self.shard_versions.read().keys().cloned());
+        accounts.extend(self.state.ns_high_water_accounts());
+        accounts.extend(self.pending_shards.lock().iter().cloned());
+        accounts
     }
 
     /// Commit with [`Self::write_lock`] already held. Account-id minting needs
@@ -1268,10 +1288,12 @@ impl SystemCatalog {
         // without it retires its rows on followers and lets WAL compaction
         // drop them. So the checkpoint fails closed, naming every offender
         // and the escape.
+        // Round-2 LOW-2: validate the accounts this publish WRITES too —
+        // `pending_shards` keeps an account whose last namespace was dropped.
+        let mut placed = self.state.shard_keys();
+        placed.extend(self.pending_shards.lock().iter().cloned());
         let violations =
-            crate::services::catalog_snapshot_store::catalog_shard_placement_violations(
-                &self.state.shard_keys(),
-            );
+            crate::services::catalog_snapshot_store::catalog_shard_placement_violations(&placed);
         if !violations.is_empty() {
             anyhow::bail!(
                 "catalog '{}': cannot place the catalog shards of account ids {violations:?} \
@@ -4610,6 +4632,118 @@ mod tests {
             owner.state.namespace_exists(&legacy),
             "the offending account's rows are never dropped"
         );
+        Ok(())
+    }
+
+    /// Round-2 MED-1: `_default` is reserved in any letter case. A
+    /// `_DEFAULT` tenant would otherwise sit beside the untenanted shard key
+    /// and turn every later checkpoint into a case-fold refusal. Refused
+    /// before the WAL append both with and without a live untenanted
+    /// namespace.
+    #[tokio::test]
+    async fn default_shard_key_in_any_case_is_refused_before_the_wal_append() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let backing = Arc::new(object_store::memory::InMemory::new());
+        let ledger = Arc::new(IoLedger::default());
+        let owner = open_owner_counting(&dir.path().join("owner.wal"), &ledger, &backing).await?;
+        // (i) no untenanted namespace yet.
+        let wal_before = owner.appender.read_all_entries().await?.len();
+        let first = nslevels(&["x", "upper"]);
+        let text = format!(
+            "{:#}",
+            owner
+                .create_namespace_for_tenant(&first, HashMap::new(), Some("_DEFAULT"))
+                .await
+                .expect_err("_DEFAULT must be refused")
+        );
+        assert!(text.contains("reserved (in any letter case)"), "{text}");
+        assert!(!owner.state.namespace_exists(&first));
+        assert_eq!(owner.appender.read_all_entries().await?.len(), wal_before);
+        // (ii) with a live untenanted namespace.
+        owner
+            .create_namespace(&nslevels(&["plain", "ns"]), HashMap::new())
+            .await?;
+        let wal_before = owner.appender.read_all_entries().await?.len();
+        let second = nslevels(&["x", "mixed"]);
+        let text = format!(
+            "{:#}",
+            owner
+                .create_namespace_for_tenant(&second, HashMap::new(), Some("_Default"))
+                .await
+                .expect_err("_Default must be refused")
+        );
+        assert!(text.contains("reserved (in any letter case)"), "{text}");
+        assert_eq!(owner.appender.read_all_entries().await?.len(), wal_before);
+        // Routine untenanted DDL still works.
+        owner
+            .create_namespace(&nslevels(&["plain", "two"]), HashMap::new())
+            .await?;
+        Ok(())
+    }
+
+    /// Round-2 LOW-1: the case-fold check runs against every account the
+    /// catalog has placed, not only live ones. Dropping `Acme`'s last
+    /// namespace does not make `acme` legal: its shard log would be Acme's
+    /// directory on a case-insensitive store.
+    #[tokio::test]
+    async fn case_fold_check_survives_dropping_the_other_account() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let backing = Arc::new(object_store::memory::InMemory::new());
+        let ledger = Arc::new(IoLedger::default());
+        let owner = open_owner_counting(&dir.path().join("owner.wal"), &ledger, &backing).await?;
+        let first = nslevels(&["a", "one"]);
+        owner
+            .create_namespace_for_tenant(&first, HashMap::new(), Some("Acme"))
+            .await?;
+        assert!(owner.drop_namespace(&first, true).await?);
+        assert!(!owner.state.shard_keys().contains("Acme"));
+        let clash = nslevels(&["a", "two"]);
+        let text = format!(
+            "{:#}",
+            owner
+                .create_namespace_for_tenant(&clash, HashMap::new(), Some("acme"))
+                .await
+                .expect_err("acme must stay refused after Acme's namespaces are dropped")
+        );
+        assert!(text.contains("differs only in letter case"), "{text}");
+        assert!(!owner.state.namespace_exists(&clash));
+        Ok(())
+    }
+
+    /// Round-2 LOW-2: an unplaceable legacy account whose namespace is
+    /// dropped is still in the publish's pending set, so the checkpoint's
+    /// up-front validation covers it and the error keeps naming it with the
+    /// escape (not the generic per-shard placement error).
+    #[tokio::test]
+    async fn dropped_unplaceable_account_still_fails_closed_with_the_escape() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let backing = Arc::new(object_store::memory::InMemory::new());
+        let ledger = Arc::new(IoLedger::default());
+        let owner = open_owner_counting(&dir.path().join("owner.wal"), &ledger, &backing).await?;
+        let legacy = nslevels(&["legacy", "ns"]);
+        let mut ns = CatalogNamespace::new(legacy.clone());
+        ns.tenant_id = Some("bad tenant".to_string());
+        owner.state.apply_committed(
+            owner.state.applied_seq() + 1,
+            CatalogDelta::UpsertNamespace {
+                namespace: Box::new(ns),
+            },
+        );
+        ledger.reset();
+        let text = format!(
+            "{:#}",
+            owner
+                .drop_namespace(&legacy, true)
+                .await
+                .expect_err("the drop's checkpoint must fail closed")
+        );
+        assert!(text.contains("\"bad tenant\""), "{text}");
+        assert!(
+            text.contains("PROXIMADB_CATALOG_SHARDED_SNAPSHOT_DISABLE=1"),
+            "{text}"
+        );
+        assert_eq!(ledger.put_paths_matching("data/"), 0);
+        assert_eq!(ledger.put_paths_matching("_root/"), 0);
         Ok(())
     }
 

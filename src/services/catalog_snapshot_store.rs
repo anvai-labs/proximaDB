@@ -511,17 +511,26 @@ impl ObjectStoreSnapshotStore {
 pub fn catalog_shard_placement_violations(
     accounts: &std::collections::HashSet<String>,
 ) -> Vec<String> {
+    // Round-2 MED-1: the untenanted key is placed under `_operator/`, never
+    // under `data/`, so it cannot physically collide with a tenant and is
+    // excluded from the case-fold count (a legacy `_DEFAULT` tenant is judged
+    // by the placement rule alone).
+    let untenanted = crate::services::system_catalog_state::DEFAULT_SHARD_KEY;
     let mut by_fold: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    for account in accounts {
+    for account in accounts
+        .iter()
+        .filter(|account| account.as_str() != untenanted)
+    {
         *by_fold.entry(account.to_ascii_lowercase()).or_default() += 1;
     }
     let mut violations: Vec<String> = accounts
         .iter()
         .filter(|account| {
             catalog_shard_manifests_prefix(account).is_err()
-                || by_fold
-                    .get(&account.to_ascii_lowercase())
-                    .is_some_and(|count| *count > 1)
+                || (account.as_str() != untenanted
+                    && by_fold
+                        .get(&account.to_ascii_lowercase())
+                        .is_some_and(|count| *count > 1))
         })
         .cloned()
         .collect();
@@ -1268,6 +1277,17 @@ mod tests {
             catalog_shard_placement_violations(&accounts),
             vec!["bad tenant", "tenantA", "tenanta"]
         );
+    }
+
+    /// Round-2 MED-1: `_default` (placed under `_operator/`) is never a
+    /// case-fold collision with a `_DEFAULT` tenant.
+    #[test]
+    fn placement_violations_ignore_the_untenanted_key_for_case_folding() {
+        let accounts: std::collections::HashSet<String> = ["_default", "_DEFAULT", "ok"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        assert!(catalog_shard_placement_violations(&accounts).is_empty());
     }
 
     /// TD-SPINE-2 R4: the root CAS is against the CALLER's expected parent.
