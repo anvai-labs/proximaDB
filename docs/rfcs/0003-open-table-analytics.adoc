@@ -318,6 +318,13 @@ discovery run until those profiles qualify their historical schema and file
 semantics. The generation window applies during active scans. See the
 link:https://iceberg.apache.org/spec/#table-metadata-and-snapshots[Iceberg metadata contract].
 
+Preserve distinct outcomes for a concealed or missing catalog table, explicit
+authorization refusal, provider failure and a missing snapshot inside a loaded
+table. Stop catalog refusals at the metadata boundary. After a transient
+failure, a fresh statement reauthorizes the same configured pin. Local release
+qualification covers a damaged published head, restoration of that head and
+the same pinned row values after recovery.
+
 [[binding]]
 == What crosses the planner and worker boundary
 
