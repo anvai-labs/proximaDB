@@ -6,7 +6,7 @@ provides the ``_session`` / ``_timeout`` attributes and the protocol methods use
 the adapter. No sockets, no servers, no sleeps.
 """
 
-import httpx
+import httpx2
 import pytest
 
 from proximadb_sdk.adapters.rest_adapter import RestProtocolAdapter
@@ -817,11 +817,11 @@ def test_get_document_error(doc_adapter):
     """Transport failures raise NetworkError — no more swallow-to-None."""
     from unittest.mock import patch
 
-    import httpx
+    import httpx2
 
     op = "proximadb_sdk._generated.rest.api.documents.get_document.sync_detailed"
     with patch(op) as mock_op:
-        mock_op.side_effect = httpx.ConnectError("x")
+        mock_op.side_effect = httpx2.ConnectError("x")
         with pytest.raises(NetworkError, match="transport error"):
             doc_adapter.get_document("docs", "d1")
 
@@ -916,11 +916,11 @@ def test_delete_document_error(doc_adapter):
     """Transport failures raise NetworkError — no more swallow-to-False."""
     from unittest.mock import patch
 
-    import httpx
+    import httpx2
 
     op = "proximadb_sdk._generated.rest.api.documents.delete_document.sync_detailed"
     with patch(op) as mock_op:
-        mock_op.side_effect = httpx.ConnectError("x")
+        mock_op.side_effect = httpx2.ConnectError("x")
         with pytest.raises(NetworkError, match="transport error"):
             doc_adapter.delete_document("docs", "d1")
 
@@ -977,11 +977,11 @@ def test_insert_document_errors_are_in_vocabulary(doc_adapter):
     httpx/RuntimeError."""
     from unittest.mock import patch
 
-    import httpx
+    import httpx2
 
     op = "proximadb_sdk._generated.rest.api.documents.insert_document.sync_detailed"
     with patch(op) as mock_op:
-        mock_op.side_effect = httpx.ConnectError("x")
+        mock_op.side_effect = httpx2.ConnectError("x")
         with pytest.raises(NetworkError, match="transport error"):
             doc_adapter.insert_document("docs", {"title": "x"})
     with patch(op) as mock_op:
@@ -999,7 +999,7 @@ def test_ingest_per_call_headers_never_bleed_onto_the_shared_pool(doc_adapter):
     stay untouched no matter the call ordering."""
     from unittest.mock import patch
 
-    import httpx
+    import httpx2
 
     from proximadb_sdk._generated.rest.models.ingest_documents_response import (
         IngestDocumentsResponse,
@@ -1010,7 +1010,7 @@ def test_ingest_per_call_headers_never_bleed_onto_the_shared_pool(doc_adapter):
     # Materialize the shared base's httpx pool FIRST (a CRUD op does this).
     base = doc_adapter._get_generated_document_client()
     base_http = base.get_httpx_client()
-    assert isinstance(base_http, httpx.Client)
+    assert isinstance(base_http, httpx2.Client)
 
     ok = Response(
         status_code=200,
@@ -1107,7 +1107,7 @@ def test_delete_document_collection_error(doc_adapter):
 
     op = "proximadb_sdk._generated.rest.api.documents.delete_document_collection.sync_detailed"
     with patch(op) as mock_op:
-        mock_op.side_effect = httpx.ConnectError("x")
+        mock_op.side_effect = httpx2.ConnectError("x")
         with pytest.raises(NetworkError, match="transport error"):
             doc_adapter.delete_document_collection("docs")
 
@@ -1141,11 +1141,11 @@ def test_hybrid_search(doc_adapter):
 def test_hybrid_search_error(doc_adapter):
     from unittest.mock import patch
 
-    import httpx
+    import httpx2
 
     op = "proximadb_sdk._generated.rest.api.hybrid.hybrid_search.sync_detailed"
     with patch(op) as mock_op:
-        mock_op.side_effect = httpx.ConnectError("x")
+        mock_op.side_effect = httpx2.ConnectError("x")
         with pytest.raises(NetworkError, match="transport error"):
             doc_adapter.hybrid_search("c1", "q", [0.1])
 
@@ -1209,14 +1209,14 @@ def test_ingest_timeseries(doc_adapter):
 def test_ingest_timeseries_error(doc_adapter):
     from unittest.mock import patch
 
-    import httpx
+    import httpx2
 
     op = (
         "proximadb_sdk._generated.rest.api.timeseries"
         ".ingest_timeseries.sync_detailed"
     )
     with patch(op) as mock_op:
-        mock_op.side_effect = httpx.ConnectError("x")
+        mock_op.side_effect = httpx2.ConnectError("x")
         with pytest.raises(NetworkError, match="transport error"):
             doc_adapter.ingest_timeseries("ts", [{"timestamp": 1}])
 
@@ -1309,14 +1309,14 @@ def test_delete_timeseries_collection(doc_adapter):
 def test_delete_timeseries_collection_error(doc_adapter):
     from unittest.mock import patch
 
-    import httpx
+    import httpx2
 
     op = (
         "proximadb_sdk._generated.rest.api.timeseries"
         ".delete_timeseries_collection.sync_detailed"
     )
     with patch(op) as mock_op:
-        mock_op.side_effect = httpx.ConnectError("x")
+        mock_op.side_effect = httpx2.ConnectError("x")
         with pytest.raises(NetworkError, match="transport error"):
             doc_adapter.delete_timeseries_collection("ts")
 

@@ -30,6 +30,7 @@ classifiers = [
 
 dependencies = [
     "httpx>=0.24.0",
+    "httpx2[http2]>=2.13.1,<3",  # Generated REST transport
     "h2>=4.0.0",  # Required for HTTP/2 support in httpx
     # attrs + python-dateutil back the generated REST transport models
     # (src/proximadb_sdk/_generated/rest, openapi-python-client output, TD-126

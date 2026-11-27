@@ -7,9 +7,9 @@ executes the call through its own ``_make_request`` seam), the async path goes
 one step further and wires the GENERATED ``asyncio_detailed`` endpoint functions
 directly — exactly as the sync ``sync``/``sync_detailed`` functions are wired —
 so the async client *also* gets the spec-governed response parsing
-(``Response.parsed`` typed models) for free, with zero hand-rolled httpx.
+(``Response.parsed`` typed models) for free, with zero hand-written HTTP requests.
 
-Each helper takes the generated ``Client`` (whose shared ``httpx.AsyncClient`` is
+Each helper takes the generated ``Client`` (whose shared ``httpx2.AsyncClient`` is
 owned by the facade) plus the facade-built body dict, builds the generated attrs
 request model (reusing the same ``from_dict`` round-trip as the sync adapter so
 the wire body matches the published spec), and ``await``s the generated

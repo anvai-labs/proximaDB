@@ -36,12 +36,18 @@ REQS="${SCRIPT_DIR}/requirements.txt"
 # Isolated generator venv (pinned). Lives under codegen/ and is git-ignored.
 GEN_VENV="${GEN_VENV:-${SCRIPT_DIR}/.venv}"
 BASE_PYTHON="${PYTHON:-python3}"
+INSTALLED_REQS="${GEN_VENV}/.generator-requirements.txt"
 
-if [[ ! -x "${GEN_VENV}/bin/openapi-python-client" ]]; then
+if [[ ! -x "${GEN_VENV}/bin/python" ]]; then
   echo "==> creating generator venv (${GEN_VENV})"
   "${BASE_PYTHON}" -m venv "${GEN_VENV}"
-  "${GEN_VENV}/bin/pip" install --quiet --upgrade pip
-  "${GEN_VENV}/bin/pip" install --quiet -r "${REQS}"
+  "${GEN_VENV}/bin/python" -m pip install --quiet --upgrade pip
+fi
+
+if [[ ! -x "${GEN_VENV}/bin/openapi-python-client" ]] || ! cmp -s "${REQS}" "${INSTALLED_REQS}"; then
+  echo "==> installing pinned generator requirements"
+  "${GEN_VENV}/bin/python" -m pip install --quiet -r "${REQS}"
+  cp "${REQS}" "${INSTALLED_REQS}"
 fi
 
 TMP_OUT="$(mktemp -d -t proximadb-py-rest.XXXXXX)"
