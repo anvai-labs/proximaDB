@@ -31,11 +31,11 @@ fn main() -> Result<(), env::VarError> {
     }
     // Match ort-sys: the dynamic preference applies to a user-provided ORT
     // installation. The downloaded distribution is static.
-    let uses_shared_ort = (env::var_os("ORT_LIB_PATH").is_some()
-        || env::var_os("ORT_LIB_LOCATION").is_some())
+    let uses_shared_ort = (env::var("ORT_LIB_PATH").is_ok()
+        || env::var("ORT_LIB_LOCATION").is_ok())
         && env::var("ORT_PREFER_DYNAMIC_LINK")
             .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
-    if env::var_os("DOCS_RS").is_some() || uses_shared_ort {
+    if env::var("DOCS_RS").is_ok() || uses_shared_ort {
         return Ok(());
     }
 
