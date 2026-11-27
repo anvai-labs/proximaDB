@@ -689,7 +689,7 @@ mod tests {
             json!("zzz"),
             json!(null),
         ];
-        let mut leaf = |next: &mut dyn FnMut(usize) -> usize| -> FilterExpression {
+        let leaf = |next: &mut dyn FnMut(usize) -> usize| -> FilterExpression {
             match next(10) {
                 0 => cmp("bucket", Op::Equals, json!(next(5))),
                 1 => cmp("band", Op::In, json!([next(7), next(7)])),

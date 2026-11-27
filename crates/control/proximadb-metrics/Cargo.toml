@@ -6,7 +6,6 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-homepage.workspace = true
 description = "ProximaDB metrics collection — collectors (access/document/filesystem/query/storage/system), aggregators, exporters, and per-subsystem metric types. Extracted from the root crate (decomposition metrics Slice 1); the storage-coupled collectors stay in the root behind a MetricsStoragePort."
 
 [lib]

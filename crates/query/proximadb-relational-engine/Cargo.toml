@@ -6,7 +6,6 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-homepage.workspace = true
 description = "Writable in-memory relational engine — first reference implementation of ProximaDB's read+write contracts (ADR-019 L5/S5b)"
 
 [lib]
@@ -28,3 +27,6 @@ thiserror.workspace = true
 proximadb-relational-planner = { workspace = true }
 proximadb-relational-frontend = { workspace = true }
 tokio = { version = "1.37", features = ["full"] }
+
+[lints]
+workspace = true

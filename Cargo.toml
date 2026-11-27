@@ -7,7 +7,6 @@ authors = ["Vijaykumar Singh <vijay@anvaiops.com>"]
 description = "ProximaDB - Cloud-native vector database engineered for AI-first applications"
 license = "Apache-2.0"
 repository = "https://github.com/anvai-labs/proximaDB"
-homepage = "https://github.com/anvai-labs/proximaDB"
 keywords = ["vector", "database", "ai", "ml", "proximity", "similarity-search"]
 categories = ["database-implementations", "science"]
 rust-version = "1.95"
@@ -180,7 +179,6 @@ rust-version = "1.95"
 license = "Apache-2.0"
 authors = ["Vijaykumar Singh <vijay@anvaiops.com>"]
 repository = "https://github.com/anvai-labs/proximaDB"
-homepage = "https://github.com/anvai-labs/proximaDB"
 
 [workspace.lints.rust]
 # Edition-2024 migration for x86_64 SIMD: many `#[target_feature] unsafe fn`s call
@@ -240,7 +238,6 @@ proximadb-hardware = { path = "crates/foundation/proximadb-hardware" }
 proximadb-hardware-caps = { path = "crates/foundation/proximadb-hardware-caps" }
 proximadb-distance-kernel = { path = "crates/foundation/proximadb-distance-kernel" }
 proximadb-clustering-kernel = { path = "crates/foundation/proximadb-clustering-kernel" }
-proximadb-concurrent = { path = "crates/foundation/proximadb-concurrent" }
 proximadb-memory-pool = { path = "crates/foundation/proximadb-memory-pool" }
 proximadb-kernel = { path = "crates/foundation/proximadb-kernel" }
 proximadb-interner = { path = "crates/foundation/proximadb-interner" }
@@ -254,24 +251,20 @@ proximadb-filter-expression = { path = "crates/foundation/proximadb-filter-expre
 proximadb-quantization-types = { path = "crates/foundation/proximadb-quantization-types" }
 proximadb-quantization-model = { path = "crates/foundation/proximadb-quantization-model" }
 proximadb-index-types = { path = "crates/foundation/proximadb-index-types" }
-proximadb-index-storage = { path = "crates/foundation/proximadb-index-storage" }
 proximadb-index-traits = { path = "crates/foundation/proximadb-index-traits" }
 proximadb-records = { path = "crates/foundation/proximadb-records" }
 proximadb-relational-types = { path = "crates/foundation/proximadb-relational-types" }
 proximadb-functions = { path = "crates/foundation/proximadb-functions" }
-proximadb-execution-contracts = { path = "crates/query/proximadb-execution-contracts" }
 proximadb-relational-algebra = { path = "crates/query/proximadb-relational-algebra" }
 proximadb-relational-reader = { path = "crates/query/proximadb-relational-reader" }
 proximadb-relational-planner = { path = "crates/query/proximadb-relational-planner" }
 proximadb-relational-executor = { path = "crates/query/proximadb-relational-executor" }
 proximadb-relational-frontend = { path = "crates/query/proximadb-relational-frontend" }
-proximadb-relational-engine = { path = "crates/query/proximadb-relational-engine" }
 proximadb-abac = { path = "crates/control/proximadb-abac" }
 proximadb-catalog = { path = "crates/control/proximadb-catalog" }
 proximadb-catalog-schema = { path = "crates/foundation/proximadb-catalog-schema" }
 proximadb-multimodel-codec = { path = "crates/horizontal/proximadb-multimodel-codec" }
 proximadb-cdc = { path = "crates/integrations/proximadb-cdc" }
-proximadb-metrics = { path = "crates/control/proximadb-metrics" }
 arc-swap = "1.7"
 dashmap = "6.1.0"
 moka = { version = "0.12", features = ["future"] }
@@ -313,27 +306,16 @@ toml = "1.1"
 tower = { version = "0.5", features = ["limit"] }
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 proximadb-vector = { path = "crates/modalities/proximadb-vector" }
-proximadb-quantization-kernel = { path = "crates/modalities/proximadb-quantization-kernel" }
-proximadb-document = { path = "crates/modalities/proximadb-document" }
 proximadb-orion-engine = { path = "crates/modalities/proximadb-orion-engine" }
-proximadb-observability = { path = "crates/modalities/proximadb-observability" }
-proximadb-observability-engine = { path = "crates/modalities/proximadb-observability-engine" }
-proximadb-embedding = { path = "crates/modalities/proximadb-embedding" }
 proximadb-rank-core = { path = "crates/modalities/proximadb-rank-core" }
 proximadb-rank-features = { path = "crates/modalities/proximadb-rank-features" }
 proximadb-rank-expr = { path = "crates/modalities/proximadb-rank-expr" }
-proximadb-rank-profile = { path = "crates/modalities/proximadb-rank-profile" }
 proximadb-rank-onnx = { path = "crates/modalities/proximadb-rank-onnx" }
-proximadb-api = { path = "crates/platform/proximadb-api" }
-proximadb-admin-ui = { path = "crates/platform/proximadb-admin-ui" }
 proximadb-codec = { path = "crates/horizontal/proximadb-codec" }
 proximadb-runtime-common = { path = "crates/horizontal/proximadb-runtime-common" }
-proximadb-serialization = { path = "crates/horizontal/proximadb-serialization" }
-proximadb-tls = { path = "crates/horizontal/proximadb-tls" }
 proximadb-resilience = { path = "crates/horizontal/proximadb-resilience" }
 proximadb-automl = { path = "crates/horizontal/proximadb-automl" }
 proximadb-audit = { path = "crates/horizontal/proximadb-audit" }
-proximadb-onnx-runtime = { path = "crates/horizontal/proximadb-onnx-runtime" }
 proximadb-cross-modal-fusion = { path = "crates/horizontal/proximadb-cross-modal-fusion" }
 proximadb-utility-scorer = { path = "crates/horizontal/proximadb-utility-scorer" }
 proximadb-document-geo-index = { path = "crates/horizontal/proximadb-document-geo-index" }
@@ -364,20 +346,10 @@ proximadb-kafka-deserializer = { path = "crates/horizontal/proximadb-kafka-deser
 proximadb-network-middleware = { path = "crates/platform/proximadb-network-middleware" }
 proximadb-storage-common = { path = "crates/storage/proximadb-storage-common" }
 proximadb-engine-core = { path = "crates/storage/proximadb-engine-core" }
-proximadb-sst-engine = { path = "crates/storage/proximadb-sst-engine" }
 proximadb-storage-ports = { path = "crates/storage/proximadb-storage-ports" }
-proximadb-storage-traits = { path = "crates/storage/proximadb-storage-traits" }
-proximadb-storage-encryption = { path = "crates/storage/proximadb-storage-encryption" }
 proximadb-block-format = { path = "crates/storage/proximadb-block-format" }
 proximadb-iceberg-engine = { path = "crates/storage/proximadb-iceberg-engine" }
-proximadb-storage-kv = { path = "crates/storage/proximadb-storage-kv" }
-proximadb-storage-operations = { path = "crates/storage/proximadb-storage-operations" }
-proximadb-storage-optimization = { path = "crates/storage/proximadb-storage-optimization" }
 proximadb-storage-filesystem-types = { path = "crates/storage/proximadb-storage-filesystem-types" }
-proximadb-storage-strategy = { path = "crates/storage/proximadb-storage-strategy" }
-proximadb-storage-tenant = { path = "crates/storage/proximadb-storage-tenant" }
-proximadb-storage-transaction = { path = "crates/storage/proximadb-storage-transaction" }
-proximadb-query-capability = { path = "crates/query/proximadb-query-capability" }
 crc32fast = "1.4"
 rmp-serde = "1.1"
 tonic-prost = "0.14"
@@ -480,7 +452,7 @@ proximadb-quantization-model = { path = "crates/foundation/proximadb-quantizatio
 proximadb-catalog = { path = "crates/control/proximadb-catalog", features = ["fc-metamodel", "openapi"] }
 proximadb-catalog-schema = { workspace = true }
 proximadb-multimodel-codec = { workspace = true }
-proximadb-cdc = { workspace = true }
+proximadb-cdc = { workspace = true, optional = true }
 proximadb-abac = { path = "crates/control/proximadb-abac", optional = true }
 proximadb-metrics = { path = "crates/control/proximadb-metrics" }
 proximadb-api = { path = "crates/platform/proximadb-api" }
@@ -564,7 +536,6 @@ proximadb-rank-profile = { path = "crates/modalities/proximadb-rank-profile" }
 proximadb-rank-onnx = { path = "crates/modalities/proximadb-rank-onnx" }
 proximadb-vector = { path = "crates/modalities/proximadb-vector" }
 proximadb-quantization-kernel = { path = "crates/modalities/proximadb-quantization-kernel" }
-proximadb-graph-arrow = { path = "crates/query/proximadb-graph-arrow" }
 proximadb-graph-query = { path = "crates/query/proximadb-graph-query" }
 proximadb-graph-subset = { path = "crates/query/proximadb-graph-subset" }
 proximadb-multimodel-query = { path = "crates/query/proximadb-multimodel-query" }
@@ -715,7 +686,6 @@ half = "2.4"  # FP16 (float16) support for centroid quantization (50% storage re
 
 # CPU optimization
 num_cpus = "1.16"
-raw-cpuid = "11.0"  # CPU feature detection for x86_64
 
 # Random number generation
 rand.workspace = true
@@ -743,7 +713,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 prometheus.workspace = true
 
 # Configuration
-config = "0.15"
 clap = { version = "4.0", features = ["derive"] }
 toml = "1.1"
 
@@ -782,12 +751,8 @@ nom = "7"
 tantivy = "0.27"  # Full-text search for documents
 jsonpath-rust = "0.5"  # JSON path queries for document filtering (actively maintained)
 
-# PostgreSQL wire protocol compatibility
-pgwire = "0.21"  # PostgreSQL wire protocol for pgvector migration
-
 # REST API
 axum = { version = "0.8", features = ["json", "ws"] }
-urlencoding = "2.1.3"
 dashmap = "6.1.0"
 moka = { version = "0.12", features = ["future"] }
 
@@ -804,8 +769,8 @@ moka = { version = "0.12", features = ["future"] }
 # Provides direct buffer access to numpy arrays without Python .tolist() conversion
 # Java bindings via JNI
 # Node.js bindings via NAPI-RS
-proximadb-raptor-common = { version = "0.7.0", path = "crates/storage/proximadb-raptor-common" }
-proximadb-raptor-engine = { version = "0.7.0", path = "crates/storage/proximadb-raptor-engine" }
+proximadb-raptor-common = { version = "0.7.0", path = "crates/storage/proximadb-raptor-common", optional = true }
+proximadb-raptor-engine = { version = "0.7.0", path = "crates/storage/proximadb-raptor-engine", optional = true }
 proximadb-engine-core = { version = "0.7.0", path = "crates/storage/proximadb-engine-core" }
 proximadb-mongodb-parser = { version = "0.7.0", path = "crates/binding/proximadb-mongodb-parser" }
 
@@ -875,7 +840,7 @@ tenant_access = []
 # Experimental storage engines (RAPTOR, SWIFT); disabled by default to prevent
 # server panics from unimplemented code paths. Enable for development/testing only.
 # RAPTOR fundamentally uses AXIS clustering, so this implies `axis`.
-experimental-engines = ["proximadb-raptor-engine/experimental-engines", "axis"]
+experimental-engines = ["dep:proximadb-raptor-common", "dep:proximadb-raptor-engine", "proximadb-raptor-engine/experimental-engines", "axis"]
 # Experimental transactional Ledger modality (ADR-071 / TD-LEDGER-1): the durable atomic-CAS
 # KV + TTL-lease OLTP surface. Off by default; enables the durable backend + its gRPC service.
 experimental-ledger = ["dep:proximadb-ledger", "proximadb-ledger/durable"]
@@ -970,7 +935,7 @@ network-rest = ["proximadb-tls/network-rest"]
 
 # CDC Kafka integration (change data capture to Kafka)
 # Note: rdkafka dependency would be added when enabling this feature
-cdc-kafka = []
+cdc-kafka = ["dep:proximadb-cdc"]
 
 # LLM-driven semantic join modes (TD-049, arXiv:2510.08489 block-batched joins).
 # When enabled, JoinType::Semantic { mode: LlmBlockBatch { ... } } is dispatched

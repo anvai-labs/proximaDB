@@ -6,7 +6,6 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-homepage = "https://github.com/anvai-labs/proximaDB"
 description = "Shared ProximaDB vector modality contracts and search primitives"
 
 [lib]
@@ -30,18 +29,13 @@ experimental-turboquant = [
 
 [dependencies]
 anyhow.workspace = true
-arrow.workspace = true
 async-trait.workspace = true
 chrono.workspace = true
-proximadb-data-model = { workspace = true }
 proximadb-hardware = { path = "../../foundation/proximadb-hardware" }
 proximadb-kernel = { path = "../../foundation/proximadb-kernel" }
 proximadb-proto = { path = "../../foundation/proximadb-proto" }
 proximadb-quantization-types = { path = "../../foundation/proximadb-quantization-types" }
 proximadb-quantization-model = { workspace = true }
-proximadb-records = { workspace = true }
-proximadb-query-filter = { path = "../../query/proximadb-query-filter" }
-proximadb-vector-query = { path = "../../query/proximadb-vector-query" }
 rand.workspace = true
 serde.workspace = true
 serde_json.workspace = true

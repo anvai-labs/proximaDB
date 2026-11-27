@@ -374,7 +374,7 @@ fn benchmark_hit_rates(c: &mut Criterion) {
                     let mut seed = 12345u64;
                     let release_count = pool_size * 3 / 4; // Release 75%
                     let mut release_indices = Vec::new();
-                    for i in 0..release_count {
+                    for _ in 0..release_count {
                         // Simple LCG: x' = (a * x + c) mod m
                         seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
                         let idx = (seed as usize) % items.len();

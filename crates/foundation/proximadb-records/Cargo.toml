@@ -6,7 +6,6 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-homepage.workspace = true
 description = "ProximaRecord unified record envelope (spec §3 — Phase B, TD-054)"
 
 [lib]
@@ -37,3 +36,6 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 bincode = { workspace = true }
 # TD-072: branch_id-survives-rmp roundtrip tests (matches canonical WAL encoder).
 rmp-serde = "1.1"
+
+[lints]
+workspace = true

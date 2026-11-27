@@ -6,7 +6,6 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-homepage.workspace = true
 description = "Minimal filesystem-backed key-value storage abstraction for ProximaDB (StorageKV trait + FsKV)"
 
 [lib]
@@ -18,3 +17,6 @@ anyhow.workspace = true
 async-trait.workspace = true
 tokio = { version = "1", features = ["fs", "io-util"] }
 tracing = "0.1"
+
+[lints]
+workspace = true

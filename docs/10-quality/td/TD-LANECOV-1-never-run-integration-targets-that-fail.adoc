@@ -70,8 +70,8 @@ deliberate change; **investigate** = deterministic failure, cause not yet proven
 == Also not wired (not failures)
 
 * **Vacuous (pass, but assert nothing):** `gap_implementation_tests` puts every
-  real test under `#[cfg(feature = "gap-tests")]`, a feature that does not exist
-  in `Cargo.toml`, and its 4 remaining tests have comment-only bodies;
+  real test in an always-disabled module, and its 4 remaining tests have
+  comment-only bodies;
   `test_record_store_route` is one empty placeholder. Wiring them would let the
   ratchet certify coverage that checks nothing, so they stay on the baseline.
   Owner decision: implement, or delete with sign-off.

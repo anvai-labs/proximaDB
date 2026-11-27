@@ -6,7 +6,6 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-homepage.workspace = true
 description = "Change-Data-Capture event types + runtime — extracted from the root crate (TD-DECOMP-7)"
 
 [lib]
@@ -43,3 +42,6 @@ tokio-postgres = { version = "0.7", optional = true }
 
 [dev-dependencies]
 tempfile.workspace = true
+
+[lints]
+workspace = true

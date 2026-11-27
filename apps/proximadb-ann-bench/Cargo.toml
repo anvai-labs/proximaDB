@@ -6,7 +6,6 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-homepage.workspace = true
 description = "ProximaDB standardized ANN-benchmarks runner (ann-benchmarks.com methodology)"
 
 [[bin]]
@@ -16,3 +15,6 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 proximadb = { path = "../../", default-features = false }
+
+[lints]
+workspace = true

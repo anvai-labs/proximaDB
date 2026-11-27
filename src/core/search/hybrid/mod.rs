@@ -467,6 +467,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[expect(deprecated, reason = "Checks display for legacy fusion variants")]
     fn test_fusion_strategy_display() {
         let strategies = vec![
             FusionStrategy::ReciprocalRank { k: 60 },
@@ -621,6 +622,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        deprecated,
+        reason = "Checks scoring for the legacy weighted fusion variant"
+    )]
     fn test_weighted_linear_fusion() {
         let engine = HybridFusionEngine::new(FusionStrategy::WeightedLinear {
             alpha: 0.5,

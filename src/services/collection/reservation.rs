@@ -3637,12 +3637,15 @@ mod tests {
 
         static ENV_LOCK: Mutex<()> = Mutex::new(());
 
-        pub struct Guard(std::sync::MutexGuard<'static, ()>, String);
+        pub struct Guard {
+            _lock: std::sync::MutexGuard<'static, ()>,
+            name: String,
+        }
 
         impl Drop for Guard {
             fn drop(&mut self) {
                 // SAFETY: test-only; the mutex proves no parallel reader.
-                unsafe { std::env::remove_var(&self.1) };
+                unsafe { std::env::remove_var(&self.name) };
             }
         }
 
@@ -3650,7 +3653,10 @@ mod tests {
             let guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
             // SAFETY: test-only; the mutex proves no parallel reader.
             unsafe { std::env::set_var(name, value) };
-            Guard(guard, name.to_string())
+            Guard {
+                _lock: guard,
+                name: name.to_owned(),
+            }
         }
     }
 }

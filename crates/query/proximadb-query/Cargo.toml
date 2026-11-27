@@ -6,7 +6,6 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-homepage.workspace = true
 description = "Shared ProximaDB cross-model query runtime layer"
 
 [lib]
@@ -41,3 +40,6 @@ proximadb-query-fusion = { path = "../proximadb-query-fusion" }
 proximadb-runtime-common = { path = "../../horizontal/proximadb-runtime-common" }
 proximadb-uql = { path = "../proximadb-uql" }
 proximadb-vector-query = { path = "../proximadb-vector-query" }
+
+[lints]
+workspace = true

@@ -639,7 +639,7 @@ mod tests {
                 if path.ends_with(&self.target)
                     && self
                         .fail
-                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                        .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
                         .is_ok()
                 {
                     return Err(proximadb_storage_filesystem_types::FilesystemError::Io(

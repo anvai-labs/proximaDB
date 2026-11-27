@@ -7349,7 +7349,7 @@ mod tests {
             self.flushes.fetch_add(1, SeqCst);
             if self
                 .failures
-                .fetch_update(SeqCst, SeqCst, |n| n.checked_sub(1))
+                .try_update(SeqCst, SeqCst, |n| n.checked_sub(1))
                 .is_ok()
             {
                 anyhow::bail!("transient segment write failure");

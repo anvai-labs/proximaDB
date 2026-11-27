@@ -563,19 +563,15 @@ fn onnx_err(e: ort::Error) -> crate::EmbeddingError {
 /// `EpKind::Cpu` is never passed here (the caller short-circuits).
 #[cfg(feature = "onnx")]
 fn register_provider(
-    mut builder: ort::session::builder::SessionBuilder,
+    builder: ort::session::builder::SessionBuilder,
     provider: EpKind,
 ) -> std::result::Result<ort::session::builder::SessionBuilder, String> {
-    use ort::ep::ExecutionProvider;
     match provider {
         EpKind::Cpu => Ok(builder),
         EpKind::CoreMl => {
             #[cfg(feature = "coreml")]
             {
-                ort::ep::CoreML::default()
-                    .register(&mut builder)
-                    .map_err(|e| format!("CoreML register: {e:?}"))?;
-                Ok(builder)
+                register_ort_provider(builder, ort::ep::CoreML::default(), "CoreML")
             }
             #[cfg(not(feature = "coreml"))]
             Err(feature_missing_msg("coreml", "coreml", "macOS / iOS"))
@@ -583,10 +579,7 @@ fn register_provider(
         EpKind::Cuda => {
             #[cfg(feature = "cuda")]
             {
-                ort::ep::CUDA::default()
-                    .register(&mut builder)
-                    .map_err(|e| format!("CUDA register: {e:?}"))?;
-                Ok(builder)
+                register_ort_provider(builder, ort::ep::CUDA::default(), "CUDA")
             }
             #[cfg(not(feature = "cuda"))]
             Err(feature_missing_msg("cuda", "cuda", "NVIDIA CUDA + cuDNN"))
@@ -594,10 +587,7 @@ fn register_provider(
         EpKind::TensorRt => {
             #[cfg(feature = "tensorrt")]
             {
-                ort::ep::TensorRT::default()
-                    .register(&mut builder)
-                    .map_err(|e| format!("TensorRT register: {e:?}"))?;
-                Ok(builder)
+                register_ort_provider(builder, ort::ep::TensorRT::default(), "TensorRT")
             }
             #[cfg(not(feature = "tensorrt"))]
             Err(feature_missing_msg(
@@ -609,10 +599,7 @@ fn register_provider(
         EpKind::Rocm => {
             #[cfg(feature = "rocm")]
             {
-                ort::ep::ROCm::default()
-                    .register(&mut builder)
-                    .map_err(|e| format!("ROCm register: {e:?}"))?;
-                Ok(builder)
+                register_ort_provider(builder, ort::ep::ROCm::default(), "ROCm")
             }
             #[cfg(not(feature = "rocm"))]
             Err(feature_missing_msg("rocm", "rocm", "AMD ROCm/HIP runtime"))
@@ -620,10 +607,7 @@ fn register_provider(
         EpKind::MiGraphX => {
             #[cfg(feature = "migraphx")]
             {
-                ort::ep::MIGraphX::default()
-                    .register(&mut builder)
-                    .map_err(|e| format!("MIGraphX register: {e:?}"))?;
-                Ok(builder)
+                register_ort_provider(builder, ort::ep::MIGraphX::default(), "MIGraphX")
             }
             #[cfg(not(feature = "migraphx"))]
             Err(feature_missing_msg(
@@ -635,10 +619,7 @@ fn register_provider(
         EpKind::OpenVino => {
             #[cfg(feature = "openvino")]
             {
-                ort::ep::OpenVINO::default()
-                    .register(&mut builder)
-                    .map_err(|e| format!("OpenVINO register: {e:?}"))?;
-                Ok(builder)
+                register_ort_provider(builder, ort::ep::OpenVINO::default(), "OpenVINO")
             }
             #[cfg(not(feature = "openvino"))]
             Err(feature_missing_msg(
@@ -650,10 +631,7 @@ fn register_provider(
         EpKind::OneDnn => {
             #[cfg(feature = "onednn")]
             {
-                ort::ep::OneDNN::default()
-                    .register(&mut builder)
-                    .map_err(|e| format!("oneDNN register: {e:?}"))?;
-                Ok(builder)
+                register_ort_provider(builder, ort::ep::OneDNN::default(), "oneDNN")
             }
             #[cfg(not(feature = "onednn"))]
             Err(feature_missing_msg("onednn", "onednn", "Intel x86_64 host"))
@@ -661,10 +639,7 @@ fn register_provider(
         EpKind::DirectMl => {
             #[cfg(feature = "directml")]
             {
-                ort::ep::DirectML::default()
-                    .register(&mut builder)
-                    .map_err(|e| format!("DirectML register: {e:?}"))?;
-                Ok(builder)
+                register_ort_provider(builder, ort::ep::DirectML::default(), "DirectML")
             }
             #[cfg(not(feature = "directml"))]
             Err(feature_missing_msg(
@@ -676,10 +651,7 @@ fn register_provider(
         EpKind::XnnPack => {
             #[cfg(feature = "xnnpack")]
             {
-                ort::ep::XNNPACK::default()
-                    .register(&mut builder)
-                    .map_err(|e| format!("XNNPACK register: {e:?}"))?;
-                Ok(builder)
+                register_ort_provider(builder, ort::ep::XNNPACK::default(), "XNNPACK")
             }
             #[cfg(not(feature = "xnnpack"))]
             Err(feature_missing_msg("xnnpack", "xnnpack", "any (CPU)"))
@@ -687,10 +659,7 @@ fn register_provider(
         EpKind::WebGpu => {
             #[cfg(feature = "webgpu")]
             {
-                ort::ep::WebGPU::default()
-                    .register(&mut builder)
-                    .map_err(|e| format!("WebGPU register: {e:?}"))?;
-                Ok(builder)
+                register_ort_provider(builder, ort::ep::WebGPU::default(), "WebGPU")
             }
             #[cfg(not(feature = "webgpu"))]
             Err(feature_missing_msg(
@@ -700,6 +669,29 @@ fn register_provider(
             ))
         }
     }
+}
+
+#[cfg(any(
+    feature = "coreml",
+    feature = "cuda",
+    feature = "tensorrt",
+    feature = "rocm",
+    feature = "migraphx",
+    feature = "openvino",
+    feature = "onednn",
+    feature = "directml",
+    feature = "xnnpack",
+    feature = "webgpu",
+))]
+fn register_ort_provider(
+    mut builder: ort::session::builder::SessionBuilder,
+    provider: impl ort::ep::ExecutionProvider,
+    name: &str,
+) -> std::result::Result<ort::session::builder::SessionBuilder, String> {
+    provider
+        .register(&mut builder)
+        .map_err(|error| format!("{name} register: {error:?}"))?;
+    Ok(builder)
 }
 
 #[cfg(feature = "onnx")]

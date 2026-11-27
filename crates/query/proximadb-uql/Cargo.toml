@@ -6,7 +6,6 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-homepage.workspace = true
 description = "Shared ProximaDB unified query parser and decomposition adapter"
 
 [lib]
@@ -25,3 +24,6 @@ proximadb-query-clauses = { path = "../proximadb-query-clauses" }
 proximadb-query-filter = { path = "../proximadb-query-filter" }
 proximadb-query-fusion = { path = "../proximadb-query-fusion" }
 proximadb-vector-query = { path = "../proximadb-vector-query" }
+
+[lints]
+workspace = true

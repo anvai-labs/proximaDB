@@ -6,7 +6,6 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-homepage.workspace = true
 description = "Foundation search-result and filter-value types for ProximaDB: search-result records, bounded result queue, SQL/JSON value filtering, and JSON value (de)serialization"
 
 [lib]

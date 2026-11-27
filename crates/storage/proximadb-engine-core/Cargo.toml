@@ -6,7 +6,6 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-homepage.workspace = true
 description = "Shared engine-core ops + formats hoisted out of the root crate (root-crate decomposition, engines extraction). Occupants: simd_decode ops + hermetic proximablocks sub-leaves."
 
 [lib]

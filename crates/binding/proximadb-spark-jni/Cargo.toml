@@ -6,7 +6,6 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-homepage.workspace = true
 description = "JNI bindings exposing ProximaDB's Spark connector helpers as a C-ABI cdylib for JVM loaders."
 
 # cdylib only. The main `proximadb` crate is rlib-only because cdylib breaks
@@ -21,3 +20,6 @@ proximadb = { path = "../../..", default-features = false, features = ["sql_fron
 proximadb-embedded = { path = "../proximadb-embedded" }
 jni = "0.21"
 tracing = "0.1"
+
+[lints]
+workspace = true

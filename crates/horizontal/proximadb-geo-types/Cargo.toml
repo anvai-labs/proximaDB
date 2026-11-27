@@ -6,7 +6,6 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-homepage.workspace = true
 description = "Geospatial type definitions (GeoPoint, GeoBoundingBox, GeoCircle, GeoPolygon, GeoDistanceUnit) — extracted from root index/geo (TD-DECOMP-59)"
 
 [lib]
@@ -15,3 +14,6 @@ path = "src/lib.rs"
 
 [dependencies]
 serde = { workspace = true }
+
+[lints]
+workspace = true

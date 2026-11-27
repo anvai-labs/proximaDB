@@ -12,9 +12,7 @@ use proximadb::storage::persistence::filesystem::{FilesystemConfig, FilesystemFa
 use proximadb::storage::persistence::write_ahead_log::BatchId;
 use proximadb::storage::traits::{FlushParameters, UnifiedStorageEngine};
 use proximadb_data_model::ProximaValue;
-use proximadb_records::{
-    EmbeddingCell, EmbeddingValues, LabelSet, ProximaRecord, ProximaTree, ProximaTreeNode,
-};
+use proximadb_records::{EmbeddingCell, LabelSet, ProximaRecord, ProximaTree, ProximaTreeNode};
 use std::collections::HashMap;
 
 // Import test utilities
@@ -130,7 +128,7 @@ async fn test_nova_engine_creation_and_insertion() {
     let collection_id = "nova_test_collection";
 
     // REFACTORED: Use TestCollectionBuilder
-    let (mut collection, _temp) = TestCollectionBuilder::new()
+    let (collection, _temp) = TestCollectionBuilder::new()
         .with_id(collection_id)
         .with_name(collection_id)
         .with_dimension(128)

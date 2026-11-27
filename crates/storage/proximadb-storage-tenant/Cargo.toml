@@ -6,7 +6,6 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-homepage.workspace = true
 description = "ProximaDB storage-layer tenant model (context, domain, RBAC, resources, entity/knowledge-graph stores)"
 
 [lib]
@@ -24,3 +23,6 @@ tracing.workspace = true
 uuid = { version = "1", features = ["v4"] }
 proximadb-proto.workspace = true
 proximadb-storage-common.workspace = true
+
+[lints]
+workspace = true

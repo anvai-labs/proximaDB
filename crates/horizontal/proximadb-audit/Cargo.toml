@@ -6,7 +6,6 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-homepage.workspace = true
 description = "Audit correlation analysis + cross-tenant guard — extracted from root (TD-DECOMP-16)"
 
 [lib]
@@ -20,5 +19,10 @@ chrono.workspace = true
 proximadb-security = { path = "../../horizontal/proximadb-security" }
 serde.workspace = true
 serde_json.workspace = true
-tokio.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+
+[lints]
+workspace = true

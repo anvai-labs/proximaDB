@@ -16,8 +16,8 @@ use std::collections::HashMap;
 
 use proximadb::datafusion::{CollectionInfo, EngineType, PruningStatistics};
 use proximadb::storage::formats::{
-    CacheStatus, ColumnBounds, FileSplit, ScalarPredicate, ScalarValue, SpatialBounds,
-    SplitStatistics, SplitType, StorageTier,
+    CacheStatus, ColumnBounds, FileSplit, ScalarPredicate, ScalarValue, SpatialBounds, SplitType,
+    StorageTier,
 };
 
 // ============================================================================

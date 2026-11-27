@@ -6,7 +6,6 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-homepage.workspace = true
 description = "ProximaDB rich hardware-capability detection (CPU/SIMD/memory/GPU) layered on proximadb-hardware; GPU detection is injected via register_gpu_detector so this foundation layer stays free of compute"
 
 [lib]
@@ -35,3 +34,6 @@ proximadb-config.workspace = true
 # crate). Pinned to match the root crate's existing `raw-cpuid = "11.0"`.
 [target.'cfg(target_arch = "x86_64")'.dependencies]
 raw-cpuid = "11.0"
+
+[lints]
+workspace = true

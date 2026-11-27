@@ -14,3 +14,8 @@ ort = { version = "2.0.0-rc.15", default-features = false, features = [
     "half",
 ] }
 
+[build-dependencies]
+cc = "1"
+
+[lints]
+workspace = true

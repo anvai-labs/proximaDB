@@ -163,7 +163,7 @@ mod helix_cold_search_recall {
         eprintln!("Query vectors: {:?}", expected_ids);
 
         // Track recall values across scopes
-        let mut warm_recall = 0.0f64;
+        let warm_recall;
 
         // ========== PHASE 1: Insert and flush with HELIX ==========
         eprintln!("\n--- Phase 1: Insert and flush ---");

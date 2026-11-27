@@ -244,7 +244,7 @@ fn bench_directory_serde_throughput() -> Vec<DirectorySerdeMeasurement> {
         };
         println!(
             "   {:<12} ser {:>8}µs   deser {:>8}µs   payload {:>10}",
-            label,
+            m.label,
             ns_to_us(m.serialize_ns),
             ns_to_us(m.deserialize_ns),
             format_bytes(m.serialized_bytes as u64),

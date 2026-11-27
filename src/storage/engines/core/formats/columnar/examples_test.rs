@@ -14,7 +14,6 @@ use tempfile::tempdir;
 use super::*;
 use crate::storage::persistence::filesystem::{FilesystemConfig, FilesystemFactory};
 use proximadb_data_model::ProximaValue;
-use proximadb_hardware_caps::HardwareCapabilities;
 use proximadb_records::{EmbeddingCell, ProximaRecord, ProximaTreeNode};
 
 /// Example: NOVA engine using the same columnar infrastructure

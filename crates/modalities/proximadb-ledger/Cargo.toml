@@ -6,7 +6,6 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-homepage = "https://github.com/anvai-labs/proximaDB"
 description = "ProximaDB transactional Ledger modality — OLTP atomic-CAS keyed records with TTL leases (ADR-071 / TD-LEDGER-1). S1: the in-memory correctness core."
 
 [lib]
@@ -28,3 +27,6 @@ bincode = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile.workspace = true
+
+[lints]
+workspace = true

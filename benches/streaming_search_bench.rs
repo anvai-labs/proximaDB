@@ -21,8 +21,8 @@ use tokio::sync::mpsc;
 /// Simulated streaming search result (mirrors EmbeddedSearchIterator output)
 #[derive(Debug, Clone)]
 struct StreamingSearchResult {
-    id: String,
-    score: f32,
+    _id: String,
+    _score: f32,
     #[allow(dead_code)]
     metadata: HashMap<String, String>,
 }
@@ -30,8 +30,8 @@ struct StreamingSearchResult {
 /// Simulated non-streaming search result with full vector data
 #[derive(Clone)]
 struct FullSearchResult {
-    id: String,
-    score: f32,
+    _id: String,
+    _score: f32,
     vector: Vec<f32>,
     #[allow(dead_code)]
     metadata: HashMap<String, String>,
@@ -94,8 +94,8 @@ fn simulate_non_streaming_search(
     scored
         .into_iter()
         .map(|(idx, score)| FullSearchResult {
-            id: format!("vec_{}", idx),
-            score,
+            _id: format!("vec_{}", idx),
+            _score: score,
             vector: database[idx].clone(),
             metadata: HashMap::new(),
         })
@@ -126,8 +126,8 @@ fn simulate_streaming_search(
     let results: Vec<StreamingSearchResult> = scored
         .into_iter()
         .map(|(idx, score)| StreamingSearchResult {
-            id: format!("vec_{}", idx),
-            score,
+            _id: format!("vec_{}", idx),
+            _score: score,
             metadata: HashMap::new(),
         })
         .collect();
@@ -191,8 +191,8 @@ async fn simulate_async_streaming_search(
             let batch: Vec<StreamingSearchResult> = chunk
                 .iter()
                 .map(|(idx, score)| StreamingSearchResult {
-                    id: format!("vec_{}", *idx),
-                    score: *score,
+                    _id: format!("vec_{}", *idx),
+                    _score: *score,
                     metadata: HashMap::new(),
                 })
                 .collect();

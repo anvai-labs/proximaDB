@@ -809,8 +809,7 @@ mod onnx_selector {
 
     use super::answer_quality_data::{QaBed, QaBedConfig, generate_qa_bed};
     use super::bench_answer_quality::{
-        AnswerExtractor, AnswerQualityEvaluator, BestSentence, SelectorRankings, WholeTopDocument,
-        sentence_bounds,
+        AnswerQualityEvaluator, BestSentence, SelectorRankings, WholeTopDocument, sentence_bounds,
     };
     use super::bench_selector_benchmark::{
         ResultSource, SelectorBenchmark, SelectorConfig, SelectorResult,
@@ -843,8 +842,6 @@ mod onnx_selector {
         extractor: proximadb_rank_onnx::bert_pair_tokenizing_extractor::BertPairTokenizingDocFeatureExtractor,
         texts: Arc<SharedTexts>,
         session: proximadb_rank_onnx::ort_tokenized_scorer_session::OrtTokenizedScorerSession,
-        max_seq_len: usize,
-        emits_tti: bool,
     }
 
     impl RealScorer {
@@ -905,8 +902,6 @@ mod onnx_selector {
                 extractor,
                 texts,
                 session,
-                max_seq_len,
-                emits_tti,
             })
         }
 
@@ -1075,7 +1070,7 @@ mod onnx_selector {
 
         // Ordering quality, gate-2 metrics: does REAL cross-encoder scoring rank
         // the gold document higher within the window than raw score order did?
-        use super::bench_selector_benchmark::{recall_at_ks, reciprocal_rank};
+        use super::bench_selector_benchmark::reciprocal_rank;
         let mrr_of = |rankings: &SelectorRankings| -> f64 {
             bed.ground_truth
                 .iter()

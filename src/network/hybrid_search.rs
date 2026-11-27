@@ -569,6 +569,7 @@ mod tests {
     }
 
     #[test]
+    #[expect(deprecated, reason = "Checks the legacy weighted fusion wire mapping")]
     fn proto_fusion_strategy_honors_rrf_and_weighted_params() {
         let rrf = proto_fusion_strategy(
             proximadb_proto::v1::FusionStrategy::Rrf as i32,

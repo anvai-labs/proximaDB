@@ -67,7 +67,6 @@ mod performance_comparison_tests {
         flush_throughput: f64,
         compaction_time: Option<Duration>,
         compaction_throughput: Option<f64>,
-        query_times: Vec<Duration>,
         avg_query_time: Duration,
         p50_query_time: Duration,
         p95_query_time: Duration,
@@ -199,7 +198,6 @@ mod performance_comparison_tests {
 
         // Measure query performance
         let mut query_times = Vec::new();
-        let mut empty_result_count = 0;
         for (idx, query) in query_vectors.iter().enumerate() {
             let query_start = Instant::now();
             let search_params = Arc::new(proximadb::core::search::SearchParams {
@@ -299,7 +297,6 @@ mod performance_comparison_tests {
 
             // Track empty results
             if results.is_empty() {
-                empty_result_count += 1;
                 if idx == 0 {
                     eprintln!(
                         "[WARN] Engine {} returned 0 results on first query - may be cache warmup",
@@ -343,7 +340,6 @@ mod performance_comparison_tests {
             flush_throughput,
             compaction_time,
             compaction_throughput,
-            query_times,
             avg_query_time,
             p50_query_time: p50,
             p95_query_time: p95,

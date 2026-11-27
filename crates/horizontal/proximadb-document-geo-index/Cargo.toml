@@ -6,7 +6,6 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-homepage.workspace = true
 description = "Geohash-based geospatial index for document fields (point insert + radius/bbox/nearest queries) — extracted from root storage/document/indexes (TD-DECOMP-39)"
 
 [lib]
@@ -15,3 +14,6 @@ path = "src/lib.rs"
 
 [dependencies]
 anyhow.workspace = true
+
+[lints]
+workspace = true

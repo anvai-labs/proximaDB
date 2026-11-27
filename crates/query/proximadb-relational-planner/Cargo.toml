@@ -6,7 +6,6 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-homepage.workspace = true
 description = "Physical planner for ProximaDB's relational query path — rules + strategy selection (ADR-019 L3/S2)"
 
 [lib]
@@ -21,3 +20,6 @@ proximadb-relational-reader = { workspace = true }
 serde.workspace = true
 stacker.workspace = true
 thiserror.workspace = true
+
+[lints]
+workspace = true

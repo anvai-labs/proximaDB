@@ -6,7 +6,6 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-homepage.workspace = true
 description = "Geospatial query builders (GeoQuery, GeoQueryBuilder, GeoQueryResult) — extracted from root index/geo (TD-DECOMP-61)"
 
 [lib]
@@ -16,3 +15,6 @@ path = "src/lib.rs"
 [dependencies]
 serde = { workspace = true }
 proximadb-geo-types = { workspace = true }
+
+[lints]
+workspace = true

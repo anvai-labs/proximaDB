@@ -6,7 +6,6 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-homepage.workspace = true
 description = "WAL v2 segment header (serialization + integrity) — extracted from root storage/persistence/write_ahead_log (TD-DECOMP-27)"
 
 [lib]
@@ -17,3 +16,6 @@ path = "src/lib.rs"
 anyhow.workspace = true
 proximadb-records.workspace = true
 serde.workspace = true
+
+[lints]
+workspace = true

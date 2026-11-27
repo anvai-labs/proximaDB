@@ -6,7 +6,6 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-homepage.workspace = true
 description = "ORION graph engine: in-memory CSR traversal + WAL-persisted topology projection over canonical records. Extracted from the root crate (ORION move 6g)."
 
 [lib]
@@ -42,7 +41,6 @@ proximadb-proto.workspace = true
 # Storage-tier leaf deps (WAL/filesystem/cache ports + tenant + common WAL types)
 proximadb-storage-common.workspace = true
 proximadb-storage-ports.workspace = true
-proximadb-storage-tenant.workspace = true
 # Control-tier (modality -> control is allowed by the workspace boundaries)
 # Modality-tier: graph algorithms/compaction (re-exported by the engine's shim modules)
 proximadb-graph = { path = "../proximadb-graph" }

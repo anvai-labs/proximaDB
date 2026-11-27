@@ -1342,6 +1342,7 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    #[expect(deprecated, reason = "Checks the legacy weighted fusion service path")]
     async fn hybrid_search_with_weighted_fusion_returns_fused_hits() {
         crate::query::request_scope::with_internal_scope("test", async move {
             use crate::core::search::hybrid::FusionStrategy;

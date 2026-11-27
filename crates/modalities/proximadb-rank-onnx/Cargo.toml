@@ -6,7 +6,6 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-homepage = "https://github.com/anvai-labs/proximaDB"
 description = "Shared ONNX scorer primitives for ProximaDB ranking: ScorerSession, OnnxModelCache (LRU+refcount), BatchedScorer, ModelRegistry. See roadmap/RANKING_FRAMEWORK_SPEC_2026_05_23.md (R-5)."
 
 [lib]
@@ -35,8 +34,6 @@ dashmap.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["sync"] }
-tracing.workspace = true
 
 # Real ONNX runtime — version + features pinned to match
 # crates/modalities/proximadb-embedding so both crates link against
@@ -63,3 +60,6 @@ tokenizers = { version = "0.23", optional = true, default-features = false, feat
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time"] }
+
+[lints]
+workspace = true

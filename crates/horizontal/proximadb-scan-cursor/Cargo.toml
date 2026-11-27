@@ -6,7 +6,6 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-homepage.workspace = true
 description = "Paginated scan-cursor state + base64 continuation-token codec — extracted from root services (TD-DECOMP-50)"
 
 [lib]
@@ -19,3 +18,6 @@ serde = { workspace = true }
 thiserror = { workspace = true }
 rmp-serde = { workspace = true }
 base64 = "0.22"
+
+[lints]
+workspace = true

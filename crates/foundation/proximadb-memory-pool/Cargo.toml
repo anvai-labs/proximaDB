@@ -6,7 +6,6 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-homepage.workspace = true
 description = "ProximaDB foundation-tier memory pooling infrastructure (reusable buffer pools to reduce allocation overhead in vector operations)"
 
 [lib]
@@ -16,3 +15,6 @@ path = "src/lib.rs"
 [dependencies]
 parking_lot.workspace = true
 tracing.workspace = true
+
+[lints]
+workspace = true

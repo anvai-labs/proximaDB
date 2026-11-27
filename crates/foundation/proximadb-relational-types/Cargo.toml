@@ -6,7 +6,6 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-homepage.workspace = true
 description = "Typed relational expressions, rows, and schema — the foundation for ProximaDB's SQL query path"
 
 [lib]
@@ -19,3 +18,6 @@ proximadb-data-model = { workspace = true }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+
+[lints]
+workspace = true

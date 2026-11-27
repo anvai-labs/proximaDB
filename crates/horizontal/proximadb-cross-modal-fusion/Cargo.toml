@@ -6,7 +6,6 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-homepage.workspace = true
 description = "Modality-agnostic cross-modal calibrate + fuse + rank core — extracted from root core/search (TD-DECOMP-19)"
 
 [lib]
@@ -14,3 +13,6 @@ name = "proximadb_cross_modal_fusion"
 path = "src/lib.rs"
 
 [dependencies]
+
+[lints]
+workspace = true

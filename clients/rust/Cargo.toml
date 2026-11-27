@@ -13,7 +13,6 @@ rust-version = "1.88"
 [dependencies]
 # Error handling
 thiserror = "2.0"
-anyhow = "1.0"
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
@@ -63,3 +62,6 @@ required-features = ["client"]
 name = "fluent_api"
 path = "examples/fluent_api.rs"
 required-features = ["client"]
+
+[lints]
+workspace = true

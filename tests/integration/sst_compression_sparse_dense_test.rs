@@ -156,8 +156,8 @@ async fn test_compression_dense_data() -> anyhow::Result<()> {
         .map(|i| {
             let values: Vec<f32> = (0..1024)
                 .map(|j| {
-                    ((i as f32 * 0.1 + j as f32 * 0.01).sin()
-                        * (i as f32 * 0.05 + j as f32 * 0.02).cos())
+                    (i as f32 * 0.1 + j as f32 * 0.01).sin()
+                        * (i as f32 * 0.05 + j as f32 * 0.02).cos()
                 })
                 .collect();
             let mut props = proximadb_records::ProximaTree::new();

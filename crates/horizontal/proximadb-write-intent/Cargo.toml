@@ -6,7 +6,6 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-homepage.workspace = true
 description = "Write-intent tracking types (TD-DECOMP-37)"
 
 [lib]
@@ -14,5 +13,7 @@ name = "proximadb_write_intent"
 path = "src/lib.rs"
 
 [dependencies]
-serde.workspace = true
 anyhow.workspace = true
+
+[lints]
+workspace = true

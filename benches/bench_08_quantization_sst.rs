@@ -22,7 +22,6 @@ fn init_hardware() {
 }
 
 use proximadb::compute::quantization::{StorageQuantizationConfig, StorageQuantizationEngine};
-use proximadb::core::memory::pool::VectorMemoryPool;
 use proximadb_distance_kernel::DistanceMetric;
 
 /// Generate random vectors for benchmarking
@@ -151,7 +150,6 @@ fn bench_memory_pool(c: &mut Criterion) {
     let mut group = c.benchmark_group("memory_pool");
     group.measurement_time(Duration::from_secs(5));
 
-    let memory_pool = Arc::new(VectorMemoryPool::new());
     let vectors = generate_vectors(128, 384);
 
     group.bench_function("with_pooling", |b| {

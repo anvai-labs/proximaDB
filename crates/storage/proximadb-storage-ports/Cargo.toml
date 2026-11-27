@@ -6,7 +6,6 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-homepage.workspace = true
 description = "Dependency-inversion port traits for ProximaDB storage: narrow contracts (CollectionMetadataPort, …) that storage depends on downward while the composition root injects concrete implementations (Slice D)"
 
 [lib]

@@ -6,7 +6,6 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-homepage.workspace = true
 description = "Record-granularity buffer-pool primitive (clock admission/eviction, VeloANN arXiv 2602.22805) — extracted from root storage/cache (TD-DECOMP-26)"
 
 [lib]
@@ -15,3 +14,6 @@ path = "src/lib.rs"
 
 [dependencies]
 tokio.workspace = true
+
+[lints]
+workspace = true

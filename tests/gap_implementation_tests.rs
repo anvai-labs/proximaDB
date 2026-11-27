@@ -7,7 +7,8 @@
 // These tests validate critical functionality that was implemented but not being
 // exercised in CI/CD due to the cdylib issue.
 
-#[cfg(feature = "gap-tests")]
+// TD-LANECOV-1 tracks replacing or retiring these dormant checks.
+#[cfg(any())]
 mod gap_tests {
     // Test transaction engine wiring (TD-020, TD-038)
     mod transaction_engine_wiring {

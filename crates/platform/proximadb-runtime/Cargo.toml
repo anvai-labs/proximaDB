@@ -6,7 +6,6 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-homepage.workspace = true
 description = "Platform runtime composition helpers for ProximaDB"
 
 [lib]
@@ -26,7 +25,6 @@ tonic.workspace = true
 serde_json.workspace = true
 # Cluster-core subsystem (TD-DECOMP-5, moved from root src/cluster/).
 chrono.workspace = true
-proximadb-graph-query = { path = "../../query/proximadb-graph-query" }
 proximadb-vector-query = { path = "../../query/proximadb-vector-query" }
 proximadb-hardware = { path = "../../foundation/proximadb-hardware" }
 proximadb-kernel = { path = "../../foundation/proximadb-kernel" }
@@ -58,3 +56,6 @@ default = []
 # in `bootstrap_config.rs` would unexpected-cfg-condition-value lint. (`uuid` is now
 # unconditional — see [dependencies] — so this feature enables only the cfg gate, not a dep.)
 cluster = []
+
+[lints]
+workspace = true

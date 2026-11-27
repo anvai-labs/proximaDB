@@ -6,7 +6,6 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-homepage.workspace = true
 description = "Geospatial secondary index (GeoIndex — geohash-based spatial search) — extracted from root index/geo (TD-DECOMP-62)"
 
 [lib]
@@ -17,3 +16,6 @@ path = "src/lib.rs"
 proximadb-geo-types = { workspace = true }
 proximadb-geohash = { workspace = true }
 proximadb-geo-queries = { workspace = true }
+
+[lints]
+workspace = true

@@ -39,7 +39,6 @@ fn free_port() -> u16 {
 
 struct ScramTestServer {
     pg_port: u16,
-    rest_port: u16,
     db: Option<ProximaDB>,
     _tmp: TempDir,
 }
@@ -147,7 +146,6 @@ impl ScramTestServer {
 
         Ok(Self {
             pg_port,
-            rest_port,
             db: Some(db),
             _tmp: tmp,
         })

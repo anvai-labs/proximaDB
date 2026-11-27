@@ -290,7 +290,7 @@ impl Route {
 }
 
 #[derive(Clone)]
-struct MockHandler {
+pub struct MockHandler {
     name: String,
     calls: Arc<std::sync::Mutex<Vec<String>>>,
 }

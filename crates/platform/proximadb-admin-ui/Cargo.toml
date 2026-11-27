@@ -6,8 +6,10 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-homepage = "https://github.com/anvai-labs/proximaDB"
 description = "ProximaDB embedded read-only admin dashboard — a self-contained web UI served at /admin"
 
 [dependencies]
 axum.workspace = true
+
+[lints]
+workspace = true

@@ -6,7 +6,6 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-homepage.workspace = true
 description = "Kafka message deserializers (JSON/Avro/Protobuf/Raw → VectorMessage) — extracted from root streaming/kafka (TD-DECOMP-42)"
 
 [lib]
@@ -17,3 +16,6 @@ path = "src/lib.rs"
 serde = { workspace = true }
 serde_json = { workspace = true }
 proximadb-kafka-config = { workspace = true }
+
+[lints]
+workspace = true

@@ -7,7 +7,7 @@
 //! ingestion consumer: broker endpoints, consumer-group config, commit
 //! strategy, dead-letter-queue (DLQ) policy, and deserialization format
 //! ([`config::KafkaConsumerConfig`] and friends). The module depends only on
-//! `serde`/`serde_json` — the heavy `rdkafka` consumer/deserializer impls stay
+//! `serde` — the heavy `rdkafka` consumer/deserializer impls stay
 //! root-side, keeping this a clean horizontal-tier config leaf.
 
 pub mod config;

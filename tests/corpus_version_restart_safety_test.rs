@@ -23,10 +23,6 @@ use proximadb::catalog::{
 };
 use tempfile::TempDir;
 
-fn store_at(dir: &TempDir, name: &str) -> Arc<FileSystemCorpusVersionStore> {
-    Arc::new(FileSystemCorpusVersionStore::new(dir.path().join(name)))
-}
-
 #[tokio::test]
 async fn bumps_survive_drop_and_reload_cycle() {
     let dir = TempDir::new().unwrap();

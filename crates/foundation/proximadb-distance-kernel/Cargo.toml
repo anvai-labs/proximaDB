@@ -6,7 +6,6 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-homepage.workspace = true
 description = "ProximaDB distance-computation kernel (SIMD/quantized/sparse distance engine over proximadb-vector); GPU acceleration is injected via register_gpu_accelerator_factory so this foundation crate stays free of compute"
 
 [lib]
@@ -34,3 +33,6 @@ proximadb-hardware.workspace = true
 proximadb-hardware-caps.workspace = true
 proximadb-proto.workspace = true
 proximadb-memory-pool.workspace = true
+
+[lints]
+workspace = true

@@ -1046,7 +1046,6 @@ mod tests {
         assert_eq!(p.group(RegionGroup::Rerank).mode_from, Provenance::Builtin);
     }
 
-    #[test]
     /// The full resolution chain: collection property > server default >
     /// advisor > built-in. Each layer must override the one below it.
     #[test]
@@ -1119,6 +1118,7 @@ mod tests {
         );
     }
 
+    #[test]
     fn server_policy_round_trips_as_config() {
         let mut server = ServerCachePolicy {
             advisor: AdvisorMode::On,

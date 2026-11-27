@@ -6,7 +6,6 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-homepage.workspace = true
 description = "Core storage-engine port traits (UnifiedStorageFormat + parameter/result types) for ProximaDB — the contract between the service layer and the pluggable storage engines, hoisted out of the root crate as the capstone of the root-crate decomposition (link 7)"
 
 [lib]

@@ -6,7 +6,6 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-homepage.workspace = true
 description = "Recall harness for the embedding-precision rollout — compares top-K overlap between a reference precision config and a candidate config across canonical recall benchmarks (SIFT-1M, GloVe-100, synthetic). LLD: docs/12-design/EMBEDDING_PRECISION_LLD_2026_05_22.adoc §PR 11"
 
 [lib]
@@ -14,7 +13,6 @@ name = "proximadb_recall_bench"
 path = "src/lib.rs"
 
 [dependencies]
-proximadb-records = { workspace = true }
 serde.workspace = true
 thiserror.workspace = true
 
@@ -29,3 +27,7 @@ serde_json.workspace = true
 # importable from horizontal crates per workspace layering rules.
 proximadb-catalog = { workspace = true }
 half = "2.7"
+proximadb-records = { workspace = true }
+
+[lints]
+workspace = true

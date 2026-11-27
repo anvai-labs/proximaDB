@@ -1,14 +1,14 @@
 #![cfg(feature = "experimental-engines")] // RAPTOR needs the `experimental-engines` feature.
+#![expect(deprecated, reason = "This suite exercises the opt-in legacy engine")]
 //! Integration tests for the Raptor storage engine.
 
 use std::sync::Arc;
 use tempfile::TempDir;
 
-use proximadb::proto::proximadb_v1::{CollectionConfig, DistanceMetric, StorageEngine};
+use proximadb::proto::proximadb_v1::{DistanceMetric, StorageEngine};
 use proximadb::storage::engines::raptor::RaptorEngine;
-use proximadb::storage::persistence::filesystem::{FilesystemConfig, FilesystemFactory};
 use proximadb::storage::persistence::write_ahead_log::BatchId;
-use proximadb::storage::traits::{FlushParameters, UnifiedStorageEngine};
+use proximadb::storage::traits::UnifiedStorageEngine;
 use proximadb_records::ProximaRecord;
 
 // Import test utilities
@@ -23,19 +23,6 @@ use vector_generator::sequential;
 /// Test setup helper
 async fn create_test_setup() -> (Arc<RaptorEngine>, TempDir) {
     let temp_dir = TempDir::new().unwrap();
-    let filesystem_config = FilesystemConfig::default();
-    let filesystem = Arc::new(FilesystemFactory::create(filesystem_config).await.unwrap());
-
-    // Create collection service - not needed for this test since we're testing the engine directly
-    // The collection service would normally manage collections at a higher level
-
-    // Create cache orchestrator for RAPTOR engine with memory budget
-    let cache_orchestrator = Arc::new(
-        proximadb::storage::cache::orchestrator::CrossCacheOrchestrator::new(
-            1024 * 1024 * 1024, // 1GB memory budget
-        ),
-    );
-
     let raptor_engine = Arc::new(RaptorEngine::new().await.unwrap());
 
     (raptor_engine, temp_dir)

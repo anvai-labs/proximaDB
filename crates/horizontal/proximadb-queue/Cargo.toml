@@ -6,7 +6,6 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-homepage = "https://github.com/anvai-labs/proximaDB"
 description = "ProximaDB tiered persistent queue — memory + disk + object-store tiers with per-tenant partitioning and group-commit fsync"
 
 [lib]
@@ -35,9 +34,6 @@ async-trait.workspace = true
 uuid = { version = "1.0", features = ["v4"] }
 proximadb-runtime-common.workspace = true
 
-# Lock-free bounded queues for the memory tier
-crossbeam-queue = "0.3"
-
 # Singleton + concurrent maps
 once_cell = "1.19"
 dashmap = "6.1.0"
@@ -65,3 +61,6 @@ pyo3 = { workspace = true, optional = true }
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "test-util", "rt-multi-thread"] }
 tempfile.workspace = true
+
+[lints]
+workspace = true
