@@ -25,8 +25,8 @@ pub mod key_manager;
 pub mod wal_encryption;
 
 use aes_gcm::{
-    Aes256Gcm, Nonce,
-    aead::{Aead, AeadCore, KeyInit, OsRng, Payload},
+    Aes256Gcm,
+    aead::{Aead, Generate, KeyInit, Nonce, Payload},
 };
 use anyhow::Result;
 use sha2::{Digest, Sha256};
@@ -76,7 +76,7 @@ impl Default for StorageEncryptionConfig {
 /// Encrypt data using AES-256-GCM
 pub fn encrypt_data(key: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>> {
     let cipher = Aes256Gcm::new(key.into());
-    let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
+    let nonce = Nonce::<Aes256Gcm>::generate();
 
     let mut ciphertext = cipher
         .encrypt(&nonce, plaintext)
@@ -92,25 +92,20 @@ pub fn encrypt_data(key: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>> {
 
 /// Decrypt data using AES-256-GCM
 pub fn decrypt_data(key: &[u8; 32], ciphertext: &[u8]) -> Result<Vec<u8>> {
-    if ciphertext.len() < 12 {
-        return Err(anyhow::anyhow!("Ciphertext too short"));
-    }
-
+    let (nonce, encrypted_data) = ciphertext
+        .split_first_chunk::<12>()
+        .ok_or_else(|| anyhow::anyhow!("Ciphertext too short"))?;
     let cipher = Aes256Gcm::new(key.into());
-    let (nonce, encrypted_data) = ciphertext.split_at(12);
-    let mut nonce_bytes = [0u8; 12];
-    nonce_bytes.copy_from_slice(nonce);
-    let nonce = Nonce::from_slice(&nonce_bytes);
 
     cipher
-        .decrypt(nonce, encrypted_data)
+        .decrypt(nonce.into(), encrypted_data)
         .map_err(|e| anyhow::anyhow!("Decryption failed: {}", e))
 }
 
 /// AES-GCM encryption with authenticated-but-plaintext associated data.
 pub fn encrypt_data_with_aad(key: &[u8; 32], plaintext: &[u8], aad: &[u8]) -> Result<Vec<u8>> {
     let cipher = Aes256Gcm::new(key.into());
-    let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
+    let nonce = Nonce::<Aes256Gcm>::generate();
     let mut ciphertext = cipher
         .encrypt(
             &nonce,
@@ -127,14 +122,13 @@ pub fn encrypt_data_with_aad(key: &[u8; 32], plaintext: &[u8], aad: &[u8]) -> Re
 }
 
 pub fn decrypt_data_with_aad(key: &[u8; 32], ciphertext: &[u8], aad: &[u8]) -> Result<Vec<u8>> {
-    if ciphertext.len() < 12 {
-        return Err(anyhow::anyhow!("Ciphertext too short"));
-    }
+    let (nonce, encrypted_data) = ciphertext
+        .split_first_chunk::<12>()
+        .ok_or_else(|| anyhow::anyhow!("Ciphertext too short"))?;
     let cipher = Aes256Gcm::new(key.into());
-    let (nonce, encrypted_data) = ciphertext.split_at(12);
     cipher
         .decrypt(
-            Nonce::from_slice(nonce),
+            nonce.into(),
             Payload {
                 msg: encrypted_data,
                 aad,
@@ -144,10 +138,7 @@ pub fn decrypt_data_with_aad(key: &[u8; 32], ciphertext: &[u8], aad: &[u8]) -> R
 }
 
 pub fn generate_aes_gcm_nonce() -> [u8; 12] {
-    let generated = Aes256Gcm::generate_nonce(&mut OsRng);
-    let mut nonce = [0u8; 12];
-    nonce.copy_from_slice(&generated);
-    nonce
+    Nonce::<Aes256Gcm>::generate().into()
 }
 
 pub fn encrypt_data_with_nonce_and_aad(
@@ -158,7 +149,7 @@ pub fn encrypt_data_with_nonce_and_aad(
 ) -> Result<Vec<u8>> {
     Aes256Gcm::new(key.into())
         .encrypt(
-            Nonce::from_slice(nonce),
+            nonce.into(),
             Payload {
                 msg: plaintext,
                 aad,
@@ -175,7 +166,7 @@ pub fn decrypt_data_with_nonce_and_aad(
 ) -> Result<Vec<u8>> {
     Aes256Gcm::new(key.into())
         .decrypt(
-            Nonce::from_slice(nonce),
+            nonce.into(),
             Payload {
                 msg: ciphertext,
                 aad,
@@ -236,6 +227,43 @@ mod tests {
 
         let decrypted = decrypt_data(&key, &ciphertext).unwrap();
         assert_eq!(decrypted, plaintext.to_vec());
+    }
+
+    #[test]
+    fn decrypts_aes_gcm_010_ciphertext() {
+        // Produced by aes-gcm 0.10.3 with this fixed key and nonce.
+        let key = [42; 32];
+        let nonce = [9; 12];
+        let plaintext = b"existing segment";
+        let file_body = [
+            0x0c, 0x63, 0x6d, 0x9a, 0x86, 0xe6, 0x26, 0x0e, 0xdb, 0x20, 0x2a, 0xb2, 0x70, 0x89,
+            0x59, 0xe8, 0x4b, 0xbd, 0xd8, 0xd3, 0x81, 0xb0, 0x0b, 0xf9, 0xdc, 0xf9, 0xb5, 0xe3,
+            0x1f, 0x51, 0x31, 0xcf,
+        ];
+        let mut file = nonce.to_vec();
+        file.extend_from_slice(&file_body);
+        assert_eq!(decrypt_data(&key, &file).unwrap(), plaintext);
+
+        let aad = b"wal v1 header";
+        let wal = [
+            0x0c, 0x63, 0x6d, 0x9a, 0x86, 0xe6, 0x26, 0x0e, 0xdb, 0x20, 0x2a, 0xb2, 0x70, 0x89,
+            0x59, 0xe8, 0x28, 0x51, 0x16, 0x9b, 0x5b, 0x62, 0x14, 0x20, 0x27, 0x28, 0x95, 0xcf,
+            0x72, 0x5c, 0x57, 0x07,
+        ];
+        assert_eq!(
+            decrypt_data_with_nonce_and_aad(&key, &wal, &nonce, aad).unwrap(),
+            plaintext
+        );
+        assert_eq!(
+            encrypt_data_with_nonce_and_aad(&key, plaintext, &nonce, aad).unwrap(),
+            wal
+        );
+        let mut legacy_wal = nonce.to_vec();
+        legacy_wal.extend_from_slice(&wal);
+        assert_eq!(
+            decrypt_data_with_aad(&key, &legacy_wal, aad).unwrap(),
+            plaintext
+        );
     }
 
     #[test]
