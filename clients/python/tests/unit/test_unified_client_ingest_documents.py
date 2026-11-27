@@ -11,7 +11,7 @@ header non-accumulation, and outcome mapping — with no server on the wire.
 from http import HTTPStatus
 from unittest.mock import MagicMock, patch
 
-import httpx
+import httpx2
 import pytest
 
 from proximadb_sdk._generated.rest.models.error_body import ErrorBody
@@ -237,7 +237,7 @@ def test_error_response_mapped_to_server_error(mock_sync):
 @patch(f"{INGEST_MOD}.sync_detailed")
 def test_transport_error_mapped_to_network_error(mock_sync):
     c = make_client()
-    mock_sync.side_effect = httpx.ConnectError("boom")
+    mock_sync.side_effect = httpx2.ConnectError("boom")
 
     with pytest.raises(NetworkError, match="transport error"):
         c.ingest_documents("coll", [{"id": "r1", "text": "hi"}])

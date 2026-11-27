@@ -19,7 +19,7 @@ class Unset:
 
 UNSET: Unset = Unset()
 
-# The types that `httpx.Client(files=)` can accept, copied from that library.
+# The types that `httpx2.Client(files=)` can accept, copied from that library.
 FileContent = IO[bytes] | bytes | str
 FileTypes = (
     # (filename, file (or bytes), content_type)
@@ -39,7 +39,7 @@ class File:
     mime_type: str | None = None
 
     def to_tuple(self) -> FileTypes:
-        """Return a tuple representation that httpx will accept for multipart/form-data"""
+        """Return a tuple representation that httpx2 will accept for multipart/form-data"""
         return self.file_name, self.payload, self.mime_type
 
 

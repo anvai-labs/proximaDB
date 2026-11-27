@@ -10,12 +10,12 @@ endpoint functions (spec-driven transport, TD-126) for each core op:
     sibling produces (Collection / list[Collection] / BatchResult /
     list[SearchResult] / DeleteResult / dict for get_vector).
 
-We mock only the HTTP transport (``httpx.MockTransport`` injected into the
+We mock only the HTTP transport (``httpx2.MockTransport`` injected into the
 generated Client's shared AsyncClient), so the real generated request-building
 and response-parsing run end to end.
 """
 
-import httpx
+import httpx2
 import pytest
 
 from proximadb_sdk.models import (
@@ -36,12 +36,12 @@ class _Recorder:
         self.routes = routes
         self.seen = []  # (method, path)
 
-    def handler(self, request: httpx.Request) -> httpx.Response:
+    def handler(self, request: httpx2.Request) -> httpx2.Response:
         self.seen.append((request.method, request.url.path))
         for method, pred, status, body in self.routes:
             if request.method == method and pred(request.url.path):
-                return httpx.Response(status, json=body)
-        return httpx.Response(404, json={"error": "no mock route"})
+                return httpx2.Response(status, json=body)
+        return httpx2.Response(404, json={"error": "no mock route"})
 
 
 async def _started_client(recorder: _Recorder) -> ProximaDBAsyncUnified:
@@ -49,9 +49,9 @@ async def _started_client(recorder: _Recorder) -> ProximaDBAsyncUnified:
     await client.astart()
     # Swap the generated client's shared async transport for our mock so the
     # real generated asyncio_detailed runs against canned responses.
-    mock = httpx.AsyncClient(
+    mock = httpx2.AsyncClient(
         base_url="http://localhost:5678",
-        transport=httpx.MockTransport(recorder.handler),
+        transport=httpx2.MockTransport(recorder.handler),
     )
     client._async_http = mock
     client._gen_client.set_async_httpx_client(mock)

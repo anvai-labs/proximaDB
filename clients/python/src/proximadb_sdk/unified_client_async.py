@@ -3,7 +3,7 @@ ProximaDB Unified Async Python Client
 
 Native-async core operations (collections CRUD, record insert/upsert/delete,
 search, get_vector) wire the **generated** ``asyncio``/``asyncio_detailed``
-endpoint functions over a single shared ``httpx.AsyncClient`` — the spec-driven
+endpoint functions over a single shared ``httpx2.AsyncClient`` — the spec-driven
 transport mandated by Core Directive #15 (CLAUDE.md) / #29 (GEMINI.md), TD-126.
 The async ops mirror the sync facade (``unified_client.py`` /
 ``protocols/rest_sync.py``) signatures + return types; they delegate to
@@ -123,13 +123,13 @@ class ProximaDBAsyncUnified:
     # ------------------------------------------------------------------
     async def astart(self):
         # Always stand up the generated-async REST transport for core ops: a
-        # single pooled httpx.AsyncClient injected into the generated Client.
-        import httpx
+        # single pooled httpx2.AsyncClient injected into the generated Client.
+        import httpx2
 
         from ._generated.rest.client import Client as GenClient
 
         base_url = (self.rest_url or "").rstrip("/")
-        self._async_http = httpx.AsyncClient(base_url=base_url, timeout=self.timeout)
+        self._async_http = httpx2.AsyncClient(base_url=base_url, timeout=self.timeout)
         self._gen_client = GenClient(base_url=base_url).set_async_httpx_client(
             self._async_http
         )

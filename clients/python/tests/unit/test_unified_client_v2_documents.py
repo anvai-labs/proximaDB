@@ -18,7 +18,7 @@ Mirrors the batch contract in the TD onto the document family:
 from http import HTTPStatus
 from unittest.mock import MagicMock, patch
 
-import httpx
+import httpx2
 import pytest
 
 import proximadb_sdk.unified_client_v2 as uc
@@ -400,7 +400,7 @@ class TestRestIngestWireEquivalence:
 
     @patch(f"{INGEST_MOD}.sync_detailed")
     def test_transport_error_mapped_to_network_error(self, mock_sync, rest_client):
-        mock_sync.side_effect = httpx.ConnectError("boom")
+        mock_sync.side_effect = httpx2.ConnectError("boom")
         with pytest.raises(NetworkError, match="transport error"):
             rest_client.ingest_documents("coll", [{"id": "r1", "text": "hi"}])
 

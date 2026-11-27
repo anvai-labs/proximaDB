@@ -12,7 +12,7 @@ import logging
 import time
 from typing import Any
 
-import httpx
+import httpx2
 
 from ..models import (
     BatchResult,
@@ -653,13 +653,13 @@ class RestProtocolAdapter(RecordOpsMixin, SyncGraphDelegations, BaseProtocolAdap
         from .._generated.rest.client import Client as GeneratedClient  # noqa: F401
 
         cfg = self._client.config
-        timeout = httpx.Timeout(
+        timeout = httpx2.Timeout(
             connect=cfg.connection.connect_timeout,
             read=cfg.connection.read_timeout,
             write=cfg.timeout,
             pool=cfg.connection.total_timeout,
         )
-        limits = httpx.Limits(
+        limits = httpx2.Limits(
             max_keepalive_connections=cfg.connection.pool_size,
             max_connections=cfg.connection.pool_maxsize,
             keepalive_expiry=cfg.connection.keepalive_timeout,
@@ -670,7 +670,7 @@ class RestProtocolAdapter(RecordOpsMixin, SyncGraphDelegations, BaseProtocolAdap
             # session): connect through the Unix-domain socket; TLS and
             # HTTP/2 do not apply once a transport is supplied.
             httpx_args: dict[str, Any] = {
-                "transport": httpx.HTTPTransport(uds=uds_path, limits=limits),
+                "transport": httpx2.HTTPTransport(uds=uds_path, limits=limits),
             }
         else:
             httpx_args = {

@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 
 import httpx
+import httpx2
 import pytest
 
 from proximadb_sdk.models import SearchResult
@@ -49,13 +50,18 @@ class _ScanRecorder:
         self.bodies: list[dict] = []
         self.calls = 0
 
-    def handler(self, request: httpx.Request) -> httpx.Response:
+    def handler(
+        self, request: httpx.Request | httpx2.Request
+    ) -> httpx.Response | httpx2.Response:
+        response = (
+            httpx2.Response if isinstance(request, httpx2.Request) else httpx.Response
+        )
         if request.url.path != SCAN_PATH or request.method != "POST":
-            return httpx.Response(404, json={"error": "no mock route"})
+            return response(404, json={"error": "no mock route"})
         self.bodies.append(json.loads(request.content.decode() or "{}"))
         body = self.pages[min(self.calls, len(self.pages) - 1)]
         self.calls += 1
-        return httpx.Response(200, json=body)
+        return response(200, json=body)
 
 
 # ---------------------------------------------------------------------------
@@ -148,9 +154,10 @@ def test_sync_scan_respects_max_rows():
 async def _async_client(rec: _ScanRecorder) -> ProximaDBAsyncUnified:
     client = ProximaDBAsyncUnified(url="http://testserver", protocol="rest")
     await client.astart()
-    mock = httpx.AsyncClient(
+    await client._async_http.aclose()
+    mock = httpx2.AsyncClient(
         base_url="http://testserver",
-        transport=httpx.MockTransport(rec.handler),
+        transport=httpx2.MockTransport(rec.handler),
     )
     client._async_http = mock
     client._gen_client.set_async_httpx_client(mock)

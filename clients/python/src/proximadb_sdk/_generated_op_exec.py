@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from typing import Any
 
-import httpx
+import httpx2
 
 from ._generated.rest.errors import UnexpectedStatus
 from ._generated.rest.models.error_response import ErrorResponse
@@ -73,7 +73,7 @@ def execute_generated_op(
     """
     try:
         response = call()
-    except httpx.HTTPError as e:
+    except httpx2.HTTPError as e:
         raise NetworkError(f"{op} transport error: {e}", original_error=e) from e
     except UnexpectedStatus as e:
         if e.status_code == 404 and not_found is not NOT_FOUND_UNSET:
