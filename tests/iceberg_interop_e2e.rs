@@ -136,6 +136,7 @@ async fn external_leg_kv(
         &["k", "v"],
         &expected,
         &scratch,
+        None,
     )
 }
 
@@ -290,6 +291,7 @@ fn external_readback(
     cols: &[&str],
     rows: &[Vec<Option<String>>],
     scratch: &FsPath,
+    snapshot_id: Option<i64>,
 ) -> bool {
     let required = std::env::var("PROXIMADB_ICEBERG_READBACK_REQUIRE").unwrap_or_default();
     let python = std::env::var("PROXIMADB_PYTHON").unwrap_or_else(|_| "python3".to_string());
@@ -308,8 +310,12 @@ fn external_readback(
     )
     .expect("write expected rows");
     let script = FsPath::new(env!("CARGO_MANIFEST_DIR")).join("scripts/iceberg_readback.py");
-    let out = std::process::Command::new(&python)
-        .arg(script)
+    let mut command = std::process::Command::new(&python);
+    command.arg(script);
+    if let Some(id) = snapshot_id {
+        command.args(["--snapshot-id", &id.to_string()]);
+    }
+    let out = command
         .args([
             "--rest-uri",
             &format!("http://127.0.0.1:{rest_port}/iceberg"),
@@ -766,6 +772,7 @@ async fn check_deletion_vector_readers() {
         &cols,
         &expected_rows,
         scratch.path(),
+        None,
     ) {
         return;
     }
@@ -814,6 +821,7 @@ async fn materialized_table_reads_back_in_external_iceberg_engines() {
 
     let scratch = TempDir::new().expect("scratch");
     let mut snapshots = Vec::new();
+    let mut first_rows = Vec::new();
     for round in 0..2 {
         if round == 1 {
             client
@@ -860,7 +868,8 @@ async fn materialized_table_reads_back_in_external_iceberg_engines() {
             "DECIMAL keeps its declared precision/scale through to Iceberg"
         );
         assert_eq!(md["last-sequence-number"], (round + 1) as i64);
-        let snapshot = &md["snapshots"][0];
+        let published = md["snapshots"].as_array().expect("snapshots array");
+        let snapshot = published.last().expect("current snapshot");
         assert!(
             snapshot["manifest-list"]
                 .as_str()
@@ -875,6 +884,14 @@ async fn materialized_table_reads_back_in_external_iceberg_engines() {
             assert_eq!(snapshot["summary"]["operation"], "overwrite");
         }
         snapshots.push(md["current-snapshot-id"].clone());
+        assert_eq!(
+            published
+                .iter()
+                .map(|entry| &entry["snapshot-id"])
+                .collect::<Vec<_>>(),
+            snapshots.iter().collect::<Vec<_>>(),
+            "current metadata advertises both retained pins after the head advances"
+        );
 
         if !external_readback(
             server.rest_port,
@@ -883,11 +900,26 @@ async fn materialized_table_reads_back_in_external_iceberg_engines() {
             &cols,
             &rows,
             scratch.path(),
+            None,
         ) {
             return;
         }
+        if round == 0 {
+            first_rows = rows;
+        } else {
+            let first_pin = snapshots[0].as_i64().expect("numeric first pin");
+            assert!(external_readback(
+                server.rest_port,
+                table,
+                &metadata_location,
+                &cols,
+                &first_rows,
+                scratch.path(),
+                Some(first_pin),
+            ));
+        }
     }
-    eprintln!("✓ external Iceberg engines read back both snapshots value-for-value");
+    eprintln!("✓ external Iceberg engines read both snapshots and rediscover the retained pin");
 }
 
 /// TD-USUB-10 3c rung 2 — a **plain v3 table through the rung-1 knob**: the

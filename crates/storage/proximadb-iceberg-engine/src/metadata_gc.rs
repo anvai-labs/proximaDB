@@ -9,15 +9,17 @@
 //! * `v{N}.metadata.json` documents older than the window — never the tip;
 //! * manifest lists (`snap-{id}-v{N}-list.avro`) and manifests
 //!   (`v{N}-{id}-m{k}.avro`) whose name places them older than the window AND
-//!   that no retained metadata document reaches.
+//!   that no retained publication reaches.
 //!
 //! Safety, all without a clock (TD-GCRETAIN-1 declined time-based grace):
 //!
 //! * **Reachability is positive evidence.** Every retained document (every
 //!   listed version at or above the floor, including versions newer than V
 //!   that a concurrent publisher committed) is read and its manifest lists and
-//!   manifests resolved. Any read or parse failure skips the whole pass — an
-//!   unreadable retained version cannot prove anything unreferenced.
+//!   manifests resolved. A retained archive's native v2 history may include
+//!   generations older than today's floor. Only the active window, explicit
+//!   refs and snapshots in the latest document hold those lists live. Any
+//!   required read or parse failure skips the whole pass.
 //! * **The version in the name orders against in-flight publishers.** A
 //!   publisher writes its manifests before its metadata CAS, so they are
 //!   unreachable until it commits. A publisher that read its parent at or
@@ -42,7 +44,7 @@ use object_store::path::Path;
 use proximadb_kernel::error::StorageError;
 use proximadb_storage_common::object_store_bridge::{IcebergMetadataGcReport, ObjectStoreBridge};
 
-use crate::{IcebergObjectStoreBridge, iceberg, read_err, retention};
+use crate::{IcebergObjectStoreBridge, iceberg, read_err, retention, snapshot_history};
 
 /// The version of a `v{N}.metadata.json` file name.
 pub(crate) fn metadata_version_of(name: &str) -> Option<u64> {
@@ -234,17 +236,19 @@ impl IcebergObjectStoreBridge {
                 ..Default::default()
             });
         }
-        let retained_docs: Vec<&Path> = listing
+        let tip = listed_versions.iter().copied().max();
+        let retained_docs = listing
             .iter()
-            .filter(|p| {
-                p.filename()
-                    .and_then(metadata_version_of)
-                    .is_some_and(|v| v >= floor)
-            })
-            .collect();
+            .filter_map(|p| Some((p, p.filename().and_then(metadata_version_of)?)))
+            .filter(|(_, version)| *version >= floor);
         let mut reachable = HashSet::new();
-        for doc in retained_docs {
-            if let Err(e) = self.collect_reachable(doc, prefix, &mut reachable).await {
+        let mut seen_lists = HashSet::new();
+        for (doc, version) in retained_docs {
+            let archive_floor = (Some(version) != tip).then_some(floor);
+            if let Err(e) = self
+                .collect_reachable(doc, prefix, archive_floor, &mut reachable, &mut seen_lists)
+                .await
+            {
                 return Ok(IcebergMetadataGcReport {
                     skipped: Some(format!(
                         "retained metadata {doc} unreadable, nothing collected: {e}"
@@ -269,12 +273,16 @@ impl IcebergObjectStoreBridge {
     }
 
     /// Add the file names of every manifest list and manifest the document at
-    /// `doc` (a full store path) reaches, over ALL its snapshots.
+    /// `doc` (a full store path) reaches. Only native archive history below
+    /// the current floor can be skipped. Foreign or malformed references
+    /// retain the existing conservative reachability behavior.
     async fn collect_reachable(
         &self,
         doc: &Path,
         metadata_prefix: &str,
+        archive_floor: Option<u64>,
         reachable: &mut HashSet<String>,
+        seen_lists: &mut HashSet<Path>,
     ) -> Result<(), StorageError> {
         let raw = self.store.store();
         let bytes = raw
@@ -291,16 +299,33 @@ impl IcebergObjectStoreBridge {
             .strip_suffix("metadata")
             .map(|p| p.trim_end_matches('/'))
             .unwrap_or("");
-        let snapshots = json
-            .get("snapshots")
-            .and_then(|s| s.as_array())
-            .cloned()
-            .unwrap_or_default();
+        let snapshots = json["snapshots"].as_array().into_iter().flatten();
         for snapshot in snapshots {
             let Some(list) = snapshot.get("manifest-list").and_then(|l| l.as_str()) else {
                 continue;
             };
             let list_path = self.resolve_recorded_path(list, table_location, table_prefix);
+            let native_generation = table_location
+                .zip(snapshot["snapshot-id"].as_i64())
+                .and_then(|(root, id)| snapshot_history::list_generation(root, id, list))
+                .filter(|_| {
+                    snapshot_history::has_generation_window(&json)
+                        && self.object_uri(list_path.as_ref()) == list
+                });
+            if let Some(floor) = archive_floor
+                && native_generation.is_some_and(|v| v < floor)
+                && let Some(id) = snapshot["snapshot-id"].as_i64()
+                && let Some(current) = json["current-snapshot-id"].as_i64()
+                && id != current
+                && !json["refs"].as_object().is_some_and(|refs| {
+                    refs.values().any(|r| r["snapshot-id"].as_i64() == Some(id))
+                })
+            {
+                continue;
+            }
+            if native_generation.is_some() && !seen_lists.insert(list_path.clone()) {
+                continue;
+            }
             if let Some(name) = list_path.filename() {
                 reachable.insert(name.to_string());
             }

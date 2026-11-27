@@ -100,6 +100,7 @@ mod pinned_reader;
 pub use pinned_reader::PinnedIcebergReader;
 pub mod retention;
 mod snapshot_deletes;
+mod snapshot_history;
 pub use snapshot_deletes::{
     IcebergSnapshotFiles, IcebergSnapshotPlan, PinnedIcebergSnapshot, SnapshotDeletionVector,
 };
@@ -541,21 +542,24 @@ impl IcebergObjectStoreBridge {
         // 2. Lineage from the parent metadata document, if any.
         let committer = metadata::MetadataCommitter::new(self.store.clone(), metadata_prefix);
         let version = metadata::MetadataCommitter::successor(parent)?;
-        let parent_json = match parent {
+        let parent_metadata = match parent {
             Some(v) => Some(
-                String::from_utf8(committer.read_metadata(v).await?.to_vec())
-                    .map_err(|e| read_err("parent metadata utf8", e))?,
+                serde_json::from_slice(&committer.read_metadata(v).await?)
+                    .map_err(|e| read_err("parse parent metadata", e))?,
             ),
             None => None,
         };
         let parent_location = parent.map(|v| self.object_uri(&committer.metadata_location(v)));
-        let mut lineage =
-            iceberg::Lineage::from_parent(parent_json.as_deref(), parent_location.as_deref())?;
+        let mut lineage = iceberg::Lineage::from_parent_metadata(
+            parent_metadata.as_ref(),
+            parent_location.as_deref(),
+        )?;
+        let retained_generations = retention::gc_retained_generations();
         // ADR-098 D4.2 / TD-SPINE-3: the metadata-log follows the generation
         // window (an older entry would name a snapshot whose data files the
         // generation GC already collected); the table property only lowers it.
         lineage.bound_metadata_log(retention::metadata_log_max_entries(
-            retention::gc_retained_generations(),
+            retained_generations,
             lineage.previous_versions_max,
         ));
         // Snapshot ids must advance past the parent's current snapshot: an equal id
@@ -664,20 +668,27 @@ impl IcebergObjectStoreBridge {
 
         // 4. Build + atomically commit the TableMetadata.
         let list_uri = self.object_uri(list_path.as_ref());
-        let json = iceberg::build_table_metadata(
-            &iceberg::SnapshotCommit {
-                format_version,
-                table_uuid,
-                location: table_location,
-                fields,
-                snapshot_id,
-                manifest_list_location: &list_uri,
-                timestamp_ms,
-                added_files,
-                added_records,
-            },
-            &lineage,
-        )?;
+        let commit = iceberg::SnapshotCommit {
+            format_version,
+            table_uuid,
+            location: table_location,
+            fields,
+            snapshot_id,
+            manifest_list_location: &list_uri,
+            timestamp_ms,
+            added_files,
+            added_records,
+        };
+        let history = match footers {
+            FooterPolicy::Required => snapshot_history::retained_snapshots(
+                &commit,
+                parent_metadata.as_ref(),
+                version,
+                retained_generations,
+            ),
+            FooterPolicy::DegradeToEmpty => None,
+        };
+        let json = iceberg::build_table_metadata_with_history(&commit, &lineage, history)?;
         match committer.commit(parent, Bytes::from(json)).await? {
             CommitOutcome::Committed(target) => {
                 self.verify_commit_is_the_tip(&committer, metadata_prefix, target, snapshot_id)

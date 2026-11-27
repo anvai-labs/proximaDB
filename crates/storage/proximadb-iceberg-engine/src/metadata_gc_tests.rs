@@ -145,6 +145,88 @@ async fn read_rows(b: &IcebergObjectStoreBridge, version: u64) -> Result<usize, 
 }
 
 #[tokio::test]
+async fn v2_head_discovers_only_the_retained_generation_window() {
+    let b = bridge().with_root_url("memory://warehouse");
+    let table_root = b.object_uri("t");
+    let file = part(&b, "t/data/part.parquet", &[1]).await;
+    for version in 0u64..5 {
+        b.publish_iceberg_files(
+            std::slice::from_ref(&file),
+            version.checked_sub(1),
+            META,
+            "uuid-gc",
+            &table_root,
+            &fields(),
+            1000 + version as i64,
+            1_700_000_000_000 + version as i64,
+            iceberg::FormatVersion::V2,
+        )
+        .await
+        .unwrap();
+        let head: serde_json::Value =
+            serde_json::from_slice(&b.read_table_metadata(META, version).await.unwrap()).unwrap();
+        let expected: Vec<_> = (version.saturating_sub(2)..=version)
+            .map(|v| 1000 + v as i64)
+            .collect();
+        for key in ["snapshots", "snapshot-log"] {
+            let actual: Vec<_> = head[key]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|snapshot| snapshot["snapshot-id"].as_i64().unwrap())
+                .collect();
+            assert_eq!(actual, expected, "{key} at v{version}");
+        }
+        let report = b.gc_metadata(META, version, 3).await.unwrap();
+        assert_eq!(report.skipped, None);
+        assert_eq!(
+            metadata_names(&b).await,
+            generation_names(version.saturating_sub(2)..=version, u64::MAX)
+        );
+    }
+}
+
+#[tokio::test]
+async fn v2_history_starts_over_at_a_schema_change() {
+    let b = bridge().with_root_url("memory://warehouse");
+    let table_root = b.object_uri("t");
+    let file = part(&b, "t/data/part.parquet", &[1]).await;
+    let mut schema = fields();
+    for (version, expected) in [(0u64, vec![1000]), (1, vec![1001]), (2, vec![1001, 1002])] {
+        if version == 1 {
+            schema.push(iceberg::IcebergField {
+                id: 2,
+                name: "name".into(),
+                type_name: "string".into(),
+                required: false,
+            });
+        }
+        b.publish_iceberg_files(
+            std::slice::from_ref(&file),
+            version.checked_sub(1),
+            META,
+            "uuid-gc",
+            &table_root,
+            &schema,
+            1000 + version as i64,
+            1_700_000_000_000 + version as i64,
+            iceberg::FormatVersion::V2,
+        )
+        .await
+        .unwrap();
+        let head: serde_json::Value =
+            serde_json::from_slice(&b.read_table_metadata(META, version).await.unwrap()).unwrap();
+        let pins: Vec<_> = head["snapshots"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["snapshot-id"].as_i64().unwrap())
+            .collect();
+        assert_eq!(pins, expected);
+    }
+}
+
+#[tokio::test]
 async fn gc_keeps_the_tip_and_the_window_and_collects_everything_older() {
     let b = bridge();
     publish_generations(&b, 6).await;

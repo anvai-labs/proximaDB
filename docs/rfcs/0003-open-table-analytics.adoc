@@ -298,6 +298,26 @@ measured independently. Keep native resolution local and budget catalog round tr
 outside the split/Parquet hot loop. Any shared client library must earn adoption from two
 conforming implementations with measured dependency and runtime budgets.
 
+For URI-backed ProximaDB Iceberg v2 publications with explicit generation
+files, stable schema and the unpartitioned spec, the persisted head advertises
+retained pins through Iceberg's standard `snapshots` and `snapshot-log`.
+Publication copies the contiguous descriptors from the parent already read for
+the commit. A clock regression leaves exact IDs discoverable and suppresses the
+optional timestamp log until timestamps in the window are ordered. An exact-pin
+reader resolves a retained or expired pin from one current metadata observation.
+It opens the selected manifest tree for a retained pin. The generation count
+governs data and metadata collection. An archived `metadata.json` can contain
+history that was live at its publication time. Each listed pin ages out on its
+own generation. `write.metadata.previous-versions-max` caps the metadata-file
+log independently.
+
+At upgrade, the first compatible publish can carry the legacy parent's
+current snapshot forward. Earlier legacy generations age out under the same
+retention policy. Schema, table root and format transitions start a new
+discovery run until those profiles qualify their historical schema and file
+semantics. The generation window applies during active scans. See the
+link:https://iceberg.apache.org/spec/#table-metadata-and-snapshots[Iceberg metadata contract].
+
 [[binding]]
 == What crosses the planner and worker boundary
 
