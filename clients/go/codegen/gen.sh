@@ -29,7 +29,8 @@ TMP_SPEC="$(mktemp -t proximadb-openapi-30.XXXXXX.yaml)"
 trap 'rm -f "${TMP_SPEC}"' EXIT
 
 echo "==> down-converting OpenAPI 3.1 -> 3.0 (${SPEC_31})"
-"${PYTHON}" "${SCRIPT_DIR}/openapi_31_to_30.py" "${SPEC_31}" "${TMP_SPEC}"
+"${PYTHON}" "${SCRIPT_DIR}/openapi_31_to_30.py" \
+  --go-optional-nullable-omitempty "${SPEC_31}" "${TMP_SPEC}"
 
 echo "==> generating ${OUT} (oapi-codegen, pinned in codegen/go.mod)"
 mkdir -p "$(dirname "${OUT}")"
