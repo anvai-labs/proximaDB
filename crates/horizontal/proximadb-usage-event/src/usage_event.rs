@@ -318,21 +318,31 @@ fn build_generation_event(
     duration_ms: u64,
 ) -> Option<UsageEvent> {
     let value: serde_json::Value = serde_json::from_str(raw_response_body).ok()?;
+    use sandhi_core::EndpointFamilyV1;
     use sandhi_core::usage::{
-        parse_anthropic_usage, parse_cohere_usage, parse_ollama_usage, parse_openai_usage, u64_at,
-        validate_openai_buffered_usage,
+        parse_anthropic_usage, parse_cohere_usage, parse_ollama_usage, parse_openai_usage,
+        qualify_buffered_usage, validate_openai_buffered_usage,
     };
-    // OpenAI-compatible providers (OpenAI / Azure / vLLM / HuggingFace TGI) share the usage shape.
-    // Qualify Sandhi's new counters before stamping final provider-reported usage.
+    // Qualify Sandhi's extended counters when present, before marking usage final.
     let usage = match provider {
-        "anthropic" => {
-            parse_anthropic_usage(&value).filter(|usage| usage.reasoning_tokens <= usage.tokens_out)
-        }
+        "anthropic" => parse_anthropic_usage(&value).filter(|usage| {
+            value
+                .pointer("/usage/output_tokens_details/thinking_tokens")
+                .is_none_or(|thinking| {
+                    thinking.as_u64() == Some(usage.reasoning_tokens)
+                        && usage.reasoning_tokens <= usage.tokens_out
+                })
+        }),
         "cohere" => parse_cohere_usage(&value),
-        "ollama" => parse_ollama_usage(&value)
-            .filter(|usage| usage.cache_read_tokens <= u64_at(&value, "prompt_eval_count")),
-        _ => parse_openai_usage(&value).filter(|usage| {
-            usage.cache_creation_tokens == 0 || validate_openai_buffered_usage(&value).is_ok()
+        "ollama" => parse_ollama_usage(&value).filter(|_| {
+            value.get("prompt_eval_cached_count").is_none()
+                || qualify_buffered_usage(EndpointFamilyV1::OllamaChat, &value).is_ok()
+        }),
+        _ => parse_openai_usage(&value).filter(|_| {
+            value
+                .pointer("/usage/prompt_tokens_details/cache_write_tokens")
+                .is_none()
+                || validate_openai_buffered_usage(&value).is_ok()
         }),
     }?;
     // All-zero usage is no measurement (TD-SANDHI-3 adversarial review): empty objects
@@ -514,8 +524,7 @@ mod tests {
 
     #[test]
     fn generation_event_ollama_separates_cache_reads_from_fresh_input() {
-        let body =
-            r#"{"prompt_eval_count": 100, "prompt_eval_cached_count": 30, "eval_count": 20}"#;
+        let body = r#"{"done": true, "prompt_eval_count": 100, "prompt_eval_cached_count": 30, "eval_count": 20}"#;
         let event = build_generation_event("ollama", "m", None, body, "query", 10).unwrap();
         assert_eq!(event.tokens_in, 70);
         assert_eq!(event.tokens_out, 20);
@@ -534,13 +543,42 @@ mod tests {
             ),
             (
                 "ollama",
-                serde_json::json!({ "prompt_eval_count": 0, "eval_count": 0,
+                serde_json::json!({ "done": true, "prompt_eval_count": 0, "eval_count": 0,
                 "prompt_eval_cached_count": 75 }),
             ),
             (
                 "anthropic",
                 serde_json::json!({ "usage": { "input_tokens": 12, "output_tokens": 2,
                 "output_tokens_details": { "thinking_tokens": 3 } } }),
+            ),
+            (
+                "openai",
+                serde_json::json!({ "usage": {
+                    "prompt_tokens": 10, "completion_tokens": 1,
+                    "prompt_tokens_details": { "cache_write_tokens": "4" }
+                } }),
+            ),
+            (
+                "openai",
+                serde_json::json!({ "usage": {
+                    "prompt_tokens": 10, "completion_tokens": 1,
+                    "prompt_tokens_details": { "cache_write_tokens": u64::MAX }
+                } }),
+            ),
+            (
+                "ollama",
+                serde_json::json!({ "done": false, "prompt_eval_count": 10, "eval_count": 1,
+                    "prompt_eval_cached_count": 4 }),
+            ),
+            (
+                "ollama",
+                serde_json::json!({ "done": true, "prompt_eval_count": 10, "eval_count": 1,
+                    "prompt_eval_cached_count": null }),
+            ),
+            (
+                "anthropic",
+                serde_json::json!({ "usage": { "input_tokens": 12, "output_tokens": 2,
+                    "output_tokens_details": { "thinking_tokens": "1" } } }),
             ),
         ];
         for (provider, body) in cases {
