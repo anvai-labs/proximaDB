@@ -28,7 +28,7 @@ pub(super) fn parse_create_node_spec(input: &str) -> IResult<&str, CreateNodeSpe
     map(
         delimited(
             char('('),
-            tuple((
+            (
                 preceded(multispace0, opt(any_identifier)), // Optional variable
                 // Labels: :A or :A:B (multi-label — the modality grammar's
                 // shape; previously single-only, which left the seam
@@ -37,7 +37,7 @@ pub(super) fn parse_create_node_spec(input: &str) -> IResult<&str, CreateNodeSpe
                 many0(preceded(char(':'), any_identifier)),
                 opt(preceded(multispace0, parse_property_value_map)), // Optional properties
                 multispace0,
-            )),
+            ),
             char(')'),
         ),
         |(variable, labels, properties_opt, _)| CreateNodeSpec {
@@ -45,7 +45,8 @@ pub(super) fn parse_create_node_spec(input: &str) -> IResult<&str, CreateNodeSpe
             labels,
             properties: properties_opt.unwrap_or_default(),
         },
-    )(input)
+    )
+    .parse(input)
 }
 
 // Parse a CREATE edge specification (a)-[r:TYPE {props}]->(b)
@@ -53,11 +54,11 @@ pub(super) fn parse_create_edge_pattern(
     input: &str,
 ) -> IResult<&str, (CreateNodeSpec, CreateEdgeSpec, CreateNodeSpec)> {
     map(
-        tuple((
+        (
             parse_create_node_spec,
             preceded(multispace0, parse_create_edge_spec),
             preceded(multispace0, parse_create_node_spec),
-        )),
+        ),
         |(from_node, (edge_var, edge_type, edge_props, direction), to_node)| {
             let from_var = from_node
                 .variable
@@ -79,17 +80,18 @@ pub(super) fn parse_create_edge_pattern(
 
             (from_node, edge, to_node)
         },
-    )(input)
+    )
+    .parse(input)
 }
 
 // Parse edge spec for CREATE: -[r:TYPE {props}]->
 pub(super) fn parse_create_edge_spec(input: &str) -> IResult<&str, CreateEdgeSpecParts> {
     map(
-        tuple((
+        (
             parse_edge_direction_left,
             delimited(
                 char('['),
-                tuple((
+                (
                     opt(any_identifier), // Variable
                     // Edge type — SINGLE type (the modality grammar's
                     // create-edge shape; review R3-F3: alternation here
@@ -98,11 +100,11 @@ pub(super) fn parse_create_edge_spec(input: &str) -> IResult<&str, CreateEdgeSpe
                     // matches the modality and rejects alternation).
                     opt(preceded(char(':'), any_identifier)),
                     opt(preceded(multispace0, parse_property_value_map)), // Properties
-                )),
+                ),
                 char(']'),
             ),
             parse_edge_direction_right,
-        )),
+        ),
         |(left_arrow, (variable, edge_type, properties_opt), right_arrow)| {
             let direction = match (left_arrow, right_arrow) {
                 (false, true) => EdgeDirection::Outgoing,
@@ -116,7 +118,8 @@ pub(super) fn parse_create_edge_spec(input: &str) -> IResult<&str, CreateEdgeSpe
                 direction,
             )
         },
-    )(input)
+    )
+    .parse(input)
 }
 
 // Parse CREATE clause
@@ -148,13 +151,14 @@ pub(super) fn parse_create_clause(input: &str) -> IResult<&str, CreateClause> {
                 },
             ),
         ),
-    )(input)
+    )
+    .parse(input)
 }
 
 // Parse DELETE clause
 pub(super) fn parse_delete_clause(input: &str) -> IResult<&str, DeleteClause> {
     map(
-        tuple((
+        (
             opt(preceded(tag_no_case("DETACH"), multispace1)),
             preceded(
                 tag_no_case("DELETE"),
@@ -166,12 +170,13 @@ pub(super) fn parse_delete_clause(input: &str) -> IResult<&str, DeleteClause> {
                     ),
                 ),
             ),
-        )),
+        ),
         |(detach_opt, variables)| DeleteClause {
             variables,
             detach: detach_opt.is_some(),
         },
-    )(input)
+    )
+    .parse(input)
 }
 
 // Parse SET item: n.prop = value OR n:Label OR n = {props} OR n += {props}
@@ -179,13 +184,13 @@ pub(super) fn parse_set_item(input: &str) -> IResult<&str, SetItem> {
     alt((
         // Property assignment: n.prop = value
         map(
-            tuple((
+            (
                 any_identifier,
                 char('.'),
                 any_identifier,
                 delimited(multispace0, char('='), multispace0),
                 property_value,
-            )),
+            ),
             |(variable, _, property, _, value)| SetItem::Property {
                 variable,
                 property,
@@ -194,16 +199,16 @@ pub(super) fn parse_set_item(input: &str) -> IResult<&str, SetItem> {
         ),
         // Add label: n:Label
         map(
-            tuple((any_identifier, char(':'), any_identifier)),
+            (any_identifier, char(':'), any_identifier),
             |(variable, _, label)| SetItem::AddLabel { variable, label },
         ),
         // Merge properties: n += {props}
         map(
-            tuple((
+            (
                 any_identifier,
                 delimited(multispace0, tag("+="), multispace0),
                 parse_property_value_map,
-            )),
+            ),
             |(variable, _, properties)| SetItem::MergeProperties {
                 variable,
                 properties,
@@ -211,17 +216,18 @@ pub(super) fn parse_set_item(input: &str) -> IResult<&str, SetItem> {
         ),
         // Replace all properties: n = {props}
         map(
-            tuple((
+            (
                 any_identifier,
                 delimited(multispace0, char('='), multispace0),
                 parse_property_value_map,
-            )),
+            ),
             |(variable, _, properties)| SetItem::AllProperties {
                 variable,
                 properties,
             },
         ),
-    ))(input)
+    ))
+    .parse(input)
 }
 
 // Parse SET clause
@@ -238,7 +244,8 @@ pub(super) fn parse_set_clause(input: &str) -> IResult<&str, SetClause> {
                 |items| SetClause { items },
             ),
         ),
-    )(input)
+    )
+    .parse(input)
 }
 
 // Parse REMOVE item: n.prop OR n:Label
@@ -246,15 +253,16 @@ pub(super) fn parse_remove_item(input: &str) -> IResult<&str, RemoveItem> {
     alt((
         // Remove property: n.prop
         map(
-            tuple((any_identifier, char('.'), any_identifier)),
+            (any_identifier, char('.'), any_identifier),
             |(variable, _, property)| RemoveItem::Property { variable, property },
         ),
         // Remove label: n:Label
         map(
-            tuple((any_identifier, char(':'), any_identifier)),
+            (any_identifier, char(':'), any_identifier),
             |(variable, _, label)| RemoveItem::Label { variable, label },
         ),
-    ))(input)
+    ))
+    .parse(input)
 }
 
 // Parse REMOVE clause
@@ -271,13 +279,14 @@ pub(super) fn parse_remove_clause(input: &str) -> IResult<&str, RemoveClause> {
                 |items| RemoveClause { items },
             ),
         ),
-    )(input)
+    )
+    .parse(input)
 }
 
 // Parse MERGE clause
 pub(super) fn parse_merge_clause(input: &str) -> IResult<&str, MergeClause> {
     map(
-        tuple((
+        (
             preceded(
                 tag_no_case("MERGE"),
                 preceded(
@@ -314,32 +323,33 @@ pub(super) fn parse_merge_clause(input: &str) -> IResult<&str, MergeClause> {
             // frozen single-space case-sensitive tags never landed the
             // claimed parity).
             opt(preceded(
-                tuple((
+                (
                     multispace1,
                     tag_no_case("ON"),
                     multispace1,
                     tag_no_case("CREATE"),
                     multispace1,
-                )),
+                ),
                 parse_set_clause,
             )),
             opt(preceded(
-                tuple((
+                (
                     multispace1,
                     tag_no_case("ON"),
                     multispace1,
                     tag_no_case("MATCH"),
                     multispace1,
-                )),
+                ),
                 parse_set_clause,
             )),
-        )),
+        ),
         |(pattern, on_create, on_match)| MergeClause {
             pattern,
             on_create,
             on_match,
         },
-    )(input)
+    )
+    .parse(input)
 }
 
 // Parse OPTIONAL MATCH clause
@@ -369,7 +379,8 @@ pub(super) fn parse_optional_match_clause(
                 .collect();
             (optional_nodes, optional_edges)
         },
-    )(input)
+    )
+    .parse(input)
 }
 
 // Parse WITH clause
@@ -377,7 +388,7 @@ pub(super) fn parse_with_clause(input: &str) -> IResult<&str, WithClause> {
     preceded(
         tag_no_case("WITH"),
         map(
-            tuple((
+            (
                 parse_distinct,
                 preceded(
                     multispace1,
@@ -390,7 +401,7 @@ pub(super) fn parse_with_clause(input: &str) -> IResult<&str, WithClause> {
                 opt(parse_skip),
                 opt(parse_limit),
                 opt(preceded(multispace1, parse_where_clause)),
-            )),
+            ),
             |(distinct, items, order_by_opt, skip_opt, limit_opt, where_opt)| WithClause {
                 projections: items,
                 distinct,
@@ -400,7 +411,8 @@ pub(super) fn parse_with_clause(input: &str) -> IResult<&str, WithClause> {
                 where_clause: where_opt,
             },
         ),
-    )(input)
+    )
+    .parse(input)
 }
 
 /// Parse a full Cypher query with all clause types.
@@ -416,7 +428,7 @@ pub(super) fn parse_with_clause(input: &str) -> IResult<&str, WithClause> {
 /// pin's `rest.trim().is_empty()` assertion is the standard).
 pub fn parse_cypher_query(input: &str) -> IResult<&str, CypherQuery> {
     map(
-        tuple((
+        (
             // Reading clauses (MATCH, OPTIONAL MATCH)
             many0(preceded(
                 multispace0,
@@ -426,10 +438,10 @@ pub fn parse_cypher_query(input: &str) -> IResult<&str, CypherQuery> {
                     // review M1: omitting it silently REJECTED
                     // `OPTIONAL MATCH ... WHERE ...`)
                     map(
-                        tuple((
+                        (
                             parse_optional_match_clause,
                             opt(preceded(multispace1, parse_where_clause)),
-                        )),
+                        ),
                         |((nodes, edges), where_opt)| ReadingClause::Match {
                             pattern: MatchPattern {
                                 nodes,
@@ -442,10 +454,10 @@ pub fn parse_cypher_query(input: &str) -> IResult<&str, CypherQuery> {
                     ),
                     // Regular MATCH with optional WHERE
                     map(
-                        tuple((
+                        (
                             parse_match_clause,
                             opt(preceded(multispace1, parse_where_clause)),
-                        )),
+                        ),
                         |((nodes, edges), where_opt)| ReadingClause::Match {
                             pattern: MatchPattern {
                                 nodes,
@@ -473,7 +485,7 @@ pub fn parse_cypher_query(input: &str) -> IResult<&str, CypherQuery> {
             )),
             // Optional RETURN clause
             opt(preceded(multispace0, parse_return_clause)),
-        )),
+        ),
         |(reading_clauses, with_clauses, updating_clauses, return_spec)| CypherQuery {
             reading_clauses,
             updating_clauses,
@@ -481,5 +493,6 @@ pub fn parse_cypher_query(input: &str) -> IResult<&str, CypherQuery> {
             union_clauses: Vec::new(), // TD-019: UNION clause support
             return_spec,
         },
-    )(input)
+    )
+    .parse(input)
 }

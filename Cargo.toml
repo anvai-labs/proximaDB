@@ -745,7 +745,6 @@ arc-swap = { workspace = true }
 async-trait = "0.1"
 futures = "0.3"
 regex = "1.10"
-nom = "7"
 
 # Multi-model storage (Document + Observability)
 tantivy = "0.27"  # Full-text search for documents

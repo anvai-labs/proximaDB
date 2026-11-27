@@ -35,13 +35,13 @@ use super::ast::{
     UpdatingClause, WhereClause, WithClause,
 };
 use nom::{
-    IResult,
+    IResult, Parser,
     branch::alt,
     bytes::complete::{tag, tag_no_case},
     character::complete::{char, digit1, multispace0, multispace1},
     combinator::{map, map_res, opt, value},
     multi::{many0, separated_list0, separated_list1},
-    sequence::{delimited, preceded, separated_pair, tuple},
+    sequence::{delimited, preceded, separated_pair},
 };
 use proximadb_kernel::error::ProximaDBError;
 use std::collections::HashMap;
@@ -135,14 +135,14 @@ fn parse_node_pattern(input: &str) -> IResult<&str, NodePattern> {
     map(
         delimited(
             char('('),
-            tuple((
+            (
                 preceded(multispace0, opt(any_identifier)), // Optional variable (backticks ok)
                 // Labels: :A or :A:B (multi-label, TD-GRAPH-4 step 3 —
                 // the modality grammar's shape; previously single-only)
                 many0(preceded(char(':'), any_identifier)),
                 opt(preceded(multispace0, property_map)), // Optional Properties
                 multispace0,
-            )),
+            ),
             char(')'),
         ),
         move |(variable_opt, labels, properties_opt, _)| NodePattern {
@@ -151,7 +151,8 @@ fn parse_node_pattern(input: &str) -> IResult<&str, NodePattern> {
             properties: properties_opt.unwrap_or_default(),
             optional: false, // Not handling OPTIONAL MATCH yet
         },
-    )(input)
+    )
+    .parse(input)
 }
 
 // Parse edge direction arrows
@@ -159,20 +160,22 @@ fn parse_edge_direction_left(input: &str) -> IResult<&str, bool> {
     alt((
         map(tag("<-"), |_| true), // Incoming
         map(tag("-"), |_| false), // Outgoing or bidirectional
-    ))(input)
+    ))
+    .parse(input)
 }
 
 fn parse_edge_direction_right(input: &str) -> IResult<&str, bool> {
     alt((
         map(tag("->"), |_| true), // Outgoing
         map(tag("-"), |_| false), // Incoming or bidirectional
-    ))(input)
+    ))
+    .parse(input)
 }
 
 // Parse edge specification inside brackets [r:TYPE {prop: val}]
 fn parse_edge_spec(input: &str) -> IResult<&str, EdgeSpec> {
     map(
-        tuple((
+        (
             opt(any_identifier), // Optional variable
             // Edge types with ALTERNATION :KNOWS|LIKES (the modality
             // grammar's shape — the full list kept; previously single)
@@ -181,13 +184,14 @@ fn parse_edge_spec(input: &str) -> IResult<&str, EdgeSpec> {
                 separated_list1(char('|'), any_identifier),
             )),
             opt(preceded(multispace0, property_map)), // Optional properties
-        )),
+        ),
         |(variable_opt, edge_types_opt, properties_opt)| {
             let edge_types = edge_types_opt.unwrap_or_default();
             let properties = properties_opt.unwrap_or_default();
             (variable_opt, edge_types, properties)
         },
-    )(input)
+    )
+    .parse(input)
 }
 
 // Parse variable-length path specification *min..max
@@ -209,21 +213,22 @@ fn parse_variable_length(input: &str) -> IResult<&str, (u32, u32)> {
             // * (equivalent to *1..5, default range)
             value((1, 5), tag("")),
         )),
-    )(input)
+    )
+    .parse(input)
 }
 
 // Parse edge pattern (e.g., -[r:KNOWS]-> or <-[r:KNOWS]- or -[r:KNOWS]-)
 fn parse_edge_pattern(input: &str) -> IResult<&str, EdgePatternSpec> {
     map(
-        tuple((
+        (
             parse_edge_direction_left,
             delimited(
                 char('['),
-                tuple((parse_edge_spec, opt(parse_variable_length))),
+                (parse_edge_spec, opt(parse_variable_length)),
                 char(']'),
             ),
             parse_edge_direction_right,
-        )),
+        ),
         |(left_arrow, ((variable, edge_types, properties), var_length_opt), right_arrow)| {
             // Determine direction from arrows
             let is_outgoing = right_arrow;
@@ -238,17 +243,18 @@ fn parse_edge_pattern(input: &str) -> IResult<&str, EdgePatternSpec> {
                 var_length_opt,
             )
         },
-    )(input)
+    )
+    .parse(input)
 }
 
 // Parse node-edge-node pattern (e.g., (a)-[r:KNOWS]->(b))
 fn parse_path_segment(input: &str) -> IResult<&str, (NodePattern, EdgePattern, NodePattern)> {
     map(
-        tuple((
+        (
             parse_node_pattern,
             preceded(multispace0, parse_edge_pattern),
             preceded(multispace0, parse_node_pattern),
-        )),
+        ),
         |(
             from_node,
             (is_incoming, edge_var, edge_types, edge_props, is_outgoing, var_length),
@@ -274,7 +280,8 @@ fn parse_path_segment(input: &str) -> IResult<&str, (NodePattern, EdgePattern, N
 
             (from_node.clone(), edge_pattern, to_node)
         },
-    )(input)
+    )
+    .parse(input)
 }
 
 /// Parse a multi-hop path chain: `(a)-[:X]->(b)-[:Y]->(c)-[:Z]->(d)`
@@ -298,7 +305,8 @@ fn parse_path_chain(input: &str) -> IResult<&str, (Vec<NodePattern>, Vec<EdgePat
         match preceded(
             multispace0::<&str, nom::error::Error<&str>>,
             parse_edge_pattern,
-        )(rest)
+        )
+        .parse(rest)
         {
             Ok((
                 after_edge,
@@ -307,7 +315,8 @@ fn parse_path_chain(input: &str) -> IResult<&str, (Vec<NodePattern>, Vec<EdgePat
                 match preceded(
                     multispace0::<&str, nom::error::Error<&str>>,
                     parse_node_pattern,
-                )(after_edge)
+                )
+                .parse(after_edge)
                 {
                     Ok((after_node, next_node)) => {
                         let prev_node = nodes.last().expect("at least one node exists");
@@ -351,14 +360,15 @@ fn parse_where_condition(input: &str) -> IResult<&str, WhereClause> {
     // a∧(b∨c) instead of (a∧b)∨c). The decision is now deliberate and
     // PINNED (where_mixed_precedence corpus entries).
     let (input, first) = parse_where_primary(input)?;
-    let result = many0(tuple((
+    let result = many0((
         delimited(
             multispace1,
             alt((tag_no_case("AND"), tag_no_case("OR"), tag_no_case("XOR"))),
             multispace1,
         ),
         parse_where_primary,
-    )))(input);
+    ))
+    .parse(input);
     match result {
         Ok((remaining, pairs)) => {
             let mut current = first;
@@ -380,7 +390,7 @@ fn parse_where_primary(input: &str) -> IResult<&str, WhereClause> {
         // STARTS WITH / ENDS WITH / CONTAINS (the modality grammar's string
         // predicates; TD-GRAPH-4 step-3 parity)
         map(
-            tuple((
+            (
                 any_identifier,
                 char('.'),
                 any_identifier,
@@ -388,7 +398,7 @@ fn parse_where_primary(input: &str) -> IResult<&str, WhereClause> {
                 tag_no_case("WITH"),
                 multispace1,
                 string_literal,
-            )),
+            ),
             |(variable, _, property, _, _, _, value)| WhereClause::Property {
                 variable,
                 property,
@@ -396,7 +406,7 @@ fn parse_where_primary(input: &str) -> IResult<&str, WhereClause> {
             },
         ),
         map(
-            tuple((
+            (
                 any_identifier,
                 char('.'),
                 any_identifier,
@@ -404,7 +414,7 @@ fn parse_where_primary(input: &str) -> IResult<&str, WhereClause> {
                 tag_no_case("WITH"),
                 multispace1,
                 string_literal,
-            )),
+            ),
             |(variable, _, property, _, _, _, value)| WhereClause::Property {
                 variable,
                 property,
@@ -412,13 +422,13 @@ fn parse_where_primary(input: &str) -> IResult<&str, WhereClause> {
             },
         ),
         map(
-            tuple((
+            (
                 any_identifier,
                 char('.'),
                 any_identifier,
                 delimited(multispace1, tag_no_case("CONTAINS"), multispace1),
                 string_literal,
-            )),
+            ),
             |(variable, _, property, _, value)| WhereClause::Property {
                 variable,
                 property,
@@ -427,13 +437,13 @@ fn parse_where_primary(input: &str) -> IResult<&str, WhereClause> {
         ),
         // IS NULL / IS NOT NULL (the modality grammar's shapes)
         map(
-            tuple((
+            (
                 any_identifier,
                 char('.'),
                 any_identifier,
                 delimited(multispace1, tag_no_case("IS"), multispace1),
                 tag_no_case("NULL"),
-            )),
+            ),
             |(variable, _, property, _, _)| WhereClause::Property {
                 variable,
                 property,
@@ -441,7 +451,7 @@ fn parse_where_primary(input: &str) -> IResult<&str, WhereClause> {
             },
         ),
         map(
-            tuple((
+            (
                 any_identifier,
                 char('.'),
                 any_identifier,
@@ -449,7 +459,7 @@ fn parse_where_primary(input: &str) -> IResult<&str, WhereClause> {
                 tag_no_case("NOT"),
                 multispace1,
                 tag_no_case("NULL"),
-            )),
+            ),
             |(variable, _, property, _, _, _, _)| WhereClause::Property {
                 variable,
                 property,
@@ -458,10 +468,7 @@ fn parse_where_primary(input: &str) -> IResult<&str, WhereClause> {
         ),
         // NOT condition
         map(
-            preceded(
-                tuple((tag_no_case("NOT"), multispace1)),
-                parse_where_primary,
-            ),
+            preceded((tag_no_case("NOT"), multispace1), parse_where_primary),
             |cond| WhereClause::Not(Box::new(cond)),
         ),
         // Parenthesized condition
@@ -472,7 +479,8 @@ fn parse_where_primary(input: &str) -> IResult<&str, WhereClause> {
         ),
         // Property comparison
         parse_where_property_condition,
-    ))(input)
+    ))
+    .parse(input)
 }
 
 fn parse_where_property_condition(input: &str) -> IResult<&str, WhereClause> {
@@ -481,7 +489,7 @@ fn parse_where_property_condition(input: &str) -> IResult<&str, WhereClause> {
         // modality grammar's shape; previously unsupported, so queries
         // using IN failed the whole WHERE parse).
         map(
-            tuple((
+            (
                 any_identifier,
                 char('.'),
                 any_identifier,
@@ -494,7 +502,7 @@ fn parse_where_property_condition(input: &str) -> IResult<&str, WhereClause> {
                     ),
                     char(']'),
                 ),
-            )),
+            ),
             |(variable, _, property, _, values)| WhereClause::Property {
                 variable,
                 property,
@@ -503,13 +511,13 @@ fn parse_where_property_condition(input: &str) -> IResult<&str, WhereClause> {
         ),
         // Comparison: n.age > 30
         map(
-            tuple((
+            (
                 any_identifier, // variable (backticks ok — modality shape)
                 char('.'),
                 any_identifier, // property
                 delimited(multispace0, parse_comparison_op, multispace0),
                 property_value, // value
-            )),
+            ),
             |(variable, _, property, operator, value)| WhereClause::Property {
                 variable,
                 property,
@@ -532,7 +540,8 @@ fn parse_where_property_condition(input: &str) -> IResult<&str, WhereClause> {
                 },
             },
         ),
-    ))(input)
+    ))
+    .parse(input)
 }
 
 fn parse_comparison_op(input: &str) -> IResult<&str, &str> {
@@ -545,7 +554,8 @@ fn parse_comparison_op(input: &str) -> IResult<&str, &str> {
         tag("="),
         tag(">"),
         tag("<"),
-    ))(input)
+    ))
+    .parse(input)
 }
 
 // Parse WHERE clause
@@ -553,7 +563,8 @@ fn parse_where_clause(input: &str) -> IResult<&str, WhereClause> {
     preceded(
         tag_no_case("WHERE"),
         preceded(multispace1, parse_where_condition),
-    )(input)
+    )
+    .parse(input)
 }
 
 // Parse aggregation functions
@@ -562,7 +573,7 @@ fn parse_aggregation(input: &str) -> IResult<&str, PropertyProjection> {
         // COUNT(*) — and COUNT(DISTINCT expr), which reduces to Count
         // (the modality grammar's simplification; TD-GRAPH-4 step 3)
         map(
-            tuple((
+            (
                 tag_no_case("COUNT"),
                 delimited(
                     char('('),
@@ -576,10 +587,7 @@ fn parse_aggregation(input: &str) -> IResult<&str, PropertyProjection> {
                         alt((
                             map(tag("*"), |_| ""),
                             map(
-                                preceded(
-                                    tuple((tag_no_case("DISTINCT"), multispace1)),
-                                    any_identifier,
-                                ),
+                                preceded((tag_no_case("DISTINCT"), multispace1), any_identifier),
                                 |_| "",
                             ),
                         )),
@@ -587,12 +595,12 @@ fn parse_aggregation(input: &str) -> IResult<&str, PropertyProjection> {
                     ),
                     char(')'),
                 ),
-            )),
+            ),
             |_| PropertyProjection::Count,
         ),
         // SUM(variable.property)
         map(
-            tuple((
+            (
                 tag_no_case("SUM"),
                 delimited(
                     char('('),
@@ -603,7 +611,7 @@ fn parse_aggregation(input: &str) -> IResult<&str, PropertyProjection> {
                     ),
                     char(')'),
                 ),
-            )),
+            ),
             |(_, (var, prop))| PropertyProjection::Sum {
                 variable: var,
                 property: prop,
@@ -611,7 +619,7 @@ fn parse_aggregation(input: &str) -> IResult<&str, PropertyProjection> {
         ),
         // AVG(variable.property)
         map(
-            tuple((
+            (
                 tag_no_case("AVG"),
                 delimited(
                     char('('),
@@ -622,7 +630,7 @@ fn parse_aggregation(input: &str) -> IResult<&str, PropertyProjection> {
                     ),
                     char(')'),
                 ),
-            )),
+            ),
             |(_, (var, prop))| PropertyProjection::Avg {
                 variable: var,
                 property: prop,
@@ -630,7 +638,7 @@ fn parse_aggregation(input: &str) -> IResult<&str, PropertyProjection> {
         ),
         // MIN(variable.property)
         map(
-            tuple((
+            (
                 tag_no_case("MIN"),
                 delimited(
                     char('('),
@@ -641,7 +649,7 @@ fn parse_aggregation(input: &str) -> IResult<&str, PropertyProjection> {
                     ),
                     char(')'),
                 ),
-            )),
+            ),
             |(_, (var, prop))| PropertyProjection::Min {
                 variable: var,
                 property: prop,
@@ -649,7 +657,7 @@ fn parse_aggregation(input: &str) -> IResult<&str, PropertyProjection> {
         ),
         // MAX(variable.property)
         map(
-            tuple((
+            (
                 tag_no_case("MAX"),
                 delimited(
                     char('('),
@@ -660,13 +668,14 @@ fn parse_aggregation(input: &str) -> IResult<&str, PropertyProjection> {
                     ),
                     char(')'),
                 ),
-            )),
+            ),
             |(_, (var, prop))| PropertyProjection::Max {
                 variable: var,
                 property: prop,
             },
         ),
-    ))(input)
+    ))
+    .parse(input)
 }
 
 // Parse a MATCH clause with support for both nodes and edge patterns
@@ -696,7 +705,8 @@ fn parse_match_clause(input: &str) -> IResult<&str, (Vec<NodePattern>, Vec<EdgeP
                 },
             ),
         ),
-    )(input)
+    )
+    .parse(input)
 }
 
 // Parse return item (variable, property projection, or aggregation)
@@ -704,13 +714,13 @@ fn parse_return_item(input: &str) -> IResult<&str, (String, PropertyProjection)>
     alt((
         // Aggregation function
         map(
-            tuple((
+            (
                 parse_aggregation,
                 opt(preceded(
                     delimited(multispace1, tag_no_case("AS"), multispace1),
                     any_identifier,
                 )),
-            )),
+            ),
             |(agg, alias_opt)| {
                 let name = alias_opt.unwrap_or_else(|| match &agg {
                     PropertyProjection::Count => "count".to_string(),
@@ -725,7 +735,7 @@ fn parse_return_item(input: &str) -> IResult<&str, (String, PropertyProjection)>
         ),
         // Property projection (variable.property AS alias)
         map(
-            tuple((
+            (
                 any_identifier,
                 char('.'),
                 any_identifier,
@@ -733,7 +743,7 @@ fn parse_return_item(input: &str) -> IResult<&str, (String, PropertyProjection)>
                     delimited(multispace1, tag_no_case("AS"), multispace1),
                     any_identifier,
                 )),
-            )),
+            ),
             |(var, _, prop, alias_opt)| {
                 let name = alias_opt.unwrap_or_else(|| format!("{}.{}", var, prop));
                 (
@@ -749,26 +759,28 @@ fn parse_return_item(input: &str) -> IResult<&str, (String, PropertyProjection)>
         // step 3: WITH n AS x previously failed because only the
         // property/aggregation arms carried AS)
         map(
-            tuple((
+            (
                 any_identifier,
                 opt(preceded(
                     delimited(multispace1, tag_no_case("AS"), multispace1),
                     any_identifier,
                 )),
-            )),
+            ),
             |(var, alias_opt)| {
                 let name = alias_opt.unwrap_or_else(|| var.clone());
                 (name, PropertyProjection::Variable(var))
             },
         ),
-    ))(input)
+    ))
+    .parse(input)
 }
 
 // Parse DISTINCT keyword
 fn parse_distinct(input: &str) -> IResult<&str, bool> {
     map(opt(preceded(multispace1, tag_no_case("DISTINCT"))), |d| {
         d.is_some()
-    })(input)
+    })
+    .parse(input)
 }
 
 // Parse ORDER BY clause
@@ -782,7 +794,7 @@ fn parse_order_by(input: &str) -> IResult<&str, Vec<(String, bool)>> {
                 separated_list1(
                     delimited(multispace0, char(','), multispace0),
                     map(
-                        tuple((
+                        (
                             any_identifier,
                             opt(preceded(
                                 multispace1,
@@ -791,13 +803,14 @@ fn parse_order_by(input: &str) -> IResult<&str, Vec<(String, bool)>> {
                                     map(tag_no_case("DESC"), |_| false),
                                 )),
                             )),
-                        )),
+                        ),
                         |(var, asc_opt)| (var, asc_opt.unwrap_or(true)),
                     ),
                 ),
             ),
         ),
-    )(input)
+    )
+    .parse(input)
 }
 
 // Parse LIMIT clause
@@ -805,7 +818,8 @@ fn parse_limit(input: &str) -> IResult<&str, usize> {
     preceded(
         delimited(multispace1, tag_no_case("LIMIT"), multispace1),
         map_res(digit1, |s: &str| s.parse::<usize>()),
-    )(input)
+    )
+    .parse(input)
 }
 
 // Parse SKIP clause
@@ -813,7 +827,8 @@ fn parse_skip(input: &str) -> IResult<&str, usize> {
     preceded(
         delimited(multispace1, tag_no_case("SKIP"), multispace1),
         map_res(digit1, |s: &str| s.parse::<usize>()),
-    )(input)
+    )
+    .parse(input)
 }
 
 // Parse enhanced RETURN clause
@@ -821,7 +836,7 @@ fn parse_return_clause(input: &str) -> IResult<&str, ReturnSpec> {
     preceded(
         tag_no_case("RETURN"),
         map(
-            tuple((
+            (
                 parse_distinct,
                 preceded(
                     multispace1,
@@ -833,7 +848,7 @@ fn parse_return_clause(input: &str) -> IResult<&str, ReturnSpec> {
                 opt(parse_order_by),
                 opt(parse_skip),
                 opt(parse_limit),
-            )),
+            ),
             |(distinct, items, order_by_opt, skip_opt, limit_opt)| {
                 let (vars, projections): (Vec<_>, Vec<_>) = items.into_iter().unzip();
                 ReturnSpec {
@@ -846,7 +861,8 @@ fn parse_return_clause(input: &str) -> IResult<&str, ReturnSpec> {
                 }
             },
         ),
-    )(input)
+    )
+    .parse(input)
 }
 
 // ==================== Mutation Clause Parsers ====================
@@ -872,14 +888,14 @@ use write_seam::*;
 // Main query parser
 fn parse_query(input: &str) -> IResult<&str, CompiledPattern> {
     map(
-        tuple((
+        (
             parse_match_clause,
             multispace0,
             opt(parse_where_clause),
             multispace0,
             parse_return_clause,
             multispace0,
-        )),
+        ),
         |((nodes, edges), _, where_clause_opt, _, return_spec, _)| CompiledPattern {
             nodes,
             edges,
@@ -889,7 +905,8 @@ fn parse_query(input: &str) -> IResult<&str, CompiledPattern> {
             return_spec,
             variables: HashMap::new(), // Populated during planning/execution
         },
-    )(input)
+    )
+    .parse(input)
 }
 
 #[cfg(test)]

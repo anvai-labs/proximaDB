@@ -18,25 +18,26 @@
 
 use std::collections::HashMap;
 
-use nom::IResult;
 use nom::branch::alt;
 use nom::bytes::complete::{tag, tag_no_case, take_while, take_while1};
 use nom::character::complete::{alpha1, alphanumeric1, char, digit1, multispace0, one_of};
 use nom::combinator::{map, map_opt, map_res, opt, recognize, value, verify};
 use nom::error::{FromExternalError, ParseError};
 use nom::multi::{many0, separated_list0};
-use nom::sequence::{delimited, pair, separated_pair, tuple};
+use nom::sequence::{delimited, pair, separated_pair};
+use nom::{IResult, Parser};
 use serde_json::Value;
 
 /// Parse a bare identifier: `[A-Za-z_][A-Za-z0-9_]*`.
 pub fn identifier<'a, E: ParseError<&'a str>>(input: &'a str) -> IResult<&'a str, String, E> {
     map(
-        recognize(tuple((
+        recognize((
             alt((alpha1, tag("_"))),
             many0(alt((alphanumeric1, tag("_")))),
-        ))),
+        )),
         String::from,
-    )(input)
+    )
+    .parse(input)
 }
 
 /// Parse a backtick-quoted identifier: `` `any chars` ``.
@@ -46,12 +47,13 @@ pub fn quoted_identifier<'a, E: ParseError<&'a str>>(
     map(
         delimited(char('`'), take_while1(|c| c != '`'), char('`')),
         String::from,
-    )(input)
+    )
+    .parse(input)
 }
 
 /// Parse any identifier (bare or backtick-quoted).
 pub fn any_identifier<'a, E: ParseError<&'a str>>(input: &'a str) -> IResult<&'a str, String, E> {
-    alt((quoted_identifier, identifier))(input)
+    alt((quoted_identifier, identifier)).parse(input)
 }
 
 /// Parse a string literal (single or double quoted; may be empty).
@@ -65,7 +67,8 @@ pub fn string_literal<'a, E: ParseError<&'a str>>(input: &'a str) -> IResult<&'a
             delimited(char('\''), take_while(|c| c != '\''), char('\'')),
             String::from,
         ),
-    ))(input)
+    ))
+    .parse(input)
 }
 
 /// Parse an integer literal (optionally negative).
@@ -75,9 +78,10 @@ pub fn integer_literal<
 >(
     input: &'a str,
 ) -> IResult<&'a str, i64, E> {
-    map_res(recognize(tuple((opt(char('-')), digit1))), |s: &str| {
+    map_res(recognize((opt(char('-')), digit1)), |s: &str| {
         s.parse::<i64>()
-    })(input)
+    })
+    .parse(input)
 }
 
 /// Parse a float literal (`-?d+.d+` with an optional exponent).
@@ -88,15 +92,16 @@ pub fn float_literal<
     input: &'a str,
 ) -> IResult<&'a str, f64, E> {
     map_res(
-        recognize(tuple((
+        recognize((
             opt(char('-')),
             digit1,
             char('.'),
             digit1,
-            opt(tuple((one_of("eE"), opt(one_of("+-")), digit1))),
-        ))),
+            opt((one_of("eE"), opt(one_of("+-")), digit1)),
+        )),
         |s: &str| s.parse::<f64>(),
-    )(input)
+    )
+    .parse(input)
 }
 
 /// Parse a boolean literal (case-insensitive).
@@ -104,12 +109,13 @@ pub fn boolean_literal<'a, E: ParseError<&'a str>>(input: &'a str) -> IResult<&'
     alt((
         value(true, tag_no_case("true")),
         value(false, tag_no_case("false")),
-    ))(input)
+    ))
+    .parse(input)
 }
 
 /// Parse a `null` literal (case-insensitive).
 pub fn null_literal<'a, E: ParseError<&'a str>>(input: &'a str) -> IResult<&'a str, Value, E> {
-    value(Value::Null, tag_no_case("null"))(input)
+    value(Value::Null, tag_no_case("null")).parse(input)
 }
 
 /// Parse a property value: string, float, integer, boolean, null, or a
@@ -146,7 +152,8 @@ pub fn property_value<
             ),
             Value::Array,
         ),
-    ))(input)
+    ))
+    .parse(input)
 }
 
 /// Parse a property-value map: `{ key: value, … }` with permissive
@@ -173,7 +180,8 @@ pub fn property_value_map<
             pair(multispace0, char('}')),
         ),
         |pairs| pairs.into_iter().collect(),
-    )(input)
+    )
+    .parse(input)
 }
 
 /// Parse a CONSTRAINT-map property assignment: `key: value` →
@@ -205,7 +213,8 @@ pub fn property_assignment<
             verify(constraint_value, |v| !v.is_null()),
         ),
         |(key, value)| (key, crate::ast::PropertyConstraint::Equals(value)),
-    )(input)
+    )
+    .parse(input)
 }
 
 /// A property value in CONSTRAINT position: the shared `property_value`
@@ -241,7 +250,8 @@ fn constraint_value<
             ),
             Value::Array,
         ),
-    ))(input)
+    ))
+    .parse(input)
 }
 
 /// Parse a constraint map: `{ key: value, … }` → per-key equality
@@ -264,5 +274,6 @@ pub fn constraint_map<
             pair(multispace0, char('}')),
         ),
         |pairs| pairs.into_iter().collect(),
-    )(input)
+    )
+    .parse(input)
 }
