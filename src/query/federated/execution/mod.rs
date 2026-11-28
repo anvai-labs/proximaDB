@@ -295,6 +295,8 @@ impl FederatedExecutor {
         Box<dyn std::future::Future<Output = Result<FederatedExecutionResult>> + Send + 'a>,
     > {
         Box::pin(async move {
+            #[cfg(feature = "abac-policy")]
+            self.require_policy_aware_reader(&node.node_type)?;
             let result = match &node.node_type {
                 PlanNodeType::Scan {
                     target,
@@ -403,6 +405,50 @@ impl FederatedExecutor {
 
             self.project_result_to_output_columns(result, &node.output_columns, !is_root)
         })
+    }
+
+    // Vector search through the canonical service evaluates the caller policy.
+    // The full ranking pipeline and legacy scans do not have that capability.
+    #[cfg(feature = "abac-policy")]
+    fn require_policy_aware_reader(&self, node: &PlanNodeType) -> Result<()> {
+        if !crate::query::request_scope::has_policy_principal()
+            || self
+                .vector_operations_service
+                .as_ref()
+                .is_some_and(|service| !service.has_abac_enforcer())
+        {
+            return Ok(());
+        }
+        let vector_reader_is_scoped =
+            self.vector_operations_service.is_some() && self.collection_port.is_some();
+        let unsupported = match node {
+            PlanNodeType::VectorSearch { .. } => !vector_reader_is_scoped,
+            PlanNodeType::RerankSearch { rank_profile, .. } => {
+                !vector_reader_is_scoped || (rank_profile.is_some() && self.rank_services.is_some())
+            }
+            PlanNodeType::Scan { .. }
+            | PlanNodeType::GraphTraversal { .. }
+            | PlanNodeType::DocumentQuery { .. }
+            | PlanNodeType::ObservabilityQuery { .. } => true,
+            PlanNodeType::HashJoin { .. }
+            | PlanNodeType::NestedLoopJoin { .. }
+            | PlanNodeType::IndexJoin { .. }
+            | PlanNodeType::Filter { .. }
+            | PlanNodeType::Project { .. }
+            | PlanNodeType::Distinct { .. }
+            | PlanNodeType::Sort { .. }
+            | PlanNodeType::Limit { .. }
+            | PlanNodeType::Aggregate { .. }
+            | PlanNodeType::Union { .. } => false,
+        };
+        if unsupported {
+            return Err(proximadb_runtime::InvalidQueryInput(
+                "This federated data source does not support subject-level read policies"
+                    .to_owned(),
+            )
+            .into());
+        }
+        Ok(())
     }
 
     /// Execute a table/collection scan
@@ -593,15 +639,21 @@ impl FederatedExecutor {
                 search_optimization: None,
             };
 
-            let response = vector_ops
-                .search_v1(
-                    request,
-                    match request_tenant.as_deref() {
-                        Some(tenant) => proximadb_runtime::PortIdentity::for_tenant(tenant),
-                        None => proximadb_runtime::PortIdentity::anonymous(),
-                    },
-                )
-                .await?;
+            let caller = crate::query::request_scope::current_port_identity();
+            let identity = match caller.as_ref() {
+                Some(caller) if caller.tenant_id == request_tenant => caller.as_borrowed(),
+                Some(_) => {
+                    return Err(proximadb_runtime::InvalidQueryInput(
+                        "Federated vector read identity disagrees with its tenant scope".to_owned(),
+                    )
+                    .into());
+                }
+                None => match request_tenant.as_deref() {
+                    Some(tenant) => proximadb_runtime::PortIdentity::for_tenant(tenant),
+                    None => proximadb_runtime::PortIdentity::anonymous(),
+                },
+            };
+            let response = vector_ops.search_v1(request, identity).await?;
             let records = response
                 .results
                 .map(|result| result.results)

@@ -15,8 +15,11 @@
 //! Federated execution runs on the calling task (no spawns), so the scope
 //! covers every node it evaluates.
 
+use proximadb_runtime::{OwnedPortIdentity, PortIdentity};
+
 tokio::task_local! {
     static REQUEST_SCOPE: RequestScope;
+    static REQUEST_PORT_IDENTITY: OwnedPortIdentity;
 }
 
 /// The scope a query runs in.
@@ -62,6 +65,55 @@ pub async fn with_identity_scope<F: std::future::Future>(
         Some(tenant) => with_request_tenant(tenant, future).await,
         None => future.await,
     }
+}
+
+/// Bind the canonical caller identity for readers reached through the query facade.
+pub(crate) async fn with_port_identity<F>(
+    identity: PortIdentity<'_>,
+    execute: impl FnOnce(OwnedPortIdentity) -> F,
+) -> F::Output
+where
+    F: std::future::Future,
+{
+    let mut identity = identity.into_owned();
+    identity.tenant_id = match identity
+        .tenant_id
+        .as_deref()
+        .filter(|tenant| !tenant.is_empty())
+    {
+        Some(tenant) => Some(proximadb_tenant::resolve_request_tenant(Some(tenant))),
+        None => match current_scope() {
+            Some(RequestScope::Tenant(tenant)) => Some(tenant),
+            _ => None,
+        },
+    };
+    if identity.subject.is_none()
+        && let Some(outer) = current_port_identity()
+        && outer.tenant_id == identity.tenant_id
+    {
+        identity = outer;
+    }
+    let tenant = identity.tenant_id.clone();
+    let effective = identity.clone();
+    let future = async move { execute(effective).await };
+    with_identity_scope(
+        tenant.as_deref(),
+        REQUEST_PORT_IDENTITY.scope(identity, future),
+    )
+    .await
+}
+
+/// The identity attached to this query dispatch, including its policy principal.
+pub(crate) fn current_port_identity() -> Option<OwnedPortIdentity> {
+    REQUEST_PORT_IDENTITY.try_with(Clone::clone).ok()
+}
+
+/// Subject-bearing results must be re-authorized for each read, including after
+/// a policy change within the same tenant.
+pub(crate) fn has_policy_principal() -> bool {
+    REQUEST_PORT_IDENTITY
+        .try_with(|identity| identity.subject.is_some())
+        .unwrap_or(false)
 }
 
 /// The scope of the current call, if any.
@@ -113,6 +165,29 @@ mod tests {
             tenant.ok(),
             Some(Some(proximadb_tenant::DEFAULT_TENANT.to_string()))
         );
+    }
+
+    #[tokio::test]
+    async fn nested_tenant_only_dispatch_preserves_the_bound_principal() {
+        let caller = PortIdentity {
+            tenant_id: Some("acme"),
+            subject: Some("alice"),
+            tenant_stable_id: Some(7),
+            auth_class: proximadb_tenant::AuthClass::Authenticated,
+        };
+        with_port_identity(caller, |outer| async move {
+            assert_eq!(current_port_identity().as_ref(), Some(&outer));
+            with_port_identity(PortIdentity::for_tenant("acme"), |effective| async move {
+                assert_eq!(current_port_identity().as_ref(), Some(&effective));
+                assert_eq!(effective, outer);
+                assert_eq!(current_scope(), Some(RequestScope::Tenant("acme".into())));
+            })
+            .await;
+            assert!(has_policy_principal());
+        })
+        .await;
+        assert_eq!(current_port_identity(), None);
+        assert_eq!(current_scope(), None);
     }
 
     #[tokio::test]

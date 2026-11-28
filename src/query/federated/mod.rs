@@ -284,8 +284,12 @@ impl FederatedQueryContext {
         crate::query::utils::metrics::record_query_start("federated");
         let start = std::time::Instant::now();
 
-        // Check cache first if enabled
-        if let Some(ref cache) = self.cache {
+        // A captured result cannot stand in for a fresh subject-policy decision.
+        let cache = self
+            .cache
+            .as_ref()
+            .filter(|_| !crate::query::request_scope::has_policy_principal());
+        if let Some(cache) = cache {
             let key = federated_cache_key(sql);
             if let Some(cached) = cache.get(&key) {
                 debug!(
@@ -327,8 +331,8 @@ impl FederatedQueryContext {
             // 3. Execute the plan
             let result = self.executor.execute(plan).await?;
 
-            // Cache the result if caching is enabled
-            if let Some(ref cache) = self.cache {
+            // Only subjectless results are eligible for the shared cache.
+            if let Some(cache) = cache {
                 let key = federated_cache_key(sql);
                 // Clone the result for caching
                 let cached_result = ExecutionResult {

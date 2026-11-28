@@ -1,4 +1,3 @@
-abac_rest_record_search_integration_test.rs
 abac_vector_pushdown_integration_test.rs
 all_engines_50k_benchmark.rs
 api_v2_integration_test.rs

@@ -109,6 +109,11 @@ The plan's acceptance was "same rows AND the same route decision over pgwire, RE
   an empty tenant. Task-local `request_scope` still serves internal port callers and federated
   lowering. Prepared-statement owner keying prefers the explicit identity tenant, then the
   scope. Plain SQL with neither identity nor scope fails closed ("no request identity").
+. **Federated read policies.** Lowered and raw federated SQL retain the port identity through
+  scoped collection lookup and the canonical vector-policy check. Subject-bearing results
+  bypass the shared federated cache. With the ABAC feature and an active policy enforcer,
+  federated readers without a subject-policy contract reject the query, including the full
+  profiled reranker. Retrieval-only reranking uses the authorized vector reader.
 . **`execute_distributed_query`** deliberately does NOT route through the seam: it is an explicit
   `force_path = "distributed"` override onto the `DistributedQueryCoordinator` — a placement
   decision orthogonal to local engine selection (ADR-098 D5's owner-versus-reader placement is
